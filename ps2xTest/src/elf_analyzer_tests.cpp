@@ -18,6 +18,15 @@ namespace
         inst.opcode = opcode;
         return inst;
     }
+
+    Instruction makeIType(uint32_t address, uint32_t opcode, uint8_t rs, uint8_t rt, uint16_t immediate)
+    {
+        Instruction inst = makeInstruction(address, opcode);
+        inst.rs = rs;
+        inst.rt = rt;
+        inst.immediate = immediate;
+        return inst;
+    }
 }
 
 void register_elf_analyzer_tests()
@@ -174,6 +183,30 @@ void register_elf_analyzer_tests()
             (void)hasHardwareIO;
             (void)hasLargeComplexMMI;
             (void)hasSelfModifying; });
+
+                       tc.Run("MMIO address resolution includes intervening ORI", [](TestCase &t)
+                              {
+            std::vector<Instruction> instructions{
+                makeIType(0x1000, OPCODE_LUI, 0, 3, 0x1000),
+                makeIType(0x1004, OPCODE_ORI, 3, 3, 0x8000),
+                makeIType(0x1008, OPCODE_SW, 3, 2, 0x0020),
+            };
+
+            uint32_t resolved = 0;
+            t.IsTrue(ElfAnalyzer::tryResolveBasePlusOffsetForHeuristics(
+                         instructions, 2, instructions[2].rs,
+                         static_cast<int16_t>(instructions[2].immediate), resolved),
+                     "LUI/ORI base should resolve");
+            t.Equals(resolved, 0x10008020u,
+                     "MMIO hint must retain the ORI low bits");
+
+            instructions.insert(instructions.begin() + 2,
+                                makeIType(0x1008, OPCODE_LW, 4, 3, 0));
+            instructions[3].address = 0x100C;
+            t.IsFalse(ElfAnalyzer::tryResolveBasePlusOffsetForHeuristics(
+                          instructions, 3, instructions[3].rs,
+                          static_cast<int16_t>(instructions[3].immediate), resolved),
+                      "a load that overwrites the base must invalidate the hint"); });
 
                        tc.Run("jump-table detection finds canonical sltiu/bne/lw/jr pattern", [](TestCase &t)
                               {

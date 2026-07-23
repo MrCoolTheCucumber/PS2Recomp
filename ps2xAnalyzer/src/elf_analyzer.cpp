@@ -359,8 +359,9 @@ namespace ps2recomp
 
             const auto &instructions = getDecodedInstructions(func);
 
-            for (const auto &inst : instructions)
+            for (size_t instructionIndex = 0; instructionIndex < instructions.size(); ++instructionIndex)
             {
+                const Instruction &inst = instructions[instructionIndex];
                 if (inst.opcode == OPCODE_LW || inst.opcode == OPCODE_SW ||
                     inst.opcode == OPCODE_LB || inst.opcode == OPCODE_SB ||
                     inst.opcode == OPCODE_LH || inst.opcode == OPCODE_SH ||
@@ -423,29 +424,13 @@ namespace ps2recomp
                     // Also check for direct addressing with LUI+ADDIU combinations
                     else if (inst.opcode == OPCODE_LW || inst.opcode == OPCODE_SW)
                     {
-                        // Look for the LUI instruction that sets up the high bits
-                        uint32_t baseAddr = 0;
-                        for (int i = 1; i <= 5 && static_cast<int>(inst.address) - i * 4 >= static_cast<int>(func.start); i++)
+                        uint32_t targetAddr = 0;
+                        if (tryResolveBasePlusOffsetForHeuristics(instructions,
+                                                                  instructionIndex,
+                                                                  inst.rs,
+                                                                  static_cast<int16_t>(inst.immediate),
+                                                                  targetAddr))
                         {
-                            uint32_t prevAddr = inst.address - i * 4;
-                            uint32_t prevInst = 0;
-                            if (!tryReadWord(m_elfParser.get(), prevAddr, prevInst))
-                            {
-                                continue;
-                            }
-
-                            // Check if it's a LUI instruction for the same register
-                            if (OPCODE(prevInst) == OPCODE_LUI && RT(prevInst) == inst.rs)
-                            {
-                                baseAddr = IMMEDIATE(prevInst) << 16;
-                                break;
-                            }
-                        }
-
-                        if (baseAddr != 0)
-                        {
-                            uint32_t targetAddr = baseAddr + static_cast<int16_t>(inst.immediate);
-
                             // Detect MMIO accesses
                             if ((targetAddr >= 0x10000000 && targetAddr < 0x14000000) || // I/O
                                 (targetAddr >= 0x70000000 && targetAddr < 0x70004000))   // Scratchpad
@@ -571,7 +556,7 @@ namespace ps2recomp
         }
 
         uint32_t targetAddr = 0;
-        if (!tryResolveBasePlusOffset(instructions, index, storeInst.rs, static_cast<int16_t>(storeInst.immediate), targetAddr))
+        if (!tryResolveBasePlusOffsetForHeuristics(instructions, index, storeInst.rs, static_cast<int16_t>(storeInst.immediate), targetAddr))
         {
             return false;
         }
@@ -597,12 +582,12 @@ namespace ps2recomp
         return true;
     }
 
-    bool ElfAnalyzer::tryResolveBasePlusOffset(
+    bool ElfAnalyzer::tryResolveBasePlusOffsetForHeuristics(
         const std::vector<Instruction> &instructions,
         size_t index,
         uint32_t baseReg,
         int16_t offset,
-        uint32_t &outAddr) const
+        uint32_t &outAddr)
     {
         uint32_t baseAddr = 0;
         if (!tryResolveLuiBase(instructions, index, baseReg, baseAddr))
@@ -618,7 +603,7 @@ namespace ps2recomp
         const std::vector<Instruction> &instructions,
         size_t index,
         uint32_t reg,
-        uint32_t &baseAddr) const
+        uint32_t &baseAddr)
     {
         baseAddr = 0;
 
