@@ -1078,6 +1078,70 @@ void register_ps2_runtime_expansion_tests()
             runtime.requestStop();
         });
 
+        tc.Run("sceMpegDemuxPssRing dispatches private-stream data callbacks", [](TestCase &t)
+        {
+            PS2Runtime runtime;
+            std::vector<uint8_t> rdram(PS2_RAM_SIZE, 0u);
+            ps2_stubs::resetMpegStubState();
+
+            constexpr uint32_t kMpegAddr = 0x00123000u;
+            constexpr uint32_t kCallbackEntry = 0x00124000u;
+            constexpr uint32_t kCallbackUserData = 0x55667788u;
+            constexpr uint32_t kPacketAddr = 0x00129000u;
+            constexpr uint32_t kDataStreamType = 3u;
+            const std::vector<uint8_t> payload = {
+                0x21u, 0x43u, 0x65u, 0x87u, 0xA9u, 0xCBu};
+
+            runtime.configureGuestHeap(0x01F00000u, 0x01F00000u);
+            t.Equals(runtime.guestMalloc(0x20u, 16u), 0u,
+                     "test setup should leave no runtime guest heap for callback scratch data");
+            runtime.registerFunction(kCallbackEntry, &testRecordMpegStreamCallback);
+
+            R5900Context addCtx{};
+            setRegU32(addCtx, 4, kMpegAddr);
+            setRegU32(addCtx, 5, kDataStreamType);
+            setRegU32(addCtx, 6, 0u);
+            setRegU32(addCtx, 7, kCallbackEntry);
+            setRegU32(addCtx, 8, kCallbackUserData);
+            ps2_stubs::sceMpegAddStrCallback(rdram.data(), &addCtx, &runtime);
+
+            const uint16_t packetLen = static_cast<uint16_t>(payload.size() + 3u);
+            std::vector<uint8_t> packet = {
+                0x00u, 0x00u, 0x01u, 0xBDu,
+                static_cast<uint8_t>(packetLen >> 8u),
+                static_cast<uint8_t>(packetLen & 0xFFu),
+                0x80u, 0x00u, 0x00u};
+            packet.insert(packet.end(), payload.begin(), payload.end());
+            std::memcpy(rdram.data() + kPacketAddr, packet.data(), packet.size());
+
+            gMpegStreamCallbackCount.store(0u, std::memory_order_release);
+            R5900Context demuxCtx{};
+            setRegU32(demuxCtx, 4, kMpegAddr);
+            setRegU32(demuxCtx, 5, kPacketAddr);
+            setRegU32(demuxCtx, 6, static_cast<uint32_t>(packet.size()));
+            setRegU32(demuxCtx, 7, kPacketAddr);
+            setRegU32(demuxCtx, 8, static_cast<uint32_t>(packet.size()));
+            ps2_stubs::sceMpegDemuxPssRing(rdram.data(), &demuxCtx, &runtime);
+
+            t.Equals(getRegS32(demuxCtx, 2), static_cast<int32_t>(packet.size()),
+                     "sceMpegDemuxPssRing should consume a private-stream PES packet");
+            t.Equals(gMpegStreamCallbackCount.load(std::memory_order_acquire), 1u,
+                     "registered data stream callback should be invoked once");
+            t.Equals(gMpegStreamCallbackMpeg.load(std::memory_order_acquire), kMpegAddr,
+                     "data callback should receive the MPEG handle");
+            t.Equals(gMpegStreamCallbackType.load(std::memory_order_acquire), kDataStreamType,
+                     "data callback should report the registered stream type");
+            t.Equals(gMpegStreamCallbackDataAddr.load(std::memory_order_acquire), kPacketAddr + 9u,
+                     "data callback should point at the raw PES payload");
+            t.Equals(gMpegStreamCallbackLen.load(std::memory_order_acquire),
+                     static_cast<uint32_t>(payload.size()),
+                     "data callback should report the raw PES payload length");
+            t.Equals(gMpegStreamCallbackUserData.load(std::memory_order_acquire), kCallbackUserData,
+                     "data callback should receive registered user data");
+
+            runtime.requestStop();
+        });
+
         tc.Run("MPEG playback stays active during a temporary demux pause before CD EOF", [](TestCase &t)
         {
             std::vector<uint8_t> rdram(PS2_RAM_SIZE, 0u);

@@ -522,6 +522,7 @@ namespace ps2_stubs
         constexpr uint32_t kMpegStrM2V = 0u;
         constexpr uint32_t kMpegStrPCM = 1u;
         constexpr uint32_t kMpegStrADPCM = 2u;
+        constexpr uint32_t kMpegStrData = 3u;
         constexpr uint8_t kMpegPackHeader = 0xBAu;
         constexpr uint8_t kMpegSystemHeader = 0xBBu;
         constexpr uint8_t kMpegProgramEnd = 0xB9u;
@@ -1133,6 +1134,15 @@ namespace ps2_stubs
                             playback.pssGuestAddrs[payloadStart],
                             static_cast<uint32_t>(packetEnd - payloadStart),
                             callbackEvents);
+                        if (streamId == kMpegPrivateStream1)
+                        {
+                            queueStreamCallbackEvent(
+                                mpegAddr,
+                                kMpegStrData,
+                                playback.pssGuestAddrs[payloadStart],
+                                static_cast<uint32_t>(packetEnd - payloadStart),
+                                callbackEvents);
+                        }
                     }
                 }
 
@@ -1319,21 +1329,31 @@ namespace ps2_stubs
 
             thread_local PS2Runtime *s_callbackStackRuntime = nullptr;
             thread_local uint32_t s_callbackStackTop = 0u;
-            if (s_callbackStackRuntime != runtime || s_callbackStackTop == 0u)
+            thread_local uint32_t s_callbackDataAddr = 0u;
+            if (s_callbackStackRuntime != runtime || s_callbackStackTop == 0u || s_callbackDataAddr == 0u)
             {
                 constexpr uint32_t kCallbackStackSize = 0x4000u;
                 s_callbackStackRuntime = runtime;
-                s_callbackStackTop = runtime->reserveAsyncCallbackStack(kCallbackStackSize, 16u);
+                s_callbackStackTop = 0u;
+                s_callbackDataAddr = 0u;
+
+                const uint32_t reservedTop = runtime->reserveAsyncCallbackStack(
+                    kCallbackStackSize + kMpegCallbackDataSize + 0x10u,
+                    16u);
+                if (reservedTop >= kMpegCallbackDataSize)
+                {
+                    s_callbackDataAddr = reservedTop - kMpegCallbackDataSize;
+                    s_callbackStackTop = s_callbackDataAddr;
+                }
             }
 
-            const uint32_t cbDataAddr = runtime->guestMalloc(kMpegCallbackDataSize, 16u);
+            const uint32_t cbDataAddr = s_callbackDataAddr;
             if (cbDataAddr == 0u)
             {
                 return;
             }
             if (!writeMpegCallbackData(rdram, cbDataAddr, event))
             {
-                runtime->guestFree(cbDataAddr);
                 return;
             }
 
@@ -1396,7 +1416,6 @@ namespace ps2_stubs
                 }
             }
 
-            runtime->guestFree(cbDataAddr);
         }
 
         void dispatchStreamCallbacks(uint8_t *rdram,
