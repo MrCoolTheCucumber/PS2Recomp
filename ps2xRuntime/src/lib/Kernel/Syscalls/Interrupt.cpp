@@ -183,7 +183,7 @@ namespace ps2_syscalls
                         {
                             break;
                         }
-                        step(rdram, &irqCtx, runtime);
+                        runtime->executeGuestStep(rdram, &irqCtx, step);
                         ++stepCount;
                     }
                     handoffBaseline = runtime->guestExecutionHandoffEpochSnapshot();
@@ -290,7 +290,7 @@ namespace ps2_syscalls
                         {
                             break;
                         }
-                        step(rdram, &irqCtx, runtime);
+                        runtime->executeGuestStep(rdram, &irqCtx, step);
                         ++steps;
                     }
                     handoffBaseline = runtime->guestExecutionHandoffEpochSnapshot();

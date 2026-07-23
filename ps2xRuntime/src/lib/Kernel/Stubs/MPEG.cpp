@@ -1692,7 +1692,7 @@ namespace ps2_stubs
                         break;
                     }
 
-                    step(rdram, &callbackCtx, runtime);
+                    runtime->executeGuestStep(rdram, &callbackCtx, step);
                     ++steps;
                 }
                 handoffBaseline = runtime->guestExecutionHandoffEpochSnapshot();

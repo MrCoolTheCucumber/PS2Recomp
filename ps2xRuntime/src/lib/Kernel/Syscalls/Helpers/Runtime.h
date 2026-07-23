@@ -235,7 +235,7 @@ static void ensureAlarmWorkerRunning()
                     callbackCtx.pc = readyAlarm->handler;
 
                     PS2Runtime::RecompiledFunction func = readyAlarm->runtime->lookupFunction(readyAlarm->handler);
-                    func(readyAlarm->rdram, &callbackCtx, readyAlarm->runtime);
+                    readyAlarm->runtime->executeGuestStep(readyAlarm->rdram, &callbackCtx, func);
                 }
                 catch (const ThreadExitException &)
                 {
@@ -423,7 +423,7 @@ static bool rpcInvokeFunction(uint8_t *rdram, R5900Context *ctx, PS2Runtime *run
         PS2Runtime::RecompiledFunction func = runtime->lookupFunction(pc);
         {
             PS2Runtime::GuestExecutionScope guestExecution(runtime);
-            func(rdram, &tmp, runtime);
+            runtime->executeGuestStep(rdram, &tmp, func);
         }
         ++steps;
     }

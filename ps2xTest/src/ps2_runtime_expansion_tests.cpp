@@ -110,6 +110,20 @@ namespace
         return generated.find(needle) != std::string::npos;
     }
 
+    template <typename Function>
+    bool raisesGuestException(Function &&function)
+    {
+        try
+        {
+            function();
+        }
+        catch (const PS2GuestException &)
+        {
+            return true;
+        }
+        return false;
+    }
+
     template <typename Predicate>
     bool waitUntil(Predicate pred, std::chrono::milliseconds timeout)
     {
@@ -245,6 +259,36 @@ namespace
             setRegU32(*ctx, 2, 0x00BEEFu);
             ctx->pc = 0x33330000u;
         }
+    }
+
+    constexpr uint32_t kExceptionUnwindEntry = 0x160000u;
+    constexpr uint32_t kExceptionUnwindNested = 0x160100u;
+    constexpr uint32_t kExceptionUnwindVector = 0x00000180u;
+
+    void testExceptionUnwindNested(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        ctx->pc = kExceptionUnwindNested;
+        const uint32_t value = runtime->Load32(rdram, ctx, 0x00000002u);
+        setRegU32(*ctx, 2, value);
+        setRegU32(*ctx, 3, 0x33333333u);
+        ctx->pc = 0u;
+    }
+
+    void testExceptionUnwindEntryFunction(uint8_t *rdram,
+                                          R5900Context *ctx,
+                                          PS2Runtime *runtime)
+    {
+        ctx->pc = kExceptionUnwindNested;
+        PS2Runtime::RecompiledFunction nested = runtime->lookupFunction(ctx->pc);
+        nested(rdram, ctx, runtime);
+        setRegU32(*ctx, 4, 0x44444444u);
+        ctx->pc = 0u;
+    }
+
+    void testExceptionUnwindVectorHandler(uint8_t *, R5900Context *ctx, PS2Runtime *)
+    {
+        setRegU32(*ctx, 5, 0x55555555u);
+        ctx->pc = 0u;
     }
 
     constexpr uint32_t kAsyncCounterAddr = 0x2400u;
@@ -2288,8 +2332,12 @@ void register_ps2_runtime_expansion_tests()
             ctx.cop0_status = 0u;
             ctx.cop0_cause = 0u;
 
-            runtime.SignalException(&ctx, EXCEPTION_ADDRESS_ERROR_LOAD);
+            const bool raised = raisesGuestException([&]()
+            {
+                runtime.SignalException(&ctx, EXCEPTION_ADDRESS_ERROR_LOAD);
+            });
 
+            t.IsTrue(raised, "exception delivery should unwind generated execution");
             t.Equals(ctx.cop0_epc, 0x1FFCu, "delay-slot exception should capture branch_pc in EPC");
             t.IsTrue((ctx.cop0_cause & COP0_CAUSE_BD) != 0u, "delay-slot exception should set CAUSE.BD");
             t.Equals(ctx.cop0_cause & COP0_CAUSE_EXCCODE_MASK,
@@ -2310,8 +2358,12 @@ void register_ps2_runtime_expansion_tests()
             ctx.cop0_status = COP0_STATUS_BEV;
             ctx.cop0_cause = COP0_CAUSE_BD;
 
-            runtime.SignalException(&ctx, EXCEPTION_ADDRESS_ERROR_STORE);
+            const bool raised = raisesGuestException([&]()
+            {
+                runtime.SignalException(&ctx, EXCEPTION_ADDRESS_ERROR_STORE);
+            });
 
+            t.IsTrue(raised, "exception delivery should unwind generated execution");
             t.Equals(ctx.cop0_epc, 0x3000u, "non-delay exception should capture current pc in EPC");
             t.IsTrue((ctx.cop0_cause & COP0_CAUSE_BD) == 0u, "non-delay exception should clear CAUSE.BD");
             t.Equals(ctx.pc, EXCEPTION_VECTOR_BOOT, "BEV=1 should route exception to boot vector");
@@ -2324,12 +2376,20 @@ void register_ps2_runtime_expansion_tests()
             R5900Context storeCtx{};
 
             loadCtx.pc = 0x4000u;
-            runtime.SignalException(&loadCtx, EXCEPTION_TLB_REFILL_LOAD);
+            const bool loadRaised = raisesGuestException([&]()
+            {
+                runtime.SignalException(&loadCtx, EXCEPTION_TLB_REFILL_LOAD);
+            });
 
             storeCtx.pc = 0x5000u;
             storeCtx.cop0_status = COP0_STATUS_BEV;
-            runtime.SignalException(&storeCtx, EXCEPTION_TLB_REFILL_STORE);
+            const bool storeRaised = raisesGuestException([&]()
+            {
+                runtime.SignalException(&storeCtx, EXCEPTION_TLB_REFILL_STORE);
+            });
 
+            t.IsTrue(loadRaised, "TLB load refill should unwind generated execution");
+            t.IsTrue(storeRaised, "TLB store refill should unwind generated execution");
             t.Equals(loadCtx.pc, EXCEPTION_VECTOR_TLB_REFILL,
                      "TLB load refill should use the normal refill vector");
             t.Equals(loadCtx.cop0_cause & COP0_CAUSE_EXCCODE_MASK,
@@ -2354,8 +2414,12 @@ void register_ps2_runtime_expansion_tests()
             ctx.cop0_epc = 0x12345678u;
             ctx.cop0_cause = COP0_CAUSE_BD | 0x00000100u;
 
-            runtime.SignalException(&ctx, EXCEPTION_TLB_REFILL_LOAD);
+            const bool raised = raisesGuestException([&]()
+            {
+                runtime.SignalException(&ctx, EXCEPTION_TLB_REFILL_LOAD);
+            });
 
+            t.IsTrue(raised, "nested exception should unwind generated execution");
             t.Equals(ctx.cop0_epc, 0x12345678u,
                      "nested level-1 exception should preserve the original EPC");
             t.IsTrue((ctx.cop0_cause & COP0_CAUSE_BD) != 0u,
@@ -2376,9 +2440,12 @@ void register_ps2_runtime_expansion_tests()
 
             R5900Context addressErrorCtx{};
             addressErrorCtx.pc = 0x7000u;
-            const uint32_t addressErrorValue = runtime.Load32(rdram, &addressErrorCtx, 0x00000002u);
+            const bool addressErrorRaised = raisesGuestException([&]()
+            {
+                (void)runtime.Load32(rdram, &addressErrorCtx, 0x00000002u);
+            });
 
-            t.Equals(addressErrorValue, 0u, "faulting load should return the neutral fallback value");
+            t.IsTrue(addressErrorRaised, "faulting load should unwind generated execution");
             t.Equals(addressErrorCtx.cop0_badvaddr, 0x00000002u,
                      "address error should record the faulting virtual address");
             t.Equals(addressErrorCtx.cop0_cause & COP0_CAUSE_EXCCODE_MASK,
@@ -2392,9 +2459,12 @@ void register_ps2_runtime_expansion_tests()
             loadMissCtx.pc = 0x8000u;
             loadMissCtx.cop0_context = 0xAB80000Fu;
             loadMissCtx.cop0_entryhi = 0x000005A5u;
-            const uint32_t loadMissValue = runtime.Load32(rdram, &loadMissCtx, loadMissAddress);
+            const bool loadMissRaised = raisesGuestException([&]()
+            {
+                (void)runtime.Load32(rdram, &loadMissCtx, loadMissAddress);
+            });
 
-            t.Equals(loadMissValue, 0u, "TLB-missing load should return the neutral fallback value");
+            t.IsTrue(loadMissRaised, "TLB-missing load should unwind generated execution");
             t.Equals(loadMissCtx.cop0_badvaddr, loadMissAddress,
                      "TLB load refill should record BadVAddr");
             t.Equals(loadMissCtx.cop0_context,
@@ -2413,8 +2483,12 @@ void register_ps2_runtime_expansion_tests()
             R5900Context storeMissCtx{};
             storeMissCtx.pc = 0x9000u;
             storeMissCtx.cop0_status = COP0_STATUS_BEV;
-            runtime.Store32(rdram, &storeMissCtx, storeMissAddress, 0x11223344u);
+            const bool storeMissRaised = raisesGuestException([&]()
+            {
+                runtime.Store32(rdram, &storeMissCtx, storeMissAddress, 0x11223344u);
+            });
 
+            t.IsTrue(storeMissRaised, "TLB-missing store should unwind generated execution");
             t.Equals(storeMissCtx.cop0_badvaddr, storeMissAddress,
                      "TLB store refill should record BadVAddr");
             t.Equals(storeMissCtx.cop0_cause & COP0_CAUSE_EXCCODE_MASK,
@@ -2422,6 +2496,44 @@ void register_ps2_runtime_expansion_tests()
                      "TLB-missing store should report ExcCode 3");
             t.Equals(storeMissCtx.pc, EXCEPTION_VECTOR_TLB_REFILL_BOOT,
                      "TLB-missing store with BEV=1 should use the bootstrap refill vector");
+        });
+
+        tc.Run("guest exceptions unwind nested generated calls and resume at the vector", [](TestCase &t)
+        {
+            PS2Runtime runtime;
+            std::vector<uint8_t> rdram(PS2_RAM_SIZE, 0u);
+            R5900Context ctx{};
+
+            t.IsTrue(runtime.registerFunction(kExceptionUnwindEntry,
+                                              &testExceptionUnwindEntryFunction),
+                     "entry function registration should succeed");
+            t.IsTrue(runtime.registerFunction(kExceptionUnwindNested,
+                                              &testExceptionUnwindNested),
+                     "nested function registration should succeed");
+            t.IsTrue(runtime.registerFunction(kExceptionUnwindVector,
+                                              &testExceptionUnwindVectorHandler),
+                     "exception vector registration should succeed");
+
+            setRegU32(ctx, 2, 0x22222222u);
+            ctx.pc = kExceptionUnwindEntry;
+            runtime.dispatchLoop(rdram.data(), &ctx);
+
+            t.Equals(::getRegU32(&ctx, 2), 0x22222222u,
+                     "faulting load must not overwrite its destination");
+            t.Equals(::getRegU32(&ctx, 3), 0u,
+                     "nested generated code after the fault must not execute");
+            t.Equals(::getRegU32(&ctx, 4), 0u,
+                     "calling generated code after the fault must not execute");
+            t.Equals(::getRegU32(&ctx, 5), 0x55555555u,
+                     "dispatcher should execute the exception vector");
+            t.Equals(ctx.cop0_epc, kExceptionUnwindNested,
+                     "EPC should identify the faulting generated function");
+            t.Equals(ctx.cop0_badvaddr, 0x00000002u,
+                     "BadVAddr should identify the faulting load address");
+            t.Equals(ctx.cop0_cause & COP0_CAUSE_EXCCODE_MASK,
+                     (static_cast<uint32_t>(EXCEPTION_ADDRESS_ERROR_LOAD) << 2) &
+                         COP0_CAUSE_EXCCODE_MASK,
+                     "fault should retain the address-error cause at the handler");
         });
 
         tc.Run("handleSyscall rejects invocation in delay slot", [](TestCase &t)

@@ -288,7 +288,7 @@ namespace
         ctx->vi[0] = 0;
     }
 
-    void raiseCop0Exception(R5900Context *ctx, uint32_t exceptionCode)
+    [[noreturn]] void raiseCop0Exception(R5900Context *ctx, uint32_t exceptionCode)
     {
         const bool alreadyInException = (ctx->cop0_status & COP0_STATUS_EXL) != 0u;
         if (!alreadyInException && ctx->in_delay_slot)
@@ -315,6 +315,7 @@ namespace
         ctx->cop0_status |= COP0_STATUS_EXL;
         ctx->pc = selectExceptionVector(ctx, exceptionCode, alreadyInException);
         ctx->in_delay_slot = false;
+        throw PS2GuestException{};
     }
 
     std::filesystem::path normalizeAbsolutePath(const std::filesystem::path &path)
@@ -1384,20 +1385,19 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
     return ctx->pc == fallthroughPc;
 }
 
-void PS2Runtime::SignalException(R5900Context *ctx, PS2Exception exception)
+[[noreturn]] void PS2Runtime::SignalException(R5900Context *ctx, PS2Exception exception)
 {
     if (exception == EXCEPTION_INTEGER_OVERFLOW)
     {
         HandleIntegerOverflow(ctx);
-        return;
     }
 
     raiseCop0Exception(ctx, static_cast<uint32_t>(exception));
 }
 
-void PS2Runtime::SignalMemoryException(R5900Context *ctx,
-                                       PS2Exception exception,
-                                       uint32_t badVAddr)
+[[noreturn]] void PS2Runtime::SignalMemoryException(R5900Context *ctx,
+                                                    PS2Exception exception,
+                                                    uint32_t badVAddr)
 {
     ctx->cop0_badvaddr = badVAddr;
 
@@ -2004,6 +2004,19 @@ uint32_t PS2Runtime::reserveAsyncCallbackStack(uint32_t size, uint32_t alignment
     return top - 0x10u;
 }
 
+void PS2Runtime::executeGuestStep(uint8_t *rdram,
+                                  R5900Context *ctx,
+                                  RecompiledFunction function)
+{
+    try
+    {
+        function(rdram, ctx, this);
+    }
+    catch (const PS2GuestException &)
+    {
+    }
+}
+
 void PS2Runtime::dispatchLoop(uint8_t *rdram, R5900Context *ctx)
 {
     uint32_t lastPc = std::numeric_limits<uint32_t>::max();
@@ -2044,7 +2057,7 @@ void PS2Runtime::dispatchLoop(uint8_t *rdram, R5900Context *ctx)
         uint64_t handoffBaseline = 0u;
         {
             GuestExecutionScope guestExecution(this);
-            fn(rdram, ctx, this);
+            executeGuestStep(rdram, ctx, fn);
             handoffBaseline = guestExecutionHandoffEpochSnapshot();
         }
 
@@ -2279,12 +2292,10 @@ uint8_t PS2Runtime::Load8(uint8_t *rdram, R5900Context *ctx, uint32_t vaddr)
     catch (const PS2TlbMissException &fault)
     {
         SignalMemoryException(ctx, EXCEPTION_TLB_REFILL_LOAD, fault.virtualAddress());
-        return 0;
     }
     catch (const std::exception &)
     {
         SignalMemoryException(ctx, EXCEPTION_ADDRESS_ERROR_LOAD, vaddr);
-        return 0;
     }
 }
 
@@ -2297,12 +2308,10 @@ uint16_t PS2Runtime::Load16(uint8_t *rdram, R5900Context *ctx, uint32_t vaddr)
     catch (const PS2TlbMissException &fault)
     {
         SignalMemoryException(ctx, EXCEPTION_TLB_REFILL_LOAD, fault.virtualAddress());
-        return 0;
     }
     catch (const std::exception &)
     {
         SignalMemoryException(ctx, EXCEPTION_ADDRESS_ERROR_LOAD, vaddr);
-        return 0;
     }
 }
 
@@ -2315,12 +2324,10 @@ uint32_t PS2Runtime::Load32(uint8_t *rdram, R5900Context *ctx, uint32_t vaddr)
     catch (const PS2TlbMissException &fault)
     {
         SignalMemoryException(ctx, EXCEPTION_TLB_REFILL_LOAD, fault.virtualAddress());
-        return 0;
     }
     catch (const std::exception &)
     {
         SignalMemoryException(ctx, EXCEPTION_ADDRESS_ERROR_LOAD, vaddr);
-        return 0;
     }
 }
 
@@ -2333,12 +2340,10 @@ uint64_t PS2Runtime::Load64(uint8_t *rdram, R5900Context *ctx, uint32_t vaddr)
     catch (const PS2TlbMissException &fault)
     {
         SignalMemoryException(ctx, EXCEPTION_TLB_REFILL_LOAD, fault.virtualAddress());
-        return 0;
     }
     catch (const std::exception &)
     {
         SignalMemoryException(ctx, EXCEPTION_ADDRESS_ERROR_LOAD, vaddr);
-        return 0;
     }
 }
 
@@ -2351,12 +2356,10 @@ __m128i PS2Runtime::Load128(uint8_t *rdram, R5900Context *ctx, uint32_t vaddr)
     catch (const PS2TlbMissException &fault)
     {
         SignalMemoryException(ctx, EXCEPTION_TLB_REFILL_LOAD, fault.virtualAddress());
-        return _mm_setzero_si128();
     }
     catch (const std::exception &)
     {
         SignalMemoryException(ctx, EXCEPTION_ADDRESS_ERROR_LOAD, vaddr);
-        return _mm_setzero_si128();
     }
 }
 
@@ -2489,7 +2492,7 @@ bool PS2Runtime::isStopRequested() const
     return m_stopRequested.load(std::memory_order_relaxed);
 }
 
-void PS2Runtime::HandleIntegerOverflow(R5900Context *ctx)
+[[noreturn]] void PS2Runtime::HandleIntegerOverflow(R5900Context *ctx)
 {
     raiseCop0Exception(ctx, EXCEPTION_INTEGER_OVERFLOW);
 }

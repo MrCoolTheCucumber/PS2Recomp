@@ -57,6 +57,12 @@ enum PS2Exception
     EXCEPTION_TRAP = 0x0D,             // Trap instruction condition met
 };
 
+// Internal control-flow signal used to leave generated guest code immediately
+// after the runtime has entered an EE exception.
+struct PS2GuestException final
+{
+};
+
 // PS2 CPU context (R5900)
 struct alignas(16) R5900Context
 {
@@ -391,8 +397,10 @@ public:
     static void setIoPaths(const IoPaths &paths);
     static void configureIoPathsFromElf(const std::string &elfPath);
 
-    void SignalException(R5900Context *ctx, PS2Exception exception);
-    void SignalMemoryException(R5900Context *ctx, PS2Exception exception, uint32_t badVAddr);
+    [[noreturn]] void SignalException(R5900Context *ctx, PS2Exception exception);
+    [[noreturn]] void SignalMemoryException(R5900Context *ctx,
+                                            PS2Exception exception,
+                                            uint32_t badVAddr);
 
     void executeVU0Microprogram(uint8_t *rdram, R5900Context *ctx, uint32_t address);
     void vu0StartMicroProgram(uint8_t *rdram, R5900Context *ctx, uint32_t address);
@@ -418,6 +426,7 @@ public:
     uint32_t guestHeapLimit() const;
     uint32_t reserveAsyncCallbackStack(uint32_t size, uint32_t alignment = 16u);
 
+    void executeGuestStep(uint8_t *rdram, R5900Context *ctx, RecompiledFunction function);
     void dispatchLoop(uint8_t *rdram, R5900Context *ctx);
 
     void drainCompletedDmacHandlers(uint8_t *rdram);
@@ -513,7 +522,7 @@ private:
     void reacquireGuestExecution(uint32_t depth);
     void markGuestExecutionAcquired();
 
-    void HandleIntegerOverflow(R5900Context *ctx);
+    [[noreturn]] void HandleIntegerOverflow(R5900Context *ctx);
 
     [[nodiscard]] ps2x::iop::RpcAbi selectIopRpcAbi(const ps2x::iop::RpcAbiRequest &request) const;
     [[nodiscard]] ps2x::iop::RpcResult handleIopRpc(uint8_t *rdram, R5900Context *ctx, ps2x::iop::RpcRequest request);
