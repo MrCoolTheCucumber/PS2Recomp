@@ -573,6 +573,39 @@ void register_ps2_sif_rpc_tests()
                      "989snd start RPC should set the trailing queue sentinel");
         });
 
+        tc.Run("repeated SifInitRpc preserves running IOP service state", [](TestCase &t)
+        {
+            TestEnv env;
+
+            constexpr uint32_t kSendAddr = 0x00035C00u;
+            constexpr uint32_t kRecvAddr = 0x00035C40u;
+            constexpr std::array<uint32_t, 6> kOpen{
+                0x400u, 0x1000u, 0x400u, 0u, 5u, 3u,
+            };
+            writeGuestStruct(env.rdram.data(), kSendAddr, kOpen);
+
+            SifInitRpc(env.rdram.data(), &env.ctx, &env.runtime);
+            const ps2x::iop::RpcResult openResult =
+                callIop(env, IOP_SID_SONY_989SND, 0x3Bu,
+                        kSendAddr, sizeof(kOpen), kRecvAddr, 12u);
+            const uint32_t workArea =
+                readGuestStruct<uint32_t>(env.rdram.data(), kRecvAddr + 4u);
+            t.IsTrue(openResult.handled && workArea != 0u,
+                     "989snd streaming state should be established before reinitialization");
+
+            SifInitRpc(env.rdram.data(), &env.ctx, &env.runtime);
+            const std::array<uint32_t, 5> playback{
+                workArea, 0x400u, 0u, 44100u, 2u,
+            };
+            writeGuestStruct(env.rdram.data(), kSendAddr, playback);
+            const ps2x::iop::RpcResult startResult =
+                callIop(env, IOP_SID_SONY_989SND, 0x3Eu,
+                        kSendAddr, sizeof(playback), kRecvAddr, 12u);
+
+            t.IsTrue(startResult.handled,
+                     "an idempotent SifInitRpc call must not reset a running IOP service");
+        });
+
         tc.Run("Sony 989snd configure RPC returns the observed success record", [](TestCase &t)
         {
             TestEnv env;

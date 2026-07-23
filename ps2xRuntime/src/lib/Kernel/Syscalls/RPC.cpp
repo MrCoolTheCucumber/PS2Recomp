@@ -240,12 +240,15 @@ namespace ps2_syscalls
     void SifInitRpc(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
         std::lock_guard<std::mutex> lock(g_rpc_mutex);
-        if (runtime)
-        {
-            PS2IopTransport::reset(runtime);
-        }
         if (!g_rpc_initialized)
         {
+            // sceSifInitRpc is idempotent.  Games and libraries can call it
+            // independently after the IOP modules they use are already
+            // running; doing so must not reset those modules' state.
+            if (runtime)
+            {
+                PS2IopTransport::reset(runtime);
+            }
             g_rpc_servers.clear();
             g_rpc_clients.clear();
             g_rpc_next_id = 1;
