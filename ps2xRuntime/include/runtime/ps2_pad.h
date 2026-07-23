@@ -4,6 +4,11 @@
 #include <cstddef>
 #include <cstdint>
 
+constexpr uint16_t mergeActiveLowPadButtons(uint16_t first, uint16_t second) noexcept
+{
+    return static_cast<uint16_t>(first & second);
+}
+
 class PSPadBackend
 {
 public:

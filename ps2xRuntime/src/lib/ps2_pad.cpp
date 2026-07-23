@@ -87,36 +87,43 @@ bool PSPadBackend::readState(int /*port*/, int /*slot*/, uint8_t *data, size_t s
         data[4] = static_cast<uint8_t>(128 + rx * 127);
         data[5] = static_cast<uint8_t>(128 + ry * 127);
     }
-    else
     {
+        // A connected host gamepad must not disable keyboard controls. Merge
+        // both active-low button states so either device can press a button.
+        uint16_t keyboardButtons = 0xFFFFu;
+        auto clearKeyboardBit = [&keyboardButtons](uint16_t mask)
+        { keyboardButtons = static_cast<uint16_t>(keyboardButtons & ~mask); };
+
         if (IsKeyDown(KEY_UP) || IsKeyDown(KEY_W))
-            clearBit(PAD_UP);
+            clearKeyboardBit(PAD_UP);
         if (IsKeyDown(KEY_DOWN) || IsKeyDown(KEY_S))
-            clearBit(PAD_DOWN);
+            clearKeyboardBit(PAD_DOWN);
         if (IsKeyDown(KEY_LEFT) || IsKeyDown(KEY_A))
-            clearBit(PAD_LEFT);
+            clearKeyboardBit(PAD_LEFT);
         if (IsKeyDown(KEY_RIGHT) || IsKeyDown(KEY_D))
-            clearBit(PAD_RIGHT);
+            clearKeyboardBit(PAD_RIGHT);
         if (IsKeyDown(KEY_X) || IsKeyDown(KEY_SPACE))
-            clearBit(PAD_CROSS);
+            clearKeyboardBit(PAD_CROSS);
         if (IsKeyDown(KEY_C) || IsKeyDown(KEY_ESCAPE))
-            clearBit(PAD_CIRCLE);
+            clearKeyboardBit(PAD_CIRCLE);
         if (IsKeyDown(KEY_Z) || IsKeyDown(KEY_KP_0))
-            clearBit(PAD_SQUARE);
+            clearKeyboardBit(PAD_SQUARE);
         if (IsKeyDown(KEY_V) || IsKeyDown(KEY_KP_1))
-            clearBit(PAD_TRIANGLE);
+            clearKeyboardBit(PAD_TRIANGLE);
         if (IsKeyDown(KEY_Q))
-            clearBit(PAD_L1);
+            clearKeyboardBit(PAD_L1);
         if (IsKeyDown(KEY_E))
-            clearBit(PAD_R1);
+            clearKeyboardBit(PAD_R1);
         if (IsKeyDown(KEY_LEFT_SHIFT))
-            clearBit(PAD_L2);
+            clearKeyboardBit(PAD_L2);
         if (IsKeyDown(KEY_RIGHT_SHIFT))
-            clearBit(PAD_R2);
+            clearKeyboardBit(PAD_R2);
         if (IsKeyDown(KEY_ENTER))
-            clearBit(PAD_START);
+            clearKeyboardBit(PAD_START);
         if (IsKeyDown(KEY_TAB))
-            clearBit(PAD_SELECT);
+            clearKeyboardBit(PAD_SELECT);
+
+        btns = mergeActiveLowPadButtons(btns, keyboardButtons);
     }
 
     data[2] = static_cast<uint8_t>(btns & 0xFF);

@@ -1,6 +1,7 @@
 #include "MiniTest.h"
 #include "ps2_stubs.h"
 #include "ps2_syscalls.h"
+#include "runtime/ps2_pad.h"
 #include "Stubs/Pad.h"
 
 #include <vector>
@@ -92,6 +93,19 @@ void register_pad_input_tests()
             ps2_stubs::clearPadOverrideState();
             closePadPort(ctx, rdram);
         });
+
+        tc.Run("keyboard buttons remain active when a gamepad is connected", [](TestCase &t)
+               {
+                   const uint16_t neutralGamepad = 0xFFFFu;
+                   const uint16_t keyboardStart = static_cast<uint16_t>(0xFFFFu & ~kPadBtnStart);
+                   t.Equals(mergeActiveLowPadButtons(neutralGamepad, keyboardStart), keyboardStart,
+                            "a connected neutral gamepad should not mask keyboard Start");
+
+                   const uint16_t gamepadCross = static_cast<uint16_t>(0xFFFFu & ~kPadBtnCross);
+                   const uint16_t expected = static_cast<uint16_t>(0xFFFFu & ~kPadBtnCross & ~kPadBtnStart);
+                   t.Equals(mergeActiveLowPadButtons(gamepadCross, keyboardStart), expected,
+                            "simultaneous gamepad and keyboard buttons should be merged");
+               });
 
         tc.Run("scePadRead button bits are active-low", [](TestCase &t)
                {
