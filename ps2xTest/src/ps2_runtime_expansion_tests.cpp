@@ -22,6 +22,7 @@
 #include <cstring>
 #include <exception>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <thread>
 #include <vector>
@@ -312,6 +313,9 @@ namespace
     std::atomic<uint32_t> gMpegStreamCallbackDataAddr{0u};
     std::atomic<uint32_t> gMpegStreamCallbackLen{0u};
     std::atomic<uint32_t> gMpegStreamCallbackUserData{0u};
+    std::atomic<uint32_t> gMpegStreamCallbackReturn{1u};
+    std::mutex gMpegStreamCallbackPayloadMutex;
+    std::vector<uint8_t> gMpegStreamCallbackPayload;
 
     void testRecordMpegStreamCallback(uint8_t *rdram, R5900Context *ctx, PS2Runtime *)
     {
@@ -328,13 +332,42 @@ namespace
         std::memcpy(&dataAddr, rdram + cbData + 0x08u, sizeof(dataAddr));
         std::memcpy(&len, rdram + cbData + 0x0Cu, sizeof(len));
 
+        {
+            std::lock_guard<std::mutex> lock(gMpegStreamCallbackPayloadMutex);
+            gMpegStreamCallbackPayload.clear();
+            if (len != 0u)
+            {
+                const uint8_t *const payload = getConstMemPtr(rdram, dataAddr);
+                const uint8_t *const payloadLast =
+                    getConstMemPtr(rdram, dataAddr + len - 1u);
+                if (payload && payloadLast && payloadLast >= payload &&
+                    static_cast<size_t>(payloadLast - payload) == len - 1u)
+                {
+                    gMpegStreamCallbackPayload.assign(payload, payload + len);
+                }
+            }
+        }
+
         gMpegStreamCallbackMpeg.store(::getRegU32(ctx, 4), std::memory_order_release);
         gMpegStreamCallbackType.store(type, std::memory_order_release);
         gMpegStreamCallbackDataAddr.store(dataAddr, std::memory_order_release);
         gMpegStreamCallbackLen.store(len, std::memory_order_release);
         gMpegStreamCallbackUserData.store(::getRegU32(ctx, 6), std::memory_order_release);
         gMpegStreamCallbackCount.fetch_add(1u, std::memory_order_acq_rel);
+        setRegU32(*ctx, 2, gMpegStreamCallbackReturn.load(std::memory_order_acquire));
         ctx->pc = 0u;
+    }
+
+    void testRejectSecondMpegStreamCallback(uint8_t *rdram,
+                                            R5900Context *ctx,
+                                            PS2Runtime *runtime)
+    {
+        testRecordMpegStreamCallback(rdram, ctx, runtime);
+        if (ctx &&
+            gMpegStreamCallbackCount.load(std::memory_order_acquire) == 2u)
+        {
+            setRegU32(*ctx, 2, 0u);
+        }
     }
 
 #if PS2X_HAS_FFMPEG
@@ -1319,6 +1352,55 @@ void register_ps2_runtime_expansion_tests()
             ps2_stubs::resetMpegStubState();
         });
 
+        tc.Run("host-decoded MPEG video is not stalled by a bypassed IPU callback", [](TestCase &t)
+        {
+            PS2Runtime runtime;
+            std::vector<uint8_t> rdram(PS2_RAM_SIZE, 0u);
+            ps2_stubs::resetMpegStubState();
+
+            constexpr uint32_t kMpegAddr = 0x00123000u;
+            constexpr uint32_t kCallbackEntry = 0x00124000u;
+            constexpr uint32_t kPacketAddr = 0x00128000u;
+            const std::vector<uint8_t> payload = {
+                0x00u, 0x00u, 0x01u, 0xB3u, 0x14u, 0x00u, 0xF0u, 0x13u};
+            const uint16_t packetLen = static_cast<uint16_t>(payload.size() + 3u);
+            std::vector<uint8_t> packet = {
+                0x00u, 0x00u, 0x01u, 0xE0u,
+                static_cast<uint8_t>(packetLen >> 8u),
+                static_cast<uint8_t>(packetLen & 0xFFu),
+                0x80u, 0x00u, 0x00u};
+            packet.insert(packet.end(), payload.begin(), payload.end());
+            std::memcpy(rdram.data() + kPacketAddr, packet.data(), packet.size());
+
+            runtime.registerFunction(kCallbackEntry, &testRecordMpegStreamCallback);
+
+            R5900Context addCtx{};
+            setRegU32(addCtx, 4, kMpegAddr);
+            setRegU32(addCtx, 5, 0u);
+            setRegU32(addCtx, 6, 0u);
+            setRegU32(addCtx, 7, kCallbackEntry);
+            setRegU32(addCtx, 8, 0x55667788u);
+            ps2_stubs::sceMpegAddStrCallback(rdram.data(), &addCtx, &runtime);
+
+            gMpegStreamCallbackCount.store(0u, std::memory_order_release);
+            gMpegStreamCallbackReturn.store(0u, std::memory_order_release);
+
+            R5900Context demuxCtx{};
+            setRegU32(demuxCtx, 4, kMpegAddr);
+            setRegU32(demuxCtx, 5, kPacketAddr);
+            setRegU32(demuxCtx, 6, static_cast<uint32_t>(packet.size()));
+            setRegU32(demuxCtx, 7, kPacketAddr);
+            setRegU32(demuxCtx, 8, static_cast<uint32_t>(packet.size()));
+            ps2_stubs::sceMpegDemuxPssRing(rdram.data(), &demuxCtx, &runtime);
+
+            t.Equals(gMpegStreamCallbackCount.load(std::memory_order_acquire), 1u,
+                     "the native IPU feed callback should still be observable");
+            t.Equals(getRegS32(demuxCtx, 2), static_cast<int32_t>(packet.size()),
+                     "the host-owned video stream should acknowledge bytes already accepted by FFmpeg");
+
+            gMpegStreamCallbackReturn.store(1u, std::memory_order_release);
+            runtime.requestStop();
+        });
 #endif
 
         tc.Run("sceMpegDemuxPssRing dispatches private-stream data callbacks", [](TestCase &t)
@@ -1381,6 +1463,273 @@ void register_ps2_runtime_expansion_tests()
                      "data callback should report the raw PES payload length");
             t.Equals(gMpegStreamCallbackUserData.load(std::memory_order_acquire), kCallbackUserData,
                      "data callback should receive registered user data");
+
+            runtime.requestStop();
+        });
+
+        tc.Run("sceMpegDemuxPssRing preserves wrapped callback guest addresses", [](TestCase &t)
+        {
+            PS2Runtime runtime;
+            std::vector<uint8_t> rdram(PS2_RAM_SIZE, 0u);
+            ps2_stubs::resetMpegStubState();
+
+            constexpr uint32_t kMpegAddr = 0x00123000u;
+            constexpr uint32_t kCallbackEntry = 0x00124000u;
+            constexpr uint32_t kRingBase = 0x00129000u;
+            constexpr uint32_t kRingSize = 0x40u;
+            constexpr uint32_t kPacketOffset = 0x30u;
+            constexpr uint32_t kDataStreamType = 3u;
+            const std::vector<uint8_t> payload = {
+                0x10u, 0x21u, 0x32u, 0x43u, 0x54u, 0x65u, 0x76u, 0x87u,
+                0x98u, 0xA9u, 0xBAu, 0xCBu, 0xDCu, 0xEDu, 0xFEu, 0x0Fu};
+
+            runtime.registerFunction(kCallbackEntry, &testRecordMpegStreamCallback);
+
+            R5900Context addCtx{};
+            setRegU32(addCtx, 4, kMpegAddr);
+            setRegU32(addCtx, 5, kDataStreamType);
+            setRegU32(addCtx, 6, 0u);
+            setRegU32(addCtx, 7, kCallbackEntry);
+            setRegU32(addCtx, 8, 0x55667788u);
+            ps2_stubs::sceMpegAddStrCallback(rdram.data(), &addCtx, &runtime);
+
+            const uint16_t packetLen = static_cast<uint16_t>(payload.size() + 3u);
+            std::vector<uint8_t> packet = {
+                0x00u, 0x00u, 0x01u, 0xBDu,
+                static_cast<uint8_t>(packetLen >> 8u),
+                static_cast<uint8_t>(packetLen & 0xFFu),
+                0x80u, 0x00u, 0x00u};
+            packet.insert(packet.end(), payload.begin(), payload.end());
+            for (size_t index = 0u; index < packet.size(); ++index)
+            {
+                const uint32_t ringOffset =
+                    (kPacketOffset + static_cast<uint32_t>(index)) % kRingSize;
+                rdram[kRingBase + ringOffset] = packet[index];
+            }
+
+            {
+                std::lock_guard<std::mutex> lock(gMpegStreamCallbackPayloadMutex);
+                gMpegStreamCallbackPayload.clear();
+            }
+            gMpegStreamCallbackCount.store(0u, std::memory_order_release);
+
+            R5900Context demuxCtx{};
+            setRegU32(demuxCtx, 4, kMpegAddr);
+            setRegU32(demuxCtx, 5, kRingBase + kPacketOffset);
+            setRegU32(demuxCtx, 6, static_cast<uint32_t>(packet.size()));
+            setRegU32(demuxCtx, 7, kRingBase);
+            setRegU32(demuxCtx, 8, kRingSize);
+            ps2_stubs::sceMpegDemuxPssRing(rdram.data(), &demuxCtx, &runtime);
+
+            const uint32_t wrappedPayloadStart =
+                kRingBase + ((kPacketOffset + 9u) % kRingSize);
+            t.Equals(getRegS32(demuxCtx, 2), static_cast<int32_t>(packet.size()),
+                     "sceMpegDemuxPssRing should consume the wrapped PES packet");
+            t.Equals(gMpegStreamCallbackCount.load(std::memory_order_acquire), 1u,
+                     "wrapped private-stream payload should dispatch one callback");
+            t.Equals(gMpegStreamCallbackLen.load(std::memory_order_acquire),
+                     static_cast<uint32_t>(payload.size()),
+                     "wrapped callback should preserve the payload length");
+            t.Equals(gMpegStreamCallbackDataAddr.load(std::memory_order_acquire),
+                     wrappedPayloadStart,
+                     "ring-aware callbacks should receive the original wrapped guest address");
+
+            runtime.requestStop();
+        });
+
+        tc.Run("sceMpegDemuxPssRing retries a backpressured callback with stable data", [](TestCase &t)
+        {
+            PS2Runtime runtime;
+            std::vector<uint8_t> rdram(PS2_RAM_SIZE, 0u);
+            ps2_stubs::resetMpegStubState();
+
+            constexpr uint32_t kMpegAddr = 0x00123000u;
+            constexpr uint32_t kCallbackEntry = 0x00124000u;
+            constexpr uint32_t kPacketAddr = 0x00129000u;
+            constexpr uint32_t kDataStreamType = 3u;
+            const std::vector<uint8_t> payload = {
+                0x12u, 0x34u, 0x56u, 0x78u, 0x9Au, 0xBCu, 0xDEu, 0xF0u};
+
+            runtime.registerFunction(kCallbackEntry, &testRecordMpegStreamCallback);
+
+            R5900Context addCtx{};
+            setRegU32(addCtx, 4, kMpegAddr);
+            setRegU32(addCtx, 5, kDataStreamType);
+            setRegU32(addCtx, 6, 0u);
+            setRegU32(addCtx, 7, kCallbackEntry);
+            setRegU32(addCtx, 8, 0x55667788u);
+            ps2_stubs::sceMpegAddStrCallback(rdram.data(), &addCtx, &runtime);
+
+            const uint16_t packetLen = static_cast<uint16_t>(payload.size() + 3u);
+            std::vector<uint8_t> packet = {
+                0x00u, 0x00u, 0x01u, 0xBDu,
+                static_cast<uint8_t>(packetLen >> 8u),
+                static_cast<uint8_t>(packetLen & 0xFFu),
+                0x80u, 0x00u, 0x00u};
+            packet.insert(packet.end(), payload.begin(), payload.end());
+            std::memcpy(rdram.data() + kPacketAddr, packet.data(), packet.size());
+
+            gMpegStreamCallbackCount.store(0u, std::memory_order_release);
+            gMpegStreamCallbackReturn.store(0u, std::memory_order_release);
+
+            R5900Context blockedCtx{};
+            setRegU32(blockedCtx, 4, kMpegAddr);
+            setRegU32(blockedCtx, 5, kPacketAddr);
+            setRegU32(blockedCtx, 6, static_cast<uint32_t>(packet.size()));
+            setRegU32(blockedCtx, 7, kPacketAddr);
+            setRegU32(blockedCtx, 8, static_cast<uint32_t>(packet.size()));
+            ps2_stubs::sceMpegDemuxPssRing(rdram.data(), &blockedCtx, &runtime);
+
+            t.Equals(gMpegStreamCallbackCount.load(std::memory_order_acquire), 1u,
+                     "a callback that reports backpressure should be invoked once");
+            t.Equals(getRegS32(blockedCtx, 2), 0,
+                     "backpressure should retain ownership of the offered input batch");
+
+            std::memset(rdram.data() + kPacketAddr, 0xEE, packet.size());
+            gMpegStreamCallbackReturn.store(1u, std::memory_order_release);
+
+            R5900Context overwrittenRetryCtx{};
+            setRegU32(overwrittenRetryCtx, 4, kMpegAddr);
+            setRegU32(overwrittenRetryCtx, 5, kPacketAddr);
+            setRegU32(overwrittenRetryCtx, 6, static_cast<uint32_t>(packet.size()));
+            setRegU32(overwrittenRetryCtx, 7, kPacketAddr);
+            setRegU32(overwrittenRetryCtx, 8, static_cast<uint32_t>(packet.size()));
+            ps2_stubs::sceMpegDemuxPssRing(
+                rdram.data(), &overwrittenRetryCtx, &runtime);
+
+            t.Equals(gMpegStreamCallbackCount.load(std::memory_order_acquire), 1u,
+                     "changed retained bytes should not be delivered through stale guest pointers");
+            t.Equals(getRegS32(overwrittenRetryCtx, 2), 0,
+                     "changed retained bytes should remain unacknowledged");
+
+            std::memcpy(rdram.data() + kPacketAddr, packet.data(), packet.size());
+            R5900Context retryCtx{};
+            setRegU32(retryCtx, 4, kMpegAddr);
+            setRegU32(retryCtx, 5, kPacketAddr);
+            setRegU32(retryCtx, 6, static_cast<uint32_t>(packet.size()));
+            setRegU32(retryCtx, 7, kPacketAddr);
+            setRegU32(retryCtx, 8, static_cast<uint32_t>(packet.size()));
+            ps2_stubs::sceMpegDemuxPssRing(rdram.data(), &retryCtx, &runtime);
+
+            std::vector<uint8_t> observedPayload;
+            {
+                std::lock_guard<std::mutex> lock(gMpegStreamCallbackPayloadMutex);
+                observedPayload = gMpegStreamCallbackPayload;
+            }
+
+            t.Equals(gMpegStreamCallbackCount.load(std::memory_order_acquire), 2u,
+                     "the pending callback should retry when the same input is presented");
+            t.Equals(getRegS32(retryCtx, 2), static_cast<int32_t>(packet.size()),
+                     "a successful retry should acknowledge the retained input batch");
+            t.IsTrue(observedPayload == payload,
+                     "the retried callback should observe the unchanged guest payload");
+            t.Equals(gMpegStreamCallbackDataAddr.load(std::memory_order_acquire),
+                     kPacketAddr + 9u,
+                     "a retry should preserve the original guest payload address");
+
+            gMpegStreamCallbackReturn.store(1u, std::memory_order_release);
+            runtime.requestStop();
+        });
+
+        tc.Run("sceMpegDemuxPssRing acknowledges packets before a backpressured callback", [](TestCase &t)
+        {
+            PS2Runtime runtime;
+            std::vector<uint8_t> rdram(PS2_RAM_SIZE, 0u);
+            ps2_stubs::resetMpegStubState();
+
+            constexpr uint32_t kMpegAddr = 0x00123000u;
+            constexpr uint32_t kCallbackEntry = 0x00124000u;
+            constexpr uint32_t kRingBase = 0x00129000u;
+            constexpr uint32_t kRingSize = 0x40u;
+            constexpr uint32_t kInputOffset = 0x28u;
+            constexpr uint32_t kDataStreamType = 3u;
+            const std::vector<uint8_t> firstPayload = {
+                0x10u, 0x21u, 0x32u, 0x43u, 0x54u, 0x65u, 0x76u, 0x87u};
+            const std::vector<uint8_t> secondPayload = {
+                0x98u, 0xA9u, 0xBAu, 0xCBu, 0xDCu, 0xEDu, 0xFEu, 0x0Fu};
+            const auto makePrivatePacket = [](const std::vector<uint8_t> &payload)
+            {
+                const uint16_t packetLen =
+                    static_cast<uint16_t>(payload.size() + 3u);
+                std::vector<uint8_t> packet = {
+                    0x00u, 0x00u, 0x01u, 0xBDu,
+                    static_cast<uint8_t>(packetLen >> 8u),
+                    static_cast<uint8_t>(packetLen & 0xFFu),
+                    0x80u, 0x00u, 0x00u};
+                packet.insert(packet.end(), payload.begin(), payload.end());
+                return packet;
+            };
+            const std::vector<uint8_t> firstPacket =
+                makePrivatePacket(firstPayload);
+            const std::vector<uint8_t> secondPacket =
+                makePrivatePacket(secondPayload);
+            std::vector<uint8_t> input = firstPacket;
+            input.insert(input.end(), secondPacket.begin(), secondPacket.end());
+
+            runtime.registerFunction(
+                kCallbackEntry, &testRejectSecondMpegStreamCallback);
+
+            R5900Context addCtx{};
+            setRegU32(addCtx, 4, kMpegAddr);
+            setRegU32(addCtx, 5, kDataStreamType);
+            setRegU32(addCtx, 6, 0u);
+            setRegU32(addCtx, 7, kCallbackEntry);
+            setRegU32(addCtx, 8, 0x55667788u);
+            ps2_stubs::sceMpegAddStrCallback(rdram.data(), &addCtx, &runtime);
+
+            for (size_t index = 0u; index < input.size(); ++index)
+            {
+                const uint32_t ringOffset =
+                    (kInputOffset + static_cast<uint32_t>(index)) % kRingSize;
+                rdram[kRingBase + ringOffset] = input[index];
+            }
+
+            gMpegStreamCallbackCount.store(0u, std::memory_order_release);
+            gMpegStreamCallbackReturn.store(1u, std::memory_order_release);
+
+            R5900Context firstDemuxCtx{};
+            setRegU32(firstDemuxCtx, 4, kMpegAddr);
+            setRegU32(firstDemuxCtx, 5, kRingBase + kInputOffset);
+            setRegU32(firstDemuxCtx, 6, static_cast<uint32_t>(input.size()));
+            setRegU32(firstDemuxCtx, 7, kRingBase);
+            setRegU32(firstDemuxCtx, 8, kRingSize);
+            ps2_stubs::sceMpegDemuxPssRing(
+                rdram.data(), &firstDemuxCtx, &runtime);
+
+            t.Equals(gMpegStreamCallbackCount.load(std::memory_order_acquire), 2u,
+                     "demux should stop when the second packet callback rejects input");
+            t.Equals(getRegS32(firstDemuxCtx, 2),
+                     static_cast<int32_t>(firstPacket.size()),
+                     "demux should acknowledge the complete packet before backpressure");
+
+            const uint32_t retryOffset =
+                (kInputOffset + static_cast<uint32_t>(firstPacket.size())) %
+                kRingSize;
+            R5900Context retryCtx{};
+            setRegU32(retryCtx, 4, kMpegAddr);
+            setRegU32(retryCtx, 5, kRingBase + retryOffset);
+            setRegU32(retryCtx, 6, static_cast<uint32_t>(secondPacket.size()));
+            setRegU32(retryCtx, 7, kRingBase);
+            setRegU32(retryCtx, 8, kRingSize);
+            ps2_stubs::sceMpegDemuxPssRing(rdram.data(), &retryCtx, &runtime);
+
+            std::vector<uint8_t> observedPayload;
+            {
+                std::lock_guard<std::mutex> lock(gMpegStreamCallbackPayloadMutex);
+                observedPayload = gMpegStreamCallbackPayload;
+            }
+            const uint32_t expectedPayloadAddr =
+                kRingBase + ((retryOffset + 9u) % kRingSize);
+            t.Equals(gMpegStreamCallbackCount.load(std::memory_order_acquire), 3u,
+                     "the rejected packet callback should retry once");
+            t.Equals(getRegS32(retryCtx, 2),
+                     static_cast<int32_t>(secondPacket.size()),
+                     "a successful retry should acknowledge only the retained suffix");
+            t.Equals(gMpegStreamCallbackDataAddr.load(std::memory_order_acquire),
+                     expectedPayloadAddr,
+                     "suffix retry should preserve the wrapped guest payload address");
+            t.IsTrue(observedPayload == secondPayload,
+                     "suffix retry should deliver the unchanged second payload");
 
             runtime.requestStop();
         });
