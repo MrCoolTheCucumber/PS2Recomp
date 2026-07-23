@@ -916,6 +916,101 @@ void register_ps2_memory_tests()
             t.Equals(mem.readIORegister(kGifCh + 0x20u), 0u, "GIF QWC should be cleared after drain");
         });
 
+        tc.Run("SPR_TO normal DMA copies RDRAM into wrapping scratchpad", [](TestCase &t)
+        {
+            PS2Memory mem;
+            t.IsTrue(mem.initialize(), "PS2Memory initialize should succeed");
+
+            constexpr uint32_t kChannel = 0x1000D400u;
+            constexpr uint32_t kSource = 0x00022000u;
+            constexpr uint32_t kScratchAddress = 0x3FF0u;
+            constexpr uint32_t kQwc = 2u;
+            for (uint32_t byte = 0u; byte < kQwc * 16u; ++byte)
+            {
+                mem.getRDRAM()[kSource + byte] = static_cast<uint8_t>(0x40u + byte);
+            }
+
+            t.IsTrue(mem.writeIORegister(kChannel + 0x10u, kSource),
+                     "SPR_TO MADR write should succeed");
+            t.IsTrue(mem.writeIORegister(kChannel + 0x20u, kQwc),
+                     "SPR_TO QWC write should succeed");
+            t.IsTrue(mem.writeIORegister(kChannel + 0x80u, kScratchAddress),
+                     "SPR_TO SADR write should succeed");
+            t.IsTrue(mem.writeIORegister(kChannel + 0x00u, 0x100u),
+                     "SPR_TO normal transfer should start");
+
+            bool copied = true;
+            for (uint32_t byte = 0u; byte < 16u; ++byte)
+            {
+                copied &= mem.getScratchpad()[0x3FF0u + byte] ==
+                          static_cast<uint8_t>(0x40u + byte);
+                copied &= mem.getScratchpad()[byte] ==
+                          static_cast<uint8_t>(0x50u + byte);
+            }
+            t.IsTrue(copied, "SPR_TO should copy both qwords across the scratchpad wrap");
+            t.Equals(mem.readIORegister(kChannel + 0x10u), kSource + 32u,
+                     "SPR_TO should advance MADR");
+            t.Equals(mem.readIORegister(kChannel + 0x80u), 0x10u,
+                     "SPR_TO should wrap and advance SADR");
+            t.Equals(mem.readIORegister(kChannel + 0x20u), 0u,
+                     "SPR_TO should consume QWC");
+            t.IsTrue((mem.readIORegister(0x1000E010u) & (1u << 9u)) != 0u,
+                     "SPR_TO should raise its D_STAT completion bit");
+
+            const std::vector<uint32_t> causes = mem.consumeCompletedDmacCauses();
+            t.Equals(causes.size(), static_cast<size_t>(1u),
+                     "SPR_TO should queue one completion");
+            t.Equals(causes[0], 9u,
+                     "SPR_TO should queue DMAC cause nine");
+        });
+
+        tc.Run("SPR_FROM normal DMA copies wrapping scratchpad into RDRAM", [](TestCase &t)
+        {
+            PS2Memory mem;
+            t.IsTrue(mem.initialize(), "PS2Memory initialize should succeed");
+
+            constexpr uint32_t kChannel = 0x1000D000u;
+            constexpr uint32_t kDestination = 0x00023000u;
+            constexpr uint32_t kScratchAddress = 0x3FF0u;
+            constexpr uint32_t kQwc = 2u;
+            for (uint32_t byte = 0u; byte < 16u; ++byte)
+            {
+                mem.getScratchpad()[0x3FF0u + byte] = static_cast<uint8_t>(0x80u + byte);
+                mem.getScratchpad()[byte] = static_cast<uint8_t>(0x90u + byte);
+            }
+
+            t.IsTrue(mem.writeIORegister(kChannel + 0x10u, kDestination),
+                     "SPR_FROM MADR write should succeed");
+            t.IsTrue(mem.writeIORegister(kChannel + 0x20u, kQwc),
+                     "SPR_FROM QWC write should succeed");
+            t.IsTrue(mem.writeIORegister(kChannel + 0x80u, kScratchAddress),
+                     "SPR_FROM SADR write should succeed");
+            t.IsTrue(mem.writeIORegister(kChannel + 0x00u, 0x100u),
+                     "SPR_FROM normal transfer should start");
+
+            bool copied = true;
+            for (uint32_t byte = 0u; byte < 32u; ++byte)
+            {
+                copied &= mem.getRDRAM()[kDestination + byte] ==
+                          static_cast<uint8_t>(0x80u + byte);
+            }
+            t.IsTrue(copied, "SPR_FROM should copy both qwords across the scratchpad wrap");
+            t.Equals(mem.readIORegister(kChannel + 0x10u), kDestination + 32u,
+                     "SPR_FROM should advance MADR");
+            t.Equals(mem.readIORegister(kChannel + 0x80u), 0x10u,
+                     "SPR_FROM should wrap and advance SADR");
+            t.Equals(mem.readIORegister(kChannel + 0x20u), 0u,
+                     "SPR_FROM should consume QWC");
+            t.IsTrue((mem.readIORegister(0x1000E010u) & (1u << 8u)) != 0u,
+                     "SPR_FROM should raise its D_STAT completion bit");
+
+            const std::vector<uint32_t> causes = mem.consumeCompletedDmacCauses();
+            t.Equals(causes.size(), static_cast<size_t>(1u),
+                     "SPR_FROM should queue one completion");
+            t.Equals(causes[0], 8u,
+                     "SPR_FROM should queue DMAC cause eight");
+        });
+
         tc.Run("GIF DMA can source from scratchpad", [](TestCase &t)
         {
             PS2Memory mem;

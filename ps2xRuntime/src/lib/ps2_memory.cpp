@@ -1144,6 +1144,12 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
             const uint32_t qwc = m_ioRegisters[channelBase + 0x20];
             m_dmaStartCount.fetch_add(1, std::memory_order_relaxed);
 
+            if (channelBase == 0x1000D000u || channelBase == 0x1000D400u)
+            {
+                (void)processScratchpadDma(channelBase);
+                return true;
+            }
+
             if ((channelBase == 0x1000A000u || channelBase == 0x10009000u || channelBase == 0x10008000u) &&
                 (m_gsVRAM || channelBase == 0x10008000u))
             {
@@ -1422,6 +1428,85 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
     return false;
 }
 
+bool PS2Memory::processScratchpadDma(uint32_t channelBase)
+{
+    constexpr uint32_t kFromScratchpadChannel = 0x1000D000u;
+    constexpr uint32_t kToScratchpadChannel = 0x1000D400u;
+
+    if (channelBase != kFromScratchpadChannel && channelBase != kToScratchpadChannel)
+    {
+        return false;
+    }
+
+    const uint32_t chcr = m_ioRegisters[channelBase + 0x00u];
+    const uint32_t mode = (chcr >> 2u) & 0x3u;
+    if (mode != 0u)
+    {
+        return false;
+    }
+
+    uint32_t madr = m_ioRegisters[channelBase + 0x10u] & 0x7FFFFFFFu;
+    const uint32_t qwc = m_ioRegisters[channelBase + 0x20u] & 0xFFFFu;
+    uint32_t sadr = m_ioRegisters[channelBase + 0x80u] & 0x3FF0u;
+    const bool toScratchpad = channelBase == kToScratchpadChannel;
+
+    try
+    {
+        for (uint32_t index = 0u; index < qwc; ++index)
+        {
+            const uint32_t scratchAddress = PS2_SCRATCHPAD_BASE + sadr;
+            if (toScratchpad)
+            {
+                write128(scratchAddress, read128(madr));
+            }
+            else
+            {
+                write128(madr, read128(scratchAddress));
+            }
+
+            madr = (madr + 16u) & 0x7FFFFFFFu;
+            sadr = (sadr + 16u) & (PS2_SCRATCHPAD_SIZE - 1u);
+        }
+    }
+    catch (const std::exception &error)
+    {
+        PS2_IF_AGRESSIVE_LOGS({
+            RUNTIME_LOG("[dmac:scratchpad] transfer failed channel=0x" << std::hex
+                        << channelBase << " madr=0x" << madr
+                        << " sadr=0x" << sadr << " qwc=0x" << qwc
+                        << std::dec << " error=" << error.what() << std::endl);
+        });
+        return false;
+    }
+
+    m_ioRegisters[channelBase + 0x10u] = madr;
+    m_ioRegisters[channelBase + 0x80u] = sadr;
+    completeDmaChannel(channelBase, toScratchpad ? 9u : 8u);
+    return true;
+}
+
+void PS2Memory::completeDmaChannel(uint32_t channelBase, uint32_t cause)
+{
+    constexpr uint32_t kDStat = 0x1000E010u;
+    m_ioRegisters[channelBase + 0x00u] &= ~0x100u;
+    m_ioRegisters[channelBase + 0x20u] = 0u;
+
+    uint32_t dstat = m_ioRegisters.count(kDStat) ? m_ioRegisters[kDStat] : 0u;
+    dstat |= (1u << cause);
+    const uint32_t status = dstat & 0x3FFu;
+    const uint32_t mask = (dstat >> 16u) & 0x3FFu;
+    if ((status & mask) != 0u)
+    {
+        dstat |= (1u << 31u);
+    }
+    else
+    {
+        dstat &= ~(1u << 31u);
+    }
+    m_ioRegisters[kDStat] = dstat;
+    queueCompletedDmacCause(cause);
+}
+
 void PS2Memory::processPendingTransfers()
 {
     const bool hadGif = !m_pendingGifTransfers.empty();
@@ -1611,43 +1696,18 @@ void PS2Memory::processPendingTransfers()
     static constexpr uint32_t GIF_CHANNEL = 0x1000A000;
     static constexpr uint32_t VIF0_CHANNEL = 0x10008000;
     static constexpr uint32_t VIF1_CHANNEL = 0x10009000;
-    static constexpr uint32_t D_STAT = 0x1000E010u;
-
-    auto raiseDStatChannel = [&](uint32_t channelBit)
-    {
-        uint32_t dstat = m_ioRegisters.count(D_STAT) ? m_ioRegisters[D_STAT] : 0u;
-        dstat |= (1u << channelBit);
-
-        const uint32_t status = dstat & 0x3FFu;
-        const uint32_t mask = (dstat >> 16) & 0x3FFu;
-        if ((status & mask) != 0u)
-            dstat |= (1u << 31);
-        else
-            dstat &= ~(1u << 31);
-
-        m_ioRegisters[D_STAT] = dstat;
-    };
 
     if (hadGif)
     {
-        raiseDStatChannel(2u); // GIF channel
-        queueCompletedDmacCause(2u);
-        m_ioRegisters[GIF_CHANNEL + 0x00] &= ~0x100u;
-        m_ioRegisters[GIF_CHANNEL + 0x20] = 0;
+        completeDmaChannel(GIF_CHANNEL, 2u);
     }
     if (hadVif0)
     {
-        raiseDStatChannel(0u); // VIF0 channel
-        queueCompletedDmacCause(0u);
-        m_ioRegisters[VIF0_CHANNEL + 0x00] &= ~0x100u;
-        m_ioRegisters[VIF0_CHANNEL + 0x20] = 0;
+        completeDmaChannel(VIF0_CHANNEL, 0u);
     }
     if (hadVif1)
     {
-        raiseDStatChannel(1u); // VIF1 channel
-        queueCompletedDmacCause(1u);
-        m_ioRegisters[VIF1_CHANNEL + 0x00] &= ~0x100u;
-        m_ioRegisters[VIF1_CHANNEL + 0x20] = 0;
+        completeDmaChannel(VIF1_CHANNEL, 1u);
     }
 }
 
