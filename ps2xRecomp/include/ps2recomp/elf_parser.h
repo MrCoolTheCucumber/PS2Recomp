@@ -1,6 +1,7 @@
 #ifndef PS2RECOMP_ELF_PARSER_H
 #define PS2RECOMP_ELF_PARSER_H
 
+#include <cstdint>
 #include <elfio/elfio.hpp>
 #include <string>
 #include <vector>
@@ -24,6 +25,8 @@ namespace ps2recomp
                 bool parse();
 
                 bool loadGhidraFunctionMap(const std::string &mapPath);
+                bool addFunctionBoundary(const Function &function);
+                size_t recoverLeafFunctionsInExecutableGaps();
                 std::vector<Function> extractFunctions() const;
                 std::vector<Function> extractExtraFunctions() const;
                 std::vector<Symbol> extractSymbols();

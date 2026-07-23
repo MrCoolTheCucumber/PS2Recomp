@@ -805,6 +805,35 @@ namespace ps2recomp
                 m_elfParser->loadGhidraFunctionMap(m_config.ghidraMapPath);
             }
 
+            for (const Function &boundary : m_config.functionBoundaries)
+            {
+                if (!m_elfParser->addFunctionBoundary(boundary))
+                {
+                    std::ostringstream msg;
+                    msg << "Configured function boundary '" << boundary.name
+                        << "' has an invalid executable range [0x" << std::hex
+                        << boundary.start << ", 0x" << boundary.end << ").";
+                    m_reporter.error("config", msg.str());
+                    return false;
+                }
+            }
+            if (!m_config.functionBoundaries.empty())
+            {
+                m_reporter.info(
+                    "config",
+                    "Loaded " + std::to_string(m_config.functionBoundaries.size()) +
+                        " configured function boundary/boundaries.");
+            }
+
+            if (m_config.recoverLeafFunctions)
+            {
+                const size_t recovered = m_elfParser->recoverLeafFunctionsInExecutableGaps();
+                m_reporter.info(
+                    "function-recovery",
+                    "Recovered " + std::to_string(recovered) +
+                        " control-flow-closed leaf function(s) from executable gaps.");
+            }
+
             m_functions = m_elfParser->extractFunctions();
             m_symbols = m_elfParser->extractSymbols();
             m_sections = m_elfParser->getSections();

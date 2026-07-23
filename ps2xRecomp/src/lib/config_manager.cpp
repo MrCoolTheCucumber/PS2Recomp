@@ -8,9 +8,39 @@
 #include <algorithm>
 #include <limits>
 #include <thread>
+#include <utility>
 
 namespace ps2recomp
 {
+    namespace
+    {
+        bool parseAddress(const toml::value &value, uint32_t &address)
+        {
+            if (value.is_string())
+            {
+                const unsigned long parsed = std::stoul(value.as_string(), nullptr, 0);
+                if (parsed > std::numeric_limits<uint32_t>::max())
+                {
+                    return false;
+                }
+                address = static_cast<uint32_t>(parsed);
+                return true;
+            }
+            if (value.is_integer())
+            {
+                const int64_t parsed = value.as_integer();
+                if (parsed < 0 ||
+                    static_cast<uint64_t>(parsed) >
+                        std::numeric_limits<uint32_t>::max())
+                {
+                    return false;
+                }
+                address = static_cast<uint32_t>(parsed);
+                return true;
+            }
+            return false;
+        }
+    }
 
     ConfigManager::ConfigManager(const std::string &configPath)
         : m_configPath(configPath)
@@ -64,6 +94,8 @@ namespace ps2recomp
             config.patchSyscalls = toml::find_or<bool>(general, "patch_syscalls", config.patchSyscalls);
             config.patchCop0 = toml::find_or<bool>(general, "patch_cop0", config.patchCop0);
             config.patchCache = toml::find_or<bool>(general, "patch_cache", config.patchCache);
+            config.recoverLeafFunctions = toml::find_or<bool>(
+                general, "recover_leaf_functions", config.recoverLeafFunctions);
 
             if (general.contains("stubs") && general.at("stubs").is_array())
             {
@@ -247,6 +279,53 @@ namespace ps2recomp
                     }
                 }
             }
+
+            if (data.contains("functions") && data.at("functions").is_table())
+            {
+                const auto &functionsNode = data.at("functions");
+                if (functionsNode.contains("boundary") &&
+                    functionsNode.at("boundary").is_array())
+                {
+                    const auto &boundaries = functionsNode.at("boundary").as_array();
+                    for (size_t index = 0u; index < boundaries.size(); ++index)
+                    {
+                        const auto &boundaryNode = boundaries[index];
+                        if (!boundaryNode.is_table() ||
+                            !boundaryNode.contains("address") ||
+                            !boundaryNode.contains("end"))
+                        {
+                            throw std::runtime_error(
+                                "Configured function boundary " +
+                                std::to_string(index) +
+                                " must contain address and end fields.");
+                        }
+
+                        Function boundary{};
+                        if (!parseAddress(boundaryNode.at("address"), boundary.start) ||
+                            !parseAddress(boundaryNode.at("end"), boundary.end) ||
+                            boundary.start == 0u ||
+                            boundary.end <= boundary.start ||
+                            (boundary.start & 3u) != 0u ||
+                            (boundary.end & 3u) != 0u)
+                        {
+                            throw std::runtime_error(
+                                "Configured function boundary " +
+                                std::to_string(index) +
+                                " has an invalid or unaligned range.");
+                        }
+
+                        boundary.name = toml::find_or<std::string>(
+                            boundaryNode, "name", "");
+                        if (boundary.name.empty())
+                        {
+                            std::ostringstream name;
+                            name << "configured_entry_" << std::hex << boundary.start;
+                            boundary.name = name.str();
+                        }
+                        config.functionBoundaries.push_back(std::move(boundary));
+                    }
+                }
+            }
         }
         catch (const std::exception &e)
         {
@@ -274,6 +353,7 @@ namespace ps2recomp
         general["patch_syscalls"] = config.patchSyscalls;
         general["patch_cop0"] = config.patchCop0;
         general["patch_cache"] = config.patchCache;
+        general["recover_leaf_functions"] = config.recoverLeafFunctions;
         general["skip"] = config.skipFunctions;
         general["stubs"] = config.stubImplementations;
         data["general"] = general;
@@ -319,6 +399,26 @@ namespace ps2recomp
             }
             jumpTables["table"] = tableArray;
             data["jump_tables"] = jumpTables;
+        }
+
+        if (!config.functionBoundaries.empty())
+        {
+            toml::table functions;
+            toml::array boundaries;
+            for (const Function &boundary : config.functionBoundaries)
+            {
+                toml::table node;
+                std::ostringstream address;
+                address << "0x" << std::hex << boundary.start;
+                std::ostringstream end;
+                end << "0x" << std::hex << boundary.end;
+                node["address"] = address.str();
+                node["end"] = end.str();
+                node["name"] = boundary.name;
+                boundaries.push_back(node);
+            }
+            functions["boundary"] = boundaries;
+            data["functions"] = functions;
         }
 
         toml::table patches;

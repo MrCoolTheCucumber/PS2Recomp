@@ -1,4 +1,5 @@
 #include "ps2recomp/elf_parser.h"
+#include "ps2recomp/r5900_decoder.h"
 #include "ps2recomp/recompiler_reporter.h"
 #include "ps2recomp/types.h"
 #include <iostream>
@@ -22,6 +23,8 @@
 #include <sstream>
 #include <algorithm>
 #include <cstring>
+#include <limits>
+#include <optional>
 
 namespace
 {
@@ -531,6 +534,199 @@ namespace
             outFunctions.push_back(std::move(func));
         }
     }
+
+    bool ReadSectionWord(const ps2recomp::Section &section, uint32_t address, uint32_t &raw)
+    {
+        if (!section.data || address < section.address)
+        {
+            return false;
+        }
+
+        const uint64_t offset =
+            static_cast<uint64_t>(address) - static_cast<uint64_t>(section.address);
+        if (offset + sizeof(uint32_t) > section.size)
+        {
+            return false;
+        }
+
+        std::memcpy(&raw, section.data + offset, sizeof(raw));
+        return true;
+    }
+
+    std::optional<uint32_t> RecoverClosedLeafFunction(
+        const ps2recomp::Section &section,
+        uint32_t start,
+        uint32_t gapEnd)
+    {
+        constexpr size_t kMaxInstructions = 1024u;
+
+        if ((start & 3u) != 0u || start >= gapEnd)
+        {
+            return std::nullopt;
+        }
+
+        ps2recomp::R5900Decoder decoder;
+        std::vector<uint32_t> pending{start};
+        std::unordered_set<uint32_t> visited;
+        visited.reserve(64u);
+        uint32_t reachableEnd = start;
+        bool sawReturn = false;
+
+        auto includeInstruction = [&](uint32_t address) -> bool
+        {
+            if (address < start || address >= gapEnd || (address & 3u) != 0u ||
+                address > (std::numeric_limits<uint32_t>::max() - 4u))
+            {
+                return false;
+            }
+
+            uint32_t raw = 0u;
+            if (!ReadSectionWord(section, address, raw))
+            {
+                return false;
+            }
+
+            visited.insert(address);
+            reachableEnd = std::max(reachableEnd, address + 4u);
+            return true;
+        };
+
+        auto includeDelaySlot = [&](const ps2recomp::Instruction &instruction) -> bool
+        {
+            if (!instruction.hasDelaySlot)
+            {
+                return true;
+            }
+            if (instruction.address > (std::numeric_limits<uint32_t>::max() - 4u))
+            {
+                return false;
+            }
+            return includeInstruction(instruction.address + 4u);
+        };
+
+        auto queueSuccessor = [&](uint32_t address) -> bool
+        {
+            if (address < start || address >= gapEnd || (address & 3u) != 0u)
+            {
+                return false;
+            }
+            if (!visited.contains(address))
+            {
+                pending.push_back(address);
+            }
+            return true;
+        };
+
+        while (!pending.empty())
+        {
+            const uint32_t address = pending.back();
+            pending.pop_back();
+            if (visited.contains(address))
+            {
+                continue;
+            }
+            if (visited.size() >= kMaxInstructions)
+            {
+                return std::nullopt;
+            }
+
+            uint32_t raw = 0u;
+            if (!ReadSectionWord(section, address, raw) || !includeInstruction(address))
+            {
+                return std::nullopt;
+            }
+
+            const ps2recomp::Instruction instruction =
+                decoder.decodeInstruction(address, raw, false);
+            const bool isJr = instruction.opcode == ps2recomp::OPCODE_SPECIAL &&
+                              instruction.function == ps2recomp::SPECIAL_JR;
+            const bool isJalr = instruction.opcode == ps2recomp::OPCODE_SPECIAL &&
+                                instruction.function == ps2recomp::SPECIAL_JALR;
+
+            if (isJr && instruction.rs == 31u)
+            {
+                if (!includeDelaySlot(instruction))
+                {
+                    return std::nullopt;
+                }
+                sawReturn = true;
+                continue;
+            }
+
+            // This pass deliberately recovers only leaf functions with closed,
+            // statically-known control flow. Calls and register jumps need stronger
+            // evidence than adjacency in an executable gap.
+            if (instruction.isCall || isJr || isJalr || instruction.isReturn)
+            {
+                return std::nullopt;
+            }
+
+            if (instruction.opcode == ps2recomp::OPCODE_J)
+            {
+                if (!includeDelaySlot(instruction) ||
+                    !queueSuccessor(decoder.getJumpTarget(instruction)))
+                {
+                    return std::nullopt;
+                }
+                continue;
+            }
+
+            if (instruction.isJump)
+            {
+                return std::nullopt;
+            }
+
+            if (instruction.isBranch)
+            {
+                if (!includeDelaySlot(instruction) ||
+                    !queueSuccessor(decoder.getBranchTarget(instruction)))
+                {
+                    return std::nullopt;
+                }
+
+                const bool unconditionalBeq =
+                    instruction.opcode == ps2recomp::OPCODE_BEQ &&
+                    instruction.rs == 0u && instruction.rt == 0u;
+                if (!unconditionalBeq)
+                {
+                    if (instruction.address > (std::numeric_limits<uint32_t>::max() - 8u) ||
+                        !queueSuccessor(instruction.address + 8u))
+                    {
+                        return std::nullopt;
+                    }
+                }
+                continue;
+            }
+
+            if (address > (std::numeric_limits<uint32_t>::max() - 4u) ||
+                !queueSuccessor(address + 4u))
+            {
+                return std::nullopt;
+            }
+        }
+
+        if (!sawReturn || reachableEnd <= start)
+        {
+            return std::nullopt;
+        }
+
+        // Permit alignment NOPs inside the recovered range, but reject hidden
+        // non-zero islands that recursive traversal could not reach.
+        for (uint32_t address = start; address < reachableEnd; address += 4u)
+        {
+            if (visited.contains(address))
+            {
+                continue;
+            }
+            uint32_t raw = 0u;
+            if (!ReadSectionWord(section, address, raw) || raw != 0u)
+            {
+                return std::nullopt;
+            }
+        }
+
+        return reachableEnd;
+    }
 }
 
 namespace ps2recomp
@@ -803,6 +999,154 @@ namespace ps2recomp
         }
 
         return functions;
+    }
+
+    bool ElfParser::addFunctionBoundary(const Function &function)
+    {
+        const Section *section = FindFunctionSectionByAddress(m_sections, function.start);
+        if (!section ||
+            function.name.empty() ||
+            function.start == 0u ||
+            function.end <= function.start ||
+            (function.start & 3u) != 0u ||
+            (function.end & 3u) != 0u)
+        {
+            return false;
+        }
+
+        const uint64_t sectionEnd =
+            static_cast<uint64_t>(section->address) + static_cast<uint64_t>(section->size);
+        if (static_cast<uint64_t>(function.end) > sectionEnd)
+        {
+            return false;
+        }
+
+        m_extraFunctions.push_back(function);
+        return true;
+    }
+
+    size_t ElfParser::recoverLeafFunctionsInExecutableGaps()
+    {
+        constexpr uint32_t kMaximumGapSize = 0x10000u;
+        constexpr size_t kMaximumPaddingWords = 16u;
+
+        std::unordered_set<uint32_t> existingStarts;
+        existingStarts.reserve(m_extraFunctions.size());
+        for (const Function &function : m_extraFunctions)
+        {
+            existingStarts.insert(function.start);
+        }
+
+        std::vector<Function> recovered;
+        for (const Section &section : m_sections)
+        {
+            if (!section.isCode || !section.data || section.size < 8u)
+            {
+                continue;
+            }
+
+            std::vector<Function> authoritative;
+            for (const Function &function : m_extraFunctions)
+            {
+                const bool fromGhidraMap =
+                    m_hasLoadedGhidraMap && m_ghidraMapStarts.contains(function.start);
+                const bool hasAuthoritativeName = !IsAutoGeneratedName(function.name);
+                if ((!fromGhidraMap && !hasAuthoritativeName) ||
+                    function.end <= function.start ||
+                    function.start < section.address)
+                {
+                    continue;
+                }
+
+                const uint64_t sectionEnd =
+                    static_cast<uint64_t>(section.address) + section.size;
+                if (static_cast<uint64_t>(function.start) >= sectionEnd ||
+                    static_cast<uint64_t>(function.end) > sectionEnd)
+                {
+                    continue;
+                }
+                authoritative.push_back(function);
+            }
+
+            std::sort(authoritative.begin(), authoritative.end(),
+                      [](const Function &a, const Function &b)
+                      {
+                          if (a.start != b.start)
+                          {
+                              return a.start < b.start;
+                          }
+                          return a.end > b.end;
+                      });
+            if (authoritative.size() < 2u)
+            {
+                continue;
+            }
+
+            uint32_t coveredEnd = authoritative.front().end;
+            for (size_t index = 1u; index < authoritative.size(); ++index)
+            {
+                const Function &next = authoritative[index];
+                if (next.start > coveredEnd)
+                {
+                    const uint32_t gapStart = coveredEnd;
+                    const uint32_t gapEnd = next.start;
+                    if (gapEnd - gapStart <= kMaximumGapSize)
+                    {
+                        uint32_t cursor = gapStart;
+                        while (cursor < gapEnd)
+                        {
+                            size_t paddingWords = 0u;
+                            uint32_t raw = 0u;
+                            while (cursor < gapEnd &&
+                                   paddingWords < kMaximumPaddingWords &&
+                                   ReadSectionWord(section, cursor, raw) && raw == 0u)
+                            {
+                                cursor += 4u;
+                                ++paddingWords;
+                            }
+
+                            if (cursor >= gapEnd || existingStarts.contains(cursor))
+                            {
+                                break;
+                            }
+
+                            const std::optional<uint32_t> end =
+                                RecoverClosedLeafFunction(section, cursor, gapEnd);
+                            if (!end.has_value() || *end <= cursor)
+                            {
+                                break;
+                            }
+
+                            Function function{};
+                            function.name = MakeAutoFunctionName(cursor);
+                            function.start = cursor;
+                            function.end = *end;
+                            function.isRecompiled = false;
+                            function.isStub = false;
+                            function.isSkipped = false;
+                            recovered.push_back(function);
+                            existingStarts.insert(cursor);
+                            cursor = *end;
+                        }
+                    }
+                }
+
+                coveredEnd = std::max(coveredEnd, next.end);
+            }
+        }
+
+        m_extraFunctions.insert(
+            m_extraFunctions.end(), recovered.begin(), recovered.end());
+        std::sort(m_extraFunctions.begin(), m_extraFunctions.end(),
+                  [](const Function &a, const Function &b)
+                  {
+                      if (a.start != b.start)
+                      {
+                          return a.start < b.start;
+                      }
+                      return a.end < b.end;
+                  });
+        return recovered.size();
     }
 
     std::vector<Symbol> ElfParser::extractSymbols()

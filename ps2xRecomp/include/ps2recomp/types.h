@@ -184,11 +184,13 @@ namespace ps2recomp
         bool patchSyscalls = false;
         bool patchCop0 = true;
         bool patchCache = true;
+        bool recoverLeafFunctions = false;
         std::vector<std::string> skipFunctions;
         std::unordered_map<uint32_t, std::string> patches;
         std::vector<std::string> stubImplementations;
         std::unordered_map<uint32_t, uint32_t> mmioByInstructionAddress;
         std::vector<JumpTable> jumpTables;
+        std::vector<Function> functionBoundaries;
     };
 
 } // namespace ps2recomp

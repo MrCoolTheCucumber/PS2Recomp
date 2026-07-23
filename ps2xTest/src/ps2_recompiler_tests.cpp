@@ -155,6 +155,57 @@ static bool writeMinimalMipsElfWithJalFallbackTarget(const std::filesystem::path
     return writer.save(elfPath.string());
 }
 
+static bool writeMinimalMipsElfWithRecoverableLeafGap(const std::filesystem::path &elfPath)
+{
+    ELFIO::elfio writer;
+    writer.create(ELFIO::ELFCLASS32, ELFIO::ELFDATA2LSB);
+    writer.set_os_abi(ELFIO::ELFOSABI_NONE);
+    writer.set_type(ELFIO::ET_EXEC);
+    writer.set_machine(ELFIO::EM_MIPS);
+    writer.set_entry(0x00100000u);
+
+    ELFIO::section *text = writer.sections.add(".text");
+    text->set_type(ELFIO::SHT_PROGBITS);
+    text->set_flags(ELFIO::SHF_ALLOC | ELFIO::SHF_EXECINSTR);
+    text->set_addr_align(4);
+    text->set_address(0x00100000u);
+
+    const std::array<uint32_t, 22> textWords = {
+        0x03E00008u, // known function A: jr $ra
+        0x00000000u, // delay slot
+        0x24020001u, // hidden leaf 1: addiu $v0, $zero, 1
+        0x03E00008u, // jr $ra
+        0x00000000u, // delay slot
+        0x00000000u, // alignment padding
+        0x10800005u, // hidden leaf 2: beqz $a0, second return
+        0x00000000u, // delay slot
+        0x24020002u, // addiu $v0, $zero, 2
+        0x03E00008u, // first return
+        0x00000000u, // delay slot
+        0x00000000u, // unreachable alignment padding
+        0x03E00008u, // second return
+        0x00000000u, // delay slot
+        0x24020003u, // hidden leaf 3: addiu $v0, $zero, 3
+        0x03E00008u, // jr $ra
+        0x00000000u, // delay slot
+        0x00000000u, // alignment padding
+        0x27BD0010u, // unterminated island: must not be recovered
+        0x00000000u,
+        0x03E00008u, // known function B: jr $ra
+        0x00000000u  // delay slot
+    };
+    text->set_data(reinterpret_cast<const char *>(textWords.data()),
+                   static_cast<ELFIO::Elf_Word>(textWords.size() * sizeof(uint32_t)));
+
+    ELFIO::segment *textSegment = writer.segments.add();
+    textSegment->set_type(ELFIO::PT_LOAD);
+    textSegment->set_flags(ELFIO::PF_R | ELFIO::PF_X);
+    textSegment->set_align(0x1000);
+    textSegment->add_section_index(text->get_index(), text->get_addr_align());
+
+    return writer.save(elfPath.string());
+}
+
 void register_ps2_recompiler_tests()
 {
     MiniTest::Case("PS2Recompiler", [](TestCase &tc)
@@ -707,6 +758,12 @@ void register_ps2_recompiler_tests()
             configFile << "[general]\n";
             configFile << "input = \"dummy.elf\"\n";
             configFile << "output = \"out\"\n\n";
+            configFile << "recover_leaf_functions = true\n\n";
+            configFile << "[functions]\n";
+            configFile << "[[functions.boundary]]\n";
+            configFile << "address = \"0x1700\"\n";
+            configFile << "end = \"0x1740\"\n";
+            configFile << "name = \"verified_indirect_target\"\n\n";
             configFile << "[jump_tables]\n";
             configFile << "[[jump_tables.table]]\n";
             configFile << "address = \"0x200000\"\n";
@@ -719,6 +776,19 @@ void register_ps2_recompiler_tests()
 
             ConfigManager manager(configPath.string());
             RecompilerConfig config = manager.loadConfig();
+
+            t.IsTrue(config.recoverLeafFunctions,
+                     "leaf-function recovery option should parse");
+            t.Equals(config.functionBoundaries.size(), static_cast<size_t>(1),
+                     "one configured function boundary should be loaded");
+            if (!config.functionBoundaries.empty())
+            {
+                const Function &boundary = config.functionBoundaries.front();
+                t.Equals(boundary.start, 0x1700u, "function start should parse from hex string");
+                t.Equals(boundary.end, 0x1740u, "function end should parse from hex string");
+                t.Equals(boundary.name, std::string("verified_indirect_target"),
+                         "function name should parse");
+            }
 
             t.Equals(config.jumpTables.size(), static_cast<size_t>(1),
                      "one configured jump table should be loaded");
@@ -765,15 +835,37 @@ void register_ps2_recompiler_tests()
                 return;
             }
 
+            Function configuredCodeBoundary{};
+            configuredCodeBoundary.name = "configured_text_entry";
+            configuredCodeBoundary.start = 0x00100000u;
+            configuredCodeBoundary.end = 0x00100008u;
+            t.IsTrue(parser.addFunctionBoundary(configuredCodeBoundary),
+                     "configured executable boundary should be accepted");
+
+            Function configuredDataBoundary{};
+            configuredDataBoundary.name = "configured_data_entry";
+            configuredDataBoundary.start = 0x00200000u;
+            configuredDataBoundary.end = 0x00200008u;
+            t.IsFalse(parser.addFunctionBoundary(configuredDataBoundary),
+                      "configured non-executable boundary should be rejected");
+
             const auto functions = parser.extractFunctions();
-            const bool hasCodeFunction = std::any_of(functions.begin(), functions.end(),
-                                                     [](const Function &fn)
-                                                     { return fn.start == 0x00100000u; });
+            const auto codeFunction = std::find_if(functions.begin(), functions.end(),
+                                                   [](const Function &fn)
+                                                   { return fn.start == 0x00100000u; });
             const bool hasDataFunction = std::any_of(functions.begin(), functions.end(),
                                                      [](const Function &fn)
                                                      { return fn.start == 0x00200000u; });
 
-            t.IsTrue(hasCodeFunction, "function in executable section should be retained");
+            t.IsTrue(codeFunction != functions.end(),
+                     "function in executable section should be retained");
+            if (codeFunction != functions.end())
+            {
+                t.Equals(codeFunction->name, std::string("code_func"),
+                         "an existing authoritative symbol name should be preserved");
+                t.Equals(codeFunction->end, 0x00100008u,
+                         "configured end should remain authoritative");
+            }
             t.IsFalse(hasDataFunction, "STT_FUNC symbol in .data must be ignored");
 
             std::error_code removeError;
@@ -847,6 +939,85 @@ void register_ps2_recompiler_tests()
                 { return fn.start == 0x00100010u; });
             t.IsFalse(stillHasFallbackOnlyStart,
                       "fallback-only function starts should be removed once ghidra map is loaded");
+
+            std::error_code removeError;
+            std::filesystem::remove(elfPath, removeError);
+            std::filesystem::remove(mapPath, removeError);
+        });
+
+        tc.Run("leaf recovery finds only closed functions in authoritative executable gaps", [](TestCase &t) {
+            const auto uniqueSuffix = std::to_string(
+                static_cast<unsigned long long>(std::chrono::steady_clock::now().time_since_epoch().count()));
+            const std::filesystem::path elfPath =
+                std::filesystem::temp_directory_path() / ("ps2recomp-leaf-gap-" + uniqueSuffix + ".elf");
+            const std::filesystem::path mapPath =
+                std::filesystem::temp_directory_path() / ("ps2recomp-leaf-gap-" + uniqueSuffix + ".csv");
+
+            const bool writeOk = writeMinimalMipsElfWithRecoverableLeafGap(elfPath);
+            t.IsTrue(writeOk, "temporary ELF should be generated");
+            if (!writeOk)
+            {
+                return;
+            }
+
+            ElfParser parser(elfPath.string());
+            const bool parseOk = parser.parse();
+            t.IsTrue(parseOk, "generated ELF should parse");
+            if (!parseOk)
+            {
+                std::error_code removeError;
+                std::filesystem::remove(elfPath, removeError);
+                return;
+            }
+
+            std::ofstream mapFile(mapPath);
+            t.IsTrue(static_cast<bool>(mapFile), "Ghidra map fixture should be writable");
+            if (!mapFile)
+            {
+                std::error_code removeError;
+                std::filesystem::remove(elfPath, removeError);
+                return;
+            }
+            mapFile << "name,start,end,size\n";
+            mapFile << "known_a,0x00100000,0x00100008,0x8\n";
+            mapFile << "known_b,0x00100050,0x00100058,0x8\n";
+            mapFile.close();
+
+            t.IsTrue(parser.loadGhidraFunctionMap(mapPath.string()),
+                     "Ghidra map should load");
+            t.Equals(parser.recoverLeafFunctionsInExecutableGaps(), static_cast<size_t>(3),
+                     "three closed leaf functions should be recovered");
+
+            const auto functions = parser.extractFunctions();
+            auto findFunction = [&](uint32_t start) -> const Function *
+            {
+                const auto it = std::find_if(
+                    functions.begin(), functions.end(),
+                    [&](const Function &function)
+                    { return function.start == start; });
+                return it == functions.end() ? nullptr : &(*it);
+            };
+
+            const Function *leaf1 = findFunction(0x00100008u);
+            const Function *leaf2 = findFunction(0x00100018u);
+            const Function *leaf3 = findFunction(0x00100038u);
+            t.IsNotNull(leaf1, "first leaf should be recovered after the known function");
+            t.IsNotNull(leaf2, "branched leaf should be recovered after alignment padding");
+            t.IsNotNull(leaf3, "third leaf should be recovered after the branched leaf");
+            if (leaf1)
+            {
+                t.Equals(leaf1->end, 0x00100014u, "first leaf should end after its return delay slot");
+            }
+            if (leaf2)
+            {
+                t.Equals(leaf2->end, 0x00100038u, "branched leaf should cover both return paths");
+            }
+            if (leaf3)
+            {
+                t.Equals(leaf3->end, 0x00100044u, "third leaf should end after its return delay slot");
+            }
+            t.IsNull(findFunction(0x00100048u),
+                     "unterminated code before the next known function must not be recovered");
 
             std::error_code removeError;
             std::filesystem::remove(elfPath, removeError);
