@@ -1029,8 +1029,22 @@ void PS2Runtime::configureIoPathsFromElf(const std::string &elfPath)
 
 namespace
 {
+    uint32_t normalizeGuestFunctionAddress(uint32_t address)
+    {
+        if (Ps2IsUncachedRamMirrorAddress(address))
+        {
+            return address & PS2_RAM_MASK;
+        }
+        if (Ps2IsKseg01Address(address))
+        {
+            return Ps2DirectMappedPhysicalAddress(address);
+        }
+        return address;
+    }
+
     bool generatedFunctionTableSlot(uint32_t address, uint32_t &slot)
     {
+        address = normalizeGuestFunctionAddress(address);
         if ((address & 3u) != 0u || g_ps2RecompiledFunctionTableSlotCount == 0u)
         {
             return false;
@@ -1097,12 +1111,29 @@ PS2Runtime::RecompiledFunction PS2Runtime::lookupFunction(uint32_t address)
 {
     pushDispatchPc(address);
 
+    const uint32_t normalizedAddress = normalizeGuestFunctionAddress(address);
     uint32_t slot = 0u;
-    if (generatedFunctionTableSlot(address, slot))
+    if (generatedFunctionTableSlot(normalizedAddress, slot))
     {
         RecompiledFunction fn = g_ps2RecompiledFunctionTable[slot];
         if (fn != nullptr)
         {
+            if (normalizedAddress != address)
+            {
+                static RecompiledFunction directMappedAlias =
+                    [](uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+                {
+                    if (!ctx || !runtime)
+                    {
+                        return;
+                    }
+
+                    ctx->pc = normalizeGuestFunctionAddress(ctx->pc);
+                    RecompiledFunction target = runtime->lookupFunction(ctx->pc);
+                    target(rdram, ctx, runtime);
+                };
+                return directMappedAlias;
+            }
             return fn;
         }
     }
@@ -1270,6 +1301,7 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
                                      GuestBranchKind kind,
                                      const char *debugName)
 {
+    targetPc = normalizeGuestFunctionAddress(targetPc);
     ctx->pc = targetPc;
     const bool isCall = (kind == GuestBranchKind::DirectCall || kind == GuestBranchKind::IndirectCall);
 
@@ -1938,7 +1970,8 @@ void PS2Runtime::dispatchLoop(uint8_t *rdram, R5900Context *ctx)
 
     while (!isStopRequested())
     {
-        const uint32_t pc = ctx->pc;
+        const uint32_t pc = normalizeGuestFunctionAddress(ctx->pc);
+        ctx->pc = pc;
 
         if (pc == lastPc)
         {

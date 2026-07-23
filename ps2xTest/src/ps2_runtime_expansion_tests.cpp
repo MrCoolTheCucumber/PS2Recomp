@@ -672,6 +672,41 @@ void register_ps2_runtime_expansion_tests()
                      "missing exact final-function target should request runtime stop");
         });
 
+        tc.Run("function dispatch resolves direct-mapped EE code aliases", [](TestCase &t)
+        {
+            PS2Runtime runtime;
+            runtime.registerFunction(0x3000u, &testGuestBranchImplicitReturnHandler);
+
+            t.IsTrue(runtime.hasFunction(0x80003000u),
+                     "KSEG0 aliases should resolve registered physical functions");
+            t.IsTrue(runtime.hasFunction(0xA0003000u),
+                     "KSEG1 aliases should resolve registered physical functions");
+            t.IsTrue(runtime.hasFunction(0x20003000u),
+                     "the EE uncached RAM mirror should resolve registered physical functions");
+
+            R5900Context lookupCtx{};
+            lookupCtx.pc = 0xA0003000u;
+            auto fn = runtime.lookupFunction(lookupCtx.pc);
+            fn(nullptr, &lookupCtx, &runtime);
+            t.Equals(lookupCtx.pc, 0x3000u,
+                     "alias lookup should present the physical PC to generated code");
+
+            R5900Context branchCtx{};
+            branchCtx.pc = 0x2000u;
+            const bool returnedToFallthrough = runtime.dispatchGuestBranch(
+                nullptr,
+                &branchCtx,
+                0x80003000u,
+                0x2000u,
+                0x2008u,
+                PS2Runtime::GuestBranchKind::IndirectCall,
+                "KSEG0 test call");
+            t.IsTrue(returnedToFallthrough,
+                     "an aliased call target should retain ordinary call-return semantics");
+            t.Equals(branchCtx.pc, 0x2008u,
+                     "an unchanged aliased callee PC should normalize to the call fallthrough");
+        });
+
         tc.Run("dispatchGuestBranch call normalizes unchanged callee PC to fallthrough", [](TestCase &t)
         {
             PS2Runtime runtime;
