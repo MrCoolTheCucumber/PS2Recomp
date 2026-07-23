@@ -131,6 +131,20 @@ namespace
         throw std::runtime_error("Unable to determine executable path. Pass the guest ELF as argv[1] or define PS2X_DEFAULT_BOOT_ELF.");
 #endif
     }
+
+    void configureOptionalCdImage(int argc, char *argv[])
+    {
+        if (argc < 3 || !argv[2] || argv[2][0] == '\0')
+        {
+            return;
+        }
+
+        PS2Runtime::IoPaths ioPaths = PS2Runtime::getIoPaths();
+        ioPaths.cdImage = std::filesystem::path(argv[2]);
+        PS2Runtime::setIoPaths(ioPaths);
+        std::cout << "Using argv CD image path: "
+                  << PS2Runtime::getIoPaths().cdImage << std::endl;
+    }
 }
 
 int main(int argc, char *argv[])
@@ -143,6 +157,7 @@ int main(int argc, char *argv[])
     try
     {
         std::filesystem::path pathObj = getExecutablePath(argc, argv);
+        configureOptionalCdImage(argc, argv);
 
         std::string filePathStr = pathObj.string();
         std::string elfName = pathObj.filename().string();
