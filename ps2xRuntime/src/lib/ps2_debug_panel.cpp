@@ -248,8 +248,8 @@ namespace
             return "REGLIST";
         case GIF_FMT_IMAGE:
             return "IMAGE";
-        case GIF_FMT_DISABLED:
-            return "DISABLED";
+        case GIF_FMT_IMAGE2:
+            return "IMAGE2";
         default:
             return "?";
         }

@@ -837,6 +837,26 @@ void register_ps2_memory_tests()
             t.Equals(order[2], static_cast<uint8_t>(0x33u), "PATH3 should be drained third");
         });
 
+        tc.Run("GIF arbiter frames IMAGE2 like IMAGE", [](TestCase &t)
+        {
+            std::vector<std::vector<uint8_t>> captured;
+            GifArbiter arbiter([&](const uint8_t *data, uint32_t sizeBytes)
+            {
+                captured.emplace_back(data, data + sizeBytes);
+            });
+
+            std::vector<uint8_t> packet;
+            appendU64(packet, makeGifTag(1u, GIF_FMT_IMAGE2, 0u, true));
+            appendU64(packet, 0u);
+            packet.insert(packet.end(), 16u, 0x5Au);
+
+            arbiter.submit(GifPathId::Path3, packet.data(), static_cast<uint32_t>(packet.size()));
+            arbiter.drain();
+
+            t.Equals(captured.size(), static_cast<size_t>(1u), "IMAGE2 should drain as one complete packet");
+            t.Equals(captured[0].size(), packet.size(), "IMAGE2 payload should be included in packet size");
+        });
+
         tc.Run("VIF DIRECTHL stalls behind queued PATH3 IMAGE packets", [](TestCase &t)
         {
             PS2Memory mem;

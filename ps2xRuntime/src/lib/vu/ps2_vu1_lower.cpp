@@ -388,7 +388,7 @@ void VU1Interpreter::execLower(uint32_t instr, uint8_t *vuData, uint32_t dataSiz
                     if ((regs & 1u) != 0u)
                         pktSize += 8u;
                 }
-                else if (flg == 2u)
+                else if (flg == 2u || flg == 3u)
                 {
                     pktSize += nloop * 16u;
                 }
