@@ -1450,6 +1450,50 @@ void register_ps2_runtime_expansion_tests()
                      "sceSdRemote set-param calls should not trap or disturb the movie audio state");
         });
 
+        tc.Run("sceMpegGetPicture publishes libmpeg end-of-sequence state", [](TestCase &t)
+        {
+            std::vector<uint8_t> rdram(PS2_RAM_SIZE, 0u);
+            ps2_stubs::resetMpegStubState();
+
+            constexpr uint32_t kMpegAddr = 0x00123000u;
+            constexpr uint32_t kWorkAddr = 0x00140000u;
+            constexpr uint32_t kEndCodeAddr = 0x00150000u;
+            constexpr uint32_t kImageAddr = 0x00160000u;
+
+            R5900Context createCtx{};
+            setRegU32(createCtx, 4, kMpegAddr);
+            setRegU32(createCtx, 5, kWorkAddr);
+            setRegU32(createCtx, 6, 0x3000u);
+            ps2_stubs::sceMpegCreate(rdram.data(), &createCtx, nullptr);
+
+            const uint32_t innerAddr = Ps2FastRead32(rdram.data(), kMpegAddr + 0x40u);
+            t.IsTrue(innerAddr != 0u, "sceMpegCreate should publish its internal state address");
+            t.Equals(Ps2FastRead32(rdram.data(), innerAddr), 0u,
+                     "fresh libmpeg state should not report end");
+
+            const uint8_t programEnd[] = {0x00u, 0x00u, 0x01u, 0xB9u};
+            std::memcpy(rdram.data() + kEndCodeAddr, programEnd, sizeof(programEnd));
+
+            R5900Context demuxCtx{};
+            setRegU32(demuxCtx, 4, kMpegAddr);
+            setRegU32(demuxCtx, 5, kEndCodeAddr);
+            setRegU32(demuxCtx, 6, sizeof(programEnd));
+            setRegU32(demuxCtx, 7, kEndCodeAddr);
+            setRegU32(demuxCtx, 8, sizeof(programEnd));
+            ps2_stubs::sceMpegDemuxPssRing(rdram.data(), &demuxCtx, nullptr);
+
+            R5900Context pictureCtx{};
+            setRegU32(pictureCtx, 4, kMpegAddr);
+            setRegU32(pictureCtx, 5, kImageAddr);
+            setRegU32(pictureCtx, 6, 832u);
+            ps2_stubs::sceMpegGetPicture(rdram.data(), &pictureCtx, nullptr);
+
+            t.Equals(Ps2FastRead32(rdram.data(), innerAddr), 1u,
+                     "sceMpegGetPicture should publish sequence end through libmpeg state");
+            t.Equals(getRegS32(pictureCtx, 2), 1,
+                     "sceMpegGetPicture should report completed end-of-sequence processing");
+        });
+
         tc.Run("sceSdRemote isolates voice transfers from block streaming state", [](TestCase &t)
         {
             std::vector<uint8_t> rdram(PS2_RAM_SIZE, 0u);

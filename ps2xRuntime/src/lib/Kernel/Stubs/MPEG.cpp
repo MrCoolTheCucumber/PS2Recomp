@@ -1976,6 +1976,7 @@ namespace ps2_stubs
         uint32_t height = kStubMovieHeight;
         uint32_t frameCount = 0u;
         bool haveFrame = false;
+        bool endOfSequence = false;
         MpegDecodedFrame frame;
         {
             PS2Runtime::GuestExecutionReleaseScope releaseGuestExecution(runtime);
@@ -2122,6 +2123,8 @@ namespace ps2_stubs
                 height = playback.height;
                 frameCount = playback.picturesServed;
             }
+
+            endOfSequence = playback.streamEnded && playback.decodedFrames.empty();
         }
 
         mpegGuestWrite32(rdram, mpegAddr + 0x00u, width);
@@ -2133,6 +2136,9 @@ namespace ps2_stubs
             const uint32_t iVar1 = *reinterpret_cast<uint32_t *>(base + 0x40);
             if (uint8_t *inner = getMemPtr(rdram, iVar1))
             {
+                // sceMpegIsEnd reads this word directly. The original _getpic
+                // clears it while decoding and sets it when the sequence ends.
+                *reinterpret_cast<uint32_t *>(inner + 0x00) = endOfSequence ? 1u : 0u;
                 *reinterpret_cast<uint32_t *>(inner + 0xb0) = 1;
                 *reinterpret_cast<uint32_t *>(inner + 0xd8) = (getRegU32(ctx, 5) & 0x0FFFFFFFu) | 0x20000000u;
                 *reinterpret_cast<uint32_t *>(inner + 0xe4) = getRegU32(ctx, 6);
@@ -2150,7 +2156,7 @@ namespace ps2_stubs
             writeBlankMpegFrame(rdram, imageAddr, width, height);
         }
 
-        setReturnS32(ctx, 0);
+        setReturnS32(ctx, (haveFrame || endOfSequence) ? 1 : 0);
     }
 
     void sceMpegGetPictureRAW8(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
