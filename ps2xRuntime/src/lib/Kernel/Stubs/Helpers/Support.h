@@ -1788,15 +1788,11 @@ namespace
         return true;
     }
 
-    static bool writeGsDispEnv(uint8_t *rdram, uint32_t addr, uint64_t display, uint64_t dispfb)
+    static bool writeGsDispEnv(uint8_t *rdram, uint32_t addr, const GsDispEnvMem &env)
     {
         uint8_t *ptr = getMemPtr(rdram, addr);
         if (!ptr)
             return false;
-        GsDispEnvMem env{};
-        std::memcpy(&env, ptr, sizeof(env));
-        env.dispfb = dispfb;
-        env.display = display;
         std::memcpy(ptr, &env, sizeof(env));
         return true;
     }
@@ -1864,8 +1860,8 @@ namespace
         auto &regs = runtime->memory().gs();
         regs.pmode = env.pmode;
         regs.smode2 = env.smode2;
-        regs.dispfb1 = env.dispfb;
-        regs.display1 = env.display;
+        // Sony's sceGsDispEnv describes read circuit 2. Circuit 1 can be
+        // configured independently through privileged GS MMIO.
         regs.dispfb2 = env.dispfb;
         regs.display2 = env.display;
         regs.bgcolor = env.bgcolor;

@@ -1067,7 +1067,7 @@ namespace ps2_stubs
         }
 
         const uint32_t fbw = std::max<uint32_t>(1u, (w + 63u) / 64u);
-        const uint64_t pmode = makePmode(1u, 1u, 0u, 0u, 0u, 0x80u);
+        const uint64_t pmode = makePmode(0u, 1u, 0u, 0u, 0u, 0x80u);
         const uint64_t smode2 =
             (static_cast<uint64_t>(g_gparam.interlace & 0x1u) << 0) |
             (static_cast<uint64_t>(g_gparam.ffmode & 0x1u) << 1);
@@ -1138,7 +1138,7 @@ namespace ps2_stubs
         }
 
         const uint32_t fbw = std::max<uint32_t>(1u, (w + 63u) / 64u);
-        const uint64_t pmode = makePmode(1u, 1u, 0u, 0u, 0u, 0x80u);
+        const uint64_t pmode = makePmode(0u, 1u, 0u, 0u, 0u, 0x80u);
         const uint64_t smode2 =
             (static_cast<uint64_t>(g_gparam.interlace & 0x1u) << 0) |
             (static_cast<uint64_t>(g_gparam.ffmode & 0x1u) << 1);
@@ -1191,11 +1191,23 @@ namespace ps2_stubs
         if (h == 0)
             h = 448;
 
-        uint32_t fbw = (w + 63) / 64;
-        uint64_t dispfb = makeDispFb(0, fbw, psm, 0, 0);
-        uint64_t display = makeDisplay(dx, dy, 0, 0, w - 1, h - 1);
+        const uint32_t fbw = (w + 63u) / 64u;
+        GsDispEnvMem env{};
+        // This matches the complete default environment produced by Sony's
+        // libgraph: circuit 2 is enabled and mixed as the display source.
+        env.pmode = makePmode(0u, 1u, 1u, 1u, 0u, 0u);
+        env.smode2 = g_gparam.interlace != 0u
+                         ? (1ull | (static_cast<uint64_t>(g_gparam.ffmode & 0x1u) << 1))
+                         : 2ull;
+        env.dispfb = makeDispFb(0u, fbw, psm, 0u, 0u);
+        env.display = makeDisplay(dx, dy, 0u, 0u, w - 1u, h - 1u);
+        env.bgcolor = 0u;
 
-        writeGsDispEnv(rdram, envAddr, display, dispfb);
+        if (!writeGsDispEnv(rdram, envAddr, env))
+        {
+            setReturnS32(ctx, -1);
+            return;
+        }
         setReturnS32(ctx, 0);
     }
 
