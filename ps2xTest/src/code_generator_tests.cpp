@@ -406,6 +406,75 @@ void register_code_generator_tests()
                   "same-function JAL target should not become an external entry candidate");
     });
 
+    tc.Run("control-flow analysis promotes REGIMM link branch fallthroughs as resumable entries", [](TestCase &t) {
+        Function func;
+        func.name = "regimm_link_resume";
+        func.start = 0x1400;
+        func.end = 0x1418;
+        func.isRecompiled = true;
+        func.isStub = false;
+
+        const std::vector<uint32_t> linkTypes = {
+            REGIMM_BLTZAL,
+            REGIMM_BGEZAL,
+            REGIMM_BLTZALL,
+            REGIMM_BGEZALL,
+        };
+
+        for (uint32_t linkType : linkTypes)
+        {
+            Instruction branch{};
+            branch.address = 0x1400;
+            branch.opcode = OPCODE_REGIMM;
+            branch.rs = 8;
+            branch.rt = linkType;
+            branch.simmediate = 3u; // target = 0x1410
+            branch.isBranch = true;
+            branch.isCall = true;
+            branch.hasDelaySlot = true;
+            branch.raw = (OPCODE_REGIMM << 26) | (8u << 21) | (linkType << 16) | 3u;
+
+            std::vector<Instruction> instructions{
+                branch,
+                makeNop(0x1404),
+                makeNop(0x1408),
+                makeNop(0x140C),
+                makeNop(0x1410),
+                makeNop(0x1414),
+            };
+
+            CodeGenerator gen({}, {});
+            CodeGenerator::AnalysisResult analysis =
+                gen.collectInternalBranchTargets(func, instructions);
+
+            t.IsTrue(analysis.resumeEntryPoints.contains(0x1408u),
+                     "REGIMM branch-and-link should mark PC + 8 as resumable");
+            t.IsTrue(analysis.entryPoints.contains(0x1408u),
+                     "REGIMM branch-and-link return pc should emit an internal label");
+
+            std::string generated = gen.generateFunction(func, instructions, false);
+            t.IsTrue(generated.find("case 0x1408u: goto label_1408;") != std::string::npos,
+                     "REGIMM branch-and-link return pc should be re-enterable through the owner wrapper");
+        }
+
+        Instruction nonLink{};
+        nonLink.address = 0x1400;
+        nonLink.opcode = OPCODE_REGIMM;
+        nonLink.rs = 8;
+        nonLink.rt = REGIMM_BGEZ;
+        nonLink.simmediate = 3u;
+        nonLink.isBranch = true;
+        nonLink.hasDelaySlot = true;
+
+        CodeGenerator gen({}, {});
+        CodeGenerator::AnalysisResult nonLinkAnalysis = gen.collectInternalBranchTargets(
+            func,
+            {nonLink, makeNop(0x1404), makeNop(0x1408), makeNop(0x140C),
+             makeNop(0x1410), makeNop(0x1414)});
+        t.IsFalse(nonLinkAnalysis.resumeEntryPoints.contains(0x1408u),
+                  "ordinary REGIMM branches must not create link return entries");
+    });
+
     tc.Run("control-flow analysis reports cross-function mid-function jumps as external entry candidates", [](TestCase &t) {
         Function caller;
         caller.name = "caller";

@@ -121,6 +121,17 @@ namespace ps2recomp
             queueResumeEntryTarget(target);
         };
 
+        auto isRegimmBranchAndLink = [](const Instruction &inst)
+        {
+            if (inst.opcode != OPCODE_REGIMM)
+            {
+                return false;
+            }
+
+            return inst.rt == REGIMM_BLTZAL || inst.rt == REGIMM_BGEZAL ||
+                   inst.rt == REGIMM_BLTZALL || inst.rt == REGIMM_BGEZALL;
+        };
+
         for (const auto &inst : instructions)
         {
             instructionAddresses.insert(inst.address);
@@ -151,6 +162,11 @@ namespace ps2recomp
                 else
                 {
                     queueExternalEntryTarget(target);
+                }
+
+                if (isRegimmBranchAndLink(inst))
+                {
+                    queueResumeEntryTarget(inst.address + 8u);
                 }
             }
             else if (isStaticJump)
