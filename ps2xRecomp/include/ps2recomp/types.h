@@ -90,8 +90,8 @@ namespace ps2recomp
     struct Function
     {
         std::string name;
-        uint32_t start;
-        uint32_t end;
+        uint32_t start = 0;
+        uint32_t end = 0;
         std::vector<Instruction> instructions;
         std::vector<uint32_t> callers;
         std::vector<uint32_t> callees;
@@ -104,71 +104,71 @@ namespace ps2recomp
     struct Symbol
     {
         std::string name;
-        uint32_t address;
-        uint32_t size;
-        bool isFunction;
-        bool isImported;
-        bool isExported;
+        uint32_t address = 0;
+        uint32_t size = 0;
+        bool isFunction = false;
+        bool isImported = false;
+        bool isExported = false;
     };
 
     // Section information
     struct Section
     {
         std::string name;
-        uint32_t address;
-        uint32_t size;
-        uint32_t offset;
-        bool isCode;
-        bool isData;
-        bool isBSS;
-        bool isReadOnly;
-        uint8_t *data;
+        uint32_t address = 0;
+        uint32_t size = 0;
+        uint32_t offset = 0;
+        bool isCode = false;
+        bool isData = false;
+        bool isBSS = false;
+        bool isReadOnly = false;
+        uint8_t *data = nullptr;
     };
 
     // Relocation information
     struct Relocation
     {
-        uint32_t offset;
-        uint32_t info;
-        uint32_t symbol;
+        uint32_t offset = 0;
+        uint32_t info = 0;
+        uint32_t symbol = 0;
         std::string symbolName;
-        uint32_t type;
-        int32_t addend;
+        uint32_t type = 0;
+        int32_t addend = 0;
     };
 
     // Jump table entry
     struct JumpTableEntry
     {
-        uint32_t index;
-        uint32_t target;
+        uint32_t index = 0;
+        uint32_t target = 0;
     };
 
     // Jump table
     struct JumpTable
     {
-        uint32_t address;
-        uint32_t baseRegister;
+        uint32_t address = 0;
+        uint32_t baseRegister = 0;
         std::vector<JumpTableEntry> entries;
     };
 
     // Control flow graph
     struct CFGNode
     {
-        uint32_t startAddress;
-        uint32_t endAddress;
+        uint32_t startAddress = 0;
+        uint32_t endAddress = 0;
         std::vector<Instruction> instructions;
         std::vector<uint32_t> predecessors;
         std::vector<uint32_t> successors;
-        bool isJumpTarget;
-        bool hasJumpTable;
+        bool isJumpTarget = false;
+        bool hasJumpTable = false;
         JumpTable jumpTable;
     };
 
     // Function call
     struct FunctionCall
     {
-        uint32_t callerAddress;
-        uint32_t calleeAddress;
+        uint32_t callerAddress = 0;
+        uint32_t calleeAddress = 0;
         std::string calleeName;
     };
 

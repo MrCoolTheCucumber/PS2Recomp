@@ -156,6 +156,35 @@ void register_code_generator_tests()
 {
     MiniTest::Case("CodeGenerator", [](TestCase &tc)
                    {
+    tc.Run("recompiler metadata defaults are deterministic", [](TestCase &t) {
+        Function function;
+        Symbol symbol;
+        Section section;
+        Relocation relocation;
+        JumpTableEntry entry;
+        JumpTable jumpTable;
+        CFGNode node;
+        FunctionCall call;
+
+        const Symbol copiedSymbol = symbol;
+        t.Equals(function.start, 0u, "default function start should be zero");
+        t.Equals(function.end, 0u, "default function end should be zero");
+        t.Equals(copiedSymbol.address, 0u, "default symbol address should be zero");
+        t.Equals(copiedSymbol.size, 0u, "default symbol size should be zero");
+        t.IsFalse(copiedSymbol.isFunction, "default symbol should not be a function");
+        t.IsFalse(copiedSymbol.isImported, "default symbol should not be imported");
+        t.IsFalse(copiedSymbol.isExported, "default symbol should not be exported");
+        t.Equals(section.address, 0u, "default section address should be zero");
+        t.IsNull(section.data, "default section data should be null");
+        t.Equals(relocation.offset, 0u, "default relocation offset should be zero");
+        t.Equals(entry.target, 0u, "default jump-table target should be zero");
+        t.Equals(jumpTable.address, 0u, "default jump-table address should be zero");
+        t.IsFalse(node.isJumpTarget, "default CFG node should not be a jump target");
+        t.IsFalse(node.hasJumpTable, "default CFG node should not have a jump table");
+        t.Equals(call.callerAddress, 0u, "default function-call source should be zero");
+        t.Equals(call.calleeAddress, 0u, "default function-call target should be zero");
+    });
+
     tc.Run("R5900 MULT writes rd when rd is non-zero", [](TestCase &t) {
         CodeGenerator gen({}, {});
 
