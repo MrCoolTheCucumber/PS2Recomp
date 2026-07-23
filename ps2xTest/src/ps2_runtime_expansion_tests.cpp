@@ -559,6 +559,44 @@ void register_ps2_runtime_expansion_tests()
 {
     MiniTest::Case("PS2RuntimeExpansion", [](TestCase &tc)
     {
+        tc.Run("scalar overflow helpers use defined wrapping arithmetic", [](TestCase &t)
+        {
+            bool overflow = false;
+            uint32_t result32 = 0u;
+            uint64_t result64 = 0ull;
+
+            ADD32_OV(0x7FFFFFFFu, 1u, result32, overflow);
+            t.Equals(result32, 0x80000000u, "32-bit addition should retain wrapped result bits");
+            t.IsTrue(overflow, "positive 32-bit addition overflow should be detected");
+
+            ADD32_OV(0x80000000u, 0xFFFFFFFFu, result32, overflow);
+            t.Equals(result32, 0x7FFFFFFFu, "negative 32-bit addition should wrap predictably");
+            t.IsTrue(overflow, "negative 32-bit addition overflow should be detected");
+
+            SUB32_OV(0x80000000u, 1u, result32, overflow);
+            t.Equals(result32, 0x7FFFFFFFu, "32-bit subtraction should retain wrapped result bits");
+            t.IsTrue(overflow, "negative 32-bit subtraction overflow should be detected");
+
+            SUB32_OV(9u, 4u, result32, overflow);
+            t.Equals(result32, 5u, "ordinary 32-bit subtraction should retain its result");
+            t.IsFalse(overflow, "ordinary 32-bit subtraction should not report overflow");
+
+            ADD64_OV(0x7FFFFFFFFFFFFFFFull, 1ull, result64, overflow);
+            t.Equals(result64, 0x8000000000000000ull,
+                     "64-bit addition should retain wrapped result bits");
+            t.IsTrue(overflow, "positive 64-bit addition overflow should be detected");
+
+            SUB64_OV(0x8000000000000000ull, 1ull, result64, overflow);
+            t.Equals(result64, 0x7FFFFFFFFFFFFFFFull,
+                     "64-bit subtraction should retain wrapped result bits");
+            t.IsTrue(overflow, "negative 64-bit subtraction overflow should be detected");
+
+            t.Equals(ADD64(0xFFFFFFFFFFFFFFFFull, 1ull), 0ull,
+                     "non-trapping 64-bit addition should wrap");
+            t.Equals(SUB64(0ull, 1ull), 0xFFFFFFFFFFFFFFFFull,
+                     "non-trapping 64-bit subtraction should wrap");
+        });
+
         tc.Run("differential decoder/codegen gpr-write contract for MULT and DIV families", [](TestCase &t)
         {
             R5900Decoder decoder;
