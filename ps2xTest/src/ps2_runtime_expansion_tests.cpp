@@ -21,9 +21,17 @@
 #include <cstdint>
 #include <cstring>
 #include <exception>
+#include <memory>
 #include <string>
 #include <thread>
 #include <vector>
+
+#if PS2X_HAS_FFMPEG
+extern "C"
+{
+#include <libavcodec/avcodec.h>
+}
+#endif
 
 using namespace ps2recomp;
 using namespace ps2_syscalls;
@@ -328,6 +336,143 @@ namespace
         gMpegStreamCallbackCount.fetch_add(1u, std::memory_order_acq_rel);
         ctx->pc = 0u;
     }
+
+#if PS2X_HAS_FFMPEG
+    struct AvCodecContextDeleter
+    {
+        void operator()(AVCodecContext *context) const
+        {
+            avcodec_free_context(&context);
+        }
+    };
+
+    struct AvFrameDeleter
+    {
+        void operator()(AVFrame *frame) const
+        {
+            av_frame_free(&frame);
+        }
+    };
+
+    struct AvPacketDeleter
+    {
+        void operator()(AVPacket *packet) const
+        {
+            av_packet_free(&packet);
+        }
+    };
+
+    std::vector<uint8_t> makeSyntheticMpeg2StartupStream()
+    {
+        constexpr int kWidth = 32;
+        constexpr int kHeight = 16;
+        constexpr int kFrameCount = 4;
+
+        const AVCodec *encoder = avcodec_find_encoder(AV_CODEC_ID_MPEG2VIDEO);
+        std::unique_ptr<AVCodecContext, AvCodecContextDeleter> codec(
+            encoder ? avcodec_alloc_context3(encoder) : nullptr);
+        std::unique_ptr<AVFrame, AvFrameDeleter> frame(av_frame_alloc());
+        std::unique_ptr<AVPacket, AvPacketDeleter> packet(av_packet_alloc());
+        if (!codec || !frame || !packet)
+        {
+            return {};
+        }
+
+        codec->bit_rate = 200000;
+        codec->width = kWidth;
+        codec->height = kHeight;
+        codec->time_base = AVRational{1, 30};
+        codec->framerate = AVRational{30, 1};
+        codec->gop_size = 12;
+        codec->max_b_frames = 0;
+        codec->pix_fmt = AV_PIX_FMT_YUV420P;
+        codec->thread_count = 1;
+        if (avcodec_open2(codec.get(), encoder, nullptr) < 0)
+        {
+            return {};
+        }
+
+        frame->format = codec->pix_fmt;
+        frame->width = kWidth;
+        frame->height = kHeight;
+        if (av_frame_get_buffer(frame.get(), 32) < 0)
+        {
+            return {};
+        }
+
+        std::vector<uint8_t> elementaryStream;
+        const auto receivePackets = [&]()
+        {
+            while (true)
+            {
+                const int result = avcodec_receive_packet(codec.get(), packet.get());
+                if (result == AVERROR(EAGAIN) || result == AVERROR_EOF)
+                {
+                    return true;
+                }
+                if (result < 0)
+                {
+                    return false;
+                }
+                elementaryStream.insert(
+                    elementaryStream.end(), packet->data, packet->data + packet->size);
+                av_packet_unref(packet.get());
+            }
+        };
+
+        for (int frameIndex = 0; frameIndex < kFrameCount; ++frameIndex)
+        {
+            if (av_frame_make_writable(frame.get()) < 0)
+            {
+                return {};
+            }
+            for (int row = 0; row < kHeight; ++row)
+            {
+                std::memset(
+                    frame->data[0] + row * frame->linesize[0],
+                    64,
+                    kWidth);
+            }
+            for (int row = 0; row < kHeight / 2; ++row)
+            {
+                std::memset(frame->data[1] + row * frame->linesize[1], 96, kWidth / 2);
+                std::memset(frame->data[2] + row * frame->linesize[2], 160, kWidth / 2);
+            }
+            frame->pts = frameIndex;
+            if (avcodec_send_frame(codec.get(), frame.get()) < 0 || !receivePackets())
+            {
+                return {};
+            }
+        }
+        if (avcodec_send_frame(codec.get(), nullptr) < 0 || !receivePackets())
+        {
+            return {};
+        }
+
+        std::vector<size_t> pictureStarts;
+        for (size_t offset = 0u; offset + 4u <= elementaryStream.size(); ++offset)
+        {
+            if (elementaryStream[offset + 0u] == 0x00u &&
+                elementaryStream[offset + 1u] == 0x00u &&
+                elementaryStream[offset + 2u] == 0x01u &&
+                elementaryStream[offset + 3u] == 0x00u)
+            {
+                pictureStarts.push_back(offset);
+            }
+        }
+        if (pictureStarts.size() < kFrameCount)
+        {
+            return {};
+        }
+
+        // Keep three complete pictures but omit both the next GOP and the
+        // sequence-end marker. A decoder must emit the initial I picture once
+        // the following P reference arrives; waiting for another I picture can
+        // deadlock a demuxer whose audio stream is already backpressured.
+        elementaryStream.resize(pictureStarts[3]);
+        return elementaryStream;
+    }
+#endif
 
 }
 
@@ -1113,6 +1258,69 @@ void register_ps2_runtime_expansion_tests()
             runtime.requestStop();
         });
 
+#if PS2X_HAS_FFMPEG
+        tc.Run("MPEG decoder emits the first reference frame without waiting for another GOP", [](TestCase &t)
+        {
+            std::vector<uint8_t> rdram(PS2_RAM_SIZE, 0u);
+            ps2_stubs::resetMpegStubState();
+
+            constexpr uint32_t kMpegAddr = 0x00123000u;
+            constexpr uint32_t kMpegWorkAddr = 0x00130000u;
+            constexpr uint32_t kPacketAddr = 0x00140000u;
+            constexpr uint32_t kImageAddr = 0x00180000u;
+            const std::vector<uint8_t> elementaryStream =
+                makeSyntheticMpeg2StartupStream();
+            t.IsFalse(elementaryStream.empty(),
+                      "the test should generate a synthetic MPEG-2 stream");
+            t.IsTrue(elementaryStream.size() <= 0xFFFCu,
+                     "the synthetic MPEG-2 stream should fit in one PES packet");
+            if (elementaryStream.empty() || elementaryStream.size() > 0xFFFCu)
+            {
+                return;
+            }
+
+            const uint16_t packetLen =
+                static_cast<uint16_t>(elementaryStream.size() + 3u);
+            std::vector<uint8_t> packet = {
+                0x00u, 0x00u, 0x01u, 0xE0u,
+                static_cast<uint8_t>(packetLen >> 8u),
+                static_cast<uint8_t>(packetLen & 0xFFu),
+                0x80u, 0x00u, 0x00u};
+            packet.insert(packet.end(), elementaryStream.begin(), elementaryStream.end());
+            std::memcpy(rdram.data() + kPacketAddr, packet.data(), packet.size());
+
+            R5900Context createCtx{};
+            setRegU32(createCtx, 4, kMpegAddr);
+            setRegU32(createCtx, 5, kMpegWorkAddr);
+            setRegU32(createCtx, 6, 0x2000u);
+            ps2_stubs::sceMpegCreate(rdram.data(), &createCtx, nullptr);
+
+            R5900Context demuxCtx{};
+            setRegU32(demuxCtx, 4, kMpegAddr);
+            setRegU32(demuxCtx, 5, kPacketAddr);
+            setRegU32(demuxCtx, 6, static_cast<uint32_t>(packet.size()));
+            setRegU32(demuxCtx, 7, kPacketAddr);
+            setRegU32(demuxCtx, 8, static_cast<uint32_t>(packet.size()));
+            ps2_stubs::sceMpegDemuxPssRing(rdram.data(), &demuxCtx, nullptr);
+            t.Equals(getRegS32(demuxCtx, 2), static_cast<int32_t>(packet.size()),
+                     "the synthetic video PES packet should be consumed");
+
+            R5900Context pictureCtx{};
+            setRegU32(pictureCtx, 4, kMpegAddr);
+            setRegU32(pictureCtx, 5, kImageAddr);
+            ps2_stubs::sceMpegGetPicture(rdram.data(), &pictureCtx, nullptr);
+            t.Equals(getRegS32(pictureCtx, 2), 1,
+                     "the first I picture should be available after the following P reference");
+            t.Equals(Ps2FastRead32(rdram.data(), kMpegAddr + 0x00u), 32u,
+                     "the decoded frame should publish its synthetic width");
+            t.Equals(Ps2FastRead32(rdram.data(), kMpegAddr + 0x04u), 16u,
+                     "the decoded frame should publish its synthetic height");
+
+            ps2_stubs::resetMpegStubState();
+        });
+
+#endif
+
         tc.Run("sceMpegDemuxPssRing dispatches private-stream data callbacks", [](TestCase &t)
         {
             PS2Runtime runtime;
@@ -1278,7 +1486,7 @@ void register_ps2_runtime_expansion_tests()
                      "a new sceCdStStart generation should release a waiter owned by the previous movie");
         });
 
-        tc.Run("sceMpegGetPicture yields during active stream starvation before CD EOF", [](TestCase &t)
+        tc.Run("sceMpegGetPicture blocks during active stream starvation before CD EOF", [](TestCase &t)
         {
             PS2Runtime runtime;
             std::vector<uint8_t> rdram(PS2_RAM_SIZE, 0u);
@@ -1310,20 +1518,20 @@ void register_ps2_runtime_expansion_tests()
                 returned.store(true, std::memory_order_release);
             });
 
-            const bool yielded = waitUntil(
-                [&]() { return returned.load(std::memory_order_acquire); },
-                std::chrono::milliseconds(200));
-
-            runtime.requestStop();
-            waiter.join();
-            t.IsTrue(yielded,
-                     "active non-EOF streams must return control when no decoded frame is currently available");
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+            t.IsFalse(returned.load(std::memory_order_acquire),
+                      "active non-EOF streams must keep waiting when no decoded frame is currently available");
 
             R5900Context isEndCtx{};
             setRegU32(isEndCtx, 4, kMpegAddr);
             ps2_stubs::sceMpegIsEnd(rdram.data(), &isEndCtx, nullptr);
             t.Equals(getRegS32(isEndCtx, 2), 0,
-                     "yielding without a frame must not mark the active stream ended");
+                     "waiting without a frame must not mark the active stream ended");
+
+            runtime.requestStop();
+            waiter.join();
+            t.Equals(getRegS32(pictureCtx, 2), -1,
+                     "runtime teardown should interrupt a pending picture wait with an error");
         });
 
         tc.Run("movie startup MPEG and audio stubs return safe progress values", [](TestCase &t)

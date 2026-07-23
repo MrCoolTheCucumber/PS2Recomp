@@ -424,7 +424,7 @@ if(PS2X_STRICT_RETURN_DIAGNOSTICS)
     )
 endif()
 
-target_compile_definitions(ps2_runtime PRIVATE
+target_compile_definitions(ps2_runtime PUBLIC
     PS2X_HAS_FFMPEG=$<BOOL:${PS2X_ENABLE_FFMPEG}>
 )
 

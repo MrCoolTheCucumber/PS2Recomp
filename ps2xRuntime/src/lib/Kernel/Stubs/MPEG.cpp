@@ -420,7 +420,10 @@ namespace ps2_stubs
                 }
 
                 m_codecCtx->thread_count = 1;
-                m_codecCtx->skip_frame = AVDISCARD_NONKEY;
+                // Keep FFmpeg's default frame-discard policy. MPEG-2 can hold
+                // the initial I picture until a following reference picture
+                // arrives; discarding that P picture can delay all output
+                // until the next GOP and deadlock a backpressured demuxer.
                 m_codecCtx->err_recognition = 0;
                 const int ret = avcodec_open2(m_codecCtx, codec, nullptr);
                 if (ret < 0)
@@ -432,7 +435,6 @@ namespace ps2_stubs
 
                 m_initialized = true;
                 m_drained = false;
-                m_seenKeyframe = false;
                 return true;
             }
 
@@ -497,12 +499,6 @@ namespace ps2_stubs
                             ++s_receiveErrorLogCount;
                         }
                         return true;
-                    }
-
-                    if (!m_seenKeyframe)
-                    {
-                        m_seenKeyframe = true;
-                        m_codecCtx->skip_frame = AVDISCARD_DEFAULT;
                     }
 
                     if (!convertFrame(frames))
@@ -591,7 +587,6 @@ namespace ps2_stubs
             AVPixelFormat m_swsFormat = AV_PIX_FMT_NONE;
             bool m_initialized = false;
             bool m_drained = false;
-            bool m_seenKeyframe = false;
             MpegFrameDump m_frameDump;
         };
 #else
@@ -699,7 +694,6 @@ namespace ps2_stubs
         constexpr size_t kStartCodeNotFound = std::numeric_limits<size_t>::max();
         constexpr uint32_t kMpegCallbackDataSize = 0x20u;
         constexpr uint32_t kMpegCallbackMaxSteps = 0x4000u;
-        constexpr std::chrono::milliseconds kMpegGetPictureNoFrameWaitTimeout{64};
         constexpr std::chrono::milliseconds kMpegNoFrameEndTimeout{500};
         constexpr uint32_t kMpegMaxConsecutiveEmptyGetPicture = 60u;
 
@@ -2176,7 +2170,6 @@ namespace ps2_stubs
                     currentThreadInfo = it->second;
             }
 
-            const auto noFrameWaitStart = std::chrono::steady_clock::now();
             while (runtime &&
                    g_mpeg_stub_state.playbackByMpeg.find(mpegAddr) != g_mpeg_stub_state.playbackByMpeg.end() &&
                    getPlaybackState(mpegAddr).decodedFrames.empty() &&
@@ -2200,24 +2193,6 @@ namespace ps2_stubs
                     break;
                 }
 
-                if (!g_mpeg_stub_state.currentCdStreamEofSeen &&
-                    std::chrono::steady_clock::now() - noFrameWaitStart >= kMpegGetPictureNoFrameWaitTimeout)
-                {
-                    static uint32_t s_noFrameYieldLogCount = 0u;
-                    if (s_noFrameYieldLogCount < 16u)
-                    {
-                        PS2_IF_AGRESSIVE_LOGS({
-                            std::cerr << "[MPEG:GetPicture:yield] mpeg=0x" << std::hex << mpegAddr
-                                      << std::dec << " generation=" << g_mpeg_stub_state.cdStreamGeneration
-                                      << " sawInput=" << waitPlayback.sawInput
-                                      << " served=" << waitPlayback.picturesServed
-                                      << " cdEof=" << g_mpeg_stub_state.currentCdStreamEofSeen
-                                      << std::endl;
-                        });
-                        ++s_noFrameYieldLogCount;
-                    }
-                    break;
-                }
             }
 
             if (g_mpeg_stub_state.playbackByMpeg.find(mpegAddr) == g_mpeg_stub_state.playbackByMpeg.end())
@@ -2324,7 +2299,12 @@ namespace ps2_stubs
             writeBlankMpegFrame(rdram, imageAddr, width, height);
         }
 
-        setReturnS32(ctx, (haveFrame || endOfSequence) ? 1 : 0);
+        // Sony's decoder waits internally for input and returns 1 for a
+        // completed picture (including sequence-end processing), or -1 when
+        // the wait is interrupted by an error/teardown. Returning 0 from a
+        // live runtime is not a harmless "try again": callers can treat every
+        // non-negative result as a completed output buffer.
+        setReturnS32(ctx, (haveFrame || endOfSequence) ? 1 : (runtime ? -1 : 0));
     }
 
     void sceMpegGetPictureRAW8(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
