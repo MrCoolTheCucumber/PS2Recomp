@@ -1184,6 +1184,7 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
                     uint32_t asr1 = m_ioRegisters[channelBase + 0x50];
                     uint32_t asp = (chcr >> 4) & 0x3u;
                     const bool tieEnabled = (chcr & (1u << 7)) != 0u;
+                    const bool tagTransferEnabled = (chcr & (1u << 6)) != 0u;
                     const int kMaxChainTags = 4096;
                     std::vector<uint8_t> chainBuf;
 
@@ -1220,22 +1221,6 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
                             bytes -= chunk;
                             src += chunk;
                         }
-                    };
-
-                    auto appendCompactVif1TagData = [&](uint32_t localTagAddr, uint32_t qwCount)
-                    {
-                        uint32_t tagPhys = 0u;
-                        const bool tagScratch = isScratchpad(localTagAddr);
-                        tagPhys = translateAddress(localTagAddr);
-
-                        const uint8_t *localBase = tagScratch ? m_scratchpad : m_rdram;
-                        const uint32_t localMax = tagScratch ? PS2_SCRATCHPAD_SIZE : PS2_RAM_SIZE;
-                        if (tagPhys + 16u > localMax)
-                            return;
-
-                        // VIF packet helpers embed 8 bytes of VIF stream in the DMAtag's upper half.
-                        chainBuf.insert(chainBuf.end(), localBase + tagPhys + 8u, localBase + tagPhys + 16u);
-                        appendData(localTagAddr + 16u, qwCount);
                     };
 
                     int tagsProcessed = 0;
@@ -1346,19 +1331,16 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
                             break;
                         }
 
-                        const bool compactVifLocalTag =
-                            (channelBase == 0x10009000u || channelBase == 0x10008000u) &&
-                            (id == 1u || id == 2u || id == 5u || id == 6u || id == 7u);
-                        if (compactVifLocalTag)
-                            appendCompactVif1TagData(currentTagAddr, 0u);
+                        // VIF0/VIF1 consume the upper 64 bits of every source-chain
+                        // tag before its QWC payload when CHCR.TTE is set. This
+                        // includes reference tags whose payload lives elsewhere.
+                        const bool transferVifTag = tagTransferEnabled &&
+                            (channelBase == 0x10009000u || channelBase == 0x10008000u);
+                        if (transferVifTag)
+                            chainBuf.insert(chainBuf.end(), tp + 8u, tp + 16u);
 
                         if (hasPayload)
-                        {
-                            if (compactVifLocalTag)
-                                appendData(currentTagAddr + 16u, tagQwc);
-                            else
-                                appendData(dataAddr, tagQwc);
-                        }
+                            appendData(dataAddr, tagQwc);
                         if (irq && tieEnabled)
                             endChain = true;
                         if (endChain)

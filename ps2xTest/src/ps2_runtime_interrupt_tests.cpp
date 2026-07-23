@@ -475,6 +475,37 @@ void register_ps2_runtime_interrupt_tests()
             cleanupRuntime(env);
         });
 
+        tc.Run("sceDmaSend preserves configured VIF tag transfer", [](TestCase &t)
+        {
+            notifyRuntimeStop();
+            TestEnv env;
+            t.IsTrue(env.runtime.memory().initialize(), "runtime memory initialize should succeed");
+
+            constexpr uint32_t kVif1Ch = 0x10009000u;
+            constexpr uint32_t kTag = 0x00027F00u;
+            uint8_t *rdram = env.runtime.memory().getRDRAM();
+            writeDmaTag(rdram, kTag, makeDmaTag(0u, 7u, 0u, false)); // END
+            writeGuestU32(rdram, kTag + 0x0Cu, 0x04000055u); // ITOP 0x55 in tag high data.
+
+            R5900Context sendCtx{};
+            setRegU32(sendCtx, 4, kVif1Ch);
+            setRegU32(sendCtx, 5, kTag);
+
+            t.IsTrue(env.runtime.memory().writeIORegister(kVif1Ch + 0x00u, 0u),
+                     "VIF1 channel should accept TTE clear");
+            ps2_stubs::sceDmaSend(rdram, &sendCtx, &env.runtime);
+            t.Equals(env.runtime.memory().vif1_regs.itops, 0u,
+                     "sceDmaSend must not infer TTE from the VIF channel");
+
+            t.IsTrue(env.runtime.memory().writeIORegister(kVif1Ch + 0x00u, 0x40u),
+                     "VIF1 channel should accept TTE set");
+            ps2_stubs::sceDmaSend(rdram, &sendCtx, &env.runtime);
+            t.Equals(env.runtime.memory().vif1_regs.itops, 0x55u,
+                     "sceDmaSend should preserve configured TTE");
+
+            cleanupRuntime(env);
+        });
+
         tc.Run("sceDmaSend defers VIF1 DMAC completion until guest state is published", [](TestCase &t)
         {
             notifyRuntimeStop();
@@ -490,6 +521,8 @@ void register_ps2_runtime_interrupt_tests()
 
             uint8_t *rdram = env.runtime.memory().getRDRAM();
             writeDmaTag(rdram, kTag0, makeDmaTag(1u, 1u, 0u, false)); // CNT
+            const uint32_t itopCmd = 0x04000066u;
+            writeGuestU32(rdram, kTag0 + 0x0Cu, itopCmd);
             writeGuestU64(rdram, kTag0 + 0x10u, 0u);
             writeGuestU64(rdram, kTag0 + 0x18u, 0u);
             writeDmaTag(rdram, kTag1, makeDmaTag(0u, 7u, 0u, false)); // END
@@ -514,6 +547,9 @@ void register_ps2_runtime_interrupt_tests()
             ps2_syscalls::EnableDmac(rdram, &enableCtx, &env.runtime);
             t.Equals(getRegS32(enableCtx, 2), KE_OK, "EnableDmac should enable VIF1 cause");
 
+            t.IsTrue(env.runtime.memory().writeIORegister(kVif1Ch + 0x00u, 0x40u),
+                     "VIF1 channel should accept preconfigured TTE");
+
             R5900Context sendCtx{};
             setRegU32(sendCtx, 4, kVif1Ch);
             setRegU32(sendCtx, 5, kTag0);
@@ -526,6 +562,8 @@ void register_ps2_runtime_interrupt_tests()
             }
 
             t.Equals(getRegS32(sendCtx, 2), 0, "sceDmaSend should succeed");
+            t.Equals(env.runtime.memory().vif1_regs.itops, 0x66u,
+                     "sceDmaSend should preserve VIF tag transfer for source chains");
             t.Equals(g_dmacSendHits.load(std::memory_order_relaxed), 1u, "the outer guest safe point should dispatch the VIF1 DMAC handler");
             t.Equals(g_dmacSendLastCause.load(std::memory_order_relaxed), 1u, "DMAC handler should observe VIF1 cause");
             t.Equals(g_dmacSendLastChcr.load(std::memory_order_relaxed) & 0x100u, 0u, "handler should see VIF1 STR cleared");

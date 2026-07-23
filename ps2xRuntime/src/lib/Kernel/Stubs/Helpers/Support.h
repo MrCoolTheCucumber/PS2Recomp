@@ -1360,7 +1360,9 @@ namespace
         uint32_t madr = 0;
         uint32_t qwc = 0;
         uint32_t tadr = payloadPhys;
-        uint32_t chcr = 0x00000181u; // DIR=1, TIE=1, STR=1 (normal mode).
+        PS2Memory &mem = runtime->memory();
+        const uint32_t previousChcr = mem.readIORegister(channelBase + 0x00u);
+        uint32_t chcr = (previousChcr & ~0x0000000Cu) | 0x00000101u; // DIR=1, STR=1, normal mode.
 
         if (preferNormalCount)
         {
@@ -1369,10 +1371,11 @@ namespace
         }
         else
         {
-            chcr = 0x00000185u; // MODE=1 chain, DIR=1, TIE=1, STR=1.
+            // Sony libdma clears MOD then selects source-chain mode while
+            // preserving channel controls such as TTE and TIE.
+            chcr = (previousChcr & ~0x0000000Cu) | 0x00000105u;
         }
 
-        PS2Memory &mem = runtime->memory();
         mem.writeIORegister(channelBase + 0x20u, qwc & 0xFFFFu);
         mem.writeIORegister(channelBase + 0x10u, madr);
         mem.writeIORegister(channelBase + 0x30u, tadr);

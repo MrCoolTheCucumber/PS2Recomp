@@ -1424,7 +1424,7 @@ void register_ps2_memory_tests()
             t.Equals(mem.readIORegister(kVif1Ch + 0x20u), 0u, "VIF1 QWC should be cleared after drain");
         });
 
-        tc.Run("VIF1 DMA chain preserves compact tag high bytes for DIRECT packets", [](TestCase &t)
+        tc.Run("VIF1 DMA chain transfers tag high bytes for DIRECT packets when TTE is enabled", [](TestCase &t)
         {
             PS2Memory mem;
             t.IsTrue(mem.initialize(), "PS2Memory initialize should succeed");
@@ -1453,7 +1453,7 @@ void register_ps2_memory_tests()
             });
 
             t.IsTrue(mem.writeIORegister(kVif1Ch + 0x30u, kTag), "write VIF1 TADR should succeed");
-            t.IsTrue(mem.writeIORegister(kVif1Ch + 0x00u, 0x104u), "write VIF1 CHCR STR|CHAIN should succeed");
+            t.IsTrue(mem.writeIORegister(kVif1Ch + 0x00u, 0x145u), "write VIF1 CHCR DIR|TTE|STR|CHAIN should succeed");
 
             mem.processPendingTransfers();
 
@@ -1474,7 +1474,7 @@ void register_ps2_memory_tests()
                      "compact VIF1 chain should clear the STR bit after drain");
         });
 
-        tc.Run("VIF1 DMA chain preserves compact tag high bytes when qwc is zero", [](TestCase &t)
+        tc.Run("VIF1 DMA chain transfers tag high bytes when qwc is zero and TTE is enabled", [](TestCase &t)
         {
             PS2Memory mem;
             t.IsTrue(mem.initialize(), "PS2Memory initialize should succeed");
@@ -1492,7 +1492,7 @@ void register_ps2_memory_tests()
             std::memcpy(rdram + kTag + 12u, &itopCmd, sizeof(itopCmd));
 
             t.IsTrue(mem.writeIORegister(kVif1Ch + 0x30u, kTag), "write VIF1 TADR should succeed");
-            t.IsTrue(mem.writeIORegister(kVif1Ch + 0x00u, 0x104u), "write VIF1 CHCR STR|CHAIN should succeed");
+            t.IsTrue(mem.writeIORegister(kVif1Ch + 0x00u, 0x145u), "write VIF1 CHCR DIR|TTE|STR|CHAIN should succeed");
 
             mem.processPendingTransfers();
 
@@ -1500,6 +1500,70 @@ void register_ps2_memory_tests()
                      "qwc-zero compact VIF1 chain should still process high-half VIFcodes");
             t.IsTrue((mem.readIORegister(kVif1Ch + 0x00u) & 0x100u) == 0u,
                      "qwc-zero compact VIF1 chain should clear the STR bit after drain");
+        });
+
+        tc.Run("VIF1 DMA chain ignores tag high bytes when TTE is disabled", [](TestCase &t)
+        {
+            PS2Memory mem;
+            t.IsTrue(mem.initialize(), "PS2Memory initialize should succeed");
+
+            constexpr uint32_t kVif1Ch = 0x10009000u;
+            constexpr uint32_t kTag = 0x00025200u;
+
+            uint8_t *rdram = mem.getRDRAM();
+            std::memset(rdram + kTag, 0, 16u);
+            const uint64_t endTag = makeDmaTag(0u, 7u, 0u, false);
+            std::memcpy(rdram + kTag, &endTag, sizeof(endTag));
+
+            const uint32_t itopCmd = makeVifCmd(0x04u, 0u, 0x55u);
+            std::memcpy(rdram + kTag + 12u, &itopCmd, sizeof(itopCmd));
+
+            t.IsTrue(mem.writeIORegister(kVif1Ch + 0x30u, kTag), "write VIF1 TADR should succeed");
+            t.IsTrue(mem.writeIORegister(kVif1Ch + 0x00u, 0x105u), "write VIF1 CHCR DIR|STR|CHAIN should succeed");
+
+            mem.processPendingTransfers();
+
+            t.Equals(mem.vif1_regs.itops, 0u, "tag high VIFcodes must not transfer while TTE is clear");
+        });
+
+        tc.Run("VIF1 DMA chain transfers REF tag high bytes before referenced payload", [](TestCase &t)
+        {
+            PS2Memory mem;
+            t.IsTrue(mem.initialize(), "PS2Memory initialize should succeed");
+
+            constexpr uint32_t kVif1Ch = 0x10009000u;
+            constexpr uint32_t kTag = 0x00025300u;
+            constexpr uint32_t kPayload = 0x00025400u;
+
+            uint8_t *rdram = mem.getRDRAM();
+            std::memset(rdram + kTag, 0, 32u);
+            std::memset(rdram + kPayload, 0, 16u);
+
+            const uint64_t refTag = makeDmaTag(1u, 3u, kPayload, false);
+            std::memcpy(rdram + kTag, &refTag, sizeof(refTag));
+            const uint32_t directCmd = makeVifCmd(0x50u, 0u, 1u);
+            std::memcpy(rdram + kTag + 12u, &directCmd, sizeof(directCmd));
+
+            const uint64_t endTag = makeDmaTag(0u, 7u, 0u, false);
+            std::memcpy(rdram + kTag + 16u, &endTag, sizeof(endTag));
+            for (uint32_t i = 0; i < 16u; ++i)
+                rdram[kPayload + i] = static_cast<uint8_t>(0x90u + i);
+
+            std::vector<std::vector<uint8_t>> captured;
+            mem.setGifPacketCallback([&](const uint8_t *data, uint32_t sizeBytes)
+            {
+                captured.emplace_back(data, data + sizeBytes);
+            });
+
+            t.IsTrue(mem.writeIORegister(kVif1Ch + 0x30u, kTag), "write VIF1 TADR should succeed");
+            t.IsTrue(mem.writeIORegister(kVif1Ch + 0x00u, 0x145u), "write VIF1 CHCR DIR|TTE|STR|CHAIN should succeed");
+
+            mem.processPendingTransfers();
+
+            t.Equals(captured.size(), static_cast<size_t>(1u), "REF tag DIRECT should emit one GIF packet");
+            t.Equals(captured[0].size(), static_cast<size_t>(16u), "REF tag DIRECT packet should be one qword");
+            t.IsTrue(std::memcmp(captured[0].data(), rdram + kPayload, 16u) == 0,
+                     "REF tag high VIFcode must execute before referenced payload");
         });
 
         tc.Run("VIF1 packet builders keep chain qwc live before terminate", [](TestCase &t)
@@ -1554,7 +1618,7 @@ void register_ps2_memory_tests()
             });
 
             t.IsTrue(mem.writeIORegister(kVif1Ch + 0x30u, kBaseAddr), "write VIF1 TADR should succeed");
-            t.IsTrue(mem.writeIORegister(kVif1Ch + 0x00u, 0x104u), "write VIF1 CHCR STR|CHAIN should succeed");
+            t.IsTrue(mem.writeIORegister(kVif1Ch + 0x00u, 0x145u), "write VIF1 CHCR DIR|TTE|STR|CHAIN should succeed");
 
             mem.processPendingTransfers();
 
