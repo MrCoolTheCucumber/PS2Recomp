@@ -136,6 +136,12 @@ namespace
             lastAudioFunction = function;
             lastAudioSend = send;
             lastAudioReceive = receive;
+            lastAudioPayload.clear();
+            if (receive.address != 0u && contains(receive.address, receive.size))
+            {
+                lastAudioPayload.assign(memory.begin() + receive.address,
+                                        memory.begin() + receive.address + receive.size);
+            }
             ++audioCalls;
         }
 
@@ -300,6 +306,7 @@ namespace
         uint32_t lastAudioFunction = 0u;
         GuestBuffer lastAudioSend{};
         GuestBuffer lastAudioReceive{};
+        std::vector<uint8_t> lastAudioPayload;
         uint64_t virtualTime = 0u;
         uint32_t memoryCardCalls = 0u;
         MemoryCardRequest lastMemoryCardRequest{};
@@ -777,16 +784,96 @@ void register_ps2_iop_tests()
 
             expectPosition(0u, 0u,
                            "polling at the playback start must not advance the cursor");
-            expectPosition(16'666'667u, 0x1A0u,
-                           "one video tick should consume 26 complete SPU ADPCM blocks");
-            expectPosition(16'666'667u, 0x1A0u,
+            expectPosition(90'703u, 0x4u,
+                           "four samples should advance NAX by one 16-bit data word");
+            expectPosition(634'921u, 0x12u,
+                           "crossing an ADPCM block should skip its header word");
+            expectPosition(16'666'667u, 0x1A4u,
+                           "one video tick should expose the exact SPU NAX word");
+            expectPosition(16'666'667u, 0x1A4u,
                            "repeated polling at one virtual instant must be stable");
-            expectPosition(162'539'683u, 0u,
-                           "the encoded-byte cursor should wrap at the channel ring size");
-            expectPosition(163'174'604u, 0x10u,
-                           "the cursor should advance one ADPCM block after wrapping");
-            expectPosition(1'000'000'000u, 0x270u,
-                           "one second should consume 25,200 encoded bytes at 44.1 kHz");
+            expectPosition(162'539'683u, 0x2u,
+                           "the NAX cursor should wrap to the first data word");
+            expectPosition(163'174'604u, 0x12u,
+                           "the cursor should skip the next block header after wrapping");
+            expectPosition(1'000'000'000u, 0x272u,
+                           "one second should retain the exact wrapped NAX word");
+        });
+
+        tc.Run("Sony 989snd forwards DMA staging data to the host audio backend", [](TestCase &t)
+        {
+            FakeIopHost host;
+            ps2x::iop::IopSubsystem subsystem(host);
+
+            constexpr uint32_t kSid = 0x00123456u;
+            constexpr uint32_t kSendAddress = 0x1000u;
+            constexpr uint32_t kReceiveAddress = 0x1100u;
+            auto call = [&](uint32_t function, uint32_t sendSize) {
+                ps2x::iop::RpcRequest request{};
+                request.sid = kSid;
+                request.function = function;
+                request.send = {sendSize == 0u ? 0u : kSendAddress, sendSize};
+                request.receive = {kReceiveAddress, 12u};
+                return subsystem.handleRpc(request);
+            };
+
+            constexpr std::array<uint32_t, 6> kOpen{
+                0x400u, 0x1000u, 0x400u, 0u, 5u, 3u,
+            };
+            (void)host.writeGuest(kSendAddress, kOpen.data(), sizeof(kOpen));
+            t.IsTrue(call(0x3Bu, sizeof(kOpen)).handled,
+                     "streaming open should complete");
+            const uint32_t workArea = host.readWord(kReceiveAddress + 4u);
+            t.Equals(host.audioCalls, 1u,
+                     "streaming open should notify the host audio backend");
+            t.Equals(host.lastAudioFunction, 0x3Bu,
+                     "the host should observe the streaming-open command");
+            t.Equals(host.lastAudioReceive.address, workArea,
+                     "streaming open should identify the allocated DMA staging area");
+            t.Equals(host.lastAudioReceive.size, 0x400u,
+                     "streaming open should report the staging-area size");
+
+            std::array<uint8_t, 0x400> encoded{};
+            for (size_t index = 0u; index < encoded.size(); ++index)
+                encoded[index] = static_cast<uint8_t>(index);
+            (void)host.writeGuest(workArea, encoded.data(), encoded.size());
+
+            constexpr std::array<uint32_t, 2> kTransfer{0x400u, 0x1000u};
+            (void)host.writeGuest(kSendAddress, kTransfer.data(), sizeof(kTransfer));
+            t.IsTrue(call(0x5Au, sizeof(kTransfer)).handled,
+                     "streaming transfer should complete");
+            t.Equals(host.audioCalls, 2u,
+                     "streaming transfer should notify the host audio backend");
+            t.Equals(host.lastAudioFunction, 0x5Au,
+                     "the host should observe the streaming-submit command");
+            t.Equals(host.lastAudioReceive.address, workArea,
+                     "streaming submit should expose the DMA staging area");
+            t.Equals(host.lastAudioPayload.size(), encoded.size(),
+                     "the host should receive the complete encoded chunk");
+            t.Equals(host.lastAudioPayload.front(), encoded.front(),
+                     "the first encoded byte should reach the host");
+            t.Equals(host.lastAudioPayload.back(), encoded.back(),
+                     "the last encoded byte should reach the host");
+
+            const std::array<uint32_t, 5> playback{
+                workArea, 0x400u, 0u, 44100u, 2u,
+            };
+            (void)host.writeGuest(kSendAddress, playback.data(), sizeof(playback));
+            t.IsTrue(call(0x3Eu, sizeof(playback)).handled,
+                     "streaming start should complete");
+            t.Equals(host.audioCalls, 3u,
+                     "streaming start should notify the host audio backend");
+            t.Equals(host.lastAudioFunction, 0x3Eu,
+                     "the host should observe the streaming-start command");
+
+            t.IsTrue(call(0x3Du, 0u).handled,
+                     "streaming stop should complete");
+            t.Equals(host.lastAudioFunction, 0x3Du,
+                     "the host should observe the streaming-stop command");
+            t.IsTrue(call(0x3Cu, 0u).handled,
+                     "streaming close should complete");
+            t.Equals(host.lastAudioFunction, 0x3Cu,
+                     "the host should observe the streaming-close command");
         });
 
         tc.Run("Sony 989snd stop freezes an open stream and close releases it", [](TestCase &t)
@@ -837,12 +924,12 @@ void register_ps2_iop_tests()
             host.virtualTime = 1'000'000'000u;
             t.IsTrue(call(0x5Bu, 0u).handled,
                      "a stopped stream should remain open");
-            t.Equals(host.readWord(kReceiveAddress + 4u), 0x1A0u,
+            t.Equals(host.readWord(kReceiveAddress + 4u), 0x1A4u,
                      "a stopped stream should retain its frozen encoded-byte cursor");
 
             t.IsTrue(call(0x3Cu, 0u).handled,
                      "streaming-close RPC should be handled");
-            t.Equals(host.readWord(kReceiveAddress + 4u), 0x1A0u,
+            t.Equals(host.readWord(kReceiveAddress + 4u), 0x1A4u,
                      "streaming close should preserve the shared response result");
             t.IsFalse(call(0x5Bu, 0u).handled,
                       "streaming position should be unavailable after close");

@@ -62,6 +62,10 @@ namespace ps2x::iop::detail
         constexpr uint32_t kEeRamSize = 32u * 1024u * 1024u;
         constexpr uint32_t kSpuAdpcmBlockBytes = 16u;
         constexpr uint32_t kSpuAdpcmSamplesPerBlock = 28u;
+        constexpr uint32_t kSpuAdpcmWordBytes = 2u;
+        constexpr uint32_t kSpuAdpcmSamplesPerWord = 4u;
+        constexpr uint32_t kSpuAdpcmDataWordsPerBlock =
+            (kSpuAdpcmBlockBytes / kSpuAdpcmWordBytes) - 1u;
         constexpr uint32_t kMaximumSpuSampleRate = 192000u;
         constexpr uint64_t kNanosecondsPerSecond = 1'000'000'000u;
 
@@ -118,6 +122,13 @@ namespace ps2x::iop::detail
 
             void reset() override
             {
+                if (m_streamingWorkArea != 0u)
+                {
+                    m_host.audioCommand(kSony989sndSid,
+                                        kRpcCloseVagStreaming,
+                                        {},
+                                        {});
+                }
                 releaseStreamingResource();
                 m_loadedSoundBanks.clear();
                 m_activeSoundHandles.clear();
@@ -149,6 +160,8 @@ namespace ps2x::iop::detail
 
                 uint32_t responseResult = m_lastResponseResult;
                 bool supported = false;
+                bool notifyAudioBackend = false;
+                GuestBuffer audioStreamData{};
                 if (request.function == kRpcStartSoundSystem &&
                     request.send.size == kStartRequestSize)
                 {
@@ -198,12 +211,21 @@ namespace ps2x::iop::detail
 
                     supported = true;
                     responseResult = openVagStreaming(streamingConfiguration);
+                    if (responseResult != 0u)
+                    {
+                        notifyAudioBackend = true;
+                        audioStreamData = {
+                            responseResult,
+                            streamingConfiguration[0],
+                        };
+                    }
                 }
                 if (request.function == kRpcCloseVagStreaming &&
                     request.send.size == 0u)
                 {
                     closeVagStreaming();
                     supported = true;
+                    notifyAudioBackend = true;
                     // The original RPC leaves the shared result word untouched.
                 }
                 if (request.function == kRpcStopVagStreaming &&
@@ -211,6 +233,7 @@ namespace ps2x::iop::detail
                 {
                     stopVagStreaming();
                     supported = true;
+                    notifyAudioBackend = true;
                     // The original RPC leaves the shared result word untouched.
                 }
                 if (request.function == kRpcStartVagStreaming &&
@@ -225,6 +248,7 @@ namespace ps2x::iop::detail
                     }
 
                     supported = startVagStreaming(playback);
+                    notifyAudioBackend = supported;
                     // Like transfer submission, the original RPC leaves the
                     // shared result word untouched.
                 }
@@ -240,6 +264,11 @@ namespace ps2x::iop::detail
                     }
 
                     supported = submitVagStreaming(transfer[0], transfer[1]);
+                    if (supported)
+                    {
+                        notifyAudioBackend = true;
+                        audioStreamData = {m_streamingWorkArea, transfer[0]};
+                    }
                     // The original server does not write a result for this RPC.
                     // Its shared response record therefore retains the result of
                     // the preceding result-producing call.
@@ -272,6 +301,18 @@ namespace ps2x::iop::detail
                     request.function != kRpcSubmitVagStreaming)
                 {
                     m_lastResponseResult = responseResult;
+                }
+
+                if (notifyAudioBackend)
+                {
+                    // For submit calls, the auxiliary buffer is the staging
+                    // work area populated by the preceding EE-to-IOP SIF DMA.
+                    // The host consumes it synchronously before the next DMA
+                    // reuses that address.
+                    m_host.audioCommand(kSony989sndSid,
+                                        request.function,
+                                        request.send,
+                                        audioStreamData);
                 }
 
                 result.handled = true;
@@ -831,10 +872,19 @@ namespace ps2x::iop::detail
                     kNanosecondsPerSecond;
                 const uint64_t samplePosition =
                     (wholeSamples + partialSamples) % samplesPerCycle;
-                const uint64_t blockPosition =
-                    samplePosition / kSpuAdpcmSamplesPerBlock;
+                // The SPU2 NAX register points at the next 16-bit ADPCM data
+                // word, not merely at the containing 16-byte block. Each
+                // block has one header word followed by seven data words, and
+                // each data word decodes to four samples. Key-on starts NAX at
+                // the first data word; crossing a block skips its header.
+                const uint64_t dataWordPosition =
+                    samplePosition / kSpuAdpcmSamplesPerWord;
+                const uint64_t headerWordsPassed =
+                    dataWordPosition / kSpuAdpcmDataWordsPerBlock;
+                const uint64_t naxWordPosition =
+                    1u + dataWordPosition + headerWordsPassed;
                 m_streamingPosition = static_cast<uint32_t>(
-                    (blockPosition * kSpuAdpcmBlockBytes) % channelBufferSize);
+                    (naxWordPosition * kSpuAdpcmWordBytes) % channelBufferSize);
                 return m_streamingPosition;
             }
 

@@ -7,6 +7,22 @@
 #include <unordered_map>
 #include <vector>
 
+namespace ps2_spu_adpcm
+{
+    struct DecoderState
+    {
+        int32_t previous1 = 0;
+        int32_t previous2 = 0;
+    };
+
+    // Decode headerless SPU ADPCM blocks while retaining predictor history.
+    // Each 16-byte block produces 28 signed 16-bit PCM samples.
+    bool decodeBlocks(const uint8_t *data,
+                      uint32_t sizeBytes,
+                      DecoderState &state,
+                      std::vector<int16_t> &outPcm);
+}
+
 class PS2AudioBackend
 {
 public:
@@ -44,6 +60,13 @@ private:
     void playDecodedSample(uint32_t sampleKey, DecodedSample &sample, float pitch, float volume,
                           bool isBgm = false);
     void pruneFinishedSounds();
+    void handleSony989sndCommand(uint32_t rpcNum,
+                                  const uint8_t *sendBuf,
+                                  uint32_t sendSize,
+                                  const uint8_t *streamData,
+                                  uint32_t streamDataSize);
+    void destroySpuAdpcmHostStream();
+    void closeSpuAdpcmStream();
 };
 
 #endif

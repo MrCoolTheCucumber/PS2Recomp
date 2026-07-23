@@ -1,4 +1,4 @@
-#include "runtime/ps2_memory.h"
+#include "runtime/ps2_audio.h"
 #include <algorithm>
 #include <cstdint>
 #include <cstring>
@@ -58,57 +58,63 @@ namespace ps2_vag
         outPcm.clear();
         outPcm.reserve(numBlocks * 28);
 
-        int16_t s1 = 0, s2 = 0;
         const uint8_t *block = data + 48;
+        const uint32_t availableBlocks = (sizeBytes - 48u) / 16u;
+        const uint32_t blocksToDecode = std::min(numBlocks, availableBlocks);
+        if (blocksToDecode == 0u)
+            return true;
 
-        for (uint32_t b = 0; b < numBlocks && (block + 16) <= data + sizeBytes; ++b, block += 16)
-        {
-            uint8_t shift = block[0] & 0x0F;
-            if (shift > 12)
-                shift = 9;
-            uint8_t filter = (block[0] >> 4) & 0x07;
-            if (filter > 4)
-                filter = 0;
-
-            for (int sampleIdx = 0; sampleIdx < 28; ++sampleIdx)
-            {
-                const uint8_t byte = block[2 + sampleIdx / 2];
-                const uint8_t nibble = (sampleIdx & 1) ? (byte >> 4) : (byte & 0x0F);
-                const int8_t rawSample = signExtend4(nibble);
-                const int32_t shiftedSample = rawSample << (12 - shift);
-
-                int32_t filteredSample;
-                const int32_t old = s1;
-                const int32_t older = s2;
-                switch (filter)
-                {
-                case 0:
-                    filteredSample = shiftedSample;
-                    break;
-                case 1:
-                    filteredSample = shiftedSample + (60 * old + 32) / 64;
-                    break;
-                case 2:
-                    filteredSample = shiftedSample + (115 * old - 52 * older + 32) / 64;
-                    break;
-                case 3:
-                    filteredSample = shiftedSample + (98 * old - 55 * older + 32) / 64;
-                    break;
-                case 4:
-                    filteredSample = shiftedSample + (122 * old - 60 * older + 32) / 64;
-                    break;
-                default:
-                    filteredSample = shiftedSample;
-                    break;
-                }
-
-                const int16_t clamped = clamp16(filteredSample);
-                s2 = s1;
-                s1 = clamped;
-                outPcm.push_back(clamped);
-            }
-        }
-
-        return true;
+        ps2_spu_adpcm::DecoderState state{};
+        return ps2_spu_adpcm::decodeBlocks(block,
+                                           blocksToDecode * 16u,
+                                           state,
+                                           outPcm);
     }
+}
+
+bool ps2_spu_adpcm::decodeBlocks(const uint8_t *data,
+                                 uint32_t sizeBytes,
+                                 DecoderState &state,
+                                 std::vector<int16_t> &outPcm)
+{
+    if (!data || sizeBytes == 0u || (sizeBytes % 16u) != 0u)
+        return false;
+
+    static constexpr int32_t kPredictors[5][2] = {
+        {0, 0},
+        {60, 0},
+        {115, -52},
+        {98, -55},
+        {122, -60},
+    };
+
+    const uint32_t blockCount = sizeBytes / 16u;
+    outPcm.reserve(outPcm.size() + static_cast<size_t>(blockCount) * 28u);
+    for (uint32_t blockIndex = 0u; blockIndex < blockCount; ++blockIndex)
+    {
+        const uint8_t *const block = data + blockIndex * 16u;
+        const uint32_t shift = block[0] & 0x0Fu;
+        const uint32_t encodedFilter = (block[0] >> 4u) & 0x0Fu;
+        const uint32_t filter = encodedFilter < 5u ? encodedFilter : 0u;
+
+        for (uint32_t sampleIndex = 0u; sampleIndex < 28u; ++sampleIndex)
+        {
+            const uint8_t packed = block[2u + sampleIndex / 2u];
+            const uint8_t nibble = (sampleIndex & 1u) != 0u
+                                       ? packed >> 4u
+                                       : packed & 0x0Fu;
+            const int32_t rawSample = signExtend4(nibble);
+            const int32_t shiftedSample = (rawSample * 4096) >> shift;
+            const int32_t predicted =
+                (kPredictors[filter][0] * state.previous1 +
+                 kPredictors[filter][1] * state.previous2 + 32) >>
+                6;
+            const int16_t sample = clamp16(shiftedSample + predicted);
+
+            state.previous2 = state.previous1;
+            state.previous1 = sample;
+            outPcm.push_back(sample);
+        }
+    }
+    return true;
 }

@@ -1,7 +1,12 @@
 #include "runtime/ps2_audio.h"
 #include "runtime/ps2_memory.h"
 #include "ps2_host_backend.h"
+#include <algorithm>
+#include <array>
+#include <atomic>
 #include <cstring>
+#include <deque>
+#include <limits>
 #include <vector>
 
 namespace
@@ -76,7 +81,89 @@ struct PS2AudioBackend::Impl
         Sound snd;
         uint32_t sampleKey;
     };
+
+    struct SpuAdpcmStream
+    {
+        std::mutex mutex;
+        std::array<ps2_spu_adpcm::DecoderState, 2> decoders{};
+        std::array<std::deque<int16_t>, 2> channelPcm;
+        std::deque<int16_t> interleavedPcm;
+        AudioStream hostStream{};
+        uint32_t channelBufferSize = 0;
+        uint32_t sampleRate = 0;
+        uint32_t channelCount = 0;
+        bool opened = false;
+        bool hostStreamLoaded = false;
+        bool playing = false;
+    };
+
     std::vector<TrackedSound> activeSounds;
+    SpuAdpcmStream spuAdpcmStream;
+
+    inline static std::atomic<SpuAdpcmStream *> activeCallbackStream{nullptr};
+
+    static void flushChannelPcm(SpuAdpcmStream &stream)
+    {
+        if (stream.channelCount == 1u)
+        {
+            auto &mono = stream.channelPcm[0];
+            while (!mono.empty())
+            {
+                stream.interleavedPcm.push_back(mono.front());
+                mono.pop_front();
+            }
+        }
+        else if (stream.channelCount == 2u)
+        {
+            auto &left = stream.channelPcm[0];
+            auto &right = stream.channelPcm[1];
+            while (!left.empty() && !right.empty())
+            {
+                stream.interleavedPcm.push_back(left.front());
+                stream.interleavedPcm.push_back(right.front());
+                left.pop_front();
+                right.pop_front();
+            }
+        }
+
+        if (stream.channelCount != 0u && stream.sampleRate != 0u)
+        {
+            const size_t maximumSamples =
+                static_cast<size_t>(stream.sampleRate) * stream.channelCount * 2u;
+            while (stream.interleavedPcm.size() > maximumSamples)
+            {
+                for (uint32_t channel = 0u;
+                     channel < stream.channelCount && !stream.interleavedPcm.empty();
+                     ++channel)
+                {
+                    stream.interleavedPcm.pop_front();
+                }
+            }
+        }
+    }
+
+    static void streamCallback(void *bufferData, unsigned int frameCount)
+    {
+        SpuAdpcmStream *const stream =
+            activeCallbackStream.load(std::memory_order_acquire);
+        if (!stream || !bufferData)
+            return;
+
+        std::lock_guard<std::mutex> lock(stream->mutex);
+        const uint32_t channels = stream->channelCount;
+        if (channels == 0u || channels > 2u)
+            return;
+
+        int16_t *const output = static_cast<int16_t *>(bufferData);
+        const size_t requestedSamples = static_cast<size_t>(frameCount) * channels;
+        size_t written = 0u;
+        while (written < requestedSamples && !stream->interleavedPcm.empty())
+        {
+            output[written++] = stream->interleavedPcm.front();
+            stream->interleavedPcm.pop_front();
+        }
+        std::fill(output + written, output + requestedSamples, 0);
+    }
 };
 
 PS2AudioBackend::PS2AudioBackend() : m_impl(std::make_unique<Impl>())
@@ -141,12 +228,24 @@ void PS2AudioBackend::onVagTransferFromBuffer(const uint8_t *data, uint32_t size
 namespace
 {
     constexpr uint32_t LIBSD_CMD_SET_VOICE = 0x8010u;
+    constexpr uint32_t SONY_989SND_SID = 0x00123456u;
+    constexpr uint32_t SONY_989SND_OPEN_STREAM = 0x3Bu;
+    constexpr uint32_t SONY_989SND_CLOSE_STREAM = 0x3Cu;
+    constexpr uint32_t SONY_989SND_STOP_STREAM = 0x3Du;
+    constexpr uint32_t SONY_989SND_START_STREAM = 0x3Eu;
+    constexpr uint32_t SONY_989SND_SUBMIT_STREAM = 0x5Au;
 }
 
 void PS2AudioBackend::onSoundCommand(uint32_t sid, uint32_t rpcNum,
                                      const uint8_t *sendBuf, uint32_t sendSize,
                                      uint8_t *recvBuf, uint32_t recvSize)
 {
+    if (sid == SONY_989SND_SID)
+    {
+        handleSony989sndCommand(rpcNum, sendBuf, sendSize, recvBuf, recvSize);
+        return;
+    }
+
     if (sid != 0x80000701u)
         return;
 
@@ -190,6 +289,197 @@ void PS2AudioBackend::onSoundCommand(uint32_t sid, uint32_t rpcNum,
         }
         play(sampleAddr, pitch, 1.0f, voiceIndex);
     }
+}
+
+void PS2AudioBackend::destroySpuAdpcmHostStream()
+{
+    Impl::SpuAdpcmStream &stream = m_impl->spuAdpcmStream;
+    AudioStream hostStream{};
+    bool loaded = false;
+    {
+        std::lock_guard<std::mutex> lock(stream.mutex);
+        hostStream = stream.hostStream;
+        loaded = stream.hostStreamLoaded;
+        stream.hostStreamLoaded = false;
+        stream.playing = false;
+        stream.hostStream = {};
+    }
+
+    Impl::SpuAdpcmStream *expected = &stream;
+    (void)Impl::activeCallbackStream.compare_exchange_strong(
+        expected, nullptr, std::memory_order_acq_rel);
+
+#if !defined(PLATFORM_VITA)
+    if (loaded && IsAudioDeviceReady())
+    {
+        SetAudioStreamCallback(hostStream, nullptr);
+        StopAudioStream(hostStream);
+        UnloadAudioStream(hostStream);
+    }
+#else
+    (void)hostStream;
+    (void)loaded;
+#endif
+}
+
+void PS2AudioBackend::closeSpuAdpcmStream()
+{
+    destroySpuAdpcmHostStream();
+
+    Impl::SpuAdpcmStream &stream = m_impl->spuAdpcmStream;
+    std::lock_guard<std::mutex> lock(stream.mutex);
+    stream.decoders = {};
+    stream.channelPcm = {};
+    stream.interleavedPcm.clear();
+    stream.channelBufferSize = 0u;
+    stream.sampleRate = 0u;
+    stream.channelCount = 0u;
+    stream.opened = false;
+}
+
+void PS2AudioBackend::handleSony989sndCommand(uint32_t rpcNum,
+                                               const uint8_t *sendBuf,
+                                               uint32_t sendSize,
+                                               const uint8_t *streamData,
+                                               uint32_t streamDataSize)
+{
+    Impl::SpuAdpcmStream &stream = m_impl->spuAdpcmStream;
+
+    if (rpcNum == SONY_989SND_OPEN_STREAM)
+    {
+        closeSpuAdpcmStream();
+        if (!sendBuf || sendSize < 6u * sizeof(uint32_t) ||
+            !streamData || streamDataSize == 0u)
+        {
+            return;
+        }
+
+        std::array<uint32_t, 6> configuration{};
+        std::memcpy(configuration.data(), sendBuf, sizeof(configuration));
+        if (configuration[0] != streamDataSize || configuration[1] == 0u)
+            return;
+
+        std::lock_guard<std::mutex> lock(stream.mutex);
+        stream.channelBufferSize = configuration[1];
+        stream.opened = true;
+        return;
+    }
+
+    if (rpcNum == SONY_989SND_CLOSE_STREAM)
+    {
+        closeSpuAdpcmStream();
+        return;
+    }
+
+    if (rpcNum == SONY_989SND_STOP_STREAM)
+    {
+        AudioStream hostStream{};
+        bool loaded = false;
+        {
+            std::lock_guard<std::mutex> lock(stream.mutex);
+            hostStream = stream.hostStream;
+            loaded = stream.hostStreamLoaded;
+            stream.playing = false;
+        }
+#if !defined(PLATFORM_VITA)
+        if (loaded && IsAudioDeviceReady())
+            PauseAudioStream(hostStream);
+#else
+        (void)hostStream;
+        (void)loaded;
+#endif
+        return;
+    }
+
+    if (rpcNum == SONY_989SND_SUBMIT_STREAM)
+    {
+        if (!sendBuf || sendSize < 2u * sizeof(uint32_t) ||
+            !streamData || streamDataSize == 0u)
+        {
+            return;
+        }
+
+        std::array<uint32_t, 2> transfer{};
+        std::memcpy(transfer.data(), sendBuf, sizeof(transfer));
+        const uint32_t byteCount = transfer[0];
+        const uint32_t destinationOffset = transfer[1];
+        if (byteCount == 0u || byteCount > streamDataSize ||
+            (byteCount % 16u) != 0u)
+        {
+            return;
+        }
+
+        std::lock_guard<std::mutex> lock(stream.mutex);
+        if (!stream.opened || stream.channelBufferSize == 0u)
+            return;
+
+        const uint32_t channel = destinationOffset / stream.channelBufferSize;
+        const uint32_t channelOffset = destinationOffset % stream.channelBufferSize;
+        if (channel >= stream.channelPcm.size() ||
+            channelOffset > stream.channelBufferSize ||
+            byteCount > stream.channelBufferSize - channelOffset)
+        {
+            return;
+        }
+
+        std::vector<int16_t> decoded;
+        if (!ps2_spu_adpcm::decodeBlocks(streamData,
+                                         byteCount,
+                                         stream.decoders[channel],
+                                         decoded))
+        {
+            return;
+        }
+        stream.channelPcm[channel].insert(stream.channelPcm[channel].end(),
+                                          decoded.begin(), decoded.end());
+        Impl::flushChannelPcm(stream);
+        return;
+    }
+
+    if (rpcNum != SONY_989SND_START_STREAM ||
+        !sendBuf || sendSize < 5u * sizeof(uint32_t))
+    {
+        return;
+    }
+
+    std::array<uint32_t, 5> playback{};
+    std::memcpy(playback.data(), sendBuf, sizeof(playback));
+    const uint32_t sampleRate = playback[3];
+    const uint32_t channelCount = playback[4];
+    if (sampleRate == 0u || sampleRate > 192000u ||
+        channelCount == 0u || channelCount > 2u)
+    {
+        return;
+    }
+
+    destroySpuAdpcmHostStream();
+    {
+        std::lock_guard<std::mutex> lock(stream.mutex);
+        if (!stream.opened)
+            return;
+        stream.sampleRate = sampleRate;
+        stream.channelCount = channelCount;
+        Impl::flushChannelPcm(stream);
+    }
+
+#if !defined(PLATFORM_VITA)
+    if (!m_audioReady || !IsAudioDeviceReady())
+        return;
+
+    AudioStream hostStream = LoadAudioStream(sampleRate, 16u, channelCount);
+    if (!IsAudioStreamValid(hostStream))
+        return;
+
+    {
+        std::lock_guard<std::mutex> lock(stream.mutex);
+        stream.hostStream = hostStream;
+        stream.hostStreamLoaded = true;
+        stream.playing = true;
+    }
+    Impl::activeCallbackStream.store(&stream, std::memory_order_release);
+    SetAudioStreamCallback(hostStream, &Impl::streamCallback);
+    PlayAudioStream(hostStream);
+#endif
 }
 
 void PS2AudioBackend::play(uint32_t sampleAddr, float pitch, float volume, uint32_t voiceIndex)
@@ -314,6 +604,8 @@ void PS2AudioBackend::stop(uint32_t voiceId)
 
 void PS2AudioBackend::stopAll()
 {
+    closeSpuAdpcmStream();
+
     std::lock_guard<std::mutex> lock(m_mutex);
 #if defined(PLATFORM_VITA)
     return;
