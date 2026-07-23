@@ -818,13 +818,20 @@ void register_ps2_memory_tests()
             std::vector<uint8_t> order;
             GifArbiter arbiter([&](const uint8_t *data, uint32_t sizeBytes)
             {
-                if (data && sizeBytes > 0u)
-                    order.push_back(data[0]);
+                if (data && sizeBytes >= 16u)
+                    order.push_back(data[8]);
             });
 
-            const std::vector<uint8_t> p1(16u, 0x11u);
-            const std::vector<uint8_t> p2(16u, 0x22u);
-            const std::vector<uint8_t> p3(16u, 0x33u);
+            auto makeEmptyPacket = [](uint8_t marker)
+            {
+                std::vector<uint8_t> packet;
+                appendU64(packet, makeGifTag(0u, GIF_FMT_PACKED, 1u, true));
+                appendU64(packet, marker);
+                return packet;
+            };
+            const std::vector<uint8_t> p1 = makeEmptyPacket(0x11u);
+            const std::vector<uint8_t> p2 = makeEmptyPacket(0x22u);
+            const std::vector<uint8_t> p3 = makeEmptyPacket(0x33u);
 
             arbiter.submit(GifPathId::Path3, p3.data(), static_cast<uint32_t>(p3.size()));
             arbiter.submit(GifPathId::Path2, p2.data(), static_cast<uint32_t>(p2.size()));
@@ -835,6 +842,34 @@ void register_ps2_memory_tests()
             t.Equals(order[0], static_cast<uint8_t>(0x11u), "PATH1 should be drained first");
             t.Equals(order[1], static_cast<uint8_t>(0x22u), "PATH2 should be drained second");
             t.Equals(order[2], static_cast<uint8_t>(0x33u), "PATH3 should be drained third");
+        });
+
+        tc.Run("GIF arbiter reassembles IMAGE payload split across submissions", [](TestCase &t)
+        {
+            std::vector<std::vector<uint8_t>> captured;
+            GifArbiter arbiter([&](const uint8_t *data, uint32_t sizeBytes)
+            {
+                captured.emplace_back(data, data + sizeBytes);
+            });
+
+            std::vector<uint8_t> packet;
+            appendU64(packet, makeGifTag(2u, GIF_FMT_IMAGE, 0u, true));
+            appendU64(packet, 0u);
+            for (uint32_t i = 0u; i < 32u; ++i)
+                packet.push_back(static_cast<uint8_t>(0x40u + i));
+
+            arbiter.submit(GifPathId::Path2, packet.data(), 32u);
+            arbiter.drain();
+            t.Equals(captured.size(), static_cast<size_t>(0u), "partial IMAGE must stay buffered");
+            t.IsFalse(arbiter.empty(), "partial IMAGE should make the path stream non-empty");
+
+            arbiter.submit(GifPathId::Path2, packet.data() + 32u, 16u);
+            arbiter.drain();
+            t.Equals(captured.size(), static_cast<size_t>(1u), "completed IMAGE should drain once");
+            t.Equals(captured[0].size(), packet.size(), "reassembled IMAGE size should match the stream");
+            t.IsTrue(std::memcmp(captured[0].data(), packet.data(), packet.size()) == 0,
+                     "reassembled IMAGE bytes should preserve tag and payload order");
+            t.IsTrue(arbiter.empty(), "completed IMAGE should leave no buffered path data");
         });
 
         tc.Run("GIF arbiter frames IMAGE2 like IMAGE", [](TestCase &t)
@@ -865,26 +900,25 @@ void register_ps2_memory_tests()
             std::vector<uint8_t> firstBytes;
             GifArbiter arbiter([&](const uint8_t *data, uint32_t sizeBytes)
             {
-                if (data && sizeBytes > 0u)
-                    firstBytes.push_back(data[0]);
+                if (data && sizeBytes >= 16u)
+                    firstBytes.push_back(data[8]);
             });
             mem.setGifArbiter(&arbiter);
 
             std::vector<uint8_t> path3Image;
-            appendU64(path3Image, makeGifTag(0x00AAu, 2u, 0u, true)); // IMAGE packet marker: first byte 0xAA
-            appendU64(path3Image, 0ull);
+            appendU64(path3Image, makeGifTag(1u, GIF_FMT_IMAGE, 0u, true));
+            appendU64(path3Image, 0xA3ull);
+            path3Image.insert(path3Image.end(), 16u, 0xAAu);
             mem.submitGifPacket(GifPathId::Path3, path3Image.data(), static_cast<uint32_t>(path3Image.size()), false);
 
             std::vector<uint8_t> vifPacket;
             appendU32(vifPacket, makeVifCmd(0x51u, 0u, 1u)); // DIRECTHL 1 QW
-            for (uint32_t i = 0; i < 16u; ++i)
-            {
-                vifPacket.push_back(static_cast<uint8_t>(0xD2u + i));
-            }
+            appendU64(vifPacket, makeGifTag(0u, GIF_FMT_PACKED, 1u, true));
+            appendU64(vifPacket, 0xD2ull);
             mem.processVIF1Data(vifPacket.data(), static_cast<uint32_t>(vifPacket.size()));
 
             t.Equals(firstBytes.size(), static_cast<size_t>(2u), "PATH3 and DIRECTHL packets should both drain");
-            t.Equals(firstBytes[0], static_cast<uint8_t>(0xAAu), "DIRECTHL should not preempt queued PATH3 IMAGE packet");
+            t.Equals(firstBytes[0], static_cast<uint8_t>(0xA3u), "DIRECTHL should not preempt queued PATH3 IMAGE packet");
             t.Equals(firstBytes[1], static_cast<uint8_t>(0xD2u), "DIRECTHL packet should drain after PATH3 IMAGE packet");
         });
 
@@ -1903,7 +1937,7 @@ void register_ps2_memory_tests()
             t.IsTrue(imageOk, "VIF1 DIRECT image should update GS VRAM through GIF path2");
         });
 
-        tc.Run("VIF1 DIRECT image tag can continue with raw image qwords", [](TestCase &t)
+        tc.Run("VIF1 DIRECT payload can continue across interpreter calls", [](TestCase &t)
         {
             PS2Memory mem;
             t.IsTrue(mem.initialize(), "PS2Memory initialize should succeed");
@@ -1929,7 +1963,7 @@ void register_ps2_memory_tests()
             gs.writeRegister(GS_REG_TRXDIR, 0ull);
 
             std::vector<uint8_t> packet;
-            appendU32(packet, makeVifCmd(0x50u, 0u, 1u)); // DIRECT 1 QW payload: GIF IMAGE tag only.
+            appendU32(packet, makeVifCmd(0x50u, 0u, 2u)); // DIRECT 2 QW payload split across calls.
             appendU64(packet, makeGifTag(1u, GIF_FMT_IMAGE, 0u, true));
             appendU64(packet, 0ull);
             for (uint32_t i = 0; i < 16u; ++i)
@@ -1937,7 +1971,8 @@ void register_ps2_memory_tests()
                 packet.push_back(static_cast<uint8_t>(0xA0u + i));
             }
 
-            mem.processVIF1Data(packet.data(), static_cast<uint32_t>(packet.size()));
+            mem.processVIF1Data(packet.data(), 20u); // command plus GIF IMAGE tag
+            mem.processVIF1Data(packet.data() + 20u, 16u); // remaining image qword
 
             const uint8_t *vramOut = mem.getGSVRAM();
             bool imageOk = true;
@@ -1953,7 +1988,7 @@ void register_ps2_memory_tests()
                     }
                 }
             }
-            t.IsTrue(imageOk, "raw qwords after a DIRECT image tag should continue the PATH2 image upload");
+            t.IsTrue(imageOk, "continued DIRECT payload should complete the PATH2 image upload");
         });
 
         tc.Run("unaligned accesses throw", [](TestCase &t)

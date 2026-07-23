@@ -1,6 +1,7 @@
 #ifndef PS2_GIF_ARBITER_H
 #define PS2_GIF_ARBITER_H
 
+#include <array>
 #include <cstdint>
 #include <functional>
 #include <vector>
@@ -33,13 +34,21 @@ public:
     void submit(GifPathId pathId, const uint8_t *data, uint32_t sizeBytes, bool path2DirectHl = false);
 
     void drain();
-    bool empty() const { return m_queue.empty(); }
+    void reset();
+    bool empty() const;
 
 private:
+    struct PathStream
+    {
+        std::vector<uint8_t> data;
+        bool path2DirectHl = false;
+    };
+
     ProcessPacketFn m_processFn;
     std::vector<GifArbiterPacket> m_queue;
+    std::array<PathStream, 4> m_pathStreams;
 
-    static bool isImagePacket(const uint8_t *data, uint32_t sizeBytes);
+    static bool containsImagePacket(const uint8_t *data, uint32_t sizeBytes);
     static uint8_t pathPriority(GifPathId id);
 };
 

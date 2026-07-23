@@ -300,7 +300,7 @@ bool PS2Memory::initialize(size_t ramSize)
     m_codeRegions.clear();
     m_path3Masked = false;
     m_path3MaskedFifo.clear();
-    m_vif1PendingPath2ImageQwc = 0u;
+    m_vif1PendingPath2DirectQwc = 0u;
     m_vif1PendingPath2DirectHl = false;
     m_timer0LastHostNs = 0;
     m_timer0FractionNs = 0;
@@ -1070,7 +1070,7 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
             if (value & 0x1u) // RST
             {
                 std::memset(&vif1_regs, 0, sizeof(vif1_regs));
-                m_vif1PendingPath2ImageQwc = 0u;
+                m_vif1PendingPath2DirectQwc = 0u;
                 m_vif1PendingPath2DirectHl = false;
             }
             if (value & 0x8u) // STC
