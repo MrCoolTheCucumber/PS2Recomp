@@ -262,6 +262,36 @@ void register_code_generator_tests()
                  "DADDI should not compute a potentially overflowing signed sum");
     });
 
+    tc.Run("MMI signed multiply-accumulate uses defined wrapping arithmetic", [](TestCase &t) {
+        CodeGenerator gen({}, {});
+
+        Instruction madd{};
+        madd.opcode = OPCODE_MMI;
+        madd.isMMI = true;
+        madd.function = MMI_MADD;
+        madd.rs = 2;
+        madd.rt = 3;
+        madd.rd = 4;
+
+        const std::string maddCode = gen.translateInstruction(madd);
+        t.IsTrue(maddCode.find("uint64_t result = Ps2MaddSigned32(acc, GPR_S32(ctx, 2), GPR_S32(ctx, 3));") != std::string::npos,
+                 "MADD should accumulate through the wrapping signed-product helper");
+        t.IsTrue(maddCode.find(" int64_t result") == std::string::npos,
+                 "MADD should not store an arbitrary accumulator bit pattern in a signed integer");
+
+        madd.function = MMI_MSUB;
+        const std::string msubCode = gen.translateInstruction(madd);
+        t.IsTrue(msubCode.find("uint64_t result = Ps2MsubSigned32(acc, GPR_S32(ctx, 2), GPR_S32(ctx, 3));") != std::string::npos,
+                 "MSUB should accumulate through the wrapping signed-product helper");
+        t.IsTrue(msubCode.find(" int64_t result") == std::string::npos,
+                 "MSUB should not store an arbitrary accumulator bit pattern in a signed integer");
+
+        madd.function = MMI_MADD1;
+        const std::string madd1Code = gen.translateInstruction(madd);
+        t.IsTrue(madd1Code.find("Ps2MaddSigned32(acc, GPR_S32(ctx, 2), GPR_S32(ctx, 3))") != std::string::npos,
+                 "MADD1 should use the same defined wrapping behavior for HI1/LO1");
+    });
+
     tc.Run("constant MMIO store emits direct runtime store", [](TestCase &t) {
         Function func;
         func.name = "mmio_store";

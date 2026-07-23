@@ -595,6 +595,19 @@ void register_ps2_runtime_expansion_tests()
                      "non-trapping 64-bit addition should wrap");
             t.Equals(SUB64(0ull, 1ull), 0xFFFFFFFFFFFFFFFFull,
                      "non-trapping 64-bit subtraction should wrap");
+
+            t.Equals(Ps2MaddSigned32(0x7FFFFFFFFFFFFFFFull, 1, 1),
+                     0x8000000000000000ull,
+                     "signed MADD should wrap across the host signed boundary");
+            t.Equals(Ps2MaddSigned32(0ull, -1, 1),
+                     0xFFFFFFFFFFFFFFFFull,
+                     "signed MADD should preserve a negative product's two's-complement bits");
+            t.Equals(Ps2MsubSigned32(0xFFFFFFFFFFFFFFFFull, -1, 1),
+                     0ull,
+                     "signed MSUB should wrap while subtracting a negative product");
+            t.Equals(Ps2MaddSigned32(0ull, INT32_MIN, INT32_MIN),
+                     0x4000000000000000ull,
+                     "signed MADD should handle the largest 32-bit product exactly");
         });
 
         tc.Run("differential decoder/codegen gpr-write contract for MULT and DIV families", [](TestCase &t)
