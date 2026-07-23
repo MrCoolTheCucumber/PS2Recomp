@@ -36,6 +36,7 @@ namespace
     constexpr uint32_t IOP_SID_MCSERV = 0x80000400u;
     constexpr uint32_t IOP_SID_CDVDFSV_DISK_READY = 0x8000059Au;
     constexpr uint32_t IOP_SID_LIBSD = 0x80000701u;
+    constexpr uint32_t IOP_SID_SONY_989SND = 0x00123456u;
     constexpr uint32_t IOP_SID_FATAL_FRAME_SDRDRV = 0x19740512u;
     constexpr uint32_t IOP_RPC_SNDDRV_SUBMIT = 0x00000000u;
     constexpr uint32_t IOP_RPC_SNDDRV_GET_STATUS_ADDR = 0x00000012u;
@@ -542,6 +543,560 @@ void register_ps2_sif_rpc_tests()
             t.Equals(readGuestStruct<uint32_t>(env.rdram.data(), kRecvAddr),
                      2u,
                      "CDVDFSV should report the complete/ready state");
+        });
+
+        tc.Run("Sony 989snd start RPC returns the observed queue sentinels", [](TestCase &t)
+        {
+            TestEnv env;
+
+            constexpr uint32_t kSendAddr = 0x00035AA0u;
+            constexpr uint32_t kRecvAddr = 0x00035AC0u;
+            constexpr uint32_t kSoundWorkArea = 0x00137B00u;
+            writeGuestStruct(env.rdram.data(), kSendAddr, kSoundWorkArea);
+            std::memset(env.rdram.data() + kRecvAddr, 0xCC, 12u);
+
+            const ps2x::iop::RpcResult result =
+                callIop(env, IOP_SID_SONY_989SND, 0u,
+                        kSendAddr, sizeof(uint32_t), kRecvAddr, 12u);
+
+            t.IsTrue(result.handled, "989snd start RPC should be handled");
+            t.Equals(result.resultAddress, kRecvAddr,
+                     "989snd start RPC should return the receive buffer");
+            t.Equals(readGuestStruct<uint32_t>(env.rdram.data(), kRecvAddr + 0u),
+                     0xFFFFFFFFu,
+                     "989snd start RPC should set the leading queue sentinel");
+            t.Equals(readGuestStruct<uint32_t>(env.rdram.data(), kRecvAddr + 4u),
+                     1u,
+                     "989snd start RPC should report success");
+            t.Equals(readGuestStruct<uint32_t>(env.rdram.data(), kRecvAddr + 8u),
+                     0xFFFFFFFFu,
+                     "989snd start RPC should set the trailing queue sentinel");
+        });
+
+        tc.Run("Sony 989snd configure RPC returns the observed success record", [](TestCase &t)
+        {
+            TestEnv env;
+
+            constexpr uint32_t kSendAddr = 0x00035AC0u;
+            constexpr uint32_t kRecvAddr = 0x00035AE0u;
+            constexpr std::array<uint32_t, 4> kRequest{4u, 0xF000u, 0u, 1u};
+            writeGuestStruct(env.rdram.data(), kSendAddr, kRequest);
+            std::memset(env.rdram.data() + kRecvAddr, 0xCC, 12u);
+
+            const ps2x::iop::RpcResult result =
+                callIop(env, IOP_SID_SONY_989SND, 0x2Au,
+                        kSendAddr, sizeof(kRequest), kRecvAddr, 12u);
+
+            t.IsTrue(result.handled, "989snd configure RPC should be handled");
+            t.Equals(readGuestStruct<uint32_t>(env.rdram.data(), kRecvAddr + 0u),
+                     0xFFFFFFFFu,
+                     "989snd configure RPC should set the leading sentinel");
+            t.Equals(readGuestStruct<uint32_t>(env.rdram.data(), kRecvAddr + 4u),
+                     1u,
+                     "989snd configure RPC should report success");
+            t.Equals(readGuestStruct<uint32_t>(env.rdram.data(), kRecvAddr + 8u),
+                     0xFFFFFFFFu,
+                     "989snd configure RPC should set the trailing sentinel");
+        });
+
+        tc.Run("Sony 989snd streaming open returns an allocated work area", [](TestCase &t)
+        {
+            TestEnv env;
+
+            constexpr uint32_t kSendAddr = 0x00035B00u;
+            constexpr uint32_t kRecvAddr = 0x00035B20u;
+            constexpr std::array<uint32_t, 6> kRequest{
+                0x400u,
+                0x1000u,
+                0x400u,
+                0u,
+                5u,
+                3u,
+            };
+            writeGuestStruct(env.rdram.data(), kSendAddr, kRequest);
+            std::memset(env.rdram.data() + kRecvAddr, 0xCC, 12u);
+
+            const ps2x::iop::RpcResult result =
+                callIop(env, IOP_SID_SONY_989SND, 0x3Bu,
+                        kSendAddr, sizeof(kRequest), kRecvAddr, 12u);
+            const uint32_t workArea =
+                readGuestStruct<uint32_t>(env.rdram.data(), kRecvAddr + 4u);
+
+            t.IsTrue(result.handled, "989snd streaming-open RPC should be handled");
+            t.Equals(result.resultAddress, kRecvAddr,
+                     "989snd streaming-open RPC should return the receive buffer");
+            t.Equals(readGuestStruct<uint32_t>(env.rdram.data(), kRecvAddr + 0u),
+                     0xFFFFFFFFu,
+                     "989snd streaming-open RPC should set the leading sentinel");
+            t.IsTrue(workArea != 0u,
+                     "989snd streaming-open RPC should return a work-area address");
+            t.Equals(workArea & 3u, 0u,
+                     "989snd streaming work area should be word aligned");
+            t.Equals(readGuestStruct<uint32_t>(env.rdram.data(), kRecvAddr + 8u),
+                     0xFFFFFFFFu,
+                     "989snd streaming-open RPC should set the trailing sentinel");
+        });
+
+        tc.Run("Sony 989snd streaming open reports invalid work-area sizes", [](TestCase &t)
+        {
+            TestEnv env;
+
+            constexpr uint32_t kSendAddr = 0x00035B40u;
+            constexpr uint32_t kRecvAddr = 0x00035B60u;
+            constexpr std::array<uint32_t, 6> kUnalignedRequest{
+                0x403u,
+                0x1000u,
+                0x400u,
+                0u,
+                5u,
+                3u,
+            };
+            writeGuestStruct(env.rdram.data(), kSendAddr, kUnalignedRequest);
+            std::memset(env.rdram.data() + kRecvAddr, 0xCC, 12u);
+
+            const ps2x::iop::RpcResult invalidResult =
+                callIop(env, IOP_SID_SONY_989SND, 0x3Bu,
+                        kSendAddr, sizeof(kUnalignedRequest), kRecvAddr, 12u);
+
+            t.IsTrue(invalidResult.handled,
+                     "989snd should complete a recognized streaming-open request");
+            t.Equals(readGuestStruct<uint32_t>(env.rdram.data(), kRecvAddr + 4u),
+                     0u,
+                     "989snd should report a null work area for an invalid size");
+
+            std::memset(env.rdram.data() + kRecvAddr, 0xCC, 12u);
+            const ps2x::iop::RpcResult truncatedResult =
+                callIop(env, IOP_SID_SONY_989SND, 0x3Bu,
+                        kSendAddr, sizeof(kUnalignedRequest) - sizeof(uint32_t),
+                        kRecvAddr, 12u);
+
+            t.IsFalse(truncatedResult.handled,
+                      "989snd should reject a truncated streaming-open request");
+            t.Equals(env.rdram[kRecvAddr], static_cast<uint8_t>(0xCC),
+                     "a rejected streaming-open request should preserve its response");
+        });
+
+        tc.Run("Sony 989snd streaming transfer requires an open stream", [](TestCase &t)
+        {
+            TestEnv env;
+
+            constexpr uint32_t kSendAddr = 0x00035B80u;
+            constexpr uint32_t kRecvAddr = 0x00035BA0u;
+            constexpr std::array<uint32_t, 2> kTransfer{0x400u, 0u};
+            writeGuestStruct(env.rdram.data(), kSendAddr, kTransfer);
+            std::memset(env.rdram.data() + kRecvAddr, 0xCC, 12u);
+
+            const ps2x::iop::RpcResult result =
+                callIop(env, IOP_SID_SONY_989SND, 0x5Au,
+                        kSendAddr, sizeof(kTransfer), kRecvAddr, 12u);
+
+            t.IsFalse(result.handled,
+                      "989snd should reject a streaming transfer before open");
+            t.Equals(env.rdram[kRecvAddr], static_cast<uint8_t>(0xCC),
+                     "a rejected streaming transfer should preserve its response");
+        });
+
+        tc.Run("Sony 989snd streaming transfer preserves the last result without poll-driven time", [](TestCase &t)
+        {
+            TestEnv env;
+
+            constexpr uint32_t kSendAddr = 0x00035BC0u;
+            constexpr uint32_t kRecvAddr = 0x00035BE0u;
+            constexpr std::array<uint32_t, 6> kOpen{
+                0x400u,
+                0x1000u,
+                0x400u,
+                0u,
+                5u,
+                3u,
+            };
+            writeGuestStruct(env.rdram.data(), kSendAddr, kOpen);
+            const ps2x::iop::RpcResult openResult =
+                callIop(env, IOP_SID_SONY_989SND, 0x3Bu,
+                        kSendAddr, sizeof(kOpen), kRecvAddr, 12u);
+            const uint32_t workArea =
+                readGuestStruct<uint32_t>(env.rdram.data(), kRecvAddr + 4u);
+            t.IsTrue(openResult.handled && workArea != 0u,
+                     "989snd streaming open should allocate a work area");
+
+            constexpr std::array<uint32_t, 2> kTransfer{0x400u, 0x1C00u};
+            writeGuestStruct(env.rdram.data(), kSendAddr, kTransfer);
+            const ps2x::iop::RpcResult transferResult =
+                callIop(env, IOP_SID_SONY_989SND, 0x5Au,
+                        kSendAddr, sizeof(kTransfer), kRecvAddr, 12u);
+            t.IsTrue(transferResult.handled,
+                     "989snd should accept a transfer inside its two channel buffers");
+            t.Equals(readGuestStruct<uint32_t>(env.rdram.data(), kRecvAddr + 4u),
+                     workArea,
+                     "989snd transfer should preserve the previous response result");
+
+            const ps2x::iop::RpcResult stoppedPositionResult =
+                callIop(env, IOP_SID_SONY_989SND, 0x5Bu,
+                        0u, 0u, kRecvAddr, 12u);
+            t.IsTrue(stoppedPositionResult.handled,
+                     "989snd should report an open stream before playback starts");
+            t.Equals(readGuestStruct<uint32_t>(env.rdram.data(), kRecvAddr + 4u),
+                     0u,
+                     "989snd streaming position should remain still before playback");
+
+            const std::array<uint32_t, 5> playback{
+                workArea,
+                0x400u,
+                0u,
+                44100u,
+                2u,
+            };
+            writeGuestStruct(env.rdram.data(), kSendAddr, playback);
+            const ps2x::iop::RpcResult playbackResult =
+                callIop(env, IOP_SID_SONY_989SND, 0x3Eu,
+                        kSendAddr, sizeof(playback), kRecvAddr, 12u);
+            t.IsTrue(playbackResult.handled,
+                     "989snd should start playback with its allocated work area");
+            t.Equals(readGuestStruct<uint32_t>(env.rdram.data(), kRecvAddr + 4u),
+                     0u,
+                     "989snd playback start should preserve the previous response result");
+
+            for (uint32_t query = 0u; query < 4u; ++query)
+            {
+                const ps2x::iop::RpcResult positionResult =
+                    callIop(env, IOP_SID_SONY_989SND, 0x5Bu,
+                            0u, 0u, kRecvAddr, 12u);
+                t.IsTrue(positionResult.handled,
+                         "989snd should report an open stream's position");
+                t.Equals(readGuestStruct<uint32_t>(env.rdram.data(), kRecvAddr + 4u),
+                         0u,
+                         "989snd streaming position must not advance merely because it was polled");
+            }
+        });
+
+        tc.Run("Sony 989snd streaming transfer rejects malformed ranges and reset state", [](TestCase &t)
+        {
+            TestEnv env;
+
+            constexpr uint32_t kSendAddr = 0x00035C00u;
+            constexpr uint32_t kRecvAddr = 0x00035C20u;
+            constexpr std::array<uint32_t, 6> kOpen{
+                0x400u,
+                0x1000u,
+                0x400u,
+                0u,
+                5u,
+                3u,
+            };
+            writeGuestStruct(env.rdram.data(), kSendAddr, kOpen);
+            (void)callIop(env, IOP_SID_SONY_989SND, 0x3Bu,
+                          kSendAddr, sizeof(kOpen), kRecvAddr, 12u);
+
+            constexpr std::array<uint32_t, 2> kOutOfRange{0x400u, 0x1E00u};
+            writeGuestStruct(env.rdram.data(), kSendAddr, kOutOfRange);
+            const ps2x::iop::RpcResult rangeResult =
+                callIop(env, IOP_SID_SONY_989SND, 0x5Au,
+                        kSendAddr, sizeof(kOutOfRange), kRecvAddr, 12u);
+            t.IsFalse(rangeResult.handled,
+                      "989snd should reject a transfer beyond its channel buffers");
+
+            const ps2x::iop::RpcResult truncatedResult =
+                callIop(env, IOP_SID_SONY_989SND, 0x5Au,
+                        kSendAddr, sizeof(uint32_t), kRecvAddr, 12u);
+            t.IsFalse(truncatedResult.handled,
+                      "989snd should reject a truncated streaming-transfer request");
+
+            constexpr std::array<uint32_t, 5> kInvalidPlayback{
+                0xDEADBEEFu,
+                0x400u,
+                0u,
+                44100u,
+                2u,
+            };
+            writeGuestStruct(env.rdram.data(), kSendAddr, kInvalidPlayback);
+            const ps2x::iop::RpcResult invalidPlaybackResult =
+                callIop(env, IOP_SID_SONY_989SND, 0x3Eu,
+                        kSendAddr, sizeof(kInvalidPlayback), kRecvAddr, 12u);
+            t.IsFalse(invalidPlaybackResult.handled,
+                      "989snd should reject playback with a foreign work area");
+
+            PS2IopTransport::reset(&env.runtime);
+            const ps2x::iop::RpcResult resetPositionResult =
+                callIop(env, IOP_SID_SONY_989SND, 0x5Bu,
+                        0u, 0u, kRecvAddr, 12u);
+            t.IsFalse(resetPositionResult.handled,
+                      "989snd reset should close the streaming resource");
+        });
+
+        tc.Run("Sony 989snd command 0x0b completes a single-command batch", [](TestCase &t)
+        {
+            TestEnv env;
+
+            constexpr uint32_t kSendAddr = 0x00035AE0u;
+            constexpr uint32_t kRecvAddr = 0x00035B00u;
+            constexpr std::array<uint32_t, 3> kCommand{
+                1u,
+                (sizeof(uint32_t) << 16u) | 0x0Bu,
+                0u,
+            };
+            writeGuestStruct(env.rdram.data(), kSendAddr, kCommand);
+            std::memset(env.rdram.data() + kRecvAddr, 0xCC, 12u);
+
+            const ps2x::iop::RpcResult result =
+                callIop(env, IOP_SID_SONY_989SND, 0x4Du,
+                        kSendAddr, sizeof(kCommand), kRecvAddr, 12u);
+
+            t.IsTrue(result.handled, "989snd command batch should be handled");
+            t.Equals(readGuestStruct<uint32_t>(env.rdram.data(), kRecvAddr + 0u),
+                     0xFFFFFFFFu,
+                     "989snd command batch should set the leading sentinel");
+            t.Equals(readGuestStruct<uint32_t>(env.rdram.data(), kRecvAddr + 4u),
+                     1u,
+                     "989snd command 0x0b should report success");
+            t.Equals(readGuestStruct<uint32_t>(env.rdram.data(), kRecvAddr + 8u),
+                     0xFFFFFFFFu,
+                     "989snd command batch should set the trailing sentinel");
+        });
+
+        tc.Run("Sony 989snd command 0x09 completes an eight-byte batch", [](TestCase &t)
+        {
+            TestEnv env;
+
+            constexpr uint32_t kSendAddr = 0x00035B00u;
+            constexpr uint32_t kRecvAddr = 0x00035B20u;
+            constexpr std::array<uint32_t, 4> kCommand{
+                1u,
+                (2u * sizeof(uint32_t) << 16u) | 0x09u,
+                0u,
+                0x333u,
+            };
+            writeGuestStruct(env.rdram.data(), kSendAddr, kCommand);
+            std::memset(env.rdram.data() + kRecvAddr, 0xCC, 12u);
+
+            const ps2x::iop::RpcResult result =
+                callIop(env, IOP_SID_SONY_989SND, 0x4Du,
+                        kSendAddr, sizeof(kCommand), kRecvAddr, 12u);
+
+            t.IsTrue(result.handled, "989snd command 0x09 should be handled");
+            t.Equals(readGuestStruct<uint32_t>(env.rdram.data(), kRecvAddr + 0u),
+                     0xFFFFFFFFu,
+                     "989snd command 0x09 should set the leading sentinel");
+            t.Equals(readGuestStruct<uint32_t>(env.rdram.data(), kRecvAddr + 4u),
+                     1u,
+                     "989snd command 0x09 should report success");
+            t.Equals(readGuestStruct<uint32_t>(env.rdram.data(), kRecvAddr + 8u),
+                     0xFFFFFFFFu,
+                     "989snd command 0x09 should set the trailing sentinel");
+        });
+
+        tc.Run("Sony 989snd command 0x0d completes an eight-byte batch", [](TestCase &t)
+        {
+            TestEnv env;
+
+            constexpr uint32_t kSendAddr = 0x00035B20u;
+            constexpr uint32_t kRecvAddr = 0x00035B40u;
+            constexpr std::array<uint32_t, 4> kCommand{
+                1u,
+                (2u * sizeof(uint32_t) << 16u) | 0x0Du,
+                0u,
+                1u,
+            };
+            writeGuestStruct(env.rdram.data(), kSendAddr, kCommand);
+            std::memset(env.rdram.data() + kRecvAddr, 0xCC, 12u);
+
+            const ps2x::iop::RpcResult result =
+                callIop(env, IOP_SID_SONY_989SND, 0x4Du,
+                        kSendAddr, sizeof(kCommand), kRecvAddr, 12u);
+
+            t.IsTrue(result.handled, "989snd command 0x0d should be handled");
+            t.Equals(readGuestStruct<uint32_t>(env.rdram.data(), kRecvAddr + 0u),
+                     0xFFFFFFFFu,
+                     "989snd command 0x0d should set the leading sentinel");
+            t.Equals(readGuestStruct<uint32_t>(env.rdram.data(), kRecvAddr + 4u),
+                     1u,
+                     "989snd command 0x0d should report success");
+            t.Equals(readGuestStruct<uint32_t>(env.rdram.data(), kRecvAddr + 8u),
+                     0xFFFFFFFFu,
+                     "989snd command 0x0d should set the trailing sentinel");
+        });
+
+        tc.Run("Sony 989snd command 0x51 completes an eight-byte batch", [](TestCase &t)
+        {
+            TestEnv env;
+
+            constexpr uint32_t kSendAddr = 0x00035B60u;
+            constexpr uint32_t kRecvAddr = 0x00035B80u;
+            constexpr std::array<uint32_t, 4> kCommand{
+                1u,
+                (2u * sizeof(uint32_t) << 16u) | 0x51u,
+                2u,
+                4u,
+            };
+            writeGuestStruct(env.rdram.data(), kSendAddr, kCommand);
+            std::memset(env.rdram.data() + kRecvAddr, 0xCC, 12u);
+
+            const ps2x::iop::RpcResult result =
+                callIop(env, IOP_SID_SONY_989SND, 0x4Du,
+                        kSendAddr, sizeof(kCommand), kRecvAddr, 12u);
+
+            t.IsTrue(result.handled, "989snd command 0x51 should be handled");
+            t.Equals(readGuestStruct<uint32_t>(env.rdram.data(), kRecvAddr + 0u),
+                     0xFFFFFFFFu,
+                     "989snd command 0x51 should set the leading sentinel");
+            t.Equals(readGuestStruct<uint32_t>(env.rdram.data(), kRecvAddr + 4u),
+                     1u,
+                     "989snd command 0x51 should report success");
+            t.Equals(readGuestStruct<uint32_t>(env.rdram.data(), kRecvAddr + 8u),
+                     0xFFFFFFFFu,
+                     "989snd command 0x51 should set the trailing sentinel");
+        });
+
+        tc.Run("Sony 989snd command 0x4e completes a twelve-byte batch", [](TestCase &t)
+        {
+            TestEnv env;
+
+            constexpr uint32_t kSendAddr = 0x00035BA0u;
+            constexpr uint32_t kRecvAddr = 0x00035BC0u;
+            constexpr std::array<uint32_t, 5> kCommand{
+                1u,
+                (3u * sizeof(uint32_t) << 16u) | 0x4Eu,
+                1u,
+                24u,
+                47u,
+            };
+            writeGuestStruct(env.rdram.data(), kSendAddr, kCommand);
+            std::memset(env.rdram.data() + kRecvAddr, 0xCC, 12u);
+
+            const ps2x::iop::RpcResult result =
+                callIop(env, IOP_SID_SONY_989SND, 0x4Du,
+                        kSendAddr, sizeof(kCommand), kRecvAddr, 12u);
+
+            t.IsTrue(result.handled, "989snd command 0x4e should be handled");
+            t.Equals(readGuestStruct<uint32_t>(env.rdram.data(), kRecvAddr + 0u),
+                     0xFFFFFFFFu,
+                     "989snd command 0x4e should set the leading sentinel");
+            t.Equals(readGuestStruct<uint32_t>(env.rdram.data(), kRecvAddr + 4u),
+                     1u,
+                     "989snd command 0x4e should report success");
+            t.Equals(readGuestStruct<uint32_t>(env.rdram.data(), kRecvAddr + 8u),
+                     0xFFFFFFFFu,
+                     "989snd command 0x4e should set the trailing sentinel");
+        });
+
+        tc.Run("Sony 989snd data read copies raw CD sectors and signals completion", [](TestCase &t)
+        {
+            TestEnv env;
+            ScopedTempDir temp("sony_989snd_data_read");
+
+            constexpr uint32_t kSectorSize = 2048u;
+            std::vector<uint8_t> disc(3u * kSectorSize, 0u);
+            for (uint32_t index = 0u; index < kSectorSize; ++index)
+            {
+                disc[kSectorSize + index] = static_cast<uint8_t>((index * 17u + 3u) & 0xFFu);
+            }
+            const std::filesystem::path discPath = temp.path / "disc.iso";
+            writeFile(discPath, disc);
+
+            const PS2Runtime::IoPaths oldPaths = PS2Runtime::getIoPaths();
+            PS2Runtime::IoPaths ioPaths = oldPaths;
+            ioPaths.cdImage = discPath;
+            PS2Runtime::setIoPaths(ioPaths);
+
+            constexpr uint32_t kSendAddr = 0x00035BE0u;
+            constexpr uint32_t kRecvAddr = 0x00035C20u;
+            constexpr uint32_t kDstAddr = 0x00180000u;
+            constexpr uint32_t kCompletionAddr = 0x00137B00u;
+            writeGuestStruct(env.rdram.data(), kSendAddr, kCompletionAddr);
+            writeGuestStruct(env.rdram.data(), kCompletionAddr, 1u);
+            const ps2x::iop::RpcResult startResult =
+                callIop(env, IOP_SID_SONY_989SND, 0u,
+                        kSendAddr, sizeof(kCompletionAddr), kRecvAddr, 12u);
+
+            constexpr std::array<uint32_t, 5> kReadCommand{
+                1u,
+                (3u * sizeof(uint32_t) << 16u) | 0x38u,
+                1u,
+                1u,
+                kDstAddr,
+            };
+            writeGuestStruct(env.rdram.data(), kSendAddr, kReadCommand);
+            std::memset(env.rdram.data() + kDstAddr - 1u, 0xCC, kSectorSize + 2u);
+
+            const ps2x::iop::RpcResult readResult =
+                callIop(env, IOP_SID_SONY_989SND, 0x4Du,
+                        kSendAddr, sizeof(kReadCommand), kRecvAddr, 12u);
+
+            t.IsTrue(readResult.handled, "989snd data-read command should be handled");
+            t.IsTrue(startResult.handled, "989snd start RPC should configure data-read completion");
+            t.Equals(std::memcmp(env.rdram.data() + kDstAddr,
+                                 disc.data() + kSectorSize,
+                                 kSectorSize),
+                     0,
+                     "989snd data-read command should copy the requested raw sector");
+            t.Equals(env.rdram[kDstAddr - 1u], static_cast<uint8_t>(0xCC),
+                     "989snd data read should preserve the byte before its destination");
+            t.Equals(env.rdram[kDstAddr + kSectorSize], static_cast<uint8_t>(0xCC),
+                     "989snd data read should preserve the byte after its destination");
+            t.Equals(readGuestStruct<uint32_t>(env.rdram.data(), kCompletionAddr),
+                     0u,
+                     "989snd data read should clear the configured completion word");
+
+            constexpr std::array<uint32_t, 2> kCancelCommand{1u, 0x37u};
+            writeGuestStruct(env.rdram.data(), kSendAddr, kCancelCommand);
+            const ps2x::iop::RpcResult cancelResult =
+                callIop(env, IOP_SID_SONY_989SND, 0x4Du,
+                        kSendAddr, sizeof(kCancelCommand), kRecvAddr, 12u);
+
+            PS2Runtime::setIoPaths(oldPaths);
+
+            t.IsTrue(cancelResult.handled, "989snd data-read cancel command should be handled");
+            t.Equals(readGuestStruct<uint32_t>(env.rdram.data(), kRecvAddr + 4u),
+                     1u,
+                     "989snd data-read cancel should report success");
+        });
+
+        tc.Run("Sony 989snd data read rejects a range beyond the CD image", [](TestCase &t)
+        {
+            TestEnv env;
+            ScopedTempDir temp("sony_989snd_data_read_range");
+
+            constexpr uint32_t kSectorSize = 2048u;
+            const std::filesystem::path discPath = temp.path / "disc.iso";
+            writeFile(discPath, std::vector<uint8_t>(kSectorSize, 0x5Au));
+
+            const PS2Runtime::IoPaths oldPaths = PS2Runtime::getIoPaths();
+            PS2Runtime::IoPaths ioPaths = oldPaths;
+            ioPaths.cdImage = discPath;
+            PS2Runtime::setIoPaths(ioPaths);
+
+            constexpr uint32_t kSendAddr = 0x00035BE0u;
+            constexpr uint32_t kRecvAddr = 0x00035C20u;
+            constexpr uint32_t kDstAddr = 0x00180000u;
+            constexpr uint32_t kCompletionAddr = 0x00137B00u;
+            writeGuestStruct(env.rdram.data(), kSendAddr, kCompletionAddr);
+            writeGuestStruct(env.rdram.data(), kCompletionAddr, 1u);
+            const ps2x::iop::RpcResult startResult =
+                callIop(env, IOP_SID_SONY_989SND, 0u,
+                        kSendAddr, sizeof(kCompletionAddr), kRecvAddr, 12u);
+
+            constexpr std::array<uint32_t, 5> kReadCommand{
+                1u,
+                (3u * sizeof(uint32_t) << 16u) | 0x38u,
+                1u,
+                1u,
+                kDstAddr,
+            };
+            writeGuestStruct(env.rdram.data(), kSendAddr, kReadCommand);
+            std::memset(env.rdram.data() + kDstAddr, 0xCC, kSectorSize);
+
+            const ps2x::iop::RpcResult result =
+                callIop(env, IOP_SID_SONY_989SND, 0x4Du,
+                        kSendAddr, sizeof(kReadCommand), kRecvAddr, 12u);
+
+            PS2Runtime::setIoPaths(oldPaths);
+
+            t.IsTrue(startResult.handled, "989snd start RPC should configure data-read completion");
+            t.IsFalse(result.handled, "989snd should reject a data read beyond the CD image");
+            t.Equals(env.rdram[kDstAddr], static_cast<uint8_t>(0xCC),
+                     "a rejected 989snd data read should not modify its destination");
+            t.Equals(readGuestStruct<uint32_t>(env.rdram.data(), kCompletionAddr),
+                     1u,
+                     "a rejected 989snd data read should leave completion pending");
         });
 
         tc.Run("LIBSD RPC routes through the IOP audio service", [](TestCase &t)

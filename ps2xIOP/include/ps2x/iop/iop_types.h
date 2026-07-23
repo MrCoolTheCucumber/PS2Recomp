@@ -72,6 +72,7 @@ namespace ps2x::iop
     {
         RpcServer = 0,
         RpcPacket = 1,
+        ServiceResource = 2,
     };
 
     enum class CallbackPolicy : uint32_t

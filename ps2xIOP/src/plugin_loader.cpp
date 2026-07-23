@@ -66,9 +66,15 @@ namespace ps2x::iop::detail
 
         IopHandleKind toHandleKind(uint32_t kind)
         {
-            return kind == PS2X_IOP_HANDLE_RPC_PACKET_V1
-                       ? IopHandleKind::RpcPacket
-                       : IopHandleKind::RpcServer;
+            switch (kind)
+            {
+            case PS2X_IOP_HANDLE_RPC_PACKET_V1:
+                return IopHandleKind::RpcPacket;
+            case PS2X_IOP_HANDLE_SERVICE_RESOURCE_V1:
+                return IopHandleKind::ServiceResource;
+            default:
+                return IopHandleKind::RpcServer;
+            }
         }
 
         HostPathKind toHostPathKind(uint32_t kind)

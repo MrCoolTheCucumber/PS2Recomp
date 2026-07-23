@@ -56,6 +56,7 @@ public:
                       uint32_t function,
                       ps2x::iop::GuestBuffer send,
                       ps2x::iop::GuestBuffer receive) override;
+    uint64_t virtualTimeNanoseconds() const override;
 
     std::string hostPath(ps2x::iop::HostPathKind kind) const override;
     std::string translateGuestPath(std::string_view path) const override;
@@ -92,6 +93,7 @@ private:
     uint8_t *m_activeRdram = nullptr;
     uint64_t m_activeToken = 0;
     uint64_t m_nextToken = 1;
+    uint32_t m_nextServiceResourceHandle = 0x00100000u;
     struct HostFile
     {
         std::FILE *stream = nullptr;

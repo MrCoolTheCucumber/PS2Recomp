@@ -1,6 +1,7 @@
 #include "ps2_iop_host.h"
 
 #include "ps2_runtime.h"
+#include "ps2_syscalls.h"
 #include "ps2_stubs.h"
 #include "runtime/ps2_memory.h"
 #include "Kernel/Stubs/MemoryCard.h"
@@ -195,6 +196,20 @@ bool PS2IopHostAdapter::normalizeGuestAddress(uint32_t address, uint32_t &normal
 
 uint32_t PS2IopHostAdapter::allocateIopHandle(ps2x::iop::IopHandleKind kind)
 {
+    if (kind == ps2x::iop::IopHandleKind::ServiceResource)
+    {
+        constexpr uint32_t kHandleStride = 0x10u;
+        if (m_nextServiceResourceHandle >
+            std::numeric_limits<uint32_t>::max() - kHandleStride)
+        {
+            return 0u;
+        }
+
+        const uint32_t handle = m_nextServiceResourceHandle;
+        m_nextServiceResourceHandle += kHandleStride;
+        return handle;
+    }
+
     uint8_t *const rdram = m_activeRdram
                                ? m_activeRdram
                                : m_runtime.memory().getRDRAM();
@@ -238,6 +253,21 @@ void PS2IopHostAdapter::audioCommand(uint32_t sid,
                                             send.size,
                                             receivePointer,
                                             receive.size);
+}
+
+uint64_t PS2IopHostAdapter::virtualTimeNanoseconds() const
+{
+    constexpr uint64_t kTicksPerSecond = 60u;
+    constexpr uint64_t kNanosecondsPerSecond = 1'000'000'000u;
+    const uint64_t tick = ps2_syscalls::GetCurrentVSyncTick();
+    const uint64_t wholeSeconds = tick / kTicksPerSecond;
+    if (wholeSeconds > std::numeric_limits<uint64_t>::max() / kNanosecondsPerSecond)
+    {
+        return std::numeric_limits<uint64_t>::max();
+    }
+
+    return wholeSeconds * kNanosecondsPerSecond +
+           ((tick % kTicksPerSecond) * kNanosecondsPerSecond) / kTicksPerSecond;
 }
 
 std::string PS2IopHostAdapter::hostPath(ps2x::iop::HostPathKind kind) const

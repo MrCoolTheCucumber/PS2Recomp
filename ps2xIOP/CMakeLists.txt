@@ -12,6 +12,7 @@ add_library(ps2_iop STATIC
     src/modules/dbcman.cpp
     src/modules/libsd.cpp
     src/modules/mcserv.cpp
+    src/modules/sony_989snd.cpp
     src/modules/tsnddrv.cpp
     src/modules/cri_dtx.cpp
     src/modules/clfile.cpp

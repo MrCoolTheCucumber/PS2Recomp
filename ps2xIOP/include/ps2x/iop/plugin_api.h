@@ -73,6 +73,7 @@ extern "C"
     {
         PS2X_IOP_HANDLE_RPC_SERVER_V1 = 0,
         PS2X_IOP_HANDLE_RPC_PACKET_V1 = 1,
+        PS2X_IOP_HANDLE_SERVICE_RESOURCE_V1 = 2,
     };
 
     enum ps2x_iop_log_level_v1
