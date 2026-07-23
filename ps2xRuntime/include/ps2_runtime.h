@@ -43,7 +43,11 @@ class PS2IopTransport;
 
 enum PS2Exception
 {
-    EXCEPTION_TLB_REFILL = 0x02,          // TLB refill/load exception
+    EXCEPTION_INTERRUPT = 0x00,
+    EXCEPTION_TLB_MODIFIED = 0x01,
+    EXCEPTION_TLB_REFILL_LOAD = 0x02,
+    EXCEPTION_TLB_REFILL = EXCEPTION_TLB_REFILL_LOAD,
+    EXCEPTION_TLB_REFILL_STORE = 0x03,
     EXCEPTION_ADDRESS_ERROR_LOAD = 0x04,  // Address error on load
     EXCEPTION_ADDRESS_ERROR_STORE = 0x05, // Address error on store
     EXCEPTION_SYSCALL = 0x08,             // SYSCALL instruction
@@ -388,6 +392,7 @@ public:
     static void configureIoPathsFromElf(const std::string &elfPath);
 
     void SignalException(R5900Context *ctx, PS2Exception exception);
+    void SignalMemoryException(R5900Context *ctx, PS2Exception exception, uint32_t badVAddr);
 
     void executeVU0Microprogram(uint8_t *rdram, R5900Context *ctx, uint32_t address);
     void vu0StartMicroProgram(uint8_t *rdram, R5900Context *ctx, uint32_t address);

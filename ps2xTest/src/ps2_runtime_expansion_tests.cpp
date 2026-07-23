@@ -43,8 +43,10 @@ namespace
     constexpr uint32_t COP0_CAUSE_EXCCODE_MASK = 0x0000007Cu;
     constexpr uint32_t COP0_STATUS_EXL = 0x00000002u;
     constexpr uint32_t COP0_STATUS_BEV = 0x00400000u;
-    constexpr uint32_t EXCEPTION_VECTOR_GENERAL = 0x80000080u;
-    constexpr uint32_t EXCEPTION_VECTOR_BOOT = 0xBFC00200u;
+    constexpr uint32_t EXCEPTION_VECTOR_GENERAL = 0x80000180u;
+    constexpr uint32_t EXCEPTION_VECTOR_BOOT = 0xBFC00380u;
+    constexpr uint32_t EXCEPTION_VECTOR_TLB_REFILL = 0x80000000u;
+    constexpr uint32_t EXCEPTION_VECTOR_TLB_REFILL_BOOT = 0xBFC00200u;
 
     constexpr int KE_OK = 0;
 
@@ -2313,6 +2315,113 @@ void register_ps2_runtime_expansion_tests()
             t.Equals(ctx.cop0_epc, 0x3000u, "non-delay exception should capture current pc in EPC");
             t.IsTrue((ctx.cop0_cause & COP0_CAUSE_BD) == 0u, "non-delay exception should clear CAUSE.BD");
             t.Equals(ctx.pc, EXCEPTION_VECTOR_BOOT, "BEV=1 should route exception to boot vector");
+        });
+
+        tc.Run("SignalException selects TLB vectors for load and store refills", [](TestCase &t)
+        {
+            PS2Runtime runtime;
+            R5900Context loadCtx{};
+            R5900Context storeCtx{};
+
+            loadCtx.pc = 0x4000u;
+            runtime.SignalException(&loadCtx, EXCEPTION_TLB_REFILL_LOAD);
+
+            storeCtx.pc = 0x5000u;
+            storeCtx.cop0_status = COP0_STATUS_BEV;
+            runtime.SignalException(&storeCtx, EXCEPTION_TLB_REFILL_STORE);
+
+            t.Equals(loadCtx.pc, EXCEPTION_VECTOR_TLB_REFILL,
+                     "TLB load refill should use the normal refill vector");
+            t.Equals(loadCtx.cop0_cause & COP0_CAUSE_EXCCODE_MASK,
+                     (static_cast<uint32_t>(EXCEPTION_TLB_REFILL_LOAD) << 2) & COP0_CAUSE_EXCCODE_MASK,
+                     "TLB load refill should report ExcCode 2");
+            t.Equals(storeCtx.pc, EXCEPTION_VECTOR_TLB_REFILL_BOOT,
+                     "TLB store refill with BEV=1 should use the bootstrap refill vector");
+            t.Equals(storeCtx.cop0_cause & COP0_CAUSE_EXCCODE_MASK,
+                     (static_cast<uint32_t>(EXCEPTION_TLB_REFILL_STORE) << 2) & COP0_CAUSE_EXCCODE_MASK,
+                     "TLB store refill should report ExcCode 3");
+        });
+
+        tc.Run("SignalException preserves EPC and BD while EXL is already set", [](TestCase &t)
+        {
+            PS2Runtime runtime;
+            R5900Context ctx{};
+
+            ctx.pc = 0x6000u;
+            ctx.branch_pc = 0x5FFCu;
+            ctx.in_delay_slot = true;
+            ctx.cop0_status = COP0_STATUS_EXL;
+            ctx.cop0_epc = 0x12345678u;
+            ctx.cop0_cause = COP0_CAUSE_BD | 0x00000100u;
+
+            runtime.SignalException(&ctx, EXCEPTION_TLB_REFILL_LOAD);
+
+            t.Equals(ctx.cop0_epc, 0x12345678u,
+                     "nested level-1 exception should preserve the original EPC");
+            t.IsTrue((ctx.cop0_cause & COP0_CAUSE_BD) != 0u,
+                     "nested level-1 exception should preserve the original BD bit");
+            t.Equals(ctx.cop0_cause & COP0_CAUSE_EXCCODE_MASK,
+                     (static_cast<uint32_t>(EXCEPTION_TLB_REFILL_LOAD) << 2) & COP0_CAUSE_EXCCODE_MASK,
+                     "nested exception should still update CAUSE.EXCCODE");
+            t.Equals(ctx.pc, EXCEPTION_VECTOR_GENERAL,
+                     "TLB refill while EXL=1 should use the common vector");
+            t.IsFalse(ctx.in_delay_slot, "exception delivery should clear runtime delay-slot state");
+        });
+
+        tc.Run("runtime memory faults populate BadVAddr and TLB metadata", [](TestCase &t)
+        {
+            PS2Runtime runtime;
+            t.IsTrue(runtime.memory().initialize(), "PS2Memory initialize should succeed");
+            uint8_t *const rdram = runtime.memory().getRDRAM();
+
+            R5900Context addressErrorCtx{};
+            addressErrorCtx.pc = 0x7000u;
+            const uint32_t addressErrorValue = runtime.Load32(rdram, &addressErrorCtx, 0x00000002u);
+
+            t.Equals(addressErrorValue, 0u, "faulting load should return the neutral fallback value");
+            t.Equals(addressErrorCtx.cop0_badvaddr, 0x00000002u,
+                     "address error should record the faulting virtual address");
+            t.Equals(addressErrorCtx.cop0_cause & COP0_CAUSE_EXCCODE_MASK,
+                     (static_cast<uint32_t>(EXCEPTION_ADDRESS_ERROR_LOAD) << 2) & COP0_CAUSE_EXCCODE_MASK,
+                     "unaligned load should report an address error");
+            t.Equals(addressErrorCtx.pc, EXCEPTION_VECTOR_GENERAL,
+                     "address error should use the common vector");
+
+            constexpr uint32_t loadMissAddress = 0xC1234000u;
+            R5900Context loadMissCtx{};
+            loadMissCtx.pc = 0x8000u;
+            loadMissCtx.cop0_context = 0xAB80000Fu;
+            loadMissCtx.cop0_entryhi = 0x000005A5u;
+            const uint32_t loadMissValue = runtime.Load32(rdram, &loadMissCtx, loadMissAddress);
+
+            t.Equals(loadMissValue, 0u, "TLB-missing load should return the neutral fallback value");
+            t.Equals(loadMissCtx.cop0_badvaddr, loadMissAddress,
+                     "TLB load refill should record BadVAddr");
+            t.Equals(loadMissCtx.cop0_context,
+                     (0xAB80000Fu & 0xFF80000Fu) | ((loadMissAddress >> 9u) & 0x007FFFF0u),
+                     "TLB load refill should update Context.BadVPN2");
+            t.Equals(loadMissCtx.cop0_entryhi,
+                     (loadMissAddress & 0xFFFFE000u) | (0x000005A5u & 0x00001FFFu),
+                     "TLB load refill should update EntryHi.VPN2 and preserve ASID");
+            t.Equals(loadMissCtx.cop0_cause & COP0_CAUSE_EXCCODE_MASK,
+                     (static_cast<uint32_t>(EXCEPTION_TLB_REFILL_LOAD) << 2) & COP0_CAUSE_EXCCODE_MASK,
+                     "TLB-missing load should report ExcCode 2");
+            t.Equals(loadMissCtx.pc, EXCEPTION_VECTOR_TLB_REFILL,
+                     "TLB-missing load should use the refill vector");
+
+            constexpr uint32_t storeMissAddress = 0xC5678000u;
+            R5900Context storeMissCtx{};
+            storeMissCtx.pc = 0x9000u;
+            storeMissCtx.cop0_status = COP0_STATUS_BEV;
+            runtime.Store32(rdram, &storeMissCtx, storeMissAddress, 0x11223344u);
+
+            t.Equals(storeMissCtx.cop0_badvaddr, storeMissAddress,
+                     "TLB store refill should record BadVAddr");
+            t.Equals(storeMissCtx.cop0_cause & COP0_CAUSE_EXCCODE_MASK,
+                     (static_cast<uint32_t>(EXCEPTION_TLB_REFILL_STORE) << 2) & COP0_CAUSE_EXCCODE_MASK,
+                     "TLB-missing store should report ExcCode 3");
+            t.Equals(storeMissCtx.pc, EXCEPTION_VECTOR_TLB_REFILL_BOOT,
+                     "TLB-missing store with BEV=1 should use the bootstrap refill vector");
         });
 
         tc.Run("handleSyscall rejects invocation in delay slot", [](TestCase &t)

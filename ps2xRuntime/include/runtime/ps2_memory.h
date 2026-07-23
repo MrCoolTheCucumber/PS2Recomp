@@ -3,6 +3,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <exception>
 #include <functional>
 #include <vector>
 #include <unordered_map>
@@ -21,6 +22,28 @@
 #endif
 
 class GS;
+
+class PS2TlbMissException final : public std::exception
+{
+public:
+    explicit PS2TlbMissException(uint32_t virtualAddress) noexcept
+        : m_virtualAddress(virtualAddress)
+    {
+    }
+
+    const char *what() const noexcept override
+    {
+        return "EE TLB miss";
+    }
+
+    uint32_t virtualAddress() const noexcept
+    {
+        return m_virtualAddress;
+    }
+
+private:
+    uint32_t m_virtualAddress;
+};
 
 constexpr uint32_t PS2_RAM_SIZE = 32u * 1024u * 1024u; // 32MB
 constexpr uint32_t PS2_RAM_MASK = PS2_RAM_SIZE - 1u;   // Mask for 32MB alignment
