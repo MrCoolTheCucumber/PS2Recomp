@@ -17,7 +17,11 @@ extern "C"
 
 #include <chrono>
 #include <condition_variable>
+#include <atomic>
+#include <cstdlib>
 #include <deque>
+#include <filesystem>
+#include <fstream>
 #include <memory>
 
 #include "Syscalls/Helpers/State.h"
@@ -34,6 +38,168 @@ namespace ps2_stubs
         };
 
 #if PS2X_HAS_FFMPEG
+        constexpr const char *kMpegFrameDumpDirectoryEnvironment =
+            "PS2X_MPEG_FRAME_DUMP_DIR";
+        std::atomic<uint32_t> g_mpegFrameDumpSequence{0u};
+
+        class MpegFrameDump
+        {
+        public:
+            ~MpegFrameDump()
+            {
+                finish();
+            }
+
+            MpegFrameDump(const MpegFrameDump &) = delete;
+            MpegFrameDump &operator=(const MpegFrameDump &) = delete;
+
+            MpegFrameDump() = default;
+
+            void write(const MpegDecodedFrame &frame, AVRational frameRate)
+            {
+                if (m_disabled || frame.width <= 0 || frame.height <= 0 || frame.rgba.empty())
+                {
+                    return;
+                }
+
+                if (!m_output.is_open() && !open(frame, frameRate))
+                {
+                    return;
+                }
+
+                if (frame.width != m_width || frame.height != m_height)
+                {
+                    std::cerr << "[MPEG:frame-dump] refusing a mid-stream dimension change from "
+                              << m_width << "x" << m_height << " to "
+                              << frame.width << "x" << frame.height << std::endl;
+                    finish();
+                    m_disabled = true;
+                    return;
+                }
+
+                if (frameRate.num > 0 && frameRate.den > 0)
+                {
+                    m_frameRate = frameRate;
+                }
+
+                m_output.write(
+                    reinterpret_cast<const char *>(frame.rgba.data()),
+                    static_cast<std::streamsize>(frame.rgba.size()));
+                if (!m_output)
+                {
+                    std::cerr << "[MPEG:frame-dump] write failed for "
+                              << m_rawPath << std::endl;
+                    finish();
+                    m_disabled = true;
+                    return;
+                }
+
+                ++m_frameCount;
+                m_output.flush();
+                writeManifest();
+            }
+
+        private:
+            bool open(const MpegDecodedFrame &frame, AVRational frameRate)
+            {
+                const char *directoryValue =
+                    std::getenv(kMpegFrameDumpDirectoryEnvironment);
+                if (!directoryValue || directoryValue[0] == '\0')
+                {
+                    m_disabled = true;
+                    return false;
+                }
+
+                const std::filesystem::path directory(directoryValue);
+                std::error_code error;
+                std::filesystem::create_directories(directory, error);
+                if (error)
+                {
+                    std::cerr << "[MPEG:frame-dump] cannot create " << directory
+                              << ": " << error.message() << std::endl;
+                    m_disabled = true;
+                    return false;
+                }
+
+                const uint32_t sequence =
+                    g_mpegFrameDumpSequence.fetch_add(1u, std::memory_order_relaxed);
+                std::array<char, 64> stem{};
+                std::snprintf(stem.data(), stem.size(),
+                              "mpeg-stream-%04u-%dx%d",
+                              sequence, frame.width, frame.height);
+                m_rawPath = directory / (std::string(stem.data()) + ".rgba");
+                m_manifestPath = directory / (std::string(stem.data()) + ".txt");
+                m_output.open(m_rawPath, std::ios::binary | std::ios::trunc);
+                if (!m_output)
+                {
+                    std::cerr << "[MPEG:frame-dump] cannot open "
+                              << m_rawPath << std::endl;
+                    m_disabled = true;
+                    return false;
+                }
+
+                m_width = frame.width;
+                m_height = frame.height;
+                if (frameRate.num > 0 && frameRate.den > 0)
+                {
+                    m_frameRate = frameRate;
+                }
+                writeManifest();
+                std::cerr << "[MPEG:frame-dump] writing decoded RGBA frames to "
+                          << m_rawPath << std::endl;
+                return true;
+            }
+
+            void writeManifest() const
+            {
+                if (m_manifestPath.empty())
+                {
+                    return;
+                }
+
+                std::ofstream manifest(m_manifestPath, std::ios::trunc);
+                if (!manifest)
+                {
+                    return;
+                }
+
+                manifest << "pixel_format=rgba\n"
+                         << "width=" << m_width << '\n'
+                         << "height=" << m_height << '\n'
+                         << "frame_rate_num=" << m_frameRate.num << '\n'
+                         << "frame_rate_den=" << m_frameRate.den << '\n'
+                         << "frames=" << m_frameCount << '\n'
+                         << "bytes_per_frame="
+                         << (static_cast<uint64_t>(m_width) *
+                             static_cast<uint64_t>(m_height) * 4u)
+                         << '\n';
+            }
+
+            void finish()
+            {
+                if (!m_output.is_open())
+                {
+                    return;
+                }
+
+                m_output.flush();
+                m_output.close();
+                writeManifest();
+                std::cerr << "[MPEG:frame-dump] completed " << m_frameCount
+                          << " frames at " << m_width << "x" << m_height
+                          << " in " << m_rawPath << std::endl;
+            }
+
+            std::ofstream m_output;
+            std::filesystem::path m_rawPath;
+            std::filesystem::path m_manifestPath;
+            AVRational m_frameRate{0, 1};
+            uint64_t m_frameCount = 0u;
+            int m_width = 0;
+            int m_height = 0;
+            bool m_disabled = false;
+        };
+
         std::string ffmpegErrorString(int err)
         {
             std::array<char, AV_ERROR_MAX_STRING_SIZE> buffer{};
@@ -410,6 +576,7 @@ namespace ps2_stubs
                     return false;
                 }
 
+                m_frameDump.write(decoded, m_codecCtx->framerate);
                 frames.push_back(std::move(decoded));
                 return true;
             }
@@ -425,6 +592,7 @@ namespace ps2_stubs
             bool m_initialized = false;
             bool m_drained = false;
             bool m_seenKeyframe = false;
+            MpegFrameDump m_frameDump;
         };
 #else
         // TODO
