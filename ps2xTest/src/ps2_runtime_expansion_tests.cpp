@@ -747,6 +747,35 @@ void register_ps2_runtime_expansion_tests()
             }
         });
 
+        tc.Run("PMULTUW writes two independent unsigned products", [](TestCase &t)
+        {
+            R5900Context ctx{};
+            const __m128i lhs =
+                Ps2MakeU32Vector(0xffffffffu, 0x11111111u, 0x80000000u, 0x22222222u);
+            const __m128i rhs =
+                Ps2MakeU32Vector(2u, 0x33333333u, 0xffffffffu, 0x44444444u);
+
+            const __m128i result = Ps2Pmultuw(&ctx, lhs, rhs);
+            constexpr uint64_t product0 = 0x00000001fffffffeull;
+            constexpr uint64_t product1 = 0x7fffffff80000000ull;
+
+            t.Equals(ctx.lo, 0xfffffffffffffffeull,
+                     "PMULTUW should sign-extend product 0's lower word into LO");
+            t.Equals(ctx.hi, 0x0000000000000001ull,
+                     "PMULTUW should sign-extend product 0's upper word into HI");
+            t.Equals(ctx.lo1, 0xffffffff80000000ull,
+                     "PMULTUW should sign-extend product 1's lower word into LO1");
+            t.Equals(ctx.hi1, 0x000000007fffffffull,
+                     "PMULTUW should sign-extend product 1's upper word into HI1");
+
+            uint64_t resultLanes[2]{};
+            std::memcpy(resultLanes, &result, sizeof(result));
+            t.Equals(resultLanes[0], product0,
+                     "PMULTUW rd low lane should contain source word 0's full product");
+            t.Equals(resultLanes[1], product1,
+                     "PMULTUW rd high lane should contain source word 2's full product");
+        });
+
         tc.Run("differential decoder/codegen gpr-write contract for MULT and DIV families", [](TestCase &t)
         {
             R5900Decoder decoder;

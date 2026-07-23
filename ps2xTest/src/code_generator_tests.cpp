@@ -352,6 +352,27 @@ void register_code_generator_tests()
                  "PMULTH must not horizontally add adjacent products");
     });
 
+    tc.Run("PMULTUW emits two independent unsigned products", [](TestCase &t) {
+        CodeGenerator gen({}, {});
+
+        Instruction pmultuw{};
+        pmultuw.opcode = OPCODE_MMI;
+        pmultuw.isMMI = true;
+        pmultuw.function = MMI_MMI3;
+        pmultuw.sa = MMI3_PMULTUW;
+        pmultuw.rs = 2;
+        pmultuw.rt = 3;
+        pmultuw.rd = 4;
+
+        const std::string generated = gen.translateInstruction(pmultuw);
+        t.IsTrue(generated.find("__m128i result = Ps2Pmultuw(ctx, GPR_VEC(ctx, 2), GPR_VEC(ctx, 3));") != std::string::npos,
+                 "PMULTUW should use the dual-product HI/LO helper");
+        t.IsTrue(generated.find("SET_GPR_VEC(ctx, 4, result);") != std::string::npos,
+                 "PMULTUW should return both 64-bit products to rd");
+        t.IsTrue(generated.find("_mm_mul_epu32") == std::string::npos,
+                 "PMULTUW should not duplicate an even lane through overlapping SIMD products");
+    });
+
     tc.Run("constant MMIO store emits direct runtime store", [](TestCase &t) {
         Function func;
         func.name = "mmio_store";

@@ -521,14 +521,9 @@ namespace ps2recomp
 
     std::string CodeGenerator::translatePMULTUW(const Instruction &inst)
     {
-        // Parallel multiply unsigned word -> results to HI/LO and rd (lower 32 bits)
-        return fmt::format("{{ __m128i p01 = _mm_mul_epu32(GPR_VEC(ctx, {}), GPR_VEC(ctx, {})); \n"
-                           "   __m128i p23 = _mm_mul_epu32(_mm_srli_si128(GPR_VEC(ctx, {}), 8), _mm_srli_si128(GPR_VEC(ctx, {}), 8)); \n"
-                           "   uint64_t res0 = _mm_cvtsi128_si64(p01); uint64_t res1 = _mm_cvtsi128_si64(_mm_srli_si128(p01, 8)); \n"
-                           "   uint64_t res2 = _mm_cvtsi128_si64(p23); uint64_t res3 = _mm_cvtsi128_si64(_mm_srli_si128(p23, 8)); \n"
-                           "   ctx->lo = (uint32_t)res0; ctx->hi = (uint32_t)(res0 >> 32); \n" // HI/LO from first product only
-                           "   SET_GPR_VEC(ctx, {}, _mm_set_epi32((uint32_t)res3, (uint32_t)res2, (uint32_t)res1, (uint32_t)res0)); }}",
-                           inst.rs, inst.rt, inst.rs, inst.rt, inst.rd);
+        return fmt::format("{{ __m128i result = Ps2Pmultuw(ctx, GPR_VEC(ctx, {}), GPR_VEC(ctx, {})); "
+                           "SET_GPR_VEC(ctx, {}, result); }}",
+                           inst.rs, inst.rt, inst.rd);
     }
 
 
