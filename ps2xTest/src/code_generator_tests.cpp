@@ -292,6 +292,45 @@ void register_code_generator_tests()
                  "MADD1 should use the same defined wrapping behavior for HI1/LO1");
     });
 
+    tc.Run("packed HI and LO moves preserve all 128 bits", [](TestCase &t) {
+        CodeGenerator gen({}, {});
+
+        Instruction packed{};
+        packed.opcode = OPCODE_MMI;
+        packed.isMMI = true;
+        packed.function = MMI_MMI2;
+        packed.sa = MMI2_PMFHI;
+        packed.rd = 4;
+        t.IsTrue(gen.translateInstruction(packed).find("SET_GPR_VEC(ctx, 4, Ps2GetHi128(ctx));") != std::string::npos,
+                 "PMFHI should copy both 64-bit halves of HI");
+
+        packed.sa = MMI2_PMFLO;
+        t.IsTrue(gen.translateInstruction(packed).find("SET_GPR_VEC(ctx, 4, Ps2GetLo128(ctx));") != std::string::npos,
+                 "PMFLO should copy both 64-bit halves of LO");
+
+        packed.function = MMI_MMI3;
+        packed.sa = MMI3_PMTHI;
+        packed.rs = 5;
+        t.IsTrue(gen.translateInstruction(packed).find("Ps2SetHi128(ctx, GPR_VEC(ctx, 5));") != std::string::npos,
+                 "PMTHI should replace both 64-bit halves of HI");
+
+        packed.sa = MMI3_PMTLO;
+        t.IsTrue(gen.translateInstruction(packed).find("Ps2SetLo128(ctx, GPR_VEC(ctx, 5));") != std::string::npos,
+                 "PMTLO should replace both 64-bit halves of LO");
+
+        packed.function = MMI_PMFHL;
+        packed.sa = PMFHL_SH;
+        packed.rd = 6;
+        t.IsTrue(gen.translateInstruction(packed).find("SET_GPR_VEC(ctx, 6, Ps2PmfhlSh(ctx));") != std::string::npos,
+                 "PMFHL.SH should consume all eight HI/LO words");
+
+        packed.function = MMI_PMTHL;
+        packed.sa = PMFHL_LW;
+        packed.rs = 7;
+        t.IsTrue(gen.translateInstruction(packed).find("Ps2PmthlLw(ctx, GPR_VEC(ctx, 7));") != std::string::npos,
+                 "PMTHL.LW should update the lower word in all four HI/LO lanes");
+    });
+
     tc.Run("constant MMIO store emits direct runtime store", [](TestCase &t) {
         Function func;
         func.name = "mmio_store";

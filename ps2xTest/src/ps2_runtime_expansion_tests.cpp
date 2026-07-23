@@ -610,6 +610,101 @@ void register_ps2_runtime_expansion_tests()
                      "signed MADD should handle the largest 32-bit product exactly");
         });
 
+        tc.Run("packed HI and LO helpers preserve all lanes", [](TestCase &t)
+        {
+            R5900Context ctx{};
+            ctx.lo = 0x2222222211111111ull;
+            ctx.hi = 0x4444444433333333ull;
+            ctx.lo1 = 0x6666666655555555ull;
+            ctx.hi1 = 0x8888888877777777ull;
+
+            uint64_t doublewords[2]{};
+            __m128i value = Ps2GetLo128(&ctx);
+            std::memcpy(doublewords, &value, sizeof(value));
+            t.Equals(doublewords[0], ctx.lo, "PMFLO low lane should come from LO");
+            t.Equals(doublewords[1], ctx.lo1, "PMFLO high lane should come from LO1");
+
+            value = Ps2GetHi128(&ctx);
+            std::memcpy(doublewords, &value, sizeof(value));
+            t.Equals(doublewords[0], ctx.hi, "PMFHI low lane should come from HI");
+            t.Equals(doublewords[1], ctx.hi1, "PMFHI high lane should come from HI1");
+
+            uint32_t words[4]{};
+            value = Ps2PmfhlLw(&ctx);
+            std::memcpy(words, &value, sizeof(value));
+            const uint32_t expectedLw[4] = {
+                0x11111111u, 0x33333333u, 0x55555555u, 0x77777777u};
+            for (size_t i = 0; i < 4; ++i)
+            {
+                t.Equals(words[i], expectedLw[i], "PMFHL.LW lane mismatch");
+            }
+
+            value = Ps2PmfhlUw(&ctx);
+            std::memcpy(words, &value, sizeof(value));
+            const uint32_t expectedUw[4] = {
+                0x22222222u, 0x44444444u, 0x66666666u, 0x88888888u};
+            for (size_t i = 0; i < 4; ++i)
+            {
+                t.Equals(words[i], expectedUw[i], "PMFHL.UW lane mismatch");
+            }
+
+            uint16_t halves[8]{};
+            value = Ps2PmfhlLh(&ctx);
+            std::memcpy(halves, &value, sizeof(value));
+            const uint16_t expectedLh[8] = {
+                0x1111u, 0x2222u, 0x3333u, 0x4444u,
+                0x5555u, 0x6666u, 0x7777u, 0x8888u};
+            for (size_t i = 0; i < 8; ++i)
+            {
+                t.Equals(halves[i], expectedLh[i], "PMFHL.LH lane mismatch");
+            }
+
+            ctx.lo = 0x0000800000007fffull;
+            ctx.hi = 0xffff7fffffff8000ull;
+            ctx.lo1 = 0xffffffff00000001ull;
+            ctx.hi1 = 0x800000007fffffffull;
+            value = Ps2PmfhlSh(&ctx);
+            std::memcpy(halves, &value, sizeof(value));
+            const uint16_t expectedSh[8] = {
+                0x7fffu, 0x7fffu, 0x8000u, 0x8000u,
+                0x0001u, 0xffffu, 0x7fffu, 0x8000u};
+            for (size_t i = 0; i < 8; ++i)
+            {
+                t.Equals(halves[i], expectedSh[i], "PMFHL.SH saturation mismatch");
+            }
+
+            ctx.lo = 0xAAAAAAAA80000000ull;
+            ctx.hi = 0xBBBBBBBB00000000ull;
+            ctx.lo1 = 0xCCCCCCCC7fffffffull;
+            ctx.hi1 = 0xDDDDDDDDffffffffull;
+            value = Ps2PmfhlSlw(&ctx);
+            std::memcpy(doublewords, &value, sizeof(value));
+            t.Equals(doublewords[0], 0x000000007fffffffull,
+                     "PMFHL.SLW should clamp positive overflow");
+            t.Equals(doublewords[1], 0xffffffff80000000ull,
+                     "PMFHL.SLW should clamp negative overflow");
+
+            const __m128i replacement = Ps2MakeU32Vector(1u, 2u, 3u, 4u);
+            Ps2PmthlLw(&ctx, replacement);
+            t.Equals(ctx.lo, 0xAAAAAAAA00000001ull,
+                     "PMTHL.LW should preserve LO's upper word");
+            t.Equals(ctx.hi, 0xBBBBBBBB00000002ull,
+                     "PMTHL.LW should preserve HI's upper word");
+            t.Equals(ctx.lo1, 0xCCCCCCCC00000003ull,
+                     "PMTHL.LW should preserve LO1's upper word");
+            t.Equals(ctx.hi1, 0xDDDDDDDD00000004ull,
+                     "PMTHL.LW should preserve HI1's upper word");
+
+            Ps2SetLo128(&ctx, Ps2MakeU64Vector(0x0123456789ABCDEFull,
+                                               0xFEDCBA9876543210ull));
+            Ps2SetHi128(&ctx, Ps2MakeU64Vector(0x13579BDF2468ACE0ull,
+                                               0x02468ACE13579BDFull));
+            t.Equals(ctx.lo, 0x0123456789ABCDEFull, "PMTLO low lane mismatch");
+            t.Equals(ctx.lo1, 0xFEDCBA9876543210ull, "PMTLO high lane mismatch");
+            t.Equals(ctx.hi, 0x13579BDF2468ACE0ull, "PMTHI low lane mismatch");
+            t.Equals(ctx.hi1, 0x02468ACE13579BDFull, "PMTHI high lane mismatch");
+        });
+
         tc.Run("differential decoder/codegen gpr-write contract for MULT and DIV families", [](TestCase &t)
         {
             R5900Decoder decoder;

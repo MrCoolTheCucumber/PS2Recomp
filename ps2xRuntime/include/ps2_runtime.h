@@ -72,8 +72,8 @@ struct alignas(16) R5900Context
     // Control registers
     uint32_t pc;         // Program counter
     uint64_t insn_count; // Instruction counter
-    uint64_t hi, lo;     // HI/LO registers for mult/div results
-    uint64_t hi1, lo1;   // Secondary HI/LO registers for MULT1/DIV1
+    uint64_t hi, lo;     // Lower 64-bit lanes of the 128-bit HI/LO registers
+    uint64_t hi1, lo1;   // Upper lanes, also used by scalar MULT1/DIV1 operations
     uint32_t sa;         // Shift amount register
 
     // VU0 registers (when used in macro mode)

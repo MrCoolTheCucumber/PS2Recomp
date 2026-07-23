@@ -68,6 +68,158 @@ static inline uint64_t Ps2MsubSigned32(uint64_t accumulator, int32_t lhs, int32_
     return accumulator - static_cast<uint64_t>(product);
 }
 
+static inline __m128i Ps2MakeU32Vector(uint32_t word0, uint32_t word1,
+                                      uint32_t word2, uint32_t word3)
+{
+    const uint32_t words[4] = {word0, word1, word2, word3};
+    __m128i result;
+    std::memcpy(&result, words, sizeof(result));
+    return result;
+}
+
+static inline __m128i Ps2MakeU16Vector(uint16_t half0, uint16_t half1,
+                                      uint16_t half2, uint16_t half3,
+                                      uint16_t half4, uint16_t half5,
+                                      uint16_t half6, uint16_t half7)
+{
+    const uint16_t halves[8] = {
+        half0, half1, half2, half3, half4, half5, half6, half7};
+    __m128i result;
+    std::memcpy(&result, halves, sizeof(result));
+    return result;
+}
+
+static inline __m128i Ps2MakeU64Vector(uint64_t doubleword0, uint64_t doubleword1)
+{
+    const uint64_t doublewords[2] = {doubleword0, doubleword1};
+    __m128i result;
+    std::memcpy(&result, doublewords, sizeof(result));
+    return result;
+}
+
+static inline __m128i Ps2GetHi128(const R5900Context *ctx)
+{
+    return Ps2MakeU64Vector(ctx->hi, ctx->hi1);
+}
+
+static inline __m128i Ps2GetLo128(const R5900Context *ctx)
+{
+    return Ps2MakeU64Vector(ctx->lo, ctx->lo1);
+}
+
+static inline void Ps2SetHi128(R5900Context *ctx, __m128i value)
+{
+    uint64_t doublewords[2];
+    std::memcpy(doublewords, &value, sizeof(value));
+    ctx->hi = doublewords[0];
+    ctx->hi1 = doublewords[1];
+}
+
+static inline void Ps2SetLo128(R5900Context *ctx, __m128i value)
+{
+    uint64_t doublewords[2];
+    std::memcpy(doublewords, &value, sizeof(value));
+    ctx->lo = doublewords[0];
+    ctx->lo1 = doublewords[1];
+}
+
+static inline uint32_t Ps2LowWord(uint64_t value)
+{
+    return static_cast<uint32_t>(value);
+}
+
+static inline uint32_t Ps2HighWord(uint64_t value)
+{
+    return static_cast<uint32_t>(value >> 32);
+}
+
+static inline uint16_t Ps2LowHalf(uint32_t value)
+{
+    return static_cast<uint16_t>(value);
+}
+
+static inline uint16_t Ps2ClampSignedWordToHalf(uint32_t bits)
+{
+    const int32_t value = std::bit_cast<int32_t>(bits);
+    if (value > INT16_MAX)
+    {
+        return static_cast<uint16_t>(INT16_MAX);
+    }
+    if (value < INT16_MIN)
+    {
+        return 0x8000u;
+    }
+    return static_cast<uint16_t>(value);
+}
+
+static inline uint64_t Ps2ClampSignedDoublewordToWord(uint64_t bits)
+{
+    const int64_t value = std::bit_cast<int64_t>(bits);
+    if (value > INT32_MAX)
+    {
+        return static_cast<uint64_t>(INT32_MAX);
+    }
+    if (value < INT32_MIN)
+    {
+        return Ps2SignExt32ToU64(0x80000000u);
+    }
+    return Ps2SignExt32ToU64(static_cast<uint32_t>(bits));
+}
+
+static inline __m128i Ps2PmfhlLw(const R5900Context *ctx)
+{
+    return Ps2MakeU32Vector(Ps2LowWord(ctx->lo), Ps2LowWord(ctx->hi),
+                            Ps2LowWord(ctx->lo1), Ps2LowWord(ctx->hi1));
+}
+
+static inline __m128i Ps2PmfhlUw(const R5900Context *ctx)
+{
+    return Ps2MakeU32Vector(Ps2HighWord(ctx->lo), Ps2HighWord(ctx->hi),
+                            Ps2HighWord(ctx->lo1), Ps2HighWord(ctx->hi1));
+}
+
+static inline __m128i Ps2PmfhlSlw(const R5900Context *ctx)
+{
+    const uint64_t lane0 =
+        (static_cast<uint64_t>(Ps2LowWord(ctx->hi)) << 32) | Ps2LowWord(ctx->lo);
+    const uint64_t lane1 =
+        (static_cast<uint64_t>(Ps2LowWord(ctx->hi1)) << 32) | Ps2LowWord(ctx->lo1);
+    return Ps2MakeU64Vector(Ps2ClampSignedDoublewordToWord(lane0),
+                            Ps2ClampSignedDoublewordToWord(lane1));
+}
+
+static inline __m128i Ps2PmfhlLh(const R5900Context *ctx)
+{
+    return Ps2MakeU16Vector(
+        Ps2LowHalf(Ps2LowWord(ctx->lo)), Ps2LowHalf(Ps2HighWord(ctx->lo)),
+        Ps2LowHalf(Ps2LowWord(ctx->hi)), Ps2LowHalf(Ps2HighWord(ctx->hi)),
+        Ps2LowHalf(Ps2LowWord(ctx->lo1)), Ps2LowHalf(Ps2HighWord(ctx->lo1)),
+        Ps2LowHalf(Ps2LowWord(ctx->hi1)), Ps2LowHalf(Ps2HighWord(ctx->hi1)));
+}
+
+static inline __m128i Ps2PmfhlSh(const R5900Context *ctx)
+{
+    return Ps2MakeU16Vector(
+        Ps2ClampSignedWordToHalf(Ps2LowWord(ctx->lo)),
+        Ps2ClampSignedWordToHalf(Ps2HighWord(ctx->lo)),
+        Ps2ClampSignedWordToHalf(Ps2LowWord(ctx->hi)),
+        Ps2ClampSignedWordToHalf(Ps2HighWord(ctx->hi)),
+        Ps2ClampSignedWordToHalf(Ps2LowWord(ctx->lo1)),
+        Ps2ClampSignedWordToHalf(Ps2HighWord(ctx->lo1)),
+        Ps2ClampSignedWordToHalf(Ps2LowWord(ctx->hi1)),
+        Ps2ClampSignedWordToHalf(Ps2HighWord(ctx->hi1)));
+}
+
+static inline void Ps2PmthlLw(R5900Context *ctx, __m128i value)
+{
+    uint32_t words[4];
+    std::memcpy(words, &value, sizeof(value));
+    ctx->lo = (ctx->lo & 0xFFFFFFFF00000000ull) | words[0];
+    ctx->hi = (ctx->hi & 0xFFFFFFFF00000000ull) | words[1];
+    ctx->lo1 = (ctx->lo1 & 0xFFFFFFFF00000000ull) | words[2];
+    ctx->hi1 = (ctx->hi1 & 0xFFFFFFFF00000000ull) | words[3];
+}
+
 // PLZCW: Count leading bits that match the sign bit, minus 1.
 // For positive values: count leading zeros minus 1 (excludes sign bit).
 // For negative values: count leading ones minus 1 (excludes sign bit).
@@ -634,18 +786,6 @@ inline __m128i _mm_custom_srav_epi32(__m128i a, __m128i count)
     }
     return _mm_loadu_si128((__m128i *)result);
 }
-
-// PMFHL function implementations
-inline __m128i ps2_u64_to_epi64_pair(uint64_t value)
-{
-    return _mm_set1_epi64x(static_cast<long long>(value));
-}
-
-#define PS2_PMFHL_LW(hi, lo) _mm_unpacklo_epi64(ps2_u64_to_epi64_pair(lo), ps2_u64_to_epi64_pair(hi))
-#define PS2_PMFHL_UW(hi, lo) _mm_unpackhi_epi64(ps2_u64_to_epi64_pair(lo), ps2_u64_to_epi64_pair(hi))
-#define PS2_PMFHL_SLW(hi, lo) _mm_packs_epi32(ps2_u64_to_epi64_pair(lo), ps2_u64_to_epi64_pair(hi))
-#define PS2_PMFHL_LH(hi, lo) _mm_shuffle_epi32(_mm_packs_epi32(ps2_u64_to_epi64_pair(lo), ps2_u64_to_epi64_pair(hi)), _MM_SHUFFLE(3, 1, 2, 0))
-#define PS2_PMFHL_SH(hi, lo) _mm_shufflehi_epi16(_mm_shufflelo_epi16(_mm_packs_epi32(ps2_u64_to_epi64_pair(lo), ps2_u64_to_epi64_pair(hi)), _MM_SHUFFLE(3, 1, 2, 0)), _MM_SHUFFLE(3, 1, 2, 0))
 
 // FPU (COP1) operations
 #define FPU_SET_ACC(ctx, res) (ctx->f_acc = res)
