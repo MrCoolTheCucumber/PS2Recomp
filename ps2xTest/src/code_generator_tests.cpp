@@ -924,6 +924,23 @@ void register_code_generator_tests()
                  "multiple resume pcs should register to the same owner wrapper");
     });
 
+    tc.Run("function registration emits guest symbol ranges", [](TestCase &t) {
+        Function mapped;
+        mapped.name = "mapped \"function\"";
+        mapped.start = 0x8000u;
+        mapped.end = 0x8020u;
+
+        CodeGenerator gen({}, {});
+        std::string registration = gen.generateFunctionRegistration({mapped}, {});
+        printGeneratedCode("function registration emits guest symbol ranges", registration);
+
+        t.IsTrue(registration.find("g_ps2GuestFunctionSymbolCount = 1u") != std::string::npos,
+                 "registration should publish the number of mapped guest symbols");
+        t.IsTrue(registration.find(
+                     "{0x8000u, 0x8020u, \"mapped \\\"function\\\"\"}") != std::string::npos,
+                 "registration should retain map names and ranges as escaped string metadata");
+    });
+
     tc.Run("external mid-function entry can register to the owner wrapper", [](TestCase &t) {
         Function caller;
         caller.name = "caller";

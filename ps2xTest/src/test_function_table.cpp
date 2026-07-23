@@ -10,6 +10,12 @@ extern const uint32_t g_ps2RecompiledFunctionTableSlotCount = (g_ps2RecompiledFu
 
 PS2Runtime::RecompiledFunction g_ps2RecompiledFunctionTable[g_ps2RecompiledFunctionTableSlotCount] = {};
 
+extern const uint32_t g_ps2GuestFunctionSymbolCount = 2u;
+extern const PS2GuestFunctionSymbol g_ps2GuestFunctionSymbols[2] = {
+    {0x00001000u, 0x00001020u, "test_function"},
+    {0x00002000u, 0x00002008u, "second_function"},
+};
+
 void reset_ps2_test_function_table()
 {
     std::fill(g_ps2RecompiledFunctionTable,

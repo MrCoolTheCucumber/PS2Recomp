@@ -63,6 +63,13 @@ struct PS2GuestException final
 {
 };
 
+struct PS2GuestFunctionSymbol
+{
+    uint32_t start;
+    uint32_t end;
+    const char *name;
+};
+
 // PS2 CPU context (R5900)
 struct alignas(16) R5900Context
 {
@@ -376,6 +383,7 @@ public:
     bool registerFunction(uint32_t address, RecompiledFunction func);
     RecompiledFunction lookupFunction(uint32_t address);
     bool hasFunction(uint32_t address) const;
+    static std::string formatGuestPc(uint32_t address);
     bool dispatchGuestBranch(uint8_t *rdram,
                              R5900Context *ctx,
                              uint32_t targetPc,
@@ -595,5 +603,7 @@ extern const uint32_t g_ps2RecompiledFunctionTableBase;
 extern const uint32_t g_ps2RecompiledFunctionTableEnd;
 extern const uint32_t g_ps2RecompiledFunctionTableSlotCount;
 extern PS2Runtime::RecompiledFunction g_ps2RecompiledFunctionTable[];
+extern const uint32_t g_ps2GuestFunctionSymbolCount;
+extern const PS2GuestFunctionSymbol g_ps2GuestFunctionSymbols[];
 
 #endif // PS2_RUNTIME_H

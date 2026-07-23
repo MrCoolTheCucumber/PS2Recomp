@@ -6,6 +6,7 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <map>
 #include <sstream>
 #include <stdexcept>
 #include <unordered_set>
@@ -14,6 +15,50 @@
 
 namespace ps2recomp
 {
+    namespace
+    {
+        std::string escapeCStringLiteral(const std::string &value)
+        {
+            std::string escaped;
+            escaped.reserve(value.size());
+            for (unsigned char c : value)
+            {
+                switch (c)
+                {
+                case '\\':
+                    escaped += "\\\\";
+                    break;
+                case '"':
+                    escaped += "\\\"";
+                    break;
+                case '\n':
+                    escaped += "\\n";
+                    break;
+                case '\r':
+                    escaped += "\\r";
+                    break;
+                case '\t':
+                    escaped += "\\t";
+                    break;
+                default:
+                    if (c < 0x20u || c == 0x7Fu)
+                    {
+                        escaped += '\\';
+                        escaped += static_cast<char>('0' + ((c >> 6u) & 0x07u));
+                        escaped += static_cast<char>('0' + ((c >> 3u) & 0x07u));
+                        escaped += static_cast<char>('0' + (c & 0x07u));
+                    }
+                    else
+                    {
+                        escaped += static_cast<char>(c);
+                    }
+                    break;
+                }
+            }
+            return escaped;
+        }
+    }
+
     FunctionTableEmitter::FunctionTableEmitter(CodeGenerator &codeGenerator)
         : m_codeGenerator(codeGenerator)
     {
@@ -135,6 +180,23 @@ namespace ps2recomp
         std::sort(entries.begin(), entries.end(), [](const auto &a, const auto &b)
                   { return a.first < b.first; });
 
+        struct GuestFunctionSymbolRecord
+        {
+            uint32_t end;
+            std::string name;
+        };
+        std::map<uint32_t, GuestFunctionSymbolRecord> symbols;
+        for (const auto &function : functions)
+        {
+            if (function.name.empty() || function.end <= function.start)
+            {
+                continue;
+            }
+
+            symbols.try_emplace(function.start,
+                                GuestFunctionSymbolRecord{function.end, function.name});
+        }
+
         uint32_t tableBase = 0u;
         uint32_t tableEnd = 0u;
         uint32_t slotCount = 0u;
@@ -156,6 +218,23 @@ namespace ps2recomp
         ss << "extern const uint32_t g_ps2RecompiledFunctionTableEnd = 0x" << std::hex << tableEnd << "u;\n";
         ss << "extern const uint32_t g_ps2RecompiledFunctionTableSlotCount = " << std::dec << slotCount << "u;\n";
         ss << "PS2Runtime::RecompiledFunction g_ps2RecompiledFunctionTable[" << std::dec << (slotCount == 0u ? 1u : slotCount) << "u] = {};\n\n";
+
+        ss << "extern const uint32_t g_ps2GuestFunctionSymbolCount = " << std::dec << symbols.size() << "u;\n";
+        ss << "extern const PS2GuestFunctionSymbol g_ps2GuestFunctionSymbols["
+           << std::dec << (symbols.empty() ? 1u : symbols.size()) << "u] = {\n";
+        if (symbols.empty())
+        {
+            ss << "    {0u, 0u, nullptr},\n";
+        }
+        else
+        {
+            for (const auto &[start, symbol] : symbols)
+            {
+                ss << "    {0x" << std::hex << start << "u, 0x" << symbol.end
+                   << "u, \"" << escapeCStringLiteral(symbol.name) << "\"},\n";
+            }
+        }
+        ss << "};\n\n";
 
         ss << "namespace {\n";
         ss << "struct GeneratedFunctionTableInitializer {\n";

@@ -184,7 +184,7 @@ namespace
                 oss << " -> ";
             }
             first = false;
-            oss << "0x" << std::hex << h.pcs[idx];
+            oss << PS2Runtime::formatGuestPc(h.pcs[idx]);
         }
         return oss.str();
     }
@@ -1081,6 +1081,58 @@ namespace
         slot = offset >> 2;
         return slot < g_ps2RecompiledFunctionTableSlotCount;
     }
+
+    const PS2GuestFunctionSymbol *findGuestFunctionSymbol(uint32_t address)
+    {
+        address = normalizeGuestFunctionAddress(address);
+        uint32_t first = 0u;
+        uint32_t last = g_ps2GuestFunctionSymbolCount;
+        while (first < last)
+        {
+            const uint32_t middle = first + ((last - first) / 2u);
+            if (g_ps2GuestFunctionSymbols[middle].start <= address)
+            {
+                first = middle + 1u;
+            }
+            else
+            {
+                last = middle;
+            }
+        }
+
+        if (first == 0u)
+        {
+            return nullptr;
+        }
+
+        const PS2GuestFunctionSymbol &symbol = g_ps2GuestFunctionSymbols[first - 1u];
+        if (address < symbol.end && symbol.name != nullptr && symbol.name[0] != '\0')
+        {
+            return &symbol;
+        }
+        return nullptr;
+    }
+}
+
+std::string PS2Runtime::formatGuestPc(uint32_t address)
+{
+    std::ostringstream oss;
+    oss << "0x" << std::hex << address;
+
+    const PS2GuestFunctionSymbol *symbol = findGuestFunctionSymbol(address);
+    if (symbol != nullptr)
+    {
+        const uint32_t normalizedAddress = normalizeGuestFunctionAddress(address);
+        const uint32_t offset = normalizedAddress - symbol->start;
+        oss << '<' << symbol->name;
+        if (offset != 0u)
+        {
+            oss << "+0x" << offset;
+        }
+        oss << '>';
+    }
+
+    return oss.str();
 }
 
 bool PS2Runtime::replaceFunction(uint32_t address, RecompiledFunction func)
@@ -1160,8 +1212,8 @@ PS2Runtime::RecompiledFunction PS2Runtime::lookupFunction(uint32_t address)
         }
     }
 
-    std::cerr << "Error: No exact recompiled function for guest PC 0x" << std::hex << address
-              << " tableBase=0x" << g_ps2RecompiledFunctionTableBase
+    std::cerr << "Error: No exact recompiled function for guest PC " << formatGuestPc(address)
+              << " tableBase=0x" << std::hex << g_ps2RecompiledFunctionTableBase
               << " tableEnd=0x" << g_ps2RecompiledFunctionTableEnd
               << " codeRegion=" << (m_memory.isCodeAddress(address) ? "yes" : "no")
               << " trace=" << formatDispatchHistory()
@@ -1265,11 +1317,11 @@ void PS2Runtime::reportMissingFunction(uint8_t *rdram,
         std::ostringstream oss;
         oss << "[guest-branch:missing-target] kind=" << describeGuestBranchKind(kind)
             << " op=" << (debugName ? debugName : "<unknown>")
-            << " source=0x" << std::hex << sourcePc
-            << " target=0x" << targetPc
-            << " pc=0x" << pc
-            << " ra=0x" << ra
-            << " sp=0x" << sp
+            << " source=" << formatGuestPc(sourcePc)
+            << " target=" << formatGuestPc(targetPc)
+            << " pc=" << formatGuestPc(pc)
+            << " ra=" << formatGuestPc(ra)
+            << " sp=0x" << std::hex << sp
             << " gp=0x" << gp
             << " a0=0x" << a0
             << " a1=0x" << a1
@@ -2031,7 +2083,7 @@ void PS2Runtime::dispatchLoop(uint8_t *rdram, R5900Context *ctx)
             if ((samePcCount % kSamePcYieldInterval) == 0u)
             {
                 PS2_IF_AGRESSIVE_LOGS({
-                    RUNTIME_LOG("CPU is doing some work at PC 0x" << std::hex << pc << ". PC not updating.");
+                    RUNTIME_LOG("CPU is doing some work at PC " << formatGuestPc(pc) << ". PC not updating.");
                 });
                 std::this_thread::yield();
             }
@@ -2066,10 +2118,10 @@ void PS2Runtime::dispatchLoop(uint8_t *rdram, R5900Context *ctx)
             const uint32_t sp = static_cast<uint32_t>(_mm_extract_epi32(ctx->r[29], 0));
             const uint32_t gp = static_cast<uint32_t>(_mm_extract_epi32(ctx->r[28], 0));
             PS2_IF_AGRESSIVE_LOGS({
-                std::cerr << "[dispatch:pc-zero] from=0x" << std::hex << dispatchedPc
-                          << " fromRa=0x" << dispatchedRa
-                          << " ra=0x" << ra
-                          << " sp=0x" << sp
+                std::cerr << "[dispatch:pc-zero] from=" << formatGuestPc(dispatchedPc)
+                          << " fromRa=" << formatGuestPc(dispatchedRa)
+                          << " ra=" << formatGuestPc(ra)
+                          << " sp=0x" << std::hex << sp
                           << " gp=0x" << gp
                           << " trace=" << formatDispatchHistory()
                           << std::dec << std::endl;

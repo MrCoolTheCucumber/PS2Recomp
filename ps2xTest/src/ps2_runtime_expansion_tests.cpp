@@ -560,6 +560,22 @@ void register_ps2_runtime_expansion_tests()
 {
     MiniTest::Case("PS2RuntimeExpansion", [](TestCase &tc)
     {
+        tc.Run("guest PCs include mapped function names and offsets", [](TestCase &t)
+        {
+            t.Equals(PS2Runtime::formatGuestPc(0x00001000u),
+                     std::string("0x1000<test_function>"),
+                     "an exact mapped PC should include its function name");
+            t.Equals(PS2Runtime::formatGuestPc(0x0000101Cu),
+                     std::string("0x101c<test_function+0x1c>"),
+                     "an interior mapped PC should include its function-relative offset");
+            t.Equals(PS2Runtime::formatGuestPc(0x80001004u),
+                     std::string("0x80001004<test_function+0x4>"),
+                     "a direct-mapped RDRAM alias should resolve against the physical function range");
+            t.Equals(PS2Runtime::formatGuestPc(0x00000180u),
+                     std::string("0x180"),
+                     "an unknown PC should remain an unambiguous raw address");
+        });
+
         tc.Run("scalar overflow helpers use defined wrapping arithmetic", [](TestCase &t)
         {
             bool overflow = false;
