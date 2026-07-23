@@ -1509,52 +1509,46 @@ void register_ps2_gs_tests()
                      "field presentation should still preserve different source content across field rows");
         });
 
-        tc.Run("GIF PACKED A+D writes DISPFB1 and DISPLAY1 privileged registers", [](TestCase &t)
+        tc.Run("GIF PACKED A+D ignores reserved register addresses", [](TestCase &t)
         {
             std::vector<uint8_t> vram(PS2_GS_VRAM_SIZE, 0u);
             GSRegisters regs{};
             GS gs;
             gs.init(vram.data(), static_cast<uint32_t>(vram.size()), &regs);
 
+            regs.dispfb1 = 0x0123456789ABCDEFull;
+            regs.display1 = 0x1111222233334444ull;
+            regs.dispfb2 = 0x2222333344445555ull;
+            regs.display2 = 0x6666777788889999ull;
+            regs.bgcolor = 0xAAAABBBBCCCCDDDDull;
+
             std::vector<uint8_t> packet;
-            appendU64(packet, makeGifTag(2u, GIF_FMT_PACKED, 1u, true));
+            appendU64(packet, makeGifTag(5u, GIF_FMT_PACKED, 1u, true));
             appendU64(packet, 0x0Eull); // REGS[0] = A+D
 
-            const uint64_t dispfb1 = 0x0123456789ABCDEFull;
-            const uint64_t display1 = 0x1111222233334444ull;
-            appendU64(packet, dispfb1);
-            appendU64(packet, 0x59ull); // DISPFB1
-            appendU64(packet, display1);
-            appendU64(packet, 0x5Aull); // DISPLAY1
+            appendU64(packet, 0x1000000000000059ull);
+            appendU64(packet, 0x59ull);
+            appendU64(packet, 0x200000000000005Aull);
+            appendU64(packet, 0x5Aull);
+            appendU64(packet, 0x300000000000005Bull);
+            appendU64(packet, 0x5Bull);
+            appendU64(packet, 0x400000000000005Cull);
+            appendU64(packet, 0x5Cull);
+            appendU64(packet, 0x500000000000005Full);
+            appendU64(packet, 0x5Full);
 
             gs.processGIFPacket(packet.data(), static_cast<uint32_t>(packet.size()));
 
-            t.Equals(regs.dispfb1, dispfb1, "A+D should write GS DISPFB1");
-            t.Equals(regs.display1, display1, "A+D should write GS DISPLAY1");
-        });
-
-        tc.Run("GIF PACKED A+D writes DISPFB2 and DISPLAY2 privileged registers", [](TestCase &t)
-        {
-            std::vector<uint8_t> vram(PS2_GS_VRAM_SIZE, 0u);
-            GSRegisters regs{};
-            GS gs;
-            gs.init(vram.data(), static_cast<uint32_t>(vram.size()), &regs);
-
-            std::vector<uint8_t> packet;
-            appendU64(packet, makeGifTag(2u, GIF_FMT_PACKED, 1u, true));
-            appendU64(packet, 0x0Eull); // REGS[0] = A+D
-
-            const uint64_t dispfb2 = 0x2222333344445555ull;
-            const uint64_t display2 = 0x6666777788889999ull;
-            appendU64(packet, dispfb2);
-            appendU64(packet, 0x5Bull); // DISPFB2
-            appendU64(packet, display2);
-            appendU64(packet, 0x5Cull); // DISPLAY2
-
-            gs.processGIFPacket(packet.data(), static_cast<uint32_t>(packet.size()));
-
-            t.Equals(regs.dispfb2, dispfb2, "A+D should write GS DISPFB2");
-            t.Equals(regs.display2, display2, "A+D should write GS DISPLAY2");
+            t.Equals(regs.dispfb1, 0x0123456789ABCDEFull,
+                     "reserved A+D address 0x59 should not change DISPFB1");
+            t.Equals(regs.display1, 0x1111222233334444ull,
+                     "reserved A+D address 0x5A should not change DISPLAY1");
+            t.Equals(regs.dispfb2, 0x2222333344445555ull,
+                     "reserved A+D address 0x5B should not change DISPFB2");
+            t.Equals(regs.display2, 0x6666777788889999ull,
+                     "reserved A+D address 0x5C should not change DISPLAY2");
+            t.Equals(regs.bgcolor, 0xAAAABBBBCCCCDDDDull,
+                     "reserved A+D address 0x5F should not change BGCOLOR");
         });
 
         tc.Run("PSMT4 address mapping matches GS manual layout", [](TestCase &t)
