@@ -1379,23 +1379,6 @@ namespace
         mem.writeIORegister(channelBase + 0x00u, chcr);
         mem.processPendingTransfers();
 
-        std::vector<uint32_t> completedCauses = mem.consumeCompletedDmacCauses();
-        if (completedCauses.empty() && (mem.readIORegister(channelBase + 0x00u) & 0x100u) == 0u)
-        {
-            if (channelBase == 0x10008000u)
-            {
-                completedCauses.push_back(0u);
-            }
-            else if (channelBase == 0x10009000u)
-            {
-                completedCauses.push_back(1u);
-            }
-            else if (channelBase == 0x1000A000u)
-            {
-                completedCauses.push_back(2u);
-            }
-        }
-
         {
             std::lock_guard<std::mutex> lock(g_dmaStubMutex);
             g_dmaPendingPolls[channelBase] = 1;
@@ -1429,11 +1412,6 @@ namespace
                 }
                 ++g_dmaStubLogCount;
             }
-        }
-
-        for (const uint32_t completedCause : completedCauses)
-        {
-            ps2_syscalls::dispatchDmacHandlersForCause(rdram, runtime, completedCause);
         }
 
         return 0;

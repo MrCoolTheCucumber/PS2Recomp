@@ -171,12 +171,12 @@ namespace ps2_syscalls
 
                 bool reschedulePending = false;
                 uint64_t handoffBaseline = 0u;
-                uint32_t steps = 0u;
+                uint32_t stepCount = 0u;
                 {
                     PS2Runtime::GuestExecutionScope guestExecution(runtime);
                     PS2Runtime::DeferredGuestYieldScope deferYield(reschedulePending);
 
-                    while (irqCtx.pc != 0u && runtime && !runtime->isStopRequested() && steps < kMaxIrqHandlerSteps)
+                    while (irqCtx.pc != 0u && runtime && !runtime->isStopRequested() && stepCount < kMaxIrqHandlerSteps)
                     {
                         PS2Runtime::RecompiledFunction step = runtime->lookupFunction(irqCtx.pc);
                         if (!step)
@@ -184,11 +184,11 @@ namespace ps2_syscalls
                             break;
                         }
                         step(rdram, &irqCtx, runtime);
-                        ++steps;
+                        ++stepCount;
                     }
                     handoffBaseline = runtime->guestExecutionHandoffEpochSnapshot();
                 }
-                if (steps >= kMaxIrqHandlerSteps)
+                if (stepCount >= kMaxIrqHandlerSteps)
                 {
                     static uint32_t s_stepLimitLogCount = 0u;
                     if (s_stepLimitLogCount < 16u)
@@ -201,6 +201,7 @@ namespace ps2_syscalls
                 {
                     runtime->waitForGuestExecutionHandoff(handoffBaseline);
                 }
+                runtime->drainCompletedDmacHandlers(rdram);
             }
             catch (const ThreadExitException &)
             {
@@ -404,6 +405,8 @@ namespace ps2_syscalls
                 bool reschedulePending = false;
                 uint64_t handoffBaseline = 0u;
                 {
+                    // Vblank callbacks are serialized with ordinary guest code. Any
+                    // blocking wake requests a handoff after the recursive scope exits.
                     PS2Runtime::GuestExecutionScope guestExecution(runtime);
                     PS2Runtime::DeferredGuestYieldScope deferYield(reschedulePending);
                     const uint64_t tickValue = signalVSyncFlag(rdram, runtime);
@@ -416,7 +419,10 @@ namespace ps2_syscalls
                     runtime->waitForGuestExecutionHandoff(handoffBaseline);
                 }
                 std::this_thread::sleep_for(std::chrono::microseconds(500));
-                dispatchIntcHandlersForCause(rdram, runtime, kIntcVblankEnd);
+                {
+                    PS2Runtime::GuestExecutionScope guestExecution(runtime);
+                    dispatchIntcHandlersForCause(rdram, runtime, kIntcVblankEnd);
+                }
             }
         }
 

@@ -52,6 +52,8 @@ namespace
     std::atomic<uint32_t> g_dmacSendHits{0u};
     std::atomic<uint32_t> g_dmacSendLastCause{0u};
     std::atomic<uint32_t> g_dmacSendLastChcr{0u};
+    std::atomic<uint32_t> g_dmacPublishedAddress{0u};
+    std::atomic<uint32_t> g_dmacObservedPublishedValue{0u};
 
     void setRegU32(R5900Context &ctx, int reg, uint32_t value)
     {
@@ -150,11 +152,15 @@ namespace
 
     void testDmacSendHandler(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
-        (void)rdram;
-
         const uint32_t cause = getRegU32(ctx, 4);
         g_dmacSendHits.fetch_add(1u, std::memory_order_relaxed);
         g_dmacSendLastCause.store(cause, std::memory_order_relaxed);
+
+        const uint32_t publishedAddress = g_dmacPublishedAddress.load(std::memory_order_relaxed);
+        if (rdram && publishedAddress != 0u)
+        {
+            g_dmacObservedPublishedValue.store(readGuestU32(rdram, publishedAddress), std::memory_order_relaxed);
+        }
 
         uint32_t channelBase = 0u;
         if (cause == 0u)
@@ -469,7 +475,7 @@ void register_ps2_runtime_interrupt_tests()
             cleanupRuntime(env);
         });
 
-        tc.Run("sceDmaSend dispatches completed VIF1 DMAC handler with latched END tag", [](TestCase &t)
+        tc.Run("sceDmaSend defers VIF1 DMAC completion until guest state is published", [](TestCase &t)
         {
             notifyRuntimeStop();
             TestEnv env;
@@ -479,6 +485,8 @@ void register_ps2_runtime_interrupt_tests()
             constexpr uint32_t kVif1Ch = 0x10009000u;
             constexpr uint32_t kTag0 = 0x00028000u;
             constexpr uint32_t kTag1 = kTag0 + 0x20u;
+            constexpr uint32_t kPublishedAddr = 0x00028100u;
+            constexpr uint32_t kPublishedValue = 0xA55A1234u;
 
             uint8_t *rdram = env.runtime.memory().getRDRAM();
             writeDmaTag(rdram, kTag0, makeDmaTag(1u, 1u, 0u, false)); // CNT
@@ -489,6 +497,8 @@ void register_ps2_runtime_interrupt_tests()
             g_dmacSendHits.store(0u, std::memory_order_relaxed);
             g_dmacSendLastCause.store(0u, std::memory_order_relaxed);
             g_dmacSendLastChcr.store(0u, std::memory_order_relaxed);
+            g_dmacPublishedAddress.store(kPublishedAddr, std::memory_order_relaxed);
+            g_dmacObservedPublishedValue.store(0u, std::memory_order_relaxed);
             env.runtime.registerFunction(kHandlerAddr, &testDmacSendHandler);
 
             R5900Context addCtx{};
@@ -507,18 +517,71 @@ void register_ps2_runtime_interrupt_tests()
             R5900Context sendCtx{};
             setRegU32(sendCtx, 4, kVif1Ch);
             setRegU32(sendCtx, 5, kTag0);
-            ps2_stubs::sceDmaSend(rdram, &sendCtx, &env.runtime);
+            {
+                PS2Runtime::GuestExecutionScope guestExecution(&env.runtime);
+                ps2_stubs::sceDmaSend(rdram, &sendCtx, &env.runtime);
+                t.Equals(g_dmacSendHits.load(std::memory_order_relaxed), 0u,
+                         "sceDmaSend must not re-enter the guest DMAC handler before returning");
+                writeGuestU32(rdram, kPublishedAddr, kPublishedValue);
+            }
 
             t.Equals(getRegS32(sendCtx, 2), 0, "sceDmaSend should succeed");
-            t.Equals(g_dmacSendHits.load(std::memory_order_relaxed), 1u, "sceDmaSend should dispatch the VIF1 DMAC handler");
+            t.Equals(g_dmacSendHits.load(std::memory_order_relaxed), 1u, "the outer guest safe point should dispatch the VIF1 DMAC handler");
             t.Equals(g_dmacSendLastCause.load(std::memory_order_relaxed), 1u, "DMAC handler should observe VIF1 cause");
             t.Equals(g_dmacSendLastChcr.load(std::memory_order_relaxed) & 0x100u, 0u, "handler should see VIF1 STR cleared");
             t.Equals(g_dmacSendLastChcr.load(std::memory_order_relaxed) & 0x70000000u, 0x70000000u, "handler should see the latched END tag id");
+            t.Equals(g_dmacObservedPublishedValue.load(std::memory_order_relaxed), kPublishedValue,
+                     "DMAC handler should observe state published after sceDmaSend returned");
 
             cleanupRuntime(env);
         });
 
-        tc.Run("MMIO VIF1 chain completion dispatches DMAC handler after CHCR store", [](TestCase &t)
+        tc.Run("VBLANK callbacks serialize with guest execution", [](TestCase &t)
+        {
+            notifyRuntimeStop();
+            TestEnv env;
+
+            constexpr uint32_t kFlagAddr = 0x1140u;
+            constexpr uint32_t kTickAddr = 0x1150u;
+            constexpr uint32_t kHandlerAddr = 0x00ABC180u;
+
+            g_vblankStartHits.store(0u, std::memory_order_relaxed);
+            env.runtime.registerFunction(kHandlerAddr, &testIntcHandler);
+
+            {
+                PS2Runtime::GuestExecutionScope guestExecution(&env.runtime);
+
+                R5900Context addCtx{};
+                setRegU32(addCtx, 4, 2u);
+                setRegU32(addCtx, 5, kHandlerAddr);
+                setRegU32(addCtx, 6, 0u);
+                setRegU32(addCtx, 7, 0xCAFE0002u);
+                ps2_syscalls::AddIntcHandler(env.rdram.data(), &addCtx, &env.runtime);
+                t.IsTrue(getRegS32(addCtx, 2) > 0, "AddIntcHandler should register VBLANK start handler");
+
+                R5900Context vsyncCtx{};
+                setRegU32(vsyncCtx, 4, kFlagAddr);
+                setRegU32(vsyncCtx, 5, kTickAddr);
+                ps2_syscalls::SetVSyncFlag(env.rdram.data(), &vsyncCtx, &env.runtime);
+
+                std::this_thread::sleep_for(std::chrono::milliseconds(50));
+                t.Equals(g_vblankStartHits.load(std::memory_order_relaxed), 0u,
+                         "VBLANK handler must not run concurrently with a guest execution scope");
+                t.Equals(readGuestU64(env.rdram.data(), kTickAddr), 0ull,
+                         "VBLANK guest state must not update concurrently with guest execution");
+            }
+
+            const bool handlerRan = waitUntil([&]() {
+                return g_vblankStartHits.load(std::memory_order_relaxed) > 0u;
+            }, std::chrono::milliseconds(300));
+            t.IsTrue(handlerRan, "VBLANK handler should run after guest execution is released");
+            t.IsTrue(readGuestU64(env.rdram.data(), kTickAddr) > 0u,
+                     "VBLANK guest state should update after guest execution is released");
+
+            cleanupRuntime(env);
+        });
+
+        tc.Run("MMIO VIF1 completion waits for the outer guest safe point", [](TestCase &t)
         {
             notifyRuntimeStop();
             TestEnv env;
@@ -554,10 +617,15 @@ void register_ps2_runtime_interrupt_tests()
             t.Equals(getRegS32(enableCtx, 2), KE_OK, "EnableDmac should enable VIF1 cause");
 
             R5900Context storeCtx{};
-            env.runtime.Store32(rdram, &storeCtx, kVif1Ch + 0x30u, kTag0);
-            env.runtime.Store32(rdram, &storeCtx, kVif1Ch + 0x00u, 0x185u);
+            {
+                PS2Runtime::GuestExecutionScope guestExecution(&env.runtime);
+                env.runtime.Store32(rdram, &storeCtx, kVif1Ch + 0x30u, kTag0);
+                env.runtime.Store32(rdram, &storeCtx, kVif1Ch + 0x00u, 0x185u);
+                t.Equals(g_dmacSendHits.load(std::memory_order_relaxed), 0u,
+                         "CHCR write must not synchronously re-enter the guest DMAC handler");
+            }
 
-            t.Equals(g_dmacSendHits.load(std::memory_order_relaxed), 1u, "CHCR store should dispatch the VIF1 DMAC handler");
+            t.Equals(g_dmacSendHits.load(std::memory_order_relaxed), 1u, "safe point should dispatch the VIF1 DMAC handler");
             t.Equals(g_dmacSendLastCause.load(std::memory_order_relaxed), 1u, "DMAC handler should observe VIF1 cause");
             t.Equals(g_dmacSendLastChcr.load(std::memory_order_relaxed) & 0x100u, 0u, "handler should see VIF1 STR cleared");
             t.Equals(g_dmacSendLastChcr.load(std::memory_order_relaxed) & 0x70000000u, 0x70000000u, "handler should see the latched END tag id");
@@ -565,7 +633,7 @@ void register_ps2_runtime_interrupt_tests()
             cleanupRuntime(env);
         });
 
-        tc.Run("native GIF DMA MMIO kick dispatches completed DMAC handler", [](TestCase &t)
+        tc.Run("native GIF DMA MMIO kick defers its completed DMAC handler", [](TestCase &t)
         {
             notifyRuntimeStop();
             TestEnv env;
@@ -600,13 +668,18 @@ void register_ps2_runtime_interrupt_tests()
             t.Equals(getRegS32(enableCtx, 2), KE_OK, "EnableDmac should enable GIF cause");
 
             R5900Context kickCtx{};
-            env.runtime.kickGifDmaChainFromMMIO(rdram, &kickCtx, 4u, 4u, kTag0, 0x105u);
+            {
+                PS2Runtime::GuestExecutionScope guestExecution(&env.runtime);
+                env.runtime.kickGifDmaChainFromMMIO(rdram, &kickCtx, 4u, 4u, kTag0, 0x105u);
+                t.Equals(g_dmacSendHits.load(std::memory_order_relaxed), 0u,
+                         "native GIF kick must not synchronously re-enter the guest DMAC handler");
+            }
 
             t.Equals(env.runtime.memory().readIORegister(kDPcr), 4u, "native GIF kick should preserve D_PCR write");
             t.IsTrue((env.runtime.memory().readIORegister(kDStat) & (1u << 2)) != 0u,
                      "native GIF kick should raise D_STAT GIF completion status");
             t.Equals(g_dmacSendHits.load(std::memory_order_relaxed), 1u,
-                     "native GIF kick should dispatch the GIF DMAC handler");
+                     "safe point should dispatch the GIF DMAC handler");
             t.Equals(g_dmacSendLastCause.load(std::memory_order_relaxed), 2u,
                      "DMAC handler should observe GIF cause");
             t.Equals(g_dmacSendLastChcr.load(std::memory_order_relaxed) & 0x100u, 0u,

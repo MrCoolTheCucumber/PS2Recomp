@@ -2021,6 +2021,20 @@ void PS2Runtime::leaveGuestExecution()
         return;
     }
 
+    // A completed DMA may not interrupt the guest from inside the instruction
+    // or library call that started it. Deliver queued completions only when the
+    // outermost recompiled invocation has returned, so guest code can publish
+    // its post-submit state before its DMAC handler observes it.
+    if (it->second == 1u)
+    {
+        drainCompletedDmacHandlers(m_memory.getRDRAM());
+        it = g_guestExecutionDepths.find(this);
+        if (it == g_guestExecutionDepths.end() || it->second == 0u)
+        {
+            return;
+        }
+    }
+
     --it->second;
     m_guestExecutionMutex.unlock();
     if (it->second == 0u)
@@ -2168,6 +2182,14 @@ bool PS2Runtime::shouldPreemptGuestExecution()
     }
 
     s_backEdgeYieldCounter = 0u;
+    if (waiterCount != 0u)
+    {
+        // Returning to the dispatcher is not itself a fair handoff: the current
+        // host thread can release and immediately reacquire the recursive mutex,
+        // indefinitely starving a guest thread that is already queued. Transfer
+        // ownership here before asking generated code to return to its dispatcher.
+        yieldGuestExecutionAfterWake();
+    }
     return true;
 }
 
@@ -2268,7 +2290,6 @@ void PS2Runtime::Store32(uint8_t *rdram, R5900Context *ctx, uint32_t vaddr, uint
     try
     {
         m_memory.write32(vaddr, value);
-        drainCompletedDmacHandlers(rdram);
     }
     catch (const std::exception &)
     {
@@ -2325,17 +2346,14 @@ void PS2Runtime::kickGifDmaChainFromMMIO(uint8_t *rdram,
     ps2TraceGuestWrite(rdram, GIF_CHCR, 4u, chcr, 0u, "WRITE32", ctx);
     if (m_memory.tryProcessNativeGifImageUploadChain(m_gs, tadr, chcr))
     {
-        drainCompletedDmacHandlers(rdram);
         return;
     }
     if (m_memory.tryProcessNativeGifPackedChain(m_gs, tadr, chcr))
     {
-        drainCompletedDmacHandlers(rdram);
         return;
     }
     m_memory.writeIORegister(GIF_CHCR, chcr);
     m_memory.processPendingTransfers();
-    drainCompletedDmacHandlers(rdram);
 }
 
 void PS2Runtime::requestStop()

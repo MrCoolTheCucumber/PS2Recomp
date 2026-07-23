@@ -256,6 +256,13 @@ namespace
                     runtime->yieldGuestExecutionAfterWake();
                 }
                 std::this_thread::sleep_for(std::chrono::milliseconds(1));
+                if (runtime && runtime->shouldPreemptGuestExecution())
+                {
+                    // Generated back edges return to the dispatcher at this
+                    // point, allowing a pending interrupt to acquire the
+                    // serialized guest execution scope.
+                    return;
+                }
             }
         } while (counter == 0u);
 
@@ -739,7 +746,7 @@ void register_ps2_runtime_expansion_tests()
                      "missing target should remain visible in ctx->pc for diagnostics");
         });
 
-        tc.Run("vblank intc handlers can preempt serialized guest execution", [](TestCase &t)
+        tc.Run("vblank intc handlers cooperatively preempt serialized guest execution", [](TestCase &t)
         {
             notifyRuntimeStop();
 

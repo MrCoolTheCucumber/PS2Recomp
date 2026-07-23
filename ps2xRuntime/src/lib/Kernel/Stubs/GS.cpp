@@ -743,6 +743,7 @@ namespace ps2_stubs
             {
                 runtime->waitForGuestExecutionHandoff(handoffBaseline);
             }
+            runtime->drainCompletedDmacHandlers(rdram);
 
             if (shouldLogDispatch)
             {
