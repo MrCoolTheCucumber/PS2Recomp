@@ -97,6 +97,20 @@ static inline __m128i Ps2MakeU64Vector(uint64_t doubleword0, uint64_t doubleword
     return result;
 }
 
+static inline __m128i Ps2VuFtoi(__m128 value, float scale)
+{
+    const __m128 scaled = _mm_mul_ps(value, _mm_set1_ps(scale));
+    const __m128 largestInRange =
+        _mm_castsi128_ps(_mm_set1_epi32(0x4EFFFFFF));
+    const __m128 positiveOverflow = _mm_cmpgt_ps(scaled, largestInRange);
+    const __m128i truncated = _mm_cvttps_epi32(scaled);
+
+    // CVTTPS2DQ returns INT_MIN for every unrepresentable input. The VUs
+    // instead saturate positive overflow to INT_MAX while retaining INT_MIN
+    // for negative overflow and NaN.
+    return _mm_xor_si128(truncated, _mm_castps_si128(positiveOverflow));
+}
+
 static inline __m128i Ps2GetHi128(const R5900Context *ctx)
 {
     return Ps2MakeU64Vector(ctx->hi, ctx->hi1);

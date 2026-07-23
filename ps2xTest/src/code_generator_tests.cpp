@@ -262,6 +262,24 @@ void register_code_generator_tests()
                  "DADDI should not compute a potentially overflowing signed sum");
     });
 
+    tc.Run("VU FTOI uses saturating conversion", [](TestCase &t) {
+        CodeGenerator gen({}, {});
+        Instruction ftoi{};
+        ftoi.rd = 17;
+        ftoi.rt = 18;
+        ftoi.vectorInfo.vectorField = 0xFu;
+
+        const std::string ftoi0 = gen.translateVU_VFTOI(ftoi, 0);
+        const std::string ftoi4 = gen.translateVU_VFTOI(ftoi, 4);
+
+        t.IsTrue(ftoi0.find("Ps2VuFtoi(ctx->vu0_vf[17], 1.0f)") != std::string::npos,
+                 "VFTOI0 should use the VU saturation helper");
+        t.IsTrue(ftoi4.find("Ps2VuFtoi(ctx->vu0_vf[17], 16.0f)") != std::string::npos,
+                 "VFTOI4 should scale through the VU saturation helper");
+        t.IsTrue(ftoi0.find("_mm_cvttps_epi32") == std::string::npos,
+                 "generated VFTOI must not use an unsaturated host conversion directly");
+    });
+
     tc.Run("MMI signed multiply-accumulate uses defined wrapping arithmetic", [](TestCase &t) {
         CodeGenerator gen({}, {});
 

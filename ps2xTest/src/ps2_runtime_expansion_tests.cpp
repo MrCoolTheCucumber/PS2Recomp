@@ -21,6 +21,7 @@
 #include <cstdint>
 #include <cstring>
 #include <exception>
+#include <limits>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -608,6 +609,40 @@ void register_ps2_runtime_expansion_tests()
             t.Equals(Ps2MaddSigned32(0ull, INT32_MIN, INT32_MIN),
                      0x4000000000000000ull,
                      "signed MADD should handle the largest 32-bit product exactly");
+        });
+
+        tc.Run("VU FTOI saturates unrepresentable values", [](TestCase &t)
+        {
+            uint32_t words[4]{};
+            const __m128 ordinaryAndOverflow = _mm_set_ps(
+                -2147483904.0f, 2147483648.0f, -123.75f, 123.75f);
+            __m128i result = Ps2VuFtoi(ordinaryAndOverflow, 1.0f);
+            std::memcpy(words, &result, sizeof(words));
+
+            t.Equals(words[0], 123u, "positive finite VFTOI should truncate toward zero");
+            t.Equals(words[1], 0xFFFFFF85u, "negative finite VFTOI should truncate toward zero");
+            t.Equals(words[2], 0x7FFFFFFFu, "positive VFTOI overflow should saturate to INT_MAX");
+            t.Equals(words[3], 0x80000000u, "negative VFTOI overflow should saturate to INT_MIN");
+
+            const __m128 specialValues = _mm_set_ps(
+                std::numeric_limits<float>::quiet_NaN(),
+                -std::numeric_limits<float>::infinity(),
+                std::numeric_limits<float>::infinity(),
+                2147483520.0f);
+            result = Ps2VuFtoi(specialValues, 1.0f);
+            std::memcpy(words, &result, sizeof(words));
+
+            t.Equals(words[0], 0x7FFFFF80u, "largest in-range float should convert exactly");
+            t.Equals(words[1], 0x7FFFFFFFu, "positive infinity should saturate to INT_MAX");
+            t.Equals(words[2], 0x80000000u, "negative infinity should saturate to INT_MIN");
+            t.Equals(words[3], 0x80000000u, "NaN should retain the VU indefinite value");
+
+            result = Ps2VuFtoi(
+                _mm_set_ps(0.0f, 0.0f, -134217728.0f, 134217728.0f),
+                16.0f);
+            std::memcpy(words, &result, sizeof(words));
+            t.Equals(words[0], 0x7FFFFFFFu, "scaled positive overflow should saturate");
+            t.Equals(words[1], 0x80000000u, "scaled negative boundary should convert to INT_MIN");
         });
 
         tc.Run("packed HI and LO helpers preserve all lanes", [](TestCase &t)
