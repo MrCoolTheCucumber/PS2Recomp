@@ -149,8 +149,8 @@ static inline uint32_t ps2_plzcw32(uint32_t x)
 #define PS2_VBLEND(a, b, mask) PS2_BLENDV_PS((__m128)(a), (__m128)(b), (__m128)(mask))
 
 // Memory access helpers - Hybrid Fast/Slow Path
-// Fast path: Direct RDRAM access (masked).
-// Slow path: Full runtime->Load/Store
+// Callers must validate aliases, bounds, and alignment before using the direct
+// helpers. The hybrid READ/WRITE macros do that and otherwise use the runtime.
 
 static inline bool Ps2FastRangeIsContiguous(uint32_t offset, uint32_t bytes)
 {
@@ -325,39 +325,39 @@ static inline void Ps2FastWrite128(uint8_t *rdram, uint32_t addr, __m128i value)
 
 #define READ8(addr) ([&]() -> uint8_t {                       \
     uint32_t _addr = (uint32_t)(addr);                        \
-    return PS2Runtime::isSpecialAddress(_addr)                \
-        ? runtime->Load8(rdram, ctx, _addr)                   \
-        : FAST_READ8(_addr); }())
+    return Ps2CanUseFastRdramAccess(_addr, 1u)                 \
+        ? FAST_READ8(_addr)                                   \
+        : runtime->Load8(rdram, ctx, _addr); }())
 
 #define READ16(addr) ([&]() -> uint16_t {                     \
     uint32_t _addr = (uint32_t)(addr);                        \
-    return PS2Runtime::isSpecialAddress(_addr)                \
-        ? runtime->Load16(rdram, ctx, _addr)                  \
-        : FAST_READ16(_addr); }())
+    return Ps2CanUseFastRdramAccess(_addr, 2u)                 \
+        ? FAST_READ16(_addr)                                  \
+        : runtime->Load16(rdram, ctx, _addr); }())
 
 #define READ32(addr) ([&]() -> uint32_t {                     \
     uint32_t _addr = (uint32_t)(addr);                        \
-    return PS2Runtime::isSpecialAddress(_addr)                \
-        ? runtime->Load32(rdram, ctx, _addr)                  \
-        : FAST_READ32(_addr); }())
+    return Ps2CanUseFastRdramAccess(_addr, 4u)                 \
+        ? FAST_READ32(_addr)                                  \
+        : runtime->Load32(rdram, ctx, _addr); }())
 
 #define READ64(addr) ([&]() -> uint64_t {                     \
     uint32_t _addr = (uint32_t)(addr);                        \
-    return PS2Runtime::isSpecialAddress(_addr)                \
-        ? runtime->Load64(rdram, ctx, _addr)                  \
-        : FAST_READ64(_addr); }())
+    return Ps2CanUseFastRdramAccess(_addr, 8u)                 \
+        ? FAST_READ64(_addr)                                  \
+        : runtime->Load64(rdram, ctx, _addr); }())
 
 #define READ128(addr) ([&]() -> __m128i {                     \
     uint32_t _addr = (uint32_t)(addr);                        \
-    return PS2Runtime::isSpecialAddress(_addr)                \
-        ? runtime->Load128(rdram, ctx, _addr)                 \
-        : FAST_READ128(_addr); }())
+    return Ps2CanUseFastRdramAccess(_addr, 16u)                \
+        ? FAST_READ128(_addr)                                 \
+        : runtime->Load128(rdram, ctx, _addr); }())
 
 #define WRITE8(addr, val)                                                            \
     do                                                                               \
     {                                                                                \
         uint32_t _addr = (addr);                                                     \
-        if (PS2Runtime::isSpecialAddress(_addr))                                     \
+        if (!Ps2CanUseFastRdramAccess(_addr, 1u))                                    \
             runtime->Store8(rdram, ctx, _addr, (val));                               \
         else                                                                         \
         {                                                                            \
@@ -370,7 +370,7 @@ static inline void Ps2FastWrite128(uint8_t *rdram, uint32_t addr, __m128i value)
     do                                                                                 \
     {                                                                                  \
         uint32_t _addr = (addr);                                                       \
-        if (PS2Runtime::isSpecialAddress(_addr))                                       \
+        if (!Ps2CanUseFastRdramAccess(_addr, 2u))                                      \
             runtime->Store16(rdram, ctx, _addr, (val));                                \
         else                                                                           \
         {                                                                              \
@@ -383,7 +383,7 @@ static inline void Ps2FastWrite128(uint8_t *rdram, uint32_t addr, __m128i value)
     do                                                                                 \
     {                                                                                  \
         uint32_t _addr = (addr);                                                       \
-        if (PS2Runtime::isSpecialAddress(_addr))                                       \
+        if (!Ps2CanUseFastRdramAccess(_addr, 4u))                                      \
             runtime->Store32(rdram, ctx, _addr, (val));                                \
         else                                                                           \
         {                                                                              \
@@ -396,7 +396,7 @@ static inline void Ps2FastWrite128(uint8_t *rdram, uint32_t addr, __m128i value)
     do                                                                                 \
     {                                                                                  \
         uint32_t _addr = (addr);                                                       \
-        if (PS2Runtime::isSpecialAddress(_addr))                                       \
+        if (!Ps2CanUseFastRdramAccess(_addr, 8u))                                      \
             runtime->Store64(rdram, ctx, _addr, (val));                                \
         else                                                                           \
         {                                                                              \
@@ -410,7 +410,7 @@ static inline void Ps2FastWrite128(uint8_t *rdram, uint32_t addr, __m128i value)
     {                                                                                \
         uint32_t _addr = (addr);                                                     \
         __m128i _value = (val);                                                      \
-        if (PS2Runtime::isSpecialAddress(_addr))                                     \
+        if (!Ps2CanUseFastRdramAccess(_addr, 16u))                                   \
             runtime->Store128(rdram, ctx, _addr, _value);                            \
         else                                                                         \
         {                                                                            \

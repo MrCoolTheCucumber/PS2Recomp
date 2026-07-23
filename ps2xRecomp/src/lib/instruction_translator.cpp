@@ -88,7 +88,8 @@ namespace ps2recomp
         {
             const uint32_t resolvedAddress = memoryHint.address;
             const std::string resolvedAddressExpr = addressLiteral(resolvedAddress);
-            if (inst.isMmio || Ps2IsSpecialAddress(resolvedAddress))
+            if (inst.isMmio ||
+                !Ps2CanUseFastRdramAccess(resolvedAddress, memoryAccessSize(width)))
             {
                 return fmt::format("runtime->Load{}(rdram, ctx, {})", width, resolvedAddressExpr);
             }
@@ -112,7 +113,8 @@ namespace ps2recomp
         {
             const uint32_t resolvedAddress = memoryHint.address;
             const std::string resolvedAddressExpr = addressLiteral(resolvedAddress);
-            if (inst.isMmio || Ps2IsSpecialAddress(resolvedAddress))
+            if (inst.isMmio ||
+                !Ps2CanUseFastRdramAccess(resolvedAddress, memoryAccessSize(width)))
             {
                 return fmt::format("runtime->Store{}(rdram, ctx, {}, {})", width, resolvedAddressExpr, value);
             }
@@ -143,6 +145,26 @@ namespace ps2recomp
         auto genWrite = [&](int width, const std::string &addr, const std::string &val)
         {
             return translateMemoryWrite(inst, effectiveMemoryHint, width, addr, val);
+        };
+
+        auto genAlignedQuadwordRead = [&](const std::string &addr)
+        {
+            MemoryAccessHint alignedHint = effectiveMemoryHint;
+            if (alignedHint.hasAddress)
+            {
+                alignedHint.address &= ~0xFu;
+            }
+            return translateMemoryRead(inst, alignedHint, 128, fmt::format("({} & ~0xFu)", addr));
+        };
+
+        auto genAlignedQuadwordWrite = [&](const std::string &addr, const std::string &val)
+        {
+            MemoryAccessHint alignedHint = effectiveMemoryHint;
+            if (alignedHint.hasAddress)
+            {
+                alignedHint.address &= ~0xFu;
+            }
+            return translateMemoryWrite(inst, alignedHint, 128, fmt::format("({} & ~0xFu)", addr), val);
         };
 
         switch (inst.opcode)
@@ -202,9 +224,9 @@ namespace ps2recomp
         case OPCODE_SW:
             return genWrite(32, fmt::format("ADD32(GPR_U32(ctx, {}), {})", inst.rs, inst.simmediate), fmt::format("GPR_U32(ctx, {})", inst.rt)) + ";";
         case OPCODE_LQ:
-            return fmt::format("SET_GPR_VEC(ctx, {}, {});", inst.rt, genRead(128, fmt::format("ADD32(GPR_U32(ctx, {}), {})", inst.rs, inst.simmediate)));
+            return fmt::format("SET_GPR_VEC(ctx, {}, {});", inst.rt, genAlignedQuadwordRead(fmt::format("ADD32(GPR_U32(ctx, {}), {})", inst.rs, inst.simmediate)));
         case OPCODE_SQ:
-            return genWrite(128, fmt::format("ADD32(GPR_U32(ctx, {}), {})", inst.rs, inst.simmediate), fmt::format("GPR_VEC(ctx, {})", inst.rt)) + ";";
+            return genAlignedQuadwordWrite(fmt::format("ADD32(GPR_U32(ctx, {}), {})", inst.rs, inst.simmediate), fmt::format("GPR_VEC(ctx, {})", inst.rt)) + ";";
         case OPCODE_LD:
             return fmt::format("SET_GPR_U64(ctx, {}, {});", inst.rt, genRead(64, fmt::format("ADD32(GPR_U32(ctx, {}), {})", inst.rs, inst.simmediate)));
         case OPCODE_SD:

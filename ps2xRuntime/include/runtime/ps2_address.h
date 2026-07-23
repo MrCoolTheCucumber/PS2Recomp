@@ -5,8 +5,6 @@
 
 #include "runtime/ps2_memory.h"
 
-static inline constexpr uint32_t PS2_EE_UNCACHED_RAM_MIRROR_BASE = 0x20000000u;
-static inline constexpr uint32_t PS2_EE_UNCACHED_RAM_MIRROR_SIZE = 0x20000000u;
 static inline constexpr uint32_t PS2_KSEG0_BASE = 0x80000000u;
 static inline constexpr uint32_t PS2_KSEG0_KSEG1_SIZE = 0x40000000u;
 static inline constexpr uint32_t PS2_KSEG2_BASE = 0xC0000000u;
@@ -19,6 +17,31 @@ static inline constexpr bool Ps2AddressInRange(uint32_t value, uint32_t base, ui
 static inline constexpr bool Ps2IsUncachedRamMirrorAddress(uint32_t addr)
 {
     return Ps2AddressInRange(addr, PS2_EE_UNCACHED_RAM_MIRROR_BASE, PS2_EE_UNCACHED_RAM_MIRROR_SIZE);
+}
+
+static inline constexpr bool Ps2IsAcceleratedRamMirrorAddress(uint32_t addr)
+{
+    return Ps2AddressInRange(addr,
+                             PS2_EE_ACCELERATED_RAM_MIRROR_BASE,
+                             PS2_EE_ACCELERATED_RAM_MIRROR_SIZE);
+}
+
+static inline constexpr bool Ps2IsDirectRdramAddress(uint32_t addr)
+{
+    uint32_t offset = 0u;
+    return ps2ResolveDirectRdramOffset(addr, offset);
+}
+
+static inline constexpr bool Ps2CanUseFastRdramAccess(uint32_t addr, uint32_t bytes)
+{
+    if (bytes == 0u || bytes > PS2_RAM_SIZE || (addr % bytes) != 0u)
+    {
+        return false;
+    }
+
+    uint32_t offset = 0u;
+    return ps2ResolveDirectRdramOffset(addr, offset) &&
+           offset <= (PS2_RAM_SIZE - bytes);
 }
 
 static inline constexpr bool Ps2IsKseg01Address(uint32_t addr)

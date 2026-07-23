@@ -453,10 +453,12 @@ uint32_t PS2Memory::translateAddress(uint32_t virtualAddress)
         return ps2ScratchpadOffset(virtualAddress);
     }
 
-    // EE uncached aliases of main RAM (per PS2 memory map):
-    //   0x20000000-0x3FFFFFFF -> 32MB mirror of RDRAM
-    // This includes the accelerated window rooted at 0x30100000.
+    // EE TLB aliases of main RAM installed by the kernel.
     if (Ps2IsUncachedRamMirrorAddress(virtualAddress))
+    {
+        return virtualAddress & PS2_RAM_MASK;
+    }
+    if (Ps2IsAcceleratedRamMirrorAddress(virtualAddress))
     {
         return virtualAddress & PS2_RAM_MASK;
     }

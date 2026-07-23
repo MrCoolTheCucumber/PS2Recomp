@@ -188,27 +188,7 @@ namespace ps2_stubs
 
         bool isCopyableGuestAddress(uint32_t addr)
         {
-            if (Ps2AddressInRange(addr, PS2_SCRATCHPAD_BASE, PS2_SCRATCHPAD_SIZE))
-            {
-                return true;
-            }
-
-            if (addr < PS2_EE_UNCACHED_RAM_MIRROR_BASE)
-            {
-                return true;
-            }
-
-            if (Ps2IsUncachedRamMirrorAddress(addr))
-            {
-                return true;
-            }
-
-            if (Ps2IsKseg01Address(addr))
-            {
-                return true;
-            }
-
-            return false;
+            return ps2IsScratchpadAddress(addr) || Ps2IsDirectRdramAddress(addr);
         }
 
         bool canCopyGuestByteRange(const uint8_t *rdram, uint32_t dstAddr, uint32_t srcAddr, uint32_t sizeBytes)

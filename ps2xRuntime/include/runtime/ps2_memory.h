@@ -48,6 +48,10 @@ private:
 constexpr uint32_t PS2_RAM_SIZE = 32u * 1024u * 1024u; // 32MB
 constexpr uint32_t PS2_RAM_MASK = PS2_RAM_SIZE - 1u;   // Mask for 32MB alignment
 constexpr uint32_t PS2_RAM_BASE = 0x00000000;          // Physical base of RDRAM
+constexpr uint32_t PS2_EE_UNCACHED_RAM_MIRROR_BASE = 0x20000000u;
+constexpr uint32_t PS2_EE_UNCACHED_RAM_MIRROR_SIZE = PS2_RAM_SIZE;
+constexpr uint32_t PS2_EE_ACCELERATED_RAM_MIRROR_BASE = 0x30100000u;
+constexpr uint32_t PS2_EE_ACCELERATED_RAM_MIRROR_SIZE = PS2_RAM_SIZE - 0x00100000u;
 constexpr uint32_t PS2_SCRATCHPAD_BASE = 0x70000000;
 constexpr uint32_t PS2_SCRATCHPAD_ALIAS_BASE = 0xF0000000;
 constexpr uint32_t PS2_SCRATCHPAD_SIZE = 16u * 1024u;  // 16KB
@@ -136,6 +140,26 @@ inline uint32_t ps2ScratchpadOffset(uint32_t addr)
     return lower - PS2_SCRATCHPAD_BASE;
 }
 
+inline constexpr bool ps2ResolveDirectRdramOffset(uint32_t addr, uint32_t &offset)
+{
+    const bool physical = addr < PS2_RAM_SIZE;
+    const bool uncached =
+        (addr - PS2_EE_UNCACHED_RAM_MIRROR_BASE) < PS2_EE_UNCACHED_RAM_MIRROR_SIZE;
+    const bool accelerated =
+        (addr - PS2_EE_ACCELERATED_RAM_MIRROR_BASE) < PS2_EE_ACCELERATED_RAM_MIRROR_SIZE;
+    const bool kseg01 = (addr - 0x80000000u) < 0x40000000u;
+
+    if (physical || uncached || accelerated ||
+        (kseg01 && ((addr & 0x1FFFFFFFu) < PS2_RAM_SIZE)))
+    {
+        offset = addr & PS2_RAM_MASK;
+        return true;
+    }
+
+    offset = 0u;
+    return false;
+}
+
 inline bool ps2ResolveGuestPointer(uint32_t addr, uint32_t &offset, bool &scratch)
 {
     if (ps2IsScratchpadAddress(addr))
@@ -145,24 +169,13 @@ inline bool ps2ResolveGuestPointer(uint32_t addr, uint32_t &offset, bool &scratc
         return true;
     }
 
-    uint32_t phys = 0;
-    if (addr < 0x20000000u)
+    if (!ps2ResolveDirectRdramOffset(addr, offset))
     {
-        phys = addr;
-    }
-    else if ((addr >= 0x20000000u && addr < 0x40000000u) ||
-             (addr >= 0x80000000u && addr < 0xC0000000u))
-    {
-        phys = addr & 0x1FFFFFFFu;
-    }
-
-    if (phys >= PS2_RAM_SIZE)
-    {
-        phys &= PS2_RAM_MASK;
+        scratch = false;
+        return false;
     }
 
     scratch = false;
-    offset = phys;
     return true;
 }
 inline uint8_t *getMemPtr(uint8_t *rdram, uint32_t addr)

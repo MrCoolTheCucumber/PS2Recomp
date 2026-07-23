@@ -245,6 +245,68 @@ void register_code_generator_tests()
                  "constant RDRAM SW should not go through WRITE32 address classification");
     });
 
+    tc.Run("constant invalid and misaligned memory accesses use checked runtime", [](TestCase &t) {
+        Function func;
+        func.name = "checked_memory_access";
+        func.start = 0x2400;
+        func.end = 0x2420;
+        func.isRecompiled = true;
+
+        std::vector<Instruction> instructions;
+        instructions.push_back(makeLui(0x2400, 1, 0x2200));
+        instructions.push_back(makeLw(0x2404, 3, 1, 0));
+        instructions.push_back(makeLui(0x2408, 2, 0x0012));
+        instructions.push_back(makeOri(0x240C, 2, 2, 0x3450));
+        instructions.push_back(makeLw(0x2410, 4, 2, 1));
+        instructions.push_back(makeSw(0x2414, 5, 2, 2));
+
+        CodeGenerator gen({}, {});
+        std::string generated = gen.generateFunction(func, instructions, false);
+        printGeneratedCode("constant invalid and misaligned memory accesses use checked runtime", generated);
+
+        t.IsTrue(generated.find("runtime->Load32(rdram, ctx, 0x22000000u)") != std::string::npos,
+                 "constant address beyond RDRAM aliases should use the checked load");
+        t.IsTrue(generated.find("runtime->Load32(rdram, ctx, 0x123451u)") != std::string::npos,
+                 "constant misaligned LW should use the checked load");
+        t.IsTrue(generated.find("runtime->Store32(rdram, ctx, 0x123452u, GPR_U32(ctx, 5))") != std::string::npos,
+                 "constant misaligned SW should use the checked store");
+        t.IsTrue(generated.find("FAST_READ32(0x22000000u)") == std::string::npos,
+                 "invalid constant load must not wrap through the fast helper");
+        t.IsTrue(generated.find("FAST_READ32(0x123451u)") == std::string::npos,
+                 "misaligned constant load must not use the fast helper");
+        t.IsTrue(generated.find("FAST_WRITE32(0x123452u") == std::string::npos,
+                 "misaligned constant store must not use the fast helper");
+    });
+
+    tc.Run("EE LQ and SQ silently align addresses", [](TestCase &t) {
+        CodeGenerator gen({}, {});
+        const Instruction lq = makeIType(0x2800, OPCODE_LQ, 1, 2, 8);
+        const Instruction sq = makeIType(0x2804, OPCODE_SQ, 3, 4, 8);
+
+        const std::string dynamicLq = gen.translateInstruction(lq);
+        const std::string dynamicSq = gen.translateInstruction(sq);
+        printGeneratedCode("EE LQ silently aligns dynamic address", dynamicLq);
+        printGeneratedCode("EE SQ silently aligns dynamic address", dynamicSq);
+
+        t.IsTrue(dynamicLq.find("READ128((ADD32(GPR_U32(ctx, 1), 8) & ~0xFu))") != std::string::npos,
+                 "LQ should clear the low four effective-address bits");
+        t.IsTrue(dynamicSq.find("WRITE128((ADD32(GPR_U32(ctx, 3), 8) & ~0xFu), GPR_VEC(ctx, 4))") != std::string::npos,
+                 "SQ should clear the low four effective-address bits");
+
+        const MemoryAccessHint unalignedHint{true, 0x00123458u};
+        const std::string constantLq = gen.translateInstruction(lq, unalignedHint);
+        const std::string constantSq = gen.translateInstruction(sq, unalignedHint);
+
+        t.IsTrue(constantLq.find("FAST_READ128(0x123450u)") != std::string::npos,
+                 "constant LQ hint should be aligned before selecting the fast path");
+        t.IsTrue(constantSq.find("FAST_WRITE128(0x123450u, _value)") != std::string::npos,
+                 "constant SQ hint should be aligned before selecting the fast path");
+        t.IsTrue(constantLq.find("runtime->Load128") == std::string::npos,
+                 "silently aligned LQ should not be treated as an address error");
+        t.IsTrue(constantSq.find("runtime->Store128") == std::string::npos,
+                 "silently aligned SQ should not be treated as an address error");
+    });
+
     tc.Run("known GIF DMA MMIO sequence emits native kick helper", [](TestCase &t) {
         Function func;
         func.name = "gif_dma_kick";

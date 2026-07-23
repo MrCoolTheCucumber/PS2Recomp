@@ -194,6 +194,40 @@ void register_ps2_memory_tests()
             t.Equals(mem.translateAddress(PS2_SCRATCHPAD_ALIAS_BASE + 0x123u), 0x123u, "0xF000 scratchpad alias should translate to local offset");
         });
 
+        tc.Run("guest pointers reject non-RDRAM address spaces", [](TestCase &t)
+        {
+            PS2Memory mem;
+            t.IsTrue(mem.initialize(), "PS2Memory initialize should succeed");
+            uint8_t *const rdram = mem.getRDRAM();
+
+            t.IsTrue(getMemPtr(rdram, 0x00000100u) == rdram + 0x100u,
+                     "physical RDRAM pointer should resolve directly");
+            t.IsTrue(getMemPtr(rdram, 0x20000100u) == rdram + 0x100u,
+                     "uncached RDRAM pointer should resolve to its physical offset");
+            t.IsTrue(getMemPtr(rdram, 0x30100100u) == rdram + 0x00100100u,
+                     "accelerated RDRAM pointer should resolve to its physical offset");
+            t.IsTrue(getMemPtr(rdram, 0x80000100u) == rdram + 0x100u,
+                     "KSEG0 RDRAM pointer should resolve to its physical offset");
+            t.IsTrue(getMemPtr(rdram, 0xA0000100u) == rdram + 0x100u,
+                     "KSEG1 RDRAM pointer should resolve to its physical offset");
+            uint8_t *const scratchpad = ps2GetScratchpadHostPtr();
+            t.IsNotNull(scratchpad, "scratchpad host storage should be initialized");
+            t.IsTrue(getMemPtr(rdram, PS2_SCRATCHPAD_ALIAS_BASE + 0x100u) ==
+                         scratchpad + 0x100u,
+                     "scratchpad alias should still resolve to scratchpad storage");
+
+            t.IsNull(getMemPtr(rdram, 0x02000000u),
+                     "address immediately beyond RDRAM must not wrap to offset zero");
+            t.IsNull(getMemPtr(rdram, 0x10000000u),
+                     "MMIO must not be exposed as an RDRAM host pointer");
+            t.IsNull(getMemPtr(rdram, 0x22000000u),
+                     "address beyond the uncached mirror must not wrap to RDRAM");
+            t.IsNull(getMemPtr(rdram, 0x30000000u),
+                     "unmapped first megabyte of the accelerated segment must be rejected");
+            t.IsNull(getMemPtr(rdram, 0xC0000000u),
+                     "TLB-mapped segments must not be treated as direct host pointers");
+        });
+
         tc.Run("EE timer0 count advances while enabled and can be reset", [](TestCase &t)
         {
             PS2Memory mem;
@@ -286,6 +320,65 @@ void register_ps2_memory_tests()
             t.Equals(static_cast<uint32_t>(rdram[1u]), 0x66u, "write byte 5 should wrap to address 1");
             t.Equals(static_cast<uint32_t>(rdram[2u]), 0x77u, "write byte 6 should wrap to address 2");
             t.Equals(static_cast<uint32_t>(rdram[3u]), 0x88u, "write byte 7 should wrap to address 3");
+        });
+
+        tc.Run("hybrid memory macros validate aliases and alignment", [](TestCase &t)
+        {
+            PS2Runtime runtimeStorage;
+            t.IsTrue(runtimeStorage.memory().initialize(), "PS2Memory initialize should succeed");
+            PS2Runtime *runtime = &runtimeStorage;
+            uint8_t *rdram = runtime->memory().getRDRAM();
+            R5900Context loadContext{};
+            R5900Context *ctx = &loadContext;
+
+            const uint32_t baseValue = 0x11223344u;
+            std::memcpy(rdram, &baseValue, sizeof(baseValue));
+
+            t.Equals(READ32(0x22000000u), 0u,
+                     "address beyond the uncached mirror should use the checked path");
+            t.Equals(READ32(0x30000000u), 0u,
+                     "unmapped accelerated address should not wrap to RDRAM");
+            WRITE32(0x22000000u, 0xAABBCCDDu);
+
+            uint32_t unchangedValue = 0u;
+            std::memcpy(&unchangedValue, rdram, sizeof(unchangedValue));
+            t.Equals(unchangedValue, baseValue,
+                     "invalid direct write should not modify wrapped RDRAM");
+
+            const uint32_t acceleratedValue = 0x55667788u;
+            std::memcpy(rdram + 0x00100000u, &acceleratedValue, sizeof(acceleratedValue));
+            t.Equals(READ32(0x30100000u), acceleratedValue,
+                     "valid accelerated alias should retain the fast RDRAM path");
+
+            bool loadRaised = false;
+            loadContext.pc = 0x1000u;
+            try
+            {
+                (void)READ32(0x00000002u);
+            }
+            catch (const PS2GuestException &)
+            {
+                loadRaised = true;
+            }
+            t.IsTrue(loadRaised, "misaligned fast-path load should raise an EE exception");
+            t.Equals(loadContext.cop0_badvaddr, 0x00000002u,
+                     "misaligned load should retain the original virtual address");
+
+            R5900Context storeContext{};
+            ctx = &storeContext;
+            storeContext.pc = 0x2000u;
+            bool storeRaised = false;
+            try
+            {
+                WRITE32(0x00000002u, 0xDEADBEEFu);
+            }
+            catch (const PS2GuestException &)
+            {
+                storeRaised = true;
+            }
+            t.IsTrue(storeRaised, "misaligned fast-path store should raise an EE exception");
+            t.Equals(storeContext.cop0_badvaddr, 0x00000002u,
+                     "misaligned store should retain the original virtual address");
         });
 
         tc.Run("VIF MPG num zero uploads 256 instructions", [](TestCase &t)

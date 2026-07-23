@@ -1056,13 +1056,10 @@ namespace
 {
     uint32_t normalizeGuestFunctionAddress(uint32_t address)
     {
-        if (Ps2IsUncachedRamMirrorAddress(address))
+        uint32_t offset = 0u;
+        if (ps2ResolveDirectRdramOffset(address, offset))
         {
-            return address & PS2_RAM_MASK;
-        }
-        if (Ps2IsKseg01Address(address))
-        {
-            return Ps2DirectMappedPhysicalAddress(address);
+            return offset;
         }
         return address;
     }
