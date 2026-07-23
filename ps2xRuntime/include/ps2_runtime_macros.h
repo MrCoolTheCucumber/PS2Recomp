@@ -261,6 +261,27 @@ static inline __m128i Ps2Pmultuw(R5900Context *ctx, __m128i lhs, __m128i rhs)
     return Ps2MakeU64Vector(product0, product1);
 }
 
+static inline __m128i Ps2Pmultw(R5900Context *ctx, __m128i lhs, __m128i rhs)
+{
+    int32_t lhsWords[4];
+    int32_t rhsWords[4];
+    std::memcpy(lhsWords, &lhs, sizeof(lhs));
+    std::memcpy(rhsWords, &rhs, sizeof(rhs));
+
+    const int64_t signedProduct0 =
+        static_cast<int64_t>(lhsWords[0]) * static_cast<int64_t>(rhsWords[0]);
+    const int64_t signedProduct1 =
+        static_cast<int64_t>(lhsWords[2]) * static_cast<int64_t>(rhsWords[2]);
+    const uint64_t product0 = std::bit_cast<uint64_t>(signedProduct0);
+    const uint64_t product1 = std::bit_cast<uint64_t>(signedProduct1);
+
+    ctx->lo = Ps2SignExt32ToU64(Ps2LowWord(product0));
+    ctx->hi = Ps2SignExt32ToU64(Ps2HighWord(product0));
+    ctx->lo1 = Ps2SignExt32ToU64(Ps2LowWord(product1));
+    ctx->hi1 = Ps2SignExt32ToU64(Ps2HighWord(product1));
+    return Ps2MakeU64Vector(product0, product1);
+}
+
 // PLZCW: Count leading bits that match the sign bit, minus 1.
 // For positive values: count leading zeros minus 1 (excludes sign bit).
 // For negative values: count leading ones minus 1 (excludes sign bit).

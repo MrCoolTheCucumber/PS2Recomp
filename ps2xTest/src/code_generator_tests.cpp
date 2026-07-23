@@ -373,6 +373,27 @@ void register_code_generator_tests()
                  "PMULTUW should not duplicate an even lane through overlapping SIMD products");
     });
 
+    tc.Run("PMULTW emits two independent signed products", [](TestCase &t) {
+        CodeGenerator gen({}, {});
+
+        Instruction pmultw{};
+        pmultw.opcode = OPCODE_MMI;
+        pmultw.isMMI = true;
+        pmultw.function = MMI_MMI2;
+        pmultw.sa = MMI2_PMULTW;
+        pmultw.rs = 2;
+        pmultw.rt = 3;
+        pmultw.rd = 4;
+
+        const std::string generated = gen.translateInstruction(pmultw);
+        t.IsTrue(generated.find("__m128i result = Ps2Pmultw(ctx, GPR_VEC(ctx, 2), GPR_VEC(ctx, 3));") != std::string::npos,
+                 "PMULTW should use the dual signed-product HI/LO helper");
+        t.IsTrue(generated.find("SET_GPR_VEC(ctx, 4, result);") != std::string::npos,
+                 "PMULTW should return both 64-bit products to rd");
+        t.IsTrue(generated.find("_mm_mul_epu32") == std::string::npos,
+                 "PMULTW must not use unsigned multiplication or collapse product lanes");
+    });
+
     tc.Run("constant MMIO store emits direct runtime store", [](TestCase &t) {
         Function func;
         func.name = "mmio_store";
