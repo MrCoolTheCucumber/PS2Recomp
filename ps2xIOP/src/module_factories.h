@@ -145,6 +145,7 @@ namespace ps2x::iop::detail
         std::string imageBodyUpperName;
     };
 
+    std::unique_ptr<IopService> createCdvdfsvService(IopHost &host);
     std::unique_ptr<IopService> createDbcmanService(IopHost &host);
     std::unique_ptr<IopService> createLibSdService(IopHost &host);
     std::unique_ptr<IopService> createMcservService(IopHost &host);

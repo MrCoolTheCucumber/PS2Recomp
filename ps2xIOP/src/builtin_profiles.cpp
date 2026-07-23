@@ -96,6 +96,7 @@ namespace ps2x::iop::detail
     ServiceList createCoreServices(IopHost &host)
     {
         ServiceList services;
+        services.emplace_back(createCdvdfsvService(host));
         services.emplace_back(createMcservService(host));
         services.emplace_back(createDbcmanService(host));
         services.emplace_back(createLibSdService(host));

@@ -34,6 +34,7 @@ namespace
     constexpr uint32_t IOP_SID_LOTR_CLFILE = 0x0000FF01u;
     constexpr uint32_t IOP_SID_LOTR_SOUND = 0x00012345u;
     constexpr uint32_t IOP_SID_MCSERV = 0x80000400u;
+    constexpr uint32_t IOP_SID_CDVDFSV_DISK_READY = 0x8000059Au;
     constexpr uint32_t IOP_SID_LIBSD = 0x80000701u;
     constexpr uint32_t IOP_SID_FATAL_FRAME_SDRDRV = 0x19740512u;
     constexpr uint32_t IOP_RPC_SNDDRV_SUBMIT = 0x00000000u;
@@ -494,6 +495,53 @@ void register_ps2_sif_rpc_tests()
                          kDbcManVersion,
                          "DBCMAN should repeat version 3.20 across the response words");
             }
+        });
+
+        tc.Run("DBCMAN 2.x startup RPCs use the legacy service protocol", [](TestCase &t)
+        {
+            TestEnv env;
+
+            constexpr uint32_t kDbcManSid = 0x80000900u;
+            constexpr uint32_t kCheckVersionRpc = 0x80000963u;
+            constexpr uint32_t kConnectRpc = 0x80000901u;
+            constexpr uint32_t kRecvAddr = 0x00035A40u;
+
+            std::memset(env.rdram.data() + kRecvAddr, 0xCC, 0x40u);
+            const ps2x::iop::RpcResult versionResult =
+                callIop(env, kDbcManSid, kCheckVersionRpc,
+                        kRecvAddr, 0x40u, kRecvAddr, 0x40u);
+
+            t.IsTrue(versionResult.handled, "DBCMAN 2.x version RPC should be handled");
+            t.Equals(readGuestStruct<uint32_t>(env.rdram.data(), kRecvAddr),
+                     0x0202u,
+                     "DBCMAN 2.x version RPC should report version 2.02");
+
+            const ps2x::iop::RpcResult connectResult =
+                callIop(env, kDbcManSid, kConnectRpc,
+                        kRecvAddr, 0x40u, kRecvAddr, 0x40u);
+
+            t.IsTrue(connectResult.handled, "DBCMAN 2.x connect RPC should be handled");
+            t.Equals(readGuestStruct<uint32_t>(env.rdram.data(), kRecvAddr + 0x24u),
+                     0u,
+                     "the first DBCMAN 2.x connection should receive socket zero");
+        });
+
+        tc.Run("CDVDFSV disk-ready RPC reports a ready disc", [](TestCase &t)
+        {
+            TestEnv env;
+
+            constexpr uint32_t kRecvAddr = 0x00035A80u;
+            std::memset(env.rdram.data() + kRecvAddr, 0xCC, sizeof(uint32_t));
+            const ps2x::iop::RpcResult result =
+                callIop(env, IOP_SID_CDVDFSV_DISK_READY, 0u,
+                        0u, 0u, kRecvAddr, sizeof(uint32_t));
+
+            t.IsTrue(result.handled, "CDVDFSV disk-ready RPC should be handled");
+            t.Equals(result.resultAddress, kRecvAddr,
+                     "CDVDFSV disk-ready RPC should return the receive buffer");
+            t.Equals(readGuestStruct<uint32_t>(env.rdram.data(), kRecvAddr),
+                     2u,
+                     "CDVDFSV should report the complete/ready state");
         });
 
         tc.Run("LIBSD RPC routes through the IOP audio service", [](TestCase &t)
