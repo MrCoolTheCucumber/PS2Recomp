@@ -331,6 +331,27 @@ void register_code_generator_tests()
                  "PMTHL.LW should update the lower word in all four HI/LO lanes");
     });
 
+    tc.Run("PMULTH emits independent packed products", [](TestCase &t) {
+        CodeGenerator gen({}, {});
+
+        Instruction pmulth{};
+        pmulth.opcode = OPCODE_MMI;
+        pmulth.isMMI = true;
+        pmulth.function = MMI_MMI2;
+        pmulth.sa = MMI2_PMULTH;
+        pmulth.rs = 2;
+        pmulth.rt = 3;
+        pmulth.rd = 4;
+
+        const std::string generated = gen.translateInstruction(pmulth);
+        t.IsTrue(generated.find("__m128i result = Ps2Pmulth(ctx, GPR_VEC(ctx, 2), GPR_VEC(ctx, 3));") != std::string::npos,
+                 "PMULTH should use the packed HI/LO lane helper");
+        t.IsTrue(generated.find("SET_GPR_VEC(ctx, 4, result);") != std::string::npos,
+                 "PMULTH should return the four even products to rd");
+        t.IsTrue(generated.find("_mm_madd_epi16") == std::string::npos,
+                 "PMULTH must not horizontally add adjacent products");
+    });
+
     tc.Run("constant MMIO store emits direct runtime store", [](TestCase &t) {
         Function func;
         func.name = "mmio_store";

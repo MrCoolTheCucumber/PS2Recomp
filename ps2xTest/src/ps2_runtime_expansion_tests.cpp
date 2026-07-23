@@ -705,6 +705,48 @@ void register_ps2_runtime_expansion_tests()
             t.Equals(ctx.hi1, 0x02468ACE13579BDFull, "PMTHI high lane mismatch");
         });
 
+        tc.Run("PMULTH writes eight independent signed products", [](TestCase &t)
+        {
+            R5900Context ctx{};
+            const __m128i lhs = Ps2MakeU16Vector(
+                0x8000u, static_cast<uint16_t>(-2), 3u, static_cast<uint16_t>(-4),
+                5u, static_cast<uint16_t>(-6), 0x7fffu, static_cast<uint16_t>(-8));
+            const __m128i rhs = Ps2MakeU16Vector(
+                0x8000u, 20u, static_cast<uint16_t>(-30), static_cast<uint16_t>(-40),
+                50u, 60u, 0x7fffu, static_cast<uint16_t>(-80));
+
+            const __m128i result = Ps2Pmulth(&ctx, lhs, rhs);
+            const uint32_t products[8] = {
+                0x40000000u,
+                static_cast<uint32_t>(-40),
+                static_cast<uint32_t>(-90),
+                160u,
+                250u,
+                static_cast<uint32_t>(-360),
+                0x3fff0001u,
+                640u,
+            };
+
+            t.Equals(ctx.lo, (static_cast<uint64_t>(products[1]) << 32) | products[0],
+                     "PMULTH should store products 0 and 1 in LO");
+            t.Equals(ctx.hi, (static_cast<uint64_t>(products[3]) << 32) | products[2],
+                     "PMULTH should store products 2 and 3 in HI");
+            t.Equals(ctx.lo1, (static_cast<uint64_t>(products[5]) << 32) | products[4],
+                     "PMULTH should store products 4 and 5 in LO1");
+            t.Equals(ctx.hi1, (static_cast<uint64_t>(products[7]) << 32) | products[6],
+                     "PMULTH should store products 6 and 7 in HI1");
+
+            uint32_t resultWords[4]{};
+            std::memcpy(resultWords, &result, sizeof(result));
+            const uint32_t expectedResult[4] = {
+                products[0], products[2], products[4], products[6]};
+            for (size_t i = 0; i < 4; ++i)
+            {
+                t.Equals(resultWords[i], expectedResult[i],
+                         "PMULTH rd should contain the even products");
+            }
+        });
+
         tc.Run("differential decoder/codegen gpr-write contract for MULT and DIV families", [](TestCase &t)
         {
             R5900Decoder decoder;

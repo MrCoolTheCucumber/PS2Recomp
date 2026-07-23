@@ -220,6 +220,28 @@ static inline void Ps2PmthlLw(R5900Context *ctx, __m128i value)
     ctx->hi1 = (ctx->hi1 & 0xFFFFFFFF00000000ull) | words[3];
 }
 
+static inline __m128i Ps2Pmulth(R5900Context *ctx, __m128i lhs, __m128i rhs)
+{
+    int16_t lhsHalves[8];
+    int16_t rhsHalves[8];
+    uint32_t products[8];
+    std::memcpy(lhsHalves, &lhs, sizeof(lhs));
+    std::memcpy(rhsHalves, &rhs, sizeof(rhs));
+
+    for (size_t i = 0; i < 8; ++i)
+    {
+        const int32_t product =
+            static_cast<int32_t>(lhsHalves[i]) * static_cast<int32_t>(rhsHalves[i]);
+        products[i] = std::bit_cast<uint32_t>(product);
+    }
+
+    ctx->lo = (static_cast<uint64_t>(products[1]) << 32) | products[0];
+    ctx->hi = (static_cast<uint64_t>(products[3]) << 32) | products[2];
+    ctx->lo1 = (static_cast<uint64_t>(products[5]) << 32) | products[4];
+    ctx->hi1 = (static_cast<uint64_t>(products[7]) << 32) | products[6];
+    return Ps2MakeU32Vector(products[0], products[2], products[4], products[6]);
+}
+
 // PLZCW: Count leading bits that match the sign bit, minus 1.
 // For positive values: count leading zeros minus 1 (excludes sign bit).
 // For negative values: count leading ones minus 1 (excludes sign bit).
