@@ -821,7 +821,7 @@ void register_ps2_recompiler_tests()
                 return;
             }
             mapFile << "name,start,end,size\n";
-            mapFile << "FUN_00100000,0x00100000,0x00100010,0x10\n";
+            mapFile << "FUN_00100000,0x00100000,0x00100008,0x8\n";
             mapFile.close();
 
             const bool mapLoaded = parser.loadGhidraFunctionMap(mapPath.string());
@@ -837,6 +837,8 @@ void register_ps2_recompiler_tests()
             {
                 t.Equals(entryIt->name, std::string("FUN_00100000"),
                          "ghidra name should win over fallback auto-name");
+                t.Equals(entryIt->end, 0x00100008u,
+                         "ghidra range should win over a broader fallback range");
             }
 
             const bool stillHasFallbackOnlyStart = std::any_of(
