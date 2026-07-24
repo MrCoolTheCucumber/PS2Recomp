@@ -48,6 +48,7 @@ add_library(ps2_test_lib STATIC
     src/elf_analyzer_tests.cpp
     src/ps2_audio_tests.cpp
     src/pad_input_tests.cpp
+    src/ps2_runtime_elf_tests.cpp
     src/ps2_runtime_io_tests.cpp
     src/ps2_runtime_kernel_tests.cpp
     src/ps2_runtime_interrupt_tests.cpp

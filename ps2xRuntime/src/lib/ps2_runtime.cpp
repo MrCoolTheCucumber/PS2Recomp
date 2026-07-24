@@ -84,12 +84,32 @@ struct ProgramHeader
     uint32_t align;
 };
 
+struct SectionHeader
+{
+    uint32_t name;
+    uint32_t type;
+    uint32_t flags;
+    uint32_t addr;
+    uint32_t offset;
+    uint32_t size;
+    uint32_t link;
+    uint32_t info;
+    uint32_t addralign;
+    uint32_t entsize;
+};
+
+static_assert(sizeof(ElfHeader) == 52u);
+static_assert(sizeof(ProgramHeader) == 32u);
+static_assert(sizeof(SectionHeader) == 40u);
+
 namespace
 {
     constexpr uint32_t kGuestHeapDefaultBase = 0x00100000u;
     constexpr uint32_t kGuestHeapDefaultAlignment = 16u;
     constexpr uint32_t kGuestHeapSafetyPad = 0x1000u;
     constexpr uint32_t kGuestHeapHardLimit = 0x01F00000u;
+    constexpr uint32_t kElfSectionAlloc = 0x2u;
+    constexpr uint32_t kElfSectionExecInstr = 0x4u;
 
     constexpr uint32_t COP0_CAUSE_EXCCODE_MASK = 0x0000007Cu;
     constexpr uint32_t COP0_CAUSE_BD = 0x80000000u;
@@ -111,6 +131,118 @@ namespace
     thread_local std::unordered_map<PS2Runtime *, uint32_t> g_guestExecutionDepths;
     thread_local uint32_t g_deferredGuestYieldDepth = 0u;
     thread_local bool g_deferredGuestYieldPending = false;
+
+    struct ElfAddressRange
+    {
+        uint32_t start = 0u;
+        uint32_t end = 0u;
+    };
+
+    bool containsRange(const ElfAddressRange &outer, const ElfAddressRange &inner)
+    {
+        return inner.start >= outer.start && inner.end <= outer.end;
+    }
+
+    void mergeAddressRanges(std::vector<ElfAddressRange> &ranges)
+    {
+        std::sort(ranges.begin(), ranges.end(), [](const ElfAddressRange &lhs, const ElfAddressRange &rhs)
+        {
+            return lhs.start < rhs.start || (lhs.start == rhs.start && lhs.end < rhs.end);
+        });
+
+        std::vector<ElfAddressRange> merged;
+        merged.reserve(ranges.size());
+        for (const ElfAddressRange &range : ranges)
+        {
+            if (range.end <= range.start)
+            {
+                continue;
+            }
+
+            if (!merged.empty() && range.start <= merged.back().end)
+            {
+                merged.back().end = std::max(merged.back().end, range.end);
+                continue;
+            }
+
+            merged.push_back(range);
+        }
+        ranges = std::move(merged);
+    }
+
+    bool readExecutableSectionRanges(std::ifstream &file,
+                                     uint64_t fileSize,
+                                     const ElfHeader &header,
+                                     const std::vector<ElfAddressRange> &executableLoadRanges,
+                                     std::vector<ElfAddressRange> &sectionRanges)
+    {
+        sectionRanges.clear();
+        if (header.shoff == 0u || header.shnum == 0u ||
+            header.shentsize < sizeof(SectionHeader))
+        {
+            return false;
+        }
+
+        const uint64_t tableEnd =
+            static_cast<uint64_t>(header.shoff) +
+            static_cast<uint64_t>(header.shnum) * static_cast<uint64_t>(header.shentsize);
+        if (tableEnd > fileSize)
+        {
+            return false;
+        }
+
+        for (uint16_t i = 0; i < header.shnum; ++i)
+        {
+            const uint64_t sectionOffset =
+                static_cast<uint64_t>(header.shoff) +
+                static_cast<uint64_t>(i) * static_cast<uint64_t>(header.shentsize);
+
+            SectionHeader section{};
+            file.clear();
+            file.seekg(static_cast<std::streamoff>(sectionOffset), std::ios::beg);
+            if (!file.read(reinterpret_cast<char *>(&section), sizeof(section)))
+            {
+                sectionRanges.clear();
+                return false;
+            }
+
+            constexpr uint32_t requiredFlags = kElfSectionAlloc | kElfSectionExecInstr;
+            if ((section.flags & requiredFlags) != requiredFlags || section.size == 0u)
+            {
+                continue;
+            }
+
+            const uint64_t sectionEnd =
+                static_cast<uint64_t>(section.addr) + static_cast<uint64_t>(section.size);
+            if (sectionEnd > std::numeric_limits<uint32_t>::max())
+            {
+                continue;
+            }
+
+            const ElfAddressRange candidate{
+                section.addr,
+                static_cast<uint32_t>(sectionEnd),
+            };
+            const bool isFileBackedExecutableRange =
+                std::any_of(executableLoadRanges.begin(), executableLoadRanges.end(),
+                            [&candidate](const ElfAddressRange &loadRange)
+                            {
+                                return containsRange(loadRange, candidate);
+                            });
+            if (isFileBackedExecutableRange)
+            {
+                sectionRanges.push_back(candidate);
+            }
+        }
+
+        if (sectionRanges.empty())
+        {
+            return false;
+        }
+
+        mergeAddressRanges(sectionRanges);
+        return true;
+    }
 
     bool computeFileCrc32(const std::string &path, uint32_t &crcOut)
     {
@@ -810,6 +942,7 @@ bool PS2Runtime::loadELF(const std::string &elfPath)
     uint32_t moduleBase = std::numeric_limits<uint32_t>::max();
     uint32_t moduleEnd = 0u;
     bool loadedAnySegment = false;
+    std::vector<ElfAddressRange> executableLoadRanges;
 
     for (uint16_t i = 0; i < header.phnum; i++)
     {
@@ -913,9 +1046,12 @@ bool PS2Runtime::loadELF(const std::string &elfPath)
         if (ph.flags & 0x1u) // PF_X
         {
             const uint64_t execEnd = static_cast<uint64_t>(ph.vaddr) + static_cast<uint64_t>(ph.filesz);
-            if (execEnd <= std::numeric_limits<uint32_t>::max())
+            if (execEnd <= std::numeric_limits<uint32_t>::max() && execEnd > ph.vaddr)
             {
-                m_memory.registerCodeRegion(ph.vaddr, static_cast<uint32_t>(execEnd));
+                executableLoadRanges.push_back({
+                    ph.vaddr,
+                    static_cast<uint32_t>(execEnd),
+                });
             }
         }
 
@@ -934,6 +1070,26 @@ bool PS2Runtime::loadELF(const std::string &elfPath)
         std::cerr << "ELF contains no loadable PT_LOAD segments." << std::endl;
         return false;
     }
+
+    mergeAddressRanges(executableLoadRanges);
+    std::vector<ElfAddressRange> executableSectionRanges;
+    const bool hasExecutableSectionRanges =
+        readExecutableSectionRanges(file,
+                                    static_cast<uint64_t>(fileSize),
+                                    header,
+                                    executableLoadRanges,
+                                    executableSectionRanges);
+    const std::vector<ElfAddressRange> &codeRanges =
+        hasExecutableSectionRanges ? executableSectionRanges : executableLoadRanges;
+    for (const ElfAddressRange &range : codeRanges)
+    {
+        m_memory.registerCodeRegion(range.start, range.end);
+    }
+    RUNTIME_LOG("Registered " << codeRanges.size()
+                              << (hasExecutableSectionRanges
+                                      ? " executable ELF section range(s)"
+                                      : " executable ELF segment fallback range(s)")
+                              << std::endl);
 
     if (maxLoadedRdramEnd > PS2_RAM_SIZE)
     {

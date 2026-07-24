@@ -2193,7 +2193,8 @@ void PS2Memory::registerCodeRegion(uint32_t start, uint32_t end)
     region.modified.resize(sizeInWords, false);
 
     m_codeRegions.push_back(region);
-    RUNTIME_LOG("Registered code region: " << std::hex << start << " - " << end << std::dec);
+    RUNTIME_LOG("Registered code region: " << std::hex << start << " - " << end
+                                            << std::dec << std::endl);
 }
 
 bool PS2Memory::isAddressInRegion(uint32_t address, const CodeRegion &region)
@@ -2238,8 +2239,12 @@ void PS2Memory::markModified(uint32_t address, uint32_t size)
             size_t bitIndex = (addr - region.start) / 4;
             if (bitIndex < region.modified.size())
             {
-                region.modified[bitIndex] = true;
-                RUNTIME_LOG("Marked code at " << std::hex << addr << std::dec << " as modified");
+                if (!region.modified[bitIndex])
+                {
+                    region.modified[bitIndex] = true;
+                    RUNTIME_LOG("Marked code at " << std::hex << addr << std::dec
+                                                   << " as modified" << std::endl);
+                }
             }
         }
     }
