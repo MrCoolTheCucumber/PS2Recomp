@@ -1111,6 +1111,115 @@ void register_ps2_memory_tests()
                      "SPR_TO should queue DMAC cause nine");
         });
 
+        tc.Run("SPR_TO source chain follows REF and REFE tags", [](TestCase &t)
+        {
+            PS2Memory mem;
+            t.IsTrue(mem.initialize(), "PS2Memory initialize should succeed");
+
+            constexpr uint32_t kChannel = 0x1000D400u;
+            constexpr uint32_t kTagAddress = 0x00024000u;
+            constexpr uint32_t kFirstSource = 0x00025000u;
+            constexpr uint32_t kSecondSource = 0x00025100u;
+            constexpr uint32_t kScratchAddress = 0x3FF0u;
+
+            writeDmaTag(mem.getRDRAM(), kTagAddress + 0x00u,
+                        makeDmaTag(2u, 3u, kFirstSource)); // REF
+            writeDmaTag(mem.getRDRAM(), kTagAddress + 0x10u,
+                        makeDmaTag(1u, 0u, kSecondSource)); // REFE
+
+            for (uint32_t byte = 0u; byte < 32u; ++byte)
+            {
+                mem.getRDRAM()[kFirstSource + byte] =
+                    static_cast<uint8_t>(0x40u + byte);
+            }
+            for (uint32_t byte = 0u; byte < 16u; ++byte)
+            {
+                mem.getRDRAM()[kSecondSource + byte] =
+                    static_cast<uint8_t>(0x80u + byte);
+            }
+
+            t.IsTrue(mem.writeIORegister(kChannel + 0x30u, kTagAddress),
+                     "SPR_TO TADR write should succeed");
+            t.IsTrue(mem.writeIORegister(kChannel + 0x80u, kScratchAddress),
+                     "SPR_TO SADR write should succeed");
+            t.IsTrue(mem.writeIORegister(kChannel + 0x00u, 0x104u),
+                     "SPR_TO source-chain transfer should start");
+
+            bool copied = true;
+            for (uint32_t byte = 0u; byte < 16u; ++byte)
+            {
+                copied &= mem.getScratchpad()[0x3FF0u + byte] ==
+                          static_cast<uint8_t>(0x40u + byte);
+                copied &= mem.getScratchpad()[byte] ==
+                          static_cast<uint8_t>(0x50u + byte);
+                copied &= mem.getScratchpad()[0x10u + byte] ==
+                          static_cast<uint8_t>(0x80u + byte);
+            }
+            t.IsTrue(copied,
+                     "SPR_TO should concatenate referenced payloads across scratchpad wrap");
+            t.Equals(mem.readIORegister(kChannel + 0x10u), kSecondSource + 16u,
+                     "SPR_TO should leave MADR after the terminal payload");
+            t.Equals(mem.readIORegister(kChannel + 0x30u), kTagAddress + 32u,
+                     "SPR_TO REFE should advance TADR past the terminal tag");
+            t.Equals(mem.readIORegister(kChannel + 0x80u), 0x20u,
+                     "SPR_TO should advance and wrap SADR for all chain payloads");
+            t.Equals(mem.readIORegister(kChannel + 0x20u), 0u,
+                     "SPR_TO source chain should consume QWC");
+            t.IsTrue((mem.readIORegister(kChannel + 0x00u) & 0x100u) == 0u,
+                     "SPR_TO source chain should clear CHCR.STR");
+
+            const std::vector<uint32_t> causes = mem.consumeCompletedDmacCauses();
+            t.Equals(causes.size(), static_cast<size_t>(1u),
+                     "SPR_TO source chain should queue one completion");
+            t.Equals(causes[0], 9u,
+                     "SPR_TO source chain should queue DMAC cause nine");
+        });
+
+        tc.Run("SPR_TO source chain follows inline CNT and END payloads", [](TestCase &t)
+        {
+            PS2Memory mem;
+            t.IsTrue(mem.initialize(), "PS2Memory initialize should succeed");
+
+            constexpr uint32_t kChannel = 0x1000D400u;
+            constexpr uint32_t kTagAddress = 0x00026000u;
+            constexpr uint32_t kScratchAddress = 0x0200u;
+
+            writeDmaTag(mem.getRDRAM(), kTagAddress + 0x00u,
+                        makeDmaTag(1u, 1u, 0u)); // CNT
+            writeDmaTag(mem.getRDRAM(), kTagAddress + 0x20u,
+                        makeDmaTag(1u, 7u, 0u)); // END
+            for (uint32_t byte = 0u; byte < 16u; ++byte)
+            {
+                mem.getRDRAM()[kTagAddress + 0x10u + byte] =
+                    static_cast<uint8_t>(0x20u + byte);
+                mem.getRDRAM()[kTagAddress + 0x30u + byte] =
+                    static_cast<uint8_t>(0xA0u + byte);
+            }
+
+            t.IsTrue(mem.writeIORegister(kChannel + 0x30u, kTagAddress),
+                     "SPR_TO TADR write should succeed");
+            t.IsTrue(mem.writeIORegister(kChannel + 0x80u, kScratchAddress),
+                     "SPR_TO SADR write should succeed");
+            t.IsTrue(mem.writeIORegister(kChannel + 0x00u, 0x104u),
+                     "SPR_TO source-chain transfer should start");
+
+            bool copied = true;
+            for (uint32_t byte = 0u; byte < 16u; ++byte)
+            {
+                copied &= mem.getScratchpad()[kScratchAddress + byte] ==
+                          static_cast<uint8_t>(0x20u + byte);
+                copied &= mem.getScratchpad()[kScratchAddress + 0x10u + byte] ==
+                          static_cast<uint8_t>(0xA0u + byte);
+            }
+            t.IsTrue(copied, "SPR_TO should copy both inline chain payloads");
+            t.Equals(mem.readIORegister(kChannel + 0x10u), kTagAddress + 0x40u,
+                     "SPR_TO should leave MADR after the END payload");
+            t.Equals(mem.readIORegister(kChannel + 0x30u), kTagAddress + 0x20u,
+                     "SPR_TO END should retain the terminal tag address");
+            t.Equals(mem.readIORegister(kChannel + 0x80u), kScratchAddress + 0x20u,
+                     "SPR_TO should advance SADR for both inline payloads");
+        });
+
         tc.Run("SPR_FROM normal DMA copies wrapping scratchpad into RDRAM", [](TestCase &t)
         {
             PS2Memory mem;

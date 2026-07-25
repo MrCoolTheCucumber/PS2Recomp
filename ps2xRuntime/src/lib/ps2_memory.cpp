@@ -1416,40 +1416,173 @@ bool PS2Memory::processScratchpadDma(uint32_t channelBase)
 {
     constexpr uint32_t kFromScratchpadChannel = 0x1000D000u;
     constexpr uint32_t kToScratchpadChannel = 0x1000D400u;
+    constexpr uint32_t kMaxChainTags = 4096u;
 
     if (channelBase != kFromScratchpadChannel && channelBase != kToScratchpadChannel)
     {
         return false;
     }
 
-    const uint32_t chcr = m_ioRegisters[channelBase + 0x00u];
+    uint32_t chcr = m_ioRegisters[channelBase + 0x00u];
     const uint32_t mode = (chcr >> 2u) & 0x3u;
-    if (mode != 0u)
+    const bool toScratchpad = channelBase == kToScratchpadChannel;
+    if (mode > 1u || (mode == 1u && !toScratchpad))
     {
         return false;
     }
 
     uint32_t madr = m_ioRegisters[channelBase + 0x10u] & 0x7FFFFFFFu;
-    const uint32_t qwc = m_ioRegisters[channelBase + 0x20u] & 0xFFFFu;
+    uint32_t qwc = m_ioRegisters[channelBase + 0x20u] & 0xFFFFu;
+    uint32_t tadr = m_ioRegisters[channelBase + 0x30u] & 0x7FFFFFFFu;
+    uint32_t asr0 = m_ioRegisters[channelBase + 0x40u] & 0x7FFFFFFFu;
+    uint32_t asr1 = m_ioRegisters[channelBase + 0x50u] & 0x7FFFFFFFu;
     uint32_t sadr = m_ioRegisters[channelBase + 0x80u] & 0x3FF0u;
-    const bool toScratchpad = channelBase == kToScratchpadChannel;
 
-    try
+    auto transferQwords = [&](uint32_t &memoryAddress, uint32_t count)
     {
-        for (uint32_t index = 0u; index < qwc; ++index)
+        for (uint32_t index = 0u; index < count; ++index)
         {
             const uint32_t scratchAddress = PS2_SCRATCHPAD_BASE + sadr;
             if (toScratchpad)
             {
-                write128(scratchAddress, read128(madr));
+                write128(scratchAddress, read128(memoryAddress));
             }
             else
             {
-                write128(madr, read128(scratchAddress));
+                write128(memoryAddress, read128(scratchAddress));
             }
 
-            madr = (madr + 16u) & 0x7FFFFFFFu;
+            memoryAddress = (memoryAddress + 16u) & 0x7FFFFFFFu;
             sadr = (sadr + 16u) & (PS2_SCRATCHPAD_SIZE - 1u);
+        }
+    };
+
+    try
+    {
+        const bool resumedChain = mode == 1u && qwc != 0u;
+        transferQwords(madr, qwc);
+        qwc = 0u;
+
+        bool endChain = false;
+        if (resumedChain)
+        {
+            const uint32_t previousTagId = (chcr >> 28u) & 0x7u;
+            const bool previousTagIrq = (chcr & (1u << 31u)) != 0u;
+            const bool tieEnabled = (chcr & (1u << 7u)) != 0u;
+            endChain = previousTagId == 0u || previousTagId == 7u ||
+                       (tieEnabled && previousTagIrq);
+        }
+
+        uint32_t tagsProcessed = 0u;
+        while (mode == 1u && !endChain && tagsProcessed < kMaxChainTags)
+        {
+            const uint32_t tagWord0 = read32(tadr + 0u);
+            const uint32_t tagAddress = read32(tadr + 4u) & 0x7FFFFFFFu;
+            const uint32_t tagQwc = tagWord0 & 0xFFFFu;
+            const uint32_t tagId = (tagWord0 >> 28u) & 0x7u;
+            const bool tagIrq = (tagWord0 & (1u << 31u)) != 0u;
+            const bool tieEnabled = (chcr & (1u << 7u)) != 0u;
+            const bool tagTransferEnabled = (chcr & (1u << 6u)) != 0u;
+            ++tagsProcessed;
+
+            chcr = (chcr & 0x0000FFFFu) | (tagWord0 & 0xFFFF0000u);
+
+            if (tagTransferEnabled)
+            {
+                const uint32_t scratchAddress = PS2_SCRATCHPAD_BASE + sadr;
+                write128(scratchAddress, read128(tadr));
+                sadr = (sadr + 16u) & (PS2_SCRATCHPAD_SIZE - 1u);
+            }
+
+            uint32_t dataAddress = tagAddress;
+            switch (tagId)
+            {
+            case 0u: // REFE
+                tadr = (tadr + 16u) & 0x7FFFFFFFu;
+                endChain = true;
+                break;
+            case 1u: // CNT
+                dataAddress = (tadr + 16u) & 0x7FFFFFFFu;
+                tadr = (dataAddress + tagQwc * 16u) & 0x7FFFFFFFu;
+                break;
+            case 2u: // NEXT
+                dataAddress = (tadr + 16u) & 0x7FFFFFFFu;
+                tadr = tagAddress;
+                break;
+            case 3u: // REF
+            case 4u: // REFS
+                tadr = (tadr + 16u) & 0x7FFFFFFFu;
+                break;
+            case 5u: // CALL
+            {
+                dataAddress = (tadr + 16u) & 0x7FFFFFFFu;
+                const uint32_t returnAddress =
+                    (dataAddress + tagQwc * 16u) & 0x7FFFFFFFu;
+                uint32_t asp = (chcr >> 4u) & 0x3u;
+                if (asp == 0u)
+                {
+                    asr0 = returnAddress;
+                    asp = 1u;
+                }
+                else if (asp == 1u)
+                {
+                    asr1 = returnAddress;
+                    asp = 2u;
+                }
+                else
+                {
+                    endChain = true;
+                }
+                chcr = (chcr & ~(0x3u << 4u)) | (asp << 4u);
+                tadr = tagAddress;
+                break;
+            }
+            case 6u: // RET
+            {
+                dataAddress = (tadr + 16u) & 0x7FFFFFFFu;
+                uint32_t asp = (chcr >> 4u) & 0x3u;
+                if (asp == 2u)
+                {
+                    tadr = asr1;
+                    asr1 = 0u;
+                    asp = 1u;
+                }
+                else if (asp == 1u)
+                {
+                    tadr = asr0;
+                    asr0 = 0u;
+                    asp = 0u;
+                }
+                else
+                {
+                    endChain = true;
+                }
+                chcr = (chcr & ~(0x3u << 4u)) | (asp << 4u);
+                break;
+            }
+            case 7u: // END
+                dataAddress = (tadr + 16u) & 0x7FFFFFFFu;
+                endChain = true;
+                break;
+            default:
+                endChain = true;
+                break;
+            }
+
+            madr = dataAddress;
+            qwc = tagQwc;
+            transferQwords(madr, qwc);
+            qwc = 0u;
+
+            if (tieEnabled && tagIrq)
+            {
+                endChain = true;
+            }
+        }
+
+        if (mode == 1u && !endChain)
+        {
+            return false;
         }
     }
     catch (const std::exception &error)
@@ -1463,7 +1596,12 @@ bool PS2Memory::processScratchpadDma(uint32_t channelBase)
         return false;
     }
 
+    m_ioRegisters[channelBase + 0x00u] = chcr;
     m_ioRegisters[channelBase + 0x10u] = madr;
+    m_ioRegisters[channelBase + 0x20u] = qwc;
+    m_ioRegisters[channelBase + 0x30u] = tadr;
+    m_ioRegisters[channelBase + 0x40u] = asr0;
+    m_ioRegisters[channelBase + 0x50u] = asr1;
     m_ioRegisters[channelBase + 0x80u] = sadr;
     completeDmaChannel(channelBase, toScratchpad ? 9u : 8u);
     return true;
