@@ -4,6 +4,7 @@
 #include "../../ps2_iop_transport.h"
 #include "runtime/ps2_address.h"
 
+#include <iterator>
 #include <map>
 
 namespace ps2_stubs
@@ -50,6 +51,19 @@ namespace ps2_stubs
             int32_t attr = 0;
         };
         static_assert(sizeof(Ps2SifDmaTransfer) == 16u, "Unexpected SIF DMA descriptor size");
+
+        enum class SifDmaDestination
+        {
+            IopRam,
+            SyntheticGuest,
+        };
+
+        struct PendingSifDmaTransfer
+        {
+            Ps2SifDmaTransfer transfer{};
+            SifDmaDestination destination = SifDmaDestination::IopRam;
+            uint32_t iopOffset = 0u;
+        };
 
         std::mutex g_sifDmaTransferMutex;
         uint32_t g_nextSifDmaTransferId = 1u;
@@ -191,7 +205,7 @@ namespace ps2_stubs
             return ps2IsScratchpadAddress(addr) || Ps2IsDirectRdramAddress(addr);
         }
 
-        bool canCopyGuestByteRange(const uint8_t *rdram, uint32_t dstAddr, uint32_t srcAddr, uint32_t sizeBytes)
+        bool canReadGuestByteRange(const uint8_t *rdram, uint32_t srcAddr, uint32_t sizeBytes)
         {
             if (!rdram)
             {
@@ -203,24 +217,117 @@ namespace ps2_stubs
                 return true;
             }
 
+            if ((sizeBytes - 1u) > (std::numeric_limits<uint32_t>::max() - srcAddr))
+            {
+                return false;
+            }
+
             for (uint32_t i = 0u; i < sizeBytes; ++i)
             {
                 const uint32_t srcByteAddr = srcAddr + i;
-                const uint32_t dstByteAddr = dstAddr + i;
-
-                if (!isCopyableGuestAddress(srcByteAddr) || !isCopyableGuestAddress(dstByteAddr))
-                {
-                    return false;
-                }
-
-                const uint8_t *src = getConstMemPtr(rdram, srcByteAddr);
-                const uint8_t *dst = getConstMemPtr(rdram, dstByteAddr);
-                if (!src || !dst)
+                if (!isCopyableGuestAddress(srcByteAddr) ||
+                    !getConstMemPtr(rdram, srcByteAddr))
                 {
                     return false;
                 }
             }
 
+            return true;
+        }
+
+        bool canCopyGuestByteRange(const uint8_t *rdram, uint32_t dstAddr, uint32_t srcAddr, uint32_t sizeBytes)
+        {
+            if (!canReadGuestByteRange(rdram, srcAddr, sizeBytes))
+            {
+                return false;
+            }
+
+            if (sizeBytes == 0u)
+            {
+                return true;
+            }
+
+            if ((sizeBytes - 1u) > (std::numeric_limits<uint32_t>::max() - dstAddr))
+            {
+                return false;
+            }
+
+            for (uint32_t i = 0u; i < sizeBytes; ++i)
+            {
+                const uint32_t dstByteAddr = dstAddr + i;
+
+                if (!isCopyableGuestAddress(dstByteAddr))
+                {
+                    return false;
+                }
+
+                const uint8_t *dst = getConstMemPtr(rdram, dstByteAddr);
+                if (!dst)
+                {
+                    return false;
+                }
+            }
+
+            return true;
+        }
+
+        bool resolveIopRamRange(uint32_t iopAddr, uint32_t sizeBytes, uint32_t &offset)
+        {
+            // SIF1 destination tags carry a 24-bit IOP physical address. The
+            // upper byte contains tag/control information and is not part of
+            // the RAM address.
+            offset = iopAddr & 0x00FFFFFFu;
+            return offset <= PS2_IOP_RAM_SIZE &&
+                   sizeBytes <= (PS2_IOP_RAM_SIZE - offset);
+        }
+
+        bool isAllocatedSyntheticIopRange(uint32_t guestAddr, uint32_t sizeBytes)
+        {
+            uint32_t offset = 0u;
+            if (!ps2ResolveDirectRdramOffset(guestAddr, offset))
+            {
+                return false;
+            }
+
+            const uint64_t rangeEnd =
+                static_cast<uint64_t>(offset) + static_cast<uint64_t>(sizeBytes);
+            std::lock_guard<std::mutex> lock(g_sifHeapMutex);
+            const auto upper = g_sifHeapAllocations.upper_bound(offset);
+            if (upper == g_sifHeapAllocations.begin())
+            {
+                return false;
+            }
+
+            const auto allocation = std::prev(upper);
+            const uint64_t allocationEnd =
+                static_cast<uint64_t>(allocation->first) +
+                static_cast<uint64_t>(allocation->second);
+            return offset >= allocation->first && rangeEnd <= allocationEnd;
+        }
+
+        bool copyEeToIopByteRange(uint8_t *rdram,
+                                  uint8_t *iopRam,
+                                  uint32_t iopOffset,
+                                  uint32_t srcAddr,
+                                  uint32_t sizeBytes)
+        {
+            if (!iopRam ||
+                !canReadGuestByteRange(rdram, srcAddr, sizeBytes) ||
+                iopOffset > PS2_IOP_RAM_SIZE ||
+                sizeBytes > (PS2_IOP_RAM_SIZE - iopOffset))
+            {
+                return false;
+            }
+
+            for (uint32_t i = 0u; i < sizeBytes; ++i)
+            {
+                const uint8_t *src = getConstMemPtr(rdram, srcAddr + i);
+                if (!src)
+                {
+                    return false;
+                }
+                iopRam[iopOffset + i] = *src;
+            }
             return true;
         }
 
@@ -656,9 +763,10 @@ namespace ps2_stubs
             return;
         }
 
-        std::array<Ps2SifDmaTransfer, 32u> pending{};
+        std::array<PendingSifDmaTransfer, 32u> pending{};
         uint32_t pendingCount = 0u;
         bool ok = true;
+        uint8_t *const iopRam = runtime ? runtime->memory().getIOPRAM() : nullptr;
         for (uint32_t i = 0; i < count; ++i)
         {
             const uint32_t entryAddr = dmatAddr + (i * static_cast<uint32_t>(sizeof(Ps2SifDmaTransfer)));
@@ -682,20 +790,52 @@ namespace ps2_stubs
                 ok = false;
                 break;
             }
-            if (!canCopyGuestByteRange(rdram, xfer.dest, xfer.src, sizeBytes))
+
+            if (!canReadGuestByteRange(rdram, xfer.src, sizeBytes))
             {
                 ok = false;
                 break;
             }
 
-            pending[pendingCount++] = xfer;
+            uint32_t iopOffset = 0u;
+            if (resolveIopRamRange(xfer.dest, sizeBytes, iopOffset))
+            {
+                if (!iopRam)
+                {
+                    ok = false;
+                    break;
+                }
+                pending[pendingCount++] = {
+                    xfer,
+                    SifDmaDestination::IopRam,
+                    iopOffset,
+                };
+                continue;
+            }
+
+            // The high-level IOP compatibility layer historically returns
+            // synthetic pointers backed by unused EE RAM. Keep that extension
+            // only for ranges explicitly allocated by the SIF heap; arbitrary
+            // IOP destinations must never alias and overwrite EE memory.
+            if (!isAllocatedSyntheticIopRange(xfer.dest, sizeBytes) ||
+                !canCopyGuestByteRange(rdram, xfer.dest, xfer.src, sizeBytes))
+            {
+                ok = false;
+                break;
+            }
+            pending[pendingCount++] = {
+                xfer,
+                SifDmaDestination::SyntheticGuest,
+                0u,
+            };
         }
 
         if (ok)
         {
             for (uint32_t i = 0; i < pendingCount; ++i)
             {
-                const Ps2SifDmaTransfer &xfer = pending[i];
+                const PendingSifDmaTransfer &pendingTransfer = pending[i];
+                const Ps2SifDmaTransfer &xfer = pendingTransfer.transfer;
                 if (runtime)
                 {
                     PS2IopTransport::notifyTransfer(runtime, rdram, {
@@ -706,7 +846,20 @@ namespace ps2_stubs
                         static_cast<uint32_t>(xfer.size),
                     });
                 }
-                if (!copyGuestByteRange(rdram, xfer.dest, xfer.src, static_cast<uint32_t>(xfer.size)))
+
+                const uint32_t sizeBytes = static_cast<uint32_t>(xfer.size);
+                const bool copied =
+                    pendingTransfer.destination == SifDmaDestination::IopRam
+                        ? copyEeToIopByteRange(rdram,
+                                               iopRam,
+                                               pendingTransfer.iopOffset,
+                                               xfer.src,
+                                               sizeBytes)
+                        : copyGuestByteRange(rdram,
+                                             xfer.dest,
+                                             xfer.src,
+                                             sizeBytes);
+                if (!copied)
                 {
                     ok = false;
                     break;

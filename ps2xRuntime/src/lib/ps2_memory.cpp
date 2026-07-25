@@ -320,10 +320,10 @@ bool PS2Memory::initialize(size_t ramSize)
         m_tlbEntries.assign(48, TLBEntry{0, 0, 0, false});
 
         // Allocate IOP RAM
-        iop_ram = new uint8_t[2 * 1024 * 1024]; // 2MB
+        iop_ram = new uint8_t[PS2_IOP_RAM_SIZE];
 
         // Initialize IOP RAM with zeros
-        std::memset(iop_ram, 0, 2 * 1024 * 1024);
+        std::memset(iop_ram, 0, PS2_IOP_RAM_SIZE);
 
         // Initialize I/O registers
         m_ioRegisters.clear();

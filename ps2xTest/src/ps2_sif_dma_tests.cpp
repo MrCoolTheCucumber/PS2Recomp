@@ -31,6 +31,10 @@ namespace
         {
             ps2_stubs::resetSifState();
             std::memset(&ctx, 0, sizeof(ctx));
+            if (!runtime.memory().initialize())
+            {
+                throw std::runtime_error("failed to initialize runtime memory");
+            }
         }
     };
 
@@ -130,7 +134,7 @@ void register_ps2_sif_dma_tests()
 {
     MiniTest::Case("PS2SifDma", [](TestCase &tc)
     {
-        tc.Run("sceSifSetDma copies payload and sceSifDmaStat reports complete", [](TestCase &t)
+        tc.Run("sceSifSetDma copies EE payload into IOP RAM without aliasing EE memory", [](TestCase &t)
         {
             TestEnv env;
 
@@ -144,7 +148,8 @@ void register_ps2_sif_dma_tests()
                 payload[i] = static_cast<uint8_t>(0x30u + i);
             }
             std::memcpy(env.rdram.data() + kSrcAddr, payload.data(), payload.size());
-            std::memset(env.rdram.data() + kDstAddr, 0, payload.size());
+            std::memset(env.rdram.data() + kDstAddr, 0xA5, payload.size());
+            std::memset(env.runtime.memory().getIOPRAM() + kDstAddr, 0, payload.size());
 
             const Ps2SifDmaTransfer desc{
                 kSrcAddr,
@@ -159,8 +164,17 @@ void register_ps2_sif_dma_tests()
             const int32_t dmaId = getRegS32(env.ctx, 2);
             t.IsTrue(dmaId > 0, "sceSifSetDma should return a positive transfer id on success");
 
-            t.IsTrue(std::memcmp(env.rdram.data() + kDstAddr, payload.data(), payload.size()) == 0,
-                     "sceSifSetDma should copy transfer payload to destination");
+            t.IsTrue(std::memcmp(env.runtime.memory().getIOPRAM() + kDstAddr,
+                                 payload.data(),
+                                 payload.size()) == 0,
+                     "sceSifSetDma should copy transfer payload into IOP RAM");
+            const std::array<uint8_t, 16> expectedEeBytes{
+                0xA5, 0xA5, 0xA5, 0xA5, 0xA5, 0xA5, 0xA5, 0xA5,
+                0xA5, 0xA5, 0xA5, 0xA5, 0xA5, 0xA5, 0xA5, 0xA5};
+            t.IsTrue(std::memcmp(env.rdram.data() + kDstAddr,
+                                 expectedEeBytes.data(),
+                                 expectedEeBytes.size()) == 0,
+                     "sceSifSetDma must not treat the IOP destination as an EE address");
 
             setRegU32(env.ctx, 4, static_cast<uint32_t>(dmaId));
             ps2_stubs::sceSifDmaStat(env.rdram.data(), &env.ctx, &env.runtime);
@@ -173,7 +187,8 @@ void register_ps2_sif_dma_tests()
 
             constexpr uint32_t kDescAddr = 0x00020240u;
             constexpr uint32_t kSrcAddr = 0x00020340u;
-            constexpr uint32_t kDstAddr = 0x00020440u;
+            constexpr uint32_t kIopDstAddr = 0x00020440u;
+            constexpr uint32_t kTaggedDstAddr = 0xA0020440u;
 
             std::array<uint8_t, 12> payload{};
             for (size_t i = 0; i < payload.size(); ++i)
@@ -181,11 +196,12 @@ void register_ps2_sif_dma_tests()
                 payload[i] = static_cast<uint8_t>(0x50u + i);
             }
             std::memcpy(env.rdram.data() + kSrcAddr, payload.data(), payload.size());
-            std::memset(env.rdram.data() + kDstAddr, 0, payload.size());
+            std::memset(env.rdram.data() + kIopDstAddr, 0xCC, payload.size());
+            std::memset(env.runtime.memory().getIOPRAM() + kIopDstAddr, 0, payload.size());
 
             const Ps2SifDmaTransfer desc{
                 kSrcAddr,
-                kDstAddr,
+                kTaggedDstAddr,
                 static_cast<int32_t>(payload.size()),
                 0};
             std::memcpy(env.rdram.data() + kDescAddr, &desc, sizeof(desc));
@@ -194,11 +210,53 @@ void register_ps2_sif_dma_tests()
             setRegU32(env.ctx, 5, 1u);
             ps2_stubs::isceSifSetDma(env.rdram.data(), &env.ctx, &env.runtime);
             t.IsTrue(getRegS32(env.ctx, 2) > 0, "isceSifSetDma should report a successful transfer id");
-            t.IsTrue(std::memcmp(env.rdram.data() + kDstAddr, payload.data(), payload.size()) == 0,
-                     "isceSifSetDma should copy transfer payload like sceSifSetDma");
+            t.IsTrue(std::memcmp(env.runtime.memory().getIOPRAM() + kIopDstAddr,
+                                 payload.data(),
+                                 payload.size()) == 0,
+                     "isceSifSetDma should use the tag's 24-bit IOP destination");
 
             ps2_stubs::isceSifSetDChain(env.rdram.data(), &env.ctx, &env.runtime);
             t.Equals(getRegS32(env.ctx, 2), 0, "isceSifSetDChain should mirror sceSifSetDChain");
+        });
+
+        tc.Run("sceSifSetDma preserves explicitly allocated synthetic IOP heap ranges", [](TestCase &t)
+        {
+            TestEnv env;
+
+            constexpr uint32_t kDescAddr = 0x00020500u;
+            constexpr uint32_t kSrcAddr = 0x00020600u;
+            constexpr uint32_t kAllocationSize = 64u;
+            std::array<uint8_t, 16> payload{};
+            for (size_t i = 0; i < payload.size(); ++i)
+            {
+                payload[i] = static_cast<uint8_t>(0xB0u + i);
+            }
+            std::memcpy(env.rdram.data() + kSrcAddr, payload.data(), payload.size());
+
+            setRegU32(env.ctx, 4, kAllocationSize);
+            ps2_stubs::sceSifAllocIopHeap(env.rdram.data(), &env.ctx, &env.runtime);
+            const uint32_t allocation = ::getRegU32(&env.ctx, 2);
+            t.IsTrue(allocation >= 0x00200000u,
+                     "test requires the compatibility heap to use a synthetic address");
+
+            const uint32_t destination = allocation + 8u;
+            std::memset(env.rdram.data() + destination, 0, payload.size());
+            const Ps2SifDmaTransfer desc{
+                kSrcAddr,
+                destination,
+                static_cast<int32_t>(payload.size()),
+                0};
+            std::memcpy(env.rdram.data() + kDescAddr, &desc, sizeof(desc));
+
+            setRegU32(env.ctx, 4, kDescAddr);
+            setRegU32(env.ctx, 5, 1u);
+            ps2_stubs::sceSifSetDma(env.rdram.data(), &env.ctx, &env.runtime);
+            t.IsTrue(getRegS32(env.ctx, 2) > 0,
+                     "sceSifSetDma should accept an allocated synthetic IOP range");
+            t.IsTrue(std::memcmp(env.rdram.data() + destination,
+                                 payload.data(),
+                                 payload.size()) == 0,
+                     "synthetic IOP allocations should retain their EE backing");
         });
 
         tc.Run("sceSifSetDma dispatches enabled DMAC handlers for cause 5", [](TestCase &t)
@@ -803,7 +861,7 @@ void register_ps2_sif_dma_tests()
             constexpr uint32_t kSrcA = 0x00021100u;
             constexpr uint32_t kDstA = 0x00021200u;
             constexpr uint32_t kSrcB = 0x00021300u;
-            constexpr uint32_t kInvalidDstB = 0xE0000100u; // unsupported guest segment
+            constexpr uint32_t kInvalidDstB = PS2_IOP_RAM_SIZE;
 
             std::array<uint8_t, 8> payloadA{};
             for (size_t i = 0; i < payloadA.size(); ++i)
@@ -818,7 +876,7 @@ void register_ps2_sif_dma_tests()
 
             std::memcpy(env.rdram.data() + kSrcA, payloadA.data(), payloadA.size());
             std::memcpy(env.rdram.data() + kSrcB, payloadB.data(), payloadB.size());
-            std::memset(env.rdram.data() + kDstA, 0x5Au, payloadA.size());
+            std::memset(env.runtime.memory().getIOPRAM() + kDstA, 0x5Au, payloadA.size());
 
             const Ps2SifDmaTransfer descs[2] = {
                 {kSrcA, kDstA, static_cast<int32_t>(payloadA.size()), 0},
@@ -832,7 +890,9 @@ void register_ps2_sif_dma_tests()
 
             const std::array<uint8_t, 8> expectedUnchanged{
                 0x5A, 0x5A, 0x5A, 0x5A, 0x5A, 0x5A, 0x5A, 0x5A};
-            t.IsTrue(std::memcmp(env.rdram.data() + kDstA, expectedUnchanged.data(), expectedUnchanged.size()) == 0,
+            t.IsTrue(std::memcmp(env.runtime.memory().getIOPRAM() + kDstA,
+                                 expectedUnchanged.data(),
+                                 expectedUnchanged.size()) == 0,
                      "failed multi-descriptor sceSifSetDma should not partially write earlier descriptors");
         });
 

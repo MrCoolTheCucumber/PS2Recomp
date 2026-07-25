@@ -48,6 +48,7 @@ private:
 constexpr uint32_t PS2_RAM_SIZE = 32u * 1024u * 1024u; // 32MB
 constexpr uint32_t PS2_RAM_MASK = PS2_RAM_SIZE - 1u;   // Mask for 32MB alignment
 constexpr uint32_t PS2_RAM_BASE = 0x00000000;          // Physical base of RDRAM
+constexpr uint32_t PS2_IOP_RAM_SIZE = 2u * 1024u * 1024u; // 2MB
 constexpr uint32_t PS2_EE_UNCACHED_RAM_MIRROR_BASE = 0x20000000u;
 constexpr uint32_t PS2_EE_UNCACHED_RAM_MIRROR_SIZE = PS2_RAM_SIZE;
 constexpr uint32_t PS2_EE_ACCELERATED_RAM_MIRROR_BASE = 0x30100000u;
