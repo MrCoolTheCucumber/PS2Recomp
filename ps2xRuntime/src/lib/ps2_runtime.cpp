@@ -918,6 +918,10 @@ bool PS2Runtime::syncCoreSubsystems()
     m_gifArbiter.reset();
     m_gifArbiter.setProcessPacketFn([this](const uint8_t *data, uint32_t size)
                                     { m_gs.processGIFPacket(data, size); });
+    m_gifArbiter.setDrainCallbacks([this]
+                                   { m_gs.beginRenderBatch(); },
+                                   [this]
+                                   { m_gs.endRenderBatch(); });
     m_memory.setGifArbiter(&m_gifArbiter);
     m_memory.setVu1MscalCallback([this](uint32_t startPC, uint32_t top, uint32_t itop)
                                  { m_vu1.execute(m_memory.getVU1Code(), PS2_VU1_CODE_SIZE,

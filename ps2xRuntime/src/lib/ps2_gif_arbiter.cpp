@@ -151,7 +151,7 @@ bool GifArbiter::empty() const
 
 void GifArbiter::drain()
 {
-    if (!m_processFn)
+    if (!m_processFn || m_queue.empty())
         return;
 
     std::stable_sort(m_queue.begin(), m_queue.end(),
@@ -167,6 +167,18 @@ void GifArbiter::drain()
                          }
                          return pathPriority(a.pathId) < pathPriority(b.pathId);
                      });
+
+    if (m_beginDrainFn)
+        m_beginDrainFn();
+    struct DrainScope
+    {
+        DrainBoundaryFn &endFn;
+        ~DrainScope()
+        {
+            if (endFn)
+                endFn();
+        }
+    } drainScope{m_endDrainFn};
 
     for (size_t i = 0; i < m_queue.size(); ++i)
     {

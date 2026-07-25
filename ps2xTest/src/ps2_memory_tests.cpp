@@ -937,6 +937,51 @@ void register_ps2_memory_tests()
             t.Equals(order[2], static_cast<uint8_t>(0x33u), "PATH3 should be drained third");
         });
 
+        tc.Run("GIF arbiter brackets a non-empty drain once", [](TestCase &t)
+        {
+            std::vector<uint8_t> events;
+            GifArbiter arbiter([&](const uint8_t *data, uint32_t sizeBytes)
+            {
+                if (data && sizeBytes >= 16u)
+                    events.push_back(data[8]);
+            });
+            arbiter.setDrainCallbacks([&]
+            {
+                events.push_back(0xB0u);
+            }, [&]
+            {
+                events.push_back(0xE0u);
+            });
+
+            auto makeEmptyPacket = [](uint8_t marker)
+            {
+                std::vector<uint8_t> packet;
+                appendU64(packet, makeGifTag(0u, GIF_FMT_PACKED, 1u, true));
+                appendU64(packet, marker);
+                return packet;
+            };
+            const std::vector<uint8_t> p1 = makeEmptyPacket(0x11u);
+            const std::vector<uint8_t> p3 = makeEmptyPacket(0x33u);
+            arbiter.submit(GifPathId::Path3, p3.data(), static_cast<uint32_t>(p3.size()));
+            arbiter.submit(GifPathId::Path1, p1.data(), static_cast<uint32_t>(p1.size()));
+            arbiter.drain();
+            arbiter.drain();
+
+            t.Equals(events.size(), static_cast<size_t>(4u),
+                     "only a non-empty drain should invoke its boundary callbacks");
+            if (events.size() == 4u)
+            {
+                t.Equals(events[0], static_cast<uint8_t>(0xB0u),
+                         "drain begin callback should run before packets");
+                t.Equals(events[1], static_cast<uint8_t>(0x11u),
+                         "PATH1 packet should remain first inside the batch");
+                t.Equals(events[2], static_cast<uint8_t>(0x33u),
+                         "PATH3 packet should remain last inside the batch");
+                t.Equals(events[3], static_cast<uint8_t>(0xE0u),
+                         "drain end callback should run after packets");
+            }
+        });
+
         tc.Run("GIF arbiter reassembles IMAGE payload split across submissions", [](TestCase &t)
         {
             std::vector<std::vector<uint8_t>> captured;

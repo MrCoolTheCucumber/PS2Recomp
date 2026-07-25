@@ -25,11 +25,17 @@ class GifArbiter
 {
 public:
     using ProcessPacketFn = std::function<void(const uint8_t *, uint32_t)>;
+    using DrainBoundaryFn = std::function<void()>;
 
     GifArbiter() = default;
     explicit GifArbiter(ProcessPacketFn processFn);
 
     void setProcessPacketFn(ProcessPacketFn fn) { m_processFn = std::move(fn); }
+    void setDrainCallbacks(DrainBoundaryFn beginFn, DrainBoundaryFn endFn)
+    {
+        m_beginDrainFn = std::move(beginFn);
+        m_endDrainFn = std::move(endFn);
+    }
 
     void submit(GifPathId pathId, const uint8_t *data, uint32_t sizeBytes, bool path2DirectHl = false);
 
@@ -45,6 +51,8 @@ private:
     };
 
     ProcessPacketFn m_processFn;
+    DrainBoundaryFn m_beginDrainFn;
+    DrainBoundaryFn m_endDrainFn;
     std::vector<GifArbiterPacket> m_queue;
     std::array<PathStream, 4> m_pathStreams;
 
