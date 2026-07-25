@@ -753,6 +753,66 @@ void register_code_generator_tests()
                   "ordinary REGIMM branches must not create link return entries");
     });
 
+    tc.Run("signed EE branches test the low 64-bit doubleword", [](TestCase &t) {
+        struct BranchCase
+        {
+            uint32_t opcode;
+            uint32_t regimmType;
+            const char *condition;
+        };
+
+        const std::vector<BranchCase> cases = {
+            {OPCODE_BLEZ, 0u, "GPR_S64(ctx, 8) <= 0"},
+            {OPCODE_BGTZ, 0u, "GPR_S64(ctx, 8) > 0"},
+            {OPCODE_BLEZL, 0u, "GPR_S64(ctx, 8) <= 0"},
+            {OPCODE_BGTZL, 0u, "GPR_S64(ctx, 8) > 0"},
+            {OPCODE_REGIMM, REGIMM_BLTZ, "GPR_S64(ctx, 8) < 0"},
+            {OPCODE_REGIMM, REGIMM_BGEZ, "GPR_S64(ctx, 8) >= 0"},
+            {OPCODE_REGIMM, REGIMM_BLTZL, "GPR_S64(ctx, 8) < 0"},
+            {OPCODE_REGIMM, REGIMM_BGEZL, "GPR_S64(ctx, 8) >= 0"},
+            {OPCODE_REGIMM, REGIMM_BLTZAL, "GPR_S64(ctx, 8) < 0"},
+            {OPCODE_REGIMM, REGIMM_BGEZAL, "GPR_S64(ctx, 8) >= 0"},
+            {OPCODE_REGIMM, REGIMM_BLTZALL, "GPR_S64(ctx, 8) < 0"},
+            {OPCODE_REGIMM, REGIMM_BGEZALL, "GPR_S64(ctx, 8) >= 0"},
+        };
+
+        for (size_t i = 0; i < cases.size(); ++i)
+        {
+            const uint32_t start = 0x1800u + static_cast<uint32_t>(i) * 0x10u;
+
+            Function func;
+            func.name = "signed_branch_width";
+            func.start = start;
+            func.end = start + 0xCu;
+            func.isRecompiled = true;
+            func.isStub = false;
+
+            Instruction branch{};
+            branch.address = start;
+            branch.opcode = cases[i].opcode;
+            branch.rs = 8;
+            branch.rt = cases[i].regimmType;
+            branch.simmediate = 1u;
+            branch.isBranch = true;
+            branch.isCall = cases[i].regimmType == REGIMM_BLTZAL ||
+                            cases[i].regimmType == REGIMM_BGEZAL ||
+                            cases[i].regimmType == REGIMM_BLTZALL ||
+                            cases[i].regimmType == REGIMM_BGEZALL;
+            branch.hasDelaySlot = true;
+
+            CodeGenerator gen({}, {});
+            const std::string generated = gen.generateFunction(
+                func,
+                {branch, makeNop(start + 4u), makeNop(start + 8u)},
+                false);
+
+            t.IsTrue(generated.find(cases[i].condition) != std::string::npos,
+                     "signed branch should compare the complete EE low doubleword");
+            t.IsFalse(generated.find("GPR_S32(ctx, 8)") != std::string::npos,
+                      "signed branch must not discard bits 63:32");
+        }
+    });
+
     tc.Run("control-flow analysis reports cross-function mid-function jumps as external entry candidates", [](TestCase &t) {
         Function caller;
         caller.name = "caller";
