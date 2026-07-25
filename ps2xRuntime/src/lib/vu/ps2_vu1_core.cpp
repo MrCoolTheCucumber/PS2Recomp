@@ -68,6 +68,30 @@ void VU1Interpreter::reset()
     m_state.vf[0][3] = 1.0f; // VF0.w = 1.0
     m_state.q = 1.0f;
     m_xgkick = {};
+    m_progressActive.store(0u, std::memory_order_relaxed);
+    m_progressInvocations.store(0u, std::memory_order_relaxed);
+    m_progressCycles.store(0u, std::memory_order_relaxed);
+    m_progressPc.store(0u, std::memory_order_relaxed);
+}
+
+VU1ProgressSnapshot VU1Interpreter::getProgressSnapshot() const
+{
+    VU1ProgressSnapshot snapshot{};
+    snapshot.enabled =
+        m_progressTrackingEnabled.load(std::memory_order_relaxed);
+    snapshot.active =
+        m_progressActive.load(std::memory_order_relaxed) != 0u;
+    snapshot.invocations =
+        m_progressInvocations.load(std::memory_order_relaxed);
+    snapshot.cycles =
+        m_progressCycles.load(std::memory_order_relaxed);
+    snapshot.pc = m_progressPc.load(std::memory_order_relaxed);
+    return snapshot;
+}
+
+void VU1Interpreter::setProgressTrackingEnabled(bool enabled)
+{
+    m_progressTrackingEnabled.store(enabled, std::memory_order_release);
 }
 
 float VU1Interpreter::broadcast(const float *vf, uint8_t bc)
@@ -199,7 +223,42 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
     // own floating-point environment.
     const ScopedVuFloatMode vuFloatMode;
     const bool traceVu1 = memory && memory->isVif1DmaTraceActive();
+    const bool trackProgress =
+        m_progressTrackingEnabled.load(std::memory_order_relaxed);
+    uint32_t committedProgressCycles = 0u;
+    if (trackProgress)
+    {
+        m_progressActive.fetch_add(1u, std::memory_order_relaxed);
+        m_progressInvocations.fetch_add(1u, std::memory_order_relaxed);
+        m_progressPc.store(m_state.pc, std::memory_order_relaxed);
+    }
+    struct ProgressGuard
+    {
+        VU1Interpreter &interpreter;
+        bool enabled;
+        uint32_t &executed;
+        uint32_t &committed;
+
+        ~ProgressGuard()
+        {
+            if (!enabled)
+            {
+                return;
+            }
+            if (executed > committed)
+            {
+                interpreter.m_progressCycles.fetch_add(
+                    executed - committed, std::memory_order_relaxed);
+            }
+            interpreter.m_progressPc.store(
+                interpreter.m_state.pc, std::memory_order_relaxed);
+            interpreter.m_progressActive.fetch_sub(
+                1u, std::memory_order_relaxed);
+        }
+    };
     uint32_t executedCycles = 0u;
+    ProgressGuard progress{
+        *this, trackProgress, executedCycles, committedProgressCycles};
     bool ended = false;
 
     for (uint32_t cycle = 0; cycle < maxCycles; ++cycle)
@@ -211,6 +270,15 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
         if (traceVu1)
             memory->traceVu1Instruction(m_state.pc, decoded.lower, decoded.upper, m_state);
         ++executedCycles;
+        if (trackProgress &&
+            executedCycles - committedProgressCycles >= 256u)
+        {
+            m_progressCycles.fetch_add(
+                executedCycles - committedProgressCycles,
+                std::memory_order_relaxed);
+            committedProgressCycles = executedCycles;
+            m_progressPc.store(m_state.pc, std::memory_order_relaxed);
+        }
 
         // Integer writes such as MTIR and auto-incrementing loads/stores expose
         // the pre-update VI value to a branch in the immediately following

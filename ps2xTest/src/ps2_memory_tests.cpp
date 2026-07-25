@@ -2390,5 +2390,48 @@ void register_ps2_memory_tests()
             t.IsTrue(threwRead32, "unaligned read32 should throw");
             t.IsTrue(threwWrite64, "unaligned write64 should throw");
         });
+
+        tc.Run("code invalidations aggregate by physical range and writer", [](TestCase &t)
+        {
+            PS2Memory mem;
+            t.IsTrue(mem.initialize(), "PS2Memory initialize should succeed");
+            mem.registerCodeRegion(0x1000u, 0x1100u);
+
+            constexpr uint32_t firstWriter = 0x00123450u;
+            constexpr uint32_t secondWriter = 0x006789a0u;
+            mem.write8(0x1001u, 0x12u, firstWriter);
+            mem.write16(0x1002u, 0x3456u, firstWriter);
+            mem.write32(0x80001004u, 0x789abcdeu, firstWriter);
+            mem.write64(0x1008u, 0x0123456789abcdefull, firstWriter);
+            mem.write128(0x1010u, _mm_setzero_si128(), firstWriter);
+            mem.write32(0x1020u, 0xfedcba98u, secondWriter);
+
+            const auto events = mem.takeCodeInvalidationEvents();
+            t.Equals(events.size(), static_cast<size_t>(2),
+                     "contiguous writes from one guest PC should form one event");
+            if (events.size() == 2u)
+            {
+                t.Equals(events[0].start, 0x1000u,
+                         "first invalidation should use the physical code address");
+                t.Equals(events[0].end, 0x1020u,
+                         "first invalidation should end after the last contiguous word");
+                t.Equals(events[0].words, 8u,
+                         "overlapping byte and halfword writes should count a code word once");
+                t.Equals(events[0].writerPc, firstWriter,
+                         "first invalidation should retain its writer PC");
+                t.Equals(events[1].start, 0x1020u,
+                         "a different writer should begin a separate event");
+                t.Equals(events[1].end, 0x1024u,
+                         "the second event should cover one code word");
+                t.Equals(events[1].words, 1u,
+                         "the second event should count one code word");
+                t.Equals(events[1].writerPc, secondWriter,
+                         "second invalidation should retain its writer PC");
+            }
+            t.IsTrue(mem.takeCodeInvalidationEvents().empty(),
+                     "consuming invalidations should leave no duplicate events");
+            t.IsTrue(mem.isCodeModified(0x1000u, 0x24u),
+                     "all invalidated code words should remain marked modified");
+        });
     });
 }

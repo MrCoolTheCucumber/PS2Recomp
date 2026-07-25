@@ -10,6 +10,7 @@
 #include <array>
 #include <atomic>
 #include <algorithm>
+#include <bitset>
 #include <chrono>
 #include <cmath>
 #include <condition_variable>
@@ -17,6 +18,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
+#include <iomanip>
 #include <iostream>
 #include <limits>
 #include <memory>
@@ -229,6 +231,103 @@ namespace
     std::atomic<uint32_t> s_debugContext1PrimitiveCount{0};
     std::atomic<uint32_t> s_debugFbp150PixelCount{0};
 
+    constexpr size_t kGsPageCount =
+        GSMem::MEMORY_SIZE / GSMem::GS_PAGE_SIZE;
+
+    uint32_t debugPageId(uint8_t psm,
+                         uint32_t base,
+                         uint32_t width,
+                         uint32_t x,
+                         uint32_t y)
+    {
+        size_t page = std::numeric_limits<size_t>::max();
+        switch (psm)
+        {
+        case GS_PSM_CT32:
+            page = GSMem::PixelStorageTraits<GSMem::C32>::PageId(
+                base, width, x, y);
+            break;
+        case GS_PSM_CT24:
+            page = GSMem::PixelStorageTraits<GSMem::C24>::PageId(
+                base, width, x, y);
+            break;
+        case GS_PSM_CT16:
+            page = GSMem::PixelStorageTraits<GSMem::C16>::PageId(
+                base, width, x, y);
+            break;
+        case GS_PSM_CT16S:
+            page = GSMem::PixelStorageTraits<GSMem::C16S>::PageId(
+                base, width, x, y);
+            break;
+        case GS_PSM_T8:
+            page = GSMem::PixelStorageTraits<GSMem::P8>::PageId(
+                base, width, x, y);
+            break;
+        case GS_PSM_T4:
+            page = GSMem::PixelStorageTraits<GSMem::P4>::PageId(
+                base, width, x, y);
+            break;
+        case GS_PSM_T8H:
+            page = GSMem::PixelStorageTraits<GSMem::P8H>::PageId(
+                base, width, x, y);
+            break;
+        case GS_PSM_T4HL:
+            page = GSMem::PixelStorageTraits<GSMem::P4HL>::PageId(
+                base, width, x, y);
+            break;
+        case GS_PSM_T4HH:
+            page = GSMem::PixelStorageTraits<GSMem::P4HH>::PageId(
+                base, width, x, y);
+            break;
+        case GS_PSM_Z32:
+            page = GSMem::PixelStorageTraits<GSMem::Z32>::PageId(
+                base, width, x, y);
+            break;
+        case GS_PSM_Z24:
+            page = GSMem::PixelStorageTraits<GSMem::Z24>::PageId(
+                base, width, x, y);
+            break;
+        case GS_PSM_Z16:
+            page = GSMem::PixelStorageTraits<GSMem::Z16>::PageId(
+                base, width, x, y);
+            break;
+        case GS_PSM_Z16S:
+            page = GSMem::PixelStorageTraits<GSMem::Z16S>::PageId(
+                base, width, x, y);
+            break;
+        default:
+            return std::numeric_limits<uint32_t>::max();
+        }
+        return static_cast<uint32_t>(page % kGsPageCount);
+    }
+
+    uint64_t debugFnv1a64(const uint8_t *data, size_t size)
+    {
+        uint64_t hash = 14695981039346656037ull;
+        for (size_t index = 0u; index < size; ++index)
+        {
+            hash ^= data[index];
+            hash *= 1099511628211ull;
+        }
+        return hash;
+    }
+
+    std::string debugPageList(const std::bitset<kGsPageCount> &pages)
+    {
+        std::ostringstream output;
+        bool first = true;
+        for (size_t page = 0u; page < pages.size(); ++page)
+        {
+            if (!pages.test(page))
+                continue;
+            if (!first)
+                output << ';';
+            first = false;
+            output << page;
+        }
+        return output.str();
+    }
+
     struct GSDrawTraceState
     {
         std::ofstream output;
@@ -259,6 +358,11 @@ namespace
         uint8_t maxTextureIndex = 0u;
         uint8_t minTextureAlpha = 0xFFu;
         uint8_t maxTextureAlpha = 0u;
+        std::bitset<kGsPageCount> framebufferPages;
+        std::bitset<kGsPageCount> depthPages;
+        std::bitset<kGsPageCount> texturePages;
+        bool feedback = false;
+        bool hashVram = false;
         bool initialized = false;
         bool capturing = false;
 
@@ -287,6 +391,13 @@ namespace
                             filterFramebuffer = true;
                         }
                     }
+                    if (const char *hashText =
+                            std::getenv("PS2X_GS_DRAW_TRACE_VRAM_HASH"))
+                    {
+                        hashVram =
+                            hashText[0] != '\0' &&
+                            std::strcmp(hashText, "0") != 0;
+                    }
                     output.open(path, std::ios::out | std::ios::trunc);
                     if (output)
                     {
@@ -304,7 +415,9 @@ namespace
                                   "framebuffer_changes,depth_writes,depth_changes,"
                                   "min_r,max_r,min_g,max_g,min_b,max_b,min_a,max_a,"
                                   "texture_samples,min_texture_index,max_texture_index,"
-                                  "min_texture_alpha,max_texture_alpha\n";
+                                  "min_texture_alpha,max_texture_alpha,"
+                                  "framebuffer_pages,depth_pages,texture_pages,"
+                                  "feedback,vram_fnv1a64\n";
                     }
                 }
             }
@@ -329,6 +442,53 @@ namespace
             textureSamples = 0u;
             minTextureIndex = minTextureAlpha = 0xFFu;
             maxTextureIndex = maxTextureAlpha = 0u;
+            framebufferPages.reset();
+            depthPages.reset();
+            texturePages.reset();
+            feedback = false;
+        }
+
+        void recordFramebufferPage(uint8_t psm,
+                                   uint32_t base,
+                                   uint32_t width,
+                                   uint32_t x,
+                                   uint32_t y)
+        {
+            recordPage(framebufferPages, psm, base, width, x, y);
+        }
+
+        void recordDepthPage(uint8_t psm,
+                             uint32_t base,
+                             uint32_t width,
+                             uint32_t x,
+                             uint32_t y)
+        {
+            recordPage(depthPages, psm, base, width, x, y);
+        }
+
+        void recordTexturePage(uint8_t psm,
+                               uint32_t base,
+                               uint32_t width,
+                               uint32_t x,
+                               uint32_t y)
+        {
+            recordPage(texturePages, psm, base, width, x, y);
+        }
+
+    private:
+        void recordPage(std::bitset<kGsPageCount> &pages,
+                        uint8_t psm,
+                        uint32_t base,
+                        uint32_t width,
+                        uint32_t x,
+                        uint32_t y)
+        {
+            if (!capturing)
+                return;
+            const uint32_t page =
+                debugPageId(psm, base, std::max(width, 1u), x, y);
+            if (page < pages.size())
+                pages.set(page);
         }
     };
 
@@ -1442,6 +1602,54 @@ struct GSRasterizer::ParallelState
 GSRasterizer::GSRasterizer() = default;
 GSRasterizer::~GSRasterizer() = default;
 
+GSRasterizer::DebugProgressScope::DebugProgressScope(
+    GSRasterizer &rasterizer, GS *owner)
+    : m_rasterizer(rasterizer)
+{
+    m_rasterizer.beginDebugProgress(owner);
+}
+
+GSRasterizer::DebugProgressScope::~DebugProgressScope()
+{
+    m_rasterizer.endDebugProgress();
+}
+
+void GSRasterizer::beginDebugProgress(GS *owner)
+{
+    m_debugProgressOwner = owner;
+    m_debugCandidatePixelBatch = 0u;
+    m_trackDebugProgress =
+        owner &&
+        owner->m_progressTrackingEnabled.load(std::memory_order_relaxed);
+    if (!m_trackDebugProgress)
+    {
+        return;
+    }
+
+    owner->m_progressDrawsStarted.fetch_add(1u, std::memory_order_relaxed);
+    owner->m_progressActiveDraws.fetch_add(1u, std::memory_order_relaxed);
+    owner->m_progressActivePrimitive.store(
+        static_cast<uint32_t>(owner->m_prim.type), std::memory_order_relaxed);
+}
+
+void GSRasterizer::endDebugProgress()
+{
+    GS *const owner = m_debugProgressOwner;
+    if (m_trackDebugProgress && owner)
+    {
+        if (m_debugCandidatePixelBatch != 0u)
+        {
+            owner->m_progressCandidatePixels.fetch_add(
+                m_debugCandidatePixelBatch, std::memory_order_relaxed);
+        }
+        owner->m_progressDrawsCompleted.fetch_add(1u, std::memory_order_relaxed);
+        owner->m_progressActiveDraws.fetch_sub(1u, std::memory_order_relaxed);
+    }
+    m_debugProgressOwner = nullptr;
+    m_debugCandidatePixelBatch = 0u;
+    m_trackDebugProgress = false;
+}
+
 bool GSRasterizer::beginDrawBatch(GS *gs)
 {
     if (!gs || rasterizerInstrumentationRequested() ||
@@ -1910,6 +2118,8 @@ void GSRasterizer::renderQueuedPrimitive(GS *renderGs,
     renderGs->m_pabe = command.pabe;
 
     GSRasterizer &rasterizer = renderGs->m_rasterizer;
+    DebugProgressScope progress(
+        rasterizer, m_parallelState->primaryGs);
     rasterizer.m_scanlineWorkerIndex = workerIndex;
     rasterizer.m_scanlineWorkerCount = workerCount;
     std::copy_n(command.fixedX, 3u, rasterizer.m_queuedFixedX);
@@ -1960,6 +2170,7 @@ void GSRasterizer::drawPrimitive(GS *gs)
     if (tryQueuePrimitive(gs))
         return;
     flushDrawBatch(gs);
+    DebugProgressScope progress(*this, gs);
 
     const auto &ctx = gs->activeContext();
     prepareDecodedClut(gs);
@@ -2003,6 +2214,7 @@ void GSRasterizer::drawPrimitive(GS *gs)
     feedbackTrace().record(gs->m_prim, ctx, gs->m_vtxQueue);
     GSDrawTraceState &trace = drawTrace();
     trace.begin(ctx);
+    trace.feedback = recursiveTextureDraw;
     dumpDrawFramebuffer(gs, ctx, trace.index, "before");
     GSDrawDumpState &dump = drawDump();
     if (dump.dumpVram && dump.contains(trace.index) &&
@@ -2261,7 +2473,19 @@ void GSRasterizer::drawPrimitive(GS *gs)
             << static_cast<uint32_t>(trace.minTextureIndex) << ','
             << static_cast<uint32_t>(trace.maxTextureIndex) << ','
             << static_cast<uint32_t>(trace.minTextureAlpha) << ','
-            << static_cast<uint32_t>(trace.maxTextureAlpha) << '\n';
+            << static_cast<uint32_t>(trace.maxTextureAlpha) << ','
+            << debugPageList(trace.framebufferPages) << ','
+            << debugPageList(trace.depthPages) << ','
+            << debugPageList(trace.texturePages) << ','
+            << static_cast<uint32_t>(trace.feedback) << ',';
+        if (trace.hashVram && gs->m_vram && gs->m_vramSize != 0u)
+        {
+            trace.output
+                << std::hex << std::setw(16) << std::setfill('0')
+                << debugFnv1a64(gs->m_vram, gs->m_vramSize)
+                << std::dec;
+        }
+        trace.output << '\n';
         ++trace.written;
     }
     ++trace.index;
@@ -2278,6 +2502,17 @@ void GSRasterizer::writePixel(GS *gs,
                               bool forceAlphaBlend,
                               bool suppressDepthWrite)
 {
+    if (m_trackDebugProgress && m_debugProgressOwner)
+    {
+        ++m_debugCandidatePixelBatch;
+        if (m_debugCandidatePixelBatch == 1024u)
+        {
+            m_debugProgressOwner->m_progressCandidatePixels.fetch_add(
+                m_debugCandidatePixelBatch, std::memory_order_relaxed);
+            m_debugCandidatePixelBatch = 0u;
+        }
+    }
+
     const auto &ctx = gs->activeContext();
     GSDrawTraceState &trace = drawTrace();
     if (trace.capturing)
@@ -2523,6 +2758,8 @@ void GSRasterizer::writePixel(GS *gs,
         writeFramebuffer(pixel);
         if (trace.capturing)
         {
+            trace.recordFramebufferPage(
+                static_cast<uint8_t>(fpsm), fbp, fbw, x, y);
             ++trace.writes;
             if (readFramebuffer() != priorFramebufferValue)
                 ++trace.framebufferChanges;
@@ -2539,6 +2776,8 @@ void GSRasterizer::writePixel(GS *gs,
         writeDepth(z);
         if (trace.capturing)
         {
+            trace.recordDepthPage(
+                static_cast<uint8_t>(zpsm), zbp, fbw, x, y);
             ++trace.depthWrites;
             if (readDepth() != priorDepthValue)
                 ++trace.depthChanges;
@@ -2966,6 +3205,17 @@ uint32_t GSRasterizer::sampleTextureLinearLevel(
     {
         for (int sample = 0; sample < 4; ++sample)
         {
+            trace.recordTexturePage(
+                tex.psm,
+                tbp,
+                tbw,
+                static_cast<uint32_t>(
+                    std::max(wrappedU[sample & 1], 0)),
+                static_cast<uint32_t>(
+                    std::max(wrappedV[sample >> 1], 0)));
+        }
+        for (int sample = 0; sample < 4; ++sample)
+        {
             ++trace.textureSamples;
             const uint8_t textureIndex =
                 static_cast<uint8_t>(raw[sample]);
@@ -3117,6 +3367,12 @@ uint32_t GSRasterizer::sampleTextureFixed(GS *gs,
                 GSDrawTraceState &trace = drawTrace();
                 if (trace.capturing)
                 {
+                    trace.recordTexturePage(
+                        tex.psm,
+                        tbp,
+                        tbw,
+                        static_cast<uint32_t>(std::max(sampleU, 0)),
+                        static_cast<uint32_t>(std::max(sampleV, 0)));
                     ++trace.textureSamples;
                     trace.minTextureIndex =
                         std::min(trace.minTextureIndex,

@@ -305,6 +305,14 @@ struct JumpTable
 class PS2Memory
 {
 public:
+    struct CodeInvalidationEvent
+    {
+        uint32_t start = 0;
+        uint32_t end = 0;
+        uint32_t words = 0;
+        uint32_t writerPc = 0;
+    };
+
     PS2Memory();
     ~PS2Memory();
 
@@ -333,11 +341,11 @@ public:
     uint64_t read64(uint32_t address);
     __m128i read128(uint32_t address);
 
-    void write8(uint32_t address, uint8_t value);
-    void write16(uint32_t address, uint16_t value);
-    void write32(uint32_t address, uint32_t value);
-    void write64(uint32_t address, uint64_t value);
-    void write128(uint32_t address, __m128i value);
+    void write8(uint32_t address, uint8_t value, uint32_t writerPc = 0);
+    void write16(uint32_t address, uint16_t value, uint32_t writerPc = 0);
+    void write32(uint32_t address, uint32_t value, uint32_t writerPc = 0);
+    void write64(uint32_t address, uint64_t value, uint32_t writerPc = 0);
+    void write128(uint32_t address, __m128i value, uint32_t writerPc = 0);
 
     // TLB handling
     uint32_t translateAddress(uint32_t virtualAddress);
@@ -389,6 +397,8 @@ public:
     void registerCodeRegion(uint32_t start, uint32_t end);
     bool isCodeAddress(uint32_t address) const;
     bool isCodeModified(uint32_t address, uint32_t size);
+    std::vector<CodeInvalidationEvent> takeCodeInvalidationEvents();
+    void flushCodeInvalidationLog();
     void clearModifiedFlag(uint32_t address, uint32_t size);
 
     // GS register accessors
@@ -467,9 +477,11 @@ public:
         std::vector<bool> modified; // Bitmap of modified 4-byte blocks
     };
     std::vector<CodeRegion> m_codeRegions;
+    std::mutex m_codeInvalidationMutex;
+    std::vector<CodeInvalidationEvent> m_pendingCodeInvalidations;
 
     bool isAddressInRegion(uint32_t address, const CodeRegion &region);
-    void markModified(uint32_t address, uint32_t size);
+    void markModified(uint32_t address, uint32_t size, uint32_t writerPc);
     void markVU1CodeModified() { m_vu1CodeGeneration.fetch_add(1, std::memory_order_relaxed); }
     bool isScratchpad(uint32_t address) const;
     uint8_t *mapVuMemory(uint32_t physAddr, uint32_t size, uint32_t &offset, uint32_t &limit);

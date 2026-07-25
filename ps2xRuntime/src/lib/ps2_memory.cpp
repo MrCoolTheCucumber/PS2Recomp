@@ -11,6 +11,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <iomanip>
 #include <limits>
 #include <stdexcept>
 #include <algorithm>
@@ -1101,6 +1102,7 @@ PS2Memory::PS2Memory()
 
 PS2Memory::~PS2Memory()
 {
+    flushCodeInvalidationLog();
     finishVif1DmaTrace();
     delete m_gsDmaTrace;
     m_gsDmaTrace = nullptr;
@@ -2199,7 +2201,7 @@ __m128i PS2Memory::read128(uint32_t address)
     return _mm_setzero_si128();
 }
 
-void PS2Memory::write8(uint32_t address, uint8_t value)
+void PS2Memory::write8(uint32_t address, uint8_t value, uint32_t writerPc)
 {
     const bool scratch = isScratchpad(address);
     uint32_t physAddr = translateAddress(address);
@@ -2210,6 +2212,7 @@ void PS2Memory::write8(uint32_t address, uint8_t value)
     }
     else if (physAddr < PS2_RAM_SIZE)
     {
+        markModified(physAddr, sizeof(value), writerPc);
         m_rdram[physAddr] = value;
     }
     else
@@ -2236,7 +2239,7 @@ void PS2Memory::write8(uint32_t address, uint8_t value)
     }
 }
 
-void PS2Memory::write16(uint32_t address, uint16_t value)
+void PS2Memory::write16(uint32_t address, uint16_t value, uint32_t writerPc)
 {
     if (address & 1)
     {
@@ -2252,6 +2255,7 @@ void PS2Memory::write16(uint32_t address, uint16_t value)
     }
     else if (physAddr < PS2_RAM_SIZE)
     {
+        markModified(physAddr, sizeof(value), writerPc);
         storeScalar<uint16_t>(m_rdram, physAddr, PS2_RAM_SIZE, value, "write16 rdram", address);
     }
     else
@@ -2276,7 +2280,7 @@ void PS2Memory::write16(uint32_t address, uint16_t value)
     }
 }
 
-void PS2Memory::write32(uint32_t address, uint32_t value)
+void PS2Memory::write32(uint32_t address, uint32_t value, uint32_t writerPc)
 {
     if (address & 3)
     {
@@ -2312,7 +2316,7 @@ void PS2Memory::write32(uint32_t address, uint32_t value)
     else if (physAddr < PS2_RAM_SIZE)
     {
         // Check if this might be code modification
-        markModified(address, 4);
+        markModified(physAddr, sizeof(value), writerPc);
 
         storeScalar<uint32_t>(m_rdram, physAddr, PS2_RAM_SIZE, value, "write32 rdram", address);
     }
@@ -2334,7 +2338,7 @@ void PS2Memory::write32(uint32_t address, uint32_t value)
     }
 }
 
-void PS2Memory::write64(uint32_t address, uint64_t value)
+void PS2Memory::write64(uint32_t address, uint64_t value, uint32_t writerPc)
 {
     if (address & 7)
     {
@@ -2366,7 +2370,7 @@ void PS2Memory::write64(uint32_t address, uint64_t value)
     }
     else if (physAddr < PS2_RAM_SIZE)
     {
-        markModified(address, 8);
+        markModified(physAddr, sizeof(value), writerPc);
         storeScalar<uint64_t>(m_rdram, physAddr, PS2_RAM_SIZE, value, "write64 rdram", address);
     }
     else
@@ -2383,12 +2387,12 @@ void PS2Memory::write64(uint32_t address, uint64_t value)
     }
     if (isIoRegister(physAddr))
     {
-        write32(address, (uint32_t)value);
-        write32(address + 4, (uint32_t)(value >> 32));
+        write32(address, (uint32_t)value, writerPc);
+        write32(address + 4, (uint32_t)(value >> 32), writerPc);
     }
 }
 
-void PS2Memory::write128(uint32_t address, __m128i value)
+void PS2Memory::write128(uint32_t address, __m128i value, uint32_t writerPc)
 {
     if (address & 15)
     {
@@ -2405,7 +2409,7 @@ void PS2Memory::write128(uint32_t address, __m128i value)
     }
     else if (physAddr < PS2_RAM_SIZE)
     {
-        markModified(address, 16);
+        markModified(physAddr, sizeof(__m128i), writerPc);
         inRange(physAddr, sizeof(__m128i), PS2_RAM_SIZE, "write128 rdram", address);
         _mm_storeu_si128(reinterpret_cast<__m128i *>(&m_rdram[physAddr]), value);
     }
@@ -2428,8 +2432,8 @@ void PS2Memory::write128(uint32_t address, __m128i value)
         uint64_t lo = _mm_extract_epi64(value, 0);
         uint64_t hi = _mm_extract_epi64(value, 1);
 
-        write64(address, lo);
-        write64(address + 8, hi);
+        write64(address, lo, writerPc);
+        write64(address + 8, hi, writerPc);
     }
 }
 
@@ -3885,7 +3889,7 @@ bool PS2Memory::isCodeAddress(uint32_t address) const
     return false;
 }
 
-void PS2Memory::markModified(uint32_t address, uint32_t size)
+void PS2Memory::markModified(uint32_t address, uint32_t size, uint32_t writerPc)
 {
     if (size == 0)
     {
@@ -3902,22 +3906,102 @@ void PS2Memory::markModified(uint32_t address, uint32_t size)
             continue;
         }
 
-        uint32_t overlapStart = static_cast<uint32_t>(std::max<uint64_t>(address, regionStart));
-        uint32_t overlapEnd = static_cast<uint32_t>(std::min<uint64_t>(writeEnd, regionEnd));
+        const uint32_t overlapStart =
+            static_cast<uint32_t>(std::max<uint64_t>(address, regionStart));
+        const uint32_t overlapEnd =
+            static_cast<uint32_t>(std::min<uint64_t>(writeEnd, regionEnd));
+        const size_t firstWord = (overlapStart - region.start) / 4u;
+        const size_t lastWord =
+            (static_cast<size_t>(overlapEnd - region.start) + 3u) / 4u;
 
-        for (uint32_t addr = overlapStart; addr < overlapEnd; addr += 4)
+        CodeInvalidationEvent pending{};
+        pending.writerPc = writerPc;
+        for (size_t bitIndex = firstWord; bitIndex < lastWord; ++bitIndex)
         {
-            size_t bitIndex = (addr - region.start) / 4;
-            if (bitIndex < region.modified.size())
+            if (bitIndex >= region.modified.size() || region.modified[bitIndex])
             {
-                if (!region.modified[bitIndex])
-                {
-                    region.modified[bitIndex] = true;
-                    RUNTIME_LOG("Marked code at " << std::hex << addr << std::dec
-                                                   << " as modified" << std::endl);
-                }
+                continue;
             }
+
+            region.modified[bitIndex] = true;
+            const uint32_t wordStart =
+                region.start + static_cast<uint32_t>(bitIndex * 4u);
+            const uint32_t wordEnd = std::min<uint32_t>(wordStart + 4u, region.end);
+            if (pending.words != 0u && wordStart != pending.end)
+            {
+                std::lock_guard<std::mutex> lock(m_codeInvalidationMutex);
+                m_pendingCodeInvalidations.push_back(pending);
+                pending = {};
+                pending.writerPc = writerPc;
+            }
+
+            if (pending.words == 0u)
+            {
+                pending.start = wordStart;
+                pending.end = wordEnd;
+            }
+            else
+            {
+                pending.end = wordEnd;
+            }
+            ++pending.words;
         }
+
+        if (pending.words != 0u)
+        {
+            std::lock_guard<std::mutex> lock(m_codeInvalidationMutex);
+            m_pendingCodeInvalidations.push_back(pending);
+        }
+    }
+}
+
+std::vector<PS2Memory::CodeInvalidationEvent> PS2Memory::takeCodeInvalidationEvents()
+{
+    std::vector<CodeInvalidationEvent> pending;
+    {
+        std::lock_guard<std::mutex> lock(m_codeInvalidationMutex);
+        pending.swap(m_pendingCodeInvalidations);
+    }
+
+    std::sort(pending.begin(), pending.end(),
+              [](const CodeInvalidationEvent &lhs, const CodeInvalidationEvent &rhs)
+              {
+                  if (lhs.writerPc != rhs.writerPc)
+                  {
+                      return lhs.writerPc < rhs.writerPc;
+                  }
+                  return lhs.start < rhs.start;
+              });
+
+    std::vector<CodeInvalidationEvent> merged;
+    merged.reserve(pending.size());
+    for (const auto &event : pending)
+    {
+        if (!merged.empty() &&
+            merged.back().writerPc == event.writerPc &&
+            event.start <= merged.back().end)
+        {
+            merged.back().end = std::max(merged.back().end, event.end);
+            merged.back().words += event.words;
+            continue;
+        }
+        merged.push_back(event);
+    }
+    return merged;
+}
+
+void PS2Memory::flushCodeInvalidationLog()
+{
+    for (const auto &event : takeCodeInvalidationEvents())
+    {
+        RUNTIME_LOG("{\"schema_version\":1,\"event\":\"code-invalidated\","
+                    << "\"start\":\"0x" << std::hex << std::setw(8)
+                    << std::setfill('0') << event.start
+                    << "\",\"end\":\"0x" << std::setw(8) << event.end
+                    << "\",\"words\":" << std::dec << event.words
+                    << ",\"writer_pc\":\"0x" << std::hex << std::setw(8)
+                    << event.writerPc << "\"}" << std::dec << std::setfill(' ')
+                    << std::endl);
     }
 }
 

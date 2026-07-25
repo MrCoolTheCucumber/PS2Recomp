@@ -320,7 +320,7 @@ int main(int argc, char **argv)
                       << hashTracePath << '\n';
             return 2;
         }
-        hashTrace << "index,fnv1a64\n";
+        hashTrace << "index,size,input_fnv1a64,vram_fnv1a64\n";
     }
 
     std::vector<size_t> packetSizes;
@@ -352,7 +352,9 @@ int main(int argc, char **argv)
         if (hashTrace)
         {
             gs.flushRenderBatch();
-            hashTrace << packetIndex << ','
+            hashTrace << packetIndex << ',' << size << ','
+                      << std::hex << std::setw(16) << std::setfill('0')
+                      << fnv1a64(data, size) << ','
                       << std::hex << std::setw(16) << std::setfill('0')
                       << fnv1a64(memory.getGSVRAM(), PS2_GS_VRAM_SIZE)
                       << std::dec << '\n';
@@ -407,7 +409,11 @@ int main(int argc, char **argv)
         return 2;
     }
 
-    std::cout << "{\"packets\":" << packetPaths.size()
-              << ",\"bytes\":" << totalBytes << "}\n";
+    std::cout << "{\"schema_version\":1,\"packets\":" << packetIndex
+              << ",\"bytes\":" << totalBytes
+              << ",\"final_vram_fnv1a64\":\"0x"
+              << std::hex << std::setw(16) << std::setfill('0')
+              << fnv1a64(memory.getGSVRAM(), PS2_GS_VRAM_SIZE)
+              << "\"}\n";
     return 0;
 }

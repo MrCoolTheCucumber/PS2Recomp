@@ -1,6 +1,7 @@
 #ifndef PS2_AUDIO_H
 #define PS2_AUDIO_H
 
+#include <cstddef>
 #include <cstdint>
 #include <memory>
 #include <mutex>
@@ -23,6 +24,20 @@ namespace ps2_spu_adpcm
                       std::vector<int16_t> &outPcm);
 }
 
+struct PS2AudioStreamDebugSnapshot
+{
+    bool opened = false;
+    bool playing = false;
+    bool debuggerPaused = false;
+    uint32_t sampleRate = 0;
+    uint32_t channelCount = 0;
+    uint32_t channelBufferSize = 0;
+    uint64_t submissionCount = 0;
+    uint64_t submittedBytes = 0;
+    uint64_t lastSubmissionHash = 0;
+    size_t queuedSamples = 0;
+};
+
 class PS2AudioBackend
 {
 public:
@@ -39,7 +54,9 @@ public:
               uint32_t voiceIndex = 0xFFFFFFFFu);
     void stop(uint32_t voiceId);
     void stopAll();
+    void setDebuggerPaused(bool paused);
     void setAudioReady(bool ready) { m_audioReady = ready; }
+    [[nodiscard]] PS2AudioStreamDebugSnapshot streamDebugSnapshot() const;
 
 private:
     struct DecodedSample

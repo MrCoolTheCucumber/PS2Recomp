@@ -11,6 +11,19 @@
 
 namespace
 {
+    uint64_t fnv1a64(const uint8_t *data, size_t size)
+    {
+        constexpr uint64_t kOffsetBasis = 14695981039346656037ull;
+        constexpr uint64_t kPrime = 1099511628211ull;
+        uint64_t hash = kOffsetBasis;
+        for (size_t index = 0; index < size; ++index)
+        {
+            hash ^= data[index];
+            hash *= kPrime;
+        }
+        return hash;
+    }
+
     std::vector<uint8_t> buildWavFromPcm(const int16_t *pcm, size_t sampleCount, uint32_t sampleRate)
     {
         const uint32_t dataSize = static_cast<uint32_t>(sampleCount * 2);
@@ -84,7 +97,7 @@ struct PS2AudioBackend::Impl
 
     struct SpuAdpcmStream
     {
-        std::mutex mutex;
+        mutable std::mutex mutex;
         std::array<ps2_spu_adpcm::DecoderState, 2> decoders{};
         std::array<std::deque<int16_t>, 2> channelPcm;
         std::deque<int16_t> interleavedPcm;
@@ -92,6 +105,9 @@ struct PS2AudioBackend::Impl
         uint32_t channelBufferSize = 0;
         uint32_t sampleRate = 0;
         uint32_t channelCount = 0;
+        uint64_t submissionCount = 0;
+        uint64_t submittedBytes = 0;
+        uint64_t lastSubmissionHash = 0;
         bool opened = false;
         bool hostStreamLoaded = false;
         bool playing = false;
@@ -99,6 +115,7 @@ struct PS2AudioBackend::Impl
 
     std::vector<TrackedSound> activeSounds;
     SpuAdpcmStream spuAdpcmStream;
+    std::atomic<bool> debuggerPaused{false};
 
     inline static std::atomic<SpuAdpcmStream *> activeCallbackStream{nullptr};
 
@@ -334,6 +351,9 @@ void PS2AudioBackend::closeSpuAdpcmStream()
     stream.channelBufferSize = 0u;
     stream.sampleRate = 0u;
     stream.channelCount = 0u;
+    stream.submissionCount = 0u;
+    stream.submittedBytes = 0u;
+    stream.lastSubmissionHash = 0u;
     stream.opened = false;
 }
 
@@ -432,6 +452,9 @@ void PS2AudioBackend::handleSony989sndCommand(uint32_t rpcNum,
         }
         stream.channelPcm[channel].insert(stream.channelPcm[channel].end(),
                                           decoded.begin(), decoded.end());
+        ++stream.submissionCount;
+        stream.submittedBytes += byteCount;
+        stream.lastSubmissionHash = fnv1a64(streamData, byteCount);
         Impl::flushChannelPcm(stream);
         return;
     }
@@ -617,4 +640,66 @@ void PS2AudioBackend::stopAll()
     }
     m_impl->activeSounds.clear();
 #endif
+}
+
+void PS2AudioBackend::setDebuggerPaused(bool paused)
+{
+#if defined(PLATFORM_VITA)
+    (void)paused;
+    return;
+#else
+    if (!m_impl || m_impl->debuggerPaused.exchange(paused, std::memory_order_acq_rel) == paused)
+        return;
+
+    m_impl->debuggerPaused = paused;
+
+    AudioStream hostStream{};
+    bool resumeStream = false;
+    {
+        Impl::SpuAdpcmStream &stream = m_impl->spuAdpcmStream;
+        std::lock_guard<std::mutex> lock(stream.mutex);
+        hostStream = stream.hostStream;
+        resumeStream = stream.hostStreamLoaded && stream.playing;
+    }
+
+    if (resumeStream && IsAudioDeviceReady())
+    {
+        if (paused)
+            PauseAudioStream(hostStream);
+        else
+            ResumeAudioStream(hostStream);
+    }
+
+    std::lock_guard<std::mutex> lock(m_mutex);
+    for (auto &tracked : m_impl->activeSounds)
+    {
+        if (paused)
+            PauseSound(tracked.snd);
+        else
+            ResumeSound(tracked.snd);
+    }
+#endif
+}
+
+PS2AudioStreamDebugSnapshot PS2AudioBackend::streamDebugSnapshot() const
+{
+    PS2AudioStreamDebugSnapshot snapshot;
+    if (!m_impl)
+        return snapshot;
+
+    const Impl::SpuAdpcmStream &stream = m_impl->spuAdpcmStream;
+    std::lock_guard<std::mutex> lock(stream.mutex);
+    snapshot.opened = stream.opened;
+    snapshot.playing = stream.playing;
+    snapshot.debuggerPaused = m_impl->debuggerPaused.load(std::memory_order_acquire);
+    snapshot.sampleRate = stream.sampleRate;
+    snapshot.channelCount = stream.channelCount;
+    snapshot.channelBufferSize = stream.channelBufferSize;
+    snapshot.submissionCount = stream.submissionCount;
+    snapshot.submittedBytes = stream.submittedBytes;
+    snapshot.lastSubmissionHash = stream.lastSubmissionHash;
+    snapshot.queuedSamples = stream.interleavedPcm.size();
+    for (const auto &channel : stream.channelPcm)
+        snapshot.queuedSamples += channel.size();
+    return snapshot;
 }

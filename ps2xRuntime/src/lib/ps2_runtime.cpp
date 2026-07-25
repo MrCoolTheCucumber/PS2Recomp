@@ -12,6 +12,9 @@
 #include "ps2_host_backend.h"
 #include "ps2_iop_host.h"
 #include "ps2x/iop/iop_subsystem.h"
+#if defined(PS2X_ENABLE_DEBUG_SERVER) && PS2X_ENABLE_DEBUG_SERVER
+#include "runtime/ps2_debug_server.h"
+#endif
 
 #include <iostream>
 #include <fstream>
@@ -436,6 +439,59 @@ namespace
         return oss.str();
     }
 
+    std::string escapeJsonString(std::string_view text)
+    {
+        std::ostringstream output;
+        for (const unsigned char ch : text)
+        {
+            switch (ch)
+            {
+            case '"':
+                output << "\\\"";
+                break;
+            case '\\':
+                output << "\\\\";
+                break;
+            case '\b':
+                output << "\\b";
+                break;
+            case '\f':
+                output << "\\f";
+                break;
+            case '\n':
+                output << "\\n";
+                break;
+            case '\r':
+                output << "\\r";
+                break;
+            case '\t':
+                output << "\\t";
+                break;
+            default:
+                if (ch < 0x20u)
+                {
+                    output << "\\u" << std::hex << std::setw(4)
+                           << std::setfill('0') << static_cast<uint32_t>(ch)
+                           << std::dec << std::setfill(' ');
+                }
+                else
+                {
+                    output << static_cast<char>(ch);
+                }
+                break;
+            }
+        }
+        return output.str();
+    }
+
+    std::string rawGuestAddress(uint32_t address)
+    {
+        std::ostringstream output;
+        output << "0x" << std::hex << std::setw(8) << std::setfill('0')
+               << address;
+        return output.str();
+    }
+
     uint32_t selectExceptionVector(const R5900Context *ctx,
                                    uint32_t exceptionCode,
                                    bool alreadyInException)
@@ -830,6 +886,13 @@ PS2Runtime::~PS2Runtime()
     try
     {
         requestStop();
+#if defined(PS2X_ENABLE_DEBUG_SERVER) && PS2X_ENABLE_DEBUG_SERVER
+        if (m_debugServer)
+        {
+            m_debugServer->stop();
+            m_debugServer.reset();
+        }
+#endif
         ps2_syscalls::detachAllGuestHostThreads();
         m_iopSubsystem.reset();
         m_iopHost.reset();
@@ -979,6 +1042,10 @@ bool PS2Runtime::initialize(const char *title)
             m_debugUiInitialized = true;
         }
 
+#if defined(PS2X_ENABLE_DEBUG_SERVER) && PS2X_ENABLE_DEBUG_SERVER
+        m_debugServer = std::make_unique<PS2DebugServer>(*this);
+        (void)m_debugServer->start();
+#endif
         return true;
     }
     catch (const std::exception &e)
@@ -1458,8 +1525,10 @@ const char *describeGuestBranchKind(PS2Runtime::GuestBranchKind kind)
 PS2Runtime::RecompiledFunction PS2Runtime::lookupFunction(uint32_t address)
 {
     pushDispatchPc(address);
+    debugRecordBranch(address);
 
     const uint32_t normalizedAddress = normalizeGuestFunctionAddress(address);
+    m_debugPc.store(normalizedAddress, std::memory_order_relaxed);
     uint32_t slot = 0u;
     if (generatedFunctionTableSlot(normalizedAddress, slot))
     {
@@ -1485,13 +1554,6 @@ PS2Runtime::RecompiledFunction PS2Runtime::lookupFunction(uint32_t address)
             return fn;
         }
     }
-
-    std::cerr << "Error: No exact recompiled function for guest PC " << formatGuestPc(address)
-              << " tableBase=0x" << std::hex << g_ps2RecompiledFunctionTableBase
-              << " tableEnd=0x" << g_ps2RecompiledFunctionTableEnd
-              << " codeRegion=" << (m_memory.isCodeAddress(address) ? "yes" : "no")
-              << " trace=" << formatDispatchHistory()
-              << std::dec << std::endl;
 
     static RecompiledFunction missingFunction = [](uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
@@ -1520,6 +1582,7 @@ PS2Runtime::MissingFunctionPolicy PS2Runtime::missingFunctionPolicy() const
 void PS2Runtime::resetMissingFunctionReportOnce()
 {
     m_missingFunctionReported.store(false, std::memory_order_release);
+    debugClearFault();
 }
 
 void PS2Runtime::reportMissingFunction(uint8_t *rdram,
@@ -1529,92 +1592,70 @@ void PS2Runtime::reportMissingFunction(uint8_t *rdram,
                                        GuestBranchKind kind,
                                        const char *debugName)
 {
+    (void)rdram;
     const MissingFunctionPolicy policy = missingFunctionPolicy();
     const bool firstReport = !m_missingFunctionReported.exchange(true, std::memory_order_acq_rel);
 
-    const uint32_t pc = ctx->pc;
-    const uint32_t ra = static_cast<uint32_t>(_mm_extract_epi32(ctx->r[31], 0));
-    const uint32_t sp = static_cast<uint32_t>(_mm_extract_epi32(ctx->r[29], 0));
-    const uint32_t gp = static_cast<uint32_t>(_mm_extract_epi32(ctx->r[28], 0));
-    const uint32_t a0 = static_cast<uint32_t>(_mm_extract_epi32(ctx->r[4], 0));
-    const uint32_t a1 = static_cast<uint32_t>(_mm_extract_epi32(ctx->r[5], 0));
-    const uint32_t v0 = static_cast<uint32_t>(_mm_extract_epi32(ctx->r[2], 0));
-    const uint32_t v1 = static_cast<uint32_t>(_mm_extract_epi32(ctx->r[3], 0));
-
-    auto readGuestU32At = [rdram](uint32_t addr, uint32_t &out) -> bool
-    {
-        // TODO this !rdram exist only because of test fix those test later
-        if (!rdram || addr > PS2_RAM_SIZE - sizeof(uint32_t))
-        {
-            out = 0u;
-            return false;
-        }
-
-        std::memcpy(&out, rdram + addr, sizeof(uint32_t));
-        return true;
-    };
-
-    auto readGuestU32Offset = [&readGuestU32At](uint32_t base, uint32_t offset, uint32_t &out) -> bool
-    {
-        if (base > PS2_RAM_SIZE - sizeof(uint32_t) || offset > PS2_RAM_SIZE - sizeof(uint32_t) - base)
-        {
-            out = 0u;
-            return false;
-        }
-
-        return readGuestU32At(base + offset, out);
-    };
-
-    uint32_t a0Word0 = 0u;
-    uint32_t a0Word4 = 0u;
-    uint32_t a0Word8 = 0u;
-    uint32_t a0WordC = 0u;
-    const bool a0Readable =
-        readGuestU32Offset(a0, 0x00u, a0Word0) &&
-        readGuestU32Offset(a0, 0x04u, a0Word4) &&
-        readGuestU32Offset(a0, 0x08u, a0Word8) &&
-        readGuestU32Offset(a0, 0x0cu, a0WordC);
-
-    uint32_t vtableSlot0 = 0u;
-    uint32_t vtableSlot4 = 0u;
-    uint32_t vtableSlot8 = 0u;
-    uint32_t vtableSlotC = 0u;
-    const bool vtableReadable =
-        a0Readable && a0Word0 != 0u &&
-        readGuestU32Offset(a0Word0, 0x00u, vtableSlot0) &&
-        readGuestU32Offset(a0Word0, 0x04u, vtableSlot4) &&
-        readGuestU32Offset(a0Word0, 0x08u, vtableSlot8) &&
-        readGuestU32Offset(a0Word0, 0x0cu, vtableSlotC);
+    const uint32_t pc =
+        ctx ? ctx->pc : m_debugPc.load(std::memory_order_relaxed);
+    const uint32_t ra =
+        ctx ? static_cast<uint32_t>(_mm_extract_epi32(ctx->r[31], 0))
+            : m_debugRa.load(std::memory_order_relaxed);
+    const uint32_t sp =
+        ctx ? static_cast<uint32_t>(_mm_extract_epi32(ctx->r[29], 0))
+            : m_debugSp.load(std::memory_order_relaxed);
+    const uint32_t gp =
+        ctx ? static_cast<uint32_t>(_mm_extract_epi32(ctx->r[28], 0))
+            : m_debugGp.load(std::memory_order_relaxed);
+    const uint32_t a0 =
+        ctx ? static_cast<uint32_t>(_mm_extract_epi32(ctx->r[4], 0)) : 0u;
+    const uint32_t a1 =
+        ctx ? static_cast<uint32_t>(_mm_extract_epi32(ctx->r[5], 0)) : 0u;
+    const uint32_t v0 =
+        ctx ? static_cast<uint32_t>(_mm_extract_epi32(ctx->r[2], 0)) : 0u;
+    const uint32_t v1 =
+        ctx ? static_cast<uint32_t>(_mm_extract_epi32(ctx->r[3], 0)) : 0u;
 
     if (firstReport)
     {
+        DebugFaultInfo fault{};
+        fault.active = true;
+        fault.type = "missing-recompiled-target";
+        fault.operation = debugName ? debugName : "";
+        fault.branchKind = kind;
+        fault.sourcePc = sourcePc;
+        fault.targetPc = targetPc;
+        fault.pc = pc;
+        fault.ra = ra;
+        fault.sp = sp;
+        fault.gp = gp;
+        fault.a0 = a0;
+        fault.a1 = a1;
+        fault.v0 = v0;
+        fault.v1 = v1;
+        fault.codeRegion = m_memory.isCodeAddress(targetPc);
+        fault.policy = policy;
+        debugRecordFault(fault);
+        fault = debugFaultSnapshot();
+
         std::ostringstream oss;
-        oss << "[guest-branch:missing-target] kind=" << describeGuestBranchKind(kind)
-            << " op=" << (debugName ? debugName : "<unknown>")
-            << " source=" << formatGuestPc(sourcePc)
-            << " target=" << formatGuestPc(targetPc)
-            << " pc=" << formatGuestPc(pc)
-            << " ra=" << formatGuestPc(ra)
-            << " sp=0x" << std::hex << sp
-            << " gp=0x" << gp
-            << " a0=0x" << a0
-            << " a1=0x" << a1
-            << " v0=0x" << v0
-            << " v1=0x" << v1
-            << " a0Readable=" << (a0Readable ? "yes" : "no")
-            << " a0[0]=0x" << a0Word0
-            << " a0[4]=0x" << a0Word4
-            << " a0[8]=0x" << a0Word8
-            << " a0[c]=0x" << a0WordC
-            << " vtableReadable=" << (vtableReadable ? "yes" : "no")
-            << " vtbl[0]=0x" << vtableSlot0
-            << " vtbl[4]=0x" << vtableSlot4
-            << " vtbl[8]=0x" << vtableSlot8
-            << " vtbl[c]=0x" << vtableSlotC
-            << " codeRegion=" << (m_memory.isCodeAddress(targetPc) ? "yes" : "no")
-            << " policy=" << static_cast<uint32_t>(policy)
-            << " trace=" << formatDispatchHistory()
-            << std::dec;
+        oss << "{\"schema_version\":1,"
+            << "\"event\":\"missing-recompiled-target\","
+            << "\"sequence\":" << fault.sequence << ','
+            << "\"kind\":\"" << describeGuestBranchKind(kind) << "\","
+            << "\"operation\":\""
+            << escapeJsonString(debugName ? debugName : "") << "\","
+            << "\"source\":\"" << rawGuestAddress(sourcePc) << "\","
+            << "\"target\":\"" << rawGuestAddress(targetPc) << "\","
+            << "\"pc\":\"" << rawGuestAddress(pc) << "\","
+            << "\"ra\":\"" << rawGuestAddress(ra) << "\","
+            << "\"sp\":\"" << rawGuestAddress(sp) << "\","
+            << "\"gp\":\"" << rawGuestAddress(gp) << "\","
+            << "\"code_region\":" << (fault.codeRegion ? "true" : "false")
+            << ",\"policy\":" << static_cast<uint32_t>(policy)
+            << ",\"trace_entries\":"
+            << debugBranchHistory(kDebugBranchHistoryCapacity).size()
+            << '}';
 
         static std::mutex s_missingFunctionLogMutex;
         {
@@ -2331,6 +2372,27 @@ void PS2Runtime::executeGuestStep(uint8_t *rdram,
                                   R5900Context *ctx,
                                   RecompiledFunction function)
 {
+    struct CodeInvalidationFlush
+    {
+        PS2Memory &memory;
+        ~CodeInvalidationFlush()
+        {
+            try
+            {
+                memory.flushCodeInvalidationLog();
+            }
+            catch (...)
+            {
+            }
+        }
+    } flush{m_memory};
+
+    debugBeforeGuestStep(ctx);
+    if (isStopRequested())
+    {
+        return;
+    }
+
     try
     {
         function(rdram, ctx, this);
@@ -2338,6 +2400,12 @@ void PS2Runtime::executeGuestStep(uint8_t *rdram,
     catch (const PS2GuestException &)
     {
     }
+    catch (...)
+    {
+        debugAfterGuestStep(ctx);
+        throw;
+    }
+    debugAfterGuestStep(ctx);
 }
 
 void PS2Runtime::dispatchLoop(uint8_t *rdram, R5900Context *ctx)
@@ -2419,9 +2487,38 @@ void PS2Runtime::enterGuestExecution()
         return;
     }
 
-    m_guestExecutionWaiters.fetch_add(1u, std::memory_order_acq_rel);
-    m_guestExecutionMutex.lock();
-    m_guestExecutionWaiters.fetch_sub(1u, std::memory_order_acq_rel);
+    if (!m_debugControlActive.load(std::memory_order_acquire))
+    {
+        m_guestExecutionWaiters.fetch_add(1u, std::memory_order_acq_rel);
+        m_guestExecutionMutex.lock();
+        m_guestExecutionWaiters.fetch_sub(1u, std::memory_order_acq_rel);
+        depth = 1u;
+        markGuestExecutionAcquired();
+        return;
+    }
+
+    for (;;)
+    {
+        {
+            std::unique_lock<std::mutex> controlLock(m_debugControlMutex);
+            m_debugControlCv.wait(controlLock, [this]()
+                                  { return !m_debugPauseRequested.load(std::memory_order_acquire) ||
+                                           isStopRequested(); });
+        }
+
+        m_guestExecutionWaiters.fetch_add(1u, std::memory_order_acq_rel);
+        m_guestExecutionMutex.lock();
+        m_guestExecutionWaiters.fetch_sub(1u, std::memory_order_acq_rel);
+
+        // Close the race where a pause is requested after the condition check
+        // but before this thread acquires the guest-execution mutex.
+        if (!m_debugPauseRequested.load(std::memory_order_acquire) ||
+            isStopRequested())
+        {
+            break;
+        }
+        m_guestExecutionMutex.unlock();
+    }
     depth = 1u;
     markGuestExecutionAcquired();
 }
@@ -2485,11 +2582,8 @@ void PS2Runtime::reacquireGuestExecution(uint32_t depth)
 
     if (heldDepth == 0u)
     {
-        m_guestExecutionWaiters.fetch_add(1u, std::memory_order_acq_rel);
-        m_guestExecutionMutex.lock();
-        m_guestExecutionWaiters.fetch_sub(1u, std::memory_order_acq_rel);
-        heldDepth = 1u;
-        markGuestExecutionAcquired();
+        enterGuestExecution();
+        heldDepth = g_guestExecutionDepths[this];
         --remaining;
     }
 
@@ -2542,6 +2636,575 @@ void PS2Runtime::waitForGuestExecutionHandoff(uint64_t baselineEpoch)
     if (!handedOff)
     {
         m_guestExecutionHandoffTimeouts.fetch_add(1u, std::memory_order_relaxed);
+    }
+}
+
+void PS2Runtime::debugRecordStopLocked(const char *reason, uint32_t pc)
+{
+    ++m_debugStopSequence;
+    m_debugLastStop.completed = true;
+    m_debugLastStop.reason = reason ? reason : "unknown";
+    m_debugLastStop.pc = normalizeGuestFunctionAddress(pc);
+    m_debugLastStop.sequence = m_debugStopSequence;
+}
+
+void PS2Runtime::debugRefreshControlActiveLocked()
+{
+    const bool active =
+        m_debugPauseRequested.load(std::memory_order_relaxed) ||
+        m_debugRunUntilActive ||
+        m_debugStepActive ||
+        !m_debugBreakpoints.empty() ||
+        !m_debugWatchpoints.empty();
+    m_debugControlActive.store(active, std::memory_order_release);
+}
+
+void PS2Runtime::debugWaitUntilResumed()
+{
+    std::unique_lock<std::mutex> lock(m_debugControlMutex);
+    m_debugControlCv.wait(lock, [this]()
+                          { return !m_debugPauseRequested.load(std::memory_order_acquire) ||
+                                   isStopRequested(); });
+}
+
+void PS2Runtime::debugBlockGuestAtBoundary(R5900Context *ctx, const char *reason)
+{
+    const uint32_t pc = ctx ? ctx->pc : m_debugPc.load(std::memory_order_relaxed);
+    {
+        std::lock_guard<std::mutex> lock(m_debugControlMutex);
+        m_debugPauseRequested.store(true, std::memory_order_release);
+        m_debugRunUntilActive = false;
+        m_debugStepActive = false;
+        m_debugStepRemaining = 0u;
+        debugRecordStopLocked(reason, pc);
+        debugRefreshControlActiveLocked();
+    }
+    m_debugControlCv.notify_all();
+    m_audioBackend.setDebuggerPaused(true);
+
+    // executeGuestStep() is called while this host thread owns the recursive
+    // guest-execution mutex. Release all levels so debugger snapshots can be
+    // proven quiescent while the guest remains stopped.
+    const uint32_t depth = releaseGuestExecution();
+    debugWaitUntilResumed();
+    if (depth != 0u)
+    {
+        reacquireGuestExecution(depth);
+    }
+}
+
+void PS2Runtime::debugBeforeGuestStep(R5900Context *ctx)
+{
+    if (!ctx)
+    {
+        return;
+    }
+
+    const uint32_t pc = normalizeGuestFunctionAddress(ctx->pc);
+    ctx->pc = pc;
+    m_debugPc.store(pc, std::memory_order_relaxed);
+    m_debugRa.store(static_cast<uint32_t>(_mm_extract_epi32(ctx->r[31], 0)),
+                    std::memory_order_relaxed);
+    m_debugSp.store(static_cast<uint32_t>(_mm_extract_epi32(ctx->r[29], 0)),
+                    std::memory_order_relaxed);
+    m_debugGp.store(static_cast<uint32_t>(_mm_extract_epi32(ctx->r[28], 0)),
+                    std::memory_order_relaxed);
+    m_debugEeInstructions.store(ctx->insn_count, std::memory_order_relaxed);
+    m_debugDispatches.fetch_add(1u, std::memory_order_relaxed);
+
+    if (!m_debugControlActive.load(std::memory_order_acquire))
+    {
+        return;
+    }
+
+    const char *stopReason = nullptr;
+    {
+        std::lock_guard<std::mutex> lock(m_debugControlMutex);
+        if (m_debugPauseRequested.load(std::memory_order_acquire))
+        {
+            stopReason = "pause";
+        }
+        else if (m_debugRunUntilActive && pc == m_debugRunUntilPc)
+        {
+            stopReason = "predicate";
+        }
+        else
+        {
+            const bool hasBreakpoint =
+                std::binary_search(m_debugBreakpoints.begin(), m_debugBreakpoints.end(), pc);
+            if (hasBreakpoint)
+            {
+                if (m_debugSkipBreakpoint && m_debugSkipBreakpointPc == pc)
+                {
+                    m_debugSkipBreakpoint = false;
+                }
+                else
+                {
+                    stopReason = "breakpoint";
+                }
+            }
+            else if (m_debugSkipBreakpoint)
+            {
+                m_debugSkipBreakpoint = false;
+            }
+        }
+    }
+
+    if (stopReason)
+    {
+        debugBlockGuestAtBoundary(ctx, stopReason);
+    }
+}
+
+void PS2Runtime::debugAfterGuestStep(R5900Context *ctx)
+{
+    if (ctx)
+    {
+        m_debugRa.store(
+            static_cast<uint32_t>(_mm_extract_epi32(ctx->r[31], 0)),
+            std::memory_order_relaxed);
+        m_debugSp.store(
+            static_cast<uint32_t>(_mm_extract_epi32(ctx->r[29], 0)),
+            std::memory_order_relaxed);
+        m_debugGp.store(
+            static_cast<uint32_t>(_mm_extract_epi32(ctx->r[28], 0)),
+            std::memory_order_relaxed);
+        m_debugEeInstructions.store(
+            ctx->insn_count, std::memory_order_relaxed);
+    }
+
+    if (!m_debugControlActive.load(std::memory_order_acquire))
+    {
+        return;
+    }
+
+    bool stopForStep = false;
+    {
+        std::lock_guard<std::mutex> lock(m_debugControlMutex);
+        if (m_debugStepActive)
+        {
+            if (m_debugStepRemaining > 0u)
+            {
+                --m_debugStepRemaining;
+            }
+            stopForStep = m_debugStepRemaining == 0u;
+        }
+    }
+
+    if (stopForStep)
+    {
+        debugBlockGuestAtBoundary(ctx, "step");
+    }
+}
+
+bool PS2Runtime::debugPause(std::chrono::milliseconds timeout)
+{
+    m_debugControlActive.store(true, std::memory_order_release);
+    bool newlyRequested = false;
+    {
+        std::lock_guard<std::mutex> lock(m_debugControlMutex);
+        if (!m_debugPauseRequested.load(std::memory_order_acquire))
+        {
+            newlyRequested = true;
+            m_debugPauseRequested.store(true, std::memory_order_release);
+            m_debugRunUntilActive = false;
+            m_debugStepActive = false;
+            m_debugStepRemaining = 0u;
+            debugRecordStopLocked("pause", m_debugPc.load(std::memory_order_relaxed));
+            debugRefreshControlActiveLocked();
+        }
+    }
+    m_debugControlCv.notify_all();
+    m_audioBackend.setDebuggerPaused(true);
+
+    const bool locked = m_guestExecutionMutex.try_lock_for(timeout);
+    if (locked)
+    {
+        m_guestExecutionMutex.unlock();
+        return true;
+    }
+
+    if (newlyRequested)
+    {
+        {
+            std::lock_guard<std::mutex> lock(m_debugControlMutex);
+            m_debugPauseRequested.store(false, std::memory_order_release);
+            debugRefreshControlActiveLocked();
+        }
+        m_debugControlCv.notify_all();
+        m_audioBackend.setDebuggerPaused(false);
+    }
+    return false;
+}
+
+void PS2Runtime::debugResume()
+{
+    {
+        std::lock_guard<std::mutex> lock(m_debugControlMutex);
+        if (m_debugLastStop.reason == "breakpoint")
+        {
+            m_debugSkipBreakpoint = true;
+            m_debugSkipBreakpointPc = m_debugLastStop.pc;
+        }
+        m_debugRunUntilActive = false;
+        m_debugStepActive = false;
+        m_debugStepRemaining = 0u;
+        m_debugPauseRequested.store(false, std::memory_order_release);
+        debugRefreshControlActiveLocked();
+    }
+    m_debugControlCv.notify_all();
+    m_audioBackend.setDebuggerPaused(false);
+}
+
+bool PS2Runtime::debugIsPaused() const
+{
+    return m_debugPauseRequested.load(std::memory_order_acquire);
+}
+
+PS2Runtime::DebugStopInfo PS2Runtime::debugRunUntilPc(
+    uint32_t pc, std::chrono::milliseconds timeout)
+{
+    m_debugControlActive.store(true, std::memory_order_release);
+    pc = normalizeGuestFunctionAddress(pc);
+    if (!debugPause(timeout))
+    {
+        return {false, "pause-timeout", m_debugPc.load(std::memory_order_relaxed), 0u};
+    }
+
+    {
+        std::lock_guard<std::mutex> lock(m_debugControlMutex);
+        if (normalizeGuestFunctionAddress(m_debugPc.load(std::memory_order_relaxed)) == pc)
+        {
+            debugRecordStopLocked("already-matched", pc);
+            return m_debugLastStop;
+        }
+    }
+
+    uint64_t baseline = 0u;
+    {
+        std::lock_guard<std::mutex> lock(m_debugControlMutex);
+        baseline = m_debugStopSequence;
+        m_debugRunUntilActive = true;
+        m_debugRunUntilPc = pc;
+        m_debugStepActive = false;
+        m_debugPauseRequested.store(false, std::memory_order_release);
+        debugRefreshControlActiveLocked();
+    }
+    m_debugControlCv.notify_all();
+    m_audioBackend.setDebuggerPaused(false);
+
+    {
+        std::unique_lock<std::mutex> lock(m_debugControlMutex);
+        if (m_debugControlCv.wait_for(lock, timeout, [this, baseline]()
+                                      { return (m_debugStopSequence > baseline &&
+                                                m_debugPauseRequested.load(std::memory_order_acquire)) ||
+                                               isStopRequested(); }))
+        {
+            if (m_debugStopSequence > baseline)
+            {
+                return m_debugLastStop;
+            }
+            return {false, "stopped", m_debugPc.load(std::memory_order_relaxed),
+                    m_debugStopSequence};
+        }
+        m_debugRunUntilActive = false;
+    }
+
+    (void)debugPause(timeout);
+    return {false, "timeout", m_debugPc.load(std::memory_order_relaxed),
+            m_debugStopSequence};
+}
+
+PS2Runtime::DebugStopInfo PS2Runtime::debugStepDispatches(
+    uint64_t count, std::chrono::milliseconds timeout)
+{
+    m_debugControlActive.store(true, std::memory_order_release);
+    if (count == 0u)
+    {
+        return {false, "invalid-count", m_debugPc.load(std::memory_order_relaxed), 0u};
+    }
+    if (!debugPause(timeout))
+    {
+        return {false, "pause-timeout", m_debugPc.load(std::memory_order_relaxed), 0u};
+    }
+
+    uint64_t baseline = 0u;
+    {
+        std::lock_guard<std::mutex> lock(m_debugControlMutex);
+        baseline = m_debugStopSequence;
+        m_debugRunUntilActive = false;
+        m_debugStepActive = true;
+        m_debugStepRemaining = count;
+        m_debugPauseRequested.store(false, std::memory_order_release);
+        debugRefreshControlActiveLocked();
+    }
+    m_debugControlCv.notify_all();
+    m_audioBackend.setDebuggerPaused(false);
+
+    {
+        std::unique_lock<std::mutex> lock(m_debugControlMutex);
+        if (m_debugControlCv.wait_for(lock, timeout, [this, baseline]()
+                                      { return (m_debugStopSequence > baseline &&
+                                                m_debugPauseRequested.load(std::memory_order_acquire)) ||
+                                               isStopRequested(); }))
+        {
+            if (m_debugStopSequence > baseline)
+            {
+                return m_debugLastStop;
+            }
+            return {false, "stopped", m_debugPc.load(std::memory_order_relaxed),
+                    m_debugStopSequence};
+        }
+        m_debugStepActive = false;
+        m_debugStepRemaining = 0u;
+    }
+
+    (void)debugPause(timeout);
+    return {false, "timeout", m_debugPc.load(std::memory_order_relaxed),
+            m_debugStopSequence};
+}
+
+R5900Context PS2Runtime::debugCpuSnapshot()
+{
+    std::lock_guard<std::recursive_timed_mutex> lock(m_guestExecutionMutex);
+    return m_cpuContext;
+}
+
+bool PS2Runtime::debugReadRdram(uint32_t address,
+                                uint32_t size,
+                                std::vector<uint8_t> &output)
+{
+    uint32_t offset = 0u;
+    if (!ps2ResolveDirectRdramOffset(address, offset) ||
+        size > PS2_RAM_SIZE ||
+        offset > (PS2_RAM_SIZE - size) ||
+        !m_memory.getRDRAM())
+    {
+        return false;
+    }
+
+    std::lock_guard<std::recursive_timed_mutex> lock(m_guestExecutionMutex);
+    output.assign(m_memory.getRDRAM() + offset,
+                  m_memory.getRDRAM() + offset + size);
+    return true;
+}
+
+bool PS2Runtime::debugCopyGsVram(std::vector<uint8_t> &output)
+{
+    std::lock_guard<std::recursive_timed_mutex> lock(m_guestExecutionMutex);
+    if (!m_boundGSVram)
+    {
+        return false;
+    }
+    output.assign(m_boundGSVram, m_boundGSVram + PS2_GS_VRAM_SIZE);
+    return true;
+}
+
+PS2Runtime::DebugRuntimeProgress PS2Runtime::debugRuntimeProgress() const
+{
+    DebugRuntimeProgress progress{};
+    progress.dispatches = m_debugDispatches.load(std::memory_order_relaxed);
+    progress.eeInstructions =
+        m_debugEeInstructions.load(std::memory_order_relaxed);
+    progress.pc = m_debugPc.load(std::memory_order_relaxed);
+    progress.ra = m_debugRa.load(std::memory_order_relaxed);
+    progress.sp = m_debugSp.load(std::memory_order_relaxed);
+    progress.gp = m_debugGp.load(std::memory_order_relaxed);
+    progress.guestExecutionWaiters =
+        m_guestExecutionWaiters.load(std::memory_order_relaxed);
+    progress.guestExecutionHandoffTimeouts =
+        m_guestExecutionHandoffTimeouts.load(std::memory_order_relaxed);
+    return progress;
+}
+
+void PS2Runtime::debugRecordBranch(uint32_t pc)
+{
+    const uint64_t sequence =
+        m_debugBranchSequence.fetch_add(1u, std::memory_order_acq_rel) + 1u;
+    DebugBranchSlot &slot =
+        m_debugBranchHistory[(sequence - 1u) % kDebugBranchHistoryCapacity];
+    slot.pc.store(normalizeGuestFunctionAddress(pc), std::memory_order_relaxed);
+    slot.sequence.store(sequence, std::memory_order_release);
+}
+
+std::vector<PS2Runtime::DebugBranchEntry> PS2Runtime::debugBranchHistory(
+    size_t maximumEntries) const
+{
+    maximumEntries =
+        std::min(maximumEntries, kDebugBranchHistoryCapacity);
+    const uint64_t last =
+        m_debugBranchSequence.load(std::memory_order_acquire);
+    const uint64_t count =
+        std::min<uint64_t>(last, static_cast<uint64_t>(maximumEntries));
+    const uint64_t first = last - count + 1u;
+
+    std::vector<DebugBranchEntry> entries;
+    entries.reserve(static_cast<size_t>(count));
+    for (uint64_t sequence = first; sequence <= last && count != 0u;
+         ++sequence)
+    {
+        const DebugBranchSlot &slot =
+            m_debugBranchHistory[(sequence - 1u) %
+                                 kDebugBranchHistoryCapacity];
+        const uint64_t observed =
+            slot.sequence.load(std::memory_order_acquire);
+        if (observed != sequence)
+        {
+            continue;
+        }
+        entries.push_back(
+            {sequence, slot.pc.load(std::memory_order_relaxed)});
+    }
+    return entries;
+}
+
+void PS2Runtime::debugRecordFault(const DebugFaultInfo &fault)
+{
+    DebugFaultInfo copy = fault;
+    copy.active = true;
+    copy.sequence =
+        m_debugFaultSequence.fetch_add(1u, std::memory_order_acq_rel) + 1u;
+    std::lock_guard<std::mutex> lock(m_debugFaultMutex);
+    m_debugFault = std::move(copy);
+}
+
+PS2Runtime::DebugFaultInfo PS2Runtime::debugFaultSnapshot() const
+{
+    std::lock_guard<std::mutex> lock(m_debugFaultMutex);
+    return m_debugFault;
+}
+
+void PS2Runtime::debugClearFault()
+{
+    std::lock_guard<std::mutex> lock(m_debugFaultMutex);
+    m_debugFault = {};
+}
+
+std::vector<uint32_t> PS2Runtime::debugBreakpoints() const
+{
+    std::lock_guard<std::mutex> lock(m_debugControlMutex);
+    return m_debugBreakpoints;
+}
+
+void PS2Runtime::debugAddBreakpoint(uint32_t address)
+{
+    m_debugControlActive.store(true, std::memory_order_release);
+    address = normalizeGuestFunctionAddress(address);
+    std::lock_guard<std::mutex> lock(m_debugControlMutex);
+    const auto position =
+        std::lower_bound(m_debugBreakpoints.begin(), m_debugBreakpoints.end(), address);
+    if (position == m_debugBreakpoints.end() || *position != address)
+    {
+        m_debugBreakpoints.insert(position, address);
+    }
+    debugRefreshControlActiveLocked();
+}
+
+void PS2Runtime::debugRemoveBreakpoint(uint32_t address)
+{
+    address = normalizeGuestFunctionAddress(address);
+    std::lock_guard<std::mutex> lock(m_debugControlMutex);
+    const auto position =
+        std::lower_bound(m_debugBreakpoints.begin(), m_debugBreakpoints.end(), address);
+    if (position != m_debugBreakpoints.end() && *position == address)
+    {
+        m_debugBreakpoints.erase(position);
+    }
+    debugRefreshControlActiveLocked();
+}
+
+std::vector<PS2Runtime::DebugWatchpoint> PS2Runtime::debugWatchpoints() const
+{
+    std::lock_guard<std::mutex> lock(m_debugControlMutex);
+    return m_debugWatchpoints;
+}
+
+uint64_t PS2Runtime::debugAddWatchpoint(uint32_t start,
+                                        uint32_t size,
+                                        DebugMemoryAccess access)
+{
+    if (size == 0u || static_cast<uint64_t>(start) + size > 0x100000000ull)
+    {
+        return 0u;
+    }
+
+    m_debugControlActive.store(true, std::memory_order_release);
+    uint32_t normalized = 0u;
+    if (ps2ResolveDirectRdramOffset(start, normalized))
+    {
+        start = normalized;
+    }
+
+    std::lock_guard<std::mutex> lock(m_debugControlMutex);
+    const uint64_t id = m_debugNextWatchpointId++;
+    m_debugWatchpoints.push_back({id, start, size, access});
+    m_debugWatchpointsActive.store(true, std::memory_order_release);
+    debugRefreshControlActiveLocked();
+    return id;
+}
+
+bool PS2Runtime::debugRemoveWatchpoint(uint64_t id)
+{
+    std::lock_guard<std::mutex> lock(m_debugControlMutex);
+    const auto position = std::find_if(
+        m_debugWatchpoints.begin(), m_debugWatchpoints.end(),
+        [id](const DebugWatchpoint &watchpoint)
+        { return watchpoint.id == id; });
+    if (position == m_debugWatchpoints.end())
+    {
+        return false;
+    }
+    m_debugWatchpoints.erase(position);
+    m_debugWatchpointsActive.store(!m_debugWatchpoints.empty(),
+                                   std::memory_order_release);
+    debugRefreshControlActiveLocked();
+    return true;
+}
+
+bool PS2Runtime::debugWatchpointsEnabled() const
+{
+    return m_debugWatchpointsActive.load(std::memory_order_acquire);
+}
+
+void PS2Runtime::debugObserveMemoryAccess(uint32_t address,
+                                          uint32_t size,
+                                          DebugMemoryAccess access,
+                                          const R5900Context *ctx)
+{
+    if (!debugWatchpointsEnabled() || size == 0u)
+    {
+        return;
+    }
+
+    uint32_t normalized = 0u;
+    if (ps2ResolveDirectRdramOffset(address, normalized))
+    {
+        address = normalized;
+    }
+
+    bool matched = false;
+    {
+        std::lock_guard<std::mutex> lock(m_debugControlMutex);
+        const uint64_t accessBegin = address;
+        const uint64_t accessEnd = accessBegin + size;
+        const uint8_t requested = static_cast<uint8_t>(access);
+        for (const DebugWatchpoint &watchpoint : m_debugWatchpoints)
+        {
+            const uint8_t watched = static_cast<uint8_t>(watchpoint.access);
+            const uint64_t watchBegin = watchpoint.start;
+            const uint64_t watchEnd = watchBegin + watchpoint.size;
+            if ((requested & watched) != 0u &&
+                accessBegin < watchEnd && watchBegin < accessEnd)
+            {
+                matched = true;
+                break;
+            }
+        }
+    }
+
+    if (matched)
+    {
+        debugBlockGuestAtBoundary(const_cast<R5900Context *>(ctx), "watchpoint");
     }
 }
 
@@ -2608,6 +3271,7 @@ bool PS2Runtime::shouldPreemptGuestExecution()
 
 uint8_t PS2Runtime::Load8(uint8_t *rdram, R5900Context *ctx, uint32_t vaddr)
 {
+    debugObserveMemoryAccess(vaddr, 1u, DebugMemoryAccess::Read, ctx);
     try
     {
         return m_memory.read8(vaddr);
@@ -2624,6 +3288,7 @@ uint8_t PS2Runtime::Load8(uint8_t *rdram, R5900Context *ctx, uint32_t vaddr)
 
 uint16_t PS2Runtime::Load16(uint8_t *rdram, R5900Context *ctx, uint32_t vaddr)
 {
+    debugObserveMemoryAccess(vaddr, 2u, DebugMemoryAccess::Read, ctx);
     try
     {
         return m_memory.read16(vaddr);
@@ -2640,6 +3305,7 @@ uint16_t PS2Runtime::Load16(uint8_t *rdram, R5900Context *ctx, uint32_t vaddr)
 
 uint32_t PS2Runtime::Load32(uint8_t *rdram, R5900Context *ctx, uint32_t vaddr)
 {
+    debugObserveMemoryAccess(vaddr, 4u, DebugMemoryAccess::Read, ctx);
     try
     {
         return m_memory.read32(vaddr);
@@ -2656,6 +3322,7 @@ uint32_t PS2Runtime::Load32(uint8_t *rdram, R5900Context *ctx, uint32_t vaddr)
 
 uint64_t PS2Runtime::Load64(uint8_t *rdram, R5900Context *ctx, uint32_t vaddr)
 {
+    debugObserveMemoryAccess(vaddr, 8u, DebugMemoryAccess::Read, ctx);
     try
     {
         return m_memory.read64(vaddr);
@@ -2672,6 +3339,7 @@ uint64_t PS2Runtime::Load64(uint8_t *rdram, R5900Context *ctx, uint32_t vaddr)
 
 __m128i PS2Runtime::Load128(uint8_t *rdram, R5900Context *ctx, uint32_t vaddr)
 {
+    debugObserveMemoryAccess(vaddr, 16u, DebugMemoryAccess::Read, ctx);
     try
     {
         return m_memory.read128(vaddr);
@@ -2688,11 +3356,12 @@ __m128i PS2Runtime::Load128(uint8_t *rdram, R5900Context *ctx, uint32_t vaddr)
 
 void PS2Runtime::Store8(uint8_t *rdram, R5900Context *ctx, uint32_t vaddr, uint8_t value)
 {
+    debugObserveMemoryAccess(vaddr, 1u, DebugMemoryAccess::Write, ctx);
     ps2TraceGuestWrite(rdram, vaddr, 1u, value, 0u, "WRITE8", ctx);
     traceVif0MmioWrite(m_memory, ctx, vaddr, 1u, value, 0u);
     try
     {
-        m_memory.write8(vaddr, value);
+        m_memory.write8(vaddr, value, ctx ? ctx->pc : 0u);
     }
     catch (const PS2TlbMissException &fault)
     {
@@ -2706,11 +3375,12 @@ void PS2Runtime::Store8(uint8_t *rdram, R5900Context *ctx, uint32_t vaddr, uint8
 
 void PS2Runtime::Store16(uint8_t *rdram, R5900Context *ctx, uint32_t vaddr, uint16_t value)
 {
+    debugObserveMemoryAccess(vaddr, 2u, DebugMemoryAccess::Write, ctx);
     ps2TraceGuestWrite(rdram, vaddr, 2u, value, 0u, "WRITE16", ctx);
     traceVif0MmioWrite(m_memory, ctx, vaddr, 2u, value, 0u);
     try
     {
-        m_memory.write16(vaddr, value);
+        m_memory.write16(vaddr, value, ctx ? ctx->pc : 0u);
     }
     catch (const PS2TlbMissException &fault)
     {
@@ -2724,11 +3394,12 @@ void PS2Runtime::Store16(uint8_t *rdram, R5900Context *ctx, uint32_t vaddr, uint
 
 void PS2Runtime::Store32(uint8_t *rdram, R5900Context *ctx, uint32_t vaddr, uint32_t value)
 {
+    debugObserveMemoryAccess(vaddr, 4u, DebugMemoryAccess::Write, ctx);
     ps2TraceGuestWrite(rdram, vaddr, 4u, value, 0u, "WRITE32", ctx);
     traceVif0MmioWrite(m_memory, ctx, vaddr, 4u, value, 0u);
     try
     {
-        m_memory.write32(vaddr, value);
+        m_memory.write32(vaddr, value, ctx ? ctx->pc : 0u);
     }
     catch (const PS2TlbMissException &fault)
     {
@@ -2742,11 +3413,12 @@ void PS2Runtime::Store32(uint8_t *rdram, R5900Context *ctx, uint32_t vaddr, uint
 
 void PS2Runtime::Store64(uint8_t *rdram, R5900Context *ctx, uint32_t vaddr, uint64_t value)
 {
+    debugObserveMemoryAccess(vaddr, 8u, DebugMemoryAccess::Write, ctx);
     ps2TraceGuestWrite(rdram, vaddr, 8u, value, 0u, "WRITE64", ctx);
     traceVif0MmioWrite(m_memory, ctx, vaddr, 8u, value, 0u);
     try
     {
-        m_memory.write64(vaddr, value);
+        m_memory.write64(vaddr, value, ctx ? ctx->pc : 0u);
     }
     catch (const PS2TlbMissException &fault)
     {
@@ -2760,13 +3432,14 @@ void PS2Runtime::Store64(uint8_t *rdram, R5900Context *ctx, uint32_t vaddr, uint
 
 void PS2Runtime::Store128(uint8_t *rdram, R5900Context *ctx, uint32_t vaddr, __m128i value)
 {
+    debugObserveMemoryAccess(vaddr, 16u, DebugMemoryAccess::Write, ctx);
     alignas(16) uint64_t _parts[2];
     _mm_storeu_si128(reinterpret_cast<__m128i *>(_parts), value);
     ps2TraceGuestWrite(rdram, vaddr, 16u, _parts[0], _parts[1], "WRITE128", ctx);
     traceVif0MmioWrite(m_memory, ctx, vaddr, 16u, _parts[0], _parts[1]);
     try
     {
-        m_memory.write128(vaddr, value);
+        m_memory.write128(vaddr, value, ctx ? ctx->pc : 0u);
     }
     catch (const PS2TlbMissException &fault)
     {
@@ -2812,6 +3485,16 @@ void PS2Runtime::kickGifDmaChainFromMMIO(uint8_t *rdram,
 void PS2Runtime::requestStop()
 {
     m_stopRequested.store(true, std::memory_order_relaxed);
+    {
+        std::lock_guard<std::mutex> lock(m_debugControlMutex);
+        m_debugRunUntilActive = false;
+        m_debugStepActive = false;
+        m_debugStepRemaining = 0u;
+        m_debugPauseRequested.store(false, std::memory_order_release);
+        debugRefreshControlActiveLocked();
+    }
+    m_debugControlCv.notify_all();
+    m_audioBackend.setDebuggerPaused(false);
     ps2_syscalls::notifyRuntimeStop();
 }
 

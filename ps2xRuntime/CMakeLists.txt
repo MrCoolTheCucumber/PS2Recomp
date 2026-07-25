@@ -48,6 +48,14 @@ if(ANDROID)
     set(PS2X_IS_ANDROID ON)
 endif()
 
+set(PS2X_DEBUG_SERVER_DEFAULT OFF)
+if(UNIX AND NOT APPLE AND NOT PS2X_IS_VITA AND NOT PS2X_IS_ANDROID)
+    set(PS2X_DEBUG_SERVER_DEFAULT ON)
+endif()
+option(PS2X_ENABLE_DEBUG_SERVER
+    "Build the local ps2dbg JSON-RPC control server"
+    ${PS2X_DEBUG_SERVER_DEFAULT})
+
 option(PS2X_VITA_CREATE_PACKAGE "Create Vita eboot/vpk targets" ON)
 set(PS2X_VITA_APP_NAME "PS2 Retro X" CACHE STRING "Display name for the Vita bubble")
 set(PS2X_VITA_TITLEID "RANJ00001" CACHE STRING "9-character Vita title id")
@@ -83,6 +91,20 @@ else()
         GIT_PROGRESS TRUE
     )
     FetchContent_MakeAvailable(raylib)
+
+    if(PS2X_ENABLE_DEBUG_SERVER)
+        FetchContent_Declare(
+            rapidjson
+            GIT_REPOSITORY https://github.com/Tencent/rapidjson.git
+            # Pinned post-1.1 revision with current C++20/GCC compatibility.
+            GIT_TAG 24b5e7a8b27f42fa16b96fc70aade9106cf7102f
+            GIT_SHALLOW TRUE
+        )
+        FetchContent_GetProperties(rapidjson)
+        if(NOT rapidjson_POPULATED)
+            FetchContent_Populate(rapidjson)
+        endif()
+    endif()
 
     if(NOT PS2X_IS_ANDROID)
     FetchContent_Declare(
@@ -394,6 +416,22 @@ add_library(ps2_runtime STATIC
     src/lib/vu/ps2_vu1_lower.cpp
     src/lib/games_database.cpp
 )
+
+if(PS2X_ENABLE_DEBUG_SERVER)
+    target_sources(ps2_runtime PRIVATE
+        src/lib/ps2_debug_server.cpp
+    )
+    target_include_directories(ps2_runtime PRIVATE
+        "${rapidjson_SOURCE_DIR}/include"
+    )
+    target_compile_definitions(ps2_runtime PUBLIC
+        PS2X_ENABLE_DEBUG_SERVER=1
+    )
+else()
+    target_compile_definitions(ps2_runtime PUBLIC
+        PS2X_ENABLE_DEBUG_SERVER=0
+    )
+endif()
 
 # VU arithmetic observes a runtime-selected rounding mode. Prevent the
 # compiler from assuming round-to-nearest or contracting multiply/add pairs.

@@ -3,6 +3,59 @@
 
 namespace ps2_syscalls
 {
+    std::vector<GuestThreadDebugSnapshot> debugThreadSnapshots()
+    {
+        std::vector<std::pair<int, std::shared_ptr<ThreadInfo>>> threads;
+        {
+            std::lock_guard<std::mutex> lock(g_thread_map_mutex);
+            threads.reserve(g_threads.size());
+            for (const auto &[id, info] : g_threads)
+            {
+                threads.emplace_back(id, info);
+            }
+        }
+
+        std::sort(threads.begin(), threads.end(),
+                  [](const auto &lhs, const auto &rhs)
+                  {
+                      return lhs.first < rhs.first;
+                  });
+
+        std::vector<GuestThreadDebugSnapshot> snapshots;
+        snapshots.reserve(threads.size());
+        for (const auto &[id, info] : threads)
+        {
+            if (!info)
+            {
+                continue;
+            }
+
+            GuestThreadDebugSnapshot snapshot{};
+            snapshot.id = id;
+            {
+                std::lock_guard<std::mutex> lock(info->m);
+                snapshot.entry = info->entry;
+                snapshot.stack = info->stack;
+                snapshot.stackSize = info->stackSize;
+                snapshot.gp = info->gp;
+                snapshot.status = info->status;
+                snapshot.waitType = info->waitType;
+                snapshot.waitId = info->waitId;
+                snapshot.wakeupCount = info->wakeupCount;
+                snapshot.currentPriority = info->currentPriority;
+                snapshot.suspendCount = info->suspendCount;
+                snapshot.started = info->started;
+            }
+            snapshot.pc = info->currentPc.load(std::memory_order_relaxed);
+            snapshot.forceRelease =
+                info->forceRelease.load(std::memory_order_relaxed);
+            snapshot.terminated =
+                info->terminated.load(std::memory_order_relaxed);
+            snapshots.push_back(snapshot);
+        }
+        return snapshots;
+    }
+
     static void applySuspendStatusLocked(ThreadInfo &info)
     {
         if (info.waitType != TSW_NONE)

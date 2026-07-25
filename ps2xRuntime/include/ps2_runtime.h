@@ -18,6 +18,7 @@
 #include <array>
 #include <mutex>
 #include <condition_variable>
+#include <chrono>
 #include <filesystem>
 #include <iostream>
 #include <iomanip>
@@ -41,6 +42,7 @@ namespace ps2x::iop
 
 class PS2IopHostAdapter;
 class PS2IopTransport;
+class PS2DebugServer;
 
 enum PS2Exception
 {
@@ -376,6 +378,68 @@ public:
         SkipCallDebug = 3,
     };
 
+    enum class DebugMemoryAccess : uint8_t
+    {
+        Read = 1u,
+        Write = 2u,
+        ReadWrite = 3u,
+    };
+
+    struct DebugStopInfo
+    {
+        bool completed = false;
+        std::string reason;
+        uint32_t pc = 0u;
+        uint64_t sequence = 0u;
+    };
+
+    struct DebugWatchpoint
+    {
+        uint64_t id = 0u;
+        uint32_t start = 0u;
+        uint32_t size = 0u;
+        DebugMemoryAccess access = DebugMemoryAccess::Write;
+    };
+
+    struct DebugRuntimeProgress
+    {
+        uint64_t dispatches = 0u;
+        uint64_t eeInstructions = 0u;
+        uint32_t pc = 0u;
+        uint32_t ra = 0u;
+        uint32_t sp = 0u;
+        uint32_t gp = 0u;
+        uint32_t guestExecutionWaiters = 0u;
+        uint64_t guestExecutionHandoffTimeouts = 0u;
+    };
+
+    struct DebugBranchEntry
+    {
+        uint64_t sequence = 0u;
+        uint32_t pc = 0u;
+    };
+
+    struct DebugFaultInfo
+    {
+        bool active = false;
+        uint64_t sequence = 0u;
+        std::string type;
+        std::string operation;
+        GuestBranchKind branchKind = GuestBranchKind::IndirectJump;
+        uint32_t sourcePc = 0u;
+        uint32_t targetPc = 0u;
+        uint32_t pc = 0u;
+        uint32_t ra = 0u;
+        uint32_t sp = 0u;
+        uint32_t gp = 0u;
+        uint32_t a0 = 0u;
+        uint32_t a1 = 0u;
+        uint32_t v0 = 0u;
+        uint32_t v1 = 0u;
+        bool codeRegion = false;
+        MissingFunctionPolicy policy = MissingFunctionPolicy::ContinueToTarget;
+    };
+
     class GuestExecutionScope
     {
     public:
@@ -489,6 +553,35 @@ public:
     void requestStop();
     bool isStopRequested() const;
 
+    // Debug-control operations are intentionally backend-neutral. They are used
+    // by the local ps2dbg server and by focused runtime tests.
+    bool debugPause(std::chrono::milliseconds timeout = std::chrono::seconds(30));
+    void debugResume();
+    bool debugIsPaused() const;
+    DebugStopInfo debugRunUntilPc(uint32_t pc, std::chrono::milliseconds timeout);
+    DebugStopInfo debugStepDispatches(uint64_t count, std::chrono::milliseconds timeout);
+    R5900Context debugCpuSnapshot();
+    bool debugReadRdram(uint32_t address, uint32_t size, std::vector<uint8_t> &output);
+    bool debugCopyGsVram(std::vector<uint8_t> &output);
+    DebugRuntimeProgress debugRuntimeProgress() const;
+    std::vector<DebugBranchEntry> debugBranchHistory(
+        size_t maximumEntries = 256u) const;
+    DebugFaultInfo debugFaultSnapshot() const;
+    void debugClearFault();
+
+    std::vector<uint32_t> debugBreakpoints() const;
+    void debugAddBreakpoint(uint32_t address);
+    void debugRemoveBreakpoint(uint32_t address);
+
+    std::vector<DebugWatchpoint> debugWatchpoints() const;
+    uint64_t debugAddWatchpoint(uint32_t start, uint32_t size, DebugMemoryAccess access);
+    bool debugRemoveWatchpoint(uint64_t id);
+    bool debugWatchpointsEnabled() const;
+    void debugObserveMemoryAccess(uint32_t address,
+                                  uint32_t size,
+                                  DebugMemoryAccess access,
+                                  const R5900Context *ctx);
+
     uint32_t guestExecutionWaiterCountForTesting() const
     {
         return m_guestExecutionWaiters.load(std::memory_order_acquire);
@@ -567,6 +660,14 @@ private:
     uint32_t releaseGuestExecution();
     void reacquireGuestExecution(uint32_t depth);
     void markGuestExecutionAcquired();
+    void debugBeforeGuestStep(R5900Context *ctx);
+    void debugAfterGuestStep(R5900Context *ctx);
+    void debugBlockGuestAtBoundary(R5900Context *ctx, const char *reason);
+    void debugWaitUntilResumed();
+    void debugRecordStopLocked(const char *reason, uint32_t pc);
+    void debugRefreshControlActiveLocked();
+    void debugRecordBranch(uint32_t pc);
+    void debugRecordFault(const DebugFaultInfo &fault);
 
     [[noreturn]] void HandleIntegerOverflow(R5900Context *ctx);
 
@@ -578,6 +679,7 @@ private:
     friend class GuestExecutionScope;
     friend class GuestExecutionReleaseScope;
     friend class PS2IopTransport;
+    friend class PS2DebugServer;
 
 private:
     PS2Memory m_memory;
@@ -590,7 +692,7 @@ private:
     VU1Interpreter m_vu0;
     VU1Interpreter m_vu1;
     R5900Context m_cpuContext;
-    mutable std::recursive_mutex m_guestExecutionMutex;
+    mutable std::recursive_timed_mutex m_guestExecutionMutex;
     mutable std::atomic<uint32_t> m_guestExecutionWaiters{0u};
     mutable std::mutex m_guestExecutionHandoffMutex;
     mutable std::condition_variable m_guestExecutionHandoffCv;
@@ -610,6 +712,36 @@ private:
     std::atomic<uint32_t> m_missingFunctionPolicy{static_cast<uint32_t>(MissingFunctionPolicy::ContinueToTarget)};
     std::atomic<bool> m_missingFunctionReported{false};
     std::atomic<bool> m_stopRequested{false};
+    std::atomic<bool> m_debugControlActive{false};
+    std::atomic<bool> m_debugPauseRequested{false};
+    std::atomic<bool> m_debugWatchpointsActive{false};
+    std::atomic<uint64_t> m_debugDispatches{0u};
+    std::atomic<uint64_t> m_debugEeInstructions{0u};
+    static constexpr size_t kDebugBranchHistoryCapacity = 256u;
+    struct DebugBranchSlot
+    {
+        std::atomic<uint64_t> sequence{0u};
+        std::atomic<uint32_t> pc{0u};
+    };
+    std::array<DebugBranchSlot, kDebugBranchHistoryCapacity>
+        m_debugBranchHistory{};
+    std::atomic<uint64_t> m_debugBranchSequence{0u};
+    mutable std::mutex m_debugFaultMutex;
+    DebugFaultInfo m_debugFault{};
+    std::atomic<uint64_t> m_debugFaultSequence{0u};
+    mutable std::mutex m_debugControlMutex;
+    mutable std::condition_variable m_debugControlCv;
+    uint64_t m_debugStopSequence = 0u;
+    DebugStopInfo m_debugLastStop{};
+    bool m_debugRunUntilActive = false;
+    uint32_t m_debugRunUntilPc = 0u;
+    bool m_debugStepActive = false;
+    uint64_t m_debugStepRemaining = 0u;
+    bool m_debugSkipBreakpoint = false;
+    uint32_t m_debugSkipBreakpointPc = 0u;
+    std::vector<uint32_t> m_debugBreakpoints;
+    std::vector<DebugWatchpoint> m_debugWatchpoints;
+    uint64_t m_debugNextWatchpointId = 1u;
     DebugUiCallback m_debugUiInitCallback = nullptr;
     DebugUiCallback m_debugUiDrawCallback = nullptr;
     DebugUiCallback m_debugUiShutdownCallback = nullptr;
@@ -634,6 +766,9 @@ private:
     std::vector<LoadedModule> m_loadedModules;
     uint8_t *m_boundRdram = nullptr;
     uint8_t *m_boundGSVram = nullptr;
+#if defined(PS2X_ENABLE_DEBUG_SERVER) && PS2X_ENABLE_DEBUG_SERVER
+    std::unique_ptr<PS2DebugServer> m_debugServer;
+#endif
 };
 
 // Generated by ps2xRecomp in ps2xRuntime/src/runner/register_functions.cpp.

@@ -38,8 +38,22 @@ public:
 
 private:
     struct ParallelState;
+    class DebugProgressScope
+    {
+    public:
+        DebugProgressScope(GSRasterizer &rasterizer, GS *owner);
+        ~DebugProgressScope();
+
+        DebugProgressScope(const DebugProgressScope &) = delete;
+        DebugProgressScope &operator=(const DebugProgressScope &) = delete;
+
+    private:
+        GSRasterizer &m_rasterizer;
+    };
 
     bool tryQueuePrimitive(GS *gs);
+    void beginDebugProgress(GS *owner);
+    void endDebugProgress();
     void renderQueuedPrimitive(GS *renderGs,
                                size_t commandIndex,
                                uint32_t workerIndex,
@@ -83,6 +97,9 @@ private:
     std::unique_ptr<ParallelState> m_parallelState;
     uint32_t m_scanlineWorkerIndex = 0u;
     uint32_t m_scanlineWorkerCount = 1u;
+    GS *m_debugProgressOwner = nullptr;
+    uint64_t m_debugCandidatePixelBatch = 0u;
+    bool m_trackDebugProgress = false;
 };
 
 #endif

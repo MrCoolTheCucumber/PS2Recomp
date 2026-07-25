@@ -49,7 +49,7 @@ namespace ps2recomp
                     "const uint64_t _lo = static_cast<uint64_t>(PS2_EXTRACT_EPI64_0(_value)); "
                     "const uint64_t _hi = static_cast<uint64_t>(PS2_EXTRACT_EPI64_1(_value)); "
                     "ps2TraceGuestWrite(rdram, {}, 16u, _lo, _hi, \"WRITE128\", ctx); "
-                    "FAST_WRITE128({}, _value); }} while (0)",
+                    "DEBUG_FAST_WRITE128({}, _value); }} while (0)",
                     val, addr, addr);
             }
 
@@ -57,7 +57,7 @@ namespace ps2recomp
             return fmt::format(
                 "do {{ {} _value = static_cast<{}>({}); "
                 "ps2TraceGuestWrite(rdram, {}, {}u, _value, 0u, \"WRITE{}\", ctx); "
-                "FAST_WRITE{}({}, _value); }} while (0)",
+                "DEBUG_FAST_WRITE{}({}, _value); }} while (0)",
                 valueType, valueType, val, addr, memoryAccessSize(width), width, width, addr);
         }
     }
@@ -93,7 +93,7 @@ namespace ps2recomp
             {
                 return fmt::format("runtime->Load{}(rdram, ctx, {})", width, resolvedAddressExpr);
             }
-            return fmt::format("FAST_READ{}({})", width, resolvedAddressExpr);
+            return fmt::format("DEBUG_FAST_READ{}({})", width, resolvedAddressExpr);
         }
 
         if (inst.isMmio)

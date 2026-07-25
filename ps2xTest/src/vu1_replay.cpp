@@ -5,14 +5,23 @@
 #include <array>
 #include <cstdint>
 #include <cstring>
+#include <filesystem>
 #include <fstream>
 #include <iomanip>
 #include <iostream>
 #include <string>
+#include <string_view>
 #include <vector>
 
 namespace
 {
+    struct FixturePaths
+    {
+        std::filesystem::path data;
+        std::filesystem::path micro;
+        std::filesystem::path state;
+    };
+
     bool readFile(const std::string &path, void *destination, size_t size)
     {
         std::ifstream input(path, std::ios::binary);
@@ -26,6 +35,55 @@ namespace
         std::memcpy(&bits, &value, sizeof(bits));
         return bits;
     }
+
+    bool resolveFixture(const std::filesystem::path &directory,
+                        FixturePaths &paths)
+    {
+        const FixturePaths standard{
+            directory / "vu1-data.bin",
+            directory / "vu1-code.bin",
+            directory / "vu1-replay-state.bin",
+        };
+        if (std::filesystem::is_regular_file(standard.data) &&
+            std::filesystem::is_regular_file(standard.micro) &&
+            std::filesystem::is_regular_file(standard.state))
+        {
+            paths = standard;
+            return true;
+        }
+
+        std::vector<FixturePaths> candidates;
+        std::error_code error;
+        for (const auto &entry :
+             std::filesystem::directory_iterator(directory, error))
+        {
+            if (error || !entry.is_regular_file())
+                continue;
+            const std::string filename =
+                entry.path().filename().string();
+            constexpr std::string_view suffix = "-state.bin";
+            if (!filename.ends_with(suffix))
+                continue;
+            const std::string prefix =
+                filename.substr(0u, filename.size() - suffix.size());
+            FixturePaths candidate{
+                directory / (prefix + "-data.bin"),
+                directory / (prefix + "-micro.bin"),
+                entry.path(),
+            };
+            if (!std::filesystem::is_regular_file(candidate.micro))
+                candidate.micro = directory / (prefix + "-code.bin");
+            if (std::filesystem::is_regular_file(candidate.data) &&
+                std::filesystem::is_regular_file(candidate.micro))
+            {
+                candidates.push_back(std::move(candidate));
+            }
+        }
+        if (candidates.size() != 1u)
+            return false;
+        paths = std::move(candidates.front());
+        return true;
+    }
 }
 
 int main(int argc, char **argv)
@@ -37,14 +95,23 @@ int main(int argc, char **argv)
         return 2;
     }
 
-    const std::string directory = argv[1];
+    const std::filesystem::path directory = argv[1];
     const uint32_t maxCycles = static_cast<uint32_t>(std::stoul(argv[2]));
+    FixturePaths fixture;
+    if (!resolveFixture(directory, fixture))
+    {
+        std::cerr
+            << "fixture directory must contain vu1-data.bin, "
+               "vu1-code.bin, and vu1-replay-state.bin, or exactly one "
+               "matching *-data/*-micro/*-state set\n";
+        return 2;
+    }
     std::array<uint8_t, PS2_VU1_DATA_SIZE> initialData{};
     std::array<uint8_t, PS2_VU1_CODE_SIZE> micro{};
     std::array<uint32_t, 159> stateWords{};
-    if (!readFile(directory + "/ordinal-2256-data.bin", initialData.data(), initialData.size()) ||
-        !readFile(directory + "/ordinal-2256-micro.bin", micro.data(), micro.size()) ||
-        !readFile(directory + "/ordinal-2256-state.bin", stateWords.data(), stateWords.size() * sizeof(uint32_t)))
+    if (!readFile(fixture.data.string(), initialData.data(), initialData.size()) ||
+        !readFile(fixture.micro.string(), micro.data(), micro.size()) ||
+        !readFile(fixture.state.string(), stateWords.data(), stateWords.size() * sizeof(uint32_t)))
     {
         std::cerr << "failed to read replay fixture\n";
         return 2;
@@ -106,7 +173,9 @@ int main(int argc, char **argv)
     }
 
     std::cout << std::hex << std::setfill('0');
-    std::cout << "{\"pc\":\"0x" << std::setw(4) << state.pc << "\",\"vi\":[";
+    std::cout << "{\"schema_version\":1,\"pc\":\"0x"
+              << std::setw(4) << state.pc << "\",\"gif_bytes\":"
+              << std::dec << gifOutput.size() << std::hex << ",\"vi\":[";
     for (size_t index = 0; index < 16; ++index)
         std::cout << (index == 0 ? "" : ",") << "\"0x" << std::setw(4)
                   << (static_cast<uint32_t>(state.vi[index]) & 0xffffu) << "\"";

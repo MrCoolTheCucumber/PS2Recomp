@@ -1,6 +1,7 @@
 #ifndef PS2_VU1_H
 #define PS2_VU1_H
 
+#include <atomic>
 #include <cstdint>
 #include <vector>
 
@@ -32,6 +33,15 @@ struct VU1State
     int32_t viBackupValue;
 };
 
+struct VU1ProgressSnapshot
+{
+    bool enabled = false;
+    bool active = false;
+    uint64_t invocations = 0;
+    uint64_t cycles = 0;
+    uint32_t pc = 0;
+};
+
 class VU1Interpreter
 {
 public:
@@ -52,6 +62,8 @@ public:
 
     VU1State &state() { return m_state; }
     const VU1State &state() const { return m_state; }
+    VU1ProgressSnapshot getProgressSnapshot() const;
+    void setProgressTrackingEnabled(bool enabled);
 
 private:
     struct DecodedInstructionPair
@@ -82,6 +94,11 @@ private:
     uint32_t m_cachedCodeSize = 0;
     uint64_t m_cachedCodeGeneration = 0;
     bool m_decodedCodeCacheValid = false;
+    std::atomic<bool> m_progressTrackingEnabled{false};
+    std::atomic<uint32_t> m_progressActive{0};
+    std::atomic<uint64_t> m_progressInvocations{0};
+    std::atomic<uint64_t> m_progressCycles{0};
+    std::atomic<uint32_t> m_progressPc{0};
 
     void run(uint8_t *vuCode, uint32_t codeSize,
              uint8_t *vuData, uint32_t dataSize,

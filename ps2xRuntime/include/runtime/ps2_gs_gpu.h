@@ -1,10 +1,12 @@
 #ifndef PS2_GS_GPU_H
 #define PS2_GS_GPU_H
 
+#include <atomic>
 #include <array>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <deque>
 #include <mutex>
 #include <vector>
 
@@ -232,6 +234,9 @@ struct GSDebugSnapshot
     GSPrimReg prim{};
     GSTexaReg texa{};
     GSTexClutReg texclut{};
+    uint32_t fogColor = 0;
+    bool prmodecont = true;
+    bool pabe = false;
     GSBitBltBuf bitbltbuf{};
     GSTrxPos trxpos{};
     GSTrxReg trxreg{};
@@ -251,6 +256,17 @@ struct GSDebugSnapshot
     bool hostPresentationUsedPreferred = false;
     bool hasHostPresentationFrame = false;
     size_t localToHostPendingBytes = 0;
+};
+
+struct GSProgressSnapshot
+{
+    bool enabled = false;
+    uint64_t drawsStarted = 0;
+    uint64_t drawsCompleted = 0;
+    uint64_t candidatePixels = 0;
+    uint64_t presentations = 0;
+    uint32_t activeDraws = 0;
+    uint32_t activePrimitive = 0;
 };
 
 enum class GSDebugEventKind : uint8_t
@@ -342,7 +358,14 @@ public:
         return m_ctx[(index != 0) ? 1 : 0].frame;
     }
     GSDebugSnapshot getDebugSnapshot() const;
+    GSProgressSnapshot getProgressSnapshot() const;
+    void setProgressTrackingEnabled(bool enabled);
     std::vector<GSDebugHistoryEntry> getDebugHistory() const;
+    void copyRecentGifPackets(size_t limit,
+                              std::vector<uint8_t> &outStream,
+                              std::vector<uint32_t> &outSizes,
+                              std::vector<uint8_t> &outInitialVram,
+                              GSDebugSnapshot *outInitialState) const;
     void clearDebugHistory();
     bool isDebugHistoryPaused() const;
     void setDebugHistoryPaused(bool paused);
@@ -460,12 +483,24 @@ private:
     bool m_hasHostPresentationFrame = false;
     uint64_t m_nativeImageUploadCount = 0;
     uint64_t m_nativePackedGIFPacketCount = 0;
+    std::atomic<bool> m_progressTrackingEnabled{false};
+    std::atomic<uint64_t> m_progressDrawsStarted{0};
+    std::atomic<uint64_t> m_progressDrawsCompleted{0};
+    std::atomic<uint64_t> m_progressCandidatePixels{0};
+    std::atomic<uint64_t> m_progressPresentations{0};
+    std::atomic<uint32_t> m_progressActiveDraws{0};
+    std::atomic<uint32_t> m_progressActivePrimitive{0};
 
     std::vector<uint8_t> m_localToHostBuffer;
     size_t m_localToHostReadPos = 0;
 
     static constexpr size_t kDebugHistoryCapacity = 512;
+    static constexpr size_t kDebugGifCaptureBytes = 16u * 1024u * 1024u;
     std::array<GSDebugHistoryEntry, kDebugHistoryCapacity> m_debugHistory{};
+    std::deque<std::vector<uint8_t>> m_debugGifPackets;
+    size_t m_debugGifPacketBytes = 0;
+    std::vector<uint8_t> m_debugGifInitialVram;
+    GSDebugSnapshot m_debugGifInitialState{};
     size_t m_debugHistoryWrite = 0;
     size_t m_debugHistoryCount = 0;
     uint64_t m_debugNextSeq = 1;

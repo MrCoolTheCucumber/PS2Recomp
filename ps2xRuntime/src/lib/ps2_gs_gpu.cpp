@@ -672,9 +672,19 @@ void GS::reset()
     m_hostPresentationSourceFbp = 0u;
     m_hostPresentationUsedPreferred = false;
     m_hasHostPresentationFrame = false;
+    m_progressDrawsStarted.store(0u, std::memory_order_relaxed);
+    m_progressDrawsCompleted.store(0u, std::memory_order_relaxed);
+    m_progressCandidatePixels.store(0u, std::memory_order_relaxed);
+    m_progressPresentations.store(0u, std::memory_order_relaxed);
+    m_progressActiveDraws.store(0u, std::memory_order_relaxed);
+    m_progressActivePrimitive.store(0u, std::memory_order_relaxed);
 
     m_debugHistoryWrite = 0;
     m_debugHistoryCount = 0;
+    m_debugGifPackets.clear();
+    m_debugGifPacketBytes = 0u;
+    m_debugGifInitialVram.clear();
+    m_debugGifInitialState = {};
     m_debugNextSeq = 1;
     m_debugFrameIndex = 0;
     m_debugLastVsyncTick = UINT64_MAX;
@@ -725,6 +735,9 @@ GSDebugSnapshot GS::getDebugSnapshot() const
     snapshot.prim = m_prim;
     snapshot.texa = m_texa;
     snapshot.texclut = m_texclut;
+    snapshot.fogColor = m_fogColor;
+    snapshot.prmodecont = m_prmodecont;
+    snapshot.pabe = m_pabe;
     snapshot.bitbltbuf = m_bitbltbuf;
     snapshot.trxpos = m_trxpos;
     snapshot.trxreg = m_trxreg;
@@ -749,6 +762,31 @@ GSDebugSnapshot GS::getDebugSnapshot() const
     return snapshot;
 }
 
+GSProgressSnapshot GS::getProgressSnapshot() const
+{
+    GSProgressSnapshot snapshot{};
+    snapshot.enabled =
+        m_progressTrackingEnabled.load(std::memory_order_relaxed);
+    snapshot.drawsStarted =
+        m_progressDrawsStarted.load(std::memory_order_relaxed);
+    snapshot.drawsCompleted =
+        m_progressDrawsCompleted.load(std::memory_order_relaxed);
+    snapshot.candidatePixels =
+        m_progressCandidatePixels.load(std::memory_order_relaxed);
+    snapshot.presentations =
+        m_progressPresentations.load(std::memory_order_relaxed);
+    snapshot.activeDraws =
+        m_progressActiveDraws.load(std::memory_order_relaxed);
+    snapshot.activePrimitive =
+        m_progressActivePrimitive.load(std::memory_order_relaxed);
+    return snapshot;
+}
+
+void GS::setProgressTrackingEnabled(bool enabled)
+{
+    m_progressTrackingEnabled.store(enabled, std::memory_order_release);
+}
+
 
 std::vector<GSDebugHistoryEntry> GS::getDebugHistory() const
 {
@@ -764,11 +802,45 @@ std::vector<GSDebugHistoryEntry> GS::getDebugHistory() const
     return out;
 }
 
+void GS::copyRecentGifPackets(size_t limit,
+                              std::vector<uint8_t> &outStream,
+                              std::vector<uint32_t> &outSizes,
+                              std::vector<uint8_t> &outInitialVram,
+                              GSDebugSnapshot *outInitialState) const
+{
+    std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
+    // The initial state belongs to the first retained packet, so always copy
+    // the complete bounded segment.
+    (void)limit;
+    const size_t count = m_debugGifPackets.size();
+    const size_t begin = m_debugGifPackets.size() - count;
+    size_t total = 0u;
+    for (size_t index = begin; index < m_debugGifPackets.size(); ++index)
+        total += m_debugGifPackets[index].size();
+    outStream.clear();
+    outSizes.clear();
+    outInitialVram = m_debugGifInitialVram;
+    if (outInitialState)
+        *outInitialState = m_debugGifInitialState;
+    outStream.reserve(total);
+    outSizes.reserve(count);
+    for (size_t index = begin; index < m_debugGifPackets.size(); ++index)
+    {
+        const std::vector<uint8_t> &packet = m_debugGifPackets[index];
+        outStream.insert(outStream.end(), packet.begin(), packet.end());
+        outSizes.push_back(static_cast<uint32_t>(packet.size()));
+    }
+}
+
 void GS::clearDebugHistory()
 {
     std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
     m_debugHistoryWrite = 0;
     m_debugHistoryCount = 0;
+    m_debugGifPackets.clear();
+    m_debugGifPacketBytes = 0u;
+    m_debugGifInitialVram.clear();
+    m_debugGifInitialState = {};
     m_debugNextSeq = 1;
     m_debugFrameIndex = 0;
     m_debugLastVsyncTick = UINT64_MAX;
@@ -1375,6 +1447,7 @@ void GS::latchHostPresentationFrameUnlocked()
             m_hostPresentationSourceFbp = selectedFrame1.fbp;
             m_hostPresentationUsedPreferred = false;
             m_hasHostPresentationFrame = true;
+            m_progressPresentations.fetch_add(1u, std::memory_order_relaxed);
             recordPresentDebugEventUnlocked(m_hostPresentationDisplayFbp,
                                             m_hostPresentationSourceFbp,
                                             m_hostPresentationWidth,
@@ -1418,6 +1491,7 @@ void GS::latchHostPresentationFrameUnlocked()
     m_hostPresentationSourceFbp = selectedFrame.fbp;
     m_hostPresentationUsedPreferred = usedPreferred;
     m_hasHostPresentationFrame = true;
+    m_progressPresentations.fetch_add(1u, std::memory_order_relaxed);
     recordPresentDebugEventUnlocked(m_hostPresentationDisplayFbp,
                                     m_hostPresentationSourceFbp,
                                     m_hostPresentationWidth,
@@ -1511,6 +1585,24 @@ void GS::processGIFPacket(const uint8_t *data, uint32_t sizeBytes)
     std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
     if (!data || sizeBytes < 16 || !m_vram)
         return;
+
+    if (!m_debugHistoryPaused &&
+        sizeBytes <= kDebugGifCaptureBytes)
+    {
+        const bool restart =
+            m_debugGifPackets.empty() ||
+            m_debugGifPacketBytes + sizeBytes > kDebugGifCaptureBytes ||
+            m_debugGifPackets.size() >= kDebugHistoryCapacity;
+        if (restart)
+        {
+            m_debugGifPackets.clear();
+            m_debugGifPacketBytes = 0u;
+            m_debugGifInitialVram.assign(m_vram, m_vram + m_vramSize);
+            m_debugGifInitialState = getDebugSnapshot();
+        }
+        m_debugGifPackets.emplace_back(data, data + sizeBytes);
+        m_debugGifPacketBytes += sizeBytes;
+    }
 
     if (tryProcessNativeImageUploadPacket(data, sizeBytes))
         return;

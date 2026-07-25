@@ -451,10 +451,10 @@ void register_code_generator_tests()
         std::string generated = gen.generateFunction(func, instructions, false);
         printGeneratedCode("constant RDRAM load and store emit fast memory access", generated);
 
-        t.IsTrue(generated.find("SET_GPR_S32(ctx, 3, (int32_t)FAST_READ32(0x123460u));") != std::string::npos,
-                 "constant RDRAM LW should emit FAST_READ32 with the resolved address");
-        t.IsTrue(generated.find("FAST_WRITE32(0x123464u, _value);") != std::string::npos,
-                 "constant RDRAM SW should emit FAST_WRITE32 with the resolved address");
+        t.IsTrue(generated.find("SET_GPR_S32(ctx, 3, (int32_t)DEBUG_FAST_READ32(0x123460u));") != std::string::npos,
+                 "constant RDRAM LW should emit a watchpoint-aware fast read");
+        t.IsTrue(generated.find("DEBUG_FAST_WRITE32(0x123464u, _value);") != std::string::npos,
+                 "constant RDRAM SW should emit a watchpoint-aware fast write");
         t.IsTrue(generated.find("READ32(ADD32(GPR_U32(ctx, 1)") == std::string::npos,
                  "constant RDRAM LW should not go through READ32 address classification");
         t.IsTrue(generated.find("WRITE32(ADD32(GPR_U32(ctx, 1)") == std::string::npos,
@@ -513,9 +513,9 @@ void register_code_generator_tests()
         const std::string constantLq = gen.translateInstruction(lq, unalignedHint);
         const std::string constantSq = gen.translateInstruction(sq, unalignedHint);
 
-        t.IsTrue(constantLq.find("FAST_READ128(0x123450u)") != std::string::npos,
+        t.IsTrue(constantLq.find("DEBUG_FAST_READ128(0x123450u)") != std::string::npos,
                  "constant LQ hint should be aligned before selecting the fast path");
-        t.IsTrue(constantSq.find("FAST_WRITE128(0x123450u, _value)") != std::string::npos,
+        t.IsTrue(constantSq.find("DEBUG_FAST_WRITE128(0x123450u, _value)") != std::string::npos,
                  "constant SQ hint should be aligned before selecting the fast path");
         t.IsTrue(constantLq.find("runtime->Load128") == std::string::npos,
                  "silently aligned LQ should not be treated as an address error");

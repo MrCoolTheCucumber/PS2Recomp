@@ -8,6 +8,7 @@
 #include <cstdint>
 #include <cstring>
 #include <string>
+#include <vector>
 
 std::string translatePs2Path(const char *ps2Path);
 
@@ -17,6 +18,25 @@ inline std::mutex g_sys_fd_mutex;
 
 namespace ps2_syscalls
 {
+    struct GuestThreadDebugSnapshot
+    {
+        int id = 0;
+        uint32_t entry = 0u;
+        uint32_t stack = 0u;
+        uint32_t stackSize = 0u;
+        uint32_t gp = 0u;
+        uint32_t pc = 0u;
+        int status = 0;
+        int waitType = 0;
+        int waitId = 0;
+        int wakeupCount = 0;
+        int currentPriority = 0;
+        int suspendCount = 0;
+        bool started = false;
+        bool forceRelease = false;
+        bool terminated = false;
+    };
+
 #define PS2_DECLARE_SYSCALL(name) void name(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
     PS2_SYSCALL_LIST(PS2_DECLARE_SYSCALL)
 #undef PS2_DECLARE_SYSCALL
@@ -38,7 +58,7 @@ namespace ps2_syscalls
     uint64_t GetCurrentVSyncTick();
     uint64_t WaitForNextVSyncTick(uint8_t *rdram, PS2Runtime *runtime);
     void WaitVSyncTick(uint8_t *rdram, PS2Runtime *runtime);
+    std::vector<GuestThreadDebugSnapshot> debugThreadSnapshots();
 }
 
 #endif // PS2_SYSCALLS_H
-
