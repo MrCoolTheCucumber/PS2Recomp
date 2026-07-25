@@ -770,77 +770,40 @@ namespace ps2_stubs
 
     void sceGsExecLoadImage(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
-        uint32_t imgAddr = getRegU32(ctx, 4);
-        uint32_t srcAddr = getRegU32(ctx, 5);
-
-        GsImageMem img{};
-        if (!runtime || !runtime->syncCoreSubsystems() || !readGsImage(rdram, imgAddr, img))
+        const uint32_t packetAddr = getRegU32(ctx, 4);
+        const uint32_t srcAddr = getRegU32(ctx, 5);
+        const uint8_t *const packet = getConstMemPtr(rdram, packetAddr);
+        if (!runtime || !runtime->syncCoreSubsystems() || !packet ||
+            !getConstMemPtr(rdram, srcAddr))
         {
             setReturnS32(ctx, -1);
             return;
         }
 
-        const uint32_t rowBytes = bytesForPixels(img.psm, static_cast<uint32_t>(img.width));
-        if (rowBytes == 0)
-        {
-            setReturnS32(ctx, -1);
-            return;
-        }
-
-        uint32_t fbw = img.vram_width ? img.vram_width : std::max<uint32_t>(1, (img.width + 63) / 64);
-        const uint32_t totalImageBytes = rowBytes * static_cast<uint32_t>(img.height);
-        const uint32_t headerQwc = 6u;
-        const uint32_t imageQwc = (totalImageBytes + 15u) / 16u;
-        const uint32_t totalQwc = headerQwc + imageQwc;
-
-        uint32_t pktAddr = runtime->guestMalloc(totalQwc * 16u, 16u);
-        if (pktAddr == 0)
-        {
-            setReturnS32(ctx, -1);
-            return;
-        }
-
-        uint8_t *pkt = getMemPtr(rdram, pktAddr);
-        const uint8_t *src = getConstMemPtr(rdram, srcAddr);
-        if (!pkt || !src)
-        {
-            runtime->guestFree(pktAddr);
-            setReturnS32(ctx, -1);
-            return;
-        }
-
-        uint32_t dbp = (static_cast<uint32_t>(img.vram_addr) * 2048u) / 256u;
-        uint32_t dsax = static_cast<uint32_t>(img.x);
-        uint32_t dsay = static_cast<uint32_t>(img.y);
-
-        // Full messy
-        uint64_t *q = reinterpret_cast<uint64_t *>(pkt);
-        q[0] = makeGiftagAplusD(4u);
-        q[1] = 0xEULL;
-        q[2] = (static_cast<uint64_t>(img.psm & 0x3Fu) << 24) | (static_cast<uint64_t>(1u) << 16) |
-               (static_cast<uint64_t>(dbp & 0x3FFFu) << 32) | (static_cast<uint64_t>(fbw & 0x3Fu) << 48) |
-               (static_cast<uint64_t>(img.psm & 0x3Fu) << 56);
-        q[3] = 0x50ULL;
-        q[4] = (static_cast<uint64_t>(dsay & 0x7FFu) << 48) | (static_cast<uint64_t>(dsax & 0x7FFu) << 32);
-        q[5] = 0x51ULL;
-        q[6] = (static_cast<uint64_t>(img.height) << 32) | static_cast<uint64_t>(img.width);
-        q[7] = 0x52ULL;
-        q[8] = 0ULL;
-        q[9] = 0x53ULL;
-        q[10] = (static_cast<uint64_t>(2) << 58) | (static_cast<uint64_t>(imageQwc) & 0x7FFF) |
-                (1ULL << 15);
-        q[11] = 0ULL;
-
-        std::memcpy(pkt + headerQwc * 16u, src, totalImageBytes);
+        // sceGsSetDefLoadImage builds a six-QW setup packet. Its final QW is
+        // an IMAGE GIFtag whose NLOOP is the QWC of the separate pixel DMA.
+        // Sony's implementation submits these as two normal-mode GIF DMAs;
+        // preserving that split is important for callers that reuse or patch
+        // the setup packet.
+        uint64_t imageTag = 0u;
+        std::memcpy(&imageTag, packet + 0x50u, sizeof(imageTag));
+        const uint32_t imageQwc = static_cast<uint32_t>(imageTag & 0x7FFFu);
 
         constexpr uint32_t GIF_CHANNEL = 0x1000A000;
         constexpr uint32_t CHCR_STR_MODE0 = 0x101u;
         auto &mem = runtime->memory();
-        mem.writeIORegister(GIF_CHANNEL + 0x10u, pktAddr);
-        mem.writeIORegister(GIF_CHANNEL + 0x20u, totalQwc & 0xFFFFu);
+        mem.writeIORegister(GIF_CHANNEL + 0x10u, packetAddr);
+        mem.writeIORegister(GIF_CHANNEL + 0x20u, 6u);
         mem.writeIORegister(GIF_CHANNEL + 0x00u, CHCR_STR_MODE0);
         mem.processPendingTransfers();
-        runtime->guestFree(pktAddr);
+
+        if (imageQwc != 0u)
+        {
+            mem.writeIORegister(GIF_CHANNEL + 0x10u, srcAddr);
+            mem.writeIORegister(GIF_CHANNEL + 0x20u, imageQwc);
+            mem.writeIORegister(GIF_CHANNEL + 0x00u, CHCR_STR_MODE0);
+            mem.processPendingTransfers();
+        }
 
         setReturnS32(ctx, 0);
     }
@@ -1299,7 +1262,74 @@ namespace ps2_stubs
 
     void sceGsSetDefLoadImage(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
-        uint32_t imgAddr = getRegU32(ctx, 4);
+        const uint32_t packetAddr = getRegU32(ctx, 4);
+        const GsSetDefImageArgs args = decodeGsSetDefImageArgs(rdram, ctx);
+        uint8_t *const packet = getMemPtr(rdram, packetAddr);
+        if (!packet)
+        {
+            setReturnS32(ctx, 0);
+            return;
+        }
+
+        const uint64_t pixelCount =
+            static_cast<uint64_t>(args.width & 0xFFFFu) *
+            static_cast<uint64_t>(args.height & 0xFFFFu);
+        if (pixelCount > 0xFFFFFFFFull)
+        {
+            setReturnS32(ctx, 0);
+            return;
+        }
+
+        const uint32_t imageBytes =
+            bytesForPixels(static_cast<uint8_t>(args.psm), static_cast<uint32_t>(pixelCount));
+        const uint64_t imageQwc64 = (static_cast<uint64_t>(imageBytes) + 15ull) / 16ull;
+        if (imageQwc64 > 0x7FFFull)
+        {
+            setReturnS32(ctx, 0);
+            return;
+        }
+
+        const uint32_t dbp = args.vramAddr & 0x3FFFu;
+        const uint32_t dbw = args.vramWidth & 0x3Fu;
+        const uint32_t dpsm = args.psm & 0x3Fu;
+        const uint32_t dsax = args.x & 0x7FFu;
+        const uint32_t dsay = args.y & 0x7FFu;
+        const uint32_t width = args.width & 0x0FFFu;
+        const uint32_t height = args.height & 0x0FFFu;
+
+        uint64_t qwords[12] = {};
+        qwords[0] = makeGiftagAplusD(4u);
+        qwords[1] = 0xEull;
+        qwords[2] =
+            (static_cast<uint64_t>(dbp) << 32u) |
+            (static_cast<uint64_t>(dbw) << 48u) |
+            (static_cast<uint64_t>(dpsm) << 56u);
+        qwords[3] = 0x50ull;
+        qwords[4] =
+            (static_cast<uint64_t>(dsax) << 32u) |
+            (static_cast<uint64_t>(dsay) << 48u);
+        qwords[5] = 0x51ull;
+        qwords[6] =
+            static_cast<uint64_t>(width) |
+            (static_cast<uint64_t>(height) << 32u);
+        qwords[7] = 0x52ull;
+        qwords[8] = 0ull;
+        qwords[9] = 0x53ull;
+        qwords[10] =
+            (static_cast<uint64_t>(2u) << 58u) |
+            (1ull << 15u) |
+            imageQwc64;
+        qwords[11] = 0ull;
+        std::memcpy(packet, qwords, sizeof(qwords));
+
+        setReturnS32(ctx, 6);
+    }
+
+    void sceGsSetDefStoreImage(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        // Keep the existing direct readback representation until the
+        // local-to-host SDK packet path is modelled independently.
+        const uint32_t imgAddr = getRegU32(ctx, 4);
         const GsSetDefImageArgs args = decodeGsSetDefImageArgs(rdram, ctx);
 
         GsImageMem img{};
@@ -1313,11 +1343,6 @@ namespace ps2_stubs
 
         writeGsImage(rdram, imgAddr, img);
         setReturnS32(ctx, 0);
-    }
-
-    void sceGsSetDefStoreImage(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
-    {
-        sceGsSetDefLoadImage(rdram, ctx, runtime);
     }
 
     void sceGsSwapDBuffDc(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)

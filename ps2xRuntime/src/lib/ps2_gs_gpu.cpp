@@ -12,7 +12,9 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
+#include <fstream>
 #include <iostream>
 #include <sstream>
 
@@ -53,6 +55,194 @@ namespace
         uint64_t v;
         std::memcpy(&v, p, 8);
         return v;
+    }
+
+    struct GSTransferTraceState
+    {
+        std::ofstream output;
+        uint64_t index = 0u;
+        uint64_t limit = 100000u;
+        uint32_t minimumDbp = 0u;
+        uint32_t maximumDbp = 0x3FFFu;
+        bool initialized = false;
+
+        void initialize()
+        {
+            if (initialized)
+                return;
+
+            initialized = true;
+            const char *path = std::getenv("PS2X_GS_TRANSFER_TRACE");
+            if (!path || path[0] == '\0')
+                return;
+
+            if (const char *limitText = std::getenv("PS2X_GS_TRANSFER_TRACE_LIMIT"))
+            {
+                char *end = nullptr;
+                const unsigned long long parsed = std::strtoull(limitText, &end, 0);
+                if (end != limitText && end && *end == '\0' && parsed != 0u)
+                    limit = parsed;
+            }
+            auto parseDbp = [](const char *name, uint32_t &out)
+            {
+                const char *text = std::getenv(name);
+                if (!text || text[0] == '\0')
+                    return;
+                char *end = nullptr;
+                const unsigned long parsed = std::strtoul(text, &end, 0);
+                if (end != text && end && *end == '\0' && parsed <= 0x3FFFu)
+                    out = static_cast<uint32_t>(parsed);
+            };
+            parseDbp("PS2X_GS_TRANSFER_TRACE_DBP_MIN", minimumDbp);
+            parseDbp("PS2X_GS_TRANSFER_TRACE_DBP_MAX", maximumDbp);
+
+            output.open(path, std::ios::out | std::ios::trunc);
+            if (output)
+            {
+                output << "index,event,trxdir,dbp,dbw,dpsm,dsax,dsay,rrw,rrh,"
+                          "copied_before,copied_after,total_pixels,payload_bytes,"
+                          "payload_nonzero_bytes,payload_hash\n";
+            }
+        }
+
+        void record(const char *event,
+                    uint32_t trxdir,
+                    const GSBitBltBuf &bitbltbuf,
+                    const GSTrxPos &trxpos,
+                    const GSTrxReg &trxreg,
+                    uint32_t copiedBefore,
+                    uint32_t copiedAfter,
+                    uint32_t totalPixels,
+                    const uint8_t *payload,
+                    uint32_t payloadBytes)
+        {
+            initialize();
+            if (!output.is_open() ||
+                index >= limit ||
+                bitbltbuf.dbp < minimumDbp ||
+                bitbltbuf.dbp > maximumDbp)
+            {
+                return;
+            }
+
+            uint32_t nonzeroBytes = 0u;
+            uint64_t hash = 1469598103934665603ull;
+            for (uint32_t i = 0u; payload && i < payloadBytes; ++i)
+            {
+                nonzeroBytes += payload[i] != 0u ? 1u : 0u;
+                hash ^= payload[i];
+                hash *= 1099511628211ull;
+            }
+
+            output << index++ << ','
+                   << event << ','
+                   << trxdir << ','
+                   << bitbltbuf.dbp << ','
+                   << static_cast<uint32_t>(bitbltbuf.dbw) << ','
+                   << static_cast<uint32_t>(bitbltbuf.dpsm) << ','
+                   << trxpos.dsax << ','
+                   << trxpos.dsay << ','
+                   << trxreg.rrw << ','
+                   << trxreg.rrh << ','
+                   << copiedBefore << ','
+                   << copiedAfter << ','
+                   << totalPixels << ','
+                   << payloadBytes << ','
+                   << nonzeroBytes << ','
+                   << std::hex << hash << std::dec << '\n';
+            output.flush();
+        }
+    };
+
+    GSTransferTraceState &transferTrace()
+    {
+        static GSTransferTraceState trace;
+        return trace;
+    }
+
+    struct GSRegisterTraceState
+    {
+        std::ofstream output;
+        uint64_t index = 0u;
+        uint64_t limit = 1000000u;
+        bool initialized = false;
+
+        void record(uint8_t reg,
+                    uint64_t value,
+                    const GSPrimReg &prim,
+                    const GSContext (&ctx)[2])
+        {
+            if (!initialized)
+            {
+                initialized = true;
+                const char *path = std::getenv("PS2X_GS_REGISTER_TRACE");
+                if (!path || path[0] == '\0')
+                    return;
+                if (const char *limitText =
+                        std::getenv("PS2X_GS_REGISTER_TRACE_LIMIT"))
+                {
+                    char *end = nullptr;
+                    const unsigned long long parsed =
+                        std::strtoull(limitText, &end, 0);
+                    if (end != limitText && end && *end == '\0' && parsed != 0u)
+                        limit = parsed;
+                }
+                output.open(path, std::ios::out | std::ios::trunc);
+                if (output)
+                {
+                    output << "index,reg,value,prim,ctxt,"
+                              "ofx0,ofy0,fbp0,fbw0,fpsm0,zbp0,zpsm0,zmask0,"
+                              "ofx1,ofy1,fbp1,fbw1,fpsm1,zbp1,zpsm1,zmask1\n";
+                }
+            }
+
+            // Per-vertex attributes and PRIM writes dominate VU-generated
+            // packets. The draw trace already records their effective values;
+            // keep this stream focused on persistent GS environment changes.
+            switch (reg)
+            {
+            case GS_REG_PRIM:
+            case GS_REG_RGBAQ:
+            case GS_REG_ST:
+            case GS_REG_UV:
+            case GS_REG_XYZF2:
+            case GS_REG_XYZ2:
+            case GS_REG_FOG:
+            case GS_REG_XYZF3:
+            case GS_REG_XYZ3:
+                return;
+            default:
+                break;
+            }
+
+            if (!output || index >= limit)
+                return;
+
+            output << index++ << ','
+                   << static_cast<uint32_t>(reg) << ','
+                   << std::hex << value << std::dec << ','
+                   << static_cast<uint32_t>(prim.type) << ','
+                   << static_cast<uint32_t>(prim.ctxt);
+            for (const GSContext &context : ctx)
+            {
+                output << ',' << context.xyoffset.ofx
+                       << ',' << context.xyoffset.ofy
+                       << ',' << context.frame.fbp
+                       << ',' << context.frame.fbw
+                       << ',' << static_cast<uint32_t>(context.frame.psm)
+                       << ',' << context.zbuf.zbp
+                       << ',' << static_cast<uint32_t>(context.zbuf.psm)
+                       << ',' << static_cast<uint32_t>(context.zbuf.zmask);
+            }
+            output << '\n';
+            output.flush();
+        }
+    };
+
+    GSRegisterTraceState &registerTrace()
+    {
+        static GSRegisterTraceState trace;
+        return trace;
     }
 
     struct PackedGifPacketTag
@@ -454,10 +644,16 @@ void GS::reset()
     m_curU = 0;
     m_curV = 0;
     m_curFog = 0;
+    m_fogColor = 0;
     m_prmodecont = true;
     m_pabe = false;
     m_texa = {0u, false, 0u};
     m_texclut = {0u, 0u, 0u};
+    std::memset(m_clutCache, 0, sizeof(m_clutCache));
+    std::memset(m_clutCacheFormat, 0, sizeof(m_clutCacheFormat));
+    std::memset(m_clutCacheValid, 0, sizeof(m_clutCacheValid));
+    std::memset(m_clutCbp, 0, sizeof(m_clutCbp));
+    ++m_clutCacheGeneration;
     m_bitbltbuf = {};
     m_trxpos = {};
     m_trxreg = {};
@@ -990,7 +1186,14 @@ void GS::latchHostPresentationFrameUnlocked()
         scratch.clear();
         usedPreferred = false;
 
+        static const bool disablePreferredDisplaySource = []
+        {
+            const char *value = std::getenv("PS2X_GS_DISABLE_PREFERRED_DISPLAY_SOURCE");
+            return value && value[0] != '\0' && std::strcmp(value, "0") != 0;
+        }();
+
         if (allowPreferred &&
+            !disablePreferredDisplaySource &&
             m_hasPreferredDisplaySource &&
             m_preferredDisplayDestFbp == displayFrame.fbp &&
             (m_preferredDisplaySourceFrame.fbw != 0u || m_preferredDisplaySourceFrame.fbp != displayFrame.fbp))
@@ -1285,6 +1488,24 @@ bool GS::copyLatchedHostPresentationFrame(std::vector<uint8_t> &outPixels,
     return true;
 }
 
+void GS::beginRenderBatch()
+{
+    std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
+    m_rasterizer.beginDrawBatch(this);
+}
+
+void GS::flushRenderBatch()
+{
+    std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
+    m_rasterizer.flushDrawBatch(this);
+}
+
+void GS::endRenderBatch()
+{
+    std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
+    m_rasterizer.endDrawBatch(this);
+}
+
 void GS::processGIFPacket(const uint8_t *data, uint32_t sizeBytes)
 {
     std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
@@ -1293,6 +1514,20 @@ void GS::processGIFPacket(const uint8_t *data, uint32_t sizeBytes)
 
     if (tryProcessNativeImageUploadPacket(data, sizeBytes))
         return;
+
+    const bool ownsDrawBatch =
+        m_rasterizer.beginDrawBatch(this);
+    struct DrawBatchScope
+    {
+        GSRasterizer &rasterizer;
+        GS *gs;
+        bool ownsBatch;
+        ~DrawBatchScope()
+        {
+            if (ownsBatch)
+                rasterizer.endDrawBatch(gs);
+        }
+    } drawBatchScope{m_rasterizer, this, ownsDrawBatch};
 
     PS2_IF_AGRESSIVE_LOGS({
         const uint32_t packetIndex = s_debugGifPacketCount.fetch_add(1, std::memory_order_relaxed);
@@ -1392,6 +1627,20 @@ bool GS::processNativePackedGIFPacket(const uint8_t *data, uint32_t sizeBytes)
 
     if (!validatePackedGifPacket(data, sizeBytes))
         return false;
+
+    const bool ownsDrawBatch =
+        m_rasterizer.beginDrawBatch(this);
+    struct DrawBatchScope
+    {
+        GSRasterizer &rasterizer;
+        GS *gs;
+        bool ownsBatch;
+        ~DrawBatchScope()
+        {
+            if (ownsBatch)
+                rasterizer.endDrawBatch(gs);
+        }
+    } drawBatchScope{m_rasterizer, this, ownsDrawBatch};
 
     const bool processed = visitPackedGifPacket(data, sizeBytes, [&](const PackedGifPacketTag &tag)
     {
@@ -1871,6 +2120,7 @@ void GS::writeRegister(uint8_t regAddr, uint64_t value)
         t.csm = static_cast<uint8_t>((value >> 55) & 0x1);
         t.csa = static_cast<uint8_t>((value >> 56) & 0x1F);
         t.cld = static_cast<uint8_t>((value >> 61) & 0x7);
+        m_rasterizer.updateClutCache(this, ci);
         break;
     }
     case GS_REG_CLAMP_1:
@@ -1890,6 +2140,20 @@ void GS::writeRegister(uint8_t regAddr, uint64_t value)
         m_ctx[ci].tex1 = value;
         break;
     }
+    case GS_REG_MIPTBP1_1:
+    case GS_REG_MIPTBP1_2:
+    {
+        const int ci = (regAddr == GS_REG_MIPTBP1_2) ? 1 : 0;
+        m_ctx[ci].miptbp1 = value;
+        break;
+    }
+    case GS_REG_MIPTBP2_1:
+    case GS_REG_MIPTBP2_2:
+    {
+        const int ci = (regAddr == GS_REG_MIPTBP2_2) ? 1 : 0;
+        m_ctx[ci].miptbp2 = value;
+        break;
+    }
     case GS_REG_TEX2_1:
     case GS_REG_TEX2_2:
     {
@@ -1901,6 +2165,7 @@ void GS::writeRegister(uint8_t regAddr, uint64_t value)
         t.csm = static_cast<uint8_t>((value >> 55) & 0x1);
         t.csa = static_cast<uint8_t>((value >> 56) & 0x1F);
         t.cld = static_cast<uint8_t>((value >> 61) & 0x7);
+        m_rasterizer.updateClutCache(this, ci);
         break;
     }
     case GS_REG_XYOFFSET_1:
@@ -2019,6 +2284,16 @@ void GS::writeRegister(uint8_t regAddr, uint64_t value)
         m_transferState.y = m_trxpos.dsay;
         m_transferState.total_pixels = m_trxreg.rrw * m_trxreg.rrh;
         m_transferState.copied_pixels = 0;
+        transferTrace().record("start",
+                               m_trxdir,
+                               m_bitbltbuf,
+                               m_trxpos,
+                               m_trxreg,
+                               0u,
+                               0u,
+                               m_transferState.total_pixels,
+                               nullptr,
+                               0u);
 
         if (m_trxdir == 2 && m_vram)
         {
@@ -2041,16 +2316,14 @@ void GS::writeRegister(uint8_t regAddr, uint64_t value)
     case GS_REG_PABE:
         m_pabe = (value & 1u) != 0u;
         break;
+    case GS_REG_FOGCOL:
+        m_fogColor = static_cast<uint32_t>(value & 0x00FFFFFFu);
+        break;
     case GS_REG_TEXFLUSH:
     case GS_REG_SCANMSK:
-    case GS_REG_FOGCOL:
     case GS_REG_DIMX:
     case GS_REG_DTHE:
     case GS_REG_COLCLAMP:
-    case GS_REG_MIPTBP1_1:
-    case GS_REG_MIPTBP1_2:
-    case GS_REG_MIPTBP2_1:
-    case GS_REG_MIPTBP2_2:
         break;
     case GS_REG_TEXA:
     {
@@ -2108,10 +2381,13 @@ void GS::writeRegister(uint8_t regAddr, uint64_t value)
     }
 
     recordRegisterDebugEventUnlocked(regAddr, value);
+    registerTrace().record(regAddr, value, m_prim, m_ctx);
 }
 
 void GS::performLocalToLocalTransfer()
 {
+    m_rasterizer.flushDrawBatch(this);
+
     if (!m_vram)
         return;
 
@@ -2251,9 +2527,6 @@ void GS::vertexKick(bool drawing)
         }
     });
 
-    if (!drawing)
-        return;
-
     int needed = 0;
     switch (m_prim.type)
     {
@@ -2285,9 +2558,17 @@ void GS::vertexKick(bool drawing)
     if (m_vtxCount < needed)
         return;
 
-    m_rasterizer.drawPrimitive(this);
-    recordDrawDebugEventUnlocked(needed);
+    if (drawing)
+    {
+        m_rasterizer.drawPrimitive(this);
+        recordDrawDebugEventUnlocked(needed);
+    }
 
+    // XYZ3/XYZF3 and packed XYZ2/XYZF2 with ADC set suppress the current
+    // primitive, but the submitted vertex still advances primitive assembly.
+    // In particular, a skipped triangle-strip vertex becomes part of the next
+    // triangle. Consume/roll the completed primitive regardless of whether it
+    // was rasterized.
     switch (m_prim.type)
     {
     case GS_PRIM_LINE:
@@ -2317,18 +2598,43 @@ void GS::vertexKick(bool drawing)
 
 void GS::processImageData(const uint8_t *data, uint32_t sizeBytes)
 {
+    m_rasterizer.flushDrawBatch(this);
+
     // wrong direction set
     if (m_trxdir != 0 || !m_vram)
     {
+        transferTrace().record("rejected_direction",
+                               m_trxdir,
+                               m_bitbltbuf,
+                               m_trxpos,
+                               m_trxreg,
+                               m_transferState.copied_pixels,
+                               m_transferState.copied_pixels,
+                               m_transferState.total_pixels,
+                               data,
+                               sizeBytes);
         return;
     }
 
     // no height and width means transfer is invalid
     if (m_trxreg.rrw == 0 || m_trxreg.rrh == 0)
     {
+        transferTrace().record("rejected_extent",
+                               m_trxdir,
+                               m_bitbltbuf,
+                               m_trxpos,
+                               m_trxreg,
+                               m_transferState.copied_pixels,
+                               m_transferState.copied_pixels,
+                               m_transferState.total_pixels,
+                               data,
+                               sizeBytes);
         return;
     }
 
+    const uint32_t copiedBefore = m_transferState.copied_pixels;
+    const uint32_t totalPixels = m_transferState.total_pixels;
+    const uint32_t transferDirection = m_trxdir;
     u32 dbp = m_bitbltbuf.dbp;
     u8 dbw = std::max<u8>(m_bitbltbuf.dbw, 1u);
     u8 dpsm = m_bitbltbuf.dpsm;
@@ -2706,10 +3012,23 @@ void GS::processImageData(const uint8_t *data, uint32_t sizeBytes)
         }
         break;
     }
+
+    transferTrace().record("payload",
+                           transferDirection,
+                           m_bitbltbuf,
+                           m_trxpos,
+                           m_trxreg,
+                           copiedBefore,
+                           m_transferState.copied_pixels,
+                           totalPixels,
+                           data,
+                           sizeBytes);
 }
 
 void GS::performLocalToHostToBuffer()
 {
+    m_rasterizer.flushDrawBatch(this);
+
     m_localToHostBuffer.clear();
     m_localToHostReadPos = 0;
 

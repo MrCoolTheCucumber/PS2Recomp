@@ -45,6 +45,7 @@ static constexpr int FB_HEIGHT = 512;
 static constexpr int DEFAULT_DISPLAY_HEIGHT = 448;
 static constexpr uint32_t DEFAULT_FB_SIZE = FB_WIDTH * FB_HEIGHT * 4;
 static constexpr uint32_t DEFAULT_FB_ADDR = (PS2_RAM_SIZE - DEFAULT_FB_SIZE - 0x10000u);
+static constexpr const char *GS_HISTORY_DUMP_ENV = "PS2X_GS_HISTORY_DUMP";
 #if defined(PLATFORM_VITA)
 static constexpr int HOST_WINDOW_WIDTH = 960;
 static constexpr int HOST_WINDOW_HEIGHT = 544;
@@ -2837,6 +2838,13 @@ void PS2Runtime::run()
     m_debugSp.store(static_cast<uint32_t>(_mm_extract_epi32(m_cpuContext.r[29], 0)), std::memory_order_relaxed);
     m_debugGp.store(static_cast<uint32_t>(_mm_extract_epi32(m_cpuContext.r[28], 0)), std::memory_order_relaxed);
 
+    const char *const gsHistoryDumpPath = std::getenv(GS_HISTORY_DUMP_ENV);
+    if (gsHistoryDumpPath && gsHistoryDumpPath[0] != '\0')
+    {
+        m_gs.clearDebugHistory();
+        m_gs.setDebugHistoryPaused(false);
+    }
+
     RUNTIME_LOG("Starting execution at address 0x" << std::hex << m_cpuContext.pc << std::dec);
 
     // A blank image to use as a framebuffer
@@ -2994,6 +3002,87 @@ void PS2Runtime::run()
         m_debugUiShutdownCallback(*this, m_debugUiUserData);
         m_debugUiInitialized = false;
     }
+
+    if (gsHistoryDumpPath && gsHistoryDumpPath[0] != '\0')
+    {
+        m_gs.setDebugHistoryPaused(true);
+        const GSDebugSnapshot snapshot = m_gs.getDebugSnapshot();
+        const std::vector<GSDebugHistoryEntry> history = m_gs.getDebugHistory();
+        std::ofstream out(gsHistoryDumpPath, std::ios::out | std::ios::trunc);
+        if (!out)
+        {
+            std::cerr << "[gs:history] failed to open dump path: "
+                      << gsHistoryDumpPath << std::endl;
+        }
+        else
+        {
+            out << "snapshot"
+                << " ctx0.frame=" << snapshot.ctx[0].frame.fbp
+                << "/" << snapshot.ctx[0].frame.fbw
+                << "/0x" << std::hex << static_cast<uint32_t>(snapshot.ctx[0].frame.psm)
+                << " ctx1.frame=" << std::dec << snapshot.ctx[1].frame.fbp
+                << "/" << snapshot.ctx[1].frame.fbw
+                << "/0x" << std::hex << static_cast<uint32_t>(snapshot.ctx[1].frame.psm)
+                << " present=" << std::dec << snapshot.hostPresentationWidth
+                << "x" << snapshot.hostPresentationHeight
+                << " display=" << snapshot.hostPresentationDisplayFbp
+                << " source=" << snapshot.hostPresentationSourceFbp
+                << " preferred=" << snapshot.hostPresentationUsedPreferred
+                << '\n';
+            out << "seq\tframe\ttick\tkind\tprim\tflags\tframebuf\tzbuf\ttex0"
+                   "\ttest\talpha\tbounds\tgif\treg\ttransfer\tpresent\n";
+            for (const GSDebugHistoryEntry &entry : history)
+            {
+                out << entry.seq << '\t'
+                    << entry.frameIndex << '\t'
+                    << entry.vsyncTick << '\t'
+                    << static_cast<uint32_t>(entry.kind) << '\t'
+                    << static_cast<uint32_t>(entry.prim.type) << '\t'
+                    << "iip=" << entry.prim.iip
+                    << "/tme=" << entry.prim.tme
+                    << "/abe=" << entry.prim.abe
+                    << "/fst=" << entry.prim.fst
+                    << "/ctxt=" << entry.prim.ctxt << '\t'
+                    << entry.frame.fbp << "/" << entry.frame.fbw
+                    << "/0x" << std::hex << static_cast<uint32_t>(entry.frame.psm)
+                    << "/0x" << entry.frame.fbmsk << std::dec << '\t'
+                    << entry.zbuf.zbp << "/0x" << std::hex
+                    << static_cast<uint32_t>(entry.zbuf.psm)
+                    << "/m=" << std::dec << entry.zbuf.zmask << '\t'
+                    << entry.tex0.tbp0 << "/" << static_cast<uint32_t>(entry.tex0.tbw)
+                    << "/0x" << std::hex << static_cast<uint32_t>(entry.tex0.psm)
+                    << "/" << std::dec << (1u << entry.tex0.tw)
+                    << "x" << (1u << entry.tex0.th)
+                    << "/cbp=" << entry.tex0.cbp
+                    << "/cpsm=0x" << std::hex << static_cast<uint32_t>(entry.tex0.cpsm)
+                    << std::dec << '\t'
+                    << "0x" << std::hex << entry.test << '\t'
+                    << "0x" << entry.alpha << std::dec << '\t'
+                    << entry.xMin << ".." << entry.xMax
+                    << "/" << entry.yMin << ".." << entry.yMax
+                    << "/z=" << entry.zMin << ".." << entry.zMax
+                    << "/a=" << static_cast<uint32_t>(entry.aMin)
+                    << ".." << static_cast<uint32_t>(entry.aMax) << '\t'
+                    << "nloop=" << entry.gifNloop
+                    << "/flg=" << static_cast<uint32_t>(entry.gifFlg)
+                    << "/nreg=" << static_cast<uint32_t>(entry.gifNreg)
+                    << "/bytes=" << entry.gifSizeBytes << '\t'
+                    << "0x" << std::hex << static_cast<uint32_t>(entry.reg)
+                    << "=0x" << entry.regValue << std::dec << '\t'
+                    << entry.trxreg.rrw << "x" << entry.trxreg.rrh
+                    << "/dir=" << entry.trxdir
+                    << "/pixels=" << entry.transferPixels << '\t'
+                    << entry.width << "x" << entry.height
+                    << "/display=" << entry.displayFbp
+                    << "/source=" << entry.sourceFbp
+                    << "/preferred=" << entry.usedPreferred
+                    << '\n';
+            }
+            std::cout << "[gs:history] wrote " << history.size()
+                      << " entries to " << gsHistoryDumpPath << std::endl;
+        }
+    }
+
     UnloadTexture(frameTex);
     CloseWindow();
 

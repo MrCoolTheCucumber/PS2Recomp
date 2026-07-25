@@ -7,19 +7,82 @@
 #include "runtime/ps2_gs_psmt8.h"
 #include "runtime/ps2_gs_memory.h"
 #include "ps2_log.h"
+#include <array>
 #include <atomic>
 #include <algorithm>
+#include <chrono>
 #include <cmath>
+#include <condition_variable>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <fstream>
 #include <iostream>
+#include <limits>
+#include <memory>
+#include <mutex>
 #include <sstream>
+#include <string>
+#include <thread>
+#include <vector>
+#if defined(__SSE4_1__)
+#include <smmintrin.h>
+#endif
+
+#if defined(_MSC_VER)
+#define PS2X_GS_ALWAYS_INLINE __forceinline
+#define PS2X_GS_LAMBDA_ALWAYS_INLINE
+#elif defined(__GNUC__) || defined(__clang__)
+#define PS2X_GS_ALWAYS_INLINE inline __attribute__((always_inline))
+#define PS2X_GS_LAMBDA_ALWAYS_INLINE __attribute__((always_inline))
+#else
+#define PS2X_GS_ALWAYS_INLINE inline
+#define PS2X_GS_LAMBDA_ALWAYS_INLINE
+#endif
 
 using namespace GSInternal;
 
 namespace
 {
+    struct FixedPointVertex
+    {
+        int32_t x;
+        int32_t y;
+    };
+
+    int ceilFixed12_4(int32_t value)
+    {
+        // C++ integer division truncates toward zero, which is ceil for
+        // negative values. Positive values need the fractional bias.
+        return (value >= 0) ? ((value + 15) / 16) : (value / 16);
+    }
+
+    int64_t triangleEdge(const FixedPointVertex &a,
+                         const FixedPointVertex &b,
+                         const FixedPointVertex &p)
+    {
+        return static_cast<int64_t>(b.x - a.x) * static_cast<int64_t>(p.y - a.y) -
+               static_cast<int64_t>(b.y - a.y) * static_cast<int64_t>(p.x - a.x);
+    }
+
+    bool isTopLeftEdge(const FixedPointVertex &a,
+                       const FixedPointVertex &b,
+                       bool positiveArea)
+    {
+        int32_t dx = b.x - a.x;
+        int32_t dy = b.y - a.y;
+        if (!positiveArea)
+        {
+            dx = -dx;
+            dy = -dy;
+        }
+
+        // Window Y increases downward. For a consistently oriented triangle,
+        // an upward edge is a left edge and a rightward horizontal edge is a
+        // top edge.
+        return dy < 0 || (dy == 0 && dx > 0);
+    }
+
     float fabsQ(float q)
     {
         return (std::fabs(q) > 1.0e-8f) ? q : 1.0f;
@@ -48,6 +111,70 @@ namespace
     u32 pack32(u8 r, u8 g, u8 b, u8 a)
     {
         return static_cast<u32>(r) | (g << 8) | (b << 16) | (a << 24);
+    }
+
+    uint8_t blendFogChannel(uint8_t source, uint8_t fog, uint8_t factor)
+    {
+        // GS fog is an 8-bit fixed-point interpolation. Using a 256-wide
+        // complement makes F=0 exactly the distant fog colour, matching the
+        // documented endpoint and PCSX2's software renderer.
+        const uint32_t sourceWeight = static_cast<uint32_t>(factor);
+        const uint32_t fogWeight = 256u - sourceWeight;
+        return static_cast<uint8_t>(
+            (static_cast<uint32_t>(source) * sourceWeight +
+             static_cast<uint32_t>(fog) * fogWeight) >>
+            8u);
+    }
+
+    PS2X_GS_ALWAYS_INLINE uint8_t blendFogChannelFixed(
+        uint8_t source,
+        uint8_t fog,
+        uint16_t factor)
+    {
+        const int difference =
+            (static_cast<int>(source) - static_cast<int>(fog)) *
+            static_cast<int>(factor);
+        const int delta =
+            difference >= 0
+                ? difference / 32768
+                : -((-difference + 32767) / 32768);
+        return clampU8(static_cast<int>(fog) + delta);
+    }
+
+    void applyFog(uint32_t fogColor,
+                  uint8_t factor,
+                  uint8_t &r,
+                  uint8_t &g,
+                  uint8_t &b)
+    {
+        r = blendFogChannel(r,
+                            static_cast<uint8_t>(fogColor),
+                            factor);
+        g = blendFogChannel(g,
+                            static_cast<uint8_t>(fogColor >> 8u),
+                            factor);
+        b = blendFogChannel(b,
+                            static_cast<uint8_t>(fogColor >> 16u),
+                            factor);
+    }
+
+    PS2X_GS_ALWAYS_INLINE void applyFogFixed(
+        uint32_t fogColor,
+        uint16_t factor,
+        uint8_t &r,
+        uint8_t &g,
+        uint8_t &b)
+    {
+        r = blendFogChannelFixed(
+            r, static_cast<uint8_t>(fogColor), factor);
+        g = blendFogChannelFixed(
+            g,
+            static_cast<uint8_t>(fogColor >> 8u),
+            factor);
+        b = blendFogChannelFixed(
+            b,
+            static_cast<uint8_t>(fogColor >> 16u),
+            factor);
     }
 
     uint32_t applyTexa(const GSTexaReg &texa, uint8_t psm, uint32_t texel)
@@ -101,7 +228,401 @@ namespace
     std::atomic<uint32_t> s_debugPixelCount{0};
     std::atomic<uint32_t> s_debugContext1PrimitiveCount{0};
     std::atomic<uint32_t> s_debugFbp150PixelCount{0};
-    bool passesAlphaTest(uint64_t testReg, uint8_t alpha)
+
+    struct GSDrawTraceState
+    {
+        std::ofstream output;
+        uint64_t index = 0u;
+        uint64_t written = 0u;
+        uint64_t limit = 1000000u;
+        uint32_t framebufferFilter = 0u;
+        bool filterFramebuffer = false;
+        uint64_t candidates = 0u;
+        uint64_t scissorRejects = 0u;
+        uint64_t alphaRejects = 0u;
+        uint64_t destinationAlphaRejects = 0u;
+        uint64_t depthRejects = 0u;
+        uint64_t writes = 0u;
+        uint64_t framebufferChanges = 0u;
+        uint64_t depthWrites = 0u;
+        uint64_t depthChanges = 0u;
+        uint8_t minR = 0xFFu;
+        uint8_t maxR = 0u;
+        uint8_t minG = 0xFFu;
+        uint8_t maxG = 0u;
+        uint8_t minB = 0xFFu;
+        uint8_t maxB = 0u;
+        uint8_t minA = 0xFFu;
+        uint8_t maxA = 0u;
+        uint64_t textureSamples = 0u;
+        uint8_t minTextureIndex = 0xFFu;
+        uint8_t maxTextureIndex = 0u;
+        uint8_t minTextureAlpha = 0xFFu;
+        uint8_t maxTextureAlpha = 0u;
+        bool initialized = false;
+        bool capturing = false;
+
+        void begin(const GSContext &ctx)
+        {
+            if (!initialized)
+            {
+                initialized = true;
+                const char *path = std::getenv("PS2X_GS_DRAW_TRACE");
+                if (path && path[0] != '\0')
+                {
+                    if (const char *limitText = std::getenv("PS2X_GS_DRAW_TRACE_LIMIT"))
+                    {
+                        char *end = nullptr;
+                        const unsigned long long parsed = std::strtoull(limitText, &end, 0);
+                        if (end != limitText && end && *end == '\0' && parsed != 0u)
+                            limit = parsed;
+                    }
+                    if (const char *fbpText = std::getenv("PS2X_GS_DRAW_TRACE_FBP"))
+                    {
+                        char *end = nullptr;
+                        const unsigned long parsed = std::strtoul(fbpText, &end, 0);
+                        if (end != fbpText && end && *end == '\0' && parsed <= 0x1FFu)
+                        {
+                            framebufferFilter = static_cast<uint32_t>(parsed);
+                            filterFramebuffer = true;
+                        }
+                    }
+                    output.open(path, std::ios::out | std::ios::trunc);
+                    if (output)
+                    {
+                        output << "index,type,iip,tme,fge,abe,fst,ctxt,fogcol,fbp,fbw,fpsm,fbmsk,zbp,zpsm,zmask,test,"
+                                  "alpha,tbp0,tbw,tpsm,tw,th,tcc,tfx,cbp,cpsm,csm,csa,cld,"
+                                  "tex1,miptbp1,miptbp2,clamp,"
+                                  "texclut_cbw,texclut_cou,texclut_cov,"
+                                  "ofx,ofy,sx0,sx1,sy0,sy1,"
+                                  "x0,y0,z0,x1,y1,z1,x2,y2,z2,"
+                                  "s0,t0,q0,u0,v0,fog0,r0,g0,b0,a0,"
+                                  "s1,t1,q1,u1,v1,fog1,r1,g1,b1,a1,"
+                                  "s2,t2,q2,u2,v2,fog2,r2,g2,b2,a2,"
+                                  "candidates,scissor_rejects,alpha_rejects,destination_alpha_rejects,"
+                                  "depth_rejects,writes,"
+                                  "framebuffer_changes,depth_writes,depth_changes,"
+                                  "min_r,max_r,min_g,max_g,min_b,max_b,min_a,max_a,"
+                                  "texture_samples,min_texture_index,max_texture_index,"
+                                  "min_texture_alpha,max_texture_alpha\n";
+                    }
+                }
+            }
+
+            capturing = output.is_open() &&
+                        written < limit &&
+                        (!filterFramebuffer || ctx.frame.fbp == framebufferFilter);
+            if (!capturing)
+                return;
+
+            candidates = 0u;
+            scissorRejects = 0u;
+            alphaRejects = 0u;
+            destinationAlphaRejects = 0u;
+            depthRejects = 0u;
+            writes = 0u;
+            framebufferChanges = 0u;
+            depthWrites = 0u;
+            depthChanges = 0u;
+            minR = minG = minB = minA = 0xFFu;
+            maxR = maxG = maxB = maxA = 0u;
+            textureSamples = 0u;
+            minTextureIndex = minTextureAlpha = 0xFFu;
+            maxTextureIndex = maxTextureAlpha = 0u;
+        }
+    };
+
+    GSDrawTraceState &drawTrace()
+    {
+        static GSDrawTraceState trace;
+        return trace;
+    }
+
+    struct GSFeedbackTraceState
+    {
+        std::ofstream output;
+        uint64_t index = 0u;
+        bool initialized = false;
+
+        void initialize()
+        {
+            if (initialized)
+                return;
+
+            initialized = true;
+            const char *path = std::getenv("PS2X_GS_FEEDBACK_TRACE");
+            if (!path || path[0] == '\0')
+                return;
+
+            output.open(path, std::ios::out | std::ios::trunc);
+            if (output)
+            {
+                output << "index,type,iip,abe,fst,ctxt,"
+                          "fbp,fbw,fpsm,fbmsk,zbp,zpsm,zmask,"
+                          "tbp0,tbw,tpsm,tw,th,tcc,tfx,"
+                          "alpha,test,ofx,ofy,sx0,sx1,sy0,sy1,"
+                          "x0,y0,z0,u0,v0,x1,y1,z1,u1,v1,x2,y2,z2,u2,v2\n";
+            }
+        }
+
+        void record(const GSPrimReg &prim, const GSContext &ctx, const GSVertex *vertices)
+        {
+            initialize();
+            if (!output || !prim.tme)
+                return;
+
+            const bool directColorOrDepthTexture =
+                ctx.tex0.psm == GS_PSM_CT32 ||
+                ctx.tex0.psm == GS_PSM_CT24 ||
+                ctx.tex0.psm == GS_PSM_CT16 ||
+                ctx.tex0.psm == GS_PSM_CT16S ||
+                ctx.tex0.psm == GS_PSM_Z32 ||
+                ctx.tex0.psm == GS_PSM_Z24 ||
+                ctx.tex0.psm == GS_PSM_Z16 ||
+                ctx.tex0.psm == GS_PSM_Z16S;
+            if (!directColorOrDepthTexture)
+                return;
+
+            const GSVertex &v0 = vertices[0];
+            const GSVertex &v1 = vertices[1];
+            const GSVertex &v2 = vertices[2];
+            output << index++ << ','
+                   << static_cast<uint32_t>(prim.type) << ','
+                   << static_cast<uint32_t>(prim.iip) << ','
+                   << static_cast<uint32_t>(prim.abe) << ','
+                   << static_cast<uint32_t>(prim.fst) << ','
+                   << static_cast<uint32_t>(prim.ctxt) << ','
+                   << ctx.frame.fbp << ','
+                   << ctx.frame.fbw << ','
+                   << static_cast<uint32_t>(ctx.frame.psm) << ','
+                   << ctx.frame.fbmsk << ','
+                   << ctx.zbuf.zbp << ','
+                   << static_cast<uint32_t>(ctx.zbuf.psm) << ','
+                   << static_cast<uint32_t>(ctx.zbuf.zmask) << ','
+                   << ctx.tex0.tbp0 << ','
+                   << static_cast<uint32_t>(ctx.tex0.tbw) << ','
+                   << static_cast<uint32_t>(ctx.tex0.psm) << ','
+                   << static_cast<uint32_t>(ctx.tex0.tw) << ','
+                   << static_cast<uint32_t>(ctx.tex0.th) << ','
+                   << static_cast<uint32_t>(ctx.tex0.tcc) << ','
+                   << static_cast<uint32_t>(ctx.tex0.tfx) << ','
+                   << ctx.alpha << ','
+                   << ctx.test << ','
+                   << (ctx.xyoffset.ofx >> 4) << ','
+                   << (ctx.xyoffset.ofy >> 4) << ','
+                   << ctx.scissor.x0 << ','
+                   << ctx.scissor.x1 << ','
+                   << ctx.scissor.y0 << ','
+                   << ctx.scissor.y1 << ','
+                   << v0.x << ',' << v0.y << ',' << v0.z << ','
+                   << (v0.u >> 4) << ',' << (v0.v >> 4) << ','
+                   << v1.x << ',' << v1.y << ',' << v1.z << ','
+                   << (v1.u >> 4) << ',' << (v1.v >> 4) << ','
+                   << v2.x << ',' << v2.y << ',' << v2.z << ','
+                   << (v2.u >> 4) << ',' << (v2.v >> 4) << '\n';
+            output.flush();
+        }
+    };
+
+    GSFeedbackTraceState &feedbackTrace()
+    {
+        static GSFeedbackTraceState trace;
+        return trace;
+    }
+
+    struct GSClutTraceState
+    {
+        std::ofstream output;
+        uint64_t index = 0u;
+        uint64_t limit = 100000u;
+        bool initialized = false;
+
+        void initialize()
+        {
+            if (initialized)
+                return;
+
+            initialized = true;
+            const char *path = std::getenv("PS2X_GS_CLUT_TRACE");
+            if (!path || path[0] == '\0')
+                return;
+
+            if (const char *limitText = std::getenv("PS2X_GS_CLUT_TRACE_LIMIT"))
+            {
+                char *end = nullptr;
+                const unsigned long long parsed = std::strtoull(limitText, &end, 0);
+                if (end != limitText && end && *end == '\0' && parsed != 0u)
+                    limit = parsed;
+            }
+
+            output.open(path, std::ios::out | std::ios::trunc);
+            if (output)
+            {
+                output << "index,context,tbp0,tpsm,cbp,cpsm,csm,csa,cld,"
+                          "raw_nonzero_bytes,raw_max_byte,decoded_nonzero_entries,"
+                          "decoded_alpha_nonzero_entries,decoded_max_alpha\n";
+            }
+        }
+
+        bool enabled()
+        {
+            initialize();
+            return output.is_open() && index < limit;
+        }
+    };
+
+    GSClutTraceState &clutTrace()
+    {
+        static GSClutTraceState trace;
+        return trace;
+    }
+
+    struct GSDrawDumpState
+    {
+        std::string directory;
+        std::vector<uint64_t> indices;
+        bool dumpVram = false;
+        bool initialized = false;
+
+        void initialize()
+        {
+            if (initialized)
+                return;
+
+            initialized = true;
+            const char *directoryText = std::getenv("PS2X_GS_DRAW_DUMP_DIR");
+            const char *indicesText = std::getenv("PS2X_GS_DRAW_DUMP_INDICES");
+            if (!directoryText || directoryText[0] == '\0' ||
+                !indicesText || indicesText[0] == '\0')
+            {
+                return;
+            }
+
+            directory = directoryText;
+            if (const char *dumpVramText = std::getenv("PS2X_GS_DRAW_DUMP_VRAM"))
+            {
+                dumpVram = dumpVramText[0] != '\0' &&
+                           std::strcmp(dumpVramText, "0") != 0;
+            }
+            std::stringstream stream(indicesText);
+            std::string token;
+            while (std::getline(stream, token, ','))
+            {
+                char *end = nullptr;
+                const unsigned long long parsed = std::strtoull(token.c_str(), &end, 0);
+                if (end != token.c_str() && end && *end == '\0')
+                    indices.push_back(static_cast<uint64_t>(parsed));
+            }
+        }
+
+        bool contains(uint64_t index)
+        {
+            initialize();
+            if (indices.empty())
+                return false;
+            return std::find(indices.begin(), indices.end(), index) != indices.end();
+        }
+    };
+
+    GSDrawDumpState &drawDump()
+    {
+        static GSDrawDumpState dump;
+        return dump;
+    }
+
+    struct GSPixelTraceTarget
+    {
+        bool enabled = false;
+        int x = 0;
+        int y = 0;
+    };
+
+    const GSPixelTraceTarget &pixelTraceTarget()
+    {
+        static const GSPixelTraceTarget target = []
+        {
+            GSPixelTraceTarget value;
+            if (const char *text = std::getenv("PS2X_GS_TRACE_PIXEL"))
+            {
+                value.enabled =
+                    std::sscanf(
+                        text,
+                        "%d,%d",
+                        &value.x,
+                        &value.y) == 2;
+            }
+            return value;
+        }();
+        return target;
+    }
+
+    bool tracePixelMatches(int x, int y)
+    {
+        const GSPixelTraceTarget &target = pixelTraceTarget();
+        return target.enabled && x == target.x && y == target.y;
+    }
+
+    void dumpDrawFramebuffer(GS *gs,
+                             const GSContext &ctx,
+                             uint64_t index,
+                             const char *phase)
+    {
+        GSDrawDumpState &dump = drawDump();
+        if (!dump.contains(index))
+            return;
+
+        constexpr uint32_t width = 640u;
+        constexpr uint32_t height = 448u;
+        std::ostringstream path;
+        path << dump.directory
+             << "/draw-" << index
+             << '-' << phase
+             << "-fbp-" << ctx.frame.fbp
+             << ".ppm";
+        std::ofstream output(path.str(), std::ios::out | std::ios::binary | std::ios::trunc);
+        if (!output)
+            return;
+
+        std::ostringstream alphaPath;
+        alphaPath << dump.directory
+                  << "/draw-" << index
+                  << '-' << phase
+                  << "-fbp-" << ctx.frame.fbp
+                  << "-alpha.pgm";
+        std::ofstream alphaOutput(alphaPath.str(),
+                                  std::ios::out | std::ios::binary | std::ios::trunc);
+
+        output << "P6\n" << width << ' ' << height << "\n255\n";
+        if (alphaOutput)
+            alphaOutput << "P5\n" << width << ' ' << height << "\n255\n";
+
+        const uint32_t base = GSInternal::framePageBaseToBlock(ctx.frame.fbp);
+        const uint32_t bufferWidth = std::max<uint32_t>(ctx.frame.fbw, 1u);
+        for (uint32_t y = 0; y < height; ++y)
+        {
+            for (uint32_t x = 0; x < width; ++x)
+            {
+                uint32_t rgba = gs->ReadVram(ctx.frame.psm, base, bufferWidth, x, y);
+                if (bitsPerPixel(ctx.frame.psm) == 16)
+                    rgba = Rgba5551ToRgba8888(static_cast<uint16_t>(rgba));
+                const uint8_t rgb[3] = {
+                    static_cast<uint8_t>(rgba),
+                    static_cast<uint8_t>(rgba >> 8),
+                    static_cast<uint8_t>(rgba >> 16)};
+                output.write(reinterpret_cast<const char *>(rgb), sizeof(rgb));
+                if (alphaOutput)
+                {
+                    const uint8_t alpha = static_cast<uint8_t>(rgba >> 24);
+                    alphaOutput.write(reinterpret_cast<const char *>(&alpha),
+                                      sizeof(alpha));
+                }
+            }
+        }
+    }
+
+    PS2X_GS_ALWAYS_INLINE bool passesAlphaTest(
+        uint64_t testReg,
+        uint8_t alpha)
     {
         if ((testReg & 0x1u) == 0u)
             return true;
@@ -135,26 +656,56 @@ namespace
     struct AlphaTestResult
     {
         bool writeFramebuffer;
+        bool writeDepth;
         bool preserveDestinationAlpha;
     };
 
-    AlphaTestResult classifyAlphaTest(uint64_t testReg, uint8_t alpha)
+    PS2X_GS_ALWAYS_INLINE AlphaTestResult classifyAlphaTest(
+        uint64_t testReg,
+        uint8_t alpha)
     {
         const bool pass = passesAlphaTest(testReg, alpha);
         if (pass)
-            return {true, false};
+            return {true, true, false};
 
         // TEST.AFAIL controls what happens when the alpha comparison fails.
         switch (static_cast<uint8_t>((testReg >> 12) & 0x3u))
         {
         case 1: // FB_ONLY
-            return {true, false};
-        case 3: // RGB_ONLY
-            return {true, true};
-        case 0: // KEEP
+            return {true, false, false};
         case 2: // ZB_ONLY
+            return {false, true, false};
+        case 3: // RGB_ONLY
+            return {true, false, true};
+        case 0: // KEEP
         default:
-            return {false, false};
+            return {false, false, false};
+        }
+    }
+
+    bool destinationAlphaTestEnabled(uint64_t testReg, uint8_t framePsm)
+    {
+        return ((testReg >> 14u) & 1u) != 0u &&
+               framePsm != GS_PSM_CT24;
+    }
+
+    bool passesDestinationAlphaTest(uint64_t testReg,
+                                    uint8_t framePsm,
+                                    uint32_t framebufferValue)
+    {
+        if (!destinationAlphaTestEnabled(testReg, framePsm))
+            return true;
+
+        const uint32_t expected = (testReg >> 15u) & 1u;
+        switch (framePsm)
+        {
+        case GS_PSM_CT32:
+            return ((framebufferValue >> 31u) & 1u) == expected;
+        case GS_PSM_CT16:
+        case GS_PSM_CT16S:
+            return ((framebufferValue >> 15u) & 1u) == expected;
+        default:
+            return true;
         }
     }
 
@@ -166,6 +717,80 @@ namespace
         uint8_t a;
     };
 
+    PS2X_GS_ALWAYS_INLINE uint8_t modulateTextureChannelFixed(
+        uint8_t texture,
+        int vertexFixed)
+    {
+        // The GS color interpolator carries seven fractional bits into the
+        // texture function. Truncating the vertex color to eight bits before
+        // modulation loses visible precision on Gouraud-shaded primitives.
+        const int fixed = clampInt(vertexFixed, 0, 0x7FFF);
+        return clampU8((static_cast<int>(texture) * fixed) >> 14);
+    }
+
+    PS2X_GS_ALWAYS_INLINE TextureCombineResult combineTextureFixed(
+        const GSTex0Reg &tex,
+        int vr,
+        int vg,
+        int vb,
+        int va,
+        uint8_t tr,
+        uint8_t tg,
+        uint8_t tb,
+        uint8_t ta)
+    {
+        const bool textureHasAlpha = tex.tcc != 0u;
+        const uint8_t vertexAlpha = clampU8(va >> 7);
+        TextureCombineResult out{
+            tr, tg, tb, textureHasAlpha ? ta : vertexAlpha};
+
+        switch (tex.tfx)
+        {
+        case 0: // MODULATE
+            out.r = modulateTextureChannelFixed(tr, vr);
+            out.g = modulateTextureChannelFixed(tg, vg);
+            out.b = modulateTextureChannelFixed(tb, vb);
+            out.a = textureHasAlpha
+                        ? modulateTextureChannelFixed(ta, va)
+                        : vertexAlpha;
+            break;
+        case 1: // DECAL
+            out.r = tr;
+            out.g = tg;
+            out.b = tb;
+            out.a = textureHasAlpha ? ta : vertexAlpha;
+            break;
+        case 2: // HIGHLIGHT
+            out.r = clampU8(
+                modulateTextureChannelFixed(tr, vr) + vertexAlpha);
+            out.g = clampU8(
+                modulateTextureChannelFixed(tg, vg) + vertexAlpha);
+            out.b = clampU8(
+                modulateTextureChannelFixed(tb, vb) + vertexAlpha);
+            out.a = textureHasAlpha
+                        ? clampU8(ta + vertexAlpha)
+                        : vertexAlpha;
+            break;
+        case 3: // HIGHLIGHT2
+            out.r = clampU8(
+                modulateTextureChannelFixed(tr, vr) + vertexAlpha);
+            out.g = clampU8(
+                modulateTextureChannelFixed(tg, vg) + vertexAlpha);
+            out.b = clampU8(
+                modulateTextureChannelFixed(tb, vb) + vertexAlpha);
+            out.a = textureHasAlpha ? ta : vertexAlpha;
+            break;
+        default:
+            out.r = tr;
+            out.g = tg;
+            out.b = tb;
+            out.a = textureHasAlpha ? ta : vertexAlpha;
+            break;
+        }
+
+        return out;
+    }
+
     TextureCombineResult combineTexture(const GSTex0Reg &tex,
                                         uint8_t vr,
                                         uint8_t vg,
@@ -176,44 +801,16 @@ namespace
                                         uint8_t tb,
                                         uint8_t ta)
     {
-        const bool textureHasAlpha = tex.tcc != 0u;
-        TextureCombineResult out{tr, tg, tb, textureHasAlpha ? ta : va};
-
-        switch (tex.tfx)
-        {
-        case 0: // MODULATE
-            out.r = clampU8((tr * vr) >> 7);
-            out.g = clampU8((tg * vg) >> 7);
-            out.b = clampU8((tb * vb) >> 7);
-            out.a = textureHasAlpha ? clampU8((ta * va) >> 7) : va;
-            break;
-        case 1: // DECAL
-            out.r = tr;
-            out.g = tg;
-            out.b = tb;
-            out.a = textureHasAlpha ? ta : va;
-            break;
-        case 2: // HIGHLIGHT
-            out.r = clampU8(((tr * vr) >> 7) + va);
-            out.g = clampU8(((tg * vg) >> 7) + va);
-            out.b = clampU8(((tb * vb) >> 7) + va);
-            out.a = textureHasAlpha ? clampU8(ta + va) : va;
-            break;
-        case 3: // HIGHLIGHT2
-            out.r = clampU8(((tr * vr) >> 7) + va);
-            out.g = clampU8(((tg * vg) >> 7) + va);
-            out.b = clampU8(((tb * vb) >> 7) + va);
-            out.a = textureHasAlpha ? ta : va;
-            break;
-        default:
-            out.r = tr;
-            out.g = tg;
-            out.b = tb;
-            out.a = textureHasAlpha ? ta : va;
-            break;
-        }
-
-        return out;
+        return combineTextureFixed(
+            tex,
+            static_cast<int>(vr) << 7,
+            static_cast<int>(vg) << 7,
+            static_cast<int>(vb) << 7,
+            static_cast<int>(va) << 7,
+            tr,
+            tg,
+            tb,
+            ta);
     }
 
     uint32_t swizzleClutIndexCSM1(uint32_t index)
@@ -257,17 +854,1173 @@ namespace
         return mmag != 0u || mmin == 1u || (mmin & 0x4u) != 0u;
     }
 
-    uint8_t lerpChannel(uint8_t c00, uint8_t c10, uint8_t c01, uint8_t c11, float fx, float fy)
+    int wrapTextureCoordinate(int coordinate,
+                              int textureSize,
+                              uint8_t mode,
+                              uint16_t regionMin,
+                              uint16_t regionMax)
     {
-        const float top = static_cast<float>(c00) + (static_cast<float>(c10) - static_cast<float>(c00)) * fx;
-        const float bottom = static_cast<float>(c01) + (static_cast<float>(c11) - static_cast<float>(c01)) * fx;
-        return clampU8(static_cast<int>(std::lround(top + (bottom - top) * fy)));
+        const int size = std::max(textureSize, 1);
+        const uint32_t textureMask = static_cast<uint32_t>(size - 1);
+
+        switch (mode)
+        {
+        case 0: // REPEAT
+            return static_cast<int>(static_cast<uint32_t>(coordinate) & textureMask);
+        case 1: // CLAMP
+            return clampInt(coordinate, 0, size - 1);
+        case 2: // REGION_CLAMP
+        {
+            const int minimum = std::min<int>(regionMin, size - 1);
+            const int maximum = std::min<int>(regionMax, size - 1);
+            return clampInt(coordinate, minimum, maximum);
+        }
+        case 3: // REGION_REPEAT
+        {
+            const uint32_t mask = static_cast<uint32_t>(regionMin) & textureMask;
+            return static_cast<int>((static_cast<uint32_t>(coordinate) & mask) |
+                                    static_cast<uint32_t>(regionMax));
+        }
+        default:
+            return clampInt(coordinate, 0, size - 1);
+        }
     }
+
+    int arithmeticShiftRight4(int value)
+    {
+        // The GS filter uses signed 16-bit arithmetic shifts. Spell out floor
+        // division so the result does not depend on the implementation's
+        // handling of right shifts of negative integers.
+        return value >= 0 ? (value / 16) : -((-value + 15) / 16);
+    }
+
+    int floorFixed16_16(int32_t value)
+    {
+        int quotient = value / 65536;
+        if (value < 0 && (value % 65536) != 0)
+            --quotient;
+        return quotient;
+    }
+
+    float approximateLog2Precision3(float value)
+    {
+        // The GS software reference uses a deliberately low-order mantissa
+        // polynomial for LOD. Near a half-level boundary, std::log2 can pick
+        // the adjacent mip even though both values look nearly identical.
+        uint32_t bits = 0u;
+        std::memcpy(&bits, &value, sizeof(bits));
+        bits &= 0x7FFFFFFFu;
+
+        const int exponent =
+            static_cast<int>((bits >> 23u) & 0xFFu) - 127;
+        const uint32_t mantissaBits =
+            (bits & 0x007FFFFFu) | 0x3F800000u;
+        float mantissa = 1.0f;
+        std::memcpy(
+            &mantissa, &mantissaBits, sizeof(mantissa));
+
+        float polynomial =
+            0.204446009836232697516f * mantissa +
+            -1.04913055217340124191f;
+        polynomial =
+            polynomial * mantissa +
+            2.28330284476918490682f;
+        polynomial *= mantissa - 1.0f;
+        return polynomial + static_cast<float>(exponent);
+    }
+
+    uint8_t lerpChannel4(uint8_t c00,
+                         uint8_t c10,
+                         uint8_t c01,
+                         uint8_t c11,
+                         uint8_t weightU,
+                         uint8_t weightV)
+    {
+        auto lerp = [](int from, int to, int weight)
+        {
+            return from + arithmeticShiftRight4((to - from) * weight);
+        };
+
+        const int top = lerp(c00, c10, weightU);
+        const int bottom = lerp(c01, c11, weightU);
+        return clampU8(lerp(top, bottom, weightV));
+    }
+
+    uint32_t bilinearColor4(uint32_t c00,
+                            uint32_t c10,
+                            uint32_t c01,
+                            uint32_t c11,
+                            uint8_t weightU,
+                            uint8_t weightV)
+    {
+#if defined(__SSE4_1__)
+        const __m128i zero = _mm_setzero_si128();
+        const __m128i maximum = _mm_set1_epi32(255);
+        const __m128i u = _mm_set1_epi32(weightU);
+        const __m128i v = _mm_set1_epi32(weightV);
+        const __m128i color00 =
+            _mm_cvtepu8_epi32(_mm_cvtsi32_si128(c00));
+        const __m128i color10 =
+            _mm_cvtepu8_epi32(_mm_cvtsi32_si128(c10));
+        const __m128i color01 =
+            _mm_cvtepu8_epi32(_mm_cvtsi32_si128(c01));
+        const __m128i color11 =
+            _mm_cvtepu8_epi32(_mm_cvtsi32_si128(c11));
+        const __m128i top = _mm_add_epi32(
+            color00,
+            _mm_srai_epi32(
+                _mm_mullo_epi32(
+                    _mm_sub_epi32(color10, color00), u),
+                4));
+        const __m128i bottom = _mm_add_epi32(
+            color01,
+            _mm_srai_epi32(
+                _mm_mullo_epi32(
+                    _mm_sub_epi32(color11, color01), u),
+                4));
+        __m128i result = _mm_add_epi32(
+            top,
+            _mm_srai_epi32(
+                _mm_mullo_epi32(_mm_sub_epi32(bottom, top), v),
+                4));
+        result = _mm_min_epi32(
+            _mm_max_epi32(result, zero), maximum);
+        return static_cast<uint32_t>(_mm_cvtsi128_si32(
+            _mm_packus_epi16(
+                _mm_packus_epi32(result, result), zero)));
+#else
+        const uint8_t r = lerpChannel4(
+            static_cast<uint8_t>(c00),
+            static_cast<uint8_t>(c10),
+            static_cast<uint8_t>(c01),
+            static_cast<uint8_t>(c11),
+            weightU,
+            weightV);
+        const uint8_t g = lerpChannel4(
+            static_cast<uint8_t>(c00 >> 8u),
+            static_cast<uint8_t>(c10 >> 8u),
+            static_cast<uint8_t>(c01 >> 8u),
+            static_cast<uint8_t>(c11 >> 8u),
+            weightU,
+            weightV);
+        const uint8_t b = lerpChannel4(
+            static_cast<uint8_t>(c00 >> 16u),
+            static_cast<uint8_t>(c10 >> 16u),
+            static_cast<uint8_t>(c01 >> 16u),
+            static_cast<uint8_t>(c11 >> 16u),
+            weightU,
+            weightV);
+        const uint8_t a = lerpChannel4(
+            static_cast<uint8_t>(c00 >> 24u),
+            static_cast<uint8_t>(c10 >> 24u),
+            static_cast<uint8_t>(c01 >> 24u),
+            static_cast<uint8_t>(c11 >> 24u),
+            weightU,
+            weightV);
+
+        return static_cast<uint32_t>(r) |
+               (static_cast<uint32_t>(g) << 8u) |
+               (static_cast<uint32_t>(b) << 16u) |
+               (static_cast<uint32_t>(a) << 24u);
+#endif
+    }
+
+    PS2X_GS_ALWAYS_INLINE uint32_t blendSourceOverRgb(
+        uint32_t source,
+        uint32_t destination,
+        uint8_t alpha)
+    {
+#if defined(__SSE4_1__)
+        const __m128i sourceChannels =
+            _mm_cvtepu8_epi32(_mm_cvtsi32_si128(source));
+        const __m128i destinationChannels =
+            _mm_cvtepu8_epi32(_mm_cvtsi32_si128(destination));
+        __m128i result = _mm_add_epi32(
+            destinationChannels,
+            _mm_srai_epi32(
+                _mm_mullo_epi32(
+                    _mm_sub_epi32(
+                        sourceChannels, destinationChannels),
+                    _mm_set1_epi32(alpha)),
+                7));
+        result = _mm_min_epi32(
+            _mm_max_epi32(result, _mm_setzero_si128()),
+            _mm_set1_epi32(255));
+        return static_cast<uint32_t>(_mm_cvtsi128_si32(
+            _mm_packus_epi16(
+                _mm_packus_epi32(result, result),
+                _mm_setzero_si128())));
+#else
+        uint32_t result = source & 0xFF000000u;
+        for (uint32_t shift = 0u; shift < 24u; shift += 8u)
+        {
+            const int sourceChannel =
+                static_cast<int>((source >> shift) & 0xFFu);
+            const int destinationChannel =
+                static_cast<int>((destination >> shift) & 0xFFu);
+            const int blended = clampInt(
+                (((sourceChannel - destinationChannel) * alpha) >> 7) +
+                    destinationChannel,
+                0,
+                255);
+            result |= static_cast<uint32_t>(blended) << shift;
+        }
+        return result;
+#endif
+    }
+
+    constexpr uint32_t kGsBlockCount = (4u * 1024u * 1024u) / 256u;
+    constexpr uint32_t kRasterStripeHeight = 16u;
+
+    struct GSBlockRange
+    {
+        uint32_t start = 0u;
+        uint32_t count = 0u;
+    };
+
+    bool blockRangesOverlap(GSBlockRange lhs, GSBlockRange rhs)
+    {
+        if (lhs.count == 0u || rhs.count == 0u)
+            return false;
+        if (lhs.count >= kGsBlockCount || rhs.count >= kGsBlockCount)
+            return true;
+
+        lhs.start %= kGsBlockCount;
+        rhs.start %= kGsBlockCount;
+
+        struct LinearRange
+        {
+            uint32_t begin;
+            uint32_t end;
+        };
+        auto split = [](GSBlockRange range,
+                        std::array<LinearRange, 2> &out) -> uint32_t
+        {
+            const uint32_t end = range.start + range.count;
+            if (end <= kGsBlockCount)
+            {
+                out[0] = {range.start, end};
+                return 1u;
+            }
+
+            out[0] = {range.start, kGsBlockCount};
+            out[1] = {0u, end - kGsBlockCount};
+            return 2u;
+        };
+
+        std::array<LinearRange, 2> lhsParts{};
+        std::array<LinearRange, 2> rhsParts{};
+        const uint32_t lhsCount = split(lhs, lhsParts);
+        const uint32_t rhsCount = split(rhs, rhsParts);
+        for (uint32_t i = 0u; i < lhsCount; ++i)
+        {
+            for (uint32_t j = 0u; j < rhsCount; ++j)
+            {
+                if (lhsParts[i].begin < rhsParts[j].end &&
+                    rhsParts[j].begin < lhsParts[i].end)
+                {
+                    return true;
+                }
+            }
+        }
+        return false;
+    }
+
+    uint32_t surfaceBlockCount(uint8_t psm,
+                               uint32_t widthUnits,
+                               uint32_t maximumX,
+                               uint32_t maximumY)
+    {
+        uint32_t pageWidth = 64u;
+        uint32_t pageHeight = 32u;
+        uint32_t pagesPerRow = std::max(widthUnits, 1u);
+        switch (psm)
+        {
+        case GS_PSM_T8:
+            pageWidth = 128u;
+            pageHeight = 64u;
+            pagesPerRow = std::max(widthUnits >> 1u, 1u);
+            break;
+        case GS_PSM_CT32:
+        case GS_PSM_CT24:
+        case GS_PSM_Z32:
+        case GS_PSM_Z24:
+        default:
+            break;
+        }
+
+        const uint64_t maximumPage =
+            static_cast<uint64_t>(maximumY / pageHeight) *
+                pagesPerRow +
+            maximumX / pageWidth;
+        return static_cast<uint32_t>(std::min<uint64_t>(
+            (maximumPage + 1u) * 32u,
+            kGsBlockCount));
+    }
+
+    GSBlockRange framebufferRange(const GSContext &ctx)
+    {
+        return {
+            GSInternal::framePageBaseToBlock(ctx.frame.fbp),
+            surfaceBlockCount(ctx.frame.psm,
+                              ctx.frame.fbw,
+                              ctx.scissor.x1,
+                              ctx.scissor.y1),
+        };
+    }
+
+    GSBlockRange depthRange(const GSContext &ctx)
+    {
+        return {
+            GSInternal::framePageBaseToBlock(ctx.zbuf.zbp),
+            surfaceBlockCount(ctx.zbuf.psm,
+                              ctx.frame.fbw,
+                              ctx.scissor.x1,
+                              ctx.scissor.y1),
+        };
+    }
+
+    GSBlockRange textureRange(const GSContext &ctx, uint8_t level)
+    {
+        uint32_t base = ctx.tex0.tbp0;
+        uint8_t width = ctx.tex0.tbw;
+        if (level != 0u)
+        {
+            const uint64_t mipRegister =
+                level <= 3u ? ctx.miptbp1 : ctx.miptbp2;
+            const uint8_t slot =
+                static_cast<uint8_t>((level - 1u) % 3u);
+            const uint8_t shift = static_cast<uint8_t>(slot * 20u);
+            base = static_cast<uint32_t>(
+                (mipRegister >> shift) & 0x3FFFu);
+            width = static_cast<uint8_t>(
+                (mipRegister >> (shift + 14u)) & 0x3Fu);
+        }
+
+        const uint32_t textureWidth =
+            std::max(1u, (1u << ctx.tex0.tw) >> level);
+        const uint32_t textureHeight =
+            std::max(1u, (1u << ctx.tex0.th) >> level);
+        return {
+            base,
+            surfaceBlockCount(ctx.tex0.psm,
+                              width,
+                              textureWidth - 1u,
+                              textureHeight - 1u),
+        };
+    }
+
+    bool rasterizerInstrumentationRequested()
+    {
+#if AGRESSIVE_LOGS
+        return true;
+#else
+        static const bool requested = []
+        {
+            constexpr const char *names[] = {
+                "PS2X_GS_DRAW_TRACE",
+                "PS2X_GS_FEEDBACK_TRACE",
+                "PS2X_GS_CLUT_TRACE",
+                "PS2X_GS_DRAW_DUMP_DIR",
+                "PS2X_GS_TRACE_PIXEL",
+            };
+            for (const char *name : names)
+            {
+                const char *value = std::getenv(name);
+                if (value && value[0] != '\0')
+                    return true;
+            }
+            return false;
+        }();
+        return requested;
+#endif
+    }
+
+    uint32_t requestedRasterThreadCount()
+    {
+        const char *disabled =
+            std::getenv("PS2X_GS_DISABLE_PARALLEL_RASTERIZER");
+        if (disabled && disabled[0] != '\0' &&
+            std::strcmp(disabled, "0") != 0)
+        {
+            return 1u;
+        }
+
+        const uint32_t hardwareThreads =
+            std::max(std::thread::hardware_concurrency(), 1u);
+        uint32_t count = std::min(hardwareThreads, 8u);
+        if (const char *text =
+                std::getenv("PS2X_GS_RASTER_THREADS"))
+        {
+            char *end = nullptr;
+            const unsigned long parsed = std::strtoul(text, &end, 0);
+            if (end != text && end && *end == '\0' && parsed != 0u)
+            {
+                count = static_cast<uint32_t>(
+                    std::min<unsigned long>(parsed, 16u));
+            }
+        }
+        return count;
+    }
+}
+
+struct GSRasterizer::ParallelState
+{
+    struct DecodedPalette
+    {
+        std::array<uint32_t, 256> colors{};
+        uint64_t generation = 0u;
+        uint64_t serial = 0u;
+        uint16_t texa = 0u;
+        uint8_t sourcePsm = 0u;
+        uint8_t csm = 0u;
+        uint8_t csa = 0u;
+    };
+
+    struct Command
+    {
+        GSContext context{};
+        GSPrimReg prim{};
+        GSVertex vertices[3]{};
+        int32_t fixedX[3]{};
+        int32_t fixedY[3]{};
+        GSTexaReg texa{};
+        uint32_t fogColor = 0u;
+        bool pabe = false;
+        bool feedbackSnapshot = false;
+        size_t paletteIndex = SIZE_MAX;
+        uint32_t workerMask = 0u;
+    };
+
+    explicit ParallelState(GSRasterizer *owner_, uint32_t count)
+        : owner(owner_), workerCount(count)
+    {
+        const char *stats =
+            std::getenv("PS2X_GS_RASTER_BATCH_STATS");
+        statsEnabled =
+            stats && stats[0] != '\0' &&
+            std::strcmp(stats, "0") != 0;
+        commands.reserve(1024u);
+        palettes.reserve(16u);
+        workerCommands.resize(workerCount);
+        workerDrawTotals.resize(workerCount);
+        workerNanoseconds.resize(workerCount);
+        renderGs.reserve(workerCount);
+        for (uint32_t i = 0u; i < workerCount; ++i)
+            renderGs.emplace_back(std::make_unique<GS>());
+
+        threads.reserve(workerCount - 1u);
+        for (uint32_t i = 1u; i < workerCount; ++i)
+        {
+            threads.emplace_back([this, i]
+            {
+                workerLoop(i);
+            });
+        }
+    }
+
+    ~ParallelState()
+    {
+        {
+            std::lock_guard<std::mutex> lock(workMutex);
+            stopping = true;
+            ++generation;
+        }
+        workReady.notify_all();
+        for (std::thread &thread : threads)
+        {
+            if (thread.joinable())
+                thread.join();
+        }
+
+        if (statsEnabled)
+        {
+            std::cerr
+                << "[gs:raster-batches] draws=" << queuedDraws
+                << " batches=" << batches
+                << " parallel=" << parallelBatches
+                << " sequential=" << sequentialBatches
+                << " parallel-draws=" << parallelDraws
+                << " sequential-draws=" << sequentialDraws
+                << " max-draws=" << maximumBatchDraws
+                << '\n';
+            for (uint32_t i = 0u; i < workerCount; ++i)
+            {
+                std::cerr
+                    << "[gs:raster-worker] index=" << i
+                    << " draws=" << workerDrawTotals[i]
+                    << " milliseconds="
+                    << static_cast<double>(workerNanoseconds[i]) /
+                           1000000.0
+                    << '\n';
+            }
+        }
+    }
+
+    void workerLoop(uint32_t workerIndex)
+    {
+        uint64_t observedGeneration = 0u;
+        std::unique_lock<std::mutex> lock(workMutex);
+        for (;;)
+        {
+            workReady.wait(lock, [&]
+            {
+                return stopping || generation != observedGeneration;
+            });
+            if (stopping)
+                return;
+
+            observedGeneration = generation;
+            lock.unlock();
+            const auto start = std::chrono::steady_clock::now();
+            for (size_t commandIndex : workerCommands[workerIndex])
+            {
+                owner->renderQueuedPrimitive(
+                    renderGs[workerIndex].get(),
+                    commandIndex,
+                    workerIndex,
+                    workerCount);
+            }
+            if (statsEnabled)
+            {
+                workerDrawTotals[workerIndex] +=
+                    workerCommands[workerIndex].size();
+                workerNanoseconds[workerIndex] +=
+                    static_cast<uint64_t>(
+                        std::chrono::duration_cast<
+                            std::chrono::nanoseconds>(
+                            std::chrono::steady_clock::now() -
+                            start)
+                            .count());
+            }
+            lock.lock();
+            if (--workersRemaining == 0u)
+                workComplete.notify_one();
+        }
+    }
+
+    GSRasterizer *owner = nullptr;
+    GS *primaryGs = nullptr;
+    uint32_t workerCount = 1u;
+    bool batchActive = false;
+    bool eligibilityCacheValid = false;
+    bool cachedEligible = false;
+    bool cachedRecursiveFeedback = false;
+    GSContext eligibilityContext{};
+    GSPrimReg eligibilityPrim{};
+    GSBlockRange eligibleFrameRange{};
+    GSBlockRange eligibleDepthRange{};
+    bool outputGroupValid = false;
+    GSFrameReg groupFrame{};
+    GSZbufReg groupDepth{};
+    GSBlockRange groupFrameRange{};
+    GSBlockRange groupDepthRange{};
+    std::vector<Command> commands;
+    std::vector<DecodedPalette> palettes;
+    std::vector<std::vector<size_t>> workerCommands;
+    std::vector<std::unique_ptr<GS>> renderGs;
+    std::vector<std::thread> threads;
+    std::vector<uint64_t> workerDrawTotals;
+    std::vector<uint64_t> workerNanoseconds;
+    std::mutex workMutex;
+    std::condition_variable workReady;
+    std::condition_variable workComplete;
+    uint64_t generation = 0u;
+    uint64_t nextPaletteSerial = 1u;
+    uint32_t workersRemaining = 0u;
+    bool stopping = false;
+    bool statsEnabled = false;
+    uint64_t queuedDraws = 0u;
+    uint64_t batches = 0u;
+    uint64_t parallelBatches = 0u;
+    uint64_t sequentialBatches = 0u;
+    uint64_t parallelDraws = 0u;
+    uint64_t sequentialDraws = 0u;
+    size_t maximumBatchDraws = 0u;
+};
+
+GSRasterizer::GSRasterizer() = default;
+GSRasterizer::~GSRasterizer() = default;
+
+bool GSRasterizer::beginDrawBatch(GS *gs)
+{
+    if (!gs || rasterizerInstrumentationRequested() ||
+        !gs->m_debugHistoryPaused)
+    {
+        return false;
+    }
+
+    if (!m_parallelState)
+    {
+        const uint32_t threadCount = requestedRasterThreadCount();
+        if (threadCount <= 1u)
+            return false;
+        m_parallelState =
+            std::make_unique<ParallelState>(this, threadCount);
+    }
+
+    if (m_parallelState->batchActive)
+        return false;
+
+    m_parallelState->primaryGs = gs;
+    m_parallelState->batchActive = true;
+    return true;
+}
+
+void GSRasterizer::flushDrawBatch(GS *gs)
+{
+    ParallelState *state = m_parallelState.get();
+    if (!state || state->commands.empty())
+    {
+        if (state)
+            state->outputGroupValid = false;
+        return;
+    }
+
+    if (gs && state->primaryGs && gs != state->primaryGs)
+        return;
+
+    ++state->batches;
+    state->queuedDraws += state->commands.size();
+    state->maximumBatchDraws =
+        std::max(state->maximumBatchDraws, state->commands.size());
+
+    uint32_t populatedWorkers = 0u;
+    for (const auto &commands : state->workerCommands)
+        populatedWorkers += commands.empty() ? 0u : 1u;
+
+    constexpr size_t kMinimumParallelDraws = 8u;
+    const bool useWorkers =
+        state->commands.size() >= kMinimumParallelDraws &&
+        populatedWorkers >= 2u;
+    if (!useWorkers)
+    {
+        ++state->sequentialBatches;
+        state->sequentialDraws += state->commands.size();
+        for (size_t commandIndex = 0u;
+             commandIndex < state->commands.size();
+             ++commandIndex)
+        {
+            renderQueuedPrimitive(
+                state->renderGs[0].get(),
+                commandIndex,
+                0u,
+                1u);
+        }
+    }
+    else
+    {
+        ++state->parallelBatches;
+        state->parallelDraws += state->commands.size();
+        {
+            std::lock_guard<std::mutex> lock(state->workMutex);
+            state->workersRemaining = state->workerCount - 1u;
+            ++state->generation;
+        }
+        state->workReady.notify_all();
+
+        const auto mainStart =
+            std::chrono::steady_clock::now();
+        for (size_t commandIndex : state->workerCommands[0])
+        {
+            renderQueuedPrimitive(
+                state->renderGs[0].get(),
+                commandIndex,
+                0u,
+                state->workerCount);
+        }
+        if (state->statsEnabled)
+        {
+            state->workerDrawTotals[0] +=
+                state->workerCommands[0].size();
+            state->workerNanoseconds[0] +=
+                static_cast<uint64_t>(
+                    std::chrono::duration_cast<
+                        std::chrono::nanoseconds>(
+                        std::chrono::steady_clock::now() -
+                        mainStart)
+                        .count());
+        }
+
+        std::unique_lock<std::mutex> lock(state->workMutex);
+        state->workComplete.wait(lock, [&]
+        {
+            return state->workersRemaining == 0u;
+        });
+    }
+
+    state->commands.clear();
+    state->palettes.clear();
+    for (auto &commands : state->workerCommands)
+        commands.clear();
+    state->outputGroupValid = false;
+}
+
+void GSRasterizer::endDrawBatch(GS *gs)
+{
+    flushDrawBatch(gs);
+    if (m_parallelState)
+    {
+        m_parallelState->batchActive = false;
+        m_parallelState->primaryGs = nullptr;
+    }
+}
+
+bool GSRasterizer::tryQueuePrimitive(GS *gs)
+{
+    ParallelState *state = m_parallelState.get();
+    if (!state || !state->batchActive || state->primaryGs != gs)
+        return false;
+
+    switch (gs->m_prim.type)
+    {
+    case GS_PRIM_TRIANGLE:
+    case GS_PRIM_TRISTRIP:
+    case GS_PRIM_TRIFAN:
+    case GS_PRIM_SPRITE:
+        break;
+    default:
+        return false;
+    }
+
+    const GSContext &ctx = gs->activeContext();
+    auto sameEligibilityState =
+        [&](const GSContext &cached,
+            const GSPrimReg &cachedPrim)
+    {
+        return
+            cached.frame.fbp == ctx.frame.fbp &&
+            cached.frame.fbw == ctx.frame.fbw &&
+            cached.frame.psm == ctx.frame.psm &&
+            cached.frame.fbmsk == ctx.frame.fbmsk &&
+            cached.scissor.x0 == ctx.scissor.x0 &&
+            cached.scissor.x1 == ctx.scissor.x1 &&
+            cached.scissor.y0 == ctx.scissor.y0 &&
+            cached.scissor.y1 == ctx.scissor.y1 &&
+            cached.zbuf.zbp == ctx.zbuf.zbp &&
+            cached.zbuf.psm == ctx.zbuf.psm &&
+            cached.zbuf.zmask == ctx.zbuf.zmask &&
+            cached.tex0.tbp0 == ctx.tex0.tbp0 &&
+            cached.tex0.tbw == ctx.tex0.tbw &&
+            cached.tex0.psm == ctx.tex0.psm &&
+            cached.tex0.tw == ctx.tex0.tw &&
+            cached.tex0.th == ctx.tex0.th &&
+            cached.tex1 == ctx.tex1 &&
+            cached.miptbp1 == ctx.miptbp1 &&
+            cached.miptbp2 == ctx.miptbp2 &&
+            cached.test == ctx.test &&
+            cached.alpha == ctx.alpha &&
+            cachedPrim.tme == gs->m_prim.tme &&
+            cachedPrim.abe == gs->m_prim.abe;
+    };
+    if (!state->eligibilityCacheValid ||
+        !sameEligibilityState(
+            state->eligibilityContext,
+            state->eligibilityPrim))
+    {
+        state->eligibilityCacheValid = true;
+        state->eligibilityContext = ctx;
+        state->eligibilityPrim = gs->m_prim;
+
+        bool eligible =
+            ctx.frame.psm == GS_PSM_CT32 &&
+            ctx.frame.fbmsk == 0u &&
+            !destinationAlphaTestEnabled(
+                ctx.test, GS_PSM_CT32) &&
+            (ctx.zbuf.psm == GS_PSM_Z24 ||
+             ctx.zbuf.psm == GS_PSM_Z32) &&
+            (!gs->m_prim.abe ||
+             (ctx.alpha & 0xFFu) == 0x44u) &&
+            (!gs->m_prim.tme ||
+             ctx.tex0.psm == GS_PSM_T8 ||
+             ctx.tex0.psm == GS_PSM_CT32);
+
+        const GSBlockRange frame = framebufferRange(ctx);
+        const bool depthTestEnabled =
+            ((ctx.test >> 16u) & 1u) != 0u;
+        const uint8_t depthTestMethod =
+            static_cast<uint8_t>((ctx.test >> 17u) & 0x3u);
+        const bool depthSurfaceUsed =
+            depthTestEnabled &&
+            (depthTestMethod >= 2u ||
+             (depthTestMethod != 0u && !ctx.zbuf.zmask));
+        const GSBlockRange depth =
+            depthSurfaceUsed ? depthRange(ctx) : GSBlockRange{};
+        const bool recursiveFeedback =
+            gs->m_prim.tme &&
+            ctx.tex0.tbp0 == frame.start;
+        eligible =
+            eligible && !blockRangesOverlap(frame, depth);
+        if (eligible && gs->m_prim.tme)
+        {
+            uint8_t maximumLevel = 0u;
+            const uint8_t minificationFilter =
+                static_cast<uint8_t>(
+                    (ctx.tex1 >> 6u) & 0x7u);
+            if (minificationFilter >= 2u &&
+                minificationFilter <= 5u)
+            {
+                maximumLevel = static_cast<uint8_t>(
+                    std::min<uint64_t>(
+                        (ctx.tex1 >> 2u) & 0x7u, 6u));
+            }
+            for (uint8_t level = 0u;
+                 level <= maximumLevel;
+                 ++level)
+            {
+                const GSBlockRange texture =
+                    textureRange(ctx, level);
+                if (!recursiveFeedback &&
+                    (blockRangesOverlap(texture, frame) ||
+                     blockRangesOverlap(texture, depth)))
+                {
+                    eligible = false;
+                    break;
+                }
+            }
+        }
+        state->cachedEligible = eligible;
+        state->cachedRecursiveFeedback =
+            eligible && recursiveFeedback;
+        state->eligibleFrameRange = frame;
+        state->eligibleDepthRange = depth;
+    }
+    if (!state->cachedEligible)
+        return false;
+
+    const GSBlockRange frame = state->eligibleFrameRange;
+    const GSBlockRange depth = state->eligibleDepthRange;
+
+    const GSVertex &v0 = gs->m_vtxQueue[0];
+    const GSVertex &v1 = gs->m_vtxQueue[1];
+    const GSVertex &v2 = gs->m_vtxQueue[2];
+    const bool sprite = gs->m_prim.type == GS_PRIM_SPRITE;
+    const FixedPointVertex p0{
+        static_cast<int32_t>(std::lround(v0.x * 16.0f)) -
+            static_cast<int32_t>(ctx.xyoffset.ofx),
+        static_cast<int32_t>(std::lround(v0.y * 16.0f)) -
+            static_cast<int32_t>(ctx.xyoffset.ofy),
+    };
+    const FixedPointVertex p1{
+        static_cast<int32_t>(std::lround(v1.x * 16.0f)) -
+            static_cast<int32_t>(ctx.xyoffset.ofx),
+        static_cast<int32_t>(std::lround(v1.y * 16.0f)) -
+            static_cast<int32_t>(ctx.xyoffset.ofy),
+    };
+    const FixedPointVertex p2{
+        sprite
+            ? p1.x
+            : static_cast<int32_t>(
+                  std::lround(v2.x * 16.0f)) -
+                  static_cast<int32_t>(ctx.xyoffset.ofx),
+        sprite
+            ? p1.y
+            : static_cast<int32_t>(
+                  std::lround(v2.y * 16.0f)) -
+                  static_cast<int32_t>(ctx.xyoffset.ofy),
+    };
+    int minimumX =
+        ceilFixed12_4(
+            sprite
+                ? std::min(p0.x, p1.x)
+                : std::min({p0.x, p1.x, p2.x}));
+    int maximumX =
+        ceilFixed12_4(
+            sprite
+                ? std::max(p0.x, p1.x)
+                : std::max({p0.x, p1.x, p2.x}));
+    int minimumY =
+        ceilFixed12_4(
+            sprite
+                ? std::min(p0.y, p1.y)
+                : std::min({p0.y, p1.y, p2.y}));
+    int maximumY =
+        ceilFixed12_4(
+            sprite
+                ? std::max(p0.y, p1.y)
+                : std::max({p0.y, p1.y, p2.y}));
+    minimumX = std::max(
+        minimumX, static_cast<int>(ctx.scissor.x0));
+    maximumX = std::min(
+        maximumX, static_cast<int>(ctx.scissor.x1) + 1);
+    minimumY = std::max(minimumY, static_cast<int>(ctx.scissor.y0));
+    maximumY = std::min(
+        maximumY, static_cast<int>(ctx.scissor.y1) + 1);
+
+    m_textureReadVram = nullptr;
+    const bool recursiveTextureDraw =
+        state->cachedRecursiveFeedback;
+    if (recursiveTextureDraw)
+    {
+        const uint32_t frameBase =
+            GSInternal::framePageBaseToBlock(ctx.frame.fbp);
+        const bool sameFeedbackSurface =
+            m_feedbackSnapshotValid &&
+            m_feedbackTextureBase == ctx.tex0.tbp0 &&
+            m_feedbackFrameBase == frameBase &&
+            m_feedbackTexturePsm == ctx.tex0.psm &&
+            m_feedbackFramePsm == ctx.frame.psm &&
+            m_feedbackTextureWidth == ctx.tex0.tbw &&
+            m_feedbackFrameWidth == ctx.frame.fbw;
+        if (!sameFeedbackSurface)
+        {
+            flushDrawBatch(gs);
+            m_textureSnapshot.resize(gs->m_vramSize);
+            std::memcpy(
+                m_textureSnapshot.data(),
+                gs->m_vram,
+                gs->m_vramSize);
+            m_feedbackTextureBase = ctx.tex0.tbp0;
+            m_feedbackFrameBase = frameBase;
+            m_feedbackTexturePsm = ctx.tex0.psm;
+            m_feedbackFramePsm = ctx.frame.psm;
+            m_feedbackTextureWidth = ctx.tex0.tbw;
+            m_feedbackFrameWidth = ctx.frame.fbw;
+            m_feedbackSnapshotValid = true;
+        }
+    }
+    else
+    {
+        if (m_feedbackSnapshotValid)
+            flushDrawBatch(gs);
+        m_feedbackSnapshotValid = false;
+    }
+    if (gs->m_hasPreferredDisplaySource &&
+        ctx.frame.fbp == gs->m_preferredDisplayDestFbp)
+    {
+        gs->m_hasPreferredDisplaySource = false;
+    }
+    if ((!sprite && triangleEdge(p0, p1, p2) == 0) ||
+        minimumX >= maximumX ||
+        minimumY >= maximumY)
+    {
+        return true;
+    }
+
+    const bool sameOutputGroup =
+        state->outputGroupValid &&
+        state->groupFrame.fbp == ctx.frame.fbp &&
+        state->groupFrame.fbw == ctx.frame.fbw &&
+        state->groupFrame.psm == ctx.frame.psm &&
+        state->groupDepth.zbp == ctx.zbuf.zbp &&
+        state->groupDepth.psm == ctx.zbuf.psm;
+    if (state->outputGroupValid && !sameOutputGroup)
+        flushDrawBatch(gs);
+    if (!state->outputGroupValid)
+    {
+        state->groupFrame = ctx.frame;
+        state->groupDepth = ctx.zbuf;
+        state->groupFrameRange = frame;
+        state->groupDepthRange = depth;
+        state->outputGroupValid = true;
+    }
+
+    uint32_t workerMask = 0u;
+    const uint32_t firstStripe =
+        static_cast<uint32_t>(minimumY) / kRasterStripeHeight;
+    const uint32_t lastStripe =
+        static_cast<uint32_t>(maximumY - 1) / kRasterStripeHeight;
+    for (uint32_t stripe = firstStripe;
+         stripe <= lastStripe;
+         ++stripe)
+    {
+        workerMask |=
+            1u << (stripe % state->workerCount);
+    }
+
+    ParallelState::Command command;
+    command.context = ctx;
+    command.prim = gs->m_prim;
+    std::copy_n(
+        gs->m_vtxQueue,
+        sprite ? 2u : 3u,
+        command.vertices);
+    command.fixedX[0] = p0.x;
+    command.fixedX[1] = p1.x;
+    command.fixedX[2] = p2.x;
+    command.fixedY[0] = p0.y;
+    command.fixedY[1] = p1.y;
+    command.fixedY[2] = p2.y;
+    command.texa = gs->m_texa;
+    command.fogColor = gs->m_fogColor;
+    command.pabe = gs->m_pabe;
+    command.feedbackSnapshot = recursiveTextureDraw;
+    if (gs->m_prim.tme && ctx.tex0.psm == GS_PSM_T8)
+    {
+        prepareDecodedClut(gs);
+        size_t paletteIndex = SIZE_MAX;
+        if (!state->palettes.empty())
+        {
+            const ParallelState::DecodedPalette &palette =
+                state->palettes.back();
+            if (palette.generation == m_decodedClutGeneration &&
+                palette.texa == m_decodedClutTexa &&
+                palette.sourcePsm == m_decodedClutSourcePsm &&
+                palette.csm == m_decodedClutCsm &&
+                palette.csa == m_decodedClutCsa)
+            {
+                paletteIndex = state->palettes.size() - 1u;
+            }
+        }
+        if (paletteIndex == SIZE_MAX)
+        {
+            ParallelState::DecodedPalette palette;
+            palette.colors = m_decodedClut;
+            palette.generation = m_decodedClutGeneration;
+            palette.serial = state->nextPaletteSerial++;
+            palette.texa = m_decodedClutTexa;
+            palette.sourcePsm = m_decodedClutSourcePsm;
+            palette.csm = m_decodedClutCsm;
+            palette.csa = m_decodedClutCsa;
+            paletteIndex = state->palettes.size();
+            state->palettes.emplace_back(std::move(palette));
+        }
+        command.paletteIndex = paletteIndex;
+    }
+    command.workerMask = workerMask;
+
+    const size_t commandIndex = state->commands.size();
+    state->commands.emplace_back(std::move(command));
+    for (uint32_t worker = 0u;
+         worker < state->workerCount;
+         ++worker)
+    {
+        if ((workerMask & (1u << worker)) != 0u)
+            state->workerCommands[worker].push_back(commandIndex);
+    }
+    return true;
+}
+
+void GSRasterizer::renderQueuedPrimitive(GS *renderGs,
+                                         size_t commandIndex,
+                                         uint32_t workerIndex,
+                                         uint32_t workerCount)
+{
+    const ParallelState::Command &command =
+        m_parallelState->commands[commandIndex];
+    renderGs->m_vram = m_parallelState->primaryGs->m_vram;
+    renderGs->m_vramSize = m_parallelState->primaryGs->m_vramSize;
+    renderGs->m_ctx[command.prim.ctxt ? 1 : 0] =
+        command.context;
+    renderGs->m_prim = command.prim;
+    std::copy_n(command.vertices, 3u, renderGs->m_vtxQueue);
+    renderGs->m_vtxCount = 3;
+    renderGs->m_texa = command.texa;
+    renderGs->m_fogColor = command.fogColor;
+    renderGs->m_pabe = command.pabe;
+
+    GSRasterizer &rasterizer = renderGs->m_rasterizer;
+    rasterizer.m_scanlineWorkerIndex = workerIndex;
+    rasterizer.m_scanlineWorkerCount = workerCount;
+    std::copy_n(command.fixedX, 3u, rasterizer.m_queuedFixedX);
+    std::copy_n(command.fixedY, 3u, rasterizer.m_queuedFixedY);
+    rasterizer.m_queuedFixedVerticesValid = true;
+    rasterizer.m_textureReadVram =
+        command.feedbackSnapshot
+            ? m_textureSnapshot.data()
+            : nullptr;
+    rasterizer.m_feedbackSnapshotValid = false;
+    if (command.paletteIndex != SIZE_MAX)
+    {
+        const ParallelState::DecodedPalette &palette =
+            m_parallelState->palettes[command.paletteIndex];
+        if (rasterizer.m_queuedPaletteSerial != palette.serial)
+        {
+            rasterizer.m_decodedClut = palette.colors;
+            rasterizer.m_queuedPaletteSerial = palette.serial;
+        }
+        rasterizer.m_decodedClutGeneration = palette.generation;
+        rasterizer.m_decodedClutTexa = palette.texa;
+        rasterizer.m_decodedClutSourcePsm = palette.sourcePsm;
+        rasterizer.m_decodedClutCsm = palette.csm;
+        rasterizer.m_decodedClutCsa = palette.csa;
+        rasterizer.m_decodedClutActive = true;
+    }
+    else
+    {
+        rasterizer.m_decodedClutActive = false;
+    }
+    if (command.prim.type == GS_PRIM_SPRITE)
+        rasterizer.drawSprite(renderGs);
+    else
+        rasterizer.drawTriangle(renderGs);
+}
+
+bool GSRasterizer::ownsScanline(int y) const
+{
+    if (m_scanlineWorkerCount <= 1u)
+        return true;
+    return (static_cast<uint32_t>(y) / kRasterStripeHeight) %
+               m_scanlineWorkerCount ==
+           m_scanlineWorkerIndex;
 }
 
 void GSRasterizer::drawPrimitive(GS *gs)
 {
+    if (tryQueuePrimitive(gs))
+        return;
+    flushDrawBatch(gs);
+
     const auto &ctx = gs->activeContext();
+    prepareDecodedClut(gs);
+    m_textureReadVram = nullptr;
+    const uint32_t frameBase =
+        GSInternal::framePageBaseToBlock(ctx.frame.fbp);
+    const bool recursiveTextureDraw =
+        gs->m_prim.tme &&
+        ctx.tex0.tbp0 == frameBase &&
+        gs->m_vram &&
+        gs->m_vramSize != 0u;
+    if (recursiveTextureDraw)
+    {
+        const bool sameFeedbackSurface =
+            m_feedbackSnapshotValid &&
+            m_feedbackTextureBase == ctx.tex0.tbp0 &&
+            m_feedbackFrameBase == frameBase &&
+            m_feedbackTexturePsm == ctx.tex0.psm &&
+            m_feedbackFramePsm == ctx.frame.psm &&
+            m_feedbackTextureWidth == ctx.tex0.tbw &&
+            m_feedbackFrameWidth == ctx.frame.fbw;
+        if (!sameFeedbackSurface)
+        {
+            m_textureSnapshot.resize(gs->m_vramSize);
+            std::memcpy(
+                m_textureSnapshot.data(), gs->m_vram, gs->m_vramSize);
+            m_feedbackTextureBase = ctx.tex0.tbp0;
+            m_feedbackFrameBase = frameBase;
+            m_feedbackTexturePsm = ctx.tex0.psm;
+            m_feedbackFramePsm = ctx.frame.psm;
+            m_feedbackTextureWidth = ctx.tex0.tbw;
+            m_feedbackFrameWidth = ctx.frame.fbw;
+            m_feedbackSnapshotValid = true;
+        }
+        m_textureReadVram = m_textureSnapshot.data();
+    }
+    else
+    {
+        m_feedbackSnapshotValid = false;
+    }
+    feedbackTrace().record(gs->m_prim, ctx, gs->m_vtxQueue);
+    GSDrawTraceState &trace = drawTrace();
+    trace.begin(ctx);
+    dumpDrawFramebuffer(gs, ctx, trace.index, "before");
+    GSDrawDumpState &dump = drawDump();
+    if (dump.dumpVram && dump.contains(trace.index) &&
+        gs->m_vram && gs->m_vramSize != 0u)
+    {
+        std::ostringstream path;
+        path << dump.directory
+             << "/draw-" << trace.index
+             << "-before-vram.bin";
+        std::ofstream output(path.str(),
+                             std::ios::out | std::ios::binary | std::ios::trunc);
+        if (output)
+        {
+            output.write(reinterpret_cast<const char *>(gs->m_vram),
+                         static_cast<std::streamsize>(gs->m_vramSize));
+        }
+    }
+
     PS2_IF_AGRESSIVE_LOGS({
         const uint32_t primitiveIndex = s_debugPrimitiveCount.fetch_add(1u, std::memory_order_relaxed);
         if (primitiveIndex < 64u)
@@ -399,26 +2152,163 @@ void GSRasterizer::drawPrimitive(GS *gs)
         const auto &ctx = gs->activeContext();
         int px = static_cast<int>(v.x) - (ctx.xyoffset.ofx >> 4);
         int py = static_cast<int>(v.y) - (ctx.xyoffset.ofy >> 4);
-        writePixel(gs, px, py, static_cast<u32>(v.z), v.r, v.g, v.b, v.a);
+        uint8_t r = v.r;
+        uint8_t g = v.g;
+        uint8_t b = v.b;
+        if (gs->m_prim.fge)
+            applyFog(gs->m_fogColor, v.fog, r, g, b);
+        writePixel(gs, px, py, static_cast<u32>(v.z), r, g, b, v.a);
         break;
     }
     default:
         break;
     }
+    m_textureReadVram = nullptr;
+
+    dumpDrawFramebuffer(gs, ctx, trace.index, "after");
+
+    if (trace.capturing)
+    {
+        const GSVertex &v0 = gs->m_vtxQueue[0];
+        const GSVertex &v1 = gs->m_vtxQueue[1];
+        const GSVertex &v2 = gs->m_vtxQueue[2];
+        trace.output
+            << trace.index << ','
+            << static_cast<uint32_t>(gs->m_prim.type) << ','
+            << static_cast<uint32_t>(gs->m_prim.iip) << ','
+            << static_cast<uint32_t>(gs->m_prim.tme) << ','
+            << static_cast<uint32_t>(gs->m_prim.fge) << ','
+            << static_cast<uint32_t>(gs->m_prim.abe) << ','
+            << static_cast<uint32_t>(gs->m_prim.fst) << ','
+            << static_cast<uint32_t>(gs->m_prim.ctxt) << ','
+            << gs->m_fogColor << ','
+            << ctx.frame.fbp << ','
+            << ctx.frame.fbw << ','
+            << static_cast<uint32_t>(ctx.frame.psm) << ','
+            << ctx.frame.fbmsk << ','
+            << ctx.zbuf.zbp << ','
+            << static_cast<uint32_t>(ctx.zbuf.psm) << ','
+            << static_cast<uint32_t>(ctx.zbuf.zmask) << ','
+            << ctx.test << ','
+            << ctx.alpha << ','
+            << ctx.tex0.tbp0 << ','
+            << static_cast<uint32_t>(ctx.tex0.tbw) << ','
+            << static_cast<uint32_t>(ctx.tex0.psm) << ','
+            << static_cast<uint32_t>(ctx.tex0.tw) << ','
+            << static_cast<uint32_t>(ctx.tex0.th) << ','
+            << static_cast<uint32_t>(ctx.tex0.tcc) << ','
+            << static_cast<uint32_t>(ctx.tex0.tfx) << ','
+            << ctx.tex0.cbp << ','
+            << static_cast<uint32_t>(ctx.tex0.cpsm) << ','
+            << static_cast<uint32_t>(ctx.tex0.csm) << ','
+            << static_cast<uint32_t>(ctx.tex0.csa) << ','
+            << static_cast<uint32_t>(ctx.tex0.cld) << ','
+            << ctx.tex1 << ','
+            << ctx.miptbp1 << ','
+            << ctx.miptbp2 << ','
+            << ctx.clamp << ','
+            << static_cast<uint32_t>(gs->m_texclut.cbw) << ','
+            << static_cast<uint32_t>(gs->m_texclut.cou) << ','
+            << gs->m_texclut.cov << ','
+            << (ctx.xyoffset.ofx >> 4) << ','
+            << (ctx.xyoffset.ofy >> 4) << ','
+            << ctx.scissor.x0 << ','
+            << ctx.scissor.x1 << ','
+            << ctx.scissor.y0 << ','
+            << ctx.scissor.y1 << ','
+            << v0.x << ',' << v0.y << ',' << v0.z << ','
+            << v1.x << ',' << v1.y << ',' << v1.z << ','
+            << v2.x << ',' << v2.y << ',' << v2.z << ','
+            << v0.s << ',' << v0.t << ',' << v0.q << ','
+            << v0.u << ',' << v0.v << ','
+            << static_cast<uint32_t>(v0.fog) << ','
+            << static_cast<uint32_t>(v0.r) << ','
+            << static_cast<uint32_t>(v0.g) << ','
+            << static_cast<uint32_t>(v0.b) << ','
+            << static_cast<uint32_t>(v0.a) << ','
+            << v1.s << ',' << v1.t << ',' << v1.q << ','
+            << v1.u << ',' << v1.v << ','
+            << static_cast<uint32_t>(v1.fog) << ','
+            << static_cast<uint32_t>(v1.r) << ','
+            << static_cast<uint32_t>(v1.g) << ','
+            << static_cast<uint32_t>(v1.b) << ','
+            << static_cast<uint32_t>(v1.a) << ','
+            << v2.s << ',' << v2.t << ',' << v2.q << ','
+            << v2.u << ',' << v2.v << ','
+            << static_cast<uint32_t>(v2.fog) << ','
+            << static_cast<uint32_t>(v2.r) << ','
+            << static_cast<uint32_t>(v2.g) << ','
+            << static_cast<uint32_t>(v2.b) << ','
+            << static_cast<uint32_t>(v2.a) << ','
+            << trace.candidates << ','
+            << trace.scissorRejects << ','
+            << trace.alphaRejects << ','
+            << trace.destinationAlphaRejects << ','
+            << trace.depthRejects << ','
+            << trace.writes << ','
+            << trace.framebufferChanges << ','
+            << trace.depthWrites << ','
+            << trace.depthChanges << ','
+            << static_cast<uint32_t>(trace.minR) << ','
+            << static_cast<uint32_t>(trace.maxR) << ','
+            << static_cast<uint32_t>(trace.minG) << ','
+            << static_cast<uint32_t>(trace.maxG) << ','
+            << static_cast<uint32_t>(trace.minB) << ','
+            << static_cast<uint32_t>(trace.maxB) << ','
+            << static_cast<uint32_t>(trace.minA) << ','
+            << static_cast<uint32_t>(trace.maxA) << ','
+            << trace.textureSamples << ','
+            << static_cast<uint32_t>(trace.minTextureIndex) << ','
+            << static_cast<uint32_t>(trace.maxTextureIndex) << ','
+            << static_cast<uint32_t>(trace.minTextureAlpha) << ','
+            << static_cast<uint32_t>(trace.maxTextureAlpha) << '\n';
+        ++trace.written;
+    }
+    ++trace.index;
 }
 
-void GSRasterizer::writePixel(GS *gs, int x, int y, int z, uint8_t r, uint8_t g, uint8_t b, uint8_t a)
+void GSRasterizer::writePixel(GS *gs,
+                              int x,
+                              int y,
+                              int z,
+                              uint8_t r,
+                              uint8_t g,
+                              uint8_t b,
+                              uint8_t a,
+                              bool forceAlphaBlend,
+                              bool suppressDepthWrite)
 {
     const auto &ctx = gs->activeContext();
+    GSDrawTraceState &trace = drawTrace();
+    if (trace.capturing)
+    {
+        ++trace.candidates;
+        trace.minR = std::min(trace.minR, r);
+        trace.maxR = std::max(trace.maxR, r);
+        trace.minG = std::min(trace.minG, g);
+        trace.maxG = std::max(trace.maxG, g);
+        trace.minB = std::min(trace.minB, b);
+        trace.maxB = std::max(trace.maxB, b);
+        trace.minA = std::min(trace.minA, a);
+        trace.maxA = std::max(trace.maxA, a);
+    }
 
     if (x < ctx.scissor.x0 || x > ctx.scissor.x1 ||
         y < ctx.scissor.y0 || y > ctx.scissor.y1)
+    {
+        if (trace.capturing)
+            ++trace.scissorRejects;
         return;
+    }
 
     const AlphaTestResult alphaTest = classifyAlphaTest(ctx.test, a);
 
-    if (!alphaTest.writeFramebuffer)
+    if (!alphaTest.writeFramebuffer && !alphaTest.writeDepth)
+    {
+        if (trace.capturing)
+            ++trace.alphaRejects;
         return;
+    }
 
     u8* vram = gs->m_vram;
 
@@ -428,18 +2318,55 @@ void GSRasterizer::writePixel(GS *gs, int x, int y, int z, uint8_t r, uint8_t g,
     const u32 fmsk = ctx.frame.fbmsk;
     const u32 zbp = GSInternal::framePageBaseToBlock(ctx.zbuf.zbp);
     const u32 zpsm = ctx.zbuf.psm;
+    auto readFramebuffer = [&]() -> u32
+    {
+        if (fpsm == GS_PSM_CT32)
+            return GSMem::ReadCT32(vram, fbp, fbw, x, y);
+        return gs->ReadVram(fpsm, fbp, fbw, x, y);
+    };
+    auto writeFramebuffer = [&](u32 value)
+    {
+        if (fpsm == GS_PSM_CT32)
+            GSMem::WriteCT32(vram, fbp, fbw, x, y, value);
+        else
+            gs->WriteVram(fpsm, fbp, fbw, x, y, value);
+    };
+    auto readDepth = [&]() -> u32
+    {
+        if (zpsm == GS_PSM_Z24)
+            return GSMem::ReadZ24(vram, zbp, fbw, x, y);
+        if (zpsm == GS_PSM_Z32)
+            return GSMem::ReadZ32(vram, zbp, fbw, x, y);
+        return gs->ReadVram(zpsm, zbp, fbw, x, y);
+    };
+    auto writeDepth = [&](u32 value)
+    {
+        if (zpsm == GS_PSM_Z24)
+            GSMem::WriteZ24(vram, zbp, fbw, x, y, value);
+        else if (zpsm == GS_PSM_Z32)
+            GSMem::WriteZ32(vram, zbp, fbw, x, y, value);
+        else
+            gs->WriteVram(zpsm, zbp, fbw, x, y, value);
+    };
 
-    const bool alphaBlendEnabled = gs->m_prim.abe;
+    const bool alphaBlendEnabled =
+        alphaTest.writeFramebuffer &&
+        (gs->m_prim.abe || forceAlphaBlend);
     const bool destinationAlpha  = alphaTest.preserveDestinationAlpha;
+    const bool destinationAlphaTest =
+        destinationAlphaTestEnabled(ctx.test, static_cast<uint8_t>(fpsm));
 
     // small optimization, avoid reading the framebuffer for simple draws
     // TODO: only one address lookup for rmw
-    const bool frmw = (ctx.frame.fbmsk != 0) || alphaBlendEnabled || destinationAlpha;
+    const bool frmw = alphaTest.writeFramebuffer &&
+                      ((ctx.frame.fbmsk != 0) || alphaBlendEnabled || destinationAlpha);
 
+    u32 rawFramebufferValue = 0;
     u32 fbrgba = 0;
-    if (frmw)
+    if (frmw || destinationAlphaTest)
     {
-        fbrgba = gs->ReadVram(fpsm, fbp, fbw, x, y);
+        rawFramebufferValue = readFramebuffer();
+        fbrgba = rawFramebufferValue;
 
         if (bitsPerPixel(fpsm) == 16)
         {
@@ -447,11 +2374,23 @@ void GSRasterizer::writePixel(GS *gs, int x, int y, int z, uint8_t r, uint8_t g,
         }
     }
 
-    uint ztest_method = (ctx.test >> 17) & 3;
+    if (!passesDestinationAlphaTest(ctx.test,
+                                    static_cast<uint8_t>(fpsm),
+                                    rawFramebufferValue))
+    {
+        if (trace.capturing)
+            ++trace.destinationAlphaRejects;
+        return;
+    }
 
+    const bool ztestEnabled = ((ctx.test >> 16) & 1u) != 0u;
+    const uint ztestMethod = (ctx.test >> 17) & 3u;
 
-    bool zpass = false;
-    switch (ztest_method)
+    // When TEST.ZTE is clear the ZTST field is ignored and the depth
+    // comparison always passes. The GS also suppresses depth writes in this
+    // mode, even when ZBUF.ZMSK is clear.
+    bool zpass = !ztestEnabled;
+    switch (ztestEnabled ? ztestMethod : 1u)
     {
     case 0:
         zpass = false;
@@ -460,95 +2399,150 @@ void GSRasterizer::writePixel(GS *gs, int x, int y, int z, uint8_t r, uint8_t g,
         zpass = true;
         break;
     case 2:
-        zpass = z >= gs->ReadVram(zpsm, zbp, fbw, x, y);
+        zpass = z >= readDepth();
         break;
     case 3:
-        zpass = z > gs->ReadVram(zpsm, zbp, fbw, x, y);
+        zpass = z > readDepth();
         break;
     }
 
     if (!zpass)
     {
+        if (trace.capturing)
+            ++trace.depthRejects;
         return;
     }
 
-    const u8 srcR = r;
-    const u8 srcG = g;
-    const u8 srcB = b;
-
-    if (gs->m_prim.abe)
+    if (alphaTest.writeFramebuffer)
     {
-        uint8_t dr = fbrgba & 0xFF;
-        uint8_t dg = (fbrgba >> 8) & 0xFF;
-        uint8_t db = (fbrgba >> 16) & 0xFF;
-        uint8_t da = (fbrgba >> 24) & 0xFF;
+        const u32 priorFramebufferValue =
+            trace.capturing ? readFramebuffer() : 0u;
+        const u8 srcR = r;
+        const u8 srcG = g;
+        const u8 srcB = b;
 
-        // PABE disables alpha blending when the source alpha MSB is clear.
-        if (!(gs->m_pabe && (a & 0x80u) == 0u))
+        if (alphaBlendEnabled)
         {
-            uint64_t alphaReg = ctx.alpha;
-            uint8_t asel = alphaReg & 3;
-            uint8_t bsel = (alphaReg >> 2) & 3;
-            uint8_t csel = (alphaReg >> 4) & 3;
-            uint8_t dsel = (alphaReg >> 6) & 3;
-            uint8_t fix = static_cast<uint8_t>((alphaReg >> 32) & 0xFF);
+            uint8_t dr = fbrgba & 0xFF;
+            uint8_t dg = (fbrgba >> 8) & 0xFF;
+            uint8_t db = (fbrgba >> 16) & 0xFF;
+            uint8_t da = (fbrgba >> 24) & 0xFF;
 
-            auto pickRGB = [&](uint8_t sel, int cs, int cd) -> int
+            // PABE disables alpha blending when the source alpha MSB is clear.
+            if (!(gs->m_pabe && (a & 0x80u) == 0u))
             {
-                if (sel == 0)
-                    return cs;
-                if (sel == 1)
-                    return cd;
-                return 0;
-            };
-            int cAlpha = (csel == 0) ? a : (csel == 1) ? da
-                                                       : fix;
+                uint64_t alphaReg = ctx.alpha;
+                if ((alphaReg & 0xFFu) == 0x44u)
+                {
+                    const uint32_t blended = blendSourceOverRgb(
+                        pack32(r, g, b, a),
+                        fbrgba,
+                        a);
+                    r = static_cast<uint8_t>(blended);
+                    g = static_cast<uint8_t>(blended >> 8u);
+                    b = static_cast<uint8_t>(blended >> 16u);
+                }
+                else
+                {
+                uint8_t asel = alphaReg & 3;
+                uint8_t bsel = (alphaReg >> 2) & 3;
+                uint8_t csel = (alphaReg >> 4) & 3;
+                uint8_t dsel = (alphaReg >> 6) & 3;
+                uint8_t fix = static_cast<uint8_t>((alphaReg >> 32) & 0xFF);
 
-            r = clampU8(((pickRGB(asel, r, dr) - pickRGB(bsel, r, dr)) * cAlpha >> 7) + pickRGB(dsel, r, dr));
-            g = clampU8(((pickRGB(asel, g, dg) - pickRGB(bsel, g, dg)) * cAlpha >> 7) + pickRGB(dsel, g, dg));
-            b = clampU8(((pickRGB(asel, b, db) - pickRGB(bsel, b, db)) * cAlpha >> 7) + pickRGB(dsel, b, db));
+                auto pickRGB = [&](uint8_t sel, int cs, int cd) -> int
+                {
+                    if (sel == 0)
+                        return cs;
+                    if (sel == 1)
+                        return cd;
+                    return 0;
+                };
+                int cAlpha = (csel == 0) ? a : (csel == 1) ? da
+                                                           : fix;
+
+                r = clampU8(((pickRGB(asel, r, dr) - pickRGB(bsel, r, dr)) * cAlpha >> 7) + pickRGB(dsel, r, dr));
+                g = clampU8(((pickRGB(asel, g, dg) - pickRGB(bsel, g, dg)) * cAlpha >> 7) + pickRGB(dsel, g, dg));
+                b = clampU8(((pickRGB(asel, b, db) - pickRGB(bsel, b, db)) * cAlpha >> 7) + pickRGB(dsel, b, db));
+                }
+            }
+            else
+            {
+                r = srcR;
+                g = srcG;
+                b = srcB;
+            }
         }
-        else
+
+        u32 fbmask = ctx.frame.fbmsk;
+
+        if (!alphaTest.preserveDestinationAlpha &&
+            (ctx.fba & 0x1ull) != 0ull &&
+            ctx.frame.psm != GS_PSM_CT24)
         {
-            r = srcR;
-            g = srcG;
-            b = srcB;
+            a = static_cast<uint8_t>(a | 0x80u);
+        }
+
+        u32 pixel = pack32(r, g, b, a);
+
+        if (fbmask != 0)
+        {
+            pixel = (pixel & ~fbmask) | (fbrgba & fbmask);
+        }
+
+        if (alphaTest.preserveDestinationAlpha)
+        {
+            pixel = (pixel & 0x00FFFFFFu) | (fbrgba & 0xFF000000u);
+        }
+
+        // format conversion
+        if (bitsPerPixel(fpsm) == 16)
+        {
+            pixel = Rgba8888ToRgba5551(pixel);
+        }
+
+        if (tracePixelMatches(x, y))
+        {
+            std::cerr
+                << "[gs:write-pixel] draw=" << trace.index
+                << " xy=(" << x << ',' << y << ')'
+                << " z=" << z
+                << " src=("
+                << static_cast<unsigned>(srcR) << ','
+                << static_cast<unsigned>(srcG) << ','
+                << static_cast<unsigned>(srcB) << ','
+                << static_cast<unsigned>(a) << ')'
+                << " dst=0x" << std::hex << fbrgba
+                << " alpha=0x" << ctx.alpha
+                << " fbmask=0x" << fbmask
+                << " pixel=0x" << pixel << std::dec
+                << " blend=" << alphaBlendEnabled
+                << '\n';
+        }
+
+        writeFramebuffer(pixel);
+        if (trace.capturing)
+        {
+            ++trace.writes;
+            if (readFramebuffer() != priorFramebufferValue)
+                ++trace.framebufferChanges;
         }
     }
 
-    u32 fbmask = ctx.frame.fbmsk;
-    bool zmask = ctx.zbuf.zmask;
-
-    if (!alphaTest.preserveDestinationAlpha &&
-        (ctx.fba & 0x1ull) != 0ull &&
-        ctx.frame.psm != GS_PSM_CT24)
+    if (alphaTest.writeDepth &&
+        ztestEnabled &&
+        !ctx.zbuf.zmask &&
+        !suppressDepthWrite)
     {
-        a = static_cast<uint8_t>(a | 0x80u);
-    }
-
-    u32 pixel = pack32(r, g, b, a);
-
-    if (fbmask != 0)
-    {
-        pixel = (pixel & ~fbmask) | (fbrgba & fbmask);
-    }
-
-    if (alphaTest.preserveDestinationAlpha)
-    {
-        pixel = (pixel & 0x00FFFFFFu) | (fbrgba & 0xFF000000u);
-    }
-    
-    // format conversion
-    if (bitsPerPixel(fpsm) == 16)
-    {
-        pixel = Rgba8888ToRgba5551(pixel);
-    }
-
-    gs->WriteVram(fpsm, fbp, fbw, x, y, pixel);
-
-    if (!zmask)
-    {
-        gs->WriteVram(zpsm, zbp, fbw, x, y, z);
+        const u32 priorDepthValue =
+            trace.capturing ? readDepth() : 0u;
+        writeDepth(z);
+        if (trace.capturing)
+        {
+            ++trace.depthWrites;
+            if (readDepth() != priorDepthValue)
+                ++trace.depthChanges;
+        }
     }
 }
 
@@ -561,21 +2555,25 @@ uint32_t GSRasterizer::lookupCLUT(GS *gs,
                                   uint8_t sourcePsm)
 {
     const uint32_t clutIndex = resolveClutIndex(index, csm, csa, sourcePsm);
-    const uint32_t clutWidth = (gs->m_texclut.cbw != 0u) ? static_cast<uint32_t>(gs->m_texclut.cbw) : 1u;
-    const uint32_t clutX = static_cast<uint32_t>(gs->m_texclut.cou) + (clutIndex & 0x0Fu);
-    const uint32_t clutY = static_cast<uint32_t>(gs->m_texclut.cov) + (clutIndex >> 4);
+    (void)cbp;
+    (void)cpsm;
 
+    if (!gs->m_clutCacheValid[clutIndex])
+        return 0u;
 
-    switch (cpsm)
+    const uint32_t cached = gs->m_clutCache[clutIndex];
+    const uint8_t cachedFormat = gs->m_clutCacheFormat[clutIndex];
+
+    switch (cachedFormat)
     {
     case GS_PSM_CT32:
-        return applyTexa(gs->m_texa, cpsm, GSMem::ReadCT32(gs->m_vram, cbp, clutWidth, clutX, clutY));
+        return applyTexa(gs->m_texa, cachedFormat, cached);
     case GS_PSM_CT24:
-        return applyTexa(gs->m_texa, cpsm, GSMem::ReadCT24(gs->m_vram, cbp, clutWidth, clutX, clutY));
+        return applyTexa(gs->m_texa, cachedFormat, cached);
     case GS_PSM_CT16:
-        return applyTexa(gs->m_texa, cpsm, Rgba5551ToRgba8888(GSMem::ReadCT16(gs->m_vram, cbp, clutWidth, clutX, clutY)));
+        return applyTexa(gs->m_texa, cachedFormat, Rgba5551ToRgba8888(cached));
     case GS_PSM_CT16S:
-        return applyTexa(gs->m_texa, cpsm, Rgba5551ToRgba8888(GSMem::ReadCT16S(gs->m_vram, cbp, clutWidth, clutX, clutY)));
+        return applyTexa(gs->m_texa, cachedFormat, Rgba5551ToRgba8888(cached));
     default:
         break;
     }
@@ -583,101 +2581,744 @@ uint32_t GSRasterizer::lookupCLUT(GS *gs,
     return 0xFFFF00FFu;
 }
 
+void GSRasterizer::prepareDecodedClut(GS *gs)
+{
+    const GSTex0Reg &tex = gs->activeContext().tex0;
+    const bool indexed =
+        tex.psm == GS_PSM_T8 ||
+        tex.psm == GS_PSM_T8H ||
+        tex.psm == GS_PSM_T4 ||
+        tex.psm == GS_PSM_T4HL ||
+        tex.psm == GS_PSM_T4HH;
+    m_decodedClutActive = indexed && gs->m_prim.tme;
+    if (!m_decodedClutActive)
+        return;
+
+    const uint16_t texa =
+        static_cast<uint16_t>(gs->m_texa.ta0) |
+        (static_cast<uint16_t>(gs->m_texa.aem) << 8u) |
+        (static_cast<uint16_t>(gs->m_texa.ta1) << 9u);
+    if (m_decodedClutGeneration == gs->m_clutCacheGeneration &&
+        m_decodedClutTexa == texa &&
+        m_decodedClutSourcePsm == tex.psm &&
+        m_decodedClutCsm == tex.csm &&
+        m_decodedClutCsa == tex.csa)
+    {
+        return;
+    }
+
+    for (uint32_t index = 0u; index < m_decodedClut.size(); ++index)
+    {
+        m_decodedClut[index] = lookupCLUT(
+            gs,
+            static_cast<uint8_t>(index),
+            tex.cbp,
+            tex.cpsm,
+            tex.csm,
+            tex.csa,
+            tex.psm);
+    }
+    m_decodedClutGeneration = gs->m_clutCacheGeneration;
+    m_decodedClutTexa = texa;
+    m_decodedClutSourcePsm = tex.psm;
+    m_decodedClutCsm = tex.csm;
+    m_decodedClutCsa = tex.csa;
+}
+
+void GSRasterizer::updateClutCache(GS *gs, int contextIndex)
+{
+    if (!gs || !gs->m_vram)
+        return;
+
+    const GSTex0Reg &tex = gs->m_ctx[(contextIndex != 0) ? 1 : 0].tex0;
+    const bool indexed =
+        tex.psm == GS_PSM_T8 ||
+        tex.psm == GS_PSM_T8H ||
+        tex.psm == GS_PSM_T4 ||
+        tex.psm == GS_PSM_T4HL ||
+        tex.psm == GS_PSM_T4HH;
+    if (!indexed)
+        return;
+
+    bool load = false;
+    switch (tex.cld)
+    {
+    case 1:
+        load = true;
+        break;
+    case 2:
+        gs->m_clutCbp[0] = tex.cbp;
+        load = true;
+        break;
+    case 3:
+        gs->m_clutCbp[1] = tex.cbp;
+        load = true;
+        break;
+    case 4:
+        if (gs->m_clutCbp[0] != tex.cbp)
+        {
+            gs->m_clutCbp[0] = tex.cbp;
+            load = true;
+        }
+        break;
+    case 5:
+        if (gs->m_clutCbp[1] != tex.cbp)
+        {
+            gs->m_clutCbp[1] = tex.cbp;
+            load = true;
+        }
+        break;
+    case 0:
+    case 6:
+    case 7:
+    default:
+        break;
+    }
+
+    if (!load)
+        return;
+
+    const bool fourBit =
+        tex.psm == GS_PSM_T4 ||
+        tex.psm == GS_PSM_T4HL ||
+        tex.psm == GS_PSM_T4HH;
+    const uint32_t entryCount = fourBit ? 16u : 256u;
+    const bool csm2 = tex.csm != 0u;
+    const uint32_t clutWidth =
+        csm2 && gs->m_texclut.cbw != 0u
+            ? static_cast<uint32_t>(gs->m_texclut.cbw)
+            : 1u;
+
+    const uint32_t maximumClutX =
+        csm2
+            ? (static_cast<uint32_t>(gs->m_texclut.cou) << 4u) +
+                  15u
+            : 15u;
+    const uint32_t maximumClutY =
+        csm2
+            ? static_cast<uint32_t>(gs->m_texclut.cov) +
+                  ((entryCount - 1u) >> 4u)
+            : 15u;
+    const GSBlockRange clutRange{
+        tex.cbp,
+        surfaceBlockCount(tex.cpsm,
+                          clutWidth,
+                          maximumClutX,
+                          maximumClutY),
+    };
+    ParallelState *state = m_parallelState.get();
+    if (state && !state->commands.empty() &&
+        (blockRangesOverlap(
+             clutRange, state->groupFrameRange) ||
+         blockRangesOverlap(
+             clutRange, state->groupDepthRange)))
+    {
+        flushDrawBatch(gs);
+    }
+
+    GSClutTraceState &trace = clutTrace();
+    uint32_t rawNonzeroBytes = 0u;
+    uint8_t rawMaxByte = 0u;
+    const bool traceEnabled = trace.enabled();
+    if (traceEnabled)
+    {
+        constexpr uint32_t kRawClutWindowBytes = 1024u;
+        const uint32_t rawBase =
+            (tex.cbp * 256u) % std::max<uint32_t>(gs->m_vramSize, 1u);
+        for (uint32_t offset = 0u; offset < kRawClutWindowBytes; ++offset)
+        {
+            const uint32_t address = (rawBase + offset) % gs->m_vramSize;
+            const uint8_t value = gs->m_vram[address];
+            rawNonzeroBytes += value != 0u ? 1u : 0u;
+            rawMaxByte = std::max(rawMaxByte, value);
+        }
+    }
+
+    for (uint32_t rawIndex = 0u; rawIndex < entryCount; ++rawIndex)
+    {
+        const uint32_t cacheIndex =
+            resolveClutIndex(static_cast<uint8_t>(rawIndex),
+                             tex.csm,
+                             tex.csa,
+                             tex.psm);
+        const uint32_t sourceIndex = csm2 ? rawIndex : cacheIndex;
+        const uint32_t clutX =
+            (csm2 ? (static_cast<uint32_t>(gs->m_texclut.cou) << 4u) : 0u) +
+            (sourceIndex & 0x0Fu);
+        const uint32_t clutY =
+            (csm2 ? static_cast<uint32_t>(gs->m_texclut.cov) : 0u) +
+            (sourceIndex >> 4u);
+
+        uint32_t value = 0u;
+        switch (tex.cpsm)
+        {
+        case GS_PSM_CT32:
+            value = GSMem::ReadCT32(gs->m_vram, tex.cbp, clutWidth, clutX, clutY);
+            break;
+        case GS_PSM_CT24:
+            value = GSMem::ReadCT24(gs->m_vram, tex.cbp, clutWidth, clutX, clutY);
+            break;
+        case GS_PSM_CT16:
+            value = GSMem::ReadCT16(gs->m_vram, tex.cbp, clutWidth, clutX, clutY);
+            break;
+        case GS_PSM_CT16S:
+            value = GSMem::ReadCT16S(gs->m_vram, tex.cbp, clutWidth, clutX, clutY);
+            break;
+        default:
+            continue;
+        }
+
+        gs->m_clutCache[cacheIndex] = value;
+        gs->m_clutCacheFormat[cacheIndex] = tex.cpsm;
+        gs->m_clutCacheValid[cacheIndex] = true;
+    }
+    ++gs->m_clutCacheGeneration;
+
+    if (traceEnabled)
+    {
+        uint32_t decodedNonzeroEntries = 0u;
+        uint32_t decodedAlphaNonzeroEntries = 0u;
+        uint8_t decodedMaxAlpha = 0u;
+        for (uint32_t rawIndex = 0u; rawIndex < entryCount; ++rawIndex)
+        {
+            const uint32_t cacheIndex =
+                resolveClutIndex(static_cast<uint8_t>(rawIndex),
+                                 tex.csm,
+                                 tex.csa,
+                                 tex.psm);
+            const uint32_t value = gs->m_clutCache[cacheIndex];
+            decodedNonzeroEntries += value != 0u ? 1u : 0u;
+            const uint8_t alpha = static_cast<uint8_t>(value >> 24u);
+            decodedAlphaNonzeroEntries += alpha != 0u ? 1u : 0u;
+            decodedMaxAlpha = std::max(decodedMaxAlpha, alpha);
+        }
+
+        trace.output << trace.index++ << ','
+                     << ((contextIndex != 0) ? 1 : 0) << ','
+                     << tex.tbp0 << ','
+                     << static_cast<uint32_t>(tex.psm) << ','
+                     << tex.cbp << ','
+                     << static_cast<uint32_t>(tex.cpsm) << ','
+                     << static_cast<uint32_t>(tex.csm) << ','
+                     << static_cast<uint32_t>(tex.csa) << ','
+                     << static_cast<uint32_t>(tex.cld) << ','
+                     << rawNonzeroBytes << ','
+                     << static_cast<uint32_t>(rawMaxByte) << ','
+                     << decodedNonzeroEntries << ','
+                     << decodedAlphaNonzeroEntries << ','
+                     << static_cast<uint32_t>(decodedMaxAlpha) << '\n';
+        trace.output.flush();
+    }
+}
+
 uint32_t GSRasterizer::sampleTexture(GS *gs, float s, float t, float q, uint16_t u, uint16_t v)
 {
     const auto &ctx = gs->activeContext();
     const auto &tex = ctx.tex0;
 
-    int texW = 1 << tex.tw;
-    int texH = 1 << tex.th;
-
-    float texUf, texVf;
+    int32_t fixedU;
+    int32_t fixedV;
     if (gs->m_prim.fst)
     {
-        texUf = static_cast<float>(u) / 16.0f;
-        texVf = static_cast<float>(v) / 16.0f;
+        fixedU = static_cast<int32_t>(u) << 12;
+        fixedV = static_cast<int32_t>(v) << 12;
     }
     else
     {
         const float invQ = 1.0f / fabsQ(q);
-        texUf = s * invQ * static_cast<float>(texW);
-        texVf = t * invQ * static_cast<float>(texH);
+        const float textureScaleU =
+            static_cast<float>(65536u << tex.tw);
+        const float textureScaleV =
+            static_cast<float>(65536u << tex.th);
+        fixedU = static_cast<int32_t>(s * invQ * textureScaleU);
+        fixedV = static_cast<int32_t>(t * invQ * textureScaleV);
     }
 
-    auto samplePoint = [&](int sampleU, int sampleV) -> uint32_t
+    return sampleTextureFixed(gs, fixedU, fixedV, false, q);
+}
+
+uint32_t GSRasterizer::sampleTextureLinearLevel(
+    GS *gs,
+    int32_t fixedU,
+    int32_t fixedV,
+    bool linearBiasApplied,
+    uint8_t level)
+{
+    const GSContext &ctx = gs->activeContext();
+    const GSTex0Reg &tex = ctx.tex0;
+    if (level != 0u)
     {
-        sampleU = clampInt(sampleU, 0, texW - 1);
-        sampleV = clampInt(sampleV, 0, texH - 1);
+        const int32_t divisor = 1 << level;
+        int32_t quotientU = fixedU / divisor;
+        int32_t quotientV = fixedV / divisor;
+        if (fixedU < 0 && (fixedU % divisor) != 0)
+            --quotientU;
+        if (fixedV < 0 && (fixedV % divisor) != 0)
+            --quotientV;
+        fixedU = quotientU;
+        fixedV = quotientV;
+    }
+    if (!linearBiasApplied)
+    {
+        fixedU = static_cast<int32_t>(
+            static_cast<uint32_t>(fixedU) - 0x8000u);
+        fixedV = static_cast<int32_t>(
+            static_cast<uint32_t>(fixedV) - 0x8000u);
+    }
 
-        u32 out = gs->ReadVram(tex.psm, tex.tbp0, tex.tbw, sampleU, sampleV);
-
-        switch (tex.psm)
-        {
-        case GS_PSM_CT32:
-        case GS_PSM_Z32:
-        case GS_PSM_CT24:
-        case GS_PSM_Z24:
-            return applyTexa(gs->m_texa, tex.psm, out);
-        case GS_PSM_CT16:
-        case GS_PSM_CT16S:
-        case GS_PSM_Z16:
-        case GS_PSM_Z16S:
-            return applyTexa(gs->m_texa, tex.psm, Rgba5551ToRgba8888(out));
-        case GS_PSM_T8:
-        case GS_PSM_T8H:
-        case GS_PSM_T4:
-        case GS_PSM_T4HL:
-        case GS_PSM_T4HH:
-            return lookupCLUT(gs, static_cast<u8>(out), tex.cbp, tex.cpsm, tex.csm, tex.csa, tex.psm);
-        }
-
-        return 0xFFFF00FFu;
+    const int u0 = floorFixed16_16(fixedU);
+    const int v0 = floorFixed16_16(fixedV);
+    const uint64_t clamp = ctx.clamp;
+    const int texW = std::max(1, (1 << tex.tw) >> level);
+    const int texH = std::max(1, (1 << tex.th) >> level);
+    auto wrapU = [&](int coordinate)
+    {
+        return wrapTextureCoordinate(
+            coordinate,
+            texW,
+            static_cast<uint8_t>(clamp & 0x3u),
+            static_cast<uint16_t>(
+                ((clamp >> 4u) & 0x3FFu) >> level),
+            static_cast<uint16_t>(
+                ((clamp >> 14u) & 0x3FFu) >> level));
+    };
+    auto wrapV = [&](int coordinate)
+    {
+        return wrapTextureCoordinate(
+            coordinate,
+            texH,
+            static_cast<uint8_t>((clamp >> 2u) & 0x3u),
+            static_cast<uint16_t>(
+                ((clamp >> 24u) & 0x3FFu) >> level),
+            static_cast<uint16_t>(
+                ((clamp >> 34u) & 0x3FFu) >> level));
     };
 
-    if (!tex1UsesLinearFilter(ctx.tex1))
+    const int wrappedU[2] = {wrapU(u0), wrapU(u0 + 1)};
+    const int wrappedV[2] = {wrapV(v0), wrapV(v0 + 1)};
+    uint32_t tbp = tex.tbp0;
+    uint8_t tbw = tex.tbw;
+    if (level != 0u)
     {
-        return samplePoint(static_cast<int>(texUf), static_cast<int>(texVf));
+        const uint64_t mipRegister =
+            level <= 3u ? ctx.miptbp1 : ctx.miptbp2;
+        const uint8_t slot =
+            static_cast<uint8_t>((level - 1u) % 3u);
+        const uint8_t shift = static_cast<uint8_t>(slot * 20u);
+        tbp = static_cast<uint32_t>(
+            (mipRegister >> shift) & 0x3FFFu);
+        tbw = static_cast<uint8_t>(
+            (mipRegister >> (shift + 14u)) & 0x3Fu);
+    }
+    const uint8_t *textureVram =
+        m_textureReadVram ? m_textureReadVram : gs->m_vram;
+    uint32_t raw[4] = {};
+    uint32_t color[4] = {};
+    if (tex.psm == GS_PSM_T8)
+    {
+        raw[0] = GSMem::ReadP8(
+            const_cast<uint8_t *>(textureVram),
+            tbp, tbw, wrappedU[0], wrappedV[0]);
+        raw[1] = GSMem::ReadP8(
+            const_cast<uint8_t *>(textureVram),
+            tbp, tbw, wrappedU[1], wrappedV[0]);
+        raw[2] = GSMem::ReadP8(
+            const_cast<uint8_t *>(textureVram),
+            tbp, tbw, wrappedU[0], wrappedV[1]);
+        raw[3] = GSMem::ReadP8(
+            const_cast<uint8_t *>(textureVram),
+            tbp, tbw, wrappedU[1], wrappedV[1]);
+        for (int sample = 0; sample < 4; ++sample)
+        {
+            color[sample] =
+                m_decodedClutActive
+                    ? m_decodedClut[static_cast<uint8_t>(raw[sample])]
+                    : lookupCLUT(
+                          gs,
+                          static_cast<uint8_t>(raw[sample]),
+                          tex.cbp,
+                          tex.cpsm,
+                          tex.csm,
+                          tex.csa,
+                          tex.psm);
+        }
+    }
+    else
+    {
+        raw[0] = GSMem::ReadCT32(
+            const_cast<uint8_t *>(textureVram),
+            tbp, tbw, wrappedU[0], wrappedV[0]);
+        raw[1] = GSMem::ReadCT32(
+            const_cast<uint8_t *>(textureVram),
+            tbp, tbw, wrappedU[1], wrappedV[0]);
+        raw[2] = GSMem::ReadCT32(
+            const_cast<uint8_t *>(textureVram),
+            tbp, tbw, wrappedU[0], wrappedV[1]);
+        raw[3] = GSMem::ReadCT32(
+            const_cast<uint8_t *>(textureVram),
+            tbp, tbw, wrappedU[1], wrappedV[1]);
+        for (int sample = 0; sample < 4; ++sample)
+            color[sample] = raw[sample];
     }
 
-    const float sampleU = texUf - 0.5f;
-    const float sampleV = texVf - 0.5f;
-    const int u0 = static_cast<int>(std::floor(sampleU));
-    const int v0 = static_cast<int>(std::floor(sampleV));
-    const int u1 = u0 + 1;
-    const int v1 = v0 + 1;
-    const float fx = sampleU - static_cast<float>(u0);
-    const float fy = sampleV - static_cast<float>(v0);
+    GSDrawTraceState &trace = drawTrace();
+    if (trace.capturing)
+    {
+        for (int sample = 0; sample < 4; ++sample)
+        {
+            ++trace.textureSamples;
+            const uint8_t textureIndex =
+                static_cast<uint8_t>(raw[sample]);
+            trace.minTextureIndex =
+                std::min(trace.minTextureIndex, textureIndex);
+            trace.maxTextureIndex =
+                std::max(trace.maxTextureIndex, textureIndex);
+            const uint8_t alpha =
+                static_cast<uint8_t>(color[sample] >> 24u);
+            trace.minTextureAlpha =
+                std::min(trace.minTextureAlpha, alpha);
+            trace.maxTextureAlpha =
+                std::max(trace.maxTextureAlpha, alpha);
+        }
+    }
 
-    const uint32_t c00 = samplePoint(u0, v0);
-    const uint32_t c10 = samplePoint(u1, v0);
-    const uint32_t c01 = samplePoint(u0, v1);
-    const uint32_t c11 = samplePoint(u1, v1);
+    const uint8_t weightU = static_cast<uint8_t>(
+        (static_cast<uint32_t>(fixedU) >> 12u) & 0xFu);
+    const uint8_t weightV = static_cast<uint8_t>(
+        (static_cast<uint32_t>(fixedV) >> 12u) & 0xFu);
+    return bilinearColor4(
+        color[0], color[1], color[2], color[3], weightU, weightV);
+}
 
-    const uint8_t r = lerpChannel(static_cast<uint8_t>(c00 & 0xFFu),
-                                  static_cast<uint8_t>(c10 & 0xFFu),
-                                  static_cast<uint8_t>(c01 & 0xFFu),
-                                  static_cast<uint8_t>(c11 & 0xFFu),
-                                  fx, fy);
-    const uint8_t g = lerpChannel(static_cast<uint8_t>((c00 >> 8) & 0xFFu),
-                                  static_cast<uint8_t>((c10 >> 8) & 0xFFu),
-                                  static_cast<uint8_t>((c01 >> 8) & 0xFFu),
-                                  static_cast<uint8_t>((c11 >> 8) & 0xFFu),
-                                  fx, fy);
-    const uint8_t b = lerpChannel(static_cast<uint8_t>((c00 >> 16) & 0xFFu),
-                                  static_cast<uint8_t>((c10 >> 16) & 0xFFu),
-                                  static_cast<uint8_t>((c01 >> 16) & 0xFFu),
-                                  static_cast<uint8_t>((c11 >> 16) & 0xFFu),
-                                  fx, fy);
-    const uint8_t a = lerpChannel(static_cast<uint8_t>((c00 >> 24) & 0xFFu),
-                                  static_cast<uint8_t>((c10 >> 24) & 0xFFu),
-                                  static_cast<uint8_t>((c01 >> 24) & 0xFFu),
-                                  static_cast<uint8_t>((c11 >> 24) & 0xFFu),
-                                  fx, fy);
+uint32_t GSRasterizer::sampleTextureFixed(GS *gs,
+                                          int32_t fixedU,
+                                          int32_t fixedV,
+                                          bool linearBiasApplied,
+                                          float lodQ)
+{
+    const auto &ctx = gs->activeContext();
+    const auto &tex = ctx.tex0;
+    const uint8_t maximumLevel =
+        static_cast<uint8_t>((ctx.tex1 >> 2u) & 0x7u);
+    const uint8_t magnificationFilter =
+        static_cast<uint8_t>((ctx.tex1 >> 5u) & 0x1u);
+    const uint8_t minificationFilter =
+        static_cast<uint8_t>((ctx.tex1 >> 6u) & 0x7u);
+    const bool mipmapsEnabled =
+        maximumLevel != 0u &&
+        minificationFilter >= 2u &&
+        minificationFilter <= 5u;
+    const bool linearFilter = tex1UsesLinearFilter(ctx.tex1);
+    const bool supportsLinearFastPath =
+        tex.psm == GS_PSM_T8 ||
+        tex.psm == GS_PSM_CT32;
+    if (!mipmapsEnabled &&
+        linearFilter &&
+        supportsLinearFastPath)
+    {
+        return sampleTextureLinearLevel(
+            gs, fixedU, fixedV, linearBiasApplied, 0u);
+    }
 
-    return static_cast<uint32_t>(r) |
-           (static_cast<uint32_t>(g) << 8) |
-           (static_cast<uint32_t>(b) << 16) |
-           (static_cast<uint32_t>(a) << 24);
+    auto shiftFixedForLevel = [](int32_t value,
+                                 uint8_t level) -> int32_t
+    {
+        if (level == 0u)
+            return value;
+        const int32_t divisor = 1 << level;
+        int32_t quotient = value / divisor;
+        if (value < 0 && (value % divisor) != 0)
+            --quotient;
+        return quotient;
+    };
+
+    auto mipAddress = [&](uint8_t level,
+                          uint32_t &tbp,
+                          uint8_t &tbw)
+    {
+        if (level == 0u)
+        {
+            tbp = tex.tbp0;
+            tbw = tex.tbw;
+            return;
+        }
+
+        const uint64_t mipRegister =
+            level <= 3u ? ctx.miptbp1 : ctx.miptbp2;
+        const uint8_t slot =
+            static_cast<uint8_t>((level - 1u) % 3u);
+        const uint8_t shift = static_cast<uint8_t>(slot * 20u);
+        tbp = static_cast<uint32_t>(
+            (mipRegister >> shift) & 0x3FFFu);
+        tbw = static_cast<uint8_t>(
+            (mipRegister >> (shift + 14u)) & 0x3Fu);
+    };
+
+    auto sampleLevel = [&](uint8_t level,
+                           bool linearFilter,
+                           bool biasAlreadyApplied) -> uint32_t
+    {
+        const int texW =
+            std::max(1, (1 << tex.tw) >> level);
+        const int texH =
+            std::max(1, (1 << tex.th) >> level);
+        int32_t levelU = shiftFixedForLevel(fixedU, level);
+        int32_t levelV = shiftFixedForLevel(fixedV, level);
+
+        if (linearFilter && !biasAlreadyApplied)
+        {
+            levelU = static_cast<int32_t>(
+                static_cast<uint32_t>(levelU) - 0x8000u);
+            levelV = static_cast<int32_t>(
+                static_cast<uint32_t>(levelV) - 0x8000u);
+        }
+
+        uint32_t tbp = 0u;
+        uint8_t tbw = 0u;
+        mipAddress(level, tbp, tbw);
+
+        auto samplePoint = [&](int sampleU,
+                               int sampleV) -> uint32_t
+        {
+            const uint64_t clamp = ctx.clamp;
+            sampleU = wrapTextureCoordinate(
+                sampleU,
+                texW,
+                static_cast<uint8_t>(clamp & 0x3u),
+                static_cast<uint16_t>(
+                    ((clamp >> 4u) & 0x3FFu) >> level),
+                static_cast<uint16_t>(
+                    ((clamp >> 14u) & 0x3FFu) >> level));
+            sampleV = wrapTextureCoordinate(
+                sampleV,
+                texH,
+                static_cast<uint8_t>((clamp >> 2u) & 0x3u),
+                static_cast<uint16_t>(
+                    ((clamp >> 24u) & 0x3FFu) >> level),
+                static_cast<uint16_t>(
+                    ((clamp >> 34u) & 0x3FFu) >> level));
+
+            const u8 *textureVram =
+                m_textureReadVram
+                    ? m_textureReadVram
+                    : gs->m_vram;
+            const u32 out = gs->ReadVramFrom(
+                textureVram,
+                tex.psm,
+                tbp,
+                tbw,
+                sampleU,
+                sampleV);
+            const uint8_t textureIndex =
+                static_cast<uint8_t>(out);
+            auto recordSample =
+                [&](uint32_t color) -> uint32_t
+            {
+                GSDrawTraceState &trace = drawTrace();
+                if (trace.capturing)
+                {
+                    ++trace.textureSamples;
+                    trace.minTextureIndex =
+                        std::min(trace.minTextureIndex,
+                                 textureIndex);
+                    trace.maxTextureIndex =
+                        std::max(trace.maxTextureIndex,
+                                 textureIndex);
+                    const uint8_t alpha =
+                        static_cast<uint8_t>(color >> 24u);
+                    trace.minTextureAlpha =
+                        std::min(trace.minTextureAlpha, alpha);
+                    trace.maxTextureAlpha =
+                        std::max(trace.maxTextureAlpha, alpha);
+                }
+                return color;
+            };
+
+            switch (tex.psm)
+            {
+            case GS_PSM_CT32:
+            case GS_PSM_Z32:
+            case GS_PSM_CT24:
+            case GS_PSM_Z24:
+                return recordSample(
+                    applyTexa(gs->m_texa, tex.psm, out));
+            case GS_PSM_CT16:
+            case GS_PSM_CT16S:
+            case GS_PSM_Z16:
+            case GS_PSM_Z16S:
+                return recordSample(applyTexa(
+                    gs->m_texa,
+                    tex.psm,
+                    Rgba5551ToRgba8888(out)));
+            case GS_PSM_T8:
+            case GS_PSM_T8H:
+            case GS_PSM_T4:
+            case GS_PSM_T4HL:
+            case GS_PSM_T4HH:
+                return recordSample(
+                    m_decodedClutActive
+                        ? m_decodedClut[static_cast<uint8_t>(out)]
+                        : lookupCLUT(
+                              gs,
+                              static_cast<u8>(out),
+                              tex.cbp,
+                              tex.cpsm,
+                              tex.csm,
+                              tex.csa,
+                              tex.psm));
+            }
+
+            return recordSample(0xFFFF00FFu);
+        };
+
+        const int u0 = floorFixed16_16(levelU);
+        const int v0 = floorFixed16_16(levelV);
+        if (!linearFilter)
+            return samplePoint(u0, v0);
+
+        const int u1 = u0 + 1;
+        const int v1 = v0 + 1;
+        const uint8_t weightU = static_cast<uint8_t>(
+            (static_cast<uint32_t>(levelU) >> 12u) & 0xFu);
+        const uint8_t weightV = static_cast<uint8_t>(
+            (static_cast<uint32_t>(levelV) >> 12u) & 0xFu);
+
+        const uint32_t c00 = samplePoint(u0, v0);
+        const uint32_t c10 = samplePoint(u1, v0);
+        const uint32_t c01 = samplePoint(u0, v1);
+        const uint32_t c11 = samplePoint(u1, v1);
+
+        return bilinearColor4(
+            c00, c10, c01, c11, weightU, weightV);
+    };
+
+    if (!mipmapsEnabled)
+    {
+        return sampleLevel(0u,
+                           linearFilter,
+                           linearBiasApplied);
+    }
+
+    const int32_t rawK =
+        static_cast<int32_t>((ctx.tex1 >> 32u) & 0xFFFu);
+    const int32_t signedK =
+        (rawK & 0x800) != 0 ? rawK - 0x1000 : rawK;
+    int32_t lodFixed;
+    if ((ctx.tex1 & 0x1u) == 0u)
+    {
+        const uint8_t l =
+            static_cast<uint8_t>((ctx.tex1 >> 19u) & 0x3u);
+        const float absoluteQ =
+            std::max(std::fabs(lodQ),
+                     std::numeric_limits<float>::min());
+        const float lodScale =
+            -static_cast<float>((1u << l) * 65536u);
+        const float lodBias =
+            static_cast<float>(signedK * 4096);
+        const float lodValue =
+            approximateLog2Precision3(absoluteQ) * lodScale +
+            lodBias;
+        const float clampedLod = std::clamp(
+            lodValue,
+            0.0f,
+            static_cast<float>(maximumLevel) * 65536.0f);
+        lodFixed = static_cast<int32_t>(
+            std::nearbyint(clampedLod));
+    }
+    else
+    {
+        lodFixed = std::clamp(
+            signedK * 4096,
+            0,
+            static_cast<int32_t>(maximumLevel) * 65536);
+    }
+
+    if (lodFixed <= 0)
+    {
+        if (magnificationFilter != 0u &&
+            supportsLinearFastPath)
+        {
+            return sampleTextureLinearLevel(
+                gs, fixedU, fixedV, false, 0u);
+        }
+        return sampleLevel(0u,
+                           magnificationFilter != 0u,
+                           false);
+    }
+
+    const bool linearWithinLevel =
+        minificationFilter >= 4u;
+    const bool interpolateLevels =
+        (minificationFilter & 0x1u) != 0u;
+    if (!interpolateLevels)
+    {
+        const int32_t roundedLod =
+            lodFixed + 0x8000;
+        const uint8_t level = static_cast<uint8_t>(
+            std::min<int>(
+                static_cast<int>(maximumLevel),
+                roundedLod >> 16));
+        if (linearWithinLevel &&
+            supportsLinearFastPath)
+        {
+            return sampleTextureLinearLevel(
+                gs, fixedU, fixedV, false, level);
+        }
+        return sampleLevel(level,
+                           linearWithinLevel,
+                           false);
+    }
+
+    const uint8_t level0 = static_cast<uint8_t>(
+        std::min<int>(
+            static_cast<int>(maximumLevel),
+            lodFixed >> 16));
+    const uint8_t level1 = std::min<uint8_t>(
+        static_cast<uint8_t>(level0 + 1u),
+        maximumLevel);
+    const uint32_t color0 =
+        linearWithinLevel && supportsLinearFastPath
+            ? sampleTextureLinearLevel(
+                  gs, fixedU, fixedV, false, level0)
+            : sampleLevel(level0, linearWithinLevel, false);
+    if (level0 == level1)
+        return color0;
+    const uint32_t color1 =
+        linearWithinLevel && supportsLinearFastPath
+            ? sampleTextureLinearLevel(
+                  gs, fixedU, fixedV, false, level1)
+            : sampleLevel(level1, linearWithinLevel, false);
+    const int weight =
+        (lodFixed & 0xFFFF) >> 1;
+    auto interpolateChannel = [&](uint8_t from,
+                                  uint8_t to) -> uint8_t
+    {
+        const int difference =
+            (static_cast<int>(to) -
+             static_cast<int>(from)) *
+            weight;
+        const int delta =
+            difference >= 0
+                ? difference / 32768
+                : -((-difference + 32767) / 32768);
+        return clampU8(static_cast<int>(from) + delta);
+    };
+
+    return static_cast<uint32_t>(interpolateChannel(
+               static_cast<uint8_t>(color0),
+               static_cast<uint8_t>(color1))) |
+           (static_cast<uint32_t>(interpolateChannel(
+                static_cast<uint8_t>(color0 >> 8u),
+                static_cast<uint8_t>(color1 >> 8u)))
+            << 8u) |
+           (static_cast<uint32_t>(interpolateChannel(
+                static_cast<uint8_t>(color0 >> 16u),
+                static_cast<uint8_t>(color1 >> 16u)))
+            << 16u) |
+           (static_cast<uint32_t>(interpolateChannel(
+                static_cast<uint8_t>(color0 >> 24u),
+                static_cast<uint8_t>(color1 >> 24u)))
+            << 24u);
 }
 
 void GSRasterizer::drawSprite(GS *gs)
@@ -686,30 +3327,75 @@ void GSRasterizer::drawSprite(GS *gs)
     const GSVertex &v1 = gs->m_vtxQueue[1];
     const auto &ctx = gs->activeContext();
 
-    int ofx = ctx.xyoffset.ofx >> 4;
-    int ofy = ctx.xyoffset.ofy >> 4;
-
-    int x0 = static_cast<int>(v0.x) - ofx;
-    int y0 = static_cast<int>(v0.y) - ofy;
-    int x1 = static_cast<int>(v1.x) - ofx;
-    int y1 = static_cast<int>(v1.y) - ofy;
+    int32_t fixedX0 =
+        m_queuedFixedVerticesValid
+            ? m_queuedFixedX[0]
+            : static_cast<int32_t>(std::lround(v0.x * 16.0f)) -
+                  static_cast<int32_t>(ctx.xyoffset.ofx);
+    int32_t fixedY0 =
+        m_queuedFixedVerticesValid
+            ? m_queuedFixedY[0]
+            : static_cast<int32_t>(std::lround(v0.y * 16.0f)) -
+                  static_cast<int32_t>(ctx.xyoffset.ofy);
+    int32_t fixedX1 =
+        m_queuedFixedVerticesValid
+            ? m_queuedFixedX[1]
+            : static_cast<int32_t>(std::lround(v1.x * 16.0f)) -
+                  static_cast<int32_t>(ctx.xyoffset.ofx);
+    int32_t fixedY1 =
+        m_queuedFixedVerticesValid
+            ? m_queuedFixedY[1]
+            : static_cast<int32_t>(std::lround(v1.y * 16.0f)) -
+                  static_cast<int32_t>(ctx.xyoffset.ofy);
     u32 z1 = static_cast<u32>(v1.z);
 
-    if (x0 > x1)
-        std::swap(x0, x1);
-    if (y0 > y1)
-        std::swap(y0, y1);
+    float u0f, v0f, u1f, v1f;
+    const auto &tex = ctx.tex0;
+    const int texW = 1 << tex.tw;
+    const int texH = 1 << tex.th;
+    if (gs->m_prim.fst)
+    {
+        u0f = static_cast<float>(v0.u) / 16.0f;
+        v0f = static_cast<float>(v0.v) / 16.0f;
+        u1f = static_cast<float>(v1.u) / 16.0f;
+        v1f = static_cast<float>(v1.v) / 16.0f;
+    }
+    else
+    {
+        const float q0 = fabsQ(v0.q);
+        const float q1 = fabsQ(v1.q);
+        u0f = (v0.s / q0) * static_cast<float>(texW);
+        v0f = (v0.t / q0) * static_cast<float>(texH);
+        u1f = (v1.s / q1) * static_cast<float>(texW);
+        v1f = (v1.t / q1) * static_cast<float>(texH);
+    }
 
-    const int unclippedX0 = x0;
-    const int unclippedY0 = y0;
-    const int spanX = std::max(1, x1 - x0);
-    const int spanY = std::max(1, y1 - y0);
-    const int unclippedX1 = unclippedX0 + spanX - 1;
-    const int unclippedY1 = unclippedY0 + spanY - 1;
+    if (fixedX0 > fixedX1)
+    {
+        std::swap(fixedX0, fixedX1);
+        std::swap(u0f, u1f);
+    }
+    if (fixedY0 > fixedY1)
+    {
+        std::swap(fixedY0, fixedY1);
+        std::swap(v0f, v1f);
+    }
+
+    const int unclippedX0 = ceilFixed12_4(fixedX0);
+    const int unclippedY0 = ceilFixed12_4(fixedY0);
+    const int unclippedX1Exclusive = ceilFixed12_4(fixedX1);
+    const int unclippedY1Exclusive = ceilFixed12_4(fixedY1);
+    if (unclippedX0 >= unclippedX1Exclusive ||
+        unclippedY0 >= unclippedY1Exclusive)
+    {
+        return;
+    }
 
     // If the sprite rectangle is fully outside scissor, nothing should render.
-    if (unclippedX1 < ctx.scissor.x0 || unclippedX0 > ctx.scissor.x1 ||
-        unclippedY1 < ctx.scissor.y0 || unclippedY0 > ctx.scissor.y1)
+    if (unclippedX1Exclusive <= ctx.scissor.x0 ||
+        unclippedX0 > ctx.scissor.x1 ||
+        unclippedY1Exclusive <= ctx.scissor.y0 ||
+        unclippedY0 > ctx.scissor.y1)
     {
         // maybe a log here idk ?
         return;
@@ -717,8 +3403,88 @@ void GSRasterizer::drawSprite(GS *gs)
 
     const int drawX0 = clampInt(unclippedX0, ctx.scissor.x0, ctx.scissor.x1);
     const int drawY0 = clampInt(unclippedY0, ctx.scissor.y0, ctx.scissor.y1);
-    const int drawX1 = clampInt(unclippedX1, ctx.scissor.x0, ctx.scissor.x1);
-    const int drawY1 = clampInt(unclippedY1, ctx.scissor.y0, ctx.scissor.y1);
+    const int drawX1 = clampInt(unclippedX1Exclusive - 1,
+                                ctx.scissor.x0, ctx.scissor.x1);
+    const int drawY1 = clampInt(unclippedY1Exclusive - 1,
+                                ctx.scissor.y0, ctx.scissor.y1);
+
+    const bool useFastDirectSprite =
+        !drawTrace().capturing &&
+        ctx.frame.psm == GS_PSM_CT32 &&
+        ctx.frame.fbmsk == 0u &&
+        !gs->m_prim.abe &&
+        (ctx.test & 1u) == 0u &&
+        !destinationAlphaTestEnabled(
+            ctx.test, GS_PSM_CT32) &&
+        ((ctx.test >> 16u) & 1u) != 0u &&
+        ((ctx.test >> 17u) & 3u) == 1u &&
+        (ctx.zbuf.psm == GS_PSM_Z24 ||
+         ctx.zbuf.psm == GS_PSM_Z32);
+    const uint32_t fastSpriteFbp =
+        GSInternal::framePageBaseToBlock(ctx.frame.fbp);
+    const uint32_t fastSpriteZbp =
+        GSInternal::framePageBaseToBlock(ctx.zbuf.zbp);
+    const uint32_t fastSpriteFbw =
+        std::max<uint32_t>(ctx.frame.fbw, 1u);
+    auto writeSpritePixel =
+        [&](int x,
+            int y,
+            uint8_t pixelR,
+            uint8_t pixelG,
+            uint8_t pixelB,
+            uint8_t pixelA)
+    {
+        if (!useFastDirectSprite ||
+            tracePixelMatches(x, y))
+        {
+            writePixel(
+                gs,
+                x,
+                y,
+                z1,
+                pixelR,
+                pixelG,
+                pixelB,
+                pixelA);
+            return;
+        }
+
+        if ((ctx.fba & 1u) != 0u)
+            pixelA = static_cast<uint8_t>(pixelA | 0x80u);
+        GSMem::WriteCT32(
+            gs->m_vram,
+            fastSpriteFbp,
+            fastSpriteFbw,
+            x,
+            y,
+            pack32(pixelR,
+                   pixelG,
+                   pixelB,
+                   pixelA));
+        if (!ctx.zbuf.zmask)
+        {
+            if (ctx.zbuf.psm == GS_PSM_Z24)
+            {
+                GSMem::WriteZ24(
+                    gs->m_vram,
+                    fastSpriteZbp,
+                    fastSpriteFbw,
+                    x,
+                    y,
+                    z1);
+            }
+            else
+            {
+                GSMem::WriteZ32(
+                    gs->m_vram,
+                    fastSpriteZbp,
+                    fastSpriteFbw,
+                    x,
+                    y,
+                    z1);
+            }
+        }
+    };
 
     const uint64_t alphaReg = ctx.alpha;
     const uint8_t alphaMode = static_cast<uint8_t>(alphaReg & 0xFFu);
@@ -733,8 +3499,8 @@ void GSRasterizer::drawSprite(GS *gs)
         (alphaFix == 0x60u || alphaFix == 0x80u) &&
         unclippedX0 <= 0 &&
         unclippedY0 <= 0 &&
-        unclippedX1 >= 639 &&
-        unclippedY1 >= 447;
+        unclippedX1Exclusive > 639 &&
+        unclippedY1Exclusive > 447;
     if (looksLikeDisplayCopy)
     {
         gs->m_preferredDisplaySourceFrame = {ctx.tex0.tbp0, ctx.tex0.tbw, ctx.tex0.psm, 0u};
@@ -743,86 +3509,241 @@ void GSRasterizer::drawSprite(GS *gs)
     }
 
     uint8_t r = v1.r, g = v1.g, b = v1.b, a = v1.a;
+    const uint8_t fog = v1.fog;
 
     if (gs->m_prim.tme)
     {
-        const auto &tex = ctx.tex0;
-        int texW = 1 << tex.tw;
-        int texH = 1 << tex.th;
-        if (texW == 0)
-            texW = 1;
-        if (texH == 0)
-            texH = 1;
-
-        float u0f, v0f, u1f, v1f;
-        if (gs->m_prim.fst)
-        {
-            u0f = static_cast<float>(v0.u >> 4);
-            v0f = static_cast<float>(v0.v >> 4);
-            u1f = static_cast<float>(v1.u >> 4);
-            v1f = static_cast<float>(v1.v >> 4);
-        }
-        else
-        {
-            const float q0 = fabsQ(v0.q);
-            const float q1 = fabsQ(v1.q);
-            u0f = (v0.s / q0) * static_cast<float>(texW);
-            v0f = (v0.t / q0) * static_cast<float>(texH);
-            u1f = (v1.s / q1) * static_cast<float>(texW);
-            v1f = (v1.t / q1) * static_cast<float>(texH);
-        }
-
-        float spriteW = static_cast<float>(spanX);
-        float spriteH = static_cast<float>(spanY);
-        if (spriteW < 1.0f)
-            spriteW = 1.0f;
-        if (spriteH < 1.0f)
-            spriteH = 1.0f;
+        const float windowX0 = static_cast<float>(fixedX0) / 16.0f;
+        const float windowY0 = static_cast<float>(fixedY0) / 16.0f;
+        const float spriteW =
+            static_cast<float>(fixedX1 - fixedX0) / 16.0f;
+        const float spriteH =
+            static_cast<float>(fixedY1 - fixedY0) / 16.0f;
+        const bool fixedTextureDda = gs->m_prim.fst;
+        const bool linearFilter =
+            fixedTextureDda && tex1UsesLinearFilter(ctx.tex1);
+        const float linearBias = linearFilter ? 32768.0f : 0.0f;
+        const float fixedU0 =
+            u0f * 65536.0f - linearBias;
+        const float fixedV0 =
+            v0f * 65536.0f - linearBias;
+        const float fixedU1 =
+            u1f * 65536.0f - linearBias;
+        const float fixedV1 =
+            v1f * 65536.0f - linearBias;
+        const float fixedStepU =
+            (fixedU1 - fixedU0) / spriteW;
+        const float fixedStepV =
+            (fixedV1 - fixedV0) / spriteH;
+        const float fixedPrestepX =
+            static_cast<float>(drawX0) - windowX0;
+        const float fixedPrestepY =
+            static_cast<float>(drawY0) - windowY0;
+        const float fixedScanU =
+            fixedU0 + fixedStepU * fixedPrestepX;
+        float fixedScanV =
+            fixedV0 + fixedStepV * fixedPrestepY;
+        constexpr int kPixelsPerLaneGroup = 8;
+        const int alignedDrawX =
+            drawX0 & ~(kPixelsPerLaneGroup - 1);
+        const int laneSkip =
+            drawX0 & (kPixelsPerLaneGroup - 1);
+        const int32_t fixedBlockStepU =
+            static_cast<int32_t>(
+                fixedStepU *
+                static_cast<float>(kPixelsPerLaneGroup));
 
         for (int y = drawY0; y <= drawY1; ++y)
         {
-            float ty = (static_cast<float>(y - unclippedY0) + 0.5f) / spriteH;
+            if (!ownsScanline(y))
+            {
+                if (fixedTextureDda)
+                    fixedScanV += fixedStepV;
+                continue;
+            }
+
+            const float ty =
+                (static_cast<float>(y) - windowY0) / spriteH;
             float texVf = v0f + (v1f - v0f) * ty;
 
-            for (int x = drawX0; x <= drawX1; ++x)
+            // GS scanlines evaluate eight pixels in parallel. In particular,
+            // all texture reads for a lane group happen before any of that
+            // group's framebuffer writes. This ordering is observable for
+            // legal recursive draws where TEX0 and FRAME overlap.
+            struct PendingSpritePixel
             {
-                float tx = (static_cast<float>(x - unclippedX0) + 0.5f) / spriteW;
-                float texUf = u0f + (u1f - u0f) * tx;
-                uint32_t texel = 0xFFFF00FFu;
-                if (gs->m_prim.fst)
+                int x;
+                uint8_t r;
+                uint8_t g;
+                uint8_t b;
+                uint8_t a;
+            };
+            const int firstGroup =
+                drawX0 & ~(kPixelsPerLaneGroup - 1);
+            for (int groupX = firstGroup;
+                 groupX <= drawX1;
+                 groupX += kPixelsPerLaneGroup)
+            {
+                std::array<PendingSpritePixel,
+                           kPixelsPerLaneGroup> pending{};
+                int pendingCount = 0;
+                const int firstX = std::max(groupX, drawX0);
+                const int lastX = std::min(
+                    groupX + kPixelsPerLaneGroup - 1, drawX1);
+                for (int x = firstX; x <= lastX; ++x)
                 {
-                    const int fixedU = static_cast<int>((texUf * 16.0f) + 0.5f);
-                    const int fixedV = static_cast<int>((texVf * 16.0f) + 0.5f);
-                    const uint16_t sampleU = static_cast<uint16_t>(clampInt(fixedU, 0, 0xFFFF));
-                    const uint16_t sampleV = static_cast<uint16_t>(clampInt(fixedV, 0, 0xFFFF));
-                    texel = sampleTexture(gs, 0.0f, 0.0f, 1.0f, sampleU, sampleV);
-                }
-                else
-                {
-                    texel = sampleTexture(gs,
-                                          texUf / static_cast<float>(texW),
-                                          texVf / static_cast<float>(texH),
-                                          1.0f, 0u, 0u);
+                    const float tx =
+                        (static_cast<float>(x) - windowX0) / spriteW;
+                    float texUf = u0f + (u1f - u0f) * tx;
+                    uint32_t texel = 0xFFFF00FFu;
+                    int traceFixedU = 0;
+                    int traceFixedV = 0;
+                    if (gs->m_prim.fst)
+                    {
+                        // The GS retains 16.16 texture precision for sprite
+                        // interpolation. Its scanline setup converts a base,
+                        // per-lane delta, and eight-pixel step independently;
+                        // the vertical edge value is then advanced once per
+                        // row. Recomputing from normalized UVs loses both the
+                        // low twelve bits and the observable accumulated
+                        // floating-point rounding.
+                        const int block =
+                            (x - alignedDrawX) /
+                            kPixelsPerLaneGroup;
+                        const int laneOffset =
+                            (x & (kPixelsPerLaneGroup - 1)) -
+                            laneSkip;
+                        const int32_t fixedBaseU =
+                            static_cast<int32_t>(fixedScanU);
+                        const int32_t fixedLaneU =
+                            static_cast<int32_t>(
+                                fixedStepU *
+                                static_cast<float>(laneOffset));
+                        const int32_t fixedU =
+                            static_cast<int32_t>(
+                                static_cast<uint32_t>(fixedBaseU) +
+                                static_cast<uint32_t>(fixedLaneU) +
+                                static_cast<uint32_t>(fixedBlockStepU) *
+                                    static_cast<uint32_t>(block));
+                        const int32_t fixedV =
+                            static_cast<int32_t>(fixedScanV);
+                        traceFixedU = fixedU;
+                        traceFixedV = fixedV;
+                        texUf =
+                            static_cast<float>(
+                                static_cast<uint32_t>(fixedU) +
+                                static_cast<uint32_t>(
+                                    linearFilter ? 0x8000 : 0)) /
+                            65536.0f;
+                        texVf =
+                            static_cast<float>(
+                                static_cast<uint32_t>(fixedV) +
+                                static_cast<uint32_t>(
+                                    linearFilter ? 0x8000 : 0)) /
+                            65536.0f;
+                        texel = sampleTextureFixed(
+                            gs,
+                            fixedU,
+                            fixedV,
+                            linearFilter,
+                            1.0f);
+                    }
+                    else
+                    {
+                        texel = sampleTexture(
+                            gs,
+                            texUf / static_cast<float>(texW),
+                            texVf / static_cast<float>(texH),
+                            1.0f,
+                            0u,
+                            0u);
+                    }
+
+                    const uint8_t tr =
+                        static_cast<uint8_t>(texel & 0xFF);
+                    const uint8_t tg =
+                        static_cast<uint8_t>((texel >> 8) & 0xFF);
+                    const uint8_t tb =
+                        static_cast<uint8_t>((texel >> 16) & 0xFF);
+                    const uint8_t ta =
+                        static_cast<uint8_t>((texel >> 24) & 0xFF);
+
+                    const TextureCombineResult color =
+                        combineTexture(
+                            tex, r, g, b, a, tr, tg, tb, ta);
+                    if (tracePixelMatches(x, y))
+                    {
+                        std::cerr
+                            << "[gs:sprite-pixel] draw="
+                            << drawTrace().index
+                            << " xy=(" << x << ',' << y << ')'
+                            << " texf=(" << texUf << ',' << texVf << ')'
+                            << " fixed=(" << traceFixedU << ','
+                            << traceFixedV << ')'
+                            << " texel=0x" << std::hex << texel
+                            << std::dec
+                            << " out=("
+                            << static_cast<unsigned>(color.r) << ','
+                            << static_cast<unsigned>(color.g) << ','
+                            << static_cast<unsigned>(color.b) << ','
+                            << static_cast<unsigned>(color.a) << ')'
+                            << '\n';
+                    }
+                    PendingSpritePixel &pixel =
+                        pending[pendingCount++];
+                    pixel.x = x;
+                    pixel.r = color.r;
+                    pixel.g = color.g;
+                    pixel.b = color.b;
+                    pixel.a = color.a;
+                    if (gs->m_prim.fge)
+                    {
+                        applyFog(
+                            gs->m_fogColor,
+                            fog,
+                            pixel.r,
+                            pixel.g,
+                            pixel.b);
+                    }
                 }
 
-                uint8_t tr = static_cast<uint8_t>(texel & 0xFF);
-                uint8_t tg = static_cast<uint8_t>((texel >> 8) & 0xFF);
-                uint8_t tb = static_cast<uint8_t>((texel >> 16) & 0xFF);
-                uint8_t ta = static_cast<uint8_t>((texel >> 24) & 0xFF);
-
-                const TextureCombineResult color = combineTexture(tex, r, g, b, a, tr, tg, tb, ta);
-                writePixel(gs, x, y, z1, color.r, color.g, color.b, color.a);
+                for (int index = 0; index < pendingCount; ++index)
+                {
+                    const PendingSpritePixel &pixel = pending[index];
+                    writeSpritePixel(
+                        pixel.x,
+                        y,
+                        pixel.r,
+                        pixel.g,
+                        pixel.b,
+                        pixel.a);
+                }
             }
+
+            if (fixedTextureDda)
+                fixedScanV += fixedStepV;
         }
     }
     else
     {
+        if (gs->m_prim.fge)
+            applyFog(gs->m_fogColor, fog, r, g, b);
         for (int y = drawY0; y <= drawY1; ++y)
+        {
+            if (!ownsScanline(y))
+                continue;
             for (int x = drawX0; x <= drawX1; ++x)
-                writePixel(gs, x, y, z1, r, g, b, a);
+                writeSpritePixel(x, y, r, g, b, a);
+        }
     }
 }
 
+#if (defined(__x86_64__) || defined(__i386__)) && \
+    defined(__GNUC__) && !defined(__clang__) && \
+    !defined(__SANITIZE_THREAD__)
+__attribute__((target_clones("fma", "default"),
+               optimize("fp-contract=off")))
+#endif
 void GSRasterizer::drawTriangle(GS *gs)
 {
     const GSVertex &v0 = gs->m_vtxQueue[0];
@@ -830,57 +3751,987 @@ void GSRasterizer::drawTriangle(GS *gs)
     const GSVertex &v2 = gs->m_vtxQueue[2];
     const auto &ctx = gs->activeContext();
 
-    int ofx = ctx.xyoffset.ofx >> 4;
-    int ofy = ctx.xyoffset.ofy >> 4;
+    // GS vertex and offset coordinates are both 12.4 fixed point. Preserve
+    // all four fractional bits when mapping to window coordinates.
+    const FixedPointVertex p0{
+        m_queuedFixedVerticesValid
+            ? m_queuedFixedX[0]
+            : static_cast<int32_t>(std::lround(v0.x * 16.0f)) -
+                  static_cast<int32_t>(ctx.xyoffset.ofx),
+        m_queuedFixedVerticesValid
+            ? m_queuedFixedY[0]
+            : static_cast<int32_t>(std::lround(v0.y * 16.0f)) -
+                  static_cast<int32_t>(ctx.xyoffset.ofy),
+    };
+    const FixedPointVertex p1{
+        m_queuedFixedVerticesValid
+            ? m_queuedFixedX[1]
+            : static_cast<int32_t>(std::lround(v1.x * 16.0f)) -
+                  static_cast<int32_t>(ctx.xyoffset.ofx),
+        m_queuedFixedVerticesValid
+            ? m_queuedFixedY[1]
+            : static_cast<int32_t>(std::lround(v1.y * 16.0f)) -
+                  static_cast<int32_t>(ctx.xyoffset.ofy),
+    };
+    const FixedPointVertex p2{
+        m_queuedFixedVerticesValid
+            ? m_queuedFixedX[2]
+            : static_cast<int32_t>(std::lround(v2.x * 16.0f)) -
+                  static_cast<int32_t>(ctx.xyoffset.ofx),
+        m_queuedFixedVerticesValid
+            ? m_queuedFixedY[2]
+            : static_cast<int32_t>(std::lround(v2.y * 16.0f)) -
+                  static_cast<int32_t>(ctx.xyoffset.ofy),
+    };
 
-    float fx0 = v0.x - static_cast<float>(ofx);
-    float fy0 = v0.y - static_cast<float>(ofy);
-    float fx1 = v1.x - static_cast<float>(ofx);
-    float fy1 = v1.y - static_cast<float>(ofy);
-    float fx2 = v2.x - static_cast<float>(ofx);
-    float fy2 = v2.y - static_cast<float>(ofy);
-
-    int minX = static_cast<int>(std::floor(std::min({fx0, fx1, fx2})));
-    int maxX = static_cast<int>(std::ceil(std::max({fx0, fx1, fx2})));
-    int minY = static_cast<int>(std::floor(std::min({fy0, fy1, fy2})));
-    int maxY = static_cast<int>(std::ceil(std::max({fy0, fy1, fy2})));
-
-    minX = clampInt(minX, ctx.scissor.x0, ctx.scissor.x1);
-    maxX = clampInt(maxX, ctx.scissor.x0, ctx.scissor.x1);
-    minY = clampInt(minY, ctx.scissor.y0, ctx.scissor.y1);
-    maxY = clampInt(maxY, ctx.scissor.y0, ctx.scissor.y1);
-
-    float denom = (fy1 - fy2) * (fx0 - fx2) + (fx2 - fx1) * (fy0 - fy2);
-    if (std::fabs(denom) < 0.001f)
+    const int64_t signedArea = triangleEdge(p0, p1, p2);
+    if (signedArea == 0)
         return;
 
-    const float winding = (denom < 0.0f) ? -1.0f : 1.0f;
-    const float invAbsDenom = 1.0f / std::fabs(denom);
-    constexpr float kEdgeEpsilon = 1.0e-4f;
+    const bool positiveArea = signedArea > 0;
+    const int64_t area = positiveArea ? signedArea : -signedArea;
+    const float invArea = 1.0f / static_cast<float>(area);
 
-    for (int y = minY; y <= maxY; ++y)
+    // Reject clipped or sub-pixel triangles before preparing their color,
+    // depth, and texture gradients. Triangle strips commonly submit many
+    // valid but fully clipped primitives.
+    int minX = ceilFixed12_4(std::min({p0.x, p1.x, p2.x}));
+    int maxX = ceilFixed12_4(std::max({p0.x, p1.x, p2.x}));
+    int minY = ceilFixed12_4(std::min({p0.y, p1.y, p2.y}));
+    int maxY = ceilFixed12_4(std::max({p0.y, p1.y, p2.y}));
+
+    minX = std::max(minX, static_cast<int>(ctx.scissor.x0));
+    maxX = std::min(maxX, static_cast<int>(ctx.scissor.x1) + 1);
+    minY = std::max(minY, static_cast<int>(ctx.scissor.y0));
+    maxY = std::min(maxY, static_cast<int>(ctx.scissor.y1) + 1);
+    if (minX >= maxX || minY >= maxY)
+        return;
+
+    const bool topLeft0 = isTopLeftEdge(p1, p2, positiveArea);
+    const bool topLeft1 = isTopLeftEdge(p2, p0, positiveArea);
+    const bool topLeft2 = isTopLeftEdge(p0, p1, positiveArea);
+
+    struct SortedVertex
     {
-        float py = static_cast<float>(y) + 0.5f;
-        for (int x = minX; x <= maxX; ++x)
+        const GSVertex *vertex;
+        float x;
+        float y;
+    };
+    SortedVertex sorted[3] = {
+        {&v0, static_cast<float>(p0.x) / 16.0f,
+         static_cast<float>(p0.y) / 16.0f},
+        {&v1, static_cast<float>(p1.x) / 16.0f,
+         static_cast<float>(p1.y) / 16.0f},
+        {&v2, static_cast<float>(p2.x) / 16.0f,
+         static_cast<float>(p2.y) / 16.0f},
+    };
+    // A strict three-element sorting network is stable for equal Y values
+    // and avoids repeating the same sort for each attribute interpolator.
+    if (sorted[1].y < sorted[0].y)
+        std::swap(sorted[0], sorted[1]);
+    if (sorted[2].y < sorted[1].y)
+        std::swap(sorted[1], sorted[2]);
+    if (sorted[1].y < sorted[0].y)
+        std::swap(sorted[0], sorted[1]);
+    const float gradientDx01 = sorted[1].x - sorted[0].x;
+    const float gradientDy01 = sorted[1].y - sorted[0].y;
+    const float gradientDx02 = sorted[2].x - sorted[0].x;
+    const float gradientDy02 = sorted[2].y - sorted[0].y;
+    const float gradientCross = std::fma(
+        gradientDy01,
+        gradientDx02,
+        -(gradientDx01 * gradientDy02));
+    const bool gradientValid = gradientCross != 0.0f;
+    const float gradientX01OverCross =
+        gradientValid ? gradientDx01 / gradientCross : 0.0f;
+    const float gradientY01OverCross =
+        gradientValid ? gradientDy01 / gradientCross : 0.0f;
+    const float gradientX02OverCross =
+        gradientValid ? gradientDx02 / gradientCross : 0.0f;
+    const float gradientY02OverCross =
+        gradientValid ? gradientDy02 / gradientCross : 0.0f;
+
+    struct TriangleColorDda
+    {
+        const GSVertex *top;
+        const GSVertex *middle;
+        const GSVertex *bottom;
+        float topX;
+        float topY;
+        float middleX;
+        float middleY;
+        float bottomX;
+        float bottomY;
+        float dx[5];
+        float dy[5];
+        bool valid;
+    };
+
+    TriangleColorDda colorDda{};
+    auto prepareColorDda =
+        [&]() PS2X_GS_LAMBDA_ALWAYS_INLINE
+    {
+        if (gs->m_prim.iip || gs->m_prim.fge)
         {
-            float px = static_cast<float>(x) + 0.5f;
+            colorDda.top = sorted[0].vertex;
+            colorDda.middle = sorted[1].vertex;
+            colorDda.bottom = sorted[2].vertex;
+            colorDda.topX = sorted[0].x;
+            colorDda.topY = sorted[0].y;
+            colorDda.middleX = sorted[1].x;
+            colorDda.middleY = sorted[1].y;
+            colorDda.bottomX = sorted[2].x;
+            colorDda.bottomY = sorted[2].y;
 
-            float w0 = (((fy1 - fy2) * (px - fx2) + (fx2 - fx1) * (py - fy2)) * winding) * invAbsDenom;
-            float w1 = (((fy2 - fy0) * (px - fx2) + (fx0 - fx2) * (py - fy2)) * winding) * invAbsDenom;
-            float w2 = 1.0f - w0 - w1;
+            colorDda.valid = gradientValid;
+            if (colorDda.valid)
+            {
+                const float topColor[5] = {
+                    static_cast<float>(colorDda.top->r) * 128.0f,
+                    static_cast<float>(colorDda.top->g) * 128.0f,
+                    static_cast<float>(colorDda.top->b) * 128.0f,
+                    static_cast<float>(colorDda.top->a) * 128.0f,
+                    static_cast<float>(colorDda.top->fog) * 128.0f,
+                };
+                const float middleColor[5] = {
+                    static_cast<float>(colorDda.middle->r) * 128.0f,
+                    static_cast<float>(colorDda.middle->g) * 128.0f,
+                    static_cast<float>(colorDda.middle->b) * 128.0f,
+                    static_cast<float>(colorDda.middle->a) * 128.0f,
+                    static_cast<float>(colorDda.middle->fog) * 128.0f,
+                };
+                const float bottomColor[5] = {
+                    static_cast<float>(colorDda.bottom->r) * 128.0f,
+                    static_cast<float>(colorDda.bottom->g) * 128.0f,
+                    static_cast<float>(colorDda.bottom->b) * 128.0f,
+                    static_cast<float>(colorDda.bottom->a) * 128.0f,
+                    static_cast<float>(colorDda.bottom->fog) * 128.0f,
+                };
+                for (int channel = 0; channel < 5; ++channel)
+                {
+                    const float delta01 =
+                        middleColor[channel] - topColor[channel];
+                    const float delta02 =
+                        bottomColor[channel] - topColor[channel];
+                    colorDda.dx[channel] = std::fma(
+                        delta02,
+                        gradientY01OverCross,
+                        -(delta01 * gradientY02OverCross));
+                    colorDda.dy[channel] = std::fma(
+                        delta01,
+                        gradientX02OverCross,
+                        -(delta02 * gradientX01OverCross));
+                }
+            }
+        }
+    };
 
-            if (w0 < -kEdgeEpsilon || w1 < -kEdgeEpsilon || w2 < -kEdgeEpsilon)
+    struct TriangleDepthDda
+    {
+        const GSVertex *top;
+        const GSVertex *middle;
+        const GSVertex *bottom;
+        float topX;
+        float topY;
+        float middleX;
+        float middleY;
+        float bottomX;
+        float bottomY;
+        double dx;
+        double dy;
+        bool valid;
+    };
+
+    TriangleDepthDda depthDda{};
+    {
+        depthDda.top = sorted[0].vertex;
+        depthDda.middle = sorted[1].vertex;
+        depthDda.bottom = sorted[2].vertex;
+        depthDda.topX = sorted[0].x;
+        depthDda.topY = sorted[0].y;
+        depthDda.middleX = sorted[1].x;
+        depthDda.middleY = sorted[1].y;
+        depthDda.bottomX = sorted[2].x;
+        depthDda.bottomY = sorted[2].y;
+
+        // Match the GS-style setup path's single-precision coordinate
+        // gradients and double-precision Z arithmetic.
+        depthDda.valid = gradientValid;
+        if (depthDda.valid)
+        {
+            const double delta01 =
+                static_cast<double>(depthDda.middle->z) -
+                static_cast<double>(depthDda.top->z);
+            const double delta02 =
+                static_cast<double>(depthDda.bottom->z) -
+                static_cast<double>(depthDda.top->z);
+            depthDda.dx = std::fma(
+                delta02,
+                static_cast<double>(gradientY01OverCross),
+                -(delta01 *
+                  static_cast<double>(gradientY02OverCross)));
+            depthDda.dy = std::fma(
+                delta01,
+                static_cast<double>(gradientX02OverCross),
+                -(delta02 *
+                  static_cast<double>(gradientX01OverCross)));
+        }
+    }
+
+    struct TriangleTextureDda
+    {
+        const GSVertex *top;
+        const GSVertex *middle;
+        const GSVertex *bottom;
+        float topX;
+        float topY;
+        float middleX;
+        float middleY;
+        float bottomX;
+        float bottomY;
+        float dx[3];
+        float dy[3];
+        bool constantQFixed;
+        bool linearFilter;
+        bool valid;
+    };
+
+    TriangleTextureDda textureDda{};
+    auto prepareTextureDda =
+        [&]() PS2X_GS_LAMBDA_ALWAYS_INLINE
+    {
+        if (gs->m_prim.tme)
+        {
+            textureDda.top = sorted[0].vertex;
+            textureDda.middle = sorted[1].vertex;
+            textureDda.bottom = sorted[2].vertex;
+            textureDda.topX = sorted[0].x;
+            textureDda.topY = sorted[0].y;
+            textureDda.middleX = sorted[1].x;
+            textureDda.middleY = sorted[1].y;
+            textureDda.bottomX = sorted[2].x;
+            textureDda.bottomY = sorted[2].y;
+            const uint8_t minificationFilter =
+                static_cast<uint8_t>((ctx.tex1 >> 6u) & 0x7u);
+            const bool mipmapsEnabled =
+                ((ctx.tex1 >> 2u) & 0x7u) != 0u &&
+                minificationFilter >= 2u &&
+                minificationFilter <= 5u;
+            textureDda.linearFilter =
+                tex1UsesLinearFilter(ctx.tex1);
+            textureDda.constantQFixed =
+                gs->m_prim.fst ||
+                (!mipmapsEnabled &&
+                 v0.q == v1.q &&
+                 v1.q == v2.q);
+
+            textureDda.valid = gradientValid;
+            if (textureDda.valid)
+            {
+                const float textureScaleU =
+                    static_cast<float>(65536u << ctx.tex0.tw);
+                const float textureScaleV =
+                    static_cast<float>(65536u << ctx.tex0.th);
+                auto textureValues =
+                    [&](const GSVertex &vertex, float values[3])
+                {
+                    if (gs->m_prim.fst)
+                    {
+                        const float filterBias =
+                            textureDda.linearFilter ? 32768.0f : 0.0f;
+                        values[0] =
+                            static_cast<float>(vertex.u) * 4096.0f -
+                            filterBias;
+                        values[1] =
+                            static_cast<float>(vertex.v) * 4096.0f -
+                            filterBias;
+                        values[2] = 1.0f;
+                    }
+                    else
+                    {
+                        if (textureDda.constantQFixed)
+                        {
+                            const float q = fabsQ(vertex.q);
+                            const float filterBias =
+                                textureDda.linearFilter ? 32768.0f : 0.0f;
+                            values[0] =
+                                (vertex.s / q) * textureScaleU - filterBias;
+                            values[1] =
+                                (vertex.t / q) * textureScaleV - filterBias;
+                            values[2] = 1.0f;
+                        }
+                        else
+                        {
+                            values[0] = vertex.s * textureScaleU;
+                            values[1] = vertex.t * textureScaleV;
+                            values[2] = vertex.q;
+                        }
+                    }
+                };
+
+                float topTexture[3];
+                float middleTexture[3];
+                float bottomTexture[3];
+                textureValues(*textureDda.top, topTexture);
+                textureValues(*textureDda.middle, middleTexture);
+                textureValues(*textureDda.bottom, bottomTexture);
+                for (int component = 0; component < 3; ++component)
+                {
+                    const float delta01 =
+                        middleTexture[component] - topTexture[component];
+                    const float delta02 =
+                        bottomTexture[component] - topTexture[component];
+                    textureDda.dx[component] = std::fma(
+                        delta02,
+                        gradientY01OverCross,
+                        -(delta01 * gradientY02OverCross));
+                    textureDda.dy[component] = std::fma(
+                        delta01,
+                        gradientX02OverCross,
+                        -(delta02 * gradientX01OverCross));
+                }
+            }
+        }
+    };
+    bool attributeDdasPrepared = false;
+
+    // The GS manual defines pixel centers at integer window coordinates.
+    // Rasterize top/left edges inclusively and bottom/right edges exclusively,
+    // so triangles which share an edge neither overlap nor leave a gap.
+    const FixedPointVertex firstSample{minX * 16, minY * 16};
+    int64_t rowEdge0 = triangleEdge(p1, p2, firstSample);
+    int64_t rowEdge1 = triangleEdge(p2, p0, firstSample);
+    int64_t rowEdge2 = triangleEdge(p0, p1, firstSample);
+    int64_t edge0StepX =
+        -static_cast<int64_t>(p2.y - p1.y) * 16;
+    int64_t edge1StepX =
+        -static_cast<int64_t>(p0.y - p2.y) * 16;
+    int64_t edge2StepX =
+        -static_cast<int64_t>(p1.y - p0.y) * 16;
+    int64_t edge0StepY =
+        static_cast<int64_t>(p2.x - p1.x) * 16;
+    int64_t edge1StepY =
+        static_cast<int64_t>(p0.x - p2.x) * 16;
+    int64_t edge2StepY =
+        static_cast<int64_t>(p1.x - p0.x) * 16;
+    if (!positiveArea)
+    {
+        rowEdge0 = -rowEdge0;
+        rowEdge1 = -rowEdge1;
+        rowEdge2 = -rowEdge2;
+        edge0StepX = -edge0StepX;
+        edge1StepX = -edge1StepX;
+        edge2StepX = -edge2StepX;
+        edge0StepY = -edge0StepY;
+        edge1StepY = -edge1StepY;
+        edge2StepY = -edge2StepY;
+    }
+
+    const bool useFastPixelPath =
+        !drawTrace().capturing &&
+        ctx.frame.psm == GS_PSM_CT32 &&
+        ctx.frame.fbmsk == 0u &&
+        !destinationAlphaTestEnabled(
+            ctx.test, GS_PSM_CT32) &&
+        (ctx.zbuf.psm == GS_PSM_Z24 ||
+         ctx.zbuf.psm == GS_PSM_Z32) &&
+        (!gs->m_prim.abe ||
+         (ctx.alpha & 0xFFu) == 0x44u);
+    const GSPixelTraceTarget &pixelTrace =
+        pixelTraceTarget();
+    const uint32_t fastFbp =
+        GSInternal::framePageBaseToBlock(ctx.frame.fbp);
+    const uint32_t fastZbp =
+        GSInternal::framePageBaseToBlock(ctx.zbuf.zbp);
+    const uint32_t fastFbw =
+        std::max<uint32_t>(ctx.frame.fbw, 1u);
+    const bool fastZtestEnabled =
+        ((ctx.test >> 16u) & 1u) != 0u;
+    const uint32_t fastZtestMethod =
+        static_cast<uint32_t>((ctx.test >> 17u) & 3u);
+    auto readFastDepth = [&](int x, int y)
+    {
+        return ctx.zbuf.psm == GS_PSM_Z24
+                   ? GSMem::ReadZ24(
+                         gs->m_vram, fastZbp, fastFbw, x, y)
+                   : GSMem::ReadZ32(
+                         gs->m_vram, fastZbp, fastFbw, x, y);
+    };
+    auto passesFastDepthTest =
+        [&](int x, int y, uint32_t z)
+    {
+        if (!fastZtestEnabled)
+            return true;
+        if (fastZtestMethod == 0u)
+            return false;
+        if (fastZtestMethod == 1u)
+            return true;
+
+        const uint32_t destinationZ =
+            readFastDepth(x, y);
+        return fastZtestMethod == 2u
+                   ? z >= destinationZ
+                   : z > destinationZ;
+    };
+    auto writeTrianglePixelFast =
+        [&](int x,
+            int y,
+            uint32_t z,
+            uint8_t r,
+            uint8_t g,
+            uint8_t b,
+            uint8_t a,
+            bool depthPretested) PS2X_GS_LAMBDA_ALWAYS_INLINE
+    {
+        const AlphaTestResult alphaTest =
+            classifyAlphaTest(ctx.test, a);
+        if (!alphaTest.writeFramebuffer &&
+            !alphaTest.writeDepth)
+        {
+            return;
+        }
+
+        if (!depthPretested &&
+            !passesFastDepthTest(x, y, z))
+        {
+            return;
+        }
+
+        if (alphaTest.writeFramebuffer)
+        {
+            const bool alphaBlendEnabled = gs->m_prim.abe;
+            uint32_t destination = 0u;
+            if (alphaBlendEnabled ||
+                alphaTest.preserveDestinationAlpha)
+            {
+                destination = GSMem::ReadCT32(
+                    gs->m_vram,
+                    fastFbp,
+                    fastFbw,
+                    x,
+                    y);
+            }
+            if (alphaBlendEnabled &&
+                !(gs->m_pabe && (a & 0x80u) == 0u))
+            {
+                const uint32_t blended =
+                    blendSourceOverRgb(
+                        pack32(r, g, b, a),
+                        destination,
+                        a);
+                r = static_cast<uint8_t>(blended);
+                g = static_cast<uint8_t>(blended >> 8u);
+                b = static_cast<uint8_t>(blended >> 16u);
+            }
+            if (!alphaTest.preserveDestinationAlpha &&
+                (ctx.fba & 1u) != 0u)
+            {
+                a = static_cast<uint8_t>(a | 0x80u);
+            }
+            uint32_t pixel = pack32(r, g, b, a);
+            if (alphaTest.preserveDestinationAlpha)
+            {
+                pixel =
+                    (pixel & 0x00FFFFFFu) |
+                    (destination & 0xFF000000u);
+            }
+            GSMem::WriteCT32(
+                gs->m_vram,
+                fastFbp,
+                fastFbw,
+                x,
+                y,
+                pixel);
+        }
+
+        if (alphaTest.writeDepth &&
+            fastZtestEnabled &&
+            !ctx.zbuf.zmask)
+        {
+            if (ctx.zbuf.psm == GS_PSM_Z24)
+                GSMem::WriteZ24(
+                    gs->m_vram,
+                    fastZbp,
+                    fastFbw,
+                    x,
+                    y,
+                    z);
+            else
+                GSMem::WriteZ32(
+                    gs->m_vram,
+                    fastZbp,
+                    fastFbw,
+                    x,
+                    y,
+                    z);
+        }
+    };
+
+    for (int y = minY; y < maxY; ++y)
+    {
+        if (!ownsScanline(y))
+        {
+            rowEdge0 += edge0StepY;
+            rowEdge1 += edge1StepY;
+            rowEdge2 += edge2StepY;
+            continue;
+        }
+
+        int spanStart = 0;
+        int spanEnd = maxX - minX;
+        auto clipSpanToEdge =
+            [&](int64_t edge,
+                int64_t step,
+                bool topLeft)
+        {
+            const int64_t threshold = topLeft ? 0 : 1;
+            if (step > 0)
+            {
+                if (edge < threshold)
+                {
+                    const int64_t delta = threshold - edge;
+                    const int64_t first =
+                        (delta + step - 1) / step;
+                    if (first >= spanEnd)
+                        spanStart = spanEnd;
+                    else
+                        spanStart = std::max(
+                            spanStart,
+                            static_cast<int>(first));
+                }
+            }
+            else if (step < 0)
+            {
+                if (edge < threshold)
+                {
+                    spanEnd = 0;
+                }
+                else
+                {
+                    const int64_t last =
+                        (edge - threshold) / -step;
+                    if (last < spanEnd - 1)
+                    {
+                        spanEnd =
+                            static_cast<int>(last + 1);
+                    }
+                }
+            }
+            else if (edge < threshold)
+            {
+                spanEnd = 0;
+            }
+        };
+        clipSpanToEdge(rowEdge0, edge0StepX, topLeft0);
+        clipSpanToEdge(rowEdge1, edge1StepX, topLeft1);
+        clipSpanToEdge(rowEdge2, edge2StepX, topLeft2);
+
+        const int scanlineMinX = minX + spanStart;
+        const int scanlineMaxX = minX + spanEnd;
+        int64_t edge0 =
+            rowEdge0 + edge0StepX * spanStart;
+        int64_t edge1 =
+            rowEdge1 + edge1StepX * spanStart;
+        int64_t edge2 =
+            rowEdge2 + edge2StepX * spanStart;
+        int scanlineLeft = 0;
+        int scanlineColor[5] = {};
+        float scanlineColorRaw[5] = {};
+        double scanlineDepth = 0.0;
+        float scanlineTexture[3] = {};
+        constexpr int kDdaPixelsPerStep = 8;
+        int scanlineDdaSkip = 0;
+        bool scanlineStarted = false;
+        bool scanlineAttributesStarted = false;
+        for (int x = scanlineMinX; x < scanlineMaxX; ++x)
+        {
+            if (!scanlineStarted)
+            {
+                scanlineStarted = true;
+                scanlineLeft = x;
+                scanlineDdaSkip =
+                    scanlineLeft & (kDdaPixelsPerStep - 1);
+                if (depthDda.valid)
+                {
+                    const GSVertex *base = depthDda.top;
+                    float baseX = depthDda.topX;
+                    float baseY = depthDda.topY;
+                    if (depthDda.topY == depthDda.middleY)
+                    {
+                        const bool negativeCross =
+                            (depthDda.middleY - depthDda.topY) *
+                                    (depthDda.bottomX - depthDda.topX) -
+                                (depthDda.middleX - depthDda.topX) *
+                                    (depthDda.bottomY - depthDda.topY) <
+                            0.0f;
+                        if (!negativeCross)
+                        {
+                            base = depthDda.middle;
+                            baseX = depthDda.middleX;
+                            baseY = depthDda.middleY;
+                        }
+                    }
+                    else if (y >= static_cast<int>(
+                                      std::ceil(depthDda.middleY)))
+                    {
+                        base = depthDda.middle;
+                        baseX = depthDda.middleX;
+                        baseY = depthDda.middleY;
+                    }
+
+                    const float deltaY =
+                        static_cast<float>(y) - baseY;
+                    const float prestep =
+                        static_cast<float>(scanlineLeft) - baseX;
+                    const double edgeDepth = std::fma(
+                        depthDda.dy,
+                        static_cast<double>(deltaY),
+                        static_cast<double>(base->z));
+                    scanlineDepth = std::fma(
+                        depthDda.dx,
+                        static_cast<double>(prestep),
+                        edgeDepth);
+                }
+            }
+
+            // Express interpolation as a base value plus two deltas. Besides
+            // reducing accumulated error, this guarantees that a constant
+            // vertex attribute remains bit-exact across the whole triangle.
+            auto interpolate = [&](float a, float b, float c)
+            {
+                const float w1 =
+                    static_cast<float>(edge1) * invArea;
+                const float w2 =
+                    static_cast<float>(edge2) * invArea;
+                return a + (b - a) * w1 + (c - a) * w2;
+            };
+
+            const int ddaAlignedLeft =
+                scanlineLeft & ~(kDdaPixelsPerStep - 1);
+            const int ddaBlock =
+                (x - ddaAlignedLeft) / kDdaPixelsPerStep;
+            const int ddaLane =
+                x & (kDdaPixelsPerStep - 1);
+            const int ddaLaneOffset =
+                ddaLane - scanlineDdaSkip;
+
+            double z;
+            if (depthDda.valid)
+            {
+                const float laneDelta =
+                    static_cast<float>(depthDda.dx) *
+                    static_cast<float>(ddaLaneOffset);
+                const double blockDelta =
+                    depthDda.dx *
+                    static_cast<double>(kDdaPixelsPerStep);
+                z = scanlineDepth +
+                    static_cast<double>(laneDelta);
+                for (int blockIndex = 0;
+                     blockIndex < ddaBlock;
+                     ++blockIndex)
+                {
+                    z += blockDelta;
+                }
+            }
+            else
+            {
+                const float w1 =
+                    static_cast<float>(edge1) * invArea;
+                const float w2 =
+                    static_cast<float>(edge2) * invArea;
+                z =
+                    v0.z +
+                    (v1.z - v0.z) * static_cast<double>(w1) +
+                    (v2.z - v0.z) * static_cast<double>(w2);
+            }
+
+            const uint32_t integerZ =
+                static_cast<uint32_t>(z);
+            const bool debugPixel =
+                pixelTrace.enabled &&
+                x == pixelTrace.x &&
+                y == pixelTrace.y;
+            const bool depthPretested =
+                useFastPixelPath && !debugPixel;
+            if (depthPretested &&
+                !passesFastDepthTest(x, y, integerZ))
+            {
+                edge0 += edge0StepX;
+                edge1 += edge1StepX;
+                edge2 += edge2StepX;
                 continue;
+            }
 
-            double z = v0.z * w0 + v1.z * w1 + v2.z * w2;
+            if (!scanlineAttributesStarted)
+            {
+                scanlineAttributesStarted = true;
+                if (!attributeDdasPrepared)
+                {
+                    attributeDdasPrepared = true;
+                    prepareColorDda();
+                    prepareTextureDda();
+                }
+                if (colorDda.valid)
+                {
+                    const GSVertex *base = colorDda.top;
+                    float baseX = colorDda.topX;
+                    float baseY = colorDda.topY;
+                    if (colorDda.topY == colorDda.middleY)
+                    {
+                        const bool negativeCross =
+                            (colorDda.middleY - colorDda.topY) *
+                                    (colorDda.bottomX - colorDda.topX) -
+                                (colorDda.middleX - colorDda.topX) *
+                                    (colorDda.bottomY - colorDda.topY) <
+                            0.0f;
+                        if (!negativeCross)
+                        {
+                            base = colorDda.middle;
+                            baseX = colorDda.middleX;
+                            baseY = colorDda.middleY;
+                        }
+                    }
+                    else if (y >= static_cast<int>(
+                                      std::ceil(colorDda.middleY)))
+                    {
+                        base = colorDda.middle;
+                        baseX = colorDda.middleX;
+                        baseY = colorDda.middleY;
+                    }
+
+                    const float baseColor[5] = {
+                        static_cast<float>(base->r) * 128.0f,
+                        static_cast<float>(base->g) * 128.0f,
+                        static_cast<float>(base->b) * 128.0f,
+                        static_cast<float>(base->a) * 128.0f,
+                        static_cast<float>(base->fog) * 128.0f,
+                    };
+                    const float deltaY =
+                        static_cast<float>(y) - baseY;
+                    const float prestep =
+                        static_cast<float>(scanlineLeft) - baseX;
+                    for (int channel = 0; channel < 5; ++channel)
+                    {
+                        const float edgeValue = std::fma(
+                            colorDda.dy[channel],
+                            deltaY,
+                            baseColor[channel]);
+                        scanlineColorRaw[channel] = std::fma(
+                            colorDda.dx[channel],
+                            prestep,
+                            edgeValue);
+                        scanlineColor[channel] =
+                            static_cast<int>(scanlineColorRaw[channel]);
+                    }
+                }
+                if (textureDda.valid)
+                {
+                    const GSVertex *base = textureDda.top;
+                    float baseX = textureDda.topX;
+                    float baseY = textureDda.topY;
+                    if (textureDda.topY == textureDda.middleY)
+                    {
+                        const bool negativeCross =
+                            (textureDda.middleY - textureDda.topY) *
+                                    (textureDda.bottomX - textureDda.topX) -
+                                (textureDda.middleX - textureDda.topX) *
+                                    (textureDda.bottomY - textureDda.topY) <
+                            0.0f;
+                        if (!negativeCross)
+                        {
+                            base = textureDda.middle;
+                            baseX = textureDda.middleX;
+                            baseY = textureDda.middleY;
+                        }
+                    }
+                    else if (y >= static_cast<int>(
+                                      std::ceil(textureDda.middleY)))
+                    {
+                        base = textureDda.middle;
+                        baseX = textureDda.middleX;
+                        baseY = textureDda.middleY;
+                    }
+
+                    const float textureScaleU =
+                        static_cast<float>(65536u << ctx.tex0.tw);
+                    const float textureScaleV =
+                        static_cast<float>(65536u << ctx.tex0.th);
+                    float baseTexture[3];
+                    if (gs->m_prim.fst)
+                    {
+                        const float filterBias =
+                            textureDda.linearFilter ? 32768.0f : 0.0f;
+                        baseTexture[0] =
+                            static_cast<float>(base->u) * 4096.0f -
+                            filterBias;
+                        baseTexture[1] =
+                            static_cast<float>(base->v) * 4096.0f -
+                            filterBias;
+                        baseTexture[2] = 1.0f;
+                    }
+                    else
+                    {
+                        if (textureDda.constantQFixed)
+                        {
+                            const float q = fabsQ(base->q);
+                            const float filterBias =
+                                textureDda.linearFilter ? 32768.0f : 0.0f;
+                            baseTexture[0] =
+                                (base->s / q) * textureScaleU -
+                                filterBias;
+                            baseTexture[1] =
+                                (base->t / q) * textureScaleV -
+                                filterBias;
+                            baseTexture[2] = 1.0f;
+                        }
+                        else
+                        {
+                            baseTexture[0] = base->s * textureScaleU;
+                            baseTexture[1] = base->t * textureScaleV;
+                            baseTexture[2] = base->q;
+                        }
+                    }
+                    const float deltaY =
+                        static_cast<float>(y) - baseY;
+                    const float prestep =
+                        static_cast<float>(scanlineLeft) - baseX;
+                    for (int component = 0; component < 3; ++component)
+                    {
+                        const float edgeValue = std::fma(
+                            textureDda.dy[component],
+                            deltaY,
+                            baseTexture[component]);
+                        scanlineTexture[component] = std::fma(
+                            textureDda.dx[component],
+                            prestep,
+                            edgeValue);
+                    }
+                }
+            }
+
+            auto interpolateDdaFixed = [&](int channel)
+            {
+                const int laneDelta = static_cast<int>(
+                    colorDda.dx[channel] *
+                    static_cast<float>(ddaLaneOffset));
+                const float blockDeltaFloat =
+                    colorDda.dx[channel] *
+                    static_cast<float>(kDdaPixelsPerStep);
+                // PCSX2's GS setup path uses the hardware-equivalent
+                // round-to-nearest conversion for the eight-pixel fog
+                // step, while colour steps and all per-lane offsets use
+                // truncation.
+                const int blockDelta =
+                    channel == 4
+                        ? static_cast<int>(std::nearbyint(blockDeltaFloat))
+                        : static_cast<int>(blockDeltaFloat);
+                if ((channel == 0 || channel == 4) &&
+                    debugPixel)
+                {
+                    std::cerr
+                        << (channel == 4
+                                ? "[gs:fog-dda] draw="
+                                : "[gs:color-dda] draw=")
+                        << drawTrace().index
+                        << " xy=(" << x << ',' << y << ')'
+                        << " scan=" << scanlineColor[channel]
+                        << " scan-raw=" << std::setprecision(9)
+                        << scanlineColorRaw[channel]
+                        << " dx=" << colorDda.dx[channel]
+                        << " dy=" << colorDda.dy[channel]
+                        << " skip=" << scanlineDdaSkip
+                        << " lane=" << ddaLaneOffset
+                        << " lane-delta=" << laneDelta
+                        << " step=" << blockDelta
+                        << " block=" << ddaBlock
+                        << " value="
+                        << scanlineColor[channel] +
+                               laneDelta +
+                               ddaBlock * blockDelta
+                        << '\n';
+                }
+                return scanlineColor[channel] +
+                       laneDelta +
+                       ddaBlock * blockDelta;
+            };
 
             uint8_t r, g, b, a;
-            if (gs->m_prim.iip)
+            int traceFixedShade[4] = {};
+            if (gs->m_prim.iip && colorDda.valid)
             {
-                r = clampU8(static_cast<int>(v0.r * w0 + v1.r * w1 + v2.r * w2));
-                g = clampU8(static_cast<int>(v0.g * w0 + v1.g * w1 + v2.g * w2));
-                b = clampU8(static_cast<int>(v0.b * w0 + v1.b * w1 + v2.b * w2));
-                a = clampU8(static_cast<int>(v0.a * w0 + v1.a * w1 + v2.a * w2));
+#if defined(__SSE4_1__)
+                const __m128 dx =
+                    _mm_loadu_ps(colorDda.dx);
+                const __m128i laneDelta =
+                    _mm_cvttps_epi32(_mm_mul_ps(
+                        dx,
+                        _mm_set1_ps(
+                            static_cast<float>(ddaLaneOffset))));
+                const __m128i blockDelta =
+                    _mm_cvttps_epi32(_mm_mul_ps(
+                        dx,
+                        _mm_set1_ps(
+                            static_cast<float>(
+                                kDdaPixelsPerStep))));
+                __m128i fixed = _mm_add_epi32(
+                    _mm_loadu_si128(
+                        reinterpret_cast<const __m128i *>(
+                            scanlineColor)),
+                    laneDelta);
+                fixed = _mm_add_epi32(
+                    fixed,
+                    _mm_mullo_epi32(
+                        blockDelta,
+                        _mm_set1_epi32(ddaBlock)));
+                _mm_storeu_si128(
+                    reinterpret_cast<__m128i *>(traceFixedShade),
+                    fixed);
+                __m128i color = _mm_srai_epi32(fixed, 7);
+                color = _mm_min_epi32(
+                    _mm_max_epi32(color, _mm_setzero_si128()),
+                    _mm_set1_epi32(255));
+                const uint32_t packed =
+                    static_cast<uint32_t>(_mm_cvtsi128_si32(
+                        _mm_packus_epi16(
+                            _mm_packus_epi32(color, color),
+                            _mm_setzero_si128())));
+                r = static_cast<uint8_t>(packed);
+                g = static_cast<uint8_t>(packed >> 8u);
+                b = static_cast<uint8_t>(packed >> 16u);
+                a = static_cast<uint8_t>(packed >> 24u);
+                if (debugPixel)
+                    (void)interpolateDdaFixed(0);
+#else
+                auto shadeChannel = [&](int channel)
+                {
+                    const int fixed = interpolateDdaFixed(channel);
+                    traceFixedShade[channel] = fixed;
+                    return clampU8(fixed >> 7);
+                };
+                r = shadeChannel(0);
+                g = shadeChannel(1);
+                b = shadeChannel(2);
+                a = shadeChannel(3);
+#endif
+            }
+            else if (gs->m_prim.iip)
+            {
+                r = clampU8(static_cast<int>(interpolate(
+                    static_cast<float>(v0.r),
+                    static_cast<float>(v1.r),
+                    static_cast<float>(v2.r))));
+                g = clampU8(static_cast<int>(interpolate(
+                    static_cast<float>(v0.g),
+                    static_cast<float>(v1.g),
+                    static_cast<float>(v2.g))));
+                b = clampU8(static_cast<int>(interpolate(
+                    static_cast<float>(v0.b),
+                    static_cast<float>(v1.b),
+                    static_cast<float>(v2.b))));
+                a = clampU8(static_cast<int>(interpolate(
+                    static_cast<float>(v0.a),
+                    static_cast<float>(v1.a),
+                    static_cast<float>(v2.a))));
             }
             else
             {
@@ -889,35 +4740,308 @@ void GSRasterizer::drawTriangle(GS *gs)
                 b = v2.b;
                 a = v2.a;
             }
+            if (!(gs->m_prim.iip && colorDda.valid))
+            {
+                traceFixedShade[0] = static_cast<int>(r) << 7;
+                traceFixedShade[1] = static_cast<int>(g) << 7;
+                traceFixedShade[2] = static_cast<int>(b) << 7;
+                traceFixedShade[3] = static_cast<int>(a) << 7;
+            }
 
+            const uint8_t initialR = r;
+            const uint8_t initialG = g;
+            const uint8_t initialB = b;
+            const uint8_t initialA = a;
+            uint32_t traceTexel = 0u;
             if (gs->m_prim.tme)
             {
                 float is, it, iq;
                 uint16_t iu, iv;
-                if (gs->m_prim.fst)
+                bool useFixedTextureCoordinates = false;
+                bool fixedTextureLinearBiasApplied = false;
+                int32_t fixedTextureU = 0;
+                int32_t fixedTextureV = 0;
+                if (textureDda.valid)
                 {
-                    iu = static_cast<uint16_t>(v0.u * w0 + v1.u * w1 + v2.u * w2);
-                    iv = static_cast<uint16_t>(v0.v * w0 + v1.v * w1 + v2.v * w2);
+                    float interpolated[3] = {};
+                    if (textureDda.constantQFixed)
+                    {
+                        int32_t fixed[2] = {};
+                        for (int component = 0; component < 2; ++component)
+                        {
+                            const int32_t scanlineBase =
+                                static_cast<int32_t>(
+                                    scanlineTexture[component]);
+                            const int32_t laneDelta =
+                                static_cast<int32_t>(
+                                    textureDda.dx[component] *
+                                    static_cast<float>(
+                                        ddaLaneOffset));
+                            const int32_t blockDelta =
+                                static_cast<int32_t>(
+                                    textureDda.dx[component] *
+                                    static_cast<float>(
+                                        kDdaPixelsPerStep));
+                            const uint32_t value =
+                                static_cast<uint32_t>(scanlineBase) +
+                                static_cast<uint32_t>(laneDelta) +
+                                static_cast<uint32_t>(blockDelta) *
+                                    static_cast<uint32_t>(
+                                        ddaBlock);
+                            fixed[component] =
+                                static_cast<int32_t>(value);
+                        }
+
+                        useFixedTextureCoordinates = true;
+                        fixedTextureLinearBiasApplied =
+                            textureDda.linearFilter;
+                        fixedTextureU = fixed[0];
+                        fixedTextureV = fixed[1];
+                        const int32_t filterBias =
+                            textureDda.linearFilter ? 0x8000 : 0;
+                        const int32_t unbiasedU = static_cast<int32_t>(
+                            static_cast<uint32_t>(fixed[0]) +
+                            static_cast<uint32_t>(filterBias));
+                        const int32_t unbiasedV = static_cast<int32_t>(
+                            static_cast<uint32_t>(fixed[1]) +
+                            static_cast<uint32_t>(filterBias));
+                        const float textureScaleU =
+                            static_cast<float>(65536u << ctx.tex0.tw);
+                        const float textureScaleV =
+                            static_cast<float>(65536u << ctx.tex0.th);
+                        is = static_cast<float>(unbiasedU) /
+                             textureScaleU;
+                        it = static_cast<float>(unbiasedV) /
+                             textureScaleV;
+                        iq = 1.0f;
+                        iu = 0u;
+                        iv = 0u;
+                    }
+                    else
+                    {
+                        for (int component = 0;
+                             component < 3;
+                             ++component)
+                        {
+                            interpolated[component] =
+                                scanlineTexture[component] +
+                                textureDda.dx[component] *
+                                    static_cast<float>(
+                                        ddaLaneOffset);
+                            const float blockStep =
+                                textureDda.dx[component] *
+                                static_cast<float>(
+                                    kDdaPixelsPerStep);
+                            for (int blockIndex = 0;
+                                 blockIndex < ddaBlock;
+                                 ++blockIndex)
+                            {
+                                interpolated[component] +=
+                                    blockStep;
+                            }
+                        }
+
+                        if (gs->m_prim.fst)
+                        {
+                            iu = static_cast<uint16_t>(clampInt(
+                                static_cast<int>(
+                                    interpolated[0] / 4096.0f),
+                                0, 0xFFFF));
+                            iv = static_cast<uint16_t>(clampInt(
+                                static_cast<int>(
+                                    interpolated[1] / 4096.0f),
+                                0, 0xFFFF));
+                            is = 0.0f;
+                            it = 0.0f;
+                            iq = 1.0f;
+                        }
+                        else
+                        {
+                            const float textureScaleU =
+                                static_cast<float>(
+                                    65536u << ctx.tex0.tw);
+                            const float textureScaleV =
+                                static_cast<float>(
+                                    65536u << ctx.tex0.th);
+                            is = interpolated[0] / textureScaleU;
+                            it = interpolated[1] / textureScaleV;
+                            iq = interpolated[2];
+                            // The GS scanline path converts S/Q and T/Q
+                            // directly from the already texture-scaled
+                            // interpolants. Normalizing S/T and multiplying
+                            // by the texture size again can move an exact
+                            // fixed-point boundary down by one ULP.
+                            useFixedTextureCoordinates = true;
+                            fixedTextureLinearBiasApplied = false;
+                            fixedTextureU = static_cast<int32_t>(
+                                interpolated[0] / fabsQ(iq));
+                            fixedTextureV = static_cast<int32_t>(
+                                interpolated[1] / fabsQ(iq));
+                            iu = 0u;
+                            iv = 0u;
+                        }
+                    }
+                }
+                else if (gs->m_prim.fst)
+                {
+                    iu = static_cast<uint16_t>(clampInt(
+                        static_cast<int>(interpolate(
+                            static_cast<float>(v0.u),
+                            static_cast<float>(v1.u),
+                            static_cast<float>(v2.u))),
+                        0, 0xFFFF));
+                    iv = static_cast<uint16_t>(clampInt(
+                        static_cast<int>(interpolate(
+                            static_cast<float>(v0.v),
+                            static_cast<float>(v1.v),
+                            static_cast<float>(v2.v))),
+                        0, 0xFFFF));
                     is = 0.0f;
                     it = 0.0f;
                     iq = 1.0f;
                 }
                 else
                 {
-                    const float invQ0 = 1.0f / fabsQ(v0.q);
-                    const float invQ1 = 1.0f / fabsQ(v1.q);
-                    const float invQ2 = 1.0f / fabsQ(v2.q);
-                    const float sOverQ = (v0.s * invQ0) * w0 + (v1.s * invQ1) * w1 + (v2.s * invQ2) * w2;
-                    const float tOverQ = (v0.t * invQ0) * w0 + (v1.t * invQ1) * w1 + (v2.t * invQ2) * w2;
-                    const float invQ = invQ0 * w0 + invQ1 * w1 + invQ2 * w2;
-                    iq = (std::fabs(invQ) > 1.0e-8f) ? (1.0f / invQ) : 1.0f;
-                    is = sOverQ * iq;
-                    it = tOverQ * iq;
+                    is = interpolate(v0.s, v1.s, v2.s);
+                    it = interpolate(v0.t, v1.t, v2.t);
+                    iq = interpolate(v0.q, v1.q, v2.q);
                     iu = 0;
                     iv = 0;
                 }
 
-                uint32_t texel = sampleTexture(gs, is, it, iq, iu, iv);
+                uint32_t texel =
+                    useFixedTextureCoordinates
+                        ? sampleTextureFixed(gs,
+                                             fixedTextureU,
+                                             fixedTextureV,
+                                             fixedTextureLinearBiasApplied,
+                                             iq)
+                        : sampleTexture(gs, is, it, iq, iu, iv);
+                traceTexel = texel;
+                if (debugPixel)
+                {
+                    const double traceU =
+                        useFixedTextureCoordinates
+                            ? (static_cast<double>(fixedTextureU) +
+                               (fixedTextureLinearBiasApplied
+                                    ? 32768.0
+                                    : 0.0)) /
+                                  65536.0
+                        : gs->m_prim.fst
+                            ? static_cast<double>(iu) / 16.0
+                            : (static_cast<double>(is) /
+                               static_cast<double>(fabsQ(iq))) *
+                                  static_cast<double>(
+                                      1 << ctx.tex0.tw);
+                    const double traceV =
+                        useFixedTextureCoordinates
+                            ? (static_cast<double>(fixedTextureV) +
+                               (fixedTextureLinearBiasApplied
+                                    ? 32768.0
+                                    : 0.0)) /
+                                  65536.0
+                        : gs->m_prim.fst
+                            ? static_cast<double>(iv) / 16.0
+                            : (static_cast<double>(it) /
+                               static_cast<double>(fabsQ(iq))) *
+                                  static_cast<double>(
+                                      1 << ctx.tex0.th);
+                    const int traceU0 =
+                        static_cast<int>(std::floor(traceU - 0.5));
+                    const int traceV0 =
+                        static_cast<int>(std::floor(traceV - 0.5));
+                    uint32_t traceColors[4] = {};
+                    for (int sampleY = 0; sampleY < 2; ++sampleY)
+                    {
+                        for (int sampleX = 0; sampleX < 2; ++sampleX)
+                        {
+                            const uint8_t index = static_cast<uint8_t>(
+                                gs->ReadVram(ctx.tex0.psm,
+                                             ctx.tex0.tbp0,
+                                             ctx.tex0.tbw,
+                                             traceU0 + sampleX,
+                                             traceV0 + sampleY));
+                            traceColors[sampleY * 2 + sampleX] =
+                                lookupCLUT(gs,
+                                           index,
+                                           ctx.tex0.cbp,
+                                           ctx.tex0.cpsm,
+                                           ctx.tex0.csm,
+                                           ctx.tex0.csa,
+                                           ctx.tex0.psm);
+                        }
+                    }
+                    std::ostringstream message;
+                    message
+                        << "[gs:pixel] draw=" << drawTrace().index
+                        << " xy=(" << x << ',' << y << ')'
+                        << " left=" << scanlineLeft
+                        << " stq=(" << is << ',' << it << ',' << iq << ')'
+                        << " uv=(" << iu << ',' << iv << ')'
+                        << " scan=(" << scanlineTexture[0] << ','
+                        << scanlineTexture[1] << ','
+                        << scanlineTexture[2] << ')'
+                        << " d=(" << textureDda.dx[0] << ','
+                        << textureDda.dx[1] << ','
+                        << textureDda.dx[2] << ')'
+                        << "/(" << textureDda.dy[0] << ','
+                        << textureDda.dy[1] << ','
+                        << textureDda.dy[2] << ')';
+                    if (textureDda.constantQFixed)
+                    {
+                        constexpr int kTraceDdaPixelsPerStep = 8;
+                        const int traceAlignedLeft =
+                            scanlineLeft &
+                            ~(kTraceDdaPixelsPerStep - 1);
+                        const int traceSkip =
+                            scanlineLeft &
+                            (kTraceDdaPixelsPerStep - 1);
+                        const int traceBlock =
+                            (x - traceAlignedLeft) /
+                            kTraceDdaPixelsPerStep;
+                        const int traceLaneOffset =
+                            (x & (kTraceDdaPixelsPerStep - 1)) -
+                            traceSkip;
+                        int32_t traceFixed[2] = {};
+                        message << " fixed_parts=";
+                        for (int component = 0;
+                             component < 2;
+                             ++component)
+                        {
+                            const int32_t base = static_cast<int32_t>(
+                                scanlineTexture[component]);
+                            const int32_t lane = static_cast<int32_t>(
+                                textureDda.dx[component] *
+                                static_cast<float>(
+                                    traceLaneOffset));
+                            const int32_t step = static_cast<int32_t>(
+                                textureDda.dx[component] *
+                                static_cast<float>(
+                                    kTraceDdaPixelsPerStep));
+                            traceFixed[component] =
+                                static_cast<int32_t>(
+                                    static_cast<uint32_t>(base) +
+                                    static_cast<uint32_t>(lane) +
+                                    static_cast<uint32_t>(step) *
+                                        static_cast<uint32_t>(
+                                            traceBlock));
+                            message << (component == 0 ? "(" : "/(")
+                                    << base << ',' << lane << ','
+                                    << step << ','
+                                    << traceFixed[component] << ')';
+                        }
+                    }
+                    message
+                        << " texcoord=(" << traceU << ','
+                        << traceV << ')'
+                        << " taps=(" << std::hex
+                        << traceColors[0] << ','
+                        << traceColors[1] << ','
+                        << traceColors[2] << ','
+                        << traceColors[3] << ')'
+                        << " texel=0x" << std::hex << texel;
+                    std::cerr << message.str() << '\n';
+                }
 
                 uint8_t tr = static_cast<uint8_t>(texel & 0xFF);
                 uint8_t tg = static_cast<uint8_t>((texel >> 8) & 0xFF);
@@ -925,11 +5049,16 @@ void GSRasterizer::drawTriangle(GS *gs)
                 uint8_t ta = static_cast<uint8_t>((texel >> 24) & 0xFF);
 
                 const auto &tex = ctx.tex0;
-                const uint8_t shadeR = r;
-                const uint8_t shadeG = g;
-                const uint8_t shadeB = b;
-                const uint8_t shadeA = a;
-                const TextureCombineResult color = combineTexture(tex, shadeR, shadeG, shadeB, shadeA, tr, tg, tb, ta);
+                const TextureCombineResult color = combineTextureFixed(
+                    tex,
+                    traceFixedShade[0],
+                    traceFixedShade[1],
+                    traceFixedShade[2],
+                    traceFixedShade[3],
+                    tr,
+                    tg,
+                    tb,
+                    ta);
 
                 r = color.r;
                 g = color.g;
@@ -937,8 +5066,98 @@ void GSRasterizer::drawTriangle(GS *gs)
                 a = color.a;
             }
 
-            writePixel(gs, x, y, static_cast<u32>(z + 0.5), r, g, b, a);
+            const uint8_t textureR = r;
+            const uint8_t textureG = g;
+            const uint8_t textureB = b;
+            const uint8_t textureA = a;
+            int traceFixedFog = -1;
+            if (gs->m_prim.fge)
+            {
+                if (colorDda.valid)
+                {
+                    const uint16_t fog = static_cast<uint16_t>(
+                        clampInt(interpolateDdaFixed(4),
+                                 0,
+                                 255 * 128));
+                    traceFixedFog = fog;
+                    applyFogFixed(
+                        gs->m_fogColor, fog, r, g, b);
+                }
+                else
+                {
+                    const uint8_t fog = clampU8(
+                        static_cast<int>(interpolate(
+                            static_cast<float>(v0.fog),
+                            static_cast<float>(v1.fog),
+                            static_cast<float>(v2.fog))));
+                    applyFog(gs->m_fogColor, fog, r, g, b);
+                }
+            }
+
+            if (debugPixel)
+            {
+                std::cerr
+                    << "[gs:pixel-stages] draw=" << drawTrace().index
+                    << " xy=(" << x << ',' << y << ')'
+                    << " fixed_rgba=("
+                    << traceFixedShade[0] << ','
+                    << traceFixedShade[1] << ','
+                    << traceFixedShade[2] << ','
+                    << traceFixedShade[3] << ')'
+                    << " shade=("
+                    << static_cast<unsigned>(initialR) << ','
+                    << static_cast<unsigned>(initialG) << ','
+                    << static_cast<unsigned>(initialB) << ','
+                    << static_cast<unsigned>(initialA) << ')'
+                    << " texel=0x" << std::hex << traceTexel << std::dec
+                    << " texture=("
+                    << static_cast<unsigned>(textureR) << ','
+                    << static_cast<unsigned>(textureG) << ','
+                    << static_cast<unsigned>(textureB) << ','
+                    << static_cast<unsigned>(textureA) << ')'
+                    << " fog=" << traceFixedFog
+                    << " fogged=("
+                    << static_cast<unsigned>(r) << ','
+                    << static_cast<unsigned>(g) << ','
+                    << static_cast<unsigned>(b) << ','
+                    << static_cast<unsigned>(a) << ')'
+                    << '\n';
+            }
+
+            // GS depth interpolation is converted to the integer Z format by
+            // truncation. Rounding to nearest makes sloped triangles one unit
+            // too near or far at roughly half their pixels.
+            if (useFastPixelPath && !debugPixel)
+            {
+                writeTrianglePixelFast(
+                    x,
+                    y,
+                    integerZ,
+                    r,
+                    g,
+                    b,
+                    a,
+                    depthPretested);
+            }
+            else
+            {
+                writePixel(
+                    gs,
+                    x,
+                    y,
+                    integerZ,
+                    r,
+                    g,
+                    b,
+                    a);
+            }
+            edge0 += edge0StepX;
+            edge1 += edge1StepX;
+            edge2 += edge2StepX;
         }
+        rowEdge0 += edge0StepY;
+        rowEdge1 += edge1StepY;
+        rowEdge2 += edge2StepY;
     }
 }
 
@@ -948,28 +5167,119 @@ void GSRasterizer::drawLine(GS *gs)
     const GSVertex &v1 = gs->m_vtxQueue[1];
     const auto &ctx = gs->activeContext();
 
-    int ofx = ctx.xyoffset.ofx >> 4;
-    int ofy = ctx.xyoffset.ofy >> 4;
+    const float x0 =
+        (static_cast<float>(std::lround(v0.x * 16.0f)) -
+         static_cast<float>(ctx.xyoffset.ofx)) /
+        16.0f;
+    const float y0 =
+        (static_cast<float>(std::lround(v0.y * 16.0f)) -
+         static_cast<float>(ctx.xyoffset.ofy)) /
+        16.0f;
+    const float x1 =
+        (static_cast<float>(std::lround(v1.x * 16.0f)) -
+         static_cast<float>(ctx.xyoffset.ofx)) /
+        16.0f;
+    const float y1 =
+        (static_cast<float>(std::lround(v1.y * 16.0f)) -
+         static_cast<float>(ctx.xyoffset.ofy)) /
+        16.0f;
 
-    int x0 = static_cast<int>(v0.x) - ofx;
-    int y0 = static_cast<int>(v0.y) - ofy;
-    int x1 = static_cast<int>(v1.x) - ofx;
-    int y1 = static_cast<int>(v1.y) - ofy;
+    const float deltaX = x1 - x0;
+    const float deltaY = y1 - y0;
+    const bool stepX = std::fabs(deltaX) >= std::fabs(deltaY);
+    const bool positiveX = deltaX >= 0.0f;
+    const bool positiveY = deltaY >= 0.0f;
+    const int directionX = positiveX ? 1 : -1;
+    const int directionY = positiveY ? 1 : -1;
 
-    int dx = std::abs(x1 - x0);
-    int dy = -std::abs(y1 - y0);
-    int sx = (x0 < x1) ? 1 : -1;
-    int sy = (y0 < y1) ? 1 : -1;
-    int err = dx + dy;
+    float roundedX0 = std::floor(x0 + 0.5f);
+    float roundedY0 = std::floor(y0 + 0.5f);
+    float roundedX1 = std::floor(x1 + 0.5f);
+    float roundedY1 = std::floor(y1 + 0.5f);
 
-    int totalSteps = std::max(std::abs(x1 - x0), std::abs(y1 - y0));
-    if (totalSteps == 0)
-        totalSteps = 1;
+    // GS lines use the diamond-exit rule. It determines whether each
+    // endpoint's pixel is owned by this segment and keeps joined line strips
+    // from drawing an endpoint twice.
+    auto exitsEndpointDiamond = [&](float dx, float dy)
+    {
+        const float distance = std::fabs(dx) + std::fabs(dy);
+        if (distance < 0.5f)
+            return false;
+
+        if (stepX)
+        {
+            const bool exitsInDirection =
+                positiveX ? (dx > 0.0f) : (dx < 0.0f);
+            return exitsInDirection &&
+                   (distance > 0.5f || dy >= 0.0f);
+        }
+
+        const bool exitsInDirection =
+            positiveY ? (dy > 0.0f) : (dy < 0.0f);
+        return exitsInDirection &&
+               (distance > 0.5f || dx >= 0.0f);
+    };
+
+    const bool drawFirst =
+        !exitsEndpointDiamond(x0 - roundedX0, y0 - roundedY0);
+    const bool drawLast =
+        exitsEndpointDiamond(x1 - roundedX1, y1 - roundedY1);
+    if (!drawFirst)
+    {
+        roundedX0 += stepX ? directionX : 0;
+        roundedY0 += stepX ? 0 : directionY;
+    }
+    if (!drawLast)
+    {
+        roundedX1 -= stepX ? directionX : 0;
+        roundedY1 -= stepX ? 0 : directionY;
+    }
+
+    if ((stepX
+             ? directionX * (roundedX1 - roundedX0)
+             : directionY * (roundedY1 - roundedY0)) < 0.0f)
+    {
+        return;
+    }
+
+    const float drivingDelta = std::fabs(stepX ? deltaX : deltaY);
+    if (drivingDelta == 0.0f)
+        return;
+
+    int pixelX = static_cast<int>(roundedX0);
+    int pixelY = static_cast<int>(roundedY0);
+    const int lastX = static_cast<int>(roundedX1);
+    const int lastY = static_cast<int>(roundedY1);
+
+    const int decisionScale = static_cast<int>(
+        2.0f * 16.0f * 16.0f * drivingDelta);
+    const int decisionStep = static_cast<int>(
+        2.0f * 16.0f * 16.0f * (stepX ? deltaY : deltaX));
+    int decision = static_cast<int>(
+        decisionScale *
+        (stepX ? (y0 - roundedY0) : (x0 - roundedX0)));
+
+    const float prestep = stepX
+                              ? directionX * (roundedX0 - x0)
+                              : directionY * (roundedY0 - y0);
+    decision += static_cast<int>(decisionStep * prestep);
+
+    auto stepDependent = [&](int direction)
+    {
+        decision -= decisionScale * direction;
+        pixelX += stepX ? 0 : direction;
+        pixelY += stepX ? direction : 0;
+    };
+
+    while (decision >= decisionScale / 2)
+        stepDependent(1);
+    while (decision < -decisionScale / 2)
+        stepDependent(-1);
+
     int step = 0;
-
     for (;;)
     {
-        float t = static_cast<float>(step) / static_cast<float>(totalSteps);
+        const float t = (prestep + static_cast<float>(step)) / drivingDelta;
         uint8_t r, g, b, a;
         if (gs->m_prim.iip)
         {
@@ -986,23 +5296,117 @@ void GSRasterizer::drawLine(GS *gs)
             a = v1.a;
         }
 
-        double z = (v0.z + (v1.z - v0.z) * t);
+        if (gs->m_prim.tme)
+        {
+            uint32_t texel = 0u;
+            if (gs->m_prim.fst)
+            {
+                const uint16_t u = static_cast<uint16_t>(clampInt(
+                    static_cast<int>(
+                        v0.u + (static_cast<float>(v1.u) - v0.u) * t),
+                    0, 0xFFFF));
+                const uint16_t v = static_cast<uint16_t>(clampInt(
+                    static_cast<int>(
+                        v0.v + (static_cast<float>(v1.v) - v0.v) * t),
+                    0, 0xFFFF));
+                texel = sampleTexture(gs, 0.0f, 0.0f, 1.0f, u, v);
+            }
+            else
+            {
+                const float s = v0.s + (v1.s - v0.s) * t;
+                const float textureT = v0.t + (v1.t - v0.t) * t;
+                const float q = v0.q + (v1.q - v0.q) * t;
+                texel = sampleTexture(gs, s, textureT, q, 0u, 0u);
+            }
 
-        writePixel(gs, x0, y0, static_cast<u32>(z), r, g, b, a);
+            const TextureCombineResult color = combineTexture(
+                ctx.tex0,
+                r, g, b, a,
+                static_cast<uint8_t>(texel),
+                static_cast<uint8_t>(texel >> 8u),
+                static_cast<uint8_t>(texel >> 16u),
+                static_cast<uint8_t>(texel >> 24u));
+            r = color.r;
+            g = color.g;
+            b = color.b;
+            a = color.a;
+        }
 
-        if (x0 == x1 && y0 == y1)
+        if (gs->m_prim.fge)
+        {
+            const uint8_t fog = clampU8(static_cast<int>(
+                v0.fog + (v1.fog - v0.fog) * t));
+            applyFog(gs->m_fogColor, fog, r, g, b);
+        }
+
+        const double z = v0.z + (v1.z - v0.z) * t;
+        if (gs->m_prim.aa1)
+        {
+            const float coverageDistance =
+                65535.0f *
+                std::fabs(static_cast<float>(decision) /
+                          static_cast<float>(decisionScale));
+            const int secondaryCoverage = clampInt(
+                static_cast<int>(coverageDistance), 0, 0xFFFF);
+            const int secondaryOffset = decision >= 0 ? 1 : -1;
+
+            auto drawAntialiasedPixel =
+                [&](int x, int y, int coverage)
+            {
+                uint8_t outputAlpha = a;
+                if (!gs->m_prim.abe || a == 0x80u)
+                {
+                    outputAlpha = static_cast<uint8_t>(
+                        clampInt(coverage, 0, 0xFFFF) >> 9);
+                }
+                writePixel(gs,
+                           x,
+                           y,
+                           static_cast<u32>(z),
+                           r,
+                           g,
+                           b,
+                           outputAlpha,
+                           true,
+                           true);
+            };
+
+            drawAntialiasedPixel(
+                pixelX,
+                pixelY,
+                0xFFFF - secondaryCoverage);
+            drawAntialiasedPixel(
+                pixelX + (stepX ? 0 : secondaryOffset),
+                pixelY + (stepX ? secondaryOffset : 0),
+                secondaryCoverage);
+        }
+        else
+        {
+            writePixel(gs,
+                       pixelX,
+                       pixelY,
+                       static_cast<u32>(z),
+                       r,
+                       g,
+                       b,
+                       a);
+        }
+
+        if (stepX ? (pixelX == lastX) : (pixelY == lastY))
             break;
 
-        int e2 = 2 * err;
-        if (e2 >= dy)
+        decision += decisionStep;
+        pixelX += stepX ? directionX : 0;
+        pixelY += stepX ? 0 : directionY;
+        if (stepX ? positiveY : positiveX)
         {
-            err += dy;
-            x0 += sx;
+            if (decision >= decisionScale / 2)
+                stepDependent(1);
         }
-        if (e2 <= dx)
+        else
         {
-            err += dx;
-            y0 += sy;
+            if (decision < -decisionScale / 2)
+                stepDependent(-1);
         }
         ++step;
     }

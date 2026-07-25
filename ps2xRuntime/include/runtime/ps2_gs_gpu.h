@@ -3,7 +3,6 @@
 
 #include <array>
 #include <cstddef>
-#include <functional>
 #include <cstdint>
 #include <cstring>
 #include <mutex>
@@ -184,6 +183,8 @@ struct GSContext
     GSXYOffsetReg xyoffset;
     GSZbufReg zbuf;
     uint64_t tex1;
+    uint64_t miptbp1;
+    uint64_t miptbp2;
     uint64_t clamp;
     uint64_t alpha;
     uint64_t test;
@@ -322,6 +323,9 @@ public:
 
     void processGIFPacket(const uint8_t *data, uint32_t sizeBytes);
     bool processNativePackedGIFPacket(const uint8_t *data, uint32_t sizeBytes);
+    void beginRenderBatch();
+    void flushRenderBatch();
+    void endRenderBatch();
     void uploadImageNative(uint64_t bitbltbuf,
                            uint64_t trxpos,
                            uint64_t trxreg,
@@ -361,6 +365,12 @@ public:
 
     inline void WriteVram(u32 psm, uint32_t base, uint32_t bw, uint32_t x, uint32_t y, uint32_t value);
     inline u32 ReadVram(u32 psm, u32 base, u32 bw, u32 x, u32 y) const;
+    inline u32 ReadVramFrom(const u8 *vram,
+                            u32 psm,
+                            u32 base,
+                            u32 bw,
+                            u32 x,
+                            u32 y) const;
 
 private:
     void snapshotVRAM();
@@ -405,11 +415,17 @@ private:
     float m_curS = 0.0f, m_curT = 0.0f;
     uint16_t m_curU = 0, m_curV = 0;
     uint8_t m_curFog = 0;
+    uint32_t m_fogColor = 0;
 
     bool m_prmodecont = true;
     bool m_pabe = false;
     GSTexaReg m_texa{0u, false, 0u};
     GSTexClutReg m_texclut{0u, 0u, 0u};
+    uint32_t m_clutCache[256]{};
+    uint8_t m_clutCacheFormat[256]{};
+    bool m_clutCacheValid[256]{};
+    uint32_t m_clutCbp[2]{};
+    uint64_t m_clutCacheGeneration = 0u;
 
     GSBitBltBuf m_bitbltbuf{};
     GSTrxPos m_trxpos{};
@@ -459,8 +475,10 @@ private:
 
     GSRasterizer m_rasterizer;
 
-    using WriteVramFunc = std::function<void(u8*, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t)>;
-    using ReadVramFunc = std::function<u32(u8*, u32, u32, u32, u32)>;
+    using WriteVramFunc =
+        void (*)(u8*, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t);
+    using ReadVramFunc =
+        u32 (*)(u8*, u32, u32, u32, u32);
 
     std::array<ReadVramFunc, 0x3F> m_read_vram_funcs{ };
     std::array<WriteVramFunc, 0x3F> m_write_vram_funcs{ };
@@ -469,6 +487,17 @@ private:
 inline u32 GS::ReadVram(u32 psm, u32 base, u32 bw, u32 x, u32 y) const
 {
     return m_read_vram_funcs[psm & 0x3F](m_vram, base, bw, x, y);
+}
+
+inline u32 GS::ReadVramFrom(const u8 *vram,
+                            u32 psm,
+                            u32 base,
+                            u32 bw,
+                            u32 x,
+                            u32 y) const
+{
+    return m_read_vram_funcs[psm & 0x3F](
+        const_cast<u8 *>(vram), base, bw, x, y);
 }
 
 inline void GS::WriteVram(u32 psm, u32 base, u32 bw, u32 x, u32 y, u32 value)
