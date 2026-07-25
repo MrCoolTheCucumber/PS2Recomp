@@ -97,6 +97,14 @@ add_executable(ps2x_tests
     $<TARGET_OBJECTS:ps2_test_function_table>
 )
 
+add_executable(vu1_replay
+    src/vu1_replay.cpp
+)
+
+add_executable(gs_replay
+    src/gs_replay.cpp
+)
+
 option(PRINT_GENERATED_CODE "Print generated code in tests" OFF)
 if(PRINT_GENERATED_CODE)
 
@@ -115,6 +123,22 @@ target_link_libraries(ps2x_tests PRIVATE
     ps2_test_lib
     ps2_recomp_lib
     ps2_analyzer_lib
+    ps2_runtime
+)
+
+target_include_directories(vu1_replay PRIVATE
+    ${CMAKE_SOURCE_DIR}/ps2xRuntime/include
+)
+
+target_link_libraries(vu1_replay PRIVATE
+    ps2_runtime
+)
+
+target_include_directories(gs_replay PRIVATE
+    ${CMAKE_SOURCE_DIR}/ps2xRuntime/include
+)
+
+target_link_libraries(gs_replay PRIVATE
     ps2_runtime
 )
 
