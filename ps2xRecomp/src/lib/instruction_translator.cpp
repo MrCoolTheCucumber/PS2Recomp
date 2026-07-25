@@ -178,7 +178,9 @@ namespace ps2recomp
         case OPCODE_COP1:
             return m_codeGenerator.translateFPUInstruction(inst);
         case OPCODE_COP2:
-            return m_codeGenerator.translateVUInstruction(inst);
+            return fmt::format(
+                "{}\nctx->enforceVu0RegisterInvariants();",
+                m_codeGenerator.translateVUInstruction(inst));
         case OPCODE_ADDI:
             if (inst.rt == 0)
                 return "// NOP (addi to $zero)";
@@ -239,7 +241,11 @@ namespace ps2recomp
                 inst.rt,
                 genWrite(32, fmt::format("ADD32(GPR_U32(ctx, {}), {})", inst.rs, inst.simmediate), "bits"));
         case OPCODE_LDC2:
-            return fmt::format("ctx->vu0_vf[{}] = _mm_castsi128_ps({});", inst.rt, genRead(128, fmt::format("ADD32(GPR_U32(ctx, {}), {})", inst.rs, inst.simmediate)));
+            return fmt::format(
+                "{{ ctx->vu0_vf[{}] = _mm_castsi128_ps({}); "
+                "ctx->enforceVu0RegisterInvariants(); }}",
+                inst.rt,
+                genRead(128, fmt::format("ADD32(GPR_U32(ctx, {}), {})", inst.rs, inst.simmediate)));
         case OPCODE_SDC2:
             return genWrite(128, fmt::format("ADD32(GPR_U32(ctx, {}), {})", inst.rs, inst.simmediate), fmt::format("_mm_castps_si128(ctx->vu0_vf[{}])", inst.rt)) + ";";
         case OPCODE_DADDI:

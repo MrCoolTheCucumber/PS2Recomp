@@ -1247,32 +1247,87 @@ void register_code_generator_tests()
             t.IsTrue(ctc1Code.find("ignored") == std::string::npos, "CTC1 FCR31 should not be ignored");
         });
 
-        tc.Run("VU CReg access uses CFC2/CTC2", [](TestCase &t) {
+        tc.Run("VU CReg access uses architectural CFC2/CTC2 indices", [](TestCase &t) {
             CodeGenerator gen({}, {});
 
             Instruction cfc2{};
             cfc2.opcode = OPCODE_COP2;
             cfc2.rs = COP2_CFC2;
             cfc2.rt = 2;
-            cfc2.rd = VU0_CR_STATUS;
+            cfc2.rd = 18;
 
             std::string cfc2Code = gen.translateInstruction(cfc2);
-            printGeneratedCode("VU CReg access uses CFC2/CTC2 (CFC2)", cfc2Code);
+            printGeneratedCode("VU CReg access uses architectural CFC2/CTC2 indices (CFC2 CLIP)", cfc2Code);
             t.IsTrue(cfc2Code.find("SET_GPR_U32(ctx, 2") != std::string::npos, "CFC2 should write to rt");
-            t.IsTrue(cfc2Code.find("ctx->vu0_status") != std::string::npos, "CFC2 STATUS should read vu0_status");
-            t.IsTrue(cfc2Code.find("Unimplemented CFC2 VU CReg") == std::string::npos, "CFC2 should not hit unimplemented CReg path");
+            t.IsTrue(cfc2Code.find("ctx->vu0_clip_flags") != std::string::npos, "CFC2 VI18 should read the CLIP register");
+            t.IsTrue(cfc2Code.find("vu0_fbrst") == std::string::npos, "CFC2 VI18 must not alias FBRST");
 
             Instruction ctc2{};
             ctc2.opcode = OPCODE_COP2;
             ctc2.rs = COP2_CTC2;
             ctc2.rt = 3;
-            ctc2.rd = VU0_CR_ITOP;
+            ctc2.rd = 18;
 
             std::string ctc2Code = gen.translateInstruction(ctc2);
-            printGeneratedCode("VU CReg access uses CFC2/CTC2 (CTC2)", ctc2Code);
-            t.IsTrue(ctc2Code.find("ctx->vu0_itop") != std::string::npos, "CTC2 ITOP should write vu0_itop");
-            t.IsTrue(ctc2Code.find("GPR_U32(ctx, 3) & 0x3FF") != std::string::npos, "CTC2 ITOP should mask to 10 bits");
-            t.IsTrue(ctc2Code.find("Unimplemented CTC2 VU CReg") == std::string::npos, "CTC2 should not hit unimplemented CReg path");
+            printGeneratedCode("VU CReg access uses architectural CFC2/CTC2 indices (CTC2 CLIP)", ctc2Code);
+            t.IsTrue(ctc2Code.find("ctx->vu0_clip_flags") != std::string::npos, "CTC2 VI18 should write the CLIP register");
+            t.IsTrue(ctc2Code.find("& 0xFFFFFF") != std::string::npos, "CTC2 CLIP should keep the architectural 24 bits");
+
+            Instruction cfc2Vi{};
+            cfc2Vi.opcode = OPCODE_COP2;
+            cfc2Vi.rs = COP2_CFC2;
+            cfc2Vi.rt = 4;
+            cfc2Vi.rd = 7;
+            const std::string cfc2ViCode = gen.translateInstruction(cfc2Vi);
+            t.IsTrue(cfc2ViCode.find("ctx->vi[7]") != std::string::npos, "CFC2 VI07 should read the integer register bank");
+
+            Instruction cfc2Q = cfc2;
+            cfc2Q.rd = 22;
+            const std::string cfc2QCode = gen.translateInstruction(cfc2Q);
+            t.IsTrue(cfc2QCode.find("ctx->vu0_q") != std::string::npos, "CFC2 VI22 should read Q");
+        });
+
+        tc.Run("VU0 macro writes preserve the hardwired zero registers", [](TestCase &t) {
+            CodeGenerator gen({}, {});
+
+            Instruction qmtc2{};
+            qmtc2.opcode = OPCODE_COP2;
+            qmtc2.rs = COP2_QMTC2;
+            qmtc2.rt = 0;
+            qmtc2.rd = 0;
+
+            const std::string qmtc2Code = gen.translateInstruction(qmtc2);
+            t.IsTrue(qmtc2Code.find("ctx->vu0_vf[0] = _mm_castsi128_ps(GPR_VEC(ctx, 0));") != std::string::npos,
+                     "QMTC2 should still execute its architecturally discarded write");
+            t.IsTrue(qmtc2Code.find("ctx->enforceVu0RegisterInvariants();") != std::string::npos,
+                     "QMTC2 must restore VF0 and VI0 after a macro-mode write");
+
+            Instruction vadd{};
+            vadd.opcode = OPCODE_COP2;
+            vadd.rs = COP2_CO;
+            vadd.rt = 2;
+            vadd.rd = 1;
+            vadd.sa = 0;
+            vadd.function = VU0_S1_VADD;
+            vadd.vectorInfo.vectorField = 0xFu;
+
+            const std::string vaddCode = gen.translateInstruction(vadd);
+            t.IsTrue(vaddCode.find("ctx->vu0_vf[0]") != std::string::npos,
+                     "the synthetic VADD should target VF0");
+            t.IsTrue(vaddCode.find("ctx->enforceVu0RegisterInvariants();") != std::string::npos,
+                     "arithmetic writes to VF0 must be discarded");
+
+            Instruction lqc2{};
+            lqc2.opcode = OPCODE_LQC2;
+            lqc2.rs = 4;
+            lqc2.rt = 0;
+            lqc2.simmediate = 16;
+
+            const std::string lqc2Code = gen.translateInstruction(lqc2);
+            t.IsTrue(lqc2Code.find("READ128") != std::string::npos,
+                     "LQC2 targeting VF0 must retain its memory access");
+            t.IsTrue(lqc2Code.find("ctx->enforceVu0RegisterInvariants();") != std::string::npos,
+                     "LQC2 targeting VF0 must discard the loaded value");
         });
 
         tc.Run("scalar logical immediates emit low64 operations", [](TestCase &t) {
@@ -1570,6 +1625,31 @@ void register_code_generator_tests()
             t.IsTrue(out.find("ctx->vu0_vf[12]") != std::string::npos, "S2 source VF should come from rd");
             t.IsTrue(out.find("ctx->vu0_vf[8]") != std::string::npos, "S2 destination VF should come from rt");
             t.IsTrue(out.find("ctx->vu0_vf[22]") == std::string::npos, "S2 must not use rs(format) as register index");
+        });
+
+        tc.Run("VU0 VCLIP uses architectural sign-magnitude comparisons", [](TestCase &t) {
+            Instruction inst{};
+            inst.opcode = OPCODE_COP2;
+            inst.rs = COP2_CO | 0xEu;
+            inst.rt = 8;
+            inst.rd = 12;
+            inst.function = 0x3C; // force Special2 path
+
+            const uint32_t upper = (VU0_S2_VCLIPw >> 2) & 0x1Fu;
+            const uint32_t lower = VU0_S2_VCLIPw & 0x3u;
+            inst.raw = (upper << 6) | lower;
+
+            CodeGenerator gen({}, {});
+            const std::string out = gen.translateInstruction(inst);
+
+            t.IsTrue(out.find("Ps2VuUpdateClipFlags") != std::string::npos,
+                     "VCLIP should use the shared bit-exact helper");
+            t.IsTrue(out.find("ctx->vu0_vf[12]") != std::string::npos,
+                     "VCLIP fs should come from rd");
+            t.IsTrue(out.find("ctx->vu0_vf[8]") != std::string::npos,
+                     "VCLIP ft should come from rt");
+            t.IsTrue(out.find("_mm_cmpgt_ps") == std::string::npos,
+                     "VCLIP must not use host IEEE floating-point comparisons");
         });
 
         tc.Run("VU0 S2 VI memory ops use rd as VI base register", [](TestCase &t) {

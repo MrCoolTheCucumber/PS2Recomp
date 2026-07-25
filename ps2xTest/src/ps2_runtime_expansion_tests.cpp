@@ -627,6 +627,30 @@ void register_ps2_runtime_expansion_tests()
                      "signed MADD should handle the largest 32-bit product exactly");
         });
 
+        tc.Run("VU0 zero registers retain their architectural constants", [](TestCase &t)
+        {
+            R5900Context ctx{};
+            float vf0[4]{};
+            _mm_storeu_ps(vf0, ctx.vu0_vf[0]);
+
+            t.Equals(vf0[0], 0.0f, "VF0.x should initialize to zero");
+            t.Equals(vf0[1], 0.0f, "VF0.y should initialize to zero");
+            t.Equals(vf0[2], 0.0f, "VF0.z should initialize to zero");
+            t.Equals(vf0[3], 1.0f, "VF0.w should initialize to one");
+            t.Equals(ctx.vi[0], static_cast<uint16_t>(0), "VI0 should initialize to zero");
+
+            ctx.vu0_vf[0] = _mm_set1_ps(7.0f);
+            ctx.vi[0] = 0xFFFFu;
+            ctx.enforceVu0RegisterInvariants();
+            _mm_storeu_ps(vf0, ctx.vu0_vf[0]);
+
+            t.Equals(vf0[0], 0.0f, "VF0.x writes should be discarded");
+            t.Equals(vf0[1], 0.0f, "VF0.y writes should be discarded");
+            t.Equals(vf0[2], 0.0f, "VF0.z writes should be discarded");
+            t.Equals(vf0[3], 1.0f, "VF0.w writes should be discarded");
+            t.Equals(ctx.vi[0], static_cast<uint16_t>(0), "VI0 writes should be discarded");
+        });
+
         tc.Run("VU FTOI saturates unrepresentable values", [](TestCase &t)
         {
             uint32_t words[4]{};

@@ -28,6 +28,7 @@
 #include "runtime/ps2_gif_arbiter.h"
 #include "runtime/ps2_memory.h"
 #include "runtime/ps2_gs_gpu.h"
+#include "runtime/ps2_vu_clip.h"
 #include "runtime/ps2_vu1.h"
 #include "runtime/ps2_audio.h"
 #include "runtime/ps2_pad.h"
@@ -157,12 +158,21 @@ struct alignas(16) R5900Context
     float f_acc;    // FPU accumulator
     uint32_t fcr31; // Control/status register
 
+    void enforceVu0RegisterInvariants()
+    {
+        // VF0 and VI0 are architectural constants. Instructions may name them
+        // as destinations, but those writes must be discarded.
+        vu0_vf[0] = _mm_set_ps(1.0f, 0.0f, 0.0f, 0.0f);
+        vi[0] = 0;
+    }
+
     R5900Context()
     {
         std::memset(this, 0, sizeof(*this));
 
         // Initialize VU0 registers
         vu0_q = 1.0f; // Q register usually initialized to 1.0
+        enforceVu0RegisterInvariants();
 
         // Reset COP0 registers
         cop0_random = 47; // Start at maximum value
