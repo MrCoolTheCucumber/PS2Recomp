@@ -3,8 +3,10 @@
 #include "runtime/ps2_gs_gpu.h"
 #include "runtime/ps2_gs_psmct32.h"
 #include "runtime/ps2_memory.h"
+#include "runtime/ps2_vu_clip.h"
 #include "runtime/ps2_vu1.h"
 
+#include <cfenv>
 #include <cstdint>
 #include <cstring>
 #include <vector>
@@ -12,6 +14,7 @@
 namespace
 {
     constexpr uint32_t kVuUpperNop = 0u;
+    constexpr uint32_t kVuUpperEnd = 1u << 30u;
 
     struct Vu1Fixture
     {
@@ -81,6 +84,16 @@ namespace
                static_cast<uint32_t>(op & 0x3Fu);
     }
 
+    uint32_t makeVuUpperSpecial(uint8_t specialOp, uint8_t dest, uint8_t ft, uint8_t fs)
+    {
+        return (static_cast<uint32_t>(dest & 0xFu) << 21) |
+               (static_cast<uint32_t>(ft & 0x1Fu) << 16) |
+               (static_cast<uint32_t>(fs & 0x1Fu) << 11) |
+               (static_cast<uint32_t>(specialOp & 0x7Cu) << 4) |
+               static_cast<uint32_t>(specialOp & 0x3u) |
+               0x3Cu;
+    }
+
     uint32_t makeVuLq(uint8_t dest, uint8_t targetVf, uint8_t baseVi, int16_t imm)
     {
         return (static_cast<uint32_t>(dest & 0xFu) << 21) |
@@ -109,6 +122,26 @@ namespace
     uint32_t makeVuBranch(int16_t imm)
     {
         return (0x20u << 25) | (static_cast<uint32_t>(imm) & 0x7FFu);
+    }
+
+    uint32_t makeVuIbeq(uint8_t is, uint8_t it, int16_t imm)
+    {
+        return (0x28u << 25) |
+               (static_cast<uint32_t>(it & 0xFu) << 16) |
+               (static_cast<uint32_t>(is & 0xFu) << 11) |
+               (static_cast<uint32_t>(imm) & 0x7FFu);
+    }
+
+    uint32_t makeVuIbgtz(uint8_t is, int16_t imm)
+    {
+        return (0x2Du << 25) |
+               (static_cast<uint32_t>(is & 0xFu) << 11) |
+               (static_cast<uint32_t>(imm) & 0x7FFu);
+    }
+
+    uint32_t makeVuMtir(uint8_t it, uint8_t fs, uint8_t fsf)
+    {
+        return makeVuLowerSpecial(0x3Cu, fs, it, 0u, fsf & 0x3u);
     }
 
     uint32_t makeVuDiv(uint8_t fs, uint8_t ft, uint8_t fsf, uint8_t ftf)
@@ -156,6 +189,18 @@ namespace
     {
         std::memcpy(values, data + qwordIndex * 16u, sizeof(float) * 4u);
     }
+
+    void setFloatBits(float &value, uint32_t bits)
+    {
+        std::memcpy(&value, &bits, sizeof(bits));
+    }
+
+    uint32_t getFloatBits(float value)
+    {
+        uint32_t bits = 0u;
+        std::memcpy(&bits, &value, sizeof(bits));
+        return bits;
+    }
 }
 
 void register_ps2_vu1_tests()
@@ -189,6 +234,134 @@ void register_ps2_vu1_tests()
             t.Equals(vu1.state().vf[3][1], -2.0f, "ADD.xz should preserve y");
             t.Equals(vu1.state().vf[3][2], 33.0f, "ADD.xz should write z");
             t.Equals(vu1.state().vf[3][3], -4.0f, "ADD.xz should preserve w");
+        });
+
+        tc.Run("VU FMAC truncates toward zero and restores the host rounding mode", [](TestCase &t)
+        {
+            Vu1Fixture fx;
+            t.IsTrue(fx.initialize(), "VU1 fixture should initialize");
+
+            // MADDA.xyzw ACC, vf1, vf5.x. These captured normal operands
+            // distinguish the VU's required truncation from host
+            // round-to-nearest in every lane.
+            writeVuInstructionPair(fx.code, 0u, 0u, 0x01E508BCu);
+
+            VU1Interpreter vu1;
+            const uint32_t vf1Bits[4] = {
+                0xBED52018u, 0x409A33CEu, 0xBFC2EB57u, 0x3B110CC2u};
+            const uint32_t vf5Bits[4] = {
+                0xC4454000u, 0x44454000u, 0xC6881A00u, 0x42380000u};
+            const uint32_t accBits[4] = {
+                0x4A90B980u, 0x4A87EA00u, 0x4B6A2CB4u, 0x4501E920u};
+            const uint32_t expectedBits[4] = {
+                0x4A90BC10u, 0x4A87CC4Bu, 0x4B6A3165u, 0x4501CD2Fu};
+            for (size_t lane = 0u; lane < 4u; ++lane)
+            {
+                setFloatBits(vu1.state().vf[1][lane], vf1Bits[lane]);
+                setFloatBits(vu1.state().vf[5][lane], vf5Bits[lane]);
+                setFloatBits(vu1.state().acc[lane], accBits[lane]);
+            }
+
+            const int hostRoundingMode = std::fegetround();
+            vu1.execute(fx.code, PS2_VU1_CODE_SIZE,
+                        fx.data, PS2_VU1_DATA_SIZE,
+                        fx.gs, &fx.mem, 0u, 0u, 0u, 1u);
+
+            for (size_t lane = 0u; lane < 4u; ++lane)
+            {
+                t.Equals(getFloatBits(vu1.state().acc[lane]), expectedBits[lane],
+                         "MADDA should truncate its result toward zero");
+            }
+            t.Equals(std::fegetround(), hostRoundingMode,
+                     "VU execution should restore the caller's rounding mode");
+        });
+
+        tc.Run("VU MADD retains the product through the truncated accumulator add", [](TestCase &t)
+        {
+            Vu1Fixture fx;
+            t.IsTrue(fx.initialize(), "VU1 fixture should initialize");
+
+            // MADDy.xyzw ACC, vf2, vf5.y.  With these captured operands,
+            // rounding the multiplication before the addition produces
+            // 0x4b69e65e; the VU's single truncated product-sum is
+            // 0x4b69e65d.
+            writeVuInstructionPair(fx.code, 0u, 0u, 0x01E510BDu);
+
+            VU1Interpreter vu1;
+            setFloatBits(vu1.state().acc[2], 0x4B6A3856u);
+            setFloatBits(vu1.state().vf[2][2], 0x41004B21u);
+            setFloatBits(vu1.state().vf[5][1], 0xC5239000u);
+
+            vu1.execute(fx.code, PS2_VU1_CODE_SIZE,
+                        fx.data, PS2_VU1_DATA_SIZE,
+                        fx.gs, &fx.mem, 0u, 0u, 0u, 1u);
+
+            t.Equals(getFloatBits(vu1.state().acc[2]), 0x4B69E65Du,
+                     "MADD should truncate once after the fused product-sum");
+        });
+
+        tc.Run("CLIP uses absolute w and architectural flag ordering", [](TestCase &t)
+        {
+            Vu1Fixture fx;
+            t.IsTrue(fx.initialize(), "VU1 fixture should initialize");
+
+            writeVuInstructionPair(
+                fx.code, 0u, 0u,
+                makeVuUpperSpecial(0x1Fu, 0xEu, 2u, 1u)); // CLIPw.xyz vf1, vf2w
+
+            VU1Interpreter vu1;
+            vu1.state().clip = 0x00123456u;
+            vu1.state().vf[1][0] = 2.0f;
+            vu1.state().vf[1][1] = -3.0f;
+            vu1.state().vf[1][2] = 0.5f;
+            vu1.state().vf[2][3] = -1.0f;
+
+            vu1.execute(fx.code, PS2_VU1_CODE_SIZE,
+                        fx.data, PS2_VU1_DATA_SIZE,
+                        fx.gs, &fx.mem, 0u, 0u, 0u, 1u);
+
+            const uint32_t expected =
+                ((0x00123456u << 6u) | 0x09u) & 0x00FFFFFFu;
+            t.Equals(vu1.state().clip, expected,
+                     "CLIP should set +x in bit 0 and -y in bit 3 using |w|");
+
+            t.Equals(Ps2VuUpdateClipFlags(
+                         0u,
+                         0x00800000u,
+                         0x80800000u,
+                         0x00000001u,
+                         0x00000000u),
+                     0x09u,
+                     "zero w should compare against the largest denormal bit pattern");
+        });
+
+        tc.Run("VU FMAC flushes denormal inputs and underflow results to signed zero", [](TestCase &t)
+        {
+            Vu1Fixture fx;
+            t.IsTrue(fx.initialize(), "VU1 fixture should initialize");
+
+            writeVuInstructionPair(
+                fx.code, 0u, 0u,
+                makeVuUpper(0x2Au, 0xEu, 2u, 1u, 3u)); // MUL.xyz vf3, vf1, vf2
+
+            VU1Interpreter vu1;
+            setFloatBits(vu1.state().vf[1][0], 0x00800000u); // smallest positive normal
+            setFloatBits(vu1.state().vf[1][1], 0x80800000u); // smallest negative normal
+            setFloatBits(vu1.state().vf[1][2], 0x00000001u); // positive denormal input
+            setFloatBits(vu1.state().vf[2][0], 0x3F000000u); // 0.5
+            setFloatBits(vu1.state().vf[2][1], 0x3F000000u); // 0.5
+            setFloatBits(vu1.state().vf[2][2], 0x7F000000u); // would normalize an IEEE denormal
+
+            vu1.execute(fx.code, PS2_VU1_CODE_SIZE,
+                        fx.data, PS2_VU1_DATA_SIZE,
+                        fx.gs, &fx.mem, 0u, 0u, 0u, 1u);
+
+            t.Equals(getFloatBits(vu1.state().vf[3][0]), 0x00000000u,
+                     "positive exponent underflow should clamp to positive zero");
+            t.Equals(getFloatBits(vu1.state().vf[3][1]), 0x80000000u,
+                     "negative exponent underflow should clamp to negative zero");
+            t.Equals(getFloatBits(vu1.state().vf[3][2]), 0x00000000u,
+                     "denormal FMAC input should be treated as zero");
         });
 
         tc.Run("LOI commits the lower immediate after the upper instruction", [](TestCase &t)
@@ -304,6 +477,62 @@ void register_ps2_vu1_tests()
             t.Equals(vu1.state().vi[1], 1, "branch delay slot should execute");
             t.Equals(vu1.state().vi[2], 0, "instruction between delay slot and target should be skipped");
             t.Equals(vu1.state().vi[3], 7, "branch target should execute after the delay slot");
+        });
+
+        tc.Run("LQI post-increment exposes the prior VI value to the next branch", [](TestCase &t)
+        {
+            Vu1Fixture fx;
+            t.IsTrue(fx.initialize(), "VU1 fixture should initialize");
+
+            writeVuInstructionPair(
+                fx.code, 0u,
+                makeVuLowerSpecial(0x34u, 1u, 1u, 0u, 0xFu),
+                kVuUpperNop); // LQI.xyzw vf1, (vi1++)
+            writeVuInstructionPair(fx.code, 8u, makeVuIbeq(1u, 2u, 2), kVuUpperNop);
+            writeVuInstructionPair(fx.code, 16u, makeVuIaddiu(3u, 0u, 1), kVuUpperNop);
+            writeVuInstructionPair(fx.code, 24u, makeVuIaddiu(4u, 0u, 99), kVuUpperNop);
+            writeVuInstructionPair(fx.code, 32u, makeVuIaddiu(5u, 0u, 7), kVuUpperNop);
+
+            VU1Interpreter vu1;
+            vu1.state().vi[1] = 5;
+            vu1.state().vi[2] = 5;
+            vu1.execute(fx.code, PS2_VU1_CODE_SIZE, fx.data, PS2_VU1_DATA_SIZE,
+                        fx.gs, &fx.mem, 0u, 0u, 0u, 4u);
+
+            t.Equals(vu1.state().vi[1], 6, "LQI should still commit its post-increment");
+            t.Equals(vu1.state().vi[3], 1, "branch delay slot should execute");
+            t.Equals(vu1.state().vi[4], 0, "branch should compare against the pre-increment value");
+            t.Equals(vu1.state().vi[5], 7, "branch target should execute");
+        });
+
+        tc.Run("MTIR uses its scalar selector and feeds integer branches", [](TestCase &t)
+        {
+            Vu1Fixture fx;
+            t.IsTrue(fx.initialize(), "VU1 fixture should initialize");
+
+            writeVuInstructionPair(fx.code, 0u, makeVuMtir(4u, 7u, 0u), kVuUpperNop);
+            writeVuInstructionPair(fx.code, 8u, 0u, kVuUpperNop);
+            writeVuInstructionPair(fx.code, 16u, makeVuIbgtz(4u, 2), kVuUpperNop);
+            writeVuInstructionPair(fx.code, 24u, makeVuIaddiu(5u, 0u, 1), kVuUpperNop);
+            writeVuInstructionPair(fx.code, 32u, makeVuIaddiu(6u, 0u, 99), kVuUpperNop);
+            writeVuInstructionPair(fx.code, 40u, makeVuIaddiu(7u, 0u, 7), kVuUpperNop);
+
+            VU1Interpreter vu1;
+            const uint32_t lanes[4] = {
+                0x00000045u, 0x00000000u, 0x00000000u, 0x00000000u};
+            std::memcpy(vu1.state().vf[7], lanes, sizeof(lanes));
+
+            vu1.execute(fx.code, PS2_VU1_CODE_SIZE, fx.data, PS2_VU1_DATA_SIZE,
+                        fx.gs, &fx.mem, 0u, 0u, 0u, 5u);
+
+            t.Equals(vu1.state().vi[4], 0x45,
+                     "MTIR.x should read vf7.x rather than treating zero as an empty mask");
+            t.Equals(vu1.state().vi[5], 1,
+                     "the branch delay slot should execute");
+            t.Equals(vu1.state().vi[6], 0,
+                     "IBGTZ should skip the fallthrough instruction");
+            t.Equals(vu1.state().vi[7], 7,
+                     "IBGTZ should reach its target using the MTIR result");
         });
 
         tc.Run("lower side sees old VF value when upper writes the same register", [](TestCase &t)
@@ -444,7 +673,7 @@ void register_ps2_vu1_tests()
 
             const uint32_t lower = makeVuLowerSpecial(0x6Cu, 1u);
             std::memcpy(vuCode + 0u, &lower, sizeof(lower));
-            const uint32_t upper = 0u;
+            const uint32_t upper = kVuUpperEnd;
             std::memcpy(vuCode + 4u, &upper, sizeof(upper));
 
             VU1Interpreter vu1;
@@ -458,7 +687,7 @@ void register_ps2_vu1_tests()
                         0u,
                         0u,
                         0u,
-                        1u);
+                        2u);
 
             t.Equals(captured.size(), static_cast<size_t>(1u), "XGKICK should emit one wrapped GIF packet");
             if (!captured.empty())
@@ -475,6 +704,102 @@ void register_ps2_vu1_tests()
                 }
                 t.IsTrue(payloadOk, "wrapped payload should be copied from start of VU1 memory");
             }
+        });
+
+        tc.Run("XGKICK streams VU memory after the kick starts", [](TestCase &t)
+        {
+            Vu1Fixture fx;
+            t.IsTrue(fx.initialize(), "VU1 fixture should initialize");
+
+            std::vector<std::vector<uint8_t>> captured;
+            fx.mem.setGifPacketCallback([&](const uint8_t *data, uint32_t sizeBytes)
+            {
+                captured.emplace_back(data, data + sizeBytes);
+            });
+
+            const uint64_t imageTag = makeGifTag(1u, GIF_FMT_IMAGE, 0u, true);
+            std::memcpy(fx.data, &imageTag, sizeof(imageTag));
+            std::memset(fx.data + 16u, 0x11, 16u);
+            writeVuInstructionPair(
+                fx.code, 0u, makeVuLowerSpecial(0x6Cu, 0u), kVuUpperNop);
+
+            VU1Interpreter vu1;
+            vu1.execute(fx.code, PS2_VU1_CODE_SIZE,
+                        fx.data, PS2_VU1_DATA_SIZE,
+                        fx.gs, &fx.mem, 0u, 0u, 0u, 1u);
+            std::memset(fx.data + 16u, 0xA5, 16u);
+
+            vu1.resume(fx.code, PS2_VU1_CODE_SIZE,
+                       fx.data, PS2_VU1_DATA_SIZE,
+                       fx.gs, &fx.mem, 0u, 0u, 3u);
+
+            t.Equals(captured.size(), static_cast<size_t>(1u),
+                     "streamed XGKICK should complete after enough VU cycles");
+            if (!captured.empty())
+            {
+                bool sawUpdatedPayload = captured[0].size() == 32u;
+                for (size_t i = 16u; i < captured[0].size(); ++i)
+                    sawUpdatedPayload = sawUpdatedPayload && captured[0][i] == 0xA5u;
+                t.IsTrue(sawUpdatedPayload,
+                         "XGKICK should read payload as PATH1 reaches it, not snapshot it at kick time");
+            }
+        });
+
+        tc.Run("XGKICK preserves non-EOP tags until PATH1 reaches EOP", [](TestCase &t)
+        {
+            Vu1Fixture fx;
+            t.IsTrue(fx.initialize(), "VU1 fixture should initialize");
+
+            std::vector<std::vector<uint8_t>> captured;
+            fx.mem.setGifPacketCallback([&](const uint8_t *data, uint32_t sizeBytes)
+            {
+                captured.emplace_back(data, data + sizeBytes);
+            });
+
+            const uint64_t firstTag = makeGifTag(0u, GIF_FMT_PACKED, 1u, false);
+            const uint64_t lastTag = makeGifTag(0u, GIF_FMT_PACKED, 1u, true);
+            std::memcpy(fx.data + 0u, &firstTag, sizeof(firstTag));
+            std::memcpy(fx.data + 16u, &lastTag, sizeof(lastTag));
+            writeVuInstructionPair(
+                fx.code, 0u, makeVuLowerSpecial(0x6Cu, 0u), kVuUpperNop);
+
+            VU1Interpreter vu1;
+            vu1.execute(fx.code, PS2_VU1_CODE_SIZE,
+                        fx.data, PS2_VU1_DATA_SIZE,
+                        fx.gs, &fx.mem, 0u, 0u, 0u, 4u);
+
+            t.Equals(captured.size(), static_cast<size_t>(1u),
+                     "PATH1 should emit once when the second tag supplies EOP");
+            if (!captured.empty())
+                t.Equals(captured[0].size(), static_cast<size_t>(32u),
+                         "PATH1 packet should include both GIFtags");
+        });
+
+        tc.Run("XGKICK rejects a GIFtag spanning the entire VU1 data ring", [](TestCase &t)
+        {
+            Vu1Fixture fx;
+            t.IsTrue(fx.initialize(), "VU1 fixture should initialize");
+
+            size_t callbackCount = 0u;
+            fx.mem.setGifPacketCallback([&](const uint8_t *, uint32_t)
+            {
+                ++callbackCount;
+            });
+
+            const uint64_t ringSizedTag =
+                makeGifTag((PS2_VU1_DATA_SIZE / 16u) - 1u,
+                           GIF_FMT_IMAGE, 0u, true);
+            std::memcpy(fx.data, &ringSizedTag, sizeof(ringSizedTag));
+            writeVuInstructionPair(
+                fx.code, 0u, makeVuLowerSpecial(0x6Cu, 0u), kVuUpperEnd);
+
+            VU1Interpreter vu1;
+            vu1.execute(fx.code, PS2_VU1_CODE_SIZE,
+                        fx.data, PS2_VU1_DATA_SIZE,
+                        fx.gs, &fx.mem, 0u, 0u, 0u, 2u);
+
+            t.Equals(callbackCount, static_cast<size_t>(0u),
+                     "invalid ring-sized PATH1 tag must not be submitted");
         });
 
         tc.Run("MSCAL can start a VU1 XGKICK program and update GS VRAM", [](TestCase &t)
@@ -509,7 +834,7 @@ void register_ps2_vu1_tests()
 
             const uint32_t lower = makeVuLowerSpecial(0x6Cu, 0u);
             std::memcpy(vuCode + 0u, &lower, sizeof(lower));
-            const uint32_t upper = 0u;
+            const uint32_t upper = kVuUpperEnd;
             std::memcpy(vuCode + 4u, &upper, sizeof(upper));
 
             const uint64_t gifTag = makeGifTag(1u, GIF_FMT_IMAGE, 0u, true);
@@ -533,7 +858,7 @@ void register_ps2_vu1_tests()
                             startPC,
                             top,
                             itop,
-                            1u);
+                            2u);
             });
 
             const uint32_t mscalCmd = makeVifCmd(0x14u, 0u, 0u);

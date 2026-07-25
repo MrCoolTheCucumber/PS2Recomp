@@ -1,8 +1,25 @@
 #include "runtime/ps2_vu1.h"
+#include "runtime/ps2_vu_clip.h"
 #include "ps2_vu1_detail.h"
 
 #include <cmath>
 #include <cstring>
+
+namespace
+{
+    float vuMadd(float accumulator, float multiplicand, float multiplier)
+    {
+        // The VU FMAC keeps the product through the following add and
+        // truncates the product-sum once.  A separated host multiply and add
+        // loses that intermediate precision and can differ by one VU ULP.
+        return std::fma(multiplicand, multiplier, accumulator);
+    }
+
+    float vuMsub(float accumulator, float multiplicand, float multiplier)
+    {
+        return std::fma(-multiplicand, multiplier, accumulator);
+    }
+}
 
 // ============================================================================
 // Upper instructions (FMAC pipeline)
@@ -52,7 +69,7 @@ void VU1Interpreter::execUpper(uint32_t instr)
     {
         float bc = broadcast(vt, op & 3);
         for (int c = 0; c < 4; c++)
-            result[c] = m_state.acc[c] + vs[c] * bc;
+            result[c] = vuMadd(m_state.acc[c], vs[c], bc);
         applyDest(vd, result, dest);
         return;
     }
@@ -63,7 +80,7 @@ void VU1Interpreter::execUpper(uint32_t instr)
     {
         float bc = broadcast(vt, op & 3);
         for (int c = 0; c < 4; c++)
-            result[c] = m_state.acc[c] - vs[c] * bc;
+            result[c] = vuMsub(m_state.acc[c], vs[c], bc);
         applyDest(vd, result, dest);
         return;
     }
@@ -127,7 +144,7 @@ void VU1Interpreter::execUpper(uint32_t instr)
         return;
     case 0x21: // MADDq
         for (int c = 0; c < 4; c++)
-            result[c] = m_state.acc[c] + vs[c] * m_state.q;
+            result[c] = vuMadd(m_state.acc[c], vs[c], m_state.q);
         applyDest(vd, result, dest);
         return;
     case 0x22: // ADDi
@@ -137,7 +154,7 @@ void VU1Interpreter::execUpper(uint32_t instr)
         return;
     case 0x23: // MADDi
         for (int c = 0; c < 4; c++)
-            result[c] = m_state.acc[c] + vs[c] * m_state.i;
+            result[c] = vuMadd(m_state.acc[c], vs[c], m_state.i);
         applyDest(vd, result, dest);
         return;
     case 0x24: // SUBq
@@ -147,7 +164,7 @@ void VU1Interpreter::execUpper(uint32_t instr)
         return;
     case 0x25: // MSUBq
         for (int c = 0; c < 4; c++)
-            result[c] = m_state.acc[c] - vs[c] * m_state.q;
+            result[c] = vuMsub(m_state.acc[c], vs[c], m_state.q);
         applyDest(vd, result, dest);
         return;
     case 0x26: // SUBi
@@ -157,7 +174,7 @@ void VU1Interpreter::execUpper(uint32_t instr)
         return;
     case 0x27: // MSUBi
         for (int c = 0; c < 4; c++)
-            result[c] = m_state.acc[c] - vs[c] * m_state.i;
+            result[c] = vuMsub(m_state.acc[c], vs[c], m_state.i);
         applyDest(vd, result, dest);
         return;
     case 0x28: // ADD
@@ -167,7 +184,7 @@ void VU1Interpreter::execUpper(uint32_t instr)
         return;
     case 0x29: // MADD
         for (int c = 0; c < 4; c++)
-            result[c] = m_state.acc[c] + vs[c] * vt[c];
+            result[c] = vuMadd(m_state.acc[c], vs[c], vt[c]);
         applyDest(vd, result, dest);
         return;
     case 0x2A: // MUL
@@ -187,7 +204,7 @@ void VU1Interpreter::execUpper(uint32_t instr)
         return;
     case 0x2D: // MSUB
         for (int c = 0; c < 4; c++)
-            result[c] = m_state.acc[c] - vs[c] * vt[c];
+            result[c] = vuMsub(m_state.acc[c], vs[c], vt[c]);
         applyDest(vd, result, dest);
         return;
     case 0x2E: // OPMSUB
@@ -246,7 +263,7 @@ void VU1Interpreter::execUpper(uint32_t instr)
         {
             float bc = broadcast(vt, specialOp & 3);
             for (int c = 0; c < 4; c++)
-                result[c] = m_state.acc[c] + vs[c] * bc;
+                result[c] = vuMadd(m_state.acc[c], vs[c], bc);
             applyDestAcc(result, dest);
             return;
         }
@@ -257,7 +274,7 @@ void VU1Interpreter::execUpper(uint32_t instr)
         {
             float bc = broadcast(vt, specialOp & 3);
             for (int c = 0; c < 4; c++)
-                result[c] = m_state.acc[c] - vs[c] * bc;
+                result[c] = vuMsub(m_state.acc[c], vs[c], bc);
             applyDestAcc(result, dest);
             return;
         }
@@ -357,15 +374,12 @@ void VU1Interpreter::execUpper(uint32_t instr)
             return;
         case 0x1F: // CLIP
         {
-            float w = std::fabs(vt[3]);
-            uint32_t flags = 0;
-            if (vs[0] > +w) flags |= 0x01;
-            if (vs[0] < -w) flags |= 0x02;
-            if (vs[1] > +w) flags |= 0x04;
-            if (vs[1] < -w) flags |= 0x08;
-            if (vs[2] > +w) flags |= 0x10;
-            if (vs[2] < -w) flags |= 0x20;
-            m_state.clip = (m_state.clip << 6) | flags;
+            uint32_t bits[4] = {};
+            uint32_t wBits = 0u;
+            std::memcpy(bits, vs, sizeof(bits));
+            std::memcpy(&wBits, &vt[3], sizeof(wBits));
+            m_state.clip = Ps2VuUpdateClipFlags(
+                m_state.clip, bits[0], bits[1], bits[2], wBits);
             return;
         }
         case 0x20: // ADDAq
@@ -375,7 +389,7 @@ void VU1Interpreter::execUpper(uint32_t instr)
             return;
         case 0x21: // MADDAq
             for (int c = 0; c < 4; c++)
-                result[c] = m_state.acc[c] + vs[c] * m_state.q;
+                result[c] = vuMadd(m_state.acc[c], vs[c], m_state.q);
             applyDestAcc(result, dest);
             return;
         case 0x22: // ADDAi
@@ -385,7 +399,7 @@ void VU1Interpreter::execUpper(uint32_t instr)
             return;
         case 0x23: // MADDAi
             for (int c = 0; c < 4; c++)
-                result[c] = m_state.acc[c] + vs[c] * m_state.i;
+                result[c] = vuMadd(m_state.acc[c], vs[c], m_state.i);
             applyDestAcc(result, dest);
             return;
         case 0x24: // SUBAq
@@ -395,7 +409,7 @@ void VU1Interpreter::execUpper(uint32_t instr)
             return;
         case 0x25: // MSUBAq
             for (int c = 0; c < 4; c++)
-                result[c] = m_state.acc[c] - vs[c] * m_state.q;
+                result[c] = vuMsub(m_state.acc[c], vs[c], m_state.q);
             applyDestAcc(result, dest);
             return;
         case 0x26: // SUBAi
@@ -405,7 +419,7 @@ void VU1Interpreter::execUpper(uint32_t instr)
             return;
         case 0x27: // MSUBAi
             for (int c = 0; c < 4; c++)
-                result[c] = m_state.acc[c] - vs[c] * m_state.i;
+                result[c] = vuMsub(m_state.acc[c], vs[c], m_state.i);
             applyDestAcc(result, dest);
             return;
         case 0x28: // ADDA
@@ -415,7 +429,7 @@ void VU1Interpreter::execUpper(uint32_t instr)
             return;
         case 0x29: // MADDA
             for (int c = 0; c < 4; c++)
-                result[c] = m_state.acc[c] + vs[c] * vt[c];
+                result[c] = vuMadd(m_state.acc[c], vs[c], vt[c]);
             applyDestAcc(result, dest);
             return;
         case 0x2A: // MULA
@@ -430,7 +444,7 @@ void VU1Interpreter::execUpper(uint32_t instr)
             return;
         case 0x2D: // MSUBA
             for (int c = 0; c < 4; c++)
-                result[c] = m_state.acc[c] - vs[c] * vt[c];
+                result[c] = vuMsub(m_state.acc[c], vs[c], vt[c]);
             applyDestAcc(result, dest);
             return;
         case 0x2E: // OPMULA

@@ -26,6 +26,10 @@ struct VU1State
     bool branchPending;
     uint32_t branchTarget;
     uint32_t branchDelay;
+
+    uint8_t viBackupCycles;
+    uint8_t viBackupRegister;
+    int32_t viBackupValue;
 };
 
 class VU1Interpreter
@@ -60,6 +64,18 @@ private:
     };
 
     VU1State m_state;
+
+    struct XgkickState
+    {
+        bool active = false;
+        uint32_t address = 0;
+        uint32_t tagBytesRemaining = 0;
+        uint32_t cycleCredit = 0;
+        bool tagEop = false;
+        std::vector<uint8_t> packet;
+    };
+
+    XgkickState m_xgkick;
     std::vector<DecodedInstructionPair> m_decodedCodeCache;
     const uint8_t *m_cachedVuCode = nullptr;
     const PS2Memory *m_cachedMemory = nullptr;
@@ -79,6 +95,13 @@ private:
 
     void execUpper(uint32_t instr);
     void execLower(uint32_t instr, uint8_t *vuData, uint32_t dataSize, GS &gs, PS2Memory *memory, uint32_t upperInstr);
+    void beginXgkick(uint32_t sourceQword, uint8_t *vuData, uint32_t dataSize,
+                     GS &gs, PS2Memory *memory);
+    void advanceXgkick(uint8_t *vuData, uint32_t dataSize,
+                       GS &gs, PS2Memory *memory, uint32_t cycles, bool flush);
+    void cancelXgkick();
+    void backupVi(uint8_t reg);
+    int32_t readViForBranch(uint8_t reg) const;
 
     void applyDest(float *dst, const float *result, uint8_t dest);
     void applyDestAcc(const float *result, uint8_t dest);

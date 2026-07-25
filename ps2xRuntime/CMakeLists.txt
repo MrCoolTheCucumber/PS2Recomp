@@ -395,6 +395,24 @@ add_library(ps2_runtime STATIC
     src/lib/games_database.cpp
 )
 
+# VU arithmetic observes a runtime-selected rounding mode. Prevent the
+# compiler from assuming round-to-nearest or contracting multiply/add pairs.
+if(MSVC)
+    set_source_files_properties(
+        src/lib/vu/ps2_vu1_core.cpp
+        src/lib/vu/ps2_vu1_upper.cpp
+        src/lib/vu/ps2_vu1_lower.cpp
+        PROPERTIES COMPILE_OPTIONS "/fp:strict"
+    )
+elseif(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+    set_source_files_properties(
+        src/lib/vu/ps2_vu1_core.cpp
+        src/lib/vu/ps2_vu1_upper.cpp
+        src/lib/vu/ps2_vu1_lower.cpp
+        PROPERTIES COMPILE_OPTIONS "-frounding-math;-ffp-contract=off"
+    )
+endif()
+
 if(PS2X_ENABLE_RUNTIME_LOGS)
     target_compile_definitions(ps2_runtime PUBLIC
         PS2_RUNTIME_LOGS=1

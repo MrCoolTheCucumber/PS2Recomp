@@ -530,8 +530,7 @@ namespace
         ctx->vu0_vpu_stat = 0;
         ctx->vu0_vpu_stat2 = 0;
 
-        ctx->vu0_vf[0] = _mm_set_ps(1.0f, 0.0f, 0.0f, 0.0f);
-        ctx->vi[0] = 0;
+        ctx->enforceVu0RegisterInvariants();
     }
 
     [[noreturn]] void raiseCop0Exception(R5900Context *ctx, uint32_t exceptionCode)

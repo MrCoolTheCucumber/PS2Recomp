@@ -252,7 +252,7 @@ void VU1Interpreter::execLower(uint32_t instr, uint8_t *vuData, uint32_t dataSiz
         uint8_t it = VIT(instr);
         uint8_t is = VIS(instr);
         int16_t imm = IMM11(instr);
-        if ((int16_t)m_state.vi[is] == (int16_t)m_state.vi[it])
+        if (readViForBranch(is) == readViForBranch(it))
         {
             uint32_t target = (m_state.pc + 8 + imm * 8) & 0x3FFF;
             m_state.branchPending = true;
@@ -266,7 +266,7 @@ void VU1Interpreter::execLower(uint32_t instr, uint8_t *vuData, uint32_t dataSiz
         uint8_t it = VIT(instr);
         uint8_t is = VIS(instr);
         int16_t imm = IMM11(instr);
-        if ((int16_t)m_state.vi[is] != (int16_t)m_state.vi[it])
+        if (readViForBranch(is) != readViForBranch(it))
         {
             uint32_t target = (m_state.pc + 8 + imm * 8) & 0x3FFF;
             m_state.branchPending = true;
@@ -279,7 +279,7 @@ void VU1Interpreter::execLower(uint32_t instr, uint8_t *vuData, uint32_t dataSiz
     {
         uint8_t is = VIS(instr);
         int16_t imm = IMM11(instr);
-        if ((int16_t)m_state.vi[is] < 0)
+        if (readViForBranch(is) < 0)
         {
             uint32_t target = (m_state.pc + 8 + imm * 8) & 0x3FFF;
             m_state.branchPending = true;
@@ -292,7 +292,7 @@ void VU1Interpreter::execLower(uint32_t instr, uint8_t *vuData, uint32_t dataSiz
     {
         uint8_t is = VIS(instr);
         int16_t imm = IMM11(instr);
-        if ((int16_t)m_state.vi[is] > 0)
+        if (readViForBranch(is) > 0)
         {
             uint32_t target = (m_state.pc + 8 + imm * 8) & 0x3FFF;
             m_state.branchPending = true;
@@ -305,7 +305,7 @@ void VU1Interpreter::execLower(uint32_t instr, uint8_t *vuData, uint32_t dataSiz
     {
         uint8_t is = VIS(instr);
         int16_t imm = IMM11(instr);
-        if ((int16_t)m_state.vi[is] <= 0)
+        if (readViForBranch(is) <= 0)
         {
             uint32_t target = (m_state.pc + 8 + imm * 8) & 0x3FFF;
             m_state.branchPending = true;
@@ -318,7 +318,7 @@ void VU1Interpreter::execLower(uint32_t instr, uint8_t *vuData, uint32_t dataSiz
     {
         uint8_t is = VIS(instr);
         int16_t imm = IMM11(instr);
-        if ((int16_t)m_state.vi[is] >= 0)
+        if (readViForBranch(is) >= 0)
         {
             uint32_t target = (m_state.pc + 8 + imm * 8) & 0x3FFF;
             m_state.branchPending = true;
@@ -337,95 +337,6 @@ void VU1Interpreter::execLower(uint32_t instr, uint8_t *vuData, uint32_t dataSiz
         const uint8_t viS = VIS(instr);
         const uint8_t viD = VID(instr);
         const uint8_t dest = (instr >> 21) & 0xF;
-
-        auto doXgkick = [&]()
-        {
-            if (!vuData || dataSize < 16u)
-                return;
-
-            auto wrapOffset = [&](uint32_t off) -> uint32_t
-            {
-                return off % dataSize;
-            };
-
-            auto read64Wrap = [&](uint32_t off) -> uint64_t
-            {
-                uint8_t bytes[8];
-                for (uint32_t i = 0; i < 8u; ++i)
-                {
-                    bytes[i] = vuData[wrapOffset(off + i)];
-                }
-                uint64_t value = 0;
-                std::memcpy(&value, bytes, sizeof(value));
-                return value;
-            };
-
-            uint32_t addr = ((uint32_t)(uint16_t)m_state.vi[viS]) * 16u;
-            addr = wrapOffset(addr);
-            uint32_t pktOff = addr;
-            uint32_t totalBytes = 0u;
-            bool done = false;
-
-            for (int safety = 0; safety < 256 && !done; ++safety)
-            {
-                uint64_t tagLo = read64Wrap(pktOff);
-                uint32_t nloop = (uint32_t)(tagLo & 0x7FFFu);
-                uint8_t flg = (uint8_t)((tagLo >> 58) & 0x3u);
-                uint32_t nreg = (uint32_t)((tagLo >> 60) & 0xFu);
-                if (nreg == 0u)
-                    nreg = 16u;
-                bool eop = ((tagLo >> 15) & 0x1ull) != 0ull;
-
-                uint32_t pktSize = 16u;
-                if (flg == 0u)
-                {
-                    pktSize += nloop * nreg * 16u;
-                }
-                else if (flg == 1u)
-                {
-                    uint32_t regs = nloop * nreg;
-                    pktSize += regs * 8u;
-                    if ((regs & 1u) != 0u)
-                        pktSize += 8u;
-                }
-                else if (flg == 2u || flg == 3u)
-                {
-                    pktSize += nloop * 16u;
-                }
-
-                if (pktSize == 0u)
-                    break;
-
-                totalBytes += pktSize;
-                pktOff = wrapOffset(pktOff + pktSize);
-                if (eop)
-                    done = true;
-            }
-
-            if (totalBytes == 0u)
-                return;
-
-            if (addr + totalBytes <= dataSize)
-            {
-                if (memory)
-                    memory->submitGifPacket(GifPathId::Path1, vuData + addr, totalBytes);
-                else
-                    gs.processGIFPacket(vuData + addr, totalBytes);
-            }
-            else
-            {
-                std::vector<uint8_t> wrappedPacket(totalBytes);
-                for (uint32_t i = 0; i < totalBytes; ++i)
-                {
-                    wrappedPacket[i] = vuData[wrapOffset(addr + i)];
-                }
-
-                if (memory)
-                    memory->submitGifPacket(GifPathId::Path1, wrappedPacket.data(), totalBytes);
-                else
-                    gs.processGIFPacket(wrappedPacket.data(), totalBytes);
-            }
-        };
 
         switch (funct)
         {
@@ -476,6 +387,7 @@ void VU1Interpreter::execLower(uint32_t instr, uint8_t *vuData, uint32_t dataSiz
             }
             case 0x34: // LQI (Load Quadword, post-increment)
             {
+                backupVi(viS);
                 uint32_t addr = ((uint32_t)(uint16_t)m_state.vi[viS]) * 16u;
                 addr &= (dataSize - 1);
                 if (addr + 16 <= dataSize)
@@ -490,6 +402,7 @@ void VU1Interpreter::execLower(uint32_t instr, uint8_t *vuData, uint32_t dataSiz
             }
             case 0x35: // SQI (Store Quadword, post-increment)
             {
+                backupVi(viT);
                 uint32_t addr = ((uint32_t)(uint16_t)m_state.vi[viT]) * 16u;
                 addr &= (dataSize - 1);
                 if (addr + 16 <= dataSize)
@@ -512,6 +425,7 @@ void VU1Interpreter::execLower(uint32_t instr, uint8_t *vuData, uint32_t dataSiz
             }
             case 0x36: // LQD (Load Quadword, pre-decrement)
             {
+                backupVi(viS);
                 if (viS != 0)
                     m_state.vi[viS] = (int16_t)(m_state.vi[viS] - 1);
                 uint32_t addr = ((uint32_t)(uint16_t)m_state.vi[viS]) * 16u;
@@ -526,6 +440,7 @@ void VU1Interpreter::execLower(uint32_t instr, uint8_t *vuData, uint32_t dataSiz
             }
             case 0x37: // SQD (Store Quadword, pre-decrement)
             {
+                backupVi(viT);
                 if (viT != 0)
                     m_state.vi[viT] = (int16_t)(m_state.vi[viT] - 1);
                 uint32_t addr = ((uint32_t)(uint16_t)m_state.vi[viT]) * 16u;
@@ -581,19 +496,16 @@ void VU1Interpreter::execLower(uint32_t instr, uint8_t *vuData, uint32_t dataSiz
                 return;
             case 0x3C: // MTIR (Move To Integer Register)
             {
-                int comp = 0;
-                if (dest & 0x8)
-                    comp = 0;
-                else if (dest & 0x4)
-                    comp = 1;
-                else if (dest & 0x2)
-                    comp = 2;
-                else
-                    comp = 3;
+                // MTIR encodes a two-bit scalar selector in bits 22:21. It is
+                // not an XYZW destination mask like the neighbouring ops.
+                const uint8_t comp = static_cast<uint8_t>((instr >> 21u) & 0x3u);
                 uint32_t fval;
                 std::memcpy(&fval, &m_state.vf[vfS][comp], 4);
                 if (viT != 0)
+                {
+                    backupVi(viT);
                     m_state.vi[viT] = (int32_t)(int16_t)(fval & 0xFFFF);
+                }
                 return;
             }
             case 0x3D: // MFIR (Move From Integer Register)
@@ -674,7 +586,8 @@ void VU1Interpreter::execLower(uint32_t instr, uint8_t *vuData, uint32_t dataSiz
                 return;
             }
             case 0x6C: // XGKICK - send GIF packet from VU1 data memory
-                doXgkick();
+                beginXgkick(static_cast<uint32_t>(static_cast<uint16_t>(m_state.vi[viS])),
+                            vuData, dataSize, gs, memory);
                 return;
             case 0x70: // ESADD
                 return;
