@@ -17,7 +17,11 @@
 #include <fstream>
 #include <algorithm>
 #include <array>
+#include <cerrno>
 #include <cctype>
+#include <cinttypes>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
 #include <chrono>
@@ -131,6 +135,116 @@ namespace
     thread_local std::unordered_map<PS2Runtime *, uint32_t> g_guestExecutionDepths;
     thread_local uint32_t g_deferredGuestYieldDepth = 0u;
     thread_local bool g_deferredGuestYieldPending = false;
+
+    struct Vif0MmioTrace
+    {
+        std::FILE *output = nullptr;
+        uint64_t sequence = 0u;
+
+        ~Vif0MmioTrace()
+        {
+            if (output)
+                std::fclose(output);
+        }
+    };
+
+    Vif0MmioTrace &getVif0MmioTrace()
+    {
+        static Vif0MmioTrace trace = []
+        {
+            Vif0MmioTrace result;
+            if (const char *path = std::getenv("PS2X_VIF0_MMIO_TRACE");
+                path && *path)
+            {
+                result.output = std::fopen(path, "wb");
+                if (!result.output)
+                {
+                    std::fprintf(stderr,
+                                 "VIF0 MMIO trace: cannot open '%s': %s\n",
+                                 path, std::strerror(errno));
+                }
+            }
+            return result;
+        }();
+        return trace;
+    }
+
+    void traceVif0MmioWrite(PS2Memory &memory,
+                            const R5900Context *ctx,
+                            uint32_t address,
+                            uint32_t size,
+                            uint64_t valueLo,
+                            uint64_t valueHi)
+    {
+        Vif0MmioTrace &trace = getVif0MmioTrace();
+        if (!trace.output)
+            return;
+
+        constexpr uint32_t VIF0_CHANNEL = 0x10008000u;
+        constexpr uint32_t VIF0_CHANNEL_END = VIF0_CHANNEL + 0x60u;
+        const uint32_t physicalAddress = address & 0x1FFFFFFFu;
+        const uint64_t writeEnd = static_cast<uint64_t>(physicalAddress) + size;
+        if (physicalAddress >= VIF0_CHANNEL_END || writeEnd <= VIF0_CHANNEL)
+            return;
+
+        std::fprintf(
+            trace.output,
+            "{\"schema_version\":1,\"event\":\"vif0-mmio-write\","
+            "\"sequence\":%" PRIu64 ",\"pc\":\"0x%08" PRIx32 "\","
+            "\"ra\":\"0x%08" PRIx32 "\",\"address\":\"0x%08" PRIx32 "\","
+            "\"size\":%" PRIu32 ",\"value_lo\":\"0x%016" PRIx64 "\","
+            "\"value_hi\":\"0x%016" PRIx64 "\"",
+            trace.sequence++,
+            ctx ? ctx->pc : 0u,
+            ctx ? getRegU32(ctx, 31) : 0u,
+            physicalAddress, size, valueLo, valueHi);
+
+        const uint32_t chcrOffset = VIF0_CHANNEL - physicalAddress;
+        if (physicalAddress <= VIF0_CHANNEL &&
+            static_cast<uint64_t>(chcrOffset) + sizeof(uint32_t) <= size)
+        {
+            uint32_t chcr = 0u;
+            if (chcrOffset < 8u)
+                chcr = static_cast<uint32_t>(valueLo >> (chcrOffset * 8u));
+            else
+                chcr = static_cast<uint32_t>(valueHi >> ((chcrOffset - 8u) * 8u));
+
+            if ((chcr & 0x100u) != 0u)
+            {
+                const uint32_t madr = memory.readIORegister(VIF0_CHANNEL + 0x10u);
+                const uint32_t qwc = memory.readIORegister(VIF0_CHANNEL + 0x20u);
+                const uint32_t tadr = memory.readIORegister(VIF0_CHANNEL + 0x30u);
+                const uint32_t asr0 = memory.readIORegister(VIF0_CHANNEL + 0x40u);
+                const uint32_t asr1 = memory.readIORegister(VIF0_CHANNEL + 0x50u);
+                uint32_t tagWords[4]{};
+                bool tagValid = false;
+                try
+                {
+                    for (uint32_t index = 0u; index < 4u; ++index)
+                        tagWords[index] = memory.read32(tadr + index * 4u);
+                    tagValid = true;
+                }
+                catch (...)
+                {
+                }
+
+                std::fprintf(
+                    trace.output,
+                    ",\"start\":{\"chcr\":\"0x%08" PRIx32 "\","
+                    "\"madr\":\"0x%08" PRIx32 "\",\"qwc\":\"0x%08" PRIx32 "\","
+                    "\"tadr\":\"0x%08" PRIx32 "\",\"asr0\":\"0x%08" PRIx32 "\","
+                    "\"asr1\":\"0x%08" PRIx32 "\",\"tag_valid\":%s,"
+                    "\"tag\":[\"0x%08" PRIx32 "\",\"0x%08" PRIx32 "\","
+                    "\"0x%08" PRIx32 "\",\"0x%08" PRIx32 "\"]}",
+                    chcr, madr, qwc, tadr, asr0, asr1,
+                    tagValid ? "true" : "false",
+                    tagWords[0], tagWords[1], tagWords[2], tagWords[3]);
+            }
+        }
+
+        std::fputs("}\n", trace.output);
+        std::fflush(trace.output);
+    }
 
     struct ElfAddressRange
     {
@@ -2571,6 +2685,7 @@ __m128i PS2Runtime::Load128(uint8_t *rdram, R5900Context *ctx, uint32_t vaddr)
 void PS2Runtime::Store8(uint8_t *rdram, R5900Context *ctx, uint32_t vaddr, uint8_t value)
 {
     ps2TraceGuestWrite(rdram, vaddr, 1u, value, 0u, "WRITE8", ctx);
+    traceVif0MmioWrite(m_memory, ctx, vaddr, 1u, value, 0u);
     try
     {
         m_memory.write8(vaddr, value);
@@ -2588,6 +2703,7 @@ void PS2Runtime::Store8(uint8_t *rdram, R5900Context *ctx, uint32_t vaddr, uint8
 void PS2Runtime::Store16(uint8_t *rdram, R5900Context *ctx, uint32_t vaddr, uint16_t value)
 {
     ps2TraceGuestWrite(rdram, vaddr, 2u, value, 0u, "WRITE16", ctx);
+    traceVif0MmioWrite(m_memory, ctx, vaddr, 2u, value, 0u);
     try
     {
         m_memory.write16(vaddr, value);
@@ -2605,6 +2721,7 @@ void PS2Runtime::Store16(uint8_t *rdram, R5900Context *ctx, uint32_t vaddr, uint
 void PS2Runtime::Store32(uint8_t *rdram, R5900Context *ctx, uint32_t vaddr, uint32_t value)
 {
     ps2TraceGuestWrite(rdram, vaddr, 4u, value, 0u, "WRITE32", ctx);
+    traceVif0MmioWrite(m_memory, ctx, vaddr, 4u, value, 0u);
     try
     {
         m_memory.write32(vaddr, value);
@@ -2622,6 +2739,7 @@ void PS2Runtime::Store32(uint8_t *rdram, R5900Context *ctx, uint32_t vaddr, uint
 void PS2Runtime::Store64(uint8_t *rdram, R5900Context *ctx, uint32_t vaddr, uint64_t value)
 {
     ps2TraceGuestWrite(rdram, vaddr, 8u, value, 0u, "WRITE64", ctx);
+    traceVif0MmioWrite(m_memory, ctx, vaddr, 8u, value, 0u);
     try
     {
         m_memory.write64(vaddr, value);
@@ -2641,6 +2759,7 @@ void PS2Runtime::Store128(uint8_t *rdram, R5900Context *ctx, uint32_t vaddr, __m
     alignas(16) uint64_t _parts[2];
     _mm_storeu_si128(reinterpret_cast<__m128i *>(_parts), value);
     ps2TraceGuestWrite(rdram, vaddr, 16u, _parts[0], _parts[1], "WRITE128", ctx);
+    traceVif0MmioWrite(m_memory, ctx, vaddr, 16u, _parts[0], _parts[1]);
     try
     {
         m_memory.write128(vaddr, value);

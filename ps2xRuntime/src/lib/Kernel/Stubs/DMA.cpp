@@ -1,6 +1,8 @@
 #include "Common.h"
 #include "DMA.h"
 
+#include <cinttypes>
+
 namespace ps2_stubs
 {
     namespace
@@ -32,6 +34,74 @@ namespace ps2_stubs
 
         std::mutex g_dmaEnvMutex;
         SceDmaEnv g_dmaCurrentEnv;
+
+        struct Vif0DmaTrace
+        {
+            std::FILE *output = nullptr;
+            uint64_t sequence = 0;
+
+            ~Vif0DmaTrace()
+            {
+                if (output)
+                    std::fclose(output);
+            }
+        };
+
+        Vif0DmaTrace &getVif0DmaTrace()
+        {
+            static Vif0DmaTrace trace = []
+            {
+                Vif0DmaTrace result;
+                if (const char *path = std::getenv("PS2X_VIF0_DMA_TRACE");
+                    path && *path)
+                {
+                    result.output = std::fopen(path, "wb");
+                    if (!result.output)
+                    {
+                        std::fprintf(stderr,
+                                     "VIF0 DMA trace: cannot open '%s': %s\n",
+                                     path, std::strerror(errno));
+                    }
+                }
+                return result;
+            }();
+            return trace;
+        }
+
+        void traceVif0DmaSend(const char *entryPoint, uint8_t *rdram,
+                              R5900Context *ctx)
+        {
+            Vif0DmaTrace &trace = getVif0DmaTrace();
+            if (!trace.output || !ctx)
+                return;
+
+            const uint32_t channelArg = getRegU32(ctx, 4);
+            const uint32_t channel = resolveDmaChannelBase(rdram, channelArg);
+            if (channel != 0x10008000u)
+                return;
+
+            const uint32_t payload = getRegU32(ctx, 5);
+            uint32_t tagWords[4]{};
+            if (const uint8_t *tag = getConstMemPtr(rdram, payload))
+                std::memcpy(tagWords, tag, sizeof(tagWords));
+
+            std::fprintf(
+                trace.output,
+                "{\"schema_version\":1,\"event\":\"vif0-dma-send\","
+                "\"sequence\":%" PRIu64 ",\"entry\":\"%s\","
+                "\"pc\":\"0x%08" PRIx32 "\",\"ra\":\"0x%08" PRIx32 "\","
+                "\"sp\":\"0x%08" PRIx32 "\","
+                "\"channel_arg\":\"0x%08" PRIx32 "\","
+                "\"payload\":\"0x%08" PRIx32 "\","
+                "\"count\":\"0x%08" PRIx32 "\","
+                "\"tag\":[\"0x%08" PRIx32 "\",\"0x%08" PRIx32 "\","
+                "\"0x%08" PRIx32 "\",\"0x%08" PRIx32 "\"]}\n",
+                trace.sequence++, entryPoint,
+                ctx->pc, getRegU32(ctx, 31), getRegU32(ctx, 29),
+                channelArg, payload, getRegU32(ctx, 6),
+                tagWords[0], tagWords[1], tagWords[2], tagWords[3]);
+            std::fflush(trace.output);
+        }
     }
 
     void DmaAddr(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
@@ -201,21 +271,25 @@ namespace ps2_stubs
 
     void sceDmaSend(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
+        traceVif0DmaSend("sceDmaSend", rdram, ctx);
         setReturnS32(ctx, submitDmaSend(rdram, ctx, runtime, false));
     }
 
     void sceDmaSendI(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
+        traceVif0DmaSend("sceDmaSendI", rdram, ctx);
         setReturnS32(ctx, submitDmaSend(rdram, ctx, runtime, false));
     }
 
     void sceDmaSendM(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
+        traceVif0DmaSend("sceDmaSendM", rdram, ctx);
         setReturnS32(ctx, submitDmaSend(rdram, ctx, runtime, false));
     }
 
     void sceDmaSendN(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
+        traceVif0DmaSend("sceDmaSendN", rdram, ctx);
         setReturnS32(ctx, submitDmaSend(rdram, ctx, runtime, true));
     }
 

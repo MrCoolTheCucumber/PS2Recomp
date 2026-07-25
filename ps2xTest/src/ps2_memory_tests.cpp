@@ -1864,6 +1864,66 @@ void register_ps2_memory_tests()
             t.IsTrue((mem.readIORegister(0x1000E010u) & 0x2u) != 0u, "VIF1 DMA completion should raise D_STAT channel bit");
         });
 
+        tc.Run("VIF1 DMA source chain supports more than 4096 tags", [](TestCase &t)
+        {
+            PS2Memory mem;
+            t.IsTrue(mem.initialize(), "PS2Memory initialize should succeed");
+
+            constexpr uint32_t kVif1Ch = 0x10009000u;
+            constexpr uint32_t kTagBase = 0x00030000u;
+            constexpr uint32_t kCntTagCount = 5000u;
+            constexpr uint32_t kEndTag = kTagBase + kCntTagCount * 16u;
+
+            uint8_t *rdram = mem.getRDRAM();
+            for (uint32_t index = 0u; index < kCntTagCount; ++index)
+            {
+                writeDmaTag(rdram, kTagBase + index * 16u,
+                            makeDmaTag(0u, 1u, 0u, false)); // CNT
+            }
+            writeDmaTag(rdram, kEndTag, makeDmaTag(1u, 7u, 0u, false)); // END
+            const uint32_t markCmd = makeVifCmd(0x07u, 0u, 0x5A5Au);
+            std::memcpy(rdram + kEndTag + 16u, &markCmd, sizeof(markCmd));
+            std::memset(rdram + kEndTag + 20u, 0, 12u);
+
+            t.IsTrue(mem.writeIORegister(kVif1Ch + 0x30u, kTagBase),
+                     "write long-chain VIF1 TADR should succeed");
+            t.IsTrue(mem.writeIORegister(kVif1Ch + 0x00u, 0x105u),
+                     "write long-chain VIF1 CHCR should succeed");
+
+            t.Equals(mem.vif1_regs.mark, 0x5A5Au,
+                     "VIF1 should consume the payload after tag 4096");
+            const uint32_t chcr = mem.readIORegister(kVif1Ch + 0x00u);
+            t.Equals(chcr & 0x100u, 0u,
+                     "a valid long VIF1 source chain should complete");
+            t.Equals(chcr & 0x70000000u, 0x70000000u,
+                     "the long chain should latch its terminal END tag");
+            t.IsTrue((mem.readIORegister(0x1000E010u) & 0x2u) != 0u,
+                     "the long chain should raise VIF1's completion status");
+        });
+
+        tc.Run("VIF1 DMA cyclic source chain is not partially completed", [](TestCase &t)
+        {
+            PS2Memory mem;
+            t.IsTrue(mem.initialize(), "PS2Memory initialize should succeed");
+
+            constexpr uint32_t kVif1Ch = 0x10009000u;
+            constexpr uint32_t kTag = 0x0002F000u;
+            writeDmaTag(mem.getRDRAM(), kTag,
+                        makeDmaTag(0u, 2u, kTag, false)); // NEXT to itself
+
+            t.IsTrue(mem.writeIORegister(kVif1Ch + 0x30u, kTag),
+                     "write cyclic VIF1 TADR should succeed");
+            t.IsTrue(mem.writeIORegister(kVif1Ch + 0x00u, 0x105u),
+                     "write cyclic VIF1 CHCR should be accepted");
+
+            t.IsTrue((mem.m_ioRegisters[kVif1Ch + 0x00u] & 0x100u) != 0u,
+                     "a cyclic chain must keep STR set instead of reporting false completion");
+            t.IsTrue((mem.readIORegister(0x1000E010u) & 0x2u) == 0u,
+                     "a cyclic chain must not raise VIF1 completion status");
+            t.Equals(mem.consumeCompletedDmacCauses().size(), static_cast<size_t>(0u),
+                     "a cyclic chain must not queue a completion interrupt");
+        });
+
         tc.Run("GIF DMA chain CALL sources payload from TADR+16", [](TestCase &t)
         {
             PS2Memory mem;

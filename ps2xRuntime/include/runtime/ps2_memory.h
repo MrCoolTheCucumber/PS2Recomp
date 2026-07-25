@@ -22,6 +22,8 @@
 #endif
 
 class GS;
+struct Ps2GsDmaTraceState;
+struct VU1State;
 
 class PS2TlbMissException final : public std::exception
 {
@@ -476,6 +478,30 @@ public:
     bool processScratchpadDma(uint32_t channelBase);
     void completeDmaChannel(uint32_t channelBase, uint32_t cause);
     void queueCompletedDmacCause(uint32_t cause);
+    void beginVif1DmaTrace(uint32_t chcr,
+                           uint32_t madr,
+                           uint32_t qwc,
+                           uint32_t tadr,
+                           uint32_t asr0,
+                           uint32_t asr1,
+                           uint32_t sadr);
+    void traceVif1DmaTag(const uint8_t *data);
+    void traceVif1DmaPayload(const uint8_t *data, uint32_t sizeBytes);
+    void traceVif1Input(const uint8_t *data, uint32_t sizeBytes);
+    void traceVif1Command(uint32_t command, const uint8_t *followingData,
+                          uint32_t followingBytes);
+    void traceVif1NormalTransfer(uint32_t srcAddr, uint32_t qwc);
+    void tracePath1Packet(const uint8_t *data, uint32_t sizeBytes);
+    bool isVif1DmaTraceActive() const;
+    void traceVu1Invocation(uint32_t startPc, uint32_t top, uint32_t itop, bool resume,
+                            const VU1State &state);
+    void traceVu1Instruction(uint32_t pc, uint32_t lower, uint32_t upper,
+                             const VU1State &state);
+    void traceVu1Xgkick(uint32_t sourceQword);
+    void traceVu1InvocationEnd(uint32_t finalPc, bool ended, bool hitCycleLimit,
+                               const int32_t *viRegisters, size_t viRegisterCount);
+    void finishVif1DmaTrace();
+    Ps2GsDmaTraceState *m_gsDmaTrace = nullptr;
     uint64_t m_timer0LastHostNs = 0;
     uint64_t m_timer0FractionNs = 0;
 };

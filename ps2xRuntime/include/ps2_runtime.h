@@ -245,6 +245,20 @@ inline void setReturnU64(R5900Context *ctx, uint64_t value)
 inline constexpr uint32_t PS2_PATH_WATCH_ADDR = 0x01EFFFA0u;
 inline constexpr uint32_t PS2_PATH_WATCH_BYTES = 0x200u;
 
+extern std::atomic<bool> g_ps2GsDmaWriteTraceEnabled;
+void ps2RecordGsDmaWriteTrace(uint32_t guestAddr,
+                              uint32_t size,
+                              uint32_t writerPc,
+                              uint32_t returnAddress);
+extern std::atomic<bool> g_ps2GuestWriteTraceEnabled;
+void ps2RecordGuestWriteTrace(uint32_t guestAddr,
+                              uint32_t size,
+                              uint64_t valueLo,
+                              uint64_t valueHi,
+                              const char *op,
+                              uint32_t writerPc,
+                              uint32_t returnAddress);
+
 inline uint32_t ps2PathWatchPhysAddr()
 {
     return PS2_PATH_WATCH_ADDR & PS2_RAM_MASK;
@@ -269,13 +283,20 @@ inline void ps2TraceGuestWrite(uint8_t *rdram,
                                const R5900Context *ctx)
 {
     (void)rdram;
-    (void)guestAddr;
-    (void)size;
     (void)valueLo;
     (void)valueHi;
     (void)op;
-    (void)ctx;
-    // TODO we dont need this anymore so on next release it will be deleted
+    if (g_ps2GsDmaWriteTraceEnabled.load(std::memory_order_relaxed))
+    {
+        ps2RecordGsDmaWriteTrace(
+            guestAddr, size, ctx ? ctx->pc : 0u, ctx ? getRegU32(ctx, 31) : 0u);
+    }
+    if (g_ps2GuestWriteTraceEnabled.load(std::memory_order_relaxed))
+    {
+        ps2RecordGuestWriteTrace(
+            guestAddr, size, valueLo, valueHi, op,
+            ctx ? ctx->pc : 0u, ctx ? getRegU32(ctx, 31) : 0u);
+    }
 }
 
 inline void ps2TraceGuestRangeWrite(uint8_t *rdram,
@@ -285,11 +306,18 @@ inline void ps2TraceGuestRangeWrite(uint8_t *rdram,
                                     const R5900Context *ctx)
 {
     (void)rdram;
-    (void)guestAddr;
-    (void)size;
     (void)op;
-    (void)ctx;
-    // TODO we dont need this anymore so on next release it will be deleted
+    if (g_ps2GsDmaWriteTraceEnabled.load(std::memory_order_relaxed))
+    {
+        ps2RecordGsDmaWriteTrace(
+            guestAddr, size, ctx ? ctx->pc : 0u, ctx ? getRegU32(ctx, 31) : 0u);
+    }
+    if (g_ps2GuestWriteTraceEnabled.load(std::memory_order_relaxed))
+    {
+        ps2RecordGuestWriteTrace(
+            guestAddr, size, 0u, 0u, op,
+            ctx ? ctx->pc : 0u, ctx ? getRegU32(ctx, 31) : 0u);
+    }
 }
 
 class PS2Runtime

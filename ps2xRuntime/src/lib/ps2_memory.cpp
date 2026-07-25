@@ -1,17 +1,58 @@
 #include "runtime/ps2_memory.h"
 #include "runtime/ps2_address.h"
 #include "runtime/ps2_gs_gpu.h"
+#include "runtime/ps2_vu1.h"
 #include "ps2_log.h"
+#include <array>
 #include <atomic>
+#include <cerrno>
+#include <cinttypes>
 #include <chrono>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
+#include <limits>
 #include <stdexcept>
 #include <algorithm>
 #include <string>
+#include <unordered_map>
+#include <unordered_set>
+#include <utility>
 #include <vector>
 
 namespace
 {
+    struct DmaChainState
+    {
+        uint32_t tagAddress;
+        uint32_t asr0;
+        uint32_t asr1;
+        uint32_t asp;
+
+        bool operator==(const DmaChainState &other) const
+        {
+            return tagAddress == other.tagAddress &&
+                   asr0 == other.asr0 &&
+                   asr1 == other.asr1 &&
+                   asp == other.asp;
+        }
+    };
+
+    struct DmaChainStateHash
+    {
+        size_t operator()(const DmaChainState &state) const
+        {
+            size_t hash = static_cast<size_t>(state.tagAddress);
+            hash ^= static_cast<size_t>(state.asr0) +
+                    static_cast<size_t>(0x9E3779B9u) + (hash << 6u) + (hash >> 2u);
+            hash ^= static_cast<size_t>(state.asr1) +
+                    static_cast<size_t>(0x9E3779B9u) + (hash << 6u) + (hash >> 2u);
+            hash ^= static_cast<size_t>(state.asp) +
+                    static_cast<size_t>(0x9E3779B9u) + (hash << 6u) + (hash >> 2u);
+            return hash;
+        }
+    };
+
     inline void inRange(uint32_t offset, size_t bytes, size_t regionSize, const char *op, uint32_t address)
     {
         if (static_cast<uint64_t>(offset) + static_cast<uint64_t>(bytes) > static_cast<uint64_t>(regionSize))
@@ -201,6 +242,849 @@ namespace
 
 }
 
+std::atomic<bool> g_ps2GsDmaWriteTraceEnabled{false};
+std::atomic<bool> g_ps2GuestWriteTraceEnabled{[]
+{
+    const char *path = std::getenv("PS2X_GUEST_WRITE_TRACE");
+    return path && *path;
+}()};
+namespace
+{
+    Ps2GsDmaTraceState *g_ps2GsDmaTraceState = nullptr;
+
+    struct GuestWriteTraceState
+    {
+        std::FILE *output = nullptr;
+        std::vector<std::pair<uint32_t, uint32_t>> ranges;
+        uint64_t sequence = 0u;
+        std::mutex mutex;
+
+        GuestWriteTraceState()
+        {
+            const char *path = std::getenv("PS2X_GUEST_WRITE_TRACE");
+            if (!path || !*path)
+                return;
+
+            output = std::fopen(path, "wb");
+            if (!output)
+            {
+                std::fprintf(stderr,
+                             "Guest write trace: cannot open '%s': %s\n",
+                             path, std::strerror(errno));
+                return;
+            }
+
+            const char *rangesText = std::getenv("PS2X_GUEST_WRITE_RANGES");
+            if (!parseRanges(rangesText))
+            {
+                std::fprintf(stderr,
+                             "Guest write trace: invalid PS2X_GUEST_WRITE_RANGES '%s'\n",
+                             rangesText ? rangesText : "");
+                std::fclose(output);
+                output = nullptr;
+                ranges.clear();
+                return;
+            }
+
+            std::fprintf(output,
+                         "{\"schema_version\":1,\"event\":\"configuration\","
+                         "\"ranges\":\"%s\"}\n",
+                         rangesText ? rangesText : "");
+            std::fflush(output);
+        }
+
+        ~GuestWriteTraceState()
+        {
+            if (output)
+                std::fclose(output);
+        }
+
+        bool parseRanges(const char *text)
+        {
+            if (!text || !*text)
+                return false;
+
+            const std::string rangesText(text);
+            size_t position = 0u;
+            while (position < rangesText.size())
+            {
+                const size_t comma = rangesText.find(',', position);
+                const size_t end = comma == std::string::npos ? rangesText.size() : comma;
+                const std::string range = rangesText.substr(position, end - position);
+                const size_t dash = range.find('-');
+                if (dash == std::string::npos)
+                    return false;
+
+                auto parseAddress = [](const std::string &addressText,
+                                       uint32_t &address)
+                {
+                    errno = 0;
+                    char *parseEnd = nullptr;
+                    const unsigned long long parsed =
+                        std::strtoull(addressText.c_str(), &parseEnd, 0);
+                    if (errno != 0 || parseEnd == addressText.c_str() ||
+                        *parseEnd != '\0' ||
+                        parsed > std::numeric_limits<uint32_t>::max())
+                    {
+                        return false;
+                    }
+                    address = static_cast<uint32_t>(parsed);
+                    return true;
+                };
+
+                uint32_t rangeBegin = 0u;
+                uint32_t rangeEnd = 0u;
+                if (!parseAddress(range.substr(0u, dash), rangeBegin) ||
+                    !parseAddress(range.substr(dash + 1u), rangeEnd) ||
+                    rangeBegin >= rangeEnd)
+                {
+                    return false;
+                }
+                ranges.emplace_back(rangeBegin, rangeEnd);
+                position = end + (comma == std::string::npos ? 0u : 1u);
+            }
+            return !ranges.empty();
+        }
+
+        void record(uint32_t guestAddr,
+                    uint32_t size,
+                    uint64_t valueLo,
+                    uint64_t valueHi,
+                    const char *op,
+                    uint32_t writerPc,
+                    uint32_t returnAddress)
+        {
+            if (!output || size == 0u)
+                return;
+
+            uint32_t physicalAddress = 0u;
+            if (!ps2ResolveDirectRdramOffset(guestAddr, physicalAddress))
+                return;
+
+            const uint64_t writeEnd =
+                static_cast<uint64_t>(physicalAddress) + size;
+            bool overlaps = false;
+            for (const auto &[rangeBegin, rangeEnd] : ranges)
+            {
+                if (physicalAddress < rangeEnd && writeEnd > rangeBegin)
+                {
+                    overlaps = true;
+                    break;
+                }
+            }
+            if (!overlaps)
+                return;
+
+            std::lock_guard<std::mutex> lock(mutex);
+            std::fprintf(
+                output,
+                "{\"schema_version\":1,\"event\":\"guest-write\","
+                "\"sequence\":%" PRIu64 ",\"pc\":\"0x%08" PRIx32 "\","
+                "\"ra\":\"0x%08" PRIx32 "\",\"address\":\"0x%08" PRIx32 "\","
+                "\"size\":%" PRIu32 ",\"op\":\"%s\","
+                "\"value_lo\":\"0x%016" PRIx64 "\","
+                "\"value_hi\":\"0x%016" PRIx64 "\"}\n",
+                sequence++, writerPc, returnAddress, physicalAddress,
+                size, op ? op : "", valueLo, valueHi);
+            std::fflush(output);
+        }
+    };
+
+    GuestWriteTraceState &getGuestWriteTraceState()
+    {
+        static GuestWriteTraceState trace;
+        return trace;
+    }
+}
+
+void ps2RecordGuestWriteTrace(uint32_t guestAddr,
+                              uint32_t size,
+                              uint64_t valueLo,
+                              uint64_t valueHi,
+                              const char *op,
+                              uint32_t writerPc,
+                              uint32_t returnAddress)
+{
+    getGuestWriteTraceState().record(
+        guestAddr, size, valueLo, valueHi, op, writerPc, returnAddress);
+}
+
+struct Ps2GsDmaTraceState
+{
+    static constexpr uint64_t FNV_OFFSET_BASIS = 14695981039346656037ull;
+    static constexpr uint64_t FNV_PRIME = 1099511628211ull;
+    static constexpr uint64_t MAX_BYTES = 64ull * 1024ull * 1024ull;
+    static constexpr size_t PREFIX_SIZE = 64u;
+
+    struct Digest
+    {
+        uint64_t hash = FNV_OFFSET_BASIS;
+        uint64_t bytes = 0u;
+        bool truncated = false;
+        std::array<uint8_t, PREFIX_SIZE> prefix{};
+        size_t prefixSize = 0u;
+
+        void append(const uint8_t *data, uint64_t size)
+        {
+            if (!data || bytes >= MAX_BYTES)
+            {
+                truncated = truncated || size != 0u;
+                return;
+            }
+
+            const uint64_t available = MAX_BYTES - bytes;
+            const uint64_t boundedSize = std::min(size, available);
+            for (uint64_t i = 0; i < boundedSize; ++i)
+            {
+                const uint8_t value = data[i];
+                hash ^= value;
+                hash *= FNV_PRIME;
+                if (prefixSize < prefix.size())
+                    prefix[prefixSize++] = value;
+            }
+            bytes += boundedSize;
+            truncated = truncated || boundedSize != size;
+        }
+    };
+
+    struct EeWriteSummary
+    {
+        uint64_t calls = 0u;
+        uint64_t bytes = 0u;
+        uint32_t firstAddress = 0u;
+        uint32_t lastAddress = 0u;
+        uint32_t minAddress = std::numeric_limits<uint32_t>::max();
+        uint32_t maxAddress = 0u;
+    };
+
+    struct Vu1RunPrefix
+    {
+        struct VifCommand
+        {
+            uint32_t command = 0u;
+            uint32_t cycle = 0u;
+            uint32_t mode = 0u;
+            uint32_t tops = 0u;
+            std::array<uint8_t, 64u> following{};
+            size_t followingSize = 0u;
+        };
+
+        uint64_t ordinal = 0u;
+        uint32_t startPc = 0u;
+        uint32_t top = 0u;
+        uint32_t itop = 0u;
+        uint32_t finalPc = 0u;
+        uint64_t microHash = FNV_OFFSET_BASIS;
+        uint64_t instructionCount = 0u;
+        bool ended = false;
+        bool hitCycleLimit = false;
+        std::array<int32_t, 16u> initialVi{};
+        std::array<int32_t, 16u> finalVi{};
+        std::array<uint8_t, 256u> topData{};
+        std::vector<VifCommand> recentVifCommands;
+        std::vector<uint32_t> pcs;
+        std::vector<uint32_t> lower;
+        std::vector<uint32_t> upper;
+    };
+
+    bool configured = false;
+    bool enabled = false;
+    bool active = false;
+    std::FILE *output = nullptr;
+    uint64_t sequence = 0u;
+    uint64_t activeSequence = 0u;
+    uint64_t limit = std::numeric_limits<uint64_t>::max();
+    uint32_t chcr = 0u;
+    uint32_t madr = 0u;
+    uint32_t qwc = 0u;
+    uint32_t tadr = 0u;
+    uint32_t asr0 = 0u;
+    uint32_t asr1 = 0u;
+    uint32_t sadr = 0u;
+    uint32_t tagCount = 0u;
+    uint64_t path1Calls = 0u;
+    uint64_t vu1Runs = 0u;
+    uint64_t vu1Resumes = 0u;
+    uint64_t vu1Pairs = 0u;
+    uint64_t vu1Xgkicks = 0u;
+    uint64_t vu1EndedRuns = 0u;
+    uint64_t vu1CycleLimitRuns = 0u;
+    uint32_t vu1LastPc = 0u;
+    uint32_t vu1CurrentStartPc = 0u;
+    uint32_t vu1CurrentTop = 0u;
+    uint32_t vu1CurrentItop = 0u;
+    uint64_t vu1CurrentMicroHash = FNV_OFFSET_BASIS;
+    uint64_t vu1CurrentPath1Calls = 0u;
+    Digest vu1CurrentPath1{};
+    uint64_t vu1StepSequence = std::numeric_limits<uint64_t>::max();
+    uint64_t vu1StepOrdinal = std::numeric_limits<uint64_t>::max();
+    uint64_t vu1StepEvents = 0u;
+    std::array<int32_t, 16u> vu1CurrentInitialVi{};
+    std::array<uint8_t, 256u> vu1CurrentTopData{};
+    std::array<uint64_t, 2048u> vu1RunStarts{};
+    std::array<uint64_t, 2048u> vu1EndedStarts{};
+    std::array<uint64_t, 2048u> vu1CycleLimitStarts{};
+    std::array<uint64_t, 128u> vu1LowerOps{};
+    std::array<uint64_t, 128u> vu1LowerSpecialOps{};
+    std::array<uint64_t, 64u> vu1UpperOps{};
+    std::array<uint64_t, 128u> vu1UpperSpecialOps{};
+    std::vector<uint32_t> vu1StartPcs;
+    std::vector<uint32_t> vu1KickAddresses;
+    std::vector<Vu1RunPrefix> vu1RunPrefix;
+    std::vector<Vu1RunPrefix::VifCommand> recentVifCommands;
+    std::array<uint32_t, 16u> vu1CurrentPcs{};
+    std::array<uint32_t, 16u> vu1CurrentLower{};
+    std::array<uint32_t, 16u> vu1CurrentUpper{};
+    size_t vu1CurrentInstructionCount = 0u;
+    bool vu1FirstCycleLimitCaptured = false;
+    uint32_t vu1FirstCycleLimitStartPc = 0u;
+    uint32_t vu1FirstCycleLimitTop = 0u;
+    uint32_t vu1FirstCycleLimitItop = 0u;
+    uint32_t vu1FirstCycleLimitFinalPc = 0u;
+    uint64_t vu1FirstCycleLimitOrdinal = 0u;
+    uint64_t vu1FirstCycleLimitMicroHash = FNV_OFFSET_BASIS;
+    std::array<int32_t, 16u> vu1FirstCycleLimitInitialVi{};
+    std::array<int32_t, 16u> vu1FirstCycleLimitVi{};
+    std::array<uint8_t, 256u> vu1FirstCycleLimitTopData{};
+    std::vector<uint32_t> vu1FirstCycleLimitPcs;
+    std::vector<uint32_t> vu1FirstCycleLimitLower;
+    std::vector<uint32_t> vu1FirstCycleLimitUpper;
+    Digest packet{};
+    Digest vifInput{};
+    Digest path1{};
+    std::string path1DumpDirectory;
+    std::string vif1InputDumpDirectory;
+    std::string vu1DumpDirectory;
+    std::vector<std::pair<uint32_t, uint32_t>> writeRanges;
+    std::vector<uint32_t> watchAddresses;
+    std::vector<uint32_t> watchValues;
+    std::unordered_map<uint64_t, EeWriteSummary> eeWrites;
+
+    ~Ps2GsDmaTraceState()
+    {
+        if (g_ps2GsDmaTraceState == this)
+        {
+            g_ps2GsDmaWriteTraceEnabled.store(false, std::memory_order_relaxed);
+            g_ps2GsDmaTraceState = nullptr;
+        }
+        if (output)
+            std::fclose(output);
+    }
+
+    bool parseWriteRanges(const char *text)
+    {
+        if (!text || !*text)
+            return true;
+
+        const std::string rangesText(text);
+        size_t position = 0u;
+        while (position < rangesText.size())
+        {
+            const size_t comma = rangesText.find(',', position);
+            const size_t end = comma == std::string::npos ? rangesText.size() : comma;
+            const std::string range = rangesText.substr(position, end - position);
+            const size_t dash = range.find('-');
+            if (dash == std::string::npos)
+                return false;
+
+            auto parseAddress = [](const std::string &addressText, uint32_t &address)
+            {
+                errno = 0;
+                char *parseEnd = nullptr;
+                const unsigned long long parsed =
+                    std::strtoull(addressText.c_str(), &parseEnd, 0);
+                if (errno != 0 || parseEnd == addressText.c_str() ||
+                    *parseEnd != '\0' || parsed > std::numeric_limits<uint32_t>::max())
+                {
+                    return false;
+                }
+                address = static_cast<uint32_t>(parsed);
+                return true;
+            };
+
+            uint32_t beginAddress = 0u;
+            uint32_t endAddress = 0u;
+            if (!parseAddress(range.substr(0u, dash), beginAddress) ||
+                !parseAddress(range.substr(dash + 1u), endAddress) ||
+                beginAddress >= endAddress)
+            {
+                return false;
+            }
+            writeRanges.emplace_back(beginAddress, endAddress);
+            position = end + (comma == std::string::npos ? 0u : 1u);
+        }
+        return true;
+    }
+
+    bool parseWatchAddresses(const char *text)
+    {
+        if (!text || !*text)
+            return true;
+
+        const char *cursor = text;
+        while (*cursor)
+        {
+            errno = 0;
+            char *end = nullptr;
+            const unsigned long long parsed = std::strtoull(cursor, &end, 0);
+            if (errno != 0 || end == cursor ||
+                (*end != '\0' && *end != ',') ||
+                parsed > std::numeric_limits<uint32_t>::max())
+            {
+                return false;
+            }
+            watchAddresses.push_back(static_cast<uint32_t>(parsed));
+            if (*end == '\0')
+                break;
+            cursor = end + 1;
+            if (*cursor == '\0')
+                return false;
+        }
+        return true;
+    }
+
+    void configure()
+    {
+        if (configured)
+            return;
+        configured = true;
+
+        const char *path = std::getenv("PS2X_GS_DMA_TRACE");
+        if (!path || !*path)
+            return;
+
+        const char *limitText = std::getenv("PS2X_GS_DMA_TRACE_LIMIT");
+        if (limitText && *limitText)
+        {
+            errno = 0;
+            char *end = nullptr;
+            const unsigned long long parsed = std::strtoull(limitText, &end, 0);
+            if (errno != 0 || end == limitText || *end != '\0' || parsed == 0u)
+            {
+                std::fprintf(stderr,
+                             "PS2 GS DMA trace: invalid PS2X_GS_DMA_TRACE_LIMIT '%s'\n",
+                             limitText);
+                return;
+            }
+            limit = static_cast<uint64_t>(parsed);
+        }
+
+        output = std::fopen(path, "wb");
+        if (!output)
+        {
+            std::fprintf(stderr, "PS2 GS DMA trace: cannot open '%s': %s\n",
+                         path, std::strerror(errno));
+            return;
+        }
+
+        enabled = true;
+        auto parseOptionalIndex = [](const char *name, uint64_t &value)
+        {
+            const char *text = std::getenv(name);
+            if (!text || !*text)
+                return true;
+            errno = 0;
+            char *end = nullptr;
+            const unsigned long long parsed = std::strtoull(text, &end, 0);
+            if (errno != 0 || end == text || *end != '\0')
+            {
+                std::fprintf(stderr, "PS2 GS DMA trace: invalid %s '%s'\n",
+                             name, text);
+                return false;
+            }
+            value = static_cast<uint64_t>(parsed);
+            return true;
+        };
+        if (!parseOptionalIndex("PS2X_VU1_STEP_SEQUENCE", vu1StepSequence) ||
+            !parseOptionalIndex("PS2X_VU1_STEP_ORDINAL", vu1StepOrdinal))
+        {
+            return;
+        }
+        if (const char *path1DumpDirectoryText =
+                std::getenv("PS2X_PATH1_DUMP_DIR");
+            path1DumpDirectoryText && *path1DumpDirectoryText)
+        {
+            path1DumpDirectory = path1DumpDirectoryText;
+        }
+        if (const char *vif1InputDumpDirectoryText =
+                std::getenv("PS2X_VIF1_INPUT_DUMP_DIR");
+            vif1InputDumpDirectoryText && *vif1InputDumpDirectoryText)
+        {
+            vif1InputDumpDirectory = vif1InputDumpDirectoryText;
+        }
+        if (const char *vu1DumpDirectoryText =
+                std::getenv("PS2X_VU1_DUMP_DIR");
+            vu1DumpDirectoryText && *vu1DumpDirectoryText)
+        {
+            vu1DumpDirectory = vu1DumpDirectoryText;
+        }
+        const char *writeRangesText = std::getenv("PS2X_GS_DMA_WRITE_RANGES");
+        if (!parseWriteRanges(writeRangesText))
+        {
+            std::fprintf(stderr,
+                         "PS2 GS DMA trace: invalid PS2X_GS_DMA_WRITE_RANGES '%s'\n",
+                         writeRangesText ? writeRangesText : "");
+            writeRanges.clear();
+        }
+        if (!writeRanges.empty())
+        {
+            g_ps2GsDmaTraceState = this;
+            g_ps2GsDmaWriteTraceEnabled.store(true, std::memory_order_relaxed);
+        }
+        const char *watchAddressesText =
+            std::getenv("PS2X_GS_DMA_WATCH_ADDRESSES");
+        if (!parseWatchAddresses(watchAddressesText))
+        {
+            std::fprintf(stderr,
+                         "PS2 GS DMA trace: invalid PS2X_GS_DMA_WATCH_ADDRESSES '%s'\n",
+                         watchAddressesText ? watchAddressesText : "");
+            watchAddresses.clear();
+        }
+        std::fprintf(output,
+                     "{\"schema_version\":1,\"event\":\"configuration\","
+                     "\"producer\":\"PS2Recomp\",\"limit\":%" PRIu64 ","
+                     "\"ee_write_ranges\":\"%s\","
+                     "\"watch_addresses\":\"%s\"}\n",
+                     limit, writeRangesText ? writeRangesText : "",
+                     watchAddressesText ? watchAddressesText : "");
+        std::fflush(output);
+    }
+
+    static void writeHex(std::FILE *file, const Digest &digest)
+    {
+        for (size_t i = 0; i < digest.prefixSize; ++i)
+            std::fprintf(file, "%02" PRIx8, digest.prefix[i]);
+    }
+
+    void recordEeWrite(uint32_t guestAddr,
+                       uint32_t size,
+                       uint32_t writerPc,
+                       uint32_t returnAddress)
+    {
+        uint32_t physicalAddress = 0u;
+        if (size == 0u || !ps2ResolveDirectRdramOffset(guestAddr, physicalAddress))
+            return;
+
+        const uint64_t writeEnd = static_cast<uint64_t>(physicalAddress) + size;
+        for (const auto &[rangeBegin, rangeEnd] : writeRanges)
+        {
+            if (physicalAddress >= rangeEnd || writeEnd <= rangeBegin)
+                continue;
+
+            const uint32_t clippedBegin = std::max(physicalAddress, rangeBegin);
+            const uint32_t clippedEnd = static_cast<uint32_t>(
+                std::min<uint64_t>(writeEnd, static_cast<uint64_t>(rangeEnd)));
+            const uint64_t key =
+                (static_cast<uint64_t>(writerPc) << 32u) | returnAddress;
+            EeWriteSummary &summary = eeWrites[key];
+            if (summary.calls == 0u)
+                summary.firstAddress = clippedBegin;
+            summary.lastAddress = clippedBegin;
+            summary.minAddress = std::min(summary.minAddress, clippedBegin);
+            summary.maxAddress = std::max(summary.maxAddress, clippedEnd - 1u);
+            ++summary.calls;
+            summary.bytes += clippedEnd - clippedBegin;
+        }
+    }
+
+    void flushEeWrites(uint64_t dmacSequence)
+    {
+        if (eeWrites.empty() || !output)
+            return;
+
+        std::vector<std::pair<uint64_t, EeWriteSummary>> summaries(
+            eeWrites.begin(), eeWrites.end());
+        std::sort(summaries.begin(), summaries.end(),
+                  [](const auto &left, const auto &right)
+                  {
+                      return left.first < right.first;
+                  });
+
+        for (const auto &[key, summary] : summaries)
+        {
+            const uint32_t writerPc = static_cast<uint32_t>(key >> 32u);
+            const uint32_t returnAddress = static_cast<uint32_t>(key);
+            std::fprintf(output,
+                         "{\"schema_version\":1,\"event\":\"ee-write-summary\","
+                         "\"dmac_sequence\":%" PRIu64 ","
+                         "\"writer_pc\":\"0x%08" PRIx32 "\","
+                         "\"ra\":\"0x%08" PRIx32 "\","
+                         "\"calls\":%" PRIu64 ",\"bytes\":%" PRIu64 ","
+                         "\"first_address\":\"0x%08" PRIx32 "\","
+                         "\"last_address\":\"0x%08" PRIx32 "\","
+                         "\"min_address\":\"0x%08" PRIx32 "\","
+                         "\"max_address\":\"0x%08" PRIx32 "\"}\n",
+                         dmacSequence, writerPc, returnAddress,
+                         summary.calls, summary.bytes,
+                         summary.firstAddress, summary.lastAddress,
+                         summary.minAddress, summary.maxAddress);
+        }
+        std::fflush(output);
+        eeWrites.clear();
+    }
+
+    void captureWatches(const uint8_t *rdram, const uint8_t *scratchpad)
+    {
+        watchValues.clear();
+        watchValues.reserve(watchAddresses.size());
+        for (uint32_t address : watchAddresses)
+        {
+            uint32_t physicalAddress = 0u;
+            uint32_t value = 0u;
+            if (scratchpad && ps2IsScratchpadAddress(address))
+            {
+                physicalAddress = ps2ScratchpadOffset(address);
+                if (physicalAddress <= PS2_SCRATCHPAD_SIZE - sizeof(value))
+                    std::memcpy(&value, scratchpad + physicalAddress, sizeof(value));
+            }
+            else if (rdram &&
+                ps2ResolveDirectRdramOffset(address, physicalAddress) &&
+                physicalAddress <= PS2_RAM_SIZE - sizeof(value))
+            {
+                std::memcpy(&value, rdram + physicalAddress, sizeof(value));
+            }
+            watchValues.push_back(value);
+        }
+    }
+
+    void finish()
+    {
+        if (!active || !output)
+            return;
+
+        auto writeSparseCounts = [&](const auto &counts)
+        {
+            bool first = true;
+            for (size_t index = 0u; index < counts.size(); ++index)
+            {
+                if (counts[index] == 0u)
+                    continue;
+                std::fprintf(output, "%s\"0x%02zx\":%" PRIu64,
+                             first ? "" : ",", index, counts[index]);
+                first = false;
+            }
+        };
+        auto writeSparsePcCounts = [&](const auto &counts)
+        {
+            bool first = true;
+            for (size_t index = 0u; index < counts.size(); ++index)
+            {
+                if (counts[index] == 0u)
+                    continue;
+                std::fprintf(output, "%s\"0x%04zx\":%" PRIu64,
+                             first ? "" : ",", index * 8u, counts[index]);
+                first = false;
+            }
+        };
+
+        std::fprintf(output,
+                     "{\"schema_version\":1,\"event\":\"vif1-segment\","
+                     "\"sequence\":%" PRIu64 ",\"chcr_write\":\"0x%08" PRIx32 "\","
+                     "\"mode\":%" PRIu32 ",\"tte\":%s,"
+                     "\"madr\":\"0x%08" PRIx32 "\",\"qwc\":%" PRIu32 ","
+                     "\"tadr\":\"0x%08" PRIx32 "\","
+                     "\"asr0\":\"0x%08" PRIx32 "\","
+                     "\"asr1\":\"0x%08" PRIx32 "\","
+                     "\"sadr\":\"0x%08" PRIx32 "\","
+                     "\"packet_hash_fnv1a64\":\"0x%016" PRIx64 "\","
+                     "\"packet_bytes\":%" PRIu64 ",\"tag_count\":%" PRIu32 ","
+                     "\"packet_truncated\":%s,\"packet_prefix\":\"",
+                     activeSequence, chcr, (chcr >> 2u) & 0x3u,
+                     (chcr & (1u << 6u)) != 0u ? "true" : "false",
+                     madr, qwc, tadr, asr0, asr1, sadr,
+                     packet.hash, packet.bytes, tagCount,
+                     packet.truncated ? "true" : "false");
+        writeHex(output, packet);
+        std::fprintf(output,
+                     "\",\"vif_hash_fnv1a64\":\"0x%016" PRIx64 "\","
+                     "\"vif_bytes\":%" PRIu64 ",\"vif_truncated\":%s,"
+                     "\"vif_prefix\":\"",
+                     vifInput.hash, vifInput.bytes,
+                     vifInput.truncated ? "true" : "false");
+        writeHex(output, vifInput);
+        std::fprintf(output,
+                     "\",\"path1_calls\":%" PRIu64 ","
+                     "\"path1_hash_fnv1a64\":\"0x%016" PRIx64 "\","
+                     "\"path1_bytes\":%" PRIu64 ",\"path1_truncated\":%s,"
+                     "\"path1_prefix\":\"",
+                     path1Calls, path1.hash, path1.bytes,
+                     path1.truncated ? "true" : "false");
+        writeHex(output, path1);
+        std::fprintf(output,
+                     "\",\"vu1_runs\":%" PRIu64 ",\"vu1_resumes\":%" PRIu64 ","
+                     "\"vu1_pairs\":%" PRIu64 ",\"vu1_xgkicks\":%" PRIu64 ","
+                     "\"vu1_ended_runs\":%" PRIu64 ","
+                     "\"vu1_cycle_limit_runs\":%" PRIu64 ","
+                     "\"vu1_last_pc\":\"0x%04" PRIx32 "\","
+                     "\"vu1_start_pcs\":[",
+                     vu1Runs, vu1Resumes, vu1Pairs, vu1Xgkicks,
+                     vu1EndedRuns, vu1CycleLimitRuns, vu1LastPc);
+        for (size_t i = 0u; i < vu1StartPcs.size(); ++i)
+        {
+            std::fprintf(output, "%s\"0x%04" PRIx32 "\"",
+                         i == 0u ? "" : ",", vu1StartPcs[i]);
+        }
+        std::fputs("],\"vu1_kick_addresses\":[", output);
+        for (size_t i = 0u; i < vu1KickAddresses.size(); ++i)
+        {
+            std::fprintf(output, "%s\"0x%03" PRIx32 "\"",
+                         i == 0u ? "" : ",", vu1KickAddresses[i]);
+        }
+        std::fputs("],\"vu1_run_prefix\":[", output);
+        for (size_t runIndex = 0u; runIndex < vu1RunPrefix.size(); ++runIndex)
+        {
+            const Vu1RunPrefix &run = vu1RunPrefix[runIndex];
+            std::fprintf(output,
+                         "%s{\"ordinal\":%" PRIu64 ","
+                         "\"start_pc\":\"0x%04" PRIx32 "\","
+                         "\"top\":\"0x%03" PRIx32 "\","
+                         "\"itop\":\"0x%03" PRIx32 "\","
+                         "\"final_pc\":\"0x%04" PRIx32 "\","
+                         "\"pairs\":%" PRIu64 ",\"ended\":%s,"
+                         "\"cycle_limit\":%s,"
+                         "\"micro_hash_fnv1a64\":\"0x%016" PRIx64 "\","
+                         "\"initial_vi\":[",
+                         runIndex == 0u ? "" : ",", run.ordinal,
+                         run.startPc, run.top, run.itop, run.finalPc,
+                         run.instructionCount,
+                         run.ended ? "true" : "false",
+                         run.hitCycleLimit ? "true" : "false",
+                         run.microHash);
+            for (size_t i = 0u; i < run.initialVi.size(); ++i)
+            {
+                std::fprintf(output, "%s\"0x%04" PRIx32 "\"",
+                             i == 0u ? "" : ",",
+                             static_cast<uint32_t>(run.initialVi[i]) & 0xFFFFu);
+            }
+            std::fputs("],\"final_vi\":[", output);
+            for (size_t i = 0u; i < run.finalVi.size(); ++i)
+            {
+                std::fprintf(output, "%s\"0x%04" PRIx32 "\"",
+                             i == 0u ? "" : ",",
+                             static_cast<uint32_t>(run.finalVi[i]) & 0xFFFFu);
+            }
+            std::fputs("],\"top_data\":\"", output);
+            for (uint8_t value : run.topData)
+                std::fprintf(output, "%02" PRIx8, value);
+            std::fputs("\",\"recent_vif\":[", output);
+            for (size_t commandIndex = 0u;
+                 commandIndex < run.recentVifCommands.size(); ++commandIndex)
+            {
+                const auto &command = run.recentVifCommands[commandIndex];
+                std::fprintf(output,
+                             "%s{\"command\":\"0x%08" PRIx32 "\","
+                             "\"cycle\":\"0x%04" PRIx32 "\","
+                             "\"mode\":%" PRIu32 ","
+                             "\"tops\":\"0x%03" PRIx32 "\","
+                             "\"following\":\"",
+                             commandIndex == 0u ? "" : ",",
+                             command.command, command.cycle,
+                             command.mode, command.tops);
+                for (size_t i = 0u; i < command.followingSize; ++i)
+                    std::fprintf(output, "%02" PRIx8, command.following[i]);
+                std::fputs("\"}", output);
+            }
+            std::fputs("],\"instructions\":[", output);
+            for (size_t i = 0u; i < run.pcs.size(); ++i)
+            {
+                std::fprintf(output,
+                             "%s{\"pc\":\"0x%04" PRIx32 "\","
+                             "\"lower\":\"0x%08" PRIx32 "\","
+                             "\"upper\":\"0x%08" PRIx32 "\"}",
+                             i == 0u ? "" : ",",
+                             run.pcs[i], run.lower[i], run.upper[i]);
+            }
+            std::fputs("]}", output);
+        }
+        std::fputs("],\"vu1_run_starts\":{", output);
+        writeSparsePcCounts(vu1RunStarts);
+        std::fputs("},\"vu1_ended_starts\":{", output);
+        writeSparsePcCounts(vu1EndedStarts);
+        std::fputs("},\"vu1_cycle_limit_starts\":{", output);
+        writeSparsePcCounts(vu1CycleLimitStarts);
+        std::fputs("},\"vu1_first_cycle_limit\":", output);
+        if (!vu1FirstCycleLimitCaptured)
+        {
+            std::fputs("null", output);
+        }
+        else
+        {
+            std::fprintf(output,
+                         "{\"start_pc\":\"0x%04" PRIx32 "\","
+                         "\"ordinal\":%" PRIu64 ","
+                         "\"top\":\"0x%03" PRIx32 "\","
+                         "\"itop\":\"0x%03" PRIx32 "\","
+                         "\"final_pc\":\"0x%04" PRIx32 "\","
+                         "\"micro_hash_fnv1a64\":\"0x%016" PRIx64 "\","
+                         "\"initial_vi\":[",
+                         vu1FirstCycleLimitStartPc, vu1FirstCycleLimitOrdinal,
+                         vu1FirstCycleLimitTop,
+                         vu1FirstCycleLimitItop, vu1FirstCycleLimitFinalPc,
+                         vu1FirstCycleLimitMicroHash);
+            for (size_t i = 0u; i < vu1FirstCycleLimitInitialVi.size(); ++i)
+            {
+                std::fprintf(output, "%s\"0x%04" PRIx32 "\"",
+                             i == 0u ? "" : ",",
+                             static_cast<uint32_t>(vu1FirstCycleLimitInitialVi[i]) & 0xFFFFu);
+            }
+            std::fputs("],\"final_vi\":[", output);
+            for (size_t i = 0u; i < vu1FirstCycleLimitVi.size(); ++i)
+            {
+                std::fprintf(output, "%s\"0x%04" PRIx32 "\"",
+                             i == 0u ? "" : ",",
+                             static_cast<uint32_t>(vu1FirstCycleLimitVi[i]) & 0xFFFFu);
+            }
+            std::fputs("],\"top_data\":\"", output);
+            for (uint8_t value : vu1FirstCycleLimitTopData)
+                std::fprintf(output, "%02" PRIx8, value);
+            std::fputs("\",\"tail\":[", output);
+            for (size_t i = 0u; i < vu1FirstCycleLimitPcs.size(); ++i)
+            {
+                std::fprintf(output,
+                             "%s{\"pc\":\"0x%04" PRIx32 "\","
+                             "\"lower\":\"0x%08" PRIx32 "\","
+                             "\"upper\":\"0x%08" PRIx32 "\"}",
+                             i == 0u ? "" : ",",
+                             vu1FirstCycleLimitPcs[i],
+                             vu1FirstCycleLimitLower[i],
+                             vu1FirstCycleLimitUpper[i]);
+            }
+            std::fputs("]}", output);
+        }
+        std::fputs(",\"vu1_lower_ops\":{", output);
+        writeSparseCounts(vu1LowerOps);
+        std::fputs("},\"vu1_lower_special_ops\":{", output);
+        writeSparseCounts(vu1LowerSpecialOps);
+        std::fputs("},\"vu1_upper_ops\":{", output);
+        writeSparseCounts(vu1UpperOps);
+        std::fputs("},\"vu1_upper_special_ops\":{", output);
+        writeSparseCounts(vu1UpperSpecialOps);
+        std::fputs("},\"watches\":{", output);
+        for (size_t i = 0; i < watchAddresses.size(); ++i)
+        {
+            std::fprintf(output, "%s\"0x%08" PRIx32 "\":\"0x%08" PRIx32 "\"",
+                         i == 0u ? "" : ",",
+                         watchAddresses[i],
+                         i < watchValues.size() ? watchValues[i] : 0u);
+        }
+        std::fputs("}}\n", output);
+        std::fflush(output);
+        active = false;
+    }
+};
+
+void ps2RecordGsDmaWriteTrace(uint32_t guestAddr,
+                              uint32_t size,
+                              uint32_t writerPc,
+                              uint32_t returnAddress)
+{
+    if (g_ps2GsDmaTraceState)
+    {
+        g_ps2GsDmaTraceState->recordEeWrite(
+            guestAddr, size, writerPc, returnAddress);
+    }
+}
+
 // Helpers for GS VRAM addressing (PSMCT32 path).
 static inline uint32_t gs_vram_offset(uint32_t basePage, uint32_t x, uint32_t y, uint32_t fbw)
 {
@@ -217,6 +1101,10 @@ PS2Memory::PS2Memory()
 
 PS2Memory::~PS2Memory()
 {
+    finishVif1DmaTrace();
+    delete m_gsDmaTrace;
+    m_gsDmaTrace = nullptr;
+
     if (m_rdram)
     {
         delete[] m_rdram;
@@ -262,6 +1150,571 @@ PS2Memory::~PS2Memory()
         delete[] iop_ram;
         iop_ram = nullptr;
     }
+}
+
+void PS2Memory::beginVif1DmaTrace(uint32_t chcr,
+                                  uint32_t madr,
+                                  uint32_t qwc,
+                                  uint32_t tadr,
+                                  uint32_t asr0,
+                                  uint32_t asr1,
+                                  uint32_t sadr)
+{
+    if (!m_gsDmaTrace)
+        m_gsDmaTrace = new Ps2GsDmaTraceState();
+
+    Ps2GsDmaTraceState &trace = *m_gsDmaTrace;
+    trace.configure();
+    trace.finish();
+    trace.flushEeWrites(trace.sequence);
+    if (!trace.enabled || trace.sequence >= trace.limit)
+    {
+        if (g_ps2GsDmaTraceState == &trace)
+            g_ps2GsDmaWriteTraceEnabled.store(false, std::memory_order_relaxed);
+        return;
+    }
+
+    trace.active = true;
+    trace.activeSequence = trace.sequence++;
+    trace.chcr = chcr;
+    trace.madr = madr;
+    trace.qwc = qwc;
+    trace.tadr = tadr;
+    trace.asr0 = asr0;
+    trace.asr1 = asr1;
+    trace.sadr = sadr;
+    trace.tagCount = 0u;
+    trace.path1Calls = 0u;
+    trace.vu1Runs = 0u;
+    trace.vu1Resumes = 0u;
+    trace.vu1Pairs = 0u;
+    trace.vu1Xgkicks = 0u;
+    trace.vu1EndedRuns = 0u;
+    trace.vu1CycleLimitRuns = 0u;
+    trace.vu1LastPc = 0u;
+    trace.vu1CurrentStartPc = 0u;
+    trace.vu1CurrentTop = 0u;
+    trace.vu1CurrentItop = 0u;
+    trace.vu1CurrentMicroHash = Ps2GsDmaTraceState::FNV_OFFSET_BASIS;
+    trace.vu1CurrentPath1Calls = 0u;
+    trace.vu1CurrentPath1 = {};
+    trace.vu1CurrentInitialVi.fill(0);
+    trace.vu1CurrentTopData.fill(0u);
+    trace.vu1RunStarts.fill(0u);
+    trace.vu1EndedStarts.fill(0u);
+    trace.vu1CycleLimitStarts.fill(0u);
+    trace.vu1LowerOps.fill(0u);
+    trace.vu1LowerSpecialOps.fill(0u);
+    trace.vu1UpperOps.fill(0u);
+    trace.vu1UpperSpecialOps.fill(0u);
+    trace.vu1StartPcs.clear();
+    trace.vu1KickAddresses.clear();
+    trace.vu1RunPrefix.clear();
+    trace.recentVifCommands.clear();
+    trace.vu1CurrentInstructionCount = 0u;
+    trace.vu1FirstCycleLimitCaptured = false;
+    trace.vu1FirstCycleLimitStartPc = 0u;
+    trace.vu1FirstCycleLimitTop = 0u;
+    trace.vu1FirstCycleLimitItop = 0u;
+    trace.vu1FirstCycleLimitFinalPc = 0u;
+    trace.vu1FirstCycleLimitOrdinal = 0u;
+    trace.vu1FirstCycleLimitMicroHash = Ps2GsDmaTraceState::FNV_OFFSET_BASIS;
+    trace.vu1FirstCycleLimitInitialVi.fill(0);
+    trace.vu1FirstCycleLimitVi.fill(0);
+    trace.vu1FirstCycleLimitTopData.fill(0u);
+    trace.vu1FirstCycleLimitPcs.clear();
+    trace.vu1FirstCycleLimitLower.clear();
+    trace.vu1FirstCycleLimitUpper.clear();
+    trace.packet = {};
+    trace.vifInput = {};
+    trace.path1 = {};
+    trace.captureWatches(m_rdram, m_scratchpad);
+}
+
+void PS2Memory::traceVif1DmaTag(const uint8_t *data)
+{
+    if (!m_gsDmaTrace || !m_gsDmaTrace->active)
+        return;
+    m_gsDmaTrace->packet.append(data, 16u);
+    ++m_gsDmaTrace->tagCount;
+}
+
+void PS2Memory::traceVif1DmaPayload(const uint8_t *data, uint32_t sizeBytes)
+{
+    if (!m_gsDmaTrace || !m_gsDmaTrace->active)
+        return;
+    m_gsDmaTrace->packet.append(data, sizeBytes);
+}
+
+void PS2Memory::traceVif1Input(const uint8_t *data, uint32_t sizeBytes)
+{
+    if (!m_gsDmaTrace || !m_gsDmaTrace->active)
+        return;
+    m_gsDmaTrace->vifInput.append(data, sizeBytes);
+    if (!m_gsDmaTrace->vif1InputDumpDirectory.empty())
+    {
+        char filename[96];
+        std::snprintf(filename, sizeof(filename),
+                      "/sequence-%04" PRIu64 ".bin",
+                      m_gsDmaTrace->activeSequence);
+        const std::string path =
+            m_gsDmaTrace->vif1InputDumpDirectory + filename;
+        if (std::FILE *dump = std::fopen(path.c_str(), "ab"))
+        {
+            std::fwrite(data, 1u, sizeBytes, dump);
+            std::fclose(dump);
+        }
+    }
+}
+
+void PS2Memory::traceVif1Command(uint32_t command, const uint8_t *followingData,
+                                 uint32_t followingBytes)
+{
+    if (!isVif1DmaTraceActive())
+        return;
+
+    Ps2GsDmaTraceState::Vu1RunPrefix::VifCommand record{};
+    record.command = command;
+    record.cycle = vif1_regs.cycle;
+    record.mode = vif1_regs.mode;
+    record.tops = vif1_regs.tops;
+    record.followingSize =
+        std::min<size_t>(record.following.size(), followingBytes);
+    if (followingData && record.followingSize != 0u)
+    {
+        std::copy_n(followingData, record.followingSize,
+                    record.following.begin());
+    }
+    if (m_gsDmaTrace->recentVifCommands.size() == 16u)
+        m_gsDmaTrace->recentVifCommands.erase(
+            m_gsDmaTrace->recentVifCommands.begin());
+    m_gsDmaTrace->recentVifCommands.push_back(record);
+}
+
+void PS2Memory::traceVif1NormalTransfer(uint32_t srcAddr, uint32_t qwc)
+{
+    if (!m_gsDmaTrace || !m_gsDmaTrace->active || qwc == 0u)
+        return;
+
+    const bool scratch = isScratchpad(srcAddr);
+    uint32_t src = 0u;
+    try
+    {
+        src = translateAddress(srcAddr);
+    }
+    catch (const std::exception &)
+    {
+        m_gsDmaTrace->packet.truncated = true;
+        m_gsDmaTrace->vifInput.truncated = true;
+        return;
+    }
+
+    const uint8_t *base = scratch ? m_scratchpad : m_rdram;
+    const uint32_t limit = scratch ? PS2_SCRATCHPAD_SIZE : PS2_RAM_SIZE;
+    const uint64_t requestedBytes = static_cast<uint64_t>(qwc) * 16ull;
+    uint64_t bytes = std::min(requestedBytes, Ps2GsDmaTraceState::MAX_BYTES);
+    if (bytes != requestedBytes)
+    {
+        m_gsDmaTrace->packet.truncated = true;
+        m_gsDmaTrace->vifInput.truncated = true;
+    }
+
+    while (bytes > 0u)
+    {
+        if (src >= limit)
+            src = 0u;
+        const uint32_t chunk = static_cast<uint32_t>(
+            std::min<uint64_t>(bytes, static_cast<uint64_t>(limit - src)));
+        if (chunk == 0u)
+            break;
+        m_gsDmaTrace->packet.append(base + src, chunk);
+        m_gsDmaTrace->vifInput.append(base + src, chunk);
+        src += chunk;
+        bytes -= chunk;
+    }
+}
+
+void PS2Memory::tracePath1Packet(const uint8_t *data, uint32_t sizeBytes)
+{
+    if (!m_gsDmaTrace || !m_gsDmaTrace->active)
+        return;
+    ++m_gsDmaTrace->path1Calls;
+    m_gsDmaTrace->path1.append(data, sizeBytes);
+    if (m_gsDmaTrace->vu1Runs != 0u)
+    {
+        ++m_gsDmaTrace->vu1CurrentPath1Calls;
+        m_gsDmaTrace->vu1CurrentPath1.append(data, sizeBytes);
+    }
+    if (!m_gsDmaTrace->path1DumpDirectory.empty() && data && sizeBytes != 0u)
+    {
+        char filename[64];
+        std::snprintf(filename, sizeof(filename),
+                      "/sequence-%04" PRIu64 ".bin",
+                      m_gsDmaTrace->activeSequence);
+        const std::string path = m_gsDmaTrace->path1DumpDirectory + filename;
+        if (std::FILE *dump = std::fopen(
+                path.c_str(), m_gsDmaTrace->path1Calls == 1u ? "wb" : "ab"))
+        {
+            std::fwrite(data, 1u, sizeBytes, dump);
+            std::fclose(dump);
+        }
+    }
+}
+
+bool PS2Memory::isVif1DmaTraceActive() const
+{
+    return m_gsDmaTrace && m_gsDmaTrace->active;
+}
+
+void PS2Memory::traceVu1Invocation(uint32_t startPc, uint32_t top, uint32_t itop, bool resume,
+                                   const VU1State &state)
+{
+    if (!isVif1DmaTraceActive())
+        return;
+
+    const uint64_t ordinal = m_gsDmaTrace->vu1Runs;
+    ++m_gsDmaTrace->vu1Runs;
+    if (resume)
+        ++m_gsDmaTrace->vu1Resumes;
+    m_gsDmaTrace->vu1CurrentStartPc = startPc & 0x3FFFu;
+    m_gsDmaTrace->vu1CurrentTop = top & 0x3FFu;
+    m_gsDmaTrace->vu1CurrentItop = itop & 0x3FFu;
+    m_gsDmaTrace->vu1CurrentInstructionCount = 0u;
+    m_gsDmaTrace->vu1CurrentPath1Calls = 0u;
+    m_gsDmaTrace->vu1CurrentPath1 = {};
+    m_gsDmaTrace->vu1CurrentInitialVi.fill(0);
+    std::copy_n(state.vi, m_gsDmaTrace->vu1CurrentInitialVi.size(),
+                m_gsDmaTrace->vu1CurrentInitialVi.begin());
+    m_gsDmaTrace->vu1CurrentTopData.fill(0u);
+    if (m_vu1Data)
+    {
+        const uint32_t start = (top & 0x3FFu) * 16u;
+        for (size_t i = 0u; i < m_gsDmaTrace->vu1CurrentTopData.size(); ++i)
+        {
+            m_gsDmaTrace->vu1CurrentTopData[i] =
+                m_vu1Data[(start + static_cast<uint32_t>(i)) % PS2_VU1_DATA_SIZE];
+        }
+    }
+    m_gsDmaTrace->vu1CurrentMicroHash = Ps2GsDmaTraceState::FNV_OFFSET_BASIS;
+    if (m_vu1Code)
+    {
+        for (size_t i = 0u; i < PS2_VU1_CODE_SIZE; ++i)
+        {
+            m_gsDmaTrace->vu1CurrentMicroHash ^= m_vu1Code[i];
+            m_gsDmaTrace->vu1CurrentMicroHash *= Ps2GsDmaTraceState::FNV_PRIME;
+        }
+    }
+
+    if (!resume &&
+        m_gsDmaTrace->activeSequence == m_gsDmaTrace->vu1StepSequence &&
+        ordinal == m_gsDmaTrace->vu1StepOrdinal &&
+        !m_gsDmaTrace->vu1DumpDirectory.empty() &&
+        m_vu1Data && m_vu1Code)
+    {
+        char filename[96];
+        auto writeFile = [&](const char *suffix, const void *data, size_t size)
+        {
+            std::snprintf(filename, sizeof(filename),
+                          "/sequence-%04" PRIu64 "-ordinal-%04" PRIu64 "-%s.bin",
+                          m_gsDmaTrace->activeSequence, ordinal, suffix);
+            const std::string path = m_gsDmaTrace->vu1DumpDirectory + filename;
+            if (std::FILE *dump = std::fopen(path.c_str(), "wb"))
+            {
+                std::fwrite(data, 1u, size, dump);
+                std::fclose(dump);
+            }
+            else
+            {
+                std::fprintf(stderr, "PS2 VU1 trace: cannot open '%s': %s\n",
+                             path.c_str(), std::strerror(errno));
+            }
+        };
+
+        writeFile("data", m_vu1Data, PS2_VU1_DATA_SIZE);
+        writeFile("micro", m_vu1Code, PS2_VU1_CODE_SIZE);
+
+        std::array<uint32_t, 159u> words{};
+        size_t cursor = 0u;
+        words[cursor++] = 0x31555652u;
+        words[cursor++] = 1u;
+        words[cursor++] = startPc & 0x3FFFu;
+        words[cursor++] = top & 0x3FFu;
+        words[cursor++] = itop & 0x3FFu;
+        std::memcpy(words.data() + cursor, state.vf, sizeof(state.vf));
+        cursor += 32u * 4u;
+        for (int32_t value : state.vi)
+            words[cursor++] = static_cast<uint32_t>(value);
+        std::memcpy(words.data() + cursor, state.acc, sizeof(state.acc));
+        cursor += 4u;
+        std::memcpy(&words[cursor++], &state.q, sizeof(state.q));
+        std::memcpy(&words[cursor++], &state.p, sizeof(state.p));
+        std::memcpy(&words[cursor++], &state.i, sizeof(state.i));
+        words[cursor++] = state.status;
+        words[cursor++] = state.mac;
+        words[cursor++] = state.clip;
+        writeFile("state", words.data(), words.size() * sizeof(words[0]));
+    }
+    ++m_gsDmaTrace->vu1RunStarts[(startPc & 0x3FFFu) / 8u];
+    if (m_gsDmaTrace->vu1StartPcs.size() < 64u)
+        m_gsDmaTrace->vu1StartPcs.push_back(startPc & 0x3FFFu);
+    const bool selectedRun =
+        m_gsDmaTrace->activeSequence == m_gsDmaTrace->vu1StepSequence &&
+        ordinal == m_gsDmaTrace->vu1StepOrdinal;
+    if (m_gsDmaTrace->vu1RunPrefix.size() < 8u ||
+        (selectedRun && ordinal >= 8u))
+    {
+        Ps2GsDmaTraceState::Vu1RunPrefix run{};
+        run.ordinal = m_gsDmaTrace->vu1Runs - 1u;
+        run.startPc = m_gsDmaTrace->vu1CurrentStartPc;
+        run.top = m_gsDmaTrace->vu1CurrentTop;
+        run.itop = m_gsDmaTrace->vu1CurrentItop;
+        run.microHash = m_gsDmaTrace->vu1CurrentMicroHash;
+        run.initialVi = m_gsDmaTrace->vu1CurrentInitialVi;
+        run.topData = m_gsDmaTrace->vu1CurrentTopData;
+        run.recentVifCommands = m_gsDmaTrace->recentVifCommands;
+        m_gsDmaTrace->vu1RunPrefix.push_back(run);
+    }
+
+    std::fprintf(m_gsDmaTrace->output,
+                 "{\"schema_version\":1,\"event\":\"vu1-start\","
+                 "\"sequence\":%" PRIu64 ",\"ordinal\":%" PRIu64 ","
+                 "\"start_pc\":\"0x%04" PRIx32 "\","
+                 "\"top\":\"0x%03" PRIx32 "\",\"itop\":\"0x%03" PRIx32 "\","
+                 "\"micro_hash_fnv1a64\":\"0x%016" PRIx64 "\","
+                 "\"vi\":[",
+                 m_gsDmaTrace->activeSequence, m_gsDmaTrace->vu1Runs - 1u,
+                 m_gsDmaTrace->vu1CurrentStartPc,
+                 m_gsDmaTrace->vu1CurrentTop,
+                 m_gsDmaTrace->vu1CurrentItop,
+                 m_gsDmaTrace->vu1CurrentMicroHash);
+    for (size_t index = 0u;
+         index < m_gsDmaTrace->vu1CurrentInitialVi.size(); ++index)
+    {
+        std::fprintf(m_gsDmaTrace->output, "%s\"0x%04" PRIx32 "\"",
+                     index == 0u ? "" : ",",
+                     static_cast<uint32_t>(
+                         m_gsDmaTrace->vu1CurrentInitialVi[index]) &
+                         0xFFFFu);
+    }
+    std::fputs("],\"top_data\":\"", m_gsDmaTrace->output);
+    for (uint8_t value : m_gsDmaTrace->vu1CurrentTopData)
+        std::fprintf(m_gsDmaTrace->output, "%02" PRIx8, value);
+    std::fputs("\"}\n", m_gsDmaTrace->output);
+}
+
+void PS2Memory::traceVu1Instruction(uint32_t pc, uint32_t lower, uint32_t upper,
+                                    const VU1State &state)
+{
+    if (!isVif1DmaTraceActive())
+        return;
+
+    Ps2GsDmaTraceState &trace = *m_gsDmaTrace;
+    if (trace.activeSequence == trace.vu1StepSequence &&
+        trace.vu1Runs != 0u &&
+        trace.vu1Runs - 1u == trace.vu1StepOrdinal &&
+        trace.vu1StepEvents < 4096u)
+    {
+        std::fprintf(trace.output,
+                     "{\"schema_version\":1,\"event\":\"vu1-step\","
+                     "\"sequence\":%" PRIu64 ",\"ordinal\":%" PRIu64 ","
+                     "\"index\":%" PRIu64 ",\"pc\":\"0x%04" PRIx32 "\","
+                     "\"lower\":\"0x%08" PRIx32 "\","
+                     "\"upper\":\"0x%08" PRIx32 "\",\"vi\":[",
+                     trace.activeSequence, trace.vu1Runs - 1u,
+                     trace.vu1StepEvents, pc & 0x3FFFu, lower, upper);
+        for (size_t index = 0u; index < std::size(state.vi); ++index)
+        {
+            std::fprintf(trace.output, "%s\"0x%04" PRIx32 "\"",
+                         index == 0u ? "" : ",",
+                         static_cast<uint32_t>(state.vi[index]) & 0xFFFFu);
+        }
+        std::fputs("],\"vf\":[", trace.output);
+        const float *vf = &state.vf[0][0];
+        for (size_t index = 0u; index < 32u * 4u; ++index)
+        {
+            uint32_t bits = 0u;
+            std::memcpy(&bits, &vf[index], sizeof(bits));
+            std::fprintf(trace.output, "%s\"0x%08" PRIx32 "\"",
+                         index == 0u ? "" : ",", bits);
+        }
+        std::fputs("],\"acc\":[", trace.output);
+        for (size_t index = 0u; index < std::size(state.acc); ++index)
+        {
+            uint32_t bits = 0u;
+            std::memcpy(&bits, &state.acc[index], sizeof(bits));
+            std::fprintf(trace.output, "%s\"0x%08" PRIx32 "\"",
+                         index == 0u ? "" : ",", bits);
+        }
+        uint32_t q = 0u;
+        uint32_t p = 0u;
+        uint32_t i = 0u;
+        std::memcpy(&q, &state.q, sizeof(q));
+        std::memcpy(&p, &state.p, sizeof(p));
+        std::memcpy(&i, &state.i, sizeof(i));
+        std::fprintf(trace.output,
+                     "],\"q\":\"0x%08" PRIx32 "\","
+                     "\"p\":\"0x%08" PRIx32 "\","
+                     "\"i\":\"0x%08" PRIx32 "\","
+                     "\"status\":\"0x%08" PRIx32 "\","
+                     "\"mac\":\"0x%08" PRIx32 "\","
+                     "\"clip\":\"0x%08" PRIx32 "\"}\n",
+                     q, p, i, state.status, state.mac, state.clip);
+        std::fflush(trace.output);
+        ++trace.vu1StepEvents;
+    }
+    ++trace.vu1Pairs;
+    trace.vu1LastPc = pc & 0x3FFFu;
+    const size_t instructionIndex =
+        trace.vu1CurrentInstructionCount % trace.vu1CurrentPcs.size();
+    trace.vu1CurrentPcs[instructionIndex] = pc & 0x3FFFu;
+    trace.vu1CurrentLower[instructionIndex] = lower;
+    trace.vu1CurrentUpper[instructionIndex] = upper;
+    ++trace.vu1CurrentInstructionCount;
+    if (!trace.vu1RunPrefix.empty() &&
+        trace.vu1RunPrefix.back().ordinal == trace.vu1Runs - 1u &&
+        trace.vu1RunPrefix.back().pcs.size() < 256u)
+    {
+        trace.vu1RunPrefix.back().pcs.push_back(pc & 0x3FFFu);
+        trace.vu1RunPrefix.back().lower.push_back(lower);
+        trace.vu1RunPrefix.back().upper.push_back(upper);
+    }
+
+    const uint8_t upperOp = static_cast<uint8_t>(upper & 0x3Fu);
+    ++trace.vu1UpperOps[upperOp];
+    if (upperOp >= 0x3Cu)
+    {
+        const uint8_t upperSpecial =
+            static_cast<uint8_t>((upper & 0x3u) | ((upper >> 4u) & 0x7Cu));
+        ++trace.vu1UpperSpecialOps[upperSpecial];
+    }
+
+    if ((upper & 0x80000000u) != 0u)
+        return;
+
+    const uint8_t lowerOp = static_cast<uint8_t>((lower >> 25u) & 0x7Fu);
+    ++trace.vu1LowerOps[lowerOp];
+    if (lowerOp == 0x40u)
+    {
+        const uint8_t function = static_cast<uint8_t>(lower & 0x3Fu);
+        if (function >= 0x3Cu)
+        {
+            const uint8_t lowerSpecial =
+                static_cast<uint8_t>((lower & 0x3u) | ((lower >> 4u) & 0x7Cu));
+            ++trace.vu1LowerSpecialOps[lowerSpecial];
+        }
+    }
+}
+
+void PS2Memory::traceVu1Xgkick(uint32_t sourceQword)
+{
+    if (!isVif1DmaTraceActive())
+        return;
+
+    ++m_gsDmaTrace->vu1Xgkicks;
+    if (m_gsDmaTrace->vu1KickAddresses.size() < 64u)
+        m_gsDmaTrace->vu1KickAddresses.push_back(sourceQword & 0x3FFu);
+}
+
+void PS2Memory::traceVu1InvocationEnd(uint32_t finalPc, bool ended, bool hitCycleLimit,
+                                      const int32_t *viRegisters, size_t viRegisterCount)
+{
+    if (!isVif1DmaTraceActive())
+        return;
+
+    m_gsDmaTrace->vu1LastPc = finalPc & 0x3FFFu;
+    if (!m_gsDmaTrace->vu1RunPrefix.empty() &&
+        m_gsDmaTrace->vu1RunPrefix.back().ordinal == m_gsDmaTrace->vu1Runs - 1u)
+    {
+        Ps2GsDmaTraceState::Vu1RunPrefix &run =
+            m_gsDmaTrace->vu1RunPrefix.back();
+        run.finalPc = finalPc & 0x3FFFu;
+        run.instructionCount = m_gsDmaTrace->vu1CurrentInstructionCount;
+        run.ended = ended;
+        run.hitCycleLimit = hitCycleLimit;
+        if (viRegisters)
+        {
+            const size_t count =
+                std::min(viRegisterCount, run.finalVi.size());
+            std::copy_n(viRegisters, count, run.finalVi.begin());
+        }
+    }
+    if (ended)
+    {
+        ++m_gsDmaTrace->vu1EndedRuns;
+        ++m_gsDmaTrace->vu1EndedStarts[m_gsDmaTrace->vu1CurrentStartPc / 8u];
+    }
+    if (hitCycleLimit)
+    {
+        ++m_gsDmaTrace->vu1CycleLimitRuns;
+        ++m_gsDmaTrace->vu1CycleLimitStarts[m_gsDmaTrace->vu1CurrentStartPc / 8u];
+
+        if (!m_gsDmaTrace->vu1FirstCycleLimitCaptured)
+        {
+            Ps2GsDmaTraceState &trace = *m_gsDmaTrace;
+            trace.vu1FirstCycleLimitCaptured = true;
+            trace.vu1FirstCycleLimitStartPc = trace.vu1CurrentStartPc;
+            trace.vu1FirstCycleLimitOrdinal = trace.vu1Runs - 1u;
+            trace.vu1FirstCycleLimitTop = trace.vu1CurrentTop;
+            trace.vu1FirstCycleLimitItop = trace.vu1CurrentItop;
+            trace.vu1FirstCycleLimitFinalPc = finalPc & 0x3FFFu;
+            trace.vu1FirstCycleLimitMicroHash = trace.vu1CurrentMicroHash;
+            trace.vu1FirstCycleLimitInitialVi = trace.vu1CurrentInitialVi;
+            trace.vu1FirstCycleLimitTopData = trace.vu1CurrentTopData;
+            if (viRegisters)
+            {
+                const size_t count =
+                    std::min(viRegisterCount, trace.vu1FirstCycleLimitVi.size());
+                std::copy_n(viRegisters, count, trace.vu1FirstCycleLimitVi.begin());
+            }
+
+            const size_t tailCount = std::min(
+                trace.vu1CurrentInstructionCount, trace.vu1CurrentPcs.size());
+            const size_t firstIndex =
+                (trace.vu1CurrentInstructionCount - tailCount) %
+                trace.vu1CurrentPcs.size();
+            for (size_t i = 0u; i < tailCount; ++i)
+            {
+                const size_t index = (firstIndex + i) % trace.vu1CurrentPcs.size();
+                trace.vu1FirstCycleLimitPcs.push_back(trace.vu1CurrentPcs[index]);
+                trace.vu1FirstCycleLimitLower.push_back(trace.vu1CurrentLower[index]);
+                trace.vu1FirstCycleLimitUpper.push_back(trace.vu1CurrentUpper[index]);
+            }
+        }
+    }
+
+    Ps2GsDmaTraceState &trace = *m_gsDmaTrace;
+    std::fprintf(trace.output,
+                 "{\"schema_version\":1,\"event\":\"vu1-end\","
+                 "\"sequence\":%" PRIu64 ",\"ordinal\":%" PRIu64 ","
+                 "\"final_pc\":\"0x%04" PRIx32 "\","
+                 "\"pairs\":%" PRIu64 ",\"ended\":%s,"
+                 "\"cycle_limit\":%s,\"vi\":[",
+                 trace.activeSequence, trace.vu1Runs - 1u,
+                 finalPc & 0x3FFFu, trace.vu1CurrentInstructionCount,
+                 ended ? "true" : "false",
+                 hitCycleLimit ? "true" : "false");
+    for (size_t index = 0u; index < 16u; ++index)
+    {
+        const uint32_t value =
+            viRegisters && index < viRegisterCount
+                ? static_cast<uint32_t>(viRegisters[index]) & 0xFFFFu
+                : 0u;
+        std::fprintf(trace.output, "%s\"0x%04" PRIx32 "\"",
+                     index == 0u ? "" : ",", value);
+    }
+    std::fprintf(trace.output,
+                 "],\"path1_calls\":%" PRIu64 ","
+                 "\"path1_bytes\":%" PRIu64 ","
+                 "\"path1_hash_fnv1a64\":\"0x%016" PRIx64 "\"}\n",
+                 trace.vu1CurrentPath1Calls,
+                 trace.vu1CurrentPath1.bytes,
+                 trace.vu1CurrentPath1.hash);
+}
+
+void PS2Memory::finishVif1DmaTrace()
+{
+    if (m_gsDmaTrace)
+        m_gsDmaTrace->finish();
 }
 
 bool PS2Memory::initialize(size_t ramSize)
@@ -1174,9 +2627,20 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
 
                 uint32_t chcr = value;
                 uint32_t mode = (chcr >> 2) & 0x3;
+                if (channelBase == 0x10009000u)
+                {
+                    beginVif1DmaTrace(
+                        chcr, madr, qwc,
+                        m_ioRegisters[channelBase + 0x30],
+                        m_ioRegisters[channelBase + 0x40],
+                        m_ioRegisters[channelBase + 0x50],
+                        m_ioRegisters[channelBase + 0x80]);
+                }
 
                 if (mode == 0 && qwc > 0)
                 {
+                    if (channelBase == 0x10009000u)
+                        traceVif1NormalTransfer(madr, qwc);
                     enqueueTransfer(madr, qwc);
                 }
                 else if (mode == 1)
@@ -1187,7 +2651,7 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
                     uint32_t asp = (chcr >> 4) & 0x3u;
                     const bool tieEnabled = (chcr & (1u << 7)) != 0u;
                     const bool tagTransferEnabled = (chcr & (1u << 6)) != 0u;
-                    const int kMaxChainTags = 4096;
+                    constexpr uint32_t kMaxChainTags = 65536u;
                     std::vector<uint8_t> chainBuf;
 
                     auto appendData = [&](uint32_t srcAddr, uint32_t qwCount)
@@ -1219,18 +2683,33 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
                                 chunk = maxSz2 - src;
                             if (chunk == 0)
                                 break;
+                            if (channelBase == 0x10009000u)
+                                traceVif1DmaPayload(base2 + src, chunk);
                             chainBuf.insert(chainBuf.end(), base2 + src, base2 + src + chunk);
                             bytes -= chunk;
                             src += chunk;
                         }
                     };
 
-                    int tagsProcessed = 0;
+                    uint32_t tagsProcessed = 0u;
                     uint32_t lastTagUpper = (chcr >> 16) & 0xFFFFu;
+                    bool chainComplete = false;
+                    bool chainFailed = false;
+                    const char *chainFailure = nullptr;
+                    std::unordered_set<DmaChainState, DmaChainStateHash> visitedStates;
+                    visitedStates.reserve(8192u);
 
                     while (tagsProcessed < kMaxChainTags)
                     {
                         const uint32_t currentTagAddr = tagAddr;
+                        const DmaChainState state{currentTagAddr, asr0, asr1, asp};
+                        if (!visitedStates.insert(state).second)
+                        {
+                            chainFailed = true;
+                            chainFailure = "repeated chain state";
+                            break;
+                        }
+
                         const bool tagInSPR = isScratchpad(tagAddr);
                         uint32_t physTag = 0;
                         try
@@ -1239,6 +2718,8 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
                         }
                         catch (...)
                         {
+                            chainFailed = true;
+                            chainFailure = "unmapped tag address";
                             break;
                         }
                         const uint8_t *tagBase;
@@ -1254,10 +2735,16 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
                             tagMax = PS2_RAM_SIZE;
                         }
                         if (physTag + 16 > tagMax)
+                        {
+                            chainFailed = true;
+                            chainFailure = "tag crosses memory boundary";
                             break;
+                        }
 
                         const uint8_t *tp = tagBase + physTag;
                         uint64_t tag = loadScalar<uint64_t>(tp, 0, 16, "dma chain tag", tagAddr);
+                        if (channelBase == 0x10009000u)
+                            traceVif1DmaTag(tp);
                         uint16_t tagQwc = static_cast<uint16_t>(tag & 0xFFFF);
                         uint32_t id = static_cast<uint32_t>((tag >> 28) & 0x7);
                         const bool irq = ((tag >> 31) & 0x1ull) != 0ull;
@@ -1333,6 +2820,28 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
                             break;
                         }
 
+                        if (channelBase == 0x10009000u &&
+                            m_gsDmaTrace && m_gsDmaTrace->active &&
+                            m_gsDmaTrace->output)
+                        {
+                            std::fprintf(
+                                m_gsDmaTrace->output,
+                                "{\"schema_version\":1,"
+                                "\"event\":\"vif1-chain-tag\","
+                                "\"sequence\":%" PRIu64 ","
+                                "\"index\":%" PRIu32 ","
+                                "\"stream_offset\":%zu,"
+                                "\"tag_address\":\"0x%08" PRIx32 "\","
+                                "\"qwc\":%" PRIu32 ",\"id\":%" PRIu32 ","
+                                "\"irq\":%s,"
+                                "\"target_address\":\"0x%08" PRIx32 "\","
+                                "\"data_address\":\"0x%08" PRIx32 "\"}\n",
+                                m_gsDmaTrace->activeSequence,
+                                tagsProcessed - 1u, chainBuf.size(),
+                                currentTagAddr, static_cast<uint32_t>(tagQwc),
+                                id, irq ? "true" : "false", addr, dataAddr);
+                        }
+
                         // VIF0/VIF1 consume the upper 64 bits of every source-chain
                         // tag before its QWC payload when CHCR.TTE is set. This
                         // includes reference tags whose payload lives elsewhere.
@@ -1346,7 +2855,16 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
                         if (irq && tieEnabled)
                             endChain = true;
                         if (endChain)
+                        {
+                            chainComplete = true;
                             break;
+                        }
+                    }
+
+                    if (!chainComplete && !chainFailed)
+                    {
+                        chainFailed = true;
+                        chainFailure = "tag safety limit reached";
                     }
 
                     m_ioRegisters[channelBase + 0x30] = tagAddr;
@@ -1356,8 +2874,18 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
                     chcr = (chcr & 0x0000FFFFu) | (lastTagUpper << 16);
                     m_ioRegisters[channelBase + 0x00] = chcr;
 
-                    if (!chainBuf.empty())
+                    if (chainFailed)
                     {
+                        std::fprintf(stderr,
+                                     "DMAC source chain did not terminate: channel=0x%08x "
+                                     "tadr=0x%08x tags=%u reason=%s\n",
+                                     channelBase, tagAddr, tagsProcessed,
+                                     chainFailure ? chainFailure : "unknown");
+                    }
+                    else if (chainComplete)
+                    {
+                        if (channelBase == 0x10009000u && !chainBuf.empty())
+                            traceVif1Input(chainBuf.data(), static_cast<uint32_t>(chainBuf.size()));
                         PendingTransfer pt;
                         pt.fromScratchpad = false;
                         pt.srcAddr = 0;
@@ -1392,6 +2920,8 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
                 {
                     processPendingTransfers();
                 }
+                if (channelBase == 0x10009000u)
+                    finishVif1DmaTrace();
             }
         }
         return true;
@@ -1875,6 +3405,9 @@ void PS2Memory::submitGifPacket(GifPathId pathId, const uint8_t *data, uint32_t 
 {
     if (!data || sizeBytes < 16)
         return;
+
+    if (pathId == GifPathId::Path1)
+        tracePath1Packet(data, sizeBytes);
 
     if (pathId == GifPathId::Path3)
     {
