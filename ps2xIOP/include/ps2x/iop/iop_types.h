@@ -7,10 +7,17 @@
 
 namespace ps2x::iop
 {
+    enum class GuestMemoryDomain : uint32_t
+    {
+        EeRdram = 0,
+        IopRam = 1,
+    };
+
     struct GuestBuffer
     {
         uint32_t address = 0;
         uint32_t size = 0;
+        GuestMemoryDomain domain = GuestMemoryDomain::EeRdram;
     };
 
     struct GameIdentity

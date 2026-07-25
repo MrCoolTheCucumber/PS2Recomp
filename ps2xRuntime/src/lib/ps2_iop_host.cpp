@@ -129,6 +129,37 @@ bool PS2IopHostAdapter::guestRange(uint32_t address, size_t size, uint8_t *&begi
     return true;
 }
 
+bool PS2IopHostAdapter::audioBufferRange(ps2x::iop::GuestBuffer buffer,
+                                         uint8_t *&begin) const
+{
+    if (buffer.domain == ps2x::iop::GuestMemoryDomain::EeRdram)
+    {
+        return guestRange(buffer.address, buffer.size, begin);
+    }
+
+    begin = nullptr;
+    if (buffer.domain != ps2x::iop::GuestMemoryDomain::IopRam)
+    {
+        return false;
+    }
+
+    uint8_t *const iopRam = m_runtime.memory().getIOPRAM();
+    if (!iopRam)
+    {
+        return false;
+    }
+
+    const uint32_t physicalAddress = buffer.address & 0x1FFFFFFFu;
+    if (physicalAddress > PS2_IOP_RAM_SIZE ||
+        buffer.size > PS2_IOP_RAM_SIZE - physicalAddress)
+    {
+        return false;
+    }
+
+    begin = iopRam + physicalAddress;
+    return true;
+}
+
 bool PS2IopHostAdapter::readGuest(uint32_t address, void *destination, size_t size) const
 {
     if (!destination && size != 0)
@@ -239,11 +270,11 @@ void PS2IopHostAdapter::audioCommand(uint32_t sid,
 {
     uint8_t *sendPointer = nullptr;
     uint8_t *receivePointer = nullptr;
-    if (send.address && !guestRange(send.address, send.size, sendPointer))
+    if (send.address && !audioBufferRange(send, sendPointer))
     {
         sendPointer = nullptr;
     }
-    if (receive.address && !guestRange(receive.address, receive.size, receivePointer))
+    if (receive.address && !audioBufferRange(receive, receivePointer))
     {
         receivePointer = nullptr;
     }

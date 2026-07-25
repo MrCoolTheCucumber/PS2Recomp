@@ -217,6 +217,7 @@ namespace ps2x::iop::detail
                         audioStreamData = {
                             responseResult,
                             streamingConfiguration[0],
+                            GuestMemoryDomain::IopRam,
                         };
                     }
                 }
@@ -267,7 +268,11 @@ namespace ps2x::iop::detail
                     if (supported)
                     {
                         notifyAudioBackend = true;
-                        audioStreamData = {m_streamingWorkArea, transfer[0]};
+                        audioStreamData = {
+                            m_streamingWorkArea,
+                            transfer[0],
+                            GuestMemoryDomain::IopRam,
+                        };
                     }
                     // The original server does not write a result for this RPC.
                     // Its shared response record therefore retains the result of

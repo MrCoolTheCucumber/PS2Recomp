@@ -39,7 +39,8 @@ namespace
     {
     public:
         explicit FakeIopHost(size_t memorySize = 0x10000u)
-            : memory(memorySize, 0u)
+            : memory(memorySize, 0u),
+              iopMemory(2u * 1024u * 1024u, 0u)
         {
         }
 
@@ -137,10 +138,13 @@ namespace
             lastAudioSend = send;
             lastAudioReceive = receive;
             lastAudioPayload.clear();
-            if (receive.address != 0u && contains(receive.address, receive.size))
+            const std::vector<uint8_t> &source =
+                receive.domain == GuestMemoryDomain::IopRam ? iopMemory : memory;
+            if (receive.address != 0u &&
+                contains(source, receive.address, receive.size))
             {
-                lastAudioPayload.assign(memory.begin() + receive.address,
-                                        memory.begin() + receive.address + receive.size);
+                lastAudioPayload.assign(source.begin() + receive.address,
+                                        source.begin() + receive.address + receive.size);
             }
             ++audioCalls;
         }
@@ -297,6 +301,7 @@ namespace
         }
 
         std::vector<uint8_t> memory;
+        std::vector<uint8_t> iopMemory;
         uint32_t nextHandle = 0x8000u;
         uint32_t nextGuestAddress = 0x4000u;
         std::vector<uint32_t> guestAllocations;
@@ -323,8 +328,16 @@ namespace
     private:
         bool contains(uint32_t address, size_t size) const
         {
-            const uint64_t end = static_cast<uint64_t>(address) + static_cast<uint64_t>(size);
-            return end <= memory.size();
+            return contains(memory, address, size);
+        }
+
+        static bool contains(const std::vector<uint8_t> &source,
+                             uint32_t address,
+                             size_t size)
+        {
+            const uint64_t end =
+                static_cast<uint64_t>(address) + static_cast<uint64_t>(size);
+            return end <= source.size();
         }
     };
 
@@ -832,11 +845,15 @@ void register_ps2_iop_tests()
                      "streaming open should identify the allocated DMA staging area");
             t.Equals(host.lastAudioReceive.size, 0x400u,
                      "streaming open should report the staging-area size");
+            t.IsTrue(host.lastAudioReceive.domain == GuestMemoryDomain::IopRam,
+                     "streaming open should identify the staging area as IOP RAM");
 
             std::array<uint8_t, 0x400> encoded{};
             for (size_t index = 0u; index < encoded.size(); ++index)
                 encoded[index] = static_cast<uint8_t>(index);
-            (void)host.writeGuest(workArea, encoded.data(), encoded.size());
+            std::memcpy(host.iopMemory.data() + workArea,
+                        encoded.data(),
+                        encoded.size());
 
             constexpr std::array<uint32_t, 2> kTransfer{0x400u, 0x1000u};
             (void)host.writeGuest(kSendAddress, kTransfer.data(), sizeof(kTransfer));
@@ -848,6 +865,8 @@ void register_ps2_iop_tests()
                      "the host should observe the streaming-submit command");
             t.Equals(host.lastAudioReceive.address, workArea,
                      "streaming submit should expose the DMA staging area");
+            t.IsTrue(host.lastAudioReceive.domain == GuestMemoryDomain::IopRam,
+                     "streaming submit should preserve the IOP RAM domain");
             t.Equals(host.lastAudioPayload.size(), encoded.size(),
                      "the host should receive the complete encoded chunk");
             t.Equals(host.lastAudioPayload.front(), encoded.front(),

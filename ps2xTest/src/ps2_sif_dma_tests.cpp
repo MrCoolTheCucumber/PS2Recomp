@@ -112,6 +112,19 @@ namespace
         return value;
     }
 
+    uint64_t fnv1a64(const uint8_t *data, size_t size)
+    {
+        constexpr uint64_t kOffsetBasis = 14695981039346656037ull;
+        constexpr uint64_t kPrime = 1099511628211ull;
+        uint64_t hash = kOffsetBasis;
+        for (size_t index = 0; index < size; ++index)
+        {
+            hash ^= data[index];
+            hash *= kPrime;
+        }
+        return hash;
+    }
+
     uint32_t g_dmacHandlerWriteAddr = 0u;
     uint32_t g_dmacHandlerValue = 0u;
     uint32_t g_dmacHandlerLastCause = 0u;
@@ -179,6 +192,118 @@ void register_ps2_sif_dma_tests()
             setRegU32(env.ctx, 4, static_cast<uint32_t>(dmaId));
             ps2_stubs::sceSifDmaStat(env.rdram.data(), &env.ctx, &env.runtime);
             t.IsTrue(getRegS32(env.ctx, 2) < 0, "sceSifDmaStat should be negative when transfer is complete");
+        });
+
+        tc.Run("Sony 989snd decodes streaming DMA from IOP RAM rather than the aliased EE address", [](TestCase &t)
+        {
+            TestEnv env;
+            configureProfile(env, "slus_201.84");
+
+            constexpr uint32_t kSid = 0x00123456u;
+            constexpr uint32_t kClientAddr = 0x00024000u;
+            constexpr uint32_t kSendAddr = 0x00024100u;
+            constexpr uint32_t kRecvAddr = 0x00024200u;
+            constexpr uint32_t kDescAddr = 0x00024300u;
+            constexpr uint32_t kDmaSourceAddr = 0x00024400u;
+            constexpr uint32_t kTransferBytes = 0x400u;
+
+            ps2_syscalls::SifInitRpc(env.rdram.data(), &env.ctx, &env.runtime);
+            setRegU32(env.ctx, 4, kClientAddr);
+            setRegU32(env.ctx, 5, kSid);
+            setRegU32(env.ctx, 6, 0u);
+            ps2_syscalls::SifBindRpc(env.rdram.data(), &env.ctx, &env.runtime);
+            t.Equals(getRegS32(env.ctx, 2), KE_OK,
+                     "SifBindRpc should bind the Sony 989snd server");
+
+            const auto callRpc = [&](uint32_t function, uint32_t sendSize)
+            {
+                setRegU32(env.ctx, 4, kClientAddr);
+                setRegU32(env.ctx, 5, function);
+                setRegU32(env.ctx, 6, 0u);
+                setRegU32(env.ctx, 7, sendSize == 0u ? 0u : kSendAddr);
+                setRegU32(env.ctx, 8, sendSize);
+                setRegU32(env.ctx, 9, kRecvAddr);
+                setRegU32(env.ctx, 10, 12u);
+                setRegU32(env.ctx, 11, 0u);
+                ps2_syscalls::SifCallRpc(env.rdram.data(), &env.ctx, &env.runtime);
+            };
+
+            constexpr std::array<uint32_t, 6> kOpen{
+                kTransferBytes,
+                0x1000u,
+                kTransferBytes,
+                0u,
+                5u,
+                3u,
+            };
+            std::memcpy(env.rdram.data() + kSendAddr, kOpen.data(), sizeof(kOpen));
+            callRpc(0x3Bu, sizeof(kOpen));
+            t.Equals(getRegS32(env.ctx, 2), KE_OK,
+                     "streaming-open RPC should succeed");
+            const uint32_t workArea = readGuestU32(env.rdram.data(), kRecvAddr + 4u);
+            t.IsTrue(workArea != 0u && workArea + kTransferBytes <= PS2_IOP_RAM_SIZE,
+                     "streaming-open RPC should allocate an address inside IOP RAM");
+            t.IsTrue(env.runtime.audioBackend().streamDebugSnapshot().opened,
+                     "the host stream should receive a valid IOP work-area pointer");
+
+            std::array<uint8_t, kTransferBytes> encoded{};
+            for (size_t block = 0u; block < encoded.size(); block += 16u)
+            {
+                encoded[block] = 0x0Cu;
+                encoded[block + 1u] = 0u;
+                for (size_t byte = 2u; byte < 16u; ++byte)
+                    encoded[block + byte] = static_cast<uint8_t>(0x10u + (block / 16u + byte) % 0x70u);
+            }
+
+            std::memset(env.rdram.data() + workArea, 0xE7, encoded.size());
+            std::memcpy(env.rdram.data() + kDmaSourceAddr,
+                        encoded.data(),
+                        encoded.size());
+            std::memset(env.runtime.memory().getIOPRAM() + workArea,
+                        0,
+                        encoded.size());
+
+            const Ps2SifDmaTransfer descriptor{
+                kDmaSourceAddr,
+                workArea,
+                static_cast<int32_t>(encoded.size()),
+                0,
+            };
+            std::memcpy(env.rdram.data() + kDescAddr,
+                        &descriptor,
+                        sizeof(descriptor));
+            setRegU32(env.ctx, 4, kDescAddr);
+            setRegU32(env.ctx, 5, 1u);
+            ps2_stubs::sceSifSetDma(env.rdram.data(), &env.ctx, &env.runtime);
+            t.IsTrue(getRegS32(env.ctx, 2) > 0,
+                     "streaming payload DMA should succeed");
+            t.IsTrue(std::memcmp(env.runtime.memory().getIOPRAM() + workArea,
+                                 encoded.data(),
+                                 encoded.size()) == 0,
+                     "streaming payload should reside in IOP RAM");
+            t.Equals(env.rdram[workArea], static_cast<uint8_t>(0xE7),
+                     "the same EE virtual address should remain unrelated");
+
+            constexpr std::array<uint32_t, 2> kSubmit{
+                kTransferBytes,
+                0u,
+            };
+            std::memcpy(env.rdram.data() + kSendAddr,
+                        kSubmit.data(),
+                        sizeof(kSubmit));
+            callRpc(0x5Au, sizeof(kSubmit));
+            t.Equals(getRegS32(env.ctx, 2), KE_OK,
+                     "streaming-submit RPC should succeed");
+
+            const PS2AudioStreamDebugSnapshot snapshot =
+                env.runtime.audioBackend().streamDebugSnapshot();
+            t.Equals(snapshot.submissionCount, uint64_t{1u},
+                     "the audio backend should decode one submitted chunk");
+            t.Equals(snapshot.submittedBytes, uint64_t{kTransferBytes},
+                     "the audio backend should decode the complete DMA chunk");
+            t.Equals(snapshot.lastSubmissionHash,
+                     fnv1a64(encoded.data(), encoded.size()),
+                     "the decoded source must be the IOP DMA payload, not aliased EE bytes");
         });
 
         tc.Run("isceSifSetDma and isceSifSetDChain alias the SIF DMA helpers", [](TestCase &t)

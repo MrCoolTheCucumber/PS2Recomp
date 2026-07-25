@@ -86,6 +86,7 @@ private:
     friend class CallScope;
 
     bool guestRange(uint32_t address, size_t size, uint8_t *&begin) const;
+    bool audioBufferRange(ps2x::iop::GuestBuffer buffer, uint8_t *&begin) const;
 
     PS2Runtime &m_runtime;
     std::recursive_mutex m_callMutex;
