@@ -198,13 +198,25 @@ VU1Interpreter::DecodedInstructionPair VU1Interpreter::getDecodedInstructionPair
         return decodeInstructionPair(vuCode, pc);
     }
 
-    const bool trackedVu1Code = vuCode == memory->getVU1Code();
-    if (!trackedVu1Code)
+    if (!memory)
     {
         return decodeInstructionPair(vuCode, pc);
     }
 
-    const uint64_t generation = memory->getVU1CodeGeneration();
+    uint64_t generation = 0u;
+    if (vuCode == memory->getVU0Code())
+    {
+        generation = memory->getVU0CodeGeneration();
+    }
+    else if (vuCode == memory->getVU1Code())
+    {
+        generation = memory->getVU1CodeGeneration();
+    }
+    else
+    {
+        return decodeInstructionPair(vuCode, pc);
+    }
+
     const bool rebuild =
         !m_decodedCodeCacheValid ||
         m_cachedVuCode != vuCode ||

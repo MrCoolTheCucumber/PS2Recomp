@@ -3085,6 +3085,99 @@ void register_ps2_runtime_expansion_tests()
             t.Equals(static_cast<uint32_t>(ctx.vi[0]), 0u, "VU0 VI0 should remain zero");
         });
 
+        tc.Run("direct VU0 code writes invalidate cached decode", [](TestCase &t)
+        {
+            PS2Runtime runtime;
+            t.IsTrue(runtime.memory().initialize(), "PS2Memory initialize should succeed");
+            t.IsTrue(runtime.syncCoreSubsystems(), "runtime core subsystems should bind");
+
+            constexpr uint32_t kVuUpperNop = 0x000002FFu;
+            constexpr uint32_t kVuUpperEnd = 0x400002FFu;
+            const auto pair = [](uint32_t lower, uint32_t upper)
+            {
+                return static_cast<uint64_t>(lower) |
+                       (static_cast<uint64_t>(upper) << 32u);
+            };
+            const auto writeProgram = [&](uint16_t value)
+            {
+                runtime.memory().write64(
+                    PS2_VU0_CODE_BASE,
+                    pair(makeVuIaddiu(1u, 0u, value), kVuUpperNop));
+                runtime.memory().write64(
+                    PS2_VU0_CODE_BASE + 8u,
+                    pair(0u, kVuUpperEnd));
+                runtime.memory().write64(
+                    PS2_VU0_CODE_BASE + 16u,
+                    pair(0u, kVuUpperNop));
+            };
+
+            writeProgram(1u);
+            R5900Context first{};
+            runtime.executeVU0Microprogram(
+                runtime.memory().getRDRAM(), &first, 0u);
+            t.Equals(static_cast<uint32_t>(first.vi[1]), 1u,
+                     "first execution should use the initial VU0 program");
+
+            writeProgram(2u);
+            R5900Context second{};
+            runtime.executeVU0Microprogram(
+                runtime.memory().getRDRAM(), &second, 0u);
+            t.Equals(static_cast<uint32_t>(second.vi[1]), 2u,
+                     "second execution should rebuild after an EE code write");
+        });
+
+        tc.Run("VIF0 MPG invalidates cached VU0 decode", [](TestCase &t)
+        {
+            PS2Runtime runtime;
+            t.IsTrue(runtime.memory().initialize(), "PS2Memory initialize should succeed");
+            t.IsTrue(runtime.syncCoreSubsystems(), "runtime core subsystems should bind");
+
+            constexpr uint32_t kVuUpperNop = 0x000002FFu;
+            constexpr uint32_t kVuUpperEnd = 0x400002FFu;
+            const auto pair = [](uint32_t lower, uint32_t upper)
+            {
+                return static_cast<uint64_t>(lower) |
+                       (static_cast<uint64_t>(upper) << 32u);
+            };
+            const auto uploadProgram = [&](uint16_t value)
+            {
+                std::vector<uint8_t> packet(sizeof(uint32_t) + 3u * sizeof(uint64_t));
+                const uint32_t command = makeVifCmd(0x4Au, 3u, 0u);
+                const uint64_t instructions[3] = {
+                    pair(makeVuIaddiu(1u, 0u, value), kVuUpperNop),
+                    pair(0u, kVuUpperEnd),
+                    pair(0u, kVuUpperNop),
+                };
+                std::memcpy(packet.data(), &command, sizeof(command));
+                std::memcpy(
+                    packet.data() + sizeof(command),
+                    instructions, sizeof(instructions));
+                runtime.memory().processVIF0Data(
+                    packet.data(), static_cast<uint32_t>(packet.size()));
+            };
+
+            const uint64_t initialGeneration =
+                runtime.memory().getVU0CodeGeneration();
+            uploadProgram(3u);
+            t.Equals(
+                runtime.memory().getVU0CodeGeneration(),
+                initialGeneration + 1u,
+                "one successful MPG command should publish one generation");
+
+            R5900Context first{};
+            runtime.executeVU0Microprogram(
+                runtime.memory().getRDRAM(), &first, 0u);
+            t.Equals(static_cast<uint32_t>(first.vi[1]), 3u,
+                     "first execution should use the initial MPG upload");
+
+            uploadProgram(4u);
+            R5900Context second{};
+            runtime.executeVU0Microprogram(
+                runtime.memory().getRDRAM(), &second, 0u);
+            t.Equals(static_cast<uint32_t>(second.vi[1]), 4u,
+                     "second execution should rebuild after an MPG upload");
+        });
+
         tc.Run("VU0 microprogram may complete after more than 4096 instruction pairs", [](TestCase &t)
         {
             PS2Runtime runtime;

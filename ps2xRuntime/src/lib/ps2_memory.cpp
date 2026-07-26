@@ -1801,6 +1801,7 @@ bool PS2Memory::initialize(size_t ramSize)
         m_vu0Data = new uint8_t[PS2_VU0_DATA_SIZE];
         std::memset(m_vu0Code, 0, PS2_VU0_CODE_SIZE);
         std::memset(m_vu0Data, 0, PS2_VU0_DATA_SIZE);
+        markVU0CodeModified();
 
         m_vu1Code = new uint8_t[PS2_VU1_CODE_SIZE];
         m_vu1Data = new uint8_t[PS2_VU1_DATA_SIZE];
@@ -2223,8 +2224,7 @@ void PS2Memory::write8(uint32_t address, uint8_t value, uint32_t writerPc)
         {
             (void)vuLimit;
             vuMem[vuOffset] = value;
-            if (vuMem == m_vu1Code)
-                markVU1CodeModified();
+            markVUCodeModified(vuMem);
             return;
         }
     }
@@ -2265,8 +2265,7 @@ void PS2Memory::write16(uint32_t address, uint16_t value, uint32_t writerPc)
         if (uint8_t *vuMem = mapVuMemory(physAddr, sizeof(uint16_t), vuOffset, vuLimit))
         {
             storeScalar<uint16_t>(vuMem, vuOffset, vuLimit, value, "write16 vu", address);
-            if (vuMem == m_vu1Code)
-                markVU1CodeModified();
+            markVUCodeModified(vuMem);
             return;
         }
     }
@@ -2327,8 +2326,7 @@ void PS2Memory::write32(uint32_t address, uint32_t value, uint32_t writerPc)
         if (uint8_t *vuMem = mapVuMemory(physAddr, sizeof(uint32_t), vuOffset, vuLimit))
         {
             storeScalar<uint32_t>(vuMem, vuOffset, vuLimit, value, "write32 vu", address);
-            if (vuMem == m_vu1Code)
-                markVU1CodeModified();
+            markVUCodeModified(vuMem);
             return;
         }
     }
@@ -2380,8 +2378,7 @@ void PS2Memory::write64(uint32_t address, uint64_t value, uint32_t writerPc)
         if (uint8_t *vuMem = mapVuMemory(physAddr, sizeof(uint64_t), vuOffset, vuLimit))
         {
             storeScalar<uint64_t>(vuMem, vuOffset, vuLimit, value, "write64 vu", address);
-            if (vuMem == m_vu1Code)
-                markVU1CodeModified();
+            markVUCodeModified(vuMem);
             return;
         }
     }
@@ -2421,8 +2418,7 @@ void PS2Memory::write128(uint32_t address, __m128i value, uint32_t writerPc)
         {
             inRange(vuOffset, sizeof(__m128i), vuLimit, "write128 vu", address);
             _mm_storeu_si128(reinterpret_cast<__m128i *>(vuMem + vuOffset), value);
-            if (vuMem == m_vu1Code)
-                markVU1CodeModified();
+            markVUCodeModified(vuMem);
             return;
         }
     }

@@ -292,6 +292,51 @@ void register_ps2_memory_tests()
             t.Equals(words[3], 0x44556677u, "VU0 data lane 3 should match");
         });
 
+        tc.Run("VU code generations track code writes and ignore data writes", [](TestCase &t)
+        {
+            PS2Memory mem;
+            t.IsTrue(mem.initialize(), "PS2Memory initialize should succeed");
+
+            uint64_t vu0Generation = mem.getVU0CodeGeneration();
+            uint64_t vu1Generation = mem.getVU1CodeGeneration();
+            t.IsTrue(vu0Generation != 0u, "VU0 initialization should publish a code generation");
+            t.IsTrue(vu1Generation != 0u, "VU1 initialization should publish a code generation");
+
+            mem.write8(PS2_VU0_CODE_BASE, 0x11u);
+            t.Equals(mem.getVU0CodeGeneration(), ++vu0Generation,
+                     "an 8-bit VU0 code write should invalidate decoded code");
+
+            mem.write16(PS2_VU0_CODE_BASE + 2u, 0x2233u);
+            t.Equals(mem.getVU0CodeGeneration(), ++vu0Generation,
+                     "a 16-bit VU0 code write should invalidate decoded code");
+
+            mem.write32(PS2_VU0_CODE_BASE + 4u, 0x44556677u);
+            t.Equals(mem.getVU0CodeGeneration(), ++vu0Generation,
+                     "a 32-bit VU0 code write should invalidate decoded code");
+
+            mem.write64(PS2_VU0_CODE_BASE + 8u, 0x8899AABBCCDDEEFFull);
+            t.Equals(mem.getVU0CodeGeneration(), ++vu0Generation,
+                     "a 64-bit VU0 code write should invalidate decoded code");
+
+            mem.write128(
+                PS2_VU0_CODE_BASE + 16u,
+                _mm_set_epi32(4, 3, 2, 1));
+            t.Equals(mem.getVU0CodeGeneration(), ++vu0Generation,
+                     "a 128-bit VU0 code write should invalidate decoded code");
+
+            mem.write32(PS2_VU0_DATA_BASE, 0x12345678u);
+            t.Equals(mem.getVU0CodeGeneration(), vu0Generation,
+                     "VU0 data writes should retain the decoded-code generation");
+            t.Equals(mem.getVU1CodeGeneration(), vu1Generation,
+                     "VU0 writes should not invalidate VU1 decoded code");
+
+            mem.write32(PS2_VU1_CODE_BASE, 0x89ABCDEFu);
+            t.Equals(mem.getVU0CodeGeneration(), vu0Generation,
+                     "VU1 code writes should not invalidate VU0 decoded code");
+            t.Equals(mem.getVU1CodeGeneration(), ++vu1Generation,
+                     "VU1 code writes should retain their existing invalidation behavior");
+        });
+
         tc.Run("fast memory helpers wrap safely at RAM boundary", [](TestCase &t)
         {
             std::vector<uint8_t> rdram(PS2_RAM_SIZE, 0u);
