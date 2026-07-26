@@ -698,6 +698,7 @@ private:
     mutable std::condition_variable m_guestExecutionHandoffCv;
     std::atomic<uint64_t> m_guestExecutionHandoffEpoch{0u};
     std::atomic<uint64_t> m_guestExecutionHandoffTimeouts{0u};
+    std::atomic<uint64_t> m_guestExecutionPreemptionEpoch{0u};
     mutable std::mutex m_guestHeapMutex;
     mutable std::mutex m_asyncCallbackStackMutex;
     std::vector<GuestHeapBlock> m_guestHeapBlocks;

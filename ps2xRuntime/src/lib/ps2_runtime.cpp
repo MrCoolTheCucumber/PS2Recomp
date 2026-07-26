@@ -1729,9 +1729,23 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
 
     RecompiledFunction targetFn = lookupFunction(targetPc);
     const uint32_t entryPc = ctx->pc;
+    const uint64_t preemptionEpoch =
+        m_guestExecutionPreemptionEpoch.load(std::memory_order_acquire);
     targetFn(rdram, ctx, this);
 
     if (isStopRequested() || ctx->pc == 0u)
+    {
+        return false;
+    }
+
+    // A generated back edge returns to the outer dispatcher when the runtime
+    // requests cooperative preemption.  In a nested call, the resume PC can
+    // legitimately equal the callee entry, which is otherwise also how an
+    // empty implicit-return handler is represented.  Preserve the resume PC
+    // instead of converting it to the call fallthrough when any nested target
+    // observed a preemption request.
+    if (m_guestExecutionPreemptionEpoch.load(std::memory_order_acquire) !=
+        preemptionEpoch)
     {
         return false;
     }
@@ -3266,6 +3280,7 @@ bool PS2Runtime::shouldPreemptGuestExecution()
         // ownership here before asking generated code to return to its dispatcher.
         yieldGuestExecutionAfterWake();
     }
+    m_guestExecutionPreemptionEpoch.fetch_add(1u, std::memory_order_release);
     return true;
 }
 

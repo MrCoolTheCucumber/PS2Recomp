@@ -262,6 +262,27 @@ namespace
         }
     }
 
+    void testGuestBranchPreemptionHandler(uint8_t *,
+                                          R5900Context *ctx,
+                                          PS2Runtime *runtime)
+    {
+        if (!ctx || !runtime)
+        {
+            return;
+        }
+
+        uint32_t probes = 0u;
+        while (probes < 256u)
+        {
+            ++probes;
+            if (runtime->shouldPreemptGuestExecution())
+            {
+                setRegU32(*ctx, 2, probes);
+                return;
+            }
+        }
+    }
+
     constexpr uint32_t kExceptionUnwindEntry = 0x160000u;
     constexpr uint32_t kExceptionUnwindNested = 0x160100u;
     constexpr uint32_t kExceptionUnwindVector = 0x00000180u;
@@ -1298,6 +1319,31 @@ void register_ps2_runtime_expansion_tests()
                       "call-like dispatch should stop caller flow when callee transfers elsewhere");
             t.Equals(ctx.pc, 0x33330000u,
                      "callee transfer PC should be preserved");
+        });
+
+        tc.Run("dispatchGuestBranch preserves a preempted callee resume PC", [](TestCase &t)
+        {
+            PS2Runtime runtime;
+            runtime.registerFunction(0x3150u, &testGuestBranchPreemptionHandler);
+
+            R5900Context ctx{};
+            ctx.pc = 0x2000u;
+
+            const bool returnedToFallthrough = runtime.dispatchGuestBranch(
+                nullptr,
+                &ctx,
+                0x3150u,
+                0x2000u,
+                0x2008u,
+                PS2Runtime::GuestBranchKind::DirectCall,
+                "test-preempted-call");
+
+            t.IsFalse(returnedToFallthrough,
+                      "a nested preemption should unwind the generated caller");
+            t.Equals(ctx.pc, 0x3150u,
+                     "the preempted callee entry must remain the dispatcher resume PC");
+            t.IsTrue(::getRegU32(&ctx, 2) != 0u,
+                     "the callee should have observed a cooperative preemption request");
         });
 
         tc.Run("dispatchGuestBranch rejects missing exact targets", [](TestCase &t)
