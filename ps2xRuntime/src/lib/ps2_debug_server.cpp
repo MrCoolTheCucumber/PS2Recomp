@@ -1012,6 +1012,8 @@ struct PS2DebugServer::Impl
     Value eeRegisters(Allocator &allocator)
     {
         const R5900Context context = runtime.debugCpuSnapshot();
+        const PS2Runtime::DebugEeTiming timing =
+            runtime.debugEeTimingSnapshot();
         static constexpr std::array<const char *, 32> names = {
             "zero", "at", "v0", "v1", "a0", "a1", "a2", "a3",
             "t0", "t1", "t2", "t3", "t4", "t5", "t6", "t7",
@@ -1021,7 +1023,18 @@ struct PS2DebugServer::Impl
         Value result(rapidjson::kObjectType);
         addString(result, "cpu", "ee", allocator);
         addString(result, "pc", addressString(context.pc), allocator);
-        result.AddMember("cycles", context.ee_cycle_ticks >> 3u, allocator);
+        result.AddMember("cycles", timing.currentCycle, allocator);
+        result.AddMember(
+            "cycle_ticks", timing.currentTick, allocator);
+        result.AddMember(
+            "local_block_cycle_ticks",
+            timing.localBlockTicks, allocator);
+        result.AddMember(
+            "local_block_active",
+            timing.localBlockActive, allocator);
+        result.AddMember(
+            "timing_context_bound",
+            timing.contextBound, allocator);
         result.AddMember("instructions", context.insn_count, allocator);
 
         Value categories(rapidjson::kArrayType);

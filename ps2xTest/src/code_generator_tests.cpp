@@ -1615,14 +1615,14 @@ void register_code_generator_tests()
             t.Equals(
                 countOccurrences(
                     generated, "ctx->finishEeBasicBlock();"),
-                static_cast<size_t>(1u),
-                "the completed branch block should discard fractional issue time");
+                static_cast<size_t>(0u),
+                "the context should not publish time independently of the runtime");
             t.Equals(
                 countOccurrences(
                     generated,
                     "runtime->advanceVU0AtEeBlockBoundary(rdram, ctx);"),
                 static_cast<size_t>(1u),
-                "the completed branch block should advance VU0 by exact EE time");
+                "one runtime boundary helper should commit time and advance VU0");
         });
 
         tc.Run("VU0 macro writes preserve the hardwired zero registers", [](TestCase &t) {

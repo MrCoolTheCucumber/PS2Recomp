@@ -709,7 +709,8 @@ namespace ps2_stubs
             bool reschedulePending = false;
             uint64_t handoffBaseline = 0u;
             {
-                PS2Runtime::GuestExecutionScope guestExecution(runtime);
+                PS2Runtime::GuestExecutionScope guestExecution(
+                    runtime, &callbackCtx);
                 PS2Runtime::DeferredGuestYieldScope deferYield(reschedulePending);
 
                 while (callbackCtx.pc != 0u && !runtime->isStopRequested() && steps < 1024u)

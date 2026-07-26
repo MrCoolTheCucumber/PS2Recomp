@@ -27,6 +27,7 @@
 #include <optional>
 
 #include "ps2_log.h"
+#include "runtime/ee_timing.h"
 #include "runtime/ps2_address.h"
 #include "runtime/ps2_gif_arbiter.h"
 #include "runtime/ps2_memory.h"
@@ -82,9 +83,8 @@ struct alignas(16) R5900Context
     __m128i r[32]; // Main registers
 
     // Control registers
-    uint32_t pc;             // Program counter
-    uint64_t insn_count;     // Retired instruction counter
-    uint64_t ee_cycle_ticks; // Three-bit fixed-point EE cycles (8 ticks/cycle)
+    uint32_t pc;         // Program counter
+    uint64_t insn_count; // Retired instruction counter
     uint32_t ee_block_cycle_ticks;
     bool ee_block_cycle_active;
     uint64_t hi, lo;     // Lower 64-bit lanes of the 128-bit HI/LO registers
@@ -177,60 +177,49 @@ struct alignas(16) R5900Context
     {
         const uint32_t issueScale = 2u - ((cop0_config >> 18u) & 1u);
         const uint32_t ticks = dualIssueTicks * issueScale;
-        ee_cycle_ticks += ticks;
         ee_block_cycle_ticks += ticks;
         ee_block_cycle_active = true;
     }
 
-    uint64_t commitEeBlockCycles()
+    [[nodiscard]] ps2x::timing::EeTickDelta commitEeBlockCycles()
     {
-        if (!ee_block_cycle_active ||
-            ee_block_cycle_ticks > ee_cycle_ticks)
+        if (!ee_block_cycle_active)
         {
-            ee_block_cycle_ticks = 0u;
-            ee_block_cycle_active = false;
-            return ee_cycle_ticks & ~uint64_t{7u};
+            return {};
         }
 
-        const uint64_t baseTicks =
-            ee_cycle_ticks - ee_block_cycle_ticks;
         const uint64_t committedCycles =
-            std::max<uint64_t>(ee_block_cycle_ticks >> 3u, 1u);
-        ee_block_cycle_ticks &= 7u;
-        ee_cycle_ticks =
-            baseTicks + (committedCycles << 3u) + ee_block_cycle_ticks;
-        return ee_cycle_ticks - ee_block_cycle_ticks;
+            std::max<uint64_t>(
+                ee_block_cycle_ticks /
+                    ps2x::timing::kEeTicksPerCycle,
+                1u);
+        ee_block_cycle_ticks %=
+            static_cast<uint32_t>(ps2x::timing::kEeTicksPerCycle);
+        return ps2x::timing::eeCyclesToTicks(committedCycles);
     }
 
-    uint64_t committedEeCycleTicks() const
-    {
-        if (!ee_block_cycle_active ||
-            ee_block_cycle_ticks > ee_cycle_ticks)
-        {
-            return ee_cycle_ticks & ~uint64_t{7u};
-        }
-        return ee_cycle_ticks - ee_block_cycle_ticks;
-    }
-
-    void finishEeBasicBlock()
+    [[nodiscard]] ps2x::timing::EeTickDelta finishEeBasicBlock()
     {
         // PCSX2's EE recompiler accumulates three-bit fixed-point issue time
         // inside a block. Its block commit is at least one cycle, and then the
         // fractional remainder is discarded when the block ends.
-        if (ee_block_cycle_active &&
-            ee_block_cycle_ticks <= ee_cycle_ticks)
+        if (!ee_block_cycle_active)
         {
-            const uint64_t baseTicks =
-                ee_cycle_ticks - ee_block_cycle_ticks;
-            const uint64_t committedCycles =
-                std::max<uint64_t>(ee_block_cycle_ticks >> 3u, 1u);
-            ee_cycle_ticks =
-                baseTicks + (committedCycles << 3u);
+            return {};
         }
-        else
-        {
-            ee_cycle_ticks &= ~uint64_t{7u};
-        }
+
+        const uint64_t committedCycles =
+            std::max<uint64_t>(
+                ee_block_cycle_ticks /
+                    ps2x::timing::kEeTicksPerCycle,
+                1u);
+        ee_block_cycle_ticks = 0u;
+        ee_block_cycle_active = false;
+        return ps2x::timing::eeCyclesToTicks(committedCycles);
+    }
+
+    void resetEeBlockTiming()
+    {
         ee_block_cycle_ticks = 0u;
         ee_block_cycle_active = false;
     }
@@ -408,6 +397,8 @@ public:
 
     bool initialize(const char *title = "PS2 Game");
     bool syncCoreSubsystems();
+    [[nodiscard]] ps2x::timing::EeTick currentEeTick() const noexcept;
+    void resetEeTiming(R5900Context *context = nullptr);
     bool loadELF(const std::string &elfPath);
     void run();
 
@@ -479,6 +470,15 @@ public:
         uint32_t gp = 0u;
         uint32_t guestExecutionWaiters = 0u;
         uint64_t guestExecutionHandoffTimeouts = 0u;
+    };
+
+    struct DebugEeTiming
+    {
+        uint64_t currentTick = 0u;
+        uint64_t currentCycle = 0u;
+        uint32_t localBlockTicks = 0u;
+        bool localBlockActive = false;
+        bool contextBound = false;
     };
 
     struct DebugBranchEntry
@@ -587,7 +587,9 @@ public:
     class GuestExecutionScope
     {
     public:
-        explicit GuestExecutionScope(PS2Runtime *runtime) noexcept;
+        explicit GuestExecutionScope(
+            PS2Runtime *runtime,
+            R5900Context *context = nullptr) noexcept;
         ~GuestExecutionScope();
 
         GuestExecutionScope(const GuestExecutionScope &) = delete;
@@ -595,6 +597,8 @@ public:
 
     private:
         PS2Runtime *m_runtime = nullptr;
+        R5900Context *m_context = nullptr;
+        R5900Context *m_previousContext = nullptr;
     };
 
     class GuestExecutionReleaseScope
@@ -608,6 +612,7 @@ public:
 
     private:
         PS2Runtime *m_runtime = nullptr;
+        R5900Context *m_context = nullptr;
         uint32_t m_depth = 0u;
     };
 
@@ -710,6 +715,7 @@ public:
     DebugStopInfo debugRunUntilPc(uint32_t pc, std::chrono::milliseconds timeout);
     DebugStopInfo debugStepDispatches(uint64_t count, std::chrono::milliseconds timeout);
     R5900Context debugCpuSnapshot();
+    DebugEeTiming debugEeTimingSnapshot();
     bool debugReadRdram(uint32_t address, uint32_t size, std::vector<uint8_t> &output);
     bool debugReadMemory(uint32_t address, uint32_t size, std::vector<uint8_t> &output);
     bool debugCopyGsVram(std::vector<uint8_t> &output);
@@ -815,10 +821,14 @@ private:
     uint32_t allocateGuestBlockLocked(uint32_t size, uint32_t alignment);
     void freeGuestBlockLocked(uint32_t guestAddr);
     void coalesceGuestHeapLocked();
-    void enterGuestExecution();
-    void leaveGuestExecution();
-    uint32_t releaseGuestExecution();
-    void reacquireGuestExecution(uint32_t depth);
+    R5900Context *enterGuestExecution(R5900Context *context);
+    void leaveGuestExecution(
+        R5900Context *context,
+        R5900Context *previousContext);
+    uint32_t releaseGuestExecution(R5900Context *&context);
+    void reacquireGuestExecution(
+        uint32_t depth,
+        R5900Context *context);
     void markGuestExecutionAcquired();
     void debugBeforeGuestStep(R5900Context *ctx);
     void debugAfterGuestStep(R5900Context *ctx);
@@ -850,6 +860,17 @@ private:
                                         R5900Context *ctx,
                                         bool interlocked,
                                         bool blockBoundary);
+    [[nodiscard]] ps2x::timing::EeTick publishEeElapsed(
+        ps2x::timing::EeTickDelta elapsed) noexcept;
+    [[nodiscard]] ps2x::timing::EeTick commitEeContextProgress(
+        R5900Context *context) noexcept;
+    [[nodiscard]] ps2x::timing::EeTick finishEeContextBlock(
+        R5900Context *context) noexcept;
+    void switchGuestExecutionContext(R5900Context *context) noexcept;
+    void restoreGuestExecutionContext(
+        R5900Context *context,
+        R5900Context *previousContext) noexcept;
+    void resetEeTimingUnlocked(R5900Context *context) noexcept;
 
     PS2Memory m_memory;
     GifArbiter m_gifArbiter;
@@ -860,13 +881,14 @@ private:
     PSPadBackend m_padBackend;
     VU1Interpreter m_vu0;
     VU1Interpreter m_vu1;
-    uint64_t m_vu0CycleTick = 0u;
-    uint64_t m_vu0LastObservedEeCycleTick = 0u;
-    uint64_t m_vu0NextEventCycleTick = 0u;
+    ps2x::timing::EeTimeline m_eeTimeline;
+    ps2x::timing::EeTick m_vu0CycleTick{};
+    ps2x::timing::EeTick m_vu0NextEventCycleTick{};
     std::atomic<uint64_t> m_vu0InvocationSequence{0u};
     std::atomic<uint64_t> m_vu0CurrentInvocation{0u};
     std::atomic<uint64_t> m_vu0CurrentInvocationInstruction{0u};
     R5900Context m_cpuContext;
+    R5900Context *m_boundEeContext = nullptr;
     mutable std::recursive_timed_mutex m_guestExecutionMutex;
     mutable std::atomic<uint32_t> m_guestExecutionWaiters{0u};
     mutable std::mutex m_guestExecutionHandoffMutex;

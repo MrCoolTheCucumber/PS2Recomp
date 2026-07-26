@@ -118,7 +118,6 @@ namespace
     constexpr uint32_t kGuestHeapHardLimit = 0x01F00000u;
     constexpr uint32_t kElfSectionAlloc = 0x2u;
     constexpr uint32_t kElfSectionExecInstr = 0x4u;
-    constexpr uint32_t kEeCycleTickShift = 3u;
     constexpr uint32_t kVu0SyncThresholdCycles = 4u;
     constexpr uint32_t kVu0MinimumRunCycles = 16u;
     // PCSX2 uses a 48-cycle rapid-event deadline when the EE must revisit
@@ -707,12 +706,15 @@ namespace
     }
 }
 
-PS2Runtime::GuestExecutionScope::GuestExecutionScope(PS2Runtime *runtime) noexcept
-    : m_runtime(runtime)
+PS2Runtime::GuestExecutionScope::GuestExecutionScope(
+    PS2Runtime *runtime, R5900Context *context) noexcept
+    : m_runtime(runtime),
+      m_context(context)
 {
     if (m_runtime)
     {
-        m_runtime->enterGuestExecution();
+        m_previousContext =
+            m_runtime->enterGuestExecution(m_context);
     }
 }
 
@@ -720,7 +722,8 @@ PS2Runtime::GuestExecutionScope::~GuestExecutionScope()
 {
     if (m_runtime)
     {
-        m_runtime->leaveGuestExecution();
+        m_runtime->leaveGuestExecution(
+            m_context, m_previousContext);
     }
 }
 
@@ -729,7 +732,8 @@ PS2Runtime::GuestExecutionReleaseScope::GuestExecutionReleaseScope(PS2Runtime *r
 {
     if (m_runtime)
     {
-        m_depth = m_runtime->releaseGuestExecution();
+        m_depth =
+            m_runtime->releaseGuestExecution(m_context);
     }
 }
 
@@ -737,7 +741,8 @@ PS2Runtime::GuestExecutionReleaseScope::~GuestExecutionReleaseScope()
 {
     if (m_runtime && m_depth != 0u)
     {
-        m_runtime->reacquireGuestExecution(m_depth);
+        m_runtime->reacquireGuestExecution(
+            m_depth, m_context);
     }
 }
 
@@ -1021,6 +1026,64 @@ void PS2Runtime::resetIop()
     m_iopSubsystem->reset();
 }
 
+ps2x::timing::EeTick PS2Runtime::currentEeTick() const noexcept
+{
+    return m_eeTimeline.now();
+}
+
+ps2x::timing::EeTick PS2Runtime::publishEeElapsed(
+    ps2x::timing::EeTickDelta elapsed) noexcept
+{
+    return m_eeTimeline.advance(elapsed);
+}
+
+ps2x::timing::EeTick PS2Runtime::commitEeContextProgress(
+    R5900Context *context) noexcept
+{
+    if (!context)
+    {
+        return currentEeTick();
+    }
+    return publishEeElapsed(context->commitEeBlockCycles());
+}
+
+ps2x::timing::EeTick PS2Runtime::finishEeContextBlock(
+    R5900Context *context) noexcept
+{
+    if (!context)
+    {
+        return currentEeTick();
+    }
+    return publishEeElapsed(context->finishEeBasicBlock());
+}
+
+void PS2Runtime::resetEeTimingUnlocked(
+    R5900Context *context) noexcept
+{
+    m_eeTimeline.reset();
+    m_vu0CycleTick = {};
+    m_vu0NextEventCycleTick = {};
+
+    m_cpuContext.resetEeBlockTiming();
+    if (m_boundEeContext && m_boundEeContext != &m_cpuContext)
+    {
+        m_boundEeContext->resetEeBlockTiming();
+    }
+    if (context &&
+        context != &m_cpuContext &&
+        context != m_boundEeContext)
+    {
+        context->resetEeBlockTiming();
+    }
+}
+
+void PS2Runtime::resetEeTiming(R5900Context *context)
+{
+    std::lock_guard<std::recursive_timed_mutex> lock(
+        m_guestExecutionMutex);
+    resetEeTimingUnlocked(context);
+}
+
 ps2x::iop::DebugSnapshot PS2Runtime::iopDebugSnapshot() const
 {
     return m_iopSubsystem->debugSnapshot();
@@ -1060,9 +1123,7 @@ bool PS2Runtime::syncCoreSubsystems()
     resetIop();
     m_vu0.reset();
     m_vu1.reset();
-    m_vu0CycleTick = 0u;
-    m_vu0LastObservedEeCycleTick = 0u;
-    m_vu0NextEventCycleTick = 0u;
+    resetEeTimingUnlocked(&m_cpuContext);
     m_vu0InvocationSequence.store(0u, std::memory_order_relaxed);
     m_vu0CurrentInvocation.store(0u, std::memory_order_relaxed);
     m_vu0CurrentInvocationInstruction.store(
@@ -1932,10 +1993,9 @@ void PS2Runtime::executeVU0Microprogram(uint8_t *rdram, R5900Context *ctx, uint3
     copyVu0StateToContext(m_vu0.state(), ctx);
     ctx->vu0_vpu_stat =
         (ctx->vu0_vpu_stat & ~1u) | (m_vu0.isActive() ? 1u : 0u);
-    const uint64_t eeCycleTick = ctx->committedEeCycleTicks();
+    const ps2x::timing::EeTick eeCycleTick = currentEeTick();
     m_vu0CycleTick = eeCycleTick;
-    m_vu0LastObservedEeCycleTick = eeCycleTick;
-    m_vu0NextEventCycleTick = 0u;
+    m_vu0NextEventCycleTick = {};
 }
 
 void PS2Runtime::vu0StartMicroProgram(uint8_t *rdram, R5900Context *ctx, uint32_t address)
@@ -1964,19 +2024,19 @@ void PS2Runtime::vu0StartMicroProgram(uint8_t *rdram, R5900Context *ctx, uint32_
     copyVu0StateToContext(m_vu0.state(), ctx);
     ctx->vu0_vpu_stat =
         (ctx->vu0_vpu_stat & ~1u) | (m_vu0.isActive() ? 1u : 0u);
-    const uint64_t eeCycleTick = ctx->committedEeCycleTicks();
+    const ps2x::timing::EeTick eeCycleTick = currentEeTick();
     m_vu0CycleTick = eeCycleTick;
     if (m_vu0.isActive())
     {
-        m_vu0CycleTick +=
-            static_cast<uint64_t>(kVu0MinimumRunCycles)
-            << kEeCycleTickShift;
+        m_vu0CycleTick = ps2x::timing::saturatingAdd(
+            m_vu0CycleTick,
+            ps2x::timing::vuCyclesToEeTicks(
+                kVu0MinimumRunCycles));
     }
-    m_vu0LastObservedEeCycleTick = eeCycleTick;
-    m_vu0NextEventCycleTick =
-        eeCycleTick +
-        (static_cast<uint64_t>(kVu0InitialEventDelayCycles)
-         << kEeCycleTickShift);
+    m_vu0NextEventCycleTick = ps2x::timing::saturatingAdd(
+        eeCycleTick,
+        ps2x::timing::eeCyclesToTicks(
+            kVu0InitialEventDelayCycles));
 }
 
 void PS2Runtime::synchronizeVU0Microprogram(
@@ -2008,30 +2068,17 @@ void PS2Runtime::synchronizeVU0MicroprogramImpl(
         return;
     }
 
-    const uint64_t eeCycleTick = ctx->commitEeBlockCycles();
+    const ps2x::timing::EeTick eeCycleTick =
+        blockBoundary
+            ? finishEeContextBlock(ctx)
+            : commitEeContextProgress(ctx);
     if (!m_vu0.isActive())
     {
         ctx->vu0_vpu_stat &= ~1u;
         m_vu0CycleTick = eeCycleTick;
-        m_vu0LastObservedEeCycleTick = eeCycleTick;
-        m_vu0NextEventCycleTick = 0u;
+        m_vu0NextEventCycleTick = {};
         return;
     }
-
-    // Keep the VU clock at the same relative distance if a restored or
-    // switched EE context moves its fixed-point scheduling counter backwards.
-    if (eeCycleTick < m_vu0LastObservedEeCycleTick)
-    {
-        const uint64_t rewind =
-            m_vu0LastObservedEeCycleTick - eeCycleTick;
-        m_vu0CycleTick =
-            rewind < m_vu0CycleTick ? m_vu0CycleTick - rewind : 0u;
-        m_vu0NextEventCycleTick =
-            rewind < m_vu0NextEventCycleTick
-                ? m_vu0NextEventCycleTick - rewind
-                : 0u;
-    }
-    m_vu0LastObservedEeCycleTick = eeCycleTick;
 
     DebugVu0SyncEntry traceEntry{};
     bool traceSync =
@@ -2053,9 +2100,10 @@ void PS2Runtime::synchronizeVU0MicroprogramImpl(
         traceEntry.invocationInstruction =
             m_vu0CurrentInvocationInstruction.load(
                 std::memory_order_relaxed);
-        traceEntry.eeCycleTicks = eeCycleTick;
-        traceEntry.vuCycleTicks = m_vu0CycleTick;
-        traceEntry.nextEventCycleTicks = m_vu0NextEventCycleTick;
+        traceEntry.eeCycleTicks = eeCycleTick.raw();
+        traceEntry.vuCycleTicks = m_vu0CycleTick.raw();
+        traceEntry.nextEventCycleTicks =
+            m_vu0NextEventCycleTick.raw();
         traceEntry.eePc = ctx->pc;
         traceEntry.vuPcBefore = state.pc;
         traceEntry.contextVi1 = ctx->vi[1];
@@ -2087,7 +2135,7 @@ void PS2Runtime::synchronizeVU0MicroprogramImpl(
     uint32_t cycleBudget = 0u;
     const bool eventDue =
         blockBoundary &&
-        m_vu0NextEventCycleTick != 0u &&
+        m_vu0NextEventCycleTick != ps2x::timing::EeTick{} &&
         eeCycleTick >= m_vu0NextEventCycleTick;
     if (interlocked)
     {
@@ -2096,8 +2144,9 @@ void PS2Runtime::synchronizeVU0MicroprogramImpl(
     else if (eeCycleTick > m_vu0CycleTick)
     {
         const uint64_t elapsedCycles =
-            (eeCycleTick - m_vu0CycleTick)
-            >> kEeCycleTickShift;
+            ps2x::timing::eeTicksToVuCyclesFloor(
+                ps2x::timing::elapsedEeTicks(
+                    m_vu0CycleTick, eeCycleTick));
         if (blockBoundary)
         {
             if (eventDue)
@@ -2122,12 +2171,20 @@ void PS2Runtime::synchronizeVU0MicroprogramImpl(
     }
     if (eventDue)
     {
-        const uint64_t intervalTicks =
-            static_cast<uint64_t>(kEeRapidEventCycles)
-            << kEeCycleTickShift;
+        const ps2x::timing::EeTickDelta intervalTicks =
+            ps2x::timing::eeCyclesToTicks(
+                kEeRapidEventCycles);
         do
         {
-            m_vu0NextEventCycleTick += intervalTicks;
+            const ps2x::timing::EeTick previous =
+                m_vu0NextEventCycleTick;
+            m_vu0NextEventCycleTick =
+                ps2x::timing::saturatingAdd(
+                    m_vu0NextEventCycleTick, intervalTicks);
+            if (m_vu0NextEventCycleTick == previous)
+            {
+                break;
+            }
         } while (m_vu0NextEventCycleTick <= eeCycleTick);
     }
 
@@ -2148,12 +2205,13 @@ void PS2Runtime::synchronizeVU0MicroprogramImpl(
     }
     else
     {
-        m_vu0CycleTick +=
-            static_cast<uint64_t>(cycleBudget) << kEeCycleTickShift;
+        m_vu0CycleTick = ps2x::timing::saturatingAdd(
+            m_vu0CycleTick,
+            ps2x::timing::vuCyclesToEeTicks(cycleBudget));
     }
     if (!m_vu0.isActive())
     {
-        m_vu0NextEventCycleTick = 0u;
+        m_vu0NextEventCycleTick = {};
     }
     if (traceSync)
     {
@@ -2808,7 +2866,7 @@ void PS2Runtime::dispatchLoop(uint8_t *rdram, R5900Context *ctx)
 
         uint64_t handoffBaseline = 0u;
         {
-            GuestExecutionScope guestExecution(this);
+            GuestExecutionScope guestExecution(this, ctx);
             executeGuestStep(rdram, ctx, fn);
             handoffBaseline = guestExecutionHandoffEpochSnapshot();
         }
@@ -2837,7 +2895,36 @@ void PS2Runtime::dispatchLoop(uint8_t *rdram, R5900Context *ctx)
     }
 }
 
-void PS2Runtime::enterGuestExecution()
+void PS2Runtime::switchGuestExecutionContext(
+    R5900Context *context) noexcept
+{
+    if (!context || context == m_boundEeContext)
+    {
+        return;
+    }
+
+    (void)finishEeContextBlock(m_boundEeContext);
+    context->resetEeBlockTiming();
+    m_boundEeContext = context;
+}
+
+void PS2Runtime::restoreGuestExecutionContext(
+    R5900Context *context,
+    R5900Context *previousContext) noexcept
+{
+    if (!context ||
+        context == previousContext ||
+        m_boundEeContext != context)
+    {
+        return;
+    }
+
+    (void)finishEeContextBlock(context);
+    m_boundEeContext = previousContext;
+}
+
+R5900Context *PS2Runtime::enterGuestExecution(
+    R5900Context *context)
 {
     uint32_t &depth = g_guestExecutionDepths[this];
 
@@ -2845,7 +2932,10 @@ void PS2Runtime::enterGuestExecution()
     {
         m_guestExecutionMutex.lock();
         ++depth;
-        return;
+        R5900Context *const previousContext =
+            m_boundEeContext;
+        switchGuestExecutionContext(context);
+        return previousContext;
     }
 
     if (!m_debugControlActive.load(std::memory_order_acquire))
@@ -2855,7 +2945,10 @@ void PS2Runtime::enterGuestExecution()
         m_guestExecutionWaiters.fetch_sub(1u, std::memory_order_acq_rel);
         depth = 1u;
         markGuestExecutionAcquired();
-        return;
+        R5900Context *const previousContext =
+            m_boundEeContext;
+        switchGuestExecutionContext(context);
+        return previousContext;
     }
 
     for (;;)
@@ -2882,15 +2975,23 @@ void PS2Runtime::enterGuestExecution()
     }
     depth = 1u;
     markGuestExecutionAcquired();
+    R5900Context *const previousContext =
+        m_boundEeContext;
+    switchGuestExecutionContext(context);
+    return previousContext;
 }
 
-void PS2Runtime::leaveGuestExecution()
+void PS2Runtime::leaveGuestExecution(
+    R5900Context *context,
+    R5900Context *previousContext)
 {
     auto it = g_guestExecutionDepths.find(this);
     if (it == g_guestExecutionDepths.end() || it->second == 0u)
     {
         return;
     }
+
+    restoreGuestExecutionContext(context, previousContext);
 
     // A completed DMA may not interrupt the guest from inside the instruction
     // or library call that started it. Deliver queued completions only when the
@@ -2914,13 +3015,19 @@ void PS2Runtime::leaveGuestExecution()
     }
 }
 
-uint32_t PS2Runtime::releaseGuestExecution()
+uint32_t PS2Runtime::releaseGuestExecution(
+    R5900Context *&context)
 {
+    context = nullptr;
     auto it = g_guestExecutionDepths.find(this);
     if (it == g_guestExecutionDepths.end() || it->second == 0u)
     {
         return 0u;
     }
+
+    context = m_boundEeContext;
+    (void)finishEeContextBlock(m_boundEeContext);
+    m_boundEeContext = nullptr;
 
     const uint32_t depth = it->second;
     for (uint32_t i = 0; i < depth; ++i)
@@ -2931,7 +3038,9 @@ uint32_t PS2Runtime::releaseGuestExecution()
     return depth;
 }
 
-void PS2Runtime::reacquireGuestExecution(uint32_t depth)
+void PS2Runtime::reacquireGuestExecution(
+    uint32_t depth,
+    R5900Context *context)
 {
     if (depth == 0u)
     {
@@ -2943,9 +3052,13 @@ void PS2Runtime::reacquireGuestExecution(uint32_t depth)
 
     if (heldDepth == 0u)
     {
-        enterGuestExecution();
+        (void)enterGuestExecution(context);
         heldDepth = g_guestExecutionDepths[this];
         --remaining;
+    }
+    else
+    {
+        switchGuestExecutionContext(context);
     }
 
     for (uint32_t i = 0; i < remaining; ++i)
@@ -3046,11 +3159,13 @@ void PS2Runtime::debugBlockGuestAtBoundary(R5900Context *ctx, const char *reason
     // executeGuestStep() is called while this host thread owns the recursive
     // guest-execution mutex. Release all levels so debugger snapshots can be
     // proven quiescent while the guest remains stopped.
-    const uint32_t depth = releaseGuestExecution();
+    R5900Context *releasedContext = nullptr;
+    const uint32_t depth =
+        releaseGuestExecution(releasedContext);
     debugWaitUntilResumed();
     if (depth != 0u)
     {
-        reacquireGuestExecution(depth);
+        reacquireGuestExecution(depth, releasedContext);
     }
 }
 
@@ -3329,6 +3444,25 @@ R5900Context PS2Runtime::debugCpuSnapshot()
 {
     std::lock_guard<std::recursive_timed_mutex> lock(m_guestExecutionMutex);
     return m_cpuContext;
+}
+
+PS2Runtime::DebugEeTiming PS2Runtime::debugEeTimingSnapshot()
+{
+    std::lock_guard<std::recursive_timed_mutex> lock(
+        m_guestExecutionMutex);
+    const R5900Context *const context =
+        m_boundEeContext ? m_boundEeContext : &m_cpuContext;
+    const uint64_t currentTick = currentEeTick().raw();
+
+    DebugEeTiming result{};
+    result.currentTick = currentTick;
+    result.currentCycle =
+        ps2x::timing::eeTickToCyclesFloor(
+            currentEeTick());
+    result.localBlockTicks = context->ee_block_cycle_ticks;
+    result.localBlockActive = context->ee_block_cycle_active;
+    result.contextBound = m_boundEeContext != nullptr;
+    return result;
 }
 
 bool PS2Runtime::debugReadRdram(uint32_t address,

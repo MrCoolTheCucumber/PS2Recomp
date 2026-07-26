@@ -3016,37 +3016,188 @@ void register_ps2_runtime_expansion_tests()
 
             context.advanceEeCycleTicks(9u);
             t.Equals(
-                context.ee_cycle_ticks, 9u,
-                "dual-issue mode should use the base fixed-point weight");
+                context.ee_block_cycle_ticks, 9u,
+                "dual-issue mode should accumulate the base fixed-point weight locally");
 
             context.cop0_config &= ~(1u << 18u);
             context.advanceEeCycleTicks(9u);
             t.Equals(
-                context.ee_cycle_ticks, 27u,
-                "single-issue mode should double subsequent issue time");
+                context.ee_block_cycle_ticks, 27u,
+                "single-issue mode should double subsequent local issue time");
 
-            context.finishEeBasicBlock();
             t.Equals(
-                context.ee_cycle_ticks, 24u,
-                "an EE block boundary should retain only whole cycles");
+                context.finishEeBasicBlock().raw(), 24u,
+                "an EE block boundary should publish only whole cycles");
+            t.Equals(
+                context.ee_block_cycle_ticks, 0u,
+                "a finished block should discard its fractional remainder");
 
             R5900Context splitBlock{};
             splitBlock.advanceEeCycleTicks(9u);
             t.Equals(
-                splitBlock.commitEeBlockCycles(), 8u,
+                splitBlock.commitEeBlockCycles().raw(), 8u,
                 "an in-block synchronization should expose whole EE cycles");
             t.Equals(
-                splitBlock.ee_cycle_ticks, 9u,
+                splitBlock.ee_block_cycle_ticks, 1u,
                 "an in-block synchronization should retain fractional issue time");
-            splitBlock.finishEeBasicBlock();
             t.Equals(
-                splitBlock.ee_cycle_ticks, 16u,
+                splitBlock.finishEeBasicBlock().raw(), 8u,
                 "the final block commit should preserve PCSX2's one-cycle minimum");
 
             PS2Runtime runtime;
             t.Equals(
                 runtime.debugCpuSnapshot().cop0_config, 0x00073443u,
                 "runtime initialization should preserve the post-BIOS configuration");
+        });
+
+        tc.Run("EE timing conversions are explicit and saturating", [](TestCase &t)
+        {
+            using namespace ps2x::timing;
+
+            t.Equals(
+                eeCyclesToTicks(3u).raw(), 24u,
+                "EE cycles should use eight fixed-point ticks");
+            t.Equals(
+                eeTicksToCyclesFloor(
+                    eeTickDeltaFromRaw(23u)), 2u,
+                "EE cycle conversion should round down explicitly");
+            t.Equals(
+                eeTicksToCyclesCeil(
+                    eeTickDeltaFromRaw(17u)), 3u,
+                "EE cycle conversion should round up explicitly");
+            t.Equals(
+                vuCyclesToEeTicks(5u).raw(), 40u,
+                "VU cycles should convert through the named EE helper");
+            t.Equals(
+                iopCyclesToEeTicks(2u).raw(), 128u,
+                "one IOP cycle should span eight EE cycles");
+            t.Equals(
+                eeTicksToIopCyclesFloor(
+                    eeTickDeltaFromRaw(191u)), 2u,
+                "IOP conversion should state its floor rounding");
+
+            EeTimeline timeline;
+            (void)timeline.advance(eeTickDeltaFromRaw(
+                std::numeric_limits<uint64_t>::max()));
+            (void)timeline.advance(eeCyclesToTicks(1u));
+            t.Equals(
+                timeline.now().raw(),
+                std::numeric_limits<uint64_t>::max(),
+                "the canonical timeline should saturate instead of wrapping");
+        });
+
+        tc.Run("fresh EE contexts share one monotonic runtime timeline", [](TestCase &t)
+        {
+            PS2Runtime runtime;
+            R5900Context mainContext{};
+            R5900Context interruptContext{};
+
+            mainContext.advanceEeCycleTicks(16u);
+            runtime.advanceVU0AtEeBlockBoundary(nullptr, &mainContext);
+            t.Equals(
+                runtime.currentEeTick().raw(), 16u,
+                "the first context should publish its elapsed block");
+
+            interruptContext.advanceEeCycleTicks(8u);
+            runtime.advanceVU0AtEeBlockBoundary(
+                nullptr, &interruptContext);
+            t.Equals(
+                runtime.currentEeTick().raw(), 24u,
+                "a fresh interrupt context must extend rather than replace time");
+
+            mainContext.advanceEeCycleTicks(24u);
+            runtime.advanceVU0AtEeBlockBoundary(nullptr, &mainContext);
+            t.Equals(
+                runtime.currentEeTick().raw(), 48u,
+                "returning to the original context must not rewind time");
+        });
+
+        tc.Run("nested guest contexts flush local time exactly once", [](TestCase &t)
+        {
+            PS2Runtime runtime;
+            R5900Context mainContext{};
+
+            {
+                PS2Runtime::GuestExecutionScope mainScope(
+                    &runtime, &mainContext);
+                mainContext.advanceEeCycleTicks(9u);
+
+                R5900Context interruptContext = mainContext;
+                {
+                    PS2Runtime::GuestExecutionScope interruptScope(
+                        &runtime, &interruptContext);
+                    t.Equals(
+                        runtime.currentEeTick().raw(), 8u,
+                        "switching contexts should finish the outgoing block");
+                    t.Equals(
+                        interruptContext.ee_block_cycle_ticks, 0u,
+                        "a copied context must not duplicate the caller's local time");
+
+                    interruptContext.advanceEeCycleTicks(9u);
+                    {
+                        PS2Runtime::GuestExecutionScope callbackScope(
+                            &runtime, &interruptContext);
+                        interruptContext.advanceEeCycleTicks(7u);
+                    }
+                    t.Equals(
+                        runtime.currentEeTick().raw(), 8u,
+                        "nesting the same context should not commit it early");
+                }
+
+                t.Equals(
+                    runtime.currentEeTick().raw(), 24u,
+                    "the nested context should publish one sixteen-tick block");
+                mainContext.advanceEeCycleTicks(7u);
+            }
+
+            t.Equals(
+                runtime.currentEeTick().raw(), 32u,
+                "the restored context should publish only its new local block");
+        });
+
+        tc.Run("EE timing reset clears canonical and bound local state", [](TestCase &t)
+        {
+            PS2Runtime runtime;
+            R5900Context context{};
+            R5900Context staleContext{};
+            staleContext.advanceEeCycleTicks(32u);
+
+            {
+                PS2Runtime::GuestExecutionScope scope(
+                    &runtime, &context);
+                context.advanceEeCycleTicks(9u);
+                runtime.synchronizeVU0Microprogram(
+                    nullptr, &context, false);
+
+                const PS2Runtime::DebugEeTiming beforeReset =
+                    runtime.debugEeTimingSnapshot();
+                t.Equals(
+                    beforeReset.currentTick, 8u,
+                    "an in-block synchronization should publish whole ticks");
+                t.Equals(
+                    beforeReset.localBlockTicks, 1u,
+                    "debug timing should expose the fractional local remainder");
+                t.IsTrue(
+                    beforeReset.contextBound,
+                    "debug timing should identify the serialized context");
+
+                runtime.resetEeTiming(&staleContext);
+                t.Equals(
+                    runtime.currentEeTick().raw(), 0u,
+                    "reset should clear canonical runtime time");
+                t.Equals(
+                    context.ee_block_cycle_ticks, 0u,
+                    "reset should clear the currently bound context");
+                t.Equals(
+                    staleContext.ee_block_cycle_ticks, 0u,
+                    "reset should clear an explicitly restored context");
+
+                context.advanceEeCycleTicks(16u);
+            }
+
+            t.Equals(
+                runtime.currentEeTick().raw(), 16u,
+                "post-reset work should begin from the defined zero tick");
         });
 
         tc.Run("VU0 microprogram executes against VU0 code and data memory", [](TestCase &t)
@@ -3235,7 +3386,9 @@ void register_ps2_runtime_expansion_tests()
 
             R5900Context ctx{};
             ctx.insn_count = 100u;
-            ctx.ee_cycle_ticks = 800u;
+            ctx.advanceEeCycleTicks(800u);
+            runtime.advanceVU0AtEeBlockBoundary(
+                runtime.memory().getRDRAM(), &ctx);
             runtime.vu0StartMicroProgram(
                 runtime.memory().getRDRAM(), &ctx, 0u);
 
@@ -3245,14 +3398,13 @@ void register_ps2_runtime_expansion_tests()
 
             const uint32_t startupPc = ctx.vu0_pc;
             ctx.insn_count = 99u;
-            ctx.ee_cycle_ticks = 799u;
             runtime.synchronizeVU0Microprogram(
                 runtime.memory().getRDRAM(), &ctx, false);
             t.Equals(
                 ctx.vu0_pc, startupPc,
                 "an EE instruction-counter reset should not become a huge VU0 time jump");
 
-            ctx.ee_cycle_ticks += 7u;
+            ctx.advanceEeCycleTicks(7u);
             runtime.synchronizeVU0Microprogram(
                 runtime.memory().getRDRAM(), &ctx, false);
             t.Equals(
@@ -3260,7 +3412,7 @@ void register_ps2_runtime_expansion_tests()
                 "a fractional EE cycle should not prematurely advance VU0");
 
             ctx.insn_count += 8u;
-            ctx.ee_cycle_ticks += 57u;
+            ctx.advanceEeCycleTicks(57u);
             runtime.synchronizeVU0Microprogram(
                 runtime.memory().getRDRAM(), &ctx, false);
             t.Equals(
@@ -3272,7 +3424,7 @@ void register_ps2_runtime_expansion_tests()
 
             ctx.vi[1] = 0u;
             ctx.insn_count += 5u;
-            ctx.ee_cycle_ticks += 104u;
+            ctx.advanceEeCycleTicks(104u);
             runtime.synchronizeVU0Microprogram(
                 runtime.memory().getRDRAM(), &ctx, false);
 
@@ -3304,7 +3456,9 @@ void register_ps2_runtime_expansion_tests()
             writeVuInstructionPair(code, 16u, 0u, kVuNop);
 
             R5900Context ctx{};
-            ctx.ee_cycle_ticks = 800u;
+            ctx.advanceEeCycleTicks(800u);
+            runtime.advanceVU0AtEeBlockBoundary(
+                runtime.memory().getRDRAM(), &ctx);
             runtime.vu0StartMicroProgram(
                 runtime.memory().getRDRAM(), &ctx, 0u);
             t.IsTrue(
@@ -3315,16 +3469,16 @@ void register_ps2_runtime_expansion_tests()
             runtime.debugStartVu0InstructionTrace(
                 64u, std::nullopt, false);
 
-            ctx.ee_cycle_ticks += 128u;
+            ctx.advanceEeCycleTicks(128u);
             runtime.advanceVU0AtEeBlockBoundary(
                 runtime.memory().getRDRAM(), &ctx);
-            ctx.ee_cycle_ticks += 40u;
+            ctx.advanceEeCycleTicks(40u);
             runtime.advanceVU0AtEeBlockBoundary(
                 runtime.memory().getRDRAM(), &ctx);
-            ctx.ee_cycle_ticks += 40u;
+            ctx.advanceEeCycleTicks(40u);
             runtime.advanceVU0AtEeBlockBoundary(
                 runtime.memory().getRDRAM(), &ctx);
-            ctx.ee_cycle_ticks += 80u;
+            ctx.advanceEeCycleTicks(80u);
             runtime.synchronizeVU0Microprogram(
                 runtime.memory().getRDRAM(), &ctx, false);
 
@@ -3431,7 +3585,9 @@ void register_ps2_runtime_expansion_tests()
                 trace.entries.size(), static_cast<size_t>(0u),
                 "arming on inactive VU0 should not fabricate a trace entry");
 
-            ctx.ee_cycle_ticks = 800u;
+            ctx.advanceEeCycleTicks(800u);
+            runtime.advanceVU0AtEeBlockBoundary(
+                runtime.memory().getRDRAM(), &ctx);
             runtime.vu0StartMicroProgram(
                 runtime.memory().getRDRAM(), &ctx, 0u);
             t.IsTrue(
@@ -3439,7 +3595,7 @@ void register_ps2_runtime_expansion_tests()
                 "the handshake fixture should leave VU0 active");
 
             ctx.pc = 0x00120000u;
-            ctx.ee_cycle_ticks += 128u;
+            ctx.advanceEeCycleTicks(128u);
             runtime.synchronizeVU0Microprogram(
                 runtime.memory().getRDRAM(), &ctx, false);
             trace = runtime.debugVu0SyncTraceSnapshot(false);
@@ -3453,7 +3609,7 @@ void register_ps2_runtime_expansion_tests()
                     "the first retained entry should follow the inactive trigger");
             }
 
-            ctx.ee_cycle_ticks += 40u;
+            ctx.advanceEeCycleTicks(40u);
             runtime.synchronizeVU0Microprogram(
                 runtime.memory().getRDRAM(), &ctx, false);
             trace = runtime.debugVu0SyncTraceSnapshot(false);
@@ -3523,7 +3679,9 @@ void register_ps2_runtime_expansion_tests()
                 trace.entries.size(), static_cast<size_t>(0u),
                 "arming on inactive VU0 should not fabricate an instruction entry");
 
-            ctx.ee_cycle_ticks = 800u;
+            ctx.advanceEeCycleTicks(800u);
+            runtime.advanceVU0AtEeBlockBoundary(
+                runtime.memory().getRDRAM(), &ctx);
             runtime.vu0StartMicroProgram(
                 runtime.memory().getRDRAM(), &ctx, 0u);
             trace = runtime.debugVu0InstructionTraceSnapshot(false);

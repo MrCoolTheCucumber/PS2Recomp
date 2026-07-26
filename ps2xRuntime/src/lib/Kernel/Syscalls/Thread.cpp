@@ -515,7 +515,8 @@ namespace ps2_syscalls
                     }
                     uint64_t handoffBaseline = 0u;
                     {
-                        PS2Runtime::GuestExecutionScope guestExecution(runtime);
+                        PS2Runtime::GuestExecutionScope guestExecution(
+                            runtime, threadCtx);
                         runtime->executeGuestStep(rdram, threadCtx, step);
                         handoffBaseline = runtime->guestExecutionHandoffEpochSnapshot();
                     }

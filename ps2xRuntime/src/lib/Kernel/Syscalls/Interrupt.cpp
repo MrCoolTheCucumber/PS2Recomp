@@ -173,7 +173,8 @@ namespace ps2_syscalls
                 uint64_t handoffBaseline = 0u;
                 uint32_t stepCount = 0u;
                 {
-                    PS2Runtime::GuestExecutionScope guestExecution(runtime);
+                    PS2Runtime::GuestExecutionScope guestExecution(
+                        runtime, &irqCtx);
                     PS2Runtime::DeferredGuestYieldScope deferYield(reschedulePending);
 
                     while (irqCtx.pc != 0u && runtime && !runtime->isStopRequested() && stepCount < kMaxIrqHandlerSteps)
@@ -279,7 +280,8 @@ namespace ps2_syscalls
                 uint64_t handoffBaseline = 0u;
                 uint32_t steps = 0u;
                 {
-                    PS2Runtime::GuestExecutionScope guestExecution(runtime);
+                    PS2Runtime::GuestExecutionScope guestExecution(
+                        runtime, &irqCtx);
                     PS2Runtime::DeferredGuestYieldScope deferYield(reschedulePending);
 
                     while (irqCtx.pc != 0u && runtime && !runtime->isStopRequested() &&

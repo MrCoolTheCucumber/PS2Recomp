@@ -324,10 +324,11 @@ namespace
         return true;
     }
 
-    void advanceBlock(R5900Context &context, uint32_t blockTicks)
+    void accountUnscheduledBlock(
+        R5900Context &context, uint32_t blockTicks)
     {
         context.advanceEeCycleTicks(blockTicks);
-        context.finishEeBasicBlock();
+        (void)context.finishEeBasicBlock();
     }
 
     void advanceLegacyBlocks(
@@ -337,7 +338,7 @@ namespace
         uint8_t *const rdram = runtime.memory().getRDRAM();
         for (uint64_t block = 0u; block < blocks; ++block)
         {
-            advanceBlock(context, blockTicks);
+            context.advanceEeCycleTicks(blockTicks);
             runtime.advanceVU0AtEeBlockBoundary(rdram, &context);
         }
     }
@@ -356,9 +357,7 @@ namespace
         runtime.vu0().reset();
         runtime.synchronizeVU0Microprogram(
             runtime.memory().getRDRAM(), &context, false);
-        const uint64_t currentTick = context.committedEeCycleTicks();
         context = R5900Context{};
-        context.ee_cycle_ticks = currentTick;
         runtime.vu0StartMicroProgram(
             runtime.memory().getRDRAM(), &context, 0u);
     }
@@ -425,7 +424,8 @@ namespace
         for (uint64_t block = 0u;
              block < configuration.warmupBlocks; ++block)
         {
-            advanceBlock(context, configuration.blockTicks);
+            accountUnscheduledBlock(
+                context, configuration.blockTicks);
         }
         vu.continueExecution(
             runtime.memory().getVU0Code(), PS2_VU0_CODE_SIZE,
@@ -464,7 +464,10 @@ namespace
         g_trackAllocations.store(true, std::memory_order_release);
         const auto started = std::chrono::steady_clock::now();
         for (uint64_t block = 0u; block < configuration.blocks; ++block)
-            advanceBlock(context, configuration.blockTicks);
+        {
+            accountUnscheduledBlock(
+                context, configuration.blockTicks);
+        }
         runtime.vu0().continueExecution(
             runtime.memory().getVU0Code(), PS2_VU0_CODE_SIZE,
             runtime.memory().getVU0Data(), PS2_VU0_DATA_SIZE,

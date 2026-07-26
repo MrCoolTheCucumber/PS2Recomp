@@ -1643,11 +1643,13 @@ namespace ps2_stubs
             }
 
             R5900Context callbackCtx{};
+            callbackCtx = *callerCtx;
             uint32_t steps = 0u;
             bool reschedulePending = false;
             uint64_t handoffBaseline = 0u;
             {
-                PS2Runtime::GuestExecutionScope guestExecution(runtime);
+                PS2Runtime::GuestExecutionScope guestExecution(
+                    runtime, &callbackCtx);
                 // Stream callbacks receive the original guest address. Ring-aware
                 // callbacks rely on that address to handle source wrapping, so an
                 // arbitrary linear staging address is not protocol-compatible.
@@ -1656,7 +1658,6 @@ namespace ps2_stubs
                     return MpegCallbackDisposition::Failed;
                 }
 
-                callbackCtx = *callerCtx;
                 SET_GPR_U32(&callbackCtx, 4, event.mpegAddr);
                 SET_GPR_U32(&callbackCtx, 5, cbDataAddr);
                 SET_GPR_U32(&callbackCtx, 6, callback.data);

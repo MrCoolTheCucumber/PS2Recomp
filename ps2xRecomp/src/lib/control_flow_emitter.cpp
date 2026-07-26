@@ -127,7 +127,6 @@ namespace ps2recomp
 
     void ControlFlowEmitter::emitBasicBlockBoundary(std::string_view indent)
     {
-        m_ss << fmt::format("{}ctx->finishEeBasicBlock();\n", indent);
         m_ss << fmt::format(
             "{}runtime->advanceVU0AtEeBlockBoundary(rdram, ctx);\n",
             indent);
