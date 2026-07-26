@@ -118,6 +118,15 @@ namespace
     constexpr uint32_t kGuestHeapHardLimit = 0x01F00000u;
     constexpr uint32_t kElfSectionAlloc = 0x2u;
     constexpr uint32_t kElfSectionExecInstr = 0x4u;
+    constexpr uint32_t kEeCycleTickShift = 3u;
+    constexpr uint32_t kVu0SyncThresholdCycles = 4u;
+    constexpr uint32_t kVu0MinimumRunCycles = 16u;
+    // PCSX2 uses a 48-cycle rapid-event deadline when the EE must revisit
+    // asynchronous work in short order. VU0 is advanced only when an emitted
+    // EE block crosses this deadline, rather than at every branch.
+    constexpr uint32_t kEeRapidEventCycles = 48u;
+    constexpr uint32_t kVu0InitialEventDelayCycles =
+        kVu0MinimumRunCycles + 1u;
 
     constexpr uint32_t COP0_CAUSE_EXCCODE_MASK = 0x0000007Cu;
     constexpr uint32_t COP0_CAUSE_BD = 0x80000000u;
@@ -532,10 +541,9 @@ namespace
         ctx->vu0_vpu_stat2 = 0;
     }
 
-    void copyVu0ContextToState(const R5900Context *ctx, VU1State &state)
+    void copyVu0ContextRegistersToState(
+        const R5900Context *ctx, VU1State &state)
     {
-        std::memset(&state, 0, sizeof(state));
-
         for (uint32_t i = 0; i < 32u; ++i)
         {
             _mm_storeu_ps(state.vf[i], ctx->vu0_vf[i]);
@@ -549,10 +557,10 @@ namespace
         state.q = ctx->vu0_q;
         state.p = ctx->vu0_p;
         state.i = ctx->vu0_i;
-        state.pc = ctx->vu0_pc;
         state.mac = ctx->vu0_mac_flags;
         state.clip = ctx->vu0_clip_flags;
         state.status = ctx->vu0_status;
+        state.top = ctx->vu0_top;
         state.itop = ctx->vu0_itop;
 
         state.vf[0][0] = 0.0f;
@@ -560,6 +568,13 @@ namespace
         state.vf[0][2] = 0.0f;
         state.vf[0][3] = 1.0f;
         state.vi[0] = 0;
+    }
+
+    void copyVu0ContextToState(const R5900Context *ctx, VU1State &state)
+    {
+        std::memset(&state, 0, sizeof(state));
+        copyVu0ContextRegistersToState(ctx, state);
+        state.pc = ctx->vu0_pc;
     }
 
     void copyVu0StateToContext(const VU1State &state, R5900Context *ctx)
@@ -584,9 +599,6 @@ namespace
         ctx->vu0_itop = state.itop;
         ctx->vu0_pc = state.pc;
         ctx->vu0_tpc = state.pc;
-        ctx->vu0_vpu_stat = 0;
-        ctx->vu0_vpu_stat2 = 0;
-
         ctx->enforceVu0RegisterInvariants();
     }
 
@@ -837,6 +849,54 @@ PS2Runtime::PS2Runtime()
 {
     m_iopHost = std::make_unique<PS2IopHostAdapter>(*this);
     m_iopSubsystem = std::make_unique<ps2x::iop::IopSubsystem>(*m_iopHost);
+    m_vu0.setInstructionObserver(
+        [this](uint64_t, uint32_t pc, uint32_t lower, uint32_t upper,
+               const VU1State &state)
+        {
+            if (!m_debugVu0InstructionTraceEnabled.load(
+                    std::memory_order_relaxed) ||
+                !m_debugVu0InstructionTraceTriggered.load(
+                    std::memory_order_acquire))
+            {
+                return;
+            }
+
+            DebugVu0InstructionEntry entry{};
+            entry.invocation =
+                m_vu0CurrentInvocation.load(std::memory_order_relaxed);
+            entry.invocationInstruction =
+                m_vu0CurrentInvocationInstruction.fetch_add(
+                    1u, std::memory_order_relaxed);
+            entry.pc = pc;
+            entry.lower = lower;
+            entry.upper = upper;
+            for (size_t index = 0u; index < entry.vi.size(); ++index)
+            {
+                entry.vi[index] =
+                    static_cast<uint16_t>(state.vi[index]);
+            }
+            std::memcpy(
+                entry.vf.data(), state.vf, sizeof(state.vf));
+            std::memcpy(
+                entry.acc.data(), state.acc, sizeof(state.acc));
+            std::memcpy(&entry.q, &state.q, sizeof(entry.q));
+            std::memcpy(&entry.p, &state.p, sizeof(entry.p));
+            std::memcpy(&entry.i, &state.i, sizeof(entry.i));
+            entry.status = state.status;
+            entry.mac = state.mac;
+            entry.clip = state.clip;
+            entry.top = state.top;
+            entry.itop = state.itop;
+            entry.branchPending = state.branchPending;
+            entry.branchTarget = state.branchTarget;
+            entry.branchDelay = state.branchDelay;
+            entry.viBackupCycles = state.viBackupCycles;
+            entry.viBackupRegister = state.viBackupRegister;
+            entry.viBackupValue =
+                static_cast<uint16_t>(state.viBackupValue);
+            debugRecordVu0Instruction(std::move(entry));
+        });
+    m_vu0.setInstructionObserverEnabled(false);
 #if defined(PS2X_IOP_ENABLE_PLUGINS) && PS2X_IOP_ENABLE_PLUGINS && \
     !defined(PLATFORM_VITA) && (defined(_WIN32) || defined(__linux__))
     if (const char *applicationDirectory = GetApplicationDirectory();
@@ -850,6 +910,9 @@ PS2Runtime::PS2Runtime()
 
     // R0 is always zero in MIPS
     m_cpuContext.r[0] = _mm_set1_epi32(0);
+    // Recompiled ELFs enter after the console BIOS has enabled normal
+    // dual-issue, cache, non-blocking-load, and branch-prediction modes.
+    m_cpuContext.cop0_config = 0x00073443u;
 
     // Stack pointer (SP) and global pointer (GP) will be set by the loaded ELF
 
@@ -997,6 +1060,13 @@ bool PS2Runtime::syncCoreSubsystems()
     resetIop();
     m_vu0.reset();
     m_vu1.reset();
+    m_vu0CycleTick = 0u;
+    m_vu0LastObservedEeCycleTick = 0u;
+    m_vu0NextEventCycleTick = 0u;
+    m_vu0InvocationSequence.store(0u, std::memory_order_relaxed);
+    m_vu0CurrentInvocation.store(0u, std::memory_order_relaxed);
+    m_vu0CurrentInvocationInstruction.store(
+        0u, std::memory_order_relaxed);
 
     m_boundRdram = rdram;
     m_boundGSVram = gsVram;
@@ -1792,6 +1862,52 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
     SignalException(ctx, exception);
 }
 
+void PS2Runtime::debugArmVu0Traces(const R5900Context *ctx)
+{
+    if (!ctx)
+    {
+        return;
+    }
+
+    if (m_debugVu0SyncTraceEnabled.load(std::memory_order_acquire) &&
+        !m_debugVu0SyncTraceTriggered.load(std::memory_order_acquire) &&
+        m_debugVu0SyncTraceHasTrigger.load(std::memory_order_relaxed) &&
+        ctx->pc ==
+            m_debugVu0SyncTraceTriggerEePc.load(std::memory_order_relaxed))
+    {
+        // VCALLMS synchronizes before the new microprogram is active. Arm at
+        // that boundary so the following invocation is retained without
+        // fabricating an inactive sync entry.
+        m_debugVu0SyncTraceTriggered.store(true, std::memory_order_release);
+    }
+
+    if (m_debugVu0InstructionTraceEnabled.load(
+            std::memory_order_acquire) &&
+        !m_debugVu0InstructionTraceTriggered.load(
+            std::memory_order_acquire) &&
+        m_debugVu0InstructionTraceHasTrigger.load(
+            std::memory_order_relaxed) &&
+        ctx->pc ==
+            m_debugVu0InstructionTraceTriggerEePc.load(
+                std::memory_order_relaxed))
+    {
+        m_debugVu0InstructionTraceTriggered.store(
+            true, std::memory_order_release);
+    }
+}
+
+void PS2Runtime::beginVu0Invocation()
+{
+    const uint64_t invocation =
+        m_vu0InvocationSequence.fetch_add(
+            1u, std::memory_order_relaxed) +
+        1u;
+    m_vu0CurrentInvocation.store(
+        invocation, std::memory_order_relaxed);
+    m_vu0CurrentInvocationInstruction.store(
+        0u, std::memory_order_relaxed);
+}
+
 void PS2Runtime::executeVU0Microprogram(uint8_t *rdram, R5900Context *ctx, uint32_t address)
 {
     (void)rdram;
@@ -1808,17 +1924,248 @@ void PS2Runtime::executeVU0Microprogram(uint8_t *rdram, R5900Context *ctx, uint3
 
     m_vu0.reset();
     copyVu0ContextToState(ctx, m_vu0.state());
+    beginVu0Invocation();
     m_vu0.execute(vu0Code, PS2_VU0_CODE_SIZE,
                   vu0Data, PS2_VU0_DATA_SIZE,
                   m_gs, &m_memory,
-                  startPC, 0u, ctx->vu0_itop, 4096);
+                  startPC, 0u, ctx->vu0_itop);
     copyVu0StateToContext(m_vu0.state(), ctx);
+    ctx->vu0_vpu_stat =
+        (ctx->vu0_vpu_stat & ~1u) | (m_vu0.isActive() ? 1u : 0u);
+    const uint64_t eeCycleTick = ctx->committedEeCycleTicks();
+    m_vu0CycleTick = eeCycleTick;
+    m_vu0LastObservedEeCycleTick = eeCycleTick;
+    m_vu0NextEventCycleTick = 0u;
 }
 
 void PS2Runtime::vu0StartMicroProgram(uint8_t *rdram, R5900Context *ctx, uint32_t address)
 {
-    // VCALLMS and VCALLMSR both route here.
-    executeVU0Microprogram(rdram, ctx, address);
+    (void)rdram;
+
+    synchronizeVU0Microprogram(rdram, ctx, true);
+
+    uint8_t *const vu0Code = m_memory.getVU0Code();
+    uint8_t *const vu0Data = m_memory.getVU0Data();
+    const uint32_t startPC = address & ~0x7u;
+
+    if (!vu0Code || !vu0Data || startPC + 8u > PS2_VU0_CODE_SIZE)
+    {
+        seedVu0IdleSuccess(ctx);
+        return;
+    }
+
+    m_vu0.reset();
+    copyVu0ContextToState(ctx, m_vu0.state());
+    beginVu0Invocation();
+    m_vu0.execute(vu0Code, PS2_VU0_CODE_SIZE,
+                  vu0Data, PS2_VU0_DATA_SIZE,
+                  m_gs, &m_memory,
+                  startPC, 0u, ctx->vu0_itop, kVu0MinimumRunCycles);
+    copyVu0StateToContext(m_vu0.state(), ctx);
+    ctx->vu0_vpu_stat =
+        (ctx->vu0_vpu_stat & ~1u) | (m_vu0.isActive() ? 1u : 0u);
+    const uint64_t eeCycleTick = ctx->committedEeCycleTicks();
+    m_vu0CycleTick = eeCycleTick;
+    if (m_vu0.isActive())
+    {
+        m_vu0CycleTick +=
+            static_cast<uint64_t>(kVu0MinimumRunCycles)
+            << kEeCycleTickShift;
+    }
+    m_vu0LastObservedEeCycleTick = eeCycleTick;
+    m_vu0NextEventCycleTick =
+        eeCycleTick +
+        (static_cast<uint64_t>(kVu0InitialEventDelayCycles)
+         << kEeCycleTickShift);
+}
+
+void PS2Runtime::synchronizeVU0Microprogram(
+    uint8_t *rdram, R5900Context *ctx, bool interlocked)
+{
+    synchronizeVU0MicroprogramImpl(
+        rdram, ctx, interlocked, false);
+}
+
+void PS2Runtime::advanceVU0AtEeBlockBoundary(
+    uint8_t *rdram, R5900Context *ctx)
+{
+    synchronizeVU0MicroprogramImpl(
+        rdram, ctx, false, true);
+}
+
+void PS2Runtime::synchronizeVU0MicroprogramImpl(
+    uint8_t *rdram, R5900Context *ctx, bool interlocked,
+    bool blockBoundary)
+{
+    (void)rdram;
+
+    debugArmVu0Traces(ctx);
+    const bool traceEnabled =
+        m_debugVu0SyncTraceEnabled.load(std::memory_order_acquire);
+
+    if (!ctx)
+    {
+        return;
+    }
+
+    const uint64_t eeCycleTick = ctx->commitEeBlockCycles();
+    if (!m_vu0.isActive())
+    {
+        ctx->vu0_vpu_stat &= ~1u;
+        m_vu0CycleTick = eeCycleTick;
+        m_vu0LastObservedEeCycleTick = eeCycleTick;
+        m_vu0NextEventCycleTick = 0u;
+        return;
+    }
+
+    // Keep the VU clock at the same relative distance if a restored or
+    // switched EE context moves its fixed-point scheduling counter backwards.
+    if (eeCycleTick < m_vu0LastObservedEeCycleTick)
+    {
+        const uint64_t rewind =
+            m_vu0LastObservedEeCycleTick - eeCycleTick;
+        m_vu0CycleTick =
+            rewind < m_vu0CycleTick ? m_vu0CycleTick - rewind : 0u;
+        m_vu0NextEventCycleTick =
+            rewind < m_vu0NextEventCycleTick
+                ? m_vu0NextEventCycleTick - rewind
+                : 0u;
+    }
+    m_vu0LastObservedEeCycleTick = eeCycleTick;
+
+    DebugVu0SyncEntry traceEntry{};
+    bool traceSync =
+        traceEnabled &&
+        m_debugVu0SyncTraceTriggered.load(std::memory_order_acquire);
+    if (traceEnabled && !traceSync &&
+        m_debugVu0SyncTraceHasTrigger.load(std::memory_order_relaxed) &&
+        ctx->pc ==
+            m_debugVu0SyncTraceTriggerEePc.load(std::memory_order_relaxed))
+    {
+        m_debugVu0SyncTraceTriggered.store(true, std::memory_order_release);
+        traceSync = true;
+    }
+    if (traceSync)
+    {
+        const VU1State &state = m_vu0.state();
+        traceEntry.invocation =
+            m_vu0CurrentInvocation.load(std::memory_order_relaxed);
+        traceEntry.invocationInstruction =
+            m_vu0CurrentInvocationInstruction.load(
+                std::memory_order_relaxed);
+        traceEntry.eeCycleTicks = eeCycleTick;
+        traceEntry.vuCycleTicks = m_vu0CycleTick;
+        traceEntry.nextEventCycleTicks = m_vu0NextEventCycleTick;
+        traceEntry.eePc = ctx->pc;
+        traceEntry.vuPcBefore = state.pc;
+        traceEntry.contextVi1 = ctx->vi[1];
+        traceEntry.contextVi2 = ctx->vi[2];
+        traceEntry.vuVi1Before = static_cast<uint16_t>(state.vi[1]);
+        traceEntry.vuVi2Before = static_cast<uint16_t>(state.vi[2]);
+        traceEntry.interlocked = interlocked;
+        traceEntry.blockBoundary = blockBoundary;
+        traceEntry.activeBefore = m_vu0.isActive();
+        for (size_t index = 0u; index < 16u; ++index)
+        {
+            if (ctx->vi[index] != static_cast<uint16_t>(state.vi[index]))
+            {
+                traceEntry.pendingViMask |=
+                    static_cast<uint16_t>(1u << index);
+            }
+        }
+        for (size_t index = 0u; index < 32u; ++index)
+        {
+            if (std::memcmp(
+                    &ctx->vu0_vf[index], state.vf[index],
+                    sizeof(state.vf[index])) != 0)
+            {
+                traceEntry.pendingVfMask |= 1u << index;
+            }
+        }
+    }
+
+    uint32_t cycleBudget = 0u;
+    const bool eventDue =
+        blockBoundary &&
+        m_vu0NextEventCycleTick != 0u &&
+        eeCycleTick >= m_vu0NextEventCycleTick;
+    if (interlocked)
+    {
+        cycleBudget = 65536u;
+    }
+    else if (eeCycleTick > m_vu0CycleTick)
+    {
+        const uint64_t elapsedCycles =
+            (eeCycleTick - m_vu0CycleTick)
+            >> kEeCycleTickShift;
+        if (blockBoundary)
+        {
+            if (eventDue)
+            {
+                cycleBudget = static_cast<uint32_t>(
+                    std::min<uint64_t>(
+                        std::max<uint64_t>(
+                            elapsedCycles,
+                            kVu0MinimumRunCycles),
+                        65536u));
+            }
+        }
+        else if (elapsedCycles >= kVu0SyncThresholdCycles)
+        {
+            cycleBudget = static_cast<uint32_t>(
+                std::min<uint64_t>(
+                    std::max<uint64_t>(
+                        elapsedCycles,
+                        kVu0MinimumRunCycles),
+                    65536u));
+        }
+    }
+    if (eventDue)
+    {
+        const uint64_t intervalTicks =
+            static_cast<uint64_t>(kEeRapidEventCycles)
+            << kEeCycleTickShift;
+        do
+        {
+            m_vu0NextEventCycleTick += intervalTicks;
+        } while (m_vu0NextEventCycleTick <= eeCycleTick);
+    }
+
+    copyVu0ContextRegistersToState(ctx, m_vu0.state());
+    if (cycleBudget != 0u)
+    {
+        m_vu0.continueExecution(
+            m_memory.getVU0Code(), PS2_VU0_CODE_SIZE,
+            m_memory.getVU0Data(), PS2_VU0_DATA_SIZE,
+            m_gs, &m_memory, cycleBudget);
+    }
+    copyVu0StateToContext(m_vu0.state(), ctx);
+    ctx->vu0_vpu_stat =
+        (ctx->vu0_vpu_stat & ~1u) | (m_vu0.isActive() ? 1u : 0u);
+    if (interlocked || !m_vu0.isActive())
+    {
+        m_vu0CycleTick = eeCycleTick;
+    }
+    else
+    {
+        m_vu0CycleTick +=
+            static_cast<uint64_t>(cycleBudget) << kEeCycleTickShift;
+    }
+    if (!m_vu0.isActive())
+    {
+        m_vu0NextEventCycleTick = 0u;
+    }
+    if (traceSync)
+    {
+        const VU1State &state = m_vu0.state();
+        traceEntry.cycleBudget = cycleBudget;
+        traceEntry.eventDue = eventDue;
+        traceEntry.vuPcAfter = state.pc;
+        traceEntry.vuVi1After = static_cast<uint16_t>(state.vi[1]);
+        traceEntry.vuVi2After = static_cast<uint16_t>(state.vi[2]);
+        traceEntry.activeAfter = m_vu0.isActive();
+        debugRecordVu0Sync(std::move(traceEntry));
+    }
 }
 
 void PS2Runtime::handleSyscall(uint8_t *rdram, R5900Context *ctx)
@@ -3092,6 +3439,219 @@ void PS2Runtime::debugClearFault()
 {
     std::lock_guard<std::mutex> lock(m_debugFaultMutex);
     m_debugFault = {};
+}
+
+void PS2Runtime::debugStartVu0SyncTrace(
+    size_t maximumEntries, std::optional<uint32_t> triggerEePc,
+    bool stopOnFull)
+{
+    maximumEntries = std::clamp<size_t>(maximumEntries, 1u, 16384u);
+    std::lock_guard<std::mutex> lock(m_debugVu0SyncTraceMutex);
+    m_debugVu0SyncTraceEnabled.store(false, std::memory_order_release);
+    m_debugVu0SyncTrace.clear();
+    m_debugVu0SyncTrace.reserve(maximumEntries);
+    m_debugVu0SyncTraceCapacity = maximumEntries;
+    m_debugVu0SyncTraceNext = 0u;
+    m_debugVu0SyncTraceTotal = 0u;
+    m_debugVu0SyncTraceStopOnFull = stopOnFull;
+    m_debugVu0SyncTraceTriggerEePc.store(
+        triggerEePc.value_or(0u), std::memory_order_relaxed);
+    m_debugVu0SyncTraceHasTrigger.store(
+        triggerEePc.has_value(), std::memory_order_relaxed);
+    m_debugVu0SyncTraceTriggered.store(
+        !triggerEePc.has_value(), std::memory_order_release);
+    m_debugVu0SyncTraceEnabled.store(true, std::memory_order_release);
+}
+
+void PS2Runtime::debugRecordVu0Sync(DebugVu0SyncEntry entry)
+{
+    if (!m_debugVu0SyncTraceEnabled.load(std::memory_order_relaxed))
+    {
+        return;
+    }
+
+    std::lock_guard<std::mutex> lock(m_debugVu0SyncTraceMutex);
+    if (!m_debugVu0SyncTraceEnabled.load(std::memory_order_relaxed) ||
+        m_debugVu0SyncTraceCapacity == 0u)
+    {
+        return;
+    }
+
+    entry.sequence = ++m_debugVu0SyncTraceTotal;
+    if (m_debugVu0SyncTrace.size() < m_debugVu0SyncTraceCapacity)
+    {
+        m_debugVu0SyncTrace.push_back(std::move(entry));
+        if (m_debugVu0SyncTraceStopOnFull &&
+            m_debugVu0SyncTrace.size() == m_debugVu0SyncTraceCapacity)
+        {
+            m_debugVu0SyncTraceEnabled.store(
+                false, std::memory_order_release);
+        }
+        return;
+    }
+
+    m_debugVu0SyncTrace[m_debugVu0SyncTraceNext] = std::move(entry);
+    m_debugVu0SyncTraceNext =
+        (m_debugVu0SyncTraceNext + 1u) % m_debugVu0SyncTraceCapacity;
+}
+
+PS2Runtime::DebugVu0SyncTrace PS2Runtime::debugVu0SyncTraceSnapshot(bool stop)
+{
+    if (stop)
+    {
+        m_debugVu0SyncTraceEnabled.store(false, std::memory_order_release);
+    }
+
+    std::lock_guard<std::mutex> lock(m_debugVu0SyncTraceMutex);
+    DebugVu0SyncTrace snapshot{};
+    snapshot.enabled =
+        m_debugVu0SyncTraceEnabled.load(std::memory_order_acquire);
+    snapshot.triggered =
+        m_debugVu0SyncTraceTriggered.load(std::memory_order_acquire);
+    snapshot.stopOnFull = m_debugVu0SyncTraceStopOnFull;
+    if (m_debugVu0SyncTraceHasTrigger.load(std::memory_order_relaxed))
+    {
+        snapshot.triggerEePc =
+            m_debugVu0SyncTraceTriggerEePc.load(std::memory_order_relaxed);
+    }
+    snapshot.totalEntries = m_debugVu0SyncTraceTotal;
+    snapshot.droppedEntries =
+        m_debugVu0SyncTraceTotal > m_debugVu0SyncTrace.size()
+            ? m_debugVu0SyncTraceTotal - m_debugVu0SyncTrace.size()
+            : 0u;
+    snapshot.entries.reserve(m_debugVu0SyncTrace.size());
+    if (m_debugVu0SyncTrace.size() < m_debugVu0SyncTraceCapacity ||
+        m_debugVu0SyncTrace.empty())
+    {
+        snapshot.entries = m_debugVu0SyncTrace;
+        return snapshot;
+    }
+
+    for (size_t offset = 0u; offset < m_debugVu0SyncTrace.size(); ++offset)
+    {
+        snapshot.entries.push_back(
+            m_debugVu0SyncTrace[
+                (m_debugVu0SyncTraceNext + offset) %
+                m_debugVu0SyncTrace.size()]);
+    }
+    return snapshot;
+}
+
+void PS2Runtime::debugStartVu0InstructionTrace(
+    size_t maximumEntries, std::optional<uint32_t> triggerEePc,
+    bool stopOnFull)
+{
+    maximumEntries = std::clamp<size_t>(maximumEntries, 1u, 8192u);
+    m_vu0.setInstructionObserverEnabled(false);
+    std::lock_guard<std::mutex> lock(m_debugVu0InstructionTraceMutex);
+    m_debugVu0InstructionTraceEnabled.store(
+        false, std::memory_order_release);
+    m_debugVu0InstructionTrace.clear();
+    m_debugVu0InstructionTrace.reserve(maximumEntries);
+    m_debugVu0InstructionTraceCapacity = maximumEntries;
+    m_debugVu0InstructionTraceNext = 0u;
+    m_debugVu0InstructionTraceTotal = 0u;
+    m_debugVu0InstructionTraceStopOnFull = stopOnFull;
+    m_debugVu0InstructionTraceTriggerEePc.store(
+        triggerEePc.value_or(0u), std::memory_order_relaxed);
+    m_debugVu0InstructionTraceHasTrigger.store(
+        triggerEePc.has_value(), std::memory_order_relaxed);
+    m_debugVu0InstructionTraceTriggered.store(
+        !triggerEePc.has_value(), std::memory_order_release);
+    m_debugVu0InstructionTraceEnabled.store(
+        true, std::memory_order_release);
+    m_vu0.setInstructionObserverEnabled(true);
+}
+
+void PS2Runtime::debugRecordVu0Instruction(
+    DebugVu0InstructionEntry entry)
+{
+    if (!m_debugVu0InstructionTraceEnabled.load(
+            std::memory_order_relaxed))
+    {
+        return;
+    }
+
+    std::lock_guard<std::mutex> lock(m_debugVu0InstructionTraceMutex);
+    if (!m_debugVu0InstructionTraceEnabled.load(
+            std::memory_order_relaxed) ||
+        m_debugVu0InstructionTraceCapacity == 0u)
+    {
+        return;
+    }
+
+    entry.sequence = ++m_debugVu0InstructionTraceTotal;
+    if (m_debugVu0InstructionTrace.size() <
+        m_debugVu0InstructionTraceCapacity)
+    {
+        m_debugVu0InstructionTrace.push_back(std::move(entry));
+        if (m_debugVu0InstructionTraceStopOnFull &&
+            m_debugVu0InstructionTrace.size() ==
+                m_debugVu0InstructionTraceCapacity)
+        {
+            m_debugVu0InstructionTraceEnabled.store(
+                false, std::memory_order_release);
+        }
+        return;
+    }
+
+    m_debugVu0InstructionTrace[m_debugVu0InstructionTraceNext] =
+        std::move(entry);
+    m_debugVu0InstructionTraceNext =
+        (m_debugVu0InstructionTraceNext + 1u) %
+        m_debugVu0InstructionTraceCapacity;
+}
+
+PS2Runtime::DebugVu0InstructionTrace
+PS2Runtime::debugVu0InstructionTraceSnapshot(bool stop)
+{
+    if (stop)
+    {
+        m_vu0.setInstructionObserverEnabled(false);
+        m_debugVu0InstructionTraceEnabled.store(
+            false, std::memory_order_release);
+    }
+
+    std::lock_guard<std::mutex> lock(m_debugVu0InstructionTraceMutex);
+    DebugVu0InstructionTrace snapshot{};
+    snapshot.enabled =
+        m_debugVu0InstructionTraceEnabled.load(std::memory_order_acquire);
+    snapshot.triggered =
+        m_debugVu0InstructionTraceTriggered.load(
+            std::memory_order_acquire);
+    snapshot.stopOnFull = m_debugVu0InstructionTraceStopOnFull;
+    if (m_debugVu0InstructionTraceHasTrigger.load(
+            std::memory_order_relaxed))
+    {
+        snapshot.triggerEePc =
+            m_debugVu0InstructionTraceTriggerEePc.load(
+                std::memory_order_relaxed);
+    }
+    snapshot.totalEntries = m_debugVu0InstructionTraceTotal;
+    snapshot.droppedEntries =
+        m_debugVu0InstructionTraceTotal >
+                m_debugVu0InstructionTrace.size()
+            ? m_debugVu0InstructionTraceTotal -
+                  m_debugVu0InstructionTrace.size()
+            : 0u;
+    snapshot.entries.reserve(m_debugVu0InstructionTrace.size());
+    if (m_debugVu0InstructionTrace.size() <
+            m_debugVu0InstructionTraceCapacity ||
+        m_debugVu0InstructionTrace.empty())
+    {
+        snapshot.entries = m_debugVu0InstructionTrace;
+        return snapshot;
+    }
+
+    for (size_t offset = 0u;
+         offset < m_debugVu0InstructionTrace.size(); ++offset)
+    {
+        snapshot.entries.push_back(
+            m_debugVu0InstructionTrace[
+                (m_debugVu0InstructionTraceNext + offset) %
+                m_debugVu0InstructionTrace.size()]);
+    }
+    return snapshot;
 }
 
 std::vector<uint32_t> PS2Runtime::debugBreakpoints() const

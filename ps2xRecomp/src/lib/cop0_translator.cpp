@@ -108,7 +108,7 @@ namespace ps2recomp
             case COP0_REG_PRID:
                 return "// MTC0 to PRID register ignored (read-only)";
             case COP0_REG_CONFIG:
-                return fmt::format("ctx->cop0_config = (ctx->cop0_config & ~0x7) | (GPR_U32(ctx, {}) & 0x7);", rt);
+                return fmt::format("ctx->cop0_config = (GPR_U32(ctx, {}) & ~0xFC0u) | 0x440u;", rt);
             case COP0_REG_BADPADDR:
                 return "// MTC0 to BADPADDR register ignored (read-only)";
             case COP0_REG_DEBUG:

@@ -157,7 +157,7 @@ namespace ps2recomp
         return fmt::format(
             "{{ "
             "    ctx->vu0_tpc = 0x{:X}; " // Set target program counter
-            "    runtime->executeVU0Microprogram(rdram, ctx, 0x{:X}); "
+            "    runtime->vu0StartMicroProgram(rdram, ctx, 0x{:X}); "
             "}}",
             target_byte_addr, target_byte_addr);
     }

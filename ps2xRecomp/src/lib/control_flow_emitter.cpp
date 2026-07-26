@@ -1,6 +1,7 @@
 #include "ps2recomp/Emitters/control_flow_emitter.h"
 
 #include "ps2recomp/control_flow_utils.h"
+#include "ps2recomp/ee_cycle_model.h"
 #include "ps2recomp/instructions.h"
 #include "ps2recomp/r5900_decoder.h"
 #include "ps2_runtime_calls.h"
@@ -124,10 +125,25 @@ namespace ps2recomp
         return code;
     }
 
+    void ControlFlowEmitter::emitBasicBlockBoundary(std::string_view indent)
+    {
+        m_ss << fmt::format("{}ctx->finishEeBasicBlock();\n", indent);
+        m_ss << fmt::format(
+            "{}runtime->advanceVU0AtEeBlockBoundary(rdram, ctx);\n",
+            indent);
+    }
+
     void ControlFlowEmitter::emitDelaySlot(std::string_view indent)
     {
+        m_ss << fmt::format("{}++ctx->insn_count;\n", indent);
+        m_ss << fmt::format(
+            "{}ctx->advanceEeCycleTicks({}u);\n",
+            indent,
+            eeInstructionCycleTicks(m_delaySlot));
+
         if (!hasRealDelaySlot())
         {
+            emitBasicBlockBoundary(indent);
             return;
         }
 
@@ -147,6 +163,7 @@ namespace ps2recomp
         }
 
         m_ss << fmt::format("{}ctx->in_delay_slot = false;\n", indent);
+        emitBasicBlockBoundary(indent);
     }
 
     void ControlFlowEmitter::emitResumeFromDelaySlotEntry()
@@ -498,6 +515,9 @@ namespace ps2recomp
                 m_ss << fmt::format("            ctx->pc = 0x{:X}u;\n", target);
                 m_ss << "            return;\n";
             }
+            m_ss << "        }\n";
+            m_ss << "        if (!" << branchTakenVar << ") {\n";
+            emitBasicBlockBoundary("            ");
             m_ss << "        }\n";
         }
         else

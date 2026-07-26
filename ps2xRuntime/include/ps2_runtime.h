@@ -1,6 +1,7 @@
 #ifndef PS2_RUNTIME_H
 #define PS2_RUNTIME_H
 
+#include <algorithm>
 #include <cstring>
 #include <cstdint>
 #include <vector>
@@ -23,6 +24,7 @@
 #include <iostream>
 #include <iomanip>
 #include <memory>
+#include <optional>
 
 #include "ps2_log.h"
 #include "runtime/ps2_address.h"
@@ -80,8 +82,11 @@ struct alignas(16) R5900Context
     __m128i r[32]; // Main registers
 
     // Control registers
-    uint32_t pc;         // Program counter
-    uint64_t insn_count; // Instruction counter
+    uint32_t pc;             // Program counter
+    uint64_t insn_count;     // Retired instruction counter
+    uint64_t ee_cycle_ticks; // Three-bit fixed-point EE cycles (8 ticks/cycle)
+    uint32_t ee_block_cycle_ticks;
+    bool ee_block_cycle_active;
     uint64_t hi, lo;     // Lower 64-bit lanes of the 128-bit HI/LO registers
     uint64_t hi1, lo1;   // Upper lanes, also used by scalar MULT1/DIV1 operations
     uint32_t sa;         // Shift amount register
@@ -168,6 +173,68 @@ struct alignas(16) R5900Context
         vi[0] = 0;
     }
 
+    void advanceEeCycleTicks(uint32_t dualIssueTicks)
+    {
+        const uint32_t issueScale = 2u - ((cop0_config >> 18u) & 1u);
+        const uint32_t ticks = dualIssueTicks * issueScale;
+        ee_cycle_ticks += ticks;
+        ee_block_cycle_ticks += ticks;
+        ee_block_cycle_active = true;
+    }
+
+    uint64_t commitEeBlockCycles()
+    {
+        if (!ee_block_cycle_active ||
+            ee_block_cycle_ticks > ee_cycle_ticks)
+        {
+            ee_block_cycle_ticks = 0u;
+            ee_block_cycle_active = false;
+            return ee_cycle_ticks & ~uint64_t{7u};
+        }
+
+        const uint64_t baseTicks =
+            ee_cycle_ticks - ee_block_cycle_ticks;
+        const uint64_t committedCycles =
+            std::max<uint64_t>(ee_block_cycle_ticks >> 3u, 1u);
+        ee_block_cycle_ticks &= 7u;
+        ee_cycle_ticks =
+            baseTicks + (committedCycles << 3u) + ee_block_cycle_ticks;
+        return ee_cycle_ticks - ee_block_cycle_ticks;
+    }
+
+    uint64_t committedEeCycleTicks() const
+    {
+        if (!ee_block_cycle_active ||
+            ee_block_cycle_ticks > ee_cycle_ticks)
+        {
+            return ee_cycle_ticks & ~uint64_t{7u};
+        }
+        return ee_cycle_ticks - ee_block_cycle_ticks;
+    }
+
+    void finishEeBasicBlock()
+    {
+        // PCSX2's EE recompiler accumulates three-bit fixed-point issue time
+        // inside a block. Its block commit is at least one cycle, and then the
+        // fractional remainder is discarded when the block ends.
+        if (ee_block_cycle_active &&
+            ee_block_cycle_ticks <= ee_cycle_ticks)
+        {
+            const uint64_t baseTicks =
+                ee_cycle_ticks - ee_block_cycle_ticks;
+            const uint64_t committedCycles =
+                std::max<uint64_t>(ee_block_cycle_ticks >> 3u, 1u);
+            ee_cycle_ticks =
+                baseTicks + (committedCycles << 3u);
+        }
+        else
+        {
+            ee_cycle_ticks &= ~uint64_t{7u};
+        }
+        ee_block_cycle_ticks = 0u;
+        ee_block_cycle_active = false;
+    }
+
     R5900Context()
     {
         std::memset(this, 0, sizeof(*this));
@@ -183,6 +250,7 @@ struct alignas(16) R5900Context
         // 0x00000000 = Normal mode (after BIOS handoff).
         cop0_status = 0x00000000;
         cop0_prid = 0x00002e20; // CPU ID for R5900
+        cop0_config = 0x00073443; // Normal post-BIOS EE configuration
 
         in_delay_slot = false;
         branch_pc = 0;
@@ -440,6 +508,82 @@ public:
         MissingFunctionPolicy policy = MissingFunctionPolicy::ContinueToTarget;
     };
 
+    struct DebugVu0SyncEntry
+    {
+        uint64_t sequence = 0u;
+        uint64_t invocation = 0u;
+        uint64_t invocationInstruction = 0u;
+        uint64_t eeCycleTicks = 0u;
+        uint64_t vuCycleTicks = 0u;
+        uint64_t nextEventCycleTicks = 0u;
+        uint32_t eePc = 0u;
+        uint32_t cycleBudget = 0u;
+        uint32_t vuPcBefore = 0u;
+        uint32_t vuPcAfter = 0u;
+        uint32_t pendingVfMask = 0u;
+        uint16_t pendingViMask = 0u;
+        uint16_t contextVi1 = 0u;
+        uint16_t contextVi2 = 0u;
+        uint16_t vuVi1Before = 0u;
+        uint16_t vuVi2Before = 0u;
+        uint16_t vuVi1After = 0u;
+        uint16_t vuVi2After = 0u;
+        bool interlocked = false;
+        bool blockBoundary = false;
+        bool eventDue = false;
+        bool activeBefore = false;
+        bool activeAfter = false;
+    };
+
+    struct DebugVu0SyncTrace
+    {
+        bool enabled = false;
+        bool triggered = false;
+        bool stopOnFull = false;
+        std::optional<uint32_t> triggerEePc;
+        uint64_t totalEntries = 0u;
+        uint64_t droppedEntries = 0u;
+        std::vector<DebugVu0SyncEntry> entries;
+    };
+
+    struct DebugVu0InstructionEntry
+    {
+        uint64_t sequence = 0u;
+        uint64_t invocation = 0u;
+        uint64_t invocationInstruction = 0u;
+        uint32_t pc = 0u;
+        uint32_t lower = 0u;
+        uint32_t upper = 0u;
+        std::array<uint16_t, 16> vi{};
+        std::array<uint32_t, 32 * 4> vf{};
+        std::array<uint32_t, 4> acc{};
+        uint32_t q = 0u;
+        uint32_t p = 0u;
+        uint32_t i = 0u;
+        uint32_t status = 0u;
+        uint32_t mac = 0u;
+        uint32_t clip = 0u;
+        uint32_t top = 0u;
+        uint32_t itop = 0u;
+        uint32_t branchTarget = 0u;
+        uint32_t branchDelay = 0u;
+        uint16_t viBackupValue = 0u;
+        uint8_t viBackupCycles = 0u;
+        uint8_t viBackupRegister = 0u;
+        bool branchPending = false;
+    };
+
+    struct DebugVu0InstructionTrace
+    {
+        bool enabled = false;
+        bool triggered = false;
+        bool stopOnFull = false;
+        std::optional<uint32_t> triggerEePc;
+        uint64_t totalEntries = 0u;
+        uint64_t droppedEntries = 0u;
+        std::vector<DebugVu0InstructionEntry> entries;
+    };
+
     class GuestExecutionScope
     {
     public:
@@ -514,6 +658,11 @@ public:
 
     void executeVU0Microprogram(uint8_t *rdram, R5900Context *ctx, uint32_t address);
     void vu0StartMicroProgram(uint8_t *rdram, R5900Context *ctx, uint32_t address);
+    void synchronizeVU0Microprogram(uint8_t *rdram,
+                                    R5900Context *ctx,
+                                    bool interlocked);
+    void advanceVU0AtEeBlockBoundary(uint8_t *rdram,
+                                     R5900Context *ctx);
 
 public:
     void handleSyscall(uint8_t *rdram, R5900Context *ctx);
@@ -562,12 +711,23 @@ public:
     DebugStopInfo debugStepDispatches(uint64_t count, std::chrono::milliseconds timeout);
     R5900Context debugCpuSnapshot();
     bool debugReadRdram(uint32_t address, uint32_t size, std::vector<uint8_t> &output);
+    bool debugReadMemory(uint32_t address, uint32_t size, std::vector<uint8_t> &output);
     bool debugCopyGsVram(std::vector<uint8_t> &output);
     DebugRuntimeProgress debugRuntimeProgress() const;
     std::vector<DebugBranchEntry> debugBranchHistory(
         size_t maximumEntries = 256u) const;
     DebugFaultInfo debugFaultSnapshot() const;
     void debugClearFault();
+    void debugStartVu0SyncTrace(
+        size_t maximumEntries,
+        std::optional<uint32_t> triggerEePc = std::nullopt,
+        bool stopOnFull = false);
+    DebugVu0SyncTrace debugVu0SyncTraceSnapshot(bool stop);
+    void debugStartVu0InstructionTrace(
+        size_t maximumEntries,
+        std::optional<uint32_t> triggerEePc = std::nullopt,
+        bool stopOnFull = false);
+    DebugVu0InstructionTrace debugVu0InstructionTraceSnapshot(bool stop);
 
     std::vector<uint32_t> debugBreakpoints() const;
     void debugAddBreakpoint(uint32_t address);
@@ -668,6 +828,10 @@ private:
     void debugRefreshControlActiveLocked();
     void debugRecordBranch(uint32_t pc);
     void debugRecordFault(const DebugFaultInfo &fault);
+    void debugRecordVu0Sync(DebugVu0SyncEntry entry);
+    void debugRecordVu0Instruction(DebugVu0InstructionEntry entry);
+    void debugArmVu0Traces(const R5900Context *ctx);
+    void beginVu0Invocation();
 
     [[noreturn]] void HandleIntegerOverflow(R5900Context *ctx);
 
@@ -682,6 +846,11 @@ private:
     friend class PS2DebugServer;
 
 private:
+    void synchronizeVU0MicroprogramImpl(uint8_t *rdram,
+                                        R5900Context *ctx,
+                                        bool interlocked,
+                                        bool blockBoundary);
+
     PS2Memory m_memory;
     GifArbiter m_gifArbiter;
     GS m_gs;
@@ -691,6 +860,12 @@ private:
     PSPadBackend m_padBackend;
     VU1Interpreter m_vu0;
     VU1Interpreter m_vu1;
+    uint64_t m_vu0CycleTick = 0u;
+    uint64_t m_vu0LastObservedEeCycleTick = 0u;
+    uint64_t m_vu0NextEventCycleTick = 0u;
+    std::atomic<uint64_t> m_vu0InvocationSequence{0u};
+    std::atomic<uint64_t> m_vu0CurrentInvocation{0u};
+    std::atomic<uint64_t> m_vu0CurrentInvocationInstruction{0u};
     R5900Context m_cpuContext;
     mutable std::recursive_timed_mutex m_guestExecutionMutex;
     mutable std::atomic<uint32_t> m_guestExecutionWaiters{0u};
@@ -730,6 +905,26 @@ private:
     mutable std::mutex m_debugFaultMutex;
     DebugFaultInfo m_debugFault{};
     std::atomic<uint64_t> m_debugFaultSequence{0u};
+    std::atomic<bool> m_debugVu0SyncTraceEnabled{false};
+    std::atomic<bool> m_debugVu0SyncTraceTriggered{false};
+    std::atomic<bool> m_debugVu0SyncTraceHasTrigger{false};
+    std::atomic<uint32_t> m_debugVu0SyncTraceTriggerEePc{0u};
+    mutable std::mutex m_debugVu0SyncTraceMutex;
+    std::vector<DebugVu0SyncEntry> m_debugVu0SyncTrace;
+    size_t m_debugVu0SyncTraceCapacity = 0u;
+    size_t m_debugVu0SyncTraceNext = 0u;
+    uint64_t m_debugVu0SyncTraceTotal = 0u;
+    bool m_debugVu0SyncTraceStopOnFull = false;
+    std::atomic<bool> m_debugVu0InstructionTraceEnabled{false};
+    std::atomic<bool> m_debugVu0InstructionTraceTriggered{false};
+    std::atomic<bool> m_debugVu0InstructionTraceHasTrigger{false};
+    std::atomic<uint32_t> m_debugVu0InstructionTraceTriggerEePc{0u};
+    mutable std::mutex m_debugVu0InstructionTraceMutex;
+    std::vector<DebugVu0InstructionEntry> m_debugVu0InstructionTrace;
+    size_t m_debugVu0InstructionTraceCapacity = 0u;
+    size_t m_debugVu0InstructionTraceNext = 0u;
+    uint64_t m_debugVu0InstructionTraceTotal = 0u;
+    bool m_debugVu0InstructionTraceStopOnFull = false;
     mutable std::mutex m_debugControlMutex;
     mutable std::condition_variable m_debugControlCv;
     uint64_t m_debugStopSequence = 0u;

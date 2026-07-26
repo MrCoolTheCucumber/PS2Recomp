@@ -9,6 +9,12 @@
 
 namespace ps2recomp
 {
+    enum class Vu0SyncMode : uint8_t
+    {
+        Skip,
+        Synchronize,
+        Finish,
+    };
 
     // Instruction representation
     struct Instruction
@@ -46,6 +52,9 @@ namespace ps2recomp
         bool isMmio = false;
         uint32_t mmioAddress = 0;
         std::string disassembly;
+        // Populated by the function-level VU0 scheduling pass. Standalone
+        // instruction translation remains conservative.
+        Vu0SyncMode vu0SyncMode = Vu0SyncMode::Synchronize;
 
         struct
         {

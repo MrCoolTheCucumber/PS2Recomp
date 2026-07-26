@@ -94,6 +94,45 @@ namespace
                0x28u;
     }
 
+    uint32_t makeVuIsubiu(uint8_t it, uint8_t is, uint16_t imm)
+    {
+        return (0x09u << 25) |
+               (static_cast<uint32_t>((imm >> 11) & 0xFu) << 21) |
+               (static_cast<uint32_t>(it & 0xFu) << 16) |
+               (static_cast<uint32_t>(is & 0xFu) << 11) |
+               (static_cast<uint32_t>(imm) & 0x7FFu);
+    }
+
+    uint32_t makeVuIaddiu(uint8_t it, uint8_t is, uint16_t imm)
+    {
+        return (0x08u << 25) |
+               (static_cast<uint32_t>((imm >> 11) & 0xFu) << 21) |
+               (static_cast<uint32_t>(it & 0xFu) << 16) |
+               (static_cast<uint32_t>(is & 0xFu) << 11) |
+               (static_cast<uint32_t>(imm) & 0x7FFu);
+    }
+
+    uint32_t makeVuIbeq(uint8_t it, uint8_t is, int16_t imm)
+    {
+        return (0x28u << 25) |
+               (static_cast<uint32_t>(it & 0xFu) << 16) |
+               (static_cast<uint32_t>(is & 0xFu) << 11) |
+               (static_cast<uint32_t>(imm) & 0x7FFu);
+    }
+
+    uint32_t makeVuBranch(int16_t imm)
+    {
+        return (0x20u << 25) |
+               (static_cast<uint32_t>(imm) & 0x7FFu);
+    }
+
+    uint32_t makeVuIbgtz(uint8_t is, int16_t imm)
+    {
+        return (0x2Du << 25) |
+               (static_cast<uint32_t>(is & 0xFu) << 11) |
+               (static_cast<uint32_t>(imm) & 0x7FFu);
+    }
+
     void writeVuInstructionPair(uint8_t *code, uint32_t pc, uint32_t lower, uint32_t upper)
     {
         std::memcpy(code + pc, &lower, sizeof(lower));
@@ -2968,6 +3007,48 @@ void register_ps2_runtime_expansion_tests()
             t.Equals(mem.vif1_regs.itop, 0x21u, "MSCNT should keep latching ITOP from ITOPS");
         });
 
+        tc.Run("EE cycle ticks honor the post-BIOS dual-issue configuration", [](TestCase &t)
+        {
+            R5900Context context{};
+            t.Equals(
+                context.cop0_config, 0x00073443u,
+                "standalone recompiled ELF context should start in the normal post-BIOS mode");
+
+            context.advanceEeCycleTicks(9u);
+            t.Equals(
+                context.ee_cycle_ticks, 9u,
+                "dual-issue mode should use the base fixed-point weight");
+
+            context.cop0_config &= ~(1u << 18u);
+            context.advanceEeCycleTicks(9u);
+            t.Equals(
+                context.ee_cycle_ticks, 27u,
+                "single-issue mode should double subsequent issue time");
+
+            context.finishEeBasicBlock();
+            t.Equals(
+                context.ee_cycle_ticks, 24u,
+                "an EE block boundary should retain only whole cycles");
+
+            R5900Context splitBlock{};
+            splitBlock.advanceEeCycleTicks(9u);
+            t.Equals(
+                splitBlock.commitEeBlockCycles(), 8u,
+                "an in-block synchronization should expose whole EE cycles");
+            t.Equals(
+                splitBlock.ee_cycle_ticks, 9u,
+                "an in-block synchronization should retain fractional issue time");
+            splitBlock.finishEeBasicBlock();
+            t.Equals(
+                splitBlock.ee_cycle_ticks, 16u,
+                "the final block commit should preserve PCSX2's one-cycle minimum");
+
+            PS2Runtime runtime;
+            t.Equals(
+                runtime.debugCpuSnapshot().cop0_config, 0x00073443u,
+                "runtime initialization should preserve the post-BIOS configuration");
+        });
+
         tc.Run("VU0 microprogram executes against VU0 code and data memory", [](TestCase &t)
         {
             PS2Runtime runtime;
@@ -3002,6 +3083,389 @@ void register_ps2_runtime_expansion_tests()
             _mm_storeu_ps(vf2, ctx.vu0_vf[2]);
             t.Equals(vf2[0], 2.0f, "VU0 VF2.x should copy back to CPU context");
             t.Equals(static_cast<uint32_t>(ctx.vi[0]), 0u, "VU0 VI0 should remain zero");
+        });
+
+        tc.Run("VU0 microprogram may complete after more than 4096 instruction pairs", [](TestCase &t)
+        {
+            PS2Runtime runtime;
+            t.IsTrue(runtime.memory().initialize(), "PS2Memory initialize should succeed");
+            t.IsTrue(runtime.syncCoreSubsystems(), "runtime core subsystems should bind");
+
+            uint8_t *const code = runtime.memory().getVU0Code();
+            std::memset(code, 0, PS2_VU0_CODE_SIZE);
+
+            constexpr uint32_t kVuNop = 0x0000003Fu;
+            constexpr uint32_t kVuEndNop = 0x4000003Fu;
+            writeVuInstructionPair(
+                code, 0u, makeVuIsubiu(1u, 1u, 1u), kVuNop);
+            writeVuInstructionPair(
+                code, 8u, makeVuIbgtz(1u, -2), kVuNop);
+            writeVuInstructionPair(code, 16u, 0u, kVuNop);
+            writeVuInstructionPair(code, 24u, 0u, kVuEndNop);
+            writeVuInstructionPair(code, 32u, 0u, kVuNop);
+
+            R5900Context ctx{};
+            ctx.vi[1] = 1370u;
+            runtime.executeVU0Microprogram(
+                runtime.memory().getRDRAM(), &ctx, 0u);
+
+            t.Equals(
+                static_cast<uint32_t>(ctx.vi[1]), 0u,
+                "VU0 should reach the E-bit instead of stopping at an internal cycle guard");
+            t.Equals(
+                ctx.vu0_pc, 40u,
+                "VU0 should execute the instruction pair after the E-bit before ending");
+        });
+
+        tc.Run("VU0 microprogram observes a non-interlocked EE register write", [](TestCase &t)
+        {
+            PS2Runtime runtime;
+            t.IsTrue(runtime.memory().initialize(), "PS2Memory initialize should succeed");
+            t.IsTrue(runtime.syncCoreSubsystems(), "runtime core subsystems should bind");
+
+            uint8_t *const code = runtime.memory().getVU0Code();
+            std::memset(code, 0, PS2_VU0_CODE_SIZE);
+
+            constexpr uint32_t kVuNop = 0x0000003Fu;
+            constexpr uint32_t kVuEndNop = 0x4000003Fu;
+            writeVuInstructionPair(
+                code, 0u, makeVuIaddiu(1u, 0u, 1u), kVuNop);
+            writeVuInstructionPair(
+                code, 8u, makeVuIbeq(1u, 0u, 3), kVuNop);
+            writeVuInstructionPair(code, 16u, 0u, kVuNop);
+            writeVuInstructionPair(
+                code, 24u, makeVuBranch(-3), kVuNop);
+            writeVuInstructionPair(code, 32u, 0u, kVuNop);
+            writeVuInstructionPair(
+                code, 40u, makeVuIaddiu(2u, 0u, 7u), kVuEndNop);
+            writeVuInstructionPair(code, 48u, 0u, kVuNop);
+
+            R5900Context ctx{};
+            ctx.insn_count = 100u;
+            ctx.ee_cycle_ticks = 800u;
+            runtime.vu0StartMicroProgram(
+                runtime.memory().getRDRAM(), &ctx, 0u);
+
+            t.IsTrue(
+                (ctx.vu0_vpu_stat & 1u) != 0u,
+                "VCALLMS should leave VU0 active while EE execution continues");
+
+            const uint32_t startupPc = ctx.vu0_pc;
+            ctx.insn_count = 99u;
+            ctx.ee_cycle_ticks = 799u;
+            runtime.synchronizeVU0Microprogram(
+                runtime.memory().getRDRAM(), &ctx, false);
+            t.Equals(
+                ctx.vu0_pc, startupPc,
+                "an EE instruction-counter reset should not become a huge VU0 time jump");
+
+            ctx.ee_cycle_ticks += 7u;
+            runtime.synchronizeVU0Microprogram(
+                runtime.memory().getRDRAM(), &ctx, false);
+            t.Equals(
+                ctx.vu0_pc, startupPc,
+                "a fractional EE cycle should not prematurely advance VU0");
+
+            ctx.insn_count += 8u;
+            ctx.ee_cycle_ticks += 57u;
+            runtime.synchronizeVU0Microprogram(
+                runtime.memory().getRDRAM(), &ctx, false);
+            t.Equals(
+                static_cast<uint32_t>(ctx.vi[1]), 1u,
+                "VU0 should reach its EE handshake loop");
+            t.Equals(
+                static_cast<uint32_t>(ctx.vi[2]), 0u,
+                "VU0 should not pass the handshake before the EE write");
+
+            ctx.vi[1] = 0u;
+            ctx.insn_count += 5u;
+            ctx.ee_cycle_ticks += 104u;
+            runtime.synchronizeVU0Microprogram(
+                runtime.memory().getRDRAM(), &ctx, false);
+
+            t.Equals(
+                static_cast<uint32_t>(ctx.vi[2]), 7u,
+                "the running microprogram should observe the non-interlocked VI write");
+            t.IsTrue(
+                (ctx.vu0_vpu_stat & 1u) == 0u,
+                "VU0 should become idle after its E-bit delay slot");
+            t.Equals(
+                ctx.vu0_pc, 56u,
+                "VU0 should stop after the E-bit delay-slot instruction pair");
+        });
+
+        tc.Run("VU0 block boundaries advance only at rapid event deadlines", [](TestCase &t)
+        {
+            PS2Runtime runtime;
+            t.IsTrue(runtime.memory().initialize(), "PS2Memory initialize should succeed");
+            t.IsTrue(runtime.syncCoreSubsystems(), "runtime core subsystems should bind");
+
+            uint8_t *const code = runtime.memory().getVU0Code();
+            std::memset(code, 0, PS2_VU0_CODE_SIZE);
+
+            constexpr uint32_t kVuNop = 0x0000003Fu;
+            writeVuInstructionPair(
+                code, 0u, makeVuIaddiu(1u, 0u, 1u), kVuNop);
+            writeVuInstructionPair(
+                code, 8u, makeVuBranch(-1), kVuNop);
+            writeVuInstructionPair(code, 16u, 0u, kVuNop);
+
+            R5900Context ctx{};
+            ctx.ee_cycle_ticks = 800u;
+            runtime.vu0StartMicroProgram(
+                runtime.memory().getRDRAM(), &ctx, 0u);
+            t.IsTrue(
+                (ctx.vu0_vpu_stat & 1u) != 0u,
+                "the loop fixture should leave VU0 active");
+
+            runtime.debugStartVu0SyncTrace(4u, std::nullopt, true);
+            runtime.debugStartVu0InstructionTrace(
+                64u, std::nullopt, false);
+
+            ctx.ee_cycle_ticks += 128u;
+            runtime.advanceVU0AtEeBlockBoundary(
+                runtime.memory().getRDRAM(), &ctx);
+            ctx.ee_cycle_ticks += 40u;
+            runtime.advanceVU0AtEeBlockBoundary(
+                runtime.memory().getRDRAM(), &ctx);
+            ctx.ee_cycle_ticks += 40u;
+            runtime.advanceVU0AtEeBlockBoundary(
+                runtime.memory().getRDRAM(), &ctx);
+            ctx.ee_cycle_ticks += 80u;
+            runtime.synchronizeVU0Microprogram(
+                runtime.memory().getRDRAM(), &ctx, false);
+
+            const PS2Runtime::DebugVu0SyncTrace trace =
+                runtime.debugVu0SyncTraceSnapshot(false);
+            t.Equals(
+                trace.entries.size(), static_cast<size_t>(4u),
+                "all four active scheduling boundaries should be traced");
+            if (trace.entries.size() == 4u)
+            {
+                t.IsTrue(
+                    trace.entries[0].blockBoundary,
+                    "the pre-deadline call should be identified as a block boundary");
+                t.IsFalse(
+                    trace.entries[0].eventDue,
+                    "the first block should remain before the rapid event deadline");
+                t.Equals(
+                    trace.entries[0].cycleBudget, 0u,
+                    "a block boundary should not run before its event deadline");
+                t.IsTrue(
+                    trace.entries[1].blockBoundary,
+                    "the deadline call should remain a block boundary");
+                t.IsTrue(
+                    trace.entries[1].eventDue,
+                    "the second block should cross the rapid event deadline");
+                t.Equals(
+                    trace.entries[1].cycleBudget, 16u,
+                    "a due event should retain the minimum VU execution batch");
+                t.IsTrue(
+                    trace.entries[2].blockBoundary,
+                    "the post-deadline call should remain a block boundary");
+                t.IsFalse(
+                    trace.entries[2].eventDue,
+                    "the next rapid event should still be in the future");
+                t.Equals(
+                    trace.entries[2].cycleBudget, 0u,
+                    "a block should not run twice for one rapid event");
+                t.IsFalse(
+                    trace.entries[3].blockBoundary,
+                    "a COP2-style synchronization should not be a block boundary");
+                t.Equals(
+                    trace.entries[3].cycleBudget, 16u,
+                    "a non-interlocked COP2 sync should retain its minimum batch");
+                t.Equals(
+                    trace.entries[3].invocation,
+                    trace.entries[0].invocation,
+                    "sync trace entries should identify their VU0 invocation");
+                t.IsTrue(
+                    trace.entries[2].invocationInstruction >
+                        trace.entries[1].invocationInstruction,
+                    "the post-event trace should expose the completed VU batch");
+                t.Equals(
+                    trace.entries[3].invocationInstruction,
+                    trace.entries[2].invocationInstruction,
+                    "a skipped block should preserve the next exact VU boundary");
+                t.IsTrue(
+                    trace.entries[2].nextEventCycleTicks >
+                        trace.entries[1].nextEventCycleTicks,
+                    "servicing an event should schedule a later deadline");
+            }
+            (void)runtime.debugVu0InstructionTraceSnapshot(true);
+        });
+
+        tc.Run("VU0 sync trace may wait for an EE PC trigger", [](TestCase &t)
+        {
+            PS2Runtime runtime;
+            t.IsTrue(runtime.memory().initialize(), "PS2Memory initialize should succeed");
+            t.IsTrue(runtime.syncCoreSubsystems(), "runtime core subsystems should bind");
+
+            uint8_t *const code = runtime.memory().getVU0Code();
+            std::memset(code, 0, PS2_VU0_CODE_SIZE);
+
+            constexpr uint32_t kVuNop = 0x0000003Fu;
+            writeVuInstructionPair(
+                code, 0u, makeVuIaddiu(1u, 0u, 1u), kVuNop);
+            writeVuInstructionPair(
+                code, 8u, makeVuIbeq(1u, 0u, 3), kVuNop);
+            writeVuInstructionPair(code, 16u, 0u, kVuNop);
+            writeVuInstructionPair(
+                code, 24u, makeVuBranch(-3), kVuNop);
+            writeVuInstructionPair(code, 32u, 0u, kVuNop);
+
+            R5900Context ctx{};
+            constexpr uint32_t kTriggerPc = 0x00123456u;
+            runtime.debugStartVu0SyncTrace(2u, kTriggerPc, true);
+
+            ctx.pc = 0x00120000u;
+            runtime.synchronizeVU0Microprogram(
+                runtime.memory().getRDRAM(), &ctx, false);
+            PS2Runtime::DebugVu0SyncTrace trace =
+                runtime.debugVu0SyncTraceSnapshot(false);
+            t.IsFalse(
+                trace.triggered,
+                "an unrelated inactive synchronization should not arm the trace");
+
+            ctx.pc = kTriggerPc;
+            runtime.synchronizeVU0Microprogram(
+                runtime.memory().getRDRAM(), &ctx, true);
+            trace = runtime.debugVu0SyncTraceSnapshot(false);
+            t.IsTrue(
+                trace.triggered,
+                "an inactive VCALL-style synchronization should arm the trace");
+            t.Equals(
+                trace.entries.size(), static_cast<size_t>(0u),
+                "arming on inactive VU0 should not fabricate a trace entry");
+
+            ctx.ee_cycle_ticks = 800u;
+            runtime.vu0StartMicroProgram(
+                runtime.memory().getRDRAM(), &ctx, 0u);
+            t.IsTrue(
+                (ctx.vu0_vpu_stat & 1u) != 0u,
+                "the handshake fixture should leave VU0 active");
+
+            ctx.pc = 0x00120000u;
+            ctx.ee_cycle_ticks += 128u;
+            runtime.synchronizeVU0Microprogram(
+                runtime.memory().getRDRAM(), &ctx, false);
+            trace = runtime.debugVu0SyncTraceSnapshot(false);
+            t.Equals(
+                trace.entries.size(), static_cast<size_t>(1u),
+                "the first active synchronization after the trigger should be retained");
+            if (!trace.entries.empty())
+            {
+                t.Equals(
+                    trace.entries.front().eePc, 0x00120000u,
+                    "the first retained entry should follow the inactive trigger");
+            }
+
+            ctx.ee_cycle_ticks += 40u;
+            runtime.synchronizeVU0Microprogram(
+                runtime.memory().getRDRAM(), &ctx, false);
+            trace = runtime.debugVu0SyncTraceSnapshot(false);
+            t.IsFalse(
+                trace.enabled,
+                "a stop-on-full sync trace should disable itself at capacity");
+            t.IsTrue(
+                trace.stopOnFull,
+                "the sync trace snapshot should report stop-on-full mode");
+            t.Equals(
+                trace.droppedEntries, static_cast<uint64_t>(0u),
+                "a stop-on-full trace should retain its first window without drops");
+            t.Equals(
+                trace.entries.size(), static_cast<size_t>(2u),
+                "a later active synchronization should append one trace entry");
+            if (trace.entries.size() == 2u)
+            {
+                t.Equals(
+                    trace.entries.back().cycleBudget, 16u,
+                    "non-interlocked VU0 catch-up should retain the reference minimum batch");
+            }
+        });
+
+        tc.Run("VU0 instruction trace captures raw state after an EE PC trigger", [](TestCase &t)
+        {
+            PS2Runtime runtime;
+            t.IsTrue(runtime.memory().initialize(), "PS2Memory initialize should succeed");
+            t.IsTrue(runtime.syncCoreSubsystems(), "runtime core subsystems should bind");
+
+            uint8_t *const code = runtime.memory().getVU0Code();
+            std::memset(code, 0, PS2_VU0_CODE_SIZE);
+
+            constexpr uint32_t kVuNop = 0x0000003Fu;
+            writeVuInstructionPair(
+                code, 0u, makeVuIaddiu(1u, 0u, 1u), kVuNop);
+            writeVuInstructionPair(
+                code, 8u, makeVuIbeq(1u, 0u, 3), kVuNop);
+            writeVuInstructionPair(code, 16u, 0u, kVuNop);
+            writeVuInstructionPair(
+                code, 24u, makeVuBranch(-3), kVuNop);
+            writeVuInstructionPair(code, 32u, 0u, kVuNop);
+
+            R5900Context ctx{};
+            ctx.vi[3] = 0x1234u;
+            ctx.vu0_vf[1] = _mm_set_ps(4.0f, 3.0f, 2.0f, 1.0f);
+            constexpr uint32_t kTriggerPc = 0x00123456u;
+            runtime.debugStartVu0InstructionTrace(
+                4u, kTriggerPc, true);
+
+            ctx.pc = 0x00120000u;
+            runtime.synchronizeVU0Microprogram(
+                runtime.memory().getRDRAM(), &ctx, false);
+            PS2Runtime::DebugVu0InstructionTrace trace =
+                runtime.debugVu0InstructionTraceSnapshot(false);
+            t.IsFalse(
+                trace.triggered,
+                "an unrelated inactive synchronization should not arm the instruction trace");
+
+            ctx.pc = kTriggerPc;
+            runtime.synchronizeVU0Microprogram(
+                runtime.memory().getRDRAM(), &ctx, true);
+            trace = runtime.debugVu0InstructionTraceSnapshot(false);
+            t.IsTrue(
+                trace.triggered,
+                "an inactive VCALL-style synchronization should arm the instruction trace");
+            t.Equals(
+                trace.entries.size(), static_cast<size_t>(0u),
+                "arming on inactive VU0 should not fabricate an instruction entry");
+
+            ctx.ee_cycle_ticks = 800u;
+            runtime.vu0StartMicroProgram(
+                runtime.memory().getRDRAM(), &ctx, 0u);
+            trace = runtime.debugVu0InstructionTraceSnapshot(false);
+            t.IsFalse(
+                trace.enabled,
+                "a stop-on-full instruction trace should disable itself");
+            t.IsTrue(
+                trace.stopOnFull,
+                "the instruction trace snapshot should report stop-on-full mode");
+            t.Equals(
+                trace.totalEntries, static_cast<uint64_t>(4u),
+                "the instruction trace should stop exactly at capacity");
+            t.Equals(
+                trace.droppedEntries, static_cast<uint64_t>(0u),
+                "the instruction trace should retain its first window without drops");
+            t.IsTrue(
+                !trace.entries.empty(),
+                "the triggered VCALL should retain VU0 instructions");
+            if (!trace.entries.empty())
+            {
+                const PS2Runtime::DebugVu0InstructionEntry &entry =
+                    trace.entries.front();
+                t.Equals(
+                    entry.invocationInstruction, 0u,
+                    "the first instruction should start a fresh invocation");
+                t.Equals(
+                    entry.pc, 0u,
+                    "the first retained instruction should use the VCALL start PC");
+                t.Equals(
+                    static_cast<uint32_t>(entry.vi[3]), 0x1234u,
+                    "raw VI state should precede the first instruction");
+                t.Equals(
+                    entry.vf[4], 0x3F800000u,
+                    "raw VF state should preserve exact IEEE-754 bits");
+            }
         });
 
         tc.Run("GS sprite draw applies XYOFFSET and fully-outside scissor should not render", [](TestCase &t)

@@ -178,9 +178,33 @@ namespace ps2recomp
         case OPCODE_COP1:
             return m_codeGenerator.translateFPUInstruction(inst);
         case OPCODE_COP2:
+        {
+            const bool transfer =
+                inst.rs == COP2_QMFC2 ||
+                inst.rs == COP2_CFC2 ||
+                inst.rs == COP2_QMTC2 ||
+                inst.rs == COP2_CTC2;
+            const bool interlocked =
+                inst.rs >= COP2_CO ||
+                (transfer && (inst.raw & 1u) != 0u);
+            const bool finish =
+                interlocked ||
+                inst.vu0SyncMode == Vu0SyncMode::Finish;
+            const std::string operation =
+                m_codeGenerator.translateVUInstruction(inst);
+            if (!finish &&
+                inst.vu0SyncMode == Vu0SyncMode::Skip)
+            {
+                return fmt::format(
+                    "{{ {}\nctx->enforceVu0RegisterInvariants(); }}",
+                    operation);
+            }
             return fmt::format(
-                "{}\nctx->enforceVu0RegisterInvariants();",
-                m_codeGenerator.translateVUInstruction(inst));
+                "{{ runtime->synchronizeVU0Microprogram(rdram, ctx, {}); "
+                "{}\nctx->enforceVu0RegisterInvariants(); }}",
+                finish ? "true" : "false",
+                operation);
+        }
         case OPCODE_ADDI:
             if (inst.rt == 0)
                 return "// NOP (addi to $zero)";
@@ -241,13 +265,41 @@ namespace ps2recomp
                 inst.rt,
                 genWrite(32, fmt::format("ADD32(GPR_U32(ctx, {}), {})", inst.rs, inst.simmediate), "bits"));
         case OPCODE_LDC2:
+            if (inst.vu0SyncMode == Vu0SyncMode::Skip)
+            {
+                return fmt::format(
+                    "{{ ctx->vu0_vf[{}] = _mm_castsi128_ps({}); "
+                    "ctx->enforceVu0RegisterInvariants(); }}",
+                    inst.rt,
+                    genRead(128, fmt::format("ADD32(GPR_U32(ctx, {}), {})", inst.rs, inst.simmediate)));
+            }
             return fmt::format(
-                "{{ ctx->vu0_vf[{}] = _mm_castsi128_ps({}); "
+                "{{ runtime->synchronizeVU0Microprogram(rdram, ctx, {}); "
+                "ctx->vu0_vf[{}] = _mm_castsi128_ps({}); "
                 "ctx->enforceVu0RegisterInvariants(); }}",
+                inst.vu0SyncMode == Vu0SyncMode::Finish
+                    ? "true"
+                    : "false",
                 inst.rt,
                 genRead(128, fmt::format("ADD32(GPR_U32(ctx, {}), {})", inst.rs, inst.simmediate)));
         case OPCODE_SDC2:
-            return genWrite(128, fmt::format("ADD32(GPR_U32(ctx, {}), {})", inst.rs, inst.simmediate), fmt::format("_mm_castps_si128(ctx->vu0_vf[{}])", inst.rt)) + ";";
+            if (inst.vu0SyncMode == Vu0SyncMode::Skip)
+            {
+                return genWrite(
+                           128,
+                           fmt::format("ADD32(GPR_U32(ctx, {}), {})", inst.rs, inst.simmediate),
+                           fmt::format("_mm_castps_si128(ctx->vu0_vf[{}])", inst.rt)) +
+                       ";";
+            }
+            return fmt::format(
+                "{{ runtime->synchronizeVU0Microprogram(rdram, ctx, {}); {}; }}",
+                inst.vu0SyncMode == Vu0SyncMode::Finish
+                    ? "true"
+                    : "false",
+                genWrite(
+                    128,
+                    fmt::format("ADD32(GPR_U32(ctx, {}), {})", inst.rs, inst.simmediate),
+                    fmt::format("_mm_castps_si128(ctx->vu0_vf[{}])", inst.rt)));
         case OPCODE_DADDI:
             return fmt::format(
                 "{{ uint64_t result; bool overflow; "

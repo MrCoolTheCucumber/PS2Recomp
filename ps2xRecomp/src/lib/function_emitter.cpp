@@ -1,10 +1,12 @@
 #include "ps2recomp/Emitters/function_emitter.h"
 #include "ps2recomp/code_generator.h"
+#include "ps2recomp/ee_cycle_model.h"
 #include "ps2recomp/gif_dma_kick_analyzer.h"
 #include "ps2recomp/instructions.h"
 #include "ps2recomp/r5900_decoder.h"
 #include "ps2recomp/recompiler_reporter.h"
 #include "ps2recomp/types.h"
+#include "ps2recomp/vu0_sync_analyzer.h"
 
 #include <algorithm>
 #include <sstream>
@@ -69,6 +71,10 @@ namespace ps2recomp
             analysisResult.entryPoints.insert(target);
         }
 
+        std::vector<Instruction> scheduledInstructions = instructions;
+        applyVu0SyncPlan(
+            scheduledInstructions, analysisResult.entryPoints);
+
         const std::unordered_set<uint32_t> &internalTargets = analysisResult.entryPoints;
         ConstantRegisterState constantRegisters;
         GifDmaKickPlan gifDmaKickPlan{};
@@ -105,9 +111,9 @@ namespace ps2recomp
 
         bool lastInstructionWasControlFlow = false;
 
-        for (size_t i = 0; i < instructions.size(); ++i)
+        for (size_t i = 0; i < scheduledInstructions.size(); ++i)
         {
-            const Instruction &inst = instructions[i];
+            const Instruction &inst = scheduledInstructions[i];
             lastInstructionWasControlFlow = inst.hasDelaySlot;
 
             if (internalTargets.contains(inst.address))
@@ -131,15 +137,18 @@ namespace ps2recomp
             {
                 if (inst.hasDelaySlot)
                 {
+                    ss << "    ++ctx->insn_count;\n";
+                    ss << "    ctx->advanceEeCycleTicks("
+                       << eeInstructionCycleTicks(inst) << "u);\n";
                     const bool hasDecodedDelaySlot =
-                        i + 1 < instructions.size() &&
-                        instructions[i + 1].address == inst.address + 4u;
+                        i + 1 < scheduledInstructions.size() &&
+                        scheduledInstructions[i + 1].address == inst.address + 4u;
 
                     Instruction syntheticDelaySlot{};
                     const Instruction *delaySlot = nullptr;
                     if (hasDecodedDelaySlot)
                     {
-                        delaySlot = &instructions[i + 1];
+                        delaySlot = &scheduledInstructions[i + 1];
                     }
                     else
                     {
@@ -178,9 +187,12 @@ namespace ps2recomp
                 }
                 else
                 {
+                    ss << "    ++ctx->insn_count;\n";
+                    ss << "    ctx->advanceEeCycleTicks("
+                       << eeInstructionCycleTicks(inst) << "u);\n";
                     if (!gifDmaKickPlan.valid)
                     {
-                        gifDmaKickPlan = tryBuildGifDmaKickPlan(instructions, i, constantRegisters, internalTargets);
+                        gifDmaKickPlan = tryBuildGifDmaKickPlan(scheduledInstructions, i, constantRegisters, internalTargets);
                     }
 
                     if (gifDmaKickPlan.suppresses(i))

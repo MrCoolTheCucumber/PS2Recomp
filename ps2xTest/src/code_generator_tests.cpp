@@ -1,5 +1,6 @@
 #include "MiniTest.h"
 #include "ps2recomp/code_generator.h"
+#include "ps2recomp/ee_cycle_model.h"
 #include "ps2recomp/instructions.h"
 #include "ps2recomp/ps2_recompiler.h"
 #include "ps2recomp/types.h"
@@ -38,6 +39,19 @@ static Instruction makeNop(uint32_t address)
 static uint32_t signExtend16(uint16_t value)
 {
     return static_cast<uint32_t>(static_cast<int32_t>(static_cast<int16_t>(value)));
+}
+
+static size_t countOccurrences(
+    const std::string &value, const std::string &needle)
+{
+    size_t count = 0u;
+    size_t offset = 0u;
+    while ((offset = value.find(needle, offset)) != std::string::npos)
+    {
+        ++count;
+        offset += needle.size();
+    }
+    return count;
 }
 
 static Instruction makeIType(uint32_t address, uint32_t opcode, uint8_t rs, uint8_t rt, uint16_t immediate)
@@ -1217,6 +1231,15 @@ void register_code_generator_tests()
             t.IsTrue(mtc0Code.find("GPR_U32(ctx, 7)") != std::string::npos, "MTC0 should read from rt");
             t.IsTrue(mtc0Code.find("Unimplemented MTC0") == std::string::npos, "MTC0 should not hit unimplemented path");
             t.IsTrue(mtc0Code.find("Unhandled COP0") == std::string::npos, "MTC0 should not hit unhandled COP0 path");
+
+            mtc0.rd = COP0_REG_CONFIG;
+            mtc0Code = gen.translateInstruction(mtc0);
+            t.IsTrue(
+                mtc0Code.find("GPR_U32(ctx, 7) & ~0xFC0u") != std::string::npos,
+                "MTC0 CONFIG should allow writable issue/cache-enable bits");
+            t.IsTrue(
+                mtc0Code.find("| 0x440u") != std::string::npos,
+                "MTC0 CONFIG should preserve hardware cache-size fields");
         });
 
         tc.Run("FCR access uses CFC1/CTC1", [](TestCase &t) {
@@ -1285,6 +1308,321 @@ void register_code_generator_tests()
             cfc2Q.rd = 22;
             const std::string cfc2QCode = gen.translateInstruction(cfc2Q);
             t.IsTrue(cfc2QCode.find("ctx->vu0_q") != std::string::npos, "CFC2 VI22 should read Q");
+        });
+
+        tc.Run("VU0 calls and transfers preserve micro-mode interlocks", [](TestCase &t) {
+            CodeGenerator gen({}, {});
+
+            Instruction vcallms{};
+            vcallms.opcode = OPCODE_COP2;
+            vcallms.rs = COP2_CO;
+            vcallms.function = VU0_S1_VCALLMS;
+            vcallms.raw = 0x4A000038u | (0x12u << 6u);
+
+            const std::string vcallmsCode =
+                gen.translateInstruction(vcallms);
+            t.IsTrue(
+                vcallmsCode.find(
+                    "synchronizeVU0Microprogram(rdram, ctx, true)") !=
+                    std::string::npos,
+                "VCALLMS should finish an earlier microprogram before starting");
+            t.IsTrue(
+                vcallmsCode.find(
+                    "vu0StartMicroProgram(rdram, ctx, 0x90)") !=
+                    std::string::npos,
+                "VCALLMS should start its target without synchronously completing it");
+            t.IsTrue(
+                vcallmsCode.find("executeVU0Microprogram") ==
+                    std::string::npos,
+                "generated VCALLMS should not serialize EE and VU0 execution");
+
+            Instruction ctc2{};
+            ctc2.opcode = OPCODE_COP2;
+            ctc2.rs = COP2_CTC2;
+            ctc2.rt = 3u;
+            ctc2.rd = 1u;
+            ctc2.raw = 0x48C30800u;
+
+            const std::string nonInterlocked =
+                gen.translateInstruction(ctc2);
+            t.IsTrue(
+                nonInterlocked.find(
+                    "synchronizeVU0Microprogram(rdram, ctx, false)") !=
+                    std::string::npos,
+                "CTC2.ni should advance VU0 without waiting for completion");
+
+            ctc2.raw |= 1u;
+            const std::string interlocked =
+                gen.translateInstruction(ctc2);
+            t.IsTrue(
+                interlocked.find(
+                    "synchronizeVU0Microprogram(rdram, ctx, true)") !=
+                    std::string::npos,
+                "CTC2.i should wait for the active microprogram");
+
+            Instruction lqc2{};
+            lqc2.opcode = OPCODE_LQC2;
+            lqc2.rs = 4u;
+            lqc2.rt = 5u;
+            const std::string lqc2Code =
+                gen.translateInstruction(lqc2);
+            t.IsTrue(
+                lqc2Code.find(
+                    "synchronizeVU0Microprogram(rdram, ctx, false)") !=
+                    std::string::npos,
+                "LQC2 should remain non-interlocked while advancing concurrent VU0 work");
+        });
+
+        tc.Run("VU0 transfer chains synchronize only at scheduling boundaries", [](TestCase &t) {
+            Function function;
+            function.name = "vu0_transfer_chain";
+            function.start = 0x3000u;
+            function.end = 0x302Cu;
+            function.isRecompiled = true;
+
+            Instruction vcall{};
+            vcall.address = 0x3000u;
+            vcall.opcode = OPCODE_COP2;
+            vcall.rs = COP2_CO;
+            vcall.function = VU0_S1_VCALLMS;
+            vcall.raw = 0x4A000038u;
+
+            auto makeQmtc2 = [](uint32_t address, uint32_t rt, uint32_t rd)
+            {
+                Instruction inst{};
+                inst.address = address;
+                inst.opcode = OPCODE_COP2;
+                inst.rs = COP2_QMTC2;
+                inst.rt = rt;
+                inst.rd = rd;
+                inst.raw =
+                    (OPCODE_COP2 << 26u) |
+                    (COP2_QMTC2 << 21u) |
+                    (rt << 16u) |
+                    (rd << 11u);
+                return inst;
+            };
+
+            Instruction lqc2{};
+            lqc2.address = 0x3010u;
+            lqc2.opcode = OPCODE_LQC2;
+            lqc2.rs = 4u;
+            lqc2.rt = 5u;
+
+            Instruction clear{};
+            clear.address = 0x3014u;
+            clear.opcode = OPCODE_COP2;
+            clear.rs = COP2_CTC2;
+            clear.rt = 0u;
+            clear.rd = 1u;
+            clear.raw =
+                (OPCODE_COP2 << 26u) |
+                (COP2_CTC2 << 21u) |
+                (1u << 11u);
+
+            Instruction qmfc2{};
+            qmfc2.address = 0x301Cu;
+            qmfc2.opcode = OPCODE_COP2;
+            qmfc2.rs = COP2_QMFC2;
+            qmfc2.rt = 6u;
+            qmfc2.rd = 7u;
+            qmfc2.raw =
+                (OPCODE_COP2 << 26u) |
+                (COP2_QMFC2 << 21u) |
+                (6u << 16u) |
+                (7u << 11u);
+
+            Instruction branch = makeBranch(0x3020u, 1u);
+            const std::string generated = CodeGenerator({}, {}).generateFunction(
+                function,
+                {
+                    vcall,
+                    makeNop(0x3004u),
+                    makeQmtc2(0x3008u, 8u, 1u),
+                    makeQmtc2(0x300Cu, 9u, 2u),
+                    lqc2,
+                    clear,
+                    makeNop(0x3018u),
+                    qmfc2,
+                    branch,
+                    makeNop(0x3024u),
+                    makeQmtc2(0x3028u, 10u, 3u),
+                },
+                false);
+
+            t.Equals(
+                countOccurrences(
+                    generated,
+                    "synchronizeVU0Microprogram(rdram, ctx, false)"),
+                static_cast<size_t>(4u),
+                "the four COP2 scheduling points should retain minimum-batch synchronization");
+            t.Equals(
+                countOccurrences(
+                    generated,
+                    "advanceVU0AtEeBlockBoundary(rdram, ctx)"),
+                static_cast<size_t>(1u),
+                "the completed EE block should use exact-time VU0 progression");
+            t.Equals(
+                countOccurrences(
+                    generated,
+                    "synchronizeVU0Microprogram(rdram, ctx, true)"),
+                static_cast<size_t>(1u),
+                "VCALLMS should be the only finishing operation in this chain");
+            t.Equals(
+                countOccurrences(generated, "ctx->enforceVu0RegisterInvariants();"),
+                static_cast<size_t>(7u),
+                "skipped catch-ups must still execute every COP2 transfer");
+        });
+
+        tc.Run("an interlocked VU0 transfer keeps its whole EE block synchronized", [](TestCase &t) {
+            Function function;
+            function.name = "vu0_interlocked_block";
+            function.start = 0x3100u;
+            function.end = 0x310Cu;
+            function.isRecompiled = true;
+
+            auto makeQmtc2 = [](uint32_t address, uint32_t rd, bool interlocked)
+            {
+                Instruction inst{};
+                inst.address = address;
+                inst.opcode = OPCODE_COP2;
+                inst.rs = COP2_QMTC2;
+                inst.rt = rd + 1u;
+                inst.rd = rd;
+                inst.raw =
+                    (OPCODE_COP2 << 26u) |
+                    (COP2_QMTC2 << 21u) |
+                    (inst.rt << 16u) |
+                    (rd << 11u) |
+                    (interlocked ? 1u : 0u);
+                return inst;
+            };
+
+            CodeGenerator gen({}, {});
+            const std::string generated = gen.generateFunction(
+                function,
+                {
+                    makeQmtc2(0x3100u, 1u, false),
+                    makeQmtc2(0x3104u, 2u, false),
+                    makeQmtc2(0x3108u, 3u, true),
+                },
+                false);
+
+            t.Equals(
+                countOccurrences(
+                    generated,
+                    "synchronizeVU0Microprogram(rdram, ctx, false)"),
+                static_cast<size_t>(2u),
+                "non-interlocked transfers should remain tightly synchronized in an interlocked block");
+            t.Equals(
+                countOccurrences(
+                    generated,
+                    "synchronizeVU0Microprogram(rdram, ctx, true)"),
+                static_cast<size_t>(1u),
+                "the interlocked transfer should wait for VU0 completion");
+        });
+
+        tc.Run("generated EE instructions advance the scheduling counter", [](TestCase &t) {
+            Function function;
+            function.name = "instruction_count";
+            function.start = 0x2000u;
+            function.end = 0x200Cu;
+            function.isRecompiled = true;
+
+            CodeGenerator gen({}, {});
+            const std::string generated = gen.generateFunction(
+                function,
+                {
+                    makeNop(0x2000u),
+                    makeNop(0x2004u),
+                    makeNop(0x2008u),
+                },
+                false);
+
+            t.Equals(
+                countOccurrences(generated, "++ctx->insn_count;"),
+                static_cast<size_t>(3u),
+                "each emitted non-branch EE instruction should retire");
+            t.Equals(
+                countOccurrences(generated, "ctx->advanceEeCycleTicks(9u);"),
+                static_cast<size_t>(3u),
+                "ordinary EE instructions should advance fixed-point issue time");
+        });
+
+        tc.Run("EE scheduling weights distinguish issue classes", [](TestCase &t) {
+            Instruction ordinary{};
+            ordinary.opcode = OPCODE_ADDIU;
+            t.Equals(eeInstructionCycleTicks(ordinary), 9u,
+                     "ordinary integer operation should use the default weight");
+
+            Instruction branch{};
+            branch.opcode = OPCODE_BEQ;
+            t.Equals(eeInstructionCycleTicks(branch), 11u,
+                     "conditional branch should include branch issue cost");
+
+            Instruction load{};
+            load.opcode = OPCODE_LW;
+            t.Equals(eeInstructionCycleTicks(load), 14u,
+                     "load should use the memory-operation weight");
+
+            Instruction mmi{};
+            mmi.opcode = OPCODE_MMI;
+            mmi.function = MMI_MMI2;
+            mmi.mmiFunction = MMI2_PMULTW;
+            t.Equals(eeInstructionCycleTicks(mmi), 24u,
+                     "packed multiply should use the MMI multiply weight");
+
+            Instruction divide{};
+            divide.opcode = OPCODE_SPECIAL;
+            divide.function = SPECIAL_DIV;
+            t.Equals(eeInstructionCycleTicks(divide), 112u,
+                     "integer divide should retain its long issue latency");
+
+            Instruction rsqrt{};
+            rsqrt.opcode = OPCODE_COP1;
+            rsqrt.rs = COP1_S;
+            rsqrt.function = COP1_S_RSQRT;
+            t.Equals(eeInstructionCycleTicks(rsqrt), 64u,
+                     "FPU reciprocal square root should retain its issue latency");
+        });
+
+        tc.Run("branch delay slots retire and accrue time on their executed path", [](TestCase &t) {
+            Function function;
+            function.name = "branch_timing";
+            function.start = 0x2100u;
+            function.end = 0x2108u;
+            function.isRecompiled = true;
+
+            Instruction branch = makeBranch(0x2100u, 1u);
+            Instruction delay = makeLw(0x2104u, 2u, 3u, 0u);
+
+            CodeGenerator gen({}, {});
+            const std::string generated =
+                gen.generateFunction(function, {branch, delay}, false);
+
+            t.IsTrue(
+                generated.find("ctx->advanceEeCycleTicks(11u);") !=
+                    std::string::npos,
+                "branch instruction should use the branch weight");
+            t.IsTrue(
+                generated.find("ctx->advanceEeCycleTicks(14u);") !=
+                    std::string::npos,
+                "executed load delay slot should use the load weight");
+            t.Equals(
+                countOccurrences(generated, "++ctx->insn_count;"),
+                static_cast<size_t>(2u),
+                "branch and delay slot should retire independently");
+            t.Equals(
+                countOccurrences(
+                    generated, "ctx->finishEeBasicBlock();"),
+                static_cast<size_t>(1u),
+                "the completed branch block should discard fractional issue time");
+            t.Equals(
+                countOccurrences(
+                    generated,
+                    "runtime->advanceVU0AtEeBlockBoundary(rdram, ctx);"),
+                static_cast<size_t>(1u),
+                "the completed branch block should advance VU0 by exact EE time");
         });
 
         tc.Run("VU0 macro writes preserve the hardwired zero registers", [](TestCase &t) {
