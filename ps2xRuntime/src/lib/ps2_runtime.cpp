@@ -3350,6 +3350,35 @@ bool PS2Runtime::debugReadRdram(uint32_t address,
     return true;
 }
 
+bool PS2Runtime::debugReadMemory(uint32_t address,
+                                 uint32_t size,
+                                 std::vector<uint8_t> &output)
+{
+    uint8_t *base = nullptr;
+    uint32_t offset = 0u;
+    uint32_t limit = 0u;
+    if (ps2ResolveDirectRdramOffset(address, offset))
+    {
+        base = m_memory.getRDRAM();
+        limit = PS2_RAM_SIZE;
+    }
+    else if (ps2IsScratchpadAddress(address))
+    {
+        base = m_memory.getScratchpad();
+        offset = ps2ScratchpadOffset(address);
+        limit = PS2_SCRATCHPAD_SIZE;
+    }
+
+    if (!base || size > limit || offset > (limit - size))
+    {
+        return false;
+    }
+
+    std::lock_guard<std::recursive_timed_mutex> lock(m_guestExecutionMutex);
+    output.assign(base + offset, base + offset + size);
+    return true;
+}
+
 bool PS2Runtime::debugCopyGsVram(std::vector<uint8_t> &output)
 {
     std::lock_guard<std::recursive_timed_mutex> lock(m_guestExecutionMutex);

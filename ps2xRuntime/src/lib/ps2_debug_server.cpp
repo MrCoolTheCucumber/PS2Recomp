@@ -548,13 +548,9 @@ struct PS2DebugServer::Impl
         bool resumeOnExit;
     };
 
-    bool enabled() const
+    bool environmentFlagEnabled(const char *name) const
     {
-        if (const char *path = std::getenv("PS2DBG_SOCKET"); path && path[0] != '\0')
-        {
-            return true;
-        }
-        const char *value = std::getenv("PS2DBG_ENABLE");
+        const char *value = std::getenv(name);
         if (!value || value[0] == '\0')
         {
             return false;
@@ -564,6 +560,15 @@ struct PS2DebugServer::Impl
                        [](unsigned char ch)
                        { return static_cast<char>(std::tolower(ch)); });
         return normalized != "0" && normalized != "false" && normalized != "off";
+    }
+
+    bool enabled() const
+    {
+        if (const char *path = std::getenv("PS2DBG_SOCKET"); path && path[0] != '\0')
+        {
+            return true;
+        }
+        return environmentFlagEnabled("PS2DBG_ENABLE");
     }
 
     std::string defaultSocketPath() const
@@ -1125,11 +1130,11 @@ struct PS2DebugServer::Impl
             throw RequestError(-32602, "invalid or excessive memory range");
         }
         std::vector<uint8_t> bytes;
-        if (!runtime.debugReadRdram(
+        if (!runtime.debugReadMemory(
                 address, static_cast<uint32_t>(requestedSize), bytes))
         {
             throw RequestError(-32001,
-                               "guest range is not contiguous readable RDRAM");
+                               "guest range is not contiguous readable memory");
         }
         Value result(rapidjson::kObjectType);
         addString(result, "address", addressString(address), allocator);
@@ -2684,6 +2689,10 @@ struct PS2DebugServer::Impl
                              { mainLoop(); });
         watchdogThread = std::thread([this]()
                                      { watchdogLoop(); });
+        if (environmentFlagEnabled("PS2DBG_START_PAUSED"))
+        {
+            (void)runtime.debugPause(std::chrono::milliseconds(0));
+        }
         std::cout << "[ps2dbg] listening on " << socketPath << '\n';
         return true;
     }

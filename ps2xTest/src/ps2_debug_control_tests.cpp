@@ -85,6 +85,34 @@ void register_ps2_debug_control_tests()
                       "the fast-path flag should clear with the final watchpoint");
         });
 
+        tc.Run("debug memory reads include scratchpad aliases", [](TestCase &t)
+        {
+            PS2Runtime runtime;
+            t.IsTrue(runtime.memory().initialize(),
+                     "the runtime memory should initialize");
+            runtime.memory().write32(0x70000010u, 0x78563412u);
+
+            std::vector<uint8_t> bytes;
+            t.IsTrue(
+                runtime.debugReadMemory(0xF0000010u, 4u, bytes),
+                "the scratchpad alias should be readable");
+            t.Equals(
+                bytes.size(), static_cast<size_t>(4u),
+                "the debug read should return the requested byte count");
+            if (bytes.size() == 4u)
+            {
+                t.Equals(bytes[0], static_cast<uint8_t>(0x12u),
+                         "the scratchpad read should retain little-endian byte zero");
+                t.Equals(bytes[3], static_cast<uint8_t>(0x78u),
+                         "the scratchpad read should retain little-endian byte three");
+            }
+            t.IsFalse(
+                runtime.debugReadMemory(
+                    0x70000000u + PS2_SCRATCHPAD_SIZE - 1u,
+                    2u, bytes),
+                "a debug read must not cross the scratchpad boundary");
+        });
+
         tc.Run("run-until and dispatch stepping stop before and after a target", [](TestCase &t)
         {
             PS2Runtime runtime;
@@ -259,6 +287,37 @@ void register_ps2_debug_control_tests()
         });
 
 #if defined(PS2X_ENABLE_DEBUG_SERVER) && PS2X_ENABLE_DEBUG_SERVER
+        tc.Run("debug server can pause before guest startup", [](TestCase &t)
+        {
+            const auto unique = std::to_string(
+                std::chrono::steady_clock::now().time_since_epoch().count());
+            const std::filesystem::path root =
+                std::filesystem::temp_directory_path() /
+                ("ps2dbg-start-paused-test-" + unique);
+            const std::filesystem::path socket = root / "debug.sock";
+            std::filesystem::create_directories(root);
+
+            setenv("PS2DBG_ENABLE", "1", 1);
+            setenv("PS2DBG_SOCKET", socket.c_str(), 1);
+            setenv("PS2DBG_START_PAUSED", "1", 1);
+
+            {
+                PS2Runtime runtime;
+                PS2DebugServer server(runtime);
+                t.IsTrue(server.start(),
+                         "the isolated debug server should start");
+                t.IsTrue(runtime.debugIsPaused(),
+                         "startup-paused mode should stop guest execution");
+                runtime.debugResume();
+                server.stop();
+            }
+
+            unsetenv("PS2DBG_START_PAUSED");
+            unsetenv("PS2DBG_SOCKET");
+            unsetenv("PS2DBG_ENABLE");
+            std::filesystem::remove_all(root);
+        });
+
         tc.Run("missing targets create one automatic diagnostic bundle", [](TestCase &t)
         {
             const auto unique = std::to_string(
