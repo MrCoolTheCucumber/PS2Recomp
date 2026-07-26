@@ -1,6 +1,7 @@
 #include "MiniTest.h"
 #include "ps2_stubs.h"
 #include "ps2_syscalls.h"
+#include "ps2_host_backend.h"
 #include "runtime/ps2_pad.h"
 #include "Stubs/Pad.h"
 
@@ -94,6 +95,126 @@ void register_pad_input_tests()
             closePadPort(ctx, rdram);
         });
 
+        tc.Run("scePad2Read emits the 18-byte libpad2 payload", [](TestCase &t)
+               {
+            std::vector<uint8_t> rdram(PS2_RAM_SIZE, 0xCC);
+            R5900Context ctx;
+
+            const uint16_t buttons = static_cast<uint16_t>(0xFFFFu &
+                                                            ~kPadBtnStart &
+                                                            ~kPadBtnLeft &
+                                                            ~kPadBtnCross);
+            ps2_stubs::setPadOverrideState(buttons, 0x11, 0x22, 0x33, 0x44);
+
+            setRegU32(ctx, 4, 0u);
+            setRegU32(ctx, 5, kPadDataAddr);
+            ps2_stubs::scePad2Read(rdram.data(), &ctx, nullptr);
+
+            const uint8_t *data = rdram.data() + kPadDataAddr;
+            t.Equals(static_cast<uint32_t>(getRegU32(&ctx, 2)), static_cast<uint32_t>(18),
+                     "scePad2Read should return the copied payload length");
+            t.Equals(data[0], static_cast<uint8_t>(buttons & 0xFFu),
+                     "Pad2 button low byte should be active-low");
+            t.Equals(data[1], static_cast<uint8_t>(buttons >> 8),
+                     "Pad2 button high byte should be active-low");
+            t.Equals(data[2], static_cast<uint8_t>(0x33), "Pad2 right X should follow the buttons");
+            t.Equals(data[3], static_cast<uint8_t>(0x44), "Pad2 right Y should follow the buttons");
+            t.Equals(data[4], static_cast<uint8_t>(0x11), "Pad2 left X should follow the right stick");
+            t.Equals(data[5], static_cast<uint8_t>(0x22), "Pad2 left Y should follow the right stick");
+            t.Equals(data[7], static_cast<uint8_t>(0xFF), "Pad2 left pressure should be populated");
+            t.Equals(data[12], static_cast<uint8_t>(0xFF), "Pad2 cross pressure should be populated");
+            t.Equals(data[6], static_cast<uint8_t>(0x00), "unpressed Pad2 pressure should be clear");
+            t.Equals(data[17], static_cast<uint8_t>(0x00), "the payload should end after twelve pressure bytes");
+            t.Equals(data[18], static_cast<uint8_t>(0xCC), "scePad2Read should write exactly 18 bytes");
+
+            ps2_stubs::clearPadOverrideState();
+        });
+
+        tc.Run("scePad2GetState reports a connected host-backed socket", [](TestCase &t)
+               {
+            R5900Context ctx;
+
+            setRegU32(ctx, 4, 0u);
+            ps2_stubs::scePad2GetState(nullptr, &ctx, nullptr);
+            t.Equals(static_cast<uint32_t>(getRegU32(&ctx, 2)), static_cast<uint32_t>(1),
+                     "an allocated Pad2 socket should report the connected state observed in PCSX2");
+
+            setRegU32(ctx, 4, static_cast<uint32_t>(-1));
+            ps2_stubs::scePad2GetState(nullptr, &ctx, nullptr);
+            t.Equals(static_cast<uint32_t>(getRegU32(&ctx, 2)), static_cast<uint32_t>(0),
+                     "a negative Pad2 socket should report disconnected");
+        });
+
+        tc.Run("Pad2 profiles match the PCSX2 dual-shock capabilities", [](TestCase &t)
+               {
+            std::vector<uint8_t> rdram(PS2_RAM_SIZE, 0xCC);
+            R5900Context ctx;
+
+            setRegU32(ctx, 4, 0u);
+            setRegU32(ctx, 5, kPadDataAddr);
+            ps2_stubs::scePad2GetButtonProfile(rdram.data(), &ctx, nullptr);
+            t.Equals(static_cast<uint32_t>(getRegU32(&ctx, 2)), static_cast<uint32_t>(4),
+                     "scePad2GetButtonProfile should return the four-byte profile length");
+            for (size_t i = 0; i < 4; ++i)
+            {
+                t.Equals(rdram[kPadDataAddr + i], static_cast<uint8_t>(0xFF),
+                         "the standard Pad2 button profile should expose every button");
+            }
+            t.Equals(rdram[kPadDataAddr + 4], static_cast<uint8_t>(0xCC),
+                     "scePad2GetButtonProfile should write exactly four bytes");
+
+            ps2_stubs::sceVibGetProfile(rdram.data(), &ctx, nullptr);
+            t.Equals(static_cast<uint32_t>(getRegU32(&ctx, 2)), static_cast<uint32_t>(4),
+                     "sceVibGetProfile should return the four-byte profile length");
+            t.Equals(rdram[kPadDataAddr], static_cast<uint8_t>(0x03),
+                     "the dual-shock vibration profile should expose both actuators");
+            for (size_t i = 1; i < 4; ++i)
+            {
+                t.Equals(rdram[kPadDataAddr + i], static_cast<uint8_t>(0x00),
+                         "unused vibration profile bytes should be clear");
+            }
+            t.Equals(rdram[kPadDataAddr + 4], static_cast<uint8_t>(0xCC),
+                     "sceVibGetProfile should write exactly four bytes");
+
+            setRegU32(ctx, 5, 0u);
+            ps2_stubs::scePad2GetButtonProfile(rdram.data(), &ctx, nullptr);
+            t.Equals(static_cast<uint32_t>(getRegU32(&ctx, 2)), static_cast<uint32_t>(-1),
+                     "scePad2GetButtonProfile should reject a null output pointer");
+            ps2_stubs::sceVibGetProfile(rdram.data(), &ctx, nullptr);
+            t.Equals(static_cast<uint32_t>(getRegU32(&ctx, 2)), static_cast<uint32_t>(-1),
+                     "sceVibGetProfile should reject a null output pointer");
+        });
+
+        tc.Run("scePad2Read matches the neutral PCSX2 packet and rejects null output", [](TestCase &t)
+               {
+            std::vector<uint8_t> rdram(PS2_RAM_SIZE, 0);
+            R5900Context ctx;
+
+            ps2_stubs::setPadOverrideState(0xFFFFu, 0x7F, 0x7F, 0x7F, 0x7F);
+            setRegU32(ctx, 4, 0u);
+            setRegU32(ctx, 5, kPadDataAddr);
+            ps2_stubs::scePad2Read(rdram.data(), &ctx, nullptr);
+
+            const uint8_t *data = rdram.data() + kPadDataAddr;
+            t.Equals(data[0], static_cast<uint8_t>(0xFF), "neutral Pad2 packet byte 0 should match PCSX2");
+            t.Equals(data[1], static_cast<uint8_t>(0xFF), "neutral Pad2 packet byte 1 should match PCSX2");
+            for (size_t i = 2; i < 6; ++i)
+            {
+                t.Equals(data[i], static_cast<uint8_t>(0x7F), "neutral Pad2 axes should match PCSX2");
+            }
+            for (size_t i = 6; i < 18; ++i)
+            {
+                t.Equals(data[i], static_cast<uint8_t>(0x00), "neutral Pad2 pressure bytes should be clear");
+            }
+
+            setRegU32(ctx, 5, 0u);
+            ps2_stubs::scePad2Read(rdram.data(), &ctx, nullptr);
+            t.Equals(static_cast<uint32_t>(getRegU32(&ctx, 2)), static_cast<uint32_t>(-1),
+                     "scePad2Read should reject a null output pointer");
+
+            ps2_stubs::clearPadOverrideState();
+        });
+
         tc.Run("keyboard buttons remain active when a gamepad is connected", [](TestCase &t)
                {
                    const uint16_t neutralGamepad = 0xFFFFu;
@@ -105,6 +226,45 @@ void register_pad_input_tests()
                    const uint16_t expected = static_cast<uint16_t>(0xFFFFu & ~kPadBtnCross & ~kPadBtnStart);
                    t.Equals(mergeActiveLowPadButtons(gamepadCross, keyboardStart), expected,
                             "simultaneous gamepad and keyboard buttons should be merged");
+               });
+
+        tc.Run("raylib Enter state maps to active-low Start", [](TestCase &t)
+               {
+                   // Raylib exposes AutomationEvent but keeps its event-type
+                   // enum private to rcore.c. Values 1 and 2 are its stable
+                   // INPUT_KEY_UP and INPUT_KEY_DOWN event types.
+                   constexpr unsigned int kInputKeyUp = 1u;
+                   constexpr unsigned int kInputKeyDown = 2u;
+
+                   AutomationEvent enterDown{};
+                   enterDown.type = kInputKeyDown;
+                   enterDown.params[0] = KEY_ENTER;
+                   PlayAutomationEvent(enterDown);
+
+                   PSPadBackend backend;
+                   uint8_t pressedData[32]{};
+                   const bool pressedRead =
+                       backend.readState(0, 0, pressedData, sizeof(pressedData));
+
+                   AutomationEvent enterUp{};
+                   enterUp.type = kInputKeyUp;
+                   enterUp.params[0] = KEY_ENTER;
+                   PlayAutomationEvent(enterUp);
+
+                   uint8_t releasedData[32]{};
+                   const bool releasedRead =
+                       backend.readState(0, 0, releasedData, sizeof(releasedData));
+
+                   const uint16_t pressedButtons =
+                       static_cast<uint16_t>(pressedData[2] | (pressedData[3] << 8));
+                   const uint16_t releasedButtons =
+                       static_cast<uint16_t>(releasedData[2] | (releasedData[3] << 8));
+                   t.IsTrue(pressedRead, "host pad read should succeed while Enter is down");
+                   t.IsTrue((pressedButtons & kPadBtnStart) == 0u,
+                            "Enter should clear the active-low Start bit");
+                   t.IsTrue(releasedRead, "host pad read should succeed after Enter is released");
+                   t.IsTrue((releasedButtons & kPadBtnStart) != 0u,
+                            "releasing Enter should restore the Start bit");
                });
 
         tc.Run("scePadRead button bits are active-low", [](TestCase &t)

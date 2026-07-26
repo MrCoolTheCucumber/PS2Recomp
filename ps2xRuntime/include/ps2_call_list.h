@@ -482,6 +482,9 @@
     X(scePadInfoPressMode)                    \
     X(scePadInit)                             \
     X(scePadInit2)                            \
+    X(scePad2GetButtonProfile)                \
+    X(scePad2GetState)                        \
+    X(scePad2Read)                            \
     X(scePadPortClose)                        \
     X(scePadPortOpen)                         \
     X(scePadRead)                             \
@@ -642,6 +645,7 @@
     X(sceTtyInit)                             \
     X(sceTtyRead)                             \
     X(sceTtyWrite)                            \
+    X(sceVibGetProfile)                       \
     X(sceVpu0Reset)                           \
     X(sceVu0AddVector)                        \
     X(sceVu0ApplyMatrix)                      \

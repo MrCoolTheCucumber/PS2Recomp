@@ -245,6 +245,14 @@ void register_ps2_recompiler_tests()
                      "getpid should remain a runtime helper");
             t.IsTrue(ps2_runtime_calls::isStubName("scePadRead"),
                      "scePadRead should remain a runtime pad stub");
+            t.IsTrue(ps2_runtime_calls::isStubName("scePad2Read"),
+                     "scePad2Read should use the runtime Pad2 bridge");
+            t.IsTrue(ps2_runtime_calls::isStubName("scePad2GetState"),
+                     "scePad2GetState should use the runtime Pad2 bridge");
+            t.IsTrue(ps2_runtime_calls::isStubName("scePad2GetButtonProfile"),
+                     "scePad2GetButtonProfile should use the runtime Pad2 bridge");
+            t.IsTrue(ps2_runtime_calls::isStubName("sceVibGetProfile"),
+                     "sceVibGetProfile should use the runtime Pad2 bridge");
         });
 
         tc.Run("additional entries split at nearest discovered boundary", [](TestCase &t) {

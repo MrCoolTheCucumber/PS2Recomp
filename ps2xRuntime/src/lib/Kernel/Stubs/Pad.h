@@ -25,6 +25,9 @@ namespace ps2_stubs
     void scePadInfoPressMode(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
     void scePadInit(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
     void scePadInit2(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
+    void scePad2GetButtonProfile(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
+    void scePad2GetState(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
+    void scePad2Read(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
     void scePadPortClose(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
     void scePadPortOpen(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
     void scePadRead(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
@@ -37,6 +40,7 @@ namespace ps2_stubs
     void scePadSetVrefParam(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
     void scePadSetWarningLevel(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
     void scePadStateIntToStr(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
+    void sceVibGetProfile(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
 
     static constexpr size_t kPadDebugPortCount = 2u;
     static constexpr size_t kPadDebugSlotCount = 1u;

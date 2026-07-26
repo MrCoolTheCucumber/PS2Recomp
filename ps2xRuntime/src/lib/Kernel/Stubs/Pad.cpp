@@ -266,6 +266,70 @@ namespace ps2_stubs
             data[19] = pressureValue(state, portState, kPadBtnR2);
         }
 
+        void fillPad2Status(uint8_t *data, const PadInputState &state)
+        {
+            constexpr size_t kPad2StatusSize = 18u;
+            std::memset(data, 0, kPad2StatusSize);
+            data[0] = static_cast<uint8_t>(state.buttons & 0xFFu);
+            data[1] = static_cast<uint8_t>((state.buttons >> 8) & 0xFFu);
+            data[2] = state.rx;
+            data[3] = state.ry;
+            data[4] = state.lx;
+            data[5] = state.ly;
+
+            const auto pressed = [&state](uint16_t mask)
+            {
+                return static_cast<uint8_t>((state.buttons & mask) == 0u ? 0xFFu : 0u);
+            };
+            data[6] = pressed(kPadBtnRight);
+            data[7] = pressed(kPadBtnLeft);
+            data[8] = pressed(kPadBtnUp);
+            data[9] = pressed(kPadBtnDown);
+            data[10] = pressed(kPadBtnTriangle);
+            data[11] = pressed(kPadBtnCircle);
+            data[12] = pressed(kPadBtnCross);
+            data[13] = pressed(kPadBtnSquare);
+            data[14] = pressed(kPadBtnL1);
+            data[15] = pressed(kPadBtnL2);
+            data[16] = pressed(kPadBtnR1);
+            data[17] = pressed(kPadBtnR2);
+        }
+
+        void samplePadInput(int port, int slot, PS2Runtime *runtime, bool allowAnalog,
+                            PadInputState &state, bool &usedOverride, bool &usedBackend)
+        {
+            usedOverride = false;
+            usedBackend = false;
+            {
+                std::lock_guard<std::mutex> lock(g_padOverrideMutex);
+                if (g_padOverrideEnabled)
+                {
+                    state = g_padOverrideState;
+                    usedOverride = true;
+                }
+            }
+
+            if (usedOverride)
+            {
+                return;
+            }
+
+            uint8_t backendData[32]{};
+            if (runtime && runtime->padBackend().readState(port, slot, backendData, sizeof(backendData)))
+            {
+                state.buttons = static_cast<uint16_t>(backendData[2] | (backendData[3] << 8));
+                state.rx = backendData[4];
+                state.ry = backendData[5];
+                state.lx = backendData[6];
+                state.ly = backendData[7];
+                usedBackend = true;
+                return;
+            }
+
+            applyGamepadState(state);
+            applyKeyboardState(state, allowAnalog);
+        }
+
         bool readPadPortData(int port, int slot, PS2Runtime *runtime, uint8_t *outData, uint32_t dataAddr)
         {
             if (!outData)
@@ -285,35 +349,9 @@ namespace ps2_stubs
             }
 
             PadInputState state;
-            bool useOverride = false;
-            {
-                std::lock_guard<std::mutex> lock(g_padOverrideMutex);
-                if (g_padOverrideEnabled)
-                {
-                    state = g_padOverrideState;
-                    useOverride = true;
-                }
-            }
-
+            bool usedOverride = false;
             bool usedBackend = false;
-            if (!useOverride)
-            {
-                uint8_t backendData[32]{};
-                if (runtime && runtime->padBackend().readState(port, slot, backendData, sizeof(backendData)))
-                {
-                    state.buttons = static_cast<uint16_t>(backendData[2] | (backendData[3] << 8));
-                    state.rx = backendData[4];
-                    state.ry = backendData[5];
-                    state.lx = backendData[6];
-                    state.ly = backendData[7];
-                    usedBackend = true;
-                }
-                else
-                {
-                    applyGamepadState(state);
-                    applyKeyboardState(state, portState.analogMode);
-                }
-            }
+            samplePadInput(port, slot, runtime, portState.analogMode, state, usedOverride, usedBackend);
 
             fillPadStatus(outData, state, portState);
 
@@ -323,7 +361,7 @@ namespace ps2_stubs
                 {
                     sharedPortState->lastInput = state;
                     std::memcpy(sharedPortState->lastData, outData, sizeof(sharedPortState->lastData));
-                    sharedPortState->lastUsedOverride = useOverride;
+                    sharedPortState->lastUsedOverride = usedOverride;
                     sharedPortState->lastUsedBackend = usedBackend;
                     sharedPortState->lastReadOk = true;
                     sharedPortState->lastReadDataAddr = dataAddr;
@@ -573,6 +611,76 @@ namespace ps2_stubs
     void scePadInit2(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
         scePadInit(rdram, ctx, runtime);
+    }
+
+    void scePad2GetButtonProfile(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        constexpr uint32_t kStandardButtonProfile = 0xFFFFFFFFu;
+        const int socket = static_cast<int>(getRegU32(ctx, 4));
+        const uint32_t profileAddr = getRegU32(ctx, 5);
+        uint8_t *profile = (profileAddr != 0u) ? getMemPtr(rdram, profileAddr) : nullptr;
+        if (socket < 0 || !profile)
+        {
+            setReturnS32(ctx, -1);
+            return;
+        }
+
+        (void)runtime;
+        ps2TraceGuestRangeWrite(rdram, profileAddr, sizeof(kStandardButtonProfile),
+                                "scePad2GetButtonProfile", ctx);
+        std::memcpy(profile, &kStandardButtonProfile, sizeof(kStandardButtonProfile));
+        setReturnS32(ctx, static_cast<int32_t>(sizeof(kStandardButtonProfile)));
+    }
+
+    void scePad2GetState(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        (void)rdram;
+        (void)runtime;
+        const int socket = static_cast<int>(getRegU32(ctx, 4));
+        setReturnS32(ctx, socket >= 0 ? 1 : 0);
+    }
+
+    void scePad2Read(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        constexpr uint32_t kPad2StatusSize = 18u;
+        const int socket = static_cast<int>(getRegU32(ctx, 4));
+        const uint32_t dataAddr = getRegU32(ctx, 5);
+        uint8_t *data = (dataAddr != 0u) ? getMemPtr(rdram, dataAddr) : nullptr;
+        if (socket < 0 || !data)
+        {
+            setReturnS32(ctx, -1);
+            return;
+        }
+
+        PadInputState state;
+        bool usedOverride = false;
+        bool usedBackend = false;
+        samplePadInput(socket, 0, runtime, true, state, usedOverride, usedBackend);
+        (void)usedOverride;
+        (void)usedBackend;
+
+        ps2TraceGuestRangeWrite(rdram, dataAddr, kPad2StatusSize, "scePad2Read", ctx);
+        fillPad2Status(data, state);
+        setReturnS32(ctx, static_cast<int32_t>(kPad2StatusSize));
+    }
+
+    void sceVibGetProfile(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        constexpr uint32_t kDualShockActuatorProfile = 3u;
+        const int socket = static_cast<int>(getRegU32(ctx, 4));
+        const uint32_t profileAddr = getRegU32(ctx, 5);
+        uint8_t *profile = (profileAddr != 0u) ? getMemPtr(rdram, profileAddr) : nullptr;
+        if (socket < 0 || !profile)
+        {
+            setReturnS32(ctx, -1);
+            return;
+        }
+
+        (void)runtime;
+        ps2TraceGuestRangeWrite(rdram, profileAddr, sizeof(kDualShockActuatorProfile),
+                                "sceVibGetProfile", ctx);
+        std::memcpy(profile, &kDualShockActuatorProfile, sizeof(kDualShockActuatorProfile));
+        setReturnS32(ctx, static_cast<int32_t>(sizeof(kDualShockActuatorProfile)));
     }
 
     void scePadPortClose(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
