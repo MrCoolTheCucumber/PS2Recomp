@@ -972,6 +972,13 @@ private:
     void scheduleVU1Event(
         ps2x::timing::EeTick deadline) noexcept;
     void cancelVU1Execution(bool resetInterpreter);
+    bool scheduleVif1DmaFromMemory(
+        uint32_t delayEeCycles);
+    void cancelVif1DmaEvent() noexcept;
+    void scheduleVif1DmaEvent(
+        ps2x::timing::EeTick deadline) noexcept;
+    void serviceVif1DmaAtEvent(
+        const ps2x::timing::EeEventService &service);
     void setVU1BusyFlag(
         R5900Context *context, bool busy) noexcept;
     void onDmacCompletionReady();
@@ -1023,6 +1030,8 @@ private:
             ps2x::timing::EeEventSource::VifVu1Finish, 0u};
     };
     Vu1ExecutionTiming m_vu1ExecutionTiming{};
+    ps2x::timing::EeEventToken m_vif1DmaEventToken{
+        ps2x::timing::EeEventSource::DmacVif1, 0u};
     ps2x::timing::EeTick m_vu0CycleTick{};
     ps2x::timing::EeTick m_vu0NextEventCycleTick{};
     bool m_eeSchedulerShadowMismatch = false;

@@ -248,19 +248,16 @@ bool PS2Memory::resumeVIF1AfterVu()
     m_vif1WaitingForVu = false;
     vif1_regs.stat &= ~(1u << 2); // VEW
 
-    std::vector<uint8_t> deferred;
-    deferred.swap(m_vif1DeferredData);
-    if (!deferred.empty())
-        processVIF1Data(deferred.data(), static_cast<uint32_t>(deferred.size()));
-
-    if (!m_vif1WaitingForVu &&
-        m_vif1DeferredDmacCompletion.has_value())
+    if (m_vif1Dma.active)
     {
-        const DmacTransferToken completion =
-            *m_vif1DeferredDmacCompletion;
-        m_vif1DeferredDmacCompletion.reset();
-        (void)requestDmacCompletion(completion);
+        m_vif1Dma.stall = Vif1DmaStallReason::None;
+        if (m_vif1Dma.eventManaged)
+            return wakeVif1Dma();
+        drainVif1DmaCompatibility();
+        return true;
     }
+
+    (void)processVif1Stream();
     return true;
 }
 
@@ -270,7 +267,6 @@ void PS2Memory::cancelVIF1VuWait()
     if (m_rdram)
         vif1_regs.stat &= ~(1u << 2); // VEW
     m_vif1DeferredData.clear();
-    m_vif1DeferredDmacCompletion.reset();
 }
 
 void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
@@ -278,19 +274,89 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
     if (!data || sizeBytes == 0u)
         return;
 
+    appendVif1Stream(data, sizeBytes);
     if (m_vif1WaitingForVu)
-    {
-        m_vif1DeferredData.insert(
-            m_vif1DeferredData.end(), data, data + sizeBytes);
         return;
+
+    (void)processVif1Stream();
+}
+
+void PS2Memory::appendVif1Stream(
+    const uint8_t *data, uint32_t sizeBytes)
+{
+    if (!data || sizeBytes == 0u)
+        return;
+    m_vif1DeferredData.insert(
+        m_vif1DeferredData.end(), data, data + sizeBytes);
+}
+
+PS2Memory::Vif1ParserDisposition
+PS2Memory::processVif1Stream()
+{
+    if (m_vif1WaitingForVu)
+        return Vif1ParserDisposition::WaitingForVu;
+    if ((vif1_regs.stat & (1u << 10)) != 0u)
+        return Vif1ParserDisposition::VifInterrupt;
+    if (m_vif1DeferredData.empty())
+    {
+        vif1_regs.stat &= ~0x3u;
+        return Vif1ParserDisposition::Drained;
     }
 
+    const uint8_t *const data = m_vif1DeferredData.data();
+    const uint32_t sizeBytes =
+        static_cast<uint32_t>(
+            std::min<size_t>(
+                m_vif1DeferredData.size(),
+                static_cast<size_t>(UINT32_MAX)));
     uint32_t pos = 0;
+    bool stallAfterCommand = false;
+
+    const auto finish =
+        [&](Vif1ParserDisposition disposition)
+        {
+            if (pos != 0u)
+            {
+                m_vif1DeferredData.erase(
+                    m_vif1DeferredData.begin(),
+                    m_vif1DeferredData.begin() + pos);
+            }
+
+            vif1_regs.stat &= ~0x3u;
+            switch (disposition)
+            {
+            case Vif1ParserDisposition::NeedMoreData:
+                vif1_regs.stat |= 0x1u;
+                break;
+            case Vif1ParserDisposition::Drained:
+            case Vif1ParserDisposition::WaitingForVu:
+            case Vif1ParserDisposition::VifInterrupt:
+            case Vif1ParserDisposition::GifPath:
+                break;
+            }
+            return disposition;
+        };
 
     while (pos + 4 <= sizeBytes)
     {
+        if (stallAfterCommand)
+        {
+            vif1_regs.stat |= (1u << 10); // VIS
+            return finish(
+                Vif1ParserDisposition::VifInterrupt);
+        }
+
         if (m_vif1PendingPath2DirectQwc != 0u)
         {
+            if (!isVif1GifPathAvailable(
+                    m_vif1PendingPath2DirectHl))
+            {
+                vif1_regs.stat |= (1u << 3); // VGW
+                return finish(
+                    Vif1ParserDisposition::GifPath);
+            }
+            vif1_regs.stat &= ~(1u << 3); // VGW
+
             const uint32_t availableQw = (sizeBytes - pos) / 16u;
             if (availableQw == 0u)
             {
@@ -309,6 +375,14 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
             if (m_vif1PendingPath2DirectQwc == 0u)
             {
                 m_vif1PendingPath2DirectHl = false;
+                if (m_vif1PendingIrqAfterCommand)
+                {
+                    m_vif1PendingIrqAfterCommand = false;
+                    vif1_regs.stat |= (1u << 10); // VIS
+                    return finish(
+                        Vif1ParserDisposition::
+                            VifInterrupt);
+                }
             }
             continue;
         }
@@ -343,11 +417,12 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
         {
             m_vif1WaitingForVu = true;
             vif1_regs.stat |= (1u << 2); // VEW
-            m_vif1DeferredData.insert(
-                m_vif1DeferredData.end(),
-                data + commandStart, data + sizeBytes);
-            return;
+            pos = commandStart;
+            return finish(
+                Vif1ParserDisposition::WaitingForVu);
         }
+
+        stallAfterCommand = irq;
 
         if (opcode == VIF_NOP)
         {
@@ -447,7 +522,11 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
         else if (opcode == VIF_STMASK)
         {
             if (pos + 4 > sizeBytes)
+            {
+                pos = commandStart;
+                stallAfterCommand = false;
                 break;
+            }
             uint32_t maskValue = 0;
             std::memcpy(&maskValue, data + pos, sizeof(maskValue));
             vif1_regs.mask = maskValue;
@@ -457,7 +536,11 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
         else if (opcode == VIF_STROW)
         {
             if (pos + 16 > sizeBytes)
+            {
+                pos = commandStart;
+                stallAfterCommand = false;
                 break;
+            }
             std::memcpy(vif1_regs.row, data + pos, 16);
             pos += 16;
             continue;
@@ -465,7 +548,11 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
         else if (opcode == VIF_STCOL)
         {
             if (pos + 16 > sizeBytes)
+            {
+                pos = commandStart;
+                stallAfterCommand = false;
                 break;
+            }
             std::memcpy(vif1_regs.col, data + pos, 16);
             pos += 16;
             continue;
@@ -477,24 +564,35 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
             // MPG payload is instruction-packed and should not be QW-aligned.
             const uint32_t instructionCount = (num == 0u) ? 256u : static_cast<uint32_t>(num);
             const uint32_t mpgBytes = instructionCount * 8u;
+            if (pos + mpgBytes > sizeBytes)
+            {
+                pos = commandStart;
+                stallAfterCommand = false;
+                break;
+            }
             if (m_vu1Code && destAddr < PS2_VU1_CODE_SIZE && mpgBytes > 0)
             {
                 uint32_t copyBytes = mpgBytes;
                 if (destAddr + copyBytes > PS2_VU1_CODE_SIZE)
                     copyBytes = PS2_VU1_CODE_SIZE - destAddr;
-                if (pos + copyBytes <= sizeBytes)
-                {
-                    std::memcpy(m_vu1Code + destAddr, data + pos, copyBytes);
-                    markVU1CodeModified();
-                }
+                std::memcpy(m_vu1Code + destAddr, data + pos, copyBytes);
+                markVU1CodeModified();
             }
             pos += mpgBytes;
-            if (pos > sizeBytes)
-                break;
             continue;
         }
         else if (opcode == VIF_DIRECT || opcode == VIF_DIRECTHL)
         {
+            const bool directHl = (opcode == VIF_DIRECTHL);
+            if (!isVif1GifPathAvailable(directHl))
+            {
+                vif1_regs.stat |= (1u << 3); // VGW
+                pos = commandStart;
+                return finish(
+                    Vif1ParserDisposition::GifPath);
+            }
+            vif1_regs.stat &= ~(1u << 3); // VGW
+
             uint32_t qwCount = imm;
             if (qwCount == 0)
                 qwCount = 65536;
@@ -505,7 +603,6 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
 
             if (qwCount > 0)
             {
-                const bool directHl = (opcode == VIF_DIRECTHL);
                 submitGifPacket(GifPathId::Path2, data + pos, qwCount * 16, true, directHl);
 
             }
@@ -515,8 +612,9 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
             {
                 const uint32_t requestedQw = (imm == 0u) ? 65536u : static_cast<uint32_t>(imm);
                 m_vif1PendingPath2DirectQwc = requestedQw - qwCount;
-                m_vif1PendingPath2DirectHl = (opcode == VIF_DIRECTHL);
-                pos = sizeBytes;
+                m_vif1PendingPath2DirectHl = directHl;
+                m_vif1PendingIrqAfterCommand = irq;
+                stallAfterCommand = false;
                 break;
             }
             continue;
@@ -570,6 +668,12 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
 
             uint32_t totalBytes = sourceVectorCount * bytesPerVector;
             totalBytes = (totalBytes + 3) & ~3u;
+            if (pos + totalBytes > sizeBytes)
+            {
+                pos = commandStart;
+                stallAfterCommand = false;
+                break;
+            }
 
             uint32_t vuAddr = (uint32_t)imm & 0x3FFu;
             if ((imm & 0x8000u) != 0u)
@@ -775,9 +879,6 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
                 }
             }
             pos += totalBytes;
-
-            if (pos > sizeBytes)
-                break;
             continue;
         }
         else
@@ -785,4 +886,17 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
             continue;
         }
     }
+
+    if (stallAfterCommand)
+    {
+        vif1_regs.stat |= (1u << 10); // VIS
+        return finish(
+            Vif1ParserDisposition::VifInterrupt);
+    }
+    if (pos == sizeBytes &&
+        m_vif1PendingPath2DirectQwc == 0u)
+    {
+        return finish(Vif1ParserDisposition::Drained);
+    }
+    return finish(Vif1ParserDisposition::NeedMoreData);
 }

@@ -893,6 +893,17 @@ PS2Runtime::PS2Runtime()
         {
             onDmacInterruptStateChanged();
         });
+    m_memory.setVif1DmaScheduleCallback(
+        [this](uint32_t delayEeCycles)
+        {
+            return scheduleVif1DmaFromMemory(
+                delayEeCycles);
+        });
+    m_memory.setVif1DmaCancelCallback(
+        [this]()
+        {
+            cancelVif1DmaEvent();
+        });
 
     m_iopHost = std::make_unique<PS2IopHostAdapter>(*this);
     m_iopSubsystem = std::make_unique<ps2x::iop::IopSubsystem>(*m_iopHost);
@@ -1102,6 +1113,12 @@ ps2x::timing::EeTick PS2Runtime::finishEeContextBlock(
 void PS2Runtime::resetEeTimingUnlocked(
     R5900Context *context) noexcept
 {
+    cancelVif1DmaEvent();
+    if (m_memory.vif1DmaSnapshot().active)
+    {
+        (void)m_memory.cancelDmacTransfer(
+            DmacChannel::Vif1);
+    }
     m_eeTimeline.reset();
     m_eeEventScheduler.reset();
     cancelVU1Execution(true);
@@ -1157,6 +1174,12 @@ void PS2Runtime::setEeSchedulingMode(
         return;
     }
 
+    cancelVif1DmaEvent();
+    if (m_memory.vif1DmaSnapshot().active)
+    {
+        (void)m_memory.cancelDmacTransfer(
+            DmacChannel::Vif1);
+    }
     m_eeSchedulingMode = mode;
     m_eeEventScheduler.reset();
     cancelVU1Execution(true);
@@ -1312,6 +1335,17 @@ bool PS2Runtime::syncCoreSubsystems()
                                    [this]
                                    { m_gs.endRenderBatch(); });
     m_memory.setGifArbiter(&m_gifArbiter);
+    m_memory.setVif1GifPathAvailableCallback(
+        [this](bool directHl)
+        {
+            if (m_eeSchedulingMode !=
+                ps2x::timing::EeSchedulingMode::Event)
+            {
+                return true;
+            }
+            return m_gifArbiter.canAcceptPath2(
+                directHl);
+        });
     m_memory.setVu1MscalCallback(
         [this](uint32_t startPC, uint32_t top, uint32_t itop)
         {
@@ -1379,6 +1413,79 @@ void PS2Runtime::scheduleVU1Event(
         m_eeEventScheduler.scheduleAbsolute(
             ps2x::timing::EeEventSource::VifVu1Finish,
             deadline);
+}
+
+bool PS2Runtime::scheduleVif1DmaFromMemory(
+    uint32_t delayEeCycles)
+{
+    if (m_eeSchedulingMode !=
+        ps2x::timing::EeSchedulingMode::Event)
+    {
+        return false;
+    }
+
+    const ps2x::timing::EeTick now =
+        commitEeContextProgress(m_boundEeContext);
+    scheduleVif1DmaEvent(
+        ps2x::timing::saturatingAdd(
+            now,
+            ps2x::timing::eeCyclesToTicks(
+                delayEeCycles)));
+    return m_vif1DmaEventToken.generation != 0u;
+}
+
+void PS2Runtime::scheduleVif1DmaEvent(
+    ps2x::timing::EeTick deadline) noexcept
+{
+    m_vif1DmaEventToken =
+        m_eeEventScheduler.scheduleAbsolute(
+            ps2x::timing::EeEventSource::DmacVif1,
+            deadline);
+}
+
+void PS2Runtime::cancelVif1DmaEvent() noexcept
+{
+    if (m_vif1DmaEventToken.generation != 0u)
+    {
+        (void)m_eeEventScheduler.cancel(
+            m_vif1DmaEventToken);
+    }
+    m_vif1DmaEventToken = {
+        ps2x::timing::EeEventSource::DmacVif1,
+        0u};
+}
+
+void PS2Runtime::serviceVif1DmaAtEvent(
+    const ps2x::timing::EeEventService &service)
+{
+    if (m_vif1DmaEventToken.generation == 0u ||
+        service.generation !=
+            m_vif1DmaEventToken.generation)
+    {
+        return;
+    }
+
+    m_vif1DmaEventToken = {
+        ps2x::timing::EeEventSource::DmacVif1,
+        0u};
+    const Vif1DmaAdvanceResult advance =
+        m_memory.advanceVif1Dma();
+    if (!advance.active || advance.completed)
+        return;
+
+    if (advance.stall !=
+            Vif1DmaStallReason::None &&
+        advance.stall !=
+            Vif1DmaStallReason::GifPath)
+    {
+        return;
+    }
+
+    scheduleVif1DmaEvent(
+        ps2x::timing::saturatingAdd(
+            service.serviceTick,
+            ps2x::timing::eeCyclesToTicks(
+                advance.delayEeCycles)));
 }
 
 void PS2Runtime::cancelVU1Execution(bool resetInterpreter)
@@ -1489,7 +1596,8 @@ void PS2Runtime::serviceVU1AtEvent(
     {
         setVU1BusyFlag(ctx, false);
         (void)m_memory.resumeVIF1AfterVu();
-        if (!m_vu1.isActive())
+        if (!m_vu1.isActive() &&
+            !m_memory.vif1DmaSnapshot().active)
             m_memory.finishVif1DmaTrace();
         return;
     }
@@ -1541,7 +1649,8 @@ void PS2Runtime::serviceVU1AtEvent(
         service.serviceTick;
     setVU1BusyFlag(ctx, false);
     (void)m_memory.resumeVIF1AfterVu();
-    if (!m_vu1.isActive())
+    if (!m_vu1.isActive() &&
+        !m_memory.vif1DmaSnapshot().active)
         m_memory.finishVif1DmaTrace();
 }
 
@@ -2726,6 +2835,7 @@ void PS2Runtime::dispatchEeEvent(
         }
         return;
     case ps2x::timing::EeEventSource::DmacVif1:
+        serviceVif1DmaAtEvent(service);
         return;
     case ps2x::timing::EeEventSource::VifVu1Finish:
         serviceVU1AtEvent(ctx, service);

@@ -149,6 +149,20 @@ bool GifArbiter::empty() const
     return true;
 }
 
+bool GifArbiter::canAcceptPath2(bool directHl) const
+{
+    if (!directHl)
+        return true;
+
+    return std::none_of(
+        m_queue.begin(), m_queue.end(),
+        [](const GifArbiterPacket &packet)
+        {
+            return packet.pathId == GifPathId::Path3 &&
+                   packet.path3Image;
+        });
+}
+
 void GifArbiter::drain()
 {
     if (!m_processFn || m_queue.empty())

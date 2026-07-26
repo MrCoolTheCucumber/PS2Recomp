@@ -10,6 +10,7 @@
 #include <utility>
 #include <vector>
 #include <unordered_map>
+#include <unordered_set>
 #include <atomic>
 #include <iostream>
 #include <mutex>
@@ -390,6 +391,59 @@ struct DmacChannelSnapshot
     uint64_t generation = 0u;
 };
 
+enum class Vif1DmaPhase : uint8_t
+{
+    Idle = 0u,
+    FetchTag,
+    TransferPayload,
+    Finalize,
+    Fault,
+};
+
+enum class Vif1DmaStallReason : uint8_t
+{
+    None = 0u,
+    WaitingForVu,
+    VifStop,
+    VifInterrupt,
+    ForceBreak,
+    GifPath,
+    DmacDisabled,
+    Fault,
+};
+
+struct Vif1DmaAdvanceResult
+{
+    DmacTransferToken transfer{};
+    Vif1DmaPhase phase = Vif1DmaPhase::Idle;
+    Vif1DmaStallReason stall = Vif1DmaStallReason::None;
+    uint32_t delayEeCycles = 0u;
+    bool progressed = false;
+    bool completed = false;
+    bool active = false;
+};
+
+struct Vif1DmaSnapshot
+{
+    DmacTransferToken transfer{};
+    Vif1DmaPhase phase = Vif1DmaPhase::Idle;
+    Vif1DmaStallReason stall = Vif1DmaStallReason::None;
+    uint32_t madr = 0u;
+    uint32_t qwc = 0u;
+    uint32_t tadr = 0u;
+    uint32_t asr0 = 0u;
+    uint32_t asr1 = 0u;
+    uint32_t parserBytes = 0u;
+    uint32_t tagsProcessed = 0u;
+    uint8_t asp = 0u;
+    uint8_t tagId = 0u;
+    bool active = false;
+    bool eventManaged = false;
+    bool chainMode = false;
+    bool tagIrq = false;
+    bool endAfterPayload = false;
+};
+
 struct JumpTable
 {
     uint32_t address = 0;          // Base address of the jump table
@@ -466,11 +520,33 @@ public:
     void setVu1BusyCallback(Vu1BusyCallback cb) { m_vu1BusyCallback = std::move(cb); }
     using Vif1ResetCallback = std::function<void()>;
     void setVif1ResetCallback(Vif1ResetCallback cb) { m_vif1ResetCallback = std::move(cb); }
+    using Vif1DmaScheduleCallback =
+        std::function<bool(uint32_t delayEeCycles)>;
+    void setVif1DmaScheduleCallback(
+        Vif1DmaScheduleCallback cb)
+    {
+        m_vif1DmaScheduleCallback = std::move(cb);
+    }
+    using Vif1DmaCancelCallback = std::function<void()>;
+    void setVif1DmaCancelCallback(Vif1DmaCancelCallback cb)
+    {
+        m_vif1DmaCancelCallback = std::move(cb);
+    }
+    using Vif1GifPathAvailableCallback =
+        std::function<bool(bool directHl)>;
+    void setVif1GifPathAvailableCallback(
+        Vif1GifPathAvailableCallback cb)
+    {
+        m_vif1GifPathAvailableCallback = std::move(cb);
+    }
 
     [[nodiscard]] bool vif1WaitingForVu() const { return m_vif1WaitingForVu; }
     [[nodiscard]] size_t vif1DeferredByteCount() const { return m_vif1DeferredData.size(); }
     bool resumeVIF1AfterVu();
     void cancelVIF1VuWait();
+    bool wakeVif1Dma();
+    Vif1DmaAdvanceResult advanceVif1Dma();
+    [[nodiscard]] Vif1DmaSnapshot vif1DmaSnapshot() const;
 
     uint8_t *getVU1Code() { return m_vu1Code; }
     const uint8_t *getVU1Code() const { return m_vu1Code; }
@@ -587,6 +663,10 @@ public:
     Vu1MscntCallback m_vu1MscntCallback;
     Vu1BusyCallback m_vu1BusyCallback;
     Vif1ResetCallback m_vif1ResetCallback;
+    Vif1DmaScheduleCallback m_vif1DmaScheduleCallback;
+    Vif1DmaCancelCallback m_vif1DmaCancelCallback;
+    Vif1GifPathAvailableCallback
+        m_vif1GifPathAvailableCallback;
 
     uint8_t *m_vu0Code = nullptr;
     uint8_t *m_vu0Data = nullptr;
@@ -595,9 +675,9 @@ public:
     bool m_path3Masked = false;
     uint32_t m_vif1PendingPath2DirectQwc = 0u;
     bool m_vif1PendingPath2DirectHl = false;
+    bool m_vif1PendingIrqAfterCommand = false;
     bool m_vif1WaitingForVu = false;
     std::vector<uint8_t> m_vif1DeferredData;
-    std::optional<DmacTransferToken> m_vif1DeferredDmacCompletion;
     std::vector<std::vector<uint8_t>> m_path3MaskedFifo;
 
     struct PendingTransfer
@@ -610,7 +690,66 @@ public:
     };
     std::vector<PendingTransfer> m_pendingGifTransfers;
     std::vector<PendingTransfer> m_pendingVif0Transfers;
-    std::vector<PendingTransfer> m_pendingVif1Transfers;
+
+    struct Vif1DmaChainKey
+    {
+        uint32_t tadr = 0u;
+        uint32_t asr0 = 0u;
+        uint32_t asr1 = 0u;
+        uint8_t asp = 0u;
+
+        friend bool operator==(
+            const Vif1DmaChainKey &,
+            const Vif1DmaChainKey &) = default;
+    };
+
+    struct Vif1DmaChainKeyHash
+    {
+        size_t operator()(
+            const Vif1DmaChainKey &key) const noexcept
+        {
+            size_t hash = static_cast<size_t>(key.tadr);
+            hash ^= static_cast<size_t>(key.asr0) +
+                    0x9e3779b9u + (hash << 6u) +
+                    (hash >> 2u);
+            hash ^= static_cast<size_t>(key.asr1) +
+                    0x9e3779b9u + (hash << 6u) +
+                    (hash >> 2u);
+            hash ^= static_cast<size_t>(key.asp) +
+                    0x9e3779b9u + (hash << 6u) +
+                    (hash >> 2u);
+            return hash;
+        }
+    };
+
+    struct Vif1DmaState
+    {
+        DmacTransferToken transfer{};
+        Vif1DmaPhase phase = Vif1DmaPhase::Idle;
+        Vif1DmaStallReason stall =
+            Vif1DmaStallReason::None;
+        uint32_t madr = 0u;
+        uint32_t qwc = 0u;
+        uint32_t tadr = 0u;
+        uint32_t asr0 = 0u;
+        uint32_t asr1 = 0u;
+        uint32_t tagsProcessed = 0u;
+        uint8_t asp = 0u;
+        uint8_t tagId = 0u;
+        bool active = false;
+        bool eventManaged = false;
+        bool chainMode = false;
+        bool tie = false;
+        bool tte = false;
+        bool tagIrq = false;
+        bool endAfterPayload = false;
+        bool faultReported = false;
+        std::unordered_set<
+            Vif1DmaChainKey,
+            Vif1DmaChainKeyHash>
+            visitedStates;
+    };
+    Vif1DmaState m_vif1Dma{};
 
     struct DmacChannelLifecycle
     {
@@ -654,6 +793,28 @@ public:
     void updateEeTimer0Counter();
     bool processScratchpadDma(uint32_t channelBase);
     void discardPendingDmacWork(DmacChannel channel);
+    bool startVif1Dma(
+        DmacTransferToken transfer, uint32_t chcr);
+    void clearVif1DmaState(bool notifyRuntime);
+    bool scheduleVif1Dma(uint32_t delayEeCycles);
+    void drainVif1DmaCompatibility();
+    void updateVif1Fqc(uint32_t qwc);
+    [[nodiscard]] bool isDmacEnabled() const;
+    [[nodiscard]] bool isVif1GifPathAvailable(
+        bool directHl) const;
+    enum class Vif1ParserDisposition : uint8_t
+    {
+        Drained = 0u,
+        NeedMoreData,
+        WaitingForVu,
+        VifInterrupt,
+        GifPath,
+    };
+    Vif1ParserDisposition processVif1Stream();
+    void appendVif1Stream(
+        const uint8_t *data, uint32_t sizeBytes);
+    [[nodiscard]] Vif1DmaStallReason
+    currentVif1DmaStall() const;
     static uint64_t nextDmacSequence(uint64_t value) noexcept;
     void beginVif1DmaTrace(uint32_t chcr,
                            uint32_t madr,
@@ -667,7 +828,6 @@ public:
     void traceVif1Input(const uint8_t *data, uint32_t sizeBytes);
     void traceVif1Command(uint32_t command, const uint8_t *followingData,
                           uint32_t followingBytes);
-    void traceVif1NormalTransfer(uint32_t srcAddr, uint32_t qwc);
     void tracePath1Packet(const uint8_t *data, uint32_t sizeBytes);
     bool isVif1DmaTraceActive() const;
     void traceVu1Invocation(uint32_t startPc, uint32_t top, uint32_t itop, bool resume,

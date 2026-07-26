@@ -1813,6 +1813,512 @@ void register_ps2_memory_tests()
                 "publication should clear VIF1 CHCR.STR");
         });
 
+        tc.Run("VIF1 scheduled parser retains a split command across chain events", [](TestCase &t)
+        {
+            PS2Memory mem;
+            t.IsTrue(mem.initialize(),
+                     "PS2Memory initialize should succeed");
+
+            constexpr uint32_t kVif1 = 0x10009000u;
+            constexpr uint32_t kTag = 0x00024900u;
+            uint8_t *const rdram = mem.getRDRAM();
+            std::memset(rdram + kTag, 0, 48u);
+
+            const uint64_t cnt =
+                makeDmaTag(0u, 1u, 0u, false);
+            const uint64_t end =
+                makeDmaTag(1u, 7u, 0u, false);
+            std::memcpy(rdram + kTag, &cnt, sizeof(cnt));
+            std::memcpy(
+                rdram + kTag + 16u, &end, sizeof(end));
+
+            const uint32_t strow =
+                makeVifCmd(0x30u, 0u, 0u);
+            const std::array<uint32_t, 4> row = {
+                0x11111111u,
+                0x22222222u,
+                0x33333333u,
+                0x44444444u,
+            };
+            std::memcpy(
+                rdram + kTag + 8u,
+                &strow, sizeof(strow));
+            std::memcpy(
+                rdram + kTag + 12u,
+                &row[0], sizeof(row[0]));
+            std::memcpy(
+                rdram + kTag + 24u,
+                &row[1], sizeof(row[1]) * 2u);
+            std::memcpy(
+                rdram + kTag + 32u,
+                &row[3], sizeof(row[3]));
+
+            uint32_t scheduleRequests = 0u;
+            mem.setVif1DmaScheduleCallback(
+                [&](uint32_t)
+                {
+                    ++scheduleRequests;
+                    return true;
+                });
+            t.IsTrue(mem.writeIORegister(
+                         kVif1 + 0x30u, kTag),
+                     "split command TADR write should succeed");
+            t.IsTrue(mem.writeIORegister(
+                         kVif1, 0x145u),
+                     "split command chain start should succeed");
+            t.Equals(scheduleRequests, 1u,
+                     "submission should request one initial event");
+
+            Vif1DmaAdvanceResult advance =
+                mem.advanceVif1Dma();
+            t.IsTrue(advance.progressed,
+                     "first event should fetch the CNT tag");
+            t.Equals(
+                mem.vif1DmaSnapshot().parserBytes, 8u,
+                "STROW header and first word should remain buffered");
+            t.Equals(mem.vif1_regs.row[0], 0u,
+                     "an incomplete STROW must not mutate row state");
+
+            advance = mem.advanceVif1Dma();
+            t.IsTrue(advance.progressed,
+                     "second event should fetch the END tag");
+            t.Equals(
+                mem.vif1DmaSnapshot().parserBytes, 16u,
+                "second tag high bytes should extend the same command");
+            t.Equals(mem.vif1_regs.row[0], 0u,
+                     "STROW should remain atomic until its full payload");
+
+            advance = mem.advanceVif1Dma();
+            t.IsTrue(advance.progressed,
+                     "third event should transfer the END payload");
+            for (size_t index = 0u;
+                 index < row.size(); ++index)
+            {
+                t.Equals(
+                    mem.vif1_regs.row[index], row[index],
+                    "split STROW should commit the retained row");
+            }
+            t.Equals(
+                mem.vif1DmaSnapshot().parserBytes, 0u,
+                "complete command and trailing NOPs should drain");
+
+            advance = mem.advanceVif1Dma();
+            t.IsTrue(advance.completed,
+                     "a separate final event should request completion");
+            t.IsTrue(mem.hasReadyDmacCompletions(),
+                     "final state should use typed DMAC completion");
+        });
+
+        tc.Run("VIF1 scheduled normal DMA normalizes QWC and retires event ownership", [](TestCase &t)
+        {
+            PS2Memory mem;
+            t.IsTrue(mem.initialize(),
+                     "PS2Memory initialize should succeed");
+
+            constexpr uint32_t kVif1 = 0x10009000u;
+            constexpr uint32_t kSource = 0x00024980u;
+            std::memset(
+                mem.getRDRAM() + kSource, 0, 16u);
+
+            uint32_t initialDelay = 0u;
+            mem.setVif1DmaScheduleCallback(
+                [&](uint32_t delayEeCycles)
+                {
+                    initialDelay = delayEeCycles;
+                    return true;
+                });
+            t.IsTrue(mem.writeIORegister(
+                         kVif1 + 0x10u, kSource),
+                     "QWC fixture MADR write should succeed");
+            t.IsTrue(mem.writeIORegister(
+                         kVif1 + 0x20u, 0x00010001u),
+                     "QWC fixture write should succeed");
+            t.IsTrue(mem.writeIORegister(
+                         kVif1, 0x100u),
+                     "QWC fixture start should succeed");
+
+            Vif1DmaSnapshot snapshot =
+                mem.vif1DmaSnapshot();
+            t.IsTrue(
+                snapshot.active &&
+                    snapshot.eventManaged,
+                     "submission should retain event ownership");
+            t.Equals(snapshot.qwc, 1u,
+                     "VIF1 QWC should expose only its hardware bits");
+            t.Equals(
+                mem.readIORegister(kVif1 + 0x20u), 1u,
+                "the visible QWC register should be normalized");
+            t.Equals(initialDelay, 4u,
+                     "normal submission should retain the reference startup delay");
+
+            const Vif1DmaAdvanceResult payload =
+                mem.advanceVif1Dma();
+            t.IsTrue(payload.progressed,
+                     "normalized QWC should transfer one qword");
+            t.Equals(payload.delayEeCycles, 2u,
+                     "one qword should cost two EE cycles");
+            t.Equals(
+                mem.readIORegister(kVif1 + 0x10u),
+                kSource + 16u,
+                "normal payload should advance MADR by one qword");
+
+            const Vif1DmaAdvanceResult completed =
+                mem.advanceVif1Dma();
+            t.IsTrue(completed.completed,
+                     "the later final state should request completion");
+            snapshot = mem.vif1DmaSnapshot();
+            t.IsFalse(snapshot.active,
+                      "finalization should retire the descriptor");
+            t.IsFalse(snapshot.eventManaged,
+                      "finalization should retire event ownership");
+        });
+
+        tc.Run("VIF1 chain TIE and tag IRQ stop after the tagged payload", [](TestCase &t)
+        {
+            PS2Memory mem;
+            t.IsTrue(mem.initialize(),
+                     "PS2Memory initialize should succeed");
+
+            constexpr uint32_t kVif1 = 0x10009000u;
+            constexpr uint32_t kTag = 0x000249C0u;
+            uint8_t *const rdram = mem.getRDRAM();
+            std::memset(rdram + kTag, 0, 48u);
+
+            const uint64_t irqCnt =
+                makeDmaTag(1u, 1u, 0u, true);
+            const uint64_t ignoredEnd =
+                makeDmaTag(0u, 7u, 0u, false);
+            std::memcpy(
+                rdram + kTag, &irqCnt, sizeof(irqCnt));
+            std::memcpy(
+                rdram + kTag + 32u,
+                &ignoredEnd, sizeof(ignoredEnd));
+
+            mem.setVif1DmaScheduleCallback(
+                [](uint32_t)
+                {
+                    return true;
+                });
+            t.IsTrue(mem.writeIORegister(
+                         kVif1 + 0x30u, kTag),
+                     "TIE fixture TADR write should succeed");
+            t.IsTrue(mem.writeIORegister(
+                         kVif1, 0x185u),
+                     "TIE fixture chain start should succeed");
+
+            Vif1DmaAdvanceResult advance =
+                mem.advanceVif1Dma();
+            Vif1DmaSnapshot snapshot =
+                mem.vif1DmaSnapshot();
+            t.IsTrue(advance.progressed &&
+                         snapshot.tagIrq &&
+                         snapshot.endAfterPayload,
+                     "TIE should make the IRQ tag terminal");
+            t.IsTrue(
+                (mem.readIORegister(kVif1) &
+                 0x80000000u) != 0u,
+                "tag setup should expose the IRQ bit in CHCR");
+
+            advance = mem.advanceVif1Dma();
+            snapshot = mem.vif1DmaSnapshot();
+            t.IsTrue(
+                snapshot.phase == Vif1DmaPhase::Finalize,
+                "the IRQ-tag payload should lead to finalization");
+            t.Equals(snapshot.tagsProcessed, 1u,
+                     "the following tag must remain unfetched");
+
+            advance = mem.advanceVif1Dma();
+            t.IsTrue(advance.completed,
+                     "a separate event should request the final IRQ");
+            t.Equals(
+                publishDmacCompletions(mem),
+                static_cast<size_t>(1u),
+                "the terminal tag should publish one completion");
+            t.IsTrue(
+                (mem.readIORegister(0x1000E010u) &
+                 0x2u) != 0u,
+                "VIF1 completion should latch its D_STAT cause");
+        });
+
+        tc.Run("VIF1 STOP ForceBreak and DMA disable retain and wake scheduled work", [](TestCase &t)
+        {
+            PS2Memory mem;
+            t.IsTrue(mem.initialize(),
+                     "PS2Memory initialize should succeed");
+
+            constexpr uint32_t kVif1 = 0x10009000u;
+            constexpr uint32_t kDctrl = 0x1000E000u;
+            constexpr uint32_t kSource = 0x00024A00u;
+            std::memset(
+                mem.getRDRAM() + kSource, 0, 16u);
+
+            uint32_t schedules = 0u;
+            uint32_t cancels = 0u;
+            mem.setVif1DmaScheduleCallback(
+                [&](uint32_t)
+                {
+                    ++schedules;
+                    return true;
+                });
+            mem.setVif1DmaCancelCallback(
+                [&]()
+                {
+                    ++cancels;
+                });
+
+            t.IsTrue(mem.writeIORegister(
+                         kVif1 + 0x10u, kSource),
+                     "stall fixture MADR write should succeed");
+            t.IsTrue(mem.writeIORegister(
+                         kVif1 + 0x20u, 1u),
+                     "stall fixture QWC write should succeed");
+            t.IsTrue(mem.writeIORegister(
+                         kVif1, 0x100u),
+                     "stall fixture start should succeed");
+
+            t.IsTrue(mem.writeIORegister(
+                         0x10003C10u, 0x4u),
+                     "FBRST.STP should succeed");
+            t.IsTrue(
+                (mem.vif1_regs.stat & (1u << 8u)) != 0u,
+                "STOP should set VSS");
+            Vif1DmaAdvanceResult stalled =
+                mem.advanceVif1Dma();
+            t.IsTrue(
+                stalled.stall ==
+                    Vif1DmaStallReason::VifStop,
+                "STOP should prevent payload progress");
+            t.Equals(
+                mem.readIORegister(kVif1 + 0x20u), 1u,
+                "STOP should retain QWC");
+
+            t.IsTrue(mem.writeIORegister(
+                         0x10003C10u, 0x8u),
+                     "FBRST.STC should wake STOP");
+            t.IsTrue(
+                (mem.vif1_regs.stat & (1u << 8u)) == 0u,
+                "STC should clear VSS");
+            t.IsTrue(schedules >= 2u,
+                     "STC should request a current-time retry");
+
+            t.IsTrue(mem.writeIORegister(
+                         0x10003C10u, 0x2u),
+                     "FBRST.FBK should succeed");
+            t.IsTrue(
+                (mem.vif1_regs.stat & (1u << 9u)) != 0u,
+                "ForceBreak should set VFS");
+            stalled = mem.advanceVif1Dma();
+            t.IsTrue(
+                stalled.stall ==
+                    Vif1DmaStallReason::ForceBreak,
+                "ForceBreak should retain the descriptor");
+            t.IsTrue(mem.writeIORegister(
+                         0x10003C10u, 0x8u),
+                     "STC should clear ForceBreak");
+
+            t.IsTrue(mem.writeIORegister(kDctrl, 0u),
+                     "clearing DMAE should succeed");
+            stalled = mem.advanceVif1Dma();
+            t.IsTrue(
+                stalled.stall ==
+                    Vif1DmaStallReason::DmacDisabled,
+                "DMAE=0 should prevent progress");
+            t.Equals(
+                mem.readIORegister(kVif1 + 0x20u), 1u,
+                "DMA disable should retain QWC");
+
+            t.IsTrue(mem.writeIORegister(kDctrl, 1u),
+                     "setting DMAE should wake the channel");
+            Vif1DmaAdvanceResult payload =
+                mem.advanceVif1Dma();
+            t.IsTrue(payload.progressed,
+                     "re-enabled DMA should transfer payload");
+            t.Equals(
+                mem.readIORegister(kVif1 + 0x20u), 0u,
+                "payload progress should consume QWC");
+            t.IsTrue(cancels >= 3u,
+                     "each external stall should cancel its pending event");
+
+            const Vif1DmaAdvanceResult completed =
+                mem.advanceVif1Dma();
+            t.IsTrue(completed.completed,
+                     "post-enable finalization should complete");
+        });
+
+        tc.Run("VIF1 command IRQ stalls retained DMA until STC", [](TestCase &t)
+        {
+            PS2Memory mem;
+            t.IsTrue(mem.initialize(),
+                     "PS2Memory initialize should succeed");
+
+            constexpr uint32_t kVif1 = 0x10009000u;
+            constexpr uint32_t kSource = 0x00024B00u;
+            const std::array<uint32_t, 4> packet = {
+                makeVifCmd(0x00u, 0u, 0u) |
+                    0x80000000u,
+                makeVifCmd(0x05u, 0u, 3u),
+                0u,
+                0u,
+            };
+            std::memcpy(
+                mem.getRDRAM() + kSource,
+                packet.data(), sizeof(packet));
+
+            t.IsTrue(mem.writeIORegister(
+                         kVif1 + 0x10u, kSource),
+                     "IRQ fixture MADR write should succeed");
+            t.IsTrue(mem.writeIORegister(
+                         kVif1 + 0x20u, 1u),
+                     "IRQ fixture QWC write should succeed");
+            t.IsTrue(mem.writeIORegister(
+                         kVif1, 0x100u),
+                     "IRQ fixture start should succeed");
+
+            const Vif1DmaSnapshot stalled =
+                mem.vif1DmaSnapshot();
+            t.IsTrue(stalled.active,
+                     "command IRQ should retain active DMA");
+            t.IsTrue(
+                stalled.stall ==
+                    Vif1DmaStallReason::VifInterrupt,
+                "descriptor should report interrupt stall");
+            t.IsTrue(
+                (mem.vif1_regs.stat & (1u << 10u)) != 0u,
+                "command IRQ should set VIS");
+            t.IsTrue(
+                (mem.vif1_regs.stat & (1u << 11u)) != 0u,
+                "command IRQ should set INT");
+            t.Equals(mem.vif1_regs.mode, 0u,
+                     "post-IRQ STMOD should remain retained");
+            t.IsFalse(mem.hasReadyDmacCompletions(),
+                      "interrupt stall should not complete DMA");
+
+            t.IsTrue(mem.writeIORegister(
+                         0x10003C10u, 0x8u),
+                     "STC should cancel the command stall");
+            t.Equals(mem.vif1_regs.mode, 3u,
+                     "STC wake should resume retained commands");
+            t.IsTrue(mem.hasReadyDmacCompletions(),
+                     "resumed final state should request completion");
+        });
+
+        tc.Run("VIF1 split IRQ command stalls only after its payload commits", [](TestCase &t)
+        {
+            PS2Memory mem;
+            t.IsTrue(mem.initialize(),
+                     "PS2Memory initialize should succeed");
+
+            const uint32_t strow =
+                makeVifCmd(0x30u, 0u, 0u) |
+                0x80000000u;
+            const std::array<uint32_t, 4> row = {
+                0x11223344u,
+                0x55667788u,
+                0x99AABBCCu,
+                0xDDEEFF00u,
+            };
+            std::array<uint8_t, 20> packet{};
+            std::memcpy(
+                packet.data(), &strow, sizeof(strow));
+            std::memcpy(
+                packet.data() + sizeof(strow),
+                row.data(), sizeof(row));
+
+            mem.processVIF1Data(packet.data(), 8u);
+            t.IsTrue(
+                (mem.vif1_regs.stat & (1u << 11u)) != 0u,
+                "the parser should retain the observed IRQ bit");
+            t.IsTrue(
+                (mem.vif1_regs.stat & (1u << 10u)) == 0u,
+                "an incomplete command must not raise VIS");
+            t.Equals(mem.vif1_regs.row[0], 0u,
+                     "an incomplete STROW must remain atomic");
+
+            mem.processVIF1Data(
+                packet.data() + 8u, 12u);
+            for (size_t index = 0u;
+                 index < row.size(); ++index)
+            {
+                t.Equals(
+                    mem.vif1_regs.row[index], row[index],
+                    "the completed STROW should commit every lane");
+            }
+            t.IsTrue(
+                (mem.vif1_regs.stat & (1u << 10u)) != 0u,
+                "VIS should assert after the command commits");
+            t.Equals(
+                mem.vif1DeferredByteCount(),
+                static_cast<size_t>(0u),
+                "the completed command should leave no retained bytes");
+        });
+
+        tc.Run("VIF1 DIRECT waits for GIF path availability and retries", [](TestCase &t)
+        {
+            PS2Memory mem;
+            t.IsTrue(mem.initialize(),
+                     "PS2Memory initialize should succeed");
+
+            constexpr uint32_t kVif1 = 0x10009000u;
+            constexpr uint32_t kSource = 0x00024C00u;
+            std::memset(
+                mem.getRDRAM() + kSource, 0, 32u);
+            const uint32_t direct =
+                makeVifCmd(0x51u, 0u, 1u);
+            std::memcpy(
+                mem.getRDRAM() + kSource,
+                &direct, sizeof(direct));
+
+            bool pathAvailable = false;
+            mem.setVif1GifPathAvailableCallback(
+                [&](bool directHl)
+                {
+                    t.IsTrue(directHl,
+                             "fixture should query DIRECTHL availability");
+                    return pathAvailable;
+                });
+            std::vector<uint8_t> captured;
+            mem.setGifPacketCallback(
+                [&](const uint8_t *data, uint32_t size)
+                {
+                    captured.assign(data, data + size);
+                });
+
+            t.IsTrue(mem.writeIORegister(
+                         kVif1 + 0x10u, kSource),
+                     "GIF-wait MADR write should succeed");
+            t.IsTrue(mem.writeIORegister(
+                         kVif1 + 0x20u, 2u),
+                     "GIF-wait QWC write should succeed");
+            t.IsTrue(mem.writeIORegister(
+                         kVif1, 0x100u),
+                     "GIF-wait start should succeed");
+
+            Vif1DmaSnapshot stalled =
+                mem.vif1DmaSnapshot();
+            t.IsTrue(stalled.active,
+                     "unavailable PATH2 should retain DMA");
+            t.IsTrue(
+                stalled.stall ==
+                    Vif1DmaStallReason::GifPath,
+                "descriptor should report GIF path stall");
+            t.IsTrue(
+                (mem.vif1_regs.stat & (1u << 3u)) != 0u,
+                "GIF path wait should set VGW");
+            t.Equals(captured.size(), static_cast<size_t>(0u),
+                     "stalled DIRECTHL should emit no packet");
+
+            pathAvailable = true;
+            t.IsTrue(mem.wakeVif1Dma(),
+                     "GIF path availability should wake VIF1");
+            t.IsTrue(
+                (mem.vif1_regs.stat & (1u << 3u)) == 0u,
+                "successful retry should clear VGW");
+            t.Equals(captured.size(), static_cast<size_t>(16u),
+                     "successful retry should emit one qword");
+            t.IsTrue(mem.hasReadyDmacCompletions(),
+                     "successful retry should reach final completion");
+        });
+
         tc.Run("VIF1 DMA chain transfers tag high bytes for DIRECT packets when TTE is enabled", [](TestCase &t)
         {
             PS2Memory mem;

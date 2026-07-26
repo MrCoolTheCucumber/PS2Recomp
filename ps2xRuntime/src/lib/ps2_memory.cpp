@@ -1293,49 +1293,6 @@ void PS2Memory::traceVif1Command(uint32_t command, const uint8_t *followingData,
     m_gsDmaTrace->recentVifCommands.push_back(record);
 }
 
-void PS2Memory::traceVif1NormalTransfer(uint32_t srcAddr, uint32_t qwc)
-{
-    if (!m_gsDmaTrace || !m_gsDmaTrace->active || qwc == 0u)
-        return;
-
-    const bool scratch = isScratchpad(srcAddr);
-    uint32_t src = 0u;
-    try
-    {
-        src = translateAddress(srcAddr);
-    }
-    catch (const std::exception &)
-    {
-        m_gsDmaTrace->packet.truncated = true;
-        m_gsDmaTrace->vifInput.truncated = true;
-        return;
-    }
-
-    const uint8_t *base = scratch ? m_scratchpad : m_rdram;
-    const uint32_t limit = scratch ? PS2_SCRATCHPAD_SIZE : PS2_RAM_SIZE;
-    const uint64_t requestedBytes = static_cast<uint64_t>(qwc) * 16ull;
-    uint64_t bytes = std::min(requestedBytes, Ps2GsDmaTraceState::MAX_BYTES);
-    if (bytes != requestedBytes)
-    {
-        m_gsDmaTrace->packet.truncated = true;
-        m_gsDmaTrace->vifInput.truncated = true;
-    }
-
-    while (bytes > 0u)
-    {
-        if (src >= limit)
-            src = 0u;
-        const uint32_t chunk = static_cast<uint32_t>(
-            std::min<uint64_t>(bytes, static_cast<uint64_t>(limit - src)));
-        if (chunk == 0u)
-            break;
-        m_gsDmaTrace->packet.append(base + src, chunk);
-        m_gsDmaTrace->vifInput.append(base + src, chunk);
-        src += chunk;
-        bytes -= chunk;
-    }
-}
-
 void PS2Memory::tracePath1Packet(const uint8_t *data, uint32_t sizeBytes)
 {
     if (!m_gsDmaTrace || !m_gsDmaTrace->active)
@@ -1758,15 +1715,15 @@ bool PS2Memory::initialize(size_t ramSize)
     }
     m_pendingGifTransfers.clear();
     m_pendingVif0Transfers.clear();
-    m_pendingVif1Transfers.clear();
+    m_vif1Dma = {};
     m_codeRegions.clear();
     m_path3Masked = false;
     m_path3MaskedFifo.clear();
     m_vif1PendingPath2DirectQwc = 0u;
     m_vif1PendingPath2DirectHl = false;
+    m_vif1PendingIrqAfterCommand = false;
     m_vif1WaitingForVu = false;
     m_vif1DeferredData.clear();
-    m_vif1DeferredDmacCompletion.reset();
     m_timer0LastHostNs = 0;
     m_timer0FractionNs = 0;
 
@@ -2527,6 +2484,31 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
         return true;
     }
 
+    if (address == 0x1000E000u) // D_CTRL
+    {
+        const bool wasEnabled = isDmacEnabled();
+        m_ioRegisters[address] = value;
+        const bool enabled = isDmacEnabled();
+        if (m_vif1Dma.active && wasEnabled != enabled)
+        {
+            if (!enabled)
+            {
+                m_vif1Dma.stall =
+                    Vif1DmaStallReason::DmacDisabled;
+                if (m_vif1Dma.eventManaged &&
+                    m_vif1DmaCancelCallback)
+                {
+                    m_vif1DmaCancelCallback();
+                }
+            }
+            else
+            {
+                (void)wakeVif1Dma();
+            }
+        }
+        return true;
+    }
+
     m_ioRegisters[address] = value;
 
     if (address >= 0x10003C00u && address < 0x10003E00u)
@@ -2541,16 +2523,47 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
                 std::memset(&vif1_regs, 0, sizeof(vif1_regs));
                 m_vif1PendingPath2DirectQwc = 0u;
                 m_vif1PendingPath2DirectHl = false;
+                m_vif1PendingIrqAfterCommand = false;
                 m_vif1WaitingForVu = false;
                 m_vif1DeferredData.clear();
-                m_vif1DeferredDmacCompletion.reset();
                 (void)cancelDmacTransfer(DmacChannel::Vif1);
                 if (m_vif1ResetCallback)
                     m_vif1ResetCallback();
+                break;
+            }
+            if (value & 0x2u) // FBK
+            {
+                vif1_regs.stat |= (1u << 9u); // VFS
+                vif1_regs.stat &= ~0x3u;       // VPS idle
+                m_vif1Dma.stall =
+                    Vif1DmaStallReason::ForceBreak;
+                if (m_vif1Dma.active &&
+                    m_vif1Dma.eventManaged &&
+                    m_vif1DmaCancelCallback)
+                {
+                    m_vif1DmaCancelCallback();
+                }
+            }
+            if (value & 0x4u) // STP
+            {
+                vif1_regs.stat |= (1u << 8u); // VSS
+                vif1_regs.stat &= ~0x3u;       // VPS idle
+                m_vif1Dma.stall =
+                    Vif1DmaStallReason::VifStop;
+                if (m_vif1Dma.active &&
+                    m_vif1Dma.eventManaged &&
+                    m_vif1DmaCancelCallback)
+                {
+                    m_vif1DmaCancelCallback();
+                }
             }
             if (value & 0x8u) // STC
             {
                 vif1_regs.stat &= ~((1u << 8) | (1u << 9) | (1u << 10) | (1u << 11) | (1u << 12) | (1u << 13));
+                if (m_vif1Dma.active)
+                    (void)wakeVif1Dma();
+                else
+                    (void)processVif1Stream();
             }
             break;
         case 0x10003C30u:
@@ -2631,7 +2644,8 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
             const DmacTransferToken transfer =
                 beginDmacTransfer(*channel);
             const uint32_t madr = m_ioRegisters[channelBase + 0x10];
-            const uint32_t qwc = m_ioRegisters[channelBase + 0x20];
+            const uint32_t qwc =
+                m_ioRegisters[channelBase + 0x20] & 0xFFFFu;
             m_dmaStartCount.fetch_add(1, std::memory_order_relaxed);
 
             if (channelBase == 0x1000D000u || channelBase == 0x1000D400u)
@@ -2640,7 +2654,22 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
                 return true;
             }
 
-            if ((channelBase == 0x1000A000u || channelBase == 0x10009000u || channelBase == 0x10008000u) &&
+            if (channelBase == 0x10009000u)
+            {
+                m_ioRegisters[channelBase + 0x20u] = qwc;
+                beginVif1DmaTrace(
+                    value, madr, qwc,
+                    m_ioRegisters[channelBase + 0x30u],
+                    m_ioRegisters[channelBase + 0x40u],
+                    m_ioRegisters[channelBase + 0x50u],
+                    m_ioRegisters[channelBase + 0x80u]);
+                (void)startVif1Dma(transfer, value);
+                if (!scheduleVif1Dma(4u))
+                    drainVif1DmaCompatibility();
+                return true;
+            }
+
+            if ((channelBase == 0x1000A000u || channelBase == 0x10008000u) &&
                 (m_gsVRAM || channelBase == 0x10008000u))
             {
                 auto enqueueTransfer = [&](uint32_t srcAddr, uint32_t qwCount)
@@ -2655,28 +2684,15 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
                     pt.qwc = qwCount;
                     if (channelBase == 0x1000A000u)
                         m_pendingGifTransfers.push_back(pt);
-                    else if (channelBase == 0x10009000u)
-                        m_pendingVif1Transfers.push_back(pt);
                     else if (channelBase == 0x10008000u)
                         m_pendingVif0Transfers.push_back(pt);
                 };
 
                 uint32_t chcr = value;
                 uint32_t mode = (chcr >> 2) & 0x3;
-                if (channelBase == 0x10009000u)
-                {
-                    beginVif1DmaTrace(
-                        chcr, madr, qwc,
-                        m_ioRegisters[channelBase + 0x30],
-                        m_ioRegisters[channelBase + 0x40],
-                        m_ioRegisters[channelBase + 0x50],
-                        m_ioRegisters[channelBase + 0x80]);
-                }
 
                 if (mode == 0 && qwc > 0)
                 {
-                    if (channelBase == 0x10009000u)
-                        traceVif1NormalTransfer(madr, qwc);
                     enqueueTransfer(madr, qwc);
                 }
                 else if (mode == 1)
@@ -2719,8 +2735,6 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
                                 chunk = maxSz2 - src;
                             if (chunk == 0)
                                 break;
-                            if (channelBase == 0x10009000u)
-                                traceVif1DmaPayload(base2 + src, chunk);
                             chainBuf.insert(chainBuf.end(), base2 + src, base2 + src + chunk);
                             bytes -= chunk;
                             src += chunk;
@@ -2779,8 +2793,6 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
 
                         const uint8_t *tp = tagBase + physTag;
                         uint64_t tag = loadScalar<uint64_t>(tp, 0, 16, "dma chain tag", tagAddr);
-                        if (channelBase == 0x10009000u)
-                            traceVif1DmaTag(tp);
                         uint16_t tagQwc = static_cast<uint16_t>(tag & 0xFFFF);
                         uint32_t id = static_cast<uint32_t>((tag >> 28) & 0x7);
                         const bool irq = ((tag >> 31) & 0x1ull) != 0ull;
@@ -2856,33 +2868,11 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
                             break;
                         }
 
-                        if (channelBase == 0x10009000u &&
-                            m_gsDmaTrace && m_gsDmaTrace->active &&
-                            m_gsDmaTrace->output)
-                        {
-                            std::fprintf(
-                                m_gsDmaTrace->output,
-                                "{\"schema_version\":1,"
-                                "\"event\":\"vif1-chain-tag\","
-                                "\"sequence\":%" PRIu64 ","
-                                "\"index\":%" PRIu32 ","
-                                "\"stream_offset\":%zu,"
-                                "\"tag_address\":\"0x%08" PRIx32 "\","
-                                "\"qwc\":%" PRIu32 ",\"id\":%" PRIu32 ","
-                                "\"irq\":%s,"
-                                "\"target_address\":\"0x%08" PRIx32 "\","
-                                "\"data_address\":\"0x%08" PRIx32 "\"}\n",
-                                m_gsDmaTrace->activeSequence,
-                                tagsProcessed - 1u, chainBuf.size(),
-                                currentTagAddr, static_cast<uint32_t>(tagQwc),
-                                id, irq ? "true" : "false", addr, dataAddr);
-                        }
-
-                        // VIF0/VIF1 consume the upper 64 bits of every source-chain
+                        // VIF0 consumes the upper 64 bits of every source-chain
                         // tag before its QWC payload when CHCR.TTE is set. This
                         // includes reference tags whose payload lives elsewhere.
                         const bool transferVifTag = tagTransferEnabled &&
-                            (channelBase == 0x10009000u || channelBase == 0x10008000u);
+                            channelBase == 0x10008000u;
                         if (transferVifTag)
                             chainBuf.insert(chainBuf.end(), tp + 8u, tp + 16u);
 
@@ -2920,8 +2910,6 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
                     }
                     else if (chainComplete)
                     {
-                        if (channelBase == 0x10009000u && !chainBuf.empty())
-                            traceVif1Input(chainBuf.data(), static_cast<uint32_t>(chainBuf.size()));
                         PendingTransfer pt;
                         pt.transfer = transfer;
                         pt.fromScratchpad = false;
@@ -2932,19 +2920,11 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
                         {
                             m_pendingGifTransfers.push_back(std::move(pt));
                         }
-                        else if (channelBase == 0x10009000u)
-                        {
-                            m_pendingVif1Transfers.push_back(std::move(pt));
-                        }
                         else if (channelBase == 0x10008000u)
                         {
                             m_pendingVif0Transfers.push_back(std::move(pt));
                         }
                     }
-                    // else if (channelBase == 0x10009000u)
-                    // {
-
-                    // }
                 }
                 else if (qwc > 0)
                 {
@@ -2956,14 +2936,6 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
                 if (autoProcessTransfers)
                 {
                     processPendingTransfers();
-                }
-                if (channelBase == 0x10009000u)
-                {
-                    const bool cooperativeVu1Active =
-                        m_vu1BusyCallback &&
-                        m_vu1BusyCallback();
-                    if (!cooperativeVu1Active)
-                        finishVif1DmaTrace();
                 }
             }
         }
@@ -3216,11 +3188,8 @@ void PS2Memory::discardPendingDmacWork(DmacChannel channel)
             m_pendingVif0Transfers.begin(),
             m_pendingVif0Transfers.end(), isChannel),
         m_pendingVif0Transfers.end());
-    m_pendingVif1Transfers.erase(
-        std::remove_if(
-            m_pendingVif1Transfers.begin(),
-            m_pendingVif1Transfers.end(), isChannel),
-        m_pendingVif1Transfers.end());
+    if (channel == DmacChannel::Vif1)
+        clearVif1DmaState(true);
 }
 
 DmacTransferToken PS2Memory::beginDmacTransfer(DmacChannel channel)
@@ -3232,8 +3201,6 @@ DmacTransferToken PS2Memory::beginDmacTransfer(DmacChannel channel)
     }
 
     discardPendingDmacWork(channel);
-    if (channel == DmacChannel::Vif1)
-        m_vif1DeferredDmacCompletion.reset();
 
     DmacTransferToken transfer{channel, 0u};
     {
@@ -3327,8 +3294,6 @@ bool PS2Memory::cancelDmacTransfer(DmacChannel channel)
     }
 
     discardPendingDmacWork(channel);
-    if (channel == DmacChannel::Vif1)
-        m_vif1DeferredDmacCompletion.reset();
 
     bool cancelled = false;
     {
@@ -3539,6 +3504,617 @@ void PS2Memory::setDmacInterruptMask(
     }
 }
 
+bool PS2Memory::isDmacEnabled() const
+{
+    constexpr uint32_t kDctrl = 0x1000E000u;
+    const auto found = m_ioRegisters.find(kDctrl);
+    return found == m_ioRegisters.end() ||
+           (found->second & 0x1u) != 0u;
+}
+
+bool PS2Memory::isVif1GifPathAvailable(
+    bool directHl) const
+{
+    return !m_vif1GifPathAvailableCallback ||
+           m_vif1GifPathAvailableCallback(directHl);
+}
+
+void PS2Memory::updateVif1Fqc(uint32_t qwc)
+{
+    constexpr uint32_t kFqcMask = 0x1Fu << 24u;
+    const uint32_t fqc = std::min(qwc, 16u);
+    vif1_regs.stat =
+        (vif1_regs.stat & ~kFqcMask) |
+        (fqc << 24u);
+}
+
+void PS2Memory::clearVif1DmaState(
+    bool notifyRuntime)
+{
+    const bool wasActive = m_vif1Dma.active;
+    const bool wasEventManaged =
+        wasActive &&
+        m_vif1Dma.eventManaged;
+    m_vif1Dma = {};
+    updateVif1Fqc(0u);
+    if (wasActive)
+        finishVif1DmaTrace();
+    if (notifyRuntime && wasEventManaged &&
+        m_vif1DmaCancelCallback)
+    {
+        m_vif1DmaCancelCallback();
+    }
+}
+
+bool PS2Memory::scheduleVif1Dma(
+    uint32_t delayEeCycles)
+{
+    if (!m_vif1Dma.active ||
+        !m_vif1DmaScheduleCallback)
+    {
+        return false;
+    }
+
+    const bool scheduled =
+        m_vif1DmaScheduleCallback(delayEeCycles);
+    m_vif1Dma.eventManaged = scheduled;
+    return scheduled;
+}
+
+bool PS2Memory::startVif1Dma(
+    DmacTransferToken transfer, uint32_t chcr)
+{
+    constexpr uint32_t kVif1Base = 0x10009000u;
+
+    clearVif1DmaState(true);
+    Vif1DmaState state{};
+    state.transfer = transfer;
+    state.madr = m_ioRegisters[kVif1Base + 0x10u];
+    state.qwc =
+        m_ioRegisters[kVif1Base + 0x20u] & 0xFFFFu;
+    state.tadr = m_ioRegisters[kVif1Base + 0x30u];
+    state.asr0 = m_ioRegisters[kVif1Base + 0x40u];
+    state.asr1 = m_ioRegisters[kVif1Base + 0x50u];
+    state.asp = static_cast<uint8_t>((chcr >> 4u) & 0x3u);
+    state.chainMode = ((chcr >> 2u) & 0x3u) == 1u;
+    state.tie = (chcr & (1u << 7u)) != 0u;
+    state.tte = (chcr & (1u << 6u)) != 0u;
+    state.active = true;
+
+    if (state.chainMode)
+    {
+        if (state.qwc != 0u)
+        {
+            state.tagId =
+                static_cast<uint8_t>((chcr >> 28u) & 0x7u);
+            state.tagIrq =
+                (chcr & (1u << 31u)) != 0u;
+            state.endAfterPayload =
+                state.tagId == 0u ||
+                state.tagId == 7u ||
+                (state.tie && state.tagIrq);
+            state.phase = Vif1DmaPhase::TransferPayload;
+        }
+        else
+        {
+            state.phase = Vif1DmaPhase::FetchTag;
+        }
+    }
+    else
+    {
+        state.endAfterPayload = true;
+        state.phase = state.qwc != 0u
+                          ? Vif1DmaPhase::TransferPayload
+                          : Vif1DmaPhase::Finalize;
+    }
+
+    m_vif1Dma = std::move(state);
+    m_ioRegisters[kVif1Base + 0x20u] =
+        m_vif1Dma.qwc;
+    updateVif1Fqc(m_vif1Dma.qwc);
+    return true;
+}
+
+Vif1DmaStallReason
+PS2Memory::currentVif1DmaStall() const
+{
+    if (m_vif1Dma.phase == Vif1DmaPhase::Fault)
+        return Vif1DmaStallReason::Fault;
+    if (!isDmacEnabled())
+        return Vif1DmaStallReason::DmacDisabled;
+    if ((vif1_regs.stat & (1u << 9u)) != 0u)
+        return Vif1DmaStallReason::ForceBreak;
+    if ((vif1_regs.stat & (1u << 8u)) != 0u)
+        return Vif1DmaStallReason::VifStop;
+    if ((vif1_regs.stat & (1u << 10u)) != 0u)
+        return Vif1DmaStallReason::VifInterrupt;
+    if (m_vif1WaitingForVu)
+        return Vif1DmaStallReason::WaitingForVu;
+    return Vif1DmaStallReason::None;
+}
+
+Vif1DmaSnapshot PS2Memory::vif1DmaSnapshot() const
+{
+    Vif1DmaSnapshot snapshot{};
+    snapshot.transfer = m_vif1Dma.transfer;
+    snapshot.phase = m_vif1Dma.phase;
+    snapshot.stall = m_vif1Dma.stall;
+    snapshot.madr = m_vif1Dma.madr;
+    snapshot.qwc = m_vif1Dma.qwc;
+    snapshot.tadr = m_vif1Dma.tadr;
+    snapshot.asr0 = m_vif1Dma.asr0;
+    snapshot.asr1 = m_vif1Dma.asr1;
+    snapshot.parserBytes =
+        static_cast<uint32_t>(
+            std::min<size_t>(
+                m_vif1DeferredData.size(),
+                static_cast<size_t>(UINT32_MAX)));
+    snapshot.tagsProcessed =
+        m_vif1Dma.tagsProcessed;
+    snapshot.asp = m_vif1Dma.asp;
+    snapshot.tagId = m_vif1Dma.tagId;
+    snapshot.active = m_vif1Dma.active;
+    snapshot.eventManaged =
+        m_vif1Dma.eventManaged;
+    snapshot.chainMode = m_vif1Dma.chainMode;
+    snapshot.tagIrq = m_vif1Dma.tagIrq;
+    snapshot.endAfterPayload =
+        m_vif1Dma.endAfterPayload;
+    return snapshot;
+}
+
+bool PS2Memory::wakeVif1Dma()
+{
+    if (!m_vif1Dma.active)
+        return false;
+
+    m_vif1Dma.stall = Vif1DmaStallReason::None;
+    if (m_vif1Dma.eventManaged &&
+        scheduleVif1Dma(0u))
+    {
+        return true;
+    }
+
+    drainVif1DmaCompatibility();
+    return true;
+}
+
+Vif1DmaAdvanceResult PS2Memory::advanceVif1Dma()
+{
+    constexpr uint32_t kVif1Base = 0x10009000u;
+    constexpr uint32_t kMaximumChainTags = 65536u;
+
+    Vif1DmaAdvanceResult result{};
+    result.transfer = m_vif1Dma.transfer;
+    result.phase = m_vif1Dma.phase;
+    result.active = m_vif1Dma.active;
+
+    if (!m_vif1Dma.active)
+        return result;
+
+    if (!progressDmacTransfer(m_vif1Dma.transfer))
+    {
+        clearVif1DmaState(false);
+        result.active = false;
+        result.phase = Vif1DmaPhase::Idle;
+        return result;
+    }
+
+    m_vif1Dma.stall = currentVif1DmaStall();
+    if (m_vif1Dma.stall !=
+        Vif1DmaStallReason::None)
+    {
+        result.stall = m_vif1Dma.stall;
+        return result;
+    }
+
+    const auto parserStall =
+        [&]() -> Vif1DmaStallReason
+        {
+            switch (processVif1Stream())
+            {
+            case Vif1ParserDisposition::WaitingForVu:
+                return Vif1DmaStallReason::WaitingForVu;
+            case Vif1ParserDisposition::VifInterrupt:
+                return Vif1DmaStallReason::VifInterrupt;
+            case Vif1ParserDisposition::GifPath:
+                return Vif1DmaStallReason::GifPath;
+            case Vif1ParserDisposition::Drained:
+            case Vif1ParserDisposition::NeedMoreData:
+                return Vif1DmaStallReason::None;
+            }
+            return Vif1DmaStallReason::None;
+        };
+
+    if (!m_vif1DeferredData.empty())
+    {
+        m_vif1Dma.stall = parserStall();
+        if (m_vif1Dma.stall !=
+            Vif1DmaStallReason::None)
+        {
+            result.stall = m_vif1Dma.stall;
+            result.delayEeCycles =
+                m_vif1Dma.stall ==
+                        Vif1DmaStallReason::GifPath
+                    ? 128u
+                    : 0u;
+            return result;
+        }
+    }
+
+    const auto fault =
+        [&](const char *reason)
+        {
+            m_vif1Dma.phase = Vif1DmaPhase::Fault;
+            m_vif1Dma.stall = Vif1DmaStallReason::Fault;
+            if (!m_vif1Dma.faultReported)
+            {
+                std::fprintf(
+                    stderr,
+                    "VIF1 DMA stalled: tadr=0x%08x "
+                    "madr=0x%08x tags=%u reason=%s\n",
+                    m_vif1Dma.tadr, m_vif1Dma.madr,
+                    m_vif1Dma.tagsProcessed, reason);
+                m_vif1Dma.faultReported = true;
+            }
+            result.phase = m_vif1Dma.phase;
+            result.stall = m_vif1Dma.stall;
+            result.active = true;
+        };
+
+    if (m_vif1Dma.phase == Vif1DmaPhase::Finalize)
+    {
+        updateVif1Fqc(0u);
+        m_vif1Dma.active = false;
+        m_vif1Dma.eventManaged = false;
+        m_vif1Dma.stall = Vif1DmaStallReason::None;
+        result.completed =
+            requestDmacCompletion(m_vif1Dma.transfer);
+        result.progressed = result.completed;
+        result.active = false;
+        result.phase = Vif1DmaPhase::Finalize;
+        finishVif1DmaTrace();
+        return result;
+    }
+
+    if (m_vif1Dma.phase == Vif1DmaPhase::FetchTag)
+    {
+        if (m_vif1Dma.tagsProcessed >=
+            kMaximumChainTags)
+        {
+            fault("tag safety limit reached");
+            return result;
+        }
+
+        const Vif1DmaChainKey key{
+            m_vif1Dma.tadr,
+            m_vif1Dma.asr0,
+            m_vif1Dma.asr1,
+            m_vif1Dma.asp};
+        if (!m_vif1Dma.visitedStates.insert(key).second)
+        {
+            fault("repeated chain state");
+            return result;
+        }
+
+        const uint32_t tagAddress = m_vif1Dma.tadr;
+        const bool scratch = isScratchpad(tagAddress);
+        uint32_t tagOffset = 0u;
+        try
+        {
+            tagOffset = translateAddress(tagAddress);
+        }
+        catch (const std::exception &)
+        {
+            fault("unmapped tag address");
+            return result;
+        }
+
+        const uint8_t *const base =
+            scratch ? m_scratchpad : m_rdram;
+        const uint32_t limit =
+            scratch ? PS2_SCRATCHPAD_SIZE : PS2_RAM_SIZE;
+        if (!base || tagOffset > limit ||
+            limit - tagOffset < 16u)
+        {
+            fault("tag crosses memory boundary");
+            return result;
+        }
+
+        const uint8_t *const tagData = base + tagOffset;
+        const uint64_t tag = loadScalar<uint64_t>(
+            tagData, 0u, 16u, "VIF1 DMA tag",
+            tagAddress);
+        const uint32_t tagQwc =
+            static_cast<uint32_t>(tag & 0xFFFFu);
+        const uint32_t tagAddressField =
+            static_cast<uint32_t>(
+                (tag >> 32u) & 0x7FFFFFFFu);
+        m_vif1Dma.tagId =
+            static_cast<uint8_t>((tag >> 28u) & 0x7u);
+        m_vif1Dma.tagIrq =
+            ((tag >> 31u) & 0x1u) != 0u;
+        m_vif1Dma.endAfterPayload = false;
+        const uint32_t tagIndex =
+            m_vif1Dma.tagsProcessed;
+        const size_t streamOffset =
+            m_gsDmaTrace && m_gsDmaTrace->active
+                ? static_cast<size_t>(
+                      m_gsDmaTrace->vifInput.bytes)
+                : 0u;
+        ++m_vif1Dma.tagsProcessed;
+        traceVif1DmaTag(tagData);
+
+        uint32_t dataAddress = 0u;
+        switch (m_vif1Dma.tagId)
+        {
+        case 0u: // REFE
+            dataAddress = tagAddressField;
+            m_vif1Dma.tadr += 16u;
+            m_vif1Dma.endAfterPayload = true;
+            break;
+        case 1u: // CNT
+            m_vif1Dma.tadr += 16u;
+            dataAddress = m_vif1Dma.tadr;
+            break;
+        case 2u: // NEXT
+            dataAddress = m_vif1Dma.tadr + 16u;
+            m_vif1Dma.tadr = tagAddressField;
+            break;
+        case 3u: // REF
+        case 4u: // REFS
+            dataAddress = tagAddressField;
+            m_vif1Dma.tadr += 16u;
+            break;
+        case 5u: // CALL
+        {
+            dataAddress = m_vif1Dma.tadr + 16u;
+            const uint32_t returnAddress =
+                dataAddress + tagQwc * 16u;
+            if (m_vif1Dma.asp == 0u)
+            {
+                m_vif1Dma.asr0 = returnAddress;
+                m_vif1Dma.asp = 1u;
+            }
+            else if (m_vif1Dma.asp == 1u)
+            {
+                m_vif1Dma.asr1 = returnAddress;
+                m_vif1Dma.asp = 2u;
+            }
+            else
+            {
+                fault("CALL stack overflow");
+                return result;
+            }
+            m_vif1Dma.tadr = tagAddressField;
+            break;
+        }
+        case 6u: // RET
+            dataAddress = m_vif1Dma.tadr + 16u;
+            if (m_vif1Dma.asp == 2u)
+            {
+                m_vif1Dma.tadr = m_vif1Dma.asr1;
+                m_vif1Dma.asr1 = 0u;
+                m_vif1Dma.asp = 1u;
+            }
+            else if (m_vif1Dma.asp == 1u)
+            {
+                m_vif1Dma.tadr = m_vif1Dma.asr0;
+                m_vif1Dma.asr0 = 0u;
+                m_vif1Dma.asp = 0u;
+            }
+            else
+            {
+                m_vif1Dma.endAfterPayload = true;
+            }
+            break;
+        case 7u: // END
+            dataAddress = m_vif1Dma.tadr + 16u;
+            m_vif1Dma.endAfterPayload = true;
+            break;
+        default:
+            fault("invalid tag ID");
+            return result;
+        }
+
+        if (m_gsDmaTrace &&
+            m_gsDmaTrace->active &&
+            m_gsDmaTrace->output)
+        {
+            std::fprintf(
+                m_gsDmaTrace->output,
+                "{\"schema_version\":1,"
+                "\"event\":\"vif1-chain-tag\","
+                "\"sequence\":%" PRIu64 ","
+                "\"index\":%" PRIu32 ","
+                "\"stream_offset\":%zu,"
+                "\"tag_address\":\"0x%08" PRIx32 "\","
+                "\"qwc\":%" PRIu32 ",\"id\":%" PRIu32 ","
+                "\"irq\":%s,"
+                "\"target_address\":\"0x%08" PRIx32 "\","
+                "\"data_address\":\"0x%08" PRIx32 "\"}\n",
+                m_gsDmaTrace->activeSequence,
+                tagIndex, streamOffset, tagAddress,
+                tagQwc,
+                static_cast<uint32_t>(
+                    m_vif1Dma.tagId),
+                m_vif1Dma.tagIrq ? "true" : "false",
+                tagAddressField, dataAddress);
+        }
+
+        if (m_vif1Dma.tie && m_vif1Dma.tagIrq)
+            m_vif1Dma.endAfterPayload = true;
+
+        m_vif1Dma.madr = dataAddress;
+        m_vif1Dma.qwc = tagQwc;
+        uint32_t chcr = m_ioRegisters[kVif1Base];
+        chcr = (chcr & 0x0000FFFFu) |
+               (static_cast<uint32_t>(
+                    (tag >> 16u) & 0xFFFFu)
+                << 16u);
+        chcr = (chcr & ~(0x3u << 4u)) |
+               (static_cast<uint32_t>(
+                    m_vif1Dma.asp)
+                << 4u);
+        m_ioRegisters[kVif1Base] = chcr;
+        m_ioRegisters[kVif1Base + 0x10u] =
+            m_vif1Dma.madr;
+        m_ioRegisters[kVif1Base + 0x20u] =
+            m_vif1Dma.qwc;
+        m_ioRegisters[kVif1Base + 0x30u] =
+            m_vif1Dma.tadr;
+        m_ioRegisters[kVif1Base + 0x40u] =
+            m_vif1Dma.asr0;
+        m_ioRegisters[kVif1Base + 0x50u] =
+            m_vif1Dma.asr1;
+        updateVif1Fqc(m_vif1Dma.qwc);
+
+        uint32_t delay = 1u;
+        if (m_vif1Dma.tte)
+        {
+            appendVif1Stream(tagData + 8u, 8u);
+            traceVif1Input(tagData + 8u, 8u);
+            ++delay;
+        }
+
+        m_vif1Dma.phase =
+            m_vif1Dma.qwc != 0u
+                ? Vif1DmaPhase::TransferPayload
+                : (m_vif1Dma.endAfterPayload
+                       ? Vif1DmaPhase::Finalize
+                       : Vif1DmaPhase::FetchTag);
+        m_vif1Dma.stall = parserStall();
+        result.progressed = true;
+        result.delayEeCycles = delay;
+    }
+    else if (
+        m_vif1Dma.phase ==
+        Vif1DmaPhase::TransferPayload)
+    {
+        const uint32_t transferredQwc =
+            m_vif1Dma.qwc;
+        uint64_t bytesLeft =
+            static_cast<uint64_t>(transferredQwc) *
+            16ull;
+        uint32_t sourceAddress = m_vif1Dma.madr;
+        const bool scratch = isScratchpad(sourceAddress);
+        uint32_t sourceOffset = 0u;
+        try
+        {
+            sourceOffset = translateAddress(sourceAddress);
+        }
+        catch (const std::exception &)
+        {
+            fault("unmapped payload address");
+            return result;
+        }
+
+        const uint8_t *const base =
+            scratch ? m_scratchpad : m_rdram;
+        const uint32_t limit =
+            scratch ? PS2_SCRATCHPAD_SIZE : PS2_RAM_SIZE;
+        while (bytesLeft != 0u)
+        {
+            if (sourceOffset >= limit)
+                sourceOffset = 0u;
+            const uint32_t chunk =
+                static_cast<uint32_t>(
+                    std::min<uint64_t>(
+                        bytesLeft,
+                        static_cast<uint64_t>(
+                            limit - sourceOffset)));
+            if (chunk == 0u)
+            {
+                fault("empty payload memory region");
+                return result;
+            }
+            appendVif1Stream(base + sourceOffset, chunk);
+            traceVif1DmaPayload(
+                base + sourceOffset, chunk);
+            traceVif1Input(
+                base + sourceOffset, chunk);
+            sourceOffset += chunk;
+            bytesLeft -= chunk;
+        }
+
+        m_vif1Dma.madr += transferredQwc * 16u;
+        m_vif1Dma.qwc = 0u;
+        if (m_vif1Dma.chainMode &&
+            m_vif1Dma.tagId == 1u)
+        {
+            m_vif1Dma.tadr = m_vif1Dma.madr;
+        }
+        m_ioRegisters[kVif1Base + 0x10u] =
+            m_vif1Dma.madr;
+        m_ioRegisters[kVif1Base + 0x20u] = 0u;
+        m_ioRegisters[kVif1Base + 0x30u] =
+            m_vif1Dma.tadr;
+        updateVif1Fqc(0u);
+
+        m_vif1Dma.phase =
+            m_vif1Dma.endAfterPayload
+                ? Vif1DmaPhase::Finalize
+                : Vif1DmaPhase::FetchTag;
+        m_vif1Dma.stall = parserStall();
+        result.progressed = true;
+        const uint64_t payloadDelay =
+            std::max<uint64_t>(
+                1u,
+                static_cast<uint64_t>(
+                    transferredQwc) *
+                    2u);
+        result.delayEeCycles =
+            static_cast<uint32_t>(
+                std::min<uint64_t>(
+                    payloadDelay,
+                    std::numeric_limits<
+                        uint32_t>::max()));
+    }
+    else
+    {
+        fault("invalid transfer phase");
+        return result;
+    }
+
+    if (m_vif1Dma.stall ==
+        Vif1DmaStallReason::GifPath)
+    {
+        result.delayEeCycles = 128u;
+    }
+    else if (m_vif1Dma.stall !=
+             Vif1DmaStallReason::None)
+    {
+        result.delayEeCycles = 0u;
+    }
+
+    result.phase = m_vif1Dma.phase;
+    result.stall = m_vif1Dma.stall;
+    result.active = m_vif1Dma.active;
+    return result;
+}
+
+void PS2Memory::drainVif1DmaCompatibility()
+{
+    constexpr uint32_t kMaximumSteps =
+        (65536u * 2u) + 4u;
+    for (uint32_t step = 0u;
+         step < kMaximumSteps && m_vif1Dma.active;
+         ++step)
+    {
+        const Vif1DmaAdvanceResult advance =
+            advanceVif1Dma();
+        if (advance.completed || !advance.active)
+            break;
+        if (advance.stall !=
+            Vif1DmaStallReason::None)
+        {
+            break;
+        }
+        if (!advance.progressed)
+            break;
+    }
+}
+
 void PS2Memory::processPendingTransfers()
 {
     std::optional<DmacTransferToken> finishedGif;
@@ -3674,69 +4250,6 @@ void PS2Memory::processPendingTransfers()
     }
     m_pendingVif0Transfers.clear();
 
-    std::optional<DmacTransferToken> finishedVif1;
-    for (auto &p : m_pendingVif1Transfers)
-    {
-        if (!progressDmacTransfer(p.transfer))
-        {
-            continue;
-        }
-        finishedVif1 = p.transfer;
-        if (!p.chainData.empty())
-        {
-            processVIF1Data(p.chainData.data(), static_cast<uint32_t>(p.chainData.size()));
-        }
-        else if (p.qwc > 0)
-        {
-            uint32_t srcPhys = 0;
-            const uint64_t bytes64 = static_cast<uint64_t>(p.qwc) * 16ull;
-            uint32_t sizeBytes = (bytes64 > 0xFFFFFFFFull) ? 0xFFFFFFFFu : static_cast<uint32_t>(bytes64);
-            try
-            {
-                srcPhys = translateAddress(p.srcAddr);
-            }
-            catch (const std::exception &)
-            {
-                continue;
-            }
-            if (p.fromScratchpad)
-            {
-                uint32_t bytesLeft = sizeBytes;
-                while (bytesLeft > 0)
-                {
-                    if (srcPhys >= PS2_SCRATCHPAD_SIZE)
-                        srcPhys = 0;
-                    uint32_t chunk = bytesLeft;
-                    if (srcPhys + chunk > PS2_SCRATCHPAD_SIZE)
-                        chunk = PS2_SCRATCHPAD_SIZE - srcPhys;
-                    if (chunk == 0)
-                        break;
-                    processVIF1Data(m_scratchpad + srcPhys, chunk);
-                    bytesLeft -= chunk;
-                    srcPhys += chunk;
-                }
-            }
-            else
-            {
-                uint32_t bytesLeft = sizeBytes;
-                while (bytesLeft > 0)
-                {
-                    if (srcPhys >= PS2_RAM_SIZE)
-                        srcPhys = 0;
-                    uint32_t chunk = bytesLeft;
-                    if (srcPhys + chunk > PS2_RAM_SIZE)
-                        chunk = PS2_RAM_SIZE - srcPhys;
-                    if (chunk == 0)
-                        break;
-                    processVIF1Data(srcPhys, chunk);
-                    bytesLeft -= chunk;
-                    srcPhys += chunk;
-                }
-            }
-        }
-    }
-    m_pendingVif1Transfers.clear();
-
     if (m_gifArbiter)
         m_gifArbiter->drain();
 
@@ -3748,13 +4261,9 @@ void PS2Memory::processPendingTransfers()
     {
         (void)requestDmacCompletion(*finishedVif0);
     }
-    if (finishedVif1.has_value())
-    {
-        if (m_vif1WaitingForVu)
-            m_vif1DeferredDmacCompletion = *finishedVif1;
-        else
-            (void)requestDmacCompletion(*finishedVif1);
-    }
+    if (m_vif1Dma.active &&
+        !m_vif1Dma.eventManaged)
+        drainVif1DmaCompatibility();
 }
 
 void PS2Memory::flushMaskedPath3Packets(bool drainImmediately)

@@ -69,6 +69,20 @@ namespace
                static_cast<uint32_t>(imm);
     }
 
+    uint64_t makeDmaTag(
+        uint16_t qwc, uint8_t id, uint32_t addr,
+        bool irq = false)
+    {
+        uint64_t tag = static_cast<uint64_t>(qwc);
+        tag |= static_cast<uint64_t>(id & 0x7u) << 28u;
+        if (irq)
+            tag |= 1ull << 31u;
+        tag |= static_cast<uint64_t>(
+                   addr & 0x7FFFFFFFu)
+               << 32u;
+        return tag;
+    }
+
     uint32_t makeVuLq(uint8_t dest, uint8_t targetVf, uint8_t baseVi, int16_t imm)
     {
         return (static_cast<uint32_t>(dest & 0xFu) << 21) |
@@ -3126,6 +3140,571 @@ void register_ps2_runtime_expansion_tests()
                      "MSCALF should not execute synchronously");
             (void)runtime.memory().writeIORegister(
                 0x10003C10u, 1u);
+        });
+
+        tc.Run("event VIF1 normal DMA exposes payload and finalization boundaries", [](TestCase &t)
+        {
+            PS2Runtime runtime;
+            t.IsTrue(runtime.memory().initialize(),
+                     "VIF1 normal fixture memory should initialize");
+            t.IsTrue(runtime.syncCoreSubsystems(),
+                     "VIF1 normal fixture subsystems should bind");
+            runtime.setEeSchedulingMode(
+                ps2x::timing::EeSchedulingMode::Event);
+
+            constexpr uint32_t kVif1 = 0x10009000u;
+            constexpr uint32_t kDstat = 0x1000E010u;
+            constexpr uint32_t kSource = 0x00030000u;
+            constexpr uint32_t kQwc = 2u;
+            std::memset(
+                runtime.memory().getRDRAM() + kSource,
+                0, kQwc * 16u);
+
+            runtime.debugStartEeEventTrace(8u);
+            t.IsTrue(runtime.memory().writeIORegister(
+                         kVif1 + 0x10u, kSource),
+                     "VIF1 MADR write should succeed");
+            t.IsTrue(runtime.memory().writeIORegister(
+                         kVif1 + 0x20u, kQwc),
+                     "VIF1 QWC write should succeed");
+            t.IsTrue(runtime.memory().writeIORegister(
+                         kVif1, 0x100u),
+                     "VIF1 normal start should succeed");
+
+            Vif1DmaSnapshot dma =
+                runtime.memory().vif1DmaSnapshot();
+            t.IsTrue(
+                dma.active && dma.eventManaged,
+                     "submission should retain an event-managed descriptor");
+            t.IsTrue(
+                dma.phase == Vif1DmaPhase::TransferPayload,
+                "normal DMA should begin at the payload phase");
+            t.Equals(dma.madr, kSource,
+                     "submission should retain MADR");
+            t.Equals(dma.qwc, kQwc,
+                     "submission should retain QWC");
+            t.IsTrue(
+                (runtime.memory().readIORegister(kVif1) &
+                 0x100u) != 0u,
+                "submission should expose CHCR.STR immediately");
+            t.IsTrue(
+                (runtime.memory().readIORegister(kDstat) &
+                 0x2u) == 0u,
+                "submission must not publish completion");
+
+            const PS2Runtime::DebugEeScheduler submitted =
+                runtime.debugEeSchedulerSnapshot();
+            const auto &submittedSlot =
+                submitted.slots[ps2x::timing::
+                    eeEventSourceIndex(
+                        ps2x::timing::EeEventSource::
+                            DmacVif1)];
+            t.IsTrue(submittedSlot.pending,
+                     "submission should schedule DMAC_VIF1");
+            t.Equals(submittedSlot.deadlineTick, 32ull,
+                     "initial VIF1 event should be four EE cycles away");
+
+            R5900Context &context = runtime.cpu();
+            context.advanceEeCycleTicks(32u);
+            runtime.serviceEeEventsAtBlockBoundary(
+                runtime.memory().getRDRAM(), &context);
+
+            dma = runtime.memory().vif1DmaSnapshot();
+            t.IsTrue(dma.active,
+                     "payload service should leave finalization pending");
+            t.IsTrue(
+                dma.phase == Vif1DmaPhase::Finalize,
+                "payload service should advance to finalization");
+            t.Equals(
+                runtime.memory().readIORegister(
+                    kVif1 + 0x10u),
+                kSource + kQwc * 16u,
+                "payload service should advance MADR");
+            t.Equals(
+                runtime.memory().readIORegister(
+                    kVif1 + 0x20u),
+                0u,
+                "payload service should consume QWC");
+            t.IsTrue(
+                (runtime.memory().readIORegister(kVif1) &
+                 0x100u) != 0u,
+                "payload service should keep CHCR.STR busy");
+            t.IsTrue(
+                (runtime.memory().readIORegister(kDstat) &
+                 0x2u) == 0u,
+                "payload service should keep D_STAT clear");
+
+            const PS2Runtime::DebugEeScheduler transferred =
+                runtime.debugEeSchedulerSnapshot();
+            const auto &transferredSlot =
+                transferred.slots[ps2x::timing::
+                    eeEventSourceIndex(
+                        ps2x::timing::EeEventSource::
+                            DmacVif1)];
+            t.IsTrue(transferredSlot.pending,
+                     "payload work should schedule finalization");
+            t.Equals(transferredSlot.deadlineTick, 64ull,
+                     "two QWC should cost four EE cycles");
+
+            context.advanceEeCycleTicks(32u);
+            runtime.serviceEeEventsAtBlockBoundary(
+                runtime.memory().getRDRAM(), &context);
+            dma = runtime.memory().vif1DmaSnapshot();
+            t.IsFalse(dma.active,
+                      "the final event should retire the descriptor");
+            t.IsTrue(
+                (runtime.memory().readIORegister(kVif1) &
+                 0x100u) == 0u,
+                "completion publication should clear CHCR.STR");
+            t.IsTrue(
+                (runtime.memory().readIORegister(kDstat) &
+                 0x2u) != 0u,
+                "completion publication should latch D_STAT");
+
+            const PS2Runtime::DebugEeEventTrace trace =
+                runtime.debugEeEventTraceSnapshot(true);
+            t.Equals(trace.entries.size(),
+                     static_cast<size_t>(3u),
+                     "normal DMA should trace payload, finalization, and publication");
+            if (trace.entries.size() == 3u)
+            {
+                t.IsTrue(
+                    trace.entries[0].source ==
+                        ps2x::timing::EeEventSource::DmacVif1 &&
+                    trace.entries[1].source ==
+                        ps2x::timing::EeEventSource::DmacVif1 &&
+                    trace.entries[2].source ==
+                        ps2x::timing::EeEventSource::DmacCompletion,
+                    "final state must precede completion publication");
+            }
+        });
+
+        tc.Run("event VIF1 cancel and restart reject the stale DMA generation", [](TestCase &t)
+        {
+            PS2Runtime runtime;
+            t.IsTrue(runtime.memory().initialize(),
+                     "VIF1 restart fixture memory should initialize");
+            t.IsTrue(runtime.syncCoreSubsystems(),
+                     "VIF1 restart fixture subsystems should bind");
+            runtime.setEeSchedulingMode(
+                ps2x::timing::EeSchedulingMode::Event);
+
+            constexpr uint32_t kVif1 = 0x10009000u;
+            constexpr uint32_t kFirstSource = 0x00030400u;
+            constexpr uint32_t kSecondSource = 0x00030500u;
+            std::memset(
+                runtime.memory().getRDRAM() + kFirstSource,
+                0, 16u);
+            std::memset(
+                runtime.memory().getRDRAM() + kSecondSource,
+                0, 16u);
+
+            runtime.debugStartEeEventTrace(8u);
+            t.IsTrue(runtime.memory().writeIORegister(
+                         kVif1 + 0x10u, kFirstSource),
+                     "first MADR write should succeed");
+            t.IsTrue(runtime.memory().writeIORegister(
+                         kVif1 + 0x20u, 1u),
+                     "first QWC write should succeed");
+            t.IsTrue(runtime.memory().writeIORegister(
+                         kVif1, 0x100u),
+                     "first VIF1 start should succeed");
+
+            PS2Runtime::DebugEeScheduler scheduler =
+                runtime.debugEeSchedulerSnapshot();
+            const auto first =
+                scheduler.slots[ps2x::timing::
+                    eeEventSourceIndex(
+                        ps2x::timing::EeEventSource::
+                            DmacVif1)];
+            t.IsTrue(first.pending,
+                     "the first generation should be scheduled");
+            t.Equals(first.deadlineTick, 32ull,
+                     "the first generation should target tick 32");
+
+            R5900Context &context = runtime.cpu();
+            context.advanceEeCycleTicks(8u);
+            runtime.serviceEeEventsAtBlockBoundary(
+                runtime.memory().getRDRAM(), &context);
+            t.IsTrue(runtime.memory().writeIORegister(
+                         kVif1, 0u),
+                     "clearing STR should cancel the first generation");
+            t.IsFalse(
+                runtime.memory().vif1DmaSnapshot().active,
+                "cancellation should retire the first descriptor");
+            scheduler = runtime.debugEeSchedulerSnapshot();
+            t.IsFalse(
+                scheduler.slots[ps2x::timing::
+                    eeEventSourceIndex(
+                        ps2x::timing::EeEventSource::
+                            DmacVif1)]
+                    .pending,
+                "cancellation should remove the active DMAC_VIF1 slot");
+
+            t.IsTrue(runtime.memory().writeIORegister(
+                         kVif1 + 0x10u, kSecondSource),
+                     "second MADR write should succeed");
+            t.IsTrue(runtime.memory().writeIORegister(
+                         kVif1 + 0x20u, 1u),
+                     "second QWC write should succeed");
+            t.IsTrue(runtime.memory().writeIORegister(
+                         kVif1, 0x100u),
+                     "second VIF1 start should succeed");
+
+            scheduler = runtime.debugEeSchedulerSnapshot();
+            const auto second =
+                scheduler.slots[ps2x::timing::
+                    eeEventSourceIndex(
+                        ps2x::timing::EeEventSource::
+                            DmacVif1)];
+            t.IsTrue(second.pending,
+                     "the replacement generation should be scheduled");
+            t.IsTrue(second.generation > first.generation,
+                     "restart should own a newer event generation");
+            t.Equals(second.deadlineTick, 40ull,
+                     "restart should schedule from committed tick 8");
+
+            context.advanceEeCycleTicks(24u);
+            runtime.serviceEeEventsAtBlockBoundary(
+                runtime.memory().getRDRAM(), &context);
+            Vif1DmaSnapshot dma =
+                runtime.memory().vif1DmaSnapshot();
+            t.IsTrue(
+                dma.active &&
+                    dma.phase ==
+                        Vif1DmaPhase::TransferPayload,
+                "the stale tick-32 event must not advance the replacement");
+            t.Equals(dma.madr, kSecondSource,
+                     "the replacement descriptor should retain its source");
+            t.Equals(dma.qwc, 1u,
+                     "the replacement descriptor should retain its QWC");
+
+            context.advanceEeCycleTicks(8u);
+            runtime.serviceEeEventsAtBlockBoundary(
+                runtime.memory().getRDRAM(), &context);
+            dma = runtime.memory().vif1DmaSnapshot();
+            t.IsTrue(
+                dma.phase == Vif1DmaPhase::Finalize,
+                "the replacement should first progress at tick 40");
+            t.Equals(dma.madr, kSecondSource + 16u,
+                     "only the replacement payload should transfer");
+
+            context.advanceEeCycleTicks(16u);
+            runtime.serviceEeEventsAtBlockBoundary(
+                runtime.memory().getRDRAM(), &context);
+            dma = runtime.memory().vif1DmaSnapshot();
+            t.IsFalse(
+                dma.active || dma.eventManaged,
+                      "replacement finalization should retire all ownership");
+
+            const PS2Runtime::DebugEeEventTrace trace =
+                runtime.debugEeEventTraceSnapshot(true);
+            t.Equals(trace.entries.size(),
+                     static_cast<size_t>(3u),
+                     "only replacement payload, finalization, and publication should dispatch");
+            if (!trace.entries.empty())
+            {
+                t.Equals(trace.entries.front().serviceTick, 40ull,
+                         "the stale tick-32 queue entry must not dispatch");
+            }
+        });
+
+        tc.Run("event VIF1 reset invalidates a pending DMA event", [](TestCase &t)
+        {
+            PS2Runtime runtime;
+            t.IsTrue(runtime.memory().initialize(),
+                     "VIF1 reset fixture memory should initialize");
+            t.IsTrue(runtime.syncCoreSubsystems(),
+                     "VIF1 reset fixture subsystems should bind");
+            runtime.setEeSchedulingMode(
+                ps2x::timing::EeSchedulingMode::Event);
+
+            constexpr uint32_t kVif1 = 0x10009000u;
+            constexpr uint32_t kVif1Fbrst = 0x10003C10u;
+            constexpr uint32_t kDstat = 0x1000E010u;
+            constexpr uint32_t kSource = 0x00030600u;
+            std::memset(
+                runtime.memory().getRDRAM() + kSource,
+                0, 16u);
+
+            runtime.debugStartEeEventTrace(4u);
+            t.IsTrue(runtime.memory().writeIORegister(
+                         kVif1 + 0x10u, kSource),
+                     "reset fixture MADR write should succeed");
+            t.IsTrue(runtime.memory().writeIORegister(
+                         kVif1 + 0x20u, 1u),
+                     "reset fixture QWC write should succeed");
+            t.IsTrue(runtime.memory().writeIORegister(
+                         kVif1, 0x100u),
+                     "reset fixture VIF1 start should succeed");
+
+            R5900Context &context = runtime.cpu();
+            context.advanceEeCycleTicks(8u);
+            runtime.serviceEeEventsAtBlockBoundary(
+                runtime.memory().getRDRAM(), &context);
+            t.IsTrue(runtime.memory().writeIORegister(
+                         kVif1Fbrst, 1u),
+                     "VIF1 reset should succeed");
+
+            t.IsFalse(
+                runtime.memory().vif1DmaSnapshot().active,
+                "reset should retire the DMA descriptor");
+            t.IsTrue(
+                (runtime.memory().readIORegister(kVif1) &
+                 0x100u) == 0u,
+                "reset should clear CHCR.STR");
+            const PS2Runtime::DebugEeScheduler reset =
+                runtime.debugEeSchedulerSnapshot();
+            t.IsFalse(
+                reset.slots[ps2x::timing::
+                    eeEventSourceIndex(
+                        ps2x::timing::EeEventSource::
+                            DmacVif1)]
+                    .pending,
+                "reset should cancel the pending DMAC_VIF1 slot");
+
+            context.advanceEeCycleTicks(24u);
+            runtime.serviceEeEventsAtBlockBoundary(
+                runtime.memory().getRDRAM(), &context);
+            t.Equals(
+                runtime.memory().readIORegister(
+                    kVif1 + 0x10u),
+                kSource,
+                "the stale deadline must not advance MADR");
+            t.IsTrue(
+                (runtime.memory().readIORegister(kDstat) &
+                 0x2u) == 0u,
+                "the stale deadline must not publish a completion");
+            const PS2Runtime::DebugEeEventTrace trace =
+                runtime.debugEeEventTraceSnapshot(true);
+            t.Equals(trace.entries.size(),
+                     static_cast<size_t>(0u),
+                     "the stale reset generation must not dispatch");
+        });
+
+        tc.Run("event VIF1 chain DMA advances one tag or payload per event", [](TestCase &t)
+        {
+            PS2Runtime runtime;
+            t.IsTrue(runtime.memory().initialize(),
+                     "VIF1 chain fixture memory should initialize");
+            t.IsTrue(runtime.syncCoreSubsystems(),
+                     "VIF1 chain fixture subsystems should bind");
+            runtime.setEeSchedulingMode(
+                ps2x::timing::EeSchedulingMode::Event);
+
+            constexpr uint32_t kVif1 = 0x10009000u;
+            constexpr uint32_t kTag = 0x00031000u;
+            uint8_t *const rdram =
+                runtime.memory().getRDRAM();
+            const uint64_t cnt =
+                makeDmaTag(1u, 1u, 0u);
+            const uint64_t end =
+                makeDmaTag(0u, 7u, 0u);
+            std::memcpy(rdram + kTag, &cnt, sizeof(cnt));
+            std::memset(rdram + kTag + 16u, 0, 16u);
+            std::memcpy(
+                rdram + kTag + 32u, &end, sizeof(end));
+
+            t.IsTrue(runtime.memory().writeIORegister(
+                         kVif1 + 0x30u, kTag),
+                     "VIF1 TADR write should succeed");
+            t.IsTrue(runtime.memory().writeIORegister(
+                         kVif1, 0x105u),
+                     "VIF1 chain start should succeed");
+
+            R5900Context &context = runtime.cpu();
+            context.advanceEeCycleTicks(32u);
+            runtime.serviceEeEventsAtBlockBoundary(
+                rdram, &context);
+            Vif1DmaSnapshot dma =
+                runtime.memory().vif1DmaSnapshot();
+            t.IsTrue(
+                dma.phase == Vif1DmaPhase::TransferPayload,
+                "first event should fetch only the CNT tag");
+            t.Equals(dma.tagsProcessed, 1u,
+                     "first event should process one tag");
+            t.Equals(
+                runtime.memory().readIORegister(
+                    kVif1 + 0x10u),
+                kTag + 16u,
+                "CNT setup should expose its payload MADR");
+            t.Equals(
+                runtime.memory().readIORegister(
+                    kVif1 + 0x20u),
+                1u,
+                "CNT setup should expose its payload QWC");
+            t.Equals(
+                runtime.memory().readIORegister(
+                    kVif1 + 0x30u),
+                kTag + 16u,
+                "CNT setup should expose the post-tag TADR");
+
+            context.advanceEeCycleTicks(8u);
+            runtime.serviceEeEventsAtBlockBoundary(
+                rdram, &context);
+            dma = runtime.memory().vif1DmaSnapshot();
+            t.IsTrue(
+                dma.phase == Vif1DmaPhase::FetchTag,
+                "second event should transfer only the CNT payload");
+            t.Equals(dma.tagsProcessed, 1u,
+                     "payload service must not fetch another tag");
+            t.Equals(
+                runtime.memory().readIORegister(
+                    kVif1 + 0x10u),
+                kTag + 32u,
+                "payload service should advance MADR");
+            t.Equals(
+                runtime.memory().readIORegister(
+                    kVif1 + 0x20u),
+                0u,
+                "payload service should consume QWC");
+            t.Equals(
+                runtime.memory().readIORegister(
+                    kVif1 + 0x30u),
+                kTag + 32u,
+                "CNT payload completion should advance TADR");
+
+            context.advanceEeCycleTicks(16u);
+            runtime.serviceEeEventsAtBlockBoundary(
+                rdram, &context);
+            dma = runtime.memory().vif1DmaSnapshot();
+            t.IsTrue(
+                dma.phase == Vif1DmaPhase::Finalize,
+                "third event should fetch the terminal END tag");
+            t.Equals(dma.tagsProcessed, 2u,
+                     "END fetch should be the second tag");
+            t.Equals(
+                runtime.memory().readIORegister(kVif1) &
+                    0x70000000u,
+                0x70000000u,
+                "END fetch should latch tag ID in CHCR");
+            t.IsTrue(
+                (runtime.memory().readIORegister(kVif1) &
+                 0x100u) != 0u,
+                "terminal tag setup should remain busy until finalization");
+
+            context.advanceEeCycleTicks(8u);
+            runtime.serviceEeEventsAtBlockBoundary(
+                rdram, &context);
+            t.IsTrue(
+                (runtime.memory().readIORegister(kVif1) &
+                 0x100u) == 0u,
+                "the later finalization event should clear STR");
+        });
+
+        tc.Run("event VIF1 VU wait removes DMAC_VIF1 until VU wake", [](TestCase &t)
+        {
+            PS2Runtime runtime;
+            t.IsTrue(runtime.memory().initialize(),
+                     "VIF1 VU-wait fixture memory should initialize");
+            t.IsTrue(runtime.syncCoreSubsystems(),
+                     "VIF1 VU-wait fixture subsystems should bind");
+            runtime.setEeSchedulingMode(
+                ps2x::timing::EeSchedulingMode::Event);
+
+            constexpr uint32_t kVuUpperNop = 0x000002FFu;
+            constexpr uint32_t kVuUpperEnd = 0x400002FFu;
+            uint8_t *const code =
+                runtime.memory().getVU1Code();
+            std::memset(code, 0, PS2_VU1_CODE_SIZE);
+            writeVuInstructionPair(
+                code, 0u, 0u, kVuUpperEnd);
+            writeVuInstructionPair(
+                code, 8u, 0u, kVuUpperNop);
+            runtime.memory().markVU1CodeModified();
+
+            const uint32_t mscal =
+                makeVifCmd(0x14u, 0u, 0u);
+            runtime.memory().processVIF1Data(
+                reinterpret_cast<const uint8_t *>(&mscal),
+                sizeof(mscal));
+
+            constexpr uint32_t kVif1 = 0x10009000u;
+            constexpr uint32_t kSource = 0x00032000u;
+            const std::array<uint32_t, 4> packet = {
+                makeVifCmd(0x11u, 0u, 0u),
+                makeVifCmd(0x05u, 0u, 3u),
+                0u,
+                0u,
+            };
+            std::memcpy(
+                runtime.memory().getRDRAM() + kSource,
+                packet.data(), sizeof(packet));
+            runtime.debugStartEeEventTrace(12u);
+            t.IsTrue(runtime.memory().writeIORegister(
+                         kVif1 + 0x10u, kSource),
+                     "VIF1 wait MADR write should succeed");
+            t.IsTrue(runtime.memory().writeIORegister(
+                         kVif1 + 0x20u, 1u),
+                     "VIF1 wait QWC write should succeed");
+            t.IsTrue(runtime.memory().writeIORegister(
+                         kVif1, 0x100u),
+                     "VIF1 wait start should succeed");
+
+            R5900Context &context = runtime.cpu();
+            context.advanceEeCycleTicks(32u);
+            runtime.serviceEeEventsAtBlockBoundary(
+                runtime.memory().getRDRAM(), &context);
+
+            const Vif1DmaSnapshot waiting =
+                runtime.memory().vif1DmaSnapshot();
+            t.IsTrue(waiting.active,
+                     "VU wait should retain the DMA descriptor");
+            t.IsTrue(
+                waiting.stall ==
+                    Vif1DmaStallReason::WaitingForVu,
+                "the descriptor should report its VU stall");
+            t.IsTrue(runtime.memory().vif1WaitingForVu(),
+                     "VIF should expose its VU wait");
+            t.IsTrue(
+                (runtime.memory().vif1_regs.stat &
+                 (1u << 2u)) != 0u,
+                "VU wait should set VEW");
+            t.Equals(runtime.memory().vif1_regs.mode, 0u,
+                     "post-FLUSH commands should remain retained");
+
+            PS2Runtime::DebugEeScheduler scheduler =
+                runtime.debugEeSchedulerSnapshot();
+            t.IsFalse(
+                scheduler.slots[ps2x::timing::
+                    eeEventSourceIndex(
+                        ps2x::timing::EeEventSource::
+                            DmacVif1)]
+                    .pending,
+                "DMAC_VIF1 should be absent during the VU-owned wait");
+            t.IsTrue(
+                scheduler.slots[ps2x::timing::
+                    eeEventSourceIndex(
+                        ps2x::timing::EeEventSource::
+                            VifVu1Finish)]
+                    .pending,
+                "VIF_VU1_FINISH should own the wait");
+
+            context.advanceEeCycleTicks(96u);
+            runtime.serviceEeEventsAtBlockBoundary(
+                runtime.memory().getRDRAM(), &context);
+            t.IsFalse(runtime.memory().vif1WaitingForVu(),
+                      "VU completion should wake VIF");
+            t.Equals(runtime.memory().vif1_regs.mode, 3u,
+                     "same-tick DMA wake should resume retained commands");
+            t.IsFalse(
+                runtime.memory().vif1DmaSnapshot().active,
+                "same-tick wake should finalize the completed payload");
+            scheduler = runtime.debugEeSchedulerSnapshot();
+            t.IsFalse(
+                scheduler.slots[ps2x::timing::
+                    eeEventSourceIndex(
+                        ps2x::timing::EeEventSource::
+                            DmacVif1)]
+                    .pending,
+                "the boundary-34-style state should retain no DMAC_VIF1 event");
+            t.IsFalse(
+                scheduler.slots[ps2x::timing::
+                    eeEventSourceIndex(
+                        ps2x::timing::EeEventSource::
+                            VifVu1Finish)]
+                    .pending,
+                "completed VU work should retain no finish event");
         });
 
         tc.Run("event VU1 deadline includes committed in-block EE time", [](TestCase &t)

@@ -42,6 +42,7 @@ public:
     void drain();
     void reset();
     bool empty() const;
+    bool canAcceptPath2(bool directHl) const;
 
 private:
     struct PathStream
