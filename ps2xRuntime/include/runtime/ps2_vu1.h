@@ -43,6 +43,15 @@ struct VU1ProgressSnapshot
     uint32_t pc = 0;
 };
 
+struct VU1AdvanceResult
+{
+    uint32_t requestedCycles = 0;
+    uint32_t executedCycles = 0;
+    bool activeBefore = false;
+    bool activeAfter = false;
+    bool completed = false;
+};
+
 class VU1Interpreter
 {
 public:
@@ -53,6 +62,18 @@ public:
     VU1Interpreter();
 
     void reset();
+
+    // Starting/resuming and advancing are separate so a runtime scheduler can
+    // make busy state visible before any VU work is performed.
+    void start(uint32_t startPC = 0, uint32_t top = 0,
+               uint32_t itop = 0, PS2Memory *memory = nullptr);
+    void resumeState(uint32_t top = 0, uint32_t itop = 0,
+                     PS2Memory *memory = nullptr);
+    [[nodiscard]] VU1AdvanceResult advance(
+        uint8_t *vuCode, uint32_t codeSize,
+        uint8_t *vuData, uint32_t dataSize,
+        GS &gs, PS2Memory *memory = nullptr,
+        uint32_t maxCycles = 65536);
 
     void execute(uint8_t *vuCode, uint32_t codeSize,
                  uint8_t *vuData, uint32_t dataSize,
@@ -65,10 +86,11 @@ public:
                 GS &gs, PS2Memory *memory = nullptr,
                 uint32_t top = 0, uint32_t itop = 0, uint32_t maxCycles = 65536);
 
-    void continueExecution(uint8_t *vuCode, uint32_t codeSize,
-                           uint8_t *vuData, uint32_t dataSize,
-                           GS &gs, PS2Memory *memory = nullptr,
-                           uint32_t maxCycles = 65536);
+    VU1AdvanceResult continueExecution(
+        uint8_t *vuCode, uint32_t codeSize,
+        uint8_t *vuData, uint32_t dataSize,
+        GS &gs, PS2Memory *memory = nullptr,
+        uint32_t maxCycles = 65536);
 
     VU1State &state() { return m_state; }
     const VU1State &state() const { return m_state; }
@@ -133,9 +155,11 @@ private:
     std::atomic<bool> m_instructionObserverEnabled{false};
     bool m_active = false;
 
-    void run(uint8_t *vuCode, uint32_t codeSize,
-             uint8_t *vuData, uint32_t dataSize,
-             GS &gs, PS2Memory *memory, uint32_t maxCycles);
+    [[nodiscard]] VU1AdvanceResult run(
+        uint8_t *vuCode, uint32_t codeSize,
+        uint8_t *vuData, uint32_t dataSize,
+        GS &gs, PS2Memory *memory, uint32_t maxCycles,
+        bool traceBudgetBoundary);
 
     DecodedInstructionPair decodeInstructionPair(const uint8_t *vuCode, uint32_t pc) const;
     DecodedInstructionPair getDecodedInstructionPairForPc(const uint8_t *vuCode, uint32_t codeSize,

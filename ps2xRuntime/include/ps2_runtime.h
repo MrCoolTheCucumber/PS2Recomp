@@ -485,6 +485,20 @@ public:
         bool contextBound = false;
     };
 
+    struct DebugVu1Timing
+    {
+        uint64_t currentTick = 0u;
+        uint64_t generation = 0u;
+        uint64_t lastAdvancedTick = 0u;
+        uint64_t totalAdvancedCycles = 0u;
+        uint64_t eventGeneration = 0u;
+        uint64_t eventDeadlineTick = 0u;
+        uint32_t pc = 0u;
+        bool active = false;
+        bool vifWaitingForVu = false;
+        bool eventPending = false;
+    };
+
     struct DebugEeEventSlot
     {
         ps2x::timing::EeEventSource source =
@@ -782,6 +796,7 @@ public:
     bool debugReadMemory(uint32_t address, uint32_t size, std::vector<uint8_t> &output);
     bool debugCopyGsVram(std::vector<uint8_t> &output);
     DebugRuntimeProgress debugRuntimeProgress() const;
+    DebugVu1Timing debugVu1TimingSnapshot();
     std::vector<DebugBranchEntry> debugBranchHistory(
         size_t maximumEntries = 256u) const;
     DebugFaultInfo debugFaultSnapshot() const;
@@ -948,6 +963,17 @@ private:
         uint8_t *rdram,
         R5900Context *ctx,
         const ps2x::timing::EeEventService &service);
+    void startVU1FromVif(
+        uint32_t startPC, uint32_t top, uint32_t itop);
+    void resumeVU1FromVif(uint32_t top, uint32_t itop);
+    void serviceVU1AtEvent(
+        R5900Context *ctx,
+        const ps2x::timing::EeEventService &service);
+    void scheduleVU1Event(
+        ps2x::timing::EeTick deadline) noexcept;
+    void cancelVU1Execution(bool resetInterpreter);
+    void setVU1BusyFlag(
+        R5900Context *context, bool busy) noexcept;
     void onDmacCompletionReady();
     size_t publishReadyDmacCompletions(
         uint64_t eventSequence);
@@ -988,6 +1014,15 @@ private:
     ps2x::timing::EeEventScheduler m_eeEventScheduler;
     ps2x::timing::EeSchedulingMode m_eeSchedulingMode =
         ps2x::timing::EeSchedulingMode::Legacy;
+    struct Vu1ExecutionTiming
+    {
+        uint64_t generation = 0u;
+        ps2x::timing::EeTick lastAdvancedTick{};
+        uint64_t totalAdvancedCycles = 0u;
+        ps2x::timing::EeEventToken eventToken{
+            ps2x::timing::EeEventSource::VifVu1Finish, 0u};
+    };
+    Vu1ExecutionTiming m_vu1ExecutionTiming{};
     ps2x::timing::EeTick m_vu0CycleTick{};
     ps2x::timing::EeTick m_vu0NextEventCycleTick{};
     bool m_eeSchedulerShadowMismatch = false;

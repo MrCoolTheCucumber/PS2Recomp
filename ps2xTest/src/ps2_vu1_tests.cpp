@@ -6,6 +6,7 @@
 #include "runtime/ps2_vu_clip.h"
 #include "runtime/ps2_vu1.h"
 
+#include <array>
 #include <cfenv>
 #include <cstdint>
 #include <cstring>
@@ -832,6 +833,148 @@ void register_ps2_vu1_tests()
                     sawUpdatedPayload = sawUpdatedPayload && captured[0][i] == 0xA5u;
                 t.IsTrue(sawUpdatedPayload,
                          "XGKICK should read payload as PATH1 reaches it, not snapshot it at kick time");
+            }
+        });
+
+        tc.Run("split VU1 advances match one equal-total cycle budget", [](TestCase &t)
+        {
+            Vu1Fixture singleFixture;
+            Vu1Fixture splitFixture;
+            t.IsTrue(singleFixture.initialize(),
+                     "single-batch fixture should initialize");
+            t.IsTrue(splitFixture.initialize(),
+                     "split-batch fixture should initialize");
+
+            std::vector<std::vector<uint8_t>> singlePackets;
+            std::vector<std::vector<uint8_t>> splitPackets;
+            singleFixture.mem.setGifPacketCallback(
+                [&](const uint8_t *data, uint32_t sizeBytes)
+                {
+                    singlePackets.emplace_back(
+                        data, data + sizeBytes);
+                });
+            splitFixture.mem.setGifPacketCallback(
+                [&](const uint8_t *data, uint32_t sizeBytes)
+                {
+                    splitPackets.emplace_back(
+                        data, data + sizeBytes);
+                });
+
+            const auto configure =
+                [](Vu1Fixture &fixture)
+                {
+                    const uint64_t imageTag =
+                        makeGifTag(1u, GIF_FMT_IMAGE, 0u);
+                    std::memcpy(
+                        fixture.data, &imageTag,
+                        sizeof(imageTag));
+                    for (uint32_t index = 0u;
+                         index < 16u; ++index)
+                    {
+                        fixture.data[16u + index] =
+                            static_cast<uint8_t>(0x80u + index);
+                    }
+
+                    writeVuInstructionPair(
+                        fixture.code, 0u,
+                        makeVuLowerSpecial(0x6Cu, 0u),
+                        kVuUpperNop);
+                    writeVuInstructionPair(
+                        fixture.code, 8u,
+                        makeVuBranch(2), kVuUpperNop);
+                    writeVuInstructionPair(
+                        fixture.code, 16u,
+                        makeVuIaddiu(1u, 0u, 3),
+                        kVuUpperNop);
+                    writeVuInstructionPair(
+                        fixture.code, 24u,
+                        makeVuIaddiu(3u, 0u, 99),
+                        kVuUpperNop);
+                    writeVuInstructionPair(
+                        fixture.code, 32u,
+                        makeVuIaddiu(2u, 0u, 7),
+                        kVuUpperEnd);
+                    writeVuInstructionPair(
+                        fixture.code, 40u, 0u,
+                        kVuUpperNop);
+                    fixture.mem.markVU1CodeModified();
+                };
+            configure(singleFixture);
+            configure(splitFixture);
+
+            VU1Interpreter single;
+            VU1Interpreter split;
+            single.start(0u, 0x123u, 0x2ABu,
+                         &singleFixture.mem);
+            split.start(0u, 0x123u, 0x2ABu,
+                        &splitFixture.mem);
+
+            const VU1AdvanceResult singleResult =
+                single.advance(
+                    singleFixture.code, PS2_VU1_CODE_SIZE,
+                    singleFixture.data, PS2_VU1_DATA_SIZE,
+                    singleFixture.gs, &singleFixture.mem,
+                    12u);
+            uint32_t splitExecuted = 0u;
+            for (const uint32_t budget :
+                 std::array<uint32_t, 4>{1u, 2u, 2u, 7u})
+            {
+                const VU1AdvanceResult result =
+                    split.advance(
+                        splitFixture.code, PS2_VU1_CODE_SIZE,
+                        splitFixture.data, PS2_VU1_DATA_SIZE,
+                        splitFixture.gs, &splitFixture.mem,
+                        budget);
+                splitExecuted += result.executedCycles;
+            }
+
+            t.Equals(singleResult.requestedCycles, 12u,
+                     "single advance should retain its supplied budget");
+            t.Equals(singleResult.executedCycles, 5u,
+                     "single advance should report exact E-bit work");
+            t.IsTrue(singleResult.completed,
+                     "single advance should report completion");
+            t.Equals(splitExecuted,
+                     singleResult.executedCycles,
+                     "split calls should execute the same total work");
+            t.IsFalse(single.isActive(),
+                      "single-batch interpreter should finish");
+            t.IsFalse(split.isActive(),
+                      "split-batch interpreter should finish");
+
+            const VU1State &singleState = single.state();
+            const VU1State &splitState = split.state();
+            t.Equals(splitState.pc, singleState.pc,
+                     "split execution should retain the same PC");
+            t.Equals(splitState.top, singleState.top,
+                     "split execution should retain the same TOP");
+            t.Equals(splitState.itop, singleState.itop,
+                     "split execution should retain the same ITOP");
+            t.Equals(splitState.vi[1], singleState.vi[1],
+                     "split execution should retain delay-slot VI state");
+            t.Equals(splitState.vi[2], singleState.vi[2],
+                     "split execution should retain branch-target VI state");
+            t.Equals(splitState.vi[3], singleState.vi[3],
+                     "split execution should skip the same fallthrough pair");
+            t.Equals(splitState.mac, singleState.mac,
+                     "split execution should retain FMAC state");
+            t.Equals(splitState.status, singleState.status,
+                     "split execution should retain STATUS state");
+            t.Equals(splitState.q, singleState.q,
+                     "split execution should retain Q state");
+            t.Equals(splitState.branchPending,
+                     singleState.branchPending,
+                     "split execution should retain branch pipeline state");
+            t.Equals(splitPackets.size(), singlePackets.size(),
+                     "split execution should emit the same packet count");
+            if (!singlePackets.empty() && !splitPackets.empty())
+            {
+                t.Equals(splitPackets[0].size(),
+                         singlePackets[0].size(),
+                         "split execution should emit the same packet size");
+                t.IsTrue(
+                    splitPackets[0] == singlePackets[0],
+                    "split execution should emit identical PATH1 bytes");
             }
         });
 

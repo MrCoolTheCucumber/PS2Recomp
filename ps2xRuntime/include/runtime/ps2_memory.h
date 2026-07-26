@@ -462,6 +462,15 @@ public:
     void setVu1MscalCallback(Vu1MscalCallback cb) { m_vu1MscalCallback = std::move(cb); }
     using Vu1MscntCallback = std::function<void(uint32_t top, uint32_t itop)>;
     void setVu1MscntCallback(Vu1MscntCallback cb) { m_vu1MscntCallback = std::move(cb); }
+    using Vu1BusyCallback = std::function<bool()>;
+    void setVu1BusyCallback(Vu1BusyCallback cb) { m_vu1BusyCallback = std::move(cb); }
+    using Vif1ResetCallback = std::function<void()>;
+    void setVif1ResetCallback(Vif1ResetCallback cb) { m_vif1ResetCallback = std::move(cb); }
+
+    [[nodiscard]] bool vif1WaitingForVu() const { return m_vif1WaitingForVu; }
+    [[nodiscard]] size_t vif1DeferredByteCount() const { return m_vif1DeferredData.size(); }
+    bool resumeVIF1AfterVu();
+    void cancelVIF1VuWait();
 
     uint8_t *getVU1Code() { return m_vu1Code; }
     const uint8_t *getVU1Code() const { return m_vu1Code; }
@@ -576,6 +585,8 @@ public:
     GifArbiter *m_gifArbiter = nullptr;
     Vu1MscalCallback m_vu1MscalCallback;
     Vu1MscntCallback m_vu1MscntCallback;
+    Vu1BusyCallback m_vu1BusyCallback;
+    Vif1ResetCallback m_vif1ResetCallback;
 
     uint8_t *m_vu0Code = nullptr;
     uint8_t *m_vu0Data = nullptr;
@@ -584,6 +595,9 @@ public:
     bool m_path3Masked = false;
     uint32_t m_vif1PendingPath2DirectQwc = 0u;
     bool m_vif1PendingPath2DirectHl = false;
+    bool m_vif1WaitingForVu = false;
+    std::vector<uint8_t> m_vif1DeferredData;
+    std::optional<DmacTransferToken> m_vif1DeferredDmacCompletion;
     std::vector<std::vector<uint8_t>> m_path3MaskedFifo;
 
     struct PendingTransfer

@@ -232,11 +232,9 @@ VU1Interpreter::DecodedInstructionPair VU1Interpreter::getDecodedInstructionPair
     return m_decodedCodeCache[pc / 8u];
 }
 
-void VU1Interpreter::execute(uint8_t *vuCode, uint32_t codeSize,
-                             uint8_t *vuData, uint32_t dataSize,
-                             GS &gs, PS2Memory *memory,
-                             uint32_t startPC, uint32_t top, uint32_t itop,
-                             uint32_t maxCycles)
+void VU1Interpreter::start(
+    uint32_t startPC, uint32_t top, uint32_t itop,
+    PS2Memory *memory)
 {
     m_state.pc = startPC & 0x3FFFu;
     m_state.ebit = false;
@@ -255,13 +253,10 @@ void VU1Interpreter::execute(uint8_t *vuCode, uint32_t codeSize,
     m_active = true;
     if (memory && memory->isVif1DmaTraceActive())
         memory->traceVu1Invocation(m_state.pc, top, itop, false, m_state);
-    run(vuCode, codeSize, vuData, dataSize, gs, memory, maxCycles);
 }
 
-void VU1Interpreter::resume(uint8_t *vuCode, uint32_t codeSize,
-                            uint8_t *vuData, uint32_t dataSize,
-                            GS &gs, PS2Memory *memory,
-                            uint32_t top, uint32_t itop, uint32_t maxCycles)
+void VU1Interpreter::resumeState(
+    uint32_t top, uint32_t itop, PS2Memory *memory)
 {
     m_state.ebit = false;
     m_state.top = top;
@@ -269,23 +264,75 @@ void VU1Interpreter::resume(uint8_t *vuCode, uint32_t codeSize,
     m_active = true;
     if (memory && memory->isVif1DmaTraceActive())
         memory->traceVu1Invocation(m_state.pc, top, itop, true, m_state);
-    run(vuCode, codeSize, vuData, dataSize, gs, memory, maxCycles);
 }
 
-void VU1Interpreter::continueExecution(
+VU1AdvanceResult VU1Interpreter::advance(
     uint8_t *vuCode, uint32_t codeSize,
     uint8_t *vuData, uint32_t dataSize,
     GS &gs, PS2Memory *memory, uint32_t maxCycles)
 {
     if (!m_active)
-        return;
+    {
+        return VU1AdvanceResult{
+            .requestedCycles = maxCycles,
+            .activeBefore = false,
+            .activeAfter = false,
+        };
+    }
 
-    run(vuCode, codeSize, vuData, dataSize, gs, memory, maxCycles);
+    return run(
+        vuCode, codeSize, vuData, dataSize,
+        gs, memory, maxCycles, false);
 }
 
-void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
-                         uint8_t *vuData, uint32_t dataSize,
-                         GS &gs, PS2Memory *memory, uint32_t maxCycles)
+void VU1Interpreter::execute(
+    uint8_t *vuCode, uint32_t codeSize,
+    uint8_t *vuData, uint32_t dataSize,
+    GS &gs, PS2Memory *memory,
+    uint32_t startPC, uint32_t top, uint32_t itop,
+    uint32_t maxCycles)
+{
+    start(startPC, top, itop, memory);
+    (void)run(
+        vuCode, codeSize, vuData, dataSize,
+        gs, memory, maxCycles, true);
+}
+
+void VU1Interpreter::resume(
+    uint8_t *vuCode, uint32_t codeSize,
+    uint8_t *vuData, uint32_t dataSize,
+    GS &gs, PS2Memory *memory,
+    uint32_t top, uint32_t itop, uint32_t maxCycles)
+{
+    resumeState(top, itop, memory);
+    (void)run(
+        vuCode, codeSize, vuData, dataSize,
+        gs, memory, maxCycles, true);
+}
+
+VU1AdvanceResult VU1Interpreter::continueExecution(
+    uint8_t *vuCode, uint32_t codeSize,
+    uint8_t *vuData, uint32_t dataSize,
+    GS &gs, PS2Memory *memory, uint32_t maxCycles)
+{
+    if (!m_active)
+    {
+        return VU1AdvanceResult{
+            .requestedCycles = maxCycles,
+            .activeBefore = false,
+            .activeAfter = false,
+        };
+    }
+    return run(
+        vuCode, codeSize, vuData, dataSize,
+        gs, memory, maxCycles, true);
+}
+
+VU1AdvanceResult VU1Interpreter::run(
+    uint8_t *vuCode, uint32_t codeSize,
+    uint8_t *vuData, uint32_t dataSize,
+    GS &gs, PS2Memory *memory, uint32_t maxCycles,
+    bool traceBudgetBoundary)
 {
     // The VU performs 24-bit floating-point calculations by truncating toward
     // zero. Keep that host mode local to VU execution so callers retain their
@@ -447,12 +494,20 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
             m_state.ebit = true;
     }
 
-    if (traceVu1)
+    if (traceVu1 &&
+        (!m_active || traceBudgetBoundary))
     {
         memory->traceVu1InvocationEnd(
             m_state.pc, ended, !ended && executedCycles == maxCycles,
             m_state.vi, std::size(m_state.vi));
     }
+    return VU1AdvanceResult{
+        .requestedCycles = maxCycles,
+        .executedCycles = executedCycles,
+        .activeBefore = true,
+        .activeAfter = m_active,
+        .completed = !m_active,
+    };
 }
 
 void VU1Interpreter::advanceQPipeline()

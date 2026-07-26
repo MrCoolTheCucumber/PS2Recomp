@@ -1745,6 +1745,74 @@ void register_ps2_memory_tests()
             t.Equals(mem.readIORegister(kVif1Ch + 0x20u), 0u, "VIF1 QWC should be cleared after drain");
         });
 
+        tc.Run("VIF1 DMA completion remains busy while VIF waits for VU1", [](TestCase &t)
+        {
+            PS2Memory mem;
+            t.IsTrue(mem.initialize(),
+                     "PS2Memory initialize should succeed");
+
+            constexpr uint32_t kVif1Ch = 0x10009000u;
+            constexpr uint32_t kSrc = 0x00024800u;
+            constexpr uint32_t kQwc = 1u;
+            uint8_t *const rdram = mem.getRDRAM();
+            std::memset(rdram + kSrc, 0, 16u);
+            const uint32_t flush = makeVifCmd(0x11u, 0u, 0u);
+            const uint32_t stmod = makeVifCmd(0x05u, 0u, 3u);
+            std::memcpy(rdram + kSrc, &flush, sizeof(flush));
+            std::memcpy(
+                rdram + kSrc + sizeof(flush),
+                &stmod, sizeof(stmod));
+
+            bool vuBusy = true;
+            mem.setVu1BusyCallback(
+                [&]()
+                {
+                    return vuBusy;
+                });
+            t.IsTrue(
+                mem.writeIORegister(kVif1Ch + 0x10u, kSrc),
+                "write VIF1 MADR should succeed");
+            t.IsTrue(
+                mem.writeIORegister(kVif1Ch + 0x20u, kQwc),
+                "write VIF1 QWC should succeed");
+            t.IsTrue(
+                mem.writeIORegister(kVif1Ch + 0x00u, 0x100u),
+                "write VIF1 CHCR STR should succeed");
+
+            mem.processPendingTransfers();
+            t.IsTrue(mem.vif1WaitingForVu(),
+                     "FLUSH should leave VIF1 waiting for active VU1");
+            t.IsTrue(
+                (mem.vif1_regs.stat & (1u << 2u)) != 0u,
+                "the wait should set VIF1_STAT.VEW");
+            t.Equals(mem.vif1_regs.mode, 0u,
+                     "post-FLUSH commands should remain deferred");
+            t.IsFalse(mem.hasReadyDmacCompletions(),
+                      "VIF1 DMAC completion must wait with the parser");
+            t.IsTrue(
+                (mem.readIORegister(kVif1Ch + 0x00u) & 0x100u) != 0u,
+                "VIF1 CHCR.STR should remain busy during the wait");
+
+            vuBusy = false;
+            t.IsTrue(mem.resumeVIF1AfterVu(),
+                     "VU completion should wake the retained VIF work");
+            t.IsFalse(mem.vif1WaitingForVu(),
+                      "wake should clear explicit VIF wait state");
+            t.Equals(mem.vif1_regs.mode, 3u,
+                     "wake should resume deferred VIF commands");
+            t.IsTrue(mem.hasReadyDmacCompletions(),
+                     "wake should make the retained DMAC completion ready");
+            t.IsTrue(
+                (mem.readIORegister(kVif1Ch + 0x00u) & 0x100u) != 0u,
+                "completion publication should still own CHCR.STR");
+
+            t.Equals(publishDmacCompletions(mem), static_cast<size_t>(1u),
+                     "retained VIF1 completion should publish once");
+            t.IsTrue(
+                (mem.readIORegister(kVif1Ch + 0x00u) & 0x100u) == 0u,
+                "publication should clear VIF1 CHCR.STR");
+        });
+
         tc.Run("VIF1 DMA chain transfers tag high bytes for DIRECT packets when TTE is enabled", [](TestCase &t)
         {
             PS2Memory mem;

@@ -240,10 +240,50 @@ void PS2Memory::processVIF1Data(uint32_t srcPhys, uint32_t sizeBytes)
     processVIF1Data(m_rdram + srcPhys, sizeBytes);
 }
 
+bool PS2Memory::resumeVIF1AfterVu()
+{
+    if (!m_vif1WaitingForVu)
+        return false;
+
+    m_vif1WaitingForVu = false;
+    vif1_regs.stat &= ~(1u << 2); // VEW
+
+    std::vector<uint8_t> deferred;
+    deferred.swap(m_vif1DeferredData);
+    if (!deferred.empty())
+        processVIF1Data(deferred.data(), static_cast<uint32_t>(deferred.size()));
+
+    if (!m_vif1WaitingForVu &&
+        m_vif1DeferredDmacCompletion.has_value())
+    {
+        const DmacTransferToken completion =
+            *m_vif1DeferredDmacCompletion;
+        m_vif1DeferredDmacCompletion.reset();
+        (void)requestDmacCompletion(completion);
+    }
+    return true;
+}
+
+void PS2Memory::cancelVIF1VuWait()
+{
+    m_vif1WaitingForVu = false;
+    if (m_rdram)
+        vif1_regs.stat &= ~(1u << 2); // VEW
+    m_vif1DeferredData.clear();
+    m_vif1DeferredDmacCompletion.reset();
+}
+
 void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
 {
-    if (sizeBytes == 0u)
+    if (!data || sizeBytes == 0u)
         return;
+
+    if (m_vif1WaitingForVu)
+    {
+        m_vif1DeferredData.insert(
+            m_vif1DeferredData.end(), data, data + sizeBytes);
+        return;
+    }
 
     uint32_t pos = 0;
 
@@ -273,6 +313,7 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
             continue;
         }
 
+        const uint32_t commandStart = pos;
         uint32_t cmd;
         memcpy(&cmd, data + pos, 4);
         pos += 4;
@@ -288,6 +329,25 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
         traceVif1Command(cmd, data + pos, sizeBytes - pos);
         if (irq)
             vif1_regs.stat |= (1u << 11); // INT
+
+        const bool waitsForVu =
+            opcode == VIF_FLUSHE ||
+            opcode == VIF_FLUSH ||
+            opcode == VIF_FLUSHA ||
+            opcode == VIF_MSCAL ||
+            opcode == VIF_MSCALF ||
+            opcode == VIF_MSCNT;
+        if (waitsForVu &&
+            m_vu1BusyCallback &&
+            m_vu1BusyCallback())
+        {
+            m_vif1WaitingForVu = true;
+            vif1_regs.stat |= (1u << 2); // VEW
+            m_vif1DeferredData.insert(
+                m_vif1DeferredData.end(),
+                data + commandStart, data + sizeBytes);
+            return;
+        }
 
         if (opcode == VIF_NOP)
         {

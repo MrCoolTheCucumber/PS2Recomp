@@ -1764,6 +1764,9 @@ bool PS2Memory::initialize(size_t ramSize)
     m_path3MaskedFifo.clear();
     m_vif1PendingPath2DirectQwc = 0u;
     m_vif1PendingPath2DirectHl = false;
+    m_vif1WaitingForVu = false;
+    m_vif1DeferredData.clear();
+    m_vif1DeferredDmacCompletion.reset();
     m_timer0LastHostNs = 0;
     m_timer0FractionNs = 0;
 
@@ -2538,7 +2541,12 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
                 std::memset(&vif1_regs, 0, sizeof(vif1_regs));
                 m_vif1PendingPath2DirectQwc = 0u;
                 m_vif1PendingPath2DirectHl = false;
+                m_vif1WaitingForVu = false;
+                m_vif1DeferredData.clear();
+                m_vif1DeferredDmacCompletion.reset();
                 (void)cancelDmacTransfer(DmacChannel::Vif1);
+                if (m_vif1ResetCallback)
+                    m_vif1ResetCallback();
             }
             if (value & 0x8u) // STC
             {
@@ -2950,7 +2958,13 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
                     processPendingTransfers();
                 }
                 if (channelBase == 0x10009000u)
-                    finishVif1DmaTrace();
+                {
+                    const bool cooperativeVu1Active =
+                        m_vu1BusyCallback &&
+                        m_vu1BusyCallback();
+                    if (!cooperativeVu1Active)
+                        finishVif1DmaTrace();
+                }
             }
         }
         return true;
@@ -3218,6 +3232,8 @@ DmacTransferToken PS2Memory::beginDmacTransfer(DmacChannel channel)
     }
 
     discardPendingDmacWork(channel);
+    if (channel == DmacChannel::Vif1)
+        m_vif1DeferredDmacCompletion.reset();
 
     DmacTransferToken transfer{channel, 0u};
     {
@@ -3311,6 +3327,8 @@ bool PS2Memory::cancelDmacTransfer(DmacChannel channel)
     }
 
     discardPendingDmacWork(channel);
+    if (channel == DmacChannel::Vif1)
+        m_vif1DeferredDmacCompletion.reset();
 
     bool cancelled = false;
     {
@@ -3732,7 +3750,10 @@ void PS2Memory::processPendingTransfers()
     }
     if (finishedVif1.has_value())
     {
-        (void)requestDmacCompletion(*finishedVif1);
+        if (m_vif1WaitingForVu)
+            m_vif1DeferredDmacCompletion = *finishedVif1;
+        else
+            (void)requestDmacCompletion(*finishedVif1);
     }
 }
 

@@ -17,6 +17,7 @@
 #include "Stubs/VU.h"
 
 #include <atomic>
+#include <array>
 #include <chrono>
 #include <cstdint>
 #include <cstring>
@@ -131,6 +132,32 @@ namespace
         return (0x2Du << 25) |
                (static_cast<uint32_t>(is & 0xFu) << 11) |
                (static_cast<uint32_t>(imm) & 0x7FFu);
+    }
+
+    uint32_t makeVuLowerSpecial(
+        uint8_t specialOp, uint8_t is, uint8_t it = 0u,
+        uint8_t id = 0u, uint8_t dest = 0u)
+    {
+        return (0x40u << 25) |
+               (static_cast<uint32_t>(dest & 0xFu) << 21) |
+               (static_cast<uint32_t>(it & 0x1Fu) << 16) |
+               (static_cast<uint32_t>(is & 0x1Fu) << 11) |
+               (static_cast<uint32_t>(id & 0x1Fu) << 6) |
+               (static_cast<uint32_t>(specialOp & 0x7Cu) << 4) |
+               static_cast<uint32_t>(specialOp & 0x3u) |
+               0x3Cu;
+    }
+
+    uint64_t makeGifTag(
+        uint16_t nloop, uint8_t flg, uint8_t nreg,
+        bool eop = true)
+    {
+        uint64_t tag = static_cast<uint64_t>(nloop & 0x7FFFu);
+        if (eop)
+            tag |= 1ull << 15u;
+        tag |= static_cast<uint64_t>(flg & 0x3u) << 58u;
+        tag |= static_cast<uint64_t>(nreg & 0xFu) << 60u;
+        return tag;
     }
 
     void writeVuInstructionPair(uint8_t *code, uint32_t pc, uint32_t lower, uint32_t upper)
@@ -3005,6 +3032,364 @@ void register_ps2_runtime_expansion_tests()
             t.Equals(mem.vif1_regs.tops, 4u, "DBF=0 should make TOPS=BASE");
             t.Equals(mem.vif1_regs.top, 6u, "MSCNT should latch TOP from current TOPS before toggling");
             t.Equals(mem.vif1_regs.itop, 0x21u, "MSCNT should keep latching ITOP from ITOPS");
+        });
+
+        tc.Run("event VU1 MSCAL stays busy until scheduled finish wakes VIF1", [](TestCase &t)
+        {
+            PS2Runtime runtime;
+            t.IsTrue(
+                runtime.memory().initialize(),
+                "VU1 timing fixture memory should initialize");
+            t.IsTrue(
+                runtime.syncCoreSubsystems(),
+                "VU1 timing fixture subsystems should bind");
+            runtime.setEeSchedulingMode(
+                ps2x::timing::EeSchedulingMode::Event);
+
+            constexpr uint32_t kVuUpperNop = 0x000002FFu;
+            constexpr uint32_t kVuUpperEnd = 0x400002FFu;
+            uint8_t *const code = runtime.memory().getVU1Code();
+            std::memset(code, 0, PS2_VU1_CODE_SIZE);
+            writeVuInstructionPair(code, 0u, 0u, kVuUpperEnd);
+            writeVuInstructionPair(code, 8u, 0u, kVuUpperNop);
+            runtime.memory().markVU1CodeModified();
+
+            const std::array<uint32_t, 3> commands = {
+                makeVifCmd(0x14u, 0u, 0u), // MSCAL
+                makeVifCmd(0x11u, 0u, 0u), // FLUSH
+                makeVifCmd(0x05u, 0u, 3u), // STMOD
+            };
+            runtime.memory().processVIF1Data(
+                reinterpret_cast<const uint8_t *>(commands.data()),
+                static_cast<uint32_t>(sizeof(commands)));
+
+            PS2Runtime::DebugVu1Timing timing =
+                runtime.debugVu1TimingSnapshot();
+            t.IsTrue(timing.active,
+                     "MSCAL should make VU1 active without completing it");
+            t.Equals(timing.totalAdvancedCycles, 0u,
+                     "MSCAL submission should execute zero VU cycles");
+            t.IsTrue(timing.eventPending,
+                     "MSCAL should schedule VIF_VU1_FINISH");
+            t.Equals(timing.eventDeadlineTick, 128u,
+                     "the first progress boundary should be sixteen VU cycles");
+            t.IsTrue(timing.vifWaitingForVu,
+                     "a following FLUSH should retain explicit VIF wait state");
+            t.IsTrue(
+                (runtime.memory().vif1_regs.stat & (1u << 2u)) != 0u,
+                "VIF wait should expose VIF1_STAT.VEW");
+            t.Equals(runtime.memory().vif1_regs.mode, 0u,
+                     "commands after the wait must remain deferred");
+            t.IsTrue(
+                (runtime.cpu().vu0_vpu_stat & (1u << 8u)) != 0u,
+                "VPU_STAT should expose VU1 busy before completion");
+
+            R5900Context &context = runtime.cpu();
+            context.advanceEeCycleTicks(120u);
+            runtime.serviceEeEventsAtBlockBoundary(
+                runtime.memory().getRDRAM(), &context);
+            timing = runtime.debugVu1TimingSnapshot();
+            t.IsTrue(timing.active,
+                     "VU1 should remain busy immediately before its deadline");
+            t.Equals(timing.totalAdvancedCycles, 0u,
+                     "pre-deadline service should not advance VU1");
+
+            context.advanceEeCycleTicks(8u);
+            runtime.serviceEeEventsAtBlockBoundary(
+                runtime.memory().getRDRAM(), &context);
+            timing = runtime.debugVu1TimingSnapshot();
+            t.IsFalse(timing.active,
+                      "the E-bit program should finish at the scheduled boundary");
+            t.Equals(timing.totalAdvancedCycles, 2u,
+                     "finish service should report the exact executed pairs");
+            t.IsFalse(timing.eventPending,
+                      "completed VU1 work should leave no progress event");
+            t.IsFalse(timing.vifWaitingForVu,
+                      "completion should clear retained VIF wait state");
+            t.IsTrue(
+                (runtime.memory().vif1_regs.stat & (1u << 2u)) == 0u,
+                "completion should clear VIF1_STAT.VEW");
+            t.Equals(runtime.memory().vif1_regs.mode, 3u,
+                     "completion should resume the deferred VIF command");
+            t.IsTrue(
+                (runtime.cpu().vu0_vpu_stat & (1u << 8u)) == 0u,
+                "completion should clear VU1 busy");
+
+            const uint32_t mscalf = makeVifCmd(0x15u, 0u, 0u);
+            runtime.memory().processVIF1Data(
+                reinterpret_cast<const uint8_t *>(&mscalf),
+                sizeof(mscalf));
+            timing = runtime.debugVu1TimingSnapshot();
+            t.IsTrue(timing.active,
+                     "MSCALF should use the same cooperative start contract");
+            t.Equals(timing.totalAdvancedCycles, 0u,
+                     "MSCALF should not execute synchronously");
+            (void)runtime.memory().writeIORegister(
+                0x10003C10u, 1u);
+        });
+
+        tc.Run("event VU1 deadline includes committed in-block EE time", [](TestCase &t)
+        {
+            PS2Runtime runtime;
+            t.IsTrue(runtime.memory().initialize(),
+                     "VU1 timestamp fixture memory should initialize");
+            t.IsTrue(runtime.syncCoreSubsystems(),
+                     "VU1 timestamp fixture subsystems should bind");
+            runtime.setEeSchedulingMode(
+                ps2x::timing::EeSchedulingMode::Event);
+
+            constexpr uint32_t kVuUpperNop = 0x000002FFu;
+            uint8_t *const code = runtime.memory().getVU1Code();
+            writeVuInstructionPair(code, 0u, 0u, kVuUpperNop);
+            runtime.memory().markVU1CodeModified();
+
+            R5900Context context{};
+            {
+                PS2Runtime::GuestExecutionScope guest(
+                    &runtime, &context);
+                context.advanceEeCycleTicks(80u);
+                const uint32_t mscal =
+                    makeVifCmd(0x14u, 0u, 0u);
+                runtime.memory().processVIF1Data(
+                    reinterpret_cast<const uint8_t *>(&mscal),
+                    sizeof(mscal));
+
+                const PS2Runtime::DebugVu1Timing timing =
+                    runtime.debugVu1TimingSnapshot();
+                t.Equals(timing.currentTick, 80u,
+                         "MSCAL should publish elapsed in-block EE time");
+                t.Equals(timing.lastAdvancedTick, 80u,
+                         "VU1 should start from the submission tick");
+                t.Equals(timing.eventDeadlineTick, 208u,
+                         "the startup deadline should be relative to submission");
+            }
+            (void)runtime.memory().writeIORegister(
+                0x10003C10u, 1u);
+        });
+
+        tc.Run("event VU1 MSCNT resumes canonical branch state", [](TestCase &t)
+        {
+            PS2Runtime runtime;
+            t.IsTrue(runtime.memory().initialize(),
+                     "VU1 resume fixture memory should initialize");
+            t.IsTrue(runtime.syncCoreSubsystems(),
+                     "VU1 resume fixture subsystems should bind");
+            runtime.setEeSchedulingMode(
+                ps2x::timing::EeSchedulingMode::Event);
+
+            constexpr uint32_t kVuUpperNop = 0x000002FFu;
+            constexpr uint32_t kVuUpperEnd = 0x400002FFu;
+            uint8_t *const code = runtime.memory().getVU1Code();
+            std::memset(code, 0, PS2_VU1_CODE_SIZE);
+            writeVuInstructionPair(
+                code, 0u, makeVuBranch(2), kVuUpperEnd);
+            writeVuInstructionPair(
+                code, 8u, makeVuIaddiu(1u, 0u, 1u),
+                kVuUpperNop);
+            writeVuInstructionPair(
+                code, 24u, makeVuIaddiu(2u, 0u, 7u),
+                kVuUpperEnd);
+            writeVuInstructionPair(
+                code, 32u, 0u, kVuUpperNop);
+            runtime.memory().markVU1CodeModified();
+
+            const uint32_t mscal = makeVifCmd(0x14u, 0u, 0u);
+            runtime.memory().processVIF1Data(
+                reinterpret_cast<const uint8_t *>(&mscal),
+                sizeof(mscal));
+            R5900Context &context = runtime.cpu();
+            context.advanceEeCycleTicks(128u);
+            runtime.serviceEeEventsAtBlockBoundary(
+                runtime.memory().getRDRAM(), &context);
+
+            PS2Runtime::DebugVu1Timing first =
+                runtime.debugVu1TimingSnapshot();
+            t.IsFalse(first.active,
+                      "the first E-bit segment should finish");
+            t.Equals(runtime.vu1().state().pc, 24u,
+                     "branch target should remain the canonical resume PC");
+            t.Equals(runtime.vu1().state().vi[1], 1,
+                     "the branch delay slot should execute before completion");
+
+            runtime.memory().vif1_regs.tops = 0x123u;
+            runtime.memory().vif1_regs.itops = 0x2ABu;
+            const uint32_t mscnt = makeVifCmd(0x17u, 0u, 0u);
+            runtime.memory().processVIF1Data(
+                reinterpret_cast<const uint8_t *>(&mscnt),
+                sizeof(mscnt));
+
+            PS2Runtime::DebugVu1Timing resumed =
+                runtime.debugVu1TimingSnapshot();
+            t.IsTrue(resumed.active,
+                     "MSCNT should reactivate the canonical VU1 state");
+            t.Equals(resumed.pc, 24u,
+                     "MSCNT submission must preserve the resume PC");
+            t.Equals(resumed.totalAdvancedCycles, 0u,
+                     "MSCNT submission should execute no VU pairs");
+            t.IsTrue(resumed.generation > first.generation,
+                     "MSCNT should own a new scheduled generation");
+            t.Equals(runtime.vu1().state().top, 0x123u,
+                     "MSCNT should latch the new TOP value");
+            t.Equals(runtime.vu1().state().itop, 0x2ABu,
+                     "MSCNT should latch the new ITOP value");
+
+            context.advanceEeCycleTicks(128u);
+            runtime.serviceEeEventsAtBlockBoundary(
+                runtime.memory().getRDRAM(), &context);
+            t.IsFalse(runtime.vu1().isActive(),
+                      "the resumed E-bit segment should finish");
+            t.Equals(runtime.vu1().state().vi[2], 7,
+                     "MSCNT should execute from the retained branch target");
+        });
+
+        tc.Run("event VU1 reset invalidates stale finish generation", [](TestCase &t)
+        {
+            PS2Runtime runtime;
+            t.IsTrue(runtime.memory().initialize(),
+                     "VU1 reset fixture memory should initialize");
+            t.IsTrue(runtime.syncCoreSubsystems(),
+                     "VU1 reset fixture subsystems should bind");
+            runtime.setEeSchedulingMode(
+                ps2x::timing::EeSchedulingMode::Event);
+
+            constexpr uint32_t kVuUpperNop = 0x000002FFu;
+            constexpr uint32_t kVuUpperEnd = 0x400002FFu;
+            uint8_t *const code = runtime.memory().getVU1Code();
+            std::memset(code, 0, PS2_VU1_CODE_SIZE);
+            for (uint32_t pc = 0u; pc < 256u; pc += 8u)
+                writeVuInstructionPair(code, pc, 0u, kVuUpperNop);
+            runtime.memory().markVU1CodeModified();
+
+            const uint32_t mscal = makeVifCmd(0x14u, 0u, 0u);
+            runtime.memory().processVIF1Data(
+                reinterpret_cast<const uint8_t *>(&mscal),
+                sizeof(mscal));
+            const PS2Runtime::DebugVu1Timing started =
+                runtime.debugVu1TimingSnapshot();
+            t.IsTrue(started.active && started.eventPending,
+                     "the old generation should begin active");
+
+            (void)runtime.memory().writeIORegister(
+                0x10003C10u, 1u);
+            PS2Runtime::DebugVu1Timing reset =
+                runtime.debugVu1TimingSnapshot();
+            t.IsFalse(reset.active,
+                      "VIF1 reset should cancel VU1 execution");
+            t.IsFalse(reset.eventPending,
+                      "VIF1 reset should cancel the finish event");
+            t.IsTrue(reset.generation > started.generation,
+                     "VIF1 reset should invalidate the old generation");
+
+            R5900Context &context = runtime.cpu();
+            context.advanceEeCycleTicks(128u);
+            runtime.serviceEeEventsAtBlockBoundary(
+                runtime.memory().getRDRAM(), &context);
+            reset = runtime.debugVu1TimingSnapshot();
+            t.Equals(reset.totalAdvancedCycles, 0u,
+                     "the stale deadline must execute no VU work");
+
+            writeVuInstructionPair(code, 0u, 0u, kVuUpperEnd);
+            writeVuInstructionPair(code, 8u, 0u, kVuUpperNop);
+            runtime.memory().markVU1CodeModified();
+            runtime.memory().processVIF1Data(
+                reinterpret_cast<const uint8_t *>(&mscal),
+                sizeof(mscal));
+            const PS2Runtime::DebugVu1Timing restarted =
+                runtime.debugVu1TimingSnapshot();
+            t.IsTrue(restarted.active && restarted.eventPending,
+                     "a post-reset MSCAL should schedule fresh work");
+            t.IsTrue(restarted.generation > reset.generation,
+                     "restart should use a later VU1 generation");
+            t.IsTrue(
+                restarted.eventGeneration != started.eventGeneration,
+                "restart should use a different scheduler token");
+
+            context.advanceEeCycleTicks(128u);
+            runtime.serviceEeEventsAtBlockBoundary(
+                runtime.memory().getRDRAM(), &context);
+            t.IsFalse(runtime.vu1().isActive(),
+                      "only the fresh generation should complete");
+        });
+
+        tc.Run("event VU1 XGKICK output follows scheduled cycle budgets", [](TestCase &t)
+        {
+            PS2Runtime runtime;
+            t.IsTrue(runtime.memory().initialize(),
+                     "VU1 XGKICK fixture memory should initialize");
+            t.IsTrue(runtime.syncCoreSubsystems(),
+                     "VU1 XGKICK fixture subsystems should bind");
+            runtime.setEeSchedulingMode(
+                ps2x::timing::EeSchedulingMode::Event);
+
+            std::vector<std::vector<uint8_t>> captured;
+            runtime.gifArbiter().setProcessPacketFn(
+                [&](const uint8_t *data, uint32_t sizeBytes)
+                {
+                    captured.emplace_back(data, data + sizeBytes);
+                });
+
+            constexpr uint32_t kVuUpperNop = 0x000002FFu;
+            uint8_t *const code = runtime.memory().getVU1Code();
+            uint8_t *const data = runtime.memory().getVU1Data();
+            std::memset(code, 0, PS2_VU1_CODE_SIZE);
+            std::memset(data, 0, PS2_VU1_DATA_SIZE);
+            for (uint32_t pc = 0u; pc < 2048u; pc += 8u)
+                writeVuInstructionPair(code, pc, 0u, kVuUpperNop);
+            writeVuInstructionPair(
+                code, 0u,
+                makeVuLowerSpecial(0x6Cu, 0u),
+                kVuUpperNop);
+            runtime.memory().markVU1CodeModified();
+
+            constexpr uint16_t kPayloadQwords = 12u;
+            const uint64_t tag =
+                makeGifTag(kPayloadQwords, GIF_FMT_IMAGE, 0u);
+            std::memcpy(data, &tag, sizeof(tag));
+            for (uint32_t index = 0u;
+                 index < kPayloadQwords * 16u; ++index)
+            {
+                data[16u + index] =
+                    static_cast<uint8_t>(index);
+            }
+
+            const uint32_t mscal = makeVifCmd(0x14u, 0u, 0u);
+            runtime.memory().processVIF1Data(
+                reinterpret_cast<const uint8_t *>(&mscal),
+                sizeof(mscal));
+            t.Equals(captured.size(), static_cast<size_t>(0u),
+                     "XGKICK must not submit output with MSCAL");
+
+            R5900Context &context = runtime.cpu();
+            context.advanceEeCycleTicks(128u);
+            runtime.serviceEeEventsAtBlockBoundary(
+                runtime.memory().getRDRAM(), &context);
+            t.Equals(captured.size(), static_cast<size_t>(0u),
+                     "the first sixteen cycles should leave the long PATH1 packet incomplete");
+            t.Equals(
+                runtime.debugVu1TimingSnapshot().totalAdvancedCycles,
+                16u,
+                "the first event should consume its exact startup budget");
+
+            context.advanceEeCycleTicks(1024u);
+            runtime.serviceEeEventsAtBlockBoundary(
+                runtime.memory().getRDRAM(), &context);
+            t.Equals(captured.size(), static_cast<size_t>(1u),
+                     "the follow-up budget should reach PATH1 EOP exactly once");
+            if (!captured.empty())
+            {
+                t.Equals(
+                    captured[0].size(),
+                    static_cast<size_t>(
+                        (kPayloadQwords + 1u) * 16u),
+                    "scheduled XGKICK should retain the complete GIF packet");
+            }
+            t.Equals(
+                runtime.debugVu1TimingSnapshot().totalAdvancedCycles,
+                144u,
+                "follow-up service should add the reference 128-cycle budget");
+
+            (void)runtime.memory().writeIORegister(
+                0x10003C10u, 1u);
         });
 
         tc.Run("EE cycle ticks honor the post-BIOS dual-issue configuration", [](TestCase &t)
