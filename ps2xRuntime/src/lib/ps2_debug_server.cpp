@@ -1,6 +1,7 @@
 #include "runtime/ps2_debug_server.h"
 
 #include "ThreadNaming.h"
+#include "Kernel/Stubs/Pad.h"
 #include "ps2_runtime.h"
 #include "ps2_syscalls.h"
 #include "runtime/ps2_watchdog.h"
@@ -17,6 +18,7 @@
 #include <cctype>
 #include <cerrno>
 #include <condition_variable>
+#include <cmath>
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
@@ -25,6 +27,7 @@
 #include <iostream>
 #include <limits>
 #include <mutex>
+#include <optional>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -85,6 +88,29 @@ namespace
     {
         std::ostringstream output;
         output << "0x" << std::hex << std::setw(8) << std::setfill('0') << address;
+        return output.str();
+    }
+
+    std::string wordString(const uint32_t *words, size_t count)
+    {
+        std::ostringstream output;
+        output << std::hex << std::setfill('0');
+        for (size_t index = 0u; index < count; ++index)
+        {
+            output << std::setw(8) << words[index];
+        }
+        return output.str();
+    }
+
+    std::string halfwordString(const uint16_t *words, size_t count)
+    {
+        std::ostringstream output;
+        output << std::hex << std::setfill('0');
+        for (size_t index = 0u; index < count; ++index)
+        {
+            output << std::setw(4)
+                   << static_cast<uint32_t>(words[index]);
+        }
         return output.str();
     }
 
@@ -760,7 +786,9 @@ struct PS2DebugServer::Impl
                  "state.registers:iop", "state.registers:vu0",
                  "state.registers:vu1", "memory.read", "memory.hash",
                  "breakpoint:ee", "watchpoint:ee", "capture",
-                 "diagnostics.status", "watchdog.status"})
+                 "trace.vu0-sync", "trace.vu0-instruction",
+                 "diagnostics.status", "watchdog.status",
+                 "input.pad.status", "input.pad.override"})
         {
             capabilities.PushBack(Value(capability, allocator), allocator);
         }
@@ -993,7 +1021,8 @@ struct PS2DebugServer::Impl
         Value result(rapidjson::kObjectType);
         addString(result, "cpu", "ee", allocator);
         addString(result, "pc", addressString(context.pc), allocator);
-        result.AddMember("cycles", context.insn_count, allocator);
+        result.AddMember("cycles", context.ee_cycle_ticks >> 3u, allocator);
+        result.AddMember("instructions", context.insn_count, allocator);
 
         Value categories(rapidjson::kArrayType);
         Value gprCategory(rapidjson::kObjectType);
@@ -1039,6 +1068,25 @@ struct PS2DebugServer::Impl
     {
         QuiesceGuard guard(runtime);
         const VU1State state = vu1 ? runtime.vu1().state() : runtime.vu0().state();
+        const auto floatValue = [](float value)
+        {
+            Value result;
+            if (std::isfinite(value))
+            {
+                result.SetFloat(value);
+            }
+            else
+            {
+                result.SetNull();
+            }
+            return result;
+        };
+        const auto floatBits = [](float value)
+        {
+            uint32_t bits = 0u;
+            std::memcpy(&bits, &value, sizeof(bits));
+            return bits;
+        };
         Value result(rapidjson::kObjectType);
         addString(result, "cpu", vu1 ? "vu1" : "vu0", allocator);
         addString(result, "pc", addressString(state.pc), allocator);
@@ -1056,19 +1104,42 @@ struct PS2DebugServer::Impl
         }
         result.AddMember("integer_registers", vi, allocator);
         Value vf(rapidjson::kArrayType);
+        Value vfBits(rapidjson::kArrayType);
         for (size_t index = 0u; index < 32u; ++index)
         {
             Value vector(rapidjson::kArrayType);
+            Value vectorBits(rapidjson::kArrayType);
             for (float lane : state.vf[index])
             {
-                vector.PushBack(lane, allocator);
+                vector.PushBack(floatValue(lane), allocator);
+                vectorBits.PushBack(
+                    makeString(addressString(floatBits(lane)), allocator),
+                    allocator);
             }
             vf.PushBack(vector, allocator);
+            vfBits.PushBack(vectorBits, allocator);
         }
         result.AddMember("vector_registers", vf, allocator);
-        result.AddMember("q", state.q, allocator);
-        result.AddMember("p", state.p, allocator);
-        result.AddMember("i", state.i, allocator);
+        result.AddMember("vector_register_bits", vfBits, allocator);
+
+        Value accumulator(rapidjson::kArrayType);
+        Value accumulatorBits(rapidjson::kArrayType);
+        for (float lane : state.acc)
+        {
+            accumulator.PushBack(floatValue(lane), allocator);
+            accumulatorBits.PushBack(
+                makeString(addressString(floatBits(lane)), allocator),
+                allocator);
+        }
+        result.AddMember("accumulator", accumulator, allocator);
+        result.AddMember("accumulator_bits", accumulatorBits, allocator);
+
+        result.AddMember("q", floatValue(state.q), allocator);
+        result.AddMember("p", floatValue(state.p), allocator);
+        result.AddMember("i", floatValue(state.i), allocator);
+        addString(result, "q_bits", addressString(floatBits(state.q)), allocator);
+        addString(result, "p_bits", addressString(floatBits(state.p)), allocator);
+        addString(result, "i_bits", addressString(floatBits(state.i)), allocator);
         result.AddMember("mac", state.mac, allocator);
         result.AddMember("clip", state.clip, allocator);
         result.AddMember("status", state.status, allocator);
@@ -1119,6 +1190,231 @@ struct PS2DebugServer::Impl
         throw RequestError(-32602, "unsupported CPU " + cpu);
     }
 
+    Value vu0SyncTraceValue(bool stop, Allocator &allocator)
+    {
+        const PS2Runtime::DebugVu0SyncTrace trace =
+            runtime.debugVu0SyncTraceSnapshot(stop);
+        Value result(rapidjson::kObjectType);
+        result.AddMember("enabled", trace.enabled, allocator);
+        result.AddMember("triggered", trace.triggered, allocator);
+        result.AddMember("stop_on_full", trace.stopOnFull, allocator);
+        if (trace.triggerEePc.has_value())
+        {
+            addString(
+                result, "trigger_ee_pc",
+                addressString(*trace.triggerEePc), allocator);
+        }
+        else
+        {
+            result.AddMember(
+                "trigger_ee_pc", Value(rapidjson::kNullType), allocator);
+        }
+        result.AddMember("total_entries", trace.totalEntries, allocator);
+        result.AddMember("dropped_entries", trace.droppedEntries, allocator);
+        Value entries(rapidjson::kArrayType);
+        for (const PS2Runtime::DebugVu0SyncEntry &source : trace.entries)
+        {
+            Value entry(rapidjson::kObjectType);
+            entry.AddMember("sequence", source.sequence, allocator);
+            entry.AddMember("invocation", source.invocation, allocator);
+            entry.AddMember(
+                "invocation_instruction",
+                source.invocationInstruction, allocator);
+            entry.AddMember("ee_cycle_ticks", source.eeCycleTicks, allocator);
+            entry.AddMember("vu_cycle_ticks", source.vuCycleTicks, allocator);
+            entry.AddMember(
+                "next_event_cycle_ticks",
+                source.nextEventCycleTicks, allocator);
+            addString(entry, "ee_pc", addressString(source.eePc), allocator);
+            entry.AddMember("cycle_budget", source.cycleBudget, allocator);
+            addString(
+                entry, "vu_pc_before", addressString(source.vuPcBefore),
+                allocator);
+            addString(
+                entry, "vu_pc_after", addressString(source.vuPcAfter),
+                allocator);
+            addString(
+                entry, "pending_vf_mask",
+                addressString(source.pendingVfMask), allocator);
+            addString(
+                entry, "pending_vi_mask",
+                addressString(source.pendingViMask), allocator);
+            entry.AddMember("context_vi1", source.contextVi1, allocator);
+            entry.AddMember("context_vi2", source.contextVi2, allocator);
+            entry.AddMember("vu_vi1_before", source.vuVi1Before, allocator);
+            entry.AddMember("vu_vi2_before", source.vuVi2Before, allocator);
+            entry.AddMember("vu_vi1_after", source.vuVi1After, allocator);
+            entry.AddMember("vu_vi2_after", source.vuVi2After, allocator);
+            entry.AddMember("interlocked", source.interlocked, allocator);
+            entry.AddMember(
+                "block_boundary", source.blockBoundary, allocator);
+            entry.AddMember("event_due", source.eventDue, allocator);
+            entry.AddMember("active_before", source.activeBefore, allocator);
+            entry.AddMember("active_after", source.activeAfter, allocator);
+            entries.PushBack(entry, allocator);
+        }
+        result.AddMember("entries", entries, allocator);
+        return result;
+    }
+
+    Value vu0SyncTraceStart(const Value *params, Allocator &allocator)
+    {
+        const uint64_t maximumEntries =
+            requiredUnsigned(params, "maximum_entries");
+        if (maximumEntries == 0u || maximumEntries > 16384u)
+        {
+            throw RequestError(
+                -32602, "maximum_entries must be between 1 and 16384");
+        }
+        std::optional<uint32_t> triggerEePc;
+        bool stopOnFull = false;
+        if (params)
+        {
+            const auto trigger = params->FindMember("trigger_ee_pc");
+            if (trigger != params->MemberEnd())
+            {
+                if (!trigger->value.IsString())
+                {
+                    throw RequestError(
+                        -32602, "trigger_ee_pc must be an address string");
+                }
+                triggerEePc = parseAddress(std::string_view(
+                    trigger->value.GetString(),
+                    trigger->value.GetStringLength()));
+            }
+            const auto stop = params->FindMember("stop_on_full");
+            if (stop != params->MemberEnd())
+            {
+                if (!stop->value.IsBool())
+                {
+                    throw RequestError(
+                        -32602, "stop_on_full must be a boolean");
+                }
+                stopOnFull = stop->value.GetBool();
+            }
+        }
+        runtime.debugStartVu0SyncTrace(
+            static_cast<size_t>(maximumEntries), triggerEePc, stopOnFull);
+        return vu0SyncTraceValue(false, allocator);
+    }
+
+    Value vu0InstructionTraceValue(bool stop, Allocator &allocator)
+    {
+        const PS2Runtime::DebugVu0InstructionTrace trace =
+            runtime.debugVu0InstructionTraceSnapshot(stop);
+        Value result(rapidjson::kObjectType);
+        result.AddMember("enabled", trace.enabled, allocator);
+        result.AddMember("triggered", trace.triggered, allocator);
+        result.AddMember("stop_on_full", trace.stopOnFull, allocator);
+        if (trace.triggerEePc.has_value())
+        {
+            addString(
+                result, "trigger_ee_pc",
+                addressString(*trace.triggerEePc), allocator);
+        }
+        else
+        {
+            result.AddMember(
+                "trigger_ee_pc", Value(rapidjson::kNullType), allocator);
+        }
+        result.AddMember("total_entries", trace.totalEntries, allocator);
+        result.AddMember("dropped_entries", trace.droppedEntries, allocator);
+        Value entries(rapidjson::kArrayType);
+        for (const PS2Runtime::DebugVu0InstructionEntry &source :
+             trace.entries)
+        {
+            Value entry(rapidjson::kObjectType);
+            entry.AddMember("sequence", source.sequence, allocator);
+            entry.AddMember("invocation", source.invocation, allocator);
+            entry.AddMember(
+                "invocation_instruction",
+                source.invocationInstruction, allocator);
+            addString(entry, "pc", addressString(source.pc), allocator);
+            addString(entry, "lower", addressString(source.lower), allocator);
+            addString(entry, "upper", addressString(source.upper), allocator);
+            addString(
+                entry, "vi",
+                halfwordString(source.vi.data(), source.vi.size()),
+                allocator);
+            addString(
+                entry, "vf",
+                wordString(source.vf.data(), source.vf.size()),
+                allocator);
+            addString(
+                entry, "acc",
+                wordString(source.acc.data(), source.acc.size()),
+                allocator);
+            addString(entry, "q", addressString(source.q), allocator);
+            addString(entry, "p", addressString(source.p), allocator);
+            addString(entry, "i", addressString(source.i), allocator);
+            addString(
+                entry, "status", addressString(source.status), allocator);
+            addString(entry, "mac", addressString(source.mac), allocator);
+            addString(entry, "clip", addressString(source.clip), allocator);
+            addString(entry, "top", addressString(source.top), allocator);
+            addString(entry, "itop", addressString(source.itop), allocator);
+            entry.AddMember(
+                "branch_pending", source.branchPending, allocator);
+            addString(
+                entry, "branch_target",
+                addressString(source.branchTarget), allocator);
+            entry.AddMember(
+                "branch_delay", source.branchDelay, allocator);
+            entry.AddMember(
+                "vi_backup_cycles", source.viBackupCycles, allocator);
+            entry.AddMember(
+                "vi_backup_register", source.viBackupRegister, allocator);
+            addString(
+                entry, "vi_backup_value",
+                addressString(source.viBackupValue), allocator);
+            entries.PushBack(entry, allocator);
+        }
+        result.AddMember("entries", entries, allocator);
+        return result;
+    }
+
+    Value vu0InstructionTraceStart(
+        const Value *params, Allocator &allocator)
+    {
+        const uint64_t maximumEntries =
+            requiredUnsigned(params, "maximum_entries");
+        if (maximumEntries == 0u || maximumEntries > 8192u)
+        {
+            throw RequestError(
+                -32602, "maximum_entries must be between 1 and 8192");
+        }
+        std::optional<uint32_t> triggerEePc;
+        bool stopOnFull = false;
+        if (params)
+        {
+            const auto trigger = params->FindMember("trigger_ee_pc");
+            if (trigger != params->MemberEnd())
+            {
+                if (!trigger->value.IsString())
+                {
+                    throw RequestError(
+                        -32602, "trigger_ee_pc must be an address string");
+                }
+                triggerEePc = parseAddress(std::string_view(
+                    trigger->value.GetString(),
+                    trigger->value.GetStringLength()));
+            }
+            const auto stop = params->FindMember("stop_on_full");
+            if (stop != params->MemberEnd())
+            {
+                if (!stop->value.IsBool())
+                {
+                    throw RequestError(
+                        -32602, "stop_on_full must be a boolean");
+                }
+                stopOnFull = stop->value.GetBool();
+            }
+        }
+        runtime.debugStartVu0InstructionTrace(
+            static_cast<size_t>(maximumEntries), triggerEePc, stopOnFull);
+        return vu0InstructionTraceValue(false, allocator);
+    }
+
     Value memory(const Value *params, bool hashOnly, Allocator &allocator)
     {
         const uint32_t address =
@@ -1150,6 +1446,59 @@ struct PS2DebugServer::Impl
             addString(result, "data", hexBytes(bytes.data(), bytes.size()), allocator);
         }
         return result;
+    }
+
+    Value padStatus(Allocator &allocator)
+    {
+        const ps2_stubs::PadDebugSnapshot snapshot =
+            ps2_stubs::getPadDebugSnapshot();
+        Value result(rapidjson::kObjectType);
+        result.AddMember("override_enabled", snapshot.overrideEnabled, allocator);
+        result.AddMember("active_low", true, allocator);
+        result.AddMember(
+            "buttons", static_cast<uint32_t>(snapshot.overrideButtons), allocator);
+        result.AddMember(
+            "lx", static_cast<uint32_t>(snapshot.overrideLx), allocator);
+        result.AddMember(
+            "ly", static_cast<uint32_t>(snapshot.overrideLy), allocator);
+        result.AddMember(
+            "rx", static_cast<uint32_t>(snapshot.overrideRx), allocator);
+        result.AddMember(
+            "ry", static_cast<uint32_t>(snapshot.overrideRy), allocator);
+        return result;
+    }
+
+    Value padControl(std::string_view method,
+                     const Value *params,
+                     Allocator &allocator)
+    {
+        if (method == "input.pad.clear")
+        {
+            ps2_stubs::clearPadOverrideState();
+            return padStatus(allocator);
+        }
+
+        const uint64_t buttons = requiredUnsigned(params, "buttons");
+        const uint64_t lx = requiredUnsigned(params, "lx");
+        const uint64_t ly = requiredUnsigned(params, "ly");
+        const uint64_t rx = requiredUnsigned(params, "rx");
+        const uint64_t ry = requiredUnsigned(params, "ry");
+        if (buttons > std::numeric_limits<uint16_t>::max() ||
+            lx > std::numeric_limits<uint8_t>::max() ||
+            ly > std::numeric_limits<uint8_t>::max() ||
+            rx > std::numeric_limits<uint8_t>::max() ||
+            ry > std::numeric_limits<uint8_t>::max())
+        {
+            throw RequestError(-32602, "pad buttons or axes are out of range");
+        }
+
+        ps2_stubs::setPadOverrideState(
+            static_cast<uint16_t>(buttons),
+            static_cast<uint8_t>(lx),
+            static_cast<uint8_t>(ly),
+            static_cast<uint8_t>(rx),
+            static_cast<uint8_t>(ry));
+        return padStatus(allocator);
     }
 
     Value breakpointList(Allocator &allocator)
@@ -2310,6 +2659,30 @@ struct PS2DebugServer::Impl
         {
             return registers(params, allocator);
         }
+        if (method == "trace.vu0-sync.start")
+        {
+            return vu0SyncTraceStart(params, allocator);
+        }
+        if (method == "trace.vu0-sync.status")
+        {
+            return vu0SyncTraceValue(false, allocator);
+        }
+        if (method == "trace.vu0-sync.stop")
+        {
+            return vu0SyncTraceValue(true, allocator);
+        }
+        if (method == "trace.vu0-instruction.start")
+        {
+            return vu0InstructionTraceStart(params, allocator);
+        }
+        if (method == "trace.vu0-instruction.status")
+        {
+            return vu0InstructionTraceValue(false, allocator);
+        }
+        if (method == "trace.vu0-instruction.stop")
+        {
+            return vu0InstructionTraceValue(true, allocator);
+        }
         if (method == "memory.read")
         {
             return memory(params, false, allocator);
@@ -2317,6 +2690,14 @@ struct PS2DebugServer::Impl
         if (method == "memory.hash")
         {
             return memory(params, true, allocator);
+        }
+        if (method == "input.pad.status")
+        {
+            return padStatus(allocator);
+        }
+        if (method == "input.pad.set" || method == "input.pad.clear")
+        {
+            return padControl(method, params, allocator);
         }
         if (method == "breakpoint.list")
         {
