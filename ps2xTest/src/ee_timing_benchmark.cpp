@@ -331,7 +331,7 @@ namespace
         (void)context.finishEeBasicBlock();
     }
 
-    void advanceLegacyBlocks(
+    void advanceScheduledBlocks(
         PS2Runtime &runtime, R5900Context &context,
         uint64_t blocks, uint32_t blockTicks)
     {
@@ -339,18 +339,21 @@ namespace
         for (uint64_t block = 0u; block < blocks; ++block)
         {
             context.advanceEeCycleTicks(blockTicks);
-            runtime.advanceVU0AtEeBlockBoundary(rdram, &context);
+            runtime.serviceEeEventsAtBlockBoundary(
+                rdram, &context);
         }
     }
 
-    void prepareLegacy(
+    void prepareScheduled(
         PS2Runtime &runtime, R5900Context &context,
-        const Configuration &configuration)
+        const Configuration &configuration,
+        ps2x::timing::EeSchedulingMode mode)
     {
+        runtime.setEeSchedulingMode(mode);
         runtime.vu0().setProgressTrackingEnabled(true);
         runtime.vu0StartMicroProgram(
             runtime.memory().getRDRAM(), &context, 0u);
-        advanceLegacyBlocks(
+        advanceScheduledBlocks(
             runtime, context, configuration.warmupBlocks,
             configuration.blockTicks);
 
@@ -362,22 +365,25 @@ namespace
             runtime.memory().getRDRAM(), &context, 0u);
     }
 
-    Measurement measureLegacy(
-        uint32_t sample, const Configuration &configuration)
+    Measurement measureScheduled(
+        uint32_t sample, const Configuration &configuration,
+        ps2x::timing::EeSchedulingMode mode)
     {
         PS2Runtime runtime;
         R5900Context context{};
         if (!initializeFixture(runtime))
-            throw std::runtime_error("failed to initialize legacy fixture");
-        prepareLegacy(runtime, context, configuration);
+            throw std::runtime_error("failed to initialize scheduler fixture");
+        prepareScheduled(runtime, context, configuration, mode);
 
         const VU1ProgressSnapshot before =
             runtime.vu0().getProgressSnapshot();
+        const uint64_t beforeServices =
+            runtime.debugEeSchedulerSnapshot().statistics.serviced;
         g_allocationCount.store(0u, std::memory_order_relaxed);
         g_allocationBytes.store(0u, std::memory_order_relaxed);
         g_trackAllocations.store(true, std::memory_order_release);
         const auto started = std::chrono::steady_clock::now();
-        advanceLegacyBlocks(
+        advanceScheduledBlocks(
             runtime, context, configuration.blocks,
             configuration.blockTicks);
         const auto stopped = std::chrono::steady_clock::now();
@@ -386,7 +392,10 @@ namespace
         const VU1ProgressSnapshot after =
             runtime.vu0().getProgressSnapshot();
         Measurement result{};
-        result.mode = "legacy_scheduler";
+        result.mode =
+            mode == ps2x::timing::EeSchedulingMode::Event
+                ? "event_scheduler_compatibility"
+                : "legacy_scheduler";
         result.sample = sample;
         result.eeBlocks = configuration.blocks;
         result.eeTicks =
@@ -395,8 +404,63 @@ namespace
                 std::max<uint32_t>(configuration.blockTicks >> 3u, 1u) *
                 8u);
         result.eventTests = configuration.blocks;
-        result.vu0Services = after.invocations - before.invocations;
+        result.vu0Services =
+            mode == ps2x::timing::EeSchedulingMode::Event
+                ? runtime.debugEeSchedulerSnapshot()
+                          .statistics.serviced -
+                      beforeServices
+                : after.invocations - before.invocations;
         result.vuPairs = after.cycles - before.cycles;
+        result.hostNanoseconds =
+            static_cast<uint64_t>(
+                std::chrono::duration_cast<std::chrono::nanoseconds>(
+                    stopped - started)
+                    .count());
+        result.allocations =
+            g_allocationCount.load(std::memory_order_relaxed);
+        result.allocatedBytes =
+            g_allocationBytes.load(std::memory_order_relaxed);
+        result.stateHash = hashState(runtime.vu0().state());
+        result.vuPc = runtime.vu0().state().pc;
+        return result;
+    }
+
+    Measurement measureNoEventHotPath(
+        uint32_t sample, const Configuration &configuration)
+    {
+        PS2Runtime runtime;
+        R5900Context context{};
+        if (!initializeFixture(runtime))
+            throw std::runtime_error(
+                "failed to initialize no-event fixture");
+        runtime.setEeSchedulingMode(
+            ps2x::timing::EeSchedulingMode::Event);
+        advanceScheduledBlocks(
+            runtime, context, configuration.warmupBlocks,
+            configuration.blockTicks);
+        runtime.resetEeTiming(&context);
+
+        g_allocationCount.store(0u, std::memory_order_relaxed);
+        g_allocationBytes.store(0u, std::memory_order_relaxed);
+        g_trackAllocations.store(true, std::memory_order_release);
+        const auto started = std::chrono::steady_clock::now();
+        advanceScheduledBlocks(
+            runtime, context, configuration.blocks,
+            configuration.blockTicks);
+        const auto stopped = std::chrono::steady_clock::now();
+        g_trackAllocations.store(false, std::memory_order_release);
+
+        Measurement result{};
+        result.mode = "event_scheduler_no_pending";
+        result.sample = sample;
+        result.eeBlocks = configuration.blocks;
+        result.eeTicks =
+            configuration.blocks *
+            static_cast<uint64_t>(
+                std::max<uint32_t>(
+                    configuration.blockTicks >> 3u, 1u) *
+                8u);
+        result.eventTests = configuration.blocks;
         result.hostNanoseconds =
             static_cast<uint64_t>(
                 std::chrono::duration_cast<std::chrono::nanoseconds>(
@@ -548,8 +612,12 @@ int main(int argc, char **argv)
     try
     {
         std::vector<uint64_t> legacyTimes;
+        std::vector<uint64_t> eventTimes;
+        std::vector<uint64_t> noEventTimes;
         std::vector<uint64_t> directTimes;
         legacyTimes.reserve(configuration.samples);
+        eventTimes.reserve(configuration.samples);
+        noEventTimes.reserve(configuration.samples);
         directTimes.reserve(configuration.samples);
 
         uint64_t expectedVuPairs = 0u;
@@ -557,7 +625,9 @@ int main(int argc, char **argv)
         for (uint32_t sample = 0u; sample < configuration.samples; ++sample)
         {
             const Measurement legacy =
-                measureLegacy(sample, configuration);
+                measureScheduled(
+                    sample, configuration,
+                    ps2x::timing::EeSchedulingMode::Legacy);
             if (sample == 0u)
             {
                 expectedVuPairs = legacy.vuPairs;
@@ -572,6 +642,31 @@ int main(int argc, char **argv)
             printMeasurement(legacy);
             legacyTimes.push_back(legacy.hostNanoseconds);
 
+            const Measurement event =
+                measureScheduled(
+                    sample, configuration,
+                    ps2x::timing::EeSchedulingMode::Event);
+            if (event.vuPairs != expectedVuPairs ||
+                event.stateHash != expectedStateHash)
+            {
+                throw std::runtime_error(
+                    "event compatibility result does not match legacy result");
+            }
+            printMeasurement(event);
+            eventTimes.push_back(event.hostNanoseconds);
+
+            const Measurement noEvent =
+                measureNoEventHotPath(sample, configuration);
+            if (noEvent.vu0Services != 0u ||
+                noEvent.vuPairs != 0u)
+            {
+                throw std::runtime_error(
+                    "no-event hot path performed device work");
+            }
+            printMeasurement(noEvent);
+            noEventTimes.push_back(
+                noEvent.hostNanoseconds);
+
             const Measurement direct =
                 measureDirect(sample, configuration, expectedVuPairs);
             if (direct.vuPairs != expectedVuPairs ||
@@ -585,6 +680,9 @@ int main(int argc, char **argv)
         }
 
         const uint64_t legacyMedian = medianHostTime(legacyTimes);
+        const uint64_t eventMedian = medianHostTime(eventTimes);
+        const uint64_t noEventMedian =
+            medianHostTime(noEventTimes);
         const uint64_t directMedian = medianHostTime(directTimes);
         const double ratio =
             directMedian == 0u
@@ -604,9 +702,18 @@ int main(int argc, char **argv)
             << ','
             << "\"vu_instruction_pairs\":" << expectedVuPairs << ','
             << "\"legacy_median_host_time_ns\":" << legacyMedian << ','
+            << "\"event_compatibility_median_host_time_ns\":"
+            << eventMedian << ','
+            << "\"event_no_pending_median_host_time_ns\":"
+            << noEventMedian << ','
             << "\"pre_scheduler_equal_work_median_host_time_ns\":"
             << directMedian << ','
             << "\"legacy_to_pre_scheduler_ratio\":" << ratio
+            << ",\"event_to_legacy_ratio\":"
+            << (legacyMedian == 0u
+                    ? 0.0
+                    : static_cast<double>(eventMedian) /
+                          static_cast<double>(legacyMedian))
             << "}\n";
     }
     catch (const std::exception &error)

@@ -1459,9 +1459,9 @@ void register_code_generator_tests()
             t.Equals(
                 countOccurrences(
                     generated,
-                    "advanceVU0AtEeBlockBoundary(rdram, ctx)"),
+                    "serviceEeEventsAtBlockBoundary(rdram, ctx)"),
                 static_cast<size_t>(1u),
-                "the completed EE block should use exact-time VU0 progression");
+                "the completed EE block should service shared timing events");
             t.Equals(
                 countOccurrences(
                     generated,
@@ -1620,9 +1620,9 @@ void register_code_generator_tests()
             t.Equals(
                 countOccurrences(
                     generated,
-                    "runtime->advanceVU0AtEeBlockBoundary(rdram, ctx);"),
+                    "runtime->serviceEeEventsAtBlockBoundary(rdram, ctx);"),
                 static_cast<size_t>(1u),
-                "one runtime boundary helper should commit time and advance VU0");
+                "one runtime boundary helper should commit time and service events");
         });
 
         tc.Run("VU0 macro writes preserve the hardwired zero registers", [](TestCase &t) {

@@ -3542,6 +3542,208 @@ void register_ps2_runtime_expansion_tests()
             (void)runtime.debugVu0InstructionTraceSnapshot(true);
         });
 
+        tc.Run("event and shadow compatibility preserve legacy VU0 work", [](TestCase &t)
+        {
+            PS2Runtime legacy;
+            PS2Runtime event;
+            PS2Runtime shadow;
+            for (PS2Runtime *runtime : {&legacy, &event, &shadow})
+            {
+                t.IsTrue(
+                    runtime->memory().initialize(),
+                    "timing fixture memory should initialize");
+                t.IsTrue(
+                    runtime->syncCoreSubsystems(),
+                    "timing fixture subsystems should bind");
+
+                uint8_t *const code =
+                    runtime->memory().getVU0Code();
+                std::memset(code, 0, PS2_VU0_CODE_SIZE);
+                constexpr uint32_t kVuNop = 0x0000003Fu;
+                writeVuInstructionPair(
+                    code, 0u,
+                    makeVuIaddiu(1u, 0u, 1u), kVuNop);
+                writeVuInstructionPair(
+                    code, 8u, makeVuBranch(-1), kVuNop);
+                writeVuInstructionPair(
+                    code, 16u, 0u, kVuNop);
+                runtime->vu0().setProgressTrackingEnabled(true);
+            }
+            event.setEeSchedulingMode(
+                ps2x::timing::EeSchedulingMode::Event);
+            shadow.setEeSchedulingMode(
+                ps2x::timing::EeSchedulingMode::Shadow);
+
+            R5900Context legacyContext{};
+            R5900Context eventContext{};
+            R5900Context shadowContext{};
+            legacyContext.advanceEeCycleTicks(800u);
+            legacy.advanceVU0AtEeBlockBoundary(
+                legacy.memory().getRDRAM(), &legacyContext);
+            eventContext.advanceEeCycleTicks(800u);
+            event.serviceEeEventsAtBlockBoundary(
+                event.memory().getRDRAM(), &eventContext);
+            shadowContext.advanceEeCycleTicks(800u);
+            shadow.serviceEeEventsAtBlockBoundary(
+                shadow.memory().getRDRAM(), &shadowContext);
+
+            legacy.vu0StartMicroProgram(
+                legacy.memory().getRDRAM(),
+                &legacyContext, 0u);
+            event.vu0StartMicroProgram(
+                event.memory().getRDRAM(),
+                &eventContext, 0u);
+            shadow.vu0StartMicroProgram(
+                shadow.memory().getRDRAM(),
+                &shadowContext, 0u);
+            legacy.debugStartVu0InstructionTrace(
+                128u, std::nullopt, false);
+            event.debugStartVu0InstructionTrace(
+                128u, std::nullopt, false);
+            event.debugStartEeEventTrace(2u, true);
+
+            constexpr std::array<uint32_t, 5> kBlockTicks = {
+                128u, 40u, 40u, 384u, 40u};
+            for (const uint32_t ticks : kBlockTicks)
+            {
+                legacyContext.advanceEeCycleTicks(ticks);
+                legacy.advanceVU0AtEeBlockBoundary(
+                    legacy.memory().getRDRAM(),
+                    &legacyContext);
+
+                eventContext.advanceEeCycleTicks(ticks);
+                event.serviceEeEventsAtBlockBoundary(
+                    event.memory().getRDRAM(),
+                    &eventContext);
+
+                shadowContext.advanceEeCycleTicks(ticks);
+                shadow.serviceEeEventsAtBlockBoundary(
+                    shadow.memory().getRDRAM(),
+                    &shadowContext);
+            }
+
+            const VU1ProgressSnapshot legacyProgress =
+                legacy.vu0().getProgressSnapshot();
+            const VU1ProgressSnapshot eventProgress =
+                event.vu0().getProgressSnapshot();
+            const VU1ProgressSnapshot shadowProgress =
+                shadow.vu0().getProgressSnapshot();
+            t.Equals(
+                eventProgress.cycles, legacyProgress.cycles,
+                "event compatibility should execute the legacy VU pair count");
+            t.Equals(
+                shadowProgress.cycles, legacyProgress.cycles,
+                "shadow compatibility should execute the legacy VU pair count");
+            t.Equals(
+                event.vu0().state().pc,
+                legacy.vu0().state().pc,
+                "event compatibility should retain the legacy VU PC");
+            t.Equals(
+                shadow.vu0().state().pc,
+                legacy.vu0().state().pc,
+                "shadow compatibility should retain the legacy VU PC");
+            t.Equals(
+                event.currentEeTick().raw(),
+                legacy.currentEeTick().raw(),
+                "event compatibility should publish identical EE time");
+            t.Equals(
+                shadow.currentEeTick().raw(),
+                legacy.currentEeTick().raw(),
+                "shadow compatibility should publish identical EE time");
+
+            const auto legacyInstructions =
+                legacy.debugVu0InstructionTraceSnapshot(true);
+            const auto eventInstructions =
+                event.debugVu0InstructionTraceSnapshot(true);
+            t.Equals(
+                eventInstructions.entries.size(),
+                legacyInstructions.entries.size(),
+                "event compatibility should retain every VU instruction pair");
+            if (eventInstructions.entries.size() ==
+                legacyInstructions.entries.size())
+            {
+                for (size_t index = 0u;
+                     index < legacyInstructions.entries.size();
+                     ++index)
+                {
+                    const auto &expected =
+                        legacyInstructions.entries[index];
+                    const auto &observed =
+                        eventInstructions.entries[index];
+                    t.Equals(
+                        observed.pc, expected.pc,
+                        "event compatibility should retain VU instruction PCs");
+                    t.Equals(
+                        observed.lower, expected.lower,
+                        "event compatibility should retain lower instructions");
+                    t.Equals(
+                        observed.upper, expected.upper,
+                        "event compatibility should retain upper instructions");
+                    t.IsTrue(
+                        observed.vi == expected.vi,
+                        "event compatibility should retain exact VI state");
+                    t.IsTrue(
+                        observed.vf == expected.vf,
+                        "event compatibility should retain exact VF state");
+                }
+            }
+
+            const PS2Runtime::DebugEeScheduler eventStatus =
+                event.debugEeSchedulerSnapshot();
+            t.IsTrue(
+                eventStatus.mode ==
+                    ps2x::timing::EeSchedulingMode::Event,
+                "event fixture should use the scheduler as authority");
+            t.Equals(
+                eventStatus.statistics.serviced, 2u,
+                "two compatibility deadlines should be serviced");
+            t.IsTrue(
+                eventStatus.hasNextDeadline,
+                "an active VU should retain its next cached deadline");
+
+            const PS2Runtime::DebugEeScheduler shadowStatus =
+                shadow.debugEeSchedulerSnapshot();
+            t.IsFalse(
+                shadowStatus.shadowMismatch,
+                "shadow mode should match the legacy deadline sequence");
+            t.Equals(
+                shadowStatus.statistics.serviced, 2u,
+                "shadow mode should observe both legacy services");
+
+            const PS2Runtime::DebugEeEventTrace eventTrace =
+                event.debugEeEventTraceSnapshot(false);
+            t.IsFalse(
+                eventTrace.enabled,
+                "a stop-on-full event trace should disable at capacity");
+            t.Equals(
+                eventTrace.entries.size(),
+                static_cast<size_t>(2u),
+                "the bounded event trace should retain both services");
+            t.Equals(
+                eventTrace.droppedEntries, 0u,
+                "stop-on-full should not overwrite event evidence");
+            for (const auto &entry : eventTrace.entries)
+            {
+                t.IsTrue(
+                    entry.source ==
+                        ps2x::timing::EeEventSource::
+                            Vu0PeriodicCompatibility,
+                    "compatibility services should identify their source");
+                t.IsTrue(
+                    entry.serviceTick >= entry.scheduledTick,
+                    "event traces should retain scheduled and service time");
+                t.Equals(
+                    entry.latenessTicks,
+                    entry.serviceTick - entry.scheduledTick,
+                    "event traces should retain explicit lateness");
+                t.IsTrue(
+                    entry.rescheduled &&
+                        entry.hasFollowup &&
+                        entry.followupTick > entry.serviceTick,
+                    "an active periodic service should trace its follow-up");
+            }
+        });
+
         tc.Run("VU0 sync trace may wait for an EE PC trigger", [](TestCase &t)
         {
             PS2Runtime runtime;

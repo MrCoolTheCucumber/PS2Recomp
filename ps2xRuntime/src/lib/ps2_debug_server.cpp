@@ -787,6 +787,7 @@ struct PS2DebugServer::Impl
                  "state.registers:vu1", "memory.read", "memory.hash",
                  "breakpoint:ee", "watchpoint:ee", "capture",
                  "trace.vu0-sync", "trace.vu0-instruction",
+                 "trace.ee-events",
                  "diagnostics.status", "watchdog.status",
                  "input.pad.status", "input.pad.override"})
         {
@@ -1014,6 +1015,8 @@ struct PS2DebugServer::Impl
         const R5900Context context = runtime.debugCpuSnapshot();
         const PS2Runtime::DebugEeTiming timing =
             runtime.debugEeTimingSnapshot();
+        const PS2Runtime::DebugEeScheduler scheduler =
+            runtime.debugEeSchedulerSnapshot();
         static constexpr std::array<const char *, 32> names = {
             "zero", "at", "v0", "v1", "a0", "a1", "a2", "a3",
             "t0", "t1", "t2", "t3", "t4", "t5", "t6", "t7",
@@ -1035,6 +1038,26 @@ struct PS2DebugServer::Impl
         result.AddMember(
             "timing_context_bound",
             timing.contextBound, allocator);
+        addString(
+            result, "scheduler_mode",
+            ps2x::timing::eeSchedulingModeName(
+                scheduler.mode),
+            allocator);
+        if (scheduler.hasNextDeadline)
+        {
+            result.AddMember(
+                "next_event_cycle_tick",
+                scheduler.nextDeadlineTick, allocator);
+        }
+        else
+        {
+            result.AddMember(
+                "next_event_cycle_tick",
+                Value(rapidjson::kNullType), allocator);
+        }
+        result.AddMember(
+            "scheduler_shadow_mismatch",
+            scheduler.shadowMismatch, allocator);
         result.AddMember("instructions", context.insn_count, allocator);
 
         Value categories(rapidjson::kArrayType);
@@ -1426,6 +1449,97 @@ struct PS2DebugServer::Impl
         runtime.debugStartVu0InstructionTrace(
             static_cast<size_t>(maximumEntries), triggerEePc, stopOnFull);
         return vu0InstructionTraceValue(false, allocator);
+    }
+
+    Value eeEventTraceValue(bool stop, Allocator &allocator)
+    {
+        const PS2Runtime::DebugEeEventTrace trace =
+            runtime.debugEeEventTraceSnapshot(stop);
+        Value result(rapidjson::kObjectType);
+        result.AddMember("enabled", trace.enabled, allocator);
+        result.AddMember(
+            "stop_on_full", trace.stopOnFull, allocator);
+        result.AddMember(
+            "total_entries", trace.totalEntries, allocator);
+        result.AddMember(
+            "dropped_entries", trace.droppedEntries, allocator);
+        Value entries(rapidjson::kArrayType);
+        for (const PS2Runtime::DebugEeEventEntry &source :
+             trace.entries)
+        {
+            Value entry(rapidjson::kObjectType);
+            entry.AddMember(
+                "sequence", source.sequence, allocator);
+            addString(
+                entry, "source",
+                ps2x::timing::eeEventSourceName(source.source),
+                allocator);
+            entry.AddMember(
+                "event_sequence",
+                source.eventSequence, allocator);
+            entry.AddMember(
+                "generation", source.generation, allocator);
+            entry.AddMember(
+                "scheduled_tick",
+                source.scheduledTick, allocator);
+            entry.AddMember(
+                "service_tick",
+                source.serviceTick, allocator);
+            entry.AddMember(
+                "lateness_ticks",
+                source.latenessTicks, allocator);
+            entry.AddMember(
+                "rescheduled", source.rescheduled, allocator);
+            if (source.hasFollowup)
+            {
+                entry.AddMember(
+                    "followup_tick",
+                    source.followupTick, allocator);
+            }
+            else
+            {
+                entry.AddMember(
+                    "followup_tick",
+                    Value(rapidjson::kNullType), allocator);
+            }
+            entries.PushBack(entry, allocator);
+        }
+        result.AddMember("entries", entries, allocator);
+        return result;
+    }
+
+    Value eeEventTraceStart(
+        const Value *params, Allocator &allocator)
+    {
+        const uint64_t maximumEntries =
+            requiredUnsigned(params, "maximum_entries");
+        if (maximumEntries == 0u || maximumEntries > 16384u)
+        {
+            throw RequestError(
+                -32602,
+                "maximum_entries must be between 1 and 16384");
+        }
+
+        bool stopOnFull = false;
+        if (params)
+        {
+            const auto stop =
+                params->FindMember("stop_on_full");
+            if (stop != params->MemberEnd())
+            {
+                if (!stop->value.IsBool())
+                {
+                    throw RequestError(
+                        -32602,
+                        "stop_on_full must be a boolean");
+                }
+                stopOnFull = stop->value.GetBool();
+            }
+        }
+        runtime.debugStartEeEventTrace(
+            static_cast<size_t>(maximumEntries),
+            stopOnFull);
+        return eeEventTraceValue(false, allocator);
     }
 
     Value memory(const Value *params, bool hashOnly, Allocator &allocator)
@@ -2695,6 +2809,18 @@ struct PS2DebugServer::Impl
         if (method == "trace.vu0-instruction.stop")
         {
             return vu0InstructionTraceValue(true, allocator);
+        }
+        if (method == "trace.ee-events.start")
+        {
+            return eeEventTraceStart(params, allocator);
+        }
+        if (method == "trace.ee-events.status")
+        {
+            return eeEventTraceValue(false, allocator);
+        }
+        if (method == "trace.ee-events.stop")
+        {
+            return eeEventTraceValue(true, allocator);
         }
         if (method == "memory.read")
         {

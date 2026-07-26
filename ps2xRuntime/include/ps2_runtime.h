@@ -27,7 +27,7 @@
 #include <optional>
 
 #include "ps2_log.h"
-#include "runtime/ee_timing.h"
+#include "runtime/ee_event_scheduler.h"
 #include "runtime/ps2_address.h"
 #include "runtime/ps2_gif_arbiter.h"
 #include "runtime/ps2_memory.h"
@@ -399,6 +399,10 @@ public:
     bool syncCoreSubsystems();
     [[nodiscard]] ps2x::timing::EeTick currentEeTick() const noexcept;
     void resetEeTiming(R5900Context *context = nullptr);
+    void setEeSchedulingMode(
+        ps2x::timing::EeSchedulingMode mode);
+    [[nodiscard]] ps2x::timing::EeSchedulingMode
+    eeSchedulingMode() const noexcept;
     bool loadELF(const std::string &elfPath);
     void run();
 
@@ -479,6 +483,59 @@ public:
         uint32_t localBlockTicks = 0u;
         bool localBlockActive = false;
         bool contextBound = false;
+    };
+
+    struct DebugEeEventSlot
+    {
+        ps2x::timing::EeEventSource source =
+            ps2x::timing::EeEventSource::Vu0PeriodicCompatibility;
+        uint64_t deadlineTick = 0u;
+        uint64_t generation = 0u;
+        uint64_t sequence = 0u;
+        bool pending = false;
+    };
+
+    struct DebugEeScheduler
+    {
+        ps2x::timing::EeSchedulingMode mode =
+            ps2x::timing::EeSchedulingMode::Legacy;
+        uint64_t currentTick = 0u;
+        uint64_t nextDeadlineTick = 0u;
+        bool hasNextDeadline = false;
+        bool shadowMismatch = false;
+        uint64_t shadowMismatchTick = 0u;
+        uint64_t legacyDeadlineTick = 0u;
+        uint64_t schedulerDeadlineTick = 0u;
+        bool legacyPending = false;
+        bool schedulerPending = false;
+        std::array<DebugEeEventSlot,
+                   ps2x::timing::kEeEventSourceCount>
+            slots{};
+        ps2x::timing::EeEventSchedulerStatistics statistics{};
+    };
+
+    struct DebugEeEventEntry
+    {
+        uint64_t sequence = 0u;
+        ps2x::timing::EeEventSource source =
+            ps2x::timing::EeEventSource::Vu0PeriodicCompatibility;
+        uint64_t eventSequence = 0u;
+        uint64_t generation = 0u;
+        uint64_t scheduledTick = 0u;
+        uint64_t serviceTick = 0u;
+        uint64_t latenessTicks = 0u;
+        uint64_t followupTick = 0u;
+        bool hasFollowup = false;
+        bool rescheduled = false;
+    };
+
+    struct DebugEeEventTrace
+    {
+        bool enabled = false;
+        bool stopOnFull = false;
+        uint64_t totalEntries = 0u;
+        uint64_t droppedEntries = 0u;
+        std::vector<DebugEeEventEntry> entries;
     };
 
     struct DebugBranchEntry
@@ -668,6 +725,8 @@ public:
                                     bool interlocked);
     void advanceVU0AtEeBlockBoundary(uint8_t *rdram,
                                      R5900Context *ctx);
+    void serviceEeEventsAtBlockBoundary(uint8_t *rdram,
+                                        R5900Context *ctx);
 
 public:
     void handleSyscall(uint8_t *rdram, R5900Context *ctx);
@@ -716,6 +775,7 @@ public:
     DebugStopInfo debugStepDispatches(uint64_t count, std::chrono::milliseconds timeout);
     R5900Context debugCpuSnapshot();
     DebugEeTiming debugEeTimingSnapshot();
+    DebugEeScheduler debugEeSchedulerSnapshot();
     bool debugReadRdram(uint32_t address, uint32_t size, std::vector<uint8_t> &output);
     bool debugReadMemory(uint32_t address, uint32_t size, std::vector<uint8_t> &output);
     bool debugCopyGsVram(std::vector<uint8_t> &output);
@@ -734,6 +794,10 @@ public:
         std::optional<uint32_t> triggerEePc = std::nullopt,
         bool stopOnFull = false);
     DebugVu0InstructionTrace debugVu0InstructionTraceSnapshot(bool stop);
+    void debugStartEeEventTrace(
+        size_t maximumEntries,
+        bool stopOnFull = false);
+    DebugEeEventTrace debugEeEventTraceSnapshot(bool stop);
 
     std::vector<uint32_t> debugBreakpoints() const;
     void debugAddBreakpoint(uint32_t address);
@@ -840,6 +904,7 @@ private:
     void debugRecordFault(const DebugFaultInfo &fault);
     void debugRecordVu0Sync(DebugVu0SyncEntry entry);
     void debugRecordVu0Instruction(DebugVu0InstructionEntry entry);
+    void debugRecordEeEvent(DebugEeEventEntry entry);
     void debugArmVu0Traces(const R5900Context *ctx);
     void beginVu0Invocation();
 
@@ -856,10 +921,35 @@ private:
     friend class PS2DebugServer;
 
 private:
-    void synchronizeVU0MicroprogramImpl(uint8_t *rdram,
-                                        R5900Context *ctx,
-                                        bool interlocked,
-                                        bool blockBoundary);
+    void synchronizeVU0MicroprogramAtTick(
+        uint8_t *rdram,
+        R5900Context *ctx,
+        bool interlocked,
+        bool blockBoundary,
+        bool eventDue,
+        ps2x::timing::EeTick eeCycleTick,
+        ps2x::timing::EeTick nextEventTick);
+    void advanceVU0LegacyAtBlockBoundary(
+        uint8_t *rdram,
+        R5900Context *ctx,
+        ps2x::timing::EeTick eeCycleTick);
+    void serviceEeEventsAtTick(
+        uint8_t *rdram,
+        R5900Context *ctx,
+        ps2x::timing::EeTick eeCycleTick);
+    void dispatchEeEvent(
+        uint8_t *rdram,
+        R5900Context *ctx,
+        const ps2x::timing::EeEventService &service);
+    [[nodiscard]] ps2x::timing::EeTick
+    nextVu0CompatibilityDeadline(
+        ps2x::timing::EeTick scheduledTick,
+        ps2x::timing::EeTick serviceTick) const noexcept;
+    void scheduleVu0CompatibilityEvent(
+        ps2x::timing::EeTick deadline) noexcept;
+    void cancelVu0CompatibilityEvent() noexcept;
+    bool checkEeSchedulerShadow(
+        ps2x::timing::EeTick now);
     [[nodiscard]] ps2x::timing::EeTick publishEeElapsed(
         ps2x::timing::EeTickDelta elapsed) noexcept;
     [[nodiscard]] ps2x::timing::EeTick commitEeContextProgress(
@@ -882,8 +972,17 @@ private:
     VU1Interpreter m_vu0;
     VU1Interpreter m_vu1;
     ps2x::timing::EeTimeline m_eeTimeline;
+    ps2x::timing::EeEventScheduler m_eeEventScheduler;
+    ps2x::timing::EeSchedulingMode m_eeSchedulingMode =
+        ps2x::timing::EeSchedulingMode::Legacy;
     ps2x::timing::EeTick m_vu0CycleTick{};
     ps2x::timing::EeTick m_vu0NextEventCycleTick{};
+    bool m_eeSchedulerShadowMismatch = false;
+    ps2x::timing::EeTick m_eeSchedulerShadowMismatchTick{};
+    ps2x::timing::EeTick m_eeSchedulerShadowLegacyDeadline{};
+    ps2x::timing::EeTick m_eeSchedulerShadowDeadline{};
+    bool m_eeSchedulerShadowLegacyPending = false;
+    bool m_eeSchedulerShadowPending = false;
     std::atomic<uint64_t> m_vu0InvocationSequence{0u};
     std::atomic<uint64_t> m_vu0CurrentInvocation{0u};
     std::atomic<uint64_t> m_vu0CurrentInvocationInstruction{0u};
@@ -947,6 +1046,13 @@ private:
     size_t m_debugVu0InstructionTraceNext = 0u;
     uint64_t m_debugVu0InstructionTraceTotal = 0u;
     bool m_debugVu0InstructionTraceStopOnFull = false;
+    std::atomic<bool> m_debugEeEventTraceEnabled{false};
+    mutable std::mutex m_debugEeEventTraceMutex;
+    std::vector<DebugEeEventEntry> m_debugEeEventTrace;
+    size_t m_debugEeEventTraceCapacity = 0u;
+    size_t m_debugEeEventTraceNext = 0u;
+    uint64_t m_debugEeEventTraceTotal = 0u;
+    bool m_debugEeEventTraceStopOnFull = false;
     mutable std::mutex m_debugControlMutex;
     mutable std::condition_variable m_debugControlCv;
     uint64_t m_debugStopSequence = 0u;
