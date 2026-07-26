@@ -718,10 +718,59 @@ void register_ps2_iop_tests()
             t.Equals(host.readWord(kReceiveAddress + 4u), firstHandle,
                      "an active sound-status query should echo its sound handle");
 
+            std::array<uint32_t, 3> stopBatch{
+                1u,
+                (4u << 16u) | 0x15u,
+                firstHandle,
+            };
+            (void)host.writeGuest(kSendAddress,
+                                  stopBatch.data(),
+                                  sizeof(stopBatch));
+            batch.send.size = sizeof(stopBatch);
+            t.IsTrue(subsystem.handleRpc(batch).handled,
+                     "a stop-sound command should be handled");
+            t.Equals(host.readWord(kReceiveAddress), 0xFFFFFFFFu,
+                     "a stop-sound response should begin with a sentinel");
+            t.Equals(host.readWord(kReceiveAddress + 4u), 1u,
+                     "a stop-sound command should retain its success word");
+            t.Equals(host.readWord(kReceiveAddress + 8u), 0xFFFFFFFFu,
+                     "a stop-sound response should end with a sentinel");
+            t.Equals(host.lastAudioFunction, 0x15u,
+                     "the backend should observe the stop-sound command");
+
+            statusBatch[2] = firstHandle;
+            (void)host.writeGuest(kSendAddress,
+                                  statusBatch.data(),
+                                  sizeof(statusBatch));
+            batch.send.size = sizeof(statusBatch);
+            t.IsTrue(subsystem.handleRpc(batch).handled,
+                     "a stopped sound should remain queryable");
+            t.Equals(host.readWord(kReceiveAddress + 4u), 0u,
+                     "a stopped sound should no longer report active");
+
+            statusBatch[2] = secondHandle;
+            (void)host.writeGuest(kSendAddress,
+                                  statusBatch.data(),
+                                  sizeof(statusBatch));
+            t.IsTrue(subsystem.handleRpc(batch).handled,
+                     "stopping one sound should leave other sounds queryable");
+            t.Equals(host.readWord(kReceiveAddress + 4u), secondHandle,
+                     "stopping one sound should not retire another handle");
+
+            stopBatch[1] = (8u << 16u) | 0x15u;
+            stopBatch[2] = secondHandle;
+            (void)host.writeGuest(kSendAddress,
+                                  stopBatch.data(),
+                                  sizeof(stopBatch));
+            batch.send.size = sizeof(stopBatch);
+            t.IsFalse(subsystem.handleRpc(batch).handled,
+                      "a malformed stop-sound payload should be rejected");
+
             statusBatch[2] = 0xDEADBEEFu;
             (void)host.writeGuest(kSendAddress,
                                   statusBatch.data(),
                                   sizeof(statusBatch));
+            batch.send.size = sizeof(statusBatch);
             t.IsTrue(subsystem.handleRpc(batch).handled,
                      "a status query for an unknown sound should still complete");
             t.Equals(host.readWord(kReceiveAddress + 4u), 0u,

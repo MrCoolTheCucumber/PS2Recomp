@@ -43,6 +43,7 @@ namespace ps2x::iop::detail
         constexpr uint32_t kCommandId0B = 0x0Bu;
         constexpr uint32_t kCommandId0D = 0x0Du;
         constexpr uint32_t kCommandIdPlaySound = 0x11u;
+        constexpr uint32_t kCommandIdStopSound = 0x15u;
         constexpr uint32_t kCommandIdSoundIsStillPlaying = 0x19u;
         constexpr uint32_t kCommandIdSetSoundParams = 0x21u;
         constexpr uint32_t kCommandIdDataReadCancel = 0x37u;
@@ -498,6 +499,22 @@ namespace ps2x::iop::detail
                         response[index + 1u] = soundHandle;
                         m_activeSoundHandles.push_back(soundHandle);
                     }
+                    if (command.id == kCommandIdStopSound)
+                    {
+                        uint32_t soundHandle = 0u;
+                        if (!m_host.readGuest(command.payloadAddress,
+                                              &soundHandle,
+                                              sizeof(soundHandle)))
+                        {
+                            warnCommandBatch("cannot read stop-sound payload");
+                            return result;
+                        }
+                        m_activeSoundHandles.erase(
+                            std::remove(m_activeSoundHandles.begin(),
+                                        m_activeSoundHandles.end(),
+                                        soundHandle),
+                            m_activeSoundHandles.end());
+                    }
                     if (command.id == kCommandIdSoundIsStillPlaying)
                     {
                         uint32_t soundHandle = 0u;
@@ -562,6 +579,8 @@ namespace ps2x::iop::detail
                         payloadSize == 2u * sizeof(uint32_t)) ||
                        (commandId == kCommandIdPlaySound &&
                         payloadSize == 6u * sizeof(uint32_t)) ||
+                       (commandId == kCommandIdStopSound &&
+                        payloadSize == sizeof(uint32_t)) ||
                        (commandId == kCommandIdSoundIsStillPlaying &&
                         payloadSize == sizeof(uint32_t)) ||
                        (commandId == kCommandIdSetSoundParams &&
