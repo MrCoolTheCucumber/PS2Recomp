@@ -328,6 +328,18 @@ namespace ps2_syscalls
         }
     }
 
+    bool isDmacCauseEnabled(uint32_t cause)
+    {
+        if (cause >= 32u)
+        {
+            return false;
+        }
+        std::lock_guard<std::mutex> lock(
+            g_irq_handler_mutex);
+        return (g_enabled_dmac_mask &
+                (1u << cause)) != 0u;
+    }
+
     static void updateGsCsrFieldForVSync(PS2Runtime *runtime, uint64_t tickValue)
     {
         if (!runtime)
@@ -744,6 +756,11 @@ namespace ps2_syscalls
             std::lock_guard<std::mutex> lock(g_irq_handler_mutex);
             g_enabled_dmac_mask |= (1u << cause);
         }
+        if (runtime && cause < PS2_DMAC_CHANNEL_COUNT)
+        {
+            runtime->memory().setDmacInterruptMask(
+                static_cast<DmacChannel>(cause), true);
+        }
         setReturnS32(ctx, KE_OK);
     }
 
@@ -759,6 +776,11 @@ namespace ps2_syscalls
         {
             std::lock_guard<std::mutex> lock(g_irq_handler_mutex);
             g_enabled_dmac_mask &= ~(1u << cause);
+        }
+        if (runtime && cause < PS2_DMAC_CHANNEL_COUNT)
+        {
+            runtime->memory().setDmacInterruptMask(
+                static_cast<DmacChannel>(cause), false);
         }
         setReturnS32(ctx, KE_OK);
     }

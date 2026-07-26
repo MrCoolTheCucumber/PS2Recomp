@@ -753,7 +753,9 @@ public:
     void dispatchLoop(uint8_t *rdram, R5900Context *ctx);
 
     void drainCompletedDmacHandlers(uint8_t *rdram);
+    void requestDmacCompletion(DmacChannel channel);
 
+    void requestGuestPreemption();
     bool shouldPreemptGuestExecution();
     void yieldGuestExecutionAfterWake();
     void waitForGuestExecutionHandoff();
@@ -815,6 +817,11 @@ public:
     uint32_t guestExecutionWaiterCountForTesting() const
     {
         return m_guestExecutionWaiters.load(std::memory_order_acquire);
+    }
+    bool guestPreemptionRequestedForTesting() const
+    {
+        return m_guestExecutionPreemptionRequested.load(
+            std::memory_order_acquire);
     }
 
     uint64_t guestExecutionHandoffTimeouts() const
@@ -941,6 +948,12 @@ private:
         uint8_t *rdram,
         R5900Context *ctx,
         const ps2x::timing::EeEventService &service);
+    void onDmacCompletionReady();
+    size_t publishReadyDmacCompletions(
+        uint64_t eventSequence);
+    void publishCompatibilityDmacCompletions();
+    void collectPendingDmacInterrupts();
+    void onDmacInterruptStateChanged();
     [[nodiscard]] ps2x::timing::EeTick
     nextVu0CompatibilityDeadline(
         ps2x::timing::EeTick scheduledTick,
@@ -995,6 +1008,10 @@ private:
     std::atomic<uint64_t> m_guestExecutionHandoffEpoch{0u};
     std::atomic<uint64_t> m_guestExecutionHandoffTimeouts{0u};
     std::atomic<uint64_t> m_guestExecutionPreemptionEpoch{0u};
+    std::atomic<bool> m_guestExecutionPreemptionRequested{false};
+    std::atomic<bool> m_dmacCompletionReady{false};
+    uint64_t m_dmacCompatibilityEventSequence = 0u;
+    std::vector<DmacPendingInterrupt> m_pendingDmacInterrupts;
     mutable std::mutex m_guestHeapMutex;
     mutable std::mutex m_asyncCallbackStackMutex;
     std::vector<GuestHeapBlock> m_guestHeapBlocks;

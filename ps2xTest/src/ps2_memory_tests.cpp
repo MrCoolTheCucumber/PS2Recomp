@@ -42,6 +42,14 @@ namespace
         std::memcpy(dst.data() + pos, &value, sizeof(uint64_t));
     }
 
+    size_t publishDmacCompletions(
+        PS2Memory &memory,
+        uint64_t eventSequence = 1u)
+    {
+        return memory.publishReadyDmacCompletions(
+            eventSequence);
+    }
+
     uint64_t makeDmaTag(uint16_t qwc, uint8_t id, uint32_t addr, bool irq = false)
     {
         return static_cast<uint64_t>(qwc) |
@@ -1133,6 +1141,7 @@ void register_ps2_memory_tests()
             t.Equals(mem.dmaStartCount(), 1ull, "starting GIF DMA should increment dmaStartCount");
 
             mem.processPendingTransfers();
+            publishDmacCompletions(mem);
 
             t.Equals(captured.size(), static_cast<size_t>(1u), "GIF DMA should emit one packet");
             t.Equals(captured[0].size(), static_cast<size_t>(kQwc * 16u), "GIF packet size should match QWC");
@@ -1175,6 +1184,7 @@ void register_ps2_memory_tests()
                      "SPR_TO SADR write should succeed");
             t.IsTrue(mem.writeIORegister(kChannel + 0x00u, 0x100u),
                      "SPR_TO normal transfer should start");
+            publishDmacCompletions(mem);
 
             bool copied = true;
             for (uint32_t byte = 0u; byte < 16u; ++byte)
@@ -1194,11 +1204,19 @@ void register_ps2_memory_tests()
             t.IsTrue((mem.readIORegister(0x1000E010u) & (1u << 9u)) != 0u,
                      "SPR_TO should raise its D_STAT completion bit");
 
-            const std::vector<uint32_t> causes = mem.consumeCompletedDmacCauses();
-            t.Equals(causes.size(), static_cast<size_t>(1u),
+            const std::vector<DmacPendingInterrupt> interrupts =
+                mem.consumePendingDmacInterrupts();
+            t.Equals(interrupts.size(), static_cast<size_t>(1u),
                      "SPR_TO should queue one completion");
-            t.Equals(causes[0], 9u,
+            t.Equals(interrupts[0].cause, 9u,
                      "SPR_TO should queue DMAC cause nine");
+            t.IsTrue(
+                interrupts[0].source ==
+                    DmacChannel::ToScratchpad,
+                "SPR_TO completion should retain its typed source");
+            t.Equals(
+                interrupts[0].eventSequence, 1ull,
+                "SPR_TO completion should retain its event sequence");
         });
 
         tc.Run("SPR_TO source chain follows REF and REFE tags", [](TestCase &t)
@@ -1234,6 +1252,7 @@ void register_ps2_memory_tests()
                      "SPR_TO SADR write should succeed");
             t.IsTrue(mem.writeIORegister(kChannel + 0x00u, 0x104u),
                      "SPR_TO source-chain transfer should start");
+            publishDmacCompletions(mem);
 
             bool copied = true;
             for (uint32_t byte = 0u; byte < 16u; ++byte)
@@ -1258,10 +1277,11 @@ void register_ps2_memory_tests()
             t.IsTrue((mem.readIORegister(kChannel + 0x00u) & 0x100u) == 0u,
                      "SPR_TO source chain should clear CHCR.STR");
 
-            const std::vector<uint32_t> causes = mem.consumeCompletedDmacCauses();
-            t.Equals(causes.size(), static_cast<size_t>(1u),
+            const std::vector<DmacPendingInterrupt> interrupts =
+                mem.consumePendingDmacInterrupts();
+            t.Equals(interrupts.size(), static_cast<size_t>(1u),
                      "SPR_TO source chain should queue one completion");
-            t.Equals(causes[0], 9u,
+            t.Equals(interrupts[0].cause, 9u,
                      "SPR_TO source chain should queue DMAC cause nine");
         });
 
@@ -1292,6 +1312,7 @@ void register_ps2_memory_tests()
                      "SPR_TO SADR write should succeed");
             t.IsTrue(mem.writeIORegister(kChannel + 0x00u, 0x104u),
                      "SPR_TO source-chain transfer should start");
+            publishDmacCompletions(mem);
 
             bool copied = true;
             for (uint32_t byte = 0u; byte < 16u; ++byte)
@@ -1333,6 +1354,7 @@ void register_ps2_memory_tests()
                      "SPR_FROM SADR write should succeed");
             t.IsTrue(mem.writeIORegister(kChannel + 0x00u, 0x100u),
                      "SPR_FROM normal transfer should start");
+            publishDmacCompletions(mem);
 
             bool copied = true;
             for (uint32_t byte = 0u; byte < 32u; ++byte)
@@ -1350,10 +1372,11 @@ void register_ps2_memory_tests()
             t.IsTrue((mem.readIORegister(0x1000E010u) & (1u << 8u)) != 0u,
                      "SPR_FROM should raise its D_STAT completion bit");
 
-            const std::vector<uint32_t> causes = mem.consumeCompletedDmacCauses();
-            t.Equals(causes.size(), static_cast<size_t>(1u),
+            const std::vector<DmacPendingInterrupt> interrupts =
+                mem.consumePendingDmacInterrupts();
+            t.Equals(interrupts.size(), static_cast<size_t>(1u),
                      "SPR_FROM should queue one completion");
-            t.Equals(causes[0], 8u,
+            t.Equals(interrupts[0].cause, 8u,
                      "SPR_FROM should queue DMAC cause eight");
         });
 
@@ -1383,6 +1406,7 @@ void register_ps2_memory_tests()
             t.IsTrue(mem.writeIORegister(kGifCh + 0x00u, 0x100u), "write CHCR STR should succeed");
 
             mem.processPendingTransfers();
+            publishDmacCompletions(mem);
 
             t.Equals(captured.size(), static_cast<size_t>(1u), "scratchpad GIF DMA should emit one packet");
             t.Equals(captured[0].size(), static_cast<size_t>(16u), "scratchpad GIF DMA packet should be 16 bytes");
@@ -1426,6 +1450,7 @@ void register_ps2_memory_tests()
             t.IsTrue(mem.writeIORegister(kGifCh + 0x00u, 0x104u), "write CHCR STR|CHAIN should succeed");
 
             mem.processPendingTransfers();
+            publishDmacCompletions(mem);
 
             t.Equals(captured.size(), static_cast<size_t>(1u), "scratchpad alias chain should emit one packet");
             t.Equals(captured[0].size(), static_cast<size_t>(16u), "scratchpad alias chain should emit one qword");
@@ -1470,6 +1495,7 @@ void register_ps2_memory_tests()
             t.IsTrue(mem.writeIORegister(kGifCh + 0x30u, kChain), "write GIF TADR should succeed");
             t.IsTrue(mem.tryProcessNativeGifImageUploadChain(gs, kChain, 0x105u),
                      "canonical load-image chain should use the native upload path");
+            publishDmacCompletions(mem);
 
             t.Equals(gs.nativeImageUploadCount(), 1ull, "native GIF DMA chain should upload through GS fast path");
             t.Equals(mem.gifCopyCount(), 1ull, "native GIF DMA chain should still count as a GIF DMA copy");
@@ -1547,6 +1573,7 @@ void register_ps2_memory_tests()
             t.IsTrue(mem.writeIORegister(kGifCh + 0x30u, kScratchTag), "write GIF TADR scratchpad alias should succeed");
             t.IsTrue(mem.tryProcessNativeGifPackedChain(nativeGs, kScratchTag, 0x105u),
                      "packed primitive chain should use the native packed GIF path");
+            publishDmacCompletions(mem);
 
             t.Equals(nativeGs.nativePackedGIFPacketCount(), 1ull, "native packed GIF packet counter should increment");
             t.Equals(mem.gifCopyCount(), 1ull, "native packed GIF chain should still count as a GIF DMA copy");
@@ -1626,6 +1653,7 @@ void register_ps2_memory_tests()
             t.IsTrue(mem.writeIORegister(kGifCh + 0x00u, 0x104u), "write GIF CHCR STR|CHAIN should succeed");
 
             mem.processPendingTransfers();
+            publishDmacCompletions(mem);
 
             constexpr uint32_t kCt32PayloadOffset = 5u * 16u + 16u + kT4Bytes + 5u * 16u + 16u;
             t.IsTrue(capturedGifPacket.size() >= kCt32PayloadOffset + kCt32Bytes,
@@ -1699,6 +1727,7 @@ void register_ps2_memory_tests()
             t.IsTrue(mem.writeIORegister(kVif1Ch + 0x00u, 0x100u), "write VIF1 CHCR STR should succeed");
 
             mem.processPendingTransfers();
+            publishDmacCompletions(mem);
 
             t.Equals(captured.size(), static_cast<size_t>(1u), "VIF1 DIRECT should emit one GIF packet");
             t.Equals(captured[0].size(), static_cast<size_t>(16u), "VIF1 DIRECT packet should be 1 QW");
@@ -1748,6 +1777,7 @@ void register_ps2_memory_tests()
             t.IsTrue(mem.writeIORegister(kVif1Ch + 0x00u, 0x145u), "write VIF1 CHCR DIR|TTE|STR|CHAIN should succeed");
 
             mem.processPendingTransfers();
+            publishDmacCompletions(mem);
 
             t.Equals(captured.size(), static_cast<size_t>(1u), "compact VIF1 chain should emit one GIF packet");
             t.Equals(captured[0].size(), static_cast<size_t>(16u), "compact VIF1 DIRECT packet should be 1 QW");
@@ -1787,6 +1817,7 @@ void register_ps2_memory_tests()
             t.IsTrue(mem.writeIORegister(kVif1Ch + 0x00u, 0x145u), "write VIF1 CHCR DIR|TTE|STR|CHAIN should succeed");
 
             mem.processPendingTransfers();
+            publishDmacCompletions(mem);
 
             t.Equals(mem.vif1_regs.itops, 0x44u,
                      "qwc-zero compact VIF1 chain should still process high-half VIFcodes");
@@ -1814,6 +1845,7 @@ void register_ps2_memory_tests()
             t.IsTrue(mem.writeIORegister(kVif1Ch + 0x00u, 0x105u), "write VIF1 CHCR DIR|STR|CHAIN should succeed");
 
             mem.processPendingTransfers();
+            publishDmacCompletions(mem);
 
             t.Equals(mem.vif1_regs.itops, 0u, "tag high VIFcodes must not transfer while TTE is clear");
         });
@@ -1851,6 +1883,7 @@ void register_ps2_memory_tests()
             t.IsTrue(mem.writeIORegister(kVif1Ch + 0x00u, 0x145u), "write VIF1 CHCR DIR|TTE|STR|CHAIN should succeed");
 
             mem.processPendingTransfers();
+            publishDmacCompletions(mem);
 
             t.Equals(captured.size(), static_cast<size_t>(1u), "REF tag DIRECT should emit one GIF packet");
             t.Equals(captured[0].size(), static_cast<size_t>(16u), "REF tag DIRECT packet should be one qword");
@@ -1913,6 +1946,7 @@ void register_ps2_memory_tests()
             t.IsTrue(mem.writeIORegister(kVif1Ch + 0x00u, 0x145u), "write VIF1 CHCR DIR|TTE|STR|CHAIN should succeed");
 
             mem.processPendingTransfers();
+            publishDmacCompletions(mem);
 
             t.Equals(captured.size(), static_cast<size_t>(1u), "live VIF1 packet should emit one GIF packet");
             t.Equals(captured[0].size(), static_cast<size_t>(16u), "live VIF1 packet should emit one qword");
@@ -1947,6 +1981,7 @@ void register_ps2_memory_tests()
             t.IsTrue(mem.writeIORegister(kVif1Ch + 0x00u, 0x185u), "write VIF1 CHCR chain start should succeed");
 
             mem.processPendingTransfers();
+            publishDmacCompletions(mem);
 
             const uint32_t chcr = mem.readIORegister(kVif1Ch + 0x00u);
             t.Equals(chcr & 0x100u, 0u, "VIF1 STR should clear after DMA chain drain");
@@ -1979,6 +2014,7 @@ void register_ps2_memory_tests()
                      "write long-chain VIF1 TADR should succeed");
             t.IsTrue(mem.writeIORegister(kVif1Ch + 0x00u, 0x105u),
                      "write long-chain VIF1 CHCR should succeed");
+            publishDmacCompletions(mem);
 
             t.Equals(mem.vif1_regs.mark, 0x5A5Au,
                      "VIF1 should consume the payload after tag 4096");
@@ -2010,7 +2046,7 @@ void register_ps2_memory_tests()
                      "a cyclic chain must keep STR set instead of reporting false completion");
             t.IsTrue((mem.readIORegister(0x1000E010u) & 0x2u) == 0u,
                      "a cyclic chain must not raise VIF1 completion status");
-            t.Equals(mem.consumeCompletedDmacCauses().size(), static_cast<size_t>(0u),
+            t.Equals(mem.consumePendingDmacInterrupts().size(), static_cast<size_t>(0u),
                      "a cyclic chain must not queue a completion interrupt");
         });
 
@@ -2047,6 +2083,7 @@ void register_ps2_memory_tests()
             t.IsTrue(mem.writeIORegister(kGifCh + 0x00u, 0x104u), "write CHCR should succeed");
 
             mem.processPendingTransfers();
+            publishDmacCompletions(mem);
 
             t.Equals(captured.size(), static_cast<size_t>(1u), "chain CALL should emit one packet");
             t.Equals(captured[0].size(), static_cast<size_t>(32u), "CALL+END should emit two qwords");
@@ -2100,6 +2137,7 @@ void register_ps2_memory_tests()
             t.IsTrue(mem.writeIORegister(kGifCh + 0x00u, 0x104u), "write CHCR should succeed");
 
             mem.processPendingTransfers();
+            publishDmacCompletions(mem);
 
             t.Equals(captured.size(), static_cast<size_t>(1u), "CALL/RET chain should emit one packet");
             t.Equals(captured[0].size(), static_cast<size_t>(48u), "CALL+RET+END should emit three qwords");
@@ -2153,6 +2191,7 @@ void register_ps2_memory_tests()
                 if (!mem.writeIORegister(kGifCh + 0x00u, chcrValue))
                     return false;
                 mem.processPendingTransfers();
+                publishDmacCompletions(mem);
                 if (captured.empty())
                     return false;
                 packetOut = captured[0];
@@ -2167,6 +2206,182 @@ void register_ps2_memory_tests()
             // STR + CHAIN + TIE(bit7)
             t.IsTrue(runChain(0x184u, packetTie), "chain run with TIE should succeed");
             t.Equals(packetTie.size(), static_cast<size_t>(16u), "IRQ tag should stop chain when TIE is set");
+        });
+
+        tc.Run("DMAC completion service owns busy and interrupt visibility", [](TestCase &t)
+        {
+            PS2Memory mem;
+            t.IsTrue(mem.initialize(), "PS2Memory initialize should succeed");
+
+            constexpr uint32_t kGifCh = 0x1000A000u;
+            constexpr uint32_t kDStat = 0x1000E010u;
+            t.IsTrue(
+                mem.writeIORegister(kGifCh + 0x20u, 7u),
+                "GIF QWC setup should succeed");
+
+            const DmacTransferToken transfer =
+                mem.beginDmacTransfer(DmacChannel::Gif);
+            t.IsTrue(
+                transfer.generation != 0u,
+                "DMAC start should assign a nonzero generation");
+            t.IsTrue(
+                mem.requestDmacCompletion(transfer),
+                "finished work should queue completion");
+
+            const DmacChannelSnapshot ready =
+                mem.dmacChannelSnapshot(DmacChannel::Gif);
+            t.IsTrue(
+                ready.phase == DmacChannelPhase::CompletionReady,
+                "finished work should remain completion-ready before service");
+            t.IsTrue(
+                (mem.readIORegister(kGifCh + 0x00u) & 0x100u) != 0u,
+                "CHCR.STR should remain busy before completion service");
+            t.Equals(
+                mem.readIORegister(kGifCh + 0x20u), 7u,
+                "QWC should remain visible before completion service");
+            t.IsTrue(
+                (mem.readIORegister(kDStat) & (1u << 2u)) == 0u,
+                "D_STAT should remain clear before completion service");
+
+            std::vector<DmacCompletionRequest> completions =
+                mem.consumeReadyDmacCompletions();
+            t.Equals(
+                completions.size(), static_cast<size_t>(1u),
+                "one finished generation should queue one completion");
+            t.IsTrue(
+                completions[0].transfer == transfer,
+                "the completion should retain its transfer token");
+            t.IsTrue(
+                mem.publishDmacCompletion(completions[0], 55u),
+                "the live completion should publish");
+            t.IsFalse(
+                mem.publishDmacCompletion(completions[0], 56u),
+                "the same completion must not publish twice");
+
+            t.IsTrue(
+                (mem.readIORegister(kGifCh + 0x00u) & 0x100u) == 0u,
+                "completion service should clear CHCR.STR");
+            t.Equals(
+                mem.readIORegister(kGifCh + 0x20u), 0u,
+                "completion service should clear QWC");
+            t.IsTrue(
+                (mem.readIORegister(kDStat) & (1u << 2u)) != 0u,
+                "completion service should latch D_STAT");
+
+            const std::vector<DmacPendingInterrupt> interrupts =
+                mem.consumePendingDmacInterrupts();
+            t.Equals(
+                interrupts.size(), static_cast<size_t>(1u),
+                "exactly one typed interrupt should publish");
+            t.IsTrue(
+                interrupts[0].source == DmacChannel::Gif,
+                "the interrupt should retain the GIF source");
+            t.Equals(
+                interrupts[0].channelGeneration,
+                transfer.generation,
+                "the interrupt should retain channel generation");
+            t.Equals(
+                interrupts[0].eventSequence, 55ull,
+                "the interrupt should retain scheduler event sequence");
+        });
+
+        tc.Run("DMAC cancellation and restart reject stale completion", [](TestCase &t)
+        {
+            PS2Memory mem;
+            t.IsTrue(mem.initialize(), "PS2Memory initialize should succeed");
+
+            const DmacTransferToken stale =
+                mem.beginDmacTransfer(DmacChannel::Vif1);
+            t.IsTrue(
+                mem.requestDmacCompletion(stale),
+                "the first generation should become completion-ready");
+            std::vector<DmacCompletionRequest> staleRequests =
+                mem.consumeReadyDmacCompletions();
+            t.Equals(
+                staleRequests.size(), static_cast<size_t>(1u),
+                "the first generation should expose one request");
+
+            t.IsTrue(
+                mem.cancelDmacTransfer(DmacChannel::Vif1),
+                "stopping completion-ready work should cancel it");
+            const DmacTransferToken current =
+                mem.beginDmacTransfer(DmacChannel::Vif1);
+            t.IsTrue(
+                current.generation != stale.generation,
+                "restart should assign a different generation");
+            t.IsTrue(
+                mem.requestDmacCompletion(current),
+                "the restarted generation should become completion-ready");
+
+            t.IsFalse(
+                mem.publishDmacCompletion(
+                    staleRequests[0], 70u),
+                "a stopped generation must not publish after restart");
+            t.IsTrue(
+                (mem.readIORegister(
+                     dmacChannelBase(DmacChannel::Vif1)) &
+                 0x100u) != 0u,
+                "stale service must not clear the restarted busy bit");
+
+            std::vector<DmacCompletionRequest> currentRequests =
+                mem.consumeReadyDmacCompletions();
+            t.Equals(
+                currentRequests.size(), static_cast<size_t>(1u),
+                "the restarted generation should retain its request");
+            t.IsTrue(
+                mem.publishDmacCompletion(
+                    currentRequests[0], 71u),
+                "the restarted completion should publish");
+            const std::vector<DmacPendingInterrupt> interrupts =
+                mem.consumePendingDmacInterrupts();
+            t.Equals(
+                interrupts.size(), static_cast<size_t>(1u),
+                "only the restarted generation should publish an interrupt");
+            t.Equals(
+                interrupts[0].channelGeneration,
+                current.generation,
+                "the published interrupt should identify the new generation");
+        });
+
+        tc.Run("equal-tick DMAC completions preserve ready order", [](TestCase &t)
+        {
+            PS2Memory mem;
+            t.IsTrue(mem.initialize(), "PS2Memory initialize should succeed");
+
+            const DmacTransferToken vif1 =
+                mem.beginDmacTransfer(DmacChannel::Vif1);
+            const DmacTransferToken gif =
+                mem.beginDmacTransfer(DmacChannel::Gif);
+            t.IsTrue(
+                mem.requestDmacCompletion(vif1),
+                "VIF1 completion should queue");
+            t.IsTrue(
+                mem.requestDmacCompletion(gif),
+                "GIF completion should queue");
+            t.Equals(
+                mem.publishReadyDmacCompletions(99u),
+                static_cast<size_t>(2u),
+                "both equal-tick completions should publish");
+
+            const std::vector<DmacPendingInterrupt> interrupts =
+                mem.consumePendingDmacInterrupts();
+            t.Equals(
+                interrupts.size(), static_cast<size_t>(2u),
+                "both typed interrupts should be visible");
+            t.IsTrue(
+                interrupts[0].source == DmacChannel::Vif1 &&
+                    interrupts[1].source == DmacChannel::Gif,
+                "publication should preserve deterministic ready order");
+            t.IsTrue(
+                interrupts[0].publicationSequence <
+                    interrupts[1].publicationSequence,
+                "publication sequence should encode that order");
+            t.Equals(
+                interrupts[0].eventSequence, 99ull,
+                "equal-tick completions should retain the shared event");
+            t.Equals(
+                interrupts[1].eventSequence, 99ull,
+                "equal-tick completions should retain the shared event");
         });
 
         tc.Run("DMAC D_STAT toggles masks and clears channel status on write-one", [](TestCase &t)
@@ -2201,6 +2416,7 @@ void register_ps2_memory_tests()
             t.IsTrue((mem.readIORegister(kDStat) & kGifStatusBit) == 0u, "D_STAT status should not set before transfer drain");
 
             mem.processPendingTransfers();
+            publishDmacCompletions(mem);
 
             const uint32_t dstatAfter = mem.readIORegister(kDStat);
             t.IsTrue((dstatAfter & kGifStatusBit) != 0u, "GIF transfer completion should set D_STAT channel status bit");
@@ -2238,6 +2454,7 @@ void register_ps2_memory_tests()
             t.IsTrue(mem.writeIORegister(kGifCh + 0x20u, 1u), "write QWC should succeed");
             t.IsTrue(mem.writeIORegister(kGifCh + 0x00u, 0x100u), "write CHCR STR should succeed");
             mem.processPendingTransfers();
+            publishDmacCompletions(mem);
 
             t.Equals(captured.size(), static_cast<size_t>(0u), "DMAE=0 should prevent GIF DMA transfer");
             t.Equals(mem.dmaStartCount(), 0ull, "DMAE=0 should not increment dmaStartCount");
@@ -2245,6 +2462,7 @@ void register_ps2_memory_tests()
             t.IsTrue(mem.writeIORegister(kDctrl, 1u), "setting D_CTRL.DMAE should succeed");
             t.IsTrue(mem.writeIORegister(kGifCh + 0x00u, 0x100u), "restarting GIF DMA should succeed");
             mem.processPendingTransfers();
+            publishDmacCompletions(mem);
 
             t.Equals(captured.size(), static_cast<size_t>(1u), "DMAE=1 should allow GIF DMA transfer");
             if (!captured.empty())
@@ -2335,6 +2553,7 @@ void register_ps2_memory_tests()
             t.IsTrue(mem.writeIORegister(kVif1Ch + 0x00u, 0x100u), "write VIF1 CHCR STR should succeed");
 
             mem.processPendingTransfers();
+            publishDmacCompletions(mem);
 
             const uint8_t *vramOut = mem.getGSVRAM();
             bool imageOk = true;

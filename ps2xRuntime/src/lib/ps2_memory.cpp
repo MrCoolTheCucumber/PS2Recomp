@@ -1749,9 +1749,16 @@ bool PS2Memory::initialize(size_t ramSize)
     m_gsWriteCount.store(0, std::memory_order_relaxed);
     m_vifWriteCount.store(0, std::memory_order_relaxed);
     {
-        std::lock_guard<std::mutex> lock(m_completedDmacMutex);
-        m_completedDmacCauses.clear();
+        std::lock_guard<std::mutex> lock(m_dmacMutex);
+        m_dmacChannels = {};
+        m_readyDmacCompletions.clear();
+        m_pendingDmacInterrupts.clear();
+        m_dmacReadySequence = 0u;
+        m_dmacPublicationSequence = 0u;
     }
+    m_pendingGifTransfers.clear();
+    m_pendingVif0Transfers.clear();
+    m_pendingVif1Transfers.clear();
     m_codeRegions.clear();
     m_path3Masked = false;
     m_path3MaskedFifo.clear();
@@ -2510,6 +2517,10 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
         if ((status & mask) != 0u)
             next |= (1u << 31);
         m_ioRegisters[address] = next;
+        if (m_dmacInterruptStateCallback)
+        {
+            m_dmacInterruptStateCallback();
+        }
         return true;
     }
 
@@ -2527,6 +2538,7 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
                 std::memset(&vif1_regs, 0, sizeof(vif1_regs));
                 m_vif1PendingPath2DirectQwc = 0u;
                 m_vif1PendingPath2DirectHl = false;
+                (void)cancelDmacTransfer(DmacChannel::Vif1);
             }
             if (value & 0x8u) // STC
             {
@@ -2585,7 +2597,21 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
 
     if (address >= 0x10008000 && address < 0x1000F000)
     {
-        if ((address & 0xFF) == 0x00 && (value & 0x100))
+        const uint32_t channelBase =
+            address & 0xFFFFFF00u;
+        const std::optional<DmacChannel> channel =
+            dmacChannelFromBase(channelBase);
+        if ((address & 0xFFu) == 0x00u &&
+            channel.has_value() &&
+            (value & 0x100u) == 0u)
+        {
+            (void)cancelDmacTransfer(*channel);
+            return true;
+        }
+
+        if ((address & 0xFFu) == 0x00u &&
+            channel.has_value() &&
+            (value & 0x100u) != 0u)
         {
             const auto dctrlIt = m_ioRegisters.find(0x1000E000u);
             const bool dmacEnabled = (dctrlIt == m_ioRegisters.end()) || ((dctrlIt->second & 0x1u) != 0u);
@@ -2594,7 +2620,8 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
                 return true;
             }
 
-            const uint32_t channelBase = address & 0xFFFFFF00;
+            const DmacTransferToken transfer =
+                beginDmacTransfer(*channel);
             const uint32_t madr = m_ioRegisters[channelBase + 0x10];
             const uint32_t qwc = m_ioRegisters[channelBase + 0x20];
             m_dmaStartCount.fetch_add(1, std::memory_order_relaxed);
@@ -2614,6 +2641,7 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
                         return;
                     const bool scratch = isScratchpad(srcAddr);
                     PendingTransfer pt;
+                    pt.transfer = transfer;
                     pt.fromScratchpad = scratch;
                     pt.srcAddr = srcAddr;
                     pt.qwc = qwCount;
@@ -2887,6 +2915,7 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
                         if (channelBase == 0x10009000u && !chainBuf.empty())
                             traceVif1Input(chainBuf.data(), static_cast<uint32_t>(chainBuf.size()));
                         PendingTransfer pt;
+                        pt.transfer = transfer;
                         pt.fromScratchpad = false;
                         pt.srcAddr = 0;
                         pt.qwc = 0;
@@ -3133,20 +3162,234 @@ bool PS2Memory::processScratchpadDma(uint32_t channelBase)
     m_ioRegisters[channelBase + 0x40u] = asr0;
     m_ioRegisters[channelBase + 0x50u] = asr1;
     m_ioRegisters[channelBase + 0x80u] = sadr;
-    completeDmaChannel(channelBase, toScratchpad ? 9u : 8u);
+    const std::optional<DmacChannel> channel =
+        dmacChannelFromBase(channelBase);
+    if (!channel.has_value())
+    {
+        return false;
+    }
+    const DmacChannelSnapshot state =
+        dmacChannelSnapshot(*channel);
+    (void)requestDmacCompletion(
+        DmacTransferToken{*channel, state.generation});
     return true;
 }
 
-void PS2Memory::completeDmaChannel(uint32_t channelBase, uint32_t cause)
+uint64_t PS2Memory::nextDmacSequence(uint64_t value) noexcept
+{
+    ++value;
+    if (value == 0u)
+    {
+        value = 1u;
+    }
+    return value;
+}
+
+void PS2Memory::discardPendingDmacWork(DmacChannel channel)
+{
+    const auto isChannel =
+        [channel](const PendingTransfer &pending)
+        {
+            return pending.transfer.channel == channel;
+        };
+    m_pendingGifTransfers.erase(
+        std::remove_if(
+            m_pendingGifTransfers.begin(),
+            m_pendingGifTransfers.end(), isChannel),
+        m_pendingGifTransfers.end());
+    m_pendingVif0Transfers.erase(
+        std::remove_if(
+            m_pendingVif0Transfers.begin(),
+            m_pendingVif0Transfers.end(), isChannel),
+        m_pendingVif0Transfers.end());
+    m_pendingVif1Transfers.erase(
+        std::remove_if(
+            m_pendingVif1Transfers.begin(),
+            m_pendingVif1Transfers.end(), isChannel),
+        m_pendingVif1Transfers.end());
+}
+
+DmacTransferToken PS2Memory::beginDmacTransfer(DmacChannel channel)
+{
+    const size_t index = static_cast<size_t>(channel);
+    if (index >= m_dmacChannels.size())
+    {
+        return {};
+    }
+
+    discardPendingDmacWork(channel);
+
+    DmacTransferToken transfer{channel, 0u};
+    {
+        std::lock_guard<std::mutex> lock(m_dmacMutex);
+        DmacChannelLifecycle &state = m_dmacChannels[index];
+        state.generation = nextDmacSequence(state.generation);
+        state.phase = DmacChannelPhase::Active;
+        transfer.generation = state.generation;
+
+        m_readyDmacCompletions.erase(
+            std::remove_if(
+                m_readyDmacCompletions.begin(),
+                m_readyDmacCompletions.end(),
+                [channel](const DmacCompletionRequest &completion)
+                {
+                    return completion.transfer.channel == channel;
+                }),
+            m_readyDmacCompletions.end());
+    }
+
+    const uint32_t channelBase = dmacChannelBase(channel);
+    if (channelBase != 0u)
+    {
+        m_ioRegisters[channelBase + 0x00u] |= 0x100u;
+    }
+    return transfer;
+}
+
+bool PS2Memory::progressDmacTransfer(
+    DmacTransferToken transfer) const
+{
+    const size_t index =
+        static_cast<size_t>(transfer.channel);
+    if (index >= m_dmacChannels.size() ||
+        transfer.generation == 0u)
+    {
+        return false;
+    }
+
+    std::lock_guard<std::mutex> lock(m_dmacMutex);
+    const DmacChannelLifecycle &state =
+        m_dmacChannels[index];
+    return state.generation == transfer.generation &&
+           state.phase == DmacChannelPhase::Active;
+}
+
+bool PS2Memory::requestDmacCompletion(
+    DmacTransferToken transfer)
+{
+    const size_t index =
+        static_cast<size_t>(transfer.channel);
+    if (index >= m_dmacChannels.size() ||
+        transfer.generation == 0u)
+    {
+        return false;
+    }
+
+    DmacCompletionReadyCallback callback;
+    {
+        std::lock_guard<std::mutex> lock(m_dmacMutex);
+        DmacChannelLifecycle &state =
+            m_dmacChannels[index];
+        if (state.generation != transfer.generation ||
+            state.phase != DmacChannelPhase::Active)
+        {
+            return false;
+        }
+
+        state.phase = DmacChannelPhase::CompletionReady;
+        m_dmacReadySequence =
+            nextDmacSequence(m_dmacReadySequence);
+        m_readyDmacCompletions.push_back(
+            DmacCompletionRequest{
+                transfer, m_dmacReadySequence});
+        callback = m_dmacCompletionReadyCallback;
+    }
+
+    if (callback)
+    {
+        callback();
+    }
+    return true;
+}
+
+bool PS2Memory::cancelDmacTransfer(DmacChannel channel)
+{
+    const size_t index = static_cast<size_t>(channel);
+    if (index >= m_dmacChannels.size())
+    {
+        return false;
+    }
+
+    discardPendingDmacWork(channel);
+
+    bool cancelled = false;
+    {
+        std::lock_guard<std::mutex> lock(m_dmacMutex);
+        DmacChannelLifecycle &state = m_dmacChannels[index];
+        cancelled = state.phase != DmacChannelPhase::Idle;
+        state.generation = nextDmacSequence(state.generation);
+        state.phase = DmacChannelPhase::Idle;
+        m_readyDmacCompletions.erase(
+            std::remove_if(
+                m_readyDmacCompletions.begin(),
+                m_readyDmacCompletions.end(),
+                [channel](const DmacCompletionRequest &completion)
+                {
+                    return completion.transfer.channel == channel;
+                }),
+            m_readyDmacCompletions.end());
+    }
+
+    const uint32_t channelBase = dmacChannelBase(channel);
+    if (channelBase != 0u)
+    {
+        m_ioRegisters[channelBase + 0x00u] &= ~0x100u;
+    }
+    return cancelled;
+}
+
+bool PS2Memory::hasReadyDmacCompletions() const
+{
+    std::lock_guard<std::mutex> lock(m_dmacMutex);
+    return !m_readyDmacCompletions.empty();
+}
+
+std::vector<DmacCompletionRequest>
+PS2Memory::consumeReadyDmacCompletions()
+{
+    std::lock_guard<std::mutex> lock(m_dmacMutex);
+    std::vector<DmacCompletionRequest> completions;
+    completions.swap(m_readyDmacCompletions);
+    return completions;
+}
+
+bool PS2Memory::publishDmacCompletion(
+    DmacCompletionRequest completion,
+    uint64_t eventSequence)
 {
     constexpr uint32_t kDStat = 0x1000E010u;
+    const DmacChannel channel =
+        completion.transfer.channel;
+    const size_t index = static_cast<size_t>(channel);
+    if (index >= m_dmacChannels.size() ||
+        completion.transfer.generation == 0u)
+    {
+        return false;
+    }
+
+    std::lock_guard<std::mutex> lock(m_dmacMutex);
+    DmacChannelLifecycle &state = m_dmacChannels[index];
+    if (state.generation !=
+            completion.transfer.generation ||
+        state.phase != DmacChannelPhase::CompletionReady)
+    {
+        return false;
+    }
+
+    state.phase = DmacChannelPhase::Idle;
+    const uint32_t channelBase = dmacChannelBase(channel);
     m_ioRegisters[channelBase + 0x00u] &= ~0x100u;
     m_ioRegisters[channelBase + 0x20u] = 0u;
 
-    uint32_t dstat = m_ioRegisters.count(kDStat) ? m_ioRegisters[kDStat] : 0u;
+    const uint32_t cause = dmacChannelCause(channel);
+    uint32_t dstat =
+        m_ioRegisters.count(kDStat)
+            ? m_ioRegisters[kDStat]
+            : 0u;
     dstat |= (1u << cause);
     const uint32_t status = dstat & 0x3FFu;
-    const uint32_t mask = (dstat >> 16u) & 0x3FFu;
+    const uint32_t mask =
+        (dstat >> 16u) & 0x3FFu;
     if ((status & mask) != 0u)
     {
         dstat |= (1u << 31u);
@@ -3156,15 +3399,139 @@ void PS2Memory::completeDmaChannel(uint32_t channelBase, uint32_t cause)
         dstat &= ~(1u << 31u);
     }
     m_ioRegisters[kDStat] = dstat;
-    queueCompletedDmacCause(cause);
+
+    m_dmacPublicationSequence =
+        nextDmacSequence(m_dmacPublicationSequence);
+    m_pendingDmacInterrupts.push_back(
+        DmacPendingInterrupt{
+            channel,
+            cause,
+            completion.transfer.generation,
+            eventSequence,
+            m_dmacPublicationSequence});
+    return true;
+}
+
+size_t PS2Memory::publishReadyDmacCompletions(
+    uint64_t eventSequence)
+{
+    std::vector<DmacCompletionRequest> completions =
+        consumeReadyDmacCompletions();
+    size_t published = 0u;
+    for (const DmacCompletionRequest &completion :
+         completions)
+    {
+        published += publishDmacCompletion(
+                         completion, eventSequence)
+                         ? 1u
+                         : 0u;
+    }
+    return published;
+}
+
+std::vector<DmacPendingInterrupt>
+PS2Memory::consumePendingDmacInterrupts()
+{
+    std::lock_guard<std::mutex> lock(m_dmacMutex);
+    std::vector<DmacPendingInterrupt> interrupts;
+    interrupts.swap(m_pendingDmacInterrupts);
+    return interrupts;
+}
+
+DmacChannelSnapshot PS2Memory::dmacChannelSnapshot(
+    DmacChannel channel) const
+{
+    const size_t index = static_cast<size_t>(channel);
+    if (index >= m_dmacChannels.size())
+    {
+        return {};
+    }
+
+    std::lock_guard<std::mutex> lock(m_dmacMutex);
+    const DmacChannelLifecycle &state =
+        m_dmacChannels[index];
+    return DmacChannelSnapshot{
+        state.phase, state.generation};
+}
+
+bool PS2Memory::dmacInterruptStatusLatched(
+    DmacChannel channel) const
+{
+    constexpr uint32_t kDStat = 0x1000E010u;
+    const uint32_t cause = dmacChannelCause(channel);
+    if (cause >= 10u)
+    {
+        return false;
+    }
+    const auto found = m_ioRegisters.find(kDStat);
+    return found != m_ioRegisters.end() &&
+           (found->second & (1u << cause)) != 0u;
+}
+
+bool PS2Memory::dmacInterruptUnmasked(
+    DmacChannel channel) const
+{
+    constexpr uint32_t kDStat = 0x1000E010u;
+    const uint32_t cause = dmacChannelCause(channel);
+    if (cause >= 10u)
+    {
+        return false;
+    }
+    const auto found = m_ioRegisters.find(kDStat);
+    return found != m_ioRegisters.end() &&
+           (found->second & (1u << (cause + 16u))) != 0u;
+}
+
+void PS2Memory::setDmacInterruptMask(
+    DmacChannel channel, bool enabled)
+{
+    constexpr uint32_t kDStat = 0x1000E010u;
+    const uint32_t cause = dmacChannelCause(channel);
+    if (cause >= 10u)
+    {
+        return;
+    }
+
+    uint32_t &dstat = m_ioRegisters[kDStat];
+    const uint32_t maskBit = 1u << (cause + 16u);
+    if (enabled)
+    {
+        dstat |= maskBit;
+    }
+    else
+    {
+        dstat &= ~maskBit;
+    }
+
+    const uint32_t status = dstat & 0x3FFu;
+    const uint32_t mask =
+        (dstat >> 16u) & 0x3FFu;
+    if ((status & mask) != 0u)
+    {
+        dstat |= (1u << 31u);
+    }
+    else
+    {
+        dstat &= ~(1u << 31u);
+    }
+
+    if (m_dmacInterruptStateCallback)
+    {
+        m_dmacInterruptStateCallback();
+    }
 }
 
 void PS2Memory::processPendingTransfers()
 {
-    const bool hadGif = !m_pendingGifTransfers.empty();
+    std::optional<DmacTransferToken> finishedGif;
     for (size_t idx = 0; idx < m_pendingGifTransfers.size(); ++idx)
     {
         auto &p = m_pendingGifTransfers[idx];
+        if (!progressDmacTransfer(p.transfer))
+        {
+            continue;
+        }
+        finishedGif = p.transfer;
         if (!p.chainData.empty())
         {
             m_seenGifCopy = true;
@@ -3226,9 +3593,14 @@ void PS2Memory::processPendingTransfers()
     }
     m_pendingGifTransfers.clear();
 
-    const bool hadVif0 = !m_pendingVif0Transfers.empty();
+    std::optional<DmacTransferToken> finishedVif0;
     for (auto &p : m_pendingVif0Transfers)
     {
+        if (!progressDmacTransfer(p.transfer))
+        {
+            continue;
+        }
+        finishedVif0 = p.transfer;
         if (!p.chainData.empty())
         {
             processVIF0Data(p.chainData.data(), static_cast<uint32_t>(p.chainData.size()));
@@ -3284,9 +3656,14 @@ void PS2Memory::processPendingTransfers()
     }
     m_pendingVif0Transfers.clear();
 
-    const bool hadVif1 = !m_pendingVif1Transfers.empty();
+    std::optional<DmacTransferToken> finishedVif1;
     for (auto &p : m_pendingVif1Transfers)
     {
+        if (!progressDmacTransfer(p.transfer))
+        {
+            continue;
+        }
+        finishedVif1 = p.transfer;
         if (!p.chainData.empty())
         {
             processVIF1Data(p.chainData.data(), static_cast<uint32_t>(p.chainData.size()));
@@ -3345,36 +3722,18 @@ void PS2Memory::processPendingTransfers()
     if (m_gifArbiter)
         m_gifArbiter->drain();
 
-    static constexpr uint32_t GIF_CHANNEL = 0x1000A000;
-    static constexpr uint32_t VIF0_CHANNEL = 0x10008000;
-    static constexpr uint32_t VIF1_CHANNEL = 0x10009000;
-
-    if (hadGif)
+    if (finishedGif.has_value())
     {
-        completeDmaChannel(GIF_CHANNEL, 2u);
+        (void)requestDmacCompletion(*finishedGif);
     }
-    if (hadVif0)
+    if (finishedVif0.has_value())
     {
-        completeDmaChannel(VIF0_CHANNEL, 0u);
+        (void)requestDmacCompletion(*finishedVif0);
     }
-    if (hadVif1)
+    if (finishedVif1.has_value())
     {
-        completeDmaChannel(VIF1_CHANNEL, 1u);
+        (void)requestDmacCompletion(*finishedVif1);
     }
-}
-
-void PS2Memory::queueCompletedDmacCause(uint32_t cause)
-{
-    std::lock_guard<std::mutex> lock(m_completedDmacMutex);
-    m_completedDmacCauses.push_back(cause);
-}
-
-std::vector<uint32_t> PS2Memory::consumeCompletedDmacCauses()
-{
-    std::lock_guard<std::mutex> lock(m_completedDmacMutex);
-    std::vector<uint32_t> causes;
-    causes.swap(m_completedDmacCauses);
-    return causes;
 }
 
 void PS2Memory::flushMaskedPath3Packets(bool drainImmediately)
@@ -3465,7 +3824,6 @@ void PS2Memory::processGIFPacket(const uint8_t *data, uint32_t sizeBytes)
 bool PS2Memory::tryProcessNativeGifImageUploadChain(GS &gs, uint32_t tadr, uint32_t chcr)
 {
     static constexpr uint32_t GIF_CHANNEL = 0x1000A000u;
-    static constexpr uint32_t D_STAT = 0x1000E010u;
     static constexpr uint32_t D_CTRL = 0x1000E000u;
 
     if (!m_rdram || !m_gsVRAM || m_path3Masked)
@@ -3630,6 +3988,8 @@ bool PS2Memory::tryProcessNativeGifImageUploadChain(GS &gs, uint32_t tadr, uint3
     if (!resolveContiguous(imageDataAddr, imageBytes, imageData))
         return false;
 
+    const DmacTransferToken transfer =
+        beginDmacTransfer(DmacChannel::Gif);
     m_dmaStartCount.fetch_add(1, std::memory_order_relaxed);
     m_seenGifCopy = true;
     m_gifCopyCount.fetch_add(1, std::memory_order_relaxed);
@@ -3638,26 +3998,18 @@ bool PS2Memory::tryProcessNativeGifImageUploadChain(GS &gs, uint32_t tadr, uint3
     m_ioRegisters[GIF_CHANNEL + 0x30u] = finalTadr;
     m_ioRegisters[GIF_CHANNEL + 0x40u] = 0u;
     m_ioRegisters[GIF_CHANNEL + 0x50u] = 0u;
-    m_ioRegisters[GIF_CHANNEL + 0x00u] = ((chcr & 0x0000FFFFu) | (lastTagUpper << 16u)) & ~0x100u;
+    m_ioRegisters[GIF_CHANNEL + 0x00u] =
+        ((chcr & 0x0000FFFFu) |
+         (lastTagUpper << 16u)) |
+        0x100u;
     m_ioRegisters[GIF_CHANNEL + 0x20u] = 0u;
-
-    uint32_t dstat = m_ioRegisters.count(D_STAT) ? m_ioRegisters[D_STAT] : 0u;
-    dstat |= (1u << 2u);
-    const uint32_t status = dstat & 0x3FFu;
-    const uint32_t mask = (dstat >> 16u) & 0x3FFu;
-    if ((status & mask) != 0u)
-        dstat |= (1u << 31u);
-    else
-        dstat &= ~(1u << 31u);
-    m_ioRegisters[D_STAT] = dstat;
-    queueCompletedDmacCause(2u);
+    (void)requestDmacCompletion(transfer);
     return true;
 }
 
 bool PS2Memory::tryProcessNativeGifPackedChain(GS &gs, uint32_t tadr, uint32_t chcr)
 {
     static constexpr uint32_t GIF_CHANNEL = 0x1000A000u;
-    static constexpr uint32_t D_STAT = 0x1000E010u;
     static constexpr uint32_t D_CTRL = 0x1000E000u;
 
     if (!m_rdram || !m_gsVRAM || m_path3Masked)
@@ -3711,6 +4063,8 @@ bool PS2Memory::tryProcessNativeGifPackedChain(GS &gs, uint32_t tadr, uint32_t c
     if (!gs.processNativePackedGIFPacket(payload, payloadBytes))
         return false;
 
+    const DmacTransferToken transfer =
+        beginDmacTransfer(DmacChannel::Gif);
     m_dmaStartCount.fetch_add(1, std::memory_order_relaxed);
     m_seenGifCopy = true;
     m_gifCopyCount.fetch_add(1, std::memory_order_relaxed);
@@ -3718,19 +4072,12 @@ bool PS2Memory::tryProcessNativeGifPackedChain(GS &gs, uint32_t tadr, uint32_t c
     m_ioRegisters[GIF_CHANNEL + 0x30u] = tadr;
     m_ioRegisters[GIF_CHANNEL + 0x40u] = 0u;
     m_ioRegisters[GIF_CHANNEL + 0x50u] = 0u;
-    m_ioRegisters[GIF_CHANNEL + 0x00u] = ((chcr & 0x0000FFFFu) | (tag.upper << 16u)) & ~0x100u;
+    m_ioRegisters[GIF_CHANNEL + 0x00u] =
+        ((chcr & 0x0000FFFFu) |
+         (tag.upper << 16u)) |
+        0x100u;
     m_ioRegisters[GIF_CHANNEL + 0x20u] = 0u;
-
-    uint32_t dstat = m_ioRegisters.count(D_STAT) ? m_ioRegisters[D_STAT] : 0u;
-    dstat |= (1u << 2u);
-    const uint32_t status = dstat & 0x3FFu;
-    const uint32_t mask = (dstat >> 16u) & 0x3FFu;
-    if ((status & mask) != 0u)
-        dstat |= (1u << 31u);
-    else
-        dstat &= ~(1u << 31u);
-    m_ioRegisters[D_STAT] = dstat;
-    queueCompletedDmacCause(2u);
+    (void)requestDmacCompletion(transfer);
     return true;
 }
 
@@ -3791,16 +4138,6 @@ uint32_t PS2Memory::readIORegister(uint32_t address)
                 }
                 auto timerIt = m_ioRegisters.find(address);
                 return timerIt != m_ioRegisters.end() ? timerIt->second : 0u;
-            }
-        }
-
-        if (address >= 0x10008000 && address < 0x1000F000)
-        {
-            if ((address & 0xFF) == 0x00)
-            {
-                uint32_t channelStatus = m_ioRegisters[address] & ~0x100u;
-                m_ioRegisters[address] = channelStatus;
-                return channelStatus;
             }
         }
 

@@ -26,6 +26,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <iterator>
 #include <limits>
 #include <chrono>
 #include <atomic>
@@ -874,6 +875,17 @@ PS2Runtime::PS2Runtime()
         }
     }
 
+    m_memory.setDmacCompletionReadyCallback(
+        [this]()
+        {
+            onDmacCompletionReady();
+        });
+    m_memory.setDmacInterruptStateCallback(
+        [this]()
+        {
+            onDmacInterruptStateChanged();
+        });
+
     m_iopHost = std::make_unique<PS2IopHostAdapter>(*this);
     m_iopSubsystem = std::make_unique<ps2x::iop::IopSubsystem>(*m_iopHost);
     m_vu0.setInstructionObserver(
@@ -1092,6 +1104,19 @@ void PS2Runtime::resetEeTimingUnlocked(
     m_eeSchedulerShadowDeadline = {};
     m_eeSchedulerShadowLegacyPending = false;
     m_eeSchedulerShadowPending = false;
+    m_dmacCompatibilityEventSequence = 0u;
+    m_guestExecutionPreemptionRequested.store(
+        false, std::memory_order_release);
+    if (m_eeSchedulingMode ==
+            ps2x::timing::EeSchedulingMode::Event &&
+        m_dmacCompletionReady.load(
+            std::memory_order_acquire))
+    {
+        (void)m_eeEventScheduler.scheduleAbsolute(
+            ps2x::timing::EeEventSource::
+                DmacCompletion,
+            currentEeTick());
+    }
 
     m_cpuContext.resetEeBlockTiming();
     if (m_boundEeContext && m_boundEeContext != &m_cpuContext)
@@ -1142,12 +1167,111 @@ void PS2Runtime::setEeSchedulingMode(
                 Vu0PeriodicCompatibility,
             m_vu0NextEventCycleTick);
     }
+    if (mode == ps2x::timing::EeSchedulingMode::Event &&
+        m_dmacCompletionReady.load(
+            std::memory_order_acquire))
+    {
+        (void)m_eeEventScheduler.scheduleAbsolute(
+            ps2x::timing::EeEventSource::
+                DmacCompletion,
+            currentEeTick());
+    }
 }
 
 ps2x::timing::EeSchedulingMode
 PS2Runtime::eeSchedulingMode() const noexcept
 {
     return m_eeSchedulingMode;
+}
+
+void PS2Runtime::onDmacCompletionReady()
+{
+    m_dmacCompletionReady.store(
+        true, std::memory_order_release);
+    if (m_eeSchedulingMode ==
+        ps2x::timing::EeSchedulingMode::Event)
+    {
+        (void)m_eeEventScheduler.scheduleAbsolute(
+            ps2x::timing::EeEventSource::
+                DmacCompletion,
+            currentEeTick());
+    }
+}
+
+void PS2Runtime::requestDmacCompletion(
+    DmacChannel channel)
+{
+    const DmacTransferToken transfer =
+        m_memory.beginDmacTransfer(channel);
+    (void)m_memory.requestDmacCompletion(transfer);
+}
+
+void PS2Runtime::collectPendingDmacInterrupts()
+{
+    std::vector<DmacPendingInterrupt> pending =
+        m_memory.consumePendingDmacInterrupts();
+    if (pending.empty())
+    {
+        return;
+    }
+    m_pendingDmacInterrupts.insert(
+        m_pendingDmacInterrupts.end(),
+        std::make_move_iterator(pending.begin()),
+        std::make_move_iterator(pending.end()));
+}
+
+void PS2Runtime::onDmacInterruptStateChanged()
+{
+    collectPendingDmacInterrupts();
+    for (const DmacPendingInterrupt &interrupt :
+         m_pendingDmacInterrupts)
+    {
+        if (m_memory.dmacInterruptStatusLatched(
+                interrupt.source) &&
+            m_memory.dmacInterruptUnmasked(
+                interrupt.source) &&
+            ps2_syscalls::isDmacCauseEnabled(
+                interrupt.cause))
+        {
+            requestGuestPreemption();
+            return;
+        }
+    }
+}
+
+size_t PS2Runtime::publishReadyDmacCompletions(
+    uint64_t eventSequence)
+{
+    const size_t published =
+        m_memory.publishReadyDmacCompletions(
+            eventSequence);
+    m_dmacCompletionReady.store(
+        m_memory.hasReadyDmacCompletions(),
+        std::memory_order_release);
+    collectPendingDmacInterrupts();
+
+    if (published != 0u)
+    {
+        onDmacInterruptStateChanged();
+    }
+    return published;
+}
+
+void PS2Runtime::publishCompatibilityDmacCompletions()
+{
+    if (!m_dmacCompletionReady.load(
+            std::memory_order_acquire))
+    {
+        return;
+    }
+
+    ++m_dmacCompatibilityEventSequence;
+    if (m_dmacCompatibilityEventSequence == 0u)
+    {
+        m_dmacCompatibilityEventSequence = 1u;
+    }
+    (void)publishReadyDmacCompletions(
+        m_dmacCompatibilityEventSequence);
 }
 
 ps2x::iop::DebugSnapshot PS2Runtime::iopDebugSnapshot() const
@@ -2178,6 +2302,11 @@ void PS2Runtime::serviceEeEventsAtBlockBoundary(
 
     const ps2x::timing::EeTick eeCycleTick =
         finishEeContextBlock(ctx);
+    if (m_eeSchedulingMode !=
+        ps2x::timing::EeSchedulingMode::Event)
+    {
+        publishCompatibilityDmacCompletions();
+    }
     switch (m_eeSchedulingMode)
     {
     case ps2x::timing::EeSchedulingMode::Legacy:
@@ -2338,6 +2467,19 @@ void PS2Runtime::dispatchEeEvent(
 {
     switch (service.source)
     {
+    case ps2x::timing::EeEventSource::
+        DmacCompletion:
+        (void)publishReadyDmacCompletions(
+            service.sequence);
+        if (m_dmacCompletionReady.load(
+                std::memory_order_acquire))
+        {
+            (void)m_eeEventScheduler.scheduleAbsolute(
+                ps2x::timing::EeEventSource::
+                    DmacCompletion,
+                service.serviceTick);
+        }
+        return;
     case ps2x::timing::EeEventSource::
         Vu0PeriodicCompatibility:
         if (!m_vu0.isActive())
@@ -2619,10 +2761,43 @@ void PS2Runtime::handleBreak(uint8_t *rdram, R5900Context *ctx)
 
 void PS2Runtime::drainCompletedDmacHandlers(uint8_t *rdram)
 {
-    for (uint32_t cause : m_memory.consumeCompletedDmacCauses())
+    // Older generated output and direct HLE test calls may reach the outer
+    // safe boundary without executing a generated event-test helper. Publish
+    // their current-tick completion here, but never invoke a handler from the
+    // device work call itself.
+    if (m_dmacCompletionReady.load(
+            std::memory_order_acquire))
     {
-        ps2_syscalls::dispatchDmacHandlersForCause(rdram, this, cause);
+        (void)m_eeEventScheduler.cancel(
+            ps2x::timing::EeEventSource::
+                DmacCompletion);
+        publishCompatibilityDmacCompletions();
     }
+    collectPendingDmacInterrupts();
+
+    std::vector<DmacPendingInterrupt> retained;
+    retained.reserve(m_pendingDmacInterrupts.size());
+    for (const DmacPendingInterrupt &interrupt :
+         m_pendingDmacInterrupts)
+    {
+        if (!m_memory.dmacInterruptStatusLatched(
+                interrupt.source))
+        {
+            // The guest acknowledged the level before handler delivery.
+            continue;
+        }
+        if (!m_memory.dmacInterruptUnmasked(
+                interrupt.source) ||
+            !ps2_syscalls::isDmacCauseEnabled(
+                interrupt.cause))
+        {
+            retained.push_back(interrupt);
+            continue;
+        }
+        ps2_syscalls::dispatchDmacHandlersForCause(
+            rdram, this, interrupt.cause);
+    }
+    m_pendingDmacInterrupts = std::move(retained);
 }
 
 void PS2Runtime::handleTrap(uint8_t *rdram, R5900Context *ctx)
@@ -3360,6 +3535,8 @@ void PS2Runtime::leaveGuestExecution(
     if (it->second == 1u)
     {
         drainCompletedDmacHandlers(m_memory.getRDRAM());
+        m_guestExecutionPreemptionRequested.store(
+            false, std::memory_order_release);
         it = g_guestExecutionDepths.find(this);
         if (it == g_guestExecutionDepths.end() || it->second == 0u)
         {
@@ -4492,8 +4669,22 @@ void PS2Runtime::yieldGuestExecutionAfterWake()
     }
 }
 
+void PS2Runtime::requestGuestPreemption()
+{
+    m_guestExecutionPreemptionRequested.store(
+        true, std::memory_order_release);
+    m_guestExecutionPreemptionEpoch.fetch_add(
+        1u, std::memory_order_release);
+}
+
 bool PS2Runtime::shouldPreemptGuestExecution()
 {
+    if (m_guestExecutionPreemptionRequested.exchange(
+            false, std::memory_order_acq_rel))
+    {
+        return true;
+    }
+
     thread_local uint32_t s_backEdgeYieldCounter = 0u;
     const uint32_t waiterCount = m_guestExecutionWaiters.load(std::memory_order_acquire);
     const uint32_t yieldInterval = (waiterCount != 0u) ? 64u : 100u;

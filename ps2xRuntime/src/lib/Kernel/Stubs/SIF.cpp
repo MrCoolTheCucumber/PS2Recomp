@@ -893,7 +893,11 @@ namespace ps2_stubs
             return;
         }
 
-        ps2_syscalls::dispatchDmacHandlersForCause(rdram, runtime, 5u);
+        if (runtime)
+        {
+            runtime->requestDmacCompletion(
+                DmacChannel::Sif0);
+        }
 
         setReturnS32(ctx, static_cast<int32_t>(allocateSifDmaTransferId()));
     }

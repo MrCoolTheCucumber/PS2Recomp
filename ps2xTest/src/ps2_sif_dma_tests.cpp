@@ -429,10 +429,24 @@ void register_ps2_sif_dma_tests()
 
             setRegU32(env.ctx, 4, kDescAddr);
             setRegU32(env.ctx, 5, 1u);
-            ps2_stubs::sceSifSetDma(env.rdram.data(), &env.ctx, &env.runtime);
+            {
+                PS2Runtime::GuestExecutionScope guestExecution(
+                    &env.runtime, &env.ctx);
+                ps2_stubs::sceSifSetDma(
+                    env.rdram.data(), &env.ctx, &env.runtime);
+                t.Equals(
+                    readGuestU32(
+                        env.rdram.data(),
+                        kHandlerWriteAddr),
+                    0u,
+                    "sceSifSetDma must not recursively enter its DMAC handler");
+            }
 
             t.IsTrue(getRegS32(env.ctx, 2) > 0, "sceSifSetDma should still report success");
-            t.Equals(readGuestU32(env.rdram.data(), kHandlerWriteAddr), g_dmacHandlerValue,
+            t.Equals(readGuestU32(
+                         env.runtime.memory().getRDRAM(),
+                         kHandlerWriteAddr),
+                     g_dmacHandlerValue,
                      "sceSifSetDma should invoke registered DMAC handlers");
             t.Equals(g_dmacHandlerLastCause, 5u, "DMAC handler should observe cause 5");
             t.Equals(g_dmacHandlerLastArg, kHandlerArg, "DMAC handler should receive registered argument");

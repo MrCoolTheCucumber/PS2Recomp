@@ -1,10 +1,13 @@
 #ifndef PS2_MEMORY_H
 #define PS2_MEMORY_H
 
+#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <exception>
 #include <functional>
+#include <optional>
+#include <utility>
 #include <vector>
 #include <unordered_map>
 #include <atomic>
@@ -295,6 +298,98 @@ struct DMARegisters
 };
 static_assert(sizeof(DMARegisters) == (7u * sizeof(uint32_t)), "DMARegisters layout changed unexpectedly");
 
+enum class DmacChannel : uint8_t
+{
+    Vif0 = 0u,
+    Vif1,
+    Gif,
+    FromIpu,
+    ToIpu,
+    Sif0,
+    Sif1,
+    Sif2,
+    FromScratchpad,
+    ToScratchpad,
+    Count,
+};
+
+inline constexpr size_t PS2_DMAC_CHANNEL_COUNT =
+    static_cast<size_t>(DmacChannel::Count);
+
+inline constexpr uint32_t dmacChannelCause(DmacChannel channel) noexcept
+{
+    return static_cast<uint32_t>(channel);
+}
+
+inline constexpr uint32_t dmacChannelBase(DmacChannel channel) noexcept
+{
+    constexpr std::array<uint32_t, PS2_DMAC_CHANNEL_COUNT> bases = {
+        0x10008000u,
+        0x10009000u,
+        0x1000A000u,
+        0x1000B000u,
+        0x1000B400u,
+        0x1000C000u,
+        0x1000C400u,
+        0x1000C800u,
+        0x1000D000u,
+        0x1000D400u,
+    };
+    const size_t index = static_cast<size_t>(channel);
+    return index < bases.size() ? bases[index] : 0u;
+}
+
+inline constexpr std::optional<DmacChannel>
+dmacChannelFromBase(uint32_t channelBase) noexcept
+{
+    for (size_t index = 0u; index < PS2_DMAC_CHANNEL_COUNT; ++index)
+    {
+        const DmacChannel channel = static_cast<DmacChannel>(index);
+        if (dmacChannelBase(channel) == channelBase)
+        {
+            return channel;
+        }
+    }
+    return std::nullopt;
+}
+
+enum class DmacChannelPhase : uint8_t
+{
+    Idle = 0u,
+    Active,
+    CompletionReady,
+};
+
+struct DmacTransferToken
+{
+    DmacChannel channel = DmacChannel::Vif0;
+    uint64_t generation = 0u;
+
+    friend constexpr bool operator==(
+        DmacTransferToken, DmacTransferToken) noexcept = default;
+};
+
+struct DmacCompletionRequest
+{
+    DmacTransferToken transfer{};
+    uint64_t readySequence = 0u;
+};
+
+struct DmacPendingInterrupt
+{
+    DmacChannel source = DmacChannel::Vif0;
+    uint32_t cause = 0u;
+    uint64_t channelGeneration = 0u;
+    uint64_t eventSequence = 0u;
+    uint64_t publicationSequence = 0u;
+};
+
+struct DmacChannelSnapshot
+{
+    DmacChannelPhase phase = DmacChannelPhase::Idle;
+    uint64_t generation = 0u;
+};
+
 struct JumpTable
 {
     uint32_t address = 0;          // Base address of the jump table
@@ -390,7 +485,39 @@ public:
     void processVIF1Data(uint32_t srcPhysAddr, uint32_t sizeBytes);
     void processVIF1Data(const uint8_t *data, uint32_t sizeBytes);
     void processPendingTransfers();
-    std::vector<uint32_t> consumeCompletedDmacCauses();
+
+    // DMAC work and completion publication intentionally have different
+    // owners. Device code begins/progresses/finishes a generation-tagged
+    // operation; only completion service mutates completion-visible channel
+    // state and publishes an interrupt.
+    DmacTransferToken beginDmacTransfer(DmacChannel channel);
+    bool progressDmacTransfer(DmacTransferToken transfer) const;
+    bool requestDmacCompletion(DmacTransferToken transfer);
+    bool cancelDmacTransfer(DmacChannel channel);
+    bool hasReadyDmacCompletions() const;
+    std::vector<DmacCompletionRequest> consumeReadyDmacCompletions();
+    bool publishDmacCompletion(
+        DmacCompletionRequest completion,
+        uint64_t eventSequence);
+    size_t publishReadyDmacCompletions(uint64_t eventSequence);
+    std::vector<DmacPendingInterrupt> consumePendingDmacInterrupts();
+    DmacChannelSnapshot dmacChannelSnapshot(DmacChannel channel) const;
+    bool dmacInterruptStatusLatched(DmacChannel channel) const;
+    bool dmacInterruptUnmasked(DmacChannel channel) const;
+    void setDmacInterruptMask(DmacChannel channel, bool enabled);
+
+    using DmacCompletionReadyCallback = std::function<void()>;
+    void setDmacCompletionReadyCallback(
+        DmacCompletionReadyCallback callback)
+    {
+        m_dmacCompletionReadyCallback = std::move(callback);
+    }
+    using DmacInterruptStateCallback = std::function<void()>;
+    void setDmacInterruptStateCallback(
+        DmacInterruptStateCallback callback)
+    {
+        m_dmacInterruptStateCallback = std::move(callback);
+    }
 
     int pollDmaRegisters();
 
@@ -461,6 +588,7 @@ public:
 
     struct PendingTransfer
     {
+        DmacTransferToken transfer{};
         bool fromScratchpad = false;
         uint32_t srcAddr = 0;
         uint32_t qwc = 0;
@@ -469,8 +597,21 @@ public:
     std::vector<PendingTransfer> m_pendingGifTransfers;
     std::vector<PendingTransfer> m_pendingVif0Transfers;
     std::vector<PendingTransfer> m_pendingVif1Transfers;
-    std::mutex m_completedDmacMutex;
-    std::vector<uint32_t> m_completedDmacCauses;
+
+    struct DmacChannelLifecycle
+    {
+        DmacChannelPhase phase = DmacChannelPhase::Idle;
+        uint64_t generation = 0u;
+    };
+    mutable std::mutex m_dmacMutex;
+    std::array<DmacChannelLifecycle, PS2_DMAC_CHANNEL_COUNT>
+        m_dmacChannels{};
+    std::vector<DmacCompletionRequest> m_readyDmacCompletions;
+    std::vector<DmacPendingInterrupt> m_pendingDmacInterrupts;
+    uint64_t m_dmacReadySequence = 0u;
+    uint64_t m_dmacPublicationSequence = 0u;
+    DmacCompletionReadyCallback m_dmacCompletionReadyCallback;
+    DmacInterruptStateCallback m_dmacInterruptStateCallback;
 
     struct CodeRegion
     {
@@ -498,8 +639,8 @@ public:
     const uint8_t *mapVuMemory(uint32_t physAddr, uint32_t size, uint32_t &offset, uint32_t &limit) const;
     void updateEeTimer0Counter();
     bool processScratchpadDma(uint32_t channelBase);
-    void completeDmaChannel(uint32_t channelBase, uint32_t cause);
-    void queueCompletedDmacCause(uint32_t cause);
+    void discardPendingDmacWork(DmacChannel channel);
+    static uint64_t nextDmacSequence(uint64_t value) noexcept;
     void beginVif1DmaTrace(uint32_t chcr,
                            uint32_t madr,
                            uint32_t qwc,

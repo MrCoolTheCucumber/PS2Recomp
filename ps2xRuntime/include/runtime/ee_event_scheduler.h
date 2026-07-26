@@ -38,7 +38,12 @@ namespace ps2x::timing
     // priority decision.
     enum class EeEventSource : uint8_t
     {
-        DmacVif1 = 0u,
+        // Compatibility-complete work is published before timed device
+        // callbacks. A timed callback that itself completes work can
+        // reschedule this source at the same tick for the scheduler's next
+        // priority pass.
+        DmacCompletion = 0u,
+        DmacVif1,
         VifVu1Finish,
         Vu0PeriodicCompatibility,
         Count,
@@ -58,6 +63,8 @@ namespace ps2x::timing
     {
         switch (source)
         {
+        case EeEventSource::DmacCompletion:
+            return "dmac_completion";
         case EeEventSource::Vu0PeriodicCompatibility:
             return "vu0_periodic_compatibility";
         case EeEventSource::DmacVif1:

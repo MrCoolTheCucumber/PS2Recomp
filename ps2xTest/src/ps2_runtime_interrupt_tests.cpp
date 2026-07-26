@@ -728,6 +728,204 @@ void register_ps2_runtime_interrupt_tests()
             cleanupRuntime(env);
         });
 
+        tc.Run("event service publishes DMAC state before safe handler delivery", [](TestCase &t)
+        {
+            notifyRuntimeStop();
+            TestEnv env;
+            t.IsTrue(
+                env.runtime.memory().initialize(),
+                "runtime memory initialize should succeed");
+            env.runtime.setEeSchedulingMode(
+                ps2x::timing::EeSchedulingMode::Event);
+
+            constexpr uint32_t kHandlerAddr = 0x00ABD200u;
+            constexpr uint32_t kVif1Ch = 0x10009000u;
+            constexpr uint32_t kDStat = 0x1000E010u;
+            uint8_t *rdram =
+                env.runtime.memory().getRDRAM();
+
+            g_dmacSendHits.store(0u, std::memory_order_relaxed);
+            g_dmacSendLastCause.store(0u, std::memory_order_relaxed);
+            g_dmacSendLastChcr.store(0u, std::memory_order_relaxed);
+            env.runtime.registerFunction(
+                kHandlerAddr, &testDmacSendHandler);
+
+            R5900Context addCtx{};
+            setRegU32(addCtx, 4, 1u);
+            setRegU32(addCtx, 5, kHandlerAddr);
+            ps2_syscalls::AddDmacHandler(
+                rdram, &addCtx, &env.runtime);
+
+            R5900Context enableCtx{};
+            setRegU32(enableCtx, 4, 1u);
+            ps2_syscalls::EnableDmac(
+                rdram, &enableCtx, &env.runtime);
+
+            env.runtime.debugStartEeEventTrace(4u);
+            R5900Context eventCtx{};
+            {
+                PS2Runtime::GuestExecutionScope guestExecution(
+                    &env.runtime, &eventCtx);
+                t.IsTrue(
+                    env.runtime.memory().writeIORegister(
+                        kVif1Ch + 0x20u, 3u),
+                    "VIF1 QWC setup should succeed");
+                const DmacTransferToken transfer =
+                    env.runtime.memory().beginDmacTransfer(
+                        DmacChannel::Vif1);
+                t.IsTrue(
+                    env.runtime.memory().requestDmacCompletion(
+                        transfer),
+                    "device work should request a completion event");
+
+                t.IsTrue(
+                    (env.runtime.memory().readIORegister(
+                         kVif1Ch + 0x00u) &
+                     0x100u) != 0u,
+                    "VIF1 should remain busy before event service");
+                t.IsTrue(
+                    (env.runtime.memory().readIORegister(
+                         kDStat) &
+                     (1u << 1u)) == 0u,
+                    "D_STAT should remain clear before event service");
+
+                env.runtime.serviceEeEventsAtBlockBoundary(
+                    rdram, &eventCtx);
+
+                t.IsTrue(
+                    (env.runtime.memory().readIORegister(
+                         kVif1Ch + 0x00u) &
+                     0x100u) == 0u,
+                    "event service should clear VIF1 busy state");
+                t.IsTrue(
+                    (env.runtime.memory().readIORegister(
+                         kDStat) &
+                     (1u << 1u)) != 0u,
+                    "event service should publish D_STAT");
+                t.Equals(
+                    g_dmacSendHits.load(
+                        std::memory_order_relaxed),
+                    0u,
+                    "event service must not recursively enter guest handlers");
+                t.IsTrue(
+                    env.runtime.guestPreemptionRequestedForTesting(),
+                    "an unmasked event should request cooperative preemption");
+            }
+
+            t.Equals(
+                g_dmacSendHits.load(std::memory_order_relaxed),
+                1u,
+                "the outer safe boundary should deliver the handler");
+            t.Equals(
+                g_dmacSendLastCause.load(
+                    std::memory_order_relaxed),
+                1u,
+                "the handler should receive the VIF1 cause");
+            {
+                PS2Runtime::GuestExecutionScope nextSafeBoundary(
+                    &env.runtime, &eventCtx);
+            }
+            t.Equals(
+                g_dmacSendHits.load(std::memory_order_relaxed),
+                1u,
+                "later safe boundaries must not redeliver the completion");
+
+            const PS2Runtime::DebugEeEventTrace trace =
+                env.runtime.debugEeEventTraceSnapshot(true);
+            t.Equals(
+                trace.entries.size(), static_cast<size_t>(1u),
+                "the completion should produce one scheduler trace entry");
+            if (!trace.entries.empty())
+            {
+                t.IsTrue(
+                    trace.entries[0].source ==
+                        ps2x::timing::EeEventSource::
+                            DmacCompletion,
+                    "the event trace should identify DMAC completion");
+            }
+            cleanupRuntime(env);
+        });
+
+        tc.Run("masked DMAC completion delivers after later enable", [](TestCase &t)
+        {
+            notifyRuntimeStop();
+            TestEnv env;
+            t.IsTrue(
+                env.runtime.memory().initialize(),
+                "runtime memory initialize should succeed");
+            env.runtime.setEeSchedulingMode(
+                ps2x::timing::EeSchedulingMode::Event);
+
+            constexpr uint32_t kHandlerAddr = 0x00ABD240u;
+            constexpr uint32_t kDStat = 0x1000E010u;
+            uint8_t *rdram =
+                env.runtime.memory().getRDRAM();
+
+            g_dmacSendHits.store(0u, std::memory_order_relaxed);
+            env.runtime.registerFunction(
+                kHandlerAddr, &testDmacSendHandler);
+
+            R5900Context addCtx{};
+            setRegU32(addCtx, 4, 1u);
+            setRegU32(addCtx, 5, kHandlerAddr);
+            ps2_syscalls::AddDmacHandler(
+                rdram, &addCtx, &env.runtime);
+
+            R5900Context disableCtx{};
+            setRegU32(disableCtx, 4, 1u);
+            ps2_syscalls::DisableDmac(
+                rdram, &disableCtx, &env.runtime);
+
+            R5900Context eventCtx{};
+            {
+                PS2Runtime::GuestExecutionScope guestExecution(
+                    &env.runtime, &eventCtx);
+                const DmacTransferToken transfer =
+                    env.runtime.memory().beginDmacTransfer(
+                        DmacChannel::Vif1);
+                t.IsTrue(
+                    env.runtime.memory().requestDmacCompletion(
+                        transfer),
+                    "masked VIF1 completion should queue");
+                env.runtime.serviceEeEventsAtBlockBoundary(
+                    rdram, &eventCtx);
+                t.IsFalse(
+                    env.runtime.guestPreemptionRequestedForTesting(),
+                    "a masked completion should not request preemption");
+            }
+
+            t.Equals(
+                g_dmacSendHits.load(std::memory_order_relaxed),
+                0u,
+                "masked completion should remain pending");
+            t.IsTrue(
+                (env.runtime.memory().readIORegister(kDStat) &
+                 (1u << 1u)) != 0u,
+                "masked completion should still latch D_STAT");
+
+            R5900Context enableCtx{};
+            setRegU32(enableCtx, 4, 1u);
+            {
+                PS2Runtime::GuestExecutionScope guestExecution(
+                    &env.runtime, &enableCtx);
+                ps2_syscalls::EnableDmac(
+                    rdram, &enableCtx, &env.runtime);
+                t.Equals(
+                    g_dmacSendHits.load(
+                        std::memory_order_relaxed),
+                    0u,
+                    "enable should not enter a handler recursively");
+                t.IsTrue(
+                    env.runtime.guestPreemptionRequestedForTesting(),
+                    "unmasking a latched cause should request preemption");
+            }
+            t.Equals(
+                g_dmacSendHits.load(std::memory_order_relaxed),
+                1u,
+                "the next safe boundary should deliver the unmasked cause");
+            cleanupRuntime(env);
+        });
+
         tc.Run("negative interrupt-safe EE syscall ids dispatch", [](TestCase &t)
         {
             notifyRuntimeStop();
