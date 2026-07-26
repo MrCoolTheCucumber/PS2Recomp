@@ -102,6 +102,11 @@ add_executable(vu1_replay
     src/vu1_replay.cpp
 )
 
+add_executable(ee_timing_benchmark
+    src/ee_timing_benchmark.cpp
+    $<TARGET_OBJECTS:ps2_test_function_table>
+)
+
 add_executable(gs_replay
     src/gs_replay.cpp
 )
@@ -135,6 +140,14 @@ target_link_libraries(vu1_replay PRIVATE
     ps2_runtime
 )
 
+target_include_directories(ee_timing_benchmark PRIVATE
+    ${CMAKE_SOURCE_DIR}/ps2xRuntime/include
+)
+
+target_link_libraries(ee_timing_benchmark PRIVATE
+    ps2_runtime
+)
+
 target_include_directories(gs_replay PRIVATE
     ${CMAKE_SOURCE_DIR}/ps2xRuntime/include
 )
@@ -152,4 +165,5 @@ include("${CMAKE_SOURCE_DIR}/ps2xRuntime/cmake/ReleaseMode.cmake")
 if(CMAKE_BUILD_TYPE STREQUAL "Release" OR CMAKE_BUILD_TYPE STREQUAL "RelWithDebInfo")
     EnableFastReleaseMode(ps2_test_lib)
     EnableFastReleaseMode(ps2x_tests)
+    EnableFastReleaseMode(ee_timing_benchmark)
 endif()
