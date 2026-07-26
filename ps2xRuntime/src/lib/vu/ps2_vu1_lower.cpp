@@ -468,16 +468,20 @@ void VU1Interpreter::execLower(uint32_t instr, uint8_t *vuData, uint32_t dataSiz
                 float num = m_state.vf[vfS][fsf];
                 float den = m_state.vf[vfT][ftf];
                 if (den != 0.0f)
-                    m_state.q = num / den;
+                    scheduleQ(num / den, 7u);
                 else
-                    m_state.q = (num >= 0.0f) ? std::numeric_limits<float>::max() : -std::numeric_limits<float>::max();
+                    scheduleQ(
+                        (num >= 0.0f)
+                            ? std::numeric_limits<float>::max()
+                            : -std::numeric_limits<float>::max(),
+                        7u);
                 return;
             }
             case 0x39: // SQRT
             {
                 int ftf = (instr >> 23) & 0x3;
                 float val = m_state.vf[vfT][ftf];
-                m_state.q = std::sqrt(std::fabs(val));
+                scheduleQ(std::sqrt(std::fabs(val)), 7u);
                 return;
             }
             case 0x3A: // RSQRT
@@ -487,9 +491,10 @@ void VU1Interpreter::execLower(uint32_t instr, uint8_t *vuData, uint32_t dataSiz
                 float num = m_state.vf[vfS][fsf];
                 float den = std::sqrt(std::fabs(m_state.vf[vfT][ftf]));
                 if (den != 0.0f)
-                    m_state.q = num / den;
+                    scheduleQ(num / den, 13u);
                 else
-                    m_state.q = std::numeric_limits<float>::max();
+                    scheduleQ(
+                        std::numeric_limits<float>::max(), 13u);
                 return;
             }
             case 0x3B: // WAITQ

@@ -1652,7 +1652,7 @@ void register_code_generator_tests()
                      "VCLIP must not use host IEEE floating-point comparisons");
         });
 
-        tc.Run("VU0 S2 VI memory ops use rd as VI base register", [](TestCase &t) {
+        tc.Run("VU0 S2 vector loads use rd as VI base register", [](TestCase &t) {
             Instruction inst{};
             inst.opcode = OPCODE_COP2;
             inst.rs = COP2_CO | 0x4; // format + destination mask bits
@@ -1671,6 +1671,64 @@ void register_code_generator_tests()
             t.IsTrue(out.find("ctx->vi[14]") != std::string::npos, "S2 VLQI base VI should come from rd");
             t.IsTrue(out.find("ctx->vu0_vf[6]") != std::string::npos, "S2 VLQI destination VF should come from rt");
             t.IsTrue(out.find("ctx->vi[20]") == std::string::npos, "S2 VLQI must not use rs(format) as VI index");
+            t.IsTrue(out.find("PS2_VU0_DATA_BASE") != std::string::npos,
+                     "S2 VLQI should access VU0 data memory rather than low EE RDRAM");
+            t.IsTrue(out.find("PS2_VU0_DATA_SIZE - 1u") != std::string::npos,
+                     "S2 VLQI should wrap addresses to the 4 KiB VU0 data memory");
+            t.IsTrue(out.find("& 0x3FF") == std::string::npos,
+                     "S2 VLQI should retain the architectural 16-bit VI value after increment");
+        });
+
+        tc.Run("VU0 S2 vector stores use rt as VI base and rd as VF source", [](TestCase &t) {
+            Instruction inst{};
+            inst.opcode = OPCODE_COP2;
+            inst.rs = COP2_CO | 0x4; // format + destination mask bits
+            inst.rt = 6;
+            inst.rd = 14;
+            inst.function = 0x3C; // force Special2 path
+            inst.vectorInfo.vectorField = 0xF;
+
+            CodeGenerator gen({}, {});
+
+            uint32_t upper = (VU0_S2_VSQI >> 2) & 0x1F;
+            uint32_t lower = VU0_S2_VSQI & 0x3;
+            inst.raw = (upper << 6) | lower;
+            const std::string sqi = gen.translateInstruction(inst);
+
+            t.IsTrue(sqi.find("ctx->vi[6]") != std::string::npos,
+                     "S2 VSQI base VI should come from rt");
+            t.IsTrue(sqi.find("ctx->vu0_vf[14]") != std::string::npos,
+                     "S2 VSQI source VF should come from rd");
+            t.IsTrue(sqi.find("ctx->vi[14]") == std::string::npos,
+                     "S2 VSQI must not use the VF source as a VI index");
+            t.IsTrue(sqi.find("ctx->vu0_vf[6]") == std::string::npos,
+                     "S2 VSQI must not use the VI base as a VF source");
+            t.IsTrue(sqi.find("PS2_VU0_DATA_BASE") != std::string::npos,
+                     "S2 VSQI should access VU0 data memory rather than low EE RDRAM");
+            t.IsTrue(sqi.find("PS2_VU0_DATA_SIZE - 1u") != std::string::npos,
+                     "S2 VSQI should wrap addresses to the 4 KiB VU0 data memory");
+            t.IsTrue(sqi.find("& 0x3FF") == std::string::npos,
+                     "S2 VSQI should retain the architectural 16-bit VI value after increment");
+
+            upper = (VU0_S2_VSQD >> 2) & 0x1F;
+            lower = VU0_S2_VSQD & 0x3;
+            inst.raw = (upper << 6) | lower;
+            const std::string sqd = gen.translateInstruction(inst);
+
+            t.IsTrue(sqd.find("ctx->vi[6]") != std::string::npos,
+                     "S2 VSQD base VI should come from rt");
+            t.IsTrue(sqd.find("ctx->vu0_vf[14]") != std::string::npos,
+                     "S2 VSQD source VF should come from rd");
+            t.IsTrue(sqd.find("ctx->vi[14]") == std::string::npos,
+                     "S2 VSQD must not use the VF source as a VI index");
+            t.IsTrue(sqd.find("ctx->vu0_vf[6]") == std::string::npos,
+                     "S2 VSQD must not use the VI base as a VF source");
+            t.IsTrue(sqd.find("PS2_VU0_DATA_BASE") != std::string::npos,
+                     "S2 VSQD should access VU0 data memory rather than low EE RDRAM");
+            t.IsTrue(sqd.find("PS2_VU0_DATA_SIZE - 1u") != std::string::npos,
+                     "S2 VSQD should wrap addresses to the 4 KiB VU0 data memory");
+            t.IsTrue(sqd.find("& 0x3FF") == std::string::npos,
+                     "S2 VSQD should retain the architectural 16-bit VI value after decrement");
         });
 
         tc.Run("JAL to known function emits call and check", [](TestCase &t) {

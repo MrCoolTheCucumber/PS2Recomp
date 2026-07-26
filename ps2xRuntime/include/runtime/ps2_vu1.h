@@ -3,6 +3,7 @@
 
 #include <atomic>
 #include <cstdint>
+#include <functional>
 #include <vector>
 
 class GS;
@@ -45,6 +46,10 @@ struct VU1ProgressSnapshot
 class VU1Interpreter
 {
 public:
+    using InstructionObserver = std::function<void(
+        uint64_t index, uint32_t pc, uint32_t lower, uint32_t upper,
+        const VU1State &state)>;
+
     VU1Interpreter();
 
     void reset();
@@ -60,10 +65,18 @@ public:
                 GS &gs, PS2Memory *memory = nullptr,
                 uint32_t top = 0, uint32_t itop = 0, uint32_t maxCycles = 65536);
 
+    void continueExecution(uint8_t *vuCode, uint32_t codeSize,
+                           uint8_t *vuData, uint32_t dataSize,
+                           GS &gs, PS2Memory *memory = nullptr,
+                           uint32_t maxCycles = 65536);
+
     VU1State &state() { return m_state; }
     const VU1State &state() const { return m_state; }
+    bool isActive() const { return m_active; }
     VU1ProgressSnapshot getProgressSnapshot() const;
     void setProgressTrackingEnabled(bool enabled);
+    void setInstructionObserver(InstructionObserver observer);
+    void setInstructionObserverEnabled(bool enabled);
 
 private:
     struct DecodedInstructionPair
@@ -88,6 +101,23 @@ private:
     };
 
     XgkickState m_xgkick;
+    struct QPipelineState
+    {
+        bool active = false;
+        float result = 0.0f;
+        uint32_t cyclesRemaining = 0;
+    };
+
+    QPipelineState m_qPipeline;
+    struct FmacFlagPipelineState
+    {
+        uint32_t mac = 0;
+        uint32_t status = 0;
+        uint32_t cyclesRemaining = 0;
+    };
+
+    std::vector<FmacFlagPipelineState> m_fmacFlagPipeline;
+    uint32_t m_workingMac = 0;
     std::vector<DecodedInstructionPair> m_decodedCodeCache;
     const uint8_t *m_cachedVuCode = nullptr;
     const PS2Memory *m_cachedMemory = nullptr;
@@ -99,6 +129,9 @@ private:
     std::atomic<uint64_t> m_progressInvocations{0};
     std::atomic<uint64_t> m_progressCycles{0};
     std::atomic<uint32_t> m_progressPc{0};
+    InstructionObserver m_instructionObserver;
+    std::atomic<bool> m_instructionObserverEnabled{false};
+    bool m_active = false;
 
     void run(uint8_t *vuCode, uint32_t codeSize,
              uint8_t *vuData, uint32_t dataSize,
@@ -117,6 +150,13 @@ private:
     void advanceXgkick(uint8_t *vuData, uint32_t dataSize,
                        GS &gs, PS2Memory *memory, uint32_t cycles, bool flush);
     void cancelXgkick();
+    void advanceQPipeline();
+    void flushQPipeline();
+    void scheduleQ(float result, uint32_t latency);
+    void advanceFmacFlagPipeline();
+    void flushFmacFlagPipeline();
+    void scheduleFmacFlags(const float result[4], uint8_t dest,
+                           bool preserveUnselected);
     void backupVi(uint8_t reg);
     int32_t readViForBranch(uint8_t reg) const;
 

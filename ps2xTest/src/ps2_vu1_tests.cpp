@@ -13,7 +13,7 @@
 
 namespace
 {
-    constexpr uint32_t kVuUpperNop = 0u;
+    constexpr uint32_t kVuUpperNop = 0x000002FFu;
     constexpr uint32_t kVuUpperEnd = 1u << 30u;
 
     struct Vu1Fixture
@@ -154,6 +154,11 @@ namespace
         return makeVuLowerSpecial(0x39u, 0u, ft, 0u, static_cast<uint8_t>((ftf & 0x3u) << 2));
     }
 
+    uint32_t makeVuWaitQ()
+    {
+        return makeVuLowerSpecial(0x3Bu, 0u);
+    }
+
     void writeVuInstructionPair(uint8_t *code, uint32_t pc, uint32_t lower, uint32_t upper)
     {
         std::memcpy(code + pc, &lower, sizeof(lower));
@@ -234,6 +239,54 @@ void register_ps2_vu1_tests()
             t.Equals(vu1.state().vf[3][1], -2.0f, "ADD.xz should preserve y");
             t.Equals(vu1.state().vf[3][2], 33.0f, "ADD.xz should write z");
             t.Equals(vu1.state().vf[3][3], -4.0f, "ADD.xz should preserve w");
+        });
+
+        tc.Run("FMAC flags become architectural after four following instruction pairs", [](TestCase &t)
+        {
+            Vu1Fixture fx;
+            t.IsTrue(fx.initialize(), "VU1 fixture should initialize");
+
+            writeVuInstructionPair(
+                fx.code, 0u, 0u,
+                makeVuUpper(0x28u, 0xFu, 2u, 1u, 3u)); // ADD.xyzw vf3, vf1, vf2
+            for (uint32_t pc = 8u; pc <= 32u; pc += 8u)
+                writeVuInstructionPair(fx.code, pc, 0u, kVuUpperNop);
+
+            VU1Interpreter vu1;
+            vu1.state().mac = 0x004Au;
+            vu1.state().status = 0x0043u;
+            const float source[4] = {1.0f, -2.0f, 3.0f, 4.0f};
+            std::memcpy(vu1.state().vf[1], source, sizeof(source));
+
+            vu1.execute(
+                fx.code, PS2_VU1_CODE_SIZE,
+                fx.data, PS2_VU1_DATA_SIZE,
+                fx.gs, &fx.mem, 0u, 0u, 0u, 1u);
+            t.Equals(vu1.state().mac, 0x004Au,
+                     "issued ADD should leave the architectural MAC flags pending");
+            t.Equals(vu1.state().status, 0x0043u,
+                     "issued ADD should leave the architectural STATUS flags pending");
+
+            for (uint32_t pair = 1u; pair < 4u; ++pair)
+            {
+                vu1.continueExecution(
+                    fx.code, PS2_VU1_CODE_SIZE,
+                    fx.data, PS2_VU1_DATA_SIZE,
+                    fx.gs, &fx.mem, 1u);
+                t.Equals(vu1.state().mac, 0x004Au,
+                         "FMAC flags should remain pending before four cycles elapse");
+                t.Equals(vu1.state().status, 0x0043u,
+                         "STATUS flags should remain pending before four cycles elapse");
+            }
+
+            vu1.continueExecution(
+                fx.code, PS2_VU1_CODE_SIZE,
+                fx.data, PS2_VU1_DATA_SIZE,
+                fx.gs, &fx.mem, 1u);
+            t.Equals(vu1.state().mac, 0x0040u,
+                     "negative y should set only the y sign MAC flag");
+            t.Equals(vu1.state().status, 0x00C2u,
+                     "STATUS should expose sign and retain prior sticky zero/sign flags");
         });
 
         tc.Run("VU FMAC truncates toward zero and restores the host rounding mode", [](TestCase &t)
@@ -574,24 +627,61 @@ void register_ps2_vu1_tests()
             t.Equals(vu1.state().vf[1][3], 440.0f, "upper ADD should write w after lower read");
         });
 
-        tc.Run("DIV and SQRT update the Q register from selected vector components", [](TestCase &t)
+        tc.Run("FDIV pipeline delays Q and WAITQ synchronizes its paired upper op", [](TestCase &t)
         {
             Vu1Fixture fx;
             t.IsTrue(fx.initialize(), "VU1 fixture should initialize");
 
             writeVuInstructionPair(fx.code, 0u, makeVuDiv(1u, 2u, 1u, 2u), kVuUpperNop);  // Q = vf1.y / vf2.z
-            writeVuInstructionPair(fx.code, 8u, makeVuSqrt(3u, 3u), kVuUpperNop);         // Q = sqrt(abs(vf3.w))
+            writeVuInstructionPair(fx.code, 8u, 0u, makeVuUpper(0x1Cu, 0x8u, 0u, 5u, 4u)); // vf4.x = vf5.x * old Q
+            writeVuInstructionPair(fx.code, 16u, makeVuWaitQ(), makeVuUpper(0x1Cu, 0x8u, 0u, 5u, 6u)); // vf6.x = vf5.x * DIV Q
+            writeVuInstructionPair(fx.code, 24u, makeVuSqrt(3u, 3u), kVuUpperNop);         // Q = sqrt(abs(vf3.w))
+            writeVuInstructionPair(fx.code, 32u, makeVuWaitQ(), makeVuUpper(0x1Cu, 0x8u, 0u, 5u, 7u)); // vf7.x = vf5.x * SQRT Q
 
             VU1Interpreter vu1;
+            vu1.state().q = 2.0f;
             vu1.state().vf[1][1] = 18.0f;
             vu1.state().vf[2][2] = 3.0f;
             vu1.state().vf[3][3] = 25.0f;
+            vu1.state().vf[5][0] = 2.0f;
 
             vu1.execute(fx.code, PS2_VU1_CODE_SIZE, fx.data, PS2_VU1_DATA_SIZE, fx.gs, &fx.mem, 0u, 0u, 0u, 1u);
-            t.Equals(vu1.state().q, 6.0f, "DIV should divide selected FS and FT components into Q");
+            t.Equals(vu1.state().q, 2.0f, "DIV should leave the old Q visible while its result is pending");
 
             vu1.resume(fx.code, PS2_VU1_CODE_SIZE, fx.data, PS2_VU1_DATA_SIZE, fx.gs, &fx.mem, 0u, 0u, 1u);
-            t.Equals(vu1.state().q, 5.0f, "SQRT should write square root of selected FT component into Q");
+            t.Equals(vu1.state().vf[4][0], 4.0f, "unsynchronized MULq should use the old Q");
+
+            vu1.resume(fx.code, PS2_VU1_CODE_SIZE, fx.data, PS2_VU1_DATA_SIZE, fx.gs, &fx.mem, 0u, 0u, 1u);
+            t.Equals(vu1.state().q, 6.0f, "WAITQ should commit the pending DIV result");
+            t.Equals(vu1.state().vf[6][0], 12.0f, "the upper op paired with WAITQ should use the committed DIV result");
+
+            vu1.resume(fx.code, PS2_VU1_CODE_SIZE, fx.data, PS2_VU1_DATA_SIZE, fx.gs, &fx.mem, 0u, 0u, 1u);
+            t.Equals(vu1.state().q, 6.0f, "SQRT should also leave Q pending");
+
+            vu1.resume(fx.code, PS2_VU1_CODE_SIZE, fx.data, PS2_VU1_DATA_SIZE, fx.gs, &fx.mem, 0u, 0u, 1u);
+            t.Equals(vu1.state().q, 5.0f, "WAITQ should commit the pending SQRT result");
+            t.Equals(vu1.state().vf[7][0], 10.0f, "the upper op paired with WAITQ should use the committed SQRT result");
+        });
+
+        tc.Run("DIV result becomes visible after seven following instruction pairs", [](TestCase &t)
+        {
+            Vu1Fixture fx;
+            t.IsTrue(fx.initialize(), "VU1 fixture should initialize");
+
+            writeVuInstructionPair(fx.code, 0u, makeVuDiv(1u, 2u, 0u, 0u), kVuUpperNop);
+            for (uint32_t pc = 8u; pc <= 56u; pc += 8u)
+                writeVuInstructionPair(fx.code, pc, 0u, kVuUpperNop);
+
+            VU1Interpreter vu1;
+            vu1.state().q = 3.0f;
+            vu1.state().vf[1][0] = 18.0f;
+            vu1.state().vf[2][0] = 3.0f;
+
+            vu1.execute(fx.code, PS2_VU1_CODE_SIZE, fx.data, PS2_VU1_DATA_SIZE, fx.gs, &fx.mem, 0u, 0u, 0u, 7u);
+            t.Equals(vu1.state().q, 3.0f, "Q should remain old through the first six pairs after DIV");
+
+            vu1.resume(fx.code, PS2_VU1_CODE_SIZE, fx.data, PS2_VU1_DATA_SIZE, fx.gs, &fx.mem, 0u, 0u, 1u);
+            t.Equals(vu1.state().q, 6.0f, "Q should commit on the seventh pair after DIV");
         });
 
         tc.Run("MPG upload invalidates cached VU1 decode before MSCAL", [](TestCase &t)

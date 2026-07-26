@@ -9,8 +9,10 @@
 #include <fstream>
 #include <iomanip>
 #include <iostream>
+#include <sstream>
 #include <string>
 #include <string_view>
+#include <utility>
 #include <vector>
 
 namespace
@@ -20,6 +22,21 @@ namespace
         std::filesystem::path data;
         std::filesystem::path micro;
         std::filesystem::path state;
+    };
+
+    enum class ScheduledWriteKind
+    {
+        Vi,
+        Vf,
+    };
+
+    struct ScheduledRegisterWrite
+    {
+        uint64_t instructionIndex = 0;
+        ScheduledWriteKind kind = ScheduledWriteKind::Vi;
+        uint8_t registerIndex = 0;
+        uint8_t lane = 0;
+        uint32_t value = 0;
     };
 
     bool readFile(const std::string &path, void *destination, size_t size)
@@ -34,6 +51,23 @@ namespace
         uint32_t bits = 0;
         std::memcpy(&bits, &value, sizeof(bits));
         return bits;
+    }
+
+    bool parseUnsigned(const std::string &text, uint64_t &value)
+    {
+        if (text.empty() || text.front() == '-')
+            return false;
+
+        size_t consumed = 0u;
+        try
+        {
+            value = std::stoull(text, &consumed, 0);
+        }
+        catch (const std::exception &)
+        {
+            return false;
+        }
+        return consumed == text.size();
     }
 
     bool resolveFixture(const std::filesystem::path &directory,
@@ -84,14 +118,116 @@ namespace
         paths = std::move(candidates.front());
         return true;
     }
+
+    bool readRegisterWriteSchedule(
+        const std::filesystem::path &path,
+        std::vector<ScheduledRegisterWrite> &writes)
+    {
+        std::ifstream input(path);
+        if (!input)
+            return false;
+
+        std::string line;
+        uint64_t previousIndex = 0;
+        bool havePreviousIndex = false;
+        while (std::getline(input, line))
+        {
+            const size_t comment = line.find('#');
+            if (comment != std::string::npos)
+                line.resize(comment);
+
+            std::istringstream fields(line);
+            std::vector<std::string> tokens;
+            for (std::string token; fields >> token;)
+                tokens.push_back(std::move(token));
+            if (tokens.empty())
+                continue;
+
+            uint64_t instructionIndex = 0u;
+            if (!parseUnsigned(tokens[0], instructionIndex))
+                return false;
+            ScheduledRegisterWrite write;
+            write.instructionIndex = instructionIndex;
+
+            // Preserve the original "INDEX REGISTER VALUE" VI-only format.
+            if (tokens.size() == 3u)
+            {
+                uint64_t registerIndex = 0u;
+                uint64_t value = 0u;
+                if (!parseUnsigned(tokens[1], registerIndex) ||
+                    !parseUnsigned(tokens[2], value) ||
+                    registerIndex >= 16u || value > UINT32_MAX)
+                {
+                    return false;
+                }
+                write.kind = ScheduledWriteKind::Vi;
+                write.registerIndex = static_cast<uint8_t>(
+                    registerIndex);
+                write.value = static_cast<uint32_t>(value);
+            }
+            else if (tokens.size() == 4u && tokens[1] == "vi")
+            {
+                uint64_t registerIndex = 0u;
+                uint64_t value = 0u;
+                if (!parseUnsigned(tokens[2], registerIndex) ||
+                    !parseUnsigned(tokens[3], value) ||
+                    registerIndex >= 16u || value > UINT32_MAX)
+                {
+                    return false;
+                }
+                write.kind = ScheduledWriteKind::Vi;
+                write.registerIndex = static_cast<uint8_t>(
+                    registerIndex);
+                write.value = static_cast<uint32_t>(value);
+            }
+            else if (tokens.size() == 5u && tokens[1] == "vf")
+            {
+                uint64_t registerIndex = 0u;
+                uint64_t lane = 0u;
+                uint64_t value = 0u;
+                if (!parseUnsigned(tokens[2], registerIndex) ||
+                    !parseUnsigned(tokens[3], lane) ||
+                    !parseUnsigned(tokens[4], value) ||
+                    registerIndex >= 32u || lane >= 4u ||
+                    value > UINT32_MAX)
+                {
+                    return false;
+                }
+                write.kind = ScheduledWriteKind::Vf;
+                write.registerIndex = static_cast<uint8_t>(
+                    registerIndex);
+                write.lane = static_cast<uint8_t>(lane);
+                write.value = static_cast<uint32_t>(value);
+            }
+            else
+            {
+                return false;
+            }
+
+            if (havePreviousIndex && instructionIndex < previousIndex)
+            {
+                return false;
+            }
+
+            writes.push_back(write);
+            previousIndex = instructionIndex;
+            havePreviousIndex = true;
+        }
+
+        return true;
+    }
 }
 
 int main(int argc, char **argv)
 {
-    if (argc < 3 || argc > 5)
+    if (argc < 3 || argc > 7)
     {
         std::cerr << "usage: vu1_replay FIXTURE_DIRECTORY INSTRUCTION_PAIRS "
-                     "[GIF_OUTPUT] [FINAL_VU_DATA]\n";
+                     "[GIF_OUTPUT] [FINAL_VU_DATA] [INSTRUCTION_TRACE] "
+                     "[REGISTER_WRITE_SCHEDULE]\n"
+                     "schedule lines: INDEX REGISTER VALUE (legacy VI), "
+                     "INDEX vi REGISTER VALUE, or "
+                     "INDEX vf REGISTER LANE VALUE\n";
         return 2;
     }
 
@@ -109,8 +245,23 @@ int main(int argc, char **argv)
     std::array<uint8_t, PS2_VU1_DATA_SIZE> initialData{};
     std::array<uint8_t, PS2_VU1_CODE_SIZE> micro{};
     std::array<uint32_t, 159> stateWords{};
-    if (!readFile(fixture.data.string(), initialData.data(), initialData.size()) ||
-        !readFile(fixture.micro.string(), micro.data(), micro.size()) ||
+    std::error_code sizeError;
+    const uintmax_t dataFileSize =
+        std::filesystem::file_size(fixture.data, sizeError);
+    const uintmax_t microFileSize =
+        sizeError ? 0u : std::filesystem::file_size(fixture.micro, sizeError);
+    if (sizeError ||
+        dataFileSize != microFileSize ||
+        (dataFileSize != PS2_VU0_DATA_SIZE &&
+         dataFileSize != PS2_VU1_DATA_SIZE))
+    {
+        std::cerr
+            << "VU data and micro files must have matching VU0 or VU1 sizes\n";
+        return 2;
+    }
+    const uint32_t vuSize = static_cast<uint32_t>(dataFileSize);
+    if (!readFile(fixture.data.string(), initialData.data(), vuSize) ||
+        !readFile(fixture.micro.string(), micro.data(), vuSize) ||
         !readFile(fixture.state.string(), stateWords.data(), stateWords.size() * sizeof(uint32_t)))
     {
         std::cerr << "failed to read replay fixture\n";
@@ -135,8 +286,8 @@ int main(int argc, char **argv)
     {
         gifOutput.insert(gifOutput.end(), data, data + size);
     });
-    std::memcpy(memory.getVU1Code(), micro.data(), micro.size());
-    std::memcpy(memory.getVU1Data(), initialData.data(), initialData.size());
+    std::memcpy(memory.getVU1Code(), micro.data(), vuSize);
+    std::memcpy(memory.getVU1Data(), initialData.data(), vuSize);
 
     VU1Interpreter interpreter;
     VU1State &state = interpreter.state();
@@ -154,10 +305,144 @@ int main(int argc, char **argv)
     state.mac = stateWords[cursor++];
     state.clip = stateWords[cursor++];
 
-    interpreter.execute(memory.getVU1Code(), PS2_VU1_CODE_SIZE,
-                        memory.getVU1Data(), PS2_VU1_DATA_SIZE,
-                        gs, &memory, stateWords[2], stateWords[3], stateWords[4],
-                        maxCycles);
+    std::vector<ScheduledRegisterWrite> scheduledWrites;
+    if (argc == 7 &&
+        !readRegisterWriteSchedule(argv[6], scheduledWrites))
+    {
+        std::cerr << "failed to read register write schedule\n";
+        return 2;
+    }
+
+    std::ofstream instructionTrace;
+    uint64_t observedInstructionIndex = 0;
+    if (argc >= 6)
+    {
+        instructionTrace.open(argv[5]);
+        if (!instructionTrace)
+        {
+            std::cerr << "failed to open instruction trace output\n";
+            return 2;
+        }
+        instructionTrace << std::hex << std::setfill('0');
+        interpreter.setInstructionObserver(
+            [&](uint64_t index, uint32_t pc, uint32_t lower, uint32_t upper,
+                const VU1State &stepState)
+            {
+                (void)index;
+                const uint64_t traceIndex = observedInstructionIndex++;
+                instructionTrace
+                    << "{\"schema_version\":1,\"event\":\"vu-step\","
+                    << "\"index\":" << std::dec << traceIndex << std::hex
+                    << ",\"pc\":\"0x" << std::setw(4) << (pc & 0x3fffu)
+                    << "\",\"lower\":\"0x" << std::setw(8) << lower
+                    << "\",\"upper\":\"0x" << std::setw(8) << upper
+                    << "\",\"vi\":[";
+                for (size_t registerIndex = 0; registerIndex < 16;
+                     ++registerIndex)
+                {
+                    instructionTrace
+                        << (registerIndex == 0 ? "" : ",")
+                        << "\"0x" << std::setw(4)
+                        << (static_cast<uint32_t>(
+                                stepState.vi[registerIndex]) &
+                            0xffffu)
+                        << "\"";
+                }
+                instructionTrace << "],\"vf\":[";
+                for (size_t componentIndex = 0;
+                     componentIndex < 32u * 4u; ++componentIndex)
+                {
+                    instructionTrace
+                        << (componentIndex == 0 ? "" : ",")
+                        << "\"0x" << std::setw(8)
+                        << floatBits((&stepState.vf[0][0])[componentIndex])
+                        << "\"";
+                }
+                instructionTrace << "],\"acc\":[";
+                for (size_t componentIndex = 0; componentIndex < 4u;
+                     ++componentIndex)
+                {
+                    instructionTrace
+                        << (componentIndex == 0 ? "" : ",")
+                        << "\"0x" << std::setw(8)
+                        << floatBits(stepState.acc[componentIndex])
+                        << "\"";
+                }
+                instructionTrace
+                    << "],\"q\":\"0x" << std::setw(8)
+                    << floatBits(stepState.q)
+                    << "\",\"p\":\"0x" << std::setw(8)
+                    << floatBits(stepState.p)
+                    << "\",\"i\":\"0x" << std::setw(8)
+                    << floatBits(stepState.i)
+                    << "\",\"status\":\"0x" << std::setw(8)
+                    << stepState.status
+                    << "\",\"mac\":\"0x" << std::setw(8)
+                    << stepState.mac
+                    << "\",\"clip\":\"0x" << std::setw(8)
+                    << stepState.clip
+                    << "\",\"branch_pending\":"
+                    << (stepState.branchPending ? "true" : "false")
+                    << ",\"branch_target\":\"0x" << std::setw(4)
+                    << (stepState.branchTarget & 0x3fffu)
+                    << "\",\"branch_delay\":" << std::dec
+                    << stepState.branchDelay
+                    << ",\"vi_backup_cycles\":"
+                    << static_cast<uint32_t>(stepState.viBackupCycles)
+                    << ",\"vi_backup_register\":"
+                    << static_cast<uint32_t>(stepState.viBackupRegister)
+                    << ",\"vi_backup_value\":\"0x" << std::hex
+                    << std::setw(4)
+                    << (static_cast<uint32_t>(stepState.viBackupValue) &
+                        0xffffu)
+                    << "\"}\n";
+            });
+    }
+
+    if (scheduledWrites.empty())
+    {
+        interpreter.execute(
+            memory.getVU1Code(), vuSize,
+            memory.getVU1Data(), vuSize,
+            gs, &memory, stateWords[2], stateWords[3], stateWords[4],
+            maxCycles);
+    }
+    else
+    {
+        interpreter.execute(
+            memory.getVU1Code(), vuSize,
+            memory.getVU1Data(), vuSize,
+            gs, &memory, stateWords[2], stateWords[3], stateWords[4], 0u);
+
+        size_t nextWrite = 0u;
+        for (uint64_t instructionIndex = 0u;
+             instructionIndex < maxCycles && interpreter.isActive();
+             ++instructionIndex)
+        {
+            while (nextWrite < scheduledWrites.size() &&
+                   scheduledWrites[nextWrite].instructionIndex ==
+                       instructionIndex)
+            {
+                const ScheduledRegisterWrite &write =
+                    scheduledWrites[nextWrite++];
+                if (write.kind == ScheduledWriteKind::Vi)
+                {
+                    state.vi[write.registerIndex] =
+                        static_cast<int32_t>(write.value);
+                }
+                else
+                {
+                    std::memcpy(
+                        &state.vf[write.registerIndex][write.lane],
+                        &write.value, sizeof(write.value));
+                }
+            }
+            interpreter.continueExecution(
+                memory.getVU1Code(), vuSize,
+                memory.getVU1Data(), vuSize,
+                gs, &memory, 1u);
+        }
+    }
 
     if (argc >= 4)
     {
@@ -165,11 +450,11 @@ int main(int argc, char **argv)
         output.write(reinterpret_cast<const char *>(gifOutput.data()),
                      static_cast<std::streamsize>(gifOutput.size()));
     }
-    if (argc == 5)
+    if (argc >= 5)
     {
         std::ofstream output(argv[4], std::ios::binary);
         output.write(reinterpret_cast<const char *>(memory.getVU1Data()),
-                     static_cast<std::streamsize>(PS2_VU1_DATA_SIZE));
+                     static_cast<std::streamsize>(vuSize));
     }
 
     std::cout << std::hex << std::setfill('0');
