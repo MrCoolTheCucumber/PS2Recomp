@@ -3205,6 +3205,8 @@ void PS2Runtime::scheduleToIpuDmaEvent(
             ps2x::timing::EeEventSource::
                 DmacToIpu,
             deadline);
+    m_memory.setToIpuDmaEventPending(
+        m_toIpuDmaEventToken.generation != 0u);
 }
 
 void PS2Runtime::cancelToIpuDmaEvent() noexcept
@@ -3217,6 +3219,7 @@ void PS2Runtime::cancelToIpuDmaEvent() noexcept
     m_toIpuDmaEventToken = {
         ps2x::timing::EeEventSource::DmacToIpu,
         0u};
+    m_memory.setToIpuDmaEventPending(false);
 }
 
 void PS2Runtime::serviceToIpuDmaAtEvent(
@@ -3232,6 +3235,7 @@ void PS2Runtime::serviceToIpuDmaAtEvent(
     m_toIpuDmaEventToken = {
         ps2x::timing::EeEventSource::DmacToIpu,
         0u};
+    m_memory.setToIpuDmaEventPending(false);
     const ToIpuDmaAdvanceResult advance =
         m_memory.advanceToIpuDma();
     if (!advance.active || advance.completed)
@@ -5527,9 +5531,11 @@ PS2Runtime::debugEeEventDeviceState(
             static_cast<uint32_t>(state.phase);
         result.stall =
             static_cast<uint32_t>(state.stall);
+        result.tadr = state.tadr;
         result.madr = state.madr;
         result.qwc = state.qwc;
-        result.tagsProcessed = state.fifoQwc;
+        result.tagsProcessed =
+            state.tagsProcessed;
         result.active = state.active;
         return result;
     }

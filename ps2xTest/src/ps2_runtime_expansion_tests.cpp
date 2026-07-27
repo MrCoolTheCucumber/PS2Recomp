@@ -7676,6 +7676,850 @@ void register_ps2_runtime_expansion_tests()
                 kToIpu, 0u);
         });
 
+        tc.Run("event To-IPU source chain reproduces tag yields and reset wake", [](TestCase &t)
+        {
+            PS2Runtime runtime;
+            t.IsTrue(
+                runtime.memory().initialize(),
+                "To-IPU chain fixture memory should initialize");
+            t.IsTrue(
+                runtime.syncCoreSubsystems(),
+                "To-IPU chain fixture subsystems should bind");
+            runtime.setEeSchedulingMode(
+                ps2x::timing::EeSchedulingMode::Event);
+
+            constexpr uint32_t kToIpu =
+                0x1000B400u;
+            constexpr uint32_t kIpuCtrl =
+                0x10002010u;
+            constexpr uint32_t kDstat =
+                0x1000E010u;
+            constexpr uint32_t kEndChain =
+                0x00036000u;
+            constexpr uint32_t kMultiChain =
+                0x00036100u;
+            constexpr uint32_t kReferencePayload =
+                0x00036200u;
+            uint8_t *const rdram =
+                runtime.memory().getRDRAM();
+            const auto storeWord =
+                [rdram](uint32_t address,
+                        uint32_t value)
+                {
+                    std::memcpy(
+                        rdram + address,
+                        &value,
+                        sizeof(value));
+                };
+
+            storeWord(kEndChain, 0x70000004u);
+            std::memset(
+                rdram + kEndChain + 16u,
+                0x11, 4u * 16u);
+
+            runtime.debugStartEeEventTrace(12u);
+            (void)runtime.memory().writeIORegister(
+                kIpuCtrl, 1u << 30u);
+            (void)runtime.memory().writeIORegister(
+                kToIpu + 0x30u, kEndChain);
+            (void)runtime.memory().writeIORegister(
+                kToIpu + 0x20u, 0u);
+            (void)runtime.memory().writeIORegister(
+                kToIpu, 0x104u);
+
+            ToIpuDmaSnapshot dma =
+                runtime.memory().toIpuDmaSnapshot();
+            t.IsTrue(
+                dma.active && dma.eventManaged &&
+                    dma.chainMode &&
+                    !dma.normalMode &&
+                    dma.phase ==
+                        ToIpuDmaPhase::Finalize,
+                "END/QWC4 should retain chain finalization");
+            t.Equals(
+                dma.tagsProcessed, 1u,
+                "END should consume one DMA tag");
+            t.Equals(
+                static_cast<uint32_t>(dma.tagId),
+                7u,
+                "END should remain the visible tag ID");
+            t.Equals(
+                dma.fifoQwc, 4u,
+                "END/QWC4 should enqueue four input QW");
+            t.Equals(
+                dma.madr,
+                kEndChain + 5u * 16u,
+                "END should expose the address after its inline payload");
+            t.Equals(
+                dma.tadr, kEndChain,
+                "END should retain TADR on the terminal tag");
+            t.Equals(
+                runtime.memory().readIORegister(
+                    kToIpu),
+                0x70000104u,
+                "END should publish tag bits, mode, and STR");
+
+            PS2Runtime::DebugEeScheduler scheduler =
+                runtime.debugEeSchedulerSnapshot();
+            auto slot =
+                scheduler.slots[ps2x::timing::
+                    eeEventSourceIndex(
+                        ps2x::timing::EeEventSource::
+                            DmacToIpu)];
+            t.IsTrue(
+                slot.pending,
+                "END should retain a finalization deadline");
+            t.Equals(
+                slot.deadlineTick, 80ull,
+                "END/QWC4 plus one tag should cost ten EE cycles");
+            t.Equals(
+                slot.device.tadr, kEndChain,
+                "debug state should expose To-IPU TADR");
+            t.Equals(
+                slot.device.tagsProcessed, 1u,
+                "debug state should expose consumed tags");
+
+            R5900Context &context = runtime.cpu();
+            context.advanceEeCycleTicks(80u);
+            runtime.serviceEeEventsAtBlockBoundary(
+                rdram, &context);
+            t.IsFalse(
+                runtime.memory()
+                    .toIpuDmaSnapshot()
+                    .active,
+                "END finalization should retire the channel");
+            t.Equals(
+                runtime.memory().readIORegister(
+                    kToIpu),
+                0x70000004u,
+                "completion should clear only END STR");
+            t.IsTrue(
+                (runtime.memory().readIORegister(
+                     kDstat) &
+                 (1u << 4u)) != 0u,
+                "END completion should publish To-IPU D_STAT");
+
+            (void)runtime.memory().writeIORegister(
+                kDstat, 1u << 4u);
+            (void)runtime.memory().writeIORegister(
+                kIpuCtrl, 1u << 30u);
+
+            storeWord(
+                kMultiChain + 0u,
+                0x10000000u);
+            storeWord(
+                kMultiChain + 16u,
+                0x30000002u);
+            storeWord(
+                kMultiChain + 20u,
+                kReferencePayload);
+            storeWord(
+                kMultiChain + 32u,
+                0x70000003u);
+            std::memset(
+                rdram + kMultiChain + 48u,
+                0x33, 3u * 16u);
+            std::memset(
+                rdram + kReferencePayload,
+                0x22, 2u * 16u);
+
+            (void)runtime.memory().writeIORegister(
+                kToIpu + 0x30u, kMultiChain);
+            (void)runtime.memory().writeIORegister(
+                kToIpu + 0x20u, 0u);
+            (void)runtime.memory().writeIORegister(
+                kToIpu, 0x104u);
+
+            dma =
+                runtime.memory().toIpuDmaSnapshot();
+            t.IsTrue(
+                dma.active && dma.eventManaged &&
+                    dma.phase ==
+                        ToIpuDmaPhase::FetchTag,
+                "CNT/QWC0 should retain a tag rescan");
+            t.Equals(
+                dma.tagsProcessed, 1u,
+                "the initial transition should read only CNT");
+            t.Equals(
+                dma.tadr, kMultiChain + 16u,
+                "CNT/QWC0 should advance TADR to the next tag");
+            t.Equals(
+                dma.madr, kMultiChain + 16u,
+                "CNT/QWC0 should publish its inline data address");
+            scheduler =
+                runtime.debugEeSchedulerSnapshot();
+            slot =
+                scheduler.slots[ps2x::timing::
+                    eeEventSourceIndex(
+                        ps2x::timing::EeEventSource::
+                            DmacToIpu)];
+            t.Equals(
+                slot.deadlineTick, 160ull,
+                "CNT/QWC0 should schedule a ten-cycle rescan");
+
+            context.advanceEeCycleTicks(80u);
+            runtime.serviceEeEventsAtBlockBoundary(
+                rdram, &context);
+            dma =
+                runtime.memory().toIpuDmaSnapshot();
+            t.IsTrue(
+                dma.active && !dma.eventManaged &&
+                    dma.phase ==
+                        ToIpuDmaPhase::FetchTag &&
+                    dma.stall ==
+                        ToIpuDmaStallReason::
+                            WaitingForInputRequest,
+                "REF/QWC2 should become dormant after its nonterminal payload");
+            t.Equals(
+                dma.tagsProcessed, 2u,
+                "the rescan should consume REF");
+            t.Equals(
+                static_cast<uint32_t>(dma.tagId),
+                3u,
+                "REF should remain the visible tag ID");
+            t.Equals(
+                dma.fifoQwc, 2u,
+                "REF/QWC2 should enqueue two input QW");
+            t.Equals(
+                dma.madr,
+                kReferencePayload + 2u * 16u,
+                "REF should expose referenced-payload progress");
+            t.Equals(
+                dma.tadr, kMultiChain + 32u,
+                "REF should advance TADR to END");
+            t.Equals(
+                runtime.memory().readIORegister(
+                    kToIpu),
+                0x30000104u,
+                "dormant REF should retain tag bits and STR");
+            scheduler =
+                runtime.debugEeSchedulerSnapshot();
+            slot =
+                scheduler.slots[ps2x::timing::
+                    eeEventSourceIndex(
+                        ps2x::timing::EeEventSource::
+                            DmacToIpu)];
+            t.IsFalse(
+                slot.pending,
+                "a nonterminal positive payload should have no deadline");
+
+            (void)runtime.memory().writeIORegister(
+                kIpuCtrl, 1u << 30u);
+            dma =
+                runtime.memory().toIpuDmaSnapshot();
+            t.IsTrue(
+                dma.active && dma.eventManaged &&
+                    dma.stall ==
+                        ToIpuDmaStallReason::None,
+                "IPU reset should wake dormant chain progress");
+            t.Equals(
+                dma.fifoQwc, 0u,
+                "chain reset wake should begin with an empty FIFO");
+            scheduler =
+                runtime.debugEeSchedulerSnapshot();
+            slot =
+                scheduler.slots[ps2x::timing::
+                    eeEventSourceIndex(
+                        ps2x::timing::EeEventSource::
+                            DmacToIpu)];
+            t.Equals(
+                slot.deadlineTick, 192ull,
+                "chain reset wake should cost four EE cycles");
+
+            context.advanceEeCycleTicks(32u);
+            runtime.serviceEeEventsAtBlockBoundary(
+                rdram, &context);
+            dma =
+                runtime.memory().toIpuDmaSnapshot();
+            t.IsTrue(
+                dma.active && dma.eventManaged &&
+                    dma.phase ==
+                        ToIpuDmaPhase::Finalize,
+                "END/QWC3 wake should retain finalization");
+            t.Equals(
+                dma.tagsProcessed, 3u,
+                "the wake should consume END");
+            t.Equals(
+                dma.fifoQwc, 3u,
+                "END/QWC3 should enqueue three input QW");
+            t.Equals(
+                dma.madr,
+                kMultiChain + 6u * 16u,
+                "END should expose its completed inline payload");
+            t.Equals(
+                dma.tadr, kMultiChain + 32u,
+                "terminal END should retain its tag address");
+            scheduler =
+                runtime.debugEeSchedulerSnapshot();
+            slot =
+                scheduler.slots[ps2x::timing::
+                    eeEventSourceIndex(
+                        ps2x::timing::EeEventSource::
+                            DmacToIpu)];
+            t.Equals(
+                slot.deadlineTick, 272ull,
+                "END/QWC3 plus one tag should cost ten EE cycles");
+
+            context.advanceEeCycleTicks(80u);
+            runtime.serviceEeEventsAtBlockBoundary(
+                rdram, &context);
+            t.IsFalse(
+                runtime.memory()
+                    .toIpuDmaSnapshot()
+                    .active,
+                "the multi-tag chain should retire");
+            t.Equals(
+                runtime.memory().readIORegister(
+                    kToIpu),
+                0x70000004u,
+                "multi-tag completion should preserve END and mode");
+            t.IsTrue(
+                (runtime.memory().readIORegister(
+                     kDstat) &
+                 (1u << 4u)) != 0u,
+                "multi-tag completion should publish D_STAT");
+
+            const PS2Runtime::DebugEeEventTrace trace =
+                runtime.debugEeEventTraceSnapshot(true);
+            t.Equals(
+                trace.entries.size(),
+                static_cast<size_t>(6u),
+                "the chain oracle should expose four channel services and two publications");
+            if (trace.entries.size() == 6u)
+            {
+                const std::array<
+                    ps2x::timing::EeEventSource, 6u>
+                    expectedSources = {
+                        ps2x::timing::EeEventSource::
+                            DmacToIpu,
+                        ps2x::timing::EeEventSource::
+                            DmacCompletion,
+                        ps2x::timing::EeEventSource::
+                            DmacToIpu,
+                        ps2x::timing::EeEventSource::
+                            DmacToIpu,
+                        ps2x::timing::EeEventSource::
+                            DmacToIpu,
+                        ps2x::timing::EeEventSource::
+                            DmacCompletion,
+                    };
+                const std::array<uint64_t, 6u>
+                    expectedTicks = {
+                        80ull, 80ull, 160ull,
+                        192ull, 272ull, 272ull};
+                for (size_t index = 0u;
+                     index < trace.entries.size();
+                     ++index)
+                {
+                    t.IsTrue(
+                        trace.entries[index].source ==
+                            expectedSources[index],
+                        "chain services should retain source order");
+                    t.Equals(
+                        trace.entries[index].serviceTick,
+                        expectedTicks[index],
+                        "chain services should retain exact ticks");
+                }
+            }
+        });
+
+        tc.Run("To-IPU source-chain tags retain IPU-specific address rules", [](TestCase &t)
+        {
+            PS2Runtime runtime;
+            t.IsTrue(
+                runtime.memory().initialize(),
+                "To-IPU tag fixture memory should initialize");
+            t.IsTrue(
+                runtime.syncCoreSubsystems(),
+                "To-IPU tag fixture subsystems should bind");
+            runtime.setEeSchedulingMode(
+                ps2x::timing::EeSchedulingMode::Event);
+
+            constexpr uint32_t kToIpu =
+                0x1000B400u;
+            constexpr uint32_t kIpuCtrl =
+                0x10002010u;
+            constexpr uint32_t kTagBase =
+                0x00036400u;
+            constexpr uint32_t kPayloadBase =
+                0x00036800u;
+            uint8_t *const rdram =
+                runtime.memory().getRDRAM();
+            const auto storeWord =
+                [rdram](uint32_t address,
+                        uint32_t value)
+                {
+                    std::memcpy(
+                        rdram + address,
+                        &value,
+                        sizeof(value));
+                };
+
+            struct TagCase
+            {
+                uint8_t id;
+                bool terminal;
+            };
+            constexpr std::array<TagCase, 8u>
+                cases = {{
+                    {0u, true},  // REFE
+                    {1u, false}, // CNT
+                    {2u, false}, // NEXT
+                    {3u, false}, // REF
+                    {4u, false}, // REFS
+                    {5u, true},  // CALL
+                    {6u, true},  // RET
+                    {7u, true},  // END
+                }};
+
+            for (const TagCase &tagCase : cases)
+            {
+                const uint32_t tagAddress =
+                    kTagBase +
+                    static_cast<uint32_t>(
+                        tagCase.id) *
+                        0x40u;
+                const uint32_t payloadAddress =
+                    kPayloadBase +
+                    static_cast<uint32_t>(
+                        tagCase.id) *
+                        0x20u;
+                storeWord(
+                    tagAddress,
+                    (static_cast<uint32_t>(
+                         tagCase.id)
+                     << 28u) |
+                        1u);
+                storeWord(
+                    tagAddress + 4u,
+                    payloadAddress);
+                std::memset(
+                    rdram + tagAddress + 16u,
+                    0x40 + tagCase.id, 16u);
+                std::memset(
+                    rdram + payloadAddress,
+                    0x60 + tagCase.id, 16u);
+
+                (void)runtime.memory()
+                    .writeIORegister(
+                        kIpuCtrl, 1u << 30u);
+                (void)runtime.memory()
+                    .writeIORegister(
+                        kToIpu + 0x30u,
+                        tagAddress);
+                (void)runtime.memory()
+                    .writeIORegister(
+                        kToIpu + 0x20u, 0u);
+                (void)runtime.memory()
+                    .writeIORegister(
+                        kToIpu, 0x104u);
+
+                const ToIpuDmaSnapshot dma =
+                    runtime.memory()
+                        .toIpuDmaSnapshot();
+                t.IsTrue(
+                    dma.active && dma.chainMode &&
+                        dma.tagsProcessed == 1u &&
+                        dma.tagId == tagCase.id,
+                    "each source-chain ID should consume exactly one tag");
+                t.Equals(
+                    dma.fifoQwc, 1u,
+                    "each one-QW tag should enqueue only its payload");
+                t.Equals(
+                    dma.qwc, 0u,
+                    "each one-QW tag should consume its payload");
+                t.IsTrue(
+                    dma.phase ==
+                        (tagCase.terminal
+                             ? ToIpuDmaPhase::
+                                   Finalize
+                             : ToIpuDmaPhase::
+                                   FetchTag),
+                    "IPU tag IDs should retain their terminal classification");
+                t.IsTrue(
+                    dma.endAfterPayload ==
+                        tagCase.terminal,
+                    "IPU tag terminal state should remain observable");
+                t.IsTrue(
+                    dma.eventManaged ==
+                        tagCase.terminal,
+                    "only a terminal positive payload should retain a deadline");
+                t.IsTrue(
+                    dma.stall ==
+                        (tagCase.terminal
+                             ? ToIpuDmaStallReason::
+                                   None
+                             : ToIpuDmaStallReason::
+                                   WaitingForInputRequest),
+                    "nonterminal positive payloads should sleep for another IPU request");
+
+                uint32_t expectedTadr =
+                    tagAddress;
+                uint32_t expectedMadr =
+                    payloadAddress + 16u;
+                switch (tagCase.id)
+                {
+                case 0u: // REFE
+                case 3u: // REF
+                case 4u: // REFS
+                    expectedTadr =
+                        tagAddress + 16u;
+                    break;
+                case 1u: // CNT
+                    expectedTadr =
+                        tagAddress + 32u;
+                    expectedMadr =
+                        tagAddress + 32u;
+                    break;
+                case 2u: // NEXT
+                    expectedTadr =
+                        payloadAddress;
+                    expectedMadr =
+                        tagAddress + 32u;
+                    break;
+                case 5u: // CALL
+                case 6u: // RET
+                    // IPU chains terminate instead of applying the
+                    // source-chain address stack.
+                    break;
+                case 7u: // END
+                    expectedMadr =
+                        tagAddress + 32u;
+                    break;
+                default:
+                    break;
+                }
+                t.Equals(
+                    dma.tadr, expectedTadr,
+                    "the tag should publish its IPU-specific TADR transition");
+                t.Equals(
+                    dma.madr, expectedMadr,
+                    "the tag should publish its IPU-specific MADR transition");
+
+                const PS2Runtime::DebugEeScheduler
+                    scheduler =
+                        runtime
+                            .debugEeSchedulerSnapshot();
+                const auto slot =
+                    scheduler.slots[ps2x::timing::
+                        eeEventSourceIndex(
+                            ps2x::timing::
+                                EeEventSource::
+                                    DmacToIpu)];
+                t.IsTrue(
+                    slot.pending ==
+                        tagCase.terminal,
+                    "terminal tag classification should own scheduler visibility");
+                if (tagCase.terminal)
+                {
+                    t.Equals(
+                        slot.deadlineTick, 80ull,
+                        "one tag and one QW should use the ten-cycle minimum");
+                }
+                (void)runtime.memory()
+                    .writeIORegister(kToIpu, 0u);
+            }
+
+            // dmaGetAddr() honors the source-chain SPR bit for both the tag
+            // fetch and a referenced payload. Preserve the flag in published
+            // addresses instead of normalizing it to an RDRAM offset.
+            constexpr uint32_t kScratchTagOffset =
+                0x00000400u;
+            constexpr uint32_t kScratchTag =
+                0x80000000u | kScratchTagOffset;
+            uint8_t *const scratchpad =
+                runtime.memory().getScratchpad();
+            const auto storeScratchWord =
+                [scratchpad](uint32_t offset,
+                             uint32_t value)
+                {
+                    std::memcpy(
+                        scratchpad + offset,
+                        &value,
+                        sizeof(value));
+                };
+            storeScratchWord(
+                kScratchTagOffset, 0x70000001u);
+            std::memset(
+                scratchpad + kScratchTagOffset + 16u,
+                0x83, 16u);
+            (void)runtime.memory().writeIORegister(
+                kIpuCtrl, 1u << 30u);
+            (void)runtime.memory().writeIORegister(
+                kToIpu + 0x30u, kScratchTag);
+            (void)runtime.memory().writeIORegister(
+                kToIpu + 0x20u, 0u);
+            (void)runtime.memory().writeIORegister(
+                kToIpu, 0x104u);
+            ToIpuDmaSnapshot dma =
+                runtime.memory().toIpuDmaSnapshot();
+            t.IsTrue(
+                dma.active && dma.eventManaged &&
+                    dma.phase ==
+                        ToIpuDmaPhase::Finalize &&
+                    dma.tagsProcessed == 1u,
+                "a scratchpad-resident END tag should transfer normally");
+            t.Equals(
+                dma.tadr, kScratchTag,
+                "a terminal scratchpad tag should retain its flagged TADR");
+            t.Equals(
+                dma.madr, kScratchTag + 32u,
+                "an inline scratchpad payload should preserve flagged MADR progress");
+            t.Equals(
+                dma.fifoQwc, 1u,
+                "a scratchpad tag should enqueue its inline payload");
+            (void)runtime.memory().writeIORegister(
+                kToIpu, 0u);
+
+            constexpr uint32_t
+                kScratchReferenceOffset = 0x00000300u;
+            constexpr uint32_t
+                kScratchReference =
+                    0x80000000u |
+                    kScratchReferenceOffset;
+            constexpr uint32_t kScratchReferenceTag =
+                0x00036600u;
+            storeWord(
+                kScratchReferenceTag,
+                0x00000001u);
+            storeWord(
+                kScratchReferenceTag + 4u,
+                kScratchReference);
+            std::memset(
+                scratchpad + kScratchReferenceOffset,
+                0xa7, 16u);
+            (void)runtime.memory().writeIORegister(
+                kIpuCtrl, 1u << 30u);
+            (void)runtime.memory().writeIORegister(
+                kToIpu + 0x30u,
+                kScratchReferenceTag);
+            (void)runtime.memory().writeIORegister(
+                kToIpu + 0x20u, 0u);
+            (void)runtime.memory().writeIORegister(
+                kToIpu, 0x104u);
+            dma =
+                runtime.memory().toIpuDmaSnapshot();
+            t.IsTrue(
+                dma.active && dma.eventManaged &&
+                    dma.phase ==
+                        ToIpuDmaPhase::Finalize,
+                "a REFE tag should accept a flagged scratchpad payload");
+            t.Equals(
+                dma.tadr,
+                kScratchReferenceTag + 16u,
+                "REFE should advance its RDRAM TADR independently");
+            t.Equals(
+                dma.madr,
+                kScratchReference + 16u,
+                "the scratchpad payload should preserve flagged MADR progress");
+            t.Equals(
+                dma.fifoQwc, 1u,
+                "the referenced scratchpad QW should enter the input FIFO");
+            (void)runtime.memory().writeIORegister(
+                kToIpu, 0u);
+
+            // Physical DMAC reads above exposed RDRAM and below the MMIO
+            // window use the zero-read page. A zero tag is REFE/QWC0 and
+            // therefore reaches a delayed terminal boundary without a bus
+            // fault.
+            constexpr uint32_t kZeroReadTag =
+                0x03000000u;
+            (void)runtime.memory().writeIORegister(
+                kIpuCtrl, 1u << 30u);
+            (void)runtime.memory().writeIORegister(
+                kToIpu + 0x30u, kZeroReadTag);
+            (void)runtime.memory().writeIORegister(
+                kToIpu + 0x20u, 0u);
+            (void)runtime.memory().writeIORegister(
+                kToIpu, 0x104u);
+            dma =
+                runtime.memory().toIpuDmaSnapshot();
+            t.IsTrue(
+                dma.active && dma.eventManaged &&
+                    dma.phase ==
+                        ToIpuDmaPhase::Finalize &&
+                    dma.tagsProcessed == 1u &&
+                    dma.tagId == 0u,
+                "an unpopulated physical tag should decode from the DMAC zero-read page");
+            t.Equals(
+                dma.tadr, kZeroReadTag + 16u,
+                "zero-read REFE should advance TADR");
+            t.Equals(
+                dma.madr, 0u,
+                "the zero-read tag should publish its zero address field");
+            t.Equals(
+                dma.fifoQwc, 0u,
+                "zero-read REFE/QWC0 should not enqueue payload");
+            (void)runtime.memory().writeIORegister(
+                kToIpu, 0u);
+
+            // TTE is ignored by the physical IPU channel. TIE plus IRQ makes
+            // an otherwise nonterminal REF payload terminal.
+            constexpr uint32_t kIrqTag =
+                0x00036700u;
+            constexpr uint32_t kIrqPayload =
+                0x00036A00u;
+            storeWord(kIrqTag, 0xB0000001u);
+            storeWord(kIrqTag + 4u, kIrqPayload);
+            std::memset(
+                rdram + kIrqPayload, 0x9a, 16u);
+            (void)runtime.memory().writeIORegister(
+                kIpuCtrl, 1u << 30u);
+            (void)runtime.memory().writeIORegister(
+                kToIpu + 0x30u, kIrqTag);
+            (void)runtime.memory().writeIORegister(
+                kToIpu + 0x20u, 0u);
+            (void)runtime.memory().writeIORegister(
+                kToIpu,
+                0x104u | (1u << 6u) |
+                    (1u << 7u));
+            dma =
+                runtime.memory().toIpuDmaSnapshot();
+            t.IsTrue(
+                dma.tagIrq && dma.endAfterPayload &&
+                    dma.phase ==
+                        ToIpuDmaPhase::Finalize,
+                "TIE plus an IRQ REF should become terminal");
+            t.Equals(
+                dma.fifoQwc, 1u,
+                "TTE should not enqueue the DMA tag itself");
+            t.Equals(
+                runtime.memory().readIORegister(
+                    kToIpu),
+                0xB00001C4u,
+                "IRQ tag bits and TTE/TIE should remain visible");
+            (void)runtime.memory().writeIORegister(
+                kToIpu, 0u);
+
+            // A nonzero chain QWC resumes the tag already latched in CHCR and
+            // does not fetch or charge another tag.
+            constexpr uint32_t kResumePayload =
+                0x00036B00u;
+            constexpr uint32_t kResumeTadr =
+                0x00036C00u;
+            std::memset(
+                rdram + kResumePayload,
+                0xbc, 2u * 16u);
+            (void)runtime.memory().writeIORegister(
+                kIpuCtrl, 1u << 30u);
+            (void)runtime.memory().writeIORegister(
+                kToIpu + 0x10u,
+                kResumePayload);
+            (void)runtime.memory().writeIORegister(
+                kToIpu + 0x20u, 2u);
+            (void)runtime.memory().writeIORegister(
+                kToIpu + 0x30u, kResumeTadr);
+            (void)runtime.memory().writeIORegister(
+                kToIpu, 0x70000104u);
+            dma =
+                runtime.memory().toIpuDmaSnapshot();
+            t.IsTrue(
+                dma.active && dma.eventManaged &&
+                    dma.phase ==
+                        ToIpuDmaPhase::Finalize &&
+                    dma.endAfterPayload,
+                "a resumed END payload should retain finalization");
+            t.Equals(
+                dma.tagsProcessed, 0u,
+                "resumed payload must not fetch another tag");
+            t.Equals(
+                dma.tadr, kResumeTadr,
+                "resumed END should retain the latched TADR");
+            t.Equals(
+                dma.madr,
+                kResumePayload + 2u * 16u,
+                "resumed END should advance only its payload MADR");
+            const PS2Runtime::DebugEeScheduler
+                scheduler =
+                    runtime.debugEeSchedulerSnapshot();
+            const auto slot =
+                scheduler.slots[ps2x::timing::
+                    eeEventSourceIndex(
+                        ps2x::timing::
+                            EeEventSource::
+                                DmacToIpu)];
+            t.Equals(
+                slot.deadlineTick, 64ull,
+                "resumed payload should omit the tag-cycle charge");
+            (void)runtime.memory().writeIORegister(
+                kToIpu, 0u);
+
+            // A full FIFO withdraws the data request before a new chain may
+            // expose its tag. Reset re-arms the untouched descriptor.
+            constexpr uint32_t kIpuInFifo =
+                0x10007010u;
+            constexpr uint32_t kBlockedTag =
+                0x00036D00u;
+            storeWord(kBlockedTag, 0x70000001u);
+            std::memset(
+                rdram + kBlockedTag + 16u,
+                0xdd, 16u);
+            (void)runtime.memory().writeIORegister(
+                kIpuCtrl, 1u << 30u);
+            for (uint32_t index = 0u;
+                 index < 8u; ++index)
+            {
+                runtime.memory().write128(
+                    kIpuInFifo,
+                    _mm_set1_epi32(
+                        static_cast<int>(index)));
+            }
+            (void)runtime.memory().writeIORegister(
+                kToIpu + 0x30u, kBlockedTag);
+            (void)runtime.memory().writeIORegister(
+                kToIpu + 0x20u, 0u);
+            (void)runtime.memory().writeIORegister(
+                kToIpu, 0x104u);
+            dma =
+                runtime.memory().toIpuDmaSnapshot();
+            t.IsTrue(
+                dma.active && !dma.eventManaged &&
+                    dma.phase ==
+                        ToIpuDmaPhase::FetchTag &&
+                    dma.stall ==
+                        ToIpuDmaStallReason::
+                            InputFifoFull,
+                "a full FIFO should block chain tag visibility");
+            t.Equals(
+                dma.tagsProcessed, 0u,
+                "a full FIFO must not consume the blocked tag");
+            PS2Runtime::DebugEeScheduler
+                blockedScheduler =
+                    runtime.debugEeSchedulerSnapshot();
+            t.IsFalse(
+                blockedScheduler
+                    .slots[ps2x::timing::
+                        eeEventSourceIndex(
+                            ps2x::timing::
+                                EeEventSource::
+                                    DmacToIpu)]
+                    .pending,
+                "a full FIFO should leave the untouched chain dormant");
+
+            (void)runtime.memory().writeIORegister(
+                kIpuCtrl, 1u << 30u);
+            dma =
+                runtime.memory().toIpuDmaSnapshot();
+            t.IsTrue(
+                dma.active && dma.eventManaged &&
+                    dma.tagsProcessed == 0u,
+                "reset should re-arm the blocked tag without consuming it early");
+            blockedScheduler =
+                runtime.debugEeSchedulerSnapshot();
+            t.Equals(
+                blockedScheduler
+                    .slots[ps2x::timing::
+                        eeEventSourceIndex(
+                            ps2x::timing::
+                                EeEventSource::
+                                    DmacToIpu)]
+                    .deadlineTick,
+                32ull,
+                "reset should wake the blocked chain after four EE cycles");
+            (void)runtime.memory().writeIORegister(
+                kToIpu, 0u);
+        });
+
         tc.Run("To-IPU cancellation invalidates scheduled generations", [](TestCase &t)
         {
             PS2Runtime runtime;

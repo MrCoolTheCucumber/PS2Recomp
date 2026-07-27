@@ -2543,9 +2543,12 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
                 m_ioRegisters[0x10002020] = 0;
                 m_ioRegisters[0x10002030] = 0;
                 if (m_toIpuDma.active &&
-                    m_toIpuDma.stall ==
-                        ToIpuDmaStallReason::
-                            InputFifoFull)
+                    (m_toIpuDma.stall ==
+                         ToIpuDmaStallReason::
+                             InputFifoFull ||
+                     m_toIpuDma.stall ==
+                         ToIpuDmaStallReason::
+                             WaitingForInputRequest))
                 {
                     (void)wakeToIpuDma(4u);
                 }
@@ -4537,6 +4540,8 @@ void PS2Memory::publishToIpuDmaRegisters()
         m_toIpuDma.madr;
     m_ioRegisters[kToIpuBase + 0x20u] =
         m_toIpuDma.qwc & 0xFFFFu;
+    m_ioRegisters[kToIpuBase + 0x30u] =
+        m_toIpuDma.tadr;
     publishIpuInputFifoCount();
 }
 
@@ -4562,8 +4567,18 @@ bool PS2Memory::startToIpuDma(
     m_toIpuDma.madr =
         m_ioRegisters[kToIpuBase + 0x10u] &
         0xFFFFFFF0u;
-    m_toIpuDma.normalMode =
-        ((chcr >> 2u) & 0x3u) == 0u;
+    m_toIpuDma.tadr =
+        m_ioRegisters[kToIpuBase + 0x30u] &
+        0xFFFFFFF0u;
+    const uint32_t mode = (chcr >> 2u) & 0x3u;
+    m_toIpuDma.normalMode = mode == 0u;
+    m_toIpuDma.chainMode = mode == 1u;
+    m_toIpuDma.tie =
+        (m_toIpuDma.chcr & (1u << 7u)) != 0u;
+    m_toIpuDma.tagId = static_cast<uint8_t>(
+        (m_toIpuDma.chcr >> 28u) & 0x7u);
+    m_toIpuDma.tagIrq =
+        (m_toIpuDma.chcr & (1u << 31u)) != 0u;
     const uint32_t registerQwc =
         m_ioRegisters[kToIpuBase + 0x20u] &
         0xFFFFu;
@@ -4573,18 +4588,48 @@ bool PS2Memory::startToIpuDma(
         m_toIpuDma.normalMode && registerQwc == 0u
             ? 0x10000u
             : registerQwc;
+    m_toIpuDma.endAfterPayload =
+        m_toIpuDma.normalMode ||
+        (m_toIpuDma.chainMode &&
+         registerQwc != 0u &&
+         (m_toIpuDma.tagId == 0u ||
+          m_toIpuDma.tagId == 7u ||
+          (m_toIpuDma.tie &&
+           m_toIpuDma.tagIrq)));
     m_toIpuDma.active = true;
-    m_toIpuDma.phase =
-        m_toIpuDma.normalMode
-            ? ToIpuDmaPhase::TransferPayload
-            : ToIpuDmaPhase::Fault;
-    m_toIpuDma.stall =
-        !isDmacEnabled()
-            ? ToIpuDmaStallReason::DmacDisabled
-            : m_toIpuDma.normalMode
-                  ? ToIpuDmaStallReason::None
-                  : ToIpuDmaStallReason::
-                        UnsupportedMode;
+    if (m_toIpuDma.normalMode)
+    {
+        m_toIpuDma.phase =
+            ToIpuDmaPhase::TransferPayload;
+    }
+    else if (m_toIpuDma.chainMode)
+    {
+        m_toIpuDma.phase =
+            registerQwc != 0u
+                ? ToIpuDmaPhase::TransferPayload
+                : ToIpuDmaPhase::FetchTag;
+    }
+    else
+    {
+        m_toIpuDma.phase = ToIpuDmaPhase::Fault;
+    }
+
+    if (!isDmacEnabled())
+    {
+        m_toIpuDma.stall =
+            ToIpuDmaStallReason::DmacDisabled;
+    }
+    else if (m_toIpuDma.normalMode ||
+             m_toIpuDma.chainMode)
+    {
+        m_toIpuDma.stall =
+            ToIpuDmaStallReason::None;
+    }
+    else
+    {
+        m_toIpuDma.stall =
+            ToIpuDmaStallReason::UnsupportedMode;
+    }
     publishToIpuDmaRegisters();
     return true;
 }
@@ -4614,7 +4659,8 @@ bool PS2Memory::wakeToIpuDma(
             ToIpuDmaStallReason::DmacDisabled;
         return false;
     }
-    if (!m_toIpuDma.normalMode)
+    if (!m_toIpuDma.normalMode &&
+        !m_toIpuDma.chainMode)
     {
         m_toIpuDma.stall =
             ToIpuDmaStallReason::UnsupportedMode;
@@ -4639,8 +4685,16 @@ bool PS2Memory::wakeToIpuDma(
     return !m_toIpuDma.active;
 }
 
+void PS2Memory::setToIpuDmaEventPending(
+    bool pending) noexcept
+{
+    if (m_toIpuDma.active)
+        m_toIpuDma.eventManaged = pending;
+}
+
 ToIpuDmaAdvanceResult PS2Memory::advanceToIpuDma()
 {
+    constexpr uint32_t kMaximumChainTags = 65536u;
     ToIpuDmaAdvanceResult result{};
     result.transfer = m_toIpuDma.transfer;
     result.phase = m_toIpuDma.phase;
@@ -4657,6 +4711,10 @@ ToIpuDmaAdvanceResult PS2Memory::advanceToIpuDma()
         result.phase = ToIpuDmaPhase::Idle;
         return result;
     }
+    // The retained deadline has been consumed. A follow-up callback sets this
+    // again after the transition returns; a dormant transition must not keep
+    // reporting stale event ownership.
+    m_toIpuDma.eventManaged = false;
 
     const auto fault =
         [&](const char *reason)
@@ -4670,9 +4728,12 @@ ToIpuDmaAdvanceResult PS2Memory::advanceToIpuDma()
                 std::fprintf(
                     stderr,
                     "To-IPU DMA stalled: madr=0x%08x "
-                    "qwc=%u fifo=%u reason=%s\n",
+                    "qwc=%u tadr=0x%08x tags=%u "
+                    "fifo=%u reason=%s\n",
                     m_toIpuDma.madr,
                     m_toIpuDma.qwc,
+                    m_toIpuDma.tadr,
+                    m_toIpuDma.tagsProcessed,
                     m_ipuInputFifoQwc,
                     reason);
                 m_toIpuDma.faultReported = true;
@@ -4682,7 +4743,8 @@ ToIpuDmaAdvanceResult PS2Memory::advanceToIpuDma()
             result.active = true;
         };
 
-    if (!m_toIpuDma.normalMode)
+    if (!m_toIpuDma.normalMode &&
+        !m_toIpuDma.chainMode)
     {
         m_toIpuDma.phase =
             ToIpuDmaPhase::Fault;
@@ -4715,6 +4777,9 @@ ToIpuDmaAdvanceResult PS2Memory::advanceToIpuDma()
         return result;
     }
 
+    m_toIpuDma.stall =
+        ToIpuDmaStallReason::None;
+
     if (m_toIpuDma.phase ==
         ToIpuDmaPhase::Finalize)
     {
@@ -4733,24 +4798,175 @@ ToIpuDmaAdvanceResult PS2Memory::advanceToIpuDma()
         return result;
     }
 
-    if (m_toIpuDma.phase !=
-        ToIpuDmaPhase::TransferPayload)
+    // A full input FIFO withdraws the IPU data request before the channel
+    // reads another source-chain tag. It remains dormant until the IPU
+    // consumes or resets the FIFO.
+    if (m_ipuInputFifoQwc >=
+        kIpuInputFifoCapacityQwc)
     {
-        fault("invalid phase");
+        m_toIpuDma.stall =
+            ToIpuDmaStallReason::InputFifoFull;
+        result.stall = m_toIpuDma.stall;
+        result.active = true;
         return result;
     }
 
-    if (m_toIpuDma.qwc == 0u)
+    uint32_t tagCycles = 0u;
+    if (m_toIpuDma.phase ==
+        ToIpuDmaPhase::FetchTag)
     {
+        if (!m_toIpuDma.chainMode)
+        {
+            fault("normal transfer entered tag phase");
+            return result;
+        }
+        if (m_toIpuDma.tagsProcessed >=
+            kMaximumChainTags)
+        {
+            fault("tag safety limit reached");
+            return result;
+        }
+
+        const uint32_t tagAddress =
+            m_toIpuDma.tadr & 0xFFFFFFF0u;
+        const uint32_t physicalAddress =
+            tagAddress & 0x1FFFFFF0u;
+        const bool scratch =
+            (tagAddress & 0x80000000u) != 0u ||
+            (physicalAddress >= 0x10000000u &&
+             physicalAddress < 0x10004000u);
+        static constexpr std::array<uint8_t, 16u>
+            kDmacZeroRead{};
+        const uint8_t *base = nullptr;
+        uint32_t tagOffset = 0u;
+        uint32_t limit = 0u;
+        if (scratch)
+        {
+            base = m_scratchpad;
+            tagOffset = tagAddress & 0x3FF0u;
+            limit = PS2_SCRATCHPAD_SIZE;
+        }
+        else if (physicalAddress < PS2_RAM_SIZE)
+        {
+            base = m_rdram;
+            tagOffset = physicalAddress;
+            limit = PS2_RAM_SIZE;
+        }
+        else if (physicalAddress < 0x10000000u)
+        {
+            // Unpopulated EE physical memory uses DMAC's zero-read page.
+            base = kDmacZeroRead.data();
+            tagOffset = 0u;
+            limit =
+                static_cast<uint32_t>(
+                    kDmacZeroRead.size());
+        }
+        if (!base || tagOffset > limit ||
+            limit - tagOffset < 16u)
+        {
+            fault("tag crosses memory boundary");
+            return result;
+        }
+
+        const uint64_t tag =
+            loadScalar<uint64_t>(
+                base + tagOffset, 0u, 16u,
+                "To-IPU DMA tag", tagAddress);
+        const uint32_t tagQwc =
+            static_cast<uint32_t>(
+                tag & 0xFFFFu);
+        const uint32_t tagAddressField =
+            static_cast<uint32_t>(
+                tag >> 32u) &
+            0xFFFFFFF0u;
+        m_toIpuDma.tagId =
+            static_cast<uint8_t>(
+                (tag >> 28u) & 0x7u);
+        m_toIpuDma.tagIrq =
+            ((tag >> 31u) & 0x1u) != 0u;
+        m_toIpuDma.endAfterPayload = false;
+        ++m_toIpuDma.tagsProcessed;
+        tagCycles = 1u;
+
+        uint32_t dataAddress =
+            tagAddressField;
+        switch (m_toIpuDma.tagId)
+        {
+        case 0u: // REFE
+            m_toIpuDma.tadr += 16u;
+            m_toIpuDma.endAfterPayload = true;
+            break;
+        case 1u: // CNT
+            dataAddress = m_toIpuDma.tadr + 16u;
+            m_toIpuDma.tadr = dataAddress;
+            break;
+        case 2u: // NEXT
+            dataAddress = m_toIpuDma.tadr + 16u;
+            m_toIpuDma.tadr = tagAddressField;
+            break;
+        case 3u: // REF
+        case 4u: // REFS
+            m_toIpuDma.tadr += 16u;
+            break;
+        case 5u: // CALL is terminal on the IPU source chain.
+        case 6u: // RET is terminal on the IPU source chain.
+            // PCSX2 intentionally uses the tag address as payload and does
+            // not apply the general source-chain CALL/RET stack here.
+            m_toIpuDma.endAfterPayload = true;
+            break;
+        case 7u: // END
+            dataAddress = m_toIpuDma.tadr + 16u;
+            m_toIpuDma.endAfterPayload = true;
+            break;
+        default:
+            fault("invalid tag ID");
+            return result;
+        }
+
+        if (m_toIpuDma.tie &&
+            m_toIpuDma.tagIrq)
+        {
+            m_toIpuDma.endAfterPayload = true;
+        }
+        m_toIpuDma.chcr =
+            (m_toIpuDma.chcr & 0x0000FFFFu) |
+            (static_cast<uint32_t>(
+                 (tag >> 16u) & 0xFFFFu)
+             << 16u);
+        m_toIpuDma.madr = dataAddress;
+        m_toIpuDma.qwc = tagQwc;
         m_toIpuDma.phase =
-            ToIpuDmaPhase::Finalize;
-        m_toIpuDma.stall =
-            ToIpuDmaStallReason::None;
+            tagQwc != 0u
+                ? ToIpuDmaPhase::TransferPayload
+                : m_toIpuDma.endAfterPayload
+                      ? ToIpuDmaPhase::Finalize
+                      : ToIpuDmaPhase::FetchTag;
         publishToIpuDmaRegisters();
         result.progressed = true;
-        result.delayEeCycles = 8u;
+    }
+
+    // A zero-QWC chain tag always yields before the next tag or final
+    // publication. PCSX2 charges one tag cycle in addition to its four-cycle
+    // minimum, then converts the combined work at two EE cycles per unit.
+    if (tagCycles != 0u &&
+        (m_toIpuDma.phase ==
+             ToIpuDmaPhase::FetchTag ||
+         m_toIpuDma.phase ==
+             ToIpuDmaPhase::Finalize))
+    {
+        result.delayEeCycles =
+            (4u + tagCycles) * 2u;
         result.phase = m_toIpuDma.phase;
-        result.stall = m_toIpuDma.stall;
+        result.stall =
+            ToIpuDmaStallReason::None;
+        result.active = true;
+        return result;
+    }
+
+    if (m_toIpuDma.phase !=
+        ToIpuDmaPhase::TransferPayload)
+    {
+        fault("invalid progress phase");
         return result;
     }
 
@@ -4759,17 +4975,10 @@ ToIpuDmaAdvanceResult PS2Memory::advanceToIpuDma()
         std::min(
             m_ipuInputFifoQwc,
             kIpuInputFifoCapacityQwc);
-    if (available == 0u)
-    {
-        m_toIpuDma.stall =
-            ToIpuDmaStallReason::InputFifoFull;
-        result.stall = m_toIpuDma.stall;
-        return result;
-    }
-
     const uint32_t sliceQwc =
         std::min(m_toIpuDma.qwc, available);
-    if (!copyToIpuDmaPayload(
+    if (sliceQwc != 0u &&
+        !copyToIpuDmaPayload(
             m_toIpuDma.madr, sliceQwc))
     {
         fault("unmapped payload address");
@@ -4778,21 +4987,47 @@ ToIpuDmaAdvanceResult PS2Memory::advanceToIpuDma()
 
     m_toIpuDma.madr += sliceQwc * 16u;
     m_toIpuDma.qwc -= sliceQwc;
-    result.progressed = true;
+    if (m_toIpuDma.chainMode &&
+        m_toIpuDma.tagId == 1u)
+    {
+        // IPU CNT chains publish TADR alongside partial MADR progress.
+        m_toIpuDma.tadr = m_toIpuDma.madr;
+    }
+    result.progressed =
+        result.progressed || sliceQwc != 0u;
     result.transferredQwc = sliceQwc;
     if (m_toIpuDma.qwc == 0u)
     {
         m_toIpuDma.phase =
-            ToIpuDmaPhase::Finalize;
+            m_toIpuDma.endAfterPayload
+                ? ToIpuDmaPhase::Finalize
+                : ToIpuDmaPhase::FetchTag;
+    }
+
+    const bool terminalPayloadComplete =
+        m_toIpuDma.phase ==
+        ToIpuDmaPhase::Finalize;
+    if (sliceQwc == 0u ||
+        terminalPayloadComplete)
+    {
+        const uint32_t delayUnits =
+            std::max(4u, sliceQwc) +
+            tagCycles;
+        result.delayEeCycles =
+            delayUnits * 2u;
         m_toIpuDma.stall =
             ToIpuDmaStallReason::None;
-        result.delayEeCycles =
-            std::max(4u, sliceQwc) * 2u;
     }
     else
     {
         m_toIpuDma.stall =
-            ToIpuDmaStallReason::InputFifoFull;
+            m_toIpuDma.qwc != 0u &&
+                    m_ipuInputFifoQwc >=
+                        kIpuInputFifoCapacityQwc
+                ? ToIpuDmaStallReason::
+                      InputFifoFull
+                : ToIpuDmaStallReason::
+                      WaitingForInputRequest;
     }
     publishToIpuDmaRegisters();
 
@@ -4812,18 +5047,28 @@ PS2Memory::toIpuDmaSnapshot() const
     snapshot.chcr = m_toIpuDma.chcr;
     snapshot.madr = m_toIpuDma.madr;
     snapshot.qwc = m_toIpuDma.qwc;
+    snapshot.tadr = m_toIpuDma.tadr;
     snapshot.fifoQwc = m_ipuInputFifoQwc;
+    snapshot.tagsProcessed =
+        m_toIpuDma.tagsProcessed;
+    snapshot.tagId = m_toIpuDma.tagId;
     snapshot.active = m_toIpuDma.active;
     snapshot.eventManaged =
         m_toIpuDma.eventManaged;
     snapshot.normalMode =
         m_toIpuDma.normalMode;
+    snapshot.chainMode =
+        m_toIpuDma.chainMode;
+    snapshot.tagIrq = m_toIpuDma.tagIrq;
+    snapshot.endAfterPayload =
+        m_toIpuDma.endAfterPayload;
     return snapshot;
 }
 
 void PS2Memory::drainToIpuDmaCompatibility()
 {
-    constexpr uint32_t kMaximumTransitions = 16u;
+    constexpr uint32_t kMaximumTransitions =
+        131072u;
     for (uint32_t transition = 0u;
          transition < kMaximumTransitions &&
          m_toIpuDma.active;

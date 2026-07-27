@@ -447,6 +447,7 @@ struct GifDmaSnapshot
 enum class ToIpuDmaPhase : uint8_t
 {
     Idle = 0u,
+    FetchTag,
     TransferPayload,
     Finalize,
     Fault,
@@ -456,6 +457,7 @@ enum class ToIpuDmaStallReason : uint8_t
 {
     None = 0u,
     InputFifoFull,
+    WaitingForInputRequest,
     DmacDisabled,
     UnsupportedMode,
     Fault,
@@ -483,10 +485,16 @@ struct ToIpuDmaSnapshot
     uint32_t chcr = 0u;
     uint32_t madr = 0u;
     uint32_t qwc = 0u;
+    uint32_t tadr = 0u;
     uint32_t fifoQwc = 0u;
+    uint32_t tagsProcessed = 0u;
+    uint8_t tagId = 0u;
     bool active = false;
     bool eventManaged = false;
     bool normalMode = false;
+    bool chainMode = false;
+    bool tagIrq = false;
+    bool endAfterPayload = false;
 };
 
 enum class Vif0DmaPhase : uint8_t
@@ -871,6 +879,8 @@ public:
     GifDmaAdvanceResult advanceGifDma();
     [[nodiscard]] GifDmaSnapshot gifDmaSnapshot() const;
     bool wakeToIpuDma(uint32_t delayEeCycles);
+    void setToIpuDmaEventPending(
+        bool pending) noexcept;
     ToIpuDmaAdvanceResult advanceToIpuDma();
     [[nodiscard]] ToIpuDmaSnapshot
     toIpuDmaSnapshot() const;
@@ -1171,9 +1181,16 @@ public:
         uint32_t chcr = 0u;
         uint32_t madr = 0u;
         uint32_t qwc = 0u;
+        uint32_t tadr = 0u;
+        uint32_t tagsProcessed = 0u;
+        uint8_t tagId = 0u;
         bool active = false;
         bool eventManaged = false;
         bool normalMode = false;
+        bool chainMode = false;
+        bool tie = false;
+        bool tagIrq = false;
+        bool endAfterPayload = false;
         bool faultReported = false;
     };
     ToIpuDmaState m_toIpuDma{};
