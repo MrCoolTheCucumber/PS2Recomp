@@ -7235,6 +7235,66 @@ void register_ps2_runtime_expansion_tests()
                 "timing reset should invalidate the counter deadline");
         });
 
+        tc.Run("scratchpad accesses do not alias EE counter MMIO timing", [](TestCase &t)
+        {
+            PS2Runtime runtime;
+            t.IsTrue(
+                runtime.memory().initialize(),
+                "scratchpad counter-alias fixture memory should initialize");
+            runtime.setEeSchedulingMode(
+                ps2x::timing::EeSchedulingMode::Event);
+
+            R5900Context &ctx = runtime.cpu();
+            uint8_t *const rdram =
+                runtime.memory().getRDRAM();
+            const __m128i value =
+                _mm_set_epi32(4, 3, 2, 1);
+
+            ctx.advanceEeCycleTicks(6u);
+            (void)runtime.Load128(
+                rdram, &ctx, 0x70000000u);
+            PS2Runtime::DebugEeTiming timing =
+                runtime.debugEeTimingSnapshot();
+            t.Equals(
+                timing.currentTick, 0u,
+                "a direct scratchpad load must not publish EE time");
+            t.Equals(
+                timing.localBlockTicks, 6u,
+                "a direct scratchpad load must retain local issue time");
+
+            runtime.Store128(
+                rdram, &ctx, 0x70000010u, value);
+            timing = runtime.debugEeTimingSnapshot();
+            t.Equals(
+                timing.currentTick, 0u,
+                "a direct scratchpad store must not publish EE time");
+            t.Equals(
+                timing.localBlockTicks, 6u,
+                "a direct scratchpad store must retain local issue time");
+
+            (void)runtime.Load128(
+                rdram, &ctx, 0xf0000020u);
+            timing = runtime.debugEeTimingSnapshot();
+            t.Equals(
+                timing.currentTick, 0u,
+                "an aliased scratchpad load must not publish EE time");
+            t.Equals(
+                timing.localBlockTicks, 6u,
+                "an aliased scratchpad load must retain local issue time");
+
+            runtime.resetEeTiming(&ctx);
+            ctx.advanceEeCycleTicks(9u);
+            (void)runtime.Load32(
+                rdram, &ctx, 0x90000000u);
+            timing = runtime.debugEeTimingSnapshot();
+            t.Equals(
+                timing.currentTick, 8u,
+                "a KSEG0 EE-counter alias must still publish EE time");
+            t.Equals(
+                timing.localBlockTicks, 1u,
+                "a real EE-counter access must retain its fractional issue time");
+        });
+
         tc.Run("sceVif1PkReset preserves the packet base pointer and clears open tag state", [](TestCase &t)
         {
             std::vector<uint8_t> rdram(PS2_RAM_SIZE, 0u);

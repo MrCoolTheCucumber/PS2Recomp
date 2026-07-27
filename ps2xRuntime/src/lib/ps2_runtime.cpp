@@ -1299,6 +1299,14 @@ bool PS2Runtime::overlapsEeCounterRegister(
     {
         return false;
     }
+    // The EE scratchpad lives at 0x70000000, which would alias the counter
+    // MMIO page if it were normalized with the ordinary KSEG physical mask.
+    // Classify this dedicated segment before resolving cached/uncached MMIO
+    // aliases.
+    if (ps2IsScratchpadAddress(address))
+    {
+        return false;
+    }
     const uint32_t physical = address & 0x1fffffffu;
     const uint64_t end =
         static_cast<uint64_t>(physical) + size;
