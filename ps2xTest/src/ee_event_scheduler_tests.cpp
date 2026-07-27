@@ -77,7 +77,11 @@ void register_ee_event_scheduler_tests()
             (void)scheduler.scheduleAbsolute(
                 EeEventSource::DmacCompletion, deadline);
             (void)scheduler.scheduleAbsolute(
+                EeEventSource::DmacToScratchpad, deadline);
+            (void)scheduler.scheduleAbsolute(
                 EeEventSource::DmacVif1, deadline);
+            (void)scheduler.scheduleAbsolute(
+                EeEventSource::DmacFromScratchpad, deadline);
             (void)scheduler.scheduleAbsolute(
                 EeEventSource::Vu0PeriodicCompatibility, deadline);
 
@@ -89,21 +93,29 @@ void register_ee_event_scheduler_tests()
                     order.push_back(service.source);
                 });
             t.Equals(
-                order.size(), static_cast<size_t>(4u),
+                order.size(), static_cast<size_t>(6u),
                 "all equal-deadline events should dispatch");
-            if (order.size() == 4u)
+            if (order.size() == 6u)
             {
                 t.IsTrue(
                     order[0] == EeEventSource::DmacCompletion,
                     "ready DMAC completion should publish first");
                 t.IsTrue(
                     order[1] == EeEventSource::DmacVif1,
-                    "DMAC VIF1 should precede VIF/VU finish");
+                    "DMAC VIF1 should precede scratchpad DMA");
                 t.IsTrue(
-                    order[2] == EeEventSource::VifVu1Finish,
-                    "VU1 finish should follow the earlier DMAC callback");
+                    order[2] ==
+                        EeEventSource::DmacFromScratchpad,
+                    "SPR-from should follow VIF1");
                 t.IsTrue(
                     order[3] ==
+                        EeEventSource::DmacToScratchpad,
+                    "SPR-to should follow SPR-from");
+                t.IsTrue(
+                    order[4] == EeEventSource::VifVu1Finish,
+                    "VU1 finish should follow DMAC callbacks");
+                t.IsTrue(
+                    order[5] ==
                         EeEventSource::Vu0PeriodicCompatibility,
                     "the ordinary VU0 batch should follow device callbacks");
             }

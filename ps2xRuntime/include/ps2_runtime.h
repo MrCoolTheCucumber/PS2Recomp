@@ -499,6 +499,31 @@ public:
         bool eventPending = false;
     };
 
+    enum class DebugEeEventDeviceKind : uint8_t
+    {
+        None = 0u,
+        Vif1Dma,
+        Vu1,
+        ScratchpadDma,
+    };
+
+    struct DebugEeEventDeviceState
+    {
+        DebugEeEventDeviceKind kind =
+            DebugEeEventDeviceKind::None;
+        uint64_t operationGeneration = 0u;
+        uint64_t lastAdvancedTick = 0u;
+        uint64_t totalAdvancedCycles = 0u;
+        uint32_t phase = 0u;
+        uint32_t stall = 0u;
+        uint32_t tadr = 0u;
+        uint32_t madr = 0u;
+        uint32_t qwc = 0u;
+        uint32_t tagsProcessed = 0u;
+        uint32_t pc = 0u;
+        bool active = false;
+    };
+
     struct DebugEeEventSlot
     {
         ps2x::timing::EeEventSource source =
@@ -506,6 +531,7 @@ public:
         uint64_t deadlineTick = 0u;
         uint64_t generation = 0u;
         uint64_t sequence = 0u;
+        DebugEeEventDeviceState device{};
         bool pending = false;
     };
 
@@ -539,6 +565,9 @@ public:
         uint64_t serviceTick = 0u;
         uint64_t latenessTicks = 0u;
         uint64_t followupTick = 0u;
+        uint32_t eePc = 0u;
+        DebugEeEventDeviceState deviceBefore{};
+        DebugEeEventDeviceState deviceAfter{};
         bool hasFollowup = false;
         bool rescheduled = false;
     };
@@ -927,6 +956,9 @@ private:
     void debugRecordVu0Sync(DebugVu0SyncEntry entry);
     void debugRecordVu0Instruction(DebugVu0InstructionEntry entry);
     void debugRecordEeEvent(DebugEeEventEntry entry);
+    [[nodiscard]] DebugEeEventDeviceState
+    debugEeEventDeviceState(
+        ps2x::timing::EeEventSource source) const noexcept;
     void debugArmVu0Traces(const R5900Context *ctx);
     void beginVu0Invocation();
 
@@ -979,6 +1011,20 @@ private:
         ps2x::timing::EeTick deadline) noexcept;
     void serviceVif1DmaAtEvent(
         const ps2x::timing::EeEventService &service);
+    bool scheduleScratchpadDmaFromMemory(
+        DmacChannel channel,
+        uint32_t delayEeCycles);
+    void cancelScratchpadDmaEvent(
+        DmacChannel channel) noexcept;
+    void scheduleScratchpadDmaEvent(
+        DmacChannel channel,
+        ps2x::timing::EeTick deadline) noexcept;
+    void serviceScratchpadDmaAtEvent(
+        DmacChannel channel,
+        const ps2x::timing::EeEventService &service);
+    [[nodiscard]] static ps2x::timing::EeEventSource
+    scratchpadDmaEventSource(
+        DmacChannel channel) noexcept;
     void setVU1BusyFlag(
         R5900Context *context, bool busy) noexcept;
     void onDmacCompletionReady();
@@ -1032,6 +1078,16 @@ private:
     Vu1ExecutionTiming m_vu1ExecutionTiming{};
     ps2x::timing::EeEventToken m_vif1DmaEventToken{
         ps2x::timing::EeEventSource::DmacVif1, 0u};
+    ps2x::timing::EeEventToken
+        m_fromScratchpadDmaEventToken{
+            ps2x::timing::EeEventSource::
+                DmacFromScratchpad,
+            0u};
+    ps2x::timing::EeEventToken
+        m_toScratchpadDmaEventToken{
+            ps2x::timing::EeEventSource::
+                DmacToScratchpad,
+            0u};
     ps2x::timing::EeTick m_vu0CycleTick{};
     ps2x::timing::EeTick m_vu0NextEventCycleTick{};
     bool m_eeSchedulerShadowMismatch = false;

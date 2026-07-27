@@ -1716,6 +1716,7 @@ bool PS2Memory::initialize(size_t ramSize)
     m_pendingGifTransfers.clear();
     m_pendingVif0Transfers.clear();
     m_vif1Dma = {};
+    m_scratchpadDma = {};
     m_codeRegions.clear();
     m_path3Masked = false;
     m_path3MaskedFifo.clear();
@@ -2650,7 +2651,35 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
 
             if (channelBase == 0x1000D000u || channelBase == 0x1000D400u)
             {
-                (void)processScratchpadDma(channelBase);
+                (void)startScratchpadDma(transfer, value);
+                ScratchpadDmaSnapshot submitted =
+                    scratchpadDmaSnapshot(*channel);
+                uint32_t initialDelayEeCycles = 0u;
+                bool pendingProgress =
+                    submitted.active &&
+                    submitted.phase ==
+                        ScratchpadDmaPhase::Finalize;
+                if (submitted.active &&
+                    submitted.phase !=
+                        ScratchpadDmaPhase::Finalize)
+                {
+                    const ScratchpadDmaAdvanceResult initial =
+                        advanceScratchpadDma(*channel);
+                    pendingProgress =
+                        initial.active &&
+                        !initial.completed &&
+                        initial.phase !=
+                            ScratchpadDmaPhase::Fault;
+                    initialDelayEeCycles =
+                        initial.delayEeCycles;
+                }
+                if (pendingProgress &&
+                    !scheduleScratchpadDma(
+                        *channel,
+                        initialDelayEeCycles))
+                {
+                    drainScratchpadDmaCompatibility(*channel);
+                }
                 return true;
             }
 
@@ -2957,208 +2986,569 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
     return false;
 }
 
-bool PS2Memory::processScratchpadDma(uint32_t channelBase)
+std::optional<size_t> PS2Memory::scratchpadDmaIndex(
+    DmacChannel channel) noexcept
 {
-    constexpr uint32_t kFromScratchpadChannel = 0x1000D000u;
-    constexpr uint32_t kToScratchpadChannel = 0x1000D400u;
-    constexpr uint32_t kMaxChainTags = 4096u;
+    switch (channel)
+    {
+    case DmacChannel::FromScratchpad:
+        return 0u;
+    case DmacChannel::ToScratchpad:
+        return 1u;
+    default:
+        return std::nullopt;
+    }
+}
 
-    if (channelBase != kFromScratchpadChannel && channelBase != kToScratchpadChannel)
+void PS2Memory::publishScratchpadDmaRegisters(
+    const ScratchpadDmaState &state)
+{
+    const uint32_t channelBase =
+        dmacChannelBase(state.transfer.channel);
+    if (channelBase == 0u)
+        return;
+
+    m_ioRegisters[channelBase + 0x00u] = state.chcr;
+    m_ioRegisters[channelBase + 0x10u] = state.madr;
+    m_ioRegisters[channelBase + 0x20u] =
+        state.qwc & 0xFFFFu;
+    m_ioRegisters[channelBase + 0x30u] = state.tadr;
+    m_ioRegisters[channelBase + 0x40u] = state.asr0;
+    m_ioRegisters[channelBase + 0x50u] = state.asr1;
+    m_ioRegisters[channelBase + 0x80u] =
+        state.sadr & 0x3FF0u;
+}
+
+void PS2Memory::clearScratchpadDmaState(
+    DmacChannel channel,
+    bool notifyRuntime)
+{
+    const std::optional<size_t> index =
+        scratchpadDmaIndex(channel);
+    if (!index.has_value())
+        return;
+
+    ScratchpadDmaState &state =
+        m_scratchpadDma[*index];
+    const bool cancelEvent =
+        state.active && state.eventManaged;
+    state = {};
+    if (notifyRuntime && cancelEvent &&
+        m_scratchpadDmaCancelCallback)
+    {
+        m_scratchpadDmaCancelCallback(channel);
+    }
+}
+
+bool PS2Memory::scheduleScratchpadDma(
+    DmacChannel channel,
+    uint32_t delayEeCycles)
+{
+    const std::optional<size_t> index =
+        scratchpadDmaIndex(channel);
+    if (!index.has_value())
+        return false;
+
+    ScratchpadDmaState &state =
+        m_scratchpadDma[*index];
+    if (!state.active ||
+        !m_scratchpadDmaScheduleCallback)
     {
         return false;
     }
 
-    uint32_t chcr = m_ioRegisters[channelBase + 0x00u];
-    const uint32_t mode = (chcr >> 2u) & 0x3u;
-    const bool toScratchpad = channelBase == kToScratchpadChannel;
-    if (mode > 1u || (mode == 1u && !toScratchpad))
-    {
+    const bool scheduled =
+        m_scratchpadDmaScheduleCallback(
+            channel, delayEeCycles);
+    state.eventManaged = scheduled;
+    return scheduled;
+}
+
+bool PS2Memory::startScratchpadDma(
+    DmacTransferToken transfer,
+    uint32_t chcr)
+{
+    const std::optional<size_t> index =
+        scratchpadDmaIndex(transfer.channel);
+    if (!index.has_value())
         return false;
-    }
 
-    uint32_t madr = m_ioRegisters[channelBase + 0x10u] & 0x7FFFFFFFu;
-    uint32_t qwc = m_ioRegisters[channelBase + 0x20u] & 0xFFFFu;
-    uint32_t tadr = m_ioRegisters[channelBase + 0x30u] & 0x7FFFFFFFu;
-    uint32_t asr0 = m_ioRegisters[channelBase + 0x40u] & 0x7FFFFFFFu;
-    uint32_t asr1 = m_ioRegisters[channelBase + 0x50u] & 0x7FFFFFFFu;
-    uint32_t sadr = m_ioRegisters[channelBase + 0x80u] & 0x3FF0u;
+    clearScratchpadDmaState(
+        transfer.channel, true);
+    const uint32_t channelBase =
+        dmacChannelBase(transfer.channel);
+    ScratchpadDmaState state{};
+    state.transfer = transfer;
+    state.chcr = chcr | 0x100u;
+    state.madr =
+        m_ioRegisters[channelBase + 0x10u] &
+        0x7FFFFFFFu;
+    state.qwc =
+        m_ioRegisters[channelBase + 0x20u] &
+        0xFFFFu;
+    state.tadr =
+        m_ioRegisters[channelBase + 0x30u] &
+        0x7FFFFFFFu;
+    state.asr0 =
+        m_ioRegisters[channelBase + 0x40u] &
+        0x7FFFFFFFu;
+    state.asr1 =
+        m_ioRegisters[channelBase + 0x50u] &
+        0x7FFFFFFFu;
+    state.sadr =
+        m_ioRegisters[channelBase + 0x80u] &
+        0x3FF0u;
+    state.asp =
+        static_cast<uint8_t>(
+            (state.chcr >> 4u) & 0x3u);
+    state.chainMode =
+        ((state.chcr >> 2u) & 0x3u) == 1u;
+    state.tie =
+        (state.chcr & (1u << 7u)) != 0u;
+    state.tte =
+        (state.chcr & (1u << 6u)) != 0u;
+    state.active = true;
 
-    auto transferQwords = [&](uint32_t &memoryAddress, uint32_t count)
+    if (((state.chcr >> 2u) & 0x3u) > 1u)
     {
-        for (uint32_t index = 0u; index < count; ++index)
+        state.phase = ScratchpadDmaPhase::Fault;
+    }
+    else if (state.chainMode)
+    {
+        if (state.qwc != 0u)
         {
-            const uint32_t scratchAddress = PS2_SCRATCHPAD_BASE + sadr;
-            if (toScratchpad)
-            {
-                write128(scratchAddress, read128(memoryAddress));
-            }
-            else
-            {
-                write128(memoryAddress, read128(scratchAddress));
-            }
-
-            memoryAddress = (memoryAddress + 16u) & 0x7FFFFFFFu;
-            sadr = (sadr + 16u) & (PS2_SCRATCHPAD_SIZE - 1u);
+            state.tagId = static_cast<uint8_t>(
+                (state.chcr >> 28u) & 0x7u);
+            state.tagIrq =
+                (state.chcr & (1u << 31u)) != 0u;
+            state.endAfterPayload =
+                transfer.channel ==
+                        DmacChannel::ToScratchpad
+                    ? state.tagId == 0u ||
+                          state.tagId == 7u ||
+                          (state.tie && state.tagIrq)
+                    : state.tagId == 7u ||
+                          (state.tie && state.tagIrq);
+            state.phase =
+                ScratchpadDmaPhase::TransferPayload;
         }
-    };
+        else
+        {
+            state.phase =
+                ScratchpadDmaPhase::FetchTag;
+        }
+    }
+    else
+    {
+        state.endAfterPayload = true;
+        state.phase =
+            state.qwc != 0u
+                ? ScratchpadDmaPhase::TransferPayload
+                : ScratchpadDmaPhase::Finalize;
+    }
+
+    m_scratchpadDma[*index] = state;
+    publishScratchpadDmaRegisters(
+        m_scratchpadDma[*index]);
+    return true;
+}
+
+ScratchpadDmaSnapshot
+PS2Memory::scratchpadDmaSnapshot(
+    DmacChannel channel) const
+{
+    ScratchpadDmaSnapshot snapshot{};
+    const std::optional<size_t> index =
+        scratchpadDmaIndex(channel);
+    if (!index.has_value())
+        return snapshot;
+
+    const ScratchpadDmaState &state =
+        m_scratchpadDma[*index];
+    snapshot.transfer = state.transfer;
+    snapshot.phase = state.phase;
+    snapshot.chcr = state.chcr;
+    snapshot.madr = state.madr;
+    snapshot.qwc = state.qwc;
+    snapshot.tadr = state.tadr;
+    snapshot.asr0 = state.asr0;
+    snapshot.asr1 = state.asr1;
+    snapshot.sadr = state.sadr;
+    snapshot.tagsProcessed = state.tagsProcessed;
+    snapshot.asp = state.asp;
+    snapshot.tagId = state.tagId;
+    snapshot.active = state.active;
+    snapshot.eventManaged = state.eventManaged;
+    snapshot.chainMode = state.chainMode;
+    snapshot.tagIrq = state.tagIrq;
+    snapshot.endAfterPayload =
+        state.endAfterPayload;
+    return snapshot;
+}
+
+ScratchpadDmaAdvanceResult
+PS2Memory::advanceScratchpadDma(
+    DmacChannel channel)
+{
+    constexpr uint32_t kMaximumChainTags = 65536u;
+    // PCSX2's SPR engine advances at half EE speed and limits one ordinary
+    // payload callback to 0x400 QWC (SPR.cpp, _SPR0chain/_SPR1chain).
+    constexpr uint32_t kMaximumSliceQwc = 0x400u;
+    constexpr uint32_t kEeCyclesPerQwc = 2u;
+
+    ScratchpadDmaAdvanceResult result{};
+    const std::optional<size_t> index =
+        scratchpadDmaIndex(channel);
+    if (!index.has_value())
+        return result;
+
+    ScratchpadDmaState &state =
+        m_scratchpadDma[*index];
+    result.transfer = state.transfer;
+    result.phase = state.phase;
+    result.active = state.active;
+    if (!state.active)
+        return result;
+
+    if (!progressDmacTransfer(state.transfer))
+    {
+        clearScratchpadDmaState(channel, false);
+        result.active = false;
+        result.phase = ScratchpadDmaPhase::Idle;
+        return result;
+    }
+
+    const auto fault =
+        [&](const char *reason)
+        {
+            state.phase = ScratchpadDmaPhase::Fault;
+            if (!state.faultReported)
+            {
+                std::fprintf(
+                    stderr,
+                    "Scratchpad DMA stalled: channel=%u "
+                    "madr=0x%08x qwc=%u tadr=0x%08x "
+                    "sadr=0x%04x reason=%s\n",
+                    static_cast<unsigned>(channel),
+                    state.madr, state.qwc, state.tadr,
+                    state.sadr, reason);
+                state.faultReported = true;
+            }
+            result.phase = state.phase;
+            result.active = true;
+        };
+
+    if (state.phase == ScratchpadDmaPhase::Fault)
+    {
+        fault("unsupported or invalid state");
+        return result;
+    }
+
+    if (state.phase ==
+        ScratchpadDmaPhase::Finalize)
+    {
+        state.active = false;
+        state.eventManaged = false;
+        result.completed =
+            requestDmacCompletion(state.transfer);
+        result.progressed = result.completed;
+        result.active = false;
+        result.phase =
+            ScratchpadDmaPhase::Finalize;
+        return result;
+    }
 
     try
     {
-        const bool resumedChain = mode == 1u && qwc != 0u;
-        transferQwords(madr, qwc);
-        qwc = 0u;
-
-        bool endChain = false;
-        if (resumedChain)
+        if (state.phase ==
+            ScratchpadDmaPhase::FetchTag)
         {
-            const uint32_t previousTagId = (chcr >> 28u) & 0x7u;
-            const bool previousTagIrq = (chcr & (1u << 31u)) != 0u;
-            const bool tieEnabled = (chcr & (1u << 7u)) != 0u;
-            endChain = previousTagId == 0u || previousTagId == 7u ||
-                       (tieEnabled && previousTagIrq);
-        }
-
-        uint32_t tagsProcessed = 0u;
-        while (mode == 1u && !endChain && tagsProcessed < kMaxChainTags)
-        {
-            const uint32_t tagWord0 = read32(tadr + 0u);
-            const uint32_t tagAddress = read32(tadr + 4u) & 0x7FFFFFFFu;
-            const uint32_t tagQwc = tagWord0 & 0xFFFFu;
-            const uint32_t tagId = (tagWord0 >> 28u) & 0x7u;
-            const bool tagIrq = (tagWord0 & (1u << 31u)) != 0u;
-            const bool tieEnabled = (chcr & (1u << 7u)) != 0u;
-            const bool tagTransferEnabled = (chcr & (1u << 6u)) != 0u;
-            ++tagsProcessed;
-
-            chcr = (chcr & 0x0000FFFFu) | (tagWord0 & 0xFFFF0000u);
-
-            if (tagTransferEnabled)
+            if (state.tagsProcessed >=
+                kMaximumChainTags)
             {
-                const uint32_t scratchAddress = PS2_SCRATCHPAD_BASE + sadr;
-                write128(scratchAddress, read128(tadr));
-                sadr = (sadr + 16u) & (PS2_SCRATCHPAD_SIZE - 1u);
+                fault("tag safety limit reached");
+                return result;
             }
 
-            uint32_t dataAddress = tagAddress;
-            switch (tagId)
+            uint32_t tagWord0 = 0u;
+            uint32_t tagAddress = 0u;
+            if (channel ==
+                DmacChannel::ToScratchpad)
             {
-            case 0u: // REFE
-                tadr = (tadr + 16u) & 0x7FFFFFFFu;
-                endChain = true;
-                break;
-            case 1u: // CNT
-                dataAddress = (tadr + 16u) & 0x7FFFFFFFu;
-                tadr = (dataAddress + tagQwc * 16u) & 0x7FFFFFFFu;
-                break;
-            case 2u: // NEXT
-                dataAddress = (tadr + 16u) & 0x7FFFFFFFu;
-                tadr = tagAddress;
-                break;
-            case 3u: // REF
-            case 4u: // REFS
-                tadr = (tadr + 16u) & 0x7FFFFFFFu;
-                break;
-            case 5u: // CALL
+                tagWord0 = read32(state.tadr);
+                tagAddress =
+                    read32(state.tadr + 4u) &
+                    0x7FFFFFFFu;
+            }
+            else
             {
-                dataAddress = (tadr + 16u) & 0x7FFFFFFFu;
-                const uint32_t returnAddress =
-                    (dataAddress + tagQwc * 16u) & 0x7FFFFFFFu;
-                uint32_t asp = (chcr >> 4u) & 0x3u;
-                if (asp == 0u)
+                const uint32_t tagBase =
+                    PS2_SCRATCHPAD_BASE +
+                    state.sadr;
+                tagWord0 = read32(tagBase);
+                tagAddress =
+                    read32(tagBase + 4u) &
+                    0x7FFFFFFFu;
+                state.sadr =
+                    (state.sadr + 16u) &
+                    (PS2_SCRATCHPAD_SIZE - 1u);
+            }
+
+            const uint32_t tagQwc =
+                tagWord0 & 0xFFFFu;
+            state.tagId = static_cast<uint8_t>(
+                (tagWord0 >> 28u) & 0x7u);
+            state.tagIrq =
+                (tagWord0 & (1u << 31u)) != 0u;
+            state.chcr =
+                (state.chcr & 0x0000FFFFu) |
+                (tagWord0 & 0xFFFF0000u);
+            ++state.tagsProcessed;
+
+            if (channel ==
+                DmacChannel::FromScratchpad)
+            {
+                if (state.tagId != 0u &&
+                    state.tagId != 1u &&
+                    state.tagId != 7u)
                 {
-                    asr0 = returnAddress;
-                    asp = 1u;
+                    fault("unsupported destination-chain tag");
+                    return result;
                 }
-                else if (asp == 1u)
+                state.madr = tagAddress;
+                state.qwc = tagQwc;
+                state.endAfterPayload =
+                    state.tagId == 7u ||
+                    (state.tie && state.tagIrq);
+            }
+            else
+            {
+                if (state.tte)
                 {
-                    asr1 = returnAddress;
-                    asp = 2u;
+                    write128(
+                        PS2_SCRATCHPAD_BASE +
+                            state.sadr,
+                        read128(state.tadr));
+                    state.sadr =
+                        (state.sadr + 16u) &
+                        (PS2_SCRATCHPAD_SIZE - 1u);
                 }
-                else
+
+                uint32_t dataAddress = tagAddress;
+                bool endChain = false;
+                switch (state.tagId)
                 {
+                case 0u: // REFE
+                    state.tadr =
+                        (state.tadr + 16u) &
+                        0x7FFFFFFFu;
                     endChain = true;
-                }
-                chcr = (chcr & ~(0x3u << 4u)) | (asp << 4u);
-                tadr = tagAddress;
-                break;
-            }
-            case 6u: // RET
-            {
-                dataAddress = (tadr + 16u) & 0x7FFFFFFFu;
-                uint32_t asp = (chcr >> 4u) & 0x3u;
-                if (asp == 2u)
+                    break;
+                case 1u: // CNT
+                    dataAddress =
+                        (state.tadr + 16u) &
+                        0x7FFFFFFFu;
+                    state.tadr =
+                        (dataAddress +
+                         tagQwc * 16u) &
+                        0x7FFFFFFFu;
+                    break;
+                case 2u: // NEXT
+                    dataAddress =
+                        (state.tadr + 16u) &
+                        0x7FFFFFFFu;
+                    state.tadr = tagAddress;
+                    break;
+                case 3u: // REF
+                case 4u: // REFS
+                    state.tadr =
+                        (state.tadr + 16u) &
+                        0x7FFFFFFFu;
+                    break;
+                case 5u: // CALL
                 {
-                    tadr = asr1;
-                    asr1 = 0u;
-                    asp = 1u;
+                    dataAddress =
+                        (state.tadr + 16u) &
+                        0x7FFFFFFFu;
+                    const uint32_t returnAddress =
+                        (dataAddress +
+                         tagQwc * 16u) &
+                        0x7FFFFFFFu;
+                    if (state.asp == 0u)
+                    {
+                        state.asr0 = returnAddress;
+                        state.asp = 1u;
+                    }
+                    else if (state.asp == 1u)
+                    {
+                        state.asr1 = returnAddress;
+                        state.asp = 2u;
+                    }
+                    else
+                    {
+                        endChain = true;
+                    }
+                    state.tadr = tagAddress;
+                    break;
                 }
-                else if (asp == 1u)
-                {
-                    tadr = asr0;
-                    asr0 = 0u;
-                    asp = 0u;
-                }
-                else
-                {
+                case 6u: // RET
+                    dataAddress =
+                        (state.tadr + 16u) &
+                        0x7FFFFFFFu;
+                    if (state.asp == 2u)
+                    {
+                        state.tadr = state.asr1;
+                        state.asr1 = 0u;
+                        state.asp = 1u;
+                    }
+                    else if (state.asp == 1u)
+                    {
+                        state.tadr = state.asr0;
+                        state.asr0 = 0u;
+                        state.asp = 0u;
+                    }
+                    else
+                    {
+                        endChain = true;
+                    }
+                    break;
+                case 7u: // END
+                    dataAddress =
+                        (state.tadr + 16u) &
+                        0x7FFFFFFFu;
                     endChain = true;
+                    break;
+                default:
+                    fault("invalid source-chain tag");
+                    return result;
                 }
-                chcr = (chcr & ~(0x3u << 4u)) | (asp << 4u);
-                break;
-            }
-            case 7u: // END
-                dataAddress = (tadr + 16u) & 0x7FFFFFFFu;
-                endChain = true;
-                break;
-            default:
-                endChain = true;
-                break;
+                state.chcr =
+                    (state.chcr & ~(0x3u << 4u)) |
+                    (static_cast<uint32_t>(
+                         state.asp)
+                     << 4u);
+                state.madr = dataAddress;
+                state.qwc = tagQwc;
+                state.endAfterPayload =
+                    endChain ||
+                    (state.tie && state.tagIrq);
             }
 
-            madr = dataAddress;
-            qwc = tagQwc;
-            transferQwords(madr, qwc);
-            qwc = 0u;
+            state.phase =
+                state.qwc != 0u
+                    ? ScratchpadDmaPhase::
+                          TransferPayload
+                    : state.endAfterPayload
+                          ? ScratchpadDmaPhase::
+                                Finalize
+                          : ScratchpadDmaPhase::
+                                FetchTag;
+            publishScratchpadDmaRegisters(state);
 
-            if (tieEnabled && tagIrq)
+            if (state.qwc == 0u)
             {
-                endChain = true;
+                result.progressed = true;
+                result.delayEeCycles = 0u;
+                result.phase = state.phase;
+                result.active = true;
+                return result;
             }
         }
 
-        if (mode == 1u && !endChain)
+        if (state.phase !=
+            ScratchpadDmaPhase::TransferPayload)
         {
-            return false;
+            fault("unexpected progress phase");
+            return result;
         }
+
+        uint32_t sliceQwc =
+            std::min(state.qwc, kMaximumSliceQwc);
+        if (channel ==
+            DmacChannel::FromScratchpad)
+        {
+            const uint32_t untilWrap =
+                0x400u -
+                ((state.sadr & 0x3FFFu) >> 4u);
+            sliceQwc =
+                std::min(sliceQwc, untilWrap);
+        }
+        if (sliceQwc == 0u)
+        {
+            fault("zero-sized payload slice");
+            return result;
+        }
+
+        for (uint32_t offset = 0u;
+             offset < sliceQwc; ++offset)
+        {
+            const uint32_t scratchAddress =
+                PS2_SCRATCHPAD_BASE + state.sadr;
+            if (channel ==
+                DmacChannel::ToScratchpad)
+            {
+                write128(
+                    scratchAddress,
+                    read128(state.madr));
+            }
+            else
+            {
+                write128(
+                    state.madr,
+                    read128(scratchAddress));
+            }
+            state.madr =
+                (state.madr + 16u) &
+                0x7FFFFFFFu;
+            state.sadr =
+                (state.sadr + 16u) &
+                (PS2_SCRATCHPAD_SIZE - 1u);
+        }
+        state.qwc -= sliceQwc;
+        if (state.qwc == 0u)
+        {
+            state.phase =
+                state.endAfterPayload
+                    ? ScratchpadDmaPhase::Finalize
+                    : ScratchpadDmaPhase::FetchTag;
+        }
+        publishScratchpadDmaRegisters(state);
+
+        result.progressed = true;
+        result.delayEeCycles =
+            sliceQwc >
+                    UINT32_MAX /
+                        kEeCyclesPerQwc
+                ? UINT32_MAX
+                : sliceQwc *
+                      kEeCyclesPerQwc;
+        result.phase = state.phase;
+        result.active = true;
+        return result;
     }
     catch (const std::exception &error)
     {
-        PS2_IF_AGRESSIVE_LOGS({
-            RUNTIME_LOG("[dmac:scratchpad] transfer failed channel=0x" << std::hex
-                        << channelBase << " madr=0x" << madr
-                        << " sadr=0x" << sadr << " qwc=0x" << qwc
-                        << std::dec << " error=" << error.what() << std::endl);
-        });
-        return false;
+        fault(error.what());
+        return result;
     }
+}
 
-    m_ioRegisters[channelBase + 0x00u] = chcr;
-    m_ioRegisters[channelBase + 0x10u] = madr;
-    m_ioRegisters[channelBase + 0x20u] = qwc;
-    m_ioRegisters[channelBase + 0x30u] = tadr;
-    m_ioRegisters[channelBase + 0x40u] = asr0;
-    m_ioRegisters[channelBase + 0x50u] = asr1;
-    m_ioRegisters[channelBase + 0x80u] = sadr;
-    const std::optional<DmacChannel> channel =
-        dmacChannelFromBase(channelBase);
-    if (!channel.has_value())
+void PS2Memory::drainScratchpadDmaCompatibility(
+    DmacChannel channel)
+{
+    constexpr size_t kMaximumTransitions = 131072u;
+    for (size_t transition = 0u;
+         transition < kMaximumTransitions;
+         ++transition)
     {
-        return false;
+        const ScratchpadDmaAdvanceResult result =
+            advanceScratchpadDma(channel);
+        if (!result.active || result.completed ||
+            result.phase == ScratchpadDmaPhase::Fault)
+        {
+            return;
+        }
     }
-    const DmacChannelSnapshot state =
-        dmacChannelSnapshot(*channel);
-    (void)requestDmacCompletion(
-        DmacTransferToken{*channel, state.generation});
-    return true;
 }
 
 uint64_t PS2Memory::nextDmacSequence(uint64_t value) noexcept
@@ -3190,6 +3580,11 @@ void PS2Memory::discardPendingDmacWork(DmacChannel channel)
         m_pendingVif0Transfers.end());
     if (channel == DmacChannel::Vif1)
         clearVif1DmaState(true);
+    if (channel == DmacChannel::FromScratchpad ||
+        channel == DmacChannel::ToScratchpad)
+    {
+        clearScratchpadDmaState(channel, true);
+    }
 }
 
 DmacTransferToken PS2Memory::beginDmacTransfer(DmacChannel channel)

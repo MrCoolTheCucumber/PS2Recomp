@@ -904,6 +904,19 @@ PS2Runtime::PS2Runtime()
         {
             cancelVif1DmaEvent();
         });
+    m_memory.setScratchpadDmaScheduleCallback(
+        [this](
+            DmacChannel channel,
+            uint32_t delayEeCycles)
+        {
+            return scheduleScratchpadDmaFromMemory(
+                channel, delayEeCycles);
+        });
+    m_memory.setScratchpadDmaCancelCallback(
+        [this](DmacChannel channel)
+        {
+            cancelScratchpadDmaEvent(channel);
+        });
 
     m_iopHost = std::make_unique<PS2IopHostAdapter>(*this);
     m_iopSubsystem = std::make_unique<ps2x::iop::IopSubsystem>(*m_iopHost);
@@ -1119,6 +1132,19 @@ void PS2Runtime::resetEeTimingUnlocked(
         (void)m_memory.cancelDmacTransfer(
             DmacChannel::Vif1);
     }
+    for (const DmacChannel channel :
+         {DmacChannel::FromScratchpad,
+          DmacChannel::ToScratchpad})
+    {
+        cancelScratchpadDmaEvent(channel);
+        if (m_memory
+                .scratchpadDmaSnapshot(channel)
+                .active)
+        {
+            (void)m_memory.cancelDmacTransfer(
+                channel);
+        }
+    }
     m_eeTimeline.reset();
     m_eeEventScheduler.reset();
     cancelVU1Execution(true);
@@ -1180,6 +1206,19 @@ void PS2Runtime::setEeSchedulingMode(
         (void)m_memory.cancelDmacTransfer(
             DmacChannel::Vif1);
     }
+    for (const DmacChannel channel :
+         {DmacChannel::FromScratchpad,
+          DmacChannel::ToScratchpad})
+    {
+        cancelScratchpadDmaEvent(channel);
+        if (m_memory
+                .scratchpadDmaSnapshot(channel)
+                .active)
+        {
+            (void)m_memory.cancelDmacTransfer(
+                channel);
+        }
+    }
     m_eeSchedulingMode = mode;
     m_eeEventScheduler.reset();
     cancelVU1Execution(true);
@@ -1190,7 +1229,8 @@ void PS2Runtime::setEeSchedulingMode(
     m_eeSchedulerShadowLegacyPending = false;
     m_eeSchedulerShadowPending = false;
 
-    if (mode != ps2x::timing::EeSchedulingMode::Legacy &&
+    if (mode ==
+            ps2x::timing::EeSchedulingMode::Shadow &&
         m_vu0.isActive() &&
         m_vu0NextEventCycleTick !=
             ps2x::timing::EeTick{})
@@ -1482,6 +1522,119 @@ void PS2Runtime::serviceVif1DmaAtEvent(
     }
 
     scheduleVif1DmaEvent(
+        ps2x::timing::saturatingAdd(
+            service.serviceTick,
+            ps2x::timing::eeCyclesToTicks(
+                advance.delayEeCycles)));
+}
+
+ps2x::timing::EeEventSource
+PS2Runtime::scratchpadDmaEventSource(
+    DmacChannel channel) noexcept
+{
+    switch (channel)
+    {
+    case DmacChannel::FromScratchpad:
+        return ps2x::timing::EeEventSource::
+            DmacFromScratchpad;
+    case DmacChannel::ToScratchpad:
+        return ps2x::timing::EeEventSource::
+            DmacToScratchpad;
+    default:
+        return ps2x::timing::EeEventSource::Count;
+    }
+}
+
+bool PS2Runtime::scheduleScratchpadDmaFromMemory(
+    DmacChannel channel,
+    uint32_t delayEeCycles)
+{
+    if (m_eeSchedulingMode !=
+            ps2x::timing::EeSchedulingMode::Event ||
+        scratchpadDmaEventSource(channel) ==
+            ps2x::timing::EeEventSource::Count)
+    {
+        return false;
+    }
+
+    const ps2x::timing::EeTick now =
+        commitEeContextProgress(m_boundEeContext);
+    scheduleScratchpadDmaEvent(
+        channel,
+        ps2x::timing::saturatingAdd(
+            now,
+            ps2x::timing::eeCyclesToTicks(
+                delayEeCycles)));
+    const ps2x::timing::EeEventToken &token =
+        channel == DmacChannel::FromScratchpad
+            ? m_fromScratchpadDmaEventToken
+            : m_toScratchpadDmaEventToken;
+    return token.generation != 0u;
+}
+
+void PS2Runtime::scheduleScratchpadDmaEvent(
+    DmacChannel channel,
+    ps2x::timing::EeTick deadline) noexcept
+{
+    const ps2x::timing::EeEventSource source =
+        scratchpadDmaEventSource(channel);
+    if (source == ps2x::timing::EeEventSource::Count)
+        return;
+
+    const ps2x::timing::EeEventToken token =
+        m_eeEventScheduler.scheduleAbsolute(
+            source, deadline);
+    if (channel == DmacChannel::FromScratchpad)
+        m_fromScratchpadDmaEventToken = token;
+    else
+        m_toScratchpadDmaEventToken = token;
+}
+
+void PS2Runtime::cancelScratchpadDmaEvent(
+    DmacChannel channel) noexcept
+{
+    ps2x::timing::EeEventToken *token = nullptr;
+    if (channel == DmacChannel::FromScratchpad)
+        token = &m_fromScratchpadDmaEventToken;
+    else if (channel == DmacChannel::ToScratchpad)
+        token = &m_toScratchpadDmaEventToken;
+    if (!token)
+        return;
+
+    if (token->generation != 0u)
+        (void)m_eeEventScheduler.cancel(*token);
+    *token = {
+        scratchpadDmaEventSource(channel), 0u};
+}
+
+void PS2Runtime::serviceScratchpadDmaAtEvent(
+    DmacChannel channel,
+    const ps2x::timing::EeEventService &service)
+{
+    ps2x::timing::EeEventToken *token =
+        channel == DmacChannel::FromScratchpad
+            ? &m_fromScratchpadDmaEventToken
+            : &m_toScratchpadDmaEventToken;
+    if (service.source !=
+            scratchpadDmaEventSource(channel) ||
+        token->generation == 0u ||
+        service.generation != token->generation)
+    {
+        return;
+    }
+
+    *token = {
+        scratchpadDmaEventSource(channel), 0u};
+    const ScratchpadDmaAdvanceResult advance =
+        m_memory.advanceScratchpadDma(channel);
+    if (!advance.active || advance.completed ||
+        advance.phase == ScratchpadDmaPhase::Fault)
+    {
+        return;
+    }
+
+    scheduleScratchpadDmaEvent(
+        channel,
         ps2x::timing::saturatingAdd(
             service.serviceTick,
             ps2x::timing::eeCyclesToTicks(
@@ -2578,6 +2731,15 @@ void PS2Runtime::synchronizeVU0Microprogram(
 
     const ps2x::timing::EeTick eeCycleTick =
         commitEeContextProgress(ctx);
+    if (m_eeSchedulingMode ==
+            ps2x::timing::EeSchedulingMode::Event &&
+        m_eeEventScheduler.deadlineDue(eeCycleTick))
+    {
+        // A COP2 synchronization is also a safe EE event boundary. Service
+        // the complete due device batch before publishing VU0 state, just
+        // as PCSX2 does when an architectural access reaches an event test.
+        serviceEeEventsAtTick(rdram, ctx, eeCycleTick);
+    }
     if (!m_vu0.isActive())
     {
         ctx->vu0_vpu_stat &= ~1u;
@@ -2586,18 +2748,20 @@ void PS2Runtime::synchronizeVU0Microprogram(
         return;
     }
 
-    ps2x::timing::EeTick nextEventTick =
-        m_vu0NextEventCycleTick;
+    ps2x::timing::EeTick nextEventTick{};
     if (m_eeSchedulingMode ==
         ps2x::timing::EeSchedulingMode::Event)
     {
-        const auto scheduled = m_eeEventScheduler.event(
-            ps2x::timing::EeEventSource::
-                Vu0PeriodicCompatibility);
+        const auto scheduled =
+            m_eeEventScheduler.nextDeadline();
         if (scheduled.has_value())
         {
-            nextEventTick = scheduled->deadline;
+            nextEventTick = *scheduled;
         }
+    }
+    else
+    {
+        nextEventTick = m_vu0NextEventCycleTick;
     }
 
     synchronizeVU0MicroprogramAtTick(
@@ -2739,8 +2903,8 @@ void PS2Runtime::scheduleVu0CompatibilityEvent(
     ps2x::timing::EeTick deadline) noexcept
 {
     m_vu0NextEventCycleTick = deadline;
-    if (m_eeSchedulingMode !=
-        ps2x::timing::EeSchedulingMode::Legacy)
+    if (m_eeSchedulingMode ==
+        ps2x::timing::EeSchedulingMode::Shadow)
     {
         (void)m_eeEventScheduler.scheduleAbsolute(
             ps2x::timing::EeEventSource::
@@ -2819,23 +2983,23 @@ void PS2Runtime::dispatchEeEvent(
             cancelVu0CompatibilityEvent();
             return;
         }
-        synchronizeVU0MicroprogramAtTick(
-            rdram, ctx, false, true, true,
-            service.serviceTick, service.scheduledTick);
-        if (m_vu0.isActive())
-        {
-            scheduleVu0CompatibilityEvent(
-                nextVu0CompatibilityDeadline(
-                    service.scheduledTick,
-                    service.serviceTick));
-        }
-        else
-        {
-            cancelVu0CompatibilityEvent();
-        }
+        scheduleVu0CompatibilityEvent(
+            nextVu0CompatibilityDeadline(
+                service.scheduledTick,
+                service.serviceTick));
         return;
     case ps2x::timing::EeEventSource::DmacVif1:
         serviceVif1DmaAtEvent(service);
+        return;
+    case ps2x::timing::EeEventSource::
+        DmacFromScratchpad:
+        serviceScratchpadDmaAtEvent(
+            DmacChannel::FromScratchpad, service);
+        return;
+    case ps2x::timing::EeEventSource::
+        DmacToScratchpad:
+        serviceScratchpadDmaAtEvent(
+            DmacChannel::ToScratchpad, service);
         return;
     case ps2x::timing::EeEventSource::VifVu1Finish:
         serviceVU1AtEvent(ctx, service);
@@ -2860,18 +3024,34 @@ void PS2Runtime::serviceEeEventsAtTick(
             eeCycleTick,
             [&](const ps2x::timing::EeEventService &service)
             {
+                const bool traceEnabled =
+                    m_debugEeEventTraceEnabled.load(
+                        std::memory_order_relaxed);
+                DebugEeEventEntry entry{};
+                if (traceEnabled)
+                {
+                    entry.source = service.source;
+                    entry.eventSequence = service.sequence;
+                    entry.generation = service.generation;
+                    entry.scheduledTick =
+                        service.scheduledTick.raw();
+                    entry.serviceTick =
+                        service.serviceTick.raw();
+                    entry.latenessTicks =
+                        service.latenessTicks.raw();
+                    entry.eePc = ctx ? ctx->pc : 0u;
+                    entry.deviceBefore =
+                        debugEeEventDeviceState(
+                            service.source);
+                }
+
                 dispatchEeEvent(rdram, ctx, service);
 
-                DebugEeEventEntry entry{};
-                entry.source = service.source;
-                entry.eventSequence = service.sequence;
-                entry.generation = service.generation;
-                entry.scheduledTick =
-                    service.scheduledTick.raw();
-                entry.serviceTick =
-                    service.serviceTick.raw();
-                entry.latenessTicks =
-                    service.latenessTicks.raw();
+                if (!traceEnabled)
+                    return;
+
+                entry.deviceAfter =
+                    debugEeEventDeviceState(service.source);
                 const auto followup =
                     m_eeEventScheduler.event(service.source);
                 if (followup.has_value())
@@ -2894,7 +3074,104 @@ void PS2Runtime::serviceEeEventsAtTick(
         }
         std::cerr << std::endl;
         requestStop();
+        return;
     }
+
+    // PCSX2 services the complete fixed-priority device batch before its
+    // ordinary VU0 catch-up. A same-tick callback scheduled by another
+    // callback therefore remains part of this batch, and VU0 advances only
+    // once to the actual shared-event service time.
+    if (result.serviced != 0u)
+    {
+        ps2x::timing::EeTick nextEventTick{};
+        const auto nextDeadline =
+            m_eeEventScheduler.nextDeadline();
+        if (nextDeadline.has_value())
+            nextEventTick = *nextDeadline;
+
+        if (m_vu0.isActive())
+        {
+            synchronizeVU0MicroprogramAtTick(
+                rdram, ctx, false, true, true,
+                eeCycleTick, nextEventTick);
+        }
+        else
+        {
+            ctx->vu0_vpu_stat &= ~1u;
+            m_vu0CycleTick = eeCycleTick;
+        }
+    }
+}
+
+PS2Runtime::DebugEeEventDeviceState
+PS2Runtime::debugEeEventDeviceState(
+    ps2x::timing::EeEventSource source) const noexcept
+{
+    DebugEeEventDeviceState result{};
+    switch (source)
+    {
+    case ps2x::timing::EeEventSource::DmacVif1:
+    {
+        const Vif1DmaSnapshot state =
+            m_memory.vif1DmaSnapshot();
+        result.kind = DebugEeEventDeviceKind::Vif1Dma;
+        result.operationGeneration =
+            state.transfer.generation;
+        result.phase =
+            static_cast<uint32_t>(state.phase);
+        result.stall =
+            static_cast<uint32_t>(state.stall);
+        result.tadr = state.tadr;
+        result.madr = state.madr;
+        result.qwc = state.qwc;
+        result.tagsProcessed = state.tagsProcessed;
+        result.active = state.active;
+        return result;
+    }
+    case ps2x::timing::EeEventSource::
+        DmacFromScratchpad:
+    case ps2x::timing::EeEventSource::
+        DmacToScratchpad:
+    {
+        const DmacChannel channel =
+            source ==
+                    ps2x::timing::EeEventSource::
+                        DmacFromScratchpad
+                ? DmacChannel::FromScratchpad
+                : DmacChannel::ToScratchpad;
+        const ScratchpadDmaSnapshot state =
+            m_memory.scratchpadDmaSnapshot(channel);
+        result.kind =
+            DebugEeEventDeviceKind::ScratchpadDma;
+        result.operationGeneration =
+            state.transfer.generation;
+        result.phase =
+            static_cast<uint32_t>(state.phase);
+        result.tadr = state.tadr;
+        result.madr = state.madr;
+        result.qwc = state.qwc;
+        result.tagsProcessed = state.tagsProcessed;
+        result.active = state.active;
+        return result;
+    }
+    case ps2x::timing::EeEventSource::VifVu1Finish:
+        result.kind = DebugEeEventDeviceKind::Vu1;
+        result.operationGeneration =
+            m_vu1ExecutionTiming.generation;
+        result.lastAdvancedTick =
+            m_vu1ExecutionTiming.lastAdvancedTick.raw();
+        result.totalAdvancedCycles =
+            m_vu1ExecutionTiming.totalAdvancedCycles;
+        result.pc = m_vu1.state().pc;
+        result.active = m_vu1.isActive();
+        return result;
+    case ps2x::timing::EeEventSource::DmacCompletion:
+    case ps2x::timing::EeEventSource::
+        Vu0PeriodicCompatibility:
+    case ps2x::timing::EeEventSource::Count:
+        return result;
+    }
+    return result;
 }
 
 bool PS2Runtime::checkEeSchedulerShadow(
@@ -4369,6 +4646,8 @@ PS2Runtime::debugEeSchedulerSnapshot()
         DebugEeEventSlot &target = result.slots[index];
         target.source =
             static_cast<ps2x::timing::EeEventSource>(index);
+        target.device =
+            debugEeEventDeviceState(target.source);
         const auto source = m_eeEventScheduler.event(
             target.source);
         if (!source.has_value())

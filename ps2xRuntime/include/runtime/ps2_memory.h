@@ -444,6 +444,46 @@ struct Vif1DmaSnapshot
     bool endAfterPayload = false;
 };
 
+enum class ScratchpadDmaPhase : uint8_t
+{
+    Idle = 0u,
+    FetchTag,
+    TransferPayload,
+    Finalize,
+    Fault,
+};
+
+struct ScratchpadDmaAdvanceResult
+{
+    DmacTransferToken transfer{};
+    ScratchpadDmaPhase phase = ScratchpadDmaPhase::Idle;
+    uint32_t delayEeCycles = 0u;
+    bool progressed = false;
+    bool completed = false;
+    bool active = false;
+};
+
+struct ScratchpadDmaSnapshot
+{
+    DmacTransferToken transfer{};
+    ScratchpadDmaPhase phase = ScratchpadDmaPhase::Idle;
+    uint32_t chcr = 0u;
+    uint32_t madr = 0u;
+    uint32_t qwc = 0u;
+    uint32_t tadr = 0u;
+    uint32_t asr0 = 0u;
+    uint32_t asr1 = 0u;
+    uint32_t sadr = 0u;
+    uint32_t tagsProcessed = 0u;
+    uint8_t asp = 0u;
+    uint8_t tagId = 0u;
+    bool active = false;
+    bool eventManaged = false;
+    bool chainMode = false;
+    bool tagIrq = false;
+    bool endAfterPayload = false;
+};
+
 struct JumpTable
 {
     uint32_t address = 0;          // Base address of the jump table
@@ -532,6 +572,24 @@ public:
     {
         m_vif1DmaCancelCallback = std::move(cb);
     }
+    using ScratchpadDmaScheduleCallback =
+        std::function<bool(
+            DmacChannel channel,
+            uint32_t delayEeCycles)>;
+    void setScratchpadDmaScheduleCallback(
+        ScratchpadDmaScheduleCallback cb)
+    {
+        m_scratchpadDmaScheduleCallback =
+            std::move(cb);
+    }
+    using ScratchpadDmaCancelCallback =
+        std::function<void(DmacChannel channel)>;
+    void setScratchpadDmaCancelCallback(
+        ScratchpadDmaCancelCallback cb)
+    {
+        m_scratchpadDmaCancelCallback =
+            std::move(cb);
+    }
     using Vif1GifPathAvailableCallback =
         std::function<bool(bool directHl)>;
     void setVif1GifPathAvailableCallback(
@@ -547,6 +605,10 @@ public:
     bool wakeVif1Dma();
     Vif1DmaAdvanceResult advanceVif1Dma();
     [[nodiscard]] Vif1DmaSnapshot vif1DmaSnapshot() const;
+    ScratchpadDmaAdvanceResult advanceScratchpadDma(
+        DmacChannel channel);
+    [[nodiscard]] ScratchpadDmaSnapshot
+    scratchpadDmaSnapshot(DmacChannel channel) const;
 
     uint8_t *getVU1Code() { return m_vu1Code; }
     const uint8_t *getVU1Code() const { return m_vu1Code; }
@@ -665,6 +727,10 @@ public:
     Vif1ResetCallback m_vif1ResetCallback;
     Vif1DmaScheduleCallback m_vif1DmaScheduleCallback;
     Vif1DmaCancelCallback m_vif1DmaCancelCallback;
+    ScratchpadDmaScheduleCallback
+        m_scratchpadDmaScheduleCallback;
+    ScratchpadDmaCancelCallback
+        m_scratchpadDmaCancelCallback;
     Vif1GifPathAvailableCallback
         m_vif1GifPathAvailableCallback;
 
@@ -751,6 +817,33 @@ public:
     };
     Vif1DmaState m_vif1Dma{};
 
+    struct ScratchpadDmaState
+    {
+        DmacTransferToken transfer{};
+        ScratchpadDmaPhase phase =
+            ScratchpadDmaPhase::Idle;
+        uint32_t chcr = 0u;
+        uint32_t madr = 0u;
+        uint32_t qwc = 0u;
+        uint32_t tadr = 0u;
+        uint32_t asr0 = 0u;
+        uint32_t asr1 = 0u;
+        uint32_t sadr = 0u;
+        uint32_t tagsProcessed = 0u;
+        uint8_t asp = 0u;
+        uint8_t tagId = 0u;
+        bool active = false;
+        bool eventManaged = false;
+        bool chainMode = false;
+        bool tie = false;
+        bool tte = false;
+        bool tagIrq = false;
+        bool endAfterPayload = false;
+        bool faultReported = false;
+    };
+    std::array<ScratchpadDmaState, 2u>
+        m_scratchpadDma{};
+
     struct DmacChannelLifecycle
     {
         DmacChannelPhase phase = DmacChannelPhase::Idle;
@@ -791,7 +884,20 @@ public:
     uint8_t *mapVuMemory(uint32_t physAddr, uint32_t size, uint32_t &offset, uint32_t &limit);
     const uint8_t *mapVuMemory(uint32_t physAddr, uint32_t size, uint32_t &offset, uint32_t &limit) const;
     void updateEeTimer0Counter();
-    bool processScratchpadDma(uint32_t channelBase);
+    bool startScratchpadDma(
+        DmacTransferToken transfer, uint32_t chcr);
+    bool scheduleScratchpadDma(
+        DmacChannel channel,
+        uint32_t delayEeCycles);
+    void clearScratchpadDmaState(
+        DmacChannel channel,
+        bool notifyRuntime);
+    void drainScratchpadDmaCompatibility(
+        DmacChannel channel);
+    [[nodiscard]] static std::optional<size_t>
+    scratchpadDmaIndex(DmacChannel channel) noexcept;
+    void publishScratchpadDmaRegisters(
+        const ScratchpadDmaState &state);
     void discardPendingDmacWork(DmacChannel channel);
     bool startVif1Dma(
         DmacTransferToken transfer, uint32_t chcr);

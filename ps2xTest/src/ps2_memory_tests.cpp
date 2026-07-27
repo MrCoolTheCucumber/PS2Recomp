@@ -1162,6 +1162,108 @@ void register_ps2_memory_tests()
             t.Equals(mem.readIORegister(kGifCh + 0x20u), 0u, "GIF QWC should be cleared after drain");
         });
 
+        tc.Run("SPR_TO scheduled progress limits payload slices to 0x400 QWC", [](TestCase &t)
+        {
+            PS2Memory mem;
+            t.IsTrue(
+                mem.initialize(),
+                "PS2Memory initialize should succeed");
+
+            constexpr uint32_t kChannel = 0x1000D400u;
+            constexpr uint32_t kSource = 0x0001C000u;
+            constexpr uint32_t kQwc = 0x401u;
+            uint32_t scheduleCount = 0u;
+            uint32_t scheduledDelay = 0u;
+            mem.setScratchpadDmaScheduleCallback(
+                [&](DmacChannel channel,
+                    uint32_t delayEeCycles)
+                {
+                    t.IsTrue(
+                        channel ==
+                            DmacChannel::ToScratchpad,
+                        "SPR_TO should retain typed scheduling ownership");
+                    ++scheduleCount;
+                    scheduledDelay = delayEeCycles;
+                    return true;
+                });
+
+            for (uint32_t qword = 0u;
+                 qword < kQwc; ++qword)
+            {
+                std::memset(
+                    mem.getRDRAM() + kSource +
+                        qword * 16u,
+                    static_cast<int>(
+                        (qword + 0x5Au) & 0xFFu),
+                    16u);
+            }
+
+            t.IsTrue(
+                mem.writeIORegister(
+                    kChannel + 0x10u, kSource),
+                "scheduled SPR_TO MADR write should succeed");
+            t.IsTrue(
+                mem.writeIORegister(
+                    kChannel + 0x20u, kQwc),
+                "scheduled SPR_TO QWC write should succeed");
+            t.IsTrue(
+                mem.writeIORegister(
+                    kChannel, 0x100u),
+                "scheduled SPR_TO start should succeed");
+
+            ScratchpadDmaSnapshot dma =
+                mem.scratchpadDmaSnapshot(
+                    DmacChannel::ToScratchpad);
+            t.IsTrue(
+                dma.active && dma.eventManaged &&
+                    dma.phase ==
+                        ScratchpadDmaPhase::TransferPayload,
+                "the first bounded slice should retain one QWC");
+            t.Equals(
+                dma.qwc, 1u,
+                "the initial callback should consume exactly 0x400 QWC");
+            t.Equals(
+                dma.madr, kSource + 0x4000u,
+                "the initial callback should expose bounded MADR progress");
+            t.Equals(
+                dma.sadr, 0u,
+                "a full scratchpad slice should wrap SADR");
+            t.Equals(
+                scheduleCount, 1u,
+                "submission should request one device event");
+            t.Equals(
+                scheduledDelay, 0x800u,
+                "0x400 QWC should cost 0x800 EE cycles");
+
+            const ScratchpadDmaAdvanceResult tail =
+                mem.advanceScratchpadDma(
+                    DmacChannel::ToScratchpad);
+            t.IsTrue(
+                tail.active && tail.progressed &&
+                    tail.phase ==
+                        ScratchpadDmaPhase::Finalize,
+                "the next event should consume the remaining QWC");
+            t.Equals(
+                tail.delayEeCycles, 2u,
+                "the final QWC should retain its two-cycle bus cost");
+            t.Equals(
+                mem.getScratchpad()[0],
+                static_cast<uint8_t>(0x5Au),
+                "the wrapping tail should copy QWC 0x400 to scratch offset zero");
+
+            const ScratchpadDmaAdvanceResult final =
+                mem.advanceScratchpadDma(
+                    DmacChannel::ToScratchpad);
+            t.IsTrue(
+                final.completed && !final.active,
+                "a later transition should request completion");
+            publishDmacCompletions(mem);
+            t.IsTrue(
+                (mem.readIORegister(kChannel) &
+                 0x100u) == 0u,
+                "completion publication should clear SPR_TO STR");
+        });
+
         tc.Run("SPR_TO normal DMA copies RDRAM into wrapping scratchpad", [](TestCase &t)
         {
             PS2Memory mem;

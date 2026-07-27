@@ -3142,6 +3142,648 @@ void register_ps2_runtime_expansion_tests()
                 0x10003C10u, 1u);
         });
 
+        tc.Run("event SPR_TO normal DMA retains busy state for its reference bus cost", [](TestCase &t)
+        {
+            PS2Runtime runtime;
+            t.IsTrue(
+                runtime.memory().initialize(),
+                "SPR_TO timing fixture memory should initialize");
+            t.IsTrue(
+                runtime.syncCoreSubsystems(),
+                "SPR_TO timing fixture subsystems should bind");
+            runtime.setEeSchedulingMode(
+                ps2x::timing::EeSchedulingMode::Event);
+
+            constexpr uint32_t kSprTo = 0x1000D400u;
+            constexpr uint32_t kDstat = 0x1000E010u;
+            constexpr uint32_t kSource = 0x0002A000u;
+            constexpr uint32_t kScratch = 0x2800u;
+            constexpr uint32_t kQwc = 118u;
+            constexpr uint64_t kCompletionTick =
+                static_cast<uint64_t>(kQwc) * 2u *
+                ps2x::timing::kEeTicksPerCycle;
+
+            for (uint32_t byte = 0u;
+                 byte < kQwc * 16u; ++byte)
+            {
+                runtime.memory().getRDRAM()[kSource + byte] =
+                    static_cast<uint8_t>(
+                        (0x31u + byte * 7u) & 0xFFu);
+            }
+
+            runtime.debugStartEeEventTrace(4u);
+            t.IsTrue(
+                runtime.memory().writeIORegister(
+                    kSprTo + 0x10u, kSource),
+                "SPR_TO MADR write should succeed");
+            t.IsTrue(
+                runtime.memory().writeIORegister(
+                    kSprTo + 0x20u, kQwc),
+                "SPR_TO QWC write should succeed");
+            t.IsTrue(
+                runtime.memory().writeIORegister(
+                    kSprTo + 0x80u, kScratch),
+                "SPR_TO SADR write should succeed");
+            t.IsTrue(
+                runtime.memory().writeIORegister(
+                    kSprTo, 0x100u),
+                "SPR_TO normal start should succeed");
+
+            const ScratchpadDmaSnapshot submitted =
+                runtime.memory().scratchpadDmaSnapshot(
+                    DmacChannel::ToScratchpad);
+            t.IsTrue(
+                submitted.active && submitted.eventManaged,
+                "submission should retain an event-owned SPR_TO operation");
+            t.IsTrue(
+                submitted.phase ==
+                    ScratchpadDmaPhase::Finalize,
+                "the bounded payload slice should await timed finalization");
+            t.Equals(
+                submitted.madr, kSource + kQwc * 16u,
+                "submission should expose transferred MADR");
+            t.Equals(
+                submitted.qwc, 0u,
+                "submission should expose the consumed payload QWC");
+            t.IsTrue(
+                (runtime.memory().readIORegister(kSprTo) &
+                 0x100u) != 0u,
+                "SPR_TO should expose CHCR.STR while timing remains");
+            t.IsTrue(
+                (runtime.memory().readIORegister(kDstat) &
+                 (1u << 9u)) == 0u,
+                "SPR_TO submission must not publish completion");
+
+            bool copied = true;
+            for (uint32_t byte = 0u;
+                 byte < kQwc * 16u; ++byte)
+            {
+                copied &=
+                    runtime.memory().getScratchpad()[
+                        kScratch + byte] ==
+                    static_cast<uint8_t>(
+                        (0x31u + byte * 7u) & 0xFFu);
+            }
+            t.IsTrue(
+                copied,
+                "SPR_TO should copy its first bounded slice at submission");
+
+            PS2Runtime::DebugEeScheduler scheduler =
+                runtime.debugEeSchedulerSnapshot();
+            const auto &submittedSlot =
+                scheduler.slots[ps2x::timing::
+                    eeEventSourceIndex(
+                        ps2x::timing::EeEventSource::
+                            DmacToScratchpad)];
+            t.IsTrue(
+                submittedSlot.pending,
+                "SPR_TO should retain a timed device event");
+            t.Equals(
+                submittedSlot.deadlineTick,
+                kCompletionTick,
+                "SPR_TO should cost two EE cycles per QWC");
+            t.IsTrue(
+                submittedSlot.device.kind ==
+                    PS2Runtime::DebugEeEventDeviceKind::
+                        ScratchpadDma,
+                "scheduler status should identify the event-owned device");
+            t.IsTrue(
+                submittedSlot.device.active,
+                "scheduler status should retain active device state");
+            t.Equals(
+                submittedSlot.device.operationGeneration,
+                submitted.transfer.generation,
+                "scheduler status should correlate slot and operation generations");
+            t.Equals(
+                submittedSlot.device.madr,
+                submitted.madr,
+                "scheduler status should expose current device registers");
+
+            R5900Context &context = runtime.cpu();
+            context.advanceEeCycleTicks(
+                static_cast<uint32_t>(
+                    kCompletionTick -
+                    ps2x::timing::kEeTicksPerCycle));
+            runtime.serviceEeEventsAtBlockBoundary(
+                runtime.memory().getRDRAM(), &context);
+            t.IsTrue(
+                runtime.memory()
+                    .scratchpadDmaSnapshot(
+                        DmacChannel::ToScratchpad)
+                    .active,
+                "SPR_TO should remain active immediately before its deadline");
+            t.IsTrue(
+                (runtime.memory().readIORegister(kDstat) &
+                 (1u << 9u)) == 0u,
+                "pre-deadline service should keep D_STAT clear");
+
+            context.advanceEeCycleTicks(
+                ps2x::timing::kEeTicksPerCycle);
+            runtime.serviceEeEventsAtBlockBoundary(
+                runtime.memory().getRDRAM(), &context);
+            t.IsFalse(
+                runtime.memory()
+                    .scratchpadDmaSnapshot(
+                        DmacChannel::ToScratchpad)
+                    .active,
+                "SPR_TO should retire at the reference deadline");
+            t.IsTrue(
+                (runtime.memory().readIORegister(kSprTo) &
+                 0x100u) == 0u,
+                "completion publication should clear SPR_TO STR");
+            t.IsTrue(
+                (runtime.memory().readIORegister(kDstat) &
+                 (1u << 9u)) != 0u,
+                "completion publication should latch SPR_TO D_STAT");
+
+            const PS2Runtime::DebugEeEventTrace trace =
+                runtime.debugEeEventTraceSnapshot(true);
+            t.Equals(
+                trace.entries.size(),
+                static_cast<size_t>(2u),
+                "SPR_TO should trace device finalization and publication");
+            if (trace.entries.size() == 2u)
+            {
+                t.IsTrue(
+                    trace.entries[0].source ==
+                            ps2x::timing::EeEventSource::
+                                DmacToScratchpad &&
+                        trace.entries[1].source ==
+                            ps2x::timing::EeEventSource::
+                                DmacCompletion,
+                    "SPR_TO state must finalize before completion publication");
+                t.Equals(
+                    trace.entries[0].scheduledTick,
+                    kCompletionTick,
+                    "SPR_TO trace should retain its exact deadline");
+            }
+        });
+
+        tc.Run("equal-tick SPR events service from-memory before to-memory", [](TestCase &t)
+        {
+            PS2Runtime runtime;
+            t.IsTrue(
+                runtime.memory().initialize(),
+                "equal-tick SPR fixture memory should initialize");
+            t.IsTrue(
+                runtime.syncCoreSubsystems(),
+                "equal-tick SPR fixture subsystems should bind");
+            runtime.setEeSchedulingMode(
+                ps2x::timing::EeSchedulingMode::Event);
+
+            constexpr uint32_t kSprFrom = 0x1000D000u;
+            constexpr uint32_t kSprTo = 0x1000D400u;
+            constexpr uint32_t kDstat = 0x1000E010u;
+            constexpr uint32_t kFromDestination =
+                0x0002B000u;
+            constexpr uint32_t kToSource = 0x0002C000u;
+            constexpr uint32_t kFromScratch = 0x1000u;
+            constexpr uint32_t kToScratch = 0x2000u;
+            constexpr uint32_t kQwc = 2u;
+
+            for (uint32_t byte = 0u;
+                 byte < kQwc * 16u; ++byte)
+            {
+                runtime.memory().getScratchpad()[
+                    kFromScratch + byte] =
+                    static_cast<uint8_t>(0x80u + byte);
+                runtime.memory().getRDRAM()[
+                    kToSource + byte] =
+                    static_cast<uint8_t>(0x40u + byte);
+            }
+
+            runtime.debugStartEeEventTrace(8u);
+            t.IsTrue(
+                runtime.memory().writeIORegister(
+                    kSprTo + 0x10u, kToSource),
+                "equal-tick SPR_TO MADR should write");
+            t.IsTrue(
+                runtime.memory().writeIORegister(
+                    kSprTo + 0x20u, kQwc),
+                "equal-tick SPR_TO QWC should write");
+            t.IsTrue(
+                runtime.memory().writeIORegister(
+                    kSprTo + 0x80u, kToScratch),
+                "equal-tick SPR_TO SADR should write");
+            t.IsTrue(
+                runtime.memory().writeIORegister(
+                    kSprTo, 0x100u),
+                "equal-tick SPR_TO should start");
+
+            t.IsTrue(
+                runtime.memory().writeIORegister(
+                    kSprFrom + 0x10u,
+                    kFromDestination),
+                "equal-tick SPR_FROM MADR should write");
+            t.IsTrue(
+                runtime.memory().writeIORegister(
+                    kSprFrom + 0x20u, kQwc),
+                "equal-tick SPR_FROM QWC should write");
+            t.IsTrue(
+                runtime.memory().writeIORegister(
+                    kSprFrom + 0x80u, kFromScratch),
+                "equal-tick SPR_FROM SADR should write");
+            t.IsTrue(
+                runtime.memory().writeIORegister(
+                    kSprFrom, 0x100u),
+                "equal-tick SPR_FROM should start");
+
+            const PS2Runtime::DebugEeScheduler submitted =
+                runtime.debugEeSchedulerSnapshot();
+            const auto &fromSlot =
+                submitted.slots[ps2x::timing::
+                    eeEventSourceIndex(
+                        ps2x::timing::EeEventSource::
+                            DmacFromScratchpad)];
+            const auto &toSlot =
+                submitted.slots[ps2x::timing::
+                    eeEventSourceIndex(
+                        ps2x::timing::EeEventSource::
+                            DmacToScratchpad)];
+            t.IsTrue(
+                fromSlot.pending && toSlot.pending,
+                "both SPR directions should retain events");
+            t.Equals(
+                fromSlot.deadlineTick, 32ull,
+                "SPR_FROM should use the two-cycle bus cost");
+            t.Equals(
+                toSlot.deadlineTick, 32ull,
+                "SPR_TO should use the two-cycle bus cost");
+
+            R5900Context &context = runtime.cpu();
+            context.advanceEeCycleTicks(32u);
+            runtime.serviceEeEventsAtBlockBoundary(
+                runtime.memory().getRDRAM(), &context);
+
+            bool copied = true;
+            for (uint32_t byte = 0u;
+                 byte < kQwc * 16u; ++byte)
+            {
+                copied &=
+                    runtime.memory().getRDRAM()[
+                        kFromDestination + byte] ==
+                    static_cast<uint8_t>(0x80u + byte);
+                copied &=
+                    runtime.memory().getScratchpad()[
+                        kToScratch + byte] ==
+                    static_cast<uint8_t>(0x40u + byte);
+            }
+            t.IsTrue(
+                copied,
+                "both equal-tick SPR payloads should be visible");
+            t.IsTrue(
+                (runtime.memory().readIORegister(kDstat) &
+                 ((1u << 8u) | (1u << 9u))) ==
+                    ((1u << 8u) | (1u << 9u)),
+                "both SPR causes should publish in the same batch");
+
+            const PS2Runtime::DebugEeEventTrace trace =
+                runtime.debugEeEventTraceSnapshot(true);
+            t.Equals(
+                trace.entries.size(),
+                static_cast<size_t>(4u),
+                "each SPR device event should precede its publication");
+            if (trace.entries.size() == 4u)
+            {
+                t.IsTrue(
+                    trace.entries[0].source ==
+                            ps2x::timing::EeEventSource::
+                                DmacFromScratchpad &&
+                        trace.entries[1].source ==
+                            ps2x::timing::EeEventSource::
+                                DmacCompletion &&
+                        trace.entries[2].source ==
+                            ps2x::timing::EeEventSource::
+                                DmacToScratchpad &&
+                        trace.entries[3].source ==
+                            ps2x::timing::EeEventSource::
+                                DmacCompletion,
+                    "fixed priority should service SPR_FROM before SPR_TO");
+            }
+        });
+
+        tc.Run("event SPR_TO chain retains tag progress between deadlines", [](TestCase &t)
+        {
+            PS2Runtime runtime;
+            t.IsTrue(
+                runtime.memory().initialize(),
+                "SPR_TO chain fixture memory should initialize");
+            t.IsTrue(
+                runtime.syncCoreSubsystems(),
+                "SPR_TO chain fixture subsystems should bind");
+            runtime.setEeSchedulingMode(
+                ps2x::timing::EeSchedulingMode::Event);
+
+            constexpr uint32_t kSprTo = 0x1000D400u;
+            constexpr uint32_t kDstat = 0x1000E010u;
+            constexpr uint32_t kTag = 0x0002D000u;
+            constexpr uint32_t kScratch = 0x0300u;
+            uint8_t *const rdram =
+                runtime.memory().getRDRAM();
+            const uint64_t cnt =
+                makeDmaTag(1u, 1u, 0u);
+            const uint64_t end =
+                makeDmaTag(1u, 7u, 0u);
+            std::memcpy(
+                rdram + kTag, &cnt, sizeof(cnt));
+            std::memcpy(
+                rdram + kTag + 32u,
+                &end, sizeof(end));
+            for (uint32_t byte = 0u; byte < 16u;
+                 ++byte)
+            {
+                rdram[kTag + 16u + byte] =
+                    static_cast<uint8_t>(0x20u + byte);
+                rdram[kTag + 48u + byte] =
+                    static_cast<uint8_t>(0xA0u + byte);
+            }
+
+            runtime.debugStartEeEventTrace(8u);
+            t.IsTrue(
+                runtime.memory().writeIORegister(
+                    kSprTo + 0x30u, kTag),
+                "SPR_TO chain TADR should write");
+            t.IsTrue(
+                runtime.memory().writeIORegister(
+                    kSprTo + 0x80u, kScratch),
+                "SPR_TO chain SADR should write");
+            t.IsTrue(
+                runtime.memory().writeIORegister(
+                    kSprTo, 0x104u),
+                "SPR_TO chain should start");
+
+            ScratchpadDmaSnapshot dma =
+                runtime.memory().scratchpadDmaSnapshot(
+                    DmacChannel::ToScratchpad);
+            t.IsTrue(
+                dma.active && dma.eventManaged &&
+                    dma.phase ==
+                        ScratchpadDmaPhase::FetchTag,
+                "submission should retain the next tag after CNT payload");
+            t.Equals(
+                dma.tagsProcessed, 1u,
+                "submission should process exactly one source-chain tag");
+            t.Equals(
+                dma.tadr, kTag + 32u,
+                "CNT progress should expose the next tag address");
+            t.Equals(
+                dma.sadr, kScratch + 16u,
+                "CNT progress should expose scratchpad advancement");
+
+            PS2Runtime::DebugEeScheduler scheduler =
+                runtime.debugEeSchedulerSnapshot();
+            t.Equals(
+                scheduler.slots[ps2x::timing::
+                    eeEventSourceIndex(
+                        ps2x::timing::EeEventSource::
+                            DmacToScratchpad)]
+                    .deadlineTick,
+                16ull,
+                "one CNT payload QWC should cost two EE cycles");
+
+            R5900Context &context = runtime.cpu();
+            context.advanceEeCycleTicks(16u);
+            runtime.serviceEeEventsAtBlockBoundary(
+                rdram, &context);
+            dma = runtime.memory().scratchpadDmaSnapshot(
+                DmacChannel::ToScratchpad);
+            t.IsTrue(
+                dma.active &&
+                    dma.phase ==
+                        ScratchpadDmaPhase::Finalize,
+                "the END payload should leave finalization pending");
+            t.Equals(
+                dma.tagsProcessed, 2u,
+                "the first deadline should process only the END tag");
+            t.Equals(
+                dma.tadr, kTag + 32u,
+                "END should retain its terminal tag address");
+            t.Equals(
+                dma.madr, kTag + 64u,
+                "END payload should advance MADR");
+            t.IsTrue(
+                (runtime.memory().readIORegister(kDstat) &
+                 (1u << 9u)) == 0u,
+                "terminal payload progress should not yet publish completion");
+
+            scheduler = runtime.debugEeSchedulerSnapshot();
+            t.Equals(
+                scheduler.slots[ps2x::timing::
+                    eeEventSourceIndex(
+                        ps2x::timing::EeEventSource::
+                            DmacToScratchpad)]
+                    .deadlineTick,
+                32ull,
+                "the END payload should retain a later finalization event");
+
+            context.advanceEeCycleTicks(16u);
+            runtime.serviceEeEventsAtBlockBoundary(
+                rdram, &context);
+            t.IsFalse(
+                runtime.memory()
+                    .scratchpadDmaSnapshot(
+                        DmacChannel::ToScratchpad)
+                    .active,
+                "the final event should retire the chain");
+            t.IsTrue(
+                (runtime.memory().readIORegister(kSprTo) &
+                 0x100u) == 0u,
+                "chain publication should clear SPR_TO STR");
+
+            bool copied = true;
+            for (uint32_t byte = 0u; byte < 16u;
+                 ++byte)
+            {
+                copied &=
+                    runtime.memory().getScratchpad()[
+                        kScratch + byte] ==
+                    static_cast<uint8_t>(0x20u + byte);
+                copied &=
+                    runtime.memory().getScratchpad()[
+                        kScratch + 16u + byte] ==
+                    static_cast<uint8_t>(0xA0u + byte);
+            }
+            t.IsTrue(
+                copied,
+                "scheduled chain progress should preserve both payloads");
+
+            const PS2Runtime::DebugEeEventTrace trace =
+                runtime.debugEeEventTraceSnapshot(true);
+            t.Equals(
+                trace.entries.size(),
+                static_cast<size_t>(3u),
+                "chain should trace END progress, finalization, and publication");
+            if (trace.entries.size() == 3u)
+            {
+                t.IsTrue(
+                    trace.entries[0].source ==
+                            ps2x::timing::EeEventSource::
+                                DmacToScratchpad &&
+                        trace.entries[1].source ==
+                            ps2x::timing::EeEventSource::
+                                DmacToScratchpad &&
+                        trace.entries[2].source ==
+                            ps2x::timing::EeEventSource::
+                                DmacCompletion,
+                    "chain finalization should retain typed event ownership");
+            }
+        });
+
+        tc.Run("event SPR_TO cancel and restart reject the stale generation", [](TestCase &t)
+        {
+            PS2Runtime runtime;
+            t.IsTrue(
+                runtime.memory().initialize(),
+                "SPR_TO restart fixture memory should initialize");
+            t.IsTrue(
+                runtime.syncCoreSubsystems(),
+                "SPR_TO restart fixture subsystems should bind");
+            runtime.setEeSchedulingMode(
+                ps2x::timing::EeSchedulingMode::Event);
+
+            constexpr uint32_t kSprTo = 0x1000D400u;
+            constexpr uint32_t kDstat = 0x1000E010u;
+            constexpr uint32_t kFirstSource =
+                0x0002E000u;
+            constexpr uint32_t kSecondSource =
+                0x0002F000u;
+            constexpr uint32_t kFirstQwc = 4u;
+            constexpr uint32_t kSecondQwc = 8u;
+            std::memset(
+                runtime.memory().getRDRAM() + kFirstSource,
+                0x31, kFirstQwc * 16u);
+            std::memset(
+                runtime.memory().getRDRAM() + kSecondSource,
+                0x72, kSecondQwc * 16u);
+
+            runtime.debugStartEeEventTrace(4u);
+            t.IsTrue(
+                runtime.memory().writeIORegister(
+                    kSprTo + 0x10u, kFirstSource),
+                "first SPR_TO MADR should write");
+            t.IsTrue(
+                runtime.memory().writeIORegister(
+                    kSprTo + 0x20u, kFirstQwc),
+                "first SPR_TO QWC should write");
+            t.IsTrue(
+                runtime.memory().writeIORegister(
+                    kSprTo + 0x80u, 0x0400u),
+                "first SPR_TO SADR should write");
+            t.IsTrue(
+                runtime.memory().writeIORegister(
+                    kSprTo, 0x100u),
+                "first SPR_TO should start");
+
+            PS2Runtime::DebugEeScheduler scheduler =
+                runtime.debugEeSchedulerSnapshot();
+            const auto first =
+                scheduler.slots[ps2x::timing::
+                    eeEventSourceIndex(
+                        ps2x::timing::EeEventSource::
+                            DmacToScratchpad)];
+            t.IsTrue(
+                first.pending,
+                "the first SPR_TO generation should be pending");
+            t.Equals(
+                first.deadlineTick, 64ull,
+                "four QWC should target tick 64");
+
+            R5900Context &context = runtime.cpu();
+            context.advanceEeCycleTicks(8u);
+            runtime.serviceEeEventsAtBlockBoundary(
+                runtime.memory().getRDRAM(), &context);
+            t.IsTrue(
+                runtime.memory().writeIORegister(
+                    kSprTo, 0u),
+                "clearing SPR_TO STR should cancel the first generation");
+            t.IsFalse(
+                runtime.memory()
+                    .scratchpadDmaSnapshot(
+                        DmacChannel::ToScratchpad)
+                    .active,
+                "cancellation should retire the first operation");
+
+            t.IsTrue(
+                runtime.memory().writeIORegister(
+                    kSprTo + 0x10u, kSecondSource),
+                "replacement SPR_TO MADR should write");
+            t.IsTrue(
+                runtime.memory().writeIORegister(
+                    kSprTo + 0x20u, kSecondQwc),
+                "replacement SPR_TO QWC should write");
+            t.IsTrue(
+                runtime.memory().writeIORegister(
+                    kSprTo + 0x80u, 0x0800u),
+                "replacement SPR_TO SADR should write");
+            t.IsTrue(
+                runtime.memory().writeIORegister(
+                    kSprTo, 0x100u),
+                "replacement SPR_TO should start");
+
+            scheduler = runtime.debugEeSchedulerSnapshot();
+            const auto second =
+                scheduler.slots[ps2x::timing::
+                    eeEventSourceIndex(
+                        ps2x::timing::EeEventSource::
+                            DmacToScratchpad)];
+            t.IsTrue(
+                second.pending &&
+                    second.generation > first.generation,
+                "replacement should own a newer event generation");
+            t.Equals(
+                second.deadlineTick, 136ull,
+                "replacement should schedule from committed tick 8");
+
+            context.advanceEeCycleTicks(56u);
+            runtime.serviceEeEventsAtBlockBoundary(
+                runtime.memory().getRDRAM(), &context);
+            const ScratchpadDmaSnapshot beforeReplacement =
+                runtime.memory().scratchpadDmaSnapshot(
+                    DmacChannel::ToScratchpad);
+            t.IsTrue(
+                beforeReplacement.active &&
+                    beforeReplacement.phase ==
+                        ScratchpadDmaPhase::Finalize,
+                "the stale tick-64 deadline must not finalize replacement work");
+            t.IsTrue(
+                (runtime.memory().readIORegister(kDstat) &
+                 (1u << 9u)) == 0u,
+                "the stale generation must not publish D_STAT");
+            t.Equals(
+                runtime.debugEeEventTraceSnapshot(false)
+                    .entries.size(),
+                static_cast<size_t>(0u),
+                "the cancelled deadline must not dispatch");
+
+            context.advanceEeCycleTicks(72u);
+            runtime.serviceEeEventsAtBlockBoundary(
+                runtime.memory().getRDRAM(), &context);
+            t.IsFalse(
+                runtime.memory()
+                    .scratchpadDmaSnapshot(
+                        DmacChannel::ToScratchpad)
+                    .active,
+                "the replacement should finalize at tick 136");
+            t.IsTrue(
+                (runtime.memory().readIORegister(kDstat) &
+                 (1u << 9u)) != 0u,
+                "only the replacement should publish completion");
+
+            const PS2Runtime::DebugEeEventTrace trace =
+                runtime.debugEeEventTraceSnapshot(true);
+            t.Equals(
+                trace.entries.size(),
+                static_cast<size_t>(2u),
+                "only replacement finalization and publication should dispatch");
+            if (!trace.entries.empty())
+            {
+                t.Equals(
+                    trace.entries.front().serviceTick,
+                    136ull,
+                    "the replacement should own the first live service");
+            }
+        });
+
         tc.Run("event VIF1 normal DMA exposes payload and finalization boundaries", [](TestCase &t)
         {
             PS2Runtime runtime;
@@ -4403,6 +5045,134 @@ void register_ps2_runtime_expansion_tests()
                 "VU0 should stop after the E-bit delay-slot instruction pair");
         });
 
+        tc.Run("event VU0 progress depends on due shared device work", [](TestCase &t)
+        {
+            PS2Runtime withDma;
+            PS2Runtime withoutDma;
+            for (PS2Runtime *runtime :
+                 {&withDma, &withoutDma})
+            {
+                t.IsTrue(
+                    runtime->memory().initialize(),
+                    "shared-event VU0 memory should initialize");
+                t.IsTrue(
+                    runtime->syncCoreSubsystems(),
+                    "shared-event VU0 subsystems should bind");
+                runtime->setEeSchedulingMode(
+                    ps2x::timing::EeSchedulingMode::Event);
+
+                uint8_t *const code =
+                    runtime->memory().getVU0Code();
+                std::memset(code, 0, PS2_VU0_CODE_SIZE);
+                constexpr uint32_t kVuNop = 0x0000003Fu;
+                writeVuInstructionPair(
+                    code, 0u,
+                    makeVuIaddiu(1u, 1u, 1u), kVuNop);
+                writeVuInstructionPair(
+                    code, 8u, makeVuBranch(-1), kVuNop);
+                writeVuInstructionPair(
+                    code, 16u, 0u, kVuNop);
+                runtime->vu0().setProgressTrackingEnabled(true);
+                runtime->vu0StartMicroProgram(
+                    runtime->memory().getRDRAM(),
+                    &runtime->cpu(), 0u);
+            }
+
+            const VU1ProgressSnapshot startupWithDma =
+                withDma.vu0().getProgressSnapshot();
+            const VU1ProgressSnapshot startupWithoutDma =
+                withoutDma.vu0().getProgressSnapshot();
+            t.Equals(
+                startupWithDma.cycles,
+                startupWithoutDma.cycles,
+                "identical VCALLs should execute the same startup batch");
+
+            const VU1ProgressSnapshot commonProgress =
+                startupWithDma;
+            t.Equals(
+                commonProgress.cycles,
+                withoutDma.vu0().getProgressSnapshot().cycles,
+                "event mode should begin with identical VU state");
+
+            constexpr uint32_t kVif1 = 0x10009000u;
+            constexpr uint32_t kDstat = 0x1000E010u;
+            constexpr uint32_t kSource = 0x00036000u;
+            constexpr uint32_t kQwc = 8u;
+            std::memset(
+                withDma.memory().getRDRAM() + kSource,
+                0, kQwc * 16u);
+            t.IsTrue(withDma.memory().writeIORegister(
+                         kVif1 + 0x10u, kSource),
+                     "shared-event VIF1 MADR write should succeed");
+            t.IsTrue(withDma.memory().writeIORegister(
+                         kVif1 + 0x20u, kQwc),
+                     "shared-event VIF1 QWC write should succeed");
+            t.IsTrue(withDma.memory().writeIORegister(
+                         kVif1, 0x100u),
+                     "shared-event VIF1 start should succeed");
+
+            // The four-cycle DMA event is earlier than VU0's new sixteen-
+            // cycle lead, so the shared test must not duplicate work.
+            withDma.cpu().advanceEeCycleTicks(32u);
+            withDma.serviceEeEventsAtBlockBoundary(
+                withDma.memory().getRDRAM(),
+                &withDma.cpu());
+            withoutDma.cpu().advanceEeCycleTicks(32u);
+            withoutDma.serviceEeEventsAtBlockBoundary(
+                withoutDma.memory().getRDRAM(),
+                &withoutDma.cpu());
+            t.Equals(
+                withDma.vu0().getProgressSnapshot().cycles,
+                commonProgress.cycles,
+                "an event before the current VU lead should execute no work");
+            t.Equals(
+                withoutDma.vu0().getProgressSnapshot().cycles,
+                commonProgress.cycles,
+                "an ordinary block boundary should execute no VU work");
+
+            // Eight QWC cost sixteen EE cycles. Reach finalization through a
+            // COP2 synchronization rather than a generated block boundary:
+            // the architectural access must first service the due batch.
+            withDma.cpu().advanceEeCycleTicks(128u);
+            withDma.synchronizeVU0Microprogram(
+                withDma.memory().getRDRAM(),
+                &withDma.cpu(), false);
+            withoutDma.cpu().advanceEeCycleTicks(128u);
+            withoutDma.serviceEeEventsAtBlockBoundary(
+                withoutDma.memory().getRDRAM(),
+                &withoutDma.cpu());
+
+            const VU1ProgressSnapshot progressed =
+                withDma.vu0().getProgressSnapshot();
+            const VU1ProgressSnapshot idleBoundary =
+                withoutDma.vu0().getProgressSnapshot();
+            t.Equals(
+                progressed.cycles,
+                commonProgress.cycles + 16u,
+                "a COP2 boundary should service due work before catching up VU0");
+            t.Equals(
+                idleBoundary.cycles,
+                commonProgress.cycles,
+                "the same EE time without a due source must not advance VU0");
+            t.IsTrue(
+                (withDma.memory().readIORegister(kDstat) &
+                 (1u << 1u)) != 0u,
+                "the COP2 boundary should publish the due VIF1 completion");
+
+            withoutDma.synchronizeVU0Microprogram(
+                withoutDma.memory().getRDRAM(),
+                &withoutDma.cpu(), false);
+            const VU1ProgressSnapshot caughtUp =
+                withoutDma.vu0().getProgressSnapshot();
+            t.Equals(
+                caughtUp.cycles, progressed.cycles,
+                "an architectural non-interlocked access should still catch up elapsed work");
+            t.Equals(
+                withoutDma.vu0().state().pc,
+                withDma.vu0().state().pc,
+                "shared-event and explicit catch-up should reach the same VU boundary");
+        });
+
         tc.Run("VU0 block boundaries advance only at rapid event deadlines", [](TestCase &t)
         {
             PS2Runtime runtime;
@@ -4506,7 +5276,7 @@ void register_ps2_runtime_expansion_tests()
             (void)runtime.debugVu0InstructionTraceSnapshot(true);
         });
 
-        tc.Run("event and shadow compatibility preserve legacy VU0 work", [](TestCase &t)
+        tc.Run("event mode omits the private VU0 compatibility cadence", [](TestCase &t)
         {
             PS2Runtime legacy;
             PS2Runtime event;
@@ -4562,9 +5332,12 @@ void register_ps2_runtime_expansion_tests()
                 &shadowContext, 0u);
             legacy.debugStartVu0InstructionTrace(
                 128u, std::nullopt, false);
-            event.debugStartVu0InstructionTrace(
+            shadow.debugStartVu0InstructionTrace(
                 128u, std::nullopt, false);
-            event.debugStartEeEventTrace(2u, true);
+            const VU1ProgressSnapshot eventStartup =
+                event.vu0().getProgressSnapshot();
+            const uint32_t eventStartupPc =
+                event.vu0().state().pc;
 
             constexpr std::array<uint32_t, 5> kBlockTicks = {
                 128u, 40u, 40u, 384u, 40u};
@@ -4593,15 +5366,15 @@ void register_ps2_runtime_expansion_tests()
             const VU1ProgressSnapshot shadowProgress =
                 shadow.vu0().getProgressSnapshot();
             t.Equals(
-                eventProgress.cycles, legacyProgress.cycles,
-                "event compatibility should execute the legacy VU pair count");
+                eventProgress.cycles, eventStartup.cycles,
+                "ordinary event-mode blocks should not advance VU0 without a shared source");
             t.Equals(
                 shadowProgress.cycles, legacyProgress.cycles,
                 "shadow compatibility should execute the legacy VU pair count");
             t.Equals(
                 event.vu0().state().pc,
-                legacy.vu0().state().pc,
-                "event compatibility should retain the legacy VU PC");
+                eventStartupPc,
+                "event mode should retain VU0 state without a shared source");
             t.Equals(
                 shadow.vu0().state().pc,
                 legacy.vu0().state().pc,
@@ -4609,7 +5382,7 @@ void register_ps2_runtime_expansion_tests()
             t.Equals(
                 event.currentEeTick().raw(),
                 legacy.currentEeTick().raw(),
-                "event compatibility should publish identical EE time");
+                "event mode should publish identical EE time");
             t.Equals(
                 shadow.currentEeTick().raw(),
                 legacy.currentEeTick().raw(),
@@ -4617,13 +5390,13 @@ void register_ps2_runtime_expansion_tests()
 
             const auto legacyInstructions =
                 legacy.debugVu0InstructionTraceSnapshot(true);
-            const auto eventInstructions =
-                event.debugVu0InstructionTraceSnapshot(true);
+            const auto shadowInstructions =
+                shadow.debugVu0InstructionTraceSnapshot(true);
             t.Equals(
-                eventInstructions.entries.size(),
+                shadowInstructions.entries.size(),
                 legacyInstructions.entries.size(),
-                "event compatibility should retain every VU instruction pair");
-            if (eventInstructions.entries.size() ==
+                "shadow mode should retain every legacy VU instruction pair");
+            if (shadowInstructions.entries.size() ==
                 legacyInstructions.entries.size())
             {
                 for (size_t index = 0u;
@@ -4633,22 +5406,22 @@ void register_ps2_runtime_expansion_tests()
                     const auto &expected =
                         legacyInstructions.entries[index];
                     const auto &observed =
-                        eventInstructions.entries[index];
+                        shadowInstructions.entries[index];
                     t.Equals(
                         observed.pc, expected.pc,
-                        "event compatibility should retain VU instruction PCs");
+                        "shadow mode should retain VU instruction PCs");
                     t.Equals(
                         observed.lower, expected.lower,
-                        "event compatibility should retain lower instructions");
+                        "shadow mode should retain lower instructions");
                     t.Equals(
                         observed.upper, expected.upper,
-                        "event compatibility should retain upper instructions");
+                        "shadow mode should retain upper instructions");
                     t.IsTrue(
                         observed.vi == expected.vi,
-                        "event compatibility should retain exact VI state");
+                        "shadow mode should retain exact VI state");
                     t.IsTrue(
                         observed.vf == expected.vf,
-                        "event compatibility should retain exact VF state");
+                        "shadow mode should retain exact VF state");
                 }
             }
 
@@ -4659,11 +5432,18 @@ void register_ps2_runtime_expansion_tests()
                     ps2x::timing::EeSchedulingMode::Event,
                 "event fixture should use the scheduler as authority");
             t.Equals(
-                eventStatus.statistics.serviced, 2u,
-                "two compatibility deadlines should be serviced");
-            t.IsTrue(
+                eventStatus.statistics.serviced, 0u,
+                "event mode should service no private VU0 deadlines");
+            t.IsFalse(
                 eventStatus.hasNextDeadline,
-                "an active VU should retain its next cached deadline");
+                "an active VU alone should not retain an event deadline");
+            t.IsFalse(
+                eventStatus.slots[ps2x::timing::
+                    eeEventSourceIndex(
+                        ps2x::timing::EeEventSource::
+                            Vu0PeriodicCompatibility)]
+                    .pending,
+                "event mode should not schedule the migration-only source");
 
             const PS2Runtime::DebugEeScheduler shadowStatus =
                 shadow.debugEeSchedulerSnapshot();
@@ -4673,39 +5453,6 @@ void register_ps2_runtime_expansion_tests()
             t.Equals(
                 shadowStatus.statistics.serviced, 2u,
                 "shadow mode should observe both legacy services");
-
-            const PS2Runtime::DebugEeEventTrace eventTrace =
-                event.debugEeEventTraceSnapshot(false);
-            t.IsFalse(
-                eventTrace.enabled,
-                "a stop-on-full event trace should disable at capacity");
-            t.Equals(
-                eventTrace.entries.size(),
-                static_cast<size_t>(2u),
-                "the bounded event trace should retain both services");
-            t.Equals(
-                eventTrace.droppedEntries, 0u,
-                "stop-on-full should not overwrite event evidence");
-            for (const auto &entry : eventTrace.entries)
-            {
-                t.IsTrue(
-                    entry.source ==
-                        ps2x::timing::EeEventSource::
-                            Vu0PeriodicCompatibility,
-                    "compatibility services should identify their source");
-                t.IsTrue(
-                    entry.serviceTick >= entry.scheduledTick,
-                    "event traces should retain scheduled and service time");
-                t.Equals(
-                    entry.latenessTicks,
-                    entry.serviceTick - entry.scheduledTick,
-                    "event traces should retain explicit lateness");
-                t.IsTrue(
-                    entry.rescheduled &&
-                        entry.hasFollowup &&
-                        entry.followupTick > entry.serviceTick,
-                    "an active periodic service should trace its follow-up");
-            }
         });
 
         tc.Run("VU0 sync trace may wait for an EE PC trigger", [](TestCase &t)
