@@ -7155,6 +7155,86 @@ void register_ps2_runtime_expansion_tests()
             t.Equals(getRegS32(ctx, 2), 0, "sceVu0TransposeMatrix should report success");
         });
 
+        tc.Run("event EE counters publish state and INTC only at their canonical deadline", [](TestCase &t)
+        {
+            PS2Runtime runtime;
+            t.IsTrue(
+                runtime.memory().initialize(),
+                "counter scheduler fixture memory should initialize");
+            runtime.setEeSchedulingMode(
+                ps2x::timing::EeSchedulingMode::Event);
+
+            constexpr uint32_t kCount = 0x10000000u;
+            constexpr uint32_t kMode = 0x10000010u;
+            constexpr uint32_t kTarget = 0x10000020u;
+            constexpr uint32_t kIntcStat = 0x1000F000u;
+            R5900Context &ctx = runtime.cpu();
+            uint8_t *const rdram =
+                runtime.memory().getRDRAM();
+
+            runtime.Store32(rdram, &ctx, kTarget, 3u);
+            runtime.Store32(rdram, &ctx, kCount, 0u);
+            runtime.Store32(rdram, &ctx, kMode, 0x1c0u);
+
+            PS2Runtime::DebugEeScheduler scheduler =
+                runtime.debugEeSchedulerSnapshot();
+            const auto &counterSlot =
+                scheduler.slots[
+                    ps2x::timing::eeEventSourceIndex(
+                        ps2x::timing::EeEventSource::
+                            EeCounters)];
+            t.IsTrue(
+                counterSlot.pending,
+                "counter target should occupy its fixed scheduler slot");
+            t.Equals(
+                counterSlot.deadlineTick, 48u,
+                "target three on BUSCLK should schedule six EE cycles");
+
+            ctx.advanceEeCycleTicks(40u);
+            runtime.serviceEeEventsAtBlockBoundary(
+                rdram, &ctx);
+            t.Equals(
+                runtime.Load32(rdram, &ctx, kCount),
+                2u,
+                "counter should expose pre-target progress");
+            t.IsTrue(
+                (runtime.Load32(
+                     rdram, &ctx, kIntcStat) &
+                 (1u << 9u)) == 0u,
+                "INTC cause must remain hidden before the deadline");
+
+            ctx.advanceEeCycleTicks(8u);
+            runtime.serviceEeEventsAtBlockBoundary(
+                rdram, &ctx);
+            t.Equals(
+                runtime.Load32(rdram, &ctx, kCount),
+                0u,
+                "zero return should publish at target service");
+            t.IsTrue(
+                (runtime.Load32(rdram, &ctx, kMode) &
+                 0x400u) != 0u,
+                "target service should latch EQUF");
+            t.IsTrue(
+                (runtime.Load32(
+                     rdram, &ctx, kIntcStat) &
+                 (1u << 9u)) != 0u,
+                "target service should publish INTC cause 9 after device state");
+
+            runtime.resetEeTiming(&ctx);
+            t.Equals(
+                runtime.Load32(rdram, &ctx, kMode),
+                0u,
+                "timing reset should clear counter state");
+            scheduler = runtime.debugEeSchedulerSnapshot();
+            t.IsFalse(
+                scheduler.slots[
+                    ps2x::timing::eeEventSourceIndex(
+                        ps2x::timing::EeEventSource::
+                            EeCounters)]
+                    .pending,
+                "timing reset should invalidate the counter deadline");
+        });
+
         tc.Run("sceVif1PkReset preserves the packet base pointer and clears open tag state", [](TestCase &t)
         {
             std::vector<uint8_t> rdram(PS2_RAM_SIZE, 0u);

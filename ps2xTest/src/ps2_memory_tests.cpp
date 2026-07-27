@@ -236,7 +236,7 @@ void register_ps2_memory_tests()
                      "TLB-mapped segments must not be treated as direct host pointers");
         });
 
-        tc.Run("EE timer0 count advances while enabled and can be reset", [](TestCase &t)
+        tc.Run("EE counters use emulated cycles and never host time", [](TestCase &t)
         {
             PS2Memory mem;
             t.IsTrue(mem.initialize(), "PS2Memory initialize should succeed");
@@ -244,19 +244,120 @@ void register_ps2_memory_tests()
             constexpr uint32_t kTimer0Count = 0x10000000u;
             constexpr uint32_t kTimer0Mode = 0x10000010u;
             constexpr uint32_t kTimer0Compare = 0x10000020u;
+            uint64_t eeCycle = 0u;
+            mem.setEeCounterCycleCallback(
+                [&eeCycle]()
+                {
+                    return eeCycle;
+                });
 
             t.IsTrue(mem.writeIORegister(kTimer0Count, 0u), "timer count reset write should succeed");
-            t.IsTrue(mem.writeIORegister(kTimer0Compare, 1u), "timer compare write should succeed");
-            t.IsTrue(mem.writeIORegister(kTimer0Mode, 0x283u), "timer mode write should be retained");
-            t.Equals(mem.readIORegister(kTimer0Mode), 0x283u, "timer mode should be readable");
+            t.IsTrue(mem.writeIORegister(kTimer0Compare, 3u), "timer compare write should succeed");
+            t.IsTrue(mem.writeIORegister(kTimer0Mode, 0x82u), "timer mode write should be retained");
+            t.Equals(mem.readIORegister(kTimer0Mode), 0x82u, "timer mode should be readable");
 
             std::this_thread::sleep_for(std::chrono::milliseconds(3));
-            const uint32_t firstCount = mem.readIORegister(kTimer0Count);
-            t.IsTrue(firstCount > 0u, "enabled timer count should advance from host time");
+            t.Equals(
+                mem.readIORegister(kTimer0Count),
+                0u,
+                "host sleep must not advance an EE hardware counter");
+
+            eeCycle = 512u;
+            const uint32_t firstCount =
+                mem.readIORegister(kTimer0Count);
+            t.Equals(
+                firstCount, 1u,
+                "clock source two should advance once per 512 emulated EE cycles");
 
             t.IsTrue(mem.writeIORegister(kTimer0Count, 0u), "timer count second reset should succeed");
-            const uint32_t resetCount = mem.readIORegister(kTimer0Count);
-            t.IsTrue(resetCount <= firstCount, "timer reset should restart the count window");
+            t.Equals(
+                mem.readIORegister(kTimer0Count),
+                0u,
+                "timer reset should be visible at the same emulated cycle");
+            eeCycle = 1024u;
+            t.Equals(
+                mem.readIORegister(kTimer0Count),
+                1u,
+                "timer reset should restart from the canonical source phase");
+        });
+
+        tc.Run("EE counter deadlines publish INTC state in device order", [](TestCase &t)
+        {
+            PS2Memory mem;
+            t.IsTrue(mem.initialize(), "PS2Memory initialize should succeed");
+
+            constexpr uint32_t kTimer0Count = 0x10000000u;
+            constexpr uint32_t kTimer0Mode = 0x10000010u;
+            constexpr uint32_t kTimer0Compare = 0x10000020u;
+            constexpr uint32_t kIntcStat = 0x1000F000u;
+            constexpr uint32_t kIntcMask = 0x1000F010u;
+            uint64_t eeCycle = 0u;
+            std::optional<uint64_t> deadline;
+            uint32_t callbackStatus = 0u;
+            uint32_t newlyRaised = 0u;
+            mem.setEeCounterCycleCallback(
+                [&eeCycle]()
+                {
+                    return eeCycle;
+                });
+            mem.setEeCounterScheduleCallback(
+                [&deadline](std::optional<uint64_t> value)
+                {
+                    deadline = value;
+                });
+            mem.setEeCounterInterruptStateCallback(
+                [&callbackStatus, &newlyRaised](
+                    uint32_t status,
+                    uint32_t,
+                    uint32_t raised)
+                {
+                    callbackStatus = status;
+                    newlyRaised |= raised;
+                });
+
+            (void)mem.writeIORegister(kTimer0Compare, 3u);
+            (void)mem.writeIORegister(kTimer0Count, 0u);
+            (void)mem.writeIORegister(kTimer0Mode, 0x1c0u);
+            t.IsTrue(
+                deadline.has_value(),
+                "target-enabled counter should publish a scheduler deadline");
+            if (deadline.has_value())
+            {
+                t.Equals(
+                    *deadline, 6u,
+                    "counter deadline should use the selected BUSCLK divisor");
+            }
+
+            eeCycle = 6u;
+            t.Equals(
+                mem.readIORegister(kTimer0Count),
+                0u,
+                "zero return should be visible before interrupt publication");
+            t.IsTrue(
+                (mem.readIORegister(kTimer0Mode) &
+                 0x400u) != 0u,
+                "counter mode should latch compare status");
+            t.IsTrue(
+                (mem.readIORegister(kIntcStat) &
+                 (1u << 9u)) != 0u,
+                "counter0 should latch INTC timer cause 9");
+            t.IsTrue(
+                (callbackStatus & (1u << 9u)) != 0u &&
+                    (newlyRaised & (1u << 9u)) != 0u,
+                "interrupt callback should observe state after device publication");
+
+            (void)mem.writeIORegister(
+                kIntcMask, 1u << 9u);
+            t.IsTrue(
+                (mem.readIORegister(kIntcMask) &
+                 (1u << 9u)) != 0u,
+                "INTC mask writes should toggle selected bits");
+            (void)mem.writeIORegister(
+                kIntcStat, 1u << 9u);
+            t.IsTrue(
+                (mem.readIORegister(kIntcStat) &
+                 (1u << 9u)) == 0u,
+                "INTC status should clear selected bits on write-one");
         });
 
         tc.Run("scratchpad alias accesses the same bytes as base", [](TestCase &t)

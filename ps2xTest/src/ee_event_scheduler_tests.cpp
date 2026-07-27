@@ -75,6 +75,8 @@ void register_ee_event_scheduler_tests()
             (void)scheduler.scheduleAbsolute(
                 EeEventSource::VSync, deadline);
             (void)scheduler.scheduleAbsolute(
+                EeEventSource::EeCounters, deadline);
+            (void)scheduler.scheduleAbsolute(
                 EeEventSource::VifVu1Finish, deadline);
             (void)scheduler.scheduleAbsolute(
                 EeEventSource::DmacCompletion, deadline);
@@ -103,44 +105,47 @@ void register_ee_event_scheduler_tests()
                     order.push_back(service.source);
                 });
             t.Equals(
-                order.size(), static_cast<size_t>(11u),
+                order.size(), static_cast<size_t>(12u),
                 "all equal-deadline events should dispatch");
-            if (order.size() == 11u)
+            if (order.size() == 12u)
             {
                 t.IsTrue(
                     order[0] == EeEventSource::VSync,
                     "VSync counter work should precede timed DMA callbacks");
                 t.IsTrue(
-                    order[1] == EeEventSource::DmacCompletion,
+                    order[1] == EeEventSource::EeCounters,
+                    "timer counter work should precede timed DMA callbacks");
+                t.IsTrue(
+                    order[2] == EeEventSource::DmacCompletion,
                     "ready DMAC completion should publish first");
                 t.IsTrue(
-                    order[2] == EeEventSource::DmacVif1,
+                    order[3] == EeEventSource::DmacVif1,
                     "DMAC VIF1 should precede GIF");
                 t.IsTrue(
-                    order[3] == EeEventSource::DmacGif,
+                    order[4] == EeEventSource::DmacGif,
                     "DMAC GIF should precede HLE SIF1");
                 t.IsTrue(
-                    order[4] == EeEventSource::HleSif1,
+                    order[5] == EeEventSource::HleSif1,
                     "HLE SIF1 should occupy the SIF callback band");
                 t.IsTrue(
-                    order[5] == EeEventSource::DmacVif0,
+                    order[6] == EeEventSource::DmacVif0,
                     "DMAC VIF0 should precede scratchpad DMA");
                 t.IsTrue(
-                    order[6] ==
+                    order[7] ==
                         EeEventSource::DmacFromScratchpad,
                     "SPR-from should follow VIF0");
                 t.IsTrue(
-                    order[7] ==
+                    order[8] ==
                         EeEventSource::DmacToScratchpad,
                     "SPR-to should follow SPR-from");
                 t.IsTrue(
-                    order[8] == EeEventSource::VifVu0Finish,
+                    order[9] == EeEventSource::VifVu0Finish,
                     "VU0 finish should follow DMAC callbacks");
                 t.IsTrue(
-                    order[9] == EeEventSource::VifVu1Finish,
+                    order[10] == EeEventSource::VifVu1Finish,
                     "VU1 finish should follow VU0 finish");
                 t.IsTrue(
-                    order[10] ==
+                    order[11] ==
                         EeEventSource::Vu0PeriodicCompatibility,
                     "the ordinary VU0 batch should follow device callbacks");
             }

@@ -532,6 +532,7 @@ public:
     {
         None = 0u,
         VSync,
+        EeCounters,
         GifDma,
         HleSifDma,
         Vif0Dma,
@@ -1123,6 +1124,22 @@ private:
     void serviceEeVSyncAtEvent(
         uint8_t *rdram,
         const ps2x::timing::EeEventService &service);
+    void onEeCounterScheduleChanged(
+        std::optional<uint64_t> deadlineCycle) noexcept;
+    void onEeCounterInterruptStateChanged(
+        uint32_t status,
+        uint32_t mask,
+        uint32_t newlyRaised) noexcept;
+    void serviceEeCountersAtEvent(
+        const ps2x::timing::EeEventService &service);
+    void cancelEeCounterEvent() noexcept;
+    void synchronizeEeCounterMmio(
+        R5900Context *ctx,
+        uint32_t address,
+        uint32_t size);
+    void drainPendingEeCounterHandlers(uint8_t *rdram);
+    [[nodiscard]] static bool overlapsEeCounterRegister(
+        uint32_t address, uint32_t size) noexcept;
     void scheduleEeVSyncEvent(
         ps2x::timing::EeTick deadline) noexcept;
     [[nodiscard]] static EeVSyncDurations
@@ -1256,6 +1273,9 @@ private:
         uint64_t renderCycles = 4'493'898u;
         uint64_t blankCycles = 421'302u;
         uint64_t gsBlankCycles = 65'535u;
+        uint32_t hRenderCycles = 15'669u;
+        uint32_t hBlankCycles = 3'055u;
+        uint32_t hSyncErrorCycles = 149u;
     };
     struct EeVSyncTiming
     {
@@ -1288,6 +1308,9 @@ private:
             ps2x::timing::EeEventScheduler::
                 kMaximumServicesPerBoundary;
     EeVSyncTiming m_eeVSyncTiming{};
+    ps2x::timing::EeEventToken m_eeCounterEventToken{
+        ps2x::timing::EeEventSource::EeCounters, 0u};
+    uint32_t m_pendingEeCounterInterrupts = 0u;
     std::array<
         PendingVSyncDelivery,
         kMaximumPendingVSyncDeliveries>

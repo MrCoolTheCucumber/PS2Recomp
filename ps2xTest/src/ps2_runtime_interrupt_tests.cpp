@@ -58,6 +58,10 @@ namespace
     std::atomic<uint32_t> g_dmacPublishedAddress{0u};
     std::atomic<uint32_t> g_dmacObservedPublishedValue{0u};
     std::atomic<uint32_t> g_dmacHandlerResubmissions{0u};
+    std::atomic<uint32_t> g_eeCounterHits{0u};
+    std::atomic<uint32_t> g_eeCounterLastCause{0u};
+    std::atomic<uint32_t> g_eeCounterModeAtHandler{0u};
+    std::atomic<uint32_t> g_eeCounterIntcAtHandler{0u};
 
     void setRegU32(R5900Context &ctx, int reg, uint32_t value)
     {
@@ -215,6 +219,31 @@ namespace
                 runtime->memory().getRDRAM(), ctx);
         }
 
+        ctx->pc = 0u;
+    }
+
+    void testEeCounterHandler(
+        uint8_t *rdram,
+        R5900Context *ctx,
+        PS2Runtime *runtime)
+    {
+        (void)rdram;
+        g_eeCounterHits.fetch_add(
+            1u, std::memory_order_relaxed);
+        g_eeCounterLastCause.store(
+            getRegU32(ctx, 4),
+            std::memory_order_relaxed);
+        if (runtime)
+        {
+            g_eeCounterModeAtHandler.store(
+                runtime->memory().readIORegister(
+                    0x10000010u),
+                std::memory_order_relaxed);
+            g_eeCounterIntcAtHandler.store(
+                runtime->memory().readIORegister(
+                    0x1000F000u),
+                std::memory_order_relaxed);
+        }
         ctx->pc = 0u;
     }
 
@@ -1262,6 +1291,10 @@ void register_ps2_runtime_interrupt_tests()
             setRegU32(disableStart, 4, 2u);
             t.IsTrue(callSyscall(0x15u, env.rdram.data(), &disableStart, &env.runtime), "DisableIntc syscall should dispatch");
             t.Equals(getRegS32(disableStart, 2), KE_OK, "DisableIntc should return KE_OK");
+            t.IsTrue(
+                (env.runtime.memory().intcMask() &
+                 (1u << 2u)) == 0u,
+                "DisableIntc should clear the matching hardware INTC mask bit");
 
             std::this_thread::sleep_for(std::chrono::milliseconds(40));
             const uint32_t startAfterDisable = g_vblankStartHits.load(std::memory_order_relaxed);
@@ -1278,6 +1311,10 @@ void register_ps2_runtime_interrupt_tests()
             setRegU32(enableStart, 4, 2u);
             t.IsTrue(callSyscall(0x14u, env.rdram.data(), &enableStart, &env.runtime), "EnableIntc syscall should dispatch");
             t.Equals(getRegS32(enableStart, 2), KE_OK, "EnableIntc should return KE_OK");
+            t.IsTrue(
+                (env.runtime.memory().intcMask() &
+                 (1u << 2u)) != 0u,
+                "EnableIntc should set the matching hardware INTC mask bit");
 
             const bool startResumed = waitUntil([&]() {
                 return g_vblankStartHits.load(std::memory_order_relaxed) > startLater;
@@ -1799,6 +1836,128 @@ void register_ps2_runtime_interrupt_tests()
                 g_dmacSendHits.load(std::memory_order_relaxed),
                 1u,
                 "the next safe boundary should deliver the unmasked cause");
+            cleanupRuntime(env);
+        });
+
+        tc.Run("masked EE counter cause publishes before deferred handler delivery", [](TestCase &t)
+        {
+            notifyRuntimeStop();
+            TestEnv env;
+            t.IsTrue(
+                env.runtime.memory().initialize(),
+                "runtime memory initialize should succeed");
+            env.runtime.setEeSchedulingMode(
+                ps2x::timing::EeSchedulingMode::Event);
+
+            constexpr uint32_t kHandlerAddr = 0x00ABD260u;
+            constexpr uint32_t kCount = 0x10000000u;
+            constexpr uint32_t kMode = 0x10000010u;
+            constexpr uint32_t kTarget = 0x10000020u;
+            constexpr uint32_t kIntcStat = 0x1000F000u;
+            uint8_t *const rdram =
+                env.runtime.memory().getRDRAM();
+
+            g_eeCounterHits.store(
+                0u, std::memory_order_relaxed);
+            g_eeCounterLastCause.store(
+                0u, std::memory_order_relaxed);
+            g_eeCounterModeAtHandler.store(
+                0u, std::memory_order_relaxed);
+            g_eeCounterIntcAtHandler.store(
+                0u, std::memory_order_relaxed);
+            env.runtime.registerFunction(
+                kHandlerAddr, &testEeCounterHandler);
+
+            R5900Context addCtx{};
+            setRegU32(addCtx, 4, 9u);
+            setRegU32(addCtx, 5, kHandlerAddr);
+            ps2_syscalls::AddIntcHandler(
+                rdram, &addCtx, &env.runtime);
+            t.IsTrue(
+                getRegS32(addCtx, 2) > 0,
+                "counter0 handler should register");
+
+            R5900Context disableCtx{};
+            setRegU32(disableCtx, 4, 9u);
+            ps2_syscalls::DisableIntc(
+                rdram, &disableCtx, &env.runtime);
+
+            R5900Context eventCtx{};
+            {
+                PS2Runtime::GuestExecutionScope guestExecution(
+                    &env.runtime, &eventCtx);
+                env.runtime.Store32(
+                    rdram, &eventCtx, kTarget, 3u);
+                env.runtime.Store32(
+                    rdram, &eventCtx, kCount, 0u);
+                env.runtime.Store32(
+                    rdram, &eventCtx, kMode, 0x1c0u);
+                eventCtx.advanceEeCycleTicks(48u);
+                env.runtime.serviceEeEventsAtBlockBoundary(
+                    rdram, &eventCtx);
+
+                t.IsTrue(
+                    (env.runtime.Load32(
+                         rdram, &eventCtx, kMode) &
+                     0x400u) != 0u,
+                    "counter target state should publish at event service");
+                t.IsTrue(
+                    (env.runtime.Load32(
+                         rdram, &eventCtx, kIntcStat) &
+                     (1u << 9u)) != 0u,
+                    "INTC status should publish before handler delivery");
+                t.Equals(
+                    g_eeCounterHits.load(
+                        std::memory_order_relaxed),
+                    0u,
+                    "masked service must not enter the handler");
+                t.IsFalse(
+                    env.runtime.guestPreemptionRequestedForTesting(),
+                    "masked timer cause should not request preemption");
+            }
+            t.Equals(
+                g_eeCounterHits.load(
+                    std::memory_order_relaxed),
+                0u,
+                "masked timer cause should remain pending");
+
+            R5900Context enableCtx{};
+            setRegU32(enableCtx, 4, 9u);
+            {
+                PS2Runtime::GuestExecutionScope guestExecution(
+                    &env.runtime, &enableCtx);
+                ps2_syscalls::EnableIntc(
+                    rdram, &enableCtx, &env.runtime);
+                t.Equals(
+                    g_eeCounterHits.load(
+                        std::memory_order_relaxed),
+                    0u,
+                    "unmask must not recursively enter the handler");
+                t.IsTrue(
+                    env.runtime.guestPreemptionRequestedForTesting(),
+                    "unmasking a latched timer cause should request preemption");
+            }
+
+            t.Equals(
+                g_eeCounterHits.load(
+                    std::memory_order_relaxed),
+                1u,
+                "the outer safe boundary should deliver the timer handler");
+            t.Equals(
+                g_eeCounterLastCause.load(
+                    std::memory_order_relaxed),
+                9u,
+                "handler should receive counter0 cause 9");
+            t.IsTrue(
+                (g_eeCounterModeAtHandler.load(
+                     std::memory_order_relaxed) &
+                 0x400u) != 0u,
+                "handler should observe the latched target flag");
+            t.IsTrue(
+                (g_eeCounterIntcAtHandler.load(
+                     std::memory_order_relaxed) &
+                 (1u << 9u)) != 0u,
+                "handler should observe INTC status after device publication");
             cleanupRuntime(env);
         });
 

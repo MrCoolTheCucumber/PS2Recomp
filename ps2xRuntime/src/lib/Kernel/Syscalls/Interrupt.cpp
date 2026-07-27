@@ -96,7 +96,7 @@ namespace ps2_syscalls
         return (s_cachedStackTop != 0u) ? s_cachedStackTop : (PS2_RAM_SIZE - 0x10u);
     }
 
-    static void dispatchIntcHandlersForCause(uint8_t *rdram, PS2Runtime *runtime, uint32_t cause)
+    void dispatchIntcHandlersForCause(uint8_t *rdram, PS2Runtime *runtime, uint32_t cause)
     {
         if (!rdram || !runtime)
         {
@@ -218,6 +218,15 @@ namespace ps2_syscalls
                 }
             }
         }
+    }
+
+    bool isIntcCauseEnabled(uint32_t cause)
+    {
+        std::lock_guard<std::mutex> lock(
+            g_irq_handler_mutex);
+        return cause < 32u &&
+               (g_enabled_intc_mask &
+                (1u << cause)) != 0u;
     }
 
     void dispatchDmacHandlersForCause(uint8_t *rdram, PS2Runtime *runtime, uint32_t cause)
@@ -614,6 +623,11 @@ namespace ps2_syscalls
             std::lock_guard<std::mutex> lock(g_irq_handler_mutex);
             g_enabled_intc_mask |= (1u << cause);
         }
+        if (runtime)
+        {
+            runtime->memory().setIntcInterruptMask(
+                cause, true);
+        }
         if (cause == kIntcVblankStart || cause == kIntcVblankEnd)
         {
             PS2_IF_AGRESSIVE_LOGS({
@@ -640,6 +654,11 @@ namespace ps2_syscalls
         {
             std::lock_guard<std::mutex> lock(g_irq_handler_mutex);
             g_enabled_intc_mask &= ~(1u << cause);
+        }
+        if (runtime)
+        {
+            runtime->memory().setIntcInterruptMask(
+                cause, false);
         }
         if (cause == kIntcVblankStart || cause == kIntcVblankEnd)
         {

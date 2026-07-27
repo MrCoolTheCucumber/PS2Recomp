@@ -7,7 +7,6 @@
 #include <atomic>
 #include <cerrno>
 #include <cinttypes>
-#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -183,27 +182,11 @@ namespace
         } while (!csr.compare_exchange_weak(expected, desired));
     }
 
-    constexpr uint32_t kEeTimer0Count = 0x10000000u;
-    constexpr uint32_t kEeTimer0Mode = 0x10000010u;
-    constexpr uint32_t kEeTimer0Compare = 0x10000020u;
-    constexpr uint32_t kEeTimer0Hold = 0x10000030u;
-    constexpr uint32_t kEeTimerModeCue = 1u << 7;
-    constexpr uint64_t kEeTimer0TicksPerSecond = 15720ull;
-    constexpr uint64_t kNanosecondsPerSecond = 1000000000ull;
-
-    inline bool isEeTimer0Register(uint32_t address)
-    {
-        return address == kEeTimer0Count ||
-               address == kEeTimer0Mode ||
-               address == kEeTimer0Compare ||
-               address == kEeTimer0Hold;
-    }
-
-    inline uint64_t steadyClockNs()
-    {
-        using namespace std::chrono;
-        return static_cast<uint64_t>(duration_cast<nanoseconds>(steady_clock::now().time_since_epoch()).count());
-    }
+    constexpr uint32_t kIntcStat = 0x1000F000u;
+    constexpr uint32_t kIntcMask = 0x1000F010u;
+    constexpr uint32_t kEeCounterIntcMask =
+        (1u << 9u) | (1u << 10u) |
+        (1u << 11u) | (1u << 12u);
 
     struct DmaTagView
     {
@@ -1728,8 +1711,7 @@ bool PS2Memory::initialize(size_t ramSize)
     m_vif1PendingIrqAfterCommand = false;
     m_vif1WaitingForVu = false;
     m_vif1DeferredData.clear();
-    m_timer0LastHostNs = 0;
-    m_timer0FractionNs = 0;
+    m_eeCounters.reset();
 
     try
     {
@@ -1797,37 +1779,100 @@ bool PS2Memory::initialize(size_t ramSize)
     }
 }
 
-void PS2Memory::updateEeTimer0Counter()
+uint64_t PS2Memory::currentEeCounterCycle() const noexcept
 {
-    const uint64_t nowNs = steadyClockNs();
-    if (m_timer0LastHostNs == 0u)
+    if (m_eeCounterCycleCallback)
     {
-        m_timer0LastHostNs = nowNs;
+        return m_eeCounterCycleCallback();
+    }
+    return m_eeCounters.snapshot().currentCycle;
+}
+
+uint32_t PS2Memory::intcStatus() const noexcept
+{
+    const auto it = m_ioRegisters.find(kIntcStat);
+    return it != m_ioRegisters.end() ? it->second : 0u;
+}
+
+uint32_t PS2Memory::intcMask() const noexcept
+{
+    const auto it = m_ioRegisters.find(kIntcMask);
+    return it != m_ioRegisters.end() ? it->second : 0u;
+}
+
+void PS2Memory::setIntcInterruptMask(
+    uint32_t cause, bool enabled)
+{
+    if (cause >= 32u)
+    {
         return;
     }
 
-    const uint32_t mode = m_ioRegisters.count(kEeTimer0Mode) ? m_ioRegisters[kEeTimer0Mode] : 0u;
-    if ((mode & kEeTimerModeCue) == 0u)
+    const uint32_t bit = 1u << cause;
+    uint32_t &mask = m_ioRegisters[kIntcMask];
+    if (enabled)
     {
-        m_timer0LastHostNs = nowNs;
-        m_timer0FractionNs = 0u;
-        return;
+        mask |= bit;
+    }
+    else
+    {
+        mask &= ~bit;
+    }
+    publishEeCounterAdvance({}, true);
+}
+
+void PS2Memory::publishEeCounterAdvance(
+    const ps2x::timing::EeCounterAdvanceResult &result,
+    bool interruptStateChanged)
+{
+    if (result.newlyRaisedInterruptMask != 0u)
+    {
+        m_ioRegisters[kIntcStat] =
+            intcStatus() |
+            result.newlyRaisedInterruptMask;
+        interruptStateChanged = true;
     }
 
-    const uint64_t elapsedNs = nowNs - m_timer0LastHostNs;
-    m_timer0LastHostNs = nowNs;
-    if (elapsedNs == 0u)
+    if (m_eeCounterScheduleCallback)
     {
-        return;
+        m_eeCounterScheduleCallback(
+            m_eeCounters.nextEventCycle());
     }
+    if (interruptStateChanged &&
+        m_eeCounterInterruptStateCallback)
+    {
+        m_eeCounterInterruptStateCallback(
+            intcStatus(),
+            intcMask(),
+            result.newlyRaisedInterruptMask);
+    }
+}
 
-    const uint64_t scaled = elapsedNs * kEeTimer0TicksPerSecond + m_timer0FractionNs;
-    const uint64_t ticks = scaled / kNanosecondsPerSecond;
-    m_timer0FractionNs = scaled % kNanosecondsPerSecond;
-    if (ticks != 0u)
-    {
-        m_ioRegisters[kEeTimer0Count] = m_ioRegisters[kEeTimer0Count] + static_cast<uint32_t>(ticks);
-    }
+void PS2Memory::resetEeCounters(uint64_t currentCycle)
+{
+    m_eeCounters.reset(currentCycle);
+    m_ioRegisters[kIntcStat] =
+        intcStatus() & ~kEeCounterIntcMask;
+    publishEeCounterAdvance({}, true);
+}
+
+void PS2Memory::configureEeCounterVideoTiming(
+    ps2x::timing::EeCounterVideoTiming timing,
+    uint64_t currentCycle)
+{
+    const ps2x::timing::EeCounterAdvanceResult result =
+        m_eeCounters.configureVideoTiming(
+            timing, currentCycle);
+    publishEeCounterAdvance(result);
+}
+
+ps2x::timing::EeCounterAdvanceResult
+PS2Memory::synchronizeEeCounters(uint64_t currentCycle)
+{
+    const ps2x::timing::EeCounterAdvanceResult result =
+        m_eeCounters.advanceTo(currentCycle);
+    publishEeCounterAdvance(result);
+    return result;
 }
 
 bool PS2Memory::isScratchpad(uint32_t address) const
@@ -2133,8 +2178,21 @@ uint64_t PS2Memory::read64(uint32_t address)
     // to avoid any side-effects from read32 handlers.
     if (isIoRegister(address))
     {
-        uint32_t lo = m_ioRegisters.count(address) ? m_ioRegisters[address] : 0u;
-        uint32_t hi = m_ioRegisters.count(address + 4) ? m_ioRegisters[address + 4] : 0u;
+        const bool counterAccess =
+            ps2x::timing::EeCounterBank::isRegisterAddress(
+                address) ||
+            ps2x::timing::EeCounterBank::isRegisterAddress(
+                address + 4u);
+        uint32_t lo = counterAccess
+                          ? readIORegister(address)
+                          : (m_ioRegisters.count(address)
+                                 ? m_ioRegisters[address]
+                                 : 0u);
+        uint32_t hi = counterAccess
+                          ? readIORegister(address + 4u)
+                          : (m_ioRegisters.count(address + 4u)
+                                 ? m_ioRegisters[address + 4u]
+                                 : 0u);
         return static_cast<uint64_t>(lo) | (static_cast<uint64_t>(hi) << 32);
     }
     return (uint64_t)read32(address) | ((uint64_t)read32(address + 4) << 32);
@@ -2205,7 +2263,9 @@ void PS2Memory::write8(uint32_t address, uint8_t value, uint32_t writerPc)
         uint32_t regAddr = physAddr & ~0x3;
         uint32_t shift = (physAddr & 3) * 8;
         uint32_t mask = ~(0xFF << shift);
-        uint32_t newValue = (m_ioRegisters[regAddr] & mask) | ((uint32_t)value << shift);
+        uint32_t newValue =
+            (readIORegister(regAddr) & mask) |
+            (static_cast<uint32_t>(value) << shift);
         writeIORegister(regAddr, newValue);
     }
 }
@@ -2245,7 +2305,9 @@ void PS2Memory::write16(uint32_t address, uint16_t value, uint32_t writerPc)
         uint32_t regAddr = physAddr & ~0x3;
         uint32_t shift = (physAddr & 2) * 8;
         uint32_t mask = ~(0xFFFF << shift);
-        uint32_t newValue = (m_ioRegisters[regAddr] & mask) | ((uint32_t)value << shift);
+        uint32_t newValue =
+            (readIORegister(regAddr) & mask) |
+            (static_cast<uint32_t>(value) << shift);
         writeIORegister(regAddr, newValue);
     }
 }
@@ -2406,23 +2468,30 @@ void PS2Memory::write128(uint32_t address, __m128i value, uint32_t writerPc)
 
 bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
 {
-    if (isEeTimer0Register(address))
+    ps2x::timing::EeCounterAdvanceResult counterAdvance{};
+    if (m_eeCounters.writeRegister(
+            address,
+            value,
+            currentEeCounterCycle(),
+            &counterAdvance))
     {
-        if (address == kEeTimer0Count)
-        {
-            m_ioRegisters[address] = value;
-            m_timer0LastHostNs = steadyClockNs();
-            m_timer0FractionNs = 0u;
-            return true;
-        }
+        publishEeCounterAdvance(counterAdvance);
+        return true;
+    }
 
-        updateEeTimer0Counter();
-        m_ioRegisters[address] = value;
-        m_timer0LastHostNs = steadyClockNs();
-        if (address == kEeTimer0Mode)
-        {
-            m_timer0FractionNs = 0u;
-        }
+    if (address == kIntcStat)
+    {
+        m_ioRegisters[kIntcStat] =
+            intcStatus() & ~value;
+        publishEeCounterAdvance({}, true);
+        return true;
+    }
+    if (address == kIntcMask)
+    {
+        // EE INTC_MASK bits toggle when written as one.
+        m_ioRegisters[kIntcMask] =
+            intcMask() ^ value;
+        publishEeCounterAdvance({}, true);
         return true;
     }
 
@@ -6310,17 +6379,16 @@ uint32_t PS2Memory::readIORegister(uint32_t address)
     }
     if (address >= 0x10000000 && address < 0x10010000)
     {
-        if (address >= 0x10000000 && address < 0x10000100)
+        uint32_t counterValue = 0u;
+        ps2x::timing::EeCounterAdvanceResult counterAdvance{};
+        if (m_eeCounters.readRegister(
+                address,
+                currentEeCounterCycle(),
+                counterValue,
+                &counterAdvance))
         {
-            if (isEeTimer0Register(address))
-            {
-                if (address == kEeTimer0Count)
-                {
-                    updateEeTimer0Counter();
-                }
-                auto timerIt = m_ioRegisters.find(address);
-                return timerIt != m_ioRegisters.end() ? timerIt->second : 0u;
-            }
+            publishEeCounterAdvance(counterAdvance);
+            return counterValue;
         }
 
         if (address >= 0x10000200 && address < 0x10000300)

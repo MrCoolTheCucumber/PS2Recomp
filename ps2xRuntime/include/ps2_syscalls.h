@@ -49,7 +49,10 @@ namespace ps2_syscalls
 
     bool dispatchNumericSyscall(uint32_t syscallNumber, uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
     void dispatchDmacHandlersForCause(uint8_t *rdram, PS2Runtime *runtime, uint32_t cause);
+    void dispatchIntcHandlersForCause(
+        uint8_t *rdram, PS2Runtime *runtime, uint32_t cause);
     bool isDmacCauseEnabled(uint32_t cause);
+    bool isIntcCauseEnabled(uint32_t cause);
     void initializeGuestKernelState(uint8_t *rdram);
     void TODO(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime, uint32_t encodedSyscallId);
     void notifyRuntimeStop();

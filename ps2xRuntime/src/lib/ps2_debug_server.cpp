@@ -1026,6 +1026,9 @@ struct PS2DebugServer::Impl
         case PS2Runtime::DebugEeEventDeviceKind::VSync:
             kind = "vsync";
             break;
+        case PS2Runtime::DebugEeEventDeviceKind::EeCounters:
+            kind = "ee_counters";
+            break;
         case PS2Runtime::DebugEeEventDeviceKind::GifDma:
             kind = "gif_dma";
             break;

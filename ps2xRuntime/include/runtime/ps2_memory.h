@@ -15,6 +15,7 @@
 #include <iostream>
 #include <mutex>
 
+#include "ee_counters.h"
 #include "ps2_gif_arbiter.h"
 #if defined(_MSC_VER)
 #include <intrin.h>
@@ -655,6 +656,47 @@ public:
     bool writeIORegister(uint32_t address, uint32_t value);
     uint32_t readIORegister(uint32_t address);
 
+    using EeCounterCycleCallback = std::function<uint64_t()>;
+    using EeCounterScheduleCallback =
+        std::function<void(std::optional<uint64_t>)>;
+    using EeCounterInterruptStateCallback =
+        std::function<void(
+            uint32_t status,
+            uint32_t mask,
+            uint32_t newlyRaised)>;
+    void setEeCounterCycleCallback(
+        EeCounterCycleCallback callback)
+    {
+        m_eeCounterCycleCallback = std::move(callback);
+    }
+    void setEeCounterScheduleCallback(
+        EeCounterScheduleCallback callback)
+    {
+        m_eeCounterScheduleCallback =
+            std::move(callback);
+    }
+    void setEeCounterInterruptStateCallback(
+        EeCounterInterruptStateCallback callback)
+    {
+        m_eeCounterInterruptStateCallback =
+            std::move(callback);
+    }
+    void resetEeCounters(uint64_t currentCycle = 0u);
+    void configureEeCounterVideoTiming(
+        ps2x::timing::EeCounterVideoTiming timing,
+        uint64_t currentCycle);
+    ps2x::timing::EeCounterAdvanceResult
+    synchronizeEeCounters(uint64_t currentCycle);
+    [[nodiscard]] ps2x::timing::EeCounterBankSnapshot
+    eeCounterSnapshot() const noexcept
+    {
+        return m_eeCounters.snapshot();
+    }
+    [[nodiscard]] uint32_t intcStatus() const noexcept;
+    [[nodiscard]] uint32_t intcMask() const noexcept;
+    void setIntcInterruptMask(
+        uint32_t cause, bool enabled);
+
     using GifPacketCallback = std::function<void(const uint8_t *, uint32_t)>;
     void setGifPacketCallback(GifPacketCallback cb) { m_gifPacketCallback = std::move(cb); }
     void setGifArbiter(GifArbiter *arbiter) { m_gifArbiter = arbiter; }
@@ -1120,7 +1162,10 @@ public:
     bool isScratchpad(uint32_t address) const;
     uint8_t *mapVuMemory(uint32_t physAddr, uint32_t size, uint32_t &offset, uint32_t &limit);
     const uint8_t *mapVuMemory(uint32_t physAddr, uint32_t size, uint32_t &offset, uint32_t &limit) const;
-    void updateEeTimer0Counter();
+    [[nodiscard]] uint64_t currentEeCounterCycle() const noexcept;
+    void publishEeCounterAdvance(
+        const ps2x::timing::EeCounterAdvanceResult &result,
+        bool interruptStateChanged = false);
     bool startScratchpadDma(
         DmacTransferToken transfer, uint32_t chcr);
     bool scheduleScratchpadDma(
@@ -1219,8 +1264,11 @@ public:
                                const int32_t *viRegisters, size_t viRegisterCount);
     void finishVif1DmaTrace();
     Ps2GsDmaTraceState *m_gsDmaTrace = nullptr;
-    uint64_t m_timer0LastHostNs = 0;
-    uint64_t m_timer0FractionNs = 0;
+    ps2x::timing::EeCounterBank m_eeCounters{};
+    EeCounterCycleCallback m_eeCounterCycleCallback;
+    EeCounterScheduleCallback m_eeCounterScheduleCallback;
+    EeCounterInterruptStateCallback
+        m_eeCounterInterruptStateCallback;
 };
 
 #endif // PS2_MEMORY_H

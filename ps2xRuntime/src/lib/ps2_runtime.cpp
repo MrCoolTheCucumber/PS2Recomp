@@ -885,6 +885,27 @@ PS2Runtime::PS2Runtime()
         }
     }
 
+    m_memory.setEeCounterCycleCallback(
+        [this]()
+        {
+            return ps2x::timing::eeTickToCyclesFloor(
+                currentEeTick());
+        });
+    m_memory.setEeCounterScheduleCallback(
+        [this](std::optional<uint64_t> deadlineCycle)
+        {
+            onEeCounterScheduleChanged(
+                deadlineCycle);
+        });
+    m_memory.setEeCounterInterruptStateCallback(
+        [this](
+            uint32_t status,
+            uint32_t mask,
+            uint32_t newlyRaised)
+        {
+            onEeCounterInterruptStateChanged(
+                status, mask, newlyRaised);
+        });
     m_memory.setDmacCompletionReadyCallback(
         [this]()
         {
@@ -1136,6 +1157,160 @@ ps2x::timing::EeTick PS2Runtime::currentEeTick() const noexcept
     return m_eeTimeline.now();
 }
 
+void PS2Runtime::cancelEeCounterEvent() noexcept
+{
+    if (m_eeCounterEventToken.generation != 0u)
+    {
+        (void)m_eeEventScheduler.cancel(
+            m_eeCounterEventToken);
+    }
+    else
+    {
+        (void)m_eeEventScheduler.cancel(
+            ps2x::timing::EeEventSource::
+                EeCounters);
+    }
+    m_eeCounterEventToken = {
+        ps2x::timing::EeEventSource::EeCounters,
+        0u};
+}
+
+void PS2Runtime::onEeCounterScheduleChanged(
+    std::optional<uint64_t> deadlineCycle) noexcept
+{
+    if (m_eeSchedulingMode !=
+            ps2x::timing::EeSchedulingMode::Event ||
+        !deadlineCycle.has_value())
+    {
+        cancelEeCounterEvent();
+        return;
+    }
+
+    const ps2x::timing::EeTick deadline =
+        ps2x::timing::eeTickFromRaw(
+            ps2x::timing::eeCyclesToTicks(
+                *deadlineCycle)
+                .raw());
+    const auto scheduled =
+        m_eeEventScheduler.event(
+            ps2x::timing::EeEventSource::
+                EeCounters);
+    if (scheduled.has_value() &&
+        scheduled->deadline == deadline)
+    {
+        m_eeCounterEventToken =
+            scheduled->token;
+        return;
+    }
+
+    m_eeCounterEventToken =
+        m_eeEventScheduler.scheduleAbsolute(
+            ps2x::timing::EeEventSource::
+                EeCounters,
+            deadline);
+}
+
+void PS2Runtime::onEeCounterInterruptStateChanged(
+    uint32_t status,
+    uint32_t mask,
+    uint32_t newlyRaised) noexcept
+{
+    constexpr uint32_t kTimerCauseMask =
+        (1u << 9u) | (1u << 10u) |
+        (1u << 11u) | (1u << 12u);
+    m_pendingEeCounterInterrupts &=
+        status & kTimerCauseMask;
+    m_pendingEeCounterInterrupts |=
+        newlyRaised & kTimerCauseMask;
+
+    for (uint32_t cause = 9u;
+         cause <= 12u;
+         ++cause)
+    {
+        if ((m_pendingEeCounterInterrupts &
+             (1u << cause)) != 0u &&
+            (status & mask &
+             (1u << cause)) != 0u &&
+            ps2_syscalls::isIntcCauseEnabled(cause))
+        {
+            requestGuestPreemption();
+            return;
+        }
+    }
+}
+
+void PS2Runtime::serviceEeCountersAtEvent(
+    const ps2x::timing::EeEventService &service)
+{
+    if (m_eeCounterEventToken.generation == 0u ||
+        service.generation !=
+            m_eeCounterEventToken.generation)
+    {
+        return;
+    }
+    m_eeCounterEventToken = {
+        ps2x::timing::EeEventSource::EeCounters,
+        0u};
+    (void)m_memory.synchronizeEeCounters(
+        ps2x::timing::eeTickToCyclesFloor(
+            service.serviceTick));
+}
+
+bool PS2Runtime::overlapsEeCounterRegister(
+    uint32_t address,
+    uint32_t size) noexcept
+{
+    if (size == 0u)
+    {
+        return false;
+    }
+    const uint32_t physical = address & 0x1fffffffu;
+    const uint64_t end =
+        static_cast<uint64_t>(physical) + size;
+    constexpr std::array<uint32_t, 4u> offsets{
+        0x00u, 0x10u, 0x20u, 0x30u};
+    for (size_t counter = 0u;
+         counter < ps2x::timing::kEeCounterCount;
+         ++counter)
+    {
+        for (const uint32_t offset : offsets)
+        {
+            if (counter >= 2u && offset == 0x30u)
+            {
+                continue;
+            }
+            const uint64_t reg =
+                ps2x::timing::kEeCounterBaseAddress +
+                counter *
+                    ps2x::timing::kEeCounterStride +
+                offset;
+            if (static_cast<uint64_t>(physical) <
+                    reg + sizeof(uint32_t) &&
+                end > reg)
+            {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+void PS2Runtime::synchronizeEeCounterMmio(
+    R5900Context *ctx,
+    uint32_t address,
+    uint32_t size)
+{
+    if (!overlapsEeCounterRegister(
+            address, size))
+    {
+        return;
+    }
+    const ps2x::timing::EeTick now =
+        commitEeContextProgress(ctx);
+    (void)m_memory.synchronizeEeCounters(
+        ps2x::timing::eeTickToCyclesFloor(now));
+}
+
 void PS2Runtime::scheduleEeVSyncEvent(
     ps2x::timing::EeTick deadline) noexcept
 {
@@ -1176,6 +1351,9 @@ PS2Runtime::eeVSyncDurationsForVideoMode(
                 .renderCycles = 5'435'818u,
                 .blankCycles = 462'422u,
                 .gsBlankCycles = 56'623u,
+                .hRenderCycles = 15'795u,
+                .hBlankCycles = 3'079u,
+                .hSyncErrorCycles = 114u,
             };
         }
         return {
@@ -1183,6 +1361,9 @@ PS2Runtime::eeVSyncDurationsForVideoMode(
             .renderCycles = 5'435'944u,
             .blankCycles = 490'744u,
             .gsBlankCycles = 84'936u,
+            .hRenderCycles = 7'898u,
+            .hBlankCycles = 1'539u,
+            .hSyncErrorCycles = 252u,
         };
     case 0x51u:
     case 0x54u:
@@ -1193,6 +1374,9 @@ PS2Runtime::eeVSyncDurationsForVideoMode(
                 .renderCycles = 4'718'592u,
                 .blankCycles = 196'608u,
                 .gsBlankCycles = 30'583u,
+                .hRenderCycles = 7'313u,
+                .hBlankCycles = 1'425u,
+                .hSyncErrorCycles = 74u,
             };
         }
         return {
@@ -1200,6 +1384,9 @@ PS2Runtime::eeVSyncDurationsForVideoMode(
             .renderCycles = 4'714'223u,
             .blankCycles = 200'977u,
             .gsBlankCycles = 34'952u,
+            .hRenderCycles = 3'657u,
+            .hBlankCycles = 712u,
+            .hSyncErrorCycles = 74u,
         };
     case 0x50u:
         // PCSX2 treats SDTV 480p as a distinct 59.94 Hz mode with the
@@ -1212,6 +1399,9 @@ PS2Runtime::eeVSyncDurationsForVideoMode(
                 .renderCycles = 4'498'396u,
                 .blankCycles = 421'724u,
                 .gsBlankCycles = 65'601u,
+                .hRenderCycles = 15'685u,
+                .hBlankCycles = 3'058u,
+                .hSyncErrorCycles = 82u,
             };
         }
         return {
@@ -1219,6 +1409,9 @@ PS2Runtime::eeVSyncDurationsForVideoMode(
             .renderCycles = 4'489'024u,
             .blankCycles = 431'096u,
             .gsBlankCycles = 74'973u,
+            .hRenderCycles = 7'842u,
+            .hBlankCycles = 1'529u,
+            .hSyncErrorCycles = 345u,
         };
     case 0x1Au:
     case 0x1Bu:
@@ -1244,6 +1437,9 @@ PS2Runtime::eeVSyncDurationsForVideoMode(
                 .renderCycles = 4'493'898u,
                 .blankCycles = 421'302u,
                 .gsBlankCycles = 65'535u,
+                .hRenderCycles = 15'669u,
+                .hBlankCycles = 3'055u,
+                .hSyncErrorCycles = 149u,
             };
         }
         return {
@@ -1251,6 +1447,9 @@ PS2Runtime::eeVSyncDurationsForVideoMode(
             .renderCycles = 4'484'535u,
             .blankCycles = 430'665u,
             .gsBlankCycles = 74'898u,
+            .hRenderCycles = 7'835u,
+            .hBlankCycles = 1'527u,
+            .hSyncErrorCycles = 149u,
         };
     case 0x00u:
     case 0x02u:
@@ -1264,6 +1463,9 @@ PS2Runtime::eeVSyncDurationsForVideoMode(
                 .renderCycles = 4'498'396u,
                 .blankCycles = 421'724u,
                 .gsBlankCycles = 65'601u,
+                .hRenderCycles = 15'685u,
+                .hBlankCycles = 3'058u,
+                .hSyncErrorCycles = 82u,
             };
         }
         return {
@@ -1271,6 +1473,9 @@ PS2Runtime::eeVSyncDurationsForVideoMode(
             .renderCycles = 4'498'098u,
             .blankCycles = 431'067u,
             .gsBlankCycles = 74'968u,
+            .hRenderCycles = 7'842u,
+            .hBlankCycles = 1'529u,
+            .hSyncErrorCycles = 19u,
         };
     }
 }
@@ -1342,6 +1547,21 @@ void PS2Runtime::configureEeVSyncVideoMode(
     m_eeVSyncTiming.videoModeClass = videoModeClass;
     m_eeVSyncTiming.videoModeConfigured = true;
     m_eeVSyncTiming.interlaced = interlaced;
+    m_memory.configureEeCounterVideoTiming(
+        ps2x::timing::EeCounterVideoTiming{
+            .renderCycles =
+                m_eeVSyncTiming.durations.renderCycles,
+            .blankCycles =
+                m_eeVSyncTiming.durations.blankCycles,
+            .hRenderCycles =
+                m_eeVSyncTiming.durations.hRenderCycles,
+            .hBlankCycles =
+                m_eeVSyncTiming.durations.hBlankCycles,
+            .hSyncErrorCycles =
+                m_eeVSyncTiming.durations.hSyncErrorCycles,
+        },
+        ps2x::timing::eeTickToCyclesFloor(
+            currentEeTick()));
 
     if (modeClassChanged)
     {
@@ -1586,6 +1806,7 @@ ps2x::timing::EeTick PS2Runtime::finishEeContextBlock(
 void PS2Runtime::resetEeTimingUnlocked(
     R5900Context *context) noexcept
 {
+    cancelEeCounterEvent();
     cancelVif0DmaEvent();
     cancelVif0VuFinishEvent();
     if (m_memory.vif0DmaSnapshot().active)
@@ -1622,6 +1843,8 @@ void PS2Runtime::resetEeTimingUnlocked(
     }
     m_eeTimeline.reset();
     m_eeEventScheduler.reset();
+    m_pendingEeCounterInterrupts = 0u;
+    m_memory.resetEeCounters(0u);
     resetEeVSyncStateUnlocked();
     cancelVU1Execution(true);
     m_vu0CycleTick = {};
@@ -1676,6 +1899,7 @@ void PS2Runtime::setEeSchedulingMode(
         return;
     }
 
+    cancelEeCounterEvent();
     cancelVif0DmaEvent();
     cancelVif0VuFinishEvent();
     if (m_memory.vif0DmaSnapshot().active)
@@ -1712,6 +1936,9 @@ void PS2Runtime::setEeSchedulingMode(
     }
     m_eeSchedulingMode = mode;
     m_eeEventScheduler.reset();
+    (void)m_memory.synchronizeEeCounters(
+        ps2x::timing::eeTickToCyclesFloor(
+            currentEeTick()));
     resetEeVSyncStateUnlocked();
     cancelVU1Execution(true);
     m_eeSchedulerShadowMismatch = false;
@@ -4308,6 +4535,9 @@ void PS2Runtime::dispatchEeEvent(
     case ps2x::timing::EeEventSource::VSync:
         serviceEeVSyncAtEvent(rdram, service);
         return;
+    case ps2x::timing::EeEventSource::EeCounters:
+        serviceEeCountersAtEvent(service);
+        return;
     case ps2x::timing::EeEventSource::
         DmacCompletion:
         (void)publishReadyDmacCompletions(
@@ -4480,6 +4710,29 @@ PS2Runtime::debugEeEventDeviceState(
             m_eeVSyncTiming.phase);
         result.active = m_eeVSyncTiming.enabled;
         return result;
+    case ps2x::timing::EeEventSource::EeCounters:
+    {
+        const ps2x::timing::EeCounterBankSnapshot state =
+            m_memory.eeCounterSnapshot();
+        result.kind =
+            DebugEeEventDeviceKind::EeCounters;
+        result.lastAdvancedTick =
+            ps2x::timing::eeCyclesToTicks(
+                state.currentCycle)
+                .raw();
+        result.phase =
+            static_cast<uint32_t>(
+                state.hSyncPhase);
+        result.stall =
+            static_cast<uint32_t>(
+                state.vSyncPhase);
+        result.qwc =
+            state.counters[0].count & 0xffffu;
+        result.tagsProcessed =
+            state.counters[1].count & 0xffffu;
+        result.active = true;
+        return result;
+    }
     case ps2x::timing::EeEventSource::DmacVif1:
     {
         const Vif1DmaSnapshot state =
@@ -4854,6 +5107,39 @@ void PS2Runtime::drainPendingVSyncHandlers(uint8_t *rdram)
             break;
         }
     }
+}
+
+void PS2Runtime::drainPendingEeCounterHandlers(
+    uint8_t *rdram)
+{
+    uint32_t pending =
+        m_pendingEeCounterInterrupts;
+    m_pendingEeCounterInterrupts = 0u;
+    uint32_t retained = 0u;
+    for (uint32_t cause = 9u;
+         cause <= 12u;
+         ++cause)
+    {
+        const uint32_t bit = 1u << cause;
+        if ((pending & bit) == 0u ||
+            (m_memory.intcStatus() & bit) == 0u)
+        {
+            continue;
+        }
+        if (!ps2_syscalls::isIntcCauseEnabled(cause))
+        {
+            retained |= bit;
+            continue;
+        }
+        if ((m_memory.intcMask() & bit) == 0u)
+        {
+            retained |= bit;
+            continue;
+        }
+        ps2_syscalls::dispatchIntcHandlersForCause(
+            rdram, this, cause);
+    }
+    m_pendingEeCounterInterrupts |= retained;
 }
 
 void PS2Runtime::drainCompletedDmacHandlers(uint8_t *rdram)
@@ -5648,6 +5934,8 @@ void PS2Runtime::leaveGuestExecution(
     if (it->second == 1u)
     {
         drainPendingVSyncHandlers(
+            m_memory.getRDRAM());
+        drainPendingEeCounterHandlers(
             m_memory.getRDRAM());
         drainCompletedDmacHandlers(m_memory.getRDRAM());
         m_guestExecutionPreemptionRequested.store(
@@ -6914,6 +7202,7 @@ bool PS2Runtime::shouldPreemptGuestExecution()
 
 uint8_t PS2Runtime::Load8(uint8_t *rdram, R5900Context *ctx, uint32_t vaddr)
 {
+    synchronizeEeCounterMmio(ctx, vaddr, 1u);
     debugObserveMemoryAccess(vaddr, 1u, DebugMemoryAccess::Read, ctx);
     try
     {
@@ -6931,6 +7220,7 @@ uint8_t PS2Runtime::Load8(uint8_t *rdram, R5900Context *ctx, uint32_t vaddr)
 
 uint16_t PS2Runtime::Load16(uint8_t *rdram, R5900Context *ctx, uint32_t vaddr)
 {
+    synchronizeEeCounterMmio(ctx, vaddr, 2u);
     debugObserveMemoryAccess(vaddr, 2u, DebugMemoryAccess::Read, ctx);
     try
     {
@@ -6948,6 +7238,7 @@ uint16_t PS2Runtime::Load16(uint8_t *rdram, R5900Context *ctx, uint32_t vaddr)
 
 uint32_t PS2Runtime::Load32(uint8_t *rdram, R5900Context *ctx, uint32_t vaddr)
 {
+    synchronizeEeCounterMmio(ctx, vaddr, 4u);
     debugObserveMemoryAccess(vaddr, 4u, DebugMemoryAccess::Read, ctx);
     try
     {
@@ -6965,6 +7256,7 @@ uint32_t PS2Runtime::Load32(uint8_t *rdram, R5900Context *ctx, uint32_t vaddr)
 
 uint64_t PS2Runtime::Load64(uint8_t *rdram, R5900Context *ctx, uint32_t vaddr)
 {
+    synchronizeEeCounterMmio(ctx, vaddr, 8u);
     debugObserveMemoryAccess(vaddr, 8u, DebugMemoryAccess::Read, ctx);
     try
     {
@@ -6982,6 +7274,7 @@ uint64_t PS2Runtime::Load64(uint8_t *rdram, R5900Context *ctx, uint32_t vaddr)
 
 __m128i PS2Runtime::Load128(uint8_t *rdram, R5900Context *ctx, uint32_t vaddr)
 {
+    synchronizeEeCounterMmio(ctx, vaddr, 16u);
     debugObserveMemoryAccess(vaddr, 16u, DebugMemoryAccess::Read, ctx);
     try
     {
@@ -6999,6 +7292,7 @@ __m128i PS2Runtime::Load128(uint8_t *rdram, R5900Context *ctx, uint32_t vaddr)
 
 void PS2Runtime::Store8(uint8_t *rdram, R5900Context *ctx, uint32_t vaddr, uint8_t value)
 {
+    synchronizeEeCounterMmio(ctx, vaddr, 1u);
     debugObserveMemoryAccess(vaddr, 1u, DebugMemoryAccess::Write, ctx);
     ps2TraceGuestWrite(rdram, vaddr, 1u, value, 0u, "WRITE8", ctx);
     traceVif0MmioWrite(m_memory, ctx, vaddr, 1u, value, 0u);
@@ -7018,6 +7312,7 @@ void PS2Runtime::Store8(uint8_t *rdram, R5900Context *ctx, uint32_t vaddr, uint8
 
 void PS2Runtime::Store16(uint8_t *rdram, R5900Context *ctx, uint32_t vaddr, uint16_t value)
 {
+    synchronizeEeCounterMmio(ctx, vaddr, 2u);
     debugObserveMemoryAccess(vaddr, 2u, DebugMemoryAccess::Write, ctx);
     ps2TraceGuestWrite(rdram, vaddr, 2u, value, 0u, "WRITE16", ctx);
     traceVif0MmioWrite(m_memory, ctx, vaddr, 2u, value, 0u);
@@ -7037,6 +7332,7 @@ void PS2Runtime::Store16(uint8_t *rdram, R5900Context *ctx, uint32_t vaddr, uint
 
 void PS2Runtime::Store32(uint8_t *rdram, R5900Context *ctx, uint32_t vaddr, uint32_t value)
 {
+    synchronizeEeCounterMmio(ctx, vaddr, 4u);
     debugObserveMemoryAccess(vaddr, 4u, DebugMemoryAccess::Write, ctx);
     ps2TraceGuestWrite(rdram, vaddr, 4u, value, 0u, "WRITE32", ctx);
     traceVif0MmioWrite(m_memory, ctx, vaddr, 4u, value, 0u);
@@ -7056,6 +7352,7 @@ void PS2Runtime::Store32(uint8_t *rdram, R5900Context *ctx, uint32_t vaddr, uint
 
 void PS2Runtime::Store64(uint8_t *rdram, R5900Context *ctx, uint32_t vaddr, uint64_t value)
 {
+    synchronizeEeCounterMmio(ctx, vaddr, 8u);
     debugObserveMemoryAccess(vaddr, 8u, DebugMemoryAccess::Write, ctx);
     ps2TraceGuestWrite(rdram, vaddr, 8u, value, 0u, "WRITE64", ctx);
     traceVif0MmioWrite(m_memory, ctx, vaddr, 8u, value, 0u);
@@ -7075,6 +7372,7 @@ void PS2Runtime::Store64(uint8_t *rdram, R5900Context *ctx, uint32_t vaddr, uint
 
 void PS2Runtime::Store128(uint8_t *rdram, R5900Context *ctx, uint32_t vaddr, __m128i value)
 {
+    synchronizeEeCounterMmio(ctx, vaddr, 16u);
     debugObserveMemoryAccess(vaddr, 16u, DebugMemoryAccess::Write, ctx);
     alignas(16) uint64_t _parts[2];
     _mm_storeu_si128(reinterpret_cast<__m128i *>(_parts), value);
