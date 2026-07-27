@@ -139,9 +139,19 @@ namespace
         kVu0MinimumRunCycles + 1u;
 
     constexpr uint32_t COP0_CAUSE_EXCCODE_MASK = 0x0000007Cu;
+    constexpr uint32_t COP0_CAUSE_IP7 = 0x00008000u;
+    constexpr uint32_t COP0_CAUSE_EXC2_MASK = 0x00070000u;
+    constexpr uint32_t COP0_CAUSE_EXC2_PERFORMANCE = 0x00020000u;
+    constexpr uint32_t COP0_CAUSE_BD2 = 0x40000000u;
     constexpr uint32_t COP0_CAUSE_BD = 0x80000000u;
+    constexpr uint32_t COP0_STATUS_IE = 0x00000001u;
     constexpr uint32_t COP0_STATUS_EXL = 0x00000002u;
+    constexpr uint32_t COP0_STATUS_ERL = 0x00000004u;
+    constexpr uint32_t COP0_STATUS_IM7 = 0x00008000u;
+    constexpr uint32_t COP0_STATUS_EIE = 0x00010000u;
     constexpr uint32_t COP0_STATUS_BEV = 0x00400000u;
+    constexpr uint32_t COP0_STATUS_DEV = 0x00800000u;
+    constexpr uint32_t COP0_STATUS_WRITABLE_MASK = 0xF0C79C1Fu;
     constexpr uint32_t EXCEPTION_VECTOR_NORMAL_BASE = 0x80000000u;
     constexpr uint32_t EXCEPTION_VECTOR_BOOT_BASE = 0xBFC00200u;
     constexpr uint32_t EXCEPTION_VECTOR_COMMON_OFFSET = 0x180u;
@@ -612,36 +622,6 @@ namespace
         ctx->enforceVu0RegisterInvariants();
     }
 
-    [[noreturn]] void raiseCop0Exception(R5900Context *ctx, uint32_t exceptionCode)
-    {
-        const bool alreadyInException = (ctx->cop0_status & COP0_STATUS_EXL) != 0u;
-        if (!alreadyInException && ctx->in_delay_slot)
-        {
-            ctx->cop0_epc = ctx->branch_pc;
-            ctx->cop0_cause = (ctx->cop0_cause & ~COP0_CAUSE_EXCCODE_MASK) |
-                              ((exceptionCode << 2) & COP0_CAUSE_EXCCODE_MASK) |
-                              COP0_CAUSE_BD;
-        }
-        else if (!alreadyInException)
-        {
-            ctx->cop0_epc = ctx->pc;
-            ctx->cop0_cause = (ctx->cop0_cause & ~(COP0_CAUSE_EXCCODE_MASK | COP0_CAUSE_BD)) |
-                              ((exceptionCode << 2) & COP0_CAUSE_EXCCODE_MASK);
-        }
-        else
-        {
-            // Nested level-1 exceptions update the cause but preserve the
-            // original restart address and branch-delay state.
-            ctx->cop0_cause = (ctx->cop0_cause & ~COP0_CAUSE_EXCCODE_MASK) |
-                              ((exceptionCode << 2) & COP0_CAUSE_EXCCODE_MASK);
-        }
-
-        ctx->cop0_status |= COP0_STATUS_EXL;
-        ctx->pc = selectExceptionVector(ctx, exceptionCode, alreadyInException);
-        ctx->in_delay_slot = false;
-        throw PS2GuestException{};
-    }
-
     std::filesystem::path normalizeAbsolutePath(const std::filesystem::path &path)
     {
         if (path.empty())
@@ -1044,6 +1024,8 @@ PS2Runtime::PS2Runtime()
     // Recompiled ELFs enter after the console BIOS has enabled normal
     // dual-issue, cache, non-blocking-load, and branch-prediction modes.
     m_cpuContext.cop0_config = 0x00073443u;
+    m_cop0Timing.reset();
+    publishCop0TimingMirrors(&m_cpuContext);
 
     // Stack pointer (SP) and global pointer (GP) will be set by the loaded ELF
 
@@ -1254,6 +1236,59 @@ void PS2Runtime::serviceEeCountersAtEvent(
     (void)m_memory.synchronizeEeCounters(
         ps2x::timing::eeTickToCyclesFloor(
             service.serviceTick));
+}
+
+void PS2Runtime::serviceCop0TimerAtEvent(
+    R5900Context *ctx,
+    const ps2x::timing::EeEventService &service)
+{
+    if (m_cop0TimerEventToken.generation == 0u ||
+        service.generation !=
+            m_cop0TimerEventToken.generation)
+    {
+        return;
+    }
+    m_cop0TimerEventToken = {
+        ps2x::timing::EeEventSource::Cop0Timer,
+        0u};
+    const uint64_t cycle =
+        ps2x::timing::eeTickToCyclesFloor(
+            service.serviceTick);
+    (void)m_cop0Timing.synchronizeCount(cycle);
+    publishCop0TimingMirrors(ctx);
+    if (!m_cop0Timing.snapshot().timerPending)
+    {
+        refreshCop0EventSchedules(ctx, cycle);
+    }
+}
+
+void PS2Runtime::serviceCop0PerformanceAtEvent(
+    R5900Context *ctx,
+    const ps2x::timing::EeEventService &service)
+{
+    if (m_cop0PerformanceEventToken.generation ==
+            0u ||
+        service.generation !=
+            m_cop0PerformanceEventToken.generation)
+    {
+        return;
+    }
+    m_cop0PerformanceEventToken = {
+        ps2x::timing::EeEventSource::
+            Cop0Performance,
+        0u};
+    const uint64_t cycle =
+        ps2x::timing::eeTickToCyclesFloor(
+            service.serviceTick);
+    (void)m_cop0Timing.synchronizePerformance(
+        cycle,
+        ctx ? ctx->cop0_status : 0u);
+    publishCop0TimingMirrors(ctx);
+    if (!m_cop0Timing.performanceExceptionPending(
+            ctx ? ctx->cop0_status : 0u))
+    {
+        refreshCop0EventSchedules(ctx, cycle);
+    }
 }
 
 bool PS2Runtime::overlapsEeCounterRegister(
@@ -1783,6 +1818,411 @@ ps2x::timing::EeTick PS2Runtime::publishEeElapsed(
     return m_eeTimeline.advance(elapsed);
 }
 
+void PS2Runtime::publishCop0TimingMirrors(
+    R5900Context *context) noexcept
+{
+    const ps2x::timing::Cop0TimingSnapshot state =
+        m_cop0Timing.snapshot();
+    const auto publish =
+        [&state](R5900Context *target)
+        {
+            if (!target)
+            {
+                return;
+            }
+            target->cop0_count = state.count;
+            target->cop0_compare = state.compare;
+            target->cop0_perf = state.pccr;
+            target->cop0_pcr0 = state.pcr[0];
+            target->cop0_pcr1 = state.pcr[1];
+            if (state.timerPending)
+            {
+                target->cop0_cause |= COP0_CAUSE_IP7;
+            }
+            else
+            {
+                target->cop0_cause &= ~COP0_CAUSE_IP7;
+            }
+        };
+
+    publish(&m_cpuContext);
+    if (m_boundEeContext != &m_cpuContext)
+    {
+        publish(m_boundEeContext);
+    }
+    if (context != &m_cpuContext &&
+        context != m_boundEeContext)
+    {
+        publish(context);
+    }
+}
+
+void PS2Runtime::synchronizeCop0Timing(
+    R5900Context *ctx,
+    uint64_t currentCycle,
+    bool synchronizeCount,
+    bool synchronizePerformance) noexcept
+{
+    R5900Context *const active =
+        ctx ? ctx
+            : (m_boundEeContext
+                   ? m_boundEeContext
+                   : &m_cpuContext);
+    if (synchronizeCount)
+    {
+        (void)m_cop0Timing.synchronizeCount(
+            currentCycle);
+    }
+    if (synchronizePerformance)
+    {
+        (void)m_cop0Timing.synchronizePerformance(
+            currentCycle,
+            active ? active->cop0_status : 0u);
+    }
+    publishCop0TimingMirrors(active);
+}
+
+void PS2Runtime::refreshCop0EventSchedules(
+    R5900Context *ctx,
+    uint64_t currentCycle) noexcept
+{
+    if (m_eeSchedulingMode !=
+        ps2x::timing::EeSchedulingMode::Event)
+    {
+        (void)m_eeEventScheduler.cancel(
+            ps2x::timing::EeEventSource::
+                Cop0Timer);
+        (void)m_eeEventScheduler.cancel(
+            ps2x::timing::EeEventSource::
+                Cop0Performance);
+        m_cop0TimerEventToken = {
+            ps2x::timing::EeEventSource::
+                Cop0Timer,
+            0u};
+        m_cop0PerformanceEventToken = {
+            ps2x::timing::EeEventSource::
+                Cop0Performance,
+            0u};
+        return;
+    }
+
+    const auto update =
+        [this](
+            ps2x::timing::EeEventSource source,
+            std::optional<uint64_t> deadlineCycle,
+            ps2x::timing::EeEventToken &token)
+        {
+            if (!deadlineCycle.has_value())
+            {
+                (void)m_eeEventScheduler.cancel(
+                    source);
+                token = {source, 0u};
+                return;
+            }
+
+            const ps2x::timing::EeTick deadline =
+                ps2x::timing::eeTickFromRaw(
+                    ps2x::timing::eeCyclesToTicks(
+                        *deadlineCycle)
+                        .raw());
+            const auto scheduled =
+                m_eeEventScheduler.event(source);
+            if (scheduled.has_value() &&
+                scheduled->deadline == deadline)
+            {
+                token = scheduled->token;
+                return;
+            }
+            token =
+                m_eeEventScheduler.scheduleAbsolute(
+                    source, deadline);
+        };
+
+    update(
+        ps2x::timing::EeEventSource::
+            Cop0Timer,
+        m_cop0Timing.nextTimerCycle(),
+        m_cop0TimerEventToken);
+
+    const R5900Context *const active =
+        ctx ? ctx
+            : (m_boundEeContext
+                   ? m_boundEeContext
+                   : &m_cpuContext);
+    update(
+        ps2x::timing::EeEventSource::
+            Cop0Performance,
+        m_cop0Timing.nextPerformanceEventCycle(
+            currentCycle,
+            active ? active->cop0_status : 0u),
+        m_cop0PerformanceEventToken);
+}
+
+ps2x::timing::EeTick PS2Runtime::prepareCop0Access(
+    uint8_t *rdram,
+    R5900Context *ctx)
+{
+    const ps2x::timing::EeTick now =
+        commitEeContextProgress(ctx);
+    if (m_eeSchedulingMode ==
+            ps2x::timing::EeSchedulingMode::Event &&
+        m_eeEventScheduler.deadlineDue(now))
+    {
+        serviceEeEventsAtTick(rdram, ctx, now);
+    }
+    return now;
+}
+
+bool PS2Runtime::cop0TimerInterruptEnabled(
+    const R5900Context *ctx) const noexcept
+{
+    if (!ctx ||
+        !m_cop0Timing.snapshot().timerPending)
+    {
+        return false;
+    }
+    constexpr uint32_t kGlobalInterruptMask =
+        COP0_STATUS_EIE |
+        COP0_STATUS_ERL |
+        COP0_STATUS_EXL |
+        COP0_STATUS_IE;
+    constexpr uint32_t kGlobalInterruptEnabled =
+        COP0_STATUS_EIE |
+        COP0_STATUS_IE;
+    return (ctx->cop0_status &
+            kGlobalInterruptMask) ==
+               kGlobalInterruptEnabled &&
+           (ctx->cop0_status &
+            COP0_STATUS_IM7) != 0u;
+}
+
+void PS2Runtime::deliverPendingCop0Exceptions(
+    R5900Context *ctx)
+{
+    if (!ctx)
+    {
+        return;
+    }
+    if (m_cop0Timing.performanceExceptionPending(
+            ctx->cop0_status))
+    {
+        raiseCop0PerformanceException(ctx);
+    }
+    if (cop0TimerInterruptEnabled(ctx))
+    {
+        raiseCop0Level1Exception(
+            ctx, EXCEPTION_INTERRUPT, false);
+    }
+}
+
+uint32_t PS2Runtime::readCop0Count(
+    uint8_t *rdram,
+    R5900Context *ctx)
+{
+    const ps2x::timing::EeTick now =
+        prepareCop0Access(rdram, ctx);
+    const uint64_t cycle =
+        ps2x::timing::eeTickToCyclesFloor(now);
+    const uint32_t value =
+        m_cop0Timing.readCount(cycle);
+    publishCop0TimingMirrors(ctx);
+    refreshCop0EventSchedules(ctx, cycle);
+    deliverPendingCop0Exceptions(ctx);
+    return value;
+}
+
+void PS2Runtime::writeCop0Count(
+    uint8_t *rdram,
+    R5900Context *ctx,
+    uint32_t value)
+{
+    const ps2x::timing::EeTick now =
+        prepareCop0Access(rdram, ctx);
+    const uint64_t cycle =
+        ps2x::timing::eeTickToCyclesFloor(now);
+    m_cop0Timing.writeCount(value, cycle);
+    publishCop0TimingMirrors(ctx);
+    refreshCop0EventSchedules(ctx, cycle);
+    deliverPendingCop0Exceptions(ctx);
+}
+
+uint32_t PS2Runtime::readCop0Compare(
+    R5900Context *ctx)
+{
+    publishCop0TimingMirrors(ctx);
+    return m_cop0Timing.snapshot().compare;
+}
+
+void PS2Runtime::writeCop0Compare(
+    uint8_t *rdram,
+    R5900Context *ctx,
+    uint32_t value)
+{
+    const ps2x::timing::EeTick now =
+        prepareCop0Access(rdram, ctx);
+    const uint64_t cycle =
+        ps2x::timing::eeTickToCyclesFloor(now);
+    m_cop0Timing.writeCompare(value, cycle);
+    publishCop0TimingMirrors(ctx);
+    refreshCop0EventSchedules(ctx, cycle);
+    deliverPendingCop0Exceptions(ctx);
+}
+
+uint32_t PS2Runtime::readCop0Performance(
+    uint8_t *rdram,
+    R5900Context *ctx,
+    uint32_t selector)
+{
+    selector &= 0x3fu;
+    if ((selector & 1u) == 0u)
+    {
+        publishCop0TimingMirrors(ctx);
+        return m_cop0Timing.snapshot().pccr;
+    }
+
+    const ps2x::timing::EeTick now =
+        prepareCop0Access(rdram, ctx);
+    const uint64_t cycle =
+        ps2x::timing::eeTickToCyclesFloor(now);
+    const uint32_t value =
+        m_cop0Timing.readPerformance(
+            selector, cycle,
+            ctx ? ctx->cop0_status : 0u);
+    publishCop0TimingMirrors(ctx);
+    refreshCop0EventSchedules(ctx, cycle);
+    deliverPendingCop0Exceptions(ctx);
+    return value;
+}
+
+void PS2Runtime::writeCop0Performance(
+    uint8_t *rdram,
+    R5900Context *ctx,
+    uint32_t selector,
+    uint32_t value)
+{
+    selector &= 0x3fu;
+    if ((selector & 1u) == 0u &&
+        selector != 0u)
+    {
+        return;
+    }
+
+    const ps2x::timing::EeTick now =
+        prepareCop0Access(rdram, ctx);
+    const uint64_t cycle =
+        ps2x::timing::eeTickToCyclesFloor(now);
+    (void)m_cop0Timing.writePerformance(
+        selector, value, cycle,
+        ctx ? ctx->cop0_status : 0u);
+    publishCop0TimingMirrors(ctx);
+    refreshCop0EventSchedules(ctx, cycle);
+    deliverPendingCop0Exceptions(ctx);
+}
+
+void PS2Runtime::writeCop0Status(
+    uint8_t *rdram,
+    R5900Context *ctx,
+    uint32_t value)
+{
+    if (!ctx)
+    {
+        return;
+    }
+    const ps2x::timing::EeTick now =
+        prepareCop0Access(rdram, ctx);
+    const uint64_t cycle =
+        ps2x::timing::eeTickToCyclesFloor(now);
+    (void)m_cop0Timing.synchronizeCount(cycle);
+    (void)m_cop0Timing.synchronizePerformance(
+        cycle, ctx->cop0_status, true);
+    ctx->cop0_status =
+        value & COP0_STATUS_WRITABLE_MASK;
+    publishCop0TimingMirrors(ctx);
+    refreshCop0EventSchedules(ctx, cycle);
+    deliverPendingCop0Exceptions(ctx);
+}
+
+void PS2Runtime::handleCop0Eret(
+    uint8_t *rdram,
+    R5900Context *ctx)
+{
+    if (!ctx)
+    {
+        return;
+    }
+    const ps2x::timing::EeTick now =
+        prepareCop0Access(rdram, ctx);
+    const uint64_t cycle =
+        ps2x::timing::eeTickToCyclesFloor(now);
+    synchronizeCop0Timing(ctx, cycle);
+    if ((ctx->cop0_status &
+         COP0_STATUS_ERL) != 0u)
+    {
+        ctx->pc = ctx->cop0_errorepc;
+        ctx->cop0_status &= ~COP0_STATUS_ERL;
+    }
+    else
+    {
+        ctx->pc = ctx->cop0_epc;
+        ctx->cop0_status &= ~COP0_STATUS_EXL;
+    }
+    clearLLBit(ctx);
+    refreshCop0EventSchedules(ctx, cycle);
+    deliverPendingCop0Exceptions(ctx);
+}
+
+void PS2Runtime::handleCop0Ei(
+    uint8_t *rdram,
+    R5900Context *ctx)
+{
+    if (!ctx)
+    {
+        return;
+    }
+    const ps2x::timing::EeTick now =
+        prepareCop0Access(rdram, ctx);
+    const bool permitted =
+        (ctx->cop0_status & 0x00020000u) != 0u ||
+        (ctx->cop0_status &
+         (COP0_STATUS_EXL |
+          COP0_STATUS_ERL)) != 0u ||
+        (ctx->cop0_status & 0x18u) == 0u;
+    if (permitted)
+    {
+        ctx->cop0_status |= COP0_STATUS_EIE;
+    }
+    const uint64_t cycle =
+        ps2x::timing::eeTickToCyclesFloor(now);
+    refreshCop0EventSchedules(ctx, cycle);
+    deliverPendingCop0Exceptions(ctx);
+}
+
+void PS2Runtime::handleCop0Di(
+    uint8_t *rdram,
+    R5900Context *ctx)
+{
+    if (!ctx)
+    {
+        return;
+    }
+    const ps2x::timing::EeTick now =
+        prepareCop0Access(rdram, ctx);
+    const bool permitted =
+        (ctx->cop0_status & 0x00020000u) != 0u ||
+        (ctx->cop0_status &
+         (COP0_STATUS_EXL |
+          COP0_STATUS_ERL)) != 0u ||
+        (ctx->cop0_status & 0x18u) == 0u;
+    if (permitted)
+    {
+        ctx->cop0_status &= ~COP0_STATUS_EIE;
+    }
+    const uint64_t cycle =
+        ps2x::timing::eeTickToCyclesFloor(now);
+    refreshCop0EventSchedules(ctx, cycle);
+    deliverPendingCop0Exceptions(ctx);
+}
+
 ps2x::timing::EeTick PS2Runtime::commitEeContextProgress(
     R5900Context *context) noexcept
 {
@@ -1806,6 +2246,15 @@ ps2x::timing::EeTick PS2Runtime::finishEeContextBlock(
 void PS2Runtime::resetEeTimingUnlocked(
     R5900Context *context) noexcept
 {
+    R5900Context *const cop0Context =
+        context ? context : &m_cpuContext;
+    synchronizeCop0Timing(
+        cop0Context,
+        ps2x::timing::eeTickToCyclesFloor(
+            currentEeTick()));
+    const ps2x::timing::Cop0TimingSnapshot
+        cop0State = m_cop0Timing.snapshot();
+
     cancelEeCounterEvent();
     cancelVif0DmaEvent();
     cancelVif0VuFinishEvent();
@@ -1843,6 +2292,14 @@ void PS2Runtime::resetEeTimingUnlocked(
     }
     m_eeTimeline.reset();
     m_eeEventScheduler.reset();
+    m_cop0Timing.reset(
+        0u,
+        cop0State.count,
+        cop0State.compare,
+        cop0State.pccr,
+        cop0State.pcr[0],
+        cop0State.pcr[1]);
+    publishCop0TimingMirrors(cop0Context);
     m_pendingEeCounterInterrupts = 0u;
     m_memory.resetEeCounters(0u);
     resetEeVSyncStateUnlocked();
@@ -1868,6 +2325,8 @@ void PS2Runtime::resetEeTimingUnlocked(
                 DmacCompletion,
             currentEeTick());
     }
+    refreshCop0EventSchedules(
+        cop0Context, 0u);
 
     m_cpuContext.resetEeBlockTiming();
     if (m_boundEeContext && m_boundEeContext != &m_cpuContext)
@@ -1934,6 +2393,15 @@ void PS2Runtime::setEeSchedulingMode(
                 channel);
         }
     }
+    R5900Context *const cop0Context =
+        m_boundEeContext
+            ? m_boundEeContext
+            : &m_cpuContext;
+    const uint64_t cop0Cycle =
+        ps2x::timing::eeTickToCyclesFloor(
+            currentEeTick());
+    synchronizeCop0Timing(
+        cop0Context, cop0Cycle);
     m_eeSchedulingMode = mode;
     m_eeEventScheduler.reset();
     (void)m_memory.synchronizeEeCounters(
@@ -1968,6 +2436,8 @@ void PS2Runtime::setEeSchedulingMode(
                 DmacCompletion,
             currentEeTick());
     }
+    refreshCop0EventSchedules(
+        cop0Context, cop0Cycle);
 }
 
 ps2x::timing::EeSchedulingMode
@@ -4015,6 +4485,115 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
     return ctx->pc == fallthroughPc;
 }
 
+[[noreturn]] void PS2Runtime::raiseCop0Level1Exception(
+    R5900Context *ctx,
+    uint32_t exceptionCode,
+    bool commitContextProgress)
+{
+    if (!ctx)
+    {
+        throw PS2GuestException{};
+    }
+
+    const ps2x::timing::EeTick now =
+        commitContextProgress
+            ? commitEeContextProgress(ctx)
+            : currentEeTick();
+    const uint64_t cycle =
+        ps2x::timing::eeTickToCyclesFloor(now);
+    synchronizeCop0Timing(ctx, cycle);
+
+    const bool alreadyInException =
+        (ctx->cop0_status &
+         COP0_STATUS_EXL) != 0u;
+    if (!alreadyInException &&
+        ctx->in_delay_slot)
+    {
+        ctx->cop0_epc = ctx->branch_pc;
+        ctx->cop0_cause =
+            (ctx->cop0_cause &
+             ~COP0_CAUSE_EXCCODE_MASK) |
+            ((exceptionCode << 2u) &
+             COP0_CAUSE_EXCCODE_MASK) |
+            COP0_CAUSE_BD;
+    }
+    else if (!alreadyInException)
+    {
+        ctx->cop0_epc = ctx->pc;
+        ctx->cop0_cause =
+            (ctx->cop0_cause &
+             ~(COP0_CAUSE_EXCCODE_MASK |
+               COP0_CAUSE_BD)) |
+            ((exceptionCode << 2u) &
+             COP0_CAUSE_EXCCODE_MASK);
+    }
+    else
+    {
+        // Nested level-1 exceptions update the cause but preserve the
+        // original restart address and branch-delay state.
+        ctx->cop0_cause =
+            (ctx->cop0_cause &
+             ~COP0_CAUSE_EXCCODE_MASK) |
+            ((exceptionCode << 2u) &
+             COP0_CAUSE_EXCCODE_MASK);
+    }
+
+    ctx->cop0_status |= COP0_STATUS_EXL;
+    ctx->pc = selectExceptionVector(
+        ctx, exceptionCode,
+        alreadyInException);
+    ctx->in_delay_slot = false;
+    refreshCop0EventSchedules(ctx, cycle);
+    throw PS2GuestException{};
+}
+
+[[noreturn]] void
+PS2Runtime::raiseCop0PerformanceException(
+    R5900Context *ctx)
+{
+    if (!ctx)
+    {
+        throw PS2GuestException{};
+    }
+
+    const ps2x::timing::EeTick now =
+        currentEeTick();
+    const uint64_t cycle =
+        ps2x::timing::eeTickToCyclesFloor(now);
+    synchronizeCop0Timing(ctx, cycle);
+
+    if (ctx->in_delay_slot)
+    {
+        ctx->cop0_errorepc =
+            ctx->branch_pc;
+        ctx->cop0_cause =
+            (ctx->cop0_cause &
+             ~(COP0_CAUSE_EXC2_MASK |
+               COP0_CAUSE_BD2)) |
+            COP0_CAUSE_EXC2_PERFORMANCE |
+            COP0_CAUSE_BD2;
+    }
+    else
+    {
+        ctx->cop0_errorepc = ctx->pc;
+        ctx->cop0_cause =
+            (ctx->cop0_cause &
+             ~(COP0_CAUSE_EXC2_MASK |
+               COP0_CAUSE_BD2)) |
+            COP0_CAUSE_EXC2_PERFORMANCE;
+    }
+
+    ctx->cop0_status |= COP0_STATUS_ERL;
+    ctx->pc =
+        (ctx->cop0_status &
+         COP0_STATUS_DEV) != 0u
+            ? 0xBFC00280u
+            : 0x80000080u;
+    ctx->in_delay_slot = false;
+    refreshCop0EventSchedules(ctx, cycle);
+    throw PS2GuestException{};
+}
+
 [[noreturn]] void PS2Runtime::SignalException(R5900Context *ctx, PS2Exception exception)
 {
     if (exception == EXCEPTION_INTEGER_OVERFLOW)
@@ -4022,7 +4601,8 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
         HandleIntegerOverflow(ctx);
     }
 
-    raiseCop0Exception(ctx, static_cast<uint32_t>(exception));
+    raiseCop0Level1Exception(
+        ctx, static_cast<uint32_t>(exception));
 }
 
 [[noreturn]] void PS2Runtime::SignalMemoryException(R5900Context *ctx,
@@ -4532,11 +5112,19 @@ void PS2Runtime::dispatchEeEvent(
 {
     switch (service.source)
     {
+    case ps2x::timing::EeEventSource::
+        Cop0Performance:
+        serviceCop0PerformanceAtEvent(
+            ctx, service);
+        return;
     case ps2x::timing::EeEventSource::VSync:
         serviceEeVSyncAtEvent(rdram, service);
         return;
     case ps2x::timing::EeEventSource::EeCounters:
         serviceEeCountersAtEvent(service);
+        return;
+    case ps2x::timing::EeEventSource::Cop0Timer:
+        serviceCop0TimerAtEvent(ctx, service);
         return;
     case ps2x::timing::EeEventSource::
         DmacCompletion:
@@ -4637,21 +5225,36 @@ void PS2Runtime::serviceEeEventsAtTick(
 
                 dispatchEeEvent(rdram, ctx, service);
 
-                if (!traceEnabled)
-                    return;
-
-                entry.deviceAfter =
-                    debugEeEventDeviceState(service.source);
-                const auto followup =
-                    m_eeEventScheduler.event(service.source);
-                if (followup.has_value())
+                if (traceEnabled)
                 {
-                    entry.hasFollowup = true;
-                    entry.rescheduled = true;
-                    entry.followupTick =
-                        followup->deadline.raw();
+                    entry.deviceAfter =
+                        debugEeEventDeviceState(
+                            service.source);
+                    const auto followup =
+                        m_eeEventScheduler.event(
+                            service.source);
+                    if (followup.has_value())
+                    {
+                        entry.hasFollowup = true;
+                        entry.rescheduled = true;
+                        entry.followupTick =
+                            followup->deadline.raw();
+                    }
+                    debugRecordEeEvent(
+                        std::move(entry));
                 }
-                debugRecordEeEvent(std::move(entry));
+
+                if (service.source ==
+                        ps2x::timing::EeEventSource::
+                            Cop0Performance ||
+                    service.source ==
+                        ps2x::timing::EeEventSource::
+                            Cop0Timer)
+                {
+                    // Record the hardware transition before unwinding
+                    // generated code into the selected exception vector.
+                    deliverPendingCop0Exceptions(ctx);
+                }
             });
     if (result.limitExceeded)
     {
@@ -4700,6 +5303,45 @@ PS2Runtime::debugEeEventDeviceState(
     DebugEeEventDeviceState result{};
     switch (source)
     {
+    case ps2x::timing::EeEventSource::
+        Cop0Performance:
+    {
+        const ps2x::timing::Cop0TimingSnapshot state =
+            m_cop0Timing.snapshot();
+        result.kind =
+            DebugEeEventDeviceKind::
+                Cop0Performance;
+        result.operationGeneration = state.pccr;
+        result.lastAdvancedTick =
+            ps2x::timing::eeCyclesToTicks(
+                std::max(
+                    state.lastPerformanceCycle[0],
+                    state.lastPerformanceCycle[1]))
+                .raw();
+        result.phase = state.pccr;
+        result.qwc = state.pcr[0];
+        result.tagsProcessed = state.pcr[1];
+        result.active =
+            (state.pccr & 0x80000000u) != 0u;
+        return result;
+    }
+    case ps2x::timing::EeEventSource::
+        Cop0Timer:
+    {
+        const ps2x::timing::Cop0TimingSnapshot state =
+            m_cop0Timing.snapshot();
+        result.kind =
+            DebugEeEventDeviceKind::Cop0Timer;
+        result.lastAdvancedTick =
+            ps2x::timing::eeCyclesToTicks(
+                state.lastCountCycle)
+                .raw();
+        result.phase = state.count;
+        result.stall = state.compare;
+        result.qwc = state.timerPending ? 1u : 0u;
+        result.active = state.timerArmed;
+        return result;
+    }
     case ps2x::timing::EeEventSource::VSync:
         result.kind = DebugEeEventDeviceKind::VSync;
         result.operationGeneration =
@@ -5068,7 +5710,8 @@ void PS2Runtime::handleSyscall(uint8_t *rdram, R5900Context *ctx, uint32_t encod
 
 void PS2Runtime::handleBreak(uint8_t *rdram, R5900Context *ctx)
 {
-    raiseCop0Exception(ctx, EXCEPTION_BREAKPOINT);
+    raiseCop0Level1Exception(
+        ctx, EXCEPTION_BREAKPOINT);
 }
 
 void PS2Runtime::drainPendingVSyncHandlers(uint8_t *rdram)
@@ -5201,7 +5844,8 @@ void PS2Runtime::drainCompletedDmacHandlers(uint8_t *rdram)
 
 void PS2Runtime::handleTrap(uint8_t *rdram, R5900Context *ctx)
 {
-    raiseCop0Exception(ctx, EXCEPTION_TRAP);
+    raiseCop0Level1Exception(
+        ctx, EXCEPTION_TRAP);
 }
 
 void PS2Runtime::handleTLBR(uint8_t *rdram, R5900Context *ctx)
@@ -5214,7 +5858,8 @@ void PS2Runtime::handleTLBR(uint8_t *rdram, R5900Context *ctx)
     const uint32_t index = ctx->cop0_index & 0x3Fu;
     if (!m_memory.tlbRead(index, vpn, pfn, mask, valid))
     {
-        raiseCop0Exception(ctx, EXCEPTION_RESERVED_INSTRUCTION);
+        raiseCop0Level1Exception(
+            ctx, EXCEPTION_RESERVED_INSTRUCTION);
         return;
     }
 
@@ -5236,7 +5881,8 @@ void PS2Runtime::handleTLBWI(uint8_t *rdram, R5900Context *ctx)
 
     if (!m_memory.tlbWrite(index, vpn, pfn, mask, valid))
     {
-        raiseCop0Exception(ctx, EXCEPTION_RESERVED_INSTRUCTION);
+        raiseCop0Level1Exception(
+            ctx, EXCEPTION_RESERVED_INSTRUCTION);
     }
 }
 
@@ -5245,7 +5891,8 @@ void PS2Runtime::handleTLBWR(uint8_t *rdram, R5900Context *ctx)
     const uint32_t entryCount = static_cast<uint32_t>(m_memory.tlbEntryCount());
     if (entryCount == 0)
     {
-        raiseCop0Exception(ctx, EXCEPTION_RESERVED_INSTRUCTION);
+        raiseCop0Level1Exception(
+            ctx, EXCEPTION_RESERVED_INSTRUCTION);
         return;
     }
 
@@ -5263,7 +5910,8 @@ void PS2Runtime::handleTLBWR(uint8_t *rdram, R5900Context *ctx)
 
     if (!m_memory.tlbWrite(random, vpn, pfn, mask, valid))
     {
-        raiseCop0Exception(ctx, EXCEPTION_RESERVED_INSTRUCTION);
+        raiseCop0Level1Exception(
+            ctx, EXCEPTION_RESERVED_INSTRUCTION);
         return;
     }
 
@@ -5837,9 +6485,21 @@ void PS2Runtime::switchGuestExecutionContext(
         return;
     }
 
-    (void)finishEeContextBlock(m_boundEeContext);
+    R5900Context *const previous =
+        m_boundEeContext;
+    const ps2x::timing::EeTick now =
+        finishEeContextBlock(previous);
+    synchronizeCop0Timing(
+        previous,
+        ps2x::timing::eeTickToCyclesFloor(
+            now));
     context->resetEeBlockTiming();
     m_boundEeContext = context;
+    publishCop0TimingMirrors(context);
+    refreshCop0EventSchedules(
+        context,
+        ps2x::timing::eeTickToCyclesFloor(
+            now));
 }
 
 void PS2Runtime::restoreGuestExecutionContext(
@@ -5853,8 +6513,18 @@ void PS2Runtime::restoreGuestExecutionContext(
         return;
     }
 
-    (void)finishEeContextBlock(context);
+    const ps2x::timing::EeTick now =
+        finishEeContextBlock(context);
+    synchronizeCop0Timing(
+        context,
+        ps2x::timing::eeTickToCyclesFloor(
+            now));
     m_boundEeContext = previousContext;
+    publishCop0TimingMirrors(previousContext);
+    refreshCop0EventSchedules(
+        previousContext,
+        ps2x::timing::eeTickToCyclesFloor(
+            now));
 }
 
 R5900Context *PS2Runtime::enterGuestExecution(
@@ -6383,6 +7053,14 @@ PS2Runtime::DebugStopInfo PS2Runtime::debugStepDispatches(
 R5900Context PS2Runtime::debugCpuSnapshot()
 {
     std::lock_guard<std::recursive_timed_mutex> lock(m_guestExecutionMutex);
+    R5900Context *const context =
+        m_boundEeContext
+            ? m_boundEeContext
+            : &m_cpuContext;
+    synchronizeCop0Timing(
+        context,
+        ps2x::timing::eeTickToCyclesFloor(
+            currentEeTick()));
     return m_cpuContext;
 }
 
@@ -7456,7 +8134,8 @@ bool PS2Runtime::isStopRequested() const
 
 [[noreturn]] void PS2Runtime::HandleIntegerOverflow(R5900Context *ctx)
 {
-    raiseCop0Exception(ctx, EXCEPTION_INTEGER_OVERFLOW);
+    raiseCop0Level1Exception(
+        ctx, EXCEPTION_INTEGER_OVERFLOW);
 }
 
 void PS2Runtime::run()

@@ -399,6 +399,7 @@ function(ps2x_stage_ffmpeg_runtime_dlls target_name)
 endfunction()
 
 add_library(ps2_runtime STATIC
+    src/lib/cop0_timing.cpp
     src/lib/ee_counters.cpp
     src/lib/ee_event_scheduler.cpp
     src/lib/game_overrides.cpp

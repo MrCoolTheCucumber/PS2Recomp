@@ -753,6 +753,11 @@ namespace
                         cpu.cop0_count,
                         cpu.cop0_compare,
                         cpu.cop0_badvaddr);
+            ImGui::Text("PCCR=0x%08X PCR0=0x%08X PCR1=0x%08X ErrorEPC=0x%08X",
+                        cpu.cop0_perf,
+                        cpu.cop0_pcr0,
+                        cpu.cop0_pcr1,
+                        cpu.cop0_errorepc);
         }
     }
 

@@ -44,11 +44,16 @@ namespace ps2recomp
             case COP0_REG_BADVADDR:
                 return fmt::format("SET_GPR_S32(ctx, {}, (int32_t)ctx->cop0_badvaddr);", rt);
             case COP0_REG_COUNT:
-                return fmt::format("SET_GPR_S32(ctx, {}, (int32_t)ctx->cop0_count);", rt);
+                return fmt::format(
+                    "{{ const uint32_t value = runtime->readCop0Count(rdram, ctx); "
+                    "SET_GPR_S32(ctx, {}, (int32_t)value); }}",
+                    rt);
             case COP0_REG_ENTRYHI:
                 return fmt::format("SET_GPR_S32(ctx, {}, (int32_t)ctx->cop0_entryhi);", rt);
             case COP0_REG_COMPARE:
-                return fmt::format("SET_GPR_S32(ctx, {}, (int32_t)ctx->cop0_compare);", rt);
+                return fmt::format(
+                    "SET_GPR_S32(ctx, {}, (int32_t)runtime->readCop0Compare(ctx));",
+                    rt);
             case COP0_REG_STATUS:
                 return fmt::format("SET_GPR_S32(ctx, {}, (int32_t)ctx->cop0_status);", rt);
             case COP0_REG_CAUSE:
@@ -64,7 +69,11 @@ namespace ps2recomp
             case COP0_REG_DEBUG:
                 return fmt::format("SET_GPR_S32(ctx, {}, (int32_t)ctx->cop0_debug);", rt);
             case COP0_REG_PERF:
-                return fmt::format("SET_GPR_S32(ctx, {}, (int32_t)ctx->cop0_perf);", rt);
+                return fmt::format(
+                    "SET_GPR_S32(ctx, {}, (int32_t)runtime->readCop0Performance("
+                    "rdram, ctx, {}u));",
+                    rt,
+                    inst.raw & 0x3fu);
             case COP0_REG_TAGLO:
                 return fmt::format("SET_GPR_S32(ctx, {}, (int32_t)ctx->cop0_taglo);", rt);
             case COP0_REG_TAGHI:
@@ -94,13 +103,19 @@ namespace ps2recomp
             case COP0_REG_BADVADDR:
                 return "// MTC0 to BADVADDR register ignored (read-only)";
             case COP0_REG_COUNT:
-                return fmt::format("ctx->cop0_count = GPR_U32(ctx, {});", rt);
+                return fmt::format(
+                    "runtime->writeCop0Count(rdram, ctx, GPR_U32(ctx, {}));",
+                    rt);
             case COP0_REG_ENTRYHI:
                 return fmt::format("ctx->cop0_entryhi = GPR_U32(ctx, {}) & 0xC00000FF;", rt);
             case COP0_REG_COMPARE:
-                return fmt::format("ctx->cop0_compare = GPR_U32(ctx, {}); ctx->cop0_cause &= ~0x8000;", rt);
+                return fmt::format(
+                    "runtime->writeCop0Compare(rdram, ctx, GPR_U32(ctx, {}));",
+                    rt);
             case COP0_REG_STATUS:
-                return fmt::format("ctx->cop0_status = GPR_U32(ctx, {}) & 0xFF57FFFF;", rt);
+                return fmt::format(
+                    "runtime->writeCop0Status(rdram, ctx, GPR_U32(ctx, {}));",
+                    rt);
             case COP0_REG_CAUSE:
                 return fmt::format("ctx->cop0_cause = (ctx->cop0_cause & ~0x00000300) | (GPR_U32(ctx, {}) & 0x00000300);", rt);
             case COP0_REG_EPC:
@@ -114,7 +129,9 @@ namespace ps2recomp
             case COP0_REG_DEBUG:
                 return fmt::format("ctx->cop0_debug = GPR_U32(ctx, {});", rt);
             case COP0_REG_PERF:
-                return fmt::format("ctx->cop0_perf = GPR_U32(ctx, {});", rt);
+                return fmt::format(
+                    "runtime->writeCop0Performance(rdram, ctx, {}u, GPR_U32(ctx, {}));",
+                    inst.raw & 0x3fu, rt);
             case COP0_REG_TAGLO:
                 return fmt::format("ctx->cop0_taglo = GPR_U32(ctx, {});", rt);
             case COP0_REG_TAGHI:
@@ -141,20 +158,15 @@ namespace ps2recomp
                 return fmt::format("runtime->handleTLBP(rdram, ctx);");
             case COP0_CO_ERET:
                 return fmt::format(
-                    "if (ctx->cop0_status & 0x4) {{ \n" // Check ERL bit (bit 2)
-                    "    ctx->pc = ctx->cop0_errorepc; \n"
-                    "    ctx->cop0_status &= ~0x4; \n" // Clear ERL bit
-                    "}} else {{ \n"                    // If ERL is not set, use EPC and clear EXL (bit 1)
-                    "    ctx->pc = ctx->cop0_epc; \n"  // Note: If neither ERL/EXL set, behavior is undefined; using EPC is common.
-                    "    ctx->cop0_status &= ~0x2; \n" // Clear EXL bit
-                    "}} \n"
-                    "runtime->clearLLBit(ctx); \n" // Essential: Clear Load-Linked bit
-                    "return;"                      // Stop execution in this recompiled block
+                    "runtime->handleCop0Eret(rdram, ctx); \n"
+                    "return;"
                 );
             case COP0_CO_EI:
-                return fmt::format("ctx->cop0_status |= 0x10000; // Enable interrupts");
+                return fmt::format(
+                    "runtime->handleCop0Ei(rdram, ctx);");
             case COP0_CO_DI:
-                return fmt::format("ctx->cop0_status &= ~0x10000; // Disable interrupts");
+                return fmt::format(
+                    "runtime->handleCop0Di(rdram, ctx);");
             default:
                 return m_codeGenerator.emitUnhandledInstruction(inst, fmt::format("Unhandled COP0 CO-OP: 0x{:X}", function));
             }

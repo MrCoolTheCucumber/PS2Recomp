@@ -73,9 +73,13 @@ void register_ee_event_scheduler_tests()
             EeEventScheduler scheduler;
             const EeTick deadline = eeTickFromRaw(80u);
             (void)scheduler.scheduleAbsolute(
+                EeEventSource::Cop0Performance, deadline);
+            (void)scheduler.scheduleAbsolute(
                 EeEventSource::VSync, deadline);
             (void)scheduler.scheduleAbsolute(
                 EeEventSource::EeCounters, deadline);
+            (void)scheduler.scheduleAbsolute(
+                EeEventSource::Cop0Timer, deadline);
             (void)scheduler.scheduleAbsolute(
                 EeEventSource::VifVu1Finish, deadline);
             (void)scheduler.scheduleAbsolute(
@@ -105,47 +109,54 @@ void register_ee_event_scheduler_tests()
                     order.push_back(service.source);
                 });
             t.Equals(
-                order.size(), static_cast<size_t>(12u),
+                order.size(), static_cast<size_t>(14u),
                 "all equal-deadline events should dispatch");
-            if (order.size() == 12u)
+            if (order.size() == 14u)
             {
                 t.IsTrue(
-                    order[0] == EeEventSource::VSync,
+                    order[0] ==
+                        EeEventSource::Cop0Performance,
+                    "level-2 performance overflow should have highest device-event priority");
+                t.IsTrue(
+                    order[1] == EeEventSource::VSync,
                     "VSync counter work should precede timed DMA callbacks");
                 t.IsTrue(
-                    order[1] == EeEventSource::EeCounters,
+                    order[2] == EeEventSource::EeCounters,
                     "timer counter work should precede timed DMA callbacks");
                 t.IsTrue(
-                    order[2] == EeEventSource::DmacCompletion,
+                    order[3] == EeEventSource::Cop0Timer,
+                    "Count/Compare should publish before timed DMA callbacks");
+                t.IsTrue(
+                    order[4] == EeEventSource::DmacCompletion,
                     "ready DMAC completion should publish first");
                 t.IsTrue(
-                    order[3] == EeEventSource::DmacVif1,
+                    order[5] == EeEventSource::DmacVif1,
                     "DMAC VIF1 should precede GIF");
                 t.IsTrue(
-                    order[4] == EeEventSource::DmacGif,
+                    order[6] == EeEventSource::DmacGif,
                     "DMAC GIF should precede HLE SIF1");
                 t.IsTrue(
-                    order[5] == EeEventSource::HleSif1,
+                    order[7] == EeEventSource::HleSif1,
                     "HLE SIF1 should occupy the SIF callback band");
                 t.IsTrue(
-                    order[6] == EeEventSource::DmacVif0,
+                    order[8] == EeEventSource::DmacVif0,
                     "DMAC VIF0 should precede scratchpad DMA");
                 t.IsTrue(
-                    order[7] ==
+                    order[9] ==
                         EeEventSource::DmacFromScratchpad,
                     "SPR-from should follow VIF0");
                 t.IsTrue(
-                    order[8] ==
+                    order[10] ==
                         EeEventSource::DmacToScratchpad,
                     "SPR-to should follow SPR-from");
                 t.IsTrue(
-                    order[9] == EeEventSource::VifVu0Finish,
+                    order[11] == EeEventSource::VifVu0Finish,
                     "VU0 finish should follow DMAC callbacks");
                 t.IsTrue(
-                    order[10] == EeEventSource::VifVu1Finish,
+                    order[12] == EeEventSource::VifVu1Finish,
                     "VU1 finish should follow VU0 finish");
                 t.IsTrue(
-                    order[11] ==
+                    order[13] ==
                         EeEventSource::Vu0PeriodicCompatibility,
                     "the ordinary VU0 batch should follow device callbacks");
             }

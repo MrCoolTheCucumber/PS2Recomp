@@ -1227,7 +1227,9 @@ void register_code_generator_tests()
 
             std::string mtc0Code = gen.translateInstruction(mtc0);
             printGeneratedCode("COP0 MFC0/MTC0 translate to COP0 register access (MTC0)", mtc0Code);
-            t.IsTrue(mtc0Code.find("ctx->cop0_status") != std::string::npos, "MTC0 STATUS should write cop0_status");
+            t.IsTrue(
+                mtc0Code.find("runtime->writeCop0Status") != std::string::npos,
+                "MTC0 STATUS should route timing-sensitive state through the runtime");
             t.IsTrue(mtc0Code.find("GPR_U32(ctx, 7)") != std::string::npos, "MTC0 should read from rt");
             t.IsTrue(mtc0Code.find("Unimplemented MTC0") == std::string::npos, "MTC0 should not hit unimplemented path");
             t.IsTrue(mtc0Code.find("Unhandled COP0") == std::string::npos, "MTC0 should not hit unhandled COP0 path");
@@ -1240,6 +1242,37 @@ void register_code_generator_tests()
             t.IsTrue(
                 mtc0Code.find("| 0x440u") != std::string::npos,
                 "MTC0 CONFIG should preserve hardware cache-size fields");
+
+            mfc0.rt = 0;
+            mfc0.rd = COP0_REG_COUNT;
+            mfc0Code = gen.translateInstruction(mfc0);
+            t.IsTrue(
+                mfc0Code.find("runtime->readCop0Count") != std::string::npos,
+                "MFC0 Count should update runtime-owned time even when rt is zero");
+
+            mfc0.rt = 5;
+            mfc0.rd = COP0_REG_PERF;
+            mfc0.raw = 3u;
+            mfc0Code = gen.translateInstruction(mfc0);
+            t.IsTrue(
+                mfc0Code.find("readCop0Performance(rdram, ctx, 3u)") != std::string::npos,
+                "MFC0 register 25 should preserve the PCR selector bits");
+
+            mfc0.rt = 0;
+            mfc0Code = gen.translateInstruction(mfc0);
+            t.IsTrue(
+                mfc0Code.find("readCop0Performance") != std::string::npos,
+                "MFC0 performance code should retain the access behind the zero-register guard");
+            t.IsFalse(
+                mfc0Code.find("const uint32_t value") != std::string::npos,
+                "MFC0 performance should not force an access when rt is zero");
+
+            mtc0.rd = COP0_REG_PERF;
+            mtc0.raw = 1u;
+            mtc0Code = gen.translateInstruction(mtc0);
+            t.IsTrue(
+                mtc0Code.find("writeCop0Performance(rdram, ctx, 1u") != std::string::npos,
+                "MTC0 register 25 should preserve the PCR selector bits");
         });
 
         tc.Run("FCR access uses CFC1/CTC1", [](TestCase &t) {

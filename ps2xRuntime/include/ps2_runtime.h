@@ -27,6 +27,7 @@
 #include <optional>
 
 #include "ps2_log.h"
+#include "runtime/cop0_timing.h"
 #include "runtime/ee_event_scheduler.h"
 #include "runtime/ps2_address.h"
 #include "runtime/ps2_gif_arbiter.h"
@@ -145,6 +146,8 @@ struct alignas(16) R5900Context
     uint32_t cop0_badpaddr;
     uint32_t cop0_debug;
     uint32_t cop0_perf;
+    uint32_t cop0_pcr0;
+    uint32_t cop0_pcr1;
     uint32_t cop0_taglo;
     uint32_t cop0_taghi;
     uint32_t cop0_errorepc;
@@ -531,6 +534,8 @@ public:
     enum class DebugEeEventDeviceKind : uint8_t
     {
         None = 0u,
+        Cop0Performance,
+        Cop0Timer,
         VSync,
         EeCounters,
         GifDma,
@@ -830,6 +835,41 @@ public:
     void handleTLBWI(uint8_t *rdram, R5900Context *ctx);
     void handleTLBWR(uint8_t *rdram, R5900Context *ctx);
     void handleTLBP(uint8_t *rdram, R5900Context *ctx);
+    [[nodiscard]] uint32_t readCop0Count(
+        uint8_t *rdram,
+        R5900Context *ctx);
+    void writeCop0Count(
+        uint8_t *rdram,
+        R5900Context *ctx,
+        uint32_t value);
+    [[nodiscard]] uint32_t readCop0Compare(
+        R5900Context *ctx);
+    void writeCop0Compare(
+        uint8_t *rdram,
+        R5900Context *ctx,
+        uint32_t value);
+    [[nodiscard]] uint32_t readCop0Performance(
+        uint8_t *rdram,
+        R5900Context *ctx,
+        uint32_t selector);
+    void writeCop0Performance(
+        uint8_t *rdram,
+        R5900Context *ctx,
+        uint32_t selector,
+        uint32_t value);
+    void writeCop0Status(
+        uint8_t *rdram,
+        R5900Context *ctx,
+        uint32_t value);
+    void handleCop0Eret(
+        uint8_t *rdram,
+        R5900Context *ctx);
+    void handleCop0Ei(
+        uint8_t *rdram,
+        R5900Context *ctx);
+    void handleCop0Di(
+        uint8_t *rdram,
+        R5900Context *ctx);
     void clearLLBit(R5900Context *ctx);
     void configureGuestHeap(uint32_t guestBase, uint32_t guestLimit = PS2_RAM_SIZE);
     uint32_t guestMalloc(uint32_t size, uint32_t alignment = 16u);
@@ -1132,6 +1172,12 @@ private:
         uint32_t newlyRaised) noexcept;
     void serviceEeCountersAtEvent(
         const ps2x::timing::EeEventService &service);
+    void serviceCop0TimerAtEvent(
+        R5900Context *ctx,
+        const ps2x::timing::EeEventService &service);
+    void serviceCop0PerformanceAtEvent(
+        R5900Context *ctx,
+        const ps2x::timing::EeEventService &service);
     void cancelEeCounterEvent() noexcept;
     void synchronizeEeCounterMmio(
         R5900Context *ctx,
@@ -1172,6 +1218,30 @@ private:
     void scheduleVu0CompatibilityEvent(
         ps2x::timing::EeTick deadline) noexcept;
     void cancelVu0CompatibilityEvent() noexcept;
+    [[nodiscard]] ps2x::timing::EeTick
+    prepareCop0Access(
+        uint8_t *rdram,
+        R5900Context *ctx);
+    void synchronizeCop0Timing(
+        R5900Context *ctx,
+        uint64_t currentCycle,
+        bool synchronizeCount = true,
+        bool synchronizePerformance = true) noexcept;
+    void publishCop0TimingMirrors(
+        R5900Context *context = nullptr) noexcept;
+    void refreshCop0EventSchedules(
+        R5900Context *ctx,
+        uint64_t currentCycle) noexcept;
+    void deliverPendingCop0Exceptions(
+        R5900Context *ctx);
+    [[nodiscard]] bool cop0TimerInterruptEnabled(
+        const R5900Context *ctx) const noexcept;
+    [[noreturn]] void raiseCop0Level1Exception(
+        R5900Context *ctx,
+        uint32_t exceptionCode,
+        bool commitContextProgress = true);
+    [[noreturn]] void raiseCop0PerformanceException(
+        R5900Context *ctx);
     bool checkEeSchedulerShadow(
         ps2x::timing::EeTick now);
     [[nodiscard]] ps2x::timing::EeTick publishEeElapsed(
@@ -1195,6 +1265,7 @@ private:
     PSPadBackend m_padBackend;
     VU1Interpreter m_vu0;
     VU1Interpreter m_vu1;
+    ps2x::timing::Cop0Timing m_cop0Timing;
     ps2x::timing::EeTimeline m_eeTimeline;
     ps2x::timing::EeEventScheduler m_eeEventScheduler;
     ps2x::timing::EeSchedulingMode m_eeSchedulingMode =
@@ -1310,6 +1381,13 @@ private:
     EeVSyncTiming m_eeVSyncTiming{};
     ps2x::timing::EeEventToken m_eeCounterEventToken{
         ps2x::timing::EeEventSource::EeCounters, 0u};
+    ps2x::timing::EeEventToken m_cop0TimerEventToken{
+        ps2x::timing::EeEventSource::Cop0Timer, 0u};
+    ps2x::timing::EeEventToken
+        m_cop0PerformanceEventToken{
+            ps2x::timing::EeEventSource::
+                Cop0Performance,
+            0u};
     uint32_t m_pendingEeCounterInterrupts = 0u;
     std::array<
         PendingVSyncDelivery,

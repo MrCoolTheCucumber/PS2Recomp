@@ -38,10 +38,16 @@ namespace ps2x::timing
     // priority decision.
     enum class EeEventSource : uint8_t
     {
+        // The EE manual assigns the non-maskable performance-counter
+        // overflow exception priority immediately below Reset/NMI.
+        Cop0Performance = 0u,
         // PCSX2 updates EE counters (including VSync) before dispatching
         // timed DMA callbacks in _cpuEventTest_Shared().
-        VSync = 0u,
+        VSync,
         EeCounters,
+        // Count/Compare publishes Cause.IP7 after hardware counters and
+        // before timed DMA callbacks at a shared EE event boundary.
+        Cop0Timer,
         // Compatibility-complete work is published before timed device
         // callbacks. A timed callback that itself completes work can
         // reschedule this source at the same tick for the scheduler's next
@@ -75,10 +81,14 @@ namespace ps2x::timing
     {
         switch (source)
         {
+        case EeEventSource::Cop0Performance:
+            return "cop0_performance";
         case EeEventSource::VSync:
             return "vsync";
         case EeEventSource::EeCounters:
             return "ee_counters";
+        case EeEventSource::Cop0Timer:
+            return "cop0_timer";
         case EeEventSource::DmacCompletion:
             return "dmac_completion";
         case EeEventSource::Vu0PeriodicCompatibility:

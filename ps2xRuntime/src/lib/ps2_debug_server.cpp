@@ -1023,6 +1023,14 @@ struct PS2DebugServer::Impl
         const char *kind = "unknown";
         switch (state.kind)
         {
+        case PS2Runtime::DebugEeEventDeviceKind::
+            Cop0Performance:
+            kind = "cop0_performance";
+            break;
+        case PS2Runtime::DebugEeEventDeviceKind::
+            Cop0Timer:
+            kind = "cop0_timer";
+            break;
         case PS2Runtime::DebugEeEventDeviceKind::VSync:
             kind = "vsync";
             break;
