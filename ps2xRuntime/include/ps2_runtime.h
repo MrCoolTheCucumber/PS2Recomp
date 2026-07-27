@@ -545,7 +545,44 @@ public:
         Vu0,
         Vu1,
         ScratchpadDma,
+        ToIpuDma,
     };
+
+    [[nodiscard]] static constexpr const char *
+    debugEeEventDeviceKindName(
+        DebugEeEventDeviceKind kind) noexcept
+    {
+        switch (kind)
+        {
+        case DebugEeEventDeviceKind::Cop0Performance:
+            return "cop0_performance";
+        case DebugEeEventDeviceKind::Cop0Timer:
+            return "cop0_timer";
+        case DebugEeEventDeviceKind::VSync:
+            return "vsync";
+        case DebugEeEventDeviceKind::EeCounters:
+            return "ee_counters";
+        case DebugEeEventDeviceKind::GifDma:
+            return "gif_dma";
+        case DebugEeEventDeviceKind::HleSifDma:
+            return "hle_sif_dma";
+        case DebugEeEventDeviceKind::Vif0Dma:
+            return "vif0_dma";
+        case DebugEeEventDeviceKind::Vif1Dma:
+            return "vif1_dma";
+        case DebugEeEventDeviceKind::Vu0:
+            return "vu0";
+        case DebugEeEventDeviceKind::Vu1:
+            return "vu1";
+        case DebugEeEventDeviceKind::ScratchpadDma:
+            return "scratchpad_dma";
+        case DebugEeEventDeviceKind::ToIpuDma:
+            return "to_ipu_dma";
+        case DebugEeEventDeviceKind::None:
+            return "none";
+        }
+        return "unknown";
+    }
 
     struct DebugEeEventDeviceState
     {
@@ -1139,6 +1176,13 @@ private:
         ps2x::timing::EeTick deadline) noexcept;
     void serviceGifDmaAtEvent(
         const ps2x::timing::EeEventService &service);
+    bool scheduleToIpuDmaFromMemory(
+        uint32_t delayEeCycles);
+    void cancelToIpuDmaEvent() noexcept;
+    void scheduleToIpuDmaEvent(
+        ps2x::timing::EeTick deadline) noexcept;
+    void serviceToIpuDmaAtEvent(
+        const ps2x::timing::EeEventService &service);
     [[nodiscard]] static uint64_t hleSifDmaIopCycles(
         const HleSifDmaSubmission &submission) noexcept;
     [[nodiscard]] bool executeHleSifDmaOperation(
@@ -1289,6 +1333,10 @@ private:
         ps2x::timing::EeEventSource::DmacVif1, 0u};
     ps2x::timing::EeEventToken m_gifDmaEventToken{
         ps2x::timing::EeEventSource::DmacGif, 0u};
+    ps2x::timing::EeEventToken
+        m_toIpuDmaEventToken{
+            ps2x::timing::EeEventSource::DmacToIpu,
+            0u};
     struct HleSifDmaOperation
     {
         HleSifDmaSubmission submission{};

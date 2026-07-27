@@ -1020,50 +1020,12 @@ struct PS2DebugServer::Impl
             return Value(rapidjson::kNullType);
         }
 
-        const char *kind = "unknown";
-        switch (state.kind)
-        {
-        case PS2Runtime::DebugEeEventDeviceKind::
-            Cop0Performance:
-            kind = "cop0_performance";
-            break;
-        case PS2Runtime::DebugEeEventDeviceKind::
-            Cop0Timer:
-            kind = "cop0_timer";
-            break;
-        case PS2Runtime::DebugEeEventDeviceKind::VSync:
-            kind = "vsync";
-            break;
-        case PS2Runtime::DebugEeEventDeviceKind::EeCounters:
-            kind = "ee_counters";
-            break;
-        case PS2Runtime::DebugEeEventDeviceKind::GifDma:
-            kind = "gif_dma";
-            break;
-        case PS2Runtime::DebugEeEventDeviceKind::HleSifDma:
-            kind = "hle_sif_dma";
-            break;
-        case PS2Runtime::DebugEeEventDeviceKind::Vif0Dma:
-            kind = "vif0_dma";
-            break;
-        case PS2Runtime::DebugEeEventDeviceKind::Vif1Dma:
-            kind = "vif1_dma";
-            break;
-        case PS2Runtime::DebugEeEventDeviceKind::Vu0:
-            kind = "vu0";
-            break;
-        case PS2Runtime::DebugEeEventDeviceKind::Vu1:
-            kind = "vu1";
-            break;
-        case PS2Runtime::DebugEeEventDeviceKind::ScratchpadDma:
-            kind = "scratchpad_dma";
-            break;
-        case PS2Runtime::DebugEeEventDeviceKind::None:
-            break;
-        }
-
         Value value(rapidjson::kObjectType);
-        addString(value, "kind", kind, allocator);
+        addString(
+            value, "kind",
+            PS2Runtime::debugEeEventDeviceKindName(
+                state.kind),
+            allocator);
         value.AddMember(
             "operation_generation",
             state.operationGeneration, allocator);

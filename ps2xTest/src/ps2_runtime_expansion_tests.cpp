@@ -7295,6 +7295,583 @@ void register_ps2_runtime_expansion_tests()
                 "a real EE-counter access must retain its fractional issue time");
         });
 
+        tc.Run("event To-IPU normal DMA reproduces PCSX2 FIFO stall and reset wake", [](TestCase &t)
+        {
+            PS2Runtime runtime;
+            t.IsTrue(
+                runtime.memory().initialize(),
+                "To-IPU fixture memory should initialize");
+            t.IsTrue(
+                runtime.syncCoreSubsystems(),
+                "To-IPU fixture subsystems should bind");
+            runtime.setEeSchedulingMode(
+                ps2x::timing::EeSchedulingMode::Event);
+
+            constexpr uint32_t kToIpu =
+                0x1000B400u;
+            constexpr uint32_t kIpuCtrl =
+                0x10002010u;
+            constexpr uint32_t kIpuInFifo =
+                0x10007010u;
+            constexpr uint32_t kDstat =
+                0x1000E010u;
+            constexpr uint32_t kFirstSource =
+                0x00035000u;
+            constexpr uint32_t kSecondSource =
+                0x00035100u;
+            std::memset(
+                runtime.memory().getRDRAM() +
+                    kFirstSource,
+                0x31, 4u * 16u);
+            std::memset(
+                runtime.memory().getRDRAM() +
+                    kSecondSource,
+                0x72, 12u * 16u);
+
+            runtime.debugStartEeEventTrace(8u);
+            t.IsTrue(
+                runtime.memory().writeIORegister(
+                    kToIpu + 0x10u,
+                    kFirstSource),
+                "first To-IPU MADR should write");
+            t.IsTrue(
+                runtime.memory().writeIORegister(
+                    kToIpu + 0x20u, 4u),
+                "first To-IPU QWC should write");
+            t.IsTrue(
+                runtime.memory().writeIORegister(
+                    kToIpu, 0x100u),
+                "first To-IPU normal DMA should start");
+
+            ToIpuDmaSnapshot dma =
+                runtime.memory().toIpuDmaSnapshot();
+            t.IsTrue(
+                dma.active && dma.eventManaged &&
+                    dma.phase ==
+                        ToIpuDmaPhase::Finalize,
+                "four QW should enter the FIFO and retain finalization");
+            t.Equals(
+                dma.fifoQwc, 4u,
+                "the first payload should occupy four FIFO QW");
+            t.Equals(
+                dma.qwc, 0u,
+                "the first payload should consume its QWC");
+            t.Equals(
+                dma.madr,
+                kFirstSource + 4u * 16u,
+                "the first payload should advance MADR");
+            t.Equals(
+                runtime.memory().readIORegister(
+                    kIpuCtrl) &
+                    0xFu,
+                4u,
+                "IPU_CTRL.IFC should expose FIFO occupancy");
+
+            PS2Runtime::DebugEeScheduler scheduler =
+                runtime.debugEeSchedulerSnapshot();
+            auto slot =
+                scheduler.slots[ps2x::timing::
+                    eeEventSourceIndex(
+                        ps2x::timing::EeEventSource::
+                            DmacToIpu)];
+            t.IsTrue(
+                slot.pending,
+                "the first transfer should retain To-IPU ownership");
+            t.Equals(
+                slot.deadlineTick, 64ull,
+                "four QW should finalize after eight EE cycles");
+            t.IsTrue(
+                slot.device.kind ==
+                    PS2Runtime::DebugEeEventDeviceKind::
+                        ToIpuDma,
+                "scheduler status should identify To-IPU DMA");
+            t.Equals(
+                std::string(
+                    PS2Runtime::
+                        debugEeEventDeviceKindName(
+                            slot.device.kind)),
+                std::string("to_ipu_dma"),
+                "debugger JSON should use the typed To-IPU device label");
+
+            R5900Context &context = runtime.cpu();
+            context.advanceEeCycleTicks(64u);
+            runtime.serviceEeEventsAtBlockBoundary(
+                runtime.memory().getRDRAM(), &context);
+            t.IsFalse(
+                runtime.memory()
+                    .toIpuDmaSnapshot()
+                    .active,
+                "the first finalization should retire To-IPU DMA");
+            t.IsTrue(
+                (runtime.memory().readIORegister(
+                     kToIpu) &
+                 0x100u) == 0u,
+                "same-boundary publication should clear first STR");
+            t.IsTrue(
+                (runtime.memory().readIORegister(
+                     kDstat) &
+                 (1u << 4u)) != 0u,
+                "same-boundary publication should latch To-IPU D_STAT");
+
+            t.IsTrue(
+                runtime.memory().writeIORegister(
+                    kDstat, 1u << 4u),
+                "To-IPU D_STAT should clear");
+            t.IsTrue(
+                runtime.memory().writeIORegister(
+                    kToIpu + 0x10u,
+                    kSecondSource),
+                "second To-IPU MADR should write");
+            t.IsTrue(
+                runtime.memory().writeIORegister(
+                    kToIpu + 0x20u, 12u),
+                "second To-IPU QWC should write");
+            t.IsTrue(
+                runtime.memory().writeIORegister(
+                    kToIpu, 0x100u),
+                "second To-IPU normal DMA should start");
+
+            dma = runtime.memory().toIpuDmaSnapshot();
+            t.IsTrue(
+                dma.active && !dma.eventManaged &&
+                    dma.phase ==
+                        ToIpuDmaPhase::
+                            TransferPayload &&
+                    dma.stall ==
+                        ToIpuDmaStallReason::
+                            InputFifoFull,
+                "the second transfer should stall without a deadline");
+            t.Equals(
+                dma.fifoQwc, 8u,
+                "the second transfer should fill the FIFO");
+            t.Equals(
+                dma.qwc, 8u,
+                "eight QW should remain while the FIFO is full");
+            t.Equals(
+                dma.madr,
+                kSecondSource + 4u * 16u,
+                "the partial second transfer should expose MADR progress");
+            scheduler = runtime.debugEeSchedulerSnapshot();
+            slot =
+                scheduler.slots[ps2x::timing::
+                    eeEventSourceIndex(
+                        ps2x::timing::EeEventSource::
+                            DmacToIpu)];
+            t.IsFalse(
+                slot.pending,
+                "a full input FIFO should leave To-IPU dormant");
+            t.IsTrue(
+                (runtime.memory().readIORegister(
+                     kToIpu) &
+                 0x100u) != 0u,
+                "STR should remain visible during the FIFO stall");
+
+            t.IsTrue(
+                runtime.memory().writeIORegister(
+                    kIpuCtrl, 1u << 30u),
+                "IPU reset should clear the input FIFO");
+            dma = runtime.memory().toIpuDmaSnapshot();
+            t.IsTrue(
+                dma.active && dma.eventManaged &&
+                    dma.stall ==
+                        ToIpuDmaStallReason::None,
+                "IPU reset should wake the stalled transfer");
+            t.Equals(
+                dma.fifoQwc, 0u,
+                "IPU reset should empty the input FIFO");
+            scheduler = runtime.debugEeSchedulerSnapshot();
+            slot =
+                scheduler.slots[ps2x::timing::
+                    eeEventSourceIndex(
+                        ps2x::timing::EeEventSource::
+                            DmacToIpu)];
+            t.IsTrue(
+                slot.pending,
+                "IPU reset should schedule To-IPU work");
+            t.Equals(
+                slot.deadlineTick, 96ull,
+                "the reset wake should occur four EE cycles later");
+
+            context.advanceEeCycleTicks(32u);
+            runtime.serviceEeEventsAtBlockBoundary(
+                runtime.memory().getRDRAM(), &context);
+            dma = runtime.memory().toIpuDmaSnapshot();
+            t.IsTrue(
+                dma.active &&
+                    dma.phase ==
+                        ToIpuDmaPhase::Finalize &&
+                    dma.stall ==
+                        ToIpuDmaStallReason::None,
+                "the reset wake should transfer the remaining payload");
+            t.Equals(
+                dma.qwc, 0u,
+                "the reset wake should consume the remaining QWC");
+            t.Equals(
+                dma.madr,
+                kSecondSource + 12u * 16u,
+                "the reset wake should advance MADR to the end");
+            t.Equals(
+                dma.fifoQwc, 8u,
+                "the remaining eight QW should refill the FIFO");
+            scheduler = runtime.debugEeSchedulerSnapshot();
+            slot =
+                scheduler.slots[ps2x::timing::
+                    eeEventSourceIndex(
+                        ps2x::timing::EeEventSource::
+                            DmacToIpu)];
+            t.IsTrue(
+                slot.pending,
+                "payload service should retain finalization ownership");
+            t.Equals(
+                slot.deadlineTick, 224ull,
+                "eight QW should cost sixteen cycles from reset service");
+
+            context.advanceEeCycleTicks(128u);
+            runtime.serviceEeEventsAtBlockBoundary(
+                runtime.memory().getRDRAM(), &context);
+            t.IsFalse(
+                runtime.memory()
+                    .toIpuDmaSnapshot()
+                    .active,
+                "the second finalization should retire To-IPU DMA");
+            t.IsTrue(
+                (runtime.memory().readIORegister(
+                     kToIpu) &
+                 0x100u) == 0u,
+                "same-boundary publication should clear second STR");
+            t.IsTrue(
+                (runtime.memory().readIORegister(
+                     kDstat) &
+                 (1u << 4u)) != 0u,
+                "same-boundary publication should latch second D_STAT");
+
+            const PS2Runtime::DebugEeEventTrace trace =
+                runtime.debugEeEventTraceSnapshot(true);
+            t.Equals(
+                trace.entries.size(),
+                static_cast<size_t>(5u),
+                "the oracle should trace two completions and three device services");
+            if (trace.entries.size() == 5u)
+            {
+                const std::array<
+                    ps2x::timing::EeEventSource, 5u>
+                    expectedSources = {
+                        ps2x::timing::EeEventSource::
+                            DmacToIpu,
+                        ps2x::timing::EeEventSource::
+                            DmacCompletion,
+                        ps2x::timing::EeEventSource::
+                            DmacToIpu,
+                        ps2x::timing::EeEventSource::
+                            DmacToIpu,
+                        ps2x::timing::EeEventSource::
+                            DmacCompletion,
+                    };
+                const std::array<uint64_t, 5u>
+                    expectedTicks = {
+                        64ull, 64ull, 96ull,
+                        224ull, 224ull};
+                for (size_t index = 0u;
+                     index < trace.entries.size();
+                     ++index)
+                {
+                    t.IsTrue(
+                        trace.entries[index].source ==
+                            expectedSources[index],
+                        "To-IPU services should retain source order");
+                    t.Equals(
+                        trace.entries[index].serviceTick,
+                        expectedTicks[index],
+                        "To-IPU services should retain exact ticks");
+                }
+            }
+
+            t.IsTrue(
+                runtime.memory().writeIORegister(
+                    kIpuCtrl, 1u << 30u),
+                "a final IPU reset should clear FIFO state");
+            runtime.memory().write128(
+                kIpuInFifo,
+                _mm_set_epi32(4, 3, 2, 1));
+            t.Equals(
+                runtime.memory()
+                    .toIpuDmaSnapshot()
+                    .fifoQwc,
+                1u,
+                "a direct 128-bit IPU input write should enqueue one QW");
+            t.Equals(
+                runtime.memory().readIORegister(
+                    kIpuCtrl) &
+                    0xFu,
+                1u,
+                "direct FIFO writes should update IPU_CTRL.IFC");
+
+            t.IsTrue(
+                runtime.memory().writeIORegister(
+                    kIpuCtrl, 1u << 30u),
+                "the zero-QWC check should begin with an empty FIFO");
+            t.IsTrue(
+                runtime.memory().writeIORegister(
+                    kToIpu + 0x10u,
+                    kSecondSource),
+                "zero-QWC To-IPU MADR should write");
+            t.IsTrue(
+                runtime.memory().writeIORegister(
+                    kToIpu + 0x20u, 0u),
+                "zero-QWC To-IPU QWC should write");
+            t.IsTrue(
+                runtime.memory().writeIORegister(
+                    kToIpu, 0x100u),
+                "zero-QWC normal To-IPU DMA should start");
+            dma = runtime.memory().toIpuDmaSnapshot();
+            t.IsTrue(
+                dma.active &&
+                    dma.phase ==
+                        ToIpuDmaPhase::
+                            TransferPayload &&
+                    dma.stall ==
+                        ToIpuDmaStallReason::
+                            InputFifoFull,
+                "zero QWC should expand to a FIFO-limited normal transfer");
+            t.Equals(
+                dma.qwc, 0xFFF8u,
+                "zero QWC should represent 0x10000 QW before the first eight-QW slice");
+            t.Equals(
+                dma.madr,
+                kSecondSource + 8u * 16u,
+                "the first zero-QWC slice should advance MADR");
+            t.Equals(
+                runtime.memory().readIORegister(
+                    kToIpu + 0x20u),
+                0xFFF8u,
+                "the QWC register should expose the low 16 bits after underflow");
+            (void)runtime.memory().writeIORegister(
+                kToIpu, 0u);
+
+            constexpr uint32_t kScratchSource =
+                0x00000300u;
+            std::memset(
+                runtime.memory().getScratchpad() +
+                    kScratchSource,
+                0x9c, 16u);
+            (void)runtime.memory().writeIORegister(
+                kIpuCtrl, 1u << 30u);
+            (void)runtime.memory().writeIORegister(
+                kToIpu + 0x10u,
+                0x80000000u | kScratchSource);
+            (void)runtime.memory().writeIORegister(
+                kToIpu + 0x20u, 1u);
+            (void)runtime.memory().writeIORegister(
+                kToIpu, 0x100u);
+            dma = runtime.memory().toIpuDmaSnapshot();
+            t.Equals(
+                dma.madr,
+                0x80000000u + kScratchSource +
+                    16u,
+                "To-IPU MADR should preserve the DMAC scratchpad flag");
+            t.Equals(
+                dma.fifoQwc, 1u,
+                "a scratchpad-sourced QW should enter the input FIFO");
+            (void)runtime.memory().writeIORegister(
+                kToIpu, 0u);
+        });
+
+        tc.Run("To-IPU cancellation invalidates scheduled generations", [](TestCase &t)
+        {
+            PS2Runtime runtime;
+            t.IsTrue(
+                runtime.memory().initialize(),
+                "To-IPU cancellation memory should initialize");
+            t.IsTrue(
+                runtime.syncCoreSubsystems(),
+                "To-IPU cancellation subsystems should bind");
+            runtime.setEeSchedulingMode(
+                ps2x::timing::EeSchedulingMode::Event);
+
+            constexpr uint32_t kToIpu =
+                0x1000B400u;
+            constexpr uint32_t kSource =
+                0x00035400u;
+            constexpr uint32_t kDstat =
+                0x1000E010u;
+            std::memset(
+                runtime.memory().getRDRAM() +
+                    kSource,
+                0x5a, 16u);
+
+            runtime.debugStartEeEventTrace(4u);
+            (void)runtime.memory().writeIORegister(
+                kToIpu + 0x10u, kSource);
+            (void)runtime.memory().writeIORegister(
+                kToIpu + 0x20u, 1u);
+            (void)runtime.memory().writeIORegister(
+                kToIpu, 0x100u);
+            const uint64_t cancelledGeneration =
+                runtime.memory()
+                    .toIpuDmaSnapshot()
+                    .transfer.generation;
+            (void)runtime.memory().writeIORegister(
+                kToIpu, 0u);
+
+            t.IsFalse(
+                runtime.memory()
+                    .toIpuDmaSnapshot()
+                    .active,
+                "clearing STR should cancel retained To-IPU work");
+            PS2Runtime::DebugEeScheduler scheduler =
+                runtime.debugEeSchedulerSnapshot();
+            t.IsFalse(
+                scheduler
+                    .slots[ps2x::timing::
+                        eeEventSourceIndex(
+                            ps2x::timing::
+                                EeEventSource::
+                                    DmacToIpu)]
+                    .pending,
+                "clearing STR should cancel the To-IPU deadline");
+
+            (void)runtime.memory().writeIORegister(
+                0x10002010u, 1u << 30u);
+            (void)runtime.memory().writeIORegister(
+                kToIpu + 0x10u, kSource);
+            (void)runtime.memory().writeIORegister(
+                kToIpu + 0x20u, 1u);
+            (void)runtime.memory().writeIORegister(
+                kToIpu, 0x100u);
+            const ToIpuDmaSnapshot replacement =
+                runtime.memory().toIpuDmaSnapshot();
+            t.IsTrue(
+                replacement.transfer.generation !=
+                    cancelledGeneration,
+                "replacement work should use a new generation");
+
+            R5900Context &context = runtime.cpu();
+            context.advanceEeCycleTicks(64u);
+            runtime.serviceEeEventsAtBlockBoundary(
+                runtime.memory().getRDRAM(), &context);
+            t.IsFalse(
+                runtime.memory()
+                    .toIpuDmaSnapshot()
+                    .active,
+                "only the replacement should finalize");
+            t.IsTrue(
+                (runtime.memory().readIORegister(
+                     kDstat) &
+                 (1u << 4u)) != 0u,
+                "only live replacement work should publish completion");
+
+            const PS2Runtime::DebugEeEventTrace trace =
+                runtime.debugEeEventTraceSnapshot(true);
+            t.Equals(
+                trace.entries.size(),
+                static_cast<size_t>(2u),
+                "only replacement finalization and publication should dispatch");
+            if (trace.entries.size() == 2u)
+            {
+                t.IsTrue(
+                    trace.entries[0].source ==
+                        ps2x::timing::EeEventSource::
+                            DmacToIpu,
+                    "replacement device service should dispatch first");
+                t.IsTrue(
+                    trace.entries[1].source ==
+                        ps2x::timing::EeEventSource::
+                            DmacCompletion,
+                    "replacement completion should publish second");
+            }
+
+            (void)runtime.memory().writeIORegister(
+                0x10002010u, 1u << 30u);
+            (void)runtime.memory().writeIORegister(
+                kToIpu + 0x10u, kSource);
+            (void)runtime.memory().writeIORegister(
+                kToIpu + 0x20u, 1u);
+            (void)runtime.memory().writeIORegister(
+                kToIpu, 0x100u);
+            runtime.setEeSchedulingMode(
+                ps2x::timing::EeSchedulingMode::Legacy);
+            t.IsFalse(
+                runtime.memory()
+                    .toIpuDmaSnapshot()
+                    .active,
+                "a scheduler mode transition should discard retained To-IPU work");
+            scheduler = runtime.debugEeSchedulerSnapshot();
+            t.IsFalse(
+                scheduler
+                    .slots[ps2x::timing::
+                        eeEventSourceIndex(
+                            ps2x::timing::
+                                EeEventSource::
+                                    DmacToIpu)]
+                    .pending,
+                "a scheduler mode transition should clear the To-IPU slot");
+
+            runtime.setEeSchedulingMode(
+                ps2x::timing::EeSchedulingMode::Event);
+            (void)runtime.memory().writeIORegister(
+                0x10002010u, 1u << 30u);
+            (void)runtime.memory().writeIORegister(
+                0x1000E000u, 0u);
+            (void)runtime.memory().writeIORegister(
+                kToIpu + 0x10u, kSource);
+            (void)runtime.memory().writeIORegister(
+                kToIpu + 0x20u, 1u);
+            (void)runtime.memory().writeIORegister(
+                kToIpu, 0x100u);
+            const ToIpuDmaSnapshot disabled =
+                runtime.memory().toIpuDmaSnapshot();
+            t.IsTrue(
+                disabled.active &&
+                    !disabled.eventManaged &&
+                    disabled.stall ==
+                        ToIpuDmaStallReason::
+                            DmacDisabled,
+                "a start while DMAC is disabled should remain queued without a deadline");
+            scheduler = runtime.debugEeSchedulerSnapshot();
+            t.IsFalse(
+                scheduler
+                    .slots[ps2x::timing::
+                        eeEventSourceIndex(
+                            ps2x::timing::
+                                EeEventSource::
+                                    DmacToIpu)]
+                    .pending,
+                "disabled To-IPU work should remain dormant");
+
+            (void)runtime.memory().writeIORegister(
+                0x1000E000u, 1u);
+            const ToIpuDmaSnapshot reenabled =
+                runtime.memory().toIpuDmaSnapshot();
+            t.IsTrue(
+                reenabled.active &&
+                    reenabled.eventManaged &&
+                    reenabled.stall ==
+                        ToIpuDmaStallReason::None,
+                "reenabling DMAC should wake queued To-IPU work");
+            scheduler = runtime.debugEeSchedulerSnapshot();
+            t.IsTrue(
+                scheduler
+                    .slots[ps2x::timing::
+                        eeEventSourceIndex(
+                            ps2x::timing::
+                                EeEventSource::
+                                    DmacToIpu)]
+                    .pending,
+                "reenabled To-IPU work should acquire a deadline");
+            t.Equals(
+                scheduler
+                    .slots[ps2x::timing::
+                        eeEventSourceIndex(
+                            ps2x::timing::
+                                EeEventSource::
+                                    DmacToIpu)]
+                    .deadlineTick,
+                scheduler.currentTick,
+                "reenabling DMAC should make queued To-IPU work immediately eligible");
+            (void)runtime.memory().writeIORegister(
+                kToIpu, 0u);
+        });
+
         tc.Run("sceVif1PkReset preserves the packet base pointer and clears open tag state", [](TestCase &t)
         {
             std::vector<uint8_t> rdram(PS2_RAM_SIZE, 0u);

@@ -444,6 +444,51 @@ struct GifDmaSnapshot
     bool endAfterPayload = false;
 };
 
+enum class ToIpuDmaPhase : uint8_t
+{
+    Idle = 0u,
+    TransferPayload,
+    Finalize,
+    Fault,
+};
+
+enum class ToIpuDmaStallReason : uint8_t
+{
+    None = 0u,
+    InputFifoFull,
+    DmacDisabled,
+    UnsupportedMode,
+    Fault,
+};
+
+struct ToIpuDmaAdvanceResult
+{
+    DmacTransferToken transfer{};
+    ToIpuDmaPhase phase = ToIpuDmaPhase::Idle;
+    ToIpuDmaStallReason stall =
+        ToIpuDmaStallReason::None;
+    uint32_t delayEeCycles = 0u;
+    uint32_t transferredQwc = 0u;
+    bool progressed = false;
+    bool completed = false;
+    bool active = false;
+};
+
+struct ToIpuDmaSnapshot
+{
+    DmacTransferToken transfer{};
+    ToIpuDmaPhase phase = ToIpuDmaPhase::Idle;
+    ToIpuDmaStallReason stall =
+        ToIpuDmaStallReason::None;
+    uint32_t chcr = 0u;
+    uint32_t madr = 0u;
+    uint32_t qwc = 0u;
+    uint32_t fifoQwc = 0u;
+    bool active = false;
+    bool eventManaged = false;
+    bool normalMode = false;
+};
+
 enum class Vif0DmaPhase : uint8_t
 {
     Idle = 0u,
@@ -786,6 +831,19 @@ public:
     {
         m_gifDmaCancelCallback = std::move(cb);
     }
+    using ToIpuDmaScheduleCallback =
+        std::function<bool(uint32_t delayEeCycles)>;
+    void setToIpuDmaScheduleCallback(
+        ToIpuDmaScheduleCallback cb)
+    {
+        m_toIpuDmaScheduleCallback = std::move(cb);
+    }
+    using ToIpuDmaCancelCallback = std::function<void()>;
+    void setToIpuDmaCancelCallback(
+        ToIpuDmaCancelCallback cb)
+    {
+        m_toIpuDmaCancelCallback = std::move(cb);
+    }
     using Vif1GifPathAvailableCallback =
         std::function<bool(bool directHl)>;
     void setVif1GifPathAvailableCallback(
@@ -812,6 +870,10 @@ public:
     bool wakeGifDma(uint32_t delayEeCycles);
     GifDmaAdvanceResult advanceGifDma();
     [[nodiscard]] GifDmaSnapshot gifDmaSnapshot() const;
+    bool wakeToIpuDma(uint32_t delayEeCycles);
+    ToIpuDmaAdvanceResult advanceToIpuDma();
+    [[nodiscard]] ToIpuDmaSnapshot
+    toIpuDmaSnapshot() const;
     ScratchpadDmaAdvanceResult advanceScratchpadDma(
         DmacChannel channel);
     [[nodiscard]] ScratchpadDmaSnapshot
@@ -950,6 +1012,9 @@ public:
         m_scratchpadDmaCancelCallback;
     GifDmaScheduleCallback m_gifDmaScheduleCallback;
     GifDmaCancelCallback m_gifDmaCancelCallback;
+    ToIpuDmaScheduleCallback
+        m_toIpuDmaScheduleCallback;
+    ToIpuDmaCancelCallback m_toIpuDmaCancelCallback;
     Vif1GifPathAvailableCallback
         m_vif1GifPathAvailableCallback;
 
@@ -1096,6 +1161,33 @@ public:
     };
     GifDmaState m_gifDma{};
 
+    struct ToIpuDmaState
+    {
+        DmacTransferToken transfer{};
+        ToIpuDmaPhase phase =
+            ToIpuDmaPhase::Idle;
+        ToIpuDmaStallReason stall =
+            ToIpuDmaStallReason::None;
+        uint32_t chcr = 0u;
+        uint32_t madr = 0u;
+        uint32_t qwc = 0u;
+        bool active = false;
+        bool eventManaged = false;
+        bool normalMode = false;
+        bool faultReported = false;
+    };
+    ToIpuDmaState m_toIpuDma{};
+
+    static constexpr uint32_t
+        kIpuInputFifoCapacityQwc = 8u;
+    std::array<
+        std::array<uint8_t, 16u>,
+        kIpuInputFifoCapacityQwc>
+        m_ipuInputFifo{};
+    uint32_t m_ipuInputFifoReadIndex = 0u;
+    uint32_t m_ipuInputFifoWriteIndex = 0u;
+    uint32_t m_ipuInputFifoQwc = 0u;
+
     struct ScratchpadDmaState
     {
         DmacTransferToken transfer{};
@@ -1192,6 +1284,18 @@ public:
         uint32_t sourceAddress,
         uint32_t qwc,
         bool toFifo);
+    bool startToIpuDma(
+        DmacTransferToken transfer, uint32_t chcr);
+    bool scheduleToIpuDma(uint32_t delayEeCycles);
+    void clearToIpuDmaState(bool notifyRuntime);
+    void drainToIpuDmaCompatibility();
+    void publishToIpuDmaRegisters();
+    void publishIpuInputFifoCount();
+    void clearIpuInputFifo();
+    uint32_t writeIpuInputFifo(
+        const uint8_t *data, uint32_t qwc);
+    bool copyToIpuDmaPayload(
+        uint32_t sourceAddress, uint32_t qwc);
     void discardPendingDmacWork(DmacChannel channel);
     bool startVif0Dma(
         DmacTransferToken transfer, uint32_t chcr);
