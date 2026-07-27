@@ -318,6 +318,37 @@ void register_ps2_debug_control_tests()
             std::filesystem::remove_all(root);
         });
 
+        tc.Run("debug server can leave GS history paused", [](TestCase &t)
+        {
+            const auto unique = std::to_string(
+                std::chrono::steady_clock::now().time_since_epoch().count());
+            const std::filesystem::path root =
+                std::filesystem::temp_directory_path() /
+                ("ps2dbg-paused-gs-history-test-" + unique);
+            const std::filesystem::path socket = root / "debug.sock";
+            std::filesystem::create_directories(root);
+
+            setenv("PS2DBG_ENABLE", "1", 1);
+            setenv("PS2DBG_SOCKET", socket.c_str(), 1);
+            setenv("PS2DBG_PAUSE_GS_HISTORY", "1", 1);
+
+            {
+                PS2Runtime runtime;
+                PS2DebugServer server(runtime);
+                t.IsTrue(server.start(),
+                         "the isolated debug server should start");
+                t.IsTrue(
+                    runtime.gs().isDebugHistoryPaused(),
+                    "the opt-in trace mode should preserve parallel GS batches");
+                server.stop();
+            }
+
+            unsetenv("PS2DBG_PAUSE_GS_HISTORY");
+            unsetenv("PS2DBG_SOCKET");
+            unsetenv("PS2DBG_ENABLE");
+            std::filesystem::remove_all(root);
+        });
+
         tc.Run("missing targets create one automatic diagnostic bundle", [](TestCase &t)
         {
             const auto unique = std::to_string(

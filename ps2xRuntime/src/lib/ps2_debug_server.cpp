@@ -3442,7 +3442,8 @@ struct PS2DebugServer::Impl
 
         stopped.store(false, std::memory_order_release);
         runtime.gs().clearDebugHistory();
-        runtime.gs().setDebugHistoryPaused(false);
+        runtime.gs().setDebugHistoryPaused(
+            environmentFlagEnabled("PS2DBG_PAUSE_GS_HISTORY"));
         runtime.gs().setProgressTrackingEnabled(true);
         runtime.vu0().setProgressTrackingEnabled(true);
         runtime.vu1().setProgressTrackingEnabled(true);
