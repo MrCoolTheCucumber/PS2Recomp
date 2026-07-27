@@ -1699,7 +1699,12 @@ bool PS2Memory::initialize(size_t ramSize)
     m_vif0Dma = {};
     m_vif1Dma = {};
     m_gifDma = {};
+    m_fromIpuDma = {};
     m_toIpuDma = {};
+    m_ipuOutputFifo = {};
+    m_ipuOutputFifoReadIndex = 0u;
+    m_ipuOutputFifoWriteIndex = 0u;
+    m_ipuOutputFifoQwc = 0u;
     m_ipuInputFifo = {};
     m_ipuInputFifoReadIndex = 0u;
     m_ipuInputFifoWriteIndex = 0u;
@@ -2213,6 +2218,15 @@ __m128i PS2Memory::read128(uint32_t address)
     const bool scratch = isScratchpad(address);
     uint32_t physAddr = translateAddress(address);
 
+    if (physAddr == 0x10007000u)
+    {
+        alignas(16) std::array<uint8_t, 16u> payload{};
+        (void)readIpuOutputFifo(payload.data(), 1u);
+        return _mm_loadu_si128(
+            reinterpret_cast<const __m128i *>(
+                payload.data()));
+    }
+
     if (scratch)
     {
         inRange(physAddr, sizeof(__m128i), PS2_SCRATCHPAD_SIZE, "read128 scratchpad", address);
@@ -2538,6 +2552,7 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
             m_ioRegisters[address] = value & ~(1u << 31);
             if (value & (1u << 30))
             {
+                clearIpuOutputFifo();
                 clearIpuInputFifo();
                 m_ioRegisters[0x10002000] = 0;
                 m_ioRegisters[0x10002020] = 0;
@@ -2555,7 +2570,7 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
             }
             else
             {
-                publishIpuInputFifoCount();
+                publishIpuFifoCounts();
             }
         }
         else
@@ -2695,6 +2710,26 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
             else
             {
                 (void)wakeGifDma(64u);
+            }
+        }
+        if (m_fromIpuDma.active &&
+            wasEnabled != enabled)
+        {
+            if (!enabled)
+            {
+                m_fromIpuDma.stall =
+                    FromIpuDmaStallReason::
+                        DmacDisabled;
+                if (m_fromIpuDma.eventManaged &&
+                    m_fromIpuDmaCancelCallback)
+                {
+                    m_fromIpuDmaCancelCallback();
+                }
+                m_fromIpuDma.eventManaged = false;
+            }
+            else
+            {
+                (void)wakeFromIpuDma(0u);
             }
         }
         if (m_toIpuDma.active &&
@@ -2938,6 +2973,7 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
             const auto dctrlIt = m_ioRegisters.find(0x1000E000u);
             const bool dmacEnabled = (dctrlIt == m_ioRegisters.end()) || ((dctrlIt->second & 0x1u) != 0u);
             if (!dmacEnabled &&
+                channelBase != 0x1000B000u &&
                 channelBase != 0x1000B400u)
             {
                 return true;
@@ -2949,6 +2985,23 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
             const uint32_t qwc =
                 m_ioRegisters[channelBase + 0x20] & 0xFFFFu;
             m_dmaStartCount.fetch_add(1, std::memory_order_relaxed);
+
+            if (channelBase == 0x1000B000u)
+            {
+                (void)startFromIpuDma(transfer, value);
+                const FromIpuDmaAdvanceResult initial =
+                    advanceFromIpuDma();
+                if (initial.active &&
+                    !initial.completed &&
+                    initial.stall ==
+                        FromIpuDmaStallReason::None &&
+                    !scheduleFromIpuDma(
+                        initial.delayEeCycles))
+                {
+                    drainFromIpuDmaCompatibility();
+                }
+                return true;
+            }
 
             if (channelBase == 0x1000B400u)
             {
@@ -4407,12 +4460,86 @@ void PS2Memory::drainGifDmaCompatibility()
     }
 }
 
-void PS2Memory::publishIpuInputFifoCount()
+void PS2Memory::publishIpuFifoCounts()
 {
     constexpr uint32_t kIpuCtrl = 0x10002010u;
     m_ioRegisters[kIpuCtrl] =
-        (m_ioRegisters[kIpuCtrl] & ~0xFu) |
-        (m_ipuInputFifoQwc & 0xFu);
+        (m_ioRegisters[kIpuCtrl] & ~0xFFu) |
+        (m_ipuInputFifoQwc & 0xFu) |
+        ((m_ipuOutputFifoQwc & 0xFu) << 4u);
+}
+
+void PS2Memory::clearIpuOutputFifo()
+{
+    m_ipuOutputFifo = {};
+    m_ipuOutputFifoReadIndex = 0u;
+    m_ipuOutputFifoWriteIndex = 0u;
+    m_ipuOutputFifoQwc = 0u;
+    publishIpuFifoCounts();
+}
+
+uint32_t PS2Memory::readIpuOutputFifo(
+    uint8_t *data, uint32_t qwc)
+{
+    if (!data || qwc == 0u)
+        return 0u;
+
+    const uint32_t accepted = std::min(
+        qwc, m_ipuOutputFifoQwc);
+    for (uint32_t index = 0u;
+         index < accepted; ++index)
+    {
+        std::memcpy(
+            data + static_cast<size_t>(index) * 16u,
+            m_ipuOutputFifo[
+                m_ipuOutputFifoReadIndex]
+                .data(),
+            16u);
+        m_ipuOutputFifoReadIndex =
+            (m_ipuOutputFifoReadIndex + 1u) %
+            kIpuOutputFifoCapacityQwc;
+    }
+    m_ipuOutputFifoQwc -= accepted;
+    publishIpuFifoCounts();
+    return accepted;
+}
+
+uint32_t PS2Memory::writeIpuOutputFifo(
+    const uint8_t *data, uint32_t qwc)
+{
+    if (!data || qwc == 0u)
+        return 0u;
+
+    const uint32_t available =
+        kIpuOutputFifoCapacityQwc -
+        std::min(
+            m_ipuOutputFifoQwc,
+            kIpuOutputFifoCapacityQwc);
+    const uint32_t accepted =
+        std::min(qwc, available);
+    for (uint32_t index = 0u;
+         index < accepted; ++index)
+    {
+        std::memcpy(
+            m_ipuOutputFifo[
+                m_ipuOutputFifoWriteIndex]
+                .data(),
+            data + static_cast<size_t>(index) * 16u,
+            16u);
+        m_ipuOutputFifoWriteIndex =
+            (m_ipuOutputFifoWriteIndex + 1u) %
+            kIpuOutputFifoCapacityQwc;
+    }
+    m_ipuOutputFifoQwc += accepted;
+    publishIpuFifoCounts();
+    if (accepted != 0u &&
+        m_fromIpuDma.active &&
+        m_fromIpuDma.phase ==
+            FromIpuDmaPhase::TransferPayload)
+    {
+        (void)wakeFromIpuDma(1u);
+    }
+    return accepted;
 }
 
 void PS2Memory::clearIpuInputFifo()
@@ -4421,7 +4548,7 @@ void PS2Memory::clearIpuInputFifo()
     m_ipuInputFifoReadIndex = 0u;
     m_ipuInputFifoWriteIndex = 0u;
     m_ipuInputFifoQwc = 0u;
-    publishIpuInputFifoCount();
+    publishIpuFifoCounts();
 }
 
 uint32_t PS2Memory::writeIpuInputFifo(
@@ -4451,8 +4578,455 @@ uint32_t PS2Memory::writeIpuInputFifo(
             kIpuInputFifoCapacityQwc;
     }
     m_ipuInputFifoQwc += accepted;
-    publishIpuInputFifoCount();
+    publishIpuFifoCounts();
     return accepted;
+}
+
+bool PS2Memory::copyFromIpuDmaPayload(
+    uint32_t destinationAddress, uint32_t qwc)
+{
+    if (qwc == 0u)
+        return true;
+    if (qwc > m_ipuOutputFifoQwc ||
+        qwc > kIpuOutputFifoCapacityQwc)
+    {
+        return false;
+    }
+
+    uint32_t currentAddress = destinationAddress;
+    for (uint32_t index = 0u;
+         index < qwc; ++index)
+    {
+        const bool scratchFlag =
+            (currentAddress & 0x80000000u) != 0u;
+        const uint32_t physicalAddress =
+            currentAddress & 0x1FFFFFF0u;
+        const bool scratchAlias =
+            physicalAddress >= 0x10000000u &&
+            physicalAddress < 0x10004000u;
+        const bool scratch =
+            scratchFlag || scratchAlias;
+        if (scratch)
+        {
+            if (!m_scratchpad)
+                return false;
+        }
+        else if (physicalAddress < PS2_RAM_SIZE)
+        {
+            if (!m_rdram ||
+                physicalAddress >
+                    PS2_RAM_SIZE - 16u)
+            {
+                return false;
+            }
+        }
+        else if (physicalAddress >= 0x10000000u)
+        {
+            return false;
+        }
+        currentAddress += 16u;
+    }
+
+    std::array<
+        uint8_t,
+        kIpuOutputFifoCapacityQwc * 16u>
+        payload{};
+    if (readIpuOutputFifo(
+            payload.data(), qwc) != qwc)
+    {
+        return false;
+    }
+
+    currentAddress = destinationAddress;
+    for (uint32_t index = 0u;
+         index < qwc; ++index)
+    {
+        const uint32_t physicalAddress =
+            currentAddress & 0x1FFFFFF0u;
+        const bool scratch =
+            (currentAddress & 0x80000000u) != 0u ||
+            (physicalAddress >= 0x10000000u &&
+             physicalAddress < 0x10004000u);
+        if (scratch)
+        {
+            const uint32_t offset =
+                currentAddress & 0x3FF0u;
+            std::memcpy(
+                m_scratchpad + offset,
+                payload.data() +
+                    static_cast<size_t>(index) * 16u,
+                16u);
+        }
+        else if (physicalAddress < PS2_RAM_SIZE)
+        {
+            markModified(
+                physicalAddress, 16u, 0u);
+            std::memcpy(
+                m_rdram + physicalAddress,
+                payload.data() +
+                    static_cast<size_t>(index) * 16u,
+                16u);
+        }
+        // DMAC writes to unpopulated EE physical memory use the zero-write
+        // page and are intentionally discarded.
+        currentAddress += 16u;
+    }
+    return true;
+}
+
+void PS2Memory::publishFromIpuDmaRegisters()
+{
+    constexpr uint32_t kFromIpuBase = 0x1000B000u;
+    constexpr uint32_t kDctrl = 0x1000E000u;
+    constexpr uint32_t kStadr = 0x1000E060u;
+    uint32_t chcr = m_fromIpuDma.chcr;
+    if (m_fromIpuDma.active)
+        chcr |= 0x100u;
+    else
+        chcr &= ~0x100u;
+    m_ioRegisters[kFromIpuBase + 0x00u] = chcr;
+    m_ioRegisters[kFromIpuBase + 0x10u] =
+        m_fromIpuDma.madr;
+    m_ioRegisters[kFromIpuBase + 0x20u] =
+        m_fromIpuDma.qwc & 0xFFFFu;
+    const auto dctrlIt = m_ioRegisters.find(kDctrl);
+    const uint32_t dctrl =
+        dctrlIt != m_ioRegisters.end()
+            ? dctrlIt->second
+            : 0u;
+    if (((dctrl >> 4u) & 0x3u) == 0x3u)
+    {
+        m_ioRegisters[kStadr] =
+            m_fromIpuDma.madr;
+    }
+    publishIpuFifoCounts();
+}
+
+void PS2Memory::clearFromIpuDmaState(
+    bool notifyRuntime)
+{
+    if (notifyRuntime &&
+        m_fromIpuDma.eventManaged &&
+        m_fromIpuDmaCancelCallback)
+    {
+        m_fromIpuDmaCancelCallback();
+    }
+    m_fromIpuDma = {};
+}
+
+bool PS2Memory::startFromIpuDma(
+    DmacTransferToken transfer, uint32_t chcr)
+{
+    constexpr uint32_t kFromIpuBase = 0x1000B000u;
+    clearFromIpuDmaState(false);
+    m_fromIpuDma.transfer = transfer;
+    m_fromIpuDma.chcr = chcr | 0x100u;
+    m_fromIpuDma.madr =
+        m_ioRegisters[kFromIpuBase + 0x10u] &
+        0xFFFFFFF0u;
+    const uint32_t registerQwc =
+        m_ioRegisters[kFromIpuBase + 0x20u] &
+        0xFFFFu;
+    m_fromIpuDma.zeroQwcStart =
+        registerQwc == 0u;
+    m_fromIpuDma.qwc =
+        m_fromIpuDma.zeroQwcStart
+            ? 0x10000u
+            : registerQwc;
+    m_fromIpuDma.normalMode =
+        ((chcr >> 2u) & 0x3u) == 0u;
+    m_fromIpuDma.active = true;
+    m_fromIpuDma.phase =
+        m_fromIpuDma.normalMode
+            ? FromIpuDmaPhase::TransferPayload
+            : FromIpuDmaPhase::Fault;
+    if (!isDmacEnabled())
+    {
+        m_fromIpuDma.stall =
+            FromIpuDmaStallReason::DmacDisabled;
+    }
+    else if (m_fromIpuDma.normalMode)
+    {
+        m_fromIpuDma.stall =
+            FromIpuDmaStallReason::None;
+    }
+    else
+    {
+        m_fromIpuDma.stall =
+            FromIpuDmaStallReason::UnsupportedMode;
+    }
+    publishFromIpuDmaRegisters();
+    return true;
+}
+
+bool PS2Memory::scheduleFromIpuDma(
+    uint32_t delayEeCycles)
+{
+    if (!m_fromIpuDma.active ||
+        !m_fromIpuDmaScheduleCallback)
+    {
+        return false;
+    }
+    const bool accepted =
+        m_fromIpuDmaScheduleCallback(delayEeCycles);
+    m_fromIpuDma.eventManaged = accepted;
+    return accepted;
+}
+
+bool PS2Memory::wakeFromIpuDma(
+    uint32_t delayEeCycles)
+{
+    if (!m_fromIpuDma.active)
+        return false;
+    if (!isDmacEnabled())
+    {
+        m_fromIpuDma.stall =
+            FromIpuDmaStallReason::DmacDisabled;
+        return false;
+    }
+    if (!m_fromIpuDma.normalMode)
+    {
+        m_fromIpuDma.stall =
+            FromIpuDmaStallReason::UnsupportedMode;
+        return false;
+    }
+    if (m_fromIpuDma.phase ==
+            FromIpuDmaPhase::TransferPayload &&
+        m_ipuOutputFifoQwc == 0u &&
+        !(m_fromIpuDma.zeroQwcStart &&
+          m_fromIpuDma.qwc == 0x10000u))
+    {
+        m_fromIpuDma.stall =
+            FromIpuDmaStallReason::OutputFifoEmpty;
+        return false;
+    }
+
+    m_fromIpuDma.stall =
+        FromIpuDmaStallReason::None;
+    if (m_fromIpuDma.eventManaged)
+        return true;
+    if (scheduleFromIpuDma(delayEeCycles))
+        return true;
+    drainFromIpuDmaCompatibility();
+    return !m_fromIpuDma.active;
+}
+
+void PS2Memory::setFromIpuDmaEventPending(
+    bool pending) noexcept
+{
+    if (m_fromIpuDma.active)
+        m_fromIpuDma.eventManaged = pending;
+}
+
+FromIpuDmaAdvanceResult
+PS2Memory::advanceFromIpuDma()
+{
+    FromIpuDmaAdvanceResult result{};
+    result.transfer = m_fromIpuDma.transfer;
+    result.phase = m_fromIpuDma.phase;
+    result.stall = m_fromIpuDma.stall;
+    result.active = m_fromIpuDma.active;
+
+    if (!m_fromIpuDma.active)
+        return result;
+    if (!progressDmacTransfer(
+            m_fromIpuDma.transfer))
+    {
+        clearFromIpuDmaState(false);
+        result.active = false;
+        result.phase = FromIpuDmaPhase::Idle;
+        return result;
+    }
+    m_fromIpuDma.eventManaged = false;
+
+    const auto fault =
+        [&](const char *reason)
+        {
+            m_fromIpuDma.phase =
+                FromIpuDmaPhase::Fault;
+            m_fromIpuDma.stall =
+                FromIpuDmaStallReason::Fault;
+            if (!m_fromIpuDma.faultReported)
+            {
+                std::fprintf(
+                    stderr,
+                    "From-IPU DMA stalled: madr=0x%08x "
+                    "qwc=%u fifo=%u reason=%s\n",
+                    m_fromIpuDma.madr,
+                    m_fromIpuDma.qwc,
+                    m_ipuOutputFifoQwc,
+                    reason);
+                m_fromIpuDma.faultReported = true;
+            }
+            result.phase = m_fromIpuDma.phase;
+            result.stall = m_fromIpuDma.stall;
+            result.active = true;
+        };
+
+    if (!m_fromIpuDma.normalMode)
+    {
+        m_fromIpuDma.phase =
+            FromIpuDmaPhase::Fault;
+        m_fromIpuDma.stall =
+            FromIpuDmaStallReason::UnsupportedMode;
+        if (!m_fromIpuDma.faultReported)
+        {
+            std::fprintf(
+                stderr,
+                "From-IPU DMA stalled: unsupported "
+                "CHCR mode (chcr=0x%08x)\n",
+                m_fromIpuDma.chcr);
+            m_fromIpuDma.faultReported = true;
+        }
+        result.phase = m_fromIpuDma.phase;
+        result.stall = m_fromIpuDma.stall;
+        return result;
+    }
+    if (m_fromIpuDma.phase ==
+        FromIpuDmaPhase::Fault)
+    {
+        fault("invalid state");
+        return result;
+    }
+    if (!isDmacEnabled())
+    {
+        m_fromIpuDma.stall =
+            FromIpuDmaStallReason::DmacDisabled;
+        result.stall = m_fromIpuDma.stall;
+        return result;
+    }
+
+    m_fromIpuDma.stall =
+        FromIpuDmaStallReason::None;
+    if (m_fromIpuDma.phase ==
+        FromIpuDmaPhase::Finalize)
+    {
+        m_fromIpuDma.active = false;
+        result.completed = requestDmacCompletion(
+            m_fromIpuDma.transfer);
+        result.progressed = result.completed;
+        result.active = false;
+        result.phase = FromIpuDmaPhase::Finalize;
+        return result;
+    }
+    if (m_fromIpuDma.phase !=
+        FromIpuDmaPhase::TransferPayload)
+    {
+        fault("invalid progress phase");
+        return result;
+    }
+
+    if (m_ipuOutputFifoQwc == 0u)
+    {
+        if (m_fromIpuDma.zeroQwcStart &&
+            m_fromIpuDma.qwc == 0x10000u)
+        {
+            m_fromIpuDma.qwc = 0u;
+            m_fromIpuDma.phase =
+                FromIpuDmaPhase::Finalize;
+            publishFromIpuDmaRegisters();
+            m_fromIpuDma.active = false;
+            result.completed = requestDmacCompletion(
+                m_fromIpuDma.transfer);
+            result.progressed = result.completed;
+            result.active = false;
+            result.phase =
+                FromIpuDmaPhase::Finalize;
+            return result;
+        }
+        m_fromIpuDma.stall =
+            FromIpuDmaStallReason::OutputFifoEmpty;
+        result.stall = m_fromIpuDma.stall;
+        result.active = true;
+        return result;
+    }
+
+    const uint32_t sliceQwc = std::min(
+        m_fromIpuDma.qwc,
+        m_ipuOutputFifoQwc);
+    if (sliceQwc == 0u)
+    {
+        fault("zero-sized payload slice");
+        return result;
+    }
+    if (!copyFromIpuDmaPayload(
+            m_fromIpuDma.madr, sliceQwc))
+    {
+        fault("unmapped payload address");
+        return result;
+    }
+
+    m_fromIpuDma.zeroQwcStart = false;
+    m_fromIpuDma.madr += sliceQwc * 16u;
+    m_fromIpuDma.qwc -= sliceQwc;
+    result.progressed = true;
+    result.transferredQwc = sliceQwc;
+    if (m_fromIpuDma.qwc == 0u)
+    {
+        m_fromIpuDma.phase =
+            FromIpuDmaPhase::Finalize;
+        result.delayEeCycles =
+            sliceQwc > UINT32_MAX / 2u
+                ? UINT32_MAX
+                : sliceQwc * 2u;
+    }
+    else
+    {
+        m_fromIpuDma.stall =
+            FromIpuDmaStallReason::OutputFifoEmpty;
+    }
+    publishFromIpuDmaRegisters();
+
+    result.phase = m_fromIpuDma.phase;
+    result.stall = m_fromIpuDma.stall;
+    result.active = true;
+    return result;
+}
+
+FromIpuDmaSnapshot
+PS2Memory::fromIpuDmaSnapshot() const
+{
+    FromIpuDmaSnapshot snapshot{};
+    snapshot.transfer = m_fromIpuDma.transfer;
+    snapshot.phase = m_fromIpuDma.phase;
+    snapshot.stall = m_fromIpuDma.stall;
+    snapshot.chcr = m_fromIpuDma.chcr;
+    snapshot.madr = m_fromIpuDma.madr;
+    snapshot.qwc = m_fromIpuDma.qwc;
+    snapshot.fifoQwc = m_ipuOutputFifoQwc;
+    snapshot.active = m_fromIpuDma.active;
+    snapshot.eventManaged =
+        m_fromIpuDma.eventManaged;
+    snapshot.normalMode =
+        m_fromIpuDma.normalMode;
+    return snapshot;
+}
+
+void PS2Memory::drainFromIpuDmaCompatibility()
+{
+    constexpr uint32_t kMaximumTransitions =
+        131072u;
+    for (uint32_t transition = 0u;
+         transition < kMaximumTransitions &&
+         m_fromIpuDma.active;
+         ++transition)
+    {
+        const FromIpuDmaAdvanceResult advance =
+            advanceFromIpuDma();
+        if (!advance.active || advance.completed ||
+            advance.phase ==
+                FromIpuDmaPhase::Fault)
+        {
+            return;
+        }
+        if (advance.stall !=
+            FromIpuDmaStallReason::None)
+        {
+            return;
+        }
+        if (!advance.progressed)
+            return;
+    }
 }
 
 bool PS2Memory::copyToIpuDmaPayload(
@@ -4542,7 +5116,7 @@ void PS2Memory::publishToIpuDmaRegisters()
         m_toIpuDma.qwc & 0xFFFFu;
     m_ioRegisters[kToIpuBase + 0x30u] =
         m_toIpuDma.tadr;
-    publishIpuInputFifoCount();
+    publishIpuFifoCounts();
 }
 
 void PS2Memory::clearToIpuDmaState(
@@ -5105,6 +5679,8 @@ void PS2Memory::discardPendingDmacWork(DmacChannel channel)
 {
     if (channel == DmacChannel::Gif)
         clearGifDmaState(true);
+    if (channel == DmacChannel::FromIpu)
+        clearFromIpuDmaState(true);
     if (channel == DmacChannel::ToIpu)
         clearToIpuDmaState(true);
     if (channel == DmacChannel::Vif0)
@@ -6677,6 +7253,9 @@ void PS2Memory::processPendingTransfers()
     if (m_vif1Dma.active &&
         !m_vif1Dma.eventManaged)
         drainVif1DmaCompatibility();
+    if (m_fromIpuDma.active &&
+        !m_fromIpuDma.eventManaged)
+        drainFromIpuDmaCompatibility();
     if (m_toIpuDma.active &&
         !m_toIpuDma.eventManaged)
         drainToIpuDmaCompatibility();
@@ -7124,8 +7703,10 @@ uint32_t PS2Memory::readIORegister(uint32_t address)
         case 0x10002010:
             val =
                 (m_ioRegisters[address] &
-                 ~((1u << 31) | 0xFu)) |
-                (m_ipuInputFifoQwc & 0xFu);
+                 ~((1u << 31) | 0xFFu)) |
+                (m_ipuInputFifoQwc & 0xFu) |
+                ((m_ipuOutputFifoQwc & 0xFu)
+                 << 4u);
             break;
         case 0x10002020:
         case 0x10002030:

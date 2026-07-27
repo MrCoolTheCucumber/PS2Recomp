@@ -444,6 +444,51 @@ struct GifDmaSnapshot
     bool endAfterPayload = false;
 };
 
+enum class FromIpuDmaPhase : uint8_t
+{
+    Idle = 0u,
+    TransferPayload,
+    Finalize,
+    Fault,
+};
+
+enum class FromIpuDmaStallReason : uint8_t
+{
+    None = 0u,
+    OutputFifoEmpty,
+    DmacDisabled,
+    UnsupportedMode,
+    Fault,
+};
+
+struct FromIpuDmaAdvanceResult
+{
+    DmacTransferToken transfer{};
+    FromIpuDmaPhase phase = FromIpuDmaPhase::Idle;
+    FromIpuDmaStallReason stall =
+        FromIpuDmaStallReason::None;
+    uint32_t delayEeCycles = 0u;
+    uint32_t transferredQwc = 0u;
+    bool progressed = false;
+    bool completed = false;
+    bool active = false;
+};
+
+struct FromIpuDmaSnapshot
+{
+    DmacTransferToken transfer{};
+    FromIpuDmaPhase phase = FromIpuDmaPhase::Idle;
+    FromIpuDmaStallReason stall =
+        FromIpuDmaStallReason::None;
+    uint32_t chcr = 0u;
+    uint32_t madr = 0u;
+    uint32_t qwc = 0u;
+    uint32_t fifoQwc = 0u;
+    bool active = false;
+    bool eventManaged = false;
+    bool normalMode = false;
+};
+
 enum class ToIpuDmaPhase : uint8_t
 {
     Idle = 0u,
@@ -839,6 +884,19 @@ public:
     {
         m_gifDmaCancelCallback = std::move(cb);
     }
+    using FromIpuDmaScheduleCallback =
+        std::function<bool(uint32_t delayEeCycles)>;
+    void setFromIpuDmaScheduleCallback(
+        FromIpuDmaScheduleCallback cb)
+    {
+        m_fromIpuDmaScheduleCallback = std::move(cb);
+    }
+    using FromIpuDmaCancelCallback = std::function<void()>;
+    void setFromIpuDmaCancelCallback(
+        FromIpuDmaCancelCallback cb)
+    {
+        m_fromIpuDmaCancelCallback = std::move(cb);
+    }
     using ToIpuDmaScheduleCallback =
         std::function<bool(uint32_t delayEeCycles)>;
     void setToIpuDmaScheduleCallback(
@@ -878,6 +936,14 @@ public:
     bool wakeGifDma(uint32_t delayEeCycles);
     GifDmaAdvanceResult advanceGifDma();
     [[nodiscard]] GifDmaSnapshot gifDmaSnapshot() const;
+    uint32_t writeIpuOutputFifo(
+        const uint8_t *data, uint32_t qwc);
+    bool wakeFromIpuDma(uint32_t delayEeCycles);
+    void setFromIpuDmaEventPending(
+        bool pending) noexcept;
+    FromIpuDmaAdvanceResult advanceFromIpuDma();
+    [[nodiscard]] FromIpuDmaSnapshot
+    fromIpuDmaSnapshot() const;
     bool wakeToIpuDma(uint32_t delayEeCycles);
     void setToIpuDmaEventPending(
         bool pending) noexcept;
@@ -1022,6 +1088,10 @@ public:
         m_scratchpadDmaCancelCallback;
     GifDmaScheduleCallback m_gifDmaScheduleCallback;
     GifDmaCancelCallback m_gifDmaCancelCallback;
+    FromIpuDmaScheduleCallback
+        m_fromIpuDmaScheduleCallback;
+    FromIpuDmaCancelCallback
+        m_fromIpuDmaCancelCallback;
     ToIpuDmaScheduleCallback
         m_toIpuDmaScheduleCallback;
     ToIpuDmaCancelCallback m_toIpuDmaCancelCallback;
@@ -1171,6 +1241,24 @@ public:
     };
     GifDmaState m_gifDma{};
 
+    struct FromIpuDmaState
+    {
+        DmacTransferToken transfer{};
+        FromIpuDmaPhase phase =
+            FromIpuDmaPhase::Idle;
+        FromIpuDmaStallReason stall =
+            FromIpuDmaStallReason::None;
+        uint32_t chcr = 0u;
+        uint32_t madr = 0u;
+        uint32_t qwc = 0u;
+        bool active = false;
+        bool eventManaged = false;
+        bool normalMode = false;
+        bool zeroQwcStart = false;
+        bool faultReported = false;
+    };
+    FromIpuDmaState m_fromIpuDma{};
+
     struct ToIpuDmaState
     {
         DmacTransferToken transfer{};
@@ -1194,6 +1282,16 @@ public:
         bool faultReported = false;
     };
     ToIpuDmaState m_toIpuDma{};
+
+    static constexpr uint32_t
+        kIpuOutputFifoCapacityQwc = 8u;
+    std::array<
+        std::array<uint8_t, 16u>,
+        kIpuOutputFifoCapacityQwc>
+        m_ipuOutputFifo{};
+    uint32_t m_ipuOutputFifoReadIndex = 0u;
+    uint32_t m_ipuOutputFifoWriteIndex = 0u;
+    uint32_t m_ipuOutputFifoQwc = 0u;
 
     static constexpr uint32_t
         kIpuInputFifoCapacityQwc = 8u;
@@ -1301,13 +1399,24 @@ public:
         uint32_t sourceAddress,
         uint32_t qwc,
         bool toFifo);
+    bool startFromIpuDma(
+        DmacTransferToken transfer, uint32_t chcr);
+    bool scheduleFromIpuDma(uint32_t delayEeCycles);
+    void clearFromIpuDmaState(bool notifyRuntime);
+    void drainFromIpuDmaCompatibility();
+    void publishFromIpuDmaRegisters();
+    uint32_t readIpuOutputFifo(
+        uint8_t *data, uint32_t qwc);
+    void clearIpuOutputFifo();
+    bool copyFromIpuDmaPayload(
+        uint32_t destinationAddress, uint32_t qwc);
     bool startToIpuDma(
         DmacTransferToken transfer, uint32_t chcr);
     bool scheduleToIpuDma(uint32_t delayEeCycles);
     void clearToIpuDmaState(bool notifyRuntime);
     void drainToIpuDmaCompatibility();
     void publishToIpuDmaRegisters();
-    void publishIpuInputFifoCount();
+    void publishIpuFifoCounts();
     void clearIpuInputFifo();
     uint32_t writeIpuInputFifo(
         const uint8_t *data, uint32_t qwc);

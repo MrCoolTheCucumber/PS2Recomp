@@ -7295,6 +7295,717 @@ void register_ps2_runtime_expansion_tests()
                 "a real EE-counter access must retain its fractional issue time");
         });
 
+        tc.Run("event From-IPU normal DMA reproduces PCSX2 producer wakes and final delay", [](TestCase &t)
+        {
+            PS2Runtime runtime;
+            t.IsTrue(
+                runtime.memory().initialize(),
+                "From-IPU fixture memory should initialize");
+            t.IsTrue(
+                runtime.syncCoreSubsystems(),
+                "From-IPU fixture subsystems should bind");
+            runtime.setEeSchedulingMode(
+                ps2x::timing::EeSchedulingMode::Event);
+
+            constexpr uint32_t kFromIpu =
+                0x1000B000u;
+            constexpr uint32_t kIpuCtrl =
+                0x10002010u;
+            constexpr uint32_t kIpuOutFifo =
+                0x10007000u;
+            constexpr uint32_t kDctrl =
+                0x1000E000u;
+            constexpr uint32_t kDstat =
+                0x1000E010u;
+            constexpr uint32_t kStadr =
+                0x1000E060u;
+            constexpr uint32_t kDestination =
+                0x00035200u;
+            std::array<uint8_t, 16u * 16u>
+                payload{};
+            for (size_t index = 0u;
+                 index < payload.size(); ++index)
+            {
+                payload[index] =
+                    static_cast<uint8_t>(
+                        (index * 37u + 11u) & 0xFFu);
+            }
+
+            t.IsTrue(
+                runtime.memory().writeIORegister(
+                    kDctrl, 0x31u),
+                "From-IPU stall-control mode should enable");
+            t.IsTrue(
+                runtime.memory().writeIORegister(
+                    kFromIpu + 0x10u,
+                    kDestination),
+                "From-IPU MADR should write");
+            t.IsTrue(
+                runtime.memory().writeIORegister(
+                    kFromIpu + 0x20u, 16u),
+                "From-IPU QWC should write");
+            runtime.debugStartEeEventTrace(8u);
+            t.IsTrue(
+                runtime.memory().writeIORegister(
+                    kFromIpu, 0x100u),
+                "From-IPU normal DMA should start");
+
+            FromIpuDmaSnapshot dma =
+                runtime.memory().fromIpuDmaSnapshot();
+            t.IsTrue(
+                dma.active && !dma.eventManaged &&
+                    dma.phase ==
+                        FromIpuDmaPhase::
+                            TransferPayload &&
+                    dma.stall ==
+                        FromIpuDmaStallReason::
+                            OutputFifoEmpty,
+                "an empty output FIFO should leave From-IPU dormant");
+            t.Equals(
+                dma.qwc, 16u,
+                "the empty start should retain all QWC");
+            t.Equals(
+                runtime.memory().readIORegister(
+                    kStadr),
+                kDestination,
+                "STS=From-IPU should publish initial D_STADR");
+            PS2Runtime::DebugEeScheduler scheduler =
+                runtime.debugEeSchedulerSnapshot();
+            auto slot =
+                scheduler.slots[ps2x::timing::
+                    eeEventSourceIndex(
+                        ps2x::timing::EeEventSource::
+                            DmacFromIpu)];
+            t.IsFalse(
+                slot.pending,
+                "an empty output FIFO should own no deadline");
+
+            t.Equals(
+                runtime.memory().writeIpuOutputFifo(
+                    payload.data(), 8u),
+                8u,
+                "the first producer slice should fill eight QW");
+            dma =
+                runtime.memory().fromIpuDmaSnapshot();
+            t.IsTrue(
+                dma.active && dma.eventManaged &&
+                    dma.stall ==
+                        FromIpuDmaStallReason::None,
+                "output production should wake From-IPU");
+            t.Equals(
+                (runtime.memory().readIORegister(
+                     kIpuCtrl) >>
+                 4u) &
+                    0xFu,
+                8u,
+                "IPU_CTRL.OFC should expose output occupancy");
+            scheduler =
+                runtime.debugEeSchedulerSnapshot();
+            slot =
+                scheduler.slots[ps2x::timing::
+                    eeEventSourceIndex(
+                        ps2x::timing::EeEventSource::
+                            DmacFromIpu)];
+            t.IsTrue(
+                slot.pending,
+                "the producer should retain From-IPU ownership");
+            t.Equals(
+                slot.deadlineTick, 8ull,
+                "the producer wake should be one EE cycle later");
+            t.IsTrue(
+                slot.device.kind ==
+                    PS2Runtime::DebugEeEventDeviceKind::
+                        FromIpuDma,
+                "scheduler status should identify From-IPU DMA");
+            t.Equals(
+                std::string(
+                    PS2Runtime::
+                        debugEeEventDeviceKindName(
+                            slot.device.kind)),
+                std::string("from_ipu_dma"),
+                "debugger JSON should use the typed From-IPU label");
+
+            R5900Context &context = runtime.cpu();
+            context.advanceEeCycleTicks(8u);
+            runtime.serviceEeEventsAtBlockBoundary(
+                runtime.memory().getRDRAM(), &context);
+            dma =
+                runtime.memory().fromIpuDmaSnapshot();
+            t.IsTrue(
+                dma.active && !dma.eventManaged &&
+                    dma.stall ==
+                        FromIpuDmaStallReason::
+                            OutputFifoEmpty,
+                "the first service should return dormant");
+            t.Equals(
+                dma.madr,
+                kDestination + 8u * 16u,
+                "the first service should advance MADR");
+            t.Equals(
+                dma.qwc, 8u,
+                "the first service should retain eight QW");
+            t.Equals(
+                dma.fifoQwc, 0u,
+                "the first service should drain the output FIFO");
+            t.Equals(
+                runtime.memory().readIORegister(
+                    kStadr),
+                kDestination + 8u * 16u,
+                "the first service should advance D_STADR");
+            t.IsTrue(
+                std::memcmp(
+                    runtime.memory().getRDRAM() +
+                        kDestination,
+                    payload.data(), 8u * 16u) == 0,
+                "the first service should copy exact FIFO bytes");
+
+            t.Equals(
+                runtime.memory().writeIpuOutputFifo(
+                    payload.data() + 8u * 16u, 8u),
+                8u,
+                "the second producer slice should fill eight QW");
+            scheduler =
+                runtime.debugEeSchedulerSnapshot();
+            slot =
+                scheduler.slots[ps2x::timing::
+                    eeEventSourceIndex(
+                        ps2x::timing::EeEventSource::
+                            DmacFromIpu)];
+            t.Equals(
+                slot.deadlineTick, 16ull,
+                "the second producer should wake one cycle later");
+
+            context.advanceEeCycleTicks(8u);
+            runtime.serviceEeEventsAtBlockBoundary(
+                runtime.memory().getRDRAM(), &context);
+            dma =
+                runtime.memory().fromIpuDmaSnapshot();
+            t.IsTrue(
+                dma.active && dma.eventManaged &&
+                    dma.phase ==
+                        FromIpuDmaPhase::Finalize &&
+                    dma.stall ==
+                        FromIpuDmaStallReason::None,
+                "the second service should retain finalization");
+            t.Equals(
+                dma.madr,
+                kDestination + 16u * 16u,
+                "the second service should advance final MADR");
+            t.Equals(
+                dma.qwc, 0u,
+                "the second service should consume all QWC");
+            t.Equals(
+                runtime.memory().readIORegister(
+                    kStadr),
+                kDestination + 16u * 16u,
+                "the second service should advance final D_STADR");
+            t.IsTrue(
+                std::memcmp(
+                    runtime.memory().getRDRAM() +
+                        kDestination,
+                    payload.data(), payload.size()) == 0,
+                "both services should reproduce the FIFO payload");
+            scheduler =
+                runtime.debugEeSchedulerSnapshot();
+            slot =
+                scheduler.slots[ps2x::timing::
+                    eeEventSourceIndex(
+                        ps2x::timing::EeEventSource::
+                            DmacFromIpu)];
+            t.Equals(
+                slot.deadlineTick, 144ull,
+                "eight final QW should delay completion sixteen cycles");
+
+            context.advanceEeCycleTicks(128u);
+            runtime.serviceEeEventsAtBlockBoundary(
+                runtime.memory().getRDRAM(), &context);
+            t.IsFalse(
+                runtime.memory()
+                    .fromIpuDmaSnapshot()
+                    .active,
+                "the final callback should retire From-IPU DMA");
+            t.IsTrue(
+                (runtime.memory().readIORegister(
+                     kFromIpu) &
+                 0x100u) == 0u,
+                "same-boundary publication should clear STR");
+            t.IsTrue(
+                (runtime.memory().readIORegister(
+                     kDstat) &
+                 (1u << 3u)) != 0u,
+                "same-boundary publication should latch From-IPU D_STAT");
+
+            const PS2Runtime::DebugEeEventTrace trace =
+                runtime.debugEeEventTraceSnapshot(true);
+            t.Equals(
+                trace.entries.size(),
+                static_cast<size_t>(4u),
+                "the oracle should trace three device services and completion");
+            if (trace.entries.size() == 4u)
+            {
+                const std::array<
+                    ps2x::timing::EeEventSource, 4u>
+                    expectedSources = {
+                        ps2x::timing::EeEventSource::
+                            DmacFromIpu,
+                        ps2x::timing::EeEventSource::
+                            DmacFromIpu,
+                        ps2x::timing::EeEventSource::
+                            DmacFromIpu,
+                        ps2x::timing::EeEventSource::
+                            DmacCompletion,
+                    };
+                const std::array<uint64_t, 4u>
+                    expectedTicks = {
+                        8ull, 16ull, 144ull, 144ull};
+                for (size_t index = 0u;
+                     index < trace.entries.size();
+                     ++index)
+                {
+                    t.IsTrue(
+                        trace.entries[index].source ==
+                            expectedSources[index],
+                        "From-IPU services should retain source order");
+                    t.Equals(
+                        trace.entries[index].serviceTick,
+                        expectedTicks[index],
+                        "From-IPU services should retain exact ticks");
+                }
+            }
+
+            std::array<uint8_t, 16u> directPayload{};
+            for (size_t index = 0u;
+                 index < directPayload.size();
+                 ++index)
+            {
+                directPayload[index] =
+                    static_cast<uint8_t>(0xD0u + index);
+            }
+            t.Equals(
+                runtime.memory().writeIpuOutputFifo(
+                    directPayload.data(), 1u),
+                1u,
+                "a direct-read payload should enter the output FIFO");
+            const __m128i direct =
+                runtime.memory().read128(kIpuOutFifo);
+            alignas(16) std::array<uint8_t, 16u>
+                directRead{};
+            _mm_storeu_si128(
+                reinterpret_cast<__m128i *>(
+                    directRead.data()),
+                direct);
+            t.IsTrue(
+                directRead == directPayload,
+                "direct IPU output reads should consume exact FIFO bytes");
+            t.Equals(
+                (runtime.memory().readIORegister(
+                     kIpuCtrl) >>
+                 4u) &
+                    0xFu,
+                0u,
+                "direct output reads should decrement OFC");
+        });
+
+        tc.Run("From-IPU zero QWC disable reset and cancel preserve retained ownership", [](TestCase &t)
+        {
+            PS2Runtime runtime;
+            t.IsTrue(
+                runtime.memory().initialize(),
+                "From-IPU lifecycle memory should initialize");
+            t.IsTrue(
+                runtime.syncCoreSubsystems(),
+                "From-IPU lifecycle subsystems should bind");
+            runtime.setEeSchedulingMode(
+                ps2x::timing::EeSchedulingMode::Event);
+
+            constexpr uint32_t kFromIpu =
+                0x1000B000u;
+            constexpr uint32_t kIpuCtrl =
+                0x10002010u;
+            constexpr uint32_t kDctrl =
+                0x1000E000u;
+            constexpr uint32_t kDstat =
+                0x1000E010u;
+            constexpr uint32_t kDestination =
+                0x00035400u;
+            std::array<uint8_t, 16u> payload{};
+            payload.fill(0xA5u);
+
+            (void)runtime.memory().writeIORegister(
+                kFromIpu + 0x10u, kDestination);
+            (void)runtime.memory().writeIORegister(
+                kFromIpu + 0x20u, 0u);
+            (void)runtime.memory().writeIORegister(
+                kFromIpu, 0x100u);
+            t.IsFalse(
+                runtime.memory()
+                    .fromIpuDmaSnapshot()
+                    .active,
+                "an empty zero-QWC start should terminate without underflow");
+            PS2Runtime::DebugEeScheduler scheduler =
+                runtime.debugEeSchedulerSnapshot();
+            t.IsFalse(
+                scheduler
+                    .slots[ps2x::timing::
+                        eeEventSourceIndex(
+                            ps2x::timing::
+                                EeEventSource::
+                                    DmacFromIpu)]
+                    .pending,
+                "zero-QWC termination should not invent a device callback");
+            t.IsTrue(
+                scheduler
+                    .slots[ps2x::timing::
+                        eeEventSourceIndex(
+                            ps2x::timing::
+                                EeEventSource::
+                                    DmacCompletion)]
+                    .pending,
+                "zero-QWC termination should use typed completion");
+            R5900Context &context = runtime.cpu();
+            runtime.serviceEeEventsAtBlockBoundary(
+                runtime.memory().getRDRAM(), &context);
+            t.IsTrue(
+                (runtime.memory().readIORegister(
+                     kDstat) &
+                 (1u << 3u)) != 0u,
+                "zero-QWC termination should latch From-IPU D_STAT");
+            (void)runtime.memory().writeIORegister(
+                kDstat, 1u << 3u);
+
+            t.Equals(
+                runtime.memory().writeIpuOutputFifo(
+                    payload.data(), 1u),
+                1u,
+                "a zero-QWC transfer should see prefilled output");
+            (void)runtime.memory().writeIORegister(
+                kFromIpu + 0x10u, kDestination);
+            (void)runtime.memory().writeIORegister(
+                kFromIpu + 0x20u, 0u);
+            (void)runtime.memory().writeIORegister(
+                kFromIpu, 0x100u);
+            FromIpuDmaSnapshot dma =
+                runtime.memory().fromIpuDmaSnapshot();
+            t.IsTrue(
+                dma.active && !dma.eventManaged &&
+                    dma.stall ==
+                        FromIpuDmaStallReason::
+                            OutputFifoEmpty,
+                "prefilled zero-QWC should transfer before testing completion");
+            t.Equals(
+                dma.qwc, 0xFFFFu,
+                "prefilled zero-QWC should apply normal DMAC underflow");
+            t.Equals(
+                dma.fifoQwc, 0u,
+                "the underflowing transfer should consume its output");
+            t.IsTrue(
+                std::memcmp(
+                    runtime.memory().getRDRAM() +
+                        kDestination,
+                    payload.data(), payload.size()) == 0,
+                "the underflowing transfer should copy exact output");
+            (void)runtime.memory().writeIORegister(
+                kFromIpu, 0u);
+
+            (void)runtime.memory().writeIORegister(
+                kDctrl, 0u);
+            (void)runtime.memory().writeIORegister(
+                kFromIpu + 0x10u, kDestination);
+            (void)runtime.memory().writeIORegister(
+                kFromIpu + 0x20u, 1u);
+            (void)runtime.memory().writeIORegister(
+                kFromIpu, 0x100u);
+            dma =
+                runtime.memory().fromIpuDmaSnapshot();
+            t.IsTrue(
+                dma.active && !dma.eventManaged &&
+                    dma.stall ==
+                        FromIpuDmaStallReason::
+                            DmacDisabled,
+                "disabled DMAC should retain From-IPU without a deadline");
+            t.Equals(
+                runtime.memory().writeIpuOutputFifo(
+                    payload.data(), 1u),
+                1u,
+                "a disabled channel should retain produced output");
+            scheduler =
+                runtime.debugEeSchedulerSnapshot();
+            t.IsFalse(
+                scheduler
+                    .slots[ps2x::timing::
+                        eeEventSourceIndex(
+                            ps2x::timing::
+                                EeEventSource::
+                                    DmacFromIpu)]
+                    .pending,
+                "disabled From-IPU should not acquire a deadline");
+
+            (void)runtime.memory().writeIORegister(
+                kIpuCtrl, 1u << 30u);
+            dma =
+                runtime.memory().fromIpuDmaSnapshot();
+            t.Equals(
+                dma.fifoQwc, 0u,
+                "IPU reset should clear the output FIFO");
+            t.IsTrue(
+                dma.active &&
+                    dma.stall ==
+                        FromIpuDmaStallReason::
+                            DmacDisabled,
+                "IPU reset should not fabricate channel completion");
+            (void)runtime.memory().writeIORegister(
+                kDctrl, 1u);
+            dma =
+                runtime.memory().fromIpuDmaSnapshot();
+            t.IsTrue(
+                dma.active && !dma.eventManaged &&
+                    dma.stall ==
+                        FromIpuDmaStallReason::
+                            OutputFifoEmpty,
+                "reenabling an empty channel should leave it dormant");
+
+            t.Equals(
+                runtime.memory().writeIpuOutputFifo(
+                    payload.data(), 1u),
+                1u,
+                "post-reset output should wake the retained channel");
+            scheduler =
+                runtime.debugEeSchedulerSnapshot();
+            t.IsTrue(
+                scheduler
+                    .slots[ps2x::timing::
+                        eeEventSourceIndex(
+                            ps2x::timing::
+                                EeEventSource::
+                                    DmacFromIpu)]
+                    .pending,
+                "post-reset output should own a deadline");
+            (void)runtime.memory().writeIORegister(
+                kFromIpu, 0u);
+            t.IsFalse(
+                runtime.memory()
+                    .fromIpuDmaSnapshot()
+                    .active,
+                "clearing STR should cancel retained From-IPU");
+            scheduler =
+                runtime.debugEeSchedulerSnapshot();
+            t.IsFalse(
+                scheduler
+                    .slots[ps2x::timing::
+                        eeEventSourceIndex(
+                            ps2x::timing::
+                                EeEventSource::
+                                    DmacFromIpu)]
+                    .pending,
+                "cancellation should invalidate the scheduled generation");
+            context.advanceEeCycleTicks(8u);
+            runtime.serviceEeEventsAtBlockBoundary(
+                runtime.memory().getRDRAM(), &context);
+            t.IsTrue(
+                (runtime.memory().readIORegister(
+                     kDstat) &
+                 (1u << 3u)) == 0u,
+                "a stale callback must not publish completion");
+
+            (void)runtime.memory().writeIORegister(
+                kIpuCtrl, 1u << 30u);
+            (void)runtime.memory().writeIORegister(
+                kFromIpu + 0x20u, 1u);
+            (void)runtime.memory().writeIORegister(
+                kFromIpu, 0x104u);
+            dma =
+                runtime.memory().fromIpuDmaSnapshot();
+            t.IsTrue(
+                dma.active && !dma.eventManaged &&
+                    dma.phase ==
+                        FromIpuDmaPhase::Fault &&
+                    dma.stall ==
+                        FromIpuDmaStallReason::
+                            UnsupportedMode,
+                "From-IPU should retain unsupported modes as an explicit fault");
+            (void)runtime.memory().writeIORegister(
+                kFromIpu, 0u);
+        });
+
+        tc.Run("From-IPU destinations follow DMAC scratchpad and zero-write mappings", [](TestCase &t)
+        {
+            PS2Runtime runtime;
+            t.IsTrue(
+                runtime.memory().initialize(),
+                "From-IPU mapping memory should initialize");
+            t.IsTrue(
+                runtime.syncCoreSubsystems(),
+                "From-IPU mapping subsystems should bind");
+            runtime.setEeSchedulingMode(
+                ps2x::timing::EeSchedulingMode::Event);
+
+            constexpr uint32_t kFromIpu =
+                0x1000B000u;
+            constexpr uint32_t kScratchDestination =
+                0x80000100u;
+            constexpr uint32_t kZeroWriteDestination =
+                0x02000000u;
+            std::array<uint8_t, 3u * 16u> payload{};
+            for (size_t index = 0u;
+                 index < payload.size(); ++index)
+            {
+                payload[index] =
+                    static_cast<uint8_t>(
+                        0x40u + index);
+            }
+
+            t.Equals(
+                runtime.memory().writeIpuOutputFifo(
+                    payload.data(), 3u),
+                3u,
+                "the mapping fixture should prefill three output QW");
+            (void)runtime.memory().writeIORegister(
+                kFromIpu + 0x10u,
+                kScratchDestination);
+            (void)runtime.memory().writeIORegister(
+                kFromIpu + 0x20u, 2u);
+            (void)runtime.memory().writeIORegister(
+                kFromIpu, 0x100u);
+            FromIpuDmaSnapshot dma =
+                runtime.memory().fromIpuDmaSnapshot();
+            t.IsTrue(
+                dma.active && dma.eventManaged &&
+                    dma.phase ==
+                        FromIpuDmaPhase::Finalize,
+                "prefilled scratchpad output should retain finalization");
+            t.IsTrue(
+                std::memcmp(
+                    runtime.memory().getScratchpad() +
+                        0x100u,
+                    payload.data(), 2u * 16u) == 0,
+                "flagged DMAC addresses should target scratchpad");
+            t.Equals(
+                dma.fifoQwc, 1u,
+                "the scratch transfer should retain the third output QW");
+
+            R5900Context &context = runtime.cpu();
+            context.advanceEeCycleTicks(32u);
+            runtime.serviceEeEventsAtBlockBoundary(
+                runtime.memory().getRDRAM(), &context);
+            t.IsFalse(
+                runtime.memory()
+                    .fromIpuDmaSnapshot()
+                    .active,
+                "the scratch transfer should complete");
+
+            (void)runtime.memory().writeIORegister(
+                kFromIpu + 0x10u,
+                kZeroWriteDestination);
+            (void)runtime.memory().writeIORegister(
+                kFromIpu + 0x20u, 1u);
+            (void)runtime.memory().writeIORegister(
+                kFromIpu, 0x100u);
+            dma =
+                runtime.memory().fromIpuDmaSnapshot();
+            t.IsTrue(
+                dma.active && dma.eventManaged &&
+                    dma.phase ==
+                        FromIpuDmaPhase::Finalize &&
+                    dma.stall ==
+                        FromIpuDmaStallReason::None,
+                "unpopulated physical writes should use the DMAC zero-write page");
+            t.Equals(
+                dma.fifoQwc, 0u,
+                "the zero-write page should still consume output");
+            context.advanceEeCycleTicks(16u);
+            runtime.serviceEeEventsAtBlockBoundary(
+                runtime.memory().getRDRAM(), &context);
+            t.IsFalse(
+                runtime.memory()
+                    .fromIpuDmaSnapshot()
+                    .active,
+                "the zero-write transfer should complete normally");
+        });
+
+        tc.Run("legacy and shadow From-IPU drain the retained descriptor without deadlines", [](TestCase &t)
+        {
+            const std::array<
+                ps2x::timing::EeSchedulingMode, 2u>
+                modes = {
+                    ps2x::timing::EeSchedulingMode::
+                        Legacy,
+                    ps2x::timing::EeSchedulingMode::
+                        Shadow,
+                };
+            for (const auto mode : modes)
+            {
+                PS2Runtime runtime;
+                t.IsTrue(
+                    runtime.memory().initialize(),
+                    "compatibility From-IPU memory should initialize");
+                t.IsTrue(
+                    runtime.syncCoreSubsystems(),
+                    "compatibility From-IPU subsystems should bind");
+                runtime.setEeSchedulingMode(mode);
+
+                constexpr uint32_t kFromIpu =
+                    0x1000B000u;
+                constexpr uint32_t kDestination =
+                    0x00035600u;
+                std::array<uint8_t, 16u> payload{};
+                payload.fill(
+                    mode ==
+                            ps2x::timing::
+                                EeSchedulingMode::
+                                    Legacy
+                        ? 0x5Au
+                        : 0xC3u);
+
+                (void)runtime.memory().writeIORegister(
+                    kFromIpu + 0x10u,
+                    kDestination);
+                (void)runtime.memory().writeIORegister(
+                    kFromIpu + 0x20u, 1u);
+                (void)runtime.memory().writeIORegister(
+                    kFromIpu, 0x100u);
+                t.IsTrue(
+                    runtime.memory()
+                            .fromIpuDmaSnapshot()
+                            .active &&
+                        !runtime.memory()
+                             .fromIpuDmaSnapshot()
+                             .eventManaged,
+                    "compatibility mode should retain an empty descriptor");
+
+                t.Equals(
+                    runtime.memory().writeIpuOutputFifo(
+                        payload.data(), 1u),
+                    1u,
+                    "compatibility output should enter the FIFO");
+                t.IsFalse(
+                    runtime.memory()
+                        .fromIpuDmaSnapshot()
+                        .active,
+                    "compatibility output should drain and finalize immediately");
+                t.IsTrue(
+                    std::memcmp(
+                        runtime.memory().getRDRAM() +
+                            kDestination,
+                        payload.data(), payload.size()) == 0,
+                    "compatibility modes should copy the retained payload");
+                t.IsTrue(
+                    runtime.memory()
+                        .hasReadyDmacCompletions(),
+                    "compatibility drain should request typed completion");
+                const auto scheduler =
+                    runtime.debugEeSchedulerSnapshot();
+                t.IsFalse(
+                    scheduler
+                        .slots[ps2x::timing::
+                            eeEventSourceIndex(
+                                ps2x::timing::
+                                    EeEventSource::
+                                        DmacFromIpu)]
+                        .pending,
+                    "compatibility drain should not own an event deadline");
+            }
+        });
+
         tc.Run("event To-IPU normal DMA reproduces PCSX2 FIFO stall and reset wake", [](TestCase &t)
         {
             PS2Runtime runtime;

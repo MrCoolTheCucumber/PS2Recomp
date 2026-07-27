@@ -545,6 +545,7 @@ public:
         Vu0,
         Vu1,
         ScratchpadDma,
+        FromIpuDma,
         ToIpuDma,
     };
 
@@ -576,6 +577,8 @@ public:
             return "vu1";
         case DebugEeEventDeviceKind::ScratchpadDma:
             return "scratchpad_dma";
+        case DebugEeEventDeviceKind::FromIpuDma:
+            return "from_ipu_dma";
         case DebugEeEventDeviceKind::ToIpuDma:
             return "to_ipu_dma";
         case DebugEeEventDeviceKind::None:
@@ -1176,6 +1179,13 @@ private:
         ps2x::timing::EeTick deadline) noexcept;
     void serviceGifDmaAtEvent(
         const ps2x::timing::EeEventService &service);
+    bool scheduleFromIpuDmaFromMemory(
+        uint32_t delayEeCycles);
+    void cancelFromIpuDmaEvent() noexcept;
+    void scheduleFromIpuDmaEvent(
+        ps2x::timing::EeTick deadline) noexcept;
+    void serviceFromIpuDmaAtEvent(
+        const ps2x::timing::EeEventService &service);
     bool scheduleToIpuDmaFromMemory(
         uint32_t delayEeCycles);
     void cancelToIpuDmaEvent() noexcept;
@@ -1333,6 +1343,10 @@ private:
         ps2x::timing::EeEventSource::DmacVif1, 0u};
     ps2x::timing::EeEventToken m_gifDmaEventToken{
         ps2x::timing::EeEventSource::DmacGif, 0u};
+    ps2x::timing::EeEventToken
+        m_fromIpuDmaEventToken{
+            ps2x::timing::EeEventSource::DmacFromIpu,
+            0u};
     ps2x::timing::EeEventToken
         m_toIpuDmaEventToken{
             ps2x::timing::EeEventSource::DmacToIpu,

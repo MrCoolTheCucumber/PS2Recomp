@@ -943,6 +943,17 @@ PS2Runtime::PS2Runtime()
         {
             cancelGifDmaEvent();
         });
+    m_memory.setFromIpuDmaScheduleCallback(
+        [this](uint32_t delayEeCycles)
+        {
+            return scheduleFromIpuDmaFromMemory(
+                delayEeCycles);
+        });
+    m_memory.setFromIpuDmaCancelCallback(
+        [this]()
+        {
+            cancelFromIpuDmaEvent();
+        });
     m_memory.setToIpuDmaScheduleCallback(
         [this](uint32_t delayEeCycles)
         {
@@ -2295,6 +2306,12 @@ void PS2Runtime::resetEeTimingUnlocked(
         (void)m_memory.cancelDmacTransfer(
             DmacChannel::Gif);
     }
+    cancelFromIpuDmaEvent();
+    if (m_memory.fromIpuDmaSnapshot().active)
+    {
+        (void)m_memory.cancelDmacTransfer(
+            DmacChannel::FromIpu);
+    }
     cancelToIpuDmaEvent();
     if (m_memory.toIpuDmaSnapshot().active)
     {
@@ -2403,6 +2420,12 @@ void PS2Runtime::setEeSchedulingMode(
     {
         (void)m_memory.cancelDmacTransfer(
             DmacChannel::Gif);
+    }
+    cancelFromIpuDmaEvent();
+    if (m_memory.fromIpuDmaSnapshot().active)
+    {
+        (void)m_memory.cancelDmacTransfer(
+            DmacChannel::FromIpu);
     }
     cancelToIpuDmaEvent();
     if (m_memory.toIpuDmaSnapshot().active)
@@ -3171,6 +3194,80 @@ void PS2Runtime::serviceGifDmaAtEvent(
             GifDmaStallReason::GifPaused)
     {
         scheduleGifDmaEvent(
+            ps2x::timing::saturatingAdd(
+                service.serviceTick,
+                ps2x::timing::eeCyclesToTicks(
+                    advance.delayEeCycles)));
+    }
+}
+
+bool PS2Runtime::scheduleFromIpuDmaFromMemory(
+    uint32_t delayEeCycles)
+{
+    if (m_eeSchedulingMode !=
+        ps2x::timing::EeSchedulingMode::Event)
+    {
+        return false;
+    }
+
+    const ps2x::timing::EeTick now =
+        commitEeContextProgress(m_boundEeContext);
+    scheduleFromIpuDmaEvent(
+        ps2x::timing::saturatingAdd(
+            now,
+            ps2x::timing::eeCyclesToTicks(
+                delayEeCycles)));
+    return m_fromIpuDmaEventToken.generation != 0u;
+}
+
+void PS2Runtime::scheduleFromIpuDmaEvent(
+    ps2x::timing::EeTick deadline) noexcept
+{
+    m_fromIpuDmaEventToken =
+        m_eeEventScheduler.scheduleAbsolute(
+            ps2x::timing::EeEventSource::
+                DmacFromIpu,
+            deadline);
+    m_memory.setFromIpuDmaEventPending(
+        m_fromIpuDmaEventToken.generation != 0u);
+}
+
+void PS2Runtime::cancelFromIpuDmaEvent() noexcept
+{
+    if (m_fromIpuDmaEventToken.generation != 0u)
+    {
+        (void)m_eeEventScheduler.cancel(
+            m_fromIpuDmaEventToken);
+    }
+    m_fromIpuDmaEventToken = {
+        ps2x::timing::EeEventSource::DmacFromIpu,
+        0u};
+    m_memory.setFromIpuDmaEventPending(false);
+}
+
+void PS2Runtime::serviceFromIpuDmaAtEvent(
+    const ps2x::timing::EeEventService &service)
+{
+    if (m_fromIpuDmaEventToken.generation == 0u ||
+        service.generation !=
+            m_fromIpuDmaEventToken.generation)
+    {
+        return;
+    }
+
+    m_fromIpuDmaEventToken = {
+        ps2x::timing::EeEventSource::DmacFromIpu,
+        0u};
+    m_memory.setFromIpuDmaEventPending(false);
+    const FromIpuDmaAdvanceResult advance =
+        m_memory.advanceFromIpuDma();
+    if (!advance.active || advance.completed)
+        return;
+
+    if (advance.stall ==
+        FromIpuDmaStallReason::None)
+    {
+        scheduleFromIpuDmaEvent(
             ps2x::timing::saturatingAdd(
                 service.serviceTick,
                 ps2x::timing::eeCyclesToTicks(
@@ -5270,6 +5367,9 @@ void PS2Runtime::dispatchEeEvent(
     case ps2x::timing::EeEventSource::DmacVif0:
         serviceVif0DmaAtEvent(service);
         return;
+    case ps2x::timing::EeEventSource::DmacFromIpu:
+        serviceFromIpuDmaAtEvent(service);
+        return;
     case ps2x::timing::EeEventSource::DmacToIpu:
         serviceToIpuDmaAtEvent(service);
         return;
@@ -5516,6 +5616,23 @@ PS2Runtime::debugEeEventDeviceState(
         result.madr = state.madr;
         result.qwc = state.qwc;
         result.tagsProcessed = state.tagsProcessed;
+        result.active = state.active;
+        return result;
+    }
+    case ps2x::timing::EeEventSource::DmacFromIpu:
+    {
+        const FromIpuDmaSnapshot state =
+            m_memory.fromIpuDmaSnapshot();
+        result.kind =
+            DebugEeEventDeviceKind::FromIpuDma;
+        result.operationGeneration =
+            state.transfer.generation;
+        result.phase =
+            static_cast<uint32_t>(state.phase);
+        result.stall =
+            static_cast<uint32_t>(state.stall);
+        result.madr = state.madr;
+        result.qwc = state.qwc;
         result.active = state.active;
         return result;
     }

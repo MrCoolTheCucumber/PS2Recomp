@@ -60,8 +60,9 @@ namespace ps2x::timing
         HleSif1,
         DmacVif0,
         // PCSX2 services the physical IPU DMA callbacks after VIF0 and before
-        // scratchpad DMA at a shared EE event boundary. DmacFromIpu will
-        // occupy the preceding slot when that channel is migrated.
+        // scratchpad DMA at a shared EE event boundary, with From-IPU before
+        // To-IPU.
+        DmacFromIpu,
         DmacToIpu,
         DmacFromScratchpad,
         DmacToScratchpad,
@@ -105,6 +106,8 @@ namespace ps2x::timing
             return "hle_sif1";
         case EeEventSource::DmacVif0:
             return "dmac_vif0";
+        case EeEventSource::DmacFromIpu:
+            return "dmac_from_ipu";
         case EeEventSource::DmacToIpu:
             return "dmac_to_ipu";
         case EeEventSource::DmacFromScratchpad:
