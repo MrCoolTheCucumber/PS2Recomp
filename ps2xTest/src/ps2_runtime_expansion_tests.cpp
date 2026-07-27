@@ -3918,6 +3918,145 @@ void register_ps2_runtime_expansion_tests()
                     trace.entries[2].source ==
                         ps2x::timing::EeEventSource::DmacCompletion,
                     "final state must precede completion publication");
+                t.IsTrue(
+                    trace.entries[0].deviceBefore.kind ==
+                            PS2Runtime::DebugEeEventDeviceKind::
+                                Vif1Dma &&
+                        trace.entries[0].deviceAfter.kind ==
+                            PS2Runtime::DebugEeEventDeviceKind::
+                                Vif1Dma,
+                    "VIF1 events should retain typed device state");
+                t.IsTrue(
+                    trace.entries[0].deviceBefore.active &&
+                        trace.entries[0].deviceAfter.active,
+                    "payload state should remain active across its event");
+                t.Equals(
+                    trace.entries[0].deviceBefore.phase,
+                    static_cast<uint32_t>(
+                        Vif1DmaPhase::TransferPayload),
+                    "payload trace should expose its starting phase");
+                t.Equals(
+                    trace.entries[0].deviceBefore.madr,
+                    kSource,
+                    "payload trace should expose its starting MADR");
+                t.Equals(
+                    trace.entries[0].deviceBefore.qwc,
+                    kQwc,
+                    "payload trace should expose its starting QWC");
+                t.Equals(
+                    trace.entries[0].deviceAfter.phase,
+                    static_cast<uint32_t>(
+                        Vif1DmaPhase::Finalize),
+                    "payload trace should expose its follow-up phase");
+                t.Equals(
+                    trace.entries[0].deviceAfter.madr,
+                    kSource + kQwc * 16u,
+                    "payload trace should expose its ending MADR");
+                t.Equals(
+                    trace.entries[0].deviceAfter.qwc,
+                    0u,
+                    "payload trace should expose consumed QWC");
+                t.IsTrue(
+                    trace.entries[1].deviceBefore.active &&
+                        !trace.entries[1].deviceAfter.active,
+                    "finalization trace should expose retirement");
+                t.Equals(
+                    trace.entries[0]
+                        .deviceBefore.operationGeneration,
+                    trace.entries[1]
+                        .deviceBefore.operationGeneration,
+                    "one VIF1 operation generation should span both events");
+            }
+        });
+
+        tc.Run("EE event trace trigger retains the first matching service window", [](TestCase &t)
+        {
+            PS2Runtime runtime;
+            t.IsTrue(runtime.memory().initialize(),
+                     "trigger fixture memory should initialize");
+            t.IsTrue(runtime.syncCoreSubsystems(),
+                     "trigger fixture subsystems should bind");
+            runtime.setEeSchedulingMode(
+                ps2x::timing::EeSchedulingMode::Event);
+
+            constexpr uint32_t kVif1 = 0x10009000u;
+            constexpr uint32_t kSource = 0x00030300u;
+            constexpr uint32_t kTriggerPc = 0x001EE97Cu;
+            constexpr uint32_t kBeforePc = 0x001EE970u;
+            constexpr uint32_t kAfterPc = 0x001EE980u;
+            std::memset(
+                runtime.memory().getRDRAM() + kSource,
+                0, 16u);
+
+            runtime.debugStartEeEventTrace(
+                4u, kTriggerPc, false);
+            t.IsTrue(runtime.memory().writeIORegister(
+                         kVif1 + 0x10u, kSource),
+                     "trigger fixture MADR write should succeed");
+            t.IsTrue(runtime.memory().writeIORegister(
+                         kVif1 + 0x20u, 1u),
+                     "trigger fixture QWC write should succeed");
+            t.IsTrue(runtime.memory().writeIORegister(
+                         kVif1, 0x100u),
+                     "trigger fixture VIF1 start should succeed");
+
+            R5900Context &context = runtime.cpu();
+            context.pc = kBeforePc;
+            context.advanceEeCycleTicks(32u);
+            runtime.serviceEeEventsAtBlockBoundary(
+                runtime.memory().getRDRAM(), &context);
+
+            const PS2Runtime::DebugEeEventTrace dormant =
+                runtime.debugEeEventTraceSnapshot(false);
+            t.IsFalse(
+                dormant.triggered,
+                "a nonmatching service PC must leave the trace dormant");
+            t.Equals(
+                dormant.totalEntries, 0ull,
+                "pre-trigger events must not consume trace capacity");
+            t.IsTrue(
+                dormant.entries.empty(),
+                "pre-trigger events must not enter the retained window");
+            t.IsTrue(
+                dormant.triggerEePc.has_value() &&
+                    *dormant.triggerEePc == kTriggerPc,
+                "the trace snapshot should retain its EE PC trigger");
+
+            context.pc = kTriggerPc;
+            context.advanceEeCycleTicks(8u);
+            runtime.serviceEeEventsAtBlockBoundary(
+                runtime.memory().getRDRAM(), &context);
+            const PS2Runtime::DebugEeEventTrace armed =
+                runtime.debugEeEventTraceSnapshot(false);
+            t.IsTrue(
+                armed.triggered && armed.entries.empty(),
+                "the matching boundary should arm before a later event");
+
+            context.pc = kAfterPc;
+            context.advanceEeCycleTicks(8u);
+            runtime.serviceEeEventsAtBlockBoundary(
+                runtime.memory().getRDRAM(), &context);
+
+            const PS2Runtime::DebugEeEventTrace trace =
+                runtime.debugEeEventTraceSnapshot(true);
+            t.IsTrue(
+                trace.triggered,
+                "the matching service PC should arm the trace");
+            t.Equals(
+                trace.entries.size(),
+                static_cast<size_t>(2u),
+                "finalization and completion should form the first retained window");
+            if (trace.entries.size() == 2u)
+            {
+                t.Equals(
+                    trace.entries[0].eePc, kAfterPc,
+                    "the first post-trigger event should retain its service PC");
+                t.Equals(
+                    trace.entries[0].sequence, 1ull,
+                    "pre-trigger dispatches must not advance trace sequence");
+                t.Equals(
+                    trace.entries[1].sequence, 2ull,
+                    "same-tick follow-up should remain in the triggered window");
             }
         });
 
@@ -5226,6 +5365,10 @@ void register_ps2_runtime_expansion_tests()
                 t.IsTrue(
                     trace.entries[0].blockBoundary,
                     "the pre-deadline call should be identified as a block boundary");
+                t.Equals(
+                    trace.entries[0].vsyncTick,
+                    ps2_syscalls::GetCurrentVSyncTick(),
+                    "the sync trace should correlate EE progress with the current VSync tick");
                 t.IsFalse(
                     trace.entries[0].eventDue,
                     "the first block should remain before the rapid event deadline");
@@ -5494,6 +5637,17 @@ void register_ps2_runtime_expansion_tests()
             t.IsTrue(
                 trace.triggered,
                 "an inactive VCALL-style synchronization should arm the trace");
+            t.IsTrue(
+                trace.hasTriggerSchedulerSnapshot,
+                "arming should retain the complete scheduler state at the VCALL boundary");
+            t.Equals(
+                trace.triggerScheduler.currentTick,
+                runtime.currentEeTick().raw(),
+                "the trigger snapshot should use the canonical EE timeline");
+            t.Equals(
+                trace.triggerVsyncTick,
+                ps2_syscalls::GetCurrentVSyncTick(),
+                "the trigger snapshot should correlate the host VSync count");
             t.Equals(
                 trace.entries.size(), static_cast<size_t>(0u),
                 "arming on inactive VU0 should not fabricate a trace entry");
@@ -5520,6 +5674,10 @@ void register_ps2_runtime_expansion_tests()
                 t.Equals(
                     trace.entries.front().eePc, 0x00120000u,
                     "the first retained entry should follow the inactive trigger");
+                t.Equals(
+                    trace.entries.front().invocationInstruction,
+                    static_cast<uint64_t>(16u),
+                    "sync tracing should count VU instruction pairs without requiring instruction-state tracing");
             }
 
             ctx.advanceEeCycleTicks(40u);

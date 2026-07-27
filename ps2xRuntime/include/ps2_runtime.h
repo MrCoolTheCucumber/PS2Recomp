@@ -575,7 +575,9 @@ public:
     struct DebugEeEventTrace
     {
         bool enabled = false;
+        bool triggered = false;
         bool stopOnFull = false;
+        std::optional<uint32_t> triggerEePc;
         uint64_t totalEntries = 0u;
         uint64_t droppedEntries = 0u;
         std::vector<DebugEeEventEntry> entries;
@@ -614,6 +616,7 @@ public:
         uint64_t invocation = 0u;
         uint64_t invocationInstruction = 0u;
         uint64_t eeCycleTicks = 0u;
+        uint64_t vsyncTick = 0u;
         uint64_t vuCycleTicks = 0u;
         uint64_t nextEventCycleTicks = 0u;
         uint32_t eePc = 0u;
@@ -641,6 +644,9 @@ public:
         bool triggered = false;
         bool stopOnFull = false;
         std::optional<uint32_t> triggerEePc;
+        bool hasTriggerSchedulerSnapshot = false;
+        uint64_t triggerVsyncTick = 0u;
+        DebugEeScheduler triggerScheduler{};
         uint64_t totalEntries = 0u;
         uint64_t droppedEntries = 0u;
         std::vector<DebugVu0SyncEntry> entries;
@@ -842,6 +848,7 @@ public:
     DebugVu0InstructionTrace debugVu0InstructionTraceSnapshot(bool stop);
     void debugStartEeEventTrace(
         size_t maximumEntries,
+        std::optional<uint32_t> triggerEePc = std::nullopt,
         bool stopOnFull = false);
     DebugEeEventTrace debugEeEventTraceSnapshot(bool stop);
 
@@ -1153,6 +1160,9 @@ private:
     size_t m_debugVu0SyncTraceNext = 0u;
     uint64_t m_debugVu0SyncTraceTotal = 0u;
     bool m_debugVu0SyncTraceStopOnFull = false;
+    bool m_debugVu0SyncTraceHasTriggerSchedulerSnapshot = false;
+    uint64_t m_debugVu0SyncTraceTriggerVsyncTick = 0u;
+    DebugEeScheduler m_debugVu0SyncTraceTriggerScheduler{};
     std::atomic<bool> m_debugVu0InstructionTraceEnabled{false};
     std::atomic<bool> m_debugVu0InstructionTraceTriggered{false};
     std::atomic<bool> m_debugVu0InstructionTraceHasTrigger{false};
@@ -1164,6 +1174,9 @@ private:
     uint64_t m_debugVu0InstructionTraceTotal = 0u;
     bool m_debugVu0InstructionTraceStopOnFull = false;
     std::atomic<bool> m_debugEeEventTraceEnabled{false};
+    std::atomic<bool> m_debugEeEventTraceTriggered{false};
+    std::atomic<bool> m_debugEeEventTraceHasTrigger{false};
+    std::atomic<uint32_t> m_debugEeEventTraceTriggerEePc{0u};
     mutable std::mutex m_debugEeEventTraceMutex;
     std::vector<DebugEeEventEntry> m_debugEeEventTrace;
     size_t m_debugEeEventTraceCapacity = 0u;

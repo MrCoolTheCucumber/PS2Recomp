@@ -1010,6 +1010,147 @@ struct PS2DebugServer::Impl
             "status", runtime.debugIsPaused(), sample, assessment, allocator);
     }
 
+    Value eeEventDeviceStateValue(
+        const PS2Runtime::DebugEeEventDeviceState &state,
+        Allocator &allocator)
+    {
+        if (state.kind ==
+            PS2Runtime::DebugEeEventDeviceKind::None)
+        {
+            return Value(rapidjson::kNullType);
+        }
+
+        const char *kind = "unknown";
+        switch (state.kind)
+        {
+        case PS2Runtime::DebugEeEventDeviceKind::Vif1Dma:
+            kind = "vif1_dma";
+            break;
+        case PS2Runtime::DebugEeEventDeviceKind::Vu1:
+            kind = "vu1";
+            break;
+        case PS2Runtime::DebugEeEventDeviceKind::ScratchpadDma:
+            kind = "scratchpad_dma";
+            break;
+        case PS2Runtime::DebugEeEventDeviceKind::None:
+            break;
+        }
+
+        Value value(rapidjson::kObjectType);
+        addString(value, "kind", kind, allocator);
+        value.AddMember(
+            "operation_generation",
+            state.operationGeneration, allocator);
+        value.AddMember("active", state.active, allocator);
+        value.AddMember("phase", state.phase, allocator);
+        value.AddMember("stall", state.stall, allocator);
+        value.AddMember("tadr", state.tadr, allocator);
+        value.AddMember("madr", state.madr, allocator);
+        value.AddMember("qwc", state.qwc, allocator);
+        value.AddMember(
+            "tags_processed", state.tagsProcessed, allocator);
+        value.AddMember("pc", state.pc, allocator);
+        value.AddMember(
+            "last_advanced_tick",
+            state.lastAdvancedTick, allocator);
+        value.AddMember(
+            "total_advanced_cycles",
+            state.totalAdvancedCycles, allocator);
+        return value;
+    }
+
+    Value eeSchedulerStatisticsValue(
+        const ps2x::timing::EeEventSchedulerStatistics &statistics,
+        Allocator &allocator)
+    {
+        Value value(rapidjson::kObjectType);
+        value.AddMember("scheduled", statistics.scheduled, allocator);
+        value.AddMember("replaced", statistics.replaced, allocator);
+        value.AddMember("cancelled", statistics.cancelled, allocator);
+        value.AddMember("serviced", statistics.serviced, allocator);
+        value.AddMember("late", statistics.late, allocator);
+        value.AddMember(
+            "same_tick_reschedules",
+            statistics.sameTickReschedules, allocator);
+        value.AddMember(
+            "service_limit_hits",
+            statistics.serviceLimitHits, allocator);
+        return value;
+    }
+
+    Value eeSchedulerSlotsValue(
+        const PS2Runtime::DebugEeScheduler &scheduler,
+        Allocator &allocator)
+    {
+        Value slots(rapidjson::kArrayType);
+        for (const PS2Runtime::DebugEeEventSlot &slot :
+             scheduler.slots)
+        {
+            Value value(rapidjson::kObjectType);
+            addString(
+                value, "source",
+                ps2x::timing::eeEventSourceName(slot.source),
+                allocator);
+            value.AddMember("pending", slot.pending, allocator);
+            value.AddMember("generation", slot.generation, allocator);
+            value.AddMember("sequence", slot.sequence, allocator);
+            if (slot.pending)
+            {
+                value.AddMember(
+                    "deadline_tick", slot.deadlineTick, allocator);
+            }
+            else
+            {
+                value.AddMember(
+                    "deadline_tick",
+                    Value(rapidjson::kNullType), allocator);
+            }
+            value.AddMember(
+                "device",
+                eeEventDeviceStateValue(slot.device, allocator),
+                allocator);
+            slots.PushBack(value, allocator);
+        }
+        return slots;
+    }
+
+    Value eeSchedulerValue(
+        const PS2Runtime::DebugEeScheduler &scheduler,
+        Allocator &allocator)
+    {
+        Value value(rapidjson::kObjectType);
+        addString(
+            value, "mode",
+            ps2x::timing::eeSchedulingModeName(scheduler.mode),
+            allocator);
+        value.AddMember(
+            "current_tick", scheduler.currentTick, allocator);
+        if (scheduler.hasNextDeadline)
+        {
+            value.AddMember(
+                "next_deadline_tick",
+                scheduler.nextDeadlineTick, allocator);
+        }
+        else
+        {
+            value.AddMember(
+                "next_deadline_tick",
+                Value(rapidjson::kNullType), allocator);
+        }
+        value.AddMember(
+            "shadow_mismatch", scheduler.shadowMismatch, allocator);
+        value.AddMember(
+            "statistics",
+            eeSchedulerStatisticsValue(
+                scheduler.statistics, allocator),
+            allocator);
+        value.AddMember(
+            "slots",
+            eeSchedulerSlotsValue(scheduler, allocator),
+            allocator);
+        return value;
+    }
+
     Value eeRegisters(Allocator &allocator)
     {
         const R5900Context context = runtime.debugCpuSnapshot();
@@ -1029,6 +1170,9 @@ struct PS2DebugServer::Impl
         result.AddMember("cycles", timing.currentCycle, allocator);
         result.AddMember(
             "cycle_ticks", timing.currentTick, allocator);
+        result.AddMember(
+            "vsync_tick",
+            ps2_syscalls::GetCurrentVSyncTick(), allocator);
         result.AddMember(
             "local_block_cycle_ticks",
             timing.localBlockTicks, allocator);
@@ -1058,6 +1202,15 @@ struct PS2DebugServer::Impl
         result.AddMember(
             "scheduler_shadow_mismatch",
             scheduler.shadowMismatch, allocator);
+        result.AddMember(
+            "scheduler_statistics",
+            eeSchedulerStatisticsValue(
+                scheduler.statistics, allocator),
+            allocator);
+        result.AddMember(
+            "scheduler_slots",
+            eeSchedulerSlotsValue(scheduler, allocator),
+            allocator);
         result.AddMember("instructions", context.insn_count, allocator);
 
         Value categories(rapidjson::kArrayType);
@@ -1245,6 +1398,26 @@ struct PS2DebugServer::Impl
             result.AddMember(
                 "trigger_ee_pc", Value(rapidjson::kNullType), allocator);
         }
+        if (trace.hasTriggerSchedulerSnapshot)
+        {
+            result.AddMember(
+                "trigger_vsync_tick",
+                trace.triggerVsyncTick, allocator);
+            result.AddMember(
+                "trigger_scheduler",
+                eeSchedulerValue(
+                    trace.triggerScheduler, allocator),
+                allocator);
+        }
+        else
+        {
+            result.AddMember(
+                "trigger_vsync_tick",
+                Value(rapidjson::kNullType), allocator);
+            result.AddMember(
+                "trigger_scheduler",
+                Value(rapidjson::kNullType), allocator);
+        }
         result.AddMember("total_entries", trace.totalEntries, allocator);
         result.AddMember("dropped_entries", trace.droppedEntries, allocator);
         Value entries(rapidjson::kArrayType);
@@ -1257,6 +1430,7 @@ struct PS2DebugServer::Impl
                 "invocation_instruction",
                 source.invocationInstruction, allocator);
             entry.AddMember("ee_cycle_ticks", source.eeCycleTicks, allocator);
+            entry.AddMember("vsync_tick", source.vsyncTick, allocator);
             entry.AddMember("vu_cycle_ticks", source.vuCycleTicks, allocator);
             entry.AddMember(
                 "next_event_cycle_ticks",
@@ -1457,8 +1631,21 @@ struct PS2DebugServer::Impl
             runtime.debugEeEventTraceSnapshot(stop);
         Value result(rapidjson::kObjectType);
         result.AddMember("enabled", trace.enabled, allocator);
+        result.AddMember("triggered", trace.triggered, allocator);
         result.AddMember(
             "stop_on_full", trace.stopOnFull, allocator);
+        if (trace.triggerEePc.has_value())
+        {
+            addString(
+                result, "trigger_ee_pc",
+                addressString(*trace.triggerEePc), allocator);
+        }
+        else
+        {
+            result.AddMember(
+                "trigger_ee_pc",
+                Value(rapidjson::kNullType), allocator);
+        }
         result.AddMember(
             "total_entries", trace.totalEntries, allocator);
         result.AddMember(
@@ -1488,6 +1675,19 @@ struct PS2DebugServer::Impl
             entry.AddMember(
                 "lateness_ticks",
                 source.latenessTicks, allocator);
+            addString(
+                entry, "ee_pc",
+                addressString(source.eePc), allocator);
+            entry.AddMember(
+                "device_before",
+                eeEventDeviceStateValue(
+                    source.deviceBefore, allocator),
+                allocator);
+            entry.AddMember(
+                "device_after",
+                eeEventDeviceStateValue(
+                    source.deviceAfter, allocator),
+                allocator);
             entry.AddMember(
                 "rescheduled", source.rescheduled, allocator);
             if (source.hasFollowup)
@@ -1520,9 +1720,24 @@ struct PS2DebugServer::Impl
                 "maximum_entries must be between 1 and 16384");
         }
 
+        std::optional<uint32_t> triggerEePc;
         bool stopOnFull = false;
         if (params)
         {
+            const auto trigger =
+                params->FindMember("trigger_ee_pc");
+            if (trigger != params->MemberEnd())
+            {
+                if (!trigger->value.IsString())
+                {
+                    throw RequestError(
+                        -32602,
+                        "trigger_ee_pc must be an address string");
+                }
+                triggerEePc = parseAddress(std::string_view(
+                    trigger->value.GetString(),
+                    trigger->value.GetStringLength()));
+            }
             const auto stop =
                 params->FindMember("stop_on_full");
             if (stop != params->MemberEnd())
@@ -1538,7 +1753,7 @@ struct PS2DebugServer::Impl
         }
         runtime.debugStartEeEventTrace(
             static_cast<size_t>(maximumEntries),
-            stopOnFull);
+            triggerEePc, stopOnFull);
         return eeEventTraceValue(false, allocator);
     }
 
