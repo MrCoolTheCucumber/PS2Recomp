@@ -121,6 +121,8 @@ namespace
     constexpr uint32_t kElfSectionExecInstr = 0x4u;
     constexpr uint32_t kVu0SyncThresholdCycles = 4u;
     constexpr uint32_t kVu0MinimumRunCycles = 16u;
+    constexpr uint32_t kVu0VifFinishStartupCycles = 16u;
+    constexpr uint32_t kVu0VifFinishFollowupCycles = 128u;
     // PCSX2 starts non-interlocked VU work in a minimum 16-cycle batch and
     // revisits an active VU1 from VIF_VU1_FINISH after 128 cycles. Event mode
     // places that startup batch at a future EE boundary so submission itself
@@ -904,6 +906,18 @@ PS2Runtime::PS2Runtime()
         {
             cancelVif1DmaEvent();
         });
+    m_memory.setVif0DmaScheduleCallback(
+        [this](uint32_t delayEeCycles)
+        {
+            return scheduleVif0DmaFromMemory(
+                delayEeCycles);
+        });
+    m_memory.setVif0DmaCancelCallback(
+        [this]()
+        {
+            cancelVif0DmaEvent();
+            cancelVif0VuFinishEvent();
+        });
     m_memory.setScratchpadDmaScheduleCallback(
         [this](
             DmacChannel channel,
@@ -1561,6 +1575,14 @@ ps2x::timing::EeTick PS2Runtime::finishEeContextBlock(
 void PS2Runtime::resetEeTimingUnlocked(
     R5900Context *context) noexcept
 {
+    cancelVif0DmaEvent();
+    cancelVif0VuFinishEvent();
+    if (m_memory.vif0DmaSnapshot().active)
+    {
+        (void)m_memory.cancelDmacTransfer(
+            DmacChannel::Vif0);
+    }
+    m_memory.cancelVIF0VuWait();
     cancelVif1DmaEvent();
     if (m_memory.vif1DmaSnapshot().active)
     {
@@ -1636,6 +1658,14 @@ void PS2Runtime::setEeSchedulingMode(
         return;
     }
 
+    cancelVif0DmaEvent();
+    cancelVif0VuFinishEvent();
+    if (m_memory.vif0DmaSnapshot().active)
+    {
+        (void)m_memory.cancelDmacTransfer(
+            DmacChannel::Vif0);
+    }
+    m_memory.cancelVIF0VuWait();
     cancelVif1DmaEvent();
     if (m_memory.vif1DmaSnapshot().active)
     {
@@ -1823,6 +1853,28 @@ bool PS2Runtime::syncCoreSubsystems()
             return m_gifArbiter.canAcceptPath2(
                 directHl);
         });
+    m_memory.setVu0MscalCallback(
+        [this](uint32_t startPC, uint32_t itop)
+        {
+            startVU0FromVif(startPC, itop);
+        });
+    m_memory.setVu0MscntCallback(
+        [this](uint32_t itop)
+        {
+            resumeVU0FromVif(itop);
+        });
+    m_memory.setVu0BusyCallback(
+        [this]()
+        {
+            return m_eeSchedulingMode ==
+                       ps2x::timing::EeSchedulingMode::Event &&
+                   m_vu0.isActive();
+        });
+    m_memory.setVif0ResetCallback(
+        [this]()
+        {
+            cancelVif0VuFinishEvent();
+        });
     m_memory.setVu1MscalCallback(
         [this](uint32_t startPC, uint32_t top, uint32_t itop)
         {
@@ -1880,6 +1932,343 @@ void PS2Runtime::setVU1BusyFlag(
         context != m_boundEeContext)
     {
         update(context);
+    }
+}
+
+void PS2Runtime::startVU0FromVif(
+    uint32_t startPC, uint32_t itop)
+{
+    R5900Context *const context =
+        m_boundEeContext
+            ? m_boundEeContext
+            : &m_cpuContext;
+    const ps2x::timing::EeTick startTick =
+        commitEeContextProgress(context);
+    uint8_t *const vu0Code = m_memory.getVU0Code();
+    uint8_t *const vu0Data = m_memory.getVU0Data();
+    if (!vu0Code || !vu0Data ||
+        startPC + 8u > PS2_VU0_CODE_SIZE)
+    {
+        seedVu0IdleSuccess(context);
+        m_vu0.reset();
+        m_vu0CycleTick = startTick;
+        cancelVu0CompatibilityEvent();
+        return;
+    }
+
+    m_vu0.reset();
+    copyVu0ContextToState(context, m_vu0.state());
+    beginVu0Invocation();
+    const uint32_t cycleBudget =
+        m_eeSchedulingMode ==
+                ps2x::timing::EeSchedulingMode::Event
+            ? kVu0MinimumRunCycles
+            : kVu1MaximumAdvanceCycles;
+    m_vu0.execute(
+        vu0Code, PS2_VU0_CODE_SIZE,
+        vu0Data, PS2_VU0_DATA_SIZE,
+        m_gs, &m_memory, startPC, 0u, itop,
+        cycleBudget);
+    copyVu0StateToContext(m_vu0.state(), context);
+    context->vu0_vpu_stat =
+        (context->vu0_vpu_stat & ~1u) |
+        (m_vu0.isActive() ? 1u : 0u);
+    m_vu0CycleTick = startTick;
+    if (m_vu0.isActive() &&
+        m_eeSchedulingMode ==
+            ps2x::timing::EeSchedulingMode::Event)
+    {
+        m_vu0CycleTick =
+            ps2x::timing::saturatingAdd(
+                startTick,
+                ps2x::timing::vuCyclesToEeTicks(
+                    kVu0MinimumRunCycles));
+    }
+    if (m_vu0.isActive() &&
+        m_eeSchedulingMode !=
+            ps2x::timing::EeSchedulingMode::Event)
+    {
+        scheduleVu0CompatibilityEvent(
+            ps2x::timing::saturatingAdd(
+                startTick,
+                ps2x::timing::eeCyclesToTicks(
+                    kVu0InitialEventDelayCycles)));
+    }
+    else
+    {
+        cancelVu0CompatibilityEvent();
+    }
+}
+
+void PS2Runtime::resumeVU0FromVif(uint32_t itop)
+{
+    R5900Context *const context =
+        m_boundEeContext
+            ? m_boundEeContext
+            : &m_cpuContext;
+    const ps2x::timing::EeTick startTick =
+        commitEeContextProgress(context);
+    uint8_t *const vu0Code = m_memory.getVU0Code();
+    uint8_t *const vu0Data = m_memory.getVU0Data();
+    if (!vu0Code || !vu0Data)
+    {
+        seedVu0IdleSuccess(context);
+        m_vu0.reset();
+        m_vu0CycleTick = startTick;
+        cancelVu0CompatibilityEvent();
+        return;
+    }
+
+    copyVu0ContextRegistersToState(
+        context, m_vu0.state());
+    if (m_eeSchedulingMode ==
+        ps2x::timing::EeSchedulingMode::Event)
+    {
+        m_vu0.resumeState(0u, itop, &m_memory);
+        (void)m_vu0.advance(
+            vu0Code, PS2_VU0_CODE_SIZE,
+            vu0Data, PS2_VU0_DATA_SIZE,
+            m_gs, &m_memory, kVu0MinimumRunCycles);
+    }
+    else
+    {
+        m_vu0.resume(
+            vu0Code, PS2_VU0_CODE_SIZE,
+            vu0Data, PS2_VU0_DATA_SIZE,
+            m_gs, &m_memory, 0u, itop,
+            kVu1MaximumAdvanceCycles);
+    }
+    copyVu0StateToContext(m_vu0.state(), context);
+    context->vu0_vpu_stat =
+        (context->vu0_vpu_stat & ~1u) |
+        (m_vu0.isActive() ? 1u : 0u);
+    m_vu0CycleTick = startTick;
+    if (m_vu0.isActive() &&
+        m_eeSchedulingMode ==
+            ps2x::timing::EeSchedulingMode::Event)
+    {
+        m_vu0CycleTick =
+            ps2x::timing::saturatingAdd(
+                startTick,
+                ps2x::timing::vuCyclesToEeTicks(
+                    kVu0MinimumRunCycles));
+    }
+    if (m_vu0.isActive() &&
+        m_eeSchedulingMode !=
+            ps2x::timing::EeSchedulingMode::Event)
+    {
+        scheduleVu0CompatibilityEvent(
+            ps2x::timing::saturatingAdd(
+                startTick,
+                ps2x::timing::eeCyclesToTicks(
+                    kVu0InitialEventDelayCycles)));
+    }
+    else
+    {
+        cancelVu0CompatibilityEvent();
+    }
+}
+
+void PS2Runtime::scheduleVif0VuFinishEvent(
+    ps2x::timing::EeTick deadline) noexcept
+{
+    m_vif0VuFinishEventToken =
+        m_eeEventScheduler.scheduleAbsolute(
+            ps2x::timing::EeEventSource::
+                VifVu0Finish,
+            deadline);
+}
+
+void PS2Runtime::cancelVif0VuFinishEvent() noexcept
+{
+    if (m_vif0VuFinishEventToken.generation != 0u)
+    {
+        (void)m_eeEventScheduler.cancel(
+            m_vif0VuFinishEventToken);
+    }
+    m_vif0VuFinishEventToken = {
+        ps2x::timing::EeEventSource::VifVu0Finish,
+        0u};
+}
+
+bool PS2Runtime::scheduleVif0DmaFromMemory(
+    uint32_t delayEeCycles)
+{
+    if (m_eeSchedulingMode !=
+        ps2x::timing::EeSchedulingMode::Event)
+    {
+        return false;
+    }
+
+    const ps2x::timing::EeTick now =
+        commitEeContextProgress(m_boundEeContext);
+    scheduleVif0DmaEvent(
+        ps2x::timing::saturatingAdd(
+            now,
+            ps2x::timing::eeCyclesToTicks(
+                delayEeCycles)));
+    return m_vif0DmaEventToken.generation != 0u;
+}
+
+void PS2Runtime::scheduleVif0DmaEvent(
+    ps2x::timing::EeTick deadline) noexcept
+{
+    m_vif0DmaEventToken =
+        m_eeEventScheduler.scheduleAbsolute(
+            ps2x::timing::EeEventSource::DmacVif0,
+            deadline);
+}
+
+void PS2Runtime::cancelVif0DmaEvent() noexcept
+{
+    if (m_vif0DmaEventToken.generation != 0u)
+    {
+        (void)m_eeEventScheduler.cancel(
+            m_vif0DmaEventToken);
+    }
+    m_vif0DmaEventToken = {
+        ps2x::timing::EeEventSource::DmacVif0,
+        0u};
+}
+
+void PS2Runtime::scheduleVif0DmaFollowup(
+    ps2x::timing::EeTick serviceTick,
+    uint32_t delayEeCycles,
+    bool allowImmediateRescan) noexcept
+{
+    const uint32_t effectiveDelay =
+        allowImmediateRescan && delayEeCycles < 4u
+            ? 0u
+            : delayEeCycles;
+    scheduleVif0DmaEvent(
+        ps2x::timing::saturatingAdd(
+            serviceTick,
+            ps2x::timing::eeCyclesToTicks(
+                effectiveDelay)));
+}
+
+void PS2Runtime::serviceVif0DmaAtEvent(
+    const ps2x::timing::EeEventService &service)
+{
+    if (m_vif0DmaEventToken.generation == 0u ||
+        service.generation !=
+            m_vif0DmaEventToken.generation)
+    {
+        return;
+    }
+
+    m_vif0DmaEventToken = {
+        ps2x::timing::EeEventSource::DmacVif0,
+        0u};
+    const Vif0DmaAdvanceResult advance =
+        m_memory.advanceVif0Dma();
+    if (!advance.active || advance.completed)
+        return;
+
+    if (advance.progressed)
+    {
+        scheduleVif0DmaFollowup(
+            service.serviceTick,
+            advance.delayEeCycles, true);
+        return;
+    }
+
+    if (advance.stall ==
+        Vif0DmaStallReason::WaitingForVu)
+    {
+        scheduleVif0VuFinishEvent(
+            ps2x::timing::saturatingAdd(
+                service.serviceTick,
+                ps2x::timing::eeCyclesToTicks(
+                    kVu0VifFinishStartupCycles)));
+        return;
+    }
+
+    if (advance.stall ==
+        Vif0DmaStallReason::None)
+    {
+        scheduleVif0DmaFollowup(
+            service.serviceTick,
+            advance.delayEeCycles, true);
+    }
+}
+
+void PS2Runtime::serviceVU0AtVifFinishEvent(
+    uint8_t *rdram,
+    R5900Context *ctx,
+    const ps2x::timing::EeEventService &service)
+{
+    if (m_vif0VuFinishEventToken.generation == 0u ||
+        service.generation !=
+            m_vif0VuFinishEventToken.generation)
+    {
+        return;
+    }
+    m_vif0VuFinishEventToken = {
+        ps2x::timing::EeEventSource::VifVu0Finish,
+        0u};
+
+    R5900Context *const context =
+        ctx ? ctx
+            : (m_boundEeContext
+                   ? m_boundEeContext
+                   : &m_cpuContext);
+    if (m_vu0.isActive())
+    {
+        ps2x::timing::EeTick nextEventTick{};
+        const auto nextDeadline =
+            m_eeEventScheduler.nextDeadline();
+        if (nextDeadline.has_value())
+            nextEventTick = *nextDeadline;
+        synchronizeVU0MicroprogramAtTick(
+            rdram, context, false, false, true,
+            service.serviceTick, nextEventTick);
+    }
+
+    if (m_vu0.isActive())
+    {
+        scheduleVif0VuFinishEvent(
+            ps2x::timing::saturatingAdd(
+                service.serviceTick,
+                ps2x::timing::vuCyclesToEeTicks(
+                    kVu0VifFinishFollowupCycles)));
+        return;
+    }
+
+    context->vu0_vpu_stat &= ~1u;
+    if (!m_memory.resumeVIF0AfterVu())
+        return;
+
+    const Vif0DmaAdvanceResult advance =
+        m_memory.advanceVif0Dma();
+    if (!advance.active || advance.completed)
+        return;
+    if (advance.progressed)
+    {
+        // PCSX2 resumes VIF directly from VIF_VU0_FINISH. The resulting
+        // sub-four-cycle DMA tail is a real later callback, not an active
+        // DMAC interrupt-scan rescan.
+        scheduleVif0DmaFollowup(
+            service.serviceTick,
+            advance.delayEeCycles, false);
+        return;
+    }
+    if (advance.stall ==
+        Vif0DmaStallReason::WaitingForVu)
+    {
+        scheduleVif0VuFinishEvent(
+            ps2x::timing::saturatingAdd(
+                service.serviceTick,
+                ps2x::timing::eeCyclesToTicks(
+                    kVu0VifFinishStartupCycles)));
+        return;
+    }
+    if (advance.stall ==
+        Vif0DmaStallReason::None)
+    {
+        scheduleVif0DmaFollowup(
+            service.serviceTick,
+            advance.delayEeCycles, false);
     }
 }
 
@@ -3554,6 +3943,9 @@ void PS2Runtime::dispatchEeEvent(
     case ps2x::timing::EeEventSource::DmacVif1:
         serviceVif1DmaAtEvent(service);
         return;
+    case ps2x::timing::EeEventSource::DmacVif0:
+        serviceVif0DmaAtEvent(service);
+        return;
     case ps2x::timing::EeEventSource::
         DmacFromScratchpad:
         serviceScratchpadDmaAtEvent(
@@ -3566,6 +3958,10 @@ void PS2Runtime::dispatchEeEvent(
         return;
     case ps2x::timing::EeEventSource::VifVu1Finish:
         serviceVU1AtEvent(ctx, service);
+        return;
+    case ps2x::timing::EeEventSource::VifVu0Finish:
+        serviceVU0AtVifFinishEvent(
+            rdram, ctx, service);
         return;
     case ps2x::timing::EeEventSource::Count:
         return;
@@ -3701,6 +4097,24 @@ PS2Runtime::debugEeEventDeviceState(
         result.active = state.active;
         return result;
     }
+    case ps2x::timing::EeEventSource::DmacVif0:
+    {
+        const Vif0DmaSnapshot state =
+            m_memory.vif0DmaSnapshot();
+        result.kind = DebugEeEventDeviceKind::Vif0Dma;
+        result.operationGeneration =
+            state.transfer.generation;
+        result.phase =
+            static_cast<uint32_t>(state.phase);
+        result.stall =
+            static_cast<uint32_t>(state.stall);
+        result.tadr = state.tadr;
+        result.madr = state.madr;
+        result.qwc = state.qwc;
+        result.tagsProcessed = state.tagsProcessed;
+        result.active = state.active;
+        return result;
+    }
     case ps2x::timing::EeEventSource::
         DmacFromScratchpad:
     case ps2x::timing::EeEventSource::
@@ -3737,6 +4151,13 @@ PS2Runtime::debugEeEventDeviceState(
             m_vu1ExecutionTiming.totalAdvancedCycles;
         result.pc = m_vu1.state().pc;
         result.active = m_vu1.isActive();
+        return result;
+    case ps2x::timing::EeEventSource::VifVu0Finish:
+        result.kind = DebugEeEventDeviceKind::Vu0;
+        result.lastAdvancedTick =
+            m_vu0CycleTick.raw();
+        result.pc = m_vu0.state().pc;
+        result.active = m_vu0.isActive();
         return result;
     case ps2x::timing::EeEventSource::DmacCompletion:
     case ps2x::timing::EeEventSource::

@@ -391,6 +391,61 @@ struct DmacChannelSnapshot
     uint64_t generation = 0u;
 };
 
+enum class Vif0DmaPhase : uint8_t
+{
+    Idle = 0u,
+    FetchTag,
+    TransferPayload,
+    Finalize,
+    Fault,
+};
+
+enum class Vif0DmaStallReason : uint8_t
+{
+    None = 0u,
+    WaitingForVu,
+    VifStop,
+    VifInterrupt,
+    ForceBreak,
+    DmacDisabled,
+    Fault,
+};
+
+struct Vif0DmaAdvanceResult
+{
+    DmacTransferToken transfer{};
+    Vif0DmaPhase phase = Vif0DmaPhase::Idle;
+    Vif0DmaStallReason stall = Vif0DmaStallReason::None;
+    uint32_t delayEeCycles = 0u;
+    uint32_t acceptedBytes = 0u;
+    bool progressed = false;
+    bool completed = false;
+    bool active = false;
+};
+
+struct Vif0DmaSnapshot
+{
+    DmacTransferToken transfer{};
+    Vif0DmaPhase phase = Vif0DmaPhase::Idle;
+    Vif0DmaStallReason stall = Vif0DmaStallReason::None;
+    uint32_t madr = 0u;
+    uint32_t qwc = 0u;
+    uint32_t tadr = 0u;
+    uint32_t asr0 = 0u;
+    uint32_t asr1 = 0u;
+    uint32_t parserBytes = 0u;
+    uint32_t bufferedPayloadBytes = 0u;
+    uint32_t payloadByteOffset = 0u;
+    uint32_t tagsProcessed = 0u;
+    uint8_t asp = 0u;
+    uint8_t tagId = 0u;
+    bool active = false;
+    bool eventManaged = false;
+    bool chainMode = false;
+    bool tagIrq = false;
+    bool endAfterPayload = false;
+};
+
 enum class Vif1DmaPhase : uint8_t
 {
     Idle = 0u,
@@ -552,6 +607,40 @@ public:
     void setGifPacketCallback(GifPacketCallback cb) { m_gifPacketCallback = std::move(cb); }
     void setGifArbiter(GifArbiter *arbiter) { m_gifArbiter = arbiter; }
 
+    using Vu0MscalCallback =
+        std::function<void(uint32_t startPC, uint32_t itop)>;
+    void setVu0MscalCallback(Vu0MscalCallback cb)
+    {
+        m_vu0MscalCallback = std::move(cb);
+    }
+    using Vu0MscntCallback = std::function<void(uint32_t itop)>;
+    void setVu0MscntCallback(Vu0MscntCallback cb)
+    {
+        m_vu0MscntCallback = std::move(cb);
+    }
+    using Vu0BusyCallback = std::function<bool()>;
+    void setVu0BusyCallback(Vu0BusyCallback cb)
+    {
+        m_vu0BusyCallback = std::move(cb);
+    }
+    using Vif0ResetCallback = std::function<void()>;
+    void setVif0ResetCallback(Vif0ResetCallback cb)
+    {
+        m_vif0ResetCallback = std::move(cb);
+    }
+    using Vif0DmaScheduleCallback =
+        std::function<bool(uint32_t delayEeCycles)>;
+    void setVif0DmaScheduleCallback(
+        Vif0DmaScheduleCallback cb)
+    {
+        m_vif0DmaScheduleCallback = std::move(cb);
+    }
+    using Vif0DmaCancelCallback = std::function<void()>;
+    void setVif0DmaCancelCallback(Vif0DmaCancelCallback cb)
+    {
+        m_vif0DmaCancelCallback = std::move(cb);
+    }
+
     using Vu1MscalCallback = std::function<void(uint32_t startPC, uint32_t top, uint32_t itop)>;
     void setVu1MscalCallback(Vu1MscalCallback cb) { m_vu1MscalCallback = std::move(cb); }
     using Vu1MscntCallback = std::function<void(uint32_t top, uint32_t itop)>;
@@ -597,6 +686,14 @@ public:
     {
         m_vif1GifPathAvailableCallback = std::move(cb);
     }
+
+    [[nodiscard]] bool vif0WaitingForVu() const { return m_vif0WaitingForVu; }
+    [[nodiscard]] size_t vif0DeferredByteCount() const { return m_vif0DeferredData.size(); }
+    bool resumeVIF0AfterVu();
+    void cancelVIF0VuWait();
+    bool wakeVif0Dma();
+    Vif0DmaAdvanceResult advanceVif0Dma();
+    [[nodiscard]] Vif0DmaSnapshot vif0DmaSnapshot() const;
 
     [[nodiscard]] bool vif1WaitingForVu() const { return m_vif1WaitingForVu; }
     [[nodiscard]] size_t vif1DeferredByteCount() const { return m_vif1DeferredData.size(); }
@@ -721,6 +818,12 @@ public:
 
     GifPacketCallback m_gifPacketCallback;
     GifArbiter *m_gifArbiter = nullptr;
+    Vu0MscalCallback m_vu0MscalCallback;
+    Vu0MscntCallback m_vu0MscntCallback;
+    Vu0BusyCallback m_vu0BusyCallback;
+    Vif0ResetCallback m_vif0ResetCallback;
+    Vif0DmaScheduleCallback m_vif0DmaScheduleCallback;
+    Vif0DmaCancelCallback m_vif0DmaCancelCallback;
     Vu1MscalCallback m_vu1MscalCallback;
     Vu1MscntCallback m_vu1MscntCallback;
     Vu1BusyCallback m_vu1BusyCallback;
@@ -739,6 +842,8 @@ public:
     uint8_t *m_vu1Code = nullptr;
     uint8_t *m_vu1Data = nullptr;
     bool m_path3Masked = false;
+    bool m_vif0WaitingForVu = false;
+    std::vector<uint8_t> m_vif0DeferredData;
     uint32_t m_vif1PendingPath2DirectQwc = 0u;
     bool m_vif1PendingPath2DirectHl = false;
     bool m_vif1PendingIrqAfterCommand = false;
@@ -755,9 +860,8 @@ public:
         std::vector<uint8_t> chainData;
     };
     std::vector<PendingTransfer> m_pendingGifTransfers;
-    std::vector<PendingTransfer> m_pendingVif0Transfers;
 
-    struct Vif1DmaChainKey
+    struct DmacSourceChainKey
     {
         uint32_t tadr = 0u;
         uint32_t asr0 = 0u;
@@ -765,14 +869,14 @@ public:
         uint8_t asp = 0u;
 
         friend bool operator==(
-            const Vif1DmaChainKey &,
-            const Vif1DmaChainKey &) = default;
+            const DmacSourceChainKey &,
+            const DmacSourceChainKey &) = default;
     };
 
-    struct Vif1DmaChainKeyHash
+    struct DmacSourceChainKeyHash
     {
         size_t operator()(
-            const Vif1DmaChainKey &key) const noexcept
+            const DmacSourceChainKey &key) const noexcept
         {
             size_t hash = static_cast<size_t>(key.tadr);
             hash ^= static_cast<size_t>(key.asr0) +
@@ -787,6 +891,37 @@ public:
             return hash;
         }
     };
+
+    struct Vif0DmaState
+    {
+        DmacTransferToken transfer{};
+        Vif0DmaPhase phase = Vif0DmaPhase::Idle;
+        Vif0DmaStallReason stall =
+            Vif0DmaStallReason::None;
+        uint32_t madr = 0u;
+        uint32_t qwc = 0u;
+        uint32_t tadr = 0u;
+        uint32_t asr0 = 0u;
+        uint32_t asr1 = 0u;
+        uint32_t bufferedPayloadBytes = 0u;
+        uint32_t payloadByteOffset = 0u;
+        uint32_t tagsProcessed = 0u;
+        uint8_t asp = 0u;
+        uint8_t tagId = 0u;
+        bool active = false;
+        bool eventManaged = false;
+        bool chainMode = false;
+        bool tie = false;
+        bool tte = false;
+        bool tagIrq = false;
+        bool endAfterPayload = false;
+        bool faultReported = false;
+        std::unordered_set<
+            DmacSourceChainKey,
+            DmacSourceChainKeyHash>
+            visitedStates;
+    };
+    Vif0DmaState m_vif0Dma{};
 
     struct Vif1DmaState
     {
@@ -811,8 +946,8 @@ public:
         bool endAfterPayload = false;
         bool faultReported = false;
         std::unordered_set<
-            Vif1DmaChainKey,
-            Vif1DmaChainKeyHash>
+            DmacSourceChainKey,
+            DmacSourceChainKeyHash>
             visitedStates;
     };
     Vif1DmaState m_vif1Dma{};
@@ -899,6 +1034,31 @@ public:
     void publishScratchpadDmaRegisters(
         const ScratchpadDmaState &state);
     void discardPendingDmacWork(DmacChannel channel);
+    bool startVif0Dma(
+        DmacTransferToken transfer, uint32_t chcr);
+    void clearVif0DmaState(bool notifyRuntime);
+    bool scheduleVif0Dma(uint32_t delayEeCycles);
+    void drainVif0DmaCompatibility();
+    void updateVif0Fqc(uint32_t qwc);
+    [[nodiscard]] Vif0DmaStallReason
+    currentVif0DmaStall() const;
+    enum class Vif0ParserDisposition : uint8_t
+    {
+        Drained = 0u,
+        NeedMoreData,
+        WaitingForVu,
+        VifInterrupt,
+    };
+    struct Vif0ParserResult
+    {
+        Vif0ParserDisposition disposition =
+            Vif0ParserDisposition::Drained;
+        uint32_t consumedBytes = 0u;
+    };
+    Vif0ParserResult processVif0Stream();
+    void appendVif0Stream(
+        const uint8_t *data, uint32_t sizeBytes);
+    void publishVif0DmaRegisters();
     bool startVif1Dma(
         DmacTransferToken transfer, uint32_t chcr);
     void clearVif1DmaState(bool notifyRuntime);

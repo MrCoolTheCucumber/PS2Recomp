@@ -3784,6 +3784,211 @@ void register_ps2_runtime_expansion_tests()
             }
         });
 
+        tc.Run("event VIF0 source chain reproduces the reference VU-finish handoff", [](TestCase &t)
+        {
+            PS2Runtime runtime;
+            t.IsTrue(runtime.memory().initialize(),
+                     "VIF0 reference memory should initialize");
+            t.IsTrue(runtime.syncCoreSubsystems(),
+                     "VIF0 reference subsystems should bind");
+            runtime.setEeSchedulingMode(
+                ps2x::timing::EeSchedulingMode::Event);
+
+            constexpr uint32_t kVif0 = 0x10008000u;
+            constexpr uint32_t kDstat = 0x1000E010u;
+            constexpr uint32_t kTag = 0x00035C00u;
+            constexpr uint32_t kVuUpperNop = 0x000002FFu;
+            constexpr uint32_t kVuUpperEnd = 0x400002FFu;
+            uint8_t *const rdram =
+                runtime.memory().getRDRAM();
+            std::memset(rdram + kTag, 0, 16u + 22u * 16u);
+            const uint64_t end =
+                makeDmaTag(22u, 7u, 0u);
+            std::memcpy(rdram + kTag, &end, sizeof(end));
+
+            std::array<uint32_t, 88u> payload{};
+            payload[0] = makeVifCmd(0x4Au, 42u, 0u);
+            for (uint32_t pair = 0u; pair < 42u; ++pair)
+            {
+                payload[1u + pair * 2u] = 0u;
+                payload[2u + pair * 2u] =
+                    pair == 40u
+                        ? kVuUpperEnd
+                        : kVuUpperNop;
+            }
+            payload[85] = makeVifCmd(0x14u, 0u, 0u);
+            payload[86] = makeVifCmd(0x10u, 0u, 0u);
+            payload[87] = 0u;
+            std::memcpy(rdram + kTag + 16u,
+                        payload.data(), sizeof(payload));
+
+            runtime.debugStartEeEventTrace(12u);
+            t.IsTrue(runtime.memory().writeIORegister(
+                         kVif0 + 0x30u, kTag),
+                     "VIF0 reference TADR write should succeed");
+            t.IsTrue(runtime.memory().writeIORegister(
+                         kVif0, 0x145u),
+                     "VIF0 reference chain should start");
+
+            PS2Runtime::DebugEeScheduler scheduler =
+                runtime.debugEeSchedulerSnapshot();
+            auto dmacSlot =
+                scheduler.slots[ps2x::timing::
+                    eeEventSourceIndex(
+                        ps2x::timing::EeEventSource::
+                            DmacVif0)];
+            t.IsTrue(dmacSlot.pending,
+                     "submission should schedule DMAC_VIF0");
+            t.Equals(dmacSlot.deadlineTick, 32ull,
+                     "submission should retain the four-cycle delay");
+
+            R5900Context &context = runtime.cpu();
+            context.advanceEeCycleTicks(32u);
+            runtime.serviceEeEventsAtBlockBoundary(
+                rdram, &context);
+
+            Vif0DmaSnapshot dma =
+                runtime.memory().vif0DmaSnapshot();
+            t.IsTrue(
+                dma.active &&
+                    dma.stall ==
+                        Vif0DmaStallReason::WaitingForVu,
+                "same-tick tag and payload services should reach FLUSHE");
+            t.Equals(dma.qwc, 1u,
+                     "payload prefix should retain one QWC");
+            t.Equals(dma.payloadByteOffset, 8u,
+                     "payload prefix should retain two words");
+            t.Equals(dma.bufferedPayloadBytes, 8u,
+                     "FLUSHE and NOP should remain copied");
+            t.IsTrue(runtime.vu0().isActive(),
+                     "MSCAL should leave the 42-pair VU0 program active");
+            scheduler = runtime.debugEeSchedulerSnapshot();
+            dmacSlot =
+                scheduler.slots[ps2x::timing::
+                    eeEventSourceIndex(
+                        ps2x::timing::EeEventSource::
+                            DmacVif0)];
+            t.IsTrue(dmacSlot.pending,
+                     "the consumed prefix should retain DMAC ownership");
+            t.Equals(dmacSlot.deadlineTick, 376ull,
+                     "43 payload cycles should end at tick 376");
+            t.IsFalse(
+                scheduler.slots[ps2x::timing::
+                    eeEventSourceIndex(
+                        ps2x::timing::EeEventSource::
+                            VifVu0Finish)]
+                    .pending,
+                "VU finish must wait for the accounted payload event");
+
+            context.advanceEeCycleTicks(344u);
+            runtime.serviceEeEventsAtBlockBoundary(
+                rdram, &context);
+            scheduler = runtime.debugEeSchedulerSnapshot();
+            t.IsFalse(
+                scheduler.slots[ps2x::timing::
+                    eeEventSourceIndex(
+                        ps2x::timing::EeEventSource::
+                            DmacVif0)]
+                    .pending,
+                "the handoff callback should remove DMAC_VIF0");
+            const auto &finishSlot =
+                scheduler.slots[ps2x::timing::
+                    eeEventSourceIndex(
+                        ps2x::timing::EeEventSource::
+                            VifVu0Finish)];
+            t.IsTrue(finishSlot.pending,
+                     "the handoff should schedule VIF_VU0_FINISH");
+            t.Equals(finishSlot.deadlineTick, 504ull,
+                     "VU finish should be sixteen cycles after handoff");
+            t.IsFalse(runtime.vu0().isActive(),
+                      "ordinary shared-event catch-up should finish 42 pairs");
+
+            context.advanceEeCycleTicks(128u);
+            runtime.serviceEeEventsAtBlockBoundary(
+                rdram, &context);
+            dma = runtime.memory().vif0DmaSnapshot();
+            t.IsFalse(runtime.memory().vif0WaitingForVu(),
+                      "VU finish should clear VEW");
+            t.IsTrue(
+                dma.phase == Vif0DmaPhase::Finalize,
+                "finish wake should consume the retained tail");
+            t.Equals(dma.qwc, 0u,
+                     "finish wake should consume the final QWC");
+            scheduler = runtime.debugEeSchedulerSnapshot();
+            dmacSlot =
+                scheduler.slots[ps2x::timing::
+                    eeEventSourceIndex(
+                        ps2x::timing::EeEventSource::
+                            DmacVif0)];
+            t.IsTrue(dmacSlot.pending,
+                     "finish wake should schedule final DMAC service");
+            t.Equals(dmacSlot.deadlineTick, 520ull,
+                     "the resumed two-cycle tail must remain a later event");
+            t.IsTrue(
+                (runtime.memory().readIORegister(kVif0) &
+                 0x100u) != 0u,
+                "finish wake should not publish completion");
+
+            context.advanceEeCycleTicks(16u);
+            runtime.serviceEeEventsAtBlockBoundary(
+                rdram, &context);
+            t.IsFalse(runtime.memory().vif0DmaSnapshot().active,
+                      "final DMAC service should retire the descriptor");
+            t.IsTrue(
+                (runtime.memory().readIORegister(kVif0) &
+                 0x100u) == 0u,
+                "same-boundary typed publication should clear STR");
+            t.IsTrue(
+                (runtime.memory().readIORegister(kDstat) &
+                 0x1u) != 0u,
+                "typed publication should latch channel-zero D_STAT");
+
+            const PS2Runtime::DebugEeEventTrace trace =
+                runtime.debugEeEventTraceSnapshot(true);
+            t.Equals(trace.entries.size(),
+                     static_cast<size_t>(6u),
+                     "reference chain should retain six scheduled services");
+            if (trace.entries.size() == 6u)
+            {
+                const std::array<
+                    ps2x::timing::EeEventSource, 6u>
+                    expectedSources = {
+                        ps2x::timing::EeEventSource::DmacVif0,
+                        ps2x::timing::EeEventSource::DmacVif0,
+                        ps2x::timing::EeEventSource::DmacVif0,
+                        ps2x::timing::EeEventSource::VifVu0Finish,
+                        ps2x::timing::EeEventSource::DmacVif0,
+                        ps2x::timing::EeEventSource::DmacCompletion,
+                    };
+                const std::array<uint64_t, 6u> expectedTicks = {
+                    32ull, 32ull, 376ull,
+                    504ull, 520ull, 520ull,
+                };
+                for (size_t index = 0u;
+                     index < trace.entries.size(); ++index)
+                {
+                    t.IsTrue(
+                        trace.entries[index].source ==
+                            expectedSources[index],
+                        "VIF0 reference services should retain source order");
+                    t.Equals(
+                        trace.entries[index].serviceTick,
+                        expectedTicks[index],
+                        "VIF0 reference services should retain exact ticks");
+                }
+                t.IsTrue(
+                    trace.entries[0].deviceBefore.kind ==
+                        PS2Runtime::DebugEeEventDeviceKind::
+                            Vif0Dma,
+                    "DMAC_VIF0 trace should expose typed channel state");
+                t.IsTrue(
+                    trace.entries[3].deviceBefore.kind ==
+                        PS2Runtime::DebugEeEventDeviceKind::
+                            Vu0,
+                    "VIF_VU0_FINISH trace should expose typed VU0 state");
+            }
+        });
+
         tc.Run("event VIF1 normal DMA exposes payload and finalization boundaries", [](TestCase &t)
         {
             PS2Runtime runtime;

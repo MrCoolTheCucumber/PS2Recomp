@@ -503,7 +503,9 @@ public:
     {
         None = 0u,
         VSync,
+        Vif0Dma,
         Vif1Dma,
+        Vu0,
         Vu1,
         ScratchpadDma,
     };
@@ -1015,6 +1017,16 @@ private:
         uint8_t *rdram,
         R5900Context *ctx,
         const ps2x::timing::EeEventService &service);
+    void startVU0FromVif(
+        uint32_t startPC, uint32_t itop);
+    void resumeVU0FromVif(uint32_t itop);
+    void serviceVU0AtVifFinishEvent(
+        uint8_t *rdram,
+        R5900Context *ctx,
+        const ps2x::timing::EeEventService &service);
+    void scheduleVif0VuFinishEvent(
+        ps2x::timing::EeTick deadline) noexcept;
+    void cancelVif0VuFinishEvent() noexcept;
     void startVU1FromVif(
         uint32_t startPC, uint32_t top, uint32_t itop);
     void resumeVU1FromVif(uint32_t top, uint32_t itop);
@@ -1031,6 +1043,17 @@ private:
         ps2x::timing::EeTick deadline) noexcept;
     void serviceVif1DmaAtEvent(
         const ps2x::timing::EeEventService &service);
+    bool scheduleVif0DmaFromMemory(
+        uint32_t delayEeCycles);
+    void cancelVif0DmaEvent() noexcept;
+    void scheduleVif0DmaEvent(
+        ps2x::timing::EeTick deadline) noexcept;
+    void serviceVif0DmaAtEvent(
+        const ps2x::timing::EeEventService &service);
+    void scheduleVif0DmaFollowup(
+        ps2x::timing::EeTick serviceTick,
+        uint32_t delayEeCycles,
+        bool allowImmediateRescan) noexcept;
     bool scheduleScratchpadDmaFromMemory(
         DmacChannel channel,
         uint32_t delayEeCycles);
@@ -1113,6 +1136,12 @@ private:
             ps2x::timing::EeEventSource::VifVu1Finish, 0u};
     };
     Vu1ExecutionTiming m_vu1ExecutionTiming{};
+    ps2x::timing::EeEventToken
+        m_vif0VuFinishEventToken{
+            ps2x::timing::EeEventSource::VifVu0Finish,
+            0u};
+    ps2x::timing::EeEventToken m_vif0DmaEventToken{
+        ps2x::timing::EeEventSource::DmacVif0, 0u};
     ps2x::timing::EeEventToken m_vif1DmaEventToken{
         ps2x::timing::EeEventSource::DmacVif1, 0u};
     ps2x::timing::EeEventToken

@@ -3302,6 +3302,400 @@ void register_ps2_memory_tests()
             t.IsTrue(imageOk, "continued DIRECT payload should complete the PATH2 image upload");
         });
 
+        tc.Run("VIF0 retained DMA accounts the PCSX2 VU-wait prefix and tail", [](TestCase &t)
+        {
+            PS2Memory mem;
+            t.IsTrue(mem.initialize(),
+                     "VIF0 wait fixture memory should initialize");
+
+            constexpr uint32_t kVif0 = 0x10008000u;
+            constexpr uint32_t kVif0Stat = 0x10003800u;
+            constexpr uint32_t kVif0Code = 0x10003880u;
+            constexpr uint32_t kDstat = 0x1000E010u;
+            constexpr uint32_t kTag = 0x00036000u;
+            constexpr uint32_t kPayload = kTag + 16u;
+            constexpr uint32_t kMpg =
+                (0x4Au << 24u) | (42u << 16u);
+            constexpr uint32_t kMscal = 0x14000000u;
+            constexpr uint32_t kFlushe = 0x10000000u;
+
+            uint8_t *const rdram = mem.getRDRAM();
+            std::memset(rdram + kTag, 0, 16u + 22u * 16u);
+            const uint64_t end =
+                makeDmaTag(22u, 7u, 0u, false);
+            std::memcpy(rdram + kTag, &end, sizeof(end));
+
+            std::vector<uint8_t> payload;
+            appendU32(payload, kMpg);
+            payload.resize(payload.size() + 42u * 8u, 0u);
+            appendU32(payload, kMscal);
+            appendU32(payload, kFlushe);
+            appendU32(payload, 0u);
+            t.Equals(payload.size(), static_cast<size_t>(22u * 16u),
+                     "reference VIF0 payload should be 22 QWC");
+            std::memcpy(rdram + kPayload,
+                        payload.data(), payload.size());
+
+            bool vuBusy = false;
+            uint32_t mscalCalls = 0u;
+            uint32_t mscalPc = UINT32_MAX;
+            uint32_t mscalItop = UINT32_MAX;
+            uint32_t initialDelay = 0u;
+            mem.setVu0BusyCallback([&]()
+                                   { return vuBusy; });
+            mem.setVu0MscalCallback(
+                [&](uint32_t startPc, uint32_t itop)
+                {
+                    ++mscalCalls;
+                    mscalPc = startPc;
+                    mscalItop = itop;
+                    vuBusy = true;
+                });
+            mem.setVif0DmaScheduleCallback(
+                [&](uint32_t delayEeCycles)
+                {
+                    initialDelay = delayEeCycles;
+                    return true;
+                });
+
+            t.IsTrue(mem.writeIORegister(
+                         kVif0 + 0x30u, kTag),
+                     "VIF0 reference TADR write should succeed");
+            t.IsTrue(mem.writeIORegister(
+                         kVif0, 0x145u),
+                     "VIF0 reference chain start should succeed");
+            t.Equals(initialDelay, 4u,
+                     "VIF0 submission should schedule after four EE cycles");
+
+            Vif0DmaAdvanceResult advance =
+                mem.advanceVif0Dma();
+            t.IsTrue(advance.progressed,
+                     "first event should fetch the END tag");
+            t.Equals(advance.delayEeCycles, 2u,
+                     "tag plus two TTE words should cost two cycles");
+            Vif0DmaSnapshot snapshot =
+                mem.vif0DmaSnapshot();
+            t.IsTrue(
+                snapshot.phase ==
+                    Vif0DmaPhase::TransferPayload,
+                "tag setup should expose the payload phase");
+            t.Equals(snapshot.qwc, 22u,
+                     "tag setup should publish payload QWC");
+            t.Equals(
+                mem.readIORegister(kVif0 + 0x10u),
+                kPayload,
+                "END setup should publish payload MADR");
+
+            advance = mem.advanceVif0Dma();
+            snapshot = mem.vif0DmaSnapshot();
+            t.IsTrue(
+                advance.progressed &&
+                    advance.stall ==
+                        Vif0DmaStallReason::WaitingForVu,
+                "payload prefix should stop at FLUSHE");
+            t.Equals(advance.acceptedBytes, 344u,
+                     "MPG plus MSCAL should accept 86 words");
+            t.Equals(advance.delayEeCycles, 43u,
+                     "86 accepted words should cost 43 EE cycles");
+            t.Equals(snapshot.qwc, 1u,
+                     "partial payload should retain one QWC");
+            t.Equals(snapshot.payloadByteOffset, 8u,
+                     "partial payload should retain a two-word QW offset");
+            t.Equals(snapshot.bufferedPayloadBytes, 8u,
+                     "FLUSHE and trailing NOP should remain buffered");
+            t.Equals(mscalCalls, 1u,
+                     "MSCAL should start VU0 exactly once");
+            t.Equals(mscalPc, 0u,
+                     "MSCAL immediate zero should start at PC zero");
+            t.Equals(mscalItop, 0u,
+                     "MSCAL should latch the pending VIF0 ITOP");
+            t.IsTrue(mem.vif0WaitingForVu(),
+                     "VIF0 should expose the VU-owned wait");
+            t.IsTrue(
+                (mem.readIORegister(kVif0Stat) &
+                 (1u << 2u)) != 0u,
+                "guest-visible VIF0 STAT should expose VEW");
+            t.Equals(mem.readIORegister(kVif0Code), kFlushe,
+                     "guest-visible VIF0 CODE should retain FLUSHE");
+
+            advance = mem.advanceVif0Dma();
+            t.IsFalse(advance.progressed,
+                      "the accounted payload callback should only hand off");
+            t.IsTrue(
+                advance.stall ==
+                    Vif0DmaStallReason::WaitingForVu,
+                "the later callback should retain the VU stall");
+
+            vuBusy = false;
+            t.IsTrue(mem.resumeVIF0AfterVu(),
+                     "VU completion should clear the VIF wait");
+            advance = mem.advanceVif0Dma();
+            snapshot = mem.vif0DmaSnapshot();
+            t.Equals(advance.acceptedBytes, 8u,
+                     "finish wake should accept the retained tail");
+            t.Equals(advance.delayEeCycles, 2u,
+                     "the retained QW tail should cost two cycles");
+            t.IsTrue(
+                snapshot.phase == Vif0DmaPhase::Finalize,
+                "tail completion should leave finalization pending");
+            t.Equals(snapshot.qwc, 0u,
+                     "tail completion should consume the final QWC");
+            t.Equals(snapshot.payloadByteOffset, 0u,
+                     "tail completion should clear the QW offset");
+            t.Equals(snapshot.bufferedPayloadBytes, 0u,
+                     "tail completion should drain copied payload bytes");
+            t.IsTrue(
+                (mem.readIORegister(kVif0Stat) &
+                 (1u << 2u)) == 0u,
+                "VU finish should clear guest-visible VEW");
+
+            advance = mem.advanceVif0Dma();
+            t.IsTrue(advance.completed,
+                     "a distinct final callback should request completion");
+            t.IsTrue(
+                (mem.readIORegister(kVif0) & 0x100u) != 0u,
+                "requesting completion should keep STR visible");
+            t.IsTrue(
+                (mem.readIORegister(kDstat) & 0x1u) == 0u,
+                "requesting completion should keep D_STAT clear");
+            t.Equals(publishDmacCompletions(mem),
+                     static_cast<size_t>(1u),
+                     "typed publication should publish one VIF0 cause");
+            t.IsTrue(
+                (mem.readIORegister(kVif0) & 0x100u) == 0u,
+                "typed publication should clear VIF0 STR");
+            t.IsTrue(
+                (mem.readIORegister(kDstat) & 0x1u) != 0u,
+                "typed publication should latch channel-zero D_STAT");
+        });
+
+        tc.Run("VIF0 retained parser completes a fixed command across TTE and payload", [](TestCase &t)
+        {
+            PS2Memory mem;
+            t.IsTrue(mem.initialize(),
+                     "VIF0 split fixture memory should initialize");
+
+            constexpr uint32_t kVif0 = 0x10008000u;
+            constexpr uint32_t kTag = 0x00036400u;
+            uint8_t *const rdram = mem.getRDRAM();
+            std::memset(rdram + kTag, 0, 48u);
+
+            const uint64_t cnt =
+                makeDmaTag(0u, 1u, 0u, false);
+            const uint64_t end =
+                makeDmaTag(1u, 7u, 0u, false);
+            std::memcpy(rdram + kTag, &cnt, sizeof(cnt));
+            std::memcpy(rdram + kTag + 16u,
+                        &end, sizeof(end));
+
+            const uint32_t strow =
+                makeVifCmd(0x30u, 0u, 0u);
+            const std::array<uint32_t, 4> row = {
+                0x11111111u,
+                0x22222222u,
+                0x33333333u,
+                0x44444444u,
+            };
+            std::memcpy(rdram + kTag + 8u,
+                        &strow, sizeof(strow));
+            std::memcpy(rdram + kTag + 12u,
+                        &row[0], sizeof(row[0]));
+            std::memcpy(rdram + kTag + 24u,
+                        &row[1], sizeof(row[1]) * 2u);
+            std::memcpy(rdram + kTag + 32u,
+                        &row[3], sizeof(row[3]));
+
+            mem.setVif0DmaScheduleCallback(
+                [](uint32_t)
+                {
+                    return true;
+                });
+            t.IsTrue(mem.writeIORegister(
+                         kVif0 + 0x30u, kTag),
+                     "split VIF0 TADR write should succeed");
+            t.IsTrue(mem.writeIORegister(
+                         kVif0, 0x145u),
+                     "split VIF0 chain start should succeed");
+
+            Vif0DmaAdvanceResult advance =
+                mem.advanceVif0Dma();
+            t.IsTrue(advance.progressed,
+                     "first callback should fetch CNT");
+            t.Equals(mem.vif0DmaSnapshot().parserBytes, 8u,
+                     "STROW header and first word should remain buffered");
+            t.Equals(mem.vif0_regs.row[0], 0u,
+                     "incomplete STROW must remain atomic");
+
+            advance = mem.advanceVif0Dma();
+            t.IsTrue(advance.progressed,
+                     "second callback should fetch END");
+            t.Equals(mem.vif0DmaSnapshot().parserBytes, 16u,
+                     "second TTE should extend the retained STROW");
+            t.Equals(mem.vif0_regs.row[0], 0u,
+                     "STROW should still wait for its final word");
+
+            advance = mem.advanceVif0Dma();
+            t.IsTrue(advance.progressed,
+                     "third callback should transfer END payload");
+            for (size_t index = 0u; index < row.size(); ++index)
+            {
+                t.Equals(mem.vif0_regs.row[index], row[index],
+                         "split VIF0 STROW should commit atomically");
+            }
+            t.Equals(mem.vif0DmaSnapshot().parserBytes, 0u,
+                     "complete STROW and NOP padding should drain");
+        });
+
+        tc.Run("VIF0 wait at the first payload word hands off without a phantom DMA cycle", [](TestCase &t)
+        {
+            PS2Memory mem;
+            t.IsTrue(mem.initialize(),
+                     "VIF0 zero-prefix fixture memory should initialize");
+
+            constexpr uint32_t kVif0 = 0x10008000u;
+            constexpr uint32_t kPayload = 0x00036700u;
+            constexpr uint32_t kFlushe = 0x10000000u;
+            std::memset(mem.getRDRAM() + kPayload, 0, 16u);
+            std::memcpy(mem.getRDRAM() + kPayload,
+                        &kFlushe, sizeof(kFlushe));
+
+            bool vuBusy = true;
+            mem.setVu0BusyCallback([&]()
+                                   { return vuBusy; });
+            mem.setVif0DmaScheduleCallback(
+                [](uint32_t)
+                {
+                    return true;
+                });
+            t.IsTrue(mem.writeIORegister(
+                         kVif0 + 0x10u, kPayload),
+                     "zero-prefix MADR write should succeed");
+            t.IsTrue(mem.writeIORegister(
+                         kVif0 + 0x20u, 1u),
+                     "zero-prefix QWC write should succeed");
+            t.IsTrue(mem.writeIORegister(
+                         kVif0, 0x100u),
+                     "zero-prefix VIF0 DMA should start");
+
+            Vif0DmaAdvanceResult advance =
+                mem.advanceVif0Dma();
+            t.IsFalse(advance.progressed,
+                      "an immediate FLUSHE wait must not invent transfer work");
+            t.Equals(advance.acceptedBytes, 0u,
+                     "an immediate wait should accept no payload bytes");
+            t.Equals(advance.delayEeCycles, 0u,
+                     "a no-progress result should carry no DMA delay");
+            t.IsTrue(
+                advance.stall ==
+                    Vif0DmaStallReason::WaitingForVu,
+                "an immediate wait should hand ownership to VU completion");
+            t.Equals(mem.vif0DmaSnapshot().qwc, 1u,
+                     "an immediate wait should retain the complete QW");
+
+            vuBusy = false;
+            t.IsTrue(mem.resumeVIF0AfterVu(),
+                     "VU completion should release the immediate wait");
+            advance = mem.advanceVif0Dma();
+            t.IsTrue(advance.progressed,
+                     "the released QW should then make progress");
+            t.Equals(advance.acceptedBytes, 16u,
+                     "the released QW should transfer exactly once");
+            t.Equals(advance.delayEeCycles, 2u,
+                     "four released words should cost two cycles");
+        });
+
+        tc.Run("VIF0 reset cancels a generation and restart completes only its replacement", [](TestCase &t)
+        {
+            PS2Memory mem;
+            t.IsTrue(mem.initialize(),
+                     "VIF0 reset fixture memory should initialize");
+
+            constexpr uint32_t kVif0 = 0x10008000u;
+            constexpr uint32_t kFbrst = 0x10003810u;
+            constexpr uint32_t kFirst = 0x00036800u;
+            constexpr uint32_t kSecond = 0x00036900u;
+            std::memset(mem.getRDRAM() + kFirst, 0, 16u);
+            std::memset(mem.getRDRAM() + kSecond, 0, 16u);
+
+            uint32_t schedules = 0u;
+            uint32_t cancels = 0u;
+            uint32_t resets = 0u;
+            mem.setVif0DmaScheduleCallback(
+                [&](uint32_t)
+                {
+                    ++schedules;
+                    return true;
+                });
+            mem.setVif0DmaCancelCallback(
+                [&]()
+                {
+                    ++cancels;
+                });
+            mem.setVif0ResetCallback(
+                [&]()
+                {
+                    ++resets;
+                });
+
+            t.IsTrue(mem.writeIORegister(
+                         kVif0 + 0x10u, kFirst),
+                     "first VIF0 MADR write should succeed");
+            t.IsTrue(mem.writeIORegister(
+                         kVif0 + 0x20u, 1u),
+                     "first VIF0 QWC write should succeed");
+            t.IsTrue(mem.writeIORegister(
+                         kVif0, 0x100u),
+                     "first VIF0 generation should start");
+            const uint64_t staleGeneration =
+                mem.vif0DmaSnapshot().transfer.generation;
+
+            t.IsTrue(mem.writeIORegister(kFbrst, 1u),
+                     "VIF0 FBRST.RST should succeed");
+            t.IsFalse(mem.vif0DmaSnapshot().active,
+                      "reset should retire the descriptor");
+            t.IsTrue(
+                (mem.readIORegister(kVif0) & 0x100u) == 0u,
+                "reset should clear channel STR");
+            t.Equals(mem.readIORegister(0x10003800u), 0u,
+                     "reset should clear guest-visible VIF0 state");
+            t.Equals(cancels, 1u,
+                     "reset should cancel event ownership once");
+            t.Equals(resets, 1u,
+                     "reset should invalidate the VU-finish owner once");
+
+            t.IsTrue(mem.writeIORegister(
+                         kVif0 + 0x10u, kSecond),
+                     "replacement VIF0 MADR write should succeed");
+            t.IsTrue(mem.writeIORegister(
+                         kVif0 + 0x20u, 1u),
+                     "replacement VIF0 QWC write should succeed");
+            t.IsTrue(mem.writeIORegister(
+                         kVif0, 0x100u),
+                     "replacement VIF0 generation should start");
+            const Vif0DmaSnapshot replacement =
+                mem.vif0DmaSnapshot();
+            t.IsTrue(
+                replacement.transfer.generation !=
+                    staleGeneration,
+                "restart should own a fresh DMAC generation");
+            t.Equals(schedules, 2u,
+                     "both generations should request startup events");
+
+            Vif0DmaAdvanceResult advance =
+                mem.advanceVif0Dma();
+            t.IsTrue(
+                advance.progressed &&
+                    advance.phase ==
+                        Vif0DmaPhase::Finalize,
+                "replacement payload should reach finalization");
+            advance = mem.advanceVif0Dma();
+            t.IsTrue(advance.completed,
+                     "replacement finalization should request completion");
+            t.Equals(publishDmacCompletions(mem),
+                     static_cast<size_t>(1u),
+                     "only the replacement should publish");
+        });
+
         tc.Run("unaligned accesses throw", [](TestCase &t)
         {
             PS2Memory mem;

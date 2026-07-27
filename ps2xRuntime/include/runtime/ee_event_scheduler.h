@@ -47,8 +47,10 @@ namespace ps2x::timing
         // priority pass.
         DmacCompletion,
         DmacVif1,
+        DmacVif0,
         DmacFromScratchpad,
         DmacToScratchpad,
+        VifVu0Finish,
         VifVu1Finish,
         Vu0PeriodicCompatibility,
         Count,
@@ -76,12 +78,16 @@ namespace ps2x::timing
             return "vu0_periodic_compatibility";
         case EeEventSource::DmacVif1:
             return "dmac_vif1";
+        case EeEventSource::DmacVif0:
+            return "dmac_vif0";
         case EeEventSource::DmacFromScratchpad:
             return "dmac_from_scratchpad";
         case EeEventSource::DmacToScratchpad:
             return "dmac_to_scratchpad";
         case EeEventSource::VifVu1Finish:
             return "vif_vu1_finish";
+        case EeEventSource::VifVu0Finish:
+            return "vif_vu0_finish";
         case EeEventSource::Count:
             break;
         }
