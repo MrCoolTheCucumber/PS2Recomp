@@ -17,6 +17,8 @@
 
 namespace
 {
+    constexpr uint32_t kOutputSchemaVersion = 2u;
+
     std::atomic<bool> g_trackAllocations{false};
     std::atomic<uint64_t> g_allocationCount{0u};
     std::atomic<uint64_t> g_allocationBytes{0u};
@@ -392,10 +394,18 @@ namespace
         const VU1ProgressSnapshot after =
             runtime.vu0().getProgressSnapshot();
         Measurement result{};
-        result.mode =
-            mode == ps2x::timing::EeSchedulingMode::Event
-                ? "event_scheduler_compatibility"
-                : "legacy_scheduler";
+        switch (mode)
+        {
+        case ps2x::timing::EeSchedulingMode::Legacy:
+            result.mode = "legacy_scheduler";
+            break;
+        case ps2x::timing::EeSchedulingMode::Shadow:
+            result.mode = "shadow_scheduler_compatibility";
+            break;
+        case ps2x::timing::EeSchedulingMode::Event:
+            result.mode = "event_scheduler";
+            break;
+        }
         result.sample = sample;
         result.eeBlocks = configuration.blocks;
         result.eeTicks =
@@ -405,11 +415,11 @@ namespace
                 8u);
         result.eventTests = configuration.blocks;
         result.vu0Services =
-            mode == ps2x::timing::EeSchedulingMode::Event
-                ? runtime.debugEeSchedulerSnapshot()
+            mode == ps2x::timing::EeSchedulingMode::Legacy
+                ? after.invocations - before.invocations
+                : runtime.debugEeSchedulerSnapshot()
                           .statistics.serviced -
-                      beforeServices
-                : after.invocations - before.invocations;
+                      beforeServices;
         result.vuPairs = after.cycles - before.cycles;
         result.hostNanoseconds =
             static_cast<uint64_t>(
@@ -569,7 +579,8 @@ namespace
     void printMeasurement(const Measurement &measurement)
     {
         std::cout
-            << "{\"schema_version\":1,\"event\":\"measurement\","
+            << "{\"schema_version\":" << kOutputSchemaVersion
+            << ",\"event\":\"measurement\","
             << "\"mode\":\"" << measurement.mode << "\","
             << "\"sample\":" << measurement.sample << ','
             << "\"ee_blocks\":" << measurement.eeBlocks << ','
@@ -612,11 +623,11 @@ int main(int argc, char **argv)
     try
     {
         std::vector<uint64_t> legacyTimes;
-        std::vector<uint64_t> eventTimes;
+        std::vector<uint64_t> shadowTimes;
         std::vector<uint64_t> noEventTimes;
         std::vector<uint64_t> directTimes;
         legacyTimes.reserve(configuration.samples);
-        eventTimes.reserve(configuration.samples);
+        shadowTimes.reserve(configuration.samples);
         noEventTimes.reserve(configuration.samples);
         directTimes.reserve(configuration.samples);
 
@@ -642,18 +653,22 @@ int main(int argc, char **argv)
             printMeasurement(legacy);
             legacyTimes.push_back(legacy.hostNanoseconds);
 
-            const Measurement event =
+            // Event mode no longer has a private periodic VU0 source. Shadow
+            // mode is the rollout compatibility path which still compares
+            // the fixed-slot deadline against the legacy scheduler while
+            // applying VU progress exactly once through the legacy owner.
+            const Measurement shadow =
                 measureScheduled(
                     sample, configuration,
-                    ps2x::timing::EeSchedulingMode::Event);
-            if (event.vuPairs != expectedVuPairs ||
-                event.stateHash != expectedStateHash)
+                    ps2x::timing::EeSchedulingMode::Shadow);
+            if (shadow.vuPairs != expectedVuPairs ||
+                shadow.stateHash != expectedStateHash)
             {
                 throw std::runtime_error(
-                    "event compatibility result does not match legacy result");
+                    "shadow compatibility result does not match legacy result");
             }
-            printMeasurement(event);
-            eventTimes.push_back(event.hostNanoseconds);
+            printMeasurement(shadow);
+            shadowTimes.push_back(shadow.hostNanoseconds);
 
             const Measurement noEvent =
                 measureNoEventHotPath(sample, configuration);
@@ -680,7 +695,8 @@ int main(int argc, char **argv)
         }
 
         const uint64_t legacyMedian = medianHostTime(legacyTimes);
-        const uint64_t eventMedian = medianHostTime(eventTimes);
+        const uint64_t shadowMedian =
+            medianHostTime(shadowTimes);
         const uint64_t noEventMedian =
             medianHostTime(noEventTimes);
         const uint64_t directMedian = medianHostTime(directTimes);
@@ -690,7 +706,8 @@ int main(int argc, char **argv)
                 : static_cast<double>(legacyMedian) /
                       static_cast<double>(directMedian);
         std::cout
-            << "{\"schema_version\":1,\"event\":\"summary\","
+            << "{\"schema_version\":" << kOutputSchemaVersion
+            << ",\"event\":\"summary\","
             << "\"samples\":" << configuration.samples << ','
             << "\"ee_blocks\":" << configuration.blocks << ','
             << "\"ee_cycle_ticks\":"
@@ -702,17 +719,17 @@ int main(int argc, char **argv)
             << ','
             << "\"vu_instruction_pairs\":" << expectedVuPairs << ','
             << "\"legacy_median_host_time_ns\":" << legacyMedian << ','
-            << "\"event_compatibility_median_host_time_ns\":"
-            << eventMedian << ','
+            << "\"shadow_compatibility_median_host_time_ns\":"
+            << shadowMedian << ','
             << "\"event_no_pending_median_host_time_ns\":"
             << noEventMedian << ','
             << "\"pre_scheduler_equal_work_median_host_time_ns\":"
             << directMedian << ','
             << "\"legacy_to_pre_scheduler_ratio\":" << ratio
-            << ",\"event_to_legacy_ratio\":"
+            << ",\"shadow_to_legacy_ratio\":"
             << (legacyMedian == 0u
                     ? 0.0
-                    : static_cast<double>(eventMedian) /
+                    : static_cast<double>(shadowMedian) /
                           static_cast<double>(legacyMedian))
             << "}\n";
     }
