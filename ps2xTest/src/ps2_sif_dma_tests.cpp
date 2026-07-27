@@ -7,6 +7,7 @@
 #include <array>
 #include <cstdint>
 #include <cstring>
+#include <limits>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -130,6 +131,48 @@ namespace
             env.rdram.data(), &env.ctx);
     }
 
+    bool serviceAllScheduledBoundaries(
+        TestEnv &env,
+        size_t maximumBoundaries = 64u)
+    {
+        for (size_t boundary = 0u;
+             boundary < maximumBoundaries;
+             ++boundary)
+        {
+            const PS2Runtime::DebugEeScheduler scheduler =
+                env.runtime.debugEeSchedulerSnapshot();
+            if (!scheduler.hasNextDeadline)
+            {
+                return true;
+            }
+
+            const uint64_t now =
+                env.runtime.currentEeTick().raw();
+            const uint64_t elapsed =
+                scheduler.nextDeadlineTick > now
+                    ? scheduler.nextDeadlineTick - now
+                    : 0u;
+            if (elapsed >
+                std::numeric_limits<uint32_t>::max())
+            {
+                return false;
+            }
+
+            {
+                PS2Runtime::GuestExecutionScope guestExecution(
+                    &env.runtime, &env.ctx);
+                env.ctx.cop0_config |= 1u << 18u;
+                env.ctx.advanceEeCycleTicks(
+                    static_cast<uint32_t>(elapsed));
+                env.runtime.serviceEeEventsAtBlockBoundary(
+                    env.rdram.data(), &env.ctx);
+            }
+        }
+        return !env.runtime
+                    .debugEeSchedulerSnapshot()
+                    .hasNextDeadline;
+    }
+
     void writeGuestS16(uint8_t *rdram, uint32_t addr, int16_t value)
     {
         std::memcpy(rdram + addr, &value, sizeof(value));
@@ -177,11 +220,9 @@ void register_ps2_sif_dma_tests()
 {
     MiniTest::Case("PS2SifDma", [](TestCase &tc)
     {
-        tc.Run("sceSifSetDma copies EE payload into IOP RAM without aliasing EE memory", [](TestCase &t)
+        tc.Run("scheduled sceSifSetDma copies into IOP RAM without aliasing EE memory", [](TestCase &t)
         {
             TestEnv env;
-            env.runtime.setEeSchedulingMode(
-                ps2x::timing::EeSchedulingMode::Legacy);
 
             constexpr uint32_t kDescAddr = 0x00020000u;
             constexpr uint32_t kSrcAddr = 0x00020100u;
@@ -208,6 +249,9 @@ void register_ps2_sif_dma_tests()
             ps2_stubs::sceSifSetDma(env.rdram.data(), &env.ctx, &env.runtime);
             const int32_t dmaId = getRegS32(env.ctx, 2);
             t.IsTrue(dmaId > 0, "sceSifSetDma should return a positive transfer id on success");
+            t.IsTrue(
+                serviceAllScheduledBoundaries(env),
+                "scheduled SIF DMA should reach completion");
 
             t.IsTrue(std::memcmp(env.runtime.memory().getIOPRAM() + kDstAddr,
                                  payload.data(),
@@ -229,8 +273,6 @@ void register_ps2_sif_dma_tests()
         tc.Run("event sceSifSetDma defers HLE IOP visibility to the IOP-cycle deadline", [](TestCase &t)
         {
             TestEnv env;
-            env.runtime.setEeSchedulingMode(
-                ps2x::timing::EeSchedulingMode::Event);
 
             constexpr uint32_t kDescAddr = 0x00020600u;
             constexpr uint32_t kSrcAddr = 0x00020700u;
@@ -363,8 +405,6 @@ void register_ps2_sif_dma_tests()
         tc.Run("event sceSifSetDma queues calls and sums rounded descriptor work", [](TestCase &t)
         {
             TestEnv env;
-            env.runtime.setEeSchedulingMode(
-                ps2x::timing::EeSchedulingMode::Event);
 
             constexpr uint32_t kDescA = 0x00020900u;
             constexpr uint32_t kDescB = 0x00020940u;
@@ -535,64 +575,9 @@ void register_ps2_sif_dma_tests()
             }
         });
 
-        tc.Run("shadow sceSifSetDma retains immediate compatibility behavior", [](TestCase &t)
-        {
-            TestEnv env;
-            env.runtime.setEeSchedulingMode(
-                ps2x::timing::EeSchedulingMode::Shadow);
-
-            constexpr uint32_t kDescAddr = 0x00020C00u;
-            constexpr uint32_t kSrcAddr = 0x00020D00u;
-            constexpr uint32_t kDstAddr = 0x00020E00u;
-            const std::array<uint8_t, 16> payload{
-                0x10, 0x11, 0x12, 0x13,
-                0x14, 0x15, 0x16, 0x17,
-                0x18, 0x19, 0x1A, 0x1B,
-                0x1C, 0x1D, 0x1E, 0x1F};
-            std::memcpy(
-                env.rdram.data() + kSrcAddr,
-                payload.data(), payload.size());
-            std::memset(
-                env.runtime.memory().getIOPRAM() + kDstAddr,
-                0, payload.size());
-            const Ps2SifDmaTransfer descriptor{
-                kSrcAddr, kDstAddr, 16, 0};
-            std::memcpy(
-                env.rdram.data() + kDescAddr,
-                &descriptor, sizeof(descriptor));
-
-            const int32_t transferId =
-                submitSifDma(env, kDescAddr, 1u);
-            t.IsTrue(
-                transferId > 0,
-                "shadow submission should succeed");
-            t.IsTrue(
-                std::memcmp(
-                    env.runtime.memory().getIOPRAM() +
-                        kDstAddr,
-                    payload.data(), payload.size()) == 0,
-                "shadow mode should preserve immediate copy");
-            t.IsTrue(
-                sifDmaStatus(
-                    env,
-                    static_cast<uint32_t>(transferId)) < 0,
-                "shadow compatibility transfer should already be complete");
-            const auto scheduler =
-                env.runtime.debugEeSchedulerSnapshot();
-            t.IsFalse(
-                scheduler.slots[
-                    ps2x::timing::eeEventSourceIndex(
-                        ps2x::timing::EeEventSource::
-                            HleSif1)]
-                    .pending,
-                "shadow mode should not apply event effects twice");
-        });
-
         tc.Run("event sceSifSetDma bounds its queue and rejects stale deadlines", [](TestCase &t)
         {
             TestEnv env;
-            env.runtime.setEeSchedulingMode(
-                ps2x::timing::EeSchedulingMode::Event);
 
             constexpr uint32_t kDescAddr = 0x00020F00u;
             constexpr uint32_t kSrcAddr = 0x00021000u;
@@ -656,10 +641,7 @@ void register_ps2_sif_dma_tests()
                 oldSlot.pending,
                 "the original generation should own a deadline");
 
-            env.runtime.setEeSchedulingMode(
-                ps2x::timing::EeSchedulingMode::Legacy);
-            env.runtime.setEeSchedulingMode(
-                ps2x::timing::EeSchedulingMode::Event);
+            env.runtime.resetEeTiming(&env.ctx);
             descriptor.dest = kNewDstAddr;
             descriptor.size = 32;
             std::memcpy(
@@ -766,8 +748,6 @@ void register_ps2_sif_dma_tests()
         tc.Run("Sony 989snd decodes streaming DMA from IOP RAM rather than the aliased EE address", [](TestCase &t)
         {
             TestEnv env;
-            env.runtime.setEeSchedulingMode(
-                ps2x::timing::EeSchedulingMode::Legacy);
             configureProfile(env, "slus_201.84");
 
             constexpr uint32_t kSid = 0x00123456u;
@@ -848,6 +828,9 @@ void register_ps2_sif_dma_tests()
             ps2_stubs::sceSifSetDma(env.rdram.data(), &env.ctx, &env.runtime);
             t.IsTrue(getRegS32(env.ctx, 2) > 0,
                      "streaming payload DMA should succeed");
+            t.IsTrue(
+                serviceAllScheduledBoundaries(env),
+                "scheduled streaming payload DMA should complete");
             t.IsTrue(std::memcmp(env.runtime.memory().getIOPRAM() + workArea,
                                  encoded.data(),
                                  encoded.size()) == 0,
@@ -880,8 +863,6 @@ void register_ps2_sif_dma_tests()
         tc.Run("isceSifSetDma and isceSifSetDChain alias the SIF DMA helpers", [](TestCase &t)
         {
             TestEnv env;
-            env.runtime.setEeSchedulingMode(
-                ps2x::timing::EeSchedulingMode::Legacy);
 
             constexpr uint32_t kDescAddr = 0x00020240u;
             constexpr uint32_t kSrcAddr = 0x00020340u;
@@ -908,6 +889,9 @@ void register_ps2_sif_dma_tests()
             setRegU32(env.ctx, 5, 1u);
             ps2_stubs::isceSifSetDma(env.rdram.data(), &env.ctx, &env.runtime);
             t.IsTrue(getRegS32(env.ctx, 2) > 0, "isceSifSetDma should report a successful transfer id");
+            t.IsTrue(
+                serviceAllScheduledBoundaries(env),
+                "scheduled isceSifSetDma transfer should complete");
             t.IsTrue(std::memcmp(env.runtime.memory().getIOPRAM() + kIopDstAddr,
                                  payload.data(),
                                  payload.size()) == 0,
@@ -920,8 +904,6 @@ void register_ps2_sif_dma_tests()
         tc.Run("sceSifSetDma preserves explicitly allocated synthetic IOP heap ranges", [](TestCase &t)
         {
             TestEnv env;
-            env.runtime.setEeSchedulingMode(
-                ps2x::timing::EeSchedulingMode::Legacy);
 
             constexpr uint32_t kDescAddr = 0x00020500u;
             constexpr uint32_t kSrcAddr = 0x00020600u;
@@ -953,6 +935,9 @@ void register_ps2_sif_dma_tests()
             ps2_stubs::sceSifSetDma(env.rdram.data(), &env.ctx, &env.runtime);
             t.IsTrue(getRegS32(env.ctx, 2) > 0,
                      "sceSifSetDma should accept an allocated synthetic IOP range");
+            t.IsTrue(
+                serviceAllScheduledBoundaries(env),
+                "scheduled synthetic IOP transfer should complete");
             t.IsTrue(std::memcmp(env.rdram.data() + destination,
                                  payload.data(),
                                  payload.size()) == 0,
@@ -962,8 +947,6 @@ void register_ps2_sif_dma_tests()
         tc.Run("sceSifSetDma dispatches enabled DMAC handlers for cause 5", [](TestCase &t)
         {
             TestEnv env;
-            env.runtime.setEeSchedulingMode(
-                ps2x::timing::EeSchedulingMode::Legacy);
 
             constexpr uint32_t kDescAddr = 0x00020300u;
             constexpr uint32_t kSrcAddr = 0x00020400u;
@@ -1011,6 +994,9 @@ void register_ps2_sif_dma_tests()
                     &env.runtime, &env.ctx);
                 ps2_stubs::sceSifSetDma(
                     env.rdram.data(), &env.ctx, &env.runtime);
+                t.IsTrue(
+                    serviceAllScheduledBoundaries(env),
+                    "scheduled SIF DMA should publish its completion");
                 t.Equals(
                     readGuestU32(
                         env.rdram.data(),
@@ -1032,8 +1018,6 @@ void register_ps2_sif_dma_tests()
         tc.Run("sceSifSetDma acknowledges DTX work-buffer transfers by advancing the EE footer ticket", [](TestCase &t)
         {
             TestEnv env;
-            env.runtime.setEeSchedulingMode(
-                ps2x::timing::EeSchedulingMode::Legacy);
             configureProfile(env, "slus_201.84");
 
             constexpr uint32_t kClientAddr = 0x0002D000u;
@@ -1088,6 +1072,9 @@ void register_ps2_sif_dma_tests()
             setRegU32(env.ctx, 5, 1u);
             ps2_stubs::sceSifSetDma(env.rdram.data(), &env.ctx, &env.runtime);
             t.IsTrue(getRegS32(env.ctx, 2) > 0, "sceSifSetDma should succeed for the DTX transfer");
+            t.IsTrue(
+                serviceAllScheduledBoundaries(env),
+                "scheduled DTX transfer should complete");
 
             t.Equals(readGuestU32(env.rdram.data(), kFooterTicketAddr), 2u,
                      "sceSifSetDma should advance the EE footer ticket so DTX clears wait_flag");
@@ -1096,8 +1083,6 @@ void register_ps2_sif_dma_tests()
         tc.Run("event sceSifSetDma orders DTX copy notification and completion", [](TestCase &t)
         {
             TestEnv env;
-            env.runtime.setEeSchedulingMode(
-                ps2x::timing::EeSchedulingMode::Event);
             configureProfile(env, "slus_201.84");
 
             constexpr uint32_t kClientAddr = 0x0002D000u;
@@ -1238,8 +1223,6 @@ void register_ps2_sif_dma_tests()
         tc.Run("sceSifSetDma applies SJX DTX payloads into the emulated SJRMT data ring", [](TestCase &t)
         {
             TestEnv env;
-            env.runtime.setEeSchedulingMode(
-                ps2x::timing::EeSchedulingMode::Legacy);
             configureProfile(env, "slus_201.84");
 
             constexpr uint32_t kClientAddr = 0x0002E000u;
@@ -1336,6 +1319,9 @@ void register_ps2_sif_dma_tests()
             setRegU32(env.ctx, 5, 1u);
             ps2_stubs::sceSifSetDma(env.rdram.data(), &env.ctx, &env.runtime);
             t.IsTrue(getRegS32(env.ctx, 2) > 0, "sceSifSetDma should succeed for the SJX transport");
+            t.IsTrue(
+                serviceAllScheduledBoundaries(env),
+                "scheduled SJX transfer should complete");
             t.Equals(env.rdram[kEeWorkAddr + 0x11u], static_cast<uint8_t>(0u),
                      "SJX DMA ack should rewrite the response line to room so EE recycles the chunk");
             t.Equals(readGuestU32(env.rdram.data(), kEeWorkAddr + kWorkLen - sizeof(uint32_t)), 2u,
@@ -1361,8 +1347,6 @@ void register_ps2_sif_dma_tests()
         tc.Run("sceSifSetDma recognizes SJX DTX payloads from rotated EE work buffers", [](TestCase &t)
         {
             TestEnv env;
-            env.runtime.setEeSchedulingMode(
-                ps2x::timing::EeSchedulingMode::Legacy);
             configureProfile(env, "slus_201.84");
 
             constexpr uint32_t kClientAddr = 0x00031000u;
@@ -1464,6 +1448,9 @@ void register_ps2_sif_dma_tests()
             setRegU32(env.ctx, 5, 1u);
             ps2_stubs::sceSifSetDma(env.rdram.data(), &env.ctx, &env.runtime);
             t.IsTrue(getRegS32(env.ctx, 2) > 0, "sceSifSetDma should succeed for the rotated SJX transport");
+            t.IsTrue(
+                serviceAllScheduledBoundaries(env),
+                "scheduled rotated SJX transfer should complete");
             t.Equals(env.rdram[kAltEeWorkAddr + 0x11u], static_cast<uint8_t>(0u),
                      "rotated SJX DMA ack should rewrite the response line to room");
             t.Equals(readGuestU32(env.rdram.data(), kAltEeWorkAddr + kAltWorkLen - sizeof(uint32_t)), 10u,
@@ -1489,8 +1476,6 @@ void register_ps2_sif_dma_tests()
         tc.Run("sceSifSetDma lets active PS2RNA playback drain emulated SJRMT data", [](TestCase &t)
         {
             TestEnv env;
-            env.runtime.setEeSchedulingMode(
-                ps2x::timing::EeSchedulingMode::Legacy);
             configureProfile(env, "slus_201.84");
 
             constexpr uint32_t kClientAddr = 0x0002F000u;
@@ -1621,6 +1606,9 @@ void register_ps2_sif_dma_tests()
             setRegU32(env.ctx, 5, 1u);
             ps2_stubs::sceSifSetDma(env.rdram.data(), &env.ctx, &env.runtime);
             t.IsTrue(getRegS32(env.ctx, 2) > 0, "sceSifSetDma should succeed for the PS2RNA control transport");
+            t.IsTrue(
+                serviceAllScheduledBoundaries(env),
+                "scheduled PS2RNA control transfer should complete");
             t.Equals(readGuestU32(env.rdram.data(), kEeWork1Addr + kWorkLen - sizeof(uint32_t)), 2u,
                      "PS2RNA control DMA should advance the EE footer ticket");
 
@@ -1644,6 +1632,9 @@ void register_ps2_sif_dma_tests()
             setRegU32(env.ctx, 5, 1u);
             ps2_stubs::sceSifSetDma(env.rdram.data(), &env.ctx, &env.runtime);
             t.IsTrue(getRegS32(env.ctx, 2) > 0, "sceSifSetDma should succeed for the SJX transport");
+            t.IsTrue(
+                serviceAllScheduledBoundaries(env),
+                "scheduled SJX payload transfer should complete");
             t.Equals(env.rdram[kEeWork0Addr + 0x11u], static_cast<uint8_t>(0u),
                      "SJX DMA ack should still rewrite the response line to room");
 

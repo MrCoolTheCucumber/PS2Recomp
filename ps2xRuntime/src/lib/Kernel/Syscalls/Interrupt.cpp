@@ -9,17 +9,10 @@ namespace ps2_syscalls
     {
         constexpr uint32_t kIntcVblankStart = 2u;
         constexpr uint32_t kIntcVblankEnd = 3u;
-        constexpr auto kVblankPeriod = std::chrono::microseconds(16667);
-        constexpr int kMaxCatchupTicks = 4;
         constexpr uint32_t kMaxIrqHandlerSteps = 4096u;
 
         std::mutex g_irq_handler_mutex;
-        std::mutex g_irq_worker_mutex;
-        std::condition_variable g_irq_worker_cv;
         std::mutex g_vsync_flag_mutex;
-        std::condition_variable g_vsync_cv;
-        std::atomic<bool> g_irq_worker_stop{false};
-        std::atomic<bool> g_irq_worker_running{false};
         uint32_t g_enabled_intc_mask = 0xFFFFFFFFu;
         uint32_t g_enabled_dmac_mask = 0xFFFFFFFFu;
         uint64_t g_vsync_tick_counter = 0u;
@@ -379,8 +372,6 @@ namespace ps2_syscalls
             tickValue = ++g_vsync_tick_counter;
         }
 
-        g_vsync_cv.notify_all();
-
         if (reg.flagAddr != 0u)
         {
             writeGuestU32NoThrow(rdram, reg.flagAddr, 1u);
@@ -422,121 +413,12 @@ namespace ps2_syscalls
             rdram, runtime, kIntcVblankEnd);
     }
 
-    static void interruptWorkerMain(uint8_t *rdram, PS2Runtime *runtime)
+    void EnsureVSyncScheduled(uint8_t *rdram, PS2Runtime *runtime)
     {
-        g_currentThreadId = -1;
-
-        using clock = std::chrono::steady_clock;
-        auto nextTick = clock::now() + kVblankPeriod;
-
-        while (runtime != nullptr && !runtime->isStopRequested())
+        if (rdram && runtime)
         {
-            {
-                std::unique_lock<std::mutex> lock(g_irq_worker_mutex);
-                if (g_irq_worker_cv.wait_until(lock, nextTick, []()
-                                               { return g_irq_worker_stop.load(std::memory_order_acquire); }))
-                {
-                    break;
-                }
-            }
-
-            const auto now = clock::now();
-            int ticksToProcess = 0;
-            while (now >= nextTick && ticksToProcess < kMaxCatchupTicks)
-            {
-                ++ticksToProcess;
-                nextTick += kVblankPeriod;
-            }
-            if (ticksToProcess == 0)
-            {
-                continue;
-            }
-
-            for (int i = 0; i < ticksToProcess; ++i)
-            {
-                bool reschedulePending = false;
-                uint64_t handoffBaseline = 0u;
-                {
-                    // Vblank callbacks are serialized with ordinary guest code. Any
-                    // blocking wake requests a handoff after the recursive scope exits.
-                    PS2Runtime::GuestExecutionScope guestExecution(runtime);
-                    if (g_irq_worker_stop.load(
-                            std::memory_order_acquire))
-                    {
-                        break;
-                    }
-                    PS2Runtime::DeferredGuestYieldScope deferYield(reschedulePending);
-                    const uint64_t tickValue =
-                        PublishVSyncStart(rdram, runtime);
-                    PublishVSyncField(runtime, tickValue);
-                    DispatchVSyncStartHandlers(
-                        rdram, runtime, tickValue);
-                    handoffBaseline = runtime->guestExecutionHandoffEpochSnapshot();
-                }
-                if (g_irq_worker_stop.load(
-                        std::memory_order_acquire))
-                {
-                    break;
-                }
-                if (reschedulePending && !runtime->isStopRequested())
-                {
-                    runtime->waitForGuestExecutionHandoff(handoffBaseline);
-                }
-                std::this_thread::sleep_for(std::chrono::microseconds(500));
-                if (g_irq_worker_stop.load(
-                        std::memory_order_acquire))
-                {
-                    break;
-                }
-                {
-                    PS2Runtime::GuestExecutionScope guestExecution(runtime);
-                    DispatchVSyncEndHandlers(rdram, runtime);
-                }
-            }
-        }
-
-        g_irq_worker_running.store(false, std::memory_order_release);
-        g_irq_worker_cv.notify_all();
-    }
-
-    static void ensureInterruptWorkerRunning(uint8_t *rdram, PS2Runtime *runtime)
-    {
-        if (!rdram || !runtime)
-        {
-            return;
-        }
-
-        std::lock_guard<std::mutex> lock(g_irq_worker_mutex);
-        if (g_irq_worker_running.load(std::memory_order_acquire))
-        {
-            return;
-        }
-
-        g_irq_worker_stop.store(false, std::memory_order_release);
-        g_irq_worker_running.store(true, std::memory_order_release);
-        try
-        {
-            std::thread(interruptWorkerMain, rdram, runtime).detach();
-        }
-        catch (...)
-        {
-            g_irq_worker_running.store(false, std::memory_order_release);
-        }
-    }
-
-    void EnsureVSyncWorkerRunning(uint8_t *rdram, PS2Runtime *runtime)
-    {
-        if (runtime &&
-            runtime->eeSchedulingMode() ==
-                ps2x::timing::EeSchedulingMode::Event)
-        {
-            // Event mode has one emulated-time owner. Stop any compatibility
-            // worker left by a live mode transition before arming its slot.
-            stopInterruptWorker();
             runtime->ensureEeVSyncScheduled();
-            return;
         }
-        ensureInterruptWorkerRunning(rdram, runtime);
     }
 
     uint64_t GetCurrentVSyncTick()
@@ -545,52 +427,25 @@ namespace ps2_syscalls
         return g_vsync_tick_counter;
     }
 
-    void stopInterruptWorker()
-    {
-        g_irq_worker_stop.store(true, std::memory_order_release);
-        g_irq_worker_cv.notify_all();
-        std::unique_lock<std::mutex> lock(g_irq_worker_mutex);
-        g_irq_worker_cv.wait_for(lock, std::chrono::milliseconds(500), []()
-                                 { return !g_irq_worker_running.load(std::memory_order_acquire); });
-        g_vsync_cv.notify_all();
-    }
-
     uint64_t WaitForNextVSyncTick(
         uint8_t *rdram,
         PS2Runtime *runtime,
         R5900Context *ctx)
     {
-        EnsureVSyncWorkerRunning(rdram, runtime);
-        if (runtime &&
-            runtime->eeSchedulingMode() ==
-                ps2x::timing::EeSchedulingMode::Event)
+        EnsureVSyncScheduled(rdram, runtime);
+        if (!runtime)
         {
-            uint64_t current = 0u;
-            {
-                std::lock_guard<std::mutex> lock(
-                    g_vsync_flag_mutex);
-                current = g_vsync_tick_counter;
-            }
-            return runtime->waitForNextScheduledVSync(
-                rdram, ctx, current);
+            return GetCurrentVSyncTick();
         }
 
-        std::unique_lock<std::mutex> lock(g_vsync_flag_mutex);
-        uint64_t current = g_vsync_tick_counter;
-        uint64_t result = current;
-        waitWithGuestExecutionReleasedUntilUnlocked(
-            runtime,
-            lock,
-            [&]()
-            {
-                g_vsync_cv.wait(lock, [current, runtime]()
-                                { return g_vsync_tick_counter > current || (runtime != nullptr && runtime->isStopRequested()); });
-            },
-            [&]()
-            {
-                result = g_vsync_tick_counter;
-            });
-        return result;
+        uint64_t current = 0u;
+        {
+            std::lock_guard<std::mutex> lock(
+                g_vsync_flag_mutex);
+            current = g_vsync_tick_counter;
+        }
+        return runtime->waitForNextScheduledVSync(
+            rdram, ctx, current);
     }
 
     void WaitVSyncTick(uint8_t *rdram, PS2Runtime *runtime)
@@ -611,7 +466,7 @@ namespace ps2_syscalls
 
         writeGuestU32NoThrow(rdram, flagAddr, 0u);
         writeGuestU64NoThrow(rdram, tickAddr, 0u);
-        EnsureVSyncWorkerRunning(rdram, runtime);
+        EnsureVSyncScheduled(rdram, runtime);
         setReturnS32(ctx, KE_OK);
     }
 
@@ -720,7 +575,7 @@ namespace ps2_syscalls
             });
         }
 
-        EnsureVSyncWorkerRunning(rdram, runtime);
+        EnsureVSyncScheduled(rdram, runtime);
         setReturnS32(ctx, handlerId);
     }
 

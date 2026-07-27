@@ -1,6 +1,5 @@
 #pragma once
 
-#include <condition_variable>
 #include "ps2_syscalls.h"
 
 namespace ps2_syscalls
@@ -14,12 +13,7 @@ namespace ps2_syscalls
         };
 
         extern std::mutex g_irq_handler_mutex;
-        extern std::mutex g_irq_worker_mutex;
-        extern std::condition_variable g_irq_worker_cv;
         extern std::mutex g_vsync_flag_mutex;
-        extern std::condition_variable g_vsync_cv;
-        extern std::atomic<bool> g_irq_worker_stop;
-        extern std::atomic<bool> g_irq_worker_running;
         extern uint32_t g_enabled_intc_mask;
         extern uint32_t g_enabled_dmac_mask;
         extern uint64_t g_vsync_tick_counter;
@@ -31,7 +25,7 @@ namespace ps2_syscalls
         uint8_t *rdram, PS2Runtime *runtime, uint32_t cause);
     bool isDmacCauseEnabled(uint32_t cause);
     bool isIntcCauseEnabled(uint32_t cause);
-    void EnsureVSyncWorkerRunning(uint8_t *rdram, PS2Runtime *runtime);
+    void EnsureVSyncScheduled(uint8_t *rdram, PS2Runtime *runtime);
     uint64_t GetCurrentVSyncTick();
     uint64_t PublishVSyncStart(uint8_t *rdram, PS2Runtime *runtime);
     void PublishVSyncField(PS2Runtime *runtime, uint64_t tick);
@@ -39,7 +33,6 @@ namespace ps2_syscalls
         uint8_t *rdram, PS2Runtime *runtime, uint64_t tick);
     void DispatchVSyncEndHandlers(
         uint8_t *rdram, PS2Runtime *runtime);
-    void stopInterruptWorker();
     uint64_t WaitForNextVSyncTick(
         uint8_t *rdram,
         PS2Runtime *runtime,

@@ -1552,7 +1552,7 @@ namespace ps2_stubs
 
         if (newCallback != 0u)
         {
-            ps2_syscalls::EnsureVSyncWorkerRunning(rdram, runtime);
+            ps2_syscalls::EnsureVSyncScheduled(rdram, runtime);
         }
 
         setReturnU32(ctx, oldCallback);

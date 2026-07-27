@@ -376,8 +376,6 @@ void register_cop0_timing_tests()
         tc.Run("event Count Compare latches IP7 while masked then vectors when enabled", [](TestCase &t)
         {
             PS2Runtime runtime;
-            runtime.setEeSchedulingMode(
-                EeSchedulingMode::Event);
             R5900Context ctx{};
             ctx.pc = 0x00102000u;
 
@@ -461,8 +459,6 @@ void register_cop0_timing_tests()
         tc.Run("MTC0 Compare acknowledges IP7 and replaces its deadline", [](TestCase &t)
         {
             PS2Runtime runtime;
-            runtime.setEeSchedulingMode(
-                EeSchedulingMode::Event);
             R5900Context ctx{};
             runtime.writeCop0Count(
                 nullptr, &ctx, 20u);
@@ -499,8 +495,6 @@ void register_cop0_timing_tests()
         tc.Run("pending delivery does not commit a COP0 access twice", [](TestCase &t)
         {
             PS2Runtime runtime;
-            runtime.setEeSchedulingMode(
-                EeSchedulingMode::Event);
             R5900Context ctx{};
             ctx.cop0_status =
                 0x00008001u;
@@ -538,8 +532,6 @@ void register_cop0_timing_tests()
         tc.Run("performance overflow enters the documented level-2 vector", [](TestCase &t)
         {
             PS2Runtime runtime;
-            runtime.setEeSchedulingMode(
-                EeSchedulingMode::Event);
             R5900Context ctx{};
             ctx.pc = 0x00103000u;
             const uint32_t pccr =
@@ -631,8 +623,6 @@ void register_cop0_timing_tests()
         tc.Run("performance overflow preserves delay restart state at the bootstrap vector", [](TestCase &t)
         {
             PS2Runtime runtime;
-            runtime.setEeSchedulingMode(
-                EeSchedulingMode::Event);
             R5900Context ctx{};
             ctx.pc = 0x00104004u;
             ctx.branch_pc = 0x00104000u;
@@ -670,8 +660,6 @@ void register_cop0_timing_tests()
         tc.Run("timing reset invalidates armed COP0 generations", [](TestCase &t)
         {
             PS2Runtime runtime;
-            runtime.setEeSchedulingMode(
-                EeSchedulingMode::Event);
             R5900Context ctx{};
             runtime.writeCop0Count(
                 nullptr, &ctx, 100u);

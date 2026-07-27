@@ -4703,44 +4703,6 @@ void register_ps2_gs_tests()
             ps2_stubs::resetGsSyncVCallbackState();
         });
 
-        tc.Run("sceGsSyncVCallback uses the shared VBlank worker", [](TestCase &t)
-        {
-            notifyRuntimeStop();
-            ps2_stubs::resetGsSyncVCallbackState();
-            g_gsSyncCallbackHits.store(0u, std::memory_order_relaxed);
-            g_gsSyncCallbackLastTick.store(0u, std::memory_order_relaxed);
-
-            PS2Runtime runtime;
-            runtime.setEeSchedulingMode(
-                ps2x::timing::EeSchedulingMode::Legacy);
-            t.IsTrue(runtime.memory().initialize(), "runtime memory initialize should succeed");
-            std::vector<uint8_t> rdram(PS2_RAM_SIZE, 0u);
-
-            constexpr uint32_t kCallbackAddr = 0x120000u;
-            runtime.registerFunction(kCallbackAddr, testGsSyncVCallback);
-
-            R5900Context callbackCtx{};
-            setRegU32(callbackCtx, 4, kCallbackAddr);
-            ps2_stubs::sceGsSyncVCallback(rdram.data(), &callbackCtx, &runtime);
-            t.Equals(getRegU32Test(callbackCtx, 2), 0u, "first sceGsSyncVCallback registration should return no previous callback");
-
-            const bool callbackFired = waitUntil([]() {
-                return g_gsSyncCallbackHits.load(std::memory_order_acquire) > 0u;
-            }, std::chrono::milliseconds(80));
-
-            t.IsTrue(callbackFired, "registered GS VSync callback should fire from the VBlank worker");
-            t.IsTrue(g_gsSyncCallbackLastTick.load(std::memory_order_acquire) > 0u,
-                     "VSync callback should receive a positive tick value");
-
-            R5900Context clearCtx{};
-            setRegU32(clearCtx, 4, 0u);
-            ps2_stubs::sceGsSyncVCallback(rdram.data(), &clearCtx, &runtime);
-            t.Equals(getRegU32Test(clearCtx, 2), kCallbackAddr, "clearing sceGsSyncVCallback should return the previous callback");
-
-            runtime.requestStop();
-            notifyRuntimeStop();
-            ps2_stubs::resetGsSyncVCallbackState();
-        });
 
         tc.Run("GS T4HL/T4HH shared-plane upload preserves both index planes via RMW", [](TestCase &t)
         {

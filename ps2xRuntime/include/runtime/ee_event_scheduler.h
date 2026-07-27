@@ -10,28 +10,6 @@
 
 namespace ps2x::timing
 {
-    enum class EeSchedulingMode : uint8_t
-    {
-        Legacy = 0u,
-        Shadow,
-        Event,
-    };
-
-    [[nodiscard]] constexpr std::string_view eeSchedulingModeName(
-        EeSchedulingMode mode) noexcept
-    {
-        switch (mode)
-        {
-        case EeSchedulingMode::Legacy:
-            return "legacy";
-        case EeSchedulingMode::Shadow:
-            return "shadow";
-        case EeSchedulingMode::Event:
-            return "event";
-        }
-        return "unknown";
-    }
-
     // Values are also the deterministic priority for equal-deadline events.
     // PCSX2 services due device callbacks before its ordinary VU batch.
     // Add new sources only with an ordering test and a reference-backed
@@ -48,8 +26,8 @@ namespace ps2x::timing
         // Count/Compare publishes Cause.IP7 after hardware counters and
         // before timed DMA callbacks at a shared EE event boundary.
         Cop0Timer,
-        // Compatibility-complete work is published before timed device
-        // callbacks. A timed callback that itself completes work can
+        // Ready completion work is published before timed device callbacks.
+        // A timed callback that itself completes work can
         // reschedule this source at the same tick for the scheduler's next
         // priority pass.
         DmacCompletion,
@@ -68,7 +46,6 @@ namespace ps2x::timing
         DmacToScratchpad,
         VifVu0Finish,
         VifVu1Finish,
-        Vu0PeriodicCompatibility,
         Count,
     };
 
@@ -96,8 +73,6 @@ namespace ps2x::timing
             return "cop0_timer";
         case EeEventSource::DmacCompletion:
             return "dmac_completion";
-        case EeEventSource::Vu0PeriodicCompatibility:
-            return "vu0_periodic_compatibility";
         case EeEventSource::DmacVif1:
             return "dmac_vif1";
         case EeEventSource::DmacGif:
@@ -126,7 +101,7 @@ namespace ps2x::timing
 
     struct EeEventToken
     {
-        EeEventSource source = EeEventSource::Vu0PeriodicCompatibility;
+        EeEventSource source = EeEventSource::Cop0Performance;
         uint64_t generation = 0u;
 
         friend constexpr bool operator==(
@@ -143,7 +118,7 @@ namespace ps2x::timing
 
     struct EeEventService
     {
-        EeEventSource source = EeEventSource::Vu0PeriodicCompatibility;
+        EeEventSource source = EeEventSource::Cop0Performance;
         EeTick scheduledTick{};
         EeTick serviceTick{};
         EeTickDelta latenessTicks{};
@@ -266,7 +241,7 @@ namespace ps2x::timing
         std::array<Slot, kEeEventSourceCount> m_slots{};
         EeTick m_nextDeadline{};
         EeEventSource m_nextSource =
-            EeEventSource::Vu0PeriodicCompatibility;
+            EeEventSource::Cop0Performance;
         bool m_hasPending = false;
         uint64_t m_nextSequence = 0u;
         EeEventSchedulerStatistics m_statistics{};

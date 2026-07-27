@@ -10,6 +10,7 @@
 #include <cstdint>
 #include <cstring>
 #include <exception>
+#include <limits>
 #include <thread>
 #include <vector>
 
@@ -135,6 +136,66 @@ namespace
     {
         env.runtime.requestStop();
         notifyRuntimeStop();
+    }
+
+    bool serviceNextScheduledBoundary(
+        TestEnv &env, R5900Context &context)
+    {
+        const PS2Runtime::DebugEeScheduler scheduler =
+            env.runtime.debugEeSchedulerSnapshot();
+        if (!scheduler.hasNextDeadline)
+        {
+            return false;
+        }
+
+        const uint64_t now =
+            env.runtime.currentEeTick().raw();
+        const uint64_t elapsed =
+            scheduler.nextDeadlineTick > now
+                ? scheduler.nextDeadlineTick - now
+                : 0u;
+        if (elapsed >
+            std::numeric_limits<uint32_t>::max())
+        {
+            return false;
+        }
+
+        {
+            PS2Runtime::GuestExecutionScope guestExecution(
+                &env.runtime, &context);
+            context.cop0_config |= 1u << 18u;
+            context.advanceEeCycleTicks(
+                static_cast<uint32_t>(elapsed));
+            env.runtime.serviceEeEventsAtBlockBoundary(
+                env.rdram.data(), &context);
+        }
+        return true;
+    }
+
+    bool serviceAllScheduledBoundaries(
+        TestEnv &env,
+        R5900Context &context,
+        size_t maximumBoundaries = 64u)
+    {
+        for (size_t boundary = 0u;
+             boundary < maximumBoundaries;
+             ++boundary)
+        {
+            if (!env.runtime
+                     .debugEeSchedulerSnapshot()
+                     .hasNextDeadline)
+            {
+                return true;
+            }
+            if (!serviceNextScheduledBoundary(
+                    env, context))
+            {
+                return false;
+            }
+        }
+        return !env.runtime
+                    .debugEeSchedulerSnapshot()
+                    .hasNextDeadline;
     }
 
     void testIntcHandler(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
@@ -266,92 +327,6 @@ void register_ps2_runtime_interrupt_tests()
 {
     MiniTest::Case("PS2RuntimeInterrupt", [](TestCase &tc)
     {
-        tc.Run("SetVSyncFlag arms a one-shot vblank notification", [](TestCase &t)
-        {
-            notifyRuntimeStop();
-            TestEnv env;
-            env.runtime.setEeSchedulingMode(
-                ps2x::timing::EeSchedulingMode::Legacy);
-
-            constexpr uint32_t kFlagAddr = 0x1000u;
-            constexpr uint32_t kTickAddr = 0x1010u;
-
-            writeGuestU32(env.rdram.data(), kFlagAddr, 0xDEADBEEFu);
-            writeGuestU32(env.rdram.data(), kTickAddr + 0u, 0xAAAAAAAAu);
-            writeGuestU32(env.rdram.data(), kTickAddr + 4u, 0xBBBBBBBBu);
-
-            R5900Context ctx{};
-            setRegU32(ctx, 4, kFlagAddr);
-            setRegU32(ctx, 5, kTickAddr);
-            t.IsTrue(callSyscall(0x73u, env.rdram.data(), &ctx, &env.runtime), "SetVSyncFlag syscall should dispatch");
-            t.Equals(getRegS32(ctx, 2), KE_OK, "SetVSyncFlag should return KE_OK");
-            t.Equals(readGuestU32(env.rdram.data(), kFlagAddr), 0u, "SetVSyncFlag should reset flag to zero");
-            t.Equals(readGuestU64(env.rdram.data(), kTickAddr), 0ull, "SetVSyncFlag should reset tick counter to zero");
-
-            const bool firstTickSeen = waitUntil([&]() {
-                return readGuestU64(env.rdram.data(), kTickAddr) > 0u;
-            }, std::chrono::milliseconds(300));
-            t.IsTrue(firstTickSeen, "VSync worker should update tick value");
-
-            const uint64_t firstTick = readGuestU64(env.rdram.data(), kTickAddr);
-            t.IsTrue(firstTick > 0u, "First observed VSync tick should be positive");
-            t.Equals(readGuestU32(env.rdram.data(), kFlagAddr), 1u, "VSync worker should set flag to one");
- 
-            const bool tickRewritten = waitUntil([&]() {
-                return readGuestU64(env.rdram.data(), kTickAddr) != firstTick;
-            }, std::chrono::milliseconds(100));
-            t.IsTrue(!tickRewritten, "consumed registration should not be written again");
-
-            // Re-arming registers a fresh one-shot notification.
-            writeGuestU32(env.rdram.data(), kFlagAddr, 0u);
-            R5900Context rearmCtx{};
-            setRegU32(rearmCtx, 4, kFlagAddr);
-            setRegU32(rearmCtx, 5, kTickAddr);
-            t.IsTrue(callSyscall(0x73u, env.rdram.data(), &rearmCtx, &env.runtime), "SetVSyncFlag re-arm should dispatch");
-            const bool rearmedTickSeen = waitUntil([&]() {
-                return readGuestU64(env.rdram.data(), kTickAddr) > firstTick;
-            }, std::chrono::milliseconds(300));
-            t.IsTrue(rearmedTickSeen, "re-armed registration should observe a later tick");
-            t.Equals(readGuestU32(env.rdram.data(), kFlagAddr), 1u, "re-armed registration should set flag to one");
-
-            cleanupRuntime(env);
-        });
-
-        tc.Run("VSync worker updates GS CSR FIELD bit for MMIO polling loops", [](TestCase &t)
-        {
-            notifyRuntimeStop();
-            TestEnv env;
-            env.runtime.setEeSchedulingMode(
-                ps2x::timing::EeSchedulingMode::Legacy);
-            t.IsTrue(env.runtime.memory().initialize(), "runtime memory initialize should succeed");
-
-            constexpr uint32_t kFlagAddr = 0x1080u;
-            constexpr uint32_t kTickAddr = 0x1090u;
-            constexpr uint64_t kGsCsrFieldMask = 0x2000ull;
-
-            env.runtime.memory().gs().csr = 0x3ull;
-
-            R5900Context ctx{};
-            setRegU32(ctx, 4, kFlagAddr);
-            setRegU32(ctx, 5, kTickAddr);
-            t.IsTrue(callSyscall(0x73u, env.rdram.data(), &ctx, &env.runtime), "SetVSyncFlag syscall should dispatch");
-
-            const uint64_t initialField = env.runtime.memory().gs().csr & kGsCsrFieldMask;
-            const bool firstFieldFlip = waitUntil([&]() {
-                return (env.runtime.memory().gs().csr & kGsCsrFieldMask) != initialField;
-            }, std::chrono::milliseconds(300));
-            t.IsTrue(firstFieldFlip, "VSync worker should toggle GS CSR FIELD for direct CSR polling");
-            t.Equals(env.runtime.memory().gs().csr & 0x3ull, 0x3ull, "VSync FIELD update should preserve CSR status bits");
-
-            const uint64_t fieldAfterFirstFlip = env.runtime.memory().gs().csr & kGsCsrFieldMask;
-            const bool secondFieldFlip = waitUntil([&]() {
-                return (env.runtime.memory().gs().csr & kGsCsrFieldMask) != fieldAfterFirstFlip;
-            }, std::chrono::milliseconds(300));
-            t.IsTrue(secondFieldFlip, "VSync worker should keep alternating GS CSR FIELD");
-
-            cleanupRuntime(env);
-        });
-
         tc.Run("event VSync follows emulated NTSC phases and defers guest callbacks", [](TestCase &t)
         {
             notifyRuntimeStop();
@@ -360,8 +335,6 @@ void register_ps2_runtime_interrupt_tests()
             t.IsTrue(
                 env.runtime.memory().initialize(),
                 "runtime memory initialize should succeed");
-            env.runtime.setEeSchedulingMode(
-                ps2x::timing::EeSchedulingMode::Event);
             env.runtime.configureEeVSyncVideoMode(
                 0x02u, true);
 
@@ -644,8 +617,6 @@ void register_ps2_runtime_interrupt_tests()
             t.IsTrue(
                 env.runtime.memory().initialize(),
                 "runtime memory initialize should succeed");
-            env.runtime.setEeSchedulingMode(
-                ps2x::timing::EeSchedulingMode::Event);
 
             constexpr uint64_t kTicksPerEeCycle = 8u;
             constexpr uint64_t kInitialRenderCycles =
@@ -655,7 +626,7 @@ void register_ps2_runtime_interrupt_tests()
             constexpr uint64_t kPalGsBlankCycles =
                 56'623u;
 
-            EnsureVSyncWorkerRunning(
+            EnsureVSyncScheduled(
                 env.rdram.data(), &env.runtime);
             const auto initial =
                 env.runtime.debugEeSchedulerSnapshot();
@@ -738,8 +709,6 @@ void register_ps2_runtime_interrupt_tests()
             t.IsTrue(
                 env.runtime.memory().initialize(),
                 "runtime memory initialize should succeed");
-            env.runtime.setEeSchedulingMode(
-                ps2x::timing::EeSchedulingMode::Event);
 
             constexpr uint64_t kGsCsrFieldMask = 0x2000ull;
             constexpr uint64_t kTicksPerEeCycle = 8u;
@@ -771,7 +740,7 @@ void register_ps2_runtime_interrupt_tests()
                 kGsCsrFieldMask,
                 "changing to SDTV 480p should initialize FIELD high");
 
-            EnsureVSyncWorkerRunning(
+            EnsureVSyncScheduled(
                 env.rdram.data(), &env.runtime);
             const auto initial =
                 env.runtime.debugEeSchedulerSnapshot();
@@ -873,8 +842,6 @@ void register_ps2_runtime_interrupt_tests()
             t.IsTrue(
                 env.runtime.memory().initialize(),
                 "runtime memory initialize should succeed");
-            env.runtime.setEeSchedulingMode(
-                ps2x::timing::EeSchedulingMode::Event);
             env.runtime.configureEeVSyncVideoMode(
                 0x02u, true);
 
@@ -973,11 +940,9 @@ void register_ps2_runtime_interrupt_tests()
             t.IsTrue(
                 env.runtime.memory().initialize(),
                 "runtime memory initialize should succeed");
-            env.runtime.setEeSchedulingMode(
-                ps2x::timing::EeSchedulingMode::Event);
             env.runtime.configureEeVSyncVideoMode(
                 0x02u, true);
-            EnsureVSyncWorkerRunning(
+            EnsureVSyncScheduled(
                 env.rdram.data(), &env.runtime);
 
             constexpr uint64_t kTicksPerEeCycle = 8u;
@@ -1153,6 +1118,7 @@ void register_ps2_runtime_interrupt_tests()
             notifyRuntimeStop();
             TestEnv env;
             t.IsTrue(env.runtime.memory().initialize(), "runtime memory initialize should succeed");
+            t.IsTrue(env.runtime.syncCoreSubsystems(), "runtime subsystems should bind");
 
             constexpr uint32_t kFlagAddr = 0x1180u;
             constexpr uint32_t kTickAddr = 0x1190u;
@@ -1244,8 +1210,9 @@ void register_ps2_runtime_interrupt_tests()
         {
             notifyRuntimeStop();
             TestEnv env;
-            env.runtime.setEeSchedulingMode(
-                ps2x::timing::EeSchedulingMode::Legacy);
+            t.IsTrue(
+                env.runtime.memory().initialize(),
+                "runtime memory initialize should succeed");
 
             g_vblankStartHits.store(0u, std::memory_order_relaxed);
             g_vblankEndHits.store(0u, std::memory_order_relaxed);
@@ -1283,15 +1250,20 @@ void register_ps2_runtime_interrupt_tests()
             t.IsTrue(callSyscall(0x73u, env.rdram.data(), &vsyncCtx, &env.runtime), "SetVSyncFlag syscall should dispatch");
             t.Equals(getRegS32(vsyncCtx, 2), KE_OK, "SetVSyncFlag should succeed");
 
-            const bool startSeen = waitUntil([&]() {
-                return g_vblankStartHits.load(std::memory_order_relaxed) > 0u;
-            }, std::chrono::milliseconds(400));
-            const bool endSeen = waitUntil([&]() {
-                return g_vblankEndHits.load(std::memory_order_relaxed) > 0u;
-            }, std::chrono::milliseconds(400));
-
-            t.IsTrue(startSeen, "VBLANK start handler should fire while cause 2 is enabled");
-            t.IsTrue(endSeen, "VBLANK end handler should fire while cause 3 is enabled");
+            R5900Context timingCtx{};
+            t.IsTrue(
+                serviceNextScheduledBoundary(env, timingCtx) &&
+                    serviceNextScheduledBoundary(env, timingCtx) &&
+                    serviceNextScheduledBoundary(env, timingCtx),
+                "one complete scheduled VBlank should service all three phases");
+            t.Equals(
+                g_vblankStartHits.load(std::memory_order_relaxed),
+                1u,
+                "VBLANK start handler should fire while cause 2 is enabled");
+            t.Equals(
+                g_vblankEndHits.load(std::memory_order_relaxed),
+                1u,
+                "VBLANK end handler should fire while cause 3 is enabled");
 
             R5900Context disableStart{};
             setRegU32(disableStart, 4, 2u);
@@ -1302,11 +1274,14 @@ void register_ps2_runtime_interrupt_tests()
                  (1u << 2u)) == 0u,
                 "DisableIntc should clear the matching hardware INTC mask bit");
 
-            std::this_thread::sleep_for(std::chrono::milliseconds(40));
             const uint32_t startAfterDisable = g_vblankStartHits.load(std::memory_order_relaxed);
             const uint32_t endAfterDisable = g_vblankEndHits.load(std::memory_order_relaxed);
 
-            std::this_thread::sleep_for(std::chrono::milliseconds(80));
+            t.IsTrue(
+                serviceNextScheduledBoundary(env, timingCtx) &&
+                    serviceNextScheduledBoundary(env, timingCtx) &&
+                    serviceNextScheduledBoundary(env, timingCtx),
+                "a second scheduled VBlank should service all three phases");
             const uint32_t startLater = g_vblankStartHits.load(std::memory_order_relaxed);
             const uint32_t endLater = g_vblankEndHits.load(std::memory_order_relaxed);
 
@@ -1322,10 +1297,13 @@ void register_ps2_runtime_interrupt_tests()
                  (1u << 2u)) != 0u,
                 "EnableIntc should set the matching hardware INTC mask bit");
 
-            const bool startResumed = waitUntil([&]() {
-                return g_vblankStartHits.load(std::memory_order_relaxed) > startLater;
-            }, std::chrono::milliseconds(300));
-            t.IsTrue(startResumed, "cause 2 handler should resume after re-enable");
+            t.IsTrue(
+                serviceNextScheduledBoundary(env, timingCtx),
+                "the next scheduled start phase should service");
+            t.IsTrue(
+                g_vblankStartHits.load(std::memory_order_relaxed) >
+                    startLater,
+                "cause 2 handler should resume after re-enable");
 
             const uint32_t lastArg = g_lastIntcArg.load(std::memory_order_relaxed);
             t.IsTrue(lastArg == 0xCAFE0002u || lastArg == 0xCAFE0003u,
@@ -1338,9 +1316,8 @@ void register_ps2_runtime_interrupt_tests()
         {
             notifyRuntimeStop();
             TestEnv env;
-            env.runtime.setEeSchedulingMode(
-                ps2x::timing::EeSchedulingMode::Legacy);
             t.IsTrue(env.runtime.memory().initialize(), "runtime memory initialize should succeed");
+            t.IsTrue(env.runtime.syncCoreSubsystems(), "runtime subsystems should bind");
 
             constexpr uint32_t kVif1Ch = 0x10009000u;
             constexpr uint32_t kTag = 0x00027F00u;
@@ -1355,12 +1332,19 @@ void register_ps2_runtime_interrupt_tests()
             t.IsTrue(env.runtime.memory().writeIORegister(kVif1Ch + 0x00u, 0u),
                      "VIF1 channel should accept TTE clear");
             ps2_stubs::sceDmaSend(rdram, &sendCtx, &env.runtime);
+            R5900Context timingCtx{};
+            t.IsTrue(
+                serviceAllScheduledBoundaries(env, timingCtx),
+                "TTE-clear VIF1 chain should reach its scheduled completion");
             t.Equals(env.runtime.memory().vif1_regs.itops, 0u,
                      "sceDmaSend must not infer TTE from the VIF channel");
 
             t.IsTrue(env.runtime.memory().writeIORegister(kVif1Ch + 0x00u, 0x40u),
                      "VIF1 channel should accept TTE set");
             ps2_stubs::sceDmaSend(rdram, &sendCtx, &env.runtime);
+            t.IsTrue(
+                serviceAllScheduledBoundaries(env, timingCtx),
+                "TTE-set VIF1 chain should reach its scheduled completion");
             t.Equals(env.runtime.memory().vif1_regs.itops, 0x55u,
                      "sceDmaSend should preserve configured TTE");
 
@@ -1371,9 +1355,8 @@ void register_ps2_runtime_interrupt_tests()
         {
             notifyRuntimeStop();
             TestEnv env;
-            env.runtime.setEeSchedulingMode(
-                ps2x::timing::EeSchedulingMode::Legacy);
             t.IsTrue(env.runtime.memory().initialize(), "runtime memory initialize should succeed");
+            t.IsTrue(env.runtime.syncCoreSubsystems(), "runtime subsystems should bind");
 
             constexpr uint32_t kHandlerAddr = 0x00ABD100u;
             constexpr uint32_t kVif1Ch = 0x10009000u;
@@ -1416,9 +1399,14 @@ void register_ps2_runtime_interrupt_tests()
             R5900Context sendCtx{};
             setRegU32(sendCtx, 4, kVif1Ch);
             setRegU32(sendCtx, 5, kTag0);
+            R5900Context timingCtx{};
             {
                 PS2Runtime::GuestExecutionScope guestExecution(&env.runtime);
                 ps2_stubs::sceDmaSend(rdram, &sendCtx, &env.runtime);
+                t.IsTrue(
+                    serviceAllScheduledBoundaries(
+                        env, timingCtx),
+                    "scheduled VIF1 work should complete before the outer safe point");
                 t.Equals(g_dmacSendHits.load(std::memory_order_relaxed), 0u,
                          "sceDmaSend must not re-enter the guest DMAC handler before returning");
                 writeGuestU32(rdram, kPublishedAddr, kPublishedValue);
@@ -1437,60 +1425,13 @@ void register_ps2_runtime_interrupt_tests()
             cleanupRuntime(env);
         });
 
-        tc.Run("VBLANK callbacks serialize with guest execution", [](TestCase &t)
-        {
-            notifyRuntimeStop();
-            TestEnv env;
-            env.runtime.setEeSchedulingMode(
-                ps2x::timing::EeSchedulingMode::Legacy);
-
-            constexpr uint32_t kFlagAddr = 0x1140u;
-            constexpr uint32_t kTickAddr = 0x1150u;
-            constexpr uint32_t kHandlerAddr = 0x00ABC180u;
-
-            g_vblankStartHits.store(0u, std::memory_order_relaxed);
-            env.runtime.registerFunction(kHandlerAddr, &testIntcHandler);
-
-            {
-                PS2Runtime::GuestExecutionScope guestExecution(&env.runtime);
-
-                R5900Context addCtx{};
-                setRegU32(addCtx, 4, 2u);
-                setRegU32(addCtx, 5, kHandlerAddr);
-                setRegU32(addCtx, 6, 0u);
-                setRegU32(addCtx, 7, 0xCAFE0002u);
-                ps2_syscalls::AddIntcHandler(env.rdram.data(), &addCtx, &env.runtime);
-                t.IsTrue(getRegS32(addCtx, 2) > 0, "AddIntcHandler should register VBLANK start handler");
-
-                R5900Context vsyncCtx{};
-                setRegU32(vsyncCtx, 4, kFlagAddr);
-                setRegU32(vsyncCtx, 5, kTickAddr);
-                ps2_syscalls::SetVSyncFlag(env.rdram.data(), &vsyncCtx, &env.runtime);
-
-                std::this_thread::sleep_for(std::chrono::milliseconds(50));
-                t.Equals(g_vblankStartHits.load(std::memory_order_relaxed), 0u,
-                         "VBLANK handler must not run concurrently with a guest execution scope");
-                t.Equals(readGuestU64(env.rdram.data(), kTickAddr), 0ull,
-                         "VBLANK guest state must not update concurrently with guest execution");
-            }
-
-            const bool handlerRan = waitUntil([&]() {
-                return g_vblankStartHits.load(std::memory_order_relaxed) > 0u;
-            }, std::chrono::milliseconds(300));
-            t.IsTrue(handlerRan, "VBLANK handler should run after guest execution is released");
-            t.IsTrue(readGuestU64(env.rdram.data(), kTickAddr) > 0u,
-                     "VBLANK guest state should update after guest execution is released");
-
-            cleanupRuntime(env);
-        });
 
         tc.Run("MMIO VIF1 completion waits for the outer guest safe point", [](TestCase &t)
         {
             notifyRuntimeStop();
             TestEnv env;
-            env.runtime.setEeSchedulingMode(
-                ps2x::timing::EeSchedulingMode::Legacy);
             t.IsTrue(env.runtime.memory().initialize(), "runtime memory initialize should succeed");
+            t.IsTrue(env.runtime.syncCoreSubsystems(), "runtime subsystems should bind");
 
             constexpr uint32_t kHandlerAddr = 0x00ABD180u;
             constexpr uint32_t kVif1Ch = 0x10009000u;
@@ -1526,6 +1467,10 @@ void register_ps2_runtime_interrupt_tests()
                 PS2Runtime::GuestExecutionScope guestExecution(&env.runtime);
                 env.runtime.Store32(rdram, &storeCtx, kVif1Ch + 0x30u, kTag0);
                 env.runtime.Store32(rdram, &storeCtx, kVif1Ch + 0x00u, 0x185u);
+                t.IsTrue(
+                    serviceAllScheduledBoundaries(
+                        env, storeCtx),
+                    "MMIO VIF1 work should complete before the outer safe point");
                 t.Equals(g_dmacSendHits.load(std::memory_order_relaxed), 0u,
                          "CHCR write must not synchronously re-enter the guest DMAC handler");
             }
@@ -1602,9 +1547,8 @@ void register_ps2_runtime_interrupt_tests()
         {
             notifyRuntimeStop();
             TestEnv env;
-            env.runtime.setEeSchedulingMode(
-                ps2x::timing::EeSchedulingMode::Legacy);
             t.IsTrue(env.runtime.memory().initialize(), "runtime memory initialize should succeed");
+            t.IsTrue(env.runtime.syncCoreSubsystems(), "runtime subsystems should bind");
 
             constexpr uint32_t kHandlerAddr = 0x00ABD1C0u;
             constexpr uint32_t kDStat = 0x1000E010u;
@@ -1638,6 +1582,10 @@ void register_ps2_runtime_interrupt_tests()
             {
                 PS2Runtime::GuestExecutionScope guestExecution(&env.runtime);
                 env.runtime.kickGifDmaChainFromMMIO(rdram, &kickCtx, 4u, 4u, kTag0, 0x105u);
+                t.IsTrue(
+                    serviceAllScheduledBoundaries(
+                        env, kickCtx),
+                    "native GIF work should complete before the outer safe point");
                 t.Equals(g_dmacSendHits.load(std::memory_order_relaxed), 0u,
                          "native GIF kick must not synchronously re-enter the guest DMAC handler");
             }
@@ -1664,8 +1612,6 @@ void register_ps2_runtime_interrupt_tests()
             t.IsTrue(
                 env.runtime.memory().initialize(),
                 "runtime memory initialize should succeed");
-            env.runtime.setEeSchedulingMode(
-                ps2x::timing::EeSchedulingMode::Event);
 
             constexpr uint32_t kHandlerAddr = 0x00ABD200u;
             constexpr uint32_t kVif1Ch = 0x10009000u;
@@ -1782,8 +1728,6 @@ void register_ps2_runtime_interrupt_tests()
             t.IsTrue(
                 env.runtime.memory().initialize(),
                 "runtime memory initialize should succeed");
-            env.runtime.setEeSchedulingMode(
-                ps2x::timing::EeSchedulingMode::Event);
 
             constexpr uint32_t kHandlerAddr = 0x00ABD240u;
             constexpr uint32_t kDStat = 0x1000E010u;
@@ -1862,8 +1806,6 @@ void register_ps2_runtime_interrupt_tests()
             t.IsTrue(
                 env.runtime.memory().initialize(),
                 "runtime memory initialize should succeed");
-            env.runtime.setEeSchedulingMode(
-                ps2x::timing::EeSchedulingMode::Event);
 
             constexpr uint32_t kHandlerAddr = 0x00ABD260u;
             constexpr uint32_t kCount = 0x10000000u;

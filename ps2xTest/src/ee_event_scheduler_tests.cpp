@@ -102,8 +102,6 @@ void register_ee_event_scheduler_tests()
                 EeEventSource::DmacFromScratchpad, deadline);
             (void)scheduler.scheduleAbsolute(
                 EeEventSource::VifVu0Finish, deadline);
-            (void)scheduler.scheduleAbsolute(
-                EeEventSource::Vu0PeriodicCompatibility, deadline);
 
             std::vector<EeEventSource> order;
             scheduler.serviceDue(
@@ -113,9 +111,9 @@ void register_ee_event_scheduler_tests()
                     order.push_back(service.source);
                 });
             t.Equals(
-                order.size(), static_cast<size_t>(16u),
+                order.size(), static_cast<size_t>(15u),
                 "all equal-deadline events should dispatch");
-            if (order.size() == 16u)
+            if (order.size() == 15u)
             {
                 t.IsTrue(
                     order[0] ==
@@ -165,11 +163,7 @@ void register_ee_event_scheduler_tests()
                     "VU0 finish should follow DMAC callbacks");
                 t.IsTrue(
                     order[14] == EeEventSource::VifVu1Finish,
-                    "VU1 finish should follow VU0 finish");
-                t.IsTrue(
-                    order[15] ==
-                        EeEventSource::Vu0PeriodicCompatibility,
-                    "the ordinary VU0 batch should follow device callbacks");
+                    "VU1 finish should follow VU0 finish and complete the device batch");
             }
         });
 

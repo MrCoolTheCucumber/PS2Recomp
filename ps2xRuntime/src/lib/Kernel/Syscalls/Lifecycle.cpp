@@ -8,7 +8,6 @@ namespace ps2_syscalls
 
     void notifyRuntimeStop()
     {
-        stopInterruptWorker();
         {
             std::lock_guard<std::mutex> lock(g_irq_handler_mutex);
             g_intcHandlers.clear();

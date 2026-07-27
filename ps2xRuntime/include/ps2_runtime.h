@@ -431,10 +431,6 @@ public:
     bool syncCoreSubsystems();
     [[nodiscard]] ps2x::timing::EeTick currentEeTick() const noexcept;
     void resetEeTiming(R5900Context *context = nullptr);
-    void setEeSchedulingMode(
-        ps2x::timing::EeSchedulingMode mode);
-    [[nodiscard]] ps2x::timing::EeSchedulingMode
-    eeSchedulingMode() const noexcept;
     bool loadELF(const std::string &elfPath);
     void run();
 
@@ -607,7 +603,7 @@ public:
     struct DebugEeEventSlot
     {
         ps2x::timing::EeEventSource source =
-            ps2x::timing::EeEventSource::Vu0PeriodicCompatibility;
+            ps2x::timing::EeEventSource::Cop0Performance;
         uint64_t deadlineTick = 0u;
         uint64_t generation = 0u;
         uint64_t sequence = 0u;
@@ -617,17 +613,9 @@ public:
 
     struct DebugEeScheduler
     {
-        ps2x::timing::EeSchedulingMode mode =
-            ps2x::timing::EeSchedulingMode::Legacy;
         uint64_t currentTick = 0u;
         uint64_t nextDeadlineTick = 0u;
         bool hasNextDeadline = false;
-        bool shadowMismatch = false;
-        uint64_t shadowMismatchTick = 0u;
-        uint64_t legacyDeadlineTick = 0u;
-        uint64_t schedulerDeadlineTick = 0u;
-        bool legacyPending = false;
-        bool schedulerPending = false;
         std::array<DebugEeEventSlot,
                    ps2x::timing::kEeEventSourceCount>
             slots{};
@@ -638,7 +626,7 @@ public:
     {
         uint64_t sequence = 0u;
         ps2x::timing::EeEventSource source =
-            ps2x::timing::EeEventSource::Vu0PeriodicCompatibility;
+            ps2x::timing::EeEventSource::Cop0Performance;
         uint64_t eventSequence = 0u;
         uint64_t generation = 0u;
         uint64_t scheduledTick = 0u;
@@ -852,8 +840,6 @@ public:
     void synchronizeVU0Microprogram(uint8_t *rdram,
                                     R5900Context *ctx,
                                     bool interlocked);
-    void advanceVU0AtEeBlockBoundary(uint8_t *rdram,
-                                     R5900Context *ctx);
     void serviceEeEventsAtBlockBoundary(uint8_t *rdram,
                                         R5900Context *ctx);
     void configureEeVSyncVideoMode(
@@ -1123,10 +1109,6 @@ private:
         bool eventDue,
         ps2x::timing::EeTick eeCycleTick,
         ps2x::timing::EeTick nextEventTick);
-    void advanceVU0LegacyAtBlockBoundary(
-        uint8_t *rdram,
-        R5900Context *ctx,
-        ps2x::timing::EeTick eeCycleTick);
     void serviceEeEventsAtTick(
         uint8_t *rdram,
         R5900Context *ctx,
@@ -1262,16 +1244,8 @@ private:
     void onDmacCompletionReady();
     size_t publishReadyDmacCompletions(
         uint64_t eventSequence);
-    void publishCompatibilityDmacCompletions();
     void collectPendingDmacInterrupts();
     void onDmacInterruptStateChanged();
-    [[nodiscard]] ps2x::timing::EeTick
-    nextVu0CompatibilityDeadline(
-        ps2x::timing::EeTick scheduledTick,
-        ps2x::timing::EeTick serviceTick) const noexcept;
-    void scheduleVu0CompatibilityEvent(
-        ps2x::timing::EeTick deadline) noexcept;
-    void cancelVu0CompatibilityEvent() noexcept;
     [[nodiscard]] ps2x::timing::EeTick
     prepareCop0Access(
         uint8_t *rdram,
@@ -1296,8 +1270,6 @@ private:
         bool commitContextProgress = true);
     [[noreturn]] void raiseCop0PerformanceException(
         R5900Context *ctx);
-    bool checkEeSchedulerShadow(
-        ps2x::timing::EeTick now);
     [[nodiscard]] ps2x::timing::EeTick publishEeElapsed(
         ps2x::timing::EeTickDelta elapsed) noexcept;
     [[nodiscard]] ps2x::timing::EeTick commitEeContextProgress(
@@ -1322,8 +1294,6 @@ private:
     ps2x::timing::Cop0Timing m_cop0Timing;
     ps2x::timing::EeTimeline m_eeTimeline;
     ps2x::timing::EeEventScheduler m_eeEventScheduler;
-    ps2x::timing::EeSchedulingMode m_eeSchedulingMode =
-        ps2x::timing::EeSchedulingMode::Event;
     struct Vu1ExecutionTiming
     {
         uint64_t generation = 0u;
@@ -1457,13 +1427,6 @@ private:
         m_pendingVSyncDeliveries{};
     size_t m_pendingVSyncDeliveryCount = 0u;
     ps2x::timing::EeTick m_vu0CycleTick{};
-    ps2x::timing::EeTick m_vu0NextEventCycleTick{};
-    bool m_eeSchedulerShadowMismatch = false;
-    ps2x::timing::EeTick m_eeSchedulerShadowMismatchTick{};
-    ps2x::timing::EeTick m_eeSchedulerShadowLegacyDeadline{};
-    ps2x::timing::EeTick m_eeSchedulerShadowDeadline{};
-    bool m_eeSchedulerShadowLegacyPending = false;
-    bool m_eeSchedulerShadowPending = false;
     std::atomic<uint64_t> m_vu0InvocationSequence{0u};
     std::atomic<uint64_t> m_vu0CurrentInvocation{0u};
     std::atomic<uint64_t> m_vu0CurrentInvocationInstruction{0u};
@@ -1479,7 +1442,6 @@ private:
     std::atomic<uint64_t> m_guestExecutionPreemptionEpoch{0u};
     std::atomic<bool> m_guestExecutionPreemptionRequested{false};
     std::atomic<bool> m_dmacCompletionReady{false};
-    uint64_t m_dmacCompatibilityEventSequence = 0u;
     std::vector<DmacPendingInterrupt> m_pendingDmacInterrupts;
     mutable std::mutex m_guestHeapMutex;
     mutable std::mutex m_asyncCallbackStackMutex;

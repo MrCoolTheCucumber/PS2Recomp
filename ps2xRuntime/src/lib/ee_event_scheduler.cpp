@@ -161,7 +161,7 @@ namespace ps2x::timing
         m_hasPending = false;
         m_nextDeadline = EeTick::fromRaw(
             std::numeric_limits<uint64_t>::max());
-        m_nextSource = EeEventSource::Vu0PeriodicCompatibility;
+        m_nextSource = EeEventSource::Cop0Performance;
 
         for (size_t index = 0u; index < m_slots.size(); ++index)
         {

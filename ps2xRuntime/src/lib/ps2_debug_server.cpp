@@ -1108,8 +1108,7 @@ struct PS2DebugServer::Impl
     {
         Value value(rapidjson::kObjectType);
         addString(
-            value, "mode",
-            ps2x::timing::eeSchedulingModeName(scheduler.mode),
+            value, "mode", "event",
             allocator);
         value.AddMember(
             "current_tick", scheduler.currentTick, allocator);
@@ -1125,8 +1124,6 @@ struct PS2DebugServer::Impl
                 "next_deadline_tick",
                 Value(rapidjson::kNullType), allocator);
         }
-        value.AddMember(
-            "shadow_mismatch", scheduler.shadowMismatch, allocator);
         value.AddMember(
             "statistics",
             eeSchedulerStatisticsValue(
@@ -1171,9 +1168,7 @@ struct PS2DebugServer::Impl
             "timing_context_bound",
             timing.contextBound, allocator);
         addString(
-            result, "scheduler_mode",
-            ps2x::timing::eeSchedulingModeName(
-                scheduler.mode),
+            result, "scheduler_mode", "event",
             allocator);
         if (scheduler.hasNextDeadline)
         {
@@ -1187,9 +1182,6 @@ struct PS2DebugServer::Impl
                 "next_event_cycle_tick",
                 Value(rapidjson::kNullType), allocator);
         }
-        result.AddMember(
-            "scheduler_shadow_mismatch",
-            scheduler.shadowMismatch, allocator);
         result.AddMember(
             "scheduler_statistics",
             eeSchedulerStatisticsValue(

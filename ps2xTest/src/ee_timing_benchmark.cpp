@@ -17,7 +17,7 @@
 
 namespace
 {
-    constexpr uint32_t kOutputSchemaVersion = 2u;
+    constexpr uint32_t kOutputSchemaVersion = 3u;
 
     std::atomic<bool> g_trackAllocations{false};
     std::atomic<uint64_t> g_allocationCount{0u};
@@ -221,7 +221,7 @@ namespace
         uint64_t eeBlocks = 0u;
         uint64_t eeTicks = 0u;
         uint64_t eventTests = 0u;
-        uint64_t vu0Services = 0u;
+        uint64_t eventServices = 0u;
         uint64_t vuPairs = 0u;
         uint64_t hostNanoseconds = 0u;
         uint64_t allocations = 0u;
@@ -346,36 +346,94 @@ namespace
         }
     }
 
-    void prepareScheduled(
-        PS2Runtime &runtime, R5900Context &context,
-        const Configuration &configuration,
-        ps2x::timing::EeSchedulingMode mode)
+    uint64_t committedEeCycles(
+        uint64_t blocks, uint32_t blockTicks)
     {
-        runtime.setEeSchedulingMode(mode);
+        const uint64_t cyclesPerBlock =
+            std::max<uint32_t>(blockTicks >> 3u, 1u);
+        if (blocks >
+            std::numeric_limits<uint64_t>::max() /
+                cyclesPerBlock)
+        {
+            throw std::runtime_error(
+                "EE cycle count overflows uint64_t");
+        }
+        return blocks * cyclesPerBlock;
+    }
+
+    uint64_t committedEeTicks(
+        uint64_t blocks, uint32_t blockTicks)
+    {
+        const uint64_t cycles =
+            committedEeCycles(blocks, blockTicks);
+        if (cycles >
+            std::numeric_limits<uint64_t>::max() / 8u)
+        {
+            throw std::runtime_error(
+                "EE tick count overflows uint64_t");
+        }
+        return cycles * 8u;
+    }
+
+    uint32_t checkedVuBudget(
+        uint64_t blocks, uint32_t blockTicks)
+    {
+        const uint64_t budget =
+            committedEeCycles(blocks, blockTicks);
+        if (budget >
+            std::numeric_limits<uint32_t>::max())
+        {
+            throw std::runtime_error(
+                "VU budget exceeds uint32_t");
+        }
+        return static_cast<uint32_t>(budget);
+    }
+
+    void startDirectVu(PS2Runtime &runtime)
+    {
+        runtime.vu0().execute(
+            runtime.memory().getVU0Code(),
+            PS2_VU0_CODE_SIZE,
+            runtime.memory().getVU0Data(),
+            PS2_VU0_DATA_SIZE,
+            runtime.gs(), &runtime.memory(),
+            0u, 0u, 0u, 16u);
+    }
+
+    void prepareEventEqualWork(
+        PS2Runtime &runtime, R5900Context &context,
+        const Configuration &configuration)
+    {
         runtime.vu0().setProgressTrackingEnabled(true);
-        runtime.vu0StartMicroProgram(
-            runtime.memory().getRDRAM(), &context, 0u);
+        startDirectVu(runtime);
         advanceScheduledBlocks(
             runtime, context, configuration.warmupBlocks,
             configuration.blockTicks);
+        runtime.vu0().continueExecution(
+            runtime.memory().getVU0Code(),
+            PS2_VU0_CODE_SIZE,
+            runtime.memory().getVU0Data(),
+            PS2_VU0_DATA_SIZE,
+            runtime.gs(), &runtime.memory(),
+            checkedVuBudget(
+                configuration.warmupBlocks,
+                configuration.blockTicks));
 
+        runtime.resetEeTiming(&context);
         runtime.vu0().reset();
-        runtime.synchronizeVU0Microprogram(
-            runtime.memory().getRDRAM(), &context, false);
         context = R5900Context{};
-        runtime.vu0StartMicroProgram(
-            runtime.memory().getRDRAM(), &context, 0u);
+        startDirectVu(runtime);
     }
 
-    Measurement measureScheduled(
-        uint32_t sample, const Configuration &configuration,
-        ps2x::timing::EeSchedulingMode mode)
+    Measurement measureEventEqualWork(
+        uint32_t sample, const Configuration &configuration)
     {
         PS2Runtime runtime;
         R5900Context context{};
         if (!initializeFixture(runtime))
             throw std::runtime_error("failed to initialize scheduler fixture");
-        prepareScheduled(runtime, context, configuration, mode);
+        prepareEventEqualWork(
+            runtime, context, configuration);
 
         const VU1ProgressSnapshot before =
             runtime.vu0().getProgressSnapshot();
@@ -388,38 +446,32 @@ namespace
         advanceScheduledBlocks(
             runtime, context, configuration.blocks,
             configuration.blockTicks);
+        runtime.vu0().continueExecution(
+            runtime.memory().getVU0Code(),
+            PS2_VU0_CODE_SIZE,
+            runtime.memory().getVU0Data(),
+            PS2_VU0_DATA_SIZE,
+            runtime.gs(), &runtime.memory(),
+            checkedVuBudget(
+                configuration.blocks,
+                configuration.blockTicks));
         const auto stopped = std::chrono::steady_clock::now();
         g_trackAllocations.store(false, std::memory_order_release);
 
         const VU1ProgressSnapshot after =
             runtime.vu0().getProgressSnapshot();
         Measurement result{};
-        switch (mode)
-        {
-        case ps2x::timing::EeSchedulingMode::Legacy:
-            result.mode = "legacy_scheduler";
-            break;
-        case ps2x::timing::EeSchedulingMode::Shadow:
-            result.mode = "shadow_scheduler_compatibility";
-            break;
-        case ps2x::timing::EeSchedulingMode::Event:
-            result.mode = "event_scheduler";
-            break;
-        }
+        result.mode = "event_scheduler_equal_work";
         result.sample = sample;
         result.eeBlocks = configuration.blocks;
-        result.eeTicks =
-            configuration.blocks *
-            static_cast<uint64_t>(
-                std::max<uint32_t>(configuration.blockTicks >> 3u, 1u) *
-                8u);
+        result.eeTicks = committedEeTicks(
+            configuration.blocks,
+            configuration.blockTicks);
         result.eventTests = configuration.blocks;
-        result.vu0Services =
-            mode == ps2x::timing::EeSchedulingMode::Legacy
-                ? after.invocations - before.invocations
-                : runtime.debugEeSchedulerSnapshot()
-                          .statistics.serviced -
-                      beforeServices;
+        result.eventServices =
+            runtime.debugEeSchedulerSnapshot()
+                    .statistics.serviced -
+                beforeServices;
         result.vuPairs = after.cycles - before.cycles;
         result.hostNanoseconds =
             static_cast<uint64_t>(
@@ -443,13 +495,14 @@ namespace
         if (!initializeFixture(runtime))
             throw std::runtime_error(
                 "failed to initialize no-event fixture");
-        runtime.setEeSchedulingMode(
-            ps2x::timing::EeSchedulingMode::Event);
         advanceScheduledBlocks(
             runtime, context, configuration.warmupBlocks,
             configuration.blockTicks);
         runtime.resetEeTiming(&context);
 
+        const uint64_t beforeServices =
+            runtime.debugEeSchedulerSnapshot()
+                .statistics.serviced;
         g_allocationCount.store(0u, std::memory_order_relaxed);
         g_allocationBytes.store(0u, std::memory_order_relaxed);
         g_trackAllocations.store(true, std::memory_order_release);
@@ -464,13 +517,14 @@ namespace
         result.mode = "event_scheduler_no_pending";
         result.sample = sample;
         result.eeBlocks = configuration.blocks;
-        result.eeTicks =
-            configuration.blocks *
-            static_cast<uint64_t>(
-                std::max<uint32_t>(
-                    configuration.blockTicks >> 3u, 1u) *
-                8u);
+        result.eeTicks = committedEeTicks(
+            configuration.blocks,
+            configuration.blockTicks);
         result.eventTests = configuration.blocks;
+        result.eventServices =
+            runtime.debugEeSchedulerSnapshot()
+                    .statistics.serviced -
+                beforeServices;
         result.hostNanoseconds =
             static_cast<uint64_t>(
                 std::chrono::duration_cast<std::chrono::nanoseconds>(
@@ -491,10 +545,7 @@ namespace
     {
         VU1Interpreter &vu = runtime.vu0();
         vu.setProgressTrackingEnabled(true);
-        vu.execute(
-            runtime.memory().getVU0Code(), PS2_VU0_CODE_SIZE,
-            runtime.memory().getVU0Data(), PS2_VU0_DATA_SIZE,
-            runtime.gs(), &runtime.memory(), 0u, 0u, 0u, 16u);
+        startDirectVu(runtime);
         for (uint64_t block = 0u;
              block < configuration.warmupBlocks; ++block)
         {
@@ -505,17 +556,13 @@ namespace
             runtime.memory().getVU0Code(), PS2_VU0_CODE_SIZE,
             runtime.memory().getVU0Data(), PS2_VU0_DATA_SIZE,
             runtime.gs(), &runtime.memory(),
-            static_cast<uint32_t>(
-                std::min<uint64_t>(
-                    configuration.warmupBlocks,
-                    std::numeric_limits<uint32_t>::max())));
+            checkedVuBudget(
+                configuration.warmupBlocks,
+                configuration.blockTicks));
 
         vu.reset();
         context = R5900Context{};
-        vu.execute(
-            runtime.memory().getVU0Code(), PS2_VU0_CODE_SIZE,
-            runtime.memory().getVU0Data(), PS2_VU0_DATA_SIZE,
-            runtime.gs(), &runtime.memory(), 0u, 0u, 0u, 16u);
+        startDirectVu(runtime);
     }
 
     Measurement measureDirect(
@@ -556,11 +603,9 @@ namespace
         result.mode = "pre_scheduler_equal_work";
         result.sample = sample;
         result.eeBlocks = configuration.blocks;
-        result.eeTicks =
-            configuration.blocks *
-            static_cast<uint64_t>(
-                std::max<uint32_t>(configuration.blockTicks >> 3u, 1u) *
-                8u);
+        result.eeTicks = committedEeTicks(
+            configuration.blocks,
+            configuration.blockTicks);
         result.vuPairs = after.cycles - before.cycles;
         result.hostNanoseconds =
             static_cast<uint64_t>(
@@ -587,9 +632,8 @@ namespace
             << "\"ee_cycle_ticks\":" << measurement.eeTicks << ','
             << "\"ee_cycles\":" << (measurement.eeTicks >> 3u) << ','
             << "\"event_tests\":" << measurement.eventTests << ','
-            << "\"event_services\":" << measurement.vu0Services << ','
-            << "\"source_services\":{\"vu0_periodic_compatibility\":"
-            << measurement.vu0Services << "},"
+            << "\"event_services\":" << measurement.eventServices << ','
+            << "\"source_services\":{},"
             << "\"vu_instruction_pairs\":" << measurement.vuPairs << ','
             << "\"vu_cycles\":" << measurement.vuPairs << ','
             << "\"host_time_ns\":" << measurement.hostNanoseconds << ','
@@ -622,57 +666,46 @@ int main(int argc, char **argv)
 
     try
     {
-        std::vector<uint64_t> legacyTimes;
-        std::vector<uint64_t> shadowTimes;
+        std::vector<uint64_t> eventTimes;
         std::vector<uint64_t> noEventTimes;
         std::vector<uint64_t> directTimes;
-        legacyTimes.reserve(configuration.samples);
-        shadowTimes.reserve(configuration.samples);
+        eventTimes.reserve(configuration.samples);
         noEventTimes.reserve(configuration.samples);
         directTimes.reserve(configuration.samples);
 
-        uint64_t expectedVuPairs = 0u;
+        const uint64_t expectedVuPairs =
+            committedEeCycles(
+                configuration.blocks,
+                configuration.blockTicks);
+        if (expectedVuPairs >
+            std::numeric_limits<uint32_t>::max())
+        {
+            throw std::runtime_error(
+                "equal-work VU budget exceeds uint32_t");
+        }
         uint64_t expectedStateHash = 0u;
         for (uint32_t sample = 0u; sample < configuration.samples; ++sample)
         {
-            const Measurement legacy =
-                measureScheduled(
-                    sample, configuration,
-                    ps2x::timing::EeSchedulingMode::Legacy);
+            const Measurement event =
+                measureEventEqualWork(
+                    sample, configuration);
             if (sample == 0u)
             {
-                expectedVuPairs = legacy.vuPairs;
-                expectedStateHash = legacy.stateHash;
+                expectedStateHash = event.stateHash;
             }
-            else if (legacy.vuPairs != expectedVuPairs ||
-                     legacy.stateHash != expectedStateHash)
+            if (event.vuPairs != expectedVuPairs ||
+                event.stateHash != expectedStateHash ||
+                event.eventServices != 0u)
             {
                 throw std::runtime_error(
-                    "legacy benchmark work is not deterministic");
+                    "event benchmark work is not deterministic");
             }
-            printMeasurement(legacy);
-            legacyTimes.push_back(legacy.hostNanoseconds);
-
-            // Event mode no longer has a private periodic VU0 source. Shadow
-            // mode is the rollout compatibility path which still compares
-            // the fixed-slot deadline against the legacy scheduler while
-            // applying VU progress exactly once through the legacy owner.
-            const Measurement shadow =
-                measureScheduled(
-                    sample, configuration,
-                    ps2x::timing::EeSchedulingMode::Shadow);
-            if (shadow.vuPairs != expectedVuPairs ||
-                shadow.stateHash != expectedStateHash)
-            {
-                throw std::runtime_error(
-                    "shadow compatibility result does not match legacy result");
-            }
-            printMeasurement(shadow);
-            shadowTimes.push_back(shadow.hostNanoseconds);
+            printMeasurement(event);
+            eventTimes.push_back(event.hostNanoseconds);
 
             const Measurement noEvent =
                 measureNoEventHotPath(sample, configuration);
-            if (noEvent.vu0Services != 0u ||
+            if (noEvent.eventServices != 0u ||
                 noEvent.vuPairs != 0u)
             {
                 throw std::runtime_error(
@@ -688,22 +721,21 @@ int main(int argc, char **argv)
                 direct.stateHash != expectedStateHash)
             {
                 throw std::runtime_error(
-                    "equal-work direct result does not match legacy result");
+                    "equal-work direct result does not match event result");
             }
             printMeasurement(direct);
             directTimes.push_back(direct.hostNanoseconds);
         }
 
-        const uint64_t legacyMedian = medianHostTime(legacyTimes);
-        const uint64_t shadowMedian =
-            medianHostTime(shadowTimes);
+        const uint64_t eventMedian =
+            medianHostTime(eventTimes);
         const uint64_t noEventMedian =
             medianHostTime(noEventTimes);
         const uint64_t directMedian = medianHostTime(directTimes);
         const double ratio =
             directMedian == 0u
                 ? 0.0
-                : static_cast<double>(legacyMedian) /
+                : static_cast<double>(eventMedian) /
                       static_cast<double>(directMedian);
         std::cout
             << "{\"schema_version\":" << kOutputSchemaVersion
@@ -711,26 +743,18 @@ int main(int argc, char **argv)
             << "\"samples\":" << configuration.samples << ','
             << "\"ee_blocks\":" << configuration.blocks << ','
             << "\"ee_cycle_ticks\":"
-            << (configuration.blocks *
-                static_cast<uint64_t>(
-                    std::max<uint32_t>(
-                        configuration.blockTicks >> 3u, 1u) *
-                    8u))
+            << committedEeTicks(
+                   configuration.blocks,
+                   configuration.blockTicks)
             << ','
             << "\"vu_instruction_pairs\":" << expectedVuPairs << ','
-            << "\"legacy_median_host_time_ns\":" << legacyMedian << ','
-            << "\"shadow_compatibility_median_host_time_ns\":"
-            << shadowMedian << ','
+            << "\"event_equal_work_median_host_time_ns\":"
+            << eventMedian << ','
             << "\"event_no_pending_median_host_time_ns\":"
             << noEventMedian << ','
             << "\"pre_scheduler_equal_work_median_host_time_ns\":"
             << directMedian << ','
-            << "\"legacy_to_pre_scheduler_ratio\":" << ratio
-            << ",\"shadow_to_legacy_ratio\":"
-            << (legacyMedian == 0u
-                    ? 0.0
-                    : static_cast<double>(shadowMedian) /
-                          static_cast<double>(legacyMedian))
+            << "\"event_to_pre_scheduler_ratio\":" << ratio
             << "}\n";
     }
     catch (const std::exception &error)

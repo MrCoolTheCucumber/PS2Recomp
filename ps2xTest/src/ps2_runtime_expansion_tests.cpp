@@ -1471,76 +1471,6 @@ void register_ps2_runtime_expansion_tests()
                      "missing target should remain visible in ctx->pc for diagnostics");
         });
 
-        tc.Run("vblank intc handlers cooperatively preempt serialized guest execution", [](TestCase &t)
-        {
-            notifyRuntimeStop();
-
-            PS2Runtime runtime;
-            runtime.setEeSchedulingMode(
-                ps2x::timing::EeSchedulingMode::Legacy);
-            std::vector<uint8_t> rdram(PS2_RAM_SIZE, 0u);
-            constexpr uint32_t kBusyEntry = 0x160000u;
-            constexpr uint32_t kIntcHandlerEntry = 0x170000u;
-
-            runtime.registerFunction(kBusyEntry, &testWaitForAsyncCounter);
-            runtime.registerFunction(kIntcHandlerEntry, &testSignalAsyncCounter);
-
-            R5900Context addCtx{};
-            setRegU32(addCtx, 4, 2u);
-            setRegU32(addCtx, 5, kIntcHandlerEntry);
-            setRegU32(addCtx, 6, 0u);
-            setRegU32(addCtx, 7, 0u);
-            AddIntcHandler(rdram.data(), &addCtx, &runtime);
-            t.IsTrue(getRegS32(addCtx, 2) > 0, "AddIntcHandler should register a VBlank handler");
-
-            R5900Context busyCtx{};
-            busyCtx.pc = kBusyEntry;
-            std::atomic<bool> workerDone{false};
-            std::atomic<bool> workerThrew{false};
-
-            std::thread worker([&]()
-            {
-                try
-                {
-                    runtime.dispatchLoop(rdram.data(), &busyCtx);
-                }
-                catch (...)
-                {
-                    workerThrew.store(true, std::memory_order_release);
-                }
-                workerDone.store(true, std::memory_order_release);
-            });
-
-            ps2_syscalls::EnsureVSyncWorkerRunning(rdram.data(), &runtime);
-
-            const bool finished = waitUntil([&]()
-            {
-                return workerDone.load(std::memory_order_acquire);
-            }, std::chrono::milliseconds(250));
-
-            if (!finished)
-            {
-                const uint32_t counter = 1u;
-                std::memcpy(rdram.data() + kAsyncCounterAddr, &counter, sizeof(counter));
-            }
-
-            if (worker.joinable())
-            {
-                worker.join();
-            }
-
-            runtime.requestStop();
-            notifyRuntimeStop();
-
-            uint32_t counter = 0u;
-            std::memcpy(&counter, rdram.data() + kAsyncCounterAddr, sizeof(counter));
-
-            t.IsFalse(workerThrew.load(std::memory_order_acquire),
-                      "busy dispatch worker should not throw while VBlank handlers fire");
-            t.IsTrue(finished,
-                     "VBlank interrupt handlers should run even while a guest thread is spinning");
-            t.Equals(counter, 1u, "VBlank handler should publish the awaited counter value");
-        });
 
         tc.Run("GS async callbacks keep a dedicated stack when guest heap is exhausted", [](TestCase &t)
         {
@@ -3078,8 +3008,6 @@ void register_ps2_runtime_expansion_tests()
             t.IsTrue(
                 runtime.syncCoreSubsystems(),
                 "VU1 timing fixture subsystems should bind");
-            runtime.setEeSchedulingMode(
-                ps2x::timing::EeSchedulingMode::Event);
 
             constexpr uint32_t kVuUpperNop = 0x000002FFu;
             constexpr uint32_t kVuUpperEnd = 0x400002FFu;
@@ -3172,8 +3100,6 @@ void register_ps2_runtime_expansion_tests()
             t.IsTrue(
                 runtime.syncCoreSubsystems(),
                 "SPR_TO timing fixture subsystems should bind");
-            runtime.setEeSchedulingMode(
-                ps2x::timing::EeSchedulingMode::Event);
 
             constexpr uint32_t kSprTo = 0x1000D400u;
             constexpr uint32_t kDstat = 0x1000E010u;
@@ -3349,8 +3275,6 @@ void register_ps2_runtime_expansion_tests()
             t.IsTrue(
                 runtime.syncCoreSubsystems(),
                 "equal-tick SPR fixture subsystems should bind");
-            runtime.setEeSchedulingMode(
-                ps2x::timing::EeSchedulingMode::Event);
 
             constexpr uint32_t kSprFrom = 0x1000D000u;
             constexpr uint32_t kSprTo = 0x1000D400u;
@@ -3492,8 +3416,6 @@ void register_ps2_runtime_expansion_tests()
             t.IsTrue(
                 runtime.syncCoreSubsystems(),
                 "SPR_TO chain fixture subsystems should bind");
-            runtime.setEeSchedulingMode(
-                ps2x::timing::EeSchedulingMode::Event);
 
             constexpr uint32_t kSprTo = 0x1000D400u;
             constexpr uint32_t kDstat = 0x1000E010u;
@@ -3659,8 +3581,6 @@ void register_ps2_runtime_expansion_tests()
             t.IsTrue(
                 runtime.syncCoreSubsystems(),
                 "SPR_TO restart fixture subsystems should bind");
-            runtime.setEeSchedulingMode(
-                ps2x::timing::EeSchedulingMode::Event);
 
             constexpr uint32_t kSprTo = 0x1000D400u;
             constexpr uint32_t kDstat = 0x1000E010u;
@@ -3814,8 +3734,6 @@ void register_ps2_runtime_expansion_tests()
             t.IsTrue(
                 runtime.syncCoreSubsystems(),
                 "GIF normal fixture subsystems should bind");
-            runtime.setEeSchedulingMode(
-                ps2x::timing::EeSchedulingMode::Event);
 
             constexpr uint32_t kGif = 0x1000A000u;
             constexpr uint32_t kDstat = 0x1000E010u;
@@ -3978,8 +3896,6 @@ void register_ps2_runtime_expansion_tests()
             t.IsTrue(
                 runtime.syncCoreSubsystems(),
                 "GIF chain fixture subsystems should bind");
-            runtime.setEeSchedulingMode(
-                ps2x::timing::EeSchedulingMode::Event);
 
             constexpr uint32_t kGif = 0x1000A000u;
             constexpr uint32_t kTag = 0x00034400u;
@@ -4123,8 +4039,6 @@ void register_ps2_runtime_expansion_tests()
             t.IsTrue(
                 runtime.syncCoreSubsystems(),
                 "GIF mask fixture subsystems should bind");
-            runtime.setEeSchedulingMode(
-                ps2x::timing::EeSchedulingMode::Event);
 
             constexpr uint32_t kGifCtrl = 0x10003000u;
             constexpr uint32_t kGifMode = 0x10003010u;
@@ -4298,8 +4212,6 @@ void register_ps2_runtime_expansion_tests()
             t.IsTrue(
                 runtime.syncCoreSubsystems(),
                 "GIF restart fixture subsystems should bind");
-            runtime.setEeSchedulingMode(
-                ps2x::timing::EeSchedulingMode::Event);
 
             constexpr uint32_t kGifCtrl = 0x10003000u;
             constexpr uint32_t kGif = 0x1000A000u;
@@ -4494,8 +4406,6 @@ void register_ps2_runtime_expansion_tests()
                      "VIF0 reference memory should initialize");
             t.IsTrue(runtime.syncCoreSubsystems(),
                      "VIF0 reference subsystems should bind");
-            runtime.setEeSchedulingMode(
-                ps2x::timing::EeSchedulingMode::Event);
 
             constexpr uint32_t kVif0 = 0x10008000u;
             constexpr uint32_t kDstat = 0x1000E010u;
@@ -4699,8 +4609,6 @@ void register_ps2_runtime_expansion_tests()
                      "VIF1 normal fixture memory should initialize");
             t.IsTrue(runtime.syncCoreSubsystems(),
                      "VIF1 normal fixture subsystems should bind");
-            runtime.setEeSchedulingMode(
-                ps2x::timing::EeSchedulingMode::Event);
 
             constexpr uint32_t kVif1 = 0x10009000u;
             constexpr uint32_t kDstat = 0x1000E010u;
@@ -4884,8 +4792,6 @@ void register_ps2_runtime_expansion_tests()
                      "trigger fixture memory should initialize");
             t.IsTrue(runtime.syncCoreSubsystems(),
                      "trigger fixture subsystems should bind");
-            runtime.setEeSchedulingMode(
-                ps2x::timing::EeSchedulingMode::Event);
 
             constexpr uint32_t kVif1 = 0x10009000u;
             constexpr uint32_t kSource = 0x00030300u;
@@ -4975,8 +4881,6 @@ void register_ps2_runtime_expansion_tests()
                      "VIF1 restart fixture memory should initialize");
             t.IsTrue(runtime.syncCoreSubsystems(),
                      "VIF1 restart fixture subsystems should bind");
-            runtime.setEeSchedulingMode(
-                ps2x::timing::EeSchedulingMode::Event);
 
             constexpr uint32_t kVif1 = 0x10009000u;
             constexpr uint32_t kFirstSource = 0x00030400u;
@@ -5105,8 +5009,6 @@ void register_ps2_runtime_expansion_tests()
                      "VIF1 reset fixture memory should initialize");
             t.IsTrue(runtime.syncCoreSubsystems(),
                      "VIF1 reset fixture subsystems should bind");
-            runtime.setEeSchedulingMode(
-                ps2x::timing::EeSchedulingMode::Event);
 
             constexpr uint32_t kVif1 = 0x10009000u;
             constexpr uint32_t kVif1Fbrst = 0x10003C10u;
@@ -5178,8 +5080,6 @@ void register_ps2_runtime_expansion_tests()
                      "VIF1 chain fixture memory should initialize");
             t.IsTrue(runtime.syncCoreSubsystems(),
                      "VIF1 chain fixture subsystems should bind");
-            runtime.setEeSchedulingMode(
-                ps2x::timing::EeSchedulingMode::Event);
 
             constexpr uint32_t kVif1 = 0x10009000u;
             constexpr uint32_t kTag = 0x00031000u;
@@ -5288,8 +5188,6 @@ void register_ps2_runtime_expansion_tests()
                      "VIF1 VU-wait fixture memory should initialize");
             t.IsTrue(runtime.syncCoreSubsystems(),
                      "VIF1 VU-wait fixture subsystems should bind");
-            runtime.setEeSchedulingMode(
-                ps2x::timing::EeSchedulingMode::Event);
 
             constexpr uint32_t kVuUpperNop = 0x000002FFu;
             constexpr uint32_t kVuUpperEnd = 0x400002FFu;
@@ -5403,8 +5301,6 @@ void register_ps2_runtime_expansion_tests()
                      "VU1 timestamp fixture memory should initialize");
             t.IsTrue(runtime.syncCoreSubsystems(),
                      "VU1 timestamp fixture subsystems should bind");
-            runtime.setEeSchedulingMode(
-                ps2x::timing::EeSchedulingMode::Event);
 
             constexpr uint32_t kVuUpperNop = 0x000002FFu;
             uint8_t *const code = runtime.memory().getVU1Code();
@@ -5442,8 +5338,6 @@ void register_ps2_runtime_expansion_tests()
                      "VU1 resume fixture memory should initialize");
             t.IsTrue(runtime.syncCoreSubsystems(),
                      "VU1 resume fixture subsystems should bind");
-            runtime.setEeSchedulingMode(
-                ps2x::timing::EeSchedulingMode::Event);
 
             constexpr uint32_t kVuUpperNop = 0x000002FFu;
             constexpr uint32_t kVuUpperEnd = 0x400002FFu;
@@ -5517,8 +5411,6 @@ void register_ps2_runtime_expansion_tests()
                      "VU1 reset fixture memory should initialize");
             t.IsTrue(runtime.syncCoreSubsystems(),
                      "VU1 reset fixture subsystems should bind");
-            runtime.setEeSchedulingMode(
-                ps2x::timing::EeSchedulingMode::Event);
 
             constexpr uint32_t kVuUpperNop = 0x000002FFu;
             constexpr uint32_t kVuUpperEnd = 0x400002FFu;
@@ -5586,8 +5478,6 @@ void register_ps2_runtime_expansion_tests()
                      "VU1 XGKICK fixture memory should initialize");
             t.IsTrue(runtime.syncCoreSubsystems(),
                      "VU1 XGKICK fixture subsystems should bind");
-            runtime.setEeSchedulingMode(
-                ps2x::timing::EeSchedulingMode::Event);
 
             std::vector<std::vector<uint8_t>> captured;
             runtime.gifArbiter().setProcessPacketFn(
@@ -5746,20 +5636,20 @@ void register_ps2_runtime_expansion_tests()
             R5900Context interruptContext{};
 
             mainContext.advanceEeCycleTicks(16u);
-            runtime.advanceVU0AtEeBlockBoundary(nullptr, &mainContext);
+            runtime.serviceEeEventsAtBlockBoundary(nullptr, &mainContext);
             t.Equals(
                 runtime.currentEeTick().raw(), 16u,
                 "the first context should publish its elapsed block");
 
             interruptContext.advanceEeCycleTicks(8u);
-            runtime.advanceVU0AtEeBlockBoundary(
+            runtime.serviceEeEventsAtBlockBoundary(
                 nullptr, &interruptContext);
             t.Equals(
                 runtime.currentEeTick().raw(), 24u,
                 "a fresh interrupt context must extend rather than replace time");
 
             mainContext.advanceEeCycleTicks(24u);
-            runtime.advanceVU0AtEeBlockBoundary(nullptr, &mainContext);
+            runtime.serviceEeEventsAtBlockBoundary(nullptr, &mainContext);
             t.Equals(
                 runtime.currentEeTick().raw(), 48u,
                 "returning to the original context must not rewind time");
@@ -6040,7 +5930,7 @@ void register_ps2_runtime_expansion_tests()
             R5900Context ctx{};
             ctx.insn_count = 100u;
             ctx.advanceEeCycleTicks(800u);
-            runtime.advanceVU0AtEeBlockBoundary(
+            runtime.serviceEeEventsAtBlockBoundary(
                 runtime.memory().getRDRAM(), &ctx);
             runtime.vu0StartMicroProgram(
                 runtime.memory().getRDRAM(), &ctx, 0u);
@@ -6105,8 +5995,6 @@ void register_ps2_runtime_expansion_tests()
                 t.IsTrue(
                     runtime->syncCoreSubsystems(),
                     "shared-event VU0 subsystems should bind");
-                runtime->setEeSchedulingMode(
-                    ps2x::timing::EeSchedulingMode::Event);
 
                 uint8_t *const code =
                     runtime->memory().getVU0Code();
@@ -6220,301 +6108,61 @@ void register_ps2_runtime_expansion_tests()
                 "shared-event and explicit catch-up should reach the same VU boundary");
         });
 
-        tc.Run("VU0 block boundaries advance only at rapid event deadlines", [](TestCase &t)
+        tc.Run("active VU0 does not schedule a private periodic event", [](TestCase &t)
         {
             PS2Runtime runtime;
-            t.IsTrue(runtime.memory().initialize(), "PS2Memory initialize should succeed");
-            t.IsTrue(runtime.syncCoreSubsystems(), "runtime core subsystems should bind");
+            t.IsTrue(
+                runtime.memory().initialize(),
+                "VU0 scheduler memory should initialize");
+            t.IsTrue(
+                runtime.syncCoreSubsystems(),
+                "VU0 scheduler subsystems should bind");
 
             uint8_t *const code = runtime.memory().getVU0Code();
             std::memset(code, 0, PS2_VU0_CODE_SIZE);
-
             constexpr uint32_t kVuNop = 0x0000003Fu;
             writeVuInstructionPair(
-                code, 0u, makeVuIaddiu(1u, 0u, 1u), kVuNop);
+                code, 0u, makeVuIaddiu(1u, 1u, 1u), kVuNop);
             writeVuInstructionPair(
                 code, 8u, makeVuBranch(-1), kVuNop);
             writeVuInstructionPair(code, 16u, 0u, kVuNop);
+            runtime.vu0().setProgressTrackingEnabled(true);
 
             R5900Context ctx{};
             ctx.advanceEeCycleTicks(800u);
-            runtime.advanceVU0AtEeBlockBoundary(
+            runtime.serviceEeEventsAtBlockBoundary(
                 runtime.memory().getRDRAM(), &ctx);
             runtime.vu0StartMicroProgram(
                 runtime.memory().getRDRAM(), &ctx, 0u);
-            t.IsTrue(
-                (ctx.vu0_vpu_stat & 1u) != 0u,
-                "the loop fixture should leave VU0 active");
+            const VU1ProgressSnapshot startup =
+                runtime.vu0().getProgressSnapshot();
+            const uint32_t startupPc = runtime.vu0().state().pc;
 
-            runtime.debugStartVu0SyncTrace(4u, std::nullopt, true);
-            runtime.debugStartVu0InstructionTrace(
-                64u, std::nullopt, false);
-
-            ctx.advanceEeCycleTicks(128u);
-            runtime.advanceVU0AtEeBlockBoundary(
-                runtime.memory().getRDRAM(), &ctx);
-            ctx.advanceEeCycleTicks(40u);
-            runtime.advanceVU0AtEeBlockBoundary(
-                runtime.memory().getRDRAM(), &ctx);
-            ctx.advanceEeCycleTicks(40u);
-            runtime.advanceVU0AtEeBlockBoundary(
-                runtime.memory().getRDRAM(), &ctx);
-            ctx.advanceEeCycleTicks(80u);
-            runtime.synchronizeVU0Microprogram(
-                runtime.memory().getRDRAM(), &ctx, false);
-
-            const PS2Runtime::DebugVu0SyncTrace trace =
-                runtime.debugVu0SyncTraceSnapshot(false);
-            t.Equals(
-                trace.entries.size(), static_cast<size_t>(4u),
-                "all four active scheduling boundaries should be traced");
-            if (trace.entries.size() == 4u)
-            {
-                t.IsTrue(
-                    trace.entries[0].blockBoundary,
-                    "the pre-deadline call should be identified as a block boundary");
-                t.Equals(
-                    trace.entries[0].vsyncTick,
-                    ps2_syscalls::GetCurrentVSyncTick(),
-                    "the sync trace should correlate EE progress with the current VSync tick");
-                t.IsFalse(
-                    trace.entries[0].eventDue,
-                    "the first block should remain before the rapid event deadline");
-                t.Equals(
-                    trace.entries[0].cycleBudget, 0u,
-                    "a block boundary should not run before its event deadline");
-                t.IsTrue(
-                    trace.entries[1].blockBoundary,
-                    "the deadline call should remain a block boundary");
-                t.IsTrue(
-                    trace.entries[1].eventDue,
-                    "the second block should cross the rapid event deadline");
-                t.Equals(
-                    trace.entries[1].cycleBudget, 16u,
-                    "a due event should retain the minimum VU execution batch");
-                t.IsTrue(
-                    trace.entries[2].blockBoundary,
-                    "the post-deadline call should remain a block boundary");
-                t.IsFalse(
-                    trace.entries[2].eventDue,
-                    "the next rapid event should still be in the future");
-                t.Equals(
-                    trace.entries[2].cycleBudget, 0u,
-                    "a block should not run twice for one rapid event");
-                t.IsFalse(
-                    trace.entries[3].blockBoundary,
-                    "a COP2-style synchronization should not be a block boundary");
-                t.Equals(
-                    trace.entries[3].cycleBudget, 16u,
-                    "a non-interlocked COP2 sync should retain its minimum batch");
-                t.Equals(
-                    trace.entries[3].invocation,
-                    trace.entries[0].invocation,
-                    "sync trace entries should identify their VU0 invocation");
-                t.IsTrue(
-                    trace.entries[2].invocationInstruction >
-                        trace.entries[1].invocationInstruction,
-                    "the post-event trace should expose the completed VU batch");
-                t.Equals(
-                    trace.entries[3].invocationInstruction,
-                    trace.entries[2].invocationInstruction,
-                    "a skipped block should preserve the next exact VU boundary");
-                t.IsTrue(
-                    trace.entries[2].nextEventCycleTicks >
-                        trace.entries[1].nextEventCycleTicks,
-                    "servicing an event should schedule a later deadline");
-            }
-            (void)runtime.debugVu0InstructionTraceSnapshot(true);
-        });
-
-        tc.Run("runtime defaults to event scheduling", [](TestCase &t)
-        {
-            PS2Runtime runtime;
-            t.IsTrue(
-                runtime.eeSchedulingMode() ==
-                    ps2x::timing::EeSchedulingMode::Event,
-                "the authoritative scheduler should be the runtime default");
-        });
-
-        tc.Run("event mode omits the private VU0 compatibility cadence", [](TestCase &t)
-        {
-            PS2Runtime legacy;
-            PS2Runtime event;
-            PS2Runtime shadow;
-            for (PS2Runtime *runtime : {&legacy, &event, &shadow})
-            {
-                t.IsTrue(
-                    runtime->memory().initialize(),
-                    "timing fixture memory should initialize");
-                t.IsTrue(
-                    runtime->syncCoreSubsystems(),
-                    "timing fixture subsystems should bind");
-
-                uint8_t *const code =
-                    runtime->memory().getVU0Code();
-                std::memset(code, 0, PS2_VU0_CODE_SIZE);
-                constexpr uint32_t kVuNop = 0x0000003Fu;
-                writeVuInstructionPair(
-                    code, 0u,
-                    makeVuIaddiu(1u, 0u, 1u), kVuNop);
-                writeVuInstructionPair(
-                    code, 8u, makeVuBranch(-1), kVuNop);
-                writeVuInstructionPair(
-                    code, 16u, 0u, kVuNop);
-                runtime->vu0().setProgressTrackingEnabled(true);
-            }
-            legacy.setEeSchedulingMode(
-                ps2x::timing::EeSchedulingMode::Legacy);
-            event.setEeSchedulingMode(
-                ps2x::timing::EeSchedulingMode::Event);
-            shadow.setEeSchedulingMode(
-                ps2x::timing::EeSchedulingMode::Shadow);
-
-            R5900Context legacyContext{};
-            R5900Context eventContext{};
-            R5900Context shadowContext{};
-            legacyContext.advanceEeCycleTicks(800u);
-            legacy.advanceVU0AtEeBlockBoundary(
-                legacy.memory().getRDRAM(), &legacyContext);
-            eventContext.advanceEeCycleTicks(800u);
-            event.serviceEeEventsAtBlockBoundary(
-                event.memory().getRDRAM(), &eventContext);
-            shadowContext.advanceEeCycleTicks(800u);
-            shadow.serviceEeEventsAtBlockBoundary(
-                shadow.memory().getRDRAM(), &shadowContext);
-
-            legacy.vu0StartMicroProgram(
-                legacy.memory().getRDRAM(),
-                &legacyContext, 0u);
-            event.vu0StartMicroProgram(
-                event.memory().getRDRAM(),
-                &eventContext, 0u);
-            shadow.vu0StartMicroProgram(
-                shadow.memory().getRDRAM(),
-                &shadowContext, 0u);
-            legacy.debugStartVu0InstructionTrace(
-                128u, std::nullopt, false);
-            shadow.debugStartVu0InstructionTrace(
-                128u, std::nullopt, false);
-            const VU1ProgressSnapshot eventStartup =
-                event.vu0().getProgressSnapshot();
-            const uint32_t eventStartupPc =
-                event.vu0().state().pc;
-
-            constexpr std::array<uint32_t, 5> kBlockTicks = {
+            constexpr std::array<uint32_t, 5u> kBlockTicks = {
                 128u, 40u, 40u, 384u, 40u};
             for (const uint32_t ticks : kBlockTicks)
             {
-                legacyContext.advanceEeCycleTicks(ticks);
-                legacy.advanceVU0AtEeBlockBoundary(
-                    legacy.memory().getRDRAM(),
-                    &legacyContext);
-
-                eventContext.advanceEeCycleTicks(ticks);
-                event.serviceEeEventsAtBlockBoundary(
-                    event.memory().getRDRAM(),
-                    &eventContext);
-
-                shadowContext.advanceEeCycleTicks(ticks);
-                shadow.serviceEeEventsAtBlockBoundary(
-                    shadow.memory().getRDRAM(),
-                    &shadowContext);
+                ctx.advanceEeCycleTicks(ticks);
+                runtime.serviceEeEventsAtBlockBoundary(
+                    runtime.memory().getRDRAM(), &ctx);
             }
 
-            const VU1ProgressSnapshot legacyProgress =
-                legacy.vu0().getProgressSnapshot();
-            const VU1ProgressSnapshot eventProgress =
-                event.vu0().getProgressSnapshot();
-            const VU1ProgressSnapshot shadowProgress =
-                shadow.vu0().getProgressSnapshot();
+            const VU1ProgressSnapshot after =
+                runtime.vu0().getProgressSnapshot();
+            const PS2Runtime::DebugEeScheduler scheduler =
+                runtime.debugEeSchedulerSnapshot();
             t.Equals(
-                eventProgress.cycles, eventStartup.cycles,
-                "ordinary event-mode blocks should not advance VU0 without a shared source");
+                after.cycles, startup.cycles,
+                "ordinary EE blocks should not advance VU0 without shared device work");
             t.Equals(
-                shadowProgress.cycles, legacyProgress.cycles,
-                "shadow compatibility should execute the legacy VU pair count");
+                runtime.vu0().state().pc, startupPc,
+                "an active VU alone should retain its architectural state");
             t.Equals(
-                event.vu0().state().pc,
-                eventStartupPc,
-                "event mode should retain VU0 state without a shared source");
-            t.Equals(
-                shadow.vu0().state().pc,
-                legacy.vu0().state().pc,
-                "shadow compatibility should retain the legacy VU PC");
-            t.Equals(
-                event.currentEeTick().raw(),
-                legacy.currentEeTick().raw(),
-                "event mode should publish identical EE time");
-            t.Equals(
-                shadow.currentEeTick().raw(),
-                legacy.currentEeTick().raw(),
-                "shadow compatibility should publish identical EE time");
-
-            const auto legacyInstructions =
-                legacy.debugVu0InstructionTraceSnapshot(true);
-            const auto shadowInstructions =
-                shadow.debugVu0InstructionTraceSnapshot(true);
-            t.Equals(
-                shadowInstructions.entries.size(),
-                legacyInstructions.entries.size(),
-                "shadow mode should retain every legacy VU instruction pair");
-            if (shadowInstructions.entries.size() ==
-                legacyInstructions.entries.size())
-            {
-                for (size_t index = 0u;
-                     index < legacyInstructions.entries.size();
-                     ++index)
-                {
-                    const auto &expected =
-                        legacyInstructions.entries[index];
-                    const auto &observed =
-                        shadowInstructions.entries[index];
-                    t.Equals(
-                        observed.pc, expected.pc,
-                        "shadow mode should retain VU instruction PCs");
-                    t.Equals(
-                        observed.lower, expected.lower,
-                        "shadow mode should retain lower instructions");
-                    t.Equals(
-                        observed.upper, expected.upper,
-                        "shadow mode should retain upper instructions");
-                    t.IsTrue(
-                        observed.vi == expected.vi,
-                        "shadow mode should retain exact VI state");
-                    t.IsTrue(
-                        observed.vf == expected.vf,
-                        "shadow mode should retain exact VF state");
-                }
-            }
-
-            const PS2Runtime::DebugEeScheduler eventStatus =
-                event.debugEeSchedulerSnapshot();
-            t.IsTrue(
-                eventStatus.mode ==
-                    ps2x::timing::EeSchedulingMode::Event,
-                "event fixture should use the scheduler as authority");
-            t.Equals(
-                eventStatus.statistics.serviced, 0u,
-                "event mode should service no private VU0 deadlines");
+                scheduler.statistics.serviced, 0u,
+                "an active VU alone should not fabricate scheduler services");
             t.IsFalse(
-                eventStatus.hasNextDeadline,
-                "an active VU alone should not retain an event deadline");
-            t.IsFalse(
-                eventStatus.slots[ps2x::timing::
-                    eeEventSourceIndex(
-                        ps2x::timing::EeEventSource::
-                            Vu0PeriodicCompatibility)]
-                    .pending,
-                "event mode should not schedule the migration-only source");
-
-            const PS2Runtime::DebugEeScheduler shadowStatus =
-                shadow.debugEeSchedulerSnapshot();
-            t.IsFalse(
-                shadowStatus.shadowMismatch,
-                "shadow mode should match the legacy deadline sequence");
-            t.Equals(
-                shadowStatus.statistics.serviced, 2u,
-                "shadow mode should observe both legacy services");
+                scheduler.hasNextDeadline,
+                "an active VU alone should not own an event deadline");
         });
 
         tc.Run("VU0 sync trace may wait for an EE PC trigger", [](TestCase &t)
@@ -6572,7 +6220,7 @@ void register_ps2_runtime_expansion_tests()
                 "arming on inactive VU0 should not fabricate a trace entry");
 
             ctx.advanceEeCycleTicks(800u);
-            runtime.advanceVU0AtEeBlockBoundary(
+            runtime.serviceEeEventsAtBlockBoundary(
                 runtime.memory().getRDRAM(), &ctx);
             runtime.vu0StartMicroProgram(
                 runtime.memory().getRDRAM(), &ctx, 0u);
@@ -6670,7 +6318,7 @@ void register_ps2_runtime_expansion_tests()
                 "arming on inactive VU0 should not fabricate an instruction entry");
 
             ctx.advanceEeCycleTicks(800u);
-            runtime.advanceVU0AtEeBlockBoundary(
+            runtime.serviceEeEventsAtBlockBoundary(
                 runtime.memory().getRDRAM(), &ctx);
             runtime.vu0StartMicroProgram(
                 runtime.memory().getRDRAM(), &ctx, 0u);
@@ -7174,8 +6822,6 @@ void register_ps2_runtime_expansion_tests()
             t.IsTrue(
                 runtime.memory().initialize(),
                 "counter scheduler fixture memory should initialize");
-            runtime.setEeSchedulingMode(
-                ps2x::timing::EeSchedulingMode::Event);
 
             constexpr uint32_t kCount = 0x10000000u;
             constexpr uint32_t kMode = 0x10000010u;
@@ -7254,8 +6900,6 @@ void register_ps2_runtime_expansion_tests()
             t.IsTrue(
                 runtime.memory().initialize(),
                 "scratchpad counter-alias fixture memory should initialize");
-            runtime.setEeSchedulingMode(
-                ps2x::timing::EeSchedulingMode::Event);
 
             R5900Context &ctx = runtime.cpu();
             uint8_t *const rdram =
@@ -7317,8 +6961,6 @@ void register_ps2_runtime_expansion_tests()
             t.IsTrue(
                 runtime.syncCoreSubsystems(),
                 "From-IPU fixture subsystems should bind");
-            runtime.setEeSchedulingMode(
-                ps2x::timing::EeSchedulingMode::Event);
 
             constexpr uint32_t kFromIpu =
                 0x1000B000u;
@@ -7628,8 +7270,6 @@ void register_ps2_runtime_expansion_tests()
             t.IsTrue(
                 runtime.syncCoreSubsystems(),
                 "From-IPU lifecycle subsystems should bind");
-            runtime.setEeSchedulingMode(
-                ps2x::timing::EeSchedulingMode::Event);
 
             constexpr uint32_t kFromIpu =
                 0x1000B000u;
@@ -7849,8 +7489,6 @@ void register_ps2_runtime_expansion_tests()
             t.IsTrue(
                 runtime.syncCoreSubsystems(),
                 "From-IPU mapping subsystems should bind");
-            runtime.setEeSchedulingMode(
-                ps2x::timing::EeSchedulingMode::Event);
 
             constexpr uint32_t kFromIpu =
                 0x1000B000u;
@@ -7935,89 +7573,6 @@ void register_ps2_runtime_expansion_tests()
                 "the zero-write transfer should complete normally");
         });
 
-        tc.Run("legacy and shadow From-IPU drain the retained descriptor without deadlines", [](TestCase &t)
-        {
-            const std::array<
-                ps2x::timing::EeSchedulingMode, 2u>
-                modes = {
-                    ps2x::timing::EeSchedulingMode::
-                        Legacy,
-                    ps2x::timing::EeSchedulingMode::
-                        Shadow,
-                };
-            for (const auto mode : modes)
-            {
-                PS2Runtime runtime;
-                t.IsTrue(
-                    runtime.memory().initialize(),
-                    "compatibility From-IPU memory should initialize");
-                t.IsTrue(
-                    runtime.syncCoreSubsystems(),
-                    "compatibility From-IPU subsystems should bind");
-                runtime.setEeSchedulingMode(mode);
-
-                constexpr uint32_t kFromIpu =
-                    0x1000B000u;
-                constexpr uint32_t kDestination =
-                    0x00035600u;
-                std::array<uint8_t, 16u> payload{};
-                payload.fill(
-                    mode ==
-                            ps2x::timing::
-                                EeSchedulingMode::
-                                    Legacy
-                        ? 0x5Au
-                        : 0xC3u);
-
-                (void)runtime.memory().writeIORegister(
-                    kFromIpu + 0x10u,
-                    kDestination);
-                (void)runtime.memory().writeIORegister(
-                    kFromIpu + 0x20u, 1u);
-                (void)runtime.memory().writeIORegister(
-                    kFromIpu, 0x100u);
-                t.IsTrue(
-                    runtime.memory()
-                            .fromIpuDmaSnapshot()
-                            .active &&
-                        !runtime.memory()
-                             .fromIpuDmaSnapshot()
-                             .eventManaged,
-                    "compatibility mode should retain an empty descriptor");
-
-                t.Equals(
-                    runtime.memory().writeIpuOutputFifo(
-                        payload.data(), 1u),
-                    1u,
-                    "compatibility output should enter the FIFO");
-                t.IsFalse(
-                    runtime.memory()
-                        .fromIpuDmaSnapshot()
-                        .active,
-                    "compatibility output should drain and finalize immediately");
-                t.IsTrue(
-                    std::memcmp(
-                        runtime.memory().getRDRAM() +
-                            kDestination,
-                        payload.data(), payload.size()) == 0,
-                    "compatibility modes should copy the retained payload");
-                t.IsTrue(
-                    runtime.memory()
-                        .hasReadyDmacCompletions(),
-                    "compatibility drain should request typed completion");
-                const auto scheduler =
-                    runtime.debugEeSchedulerSnapshot();
-                t.IsFalse(
-                    scheduler
-                        .slots[ps2x::timing::
-                            eeEventSourceIndex(
-                                ps2x::timing::
-                                    EeEventSource::
-                                        DmacFromIpu)]
-                        .pending,
-                    "compatibility drain should not own an event deadline");
-            }
-        });
 
         tc.Run("event To-IPU normal DMA reproduces PCSX2 FIFO stall and reset wake", [](TestCase &t)
         {
@@ -8028,8 +7583,6 @@ void register_ps2_runtime_expansion_tests()
             t.IsTrue(
                 runtime.syncCoreSubsystems(),
                 "To-IPU fixture subsystems should bind");
-            runtime.setEeSchedulingMode(
-                ps2x::timing::EeSchedulingMode::Event);
 
             constexpr uint32_t kToIpu =
                 0x1000B400u;
@@ -8409,8 +7962,6 @@ void register_ps2_runtime_expansion_tests()
             t.IsTrue(
                 runtime.syncCoreSubsystems(),
                 "To-IPU chain fixture subsystems should bind");
-            runtime.setEeSchedulingMode(
-                ps2x::timing::EeSchedulingMode::Event);
 
             constexpr uint32_t kToIpu =
                 0x1000B400u;
@@ -8756,8 +8307,6 @@ void register_ps2_runtime_expansion_tests()
             t.IsTrue(
                 runtime.syncCoreSubsystems(),
                 "To-IPU tag fixture subsystems should bind");
-            runtime.setEeSchedulingMode(
-                ps2x::timing::EeSchedulingMode::Event);
 
             constexpr uint32_t kToIpu =
                 0x1000B400u;
@@ -9253,8 +8802,6 @@ void register_ps2_runtime_expansion_tests()
             t.IsTrue(
                 runtime.syncCoreSubsystems(),
                 "To-IPU cancellation subsystems should bind");
-            runtime.setEeSchedulingMode(
-                ps2x::timing::EeSchedulingMode::Event);
 
             constexpr uint32_t kToIpu =
                 0x1000B400u;
@@ -9356,13 +8903,12 @@ void register_ps2_runtime_expansion_tests()
                 kToIpu + 0x20u, 1u);
             (void)runtime.memory().writeIORegister(
                 kToIpu, 0x100u);
-            runtime.setEeSchedulingMode(
-                ps2x::timing::EeSchedulingMode::Legacy);
+            runtime.resetEeTiming(&context);
             t.IsFalse(
                 runtime.memory()
                     .toIpuDmaSnapshot()
                     .active,
-                "a scheduler mode transition should discard retained To-IPU work");
+                "a timing reset should discard retained To-IPU work");
             scheduler = runtime.debugEeSchedulerSnapshot();
             t.IsFalse(
                 scheduler
@@ -9372,10 +8918,8 @@ void register_ps2_runtime_expansion_tests()
                                 EeEventSource::
                                     DmacToIpu)]
                     .pending,
-                "a scheduler mode transition should clear the To-IPU slot");
+                "a timing reset should clear the To-IPU slot");
 
-            runtime.setEeSchedulingMode(
-                ps2x::timing::EeSchedulingMode::Event);
             (void)runtime.memory().writeIORegister(
                 0x10002010u, 1u << 30u);
             (void)runtime.memory().writeIORegister(
