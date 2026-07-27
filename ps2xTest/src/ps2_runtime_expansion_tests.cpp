@@ -1476,6 +1476,8 @@ void register_ps2_runtime_expansion_tests()
             notifyRuntimeStop();
 
             PS2Runtime runtime;
+            runtime.setEeSchedulingMode(
+                ps2x::timing::EeSchedulingMode::Legacy);
             std::vector<uint8_t> rdram(PS2_RAM_SIZE, 0u);
             constexpr uint32_t kBusyEntry = 0x160000u;
             constexpr uint32_t kIntcHandlerEntry = 0x170000u;
@@ -6325,6 +6327,15 @@ void register_ps2_runtime_expansion_tests()
             (void)runtime.debugVu0InstructionTraceSnapshot(true);
         });
 
+        tc.Run("runtime defaults to event scheduling", [](TestCase &t)
+        {
+            PS2Runtime runtime;
+            t.IsTrue(
+                runtime.eeSchedulingMode() ==
+                    ps2x::timing::EeSchedulingMode::Event,
+                "the authoritative scheduler should be the runtime default");
+        });
+
         tc.Run("event mode omits the private VU0 compatibility cadence", [](TestCase &t)
         {
             PS2Runtime legacy;
@@ -6352,6 +6363,8 @@ void register_ps2_runtime_expansion_tests()
                     code, 16u, 0u, kVuNop);
                 runtime->vu0().setProgressTrackingEnabled(true);
             }
+            legacy.setEeSchedulingMode(
+                ps2x::timing::EeSchedulingMode::Legacy);
             event.setEeSchedulingMode(
                 ps2x::timing::EeSchedulingMode::Event);
             shadow.setEeSchedulingMode(

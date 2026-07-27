@@ -270,6 +270,8 @@ void register_ps2_runtime_interrupt_tests()
         {
             notifyRuntimeStop();
             TestEnv env;
+            env.runtime.setEeSchedulingMode(
+                ps2x::timing::EeSchedulingMode::Legacy);
 
             constexpr uint32_t kFlagAddr = 0x1000u;
             constexpr uint32_t kTickAddr = 0x1010u;
@@ -319,6 +321,8 @@ void register_ps2_runtime_interrupt_tests()
         {
             notifyRuntimeStop();
             TestEnv env;
+            env.runtime.setEeSchedulingMode(
+                ps2x::timing::EeSchedulingMode::Legacy);
             t.IsTrue(env.runtime.memory().initialize(), "runtime memory initialize should succeed");
 
             constexpr uint32_t kFlagAddr = 0x1080u;
@@ -1240,6 +1244,8 @@ void register_ps2_runtime_interrupt_tests()
         {
             notifyRuntimeStop();
             TestEnv env;
+            env.runtime.setEeSchedulingMode(
+                ps2x::timing::EeSchedulingMode::Legacy);
 
             g_vblankStartHits.store(0u, std::memory_order_relaxed);
             g_vblankEndHits.store(0u, std::memory_order_relaxed);
@@ -1332,6 +1338,8 @@ void register_ps2_runtime_interrupt_tests()
         {
             notifyRuntimeStop();
             TestEnv env;
+            env.runtime.setEeSchedulingMode(
+                ps2x::timing::EeSchedulingMode::Legacy);
             t.IsTrue(env.runtime.memory().initialize(), "runtime memory initialize should succeed");
 
             constexpr uint32_t kVif1Ch = 0x10009000u;
@@ -1363,6 +1371,8 @@ void register_ps2_runtime_interrupt_tests()
         {
             notifyRuntimeStop();
             TestEnv env;
+            env.runtime.setEeSchedulingMode(
+                ps2x::timing::EeSchedulingMode::Legacy);
             t.IsTrue(env.runtime.memory().initialize(), "runtime memory initialize should succeed");
 
             constexpr uint32_t kHandlerAddr = 0x00ABD100u;
@@ -1431,6 +1441,8 @@ void register_ps2_runtime_interrupt_tests()
         {
             notifyRuntimeStop();
             TestEnv env;
+            env.runtime.setEeSchedulingMode(
+                ps2x::timing::EeSchedulingMode::Legacy);
 
             constexpr uint32_t kFlagAddr = 0x1140u;
             constexpr uint32_t kTickAddr = 0x1150u;
@@ -1476,6 +1488,8 @@ void register_ps2_runtime_interrupt_tests()
         {
             notifyRuntimeStop();
             TestEnv env;
+            env.runtime.setEeSchedulingMode(
+                ps2x::timing::EeSchedulingMode::Legacy);
             t.IsTrue(env.runtime.memory().initialize(), "runtime memory initialize should succeed");
 
             constexpr uint32_t kHandlerAddr = 0x00ABD180u;
@@ -1588,6 +1602,8 @@ void register_ps2_runtime_interrupt_tests()
         {
             notifyRuntimeStop();
             TestEnv env;
+            env.runtime.setEeSchedulingMode(
+                ps2x::timing::EeSchedulingMode::Legacy);
             t.IsTrue(env.runtime.memory().initialize(), "runtime memory initialize should succeed");
 
             constexpr uint32_t kHandlerAddr = 0x00ABD1C0u;

@@ -4711,6 +4711,8 @@ void register_ps2_gs_tests()
             g_gsSyncCallbackLastTick.store(0u, std::memory_order_relaxed);
 
             PS2Runtime runtime;
+            runtime.setEeSchedulingMode(
+                ps2x::timing::EeSchedulingMode::Legacy);
             t.IsTrue(runtime.memory().initialize(), "runtime memory initialize should succeed");
             std::vector<uint8_t> rdram(PS2_RAM_SIZE, 0u);
 

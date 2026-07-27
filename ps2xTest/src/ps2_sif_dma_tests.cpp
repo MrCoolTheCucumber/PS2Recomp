@@ -180,6 +180,8 @@ void register_ps2_sif_dma_tests()
         tc.Run("sceSifSetDma copies EE payload into IOP RAM without aliasing EE memory", [](TestCase &t)
         {
             TestEnv env;
+            env.runtime.setEeSchedulingMode(
+                ps2x::timing::EeSchedulingMode::Legacy);
 
             constexpr uint32_t kDescAddr = 0x00020000u;
             constexpr uint32_t kSrcAddr = 0x00020100u;
@@ -764,6 +766,8 @@ void register_ps2_sif_dma_tests()
         tc.Run("Sony 989snd decodes streaming DMA from IOP RAM rather than the aliased EE address", [](TestCase &t)
         {
             TestEnv env;
+            env.runtime.setEeSchedulingMode(
+                ps2x::timing::EeSchedulingMode::Legacy);
             configureProfile(env, "slus_201.84");
 
             constexpr uint32_t kSid = 0x00123456u;
@@ -876,6 +880,8 @@ void register_ps2_sif_dma_tests()
         tc.Run("isceSifSetDma and isceSifSetDChain alias the SIF DMA helpers", [](TestCase &t)
         {
             TestEnv env;
+            env.runtime.setEeSchedulingMode(
+                ps2x::timing::EeSchedulingMode::Legacy);
 
             constexpr uint32_t kDescAddr = 0x00020240u;
             constexpr uint32_t kSrcAddr = 0x00020340u;
@@ -914,6 +920,8 @@ void register_ps2_sif_dma_tests()
         tc.Run("sceSifSetDma preserves explicitly allocated synthetic IOP heap ranges", [](TestCase &t)
         {
             TestEnv env;
+            env.runtime.setEeSchedulingMode(
+                ps2x::timing::EeSchedulingMode::Legacy);
 
             constexpr uint32_t kDescAddr = 0x00020500u;
             constexpr uint32_t kSrcAddr = 0x00020600u;
@@ -954,6 +962,8 @@ void register_ps2_sif_dma_tests()
         tc.Run("sceSifSetDma dispatches enabled DMAC handlers for cause 5", [](TestCase &t)
         {
             TestEnv env;
+            env.runtime.setEeSchedulingMode(
+                ps2x::timing::EeSchedulingMode::Legacy);
 
             constexpr uint32_t kDescAddr = 0x00020300u;
             constexpr uint32_t kSrcAddr = 0x00020400u;
@@ -1022,6 +1032,8 @@ void register_ps2_sif_dma_tests()
         tc.Run("sceSifSetDma acknowledges DTX work-buffer transfers by advancing the EE footer ticket", [](TestCase &t)
         {
             TestEnv env;
+            env.runtime.setEeSchedulingMode(
+                ps2x::timing::EeSchedulingMode::Legacy);
             configureProfile(env, "slus_201.84");
 
             constexpr uint32_t kClientAddr = 0x0002D000u;
@@ -1226,6 +1238,8 @@ void register_ps2_sif_dma_tests()
         tc.Run("sceSifSetDma applies SJX DTX payloads into the emulated SJRMT data ring", [](TestCase &t)
         {
             TestEnv env;
+            env.runtime.setEeSchedulingMode(
+                ps2x::timing::EeSchedulingMode::Legacy);
             configureProfile(env, "slus_201.84");
 
             constexpr uint32_t kClientAddr = 0x0002E000u;
@@ -1347,6 +1361,8 @@ void register_ps2_sif_dma_tests()
         tc.Run("sceSifSetDma recognizes SJX DTX payloads from rotated EE work buffers", [](TestCase &t)
         {
             TestEnv env;
+            env.runtime.setEeSchedulingMode(
+                ps2x::timing::EeSchedulingMode::Legacy);
             configureProfile(env, "slus_201.84");
 
             constexpr uint32_t kClientAddr = 0x00031000u;
@@ -1473,6 +1489,8 @@ void register_ps2_sif_dma_tests()
         tc.Run("sceSifSetDma lets active PS2RNA playback drain emulated SJRMT data", [](TestCase &t)
         {
             TestEnv env;
+            env.runtime.setEeSchedulingMode(
+                ps2x::timing::EeSchedulingMode::Legacy);
             configureProfile(env, "slus_201.84");
 
             constexpr uint32_t kClientAddr = 0x0002F000u;

@@ -1323,7 +1323,7 @@ private:
     ps2x::timing::EeTimeline m_eeTimeline;
     ps2x::timing::EeEventScheduler m_eeEventScheduler;
     ps2x::timing::EeSchedulingMode m_eeSchedulingMode =
-        ps2x::timing::EeSchedulingMode::Legacy;
+        ps2x::timing::EeSchedulingMode::Event;
     struct Vu1ExecutionTiming
     {
         uint64_t generation = 0u;

@@ -857,7 +857,12 @@ PS2Runtime::PS2Runtime()
             m_eeSchedulingMode =
                 ps2x::timing::EeSchedulingMode::Event;
         }
-        else if (std::strcmp(mode, "legacy") != 0)
+        else if (std::strcmp(mode, "legacy") == 0)
+        {
+            m_eeSchedulingMode =
+                ps2x::timing::EeSchedulingMode::Legacy;
+        }
+        else
         {
             std::cerr
                 << "Ignoring unknown PS2X_EE_SCHEDULER_MODE='"
