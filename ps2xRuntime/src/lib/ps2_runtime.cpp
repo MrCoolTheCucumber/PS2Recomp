@@ -3999,10 +3999,16 @@ void PS2Runtime::drainCompletedDmacHandlers(uint8_t *rdram)
     }
     collectPendingDmacInterrupts();
 
+    // A delivered handler can acknowledge this completion, start another DMA,
+    // and publish that completion before it returns. Drain a detached batch so
+    // such re-entrant publications append to stable pending storage instead of
+    // invalidating this traversal or being overwritten below.
+    std::vector<DmacPendingInterrupt> pending;
+    pending.swap(m_pendingDmacInterrupts);
     std::vector<DmacPendingInterrupt> retained;
-    retained.reserve(m_pendingDmacInterrupts.size());
+    retained.reserve(pending.size());
     for (const DmacPendingInterrupt &interrupt :
-         m_pendingDmacInterrupts)
+         pending)
     {
         if (!m_memory.dmacInterruptStatusLatched(
                 interrupt.source))
@@ -4021,7 +4027,17 @@ void PS2Runtime::drainCompletedDmacHandlers(uint8_t *rdram)
         ps2_syscalls::dispatchDmacHandlersForCause(
             rdram, this, interrupt.cause);
     }
-    m_pendingDmacInterrupts = std::move(retained);
+
+    if (!retained.empty())
+    {
+        retained.insert(
+            retained.end(),
+            std::make_move_iterator(
+                m_pendingDmacInterrupts.begin()),
+            std::make_move_iterator(
+                m_pendingDmacInterrupts.end()));
+        m_pendingDmacInterrupts = std::move(retained);
+    }
 }
 
 void PS2Runtime::handleTrap(uint8_t *rdram, R5900Context *ctx)

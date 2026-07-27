@@ -57,6 +57,7 @@ namespace
     std::atomic<uint32_t> g_dmacSendLastChcr{0u};
     std::atomic<uint32_t> g_dmacPublishedAddress{0u};
     std::atomic<uint32_t> g_dmacObservedPublishedValue{0u};
+    std::atomic<uint32_t> g_dmacHandlerResubmissions{0u};
 
     void setRegU32(R5900Context &ctx, int reg, uint32_t value)
     {
@@ -182,6 +183,36 @@ namespace
         if (runtime && channelBase != 0u)
         {
             g_dmacSendLastChcr.store(runtime->memory().readIORegister(channelBase + 0x00u), std::memory_order_relaxed);
+        }
+
+        ctx->pc = 0u;
+    }
+
+    void testDmacResubmittingHandler(
+        uint8_t *rdram,
+        R5900Context *ctx,
+        PS2Runtime *runtime)
+    {
+        (void)rdram;
+        g_dmacSendHits.fetch_add(1u, std::memory_order_relaxed);
+
+        if (runtime &&
+            g_dmacHandlerResubmissions.exchange(
+                0u, std::memory_order_relaxed) != 0u)
+        {
+            constexpr uint32_t kDStat = 0x1000E010u;
+            constexpr uint32_t kVif1StatusBit = 1u << 1u;
+
+            // A handler can acknowledge the current completion, submit the
+            // next chain, and reach an event-test boundary before returning.
+            (void)runtime->memory().writeIORegister(
+                kDStat, kVif1StatusBit);
+            const DmacTransferToken next =
+                runtime->memory().beginDmacTransfer(
+                    DmacChannel::Vif1);
+            (void)runtime->memory().requestDmacCompletion(next);
+            runtime->serviceEeEventsAtBlockBoundary(
+                runtime->memory().getRDRAM(), ctx);
         }
 
         ctx->pc = 0u;
@@ -1452,6 +1483,66 @@ void register_ps2_runtime_interrupt_tests()
             t.Equals(g_dmacSendLastCause.load(std::memory_order_relaxed), 1u, "DMAC handler should observe VIF1 cause");
             t.Equals(g_dmacSendLastChcr.load(std::memory_order_relaxed) & 0x100u, 0u, "handler should see VIF1 STR cleared");
             t.Equals(g_dmacSendLastChcr.load(std::memory_order_relaxed) & 0x70000000u, 0x70000000u, "handler should see the latched END tag id");
+
+            cleanupRuntime(env);
+        });
+
+        tc.Run("DMAC handler resubmission remains pending for the next safe point", [](TestCase &t)
+        {
+            notifyRuntimeStop();
+            TestEnv env;
+            t.IsTrue(
+                env.runtime.memory().initialize(),
+                "runtime memory initialize should succeed");
+
+            constexpr uint32_t kHandlerAddr = 0x00ABD1A0u;
+            uint8_t *const rdram =
+                env.runtime.memory().getRDRAM();
+
+            g_dmacSendHits.store(0u, std::memory_order_relaxed);
+            g_dmacHandlerResubmissions.store(
+                1u, std::memory_order_relaxed);
+            env.runtime.registerFunction(
+                kHandlerAddr, &testDmacResubmittingHandler);
+
+            R5900Context addCtx{};
+            setRegU32(addCtx, 4, 1u);
+            setRegU32(addCtx, 5, kHandlerAddr);
+            ps2_syscalls::AddDmacHandler(
+                rdram, &addCtx, &env.runtime);
+
+            R5900Context enableCtx{};
+            setRegU32(enableCtx, 4, 1u);
+            ps2_syscalls::EnableDmac(
+                rdram, &enableCtx, &env.runtime);
+
+            R5900Context eventCtx{};
+            {
+                PS2Runtime::GuestExecutionScope guestExecution(
+                    &env.runtime, &eventCtx);
+                const DmacTransferToken first =
+                    env.runtime.memory().beginDmacTransfer(
+                        DmacChannel::Vif1);
+                t.IsTrue(
+                    env.runtime.memory().requestDmacCompletion(first),
+                    "initial VIF1 completion should queue");
+                env.runtime.serviceEeEventsAtBlockBoundary(
+                    rdram, &eventCtx);
+            }
+
+            t.Equals(
+                g_dmacSendHits.load(std::memory_order_relaxed),
+                1u,
+                "the first safe point should deliver the original completion");
+
+            {
+                PS2Runtime::GuestExecutionScope nextSafePoint(
+                    &env.runtime, &eventCtx);
+            }
+            t.Equals(
+                g_dmacSendHits.load(std::memory_order_relaxed),
+                2u,
+                "a completion published by the handler must survive its active drain");
 
             cleanupRuntime(env);
         });
