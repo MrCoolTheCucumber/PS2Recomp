@@ -1606,6 +1606,7 @@ void PS2Runtime::resetEeTimingUnlocked(
         (void)m_memory.cancelDmacTransfer(
             DmacChannel::Gif);
     }
+    cancelHleSifDmaEvent();
     for (const DmacChannel channel :
          {DmacChannel::FromScratchpad,
           DmacChannel::ToScratchpad})
@@ -1695,6 +1696,7 @@ void PS2Runtime::setEeSchedulingMode(
         (void)m_memory.cancelDmacTransfer(
             DmacChannel::Gif);
     }
+    cancelHleSifDmaEvent();
     for (const DmacChannel channel :
          {DmacChannel::FromScratchpad,
           DmacChannel::ToScratchpad})
@@ -2445,6 +2447,305 @@ void PS2Runtime::serviceGifDmaAtEvent(
                 service.serviceTick,
                 ps2x::timing::eeCyclesToTicks(
                     advance.delayEeCycles)));
+    }
+}
+
+uint64_t PS2Runtime::hleSifDmaIopCycles(
+    const HleSifDmaSubmission &submission) noexcept
+{
+    uint64_t cycles = 0u;
+    const uint32_t transferCount = std::min<uint32_t>(
+        submission.transferCount,
+        static_cast<uint32_t>(
+            kMaximumHleSifDmaTransfers));
+    for (uint32_t index = 0u;
+         index < transferCount; ++index)
+    {
+        const uint64_t size =
+            submission.transfers[index].size;
+        cycles += (size + 15u) / 16u;
+    }
+    return std::max<uint64_t>(cycles, 1u);
+}
+
+bool PS2Runtime::executeHleSifDmaOperation(
+    uint8_t *rdram,
+    const HleSifDmaSubmission &submission)
+{
+    if (!rdram ||
+        submission.transferCount >
+            kMaximumHleSifDmaTransfers)
+    {
+        return false;
+    }
+
+    uint8_t *const iopRam = m_memory.getIOPRAM();
+    for (uint32_t index = 0u;
+         index < submission.transferCount; ++index)
+    {
+        const HleSifDmaTransfer &transfer =
+            submission.transfers[index];
+        notifyIopSifTransfer(
+            rdram,
+            {
+                ps2x::iop::SifTransferKind::SetDma,
+                ps2x::iop::SifTransferPhase::BeforeCopy,
+                transfer.src,
+                transfer.dest,
+                transfer.size,
+            });
+
+        bool copied = true;
+        if (transfer.destination ==
+            HleSifDmaDestination::IopRam)
+        {
+            copied =
+                iopRam &&
+                transfer.iopOffset <= PS2_IOP_RAM_SIZE &&
+                transfer.size <=
+                    PS2_IOP_RAM_SIZE -
+                        transfer.iopOffset;
+            for (uint32_t byte = 0u;
+                 copied && byte < transfer.size;
+                 ++byte)
+            {
+                const uint8_t *const source =
+                    getConstMemPtr(
+                        rdram, transfer.src + byte);
+                if (!source)
+                {
+                    copied = false;
+                    break;
+                }
+                iopRam[transfer.iopOffset + byte] =
+                    *source;
+            }
+        }
+        else
+        {
+            ps2TraceGuestRangeWrite(
+                rdram, transfer.dest, transfer.size,
+                "hleSifDmaCopy", nullptr);
+            const uint64_t sourceBegin = transfer.src;
+            const uint64_t sourceEnd =
+                sourceBegin + transfer.size;
+            const uint64_t destinationBegin =
+                transfer.dest;
+            const bool copyBackward =
+                destinationBegin > sourceBegin &&
+                destinationBegin < sourceEnd;
+            if (copyBackward)
+            {
+                for (uint32_t remaining = transfer.size;
+                     remaining > 0u; --remaining)
+                {
+                    const uint32_t byte = remaining - 1u;
+                    const uint8_t *const source =
+                        getConstMemPtr(
+                            rdram, transfer.src + byte);
+                    uint8_t *const destination =
+                        getMemPtr(
+                            rdram, transfer.dest + byte);
+                    if (!source || !destination)
+                    {
+                        copied = false;
+                        break;
+                    }
+                    *destination = *source;
+                }
+            }
+            else
+            {
+                for (uint32_t byte = 0u;
+                     byte < transfer.size; ++byte)
+                {
+                    const uint8_t *const source =
+                        getConstMemPtr(
+                            rdram, transfer.src + byte);
+                    uint8_t *const destination =
+                        getMemPtr(
+                            rdram, transfer.dest + byte);
+                    if (!source || !destination)
+                    {
+                        copied = false;
+                        break;
+                    }
+                    *destination = *source;
+                }
+            }
+        }
+
+        if (!copied)
+        {
+            return false;
+        }
+
+        notifyIopSifTransfer(
+            rdram,
+            {
+                ps2x::iop::SifTransferKind::SetDma,
+                ps2x::iop::SifTransferPhase::AfterCopy,
+                transfer.src,
+                transfer.dest,
+                transfer.size,
+            });
+    }
+    return true;
+}
+
+void PS2Runtime::scheduleHleSifDmaEvent(
+    ps2x::timing::EeTick deadline) noexcept
+{
+    m_hleSifDmaEventToken =
+        m_eeEventScheduler.scheduleAbsolute(
+            ps2x::timing::EeEventSource::HleSif1,
+            deadline);
+}
+
+void PS2Runtime::cancelHleSifDmaEvent() noexcept
+{
+    if (m_hleSifDmaEventToken.generation != 0u)
+    {
+        (void)m_eeEventScheduler.cancel(
+            m_hleSifDmaEventToken);
+    }
+    m_hleSifDmaEventToken = {
+        ps2x::timing::EeEventSource::HleSif1, 0u};
+    m_hleSifDmaQueueHead = 0u;
+    m_hleSifDmaQueueCount = 0u;
+    m_hleSifDmaQueue.fill({});
+}
+
+bool PS2Runtime::submitHleSifDma(
+    uint8_t *rdram,
+    R5900Context *ctx,
+    const HleSifDmaSubmission &submission)
+{
+    if (!rdram || submission.transferId == 0u ||
+        submission.transferCount >
+            kMaximumHleSifDmaTransfers)
+    {
+        return false;
+    }
+
+    if (m_eeSchedulingMode !=
+        ps2x::timing::EeSchedulingMode::Event)
+    {
+        if (!executeHleSifDmaOperation(
+                rdram, submission))
+        {
+            return false;
+        }
+        requestDmacCompletion(DmacChannel::Sif0);
+        return true;
+    }
+
+    if (m_hleSifDmaQueueCount >=
+        kHleSifDmaQueueCapacity)
+    {
+        return false;
+    }
+
+    const ps2x::timing::EeTick now =
+        commitEeContextProgress(ctx);
+    const size_t insertion =
+        (m_hleSifDmaQueueHead +
+         m_hleSifDmaQueueCount) %
+        kHleSifDmaQueueCapacity;
+    HleSifDmaOperation &operation =
+        m_hleSifDmaQueue[insertion];
+    operation = {};
+    operation.submission = submission;
+    operation.operationGeneration =
+        ++m_hleSifDmaOperationGeneration;
+    if (operation.operationGeneration == 0u)
+    {
+        operation.operationGeneration =
+            ++m_hleSifDmaOperationGeneration;
+    }
+    operation.iopCycles =
+        hleSifDmaIopCycles(submission);
+    ++m_hleSifDmaQueueCount;
+
+    if (m_hleSifDmaQueueCount == 1u)
+    {
+        scheduleHleSifDmaEvent(
+            ps2x::timing::saturatingAdd(
+                now,
+                ps2x::timing::iopCyclesToEeTicks(
+                    operation.iopCycles)));
+    }
+    return m_hleSifDmaEventToken.generation != 0u;
+}
+
+int32_t PS2Runtime::hleSifDmaStatus(
+    uint32_t transferId) const noexcept
+{
+    if (transferId == 0u)
+    {
+        return -1;
+    }
+    for (size_t offset = 0u;
+         offset < m_hleSifDmaQueueCount; ++offset)
+    {
+        const size_t index =
+            (m_hleSifDmaQueueHead + offset) %
+            kHleSifDmaQueueCapacity;
+        if (m_hleSifDmaQueue[index]
+                .submission.transferId == transferId)
+        {
+            return offset == 0u ? 0 : 1;
+        }
+    }
+    return -1;
+}
+
+void PS2Runtime::serviceHleSifDmaAtEvent(
+    uint8_t *rdram,
+    const ps2x::timing::EeEventService &service)
+{
+    if (m_hleSifDmaEventToken.generation == 0u ||
+        service.generation !=
+            m_hleSifDmaEventToken.generation ||
+        m_hleSifDmaQueueCount == 0u)
+    {
+        return;
+    }
+
+    m_hleSifDmaEventToken = {
+        ps2x::timing::EeEventSource::HleSif1, 0u};
+    HleSifDmaOperation &operation =
+        m_hleSifDmaQueue[m_hleSifDmaQueueHead];
+    if (!executeHleSifDmaOperation(
+            rdram, operation.submission))
+    {
+        std::cerr
+            << "HLE SIF DMA failed after validated submission"
+            << std::endl;
+        m_hleSifDmaQueueHead = 0u;
+        m_hleSifDmaQueueCount = 0u;
+        m_hleSifDmaQueue.fill({});
+        requestStop();
+        return;
+    }
+
+    operation = {};
+    m_hleSifDmaQueueHead =
+        (m_hleSifDmaQueueHead + 1u) %
+        kHleSifDmaQueueCapacity;
+    --m_hleSifDmaQueueCount;
+    requestDmacCompletion(DmacChannel::Sif0);
+
+    if (m_hleSifDmaQueueCount != 0u)
+    {
+        const HleSifDmaOperation &next =
+            m_hleSifDmaQueue[
+                m_hleSifDmaQueueHead];
+        scheduleHleSifDmaEvent(
+            ps2x::timing::saturatingAdd(
+                service.serviceTick,
+                ps2x::timing::iopCyclesToEeTicks(
+                    next.iopCycles)));
     }
 }
 
@@ -4040,6 +4341,9 @@ void PS2Runtime::dispatchEeEvent(
     case ps2x::timing::EeEventSource::DmacGif:
         serviceGifDmaAtEvent(service);
         return;
+    case ps2x::timing::EeEventSource::HleSif1:
+        serviceHleSifDmaAtEvent(rdram, service);
+        return;
     case ps2x::timing::EeEventSource::DmacVif0:
         serviceVif0DmaAtEvent(service);
         return;
@@ -4210,6 +4514,39 @@ PS2Runtime::debugEeEventDeviceState(
         result.qwc = state.qwc;
         result.tagsProcessed = state.tagsProcessed;
         result.active = state.active;
+        return result;
+    }
+    case ps2x::timing::EeEventSource::HleSif1:
+    {
+        result.kind =
+            DebugEeEventDeviceKind::HleSifDma;
+        if (m_hleSifDmaQueueCount == 0u)
+        {
+            return result;
+        }
+        const HleSifDmaOperation &state =
+            m_hleSifDmaQueue[
+                m_hleSifDmaQueueHead];
+        result.operationGeneration =
+            state.operationGeneration;
+        result.totalAdvancedCycles =
+            state.iopCycles;
+        result.phase = static_cast<uint32_t>(
+            m_hleSifDmaQueueCount);
+        result.qwc = static_cast<uint32_t>(
+            std::min<uint64_t>(
+                state.iopCycles,
+                std::numeric_limits<uint32_t>::max()));
+        result.tagsProcessed =
+            state.submission.transferCount;
+        if (state.submission.transferCount != 0u)
+        {
+            result.madr =
+                state.submission.transfers[0].src;
+            result.tadr =
+                state.submission.transfers[0].dest;
+        }
+        result.active = true;
         return result;
     }
     case ps2x::timing::EeEventSource::DmacVif0:

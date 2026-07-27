@@ -392,6 +392,35 @@ public:
         std::filesystem::path cdImage;
     };
 
+    enum class HleSifDmaDestination : uint8_t
+    {
+        IopRam = 0u,
+        SyntheticGuest,
+    };
+
+    struct HleSifDmaTransfer
+    {
+        uint32_t src = 0u;
+        uint32_t dest = 0u;
+        uint32_t size = 0u;
+        uint32_t iopOffset = 0u;
+        HleSifDmaDestination destination =
+            HleSifDmaDestination::IopRam;
+    };
+
+    static constexpr size_t kMaximumHleSifDmaTransfers = 32u;
+    static constexpr size_t kHleSifDmaQueueCapacity = 32u;
+
+    struct HleSifDmaSubmission
+    {
+        std::array<
+            HleSifDmaTransfer,
+            kMaximumHleSifDmaTransfers>
+            transfers{};
+        uint32_t transferId = 0u;
+        uint32_t transferCount = 0u;
+    };
+
     PS2Runtime();
     ~PS2Runtime();
 
@@ -504,6 +533,7 @@ public:
         None = 0u,
         VSync,
         GifDma,
+        HleSifDma,
         Vif0Dma,
         Vif1Dma,
         Vu0,
@@ -815,6 +845,12 @@ public:
 
     void drainCompletedDmacHandlers(uint8_t *rdram);
     void requestDmacCompletion(DmacChannel channel);
+    bool submitHleSifDma(
+        uint8_t *rdram,
+        R5900Context *ctx,
+        const HleSifDmaSubmission &submission);
+    [[nodiscard]] int32_t hleSifDmaStatus(
+        uint32_t transferId) const noexcept;
 
     void requestGuestPreemption();
     bool shouldPreemptGuestExecution();
@@ -1062,6 +1098,17 @@ private:
         ps2x::timing::EeTick deadline) noexcept;
     void serviceGifDmaAtEvent(
         const ps2x::timing::EeEventService &service);
+    [[nodiscard]] static uint64_t hleSifDmaIopCycles(
+        const HleSifDmaSubmission &submission) noexcept;
+    [[nodiscard]] bool executeHleSifDmaOperation(
+        uint8_t *rdram,
+        const HleSifDmaSubmission &submission);
+    void scheduleHleSifDmaEvent(
+        ps2x::timing::EeTick deadline) noexcept;
+    void cancelHleSifDmaEvent() noexcept;
+    void serviceHleSifDmaAtEvent(
+        uint8_t *rdram,
+        const ps2x::timing::EeEventService &service);
     bool scheduleScratchpadDmaFromMemory(
         DmacChannel channel,
         uint32_t delayEeCycles);
@@ -1154,6 +1201,21 @@ private:
         ps2x::timing::EeEventSource::DmacVif1, 0u};
     ps2x::timing::EeEventToken m_gifDmaEventToken{
         ps2x::timing::EeEventSource::DmacGif, 0u};
+    struct HleSifDmaOperation
+    {
+        HleSifDmaSubmission submission{};
+        uint64_t operationGeneration = 0u;
+        uint64_t iopCycles = 0u;
+    };
+    std::array<
+        HleSifDmaOperation,
+        kHleSifDmaQueueCapacity>
+        m_hleSifDmaQueue{};
+    size_t m_hleSifDmaQueueHead = 0u;
+    size_t m_hleSifDmaQueueCount = 0u;
+    uint64_t m_hleSifDmaOperationGeneration = 0u;
+    ps2x::timing::EeEventToken m_hleSifDmaEventToken{
+        ps2x::timing::EeEventSource::HleSif1, 0u};
     ps2x::timing::EeEventToken
         m_fromScratchpadDmaEventToken{
             ps2x::timing::EeEventSource::

@@ -100,6 +100,36 @@ namespace
         return value;
     }
 
+    int32_t submitSifDma(
+        TestEnv &env,
+        uint32_t descriptorAddress,
+        uint32_t descriptorCount)
+    {
+        setRegU32(env.ctx, 4, descriptorAddress);
+        setRegU32(env.ctx, 5, descriptorCount);
+        ps2_stubs::sceSifSetDma(
+            env.rdram.data(), &env.ctx, &env.runtime);
+        return getRegS32(env.ctx, 2);
+    }
+
+    int32_t sifDmaStatus(
+        TestEnv &env, uint32_t transferId)
+    {
+        setRegU32(env.ctx, 4, transferId);
+        ps2_stubs::sceSifDmaStat(
+            env.rdram.data(), &env.ctx, &env.runtime);
+        return getRegS32(env.ctx, 2);
+    }
+
+    void advanceEventTime(
+        TestEnv &env, uint32_t rawEeTicks)
+    {
+        env.ctx.cop0_config |= 1u << 18u;
+        env.ctx.advanceEeCycleTicks(rawEeTicks);
+        env.runtime.serviceEeEventsAtBlockBoundary(
+            env.rdram.data(), &env.ctx);
+    }
+
     void writeGuestS16(uint8_t *rdram, uint32_t addr, int16_t value)
     {
         std::memcpy(rdram + addr, &value, sizeof(value));
@@ -192,6 +222,543 @@ void register_ps2_sif_dma_tests()
             setRegU32(env.ctx, 4, static_cast<uint32_t>(dmaId));
             ps2_stubs::sceSifDmaStat(env.rdram.data(), &env.ctx, &env.runtime);
             t.IsTrue(getRegS32(env.ctx, 2) < 0, "sceSifDmaStat should be negative when transfer is complete");
+        });
+
+        tc.Run("event sceSifSetDma defers HLE IOP visibility to the IOP-cycle deadline", [](TestCase &t)
+        {
+            TestEnv env;
+            env.runtime.setEeSchedulingMode(
+                ps2x::timing::EeSchedulingMode::Event);
+
+            constexpr uint32_t kDescAddr = 0x00020600u;
+            constexpr uint32_t kSrcAddr = 0x00020700u;
+            constexpr uint32_t kDstAddr = 0x00020800u;
+            constexpr uint32_t kDstat = 0x1000E010u;
+
+            std::array<uint8_t, 16> submitted{};
+            std::array<uint8_t, 16> serviced{};
+            for (size_t index = 0u;
+                 index < submitted.size(); ++index)
+            {
+                submitted[index] =
+                    static_cast<uint8_t>(0x20u + index);
+                serviced[index] =
+                    static_cast<uint8_t>(0x80u + index);
+            }
+            std::memcpy(
+                env.rdram.data() + kSrcAddr,
+                submitted.data(), submitted.size());
+            std::memset(
+                env.runtime.memory().getIOPRAM() + kDstAddr,
+                0, submitted.size());
+            const Ps2SifDmaTransfer descriptor{
+                kSrcAddr, kDstAddr,
+                static_cast<int32_t>(submitted.size()), 0};
+            std::memcpy(
+                env.rdram.data() + kDescAddr,
+                &descriptor, sizeof(descriptor));
+
+            env.runtime.debugStartEeEventTrace(4u);
+            const int32_t transferId =
+                submitSifDma(env, kDescAddr, 1u);
+            t.IsTrue(
+                transferId > 0,
+                "event submission should return a transfer id");
+            t.Equals(
+                sifDmaStatus(
+                    env,
+                    static_cast<uint32_t>(transferId)),
+                0,
+                "the front event transfer should report in-progress");
+            t.IsTrue(
+                std::memcmp(
+                    env.runtime.memory().getIOPRAM() +
+                        kDstAddr,
+                    std::array<uint8_t, 16>{}.data(),
+                    submitted.size()) == 0,
+                "submission must not expose payload before service");
+            t.IsTrue(
+                (env.runtime.memory().readIORegister(
+                     kDstat) &
+                 (1u << 5u)) == 0u,
+                "submission must not publish the compatibility cause");
+
+            const PS2Runtime::DebugEeScheduler scheduler =
+                env.runtime.debugEeSchedulerSnapshot();
+            const auto slot =
+                scheduler.slots[
+                    ps2x::timing::eeEventSourceIndex(
+                        ps2x::timing::EeEventSource::
+                            HleSif1)];
+            t.IsTrue(
+                slot.pending &&
+                    slot.device.kind ==
+                        PS2Runtime::
+                            DebugEeEventDeviceKind::
+                                HleSifDma,
+                "HLE SIF1 should retain visible event ownership");
+            t.Equals(
+                slot.deadlineTick, 64ull,
+                "one QW should cost one IOP cycle or eight EE cycles");
+
+            std::memcpy(
+                env.rdram.data() + kSrcAddr,
+                serviced.data(), serviced.size());
+            advanceEventTime(env, 56u);
+            t.IsTrue(
+                std::memcmp(
+                    env.runtime.memory().getIOPRAM() +
+                        kDstAddr,
+                    std::array<uint8_t, 16>{}.data(),
+                    serviced.size()) == 0,
+                "payload should remain hidden before tick 64");
+
+            advanceEventTime(env, 8u);
+            t.IsTrue(
+                std::memcmp(
+                    env.runtime.memory().getIOPRAM() +
+                        kDstAddr,
+                    serviced.data(), serviced.size()) == 0,
+                "service should read the payload at service time");
+            t.IsTrue(
+                sifDmaStatus(
+                    env,
+                    static_cast<uint32_t>(transferId)) < 0,
+                "serviced transfer should report complete");
+            t.IsTrue(
+                (env.runtime.memory().readIORegister(
+                     kDstat) &
+                 (1u << 5u)) != 0u,
+                "typed publication should latch SIF0 cause 5");
+
+            const PS2Runtime::DebugEeEventTrace trace =
+                env.runtime.debugEeEventTraceSnapshot(true);
+            t.Equals(
+                trace.entries.size(),
+                static_cast<size_t>(2u),
+                "service and typed publication should be distinct events");
+            if (trace.entries.size() == 2u)
+            {
+                t.IsTrue(
+                    trace.entries[0].source ==
+                            ps2x::timing::EeEventSource::
+                                HleSif1 &&
+                        trace.entries[1].source ==
+                            ps2x::timing::EeEventSource::
+                                DmacCompletion,
+                    "copy and HLE notification must precede publication");
+                t.Equals(
+                    trace.entries[0].serviceTick,
+                    64ull,
+                    "HLE SIF service should retain the exact deadline");
+                t.Equals(
+                    trace.entries[1].serviceTick,
+                    64ull,
+                    "typed completion should publish in the same boundary");
+            }
+        });
+
+        tc.Run("event sceSifSetDma queues calls and sums rounded descriptor work", [](TestCase &t)
+        {
+            TestEnv env;
+            env.runtime.setEeSchedulingMode(
+                ps2x::timing::EeSchedulingMode::Event);
+
+            constexpr uint32_t kDescA = 0x00020900u;
+            constexpr uint32_t kDescB = 0x00020940u;
+            constexpr uint32_t kSrcA0 = 0x00020A00u;
+            constexpr uint32_t kSrcA1 = 0x00020A40u;
+            constexpr uint32_t kSrcB = 0x00020A80u;
+            constexpr uint32_t kDstA0 = 0x00020B00u;
+            constexpr uint32_t kDstA1 = 0x00020B40u;
+            constexpr uint32_t kDstB = 0x00020B80u;
+
+            std::array<uint8_t, 1> payloadA0{0x31u};
+            std::array<uint8_t, 17> payloadA1{};
+            std::array<uint8_t, 16> payloadB{};
+            for (size_t index = 0u;
+                 index < payloadA1.size(); ++index)
+            {
+                payloadA1[index] =
+                    static_cast<uint8_t>(0x50u + index);
+            }
+            for (size_t index = 0u;
+                 index < payloadB.size(); ++index)
+            {
+                payloadB[index] =
+                    static_cast<uint8_t>(0xA0u + index);
+            }
+            std::memcpy(
+                env.rdram.data() + kSrcA0,
+                payloadA0.data(), payloadA0.size());
+            std::memcpy(
+                env.rdram.data() + kSrcA1,
+                payloadA1.data(), payloadA1.size());
+            std::memcpy(
+                env.rdram.data() + kSrcB,
+                payloadB.data(), payloadB.size());
+            std::memset(
+                env.runtime.memory().getIOPRAM() + kDstA0,
+                0, payloadA0.size());
+            std::memset(
+                env.runtime.memory().getIOPRAM() + kDstA1,
+                0, payloadA1.size());
+            std::memset(
+                env.runtime.memory().getIOPRAM() + kDstB,
+                0, payloadB.size());
+
+            const std::array<Ps2SifDmaTransfer, 2>
+                descriptorsA{{
+                    {kSrcA0, kDstA0, 1, 0},
+                    {kSrcA1, kDstA1, 17, 0},
+                }};
+            const Ps2SifDmaTransfer descriptorB{
+                kSrcB, kDstB, 16, 0};
+            std::memcpy(
+                env.rdram.data() + kDescA,
+                descriptorsA.data(), sizeof(descriptorsA));
+            std::memcpy(
+                env.rdram.data() + kDescB,
+                &descriptorB, sizeof(descriptorB));
+
+            env.runtime.debugStartEeEventTrace(8u);
+            const int32_t firstId =
+                submitSifDma(env, kDescA, 2u);
+            const int32_t secondId =
+                submitSifDma(env, kDescB, 1u);
+            t.IsTrue(
+                firstId > 0 && secondId > firstId,
+                "queued submissions should receive ordered ids");
+            t.Equals(
+                sifDmaStatus(
+                    env, static_cast<uint32_t>(firstId)),
+                0,
+                "front operation should report in-progress");
+            t.IsTrue(
+                sifDmaStatus(
+                    env, static_cast<uint32_t>(secondId)) > 0,
+                "later operation should report queued");
+
+            auto scheduler =
+                env.runtime.debugEeSchedulerSnapshot();
+            auto slot =
+                scheduler.slots[
+                    ps2x::timing::eeEventSourceIndex(
+                        ps2x::timing::EeEventSource::
+                            HleSif1)];
+            t.Equals(
+                slot.deadlineTick, 192ull,
+                "1-byte and 17-byte descriptors should cost three rounded QWs");
+
+            advanceEventTime(env, 192u);
+            t.IsTrue(
+                std::memcmp(
+                    env.runtime.memory().getIOPRAM() +
+                        kDstA0,
+                    payloadA0.data(), payloadA0.size()) == 0 &&
+                    std::memcmp(
+                        env.runtime.memory().getIOPRAM() +
+                            kDstA1,
+                        payloadA1.data(),
+                        payloadA1.size()) == 0,
+                "first service should apply all descriptors in order");
+            t.IsTrue(
+                std::memcmp(
+                    env.runtime.memory().getIOPRAM() +
+                        kDstB,
+                    std::array<uint8_t, 16>{}.data(),
+                    payloadB.size()) == 0,
+                "queued operation must remain hidden");
+            t.IsTrue(
+                sifDmaStatus(
+                    env, static_cast<uint32_t>(firstId)) < 0,
+                "first operation should retire");
+            t.Equals(
+                sifDmaStatus(
+                    env, static_cast<uint32_t>(secondId)),
+                0,
+                "second operation should become active");
+
+            scheduler =
+                env.runtime.debugEeSchedulerSnapshot();
+            slot =
+                scheduler.slots[
+                    ps2x::timing::eeEventSourceIndex(
+                        ps2x::timing::EeEventSource::
+                            HleSif1)];
+            t.Equals(
+                slot.deadlineTick, 256ull,
+                "queued one-QW work should rebase from service tick");
+
+            advanceEventTime(env, 64u);
+            t.IsTrue(
+                std::memcmp(
+                    env.runtime.memory().getIOPRAM() +
+                        kDstB,
+                    payloadB.data(), payloadB.size()) == 0,
+                "second operation should apply at tick 256");
+            t.IsTrue(
+                sifDmaStatus(
+                    env, static_cast<uint32_t>(secondId)) < 0,
+                "second operation should retire");
+
+            const PS2Runtime::DebugEeEventTrace trace =
+                env.runtime.debugEeEventTraceSnapshot(true);
+            t.Equals(
+                trace.entries.size(),
+                static_cast<size_t>(4u),
+                "two operations should each own service and publication");
+            if (trace.entries.size() == 4u)
+            {
+                const std::array<
+                    ps2x::timing::EeEventSource, 4u>
+                    expected{
+                        ps2x::timing::EeEventSource::
+                            HleSif1,
+                        ps2x::timing::EeEventSource::
+                            DmacCompletion,
+                        ps2x::timing::EeEventSource::
+                            HleSif1,
+                        ps2x::timing::EeEventSource::
+                            DmacCompletion,
+                    };
+                for (size_t index = 0u;
+                     index < expected.size(); ++index)
+                {
+                    t.IsTrue(
+                        trace.entries[index].source ==
+                            expected[index],
+                        "queued SIF events should retain source order");
+                }
+            }
+        });
+
+        tc.Run("shadow sceSifSetDma retains immediate compatibility behavior", [](TestCase &t)
+        {
+            TestEnv env;
+            env.runtime.setEeSchedulingMode(
+                ps2x::timing::EeSchedulingMode::Shadow);
+
+            constexpr uint32_t kDescAddr = 0x00020C00u;
+            constexpr uint32_t kSrcAddr = 0x00020D00u;
+            constexpr uint32_t kDstAddr = 0x00020E00u;
+            const std::array<uint8_t, 16> payload{
+                0x10, 0x11, 0x12, 0x13,
+                0x14, 0x15, 0x16, 0x17,
+                0x18, 0x19, 0x1A, 0x1B,
+                0x1C, 0x1D, 0x1E, 0x1F};
+            std::memcpy(
+                env.rdram.data() + kSrcAddr,
+                payload.data(), payload.size());
+            std::memset(
+                env.runtime.memory().getIOPRAM() + kDstAddr,
+                0, payload.size());
+            const Ps2SifDmaTransfer descriptor{
+                kSrcAddr, kDstAddr, 16, 0};
+            std::memcpy(
+                env.rdram.data() + kDescAddr,
+                &descriptor, sizeof(descriptor));
+
+            const int32_t transferId =
+                submitSifDma(env, kDescAddr, 1u);
+            t.IsTrue(
+                transferId > 0,
+                "shadow submission should succeed");
+            t.IsTrue(
+                std::memcmp(
+                    env.runtime.memory().getIOPRAM() +
+                        kDstAddr,
+                    payload.data(), payload.size()) == 0,
+                "shadow mode should preserve immediate copy");
+            t.IsTrue(
+                sifDmaStatus(
+                    env,
+                    static_cast<uint32_t>(transferId)) < 0,
+                "shadow compatibility transfer should already be complete");
+            const auto scheduler =
+                env.runtime.debugEeSchedulerSnapshot();
+            t.IsFalse(
+                scheduler.slots[
+                    ps2x::timing::eeEventSourceIndex(
+                        ps2x::timing::EeEventSource::
+                            HleSif1)]
+                    .pending,
+                "shadow mode should not apply event effects twice");
+        });
+
+        tc.Run("event sceSifSetDma bounds its queue and rejects stale deadlines", [](TestCase &t)
+        {
+            TestEnv env;
+            env.runtime.setEeSchedulingMode(
+                ps2x::timing::EeSchedulingMode::Event);
+
+            constexpr uint32_t kDescAddr = 0x00020F00u;
+            constexpr uint32_t kSrcAddr = 0x00021000u;
+            constexpr uint32_t kOldDstAddr = 0x00021100u;
+            constexpr uint32_t kNewDstAddr = 0x00021200u;
+            std::array<uint8_t, 32> payload{};
+            for (size_t index = 0u;
+                 index < payload.size(); ++index)
+            {
+                payload[index] =
+                    static_cast<uint8_t>(0xC0u + index);
+            }
+            std::memcpy(
+                env.rdram.data() + kSrcAddr,
+                payload.data(), payload.size());
+            std::memset(
+                env.runtime.memory().getIOPRAM() +
+                    kOldDstAddr,
+                0, 16u);
+            std::memset(
+                env.runtime.memory().getIOPRAM() +
+                    kNewDstAddr,
+                0, payload.size());
+
+            Ps2SifDmaTransfer descriptor{
+                kSrcAddr, kOldDstAddr, 16, 0};
+            std::memcpy(
+                env.rdram.data() + kDescAddr,
+                &descriptor, sizeof(descriptor));
+            for (size_t index = 0u;
+                 index <
+                     PS2Runtime::
+                         kHleSifDmaQueueCapacity;
+                 ++index)
+            {
+                t.IsTrue(
+                    submitSifDma(
+                        env, kDescAddr, 1u) > 0,
+                    "each fixed queue slot should accept one operation");
+            }
+            t.Equals(
+                submitSifDma(env, kDescAddr, 1u),
+                0,
+                "queue overflow should fail without side effects");
+            t.IsTrue(
+                std::memcmp(
+                    env.runtime.memory().getIOPRAM() +
+                        kOldDstAddr,
+                    std::array<uint8_t, 16>{}.data(),
+                    16u) == 0,
+                "queued and rejected work should remain hidden");
+
+            const auto oldScheduler =
+                env.runtime.debugEeSchedulerSnapshot();
+            const auto oldSlot =
+                oldScheduler.slots[
+                    ps2x::timing::eeEventSourceIndex(
+                        ps2x::timing::EeEventSource::
+                            HleSif1)];
+            t.IsTrue(
+                oldSlot.pending,
+                "the original generation should own a deadline");
+
+            env.runtime.setEeSchedulingMode(
+                ps2x::timing::EeSchedulingMode::Legacy);
+            env.runtime.setEeSchedulingMode(
+                ps2x::timing::EeSchedulingMode::Event);
+            descriptor.dest = kNewDstAddr;
+            descriptor.size = 32;
+            std::memcpy(
+                env.rdram.data() + kDescAddr,
+                &descriptor, sizeof(descriptor));
+            const int32_t replacementId =
+                submitSifDma(env, kDescAddr, 1u);
+            t.IsTrue(
+                replacementId > 0,
+                "replacement generation should submit");
+            const auto replacementScheduler =
+                env.runtime.debugEeSchedulerSnapshot();
+            const auto replacementSlot =
+                replacementScheduler.slots[
+                    ps2x::timing::eeEventSourceIndex(
+                        ps2x::timing::EeEventSource::
+                            HleSif1)];
+            t.IsTrue(
+                replacementSlot.pending &&
+                    replacementSlot.generation >
+                        oldSlot.generation,
+                "replacement should own a newer scheduler generation");
+            t.Equals(
+                replacementSlot.deadlineTick, 128ull,
+                "two replacement QWs should cost two IOP cycles");
+
+            env.runtime.debugStartEeEventTrace(4u);
+            advanceEventTime(env, 64u);
+            t.IsTrue(
+                std::memcmp(
+                    env.runtime.memory().getIOPRAM() +
+                        kOldDstAddr,
+                    std::array<uint8_t, 16>{}.data(),
+                    16u) == 0 &&
+                    std::memcmp(
+                        env.runtime.memory().getIOPRAM() +
+                            kNewDstAddr,
+                        std::array<uint8_t, 32>{}.data(),
+                        payload.size()) == 0,
+                "the cancelled tick-64 generation must not copy");
+            t.Equals(
+                env.runtime
+                    .debugEeEventTraceSnapshot(false)
+                    .entries.size(),
+                static_cast<size_t>(0u),
+                "the stale deadline must not dispatch");
+
+            advanceEventTime(env, 64u);
+            t.IsTrue(
+                std::memcmp(
+                    env.runtime.memory().getIOPRAM() +
+                        kNewDstAddr,
+                    payload.data(), payload.size()) == 0,
+                "replacement should copy at tick 128");
+            t.IsTrue(
+                sifDmaStatus(
+                    env,
+                    static_cast<uint32_t>(
+                        replacementId)) < 0,
+                "replacement should retire");
+            t.IsTrue(
+                std::memcmp(
+                    env.runtime.memory().getIOPRAM() +
+                        kOldDstAddr,
+                    std::array<uint8_t, 16>{}.data(),
+                    16u) == 0,
+                "cancelled queued work must never become visible");
+
+            descriptor.dest = kOldDstAddr;
+            descriptor.size = 16;
+            std::memcpy(
+                env.rdram.data() + kDescAddr,
+                &descriptor, sizeof(descriptor));
+            const int32_t resetCancelledId =
+                submitSifDma(env, kDescAddr, 1u);
+            t.IsTrue(
+                resetCancelledId > 0,
+                "pre-reset work should submit");
+            env.runtime.resetEeTiming(&env.ctx);
+            t.IsFalse(
+                env.runtime.debugEeSchedulerSnapshot()
+                    .slots[
+                        ps2x::timing::eeEventSourceIndex(
+                            ps2x::timing::EeEventSource::
+                                HleSif1)]
+                    .pending,
+                "timing reset should cancel the retained source");
+            advanceEventTime(env, 192u);
+            t.IsTrue(
+                std::memcmp(
+                    env.runtime.memory().getIOPRAM() +
+                        kOldDstAddr,
+                    std::array<uint8_t, 16>{}.data(),
+                    16u) == 0,
+                "timing-reset work must never become visible");
+            t.IsTrue(
+                sifDmaStatus(
+                    env,
+                    static_cast<uint32_t>(
+                        resetCancelledId)) < 0,
+                "timing-reset work should report retired");
         });
 
         tc.Run("Sony 989snd decodes streaming DMA from IOP RAM rather than the aliased EE address", [](TestCase &t)
@@ -512,6 +1079,148 @@ void register_ps2_sif_dma_tests()
 
             t.Equals(readGuestU32(env.rdram.data(), kFooterTicketAddr), 2u,
                      "sceSifSetDma should advance the EE footer ticket so DTX clears wait_flag");
+        });
+
+        tc.Run("event sceSifSetDma orders DTX copy notification and completion", [](TestCase &t)
+        {
+            TestEnv env;
+            env.runtime.setEeSchedulingMode(
+                ps2x::timing::EeSchedulingMode::Event);
+            configureProfile(env, "slus_201.84");
+
+            constexpr uint32_t kClientAddr = 0x0002D000u;
+            constexpr uint32_t kDtxSid = 0x7D000000u;
+            constexpr uint32_t kSendAddr = 0x0002D100u;
+            constexpr uint32_t kRecvAddr = 0x0002D200u;
+            constexpr uint32_t kDescAddr = 0x0002D300u;
+            constexpr uint32_t kEeWorkAddr = 0x0002D400u;
+            constexpr uint32_t kIopWorkAddr = 0x0002D800u;
+            constexpr uint32_t kDtxId = 3u;
+            constexpr uint32_t kWorkLen = 0x100u;
+            constexpr uint32_t kFooterTicketAddr =
+                kEeWorkAddr + kWorkLen - sizeof(uint32_t);
+            constexpr uint32_t kIopFooterTicketOffset =
+                kIopWorkAddr + kWorkLen - sizeof(uint32_t);
+            constexpr uint32_t kDstat = 0x1000E010u;
+
+            ps2_syscalls::SifInitRpc(
+                env.rdram.data(), &env.ctx, &env.runtime);
+
+            setRegU32(env.ctx, 4, kClientAddr);
+            setRegU32(env.ctx, 5, kDtxSid);
+            setRegU32(env.ctx, 6, 0u);
+            ps2_syscalls::SifBindRpc(
+                env.rdram.data(), &env.ctx, &env.runtime);
+            t.Equals(
+                getRegS32(env.ctx, 2), KE_OK,
+                "SifBindRpc should succeed for the DTX sid");
+
+            writeGuestU32(
+                env.rdram.data(), kSendAddr + 0x00u, kDtxId);
+            writeGuestU32(
+                env.rdram.data(), kSendAddr + 0x04u,
+                kEeWorkAddr);
+            writeGuestU32(
+                env.rdram.data(), kSendAddr + 0x08u,
+                kIopWorkAddr);
+            writeGuestU32(
+                env.rdram.data(), kSendAddr + 0x0Cu, kWorkLen);
+            writeGuestU32(
+                env.rdram.data(), kRecvAddr + 0x00u, 0u);
+
+            setRegU32(env.ctx, 4, kClientAddr);
+            setRegU32(env.ctx, 5, 2u);
+            setRegU32(env.ctx, 6, 0u);
+            setRegU32(env.ctx, 7, kSendAddr);
+            setRegU32(env.ctx, 8, 16u);
+            setRegU32(env.ctx, 9, kRecvAddr);
+            setRegU32(env.ctx, 10, 4u);
+            setRegU32(env.ctx, 11, 0u);
+            ps2_syscalls::SifCallRpc(
+                env.rdram.data(), &env.ctx, &env.runtime);
+            t.Equals(
+                getRegS32(env.ctx, 2), KE_OK,
+                "SifCallRpc should create the DTX transport");
+
+            std::memset(
+                env.rdram.data() + kEeWorkAddr,
+                0x44, kWorkLen);
+            std::memset(
+                env.runtime.memory().getIOPRAM() +
+                    kIopWorkAddr,
+                0, kWorkLen);
+            writeGuestU32(
+                env.rdram.data(), kFooterTicketAddr, 1u);
+
+            const Ps2SifDmaTransfer descriptor{
+                kEeWorkAddr,
+                kIopWorkAddr,
+                static_cast<int32_t>(kWorkLen),
+                0};
+            std::memcpy(
+                env.rdram.data() + kDescAddr,
+                &descriptor, sizeof(descriptor));
+
+            env.runtime.debugStartEeEventTrace(4u);
+            const int32_t transferId =
+                submitSifDma(env, kDescAddr, 1u);
+            t.IsTrue(
+                transferId > 0,
+                "event DTX transfer should submit");
+            t.Equals(
+                readGuestU32(
+                    env.rdram.data(), kFooterTicketAddr),
+                1u,
+                "DTX notification must remain deferred");
+            t.Equals(
+                readGuestU32(
+                    env.runtime.memory().getIOPRAM(),
+                    kIopFooterTicketOffset),
+                0u,
+                "DTX payload must remain hidden before service");
+
+            advanceEventTime(env, 1016u);
+            t.Equals(
+                readGuestU32(
+                    env.rdram.data(), kFooterTicketAddr),
+                1u,
+                "DTX notification must remain hidden before tick 1024");
+            t.Equals(
+                readGuestU32(
+                    env.runtime.memory().getIOPRAM(),
+                    kIopFooterTicketOffset),
+                0u,
+                "DTX copy must remain hidden before tick 1024");
+
+            advanceEventTime(env, 8u);
+            t.Equals(
+                readGuestU32(
+                    env.runtime.memory().getIOPRAM(),
+                    kIopFooterTicketOffset),
+                1u,
+                "copy should capture the pre-notification footer");
+            t.Equals(
+                readGuestU32(
+                    env.rdram.data(), kFooterTicketAddr),
+                2u,
+                "AfterCopy notification should advance the EE footer");
+            t.IsTrue(
+                (env.runtime.memory().readIORegister(
+                     kDstat) &
+                 (1u << 5u)) != 0u,
+                "typed completion should follow DTX notification");
+
+            const PS2Runtime::DebugEeEventTrace trace =
+                env.runtime.debugEeEventTraceSnapshot(true);
+            t.IsTrue(
+                trace.entries.size() == 2u &&
+                    trace.entries[0].source ==
+                        ps2x::timing::EeEventSource::
+                            HleSif1 &&
+                    trace.entries[1].source ==
+                        ps2x::timing::EeEventSource::
+                            DmacCompletion,
+                "DTX service should precede typed publication");
         });
 
         tc.Run("sceSifSetDma applies SJX DTX payloads into the emulated SJRMT data ring", [](TestCase &t)

@@ -305,32 +305,6 @@ namespace ps2_stubs
             return offset >= allocation->first && rangeEnd <= allocationEnd;
         }
 
-        bool copyEeToIopByteRange(uint8_t *rdram,
-                                  uint8_t *iopRam,
-                                  uint32_t iopOffset,
-                                  uint32_t srcAddr,
-                                  uint32_t sizeBytes)
-        {
-            if (!iopRam ||
-                !canReadGuestByteRange(rdram, srcAddr, sizeBytes) ||
-                iopOffset > PS2_IOP_RAM_SIZE ||
-                sizeBytes > (PS2_IOP_RAM_SIZE - iopOffset))
-            {
-                return false;
-            }
-
-            for (uint32_t i = 0u; i < sizeBytes; ++i)
-            {
-                const uint8_t *src = getConstMemPtr(rdram, srcAddr + i);
-                if (!src)
-                {
-                    return false;
-                }
-                iopRam[iopOffset + i] = *src;
-            }
-            return true;
-        }
-
         bool copyGuestByteRange(uint8_t *rdram, uint32_t dstAddr, uint32_t srcAddr, uint32_t sizeBytes)
         {
             if (!canCopyGuestByteRange(rdram, dstAddr, srcAddr, sizeBytes))
@@ -427,11 +401,12 @@ namespace ps2_stubs
     void sceSifDmaStat(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
         (void)rdram;
-        (void)runtime;
-        (void)getRegU32(ctx, 4); // trid
-
-        // Transfers are applied immediately by sceSifSetDma in this runtime.
-        setReturnS32(ctx, -1);
+        const uint32_t transferId = getRegU32(ctx, 4);
+        setReturnS32(
+            ctx,
+            runtime
+                ? runtime->hleSifDmaStatus(transferId)
+                : -1);
     }
 
     void sceSifExecRequest(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
@@ -830,50 +805,30 @@ namespace ps2_stubs
             };
         }
 
+        PS2Runtime::HleSifDmaSubmission submission{};
         if (ok)
         {
             for (uint32_t i = 0; i < pendingCount; ++i)
             {
                 const PendingSifDmaTransfer &pendingTransfer = pending[i];
                 const Ps2SifDmaTransfer &xfer = pendingTransfer.transfer;
-                if (runtime)
-                {
-                    PS2IopTransport::notifyTransfer(runtime, rdram, {
-                        ps2x::iop::SifTransferKind::SetDma,
-                        ps2x::iop::SifTransferPhase::BeforeCopy,
-                        xfer.src,
-                        xfer.dest,
-                        static_cast<uint32_t>(xfer.size),
-                    });
-                }
-
-                const uint32_t sizeBytes = static_cast<uint32_t>(xfer.size);
-                const bool copied =
-                    pendingTransfer.destination == SifDmaDestination::IopRam
-                        ? copyEeToIopByteRange(rdram,
-                                               iopRam,
-                                               pendingTransfer.iopOffset,
-                                               xfer.src,
-                                               sizeBytes)
-                        : copyGuestByteRange(rdram,
-                                             xfer.dest,
-                                             xfer.src,
-                                             sizeBytes);
-                if (!copied)
-                {
-                    ok = false;
-                    break;
-                }
-                if (runtime)
-                {
-                    PS2IopTransport::notifyTransfer(runtime, rdram, {
-                        ps2x::iop::SifTransferKind::SetDma,
-                        ps2x::iop::SifTransferPhase::AfterCopy,
-                        xfer.src,
-                        xfer.dest,
-                        static_cast<uint32_t>(xfer.size),
-                    });
-                }
+                PS2Runtime::HleSifDmaTransfer &scheduled =
+                    submission.transfers[
+                        submission.transferCount++];
+                scheduled.src = xfer.src;
+                scheduled.dest = xfer.dest;
+                scheduled.size =
+                    static_cast<uint32_t>(xfer.size);
+                scheduled.iopOffset =
+                    pendingTransfer.iopOffset;
+                scheduled.destination =
+                    pendingTransfer.destination ==
+                            SifDmaDestination::IopRam
+                        ? PS2Runtime::
+                              HleSifDmaDestination::IopRam
+                        : PS2Runtime::
+                              HleSifDmaDestination::
+                                  SyntheticGuest;
             }
         }
 
@@ -893,13 +848,25 @@ namespace ps2_stubs
             return;
         }
 
-        if (runtime)
+        if (!runtime)
         {
-            runtime->requestDmacCompletion(
-                DmacChannel::Sif0);
+            setReturnS32(ctx, 0);
+            return;
         }
 
-        setReturnS32(ctx, static_cast<int32_t>(allocateSifDmaTransferId()));
+        submission.transferId =
+            allocateSifDmaTransferId();
+        if (!runtime->submitHleSifDma(
+                rdram, ctx, submission))
+        {
+            setReturnS32(ctx, 0);
+            return;
+        }
+
+        setReturnS32(
+            ctx,
+            static_cast<int32_t>(
+                submission.transferId));
     }
 
     void sceSifSetIopAddr(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)

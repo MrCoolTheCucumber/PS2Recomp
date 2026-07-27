@@ -1029,6 +1029,9 @@ struct PS2DebugServer::Impl
         case PS2Runtime::DebugEeEventDeviceKind::GifDma:
             kind = "gif_dma";
             break;
+        case PS2Runtime::DebugEeEventDeviceKind::HleSifDma:
+            kind = "hle_sif_dma";
+            break;
         case PS2Runtime::DebugEeEventDeviceKind::Vif0Dma:
             kind = "vif0_dma";
             break;

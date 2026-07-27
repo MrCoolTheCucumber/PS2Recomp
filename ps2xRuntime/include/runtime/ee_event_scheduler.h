@@ -48,6 +48,9 @@ namespace ps2x::timing
         DmacCompletion,
         DmacVif1,
         DmacGif,
+        // PS2Recomp's high-level IOP substitutes one retained cross-domain
+        // operation for the physical EE/IOP SIF1 endpoints.
+        HleSif1,
         DmacVif0,
         DmacFromScratchpad,
         DmacToScratchpad,
@@ -81,6 +84,8 @@ namespace ps2x::timing
             return "dmac_vif1";
         case EeEventSource::DmacGif:
             return "dmac_gif";
+        case EeEventSource::HleSif1:
+            return "hle_sif1";
         case EeEventSource::DmacVif0:
             return "dmac_vif0";
         case EeEventSource::DmacFromScratchpad:
