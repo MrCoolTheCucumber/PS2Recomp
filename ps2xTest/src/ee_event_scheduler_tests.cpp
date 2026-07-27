@@ -2,6 +2,7 @@
 
 #include "runtime/ee_event_scheduler.h"
 
+#include <algorithm>
 #include <array>
 #include <cstdint>
 #include <limits>
@@ -295,6 +296,382 @@ void register_ee_event_scheduler_tests()
             t.IsTrue(
                 !scheduler.cancel(stale),
                 "a pre-reset token must not cancel new work");
+        });
+
+        tc.Run("fixed-seed operation streams preserve scheduler invariants", [](TestCase &t)
+        {
+            struct ModelSlot
+            {
+                EeEventToken live{};
+                EeEventToken stale{};
+                uint64_t deadline = 0u;
+                bool pending = false;
+            };
+
+            struct ModelStatistics
+            {
+                uint64_t scheduled = 0u;
+                uint64_t replaced = 0u;
+                uint64_t cancelled = 0u;
+                uint64_t serviced = 0u;
+                uint64_t late = 0u;
+            };
+
+            constexpr std::array<uint64_t, 4u> seeds{
+                0x243F6A8885A308D3ull,
+                0x13198A2E03707344ull,
+                0xA4093822299F31D0ull,
+                0x082EFA98EC4E6C89ull,
+            };
+
+            for (const uint64_t seed : seeds)
+            {
+                EeEventScheduler scheduler;
+                std::array<ModelSlot, kEeEventSourceCount> model{};
+                ModelStatistics expectedStatistics{};
+                uint64_t randomState = seed;
+                uint64_t now = 0u;
+
+                auto nextRandom = [&randomState]()
+                {
+                    randomState ^= randomState >> 12u;
+                    randomState ^= randomState << 25u;
+                    randomState ^= randomState >> 27u;
+                    return randomState *
+                           0x2545F4914F6CDD1Dull;
+                };
+
+                for (size_t step = 0u; step < 4096u; ++step)
+                {
+                    const size_t sourceIndex =
+                        static_cast<size_t>(
+                            nextRandom() %
+                            kEeEventSourceCount);
+                    const EeEventSource source =
+                        static_cast<EeEventSource>(
+                            sourceIndex);
+                    ModelSlot &slot = model[sourceIndex];
+
+                    switch (nextRandom() % 8u)
+                    {
+                    case 0u:
+                    case 1u:
+                    {
+                        const uint64_t distance =
+                            nextRandom() % 129u;
+                        const bool scheduleInPast =
+                            (nextRandom() & 3u) == 0u;
+                        const uint64_t deadline =
+                            scheduleInPast
+                                ? (distance < now
+                                       ? now - distance
+                                       : 0u)
+                                : now + distance;
+                        if (slot.live.generation != 0u)
+                        {
+                            slot.stale = slot.live;
+                        }
+                        if (slot.pending)
+                        {
+                            ++expectedStatistics.replaced;
+                        }
+                        slot.live =
+                            scheduler.scheduleAbsolute(
+                                source,
+                                eeTickFromRaw(deadline));
+                        slot.deadline = deadline;
+                        slot.pending = true;
+                        ++expectedStatistics.scheduled;
+                        break;
+                    }
+                    case 2u:
+                    {
+                        const uint64_t delay =
+                            nextRandom() % 129u;
+                        if (slot.live.generation != 0u)
+                        {
+                            slot.stale = slot.live;
+                        }
+                        if (slot.pending)
+                        {
+                            ++expectedStatistics.replaced;
+                        }
+                        slot.live = scheduler.scheduleAfter(
+                            source,
+                            eeTickFromRaw(now),
+                            eeTickDeltaFromRaw(delay));
+                        slot.deadline = now + delay;
+                        slot.pending = true;
+                        ++expectedStatistics.scheduled;
+                        break;
+                    }
+                    case 3u:
+                    {
+                        const bool expected = slot.pending;
+                        const bool cancelled =
+                            scheduler.cancel(source);
+                        t.IsTrue(
+                            cancelled == expected,
+                            "source cancellation should match the fixed-slot model");
+                        if (expected)
+                        {
+                            slot.pending = false;
+                            ++expectedStatistics.cancelled;
+                        }
+                        break;
+                    }
+                    case 4u:
+                    {
+                        const EeEventToken token =
+                            (nextRandom() & 1u) != 0u
+                                ? slot.live
+                                : slot.stale;
+                        const bool expected =
+                            slot.pending &&
+                            token == slot.live;
+                        const bool cancelled =
+                            scheduler.cancel(token);
+                        t.IsTrue(
+                            cancelled == expected,
+                            "token cancellation should reject stale generations");
+                        if (expected)
+                        {
+                            slot.pending = false;
+                            ++expectedStatistics.cancelled;
+                        }
+                        break;
+                    }
+                    case 5u:
+                    case 6u:
+                    {
+                        now += nextRandom() % 33u;
+
+                        struct ExpectedService
+                        {
+                            EeEventSource source{};
+                            EeEventToken token{};
+                            uint64_t deadline = 0u;
+                        };
+                        std::array<
+                            ExpectedService,
+                            kEeEventSourceCount>
+                            expected{};
+                        std::array<ModelSlot, kEeEventSourceCount>
+                            remaining = model;
+                        size_t expectedCount = 0u;
+
+                        while (true)
+                        {
+                            size_t best =
+                                kEeEventSourceCount;
+                            for (size_t index = 0u;
+                                 index <
+                                 remaining.size();
+                                 ++index)
+                            {
+                                if (!remaining[index].pending ||
+                                    remaining[index].deadline >
+                                        now)
+                                {
+                                    continue;
+                                }
+                                if (best ==
+                                        kEeEventSourceCount ||
+                                    remaining[index].deadline <
+                                        remaining[best].deadline ||
+                                    (remaining[index].deadline ==
+                                         remaining[best].deadline &&
+                                     index < best))
+                                {
+                                    best = index;
+                                }
+                            }
+
+                            if (best ==
+                                kEeEventSourceCount)
+                            {
+                                break;
+                            }
+                            expected[expectedCount++] = {
+                                .source =
+                                    static_cast<
+                                        EeEventSource>(best),
+                                .token =
+                                    remaining[best].live,
+                                .deadline =
+                                    remaining[best].deadline,
+                            };
+                            remaining[best].pending = false;
+                        }
+
+                        size_t observed = 0u;
+                        const EeEventServiceResult result =
+                            scheduler.serviceDue(
+                                eeTickFromRaw(now),
+                                [&](const EeEventService &service)
+                                {
+                                    t.IsTrue(
+                                        observed <
+                                            expectedCount,
+                                        "service should not produce an unmodelled event");
+                                    if (observed >=
+                                        expectedCount)
+                                    {
+                                        return;
+                                    }
+
+                                    const ExpectedService &
+                                        next =
+                                            expected[observed++];
+                                    t.IsTrue(
+                                        service.source ==
+                                            next.source,
+                                        "service order should use deadline then fixed source priority");
+                                    t.Equals(
+                                        service.generation,
+                                        next.token.generation,
+                                        "service should retain the live generation");
+                                    t.Equals(
+                                        service.scheduledTick.raw(),
+                                        next.deadline,
+                                        "service should retain its scheduled tick");
+                                    t.Equals(
+                                        service.serviceTick.raw(),
+                                        now,
+                                        "service should retain the model service tick");
+                                    t.Equals(
+                                        service.latenessTicks.raw(),
+                                        now - next.deadline,
+                                        "service should report deterministic lateness");
+                                    model[
+                                        eeEventSourceIndex(
+                                            next.source)]
+                                        .pending = false;
+                                    ++expectedStatistics.serviced;
+                                    if (next.deadline != now)
+                                    {
+                                        ++expectedStatistics.late;
+                                    }
+                                });
+                        t.Equals(
+                            result.serviced,
+                            expectedCount,
+                            "service count should match the fixed-slot model");
+                        t.Equals(
+                            observed,
+                            expectedCount,
+                            "every modelled due event should be observed");
+                        t.IsTrue(
+                            !result.limitExceeded &&
+                                !result
+                                     .reentrantServiceRejected,
+                            "a bounded model batch should not hit scheduler guards");
+                        break;
+                    }
+                    case 7u:
+                        for (ModelSlot &entry : model)
+                        {
+                            if (entry.live.generation != 0u)
+                            {
+                                entry.stale = entry.live;
+                            }
+                            entry.pending = false;
+                        }
+                        scheduler.reset();
+                        expectedStatistics = {};
+                        break;
+                    }
+
+                    bool expectedPending = false;
+                    uint64_t expectedNext =
+                        std::numeric_limits<
+                            uint64_t>::max();
+                    for (size_t index = 0u;
+                         index < model.size(); ++index)
+                    {
+                        const EeEventSource modelSource =
+                            static_cast<EeEventSource>(index);
+                        const auto event =
+                            scheduler.event(modelSource);
+                        t.IsTrue(
+                            scheduler.pending(modelSource) ==
+                                model[index].pending,
+                            "pending state should match the fixed-slot model");
+                        t.IsTrue(
+                            event.has_value() ==
+                                model[index].pending,
+                            "event visibility should match pending state");
+                        if (!model[index].pending)
+                        {
+                            continue;
+                        }
+
+                        t.IsTrue(
+                            event.has_value() &&
+                                event->token ==
+                                    model[index].live &&
+                                event->deadline.raw() ==
+                                    model[index].deadline,
+                            "event token and deadline should match the fixed-slot model");
+                        expectedPending = true;
+                        expectedNext =
+                            std::min(
+                                expectedNext,
+                                model[index].deadline);
+                    }
+
+                    t.IsTrue(
+                        scheduler.hasPendingEvents() ==
+                            expectedPending,
+                        "global pending state should match the fixed-slot model");
+                    const auto next =
+                        scheduler.nextDeadline();
+                    t.IsTrue(
+                        next.has_value() ==
+                            expectedPending,
+                        "cached minimum visibility should match pending state");
+                    if (expectedPending)
+                    {
+                        t.IsTrue(
+                            next.has_value() &&
+                                next->raw() ==
+                                    expectedNext,
+                            "cached minimum should match the fixed-slot model");
+                    }
+
+                    const EeEventSchedulerStatistics &
+                        statistics =
+                            scheduler.statistics();
+                    t.Equals(
+                        statistics.scheduled,
+                        expectedStatistics.scheduled,
+                        "scheduled count should match the model");
+                    t.Equals(
+                        statistics.replaced,
+                        expectedStatistics.replaced,
+                        "replacement count should match the model");
+                    t.Equals(
+                        statistics.cancelled,
+                        expectedStatistics.cancelled,
+                        "cancellation count should match the model");
+                    t.Equals(
+                        statistics.serviced,
+                        expectedStatistics.serviced,
+                        "service count should match the model");
+                    t.Equals(
+                        statistics.late,
+                        expectedStatistics.late,
+                        "late count should match the model");
+                    t.Equals(
+                        statistics.sameTickReschedules,
+                        0ull,
+                        "external operations should not count as same-tick callback reschedules");
+                    t.Equals(
+                        statistics.serviceLimitHits,
+                        0ull,
+                        "bounded model batches should not hit the service limit");
+                }
+            }
         });
     });
 }
