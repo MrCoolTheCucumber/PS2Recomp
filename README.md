@@ -136,6 +136,9 @@ To execute the recompiled code.
 * `ps2xIOP` profile selection and optional `.dll`/`.so` discovery for game-specific IOP HLE.
 
 See [IOP HLE profiles and plugins](ps2xIOP/README.md) for the service boundary and external plugin workflow.
+See [EE event scheduling](docs/ee-event-scheduling.md) for the canonical
+runtime timeline, timed-device contract, debugger surface, and performance
+gate.
 
 ### Game Override Hooks
 
