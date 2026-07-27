@@ -1111,6 +1111,427 @@ ps2x::timing::EeTick PS2Runtime::currentEeTick() const noexcept
     return m_eeTimeline.now();
 }
 
+void PS2Runtime::scheduleEeVSyncEvent(
+    ps2x::timing::EeTick deadline) noexcept
+{
+    if (m_eeSchedulingMode !=
+            ps2x::timing::EeSchedulingMode::Event ||
+        !m_eeVSyncTiming.enabled)
+    {
+        m_eeVSyncTiming.eventToken = {
+            ps2x::timing::EeEventSource::VSync, 0u};
+        return;
+    }
+
+    m_eeVSyncTiming.eventToken =
+        m_eeEventScheduler.scheduleAbsolute(
+            ps2x::timing::EeEventSource::VSync,
+            deadline);
+}
+
+PS2Runtime::EeVSyncDurations
+PS2Runtime::eeVSyncDurationsForVideoMode(
+    uint32_t videoMode,
+    bool interlaced) noexcept
+{
+    // These values reproduce PCSX2 vSyncInfoCalc() at revision f22c4b47d
+    // using the default 294.912 MHz EE clock and default refresh rates.
+    // SetGsCrt treats both BIOS (0/1) and libgs (2/3) encodings as
+    // NTSC/PAL. DVD modes use the corresponding standard.
+    switch (videoMode & 0xFFu)
+    {
+    case 0x01u:
+    case 0x03u:
+    case 0x73u:
+    case 0x83u:
+        if (interlaced)
+        {
+            return {
+                .periodCycles = 5'898'240u,
+                .renderCycles = 5'435'818u,
+                .blankCycles = 462'422u,
+                .gsBlankCycles = 56'623u,
+            };
+        }
+        return {
+            .periodCycles = 5'926'688u,
+            .renderCycles = 5'435'944u,
+            .blankCycles = 490'744u,
+            .gsBlankCycles = 84'936u,
+        };
+    case 0x51u:
+    case 0x54u:
+        if (interlaced)
+        {
+            return {
+                .periodCycles = 4'915'200u,
+                .renderCycles = 4'718'592u,
+                .blankCycles = 196'608u,
+                .gsBlankCycles = 30'583u,
+            };
+        }
+        return {
+            .periodCycles = 4'915'200u,
+            .renderCycles = 4'714'223u,
+            .blankCycles = 200'977u,
+            .gsBlankCycles = 34'952u,
+        };
+    case 0x50u:
+        // PCSX2 treats SDTV 480p as a distinct 59.94 Hz mode with the
+        // ordinary 525-line geometry. It therefore must not share the
+        // otherwise similar 60 Hz VESA/720p timing below.
+        if (interlaced)
+        {
+            return {
+                .periodCycles = 4'920'120u,
+                .renderCycles = 4'498'396u,
+                .blankCycles = 421'724u,
+                .gsBlankCycles = 65'601u,
+            };
+        }
+        return {
+            .periodCycles = 4'920'120u,
+            .renderCycles = 4'489'024u,
+            .blankCycles = 431'096u,
+            .gsBlankCycles = 74'973u,
+        };
+    case 0x1Au:
+    case 0x1Bu:
+    case 0x1Cu:
+    case 0x1Du:
+    case 0x2Au:
+    case 0x2Bu:
+    case 0x2Cu:
+    case 0x2Du:
+    case 0x2Eu:
+    case 0x3Bu:
+    case 0x3Cu:
+    case 0x3Du:
+    case 0x3Eu:
+    case 0x4Au:
+    case 0x4Bu:
+    case 0x52u:
+    case 0x53u:
+        if (interlaced)
+        {
+            return {
+                .periodCycles = 4'915'200u,
+                .renderCycles = 4'493'898u,
+                .blankCycles = 421'302u,
+                .gsBlankCycles = 65'535u,
+            };
+        }
+        return {
+            .periodCycles = 4'915'200u,
+            .renderCycles = 4'484'535u,
+            .blankCycles = 430'665u,
+            .gsBlankCycles = 74'898u,
+        };
+    case 0x00u:
+    case 0x02u:
+    case 0x72u:
+    case 0x82u:
+    default:
+        if (interlaced)
+        {
+            return {
+                .periodCycles = 4'920'120u,
+                .renderCycles = 4'498'396u,
+                .blankCycles = 421'724u,
+                .gsBlankCycles = 65'601u,
+            };
+        }
+        return {
+            .periodCycles = 4'929'165u,
+            .renderCycles = 4'498'098u,
+            .blankCycles = 431'067u,
+            .gsBlankCycles = 74'968u,
+        };
+    }
+}
+
+PS2Runtime::EeVSyncVideoModeClass
+PS2Runtime::eeVSyncVideoModeClassForMode(
+    uint32_t videoMode) noexcept
+{
+    switch (videoMode & 0xFFu)
+    {
+    case 0x00u:
+    case 0x02u:
+        return EeVSyncVideoModeClass::Ntsc;
+    case 0x01u:
+    case 0x03u:
+        return EeVSyncVideoModeClass::Pal;
+    case 0x1Au:
+    case 0x1Bu:
+    case 0x1Cu:
+    case 0x1Du:
+    case 0x2Au:
+    case 0x2Bu:
+    case 0x2Cu:
+    case 0x2Du:
+    case 0x2Eu:
+    case 0x3Bu:
+    case 0x3Cu:
+    case 0x3Du:
+    case 0x3Eu:
+    case 0x4Au:
+    case 0x4Bu:
+        return EeVSyncVideoModeClass::Vesa;
+    case 0x50u:
+        return EeVSyncVideoModeClass::Sdtv480P;
+    case 0x53u:
+        return EeVSyncVideoModeClass::Sdtv576P;
+    case 0x52u:
+        return EeVSyncVideoModeClass::Hdtv720P;
+    case 0x51u:
+        return EeVSyncVideoModeClass::Hdtv1080I;
+    case 0x54u:
+        return EeVSyncVideoModeClass::Hdtv1080P;
+    case 0x72u:
+    case 0x82u:
+        return EeVSyncVideoModeClass::DvdNtsc;
+    case 0x73u:
+    case 0x83u:
+        return EeVSyncVideoModeClass::DvdPal;
+    default:
+        return EeVSyncVideoModeClass::Unknown;
+    }
+}
+
+void PS2Runtime::configureEeVSyncVideoMode(
+    uint32_t videoMode,
+    bool interlaced)
+{
+    std::lock_guard<std::recursive_timed_mutex> lock(
+        m_guestExecutionMutex);
+    const EeVSyncVideoModeClass videoModeClass =
+        eeVSyncVideoModeClassForMode(videoMode);
+    const bool modeClassChanged =
+        m_eeVSyncTiming.videoModeClass !=
+        videoModeClass;
+    m_eeVSyncTiming.durations =
+        eeVSyncDurationsForVideoMode(
+            videoMode, interlaced);
+    m_eeVSyncTiming.videoMode = videoMode & 0xFFu;
+    m_eeVSyncTiming.videoModeClass = videoModeClass;
+    m_eeVSyncTiming.videoModeConfigured = true;
+    m_eeVSyncTiming.interlaced = interlaced;
+
+    if (modeClassChanged)
+    {
+        // PCSX2 initializes CSR.FIELD high when SetGsCrt changes its
+        // normalized GS video-mode class. BIOS/libgs aliases for the same
+        // class do not constitute a change. The later GS-blank phase swaps
+        // it for interlaced modes.
+        constexpr uint64_t kGsCsrFieldMask = 0x2000ull;
+        m_memory.gs().csr.fetch_or(
+            kGsCsrFieldMask,
+            std::memory_order_relaxed);
+    }
+
+    // PCSX2's UpdateVSyncRate() adjusts the phase origin by the difference
+    // between old and new durations. That leaves the already-pending phase
+    // endpoint unchanged; the new timing takes effect when this phase
+    // services and schedules its successor.
+}
+
+void PS2Runtime::resetEeVSyncStateUnlocked() noexcept
+{
+    const bool enabled = m_eeVSyncTiming.enabled;
+    const EeVSyncDurations durations =
+        m_eeVSyncTiming.durations;
+    const uint32_t videoMode =
+        m_eeVSyncTiming.videoMode;
+    const EeVSyncVideoModeClass videoModeClass =
+        m_eeVSyncTiming.videoModeClass;
+    const bool videoModeConfigured =
+        m_eeVSyncTiming.videoModeConfigured;
+    const bool interlaced =
+        m_eeVSyncTiming.interlaced;
+    m_eeVSyncTiming = {};
+    m_eeVSyncTiming.enabled = enabled;
+    m_eeVSyncTiming.durations = durations;
+    m_eeVSyncTiming.videoMode = videoMode;
+    m_eeVSyncTiming.videoModeClass = videoModeClass;
+    m_eeVSyncTiming.videoModeConfigured =
+        videoModeConfigured;
+    m_eeVSyncTiming.interlaced = interlaced;
+    m_pendingVSyncDeliveryCount = 0u;
+
+    if (enabled &&
+        m_eeSchedulingMode ==
+            ps2x::timing::EeSchedulingMode::Event)
+    {
+        scheduleEeVSyncEvent(
+            ps2x::timing::saturatingAdd(
+                currentEeTick(),
+                ps2x::timing::eeCyclesToTicks(
+                    m_eeVSyncTiming
+                        .durations.renderCycles)));
+    }
+}
+
+void PS2Runtime::publishEeVSyncField() noexcept
+{
+    constexpr uint64_t kGsCsrFieldMask = 0x2000ull;
+    std::atomic<uint64_t> &csr = m_memory.gs().csr;
+    if (m_eeVSyncTiming.interlaced)
+    {
+        csr.fetch_xor(
+            kGsCsrFieldMask,
+            std::memory_order_relaxed);
+    }
+    else
+    {
+        csr.fetch_or(
+            kGsCsrFieldMask,
+            std::memory_order_relaxed);
+    }
+}
+
+bool PS2Runtime::queuePendingVSyncDelivery(
+    PendingVSyncDelivery delivery) noexcept
+{
+    if (m_pendingVSyncDeliveryCount >=
+        m_pendingVSyncDeliveries.size())
+    {
+        return false;
+    }
+
+    m_pendingVSyncDeliveries[
+        m_pendingVSyncDeliveryCount++] = delivery;
+    return true;
+}
+
+void PS2Runtime::ensureEeVSyncScheduled()
+{
+    std::lock_guard<std::recursive_timed_mutex> lock(
+        m_guestExecutionMutex);
+    if (m_eeSchedulingMode !=
+        ps2x::timing::EeSchedulingMode::Event)
+    {
+        return;
+    }
+
+    m_eeVSyncTiming.enabled = true;
+    if (m_eeEventScheduler.pending(
+            ps2x::timing::EeEventSource::VSync))
+    {
+        return;
+    }
+
+    m_eeVSyncTiming.phase = EeVSyncPhase::Start;
+    m_eeVSyncTiming.startTick = {};
+    scheduleEeVSyncEvent(
+        ps2x::timing::saturatingAdd(
+            currentEeTick(),
+            ps2x::timing::eeCyclesToTicks(
+                m_eeVSyncTiming
+                    .durations.renderCycles)));
+}
+
+uint64_t PS2Runtime::waitForNextScheduledVSync(
+    uint8_t *rdram,
+    R5900Context *ctx,
+    uint64_t observedVSyncTick)
+{
+    if (m_eeSchedulingMode !=
+        ps2x::timing::EeSchedulingMode::Event)
+    {
+        return ps2_syscalls::GetCurrentVSyncTick();
+    }
+
+    // Only one blocked VSync waiter may arbitrate idle-time advancement.
+    // Other VSync waiters remain outside the guest mutex and will observe the
+    // same published tick. This also makes m_guestExecutionWaiters below mean
+    // that an ordinary runnable guest is queued and must receive the token
+    // before emulated time can be skipped to the next device deadline.
+    GuestExecutionReleaseScope releaseGuestExecution(this);
+    std::unique_lock<std::mutex> idleAdvanceLock(
+        m_eeIdleAdvanceMutex);
+    R5900Context *const serviceContext =
+        ctx ? ctx : &m_cpuContext;
+
+    while (!isStopRequested())
+    {
+        const uint64_t currentVSyncTick =
+            ps2_syscalls::GetCurrentVSyncTick();
+        if (currentVSyncTick > observedVSyncTick)
+        {
+            return currentVSyncTick;
+        }
+
+        bool runnableGuestQueued = false;
+        uint64_t handoffBaseline = 0u;
+        {
+            GuestExecutionScope guestExecution(
+                this, serviceContext);
+
+            if (ps2_syscalls::GetCurrentVSyncTick() >
+                observedVSyncTick)
+            {
+                continue;
+            }
+
+            if (m_guestExecutionWaiters.load(
+                    std::memory_order_acquire) != 0u)
+            {
+                runnableGuestQueued = true;
+                handoffBaseline =
+                    guestExecutionHandoffEpochSnapshot();
+            }
+            else
+            {
+                if (!m_eeEventScheduler.pending(
+                        ps2x::timing::EeEventSource::
+                            VSync))
+                {
+                    m_eeVSyncTiming.enabled = true;
+                    m_eeVSyncTiming.phase =
+                        EeVSyncPhase::Start;
+                    m_eeVSyncTiming.startTick = {};
+                    scheduleEeVSyncEvent(
+                        ps2x::timing::saturatingAdd(
+                            currentEeTick(),
+                            ps2x::timing::eeCyclesToTicks(
+                                m_eeVSyncTiming
+                                    .durations.renderCycles)));
+                }
+
+                const std::optional<ps2x::timing::EeTick>
+                    nextDeadline =
+                        m_eeEventScheduler.nextDeadline();
+                if (!nextDeadline.has_value())
+                {
+                    requestStop();
+                    continue;
+                }
+
+                const ps2x::timing::EeTick now =
+                    currentEeTick();
+                if (*nextDeadline > now)
+                {
+                    (void)publishEeElapsed(
+                        ps2x::timing::elapsedEeTicks(
+                            now, *nextDeadline));
+                }
+                serviceEeEventsAtTick(
+                    rdram, serviceContext,
+                    currentEeTick());
+            }
+        }
+
+        if (runnableGuestQueued)
+        {
+            waitForGuestExecutionHandoff(
+                handoffBaseline);
+        }
+    }
+
+    return ps2_syscalls::GetCurrentVSyncTick();
+}
+
 ps2x::timing::EeTick PS2Runtime::publishEeElapsed(
     ps2x::timing::EeTickDelta elapsed) noexcept
 {
@@ -1161,6 +1582,7 @@ void PS2Runtime::resetEeTimingUnlocked(
     }
     m_eeTimeline.reset();
     m_eeEventScheduler.reset();
+    resetEeVSyncStateUnlocked();
     cancelVU1Execution(true);
     m_vu0CycleTick = {};
     m_vu0NextEventCycleTick = {};
@@ -1235,6 +1657,7 @@ void PS2Runtime::setEeSchedulingMode(
     }
     m_eeSchedulingMode = mode;
     m_eeEventScheduler.reset();
+    resetEeVSyncStateUnlocked();
     cancelVU1Execution(true);
     m_eeSchedulerShadowMismatch = false;
     m_eeSchedulerShadowMismatchTick = {};
@@ -3005,6 +3428,92 @@ void PS2Runtime::advanceVU0LegacyAtBlockBoundary(
     }
 }
 
+void PS2Runtime::serviceEeVSyncAtEvent(
+    uint8_t *rdram,
+    const ps2x::timing::EeEventService &service)
+{
+    if (!m_eeVSyncTiming.enabled ||
+        m_eeVSyncTiming.eventToken.generation == 0u ||
+        service.generation !=
+            m_eeVSyncTiming.eventToken.generation)
+    {
+        return;
+    }
+
+    m_eeVSyncTiming.eventToken = {
+        ps2x::timing::EeEventSource::VSync, 0u};
+
+    switch (m_eeVSyncTiming.phase)
+    {
+    case EeVSyncPhase::Start:
+    {
+        m_eeVSyncTiming.startTick =
+            service.scheduledTick;
+        m_eeVSyncTiming.currentVSyncTick =
+            ps2_syscalls::PublishVSyncStart(
+                rdram, this);
+        if (!queuePendingVSyncDelivery(
+                PendingVSyncDelivery{
+                    .kind = PendingVSyncKind::Start,
+                    .tick =
+                        m_eeVSyncTiming.currentVSyncTick,
+                    .eventSequence = service.sequence,
+                }))
+        {
+            std::cerr
+                << "EE VSync delivery queue exceeded its fixed bound"
+                << std::endl;
+            requestStop();
+            return;
+        }
+        m_eeVSyncTiming.phase =
+            EeVSyncPhase::GsBlank;
+        scheduleEeVSyncEvent(
+            ps2x::timing::saturatingAdd(
+                m_eeVSyncTiming.startTick,
+                ps2x::timing::eeCyclesToTicks(
+                    m_eeVSyncTiming
+                        .durations.gsBlankCycles)));
+        requestGuestPreemption();
+        return;
+    }
+    case EeVSyncPhase::GsBlank:
+        publishEeVSyncField();
+        m_eeVSyncTiming.phase = EeVSyncPhase::End;
+        scheduleEeVSyncEvent(
+            ps2x::timing::saturatingAdd(
+                m_eeVSyncTiming.startTick,
+                ps2x::timing::eeCyclesToTicks(
+                    m_eeVSyncTiming
+                        .durations.blankCycles)));
+        return;
+    case EeVSyncPhase::End:
+        if (!queuePendingVSyncDelivery(
+                PendingVSyncDelivery{
+                    .kind = PendingVSyncKind::End,
+                    .tick =
+                        m_eeVSyncTiming.currentVSyncTick,
+                    .eventSequence = service.sequence,
+                }))
+        {
+            std::cerr
+                << "EE VSync delivery queue exceeded its fixed bound"
+                << std::endl;
+            requestStop();
+            return;
+        }
+        m_eeVSyncTiming.phase = EeVSyncPhase::Start;
+        scheduleEeVSyncEvent(
+            ps2x::timing::saturatingAdd(
+                m_eeVSyncTiming.startTick,
+                ps2x::timing::eeCyclesToTicks(
+                    m_eeVSyncTiming
+                        .durations.periodCycles)));
+        requestGuestPreemption();
+        return;
+    }
+}
+
 void PS2Runtime::dispatchEeEvent(
     uint8_t *rdram,
     R5900Context *ctx,
@@ -3012,6 +3521,9 @@ void PS2Runtime::dispatchEeEvent(
 {
     switch (service.source)
     {
+    case ps2x::timing::EeEventSource::VSync:
+        serviceEeVSyncAtEvent(rdram, service);
+        return;
     case ps2x::timing::EeEventSource::
         DmacCompletion:
         (void)publishReadyDmacCompletions(
@@ -3161,6 +3673,16 @@ PS2Runtime::debugEeEventDeviceState(
     DebugEeEventDeviceState result{};
     switch (source)
     {
+    case ps2x::timing::EeEventSource::VSync:
+        result.kind = DebugEeEventDeviceKind::VSync;
+        result.operationGeneration =
+            m_eeVSyncTiming.currentVSyncTick;
+        result.lastAdvancedTick =
+            m_eeVSyncTiming.startTick.raw();
+        result.phase = static_cast<uint32_t>(
+            m_eeVSyncTiming.phase);
+        result.active = m_eeVSyncTiming.enabled;
+        return result;
     case ps2x::timing::EeEventSource::DmacVif1:
     {
         const Vif1DmaSnapshot state =
@@ -3421,6 +3943,44 @@ void PS2Runtime::handleSyscall(uint8_t *rdram, R5900Context *ctx, uint32_t encod
 void PS2Runtime::handleBreak(uint8_t *rdram, R5900Context *ctx)
 {
     raiseCop0Exception(ctx, EXCEPTION_BREAKPOINT);
+}
+
+void PS2Runtime::drainPendingVSyncHandlers(uint8_t *rdram)
+{
+    if (m_pendingVSyncDeliveryCount == 0u)
+    {
+        return;
+    }
+
+    std::array<
+        PendingVSyncDelivery,
+        kMaximumPendingVSyncDeliveries>
+        pending{};
+    const size_t pendingCount =
+        m_pendingVSyncDeliveryCount;
+    std::copy_n(
+        m_pendingVSyncDeliveries.begin(),
+        pendingCount,
+        pending.begin());
+    m_pendingVSyncDeliveryCount = 0u;
+    for (size_t index = 0u;
+         index < pendingCount;
+         ++index)
+    {
+        const PendingVSyncDelivery &delivery =
+            pending[index];
+        switch (delivery.kind)
+        {
+        case PendingVSyncKind::Start:
+            ps2_syscalls::DispatchVSyncStartHandlers(
+                rdram, this, delivery.tick);
+            break;
+        case PendingVSyncKind::End:
+            ps2_syscalls::DispatchVSyncEndHandlers(
+                rdram, this);
+            break;
+        }
+    }
 }
 
 void PS2Runtime::drainCompletedDmacHandlers(uint8_t *rdram)
@@ -4198,6 +4758,8 @@ void PS2Runtime::leaveGuestExecution(
     // its post-submit state before its DMAC handler observes it.
     if (it->second == 1u)
     {
+        drainPendingVSyncHandlers(
+            m_memory.getRDRAM());
         drainCompletedDmacHandlers(m_memory.getRDRAM());
         m_guestExecutionPreemptionRequested.store(
             false, std::memory_order_release);
@@ -5734,6 +6296,11 @@ void PS2Runtime::run()
     g_activeThreads.store(1, std::memory_order_relaxed);
     std::atomic<bool> gameThreadFinished{false};
 
+    // Arm emulated VSync before the first guest instruction so event mode has
+    // a deterministic phase independent of host thread startup.
+    ps2_syscalls::EnsureVSyncWorkerRunning(
+        m_memory.getRDRAM(), this);
+
     std::thread gameThread([&]()
                            {
         ThreadNaming::SetCurrentThreadName("GameThread");
@@ -5754,8 +6321,6 @@ void PS2Runtime::run()
         }
         g_activeThreads.fetch_sub(1, std::memory_order_relaxed);
         gameThreadFinished.store(true, std::memory_order_release); });
-
-    ps2_syscalls::EnsureVSyncWorkerRunning(m_memory.getRDRAM(), this);
 
     uint64_t tick = 0;
     while (!isStopRequested() && g_activeThreads.load(std::memory_order_relaxed) > 0)

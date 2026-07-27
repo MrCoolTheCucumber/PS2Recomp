@@ -38,11 +38,14 @@ namespace ps2x::timing
     // priority decision.
     enum class EeEventSource : uint8_t
     {
+        // PCSX2 updates EE counters (including VSync) before dispatching
+        // timed DMA callbacks in _cpuEventTest_Shared().
+        VSync = 0u,
         // Compatibility-complete work is published before timed device
         // callbacks. A timed callback that itself completes work can
         // reschedule this source at the same tick for the scheduler's next
         // priority pass.
-        DmacCompletion = 0u,
+        DmacCompletion,
         DmacVif1,
         DmacFromScratchpad,
         DmacToScratchpad,
@@ -65,6 +68,8 @@ namespace ps2x::timing
     {
         switch (source)
         {
+        case EeEventSource::VSync:
+            return "vsync";
         case EeEventSource::DmacCompletion:
             return "dmac_completion";
         case EeEventSource::Vu0PeriodicCompatibility:

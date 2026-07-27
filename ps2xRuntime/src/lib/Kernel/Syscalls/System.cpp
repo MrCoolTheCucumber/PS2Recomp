@@ -23,6 +23,10 @@ namespace ps2_syscalls
             {
                 gs.pmode |= 0x1ull;
             }
+
+            runtime->configureEeVSyncVideoMode(
+                static_cast<uint32_t>(videoMode),
+                interlaced != 0);
         }
 
         RUNTIME_LOG("PS2 GsSetCrt: interlaced=" << interlaced

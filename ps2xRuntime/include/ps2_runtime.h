@@ -502,6 +502,7 @@ public:
     enum class DebugEeEventDeviceKind : uint8_t
     {
         None = 0u,
+        VSync,
         Vif1Dma,
         Vu1,
         ScratchpadDma,
@@ -776,6 +777,14 @@ public:
                                      R5900Context *ctx);
     void serviceEeEventsAtBlockBoundary(uint8_t *rdram,
                                         R5900Context *ctx);
+    void configureEeVSyncVideoMode(
+        uint32_t videoMode,
+        bool interlaced);
+    void ensureEeVSyncScheduled();
+    uint64_t waitForNextScheduledVSync(
+        uint8_t *rdram,
+        R5900Context *ctx,
+        uint64_t observedVSyncTick);
 
 public:
     void handleSyscall(uint8_t *rdram, R5900Context *ctx);
@@ -925,6 +934,10 @@ public:
     inline const PSPadBackend &padBackend() const { return m_padBackend; }
 
 private:
+    struct EeVSyncDurations;
+    enum class EeVSyncVideoModeClass : uint8_t;
+    struct PendingVSyncDelivery;
+
     struct GuestHeapBlock
     {
         uint32_t addr = 0;
@@ -1029,6 +1042,23 @@ private:
     void serviceScratchpadDmaAtEvent(
         DmacChannel channel,
         const ps2x::timing::EeEventService &service);
+    void serviceEeVSyncAtEvent(
+        uint8_t *rdram,
+        const ps2x::timing::EeEventService &service);
+    void scheduleEeVSyncEvent(
+        ps2x::timing::EeTick deadline) noexcept;
+    [[nodiscard]] static EeVSyncDurations
+    eeVSyncDurationsForVideoMode(
+        uint32_t videoMode,
+        bool interlaced) noexcept;
+    [[nodiscard]] static EeVSyncVideoModeClass
+    eeVSyncVideoModeClassForMode(
+        uint32_t videoMode) noexcept;
+    void publishEeVSyncField() noexcept;
+    void resetEeVSyncStateUnlocked() noexcept;
+    [[nodiscard]] bool queuePendingVSyncDelivery(
+        PendingVSyncDelivery delivery) noexcept;
+    void drainPendingVSyncHandlers(uint8_t *rdram);
     [[nodiscard]] static ps2x::timing::EeEventSource
     scratchpadDmaEventSource(
         DmacChannel channel) noexcept;
@@ -1095,6 +1125,73 @@ private:
             ps2x::timing::EeEventSource::
                 DmacToScratchpad,
             0u};
+    enum class EeVSyncPhase : uint8_t
+    {
+        Start = 0u,
+        GsBlank,
+        End,
+    };
+    enum class EeVSyncVideoModeClass : uint8_t
+    {
+        Uninitialized = 0u,
+        Unknown,
+        Ntsc,
+        Pal,
+        Vesa,
+        Sdtv480P,
+        Sdtv576P,
+        Hdtv720P,
+        Hdtv1080I,
+        Hdtv1080P,
+        DvdNtsc,
+        DvdPal,
+    };
+    struct EeVSyncDurations
+    {
+        // Before SetGsCrt, PCSX2 uses a temporary 60 Hz interlaced NTSC
+        // counter shape. A later mode change preserves the current phase
+        // deadline and changes only the durations used by following phases.
+        uint64_t periodCycles = 4'915'200u;
+        uint64_t renderCycles = 4'493'898u;
+        uint64_t blankCycles = 421'302u;
+        uint64_t gsBlankCycles = 65'535u;
+    };
+    struct EeVSyncTiming
+    {
+        EeVSyncPhase phase = EeVSyncPhase::Start;
+        ps2x::timing::EeTick startTick{};
+        ps2x::timing::EeEventToken eventToken{
+            ps2x::timing::EeEventSource::VSync, 0u};
+        EeVSyncDurations durations{};
+        uint64_t currentVSyncTick = 0u;
+        uint32_t videoMode = 0u;
+        EeVSyncVideoModeClass videoModeClass =
+            EeVSyncVideoModeClass::Uninitialized;
+        bool videoModeConfigured = false;
+        bool interlaced = true;
+        bool enabled = false;
+    };
+    enum class PendingVSyncKind : uint8_t
+    {
+        Start = 0u,
+        End,
+    };
+    struct PendingVSyncDelivery
+    {
+        PendingVSyncKind kind = PendingVSyncKind::Start;
+        uint64_t tick = 0u;
+        uint64_t eventSequence = 0u;
+    };
+    static constexpr size_t
+        kMaximumPendingVSyncDeliveries =
+            ps2x::timing::EeEventScheduler::
+                kMaximumServicesPerBoundary;
+    EeVSyncTiming m_eeVSyncTiming{};
+    std::array<
+        PendingVSyncDelivery,
+        kMaximumPendingVSyncDeliveries>
+        m_pendingVSyncDeliveries{};
+    size_t m_pendingVSyncDeliveryCount = 0u;
     ps2x::timing::EeTick m_vu0CycleTick{};
     ps2x::timing::EeTick m_vu0NextEventCycleTick{};
     bool m_eeSchedulerShadowMismatch = false;
@@ -1112,6 +1209,7 @@ private:
     mutable std::atomic<uint32_t> m_guestExecutionWaiters{0u};
     mutable std::mutex m_guestExecutionHandoffMutex;
     mutable std::condition_variable m_guestExecutionHandoffCv;
+    mutable std::mutex m_eeIdleAdvanceMutex;
     std::atomic<uint64_t> m_guestExecutionHandoffEpoch{0u};
     std::atomic<uint64_t> m_guestExecutionHandoffTimeouts{0u};
     std::atomic<uint64_t> m_guestExecutionPreemptionEpoch{0u};

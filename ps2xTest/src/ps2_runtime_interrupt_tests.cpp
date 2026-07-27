@@ -2,6 +2,7 @@
 #include "ps2_runtime.h"
 #include "ps2_syscalls.h"
 #include "Stubs/DMA.h"
+#include "Stubs/GS.h"
 #include "runtime/ps2_gs_gpu.h"
 
 #include <atomic>
@@ -48,6 +49,8 @@ namespace
 
     std::atomic<uint32_t> g_vblankStartHits{0u};
     std::atomic<uint32_t> g_vblankEndHits{0u};
+    std::atomic<uint32_t> g_vsyncCallbackHits{0u};
+    std::atomic<uint32_t> g_vsyncCallbackLastTick{0u};
     std::atomic<uint32_t> g_lastIntcArg{0u};
     std::atomic<uint32_t> g_dmacSendHits{0u};
     std::atomic<uint32_t> g_dmacSendLastCause{0u};
@@ -183,6 +186,20 @@ namespace
 
         ctx->pc = 0u;
     }
+
+    void testVSyncCallback(
+        uint8_t *rdram,
+        R5900Context *ctx,
+        PS2Runtime *runtime)
+    {
+        (void)rdram;
+        (void)runtime;
+        g_vsyncCallbackHits.fetch_add(
+            1u, std::memory_order_relaxed);
+        g_vsyncCallbackLastTick.store(
+            getRegU32(ctx, 4), std::memory_order_relaxed);
+        ctx->pc = 0u;
+    }
 }
 
 void register_ps2_runtime_interrupt_tests()
@@ -267,6 +284,774 @@ void register_ps2_runtime_interrupt_tests()
                 return (env.runtime.memory().gs().csr & kGsCsrFieldMask) != fieldAfterFirstFlip;
             }, std::chrono::milliseconds(300));
             t.IsTrue(secondFieldFlip, "VSync worker should keep alternating GS CSR FIELD");
+
+            cleanupRuntime(env);
+        });
+
+        tc.Run("event VSync follows emulated NTSC phases and defers guest callbacks", [](TestCase &t)
+        {
+            notifyRuntimeStop();
+            ps2_stubs::resetGsSyncVCallbackState();
+            TestEnv env;
+            t.IsTrue(
+                env.runtime.memory().initialize(),
+                "runtime memory initialize should succeed");
+            env.runtime.setEeSchedulingMode(
+                ps2x::timing::EeSchedulingMode::Event);
+            env.runtime.configureEeVSyncVideoMode(
+                0x02u, true);
+
+            constexpr uint64_t kTicksPerEeCycle = 8u;
+            constexpr uint64_t kRenderCycles = 4'498'396u;
+            constexpr uint64_t kGsBlankCycles = 65'601u;
+            constexpr uint64_t kBlankCycles = 421'724u;
+            constexpr uint64_t kPeriodCycles = 4'920'120u;
+            constexpr uint64_t kGsCsrFieldMask = 0x2000ull;
+            constexpr uint32_t kFlagAddr = 0x10A0u;
+            constexpr uint32_t kTickAddr = 0x10B0u;
+            constexpr uint32_t kIntcHandlerAddr = 0x00ABC240u;
+            constexpr uint32_t kGsCallbackAddr = 0x00ABC280u;
+
+            g_vblankStartHits.store(
+                0u, std::memory_order_relaxed);
+            g_vblankEndHits.store(
+                0u, std::memory_order_relaxed);
+            g_vsyncCallbackHits.store(
+                0u, std::memory_order_relaxed);
+            g_vsyncCallbackLastTick.store(
+                0u, std::memory_order_relaxed);
+            env.runtime.registerFunction(
+                kIntcHandlerAddr, &testIntcHandler);
+            env.runtime.registerFunction(
+                kGsCallbackAddr, &testVSyncCallback);
+
+            for (const uint32_t cause : {2u, 3u})
+            {
+                R5900Context addCtx{};
+                setRegU32(addCtx, 4, cause);
+                setRegU32(addCtx, 5, kIntcHandlerAddr);
+                setRegU32(addCtx, 6, 0u);
+                setRegU32(addCtx, 7, cause);
+                AddIntcHandler(
+                    env.rdram.data(), &addCtx,
+                    &env.runtime);
+                t.IsTrue(
+                    getRegS32(addCtx, 2) > 0,
+                    "event VSync fixture should register both INTC edges");
+            }
+
+            R5900Context callbackCtx{};
+            setRegU32(
+                callbackCtx, 4, kGsCallbackAddr);
+            ps2_stubs::sceGsSyncVCallback(
+                env.rdram.data(), &callbackCtx,
+                &env.runtime);
+
+            R5900Context flagCtx{};
+            setRegU32(flagCtx, 4, kFlagAddr);
+            setRegU32(flagCtx, 5, kTickAddr);
+            SetVSyncFlag(
+                env.rdram.data(), &flagCtx,
+                &env.runtime);
+
+            const uint64_t initialVSyncTick =
+                GetCurrentVSyncTick();
+            const PS2Runtime::DebugEeScheduler initial =
+                env.runtime.debugEeSchedulerSnapshot();
+            const auto &initialSlot =
+                initial.slots[
+                    ps2x::timing::eeEventSourceIndex(
+                        ps2x::timing::EeEventSource::
+                            VSync)];
+            t.IsTrue(
+                initialSlot.pending,
+                "event mode should retain one scheduled VSync source");
+            t.Equals(
+                initialSlot.deadlineTick,
+                kRenderCycles * kTicksPerEeCycle,
+                "the first NTSC VBlank start should follow the render interval");
+            t.IsTrue(
+                initialSlot.device.kind ==
+                    PS2Runtime::DebugEeEventDeviceKind::
+                        VSync,
+                "scheduler status should expose typed VSync phase state");
+            t.Equals(
+                initialSlot.device.phase, 0u,
+                "the initial VSync phase should be start");
+
+            std::this_thread::sleep_for(
+                std::chrono::milliseconds(25));
+            t.Equals(
+                GetCurrentVSyncTick(), initialVSyncTick,
+                "host wall time must not service event-mode VSync");
+            t.Equals(
+                readGuestU32(
+                    env.rdram.data(), kFlagAddr),
+                0u,
+                "the one-shot flag must remain clear without emulated progress");
+
+            env.runtime.memory().gs().csr =
+                kGsCsrFieldMask | 0x3ull;
+            env.runtime.debugStartEeEventTrace(
+                3u, std::nullopt, true);
+            R5900Context timingCtx{};
+            timingCtx.cop0_config = 1u << 18u;
+            {
+                PS2Runtime::GuestExecutionScope guestExecution(
+                    &env.runtime, &timingCtx);
+                timingCtx.advanceEeCycleTicks(
+                    static_cast<uint32_t>(
+                        initialSlot.deadlineTick -
+                        kTicksPerEeCycle));
+                env.runtime.serviceEeEventsAtBlockBoundary(
+                    env.rdram.data(), &timingCtx);
+                t.Equals(
+                    GetCurrentVSyncTick(),
+                    initialVSyncTick,
+                    "VSync must remain pending immediately before its deadline");
+
+                timingCtx.advanceEeCycleTicks(
+                    static_cast<uint32_t>(
+                        kTicksPerEeCycle));
+                env.runtime.serviceEeEventsAtBlockBoundary(
+                    env.rdram.data(), &timingCtx);
+                t.Equals(
+                    g_vblankStartHits.load(
+                        std::memory_order_relaxed),
+                    0u,
+                    "VBlank INTC start must wait for the outer guest boundary");
+                t.Equals(
+                    g_vsyncCallbackHits.load(
+                        std::memory_order_relaxed),
+                    0u,
+                    "GS VSync callback must wait for the outer guest boundary");
+            }
+
+            const uint64_t firstVSyncTick =
+                initialVSyncTick + 1u;
+            t.Equals(
+                GetCurrentVSyncTick(), firstVSyncTick,
+                "VBlank start should publish exactly one VSync tick");
+            t.Equals(
+                readGuestU32(
+                    env.rdram.data(), kFlagAddr),
+                1u,
+                "VBlank start should publish the one-shot flag");
+            t.Equals(
+                readGuestU64(
+                    env.rdram.data(), kTickAddr),
+                firstVSyncTick,
+                "VBlank start should publish the matching tick value");
+            t.Equals(
+                g_vblankStartHits.load(
+                    std::memory_order_relaxed),
+                1u,
+                "the outer guest boundary should deliver VBlank start");
+            t.Equals(
+                g_vsyncCallbackHits.load(
+                    std::memory_order_relaxed),
+                1u,
+                "the outer guest boundary should deliver the GS callback");
+            t.Equals(
+                g_vsyncCallbackLastTick.load(
+                    std::memory_order_relaxed),
+                static_cast<uint32_t>(
+                    firstVSyncTick),
+                "the GS callback should receive the published tick");
+            t.Equals(
+                env.runtime.memory().gs().csr.load() &
+                    kGsCsrFieldMask,
+                kGsCsrFieldMask,
+                "GS CSR.FIELD should not change at VBlank start");
+
+            PS2Runtime::DebugEeScheduler afterStart =
+                env.runtime.debugEeSchedulerSnapshot();
+            const auto &gsBlankSlot =
+                afterStart.slots[
+                    ps2x::timing::eeEventSourceIndex(
+                        ps2x::timing::EeEventSource::
+                            VSync)];
+            t.Equals(
+                gsBlankSlot.deadlineTick,
+                (kRenderCycles + kGsBlankCycles) *
+                    kTicksPerEeCycle,
+                "GS field publication should follow the reference scanline delay");
+            t.Equals(
+                gsBlankSlot.device.phase, 1u,
+                "the source should retain its GS-blank phase");
+
+            {
+                PS2Runtime::GuestExecutionScope guestExecution(
+                    &env.runtime, &timingCtx);
+                timingCtx.advanceEeCycleTicks(
+                    static_cast<uint32_t>(
+                        gsBlankSlot.deadlineTick -
+                        env.runtime.currentEeTick().raw()));
+                env.runtime.serviceEeEventsAtBlockBoundary(
+                    env.rdram.data(), &timingCtx);
+            }
+            t.Equals(
+                env.runtime.memory().gs().csr.load() &
+                    kGsCsrFieldMask,
+                0ull,
+                "the delayed GS phase should swap interlaced FIELD");
+            t.Equals(
+                g_vblankEndHits.load(
+                    std::memory_order_relaxed),
+                0u,
+                "GS field publication must precede VBlank end");
+
+            PS2Runtime::DebugEeScheduler afterGsBlank =
+                env.runtime.debugEeSchedulerSnapshot();
+            const auto &endSlot =
+                afterGsBlank.slots[
+                    ps2x::timing::eeEventSourceIndex(
+                        ps2x::timing::EeEventSource::
+                            VSync)];
+            t.Equals(
+                endSlot.deadlineTick,
+                (kRenderCycles + kBlankCycles) *
+                    kTicksPerEeCycle,
+                "VBlank end should retain the reference blank duration");
+            t.Equals(
+                endSlot.device.phase, 2u,
+                "the source should retain its VBlank-end phase");
+
+            {
+                PS2Runtime::GuestExecutionScope guestExecution(
+                    &env.runtime, &timingCtx);
+                timingCtx.advanceEeCycleTicks(
+                    static_cast<uint32_t>(
+                        endSlot.deadlineTick -
+                        env.runtime.currentEeTick().raw()));
+                env.runtime.serviceEeEventsAtBlockBoundary(
+                    env.rdram.data(), &timingCtx);
+                t.Equals(
+                    g_vblankEndHits.load(
+                        std::memory_order_relaxed),
+                    0u,
+                    "VBlank end must remain deferred inside guest execution");
+            }
+            t.Equals(
+                g_vblankEndHits.load(
+                    std::memory_order_relaxed),
+                1u,
+                "the outer boundary should deliver VBlank end");
+
+            const PS2Runtime::DebugEeScheduler afterEnd =
+                env.runtime.debugEeSchedulerSnapshot();
+            const auto &nextStartSlot =
+                afterEnd.slots[
+                    ps2x::timing::eeEventSourceIndex(
+                        ps2x::timing::EeEventSource::
+                            VSync)];
+            t.Equals(
+                nextStartSlot.deadlineTick,
+                (kRenderCycles + kPeriodCycles) *
+                    kTicksPerEeCycle,
+                "the next VBlank start should retain field cadence without rebasing");
+            t.Equals(
+                nextStartSlot.device.phase, 0u,
+                "VBlank end should return the source to start phase");
+
+            const PS2Runtime::DebugEeEventTrace trace =
+                env.runtime.debugEeEventTraceSnapshot(true);
+            t.Equals(
+                trace.entries.size(),
+                static_cast<size_t>(3u),
+                "the three VSync phases should be independently observable");
+            for (const auto &entry : trace.entries)
+            {
+                t.IsTrue(
+                    entry.source ==
+                        ps2x::timing::EeEventSource::
+                            VSync,
+                    "every phased entry should retain VSync source ownership");
+            }
+
+            cleanupRuntime(env);
+            ps2_stubs::resetGsSyncVCallbackState();
+        });
+
+        tc.Run("event VSync preserves the active phase when SetGsCrt selects PAL", [](TestCase &t)
+        {
+            notifyRuntimeStop();
+            TestEnv env;
+            t.IsTrue(
+                env.runtime.memory().initialize(),
+                "runtime memory initialize should succeed");
+            env.runtime.setEeSchedulingMode(
+                ps2x::timing::EeSchedulingMode::Event);
+
+            constexpr uint64_t kTicksPerEeCycle = 8u;
+            constexpr uint64_t kInitialRenderCycles =
+                4'493'898u;
+            constexpr uint64_t kPalRenderCycles =
+                5'435'818u;
+            constexpr uint64_t kPalGsBlankCycles =
+                56'623u;
+
+            EnsureVSyncWorkerRunning(
+                env.rdram.data(), &env.runtime);
+            const auto initial =
+                env.runtime.debugEeSchedulerSnapshot();
+            const auto &initialSlot =
+                initial.slots[
+                    ps2x::timing::eeEventSourceIndex(
+                        ps2x::timing::EeEventSource::
+                            VSync)];
+            t.Equals(
+                initialSlot.deadlineTick,
+                kInitialRenderCycles * kTicksPerEeCycle,
+                "VSync should begin with PCSX2's temporary 60 Hz render phase");
+
+            R5900Context crtCtx{};
+            setRegU32(crtCtx, 4, 1u);
+            setRegU32(crtCtx, 5, 0x03u);
+            setRegU32(crtCtx, 6, 1u);
+            GsSetCrt(
+                env.rdram.data(), &crtCtx,
+                &env.runtime);
+
+            const auto configured =
+                env.runtime.debugEeSchedulerSnapshot();
+            const auto &configuredSlot =
+                configured.slots[
+                    ps2x::timing::eeEventSourceIndex(
+                        ps2x::timing::EeEventSource::
+                            VSync)];
+            t.Equals(
+                configuredSlot.deadlineTick,
+                initialSlot.deadlineTick,
+                "SetGsCrt should preserve the already-pending phase endpoint");
+
+            R5900Context timingCtx{};
+            timingCtx.cop0_config = 1u << 18u;
+            {
+                PS2Runtime::GuestExecutionScope guestExecution(
+                    &env.runtime, &timingCtx);
+                timingCtx.advanceEeCycleTicks(
+                    static_cast<uint32_t>(
+                        initialSlot.deadlineTick));
+                env.runtime.serviceEeEventsAtBlockBoundary(
+                    env.rdram.data(), &timingCtx);
+            }
+
+            const auto afterStart =
+                env.runtime.debugEeSchedulerSnapshot();
+            const auto &palGsBlankSlot =
+                afterStart.slots[
+                    ps2x::timing::eeEventSourceIndex(
+                        ps2x::timing::EeEventSource::
+                            VSync)];
+            t.Equals(
+                palGsBlankSlot.deadlineTick,
+                (kInitialRenderCycles +
+                 kPalGsBlankCycles) *
+                    kTicksPerEeCycle,
+                "the next phase should use PAL scanline timing");
+
+            env.runtime.resetEeTiming(&timingCtx);
+            const auto reset =
+                env.runtime.debugEeSchedulerSnapshot();
+            const auto &resetSlot =
+                reset.slots[
+                    ps2x::timing::eeEventSourceIndex(
+                        ps2x::timing::EeEventSource::
+                            VSync)];
+            t.Equals(
+                resetSlot.deadlineTick,
+                kPalRenderCycles * kTicksPerEeCycle,
+                "timing reset should retain the configured PAL standard");
+
+            cleanupRuntime(env);
+        });
+
+        tc.Run("event VSync normalizes aliases and retains SDTV 480p timing", [](TestCase &t)
+        {
+            notifyRuntimeStop();
+            TestEnv env;
+            t.IsTrue(
+                env.runtime.memory().initialize(),
+                "runtime memory initialize should succeed");
+            env.runtime.setEeSchedulingMode(
+                ps2x::timing::EeSchedulingMode::Event);
+
+            constexpr uint64_t kGsCsrFieldMask = 0x2000ull;
+            constexpr uint64_t kTicksPerEeCycle = 8u;
+            constexpr uint64_t kRenderCycles = 4'489'024u;
+            constexpr uint64_t kGsBlankCycles = 74'973u;
+            constexpr uint64_t kBlankCycles = 431'096u;
+            constexpr uint64_t kPeriodCycles = 4'920'120u;
+
+            env.runtime.configureEeVSyncVideoMode(
+                0x00u, true);
+            env.runtime.memory().gs().csr.fetch_and(
+                ~kGsCsrFieldMask,
+                std::memory_order_relaxed);
+            env.runtime.configureEeVSyncVideoMode(
+                0x02u, true);
+            t.Equals(
+                env.runtime.memory().gs().csr.load(
+                    std::memory_order_relaxed) &
+                    kGsCsrFieldMask,
+                0ull,
+                "BIOS and libgs NTSC aliases should retain one normalized mode class");
+
+            env.runtime.configureEeVSyncVideoMode(
+                0x50u, false);
+            t.Equals(
+                env.runtime.memory().gs().csr.load(
+                    std::memory_order_relaxed) &
+                    kGsCsrFieldMask,
+                kGsCsrFieldMask,
+                "changing to SDTV 480p should initialize FIELD high");
+
+            EnsureVSyncWorkerRunning(
+                env.rdram.data(), &env.runtime);
+            const auto initial =
+                env.runtime.debugEeSchedulerSnapshot();
+            const auto &startSlot =
+                initial.slots[
+                    ps2x::timing::eeEventSourceIndex(
+                        ps2x::timing::EeEventSource::
+                            VSync)];
+            t.Equals(
+                startSlot.deadlineTick,
+                kRenderCycles * kTicksPerEeCycle,
+                "SDTV 480p should use PCSX2's distinct 59.94 Hz render duration");
+
+            R5900Context timingCtx{};
+            timingCtx.cop0_config = 1u << 18u;
+            {
+                PS2Runtime::GuestExecutionScope guestExecution(
+                    &env.runtime, &timingCtx);
+                timingCtx.advanceEeCycleTicks(
+                    static_cast<uint32_t>(
+                        startSlot.deadlineTick));
+                env.runtime.serviceEeEventsAtBlockBoundary(
+                    env.rdram.data(), &timingCtx);
+            }
+
+            const auto afterStart =
+                env.runtime.debugEeSchedulerSnapshot();
+            const auto &gsBlankSlot =
+                afterStart.slots[
+                    ps2x::timing::eeEventSourceIndex(
+                        ps2x::timing::EeEventSource::
+                            VSync)];
+            t.Equals(
+                gsBlankSlot.deadlineTick,
+                (kRenderCycles + kGsBlankCycles) *
+                    kTicksPerEeCycle,
+                "SDTV 480p should retain its reference GS-blank offset");
+
+            {
+                PS2Runtime::GuestExecutionScope guestExecution(
+                    &env.runtime, &timingCtx);
+                timingCtx.advanceEeCycleTicks(
+                    static_cast<uint32_t>(
+                        gsBlankSlot.deadlineTick -
+                        env.runtime.currentEeTick().raw()));
+                env.runtime.serviceEeEventsAtBlockBoundary(
+                    env.rdram.data(), &timingCtx);
+            }
+            t.Equals(
+                env.runtime.memory().gs().csr.load(
+                    std::memory_order_relaxed) &
+                    kGsCsrFieldMask,
+                kGsCsrFieldMask,
+                "a progressive GS-blank should keep FIELD high");
+
+            const auto afterGsBlank =
+                env.runtime.debugEeSchedulerSnapshot();
+            const auto &endSlot =
+                afterGsBlank.slots[
+                    ps2x::timing::eeEventSourceIndex(
+                        ps2x::timing::EeEventSource::
+                            VSync)];
+            t.Equals(
+                endSlot.deadlineTick,
+                (kRenderCycles + kBlankCycles) *
+                    kTicksPerEeCycle,
+                "SDTV 480p should retain its reference blank duration");
+
+            {
+                PS2Runtime::GuestExecutionScope guestExecution(
+                    &env.runtime, &timingCtx);
+                timingCtx.advanceEeCycleTicks(
+                    static_cast<uint32_t>(
+                        endSlot.deadlineTick -
+                        env.runtime.currentEeTick().raw()));
+                env.runtime.serviceEeEventsAtBlockBoundary(
+                    env.rdram.data(), &timingCtx);
+            }
+            const auto afterEnd =
+                env.runtime.debugEeSchedulerSnapshot();
+            const auto &nextStartSlot =
+                afterEnd.slots[
+                    ps2x::timing::eeEventSourceIndex(
+                        ps2x::timing::EeEventSource::
+                            VSync)];
+            t.Equals(
+                nextStartSlot.deadlineTick,
+                (kRenderCycles + kPeriodCycles) *
+                    kTicksPerEeCycle,
+                "SDTV 480p should retain its 59.94 Hz field cadence");
+
+            cleanupRuntime(env);
+        });
+
+        tc.Run("event VSync wait fast-forwards only emulated deadlines and survives reset", [](TestCase &t)
+        {
+            notifyRuntimeStop();
+            TestEnv env;
+            t.IsTrue(
+                env.runtime.memory().initialize(),
+                "runtime memory initialize should succeed");
+            env.runtime.setEeSchedulingMode(
+                ps2x::timing::EeSchedulingMode::Event);
+            env.runtime.configureEeVSyncVideoMode(
+                0x02u, true);
+
+            constexpr uint64_t kTicksPerEeCycle = 8u;
+            constexpr uint64_t kRenderCycles = 4'498'396u;
+            constexpr uint64_t kPeriodCycles = 4'920'120u;
+
+            R5900Context ctx{};
+            ctx.cop0_config = 1u << 18u;
+            const uint64_t tickBefore =
+                GetCurrentVSyncTick();
+            const auto hostStart =
+                std::chrono::steady_clock::now();
+            uint64_t firstTick = 0u;
+            {
+                PS2Runtime::GuestExecutionScope guestExecution(
+                    &env.runtime, &ctx);
+                firstTick = WaitForNextVSyncTick(
+                    env.rdram.data(), &env.runtime,
+                    &ctx);
+            }
+            const auto hostElapsed =
+                std::chrono::steady_clock::now() -
+                hostStart;
+
+            t.Equals(
+                firstTick, tickBefore + 1u,
+                "the last runnable guest should publish the next VSync");
+            t.Equals(
+                env.runtime.currentEeTick().raw(),
+                kRenderCycles * kTicksPerEeCycle,
+                "idle advancement should stop at the exact first VSync deadline");
+            t.IsTrue(
+                hostElapsed < std::chrono::milliseconds(100),
+                "event VSync wait should not consume a host-frame delay");
+
+            uint64_t secondTick = 0u;
+            {
+                PS2Runtime::GuestExecutionScope guestExecution(
+                    &env.runtime, &ctx);
+                secondTick = WaitForNextVSyncTick(
+                    env.rdram.data(), &env.runtime,
+                    &ctx);
+            }
+            t.Equals(
+                secondTick, firstTick + 1u,
+                "the next wait should cross GS-blank and end phases to the next start");
+            t.Equals(
+                env.runtime.currentEeTick().raw(),
+                (kRenderCycles + kPeriodCycles) *
+                    kTicksPerEeCycle,
+                "successive waits should preserve the fixed emulated field cadence");
+
+            env.runtime.resetEeTiming(&ctx);
+            const PS2Runtime::DebugEeScheduler reset =
+                env.runtime.debugEeSchedulerSnapshot();
+            const auto &resetSlot =
+                reset.slots[
+                    ps2x::timing::eeEventSourceIndex(
+                        ps2x::timing::EeEventSource::
+                            VSync)];
+            t.Equals(
+                env.runtime.currentEeTick().raw(), 0u,
+                "timing reset should restore canonical EE time");
+            t.IsTrue(
+                resetSlot.pending,
+                "timing reset should re-arm an enabled VSync source");
+            t.Equals(
+                resetSlot.deadlineTick,
+                kRenderCycles * kTicksPerEeCycle,
+                "timing reset should restore the deterministic initial phase");
+
+            uint64_t postResetTick = 0u;
+            {
+                PS2Runtime::GuestExecutionScope guestExecution(
+                    &env.runtime, &ctx);
+                postResetTick = WaitForNextVSyncTick(
+                    env.rdram.data(), &env.runtime,
+                    &ctx);
+            }
+            t.Equals(
+                postResetTick, secondTick + 1u,
+                "reset should preserve the monotonic guest-visible VSync count");
+            t.Equals(
+                env.runtime.currentEeTick().raw(),
+                kRenderCycles * kTicksPerEeCycle,
+                "post-reset wait should reach the same emulated deadline");
+
+            cleanupRuntime(env);
+        });
+
+        tc.Run("event VSync wait shares one idle advance and yields to queued guest work", [](TestCase &t)
+        {
+            notifyRuntimeStop();
+            TestEnv env;
+            t.IsTrue(
+                env.runtime.memory().initialize(),
+                "runtime memory initialize should succeed");
+            env.runtime.setEeSchedulingMode(
+                ps2x::timing::EeSchedulingMode::Event);
+            env.runtime.configureEeVSyncVideoMode(
+                0x02u, true);
+            EnsureVSyncWorkerRunning(
+                env.rdram.data(), &env.runtime);
+
+            constexpr uint64_t kTicksPerEeCycle = 8u;
+            constexpr uint64_t kRenderCycles = 4'498'396u;
+            const uint64_t observedTick =
+                GetCurrentVSyncTick();
+
+            R5900Context firstWaitCtx{};
+            R5900Context secondWaitCtx{};
+            uint64_t firstResult = 0u;
+            uint64_t secondResult = 0u;
+            std::thread firstWaiter(
+                [&]()
+                {
+                    firstResult =
+                        env.runtime.waitForNextScheduledVSync(
+                            env.rdram.data(),
+                            &firstWaitCtx,
+                            observedTick);
+                });
+            std::thread secondWaiter(
+                [&]()
+                {
+                    secondResult =
+                        env.runtime.waitForNextScheduledVSync(
+                            env.rdram.data(),
+                            &secondWaitCtx,
+                            observedTick);
+                });
+            firstWaiter.join();
+            secondWaiter.join();
+
+            t.Equals(
+                firstResult, observedTick + 1u,
+                "the first idle waiter should observe the next shared tick");
+            t.Equals(
+                secondResult, observedTick + 1u,
+                "concurrent idle waiters should share one VSync advance");
+            t.Equals(
+                env.runtime.currentEeTick().raw(),
+                kRenderCycles * kTicksPerEeCycle,
+                "two waiters must not advance through two VSync fields");
+
+            const uint64_t secondObservedTick =
+                GetCurrentVSyncTick();
+            std::atomic<bool> ordinaryEntered{false};
+            std::atomic<bool> allowOrdinaryExit{false};
+            std::atomic<bool> thirdWaitDone{false};
+            uint64_t thirdResult = 0u;
+            R5900Context ownerCtx{};
+            R5900Context ordinaryCtx{};
+            R5900Context thirdWaitCtx{};
+            std::thread ordinaryThread;
+            std::thread thirdWaiter;
+            {
+                PS2Runtime::GuestExecutionScope owner(
+                    &env.runtime, &ownerCtx);
+                ordinaryThread = std::thread(
+                    [&]()
+                    {
+                        PS2Runtime::GuestExecutionScope guest(
+                            &env.runtime, &ordinaryCtx);
+                        ordinaryEntered.store(
+                            true, std::memory_order_release);
+                        while (!allowOrdinaryExit.load(
+                            std::memory_order_acquire) &&
+                               !env.runtime.isStopRequested())
+                        {
+                            std::this_thread::yield();
+                        }
+                    });
+                t.IsTrue(
+                    waitUntil(
+                        [&]()
+                        {
+                            return env.runtime
+                                       .guestExecutionWaiterCountForTesting() >=
+                                   1u;
+                        },
+                        std::chrono::milliseconds(100)),
+                    "ordinary guest work should queue behind the owner");
+
+                thirdWaiter = std::thread(
+                    [&]()
+                    {
+                        thirdResult =
+                            env.runtime.waitForNextScheduledVSync(
+                                env.rdram.data(),
+                                &thirdWaitCtx,
+                                secondObservedTick);
+                        thirdWaitDone.store(
+                            true, std::memory_order_release);
+                    });
+                t.IsTrue(
+                    waitUntil(
+                        [&]()
+                        {
+                            return env.runtime
+                                       .guestExecutionWaiterCountForTesting() >=
+                                   2u;
+                        },
+                        std::chrono::milliseconds(100)),
+                    "the idle arbiter should also queue behind the owner");
+            }
+
+            const bool ordinaryReceivedToken =
+                waitUntil(
+                    [&]()
+                    {
+                        return ordinaryEntered.load(
+                            std::memory_order_acquire);
+                    },
+                    std::chrono::milliseconds(100));
+            t.IsTrue(
+                ordinaryReceivedToken,
+                "queued ordinary guest work should receive the token first");
+            t.IsFalse(
+                thirdWaitDone.load(
+                    std::memory_order_acquire),
+                "VSync must not skip emulated time while ordinary guest work is runnable");
+            t.Equals(
+                GetCurrentVSyncTick(),
+                secondObservedTick,
+                "the next VSync should remain pending while ordinary work owns the token");
+
+            allowOrdinaryExit.store(
+                true, std::memory_order_release);
+            if (ordinaryThread.joinable())
+            {
+                ordinaryThread.join();
+            }
+            if (thirdWaiter.joinable())
+            {
+                thirdWaiter.join();
+            }
+            t.Equals(
+                thirdResult, secondObservedTick + 1u,
+                "idle advancement should resume after queued guest work yields");
 
             cleanupRuntime(env);
         });

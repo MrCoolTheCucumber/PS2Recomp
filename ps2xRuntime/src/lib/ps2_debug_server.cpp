@@ -1023,6 +1023,9 @@ struct PS2DebugServer::Impl
         const char *kind = "unknown";
         switch (state.kind)
         {
+        case PS2Runtime::DebugEeEventDeviceKind::VSync:
+            kind = "vsync";
+            break;
         case PS2Runtime::DebugEeEventDeviceKind::Vif1Dma:
             kind = "vif1_dma";
             break;

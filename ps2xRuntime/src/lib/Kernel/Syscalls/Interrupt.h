@@ -30,8 +30,17 @@ namespace ps2_syscalls
     bool isDmacCauseEnabled(uint32_t cause);
     void EnsureVSyncWorkerRunning(uint8_t *rdram, PS2Runtime *runtime);
     uint64_t GetCurrentVSyncTick();
+    uint64_t PublishVSyncStart(uint8_t *rdram, PS2Runtime *runtime);
+    void PublishVSyncField(PS2Runtime *runtime, uint64_t tick);
+    void DispatchVSyncStartHandlers(
+        uint8_t *rdram, PS2Runtime *runtime, uint64_t tick);
+    void DispatchVSyncEndHandlers(
+        uint8_t *rdram, PS2Runtime *runtime);
     void stopInterruptWorker();
-    uint64_t WaitForNextVSyncTick(uint8_t *rdram, PS2Runtime *runtime);
+    uint64_t WaitForNextVSyncTick(
+        uint8_t *rdram,
+        PS2Runtime *runtime,
+        R5900Context *ctx);
     void WaitVSyncTick(uint8_t *rdram, PS2Runtime *runtime);
     void SetVSyncFlag(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
     void EnableIntc(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);

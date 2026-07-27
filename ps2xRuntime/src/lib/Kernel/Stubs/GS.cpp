@@ -945,6 +945,11 @@ namespace ps2_stubs
             g_gparam.ffmode = static_cast<uint8_t>(ffmode & 0x1);
             writeGsGParamToScratch(runtime);
             resetGsSyncVState();
+            if (runtime)
+            {
+                runtime->configureEeVSyncVideoMode(
+                    omode, interlace != 0u);
+            }
 
             uint64_t pmode = makePmode(1, 0, 0, 0, 0, 0x80);
             uint64_t smode2 = (interlace & 0x1) | ((ffmode & 0x1) << 1);
@@ -1498,7 +1503,9 @@ namespace ps2_stubs
 
     void sceGsSyncV(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
-        const uint64_t tick = ps2_syscalls::WaitForNextVSyncTick(rdram, runtime);
+        const uint64_t tick =
+            ps2_syscalls::WaitForNextVSyncTick(
+                rdram, runtime, ctx);
         if (g_gparam.interlace != 0u)
         {
             setReturnS32(ctx, getGsSyncVFieldForTick(tick));
