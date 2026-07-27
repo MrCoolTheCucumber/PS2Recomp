@@ -503,6 +503,7 @@ public:
     {
         None = 0u,
         VSync,
+        GifDma,
         Vif0Dma,
         Vif1Dma,
         Vu0,
@@ -1054,6 +1055,13 @@ private:
         ps2x::timing::EeTick serviceTick,
         uint32_t delayEeCycles,
         bool allowImmediateRescan) noexcept;
+    bool scheduleGifDmaFromMemory(
+        uint32_t delayEeCycles);
+    void cancelGifDmaEvent() noexcept;
+    void scheduleGifDmaEvent(
+        ps2x::timing::EeTick deadline) noexcept;
+    void serviceGifDmaAtEvent(
+        const ps2x::timing::EeEventService &service);
     bool scheduleScratchpadDmaFromMemory(
         DmacChannel channel,
         uint32_t delayEeCycles);
@@ -1144,6 +1152,8 @@ private:
         ps2x::timing::EeEventSource::DmacVif0, 0u};
     ps2x::timing::EeEventToken m_vif1DmaEventToken{
         ps2x::timing::EeEventSource::DmacVif1, 0u};
+    ps2x::timing::EeEventToken m_gifDmaEventToken{
+        ps2x::timing::EeEventSource::DmacGif, 0u};
     ps2x::timing::EeEventToken
         m_fromScratchpadDmaEventToken{
             ps2x::timing::EeEventSource::

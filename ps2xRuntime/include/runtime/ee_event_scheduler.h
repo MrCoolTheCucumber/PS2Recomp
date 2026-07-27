@@ -47,6 +47,7 @@ namespace ps2x::timing
         // priority pass.
         DmacCompletion,
         DmacVif1,
+        DmacGif,
         DmacVif0,
         DmacFromScratchpad,
         DmacToScratchpad,
@@ -78,6 +79,8 @@ namespace ps2x::timing
             return "vu0_periodic_compatibility";
         case EeEventSource::DmacVif1:
             return "dmac_vif1";
+        case EeEventSource::DmacGif:
+            return "dmac_gif";
         case EeEventSource::DmacVif0:
             return "dmac_vif0";
         case EeEventSource::DmacFromScratchpad:

@@ -174,6 +174,25 @@ namespace
         return tag;
     }
 
+    void writeGifImagePacket(
+        uint8_t *destination, uint32_t qwc,
+        uint8_t payloadByte)
+    {
+        if (!destination || qwc == 0u)
+            return;
+        std::memset(destination, 0, qwc * 16u);
+        const uint64_t tag = makeGifTag(
+            static_cast<uint16_t>(qwc - 1u),
+            GIF_FMT_IMAGE, 0u);
+        std::memcpy(destination, &tag, sizeof(tag));
+        if (qwc > 1u)
+        {
+            std::memset(
+                destination + 16u, payloadByte,
+                (qwc - 1u) * 16u);
+        }
+    }
+
     void writeVuInstructionPair(uint8_t *code, uint32_t pc, uint32_t lower, uint32_t upper)
     {
         std::memcpy(code + pc, &lower, sizeof(lower));
@@ -3781,6 +3800,688 @@ void register_ps2_runtime_expansion_tests()
                     trace.entries.front().serviceTick,
                     136ull,
                     "the replacement should own the first live service");
+            }
+        });
+
+        tc.Run("event GIF normal DMA reproduces PCSX2 slice deadlines", [](TestCase &t)
+        {
+            PS2Runtime runtime;
+            t.IsTrue(
+                runtime.memory().initialize(),
+                "GIF normal fixture memory should initialize");
+            t.IsTrue(
+                runtime.syncCoreSubsystems(),
+                "GIF normal fixture subsystems should bind");
+            runtime.setEeSchedulingMode(
+                ps2x::timing::EeSchedulingMode::Event);
+
+            constexpr uint32_t kGif = 0x1000A000u;
+            constexpr uint32_t kDstat = 0x1000E010u;
+            constexpr uint32_t kSource = 0x00034000u;
+            constexpr uint32_t kQwc = 12u;
+            writeGifImagePacket(
+                runtime.memory().getRDRAM() + kSource,
+                kQwc, 0x31u);
+
+            std::vector<std::vector<uint8_t>> captured;
+            runtime.gifArbiter().setProcessPacketFn(
+                [&](const uint8_t *data,
+                    uint32_t sizeBytes)
+                {
+                    captured.emplace_back(
+                        data, data + sizeBytes);
+                });
+
+            runtime.debugStartEeEventTrace(8u);
+            t.IsTrue(
+                runtime.memory().writeIORegister(
+                    kGif + 0x10u, kSource),
+                "GIF normal MADR should write");
+            t.IsTrue(
+                runtime.memory().writeIORegister(
+                    kGif + 0x20u, kQwc),
+                "GIF normal QWC should write");
+            t.IsTrue(
+                runtime.memory().writeIORegister(
+                    kGif, 0x100u),
+                "GIF normal DMA should start");
+
+            GifDmaSnapshot dma =
+                runtime.memory().gifDmaSnapshot();
+            t.IsTrue(
+                dma.active && dma.eventManaged &&
+                    dma.phase ==
+                        GifDmaPhase::TransferPayload,
+                "submission should retain scheduled payload work");
+            t.Equals(
+                dma.qwc, 8u,
+                "submission should consume the initial four QW");
+            t.Equals(
+                dma.madr, kSource + 4u * 16u,
+                "submission should expose the initial MADR advance");
+            t.Equals(
+                captured.size(), static_cast<size_t>(0u),
+                "the partial GIF packet should remain buffered");
+
+            PS2Runtime::DebugEeScheduler scheduler =
+                runtime.debugEeSchedulerSnapshot();
+            auto slot =
+                scheduler.slots[ps2x::timing::
+                    eeEventSourceIndex(
+                        ps2x::timing::EeEventSource::
+                            DmacGif)];
+            t.IsTrue(
+                slot.pending,
+                "submission should retain DMAC_GIF ownership");
+            t.Equals(
+                slot.deadlineTick, 64ull,
+                "four initial QW should cost eight EE cycles");
+            t.IsTrue(
+                slot.device.kind ==
+                    PS2Runtime::DebugEeEventDeviceKind::
+                        GifDma,
+                "scheduler status should identify GIF DMA");
+
+            R5900Context &context = runtime.cpu();
+            context.advanceEeCycleTicks(64u);
+            runtime.serviceEeEventsAtBlockBoundary(
+                runtime.memory().getRDRAM(), &context);
+            dma = runtime.memory().gifDmaSnapshot();
+            t.IsTrue(
+                dma.active &&
+                    dma.phase == GifDmaPhase::Finalize,
+                "the first service should retain finalization");
+            t.Equals(
+                dma.qwc, 0u,
+                "the first service should consume the remaining QW");
+            t.Equals(
+                captured.size(), static_cast<size_t>(1u),
+                "the remaining slice should complete one GIF packet");
+            scheduler = runtime.debugEeSchedulerSnapshot();
+            slot =
+                scheduler.slots[ps2x::timing::
+                    eeEventSourceIndex(
+                        ps2x::timing::EeEventSource::
+                            DmacGif)];
+            t.IsTrue(
+                slot.pending,
+                "payload service should retain finalization ownership");
+            t.Equals(
+                slot.deadlineTick, 192ull,
+                "eight remaining QW should cost sixteen cycles from service");
+            t.IsTrue(
+                (runtime.memory().readIORegister(kGif) &
+                 0x100u) != 0u,
+                "STR should remain visible before finalization");
+            t.IsTrue(
+                (runtime.memory().readIORegister(kDstat) &
+                 (1u << 2u)) == 0u,
+                "D_STAT should remain clear before finalization");
+
+            context.advanceEeCycleTicks(128u);
+            runtime.serviceEeEventsAtBlockBoundary(
+                runtime.memory().getRDRAM(), &context);
+            t.IsFalse(
+                runtime.memory().gifDmaSnapshot().active,
+                "the second service should retire GIF DMA");
+            t.IsTrue(
+                (runtime.memory().readIORegister(kGif) &
+                 0x100u) == 0u,
+                "same-boundary publication should clear STR");
+            t.IsTrue(
+                (runtime.memory().readIORegister(kDstat) &
+                 (1u << 2u)) != 0u,
+                "same-boundary publication should latch GIF D_STAT");
+
+            const PS2Runtime::DebugEeEventTrace trace =
+                runtime.debugEeEventTraceSnapshot(true);
+            t.Equals(
+                trace.entries.size(),
+                static_cast<size_t>(3u),
+                "normal DMA should trace two services and publication");
+            if (trace.entries.size() == 3u)
+            {
+                const std::array<
+                    ps2x::timing::EeEventSource, 3u>
+                    expectedSources = {
+                        ps2x::timing::EeEventSource::DmacGif,
+                        ps2x::timing::EeEventSource::DmacGif,
+                        ps2x::timing::EeEventSource::
+                            DmacCompletion,
+                    };
+                const std::array<uint64_t, 3u>
+                    expectedTicks = {
+                        64ull, 192ull, 192ull};
+                for (size_t index = 0u;
+                     index < trace.entries.size(); ++index)
+                {
+                    t.IsTrue(
+                        trace.entries[index].source ==
+                            expectedSources[index],
+                        "normal GIF services should retain source order");
+                    t.Equals(
+                        trace.entries[index].serviceTick,
+                        expectedTicks[index],
+                        "normal GIF services should retain exact ticks");
+                }
+            }
+        });
+
+        tc.Run("event GIF END chain combines tag and initial slice cost", [](TestCase &t)
+        {
+            PS2Runtime runtime;
+            t.IsTrue(
+                runtime.memory().initialize(),
+                "GIF chain fixture memory should initialize");
+            t.IsTrue(
+                runtime.syncCoreSubsystems(),
+                "GIF chain fixture subsystems should bind");
+            runtime.setEeSchedulingMode(
+                ps2x::timing::EeSchedulingMode::Event);
+
+            constexpr uint32_t kGif = 0x1000A000u;
+            constexpr uint32_t kTag = 0x00034400u;
+            constexpr uint32_t kQwc = 12u;
+            uint8_t *const rdram =
+                runtime.memory().getRDRAM();
+            std::memset(rdram + kTag, 0, 16u);
+            const uint64_t end =
+                makeDmaTag(kQwc, 7u, 0u);
+            std::memcpy(rdram + kTag, &end, sizeof(end));
+            writeGifImagePacket(
+                rdram + kTag + 16u, kQwc, 0x42u);
+
+            std::vector<std::vector<uint8_t>> captured;
+            runtime.gifArbiter().setProcessPacketFn(
+                [&](const uint8_t *data,
+                    uint32_t sizeBytes)
+                {
+                    captured.emplace_back(
+                        data, data + sizeBytes);
+                });
+
+            runtime.debugStartEeEventTrace(8u);
+            t.IsTrue(
+                runtime.memory().writeIORegister(
+                    kGif + 0x30u, kTag),
+                "GIF chain TADR should write");
+            t.IsTrue(
+                runtime.memory().writeIORegister(
+                    kGif, 0x104u),
+                "GIF END chain should start");
+
+            GifDmaSnapshot dma =
+                runtime.memory().gifDmaSnapshot();
+            t.Equals(
+                dma.tagsProcessed, 1u,
+                "submission should fetch the END tag");
+            t.Equals(
+                dma.qwc, 8u,
+                "submission should retain eight payload QW");
+            t.Equals(
+                dma.madr, kTag + 16u + 4u * 16u,
+                "submission should expose payload MADR progress");
+            t.Equals(
+                dma.tadr, kTag,
+                "END should retain the terminal tag address");
+
+            PS2Runtime::DebugEeScheduler scheduler =
+                runtime.debugEeSchedulerSnapshot();
+            auto slot =
+                scheduler.slots[ps2x::timing::
+                    eeEventSourceIndex(
+                        ps2x::timing::EeEventSource::
+                            DmacGif)];
+            t.IsTrue(
+                slot.pending,
+                "END submission should retain DMAC_GIF");
+            t.Equals(
+                slot.deadlineTick, 80ull,
+                "tag plus four QW should cost ten EE cycles");
+
+            R5900Context &context = runtime.cpu();
+            context.advanceEeCycleTicks(80u);
+            runtime.serviceEeEventsAtBlockBoundary(
+                rdram, &context);
+            dma = runtime.memory().gifDmaSnapshot();
+            t.IsTrue(
+                dma.active &&
+                    dma.phase == GifDmaPhase::Finalize,
+                "payload service should retain finalization");
+            scheduler = runtime.debugEeSchedulerSnapshot();
+            slot =
+                scheduler.slots[ps2x::timing::
+                    eeEventSourceIndex(
+                        ps2x::timing::EeEventSource::
+                            DmacGif)];
+            t.Equals(
+                slot.deadlineTick, 208ull,
+                "remaining payload should cost sixteen cycles");
+
+            context.advanceEeCycleTicks(128u);
+            runtime.serviceEeEventsAtBlockBoundary(
+                rdram, &context);
+            t.Equals(
+                runtime.memory().readIORegister(kGif),
+                0x70000004u,
+                "completion should retain END and chain-mode bits");
+            t.Equals(
+                runtime.memory().readIORegister(
+                    kGif + 0x10u),
+                kTag + 16u + kQwc * 16u,
+                "completion should retain final MADR");
+            t.Equals(
+                runtime.memory().readIORegister(
+                    kGif + 0x30u),
+                kTag,
+                "completion should retain terminal TADR");
+            t.Equals(
+                captured.size(), static_cast<size_t>(1u),
+                "chain progress should submit one complete GIF packet");
+
+            const PS2Runtime::DebugEeEventTrace trace =
+                runtime.debugEeEventTraceSnapshot(true);
+            t.Equals(
+                trace.entries.size(),
+                static_cast<size_t>(3u),
+                "END chain should trace two services and publication");
+            if (trace.entries.size() == 3u)
+            {
+                const std::array<uint64_t, 3u>
+                    expectedTicks = {
+                        80ull, 208ull, 208ull};
+                t.IsTrue(
+                    trace.entries[0].source ==
+                            ps2x::timing::EeEventSource::
+                                DmacGif &&
+                        trace.entries[1].source ==
+                            ps2x::timing::EeEventSource::
+                                DmacGif &&
+                        trace.entries[2].source ==
+                            ps2x::timing::EeEventSource::
+                                DmacCompletion,
+                    "END completion should follow GIF progress");
+                for (size_t index = 0u;
+                     index < trace.entries.size(); ++index)
+                {
+                    t.Equals(
+                        trace.entries[index].serviceTick,
+                        expectedTicks[index],
+                        "END services should retain exact ticks");
+                }
+            }
+        });
+
+        tc.Run("event GIF MODE unmask owns the full FIFO wakeup", [](TestCase &t)
+        {
+            PS2Runtime runtime;
+            t.IsTrue(
+                runtime.memory().initialize(),
+                "GIF mask fixture memory should initialize");
+            t.IsTrue(
+                runtime.syncCoreSubsystems(),
+                "GIF mask fixture subsystems should bind");
+            runtime.setEeSchedulingMode(
+                ps2x::timing::EeSchedulingMode::Event);
+
+            constexpr uint32_t kGifCtrl = 0x10003000u;
+            constexpr uint32_t kGifMode = 0x10003010u;
+            constexpr uint32_t kGifStat = 0x10003020u;
+            constexpr uint32_t kGif = 0x1000A000u;
+            constexpr uint32_t kDstat = 0x1000E010u;
+            constexpr uint32_t kSource = 0x00034800u;
+            constexpr uint32_t kQwc = 16u;
+            writeGifImagePacket(
+                runtime.memory().getRDRAM() + kSource,
+                kQwc, 0x53u);
+
+            t.IsTrue(
+                runtime.memory().writeIORegister(
+                    kGifCtrl, 1u),
+                "GIF reset should establish an empty parser");
+            std::vector<std::vector<uint8_t>> captured;
+            runtime.gifArbiter().setProcessPacketFn(
+                [&](const uint8_t *data,
+                    uint32_t sizeBytes)
+                {
+                    captured.emplace_back(
+                        data, data + sizeBytes);
+                });
+            t.IsTrue(
+                runtime.memory().writeIORegister(
+                    kGifMode, 1u),
+                "M3R should mask PATH3");
+
+            runtime.debugStartEeEventTrace(8u);
+            t.IsTrue(
+                runtime.memory().writeIORegister(
+                    kGif + 0x10u, kSource),
+                "masked GIF MADR should write");
+            t.IsTrue(
+                runtime.memory().writeIORegister(
+                    kGif + 0x20u, kQwc),
+                "masked GIF QWC should write");
+            t.IsTrue(
+                runtime.memory().writeIORegister(
+                    kGif, 0x100u),
+                "masked GIF DMA should start");
+
+            GifDmaSnapshot dma =
+                runtime.memory().gifDmaSnapshot();
+            t.IsTrue(
+                dma.active &&
+                    dma.stall ==
+                        GifDmaStallReason::Path3Masked,
+                "masked submission should retain a path stall");
+            t.Equals(
+                dma.fifoQwc, 16u,
+                "masked submission should fill the GIF FIFO");
+            t.Equals(
+                dma.qwc, 0u,
+                "FIFO fill should consume channel QWC");
+            t.Equals(
+                runtime.memory().readIORegister(kGifStat),
+                0x10000001u,
+                "GIF_STAT should expose FQC=16 and M3R");
+            PS2Runtime::DebugEeScheduler scheduler =
+                runtime.debugEeSchedulerSnapshot();
+            t.IsFalse(
+                scheduler.slots[ps2x::timing::
+                    eeEventSourceIndex(
+                        ps2x::timing::EeEventSource::
+                            DmacGif)]
+                    .pending,
+                "a full masked FIFO should have no deadline");
+
+            t.IsTrue(
+                runtime.memory().writeIORegister(
+                    kGifMode, 0u),
+                "clearing M3R should succeed");
+            scheduler = runtime.debugEeSchedulerSnapshot();
+            auto slot =
+                scheduler.slots[ps2x::timing::
+                    eeEventSourceIndex(
+                        ps2x::timing::EeEventSource::
+                            DmacGif)];
+            t.IsTrue(
+                slot.pending,
+                "unmask should schedule DMAC_GIF");
+            t.Equals(
+                slot.deadlineTick, 64ull,
+                "M3R removal should own the eight-cycle wakeup");
+
+            R5900Context &context = runtime.cpu();
+            context.advanceEeCycleTicks(64u);
+            runtime.serviceEeEventsAtBlockBoundary(
+                runtime.memory().getRDRAM(), &context);
+            dma = runtime.memory().gifDmaSnapshot();
+            t.IsTrue(
+                dma.active &&
+                    dma.phase == GifDmaPhase::Finalize,
+                "wake service should drain into finalization");
+            t.Equals(
+                dma.fifoQwc, 0u,
+                "wake service should empty the FIFO");
+            t.Equals(
+                runtime.memory().readIORegister(kGifStat),
+                0u,
+                "FIFO drain should clear FQC and M3R");
+            t.Equals(
+                captured.size(), static_cast<size_t>(1u),
+                "FIFO drain should submit one complete GIF packet");
+            scheduler = runtime.debugEeSchedulerSnapshot();
+            slot =
+                scheduler.slots[ps2x::timing::
+                    eeEventSourceIndex(
+                        ps2x::timing::EeEventSource::
+                            DmacGif)];
+            t.Equals(
+                slot.deadlineTick, 320ull,
+                "sixteen drained QW should cost thirty-two cycles");
+
+            context.advanceEeCycleTicks(256u);
+            runtime.serviceEeEventsAtBlockBoundary(
+                runtime.memory().getRDRAM(), &context);
+            t.IsFalse(
+                runtime.memory().gifDmaSnapshot().active,
+                "final service should retire masked GIF DMA");
+            t.IsTrue(
+                (runtime.memory().readIORegister(kGif) &
+                 0x100u) == 0u,
+                "publication should clear masked GIF STR");
+            t.IsTrue(
+                (runtime.memory().readIORegister(kDstat) &
+                 (1u << 2u)) != 0u,
+                "publication should latch masked GIF D_STAT");
+
+            const PS2Runtime::DebugEeEventTrace trace =
+                runtime.debugEeEventTraceSnapshot(true);
+            t.Equals(
+                trace.entries.size(),
+                static_cast<size_t>(3u),
+                "masked DMA should trace wake, finalization, and publication");
+            if (trace.entries.size() == 3u)
+            {
+                const std::array<uint64_t, 3u>
+                    expectedTicks = {
+                        64ull, 320ull, 320ull};
+                t.IsTrue(
+                    trace.entries[0].source ==
+                            ps2x::timing::EeEventSource::
+                                DmacGif &&
+                        trace.entries[1].source ==
+                            ps2x::timing::EeEventSource::
+                                DmacGif &&
+                        trace.entries[2].source ==
+                            ps2x::timing::EeEventSource::
+                                DmacCompletion,
+                    "masked wake should precede typed publication");
+                for (size_t index = 0u;
+                     index < trace.entries.size(); ++index)
+                {
+                    t.Equals(
+                        trace.entries[index].serviceTick,
+                        expectedTicks[index],
+                        "masked GIF services should retain exact ticks");
+                }
+            }
+        });
+
+        tc.Run("event GIF cancel and restart reject the stale generation", [](TestCase &t)
+        {
+            PS2Runtime runtime;
+            t.IsTrue(
+                runtime.memory().initialize(),
+                "GIF restart fixture memory should initialize");
+            t.IsTrue(
+                runtime.syncCoreSubsystems(),
+                "GIF restart fixture subsystems should bind");
+            runtime.setEeSchedulingMode(
+                ps2x::timing::EeSchedulingMode::Event);
+
+            constexpr uint32_t kGifCtrl = 0x10003000u;
+            constexpr uint32_t kGif = 0x1000A000u;
+            constexpr uint32_t kDstat = 0x1000E010u;
+            constexpr uint32_t kFirstSource =
+                0x00034C00u;
+            constexpr uint32_t kSecondSource =
+                0x00035000u;
+            constexpr uint32_t kFirstQwc = 12u;
+            constexpr uint32_t kSecondQwc = 16u;
+            writeGifImagePacket(
+                runtime.memory().getRDRAM() +
+                    kFirstSource,
+                kFirstQwc, 0x61u);
+            writeGifImagePacket(
+                runtime.memory().getRDRAM() +
+                    kSecondSource,
+                kSecondQwc, 0x72u);
+
+            std::vector<std::vector<uint8_t>> captured;
+            runtime.gifArbiter().setProcessPacketFn(
+                [&](const uint8_t *data,
+                    uint32_t sizeBytes)
+                {
+                    captured.emplace_back(
+                        data, data + sizeBytes);
+                });
+
+            runtime.debugStartEeEventTrace(8u);
+            t.IsTrue(
+                runtime.memory().writeIORegister(
+                    kGif + 0x10u, kFirstSource),
+                "first GIF MADR should write");
+            t.IsTrue(
+                runtime.memory().writeIORegister(
+                    kGif + 0x20u, kFirstQwc),
+                "first GIF QWC should write");
+            t.IsTrue(
+                runtime.memory().writeIORegister(
+                    kGif, 0x100u),
+                "first GIF DMA should start");
+
+            PS2Runtime::DebugEeScheduler scheduler =
+                runtime.debugEeSchedulerSnapshot();
+            const auto first =
+                scheduler.slots[ps2x::timing::
+                    eeEventSourceIndex(
+                        ps2x::timing::EeEventSource::
+                            DmacGif)];
+            const GifDmaSnapshot firstDma =
+                runtime.memory().gifDmaSnapshot();
+            t.IsTrue(
+                first.pending,
+                "first GIF generation should be pending");
+            t.Equals(
+                first.deadlineTick, 64ull,
+                "first GIF generation should target tick 64");
+
+            R5900Context &context = runtime.cpu();
+            context.advanceEeCycleTicks(8u);
+            runtime.serviceEeEventsAtBlockBoundary(
+                runtime.memory().getRDRAM(), &context);
+            t.IsTrue(
+                runtime.memory().cancelDmacTransfer(
+                    DmacChannel::Gif),
+                "explicit cancellation should retire first GIF DMA");
+            t.IsTrue(
+                runtime.memory().writeIORegister(
+                    kGifCtrl, 1u),
+                "GIF reset should discard the partial first packet");
+
+            scheduler = runtime.debugEeSchedulerSnapshot();
+            t.IsFalse(
+                scheduler.slots[ps2x::timing::
+                    eeEventSourceIndex(
+                        ps2x::timing::EeEventSource::
+                            DmacGif)]
+                    .pending,
+                "cancellation should remove the first deadline");
+            t.IsTrue(
+                runtime.memory().writeIORegister(
+                    kGif + 0x10u, kSecondSource),
+                "replacement GIF MADR should write");
+            t.IsTrue(
+                runtime.memory().writeIORegister(
+                    kGif + 0x20u, kSecondQwc),
+                "replacement GIF QWC should write");
+            t.IsTrue(
+                runtime.memory().writeIORegister(
+                    kGif, 0x100u),
+                "replacement GIF DMA should start");
+
+            scheduler = runtime.debugEeSchedulerSnapshot();
+            const auto second =
+                scheduler.slots[ps2x::timing::
+                    eeEventSourceIndex(
+                        ps2x::timing::EeEventSource::
+                            DmacGif)];
+            const GifDmaSnapshot secondDma =
+                runtime.memory().gifDmaSnapshot();
+            t.IsTrue(
+                second.pending &&
+                    second.generation > first.generation,
+                "replacement should own a newer event generation");
+            t.IsTrue(
+                secondDma.transfer.generation >
+                    firstDma.transfer.generation,
+                "replacement should own a newer operation generation");
+            t.Equals(
+                second.deadlineTick, 136ull,
+                "replacement should schedule from committed tick 8");
+
+            context.advanceEeCycleTicks(56u);
+            runtime.serviceEeEventsAtBlockBoundary(
+                runtime.memory().getRDRAM(), &context);
+            GifDmaSnapshot dma =
+                runtime.memory().gifDmaSnapshot();
+            t.IsTrue(
+                dma.active &&
+                    dma.phase ==
+                        GifDmaPhase::TransferPayload &&
+                    dma.qwc == 8u,
+                "the stale tick-64 deadline must not advance replacement work");
+            t.IsTrue(
+                (runtime.memory().readIORegister(kDstat) &
+                 (1u << 2u)) == 0u,
+                "the stale generation must not publish D_STAT");
+            t.Equals(
+                runtime.debugEeEventTraceSnapshot(false)
+                    .entries.size(),
+                static_cast<size_t>(0u),
+                "the cancelled deadline must not dispatch");
+
+            context.advanceEeCycleTicks(72u);
+            runtime.serviceEeEventsAtBlockBoundary(
+                runtime.memory().getRDRAM(), &context);
+            dma = runtime.memory().gifDmaSnapshot();
+            t.IsTrue(
+                dma.active &&
+                    dma.phase == GifDmaPhase::Finalize,
+                "replacement should reach finalization at tick 136");
+            scheduler = runtime.debugEeSchedulerSnapshot();
+            t.Equals(
+                scheduler.slots[ps2x::timing::
+                    eeEventSourceIndex(
+                        ps2x::timing::EeEventSource::
+                            DmacGif)]
+                    .deadlineTick,
+                264ull,
+                "replacement should retain its finalization deadline");
+
+            context.advanceEeCycleTicks(128u);
+            runtime.serviceEeEventsAtBlockBoundary(
+                runtime.memory().getRDRAM(), &context);
+            t.IsFalse(
+                runtime.memory().gifDmaSnapshot().active,
+                "only the replacement should complete");
+            t.IsTrue(
+                (runtime.memory().readIORegister(kDstat) &
+                 (1u << 2u)) != 0u,
+                "only the replacement should publish D_STAT");
+            t.Equals(
+                captured.size(), static_cast<size_t>(1u),
+                "reset should discard the cancelled partial packet");
+
+            const PS2Runtime::DebugEeEventTrace trace =
+                runtime.debugEeEventTraceSnapshot(true);
+            t.Equals(
+                trace.entries.size(),
+                static_cast<size_t>(3u),
+                "only replacement services and publication should dispatch");
+            if (trace.entries.size() == 3u)
+            {
+                const std::array<uint64_t, 3u>
+                    expectedTicks = {
+                        136ull, 264ull, 264ull};
+                for (size_t index = 0u;
+                     index < trace.entries.size(); ++index)
+                {
+                    t.Equals(
+                        trace.entries[index].serviceTick,
+                        expectedTicks[index],
+                        "replacement services should retain exact ticks");
+                }
             }
         });
 

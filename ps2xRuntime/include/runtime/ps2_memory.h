@@ -391,6 +391,58 @@ struct DmacChannelSnapshot
     uint64_t generation = 0u;
 };
 
+enum class GifDmaPhase : uint8_t
+{
+    Idle = 0u,
+    FetchTag,
+    TransferPayload,
+    Finalize,
+    Fault,
+};
+
+enum class GifDmaStallReason : uint8_t
+{
+    None = 0u,
+    Path3Masked,
+    GifPaused,
+    DmacDisabled,
+    Fault,
+};
+
+struct GifDmaAdvanceResult
+{
+    DmacTransferToken transfer{};
+    GifDmaPhase phase = GifDmaPhase::Idle;
+    GifDmaStallReason stall = GifDmaStallReason::None;
+    uint32_t delayEeCycles = 0u;
+    uint32_t transferredQwc = 0u;
+    bool progressed = false;
+    bool completed = false;
+    bool active = false;
+};
+
+struct GifDmaSnapshot
+{
+    DmacTransferToken transfer{};
+    GifDmaPhase phase = GifDmaPhase::Idle;
+    GifDmaStallReason stall = GifDmaStallReason::None;
+    uint32_t chcr = 0u;
+    uint32_t madr = 0u;
+    uint32_t qwc = 0u;
+    uint32_t tadr = 0u;
+    uint32_t asr0 = 0u;
+    uint32_t asr1 = 0u;
+    uint32_t fifoQwc = 0u;
+    uint32_t tagsProcessed = 0u;
+    uint8_t asp = 0u;
+    uint8_t tagId = 0u;
+    bool active = false;
+    bool eventManaged = false;
+    bool chainMode = false;
+    bool tagIrq = false;
+    bool endAfterPayload = false;
+};
+
 enum class Vif0DmaPhase : uint8_t
 {
     Idle = 0u,
@@ -679,6 +731,19 @@ public:
         m_scratchpadDmaCancelCallback =
             std::move(cb);
     }
+    using GifDmaScheduleCallback =
+        std::function<bool(uint32_t delayEeCycles)>;
+    void setGifDmaScheduleCallback(
+        GifDmaScheduleCallback cb)
+    {
+        m_gifDmaScheduleCallback = std::move(cb);
+    }
+    using GifDmaCancelCallback = std::function<void()>;
+    void setGifDmaCancelCallback(
+        GifDmaCancelCallback cb)
+    {
+        m_gifDmaCancelCallback = std::move(cb);
+    }
     using Vif1GifPathAvailableCallback =
         std::function<bool(bool directHl)>;
     void setVif1GifPathAvailableCallback(
@@ -702,6 +767,9 @@ public:
     bool wakeVif1Dma();
     Vif1DmaAdvanceResult advanceVif1Dma();
     [[nodiscard]] Vif1DmaSnapshot vif1DmaSnapshot() const;
+    bool wakeGifDma(uint32_t delayEeCycles);
+    GifDmaAdvanceResult advanceGifDma();
+    [[nodiscard]] GifDmaSnapshot gifDmaSnapshot() const;
     ScratchpadDmaAdvanceResult advanceScratchpadDma(
         DmacChannel channel);
     [[nodiscard]] ScratchpadDmaSnapshot
@@ -716,7 +784,11 @@ public:
     uint8_t *getVU0Data() { return m_vu0Data; }
     const uint8_t *getVU0Data() const { return m_vu0Data; }
 
-    bool isPath3Masked() const { return m_path3Masked; }
+    bool isPath3Masked() const
+    {
+        return m_path3Masked ||
+               m_gifModePath3Masked;
+    }
     void flushMaskedPath3Packets(bool drainImmediately = true);
 
     void submitGifPacket(GifPathId pathId, const uint8_t *data, uint32_t sizeBytes, bool drainImmediately = true, bool path2DirectHl = false);
@@ -834,6 +906,8 @@ public:
         m_scratchpadDmaScheduleCallback;
     ScratchpadDmaCancelCallback
         m_scratchpadDmaCancelCallback;
+    GifDmaScheduleCallback m_gifDmaScheduleCallback;
+    GifDmaCancelCallback m_gifDmaCancelCallback;
     Vif1GifPathAvailableCallback
         m_vif1GifPathAvailableCallback;
 
@@ -841,7 +915,10 @@ public:
     uint8_t *m_vu0Data = nullptr;
     uint8_t *m_vu1Code = nullptr;
     uint8_t *m_vu1Data = nullptr;
+    // PATH3 has two independent masks: VIF1 MSKPATH3 publishes M3P while
+    // GIF_MODE publishes M3R.
     bool m_path3Masked = false;
+    bool m_gifModePath3Masked = false;
     bool m_vif0WaitingForVu = false;
     std::vector<uint8_t> m_vif0DeferredData;
     uint32_t m_vif1PendingPath2DirectQwc = 0u;
@@ -850,16 +927,6 @@ public:
     bool m_vif1WaitingForVu = false;
     std::vector<uint8_t> m_vif1DeferredData;
     std::vector<std::vector<uint8_t>> m_path3MaskedFifo;
-
-    struct PendingTransfer
-    {
-        DmacTransferToken transfer{};
-        bool fromScratchpad = false;
-        uint32_t srcAddr = 0;
-        uint32_t qwc = 0;
-        std::vector<uint8_t> chainData;
-    };
-    std::vector<PendingTransfer> m_pendingGifTransfers;
 
     struct DmacSourceChainKey
     {
@@ -952,6 +1019,41 @@ public:
     };
     Vif1DmaState m_vif1Dma{};
 
+    struct GifDmaState
+    {
+        DmacTransferToken transfer{};
+        GifDmaPhase phase = GifDmaPhase::Idle;
+        GifDmaStallReason stall =
+            GifDmaStallReason::None;
+        uint32_t chcr = 0u;
+        uint32_t madr = 0u;
+        uint32_t qwc = 0u;
+        uint32_t tadr = 0u;
+        uint32_t asr0 = 0u;
+        uint32_t asr1 = 0u;
+        uint32_t tagsProcessed = 0u;
+        uint8_t asp = 0u;
+        uint8_t tagId = 0u;
+        bool active = false;
+        bool eventManaged = false;
+        bool chainMode = false;
+        bool tie = false;
+        bool tagIrq = false;
+        bool endAfterPayload = false;
+        bool faultReported = false;
+        bool copyCounted = false;
+        std::vector<uint8_t> fifoData;
+        // A raw callback has no path-stream reassembler. Retain the complete
+        // DMA stream so compatibility users observe the historical one-call
+        // packet while the runtime arbiter still receives timed slices.
+        std::vector<uint8_t> directCallbackData;
+        std::unordered_set<
+            DmacSourceChainKey,
+            DmacSourceChainKeyHash>
+            visitedStates;
+    };
+    GifDmaState m_gifDma{};
+
     struct ScratchpadDmaState
     {
         DmacTransferToken transfer{};
@@ -1033,6 +1135,18 @@ public:
     scratchpadDmaIndex(DmacChannel channel) noexcept;
     void publishScratchpadDmaRegisters(
         const ScratchpadDmaState &state);
+    bool startGifDma(
+        DmacTransferToken transfer, uint32_t chcr);
+    bool scheduleGifDma(uint32_t delayEeCycles);
+    void clearGifDmaState(bool notifyRuntime);
+    void drainGifDmaCompatibility();
+    void publishGifDmaRegisters();
+    void updateGifStat();
+    [[nodiscard]] bool isGifPaused() const;
+    bool copyGifDmaPayload(
+        uint32_t sourceAddress,
+        uint32_t qwc,
+        bool toFifo);
     void discardPendingDmacWork(DmacChannel channel);
     bool startVif0Dma(
         DmacTransferToken transfer, uint32_t chcr);

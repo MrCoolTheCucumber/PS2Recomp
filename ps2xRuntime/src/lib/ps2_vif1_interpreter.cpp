@@ -636,10 +636,14 @@ PS2Memory::processVif1Stream()
         else if (opcode == VIF_MSKPATH3)
         {
             // VIF command docs: MSKPATH3 uses IMMEDIATE bit 15.
-            const bool wasMasked = m_path3Masked;
+            const bool wasMasked = isPath3Masked();
             m_path3Masked = (imm & 0x8000u) != 0u;
-            if (wasMasked && !m_path3Masked)
+            updateGifStat();
+            if (wasMasked && !isPath3Masked())
+            {
                 flushMaskedPath3Packets();
+                (void)wakeGifDma(0u);
+            }
             continue;
         }
         else if (opcode == VIF_MARK)

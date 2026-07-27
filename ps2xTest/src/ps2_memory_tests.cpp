@@ -1162,6 +1162,293 @@ void register_ps2_memory_tests()
             t.Equals(mem.readIORegister(kGifCh + 0x20u), 0u, "GIF QWC should be cleared after drain");
         });
 
+        tc.Run("GIF DMA scheduled normal mode retains PCSX2 slice boundaries", [](TestCase &t)
+        {
+            PS2Memory mem;
+            t.IsTrue(mem.initialize(),
+                     "PS2Memory initialize should succeed");
+
+            constexpr uint32_t kGifCh = 0x1000A000u;
+            constexpr uint32_t kDstat = 0x1000E010u;
+            constexpr uint32_t kSource = 0x00022400u;
+            constexpr uint32_t kQwc = 12u;
+            std::memset(mem.getRDRAM() + kSource,
+                        0x31, kQwc * 16u);
+
+            std::vector<uint32_t> scheduledDelays;
+            mem.setGifDmaScheduleCallback(
+                [&](uint32_t delayEeCycles)
+                {
+                    scheduledDelays.push_back(
+                        delayEeCycles);
+                    return true;
+                });
+            std::vector<std::vector<uint8_t>> captured;
+            mem.setGifPacketCallback(
+                [&](const uint8_t *data,
+                    uint32_t sizeBytes)
+                {
+                    captured.emplace_back(
+                        data, data + sizeBytes);
+                });
+
+            t.IsTrue(mem.writeIORegister(
+                         kGifCh + 0x10u, kSource),
+                     "GIF MADR write should succeed");
+            t.IsTrue(mem.writeIORegister(
+                         kGifCh + 0x20u, kQwc),
+                     "GIF QWC write should succeed");
+            t.IsTrue(mem.writeIORegister(
+                         kGifCh, 0x100u),
+                     "GIF normal transfer should start");
+
+            GifDmaSnapshot state =
+                mem.gifDmaSnapshot();
+            t.Equals(scheduledDelays.size(),
+                     static_cast<size_t>(1u),
+                     "submission should publish one deadline");
+            if (!scheduledDelays.empty())
+            {
+                t.Equals(scheduledDelays[0], 8u,
+                         "initial four QW should cost eight cycles");
+            }
+            t.IsTrue(state.active &&
+                         state.eventManaged,
+                     "normal transfer should retain event ownership");
+            t.IsTrue(state.phase ==
+                         GifDmaPhase::TransferPayload,
+                     "eight QW should remain after the initial slice");
+            t.Equals(state.qwc, 8u,
+                     "initial slice should retain eight QW");
+            t.Equals(state.madr, kSource + 4u * 16u,
+                     "initial slice should advance MADR by four QW");
+
+            const GifDmaAdvanceResult payload =
+                mem.advanceGifDma();
+            t.IsTrue(payload.progressed &&
+                         payload.active &&
+                         !payload.completed,
+                     "first service should consume the remaining payload");
+            t.Equals(payload.transferredQwc, 8u,
+                     "first service should accept eight QW");
+            t.Equals(payload.delayEeCycles, 16u,
+                     "remaining eight QW should cost sixteen cycles");
+            state = mem.gifDmaSnapshot();
+            t.IsTrue(state.phase ==
+                         GifDmaPhase::Finalize,
+                     "payload service should retain a completion boundary");
+            t.IsTrue(
+                (mem.readIORegister(kGifCh) & 0x100u) != 0u,
+                "STR must remain visible before final service");
+            t.IsTrue(
+                (mem.readIORegister(kDstat) & (1u << 2u)) == 0u,
+                "D_STAT must remain clear before final service");
+
+            const GifDmaAdvanceResult completion =
+                mem.advanceGifDma();
+            t.IsTrue(completion.completed &&
+                         !completion.active,
+                     "second service should request completion");
+            publishDmacCompletions(mem);
+            t.IsTrue(
+                (mem.readIORegister(kGifCh) & 0x100u) == 0u,
+                "typed publication should clear STR");
+            t.IsTrue(
+                (mem.readIORegister(kDstat) & (1u << 2u)) != 0u,
+                "typed publication should latch GIF D_STAT");
+            t.Equals(captured.size(),
+                     static_cast<size_t>(1u),
+                     "compatibility callback should receive one DMA stream");
+            if (!captured.empty())
+            {
+                t.Equals(captured[0].size(),
+                         static_cast<size_t>(kQwc * 16u),
+                         "callback should receive all twelve QW");
+            }
+        });
+
+        tc.Run("GIF DMA scheduled END chain combines tag and initial slice cost", [](TestCase &t)
+        {
+            PS2Memory mem;
+            t.IsTrue(mem.initialize(),
+                     "PS2Memory initialize should succeed");
+
+            constexpr uint32_t kGifCh = 0x1000A000u;
+            constexpr uint32_t kTag = 0x00022800u;
+            constexpr uint32_t kQwc = 12u;
+            const uint64_t endTag =
+                makeDmaTag(kQwc, 7u, 0u, false);
+            std::memcpy(mem.getRDRAM() + kTag,
+                        &endTag, sizeof(endTag));
+            std::memset(mem.getRDRAM() + kTag + 16u,
+                        0x42, kQwc * 16u);
+
+            std::vector<uint32_t> scheduledDelays;
+            mem.setGifDmaScheduleCallback(
+                [&](uint32_t delayEeCycles)
+                {
+                    scheduledDelays.push_back(
+                        delayEeCycles);
+                    return true;
+                });
+            std::vector<std::vector<uint8_t>> captured;
+            mem.setGifPacketCallback(
+                [&](const uint8_t *data,
+                    uint32_t sizeBytes)
+                {
+                    captured.emplace_back(
+                        data, data + sizeBytes);
+                });
+
+            t.IsTrue(mem.writeIORegister(
+                         kGifCh + 0x30u, kTag),
+                     "GIF TADR write should succeed");
+            t.IsTrue(mem.writeIORegister(
+                         kGifCh, 0x104u),
+                     "GIF END chain should start");
+
+            GifDmaSnapshot state =
+                mem.gifDmaSnapshot();
+            t.Equals(scheduledDelays.size(),
+                     static_cast<size_t>(1u),
+                     "chain submission should publish one deadline");
+            if (!scheduledDelays.empty())
+            {
+                t.Equals(scheduledDelays[0], 10u,
+                         "tag plus four QW should cost ten cycles");
+            }
+            t.Equals(state.tagsProcessed, 1u,
+                     "initial progress should consume the END tag");
+            t.Equals(state.qwc, 8u,
+                     "initial progress should retain eight QW");
+            t.Equals(state.madr,
+                     kTag + 16u + 4u * 16u,
+                     "initial progress should expose payload MADR");
+            t.Equals(state.tadr, kTag,
+                     "END should retain its tag address in TADR");
+
+            const GifDmaAdvanceResult payload =
+                mem.advanceGifDma();
+            t.Equals(payload.delayEeCycles, 16u,
+                     "remaining chain payload should cost sixteen cycles");
+            t.IsTrue(
+                mem.advanceGifDma().completed,
+                "the following service should complete the chain");
+            publishDmacCompletions(mem);
+
+            t.Equals(mem.readIORegister(kGifCh),
+                     0x70000004u,
+                     "completion should retain END tag and chain-mode bits while clearing STR");
+            t.Equals(mem.readIORegister(kGifCh + 0x10u),
+                     kTag + 16u + kQwc * 16u,
+                     "completion should retain final MADR");
+            t.Equals(mem.readIORegister(kGifCh + 0x20u),
+                     0u,
+                     "completion should retain QWC zero");
+            t.Equals(mem.readIORegister(kGifCh + 0x30u),
+                     kTag,
+                     "completion should retain END TADR");
+            t.Equals(captured.size(),
+                     static_cast<size_t>(1u),
+                     "chain should emit one contiguous stream");
+        });
+
+        tc.Run("GIF MODE unmask owns the full FIFO wakeup", [](TestCase &t)
+        {
+            PS2Memory mem;
+            t.IsTrue(mem.initialize(),
+                     "PS2Memory initialize should succeed");
+
+            constexpr uint32_t kGifMode = 0x10003010u;
+            constexpr uint32_t kGifStat = 0x10003020u;
+            constexpr uint32_t kGifCh = 0x1000A000u;
+            constexpr uint32_t kSource = 0x00022C00u;
+            constexpr uint32_t kQwc = 16u;
+            std::memset(mem.getRDRAM() + kSource,
+                        0x53, kQwc * 16u);
+
+            std::vector<uint32_t> scheduledDelays;
+            mem.setGifDmaScheduleCallback(
+                [&](uint32_t delayEeCycles)
+                {
+                    scheduledDelays.push_back(
+                        delayEeCycles);
+                    return true;
+                });
+            std::vector<std::vector<uint8_t>> captured;
+            mem.setGifPacketCallback(
+                [&](const uint8_t *data,
+                    uint32_t sizeBytes)
+                {
+                    captured.emplace_back(
+                        data, data + sizeBytes);
+                });
+
+            t.IsTrue(mem.writeIORegister(kGifMode, 1u),
+                     "M3R should mask PATH3");
+            t.IsTrue(mem.writeIORegister(
+                         kGifCh + 0x10u, kSource),
+                     "GIF MADR write should succeed");
+            t.IsTrue(mem.writeIORegister(
+                         kGifCh + 0x20u, kQwc),
+                     "GIF QWC write should succeed");
+            t.IsTrue(mem.writeIORegister(
+                         kGifCh, 0x100u),
+                     "masked GIF transfer should start");
+
+            GifDmaSnapshot state =
+                mem.gifDmaSnapshot();
+            t.IsTrue(scheduledDelays.empty(),
+                     "a full masked FIFO must have no deadline");
+            t.IsTrue(state.active &&
+                         state.stall ==
+                             GifDmaStallReason::
+                                 Path3Masked,
+                     "masked transfer should retain its stall");
+            t.Equals(state.fifoQwc, 16u,
+                     "masked transfer should fill all sixteen FIFO QW");
+            t.Equals(state.qwc, 0u,
+                     "FIFO fill should consume channel QWC");
+            t.Equals(mem.readIORegister(kGifStat),
+                     0x10000001u,
+                     "GIF_STAT should expose FQC=16 and M3R");
+            t.IsTrue(
+                (mem.readIORegister(kGifCh) & 0x100u) != 0u,
+                "masked FIFO should retain STR");
+
+            t.IsTrue(mem.writeIORegister(kGifMode, 0u),
+                     "clearing M3R should succeed");
+            t.Equals(scheduledDelays.size(),
+                     static_cast<size_t>(1u),
+                     "unmask should publish one wakeup");
+            if (!scheduledDelays.empty())
+            {
+                t.Equals(scheduledDelays[0], 8u,
+                         "M3R removal should own the +8 wake");
+            }
+
+            const GifDmaAdvanceResult drain =
+                mem.advanceGifDma();
+            t.IsTrue(drain.progressed &&
+                         drain.active,
+                     "wake service should drain the FIFO");
+            t.Equals(drain.transferredQwc, 16u,
+                     "wake service should drain sixteen QW");
+            t.Equals(drain.delayEeCycles, 32u,
+                     "sixteen FIFO QW should cost thirty-two cycles");
+            t.Equals(mem.readIORegister(kGifStat), 0u,
+                     "FIFO drain should clear FQC and M3R");
+            t.IsTrue(
+                mem.advanceGifDma().completed,
+                "the following service should request completion");
+            publishDmacCompletions(mem);
+            t.Equals(mem.readIORegister(kGifCh), 0u,
+                     "completion should clear channel STR");
+            t.Equals(captured.size(),
+                     static_cast<size_t>(1u),
+                     "FIFO contents should emit as one stream");
+        });
+
         tc.Run("SPR_TO scheduled progress limits payload slices to 0x400 QWC", [](TestCase &t)
         {
             PS2Memory mem;

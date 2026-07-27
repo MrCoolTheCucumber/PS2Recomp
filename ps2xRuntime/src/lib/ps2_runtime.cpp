@@ -931,6 +931,17 @@ PS2Runtime::PS2Runtime()
         {
             cancelScratchpadDmaEvent(channel);
         });
+    m_memory.setGifDmaScheduleCallback(
+        [this](uint32_t delayEeCycles)
+        {
+            return scheduleGifDmaFromMemory(
+                delayEeCycles);
+        });
+    m_memory.setGifDmaCancelCallback(
+        [this]()
+        {
+            cancelGifDmaEvent();
+        });
 
     m_iopHost = std::make_unique<PS2IopHostAdapter>(*this);
     m_iopSubsystem = std::make_unique<ps2x::iop::IopSubsystem>(*m_iopHost);
@@ -1589,6 +1600,12 @@ void PS2Runtime::resetEeTimingUnlocked(
         (void)m_memory.cancelDmacTransfer(
             DmacChannel::Vif1);
     }
+    cancelGifDmaEvent();
+    if (m_memory.gifDmaSnapshot().active)
+    {
+        (void)m_memory.cancelDmacTransfer(
+            DmacChannel::Gif);
+    }
     for (const DmacChannel channel :
          {DmacChannel::FromScratchpad,
           DmacChannel::ToScratchpad})
@@ -1671,6 +1688,12 @@ void PS2Runtime::setEeSchedulingMode(
     {
         (void)m_memory.cancelDmacTransfer(
             DmacChannel::Vif1);
+    }
+    cancelGifDmaEvent();
+    if (m_memory.gifDmaSnapshot().active)
+    {
+        (void)m_memory.cancelDmacTransfer(
+            DmacChannel::Gif);
     }
     for (const DmacChannel channel :
          {DmacChannel::FromScratchpad,
@@ -2352,6 +2375,77 @@ void PS2Runtime::serviceVif1DmaAtEvent(
             service.serviceTick,
             ps2x::timing::eeCyclesToTicks(
                 advance.delayEeCycles)));
+}
+
+bool PS2Runtime::scheduleGifDmaFromMemory(
+    uint32_t delayEeCycles)
+{
+    if (m_eeSchedulingMode !=
+        ps2x::timing::EeSchedulingMode::Event)
+    {
+        return false;
+    }
+
+    const ps2x::timing::EeTick now =
+        commitEeContextProgress(m_boundEeContext);
+    scheduleGifDmaEvent(
+        ps2x::timing::saturatingAdd(
+            now,
+            ps2x::timing::eeCyclesToTicks(
+                delayEeCycles)));
+    return m_gifDmaEventToken.generation != 0u;
+}
+
+void PS2Runtime::scheduleGifDmaEvent(
+    ps2x::timing::EeTick deadline) noexcept
+{
+    m_gifDmaEventToken =
+        m_eeEventScheduler.scheduleAbsolute(
+            ps2x::timing::EeEventSource::DmacGif,
+            deadline);
+}
+
+void PS2Runtime::cancelGifDmaEvent() noexcept
+{
+    if (m_gifDmaEventToken.generation != 0u)
+    {
+        (void)m_eeEventScheduler.cancel(
+            m_gifDmaEventToken);
+    }
+    m_gifDmaEventToken = {
+        ps2x::timing::EeEventSource::DmacGif,
+        0u};
+}
+
+void PS2Runtime::serviceGifDmaAtEvent(
+    const ps2x::timing::EeEventService &service)
+{
+    if (m_gifDmaEventToken.generation == 0u ||
+        service.generation !=
+            m_gifDmaEventToken.generation)
+    {
+        return;
+    }
+
+    m_gifDmaEventToken = {
+        ps2x::timing::EeEventSource::DmacGif,
+        0u};
+    const GifDmaAdvanceResult advance =
+        m_memory.advanceGifDma();
+    if (!advance.active || advance.completed)
+        return;
+
+    if (advance.stall ==
+            GifDmaStallReason::None ||
+        advance.stall ==
+            GifDmaStallReason::GifPaused)
+    {
+        scheduleGifDmaEvent(
+            ps2x::timing::saturatingAdd(
+                service.serviceTick,
+                ps2x::timing::eeCyclesToTicks(
+                    advance.delayEeCycles)));
+    }
 }
 
 ps2x::timing::EeEventSource
@@ -3943,6 +4037,9 @@ void PS2Runtime::dispatchEeEvent(
     case ps2x::timing::EeEventSource::DmacVif1:
         serviceVif1DmaAtEvent(service);
         return;
+    case ps2x::timing::EeEventSource::DmacGif:
+        serviceGifDmaAtEvent(service);
+        return;
     case ps2x::timing::EeEventSource::DmacVif0:
         serviceVif0DmaAtEvent(service);
         return;
@@ -4084,6 +4181,24 @@ PS2Runtime::debugEeEventDeviceState(
         const Vif1DmaSnapshot state =
             m_memory.vif1DmaSnapshot();
         result.kind = DebugEeEventDeviceKind::Vif1Dma;
+        result.operationGeneration =
+            state.transfer.generation;
+        result.phase =
+            static_cast<uint32_t>(state.phase);
+        result.stall =
+            static_cast<uint32_t>(state.stall);
+        result.tadr = state.tadr;
+        result.madr = state.madr;
+        result.qwc = state.qwc;
+        result.tagsProcessed = state.tagsProcessed;
+        result.active = state.active;
+        return result;
+    }
+    case ps2x::timing::EeEventSource::DmacGif:
+    {
+        const GifDmaSnapshot state =
+            m_memory.gifDmaSnapshot();
+        result.kind = DebugEeEventDeviceKind::GifDma;
         result.operationGeneration =
             state.transfer.generation;
         result.phase =
@@ -6661,16 +6776,26 @@ void PS2Runtime::kickGifDmaChainFromMMIO(uint8_t *rdram,
     ps2TraceGuestWrite(rdram, GIF_TADR, 4u, tadr, 0u, "WRITE32", ctx);
     m_memory.writeIORegister(GIF_TADR, tadr);
     ps2TraceGuestWrite(rdram, GIF_CHCR, 4u, chcr, 0u, "WRITE32", ctx);
-    if (m_memory.tryProcessNativeGifImageUploadChain(m_gs, tadr, chcr))
+    if (m_eeSchedulingMode !=
+        ps2x::timing::EeSchedulingMode::Event)
     {
-        return;
-    }
-    if (m_memory.tryProcessNativeGifPackedChain(m_gs, tadr, chcr))
-    {
-        return;
+        if (m_memory.tryProcessNativeGifImageUploadChain(
+                m_gs, tadr, chcr))
+        {
+            return;
+        }
+        if (m_memory.tryProcessNativeGifPackedChain(
+                m_gs, tadr, chcr))
+        {
+            return;
+        }
     }
     m_memory.writeIORegister(GIF_CHCR, chcr);
-    m_memory.processPendingTransfers();
+    if (m_eeSchedulingMode !=
+        ps2x::timing::EeSchedulingMode::Event)
+    {
+        m_memory.processPendingTransfers();
+    }
 }
 
 void PS2Runtime::requestStop()
