@@ -158,6 +158,11 @@ allocation counts must remain zero. The median
 secondary end-to-end metric because it also measures game logic, graphics,
 and interpreted VU throughput.
 
+Use `--vu-workload fmac` to run the same equal-work comparison with an FMAC
+instruction issued every pair. The JSON output identifies the workload and
+reports guest pairs per host second so interpreter pipeline changes can be
+measured independently of presentation rate.
+
 ## Adding a source
 
 Before adding another timed source:

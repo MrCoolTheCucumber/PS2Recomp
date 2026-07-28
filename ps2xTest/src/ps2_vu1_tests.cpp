@@ -290,6 +290,161 @@ void register_ps2_vu1_tests()
                      "STATUS should expose sign and retain prior sticky zero/sign flags");
         });
 
+        tc.Run("FMAC flags preserve consecutive partial results across pipeline wraparound", [](TestCase &t)
+        {
+            Vu1Fixture fx;
+            t.IsTrue(fx.initialize(), "VU1 fixture should initialize");
+
+            constexpr std::array<uint8_t, 8> destinations{
+                0x8u, 0x4u, 0x2u, 0x1u,
+                0x8u, 0x4u, 0x2u, 0x1u,
+            };
+            for (uint32_t pair = 0u; pair < destinations.size(); ++pair)
+            {
+                writeVuInstructionPair(
+                    fx.code, pair * 8u, 0u,
+                    makeVuUpper(
+                        0x28u, destinations[pair], 2u, 1u, 3u));
+            }
+            for (uint32_t pair = 8u; pair < 12u; ++pair)
+                writeVuInstructionPair(
+                    fx.code, pair * 8u, 0u, kVuUpperNop);
+
+            const auto initializeState = [](VU1Interpreter &interpreter)
+            {
+                const float source[4] = {-1.0f, 0.0f, -1.0f, 0.0f};
+                std::memcpy(
+                    interpreter.state().vf[1], source, sizeof(source));
+                interpreter.state().mac = 0x55AAu;
+                interpreter.state().status = 0u;
+            };
+
+            VU1Interpreter stepped;
+            VU1Interpreter batched;
+            initializeState(stepped);
+            initializeState(batched);
+
+            constexpr std::array<uint32_t, 8> expectedMac{
+                0x0080u, 0x0004u, 0x0020u, 0x0001u,
+                0x0080u, 0x0004u, 0x0020u, 0x0001u,
+            };
+            constexpr std::array<uint32_t, 8> expectedStatus{
+                0x0082u, 0x00C1u, 0x00C2u, 0x00C1u,
+                0x00C2u, 0x00C1u, 0x00C2u, 0x00C1u,
+            };
+
+            stepped.execute(
+                fx.code, PS2_VU1_CODE_SIZE,
+                fx.data, PS2_VU1_DATA_SIZE,
+                fx.gs, &fx.mem, 0u, 0u, 0u, 1u);
+            for (uint32_t pair = 1u; pair < 12u; ++pair)
+            {
+                stepped.continueExecution(
+                    fx.code, PS2_VU1_CODE_SIZE,
+                    fx.data, PS2_VU1_DATA_SIZE,
+                    fx.gs, &fx.mem, 1u);
+                if (pair < 4u)
+                {
+                    t.Equals(
+                        stepped.state().mac, 0x55AAu,
+                        "no consecutive FMAC result should mature early");
+                    t.Equals(
+                        stepped.state().status, 0u,
+                        "no consecutive FMAC STATUS should mature early");
+                }
+                else
+                {
+                    const uint32_t result = pair - 4u;
+                    t.Equals(
+                        stepped.state().mac, expectedMac[result],
+                        "partial-destination MAC flags should mature in issue order");
+                    t.Equals(
+                        stepped.state().status, expectedStatus[result],
+                        "partial-destination STATUS flags should retain sticky summaries");
+                }
+            }
+
+            batched.execute(
+                fx.code, PS2_VU1_CODE_SIZE,
+                fx.data, PS2_VU1_DATA_SIZE,
+                fx.gs, &fx.mem, 0u, 0u, 0u, 12u);
+            t.Equals(
+                stepped.state().pc, batched.state().pc,
+                "split and batched wraparound execution should stop at the same PC");
+            t.Equals(
+                stepped.state().mac, batched.state().mac,
+                "split and batched wraparound execution should retain the same MAC flags");
+            t.Equals(
+                stepped.state().status, batched.state().status,
+                "split and batched wraparound execution should retain the same STATUS flags");
+        });
+
+        tc.Run("FMAC reset discards pending flags", [](TestCase &t)
+        {
+            Vu1Fixture fx;
+            t.IsTrue(fx.initialize(), "VU1 fixture should initialize");
+
+            writeVuInstructionPair(
+                fx.code, 0u, 0u,
+                makeVuUpper(0x28u, 0x8u, 2u, 1u, 3u));
+            for (uint32_t pc = 8u; pc <= 48u; pc += 8u)
+                writeVuInstructionPair(
+                    fx.code, pc, 0u, kVuUpperNop);
+
+            VU1Interpreter vu1;
+            vu1.state().vf[1][0] = -1.0f;
+            vu1.execute(
+                fx.code, PS2_VU1_CODE_SIZE,
+                fx.data, PS2_VU1_DATA_SIZE,
+                fx.gs, &fx.mem, 0u, 0u, 0u, 1u);
+
+            vu1.reset();
+            vu1.state().mac = 0x1234u;
+            vu1.state().status = 0x05A0u;
+            vu1.execute(
+                fx.code, PS2_VU1_CODE_SIZE,
+                fx.data, PS2_VU1_DATA_SIZE,
+                fx.gs, &fx.mem, 8u, 0u, 0u, 5u);
+            t.Equals(
+                vu1.state().mac, 0x1234u,
+                "reset should prevent an old pending MAC result from becoming visible");
+            t.Equals(
+                vu1.state().status, 0x05A0u,
+                "reset should prevent an old pending STATUS result from becoming visible");
+        });
+
+        tc.Run("E-bit completion flushes pending FMAC flags in issue order", [](TestCase &t)
+        {
+            Vu1Fixture fx;
+            t.IsTrue(fx.initialize(), "VU1 fixture should initialize");
+
+            writeVuInstructionPair(
+                fx.code, 0u, 0u,
+                makeVuUpper(0x28u, 0x8u, 2u, 1u, 3u) |
+                    kVuUpperEnd);
+            writeVuInstructionPair(
+                fx.code, 8u, 0u,
+                makeVuUpper(0x28u, 0x4u, 2u, 1u, 3u));
+
+            VU1Interpreter vu1;
+            const float source[4] = {-1.0f, 0.0f, 1.0f, 1.0f};
+            std::memcpy(vu1.state().vf[1], source, sizeof(source));
+            vu1.execute(
+                fx.code, PS2_VU1_CODE_SIZE,
+                fx.data, PS2_VU1_DATA_SIZE,
+                fx.gs, &fx.mem, 0u, 0u, 0u, 8u);
+
+            t.IsFalse(
+                vu1.isActive(),
+                "the E-bit delay pair should complete the microprogram");
+            t.Equals(
+                vu1.state().mac, 0x0004u,
+                "the newest pending partial result should be architectural after flush");
+            t.Equals(
+                vu1.state().status, 0x00C1u,
+                "flush should commit older and newer sticky STATUS results in order");
+        });
+
         tc.Run("VU FMAC truncates toward zero and restores the host rounding mode", [](TestCase &t)
         {
             Vu1Fixture fx;

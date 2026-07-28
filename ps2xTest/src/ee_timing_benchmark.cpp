@@ -17,7 +17,7 @@
 
 namespace
 {
-    constexpr uint32_t kOutputSchemaVersion = 3u;
+    constexpr uint32_t kOutputSchemaVersion = 4u;
 
     std::atomic<bool> g_trackAllocations{false};
     std::atomic<uint64_t> g_allocationCount{0u};
@@ -205,6 +205,15 @@ void operator delete[](
 namespace
 {
     constexpr uint32_t kVuUpperNop = 0x0000003Fu;
+    constexpr uint32_t kVuUpperAdd =
+        (0xFu << 21u) | (2u << 16u) | (1u << 11u) |
+        (3u << 6u) | 0x28u;
+
+    enum class VuWorkload
+    {
+        Nop,
+        Fmac,
+    };
 
     struct Configuration
     {
@@ -212,6 +221,7 @@ namespace
         uint64_t warmupBlocks = 20'000u;
         uint32_t blockTicks = 64u;
         uint32_t samples = 5u;
+        VuWorkload vuWorkload = VuWorkload::Nop;
     };
 
     struct Measurement
@@ -228,7 +238,20 @@ namespace
         uint64_t allocatedBytes = 0u;
         uint64_t stateHash = 0u;
         uint32_t vuPc = 0u;
+        VuWorkload vuWorkload = VuWorkload::Nop;
     };
+
+    std::string_view vuWorkloadName(VuWorkload workload)
+    {
+        switch (workload)
+        {
+        case VuWorkload::Nop:
+            return "nop";
+        case VuWorkload::Fmac:
+            return "fmac";
+        }
+        return "unknown";
+    }
 
     bool parseUnsigned(std::string_view text, uint64_t &value)
     {
@@ -248,8 +271,20 @@ namespace
                 return false;
 
             const std::string_view option = argv[index];
+            const std::string_view argument = argv[index + 1];
+            if (option == "--vu-workload")
+            {
+                if (argument == "nop")
+                    configuration.vuWorkload = VuWorkload::Nop;
+                else if (argument == "fmac")
+                    configuration.vuWorkload = VuWorkload::Fmac;
+                else
+                    return false;
+                continue;
+            }
+
             uint64_t value = 0u;
-            if (!parseUnsigned(argv[index + 1], value))
+            if (!parseUnsigned(argument, value))
                 return false;
 
             if (option == "--blocks")
@@ -306,7 +341,8 @@ namespace
         std::memcpy(code + pc + sizeof(lower), &upper, sizeof(upper));
     }
 
-    bool initializeFixture(PS2Runtime &runtime)
+    bool initializeFixture(
+        PS2Runtime &runtime, VuWorkload workload)
     {
         if (!runtime.memory().initialize() ||
             !runtime.syncCoreSubsystems())
@@ -321,8 +357,12 @@ namespace
 
         std::memset(code, 0, PS2_VU0_CODE_SIZE);
         std::memset(data, 0, PS2_VU0_DATA_SIZE);
+        const uint32_t upper =
+            workload == VuWorkload::Fmac
+                ? kVuUpperAdd
+                : kVuUpperNop;
         for (uint32_t pc = 0u; pc < PS2_VU0_CODE_SIZE; pc += 8u)
-            writeInstructionPair(code, pc, 0u, kVuUpperNop);
+            writeInstructionPair(code, pc, 0u, upper);
         return true;
     }
 
@@ -389,8 +429,28 @@ namespace
         return static_cast<uint32_t>(budget);
     }
 
-    void startDirectVu(PS2Runtime &runtime)
+    void configureVuWorkloadState(
+        PS2Runtime &runtime, VuWorkload workload)
     {
+        if (workload != VuWorkload::Fmac)
+            return;
+
+        const float source1[4] = {
+            -1.0f, 2.0f, -3.0f, 4.0f};
+        const float source2[4] = {
+            0.5f, -2.0f, 3.0f, -4.0f};
+        std::memcpy(
+            runtime.vu0().state().vf[1],
+            source1, sizeof(source1));
+        std::memcpy(
+            runtime.vu0().state().vf[2],
+            source2, sizeof(source2));
+    }
+
+    void startDirectVu(
+        PS2Runtime &runtime, VuWorkload workload)
+    {
+        configureVuWorkloadState(runtime, workload);
         runtime.vu0().execute(
             runtime.memory().getVU0Code(),
             PS2_VU0_CODE_SIZE,
@@ -405,7 +465,7 @@ namespace
         const Configuration &configuration)
     {
         runtime.vu0().setProgressTrackingEnabled(true);
-        startDirectVu(runtime);
+        startDirectVu(runtime, configuration.vuWorkload);
         advanceScheduledBlocks(
             runtime, context, configuration.warmupBlocks,
             configuration.blockTicks);
@@ -422,7 +482,7 @@ namespace
         runtime.resetEeTiming(&context);
         runtime.vu0().reset();
         context = R5900Context{};
-        startDirectVu(runtime);
+        startDirectVu(runtime, configuration.vuWorkload);
     }
 
     Measurement measureEventEqualWork(
@@ -430,7 +490,8 @@ namespace
     {
         PS2Runtime runtime;
         R5900Context context{};
-        if (!initializeFixture(runtime))
+        if (!initializeFixture(
+                runtime, configuration.vuWorkload))
             throw std::runtime_error("failed to initialize scheduler fixture");
         prepareEventEqualWork(
             runtime, context, configuration);
@@ -484,6 +545,7 @@ namespace
             g_allocationBytes.load(std::memory_order_relaxed);
         result.stateHash = hashState(runtime.vu0().state());
         result.vuPc = runtime.vu0().state().pc;
+        result.vuWorkload = configuration.vuWorkload;
         return result;
     }
 
@@ -492,7 +554,8 @@ namespace
     {
         PS2Runtime runtime;
         R5900Context context{};
-        if (!initializeFixture(runtime))
+        if (!initializeFixture(
+                runtime, configuration.vuWorkload))
             throw std::runtime_error(
                 "failed to initialize no-event fixture");
         advanceScheduledBlocks(
@@ -536,6 +599,7 @@ namespace
             g_allocationBytes.load(std::memory_order_relaxed);
         result.stateHash = hashState(runtime.vu0().state());
         result.vuPc = runtime.vu0().state().pc;
+        result.vuWorkload = configuration.vuWorkload;
         return result;
     }
 
@@ -545,7 +609,7 @@ namespace
     {
         VU1Interpreter &vu = runtime.vu0();
         vu.setProgressTrackingEnabled(true);
-        startDirectVu(runtime);
+        startDirectVu(runtime, configuration.vuWorkload);
         for (uint64_t block = 0u;
              block < configuration.warmupBlocks; ++block)
         {
@@ -562,7 +626,7 @@ namespace
 
         vu.reset();
         context = R5900Context{};
-        startDirectVu(runtime);
+        startDirectVu(runtime, configuration.vuWorkload);
     }
 
     Measurement measureDirect(
@@ -574,7 +638,8 @@ namespace
 
         PS2Runtime runtime;
         R5900Context context{};
-        if (!initializeFixture(runtime))
+        if (!initializeFixture(
+                runtime, configuration.vuWorkload))
             throw std::runtime_error("failed to initialize direct fixture");
         prepareDirect(runtime, context, configuration);
 
@@ -618,6 +683,7 @@ namespace
             g_allocationBytes.load(std::memory_order_relaxed);
         result.stateHash = hashState(runtime.vu0().state());
         result.vuPc = runtime.vu0().state().pc;
+        result.vuWorkload = configuration.vuWorkload;
         return result;
     }
 
@@ -627,6 +693,8 @@ namespace
             << "{\"schema_version\":" << kOutputSchemaVersion
             << ",\"event\":\"measurement\","
             << "\"mode\":\"" << measurement.mode << "\","
+            << "\"vu_workload\":\""
+            << vuWorkloadName(measurement.vuWorkload) << "\","
             << "\"sample\":" << measurement.sample << ','
             << "\"ee_blocks\":" << measurement.eeBlocks << ','
             << "\"ee_cycle_ticks\":" << measurement.eeTicks << ','
@@ -637,6 +705,14 @@ namespace
             << "\"vu_instruction_pairs\":" << measurement.vuPairs << ','
             << "\"vu_cycles\":" << measurement.vuPairs << ','
             << "\"host_time_ns\":" << measurement.hostNanoseconds << ','
+            << "\"guest_pairs_per_host_second\":"
+            << (measurement.hostNanoseconds == 0u
+                    ? 0.0
+                    : static_cast<double>(measurement.vuPairs) *
+                          1'000'000'000.0 /
+                          static_cast<double>(
+                              measurement.hostNanoseconds))
+            << ','
             << "\"allocation_count\":" << measurement.allocations << ','
             << "\"allocation_bytes\":" << measurement.allocatedBytes << ','
             << "\"state_hash\":\"0x" << std::hex
@@ -660,7 +736,8 @@ int main(int argc, char **argv)
         std::cerr
             << "usage: ee_timing_benchmark "
                "[--blocks N] [--warmup-blocks N] "
-               "[--block-ticks N] [--samples N]\n";
+               "[--block-ticks N] [--samples N] "
+               "[--vu-workload nop|fmac]\n";
         return 2;
     }
 
@@ -740,6 +817,8 @@ int main(int argc, char **argv)
         std::cout
             << "{\"schema_version\":" << kOutputSchemaVersion
             << ",\"event\":\"summary\","
+            << "\"vu_workload\":\""
+            << vuWorkloadName(configuration.vuWorkload) << "\","
             << "\"samples\":" << configuration.samples << ','
             << "\"ee_blocks\":" << configuration.blocks << ','
             << "\"ee_cycle_ticks\":"
@@ -754,6 +833,20 @@ int main(int argc, char **argv)
             << noEventMedian << ','
             << "\"pre_scheduler_equal_work_median_host_time_ns\":"
             << directMedian << ','
+            << "\"event_guest_pairs_per_host_second\":"
+            << (eventMedian == 0u
+                    ? 0.0
+                    : static_cast<double>(expectedVuPairs) *
+                          1'000'000'000.0 /
+                          static_cast<double>(eventMedian))
+            << ','
+            << "\"pre_scheduler_guest_pairs_per_host_second\":"
+            << (directMedian == 0u
+                    ? 0.0
+                    : static_cast<double>(expectedVuPairs) *
+                          1'000'000'000.0 /
+                          static_cast<double>(directMedian))
+            << ','
             << "\"event_to_pre_scheduler_ratio\":" << ratio
             << "}\n";
     }
