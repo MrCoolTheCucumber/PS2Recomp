@@ -5,10 +5,12 @@
 #include "runtime/ps2_gs_psmct32.h"
 #include "runtime/ps2_memory.h"
 #include "runtime/ps2_vu_clip.h"
+#include "runtime/ps2_vu_analysis.h"
 #include "runtime/ps2_vu_ir.h"
 #include "runtime/ps2_vu_recompiler.h"
 #include "runtime/ps2_vu1.h"
 
+#include <algorithm>
 #include <array>
 #include <cfenv>
 #include <cstdlib>
@@ -1877,6 +1879,954 @@ void register_ps2_vu1_tests()
             t.IsFalse(
                 verifyVuIrBlock(malformedEmpty, &error),
                 "an empty block should reject an exit inconsistent with its entry");
+        });
+
+        tc.Run("VU block analysis builds exact branch delay and wrap edges", [](TestCase &t)
+        {
+            std::array<uint8_t, 64u> code{};
+            for (uint32_t pc = 0u;
+                 pc < code.size(); pc += 8u)
+            {
+                writeVuInstructionPair(
+                    code.data(), pc, 0u, kVuUpperNop);
+            }
+            writeVuInstructionPair(
+                code.data(), 0u,
+                makeVuIbeq(1u, 2u, 2),
+                kVuUpperNop);
+            writeVuInstructionPair(
+                code.data(), 8u,
+                makeVuIaddiu(3u, 0u, 1),
+                kVuUpperNop);
+            writeVuInstructionPair(
+                code.data(), 16u, 0u, kVuUpperEnd);
+            writeVuInstructionPair(
+                code.data(), 24u, 0u, kVuUpperEnd);
+
+            VuAnalysisConfiguration configuration{
+                .hostFeatures =
+                    VuRecompilerBackend::hostFeatures(),
+            };
+            const VuControlFlowGraph graph =
+                analyzeVuControlFlow(
+                    code.data(),
+                    static_cast<uint32_t>(code.size()),
+                    0u, configuration);
+            t.IsTrue(
+                graph.valid,
+                "branch CFG analysis failed: " +
+                    graph.diagnostic);
+            t.IsTrue(
+                !graph.blocks.empty(),
+                "the CFG should retain its entry block");
+            if (graph.blocks.empty())
+                return;
+
+            const VuAnalysisBlock &entry =
+                graph.blocks.front();
+            t.IsTrue(
+                entry.terminal ==
+                    VuAnalysisBlockTerminal::
+                        BranchBoundary,
+                "a conditional branch should end after its delay pair");
+            t.Equals(
+                entry.fixedPairs, uint32_t{2u},
+                "branch and delay should have a fixed two-pair cost");
+            t.Equals(
+                entry.fixedCycles, uint32_t{2u},
+                "branch and delay should have a fixed two-cycle cost");
+            t.Equals(
+                entry.successors.size(), size_t{2u},
+                "a conditional branch should expose both successors");
+
+            bool sawTaken = false;
+            bool sawNotTaken = false;
+            for (const VuAnalysisSuccessor &successor :
+                 entry.successors)
+            {
+                t.Equals(
+                    successor.fixedCycles,
+                    uint32_t{2u},
+                    "every branch edge should retain the block cost");
+                if (successor.kind ==
+                        VuAnalysisSuccessorKind::
+                            BranchTaken &&
+                    successor.entry.pc == 24u)
+                {
+                    sawTaken = true;
+                }
+                if (successor.kind ==
+                        VuAnalysisSuccessorKind::
+                            BranchNotTaken &&
+                    successor.entry.pc == 16u)
+                {
+                    sawNotTaken = true;
+                }
+                t.IsTrue(
+                    successor.targetBlock <
+                        graph.blocks.size(),
+                    "a static branch edge should resolve to a block");
+            }
+            t.IsTrue(
+                sawTaken,
+                "the taken edge should use PC+8+imm11*8");
+            t.IsTrue(
+                sawNotTaken,
+                "the not-taken edge should follow the delay pair");
+
+            const VuControlFlowGraph wrap =
+                analyzeVuControlFlow(
+                    code.data(),
+                    static_cast<uint32_t>(code.size()),
+                    56u, configuration);
+            t.IsTrue(
+                wrap.valid && !wrap.blocks.empty(),
+                "code-wrap CFG analysis should succeed");
+            if (!wrap.blocks.empty())
+            {
+                t.IsTrue(
+                    wrap.blocks[0u].terminal ==
+                        VuAnalysisBlockTerminal::
+                            CodeWrap,
+                    "sequential code wrap should be an explicit edge");
+                t.Equals(
+                    wrap.blocks[0u].fixedCycles,
+                    uint32_t{1u},
+                    "the last pair should cost one cycle before wrap");
+                t.IsTrue(
+                    wrap.blocks[0u].successors.size() ==
+                            1u &&
+                        wrap.blocks[0u].
+                                successors[0u].entry.pc ==
+                            0u,
+                    "code wrap should resolve to PC zero");
+            }
+        });
+
+        tc.Run("VU block analysis costs and successors match interpreter traces", [](TestCase &t)
+        {
+            std::array<uint8_t, 64u> code{};
+            std::array<uint8_t, 256u> data{};
+            for (uint32_t pc = 0u;
+                 pc < code.size(); pc += 8u)
+            {
+                writeVuInstructionPair(
+                    code.data(), pc, 0u, kVuUpperNop);
+            }
+            writeVuInstructionPair(
+                code.data(), 0u,
+                makeVuIbeq(1u, 2u, 2),
+                kVuUpperNop);
+            writeVuInstructionPair(
+                code.data(), 8u,
+                makeVuIaddiu(3u, 0u, 1),
+                kVuUpperNop);
+            writeVuInstructionPair(
+                code.data(), 16u, 0u, kVuUpperEnd);
+            writeVuInstructionPair(
+                code.data(), 24u, 0u, kVuUpperEnd);
+
+            const VuControlFlowGraph graph =
+                analyzeVuControlFlow(
+                    code.data(),
+                    static_cast<uint32_t>(code.size()),
+                    0u);
+            t.IsTrue(
+                graph.valid && !graph.blocks.empty(),
+                "trace CFG should be valid");
+            if (!graph.valid || graph.blocks.empty())
+                return;
+            const VuAnalysisBlock &entry =
+                graph.blocks[0u];
+
+            const auto runBranch =
+                [&](bool taken)
+                {
+                    VuUnit unit(VuUnitId::Vu1);
+                    VuIrInterpreterBackend interpreter(unit);
+                    VuExecutionState state = unit.state();
+                    state.active = true;
+                    state.pc = 0u;
+                    state.vi[1u] = 7;
+                    state.vi[2u] = taken ? 7 : 8;
+                    VuTransactionalSideEffectSink effects;
+                    VuExecutionContext context{
+                        .state = state,
+                        .code = code.data(),
+                        .codeSize =
+                            static_cast<uint32_t>(
+                                code.size()),
+                        .data = data.data(),
+                        .dataSize =
+                            static_cast<uint32_t>(
+                                data.size()),
+                        .sideEffects = effects,
+                        .enableInstrumentation = false,
+                    };
+                    const VuRunResult result =
+                        interpreter.run(
+                            context,
+                            entry.fixedCycles);
+                    t.Equals(
+                        result.executedCycles,
+                        entry.fixedCycles,
+                        "interpreter should retire the analyzed branch cost");
+                    const uint32_t expectedPc =
+                        taken ? 24u : 16u;
+                    t.Equals(
+                        state.pc, expectedPc,
+                        "interpreter branch successor should match the CFG");
+                    const bool matched =
+                        std::any_of(
+                            entry.successors.begin(),
+                            entry.successors.end(),
+                            [&](const VuAnalysisSuccessor
+                                    &successor)
+                            {
+                                return
+                                    successor.entry.pc ==
+                                        state.pc &&
+                                    successor.entry.
+                                            endPending ==
+                                        state.ebit &&
+                                    successor.kind ==
+                                        (taken
+                                             ? VuAnalysisSuccessorKind::
+                                                   BranchTaken
+                                             : VuAnalysisSuccessorKind::
+                                                   BranchNotTaken);
+                            });
+                    t.IsTrue(
+                        matched,
+                        "the observed branch state should select one declared edge");
+                    t.Equals(
+                        state.vi[3u], int32_t{1},
+                        "the analyzed delay pair should execute on both branch paths");
+                };
+            runBranch(true);
+            runBranch(false);
+
+            const VuControlFlowGraph wrap =
+                analyzeVuControlFlow(
+                    code.data(),
+                    static_cast<uint32_t>(code.size()),
+                    56u);
+            t.IsTrue(
+                wrap.valid && !wrap.blocks.empty(),
+                "wrap trace CFG should be valid");
+            if (!wrap.valid || wrap.blocks.empty())
+                return;
+            VuUnit unit(VuUnitId::Vu1);
+            VuIrInterpreterBackend interpreter(unit);
+            VuExecutionState state = unit.state();
+            state.active = true;
+            state.pc = 56u;
+            VuTransactionalSideEffectSink effects;
+            VuExecutionContext context{
+                .state = state,
+                .code = code.data(),
+                .codeSize =
+                    static_cast<uint32_t>(code.size()),
+                .data = data.data(),
+                .dataSize =
+                    static_cast<uint32_t>(data.size()),
+                .sideEffects = effects,
+                .enableInstrumentation = false,
+            };
+            const VuRunResult result =
+                interpreter.run(
+                    context,
+                    wrap.blocks[0u].fixedCycles);
+            t.Equals(
+                result.executedCycles,
+                wrap.blocks[0u].fixedCycles,
+                "interpreter should retire the analyzed wrap cost");
+            t.IsTrue(
+                state.pc == 0u &&
+                    wrap.blocks[0u].successors.size() ==
+                        1u &&
+                    wrap.blocks[0u].successors[0u].
+                            entry.pc ==
+                        state.pc,
+                "the observed code wrap should select the PC-zero edge");
+        });
+
+        tc.Run("VU block analysis carries E-bit and nested delay state across blocks", [](TestCase &t)
+        {
+            std::array<uint8_t, 64u> code{};
+            for (uint32_t pc = 0u;
+                 pc < code.size(); pc += 8u)
+            {
+                writeVuInstructionPair(
+                    code.data(), pc, 0u, kVuUpperNop);
+            }
+            writeVuInstructionPair(
+                code.data(), 0u,
+                makeVuBranch(2), kVuUpperNop);
+            writeVuInstructionPair(
+                code.data(), 8u, 0u, kVuUpperEnd);
+
+            const VuControlFlowGraph endInDelay =
+                analyzeVuControlFlow(
+                    code.data(),
+                    static_cast<uint32_t>(code.size()),
+                    0u);
+            t.IsTrue(
+                endInDelay.valid &&
+                    !endInDelay.blocks.empty(),
+                "E-bit-in-delay CFG should be valid");
+            if (endInDelay.blocks.empty() ||
+                endInDelay.blocks[0u].successors.empty())
+            {
+                return;
+            }
+            const VuAnalysisSuccessor &pendingEnd =
+                endInDelay.blocks[0u].successors[0u];
+            t.IsTrue(
+                pendingEnd.entry.pc == 24u &&
+                    pendingEnd.entry.endPending,
+                "an E-bit delay pair should carry pending completion to the branch target");
+            t.IsTrue(
+                pendingEnd.targetBlock <
+                    endInDelay.blocks.size(),
+                "the pending-end target should resolve");
+            if (pendingEnd.targetBlock <
+                endInDelay.blocks.size())
+            {
+                const VuAnalysisBlock &ending =
+                    endInDelay.blocks[
+                        pendingEnd.targetBlock];
+                t.IsTrue(
+                    ending.terminal ==
+                            VuAnalysisBlockTerminal::
+                                ProgramEnd &&
+                        ending.fixedCycles == 1u,
+                    "pending E-bit should execute exactly one final pair");
+            }
+
+            std::array<uint8_t, 64u> data{};
+            VuUnit endUnit(VuUnitId::Vu1);
+            VuIrInterpreterBackend endInterpreter(endUnit);
+            VuExecutionState endState = endUnit.state();
+            endState.active = true;
+            VuTransactionalSideEffectSink endEffects;
+            VuExecutionContext endContext{
+                .state = endState,
+                .code = code.data(),
+                .codeSize =
+                    static_cast<uint32_t>(code.size()),
+                .data = data.data(),
+                .dataSize =
+                    static_cast<uint32_t>(data.size()),
+                .sideEffects = endEffects,
+                .enableInstrumentation = false,
+            };
+            const VuRunResult branchAndDelay =
+                endInterpreter.run(
+                    endContext,
+                    endInDelay.blocks[0u].
+                        fixedCycles);
+            t.IsTrue(
+                branchAndDelay.executedCycles == 2u &&
+                    endState.active &&
+                    endState.pc == 24u &&
+                    endState.ebit,
+                "the interpreter should reach the analyzed pending-end entry");
+            if (pendingEnd.targetBlock <
+                endInDelay.blocks.size())
+            {
+                const VuAnalysisBlock &ending =
+                    endInDelay.blocks[
+                        pendingEnd.targetBlock];
+                const VuRunResult finalPair =
+                    endInterpreter.run(
+                        endContext,
+                        ending.fixedCycles);
+                t.IsTrue(
+                    finalPair.executedCycles ==
+                            ending.fixedCycles &&
+                        finalPair.reason ==
+                            VuExitReason::ProgramEnded &&
+                        !endState.active,
+                    "the interpreter should end at the analyzed one-pair cost");
+            }
+
+            writeVuInstructionPair(
+                code.data(), 8u,
+                makeVuBranch(2), kVuUpperNop);
+            const VuControlFlowGraph nestedDelay =
+                analyzeVuControlFlow(
+                    code.data(),
+                    static_cast<uint32_t>(code.size()),
+                    0u);
+            t.IsTrue(
+                nestedDelay.valid &&
+                    !nestedDelay.blocks.empty() &&
+                    !nestedDelay.blocks[0u].
+                         successors.empty(),
+                "a branch in a delay pair should remain analyzable");
+            if (!nestedDelay.blocks.empty() &&
+                !nestedDelay.blocks[0u].
+                     successors.empty())
+            {
+                const VuAnalysisSuccessor &nested =
+                    nestedDelay.blocks[0u].
+                        successors[0u];
+                t.IsTrue(
+                    nested.entry.pc == 16u &&
+                        nested.entry.pendingBranch ==
+                            VuAnalysisPendingBranchKind::
+                                Static &&
+                        nested.entry.
+                                pendingBranchTarget ==
+                            32u,
+                    "the delay branch should replace the older target and carry one more delay");
+                if (nested.targetBlock <
+                    nestedDelay.blocks.size())
+                {
+                    const VuAnalysisBlock &secondDelay =
+                        nestedDelay.blocks[
+                            nested.targetBlock];
+                    t.IsTrue(
+                        secondDelay.fixedCycles == 1u &&
+                            secondDelay.successors.size() ==
+                                1u &&
+                            secondDelay.successors[0u].
+                                    entry.pc ==
+                                32u,
+                        "the nested delay should commit its replacement target after one pair");
+                }
+            }
+        });
+
+        tc.Run("VU block analysis declares helper memory and observability barriers", [](TestCase &t)
+        {
+            std::array<uint8_t, 32u> code{};
+            for (uint32_t pc = 0u;
+                 pc < code.size(); pc += 8u)
+            {
+                writeVuInstructionPair(
+                    code.data(), pc, 0u, kVuUpperNop);
+            }
+            writeVuInstructionPair(
+                code.data(), 0u,
+                makeVuSq(0xfu, 3u, 1u, 0),
+                makeVuUpper(
+                    0x28u, 0x8u, 2u, 1u, 4u));
+            writeVuInstructionPair(
+                code.data(), 8u,
+                makeVuWaitQ(), kVuUpperNop);
+            writeVuInstructionPair(
+                code.data(), 16u,
+                makeVuLowerSpecial(0x6cu, 2u),
+                kVuUpperNop);
+            writeVuInstructionPair(
+                code.data(), 24u, 0x04000000u,
+                kVuUpperNop);
+
+            VuAnalysisConfiguration configuration{
+                .hostFeatures =
+                    VuRecompilerBackend::hostFeatures(),
+            };
+            const VuControlFlowGraph graph =
+                analyzeVuControlFlow(
+                    code.data(),
+                    static_cast<uint32_t>(code.size()),
+                    0u, configuration);
+            t.IsTrue(
+                graph.valid && graph.blocks.size() >= 2u,
+                "barrier CFG should reach the post-XGKICK block");
+            if (!graph.valid || graph.blocks.empty())
+                return;
+
+            const auto barrierFor =
+                [](const VuAnalysisPair &pair,
+                   VuAnalysisBarrierKind kind)
+                    -> const VuAnalysisBarrier *
+                {
+                    const auto found = std::find_if(
+                        pair.barriers.begin(),
+                        pair.barriers.end(),
+                        [&](const VuAnalysisBarrier &barrier)
+                        {
+                            return barrier.kind == kind;
+                        });
+                    return found == pair.barriers.end()
+                               ? nullptr
+                               : &*found;
+                };
+            const auto hasBarrier =
+                [&](const VuAnalysisPair &pair,
+                    VuAnalysisBarrierKind kind)
+                {
+                    return barrierFor(pair, kind) !=
+                           nullptr;
+                };
+            const VuAnalysisBlock &first =
+                graph.blocks[0u];
+            t.IsTrue(
+                first.pairs.size() == 3u,
+                "XGKICK should terminate the first block");
+            if (first.pairs.size() == 3u)
+            {
+                const VuAnalysisPair &store =
+                    first.pairs[0u];
+                t.IsTrue(
+                    (store.reads.vf[3u] & 0xfu) ==
+                            0xfu &&
+                        (store.reads.vi & (1u << 1u)) !=
+                            0u &&
+                        (store.writes.memory &
+                         VuAnalysisMemoryVuData) != 0u,
+                    "SQ should declare its vector, address, and VU-data effects");
+                const VuAnalysisBarrier *const memory =
+                    barrierFor(
+                        store,
+                        VuAnalysisBarrierKind::
+                            UnknownMemory);
+                t.IsTrue(
+                    memory &&
+                        memory->phase ==
+                            VuAnalysisBarrierPhase::
+                                PairExecution,
+                    "a dynamic VU-data address should be an explicit alias barrier");
+
+                const VuAnalysisPair &wait =
+                    first.pairs[1u];
+                t.IsTrue(
+                    wait.usesNativeHelper &&
+                        hasBarrier(
+                            wait,
+                            VuAnalysisBarrierKind::
+                                NativeHelper),
+                    "WAITQ should declare its opaque native helper");
+                for (const VuAnalysisBarrier &barrier :
+                     wait.barriers)
+                {
+                    if (barrier.kind ==
+                        VuAnalysisBarrierKind::
+                            NativeHelper)
+                    {
+                        t.IsTrue(
+                            barrier.phase ==
+                                    VuAnalysisBarrierPhase::
+                                        WholePair &&
+                                barrier.reads ==
+                                    wait.reads &&
+                                barrier.clobbers ==
+                                    wait.writes,
+                            "a helper declaration should cover the exact pair read/write contract");
+                    }
+                }
+
+                const VuAnalysisPair &xgkick =
+                    first.pairs[2u];
+                const VuAnalysisBarrier *const start =
+                    barrierFor(
+                        xgkick,
+                        VuAnalysisBarrierKind::
+                            XgkickStart);
+                const VuAnalysisBarrier *const advance =
+                    barrierFor(
+                        xgkick,
+                        VuAnalysisBarrierKind::
+                            XgkickAdvance);
+                t.IsTrue(
+                    start &&
+                        start->phase ==
+                            VuAnalysisBarrierPhase::
+                                PairExecution &&
+                        advance &&
+                        advance->phase ==
+                            VuAnalysisBarrierPhase::
+                                AfterPair,
+                    "XGKICK start and streaming advancement should be separate barriers");
+            }
+
+            bool sawUnsupported = false;
+            for (const VuAnalysisBlock &block :
+                 graph.blocks)
+            {
+                if (block.terminal !=
+                    VuAnalysisBlockTerminal::
+                        UnsupportedInstruction)
+                {
+                    continue;
+                }
+                sawUnsupported = true;
+                t.Equals(
+                    block.fixedCycles, uint32_t{0u},
+                    "an unsupported entry must not retire its diagnostic pair");
+                t.IsTrue(
+                    block.pairs.size() == 1u &&
+                        !block.pairs[0u].retires &&
+                        vuAnalysisResourcesEmpty(
+                            block.pairs[0u].reads) &&
+                        vuAnalysisResourcesEmpty(
+                            block.pairs[0u].writes) &&
+                        vuAnalysisResourcesEmpty(
+                            block.pairs[0u].
+                                definiteWrites) &&
+                        block.pairs[0u].
+                                barriers.size() ==
+                            1u &&
+                        hasBarrier(
+                            block.pairs[0u],
+                            VuAnalysisBarrierKind::
+                                UnsupportedOperation) &&
+                        block.pairs[0u].barriers[0u].
+                                phase ==
+                            VuAnalysisBarrierPhase::
+                                BeforePair,
+                    "unsupported semantics should have an explicit zero-clobber barrier");
+            }
+            t.IsTrue(
+                sawUnsupported,
+                "the XGKICK resume edge should expose its unsupported successor");
+
+            configuration.instrumented = true;
+            configuration.verification = true;
+            const VuControlFlowGraph observable =
+                analyzeVuControlFlow(
+                    code.data(),
+                    static_cast<uint32_t>(code.size()),
+                    0u, configuration);
+            t.IsTrue(
+                observable.valid &&
+                    !observable.blocks.empty() &&
+                    !observable.blocks[0u].pairs.empty(),
+                "observable CFG should remain valid");
+            if (observable.valid &&
+                !observable.blocks.empty() &&
+                !observable.blocks[0u].pairs.empty())
+            {
+                const VuAnalysisPair &pair =
+                    observable.blocks[0u].pairs[0u];
+                const VuAnalysisBarrier *const debug =
+                    barrierFor(
+                        pair,
+                        VuAnalysisBarrierKind::
+                            DebugObserver);
+                const VuAnalysisBarrier *const verify =
+                    barrierFor(
+                        pair,
+                        VuAnalysisBarrierKind::
+                            Verification);
+                t.IsTrue(
+                    pair.usesNativeHelper &&
+                        debug &&
+                        debug->phase ==
+                            VuAnalysisBarrierPhase::
+                                BeforePair &&
+                        verify &&
+                        verify->phase ==
+                            VuAnalysisBarrierPhase::
+                                WholePair,
+                    "debug and transactional verification should force explicit materialization barriers");
+            }
+        });
+
+        tc.Run("VU block analysis retains liveness constants and proven pipeline facts", [](TestCase &t)
+        {
+            std::array<uint8_t, 64u> code{};
+            for (uint32_t pc = 0u;
+                 pc < code.size(); pc += 8u)
+            {
+                writeVuInstructionPair(
+                    code.data(), pc, 0u, kVuUpperNop);
+            }
+            writeVuInstructionPair(
+                code.data(), 0u,
+                makeVuDiv(1u, 2u, 0u, 1u),
+                makeVuUpper(
+                    0x28u, 0x8u, 2u, 1u, 3u));
+            writeVuInstructionPair(
+                code.data(), 16u,
+                makeVuLowerSpecial(
+                    0x34u, 1u, 4u, 0u, 0xfu),
+                kVuUpperNop);
+            writeVuInstructionPair(
+                code.data(), 24u,
+                makeVuWaitQ(), kVuUpperNop);
+            writeVuInstructionPair(
+                code.data(), 32u,
+                makeVuSq(0xfu, 3u, 1u, 0),
+                kVuUpperNop);
+            writeVuInstructionPair(
+                code.data(), 40u, 0u, kVuUpperEnd);
+
+            VuAnalysisConfiguration configuration{
+                .hostFeatures =
+                    VuRecompilerBackend::hostFeatures(),
+            };
+            const VuControlFlowGraph graph =
+                analyzeVuControlFlow(
+                    code.data(),
+                    static_cast<uint32_t>(code.size()),
+                    0u, configuration);
+            t.IsTrue(
+                graph.valid && !graph.blocks.empty(),
+                "pipeline-fact CFG should be valid");
+            if (!graph.valid || graph.blocks.empty())
+                return;
+            const VuAnalysisBlock &block =
+                graph.blocks[0u];
+            t.IsTrue(
+                block.pairs.size() >= 5u,
+                "the straight block should retain the fact sequence");
+            if (block.pairs.size() < 5u)
+                return;
+
+            t.IsTrue(
+                block.pairs[0u].entryFacts.delayedQ ==
+                        VuAnalysisKnownState::Dynamic &&
+                    block.pairs[0u].exitFacts.delayedQ ==
+                        VuAnalysisKnownState::Active &&
+                    block.pairs[0u].exitFacts.
+                            qCyclesRemaining ==
+                        7u,
+                "DIV should turn dynamic Q into a proven seven-cycle producer");
+            t.IsTrue(
+                block.pairs[1u].entryFacts.delayedQ ==
+                        VuAnalysisKnownState::Active &&
+                    block.pairs[1u].entryFacts.
+                            qCyclesRemaining ==
+                        7u &&
+                    block.pairs[1u].exitFacts.
+                            qCyclesRemaining ==
+                        6u,
+                "known Q latency should age once per subsequent pair");
+            t.IsTrue(
+                block.pairs[2u].entryFacts.viBackup ==
+                        VuAnalysisKnownState::Inactive &&
+                    block.pairs[2u].exitFacts.viBackup ==
+                        VuAnalysisKnownState::Active &&
+                    block.pairs[2u].exitFacts.
+                            viBackupCycles ==
+                        2u,
+                "LQI should establish a proven two-cycle VI backup");
+            t.IsTrue(
+                block.pairs[3u].exitFacts.delayedQ ==
+                    VuAnalysisKnownState::Inactive,
+                "WAITQ should prove the delayed Q pipeline inactive");
+            t.IsTrue(
+                block.pairs[4u].entryFacts.
+                        advancingFmacSlot ==
+                    VuAnalysisKnownState::Active,
+                "the fourth successor should know that pair zero filled the advancing FMAC slot");
+
+            // Pair zero defines only VF3.x, while the later SQ consumes all
+            // components. Backwards liveness should need only the untouched
+            // y/z/w lanes at entry.
+            t.Equals(
+                block.pairs[0u].liveIn.vf[3u],
+                uint8_t{0x7u},
+                "partial VF definitions should kill only their written lanes");
+            for (const VuAnalysisPair &pair : block.pairs)
+            {
+                t.Equals(
+                    pair.liveIn.vf[0u], uint8_t{0u},
+                    "VF0 should be a constant rather than a live input");
+                t.IsTrue(
+                    (pair.liveIn.vi & 1u) == 0u,
+                    "VI0 should be a constant rather than a live input");
+                t.IsTrue(
+                    pair.entryFacts.vf0Constant &&
+                        pair.entryFacts.vi0Constant,
+                    "constant facts should be explicit at every pair");
+            }
+        });
+
+        tc.Run("VU block analysis diagnostics and native declarations stay stable", [](TestCase &t)
+        {
+            t.Equals(
+                kVuAnalysisNativeExitCount,
+                kVuNativeBlockExitCount,
+                "analysis and native exit catalogs should have equal extent");
+            for (size_t index = 0u;
+                 index < kVuAnalysisNativeExitCount;
+                 ++index)
+            {
+                t.Equals(
+                    std::string(
+                        vuAnalysisNativeExitName(
+                            static_cast<
+                                VuAnalysisNativeExit>(
+                                index))),
+                    std::string(
+                        vuNativeBlockExitName(
+                            static_cast<
+                                VuNativeBlockExit>(
+                                index))),
+                    "analysis and native exit names should remain in lockstep");
+            }
+
+            const std::array<uint64_t, 3u>
+                featureSets = {
+                    0u,
+                    VuRecompilerBackend::hostFeatures(),
+                    UINT64_MAX,
+                };
+            for (const uint64_t hostFeatures :
+                 featureSets)
+            {
+                for (size_t index = 0u;
+                     index <= static_cast<size_t>(
+                         VuIrOpcode::Unsupported);
+                     ++index)
+                {
+                    const VuIrOpcode opcode =
+                        static_cast<VuIrOpcode>(
+                            index);
+                    const bool analysisInline =
+                        vuAnalysisCanInlineUpperOpcode(
+                            opcode, hostFeatures) ||
+                        vuAnalysisCanInlineLowerOpcode(
+                            opcode);
+                    const VuRecompilerOpcodeDisposition
+                        disposition =
+                            VuRecompilerBackend::
+                                opcodeDisposition(
+                                    opcode,
+                                    hostFeatures);
+                    if (opcode ==
+                        VuIrOpcode::Unsupported)
+                    {
+                        t.IsTrue(
+                            disposition ==
+                                VuRecompilerOpcodeDisposition::
+                                    InterpreterSideExit &&
+                                !analysisInline,
+                            "unsupported analysis should match the native side exit");
+                    }
+                    else
+                    {
+                        t.IsTrue(
+                            analysisInline ==
+                                (disposition ==
+                                 VuRecompilerOpcodeDisposition::
+                                     NativeInline),
+                            "analysis helper classification drifted for " +
+                                std::string(
+                                    vuIrOpcodeName(
+                                        opcode)));
+                    }
+                }
+            }
+
+            std::array<uint8_t, 16u> unsupportedCode{};
+            writeVuInstructionPair(
+                unsupportedCode.data(), 0u,
+                0u, kVuUpperNop);
+            writeVuInstructionPair(
+                unsupportedCode.data(), 8u,
+                0x04000000u, kVuUpperNop);
+            const VuControlFlowGraph unsupportedGraph =
+                analyzeVuControlFlow(
+                    unsupportedCode.data(),
+                    static_cast<uint32_t>(
+                        unsupportedCode.size()),
+                    0u);
+            t.IsTrue(
+                unsupportedGraph.valid &&
+                    unsupportedGraph.blocks.size() == 1u,
+                "unsupported-exit cost CFG should be valid");
+            if (unsupportedGraph.valid &&
+                unsupportedGraph.blocks.size() == 1u)
+            {
+                const VuAnalysisBlock &block =
+                    unsupportedGraph.blocks[0u];
+                const VuAnalysisExit &budget =
+                    block.exits[static_cast<size_t>(
+                        VuAnalysisNativeExit::
+                            CycleBudget)];
+                const VuAnalysisExit &unsupported =
+                    block.exits[static_cast<size_t>(
+                        VuAnalysisNativeExit::
+                            UnsupportedInstruction)];
+                t.IsTrue(
+                    block.fixedPairs == 1u &&
+                        block.fixedCycles == 1u &&
+                        budget.possible &&
+                        budget.minimumPairs == 0u &&
+                        budget.maximumPairs == 1u &&
+                        budget.minimumCycles == 0u &&
+                        budget.maximumCycles == 1u,
+                    "the budget check before an unsupported pair should include the full preceding cost");
+                t.IsTrue(
+                    unsupported.possible &&
+                        unsupported.minimumPairs == 1u &&
+                        unsupported.maximumPairs == 1u &&
+                        unsupported.minimumCycles == 1u &&
+                        unsupported.maximumCycles == 1u,
+                    "the unsupported side exit should retain the exact preceding cost");
+            }
+
+            std::array<uint8_t, 16u> code{};
+            writeVuInstructionPair(
+                code.data(), 0u,
+                makeVuBranch(-1), kVuUpperNop);
+            writeVuInstructionPair(
+                code.data(), 8u, 0u, kVuUpperNop);
+            const VuControlFlowGraph graph =
+                analyzeVuControlFlow(
+                    code.data(),
+                    static_cast<uint32_t>(code.size()),
+                    0u);
+            t.IsTrue(
+                graph.valid,
+                "diagnostic-golden CFG should be valid");
+            for (const VuAnalysisBlock &block :
+                 graph.blocks)
+            {
+                t.Equals(
+                    block.exits.size(),
+                    kVuAnalysisNativeExitCount,
+                    "every block should explicitly declare every native exit");
+                for (size_t index = 0u;
+                     index < block.exits.size();
+                     ++index)
+                {
+                    t.IsTrue(
+                        block.exits[index].kind ==
+                            static_cast<
+                                VuAnalysisNativeExit>(
+                                index),
+                        "native exit declarations should retain enum order");
+                }
+            }
+            const std::string diagnostic =
+                serializeVuAnalysis(graph);
+            constexpr std::string_view headerGolden =
+                "vu-analysis-v1 valid=1 code=16 "
+                "entry={pc=0000,end=0,pending=none} "
+                "blocks=1\n"
+                "native-exits=block-complete:1,"
+                "cycle-budget:1,inactive:1,"
+                "program-ended:1,code-bounds:1,"
+                "xgkick-boundary:1,debug-observer:1,"
+                "code-invalidated:1,"
+                "unsupported-instruction:1,fault:1\n"
+                "block 0 entry={pc=0000,end=0,"
+                "pending=none} terminal=branch-boundary "
+                "pairs=2 cycles=2\n";
+            t.IsTrue(
+                diagnostic.starts_with(headerGolden),
+                "serialized CFG header changed:\n" +
+                    diagnostic);
+            t.IsTrue(
+                diagnostic.find(
+                    "  edge=branch-taken "
+                    "target={pc=0000,end=0,pending=none} "
+                    "block=0 cost=2/2\n") !=
+                    std::string::npos,
+                "the reviewable golden should retain its self-loop edge");
+            t.IsTrue(
+                diagnostic.find(
+                    "facts-in={vf0=constant,"
+                    "vi0=constant") !=
+                    std::string::npos,
+                "serialized diagnostics should expose constant and pipeline facts");
         });
 
         tc.Run("RAC1 steady-workload encodings all map to explicit IR", [](TestCase &t)

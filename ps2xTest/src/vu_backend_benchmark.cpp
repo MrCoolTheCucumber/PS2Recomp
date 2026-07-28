@@ -1,5 +1,6 @@
 #include "runtime/ps2_gif_arbiter.h"
 #include "runtime/ps2_memory.h"
+#include "runtime/ps2_vu_analysis.h"
 #include "runtime/ps2_vu_recompiler.h"
 #include "runtime/ps2_vu1.h"
 
@@ -252,6 +253,7 @@ namespace
         bool measureVuPlusPath1 = true;
         bool measureInterpreter = true;
         bool measureRecompiler = true;
+        bool analysisCheck = false;
     };
 
     bool parseUnsigned(
@@ -314,6 +316,27 @@ namespace
                     argument == "both";
                 if (!configuration.measureInterpreter &&
                     !configuration.measureRecompiler)
+                {
+                    return false;
+                }
+                continue;
+            }
+            if (option == "--analysis-check")
+            {
+                if (argument == "1" ||
+                    argument == "true" ||
+                    argument == "on")
+                {
+                    configuration.analysisCheck = true;
+                }
+                else if (
+                    argument == "0" ||
+                    argument == "false" ||
+                    argument == "off")
+                {
+                    configuration.analysisCheck = false;
+                }
+                else
                 {
                     return false;
                 }
@@ -850,6 +873,333 @@ namespace
             }
             break;
         }
+        return summary;
+    }
+
+    struct AnalysisCheckSummary
+    {
+        bool valid = false;
+        bool bounded = false;
+        uint64_t analyzedBlocks = 0u;
+        uint64_t executedBlocks = 0u;
+        uint64_t pairs = 0u;
+        uint64_t cycles = 0u;
+        uint64_t staticEdges = 0u;
+        uint64_t dynamicEdges = 0u;
+        uint64_t xgkickBoundaries = 0u;
+        VuExitReason reason = VuExitReason::Inactive;
+        std::string diagnostic;
+    };
+
+    VuAnalysisEntryState analysisEntry(
+        const VuExecutionState &state)
+    {
+        VuAnalysisEntryState entry{
+            .pc = state.pc,
+            .endPending = state.ebit,
+        };
+        if (state.branchPending)
+        {
+            entry.pendingBranch =
+                VuAnalysisPendingBranchKind::Static;
+            entry.pendingBranchTarget =
+                state.branchTarget;
+        }
+        return entry;
+    }
+
+    bool analysisEntryMatchesState(
+        const VuAnalysisEntryState &entry,
+        const VuExecutionState &state)
+    {
+        if (entry.pc != state.pc ||
+            entry.endPending != state.ebit)
+        {
+            return false;
+        }
+        switch (entry.pendingBranch)
+        {
+        case VuAnalysisPendingBranchKind::None:
+            return !state.branchPending;
+        case VuAnalysisPendingBranchKind::Static:
+            return
+                state.branchPending &&
+                state.branchDelay == 0u &&
+                entry.pendingBranchTarget ==
+                    state.branchTarget;
+        case VuAnalysisPendingBranchKind::Dynamic:
+            return
+                state.branchPending &&
+                state.branchDelay == 0u;
+        }
+        return false;
+    }
+
+    AnalysisCheckSummary validateAnalysisTrace(
+        const uint8_t *code, uint32_t codeSize,
+        const uint8_t *initialData, uint32_t dataSize,
+        const VuExecutionState &initialState,
+        PS2Memory &memory, uint32_t maximumPairs)
+    {
+        AnalysisCheckSummary summary;
+        if (!code ||
+            (dataSize != 0u && !initialData))
+        {
+            summary.diagnostic =
+                "analysis trace requires code and data";
+            return summary;
+        }
+
+        VuExecutionState state = initialState;
+        std::vector<uint8_t> data(dataSize);
+        if (dataSize != 0u)
+        {
+            std::memcpy(
+                data.data(), initialData, dataSize);
+        }
+        BufferedPath1Sink effects;
+        VuExecutionContext context{
+            .state = state,
+            .code = code,
+            .codeSize = codeSize,
+            .data = data.data(),
+            .dataSize = dataSize,
+            .sideEffects = effects,
+            .memory = &memory,
+            .enableInstrumentation = false,
+            .enableProgressAccounting = false,
+        };
+        VuUnit unit(VuUnitId::Vu1);
+        VuIrInterpreterBackend interpreter(unit);
+        const VuAnalysisConfiguration configuration{
+            .maximumPairsPerBlock = 64u,
+            .maximumBlocks = 16384u,
+            .hostFeatures =
+                VuRecompilerBackend::hostFeatures(),
+        };
+
+        VuControlFlowGraph graph =
+            analyzeVuControlFlow(
+                code, codeSize,
+                analysisEntry(state),
+                configuration);
+        if (!graph.valid || graph.blocks.empty())
+        {
+            summary.diagnostic =
+                "initial CFG failed: " +
+                graph.diagnostic;
+            return summary;
+        }
+        summary.analyzedBlocks += graph.blocks.size();
+        uint32_t blockIndex = 0u;
+        const uint64_t issuedBefore =
+            state.issuedCycles;
+
+        while (state.active &&
+               summary.pairs < maximumPairs)
+        {
+            if (blockIndex >= graph.blocks.size())
+            {
+                summary.diagnostic =
+                    "resolved CFG block index is out of range";
+                return summary;
+            }
+            const VuAnalysisBlock &block =
+                graph.blocks[blockIndex];
+            if (!analysisEntryMatchesState(
+                    block.entry, state))
+            {
+                summary.diagnostic =
+                    "interpreter state does not match CFG block entry";
+                return summary;
+            }
+
+            ++summary.executedBlocks;
+            uint32_t blockPairs = 0u;
+            VuRunResult lastResult{};
+            bool sawUnsupported = false;
+            for (const VuAnalysisPair &pair :
+                 block.pairs)
+            {
+                if (summary.pairs >= maximumPairs)
+                {
+                    summary.bounded = true;
+                    summary.reason =
+                        VuExitReason::CycleBudget;
+                    break;
+                }
+                if (state.pc != pair.ir.pc)
+                {
+                    summary.diagnostic =
+                        "interpreter PC diverged inside a static block";
+                    return summary;
+                }
+
+                lastResult =
+                    interpreter.run(context, 1u);
+                if (!pair.retires)
+                {
+                    if (lastResult.executedCycles != 0u ||
+                        lastResult.reason !=
+                            VuExitReason::
+                                UnsupportedInstruction)
+                    {
+                        summary.diagnostic =
+                            "unsupported analysis pair retired in the interpreter";
+                        return summary;
+                    }
+                    sawUnsupported = true;
+                    break;
+                }
+                if (lastResult.executedCycles !=
+                    pair.ir.cycles)
+                {
+                    summary.diagnostic =
+                        "analysis pair cost did not match the interpreter";
+                    return summary;
+                }
+                ++blockPairs;
+                summary.pairs +=
+                    lastResult.executedCycles;
+                summary.cycles +=
+                    lastResult.executedCycles;
+                summary.reason = lastResult.reason;
+                if (!state.active)
+                    break;
+            }
+
+            if (summary.bounded)
+                break;
+            if (blockPairs != block.fixedPairs ||
+                blockPairs != block.fixedCycles)
+            {
+                summary.diagnostic =
+                    "fixed block cost did not match the interpreter trace";
+                return summary;
+            }
+
+            if (block.terminal ==
+                    VuAnalysisBlockTerminal::
+                        UnsupportedInstruction)
+            {
+                if (!sawUnsupported)
+                {
+                    summary.diagnostic =
+                        "analysis expected an unsupported exit that the interpreter did not take";
+                    return summary;
+                }
+                summary.reason =
+                    VuExitReason::UnsupportedInstruction;
+                break;
+            }
+            if (block.terminal ==
+                    VuAnalysisBlockTerminal::ProgramEnd)
+            {
+                if (state.active ||
+                    lastResult.reason !=
+                        VuExitReason::ProgramEnded)
+                {
+                    summary.diagnostic =
+                        "analysis program-end cost did not stop the interpreter";
+                    return summary;
+                }
+                summary.reason =
+                    VuExitReason::ProgramEnded;
+                break;
+            }
+            if (!state.active)
+            {
+                summary.diagnostic =
+                    "interpreter stopped at a non-terminal analysis block";
+                return summary;
+            }
+            if (block.terminal ==
+                VuAnalysisBlockTerminal::XgkickBoundary)
+            {
+                ++summary.xgkickBoundaries;
+            }
+
+            const VuAnalysisSuccessor *matched = nullptr;
+            const VuAnalysisSuccessor *dynamic = nullptr;
+            for (const VuAnalysisSuccessor &successor :
+                 block.successors)
+            {
+                if (successor.fixedPairs !=
+                        block.fixedPairs ||
+                    successor.fixedCycles !=
+                        block.fixedCycles)
+                {
+                    summary.diagnostic =
+                        "CFG edge lost its source block cost";
+                    return summary;
+                }
+                if (successor.dynamicTarget)
+                {
+                    dynamic = &successor;
+                    continue;
+                }
+                if (analysisEntryMatchesState(
+                        successor.entry, state))
+                {
+                    matched = &successor;
+                    break;
+                }
+            }
+
+            if (matched)
+            {
+                ++summary.staticEdges;
+                if (matched->targetBlock >=
+                    graph.blocks.size())
+                {
+                    summary.diagnostic =
+                        "static CFG edge has no resolved target";
+                    return summary;
+                }
+                blockIndex = matched->targetBlock;
+                continue;
+            }
+            if (!dynamic ||
+                (state.pc & 7u) != 0u ||
+                state.pc >= codeSize)
+            {
+                summary.diagnostic =
+                    "interpreter successor is absent from the CFG";
+                return summary;
+            }
+
+            ++summary.dynamicEdges;
+            graph = analyzeVuControlFlow(
+                code, codeSize,
+                analysisEntry(state),
+                configuration);
+            if (!graph.valid || graph.blocks.empty())
+            {
+                summary.diagnostic =
+                    "dynamic CFG continuation failed: " +
+                    graph.diagnostic;
+                return summary;
+            }
+            summary.analyzedBlocks +=
+                graph.blocks.size();
+            blockIndex = 0u;
+        }
+
+        if (state.issuedCycles - issuedBefore !=
+                summary.cycles ||
+            summary.pairs != summary.cycles)
+        {
+            summary.diagnostic =
+                "analysis trace cycle accounting did not reconcile";
+            return summary;
+        }
+        if (summary.pairs == maximumPairs &&
+            state.active)
+        {
+            summary.bounded = true;
+            summary.reason = VuExitReason::CycleBudget;
+        }
+        summary.valid = true;
         return summary;
     }
 
@@ -1706,6 +2056,7 @@ int main(int argc, char **argv)
                "[--iterations N] [--warmup N] "
                "[--samples N] "
                "[--cache-churn-iterations N] "
+               "[--analysis-check on|off] "
                "[--scope core|path1|all] "
                "[--backend interpreter|recompiler|both]\n";
         return 2;
@@ -1772,6 +2123,51 @@ int main(int argc, char **argv)
     memory.markVU1CodeModified();
     const VuExecutionState initialState =
         loadInitialState(stateWords, memory);
+
+    if (configuration.analysisCheck)
+    {
+        const AnalysisCheckSummary analysis =
+            validateAnalysisTrace(
+                memory.getVU1Code(),
+                PS2_VU1_CODE_SIZE,
+                initialData.data(),
+                PS2_VU1_DATA_SIZE,
+                initialState,
+                memory,
+                configuration.maximumPairs);
+        if (!analysis.valid)
+        {
+            std::cerr
+                << "VU analysis trace failed: "
+                << analysis.diagnostic << "\n";
+            return 1;
+        }
+        std::cout
+            << "{\"schema_version\":2"
+            << ",\"event\":\"analysis-check\""
+            << ",\"fixture\":\""
+            << configuration.fixtureDirectory.
+                   filename().string()
+            << "\""
+            << ",\"valid\":true"
+            << ",\"bounded\":"
+            << (analysis.bounded ? "true" : "false")
+            << ",\"analyzed_blocks\":"
+            << analysis.analyzedBlocks
+            << ",\"executed_blocks\":"
+            << analysis.executedBlocks
+            << ",\"pairs\":" << analysis.pairs
+            << ",\"cycles\":" << analysis.cycles
+            << ",\"static_edges\":"
+            << analysis.staticEdges
+            << ",\"dynamic_edges\":"
+            << analysis.dynamicEdges
+            << ",\"xgkick_boundaries\":"
+            << analysis.xgkickBoundaries
+            << ",\"exit\":\""
+            << vuExitReasonName(analysis.reason)
+            << "\"}\n";
+    }
 
     VuUnit interpreterUnit(VuUnitId::Vu1);
     VuUnit nativeUnit(VuUnitId::Vu1);

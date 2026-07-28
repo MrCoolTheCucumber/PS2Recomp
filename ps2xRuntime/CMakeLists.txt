@@ -436,6 +436,7 @@ add_library(ps2_runtime STATIC
     src/lib/ps2_perf_jitdump.cpp
     src/lib/ps2_runtime.cpp
     src/lib/ps2_vif1_interpreter.cpp
+    src/lib/vu/ps2_vu_analysis.cpp
     src/lib/vu/ps2_vu_ir.cpp
     src/lib/vu/ps2_vu_ir_interpreter.cpp
     src/lib/vu/ps2_vu_executable_memory.cpp

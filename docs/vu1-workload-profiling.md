@@ -88,6 +88,37 @@ Each `cache-churn-sample` flushes the VU program cache before every timed
 invocation. It requires a recompiler-enabled backend selection and verifies
 the exact same output as the warm and cold paths.
 
+### Static block-analysis validation
+
+`--analysis-check on` is a validation mode, not a timing mode. Before any
+benchmark warm-up it constructs the reusable basic-block CFG from verified
+pair IR, then steps the IR interpreter across each selected block. The
+`analysis-check` JSON record reports analyzed and executed blocks, exact
+pairs/cycles, static and dynamic edges, XGKICK boundaries, and the terminal
+exit. The command fails at the first mismatched PC, fixed cost, successor, or
+exit.
+
+```sh
+BUILD/ps2xTest/vu_backend_benchmark FIXTURE 4096 \
+    --iterations 1 --warmup 1 --samples 1 \
+    --backend interpreter --scope core --analysis-check on
+```
+
+The analysis models branch and E-bit delay state across block boundaries,
+code wrap, unsupported and native fault exits, conditional XGKICK
+advancement, helper and unknown-memory clobbers, instrumentation and
+transactional-verification barriers (including their phase relative to pair
+execution), backwards liveness, VF0/VI0 constants, and the Q/P/VI/FMAC
+pipeline facts already proven by the native emitter. Unsupported diagnostic
+pairs retire no work and declare no architectural or pipeline resource
+effects.
+`serializeVuAnalysis` provides the stable `vu-analysis-v1` diagnostic used by
+small synthetic golden tests.
+
+Do not compare timings from an analysis-check process with ordinary benchmark
+samples: CFG construction and the interpreter trace intentionally warm host
+caches before the measured benchmark starts.
+
 ## Generated-block attribution
 
 Two independent, opt-in facilities attribute native VU work. Both are
