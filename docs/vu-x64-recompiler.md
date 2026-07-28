@@ -47,6 +47,14 @@ families directly. Backend-neutral linear traces continue across sequential
 fallthrough, with canonical-PC side exits for taken control flow. Unsupported
 IR exits at its original PC without retiring or mutating the pair.
 
+Entry pipeline values remain architectural data, not cache-key inputs. A block
+therefore advances entry Q, P, and VI-backup state dynamically. Once an
+instruction in that block establishes a delayed-scalar latency or VI-backup
+countdown, later fallthrough pairs use the statically proven countdown and
+omit inactive-pipeline tests. A VU VI backup is architecturally bounded to two
+pairs; an impossible larger value faults before the block retires work rather
+than entering code compiled under a false invariant.
+
 The helper callback catches all exceptions. No C++ exception may unwind through
 generated code.
 
@@ -95,6 +103,8 @@ Focused tests cover:
 - instrumentation fallback and exact observer/progress counts;
 - retained XGKICK progress across a native side exit;
 - a code-generation change made by a helper;
+- rejection of an impossible VI-backup countdown before pipeline
+  specialization;
 - SysV RBX, RBP, and R12-R15 preservation in a separate assembly caller;
 - exact MXCSR restoration around a raw native entry.
 

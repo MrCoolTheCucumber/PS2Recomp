@@ -150,6 +150,20 @@ namespace
             Active,
         };
 
+        enum class KnownViBackup : uint8_t
+        {
+            Dynamic,
+            Inactive,
+            Active,
+        };
+
+        enum class KnownDelayedScalar : uint8_t
+        {
+            Dynamic,
+            Inactive,
+            Active,
+        };
+
         std::vector<uint8_t> m_buffer;
         Xbyak::CodeGenerator m_code;
         uint64_t m_hostFeatures = 0u;
@@ -320,37 +334,61 @@ namespace
 
         void emitAdvanceDelayedScalar(
             size_t delayedOffset,
-            size_t architecturalOffset)
+            size_t architecturalOffset,
+            KnownDelayedScalar knownState,
+            uint32_t knownCyclesRemaining)
         {
             using DelayedQ = VuPipelineState::DelayedQ;
             using namespace Xbyak;
+
+            if (knownState ==
+                KnownDelayedScalar::Inactive)
+            {
+                return;
+            }
 
             Label done;
             Label commit;
             const int base =
                 pipelineOffset(delayedOffset);
-            m_code.cmp(
-                m_code.byte[
-                    m_code.rbx + base +
-                    offsetof(DelayedQ, active)],
-                0u);
-            m_code.je(done);
-            m_code.mov(
-                m_code.eax,
-                m_code.dword[
-                    m_code.rbx + base +
-                    offsetof(
-                        DelayedQ, cyclesRemaining)]);
-            m_code.test(m_code.eax, m_code.eax);
-            m_code.jz(commit);
-            m_code.dec(m_code.eax);
-            m_code.mov(
-                m_code.dword[
-                    m_code.rbx + base +
-                    offsetof(
-                        DelayedQ, cyclesRemaining)],
-                m_code.eax);
-            m_code.jnz(done);
+            if (knownState ==
+                KnownDelayedScalar::Dynamic)
+            {
+                m_code.cmp(
+                    m_code.byte[
+                        m_code.rbx + base +
+                        offsetof(DelayedQ, active)],
+                    0u);
+                m_code.je(done);
+                m_code.mov(
+                    m_code.eax,
+                    m_code.dword[
+                        m_code.rbx + base +
+                        offsetof(
+                            DelayedQ,
+                            cyclesRemaining)]);
+                m_code.test(m_code.eax, m_code.eax);
+                m_code.jz(commit);
+                m_code.dec(m_code.eax);
+                m_code.mov(
+                    m_code.dword[
+                        m_code.rbx + base +
+                        offsetof(
+                            DelayedQ,
+                            cyclesRemaining)],
+                    m_code.eax);
+                m_code.jnz(done);
+            }
+            else if (knownCyclesRemaining > 1u)
+            {
+                m_code.dec(
+                    m_code.dword[
+                        m_code.rbx + base +
+                        offsetof(
+                            DelayedQ,
+                            cyclesRemaining)]);
+                return;
+            }
 
             m_code.L(commit);
             m_code.movss(
@@ -524,37 +562,61 @@ namespace
             m_code.L(done);
         }
 
-        void emitAdvancePipelines(
-            KnownFmacSlot knownFmacSlot)
+        void emitAdvanceViBackup(
+            KnownViBackup knownViBackup)
         {
-            emitAdvanceDelayedScalar(
-                offsetof(
-                    VuPipelineState, delayedQ),
-                offsetof(VuExecutionState, q));
-            emitAdvanceDelayedScalar(
-                offsetof(
-                    VuPipelineState, delayedP),
-                offsetof(VuExecutionState, p));
-            emitAdvanceFmacFlags(knownFmacSlot);
+            if (knownViBackup ==
+                KnownViBackup::Inactive)
+            {
+                return;
+            }
+
+            constexpr int cyclesOffset =
+                stateOffset(
+                    offsetof(
+                        VuExecutionState,
+                        viBackupCycles));
+            if (knownViBackup ==
+                KnownViBackup::Active)
+            {
+                m_code.dec(
+                    m_code.byte[
+                        m_code.rbx + cyclesOffset]);
+                return;
+            }
 
             Xbyak::Label noBackup;
             m_code.cmp(
                 m_code.byte[
-                    m_code.rbx +
-                    stateOffset(
-                        offsetof(
-                            VuExecutionState,
-                            viBackupCycles))],
+                    m_code.rbx + cyclesOffset],
                 0u);
             m_code.je(noBackup);
             m_code.dec(
                 m_code.byte[
-                    m_code.rbx +
-                    stateOffset(
-                        offsetof(
-                            VuExecutionState,
-                            viBackupCycles))]);
+                    m_code.rbx + cyclesOffset]);
             m_code.L(noBackup);
+        }
+
+        void emitAdvancePipelines(
+            KnownFmacSlot knownFmacSlot,
+            KnownViBackup knownViBackup,
+            KnownDelayedScalar knownQ,
+            uint32_t knownQCyclesRemaining,
+            KnownDelayedScalar knownP,
+            uint32_t knownPCyclesRemaining)
+        {
+            emitAdvanceDelayedScalar(
+                offsetof(
+                    VuPipelineState, delayedQ),
+                offsetof(VuExecutionState, q),
+                knownQ, knownQCyclesRemaining);
+            emitAdvanceDelayedScalar(
+                offsetof(
+                    VuPipelineState, delayedP),
+                offsetof(VuExecutionState, p),
+                knownP, knownPCyclesRemaining);
+            emitAdvanceFmacFlags(knownFmacSlot);
+            emitAdvanceViBackup(knownViBackup);
         }
 
         void emitBackupVi(uint8_t reg)
@@ -2211,7 +2273,12 @@ namespace
             Xbyak::Label &dynamicExit,
             bool enforceZeroRegisters,
             bool handleBranchState,
-            KnownFmacSlot knownFmacSlot)
+            KnownFmacSlot knownFmacSlot,
+            KnownViBackup knownViBackup,
+            KnownDelayedScalar knownQ,
+            uint32_t knownQCyclesRemaining,
+            KnownDelayedScalar knownP,
+            uint32_t knownPCyclesRemaining)
         {
             using namespace Xbyak;
             constexpr int activeOffset =
@@ -2277,7 +2344,10 @@ namespace
                     0u);
                 m_code.jne(*fallback, m_code.T_NEAR);
             }
-            emitAdvancePipelines(knownFmacSlot);
+            emitAdvancePipelines(
+                knownFmacSlot, knownViBackup,
+                knownQ, knownQCyclesRemaining,
+                knownP, knownPCyclesRemaining);
             if (vuIrHasOpFlag(
                     pair.lower, VuIrOpQBarrier))
             {
@@ -2621,11 +2691,27 @@ namespace
             Label epilogue;
             Label body;
             Label skipFloatModeRestore;
+            Label invalidPipelineState;
+            Label pipelineStateValid;
 
             emitRawEntry(backend, body);
             m_fastEntryOffset = m_code.getSize();
             emitFastEntry(backend, body);
             m_code.L(body);
+            m_code.test(m_code.rbx, m_code.rbx);
+            m_code.jz(pipelineStateValid);
+            m_code.cmp(
+                m_code.byte[
+                    m_code.rbx +
+                    stateOffset(
+                        offsetof(
+                            VuExecutionState,
+                            viBackupCycles))],
+                2u);
+            m_code.ja(
+                invalidPipelineState,
+                m_code.T_NEAR);
+            m_code.L(pipelineStateValid);
 
             if (block.pairs.empty())
             {
@@ -2639,6 +2725,12 @@ namespace
                 m_code.jmp(packResult, m_code.T_NEAR);
             }
 
+            bool viBackupKnown = false;
+            uint8_t viBackupCycles = 2u;
+            bool qKnown = false;
+            uint32_t qCyclesRemaining = 0u;
+            bool pKnown = false;
+            uint32_t pCyclesRemaining = 0u;
             for (size_t pairIndex = 0u;
                  pairIndex < block.pairs.size();
                  ++pairIndex)
@@ -2693,6 +2785,24 @@ namespace
                             ? KnownFmacSlot::Active
                             : KnownFmacSlot::Inactive;
                 }
+                const KnownViBackup knownViBackup =
+                    !viBackupKnown
+                        ? KnownViBackup::Dynamic
+                        : viBackupCycles != 0u
+                              ? KnownViBackup::Active
+                              : KnownViBackup::Inactive;
+                const KnownDelayedScalar knownQ =
+                    !qKnown
+                        ? KnownDelayedScalar::Dynamic
+                        : qCyclesRemaining != 0u
+                              ? KnownDelayedScalar::Active
+                              : KnownDelayedScalar::Inactive;
+                const KnownDelayedScalar knownP =
+                    !pKnown
+                        ? KnownDelayedScalar::Dynamic
+                        : pCyclesRemaining != 0u
+                              ? KnownDelayedScalar::Active
+                              : KnownDelayedScalar::Inactive;
 
                 if (inlinePair)
                 {
@@ -2705,7 +2815,10 @@ namespace
                             &fallback, xgkickHelper,
                             dynamicExit, true,
                             handleBranchState,
-                            knownFmacSlot);
+                            knownFmacSlot,
+                            knownViBackup,
+                            knownQ, qCyclesRemaining,
+                            knownP, pCyclesRemaining);
                         m_code.jmp(
                             done, m_code.T_NEAR);
                         m_code.L(fallback);
@@ -2721,13 +2834,82 @@ namespace
                             nullptr, xgkickHelper,
                             dynamicExit, false,
                             handleBranchState,
-                            knownFmacSlot);
+                            knownFmacSlot,
+                            knownViBackup,
+                            knownQ, qCyclesRemaining,
+                            knownP, pCyclesRemaining);
                     }
                 }
                 else
                 {
                     emitHelperPair(
                         pair, pairHelper, dynamicExit);
+                }
+
+                if (viBackupCycles != 0u)
+                    --viBackupCycles;
+                if (!viBackupKnown &&
+                    viBackupCycles == 0u)
+                {
+                    viBackupKnown = true;
+                }
+                uint8_t backedUpRegister = 0u;
+                switch (pair.lower.opcode)
+                {
+                case VuIrOpcode::LowerLqi:
+                case VuIrOpcode::LowerLqd:
+                    backedUpRegister =
+                        static_cast<uint8_t>(
+                            (pair.lowerWord >> 11u) &
+                            0x0fu);
+                    break;
+                case VuIrOpcode::LowerSqi:
+                case VuIrOpcode::LowerSqd:
+                case VuIrOpcode::LowerMtir:
+                    backedUpRegister =
+                        static_cast<uint8_t>(
+                            (pair.lowerWord >> 16u) &
+                            0x0fu);
+                    break;
+                default:
+                    break;
+                }
+                if (backedUpRegister != 0u)
+                {
+                    viBackupKnown = true;
+                    viBackupCycles = 2u;
+                }
+                if (qKnown &&
+                    qCyclesRemaining != 0u)
+                {
+                    --qCyclesRemaining;
+                }
+                if (vuIrHasOpFlag(
+                        pair.lower, VuIrOpQBarrier))
+                {
+                    qKnown = true;
+                    qCyclesRemaining =
+                        vuIrHasOpFlag(
+                            pair.lower,
+                            VuIrOpWritesQ)
+                            ? pair.lower.latency
+                            : 0u;
+                }
+                if (pKnown &&
+                    pCyclesRemaining != 0u)
+                {
+                    --pCyclesRemaining;
+                }
+                if (vuIrHasOpFlag(
+                        pair.lower, VuIrOpPBarrier))
+                {
+                    pKnown = true;
+                    pCyclesRemaining =
+                        vuIrHasOpFlag(
+                            pair.lower,
+                            VuIrOpWritesP)
+                            ? pair.lower.latency
+                            : 0u;
                 }
 
                 if (pairIndex + 1u <
@@ -2805,6 +2987,13 @@ namespace
 
             m_code.L(dynamicExit);
             m_code.mov(m_code.r10d, m_code.r11d);
+
+            m_code.jmp(packResult, m_code.T_NEAR);
+            m_code.L(invalidPipelineState);
+            m_code.mov(
+                m_code.r10d,
+                static_cast<uint32_t>(
+                    VuNativeBlockExit::Fault));
 
             m_code.L(packResult);
             m_code.mov(m_code.eax, m_code.r14d);

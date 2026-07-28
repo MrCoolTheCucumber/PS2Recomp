@@ -1832,6 +1832,59 @@ void register_ps2_vu_recompiler_tests()
             });
 
         tc.Run(
+            "native pipeline specialization rejects an impossible VI backup countdown",
+            [](TestCase &t)
+            {
+                if (!VuRecompilerBackend::supported())
+                    return;
+
+                VuNativeFixture fixture;
+                t.IsTrue(
+                    fixture.initialize(),
+                    "VU memory fixture should initialize");
+                writePair(
+                    fixture.code, 0u, 0u,
+                    kVuUpperNop | kVuUpperEnd);
+                writePair(
+                    fixture.code, 8u, 0u, kVuUpperNop);
+                fixture.memory.markVU1CodeModified();
+
+                VuUnit unit(VuUnitId::Vu1);
+                VuRecompilerBackend backend(unit);
+                VuExecutionState state =
+                    initialSyntheticState();
+                VuTransactionalSideEffectSink effects;
+                VuExecutionContext context =
+                    makeContext(state, fixture, effects);
+                const VuRunResult compileRun =
+                    backend.run(context, 1u);
+                t.Equals(
+                    compileRun.executedCycles, uint32_t{1u},
+                    "the valid cold run should compile one pair");
+
+                state = initialSyntheticState();
+                state.viBackupCycles = 3u;
+                const VuRecompilerDiagnostics before =
+                    backend.diagnostics();
+                const VuRunResult invalid =
+                    backend.run(context, 1u);
+                t.Equals(
+                    invalid.executedCycles, uint32_t{0u},
+                    "an invalid entry countdown must not retire work");
+                t.IsTrue(
+                    invalid.reason == VuExitReason::Fault,
+                    "an invalid entry countdown should fault");
+                t.Equals(
+                    state.viBackupCycles, uint8_t{3u},
+                    "the rejected state must remain untouched");
+                t.Equals(
+                    backend.diagnostics().faultExits -
+                        before.faultExits,
+                    uint64_t{1u},
+                    "the rejected entry should be diagnosed");
+            });
+
+        tc.Run(
             "raw entry preserves SysV registers and MXCSR",
             [](TestCase &t)
             {
