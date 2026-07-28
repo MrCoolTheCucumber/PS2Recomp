@@ -38,6 +38,7 @@ struct VuProgramKey
     uint32_t addressMask = 0u;
     uint32_t entryPc = 0u;
     uint64_t codeGeneration = 0u;
+    uint64_t codeContentIdentity = 0u;
     VuNativeBackendMode backend =
         VuNativeBackendMode::X86_64;
     uint64_t hostFeatures = 0u;
@@ -78,8 +79,8 @@ struct VuProgramHandle
 
 struct VuProgramCacheLimits
 {
-    size_t maximumPrograms = 256u;
-    size_t maximumExecutableBytes = 16u * 1024u * 1024u;
+    size_t maximumPrograms = 3072u;
+    size_t maximumExecutableBytes = 96u * 1024u * 1024u;
 };
 
 struct VuProgramCacheDiagnostics
@@ -89,6 +90,9 @@ struct VuProgramCacheDiagnostics
     uint64_t compilations = 0u;
     uint64_t invalidations = 0u;
     uint64_t invalidatedPrograms = 0u;
+    uint64_t generationRetentions = 0u;
+    uint64_t retainedPrograms = 0u;
+    uint64_t crossGenerationHits = 0u;
     uint64_t evictionFlushes = 0u;
     uint64_t evictedPrograms = 0u;
     uint64_t manualFlushes = 0u;
@@ -152,6 +156,13 @@ private:
         size_t operator()(const VuProgramKey &key) const;
     };
 
+    struct KeyEqual
+    {
+        bool operator()(
+            const VuProgramKey &left,
+            const VuProgramKey &right) const;
+    };
+
     struct Scope
     {
         uintptr_t memoryIdentity = 0u;
@@ -173,7 +184,11 @@ private:
     bool activateScope(
         const VuProgramKey &key,
         std::string *diagnostic = nullptr);
+    void retainProgramsForGeneration();
     void discardPrograms(FlushReason reason);
+    [[nodiscard]] static bool sameProgramIdentity(
+        const VuProgramKey &left,
+        const VuProgramKey &right);
     static uint64_t nextEpoch(uint64_t epoch);
     static bool fail(
         std::string message, std::string *diagnostic);
@@ -186,7 +201,7 @@ private:
     uint64_t m_epoch = 1u;
     std::vector<VuCompiledProgram> m_programs;
     std::unordered_map<
-        VuProgramKey, uint32_t, KeyHash> m_lookup;
+        VuProgramKey, uint32_t, KeyHash, KeyEqual> m_lookup;
     VuProgramCacheDiagnostics m_diagnostics{};
     mutable bool m_ownerBound = false;
     mutable std::thread::id m_ownerThread;

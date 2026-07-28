@@ -25,6 +25,10 @@ namespace
     using Clock = std::chrono::steady_clock;
     constexpr uint32_t kNativePairExecuted = 1u << 31u;
     constexpr uint32_t kNativePairExitMask = 0xffu;
+    constexpr uint64_t kFnv1a64Offset =
+        14695981039346656037ull;
+    constexpr uint64_t kFnv1a64Prime =
+        1099511628211ull;
 
     bool fail(
         std::string message, std::string *diagnostic)
@@ -32,6 +36,19 @@ namespace
         if (diagnostic)
             *diagnostic = std::move(message);
         return false;
+    }
+
+    uint64_t hashCodeImage(
+        const uint8_t *code, uint32_t codeSize)
+    {
+        uint64_t hash = kFnv1a64Offset;
+        for (uint32_t index = 0u;
+             index < codeSize; ++index)
+        {
+            hash ^= code[index];
+            hash *= kFnv1a64Prime;
+        }
+        return hash;
     }
 
 #if PS2X_HAS_VU_X64_RECOMPILER
@@ -2814,7 +2831,7 @@ bool VuRecompilerBackend::programKey(
     const VuExecutionContext &context,
     VuCompilationMode mode,
     VuProgramKey &key,
-    std::string *diagnostic) const
+    std::string *diagnostic)
 {
     if (!supported())
     {
@@ -2866,6 +2883,14 @@ bool VuRecompilerBackend::programKey(
             "native VU code size does not match its unit",
             diagnostic);
     }
+    const uint64_t contentIdentity =
+        codeContentIdentity(context, generation);
+    if (contentIdentity == 0u)
+    {
+        return fail(
+            "native VU code content identity is unavailable",
+            diagnostic);
+    }
 
     key = {
         .unit = codeUnit,
@@ -2877,11 +2902,92 @@ bool VuRecompilerBackend::programKey(
         .addressMask = context.codeSize - 1u,
         .entryPc = context.state.pc,
         .codeGeneration = generation,
+        .codeContentIdentity = contentIdentity,
         .backend = VuNativeBackendMode::X86_64,
         .hostFeatures = hostFeatures(),
         .compilationMode = mode,
     };
     return VuProgramCache::validKey(key, diagnostic);
+}
+
+uint64_t VuRecompilerBackend::codeContentIdentity(
+    const VuExecutionContext &context,
+    uint64_t generation)
+{
+    const uintptr_t memoryIdentity =
+        reinterpret_cast<uintptr_t>(context.memory);
+    const uintptr_t codeIdentity =
+        reinterpret_cast<uintptr_t>(context.code);
+    const bool sameScope =
+        m_currentCodeMemoryIdentity == memoryIdentity &&
+        m_currentCodeIdentity == codeIdentity &&
+        m_currentCodeSize == context.codeSize;
+    if (sameScope &&
+        m_currentCodeContentIdentity != 0u &&
+        m_currentCodeGeneration == generation)
+    {
+        return m_currentCodeContentIdentity;
+    }
+    if (!sameScope)
+    {
+        m_codeImages.clear();
+        m_currentCodeContentIdentity = 0u;
+    }
+
+    const uint64_t hash =
+        hashCodeImage(context.code, context.codeSize);
+    uint64_t identity = 0u;
+    for (const CodeImageIdentity &image : m_codeImages)
+    {
+        if (image.memoryIdentity == memoryIdentity &&
+            image.codeIdentity == codeIdentity &&
+            image.codeSize == context.codeSize &&
+            image.hash == hash &&
+            image.bytes.size() == context.codeSize &&
+            std::memcmp(
+                image.bytes.data(), context.code,
+                context.codeSize) == 0)
+        {
+            identity = image.identity;
+            ++m_diagnostics.codeImageReuses;
+            break;
+        }
+    }
+
+    if (identity == 0u)
+    {
+        if (m_codeImages.size() >=
+            kMaximumRememberedCodeImages)
+        {
+            m_codeImages.erase(m_codeImages.begin());
+            ++m_diagnostics.codeImageCatalogEvictions;
+        }
+        if (m_nextCodeContentIdentity == 0u)
+        {
+            m_codeImages.clear();
+            m_unit.programCache().flush();
+            m_nextCodeContentIdentity = 1u;
+        }
+        identity = m_nextCodeContentIdentity++;
+        ++m_diagnostics.codeImageIdentities;
+        m_codeImages.push_back({
+            .memoryIdentity = memoryIdentity,
+            .codeIdentity = codeIdentity,
+            .codeSize = context.codeSize,
+            .hash = hash,
+            .identity = identity,
+            .bytes = std::vector<uint8_t>(
+                context.code,
+                context.code + context.codeSize),
+        });
+    }
+
+    m_currentCodeMemoryIdentity = memoryIdentity;
+    m_currentCodeIdentity = codeIdentity;
+    m_currentCodeSize = context.codeSize;
+    m_currentCodeGeneration = generation;
+    m_currentCodeContentIdentity = identity;
+    return identity;
 }
 
 VuRunResult VuRecompilerBackend::run(

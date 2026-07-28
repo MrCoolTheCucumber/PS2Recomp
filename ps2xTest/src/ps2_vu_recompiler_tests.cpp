@@ -1295,7 +1295,7 @@ void register_ps2_vu_recompiler_tests()
             });
 
         tc.Run(
-            "warm hits and generation invalidation replace native code",
+            "warm hits reuse exact images and replace changed native code",
             [](TestCase &t)
             {
                 if (!VuRecompilerBackend::supported())
@@ -1350,6 +1350,22 @@ void register_ps2_vu_recompiler_tests()
                     warm.reason == VuExitReason::ProgramEnded,
                     "the warm native run should complete");
 
+                fixture.memory.markVU1CodeModified();
+                state = initialSyntheticState();
+                effects.clear();
+                const VuRunResult identical =
+                    backend.run(context, 2u);
+                t.IsTrue(
+                    identical.reason ==
+                        VuExitReason::ProgramEnded,
+                    "an identical reupload generation should complete");
+                t.Equals(
+                    state.vi[1], int32_t{1},
+                    "an identical reupload should preserve semantics");
+                t.IsNull(
+                    unit.programCache().resolve(oldHandle),
+                    "the write generation must stale its old direct handle");
+
                 writePair(
                     fixture.code, 0u,
                     makeVuIaddiu(1u, 0u, 2),
@@ -1374,10 +1390,19 @@ void register_ps2_vu_recompiler_tests()
                     unit.programCache().diagnostics();
                 t.Equals(
                     cache.compilations, uint64_t{2u},
-                    "cold and replacement generations should compile");
+                    "only cold and changed content should compile");
                 t.Equals(
-                    cache.invalidations, uint64_t{1u},
-                    "the generation transition should invalidate once");
+                    cache.invalidations, uint64_t{2u},
+                    "both generation transitions should stale handles");
+                t.Equals(
+                    cache.generationRetentions, uint64_t{2u},
+                    "content-tracked generations should retain residents");
+                t.IsTrue(
+                    cache.crossGenerationHits >= 1u,
+                    "the identical image should hit across generations");
+                t.Equals(
+                    cache.residentPrograms, size_t{2u},
+                    "changed and recurring code images should remain resident");
                 t.IsTrue(
                     cache.hits >= 2u,
                     "explicit lookup and warm execution should hit");

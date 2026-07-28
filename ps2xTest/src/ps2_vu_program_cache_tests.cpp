@@ -392,6 +392,79 @@ void register_ps2_vu_program_cache_tests()
             });
 
         tc.Run(
+            "exact content identity reuses programs across stale generations",
+            [](TestCase &t)
+            {
+                int memoryIdentity = 0;
+                int codeIdentity = 0;
+                VuProgramKey firstKey =
+                    syntheticKey(
+                        VuUnitId::Vu1,
+                        &memoryIdentity, &codeIdentity);
+                firstKey.codeContentIdentity = 0x1234u;
+                VuProgramCache cache(VuUnitId::Vu1);
+                const VuProgramHandle first =
+                    cache.insert(makeProgram(firstKey));
+
+                VuProgramKey sameContent = firstKey;
+                ++sameContent.codeGeneration;
+                t.IsNull(
+                    cache.resolveCurrent(first, sameContent),
+                    "a direct handle must not cross a write generation");
+                const VuProgramHandle reused =
+                    cache.lookup(sameContent);
+                t.IsTrue(
+                    reused.valid(),
+                    "an exact recurring code image should reuse native code");
+                t.IsFalse(
+                    reused == first,
+                    "generation activation should advance the handle epoch");
+                t.IsNull(
+                    cache.resolve(first),
+                    "the pre-write handle should remain stale");
+                t.IsNotNull(
+                    cache.resolveCurrent(reused, sameContent),
+                    "the rebound handle should resolve current content");
+
+                VuProgramKey differentContent = sameContent;
+                ++differentContent.codeGeneration;
+                ++differentContent.codeContentIdentity;
+                t.IsFalse(
+                    cache.lookup(differentContent).valid(),
+                    "different exact content must not alias resident code");
+                const VuProgramHandle second =
+                    cache.insert(makeProgram(differentContent));
+                t.IsTrue(
+                    second.valid(),
+                    "different content should compile independently");
+
+                VuProgramKey recurringContent = firstKey;
+                recurringContent.codeGeneration =
+                    differentContent.codeGeneration + 1u;
+                const VuProgramHandle recurring =
+                    cache.lookup(recurringContent);
+                t.IsTrue(
+                    recurring.valid(),
+                    "a later return to exact content should reuse the first program");
+                t.IsNotNull(
+                    cache.resolveCurrent(
+                        recurring, recurringContent),
+                    "the recurring content handle should be current");
+
+                const VuProgramCacheDiagnostics stats =
+                    cache.diagnostics();
+                t.Equals(
+                    stats.compilations, uint64_t{2u},
+                    "only distinct content should compile");
+                t.Equals(
+                    stats.invalidations, uint64_t{3u},
+                    "every generation should stale prior handles");
+                t.Equals(
+                    stats.residentPrograms, size_t{2u},
+                    "both exact content images should remain bounded residents");
+            });
+
+        tc.Run(
             "code-space identity and extent changes replace the active scope",
             [](TestCase &t)
             {

@@ -8,6 +8,7 @@
 #include <cstdint>
 #include <string>
 #include <string_view>
+#include <vector>
 
 enum class VuNativeBlockExit : uint32_t
 {
@@ -65,6 +66,9 @@ struct VuRecompilerDiagnostics
     uint64_t faultExits = 0u;
     uint64_t interpreterInstrumentationFallbacks = 0u;
     uint64_t interpreterFallbackPairs = 0u;
+    uint64_t codeImageIdentities = 0u;
+    uint64_t codeImageReuses = 0u;
+    uint64_t codeImageCatalogEvictions = 0u;
 };
 
 class VuRecompilerBackend final : public IVuExecutionBackend
@@ -85,7 +89,7 @@ public:
         const VuExecutionContext &context,
         VuCompilationMode mode,
         VuProgramKey &key,
-        std::string *diagnostic = nullptr) const;
+        std::string *diagnostic = nullptr);
 
     [[nodiscard]] VuRecompilerDiagnostics diagnostics() const
     {
@@ -102,6 +106,17 @@ private:
     static constexpr uint32_t kMaximumBlockPairs = 64u;
     static constexpr size_t kMaximumDispatchEntries =
         0x4000u / 8u;
+    static constexpr size_t kMaximumRememberedCodeImages = 64u;
+
+    struct CodeImageIdentity
+    {
+        uintptr_t memoryIdentity = 0u;
+        uintptr_t codeIdentity = 0u;
+        uint32_t codeSize = 0u;
+        uint64_t hash = 0u;
+        uint64_t identity = 0u;
+        std::vector<uint8_t> bytes;
+    };
 
     [[nodiscard]] uint32_t executePair(
         VuExecutionContext &context, uint32_t expectedPc,
@@ -119,6 +134,9 @@ private:
     [[nodiscard]] VuProgramHandle lookupOrCompile(
         VuExecutionContext &context,
         const VuProgramKey &key);
+    [[nodiscard]] uint64_t codeContentIdentity(
+        const VuExecutionContext &context,
+        uint64_t generation);
     [[nodiscard]] bool compile(
         VuExecutionContext &context,
         const VuProgramKey &key,
@@ -138,6 +156,13 @@ private:
     std::array<
         VuProgramHandle,
         kMaximumDispatchEntries> m_dispatchHandles{};
+    std::vector<CodeImageIdentity> m_codeImages;
+    uintptr_t m_currentCodeMemoryIdentity = 0u;
+    uintptr_t m_currentCodeIdentity = 0u;
+    uint32_t m_currentCodeSize = 0u;
+    uint64_t m_currentCodeGeneration = 0u;
+    uint64_t m_currentCodeContentIdentity = 0u;
+    uint64_t m_nextCodeContentIdentity = 1u;
     uint64_t m_helperPairsIssued = 0u;
     std::string m_lastDiagnostic;
 };

@@ -6611,6 +6611,12 @@ void PS2Runtime::debugPublishVuBackendDiagnostics()
                     .invalidations = source.invalidations,
                     .invalidatedPrograms =
                         source.invalidatedPrograms,
+                    .generationRetentions =
+                        source.generationRetentions,
+                    .retainedPrograms =
+                        source.retainedPrograms,
+                    .crossGenerationHits =
+                        source.crossGenerationHits,
                     .evictionFlushes = source.evictionFlushes,
                     .evictedPrograms = source.evictedPrograms,
                     .manualFlushes = source.manualFlushes,
@@ -6654,6 +6660,12 @@ void PS2Runtime::debugPublishVuBackendDiagnostics()
                         source->interpreterInstrumentationFallbacks,
                     .interpreterFallbackPairs =
                         source->interpreterFallbackPairs,
+                    .codeImageIdentities =
+                        source->codeImageIdentities,
+                    .codeImageReuses =
+                        source->codeImageReuses,
+                    .codeImageCatalogEvictions =
+                        source->codeImageCatalogEvictions,
                 };
             }
             return result;

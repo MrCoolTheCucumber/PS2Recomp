@@ -40,6 +40,11 @@ VuProgramHandle VuProgramCache::lookup(
     }
 
     ++m_diagnostics.hits;
+    if (m_programs[found->second].key.codeGeneration !=
+        key.codeGeneration)
+    {
+        ++m_diagnostics.crossGenerationHits;
+    }
     return {
         .epoch = m_epoch,
         .index = found->second,
@@ -176,9 +181,20 @@ const VuCompiledProgram *VuProgramCache::resolveCurrent(
     const VuProgramKey &expectedKey)
 {
     requireOwnerThread();
-    if (!handle.valid() || handle.epoch != m_epoch ||
+    const Scope expectedScope{
+        .memoryIdentity = expectedKey.memoryIdentity,
+        .codeIdentity = expectedKey.codeIdentity,
+        .codeSize = expectedKey.codeSize,
+        .addressMask = expectedKey.addressMask,
+    };
+    if (!m_scopeActive ||
+        m_scope != expectedScope ||
+        m_codeGeneration != expectedKey.codeGeneration ||
+        !handle.valid() || handle.epoch != m_epoch ||
         handle.index >= m_programs.size() ||
-        m_programs[handle.index].key != expectedKey)
+        !sameProgramIdentity(
+            m_programs[handle.index].key,
+            expectedKey))
     {
         return nullptr;
     }
@@ -252,8 +268,22 @@ size_t VuProgramCache::KeyHash::operator()(
     hashCombine(value, std::hash<uint32_t>{}(key.codeSize));
     hashCombine(value, std::hash<uint32_t>{}(key.addressMask));
     hashCombine(value, std::hash<uint32_t>{}(key.entryPc));
-    hashCombine(
-        value, std::hash<uint64_t>{}(key.codeGeneration));
+    if (key.codeContentIdentity != 0u)
+    {
+        hashCombine(value, 1u);
+        hashCombine(
+            value,
+            std::hash<uint64_t>{}(
+                key.codeContentIdentity));
+    }
+    else
+    {
+        hashCombine(value, 0u);
+        hashCombine(
+            value,
+            std::hash<uint64_t>{}(
+                key.codeGeneration));
+    }
     hashCombine(
         value, std::hash<uint8_t>{}(
                    static_cast<uint8_t>(key.backend)));
@@ -264,6 +294,39 @@ size_t VuProgramCache::KeyHash::operator()(
                    static_cast<uint8_t>(
                        key.compilationMode)));
     return value;
+}
+
+bool VuProgramCache::KeyEqual::operator()(
+    const VuProgramKey &left,
+    const VuProgramKey &right) const
+{
+    return sameProgramIdentity(left, right);
+}
+
+bool VuProgramCache::sameProgramIdentity(
+    const VuProgramKey &left,
+    const VuProgramKey &right)
+{
+    if (left.unit != right.unit ||
+        left.memoryIdentity != right.memoryIdentity ||
+        left.codeIdentity != right.codeIdentity ||
+        left.codeSize != right.codeSize ||
+        left.addressMask != right.addressMask ||
+        left.entryPc != right.entryPc ||
+        left.backend != right.backend ||
+        left.hostFeatures != right.hostFeatures ||
+        left.compilationMode != right.compilationMode)
+    {
+        return false;
+    }
+    if (left.codeContentIdentity != 0u ||
+        right.codeContentIdentity != 0u)
+    {
+        return left.codeContentIdentity != 0u &&
+               left.codeContentIdentity ==
+                   right.codeContentIdentity;
+    }
+    return left.codeGeneration == right.codeGeneration;
 }
 
 void VuProgramCache::requireOwnerThread() const
@@ -309,16 +372,32 @@ bool VuProgramCache::activateScope(
             diagnostic->clear();
         return true;
     }
-    if (m_scope != scope ||
-        m_codeGeneration != key.codeGeneration)
+    if (m_scope != scope)
     {
         discardPrograms(FlushReason::Invalidation);
         m_scope = scope;
         m_codeGeneration = key.codeGeneration;
     }
+    else if (m_codeGeneration != key.codeGeneration)
+    {
+        if (key.codeContentIdentity != 0u)
+            retainProgramsForGeneration();
+        else
+            discardPrograms(FlushReason::Invalidation);
+        m_codeGeneration = key.codeGeneration;
+    }
     if (diagnostic)
         diagnostic->clear();
     return true;
+}
+
+void VuProgramCache::retainProgramsForGeneration()
+{
+    ++m_diagnostics.invalidations;
+    ++m_diagnostics.generationRetentions;
+    m_diagnostics.retainedPrograms +=
+        static_cast<uint64_t>(m_programs.size());
+    m_epoch = nextEpoch(m_epoch);
 }
 
 void VuProgramCache::discardPrograms(FlushReason reason)

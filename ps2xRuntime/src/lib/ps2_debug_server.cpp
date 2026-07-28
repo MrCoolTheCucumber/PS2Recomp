@@ -804,6 +804,15 @@ struct PS2DebugServer::Impl
                     "invalidated_programs",
                     source.invalidatedPrograms, allocator);
                 cache.AddMember(
+                    "generation_retentions",
+                    source.generationRetentions, allocator);
+                cache.AddMember(
+                    "retained_programs",
+                    source.retainedPrograms, allocator);
+                cache.AddMember(
+                    "cross_generation_hits",
+                    source.crossGenerationHits, allocator);
+                cache.AddMember(
                     "eviction_flushes",
                     source.evictionFlushes, allocator);
                 cache.AddMember(
@@ -879,6 +888,16 @@ struct PS2DebugServer::Impl
                 recompiler.AddMember(
                     "interpreter_fallback_pairs",
                     source.interpreterFallbackPairs, allocator);
+                recompiler.AddMember(
+                    "code_image_identities",
+                    source.codeImageIdentities, allocator);
+                recompiler.AddMember(
+                    "code_image_reuses",
+                    source.codeImageReuses, allocator);
+                recompiler.AddMember(
+                    "code_image_catalog_evictions",
+                    source.codeImageCatalogEvictions,
+                    allocator);
                 value.AddMember(
                     "recompiler", recompiler, allocator);
             }

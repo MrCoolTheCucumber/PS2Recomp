@@ -804,6 +804,12 @@ int main(int argc, char **argv)
             << recompilerDiagnostics.faultExits
             << ",\"interpreter_fallback_pairs\":"
             << recompilerDiagnostics.interpreterFallbackPairs
+            << ",\"code_image_identities\":"
+            << recompilerDiagnostics.codeImageIdentities
+            << ",\"code_image_reuses\":"
+            << recompilerDiagnostics.codeImageReuses
+            << ",\"code_image_catalog_evictions\":"
+            << recompilerDiagnostics.codeImageCatalogEvictions
             << "}" << std::hex;
     }
     std::cout << ",\"pc\":\"0x"

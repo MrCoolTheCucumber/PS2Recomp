@@ -543,6 +543,9 @@ public:
         uint64_t compilations = 0u;
         uint64_t invalidations = 0u;
         uint64_t invalidatedPrograms = 0u;
+        uint64_t generationRetentions = 0u;
+        uint64_t retainedPrograms = 0u;
+        uint64_t crossGenerationHits = 0u;
         uint64_t evictionFlushes = 0u;
         uint64_t evictedPrograms = 0u;
         uint64_t manualFlushes = 0u;
@@ -570,6 +573,9 @@ public:
         uint64_t faultExits = 0u;
         uint64_t interpreterInstrumentationFallbacks = 0u;
         uint64_t interpreterFallbackPairs = 0u;
+        uint64_t codeImageIdentities = 0u;
+        uint64_t codeImageReuses = 0u;
+        uint64_t codeImageCatalogEvictions = 0u;
     };
 
     struct DebugVuBackendDiagnostics

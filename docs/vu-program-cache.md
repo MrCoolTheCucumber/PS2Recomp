@@ -1,6 +1,6 @@
 # VU compiled-program cache
 
-`VuProgramCache` is the generation-scoped owner for verified VU IR and its
+`VuProgramCache` is the generation-safe owner for verified VU IR and its
 immutable native code. Every `VuUnit` lazily owns a separate cache, so VU0 and
 VU1 can never share entries even when their entry PCs and code bytes happen to
 match.
@@ -20,7 +20,8 @@ A compiled program key contains only inputs which can change compilation:
 | Code identity | Separates host mappings of VU MicroMem |
 | Code size and address mask | Defines PC wrapping and valid entry extent |
 | Entry PC | Selects the compiled block |
-| Code generation | Rejects every pre-write block |
+| Code generation | Stales every pre-write direct handle |
+| Exact code-content identity | Reuses a recurring MicroMem image safely |
 | Native backend and host features | Separates incompatible emitted code |
 | Compilation mode | Separates normal and instrumented blocks |
 
@@ -31,14 +32,21 @@ context.
 `PS2Memory` increments an independent generation for VU0 or VU1 on every
 MicroMem write. This includes direct EE stores and VIF `MPG`, including wrapped
 or byte-identical uploads. Data-memory writes do not change the generation.
-The first implementation does not compare content or reuse code across
-generations.
 
-A cache has one active memory/code scope and generation. Looking up or inserting
-a key from a new scope or generation performs a full invalidation before doing
-anything else. Architectural `VuUnit::reset()` retains the cache because it
-does not modify MicroMem; a subsequent code write or memory rebind changes the
-key and invalidates it.
+The native backend assigns content identities from a bounded catalog of exact
+MicroMem snapshots. FNV-1a is only a candidate prefilter; a byte-for-byte
+comparison is required before an identity is reused, so hash collisions cannot
+alias native code. The catalog remembers at most 64 images and discards its
+oldest comparison snapshot when full without reusing the identity number.
+
+A cache has one active memory/code scope and generation. A new generation
+always advances the handle epoch before lookup. Programs with exact content
+identities remain resident and can be rebound through a fresh handle when the
+whole code image recurs; changed content misses and compiles independently.
+Keys without an exact identity retain the conservative generation-only full
+invalidation behavior. A memory/code scope change still discards every
+resident. Architectural `VuUnit::reset()` retains the cache because it does
+not modify MicroMem.
 
 The native backend must construct a key from the current generation and look it
 up immediately before native entry. It must repeat that validation after any
@@ -49,15 +57,15 @@ crossed by a stale native entry.
 ## Handles, bounds, and lifetime
 
 Insertion returns an opaque `{epoch, index}` handle rather than a durable raw
-entry pointer. Every full invalidation, eviction, or manual flush advances the
-nonzero epoch. Consequently, an old handle cannot resolve even if its vector
-index is reused.
+entry pointer. Every generation transition, full invalidation, eviction, or
+manual flush advances the nonzero epoch. Consequently, an old handle cannot
+resolve even when exact content recurs or its vector index is reused.
 
 Resolved program pointers are valid only until the next non-const cache
 operation on the owner thread. Native callers must not retain an entry pointer
 across cache lookup, insertion, invalidation, or a helper boundary.
 
-The default bounds are 256 programs and 16 MiB of executable mappings per VU.
+The default bounds are 3,072 programs and 96 MiB of executable mappings per VU.
 Crossing either bound performs a deterministic full flush, then inserts the new
 program. A program larger than the byte limit is rejected without disturbing
 resident entries. Full flushes keep ownership simple and make dangling native
@@ -95,7 +103,9 @@ external synchronization.
 `VuProgramCacheDiagnostics` exposes cumulative:
 
 - hits, misses, and accepted compilations;
-- generation/scope invalidations and discarded programs;
+- generation/scope invalidations, retained residents, and programs actually
+  discarded;
+- exact cross-generation reuse hits;
 - eviction flushes, evicted programs, and manual flushes;
 - rejected programs;
 - emitted bytes and compilation nanoseconds;

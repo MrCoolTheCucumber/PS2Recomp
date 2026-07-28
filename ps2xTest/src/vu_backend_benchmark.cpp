@@ -966,6 +966,10 @@ int main(int argc, char **argv)
         << coldCache.compilationNanoseconds
         << ",\"generated_bytes\":"
         << coldCache.generatedBytes
+        << ",\"generation_retentions\":"
+        << coldCache.generationRetentions
+        << ",\"cross_generation_hits\":"
+        << coldCache.crossGenerationHits
         << ",\"resident_programs\":"
         << coldCache.residentPrograms
         << ",\"resident_executable_bytes\":"
