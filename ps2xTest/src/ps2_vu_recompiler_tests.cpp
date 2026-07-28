@@ -23,27 +23,51 @@ namespace
         PS2Memory memory;
         uint8_t *code = nullptr;
         uint8_t *data = nullptr;
+        uint32_t codeSize = 0u;
+        uint32_t dataSize = 0u;
+        VuUnitId unit = VuUnitId::Vu1;
 
-        bool initialize()
+        bool initialize(
+            VuUnitId requestedUnit = VuUnitId::Vu1)
         {
             if (!memory.initialize())
                 return false;
-            code = memory.getVU1Code();
-            data = memory.getVU1Data();
+            unit = requestedUnit;
+            if (unit == VuUnitId::Vu0)
+            {
+                code = memory.getVU0Code();
+                data = memory.getVU0Data();
+                codeSize = PS2_VU0_CODE_SIZE;
+                dataSize = PS2_VU0_DATA_SIZE;
+            }
+            else
+            {
+                code = memory.getVU1Code();
+                data = memory.getVU1Data();
+                codeSize = PS2_VU1_CODE_SIZE;
+                dataSize = PS2_VU1_DATA_SIZE;
+            }
             if (!code || !data)
                 return false;
-            std::memset(code, 0, PS2_VU1_CODE_SIZE);
-            std::memset(data, 0, PS2_VU1_DATA_SIZE);
-            for (uint32_t pc = 0u;
-                 pc < PS2_VU1_CODE_SIZE; pc += 8u)
+            std::memset(code, 0, codeSize);
+            std::memset(data, 0, dataSize);
+            for (uint32_t pc = 0u; pc < codeSize; pc += 8u)
             {
                 std::memcpy(
                     code + pc + 4u,
                     &kVuUpperNop,
                     sizeof(kVuUpperNop));
             }
-            memory.markVU1CodeModified();
+            markCodeModified();
             return true;
+        }
+
+        void markCodeModified()
+        {
+            if (unit == VuUnitId::Vu0)
+                memory.markVU0CodeModified();
+            else
+                memory.markVU1CodeModified();
         }
     };
 
@@ -282,9 +306,9 @@ namespace
         return {
             .state = state,
             .code = fixture.code,
-            .codeSize = PS2_VU1_CODE_SIZE,
+            .codeSize = fixture.codeSize,
             .data = fixture.data,
-            .dataSize = PS2_VU1_DATA_SIZE,
+            .dataSize = fixture.dataSize,
             .sideEffects = effects,
             .memory = &fixture.memory,
             .enableInstrumentation = instrumentation,
@@ -394,8 +418,101 @@ void register_ps2_vu_recompiler_tests()
                     "detached code should not bypass generation tracking");
             });
 
+        tc.Run("synthetic block matches every cycle-budget cut",
+            [](TestCase &t)
+            {
+                if (!VuRecompilerBackend::supported())
+                    return;
+
+                for (const VuUnitId unitId : {
+                         VuUnitId::Vu0,
+                         VuUnitId::Vu1,
+                     })
+                {
+                    VuNativeFixture referenceFixture;
+                    VuNativeFixture nativeFixture;
+                    t.IsTrue(referenceFixture.initialize(unitId),
+                        "reference memory should initialize");
+                    t.IsTrue(nativeFixture.initialize(unitId),
+                        "native memory should initialize");
+                    configureSyntheticProgram(referenceFixture.code);
+                    configureSyntheticProgram(nativeFixture.code);
+                    referenceFixture.markCodeModified();
+                    nativeFixture.markCodeModified();
+
+                    VuUnit referenceUnit(unitId);
+                    VuUnit nativeUnit(unitId);
+                    VuInterpreterBackend reference(referenceUnit);
+                    VuRecompilerBackend native(nativeUnit);
+                    const std::string unitPrefix =
+                        unitId == VuUnitId::Vu0 ? "VU0 " : "VU1 ";
+
+                    for (uint32_t budget = 0u; budget <= 12u; ++budget)
+                    {
+                        std::memset(referenceFixture.data,
+                            0x5a,
+                            referenceFixture.dataSize);
+                        std::memset(
+                            nativeFixture.data, 0x5a, nativeFixture.dataSize);
+                        VuExecutionState referenceState =
+                            initialSyntheticState();
+                        VuExecutionState nativeState = referenceState;
+                        VuTransactionalSideEffectSink referenceEffects;
+                        VuTransactionalSideEffectSink nativeEffects;
+                        VuExecutionContext referenceContext = makeContext(
+                            referenceState, referenceFixture, referenceEffects);
+                        VuExecutionContext nativeContext = makeContext(
+                            nativeState, nativeFixture, nativeEffects);
+
+                        const VuRunResult referenceResult =
+                            reference.run(referenceContext, budget);
+                        const VuRunResult nativeResult =
+                            native.run(nativeContext, budget);
+                        const std::string prefix = unitPrefix + "budget " +
+                                                   std::to_string(budget) +
+                                                   ": ";
+
+                        t.IsTrue(sameRunResult(referenceResult, nativeResult),
+                            prefix + "run result differs (" +
+                                std::string(
+                                    vuExitReasonName(referenceResult.reason)) +
+                                "/" +
+                                std::string(
+                                    vuExitReasonName(nativeResult.reason)) +
+                                ")");
+                        std::string difference;
+                        t.IsTrue(vuExecutionStatesEqual(
+                                     referenceState, nativeState, &difference),
+                            prefix + "state differs at " + difference);
+                        t.IsTrue(std::memcmp(referenceFixture.data,
+                                     nativeFixture.data,
+                                     referenceFixture.dataSize) == 0,
+                            prefix + "VU data differs");
+                        t.IsTrue(referenceEffects.path1Packets() ==
+                                     nativeEffects.path1Packets(),
+                            prefix + "PATH1 effects differ");
+                    }
+
+                    const VuProgramCacheDiagnostics cache =
+                        nativeUnit.programCache().diagnostics();
+                    t.IsTrue(cache.compilations > 0u,
+                        "the differential should compile native blocks");
+                    t.IsTrue(cache.hits > 0u,
+                        "later budget cuts should reuse native blocks");
+                    const VuRecompilerDiagnostics diagnostics =
+                        native.diagnostics();
+                    t.IsTrue(diagnostics.inlinePairs > 0u,
+                        "eligible memory/MULq pairs should run inline");
+                    t.IsTrue(diagnostics.helperPairs > 0u,
+                        "delicate pairs should remain on shared helpers");
+                    t.Equals(diagnostics.inlinePairs + diagnostics.helperPairs,
+                        diagnostics.nativePairs,
+                        "native pair accounting should be complete");
+                }
+            });
+
         tc.Run(
-            "synthetic block matches every cycle-budget cut",
+            "VU0 branch targets wrap within its MicroMem extent",
             [](TestCase &t)
             {
                 if (!VuRecompilerBackend::supported())
@@ -404,107 +521,61 @@ void register_ps2_vu_recompiler_tests()
                 VuNativeFixture referenceFixture;
                 VuNativeFixture nativeFixture;
                 t.IsTrue(
-                    referenceFixture.initialize(),
-                    "reference memory should initialize");
+                    referenceFixture.initialize(
+                        VuUnitId::Vu0),
+                    "reference VU0 memory should initialize");
                 t.IsTrue(
-                    nativeFixture.initialize(),
-                    "native memory should initialize");
-                configureSyntheticProgram(
-                    referenceFixture.code);
-                configureSyntheticProgram(nativeFixture.code);
-                referenceFixture.memory.markVU1CodeModified();
-                nativeFixture.memory.markVU1CodeModified();
+                    nativeFixture.initialize(
+                        VuUnitId::Vu0),
+                    "native VU0 memory should initialize");
+                const uint32_t jump =
+                    makeVuBranchOperation(
+                        0x24u, 1u, 0u, 0);
+                writePair(
+                    referenceFixture.code, 0u,
+                    jump, kVuUpperNop);
+                writePair(
+                    nativeFixture.code, 0u,
+                    jump, kVuUpperNop);
+                referenceFixture.markCodeModified();
+                nativeFixture.markCodeModified();
 
-                VuUnit referenceUnit(VuUnitId::Vu1);
-                VuUnit nativeUnit(VuUnitId::Vu1);
-                VuInterpreterBackend reference(referenceUnit);
+                VuExecutionState referenceState =
+                    initialSyntheticState();
+                referenceState.vi[1] = 0x201;
+                VuExecutionState nativeState =
+                    referenceState;
+                VuTransactionalSideEffectSink
+                    referenceEffects;
+                VuTransactionalSideEffectSink nativeEffects;
+                VuExecutionContext referenceContext =
+                    makeContext(
+                        referenceState, referenceFixture,
+                        referenceEffects);
+                VuExecutionContext nativeContext =
+                    makeContext(
+                        nativeState, nativeFixture,
+                        nativeEffects);
+                VuUnit referenceUnit(VuUnitId::Vu0);
+                VuUnit nativeUnit(VuUnitId::Vu0);
+                VuInterpreterBackend reference(
+                    referenceUnit);
                 VuRecompilerBackend native(nativeUnit);
 
-                for (uint32_t budget = 0u;
-                     budget <= 12u; ++budget)
-                {
-                    std::memset(
-                        referenceFixture.data, 0x5a,
-                        PS2_VU1_DATA_SIZE);
-                    std::memset(
-                        nativeFixture.data, 0x5a,
-                        PS2_VU1_DATA_SIZE);
-                    VuExecutionState referenceState =
-                        initialSyntheticState();
-                    VuExecutionState nativeState =
-                        referenceState;
-                    VuTransactionalSideEffectSink
-                        referenceEffects;
-                    VuTransactionalSideEffectSink nativeEffects;
-                    VuExecutionContext referenceContext =
-                        makeContext(
-                            referenceState,
-                            referenceFixture,
-                            referenceEffects);
-                    VuExecutionContext nativeContext =
-                        makeContext(
-                            nativeState, nativeFixture,
-                            nativeEffects);
-
-                    const VuRunResult referenceResult =
-                        reference.run(
-                            referenceContext, budget);
-                    const VuRunResult nativeResult =
-                        native.run(nativeContext, budget);
-                    const std::string prefix =
-                        "budget " + std::to_string(budget) +
-                        ": ";
-
-                    t.IsTrue(
-                        sameRunResult(
-                            referenceResult, nativeResult),
-                        prefix + "run result differs (" +
-                            std::string(vuExitReasonName(
-                                referenceResult.reason)) +
-                            "/" +
-                            std::string(vuExitReasonName(
-                                nativeResult.reason)) +
-                            ")");
-                    std::string difference;
-                    t.IsTrue(
-                        vuExecutionStatesEqual(
-                            referenceState, nativeState,
-                            &difference),
-                        prefix + "state differs at " +
-                            difference);
-                    t.IsTrue(
-                        std::memcmp(
-                            referenceFixture.data,
-                            nativeFixture.data,
-                            PS2_VU1_DATA_SIZE) == 0,
-                        prefix + "VU data differs");
-                    t.IsTrue(
-                        referenceEffects.path1Packets() ==
-                            nativeEffects.path1Packets(),
-                        prefix + "PATH1 effects differ");
-                }
-
-                const VuProgramCacheDiagnostics cache =
-                    nativeUnit.programCache().diagnostics();
+                const VuRunResult referenceResult =
+                    reference.run(referenceContext, 2u);
+                const VuRunResult nativeResult =
+                    native.run(nativeContext, 2u);
                 t.IsTrue(
-                    cache.compilations > 0u,
-                    "the differential should compile native blocks");
-                t.IsTrue(
-                    cache.hits > 0u,
-                    "later budget cuts should reuse native blocks");
-                const VuRecompilerDiagnostics diagnostics =
-                    native.diagnostics();
-                t.IsTrue(
-                    diagnostics.inlinePairs > 0u,
-                    "eligible memory/MULq pairs should run inline");
-                t.IsTrue(
-                    diagnostics.helperPairs > 0u,
-                    "delicate pairs should remain on shared helpers");
+                    sameRunResult(
+                        referenceResult, nativeResult),
+                    "VU0 branch run results should match");
                 t.Equals(
-                    diagnostics.inlinePairs +
-                        diagnostics.helperPairs,
-                    diagnostics.nativePairs,
-                    "native pair accounting should be complete");
+                    referenceState.pc, uint32_t{8u},
+                    "the interpreter should wrap the VU0 jump target");
+                t.Equals(
+                    nativeState.pc, uint32_t{8u},
+                    "native code should wrap the VU0 jump target");
             });
 
         tc.Run(

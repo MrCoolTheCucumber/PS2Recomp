@@ -356,6 +356,7 @@ private:
 
     VuUnit &m_unit;
     VuExecutionState *m_state = nullptr;
+    uint32_t m_codeAddressMask = 0x3fffu;
 
     DecodedInstructionPair decodeInstructionPair(const uint8_t *vuCode, uint32_t pc) const;
     void rebuildDecodedCodeCache(const uint8_t *vuCode, uint32_t codeSize,

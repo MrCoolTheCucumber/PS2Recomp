@@ -210,7 +210,9 @@ void VuInterpreterBackend::execLower(
     case 0x20: // B (unconditional branch)
     {
         int16_t imm = IMM11(instr);
-        uint32_t target = (state.pc + 8 + imm * 8) & 0x3FFF;
+        uint32_t target =
+            (state.pc + 8 + imm * 8) &
+            m_codeAddressMask;
         state.branchPending = true;
         state.branchTarget = target;
         state.branchDelay = 1;
@@ -220,7 +222,9 @@ void VuInterpreterBackend::execLower(
     {
         uint8_t it = VIT(instr);
         int16_t imm = IMM11(instr);
-        uint32_t target = (state.pc + 8 + imm * 8) & 0x3FFF;
+        uint32_t target =
+            (state.pc + 8 + imm * 8) &
+            m_codeAddressMask;
         if (it != 0)
             state.vi[it] = (int32_t)((state.pc + 16) / 8);
         state.branchPending = true;
@@ -231,7 +235,9 @@ void VuInterpreterBackend::execLower(
     case 0x24: // JR
     {
         uint8_t is = VIS(instr);
-        uint32_t target = ((uint32_t)(uint16_t)state.vi[is] * 8u) & 0x3FFF;
+        uint32_t target =
+            ((uint32_t)(uint16_t)state.vi[is] * 8u) &
+            m_codeAddressMask;
         state.branchPending = true;
         state.branchTarget = target;
         state.branchDelay = 1;
@@ -241,7 +247,9 @@ void VuInterpreterBackend::execLower(
     {
         uint8_t it = VIT(instr);
         uint8_t is = VIS(instr);
-        uint32_t target = ((uint32_t)(uint16_t)state.vi[is] * 8u) & 0x3FFF;
+        uint32_t target =
+            ((uint32_t)(uint16_t)state.vi[is] * 8u) &
+            m_codeAddressMask;
         if (it != 0)
             state.vi[it] = (int32_t)((state.pc + 16) / 8);
         state.branchPending = true;
@@ -256,7 +264,9 @@ void VuInterpreterBackend::execLower(
         int16_t imm = IMM11(instr);
         if (readViForBranch(is) == readViForBranch(it))
         {
-            uint32_t target = (state.pc + 8 + imm * 8) & 0x3FFF;
+            uint32_t target =
+                (state.pc + 8 + imm * 8) &
+                m_codeAddressMask;
             state.branchPending = true;
             state.branchTarget = target;
             state.branchDelay = 1;
@@ -270,7 +280,9 @@ void VuInterpreterBackend::execLower(
         int16_t imm = IMM11(instr);
         if (readViForBranch(is) != readViForBranch(it))
         {
-            uint32_t target = (state.pc + 8 + imm * 8) & 0x3FFF;
+            uint32_t target =
+                (state.pc + 8 + imm * 8) &
+                m_codeAddressMask;
             state.branchPending = true;
             state.branchTarget = target;
             state.branchDelay = 1;
@@ -283,7 +295,9 @@ void VuInterpreterBackend::execLower(
         int16_t imm = IMM11(instr);
         if (readViForBranch(is) < 0)
         {
-            uint32_t target = (state.pc + 8 + imm * 8) & 0x3FFF;
+            uint32_t target =
+                (state.pc + 8 + imm * 8) &
+                m_codeAddressMask;
             state.branchPending = true;
             state.branchTarget = target;
             state.branchDelay = 1;
@@ -296,7 +310,9 @@ void VuInterpreterBackend::execLower(
         int16_t imm = IMM11(instr);
         if (readViForBranch(is) > 0)
         {
-            uint32_t target = (state.pc + 8 + imm * 8) & 0x3FFF;
+            uint32_t target =
+                (state.pc + 8 + imm * 8) &
+                m_codeAddressMask;
             state.branchPending = true;
             state.branchTarget = target;
             state.branchDelay = 1;
@@ -309,7 +325,9 @@ void VuInterpreterBackend::execLower(
         int16_t imm = IMM11(instr);
         if (readViForBranch(is) <= 0)
         {
-            uint32_t target = (state.pc + 8 + imm * 8) & 0x3FFF;
+            uint32_t target =
+                (state.pc + 8 + imm * 8) &
+                m_codeAddressMask;
             state.branchPending = true;
             state.branchTarget = target;
             state.branchDelay = 1;
@@ -322,7 +340,9 @@ void VuInterpreterBackend::execLower(
         int16_t imm = IMM11(instr);
         if (readViForBranch(is) >= 0)
         {
-            uint32_t target = (state.pc + 8 + imm * 8) & 0x3FFF;
+            uint32_t target =
+                (state.pc + 8 + imm * 8) &
+                m_codeAddressMask;
             state.branchPending = true;
             state.branchTarget = target;
             state.branchDelay = 1;

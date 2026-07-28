@@ -119,7 +119,11 @@ namespace
             uint64_t hostFeatures)
             : m_buffer(kEmitterCapacity),
               m_code(m_buffer.size(), m_buffer.data()),
-              m_hostFeatures(hostFeatures)
+              m_hostFeatures(hostFeatures),
+              m_codeAddressMask(
+                  block.codeSize != 0u
+                      ? block.codeSize - 1u
+                      : 0u)
         {
             emit(
                 block, backend, pairHelper,
@@ -167,6 +171,7 @@ namespace
         std::vector<uint8_t> m_buffer;
         Xbyak::CodeGenerator m_code;
         uint64_t m_hostFeatures = 0u;
+        uint32_t m_codeAddressMask = 0x3fffu;
         size_t m_fastEntryOffset = 0u;
         bool m_usesAvx = false;
 
@@ -766,7 +771,7 @@ namespace
             m_code.mov(
                 m_code.dword[
                     m_code.rbx + targetOffset],
-                target & 0x3fffu);
+                target & m_codeAddressMask);
             m_code.mov(
                 m_code.byte[
                     m_code.rbx + delayOffset],
@@ -790,7 +795,8 @@ namespace
                     offsetof(
                         VuExecutionState,
                         branchDelay));
-            m_code.and_(m_code.eax, 0x3fffu);
+            m_code.and_(
+                m_code.eax, m_codeAddressMask);
             m_code.mov(
                 m_code.byte[
                     m_code.rbx + pendingOffset],
@@ -1542,7 +1548,7 @@ namespace
                         static_cast<int32_t>(
                             pair.pc + 8u) +
                         immediate * 8) &
-                    0x3fffu;
+                    m_codeAddressMask;
                 if (pair.lower.opcode ==
                         VuIrOpcode::LowerBal &&
                     viT != 0u)
@@ -1602,7 +1608,7 @@ namespace
                         static_cast<int32_t>(
                             pair.pc + 8u) +
                         immediate * 8) &
-                    0x3fffu;
+                    m_codeAddressMask;
                 emitArmBranch(target);
                 m_code.L(notTaken);
                 return;
@@ -1639,7 +1645,7 @@ namespace
                         static_cast<int32_t>(
                             pair.pc + 8u) +
                         immediate * 8) &
-                    0x3fffu;
+                    m_codeAddressMask;
                 emitArmBranch(target);
                 m_code.L(notTaken);
                 return;
@@ -2476,7 +2482,8 @@ namespace
                     m_code.dword[
                         m_code.rbx +
                         branchTargetOffset]);
-                m_code.and_(m_code.eax, 0x3fffu);
+                m_code.and_(
+                    m_code.eax, m_codeAddressMask);
                 m_code.mov(
                     m_code.dword[
                         m_code.rbx + pcOffset],
@@ -3526,19 +3533,31 @@ uint32_t VuRecompilerBackend::executePair(
 
     VuExecutionState *const previousState =
         m_semantics.m_state;
+    const uint32_t previousCodeAddressMask =
+        m_semantics.m_codeAddressMask;
     m_semantics.m_state = &state;
+    m_semantics.m_codeAddressMask =
+        context.codeSize != 0u
+            ? context.codeSize - 1u
+            : 0u;
     struct StateBindingGuard
     {
         VuExecutionState *&bound;
         VuExecutionState *previous;
+        uint32_t &boundCodeAddressMask;
+        uint32_t previousCodeAddressMask;
 
         ~StateBindingGuard()
         {
             bound = previous;
+            boundCodeAddressMask =
+                previousCodeAddressMask;
         }
     };
     const StateBindingGuard binding{
-        m_semantics.m_state, previousState};
+        m_semantics.m_state, previousState,
+        m_semantics.m_codeAddressMask,
+        previousCodeAddressMask};
 
     try
     {
@@ -3604,7 +3623,8 @@ uint32_t VuRecompilerBackend::executePair(
             if (state.branchDelay == 0u)
             {
                 state.pc =
-                    state.branchTarget & 0x3fffu;
+                    state.branchTarget &
+                    m_semantics.m_codeAddressMask;
                 state.branchPending = false;
             }
             else

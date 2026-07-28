@@ -20,19 +20,31 @@ VuRunResult VuIrInterpreterBackend::run(
 {
     VuExecutionState &state = context.state;
     VuExecutionState *const previousState = m_semantics.m_state;
+    const uint32_t previousCodeAddressMask =
+        m_semantics.m_codeAddressMask;
     m_semantics.m_state = &state;
+    m_semantics.m_codeAddressMask =
+        context.codeSize != 0u
+            ? context.codeSize - 1u
+            : 0u;
     struct StateBindingGuard
     {
         VuExecutionState *&boundState;
         VuExecutionState *previousState;
+        uint32_t &boundCodeAddressMask;
+        uint32_t previousCodeAddressMask;
 
         ~StateBindingGuard()
         {
             boundState = previousState;
+            boundCodeAddressMask =
+                previousCodeAddressMask;
         }
     };
     const StateBindingGuard stateBinding{
-        m_semantics.m_state, previousState};
+        m_semantics.m_state, previousState,
+        m_semantics.m_codeAddressMask,
+        previousCodeAddressMask};
 
     if (!state.active)
     {
@@ -140,7 +152,9 @@ VuRunResult VuIrInterpreterBackend::run(
         {
             if (state.branchDelay == 0u)
             {
-                state.pc = state.branchTarget & 0x3fffu;
+                state.pc =
+                    state.branchTarget &
+                    m_semantics.m_codeAddressMask;
                 state.branchPending = false;
             }
             else

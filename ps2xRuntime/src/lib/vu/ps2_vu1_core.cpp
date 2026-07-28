@@ -563,7 +563,11 @@ void VuUnit::start(
     }
     m_workloadProfileInvocationActive = false;
     m_workloadProfileInvocationPending = true;
-    m_state.pc = startPC & 0x3FFFu;
+    const uint32_t codeAddressMask =
+        m_unitId == VuUnitId::Vu0
+            ? PS2_VU0_CODE_SIZE - 1u
+            : PS2_VU1_CODE_SIZE - 1u;
+    m_state.pc = startPC & codeAddressMask;
     m_state.ebit = false;
     m_state.top = top;
     m_state.itop = itop;
@@ -804,18 +808,30 @@ VuRunResult VuInterpreterBackend::run(
 {
     VuExecutionState &state = context.state;
     VuExecutionState *const previousState = m_state;
+    const uint32_t previousCodeAddressMask =
+        m_codeAddressMask;
     m_state = &state;
+    m_codeAddressMask =
+        context.codeSize != 0u
+            ? context.codeSize - 1u
+            : 0u;
     struct StateBindingGuard
     {
         VuExecutionState *&boundState;
         VuExecutionState *previousState;
+        uint32_t &boundCodeAddressMask;
+        uint32_t previousCodeAddressMask;
 
         ~StateBindingGuard()
         {
             boundState = previousState;
+            boundCodeAddressMask =
+                previousCodeAddressMask;
         }
     };
-    const StateBindingGuard stateBinding{m_state, previousState};
+    const StateBindingGuard stateBinding{
+        m_state, previousState,
+        m_codeAddressMask, previousCodeAddressMask};
 
     if (!state.active)
     {
@@ -1059,7 +1075,9 @@ VuRunResult VuInterpreterBackend::run(
         {
             if (state.branchDelay == 0)
             {
-                state.pc = state.branchTarget & 0x3FFFu;
+                state.pc =
+                    state.branchTarget &
+                    m_codeAddressMask;
                 state.branchPending = false;
             }
             else
