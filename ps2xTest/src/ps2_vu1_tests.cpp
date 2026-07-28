@@ -751,13 +751,13 @@ void register_ps2_vu1_tests()
                       "unknown backend names should be rejected");
 
             PS2RuntimeConfiguration configuration{};
-            configuration.vu0Backend = VuBackendKind::Recompiler;
+            configuration.vu0Backend = VuBackendKind::Verify;
             configuration.vu1Backend = VuBackendKind::Verify;
             configuration.useVuBackendEnvironment = false;
             PS2Runtime runtime(configuration);
             t.IsTrue(
                 runtime.vu0().requestedBackend() ==
-                    VuBackendKind::Recompiler,
+                    VuBackendKind::Verify,
                 "VU0 should retain its independent request");
             t.IsTrue(
                 runtime.vu1().requestedBackend() ==
@@ -831,6 +831,33 @@ void register_ps2_vu1_tests()
                     "an unavailable explicit recompiler should fail early");
                 t.IsFalse(diagnostic.empty(),
                           "unavailable selection should explain the failure");
+            }
+
+            VuUnit vu0(VuUnitId::Vu0);
+            if (VuRecompilerBackend::supported())
+            {
+                t.IsTrue(
+                    vu0.setBackend(
+                        VuBackendKind::Recompiler,
+                        &diagnostic),
+                    "an idle VU0 should accept a supported recompiler");
+                t.IsTrue(
+                    vu0.resolvedBackend() ==
+                            VuBackendKind::Recompiler &&
+                        vu0.backendName() ==
+                            "x86-64-recompiler",
+                    "explicit VU0 recompiler selection should resolve natively");
+            }
+            else
+            {
+                t.IsFalse(
+                    vu0.setBackend(
+                        VuBackendKind::Recompiler,
+                        &diagnostic),
+                    "an unavailable explicit VU0 recompiler should fail early");
+                t.IsFalse(
+                    diagnostic.empty(),
+                    "an unavailable VU0 backend should explain the failure");
             }
         });
 
@@ -1051,6 +1078,16 @@ void register_ps2_vu1_tests()
                         native.vu1().resolvedBackend() ==
                             VuBackendKind::Recompiler,
                     "the VU1 environment should select native execution independently");
+
+                vu0.set("recompiler");
+                vu1.set("interpreter");
+                PS2Runtime nativeVu0;
+                t.IsTrue(
+                    nativeVu0.vu0().resolvedBackend() ==
+                            VuBackendKind::Recompiler &&
+                        nativeVu0.vu1().resolvedBackend() ==
+                            VuBackendKind::Interpreter,
+                    "the VU0 environment should select native execution independently");
             }
 
             vu1.set("jit");

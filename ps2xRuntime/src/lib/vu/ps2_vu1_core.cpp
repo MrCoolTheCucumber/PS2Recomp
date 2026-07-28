@@ -444,9 +444,7 @@ bool VuUnit::setBackend(
 
     VuBackendKind resolved = VuBackendKind::Interpreter;
     IVuExecutionBackend *backend = m_interpreter.get();
-    const bool nativeUnit = m_unitId == VuUnitId::Vu1;
     const bool explicitNative =
-        nativeUnit &&
         requested == VuBackendKind::Recompiler;
     if (explicitNative &&
         !VuRecompilerBackend::supported())
@@ -461,7 +459,7 @@ bool VuUnit::setBackend(
         return false;
     }
     const bool automaticNative =
-        nativeUnit &&
+        m_unitId == VuUnitId::Vu1 &&
         requested == VuBackendKind::Auto &&
         VuRecompilerBackend::supported();
     if (explicitNative || automaticNative)

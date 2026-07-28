@@ -20,8 +20,8 @@ publishing either candidate's output twice.
 The compact instruction-pair representation and its development-only
 differential interpreter are documented in
 [`vu-ir.md`](vu-ir.md). They are not selectable runtime backends; runtime
-selection can explicitly route VU1 through the production x86-64 backend. Its
-ABI, native lowering, and helper-routed side exits are documented in
+selection can explicitly route either unit through the production x86-64
+backend. Its ABI, native lowering, and helper-routed side exits are documented in
 [`vu-x64-recompiler.md`](vu-x64-recompiler.md). Each unit lazily owns the
 generation-scoped cache and W^X executable-memory layer documented in
 [`vu-program-cache.md`](vu-program-cache.md).
@@ -50,21 +50,22 @@ Programmatic values are applied independently; when
 overrides that unit's value. Invalid names fail runtime construction with the
 variable name and accepted values.
 
-On a supported x86-64 host, an explicit VU1 `recompiler` request resolves to
-`x86-64-recompiler`; if native executable memory or the required host features
-are unavailable, the request fails early with a diagnostic. VU1 `auto`
-resolves to `x86-64-recompiler` when that backend is built and supported, and
-falls back to the interpreter on other hosts. VU0 recompiler integration and
-transactional `verify` mode are later milestones, so those requests still
-retain their requested value while resolving to the interpreter.
+On a supported x86-64 host, an explicit VU0 or VU1 `recompiler` request resolves
+to `x86-64-recompiler`; if native executable memory or the required host
+features are unavailable, the request fails early with a diagnostic. VU1
+`auto` resolves to `x86-64-recompiler` when that backend is built and supported,
+and falls back to the interpreter on other hosts. VU0 `auto` deliberately
+remains on the interpreter until its full synchronization and verification
+matrix passes. Transactional `verify` mode is also a later milestone and
+currently retains its requested value while resolving to the interpreter.
 
-The VU1 unit adapter consumes a scheduler budget across internal XGKICK helper
-exits. If a compiled block reaches an unsupported pair, it records the native
-side exit, executes exactly that pair through the permanent interpreter at the
-unchanged PC, and resumes native execution with the remaining budget. This
-keeps VIF completion timing independent of native block boundaries. Changing a
-request while a unit is active is rejected and leaves the previous selection
-intact.
+The unit adapter consumes one scheduler budget across internal native exits,
+including VU1 XGKICK helper boundaries. If a compiled block reaches an
+unsupported pair, it records the native side exit, executes exactly that pair
+through the permanent interpreter at the unchanged PC, and resumes native
+execution with the remaining budget. This keeps VU0 EE synchronization and VIF
+completion timing independent of native block boundaries. Changing a request
+while a unit is active is rejected and leaves the previous selection intact.
 
 Aggregate debugger progress wraps the complete scheduler-facing unit call, so
 internal native entries and one-pair interpreter fallbacks do not double-count

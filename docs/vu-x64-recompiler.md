@@ -86,18 +86,20 @@ An armed instruction observer, VIF trace, or workload profile uses the
 permanent interpreter. Aggregate progress tracking wraps the complete
 scheduler-facing unit call and does not add a per-pair native callback.
 
-An explicit supported VU1 `recompiler` selection executes through `VuUnit`.
-The unit adapter continues within one scheduler budget after an internal
-XGKICK boundary. On `UnsupportedInstruction`, it executes exactly one pair
-through the interpreter and then resumes native code; diagnostics count both
-the unsupported exit and interpreter fallback pair. VU1 `auto` selects this
-backend on supported x86-64 hosts and retains interpreter fallback elsewhere.
-VU0 integration is separate.
+An explicit supported VU0 or VU1 `recompiler` selection executes through
+`VuUnit`. The unit adapter continues within one scheduler budget after an
+internal exit, including a VU1 XGKICK boundary. On `UnsupportedInstruction`, it
+executes exactly one pair through the interpreter and then resumes native code;
+diagnostics count both the unsupported exit and interpreter fallback pair. VU1
+`auto` selects this backend on supported x86-64 hosts and retains interpreter
+fallback elsewhere. VU0 `auto` remains interpreted until the VU0
+synchronization and verification rollout gate passes.
 
 Focused tests cover:
 
 - every possible cycle-budget cut through a synthetic FMAC, Q, memory, branch,
-  and E-bit program;
+  and E-bit program on both VU0 and VU1;
+- VU0 MicroMem branch wrapping and EE-visible synchronization boundaries;
 - cold compilation, warm hits, generation replacement, and stale handles;
 - unsupported-pair no-mutation behavior;
 - instrumentation fallback and exact observer/progress counts;

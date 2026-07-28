@@ -6221,6 +6221,125 @@ void register_ps2_runtime_expansion_tests()
                 "VU0 should stop after the E-bit delay-slot instruction pair");
         });
 
+        tc.Run("selected VU0 recompiler stops at the same EE synchronization "
+               "boundaries",
+            [](TestCase &t)
+            {
+                if (!VuRecompilerBackend::supported())
+                    return;
+
+                PS2RuntimeConfiguration referenceConfiguration{};
+                referenceConfiguration.vu0Backend = VuBackendKind::Interpreter;
+                referenceConfiguration.vu1Backend = VuBackendKind::Interpreter;
+                referenceConfiguration.useVuBackendEnvironment = false;
+                PS2RuntimeConfiguration nativeConfiguration =
+                    referenceConfiguration;
+                nativeConfiguration.vu0Backend = VuBackendKind::Recompiler;
+
+                PS2Runtime reference(referenceConfiguration);
+                PS2Runtime native(nativeConfiguration);
+                for (PS2Runtime *runtime : {&reference, &native})
+                {
+                    t.IsTrue(runtime->memory().initialize(),
+                        "VU0 differential memory should initialize");
+                    t.IsTrue(runtime->syncCoreSubsystems(),
+                        "VU0 differential subsystems should bind");
+
+                    uint8_t *const code = runtime->memory().getVU0Code();
+                    std::memset(code, 0, PS2_VU0_CODE_SIZE);
+                    constexpr uint32_t kVuNop = 0x0000003Fu;
+                    constexpr uint32_t kVuEndNop = 0x4000003Fu;
+                    writeVuInstructionPair(
+                        code, 0u, makeVuIaddiu(1u, 0u, 1u), kVuNop);
+                    writeVuInstructionPair(
+                        code, 8u, makeVuIbeq(1u, 0u, 3), kVuNop);
+                    writeVuInstructionPair(code, 16u, 0u, kVuNop);
+                    writeVuInstructionPair(code, 24u, makeVuBranch(-3), kVuNop);
+                    writeVuInstructionPair(code, 32u, 0u, kVuNop);
+                    writeVuInstructionPair(
+                        code, 40u, makeVuIaddiu(2u, 0u, 7u), kVuEndNop);
+                    writeVuInstructionPair(code, 48u, 0u, kVuNop);
+                    runtime->memory().markVU0CodeModified();
+                    runtime->vu0().setProgressTrackingEnabled(true);
+                }
+
+                R5900Context referenceContext{};
+                R5900Context nativeContext{};
+                const auto compare = [&](const std::string &boundary)
+                {
+                    std::string difference;
+                    t.IsTrue(vuExecutionStatesEqual(reference.vu0().state(),
+                                 native.vu0().state(),
+                                 &difference),
+                        boundary + " canonical VU0 state differs at " +
+                            difference);
+                    t.IsTrue(std::memcmp(reference.memory().getVU0Data(),
+                                 native.memory().getVU0Data(),
+                                 PS2_VU0_DATA_SIZE) == 0,
+                        boundary + " VU0 data differs");
+                    t.Equals(referenceContext.vu0_pc,
+                        nativeContext.vu0_pc,
+                        boundary + " copied PC differs");
+                    t.Equals(referenceContext.vu0_vpu_stat,
+                        nativeContext.vu0_vpu_stat,
+                        boundary + " copied busy state differs");
+                    t.Equals(reference.vu0().getProgressSnapshot().cycles,
+                        native.vu0().getProgressSnapshot().cycles,
+                        boundary + " retired cycles differ");
+                };
+
+                for (auto pair : {
+                         std::pair{&reference, &referenceContext},
+                         std::pair{&native, &nativeContext},
+                     })
+                {
+                    pair.second->advanceEeCycleTicks(800u);
+                    pair.first->serviceEeEventsAtBlockBoundary(
+                        pair.first->memory().getRDRAM(), pair.second);
+                    pair.first->vu0StartMicroProgram(
+                        pair.first->memory().getRDRAM(), pair.second, 0u);
+                }
+                compare("startup");
+
+                constexpr std::array<uint32_t, 3u> kElapsedTicks{
+                    64u, 64u, 128u};
+                for (size_t boundary = 0u; boundary < kElapsedTicks.size();
+                    ++boundary)
+                {
+                    if (boundary == 2u)
+                    {
+                        referenceContext.vi[1] = 0u;
+                        nativeContext.vi[1] = 0u;
+                    }
+                    referenceContext.advanceEeCycleTicks(
+                        kElapsedTicks[boundary]);
+                    nativeContext.advanceEeCycleTicks(kElapsedTicks[boundary]);
+                    reference.synchronizeVU0Microprogram(
+                        reference.memory().getRDRAM(),
+                        &referenceContext,
+                        false);
+                    native.synchronizeVU0Microprogram(
+                        native.memory().getRDRAM(), &nativeContext, false);
+                    compare("synchronization " + std::to_string(boundary));
+                }
+
+                const VuRecompilerDiagnostics *const diagnostics =
+                    native.vu0().recompilerDiagnosticsIfCreated();
+                t.IsNotNull(diagnostics,
+                    "selected VU0 native execution should expose diagnostics");
+                if (diagnostics)
+                {
+                    t.IsTrue(diagnostics->nativePairs > 0u,
+                        "the selected VU0 path should retire native pairs");
+                    t.Equals(diagnostics->interpreterInstrumentationFallbacks,
+                        uint64_t{0u},
+                        "ordinary VU0 synchronization should remain native");
+                    t.Equals(diagnostics->faultExits,
+                        uint64_t{0u},
+                        "the selected VU0 path should not fault");
+                }
+            });
+
         tc.Run("event VU0 progress depends on due shared device work", [](TestCase &t)
         {
             PS2Runtime withDma;
