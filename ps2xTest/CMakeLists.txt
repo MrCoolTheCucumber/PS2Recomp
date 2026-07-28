@@ -171,6 +171,7 @@ add_executable(ee_timing_benchmark
 
 add_executable(gs_replay
     src/gs_replay.cpp
+    src/standalone_runtime_function_table.cpp
 )
 
 option(PRINT_GENERATED_CODE "Print generated code in tests" OFF)
