@@ -1,6 +1,7 @@
 #ifndef PS2_VU1_H
 #define PS2_VU1_H
 
+#include <array>
 #include <atomic>
 #include <cstdint>
 #include <functional>
@@ -133,12 +134,15 @@ private:
     QPipelineState m_qPipeline;
     struct FmacFlagPipelineState
     {
+        bool active = false;
         uint32_t mac = 0;
         uint32_t status = 0;
-        uint32_t cyclesRemaining = 0;
     };
 
-    std::vector<FmacFlagPipelineState> m_fmacFlagPipeline;
+    static constexpr uint8_t kFmacFlagPipelineStages = 4u;
+    std::array<FmacFlagPipelineState, kFmacFlagPipelineStages>
+        m_fmacFlagPipeline{};
+    uint8_t m_fmacFlagPipelineIndex = 0u;
     uint32_t m_workingMac = 0;
     std::vector<DecodedInstructionPair> m_decodedCodeCache;
     const uint8_t *m_cachedVuCode = nullptr;
@@ -179,6 +183,7 @@ private:
     void scheduleQ(float result, uint32_t latency);
     void advanceFmacFlagPipeline();
     void flushFmacFlagPipeline();
+    void commitFmacFlags(const FmacFlagPipelineState &pending);
     void scheduleFmacFlags(const float result[4], uint8_t dest,
                            bool preserveUnselected);
     void backupVi(uint8_t reg);

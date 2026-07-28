@@ -96,7 +96,8 @@ void VU1Interpreter::reset()
     m_active = false;
     m_xgkick = {};
     m_qPipeline = {};
-    m_fmacFlagPipeline.clear();
+    m_fmacFlagPipeline = {};
+    m_fmacFlagPipelineIndex = 0u;
     m_workingMac = 0u;
     m_progressActive.store(0u, std::memory_order_relaxed);
     m_progressInvocations.store(0u, std::memory_order_relaxed);
@@ -244,7 +245,8 @@ void VU1Interpreter::start(
     m_state.branchTarget = 0;
     m_state.branchDelay = 0;
     m_state.viBackupCycles = 0;
-    m_fmacFlagPipeline.clear();
+    m_fmacFlagPipeline = {};
+    m_fmacFlagPipelineIndex = 0u;
     m_workingMac = m_state.mac;
     m_state.vf[0][0] = 0.0f;
     m_state.vf[0][1] = 0.0f;
@@ -539,31 +541,45 @@ void VU1Interpreter::scheduleQ(float result, uint32_t latency)
 
 void VU1Interpreter::advanceFmacFlagPipeline()
 {
-    for (FmacFlagPipelineState &pending : m_fmacFlagPipeline)
-    {
-        if (pending.cyclesRemaining != 0u)
-            --pending.cyclesRemaining;
-    }
+    m_fmacFlagPipelineIndex = static_cast<uint8_t>(
+        (m_fmacFlagPipelineIndex + 1u) %
+        kFmacFlagPipelineStages);
+    FmacFlagPipelineState &pending =
+        m_fmacFlagPipeline[m_fmacFlagPipelineIndex];
+    if (!pending.active)
+        return;
 
-    while (!m_fmacFlagPipeline.empty() &&
-           m_fmacFlagPipeline.front().cyclesRemaining == 0u)
-    {
-        const FmacFlagPipelineState pending =
-            m_fmacFlagPipeline.front();
-        m_fmacFlagPipeline.erase(m_fmacFlagPipeline.begin());
-        m_state.mac = pending.mac;
-        m_state.status =
-            (m_state.status & 0xff0u) |
-            (pending.status & 0x0fu) |
-            ((pending.status & 0x0fu) << 6u);
-    }
+    commitFmacFlags(pending);
+    pending = {};
 }
 
 void VU1Interpreter::flushFmacFlagPipeline()
 {
-    for (FmacFlagPipelineState &pending : m_fmacFlagPipeline)
-        pending.cyclesRemaining = 0u;
-    advanceFmacFlagPipeline();
+    // Walk from the next stage due through the stage used by the current
+    // instruction pair. This commits retained results from oldest to newest.
+    for (uint8_t offset = 1u;
+         offset <= kFmacFlagPipelineStages; ++offset)
+    {
+        const uint8_t index = static_cast<uint8_t>(
+            (m_fmacFlagPipelineIndex + offset) %
+            kFmacFlagPipelineStages);
+        FmacFlagPipelineState &pending =
+            m_fmacFlagPipeline[index];
+        if (!pending.active)
+            continue;
+        commitFmacFlags(pending);
+        pending = {};
+    }
+}
+
+void VU1Interpreter::commitFmacFlags(
+    const FmacFlagPipelineState &pending)
+{
+    m_state.mac = pending.mac;
+    m_state.status =
+        (m_state.status & 0xff0u) |
+        (pending.status & 0x0fu) |
+        ((pending.status & 0x0fu) << 6u);
 }
 
 void VU1Interpreter::scheduleFmacFlags(
@@ -611,7 +627,11 @@ void VU1Interpreter::scheduleFmacFlags(
         status |= 0x8u;
 
     m_workingMac = mac;
-    m_fmacFlagPipeline.push_back({mac, status, 4u});
+    m_fmacFlagPipeline[m_fmacFlagPipelineIndex] = {
+        .active = true,
+        .mac = mac,
+        .status = status,
+    };
 }
 
 void VU1Interpreter::backupVi(uint8_t reg)
