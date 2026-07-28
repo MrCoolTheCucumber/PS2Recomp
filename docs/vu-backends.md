@@ -8,14 +8,20 @@ and debugger code do not depend on a concrete backend class.
 
 `VuExecutionState` is a deep-copyable verification snapshot. It contains the
 architectural registers, branch and active state, issued-cycle count, delayed Q
-result, fixed FMAC flag pipeline, and retained XGKICK packet/progress. Caches,
-observers, profiling state, and host progress atomics remain unit-owned and are
-not cloned.
+and P results, fixed FMAC flag pipeline, and retained XGKICK packet/progress.
+Caches, observers, profiling state, and host progress atomics remain unit-owned
+and are not cloned.
 
 Device effects use the explicit `IVuSideEffectSink` in the execution context.
 The normal runtime sink submits PATH1 packets to PS2 memory/GIF arbitration.
 Differential backends can instead record effects transactionally without
 publishing either candidate's output twice.
+
+The compact instruction-pair representation and its development-only
+differential interpreter are documented in
+[`vu-ir.md`](vu-ir.md). They are not selectable runtime backends; runtime
+selection continues to resolve through the permanent interpreter until the
+generation-scoped native cache and emitter are integrated.
 
 ## Selection
 
@@ -49,4 +55,3 @@ previous selection intact.
 
 `system.status` exposes `vu_backends.vu0` and `vu_backends.vu1`, including each
 unit's requested mode, resolved mode, backend name, and active state.
-

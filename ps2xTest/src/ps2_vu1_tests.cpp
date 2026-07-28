@@ -5,6 +5,7 @@
 #include "runtime/ps2_gs_psmct32.h"
 #include "runtime/ps2_memory.h"
 #include "runtime/ps2_vu_clip.h"
+#include "runtime/ps2_vu_ir.h"
 #include "runtime/ps2_vu1.h"
 
 #include <array>
@@ -16,6 +17,7 @@
 #include <fstream>
 #include <iterator>
 #include <optional>
+#include <sstream>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -211,6 +213,13 @@ namespace
         return makeVuLowerSpecial(0x72u, fs);
     }
 
+    uint32_t makeVuErcpr(uint8_t fs, uint8_t fsf)
+    {
+        return makeVuLowerSpecial(
+            0x7Au, fs, 0u, 0u,
+            static_cast<uint8_t>(fsf & 3u));
+    }
+
     uint32_t makeVuWaitP()
     {
         return makeVuLowerSpecial(0x7Bu, 0u);
@@ -262,6 +271,244 @@ namespace
         uint32_t bits = 0u;
         std::memcpy(&bits, &value, sizeof(bits));
         return bits;
+    }
+
+    constexpr size_t kVuIrOpcodeCount =
+        static_cast<size_t>(VuIrOpcode::Unsupported) + 1u;
+
+    struct VuDifferentialResult
+    {
+        bool matched = false;
+        uint32_t executedPairs = 0u;
+        std::string failure;
+        VuExecutionState finalState{};
+        std::vector<uint8_t> finalData;
+        std::vector<std::vector<uint8_t>> path1Packets;
+        std::array<uint64_t, kVuIrOpcodeCount> opcodeCounts{};
+    };
+
+    VuDifferentialResult runVuDifferential(
+        const std::vector<uint8_t> &code,
+        const std::vector<uint8_t> &initialData,
+        const VuExecutionState &initialState,
+        uint32_t maximumPairs)
+    {
+        VuDifferentialResult outcome;
+        VuExecutionState referenceState = initialState;
+        VuExecutionState irState = initialState;
+        std::vector<uint8_t> referenceData = initialData;
+        std::vector<uint8_t> irData = initialData;
+        VuTransactionalSideEffectSink referenceEffects;
+        VuTransactionalSideEffectSink irEffects;
+        VuUnit referenceUnit;
+        VuUnit irUnit;
+        VuInterpreterBackend reference(referenceUnit);
+        VuIrInterpreterBackend ir(irUnit);
+        VuExecutionContext referenceContext{
+            .state = referenceState,
+            .code = code.data(),
+            .codeSize = static_cast<uint32_t>(code.size()),
+            .data = referenceData.data(),
+            .dataSize = static_cast<uint32_t>(referenceData.size()),
+            .sideEffects = referenceEffects,
+            .enableInstrumentation = false,
+        };
+        VuExecutionContext irContext{
+            .state = irState,
+            .code = code.data(),
+            .codeSize = static_cast<uint32_t>(code.size()),
+            .data = irData.data(),
+            .dataSize = static_cast<uint32_t>(irData.size()),
+            .sideEffects = irEffects,
+            .enableInstrumentation = false,
+        };
+
+        for (uint32_t pairIndex = 0u;
+             pairIndex < maximumPairs; ++pairIndex)
+        {
+            const uint32_t issuedPc = referenceState.pc;
+            uint32_t lowerWord = 0u;
+            uint32_t upperWord = 0u;
+            if (issuedPc + 8u <= code.size())
+            {
+                std::memcpy(
+                    &lowerWord, code.data() + issuedPc,
+                    sizeof(lowerWord));
+                std::memcpy(
+                    &upperWord, code.data() + issuedPc + 4u,
+                    sizeof(upperWord));
+                const VuIrInstructionPair pair =
+                    decodeVuIrInstructionPair(
+                        issuedPc, lowerWord, upperWord);
+                ++outcome.opcodeCounts[
+                    static_cast<size_t>(pair.upper.opcode)];
+                ++outcome.opcodeCounts[
+                    static_cast<size_t>(pair.lower.opcode)];
+            }
+
+            const VuRunResult referenceResult =
+                reference.run(referenceContext, 1u);
+            const VuRunResult irResult = ir.run(irContext, 1u);
+            ++outcome.executedPairs;
+
+            const bool resultsMatch =
+                referenceResult.requestedCycles ==
+                    irResult.requestedCycles &&
+                referenceResult.executedCycles ==
+                    irResult.executedCycles &&
+                referenceResult.reason == irResult.reason &&
+                referenceResult.activeBefore ==
+                    irResult.activeBefore &&
+                referenceResult.activeAfter == irResult.activeAfter &&
+                referenceResult.completed == irResult.completed;
+            std::string stateDifference;
+            const bool statesMatch = vuExecutionStatesEqual(
+                referenceState, irState, &stateDifference);
+            const bool dataMatches = referenceData == irData;
+            const bool effectsMatch =
+                referenceEffects.path1Packets() ==
+                irEffects.path1Packets();
+            if (!resultsMatch || !statesMatch ||
+                !dataMatches || !effectsMatch)
+            {
+                std::ostringstream message;
+                message
+                    << "pair " << pairIndex
+                    << " pc " << issuedPc
+                    << " lower " << lowerWord
+                    << " upper " << upperWord;
+                if (!resultsMatch)
+                {
+                    message
+                        << " result "
+                        << vuExitReasonName(referenceResult.reason)
+                        << "/"
+                        << vuExitReasonName(irResult.reason);
+                }
+                if (!statesMatch)
+                    message << " state " << stateDifference;
+                if (!dataMatches)
+                    message << " VU data";
+                if (!effectsMatch)
+                    message << " PATH1 effects";
+                outcome.failure = message.str();
+                break;
+            }
+            if (!referenceState.active)
+            {
+                outcome.matched = true;
+                break;
+            }
+        }
+
+        if (outcome.failure.empty())
+            outcome.matched = true;
+        outcome.finalState = std::move(referenceState);
+        outcome.finalData = std::move(referenceData);
+        outcome.path1Packets = referenceEffects.path1Packets();
+        return outcome;
+    }
+
+    class FixedVuGenerator
+    {
+    public:
+        explicit FixedVuGenerator(uint32_t seed)
+            : m_state(seed)
+        {
+        }
+
+        uint32_t next()
+        {
+            m_state ^= m_state << 13u;
+            m_state ^= m_state >> 17u;
+            m_state ^= m_state << 5u;
+            return m_state;
+        }
+
+        uint8_t registerIndex()
+        {
+            return static_cast<uint8_t>(2u + next() % 14u);
+        }
+
+    private:
+        uint32_t m_state;
+    };
+
+    uint32_t generatedUpper(FixedVuGenerator &generator)
+    {
+        const uint8_t ft = generator.registerIndex();
+        const uint8_t fs = generator.registerIndex();
+        const uint8_t fd = generator.registerIndex();
+        switch (generator.next() % 10u)
+        {
+        case 0u:
+            return kVuUpperNop;
+        case 1u:
+            return makeVuUpper(0x28u, 0xfu, ft, fs, fd);
+        case 2u:
+            return makeVuUpper(0x2au, 0xfu, ft, fs, fd);
+        case 3u:
+            return makeVuUpper(
+                static_cast<uint8_t>(generator.next() & 3u),
+                0xfu, ft, fs, fd);
+        case 4u:
+            return makeVuUpper(
+                static_cast<uint8_t>(0x10u |
+                                     (generator.next() & 3u)),
+                0xfu, ft, fs, fd);
+        case 5u:
+            return makeVuUpper(0x1cu, 0xfu, ft, fs, fd);
+        case 6u:
+            return makeVuUpperSpecial(0x10u, 0xfu, ft, fs);
+        case 7u:
+            return makeVuUpperSpecial(0x15u, 0xfu, ft, fs);
+        case 8u:
+            return makeVuUpperSpecial(0x1fu, 0xfu, ft, fs);
+        default:
+            return makeVuUpper(0x22u, 0xfu, ft, fs, fd) |
+                   0x80000000u;
+        }
+    }
+
+    uint32_t generatedLower(FixedVuGenerator &generator)
+    {
+        const uint8_t first = generator.registerIndex();
+        const uint8_t second = generator.registerIndex();
+        const uint8_t third = generator.registerIndex();
+        switch (generator.next() % 10u)
+        {
+        case 0u:
+            return 0u;
+        case 1u:
+            return makeVuLq(0xfu, first, second, 0);
+        case 2u:
+            return makeVuSq(0xfu, first, second, 0);
+        case 3u:
+            return makeVuIaddiu(
+                first, second,
+                static_cast<int16_t>(generator.next() & 7u));
+        case 4u:
+            return makeVuLowerDirect(
+                0x30u, first, second, third);
+        case 5u:
+            return makeVuLowerSpecial(
+                0x30u, first, second, 0u, 0xfu);
+        case 6u:
+            return makeVuLowerSpecial(
+                0x34u, first, second, 0u, 0xfu);
+        case 7u:
+            return makeVuMtir(
+                first, second,
+                static_cast<uint8_t>(generator.next() & 3u));
+        case 8u:
+            return makeVuDiv(
+                first, second,
+                static_cast<uint8_t>(generator.next() & 3u),
+                static_cast<uint8_t>(generator.next() & 3u));
+        default:
+            return makeVuLowerSpecial(
+                0x3du, first, second, 0u, 0xfu);
+        }
     }
 }
 
@@ -582,6 +829,769 @@ void register_ps2_vu1_tests()
             t.IsTrue(
                 rejected,
                 "an invalid environment request should name the failing unit");
+        });
+
+        tc.Run("instruction-pair IR retains hazards and pipeline effects", [](TestCase &t)
+        {
+            const uint32_t upper =
+                makeVuUpper(0x28u, 0xfu, 2u, 1u, 3u);
+            const uint32_t lower = makeVuSq(0xfu, 3u, 1u, 0);
+            const VuIrInstructionPair pair =
+                decodeVuIrInstructionPair(0x120u, lower, upper);
+
+            t.IsTrue(
+                pair.upper.opcode == VuIrOpcode::UpperAdd,
+                "the upper operation should have a semantic opcode");
+            t.IsTrue(
+                pair.lower.opcode == VuIrOpcode::LowerSq,
+                "the lower operation should have a semantic opcode");
+            t.IsTrue(
+                (pair.upper.vfReadMask & ((1u << 1u) | (1u << 2u))) ==
+                    ((1u << 1u) | (1u << 2u)),
+                "upper VF reads should be explicit");
+            t.IsTrue(
+                (pair.upper.vfWriteMask & (1u << 3u)) != 0u &&
+                    (pair.lower.vfReadMask & (1u << 3u)) != 0u,
+                "the cross-lane VF hazard should be explicit");
+            t.IsTrue(
+                pair.order == VuIrPairOrder::LowerThenUpper,
+                "the lower reader should observe the pre-upper value");
+            t.IsTrue(
+                vuIrHasOpFlag(pair.upper, VuIrOpFmac) &&
+                    pair.upper.latency == 4u,
+                "FMAC pipeline changes should carry their latency");
+            t.IsTrue(
+                vuIrHasOpFlag(pair.lower, VuIrOpWritesVuData),
+                "VU data writes should be explicit");
+            t.IsTrue(
+                vuIrHasPairFlag(pair, VuIrPairAdvancesPipelines),
+                "each issued pair should advance retained pipelines");
+
+            VuIrVerificationError error;
+            t.IsTrue(
+                verifyVuIrInstructionPair(pair, &error),
+                "a decoded pair should pass the IR verifier");
+            VuIrInstructionPair malformed = pair;
+            malformed.cycles = 2u;
+            t.IsFalse(
+                verifyVuIrInstructionPair(malformed, &error),
+                "a malformed cycle cost should fail verification");
+            t.Equals(error.pc, uint32_t{0x120u},
+                     "verification diagnostics should retain the VU PC");
+            t.IsTrue(!error.message.empty(),
+                     "verification diagnostics should explain the failure");
+        });
+
+        tc.Run("instruction-pair IR exposes immediates latency and unsupported ops", [](TestCase &t)
+        {
+            const VuIrInstructionPair immediate =
+                decodeVuIrInstructionPair(
+                    0u, makeVuBranch(2),
+                    makeVuUpper(0x22u, 0xfu, 0u, 1u, 2u) |
+                        0x80000000u);
+            t.IsTrue(
+                immediate.order == VuIrPairOrder::UpperThenLoi &&
+                    immediate.lower.opcode == VuIrOpcode::Loi &&
+                    vuIrHasPairFlag(immediate, VuIrPairImmediate),
+                "the I bit should turn the lower word into LOI");
+            t.IsFalse(
+                vuIrHasPairFlag(immediate, VuIrPairBranch),
+                "LOI data must not retain a decoded lower branch");
+            t.IsTrue(
+                vuIrHasOpFlag(immediate.lower, VuIrOpWritesI),
+                "LOI should expose its scalar write");
+
+            const VuIrInstructionPair qPair =
+                decodeVuIrInstructionPair(
+                    8u, makeVuDiv(1u, 2u, 0u, 1u),
+                    makeVuUpper(0x1cu, 0x8u, 0u, 3u, 4u));
+            t.IsTrue(
+                qPair.lower.opcode == VuIrOpcode::LowerDiv &&
+                    qPair.lower.latency == 7u &&
+                    vuIrHasOpFlag(qPair.lower, VuIrOpWritesQ) &&
+                    vuIrHasOpFlag(qPair.lower, VuIrOpQBarrier),
+                "DIV should expose delayed Q production");
+            t.IsTrue(
+                qPair.upper.opcode == VuIrOpcode::UpperMulQ &&
+                    vuIrHasOpFlag(qPair.upper, VuIrOpReadsQ),
+                "MULq should expose Q consumption");
+
+            const VuIrInstructionPair unsupported =
+                decodeVuIrInstructionPair(
+                    16u, 0x04000000u,
+                    makeVuUpper(0x34u, 0xfu, 2u, 1u, 3u));
+            t.IsTrue(
+                unsupported.upper.opcode == VuIrOpcode::Unsupported &&
+                    unsupported.lower.opcode == VuIrOpcode::Unsupported &&
+                    vuIrHasPairFlag(
+                        unsupported, VuIrPairUnsupported),
+                "unimplemented encodings should remain explicit");
+            t.Equals(
+                std::string(vuIrOpcodeName(unsupported.upper.opcode)),
+                std::string("Unsupported"),
+                "unsupported diagnostics should have a stable name");
+        });
+
+        tc.Run("lower IR distinguishes masks selectors and P barriers", [](TestCase &t)
+        {
+            const VuIrOperation masked =
+                decodeVuIrInstructionPair(
+                    0u, makeVuMfp(2u, 0xau),
+                    kVuUpperNop).lower;
+            t.Equals(
+                masked.destinationMask, uint8_t{0xau},
+                "MFP should retain its destination mask");
+            t.Equals(
+                masked.selector, uint8_t{0u},
+                "a destination mask must not become a scalar selector");
+            t.IsTrue(
+                vuIrHasOpFlag(masked, VuIrOpReadsP) &&
+                    !vuIrHasOpFlag(masked, VuIrOpPBarrier),
+                "MFP should read old P without an automatic dependency");
+
+            const VuIrOperation div =
+                decodeVuIrInstructionPair(
+                    8u, makeVuDiv(1u, 2u, 2u, 3u),
+                    kVuUpperNop).lower;
+            t.Equals(
+                div.destinationMask, uint8_t{0u},
+                "DIV component fields are not a destination mask");
+            t.Equals(
+                div.selector, uint8_t{0xeu},
+                "DIV should retain packed fsf and ftf selectors");
+
+            const VuIrOperation mtir =
+                decodeVuIrInstructionPair(
+                    16u, makeVuMtir(3u, 4u, 2u),
+                    kVuUpperNop).lower;
+            t.Equals(
+                mtir.destinationMask, uint8_t{0u},
+                "MTIR's component field is not a destination mask");
+            t.Equals(
+                mtir.selector, uint8_t{2u},
+                "MTIR should expose its fsf selector");
+
+            const VuIrOperation ercpr =
+                decodeVuIrInstructionPair(
+                    24u, makeVuErcpr(5u, 1u),
+                    kVuUpperNop).lower;
+            t.IsTrue(
+                ercpr.opcode == VuIrOpcode::LowerErcpr &&
+                    ercpr.latency == 12u &&
+                    vuIrHasOpFlag(ercpr, VuIrOpWritesP) &&
+                    vuIrHasOpFlag(ercpr, VuIrOpPBarrier),
+                "ERCPR should expose delayed P production");
+            t.Equals(
+                ercpr.selector, uint8_t{1u},
+                "ERCPR should expose its fsf selector");
+
+            const VuIrOperation eleng =
+                decodeVuIrInstructionPair(
+                    32u, makeVuEleng(6u),
+                    kVuUpperNop).lower;
+            t.IsTrue(
+                eleng.latency == 18u &&
+                    vuIrHasOpFlag(eleng, VuIrOpWritesP) &&
+                    vuIrHasOpFlag(eleng, VuIrOpPBarrier),
+                "ELENG should expose its documented P latency");
+
+            const VuIrOperation esadd =
+                decodeVuIrInstructionPair(
+                    40u, makeVuLowerSpecial(0x70u, 7u),
+                    kVuUpperNop).lower;
+            t.IsTrue(
+                esadd.opcode == VuIrOpcode::LowerEsadd &&
+                    esadd.latency == 11u &&
+                    vuIrHasOpFlag(esadd, VuIrOpUnsupported) &&
+                    vuIrHasOpFlag(esadd, VuIrOpWritesP) &&
+                    vuIrHasOpFlag(esadd, VuIrOpPBarrier) &&
+                    (esadd.vfReadMask & (1u << 7u)) != 0u,
+                "recognized EFU placeholders should retain full metadata");
+
+            const VuIrOperation eatan =
+                decodeVuIrInstructionPair(
+                    48u,
+                    makeVuLowerSpecial(
+                        0x7du, 8u, 0u, 0u, 3u),
+                    kVuUpperNop).lower;
+            t.IsTrue(
+                eatan.opcode == VuIrOpcode::LowerEatan &&
+                    eatan.selector == 3u &&
+                    eatan.latency == 54u &&
+                    vuIrHasOpFlag(eatan, VuIrOpUnsupported) &&
+                    vuIrHasOpFlag(eatan, VuIrOpPBarrier),
+                "EATAN should retain its selector and documented latency");
+
+            const uint32_t wideImmediate =
+                (0x08u << 25u) | (0xau << 21u) |
+                (2u << 16u) | (1u << 11u) | 3u;
+            const VuIrOperation iaddiu =
+                decodeVuIrInstructionPair(
+                    56u, wideImmediate, kVuUpperNop).lower;
+            t.Equals(
+                iaddiu.destinationMask, uint8_t{0u},
+                "IADDIU immediate bits must not masquerade as a mask");
+
+            const VuIrOperation upperMadd =
+                decodeVuIrInstructionPair(
+                    64u, 0u,
+                    makeVuUpper(
+                        0x29u, 0xfu, 2u, 1u, 3u)).upper;
+            const VuIrOperation upperBroadcast =
+                decodeVuIrInstructionPair(
+                    72u, 0u,
+                    makeVuUpper(
+                        0x0bu, 0xfu, 2u, 1u, 3u)).upper;
+            t.Equals(
+                upperMadd.selector, uint8_t{0u},
+                "non-broadcast upper opcodes should have no selector");
+            t.Equals(
+                upperBroadcast.selector, uint8_t{3u},
+                "broadcast upper opcodes should retain their component");
+        });
+
+        tc.Run("VU IR blocks retain delay slots and side-exit reasons", [](TestCase &t)
+        {
+            std::array<uint8_t, 64> code{};
+            writeVuInstructionPair(
+                code.data(), 0u, makeVuBranch(2), kVuUpperNop);
+            writeVuInstructionPair(
+                code.data(), 8u, makeVuIaddiu(1u, 0u, 1),
+                kVuUpperNop);
+            writeVuInstructionPair(
+                code.data(), 16u, 0u, kVuUpperNop);
+
+            const VuIrBlock branch = decodeVuIrBlock(
+                code.data(), static_cast<uint32_t>(code.size()),
+                0u, 8u);
+            t.Equals(branch.pairs.size(), size_t{2u},
+                     "a branch block should include its delay pair");
+            t.IsTrue(
+                branch.exit == VuIrBlockExit::BranchBoundary,
+                "the block should leave at a resumable branch boundary");
+            t.IsTrue(
+                verifyVuIrBlock(branch),
+                "the branch block should pass structural verification");
+            VuIrBlock malformedExit = branch;
+            malformedExit.exit = VuIrBlockExit::PairLimit;
+            VuIrVerificationError error;
+            t.IsFalse(
+                verifyVuIrBlock(malformedExit, &error),
+                "a block should reject an inconsistent side exit");
+            t.Equals(
+                error.lowerWord, branch.pairs.back().lowerWord,
+                "block verification should report terminal words");
+
+            writeVuInstructionPair(
+                code.data(), 0u, 0u, kVuUpperEnd);
+            const VuIrBlock ending = decodeVuIrBlock(
+                code.data(), static_cast<uint32_t>(code.size()),
+                0u, 8u);
+            t.Equals(ending.pairs.size(), size_t{2u},
+                     "an E-bit block should include its delay pair");
+            t.IsTrue(
+                ending.exit == VuIrBlockExit::ProgramEndBoundary,
+                "the E-bit delay should have a structured block exit");
+
+            writeVuInstructionPair(
+                code.data(), 0u,
+                makeVuLowerSpecial(0x6cu, 1u), kVuUpperNop);
+            const VuIrBlock xgkick = decodeVuIrBlock(
+                code.data(), static_cast<uint32_t>(code.size()),
+                0u, 8u);
+            t.Equals(xgkick.pairs.size(), size_t{1u},
+                     "XGKICK should form an explicit helper boundary");
+            t.IsTrue(
+                xgkick.exit == VuIrBlockExit::XgkickBoundary &&
+                    vuIrHasOpFlag(
+                        xgkick.pairs[0].lower,
+                        VuIrOpExternalEffect),
+                "XGKICK should retain its external side effect");
+
+            writeVuInstructionPair(
+                code.data(), 0u, makeVuBranch(2), kVuUpperNop);
+            writeVuInstructionPair(
+                code.data(), 8u, 0x04000000u,
+                makeVuUpper(0x34u, 0xfu, 2u, 1u, 3u));
+            const VuIrBlock unsupportedDelay = decodeVuIrBlock(
+                code.data(), static_cast<uint32_t>(code.size()),
+                0u, 8u);
+            t.Equals(
+                unsupportedDelay.pairs.size(), size_t{2u},
+                "an unsupported delay pair should be retained for diagnostics");
+            t.IsTrue(
+                unsupportedDelay.exit ==
+                    VuIrBlockExit::UnsupportedInstruction,
+                "unsupported semantics should take priority over a later branch exit");
+            t.IsTrue(
+                verifyVuIrBlock(unsupportedDelay),
+                "an explicit unsupported delay exit should verify");
+
+            const VuIrBlock unalignedCode = decodeVuIrBlock(
+                code.data(), 63u, 0u, 8u);
+            t.IsTrue(
+                unalignedCode.pairs.empty() &&
+                    unalignedCode.exit == VuIrBlockExit::CodeBounds &&
+                    verifyVuIrBlock(unalignedCode),
+                "a non-pair-aligned code extent should side-exit safely");
+
+            VuIrBlock malformedEmpty = unalignedCode;
+            malformedEmpty.exit = VuIrBlockExit::PairLimit;
+            t.IsFalse(
+                verifyVuIrBlock(malformedEmpty, &error),
+                "an empty block should reject an exit inconsistent with its entry");
+        });
+
+        tc.Run("RAC1 steady-workload encodings all map to explicit IR", [](TestCase &t)
+        {
+            // Exact raw opcode sets from the retained 100,000,000-pair
+            // steady-state profile.
+            constexpr std::array<uint8_t, 17> upperPrimary = {
+                0x00u, 0x01u, 0x02u, 0x03u, 0x04u, 0x05u,
+                0x06u, 0x07u, 0x08u, 0x09u, 0x0au, 0x0bu,
+                0x10u, 0x11u, 0x15u, 0x16u, 0x18u,
+            };
+            constexpr std::array<uint8_t, 8> upperPrimaryTail = {
+                0x1au, 0x1bu, 0x1cu, 0x22u,
+                0x28u, 0x2au, 0x2cu, 0x2fu,
+            };
+            constexpr std::array<uint8_t, 13> upperSpecial = {
+                0x08u, 0x09u, 0x0au, 0x10u, 0x12u,
+                0x14u, 0x15u, 0x18u, 0x19u, 0x1au,
+                0x1bu, 0x1fu, 0x2fu,
+            };
+            constexpr std::array<uint8_t, 20> lowerPrimary = {
+                0x00u, 0x01u, 0x04u, 0x05u, 0x08u,
+                0x09u, 0x11u, 0x12u, 0x16u, 0x1cu,
+                0x20u, 0x21u, 0x24u, 0x25u, 0x28u,
+                0x29u, 0x2cu, 0x2du, 0x2eu, 0x2fu,
+            };
+            constexpr std::array<uint8_t, 12> lowerSpecial = {
+                0x30u, 0x31u, 0x34u, 0x35u,
+                0x38u, 0x3bu, 0x3cu, 0x3du,
+                0x3eu, 0x3fu, 0x68u, 0x6cu,
+            };
+
+            const auto checkUpper = [&](uint32_t word)
+            {
+                const VuIrInstructionPair pair =
+                    decodeVuIrInstructionPair(
+                        0u, 0u, word);
+                t.IsFalse(
+                    vuIrHasOpFlag(
+                        pair.upper, VuIrOpUnsupported),
+                    "an observed RAC1 upper encoding was unsupported");
+            };
+            for (const uint8_t opcode : upperPrimary)
+            {
+                checkUpper(makeVuUpper(
+                    opcode, 0xfu, 2u, 1u, 3u));
+            }
+            for (const uint8_t opcode : upperPrimaryTail)
+            {
+                checkUpper(makeVuUpper(
+                    opcode, 0xfu, 2u, 1u, 3u));
+            }
+            for (const uint8_t opcode : upperSpecial)
+            {
+                checkUpper(makeVuUpperSpecial(
+                    opcode, 0xfu, 2u, 1u));
+            }
+
+            for (const uint8_t opcode : lowerPrimary)
+            {
+                const uint32_t word =
+                    (static_cast<uint32_t>(opcode) << 25u) |
+                    (0xfu << 21u) |
+                    (2u << 16u) |
+                    (3u << 11u) |
+                    1u;
+                const VuIrInstructionPair pair =
+                    decodeVuIrInstructionPair(
+                        0u, word, kVuUpperNop);
+                t.IsFalse(
+                    vuIrHasOpFlag(
+                        pair.lower, VuIrOpUnsupported),
+                    "an observed RAC1 lower encoding was unsupported");
+            }
+            for (const uint8_t opcode : lowerSpecial)
+            {
+                const VuIrInstructionPair pair =
+                    decodeVuIrInstructionPair(
+                        0u,
+                        makeVuLowerSpecial(
+                            opcode, 3u, 2u, 1u, 0xfu),
+                        kVuUpperNop);
+                t.IsFalse(
+                    vuIrHasOpFlag(
+                        pair.lower, VuIrOpUnsupported),
+                    "an observed RAC1 lower-special encoding was unsupported");
+            }
+        });
+
+        tc.Run("IR oracle matches pair ordering pipelines and completion", [](TestCase &t)
+        {
+            std::vector<uint8_t> code(8u * 8u);
+            std::vector<uint8_t> data(256u);
+            const float oldStoredValue[4] = {
+                10.0f, 11.0f, 12.0f, 13.0f};
+            std::memcpy(
+                data.data() + 16u, oldStoredValue,
+                sizeof(oldStoredValue));
+
+            float immediate = 5.0f;
+            uint32_t immediateBits = 0u;
+            std::memcpy(
+                &immediateBits, &immediate,
+                sizeof(immediateBits));
+            writeVuInstructionPair(
+                code.data(), 0u, immediateBits,
+                makeVuUpper(0x22u, 0xfu, 0u, 1u, 3u) |
+                    0x80000000u);
+            writeVuInstructionPair(
+                code.data(), 8u,
+                makeVuDiv(1u, 2u, 0u, 0u),
+                makeVuUpper(0x1eu, 0xfu, 0u, 1u, 4u));
+            writeVuInstructionPair(
+                code.data(), 16u, makeVuWaitQ(),
+                makeVuUpper(0x1cu, 0xfu, 0u, 1u, 5u));
+            writeVuInstructionPair(
+                code.data(), 24u, makeVuSq(0xfu, 4u, 2u, 0),
+                makeVuUpper(0x28u, 0xfu, 2u, 1u, 4u));
+            writeVuInstructionPair(
+                code.data(), 32u, makeVuBranch(1),
+                kVuUpperNop);
+            writeVuInstructionPair(
+                code.data(), 40u, 0u,
+                makeVuUpper(0x2au, 0xfu, 2u, 1u, 6u));
+            writeVuInstructionPair(
+                code.data(), 48u, 0u,
+                kVuUpperNop | 0x40000000u);
+            writeVuInstructionPair(
+                code.data(), 56u, 0u, kVuUpperNop);
+
+            VuUnit seedUnit;
+            VuExecutionState initialState = seedUnit.state();
+            initialState.active = true;
+            initialState.i = 2.0f;
+            initialState.vi[2] = 1;
+            for (uint32_t lane = 0u; lane < 4u; ++lane)
+            {
+                initialState.vf[1][lane] =
+                    static_cast<float>(8u + lane);
+                initialState.vf[2][lane] =
+                    static_cast<float>(2u + lane);
+                initialState.vf[4][lane] =
+                    oldStoredValue[lane];
+            }
+
+            const VuDifferentialResult result =
+                runVuDifferential(
+                    code, data, initialState, 32u);
+            t.IsTrue(
+                result.matched,
+                "IR oracle divergence: " + result.failure);
+            t.IsFalse(
+                result.finalState.active,
+                "the E-bit delay pair should complete both engines");
+            t.Equals(
+                result.executedPairs, uint32_t{8u},
+                "the branch delay and E-bit delay should issue exactly");
+            t.Equals(
+                result.finalState.q, 4.0f,
+                "WAITQ should expose the prior DIV result to MULq");
+            float stored[4]{};
+            std::memcpy(
+                stored, result.finalData.data() + 16u,
+                sizeof(stored));
+            for (uint32_t lane = 0u; lane < 4u; ++lane)
+            {
+                t.Equals(
+                    stored[lane],
+                    initialState.vf[1][lane] * immediate,
+                    "lower-before-upper should store the pre-ADD VF value");
+            }
+        });
+
+        tc.Run("IR oracle matches delayed P barriers and unsynchronized MFP", [](TestCase &t)
+        {
+            std::vector<uint8_t> code(8u * 8u);
+            std::vector<uint8_t> data(256u);
+            writeVuInstructionPair(
+                code.data(), 0u, makeVuEleng(1u),
+                kVuUpperNop);
+            writeVuInstructionPair(
+                code.data(), 8u, makeVuMfp(2u, 0x8u),
+                kVuUpperNop);
+            writeVuInstructionPair(
+                code.data(), 16u, makeVuErcpr(4u, 1u),
+                kVuUpperNop);
+            writeVuInstructionPair(
+                code.data(), 24u, makeVuMfp(3u, 0x8u),
+                kVuUpperNop);
+            writeVuInstructionPair(
+                code.data(), 32u, makeVuWaitP(),
+                kVuUpperNop);
+            writeVuInstructionPair(
+                code.data(), 40u, makeVuMfp(5u, 0x8u),
+                kVuUpperNop);
+            writeVuInstructionPair(
+                code.data(), 48u, 0u,
+                kVuUpperNop | kVuUpperEnd);
+            writeVuInstructionPair(
+                code.data(), 56u, 0u, kVuUpperNop);
+
+            VuUnit seedUnit;
+            VuExecutionState initialState = seedUnit.state();
+            initialState.active = true;
+            initialState.p = 2.0f;
+            initialState.vf[1][0] = 3.0f;
+            initialState.vf[1][1] = 4.0f;
+            initialState.vf[4][1] = 4.0f;
+
+            const VuDifferentialResult result =
+                runVuDifferential(
+                    code, data, initialState, 16u);
+            t.IsTrue(
+                result.matched,
+                "IR P-pipeline divergence: " + result.failure);
+            t.Equals(
+                result.executedPairs, uint32_t{8u},
+                "the P fixture should include its E-bit delay pair");
+            t.Equals(
+                result.finalState.vf[2][0], 2.0f,
+                "MFP before synchronization should see old P");
+            t.Equals(
+                result.finalState.vf[3][0], 5.0f,
+                "a new EFU op should publish the prior P result");
+            t.Equals(
+                result.finalState.vf[5][0], 0.25f,
+                "MFP after WAITP should see the ERCPR result");
+            t.Equals(
+                result.finalState.p, 0.25f,
+                "both engines should finish with synchronized P");
+            t.IsFalse(
+                result.finalState.pipeline.delayedP.active,
+                "both engines should drain delayed P");
+        });
+
+        tc.Run("IR oracle retains streaming XGKICK transactionally", [](TestCase &t)
+        {
+            std::vector<uint8_t> code(8u * 6u);
+            std::vector<uint8_t> data(256u);
+            const uint64_t tag = makeGifTag(1u, 2u, 1u);
+            std::memcpy(data.data(), &tag, sizeof(tag));
+
+            writeVuInstructionPair(
+                code.data(), 0u,
+                makeVuLowerSpecial(0x6cu, 1u),
+                kVuUpperNop);
+            writeVuInstructionPair(
+                code.data(), 8u, 0u, kVuUpperNop);
+            writeVuInstructionPair(
+                code.data(), 16u,
+                makeVuSq(0xfu, 3u, 2u, 0),
+                kVuUpperNop);
+            writeVuInstructionPair(
+                code.data(), 24u, 0u,
+                kVuUpperNop | 0x40000000u);
+            writeVuInstructionPair(
+                code.data(), 32u, 0u, kVuUpperNop);
+
+            VuUnit seedUnit;
+            VuExecutionState initialState = seedUnit.state();
+            initialState.active = true;
+            initialState.vi[1] = 0;
+            initialState.vi[2] = 1;
+            const float payload[4] = {
+                21.0f, 22.0f, 23.0f, 24.0f};
+            std::memcpy(
+                initialState.vf[3], payload,
+                sizeof(payload));
+
+            const VuDifferentialResult result =
+                runVuDifferential(
+                    code, data, initialState, 16u);
+            t.IsTrue(
+                result.matched,
+                "IR XGKICK divergence: " + result.failure);
+            t.Equals(
+                result.executedPairs, uint32_t{5u},
+                "the retained transfer should cross multiple pairs");
+            t.Equals(
+                result.path1Packets.size(), size_t{1u},
+                "the transactional sink should retain one packet");
+            if (result.path1Packets.size() == 1u)
+            {
+                t.Equals(
+                    result.path1Packets[0].size(), size_t{32u},
+                    "the complete GIFtag and payload should be retained");
+                if (result.path1Packets[0].size() == 32u)
+                {
+                    t.IsTrue(
+                        std::memcmp(
+                            result.path1Packets[0].data() + 16u,
+                            payload, sizeof(payload)) == 0,
+                        "XGKICK should observe the later VU data write");
+                }
+            }
+        });
+
+        tc.Run("fixed-seed VU programs match the IR oracle after every pair", [](TestCase &t)
+        {
+            constexpr std::array<uint32_t, 4> seeds = {
+                0x13579bdfu,
+                0x2468ace1u,
+                0x6d2b79f5u,
+                0xa5a55a5au,
+            };
+            for (const uint32_t seed : seeds)
+            {
+                FixedVuGenerator generator(seed);
+                std::vector<uint8_t> code(64u * 8u);
+                std::vector<uint8_t> data(1024u);
+                for (uint8_t &byte : data)
+                {
+                    byte = static_cast<uint8_t>(
+                        generator.next() & 0xffu);
+                }
+
+                writeVuInstructionPair(
+                    code.data(), 0u,
+                    makeVuIaddiu(1u, 0u, 3),
+                    kVuUpperNop);
+                writeVuInstructionPair(
+                    code.data(), 8u,
+                    makeVuIaddiu(2u, 0u, 1),
+                    kVuUpperNop);
+                for (uint32_t index = 2u; index <= 55u; ++index)
+                {
+                    const uint32_t upper =
+                        generatedUpper(generator);
+                    const uint32_t lower =
+                        (upper & 0x80000000u) != 0u
+                            ? generator.next()
+                            : generatedLower(generator);
+                    writeVuInstructionPair(
+                        code.data(), index * 8u,
+                        lower, upper);
+                }
+                writeVuInstructionPair(
+                    code.data(), 56u * 8u,
+                    makeVuLowerDirect(
+                        0x32u, 1u, 1u, 31u),
+                    kVuUpperNop);
+                writeVuInstructionPair(
+                    code.data(), 57u * 8u,
+                    makeVuIbgtz(1u, -56),
+                    kVuUpperNop);
+                writeVuInstructionPair(
+                    code.data(), 58u * 8u, 0u, kVuUpperNop);
+                writeVuInstructionPair(
+                    code.data(), 59u * 8u, 0u,
+                    kVuUpperNop | 0x40000000u);
+                writeVuInstructionPair(
+                    code.data(), 60u * 8u, 0u, kVuUpperNop);
+
+                VuUnit seedUnit;
+                VuExecutionState initialState = seedUnit.state();
+                initialState.active = true;
+                for (uint32_t reg = 1u; reg < 32u; ++reg)
+                {
+                    for (uint32_t lane = 0u; lane < 4u; ++lane)
+                    {
+                        const int32_t value =
+                            static_cast<int32_t>(
+                                generator.next() % 4096u) -
+                            2048;
+                        initialState.vf[reg][lane] =
+                            static_cast<float>(value) / 32.0f;
+                    }
+                }
+                for (uint32_t reg = 1u; reg < 16u; ++reg)
+                {
+                    initialState.vi[reg] =
+                        static_cast<int32_t>(
+                            generator.next() & 0x3fu);
+                }
+                initialState.i = 0.25f;
+
+                const VuDifferentialResult result =
+                    runVuDifferential(
+                        code, data, initialState, 512u);
+                t.IsTrue(
+                    result.matched,
+                    "fixed-seed IR divergence for seed " +
+                        std::to_string(seed) + ": " +
+                        result.failure);
+                t.IsFalse(
+                    result.finalState.active,
+                    "the bounded generated loop should terminate");
+                t.Equals(
+                    result.executedPairs, uint32_t{175u},
+                    "the fixed three-iteration loop should be exact");
+
+                size_t observedOpcodes = 0u;
+                for (const uint64_t count : result.opcodeCounts)
+                {
+                    if (count != 0u)
+                        ++observedOpcodes;
+                }
+                t.IsTrue(
+                    observedOpcodes >= 12u,
+                    "each generated corpus should exercise varied IR");
+                t.Equals(
+                    result.opcodeCounts[
+                        static_cast<size_t>(
+                            VuIrOpcode::Unsupported)],
+                    uint64_t{0u},
+                    "generated operations should all be supported");
+            }
+        });
+
+        tc.Run("IR oracle side-exits before unsupported semantics", [](TestCase &t)
+        {
+            std::vector<uint8_t> code(16u);
+            std::vector<uint8_t> data(256u, 0x5au);
+            writeVuInstructionPair(
+                code.data(), 0u, 0x04000000u,
+                makeVuUpper(0x34u, 0xfu, 2u, 1u, 3u));
+
+            VuUnit unit;
+            VuExecutionState state = unit.state();
+            state.active = true;
+            const VuExecutionState initialState = state;
+            VuTransactionalSideEffectSink effects;
+            VuExecutionContext context{
+                .state = state,
+                .code = code.data(),
+                .codeSize = static_cast<uint32_t>(code.size()),
+                .data = data.data(),
+                .dataSize = static_cast<uint32_t>(data.size()),
+                .sideEffects = effects,
+                .enableInstrumentation = false,
+            };
+            VuIrInterpreterBackend oracle(unit);
+            const VuRunResult result = oracle.run(context, 1u);
+
+            t.IsTrue(
+                result.reason ==
+                    VuExitReason::UnsupportedInstruction,
+                "unsupported IR should return a structured side exit");
+            t.Equals(
+                result.executedCycles, uint32_t{0u},
+                "unsupported IR should not retire a pair");
+            t.Equals(
+                state.pc, uint32_t{0u},
+                "unsupported IR should remain at the original PC");
+            std::string difference;
+            t.IsTrue(
+                vuExecutionStatesEqual(
+                    state, initialState, &difference),
+                "unsupported IR mutated " + difference);
+            t.IsTrue(
+                effects.path1Packets().empty(),
+                "unsupported IR should publish no side effects");
         });
 
         tc.Run("bounded workload profile records exact pairs and identical MPG uploads", [](TestCase &t)

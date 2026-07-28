@@ -89,6 +89,10 @@ struct VuExecutionState
     VuPipelineState pipeline;
 };
 
+[[nodiscard]] bool vuExecutionStatesEqual(
+    const VuExecutionState &left, const VuExecutionState &right,
+    std::string *firstDifference = nullptr);
+
 enum class VuBackendKind : uint8_t
 {
     Auto,
@@ -144,6 +148,25 @@ public:
     virtual ~IVuSideEffectSink() = default;
     virtual void submitPath1Packet(
         const uint8_t *data, uint32_t sizeBytes) = 0;
+};
+
+class VuTransactionalSideEffectSink final : public IVuSideEffectSink
+{
+public:
+    void submitPath1Packet(
+        const uint8_t *data, uint32_t sizeBytes) override;
+
+    [[nodiscard]] const std::vector<std::vector<uint8_t>> &
+    path1Packets() const
+    {
+        return m_path1Packets;
+    }
+
+    void clear();
+    void commitTo(IVuSideEffectSink &destination) const;
+
+private:
+    std::vector<std::vector<uint8_t>> m_path1Packets;
 };
 
 struct VuExecutionContext
@@ -278,6 +301,7 @@ public:
     [[nodiscard]] std::string_view name() const override;
 
 private:
+    friend class VuIrInterpreterBackend;
     friend struct VU1NativeEmitterSpikeAccess;
 
     using DecodedInstructionPair = VuUnit::DecodedInstructionPair;
@@ -317,6 +341,22 @@ private:
     void applyDest(float *dst, const float *result, uint8_t dest);
     void applyDestAcc(const float *result, uint8_t dest);
     float broadcast(const float *vf, uint8_t bc);
+};
+
+// Development-only semantic oracle. It executes control, ordering, and
+// pipeline sequencing from VuIrInstructionPair while reusing the permanent
+// interpreter's proven opcode helpers.
+class VuIrInterpreterBackend final : public IVuExecutionBackend
+{
+public:
+    explicit VuIrInterpreterBackend(VuUnit &unit);
+
+    [[nodiscard]] VuRunResult run(
+        VuExecutionContext &context, uint32_t maxCycles) override;
+    [[nodiscard]] std::string_view name() const override;
+
+private:
+    VuInterpreterBackend m_semantics;
 };
 
 #endif

@@ -103,6 +103,7 @@ add_executable(ps2x_tests
 
 add_executable(vu1_replay
     src/vu1_replay.cpp
+    $<TARGET_OBJECTS:ps2_test_function_table>
 )
 
 option(PS2X_BUILD_VU_NATIVE_EMITTER_SPIKE

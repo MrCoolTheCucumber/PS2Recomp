@@ -1,5 +1,6 @@
 #include "runtime/ps2_gs_gpu.h"
 #include "runtime/ps2_memory.h"
+#include "runtime/ps2_vu_ir.h"
 #include "runtime/ps2_vu1.h"
 
 #include <array>
@@ -216,23 +217,45 @@ namespace
 
         return true;
     }
+
+    bool sameRunResult(
+        const VuRunResult &left, const VuRunResult &right)
+    {
+        return
+            left.requestedCycles == right.requestedCycles &&
+            left.executedCycles == right.executedCycles &&
+            left.reason == right.reason &&
+            left.activeBefore == right.activeBefore &&
+            left.activeAfter == right.activeAfter &&
+            left.completed == right.completed;
+    }
 }
 
 int main(int argc, char **argv)
 {
-    if (argc < 3 || argc > 7)
+    bool irDifferential = false;
+    std::vector<std::string> arguments;
+    for (int index = 1; index < argc; ++index)
+    {
+        if (std::string_view(argv[index]) == "--ir-differential")
+            irDifferential = true;
+        else
+            arguments.emplace_back(argv[index]);
+    }
+    if (arguments.size() < 2u || arguments.size() > 6u)
     {
         std::cerr << "usage: vu1_replay FIXTURE_DIRECTORY INSTRUCTION_PAIRS "
                      "[GIF_OUTPUT] [FINAL_VU_DATA] [INSTRUCTION_TRACE] "
-                     "[REGISTER_WRITE_SCHEDULE]\n"
+                     "[REGISTER_WRITE_SCHEDULE] [--ir-differential]\n"
                      "schedule lines: INDEX REGISTER VALUE (legacy VI), "
                      "INDEX vi REGISTER VALUE, or "
                      "INDEX vf REGISTER LANE VALUE\n";
         return 2;
     }
 
-    const std::filesystem::path directory = argv[1];
-    const uint32_t maxCycles = static_cast<uint32_t>(std::stoul(argv[2]));
+    const std::filesystem::path directory = arguments[0];
+    const uint32_t maxCycles =
+        static_cast<uint32_t>(std::stoul(arguments[1]));
     FixturePaths fixture;
     if (!resolveFixture(directory, fixture))
     {
@@ -306,8 +329,9 @@ int main(int argc, char **argv)
     state.clip = stateWords[cursor++];
 
     std::vector<ScheduledRegisterWrite> scheduledWrites;
-    if (argc == 7 &&
-        !readRegisterWriteSchedule(argv[6], scheduledWrites))
+    if (arguments.size() == 6u &&
+        !readRegisterWriteSchedule(
+            arguments[5], scheduledWrites))
     {
         std::cerr << "failed to read register write schedule\n";
         return 2;
@@ -315,9 +339,9 @@ int main(int argc, char **argv)
 
     std::ofstream instructionTrace;
     uint64_t observedInstructionIndex = 0;
-    if (argc >= 6)
+    if (arguments.size() >= 5u)
     {
-        instructionTrace.open(argv[5]);
+        instructionTrace.open(arguments[4]);
         if (!instructionTrace)
         {
             std::cerr << "failed to open instruction trace output\n";
@@ -399,7 +423,148 @@ int main(int argc, char **argv)
             });
     }
 
-    if (scheduledWrites.empty())
+    constexpr size_t kVuIrOpcodeCount =
+        static_cast<size_t>(VuIrOpcode::Unsupported) + 1u;
+    std::array<uint64_t, kVuIrOpcodeCount> irOpcodeCounts{};
+    uint64_t irComparedPairs = 0u;
+    if (irDifferential)
+    {
+        interpreter.start(
+            stateWords[2], stateWords[3], stateWords[4],
+            &memory);
+        VuExecutionState referenceState = state;
+        VuExecutionState irState = state;
+        std::vector<uint8_t> referenceData(
+            initialData.begin(), initialData.begin() + vuSize);
+        std::vector<uint8_t> irData = referenceData;
+        VuTransactionalSideEffectSink referenceEffects;
+        VuTransactionalSideEffectSink irEffects;
+        VuUnit irUnit;
+        VuInterpreterBackend reference(interpreter);
+        VuIrInterpreterBackend oracle(irUnit);
+        VuExecutionContext referenceContext{
+            .state = referenceState,
+            .code = memory.getVU1Code(),
+            .codeSize = vuSize,
+            .data = referenceData.data(),
+            .dataSize = vuSize,
+            .sideEffects = referenceEffects,
+            .memory = &memory,
+            .enableInstrumentation = true,
+        };
+        VuExecutionContext irContext{
+            .state = irState,
+            .code = memory.getVU1Code(),
+            .codeSize = vuSize,
+            .data = irData.data(),
+            .dataSize = vuSize,
+            .sideEffects = irEffects,
+            .enableInstrumentation = false,
+        };
+
+        size_t nextWrite = 0u;
+        for (uint64_t instructionIndex = 0u;
+             instructionIndex < maxCycles &&
+             referenceState.active;
+             ++instructionIndex)
+        {
+            while (nextWrite < scheduledWrites.size() &&
+                   scheduledWrites[nextWrite].instructionIndex ==
+                       instructionIndex)
+            {
+                const ScheduledRegisterWrite &write =
+                    scheduledWrites[nextWrite++];
+                if (write.kind == ScheduledWriteKind::Vi)
+                {
+                    referenceState.vi[write.registerIndex] =
+                        static_cast<int32_t>(write.value);
+                    irState.vi[write.registerIndex] =
+                        static_cast<int32_t>(write.value);
+                }
+                else
+                {
+                    std::memcpy(
+                        &referenceState.vf[write.registerIndex][write.lane],
+                        &write.value, sizeof(write.value));
+                    std::memcpy(
+                        &irState.vf[write.registerIndex][write.lane],
+                        &write.value, sizeof(write.value));
+                }
+            }
+
+            const uint32_t issuedPc = referenceState.pc;
+            uint32_t lowerWord = 0u;
+            uint32_t upperWord = 0u;
+            VuIrInstructionPair pair;
+            pair.pc = issuedPc;
+            if (issuedPc + 8u <= vuSize)
+            {
+                std::memcpy(
+                    &lowerWord, memory.getVU1Code() + issuedPc,
+                    sizeof(lowerWord));
+                std::memcpy(
+                    &upperWord,
+                    memory.getVU1Code() + issuedPc + 4u,
+                    sizeof(upperWord));
+                pair = decodeVuIrInstructionPair(
+                    issuedPc, lowerWord, upperWord);
+                ++irOpcodeCounts[
+                    static_cast<size_t>(pair.upper.opcode)];
+                ++irOpcodeCounts[
+                    static_cast<size_t>(pair.lower.opcode)];
+            }
+
+            const VuRunResult referenceResult =
+                reference.run(referenceContext, 1u);
+            const VuRunResult irResult =
+                oracle.run(irContext, 1u);
+            irComparedPairs += referenceResult.executedCycles;
+            std::string stateDifference;
+            const bool statesMatch = vuExecutionStatesEqual(
+                referenceState, irState, &stateDifference);
+            if (!sameRunResult(referenceResult, irResult) ||
+                !statesMatch ||
+                referenceData != irData ||
+                referenceEffects.path1Packets() !=
+                    irEffects.path1Packets())
+            {
+                std::cerr
+                    << "IR differential mismatch at pair "
+                    << instructionIndex
+                    << " pc=0x" << std::hex << issuedPc
+                    << " lower=0x" << lowerWord
+                    << " (" << vuIrOpcodeName(pair.lower.opcode)
+                    << ") upper=0x" << upperWord
+                    << " (" << vuIrOpcodeName(pair.upper.opcode)
+                    << ") reference_exit="
+                    << vuExitReasonName(referenceResult.reason)
+                    << " ir_exit="
+                    << vuExitReasonName(irResult.reason);
+                if (!statesMatch)
+                    std::cerr << " state=" << stateDifference;
+                if (referenceData != irData)
+                    std::cerr << " data=VU";
+                if (referenceEffects.path1Packets() !=
+                    irEffects.path1Packets())
+                {
+                    std::cerr << " effects=PATH1";
+                }
+                std::cerr << "\n";
+                return 1;
+            }
+        }
+
+        state = std::move(referenceState);
+        std::memcpy(
+            memory.getVU1Data(), referenceData.data(), vuSize);
+        for (const std::vector<uint8_t> &packet :
+             referenceEffects.path1Packets())
+        {
+            gifOutput.insert(
+                gifOutput.end(), packet.begin(), packet.end());
+        }
+    }
+    else if (scheduledWrites.empty())
     {
         interpreter.execute(
             memory.getVU1Code(), vuSize,
@@ -444,21 +609,44 @@ int main(int argc, char **argv)
         }
     }
 
-    if (argc >= 4)
+    if (arguments.size() >= 3u)
     {
-        std::ofstream output(argv[3], std::ios::binary);
+        std::ofstream output(arguments[2], std::ios::binary);
         output.write(reinterpret_cast<const char *>(gifOutput.data()),
                      static_cast<std::streamsize>(gifOutput.size()));
     }
-    if (argc >= 5)
+    if (arguments.size() >= 4u)
     {
-        std::ofstream output(argv[4], std::ios::binary);
+        std::ofstream output(arguments[3], std::ios::binary);
         output.write(reinterpret_cast<const char *>(memory.getVU1Data()),
                      static_cast<std::streamsize>(vuSize));
     }
 
     std::cout << std::hex << std::setfill('0');
-    std::cout << "{\"schema_version\":1,\"pc\":\"0x"
+    std::cout << "{\"schema_version\":1";
+    if (irDifferential)
+    {
+        std::cout
+            << ",\"ir_differential\":true"
+            << ",\"ir_compared_pairs\":" << std::dec
+            << irComparedPairs
+            << ",\"ir_opcodes\":{";
+        bool firstOpcode = true;
+        for (size_t index = 0u;
+             index < irOpcodeCounts.size(); ++index)
+        {
+            if (irOpcodeCounts[index] == 0u)
+                continue;
+            std::cout
+                << (firstOpcode ? "" : ",")
+                << "\"" << vuIrOpcodeName(
+                       static_cast<VuIrOpcode>(index))
+                << "\":" << irOpcodeCounts[index];
+            firstOpcode = false;
+        }
+        std::cout << "}" << std::hex;
+    }
+    std::cout << ",\"pc\":\"0x"
               << std::setw(4) << state.pc << "\",\"gif_bytes\":"
               << std::dec << gifOutput.size() << std::hex << ",\"vi\":[";
     for (size_t index = 0; index < 16; ++index)

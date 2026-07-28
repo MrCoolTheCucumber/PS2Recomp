@@ -1,17 +1,13 @@
 #include "runtime/ps2_vu1.h"
 #include "runtime/ps2_gs_gpu.h"
 #include "runtime/ps2_memory.h"
+#include "ps2_vu_float_mode.h"
 #include "ps2_vu1_detail.h"
 
 #include <algorithm>
-#include <cfenv>
 #include <cstring>
 #include <limits>
 #include <utility>
-
-#if defined(__SSE__)
-#include <xmmintrin.h>
-#endif
 
 namespace
 {
@@ -56,48 +52,6 @@ namespace
             return false;
         }
     }
-
-    class ScopedVuFloatMode
-    {
-    public:
-        ScopedVuFloatMode()
-            : m_previous(std::fegetround())
-        {
-#if defined(__SSE__)
-            m_previousMxcsr = _mm_getcsr();
-#endif
-            if (m_previous != FE_TOWARDZERO)
-                m_changed = std::fesetround(FE_TOWARDZERO) == 0;
-
-#if defined(__SSE__)
-            // The VU treats denormal inputs as zero and clamps exponent
-            // underflow to signed zero. DAZ and FTZ provide those semantics
-            // for the host scalar floating-point operations used below.
-            constexpr uint32_t kDenormalsAreZero = 1u << 6u;
-            constexpr uint32_t kFlushToZero = 1u << 15u;
-            _mm_setcsr(_mm_getcsr() | kDenormalsAreZero | kFlushToZero);
-#endif
-        }
-
-        ~ScopedVuFloatMode()
-        {
-            if (m_changed && m_previous != -1)
-                std::fesetround(m_previous);
-#if defined(__SSE__)
-            _mm_setcsr(m_previousMxcsr);
-#endif
-        }
-
-        ScopedVuFloatMode(const ScopedVuFloatMode &) = delete;
-        ScopedVuFloatMode &operator=(const ScopedVuFloatMode &) = delete;
-
-    private:
-        int m_previous = -1;
-        bool m_changed = false;
-#if defined(__SSE__)
-        uint32_t m_previousMxcsr = 0u;
-#endif
-    };
 
     class RuntimeVuSideEffectSink final : public IVuSideEffectSink
     {
@@ -185,6 +139,129 @@ std::string_view vuExitReasonName(VuExitReason reason)
         return "fault";
     }
     return "unknown";
+}
+
+bool vuExecutionStatesEqual(
+    const VuExecutionState &left, const VuExecutionState &right,
+    std::string *firstDifference)
+{
+    const auto fail = [&](const char *field)
+    {
+        if (firstDifference)
+            *firstDifference = field;
+        return false;
+    };
+    const auto differentBytes =
+        [](const void *leftBytes, const void *rightBytes, size_t size)
+    {
+        return std::memcmp(leftBytes, rightBytes, size) != 0;
+    };
+
+    if (differentBytes(left.vf, right.vf, sizeof(left.vf)))
+        return fail("vf");
+    if (differentBytes(left.vi, right.vi, sizeof(left.vi)))
+        return fail("vi");
+    if (differentBytes(left.acc, right.acc, sizeof(left.acc)))
+        return fail("acc");
+    if (differentBytes(&left.q, &right.q, sizeof(left.q)))
+        return fail("q");
+    if (differentBytes(&left.p, &right.p, sizeof(left.p)))
+        return fail("p");
+    if (differentBytes(&left.i, &right.i, sizeof(left.i)))
+        return fail("i");
+#define VU_COMPARE_STATE_FIELD(field) \
+    if (left.field != right.field)    \
+        return fail(#field)
+    VU_COMPARE_STATE_FIELD(pc);
+    VU_COMPARE_STATE_FIELD(mac);
+    VU_COMPARE_STATE_FIELD(clip);
+    VU_COMPARE_STATE_FIELD(status);
+    VU_COMPARE_STATE_FIELD(ebit);
+    VU_COMPARE_STATE_FIELD(top);
+    VU_COMPARE_STATE_FIELD(itop);
+    VU_COMPARE_STATE_FIELD(branchPending);
+    VU_COMPARE_STATE_FIELD(branchTarget);
+    VU_COMPARE_STATE_FIELD(branchDelay);
+    VU_COMPARE_STATE_FIELD(viBackupCycles);
+    VU_COMPARE_STATE_FIELD(viBackupRegister);
+    VU_COMPARE_STATE_FIELD(viBackupValue);
+    VU_COMPARE_STATE_FIELD(active);
+    VU_COMPARE_STATE_FIELD(issuedCycles);
+#undef VU_COMPARE_STATE_FIELD
+
+    const VuPipelineState &leftPipeline = left.pipeline;
+    const VuPipelineState &rightPipeline = right.pipeline;
+#define VU_COMPARE_PIPELINE_FIELD(field)                  \
+    if (leftPipeline.field != rightPipeline.field)        \
+        return fail("pipeline." #field)
+    VU_COMPARE_PIPELINE_FIELD(xgkick.active);
+    VU_COMPARE_PIPELINE_FIELD(xgkick.address);
+    VU_COMPARE_PIPELINE_FIELD(xgkick.tagBytesRemaining);
+    VU_COMPARE_PIPELINE_FIELD(xgkick.cycleCredit);
+    VU_COMPARE_PIPELINE_FIELD(xgkick.tagEop);
+    VU_COMPARE_PIPELINE_FIELD(xgkick.packet);
+    VU_COMPARE_PIPELINE_FIELD(delayedQ.active);
+    if (differentBytes(
+            &leftPipeline.delayedQ.result,
+            &rightPipeline.delayedQ.result,
+            sizeof(leftPipeline.delayedQ.result)))
+    {
+        return fail("pipeline.delayedQ.result");
+    }
+    VU_COMPARE_PIPELINE_FIELD(delayedQ.cyclesRemaining);
+    VU_COMPARE_PIPELINE_FIELD(delayedP.active);
+    if (differentBytes(
+            &leftPipeline.delayedP.result,
+            &rightPipeline.delayedP.result,
+            sizeof(leftPipeline.delayedP.result)))
+    {
+        return fail("pipeline.delayedP.result");
+    }
+    VU_COMPARE_PIPELINE_FIELD(delayedP.cyclesRemaining);
+    for (size_t index = 0u;
+         index < leftPipeline.fmacFlags.size(); ++index)
+    {
+        const VuPipelineState::FmacFlags &leftFlags =
+            leftPipeline.fmacFlags[index];
+        const VuPipelineState::FmacFlags &rightFlags =
+            rightPipeline.fmacFlags[index];
+        if (leftFlags.active != rightFlags.active)
+            return fail("pipeline.fmacFlags.active");
+        if (leftFlags.mac != rightFlags.mac)
+            return fail("pipeline.fmacFlags.mac");
+        if (leftFlags.status != rightFlags.status)
+            return fail("pipeline.fmacFlags.status");
+    }
+    VU_COMPARE_PIPELINE_FIELD(fmacFlagIndex);
+    VU_COMPARE_PIPELINE_FIELD(workingMac);
+#undef VU_COMPARE_PIPELINE_FIELD
+
+    if (firstDifference)
+        firstDifference->clear();
+    return true;
+}
+
+void VuTransactionalSideEffectSink::submitPath1Packet(
+    const uint8_t *data, uint32_t sizeBytes)
+{
+    std::vector<uint8_t> &packet = m_path1Packets.emplace_back();
+    if (sizeBytes != 0u)
+        packet.assign(data, data + sizeBytes);
+}
+
+void VuTransactionalSideEffectSink::clear()
+{
+    m_path1Packets.clear();
+}
+
+void VuTransactionalSideEffectSink::commitTo(
+    IVuSideEffectSink &destination) const
+{
+    for (const std::vector<uint8_t> &packet : m_path1Packets)
+    {
+        destination.submitPath1Packet(
+            packet.data(), static_cast<uint32_t>(packet.size()));
+    }
 }
 
 VuUnit::VuUnit()
