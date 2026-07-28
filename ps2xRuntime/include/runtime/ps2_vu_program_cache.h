@@ -123,6 +123,9 @@ public:
     [[nodiscard]] VuProgramHandle insert(
         VuCompiledProgram program,
         std::string *diagnostic = nullptr);
+    [[nodiscard]] const VuCompiledProgram *resolveCurrent(
+        VuProgramHandle handle,
+        const VuProgramKey &expectedKey);
     [[nodiscard]] const VuCompiledProgram *resolve(
         VuProgramHandle handle) const;
 

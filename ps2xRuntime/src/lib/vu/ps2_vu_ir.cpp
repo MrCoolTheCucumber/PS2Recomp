@@ -871,11 +871,13 @@ VuIrInstructionPair decodeVuIrInstructionPair(
 
 VuIrBlock decodeVuIrBlock(
     const uint8_t *code, uint32_t codeSize,
-    uint32_t entryPc, uint32_t maximumPairs)
+    uint32_t entryPc, uint32_t maximumPairs,
+    VuIrBlockForm form)
 {
     VuIrBlock block;
     block.entryPc = entryPc;
     block.codeSize = codeSize;
+    block.form = form;
     if (!code || codeSize < 8u || (codeSize & 7u) != 0u ||
         (entryPc & 7u) != 0u || entryPc > codeSize - 8u)
     {
@@ -911,7 +913,8 @@ VuIrBlock decodeVuIrBlock(
             block.exit = delayedExit;
             return block;
         }
-        if (vuIrHasPairFlag(pair, VuIrPairBranch))
+        if (form == VuIrBlockForm::Basic &&
+            vuIrHasPairFlag(pair, VuIrPairBranch))
         {
             delayedExit = VuIrBlockExit::BranchBoundary;
             exitAfterCurrentPair = true;
@@ -958,6 +961,18 @@ bool verifyVuIrBlock(
     const VuIrBlock &block,
     VuIrVerificationError *error)
 {
+    if (block.form != VuIrBlockForm::Basic &&
+        block.form != VuIrBlockForm::LinearTrace)
+    {
+        if (error)
+        {
+            *error = {
+                .pc = block.entryPc,
+                .message = "VU IR block has an invalid form",
+            };
+        }
+        return false;
+    }
     const bool validEntry =
         block.codeSize >= 8u &&
         (block.codeSize & 7u) == 0u &&
@@ -1023,7 +1038,8 @@ bool verifyVuIrBlock(
 
         if (terminalIndex != block.pairs.size())
             break;
-        if (vuIrHasPairFlag(pair, VuIrPairBranch))
+        if (block.form == VuIrBlockForm::Basic &&
+            vuIrHasPairFlag(pair, VuIrPairBranch))
         {
             delayedExit = VuIrBlockExit::BranchBoundary;
             delayedExitPending = true;

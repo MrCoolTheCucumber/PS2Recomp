@@ -234,6 +234,51 @@ void register_ps2_vu_program_cache_tests()
             });
 
         tc.Run(
+            "direct handles require the complete current key and epoch",
+            [](TestCase &t)
+            {
+                int memoryIdentity = 0;
+                int codeIdentity = 0;
+                const VuProgramKey key =
+                    syntheticKey(
+                        VuUnitId::Vu1,
+                        &memoryIdentity, &codeIdentity);
+                VuProgramCache cache(VuUnitId::Vu1);
+                const VuProgramHandle handle =
+                    cache.insert(makeProgram(key));
+
+                t.IsNotNull(
+                    cache.resolveCurrent(handle, key),
+                    "the matching current handle should bypass hashing");
+
+                VuProgramKey differentEntry = key;
+                differentEntry.entryPc = 8u;
+                t.IsNull(
+                    cache.resolveCurrent(
+                        handle, differentEntry),
+                    "a direct handle must not alias another entry");
+
+                VuProgramKey newerGeneration = key;
+                ++newerGeneration.codeGeneration;
+                t.IsNull(
+                    cache.resolveCurrent(
+                        handle, newerGeneration),
+                    "a direct handle must not cross generations");
+                t.IsNotNull(
+                    cache.resolve(handle),
+                    "a rejected direct probe must not mutate cache scope");
+
+                cache.flush();
+                t.IsNull(
+                    cache.resolveCurrent(handle, key),
+                    "a stale epoch must reject a direct handle");
+                t.Equals(
+                    cache.diagnostics().hits,
+                    uint64_t{1u},
+                    "only the exact direct resolution should count as a hit");
+            });
+
+        tc.Run(
             "invalid keys and malformed programs are rejected",
             [](TestCase &t)
             {

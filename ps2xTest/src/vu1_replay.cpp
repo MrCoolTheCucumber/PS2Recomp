@@ -1,6 +1,7 @@
 #include "runtime/ps2_gs_gpu.h"
 #include "runtime/ps2_memory.h"
 #include "runtime/ps2_vu_ir.h"
+#include "runtime/ps2_vu_recompiler.h"
 #include "runtime/ps2_vu1.h"
 
 #include <array>
@@ -229,24 +230,60 @@ namespace
             left.activeAfter == right.activeAfter &&
             left.completed == right.completed;
     }
+
+    bool sameDifferentialRunResult(
+        const VuRunResult &reference,
+        const VuRunResult &candidate,
+        bool nativeCandidate)
+    {
+        if (sameRunResult(reference, candidate))
+            return true;
+        return
+            nativeCandidate &&
+            reference.requestedCycles ==
+                candidate.requestedCycles &&
+            reference.executedCycles ==
+                candidate.executedCycles &&
+            reference.reason == VuExitReason::CycleBudget &&
+            candidate.reason ==
+                VuExitReason::XgkickBoundary &&
+            reference.activeBefore ==
+                candidate.activeBefore &&
+            reference.activeAfter ==
+                candidate.activeAfter &&
+            reference.completed == candidate.completed;
+    }
 }
 
 int main(int argc, char **argv)
 {
     bool irDifferential = false;
+    bool recompilerDifferential = false;
     std::vector<std::string> arguments;
     for (int index = 1; index < argc; ++index)
     {
         if (std::string_view(argv[index]) == "--ir-differential")
             irDifferential = true;
+        else if (std::string_view(argv[index]) ==
+                 "--recompiler-differential")
+        {
+            recompilerDifferential = true;
+        }
         else
             arguments.emplace_back(argv[index]);
+    }
+    if (irDifferential && recompilerDifferential)
+    {
+        std::cerr
+            << "select only one differential backend\n";
+        return 2;
     }
     if (arguments.size() < 2u || arguments.size() > 6u)
     {
         std::cerr << "usage: vu1_replay FIXTURE_DIRECTORY INSTRUCTION_PAIRS "
                      "[GIF_OUTPUT] [FINAL_VU_DATA] [INSTRUCTION_TRACE] "
-                     "[REGISTER_WRITE_SCHEDULE] [--ir-differential]\n"
+                     "[REGISTER_WRITE_SCHEDULE] "
+                     "[--ir-differential|--recompiler-differential]\n"
                      "schedule lines: INDEX REGISTER VALUE (legacy VI), "
                      "INDEX vi REGISTER VALUE, or "
                      "INDEX vf REGISTER LANE VALUE\n";
@@ -426,22 +463,45 @@ int main(int argc, char **argv)
     constexpr size_t kVuIrOpcodeCount =
         static_cast<size_t>(VuIrOpcode::Unsupported) + 1u;
     std::array<uint64_t, kVuIrOpcodeCount> irOpcodeCounts{};
-    uint64_t irComparedPairs = 0u;
-    if (irDifferential)
+    uint64_t differentialComparedPairs = 0u;
+    VuRecompilerDiagnostics recompilerDiagnostics{};
+    if (irDifferential || recompilerDifferential)
     {
+        if (recompilerDifferential &&
+            vuSize != PS2_VU1_CODE_SIZE)
+        {
+            std::cerr
+                << "the VU1 recompiler requires a full VU1 fixture\n";
+            return 2;
+        }
+        if (recompilerDifferential &&
+            !VuRecompilerBackend::supported())
+        {
+            std::cerr
+                << "the x86-64 VU recompiler is unavailable\n";
+            return 2;
+        }
+
         interpreter.start(
             stateWords[2], stateWords[3], stateWords[4],
             &memory);
         VuExecutionState referenceState = state;
-        VuExecutionState irState = state;
+        VuExecutionState candidateState = state;
         std::vector<uint8_t> referenceData(
             initialData.begin(), initialData.begin() + vuSize);
-        std::vector<uint8_t> irData = referenceData;
+        std::vector<uint8_t> candidateData = referenceData;
         VuTransactionalSideEffectSink referenceEffects;
-        VuTransactionalSideEffectSink irEffects;
-        VuUnit irUnit;
+        VuTransactionalSideEffectSink candidateEffects;
+        VuUnit candidateUnit(VuUnitId::Vu1);
         VuInterpreterBackend reference(interpreter);
-        VuIrInterpreterBackend oracle(irUnit);
+        VuIrInterpreterBackend oracle(candidateUnit);
+        VuRecompilerBackend recompiler(candidateUnit);
+        IVuExecutionBackend *const candidate =
+            recompilerDifferential
+                ? static_cast<IVuExecutionBackend *>(
+                      &recompiler)
+                : static_cast<IVuExecutionBackend *>(
+                      &oracle);
         VuExecutionContext referenceContext{
             .state = referenceState,
             .code = memory.getVU1Code(),
@@ -452,13 +512,14 @@ int main(int argc, char **argv)
             .memory = &memory,
             .enableInstrumentation = true,
         };
-        VuExecutionContext irContext{
-            .state = irState,
+        VuExecutionContext candidateContext{
+            .state = candidateState,
             .code = memory.getVU1Code(),
             .codeSize = vuSize,
-            .data = irData.data(),
+            .data = candidateData.data(),
             .dataSize = vuSize,
-            .sideEffects = irEffects,
+            .sideEffects = candidateEffects,
+            .memory = &memory,
             .enableInstrumentation = false,
         };
 
@@ -478,7 +539,7 @@ int main(int argc, char **argv)
                 {
                     referenceState.vi[write.registerIndex] =
                         static_cast<int32_t>(write.value);
-                    irState.vi[write.registerIndex] =
+                    candidateState.vi[write.registerIndex] =
                         static_cast<int32_t>(write.value);
                 }
                 else
@@ -487,7 +548,8 @@ int main(int argc, char **argv)
                         &referenceState.vf[write.registerIndex][write.lane],
                         &write.value, sizeof(write.value));
                     std::memcpy(
-                        &irState.vf[write.registerIndex][write.lane],
+                        &candidateState.vf[
+                            write.registerIndex][write.lane],
                         &write.value, sizeof(write.value));
                 }
             }
@@ -516,20 +578,27 @@ int main(int argc, char **argv)
 
             const VuRunResult referenceResult =
                 reference.run(referenceContext, 1u);
-            const VuRunResult irResult =
-                oracle.run(irContext, 1u);
-            irComparedPairs += referenceResult.executedCycles;
+            const VuRunResult candidateResult =
+                candidate->run(candidateContext, 1u);
+            differentialComparedPairs +=
+                referenceResult.executedCycles;
             std::string stateDifference;
             const bool statesMatch = vuExecutionStatesEqual(
-                referenceState, irState, &stateDifference);
-            if (!sameRunResult(referenceResult, irResult) ||
+                referenceState, candidateState,
+                &stateDifference);
+            if (!sameDifferentialRunResult(
+                    referenceResult, candidateResult,
+                    recompilerDifferential) ||
                 !statesMatch ||
-                referenceData != irData ||
+                referenceData != candidateData ||
                 referenceEffects.path1Packets() !=
-                    irEffects.path1Packets())
+                    candidateEffects.path1Packets())
             {
                 std::cerr
-                    << "IR differential mismatch at pair "
+                    << (recompilerDifferential
+                            ? "recompiler"
+                            : "IR")
+                    << " differential mismatch at pair "
                     << instructionIndex
                     << " pc=0x" << std::hex << issuedPc
                     << " lower=0x" << lowerWord
@@ -538,14 +607,15 @@ int main(int argc, char **argv)
                     << " (" << vuIrOpcodeName(pair.upper.opcode)
                     << ") reference_exit="
                     << vuExitReasonName(referenceResult.reason)
-                    << " ir_exit="
-                    << vuExitReasonName(irResult.reason);
+                    << " candidate_exit="
+                    << vuExitReasonName(
+                           candidateResult.reason);
                 if (!statesMatch)
                     std::cerr << " state=" << stateDifference;
-                if (referenceData != irData)
+                if (referenceData != candidateData)
                     std::cerr << " data=VU";
                 if (referenceEffects.path1Packets() !=
-                    irEffects.path1Packets())
+                    candidateEffects.path1Packets())
                 {
                     std::cerr << " effects=PATH1";
                 }
@@ -554,6 +624,8 @@ int main(int argc, char **argv)
             }
         }
 
+        if (recompilerDifferential)
+            recompilerDiagnostics = recompiler.diagnostics();
         state = std::move(referenceState);
         std::memcpy(
             memory.getVU1Data(), referenceData.data(), vuSize);
@@ -629,7 +701,7 @@ int main(int argc, char **argv)
         std::cout
             << ",\"ir_differential\":true"
             << ",\"ir_compared_pairs\":" << std::dec
-            << irComparedPairs
+            << differentialComparedPairs
             << ",\"ir_opcodes\":{";
         bool firstOpcode = true;
         for (size_t index = 0u;
@@ -645,6 +717,37 @@ int main(int argc, char **argv)
             firstOpcode = false;
         }
         std::cout << "}" << std::hex;
+    }
+    if (recompilerDifferential)
+    {
+        std::cout
+            << ",\"recompiler_differential\":true"
+            << ",\"recompiler_compared_pairs\":"
+            << std::dec << differentialComparedPairs
+            << ",\"recompiler_diagnostics\":{"
+            << "\"native_entries\":"
+            << recompilerDiagnostics.nativeEntries
+            << ",\"native_pairs\":"
+            << recompilerDiagnostics.nativePairs
+            << ",\"inline_pairs\":"
+            << recompilerDiagnostics.inlinePairs
+            << ",\"helper_pairs\":"
+            << recompilerDiagnostics.helperPairs
+            << ",\"block_completes\":"
+            << recompilerDiagnostics.blockCompletes
+            << ",\"cycle_budget_exits\":"
+            << recompilerDiagnostics.cycleBudgetExits
+            << ",\"xgkick_exits\":"
+            << recompilerDiagnostics.xgkickExits
+            << ",\"xgkick_advance_helper_calls\":"
+            << recompilerDiagnostics.xgkickAdvanceHelperCalls
+            << ",\"unsupported_exits\":"
+            << recompilerDiagnostics.unsupportedExits
+            << ",\"code_invalidation_exits\":"
+            << recompilerDiagnostics.codeInvalidationExits
+            << ",\"fault_exits\":"
+            << recompilerDiagnostics.faultExits
+            << "}" << std::hex;
     }
     std::cout << ",\"pc\":\"0x"
               << std::setw(4) << state.pc << "\",\"gif_bytes\":"

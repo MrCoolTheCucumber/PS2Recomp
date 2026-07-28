@@ -224,10 +224,17 @@ enum class VuIrBlockExit : uint8_t
     CodeBounds,
 };
 
+enum class VuIrBlockForm : uint8_t
+{
+    Basic,
+    LinearTrace,
+};
+
 struct VuIrBlock
 {
     uint32_t entryPc = 0u;
     uint32_t codeSize = 0u;
+    VuIrBlockForm form = VuIrBlockForm::Basic;
     VuIrBlockExit exit = VuIrBlockExit::PairLimit;
     std::vector<VuIrInstructionPair> pairs;
 };
@@ -244,7 +251,8 @@ struct VuIrVerificationError
     uint32_t pc, uint32_t lowerWord, uint32_t upperWord);
 [[nodiscard]] VuIrBlock decodeVuIrBlock(
     const uint8_t *code, uint32_t codeSize,
-    uint32_t entryPc, uint32_t maximumPairs);
+    uint32_t entryPc, uint32_t maximumPairs,
+    VuIrBlockForm form = VuIrBlockForm::Basic);
 [[nodiscard]] bool verifyVuIrInstructionPair(
     const VuIrInstructionPair &pair,
     VuIrVerificationError *error = nullptr);

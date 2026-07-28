@@ -171,6 +171,21 @@ const VuCompiledProgram *VuProgramCache::resolve(
     return &m_programs[handle.index];
 }
 
+const VuCompiledProgram *VuProgramCache::resolveCurrent(
+    VuProgramHandle handle,
+    const VuProgramKey &expectedKey)
+{
+    requireOwnerThread();
+    if (!handle.valid() || handle.epoch != m_epoch ||
+        handle.index >= m_programs.size() ||
+        m_programs[handle.index].key != expectedKey)
+    {
+        return nullptr;
+    }
+    ++m_diagnostics.hits;
+    return &m_programs[handle.index];
+}
+
 void VuProgramCache::flush()
 {
     requireOwnerThread();

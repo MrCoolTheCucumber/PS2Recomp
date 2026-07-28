@@ -1073,6 +1073,21 @@ void register_ps2_vu1_tests()
             t.IsTrue(
                 verifyVuIrBlock(branch),
                 "the branch block should pass structural verification");
+
+            const VuIrBlock trace = decodeVuIrBlock(
+                code.data(), static_cast<uint32_t>(code.size()),
+                0u, 3u, VuIrBlockForm::LinearTrace);
+            t.Equals(
+                trace.pairs.size(), size_t{3u},
+                "a linear trace should retain sequential branch fallthrough");
+            t.IsTrue(
+                trace.form == VuIrBlockForm::LinearTrace &&
+                    trace.exit == VuIrBlockExit::PairLimit,
+                "a fallthrough trace should end only at its pair limit");
+            t.IsTrue(
+                verifyVuIrBlock(trace),
+                "the linear branch trace should verify");
+
             VuIrBlock malformedExit = branch;
             malformedExit.exit = VuIrBlockExit::PairLimit;
             VuIrVerificationError error;
