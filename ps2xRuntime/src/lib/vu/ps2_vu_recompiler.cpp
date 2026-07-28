@@ -216,117 +216,18 @@ namespace
         bool canInlineUpper(
             const VuIrOperation &operation) const
         {
-            switch (operation.opcode)
-            {
-            case VuIrOpcode::Nop:
-            case VuIrOpcode::UpperAddBc:
-            case VuIrOpcode::UpperSubBc:
-            case VuIrOpcode::UpperMaxBc:
-            case VuIrOpcode::UpperMiniBc:
-            case VuIrOpcode::UpperMulBc:
-            case VuIrOpcode::UpperMulQ:
-            case VuIrOpcode::UpperMaxI:
-            case VuIrOpcode::UpperMulI:
-            case VuIrOpcode::UpperMiniI:
-            case VuIrOpcode::UpperAddQ:
-            case VuIrOpcode::UpperAddI:
-            case VuIrOpcode::UpperSubQ:
-            case VuIrOpcode::UpperSubI:
-            case VuIrOpcode::UpperAdd:
-            case VuIrOpcode::UpperMul:
-            case VuIrOpcode::UpperMax:
-            case VuIrOpcode::UpperSub:
-            case VuIrOpcode::UpperMini:
-            case VuIrOpcode::UpperAddaBc:
-            case VuIrOpcode::UpperSubaBc:
-            case VuIrOpcode::UpperMulaBc:
-            case VuIrOpcode::UpperMulaQ:
-            case VuIrOpcode::UpperMulaI:
-            case VuIrOpcode::UpperAddaQ:
-            case VuIrOpcode::UpperAddaI:
-            case VuIrOpcode::UpperSubaQ:
-            case VuIrOpcode::UpperSubaI:
-            case VuIrOpcode::UpperAdda:
-            case VuIrOpcode::UpperMula:
-            case VuIrOpcode::UpperSuba:
-            case VuIrOpcode::UpperItof0:
-            case VuIrOpcode::UpperItof4:
-            case VuIrOpcode::UpperItof12:
-            case VuIrOpcode::UpperItof15:
-            case VuIrOpcode::UpperFtoi0:
-            case VuIrOpcode::UpperFtoi4:
-            case VuIrOpcode::UpperFtoi12:
-            case VuIrOpcode::UpperFtoi15:
-                return true;
-            case VuIrOpcode::UpperMaddBc:
-            case VuIrOpcode::UpperMsubBc:
-            case VuIrOpcode::UpperMaddQ:
-            case VuIrOpcode::UpperMaddI:
-            case VuIrOpcode::UpperMsubQ:
-            case VuIrOpcode::UpperMsubI:
-            case VuIrOpcode::UpperMadd:
-            case VuIrOpcode::UpperMsub:
-            case VuIrOpcode::UpperMaddaBc:
-            case VuIrOpcode::UpperMsubaBc:
-            case VuIrOpcode::UpperMaddaQ:
-            case VuIrOpcode::UpperMaddaI:
-            case VuIrOpcode::UpperMsubaQ:
-            case VuIrOpcode::UpperMsubaI:
-            case VuIrOpcode::UpperMadda:
-            case VuIrOpcode::UpperMsuba:
-                return
-                    (m_hostFeatures &
-                     (kHostFeatureAvx |
-                      kHostFeatureFma)) ==
-                    (kHostFeatureAvx |
-                     kHostFeatureFma);
-            default:
-                return false;
-            }
+            return VuRecompilerBackend::
+                canInlineUpperOpcode(
+                    operation.opcode,
+                    m_hostFeatures);
         }
 
         static bool canInlineLower(
             const VuIrOperation &operation)
         {
-            switch (operation.opcode)
-            {
-            case VuIrOpcode::Nop:
-            case VuIrOpcode::LowerLq:
-            case VuIrOpcode::LowerSq:
-            case VuIrOpcode::LowerIlw:
-            case VuIrOpcode::LowerIsw:
-            case VuIrOpcode::LowerIaddiu:
-            case VuIrOpcode::LowerIsubiu:
-            case VuIrOpcode::LowerIadd:
-            case VuIrOpcode::LowerIsub:
-            case VuIrOpcode::LowerIaddi:
-            case VuIrOpcode::LowerIand:
-            case VuIrOpcode::LowerIor:
-            case VuIrOpcode::LowerMove:
-            case VuIrOpcode::LowerMr32:
-            case VuIrOpcode::LowerLqi:
-            case VuIrOpcode::LowerSqi:
-            case VuIrOpcode::LowerMtir:
-            case VuIrOpcode::LowerMfir:
-            case VuIrOpcode::LowerIlwr:
-            case VuIrOpcode::LowerIswr:
-            case VuIrOpcode::LowerXtop:
-            case VuIrOpcode::LowerXitop:
-            case VuIrOpcode::LowerDiv:
-            case VuIrOpcode::LowerB:
-            case VuIrOpcode::LowerBal:
-            case VuIrOpcode::LowerJr:
-            case VuIrOpcode::LowerJalr:
-            case VuIrOpcode::LowerIbeq:
-            case VuIrOpcode::LowerIbne:
-            case VuIrOpcode::LowerIbltz:
-            case VuIrOpcode::LowerIbgtz:
-            case VuIrOpcode::LowerIblez:
-            case VuIrOpcode::LowerIbgez:
-                return true;
-            default:
-                return false;
-            }
+            return VuRecompilerBackend::
+                canInlineLowerOpcode(
+                    operation.opcode);
         }
 
         bool canInlinePair(
@@ -3122,6 +3023,135 @@ uint64_t VuRecompilerBackend::hostFeatures()
 #else
     return 0u;
 #endif
+}
+
+bool VuRecompilerBackend::canInlineUpperOpcode(
+    VuIrOpcode opcode, uint64_t hostFeatures)
+{
+    switch (opcode)
+    {
+    case VuIrOpcode::Nop:
+    case VuIrOpcode::UpperAddBc:
+    case VuIrOpcode::UpperSubBc:
+    case VuIrOpcode::UpperMaxBc:
+    case VuIrOpcode::UpperMiniBc:
+    case VuIrOpcode::UpperMulBc:
+    case VuIrOpcode::UpperMulQ:
+    case VuIrOpcode::UpperMaxI:
+    case VuIrOpcode::UpperMulI:
+    case VuIrOpcode::UpperMiniI:
+    case VuIrOpcode::UpperAddQ:
+    case VuIrOpcode::UpperAddI:
+    case VuIrOpcode::UpperSubQ:
+    case VuIrOpcode::UpperSubI:
+    case VuIrOpcode::UpperAdd:
+    case VuIrOpcode::UpperMul:
+    case VuIrOpcode::UpperMax:
+    case VuIrOpcode::UpperSub:
+    case VuIrOpcode::UpperMini:
+    case VuIrOpcode::UpperAddaBc:
+    case VuIrOpcode::UpperSubaBc:
+    case VuIrOpcode::UpperMulaBc:
+    case VuIrOpcode::UpperMulaQ:
+    case VuIrOpcode::UpperMulaI:
+    case VuIrOpcode::UpperAddaQ:
+    case VuIrOpcode::UpperAddaI:
+    case VuIrOpcode::UpperSubaQ:
+    case VuIrOpcode::UpperSubaI:
+    case VuIrOpcode::UpperAdda:
+    case VuIrOpcode::UpperMula:
+    case VuIrOpcode::UpperSuba:
+    case VuIrOpcode::UpperItof0:
+    case VuIrOpcode::UpperItof4:
+    case VuIrOpcode::UpperItof12:
+    case VuIrOpcode::UpperItof15:
+    case VuIrOpcode::UpperFtoi0:
+    case VuIrOpcode::UpperFtoi4:
+    case VuIrOpcode::UpperFtoi12:
+    case VuIrOpcode::UpperFtoi15:
+        return true;
+    case VuIrOpcode::UpperMaddBc:
+    case VuIrOpcode::UpperMsubBc:
+    case VuIrOpcode::UpperMaddQ:
+    case VuIrOpcode::UpperMaddI:
+    case VuIrOpcode::UpperMsubQ:
+    case VuIrOpcode::UpperMsubI:
+    case VuIrOpcode::UpperMadd:
+    case VuIrOpcode::UpperMsub:
+    case VuIrOpcode::UpperMaddaBc:
+    case VuIrOpcode::UpperMsubaBc:
+    case VuIrOpcode::UpperMaddaQ:
+    case VuIrOpcode::UpperMaddaI:
+    case VuIrOpcode::UpperMsubaQ:
+    case VuIrOpcode::UpperMsubaI:
+    case VuIrOpcode::UpperMadda:
+    case VuIrOpcode::UpperMsuba:
+        return
+            (hostFeatures &
+             (kHostFeatureAvx | kHostFeatureFma)) ==
+            (kHostFeatureAvx | kHostFeatureFma);
+    default:
+        return false;
+    }
+}
+
+bool VuRecompilerBackend::canInlineLowerOpcode(
+    VuIrOpcode opcode)
+{
+    switch (opcode)
+    {
+    case VuIrOpcode::Nop:
+    case VuIrOpcode::LowerLq:
+    case VuIrOpcode::LowerSq:
+    case VuIrOpcode::LowerIlw:
+    case VuIrOpcode::LowerIsw:
+    case VuIrOpcode::LowerIaddiu:
+    case VuIrOpcode::LowerIsubiu:
+    case VuIrOpcode::LowerIadd:
+    case VuIrOpcode::LowerIsub:
+    case VuIrOpcode::LowerIaddi:
+    case VuIrOpcode::LowerIand:
+    case VuIrOpcode::LowerIor:
+    case VuIrOpcode::LowerMove:
+    case VuIrOpcode::LowerMr32:
+    case VuIrOpcode::LowerLqi:
+    case VuIrOpcode::LowerSqi:
+    case VuIrOpcode::LowerMtir:
+    case VuIrOpcode::LowerMfir:
+    case VuIrOpcode::LowerIlwr:
+    case VuIrOpcode::LowerIswr:
+    case VuIrOpcode::LowerXtop:
+    case VuIrOpcode::LowerXitop:
+    case VuIrOpcode::LowerDiv:
+    case VuIrOpcode::LowerB:
+    case VuIrOpcode::LowerBal:
+    case VuIrOpcode::LowerJr:
+    case VuIrOpcode::LowerJalr:
+    case VuIrOpcode::LowerIbeq:
+    case VuIrOpcode::LowerIbne:
+    case VuIrOpcode::LowerIbltz:
+    case VuIrOpcode::LowerIbgtz:
+    case VuIrOpcode::LowerIblez:
+    case VuIrOpcode::LowerIbgez:
+        return true;
+    default:
+        return false;
+    }
+}
+
+VuRecompilerOpcodeDisposition
+VuRecompilerBackend::opcodeDisposition(
+    VuIrOpcode opcode, uint64_t hostFeatures)
+{
+    if (opcode == VuIrOpcode::Unsupported)
+        return VuRecompilerOpcodeDisposition::
+            InterpreterSideExit;
+    if (canInlineUpperOpcode(opcode, hostFeatures) ||
+        canInlineLowerOpcode(opcode))
+    {
+        return VuRecompilerOpcodeDisposition::NativeInline;
+    }
+    return VuRecompilerOpcodeDisposition::NativeHelper;
 }
 
 bool VuRecompilerBackend::programKey(

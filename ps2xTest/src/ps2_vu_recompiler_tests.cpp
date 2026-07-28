@@ -351,6 +351,94 @@ void register_ps2_vu_recompiler_tests()
     MiniTest::Case("PS2VURecompiler", [](TestCase &tc)
     {
         tc.Run(
+            "every IR opcode has an explicit native disposition",
+            [](TestCase &t)
+            {
+                constexpr size_t kDispositionCount = 3u;
+                constexpr uint32_t kOpcodeCount =
+                    static_cast<uint32_t>(
+                        VuIrOpcode::Unsupported) +
+                    1u;
+                std::array<uint32_t, kDispositionCount>
+                    baselineCounts{};
+                std::array<uint32_t, kDispositionCount>
+                    avxFmaCounts{};
+
+                for (uint32_t value = 0u;
+                     value < kOpcodeCount;
+                     ++value)
+                {
+                    const VuIrOpcode opcode =
+                        static_cast<VuIrOpcode>(value);
+                    t.IsTrue(
+                        vuIrOpcodeName(opcode) != "Unknown",
+                        "IR opcode " +
+                            std::to_string(value) +
+                            " should have a stable name");
+
+                    const auto baseline =
+                        VuRecompilerBackend::
+                            opcodeDisposition(opcode, 0u);
+                    const auto avxFma =
+                        VuRecompilerBackend::
+                            opcodeDisposition(
+                                opcode,
+                                std::numeric_limits<
+                                    uint64_t>::max());
+                    ++baselineCounts[
+                        static_cast<size_t>(baseline)];
+                    ++avxFmaCounts[
+                        static_cast<size_t>(avxFma)];
+                }
+
+                t.Equals(
+                    kOpcodeCount, uint32_t{122u},
+                    "the audit must be updated when IR grows");
+                t.Equals(
+                    baselineCounts[static_cast<size_t>(
+                        VuRecompilerOpcodeDisposition::
+                            NativeInline)],
+                    uint32_t{71u},
+                    "baseline inline opcode count");
+                t.Equals(
+                    baselineCounts[static_cast<size_t>(
+                        VuRecompilerOpcodeDisposition::
+                            NativeHelper)],
+                    uint32_t{50u},
+                    "baseline helper opcode count");
+                t.Equals(
+                    baselineCounts[static_cast<size_t>(
+                        VuRecompilerOpcodeDisposition::
+                            InterpreterSideExit)],
+                    uint32_t{1u},
+                    "only unsupported IR may side-exit");
+                t.Equals(
+                    avxFmaCounts[static_cast<size_t>(
+                        VuRecompilerOpcodeDisposition::
+                            NativeInline)],
+                    uint32_t{87u},
+                    "AVX/FMA inline opcode count");
+                t.Equals(
+                    avxFmaCounts[static_cast<size_t>(
+                        VuRecompilerOpcodeDisposition::
+                            NativeHelper)],
+                    uint32_t{34u},
+                    "AVX/FMA helper opcode count");
+                t.Equals(
+                    avxFmaCounts[static_cast<size_t>(
+                        VuRecompilerOpcodeDisposition::
+                            InterpreterSideExit)],
+                    uint32_t{1u},
+                    "AVX/FMA should retain one side-exit opcode");
+                t.IsTrue(
+                    VuRecompilerBackend::opcodeDisposition(
+                        VuIrOpcode::Unsupported, 0u) ==
+                        VuRecompilerOpcodeDisposition::
+                            InterpreterSideExit,
+                    "unsupported IR must retain its interpreter side exit");
+            });
+
+        tc.Run(
             "availability and keys require tracked unit-owned code",
             [](TestCase &t)
             {

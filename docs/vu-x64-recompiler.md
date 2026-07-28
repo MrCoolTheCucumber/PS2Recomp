@@ -47,6 +47,15 @@ families directly. Backend-neutral linear traces continue across sequential
 fallthrough, with canonical-PC side exits for taken control flow. Unsupported
 IR exits at its original PC without retiring or mutating the pair.
 
+The opcode-disposition audit covers all 122 current IR opcodes. On the
+baseline x86-64 feature mask, 71 opcodes are inline-capable, 50 use native
+semantic helpers, and only `Unsupported` takes an interpreter side exit.
+AVX/FMA promotes 16 FMAC opcodes from helpers to inline lowering, for an
+87-inline/34-helper/1-side-exit split. The exhaustive test intentionally pins
+these counts so adding or reclassifying an IR opcode requires an explicit
+review; the unsupported-pair test separately proves that the side exit retires
+and mutates nothing.
+
 Entry pipeline values remain architectural data, not cache-key inputs. A block
 therefore advances entry Q, P, and VI-backup state dynamically. Once an
 instruction in that block establishes a delayed-scalar latency or VI-backup

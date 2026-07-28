@@ -73,6 +73,13 @@ struct VuRecompilerDiagnostics
     uint64_t codeImageCatalogEvictions = 0u;
 };
 
+enum class VuRecompilerOpcodeDisposition : uint8_t
+{
+    NativeInline,
+    NativeHelper,
+    InterpreterSideExit,
+};
+
 class VuRecompilerBackend final : public IVuExecutionBackend
 {
 public:
@@ -86,6 +93,13 @@ public:
     [[nodiscard]] static bool built();
     [[nodiscard]] static bool supported();
     [[nodiscard]] static uint64_t hostFeatures();
+    [[nodiscard]] static bool canInlineUpperOpcode(
+        VuIrOpcode opcode, uint64_t hostFeatures);
+    [[nodiscard]] static bool canInlineLowerOpcode(
+        VuIrOpcode opcode);
+    [[nodiscard]] static VuRecompilerOpcodeDisposition
+    opcodeDisposition(
+        VuIrOpcode opcode, uint64_t hostFeatures);
 
     [[nodiscard]] bool programKey(
         const VuExecutionContext &context,
