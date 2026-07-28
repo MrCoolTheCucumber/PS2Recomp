@@ -290,7 +290,7 @@ int main(int argc, char **argv)
     std::memcpy(memory.getVU1Data(), initialData.data(), vuSize);
 
     VU1Interpreter interpreter;
-    VU1State &state = interpreter.state();
+    VuExecutionState &state = interpreter.state();
     size_t cursor = 5;
     std::memcpy(state.vf, stateWords.data() + cursor, sizeof(state.vf));
     cursor += 32 * 4;
@@ -326,7 +326,7 @@ int main(int argc, char **argv)
         instructionTrace << std::hex << std::setfill('0');
         interpreter.setInstructionObserver(
             [&](uint64_t index, uint32_t pc, uint32_t lower, uint32_t upper,
-                const VU1State &stepState)
+                const VuExecutionState &stepState)
             {
                 (void)index;
                 const uint64_t traceIndex = observedInstructionIndex++;

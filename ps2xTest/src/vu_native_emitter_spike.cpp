@@ -35,13 +35,13 @@
 struct VU1NativeEmitterSpikeAccess
 {
     static void prepare(VU1Interpreter &interpreter,
-                        const VU1State &initialState)
+                        const VuExecutionState &initialState)
     {
         interpreter.reset();
         interpreter.m_state = initialState;
-        interpreter.m_fmacFlagPipeline = {};
-        interpreter.m_fmacFlagPipelineIndex = 0u;
-        interpreter.m_workingMac = initialState.mac;
+        interpreter.m_state.pipeline.fmacFlags = {};
+        interpreter.m_state.pipeline.fmacFlagIndex = 0u;
+        interpreter.m_state.pipeline.workingMac = initialState.mac;
     }
 
     static void advanceFmac(VU1Interpreter &interpreter)
@@ -92,7 +92,7 @@ namespace
 
     struct CapturedBlock
     {
-        VU1State initialState{};
+        VuExecutionState initialState{};
         std::vector<uint32_t> pcs;
         std::vector<uint32_t> upper;
     };
@@ -100,7 +100,7 @@ namespace
     struct alignas(16) SpikeContext
     {
         VU1Interpreter *interpreter = nullptr;
-        VU1State *state = nullptr;
+        VuExecutionState *state = nullptr;
         uint32_t nextPair = 0u;
         uint32_t remainingPairs = 0u;
         uint32_t savedMxcsr = 0u;
@@ -235,14 +235,14 @@ namespace
             const int resultOffset =
                 contextOffset(offsetof(SpikeContext, fmacResult));
             const int sourceOffset =
-                contextOffset(offsetof(VU1State, vf) +
+                contextOffset(offsetof(VuExecutionState, vf) +
                               static_cast<size_t>(source) * 4u *
                                   sizeof(float));
             const int outputOffset =
-                contextOffset(offsetof(VU1State, vf) +
+                contextOffset(offsetof(VuExecutionState, vf) +
                               static_cast<size_t>(output) * 4u *
                                   sizeof(float));
-            const int qOffset = contextOffset(offsetof(VU1State, q));
+            const int qOffset = contextOffset(offsetof(VuExecutionState, q));
 
             mov(rdx, ptr[r12 + stateOffset]);
             movups(xmm0, ptr[rdx + sourceOffset]);
@@ -468,12 +468,12 @@ namespace
         return true;
     }
 
-    VU1State decodeFixtureState(const std::array<uint32_t, 159> &words)
+    VuExecutionState decodeFixtureState(const std::array<uint32_t, 159> &words)
     {
         if (words[0] != 0x31555652u || words[1] != 1u)
             throw std::runtime_error("unsupported VU replay state");
 
-        VU1State state{};
+        VuExecutionState state{};
         size_t cursor = 5u;
         std::memcpy(state.vf, words.data() + cursor, sizeof(state.vf));
         cursor += 32u * 4u;
@@ -523,7 +523,7 @@ namespace
         interpreter.state() = decodeFixtureState(stateWords);
         interpreter.setInstructionObserver(
             [&](uint64_t index, uint32_t pc, uint32_t, uint32_t upper,
-                const VU1State &state)
+                const VuExecutionState &state)
             {
                 if (index == kBlockTraceStart)
                 {
@@ -571,7 +571,7 @@ namespace
         }
     }
 
-    uint64_t hashState(const VU1State &state)
+    uint64_t hashState(const VuExecutionState &state)
     {
         uint64_t hash = kFnvOffset;
         hashValue(hash, state.vf);

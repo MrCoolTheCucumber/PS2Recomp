@@ -11,7 +11,42 @@ class GS;
 class PS2Memory;
 struct VU1NativeEmitterSpikeAccess;
 
-struct VU1State
+struct VuPipelineState
+{
+    struct Xgkick
+    {
+        bool active = false;
+        uint32_t address = 0;
+        uint32_t tagBytesRemaining = 0;
+        uint32_t cycleCredit = 0;
+        bool tagEop = false;
+        std::vector<uint8_t> packet;
+    };
+
+    struct DelayedQ
+    {
+        bool active = false;
+        float result = 0.0f;
+        uint32_t cyclesRemaining = 0;
+    };
+
+    struct FmacFlags
+    {
+        bool active = false;
+        uint32_t mac = 0;
+        uint32_t status = 0;
+    };
+
+    static constexpr uint8_t kFmacFlagStages = 4u;
+
+    Xgkick xgkick;
+    DelayedQ delayedQ;
+    std::array<FmacFlags, kFmacFlagStages> fmacFlags{};
+    uint8_t fmacFlagIndex = 0u;
+    uint32_t workingMac = 0u;
+};
+
+struct VuExecutionState
 {
     float vf[32][4];
     int32_t vi[16];
@@ -34,6 +69,10 @@ struct VU1State
     uint8_t viBackupCycles;
     uint8_t viBackupRegister;
     int32_t viBackupValue;
+
+    // Delayed architectural effects must travel with a cloned register state.
+    // Backend-owned decode/native caches and diagnostics deliberately do not.
+    VuPipelineState pipeline;
 };
 
 struct VU1ProgressSnapshot
@@ -59,7 +98,7 @@ class VU1Interpreter
 public:
     using InstructionObserver = std::function<void(
         uint64_t index, uint32_t pc, uint32_t lower, uint32_t upper,
-        const VU1State &state)>;
+        const VuExecutionState &state)>;
 
     VU1Interpreter();
 
@@ -94,8 +133,8 @@ public:
         GS &gs, PS2Memory *memory = nullptr,
         uint32_t maxCycles = 65536);
 
-    VU1State &state() { return m_state; }
-    const VU1State &state() const { return m_state; }
+    VuExecutionState &state() { return m_state; }
+    const VuExecutionState &state() const { return m_state; }
     bool isActive() const { return m_active; }
     VU1ProgressSnapshot getProgressSnapshot() const;
     void setProgressTrackingEnabled(bool enabled);
@@ -118,39 +157,7 @@ private:
         bool lowerBeforeUpper = false;
     };
 
-    VU1State m_state;
-
-    struct XgkickState
-    {
-        bool active = false;
-        uint32_t address = 0;
-        uint32_t tagBytesRemaining = 0;
-        uint32_t cycleCredit = 0;
-        bool tagEop = false;
-        std::vector<uint8_t> packet;
-    };
-
-    XgkickState m_xgkick;
-    struct QPipelineState
-    {
-        bool active = false;
-        float result = 0.0f;
-        uint32_t cyclesRemaining = 0;
-    };
-
-    QPipelineState m_qPipeline;
-    struct FmacFlagPipelineState
-    {
-        bool active = false;
-        uint32_t mac = 0;
-        uint32_t status = 0;
-    };
-
-    static constexpr uint8_t kFmacFlagPipelineStages = 4u;
-    std::array<FmacFlagPipelineState, kFmacFlagPipelineStages>
-        m_fmacFlagPipeline{};
-    uint8_t m_fmacFlagPipelineIndex = 0u;
-    uint32_t m_workingMac = 0;
+    VuExecutionState m_state;
     std::vector<DecodedInstructionPair> m_decodedCodeCache;
     const uint8_t *m_cachedVuCode = nullptr;
     const PS2Memory *m_cachedMemory = nullptr;
@@ -193,7 +200,7 @@ private:
     void scheduleQ(float result, uint32_t latency);
     void advanceFmacFlagPipeline();
     void flushFmacFlagPipeline();
-    void commitFmacFlags(const FmacFlagPipelineState &pending);
+    void commitFmacFlags(const VuPipelineState::FmacFlags &pending);
     void scheduleFmacFlags(const float result[4], uint8_t dest,
                            bool preserveUnselected);
     void backupVi(uint8_t reg);

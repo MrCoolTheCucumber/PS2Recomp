@@ -2061,7 +2061,7 @@ bool PS2Memory::isVif1DmaTraceActive() const
 }
 
 void PS2Memory::traceVu1Invocation(uint32_t startPc, uint32_t top, uint32_t itop, bool resume,
-                                   const VU1State &state)
+                                   const VuExecutionState &state)
 {
     if (!isVif1DmaTraceActive())
         return;
@@ -2197,7 +2197,7 @@ void PS2Memory::traceVu1Invocation(uint32_t startPc, uint32_t top, uint32_t itop
 }
 
 void PS2Memory::traceVu1Instruction(uint32_t pc, uint32_t lower, uint32_t upper,
-                                    const VU1State &state)
+                                    const VuExecutionState &state)
 {
     if (!isVif1DmaTraceActive())
         return;

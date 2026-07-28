@@ -1265,7 +1265,8 @@ struct PS2DebugServer::Impl
     Value vuRegisters(bool vu1, Allocator &allocator)
     {
         QuiesceGuard guard(runtime);
-        const VU1State state = vu1 ? runtime.vu1().state() : runtime.vu0().state();
+        const VuExecutionState state =
+            vu1 ? runtime.vu1().state() : runtime.vu0().state();
         const auto floatValue = [](float value)
         {
             Value result;
@@ -2223,7 +2224,7 @@ struct PS2DebugServer::Impl
 
         if (vu1)
         {
-            const VU1State state = runtime.vu1().state();
+            const VuExecutionState state = runtime.vu1().state();
             std::array<uint32_t, 159> words{};
             words[0] = 0x31555652u; // "RVU1"
             words[1] = 1u;

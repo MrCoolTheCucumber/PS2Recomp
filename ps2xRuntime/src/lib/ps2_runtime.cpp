@@ -555,7 +555,7 @@ namespace
     }
 
     void copyVu0ContextRegistersToState(
-        const R5900Context *ctx, VU1State &state)
+        const R5900Context *ctx, VuExecutionState &state)
     {
         for (uint32_t i = 0; i < 32u; ++i)
         {
@@ -583,14 +583,14 @@ namespace
         state.vi[0] = 0;
     }
 
-    void copyVu0ContextToState(const R5900Context *ctx, VU1State &state)
+    void copyVu0ContextToState(const R5900Context *ctx, VuExecutionState &state)
     {
-        std::memset(&state, 0, sizeof(state));
+        state = {};
         copyVu0ContextRegistersToState(ctx, state);
         state.pc = ctx->vu0_pc;
     }
 
-    void copyVu0StateToContext(const VU1State &state, R5900Context *ctx)
+    void copyVu0StateToContext(const VuExecutionState &state, R5900Context *ctx)
     {
         for (uint32_t i = 0; i < 32u; ++i)
         {
@@ -941,7 +941,7 @@ PS2Runtime::PS2Runtime()
     m_iopSubsystem = std::make_unique<ps2x::iop::IopSubsystem>(*m_iopHost);
     m_vu0.setInstructionObserver(
         [this](uint64_t, uint32_t pc, uint32_t lower, uint32_t upper,
-               const VU1State &state)
+               const VuExecutionState &state)
         {
             const bool recordInstruction =
                 m_debugVu0InstructionTraceEnabled.load(
@@ -5384,7 +5384,7 @@ void PS2Runtime::synchronizeVU0MicroprogramAtTick(
     }
     if (traceSync)
     {
-        const VU1State &state = m_vu0.state();
+        const VuExecutionState &state = m_vu0.state();
         traceEntry.invocation =
             m_vu0CurrentInvocation.load(std::memory_order_relaxed);
         traceEntry.invocationInstruction =
@@ -5480,7 +5480,7 @@ void PS2Runtime::synchronizeVU0MicroprogramAtTick(
     }
     if (traceSync)
     {
-        const VU1State &state = m_vu0.state();
+        const VuExecutionState &state = m_vu0.state();
         traceEntry.cycleBudget = cycleBudget;
         traceEntry.eventDue = eventDue;
         traceEntry.vuPcAfter = state.pc;

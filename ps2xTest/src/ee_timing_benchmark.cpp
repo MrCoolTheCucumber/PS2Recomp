@@ -321,12 +321,60 @@ namespace
         return configuration.blocks != 0u;
     }
 
-    uint64_t hashState(const VU1State &state)
+    struct VuBenchmarkRegisterState
     {
+        float vf[32][4];
+        int32_t vi[16];
+        float acc[4];
+        float q;
+        float p;
+        float i;
+        uint32_t pc;
+        uint32_t mac;
+        uint32_t clip;
+        uint32_t status;
+        bool ebit;
+        uint32_t top;
+        uint32_t itop;
+        bool branchPending;
+        uint32_t branchTarget;
+        uint32_t branchDelay;
+        uint8_t viBackupCycles;
+        uint8_t viBackupRegister;
+        int32_t viBackupValue;
+    };
+
+    uint64_t hashState(const VuExecutionState &state)
+    {
+        // Keep the Phase 0 benchmark identity stable while delayed execution
+        // state moves into the cloneable state used by all backends.
+        VuBenchmarkRegisterState registers;
+        std::memset(&registers, 0, sizeof(registers));
+        std::memcpy(registers.vf, state.vf, sizeof(registers.vf));
+        std::memcpy(registers.vi, state.vi, sizeof(registers.vi));
+        std::memcpy(registers.acc, state.acc, sizeof(registers.acc));
+        registers.q = state.q;
+        registers.p = state.p;
+        registers.i = state.i;
+        registers.pc = state.pc;
+        registers.mac = state.mac;
+        registers.clip = state.clip;
+        registers.status = state.status;
+        registers.ebit = state.ebit;
+        registers.top = state.top;
+        registers.itop = state.itop;
+        registers.branchPending = state.branchPending;
+        registers.branchTarget = state.branchTarget;
+        registers.branchDelay = state.branchDelay;
+        registers.viBackupCycles = state.viBackupCycles;
+        registers.viBackupRegister = state.viBackupRegister;
+        registers.viBackupValue = state.viBackupValue;
+
         const auto *const bytes =
-            reinterpret_cast<const uint8_t *>(&state);
+            reinterpret_cast<const uint8_t *>(&registers);
         uint64_t hash = 1469598103934665603ull;
-        for (std::size_t index = 0u; index < sizeof(state); ++index)
+        for (std::size_t index = 0u;
+             index < sizeof(registers); ++index)
         {
             hash ^= bytes[index];
             hash *= 1099511628211ull;

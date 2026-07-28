@@ -104,15 +104,10 @@ void VU1Interpreter::reset()
     m_workloadProfileMemory = nullptr;
     m_workloadProfileInvocationPending = false;
     m_workloadProfileInvocationActive = false;
-    std::memset(&m_state, 0, sizeof(m_state));
+    m_state = {};
     m_state.vf[0][3] = 1.0f; // VF0.w = 1.0
     m_state.q = 1.0f;
     m_active = false;
-    m_xgkick = {};
-    m_qPipeline = {};
-    m_fmacFlagPipeline = {};
-    m_fmacFlagPipelineIndex = 0u;
-    m_workingMac = 0u;
     m_progressActive.store(0u, std::memory_order_relaxed);
     m_progressInvocations.store(0u, std::memory_order_relaxed);
     m_progressCycles.store(0u, std::memory_order_relaxed);
@@ -267,9 +262,9 @@ void VU1Interpreter::start(
     m_state.branchTarget = 0;
     m_state.branchDelay = 0;
     m_state.viBackupCycles = 0;
-    m_fmacFlagPipeline = {};
-    m_fmacFlagPipelineIndex = 0u;
-    m_workingMac = m_state.mac;
+    m_state.pipeline.fmacFlags = {};
+    m_state.pipeline.fmacFlagIndex = 0u;
+    m_state.pipeline.workingMac = m_state.mac;
     m_state.vf[0][0] = 0.0f;
     m_state.vf[0][1] = 0.0f;
     m_state.vf[0][2] = 0.0f;
@@ -578,38 +573,43 @@ VU1AdvanceResult VU1Interpreter::run(
 
 void VU1Interpreter::advanceQPipeline()
 {
-    if (!m_qPipeline.active)
+    VuPipelineState::DelayedQ &delayedQ = m_state.pipeline.delayedQ;
+    if (!delayedQ.active)
         return;
 
-    if (m_qPipeline.cyclesRemaining != 0u)
-        --m_qPipeline.cyclesRemaining;
-    if (m_qPipeline.cyclesRemaining == 0u)
+    if (delayedQ.cyclesRemaining != 0u)
+        --delayedQ.cyclesRemaining;
+    if (delayedQ.cyclesRemaining == 0u)
         flushQPipeline();
 }
 
 void VU1Interpreter::flushQPipeline()
 {
-    if (!m_qPipeline.active)
+    VuPipelineState::DelayedQ &delayedQ = m_state.pipeline.delayedQ;
+    if (!delayedQ.active)
         return;
 
-    m_state.q = m_qPipeline.result;
-    m_qPipeline = {};
+    m_state.q = delayedQ.result;
+    delayedQ = {};
 }
 
 void VU1Interpreter::scheduleQ(float result, uint32_t latency)
 {
-    m_qPipeline.active = true;
-    m_qPipeline.result = result;
-    m_qPipeline.cyclesRemaining = latency;
+    m_state.pipeline.delayedQ = {
+        .active = true,
+        .result = result,
+        .cyclesRemaining = latency,
+    };
 }
 
 void VU1Interpreter::advanceFmacFlagPipeline()
 {
-    m_fmacFlagPipelineIndex = static_cast<uint8_t>(
-        (m_fmacFlagPipelineIndex + 1u) %
-        kFmacFlagPipelineStages);
-    FmacFlagPipelineState &pending =
-        m_fmacFlagPipeline[m_fmacFlagPipelineIndex];
+    VuPipelineState &pipeline = m_state.pipeline;
+    pipeline.fmacFlagIndex = static_cast<uint8_t>(
+        (pipeline.fmacFlagIndex + 1u) %
+        VuPipelineState::kFmacFlagStages);
+    VuPipelineState::FmacFlags &pending =
+        pipeline.fmacFlags[pipeline.fmacFlagIndex];
     if (!pending.active)
         return;
 
@@ -619,16 +619,17 @@ void VU1Interpreter::advanceFmacFlagPipeline()
 
 void VU1Interpreter::flushFmacFlagPipeline()
 {
+    VuPipelineState &pipeline = m_state.pipeline;
     // Walk from the next stage due through the stage used by the current
     // instruction pair. This commits retained results from oldest to newest.
     for (uint8_t offset = 1u;
-         offset <= kFmacFlagPipelineStages; ++offset)
+         offset <= VuPipelineState::kFmacFlagStages; ++offset)
     {
         const uint8_t index = static_cast<uint8_t>(
-            (m_fmacFlagPipelineIndex + offset) %
-            kFmacFlagPipelineStages);
-        FmacFlagPipelineState &pending =
-            m_fmacFlagPipeline[index];
+            (pipeline.fmacFlagIndex + offset) %
+            VuPipelineState::kFmacFlagStages);
+        VuPipelineState::FmacFlags &pending =
+            pipeline.fmacFlags[index];
         if (!pending.active)
             continue;
         commitFmacFlags(pending);
@@ -637,7 +638,7 @@ void VU1Interpreter::flushFmacFlagPipeline()
 }
 
 void VU1Interpreter::commitFmacFlags(
-    const FmacFlagPipelineState &pending)
+    const VuPipelineState::FmacFlags &pending)
 {
     m_state.mac = pending.mac;
     m_state.status =
@@ -649,7 +650,8 @@ void VU1Interpreter::commitFmacFlags(
 void VU1Interpreter::scheduleFmacFlags(
     const float result[4], uint8_t dest, bool preserveUnselected)
 {
-    uint32_t mac = preserveUnselected ? m_workingMac : 0u;
+    VuPipelineState &pipeline = m_state.pipeline;
+    uint32_t mac = preserveUnselected ? pipeline.workingMac : 0u;
     for (uint32_t lane = 0u; lane < 4u; ++lane)
     {
         const uint32_t laneMask = 0x8u >> lane;
@@ -690,8 +692,8 @@ void VU1Interpreter::scheduleFmacFlags(
     if ((mac & 0xf000u) != 0u)
         status |= 0x8u;
 
-    m_workingMac = mac;
-    m_fmacFlagPipeline[m_fmacFlagPipelineIndex] = {
+    pipeline.workingMac = mac;
+    pipeline.fmacFlags[pipeline.fmacFlagIndex] = {
         .active = true,
         .mac = mac,
         .status = status,
@@ -724,7 +726,7 @@ int32_t VU1Interpreter::readViForBranch(uint8_t reg) const
 
 void VU1Interpreter::cancelXgkick()
 {
-    m_xgkick = {};
+    m_state.pipeline.xgkick = {};
 }
 
 void VU1Interpreter::beginXgkick(uint32_t sourceQword,
@@ -739,13 +741,14 @@ void VU1Interpreter::beginXgkick(uint32_t sourceQword,
     if (memory)
         memory->traceVu1Xgkick(sourceQword);
 
+    VuPipelineState::Xgkick &xgkick = m_state.pipeline.xgkick;
     // A second XGKICK stalls behind and drains the prior PATH1 transfer.
-    if (m_xgkick.active)
+    if (xgkick.active)
         advanceXgkick(vuData, dataSize, gs, memory, 0u, true);
 
-    m_xgkick = {};
-    m_xgkick.active = true;
-    m_xgkick.address = ((sourceQword & 0x3FFu) * 16u) % dataSize;
+    xgkick = {};
+    xgkick.active = true;
+    xgkick.address = ((sourceQword & 0x3FFu) * 16u) % dataSize;
 }
 
 void VU1Interpreter::advanceXgkick(uint8_t *vuData,
@@ -755,21 +758,23 @@ void VU1Interpreter::advanceXgkick(uint8_t *vuData,
                                    uint32_t cycles,
                                    bool flush)
 {
-    if (!m_xgkick.active || !vuData || dataSize < 16u)
+    VuPipelineState::Xgkick &xgkick = m_state.pipeline.xgkick;
+    if (!xgkick.active || !vuData || dataSize < 16u)
         return;
 
     constexpr size_t kMaxPath1PacketBytes = 64u * 1024u * 1024u;
 
-    if (cycles > std::numeric_limits<uint32_t>::max() - m_xgkick.cycleCredit)
-        m_xgkick.cycleCredit = std::numeric_limits<uint32_t>::max();
+    if (cycles > std::numeric_limits<uint32_t>::max() - xgkick.cycleCredit)
+        xgkick.cycleCredit = std::numeric_limits<uint32_t>::max();
     else
-        m_xgkick.cycleCredit += cycles;
+        xgkick.cycleCredit += cycles;
 
     uint32_t transferQwords = flush
         ? std::numeric_limits<uint32_t>::max()
-        : m_xgkick.cycleCredit / 2u;
+        : xgkick.cycleCredit / 2u;
     uint64_t flushScanBytes = 0u;
-    bool validateFlushChain = flush && m_xgkick.tagBytesRemaining == 0u;
+    bool validateFlushChain =
+        flush && xgkick.tagBytesRemaining == 0u;
 
     auto read64Wrap = [&](uint32_t address)
     {
@@ -783,7 +788,7 @@ void VU1Interpreter::advanceXgkick(uint8_t *vuData,
 
     auto loadTag = [&]() -> bool
     {
-        const uint64_t tagLo = read64Wrap(m_xgkick.address);
+        const uint64_t tagLo = read64Wrap(xgkick.address);
         const uint32_t nloop = static_cast<uint32_t>(tagLo & 0x7FFFu);
         const uint8_t flg = static_cast<uint8_t>((tagLo >> 58u) & 0x3u);
         uint32_t nreg = static_cast<uint32_t>((tagLo >> 60u) & 0xFu);
@@ -817,14 +822,14 @@ void VU1Interpreter::advanceXgkick(uint8_t *vuData,
                 return false;
         }
 
-        m_xgkick.tagBytesRemaining = static_cast<uint32_t>(tagBytes);
-        m_xgkick.tagEop = ((tagLo >> 15u) & 1u) != 0u;
+        xgkick.tagBytesRemaining = static_cast<uint32_t>(tagBytes);
+        xgkick.tagEop = ((tagLo >> 15u) & 1u) != 0u;
         return true;
     };
 
-    while (m_xgkick.active)
+    while (xgkick.active)
     {
-        if (m_xgkick.tagBytesRemaining == 0u)
+        if (xgkick.tagBytesRemaining == 0u)
         {
             if (!loadTag())
             {
@@ -836,51 +841,52 @@ void VU1Interpreter::advanceXgkick(uint8_t *vuData,
         if (!flush && transferQwords == 0u)
             break;
 
-        const uint32_t remainingQwords = m_xgkick.tagBytesRemaining / 16u;
+        const uint32_t remainingQwords =
+            xgkick.tagBytesRemaining / 16u;
         const uint32_t qwords = flush
             ? remainingQwords
             : std::min(remainingQwords, transferQwords);
         const uint32_t bytes = qwords * 16u;
         if (bytes == 0u ||
-            m_xgkick.packet.size() > kMaxPath1PacketBytes - bytes)
+            xgkick.packet.size() > kMaxPath1PacketBytes - bytes)
         {
             cancelXgkick();
             return;
         }
 
-        const size_t oldSize = m_xgkick.packet.size();
-        m_xgkick.packet.resize(oldSize + bytes);
+        const size_t oldSize = xgkick.packet.size();
+        xgkick.packet.resize(oldSize + bytes);
         for (uint32_t i = 0u; i < bytes; ++i)
         {
-            m_xgkick.packet[oldSize + i] =
-                vuData[(m_xgkick.address + i) % dataSize];
+            xgkick.packet[oldSize + i] =
+                vuData[(xgkick.address + i) % dataSize];
         }
 
-        m_xgkick.address = (m_xgkick.address + bytes) % dataSize;
-        m_xgkick.tagBytesRemaining -= bytes;
+        xgkick.address = (xgkick.address + bytes) % dataSize;
+        xgkick.tagBytesRemaining -= bytes;
         if (!flush)
         {
             transferQwords -= qwords;
-            m_xgkick.cycleCredit -= qwords * 2u;
+            xgkick.cycleCredit -= qwords * 2u;
         }
 
-        if (m_xgkick.tagBytesRemaining != 0u)
+        if (xgkick.tagBytesRemaining != 0u)
             continue;
 
-        if (m_xgkick.tagEop)
+        if (xgkick.tagEop)
         {
             if (memory)
             {
                 memory->submitGifPacket(
                     GifPathId::Path1,
-                    m_xgkick.packet.data(),
-                    static_cast<uint32_t>(m_xgkick.packet.size()));
+                    xgkick.packet.data(),
+                    static_cast<uint32_t>(xgkick.packet.size()));
             }
             else
             {
                 gs.processGIFPacket(
-                    m_xgkick.packet.data(),
-                    static_cast<uint32_t>(m_xgkick.packet.size()));
+                    xgkick.packet.data(),
+                    static_cast<uint32_t>(xgkick.packet.size()));
             }
             cancelXgkick();
             return;

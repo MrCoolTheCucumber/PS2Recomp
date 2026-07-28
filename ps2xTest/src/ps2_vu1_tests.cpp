@@ -217,6 +217,51 @@ void register_ps2_vu1_tests()
 {
     MiniTest::Case("PS2VU1", [](TestCase &tc)
     {
+        tc.Run("execution state clones every delayed pipeline", [](TestCase &t)
+        {
+            VuExecutionState original{};
+            original.pc = 0x138u;
+            original.branchPending = true;
+            original.branchTarget = 0x280u;
+            original.branchDelay = 1u;
+            original.pipeline.xgkick.active = true;
+            original.pipeline.xgkick.address = 0x40u;
+            original.pipeline.xgkick.tagBytesRemaining = 16u;
+            original.pipeline.xgkick.packet = {0x11u, 0x22u, 0x33u};
+            original.pipeline.delayedQ = {
+                .active = true,
+                .result = 3.5f,
+                .cyclesRemaining = 5u,
+            };
+            original.pipeline.fmacFlags[2] = {
+                .active = true,
+                .mac = 0x1234u,
+                .status = 0x5u,
+            };
+            original.pipeline.fmacFlagIndex = 1u;
+            original.pipeline.workingMac = 0xabcd;
+
+            VuExecutionState clone = original;
+            original.pipeline.xgkick.packet[0] = 0xffu;
+            original.pipeline.delayedQ.result = -1.0f;
+            original.pipeline.fmacFlags[2].mac = 0u;
+
+            t.Equals(clone.pc, uint32_t{0x138u},
+                     "the architectural state should be copied");
+            t.IsTrue(clone.branchPending,
+                     "the branch delay state should be copied");
+            t.Equals(clone.pipeline.xgkick.packet[0], uint8_t{0x11u},
+                     "XGKICK packet storage should be deep-copied");
+            t.Equals(clone.pipeline.delayedQ.result, 3.5f,
+                     "the delayed Q result should be copied");
+            t.Equals(clone.pipeline.fmacFlags[2].mac, uint32_t{0x1234u},
+                     "the fixed FMAC pipeline should be copied");
+            t.Equals(clone.pipeline.fmacFlagIndex, uint8_t{1u},
+                     "the FMAC pipeline cursor should be copied");
+            t.Equals(clone.pipeline.workingMac, uint32_t{0xabcdu},
+                     "the pending MAC accumulator should be copied");
+        });
+
         tc.Run("bounded workload profile records exact pairs and identical MPG uploads", [](TestCase &t)
         {
             Vu1Fixture fx;
@@ -1181,8 +1226,8 @@ void register_ps2_vu1_tests()
             t.IsFalse(split.isActive(),
                       "split-batch interpreter should finish");
 
-            const VU1State &singleState = single.state();
-            const VU1State &splitState = split.state();
+            const VuExecutionState &singleState = single.state();
+            const VuExecutionState &splitState = split.state();
             t.Equals(splitState.pc, singleState.pc,
                      "split execution should retain the same PC");
             t.Equals(splitState.top, singleState.top,

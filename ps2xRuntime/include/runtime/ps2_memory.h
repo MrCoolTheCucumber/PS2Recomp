@@ -29,7 +29,7 @@
 class GS;
 struct Ps2GsDmaTraceState;
 struct Ps2Vu1WorkloadProfileState;
-struct VU1State;
+struct VuExecutionState;
 
 class PS2TlbMissException final : public std::exception
 {
@@ -1517,9 +1517,9 @@ public:
     void tracePath1Packet(const uint8_t *data, uint32_t sizeBytes);
     bool isVif1DmaTraceActive() const;
     void traceVu1Invocation(uint32_t startPc, uint32_t top, uint32_t itop, bool resume,
-                            const VU1State &state);
+                            const VuExecutionState &state);
     void traceVu1Instruction(uint32_t pc, uint32_t lower, uint32_t upper,
-                             const VU1State &state);
+                             const VuExecutionState &state);
     void traceVu1Xgkick(uint32_t sourceQword);
     void traceVu1InvocationEnd(uint32_t finalPc, bool ended, bool hitCycleLimit,
                                const int32_t *viRegisters, size_t viRegisterCount);
