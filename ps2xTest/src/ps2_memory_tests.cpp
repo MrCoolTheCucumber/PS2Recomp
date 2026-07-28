@@ -565,6 +565,73 @@ void register_ps2_memory_tests()
             t.IsTrue(matches, "MPG num=0 should copy 2048 bytes into VU1 code memory");
         });
 
+        tc.Run("VIF MPG wraps microprogram uploads at each MicroMem boundary", [](TestCase &t)
+        {
+            PS2Memory mem;
+            t.IsTrue(mem.initialize(), "PS2Memory initialize should succeed");
+
+            const auto checkWrappedUpload =
+                [&](bool vu1, uint16_t immediate,
+                    uint8_t *code, uint32_t codeSize)
+            {
+                std::array<uint8_t, 16u> payload{};
+                for (uint32_t index = 0u;
+                     index < payload.size(); ++index)
+                {
+                    payload[index] = static_cast<uint8_t>(
+                        0x40u + index);
+                }
+
+                std::vector<uint8_t> packet;
+                appendU32(
+                    packet,
+                    makeVifCmd(0x4au, 2u, immediate));
+                packet.insert(
+                    packet.end(), payload.begin(), payload.end());
+                std::memset(code, 0xcc, codeSize);
+
+                const uint64_t generationBefore =
+                    vu1
+                        ? mem.getVU1CodeGeneration()
+                        : mem.getVU0CodeGeneration();
+                if (vu1)
+                {
+                    mem.processVIF1Data(
+                        packet.data(),
+                        static_cast<uint32_t>(packet.size()));
+                }
+                else
+                {
+                    mem.processVIF0Data(
+                        packet.data(),
+                        static_cast<uint32_t>(packet.size()));
+                }
+
+                t.IsTrue(
+                    std::memcmp(
+                        code + codeSize - 8u,
+                        payload.data(), 8u) == 0,
+                    "MPG should write the tail before wrapping");
+                t.IsTrue(
+                    std::memcmp(
+                        code, payload.data() + 8u, 8u) == 0,
+                    "MPG should continue at MicroMem offset zero");
+                t.Equals(
+                    vu1
+                        ? mem.getVU1CodeGeneration()
+                        : mem.getVU0CodeGeneration(),
+                    generationBefore + 1u,
+                    "one wrapped MPG command should publish one generation");
+            };
+
+            checkWrappedUpload(
+                false, 0x01ffu,
+                mem.getVU0Code(), PS2_VU0_CODE_SIZE);
+            checkWrappedUpload(
+                true, 0x07ffu,
+                mem.getVU1Code(), PS2_VU1_CODE_SIZE);
+        });
+
         tc.Run("VIF UNPACK num zero uploads 256 vectors", [](TestCase &t)
         {
             PS2Memory mem;

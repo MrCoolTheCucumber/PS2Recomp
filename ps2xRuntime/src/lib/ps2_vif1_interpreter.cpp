@@ -1,5 +1,7 @@
 // Based on Blackline Interactive implementation
 #include "runtime/ps2_memory.h"
+
+#include <algorithm>
 #include <cstring>
 
 enum VIFCmd : uint8_t
@@ -25,6 +27,51 @@ enum VIFCmd : uint8_t
     VIF_DIRECT = 0x50,
     VIF_DIRECTHL = 0x51,
 };
+
+namespace
+{
+    void copyWrappedMicroMemory(
+        uint8_t *destination, uint32_t destinationSize,
+        uint32_t destinationOffset, const uint8_t *source,
+        uint32_t sizeBytes)
+    {
+        while (sizeBytes != 0u)
+        {
+            const uint32_t chunk = std::min(
+                sizeBytes,
+                destinationSize - destinationOffset);
+            std::memcpy(
+                destination + destinationOffset,
+                source, chunk);
+            source += chunk;
+            sizeBytes -= chunk;
+            destinationOffset = 0u;
+        }
+    }
+
+    bool equalsWrappedMicroMemory(
+        const uint8_t *destination, uint32_t destinationSize,
+        uint32_t destinationOffset, const uint8_t *source,
+        uint32_t sizeBytes)
+    {
+        while (sizeBytes != 0u)
+        {
+            const uint32_t chunk = std::min(
+                sizeBytes,
+                destinationSize - destinationOffset);
+            if (std::memcmp(
+                    destination + destinationOffset,
+                    source, chunk) != 0)
+            {
+                return false;
+            }
+            source += chunk;
+            sizeBytes -= chunk;
+            destinationOffset = 0u;
+        }
+        return true;
+    }
+}
 
 void PS2Memory::processVIF0Data(uint32_t srcPhys, uint32_t sizeBytes)
 {
@@ -271,14 +318,11 @@ PS2Memory::processVif0Stream()
                 stallAfterCommand = false;
                 break;
             }
-            if (m_vu0Code && destAddr < PS2_VU0_CODE_SIZE && mpgBytes > 0u)
+            if (m_vu0Code && mpgBytes > 0u)
             {
-                uint32_t copyBytes = mpgBytes;
-                if (destAddr + copyBytes > PS2_VU0_CODE_SIZE)
-                    copyBytes = PS2_VU0_CODE_SIZE - destAddr;
-                std::memcpy(
-                    m_vu0Code + destAddr, data + pos,
-                    copyBytes);
+                copyWrappedMicroMemory(
+                    m_vu0Code, PS2_VU0_CODE_SIZE,
+                    destAddr, data + pos, mpgBytes);
                 markVU0CodeModified();
             }
 
@@ -737,7 +781,9 @@ PS2Memory::processVif1Stream()
         }
         else if (opcode == VIF_MPG)
         {
-            uint32_t destAddr = (uint32_t)imm * 8u;
+            const uint32_t destAddr =
+                (static_cast<uint32_t>(imm) * 8u) &
+                (PS2_VU1_CODE_SIZE - 1u);
             // VIF MPG semantics: NUM==0 means 256 instructions (2048 bytes).
             // MPG payload is instruction-packed and should not be QW-aligned.
             const uint32_t instructionCount = (num == 0u) ? 256u : static_cast<uint32_t>(num);
@@ -748,27 +794,25 @@ PS2Memory::processVif1Stream()
                 stallAfterCommand = false;
                 break;
             }
-            if (m_vu1Code && destAddr < PS2_VU1_CODE_SIZE && mpgBytes > 0)
+            if (m_vu1Code && mpgBytes > 0u)
             {
-                uint32_t copyBytes = mpgBytes;
-                if (destAddr + copyBytes > PS2_VU1_CODE_SIZE)
-                    copyBytes = PS2_VU1_CODE_SIZE - destAddr;
                 const bool profileUpload =
                     isVu1WorkloadProfileEnabled();
                 const bool identical =
                     profileUpload &&
-                    std::memcmp(
-                        m_vu1Code + destAddr,
-                        data + pos,
-                        copyBytes) == 0;
+                    equalsWrappedMicroMemory(
+                        m_vu1Code, PS2_VU1_CODE_SIZE,
+                        destAddr, data + pos, mpgBytes);
                 const uint64_t generationBefore =
                     profileUpload ? getVU1CodeGeneration() : 0u;
-                std::memcpy(m_vu1Code + destAddr, data + pos, copyBytes);
+                copyWrappedMicroMemory(
+                    m_vu1Code, PS2_VU1_CODE_SIZE,
+                    destAddr, data + pos, mpgBytes);
                 markVU1CodeModified();
                 if (profileUpload)
                 {
                     recordVu1WorkloadProfileCodeUpload(
-                        destAddr, data + pos, copyBytes, identical,
+                        destAddr, data + pos, mpgBytes, identical,
                         generationBefore, getVU1CodeGeneration());
                 }
             }
