@@ -1055,8 +1055,14 @@ void register_ps2_vu1_tests()
         {
             ScopedEnvironmentVariable vu0("PS2X_VU0_BACKEND");
             ScopedEnvironmentVariable vu1("PS2X_VU1_BACKEND");
+            ScopedEnvironmentVariable vu0Instrumentation(
+                "PS2X_VU0_NATIVE_INSTRUMENTATION");
+            ScopedEnvironmentVariable vu1Instrumentation(
+                "PS2X_VU1_NATIVE_INSTRUMENTATION");
             vu0.set("interpreter");
             vu1.set("verify");
+            vu0Instrumentation.set("on");
+            vu1Instrumentation.set("0");
 
             PS2Runtime runtime;
             t.IsTrue(
@@ -1067,6 +1073,12 @@ void register_ps2_vu1_tests()
                 runtime.vu1().requestedBackend() ==
                     VuBackendKind::Verify,
                 "the VU1 environment request should be applied independently");
+            t.IsTrue(
+                runtime.vu0().nativeInstrumentationEnabled(),
+                "VU0 native instrumentation should be independently enabled");
+            t.IsFalse(
+                runtime.vu1().nativeInstrumentationEnabled(),
+                "VU1 native instrumentation should remain disabled");
 
             if (VuRecompilerBackend::supported())
             {

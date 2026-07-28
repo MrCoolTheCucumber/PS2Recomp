@@ -1598,6 +1598,86 @@ void register_ps2_vu_recompiler_tests()
             });
 
         tc.Run(
+            "opt-in instrumentation uses distinct native blocks",
+            [](TestCase &t)
+            {
+                if (!VuRecompilerBackend::supported())
+                    return;
+
+                VuNativeFixture fixture;
+                t.IsTrue(
+                    fixture.initialize(),
+                    "VU memory fixture should initialize");
+                writePair(
+                    fixture.code, 0u,
+                    makeVuIaddiu(1u, 0u, 7),
+                    kVuUpperNop | kVuUpperEnd);
+                writePair(
+                    fixture.code, 8u, 0u, kVuUpperNop);
+                fixture.markCodeModified();
+
+                VuUnit unit(VuUnitId::Vu1);
+                std::vector<uint32_t> observedPcs;
+                std::vector<int32_t> observedVi1;
+                unit.setInstructionObserver(
+                    [&](uint64_t, uint32_t pc, uint32_t,
+                        uint32_t, const VuExecutionState &state)
+                    {
+                        observedPcs.push_back(pc);
+                        observedVi1.push_back(state.vi[1]);
+                    });
+                unit.setInstructionObserverEnabled(true);
+
+                VuRecompilerBackend backend(unit);
+                VuExecutionState state =
+                    initialSyntheticState();
+                VuTransactionalSideEffectSink effects;
+                VuExecutionContext context =
+                    makeContext(
+                        state, fixture, effects, true);
+                context.enableNativeInstrumentation = true;
+                VuProgramKey key;
+                std::string diagnostic;
+                t.IsTrue(
+                    backend.programKey(
+                        context,
+                        VuCompilationMode::Instrumented,
+                        key, &diagnostic),
+                    "the instrumented key should be valid: " +
+                        diagnostic);
+
+                const VuRunResult result =
+                    backend.run(context, 2u);
+                t.IsTrue(
+                    result.reason == VuExitReason::ProgramEnded,
+                    "instrumented native execution should complete");
+                t.IsTrue(
+                    observedPcs ==
+                        std::vector<uint32_t>{0u, 8u},
+                    "native observation should retain pair order");
+                t.IsTrue(
+                    observedVi1 ==
+                        std::vector<int32_t>{0, 7},
+                    "native observation should precede pair mutation");
+
+                const VuRecompilerDiagnostics diagnostics =
+                    backend.diagnostics();
+                t.Equals(
+                    diagnostics.interpreterInstrumentationFallbacks,
+                    uint64_t{0u},
+                    "opt-in instrumentation should not fall back");
+                t.IsTrue(
+                    diagnostics.nativeEntries > 0u,
+                    "opt-in instrumentation should enter native code");
+                t.Equals(
+                    diagnostics.nativePairs, uint64_t{2u},
+                    "instrumented native accounting should be exact");
+                t.IsTrue(
+                    unit.programCache().lookup(key).valid(),
+                    "the instrumented cache namespace should contain the block");
+            });
+
+        tc.Run(
             "retained XGKICK advances across a native side exit",
             [](TestCase &t)
             {

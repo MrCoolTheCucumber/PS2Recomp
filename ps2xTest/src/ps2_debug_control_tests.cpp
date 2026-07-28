@@ -138,6 +138,14 @@ void register_ps2_debug_control_tests()
                 snapshots[1u].recompiler.nativePairs,
                 uint64_t{2u},
                 "the paused snapshot should report exact native work");
+            t.IsTrue(
+                snapshots[1u].lastExitReason ==
+                    VuExitReason::ProgramEnded,
+                "the paused snapshot should retain the last backend exit");
+            t.Equals(
+                snapshots[1u].recompiler.instrumentedNativePairs,
+                uint64_t{0u},
+                "ordinary native work should not count as instrumented");
             t.Equals(
                 snapshots[1u].recompiler.faultExits,
                 uint64_t{0u},

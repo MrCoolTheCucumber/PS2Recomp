@@ -116,14 +116,18 @@ namespace
             VuRecompilerBackend *backend,
             const void *pairHelper,
             const void *xgkickHelper,
-            uint64_t hostFeatures)
+            uint64_t hostFeatures,
+            VuCompilationMode compilationMode)
             : m_buffer(kEmitterCapacity),
               m_code(m_buffer.size(), m_buffer.data()),
               m_hostFeatures(hostFeatures),
               m_codeAddressMask(
                   block.codeSize != 0u
                       ? block.codeSize - 1u
-                      : 0u)
+                      : 0u),
+              m_instrumented(
+                  compilationMode ==
+                  VuCompilationMode::Instrumented)
         {
             emit(
                 block, backend, pairHelper,
@@ -172,6 +176,7 @@ namespace
         Xbyak::CodeGenerator m_code;
         uint64_t m_hostFeatures = 0u;
         uint32_t m_codeAddressMask = 0x3fffu;
+        bool m_instrumented = false;
         size_t m_fastEntryOffset = 0u;
         bool m_usesAvx = false;
 
@@ -2765,6 +2770,7 @@ namespace
                         block.pairs[pairIndex - 1u],
                         VuIrPairEnd);
                 const bool inlinePair =
+                    !m_instrumented &&
                     canInlinePair(pair) &&
                     !ebitDelayPair;
                 const bool handleBranchState =
@@ -3316,7 +3322,10 @@ VuRunResult VuRecompilerBackend::run(
         context.enableInstrumentation &&
             context.enableProgressAccounting,
         totalExecuted);
-    if (needsInterpreterInstrumentation(context))
+    const bool nativeInstrumentation =
+        usesNativeInstrumentation(context);
+    if (needsInterpreterInstrumentation(
+            context, nativeInstrumentation))
     {
         ++m_diagnostics.interpreterInstrumentationFallbacks;
         VuRunResult result = runInterpreterFallback(
@@ -3333,8 +3342,12 @@ VuRunResult VuRecompilerBackend::run(
 
     const ScopedVuFloatMode vuFloatMode;
     VuProgramKey key;
+    const VuCompilationMode compilationMode =
+        nativeInstrumentation
+            ? VuCompilationMode::Instrumented
+            : VuCompilationMode::Normal;
     if (!programKey(
-            context, VuCompilationMode::Normal,
+            context, compilationMode,
             key, &m_lastDiagnostic))
     {
         ++m_diagnostics.faultExits;
@@ -3345,6 +3358,7 @@ VuRunResult VuRecompilerBackend::run(
         .data = context.data,
         .dataSize = context.dataSize,
     };
+    m_instrumentedPairIndex = 0u;
     while (state.active && totalExecuted < maximumCycles)
     {
         key.entryPc = state.pc;
@@ -3404,6 +3418,10 @@ VuRunResult VuRecompilerBackend::run(
         const uint64_t helperPairs =
             m_helperPairsIssued - helperPairsBefore;
         ++m_diagnostics.nativeEntries;
+        if (nativeInstrumentation)
+        {
+            ++m_diagnostics.instrumentedNativeEntries;
+        }
         if (native.executedCycles > remaining)
         {
             m_lastDiagnostic =
@@ -3423,6 +3441,11 @@ VuRunResult VuRecompilerBackend::run(
         state.issuedCycles += native.executedCycles;
         m_diagnostics.nativePairs +=
             native.executedCycles;
+        if (nativeInstrumentation)
+        {
+            m_diagnostics.instrumentedNativePairs +=
+                native.executedCycles;
+        }
         m_diagnostics.helperPairs += helperPairs;
         m_diagnostics.inlinePairs +=
             native.executedCycles - helperPairs;
@@ -3694,6 +3717,65 @@ uint32_t VuRecompilerBackend::executePairThunk(
             instructionWords >> 32u));
 }
 
+uint32_t VuRecompilerBackend::executeInstrumentedPair(
+    VuExecutionContext &context, uint32_t expectedPc,
+    uint32_t lowerWord, uint32_t upperWord) noexcept
+{
+    VuExecutionState &state = context.state;
+    if (!state.active ||
+        !context.code ||
+        context.codeSize < 8u ||
+        expectedPc != state.pc ||
+        expectedPc > context.codeSize - 8u)
+    {
+        return executePair(
+            context, expectedPc,
+            lowerWord, upperWord);
+    }
+
+    try
+    {
+        if (context.enableInstrumentation &&
+            m_unit.m_instructionObserverEnabled.load(
+                std::memory_order_relaxed) &&
+            m_unit.m_instructionObserver)
+        {
+            m_unit.m_instructionObserver(
+                m_instrumentedPairIndex,
+                expectedPc, lowerWord, upperWord,
+                state);
+        }
+        ++m_instrumentedPairIndex;
+    }
+    catch (...)
+    {
+        return static_cast<uint32_t>(
+            VuNativeBlockExit::Fault);
+    }
+
+    return executePair(
+        context, expectedPc,
+        lowerWord, upperWord);
+}
+
+uint32_t VuRecompilerBackend::executeInstrumentedPairThunk(
+    VuRecompilerBackend *backend,
+    VuExecutionContext *context,
+    uint32_t expectedPc,
+    uint64_t instructionWords) noexcept
+{
+    if (!backend || !context)
+    {
+        return static_cast<uint32_t>(
+            VuNativeBlockExit::Fault);
+    }
+    return backend->executeInstrumentedPair(
+        *context, expectedPc,
+        static_cast<uint32_t>(instructionWords),
+        static_cast<uint32_t>(
+            instructionWords >> 32u));
+}
+
 uint32_t VuRecompilerBackend::advanceXgkick(
     VuExecutionContext &context) noexcept
 {
@@ -3805,15 +3887,22 @@ bool VuRecompilerBackend::compile(
 
     try
     {
+        const void *const pairHelper =
+            key.compilationMode ==
+                    VuCompilationMode::Instrumented
+                ? reinterpret_cast<const void *>(
+                      &VuRecompilerBackend::
+                          executeInstrumentedPairThunk)
+                : reinterpret_cast<const void *>(
+                      &VuRecompilerBackend::
+                          executePairThunk);
         X64VuBlockEmitter emitter(
-            block, this,
-            reinterpret_cast<const void *>(
-                &VuRecompilerBackend::
-                    executePairThunk),
+            block, this, pairHelper,
             reinterpret_cast<const void *>(
                 &VuRecompilerBackend::
                     advanceXgkickThunk),
-            key.hostFeatures);
+            key.hostFeatures,
+            key.compilationMode);
         if (emitter.size() == 0u)
         {
             diagnostic =
@@ -3875,12 +3964,25 @@ bool VuRecompilerBackend::compile(
 #endif
 }
 
-bool VuRecompilerBackend::needsInterpreterInstrumentation(
+bool VuRecompilerBackend::usesNativeInstrumentation(
     const VuExecutionContext &context) const
+{
+    return
+        context.enableInstrumentation &&
+        context.enableNativeInstrumentation &&
+        m_unit.m_instructionObserverEnabled.load(
+            std::memory_order_relaxed) &&
+        static_cast<bool>(m_unit.m_instructionObserver);
+}
+
+bool VuRecompilerBackend::needsInterpreterInstrumentation(
+    const VuExecutionContext &context,
+    bool nativeInstrumentation) const
 {
     if (!context.enableInstrumentation)
         return false;
-    if (m_unit.m_instructionObserverEnabled.load(
+    if (!nativeInstrumentation &&
+        m_unit.m_instructionObserverEnabled.load(
             std::memory_order_relaxed) &&
         m_unit.m_instructionObserver)
     {

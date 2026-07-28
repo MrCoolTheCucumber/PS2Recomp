@@ -874,6 +874,42 @@ PS2Runtime::PS2Runtime(PS2RuntimeConfiguration configuration)
         m_vu0, configuration.vu0Backend, "PS2X_VU0_BACKEND");
     configureVuBackend(
         m_vu1, configuration.vu1Backend, "PS2X_VU1_BACKEND");
+    const auto configureNativeInstrumentation =
+        [&](VuUnit &unit, bool enabled,
+            const char *environmentName)
+    {
+        if (configuration.useVuBackendEnvironment)
+        {
+            if (const char *const value =
+                    std::getenv(environmentName))
+            {
+                const std::string_view text(value);
+                if (text == "1" || text == "true" ||
+                    text == "on")
+                {
+                    enabled = true;
+                }
+                else if (text == "0" || text == "false" ||
+                         text == "off")
+                {
+                    enabled = false;
+                }
+                else
+                {
+                    throw std::invalid_argument(
+                        std::string(environmentName) +
+                        " must be 0, 1, false, true, off, or on");
+                }
+            }
+        }
+        unit.setNativeInstrumentationEnabled(enabled);
+    };
+    configureNativeInstrumentation(
+        m_vu0, configuration.vu0NativeInstrumentation,
+        "PS2X_VU0_NATIVE_INSTRUMENTATION");
+    configureNativeInstrumentation(
+        m_vu1, configuration.vu1NativeInstrumentation,
+        "PS2X_VU1_NATIVE_INSTRUMENTATION");
 
     m_memory.setEeCounterCycleCallback(
         [this]()
@@ -6595,6 +6631,7 @@ void PS2Runtime::debugPublishVuBackendDiagnostics()
             result.snapshotSequence = sequence;
             result.issuedCycles = unit.state().issuedCycles;
             result.pc = unit.state().pc;
+            result.lastExitReason = unit.lastExitReason();
             result.captured = true;
 
             if (const VuProgramCache *const cache =
@@ -6644,6 +6681,10 @@ void PS2Runtime::debugPublishVuBackendDiagnostics()
                 result.recompiler = {
                     .nativeEntries = source->nativeEntries,
                     .nativePairs = source->nativePairs,
+                    .instrumentedNativeEntries =
+                        source->instrumentedNativeEntries,
+                    .instrumentedNativePairs =
+                        source->instrumentedNativePairs,
                     .inlinePairs = source->inlinePairs,
                     .helperPairs = source->helperPairs,
                     .blockCompletes = source->blockCompletes,

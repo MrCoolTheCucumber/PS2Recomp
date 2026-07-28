@@ -55,6 +55,8 @@ struct VuRecompilerDiagnostics
 {
     uint64_t nativeEntries = 0u;
     uint64_t nativePairs = 0u;
+    uint64_t instrumentedNativeEntries = 0u;
+    uint64_t instrumentedNativePairs = 0u;
     uint64_t inlinePairs = 0u;
     uint64_t helperPairs = 0u;
     uint64_t blockCompletes = 0u;
@@ -126,6 +128,14 @@ private:
         VuExecutionContext *context,
         uint32_t expectedPc,
         uint64_t instructionWords) noexcept;
+    [[nodiscard]] uint32_t executeInstrumentedPair(
+        VuExecutionContext &context, uint32_t expectedPc,
+        uint32_t lowerWord, uint32_t upperWord) noexcept;
+    [[nodiscard]] static uint32_t executeInstrumentedPairThunk(
+        VuRecompilerBackend *backend,
+        VuExecutionContext *context,
+        uint32_t expectedPc,
+        uint64_t instructionWords) noexcept;
     [[nodiscard]] uint32_t advanceXgkick(
         VuExecutionContext &context) noexcept;
     [[nodiscard]] static uint32_t advanceXgkickThunk(
@@ -142,8 +152,11 @@ private:
         const VuProgramKey &key,
         VuCompiledProgram &program,
         std::string &diagnostic);
-    [[nodiscard]] bool needsInterpreterInstrumentation(
+    [[nodiscard]] bool usesNativeInstrumentation(
         const VuExecutionContext &context) const;
+    [[nodiscard]] bool needsInterpreterInstrumentation(
+        const VuExecutionContext &context,
+        bool nativeInstrumentation) const;
     [[nodiscard]] VuRunResult runInterpreterFallback(
         VuExecutionContext &context,
         uint32_t maximumCycles);
@@ -164,6 +177,7 @@ private:
     uint64_t m_currentCodeContentIdentity = 0u;
     uint64_t m_nextCodeContentIdentity = 1u;
     uint64_t m_helperPairsIssued = 0u;
+    uint64_t m_instrumentedPairIndex = 0u;
     std::string m_lastDiagnostic;
 };
 

@@ -183,6 +183,9 @@ struct VuExecutionContext
     PS2Memory *memory = nullptr;
     bool traceBudgetBoundary = false;
     bool enableInstrumentation = true;
+    // Opt-in CI/test path. When an observer is armed, compile a distinct
+    // helper-routed native block instead of using the permanent interpreter.
+    bool enableNativeInstrumentation = false;
     // False when an outer unit adapter owns aggregate progress for nested
     // backend entries and interpreter side exits.
     bool enableProgressAccounting = true;
@@ -246,12 +249,21 @@ public:
     void setProgressTrackingEnabled(bool enabled);
     void setInstructionObserver(VuInstructionObserver observer);
     void setInstructionObserverEnabled(bool enabled);
+    void setNativeInstrumentationEnabled(bool enabled)
+    {
+        m_nativeInstrumentationEnabled = enabled;
+    }
+    bool nativeInstrumentationEnabled() const
+    {
+        return m_nativeInstrumentationEnabled;
+    }
 
     bool setBackend(
         VuBackendKind requested, std::string *diagnostic = nullptr);
     VuBackendKind requestedBackend() const { return m_requestedBackend; }
     VuBackendKind resolvedBackend() const { return m_resolvedBackend; }
     std::string_view backendName() const;
+    VuExitReason lastExitReason() const { return m_lastExitReason; }
     VuUnitId unitId() const { return m_unitId; }
     VuProgramCache &programCache();
     const VuProgramCache *programCacheIfCreated() const
@@ -327,6 +339,7 @@ private:
     std::atomic<uint32_t> m_progressPc{0};
     VuInstructionObserver m_instructionObserver;
     std::atomic<bool> m_instructionObserverEnabled{false};
+    bool m_nativeInstrumentationEnabled = false;
     PS2Memory *m_workloadProfileMemory = nullptr;
     bool m_workloadProfileInvocationPending = false;
     bool m_workloadProfileInvocationActive = false;
@@ -336,6 +349,7 @@ private:
     IVuExecutionBackend *m_backend = nullptr;
     VuBackendKind m_requestedBackend = VuBackendKind::Auto;
     VuBackendKind m_resolvedBackend = VuBackendKind::Interpreter;
+    VuExitReason m_lastExitReason = VuExitReason::Inactive;
 };
 
 class VuInterpreterBackend final : public IVuExecutionBackend

@@ -83,8 +83,17 @@ each pair.
 ## Instrumentation and tests
 
 An armed instruction observer, VIF trace, or workload profile uses the
-permanent interpreter. Aggregate progress tracking wraps the complete
-scheduler-facing unit call and does not add a per-pair native callback.
+permanent interpreter by default. Aggregate progress tracking wraps the
+complete scheduler-facing unit call and does not add a per-pair native
+callback.
+
+Tests may explicitly enable native instrumentation for a selected unit. In that
+mode every supported pair in the block uses the semantic helper, which calls
+the instruction observer before pipeline aging or architectural mutation.
+Instrumented blocks carry `VuCompilationMode::Instrumented` in their cache key
+and cannot alias optimized normal blocks. Unsupported pairs still side-exit at
+their original PC and use the permanent interpreter. VIF1 DMA tracing and
+workload profiling retain their interpreter path.
 
 An explicit supported VU0 or VU1 `recompiler` selection executes through
 `VuUnit`. The unit adapter continues within one scheduler budget after an
@@ -103,6 +112,7 @@ Focused tests cover:
 - cold compilation, warm hits, generation replacement, and stale handles;
 - unsupported-pair no-mutation behavior;
 - instrumentation fallback and exact observer/progress counts;
+- opt-in instrumented-native observer ordering and cache separation;
 - retained XGKICK progress across a native side exit;
 - a code-generation change made by a helper;
 - rejection of an impossible VI-backup countdown before pipeline

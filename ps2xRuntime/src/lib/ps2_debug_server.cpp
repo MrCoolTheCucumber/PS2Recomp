@@ -776,6 +776,9 @@ struct PS2DebugServer::Impl
             addString(value, "name", unit.backendName(), allocator);
             value.AddMember("active", unit.isActive(), allocator);
             value.AddMember(
+                "native_instrumentation",
+                unit.nativeInstrumentationEnabled(), allocator);
+            value.AddMember(
                 "diagnostics_captured",
                 diagnostics.captured, allocator);
             if (!diagnostics.captured)
@@ -787,6 +790,10 @@ struct PS2DebugServer::Impl
             addString(
                 value, "pc",
                 addressString(diagnostics.pc), allocator);
+            addString(
+                value, "last_exit_reason",
+                vuExitReasonName(diagnostics.lastExitReason),
+                allocator);
             value.AddMember(
                 "issued_cycles",
                 diagnostics.issuedCycles, allocator);
@@ -854,6 +861,14 @@ struct PS2DebugServer::Impl
                 recompiler.AddMember(
                     "native_pairs",
                     source.nativePairs, allocator);
+                recompiler.AddMember(
+                    "instrumented_native_entries",
+                    source.instrumentedNativeEntries,
+                    allocator);
+                recompiler.AddMember(
+                    "instrumented_native_pairs",
+                    source.instrumentedNativePairs,
+                    allocator);
                 recompiler.AddMember(
                     "inline_pairs",
                     source.inlinePairs, allocator);

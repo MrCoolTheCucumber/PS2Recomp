@@ -345,6 +345,7 @@ void VuUnit::reset()
     m_progressInvocations.store(0u, std::memory_order_relaxed);
     m_progressCycles.store(0u, std::memory_order_relaxed);
     m_progressPc.store(0u, std::memory_order_relaxed);
+    m_lastExitReason = VuExitReason::Inactive;
 }
 
 VuProgressSnapshot VuUnit::getProgressSnapshot() const
@@ -613,12 +614,14 @@ VuRunResult VuUnit::advance(
 {
     if (!m_state.active)
     {
-        return VuRunResult{
+        const VuRunResult result{
             .requestedCycles = maxCycles,
             .reason = VuExitReason::Inactive,
             .activeBefore = false,
             .activeAfter = false,
         };
+        m_lastExitReason = result.reason;
+        return result;
     }
 
     return run(
@@ -658,12 +661,14 @@ VuRunResult VuUnit::continueExecution(
 {
     if (!m_state.active)
     {
-        return VuRunResult{
+        const VuRunResult result{
             .requestedCycles = maxCycles,
             .reason = VuExitReason::Inactive,
             .activeBefore = false,
             .activeAfter = false,
         };
+        m_lastExitReason = result.reason;
+        return result;
     }
     return run(
         vuCode, codeSize, vuData, dataSize,
@@ -676,31 +681,36 @@ PS2X_VU_ALWAYS_INLINE VuRunResult VuUnit::run(
     GS &gs, PS2Memory *memory, uint32_t maxCycles,
     bool traceBudgetBoundary)
 {
+    VuRunResult result;
     if (m_resolvedBackend == VuBackendKind::Recompiler)
         [[unlikely]]
     {
-        return runRecompiler(
+        result = runRecompiler(
             vuCode, codeSize, vuData, dataSize,
             gs, memory, maxCycles,
             traceBudgetBoundary);
     }
+    else
+    {
+        RuntimeVuSideEffectSink sideEffects(gs, memory);
+        VuExecutionContext context{
+            .state = m_state,
+            .code = vuCode,
+            .codeSize = codeSize,
+            .data = vuData,
+            .dataSize = dataSize,
+            .sideEffects = sideEffects,
+            .memory = memory,
+            .traceBudgetBoundary = traceBudgetBoundary,
+            .enableInstrumentation = true,
+        };
 
-    RuntimeVuSideEffectSink sideEffects(gs, memory);
-    VuExecutionContext context{
-        .state = m_state,
-        .code = vuCode,
-        .codeSize = codeSize,
-        .data = vuData,
-        .dataSize = dataSize,
-        .sideEffects = sideEffects,
-        .memory = memory,
-        .traceBudgetBoundary = traceBudgetBoundary,
-        .enableInstrumentation = true,
-    };
-
-    // Keep the interpreter call concrete so auto/debug mode retains its
-    // optimizer-visible hot loop.
-    return m_interpreter->run(context, maxCycles);
+        // Keep the interpreter call concrete so auto/debug mode retains its
+        // optimizer-visible hot loop.
+        result = m_interpreter->run(context, maxCycles);
+    }
+    m_lastExitReason = result.reason;
+    return result;
 }
 
 #undef PS2X_VU_ALWAYS_INLINE
@@ -733,6 +743,8 @@ VuRunResult VuUnit::runRecompiler(
         .memory = memory,
         .traceBudgetBoundary = traceBudgetBoundary,
         .enableInstrumentation = true,
+        .enableNativeInstrumentation =
+            m_nativeInstrumentationEnabled,
         .enableProgressAccounting = false,
     };
     const bool activeBefore = m_state.active;

@@ -52,6 +52,8 @@ struct PS2RuntimeConfiguration
 {
     VuBackendKind vu0Backend = VuBackendKind::Auto;
     VuBackendKind vu1Backend = VuBackendKind::Auto;
+    bool vu0NativeInstrumentation = false;
+    bool vu1NativeInstrumentation = false;
     bool useVuBackendEnvironment = true;
 };
 
@@ -562,6 +564,8 @@ public:
     {
         uint64_t nativeEntries = 0u;
         uint64_t nativePairs = 0u;
+        uint64_t instrumentedNativeEntries = 0u;
+        uint64_t instrumentedNativePairs = 0u;
         uint64_t inlinePairs = 0u;
         uint64_t helperPairs = 0u;
         uint64_t blockCompletes = 0u;
@@ -583,6 +587,7 @@ public:
         uint64_t snapshotSequence = 0u;
         uint64_t issuedCycles = 0u;
         uint32_t pc = 0u;
+        VuExitReason lastExitReason = VuExitReason::Inactive;
         bool captured = false;
         bool cacheCreated = false;
         bool recompilerCreated = false;

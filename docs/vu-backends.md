@@ -43,6 +43,8 @@ The temporary launch-time front end is:
 ```text
 PS2X_VU0_BACKEND=auto|interpreter|recompiler|verify
 PS2X_VU1_BACKEND=auto|interpreter|recompiler|verify
+PS2X_VU0_NATIVE_INSTRUMENTATION=0|1
+PS2X_VU1_NATIVE_INSTRUMENTATION=0|1
 ```
 
 Programmatic values are applied independently; when
@@ -67,6 +69,15 @@ execution with the remaining budget. This keeps VU0 EE synchronization and VIF
 completion timing independent of native block boundaries. Changing a request
 while a unit is active is rejected and leaves the previous selection intact.
 
+An armed instruction observer uses the permanent interpreter by default, which
+preserves the normal instruction-level debugger path. CI and differential trace
+runs can set the corresponding `PS2X_VU*_NATIVE_INSTRUMENTATION` value to `1`
+(`true` and `on` are also accepted). A selected recompiler then uses
+helper-routed native blocks from the distinct `Instrumented` cache namespace
+and calls the observer before each supported pair mutates state. This mode is
+deliberately slower and does not change normal unobserved blocks. VIF1 DMA
+tracing and workload profiling continue to select the permanent interpreter.
+
 Aggregate debugger progress wraps the complete scheduler-facing unit call, so
 internal native entries and one-pair interpreter fallbacks do not double-count
 cycles or invocations. Progress tracking alone does not request per-pair
@@ -74,8 +85,9 @@ instrumentation and therefore does not move supported native work back to the
 interpreter.
 
 `system.status` exposes `vu_backends.vu0` and `vu_backends.vu1`, including each
-unit's requested mode, resolved mode, backend name, and active state. At a
-debugger pause boundary, the GameThread or the quiescent guest-execution lock
-also publishes the current PC, issued cycles, cache/compile counters, and
-recompiler pair/exit/fallback counters. These snapshots keep owner-only cache
-state out of the debugger thread while the guest is running.
+unit's requested mode, resolved mode, backend name, active state, and native
+instrumentation setting. At a debugger pause boundary, the GameThread or the
+quiescent guest-execution lock also publishes the current PC, last exit reason,
+issued cycles, cache/compile counters, and normal/instrumented native
+pair/exit/fallback counters. These snapshots keep owner-only cache state out of
+the debugger thread while the guest is running.
