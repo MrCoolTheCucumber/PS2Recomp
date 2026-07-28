@@ -631,6 +631,7 @@ namespace ps2_stubs
             uint32_t dataAddr = 0u;
             uint32_t len = 0u;
             size_t inputOffset = 0u;
+            size_t inputEndOffset = 0u;
             uint64_t pts = 0xFFFFFFFFFFFFFFFFull;
             uint64_t dts = 0xFFFFFFFFFFFFFFFFull;
             std::vector<uint8_t> payload;
@@ -655,7 +656,8 @@ namespace ps2_stubs
             uint32_t byteCount = 0u;
             uint32_t ringBaseAddr = 0u;
             uint32_t ringSize = 0u;
-            std::vector<uint8_t> bytes;
+            std::shared_ptr<const std::vector<uint8_t>> bytes;
+            size_t byteOffset = 0u;
         };
 
         struct MpegPlaybackState
@@ -1125,6 +1127,13 @@ namespace ps2_stubs
             }
         }
 
+        void discardBufferedPssInput(MpegPlaybackState &playback)
+        {
+            playback.pssBuffer.clear();
+            playback.pssGuestAddrs.clear();
+            playback.pssInputOffsets.clear();
+        }
+
         std::vector<MpegRegisteredCallback> matchingStreamCallbacks(uint32_t mpegAddr, uint32_t streamType)
         {
             std::vector<MpegRegisteredCallback> out;
@@ -1152,6 +1161,7 @@ namespace ps2_stubs
                                       bool sourceContiguous,
                                       bool hostConsumesPayload,
                                       size_t inputOffset,
+                                      size_t inputEndOffset,
                                       std::vector<MpegStreamCallbackEvent> &callbackEvents)
         {
             MpegStreamCallbackEvent event{};
@@ -1160,6 +1170,7 @@ namespace ps2_stubs
             event.dataAddr = dataAddr;
             event.len = len;
             event.inputOffset = inputOffset;
+            event.inputEndOffset = inputEndOffset;
             event.callbacks = matchingStreamCallbacks(mpegAddr, streamType);
             event.hostConsumesPayload = hostConsumesPayload;
             if (!event.callbacks.empty())
@@ -1347,6 +1358,19 @@ namespace ps2_stubs
                 {
                     packetInputOffset = playback.pssInputOffsets.front();
                 }
+                size_t packetInputEndOffset = packetInputOffset;
+                const size_t offsetCount =
+                    std::min(packetEnd, playback.pssInputOffsets.size());
+                for (size_t index = offsetCount; index != 0u; --index)
+                {
+                    const size_t inputOffset =
+                        playback.pssInputOffsets[index - 1u];
+                    if (inputOffset != kMpegNoInputOffset)
+                    {
+                        packetInputEndOffset = inputOffset + 1u;
+                        break;
+                    }
+                }
                 const size_t callbacksBeforePacket = callbackEvents.size();
 
                 if (isVideoStreamId(streamId))
@@ -1370,6 +1394,7 @@ namespace ps2_stubs
                                     payloadSize),
                                 PS2X_HAS_FFMPEG != 0,
                                 packetInputOffset,
+                                packetInputEndOffset,
                                 callbackEvents);
                         }
                         feedElementaryStream(
@@ -1398,6 +1423,7 @@ namespace ps2_stubs
                             sourceContiguous,
                             false,
                             packetInputOffset,
+                            packetInputEndOffset,
                             callbackEvents);
                         queueStreamCallbackEvent(
                             mpegAddr,
@@ -1408,6 +1434,7 @@ namespace ps2_stubs
                             sourceContiguous,
                             false,
                             packetInputOffset,
+                            packetInputEndOffset,
                             callbackEvents);
                         if (streamId == kMpegPrivateStream1)
                         {
@@ -1420,6 +1447,7 @@ namespace ps2_stubs
                                 sourceContiguous,
                                 false,
                                 packetInputOffset,
+                                packetInputEndOffset,
                                 callbackEvents);
                         }
                     }
@@ -1578,6 +1606,77 @@ namespace ps2_stubs
             }
 
             return snapshotGuestBytes(rdram, dataAddr, byteCount, snapshot);
+        }
+
+        bool guestBytesMatch(const uint8_t *rdram,
+                             uint32_t addr,
+                             const uint8_t *expected,
+                             size_t size)
+        {
+            if (!rdram || (!expected && size != 0u))
+            {
+                return false;
+            }
+
+            size_t compared = 0u;
+            while (compared < size)
+            {
+                const uint32_t curAddr =
+                    addr + static_cast<uint32_t>(compared);
+                const uint32_t offset = curAddr & PS2_RAM_MASK;
+                const size_t chunk = std::min<size_t>(
+                    size - compared, PS2_RAM_SIZE - offset);
+                const uint8_t *src = getConstMemPtr(rdram, curAddr);
+                if (!src || chunk == 0u ||
+                    std::memcmp(src, expected + compared, chunk) != 0)
+                {
+                    return false;
+                }
+                compared += chunk;
+            }
+            return true;
+        }
+
+        bool guestRingBytesMatch(const uint8_t *rdram,
+                                 uint32_t dataAddr,
+                                 uint32_t byteCount,
+                                 uint32_t ringBaseAddr,
+                                 uint32_t ringSize,
+                                 const uint8_t *expected)
+        {
+            if (byteCount == 0u)
+            {
+                return true;
+            }
+
+            const uint32_t base = ringBaseAddr & PS2_RAM_MASK;
+            const uint32_t data = dataAddr & PS2_RAM_MASK;
+            if (ringBaseAddr != 0u && ringSize != 0u &&
+                ringSize <= PS2_RAM_SIZE)
+            {
+                const uint32_t ringOffset =
+                    (data - base) & PS2_RAM_MASK;
+                if (ringOffset < ringSize)
+                {
+                    const uint32_t first = std::min<uint32_t>(
+                        byteCount, ringSize - ringOffset);
+                    if (!guestBytesMatch(
+                            rdram, dataAddr, expected, first))
+                    {
+                        return false;
+                    }
+
+                    const uint32_t remaining = byteCount - first;
+                    return remaining == 0u ||
+                           guestBytesMatch(
+                               rdram,
+                               ringBaseAddr,
+                               expected + first,
+                               remaining);
+                }
+            }
+
+            return guestBytesMatch(rdram, dataAddr, expected, byteCount);
         }
 
         bool writeMpegCallbackData(uint8_t *rdram, uint32_t addr, const MpegStreamCallbackEvent &event)
@@ -1887,12 +1986,15 @@ namespace ps2_stubs
                                           uint32_t ringBaseAddr,
                                           uint32_t ringSize,
                                           size_t acknowledgedPrefix,
+                                          size_t retainedEnd,
                                           const MpegInputSnapshot &snapshot)
         {
             MpegPendingInput pending{};
             const size_t prefix =
                 std::min(acknowledgedPrefix, snapshot.bytes.size());
-            const size_t remaining = snapshot.bytes.size() - prefix;
+            const size_t end = std::clamp(
+                retainedEnd, prefix, snapshot.bytes.size());
+            const size_t remaining = end - prefix;
             if (remaining == 0u)
             {
                 return pending;
@@ -1905,9 +2007,9 @@ namespace ps2_stubs
             pending.byteCount = static_cast<uint32_t>(remaining);
             pending.ringBaseAddr = ringBaseAddr;
             pending.ringSize = ringSize;
-            pending.bytes.assign(
+            pending.bytes = std::make_shared<const std::vector<uint8_t>>(
                 snapshot.bytes.begin() + static_cast<std::ptrdiff_t>(prefix),
-                snapshot.bytes.end());
+                snapshot.bytes.begin() + static_cast<std::ptrdiff_t>(end));
             return pending;
         }
 
@@ -1922,6 +2024,21 @@ namespace ps2_stubs
             return std::min(events.front().inputOffset, inputSize);
         }
 
+        size_t retainedCallbackInputEnd(
+            const std::vector<MpegStreamCallbackEvent> &events,
+            size_t inputSize)
+        {
+            if (events.empty())
+            {
+                return inputSize;
+            }
+            return std::min(
+                std::max(
+                    events.front().inputOffset,
+                    events.front().inputEndOffset),
+                inputSize);
+        }
+
         void rebaseCallbackInputOffsets(
             std::vector<MpegStreamCallbackEvent> &events,
             size_t acceptedPrefix)
@@ -1931,12 +2048,21 @@ namespace ps2_stubs
                 event.inputOffset = event.inputOffset > acceptedPrefix
                                         ? event.inputOffset - acceptedPrefix
                                         : 0u;
+                event.inputEndOffset =
+                    event.inputEndOffset > acceptedPrefix
+                        ? event.inputEndOffset - acceptedPrefix
+                        : 0u;
             }
         }
 
         void rebasePlaybackInputOffsets(MpegPlaybackState &playback,
                                         size_t acceptedPrefix)
         {
+            if (acceptedPrefix == 0u)
+            {
+                return;
+            }
+
             for (size_t &inputOffset : playback.pssInputOffsets)
             {
                 if (inputOffset == kMpegNoInputOffset)
@@ -1952,7 +2078,8 @@ namespace ps2_stubs
         void trimPendingInputPrefix(MpegPendingInput &pending,
                                     size_t acceptedPrefix)
         {
-            const size_t prefix = std::min(acceptedPrefix, pending.bytes.size());
+            const size_t prefix = std::min<size_t>(
+                acceptedPrefix, pending.byteCount);
             if (prefix == 0u)
             {
                 return;
@@ -1964,11 +2091,9 @@ namespace ps2_stubs
                 prefix,
                 pending.ringBaseAddr,
                 pending.ringSize);
-            pending.bytes.erase(
-                pending.bytes.begin(),
-                pending.bytes.begin() + static_cast<std::ptrdiff_t>(prefix));
-            pending.byteCount = static_cast<uint32_t>(pending.bytes.size());
-            pending.active = !pending.bytes.empty();
+            pending.byteOffset += prefix;
+            pending.byteCount -= static_cast<uint32_t>(prefix);
+            pending.active = pending.byteCount != 0u;
         }
 
         bool pendingInputMatches(uint8_t *rdram,
@@ -1994,22 +2119,29 @@ namespace ps2_stubs
                 return false;
             }
 
-            MpegInputSnapshot retrySnapshot;
-            const size_t copied = ring
-                                      ? snapshotGuestRingBytes(
-                                            rdram,
-                                            dataAddr,
-                                            pending.byteCount,
-                                            ringBaseAddr,
-                                            ringSize,
-                                            retrySnapshot)
-                                      : snapshotGuestBytes(
-                                            rdram,
-                                            dataAddr,
-                                            pending.byteCount,
-                                            retrySnapshot);
-            return copied == pending.byteCount &&
-                   retrySnapshot.bytes == pending.bytes;
+            if (!pending.bytes ||
+                pending.byteOffset > pending.bytes->size() ||
+                pending.byteCount >
+                    pending.bytes->size() - pending.byteOffset)
+            {
+                return false;
+            }
+            const uint8_t *const expected =
+                pending.bytes->data() + pending.byteOffset;
+
+            return ring
+                       ? guestRingBytesMatch(
+                             rdram,
+                             dataAddr,
+                             pending.byteCount,
+                             ringBaseAddr,
+                             ringSize,
+                             expected)
+                       : guestBytesMatch(
+                             rdram,
+                             dataAddr,
+                             expected,
+                             pending.byteCount);
         }
 
         bool acknowledgePendingInput(uint8_t *rdram,
@@ -2058,7 +2190,7 @@ namespace ps2_stubs
             if (!dispatchStreamCallbacksUnlocked(rdram, ctx, runtime, callbackEvents))
             {
                 size_t acceptedPrefix = acceptedCallbackInputPrefix(
-                    callbackEvents, pending.bytes.size());
+                    callbackEvents, pending.byteCount);
                 if (acceptedPrefix != 0u)
                 {
                     trimPendingInputPrefix(pending, acceptedPrefix);
@@ -2088,7 +2220,8 @@ namespace ps2_stubs
                     callbackCount))
             {
                 size_t acceptedPrefix = std::min(
-                    failedInputOffset, pending.bytes.size());
+                    failedInputOffset,
+                    static_cast<size_t>(pending.byteCount));
                 trimPendingInputPrefix(pending, acceptedPrefix);
                 rebaseCallbackInputOffsets(failedEvents, acceptedPrefix);
 
@@ -2556,24 +2689,37 @@ namespace ps2_stubs
         {
             size_t acceptedPrefix = std::min(
                 failedInputOffset, inputSnapshot.bytes.size());
+            size_t retainedEnd = retainedCallbackInputEnd(
+                failedEvents, inputSnapshot.bytes.size());
             MpegPendingInput pendingInput = makePendingInput(
                 false,
                 dataAddr,
                 0u,
                 0u,
                 acceptedPrefix,
+                retainedEnd,
                 inputSnapshot);
             if (!pendingInput.active)
             {
                 acceptedPrefix = 0u;
+                retainedEnd = inputSnapshot.bytes.size();
                 pendingInput = makePendingInput(
-                    false, dataAddr, 0u, 0u, 0u, inputSnapshot);
+                    false,
+                    dataAddr,
+                    0u,
+                    0u,
+                    0u,
+                    retainedEnd,
+                    inputSnapshot);
             }
             rebaseCallbackInputOffsets(failedEvents, acceptedPrefix);
 
             std::lock_guard<std::mutex> lock(g_mpeg_stub_mutex);
             MpegPlaybackState &playback = getPlaybackState(mpegAddr);
-            rebasePlaybackInputOffsets(playback, acceptedPrefix);
+            // Bytes following the blocked packet were neither parsed nor
+            // acknowledged. Leave them caller-owned so a successful retry
+            // only consumes the retained packet.
+            discardBufferedPssInput(playback);
             playback.pendingCallbacks = std::move(failedEvents);
             playback.pendingInput = std::move(pendingInput);
             setReturnS32(ctx, static_cast<int32_t>(acceptedPrefix));
@@ -2669,29 +2815,37 @@ namespace ps2_stubs
         {
             size_t acceptedPrefix = std::min(
                 failedInputOffset, inputSnapshot.bytes.size());
+            size_t retainedEnd = retainedCallbackInputEnd(
+                failedEvents, inputSnapshot.bytes.size());
             MpegPendingInput pendingInput = makePendingInput(
                 true,
                 dataAddr,
                 ringBaseAddr,
                 ringSize,
                 acceptedPrefix,
+                retainedEnd,
                 inputSnapshot);
             if (!pendingInput.active)
             {
                 acceptedPrefix = 0u;
+                retainedEnd = inputSnapshot.bytes.size();
                 pendingInput = makePendingInput(
                     true,
                     dataAddr,
                     ringBaseAddr,
                     ringSize,
                     0u,
+                    retainedEnd,
                     inputSnapshot);
             }
             rebaseCallbackInputOffsets(failedEvents, acceptedPrefix);
 
             std::lock_guard<std::mutex> lock(g_mpeg_stub_mutex);
             MpegPlaybackState &playback = getPlaybackState(mpegAddr);
-            rebasePlaybackInputOffsets(playback, acceptedPrefix);
+            // Bytes following the blocked packet were neither parsed nor
+            // acknowledged. Leave them caller-owned so a successful retry
+            // only consumes the retained packet.
+            discardBufferedPssInput(playback);
             playback.pendingCallbacks = std::move(failedEvents);
             playback.pendingInput = std::move(pendingInput);
             setReturnS32(ctx, static_cast<int32_t>(acceptedPrefix));

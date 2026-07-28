@@ -2091,6 +2091,8 @@ void register_ps2_runtime_expansion_tests()
                 0x10u, 0x21u, 0x32u, 0x43u, 0x54u, 0x65u, 0x76u, 0x87u};
             const std::vector<uint8_t> secondPayload = {
                 0x98u, 0xA9u, 0xBAu, 0xCBu, 0xDCu, 0xEDu, 0xFEu, 0x0Fu};
+            const std::vector<uint8_t> thirdPayload = {
+                0x01u, 0x23u, 0x45u, 0x67u, 0x89u, 0xABu, 0xCDu, 0xEFu};
             const auto makePrivatePacket = [](const std::vector<uint8_t> &payload)
             {
                 const uint16_t packetLen =
@@ -2107,8 +2109,11 @@ void register_ps2_runtime_expansion_tests()
                 makePrivatePacket(firstPayload);
             const std::vector<uint8_t> secondPacket =
                 makePrivatePacket(secondPayload);
+            const std::vector<uint8_t> thirdPacket =
+                makePrivatePacket(thirdPayload);
             std::vector<uint8_t> input = firstPacket;
             input.insert(input.end(), secondPacket.begin(), secondPacket.end());
+            input.insert(input.end(), thirdPacket.begin(), thirdPacket.end());
 
             runtime.registerFunction(
                 kCallbackEntry, &testRejectSecondMpegStreamCallback);
@@ -2152,7 +2157,11 @@ void register_ps2_runtime_expansion_tests()
             R5900Context retryCtx{};
             setRegU32(retryCtx, 4, kMpegAddr);
             setRegU32(retryCtx, 5, kRingBase + retryOffset);
-            setRegU32(retryCtx, 6, static_cast<uint32_t>(secondPacket.size()));
+            setRegU32(
+                retryCtx,
+                6,
+                static_cast<uint32_t>(
+                    secondPacket.size() + thirdPacket.size()));
             setRegU32(retryCtx, 7, kRingBase);
             setRegU32(retryCtx, 8, kRingSize);
             ps2_stubs::sceMpegDemuxPssRing(rdram.data(), &retryCtx, &runtime);
@@ -2168,12 +2177,42 @@ void register_ps2_runtime_expansion_tests()
                      "the rejected packet callback should retry once");
             t.Equals(getRegS32(retryCtx, 2),
                      static_cast<int32_t>(secondPacket.size()),
-                     "a successful retry should acknowledge only the retained suffix");
+                     "a successful retry should acknowledge only the blocked packet");
             t.Equals(gMpegStreamCallbackDataAddr.load(std::memory_order_acquire),
                      expectedPayloadAddr,
                      "suffix retry should preserve the wrapped guest payload address");
             t.IsTrue(observedPayload == secondPayload,
                      "suffix retry should deliver the unchanged second payload");
+
+            const uint32_t thirdOffset =
+                (retryOffset + static_cast<uint32_t>(secondPacket.size())) %
+                kRingSize;
+            R5900Context thirdCtx{};
+            setRegU32(thirdCtx, 4, kMpegAddr);
+            setRegU32(thirdCtx, 5, kRingBase + thirdOffset);
+            setRegU32(
+                thirdCtx, 6, static_cast<uint32_t>(thirdPacket.size()));
+            setRegU32(thirdCtx, 7, kRingBase);
+            setRegU32(thirdCtx, 8, kRingSize);
+            ps2_stubs::sceMpegDemuxPssRing(
+                rdram.data(), &thirdCtx, &runtime);
+
+            {
+                std::lock_guard<std::mutex> lock(
+                    gMpegStreamCallbackPayloadMutex);
+                observedPayload = gMpegStreamCallbackPayload;
+            }
+            t.Equals(
+                gMpegStreamCallbackCount.load(std::memory_order_acquire),
+                4u,
+                "input after the blocked packet should remain caller-owned");
+            t.Equals(
+                getRegS32(thirdCtx, 2),
+                static_cast<int32_t>(thirdPacket.size()),
+                "the caller should be able to submit the unretained tail");
+            t.IsTrue(
+                observedPayload == thirdPayload,
+                "the later call should deliver the caller-owned tail payload");
 
             runtime.requestStop();
         });
