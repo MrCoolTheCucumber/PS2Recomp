@@ -933,6 +933,54 @@ void register_ps2_runtime_interrupt_tests()
             cleanupRuntime(env);
         });
 
+        tc.Run("interactive VSync pacing bounds consecutive idle advances", [](TestCase &t)
+        {
+            notifyRuntimeStop();
+            TestEnv env;
+            t.IsTrue(
+                env.runtime.memory().initialize(),
+                "runtime memory initialize should succeed");
+            env.runtime.configureEeVSyncVideoMode(
+                0x02u, true);
+            env.runtime.setRealtimeVSyncPacingEnabled(
+                true);
+
+            R5900Context ctx{};
+            ctx.cop0_config = 1u << 18u;
+            const uint64_t tickBefore =
+                GetCurrentVSyncTick();
+            const auto hostStart =
+                std::chrono::steady_clock::now();
+            uint64_t secondTick = 0u;
+            {
+                PS2Runtime::GuestExecutionScope guestExecution(
+                    &env.runtime, &ctx);
+                (void)WaitForNextVSyncTick(
+                    env.rdram.data(), &env.runtime,
+                    &ctx);
+                secondTick = WaitForNextVSyncTick(
+                    env.rdram.data(), &env.runtime,
+                    &ctx);
+            }
+            const auto hostElapsed =
+                std::chrono::steady_clock::now() -
+                hostStart;
+
+            t.Equals(
+                secondTick, tickBefore + 2u,
+                "two idle waits should still publish two exact emulated VSync starts");
+            t.IsTrue(
+                hostElapsed >=
+                    std::chrono::milliseconds(20),
+                "interactive pacing should retain consecutive VSync waits in host time");
+            t.IsTrue(
+                hostElapsed <
+                    std::chrono::milliseconds(500),
+                "interactive pacing should not introduce an unbounded host delay");
+
+            cleanupRuntime(env);
+        });
+
         tc.Run("event VSync wait shares one idle advance and yields to queued guest work", [](TestCase &t)
         {
             notifyRuntimeStop();

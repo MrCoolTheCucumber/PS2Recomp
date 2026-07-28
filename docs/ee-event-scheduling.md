@@ -82,6 +82,14 @@ Idle waits may advance the canonical timeline directly to the cached next
 deadline only when no runnable guest owns execution. They do not start a
 detached host-time clock.
 
+The interactive runner applies a one-way real-time VSync rate limit after the
+scheduler has selected an emulated deadline. It can delay an early VSync but
+cannot create an event, advance the EE timeline, or alter a device deadline.
+Directly constructed runtimes keep this presentation policy disabled, so
+tests and deterministic tools can fast-forward idle waits without host delay.
+A bounded four-field catch-up window prevents debugger pauses or slow frames
+from turning later guest VSync waits into an unbounded wall-time burst.
+
 ## VU execution contract
 
 The scheduler gives a VU an elapsed guest-cycle budget; the VU executes a

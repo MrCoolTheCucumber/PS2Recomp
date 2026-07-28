@@ -431,6 +431,7 @@ public:
     bool syncCoreSubsystems();
     [[nodiscard]] ps2x::timing::EeTick currentEeTick() const noexcept;
     void resetEeTiming(R5900Context *context = nullptr);
+    void setRealtimeVSyncPacingEnabled(bool enabled);
     bool loadELF(const std::string &elfPath);
     void run();
 
@@ -1238,6 +1239,12 @@ private:
         uint32_t videoMode) noexcept;
     void publishEeVSyncField() noexcept;
     void resetEeVSyncStateUnlocked() noexcept;
+    void resetEeVSyncPacingUnlocked() noexcept;
+    void paceEeVSyncStart(
+        ps2x::timing::EeTick scheduledTick);
+    [[nodiscard]] static std::chrono::steady_clock::duration
+    hostDurationForEeTicks(
+        ps2x::timing::EeTickDelta ticks) noexcept;
     [[nodiscard]] bool queuePendingVSyncDelivery(
         PendingVSyncDelivery delivery) noexcept;
     void drainPendingVSyncHandlers(uint8_t *rdram);
@@ -1400,6 +1407,13 @@ private:
         bool interlaced = true;
         bool enabled = false;
     };
+    struct EeVSyncPacing
+    {
+        std::chrono::steady_clock::time_point hostDeadline{};
+        ps2x::timing::EeTick eeDeadlineTick{};
+        bool enabled = false;
+        bool anchored = false;
+    };
     enum class PendingVSyncKind : uint8_t
     {
         Start = 0u,
@@ -1416,6 +1430,7 @@ private:
             ps2x::timing::EeEventScheduler::
                 kMaximumServicesPerBoundary;
     EeVSyncTiming m_eeVSyncTiming{};
+    EeVSyncPacing m_eeVSyncPacing{};
     ps2x::timing::EeEventToken m_eeCounterEventToken{
         ps2x::timing::EeEventSource::EeCounters, 0u};
     ps2x::timing::EeEventToken m_cop0TimerEventToken{

@@ -1647,6 +1647,112 @@ void PS2Runtime::resetEeVSyncStateUnlocked() noexcept
     }
 }
 
+std::chrono::steady_clock::duration
+PS2Runtime::hostDurationForEeTicks(
+    ps2x::timing::EeTickDelta ticks) noexcept
+{
+    // The default Emotion Engine clock is 294.912 MHz. This conversion only
+    // rate-limits already-scheduled work; its result never feeds back into
+    // the emulated timeline.
+    constexpr uint64_t kEeCyclesPerSecond =
+        294'912'000u;
+    constexpr uint64_t kEeTicksPerSecond =
+        kEeCyclesPerSecond *
+        ps2x::timing::kEeTicksPerCycle;
+    constexpr uint64_t kNanosecondsPerSecond =
+        1'000'000'000u;
+
+    const uint64_t rawTicks = ticks.raw();
+    const uint64_t wholeSeconds =
+        rawTicks / kEeTicksPerSecond;
+    const uint64_t remainingTicks =
+        rawTicks % kEeTicksPerSecond;
+    const uint64_t remainingNanoseconds =
+        (remainingTicks * kNanosecondsPerSecond) /
+        kEeTicksPerSecond;
+
+    return std::chrono::duration_cast<
+        std::chrono::steady_clock::duration>(
+            std::chrono::seconds(wholeSeconds) +
+            std::chrono::nanoseconds(
+                remainingNanoseconds));
+}
+
+void PS2Runtime::resetEeVSyncPacingUnlocked() noexcept
+{
+    m_eeVSyncPacing.anchored =
+        m_eeVSyncPacing.enabled;
+    m_eeVSyncPacing.eeDeadlineTick =
+        currentEeTick();
+    m_eeVSyncPacing.hostDeadline =
+        std::chrono::steady_clock::now();
+}
+
+void PS2Runtime::setRealtimeVSyncPacingEnabled(
+    bool enabled)
+{
+    std::lock_guard<std::recursive_timed_mutex> lock(
+        m_guestExecutionMutex);
+    m_eeVSyncPacing.enabled = enabled;
+    resetEeVSyncPacingUnlocked();
+}
+
+void PS2Runtime::paceEeVSyncStart(
+    ps2x::timing::EeTick scheduledTick)
+{
+    if (!m_eeVSyncPacing.enabled)
+    {
+        return;
+    }
+
+    using Clock = std::chrono::steady_clock;
+    const Clock::time_point now = Clock::now();
+    if (!m_eeVSyncPacing.anchored ||
+        scheduledTick <=
+            m_eeVSyncPacing.eeDeadlineTick)
+    {
+        m_eeVSyncPacing.anchored = true;
+        m_eeVSyncPacing.eeDeadlineTick =
+            scheduledTick;
+        m_eeVSyncPacing.hostDeadline = now;
+        return;
+    }
+
+    const auto elapsedHostTime =
+        hostDurationForEeTicks(
+            ps2x::timing::elapsedEeTicks(
+                m_eeVSyncPacing.eeDeadlineTick,
+                scheduledTick));
+    Clock::time_point deadline =
+        m_eeVSyncPacing.hostDeadline +
+        elapsedHostTime;
+
+    // Match the former worker's bounded catch-up policy. A slow frame or
+    // debugger pause must not turn later guest VSync waits into an unbounded
+    // burst, while a few late fields may still recover without added delay.
+    constexpr uint64_t kMaximumCatchUpFields = 4u;
+    const auto maximumLag =
+        hostDurationForEeTicks(
+            ps2x::timing::eeCyclesToTicks(
+                m_eeVSyncTiming
+                    .durations.periodCycles *
+                kMaximumCatchUpFields));
+    if (now > deadline &&
+        now - deadline > maximumLag)
+    {
+        deadline = now - maximumLag;
+    }
+
+    if (deadline > now)
+    {
+        std::this_thread::sleep_until(deadline);
+    }
+
+    m_eeVSyncPacing.eeDeadlineTick =
+        scheduledTick;
+    m_eeVSyncPacing.hostDeadline = deadline;
+}
+
 void PS2Runtime::publishEeVSyncField() noexcept
 {
     constexpr uint64_t kGsCsrFieldMask = 0x2000ull;
@@ -2266,6 +2372,7 @@ void PS2Runtime::resetEeTimingUnlocked(
     }
     m_eeTimeline.reset();
     m_eeEventScheduler.reset();
+    resetEeVSyncPacingUnlocked();
     m_cop0Timing.reset(
         0u,
         cop0State.count,
@@ -3629,6 +3736,7 @@ bool PS2Runtime::initialize(const char *title)
         m_audioBackend.setAudioReady(IsAudioDeviceReady());
 #endif
         SetTargetFPS(60);
+        setRealtimeVSyncPacingEnabled(true);
         if (m_debugUiInitCallback)
         {
             m_debugUiInitCallback(*this, m_debugUiUserData);
@@ -4714,6 +4822,11 @@ void PS2Runtime::serviceEeVSyncAtEvent(
     {
     case EeVSyncPhase::Start:
     {
+        paceEeVSyncStart(service.scheduledTick);
+        if (isStopRequested())
+        {
+            return;
+        }
         m_eeVSyncTiming.startTick =
             service.scheduledTick;
         m_eeVSyncTiming.currentVSyncTick =
@@ -7785,6 +7898,11 @@ void PS2Runtime::run()
     m_debugRa.store(static_cast<uint32_t>(_mm_extract_epi32(m_cpuContext.r[31], 0)), std::memory_order_relaxed);
     m_debugSp.store(static_cast<uint32_t>(_mm_extract_epi32(m_cpuContext.r[29], 0)), std::memory_order_relaxed);
     m_debugGp.store(static_cast<uint32_t>(_mm_extract_epi32(m_cpuContext.r[28], 0)), std::memory_order_relaxed);
+    {
+        std::lock_guard<std::recursive_timed_mutex> lock(
+            m_guestExecutionMutex);
+        resetEeVSyncPacingUnlocked();
+    }
 
     const char *const gsHistoryDumpPath = std::getenv(GS_HISTORY_DUMP_ENV);
     if (gsHistoryDumpPath && gsHistoryDumpPath[0] != '\0')
