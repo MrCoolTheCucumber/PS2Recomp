@@ -79,6 +79,19 @@ if(PS2X_IS_ARM_TARGET)
     endif()
 endif()
 
+if(NOT PS2X_IS_ARM_TARGET AND
+   CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|AMD64|amd64|i[3-6]86)$" AND
+   NOT MSVC)
+    include(CheckCXXCompilerFlag)
+    check_cxx_compiler_flag("-msse4.1" PS2X_COMPILER_SUPPORTS_MSSE41)
+    if(NOT PS2X_COMPILER_SUPPORTS_MSSE41)
+        message(FATAL_ERROR
+            "The x86 runtime requires compiler support for SSE4.1")
+    endif()
+    add_compile_options(
+        "$<$<COMPILE_LANGUAGE:CXX>:-msse4.1>")
+endif()
+
 if(PS2X_BUILD_RECOMP)
     add_subdirectory("ps2xRecomp")
 endif()

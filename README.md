@@ -48,7 +48,8 @@ The translated code is very literal, with each MIPS instruction mapping to a C++
 
 * CMake 3.20+
 * C++20 compiler (currently tested mainly with MSVC)
-* SSE4/AVX host support for some vector paths
+* SSE4.1 host support for x86 builds; CMake enables the required compiler
+  target automatically. AVX is detected at runtime for optional vector paths.
 
 ### Build
 
