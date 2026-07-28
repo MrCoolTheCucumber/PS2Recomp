@@ -41,9 +41,9 @@ Three equal-work paths advance the fixed FMAC flag pipeline at the same point:
    SSE, while retaining the interpreter's FMAC flag scheduler.
 
 All paths start from the captured RAC state, execute the same pair count, flush
-the FMAC pipeline, and compare a hash of every public `VuExecutionState` field.
-The spike also repeats one-pair native entries and verifies that `nextPair`
-resumes at the correct position.
+the FMAC pipeline, and compare the architectural `VuExecutionState` fields
+exercised by the block. The spike also repeats one-pair native entries and
+verifies that `nextPair` resumes at the correct position.
 
 This is not a complete VU backend. It intentionally excludes the lower lane,
 Q/XGKICK advancement, branches, cycle accounting, code invalidation, and

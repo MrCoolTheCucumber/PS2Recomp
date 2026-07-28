@@ -28,6 +28,7 @@
 #include <cstring>
 #include <iterator>
 #include <limits>
+#include <stdexcept>
 #include <chrono>
 #include <atomic>
 #include <thread>
@@ -835,7 +836,41 @@ static void UploadFrame(Texture2D &tex, PS2Runtime *rt, uint32_t &outWidth, uint
 }
 
 PS2Runtime::PS2Runtime()
+    : PS2Runtime(PS2RuntimeConfiguration{})
 {
+}
+
+PS2Runtime::PS2Runtime(PS2RuntimeConfiguration configuration)
+{
+    const auto configureVuBackend =
+        [&](VuUnit &unit, VuBackendKind requested,
+            const char *environmentName)
+    {
+        if (configuration.useVuBackendEnvironment)
+        {
+            if (const char *const value = std::getenv(environmentName))
+            {
+                if (!parseVuBackendKind(value, requested))
+                {
+                    throw std::invalid_argument(
+                        std::string(environmentName) +
+                        " must be auto, interpreter, recompiler, or verify");
+                }
+            }
+        }
+
+        std::string diagnostic;
+        if (!unit.setBackend(requested, &diagnostic))
+        {
+            throw std::runtime_error(
+                std::string(environmentName) + ": " + diagnostic);
+        }
+    };
+    configureVuBackend(
+        m_vu0, configuration.vu0Backend, "PS2X_VU0_BACKEND");
+    configureVuBackend(
+        m_vu1, configuration.vu1Backend, "PS2X_VU1_BACKEND");
+
     m_memory.setEeCounterCycleCallback(
         [this]()
         {
@@ -3700,7 +3735,7 @@ void PS2Runtime::serviceVU1AtEvent(
         return;
     }
 
-    const VU1AdvanceResult advance =
+    const VuRunResult advance =
         m_vu1.advance(
             m_memory.getVU1Code(), PS2_VU1_CODE_SIZE,
             m_memory.getVU1Data(), PS2_VU1_DATA_SIZE,

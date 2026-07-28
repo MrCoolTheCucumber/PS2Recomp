@@ -6052,16 +6052,16 @@ void register_ps2_runtime_expansion_tests()
                     &runtime->cpu(), 0u);
             }
 
-            const VU1ProgressSnapshot startupWithDma =
+            const VuProgressSnapshot startupWithDma =
                 withDma.vu0().getProgressSnapshot();
-            const VU1ProgressSnapshot startupWithoutDma =
+            const VuProgressSnapshot startupWithoutDma =
                 withoutDma.vu0().getProgressSnapshot();
             t.Equals(
                 startupWithDma.cycles,
                 startupWithoutDma.cycles,
                 "identical VCALLs should execute the same startup batch");
 
-            const VU1ProgressSnapshot commonProgress =
+            const VuProgressSnapshot commonProgress =
                 startupWithDma;
             t.Equals(
                 commonProgress.cycles,
@@ -6116,9 +6116,9 @@ void register_ps2_runtime_expansion_tests()
                 withoutDma.memory().getRDRAM(),
                 &withoutDma.cpu());
 
-            const VU1ProgressSnapshot progressed =
+            const VuProgressSnapshot progressed =
                 withDma.vu0().getProgressSnapshot();
-            const VU1ProgressSnapshot idleBoundary =
+            const VuProgressSnapshot idleBoundary =
                 withoutDma.vu0().getProgressSnapshot();
             t.Equals(
                 progressed.cycles,
@@ -6136,7 +6136,7 @@ void register_ps2_runtime_expansion_tests()
             withoutDma.synchronizeVU0Microprogram(
                 withoutDma.memory().getRDRAM(),
                 &withoutDma.cpu(), false);
-            const VU1ProgressSnapshot caughtUp =
+            const VuProgressSnapshot caughtUp =
                 withoutDma.vu0().getProgressSnapshot();
             t.Equals(
                 caughtUp.cycles, progressed.cycles,
@@ -6173,7 +6173,7 @@ void register_ps2_runtime_expansion_tests()
                 runtime.memory().getRDRAM(), &ctx);
             runtime.vu0StartMicroProgram(
                 runtime.memory().getRDRAM(), &ctx, 0u);
-            const VU1ProgressSnapshot startup =
+            const VuProgressSnapshot startup =
                 runtime.vu0().getProgressSnapshot();
             const uint32_t startupPc = runtime.vu0().state().pc;
 
@@ -6186,7 +6186,7 @@ void register_ps2_runtime_expansion_tests()
                     runtime.memory().getRDRAM(), &ctx);
             }
 
-            const VU1ProgressSnapshot after =
+            const VuProgressSnapshot after =
                 runtime.vu0().getProgressSnapshot();
             const PS2Runtime::DebugEeScheduler scheduler =
                 runtime.debugEeSchedulerSnapshot();

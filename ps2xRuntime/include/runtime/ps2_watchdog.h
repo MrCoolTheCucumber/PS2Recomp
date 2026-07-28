@@ -98,7 +98,7 @@ inline PS2WatchdogAssessment ps2ClassifyWatchdogSample(
             PS2WatchdogClassification::ComputeBoundVu,
             true,
             "compute-bound-vu",
-            current.vu1Active ? "VU1Interpreter::run"
+            current.vu1Active ? "VuUnit::run"
                               : "VU0Interpreter::run",
         };
     }

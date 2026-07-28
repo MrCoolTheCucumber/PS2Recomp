@@ -1,4 +1,5 @@
 #include "MiniTest.h"
+#include "ps2_runtime.h"
 #include "runtime/ps2_gif_arbiter.h"
 #include "runtime/ps2_gs_gpu.h"
 #include "runtime/ps2_gs_psmct32.h"
@@ -8,11 +9,14 @@
 
 #include <array>
 #include <cfenv>
+#include <cstdlib>
 #include <cstdint>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <iterator>
+#include <optional>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -20,6 +24,39 @@ namespace
 {
     constexpr uint32_t kVuUpperNop = 0x000002FFu;
     constexpr uint32_t kVuUpperEnd = 1u << 30u;
+
+    class ScopedEnvironmentVariable
+    {
+    public:
+        explicit ScopedEnvironmentVariable(const char *name)
+            : m_name(name)
+        {
+            if (const char *const value = std::getenv(name))
+                m_original = value;
+        }
+
+        ~ScopedEnvironmentVariable()
+        {
+            if (m_original)
+                setenv(m_name.c_str(), m_original->c_str(), 1);
+            else
+                unsetenv(m_name.c_str());
+        }
+
+        void set(const char *value)
+        {
+            setenv(m_name.c_str(), value, 1);
+        }
+
+        ScopedEnvironmentVariable(
+            const ScopedEnvironmentVariable &) = delete;
+        ScopedEnvironmentVariable &operator=(
+            const ScopedEnvironmentVariable &) = delete;
+
+    private:
+        std::string m_name;
+        std::optional<std::string> m_original;
+    };
 
     struct Vu1Fixture
     {
@@ -224,6 +261,8 @@ void register_ps2_vu1_tests()
             original.branchPending = true;
             original.branchTarget = 0x280u;
             original.branchDelay = 1u;
+            original.active = true;
+            original.issuedCycles = 27u;
             original.pipeline.xgkick.active = true;
             original.pipeline.xgkick.address = 0x40u;
             original.pipeline.xgkick.tagBytesRemaining = 16u;
@@ -250,6 +289,10 @@ void register_ps2_vu1_tests()
                      "the architectural state should be copied");
             t.IsTrue(clone.branchPending,
                      "the branch delay state should be copied");
+            t.IsTrue(clone.active,
+                     "the active state should be copied");
+            t.Equals(clone.issuedCycles, uint64_t{27u},
+                     "issued-cycle bookkeeping should be copied");
             t.Equals(clone.pipeline.xgkick.packet[0], uint8_t{0x11u},
                      "XGKICK packet storage should be deep-copied");
             t.Equals(clone.pipeline.delayedQ.result, 3.5f,
@@ -260,6 +303,262 @@ void register_ps2_vu1_tests()
                      "the FMAC pipeline cursor should be copied");
             t.Equals(clone.pipeline.workingMac, uint32_t{0xabcdu},
                      "the pending MAC accumulator should be copied");
+        });
+
+        tc.Run("unit reports backend-neutral execution lifecycle", [](TestCase &t)
+        {
+            Vu1Fixture fx;
+            t.IsTrue(fx.initialize(), "VU fixture should initialize");
+
+            writeVuInstructionPair(
+                fx.code, 0u, makeVuIaddiu(1u, 0u, 3), kVuUpperEnd);
+            writeVuInstructionPair(
+                fx.code, 8u, makeVuIaddiu(2u, 0u, 5), kVuUpperNop);
+
+            VuUnit unit;
+            t.IsFalse(unit.isActive(),
+                      "reset state should be inactive");
+            t.Equals(unit.state().q, 1.0f,
+                     "reset should restore Q");
+            t.Equals(unit.state().vf[0][3], 1.0f,
+                     "reset should restore VF0.w");
+
+            const VuRunResult inactive = unit.advance(
+                fx.code, PS2_VU1_CODE_SIZE,
+                fx.data, PS2_VU1_DATA_SIZE,
+                fx.gs, &fx.mem, 1u);
+            t.IsTrue(inactive.reason == VuExitReason::Inactive,
+                     "advancing an idle unit should report inactive");
+            t.Equals(inactive.executedCycles, uint32_t{0u},
+                     "an idle unit should execute no pairs");
+
+            std::vector<uint32_t> observedPcs;
+            unit.setInstructionObserver(
+                [&](uint64_t, uint32_t pc, uint32_t, uint32_t,
+                    const VuExecutionState &)
+                {
+                    observedPcs.push_back(pc);
+                });
+            unit.setProgressTrackingEnabled(true);
+            unit.start(0u, 7u, 9u, &fx.mem);
+            t.IsTrue(unit.isActive(),
+                     "start should make the unit active");
+            t.Equals(unit.state().top, uint32_t{7u},
+                     "start should publish TOP");
+            t.Equals(unit.state().itop, uint32_t{9u},
+                     "start should publish ITOP");
+
+            const VuRunResult budget = unit.advance(
+                fx.code, PS2_VU1_CODE_SIZE,
+                fx.data, PS2_VU1_DATA_SIZE,
+                fx.gs, &fx.mem, 1u);
+            t.IsTrue(budget.reason == VuExitReason::CycleBudget,
+                     "a bounded active run should report its cycle budget");
+            t.Equals(budget.executedCycles, uint32_t{1u},
+                     "the first budget should issue one pair");
+            t.IsTrue(budget.activeAfter,
+                     "the E-bit delay pair should remain active");
+            t.Equals(unit.state().issuedCycles, uint64_t{1u},
+                     "issued cycles should be exact after a side exit");
+
+            const VuRunResult completed = unit.advance(
+                fx.code, PS2_VU1_CODE_SIZE,
+                fx.data, PS2_VU1_DATA_SIZE,
+                fx.gs, &fx.mem, 4u);
+            t.IsTrue(completed.reason == VuExitReason::ProgramEnded,
+                     "the E-bit delay pair should report completion");
+            t.Equals(completed.executedCycles, uint32_t{1u},
+                     "completion should execute the one remaining pair");
+            t.IsTrue(completed.completed && !completed.activeAfter,
+                     "completion should make the unit idle");
+            t.Equals(unit.state().issuedCycles, uint64_t{2u},
+                     "completion should retain total issued cycles");
+            t.Equals(observedPcs.size(), size_t{2u},
+                     "the observer should run once before every pair");
+            if (observedPcs.size() == 2u)
+            {
+                t.Equals(observedPcs[0], uint32_t{0u},
+                         "the observer should see the entry PC");
+                t.Equals(observedPcs[1], uint32_t{8u},
+                         "the observer should see the E-bit delay PC");
+            }
+
+            const VuProgressSnapshot progress =
+                unit.getProgressSnapshot();
+            t.IsTrue(progress.enabled,
+                     "progress tracking should remain enabled");
+            t.IsFalse(progress.active,
+                      "completed progress should not report a live host run");
+            t.Equals(progress.invocations, uint64_t{2u},
+                     "both bounded calls should be counted");
+            t.Equals(progress.cycles, uint64_t{2u},
+                     "progress should report exact issued pairs");
+            t.Equals(progress.pc, uint32_t{16u},
+                     "progress should report the completion PC");
+
+            unit.reset();
+            t.IsFalse(unit.isActive(),
+                      "reset should cancel execution");
+            t.Equals(unit.state().issuedCycles, uint64_t{0u},
+                     "reset should clear issued-cycle bookkeeping");
+            unit.state().pc = 8u;
+            unit.state().vi[3] = 0x44;
+            unit.state().pipeline.delayedQ = {
+                .active = true,
+                .result = 2.0f,
+                .cyclesRemaining = 3u,
+            };
+            unit.resumeState(11u, 13u, &fx.mem);
+            t.IsTrue(unit.isActive(),
+                     "resume should make retained state active");
+            t.Equals(unit.state().pc, uint32_t{8u},
+                     "resume should retain the current PC");
+            t.Equals(unit.state().vi[3], int32_t{0x44},
+                     "resume should retain architectural registers");
+            t.IsTrue(unit.state().pipeline.delayedQ.active,
+                     "resume should retain delayed pipeline state");
+            t.Equals(unit.state().top, uint32_t{11u},
+                     "resume should update TOP");
+            t.Equals(unit.state().itop, uint32_t{13u},
+                     "resume should update ITOP");
+        });
+
+        tc.Run("interpreter backend executes a supplied clone", [](TestCase &t)
+        {
+            Vu1Fixture fx;
+            t.IsTrue(fx.initialize(), "VU fixture should initialize");
+            writeVuInstructionPair(
+                fx.code, 0u, makeVuIaddiu(1u, 0u, 7), kVuUpperEnd);
+
+            struct NoopSideEffectSink final : IVuSideEffectSink
+            {
+                void submitPath1Packet(
+                    const uint8_t *, uint32_t) override
+                {
+                }
+            } sideEffects;
+
+            VuUnit unit;
+            VuExecutionState clone = unit.state();
+            clone.active = true;
+            VuExecutionContext context{
+                .state = clone,
+                .code = fx.code,
+                .codeSize = PS2_VU1_CODE_SIZE,
+                .data = fx.data,
+                .dataSize = PS2_VU1_DATA_SIZE,
+                .sideEffects = sideEffects,
+                .memory = &fx.mem,
+                .enableInstrumentation = false,
+            };
+            VuInterpreterBackend backend(unit);
+            const VuRunResult result = backend.run(context, 1u);
+
+            t.IsTrue(result.reason == VuExitReason::CycleBudget,
+                     "the clone should stop at the requested pair budget");
+            t.Equals(result.executedCycles, uint32_t{1u},
+                     "the backend should report exact clone work");
+            t.Equals(clone.vi[1], int32_t{7},
+                     "the supplied clone should receive architectural writes");
+            t.Equals(clone.issuedCycles, uint64_t{1u},
+                     "the supplied clone should receive cycle bookkeeping");
+            t.IsFalse(unit.isActive(),
+                      "backend execution should not activate canonical state");
+            t.Equals(unit.state().vi[1], int32_t{0},
+                     "backend execution should not mutate canonical registers");
+        });
+
+        tc.Run("backend requests are independent and reject active switches", [](TestCase &t)
+        {
+            VuBackendKind parsed = VuBackendKind::Auto;
+            t.IsTrue(
+                parseVuBackendKind("verify", parsed) &&
+                    parsed == VuBackendKind::Verify,
+                "backend names should parse");
+            t.IsFalse(parseVuBackendKind("jit", parsed),
+                      "unknown backend names should be rejected");
+
+            PS2RuntimeConfiguration configuration{};
+            configuration.vu0Backend = VuBackendKind::Recompiler;
+            configuration.vu1Backend = VuBackendKind::Verify;
+            configuration.useVuBackendEnvironment = false;
+            PS2Runtime runtime(configuration);
+            t.IsTrue(
+                runtime.vu0().requestedBackend() ==
+                    VuBackendKind::Recompiler,
+                "VU0 should retain its independent request");
+            t.IsTrue(
+                runtime.vu1().requestedBackend() ==
+                    VuBackendKind::Verify,
+                "VU1 should retain its independent request");
+            t.IsTrue(
+                runtime.vu0().resolvedBackend() ==
+                        VuBackendKind::Interpreter &&
+                    runtime.vu1().resolvedBackend() ==
+                        VuBackendKind::Interpreter,
+                "Phase 1 modes should resolve through the interpreter");
+
+            VuUnit unit;
+            unit.start();
+            std::string diagnostic;
+            t.IsFalse(
+                unit.setBackend(
+                    VuBackendKind::Recompiler, &diagnostic),
+                "an active unit should reject a backend change");
+            t.IsFalse(diagnostic.empty(),
+                      "a rejected switch should explain why");
+            t.IsTrue(
+                unit.requestedBackend() == VuBackendKind::Auto,
+                "a rejected switch should preserve the request");
+
+            unit.reset();
+            t.IsTrue(
+                unit.setBackend(
+                    VuBackendKind::Recompiler, &diagnostic),
+                "an idle unit should accept a backend request");
+            t.IsTrue(diagnostic.empty(),
+                     "an accepted request should clear the diagnostic");
+            t.IsTrue(
+                unit.requestedBackend() ==
+                        VuBackendKind::Recompiler &&
+                    unit.resolvedBackend() ==
+                        VuBackendKind::Interpreter &&
+                    unit.backendName() == "interpreter",
+                "request and resolved backend status should remain explicit");
+        });
+
+        tc.Run("runtime backend environment overrides each unit", [](TestCase &t)
+        {
+            ScopedEnvironmentVariable vu0("PS2X_VU0_BACKEND");
+            ScopedEnvironmentVariable vu1("PS2X_VU1_BACKEND");
+            vu0.set("interpreter");
+            vu1.set("verify");
+
+            PS2Runtime runtime;
+            t.IsTrue(
+                runtime.vu0().requestedBackend() ==
+                    VuBackendKind::Interpreter,
+                "the VU0 environment request should be applied");
+            t.IsTrue(
+                runtime.vu1().requestedBackend() ==
+                    VuBackendKind::Verify,
+                "the VU1 environment request should be applied independently");
+
+            vu1.set("jit");
+            bool rejected = false;
+            try
+            {
+                PS2Runtime invalid;
+            }
+            catch (const std::invalid_argument &error)
+            {
+                rejected =
+                    std::string(error.what()).find(
+                        "PS2X_VU1_BACKEND") != std::string::npos;
+            }
+            t.IsTrue(
+                rejected,
+                "an invalid environment request should name the failing unit");
         });
 
         tc.Run("bounded workload profile records exact pairs and identical MPG uploads", [](TestCase &t)
@@ -296,7 +595,7 @@ void register_ps2_vu1_tests()
             uploadVu1Mpg(
                 fx.mem, 0x100u, uploadedLower, kVuUpperNop);
 
-            VU1Interpreter vu1;
+            VuUnit vu1;
             vu1.execute(
                 fx.code, PS2_VU1_CODE_SIZE,
                 fx.data, PS2_VU1_DATA_SIZE,
@@ -349,7 +648,7 @@ void register_ps2_vu1_tests()
 
             writeVuInstructionPair(fx.code, 0u, 0u, makeVuUpper(0x28u, 0xAu, 2u, 1u, 3u)); // ADD.xz vf3, vf1, vf2
 
-            VU1Interpreter vu1;
+            VuUnit vu1;
             vu1.state().vf[1][0] = 1.0f;
             vu1.state().vf[1][1] = 2.0f;
             vu1.state().vf[1][2] = 3.0f;
@@ -382,7 +681,7 @@ void register_ps2_vu1_tests()
             for (uint32_t pc = 8u; pc <= 32u; pc += 8u)
                 writeVuInstructionPair(fx.code, pc, 0u, kVuUpperNop);
 
-            VU1Interpreter vu1;
+            VuUnit vu1;
             vu1.state().mac = 0x004Au;
             vu1.state().status = 0x0043u;
             const float source[4] = {1.0f, -2.0f, 3.0f, 4.0f};
@@ -439,7 +738,7 @@ void register_ps2_vu1_tests()
                 writeVuInstructionPair(
                     fx.code, pair * 8u, 0u, kVuUpperNop);
 
-            const auto initializeState = [](VU1Interpreter &interpreter)
+            const auto initializeState = [](VuUnit &interpreter)
             {
                 const float source[4] = {-1.0f, 0.0f, -1.0f, 0.0f};
                 std::memcpy(
@@ -448,8 +747,8 @@ void register_ps2_vu1_tests()
                 interpreter.state().status = 0u;
             };
 
-            VU1Interpreter stepped;
-            VU1Interpreter batched;
+            VuUnit stepped;
+            VuUnit batched;
             initializeState(stepped);
             initializeState(batched);
 
@@ -520,7 +819,7 @@ void register_ps2_vu1_tests()
                 writeVuInstructionPair(
                     fx.code, pc, 0u, kVuUpperNop);
 
-            VU1Interpreter vu1;
+            VuUnit vu1;
             vu1.state().vf[1][0] = -1.0f;
             vu1.execute(
                 fx.code, PS2_VU1_CODE_SIZE,
@@ -555,7 +854,7 @@ void register_ps2_vu1_tests()
                 fx.code, 8u, 0u,
                 makeVuUpper(0x28u, 0x4u, 2u, 1u, 3u));
 
-            VU1Interpreter vu1;
+            VuUnit vu1;
             const float source[4] = {-1.0f, 0.0f, 1.0f, 1.0f};
             std::memcpy(vu1.state().vf[1], source, sizeof(source));
             vu1.execute(
@@ -584,7 +883,7 @@ void register_ps2_vu1_tests()
             // round-to-nearest in every lane.
             writeVuInstructionPair(fx.code, 0u, 0u, 0x01E508BCu);
 
-            VU1Interpreter vu1;
+            VuUnit vu1;
             const uint32_t vf1Bits[4] = {
                 0xBED52018u, 0x409A33CEu, 0xBFC2EB57u, 0x3B110CC2u};
             const uint32_t vf5Bits[4] = {
@@ -625,7 +924,7 @@ void register_ps2_vu1_tests()
             // 0x4b69e65d.
             writeVuInstructionPair(fx.code, 0u, 0u, 0x01E510BDu);
 
-            VU1Interpreter vu1;
+            VuUnit vu1;
             setFloatBits(vu1.state().acc[2], 0x4B6A3856u);
             setFloatBits(vu1.state().vf[2][2], 0x41004B21u);
             setFloatBits(vu1.state().vf[5][1], 0xC5239000u);
@@ -647,7 +946,7 @@ void register_ps2_vu1_tests()
                 fx.code, 0u, 0u,
                 makeVuUpperSpecial(0x1Fu, 0xEu, 2u, 1u)); // CLIPw.xyz vf1, vf2w
 
-            VU1Interpreter vu1;
+            VuUnit vu1;
             vu1.state().clip = 0x00123456u;
             vu1.state().vf[1][0] = 2.0f;
             vu1.state().vf[1][1] = -3.0f;
@@ -682,7 +981,7 @@ void register_ps2_vu1_tests()
                 fx.code, 0u, 0u,
                 makeVuUpper(0x2Au, 0xEu, 2u, 1u, 3u)); // MUL.xyz vf3, vf1, vf2
 
-            VU1Interpreter vu1;
+            VuUnit vu1;
             setFloatBits(vu1.state().vf[1][0], 0x00800000u); // smallest positive normal
             setFloatBits(vu1.state().vf[1][1], 0x80800000u); // smallest negative normal
             setFloatBits(vu1.state().vf[1][2], 0x00000001u); // positive denormal input
@@ -713,7 +1012,7 @@ void register_ps2_vu1_tests()
             const uint32_t upperAddiWithIBit = makeVuUpper(0x22u, 0xFu, 0u, 1u, 2u) | 0x80000000u; // ADDi.xyzw vf2, vf1
             writeVuInstructionPair(fx.code, 0u, lowerImmediate, upperAddiWithIBit);
 
-            VU1Interpreter vu1;
+            VuUnit vu1;
             vu1.state().i = 2.0f;
             vu1.state().vf[1][0] = 1.0f;
             vu1.state().vf[1][1] = 2.0f;
@@ -741,7 +1040,7 @@ void register_ps2_vu1_tests()
             writeVuInstructionPair(fx.code, 0u, makeVuLq(0x5u, 4u, 1u, 1), kVuUpperNop); // LQ.yw vf4, 1(vi1)
             writeVuInstructionPair(fx.code, 8u, makeVuSq(0xAu, 4u, 2u, 1), kVuUpperNop); // SQ.xz vf4, 1(vi2)
 
-            VU1Interpreter vu1;
+            VuUnit vu1;
             vu1.state().vi[1] = 2;
             vu1.state().vi[2] = 4;
             vu1.state().vf[4][0] = 100.0f;
@@ -773,7 +1072,7 @@ void register_ps2_vu1_tests()
             writeVuInstructionPair(fx.code, 8u, makeVuIaddiu(0u, 2u, 7), kVuUpperNop);      // IADDIU vi0, vi2, 7
             writeVuInstructionPair(fx.code, 16u, makeVuLowerDirect(0x30u, 2u, 1u, 3u), kVuUpperNop); // IADD vi3, vi2, vi1
 
-            VU1Interpreter vu1;
+            VuUnit vu1;
             vu1.state().vi[0] = 99;
             vu1.state().vi[1] = 10;
 
@@ -792,7 +1091,7 @@ void register_ps2_vu1_tests()
             writeVuInstructionPair(fx.code, 0u, makeVuLowerSpecial(0x68u, 0u, 2u), kVuUpperNop); // XTOP vi2
             writeVuInstructionPair(fx.code, 8u, makeVuLowerSpecial(0x69u, 0u, 3u), kVuUpperNop); // XITOP vi3
 
-            VU1Interpreter vu1;
+            VuUnit vu1;
             vu1.execute(fx.code, PS2_VU1_CODE_SIZE, fx.data, PS2_VU1_DATA_SIZE, fx.gs, &fx.mem, 0u, 0x123u, 0x2ABu, 2u);
 
             t.Equals(vu1.state().vi[2], 0x123, "XTOP should move TOP into the target VI register");
@@ -809,7 +1108,7 @@ void register_ps2_vu1_tests()
             writeVuInstructionPair(fx.code, 16u, makeVuIaddiu(2u, 0u, 99), kVuUpperNop);    // skipped
             writeVuInstructionPair(fx.code, 24u, makeVuIaddiu(3u, 0u, 7), kVuUpperNop);     // branch target
 
-            VU1Interpreter vu1;
+            VuUnit vu1;
             vu1.execute(fx.code, PS2_VU1_CODE_SIZE, fx.data, PS2_VU1_DATA_SIZE, fx.gs, &fx.mem, 0u, 0u, 0u, 3u);
 
             t.Equals(vu1.state().vi[1], 1, "branch delay slot should execute");
@@ -831,7 +1130,7 @@ void register_ps2_vu1_tests()
             writeVuInstructionPair(fx.code, 24u, makeVuIaddiu(4u, 0u, 99), kVuUpperNop);
             writeVuInstructionPair(fx.code, 32u, makeVuIaddiu(5u, 0u, 7), kVuUpperNop);
 
-            VU1Interpreter vu1;
+            VuUnit vu1;
             vu1.state().vi[1] = 5;
             vu1.state().vi[2] = 5;
             vu1.execute(fx.code, PS2_VU1_CODE_SIZE, fx.data, PS2_VU1_DATA_SIZE,
@@ -855,7 +1154,7 @@ void register_ps2_vu1_tests()
             writeVuInstructionPair(fx.code, 32u, makeVuIaddiu(6u, 0u, 99), kVuUpperNop);
             writeVuInstructionPair(fx.code, 40u, makeVuIaddiu(7u, 0u, 7), kVuUpperNop);
 
-            VU1Interpreter vu1;
+            VuUnit vu1;
             const uint32_t lanes[4] = {
                 0x00000045u, 0x00000000u, 0x00000000u, 0x00000000u};
             std::memcpy(vu1.state().vf[7], lanes, sizeof(lanes));
@@ -883,7 +1182,7 @@ void register_ps2_vu1_tests()
                                    makeVuSq(0xFu, 1u, 1u, 0),                 // SQ.xyzw vf1, 0(vi1)
                                    makeVuUpper(0x28u, 0xFu, 3u, 2u, 1u));     // ADD.xyzw vf1, vf2, vf3
 
-            VU1Interpreter vu1;
+            VuUnit vu1;
             vu1.state().vi[1] = 6;
             vu1.state().vf[1][0] = 1.0f;
             vu1.state().vf[1][1] = 2.0f;
@@ -923,7 +1222,7 @@ void register_ps2_vu1_tests()
             writeVuInstructionPair(fx.code, 24u, makeVuSqrt(3u, 3u), kVuUpperNop);         // Q = sqrt(abs(vf3.w))
             writeVuInstructionPair(fx.code, 32u, makeVuWaitQ(), makeVuUpper(0x1Cu, 0x8u, 0u, 5u, 7u)); // vf7.x = vf5.x * SQRT Q
 
-            VU1Interpreter vu1;
+            VuUnit vu1;
             vu1.state().q = 2.0f;
             vu1.state().vf[1][1] = 18.0f;
             vu1.state().vf[2][2] = 3.0f;
@@ -957,7 +1256,7 @@ void register_ps2_vu1_tests()
             for (uint32_t pc = 8u; pc <= 56u; pc += 8u)
                 writeVuInstructionPair(fx.code, pc, 0u, kVuUpperNop);
 
-            VU1Interpreter vu1;
+            VuUnit vu1;
             vu1.state().q = 3.0f;
             vu1.state().vf[1][0] = 18.0f;
             vu1.state().vf[2][0] = 3.0f;
@@ -974,7 +1273,7 @@ void register_ps2_vu1_tests()
             Vu1Fixture fx;
             t.IsTrue(fx.initialize(), "VU1 fixture should initialize");
 
-            VU1Interpreter vu1;
+            VuUnit vu1;
             fx.mem.setVu1MscalCallback([&](uint32_t startPC, uint32_t top, uint32_t itop)
             {
                 vu1.execute(fx.code,
@@ -1005,7 +1304,7 @@ void register_ps2_vu1_tests()
             Vu1Fixture fx;
             t.IsTrue(fx.initialize(), "VU1 fixture should initialize");
 
-            VU1Interpreter vu1;
+            VuUnit vu1;
             fx.mem.write64(PS2_VU1_CODE_BASE, packVuInstructionPair(makeVuIaddiu(1u, 0u, 1), kVuUpperNop));
             vu1.execute(fx.code, PS2_VU1_CODE_SIZE, fx.data, PS2_VU1_DATA_SIZE, fx.gs, &fx.mem, 0u, 0u, 0u, 1u);
             t.Equals(vu1.state().vi[1], 1, "first execution should use the original direct write");
@@ -1051,7 +1350,7 @@ void register_ps2_vu1_tests()
             const uint32_t upper = kVuUpperEnd;
             std::memcpy(vuCode + 4u, &upper, sizeof(upper));
 
-            VU1Interpreter vu1;
+            VuUnit vu1;
             vu1.state().vi[1] = static_cast<int32_t>(kLastQw);
             vu1.execute(vuCode,
                         PS2_VU1_CODE_SIZE,
@@ -1098,7 +1397,7 @@ void register_ps2_vu1_tests()
             writeVuInstructionPair(
                 fx.code, 0u, makeVuLowerSpecial(0x6Cu, 0u), kVuUpperNop);
 
-            VU1Interpreter vu1;
+            VuUnit vu1;
             vu1.execute(fx.code, PS2_VU1_CODE_SIZE,
                         fx.data, PS2_VU1_DATA_SIZE,
                         fx.gs, &fx.mem, 0u, 0u, 0u, 1u);
@@ -1186,14 +1485,14 @@ void register_ps2_vu1_tests()
             configure(singleFixture);
             configure(splitFixture);
 
-            VU1Interpreter single;
-            VU1Interpreter split;
+            VuUnit single;
+            VuUnit split;
             single.start(0u, 0x123u, 0x2ABu,
                          &singleFixture.mem);
             split.start(0u, 0x123u, 0x2ABu,
                         &splitFixture.mem);
 
-            const VU1AdvanceResult singleResult =
+            const VuRunResult singleResult =
                 single.advance(
                     singleFixture.code, PS2_VU1_CODE_SIZE,
                     singleFixture.data, PS2_VU1_DATA_SIZE,
@@ -1203,7 +1502,7 @@ void register_ps2_vu1_tests()
             for (const uint32_t budget :
                  std::array<uint32_t, 4>{1u, 2u, 2u, 7u})
             {
-                const VU1AdvanceResult result =
+                const VuRunResult result =
                     split.advance(
                         splitFixture.code, PS2_VU1_CODE_SIZE,
                         splitFixture.data, PS2_VU1_DATA_SIZE,
@@ -1280,7 +1579,7 @@ void register_ps2_vu1_tests()
             writeVuInstructionPair(
                 fx.code, 0u, makeVuLowerSpecial(0x6Cu, 0u), kVuUpperNop);
 
-            VU1Interpreter vu1;
+            VuUnit vu1;
             vu1.execute(fx.code, PS2_VU1_CODE_SIZE,
                         fx.data, PS2_VU1_DATA_SIZE,
                         fx.gs, &fx.mem, 0u, 0u, 0u, 4u);
@@ -1310,7 +1609,7 @@ void register_ps2_vu1_tests()
             writeVuInstructionPair(
                 fx.code, 0u, makeVuLowerSpecial(0x6Cu, 0u), kVuUpperEnd);
 
-            VU1Interpreter vu1;
+            VuUnit vu1;
             vu1.execute(fx.code, PS2_VU1_CODE_SIZE,
                         fx.data, PS2_VU1_DATA_SIZE,
                         fx.gs, &fx.mem, 0u, 0u, 0u, 2u);
@@ -1363,7 +1662,7 @@ void register_ps2_vu1_tests()
                 vuData[16u + i] = static_cast<uint8_t>(0x90u + i);
             }
 
-            VU1Interpreter vu1;
+            VuUnit vu1;
             mem.setVu1MscalCallback([&](uint32_t startPC, uint32_t top, uint32_t itop)
             {
                 vu1.execute(vuCode,

@@ -289,7 +289,7 @@ int main(int argc, char **argv)
     std::memcpy(memory.getVU1Code(), micro.data(), vuSize);
     std::memcpy(memory.getVU1Data(), initialData.data(), vuSize);
 
-    VU1Interpreter interpreter;
+    VuUnit interpreter;
     VuExecutionState &state = interpreter.state();
     size_t cursor = 5;
     std::memcpy(state.vf, stateWords.data() + cursor, sizeof(state.vf));

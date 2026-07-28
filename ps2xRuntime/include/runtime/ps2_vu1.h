@@ -5,6 +5,9 @@
 #include <atomic>
 #include <cstdint>
 #include <functional>
+#include <memory>
+#include <string>
+#include <string_view>
 #include <vector>
 
 class GS;
@@ -70,12 +73,45 @@ struct VuExecutionState
     uint8_t viBackupRegister;
     int32_t viBackupValue;
 
+    bool active;
+    uint64_t issuedCycles;
+
     // Delayed architectural effects must travel with a cloned register state.
-    // Backend-owned decode/native caches and diagnostics deliberately do not.
+    // Unit-owned decode/native caches and diagnostics deliberately do not.
     VuPipelineState pipeline;
 };
 
-struct VU1ProgressSnapshot
+enum class VuBackendKind : uint8_t
+{
+    Auto,
+    Interpreter,
+    Recompiler,
+    Verify,
+};
+
+enum class VuExitReason : uint8_t
+{
+    Inactive,
+    CycleBudget,
+    ProgramEnded,
+    CodeBounds,
+    BranchBoundary,
+    XgkickBoundary,
+    DebugObserver,
+    CodeInvalidated,
+    UnsupportedInstruction,
+    Fault,
+};
+
+std::string_view vuBackendKindName(VuBackendKind kind);
+bool parseVuBackendKind(std::string_view text, VuBackendKind &kind);
+std::string_view vuExitReasonName(VuExitReason reason);
+
+using VuInstructionObserver = std::function<void(
+    uint64_t index, uint32_t pc, uint32_t lower, uint32_t upper,
+    const VuExecutionState &state)>;
+
+struct VuProgressSnapshot
 {
     bool enabled = false;
     bool active = false;
@@ -84,23 +120,53 @@ struct VU1ProgressSnapshot
     uint32_t pc = 0;
 };
 
-struct VU1AdvanceResult
+struct VuRunResult
 {
     uint32_t requestedCycles = 0;
     uint32_t executedCycles = 0;
+    VuExitReason reason = VuExitReason::Inactive;
     bool activeBefore = false;
     bool activeAfter = false;
     bool completed = false;
 };
 
-class VU1Interpreter
+class IVuSideEffectSink
 {
 public:
-    using InstructionObserver = std::function<void(
-        uint64_t index, uint32_t pc, uint32_t lower, uint32_t upper,
-        const VuExecutionState &state)>;
+    virtual ~IVuSideEffectSink() = default;
+    virtual void submitPath1Packet(
+        const uint8_t *data, uint32_t sizeBytes) = 0;
+};
 
-    VU1Interpreter();
+struct VuExecutionContext
+{
+    VuExecutionState &state;
+    const uint8_t *code = nullptr;
+    uint32_t codeSize = 0;
+    uint8_t *data = nullptr;
+    uint32_t dataSize = 0;
+    IVuSideEffectSink &sideEffects;
+    PS2Memory *memory = nullptr;
+    bool traceBudgetBoundary = false;
+    bool enableInstrumentation = true;
+};
+
+class IVuExecutionBackend
+{
+public:
+    virtual ~IVuExecutionBackend() = default;
+    [[nodiscard]] virtual VuRunResult run(
+        VuExecutionContext &context, uint32_t maxCycles) = 0;
+    [[nodiscard]] virtual std::string_view name() const = 0;
+};
+
+class VuInterpreterBackend;
+
+class VuUnit
+{
+public:
+    VuUnit();
+    ~VuUnit();
 
     void reset();
 
@@ -110,7 +176,7 @@ public:
                uint32_t itop = 0, PS2Memory *memory = nullptr);
     void resumeState(uint32_t top = 0, uint32_t itop = 0,
                      PS2Memory *memory = nullptr);
-    [[nodiscard]] VU1AdvanceResult advance(
+    [[nodiscard]] VuRunResult advance(
         uint8_t *vuCode, uint32_t codeSize,
         uint8_t *vuData, uint32_t dataSize,
         GS &gs, PS2Memory *memory = nullptr,
@@ -127,7 +193,7 @@ public:
                 GS &gs, PS2Memory *memory = nullptr,
                 uint32_t top = 0, uint32_t itop = 0, uint32_t maxCycles = 65536);
 
-    VU1AdvanceResult continueExecution(
+    VuRunResult continueExecution(
         uint8_t *vuCode, uint32_t codeSize,
         uint8_t *vuData, uint32_t dataSize,
         GS &gs, PS2Memory *memory = nullptr,
@@ -135,17 +201,20 @@ public:
 
     VuExecutionState &state() { return m_state; }
     const VuExecutionState &state() const { return m_state; }
-    bool isActive() const { return m_active; }
-    VU1ProgressSnapshot getProgressSnapshot() const;
+    bool isActive() const { return m_state.active; }
+    VuProgressSnapshot getProgressSnapshot() const;
     void setProgressTrackingEnabled(bool enabled);
-    void setInstructionObserver(InstructionObserver observer);
+    void setInstructionObserver(VuInstructionObserver observer);
     void setInstructionObserverEnabled(bool enabled);
 
+    bool setBackend(
+        VuBackendKind requested, std::string *diagnostic = nullptr);
+    VuBackendKind requestedBackend() const { return m_requestedBackend; }
+    VuBackendKind resolvedBackend() const { return m_resolvedBackend; }
+    std::string_view backendName() const;
+
 private:
-    // Phase 0 native-emitter feasibility tooling needs to drive the existing
-    // upper-lane helpers without making them part of the runtime API. Remove
-    // this friend when the production backend-neutral execution context owns
-    // the corresponding state and operations.
+    friend class VuInterpreterBackend;
     friend struct VU1NativeEmitterSpikeAccess;
 
     struct DecodedInstructionPair
@@ -157,43 +226,71 @@ private:
         bool lowerBeforeUpper = false;
     };
 
-    VuExecutionState m_state;
-    std::vector<DecodedInstructionPair> m_decodedCodeCache;
-    const uint8_t *m_cachedVuCode = nullptr;
-    const PS2Memory *m_cachedMemory = nullptr;
-    uint32_t m_cachedCodeSize = 0;
-    uint64_t m_cachedCodeGeneration = 0;
-    bool m_decodedCodeCacheValid = false;
-    std::atomic<bool> m_progressTrackingEnabled{false};
-    std::atomic<uint32_t> m_progressActive{0};
-    std::atomic<uint64_t> m_progressInvocations{0};
-    std::atomic<uint64_t> m_progressCycles{0};
-    std::atomic<uint32_t> m_progressPc{0};
-    InstructionObserver m_instructionObserver;
-    std::atomic<bool> m_instructionObserverEnabled{false};
-    PS2Memory *m_workloadProfileMemory = nullptr;
-    bool m_workloadProfileInvocationPending = false;
-    bool m_workloadProfileInvocationActive = false;
-    bool m_active = false;
+    struct InterpreterCache
+    {
+        std::vector<DecodedInstructionPair> decodedCode;
+        const uint8_t *vuCode = nullptr;
+        const PS2Memory *memory = nullptr;
+        uint32_t codeSize = 0;
+        uint64_t codeGeneration = 0;
+        bool valid = false;
+    };
 
-    [[nodiscard]] VU1AdvanceResult run(
+    [[nodiscard]] VuRunResult run(
         uint8_t *vuCode, uint32_t codeSize,
         uint8_t *vuData, uint32_t dataSize,
         GS &gs, PS2Memory *memory, uint32_t maxCycles,
         bool traceBudgetBoundary);
 
+    VuExecutionState m_state{};
+    std::atomic<bool> m_progressTrackingEnabled{false};
+    std::atomic<uint32_t> m_progressActive{0};
+    std::atomic<uint64_t> m_progressInvocations{0};
+    std::atomic<uint64_t> m_progressCycles{0};
+    std::atomic<uint32_t> m_progressPc{0};
+    VuInstructionObserver m_instructionObserver;
+    std::atomic<bool> m_instructionObserverEnabled{false};
+    PS2Memory *m_workloadProfileMemory = nullptr;
+    bool m_workloadProfileInvocationPending = false;
+    bool m_workloadProfileInvocationActive = false;
+    InterpreterCache m_interpreterCache;
+    std::unique_ptr<VuInterpreterBackend> m_interpreter;
+    IVuExecutionBackend *m_backend = nullptr;
+    VuBackendKind m_requestedBackend = VuBackendKind::Auto;
+    VuBackendKind m_resolvedBackend = VuBackendKind::Interpreter;
+};
+
+class VuInterpreterBackend final : public IVuExecutionBackend
+{
+public:
+    explicit VuInterpreterBackend(VuUnit &unit);
+
+    [[nodiscard]] VuRunResult run(
+        VuExecutionContext &context, uint32_t maxCycles) override;
+    [[nodiscard]] std::string_view name() const override;
+
+private:
+    friend struct VU1NativeEmitterSpikeAccess;
+
+    using DecodedInstructionPair = VuUnit::DecodedInstructionPair;
+
+    VuUnit &m_unit;
+    VuExecutionState *m_state = nullptr;
+
     DecodedInstructionPair decodeInstructionPair(const uint8_t *vuCode, uint32_t pc) const;
-    DecodedInstructionPair getDecodedInstructionPairForPc(const uint8_t *vuCode, uint32_t codeSize,
-                                                          PS2Memory *memory, uint32_t pc);
     void rebuildDecodedCodeCache(const uint8_t *vuCode, uint32_t codeSize,
                                  const PS2Memory *memory, uint64_t generation);
 
     void execUpper(uint32_t instr);
-    void execLower(uint32_t instr, uint8_t *vuData, uint32_t dataSize, GS &gs, PS2Memory *memory, uint32_t upperInstr);
+    void execLower(
+        uint32_t instr, uint8_t *vuData, uint32_t dataSize,
+        IVuSideEffectSink &sideEffects, PS2Memory *memory,
+        uint32_t upperInstr);
     void beginXgkick(uint32_t sourceQword, uint8_t *vuData, uint32_t dataSize,
-                     GS &gs, PS2Memory *memory);
+                     IVuSideEffectSink &sideEffects, PS2Memory *memory);
     void advanceXgkick(uint8_t *vuData, uint32_t dataSize,
-                       GS &gs, PS2Memory *memory, uint32_t cycles, bool flush);
+                       IVuSideEffectSink &sideEffects, PS2Memory *memory,
+                       uint32_t cycles, bool flush);
     void cancelXgkick();
     void advanceQPipeline();
     void flushQPipeline();

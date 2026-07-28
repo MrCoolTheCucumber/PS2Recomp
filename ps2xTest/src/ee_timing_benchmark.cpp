@@ -544,7 +544,7 @@ namespace
         prepareEventEqualWork(
             runtime, context, configuration);
 
-        const VU1ProgressSnapshot before =
+        const VuProgressSnapshot before =
             runtime.vu0().getProgressSnapshot();
         const uint64_t beforeServices =
             runtime.debugEeSchedulerSnapshot().statistics.serviced;
@@ -567,7 +567,7 @@ namespace
         const auto stopped = std::chrono::steady_clock::now();
         g_trackAllocations.store(false, std::memory_order_release);
 
-        const VU1ProgressSnapshot after =
+        const VuProgressSnapshot after =
             runtime.vu0().getProgressSnapshot();
         Measurement result{};
         result.mode = "event_scheduler_equal_work";
@@ -655,7 +655,7 @@ namespace
         PS2Runtime &runtime, R5900Context &context,
         const Configuration &configuration)
     {
-        VU1Interpreter &vu = runtime.vu0();
+        VuUnit &vu = runtime.vu0();
         vu.setProgressTrackingEnabled(true);
         startDirectVu(runtime, configuration.vuWorkload);
         for (uint64_t block = 0u;
@@ -691,7 +691,7 @@ namespace
             throw std::runtime_error("failed to initialize direct fixture");
         prepareDirect(runtime, context, configuration);
 
-        const VU1ProgressSnapshot before =
+        const VuProgressSnapshot before =
             runtime.vu0().getProgressSnapshot();
         g_allocationCount.store(0u, std::memory_order_relaxed);
         g_allocationBytes.store(0u, std::memory_order_relaxed);
@@ -710,7 +710,7 @@ namespace
         const auto stopped = std::chrono::steady_clock::now();
         g_trackAllocations.store(false, std::memory_order_release);
 
-        const VU1ProgressSnapshot after =
+        const VuProgressSnapshot after =
             runtime.vu0().getProgressSnapshot();
         Measurement result{};
         result.mode = "pre_scheduler_equal_work";

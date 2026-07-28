@@ -81,14 +81,115 @@ namespace
         uint32_t m_previousMxcsr = 0u;
 #endif
     };
+
+    class RuntimeVuSideEffectSink final : public IVuSideEffectSink
+    {
+    public:
+        RuntimeVuSideEffectSink(GS &gs, PS2Memory *memory)
+            : m_gs(gs), m_memory(memory)
+        {
+        }
+
+        void submitPath1Packet(
+            const uint8_t *data, uint32_t sizeBytes) override
+        {
+            if (m_memory)
+            {
+                m_memory->submitGifPacket(
+                    GifPathId::Path1, data, sizeBytes);
+                return;
+            }
+            m_gs.processGIFPacket(data, sizeBytes);
+        }
+
+    private:
+        GS &m_gs;
+        PS2Memory *m_memory;
+    };
 }
 
-VU1Interpreter::VU1Interpreter()
+std::string_view vuBackendKindName(VuBackendKind kind)
+{
+    switch (kind)
+    {
+    case VuBackendKind::Auto:
+        return "auto";
+    case VuBackendKind::Interpreter:
+        return "interpreter";
+    case VuBackendKind::Recompiler:
+        return "recompiler";
+    case VuBackendKind::Verify:
+        return "verify";
+    }
+    return "unknown";
+}
+
+bool parseVuBackendKind(std::string_view text, VuBackendKind &kind)
+{
+    for (const VuBackendKind candidate : {
+             VuBackendKind::Auto,
+             VuBackendKind::Interpreter,
+             VuBackendKind::Recompiler,
+             VuBackendKind::Verify,
+         })
+    {
+        if (text == vuBackendKindName(candidate))
+        {
+            kind = candidate;
+            return true;
+        }
+    }
+    return false;
+}
+
+std::string_view vuExitReasonName(VuExitReason reason)
+{
+    switch (reason)
+    {
+    case VuExitReason::Inactive:
+        return "inactive";
+    case VuExitReason::CycleBudget:
+        return "cycle-budget";
+    case VuExitReason::ProgramEnded:
+        return "program-ended";
+    case VuExitReason::CodeBounds:
+        return "code-bounds";
+    case VuExitReason::BranchBoundary:
+        return "branch-boundary";
+    case VuExitReason::XgkickBoundary:
+        return "xgkick-boundary";
+    case VuExitReason::DebugObserver:
+        return "debug-observer";
+    case VuExitReason::CodeInvalidated:
+        return "code-invalidated";
+    case VuExitReason::UnsupportedInstruction:
+        return "unsupported-instruction";
+    case VuExitReason::Fault:
+        return "fault";
+    }
+    return "unknown";
+}
+
+VuUnit::VuUnit()
+    : m_interpreter(std::make_unique<VuInterpreterBackend>(*this)),
+      m_backend(m_interpreter.get())
 {
     reset();
 }
 
-void VU1Interpreter::reset()
+VuUnit::~VuUnit() = default;
+
+VuInterpreterBackend::VuInterpreterBackend(VuUnit &unit)
+    : m_unit(unit)
+{
+}
+
+std::string_view VuInterpreterBackend::name() const
+{
+    return "interpreter";
+}
+
+void VuUnit::reset()
 {
     if (m_workloadProfileInvocationActive &&
         m_workloadProfileMemory)
@@ -107,16 +208,15 @@ void VU1Interpreter::reset()
     m_state = {};
     m_state.vf[0][3] = 1.0f; // VF0.w = 1.0
     m_state.q = 1.0f;
-    m_active = false;
     m_progressActive.store(0u, std::memory_order_relaxed);
     m_progressInvocations.store(0u, std::memory_order_relaxed);
     m_progressCycles.store(0u, std::memory_order_relaxed);
     m_progressPc.store(0u, std::memory_order_relaxed);
 }
 
-VU1ProgressSnapshot VU1Interpreter::getProgressSnapshot() const
+VuProgressSnapshot VuUnit::getProgressSnapshot() const
 {
-    VU1ProgressSnapshot snapshot{};
+    VuProgressSnapshot snapshot{};
     snapshot.enabled =
         m_progressTrackingEnabled.load(std::memory_order_relaxed);
     snapshot.active =
@@ -129,29 +229,59 @@ VU1ProgressSnapshot VU1Interpreter::getProgressSnapshot() const
     return snapshot;
 }
 
-void VU1Interpreter::setProgressTrackingEnabled(bool enabled)
+void VuUnit::setProgressTrackingEnabled(bool enabled)
 {
     m_progressTrackingEnabled.store(enabled, std::memory_order_release);
 }
 
-void VU1Interpreter::setInstructionObserver(InstructionObserver observer)
+void VuUnit::setInstructionObserver(VuInstructionObserver observer)
 {
     m_instructionObserver = std::move(observer);
     m_instructionObserverEnabled.store(
         static_cast<bool>(m_instructionObserver), std::memory_order_release);
 }
 
-void VU1Interpreter::setInstructionObserverEnabled(bool enabled)
+void VuUnit::setInstructionObserverEnabled(bool enabled)
 {
     m_instructionObserverEnabled.store(enabled, std::memory_order_release);
 }
 
-float VU1Interpreter::broadcast(const float *vf, uint8_t bc)
+bool VuUnit::setBackend(
+    VuBackendKind requested, std::string *diagnostic)
+{
+    if (m_state.active && requested != m_requestedBackend)
+    {
+        if (diagnostic)
+        {
+            *diagnostic =
+                "cannot change a VU backend while the unit is active";
+        }
+        return false;
+    }
+
+    m_requestedBackend = requested;
+    // Phase 1 establishes independent configuration and status. Until the
+    // native and verification engines exist, every mode deliberately resolves
+    // through the permanent interpreter backend.
+    m_resolvedBackend = VuBackendKind::Interpreter;
+    m_backend = m_interpreter.get();
+    if (diagnostic)
+        diagnostic->clear();
+    return true;
+}
+
+std::string_view VuUnit::backendName() const
+{
+    return m_backend ? m_backend->name() : "none";
+}
+
+float VuInterpreterBackend::broadcast(const float *vf, uint8_t bc)
 {
     return vf[bc & 3];
 }
 
-void VU1Interpreter::applyDest(float *dst, const float *result, uint8_t dest)
+void VuInterpreterBackend::applyDest(
+    float *dst, const float *result, uint8_t dest)
 {
     if (dest & 0x8)
         dst[0] = result[0]; // x
@@ -163,12 +293,16 @@ void VU1Interpreter::applyDest(float *dst, const float *result, uint8_t dest)
         dst[3] = result[3]; // w
 }
 
-void VU1Interpreter::applyDestAcc(const float *result, uint8_t dest)
+void VuInterpreterBackend::applyDestAcc(
+    const float *result, uint8_t dest)
 {
-    applyDest(m_state.acc, result, dest);
+    VuExecutionState &state = *m_state;
+    applyDest(state.acc, result, dest);
 }
 
-VU1Interpreter::DecodedInstructionPair VU1Interpreter::decodeInstructionPair(const uint8_t *vuCode, uint32_t pc) const
+VuInterpreterBackend::DecodedInstructionPair
+VuInterpreterBackend::decodeInstructionPair(
+    const uint8_t *vuCode, uint32_t pc) const
 {
     DecodedInstructionPair decoded;
     std::memcpy(&decoded.lower, vuCode + pc, sizeof(decoded.lower));
@@ -180,69 +314,27 @@ VU1Interpreter::DecodedInstructionPair VU1Interpreter::decodeInstructionPair(con
     return decoded;
 }
 
-void VU1Interpreter::rebuildDecodedCodeCache(const uint8_t *vuCode, uint32_t codeSize,
-                                             const PS2Memory *memory, uint64_t generation)
+void VuInterpreterBackend::rebuildDecodedCodeCache(
+    const uint8_t *vuCode, uint32_t codeSize,
+    const PS2Memory *memory, uint64_t generation)
 {
+    VuUnit::InterpreterCache &cache = m_unit.m_interpreterCache;
     const uint32_t pairCount = codeSize / 8u;
-    m_decodedCodeCache.resize(pairCount);
+    cache.decodedCode.resize(pairCount);
     for (uint32_t i = 0; i < pairCount; ++i)
     {
-        m_decodedCodeCache[i] = decodeInstructionPair(vuCode, i * 8u);
+        cache.decodedCode[i] =
+            decodeInstructionPair(vuCode, i * 8u);
     }
 
-    m_cachedVuCode = vuCode;
-    m_cachedMemory = memory;
-    m_cachedCodeSize = codeSize;
-    m_cachedCodeGeneration = generation;
-    m_decodedCodeCacheValid = true;
+    cache.vuCode = vuCode;
+    cache.memory = memory;
+    cache.codeSize = codeSize;
+    cache.codeGeneration = generation;
+    cache.valid = true;
 }
 
-VU1Interpreter::DecodedInstructionPair VU1Interpreter::getDecodedInstructionPairForPc(const uint8_t *vuCode,
-                                                                                      uint32_t codeSize,
-                                                                                      PS2Memory *memory,
-                                                                                      uint32_t pc)
-{
-    // Only 8-byte aligned VU instruction pairs can use the decode cache.
-    if ((pc & 7u) != 0u)
-    {
-        return decodeInstructionPair(vuCode, pc);
-    }
-
-    if (!memory)
-    {
-        return decodeInstructionPair(vuCode, pc);
-    }
-
-    uint64_t generation = 0u;
-    if (vuCode == memory->getVU0Code())
-    {
-        generation = memory->getVU0CodeGeneration();
-    }
-    else if (vuCode == memory->getVU1Code())
-    {
-        generation = memory->getVU1CodeGeneration();
-    }
-    else
-    {
-        return decodeInstructionPair(vuCode, pc);
-    }
-
-    const bool rebuild =
-        !m_decodedCodeCacheValid ||
-        m_cachedVuCode != vuCode ||
-        m_cachedMemory != memory ||
-        m_cachedCodeSize != codeSize ||
-        m_cachedCodeGeneration != generation;
-
-    if (rebuild)
-    {
-        rebuildDecodedCodeCache(vuCode, codeSize, memory, generation);
-    }
-
-    return m_decodedCodeCache[pc / 8u];
-}
-
-void VU1Interpreter::start(
+void VuUnit::start(
     uint32_t startPC, uint32_t top, uint32_t itop,
     PS2Memory *memory)
 {
@@ -269,12 +361,13 @@ void VU1Interpreter::start(
     m_state.vf[0][1] = 0.0f;
     m_state.vf[0][2] = 0.0f;
     m_state.vf[0][3] = 1.0f;
-    m_active = true;
+    m_state.active = true;
+    m_state.issuedCycles = 0u;
     if (memory && memory->isVif1DmaTraceActive())
         memory->traceVu1Invocation(m_state.pc, top, itop, false, m_state);
 }
 
-void VU1Interpreter::resumeState(
+void VuUnit::resumeState(
     uint32_t top, uint32_t itop, PS2Memory *memory)
 {
     if (m_workloadProfileInvocationActive &&
@@ -288,20 +381,22 @@ void VU1Interpreter::resumeState(
     m_state.ebit = false;
     m_state.top = top;
     m_state.itop = itop;
-    m_active = true;
+    m_state.active = true;
+    m_state.issuedCycles = 0u;
     if (memory && memory->isVif1DmaTraceActive())
         memory->traceVu1Invocation(m_state.pc, top, itop, true, m_state);
 }
 
-VU1AdvanceResult VU1Interpreter::advance(
+VuRunResult VuUnit::advance(
     uint8_t *vuCode, uint32_t codeSize,
     uint8_t *vuData, uint32_t dataSize,
     GS &gs, PS2Memory *memory, uint32_t maxCycles)
 {
-    if (!m_active)
+    if (!m_state.active)
     {
-        return VU1AdvanceResult{
+        return VuRunResult{
             .requestedCycles = maxCycles,
+            .reason = VuExitReason::Inactive,
             .activeBefore = false,
             .activeAfter = false,
         };
@@ -312,7 +407,7 @@ VU1AdvanceResult VU1Interpreter::advance(
         gs, memory, maxCycles, false);
 }
 
-void VU1Interpreter::execute(
+void VuUnit::execute(
     uint8_t *vuCode, uint32_t codeSize,
     uint8_t *vuData, uint32_t dataSize,
     GS &gs, PS2Memory *memory,
@@ -325,7 +420,7 @@ void VU1Interpreter::execute(
         gs, memory, maxCycles, true);
 }
 
-void VU1Interpreter::resume(
+void VuUnit::resume(
     uint8_t *vuCode, uint32_t codeSize,
     uint8_t *vuData, uint32_t dataSize,
     GS &gs, PS2Memory *memory,
@@ -337,15 +432,16 @@ void VU1Interpreter::resume(
         gs, memory, maxCycles, true);
 }
 
-VU1AdvanceResult VU1Interpreter::continueExecution(
+VuRunResult VuUnit::continueExecution(
     uint8_t *vuCode, uint32_t codeSize,
     uint8_t *vuData, uint32_t dataSize,
     GS &gs, PS2Memory *memory, uint32_t maxCycles)
 {
-    if (!m_active)
+    if (!m_state.active)
     {
-        return VU1AdvanceResult{
+        return VuRunResult{
             .requestedCycles = maxCycles,
+            .reason = VuExitReason::Inactive,
             .activeBefore = false,
             .activeAfter = false,
         };
@@ -355,40 +451,101 @@ VU1AdvanceResult VU1Interpreter::continueExecution(
         gs, memory, maxCycles, true);
 }
 
-VU1AdvanceResult VU1Interpreter::run(
+VuRunResult VuUnit::run(
     uint8_t *vuCode, uint32_t codeSize,
     uint8_t *vuData, uint32_t dataSize,
     GS &gs, PS2Memory *memory, uint32_t maxCycles,
     bool traceBudgetBoundary)
 {
+    RuntimeVuSideEffectSink sideEffects(gs, memory);
+    VuExecutionContext context{
+        .state = m_state,
+        .code = vuCode,
+        .codeSize = codeSize,
+        .data = vuData,
+        .dataSize = dataSize,
+        .sideEffects = sideEffects,
+        .memory = memory,
+        .traceBudgetBoundary = traceBudgetBoundary,
+        .enableInstrumentation = true,
+    };
+    // Keep the currently resolved backend call concrete. This lets the
+    // optimizer specialize the permanent interpreter's hot loop while the
+    // public execution contract remains virtual for interchangeable engines.
+    return m_interpreter->run(context, maxCycles);
+}
+
+VuRunResult VuInterpreterBackend::run(
+    VuExecutionContext &context, uint32_t maxCycles)
+{
+    VuExecutionState &state = context.state;
+    VuExecutionState *const previousState = m_state;
+    m_state = &state;
+    struct StateBindingGuard
+    {
+        VuExecutionState *&boundState;
+        VuExecutionState *previousState;
+
+        ~StateBindingGuard()
+        {
+            boundState = previousState;
+        }
+    };
+    const StateBindingGuard stateBinding{m_state, previousState};
+
+    if (!state.active)
+    {
+        return VuRunResult{
+            .requestedCycles = maxCycles,
+            .reason = VuExitReason::Inactive,
+            .activeBefore = false,
+            .activeAfter = false,
+        };
+    }
+
+    const uint8_t *const vuCode = context.code;
+    const uint32_t codeSize = context.codeSize;
+    uint8_t *const vuData = context.data;
+    const uint32_t dataSize = context.dataSize;
+    IVuSideEffectSink &sideEffects = context.sideEffects;
+    PS2Memory *const memory = context.memory;
+    const bool traceBudgetBoundary = context.traceBudgetBoundary;
+    const bool instrumentation = context.enableInstrumentation;
+
     // The VU performs 24-bit floating-point calculations by truncating toward
     // zero. Keep that host mode local to VU execution so callers retain their
     // own floating-point environment.
     const ScopedVuFloatMode vuFloatMode;
-    const bool traceVu1 = memory && memory->isVif1DmaTraceActive();
+    const bool traceVu1 =
+        instrumentation && memory && memory->isVif1DmaTraceActive();
     const bool profileVu1 =
-        memory &&
+        instrumentation && memory &&
         vuCode == memory->getVU1Code() &&
         memory->isVu1WorkloadProfileEnabled();
-    if (profileVu1 && m_workloadProfileInvocationPending)
+    if (profileVu1 && m_unit.m_workloadProfileInvocationPending)
     {
-        memory->beginVu1WorkloadProfileInvocation(m_state.pc);
-        m_workloadProfileMemory = memory;
-        m_workloadProfileInvocationPending = false;
-        m_workloadProfileInvocationActive = true;
+        memory->beginVu1WorkloadProfileInvocation(state.pc);
+        m_unit.m_workloadProfileMemory = memory;
+        m_unit.m_workloadProfileInvocationPending = false;
+        m_unit.m_workloadProfileInvocationActive = true;
     }
     const bool trackProgress =
-        m_progressTrackingEnabled.load(std::memory_order_relaxed);
+        instrumentation &&
+        m_unit.m_progressTrackingEnabled.load(std::memory_order_relaxed);
     uint32_t committedProgressCycles = 0u;
+    VuUnit::InterpreterCache &cache = m_unit.m_interpreterCache;
     if (trackProgress)
     {
-        m_progressActive.fetch_add(1u, std::memory_order_relaxed);
-        m_progressInvocations.fetch_add(1u, std::memory_order_relaxed);
-        m_progressPc.store(m_state.pc, std::memory_order_relaxed);
+        m_unit.m_progressActive.fetch_add(1u, std::memory_order_relaxed);
+        m_unit.m_progressInvocations.fetch_add(
+            1u, std::memory_order_relaxed);
+        m_unit.m_progressPc.store(
+            state.pc, std::memory_order_relaxed);
     }
     struct ProgressGuard
     {
-        VU1Interpreter &interpreter;
+        VuUnit &unit;
+        VuExecutionState &state;
         bool enabled;
         uint32_t &executed;
         uint32_t &committed;
@@ -401,55 +558,99 @@ VU1AdvanceResult VU1Interpreter::run(
             }
             if (executed > committed)
             {
-                interpreter.m_progressCycles.fetch_add(
+                unit.m_progressCycles.fetch_add(
                     executed - committed, std::memory_order_relaxed);
             }
-            interpreter.m_progressPc.store(
-                interpreter.m_state.pc, std::memory_order_relaxed);
-            interpreter.m_progressActive.fetch_sub(
+            unit.m_progressPc.store(
+                state.pc, std::memory_order_relaxed);
+            unit.m_progressActive.fetch_sub(
                 1u, std::memory_order_relaxed);
         }
     };
     uint32_t executedCycles = 0u;
     ProgressGuard progress{
-        *this, trackProgress, executedCycles, committedProgressCycles};
+        m_unit, state, trackProgress,
+        executedCycles, committedProgressCycles};
     bool ended = false;
+    VuExitReason exitReason = VuExitReason::CycleBudget;
 
     for (uint32_t cycle = 0; cycle < maxCycles; ++cycle)
     {
-        if (m_state.pc + 8 > codeSize)
+        if (state.pc + 8 > codeSize)
         {
-            m_active = false;
+            state.active = false;
+            exitReason = VuExitReason::CodeBounds;
             break;
         }
 
-        const uint32_t issuedPc = m_state.pc;
-        const DecodedInstructionPair decoded = getDecodedInstructionPairForPc(vuCode, codeSize, memory, issuedPc);
-        if (traceVu1)
-            memory->traceVu1Instruction(issuedPc, decoded.lower, decoded.upper, m_state);
-        if (m_workloadProfileInvocationActive &&
-            m_workloadProfileMemory)
+        const uint32_t issuedPc = state.pc;
+        DecodedInstructionPair decoded;
+        bool decodedFromCache = false;
+        if ((issuedPc & 7u) == 0u && memory)
         {
-            m_workloadProfileMemory->
+            uint64_t generation = 0u;
+            bool cacheable = false;
+            if (vuCode == memory->getVU0Code())
+            {
+                generation = memory->getVU0CodeGeneration();
+                cacheable = true;
+            }
+            else if (vuCode == memory->getVU1Code())
+            {
+                generation = memory->getVU1CodeGeneration();
+                cacheable = true;
+            }
+
+            if (cacheable)
+            {
+                const bool rebuild =
+                    !cache.valid ||
+                    cache.vuCode != vuCode ||
+                    cache.memory != memory ||
+                    cache.codeSize != codeSize ||
+                    cache.codeGeneration != generation;
+                if (rebuild)
+                {
+                    rebuildDecodedCodeCache(
+                        vuCode, codeSize, memory, generation);
+                }
+                decoded = cache.decodedCode[issuedPc / 8u];
+                decodedFromCache = true;
+            }
+        }
+        if (!decodedFromCache)
+            decoded = decodeInstructionPair(vuCode, issuedPc);
+        if (traceVu1)
+        {
+            memory->traceVu1Instruction(
+                issuedPc, decoded.lower, decoded.upper, state);
+        }
+        if (instrumentation &&
+            m_unit.m_workloadProfileInvocationActive &&
+            m_unit.m_workloadProfileMemory)
+        {
+            m_unit.m_workloadProfileMemory->
                 recordVu1WorkloadProfileInstruction(
                     issuedPc, decoded.lower, decoded.upper);
         }
-        if (m_instructionObserverEnabled.load(std::memory_order_relaxed) &&
-            m_instructionObserver)
+        if (instrumentation &&
+            m_unit.m_instructionObserverEnabled.load(
+                std::memory_order_relaxed) &&
+            m_unit.m_instructionObserver)
         {
-            m_instructionObserver(
-                executedCycles, m_state.pc, decoded.lower, decoded.upper,
-                m_state);
+            m_unit.m_instructionObserver(
+                executedCycles, state.pc, decoded.lower, decoded.upper,
+                state);
         }
         ++executedCycles;
         if (trackProgress &&
             executedCycles - committedProgressCycles >= 256u)
         {
-            m_progressCycles.fetch_add(
+            m_unit.m_progressCycles.fetch_add(
                 executedCycles - committedProgressCycles,
                 std::memory_order_relaxed);
             committedProgressCycles = executedCycles;
-            m_progressPc.store(m_state.pc, std::memory_order_relaxed);
+            m_unit.m_progressPc.store(state.pc, std::memory_order_relaxed);
         }
 
         // DIV/SQRT results are written to Q seven cycles after issue
@@ -467,8 +668,8 @@ VU1AdvanceResult VU1Interpreter::run(
         // the pre-update VI value to a branch in the immediately following
         // instruction pair. PCSX2 models this as a two-cycle backup which is
         // aged before each subsequent pair.
-        if (m_state.viBackupCycles != 0u)
-            --m_state.viBackupCycles;
+        if (state.viBackupCycles != 0u)
+            --state.viBackupCycles;
 
         // LOI is controlled by the upper I-bit.  The lower word is the float immediate.
         // DobieStation executes the upper instruction first, then commits lower into I.
@@ -476,104 +677,126 @@ VU1AdvanceResult VU1Interpreter::run(
         {
             // LOI is special: the upper instruction sees the old I value, then LOI loads I.
             execUpper(decoded.upper);
-            std::memcpy(&m_state.i, &decoded.lower, sizeof(decoded.lower));
+            std::memcpy(&state.i, &decoded.lower, sizeof(decoded.lower));
         }
         else if (decoded.lowerBeforeUpper)
         {
             // VU upper/lower execute as a pair.  If the upper op writes a VF register
             // that the lower op reads or also writes, Dobie runs the lower side first
             // so it observes the old VF value and the upper write has priority.
-            execLower(decoded.lower, vuData, dataSize, gs, memory, decoded.upper);
+            execLower(
+                decoded.lower, vuData, dataSize,
+                sideEffects, memory, decoded.upper);
             execUpper(decoded.upper);
         }
         else
         {
             execUpper(decoded.upper);
-            execLower(decoded.lower, vuData, dataSize, gs, memory, decoded.upper);
+            if (decoded.lower != 0x00000000u &&
+                decoded.lower != 0x8000033cu)
+            {
+                execLower(
+                    decoded.lower, vuData, dataSize,
+                    sideEffects, memory, decoded.upper);
+            }
         }
 
         // Enforce VF0 invariant
-        m_state.vf[0][0] = 0.0f;
-        m_state.vf[0][1] = 0.0f;
-        m_state.vf[0][2] = 0.0f;
-        m_state.vf[0][3] = 1.0f;
+        state.vf[0][0] = 0.0f;
+        state.vf[0][1] = 0.0f;
+        state.vf[0][2] = 0.0f;
+        state.vf[0][3] = 1.0f;
         // Enforce VI0 invariant
-        m_state.vi[0] = 0;
+        state.vi[0] = 0;
 
         // PATH1 consumes one quadword per two VU cycles while the microprogram
         // continues to run and may keep producing data in the same ring buffer.
-        advanceXgkick(vuData, dataSize, gs, memory, 1u, false);
+        if (state.pipeline.xgkick.active)
+        {
+            advanceXgkick(
+                vuData, dataSize, sideEffects, memory, 1u, false);
+        }
 
-        uint32_t nextPC = m_state.pc + 8;
+        uint32_t nextPC = state.pc + 8;
         if (nextPC >= codeSize)
             nextPC = 0;
-        m_state.pc = nextPC;
+        state.pc = nextPC;
 
         // VU branch/jump has a delay slot. Branch handlers set a pending target;
         // we execute one sequential instruction before committing the branch.
-        if (m_state.branchPending)
+        if (state.branchPending)
         {
-            if (m_state.branchDelay == 0)
+            if (state.branchDelay == 0)
             {
-                m_state.pc = m_state.branchTarget & 0x3FFFu;
-                m_state.branchPending = false;
+                state.pc = state.branchTarget & 0x3FFFu;
+                state.branchPending = false;
             }
             else
             {
-                --m_state.branchDelay;
+                --state.branchDelay;
             }
         }
-        if (m_workloadProfileInvocationActive &&
-            m_workloadProfileMemory)
+        if (instrumentation &&
+            m_unit.m_workloadProfileInvocationActive &&
+            m_unit.m_workloadProfileMemory)
         {
-            m_workloadProfileMemory->
+            m_unit.m_workloadProfileMemory->
                 recordVu1WorkloadProfileTransition(
-                    issuedPc, m_state.pc);
+                    issuedPc, state.pc);
         }
 
-        if (m_state.ebit)
+        if (state.ebit)
         {
             // VU1 completion drains the pending XGKICK before becoming idle.
-            advanceXgkick(vuData, dataSize, gs, memory, 0u, true);
+            if (state.pipeline.xgkick.active)
+            {
+                advanceXgkick(
+                    vuData, dataSize, sideEffects, memory, 0u, true);
+            }
             flushQPipeline();
             flushFmacFlagPipeline();
-            m_state.viBackupCycles = 0u;
+            state.viBackupCycles = 0u;
             ended = true;
-            m_active = false;
+            state.active = false;
+            exitReason = VuExitReason::ProgramEnded;
             break;
         }
 
         if (decoded.eBit)
-            m_state.ebit = true;
+            state.ebit = true;
     }
 
     if (traceVu1 &&
-        (!m_active || traceBudgetBoundary))
+        (!state.active || traceBudgetBoundary))
     {
         memory->traceVu1InvocationEnd(
-            m_state.pc, ended, !ended && executedCycles == maxCycles,
-            m_state.vi, std::size(m_state.vi));
+            state.pc, ended, !ended && executedCycles == maxCycles,
+            state.vi, std::size(state.vi));
     }
-    if (!m_active &&
-        m_workloadProfileInvocationActive &&
-        m_workloadProfileMemory)
+    if (instrumentation &&
+        !state.active &&
+        m_unit.m_workloadProfileInvocationActive &&
+        m_unit.m_workloadProfileMemory)
     {
-        m_workloadProfileMemory->
+        m_unit.m_workloadProfileMemory->
             endVu1WorkloadProfileInvocation(ended);
-        m_workloadProfileInvocationActive = false;
+        m_unit.m_workloadProfileInvocationActive = false;
     }
-    return VU1AdvanceResult{
+    state.issuedCycles += executedCycles;
+    return VuRunResult{
         .requestedCycles = maxCycles,
         .executedCycles = executedCycles,
+        .reason = exitReason,
         .activeBefore = true,
-        .activeAfter = m_active,
-        .completed = !m_active,
+        .activeAfter = state.active,
+        .completed = !state.active,
     };
 }
 
-void VU1Interpreter::advanceQPipeline()
+void VuInterpreterBackend::advanceQPipeline()
 {
-    VuPipelineState::DelayedQ &delayedQ = m_state.pipeline.delayedQ;
+    VuExecutionState &state = *m_state;
+    VuPipelineState::DelayedQ &delayedQ = state.pipeline.delayedQ;
     if (!delayedQ.active)
         return;
 
@@ -583,28 +806,31 @@ void VU1Interpreter::advanceQPipeline()
         flushQPipeline();
 }
 
-void VU1Interpreter::flushQPipeline()
+void VuInterpreterBackend::flushQPipeline()
 {
-    VuPipelineState::DelayedQ &delayedQ = m_state.pipeline.delayedQ;
+    VuExecutionState &state = *m_state;
+    VuPipelineState::DelayedQ &delayedQ = state.pipeline.delayedQ;
     if (!delayedQ.active)
         return;
 
-    m_state.q = delayedQ.result;
+    state.q = delayedQ.result;
     delayedQ = {};
 }
 
-void VU1Interpreter::scheduleQ(float result, uint32_t latency)
+void VuInterpreterBackend::scheduleQ(float result, uint32_t latency)
 {
-    m_state.pipeline.delayedQ = {
+    VuExecutionState &state = *m_state;
+    state.pipeline.delayedQ = {
         .active = true,
         .result = result,
         .cyclesRemaining = latency,
     };
 }
 
-void VU1Interpreter::advanceFmacFlagPipeline()
+void VuInterpreterBackend::advanceFmacFlagPipeline()
 {
-    VuPipelineState &pipeline = m_state.pipeline;
+    VuExecutionState &state = *m_state;
+    VuPipelineState &pipeline = state.pipeline;
     pipeline.fmacFlagIndex = static_cast<uint8_t>(
         (pipeline.fmacFlagIndex + 1u) %
         VuPipelineState::kFmacFlagStages);
@@ -617,9 +843,10 @@ void VU1Interpreter::advanceFmacFlagPipeline()
     pending = {};
 }
 
-void VU1Interpreter::flushFmacFlagPipeline()
+void VuInterpreterBackend::flushFmacFlagPipeline()
 {
-    VuPipelineState &pipeline = m_state.pipeline;
+    VuExecutionState &state = *m_state;
+    VuPipelineState &pipeline = state.pipeline;
     // Walk from the next stage due through the stage used by the current
     // instruction pair. This commits retained results from oldest to newest.
     for (uint8_t offset = 1u;
@@ -637,20 +864,22 @@ void VU1Interpreter::flushFmacFlagPipeline()
     }
 }
 
-void VU1Interpreter::commitFmacFlags(
+void VuInterpreterBackend::commitFmacFlags(
     const VuPipelineState::FmacFlags &pending)
 {
-    m_state.mac = pending.mac;
-    m_state.status =
-        (m_state.status & 0xff0u) |
+    VuExecutionState &state = *m_state;
+    state.mac = pending.mac;
+    state.status =
+        (state.status & 0xff0u) |
         (pending.status & 0x0fu) |
         ((pending.status & 0x0fu) << 6u);
 }
 
-void VU1Interpreter::scheduleFmacFlags(
+void VuInterpreterBackend::scheduleFmacFlags(
     const float result[4], uint8_t dest, bool preserveUnselected)
 {
-    VuPipelineState &pipeline = m_state.pipeline;
+    VuExecutionState &state = *m_state;
+    VuPipelineState &pipeline = state.pipeline;
     uint32_t mac = preserveUnselected ? pipeline.workingMac : 0u;
     for (uint32_t lane = 0u; lane < 4u; ++lane)
     {
@@ -700,65 +929,73 @@ void VU1Interpreter::scheduleFmacFlags(
     };
 }
 
-void VU1Interpreter::backupVi(uint8_t reg)
+void VuInterpreterBackend::backupVi(uint8_t reg)
 {
+    VuExecutionState &state = *m_state;
     if (reg == 0u)
         return;
 
-    if (m_state.viBackupCycles != 0u && m_state.viBackupRegister == reg)
+    if (state.viBackupCycles != 0u && state.viBackupRegister == reg)
     {
         // Consecutive auto-increments retain the value from before the chain.
-        m_state.viBackupCycles = 2u;
+        state.viBackupCycles = 2u;
         return;
     }
 
-    m_state.viBackupCycles = 2u;
-    m_state.viBackupRegister = reg;
-    m_state.viBackupValue = static_cast<int16_t>(m_state.vi[reg]);
+    state.viBackupCycles = 2u;
+    state.viBackupRegister = reg;
+    state.viBackupValue = static_cast<int16_t>(state.vi[reg]);
 }
 
-int32_t VU1Interpreter::readViForBranch(uint8_t reg) const
+int32_t VuInterpreterBackend::readViForBranch(uint8_t reg) const
 {
-    if (m_state.viBackupCycles != 0u && m_state.viBackupRegister == reg)
-        return static_cast<int16_t>(m_state.viBackupValue);
-    return static_cast<int16_t>(m_state.vi[reg]);
+    const VuExecutionState &state = *m_state;
+    if (state.viBackupCycles != 0u && state.viBackupRegister == reg)
+        return static_cast<int16_t>(state.viBackupValue);
+    return static_cast<int16_t>(state.vi[reg]);
 }
 
-void VU1Interpreter::cancelXgkick()
+void VuInterpreterBackend::cancelXgkick()
 {
-    m_state.pipeline.xgkick = {};
+    VuExecutionState &state = *m_state;
+    state.pipeline.xgkick = {};
 }
 
-void VU1Interpreter::beginXgkick(uint32_t sourceQword,
-                                 uint8_t *vuData,
-                                 uint32_t dataSize,
-                                 GS &gs,
-                                 PS2Memory *memory)
+void VuInterpreterBackend::beginXgkick(uint32_t sourceQword,
+                                               uint8_t *vuData,
+                                               uint32_t dataSize,
+                                               IVuSideEffectSink &sideEffects,
+                                               PS2Memory *memory)
 {
+    VuExecutionState &state = *m_state;
     if (!vuData || dataSize < 16u)
         return;
 
     if (memory)
         memory->traceVu1Xgkick(sourceQword);
 
-    VuPipelineState::Xgkick &xgkick = m_state.pipeline.xgkick;
+    VuPipelineState::Xgkick &xgkick = state.pipeline.xgkick;
     // A second XGKICK stalls behind and drains the prior PATH1 transfer.
     if (xgkick.active)
-        advanceXgkick(vuData, dataSize, gs, memory, 0u, true);
+    {
+        advanceXgkick(
+            vuData, dataSize, sideEffects, memory, 0u, true);
+    }
 
     xgkick = {};
     xgkick.active = true;
     xgkick.address = ((sourceQword & 0x3FFu) * 16u) % dataSize;
 }
 
-void VU1Interpreter::advanceXgkick(uint8_t *vuData,
-                                   uint32_t dataSize,
-                                   GS &gs,
-                                   PS2Memory *memory,
-                                   uint32_t cycles,
-                                   bool flush)
+void VuInterpreterBackend::advanceXgkick(uint8_t *vuData,
+                                         uint32_t dataSize,
+                                         IVuSideEffectSink &sideEffects,
+                                         PS2Memory *memory,
+                                         uint32_t cycles,
+                                         bool flush)
 {
-    VuPipelineState::Xgkick &xgkick = m_state.pipeline.xgkick;
+    VuExecutionState &state = *m_state;
+    VuPipelineState::Xgkick &xgkick = state.pipeline.xgkick;
     if (!xgkick.active || !vuData || dataSize < 16u)
         return;
 
@@ -875,19 +1112,9 @@ void VU1Interpreter::advanceXgkick(uint8_t *vuData,
 
         if (xgkick.tagEop)
         {
-            if (memory)
-            {
-                memory->submitGifPacket(
-                    GifPathId::Path1,
-                    xgkick.packet.data(),
-                    static_cast<uint32_t>(xgkick.packet.size()));
-            }
-            else
-            {
-                gs.processGIFPacket(
-                    xgkick.packet.data(),
-                    static_cast<uint32_t>(xgkick.packet.size()));
-            }
+            sideEffects.submitPath1Packet(
+                xgkick.packet.data(),
+                static_cast<uint32_t>(xgkick.packet.size()));
             cancelXgkick();
             return;
         }

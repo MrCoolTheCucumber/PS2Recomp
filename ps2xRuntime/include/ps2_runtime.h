@@ -48,6 +48,13 @@ class PS2IopHostAdapter;
 class PS2IopTransport;
 class PS2DebugServer;
 
+struct PS2RuntimeConfiguration
+{
+    VuBackendKind vu0Backend = VuBackendKind::Auto;
+    VuBackendKind vu1Backend = VuBackendKind::Auto;
+    bool useVuBackendEnvironment = true;
+};
+
 enum PS2Exception
 {
     EXCEPTION_INTERRUPT = 0x00,
@@ -425,6 +432,7 @@ public:
     };
 
     PS2Runtime();
+    explicit PS2Runtime(PS2RuntimeConfiguration configuration);
     ~PS2Runtime();
 
     bool initialize(const char *title = "PS2 Game");
@@ -1039,10 +1047,10 @@ public:
     inline const GS &gs() const { return m_gs; }
     inline GifArbiter &gifArbiter() { return m_gifArbiter; }
     inline const GifArbiter &gifArbiter() const { return m_gifArbiter; }
-    inline VU1Interpreter &vu0() { return m_vu0; }
-    inline const VU1Interpreter &vu0() const { return m_vu0; }
-    inline VU1Interpreter &vu1() { return m_vu1; }
-    inline const VU1Interpreter &vu1() const { return m_vu1; }
+    inline VuUnit &vu0() { return m_vu0; }
+    inline const VuUnit &vu0() const { return m_vu0; }
+    inline VuUnit &vu1() { return m_vu1; }
+    inline const VuUnit &vu1() const { return m_vu1; }
 
     inline PS2AudioBackend &audioBackend() { return m_audioBackend; }
     inline const PS2AudioBackend &audioBackend() const { return m_audioBackend; }
@@ -1307,8 +1315,8 @@ private:
     std::unique_ptr<ps2x::iop::IopSubsystem> m_iopSubsystem;
     PS2AudioBackend m_audioBackend;
     PSPadBackend m_padBackend;
-    VU1Interpreter m_vu0;
-    VU1Interpreter m_vu1;
+    VuUnit m_vu0;
+    VuUnit m_vu1;
     ps2x::timing::Cop0Timing m_cop0Timing;
     ps2x::timing::EeTimeline m_eeTimeline;
     ps2x::timing::EeEventScheduler m_eeEventScheduler;

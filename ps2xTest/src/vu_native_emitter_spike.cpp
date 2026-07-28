@@ -34,7 +34,14 @@
 
 struct VU1NativeEmitterSpikeAccess
 {
-    static void prepare(VU1Interpreter &interpreter,
+    static VuInterpreterBackend &backend(VuUnit &unit)
+    {
+        VuInterpreterBackend &backend = *unit.m_interpreter;
+        backend.m_state = &unit.m_state;
+        return backend;
+    }
+
+    static void prepare(VuUnit &interpreter,
                         const VuExecutionState &initialState)
     {
         interpreter.reset();
@@ -44,25 +51,26 @@ struct VU1NativeEmitterSpikeAccess
         interpreter.m_state.pipeline.workingMac = initialState.mac;
     }
 
-    static void advanceFmac(VU1Interpreter &interpreter)
+    static void advanceFmac(VuUnit &interpreter)
     {
-        interpreter.advanceFmacFlagPipeline();
+        backend(interpreter).advanceFmacFlagPipeline();
     }
 
-    static void executeUpper(VU1Interpreter &interpreter, uint32_t upper)
+    static void executeUpper(VuUnit &interpreter, uint32_t upper)
     {
-        interpreter.execUpper(upper);
+        backend(interpreter).execUpper(upper);
     }
 
-    static void scheduleFmac(VU1Interpreter &interpreter,
+    static void scheduleFmac(VuUnit &interpreter,
                              const float result[4], uint8_t destination)
     {
-        interpreter.scheduleFmacFlags(result, destination, false);
+        backend(interpreter).scheduleFmacFlags(
+            result, destination, false);
     }
 
-    static void flushFmac(VU1Interpreter &interpreter)
+    static void flushFmac(VuUnit &interpreter)
     {
-        interpreter.flushFmacFlagPipeline();
+        backend(interpreter).flushFmacFlagPipeline();
     }
 };
 
@@ -99,7 +107,7 @@ namespace
 
     struct alignas(16) SpikeContext
     {
-        VU1Interpreter *interpreter = nullptr;
+        VuUnit *interpreter = nullptr;
         VuExecutionState *state = nullptr;
         uint32_t nextPair = 0u;
         uint32_t remainingPairs = 0u;
@@ -519,7 +527,7 @@ namespace
 
         CapturedBlock block;
         bool capturedInitialState = false;
-        VU1Interpreter interpreter;
+        VuUnit interpreter;
         interpreter.state() = decodeFixtureState(stateWords);
         interpreter.setInstructionObserver(
             [&](uint64_t index, uint32_t pc, uint32_t, uint32_t upper,
@@ -615,7 +623,7 @@ namespace
         };
     }
 
-    SpikeContext makeContext(VU1Interpreter &interpreter)
+    SpikeContext makeContext(VuUnit &interpreter)
     {
         SpikeContext context;
         context.interpreter = &interpreter;
@@ -624,7 +632,7 @@ namespace
         return context;
     }
 
-    void runDirect(VU1Interpreter &interpreter,
+    void runDirect(VuUnit &interpreter,
                    const std::vector<uint32_t> &upper,
                    uint32_t pairCount)
     {
@@ -648,7 +656,7 @@ namespace
         uint64_t expectedHash = 0u;
         for (uint32_t sample = 0u; sample < samples; ++sample)
         {
-            VU1Interpreter interpreter;
+            VuUnit interpreter;
             VU1NativeEmitterSpikeAccess::prepare(
                 interpreter, block.initialState);
             const auto begin = Clock::now();
@@ -676,7 +684,7 @@ namespace
         uint64_t expectedHash = 0u;
         for (uint32_t sample = 0u; sample < samples; ++sample)
         {
-            VU1Interpreter interpreter;
+            VuUnit interpreter;
             VU1NativeEmitterSpikeAccess::prepare(
                 interpreter, block.initialState);
             SpikeContext context = makeContext(interpreter);
@@ -713,7 +721,7 @@ namespace
         uint32_t expectedNextPair = 0u;
         for (uint32_t sample = 0u; sample < samples; ++sample)
         {
-            VU1Interpreter interpreter;
+            VuUnit interpreter;
             VU1NativeEmitterSpikeAccess::prepare(
                 interpreter, block.initialState);
             SpikeContext context = makeContext(interpreter);
@@ -946,7 +954,7 @@ int main(int argc, char **argv)
         const Distribution inlineCompile = summarize(
             measureCompilation(block.upper, true, compileSamples));
 
-        VU1Interpreter abiInterpreter;
+        VuUnit abiInterpreter;
         VU1NativeEmitterSpikeAccess::prepare(
             abiInterpreter, block.initialState);
         SpikeContext abiContext = makeContext(abiInterpreter);
@@ -978,14 +986,14 @@ int main(int argc, char **argv)
 
         // Touch each path before collecting samples.
         {
-            VU1Interpreter warmupInterpreter;
+            VuUnit warmupInterpreter;
             VU1NativeEmitterSpikeAccess::prepare(
                 warmupInterpreter, block.initialState);
             runDirect(warmupInterpreter, block.upper,
                       static_cast<uint32_t>(block.upper.size() * 100u));
         }
         {
-            VU1Interpreter warmupInterpreter;
+            VuUnit warmupInterpreter;
             VU1NativeEmitterSpikeAccess::prepare(
                 warmupInterpreter, block.initialState);
             SpikeContext context = makeContext(warmupInterpreter);
@@ -994,7 +1002,7 @@ int main(int argc, char **argv)
             helperBlock->function()(&context);
         }
         {
-            VU1Interpreter warmupInterpreter;
+            VuUnit warmupInterpreter;
             VU1NativeEmitterSpikeAccess::prepare(
                 warmupInterpreter, block.initialState);
             SpikeContext context = makeContext(warmupInterpreter);
@@ -1023,7 +1031,7 @@ int main(int argc, char **argv)
             block, helperBlock->function(), sideExits, sideSamples);
         const SideExitPath inlineSide = measureSideExits(
             block, inlineBlock->function(), sideExits, sideSamples);
-        VU1Interpreter sideReference;
+        VuUnit sideReference;
         VU1NativeEmitterSpikeAccess::prepare(
             sideReference, block.initialState);
         runDirect(sideReference, block.upper, sideExits);

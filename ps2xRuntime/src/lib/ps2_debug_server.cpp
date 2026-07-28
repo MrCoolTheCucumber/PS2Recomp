@@ -627,9 +627,9 @@ struct PS2DebugServer::Impl
         const PS2Runtime::DebugRuntimeProgress core =
             runtime.debugRuntimeProgress();
         const GSProgressSnapshot gs = runtime.gs().getProgressSnapshot();
-        const VU1ProgressSnapshot vu0 =
+        const VuProgressSnapshot vu0 =
             runtime.vu0().getProgressSnapshot();
-        const VU1ProgressSnapshot vu1 =
+        const VuProgressSnapshot vu1 =
             runtime.vu1().getProgressSnapshot();
         const auto threads = ps2_syscalls::debugThreadSnapshots();
 
@@ -718,9 +718,9 @@ struct PS2DebugServer::Impl
             runtime.debugRuntimeProgress();
         const GSProgressSnapshot gsProgress =
             runtime.gs().getProgressSnapshot();
-        const VU1ProgressSnapshot vu0Progress =
+        const VuProgressSnapshot vu0Progress =
             runtime.vu0().getProgressSnapshot();
-        const VU1ProgressSnapshot vu1Progress =
+        const VuProgressSnapshot vu1Progress =
             runtime.vu1().getProgressSnapshot();
         Value result(rapidjson::kObjectType);
         addString(result, "backend", "recomp", allocator);
@@ -759,6 +759,28 @@ struct PS2DebugServer::Impl
         progress.AddMember("vu0_cycles", vu0Progress.cycles, allocator);
         progress.AddMember("vu1_cycles", vu1Progress.cycles, allocator);
         result.AddMember("progress", progress, allocator);
+
+        const auto vuBackendStatus =
+            [&](const VuUnit &unit)
+        {
+            Value value(rapidjson::kObjectType);
+            addString(
+                value, "requested",
+                vuBackendKindName(unit.requestedBackend()), allocator);
+            addString(
+                value, "resolved",
+                vuBackendKindName(unit.resolvedBackend()), allocator);
+            addString(value, "name", unit.backendName(), allocator);
+            value.AddMember("active", unit.isActive(), allocator);
+            return value;
+        };
+        Value vuBackends(rapidjson::kObjectType);
+        vuBackends.AddMember(
+            "vu0", vuBackendStatus(runtime.vu0()), allocator);
+        vuBackends.AddMember(
+            "vu1", vuBackendStatus(runtime.vu1()), allocator);
+        result.AddMember("vu_backends", vuBackends, allocator);
+
         const Vu1WorkloadProfileSnapshot vu1Profile =
             runtime.memory().vu1WorkloadProfileSnapshot();
         Value profile(rapidjson::kObjectType);
