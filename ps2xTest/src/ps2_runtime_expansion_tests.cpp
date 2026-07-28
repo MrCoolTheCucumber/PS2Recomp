@@ -6578,7 +6578,11 @@ void register_ps2_runtime_expansion_tests()
 
         tc.Run("VU0 sync trace may wait for an EE PC trigger", [](TestCase &t)
         {
-            PS2Runtime runtime;
+            PS2RuntimeConfiguration configuration{};
+            configuration.vu0Backend = VuBackendKind::Interpreter;
+            configuration.vu1Backend = VuBackendKind::Interpreter;
+            configuration.useVuBackendEnvironment = false;
+            PS2Runtime runtime(configuration);
             t.IsTrue(runtime.memory().initialize(), "PS2Memory initialize should succeed");
             t.IsTrue(runtime.syncCoreSubsystems(), "runtime core subsystems should bind");
 
@@ -6684,7 +6688,11 @@ void register_ps2_runtime_expansion_tests()
 
         tc.Run("VU0 instruction trace captures raw state after an EE PC trigger", [](TestCase &t)
         {
-            PS2Runtime runtime;
+            PS2RuntimeConfiguration configuration{};
+            configuration.vu0Backend = VuBackendKind::Interpreter;
+            configuration.vu1Backend = VuBackendKind::Interpreter;
+            configuration.useVuBackendEnvironment = false;
+            PS2Runtime runtime(configuration);
             t.IsTrue(runtime.memory().initialize(), "PS2Memory initialize should succeed");
             t.IsTrue(runtime.syncCoreSubsystems(), "runtime core subsystems should bind");
 
