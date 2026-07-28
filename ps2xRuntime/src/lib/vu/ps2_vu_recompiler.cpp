@@ -2913,11 +2913,20 @@ VuRunResult VuRecompilerBackend::run(
         ++m_diagnostics.faultExits;
         return finish(0u, VuExitReason::Fault);
     }
+    uint32_t totalExecuted = 0u;
+    VuUnit::ProgressTracker progress(
+        m_unit, state,
+        context.enableInstrumentation &&
+            context.enableProgressAccounting,
+        totalExecuted);
     if (needsInterpreterInstrumentation(context))
     {
         ++m_diagnostics.interpreterInstrumentationFallbacks;
-        return runInterpreterFallback(
+        VuRunResult result = runInterpreterFallback(
             context, maximumCycles);
+        totalExecuted = result.executedCycles;
+        progress.publish();
+        return result;
     }
     if (maximumCycles == 0u)
     {
@@ -2926,7 +2935,6 @@ VuRunResult VuRecompilerBackend::run(
     }
 
     const ScopedVuFloatMode vuFloatMode;
-    uint32_t totalExecuted = 0u;
     while (state.active && totalExecuted < maximumCycles)
     {
         VuProgramKey key;
@@ -3004,6 +3012,7 @@ VuRunResult VuRecompilerBackend::run(
         m_diagnostics.helperPairs += helperPairs;
         m_diagnostics.inlinePairs +=
             native.executedCycles - helperPairs;
+        progress.publish();
 
         const uint64_t currentGeneration =
             key.unit == VuUnitId::Vu0
@@ -3064,8 +3073,10 @@ VuRunResult VuRecompilerBackend::runInterpreterFallback(
     VuExecutionContext &context,
     uint32_t maximumCycles)
 {
+    VuExecutionContext fallbackContext = context;
+    fallbackContext.enableProgressAccounting = false;
     VuRunResult result =
-        m_semantics.run(context, maximumCycles);
+        m_semantics.run(fallbackContext, maximumCycles);
     m_diagnostics.interpreterFallbackPairs +=
         result.executedCycles;
     return result;
@@ -3443,11 +3454,6 @@ bool VuRecompilerBackend::needsInterpreterInstrumentation(
     if (m_unit.m_instructionObserverEnabled.load(
             std::memory_order_relaxed) &&
         m_unit.m_instructionObserver)
-    {
-        return true;
-    }
-    if (m_unit.m_progressTrackingEnabled.load(
-            std::memory_order_relaxed))
     {
         return true;
     }

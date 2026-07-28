@@ -66,6 +66,12 @@ keeps VIF completion timing independent of native block boundaries. Changing a
 request while a unit is active is rejected and leaves the previous selection
 intact.
 
+Aggregate debugger progress wraps the complete scheduler-facing unit call, so
+internal native entries and one-pair interpreter fallbacks do not double-count
+cycles or invocations. Progress tracking alone does not request per-pair
+instrumentation and therefore does not move supported native work back to the
+interpreter.
+
 `system.status` exposes `vu_backends.vu0` and `vu_backends.vu1`, including each
 unit's requested mode, resolved mode, backend name, and active state. At a
 debugger pause boundary, the GameThread or the quiescent guest-execution lock

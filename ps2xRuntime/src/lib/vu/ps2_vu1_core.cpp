@@ -367,6 +367,56 @@ void VuUnit::setProgressTrackingEnabled(bool enabled)
     m_progressTrackingEnabled.store(enabled, std::memory_order_release);
 }
 
+VuUnit::ProgressTracker::ProgressTracker(
+    VuUnit &unit, VuExecutionState &state,
+    bool enabled, uint32_t &executedCycles)
+    : m_unit(unit),
+      m_state(state),
+      m_executedCycles(executedCycles),
+      m_enabled(
+          enabled &&
+          unit.m_progressTrackingEnabled.load(
+              std::memory_order_relaxed))
+{
+    if (!m_enabled)
+        return;
+
+    m_unit.m_progressActive.fetch_add(
+        1u, std::memory_order_relaxed);
+    m_unit.m_progressInvocations.fetch_add(
+        1u, std::memory_order_relaxed);
+    m_unit.m_progressPc.store(
+        m_state.pc, std::memory_order_relaxed);
+}
+
+VuUnit::ProgressTracker::~ProgressTracker()
+{
+    if (!m_enabled)
+        return;
+
+    publish();
+    m_unit.m_progressPc.store(
+        m_state.pc, std::memory_order_relaxed);
+    m_unit.m_progressActive.fetch_sub(
+        1u, std::memory_order_relaxed);
+}
+
+void VuUnit::ProgressTracker::publish()
+{
+    if (!m_enabled ||
+        m_executedCycles <= m_committedCycles)
+    {
+        return;
+    }
+
+    m_unit.m_progressCycles.fetch_add(
+        m_executedCycles - m_committedCycles,
+        std::memory_order_relaxed);
+    m_committedCycles = m_executedCycles;
+    m_unit.m_progressPc.store(
+        m_state.pc, std::memory_order_relaxed);
+}
+
 void VuUnit::setInstructionObserver(VuInstructionObserver observer)
 {
     m_instructionObserver = std::move(observer);
@@ -673,9 +723,12 @@ VuRunResult VuUnit::runRecompiler(
         .memory = memory,
         .traceBudgetBoundary = traceBudgetBoundary,
         .enableInstrumentation = true,
+        .enableProgressAccounting = false,
     };
     const bool activeBefore = m_state.active;
     uint32_t executedCycles = 0u;
+    ProgressTracker progress(
+        *this, m_state, true, executedCycles);
     const auto finish =
         [&](VuRunResult result)
         {
@@ -694,6 +747,7 @@ VuRunResult VuUnit::runRecompiler(
                 context,
                 maxCycles - executedCycles);
         executedCycles += result.executedCycles;
+        progress.publish();
         if (result.reason ==
             VuExitReason::XgkickBoundary)
         {
@@ -713,6 +767,7 @@ VuRunResult VuUnit::runRecompiler(
         result = m_recompiler->
             runInterpreterFallback(context, 1u);
         executedCycles += result.executedCycles;
+        progress.publish();
         if (result.executedCycles != 1u)
         {
             result.reason = VuExitReason::Fault;
@@ -792,7 +847,8 @@ VuRunResult VuInterpreterBackend::run(
     }
     const bool trackProgress =
         instrumentation &&
-        m_unit.m_progressTrackingEnabled.load(std::memory_order_relaxed);
+        m_unit.m_progressTrackingEnabled.load(std::memory_order_relaxed) &&
+        context.enableProgressAccounting;
     uint32_t committedProgressCycles = 0u;
     VuUnit::InterpreterCache &cache = m_unit.m_interpreterCache;
     if (trackProgress)
@@ -911,7 +967,8 @@ VuRunResult VuInterpreterBackend::run(
                 executedCycles - committedProgressCycles,
                 std::memory_order_relaxed);
             committedProgressCycles = executedCycles;
-            m_unit.m_progressPc.store(state.pc, std::memory_order_relaxed);
+            m_unit.m_progressPc.store(
+                state.pc, std::memory_order_relaxed);
         }
 
         // DIV/SQRT results are written to Q seven cycles after issue

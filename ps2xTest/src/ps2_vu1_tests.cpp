@@ -865,6 +865,80 @@ void register_ps2_vu1_tests()
                 "selected native execution should populate the unit cache");
         });
 
+        tc.Run("VU1 progress tracking preserves native execution", [](TestCase &t)
+        {
+            if (!VuRecompilerBackend::supported())
+                return;
+
+            Vu1Fixture fx;
+            t.IsTrue(fx.initialize(),
+                     "VU1 progress fixture should initialize");
+            writeVuInstructionPair(
+                fx.code, 0u,
+                makeVuIaddiu(1u, 0u, 7),
+                kVuUpperEnd);
+            writeVuInstructionPair(
+                fx.code, 8u,
+                makeVuIaddiu(2u, 0u, 9),
+                kVuUpperNop);
+            fx.mem.markVU1CodeModified();
+
+            VuUnit unit(VuUnitId::Vu1);
+            std::string diagnostic;
+            t.IsTrue(
+                unit.setBackend(
+                    VuBackendKind::Recompiler,
+                    &diagnostic),
+                "supported explicit VU1 recompiler should resolve");
+            unit.setProgressTrackingEnabled(true);
+            unit.start(0u, 0u, 0u, &fx.mem);
+
+            const VuRunResult result = unit.advance(
+                fx.code, PS2_VU1_CODE_SIZE,
+                fx.data, PS2_VU1_DATA_SIZE,
+                fx.gs, &fx.mem, 2u);
+            t.IsTrue(
+                result.reason == VuExitReason::ProgramEnded,
+                "the progress-tracked native run should complete");
+            t.Equals(
+                result.executedCycles, uint32_t{2u},
+                "the progress-tracked run should retain exact cycles");
+
+            const VuProgressSnapshot progress =
+                unit.getProgressSnapshot();
+            t.IsTrue(progress.enabled,
+                     "progress tracking should remain enabled");
+            t.IsFalse(progress.active,
+                      "the completed native run should be quiescent");
+            t.Equals(progress.invocations, uint64_t{1u},
+                     "one unit run should be one progress invocation");
+            t.Equals(progress.cycles, uint64_t{2u},
+                     "native progress should count exact retired pairs");
+            t.Equals(progress.pc, uint32_t{16u},
+                     "native progress should publish the completion PC");
+
+            const VuRecompilerDiagnostics *const diagnostics =
+                unit.recompilerDiagnosticsIfCreated();
+            t.IsNotNull(
+                diagnostics,
+                "the native run should expose recompiler diagnostics");
+            if (diagnostics)
+            {
+                t.Equals(
+                    diagnostics->nativePairs,
+                    uint64_t{2u},
+                    "progress tracking must not disable native pairs");
+                t.Equals(
+                    diagnostics->interpreterInstrumentationFallbacks,
+                    uint64_t{0u},
+                    "aggregate progress is not per-pair instrumentation");
+                t.Equals(
+                    diagnostics->interpreterFallbackPairs,
+                    uint64_t{0u},
+                    "supported pairs should not use interpreter fallback");
+            }
+        });
+
         tc.Run("VU1 unit adapter resumes native execution after an unsupported pair", [](TestCase &t)
         {
             if (!VuRecompilerBackend::supported())

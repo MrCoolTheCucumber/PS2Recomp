@@ -183,6 +183,9 @@ struct VuExecutionContext
     PS2Memory *memory = nullptr;
     bool traceBudgetBoundary = false;
     bool enableInstrumentation = true;
+    // False when an outer unit adapter owns aggregate progress for nested
+    // backend entries and interpreter side exits.
+    bool enableProgressAccounting = true;
 };
 
 class IVuExecutionBackend
@@ -262,6 +265,27 @@ private:
     friend class VuInterpreterBackend;
     friend class VuRecompilerBackend;
     friend struct VU1NativeEmitterSpikeAccess;
+
+    class ProgressTracker
+    {
+    public:
+        ProgressTracker(
+            VuUnit &unit, VuExecutionState &state,
+            bool enabled, uint32_t &executedCycles);
+        ~ProgressTracker();
+
+        void publish();
+
+        ProgressTracker(const ProgressTracker &) = delete;
+        ProgressTracker &operator=(const ProgressTracker &) = delete;
+
+    private:
+        VuUnit &m_unit;
+        VuExecutionState &m_state;
+        uint32_t &m_executedCycles;
+        uint32_t m_committedCycles = 0u;
+        bool m_enabled = false;
+    };
 
     struct DecodedInstructionPair
     {
