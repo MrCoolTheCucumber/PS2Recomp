@@ -105,6 +105,44 @@ add_executable(vu1_replay
     src/vu1_replay.cpp
 )
 
+option(PS2X_BUILD_VU_NATIVE_EMITTER_SPIKE
+    "Build the disposable Phase 0 x86-64 VU native-emitter spike" OFF)
+set(PS2X_XBYAK_INCLUDE_DIR "" CACHE PATH
+    "Directory containing xbyak/xbyak.h for the VU emitter spike")
+
+if(PS2X_BUILD_VU_NATIVE_EMITTER_SPIKE)
+    if(NOT CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|AMD64|amd64)$")
+        message(FATAL_ERROR
+            "The Phase 0 VU native-emitter spike only supports x86-64")
+    endif()
+    if(MSVC OR WIN32)
+        message(FATAL_ERROR
+            "The Phase 0 VU native-emitter spike currently uses the SysV x86-64 ABI")
+    endif()
+    if(NOT CMAKE_SYSTEM_NAME STREQUAL "Linux")
+        message(FATAL_ERROR
+            "The Phase 0 VU native-emitter spike currently validates W^X through Linux /proc")
+    endif()
+    if(NOT EXISTS "${PS2X_XBYAK_INCLUDE_DIR}/xbyak/xbyak.h")
+        message(FATAL_ERROR
+            "Set PS2X_XBYAK_INCLUDE_DIR to a pinned Xbyak checkout")
+    endif()
+
+    enable_language(ASM)
+    add_executable(vu_native_emitter_spike
+        src/vu_native_emitter_spike.cpp
+        src/vu_native_emitter_spike_abi.S
+        src/vu_native_emitter_spike_function_table.cpp
+    )
+    target_include_directories(vu_native_emitter_spike PRIVATE
+        ${CMAKE_SOURCE_DIR}/ps2xRuntime/include
+        ${PS2X_XBYAK_INCLUDE_DIR}
+    )
+    target_link_libraries(vu_native_emitter_spike PRIVATE
+        ps2_runtime
+    )
+endif()
+
 add_executable(ee_timing_benchmark
     src/ee_timing_benchmark.cpp
     $<TARGET_OBJECTS:ps2_test_function_table>
@@ -169,4 +207,7 @@ if(CMAKE_BUILD_TYPE STREQUAL "Release" OR CMAKE_BUILD_TYPE STREQUAL "RelWithDebI
     EnableFastReleaseMode(ps2_test_lib)
     EnableFastReleaseMode(ps2x_tests)
     EnableFastReleaseMode(ee_timing_benchmark)
+    if(TARGET vu_native_emitter_spike)
+        EnableFastReleaseMode(vu_native_emitter_spike)
+    endif()
 endif()

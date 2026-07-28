@@ -9,6 +9,7 @@
 
 class GS;
 class PS2Memory;
+struct VU1NativeEmitterSpikeAccess;
 
 struct VU1State
 {
@@ -102,6 +103,12 @@ public:
     void setInstructionObserverEnabled(bool enabled);
 
 private:
+    // Phase 0 native-emitter feasibility tooling needs to drive the existing
+    // upper-lane helpers without making them part of the runtime API. Remove
+    // this friend when the production backend-neutral execution context owns
+    // the corresponding state and operations.
+    friend struct VU1NativeEmitterSpikeAccess;
+
     struct DecodedInstructionPair
     {
         uint32_t lower = 0;
