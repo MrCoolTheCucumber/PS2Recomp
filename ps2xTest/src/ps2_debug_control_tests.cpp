@@ -3,11 +3,13 @@
 #include "runtime/ps2_debug_server.h"
 #include "runtime/ps2_gs_gpu.h"
 #include "runtime/ps2_memory.h"
+#include "runtime/ps2_vu_recompiler.h"
 #include "runtime/ps2_watchdog.h"
 
 #include <array>
 #include <atomic>
 #include <chrono>
+#include <cstring>
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
@@ -24,6 +26,11 @@ namespace
     void secondDispatch(uint8_t *, R5900Context *ctx, PS2Runtime *)
     {
         ctx->pc = 0u;
+    }
+
+    void loopDispatch(uint8_t *, R5900Context *ctx, PS2Runtime *)
+    {
+        ctx->pc = 0x00001000u;
     }
 }
 
@@ -46,6 +53,99 @@ void register_ps2_debug_control_tests()
             runtime.debugResume();
             t.IsFalse(runtime.debugIsPaused(),
                       "a repeated resume should remain harmless");
+        });
+
+        tc.Run("pause publishes VU diagnostics on the cache owner thread", [](TestCase &t)
+        {
+            if (!VuRecompilerBackend::supported())
+                return;
+
+            PS2RuntimeConfiguration configuration{};
+            configuration.vu1Backend =
+                VuBackendKind::Recompiler;
+            configuration.useVuBackendEnvironment = false;
+            PS2Runtime runtime(configuration);
+            t.IsTrue(runtime.memory().initialize(),
+                     "diagnostic snapshot memory should initialize");
+            t.IsTrue(runtime.syncCoreSubsystems(),
+                     "diagnostic snapshot subsystems should bind");
+            runtime.registerFunction(0x00001000u, loopDispatch);
+
+            uint8_t *const code =
+                runtime.memory().getVU1Code();
+            std::memset(code, 0, PS2_VU1_CODE_SIZE);
+            constexpr uint32_t kVuUpperNop = 0x000002FFu;
+            constexpr uint32_t kVuUpperEnd = 0x400002FFu;
+            std::memcpy(code + 4u, &kVuUpperEnd, sizeof(kVuUpperEnd));
+            std::memcpy(code + 12u, &kVuUpperNop, sizeof(kVuUpperNop));
+            runtime.memory().markVU1CodeModified();
+
+            R5900Context context{};
+            context.pc = 0x00001000u;
+            std::atomic<bool> vuExecuted{false};
+            std::thread worker([&]()
+            {
+                runtime.vu1().start(0u, 0u, 0u, &runtime.memory());
+                (void)runtime.vu1().advance(
+                    code, PS2_VU1_CODE_SIZE,
+                    runtime.memory().getVU1Data(),
+                    PS2_VU1_DATA_SIZE,
+                    runtime.gs(), &runtime.memory(), 2u);
+                vuExecuted.store(true, std::memory_order_release);
+                runtime.dispatchLoop(nullptr, &context);
+            });
+
+            const auto deadline =
+                std::chrono::steady_clock::now() +
+                std::chrono::seconds(1);
+            while (!vuExecuted.load(std::memory_order_acquire) &&
+                   std::chrono::steady_clock::now() < deadline)
+            {
+                std::this_thread::yield();
+            }
+
+            t.IsTrue(
+                vuExecuted.load(std::memory_order_acquire),
+                "the cache owner should execute the native fixture");
+            t.IsTrue(
+                runtime.debugPause(std::chrono::seconds(1)),
+                "a live guest pause should reach an owner-thread boundary");
+            std::array<
+                PS2Runtime::DebugVuBackendDiagnostics, 2u>
+                snapshots{};
+            const auto snapshotDeadline =
+                std::chrono::steady_clock::now() +
+                std::chrono::seconds(1);
+            do
+            {
+                snapshots =
+                    runtime.debugVuBackendDiagnosticsSnapshot();
+                if (snapshots[1u].captured)
+                    break;
+                std::this_thread::yield();
+            } while (
+                std::chrono::steady_clock::now() <
+                snapshotDeadline);
+            t.IsTrue(snapshots[1u].captured,
+                     "the pause boundary should publish a VU1 snapshot");
+            t.IsTrue(snapshots[1u].cacheCreated,
+                     "native execution should publish cache counters");
+            t.IsTrue(snapshots[1u].recompilerCreated,
+                     "native execution should publish backend counters");
+            t.IsTrue(snapshots[1u].cache.compilations >= 1u,
+                     "the paused snapshot should include compilation");
+            t.Equals(
+                snapshots[1u].recompiler.nativePairs,
+                uint64_t{2u},
+                "the paused snapshot should report exact native work");
+            t.Equals(
+                snapshots[1u].recompiler.faultExits,
+                uint64_t{0u},
+                "the native diagnostic snapshot should remain fault-free");
+
+            runtime.requestStop();
+            runtime.debugResume();
+            worker.join();
         });
 
         tc.Run("breakpoint and watchpoint collections are deterministic", [](TestCase &t)

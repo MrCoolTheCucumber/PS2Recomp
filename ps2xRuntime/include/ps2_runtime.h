@@ -536,6 +536,54 @@ public:
         bool eventPending = false;
     };
 
+    struct DebugVuProgramCacheDiagnostics
+    {
+        uint64_t hits = 0u;
+        uint64_t misses = 0u;
+        uint64_t compilations = 0u;
+        uint64_t invalidations = 0u;
+        uint64_t invalidatedPrograms = 0u;
+        uint64_t evictionFlushes = 0u;
+        uint64_t evictedPrograms = 0u;
+        uint64_t manualFlushes = 0u;
+        uint64_t rejectedPrograms = 0u;
+        uint64_t generatedBytes = 0u;
+        uint64_t compilationNanoseconds = 0u;
+        uint64_t residentPrograms = 0u;
+        uint64_t residentExecutableBytes = 0u;
+        uint64_t highWaterPrograms = 0u;
+        uint64_t highWaterExecutableBytes = 0u;
+    };
+
+    struct DebugVuRecompilerDiagnostics
+    {
+        uint64_t nativeEntries = 0u;
+        uint64_t nativePairs = 0u;
+        uint64_t inlinePairs = 0u;
+        uint64_t helperPairs = 0u;
+        uint64_t blockCompletes = 0u;
+        uint64_t cycleBudgetExits = 0u;
+        uint64_t xgkickExits = 0u;
+        uint64_t xgkickAdvanceHelperCalls = 0u;
+        uint64_t unsupportedExits = 0u;
+        uint64_t codeInvalidationExits = 0u;
+        uint64_t faultExits = 0u;
+        uint64_t interpreterInstrumentationFallbacks = 0u;
+        uint64_t interpreterFallbackPairs = 0u;
+    };
+
+    struct DebugVuBackendDiagnostics
+    {
+        uint64_t snapshotSequence = 0u;
+        uint64_t issuedCycles = 0u;
+        uint32_t pc = 0u;
+        bool captured = false;
+        bool cacheCreated = false;
+        bool recompilerCreated = false;
+        DebugVuProgramCacheDiagnostics cache{};
+        DebugVuRecompilerDiagnostics recompiler{};
+    };
+
     enum class DebugEeEventDeviceKind : uint8_t
     {
         None = 0u,
@@ -956,6 +1004,8 @@ public:
     bool debugCopyGsVram(std::vector<uint8_t> &output);
     DebugRuntimeProgress debugRuntimeProgress() const;
     DebugVu1Timing debugVu1TimingSnapshot();
+    std::array<DebugVuBackendDiagnostics, 2u>
+    debugVuBackendDiagnosticsSnapshot() const;
     std::vector<DebugBranchEntry> debugBranchHistory(
         size_t maximumEntries = 256u) const;
     DebugFaultInfo debugFaultSnapshot() const;
@@ -1095,6 +1145,7 @@ private:
     void debugWaitUntilResumed();
     void debugRecordStopLocked(const char *reason, uint32_t pc);
     void debugRefreshControlActiveLocked();
+    void debugPublishVuBackendDiagnostics();
     void debugRecordBranch(uint32_t pc);
     void debugRecordFault(const DebugFaultInfo &fault);
     void debugRecordVu0Sync(DebugVu0SyncEntry entry);
@@ -1498,6 +1549,10 @@ private:
     std::atomic<bool> m_debugWatchpointsActive{false};
     std::atomic<uint64_t> m_debugDispatches{0u};
     std::atomic<uint64_t> m_debugEeInstructions{0u};
+    mutable std::mutex m_debugVuBackendDiagnosticsMutex;
+    std::array<DebugVuBackendDiagnostics, 2u>
+        m_debugVuBackendDiagnostics{};
+    uint64_t m_debugVuBackendDiagnosticsSequence = 0u;
     static constexpr size_t kDebugBranchHistoryCapacity = 256u;
     struct DebugBranchSlot
     {

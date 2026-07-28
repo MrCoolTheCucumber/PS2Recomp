@@ -67,4 +67,8 @@ request while a unit is active is rejected and leaves the previous selection
 intact.
 
 `system.status` exposes `vu_backends.vu0` and `vu_backends.vu1`, including each
-unit's requested mode, resolved mode, backend name, and active state.
+unit's requested mode, resolved mode, backend name, and active state. At a
+debugger pause boundary, the GameThread or the quiescent guest-execution lock
+also publishes the current PC, issued cycles, cache/compile counters, and
+recompiler pair/exit/fallback counters. These snapshots keep owner-only cache
+state out of the debugger thread while the guest is running.

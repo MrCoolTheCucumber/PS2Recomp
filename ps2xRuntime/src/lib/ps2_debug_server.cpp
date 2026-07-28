@@ -722,6 +722,8 @@ struct PS2DebugServer::Impl
             runtime.vu0().getProgressSnapshot();
         const VuProgressSnapshot vu1Progress =
             runtime.vu1().getProgressSnapshot();
+        const auto vuDiagnostics =
+            runtime.debugVuBackendDiagnosticsSnapshot();
         Value result(rapidjson::kObjectType);
         addString(result, "backend", "recomp", allocator);
         const char *state = runtime.isStopRequested()
@@ -761,7 +763,8 @@ struct PS2DebugServer::Impl
         result.AddMember("progress", progress, allocator);
 
         const auto vuBackendStatus =
-            [&](const VuUnit &unit)
+            [&](const VuUnit &unit,
+                const PS2Runtime::DebugVuBackendDiagnostics &diagnostics)
         {
             Value value(rapidjson::kObjectType);
             addString(
@@ -772,13 +775,124 @@ struct PS2DebugServer::Impl
                 vuBackendKindName(unit.resolvedBackend()), allocator);
             addString(value, "name", unit.backendName(), allocator);
             value.AddMember("active", unit.isActive(), allocator);
+            value.AddMember(
+                "diagnostics_captured",
+                diagnostics.captured, allocator);
+            if (!diagnostics.captured)
+                return value;
+
+            value.AddMember(
+                "diagnostics_snapshot_sequence",
+                diagnostics.snapshotSequence, allocator);
+            addString(
+                value, "pc",
+                addressString(diagnostics.pc), allocator);
+            value.AddMember(
+                "issued_cycles",
+                diagnostics.issuedCycles, allocator);
+            if (diagnostics.cacheCreated)
+            {
+                const auto &source = diagnostics.cache;
+                Value cache(rapidjson::kObjectType);
+                cache.AddMember("hits", source.hits, allocator);
+                cache.AddMember("misses", source.misses, allocator);
+                cache.AddMember(
+                    "compilations", source.compilations, allocator);
+                cache.AddMember(
+                    "invalidations", source.invalidations, allocator);
+                cache.AddMember(
+                    "invalidated_programs",
+                    source.invalidatedPrograms, allocator);
+                cache.AddMember(
+                    "eviction_flushes",
+                    source.evictionFlushes, allocator);
+                cache.AddMember(
+                    "evicted_programs",
+                    source.evictedPrograms, allocator);
+                cache.AddMember(
+                    "manual_flushes",
+                    source.manualFlushes, allocator);
+                cache.AddMember(
+                    "rejected_programs",
+                    source.rejectedPrograms, allocator);
+                cache.AddMember(
+                    "generated_bytes",
+                    source.generatedBytes, allocator);
+                cache.AddMember(
+                    "compilation_time_ns",
+                    source.compilationNanoseconds, allocator);
+                cache.AddMember(
+                    "resident_programs",
+                    source.residentPrograms, allocator);
+                cache.AddMember(
+                    "resident_executable_bytes",
+                    source.residentExecutableBytes, allocator);
+                cache.AddMember(
+                    "high_water_programs",
+                    source.highWaterPrograms, allocator);
+                cache.AddMember(
+                    "high_water_executable_bytes",
+                    source.highWaterExecutableBytes, allocator);
+                value.AddMember("cache", cache, allocator);
+            }
+            if (diagnostics.recompilerCreated)
+            {
+                const auto &source = diagnostics.recompiler;
+                Value recompiler(rapidjson::kObjectType);
+                recompiler.AddMember(
+                    "native_entries",
+                    source.nativeEntries, allocator);
+                recompiler.AddMember(
+                    "native_pairs",
+                    source.nativePairs, allocator);
+                recompiler.AddMember(
+                    "inline_pairs",
+                    source.inlinePairs, allocator);
+                recompiler.AddMember(
+                    "helper_pairs",
+                    source.helperPairs, allocator);
+                recompiler.AddMember(
+                    "block_completes",
+                    source.blockCompletes, allocator);
+                recompiler.AddMember(
+                    "cycle_budget_exits",
+                    source.cycleBudgetExits, allocator);
+                recompiler.AddMember(
+                    "xgkick_exits",
+                    source.xgkickExits, allocator);
+                recompiler.AddMember(
+                    "xgkick_advance_helper_calls",
+                    source.xgkickAdvanceHelperCalls, allocator);
+                recompiler.AddMember(
+                    "unsupported_exits",
+                    source.unsupportedExits, allocator);
+                recompiler.AddMember(
+                    "code_invalidation_exits",
+                    source.codeInvalidationExits, allocator);
+                recompiler.AddMember(
+                    "fault_exits",
+                    source.faultExits, allocator);
+                recompiler.AddMember(
+                    "interpreter_instrumentation_fallbacks",
+                    source.interpreterInstrumentationFallbacks,
+                    allocator);
+                recompiler.AddMember(
+                    "interpreter_fallback_pairs",
+                    source.interpreterFallbackPairs, allocator);
+                value.AddMember(
+                    "recompiler", recompiler, allocator);
+            }
             return value;
         };
         Value vuBackends(rapidjson::kObjectType);
         vuBackends.AddMember(
-            "vu0", vuBackendStatus(runtime.vu0()), allocator);
+            "vu0",
+            vuBackendStatus(runtime.vu0(), vuDiagnostics[0u]),
+            allocator);
         vuBackends.AddMember(
-            "vu1", vuBackendStatus(runtime.vu1()), allocator);
+            "vu1",
+            vuBackendStatus(runtime.vu1(), vuDiagnostics[1u]),
+            allocator);
         result.AddMember("vu_backends", vuBackends, allocator);
 
         const Vu1WorkloadProfileSnapshot vu1Profile =

@@ -201,6 +201,12 @@ VuProgramCacheDiagnostics VuProgramCache::diagnostics() const
     return m_diagnostics;
 }
 
+VuProgramCacheDiagnostics
+VuProgramCache::diagnosticsWhileExecutionQuiescent() const
+{
+    return m_diagnostics;
+}
+
 bool VuProgramCache::validKey(
     const VuProgramKey &key,
     std::string *diagnostic)

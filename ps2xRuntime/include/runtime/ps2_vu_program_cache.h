@@ -137,6 +137,10 @@ public:
         return m_limits;
     }
     [[nodiscard]] VuProgramCacheDiagnostics diagnostics() const;
+    // Read-only debugger snapshot. The caller must externally prove that the
+    // owner thread cannot access the cache for the duration of this copy.
+    [[nodiscard]] VuProgramCacheDiagnostics
+    diagnosticsWhileExecutionQuiescent() const;
 
     [[nodiscard]] static bool validKey(
         const VuProgramKey &key,

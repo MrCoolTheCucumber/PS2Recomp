@@ -86,6 +86,12 @@ come from that same thread; cross-thread access throws `std::logic_error`.
 Destruction is exempt. This matches the current GameThread-owned VU execution
 model and makes accidental MTVU-style sharing explicit.
 
+The debugger has one read-only exception:
+`diagnosticsWhileExecutionQuiescent()` copies counters only while the runtime's
+guest-execution mutex proves that the owner cannot access the cache. It neither
+binds nor changes cache ownership and must not be used without equivalent
+external synchronization.
+
 `VuProgramCacheDiagnostics` exposes cumulative:
 
 - hits, misses, and accepted compilations;

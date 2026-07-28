@@ -6,6 +6,7 @@
 #include "ps2_runtime_macros.h"
 #include "runtime/ps2_gs_gpu.h"
 #include "runtime/ps2_vu_program_cache.h"
+#include "runtime/ps2_vu_recompiler.h"
 #include "ThreadNaming.h"
 #include "Kernel/Stubs/Audio.h"
 #include "Kernel/Stubs/GS.h"
@@ -6583,6 +6584,90 @@ void PS2Runtime::debugRefreshControlActiveLocked()
     m_debugControlActive.store(active, std::memory_order_release);
 }
 
+void PS2Runtime::debugPublishVuBackendDiagnostics()
+{
+    const uint64_t sequence =
+        ++m_debugVuBackendDiagnosticsSequence;
+    const auto captureUnit =
+        [sequence](const VuUnit &unit)
+        {
+            DebugVuBackendDiagnostics result{};
+            result.snapshotSequence = sequence;
+            result.issuedCycles = unit.state().issuedCycles;
+            result.pc = unit.state().pc;
+            result.captured = true;
+
+            if (const VuProgramCache *const cache =
+                    unit.programCacheIfCreated())
+            {
+                const VuProgramCacheDiagnostics source =
+                    cache->
+                        diagnosticsWhileExecutionQuiescent();
+                result.cacheCreated = true;
+                result.cache = {
+                    .hits = source.hits,
+                    .misses = source.misses,
+                    .compilations = source.compilations,
+                    .invalidations = source.invalidations,
+                    .invalidatedPrograms =
+                        source.invalidatedPrograms,
+                    .evictionFlushes = source.evictionFlushes,
+                    .evictedPrograms = source.evictedPrograms,
+                    .manualFlushes = source.manualFlushes,
+                    .rejectedPrograms = source.rejectedPrograms,
+                    .generatedBytes = source.generatedBytes,
+                    .compilationNanoseconds =
+                        source.compilationNanoseconds,
+                    .residentPrograms = static_cast<uint64_t>(
+                        source.residentPrograms),
+                    .residentExecutableBytes =
+                        static_cast<uint64_t>(
+                            source.residentExecutableBytes),
+                    .highWaterPrograms = static_cast<uint64_t>(
+                        source.highWaterPrograms),
+                    .highWaterExecutableBytes =
+                        static_cast<uint64_t>(
+                            source.highWaterExecutableBytes),
+                };
+            }
+
+            if (const VuRecompilerDiagnostics *const source =
+                    unit.recompilerDiagnosticsIfCreated())
+            {
+                result.recompilerCreated = true;
+                result.recompiler = {
+                    .nativeEntries = source->nativeEntries,
+                    .nativePairs = source->nativePairs,
+                    .inlinePairs = source->inlinePairs,
+                    .helperPairs = source->helperPairs,
+                    .blockCompletes = source->blockCompletes,
+                    .cycleBudgetExits =
+                        source->cycleBudgetExits,
+                    .xgkickExits = source->xgkickExits,
+                    .xgkickAdvanceHelperCalls =
+                        source->xgkickAdvanceHelperCalls,
+                    .unsupportedExits = source->unsupportedExits,
+                    .codeInvalidationExits =
+                        source->codeInvalidationExits,
+                    .faultExits = source->faultExits,
+                    .interpreterInstrumentationFallbacks =
+                        source->interpreterInstrumentationFallbacks,
+                    .interpreterFallbackPairs =
+                        source->interpreterFallbackPairs,
+                };
+            }
+            return result;
+        };
+
+    const std::array<DebugVuBackendDiagnostics, 2u> snapshots{
+        captureUnit(m_vu0),
+        captureUnit(m_vu1),
+    };
+    std::lock_guard<std::mutex> lock(
+        m_debugVuBackendDiagnosticsMutex);
+    m_debugVuBackendDiagnostics = snapshots;
+}
+
 void PS2Runtime::debugWaitUntilResumed()
 {
     std::unique_lock<std::mutex> lock(m_debugControlMutex);
@@ -6605,6 +6690,10 @@ void PS2Runtime::debugBlockGuestAtBoundary(R5900Context *ctx, const char *reason
     }
     m_debugControlCv.notify_all();
     m_audioBackend.setDebuggerPaused(true);
+
+    // Cache ownership remains on this GameThread. Publish one coherent copy
+    // before the debugger thread is allowed to inspect the paused runtime.
+    debugPublishVuBackendDiagnostics();
 
     // executeGuestStep() is called while this host thread owns the recursive
     // guest-execution mutex. Release all levels so debugger snapshots can be
@@ -6746,6 +6835,7 @@ bool PS2Runtime::debugPause(std::chrono::milliseconds timeout)
     const bool locked = m_guestExecutionMutex.try_lock_for(timeout);
     if (locked)
     {
+        debugPublishVuBackendDiagnostics();
         m_guestExecutionMutex.unlock();
         return true;
     }
@@ -6987,6 +7077,14 @@ PS2Runtime::debugVu1TimingSnapshot()
             event->deadline.raw();
     }
     return result;
+}
+
+std::array<PS2Runtime::DebugVuBackendDiagnostics, 2u>
+PS2Runtime::debugVuBackendDiagnosticsSnapshot() const
+{
+    std::lock_guard<std::mutex> lock(
+        m_debugVuBackendDiagnosticsMutex);
+    return m_debugVuBackendDiagnostics;
 }
 
 bool PS2Runtime::debugReadRdram(uint32_t address,
