@@ -17,6 +17,7 @@ class VuRecompilerBackend;
 enum class VuUnitId : uint8_t;
 struct VU1NativeEmitterSpikeAccess;
 struct VuVerifyTestAccess;
+struct VuXgkickTestAccess;
 
 struct VuPipelineState
 {
@@ -418,6 +419,7 @@ private:
     friend class VuIrInterpreterBackend;
     friend class VuRecompilerBackend;
     friend struct VU1NativeEmitterSpikeAccess;
+    friend struct VuXgkickTestAccess;
 
     using DecodedInstructionPair = VuUnit::DecodedInstructionPair;
 

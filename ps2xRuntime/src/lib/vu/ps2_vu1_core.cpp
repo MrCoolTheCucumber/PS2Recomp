@@ -101,6 +101,48 @@ namespace
         }
     }
 
+    struct VuRingSpans
+    {
+        uint32_t firstBytes;
+        uint32_t secondBytes;
+    };
+
+    VuRingSpans vuRingSpans(
+        uint32_t address, uint32_t dataSize, uint32_t byteCount)
+    {
+        const uint32_t firstBytes =
+            std::min(byteCount, dataSize - address);
+        return {
+            .firstBytes = firstBytes,
+            .secondBytes = byteCount - firstBytes,
+        };
+    }
+
+    void copyVuRingBytes(
+        uint8_t *destination, const uint8_t *vuData,
+        uint32_t dataSize, uint32_t address, uint32_t byteCount)
+    {
+        const VuRingSpans spans =
+            vuRingSpans(address, dataSize, byteCount);
+        std::memcpy(
+            destination, vuData + address, spans.firstBytes);
+        if (spans.secondBytes != 0u)
+        {
+            std::memcpy(
+                destination + spans.firstBytes,
+                vuData, spans.secondBytes);
+        }
+    }
+
+    uint32_t advanceVuRingAddress(
+        uint32_t address, uint32_t dataSize, uint32_t byteCount)
+    {
+        const uint32_t bytesToEnd = dataSize - address;
+        return byteCount >= bytesToEnd
+            ? byteCount - bytesToEnd
+            : address + byteCount;
+    }
+
     class RuntimeVuSideEffectSink final : public IVuSideEffectSink
     {
     public:
@@ -1903,11 +1945,11 @@ void VuInterpreterBackend::advanceXgkick(uint8_t *vuData,
 
     auto read64Wrap = [&](uint32_t address)
     {
-        uint8_t bytes[8];
-        for (uint32_t i = 0; i < 8u; ++i)
-            bytes[i] = vuData[(address + i) % dataSize];
         uint64_t value = 0u;
-        std::memcpy(&value, bytes, sizeof(value));
+        copyVuRingBytes(
+            reinterpret_cast<uint8_t *>(&value),
+            vuData, dataSize, address,
+            static_cast<uint32_t>(sizeof(value)));
         return value;
     };
 
@@ -1981,13 +2023,12 @@ void VuInterpreterBackend::advanceXgkick(uint8_t *vuData,
 
         const size_t oldSize = xgkick.packet.size();
         xgkick.packet.resize(oldSize + bytes);
-        for (uint32_t i = 0u; i < bytes; ++i)
-        {
-            xgkick.packet[oldSize + i] =
-                vuData[(xgkick.address + i) % dataSize];
-        }
+        copyVuRingBytes(
+            xgkick.packet.data() + oldSize,
+            vuData, dataSize, xgkick.address, bytes);
 
-        xgkick.address = (xgkick.address + bytes) % dataSize;
+        xgkick.address = advanceVuRingAddress(
+            xgkick.address, dataSize, bytes);
         xgkick.tagBytesRemaining -= bytes;
         if (!flush)
         {

@@ -82,6 +82,33 @@ struct VuVerifyTestAccess
     }
 };
 
+struct VuXgkickTestAccess
+{
+    static void begin(
+        VuInterpreterBackend &backend, VuExecutionState &state,
+        uint32_t sourceQword, uint8_t *vuData, uint32_t dataSize,
+        IVuSideEffectSink &sideEffects)
+    {
+        VuExecutionState *const previous = backend.m_state;
+        backend.m_state = &state;
+        backend.beginXgkick(
+            sourceQword, vuData, dataSize, sideEffects, nullptr);
+        backend.m_state = previous;
+    }
+
+    static void advance(
+        VuInterpreterBackend &backend, VuExecutionState &state,
+        uint8_t *vuData, uint32_t dataSize,
+        IVuSideEffectSink &sideEffects, uint32_t cycles, bool flush)
+    {
+        VuExecutionState *const previous = backend.m_state;
+        backend.m_state = &state;
+        backend.advanceXgkick(
+            vuData, dataSize, sideEffects, nullptr, cycles, flush);
+        backend.m_state = previous;
+    }
+};
+
 namespace
 {
     constexpr uint32_t kVuUpperNop = 0x000002FFu;
@@ -140,6 +167,35 @@ namespace
         }
     };
 
+    struct XgkickHarness
+    {
+        explicit XgkickHarness(uint32_t dataSize)
+            : backend(unit), data(dataSize, 0u)
+        {
+        }
+
+        void begin(uint32_t sourceQword)
+        {
+            VuXgkickTestAccess::begin(
+                backend, state, sourceQword, data.data(),
+                static_cast<uint32_t>(data.size()), effects);
+        }
+
+        void advance(uint32_t cycles, bool flush = false)
+        {
+            VuXgkickTestAccess::advance(
+                backend, state, data.data(),
+                static_cast<uint32_t>(data.size()), effects,
+                cycles, flush);
+        }
+
+        VuUnit unit;
+        VuInterpreterBackend backend;
+        VuExecutionState state{};
+        VuTransactionalSideEffectSink effects;
+        std::vector<uint8_t> data;
+    };
+
     uint32_t makeVifCmd(uint8_t opcode, uint8_t num, uint16_t imm)
     {
         return (static_cast<uint32_t>(opcode) << 24) |
@@ -155,6 +211,63 @@ namespace
         tag |= (static_cast<uint64_t>(flg & 0x3u) << 58);
         tag |= (static_cast<uint64_t>(nreg & 0xFu) << 60);
         return tag;
+    }
+
+    uint32_t gifPacketBytes(uint16_t nloop, uint8_t flg, uint8_t nreg)
+    {
+        const uint32_t registers = nreg == 0u ? 16u : nreg;
+        uint64_t payloadBytes = 0u;
+        if (flg == 0u)
+        {
+            payloadBytes =
+                static_cast<uint64_t>(nloop) * registers * 16u;
+        }
+        else if (flg == 1u)
+        {
+            payloadBytes =
+                (static_cast<uint64_t>(nloop) * registers * 8u +
+                 15u) &
+                ~15ull;
+        }
+        else
+        {
+            payloadBytes = static_cast<uint64_t>(nloop) * 16u;
+        }
+        return static_cast<uint32_t>(16u + payloadBytes);
+    }
+
+    std::vector<uint8_t> makeGifPacketBytes(
+        uint16_t nloop, uint8_t flg, uint8_t nreg,
+        bool eop, uint8_t seed)
+    {
+        std::vector<uint8_t> packet(
+            gifPacketBytes(nloop, flg, nreg));
+        const uint64_t tag = makeGifTag(nloop, flg, nreg, eop);
+        std::memcpy(packet.data(), &tag, sizeof(tag));
+        for (size_t index = sizeof(tag); index < packet.size(); ++index)
+        {
+            packet[index] = static_cast<uint8_t>(
+                seed + static_cast<uint8_t>(index * 13u));
+        }
+        return packet;
+    }
+
+    uint32_t xgkickAddress(
+        uint32_t sourceQword, uint32_t dataSize)
+    {
+        return ((sourceQword & 0x3ffu) * 16u) % dataSize;
+    }
+
+    void writeWrappedBytes(
+        std::vector<uint8_t> &data, uint32_t address,
+        const std::vector<uint8_t> &bytes)
+    {
+        for (size_t index = 0u; index < bytes.size(); ++index)
+        {
+            data[
+                (address + static_cast<uint32_t>(index)) %
+                static_cast<uint32_t>(data.size())] = bytes[index];
+        }
     }
 
     uint32_t makeVuLowerSpecial(uint8_t specialOp, uint8_t is, uint8_t it = 0u, uint8_t id = 0u, uint8_t dest = 0u)
@@ -3221,6 +3334,326 @@ void register_ps2_vu1_tests()
             fx.mem.write64(PS2_VU1_CODE_BASE, packVuInstructionPair(makeVuIaddiu(1u, 0u, 2), kVuUpperNop));
             vu1.execute(fx.code, PS2_VU1_CODE_SIZE, fx.data, PS2_VU1_DATA_SIZE, fx.gs, &fx.mem, 0u, 0u, 0u, 1u);
             t.Equals(vu1.state().vi[1], 2, "second execution should rebuild decode after the direct write");
+        });
+
+        tc.Run(
+            "XGKICK copies every qword-aligned VU1 ring start",
+            [](TestCase &t)
+        {
+            XgkickHarness harness(PS2_VU1_DATA_SIZE);
+            bool allStartsMatch = true;
+            uint32_t failedQword = 0u;
+            constexpr uint32_t kQwordCount =
+                PS2_VU1_DATA_SIZE / 16u;
+
+            for (uint32_t sourceQword = 0u;
+                 sourceQword < kQwordCount; ++sourceQword)
+            {
+                std::fill(
+                    harness.data.begin(), harness.data.end(), 0x5au);
+                harness.effects.clear();
+                harness.state.pipeline.xgkick = {};
+
+                const std::vector<uint8_t> expected =
+                    makeGifPacketBytes(
+                        1u, GIF_FMT_IMAGE, 0u, true,
+                        static_cast<uint8_t>(sourceQword));
+                writeWrappedBytes(
+                    harness.data,
+                    xgkickAddress(
+                        sourceQword,
+                        static_cast<uint32_t>(harness.data.size())),
+                    expected);
+
+                harness.begin(sourceQword);
+                harness.advance(4u);
+
+                const auto &packets =
+                    harness.effects.path1Packets();
+                if (packets.size() != 1u ||
+                    packets[0] != expected ||
+                    harness.state.pipeline.xgkick.active)
+                {
+                    allStartsMatch = false;
+                    failedQword = sourceQword;
+                    break;
+                }
+            }
+
+            std::ostringstream message;
+            message
+                << "all " << kQwordCount
+                << " qword starts should preserve exact PATH1 bytes"
+                << " (first failure " << failedQword << ")";
+            t.IsTrue(allStartsMatch, message.str());
+        });
+
+        tc.Run(
+            "XGKICK wraps tag reads in non-power-of-two rings",
+            [](TestCase &t)
+        {
+            struct RingCase
+            {
+                uint32_t dataSize;
+                uint32_t sourceQword;
+            };
+            constexpr std::array<RingCase, 3> cases{{
+                {70u, 1u},
+                {70u, 4u},
+                {80u, 4u},
+            }};
+
+            bool allCasesMatch = true;
+            for (size_t caseIndex = 0u;
+                 caseIndex < cases.size(); ++caseIndex)
+            {
+                const RingCase &test = cases[caseIndex];
+                XgkickHarness harness(test.dataSize);
+                const std::vector<uint8_t> expected =
+                    makeGifPacketBytes(
+                        1u, GIF_FMT_IMAGE, 0u, true,
+                        static_cast<uint8_t>(0x30u + caseIndex));
+                writeWrappedBytes(
+                    harness.data,
+                    xgkickAddress(
+                        test.sourceQword, test.dataSize),
+                    expected);
+
+                harness.begin(test.sourceQword);
+                harness.advance(4u);
+
+                const auto &packets =
+                    harness.effects.path1Packets();
+                allCasesMatch =
+                    allCasesMatch &&
+                    packets.size() == 1u &&
+                    packets[0] == expected &&
+                    !harness.state.pipeline.xgkick.active;
+            }
+
+            t.IsTrue(
+                allCasesMatch,
+                "contiguous and wrapped tag headers should use exact "
+                "generic ring spans");
+        });
+
+        tc.Run(
+            "XGKICK span copies packed reglist and image tags",
+            [](TestCase &t)
+        {
+            struct TagCase
+            {
+                uint16_t nloop;
+                uint8_t flg;
+                uint8_t nreg;
+            };
+            constexpr std::array<TagCase, 3> cases{{
+                {2u, GIF_FMT_PACKED, 3u},
+                {3u, GIF_FMT_REGLIST, 3u},
+                {5u, GIF_FMT_IMAGE, 0u},
+            }};
+
+            bool allFormatsMatch = true;
+            for (size_t caseIndex = 0u;
+                 caseIndex < cases.size(); ++caseIndex)
+            {
+                constexpr uint32_t kDataSize = 512u;
+                constexpr uint32_t kSourceQword = 30u;
+                const TagCase &test = cases[caseIndex];
+                XgkickHarness harness(kDataSize);
+                const std::vector<uint8_t> expected =
+                    makeGifPacketBytes(
+                        test.nloop, test.flg, test.nreg, true,
+                        static_cast<uint8_t>(0x60u + caseIndex));
+                writeWrappedBytes(
+                    harness.data,
+                    xgkickAddress(kSourceQword, kDataSize),
+                    expected);
+
+                harness.begin(kSourceQword);
+                harness.advance(
+                    static_cast<uint32_t>(
+                        expected.size() / 16u * 2u));
+
+                const auto &packets =
+                    harness.effects.path1Packets();
+                allFormatsMatch =
+                    allFormatsMatch &&
+                    packets.size() == 1u &&
+                    packets[0] == expected;
+            }
+
+            t.IsTrue(
+                allFormatsMatch,
+                "all three GIF payload formats should preserve exact "
+                "wrapped packet sizes and bytes");
+        });
+
+        tc.Run(
+            "XGKICK copies only earned qwords and retains odd credit",
+            [](TestCase &t)
+        {
+            constexpr uint32_t kDataSize = 160u;
+            constexpr uint32_t kSourceQword = 9u;
+            XgkickHarness harness(kDataSize);
+            std::vector<uint8_t> expected =
+                makeGifPacketBytes(
+                    3u, GIF_FMT_IMAGE, 0u, true, 0x80u);
+            const uint32_t start =
+                xgkickAddress(kSourceQword, kDataSize);
+            writeWrappedBytes(harness.data, start, expected);
+
+            harness.begin(kSourceQword);
+            harness.advance(1u);
+            t.Equals(
+                harness.state.pipeline.xgkick.packet.size(), size_t{0u},
+                "one odd cycle must not earn a qword");
+            t.Equals(
+                harness.state.pipeline.xgkick.cycleCredit, 1u,
+                "one odd cycle should remain credited");
+
+            harness.advance(2u);
+            t.Equals(
+                harness.state.pipeline.xgkick.packet.size(), size_t{16u},
+                "three credited cycles should copy only one qword");
+            t.Equals(
+                harness.state.pipeline.xgkick.cycleCredit, 1u,
+                "odd credit should survive the first copied qword");
+            harness.advance(2u);
+            t.Equals(
+                harness.state.pipeline.xgkick.packet.size(), size_t{32u},
+                "five credited cycles should copy only two qwords");
+
+            std::vector<uint8_t> replacement(16u);
+            for (uint32_t index = 0u; index < 16u; ++index)
+            {
+                replacement[index] =
+                    static_cast<uint8_t>(0xe0u + index);
+                expected[48u + index] = replacement[index];
+            }
+            writeWrappedBytes(
+                harness.data,
+                (start + 48u) % kDataSize,
+                replacement);
+
+            harness.advance(2u);
+            t.Equals(
+                harness.state.pipeline.xgkick.packet.size(), size_t{48u},
+                "seven credited cycles must leave the final qword live");
+            t.IsTrue(
+                harness.effects.path1Packets().empty(),
+                "EOP must not publish before its final qword is earned");
+
+            harness.advance(1u);
+            const auto &packets =
+                harness.effects.path1Packets();
+            t.IsTrue(
+                packets.size() == 1u && packets[0] == expected,
+                "the final earned qword should observe the later VU write");
+            t.IsFalse(
+                harness.state.pipeline.xgkick.active,
+                "exact completion should clear retained XGKICK state");
+        });
+
+        tc.Run(
+            "a second XGKICK drains the first packet in order",
+            [](TestCase &t)
+        {
+            constexpr uint32_t kDataSize = 256u;
+            constexpr uint32_t kFirstQword = 14u;
+            constexpr uint32_t kSecondQword = 4u;
+            XgkickHarness harness(kDataSize);
+            const std::vector<uint8_t> first =
+                makeGifPacketBytes(
+                    2u, GIF_FMT_IMAGE, 0u, true, 0x21u);
+            const std::vector<uint8_t> second =
+                makeGifPacketBytes(
+                    1u, GIF_FMT_IMAGE, 0u, true, 0x91u);
+            writeWrappedBytes(
+                harness.data,
+                xgkickAddress(kFirstQword, kDataSize), first);
+            writeWrappedBytes(
+                harness.data,
+                xgkickAddress(kSecondQword, kDataSize), second);
+
+            harness.begin(kFirstQword);
+            harness.advance(2u);
+            t.Equals(
+                harness.state.pipeline.xgkick.packet.size(), size_t{16u},
+                "the first kick should remain partially transferred");
+
+            harness.begin(kSecondQword);
+            const auto &afterSecondKick =
+                harness.effects.path1Packets();
+            t.IsTrue(
+                afterSecondKick.size() == 1u &&
+                afterSecondKick[0] == first,
+                "the second kick should flush and publish the first packet");
+
+            harness.advance(4u);
+            const auto &completed =
+                harness.effects.path1Packets();
+            t.IsTrue(
+                completed.size() == 2u &&
+                completed[0] == first &&
+                completed[1] == second,
+                "the second packet should follow the drained first packet");
+        });
+
+        tc.Run(
+            "XGKICK final flush completes bounded chains and cancels loops",
+            [](TestCase &t)
+        {
+            {
+                constexpr uint32_t kDataSize = 96u;
+                constexpr uint32_t kSourceQword = 5u;
+                XgkickHarness harness(kDataSize);
+                std::vector<uint8_t> chain =
+                    makeGifPacketBytes(
+                        0u, GIF_FMT_PACKED, 1u, false, 0x11u);
+                const std::vector<uint8_t> last =
+                    makeGifPacketBytes(
+                        0u, GIF_FMT_PACKED, 1u, true, 0x71u);
+                chain.insert(chain.end(), last.begin(), last.end());
+                writeWrappedBytes(
+                    harness.data,
+                    xgkickAddress(kSourceQword, kDataSize), chain);
+
+                harness.begin(kSourceQword);
+                harness.advance(0u, true);
+                const auto &packets =
+                    harness.effects.path1Packets();
+                t.IsTrue(
+                    packets.size() == 1u && packets[0] == chain,
+                    "final flush should complete a bounded wrapped chain");
+            }
+
+            {
+                constexpr uint32_t kDataSize = 64u;
+                XgkickHarness harness(kDataSize);
+                std::vector<uint8_t> loop;
+                for (uint8_t index = 0u; index < 4u; ++index)
+                {
+                    const std::vector<uint8_t> tag =
+                        makeGifPacketBytes(
+                            0u, GIF_FMT_PACKED, 1u, false,
+                            static_cast<uint8_t>(0x20u + index));
+                    loop.insert(loop.end(), tag.begin(), tag.end());
+                }
+                writeWrappedBytes(harness.data, 0u, loop);
+
+                harness.begin(0u);
+                harness.advance(0u, true);
+                t.IsFalse(
+                    harness.state.pipeline.xgkick.active,
+                    "a ring-sized non-EOP loop should cancel");
+                t.IsTrue(
+                    harness.state.pipeline.xgkick.packet.empty(),
+                    "cancellation should release partial packet bytes");
+                t.IsTrue(
+                    harness.effects.path1Packets().empty(),
+                    "a malformed loop must not publish PATH1 output");
+            }
         });
 
         tc.Run("XGKICK sends a VU memory GIF packet through PATH1", [](TestCase &t)
