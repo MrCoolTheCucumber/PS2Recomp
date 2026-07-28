@@ -13,6 +13,7 @@
 class GS;
 class PS2Memory;
 class VuProgramCache;
+class VuRecompilerBackend;
 enum class VuUnitId : uint8_t;
 struct VU1NativeEmitterSpikeAccess;
 
@@ -255,6 +256,7 @@ public:
 
 private:
     friend class VuInterpreterBackend;
+    friend class VuRecompilerBackend;
     friend struct VU1NativeEmitterSpikeAccess;
 
     struct DecodedInstructionPair
@@ -313,6 +315,7 @@ public:
 
 private:
     friend class VuIrInterpreterBackend;
+    friend class VuRecompilerBackend;
     friend struct VU1NativeEmitterSpikeAccess;
 
     using DecodedInstructionPair = VuUnit::DecodedInstructionPair;

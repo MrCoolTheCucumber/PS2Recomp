@@ -17,6 +17,8 @@ option(PS2X_ENABLE_AGRESSIVE_LOGS "Enable very verbose/agressive PS2 runtime log
 option(PS2X_ENABLE_IOP_RPC_TRACE "Log unhandled IOP/SIF RPC trace suggestions" ON)
 option(PS2X_STRICT_RETURN_DIAGNOSTICS "Route generated JR $ra returns through runtime branch diagnostics" OFF)
 option(PS2X_SHOW_WINDOWS_CONSOLE "Show a console window for ps2EntryRunner on Windows release builds" ON)
+option(PS2X_ENABLE_VU_X64_RECOMPILER
+    "Build the production x86-64 VU dynamic recompiler when supported" ON)
 
 if(PS2X_ENABLE_SCCACHE)
     find_program(PS2X_SCCACHE_PROGRAM sccache)
@@ -46,6 +48,15 @@ set(PS2X_IS_ANDROID OFF)
 
 if(ANDROID)
     set(PS2X_IS_ANDROID ON)
+endif()
+
+set(PS2X_HAS_VU_X64_RECOMPILER OFF)
+if(PS2X_ENABLE_VU_X64_RECOMPILER
+   AND NOT PS2X_IS_VITA
+   AND NOT PS2X_IS_ANDROID
+   AND CMAKE_SIZEOF_VOID_P EQUAL 8
+   AND CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|AMD64|amd64)$")
+    set(PS2X_HAS_VU_X64_RECOMPILER ON)
 endif()
 
 set(PS2X_DEBUG_SERVER_DEFAULT OFF)
@@ -79,6 +90,16 @@ else()
     set(FETCHCONTENT_QUIET FALSE)
     set(BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
     set(BUILD_GAMES OFF CACHE BOOL "" FORCE)
+
+    if(PS2X_HAS_VU_X64_RECOMPILER)
+        FetchContent_Declare(
+            xbyak
+            GIT_REPOSITORY https://github.com/herumi/xbyak.git
+            # Xbyak 7.37, byte-identical to the accepted PCSX2 snapshot.
+            GIT_TAG 431abd865e70a46d56f5aa0e1f87572decb60169
+        )
+        FetchContent_MakeAvailable(xbyak)
+    endif()
 
     if(PS2X_IS_ANDROID)
         set(PLATFORM "Android" CACHE STRING "" FORCE)
@@ -418,6 +439,7 @@ add_library(ps2_runtime STATIC
     src/lib/vu/ps2_vu_ir_interpreter.cpp
     src/lib/vu/ps2_vu_executable_memory.cpp
     src/lib/vu/ps2_vu_program_cache.cpp
+    src/lib/vu/ps2_vu_recompiler.cpp
     src/lib/vu/ps2_vu1_core.cpp
     src/lib/vu/ps2_vu1_upper.cpp
     src/lib/vu/ps2_vu1_lower.cpp
@@ -437,6 +459,17 @@ if(PS2X_ENABLE_DEBUG_SERVER)
 else()
     target_compile_definitions(ps2_runtime PUBLIC
         PS2X_ENABLE_DEBUG_SERVER=0
+    )
+endif()
+
+if(PS2X_HAS_VU_X64_RECOMPILER)
+    target_link_libraries(ps2_runtime PRIVATE xbyak::xbyak)
+    target_compile_definitions(ps2_runtime PUBLIC
+        PS2X_HAS_VU_X64_RECOMPILER=1
+    )
+else()
+    target_compile_definitions(ps2_runtime PUBLIC
+        PS2X_HAS_VU_X64_RECOMPILER=0
     )
 endif()
 

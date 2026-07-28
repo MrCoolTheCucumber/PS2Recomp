@@ -15,10 +15,10 @@ microseconds for the selected 44-pair block. LLVM ORC is not justified for the
 first backend, and PCSX2's custom emitter is too coupled to PCSX2 to import as
 a dependency.
 
-The production integration must pin Xbyak independently. The spike deliberately
+The production integration pins Xbyak independently. The spike deliberately
 accepts `PS2X_XBYAK_INCLUDE_DIR` and uses the copy bundled with the local PCSX2
-reference; ordinary PS2Recomp builds remain dependency-free because
-`PS2X_BUILD_VU_NATIVE_EMITTER_SPIKE` defaults to `OFF`.
+reference. The later production backend uses upstream Xbyak 7.37 at exact
+commit `431abd865e70a46d56f5aa0e1f87572decb60169`.
 
 ## Scope
 

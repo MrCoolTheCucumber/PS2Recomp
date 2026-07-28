@@ -21,10 +21,12 @@ The compact instruction-pair representation and its development-only
 differential interpreter are documented in
 [`vu-ir.md`](vu-ir.md). They are not selectable runtime backends; runtime
 selection continues to resolve through the permanent interpreter until the
-native emitter is integrated. Each unit now lazily owns the generation-scoped
-cache and W^X executable-memory layer documented in
-[`vu-program-cache.md`](vu-program-cache.md); no runtime execution path enters
-cached native code yet.
+native emitter is integrated with `VuUnit` selection. The production x86-64
+backend skeleton can already be exercised directly by differential tests; its
+ABI and helper-routed execution path are documented in
+[`vu-x64-recompiler.md`](vu-x64-recompiler.md). Each unit lazily owns the
+generation-scoped cache and W^X executable-memory layer documented in
+[`vu-program-cache.md`](vu-program-cache.md).
 
 ## Selection
 

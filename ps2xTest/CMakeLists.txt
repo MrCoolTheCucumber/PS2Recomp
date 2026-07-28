@@ -58,6 +58,7 @@ add_library(ps2_test_lib STATIC
     src/ps2_memory_tests.cpp
     src/ps2_vu_executable_memory_tests.cpp
     src/ps2_vu_program_cache_tests.cpp
+    src/ps2_vu_recompiler_tests.cpp
     src/ps2_vu1_tests.cpp
     src/ps2_gs_tests.cpp
     src/ps2_iop_tests.cpp
@@ -67,6 +68,17 @@ add_library(ps2_test_lib STATIC
     src/ps2_runtime_expansion_tests.cpp
     src/ps2_debug_control_tests.cpp
 )
+
+if(UNIX AND NOT APPLE AND NOT WIN32 AND
+        CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|AMD64|amd64)$")
+    enable_language(ASM)
+    target_sources(ps2_test_lib PRIVATE
+        src/ps2_vu_recompiler_abi.S
+    )
+    target_compile_definitions(ps2_test_lib PRIVATE
+        PS2X_TEST_HAS_VU_RECOMPILER_ABI_PROBE=1
+    )
+endif()
 
 target_include_directories(ps2_test_lib PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/include

@@ -1,0 +1,83 @@
+# VU x86-64 recompiler
+
+The production VU recompiler lowers verified instruction-pair IR into immutable
+x86-64 blocks. It is built on supported desktop x86-64 targets when
+`PS2X_ENABLE_VU_X64_RECOMPILER=ON`. Unsupported or disabled builds retain the
+same public class, report the backend unavailable, and continue to build the
+permanent interpreter.
+
+Xbyak 7.37 is fetched from its upstream repository at exact commit
+`431abd865e70a46d56f5aa0e1f87572decb60169`. The selected headers are
+byte-identical to the snapshot in the accepted PCSX2 reference
+`897a2d5516787787e8d4236931b8e2804606bf3c`. Xbyak is used only as an
+instruction encoder; its BSD 3-clause license is reproduced in
+[`third-party/xbyak.txt`](third-party/xbyak.txt).
+
+## Native entry contract
+
+Every emitted entry has the stable signature:
+
+```cpp
+uint64_t block(VuExecutionContext *context, uint32_t maximumCycles);
+```
+
+The low 32 result bits are the exact number of retired instruction pairs. The
+high 32 bits contain a `VuNativeBlockExit`. Generated code:
+
+- checks the remaining budget before every pair;
+- preserves the platform's nonvolatile registers and call-stack requirements;
+- saves MXCSR, selects round-toward-zero with DAZ and FTZ for VU work, and
+  restores the caller's exact value on every exit;
+- writes all architectural and delayed-pipeline state through the supplied
+  context;
+- returns only at an instruction-pair boundary.
+
+The initial backend deliberately routes each supported pair through the
+permanent interpreter's opcode helpers. That establishes native entry/exit,
+branch-delay, E-bit, Q/P/FMAC pipeline, XGKICK, cache, and invalidation behavior
+before arithmetic lowering changes. Unsupported IR exits at its original PC
+without retiring or mutating the pair.
+
+The helper callback catches all exceptions. No C++ exception may unwind through
+generated code.
+
+## Code ownership and invalidation
+
+Xbyak emits into ordinary read/write vector storage. Final bytes are copied
+into `VuExecutableMemory`, which performs the sole RW-to-RX transition and host
+instruction-cache maintenance. Xbyak never owns executable memory and no RWE
+mapping is used.
+
+Blocks embed their owning `VuRecompilerBackend` address. They therefore remain
+valid only while that backend and its unit-owned cache live. The cache key
+includes unit, memory/code identity, extent, entry PC, code generation, native
+feature mask, and compilation mode.
+
+The backend resolves a generation-scoped cache handle immediately before each
+native call. It rechecks the unit's code generation after every call because a
+helper may publish an effect which modifies MicroMem. A change invalidates all
+resident blocks and returns `CodeInvalidated`. The current single-GameThread
+ownership contract avoids an unmeasured generation load at each pair.
+
+## Instrumentation and tests
+
+An armed instruction observer, progress tracker, VIF trace, or workload profile
+uses the permanent interpreter. Normal native blocks therefore carry no
+per-pair debugger callback.
+
+Focused tests cover:
+
+- every possible cycle-budget cut through a synthetic FMAC, Q, memory, branch,
+  and E-bit program;
+- cold compilation, warm hits, generation replacement, and stale handles;
+- unsupported-pair no-mutation behavior;
+- instrumentation fallback and exact observer/progress counts;
+- retained XGKICK progress across a native side exit;
+- a code-generation change made by a helper;
+- SysV RBX, RBP, and R12-R15 preservation in a separate assembly caller;
+- exact MXCSR restoration around a raw native entry.
+
+Opcode families are inlined only after a measured helper-only baseline and
+pair-by-pair differential coverage. Until `VuUnit` selection is wired to this
+backend, it remains directly testable but not a selectable runtime execution
+path.
