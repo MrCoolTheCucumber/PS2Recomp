@@ -6,6 +6,7 @@
 #include "runtime/ps2_memory.h"
 #include "runtime/ps2_vu_clip.h"
 #include "runtime/ps2_vu_ir.h"
+#include "runtime/ps2_vu_recompiler.h"
 #include "runtime/ps2_vu1.h"
 
 #include <array>
@@ -783,19 +784,150 @@ void register_ps2_vu1_tests()
                 "a rejected switch should preserve the request");
 
             unit.reset();
+            if (VuRecompilerBackend::supported())
+            {
+                t.IsTrue(
+                    unit.setBackend(
+                        VuBackendKind::Recompiler,
+                        &diagnostic),
+                    "an idle VU1 should accept a supported recompiler");
+                t.IsTrue(diagnostic.empty(),
+                         "an accepted request should clear the diagnostic");
+                t.IsTrue(
+                    unit.requestedBackend() ==
+                            VuBackendKind::Recompiler &&
+                        unit.resolvedBackend() ==
+                            VuBackendKind::Recompiler &&
+                        unit.backendName() ==
+                            "x86-64-recompiler",
+                    "explicit VU1 recompiler selection should resolve natively");
+            }
+            else
+            {
+                t.IsFalse(
+                    unit.setBackend(
+                        VuBackendKind::Recompiler,
+                        &diagnostic),
+                    "an unavailable explicit recompiler should fail early");
+                t.IsFalse(diagnostic.empty(),
+                          "unavailable selection should explain the failure");
+            }
+        });
+
+        tc.Run("VU1 explicit recompiler executes through the unit adapter", [](TestCase &t)
+        {
+            if (!VuRecompilerBackend::supported())
+                return;
+
+            Vu1Fixture fx;
+            t.IsTrue(fx.initialize(),
+                     "VU1 recompiler fixture should initialize");
+            writeVuInstructionPair(
+                fx.code, 0u,
+                makeVuIaddiu(1u, 0u, 7),
+                kVuUpperEnd);
+            writeVuInstructionPair(
+                fx.code, 8u,
+                makeVuIaddiu(2u, 0u, 9),
+                kVuUpperNop);
+            fx.mem.markVU1CodeModified();
+
+            VuUnit unit(VuUnitId::Vu1);
             t.IsTrue(
-                unit.setBackend(
-                    VuBackendKind::Recompiler, &diagnostic),
-                "an idle unit should accept a backend request");
-            t.IsTrue(diagnostic.empty(),
-                     "an accepted request should clear the diagnostic");
-            t.IsTrue(
-                unit.requestedBackend() ==
-                        VuBackendKind::Recompiler &&
-                    unit.resolvedBackend() ==
+                unit.resolvedBackend() ==
                         VuBackendKind::Interpreter &&
                     unit.backendName() == "interpreter",
-                "request and resolved backend status should remain explicit");
+                "auto should remain on the interpreter before rollout");
+            std::string diagnostic;
+            t.IsTrue(
+                unit.setBackend(
+                    VuBackendKind::Recompiler,
+                    &diagnostic),
+                "supported explicit VU1 recompiler should resolve");
+
+            unit.start(0u, 3u, 5u, &fx.mem);
+            const VuRunResult result = unit.advance(
+                fx.code, PS2_VU1_CODE_SIZE,
+                fx.data, PS2_VU1_DATA_SIZE,
+                fx.gs, &fx.mem, 2u);
+            t.IsTrue(
+                result.reason == VuExitReason::ProgramEnded,
+                "the selected recompiler should complete the E-bit program");
+            t.Equals(
+                result.executedCycles, uint32_t{2u},
+                "the selected recompiler should preserve the exact budget");
+            t.Equals(unit.state().vi[1], int32_t{7},
+                     "native execution should publish the first pair");
+            t.Equals(unit.state().vi[2], int32_t{9},
+                     "native execution should publish the E-bit delay pair");
+            t.IsNotNull(
+                unit.programCacheIfCreated(),
+                "selected native execution should populate the unit cache");
+        });
+
+        tc.Run("VU1 unit adapter resumes native execution after an unsupported pair", [](TestCase &t)
+        {
+            if (!VuRecompilerBackend::supported())
+                return;
+
+            Vu1Fixture fx;
+            t.IsTrue(fx.initialize(),
+                     "VU1 fallback fixture should initialize");
+            writeVuInstructionPair(
+                fx.code, 0u,
+                makeVuLowerSpecial(0x70u, 1u),
+                kVuUpperNop);
+            writeVuInstructionPair(
+                fx.code, 8u,
+                makeVuIaddiu(1u, 0u, 11),
+                kVuUpperEnd);
+            writeVuInstructionPair(
+                fx.code, 16u,
+                makeVuIaddiu(2u, 0u, 13),
+                kVuUpperNop);
+            fx.mem.markVU1CodeModified();
+
+            VuUnit unit(VuUnitId::Vu1);
+            std::string diagnostic;
+            t.IsTrue(
+                unit.setBackend(
+                    VuBackendKind::Recompiler,
+                    &diagnostic),
+                "supported explicit VU1 recompiler should resolve");
+            unit.start(0u, 0u, 0u, &fx.mem);
+
+            const VuRunResult result = unit.advance(
+                fx.code, PS2_VU1_CODE_SIZE,
+                fx.data, PS2_VU1_DATA_SIZE,
+                fx.gs, &fx.mem, 3u);
+            t.IsTrue(
+                result.reason == VuExitReason::ProgramEnded,
+                "fallback plus native tail should complete");
+            t.Equals(
+                result.executedCycles, uint32_t{3u},
+                "fallback must retain the original cycle budget");
+            t.Equals(unit.state().vi[1], int32_t{11},
+                     "native execution should resume after fallback");
+            t.Equals(unit.state().vi[2], int32_t{13},
+                     "the E-bit delay pair should remain exact");
+            t.Equals(unit.state().issuedCycles, uint64_t{3u},
+                     "mixed execution should count every pair once");
+            const VuRecompilerDiagnostics *const diagnostics =
+                unit.recompilerDiagnosticsIfCreated();
+            t.IsNotNull(
+                diagnostics,
+                "mixed execution should expose native diagnostics");
+            if (diagnostics)
+            {
+                t.Equals(
+                    diagnostics->unsupportedExits,
+                    uint64_t{1u},
+                    "the unsupported native side exit should be counted");
+                t.Equals(
+                    diagnostics->interpreterFallbackPairs,
+                    uint64_t{1u},
+                    "exactly one pair should use interpreter fallback");
+            }
         });
 
         tc.Run("runtime backend environment overrides each unit", [](TestCase &t)
@@ -814,6 +946,18 @@ void register_ps2_vu1_tests()
                 runtime.vu1().requestedBackend() ==
                     VuBackendKind::Verify,
                 "the VU1 environment request should be applied independently");
+
+            if (VuRecompilerBackend::supported())
+            {
+                vu1.set("recompiler");
+                PS2Runtime native;
+                t.IsTrue(
+                    native.vu0().resolvedBackend() ==
+                            VuBackendKind::Interpreter &&
+                        native.vu1().resolvedBackend() ==
+                            VuBackendKind::Recompiler,
+                    "the VU1 environment should select native execution independently");
+            }
 
             vu1.set("jit");
             bool rejected = false;

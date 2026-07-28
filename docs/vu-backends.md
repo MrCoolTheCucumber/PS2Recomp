@@ -20,10 +20,8 @@ publishing either candidate's output twice.
 The compact instruction-pair representation and its development-only
 differential interpreter are documented in
 [`vu-ir.md`](vu-ir.md). They are not selectable runtime backends; runtime
-selection continues to resolve through the permanent interpreter until the
-native emitter is integrated with `VuUnit` selection. The production x86-64
-backend skeleton can already be exercised directly by differential tests; its
-ABI and helper-routed execution path are documented in
+selection can explicitly route VU1 through the production x86-64 backend. Its
+ABI, native lowering, and helper-routed side exits are documented in
 [`vu-x64-recompiler.md`](vu-x64-recompiler.md). Each unit lazily owns the
 generation-scoped cache and W^X executable-memory layer documented in
 [`vu-program-cache.md`](vu-program-cache.md).
@@ -52,11 +50,21 @@ Programmatic values are applied independently; when
 overrides that unit's value. Invalid names fail runtime construction with the
 variable name and accepted values.
 
-During the backend-neutral architecture phase, every requested mode resolves
-to the permanent interpreter. Requested and resolved modes remain distinct so
-configuration can be tested before the native and verification backends are
-enabled. Changing a request while a unit is active is rejected and leaves the
-previous selection intact.
+On a supported x86-64 host, an explicit VU1 `recompiler` request resolves to
+`x86-64-recompiler`; if native executable memory or the required host features
+are unavailable, the request fails early with a diagnostic. VU1 `auto` remains
+on the interpreter until the title-level parity and performance rollout gates
+pass. VU0 recompiler integration and transactional `verify` mode are later
+milestones, so those requests still retain their requested value while
+resolving to the interpreter.
+
+The VU1 unit adapter consumes a scheduler budget across internal XGKICK helper
+exits. If a compiled block reaches an unsupported pair, it records the native
+side exit, executes exactly that pair through the permanent interpreter at the
+unchanged PC, and resumes native execution with the remaining budget. This
+keeps VIF completion timing independent of native block boundaries. Changing a
+request while a unit is active is rejected and leaves the previous selection
+intact.
 
 `system.status` exposes `vu_backends.vu0` and `vu_backends.vu1`, including each
 unit's requested mode, resolved mode, backend name, and active state.

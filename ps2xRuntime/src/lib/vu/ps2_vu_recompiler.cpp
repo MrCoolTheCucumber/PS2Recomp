@@ -2916,7 +2916,8 @@ VuRunResult VuRecompilerBackend::run(
     if (needsInterpreterInstrumentation(context))
     {
         ++m_diagnostics.interpreterInstrumentationFallbacks;
-        return m_semantics.run(context, maximumCycles);
+        return runInterpreterFallback(
+            context, maximumCycles);
     }
     if (maximumCycles == 0u)
     {
@@ -3057,6 +3058,17 @@ VuRunResult VuRecompilerBackend::run(
 
     ++m_diagnostics.cycleBudgetExits;
     return finish(totalExecuted, VuExitReason::CycleBudget);
+}
+
+VuRunResult VuRecompilerBackend::runInterpreterFallback(
+    VuExecutionContext &context,
+    uint32_t maximumCycles)
+{
+    VuRunResult result =
+        m_semantics.run(context, maximumCycles);
+    m_diagnostics.interpreterFallbackPairs +=
+        result.executedCycles;
+    return result;
 }
 
 uint32_t VuRecompilerBackend::executePair(

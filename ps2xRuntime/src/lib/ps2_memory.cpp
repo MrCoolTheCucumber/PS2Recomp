@@ -23,6 +23,16 @@
 #include <utility>
 #include <vector>
 
+// These opt-in observers are large and cold in normal execution. Keep LTO
+// from folding them into the permanent interpreter's instruction-pair loop.
+#if defined(_MSC_VER)
+#define PS2X_VU_OBSERVER_NOINLINE __declspec(noinline)
+#elif defined(__GNUC__) || defined(__clang__)
+#define PS2X_VU_OBSERVER_NOINLINE __attribute__((noinline))
+#else
+#define PS2X_VU_OBSERVER_NOINLINE
+#endif
+
 namespace
 {
     struct DmaChainState
@@ -1834,6 +1844,7 @@ bool PS2Memory::isVu1WorkloadProfileEnabled() const
                std::memory_order_relaxed);
 }
 
+PS2X_VU_OBSERVER_NOINLINE
 void PS2Memory::beginVu1WorkloadProfileInvocation(
     uint32_t startPc)
 {
@@ -1844,6 +1855,7 @@ void PS2Memory::beginVu1WorkloadProfileInvocation(
         getVU1CodeGeneration());
 }
 
+PS2X_VU_OBSERVER_NOINLINE
 void PS2Memory::recordVu1WorkloadProfileInstruction(
     uint32_t,
     uint32_t lower,
@@ -1853,6 +1865,7 @@ void PS2Memory::recordVu1WorkloadProfileInstruction(
         m_vu1WorkloadProfile->recordInstruction(lower, upper);
 }
 
+PS2X_VU_OBSERVER_NOINLINE
 void PS2Memory::recordVu1WorkloadProfileTransition(
     uint32_t pc,
     uint32_t nextPc)
@@ -1861,6 +1874,7 @@ void PS2Memory::recordVu1WorkloadProfileTransition(
         m_vu1WorkloadProfile->recordTransition(pc, nextPc);
 }
 
+PS2X_VU_OBSERVER_NOINLINE
 void PS2Memory::endVu1WorkloadProfileInvocation(
     bool completed)
 {
@@ -2196,8 +2210,10 @@ void PS2Memory::traceVu1Invocation(uint32_t startPc, uint32_t top, uint32_t itop
     std::fputs("\"}\n", m_gsDmaTrace->output);
 }
 
-void PS2Memory::traceVu1Instruction(uint32_t pc, uint32_t lower, uint32_t upper,
-                                    const VuExecutionState &state)
+PS2X_VU_OBSERVER_NOINLINE
+void PS2Memory::traceVu1Instruction(
+    uint32_t pc, uint32_t lower, uint32_t upper,
+    const VuExecutionState &state)
 {
     if (!isVif1DmaTraceActive())
         return;
@@ -2309,8 +2325,10 @@ void PS2Memory::traceVu1Xgkick(uint32_t sourceQword)
         m_gsDmaTrace->vu1KickAddresses.push_back(sourceQword & 0x3FFu);
 }
 
-void PS2Memory::traceVu1InvocationEnd(uint32_t finalPc, bool ended, bool hitCycleLimit,
-                                      const int32_t *viRegisters, size_t viRegisterCount)
+PS2X_VU_OBSERVER_NOINLINE
+void PS2Memory::traceVu1InvocationEnd(
+    uint32_t finalPc, bool ended, bool hitCycleLimit,
+    const int32_t *viRegisters, size_t viRegisterCount)
 {
     if (!isVif1DmaTraceActive())
         return;
@@ -2404,6 +2422,8 @@ void PS2Memory::traceVu1InvocationEnd(uint32_t finalPc, bool ended, bool hitCycl
                  trace.vu1CurrentPath1.bytes,
                  trace.vu1CurrentPath1.hash);
 }
+
+#undef PS2X_VU_OBSERVER_NOINLINE
 
 void PS2Memory::finishVif1DmaTrace()
 {

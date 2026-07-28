@@ -699,6 +699,10 @@ namespace
                 difference(
                     after.faultExits,
                     nativeBefore.faultExits);
+            result.nativeDelta.interpreterFallbackPairs =
+                difference(
+                    after.interpreterFallbackPairs,
+                    nativeBefore.interpreterFallbackPairs);
         }
         if (nativeUnit)
         {
@@ -787,6 +791,9 @@ namespace
                 << measurement.nativeDelta.codeInvalidationExits
                 << ",\"fault_exits\":"
                 << measurement.nativeDelta.faultExits
+                << ",\"interpreter_fallback_pairs\":"
+                << measurement.nativeDelta
+                       .interpreterFallbackPairs
                 << ",\"cache_hits\":"
                 << measurement.cacheDelta.hits
                 << ",\"cache_misses\":"

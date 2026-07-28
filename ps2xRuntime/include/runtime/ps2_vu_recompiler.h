@@ -64,6 +64,7 @@ struct VuRecompilerDiagnostics
     uint64_t codeInvalidationExits = 0u;
     uint64_t faultExits = 0u;
     uint64_t interpreterInstrumentationFallbacks = 0u;
+    uint64_t interpreterFallbackPairs = 0u;
 };
 
 class VuRecompilerBackend final : public IVuExecutionBackend
@@ -96,6 +97,8 @@ public:
     }
 
 private:
+    friend class VuUnit;
+
     static constexpr uint32_t kMaximumBlockPairs = 64u;
     static constexpr size_t kMaximumDispatchEntries =
         0x4000u / 8u;
@@ -123,6 +126,9 @@ private:
         std::string &diagnostic);
     [[nodiscard]] bool needsInterpreterInstrumentation(
         const VuExecutionContext &context) const;
+    [[nodiscard]] VuRunResult runInterpreterFallback(
+        VuExecutionContext &context,
+        uint32_t maximumCycles);
     [[nodiscard]] static VuExitReason publicExit(
         VuNativeBlockExit exit);
 

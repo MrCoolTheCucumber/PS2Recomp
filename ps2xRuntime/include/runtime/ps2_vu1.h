@@ -195,6 +195,8 @@ public:
 };
 
 class VuInterpreterBackend;
+class VuRecompilerBackend;
+struct VuRecompilerDiagnostics;
 
 class VuUnit
 {
@@ -253,6 +255,8 @@ public:
     {
         return m_programCache.get();
     }
+    const VuRecompilerDiagnostics *
+    recompilerDiagnosticsIfCreated() const;
 
 private:
     friend class VuInterpreterBackend;
@@ -283,6 +287,11 @@ private:
         uint8_t *vuData, uint32_t dataSize,
         GS &gs, PS2Memory *memory, uint32_t maxCycles,
         bool traceBudgetBoundary);
+    [[nodiscard]] VuRunResult runRecompiler(
+        uint8_t *vuCode, uint32_t codeSize,
+        uint8_t *vuData, uint32_t dataSize,
+        GS &gs, PS2Memory *memory, uint32_t maxCycles,
+        bool traceBudgetBoundary);
 
     VuUnitId m_unitId;
     std::unique_ptr<VuProgramCache> m_programCache;
@@ -299,6 +308,7 @@ private:
     bool m_workloadProfileInvocationActive = false;
     InterpreterCache m_interpreterCache;
     std::unique_ptr<VuInterpreterBackend> m_interpreter;
+    std::unique_ptr<VuRecompilerBackend> m_recompiler;
     IVuExecutionBackend *m_backend = nullptr;
     VuBackendKind m_requestedBackend = VuBackendKind::Auto;
     VuBackendKind m_resolvedBackend = VuBackendKind::Interpreter;

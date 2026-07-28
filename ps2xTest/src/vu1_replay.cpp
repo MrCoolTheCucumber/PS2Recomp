@@ -259,23 +259,42 @@ int main(int argc, char **argv)
 {
     bool irDifferential = false;
     bool recompilerDifferential = false;
+    bool unitBackendSpecified = false;
+    VuBackendKind unitBackend = VuBackendKind::Interpreter;
     std::vector<std::string> arguments;
     for (int index = 1; index < argc; ++index)
     {
-        if (std::string_view(argv[index]) == "--ir-differential")
+        const std::string_view argument(argv[index]);
+        if (argument == "--ir-differential")
             irDifferential = true;
-        else if (std::string_view(argv[index]) ==
-                 "--recompiler-differential")
+        else if (argument == "--recompiler-differential")
         {
             recompilerDifferential = true;
+        }
+        else if (argument.starts_with("--backend="))
+        {
+            const std::string_view value =
+                argument.substr(
+                    std::string_view("--backend=").size());
+            if (!parseVuBackendKind(value, unitBackend) ||
+                (unitBackend != VuBackendKind::Interpreter &&
+                 unitBackend != VuBackendKind::Recompiler))
+            {
+                std::cerr
+                    << "--backend must be interpreter or recompiler\n";
+                return 2;
+            }
+            unitBackendSpecified = true;
         }
         else
             arguments.emplace_back(argv[index]);
     }
-    if (irDifferential && recompilerDifferential)
+    if ((irDifferential && recompilerDifferential) ||
+        (unitBackendSpecified &&
+         (irDifferential || recompilerDifferential)))
     {
         std::cerr
-            << "select only one differential backend\n";
+            << "select either one differential mode or --backend\n";
         return 2;
     }
     if (arguments.size() < 2u || arguments.size() > 6u)
@@ -283,7 +302,8 @@ int main(int argc, char **argv)
         std::cerr << "usage: vu1_replay FIXTURE_DIRECTORY INSTRUCTION_PAIRS "
                      "[GIF_OUTPUT] [FINAL_VU_DATA] [INSTRUCTION_TRACE] "
                      "[REGISTER_WRITE_SCHEDULE] "
-                     "[--ir-differential|--recompiler-differential]\n"
+                     "[--ir-differential|--recompiler-differential|"
+                     "--backend=interpreter|recompiler]\n"
                      "schedule lines: INDEX REGISTER VALUE (legacy VI), "
                      "INDEX vi REGISTER VALUE, or "
                      "INDEX vf REGISTER LANE VALUE\n";
@@ -349,8 +369,17 @@ int main(int argc, char **argv)
     std::memcpy(memory.getVU1Code(), micro.data(), vuSize);
     std::memcpy(memory.getVU1Data(), initialData.data(), vuSize);
 
-    VuUnit interpreter;
-    VuExecutionState &state = interpreter.state();
+    VuUnit unit;
+    if (unitBackendSpecified)
+    {
+        std::string diagnostic;
+        if (!unit.setBackend(unitBackend, &diagnostic))
+        {
+            std::cerr << diagnostic << "\n";
+            return 2;
+        }
+    }
+    VuExecutionState &state = unit.state();
     size_t cursor = 5;
     std::memcpy(state.vf, stateWords.data() + cursor, sizeof(state.vf));
     cursor += 32 * 4;
@@ -385,7 +414,7 @@ int main(int argc, char **argv)
             return 2;
         }
         instructionTrace << std::hex << std::setfill('0');
-        interpreter.setInstructionObserver(
+        unit.setInstructionObserver(
             [&](uint64_t index, uint32_t pc, uint32_t lower, uint32_t upper,
                 const VuExecutionState &stepState)
             {
@@ -482,7 +511,7 @@ int main(int argc, char **argv)
             return 2;
         }
 
-        interpreter.start(
+        unit.start(
             stateWords[2], stateWords[3], stateWords[4],
             &memory);
         VuExecutionState referenceState = state;
@@ -493,7 +522,7 @@ int main(int argc, char **argv)
         VuTransactionalSideEffectSink referenceEffects;
         VuTransactionalSideEffectSink candidateEffects;
         VuUnit candidateUnit(VuUnitId::Vu1);
-        VuInterpreterBackend reference(interpreter);
+        VuInterpreterBackend reference(unit);
         VuIrInterpreterBackend oracle(candidateUnit);
         VuRecompilerBackend recompiler(candidateUnit);
         IVuExecutionBackend *const candidate =
@@ -638,7 +667,7 @@ int main(int argc, char **argv)
     }
     else if (scheduledWrites.empty())
     {
-        interpreter.execute(
+        unit.execute(
             memory.getVU1Code(), vuSize,
             memory.getVU1Data(), vuSize,
             gs, &memory, stateWords[2], stateWords[3], stateWords[4],
@@ -646,14 +675,14 @@ int main(int argc, char **argv)
     }
     else
     {
-        interpreter.execute(
+        unit.execute(
             memory.getVU1Code(), vuSize,
             memory.getVU1Data(), vuSize,
             gs, &memory, stateWords[2], stateWords[3], stateWords[4], 0u);
 
         size_t nextWrite = 0u;
         for (uint64_t instructionIndex = 0u;
-             instructionIndex < maxCycles && interpreter.isActive();
+             instructionIndex < maxCycles && unit.isActive();
              ++instructionIndex)
         {
             while (nextWrite < scheduledWrites.size() &&
@@ -674,10 +703,19 @@ int main(int argc, char **argv)
                         &write.value, sizeof(write.value));
                 }
             }
-            interpreter.continueExecution(
+            unit.continueExecution(
                 memory.getVU1Code(), vuSize,
                 memory.getVU1Data(), vuSize,
                 gs, &memory, 1u);
+        }
+    }
+
+    if (unitBackendSpecified)
+    {
+        if (const VuRecompilerDiagnostics *const diagnostics =
+                unit.recompilerDiagnosticsIfCreated())
+        {
+            recompilerDiagnostics = *diagnostics;
         }
     }
 
@@ -696,6 +734,15 @@ int main(int argc, char **argv)
 
     std::cout << std::hex << std::setfill('0');
     std::cout << "{\"schema_version\":1";
+    if (unitBackendSpecified)
+    {
+        std::cout
+            << ",\"unit_backend_requested\":\""
+            << vuBackendKindName(unit.requestedBackend())
+            << "\",\"unit_backend_resolved\":\""
+            << vuBackendKindName(unit.resolvedBackend())
+            << "\"";
+    }
     if (irDifferential)
     {
         std::cout
@@ -718,13 +765,21 @@ int main(int argc, char **argv)
         }
         std::cout << "}" << std::hex;
     }
-    if (recompilerDifferential)
+    if (recompilerDifferential ||
+        (unitBackendSpecified &&
+         unit.resolvedBackend() ==
+             VuBackendKind::Recompiler))
     {
+        if (recompilerDifferential)
+        {
+            std::cout
+                << ",\"recompiler_differential\":true"
+                << ",\"recompiler_compared_pairs\":"
+                << std::dec << differentialComparedPairs;
+        }
         std::cout
-            << ",\"recompiler_differential\":true"
-            << ",\"recompiler_compared_pairs\":"
-            << std::dec << differentialComparedPairs
             << ",\"recompiler_diagnostics\":{"
+            << std::dec
             << "\"native_entries\":"
             << recompilerDiagnostics.nativeEntries
             << ",\"native_pairs\":"
@@ -747,6 +802,8 @@ int main(int argc, char **argv)
             << recompilerDiagnostics.codeInvalidationExits
             << ",\"fault_exits\":"
             << recompilerDiagnostics.faultExits
+            << ",\"interpreter_fallback_pairs\":"
+            << recompilerDiagnostics.interpreterFallbackPairs
             << "}" << std::hex;
     }
     std::cout << ",\"pc\":\"0x"

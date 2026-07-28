@@ -5,6 +5,7 @@
 #include "ps2recomp/types.h"
 #include "ps2_runtime.h"
 #include "runtime/ps2_memory.h"
+#include "runtime/ps2_vu_recompiler.h"
 #include "ps2_syscalls.h"
 #include "ps2_stubs.h"
 #include "runtime/ps2_gs_gpu.h"
@@ -5587,6 +5588,205 @@ void register_ps2_runtime_expansion_tests()
 
             (void)runtime.memory().writeIORegister(
                 0x10003C10u, 1u);
+        });
+
+        tc.Run("selected VU1 recompiler consumes one scheduled budget across XGKICK exits", [](TestCase &t)
+        {
+            if (!VuRecompilerBackend::supported())
+                return;
+
+            PS2RuntimeConfiguration configuration{};
+            configuration.vu1Backend =
+                VuBackendKind::Recompiler;
+            configuration.useVuBackendEnvironment = false;
+            PS2Runtime runtime(configuration);
+            t.IsTrue(runtime.memory().initialize(),
+                     "native VU1 timing memory should initialize");
+            t.IsTrue(runtime.syncCoreSubsystems(),
+                     "native VU1 timing subsystems should bind");
+
+            std::vector<std::vector<uint8_t>> captured;
+            runtime.gifArbiter().setProcessPacketFn(
+                [&](const uint8_t *data, uint32_t sizeBytes)
+                {
+                    captured.emplace_back(
+                        data, data + sizeBytes);
+                });
+
+            constexpr uint32_t kVuUpperNop = 0x000002FFu;
+            uint8_t *const code =
+                runtime.memory().getVU1Code();
+            uint8_t *const data =
+                runtime.memory().getVU1Data();
+            std::memset(code, 0, PS2_VU1_CODE_SIZE);
+            std::memset(data, 0, PS2_VU1_DATA_SIZE);
+            for (uint32_t pc = 0u; pc < 2048u; pc += 8u)
+            {
+                writeVuInstructionPair(
+                    code, pc, 0u, kVuUpperNop);
+            }
+            writeVuInstructionPair(
+                code, 0u,
+                makeVuLowerSpecial(0x6Cu, 0u),
+                kVuUpperNop);
+            runtime.memory().markVU1CodeModified();
+
+            constexpr uint16_t kPayloadQwords = 12u;
+            const uint64_t tag =
+                makeGifTag(
+                    kPayloadQwords, GIF_FMT_IMAGE, 0u);
+            std::memcpy(data, &tag, sizeof(tag));
+            for (uint32_t index = 0u;
+                 index < kPayloadQwords * 16u; ++index)
+            {
+                data[16u + index] =
+                    static_cast<uint8_t>(index);
+            }
+
+            const uint32_t mscal =
+                makeVifCmd(0x14u, 0u, 0u);
+            runtime.memory().processVIF1Data(
+                reinterpret_cast<const uint8_t *>(&mscal),
+                sizeof(mscal));
+            R5900Context &context = runtime.cpu();
+            context.advanceEeCycleTicks(128u);
+            runtime.serviceEeEventsAtBlockBoundary(
+                runtime.memory().getRDRAM(), &context);
+
+            const PS2Runtime::DebugVu1Timing timing =
+                runtime.debugVu1TimingSnapshot();
+            t.Equals(
+                timing.totalAdvancedCycles, uint64_t{16u},
+                "native helper exits must not discard the startup budget");
+            t.Equals(
+                timing.pc, uint32_t{16u * 8u},
+                "native execution should reach the same scheduled boundary");
+            t.Equals(
+                captured.size(), static_cast<size_t>(0u),
+                "the first scheduled budget should retain the partial packet");
+            t.IsNotNull(
+                runtime.vu1().programCacheIfCreated(),
+                "the scheduled path should execute compiled VU1 blocks");
+
+            (void)runtime.memory().writeIORegister(
+                0x10003C10u, 1u);
+        });
+
+        tc.Run("selected VU1 recompiler preserves VIF start resume completion and reset", [](TestCase &t)
+        {
+            if (!VuRecompilerBackend::supported())
+                return;
+
+            PS2RuntimeConfiguration configuration{};
+            configuration.vu1Backend =
+                VuBackendKind::Recompiler;
+            configuration.useVuBackendEnvironment = false;
+            PS2Runtime runtime(configuration);
+            t.IsTrue(runtime.memory().initialize(),
+                     "native VIF/VU1 memory should initialize");
+            t.IsTrue(runtime.syncCoreSubsystems(),
+                     "native VIF/VU1 subsystems should bind");
+
+            constexpr uint32_t kVuUpperNop = 0x000002FFu;
+            constexpr uint32_t kVuUpperEnd = 0x400002FFu;
+            uint8_t *const code =
+                runtime.memory().getVU1Code();
+            std::memset(code, 0, PS2_VU1_CODE_SIZE);
+            writeVuInstructionPair(
+                code, 0u, makeVuBranch(2), kVuUpperEnd);
+            writeVuInstructionPair(
+                code, 8u,
+                makeVuIaddiu(1u, 0u, 1u),
+                kVuUpperNop);
+            writeVuInstructionPair(
+                code, 24u,
+                makeVuIaddiu(2u, 0u, 7u),
+                kVuUpperEnd);
+            writeVuInstructionPair(
+                code, 32u, 0u, kVuUpperNop);
+            runtime.memory().markVU1CodeModified();
+
+            runtime.memory().vif1_regs.tops = 0x123u;
+            runtime.memory().vif1_regs.itops = 0x2ABu;
+            const std::array<uint32_t, 3u> startCommands{
+                makeVifCmd(0x15u, 0u, 0u), // MSCALF
+                makeVifCmd(0x11u, 0u, 0u), // FLUSH
+                makeVifCmd(0x05u, 0u, 3u), // STMOD
+            };
+            runtime.memory().processVIF1Data(
+                reinterpret_cast<const uint8_t *>(
+                    startCommands.data()),
+                static_cast<uint32_t>(
+                    sizeof(startCommands)));
+            t.IsTrue(runtime.vu1().isActive(),
+                     "MSCALF should start selected native VU1");
+            t.Equals(runtime.vu1().state().top, uint32_t{0x123u},
+                     "MSCALF should latch TOPS into TOP");
+            t.Equals(runtime.vu1().state().itop, uint32_t{0x2ABu},
+                     "MSCALF should latch ITOPS into ITOP");
+            t.IsTrue(runtime.memory().vif1WaitingForVu(),
+                     "FLUSH should wait for selected native VU1");
+
+            R5900Context &context = runtime.cpu();
+            context.advanceEeCycleTicks(128u);
+            runtime.serviceEeEventsAtBlockBoundary(
+                runtime.memory().getRDRAM(), &context);
+            t.IsFalse(runtime.vu1().isActive(),
+                      "native E-bit branch segment should complete");
+            t.Equals(runtime.vu1().state().pc, uint32_t{24u},
+                     "native branch target should remain the resume PC");
+            t.Equals(runtime.vu1().state().vi[1], int32_t{1},
+                     "native branch delay slot should execute");
+            t.IsFalse(runtime.memory().vif1WaitingForVu(),
+                      "native completion should wake VIF1");
+            t.Equals(runtime.memory().vif1_regs.mode, uint32_t{3u},
+                     "native completion should resume deferred VIF1 commands");
+
+            runtime.memory().vif1_regs.tops = 0x155u;
+            runtime.memory().vif1_regs.itops = 0x2CCu;
+            const uint32_t mscnt =
+                makeVifCmd(0x17u, 0u, 0u);
+            runtime.memory().processVIF1Data(
+                reinterpret_cast<const uint8_t *>(&mscnt),
+                sizeof(mscnt));
+            t.IsTrue(runtime.vu1().isActive(),
+                     "MSCNT should resume selected native VU1");
+            t.Equals(runtime.vu1().state().pc, uint32_t{24u},
+                     "MSCNT should preserve the native resume PC");
+            t.Equals(runtime.vu1().state().top, uint32_t{0x155u},
+                     "MSCNT should latch the new TOP");
+            t.Equals(runtime.vu1().state().itop, uint32_t{0x2CCu},
+                     "MSCNT should latch the new ITOP");
+
+            context.advanceEeCycleTicks(128u);
+            runtime.serviceEeEventsAtBlockBoundary(
+                runtime.memory().getRDRAM(), &context);
+            t.IsFalse(runtime.vu1().isActive(),
+                      "resumed native E-bit segment should complete");
+            t.Equals(runtime.vu1().state().vi[2], int32_t{7},
+                     "MSCNT should execute the retained native target");
+
+            for (uint32_t pc = 0u; pc < 256u; pc += 8u)
+            {
+                writeVuInstructionPair(
+                    code, pc, 0u, kVuUpperNop);
+            }
+            runtime.memory().markVU1CodeModified();
+            const uint32_t mscal =
+                makeVifCmd(0x14u, 0u, 0u);
+            runtime.memory().processVIF1Data(
+                reinterpret_cast<const uint8_t *>(&mscal),
+                sizeof(mscal));
+            t.IsTrue(runtime.vu1().isActive(),
+                     "MSCAL should start a new native generation");
+            (void)runtime.memory().writeIORegister(
+                0x10003C10u, 1u);
+            const PS2Runtime::DebugVu1Timing reset =
+                runtime.debugVu1TimingSnapshot();
+            t.IsFalse(reset.active,
+                      "VIF1 reset should cancel selected native VU1");
+            t.IsFalse(reset.eventPending,
+                      "VIF1 reset should cancel its native finish event");
         });
 
         tc.Run("EE cycle ticks honor the post-BIOS dual-issue configuration", [](TestCase &t)

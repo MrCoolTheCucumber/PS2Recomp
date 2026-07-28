@@ -2,6 +2,7 @@
 #include "runtime/ps2_gs_gpu.h"
 #include "runtime/ps2_memory.h"
 #include "runtime/ps2_vu_program_cache.h"
+#include "runtime/ps2_vu_recompiler.h"
 #include "ps2_vu_float_mode.h"
 #include "ps2_vu1_detail.h"
 
@@ -9,6 +10,19 @@
 #include <cstring>
 #include <limits>
 #include <utility>
+
+// Keep selection cheap for the permanent interpreter and keep its cold decode
+// cache maintenance outside the pair loop under whole-program optimization.
+#if defined(_MSC_VER)
+#define PS2X_VU_ALWAYS_INLINE __forceinline
+#define PS2X_VU_NOINLINE __declspec(noinline)
+#elif defined(__GNUC__) || defined(__clang__)
+#define PS2X_VU_ALWAYS_INLINE inline __attribute__((always_inline))
+#define PS2X_VU_NOINLINE __attribute__((noinline))
+#else
+#define PS2X_VU_ALWAYS_INLINE inline
+#define PS2X_VU_NOINLINE
+#endif
 
 namespace
 {
@@ -290,6 +304,14 @@ VuProgramCache &VuUnit::programCache()
     return *m_programCache;
 }
 
+const VuRecompilerDiagnostics *
+VuUnit::recompilerDiagnosticsIfCreated() const
+{
+    return m_recompiler
+               ? &m_recompiler->m_diagnostics
+               : nullptr;
+}
+
 VuInterpreterBackend::VuInterpreterBackend(VuUnit &unit)
     : m_unit(unit)
 {
@@ -370,12 +392,34 @@ bool VuUnit::setBackend(
         return false;
     }
 
+    VuBackendKind resolved = VuBackendKind::Interpreter;
+    IVuExecutionBackend *backend = m_interpreter.get();
+    if (requested == VuBackendKind::Recompiler &&
+        m_unitId == VuUnitId::Vu1)
+    {
+        if (!VuRecompilerBackend::supported())
+        {
+            if (diagnostic)
+            {
+                *diagnostic =
+                    VuRecompilerBackend::built()
+                        ? "the x86-64 VU recompiler is unsupported on this host"
+                        : "the x86-64 VU recompiler was not built";
+            }
+            return false;
+        }
+        if (!m_recompiler)
+        {
+            m_recompiler =
+                std::make_unique<VuRecompilerBackend>(*this);
+        }
+        resolved = VuBackendKind::Recompiler;
+        backend = m_recompiler.get();
+    }
+
     m_requestedBackend = requested;
-    // Phase 1 establishes independent configuration and status. Until the
-    // native and verification engines exist, every mode deliberately resolves
-    // through the permanent interpreter backend.
-    m_resolvedBackend = VuBackendKind::Interpreter;
-    m_backend = m_interpreter.get();
+    m_resolvedBackend = resolved;
+    m_backend = backend;
     if (diagnostic)
         diagnostic->clear();
     return true;
@@ -411,6 +455,7 @@ void VuInterpreterBackend::applyDestAcc(
     applyDest(state.acc, result, dest);
 }
 
+PS2X_VU_NOINLINE
 VuInterpreterBackend::DecodedInstructionPair
 VuInterpreterBackend::decodeInstructionPair(
     const uint8_t *vuCode, uint32_t pc) const
@@ -425,6 +470,7 @@ VuInterpreterBackend::decodeInstructionPair(
     return decoded;
 }
 
+PS2X_VU_NOINLINE
 void VuInterpreterBackend::rebuildDecodedCodeCache(
     const uint8_t *vuCode, uint32_t codeSize,
     const PS2Memory *memory, uint64_t generation)
@@ -444,6 +490,8 @@ void VuInterpreterBackend::rebuildDecodedCodeCache(
     cache.codeGeneration = generation;
     cache.valid = true;
 }
+
+#undef PS2X_VU_NOINLINE
 
 void VuUnit::start(
     uint32_t startPC, uint32_t top, uint32_t itop,
@@ -562,12 +610,21 @@ VuRunResult VuUnit::continueExecution(
         gs, memory, maxCycles, true);
 }
 
-VuRunResult VuUnit::run(
+PS2X_VU_ALWAYS_INLINE VuRunResult VuUnit::run(
     uint8_t *vuCode, uint32_t codeSize,
     uint8_t *vuData, uint32_t dataSize,
     GS &gs, PS2Memory *memory, uint32_t maxCycles,
     bool traceBudgetBoundary)
 {
+    if (m_resolvedBackend == VuBackendKind::Recompiler)
+        [[unlikely]]
+    {
+        return runRecompiler(
+            vuCode, codeSize, vuData, dataSize,
+            gs, memory, maxCycles,
+            traceBudgetBoundary);
+    }
+
     RuntimeVuSideEffectSink sideEffects(gs, memory);
     VuExecutionContext context{
         .state = m_state,
@@ -580,10 +637,103 @@ VuRunResult VuUnit::run(
         .traceBudgetBoundary = traceBudgetBoundary,
         .enableInstrumentation = true,
     };
-    // Keep the currently resolved backend call concrete. This lets the
-    // optimizer specialize the permanent interpreter's hot loop while the
-    // public execution contract remains virtual for interchangeable engines.
+
+    // Keep the interpreter call concrete so auto/debug mode retains its
+    // optimizer-visible hot loop.
     return m_interpreter->run(context, maxCycles);
+}
+
+#undef PS2X_VU_ALWAYS_INLINE
+
+VuRunResult VuUnit::runRecompiler(
+    uint8_t *vuCode, uint32_t codeSize,
+    uint8_t *vuData, uint32_t dataSize,
+    GS &gs, PS2Memory *memory, uint32_t maxCycles,
+    bool traceBudgetBoundary)
+{
+    if (!m_recompiler)
+    {
+        return {
+            .requestedCycles = maxCycles,
+            .reason = VuExitReason::Fault,
+            .activeBefore = m_state.active,
+            .activeAfter = m_state.active,
+            .completed = !m_state.active,
+        };
+    }
+
+    RuntimeVuSideEffectSink sideEffects(gs, memory);
+    VuExecutionContext context{
+        .state = m_state,
+        .code = vuCode,
+        .codeSize = codeSize,
+        .data = vuData,
+        .dataSize = dataSize,
+        .sideEffects = sideEffects,
+        .memory = memory,
+        .traceBudgetBoundary = traceBudgetBoundary,
+        .enableInstrumentation = true,
+    };
+    const bool activeBefore = m_state.active;
+    uint32_t executedCycles = 0u;
+    const auto finish =
+        [&](VuRunResult result)
+        {
+            result.requestedCycles = maxCycles;
+            result.executedCycles = executedCycles;
+            result.activeBefore = activeBefore;
+            result.activeAfter = m_state.active;
+            result.completed = !m_state.active;
+            return result;
+        };
+    while (m_state.active &&
+           executedCycles < maxCycles)
+    {
+        VuRunResult result =
+            m_recompiler->run(
+                context,
+                maxCycles - executedCycles);
+        executedCycles += result.executedCycles;
+        if (result.reason ==
+            VuExitReason::XgkickBoundary)
+        {
+            if (result.executedCycles == 0u)
+            {
+                result.reason = VuExitReason::Fault;
+                return finish(result);
+            }
+            continue;
+        }
+        if (result.reason !=
+            VuExitReason::UnsupportedInstruction)
+        {
+            return finish(result);
+        }
+
+        result = m_recompiler->
+            runInterpreterFallback(context, 1u);
+        executedCycles += result.executedCycles;
+        if (result.executedCycles != 1u)
+        {
+            result.reason = VuExitReason::Fault;
+            return finish(result);
+        }
+        if (result.reason != VuExitReason::CycleBudget ||
+            !m_state.active)
+        {
+            return finish(result);
+        }
+    }
+    return {
+        .requestedCycles = maxCycles,
+        .executedCycles = executedCycles,
+        .reason = m_state.active
+                      ? VuExitReason::CycleBudget
+                      : VuExitReason::ProgramEnded,
+        .activeBefore = activeBefore,
+        .activeAfter = m_state.active,
+        .completed = !m_state.active,
+    };
 }
 
 VuRunResult VuInterpreterBackend::run(

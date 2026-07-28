@@ -32,11 +32,11 @@ high 32 bits contain a `VuNativeBlockExit`. Generated code:
   context;
 - returns only at an instruction-pair boundary.
 
-The initial backend deliberately routes each supported pair through the
-permanent interpreter's opcode helpers. That establishes native entry/exit,
-branch-delay, E-bit, Q/P/FMAC pipeline, XGKICK, cache, and invalidation behavior
-before arithmetic lowering changes. Unsupported IR exits at its original PC
-without retiring or mutating the pair.
+The backend can keep delicate pairs on permanent semantic helpers while
+lowering the measured FMAC/conversion, integer, memory, DIV, and branch
+families directly. Backend-neutral linear traces continue across sequential
+fallthrough, with canonical-PC side exits for taken control flow. Unsupported
+IR exits at its original PC without retiring or mutating the pair.
 
 The helper callback catches all exceptions. No C++ exception may unwind through
 generated code.
@@ -65,6 +65,14 @@ An armed instruction observer, progress tracker, VIF trace, or workload profile
 uses the permanent interpreter. Normal native blocks therefore carry no
 per-pair debugger callback.
 
+An explicit supported VU1 `recompiler` selection executes through `VuUnit`.
+The unit adapter continues within one scheduler budget after an internal
+XGKICK boundary. On `UnsupportedInstruction`, it executes exactly one pair
+through the interpreter and then resumes native code; diagnostics count both
+the unsupported exit and interpreter fallback pair. VU1 `auto` remains
+interpreter-selected pending the rollout performance gate, and VU0 integration
+is separate.
+
 Focused tests cover:
 
 - every possible cycle-budget cut through a synthetic FMAC, Q, memory, branch,
@@ -78,6 +86,6 @@ Focused tests cover:
 - exact MXCSR restoration around a raw native entry.
 
 Opcode families are inlined only after a measured helper-only baseline and
-pair-by-pair differential coverage. Until `VuUnit` selection is wired to this
-backend, it remains directly testable but not a selectable runtime execution
-path.
+pair-by-pair differential coverage. Four retained RAC1 VU1 programs also run
+through interpreter- and recompiler-selected `VuUnit` paths with identical
+final state, VU memory, PATH1 output, and guest-pair counts.
