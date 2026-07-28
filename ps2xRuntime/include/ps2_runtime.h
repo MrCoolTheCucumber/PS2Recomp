@@ -989,6 +989,11 @@ public:
         return m_guestExecutionPreemptionRequested.load(
             std::memory_order_acquire);
     }
+    uint64_t dmacInterruptDrainPassesForTesting() const
+    {
+        return m_dmacInterruptDrainPasses.load(
+            std::memory_order_acquire);
+    }
 
     uint64_t guestExecutionHandoffTimeouts() const
     {
@@ -1442,6 +1447,8 @@ private:
     std::atomic<uint64_t> m_guestExecutionPreemptionEpoch{0u};
     std::atomic<bool> m_guestExecutionPreemptionRequested{false};
     std::atomic<bool> m_dmacCompletionReady{false};
+    std::atomic<bool> m_dmacInterruptDeliveryDirty{false};
+    std::atomic<uint64_t> m_dmacInterruptDrainPasses{0u};
     std::vector<DmacPendingInterrupt> m_pendingDmacInterrupts;
     mutable std::mutex m_guestHeapMutex;
     mutable std::mutex m_asyncCallbackStackMutex;

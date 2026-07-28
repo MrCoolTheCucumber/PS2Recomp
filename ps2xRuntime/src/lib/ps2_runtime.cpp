@@ -2342,10 +2342,14 @@ void PS2Runtime::collectPendingDmacInterrupts()
         m_pendingDmacInterrupts.end(),
         std::make_move_iterator(pending.begin()),
         std::make_move_iterator(pending.end()));
+    m_dmacInterruptDeliveryDirty.store(
+        true, std::memory_order_release);
 }
 
 void PS2Runtime::onDmacInterruptStateChanged()
 {
+    m_dmacInterruptDeliveryDirty.store(
+        true, std::memory_order_release);
     collectPendingDmacInterrupts();
     for (const DmacPendingInterrupt &interrupt :
          m_pendingDmacInterrupts)
@@ -5450,6 +5454,13 @@ void PS2Runtime::drainPendingEeCounterHandlers(
 
 void PS2Runtime::drainCompletedDmacHandlers(uint8_t *rdram)
 {
+    if (!m_dmacInterruptDeliveryDirty.exchange(
+            false, std::memory_order_acq_rel))
+    {
+        return;
+    }
+    m_dmacInterruptDrainPasses.fetch_add(
+        1u, std::memory_order_relaxed);
     collectPendingDmacInterrupts();
 
     // A delivered handler can acknowledge this completion, start another DMA,

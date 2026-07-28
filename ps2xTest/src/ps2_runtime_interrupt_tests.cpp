@@ -1776,6 +1776,18 @@ void register_ps2_runtime_interrupt_tests()
                  (1u << 1u)) != 0u,
                 "masked completion should still latch D_STAT");
 
+            const uint64_t maskedDrainPasses =
+                env.runtime.dmacInterruptDrainPassesForTesting();
+            for (uint32_t index = 0u; index < 8u; ++index)
+            {
+                PS2Runtime::GuestExecutionScope unchangedSafeBoundary(
+                    &env.runtime, &eventCtx);
+            }
+            t.Equals(
+                env.runtime.dmacInterruptDrainPassesForTesting(),
+                maskedDrainPasses,
+                "unchanged safe boundaries should not rescan a retained masked completion");
+
             R5900Context enableCtx{};
             setRegU32(enableCtx, 4, 1u);
             {
@@ -1796,6 +1808,10 @@ void register_ps2_runtime_interrupt_tests()
                 g_dmacSendHits.load(std::memory_order_relaxed),
                 1u,
                 "the next safe boundary should deliver the unmasked cause");
+            t.Equals(
+                env.runtime.dmacInterruptDrainPassesForTesting(),
+                maskedDrainPasses + 1u,
+                "unmasking should schedule exactly one new delivery scan");
             cleanupRuntime(env);
         });
 
