@@ -5,6 +5,7 @@
 #include "ps2_runtime.h"
 #include "ps2_syscalls.h"
 #include "runtime/ps2_vu_program_cache.h"
+#include "runtime/ps2_vu_recompiler.h"
 #include "runtime/ps2_watchdog.h"
 
 #include "rapidjson/document.h"
@@ -48,6 +49,8 @@ namespace
     constexpr uint64_t kMaxTimeoutMs = 86400000u;
     constexpr uint64_t kDefaultWatchdogIntervalMs = 1000u;
     constexpr uint64_t kDefaultWatchdogThresholdMs = 15000u;
+    constexpr size_t kStatusBlockProfileRecords = 16u;
+    constexpr size_t kMaximumBlockProfilePageRecords = 256u;
 
     using Document = rapidjson::Document;
     using Value = rapidjson::Value;
@@ -89,6 +92,15 @@ namespace
     {
         std::ostringstream output;
         output << "0x" << std::hex << std::setw(8) << std::setfill('0') << address;
+        return output.str();
+    }
+
+    std::string hostAddressString(uint64_t address)
+    {
+        std::ostringstream output;
+        output
+            << "0x" << std::hex << std::setw(16)
+            << std::setfill('0') << address;
         return output.str();
     }
 
@@ -713,6 +725,159 @@ struct PS2DebugServer::Impl
         return result;
     }
 
+    Value blockProfileRecord(
+        const PS2Runtime::DebugVuRecompilerDiagnostics::
+            BlockProfile &block,
+        Allocator &allocator)
+    {
+        Value result(rapidjson::kObjectType);
+        result.AddMember(
+            "compilation_id",
+            block.compilationIdentity,
+            allocator);
+        result.AddMember(
+            "code_content_identity",
+            block.codeContentIdentity,
+            allocator);
+        result.AddMember(
+            "compilation_generation",
+            block.compilationGeneration,
+            allocator);
+        addString(
+            result, "native_address",
+            hostAddressString(block.nativeAddress),
+            allocator);
+        result.AddMember(
+            "native_bytes",
+            block.nativeBytes,
+            allocator);
+        addString(
+            result, "entry_pc",
+            addressString(block.entryPc),
+            allocator);
+        addString(
+            result, "first_pc",
+            addressString(block.firstPc),
+            allocator);
+        addString(
+            result, "last_pc",
+            addressString(block.lastPc),
+            allocator);
+        result.AddMember(
+            "block_pairs",
+            block.blockPairs,
+            allocator);
+        result.AddMember(
+            "fixed_cycles",
+            block.fixedCycles,
+            allocator);
+        addString(
+            result, "compilation_mode",
+            block.compilationMode,
+            allocator);
+        addString(
+            result, "block_exit",
+            block.blockExit,
+            allocator);
+        result.AddMember(
+            "resident",
+            block.resident,
+            allocator);
+        result.AddMember(
+            "executions",
+            block.executions,
+            allocator);
+        result.AddMember(
+            "guest_pairs",
+            block.guestPairs,
+            allocator);
+        result.AddMember(
+            "full_budget_entries",
+            block.fullBudgetEntries,
+            allocator);
+        result.AddMember(
+            "bounded_entries",
+            block.boundedEntries,
+            allocator);
+        result.AddMember(
+            "linked_edges",
+            block.linkedEdges,
+            allocator);
+        result.AddMember(
+            "helper_barriers",
+            block.helperBarriers,
+            allocator);
+
+        Value exits(rapidjson::kObjectType);
+        static_assert(
+            kVuNativeBlockExitCount ==
+            std::tuple_size_v<
+                decltype(block.exitReasons)>);
+        for (size_t exit = 0u;
+             exit < block.exitReasons.size();
+             ++exit)
+        {
+            Value exitName =
+                makeString(
+                    vuNativeBlockExitName(
+                        static_cast<
+                            VuNativeBlockExit>(
+                            exit)),
+                    allocator);
+            exits.AddMember(
+                exitName,
+                block.exitReasons[exit],
+                allocator);
+        }
+        result.AddMember(
+            "exit_reasons", exits,
+            allocator);
+
+        Value opcodes(rapidjson::kArrayType);
+        for (const auto &opcode :
+             block.opcodeCounts)
+        {
+            Value opcodeValue(
+                rapidjson::kObjectType);
+            addString(
+                opcodeValue, "name",
+                opcode.name, allocator);
+            opcodeValue.AddMember(
+                "operations",
+                opcode.operations,
+                allocator);
+            opcodes.PushBack(
+                opcodeValue, allocator);
+        }
+        result.AddMember(
+            "opcodes", opcodes,
+            allocator);
+
+        Value registrations(
+            rapidjson::kArrayType);
+        for (const auto &registration :
+             block.jitRegistrations)
+        {
+            Value registrationValue(
+                rapidjson::kObjectType);
+            registrationValue.AddMember(
+                "generation",
+                registration.generation,
+                allocator);
+            registrationValue.AddMember(
+                "code_index",
+                registration.codeIndex,
+                allocator);
+            registrations.PushBack(
+                registrationValue,
+                allocator);
+        }
+        result.AddMember(
+            "jit_registrations",
+            registrations, allocator);
+        return result;
+    }
+
     Value status(Allocator &allocator)
     {
         const PS2Runtime::DebugRuntimeProgress core =
@@ -914,6 +1079,72 @@ struct PS2DebugServer::Impl
                     "code_image_catalog_evictions",
                     source.codeImageCatalogEvictions,
                     allocator);
+                recompiler.AddMember(
+                    "jitdump_registrations",
+                    source.jitDumpRegistrations,
+                    allocator);
+                recompiler.AddMember(
+                    "jitdump_failures",
+                    source.jitDumpFailures,
+                    allocator);
+                if (!source.lastJitDiagnostic.empty())
+                {
+                    addString(
+                        recompiler,
+                        "last_jitdump_diagnostic",
+                        source.lastJitDiagnostic,
+                        allocator);
+                }
+
+                Value blockProfile(
+                    rapidjson::kObjectType);
+                blockProfile.AddMember(
+                    "enabled",
+                    source.blockProfileEnabled,
+                    allocator);
+                blockProfile.AddMember(
+                    "maximum_records",
+                    source.blockProfileMaximumRecords,
+                    allocator);
+                blockProfile.AddMember(
+                    "dropped_records",
+                    source.blockProfileDroppedRecords,
+                    allocator);
+                blockProfile.AddMember(
+                    "record_count",
+                    static_cast<uint64_t>(
+                        source.blockProfiles.size()),
+                    allocator);
+                const size_t returnedRecords =
+                    std::min(
+                        source.blockProfiles.size(),
+                        kStatusBlockProfileRecords);
+                blockProfile.AddMember(
+                    "returned_records",
+                    static_cast<uint64_t>(
+                        returnedRecords),
+                    allocator);
+                blockProfile.AddMember(
+                    "records_truncated",
+                    returnedRecords <
+                        source.blockProfiles.size(),
+                    allocator);
+                Value blocks(rapidjson::kArrayType);
+                for (size_t index = 0u;
+                     index < returnedRecords;
+                     ++index)
+                {
+                    blocks.PushBack(
+                        blockProfileRecord(
+                            source.blockProfiles[index],
+                            allocator),
+                        allocator);
+                }
+                blockProfile.AddMember(
+                    "blocks", blocks, allocator);
+                recompiler.AddMember(
+                    "block_profile",
+                    blockProfile, allocator);
                 value.AddMember(
                     "recompiler", recompiler, allocator);
             }
@@ -1001,6 +1232,137 @@ struct PS2DebugServer::Impl
         return result;
     }
 
+    Value vuBlockProfile(
+        const Value *params,
+        Allocator &allocator)
+    {
+        if (!runtime.debugIsPaused())
+        {
+            throw RequestError(
+                -32002,
+                "VU block profiles require a paused guest");
+        }
+        const std::string unitName =
+            requiredString(params, "unit");
+        size_t unitIndex = 0u;
+        if (unitName == "vu0")
+        {
+            unitIndex = 0u;
+        }
+        else if (unitName == "vu1")
+        {
+            unitIndex = 1u;
+        }
+        else
+        {
+            throw RequestError(
+                -32602,
+                "unit must be vu0 or vu1");
+        }
+        const uint64_t offsetValue =
+            requiredUnsigned(params, "offset");
+        const uint64_t limitValue =
+            requiredUnsigned(params, "limit");
+        if (offsetValue >
+                std::numeric_limits<size_t>::max() ||
+            limitValue == 0u ||
+            limitValue >
+                kMaximumBlockProfilePageRecords)
+        {
+            throw RequestError(
+                -32602,
+                "offset is too large or limit is outside 1..256");
+        }
+
+        const auto snapshots =
+            runtime.debugVuBackendDiagnosticsSnapshot();
+        const auto &diagnostics =
+            snapshots[unitIndex];
+        if (!diagnostics.captured ||
+            !diagnostics.recompilerCreated)
+        {
+            throw RequestError(
+                -32003,
+                "VU recompiler diagnostics are unavailable");
+        }
+        const auto &source =
+            diagnostics.recompiler;
+        const size_t offset =
+            static_cast<size_t>(offsetValue);
+        if (offset > source.blockProfiles.size())
+        {
+            throw RequestError(
+                -32602,
+                "offset exceeds the block profile record count");
+        }
+        const size_t returned =
+            std::min(
+                static_cast<size_t>(limitValue),
+                source.blockProfiles.size() -
+                    offset);
+        const size_t nextOffset =
+            offset + returned;
+
+        Value result(rapidjson::kObjectType);
+        result.AddMember(
+            "schema_version", 1u, allocator);
+        addString(
+            result, "unit", unitName,
+            allocator);
+        result.AddMember(
+            "snapshot_sequence",
+            diagnostics.snapshotSequence,
+            allocator);
+        result.AddMember(
+            "enabled",
+            source.blockProfileEnabled,
+            allocator);
+        result.AddMember(
+            "maximum_records",
+            source.blockProfileMaximumRecords,
+            allocator);
+        result.AddMember(
+            "dropped_records",
+            source.blockProfileDroppedRecords,
+            allocator);
+        result.AddMember(
+            "record_count",
+            static_cast<uint64_t>(
+                source.blockProfiles.size()),
+            allocator);
+        result.AddMember(
+            "offset",
+            static_cast<uint64_t>(offset),
+            allocator);
+        result.AddMember(
+            "returned_records",
+            static_cast<uint64_t>(returned),
+            allocator);
+        result.AddMember(
+            "next_offset",
+            static_cast<uint64_t>(nextOffset),
+            allocator);
+        result.AddMember(
+            "complete",
+            nextOffset ==
+                source.blockProfiles.size(),
+            allocator);
+        Value blocks(rapidjson::kArrayType);
+        for (size_t index = offset;
+             index < nextOffset;
+             ++index)
+        {
+            blocks.PushBack(
+                blockProfileRecord(
+                    source.blockProfiles[index],
+                    allocator),
+                allocator);
+        }
+        result.AddMember(
+            "blocks", blocks, allocator);
+        return result;
+    }
+
     Value hello(Allocator &allocator)
     {
         Value result = status(allocator);
@@ -1016,7 +1378,7 @@ struct PS2DebugServer::Impl
                  "trace.ee-events",
                  "diagnostics.status", "watchdog.status",
                  "input.pad.status", "input.pad.override",
-                 "vu.backend.set"})
+                 "vu.backend.set", "vu.block-profile"})
         {
             capabilities.PushBack(Value(capability, allocator), allocator);
         }
@@ -3279,6 +3641,10 @@ struct PS2DebugServer::Impl
         if (method == "vu.backend.set")
         {
             return vuBackendSet(params, allocator);
+        }
+        if (method == "vu.block-profile")
+        {
+            return vuBlockProfile(params, allocator);
         }
         if (method == "trace.vu0-sync.start")
         {

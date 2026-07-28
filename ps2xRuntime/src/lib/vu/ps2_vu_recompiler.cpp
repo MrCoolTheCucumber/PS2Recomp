@@ -1,12 +1,19 @@
 #include "runtime/ps2_vu_recompiler.h"
 
 #include "runtime/ps2_memory.h"
+#include "runtime/ps2_perf_jitdump.h"
 #include "ps2_vu_float_mode.h"
 
+#include <atomic>
+#include <charconv>
 #include <chrono>
 #include <cstddef>
+#include <cstdlib>
 #include <cstring>
 #include <exception>
+#include <iomanip>
+#include <limits>
+#include <sstream>
 #include <type_traits>
 #include <utility>
 #include <vector>
@@ -20,6 +27,35 @@
 #include <xbyak/xbyak_util.h>
 #endif
 
+struct VuBlockProfileRecord
+{
+    VuProgramKey key{};
+    uint64_t compilationIdentity = 0u;
+    uint64_t nativeAddress = 0u;
+    uint64_t nativeBytes = 0u;
+    uint32_t firstPc = 0u;
+    uint32_t lastPc = 0u;
+    uint32_t blockPairs = 0u;
+    uint32_t fixedCycles = 0u;
+    VuIrBlockExit blockExit = VuIrBlockExit::PairLimit;
+    std::weak_ptr<void> codeLifetime;
+    bool archived = false;
+    uint64_t executions = 0u;
+    uint64_t guestPairs = 0u;
+    uint64_t fullBudgetEntries = 0u;
+    uint64_t boundedEntries = 0u;
+    uint64_t linkedEdges = 0u;
+    uint64_t helperBarriers = 0u;
+    std::array<
+        uint64_t,
+        kVuNativeBlockExitCount> exitReasons{};
+    std::array<
+        uint64_t,
+        kVuIrOpcodeCount> opcodeOperations{};
+    std::vector<VuBlockJitRegistrationSnapshot>
+        jitRegistrations;
+};
+
 namespace
 {
     using Clock = std::chrono::steady_clock;
@@ -29,6 +65,95 @@ namespace
         14695981039346656037ull;
     constexpr uint64_t kFnv1a64Prime =
         1099511628211ull;
+    constexpr size_t kDefaultMaximumBlockProfiles =
+        16384u;
+    std::atomic<uint64_t> g_nextCompilationIdentity{1u};
+
+    bool environmentFlagEnabled(const char *value)
+    {
+        if (!value || value[0] == '\0')
+            return false;
+        return
+            std::strcmp(value, "0") != 0 &&
+            std::strcmp(value, "false") != 0 &&
+            std::strcmp(value, "FALSE") != 0 &&
+            std::strcmp(value, "off") != 0 &&
+            std::strcmp(value, "OFF") != 0 &&
+            std::strcmp(value, "no") != 0 &&
+            std::strcmp(value, "NO") != 0;
+    }
+
+    VuBlockProfilingConfiguration
+    blockProfilingConfigurationFromEnvironment()
+    {
+        VuBlockProfilingConfiguration configuration{
+            .enabled = environmentFlagEnabled(
+                std::getenv(
+                    "PS2X_VU_BLOCK_PROFILE")),
+            .maximumRecords =
+                kDefaultMaximumBlockProfiles,
+        };
+        if (const char *const text =
+                std::getenv(
+                    "PS2X_VU_BLOCK_PROFILE_LIMIT");
+            text && text[0] != '\0')
+        {
+            uint64_t value = 0u;
+            const char *const end =
+                text + std::strlen(text);
+            const auto result =
+                std::from_chars(text, end, value);
+            if (result.ec == std::errc{} &&
+                result.ptr == end &&
+                value != 0u &&
+                value <=
+                    std::numeric_limits<size_t>::max())
+            {
+                configuration.maximumRecords =
+                    static_cast<size_t>(value);
+            }
+        }
+        return configuration;
+    }
+
+    uint64_t nextCompilationIdentity()
+    {
+        uint64_t value =
+            g_nextCompilationIdentity.fetch_add(
+                1u, std::memory_order_relaxed);
+        if (value == 0u)
+        {
+            value =
+                g_nextCompilationIdentity.fetch_add(
+                    1u, std::memory_order_relaxed);
+        }
+        return value;
+    }
+
+    void recordBlockExecution(
+        VuBlockProfileRecord *profile,
+        uint32_t remainingCycles,
+        const VuNativeBlockResult &result,
+        uint64_t helperPairs)
+    {
+        if (!profile)
+            return;
+        ++profile->executions;
+        profile->guestPairs += result.executedCycles;
+        if (remainingCycles >= profile->fixedCycles)
+            ++profile->fullBudgetEntries;
+        else
+            ++profile->boundedEntries;
+        profile->helperBarriers += helperPairs;
+        size_t exitIndex =
+            static_cast<size_t>(result.exit);
+        if (exitIndex >= kVuNativeBlockExitCount)
+        {
+            exitIndex = static_cast<size_t>(
+                VuNativeBlockExit::Fault);
+        }
+        ++profile->exitReasons[exitIndex];
+    }
 
     bool fail(
         std::string message, std::string *diagnostic)
@@ -2969,9 +3094,146 @@ std::string_view vuNativeBlockExitName(
     return "unknown";
 }
 
+std::string vuPerfJitSymbolName(
+    const VuProgramKey &key,
+    const VuIrBlock &block,
+    uint64_t compilationIdentity)
+{
+    const uint32_t firstPc =
+        block.pairs.empty()
+            ? key.entryPc
+            : block.pairs.front().pc;
+    const uint32_t lastPc =
+        block.pairs.empty()
+            ? key.entryPc
+            : block.pairs.back().pc;
+    std::ostringstream output;
+    output
+        << "ps2x-"
+        << (key.unit == VuUnitId::Vu0
+                ? "vu0" : "vu1")
+        << "-code-"
+        << std::hex << std::setfill('0')
+        << std::setw(16)
+        << key.codeContentIdentity
+        << "-size-"
+        << std::setw(4) << key.codeSize
+        << "-gen-"
+        << std::setw(16)
+        << key.codeGeneration
+        << "-entry-"
+        << std::setw(4) << key.entryPc
+        << "-pcs-"
+        << std::setw(4) << firstPc
+        << "-" << std::setw(4) << lastPc
+        << "-"
+        << (key.compilationMode ==
+                    VuCompilationMode::Instrumented
+                ? "instrumented" : "normal")
+        << "-compile-"
+        << std::setw(16)
+        << compilationIdentity;
+    return output.str();
+}
+
 VuRecompilerBackend::VuRecompilerBackend(VuUnit &unit)
+    : VuRecompilerBackend(
+          unit,
+          blockProfilingConfigurationFromEnvironment())
+{
+}
+
+VuRecompilerBackend::VuRecompilerBackend(
+    VuUnit &unit,
+    VuBlockProfilingConfiguration configuration)
     : m_unit(unit), m_semantics(unit)
 {
+    m_blockProfilingEnabled = configuration.enabled;
+    m_maximumBlockProfiles =
+        configuration.maximumRecords;
+    m_perfJitDumpEnabled =
+        ps2PerfJitDumpEnvironmentRequested();
+    if (m_perfJitDumpEnabled)
+    {
+        (void)ps2PerfJitDumpInitialize(
+            &m_lastJitDiagnostic);
+    }
+    if (m_blockProfilingEnabled)
+    {
+        m_blockProfiles.reserve(
+            std::min<size_t>(
+                m_maximumBlockProfiles,
+                kDefaultMaximumBlockProfiles));
+    }
+}
+
+VuBlockProfilingSnapshot
+VuRecompilerBackend::
+    blockProfilingSnapshotWhileExecutionQuiescent() const
+{
+    VuBlockProfilingSnapshot snapshot{
+        .enabled = m_blockProfilingEnabled,
+        .maximumRecords =
+            static_cast<uint64_t>(
+                m_maximumBlockProfiles),
+        .droppedRecords =
+            m_droppedBlockProfiles,
+    };
+    snapshot.blocks.reserve(m_blockProfiles.size());
+    for (const auto &sourcePointer : m_blockProfiles)
+    {
+        if (!sourcePointer)
+            continue;
+        const VuBlockProfileRecord &source =
+            *sourcePointer;
+        VuBlockProfileSnapshot block{
+            .key = source.key,
+            .compilationIdentity =
+                source.compilationIdentity,
+            .nativeAddress = source.nativeAddress,
+            .nativeBytes = source.nativeBytes,
+            .firstPc = source.firstPc,
+            .lastPc = source.lastPc,
+            .blockPairs = source.blockPairs,
+            .fixedCycles = source.fixedCycles,
+            .blockExit = source.blockExit,
+            .resident =
+                !source.codeLifetime.expired(),
+            .executions = source.executions,
+            .guestPairs = source.guestPairs,
+            .fullBudgetEntries =
+                source.fullBudgetEntries,
+            .boundedEntries =
+                source.boundedEntries,
+            .linkedEdges = source.linkedEdges,
+            .helperBarriers =
+                source.helperBarriers,
+            .exitReasons = source.exitReasons,
+            .opcodeOperations =
+                source.opcodeOperations,
+            .jitRegistrations =
+                source.jitRegistrations,
+        };
+        snapshot.blocks.push_back(std::move(block));
+    }
+    return snapshot;
+}
+
+void VuRecompilerBackend::
+    resetBlockProfilingCountersWhileExecutionQuiescent()
+{
+    for (const auto &profile : m_blockProfiles)
+    {
+        if (!profile)
+            continue;
+        profile->executions = 0u;
+        profile->guestPairs = 0u;
+        profile->fullBudgetEntries = 0u;
+        profile->boundedEntries = 0u;
+        profile->linkedEdges = 0u;
+        profile->helperBarriers = 0u;
+        profile->exitReasons.fill(0u);
+    }
 }
 
 std::string_view VuRecompilerBackend::name() const
@@ -3389,151 +3651,188 @@ VuRunResult VuRecompilerBackend::run(
         .dataSize = context.dataSize,
     };
     m_instrumentedPairIndex = 0u;
-    while (state.active && totalExecuted < maximumCycles)
+    const auto runNativeBlocks =
+        [&]<bool ProfileBlocks>(
+            std::bool_constant<ProfileBlocks>)
+            -> VuRunResult
     {
-        key.entryPc = state.pc;
-        if ((key.entryPc & 7u) != 0u ||
-            key.entryPc >= key.codeSize)
+        while (state.active &&
+               totalExecuted < maximumCycles)
         {
-            m_lastDiagnostic =
-                "native VU block entry PC is outside its code extent";
-            ++m_diagnostics.faultExits;
-            return finish(totalExecuted, VuExitReason::Fault);
-        }
-
-        VuProgramCache &cache =
-            m_unit.programCache();
-        const size_t dispatchIndex =
-            key.entryPc / 8u;
-        VuProgramHandle handle =
-            m_dispatchHandles[dispatchIndex];
-        const VuCompiledProgram *program =
-            cache.resolveCurrent(handle, key);
-        if (!program)
-        {
-            handle = lookupOrCompile(context, key);
-            program = cache.resolve(handle);
-            if (program)
-            {
-                m_dispatchHandles[dispatchIndex] =
-                    handle;
-            }
-        }
-        if (!program)
-        {
-            if (m_lastDiagnostic.empty())
+            key.entryPc = state.pc;
+            if ((key.entryPc & 7u) != 0u ||
+                key.entryPc >= key.codeSize)
             {
                 m_lastDiagnostic =
-                    "compiled VU program handle did not resolve";
-            }
-            ++m_diagnostics.faultExits;
-            return finish(totalExecuted, VuExitReason::Fault);
-        }
-
-        VuNativeFastBlockEntry entry = nullptr;
-        const void *const address =
-            program->nativeFastEntry();
-        static_assert(sizeof(entry) == sizeof(address));
-        std::memcpy(&entry, &address, sizeof(entry));
-
-        const uint32_t remaining =
-            maximumCycles - totalExecuted;
-        const uint64_t helperPairsBefore =
-            m_helperPairsIssued;
-        const VuNativeBlockResult native =
-            VuNativeBlockResult::decode(
-                entry(
-                    &context, remaining,
-                    &nativeContextView));
-        const uint64_t helperPairs =
-            m_helperPairsIssued - helperPairsBefore;
-        ++m_diagnostics.nativeEntries;
-        if (nativeInstrumentation)
-        {
-            ++m_diagnostics.instrumentedNativeEntries;
-        }
-        if (native.executedCycles > remaining)
-        {
-            m_lastDiagnostic =
-                "native VU block exceeded its cycle budget";
-            ++m_diagnostics.faultExits;
-            return finish(totalExecuted, VuExitReason::Fault);
-        }
-        if (helperPairs > native.executedCycles)
-        {
-            m_lastDiagnostic =
-                "native VU block reported fewer cycles than its helpers";
-            ++m_diagnostics.faultExits;
-            return finish(totalExecuted, VuExitReason::Fault);
-        }
-
-        totalExecuted += native.executedCycles;
-        state.issuedCycles += native.executedCycles;
-        m_diagnostics.nativePairs +=
-            native.executedCycles;
-        if (nativeInstrumentation)
-        {
-            m_diagnostics.instrumentedNativePairs +=
-                native.executedCycles;
-        }
-        m_diagnostics.helperPairs += helperPairs;
-        m_diagnostics.inlinePairs +=
-            native.executedCycles - helperPairs;
-        progress.publish();
-
-        const uint64_t currentGeneration =
-            key.unit == VuUnitId::Vu0
-                ? context.memory->getVU0CodeGeneration()
-                : context.memory->getVU1CodeGeneration();
-        if (currentGeneration != key.codeGeneration)
-        {
-            VuProgramKey currentKey = key;
-            currentKey.codeGeneration = currentGeneration;
-            (void)m_unit.programCache().lookup(currentKey);
-            ++m_diagnostics.codeInvalidationExits;
-            return finish(
-                totalExecuted, VuExitReason::CodeInvalidated);
-        }
-
-        switch (native.exit)
-        {
-        case VuNativeBlockExit::BlockComplete:
-            ++m_diagnostics.blockCompletes;
-            if (native.executedCycles == 0u)
-            {
-                m_lastDiagnostic =
-                    "native VU block completed without progress";
+                    "native VU block entry PC is outside its code extent";
                 ++m_diagnostics.faultExits;
                 return finish(
                     totalExecuted, VuExitReason::Fault);
             }
-            continue;
-        case VuNativeBlockExit::CycleBudget:
-            ++m_diagnostics.cycleBudgetExits;
-            return finish(
-                totalExecuted, VuExitReason::CycleBudget);
-        case VuNativeBlockExit::XgkickBoundary:
-            ++m_diagnostics.xgkickExits;
-            return finish(
-                totalExecuted, VuExitReason::XgkickBoundary);
-        case VuNativeBlockExit::UnsupportedInstruction:
-            ++m_diagnostics.unsupportedExits;
-            return finish(
-                totalExecuted,
-                VuExitReason::UnsupportedInstruction);
-        case VuNativeBlockExit::Fault:
-            m_lastDiagnostic =
-                "native VU pair helper reported a fault";
-            ++m_diagnostics.faultExits;
-            return finish(totalExecuted, VuExitReason::Fault);
-        default:
-            return finish(
-                totalExecuted, publicExit(native.exit));
-        }
-    }
 
-    ++m_diagnostics.cycleBudgetExits;
-    return finish(totalExecuted, VuExitReason::CycleBudget);
+            VuProgramCache &cache =
+                m_unit.programCache();
+            const size_t dispatchIndex =
+                key.entryPc / 8u;
+            VuProgramHandle handle =
+                m_dispatchHandles[dispatchIndex];
+            const VuCompiledProgram *program =
+                cache.resolveCurrent(handle, key);
+            if (!program)
+            {
+                handle = lookupOrCompile(context, key);
+                program = cache.resolve(handle);
+                if (program)
+                {
+                    m_dispatchHandles[dispatchIndex] =
+                        handle;
+                }
+            }
+            if (!program)
+            {
+                if (m_lastDiagnostic.empty())
+                {
+                    m_lastDiagnostic =
+                        "compiled VU program handle did not resolve";
+                }
+                ++m_diagnostics.faultExits;
+                return finish(
+                    totalExecuted, VuExitReason::Fault);
+            }
+
+            VuNativeFastBlockEntry entry = nullptr;
+            const void *const address =
+                program->nativeFastEntry();
+            static_assert(
+                sizeof(entry) == sizeof(address));
+            std::memcpy(
+                &entry, &address, sizeof(entry));
+
+            const uint32_t remaining =
+                maximumCycles - totalExecuted;
+            const uint64_t helperPairsBefore =
+                m_helperPairsIssued;
+            const VuNativeBlockResult native =
+                VuNativeBlockResult::decode(
+                    entry(
+                        &context, remaining,
+                        &nativeContextView));
+            const uint64_t helperPairs =
+                m_helperPairsIssued -
+                helperPairsBefore;
+            ++m_diagnostics.nativeEntries;
+            if constexpr (ProfileBlocks)
+            {
+                recordBlockExecution(
+                    program->blockProfile.get(),
+                    remaining, native, helperPairs);
+            }
+            if (nativeInstrumentation)
+            {
+                ++m_diagnostics.instrumentedNativeEntries;
+            }
+            if (native.executedCycles > remaining)
+            {
+                m_lastDiagnostic =
+                    "native VU block exceeded its cycle budget";
+                ++m_diagnostics.faultExits;
+                return finish(
+                    totalExecuted, VuExitReason::Fault);
+            }
+            if (helperPairs > native.executedCycles)
+            {
+                m_lastDiagnostic =
+                    "native VU block reported fewer cycles than its helpers";
+                ++m_diagnostics.faultExits;
+                return finish(
+                    totalExecuted, VuExitReason::Fault);
+            }
+
+            totalExecuted += native.executedCycles;
+            state.issuedCycles += native.executedCycles;
+            m_diagnostics.nativePairs +=
+                native.executedCycles;
+            if (nativeInstrumentation)
+            {
+                m_diagnostics.instrumentedNativePairs +=
+                    native.executedCycles;
+            }
+            m_diagnostics.helperPairs += helperPairs;
+            m_diagnostics.inlinePairs +=
+                native.executedCycles - helperPairs;
+            progress.publish();
+
+            const uint64_t currentGeneration =
+                key.unit == VuUnitId::Vu0
+                    ? context.memory->
+                          getVU0CodeGeneration()
+                    : context.memory->
+                          getVU1CodeGeneration();
+            if (currentGeneration !=
+                key.codeGeneration)
+            {
+                VuProgramKey currentKey = key;
+                currentKey.codeGeneration =
+                    currentGeneration;
+                (void)m_unit.programCache().lookup(
+                    currentKey);
+                ++m_diagnostics.codeInvalidationExits;
+                return finish(
+                    totalExecuted,
+                    VuExitReason::CodeInvalidated);
+            }
+
+            switch (native.exit)
+            {
+            case VuNativeBlockExit::BlockComplete:
+                ++m_diagnostics.blockCompletes;
+                if (native.executedCycles == 0u)
+                {
+                    m_lastDiagnostic =
+                        "native VU block completed without progress";
+                    ++m_diagnostics.faultExits;
+                    return finish(
+                        totalExecuted,
+                        VuExitReason::Fault);
+                }
+                continue;
+            case VuNativeBlockExit::CycleBudget:
+                ++m_diagnostics.cycleBudgetExits;
+                return finish(
+                    totalExecuted,
+                    VuExitReason::CycleBudget);
+            case VuNativeBlockExit::XgkickBoundary:
+                ++m_diagnostics.xgkickExits;
+                return finish(
+                    totalExecuted,
+                    VuExitReason::XgkickBoundary);
+            case VuNativeBlockExit::
+                UnsupportedInstruction:
+                ++m_diagnostics.unsupportedExits;
+                return finish(
+                    totalExecuted,
+                    VuExitReason::
+                        UnsupportedInstruction);
+            case VuNativeBlockExit::Fault:
+                m_lastDiagnostic =
+                    "native VU pair helper reported a fault";
+                ++m_diagnostics.faultExits;
+                return finish(
+                    totalExecuted, VuExitReason::Fault);
+            default:
+                return finish(
+                    totalExecuted,
+                    publicExit(native.exit));
+            }
+        }
+
+        ++m_diagnostics.cycleBudgetExits;
+        return finish(
+            totalExecuted, VuExitReason::CycleBudget);
+    };
+    if (m_blockProfilingEnabled)
+        return runNativeBlocks(std::true_type{});
+    return runNativeBlocks(std::false_type{});
 }
 
 VuRunResult VuRecompilerBackend::runInterpreterFallback(
@@ -3879,7 +4178,14 @@ VuProgramHandle VuRecompilerBackend::lookupOrCompile(
     VuProgramCache &cache = m_unit.programCache();
     VuProgramHandle handle = cache.lookup(key);
     if (handle.valid())
+    {
+        if (const VuCompiledProgram *const program =
+                cache.resolve(handle))
+        {
+            ensureJitRegistration(*program);
+        }
         return handle;
+    }
 
     VuCompiledProgram program;
     if (!compile(
@@ -3890,7 +4196,68 @@ VuProgramHandle VuRecompilerBackend::lookupOrCompile(
     }
     handle = cache.insert(
         std::move(program), &m_lastDiagnostic);
+    if (const VuCompiledProgram *const inserted =
+            cache.resolve(handle))
+    {
+        if (inserted->blockProfile &&
+            !inserted->blockProfile->archived)
+        {
+            inserted->blockProfile->archived = true;
+            m_blockProfiles.push_back(
+                inserted->blockProfile);
+        }
+        ensureJitRegistration(*inserted);
+    }
     return handle;
+}
+
+void VuRecompilerBackend::ensureJitRegistration(
+    const VuCompiledProgram &program)
+{
+    if (!m_perfJitDumpEnabled ||
+        program.jitCodeIndex != 0u)
+    {
+        return;
+    }
+    const uint8_t *const code =
+        program.nativeCode.executableData();
+    const size_t sizeBytes =
+        program.nativeCode.usedSize();
+    if (!code || sizeBytes == 0u)
+    {
+        ++m_diagnostics.jitDumpFailures;
+        m_lastJitDiagnostic =
+            "compiled VU program has no code to register";
+        return;
+    }
+
+    const std::string symbol =
+        vuPerfJitSymbolName(
+            program.key, program.block,
+            program.compilationIdentity);
+    uint64_t codeIndex = 0u;
+    std::string diagnostic;
+    if (!ps2PerfJitDumpRegisterCode(
+            code, sizeBytes, symbol,
+            &codeIndex, &diagnostic))
+    {
+        ++m_diagnostics.jitDumpFailures;
+        m_lastJitDiagnostic = std::move(diagnostic);
+        return;
+    }
+
+    program.jitCodeIndex = codeIndex;
+    ++m_diagnostics.jitDumpRegistrations;
+    m_lastJitDiagnostic.clear();
+    if (program.blockProfile)
+    {
+        program.blockProfile->
+            jitRegistrations.push_back({
+                .generation =
+                    program.key.codeGeneration,
+                .codeIndex = codeIndex,
+            });
+    }
 }
 
 bool VuRecompilerBackend::compile(
@@ -3959,6 +4326,66 @@ bool VuRecompilerBackend::compile(
                     std::chrono::nanoseconds>(
                     Clock::now() - start)
                     .count());
+        const uint64_t compilationIdentity =
+            m_blockProfilingEnabled ||
+                    m_perfJitDumpEnabled
+                ? nextCompilationIdentity()
+                : 0u;
+        std::shared_ptr<VuBlockProfileRecord>
+            blockProfile;
+        std::shared_ptr<void> blockProfileLifetime;
+        if (m_blockProfilingEnabled)
+        {
+            if (m_blockProfiles.size() >=
+                m_maximumBlockProfiles)
+            {
+                ++m_droppedBlockProfiles;
+            }
+            else
+            {
+                blockProfile =
+                    std::make_shared<
+                        VuBlockProfileRecord>();
+                blockProfileLifetime =
+                    std::make_shared<uint8_t>(0u);
+                blockProfile->key = key;
+                blockProfile->compilationIdentity =
+                    compilationIdentity;
+                blockProfile->nativeAddress =
+                    static_cast<uint64_t>(
+                        reinterpret_cast<uintptr_t>(
+                            nativeCode.executableData()));
+                blockProfile->nativeBytes =
+                    static_cast<uint64_t>(
+                        nativeCode.usedSize());
+                blockProfile->blockPairs =
+                    static_cast<uint32_t>(
+                        block.pairs.size());
+                blockProfile->blockExit = block.exit;
+                blockProfile->firstPc =
+                    block.pairs.empty()
+                        ? key.entryPc
+                        : block.pairs.front().pc;
+                blockProfile->lastPc =
+                    block.pairs.empty()
+                        ? key.entryPc
+                        : block.pairs.back().pc;
+                for (const VuIrInstructionPair &pair :
+                     block.pairs)
+                {
+                    blockProfile->fixedCycles +=
+                        pair.cycles;
+                    ++blockProfile->opcodeOperations[
+                        static_cast<size_t>(
+                            pair.upper.opcode)];
+                    ++blockProfile->opcodeOperations[
+                        static_cast<size_t>(
+                            pair.lower.opcode)];
+                }
+                blockProfile->codeLifetime =
+                    blockProfileLifetime;
+            }
+        }
         program = {
             .key = key,
             .block = std::move(block),
@@ -3967,6 +4394,12 @@ bool VuRecompilerBackend::compile(
             .fastEntryOffset =
                 emitter.fastEntryOffset(),
             .compilationNanoseconds = nanoseconds,
+            .compilationIdentity =
+                compilationIdentity,
+            .blockProfile =
+                std::move(blockProfile),
+            .blockProfileLifetime =
+                std::move(blockProfileLifetime),
         };
         diagnostic.clear();
         return true;

@@ -88,6 +88,64 @@ Each `cache-churn-sample` flushes the VU program cache before every timed
 invocation. It requires a recompiler-enabled backend selection and verifies
 the exact same output as the warm and cold paths.
 
+## Generated-block attribution
+
+Two independent, opt-in facilities attribute native VU work. Both are
+disabled by default:
+
+```sh
+PS2X_PERF_JITDUMP=1 \
+PS2X_PERF_JITDUMP_DIR="$PWD/profile" \
+PS2X_VU_BLOCK_PROFILE=1 \
+PS2X_VU_BLOCK_PROFILE_LIMIT=16384 \
+ps2EntryRunner GAME.ELF GAME.iso
+```
+
+`PS2X_PERF_JITDUMP` creates `jit-PID.dump` on supported Linux x86-64 and
+AArch64 hosts. The runtime opens it when the VU backend is created and keeps
+the executable marker mapping alive until process shutdown, so `perf record`
+can discover the dump even when it attaches to an already-paused process.
+Each successfully cached executable block is registered and flushed once.
+After recording, inject the symbols before reporting:
+
+```sh
+perf inject --jit -i perf.data -o perf.jit.data
+perf report -i perf.jit.data
+```
+
+Generated names encode the VU unit, whole-code content identity and extent,
+the generation at which that executable was compiled, entry PC, inclusive
+block PC range, normal or instrumented mode, and a process-unique compilation
+identity. A cache hit under a later guest generation does not duplicate the
+code-load record: the executable and its compilation identity are unchanged.
+New or replacement executable storage always receives a new compilation
+identity, preventing an old name from being confused with new code at a
+reused host address.
+
+`PS2X_VU_BLOCK_PROFILE` adds cold-created records and dynamic counters for:
+
+- executions and guest pairs;
+- full-budget and precise bounded entries;
+- linked edges and helper barriers;
+- every native exit reason;
+- static IR opcode counts, native range and byte size; and
+- JIT code indices and whether the cache allocation is still resident.
+
+The default record limit is 16,384 per VU backend. A positive
+`PS2X_VU_BLOCK_PROFILE_LIMIT` changes it; compilations beyond the limit remain
+correct and increment `dropped_records`. Because enabled counters update the
+hot dispatch loop, use them for attribution rather than production timing.
+When the environment variable is absent, the runtime selects a separately
+instantiated loop with no per-entry profiling branch or counter update.
+
+With block profiling enabled, `vu_backend_benchmark` appends one
+`block-profile-summary` and one `block-profile` JSON record per retained
+compilation. For a live runtime, pause the guest before requesting a coherent
+snapshot. `system.status` includes the first 16 records and reports whether
+they were truncated; the `vu.block-profile` debugger method returns pages of
+up to 256 records. Static opcode mixes identify the instruction families
+present in a sampled block, but they are not per-opcode sample attribution.
+
 ### Hardware counters
 
 On Linux, `ps2xTest/tools/vu_backend_perf_stat.sh` uses perf's control FIFO so

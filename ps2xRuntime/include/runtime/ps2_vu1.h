@@ -283,6 +283,10 @@ public:
     }
     const VuRecompilerDiagnostics *
     recompilerDiagnosticsIfCreated() const;
+    const VuRecompilerBackend *recompilerIfCreated() const
+    {
+        return m_recompiler.get();
+    }
     const VuVerifyDiagnostics &verifyDiagnostics() const
     {
         return m_verifyDiagnostics;

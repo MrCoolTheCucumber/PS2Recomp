@@ -1551,6 +1551,147 @@ namespace
         }
         std::cout << "}\n";
     }
+
+    void printBlockProfiles(
+        const VuBlockProfilingSnapshot &profile,
+        const VuRecompilerDiagnostics &diagnostics)
+    {
+        if (!profile.enabled)
+            return;
+        std::cout
+            << "{\"schema_version\":2"
+            << ",\"event\":\"block-profile-summary\""
+            << ",\"maximum_records\":"
+            << profile.maximumRecords
+            << ",\"dropped_records\":"
+            << profile.droppedRecords
+            << ",\"record_count\":"
+            << profile.blocks.size()
+            << ",\"jitdump_registrations\":"
+            << diagnostics.jitDumpRegistrations
+            << ",\"jitdump_failures\":"
+            << diagnostics.jitDumpFailures
+            << "}\n";
+
+        for (const VuBlockProfileSnapshot &block :
+             profile.blocks)
+        {
+            std::cout
+                << "{\"schema_version\":2"
+                << ",\"event\":\"block-profile\""
+                << ",\"unit\":\""
+                << (block.key.unit == VuUnitId::Vu0
+                        ? "vu0" : "vu1")
+                << "\""
+                << ",\"compilation_id\":"
+                << block.compilationIdentity
+                << ",\"code_content_identity\":"
+                << block.key.codeContentIdentity
+                << ",\"compilation_generation\":"
+                << block.key.codeGeneration
+                << ",\"native_address\":\"0x"
+                << std::hex << std::setw(16)
+                << std::setfill('0')
+                << block.nativeAddress
+                << "\",\"native_bytes\":"
+                << std::dec << std::setfill(' ')
+                << block.nativeBytes
+                << ",\"entry_pc\":\"0x"
+                << std::hex << std::setw(4)
+                << std::setfill('0')
+                << block.key.entryPc
+                << "\",\"first_pc\":\"0x"
+                << std::setw(4) << block.firstPc
+                << "\",\"last_pc\":\"0x"
+                << std::setw(4) << block.lastPc
+                << "\"" << std::dec
+                << std::setfill(' ')
+                << ",\"block_pairs\":"
+                << block.blockPairs
+                << ",\"fixed_cycles\":"
+                << block.fixedCycles
+                << ",\"compilation_mode\":\""
+                << (block.key.compilationMode ==
+                            VuCompilationMode::Instrumented
+                        ? "instrumented" : "normal")
+                << "\""
+                << ",\"block_exit\":\""
+                << vuIrBlockExitName(block.blockExit)
+                << "\""
+                << ",\"resident\":"
+                << (block.resident
+                        ? "true" : "false")
+                << ",\"executions\":"
+                << block.executions
+                << ",\"guest_pairs\":"
+                << block.guestPairs
+                << ",\"full_budget_entries\":"
+                << block.fullBudgetEntries
+                << ",\"bounded_entries\":"
+                << block.boundedEntries
+                << ",\"linked_edges\":"
+                << block.linkedEdges
+                << ",\"helper_barriers\":"
+                << block.helperBarriers
+                << ",\"exit_reasons\":{";
+            for (size_t exit = 0u;
+                 exit < block.exitReasons.size();
+                 ++exit)
+            {
+                if (exit != 0u)
+                    std::cout << ",";
+                std::cout
+                    << "\""
+                    << vuNativeBlockExitName(
+                           static_cast<
+                               VuNativeBlockExit>(
+                               exit))
+                    << "\":"
+                    << block.exitReasons[exit];
+            }
+            std::cout << "},\"opcodes\":[";
+            bool firstOpcode = true;
+            for (size_t opcode = 0u;
+                 opcode <
+                     block.opcodeOperations.size();
+                 ++opcode)
+            {
+                const uint64_t operations =
+                    block.opcodeOperations[opcode];
+                if (operations == 0u)
+                    continue;
+                if (!firstOpcode)
+                    std::cout << ",";
+                firstOpcode = false;
+                std::cout
+                    << "{\"name\":\""
+                    << vuIrOpcodeName(
+                           static_cast<VuIrOpcode>(
+                               opcode))
+                    << "\",\"operations\":"
+                    << operations << "}";
+            }
+            std::cout << "],\"jit_registrations\":[";
+            for (size_t registration = 0u;
+                 registration <
+                     block.jitRegistrations.size();
+                 ++registration)
+            {
+                if (registration != 0u)
+                    std::cout << ",";
+                const auto &source =
+                    block.jitRegistrations[
+                        registration];
+                std::cout
+                    << "{\"generation\":"
+                    << source.generation
+                    << ",\"code_index\":"
+                    << source.codeIndex
+                    << "}";
+            }
+            std::cout << "]}\n";
+        }
+    }
 }
 
 int main(int argc, char **argv)
@@ -1865,6 +2006,8 @@ int main(int argc, char **argv)
             }
         }
     }
+    native
+        .resetBlockProfilingCountersWhileExecutionQuiescent();
 
     std::vector<Invocation> invocations(
         configuration.iterations);
@@ -2213,5 +2356,9 @@ int main(int argc, char **argv)
             << (allValid ? "true" : "false")
             << "}\n";
     }
+    printBlockProfiles(
+        native
+            .blockProfilingSnapshotWhileExecutionQuiescent(),
+        native.diagnostics());
     return allValid ? 0 : 1;
 }

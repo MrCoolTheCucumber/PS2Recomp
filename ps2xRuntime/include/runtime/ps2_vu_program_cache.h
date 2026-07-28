@@ -6,6 +6,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <memory>
 #include <string>
 #include <thread>
 #include <unordered_map>
@@ -28,6 +29,8 @@ enum class VuCompilationMode : uint8_t
     Normal,
     Instrumented,
 };
+
+struct VuBlockProfileRecord;
 
 struct VuProgramKey
 {
@@ -56,6 +59,10 @@ struct VuCompiledProgram
     size_t entryOffset = 0u;
     size_t fastEntryOffset = 0u;
     uint64_t compilationNanoseconds = 0u;
+    uint64_t compilationIdentity = 0u;
+    mutable uint64_t jitCodeIndex = 0u;
+    std::shared_ptr<VuBlockProfileRecord> blockProfile;
+    std::shared_ptr<void> blockProfileLifetime;
 
     [[nodiscard]] const void *nativeEntry() const
     {

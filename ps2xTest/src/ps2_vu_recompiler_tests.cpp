@@ -2124,6 +2124,245 @@ void register_ps2_vu_recompiler_tests()
             });
 
         tc.Run(
+            "perf symbols encode complete logical block identity",
+            [](TestCase &t)
+            {
+                VuProgramKey key{
+                    .unit = VuUnitId::Vu1,
+                    .codeSize = PS2_VU1_CODE_SIZE,
+                    .entryPc = 0x70u,
+                    .codeGeneration =
+                        0x1122334455667788ull,
+                    .codeContentIdentity =
+                        0x8877665544332211ull,
+                    .compilationMode =
+                        VuCompilationMode::Normal,
+                };
+                VuIrBlock block{
+                    .entryPc = 0x70u,
+                    .codeSize = PS2_VU1_CODE_SIZE,
+                };
+                block.pairs.resize(3u);
+                block.pairs[0u].pc = 0x70u;
+                block.pairs[1u].pc = 0x78u;
+                block.pairs[2u].pc = 0x80u;
+                const std::string normal =
+                    vuPerfJitSymbolName(
+                        key, block,
+                        0x1234u);
+                t.IsTrue(
+                    normal.find("ps2x-vu1-") !=
+                        std::string::npos,
+                    "symbol should identify VU1");
+                t.IsTrue(
+                    normal.find(
+                        "code-8877665544332211") !=
+                        std::string::npos,
+                    "symbol should identify the whole code image");
+                t.IsTrue(
+                    normal.find(
+                        "gen-1122334455667788") !=
+                        std::string::npos,
+                    "symbol should identify the compilation generation");
+                t.IsTrue(
+                    normal.find(
+                        "entry-0070-pcs-0070-0080") !=
+                        std::string::npos,
+                    "symbol should identify entry and block PC range");
+                t.IsTrue(
+                    normal.find("-normal-") !=
+                        std::string::npos,
+                    "normal mode should be explicit");
+                t.IsTrue(
+                    normal.find(
+                        "compile-0000000000001234") !=
+                        std::string::npos,
+                    "symbol should identify the compilation instance");
+
+                key.unit = VuUnitId::Vu0;
+                key.compilationMode =
+                    VuCompilationMode::Instrumented;
+                const std::string instrumented =
+                    vuPerfJitSymbolName(
+                        key, block, 1u);
+                t.IsTrue(
+                    instrumented.find("ps2x-vu0-") !=
+                        std::string::npos &&
+                    instrumented.find(
+                        "-instrumented-") !=
+                        std::string::npos,
+                    "unit and instrumented mode should not alias normal VU1 code");
+            });
+
+        tc.Run(
+            "opt-in block counters survive executable cache eviction",
+            [](TestCase &t)
+            {
+                if (!VuRecompilerBackend::supported())
+                    return;
+
+                VuNativeFixture fixture;
+                t.IsTrue(
+                    fixture.initialize(),
+                    "VU memory fixture should initialize");
+                configureSyntheticProgram(fixture.code);
+                fixture.markCodeModified();
+
+                VuUnit unit(VuUnitId::Vu1);
+                VuRecompilerBackend backend(
+                    unit,
+                    VuBlockProfilingConfiguration{
+                        .enabled = true,
+                        .maximumRecords = 128u,
+                    });
+                VuExecutionState state =
+                    initialSyntheticState();
+                VuTransactionalSideEffectSink effects;
+                VuExecutionContext context =
+                    makeContext(state, fixture, effects);
+                for (const uint32_t budget :
+                     {1u, 12u})
+                {
+                    state = initialSyntheticState();
+                    effects.clear();
+                    (void)backend.run(context, budget);
+                }
+
+                const VuRecompilerDiagnostics diagnostics =
+                    backend.diagnostics();
+                const VuBlockProfilingSnapshot snapshot =
+                    backend
+                        .blockProfilingSnapshotWhileExecutionQuiescent();
+                t.IsTrue(
+                    snapshot.enabled,
+                    "explicit block profiling should be enabled");
+                t.Equals(
+                    snapshot.droppedRecords,
+                    uint64_t{0u},
+                    "the focused profile should not drop records");
+                t.IsTrue(
+                    !snapshot.blocks.empty(),
+                    "native execution should create block records");
+
+                uint64_t executions = 0u;
+                uint64_t guestPairs = 0u;
+                uint64_t helperBarriers = 0u;
+                uint64_t fullEntries = 0u;
+                uint64_t boundedEntries = 0u;
+                uint64_t exits = 0u;
+                for (size_t blockIndex = 0u;
+                     blockIndex <
+                         snapshot.blocks.size();
+                     ++blockIndex)
+                {
+                    const VuBlockProfileSnapshot &block =
+                        snapshot.blocks[blockIndex];
+                    t.IsTrue(
+                        block.compilationIdentity != 0u,
+                        "profiled compilation identity should be nonzero");
+                    t.IsTrue(
+                        block.resident,
+                        "newly compiled code should be resident");
+                    t.IsTrue(
+                        block.fixedCycles != 0u &&
+                        block.blockPairs != 0u,
+                        "block static cost should be present");
+                    uint64_t opcodeOperations = 0u;
+                    for (const uint64_t count :
+                         block.opcodeOperations)
+                    {
+                        opcodeOperations += count;
+                    }
+                    t.Equals(
+                        opcodeOperations,
+                        static_cast<uint64_t>(
+                            block.blockPairs) *
+                            2u,
+                        "each pair should retain both decoded operations");
+                    for (size_t other = 0u;
+                         other < blockIndex; ++other)
+                    {
+                        t.IsTrue(
+                            block.compilationIdentity !=
+                                snapshot.blocks[other]
+                                    .compilationIdentity,
+                            "compilation identities should be process-unique");
+                    }
+                    executions += block.executions;
+                    guestPairs += block.guestPairs;
+                    helperBarriers +=
+                        block.helperBarriers;
+                    fullEntries +=
+                        block.fullBudgetEntries;
+                    boundedEntries +=
+                        block.boundedEntries;
+                    t.Equals(
+                        block.linkedEdges,
+                        uint64_t{0u},
+                        "Phase 0 blocks should not report linked edges");
+                    for (const uint64_t count :
+                         block.exitReasons)
+                    {
+                        exits += count;
+                    }
+                }
+                t.Equals(
+                    executions, diagnostics.nativeEntries,
+                    "block executions should sum to native entries");
+                t.Equals(
+                    guestPairs, diagnostics.nativePairs,
+                    "block guest pairs should sum to native pairs");
+                t.Equals(
+                    helperBarriers,
+                    diagnostics.helperPairs,
+                    "block helper barriers should sum to helper pairs");
+                t.Equals(
+                    exits, executions,
+                    "every block execution should have one exit reason");
+                t.Equals(
+                    fullEntries + boundedEntries,
+                    executions,
+                    "every block execution should have one budget class");
+                t.IsTrue(
+                    fullEntries != 0u &&
+                    boundedEntries != 0u,
+                    "focused budgets should exercise full and bounded entries");
+
+                backend
+                    .resetBlockProfilingCountersWhileExecutionQuiescent();
+                const VuBlockProfilingSnapshot reset =
+                    backend
+                        .blockProfilingSnapshotWhileExecutionQuiescent();
+                for (const VuBlockProfileSnapshot &block :
+                     reset.blocks)
+                {
+                    t.Equals(
+                        block.executions, uint64_t{0u},
+                        "counter reset should clear dynamic execution counts");
+                }
+
+                state = initialSyntheticState();
+                effects.clear();
+                (void)backend.run(context, 12u);
+                unit.programCache().flush();
+                const VuBlockProfilingSnapshot evicted =
+                    backend
+                        .blockProfilingSnapshotWhileExecutionQuiescent();
+                uint64_t evictedExecutions = 0u;
+                for (const VuBlockProfileSnapshot &block :
+                     evicted.blocks)
+                {
+                    t.IsFalse(
+                        block.resident,
+                        "cache flush should expire every executable lifetime token");
+                    evictedExecutions += block.executions;
+                }
+                t.IsTrue(
+                    evictedExecutions != 0u,
+                    "cache flush should not discard archived counters");
+            });
+
+        tc.Run(
             "raw entry preserves SysV registers and MXCSR",
             [](TestCase &t)
             {

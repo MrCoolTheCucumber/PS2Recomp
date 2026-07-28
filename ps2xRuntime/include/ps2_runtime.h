@@ -562,6 +562,45 @@ public:
 
     struct DebugVuRecompilerDiagnostics
     {
+        struct BlockJitRegistration
+        {
+            uint64_t generation = 0u;
+            uint64_t codeIndex = 0u;
+        };
+
+        struct BlockOpcodeCount
+        {
+            std::string name;
+            uint64_t operations = 0u;
+        };
+
+        struct BlockProfile
+        {
+            uint64_t compilationIdentity = 0u;
+            uint64_t codeContentIdentity = 0u;
+            uint64_t compilationGeneration = 0u;
+            uint64_t nativeAddress = 0u;
+            uint64_t nativeBytes = 0u;
+            uint32_t entryPc = 0u;
+            uint32_t firstPc = 0u;
+            uint32_t lastPc = 0u;
+            uint32_t blockPairs = 0u;
+            uint32_t fixedCycles = 0u;
+            std::string compilationMode;
+            std::string blockExit;
+            bool resident = false;
+            uint64_t executions = 0u;
+            uint64_t guestPairs = 0u;
+            uint64_t fullBudgetEntries = 0u;
+            uint64_t boundedEntries = 0u;
+            uint64_t linkedEdges = 0u;
+            uint64_t helperBarriers = 0u;
+            std::array<uint64_t, 10u> exitReasons{};
+            std::vector<BlockOpcodeCount> opcodeCounts;
+            std::vector<BlockJitRegistration>
+                jitRegistrations;
+        };
+
         uint64_t nativeEntries = 0u;
         uint64_t nativePairs = 0u;
         uint64_t instrumentedNativeEntries = 0u;
@@ -580,6 +619,13 @@ public:
         uint64_t codeImageIdentities = 0u;
         uint64_t codeImageReuses = 0u;
         uint64_t codeImageCatalogEvictions = 0u;
+        uint64_t jitDumpRegistrations = 0u;
+        uint64_t jitDumpFailures = 0u;
+        std::string lastJitDiagnostic;
+        bool blockProfileEnabled = false;
+        uint64_t blockProfileMaximumRecords = 0u;
+        uint64_t blockProfileDroppedRecords = 0u;
+        std::vector<BlockProfile> blockProfiles;
     };
 
     struct DebugVuVerifyDiagnostics

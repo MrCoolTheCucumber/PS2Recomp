@@ -144,7 +144,10 @@ void register_ps2_debug_control_tests()
             configuration.vu1Backend =
                 VuBackendKind::Verify;
             configuration.useVuBackendEnvironment = false;
+            setenv(
+                "PS2X_VU_BLOCK_PROFILE", "1", 1);
             PS2Runtime runtime(configuration);
+            unsetenv("PS2X_VU_BLOCK_PROFILE");
             t.IsTrue(runtime.memory().initialize(),
                      "diagnostic snapshot memory should initialize");
             t.IsTrue(runtime.syncCoreSubsystems(),
@@ -230,6 +233,25 @@ void register_ps2_debug_control_tests()
                 snapshots[1u].recompiler.faultExits,
                 uint64_t{0u},
                 "the native diagnostic snapshot should remain fault-free");
+            t.IsTrue(
+                snapshots[1u].recompiler
+                    .blockProfileEnabled,
+                "the pause boundary should retain opt-in block profiling");
+            t.Equals(
+                snapshots[1u].recompiler
+                    .blockProfileDroppedRecords,
+                uint64_t{0u},
+                "the focused debugger profile should not drop blocks");
+            uint64_t profiledPairs = 0u;
+            for (const auto &block :
+                 snapshots[1u].recompiler
+                     .blockProfiles)
+            {
+                profiledPairs += block.guestPairs;
+            }
+            t.Equals(
+                profiledPairs, uint64_t{2u},
+                "quiescent debugger blocks should report exact native work");
             t.Equals(
                 snapshots[1u].verify.runs,
                 uint64_t{1u},

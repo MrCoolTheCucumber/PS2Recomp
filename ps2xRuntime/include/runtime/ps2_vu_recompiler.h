@@ -5,7 +5,9 @@
 #include "runtime/ps2_vu1.h"
 
 #include <array>
+#include <cstddef>
 #include <cstdint>
+#include <memory>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -23,6 +25,11 @@ enum class VuNativeBlockExit : uint32_t
     UnsupportedInstruction,
     Fault,
 };
+
+inline constexpr size_t kVuNativeBlockExitCount =
+    static_cast<size_t>(VuNativeBlockExit::Fault) + 1u;
+inline constexpr size_t kVuIrOpcodeCount =
+    static_cast<size_t>(VuIrOpcode::Unsupported) + 1u;
 
 struct VuNativeBlockResult
 {
@@ -71,6 +78,8 @@ struct VuRecompilerDiagnostics
     uint64_t codeImageIdentities = 0u;
     uint64_t codeImageReuses = 0u;
     uint64_t codeImageCatalogEvictions = 0u;
+    uint64_t jitDumpRegistrations = 0u;
+    uint64_t jitDumpFailures = 0u;
 };
 
 enum class VuRecompilerOpcodeDisposition : uint8_t
@@ -80,10 +89,61 @@ enum class VuRecompilerOpcodeDisposition : uint8_t
     InterpreterSideExit,
 };
 
+struct VuBlockJitRegistrationSnapshot
+{
+    uint64_t generation = 0u;
+    uint64_t codeIndex = 0u;
+};
+
+struct VuBlockProfileSnapshot
+{
+    VuProgramKey key{};
+    uint64_t compilationIdentity = 0u;
+    uint64_t nativeAddress = 0u;
+    uint64_t nativeBytes = 0u;
+    uint32_t firstPc = 0u;
+    uint32_t lastPc = 0u;
+    uint32_t blockPairs = 0u;
+    uint32_t fixedCycles = 0u;
+    VuIrBlockExit blockExit = VuIrBlockExit::PairLimit;
+    bool resident = false;
+    uint64_t executions = 0u;
+    uint64_t guestPairs = 0u;
+    uint64_t fullBudgetEntries = 0u;
+    uint64_t boundedEntries = 0u;
+    uint64_t linkedEdges = 0u;
+    uint64_t helperBarriers = 0u;
+    std::array<
+        uint64_t,
+        kVuNativeBlockExitCount> exitReasons{};
+    std::array<
+        uint64_t,
+        kVuIrOpcodeCount> opcodeOperations{};
+    std::vector<VuBlockJitRegistrationSnapshot>
+        jitRegistrations;
+};
+
+struct VuBlockProfilingSnapshot
+{
+    bool enabled = false;
+    uint64_t maximumRecords = 0u;
+    uint64_t droppedRecords = 0u;
+    std::vector<VuBlockProfileSnapshot> blocks;
+};
+
+struct VuBlockProfilingConfiguration
+{
+    bool enabled = false;
+    size_t maximumRecords = 16384u;
+};
+
 class VuRecompilerBackend final : public IVuExecutionBackend
 {
 public:
     explicit VuRecompilerBackend(VuUnit &unit);
+    VuRecompilerBackend(
+        VuUnit &unit,
+        VuBlockProfilingConfiguration configuration);
 
     [[nodiscard]] VuRunResult run(
         VuExecutionContext &context,
@@ -115,6 +175,16 @@ public:
     {
         return m_lastDiagnostic;
     }
+    [[nodiscard]] const std::string &
+    lastJitDiagnostic() const
+    {
+        return m_lastJitDiagnostic;
+    }
+    // The caller must prove that VU execution is quiescent while copying or
+    // resetting these single-owner-thread records.
+    [[nodiscard]] VuBlockProfilingSnapshot
+    blockProfilingSnapshotWhileExecutionQuiescent() const;
+    void resetBlockProfilingCountersWhileExecutionQuiescent();
 
 private:
     friend class VuUnit;
@@ -158,6 +228,8 @@ private:
     [[nodiscard]] VuProgramHandle lookupOrCompile(
         VuExecutionContext &context,
         const VuProgramKey &key);
+    void ensureJitRegistration(
+        const VuCompiledProgram &program);
     [[nodiscard]] uint64_t codeContentIdentity(
         const VuExecutionContext &context,
         uint64_t generation);
@@ -192,10 +264,22 @@ private:
     uint64_t m_nextCodeContentIdentity = 1u;
     uint64_t m_helperPairsIssued = 0u;
     uint64_t m_instrumentedPairIndex = 0u;
+    bool m_blockProfilingEnabled = false;
+    size_t m_maximumBlockProfiles = 0u;
+    uint64_t m_droppedBlockProfiles = 0u;
+    bool m_perfJitDumpEnabled = false;
+    std::vector<
+        std::shared_ptr<VuBlockProfileRecord>>
+        m_blockProfiles;
     std::string m_lastDiagnostic;
+    std::string m_lastJitDiagnostic;
 };
 
 [[nodiscard]] std::string_view vuNativeBlockExitName(
     VuNativeBlockExit exit);
+[[nodiscard]] std::string vuPerfJitSymbolName(
+    const VuProgramKey &key,
+    const VuIrBlock &block,
+    uint64_t compilationIdentity);
 
 #endif

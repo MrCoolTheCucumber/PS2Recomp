@@ -6685,40 +6685,144 @@ void PS2Runtime::debugPublishVuBackendDiagnostics()
                 };
             }
 
-            if (const VuRecompilerDiagnostics *const source =
-                    unit.recompilerDiagnosticsIfCreated())
+            if (const VuRecompilerBackend *const backend =
+                    unit.recompilerIfCreated())
             {
+                const VuRecompilerDiagnostics source =
+                    backend->diagnostics();
                 result.recompilerCreated = true;
                 result.recompiler = {
-                    .nativeEntries = source->nativeEntries,
-                    .nativePairs = source->nativePairs,
+                    .nativeEntries = source.nativeEntries,
+                    .nativePairs = source.nativePairs,
                     .instrumentedNativeEntries =
-                        source->instrumentedNativeEntries,
+                        source.instrumentedNativeEntries,
                     .instrumentedNativePairs =
-                        source->instrumentedNativePairs,
-                    .inlinePairs = source->inlinePairs,
-                    .helperPairs = source->helperPairs,
-                    .blockCompletes = source->blockCompletes,
+                        source.instrumentedNativePairs,
+                    .inlinePairs = source.inlinePairs,
+                    .helperPairs = source.helperPairs,
+                    .blockCompletes = source.blockCompletes,
                     .cycleBudgetExits =
-                        source->cycleBudgetExits,
-                    .xgkickExits = source->xgkickExits,
+                        source.cycleBudgetExits,
+                    .xgkickExits = source.xgkickExits,
                     .xgkickAdvanceHelperCalls =
-                        source->xgkickAdvanceHelperCalls,
-                    .unsupportedExits = source->unsupportedExits,
+                        source.xgkickAdvanceHelperCalls,
+                    .unsupportedExits = source.unsupportedExits,
                     .codeInvalidationExits =
-                        source->codeInvalidationExits,
-                    .faultExits = source->faultExits,
+                        source.codeInvalidationExits,
+                    .faultExits = source.faultExits,
                     .interpreterInstrumentationFallbacks =
-                        source->interpreterInstrumentationFallbacks,
+                        source.interpreterInstrumentationFallbacks,
                     .interpreterFallbackPairs =
-                        source->interpreterFallbackPairs,
+                        source.interpreterFallbackPairs,
                     .codeImageIdentities =
-                        source->codeImageIdentities,
+                        source.codeImageIdentities,
                     .codeImageReuses =
-                        source->codeImageReuses,
+                        source.codeImageReuses,
                     .codeImageCatalogEvictions =
-                        source->codeImageCatalogEvictions,
+                        source.codeImageCatalogEvictions,
+                    .jitDumpRegistrations =
+                        source.jitDumpRegistrations,
+                    .jitDumpFailures =
+                        source.jitDumpFailures,
+                    .lastJitDiagnostic =
+                        backend->lastJitDiagnostic(),
                 };
+
+                const VuBlockProfilingSnapshot profile =
+                    backend->
+                        blockProfilingSnapshotWhileExecutionQuiescent();
+                auto &destination = result.recompiler;
+                destination.blockProfileEnabled =
+                    profile.enabled;
+                destination.blockProfileMaximumRecords =
+                    profile.maximumRecords;
+                destination.blockProfileDroppedRecords =
+                    profile.droppedRecords;
+                destination.blockProfiles.reserve(
+                    profile.blocks.size());
+                for (const VuBlockProfileSnapshot &block :
+                     profile.blocks)
+                {
+                    DebugVuRecompilerDiagnostics::
+                        BlockProfile converted{
+                            .compilationIdentity =
+                                block.compilationIdentity,
+                            .codeContentIdentity =
+                                block.key.codeContentIdentity,
+                            .compilationGeneration =
+                                block.key.codeGeneration,
+                            .nativeAddress =
+                                block.nativeAddress,
+                            .nativeBytes =
+                                block.nativeBytes,
+                            .entryPc =
+                                block.key.entryPc,
+                            .firstPc = block.firstPc,
+                            .lastPc = block.lastPc,
+                            .blockPairs =
+                                block.blockPairs,
+                            .fixedCycles =
+                                block.fixedCycles,
+                            .compilationMode =
+                                block.key.compilationMode ==
+                                        VuCompilationMode::
+                                            Instrumented
+                                    ? "instrumented"
+                                    : "normal",
+                            .blockExit =
+                                std::string(
+                                    vuIrBlockExitName(
+                                        block.blockExit)),
+                            .resident = block.resident,
+                            .executions =
+                                block.executions,
+                            .guestPairs =
+                                block.guestPairs,
+                            .fullBudgetEntries =
+                                block.fullBudgetEntries,
+                            .boundedEntries =
+                                block.boundedEntries,
+                            .linkedEdges =
+                                block.linkedEdges,
+                            .helperBarriers =
+                                block.helperBarriers,
+                            .exitReasons =
+                                block.exitReasons,
+                        };
+                    for (size_t opcode = 0u;
+                         opcode <
+                             block.opcodeOperations.size();
+                         ++opcode)
+                    {
+                        const uint64_t operations =
+                            block.opcodeOperations[opcode];
+                        if (operations == 0u)
+                            continue;
+                        converted.opcodeCounts.push_back({
+                            .name = std::string(
+                                vuIrOpcodeName(
+                                    static_cast<
+                                        VuIrOpcode>(
+                                        opcode))),
+                            .operations = operations,
+                        });
+                    }
+                    converted.jitRegistrations.reserve(
+                        block.jitRegistrations.size());
+                    for (const auto &registration :
+                         block.jitRegistrations)
+                    {
+                        converted.jitRegistrations
+                            .push_back({
+                                .generation =
+                                    registration.generation,
+                                .codeIndex =
+                                    registration.codeIndex,
+                            });
+                    }
+                    destination.blockProfiles.push_back(
+                        std::move(converted));
+                }
             }
             return result;
         };
