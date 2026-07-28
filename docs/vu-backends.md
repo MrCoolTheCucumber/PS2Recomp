@@ -21,7 +21,10 @@ The compact instruction-pair representation and its development-only
 differential interpreter are documented in
 [`vu-ir.md`](vu-ir.md). They are not selectable runtime backends; runtime
 selection continues to resolve through the permanent interpreter until the
-generation-scoped native cache and emitter are integrated.
+native emitter is integrated. Each unit now lazily owns the generation-scoped
+cache and W^X executable-memory layer documented in
+[`vu-program-cache.md`](vu-program-cache.md); no runtime execution path enters
+cached native code yet.
 
 ## Selection
 

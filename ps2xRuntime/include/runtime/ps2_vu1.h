@@ -12,6 +12,8 @@
 
 class GS;
 class PS2Memory;
+class VuProgramCache;
+enum class VuUnitId : uint8_t;
 struct VU1NativeEmitterSpikeAccess;
 
 struct VuPipelineState
@@ -197,6 +199,7 @@ class VuUnit
 {
 public:
     VuUnit();
+    explicit VuUnit(VuUnitId unit);
     ~VuUnit();
 
     void reset();
@@ -243,6 +246,12 @@ public:
     VuBackendKind requestedBackend() const { return m_requestedBackend; }
     VuBackendKind resolvedBackend() const { return m_resolvedBackend; }
     std::string_view backendName() const;
+    VuUnitId unitId() const { return m_unitId; }
+    VuProgramCache &programCache();
+    const VuProgramCache *programCacheIfCreated() const
+    {
+        return m_programCache.get();
+    }
 
 private:
     friend class VuInterpreterBackend;
@@ -273,6 +282,8 @@ private:
         GS &gs, PS2Memory *memory, uint32_t maxCycles,
         bool traceBudgetBoundary);
 
+    VuUnitId m_unitId;
+    std::unique_ptr<VuProgramCache> m_programCache;
     VuExecutionState m_state{};
     std::atomic<bool> m_progressTrackingEnabled{false};
     std::atomic<uint32_t> m_progressActive{0};

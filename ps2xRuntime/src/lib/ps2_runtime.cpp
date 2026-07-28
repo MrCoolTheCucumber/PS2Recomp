@@ -5,6 +5,7 @@
 #include "game_overrides.h"
 #include "ps2_runtime_macros.h"
 #include "runtime/ps2_gs_gpu.h"
+#include "runtime/ps2_vu_program_cache.h"
 #include "ThreadNaming.h"
 #include "Kernel/Stubs/Audio.h"
 #include "Kernel/Stubs/GS.h"
@@ -841,6 +842,8 @@ PS2Runtime::PS2Runtime()
 }
 
 PS2Runtime::PS2Runtime(PS2RuntimeConfiguration configuration)
+    : m_vu0(VuUnitId::Vu0),
+      m_vu1(VuUnitId::Vu1)
 {
     const auto configureVuBackend =
         [&](VuUnit &unit, VuBackendKind requested,

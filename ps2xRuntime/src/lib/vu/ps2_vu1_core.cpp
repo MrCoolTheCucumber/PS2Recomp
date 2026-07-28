@@ -1,6 +1,7 @@
 #include "runtime/ps2_vu1.h"
 #include "runtime/ps2_gs_gpu.h"
 #include "runtime/ps2_memory.h"
+#include "runtime/ps2_vu_program_cache.h"
 #include "ps2_vu_float_mode.h"
 #include "ps2_vu1_detail.h"
 
@@ -265,13 +266,29 @@ void VuTransactionalSideEffectSink::commitTo(
 }
 
 VuUnit::VuUnit()
-    : m_interpreter(std::make_unique<VuInterpreterBackend>(*this)),
+    : VuUnit(VuUnitId::Vu1)
+{
+}
+
+VuUnit::VuUnit(VuUnitId unit)
+    : m_unitId(unit),
+      m_interpreter(std::make_unique<VuInterpreterBackend>(*this)),
       m_backend(m_interpreter.get())
 {
     reset();
 }
 
 VuUnit::~VuUnit() = default;
+
+VuProgramCache &VuUnit::programCache()
+{
+    if (!m_programCache)
+    {
+        m_programCache =
+            std::make_unique<VuProgramCache>(m_unitId);
+    }
+    return *m_programCache;
+}
 
 VuInterpreterBackend::VuInterpreterBackend(VuUnit &unit)
     : m_unit(unit)
