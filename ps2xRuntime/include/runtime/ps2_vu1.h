@@ -16,6 +16,7 @@ class VuProgramCache;
 class VuRecompilerBackend;
 enum class VuUnitId : uint8_t;
 struct VU1NativeEmitterSpikeAccess;
+struct VuVerifyTestAccess;
 
 struct VuPipelineState
 {
@@ -145,6 +146,16 @@ struct VuRunResult
     bool completed = false;
 };
 
+struct VuVerifyDiagnostics
+{
+    uint64_t runs = 0u;
+    uint64_t comparedPairs = 0u;
+    uint64_t publishedPairs = 0u;
+    uint64_t publishedPath1Packets = 0u;
+    uint64_t mismatches = 0u;
+    std::string lastMismatch;
+};
+
 class IVuSideEffectSink
 {
 public:
@@ -272,11 +283,16 @@ public:
     }
     const VuRecompilerDiagnostics *
     recompilerDiagnosticsIfCreated() const;
+    const VuVerifyDiagnostics &verifyDiagnostics() const
+    {
+        return m_verifyDiagnostics;
+    }
 
 private:
     friend class VuInterpreterBackend;
     friend class VuRecompilerBackend;
     friend struct VU1NativeEmitterSpikeAccess;
+    friend struct VuVerifyTestAccess;
 
     class ProgressTracker
     {
@@ -318,6 +334,29 @@ private:
         bool valid = false;
     };
 
+    struct VerifyMismatch
+    {
+        const VuExecutionState &beforeState;
+        const VuExecutionState &referenceState;
+        const VuExecutionState &nativeState;
+        const VuRunResult &referenceResult;
+        const VuRunResult &nativeResult;
+        const std::vector<uint8_t> &referenceData;
+        const std::vector<uint8_t> &nativeData;
+        const VuTransactionalSideEffectSink &referenceEffects;
+        const VuTransactionalSideEffectSink &nativeEffects;
+        const uint8_t *code = nullptr;
+        uint32_t codeSize = 0u;
+        PS2Memory *memory = nullptr;
+        uint32_t invocationEntryPc = 0u;
+        uint32_t failingPc = 0u;
+        uint32_t lowerWord = 0u;
+        uint32_t upperWord = 0u;
+        uint32_t cycleBudget = 0u;
+        uint64_t pairIndex = 0u;
+        std::string_view detail;
+    };
+
     [[nodiscard]] VuRunResult run(
         uint8_t *vuCode, uint32_t codeSize,
         uint8_t *vuData, uint32_t dataSize,
@@ -328,6 +367,15 @@ private:
         uint8_t *vuData, uint32_t dataSize,
         GS &gs, PS2Memory *memory, uint32_t maxCycles,
         bool traceBudgetBoundary);
+    [[nodiscard]] VuRunResult runRecompilerContext(
+        VuExecutionContext &context, uint32_t maxCycles,
+        bool trackProgress);
+    [[nodiscard]] VuRunResult runVerify(
+        uint8_t *vuCode, uint32_t codeSize,
+        uint8_t *vuData, uint32_t dataSize,
+        GS &gs, PS2Memory *memory, uint32_t maxCycles);
+    [[nodiscard]] std::string formatVerifyMismatch(
+        const VerifyMismatch &mismatch);
 
     VuUnitId m_unitId;
     std::unique_ptr<VuProgramCache> m_programCache;
@@ -350,6 +398,7 @@ private:
     VuBackendKind m_requestedBackend = VuBackendKind::Auto;
     VuBackendKind m_resolvedBackend = VuBackendKind::Interpreter;
     VuExitReason m_lastExitReason = VuExitReason::Inactive;
+    VuVerifyDiagnostics m_verifyDiagnostics{};
 };
 
 class VuInterpreterBackend final : public IVuExecutionBackend

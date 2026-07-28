@@ -6235,10 +6235,15 @@ void register_ps2_runtime_expansion_tests()
                 PS2RuntimeConfiguration nativeConfiguration =
                     referenceConfiguration;
                 nativeConfiguration.vu0Backend = VuBackendKind::Recompiler;
+                PS2RuntimeConfiguration verifyConfiguration =
+                    referenceConfiguration;
+                verifyConfiguration.vu0Backend = VuBackendKind::Verify;
 
                 PS2Runtime reference(referenceConfiguration);
                 PS2Runtime native(nativeConfiguration);
-                for (PS2Runtime *runtime : {&reference, &native})
+                PS2Runtime verified(verifyConfiguration);
+                for (PS2Runtime *runtime :
+                     {&reference, &native, &verified})
                 {
                     t.IsTrue(runtime->memory().initialize(),
                         "VU0 differential memory should initialize");
@@ -6265,32 +6270,61 @@ void register_ps2_runtime_expansion_tests()
 
                 R5900Context referenceContext{};
                 R5900Context nativeContext{};
-                const auto compare = [&](const std::string &boundary)
+                R5900Context verifiedContext{};
+                const auto compareCandidate =
+                    [&](PS2Runtime &candidate,
+                        R5900Context &candidateContext,
+                        const std::string &boundary,
+                        const std::string &name)
                 {
                     std::string difference;
-                    t.IsTrue(vuExecutionStatesEqual(reference.vu0().state(),
-                                 native.vu0().state(),
-                                 &difference),
-                        boundary + " canonical VU0 state differs at " +
+                    t.IsTrue(
+                        vuExecutionStatesEqual(
+                            reference.vu0().state(),
+                            candidate.vu0().state(),
+                            &difference),
+                        boundary + " " + name +
+                            " canonical VU0 state differs at " +
                             difference);
-                    t.IsTrue(std::memcmp(reference.memory().getVU0Data(),
-                                 native.memory().getVU0Data(),
-                                 PS2_VU0_DATA_SIZE) == 0,
-                        boundary + " VU0 data differs");
-                    t.Equals(referenceContext.vu0_pc,
-                        nativeContext.vu0_pc,
-                        boundary + " copied PC differs");
-                    t.Equals(referenceContext.vu0_vpu_stat,
-                        nativeContext.vu0_vpu_stat,
-                        boundary + " copied busy state differs");
-                    t.Equals(reference.vu0().getProgressSnapshot().cycles,
-                        native.vu0().getProgressSnapshot().cycles,
-                        boundary + " retired cycles differ");
+                    t.IsTrue(
+                        std::memcmp(
+                            reference.memory().getVU0Data(),
+                            candidate.memory().getVU0Data(),
+                            PS2_VU0_DATA_SIZE) == 0,
+                        boundary + " " + name +
+                            " VU0 data differs");
+                    t.Equals(
+                        referenceContext.vu0_pc,
+                        candidateContext.vu0_pc,
+                        boundary + " " + name +
+                            " copied PC differs");
+                    t.Equals(
+                        referenceContext.vu0_vpu_stat,
+                        candidateContext.vu0_vpu_stat,
+                        boundary + " " + name +
+                            " copied busy state differs");
+                    t.Equals(
+                        reference.vu0().
+                            getProgressSnapshot().cycles,
+                        candidate.vu0().
+                            getProgressSnapshot().cycles,
+                        boundary + " " + name +
+                            " retired cycles differ");
+                };
+                const auto compare = [&](const std::string &boundary)
+                {
+                    compareCandidate(
+                        native, nativeContext,
+                        boundary, "native");
+                    compareCandidate(
+                        verified, verifiedContext,
+                        boundary, "verify");
                 };
 
                 for (auto pair : {
                          std::pair{&reference, &referenceContext},
                          std::pair{&native, &nativeContext},
+                         std::pair{&verified, &verifiedContext},
                      })
                 {
                     pair.second->advanceEeCycleTicks(800u);
@@ -6310,16 +6344,22 @@ void register_ps2_runtime_expansion_tests()
                     {
                         referenceContext.vi[1] = 0u;
                         nativeContext.vi[1] = 0u;
+                        verifiedContext.vi[1] = 0u;
                     }
                     referenceContext.advanceEeCycleTicks(
                         kElapsedTicks[boundary]);
                     nativeContext.advanceEeCycleTicks(kElapsedTicks[boundary]);
+                    verifiedContext.advanceEeCycleTicks(
+                        kElapsedTicks[boundary]);
                     reference.synchronizeVU0Microprogram(
                         reference.memory().getRDRAM(),
                         &referenceContext,
                         false);
                     native.synchronizeVU0Microprogram(
                         native.memory().getRDRAM(), &nativeContext, false);
+                    verified.synchronizeVU0Microprogram(
+                        verified.memory().getRDRAM(),
+                        &verifiedContext, false);
                     compare("synchronization " + std::to_string(boundary));
                 }
 
@@ -6338,6 +6378,19 @@ void register_ps2_runtime_expansion_tests()
                         uint64_t{0u},
                         "the selected VU0 path should not fault");
                 }
+                const VuVerifyDiagnostics &verify =
+                    verified.vu0().verifyDiagnostics();
+                t.IsTrue(
+                    verify.runs > 0u &&
+                        verify.comparedPairs > 0u,
+                    "VU0 verify should compare scheduler-visible work");
+                t.Equals(
+                    verify.comparedPairs,
+                    verify.publishedPairs,
+                    "every compared VU0 pair should publish once");
+                t.Equals(
+                    verify.mismatches, uint64_t{0u},
+                    "VU0 synchronization should remain divergence-free");
             });
 
         tc.Run("event VU0 progress depends on due shared device work", [](TestCase &t)

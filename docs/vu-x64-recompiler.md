@@ -113,6 +113,8 @@ Focused tests cover:
 - unsupported-pair no-mutation behavior;
 - instrumentation fallback and exact observer/progress counts;
 - opt-in instrumented-native observer ordering and cache separation;
+- transactional runtime verification, unsupported-pair fallback, one-time
+  PATH1 publication, and compact first-mismatch diagnostics;
 - retained XGKICK progress across a native side exit;
 - a code-generation change made by a helper;
 - rejection of an impossible VI-backup countdown before pipeline

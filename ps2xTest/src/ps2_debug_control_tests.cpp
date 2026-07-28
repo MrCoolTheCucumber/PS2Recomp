@@ -55,6 +55,86 @@ void register_ps2_debug_control_tests()
                       "a repeated resume should remain harmless");
         });
 
+        tc.Run("paused debugger changes only an inactive VU backend", [](TestCase &t)
+        {
+            PS2RuntimeConfiguration configuration{};
+            configuration.useVuBackendEnvironment = false;
+            PS2Runtime runtime(configuration);
+            std::string diagnostic;
+            t.IsFalse(
+                runtime.debugSetVuBackend(
+                    VuUnitId::Vu0,
+                    VuBackendKind::Interpreter,
+                    &diagnostic,
+                    std::chrono::milliseconds(50)),
+                "a running debugger request should be rejected");
+            t.IsTrue(
+                diagnostic.find("paused") != std::string::npos,
+                "the running rejection should explain the safe-point requirement");
+
+            t.IsTrue(
+                runtime.debugPause(std::chrono::milliseconds(50)),
+                "the idle runtime should pause for backend control");
+            t.IsTrue(
+                runtime.debugSetVuBackend(
+                    VuUnitId::Vu0,
+                    VuBackendKind::Interpreter,
+                    &diagnostic,
+                    std::chrono::milliseconds(50)),
+                "paused VU0 selection should succeed");
+            t.IsTrue(
+                runtime.debugSetVuBackend(
+                    VuUnitId::Vu1,
+                    VuBackendKind::Interpreter,
+                    &diagnostic,
+                    std::chrono::milliseconds(50)),
+                "paused VU1 selection should succeed independently");
+            t.IsTrue(
+                runtime.vu0().resolvedBackend() ==
+                        VuBackendKind::Interpreter &&
+                    runtime.vu1().resolvedBackend() ==
+                        VuBackendKind::Interpreter,
+                "both units should expose the selected debug backend");
+
+            runtime.vu0().start();
+            const VuBackendKind activeRequest =
+                VuRecompilerBackend::supported()
+                    ? VuBackendKind::Recompiler
+                    : VuBackendKind::Auto;
+            t.IsFalse(
+                runtime.debugSetVuBackend(
+                    VuUnitId::Vu0, activeRequest,
+                    &diagnostic,
+                    std::chrono::milliseconds(50)),
+                "an active VU should reject a different backend");
+            t.IsTrue(
+                diagnostic.find("active") != std::string::npos,
+                "the active rejection should preserve a useful diagnostic");
+            t.IsTrue(
+                runtime.vu0().requestedBackend() ==
+                    VuBackendKind::Interpreter,
+                "a rejected active switch should preserve VU0 selection");
+            runtime.vu0().reset();
+
+            if (VuRecompilerBackend::supported())
+            {
+                t.IsTrue(
+                    runtime.debugSetVuBackend(
+                        VuUnitId::Vu1,
+                        VuBackendKind::Verify,
+                        &diagnostic,
+                        std::chrono::milliseconds(50)),
+                    "paused inactive VU1 should accept verify");
+                t.IsTrue(
+                    runtime.vu0().resolvedBackend() ==
+                            VuBackendKind::Interpreter &&
+                        runtime.vu1().resolvedBackend() ==
+                            VuBackendKind::Verify,
+                    "debugger selection should remain per-unit");
+            }
+            runtime.debugResume();
+        });
+
         tc.Run("pause publishes VU diagnostics on the cache owner thread", [](TestCase &t)
         {
             if (!VuRecompilerBackend::supported())
@@ -62,7 +142,7 @@ void register_ps2_debug_control_tests()
 
             PS2RuntimeConfiguration configuration{};
             configuration.vu1Backend =
-                VuBackendKind::Recompiler;
+                VuBackendKind::Verify;
             configuration.useVuBackendEnvironment = false;
             PS2Runtime runtime(configuration);
             t.IsTrue(runtime.memory().initialize(),
@@ -150,6 +230,22 @@ void register_ps2_debug_control_tests()
                 snapshots[1u].recompiler.faultExits,
                 uint64_t{0u},
                 "the native diagnostic snapshot should remain fault-free");
+            t.Equals(
+                snapshots[1u].verify.runs,
+                uint64_t{1u},
+                "the snapshot should retain one verify run");
+            t.Equals(
+                snapshots[1u].verify.comparedPairs,
+                uint64_t{2u},
+                "the snapshot should retain per-pair comparisons");
+            t.Equals(
+                snapshots[1u].verify.publishedPairs,
+                uint64_t{2u},
+                "the snapshot should count published work once");
+            t.Equals(
+                snapshots[1u].verify.mismatches,
+                uint64_t{0u},
+                "the paused verify snapshot should remain matched");
 
             runtime.requestStop();
             runtime.debugResume();

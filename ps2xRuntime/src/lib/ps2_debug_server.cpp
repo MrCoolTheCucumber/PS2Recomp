@@ -4,6 +4,7 @@
 #include "Kernel/Stubs/Pad.h"
 #include "ps2_runtime.h"
 #include "ps2_syscalls.h"
+#include "runtime/ps2_vu_program_cache.h"
 #include "runtime/ps2_watchdog.h"
 
 #include "rapidjson/document.h"
@@ -916,6 +917,32 @@ struct PS2DebugServer::Impl
                 value.AddMember(
                     "recompiler", recompiler, allocator);
             }
+            const auto &verifySource =
+                diagnostics.verify;
+            Value verify(rapidjson::kObjectType);
+            verify.AddMember(
+                "runs", verifySource.runs, allocator);
+            verify.AddMember(
+                "compared_pairs",
+                verifySource.comparedPairs, allocator);
+            verify.AddMember(
+                "published_pairs",
+                verifySource.publishedPairs, allocator);
+            verify.AddMember(
+                "published_path1_packets",
+                verifySource.publishedPath1Packets,
+                allocator);
+            verify.AddMember(
+                "mismatches",
+                verifySource.mismatches, allocator);
+            if (!verifySource.lastMismatch.empty())
+            {
+                addString(
+                    verify, "last_mismatch",
+                    verifySource.lastMismatch, allocator);
+            }
+            value.AddMember(
+                "verify", verify, allocator);
             return value;
         };
         Value vuBackends(rapidjson::kObjectType);
@@ -988,7 +1015,8 @@ struct PS2DebugServer::Impl
                  "trace.vu0-sync", "trace.vu0-instruction",
                  "trace.ee-events",
                  "diagnostics.status", "watchdog.status",
-                 "input.pad.status", "input.pad.override"})
+                 "input.pad.status", "input.pad.override",
+                 "vu.backend.set"})
         {
             capabilities.PushBack(Value(capability, allocator), allocator);
         }
@@ -1766,6 +1794,13 @@ struct PS2DebugServer::Impl
     Value vu0InstructionTraceStart(
         const Value *params, Allocator &allocator)
     {
+        if (runtime.vu0().resolvedBackend() ==
+            VuBackendKind::Verify)
+        {
+            throw RequestError(
+                -32002,
+                "VU0 instruction tracing requires the interpreter or an instrumented recompiler; select the interpreter while paused");
+        }
         const uint64_t maximumEntries =
             requiredUnsigned(params, "maximum_entries");
         if (maximumEntries == 0u || maximumEntries > 8192u)
@@ -1987,6 +2022,66 @@ struct PS2DebugServer::Impl
             "rx", static_cast<uint32_t>(snapshot.overrideRx), allocator);
         result.AddMember(
             "ry", static_cast<uint32_t>(snapshot.overrideRy), allocator);
+        return result;
+    }
+
+    Value vuBackendSet(
+        const Value *params, Allocator &allocator)
+    {
+        const std::string unitText =
+            requiredString(params, "unit");
+        VuUnitId unit;
+        if (unitText == "vu0")
+            unit = VuUnitId::Vu0;
+        else if (unitText == "vu1")
+            unit = VuUnitId::Vu1;
+        else
+        {
+            throw RequestError(
+                -32602, "unit must be vu0 or vu1");
+        }
+
+        const std::string backendText =
+            requiredString(params, "backend");
+        VuBackendKind backend;
+        if (!parseVuBackendKind(backendText, backend))
+        {
+            throw RequestError(
+                -32602,
+                "backend must be auto, interpreter, recompiler, or verify");
+        }
+        std::string diagnostic;
+        if (!runtime.debugSetVuBackend(
+                unit, backend, &diagnostic))
+        {
+            throw RequestError(
+                -32002,
+                diagnostic.empty()
+                    ? "VU backend change was rejected"
+                    : diagnostic);
+        }
+
+        const VuUnit &selected =
+            unit == VuUnitId::Vu0
+                ? runtime.vu0()
+                : runtime.vu1();
+        Value result(rapidjson::kObjectType);
+        addString(result, "unit", unitText, allocator);
+        addString(
+            result, "requested",
+            vuBackendKindName(
+                selected.requestedBackend()),
+            allocator);
+        addString(
+            result, "resolved",
+            vuBackendKindName(
+                selected.resolvedBackend()),
+            allocator);
+        addString(
+            result, "name",
+            selected.backendName(), allocator);
+        result.AddMember(
+            "active", selected.isActive(), allocator);
         return result;
     }
 
@@ -3180,6 +3275,10 @@ struct PS2DebugServer::Impl
         if (method == "state.registers")
         {
             return registers(params, allocator);
+        }
+        if (method == "vu.backend.set")
+        {
+            return vuBackendSet(params, allocator);
         }
         if (method == "trace.vu0-sync.start")
         {

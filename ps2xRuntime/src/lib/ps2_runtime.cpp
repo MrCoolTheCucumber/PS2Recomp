@@ -6633,6 +6633,17 @@ void PS2Runtime::debugPublishVuBackendDiagnostics()
             result.pc = unit.state().pc;
             result.lastExitReason = unit.lastExitReason();
             result.captured = true;
+            const VuVerifyDiagnostics &verify =
+                unit.verifyDiagnostics();
+            result.verify = {
+                .runs = verify.runs,
+                .comparedPairs = verify.comparedPairs,
+                .publishedPairs = verify.publishedPairs,
+                .publishedPath1Packets =
+                    verify.publishedPath1Packets,
+                .mismatches = verify.mismatches,
+                .lastMismatch = verify.lastMismatch,
+            };
 
             if (const VuProgramCache *const cache =
                     unit.programCacheIfCreated())
@@ -6928,6 +6939,58 @@ void PS2Runtime::debugResume()
 bool PS2Runtime::debugIsPaused() const
 {
     return m_debugPauseRequested.load(std::memory_order_acquire);
+}
+
+bool PS2Runtime::debugSetVuBackend(
+    VuUnitId unit, VuBackendKind backend,
+    std::string *diagnostic,
+    std::chrono::milliseconds timeout)
+{
+    const auto fail =
+        [&](std::string message)
+        {
+            if (diagnostic)
+                *diagnostic = std::move(message);
+            return false;
+        };
+    if (!debugIsPaused())
+    {
+        return fail(
+            "VU backend changes require paused guest execution");
+    }
+
+    std::unique_lock<std::recursive_timed_mutex> lock(
+        m_guestExecutionMutex, std::defer_lock);
+    if (!lock.try_lock_for(timeout))
+    {
+        return fail(
+            "timed out waiting for a guest safe point");
+    }
+    if (!debugIsPaused())
+    {
+        return fail(
+            "guest execution resumed before the VU backend change");
+    }
+
+    VuUnit *target = nullptr;
+    switch (unit)
+    {
+    case VuUnitId::Vu0:
+        target = &m_vu0;
+        break;
+    case VuUnitId::Vu1:
+        target = &m_vu1;
+        break;
+    }
+    if (!target)
+        return fail("unknown VU unit");
+    if (!target->setBackend(backend, diagnostic))
+        return false;
+
+    debugPublishVuBackendDiagnostics();
+    if (diagnostic)
+        diagnostic->clear();
+    return true;
 }
 
 PS2Runtime::DebugStopInfo PS2Runtime::debugRunUntilPc(

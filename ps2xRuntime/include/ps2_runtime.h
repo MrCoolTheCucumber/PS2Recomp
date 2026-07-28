@@ -582,6 +582,16 @@ public:
         uint64_t codeImageCatalogEvictions = 0u;
     };
 
+    struct DebugVuVerifyDiagnostics
+    {
+        uint64_t runs = 0u;
+        uint64_t comparedPairs = 0u;
+        uint64_t publishedPairs = 0u;
+        uint64_t publishedPath1Packets = 0u;
+        uint64_t mismatches = 0u;
+        std::string lastMismatch;
+    };
+
     struct DebugVuBackendDiagnostics
     {
         uint64_t snapshotSequence = 0u;
@@ -593,6 +603,7 @@ public:
         bool recompilerCreated = false;
         DebugVuProgramCacheDiagnostics cache{};
         DebugVuRecompilerDiagnostics recompiler{};
+        DebugVuVerifyDiagnostics verify{};
     };
 
     enum class DebugEeEventDeviceKind : uint8_t
@@ -1005,6 +1016,11 @@ public:
     bool debugPause(std::chrono::milliseconds timeout = std::chrono::seconds(30));
     void debugResume();
     bool debugIsPaused() const;
+    bool debugSetVuBackend(
+        VuUnitId unit, VuBackendKind backend,
+        std::string *diagnostic = nullptr,
+        std::chrono::milliseconds timeout =
+            std::chrono::seconds(30));
     DebugStopInfo debugRunUntilPc(uint32_t pc, std::chrono::milliseconds timeout);
     DebugStopInfo debugStepDispatches(uint64_t count, std::chrono::milliseconds timeout);
     R5900Context debugCpuSnapshot();

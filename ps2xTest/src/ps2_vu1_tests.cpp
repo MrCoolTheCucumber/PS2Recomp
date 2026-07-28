@@ -24,6 +24,64 @@
 #include <string>
 #include <vector>
 
+struct VuVerifyTestAccess
+{
+    static std::string formatSyntheticMismatch(
+        VuUnit &unit, PS2Memory &memory,
+        const uint8_t *code, uint32_t codeSize,
+        uint32_t lowerWord, uint32_t upperWord)
+    {
+        VuExecutionState beforeState = unit.state();
+        beforeState.active = true;
+        VuExecutionState referenceState = beforeState;
+        VuExecutionState nativeState = beforeState;
+        nativeState.vi[3] = 9;
+        const VuRunResult referenceResult{
+            .requestedCycles = 1u,
+            .executedCycles = 1u,
+            .reason = VuExitReason::CycleBudget,
+            .activeBefore = true,
+            .activeAfter = true,
+        };
+        const VuRunResult nativeResult{
+            .requestedCycles = 1u,
+            .reason = VuExitReason::Fault,
+            .activeBefore = true,
+            .activeAfter = true,
+        };
+        std::vector<uint8_t> referenceData(16u);
+        std::vector<uint8_t> nativeData(16u);
+        referenceData[3u] = 1u;
+        nativeData[3u] = 2u;
+        VuTransactionalSideEffectSink referenceEffects;
+        VuTransactionalSideEffectSink nativeEffects;
+        const uint8_t packet[]{0x11u, 0x22u};
+        referenceEffects.submitPath1Packet(
+            packet, static_cast<uint32_t>(sizeof(packet)));
+        const VuUnit::VerifyMismatch mismatch{
+            .beforeState = beforeState,
+            .referenceState = referenceState,
+            .nativeState = nativeState,
+            .referenceResult = referenceResult,
+            .nativeResult = nativeResult,
+            .referenceData = referenceData,
+            .nativeData = nativeData,
+            .referenceEffects = referenceEffects,
+            .nativeEffects = nativeEffects,
+            .code = code,
+            .codeSize = codeSize,
+            .memory = &memory,
+            .invocationEntryPc = 0u,
+            .failingPc = 0u,
+            .lowerWord = lowerWord,
+            .upperWord = upperWord,
+            .cycleBudget = 7u,
+            .pairIndex = 3u,
+        };
+        return unit.formatVerifyMismatch(mismatch);
+    }
+};
+
 namespace
 {
     constexpr uint32_t kVuUpperNop = 0x000002FFu;
@@ -750,25 +808,39 @@ void register_ps2_vu1_tests()
             t.IsFalse(parseVuBackendKind("jit", parsed),
                       "unknown backend names should be rejected");
 
-            PS2RuntimeConfiguration configuration{};
-            configuration.vu0Backend = VuBackendKind::Verify;
-            configuration.vu1Backend = VuBackendKind::Verify;
-            configuration.useVuBackendEnvironment = false;
-            PS2Runtime runtime(configuration);
-            t.IsTrue(
-                runtime.vu0().requestedBackend() ==
-                    VuBackendKind::Verify,
-                "VU0 should retain its independent request");
-            t.IsTrue(
-                runtime.vu1().requestedBackend() ==
-                    VuBackendKind::Verify,
-                "VU1 should retain its independent request");
-            t.IsTrue(
-                runtime.vu0().resolvedBackend() ==
-                        VuBackendKind::Interpreter &&
-                    runtime.vu1().resolvedBackend() ==
-                        VuBackendKind::Interpreter,
-                "unintegrated modes should resolve through the interpreter");
+            if (VuRecompilerBackend::supported())
+            {
+                PS2RuntimeConfiguration configuration{};
+                configuration.vu0Backend = VuBackendKind::Verify;
+                configuration.vu1Backend = VuBackendKind::Verify;
+                configuration.useVuBackendEnvironment = false;
+                PS2Runtime runtime(configuration);
+                t.IsTrue(
+                    runtime.vu0().requestedBackend() ==
+                            VuBackendKind::Verify &&
+                        runtime.vu1().requestedBackend() ==
+                            VuBackendKind::Verify,
+                    "each VU should retain its independent verify request");
+                t.IsTrue(
+                    runtime.vu0().resolvedBackend() ==
+                            VuBackendKind::Verify &&
+                        runtime.vu1().resolvedBackend() ==
+                            VuBackendKind::Verify,
+                    "verify should resolve to transactional dual execution");
+            }
+            else
+            {
+                VuUnit unavailable;
+                std::string verifyDiagnostic;
+                t.IsFalse(
+                    unavailable.setBackend(
+                        VuBackendKind::Verify,
+                        &verifyDiagnostic),
+                    "verify should fail early without a native backend");
+                t.IsFalse(
+                    verifyDiagnostic.empty(),
+                    "unavailable verify should explain its requirement");
+            }
 
             PS2RuntimeConfiguration automaticConfiguration{};
             automaticConfiguration.useVuBackendEnvironment = false;
@@ -1051,6 +1123,248 @@ void register_ps2_vu1_tests()
             }
         });
 
+        tc.Run("verify publishes agreed state and unsupported fallback once", [](TestCase &t)
+        {
+            if (!VuRecompilerBackend::supported())
+                return;
+
+            Vu1Fixture fx;
+            t.IsTrue(
+                fx.initialize(),
+                "VU1 verify fixture should initialize");
+            writeVuInstructionPair(
+                fx.code, 0u,
+                makeVuLowerSpecial(0x70u, 1u),
+                kVuUpperNop);
+            writeVuInstructionPair(
+                fx.code, 8u,
+                makeVuSq(0xfu, 2u, 1u, 0),
+                kVuUpperEnd);
+            writeVuInstructionPair(
+                fx.code, 16u,
+                makeVuIaddiu(3u, 0u, 13),
+                kVuUpperNop);
+            fx.mem.markVU1CodeModified();
+
+            VuUnit unit(VuUnitId::Vu1);
+            std::string diagnostic;
+            t.IsTrue(
+                unit.setBackend(
+                    VuBackendKind::Verify,
+                    &diagnostic),
+                "supported verify should resolve");
+            t.IsTrue(
+                unit.resolvedBackend() ==
+                        VuBackendKind::Verify &&
+                    unit.backendName() ==
+                        "interpreter+x86-64-recompiler",
+                "verify should identify both engines");
+            unit.setProgressTrackingEnabled(true);
+            unit.state().vi[1] = 0;
+            unit.state().vf[2][0] = 1.0f;
+            unit.state().vf[2][1] = 2.0f;
+            unit.state().vf[2][2] = 3.0f;
+            unit.state().vf[2][3] = 4.0f;
+            unit.start(0u, 0u, 0u, &fx.mem);
+
+            const VuRunResult result = unit.advance(
+                fx.code, PS2_VU1_CODE_SIZE,
+                fx.data, PS2_VU1_DATA_SIZE,
+                fx.gs, &fx.mem, 3u);
+            t.IsTrue(
+                result.reason == VuExitReason::ProgramEnded,
+                "verified fallback plus native work should complete");
+            t.Equals(
+                result.executedCycles, uint32_t{3u},
+                "verify should publish the exact agreed budget");
+            t.Equals(
+                unit.state().vi[3], int32_t{13},
+                "verify should publish agreed register state");
+            const float expected[]{1.0f, 2.0f, 3.0f, 4.0f};
+            t.IsTrue(
+                std::memcmp(
+                    fx.data, expected, sizeof(expected)) == 0,
+                "verify should publish agreed VU data");
+
+            const VuVerifyDiagnostics &verify =
+                unit.verifyDiagnostics();
+            t.Equals(
+                verify.runs, uint64_t{1u},
+                "one scheduler call should be one verification run");
+            t.Equals(
+                verify.comparedPairs, uint64_t{3u},
+                "verify should compare after every pair");
+            t.Equals(
+                verify.publishedPairs, uint64_t{3u},
+                "verify should publish each agreed pair once");
+            t.Equals(
+                verify.mismatches, uint64_t{0u},
+                "matching engines should remain divergence-free");
+            t.IsTrue(
+                verify.lastMismatch.empty(),
+                "a successful run should not create mismatch text");
+
+            const VuProgressSnapshot progress =
+                unit.getProgressSnapshot();
+            t.Equals(
+                progress.invocations, uint64_t{1u},
+                "dual execution should remain one progress invocation");
+            t.Equals(
+                progress.cycles, uint64_t{3u},
+                "dual execution should count agreed pairs once");
+            const VuRecompilerDiagnostics *const recompiler =
+                unit.recompilerDiagnosticsIfCreated();
+            t.IsNotNull(
+                recompiler,
+                "verify should expose native diagnostics");
+            if (recompiler)
+            {
+                t.Equals(
+                    recompiler->interpreterFallbackPairs,
+                    uint64_t{1u},
+                    "the unsupported native pair should fall back once");
+                t.Equals(
+                    recompiler->nativePairs,
+                    uint64_t{2u},
+                    "the supported verify pairs should execute natively");
+            }
+        });
+
+        tc.Run("verify commits matching PATH1 output only once", [](TestCase &t)
+        {
+            if (!VuRecompilerBackend::supported())
+                return;
+
+            Vu1Fixture fx;
+            t.IsTrue(
+                fx.initialize(),
+                "VU1 PATH1 verify fixture should initialize");
+            std::vector<std::vector<uint8_t>> captured;
+            fx.mem.setGifPacketCallback(
+                [&](const uint8_t *data, uint32_t sizeBytes)
+                {
+                    captured.emplace_back(
+                        data, data + sizeBytes);
+                });
+
+            constexpr uint32_t kLastQword =
+                (PS2_VU1_DATA_SIZE / 16u) - 1u;
+            const uint64_t tag =
+                makeGifTag(1u, GIF_FMT_IMAGE, 0u, true);
+            std::memcpy(
+                fx.data + kLastQword * 16u,
+                &tag, sizeof(tag));
+            for (uint32_t index = 0u; index < 16u; ++index)
+            {
+                fx.data[index] =
+                    static_cast<uint8_t>(0xa0u + index);
+            }
+            const uint32_t xgkick =
+                makeVuLowerSpecial(0x6cu, 1u);
+            writeVuInstructionPair(
+                fx.code, 0u, xgkick, kVuUpperEnd);
+            writeVuInstructionPair(
+                fx.code, 8u, 0u, kVuUpperNop);
+            fx.mem.markVU1CodeModified();
+
+            VuUnit unit(VuUnitId::Vu1);
+            std::string diagnostic;
+            t.IsTrue(
+                unit.setBackend(
+                    VuBackendKind::Verify,
+                    &diagnostic),
+                "PATH1 verify should resolve");
+            unit.state().vi[1] =
+                static_cast<int32_t>(kLastQword);
+            unit.start(0u, 0u, 0u, &fx.mem);
+            const VuRunResult result = unit.advance(
+                fx.code, PS2_VU1_CODE_SIZE,
+                fx.data, PS2_VU1_DATA_SIZE,
+                fx.gs, &fx.mem, 2u);
+
+            t.IsTrue(
+                result.reason == VuExitReason::ProgramEnded,
+                "the verified XGKICK should complete");
+            t.Equals(
+                captured.size(), size_t{1u},
+                "two transactional engines must publish one PATH1 packet");
+            if (captured.size() == 1u)
+            {
+                t.Equals(
+                    captured[0u].size(), size_t{32u},
+                    "the agreed packet should include tag and payload");
+            }
+            t.Equals(
+                unit.verifyDiagnostics().
+                    publishedPath1Packets,
+                uint64_t{1u},
+                "verify should account one published packet");
+            t.Equals(
+                unit.verifyDiagnostics().mismatches,
+                uint64_t{0u},
+                "matching PATH1 bytes should compare exactly");
+        });
+
+        tc.Run("verify mismatch diagnostics retain a compact reproducer", [](TestCase &t)
+        {
+            if (!VuRecompilerBackend::supported())
+                return;
+
+            Vu1Fixture fx;
+            t.IsTrue(
+                fx.initialize(),
+                "VU1 diagnostic fixture should initialize");
+            const uint32_t lower =
+                makeVuIaddiu(1u, 0u, 7);
+            const uint32_t upper =
+                kVuUpperNop;
+            writeVuInstructionPair(
+                fx.code, 0u, lower, upper);
+            fx.mem.markVU1CodeModified();
+
+            VuUnit unit(VuUnitId::Vu1);
+            std::string selectionDiagnostic;
+            t.IsTrue(
+                unit.setBackend(
+                    VuBackendKind::Verify,
+                    &selectionDiagnostic),
+                "diagnostic formatter requires both engines");
+            const std::string diagnostic =
+                VuVerifyTestAccess::
+                    formatSyntheticMismatch(
+                        unit, fx.mem, fx.code,
+                        PS2_VU1_CODE_SIZE,
+                        lower, upper);
+            for (const std::string_view field : {
+                     "unit=vu1",
+                     "micro_hash=0x",
+                     "entry_pc=0x0",
+                     "failing_pc=0x0",
+                     "lower=0x",
+                     "upper=0x",
+                     "ir=",
+                     "cycle_budget=7",
+                     "pair_index=3",
+                     "result=cycle-budget/fault",
+                     "first_state_difference=vi",
+                     "first_data_difference=0x3",
+                     "path1_packets=1/0",
+                     "pipeline_before=",
+                     "pipeline_reference=",
+                     "pipeline_native=",
+                     "cache_key={",
+                     "generation=0x",
+                     "content=0x",
+                 })
+            {
+                t.IsTrue(
+                    diagnostic.find(field) !=
+                        std::string::npos,
+                    "verify diagnostic should retain " +
+                        std::string(field));
+            }
+        });
+
         tc.Run("runtime backend environment overrides each unit", [](TestCase &t)
         {
             ScopedEnvironmentVariable vu0("PS2X_VU0_BACKEND");
@@ -1060,7 +1374,10 @@ void register_ps2_vu1_tests()
             ScopedEnvironmentVariable vu1Instrumentation(
                 "PS2X_VU1_NATIVE_INSTRUMENTATION");
             vu0.set("interpreter");
-            vu1.set("verify");
+            vu1.set(
+                VuRecompilerBackend::supported()
+                    ? "verify"
+                    : "interpreter");
             vu0Instrumentation.set("on");
             vu1Instrumentation.set("0");
 
@@ -1071,7 +1388,9 @@ void register_ps2_vu1_tests()
                 "the VU0 environment request should be applied");
             t.IsTrue(
                 runtime.vu1().requestedBackend() ==
-                    VuBackendKind::Verify,
+                    (VuRecompilerBackend::supported()
+                         ? VuBackendKind::Verify
+                         : VuBackendKind::Interpreter),
                 "the VU1 environment request should be applied independently");
             t.IsTrue(
                 runtime.vu0().nativeInstrumentationEnabled(),

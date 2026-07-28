@@ -8,7 +8,9 @@
 
 #include <algorithm>
 #include <cstring>
+#include <iomanip>
 #include <limits>
+#include <sstream>
 #include <utility>
 
 // Keep selection cheap for the permanent interpreter and keep its cold decode
@@ -26,6 +28,37 @@
 
 namespace
 {
+    constexpr uint64_t kVuVerifyFnv1a64Offset =
+        14695981039346656037ull;
+    constexpr uint64_t kVuVerifyFnv1a64Prime =
+        1099511628211ull;
+
+    bool vuRunResultsEqual(
+        const VuRunResult &left,
+        const VuRunResult &right)
+    {
+        return
+            left.requestedCycles == right.requestedCycles &&
+            left.executedCycles == right.executedCycles &&
+            left.reason == right.reason &&
+            left.activeBefore == right.activeBefore &&
+            left.activeAfter == right.activeAfter &&
+            left.completed == right.completed;
+    }
+
+    uint64_t hashVuCode(
+        const uint8_t *code, uint32_t codeSize)
+    {
+        uint64_t hash = kVuVerifyFnv1a64Offset;
+        for (uint32_t index = 0u;
+             code && index < codeSize; ++index)
+        {
+            hash ^= code[index];
+            hash *= kVuVerifyFnv1a64Prime;
+        }
+        return hash;
+    }
+
     uint8_t vuLowerSpecialOp(uint32_t lower)
     {
         if ((lower & 0x80000000u) == 0u ||
@@ -447,15 +480,17 @@ bool VuUnit::setBackend(
     IVuExecutionBackend *backend = m_interpreter.get();
     const bool explicitNative =
         requested == VuBackendKind::Recompiler;
-    if (explicitNative &&
+    const bool verification =
+        requested == VuBackendKind::Verify;
+    if ((explicitNative || verification) &&
         !VuRecompilerBackend::supported())
     {
         if (diagnostic)
         {
             *diagnostic =
                 VuRecompilerBackend::built()
-                    ? "the x86-64 VU recompiler is unsupported on this host"
-                    : "the x86-64 VU recompiler was not built";
+                    ? "the x86-64 VU recompiler required by the request is unsupported on this host"
+                    : "the x86-64 VU recompiler required by the request was not built";
         }
         return false;
     }
@@ -463,14 +498,17 @@ bool VuUnit::setBackend(
         m_unitId == VuUnitId::Vu1 &&
         requested == VuBackendKind::Auto &&
         VuRecompilerBackend::supported();
-    if (explicitNative || automaticNative)
+    if (explicitNative || automaticNative || verification)
     {
         if (!m_recompiler)
         {
             m_recompiler =
                 std::make_unique<VuRecompilerBackend>(*this);
         }
-        resolved = VuBackendKind::Recompiler;
+        resolved =
+            verification
+                ? VuBackendKind::Verify
+                : VuBackendKind::Recompiler;
         backend = m_recompiler.get();
     }
 
@@ -484,6 +522,8 @@ bool VuUnit::setBackend(
 
 std::string_view VuUnit::backendName() const
 {
+    if (m_resolvedBackend == VuBackendKind::Verify)
+        return "interpreter+x86-64-recompiler";
     return m_backend ? m_backend->name() : "none";
 }
 
@@ -690,6 +730,13 @@ PS2X_VU_ALWAYS_INLINE VuRunResult VuUnit::run(
             gs, memory, maxCycles,
             traceBudgetBoundary);
     }
+    else if (m_resolvedBackend == VuBackendKind::Verify)
+        [[unlikely]]
+    {
+        result = runVerify(
+            vuCode, codeSize, vuData, dataSize,
+            gs, memory, maxCycles);
+    }
     else
     {
         RuntimeVuSideEffectSink sideEffects(gs, memory);
@@ -721,17 +768,6 @@ VuRunResult VuUnit::runRecompiler(
     GS &gs, PS2Memory *memory, uint32_t maxCycles,
     bool traceBudgetBoundary)
 {
-    if (!m_recompiler)
-    {
-        return {
-            .requestedCycles = maxCycles,
-            .reason = VuExitReason::Fault,
-            .activeBefore = m_state.active,
-            .activeAfter = m_state.active,
-            .completed = !m_state.active,
-        };
-    }
-
     RuntimeVuSideEffectSink sideEffects(gs, memory);
     VuExecutionContext context{
         .state = m_state,
@@ -745,23 +781,60 @@ VuRunResult VuUnit::runRecompiler(
         .enableInstrumentation = true,
         .enableNativeInstrumentation =
             m_nativeInstrumentationEnabled,
-        .enableProgressAccounting = false,
+        .enableProgressAccounting = true,
     };
-    const bool activeBefore = m_state.active;
+    return runRecompilerContext(
+        context, maxCycles, true);
+}
+
+VuRunResult VuUnit::runRecompilerContext(
+    VuExecutionContext &context, uint32_t maxCycles,
+    bool trackProgress)
+{
+    VuExecutionState &state = context.state;
+    if (!m_recompiler)
+    {
+        return {
+            .requestedCycles = maxCycles,
+            .reason = VuExitReason::Fault,
+            .activeBefore = state.active,
+            .activeAfter = state.active,
+            .completed = !state.active,
+        };
+    }
+
+    const bool previousProgressAccounting =
+        context.enableProgressAccounting;
+    context.enableProgressAccounting = false;
+    struct ProgressAccountingGuard
+    {
+        bool &value;
+        bool previous;
+
+        ~ProgressAccountingGuard()
+        {
+            value = previous;
+        }
+    };
+    const ProgressAccountingGuard accountingGuard{
+        context.enableProgressAccounting,
+        previousProgressAccounting};
+
+    const bool activeBefore = state.active;
     uint32_t executedCycles = 0u;
     ProgressTracker progress(
-        *this, m_state, true, executedCycles);
+        *this, state, trackProgress, executedCycles);
     const auto finish =
         [&](VuRunResult result)
         {
             result.requestedCycles = maxCycles;
             result.executedCycles = executedCycles;
             result.activeBefore = activeBefore;
-            result.activeAfter = m_state.active;
-            result.completed = !m_state.active;
+            result.activeAfter = state.active;
+            result.completed = !state.active;
             return result;
         };
-    while (m_state.active &&
+    while (state.active &&
            executedCycles < maxCycles)
     {
         VuRunResult result =
@@ -796,7 +869,7 @@ VuRunResult VuUnit::runRecompiler(
             return finish(result);
         }
         if (result.reason != VuExitReason::CycleBudget ||
-            !m_state.active)
+            !state.active)
         {
             return finish(result);
         }
@@ -804,13 +877,430 @@ VuRunResult VuUnit::runRecompiler(
     return {
         .requestedCycles = maxCycles,
         .executedCycles = executedCycles,
-        .reason = m_state.active
+        .reason = state.active
                       ? VuExitReason::CycleBudget
                       : VuExitReason::ProgramEnded,
         .activeBefore = activeBefore,
-        .activeAfter = m_state.active,
-        .completed = !m_state.active,
+        .activeAfter = state.active,
+        .completed = !state.active,
     };
+}
+
+VuRunResult VuUnit::runVerify(
+    uint8_t *vuCode, uint32_t codeSize,
+    uint8_t *vuData, uint32_t dataSize,
+    GS &gs, PS2Memory *memory, uint32_t maxCycles)
+{
+    ++m_verifyDiagnostics.runs;
+    const bool activeBefore = m_state.active;
+    const uint32_t invocationEntryPc = m_state.pc;
+    const auto fault =
+        [&](std::string diagnostic, uint32_t executedCycles)
+        {
+            ++m_verifyDiagnostics.mismatches;
+            m_verifyDiagnostics.lastMismatch =
+                std::move(diagnostic);
+            // A verification failure is terminal for this invocation. Keep
+            // the last agreed architectural snapshot, but make the unit idle
+            // so a scheduler cannot repeatedly execute the same divergence.
+            m_state.active = false;
+            return VuRunResult{
+                .requestedCycles = maxCycles,
+                .executedCycles = executedCycles,
+                .reason = VuExitReason::Fault,
+                .activeBefore = activeBefore,
+                .activeAfter = m_state.active,
+                .completed = !m_state.active,
+            };
+        };
+
+    if (!m_recompiler)
+    {
+        return fault(
+            "VU verify input error: native backend is unavailable",
+            0u);
+    }
+    if (!vuCode || !memory ||
+        (dataSize != 0u && !vuData))
+    {
+        return fault(
+            "VU verify input error: tracked code, memory, and VU data are required",
+            0u);
+    }
+    if (maxCycles == 0u)
+    {
+        return {
+            .requestedCycles = 0u,
+            .reason = VuExitReason::CycleBudget,
+            .activeBefore = activeBefore,
+            .activeAfter = m_state.active,
+            .completed = !m_state.active,
+        };
+    }
+
+    VuExecutionState referenceState = m_state;
+    VuExecutionState nativeState = m_state;
+    std::vector<uint8_t> referenceData(dataSize);
+    std::vector<uint8_t> nativeData(dataSize);
+    if (dataSize != 0u)
+    {
+        std::memcpy(
+            referenceData.data(), vuData, dataSize);
+        std::memcpy(
+            nativeData.data(), vuData, dataSize);
+    }
+    VuTransactionalSideEffectSink referenceEffects;
+    VuTransactionalSideEffectSink nativeEffects;
+    VuExecutionContext referenceContext{
+        .state = referenceState,
+        .code = vuCode,
+        .codeSize = codeSize,
+        .data = referenceData.data(),
+        .dataSize = dataSize,
+        .sideEffects = referenceEffects,
+        .memory = memory,
+        .enableInstrumentation = false,
+        .enableProgressAccounting = false,
+    };
+    VuExecutionContext nativeContext{
+        .state = nativeState,
+        .code = vuCode,
+        .codeSize = codeSize,
+        .data = nativeData.data(),
+        .dataSize = dataSize,
+        .sideEffects = nativeEffects,
+        .memory = memory,
+        .enableInstrumentation = false,
+        .enableProgressAccounting = false,
+    };
+    RuntimeVuSideEffectSink runtimeEffects(gs, memory);
+    uint32_t executedCycles = 0u;
+    uint64_t pairIndex = 0u;
+    ProgressTracker progress(
+        *this, m_state, true, executedCycles);
+
+    const auto finish =
+        [&](VuExitReason reason)
+        {
+            return VuRunResult{
+                .requestedCycles = maxCycles,
+                .executedCycles = executedCycles,
+                .reason = reason,
+                .activeBefore = activeBefore,
+                .activeAfter = m_state.active,
+                .completed = !m_state.active,
+            };
+        };
+
+    while (referenceState.active &&
+           executedCycles < maxCycles)
+    {
+        const uint32_t failingPc =
+            referenceState.pc;
+        uint32_t lowerWord = 0u;
+        uint32_t upperWord = 0u;
+        if (failingPc <= codeSize &&
+            codeSize - failingPc >= 8u)
+        {
+            std::memcpy(
+                &lowerWord, vuCode + failingPc,
+                sizeof(lowerWord));
+            std::memcpy(
+                &upperWord,
+                vuCode + failingPc + sizeof(lowerWord),
+                sizeof(upperWord));
+        }
+
+        const VuRunResult referenceResult =
+            m_interpreter->run(referenceContext, 1u);
+        const VuRunResult nativeResult =
+            runRecompilerContext(
+                nativeContext, 1u, false);
+        ++m_verifyDiagnostics.comparedPairs;
+
+        std::string stateDifference;
+        const bool resultsMatch =
+            vuRunResultsEqual(
+                referenceResult, nativeResult);
+        const bool statesMatch =
+            vuExecutionStatesEqual(
+                referenceState, nativeState,
+                &stateDifference);
+        const bool dataMatches =
+            referenceData == nativeData;
+        const bool effectsMatch =
+            referenceEffects.path1Packets() ==
+            nativeEffects.path1Packets();
+        const bool madeExpectedProgress =
+            referenceResult.executedCycles == 1u ||
+            !referenceState.active;
+        if (!resultsMatch || !statesMatch ||
+            !dataMatches || !effectsMatch ||
+            !madeExpectedProgress)
+        {
+            std::string detail;
+            if (!madeExpectedProgress)
+                detail = "verification step made no progress";
+            const VerifyMismatch mismatch{
+                .beforeState = m_state,
+                .referenceState = referenceState,
+                .nativeState = nativeState,
+                .referenceResult = referenceResult,
+                .nativeResult = nativeResult,
+                .referenceData = referenceData,
+                .nativeData = nativeData,
+                .referenceEffects = referenceEffects,
+                .nativeEffects = nativeEffects,
+                .code = vuCode,
+                .codeSize = codeSize,
+                .memory = memory,
+                .invocationEntryPc = invocationEntryPc,
+                .failingPc = failingPc,
+                .lowerWord = lowerWord,
+                .upperWord = upperWord,
+                .cycleBudget = maxCycles,
+                .pairIndex = pairIndex,
+                .detail = detail,
+            };
+            return fault(
+                formatVerifyMismatch(mismatch),
+                executedCycles);
+        }
+
+        m_state = referenceState;
+        if (dataSize != 0u)
+        {
+            std::memcpy(
+                vuData, referenceData.data(),
+                dataSize);
+        }
+        referenceEffects.commitTo(runtimeEffects);
+        m_verifyDiagnostics.publishedPath1Packets +=
+            referenceEffects.path1Packets().size();
+        referenceEffects.clear();
+        nativeEffects.clear();
+
+        executedCycles +=
+            referenceResult.executedCycles;
+        m_verifyDiagnostics.publishedPairs +=
+            referenceResult.executedCycles;
+        ++pairIndex;
+        progress.publish();
+
+        if (!referenceState.active ||
+            referenceResult.reason !=
+                VuExitReason::CycleBudget)
+        {
+            return finish(referenceResult.reason);
+        }
+    }
+
+    return finish(
+        m_state.active
+            ? VuExitReason::CycleBudget
+            : VuExitReason::ProgramEnded);
+}
+
+std::string VuUnit::formatVerifyMismatch(
+    const VerifyMismatch &mismatch)
+{
+    std::string stateDifference;
+    (void)vuExecutionStatesEqual(
+        mismatch.referenceState,
+        mismatch.nativeState,
+        &stateDifference);
+
+    size_t dataDifference =
+        mismatch.referenceData.size();
+    const size_t commonDataSize =
+        std::min(
+            mismatch.referenceData.size(),
+            mismatch.nativeData.size());
+    for (size_t index = 0u;
+         index < commonDataSize; ++index)
+    {
+        if (mismatch.referenceData[index] !=
+            mismatch.nativeData[index])
+        {
+            dataDifference = index;
+            break;
+        }
+    }
+    if (dataDifference == mismatch.referenceData.size() &&
+        mismatch.referenceData.size() !=
+            mismatch.nativeData.size())
+    {
+        dataDifference = commonDataSize;
+    }
+
+    const VuIrInstructionPair pair =
+        decodeVuIrInstructionPair(
+            mismatch.failingPc,
+            mismatch.lowerWord,
+            mismatch.upperWord);
+    const auto pipelineText =
+        [](const VuExecutionState &state)
+        {
+            const VuPipelineState &pipeline =
+                state.pipeline;
+            std::ostringstream text;
+            text
+                << "{xgkick=" << pipeline.xgkick.active
+                << ",address=0x" << std::hex
+                << pipeline.xgkick.address
+                << ",remaining=0x"
+                << pipeline.xgkick.tagBytesRemaining
+                << ",credit=0x"
+                << pipeline.xgkick.cycleCredit
+                << ",eop=" << std::dec
+                << pipeline.xgkick.tagEop
+                << ",packet_bytes="
+                << pipeline.xgkick.packet.size()
+                << ",q=" << pipeline.delayedQ.active
+                << "/" << pipeline.delayedQ.cyclesRemaining
+                << ",p=" << pipeline.delayedP.active
+                << "/" << pipeline.delayedP.cyclesRemaining
+                << ",fmac_index="
+                << static_cast<uint32_t>(
+                       pipeline.fmacFlagIndex)
+                << ",working_mac=0x" << std::hex
+                << pipeline.workingMac
+                << ",vi_backup=" << std::dec
+                << static_cast<uint32_t>(
+                       state.viBackupCycles)
+                << "/"
+                << static_cast<uint32_t>(
+                       state.viBackupRegister)
+                << "}";
+            return text.str();
+        };
+
+    VuExecutionState keyState =
+        mismatch.beforeState;
+    std::vector<uint8_t> keyData =
+        mismatch.nativeData;
+    VuTransactionalSideEffectSink keyEffects;
+    VuExecutionContext keyContext{
+        .state = keyState,
+        .code = mismatch.code,
+        .codeSize = mismatch.codeSize,
+        .data = keyData.data(),
+        .dataSize =
+            static_cast<uint32_t>(keyData.size()),
+        .sideEffects = keyEffects,
+        .memory = mismatch.memory,
+        .enableInstrumentation = false,
+        .enableProgressAccounting = false,
+    };
+    VuProgramKey key;
+    std::string keyDiagnostic;
+    const bool keyValid =
+        m_recompiler &&
+        m_recompiler->programKey(
+            keyContext, VuCompilationMode::Normal,
+            key, &keyDiagnostic);
+
+    std::ostringstream message;
+    message
+        << "VU verify mismatch:"
+        << " unit="
+        << (m_unitId == VuUnitId::Vu0 ? "vu0" : "vu1")
+        << " micro_hash=0x" << std::hex
+        << hashVuCode(
+               mismatch.code, mismatch.codeSize)
+        << " entry_pc=0x"
+        << mismatch.invocationEntryPc
+        << " failing_pc=0x"
+        << mismatch.failingPc
+        << " lower=0x" << std::setw(8)
+        << std::setfill('0') << mismatch.lowerWord
+        << " upper=0x" << std::setw(8)
+        << mismatch.upperWord
+        << std::setfill(' ')
+        << " ir=" << vuIrOpcodeName(pair.upper.opcode)
+        << "/" << vuIrOpcodeName(pair.lower.opcode)
+        << std::dec
+        << " cycle_budget=" << mismatch.cycleBudget
+        << " pair_index=" << mismatch.pairIndex
+        << " result="
+        << vuExitReasonName(
+               mismatch.referenceResult.reason)
+        << "/"
+        << vuExitReasonName(
+               mismatch.nativeResult.reason)
+        << " executed="
+        << mismatch.referenceResult.executedCycles
+        << "/"
+        << mismatch.nativeResult.executedCycles;
+    if (!stateDifference.empty())
+    {
+        message
+            << " first_state_difference="
+            << stateDifference;
+    }
+    if (dataDifference <
+        mismatch.referenceData.size() ||
+        mismatch.referenceData.size() !=
+            mismatch.nativeData.size())
+    {
+        message
+            << " first_data_difference=0x"
+            << std::hex << dataDifference << std::dec;
+    }
+    if (mismatch.referenceEffects.path1Packets() !=
+        mismatch.nativeEffects.path1Packets())
+    {
+        message
+            << " path1_packets="
+            << mismatch.referenceEffects
+                   .path1Packets().size()
+            << "/"
+            << mismatch.nativeEffects
+                   .path1Packets().size();
+    }
+    message
+        << " pipeline_before="
+        << pipelineText(mismatch.beforeState)
+        << " pipeline_reference="
+        << pipelineText(mismatch.referenceState)
+        << " pipeline_native="
+        << pipelineText(mismatch.nativeState);
+    if (keyValid)
+    {
+        message
+            << " cache_key={memory=0x"
+            << std::hex << key.memoryIdentity
+            << ",code=0x" << key.codeIdentity
+            << ",size=0x" << key.codeSize
+            << ",mask=0x" << key.addressMask
+            << ",entry=0x" << key.entryPc
+            << ",generation=0x"
+            << key.codeGeneration
+            << ",content=0x"
+            << key.codeContentIdentity
+            << ",host=0x" << key.hostFeatures
+            << ",mode="
+            << static_cast<uint32_t>(
+                   key.compilationMode)
+            << "}" << std::dec;
+    }
+    else
+    {
+        message
+            << " cache_key_error=\""
+            << keyDiagnostic << "\"";
+    }
+    if (m_recompiler &&
+        !m_recompiler->lastDiagnostic().empty())
+    {
+        message
+            << " recompiler=\""
+            << m_recompiler->lastDiagnostic()
+            << "\"";
+    }
+    if (!mismatch.detail.empty())
+        message << " detail=\"" << mismatch.detail << "\"";
+    return message.str();
 }
 
 VuRunResult VuInterpreterBackend::run(

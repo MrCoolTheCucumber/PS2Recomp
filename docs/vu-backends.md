@@ -54,12 +54,25 @@ variable name and accepted values.
 
 On a supported x86-64 host, an explicit VU0 or VU1 `recompiler` request resolves
 to `x86-64-recompiler`; if native executable memory or the required host
-features are unavailable, the request fails early with a diagnostic. VU1
-`auto` resolves to `x86-64-recompiler` when that backend is built and supported,
-and falls back to the interpreter on other hosts. VU0 `auto` deliberately
-remains on the interpreter until its full synchronization and verification
-matrix passes. Transactional `verify` mode is also a later milestone and
-currently retains its requested value while resolving to the interpreter.
+features are unavailable, the request fails early with a diagnostic. `verify`
+has the same host requirement and resolves to
+`interpreter+x86-64-recompiler`. VU1 `auto` resolves to
+`x86-64-recompiler` when that backend is built and supported, and falls back to
+the interpreter on other hosts. VU0 `auto` deliberately remains on the
+interpreter until its full synchronization and verification matrix passes.
+
+`verify` clones the canonical execution state and complete unit data memory for
+both engines. It advances one pair at a time, compares the public result,
+architectural and pipeline state, data bytes, and transactional PATH1 packets,
+then publishes the agreed state, data, and reference packet exactly once.
+Unsupported native pairs retain the normal one-pair interpreter fallback. A
+mismatch publishes neither candidate for the failing pair, returns a structured
+fault, makes the unit idle to prevent a repeated divergence, and retains a
+compact first-divergence diagnostic containing the unit, whole-microcode hash,
+entry/failing PC, words and IR operations, budget/pair index, first
+state/data/effect difference, pipeline snapshots, exit reasons, cache key, and
+code generation. Verification is intentionally slow and is for bounded
+fixtures rather than full-speed play.
 
 The unit adapter consumes one scheduler budget across internal native exits,
 including VU1 XGKICK helper boundaries. If a compiled block reaches an
@@ -68,6 +81,9 @@ through the permanent interpreter at the unchanged PC, and resumes native
 execution with the remaining budget. This keeps VU0 EE synchronization and VIF
 completion timing independent of native block boundaries. Changing a request
 while a unit is active is rejected and leaves the previous selection intact.
+The debugger's `vu.backend.set` request additionally requires paused guest
+execution; it acquires the guest-execution safe point and changes only the
+named inactive unit.
 
 An armed instruction observer uses the permanent interpreter by default, which
 preserves the normal instruction-level debugger path. CI and differential trace
@@ -77,6 +93,11 @@ helper-routed native blocks from the distinct `Instrumented` cache namespace
 and calls the observer before each supported pair mutates state. This mode is
 deliberately slower and does not change normal unobserved blocks. VIF1 DMA
 tracing and workload profiling continue to select the permanent interpreter.
+
+Verification disables observers, VIF tracing, and workload profiling inside
+both private candidates. Select the interpreter for instruction-level
+debugging; this prevents either candidate from publishing trace/device state
+before agreement.
 
 Aggregate debugger progress wraps the complete scheduler-facing unit call, so
 internal native entries and one-pair interpreter fallbacks do not double-count
@@ -88,6 +109,8 @@ interpreter.
 unit's requested mode, resolved mode, backend name, active state, and native
 instrumentation setting. At a debugger pause boundary, the GameThread or the
 quiescent guest-execution lock also publishes the current PC, last exit reason,
-issued cycles, cache/compile counters, and normal/instrumented native
-pair/exit/fallback counters. These snapshots keep owner-only cache state out of
-the debugger thread while the guest is running.
+issued cycles, cache/compile counters, normal/instrumented native
+pair/exit/fallback counters, and verify run/comparison/publication/mismatch
+counters. The first mismatch text is included when present. These snapshots
+keep owner-only cache state out of the debugger thread while the guest is
+running.
