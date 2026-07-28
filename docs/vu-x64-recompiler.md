@@ -90,9 +90,9 @@ An explicit supported VU1 `recompiler` selection executes through `VuUnit`.
 The unit adapter continues within one scheduler budget after an internal
 XGKICK boundary. On `UnsupportedInstruction`, it executes exactly one pair
 through the interpreter and then resumes native code; diagnostics count both
-the unsupported exit and interpreter fallback pair. VU1 `auto` remains
-interpreter-selected pending the rollout performance gate, and VU0 integration
-is separate.
+the unsupported exit and interpreter fallback pair. VU1 `auto` selects this
+backend on supported x86-64 hosts and retains interpreter fallback elsewhere.
+VU0 integration is separate.
 
 Focused tests cover:
 

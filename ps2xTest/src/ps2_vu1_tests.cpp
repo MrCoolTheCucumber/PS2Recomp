@@ -768,7 +768,27 @@ void register_ps2_vu1_tests()
                         VuBackendKind::Interpreter &&
                     runtime.vu1().resolvedBackend() ==
                         VuBackendKind::Interpreter,
-                "Phase 1 modes should resolve through the interpreter");
+                "unintegrated modes should resolve through the interpreter");
+
+            PS2RuntimeConfiguration automaticConfiguration{};
+            automaticConfiguration.useVuBackendEnvironment = false;
+            PS2Runtime automatic(automaticConfiguration);
+            t.IsTrue(
+                automatic.vu0().requestedBackend() ==
+                        VuBackendKind::Auto &&
+                    automatic.vu0().resolvedBackend() ==
+                        VuBackendKind::Interpreter,
+                "VU0 auto should remain interpreted until its integration gate");
+            t.IsTrue(
+                automatic.vu1().requestedBackend() ==
+                    VuBackendKind::Auto,
+                "VU1 should retain its automatic request");
+            t.IsTrue(
+                automatic.vu1().resolvedBackend() ==
+                    (VuRecompilerBackend::supported()
+                         ? VuBackendKind::Recompiler
+                         : VuBackendKind::Interpreter),
+                "VU1 auto should select native execution only on a supported host");
 
             VuUnit unit;
             unit.start();

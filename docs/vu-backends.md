@@ -52,11 +52,11 @@ variable name and accepted values.
 
 On a supported x86-64 host, an explicit VU1 `recompiler` request resolves to
 `x86-64-recompiler`; if native executable memory or the required host features
-are unavailable, the request fails early with a diagnostic. VU1 `auto` remains
-on the interpreter until the title-level parity and performance rollout gates
-pass. VU0 recompiler integration and transactional `verify` mode are later
-milestones, so those requests still retain their requested value while
-resolving to the interpreter.
+are unavailable, the request fails early with a diagnostic. VU1 `auto`
+resolves to `x86-64-recompiler` when that backend is built and supported, and
+falls back to the interpreter on other hosts. VU0 recompiler integration and
+transactional `verify` mode are later milestones, so those requests still
+retain their requested value while resolving to the interpreter.
 
 The VU1 unit adapter consumes a scheduler budget across internal XGKICK helper
 exits. If a compiled block reaches an unsupported pair, it records the native

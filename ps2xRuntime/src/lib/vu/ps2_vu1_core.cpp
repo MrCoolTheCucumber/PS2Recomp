@@ -444,20 +444,28 @@ bool VuUnit::setBackend(
 
     VuBackendKind resolved = VuBackendKind::Interpreter;
     IVuExecutionBackend *backend = m_interpreter.get();
-    if (requested == VuBackendKind::Recompiler &&
-        m_unitId == VuUnitId::Vu1)
+    const bool nativeUnit = m_unitId == VuUnitId::Vu1;
+    const bool explicitNative =
+        nativeUnit &&
+        requested == VuBackendKind::Recompiler;
+    if (explicitNative &&
+        !VuRecompilerBackend::supported())
     {
-        if (!VuRecompilerBackend::supported())
+        if (diagnostic)
         {
-            if (diagnostic)
-            {
-                *diagnostic =
-                    VuRecompilerBackend::built()
-                        ? "the x86-64 VU recompiler is unsupported on this host"
-                        : "the x86-64 VU recompiler was not built";
-            }
-            return false;
+            *diagnostic =
+                VuRecompilerBackend::built()
+                    ? "the x86-64 VU recompiler is unsupported on this host"
+                    : "the x86-64 VU recompiler was not built";
         }
+        return false;
+    }
+    const bool automaticNative =
+        nativeUnit &&
+        requested == VuBackendKind::Auto &&
+        VuRecompilerBackend::supported();
+    if (explicitNative || automaticNative)
+    {
         if (!m_recompiler)
         {
             m_recompiler =
