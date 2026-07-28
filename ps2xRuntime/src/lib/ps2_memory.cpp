@@ -12,9 +12,12 @@
 #include <cstring>
 #include <iomanip>
 #include <limits>
+#include <map>
+#include <set>
 #include <stdexcept>
 #include <algorithm>
 #include <string>
+#include <tuple>
 #include <unordered_map>
 #include <unordered_set>
 #include <utility>
@@ -1057,6 +1060,588 @@ struct Ps2GsDmaTraceState
     }
 };
 
+struct Ps2Vu1WorkloadProfileState
+{
+    static constexpr uint64_t FNV_OFFSET_BASIS =
+        14695981039346656037ull;
+    static constexpr uint64_t FNV_PRIME = 1099511628211ull;
+
+    struct ProgramKey
+    {
+        uint64_t epoch = 0u;
+        uint64_t microHash = FNV_OFFSET_BASIS;
+        uint32_t startPc = 0u;
+
+        bool operator<(const ProgramKey &other) const
+        {
+            return std::tie(epoch, microHash, startPc) <
+                   std::tie(other.epoch, other.microHash, other.startPc);
+        }
+    };
+
+    struct ProgramStats
+    {
+        uint64_t invocations = 0u;
+        uint64_t completedInvocations = 0u;
+        uint64_t abortedInvocations = 0u;
+        uint64_t pairs = 0u;
+        uint64_t minPairs = std::numeric_limits<uint64_t>::max();
+        uint64_t maxPairs = 0u;
+        uint64_t measuredPairs = 0u;
+        uint64_t measuredInvocationsTouched = 0u;
+        uint64_t fullyMeasuredInvocations = 0u;
+        uint64_t fullyMeasuredInvocationPairs = 0u;
+        uint64_t branchPairs = 0u;
+        uint64_t conditionalBranchPairs = 0u;
+        uint64_t nonsequentialTransitions = 0u;
+        std::array<uint64_t, 128u> lowerOps{};
+        std::array<uint64_t, 128u> lowerSpecialOps{};
+        std::array<uint64_t, 64u> upperOps{};
+        std::array<uint64_t, 128u> upperSpecialOps{};
+        std::set<uint64_t> codeGenerations;
+        std::set<uint64_t> measuredCodeGenerations;
+    };
+
+    struct EpochStats
+    {
+        uint64_t invocations = 0u;
+        uint64_t completedInvocations = 0u;
+        uint64_t abortedInvocations = 0u;
+        uint64_t pairs = 0u;
+        uint64_t measuredPairs = 0u;
+    };
+
+    struct UploadKey
+    {
+        uint64_t payloadHash = FNV_OFFSET_BASIS;
+        uint32_t destination = 0u;
+        uint32_t sizeBytes = 0u;
+
+        bool operator<(const UploadKey &other) const
+        {
+            return std::tie(payloadHash, destination, sizeBytes) <
+                   std::tie(
+                       other.payloadHash,
+                       other.destination,
+                       other.sizeBytes);
+        }
+    };
+
+    struct UploadStats
+    {
+        uint64_t count = 0u;
+        uint64_t identicalCount = 0u;
+        uint64_t measuredCount = 0u;
+        uint64_t measuredIdenticalCount = 0u;
+    };
+
+    struct CurrentInvocation
+    {
+        ProgramStats *program = nullptr;
+        EpochStats *epoch = nullptr;
+        uint64_t microHash = FNV_OFFSET_BASIS;
+        uint64_t codeGeneration = 0u;
+        uint64_t pairs = 0u;
+        uint64_t measuredPairs = 0u;
+        bool active = false;
+        bool fullyMeasured = false;
+        bool lastPairMeasured = false;
+    };
+
+    std::FILE *output = nullptr;
+    uint64_t warmupPairs = 0u;
+    uint64_t pairLimit = std::numeric_limits<uint64_t>::max();
+    uint64_t epoch = 0u;
+    std::atomic<bool> enabled{false};
+    bool written = false;
+    std::atomic<uint64_t> observedPairs{0u};
+    std::atomic<uint64_t> measuredPairs{0u};
+    std::atomic<uint64_t> invocations{0u};
+    std::atomic<uint64_t> codeUploads{0u};
+    std::atomic<uint64_t> identicalCodeUploads{0u};
+    std::atomic<uint64_t> codeUploadBytes{0u};
+    std::atomic<uint64_t> identicalCodeUploadBytes{0u};
+    std::map<ProgramKey, ProgramStats> programs;
+    std::map<uint64_t, EpochStats> epochs;
+    std::map<UploadKey, UploadStats> uploadPayloads;
+    std::unordered_map<uint64_t, uint64_t> generationHashes;
+    std::set<uint64_t> observedCodeGenerations;
+    std::set<uint64_t> observedMicroHashes;
+    std::set<uint64_t> measuredCodeGenerations;
+    std::set<uint64_t> measuredMicroHashes;
+    CurrentInvocation current{};
+
+    Ps2Vu1WorkloadProfileState(
+        const char *path,
+        uint64_t configuredWarmupPairs,
+        uint64_t configuredPairLimit)
+        : warmupPairs(configuredWarmupPairs),
+          pairLimit(
+              configuredPairLimit == 0u
+                  ? std::numeric_limits<uint64_t>::max()
+                  : configuredPairLimit)
+    {
+        output = path && *path ? std::fopen(path, "wb") : nullptr;
+        if (!output)
+        {
+            if (path && *path)
+            {
+                std::fprintf(
+                    stderr,
+                    "VU1 workload profile: cannot open '%s': %s\n",
+                    path, std::strerror(errno));
+            }
+            return;
+        }
+        enabled.store(true, std::memory_order_relaxed);
+    }
+
+    ~Ps2Vu1WorkloadProfileState()
+    {
+        write();
+        if (output)
+            std::fclose(output);
+    }
+
+    static uint64_t hashBytes(const uint8_t *data, uint32_t sizeBytes)
+    {
+        uint64_t hash = FNV_OFFSET_BASIS;
+        if (!data)
+            return hash;
+        for (uint32_t index = 0u; index < sizeBytes; ++index)
+        {
+            hash ^= data[index];
+            hash *= FNV_PRIME;
+        }
+        return hash;
+    }
+
+    uint64_t microHash(
+        const uint8_t *code,
+        uint32_t codeSize,
+        uint64_t generation)
+    {
+        const auto found = generationHashes.find(generation);
+        if (found != generationHashes.end())
+            return found->second;
+        const uint64_t hash = hashBytes(code, codeSize);
+        generationHashes.emplace(generation, hash);
+        return hash;
+    }
+
+    void beginInvocation(
+        uint32_t startPc,
+        const uint8_t *code,
+        uint32_t codeSize,
+        uint64_t generation)
+    {
+        if (!enabled.load(std::memory_order_relaxed))
+            return;
+        if (current.active)
+            endInvocation(false);
+
+        const uint64_t hash = microHash(code, codeSize, generation);
+        ProgramStats &program = programs[ProgramKey{
+            epoch, hash, startPc & 0x3FFFu}];
+        EpochStats &epochStats = epochs[epoch];
+        ++program.invocations;
+        ++epochStats.invocations;
+        program.codeGenerations.insert(generation);
+        observedCodeGenerations.insert(generation);
+        observedMicroHashes.insert(hash);
+        invocations.fetch_add(1u, std::memory_order_relaxed);
+
+        const uint64_t observed =
+            observedPairs.load(std::memory_order_relaxed);
+        const uint64_t measured =
+            measuredPairs.load(std::memory_order_relaxed);
+        current = CurrentInvocation{
+            .program = &program,
+            .epoch = &epochStats,
+            .microHash = hash,
+            .codeGeneration = generation,
+            .active = true,
+            .fullyMeasured =
+                observed >= warmupPairs && measured < pairLimit,
+        };
+    }
+
+    void recordInstruction(
+        uint32_t lower,
+        uint32_t upper)
+    {
+        if (!enabled.load(std::memory_order_relaxed) || !current.active)
+            return;
+
+        ++current.pairs;
+        const uint64_t observed =
+            observedPairs.fetch_add(1u, std::memory_order_relaxed) + 1u;
+        const uint64_t measured =
+            measuredPairs.load(std::memory_order_relaxed);
+        const bool capture =
+            observed > warmupPairs && measured < pairLimit;
+        current.lastPairMeasured = capture;
+        if (!capture)
+        {
+            current.fullyMeasured = false;
+            return;
+        }
+
+        measuredPairs.fetch_add(1u, std::memory_order_relaxed);
+        ++current.measuredPairs;
+        ProgramStats &program = *current.program;
+        if (current.measuredPairs == 1u)
+        {
+            ++program.measuredInvocationsTouched;
+            program.measuredCodeGenerations.insert(
+                current.codeGeneration);
+            measuredCodeGenerations.insert(
+                current.codeGeneration);
+            measuredMicroHashes.insert(current.microHash);
+        }
+        ++program.measuredPairs;
+        ++current.epoch->measuredPairs;
+
+        const uint8_t upperOp = static_cast<uint8_t>(upper & 0x3Fu);
+        ++program.upperOps[upperOp];
+        if (upperOp >= 0x3Cu)
+        {
+            const uint8_t special =
+                static_cast<uint8_t>(
+                    (upper & 0x3u) | ((upper >> 4u) & 0x7Cu));
+            ++program.upperSpecialOps[special];
+        }
+
+        if ((upper & 0x80000000u) != 0u)
+            return;
+
+        const uint8_t lowerOp =
+            static_cast<uint8_t>((lower >> 25u) & 0x7Fu);
+        ++program.lowerOps[lowerOp];
+        if (lowerOp == 0x40u)
+        {
+            const uint8_t function =
+                static_cast<uint8_t>(lower & 0x3Fu);
+            if (function >= 0x3Cu)
+            {
+                const uint8_t special =
+                    static_cast<uint8_t>(
+                        (lower & 0x3u) |
+                        ((lower >> 4u) & 0x7Cu));
+                ++program.lowerSpecialOps[special];
+            }
+        }
+
+        switch (lowerOp)
+        {
+        case 0x20u: // B
+        case 0x21u: // BAL
+        case 0x24u: // JR
+        case 0x25u: // JALR
+            ++program.branchPairs;
+            break;
+        case 0x28u: // IBEQ
+        case 0x29u: // IBNE
+        case 0x2Cu: // IBLTZ
+        case 0x2Du: // IBGTZ
+        case 0x2Eu: // IBLEZ
+        case 0x2Fu: // IBGEZ
+            ++program.branchPairs;
+            ++program.conditionalBranchPairs;
+            break;
+        default:
+            break;
+        }
+    }
+
+    void recordTransition(uint32_t pc, uint32_t nextPc)
+    {
+        if (!enabled.load(std::memory_order_relaxed) || !current.active ||
+            !current.lastPairMeasured)
+        {
+            return;
+        }
+        const uint32_t sequential = (pc + 8u) & 0x3FFFu;
+        if ((nextPc & 0x3FFFu) != sequential)
+            ++current.program->nonsequentialTransitions;
+        if (pairLimit != std::numeric_limits<uint64_t>::max() &&
+            measuredPairs.load(std::memory_order_relaxed) >= pairLimit)
+        {
+            // ps2EntryRunner terminates with std::_Exit after its explicit
+            // shutdown sequence, so process/static destructors are not a
+            // reliable finalization point. A bounded profile is complete at
+            // this exact architectural pair boundary and can be committed
+            // immediately.
+            write();
+        }
+    }
+
+    void endInvocation(bool completed)
+    {
+        if (!current.active)
+            return;
+
+        ProgramStats &program = *current.program;
+        EpochStats &epochStats = *current.epoch;
+        program.pairs += current.pairs;
+        program.minPairs = std::min(program.minPairs, current.pairs);
+        program.maxPairs = std::max(program.maxPairs, current.pairs);
+        epochStats.pairs += current.pairs;
+        if (completed)
+        {
+            ++program.completedInvocations;
+            ++epochStats.completedInvocations;
+        }
+        else
+        {
+            ++program.abortedInvocations;
+            ++epochStats.abortedInvocations;
+        }
+        if (completed && current.measuredPairs != 0u &&
+            current.fullyMeasured)
+        {
+            ++program.fullyMeasuredInvocations;
+            program.fullyMeasuredInvocationPairs += current.measuredPairs;
+        }
+        current = {};
+    }
+
+    void resetEpoch()
+    {
+        if (!enabled.load(std::memory_order_relaxed))
+            return;
+        if (current.active)
+            endInvocation(false);
+        ++epoch;
+    }
+
+    void recordCodeUpload(
+        uint32_t destination,
+        const uint8_t *payload,
+        uint32_t sizeBytes,
+        bool identical)
+    {
+        if (!enabled.load(std::memory_order_relaxed))
+            return;
+
+        codeUploads.fetch_add(1u, std::memory_order_relaxed);
+        codeUploadBytes.fetch_add(sizeBytes, std::memory_order_relaxed);
+        if (identical)
+        {
+            identicalCodeUploads.fetch_add(1u, std::memory_order_relaxed);
+            identicalCodeUploadBytes.fetch_add(
+                sizeBytes, std::memory_order_relaxed);
+        }
+
+        UploadStats &stats = uploadPayloads[UploadKey{
+            hashBytes(payload, sizeBytes), destination, sizeBytes}];
+        ++stats.count;
+        if (identical)
+            ++stats.identicalCount;
+
+        const uint64_t observed =
+            observedPairs.load(std::memory_order_relaxed);
+        const uint64_t measured =
+            measuredPairs.load(std::memory_order_relaxed);
+        if (observed >= warmupPairs && measured < pairLimit)
+        {
+            ++stats.measuredCount;
+            if (identical)
+                ++stats.measuredIdenticalCount;
+        }
+    }
+
+    template <size_t Size>
+    static void writeSparseCounts(
+        std::FILE *file,
+        const std::array<uint64_t, Size> &counts)
+    {
+        bool first = true;
+        for (size_t index = 0u; index < counts.size(); ++index)
+        {
+            if (counts[index] == 0u)
+                continue;
+            std::fprintf(
+                file, "%s\"0x%02zx\":%" PRIu64,
+                first ? "" : ",", index, counts[index]);
+            first = false;
+        }
+    }
+
+    void write()
+    {
+        if (written || !output)
+            return;
+        written = true;
+        if (current.active)
+            endInvocation(false);
+
+        const uint64_t observed =
+            observedPairs.load(std::memory_order_relaxed);
+        const uint64_t measured =
+            measuredPairs.load(std::memory_order_relaxed);
+        const bool bounded =
+            pairLimit != std::numeric_limits<uint64_t>::max();
+        uint64_t measuredUploads = 0u;
+        uint64_t measuredIdenticalUploads = 0u;
+        for (const auto &[key, stats] : uploadPayloads)
+        {
+            (void)key;
+            measuredUploads += stats.measuredCount;
+            measuredIdenticalUploads +=
+                stats.measuredIdenticalCount;
+        }
+        std::fprintf(
+            output,
+            "{\"schema_version\":1,\"producer\":\"PS2Recomp\","
+            "\"warmup_pairs\":%" PRIu64 ",\"pair_limit\":",
+            warmupPairs);
+        if (bounded)
+            std::fprintf(output, "%" PRIu64, pairLimit);
+        else
+            std::fputs("null", output);
+        std::fprintf(
+            output,
+            ",\"observed_pairs\":%" PRIu64 ","
+            "\"measured_pairs\":%" PRIu64 ","
+            "\"measurement_complete\":%s,"
+            "\"invocations\":%" PRIu64 ","
+            "\"reset_epochs\":%" PRIu64 ","
+            "\"code_generations_observed\":%zu,"
+            "\"microcode_hashes_observed\":%zu,"
+            "\"measured_code_generations\":%zu,"
+            "\"measured_microcode_hashes\":%zu,"
+            "\"uploads\":{\"count\":%" PRIu64 ","
+            "\"identical_count\":%" PRIu64 ","
+            "\"measured_count\":%" PRIu64 ","
+            "\"measured_identical_count\":%" PRIu64 ","
+            "\"bytes\":%" PRIu64 ","
+            "\"identical_bytes\":%" PRIu64 ","
+            "\"payloads\":[",
+            observed, measured,
+            bounded && measured >= pairLimit ? "true" : "false",
+            invocations.load(std::memory_order_relaxed),
+            epoch + 1u,
+            observedCodeGenerations.size(),
+            observedMicroHashes.size(),
+            measuredCodeGenerations.size(),
+            measuredMicroHashes.size(),
+            codeUploads.load(std::memory_order_relaxed),
+            identicalCodeUploads.load(std::memory_order_relaxed),
+            measuredUploads,
+            measuredIdenticalUploads,
+            codeUploadBytes.load(std::memory_order_relaxed),
+            identicalCodeUploadBytes.load(std::memory_order_relaxed));
+
+        bool first = true;
+        for (const auto &[key, stats] : uploadPayloads)
+        {
+            std::fprintf(
+                output,
+                "%s{\"payload_hash_fnv1a64\":\"0x%016" PRIx64 "\","
+                "\"destination\":\"0x%04" PRIx32 "\","
+                "\"bytes\":%" PRIu32 ",\"count\":%" PRIu64 ","
+                "\"identical_count\":%" PRIu64 ","
+                "\"measured_count\":%" PRIu64 ","
+                "\"measured_identical_count\":%" PRIu64 "}",
+                first ? "" : ",",
+                key.payloadHash, key.destination, key.sizeBytes,
+                stats.count, stats.identicalCount,
+                stats.measuredCount, stats.measuredIdenticalCount);
+            first = false;
+        }
+        std::fputs("]},\"epochs\":[", output);
+
+        first = true;
+        for (const auto &[epochIndex, stats] : epochs)
+        {
+            std::fprintf(
+                output,
+                "%s{\"epoch\":%" PRIu64 ","
+                "\"invocations\":%" PRIu64 ","
+                "\"completed_invocations\":%" PRIu64 ","
+                "\"aborted_invocations\":%" PRIu64 ","
+                "\"pairs\":%" PRIu64 ","
+                "\"measured_pairs\":%" PRIu64 "}",
+                first ? "" : ",", epochIndex,
+                stats.invocations, stats.completedInvocations,
+                stats.abortedInvocations, stats.pairs,
+                stats.measuredPairs);
+            first = false;
+        }
+        std::fputs("],\"programs\":[", output);
+
+        first = true;
+        for (const auto &[key, stats] : programs)
+        {
+            const double averagePairs =
+                stats.invocations == 0u
+                    ? 0.0
+                    : static_cast<double>(stats.pairs) /
+                          static_cast<double>(stats.invocations);
+            const double fullyMeasuredAverage =
+                stats.fullyMeasuredInvocations == 0u
+                    ? 0.0
+                    : static_cast<double>(
+                          stats.fullyMeasuredInvocationPairs) /
+                          static_cast<double>(
+                              stats.fullyMeasuredInvocations);
+            std::fprintf(
+                output,
+                "%s{\"epoch\":%" PRIu64 ","
+                "\"micro_hash_fnv1a64\":\"0x%016" PRIx64 "\","
+                "\"start_pc\":\"0x%04" PRIx32 "\","
+                "\"invocations\":%" PRIu64 ","
+                "\"completed_invocations\":%" PRIu64 ","
+                "\"aborted_invocations\":%" PRIu64 ","
+                "\"pairs\":%" PRIu64 ","
+                "\"average_pairs\":%.6f,"
+                "\"min_pairs\":%" PRIu64 ","
+                "\"max_pairs\":%" PRIu64 ","
+                "\"code_generations\":%zu,"
+                "\"measured_code_generations\":%zu,"
+                "\"measured_pairs\":%" PRIu64 ","
+                "\"measured_invocations_touched\":%" PRIu64 ","
+                "\"fully_measured_invocations\":%" PRIu64 ","
+                "\"fully_measured_average_pairs\":%.6f,"
+                "\"branch_pairs\":%" PRIu64 ","
+                "\"conditional_branch_pairs\":%" PRIu64 ","
+                "\"nonsequential_transitions\":%" PRIu64 ","
+                "\"lower_ops\":{",
+                first ? "" : ",", key.epoch, key.microHash,
+                key.startPc, stats.invocations,
+                stats.completedInvocations,
+                stats.abortedInvocations, stats.pairs,
+                averagePairs,
+                stats.minPairs ==
+                        std::numeric_limits<uint64_t>::max()
+                    ? 0u
+                    : stats.minPairs,
+                stats.maxPairs, stats.codeGenerations.size(),
+                stats.measuredCodeGenerations.size(),
+                stats.measuredPairs,
+                stats.measuredInvocationsTouched,
+                stats.fullyMeasuredInvocations,
+                fullyMeasuredAverage,
+                stats.branchPairs,
+                stats.conditionalBranchPairs,
+                stats.nonsequentialTransitions);
+            writeSparseCounts(output, stats.lowerOps);
+            std::fputs("},\"lower_special_ops\":{", output);
+            writeSparseCounts(output, stats.lowerSpecialOps);
+            std::fputs("},\"upper_ops\":{", output);
+            writeSparseCounts(output, stats.upperOps);
+            std::fputs("},\"upper_special_ops\":{", output);
+            writeSparseCounts(output, stats.upperSpecialOps);
+            std::fputs("}}", output);
+            first = false;
+        }
+        std::fputs("]}\n", output);
+        std::fflush(output);
+        enabled.store(false, std::memory_order_relaxed);
+    }
+};
+
 void ps2RecordGsDmaWriteTrace(uint32_t guestAddr,
                               uint32_t size,
                               uint32_t writerPc,
@@ -1081,6 +1666,50 @@ PS2Memory::PS2Memory()
     : m_rdram(nullptr), m_scratchpad(nullptr), iop_ram(nullptr), m_seenGifCopy(false), m_gsVRAM(nullptr)
 {
     ps2SetScratchpadHostPtr(nullptr);
+
+    const char *profilePath = std::getenv("PS2X_VU1_PROFILE");
+    if (!profilePath || !*profilePath)
+        return;
+
+    auto parsePairCount = [](
+                              const char *name,
+                              uint64_t defaultValue,
+                              uint64_t &value)
+    {
+        const char *text = std::getenv(name);
+        if (!text || !*text)
+        {
+            value = defaultValue;
+            return true;
+        }
+        errno = 0;
+        char *end = nullptr;
+        const unsigned long long parsed =
+            std::strtoull(text, &end, 0);
+        if (errno != 0 || end == text || *end != '\0')
+        {
+            std::fprintf(
+                stderr,
+                "VU1 workload profile: invalid %s '%s'\n",
+                name, text);
+            return false;
+        }
+        value = static_cast<uint64_t>(parsed);
+        return true;
+    };
+
+    uint64_t warmupPairs = 0u;
+    uint64_t pairLimit = 0u;
+    if (parsePairCount(
+            "PS2X_VU1_PROFILE_WARMUP_PAIRS",
+            0u, warmupPairs) &&
+        parsePairCount(
+            "PS2X_VU1_PROFILE_PAIRS",
+            0u, pairLimit))
+    {
+        (void)configureVu1WorkloadProfile(
+            profilePath, warmupPairs, pairLimit);
+    }
 }
 
 PS2Memory::~PS2Memory()
@@ -1089,6 +1718,9 @@ PS2Memory::~PS2Memory()
     finishVif1DmaTrace();
     delete m_gsDmaTrace;
     m_gsDmaTrace = nullptr;
+    finishVu1WorkloadProfile();
+    delete m_vu1WorkloadProfile;
+    m_vu1WorkloadProfile = nullptr;
 
     if (m_rdram)
     {
@@ -1134,6 +1766,126 @@ PS2Memory::~PS2Memory()
     {
         delete[] iop_ram;
         iop_ram = nullptr;
+    }
+}
+
+bool PS2Memory::configureVu1WorkloadProfile(
+    const char *outputPath,
+    uint64_t warmupPairs,
+    uint64_t pairLimit)
+{
+    finishVu1WorkloadProfile();
+    delete m_vu1WorkloadProfile;
+    m_vu1WorkloadProfile = new Ps2Vu1WorkloadProfileState(
+        outputPath, warmupPairs, pairLimit);
+    return m_vu1WorkloadProfile->enabled.load(
+        std::memory_order_relaxed);
+}
+
+void PS2Memory::finishVu1WorkloadProfile()
+{
+    if (m_vu1WorkloadProfile)
+        m_vu1WorkloadProfile->write();
+}
+
+Vu1WorkloadProfileSnapshot
+PS2Memory::vu1WorkloadProfileSnapshot() const
+{
+    Vu1WorkloadProfileSnapshot snapshot{};
+    if (!m_vu1WorkloadProfile)
+        return snapshot;
+
+    const Ps2Vu1WorkloadProfileState &profile =
+        *m_vu1WorkloadProfile;
+    snapshot.enabled =
+        profile.enabled.load(std::memory_order_relaxed);
+    snapshot.warmupPairs = profile.warmupPairs;
+    snapshot.pairLimit =
+        profile.pairLimit ==
+                std::numeric_limits<uint64_t>::max()
+            ? 0u
+            : profile.pairLimit;
+    snapshot.observedPairs =
+        profile.observedPairs.load(std::memory_order_relaxed);
+    snapshot.measuredPairs =
+        profile.measuredPairs.load(std::memory_order_relaxed);
+    snapshot.measurementComplete =
+        snapshot.pairLimit != 0u &&
+        snapshot.measuredPairs >= snapshot.pairLimit;
+    snapshot.invocations =
+        profile.invocations.load(std::memory_order_relaxed);
+    snapshot.codeUploads =
+        profile.codeUploads.load(std::memory_order_relaxed);
+    snapshot.identicalCodeUploads =
+        profile.identicalCodeUploads.load(
+            std::memory_order_relaxed);
+    snapshot.codeUploadBytes =
+        profile.codeUploadBytes.load(std::memory_order_relaxed);
+    snapshot.identicalCodeUploadBytes =
+        profile.identicalCodeUploadBytes.load(
+            std::memory_order_relaxed);
+    return snapshot;
+}
+
+bool PS2Memory::isVu1WorkloadProfileEnabled() const
+{
+    return m_vu1WorkloadProfile &&
+           m_vu1WorkloadProfile->enabled.load(
+               std::memory_order_relaxed);
+}
+
+void PS2Memory::beginVu1WorkloadProfileInvocation(
+    uint32_t startPc)
+{
+    if (!isVu1WorkloadProfileEnabled() || !m_vu1Code)
+        return;
+    m_vu1WorkloadProfile->beginInvocation(
+        startPc, m_vu1Code, PS2_VU1_CODE_SIZE,
+        getVU1CodeGeneration());
+}
+
+void PS2Memory::recordVu1WorkloadProfileInstruction(
+    uint32_t,
+    uint32_t lower,
+    uint32_t upper)
+{
+    if (isVu1WorkloadProfileEnabled())
+        m_vu1WorkloadProfile->recordInstruction(lower, upper);
+}
+
+void PS2Memory::recordVu1WorkloadProfileTransition(
+    uint32_t pc,
+    uint32_t nextPc)
+{
+    if (isVu1WorkloadProfileEnabled())
+        m_vu1WorkloadProfile->recordTransition(pc, nextPc);
+}
+
+void PS2Memory::endVu1WorkloadProfileInvocation(
+    bool completed)
+{
+    if (isVu1WorkloadProfileEnabled())
+        m_vu1WorkloadProfile->endInvocation(completed);
+}
+
+void PS2Memory::resetVu1WorkloadProfileEpoch()
+{
+    if (isVu1WorkloadProfileEnabled())
+        m_vu1WorkloadProfile->resetEpoch();
+}
+
+void PS2Memory::recordVu1WorkloadProfileCodeUpload(
+    uint32_t destination,
+    const uint8_t *payload,
+    uint32_t sizeBytes,
+    bool identical,
+    uint64_t,
+    uint64_t)
+{
+    if (isVu1WorkloadProfileEnabled())
+    {
+        m_vu1WorkloadProfile->recordCodeUpload(
+            destination, payload, sizeBytes, identical);
     }
 }
 

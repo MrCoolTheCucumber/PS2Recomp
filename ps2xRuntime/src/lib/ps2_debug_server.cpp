@@ -759,6 +759,35 @@ struct PS2DebugServer::Impl
         progress.AddMember("vu0_cycles", vu0Progress.cycles, allocator);
         progress.AddMember("vu1_cycles", vu1Progress.cycles, allocator);
         result.AddMember("progress", progress, allocator);
+        const Vu1WorkloadProfileSnapshot vu1Profile =
+            runtime.memory().vu1WorkloadProfileSnapshot();
+        Value profile(rapidjson::kObjectType);
+        profile.AddMember("enabled", vu1Profile.enabled, allocator);
+        profile.AddMember(
+            "measurement_complete",
+            vu1Profile.measurementComplete, allocator);
+        profile.AddMember(
+            "warmup_pairs", vu1Profile.warmupPairs, allocator);
+        profile.AddMember(
+            "pair_limit", vu1Profile.pairLimit, allocator);
+        profile.AddMember(
+            "observed_pairs", vu1Profile.observedPairs, allocator);
+        profile.AddMember(
+            "measured_pairs", vu1Profile.measuredPairs, allocator);
+        profile.AddMember(
+            "invocations", vu1Profile.invocations, allocator);
+        profile.AddMember(
+            "code_uploads", vu1Profile.codeUploads, allocator);
+        profile.AddMember(
+            "identical_code_uploads",
+            vu1Profile.identicalCodeUploads, allocator);
+        profile.AddMember(
+            "code_upload_bytes",
+            vu1Profile.codeUploadBytes, allocator);
+        profile.AddMember(
+            "identical_code_upload_bytes",
+            vu1Profile.identicalCodeUploadBytes, allocator);
+        result.AddMember("vu1_workload_profile", profile, allocator);
         result.AddMember("watchdog", watchdogStatus(allocator), allocator);
 
         const PS2Runtime::DebugFaultInfo fault = runtime.debugFaultSnapshot();

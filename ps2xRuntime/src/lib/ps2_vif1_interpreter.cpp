@@ -753,8 +753,24 @@ PS2Memory::processVif1Stream()
                 uint32_t copyBytes = mpgBytes;
                 if (destAddr + copyBytes > PS2_VU1_CODE_SIZE)
                     copyBytes = PS2_VU1_CODE_SIZE - destAddr;
+                const bool profileUpload =
+                    isVu1WorkloadProfileEnabled();
+                const bool identical =
+                    profileUpload &&
+                    std::memcmp(
+                        m_vu1Code + destAddr,
+                        data + pos,
+                        copyBytes) == 0;
+                const uint64_t generationBefore =
+                    profileUpload ? getVU1CodeGeneration() : 0u;
                 std::memcpy(m_vu1Code + destAddr, data + pos, copyBytes);
                 markVU1CodeModified();
+                if (profileUpload)
+                {
+                    recordVu1WorkloadProfileCodeUpload(
+                        destAddr, data + pos, copyBytes, identical,
+                        generationBefore, getVU1CodeGeneration());
+                }
             }
             pos += mpgBytes;
             continue;

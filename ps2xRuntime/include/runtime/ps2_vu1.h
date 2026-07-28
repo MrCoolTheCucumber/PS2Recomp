@@ -157,6 +157,9 @@ private:
     std::atomic<uint32_t> m_progressPc{0};
     InstructionObserver m_instructionObserver;
     std::atomic<bool> m_instructionObserverEnabled{false};
+    PS2Memory *m_workloadProfileMemory = nullptr;
+    bool m_workloadProfileInvocationPending = false;
+    bool m_workloadProfileInvocationActive = false;
     bool m_active = false;
 
     [[nodiscard]] VU1AdvanceResult run(

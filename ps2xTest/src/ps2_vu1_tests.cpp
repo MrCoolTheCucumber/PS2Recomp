@@ -10,6 +10,10 @@
 #include <cfenv>
 #include <cstdint>
 #include <cstring>
+#include <filesystem>
+#include <fstream>
+#include <iterator>
+#include <string>
 #include <vector>
 
 namespace
@@ -213,6 +217,86 @@ void register_ps2_vu1_tests()
 {
     MiniTest::Case("PS2VU1", [](TestCase &tc)
     {
+        tc.Run("bounded workload profile records exact pairs and identical MPG uploads", [](TestCase &t)
+        {
+            Vu1Fixture fx;
+            t.IsTrue(fx.initialize(), "VU1 fixture should initialize");
+
+            const std::filesystem::path profilePath =
+                std::filesystem::temp_directory_path() /
+                ("ps2x-vu1-profile-" +
+                 std::to_string(
+                     reinterpret_cast<uintptr_t>(&t)) +
+                 ".json");
+            std::error_code removeError;
+            std::filesystem::remove(profilePath, removeError);
+            t.IsTrue(
+                fx.mem.configureVu1WorkloadProfile(
+                    profilePath.string().c_str(), 2u, 3u),
+                "workload profile should open its bounded output");
+
+            for (uint32_t pair = 0u; pair < 6u; ++pair)
+            {
+                const uint32_t upper =
+                    kVuUpperNop |
+                    (pair == 4u ? kVuUpperEnd : 0u);
+                writeVuInstructionPair(
+                    fx.code, pair * 8u, 0u, upper);
+            }
+
+            const uint32_t uploadedLower =
+                makeVuIaddiu(1u, 0u, 7);
+            uploadVu1Mpg(
+                fx.mem, 0x100u, uploadedLower, kVuUpperNop);
+            uploadVu1Mpg(
+                fx.mem, 0x100u, uploadedLower, kVuUpperNop);
+
+            VU1Interpreter vu1;
+            vu1.execute(
+                fx.code, PS2_VU1_CODE_SIZE,
+                fx.data, PS2_VU1_DATA_SIZE,
+                fx.gs, &fx.mem, 0u, 0u, 0u, 64u);
+
+            const Vu1WorkloadProfileSnapshot snapshot =
+                fx.mem.vu1WorkloadProfileSnapshot();
+            t.IsFalse(snapshot.enabled,
+                      "a completed bounded profile should finalize immediately");
+            t.IsTrue(snapshot.measurementComplete,
+                     "three measured pairs should complete the bound");
+            t.Equals(snapshot.observedPairs, uint64_t{5u},
+                     "profile should stop after two warm-up and three measured pairs");
+            t.Equals(snapshot.measuredPairs, uint64_t{3u},
+                     "profile should retain exactly three post-warmup pairs");
+            t.Equals(snapshot.codeUploads, uint64_t{2u},
+                     "profile should count both MPG uploads");
+            t.Equals(snapshot.identicalCodeUploads, uint64_t{1u},
+                     "the second equal MPG upload should be identified");
+            t.Equals(snapshot.codeUploadBytes, uint64_t{16u},
+                     "two one-pair MPG uploads should total sixteen bytes");
+            t.Equals(snapshot.identicalCodeUploadBytes, uint64_t{8u},
+                     "the repeated one-pair upload should total eight bytes");
+
+            fx.mem.finishVu1WorkloadProfile();
+            std::ifstream profileFile(profilePath);
+            const std::string profileText{
+                std::istreambuf_iterator<char>(profileFile),
+                std::istreambuf_iterator<char>()};
+            t.IsTrue(
+                profileText.find(
+                    "\"measurement_complete\":true") !=
+                    std::string::npos,
+                "profile output should record the completed bound");
+            t.IsTrue(
+                profileText.find("\"measured_pairs\":3") !=
+                    std::string::npos,
+                "profile output should retain the exact measured work");
+            t.IsTrue(
+                profileText.find("\"identical_count\":1") !=
+                    std::string::npos,
+                "profile output should retain identical upload frequency");
+            std::filesystem::remove(profilePath, removeError);
+        });
+
         tc.Run("upper ADD applies the destination mask", [](TestCase &t)
         {
             Vu1Fixture fx;

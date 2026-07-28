@@ -90,6 +90,20 @@ VU1Interpreter::VU1Interpreter()
 
 void VU1Interpreter::reset()
 {
+    if (m_workloadProfileInvocationActive &&
+        m_workloadProfileMemory)
+    {
+        m_workloadProfileMemory->
+            endVu1WorkloadProfileInvocation(false);
+    }
+    if (m_workloadProfileMemory)
+    {
+        m_workloadProfileMemory->
+            resetVu1WorkloadProfileEpoch();
+    }
+    m_workloadProfileMemory = nullptr;
+    m_workloadProfileInvocationPending = false;
+    m_workloadProfileInvocationActive = false;
     std::memset(&m_state, 0, sizeof(m_state));
     m_state.vf[0][3] = 1.0f; // VF0.w = 1.0
     m_state.q = 1.0f;
@@ -237,6 +251,14 @@ void VU1Interpreter::start(
     uint32_t startPC, uint32_t top, uint32_t itop,
     PS2Memory *memory)
 {
+    if (m_workloadProfileInvocationActive &&
+        m_workloadProfileMemory)
+    {
+        m_workloadProfileMemory->
+            endVu1WorkloadProfileInvocation(false);
+    }
+    m_workloadProfileInvocationActive = false;
+    m_workloadProfileInvocationPending = true;
     m_state.pc = startPC & 0x3FFFu;
     m_state.ebit = false;
     m_state.top = top;
@@ -260,6 +282,14 @@ void VU1Interpreter::start(
 void VU1Interpreter::resumeState(
     uint32_t top, uint32_t itop, PS2Memory *memory)
 {
+    if (m_workloadProfileInvocationActive &&
+        m_workloadProfileMemory)
+    {
+        m_workloadProfileMemory->
+            endVu1WorkloadProfileInvocation(false);
+    }
+    m_workloadProfileInvocationActive = false;
+    m_workloadProfileInvocationPending = true;
     m_state.ebit = false;
     m_state.top = top;
     m_state.itop = itop;
@@ -341,6 +371,17 @@ VU1AdvanceResult VU1Interpreter::run(
     // own floating-point environment.
     const ScopedVuFloatMode vuFloatMode;
     const bool traceVu1 = memory && memory->isVif1DmaTraceActive();
+    const bool profileVu1 =
+        memory &&
+        vuCode == memory->getVU1Code() &&
+        memory->isVu1WorkloadProfileEnabled();
+    if (profileVu1 && m_workloadProfileInvocationPending)
+    {
+        memory->beginVu1WorkloadProfileInvocation(m_state.pc);
+        m_workloadProfileMemory = memory;
+        m_workloadProfileInvocationPending = false;
+        m_workloadProfileInvocationActive = true;
+    }
     const bool trackProgress =
         m_progressTrackingEnabled.load(std::memory_order_relaxed);
     uint32_t committedProgressCycles = 0u;
@@ -387,9 +428,17 @@ VU1AdvanceResult VU1Interpreter::run(
             break;
         }
 
-        const DecodedInstructionPair decoded = getDecodedInstructionPairForPc(vuCode, codeSize, memory, m_state.pc);
+        const uint32_t issuedPc = m_state.pc;
+        const DecodedInstructionPair decoded = getDecodedInstructionPairForPc(vuCode, codeSize, memory, issuedPc);
         if (traceVu1)
-            memory->traceVu1Instruction(m_state.pc, decoded.lower, decoded.upper, m_state);
+            memory->traceVu1Instruction(issuedPc, decoded.lower, decoded.upper, m_state);
+        if (m_workloadProfileInvocationActive &&
+            m_workloadProfileMemory)
+        {
+            m_workloadProfileMemory->
+                recordVu1WorkloadProfileInstruction(
+                    issuedPc, decoded.lower, decoded.upper);
+        }
         if (m_instructionObserverEnabled.load(std::memory_order_relaxed) &&
             m_instructionObserver)
         {
@@ -479,6 +528,13 @@ VU1AdvanceResult VU1Interpreter::run(
                 --m_state.branchDelay;
             }
         }
+        if (m_workloadProfileInvocationActive &&
+            m_workloadProfileMemory)
+        {
+            m_workloadProfileMemory->
+                recordVu1WorkloadProfileTransition(
+                    issuedPc, m_state.pc);
+        }
 
         if (m_state.ebit)
         {
@@ -502,6 +558,14 @@ VU1AdvanceResult VU1Interpreter::run(
         memory->traceVu1InvocationEnd(
             m_state.pc, ended, !ended && executedCycles == maxCycles,
             m_state.vi, std::size(m_state.vi));
+    }
+    if (!m_active &&
+        m_workloadProfileInvocationActive &&
+        m_workloadProfileMemory)
+    {
+        m_workloadProfileMemory->
+            endVu1WorkloadProfileInvocation(ended);
+        m_workloadProfileInvocationActive = false;
     }
     return VU1AdvanceResult{
         .requestedCycles = maxCycles,

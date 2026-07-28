@@ -28,6 +28,7 @@
 
 class GS;
 struct Ps2GsDmaTraceState;
+struct Ps2Vu1WorkloadProfileState;
 struct VU1State;
 
 class PS2TlbMissException final : public std::exception
@@ -697,6 +698,21 @@ struct JumpTable
     std::vector<uint32_t> targets; // Jump targets
 };
 
+struct Vu1WorkloadProfileSnapshot
+{
+    bool enabled = false;
+    bool measurementComplete = false;
+    uint64_t warmupPairs = 0u;
+    uint64_t pairLimit = 0u;
+    uint64_t observedPairs = 0u;
+    uint64_t measuredPairs = 0u;
+    uint64_t invocations = 0u;
+    uint64_t codeUploads = 0u;
+    uint64_t identicalCodeUploads = 0u;
+    uint64_t codeUploadBytes = 0u;
+    uint64_t identicalCodeUploadBytes = 0u;
+};
+
 class PS2Memory
 {
 public:
@@ -729,6 +745,21 @@ public:
     uint64_t vifWriteCount() const { return m_vifWriteCount.load(std::memory_order_relaxed); }
     uint64_t getVU0CodeGeneration() const { return m_vu0CodeGeneration.load(std::memory_order_relaxed); }
     uint64_t getVU1CodeGeneration() const { return m_vu1CodeGeneration.load(std::memory_order_relaxed); }
+    bool configureVu1WorkloadProfile(
+        const char *outputPath,
+        uint64_t warmupPairs = 0u,
+        uint64_t pairLimit = 0u);
+    void finishVu1WorkloadProfile();
+    [[nodiscard]] Vu1WorkloadProfileSnapshot
+    vu1WorkloadProfileSnapshot() const;
+    [[nodiscard]] bool isVu1WorkloadProfileEnabled() const;
+    void beginVu1WorkloadProfileInvocation(uint32_t startPc);
+    void recordVu1WorkloadProfileInstruction(
+        uint32_t pc, uint32_t lower, uint32_t upper);
+    void recordVu1WorkloadProfileTransition(
+        uint32_t pc, uint32_t nextPc);
+    void endVu1WorkloadProfileInvocation(bool completed);
+    void resetVu1WorkloadProfileEpoch();
 
     // Read/write memory
     uint8_t read8(uint32_t address);
@@ -1494,6 +1525,14 @@ public:
                                const int32_t *viRegisters, size_t viRegisterCount);
     void finishVif1DmaTrace();
     Ps2GsDmaTraceState *m_gsDmaTrace = nullptr;
+    void recordVu1WorkloadProfileCodeUpload(
+        uint32_t destination,
+        const uint8_t *payload,
+        uint32_t sizeBytes,
+        bool identical,
+        uint64_t generationBefore,
+        uint64_t generationAfter);
+    Ps2Vu1WorkloadProfileState *m_vu1WorkloadProfile = nullptr;
     ps2x::timing::EeCounterBank m_eeCounters{};
     EeCounterCycleCallback m_eeCounterCycleCallback;
     EeCounterScheduleCallback m_eeCounterScheduleCallback;
