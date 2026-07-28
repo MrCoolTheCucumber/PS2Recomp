@@ -16,6 +16,7 @@
 #include <filesystem>
 #include <fstream>
 #include <iterator>
+#include <limits>
 #include <optional>
 #include <sstream>
 #include <stdexcept>
@@ -1968,6 +1969,89 @@ void register_ps2_vu1_tests()
 
             t.Equals(getFloatBits(vu1.state().acc[2]), 0x4B69E65Du,
                      "MADD should truncate once after the fused product-sum");
+        });
+
+        tc.Run("VU conversion instructions saturate and honor round-toward-zero", [](TestCase &t)
+        {
+            std::vector<uint8_t> code(32u);
+            std::vector<uint8_t> data(256u);
+            writeVuInstructionPair(
+                code.data(), 0u, 0u,
+                makeVuUpperSpecial(
+                    0x14u, 0xfu, 2u, 1u)); // FTOI0 vf2, vf1
+            writeVuInstructionPair(
+                code.data(), 8u, 0u,
+                makeVuUpperSpecial(
+                    0x15u, 0xfu, 4u, 3u)); // FTOI4 vf4, vf3
+            writeVuInstructionPair(
+                code.data(), 16u, 0u,
+                makeVuUpperSpecial(
+                    0x10u, 0xfu, 6u, 5u)); // ITOF0 vf6, vf5
+
+            VuUnit unit;
+            VuExecutionState state = unit.state();
+            state.active = true;
+            state.pc = 0u;
+            state.vf[1][0] = 123.75f;
+            state.vf[1][1] = 2147483648.0f;
+            state.vf[1][2] = -2147483904.0f;
+            state.vf[1][3] =
+                std::numeric_limits<float>::quiet_NaN();
+            state.vf[3][0] = 134217728.0f;
+            state.vf[3][1] = -134217728.0f;
+            state.vf[3][2] = 0.55f;
+            state.vf[3][3] = -0.45f;
+            setFloatBits(state.vf[5][0], 0x7fffffffu);
+            setFloatBits(state.vf[5][1], 0x80000000u);
+            setFloatBits(state.vf[5][2], 123u);
+            setFloatBits(state.vf[5][3], 0xffffff85u);
+
+            VuTransactionalSideEffectSink effects;
+            VuExecutionContext context{
+                .state = state,
+                .code = code.data(),
+                .codeSize =
+                    static_cast<uint32_t>(code.size()),
+                .data = data.data(),
+                .dataSize =
+                    static_cast<uint32_t>(data.size()),
+                .sideEffects = effects,
+                .enableInstrumentation = false,
+            };
+            VuInterpreterBackend backend(unit);
+            const VuRunResult result =
+                backend.run(context, 3u);
+
+            t.Equals(
+                result.executedCycles, uint32_t{3u},
+                "all conversion pairs should execute");
+            const std::array<uint32_t, 4u> ftoi0Expected{
+                123u, 0x7fffffffu, 0x80000000u,
+                0x80000000u};
+            const std::array<uint32_t, 4u> ftoi4Expected{
+                0x7fffffffu, 0x80000000u, 8u,
+                0xfffffff9u};
+            const std::array<uint32_t, 4u> itof0Expected{
+                0x4effffffu, 0xcf000000u,
+                0x42f60000u, 0xc2f60000u};
+            for (size_t lane = 0u; lane < 4u; ++lane)
+            {
+                t.Equals(
+                    getFloatBits(state.vf[2][lane]),
+                    ftoi0Expected[lane],
+                    "FTOI0 lane " +
+                        std::to_string(lane));
+                t.Equals(
+                    getFloatBits(state.vf[4][lane]),
+                    ftoi4Expected[lane],
+                    "FTOI4 lane " +
+                        std::to_string(lane));
+                t.Equals(
+                    getFloatBits(state.vf[6][lane]),
+                    itof0Expected[lane],
+                    "ITOF0 lane " +
+                        std::to_string(lane));
+            }
         });
 
         tc.Run("CLIP uses absolute w and architectural flag ordering", [](TestCase &t)

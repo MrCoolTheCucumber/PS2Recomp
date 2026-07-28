@@ -4,6 +4,7 @@
 
 #include <cmath>
 #include <cstring>
+#include <limits>
 
 namespace
 {
@@ -18,6 +19,27 @@ namespace
     float vuMsub(float accumulator, float multiplicand, float multiplier)
     {
         return std::fma(-multiplicand, multiplier, accumulator);
+    }
+
+    int32_t vuFtoi(float value, float scale)
+    {
+        const float scaled = value * scale;
+        if (std::isnan(scaled))
+            return std::numeric_limits<int32_t>::min();
+
+        // 0x4effffff is the largest positive float that converts without
+        // crossing the signed 32-bit boundary. The VUs saturate positive
+        // overflow instead of returning the host CVTT indefinite value.
+        constexpr float kLargestInRange = 2147483520.0f;
+        if (scaled > kLargestInRange)
+            return std::numeric_limits<int32_t>::max();
+        if (scaled <=
+            static_cast<float>(
+                std::numeric_limits<int32_t>::min()))
+        {
+            return std::numeric_limits<int32_t>::min();
+        }
+        return static_cast<int32_t>(scaled);
     }
 }
 
@@ -354,7 +376,7 @@ void VuInterpreterBackend::execUpper(uint32_t instr)
         case 0x14: // FTOI0
             for (int c = 0; c < 4; c++)
             {
-                int32_t iv = static_cast<int32_t>(vs[c]);
+                const int32_t iv = vuFtoi(vs[c], 1.0f);
                 std::memcpy(&result[c], &iv, 4);
             }
             applyFmacDest(vtDest);
@@ -362,7 +384,7 @@ void VuInterpreterBackend::execUpper(uint32_t instr)
         case 0x15: // FTOI4
             for (int c = 0; c < 4; c++)
             {
-                int32_t iv = static_cast<int32_t>(vs[c] * 16.0f);
+                const int32_t iv = vuFtoi(vs[c], 16.0f);
                 std::memcpy(&result[c], &iv, 4);
             }
             applyFmacDest(vtDest);
@@ -370,7 +392,7 @@ void VuInterpreterBackend::execUpper(uint32_t instr)
         case 0x16: // FTOI12
             for (int c = 0; c < 4; c++)
             {
-                int32_t iv = static_cast<int32_t>(vs[c] * 4096.0f);
+                const int32_t iv = vuFtoi(vs[c], 4096.0f);
                 std::memcpy(&result[c], &iv, 4);
             }
             applyFmacDest(vtDest);
@@ -378,7 +400,7 @@ void VuInterpreterBackend::execUpper(uint32_t instr)
         case 0x17: // FTOI15
             for (int c = 0; c < 4; c++)
             {
-                int32_t iv = static_cast<int32_t>(vs[c] * 32768.0f);
+                const int32_t iv = vuFtoi(vs[c], 32768.0f);
                 std::memcpy(&result[c], &iv, 4);
             }
             applyFmacDest(vtDest);
