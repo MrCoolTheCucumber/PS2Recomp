@@ -41,3 +41,72 @@ The profiler hashes the whole VU code space once per code generation and
 updates maps and opcode counters for every measured pair. Do not enable it
 during CPU sampling or throughput measurements. Use the ordinary progress
 counters or a deterministic replay/benchmark for timed comparisons.
+
+## Deterministic fixture benchmark
+
+`vu_backend_benchmark` compares the VU1 interpreter and x86-64 recompiler on
+one captured fixture. A fixture contains full 16 KiB data and microcode images
+plus a replay-state file. Build and run it from a Release build:
+
+```sh
+cmake --build BUILD --target vu_backend_benchmark
+taskset -c 6 BUILD/ps2xTest/vu_backend_benchmark FIXTURE 4096 \
+    --iterations 1000 --warmup 10 --samples 15 \
+    --backend both --scope all
+```
+
+The benchmark emits one JSON object per line. It first emits a separately
+timed `cold-recompiler` result. `warm-sample` and `summary` records then report
+the requested timing scopes:
+
+- `vu-core` executes with a pre-sized buffered PATH1 sink. Packet construction
+  and required packet copies remain timed, but FNV-1a correctness hashing is
+  outside the timed window.
+- `vu-plus-path1` submits PATH1 through `PS2Memory` and `GifArbiter`.
+  Production-equivalent parsing, queueing, and copies are timed.
+- `final_drain_nanoseconds` and `validation_nanoseconds` are outside
+  `host_nanoseconds`. `timed_plus_final_drain_nanoseconds` is available when a
+  combined wall duration is useful.
+
+Every sample reports guest pairs and cycles, exit reason, allocation counts,
+PATH1 packet and byte counts, architectural-state and VU-data hashes, a
+per-invocation PATH1 hash, and a full-sample PATH1 hash. Recompiler records
+also include native exit/fallback counters and the complete program-cache
+delta. A sample is valid only when every invocation exactly matches the
+interpreter reference and a warm recompiler sample performs no compilation.
+
+Cold compilation, warm execution, and forced cache churn are distinct events.
+Add cache churn without changing the warm sample:
+
+```sh
+taskset -c 6 BUILD/ps2xTest/vu_backend_benchmark FIXTURE 4096 \
+    --iterations 1000 --warmup 10 --samples 15 \
+    --cache-churn-iterations 10 --backend both --scope all
+```
+
+Each `cache-churn-sample` flushes the VU program cache before every timed
+invocation. It requires a recompiler-enabled backend selection and verifies
+the exact same output as the warm and cold paths.
+
+### Hardware counters
+
+On Linux, `ps2xTest/tools/vu_backend_perf_stat.sh` uses perf's control FIFO so
+counters are enabled only around validated warm timing windows:
+
+```sh
+ps2xTest/tools/vu_backend_perf_stat.sh \
+    --benchmark BUILD/ps2xTest/vu_backend_benchmark \
+    --fixture FIXTURE --pairs 4096 --output OUTPUT \
+    --cpu 6 --iterations 1000 --warmup 10 --samples 5 \
+    --backend both --scope all
+```
+
+The wrapper requires `perf`, `jq`, and `sha256sum`, refuses to replace an
+existing output directory, and preserves raw benchmark and perf JSON. It uses
+two identical benchmark passes to avoid PMU multiplexing: cycles,
+instructions, branches, branch misses, and context switches are collected in
+the primary pass; L1 data misses, `LLC-load-misses`, and the portable
+`cache-misses` fallback are collected in the cache pass. Unsupported perf
+aliases remain explicit in the output. Check `pcnt-running` before comparing
+counters and repeat short runs when process placement or host power state
+causes outliers.

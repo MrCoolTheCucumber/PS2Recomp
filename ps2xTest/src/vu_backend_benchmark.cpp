@@ -1,3 +1,4 @@
+#include "runtime/ps2_gif_arbiter.h"
 #include "runtime/ps2_memory.h"
 #include "runtime/ps2_vu_recompiler.h"
 #include "runtime/ps2_vu1.h"
@@ -18,6 +19,7 @@
 #include <new>
 #include <string>
 #include <string_view>
+#include <thread>
 #include <vector>
 
 namespace
@@ -219,6 +221,25 @@ namespace
         std::filesystem::path state;
     };
 
+    enum class TimingScope : uint8_t
+    {
+        VuCore,
+        VuPlusPath1,
+    };
+
+    std::string_view timingScopeName(
+        TimingScope scope)
+    {
+        switch (scope)
+        {
+        case TimingScope::VuCore:
+            return "vu-core";
+        case TimingScope::VuPlusPath1:
+            return "vu-plus-path1";
+        }
+        return "unknown";
+    }
+
     struct Configuration
     {
         std::filesystem::path fixtureDirectory;
@@ -226,6 +247,11 @@ namespace
         uint32_t iterations = 1000u;
         uint32_t warmupIterations = 10u;
         uint32_t samples = 7u;
+        uint32_t cacheChurnIterations = 0u;
+        bool measureVuCore = true;
+        bool measureVuPlusPath1 = true;
+        bool measureInterpreter = true;
+        bool measureRecompiler = true;
     };
 
     bool parseUnsigned(
@@ -263,13 +289,43 @@ namespace
         {
             if (index + 1 >= argc)
                 return false;
+            const std::string_view option(argv[index]);
+            const std::string_view argument(argv[index + 1]);
+            if (option == "--scope")
+            {
+                configuration.measureVuCore =
+                    argument == "core" || argument == "all";
+                configuration.measureVuPlusPath1 =
+                    argument == "path1" || argument == "all";
+                if (!configuration.measureVuCore &&
+                    !configuration.measureVuPlusPath1)
+                {
+                    return false;
+                }
+                continue;
+            }
+            if (option == "--backend")
+            {
+                configuration.measureInterpreter =
+                    argument == "interpreter" ||
+                    argument == "both";
+                configuration.measureRecompiler =
+                    argument == "recompiler" ||
+                    argument == "both";
+                if (!configuration.measureInterpreter &&
+                    !configuration.measureRecompiler)
+                {
+                    return false;
+                }
+                continue;
+            }
+
             uint64_t value = 0u;
-            if (!parseUnsigned(argv[index + 1], value) ||
+            if (!parseUnsigned(argument, value) ||
                 value == 0u || value > UINT32_MAX)
             {
                 return false;
             }
-            const std::string_view option(argv[index]);
             if (option == "--iterations")
             {
                 configuration.iterations =
@@ -285,6 +341,11 @@ namespace
                 configuration.samples =
                     static_cast<uint32_t>(value);
             }
+            else if (option == "--cache-churn-iterations")
+            {
+                configuration.cacheChurnIterations =
+                    static_cast<uint32_t>(value);
+            }
             else
             {
                 return false;
@@ -292,6 +353,113 @@ namespace
         }
         return true;
     }
+
+    class PerfStatControl
+    {
+    public:
+        PerfStatControl()
+        {
+            const char *const controlPath =
+                std::getenv(
+                    "PS2X_PERF_CONTROL_FIFO");
+            const char *const acknowledgePath =
+                std::getenv(
+                    "PS2X_PERF_ACK_FIFO");
+            if (!controlPath && !acknowledgePath)
+                return;
+            m_requested = true;
+            if (!controlPath || !acknowledgePath)
+            {
+                m_error =
+                    "both PS2X_PERF_CONTROL_FIFO and "
+                    "PS2X_PERF_ACK_FIFO are required";
+                return;
+            }
+            m_control.open(controlPath);
+            if (!m_control)
+            {
+                m_error =
+                    "failed to open perf control FIFO";
+                return;
+            }
+            m_acknowledge.open(acknowledgePath);
+            if (!m_acknowledge)
+            {
+                m_error =
+                    "failed to open perf acknowledgement FIFO";
+                return;
+            }
+            m_valid = true;
+        }
+
+        [[nodiscard]] bool valid() const
+        {
+            return !m_requested || m_valid;
+        }
+
+        [[nodiscard]] const std::string &error() const
+        {
+            return m_error;
+        }
+
+        bool enable()
+        {
+            return command("enable");
+        }
+
+        bool disable()
+        {
+            return command("disable");
+        }
+
+    private:
+        bool command(std::string_view text)
+        {
+            if (!m_requested)
+                return true;
+            if (!m_valid)
+                return false;
+            m_control << text << '\n';
+            m_control.flush();
+            for (uint32_t attempt = 0u;
+                 attempt < 1000u; ++attempt)
+            {
+                std::string response;
+                m_acknowledge.clear();
+                if (std::getline(
+                        m_acknowledge, response))
+                {
+                    const size_t firstText =
+                        response.find_first_not_of('\0');
+                    if (firstText == std::string::npos)
+                        response.clear();
+                    else if (firstText != 0u)
+                        response.erase(0u, firstText);
+                    if (response == "ack")
+                        return true;
+                    m_error =
+                        "perf control returned an "
+                        "unexpected acknowledgement: " +
+                        response;
+                    m_valid = false;
+                    return false;
+                }
+                std::this_thread::sleep_for(
+                    std::chrono::milliseconds(1));
+            }
+            m_error =
+                "perf control command was not "
+                "acknowledged";
+            m_valid = false;
+            return false;
+        }
+
+        bool m_requested = false;
+        bool m_valid = false;
+        std::string m_error;
+        std::ofstream m_control;
+        std::ifstream m_acknowledge;
+    };
 
     bool resolveFixture(
         const std::filesystem::path &directory,
@@ -376,63 +544,263 @@ namespace
                 sizeof(destination[0]));
     }
 
-    class HashingSink final : public IVuSideEffectSink
+    constexpr uint64_t kFnvOffset =
+        1469598103934665603ull;
+    constexpr uint64_t kFnvPrime =
+        1099511628211ull;
+
+    template <typename Value>
+    void hashValue(uint64_t &hash, const Value &value)
+    {
+        const auto *const bytes =
+            reinterpret_cast<const uint8_t *>(&value);
+        for (size_t index = 0u;
+             index < sizeof(Value); ++index)
+        {
+            hash ^= bytes[index];
+            hash *= kFnvPrime;
+        }
+    }
+
+    uint64_t hashBytes(
+        const uint8_t *data, size_t size)
+    {
+        uint64_t hash = kFnvOffset;
+        for (size_t index = 0u; index < size; ++index)
+        {
+            hash ^= data[index];
+            hash *= kFnvPrime;
+        }
+        return hash;
+    }
+
+    class BufferedPath1Sink final : public IVuSideEffectSink
     {
     public:
         void submitPath1Packet(
             const uint8_t *data,
             uint32_t sizeBytes) override
         {
-            ++packets;
-            bytes += sizeBytes;
-            mix(sizeBytes);
-            for (uint32_t index = 0u;
-                 index < sizeBytes; ++index)
-            {
-                hash ^= data[index];
-                hash *= 1099511628211ull;
-            }
+            m_packetSizes.push_back(sizeBytes);
+            m_bytes.insert(
+                m_bytes.end(), data, data + sizeBytes);
         }
 
         void reset()
         {
-            packets = 0u;
-            bytes = 0u;
-            hash = 1469598103934665603ull;
+            m_packetSizes.clear();
+            m_bytes.clear();
+        }
+
+        void reserveLike(
+            const BufferedPath1Sink &other)
+        {
+            m_packetSizes.reserve(
+                other.m_packetSizes.size());
+            m_bytes.reserve(other.m_bytes.size());
+        }
+
+        bool reserveRepeated(
+            const BufferedPath1Sink &other,
+            size_t repetitions)
+        {
+            if ((other.m_packetSizes.size() != 0u &&
+                 repetitions >
+                     m_packetSizes.max_size() /
+                         other.m_packetSizes.size()) ||
+                (other.m_bytes.size() != 0u &&
+                 repetitions >
+                     m_bytes.max_size() /
+                         other.m_bytes.size()))
+            {
+                return false;
+            }
+            m_packetSizes.reserve(
+                other.m_packetSizes.size() *
+                repetitions);
+            m_bytes.reserve(
+                other.m_bytes.size() * repetitions);
+            return true;
+        }
+
+        [[nodiscard]] uint64_t packetCount() const
+        {
+            return m_packetSizes.size();
+        }
+
+        [[nodiscard]] uint64_t byteCount() const
+        {
+            return m_bytes.size();
+        }
+
+        [[nodiscard]] uint64_t hash() const
+        {
+            uint64_t result = kFnvOffset;
+            for (const uint32_t size : m_packetSizes)
+                hashValue(result, size);
+            for (const uint8_t byte : m_bytes)
+            {
+                result ^= byte;
+                result *= kFnvPrime;
+            }
+            return result;
+        }
+
+        [[nodiscard]] uint64_t hashRepeated(
+            size_t repetitions) const
+        {
+            uint64_t result = kFnvOffset;
+            for (size_t repetition = 0u;
+                 repetition < repetitions;
+                 ++repetition)
+            {
+                for (const uint32_t size :
+                     m_packetSizes)
+                {
+                    hashValue(result, size);
+                }
+            }
+            for (size_t repetition = 0u;
+                 repetition < repetitions;
+                 ++repetition)
+            {
+                for (const uint8_t byte : m_bytes)
+                {
+                    result ^= byte;
+                    result *= kFnvPrime;
+                }
+            }
+            return result;
         }
 
         bool operator==(
-            const HashingSink &other) const
+            const BufferedPath1Sink &other) const
         {
             return
-                packets == other.packets &&
-                bytes == other.bytes &&
-                hash == other.hash;
+                m_packetSizes == other.m_packetSizes &&
+                m_bytes == other.m_bytes;
         }
 
-        uint64_t packets = 0u;
-        uint64_t bytes = 0u;
-        uint64_t hash = 1469598103934665603ull;
+        bool equalsRepeated(
+            const BufferedPath1Sink &other,
+            size_t repetitions) const
+        {
+            if ((other.m_packetSizes.size() != 0u &&
+                 repetitions >
+                     m_packetSizes.max_size() /
+                         other.m_packetSizes.size()) ||
+                (other.m_bytes.size() != 0u &&
+                 repetitions >
+                     m_bytes.max_size() /
+                         other.m_bytes.size()) ||
+                m_packetSizes.size() !=
+                    other.m_packetSizes.size() *
+                        repetitions ||
+                m_bytes.size() !=
+                    other.m_bytes.size() * repetitions)
+            {
+                return false;
+            }
+            for (size_t repetition = 0u;
+                 repetition < repetitions;
+                 ++repetition)
+            {
+                if (!std::equal(
+                        other.m_packetSizes.begin(),
+                        other.m_packetSizes.end(),
+                        m_packetSizes.begin() +
+                            static_cast<ptrdiff_t>(
+                                repetition *
+                                other.m_packetSizes
+                                    .size())) ||
+                    !std::equal(
+                        other.m_bytes.begin(),
+                        other.m_bytes.end(),
+                        m_bytes.begin() +
+                            static_cast<ptrdiff_t>(
+                                repetition *
+                                other.m_bytes.size())))
+                {
+                    return false;
+                }
+            }
+            return true;
+        }
 
     private:
-        void mix(uint32_t value)
+        std::vector<uint32_t> m_packetSizes;
+        std::vector<uint8_t> m_bytes;
+    };
+
+    class ProductionPath1Transfer final
+        : public IVuSideEffectSink
+    {
+    public:
+        explicit ProductionPath1Transfer(
+            PS2Memory &memory)
+            : m_memory(memory),
+              m_arbiter(
+                  [this](const uint8_t *data,
+                         uint32_t sizeBytes)
+                  {
+                      if (m_output)
+                      {
+                          m_output->submitPath1Packet(
+                              data, sizeBytes);
+                      }
+                  })
         {
-            for (uint32_t shift = 0u;
-                 shift < 32u; shift += 8u)
-            {
-                hash ^=
-                    static_cast<uint8_t>(
-                        value >> shift);
-                hash *= 1099511628211ull;
-            }
         }
+
+        ~ProductionPath1Transfer() override
+        {
+            m_memory.setGifArbiter(nullptr);
+        }
+
+        void begin(BufferedPath1Sink &output)
+        {
+            if (!m_arbiter.empty())
+                m_arbiter.reset();
+            m_output = &output;
+            m_memory.setGifArbiter(&m_arbiter);
+        }
+
+        void submitPath1Packet(
+            const uint8_t *data,
+            uint32_t sizeBytes) override
+        {
+            m_memory.submitGifPacket(
+                GifPathId::Path1, data, sizeBytes,
+                false);
+        }
+
+        void drain()
+        {
+            m_arbiter.drain();
+        }
+
+        [[nodiscard]] bool empty() const
+        {
+            return m_arbiter.empty();
+        }
+
+        void end()
+        {
+            m_memory.setGifArbiter(nullptr);
+            m_output = nullptr;
+        }
+
+    private:
+        PS2Memory &m_memory;
+        GifArbiter m_arbiter;
+        BufferedPath1Sink *m_output = nullptr;
     };
 
     struct Invocation
     {
         VuExecutionState state{};
         std::array<uint8_t, PS2_VU1_DATA_SIZE> data{};
-        HashingSink effects;
+        BufferedPath1Sink effects;
     };
 
     struct RunSummary
@@ -485,6 +853,69 @@ namespace
         return summary;
     }
 
+    uint64_t hashState(
+        const VuExecutionState &state)
+    {
+        uint64_t hash = kFnvOffset;
+        hashValue(hash, state.vf);
+        hashValue(hash, state.vi);
+        hashValue(hash, state.acc);
+        hashValue(hash, state.q);
+        hashValue(hash, state.p);
+        hashValue(hash, state.i);
+        hashValue(hash, state.pc);
+        hashValue(hash, state.mac);
+        hashValue(hash, state.clip);
+        hashValue(hash, state.status);
+        hashValue(hash, state.ebit);
+        hashValue(hash, state.top);
+        hashValue(hash, state.itop);
+        hashValue(hash, state.branchPending);
+        hashValue(hash, state.branchTarget);
+        hashValue(hash, state.branchDelay);
+        hashValue(hash, state.viBackupCycles);
+        hashValue(hash, state.viBackupRegister);
+        hashValue(hash, state.viBackupValue);
+        hashValue(hash, state.active);
+        hashValue(hash, state.issuedCycles);
+
+        const VuPipelineState &pipeline =
+            state.pipeline;
+        hashValue(hash, pipeline.xgkick.active);
+        hashValue(hash, pipeline.xgkick.address);
+        hashValue(
+            hash, pipeline.xgkick.tagBytesRemaining);
+        hashValue(hash, pipeline.xgkick.cycleCredit);
+        hashValue(hash, pipeline.xgkick.tagEop);
+        const uint64_t packetSize =
+            pipeline.xgkick.packet.size();
+        hashValue(hash, packetSize);
+        for (const uint8_t byte :
+             pipeline.xgkick.packet)
+        {
+            hash ^= byte;
+            hash *= kFnvPrime;
+        }
+        hashValue(hash, pipeline.delayedQ.active);
+        hashValue(hash, pipeline.delayedQ.result);
+        hashValue(
+            hash, pipeline.delayedQ.cyclesRemaining);
+        hashValue(hash, pipeline.delayedP.active);
+        hashValue(hash, pipeline.delayedP.result);
+        hashValue(
+            hash, pipeline.delayedP.cyclesRemaining);
+        for (const auto &stage :
+             pipeline.fmacFlags)
+        {
+            hashValue(hash, stage.active);
+            hashValue(hash, stage.mac);
+            hashValue(hash, stage.status);
+        }
+        hashValue(hash, pipeline.fmacFlagIndex);
+        hashValue(hash, pipeline.workingMac);
+        return hash;
+    }
+
     VuExecutionState loadInitialState(
         const std::array<uint32_t, 159u> &words,
         PS2Memory &memory)
@@ -527,7 +958,8 @@ namespace
         std::vector<Invocation> &invocations,
         const VuExecutionState &initialState,
         const std::array<
-            uint8_t, PS2_VU1_DATA_SIZE> &initialData)
+            uint8_t, PS2_VU1_DATA_SIZE> &initialData,
+        const BufferedPath1Sink &expectedEffects)
     {
         for (Invocation &invocation : invocations)
         {
@@ -537,17 +969,31 @@ namespace
                 initialData.data(),
                 initialData.size());
             invocation.effects.reset();
+            invocation.effects.reserveLike(
+                expectedEffects);
         }
     }
 
     struct Measurement
     {
-        uint64_t nanoseconds = 0u;
+        uint64_t hostNanoseconds = 0u;
+        uint64_t timedPlusDrainNanoseconds = 0u;
+        uint64_t drainNanoseconds = 0u;
+        uint64_t validationNanoseconds = 0u;
         uint64_t pairs = 0u;
+        uint64_t cycles = 0u;
         uint64_t allocations = 0u;
         uint64_t allocationBytes = 0u;
+        uint64_t drainAllocations = 0u;
+        uint64_t drainAllocationBytes = 0u;
         uint64_t packets = 0u;
         uint64_t packetBytes = 0u;
+        uint64_t stateHash = 0u;
+        uint64_t dataHash = 0u;
+        uint64_t path1Hash = 0u;
+        uint64_t samplePath1Hash = 0u;
+        VuExitReason exitReason =
+            VuExitReason::Inactive;
         bool valid = true;
         VuRecompilerDiagnostics nativeDelta{};
         VuProgramCacheDiagnostics cacheDelta{};
@@ -560,9 +1006,12 @@ namespace
     }
 
     Measurement measure(
+        TimingScope scope,
         IVuExecutionBackend &backend,
         VuRecompilerBackend *native,
         VuUnit *nativeUnit,
+        ProductionPath1Transfer &path1Transfer,
+        PerfStatControl &perfControl,
         std::vector<Invocation> &invocations,
         const VuExecutionState &initialState,
         const std::array<
@@ -570,13 +1019,32 @@ namespace
         const VuExecutionState &expectedState,
         const std::array<
             uint8_t, PS2_VU1_DATA_SIZE> &expectedData,
-        const HashingSink &expectedEffects,
+        const BufferedPath1Sink &expectedEffects,
         const uint8_t *code, PS2Memory &memory,
         uint32_t maximumPairs,
-        uint32_t expectedPairs)
+        uint32_t expectedPairs,
+        VuExitReason expectedReason,
+        bool churnCache)
     {
+        Measurement result;
         prepareInvocations(
-            invocations, initialState, initialData);
+            invocations, initialState, initialData,
+            expectedEffects);
+        memory.setGifArbiter(nullptr);
+        BufferedPath1Sink drainedEffects;
+        if (scope == TimingScope::VuPlusPath1)
+        {
+            if (!drainedEffects.reserveRepeated(
+                    expectedEffects,
+                    invocations.size()))
+            {
+                std::cerr
+                    << "PATH1 validation buffer is too large\n";
+                result.valid = false;
+                return result;
+            }
+            path1Transfer.begin(drainedEffects);
+        }
         const VuRecompilerDiagnostics nativeBefore =
             native ? native->diagnostics()
                    : VuRecompilerDiagnostics{};
@@ -589,32 +1057,71 @@ namespace
             0u, std::memory_order_relaxed);
         g_allocationBytes.store(
             0u, std::memory_order_relaxed);
+        if (!perfControl.enable())
+        {
+            if (scope == TimingScope::VuPlusPath1)
+                path1Transfer.end();
+            std::cerr
+                << "failed to enable perf counters: "
+                << perfControl.error() << "\n";
+            result.valid = false;
+            return result;
+        }
         g_trackAllocations.store(
             true, std::memory_order_release);
         const auto started = Clock::now();
-        Measurement result;
+        bool firstRun = true;
         for (Invocation &invocation : invocations)
         {
+            if (churnCache)
+            {
+                if (!nativeUnit)
+                {
+                    result.valid = false;
+                    break;
+                }
+                nativeUnit->programCache().flush();
+            }
+            IVuSideEffectSink *sideEffects =
+                scope == TimingScope::VuPlusPath1
+                    ? static_cast<IVuSideEffectSink *>(
+                          &path1Transfer)
+                    : static_cast<IVuSideEffectSink *>(
+                          &invocation.effects);
             VuExecutionContext context{
                 .state = invocation.state,
                 .code = code,
                 .codeSize = PS2_VU1_CODE_SIZE,
                 .data = invocation.data.data(),
                 .dataSize = PS2_VU1_DATA_SIZE,
-                .sideEffects = invocation.effects,
+                .sideEffects = *sideEffects,
                 .memory = &memory,
                 .enableInstrumentation = false,
             };
             const RunSummary run =
                 runBackend(
                     backend, context, maximumPairs);
+            if (firstRun)
+            {
+                result.exitReason = run.reason;
+                firstRun = false;
+            }
+            else if (run.reason != result.exitReason)
+            {
+                result.valid = false;
+            }
             result.pairs += run.pairs;
-            result.packets +=
-                invocation.effects.packets;
-            result.packetBytes +=
-                invocation.effects.bytes;
+            result.cycles += run.pairs;
+            if (scope == TimingScope::VuCore)
+            {
+                result.packets +=
+                    invocation.effects.packetCount();
+                result.packetBytes +=
+                    invocation.effects.byteCount();
+            }
             if (!run.valid ||
-                run.pairs != expectedPairs)
+                run.pairs != expectedPairs ||
+                run.reason != expectedReason)
             {
                 result.valid = false;
             }
@@ -622,8 +1129,15 @@ namespace
         const auto stopped = Clock::now();
         g_trackAllocations.store(
             false, std::memory_order_release);
+        if (!perfControl.disable())
+        {
+            std::cerr
+                << "failed to disable perf counters: "
+                << perfControl.error() << "\n";
+            result.valid = false;
+        }
 
-        result.nanoseconds =
+        result.hostNanoseconds =
             static_cast<uint64_t>(
                 std::chrono::duration_cast<
                     std::chrono::nanoseconds>(
@@ -635,21 +1149,105 @@ namespace
         result.allocationBytes =
             g_allocationBytes.load(
                 std::memory_order_relaxed);
+        if (scope == TimingScope::VuPlusPath1)
+        {
+            g_allocationCount.store(
+                0u, std::memory_order_relaxed);
+            g_allocationBytes.store(
+                0u, std::memory_order_relaxed);
+            g_trackAllocations.store(
+                true, std::memory_order_release);
+            const auto drainStarted = Clock::now();
+            path1Transfer.drain();
+            const auto drainStopped = Clock::now();
+            g_trackAllocations.store(
+                false, std::memory_order_release);
+            result.drainNanoseconds =
+                static_cast<uint64_t>(
+                    std::chrono::duration_cast<
+                        std::chrono::nanoseconds>(
+                        drainStopped - drainStarted)
+                        .count());
+            result.drainAllocations =
+                g_allocationCount.load(
+                    std::memory_order_relaxed);
+            result.drainAllocationBytes =
+                g_allocationBytes.load(
+                    std::memory_order_relaxed);
+            result.packets =
+                drainedEffects.packetCount();
+            result.packetBytes =
+                drainedEffects.byteCount();
+            if (!path1Transfer.empty())
+                result.valid = false;
+            path1Transfer.end();
+        }
+        result.timedPlusDrainNanoseconds =
+            result.hostNanoseconds +
+            result.drainNanoseconds;
 
+        const auto validationStarted = Clock::now();
+        bool firstInvocation = true;
         for (const Invocation &invocation : invocations)
         {
+            const uint64_t stateHash =
+                hashState(invocation.state);
+            const uint64_t dataHash =
+                hashBytes(
+                    invocation.data.data(),
+                    invocation.data.size());
+            if (firstInvocation)
+            {
+                result.stateHash = stateHash;
+                result.dataHash = dataHash;
+                firstInvocation = false;
+            }
+            else if (
+                stateHash != result.stateHash ||
+                dataHash != result.dataHash)
+            {
+                result.valid = false;
+            }
             std::string differenceField;
             if (!vuExecutionStatesEqual(
                     invocation.state, expectedState,
                     &differenceField) ||
                 invocation.data != expectedData ||
-                !(invocation.effects ==
-                  expectedEffects))
+                (scope == TimingScope::VuCore &&
+                 !(invocation.effects ==
+                   expectedEffects)))
             {
                 result.valid = false;
                 break;
             }
         }
+        result.path1Hash = expectedEffects.hash();
+        if (scope == TimingScope::VuCore)
+        {
+            result.samplePath1Hash =
+                invocations.front()
+                    .effects.hashRepeated(
+                        invocations.size());
+        }
+        else
+        {
+            result.samplePath1Hash =
+                drainedEffects.hash();
+            if (!drainedEffects.equalsRepeated(
+                    expectedEffects,
+                    invocations.size()))
+            {
+                result.valid = false;
+            }
+        }
+        const auto validationStopped = Clock::now();
+        result.validationNanoseconds =
+            static_cast<uint64_t>(
+                std::chrono::duration_cast<
+                    std::chrono::nanoseconds>(
+                    validationStopped -
+                    validationStarted)
+                    .count());
 
         if (native)
         {
@@ -718,6 +1316,73 @@ namespace
                 difference(
                     after.compilations,
                     cacheBefore.compilations);
+            result.cacheDelta.invalidations =
+                difference(
+                    after.invalidations,
+                    cacheBefore.invalidations);
+            result.cacheDelta.invalidatedPrograms =
+                difference(
+                    after.invalidatedPrograms,
+                    cacheBefore.invalidatedPrograms);
+            result.cacheDelta.generationRetentions =
+                difference(
+                    after.generationRetentions,
+                    cacheBefore.generationRetentions);
+            result.cacheDelta.retainedPrograms =
+                difference(
+                    after.retainedPrograms,
+                    cacheBefore.retainedPrograms);
+            result.cacheDelta.crossGenerationHits =
+                difference(
+                    after.crossGenerationHits,
+                    cacheBefore.crossGenerationHits);
+            result.cacheDelta.evictionFlushes =
+                difference(
+                    after.evictionFlushes,
+                    cacheBefore.evictionFlushes);
+            result.cacheDelta.evictedPrograms =
+                difference(
+                    after.evictedPrograms,
+                    cacheBefore.evictedPrograms);
+            result.cacheDelta.manualFlushes =
+                difference(
+                    after.manualFlushes,
+                    cacheBefore.manualFlushes);
+            result.cacheDelta.rejectedPrograms =
+                difference(
+                    after.rejectedPrograms,
+                    cacheBefore.rejectedPrograms);
+            result.cacheDelta.generatedBytes =
+                difference(
+                    after.generatedBytes,
+                    cacheBefore.generatedBytes);
+            result.cacheDelta.compilationNanoseconds =
+                difference(
+                    after.compilationNanoseconds,
+                    cacheBefore.compilationNanoseconds);
+            result.cacheDelta.residentPrograms =
+                after.residentPrograms;
+            result.cacheDelta.residentExecutableBytes =
+                after.residentExecutableBytes;
+            result.cacheDelta.highWaterPrograms =
+                after.highWaterPrograms;
+            result.cacheDelta.highWaterExecutableBytes =
+                after.highWaterExecutableBytes;
+            if (churnCache)
+            {
+                result.valid =
+                    result.valid &&
+                    result.cacheDelta.manualFlushes ==
+                        invocations.size() &&
+                    result.cacheDelta.compilations != 0u;
+            }
+            else
+            {
+                result.valid =
+                    result.valid &&
+                    result.cacheDelta.misses == 0u &&
+                    result.cacheDelta.compilations == 0u;
+            }
         }
         return result;
     }
@@ -729,39 +1394,86 @@ namespace
     }
 
     void printMeasurement(
+        std::string_view event,
+        TimingScope scope,
         std::string_view backend, uint32_t sample,
         uint32_t invocations,
         const Measurement &measurement)
     {
         const double pairsPerSecond =
-            measurement.nanoseconds == 0u
+            measurement.hostNanoseconds == 0u
                 ? 0.0
                 : static_cast<double>(
                       measurement.pairs) *
                       1.0e9 /
                       static_cast<double>(
-                          measurement.nanoseconds);
+                          measurement.hostNanoseconds);
+        const double nanosecondsPerPair =
+            measurement.pairs == 0u
+                ? 0.0
+                : static_cast<double>(
+                      measurement.hostNanoseconds) /
+                      static_cast<double>(
+                          measurement.pairs);
         std::cout
-            << "{\"schema_version\":1"
-            << ",\"event\":\"warm-sample\""
+            << "{\"schema_version\":2"
+            << ",\"event\":\"" << event << "\""
             << ",\"backend\":\"" << backend << "\""
+            << ",\"timing_scope\":\""
+            << timingScopeName(scope) << "\""
             << ",\"sample\":" << sample
             << ",\"invocations\":" << invocations
             << ",\"guest_pairs\":"
             << measurement.pairs
+            << ",\"guest_cycles\":"
+            << measurement.cycles
+            << ",\"exit_reason\":\""
+            << vuExitReasonName(
+                   measurement.exitReason)
+            << "\""
             << ",\"host_nanoseconds\":"
-            << measurement.nanoseconds
+            << measurement.hostNanoseconds
+            << ",\"timed_plus_final_drain_nanoseconds\":"
+            << measurement.timedPlusDrainNanoseconds
+            << ",\"final_drain_nanoseconds\":"
+            << measurement.drainNanoseconds
+            << ",\"validation_nanoseconds\":"
+            << measurement.validationNanoseconds
             << ",\"guest_pairs_per_second\":"
             << std::fixed << std::setprecision(3)
             << pairsPerSecond
+            << ",\"host_nanoseconds_per_guest_pair\":"
+            << nanosecondsPerPair
             << ",\"allocation_count\":"
             << measurement.allocations
             << ",\"allocation_bytes\":"
             << measurement.allocationBytes
+            << ",\"execution_allocation_count\":"
+            << measurement.allocations
+            << ",\"execution_allocation_bytes\":"
+            << measurement.allocationBytes
+            << ",\"final_drain_allocation_count\":"
+            << measurement.drainAllocations
+            << ",\"final_drain_allocation_bytes\":"
+            << measurement.drainAllocationBytes
             << ",\"path1_packets\":"
             << measurement.packets
             << ",\"path1_bytes\":"
             << measurement.packetBytes
+            << ",\"state_fnv1a64\":\"0x"
+            << std::hex << std::setw(16)
+            << std::setfill('0')
+            << measurement.stateHash
+            << "\",\"vu_data_fnv1a64\":\"0x"
+            << std::setw(16)
+            << measurement.dataHash
+            << "\",\"path1_fnv1a64\":\"0x"
+            << std::setw(16)
+            << measurement.path1Hash
+            << "\",\"path1_sample_fnv1a64\":\"0x"
+            << std::setw(16)
+            << measurement.samplePath1Hash
+            << "\"" << std::dec << std::setfill(' ')
             << ",\"valid\":"
             << (measurement.valid
                     ? "true" : "false");
@@ -799,7 +1511,43 @@ namespace
                 << ",\"cache_misses\":"
                 << measurement.cacheDelta.misses
                 << ",\"cache_compilations\":"
-                << measurement.cacheDelta.compilations;
+                << measurement.cacheDelta.compilations
+                << ",\"cache_invalidations\":"
+                << measurement.cacheDelta.invalidations
+                << ",\"cache_invalidated_programs\":"
+                << measurement.cacheDelta
+                       .invalidatedPrograms
+                << ",\"cache_generation_retentions\":"
+                << measurement.cacheDelta
+                       .generationRetentions
+                << ",\"cache_retained_programs\":"
+                << measurement.cacheDelta.retainedPrograms
+                << ",\"cache_cross_generation_hits\":"
+                << measurement.cacheDelta
+                       .crossGenerationHits
+                << ",\"cache_eviction_flushes\":"
+                << measurement.cacheDelta.evictionFlushes
+                << ",\"cache_evicted_programs\":"
+                << measurement.cacheDelta.evictedPrograms
+                << ",\"cache_manual_flushes\":"
+                << measurement.cacheDelta.manualFlushes
+                << ",\"cache_rejected_programs\":"
+                << measurement.cacheDelta.rejectedPrograms
+                << ",\"cache_generated_bytes\":"
+                << measurement.cacheDelta.generatedBytes
+                << ",\"cache_compilation_nanoseconds\":"
+                << measurement.cacheDelta
+                       .compilationNanoseconds
+                << ",\"cache_resident_programs\":"
+                << measurement.cacheDelta.residentPrograms
+                << ",\"cache_resident_executable_bytes\":"
+                << measurement.cacheDelta
+                       .residentExecutableBytes
+                << ",\"cache_high_water_programs\":"
+                << measurement.cacheDelta.highWaterPrograms
+                << ",\"cache_high_water_executable_bytes\":"
+                << measurement.cacheDelta
+                       .highWaterExecutableBytes;
         }
         std::cout << "}\n";
     }
@@ -815,13 +1563,23 @@ int main(int argc, char **argv)
             << "usage: vu_backend_benchmark "
                "FIXTURE_DIRECTORY INSTRUCTION_PAIRS "
                "[--iterations N] [--warmup N] "
-               "[--samples N]\n";
+               "[--samples N] "
+               "[--cache-churn-iterations N] "
+               "[--scope core|path1|all] "
+               "[--backend interpreter|recompiler|both]\n";
         return 2;
     }
     if (!VuRecompilerBackend::supported())
     {
         std::cerr
             << "the x86-64 VU recompiler is unavailable\n";
+        return 2;
+    }
+    if (configuration.cacheChurnIterations != 0u &&
+        !configuration.measureRecompiler)
+    {
+        std::cerr
+            << "cache churn requires the recompiler backend\n";
         return 2;
     }
 
@@ -878,6 +1636,7 @@ int main(int argc, char **argv)
     VuUnit nativeUnit(VuUnitId::Vu1);
     VuInterpreterBackend interpreter(interpreterUnit);
     VuRecompilerBackend native(nativeUnit);
+    ProductionPath1Transfer path1Transfer(memory);
 
     Invocation reference;
     Invocation cold;
@@ -937,6 +1696,7 @@ int main(int argc, char **argv)
                 std::chrono::nanoseconds>(
                 coldStopped - coldStarted)
                 .count());
+    const auto coldValidationStarted = Clock::now();
     std::string stateDifference;
     const bool coldMatches =
         coldRun.valid &&
@@ -946,14 +1706,35 @@ int main(int argc, char **argv)
             &stateDifference) &&
         cold.data == reference.data &&
         cold.effects == reference.effects;
+    const uint64_t coldStateHash =
+        hashState(cold.state);
+    const uint64_t coldDataHash =
+        hashBytes(cold.data.data(), cold.data.size());
+    const uint64_t coldPath1Hash =
+        cold.effects.hash();
+    const auto coldValidationStopped = Clock::now();
+    const uint64_t coldValidationNanoseconds =
+        static_cast<uint64_t>(
+            std::chrono::duration_cast<
+                std::chrono::nanoseconds>(
+                coldValidationStopped -
+                coldValidationStarted)
+                .count());
     const VuProgramCacheDiagnostics coldCache =
         nativeUnit.programCache().diagnostics();
     std::cout
-        << "{\"schema_version\":1"
+        << "{\"schema_version\":2"
         << ",\"event\":\"cold-recompiler\""
+        << ",\"timing_scope\":\"vu-core\""
         << ",\"guest_pairs\":" << coldRun.pairs
+        << ",\"guest_cycles\":" << coldRun.pairs
+        << ",\"exit_reason\":\""
+        << vuExitReasonName(coldRun.reason)
+        << "\""
         << ",\"host_nanoseconds\":"
         << coldNanoseconds
+        << ",\"validation_nanoseconds\":"
+        << coldValidationNanoseconds
         << ",\"allocation_count\":"
         << g_allocationCount.load(
                std::memory_order_relaxed)
@@ -974,6 +1755,18 @@ int main(int argc, char **argv)
         << coldCache.residentPrograms
         << ",\"resident_executable_bytes\":"
         << coldCache.residentExecutableBytes
+        << ",\"path1_packets\":"
+        << cold.effects.packetCount()
+        << ",\"path1_bytes\":"
+        << cold.effects.byteCount()
+        << ",\"state_fnv1a64\":\"0x"
+        << std::hex << std::setw(16)
+        << std::setfill('0') << coldStateHash
+        << "\",\"vu_data_fnv1a64\":\"0x"
+        << std::setw(16) << coldDataHash
+        << "\",\"path1_fnv1a64\":\"0x"
+        << std::setw(16) << coldPath1Hash
+        << "\"" << std::dec << std::setfill(' ')
         << ",\"matches_interpreter\":"
         << (coldMatches ? "true" : "false")
         << "}\n";
@@ -985,148 +1778,440 @@ int main(int argc, char **argv)
         return 1;
     }
 
+    PerfStatControl perfControl;
+    if (!perfControl.valid())
+    {
+        std::cerr
+            << "failed to configure perf counters: "
+            << perfControl.error() << "\n";
+        return 2;
+    }
+
     Invocation warmup;
-    for (uint32_t iteration = 0u;
-         iteration < configuration.warmupIterations;
-         ++iteration)
+    warmup.effects.reserveLike(reference.effects);
+    const auto runWarmup =
+        [&](IVuExecutionBackend &backend,
+            TimingScope scope)
     {
         warmup.state = initialState;
         warmup.data = initialData;
         warmup.effects.reset();
+        IVuSideEffectSink *sideEffects =
+            &warmup.effects;
+        if (scope == TimingScope::VuPlusPath1)
+        {
+            path1Transfer.begin(warmup.effects);
+            sideEffects = &path1Transfer;
+        }
         VuExecutionContext context{
             .state = warmup.state,
             .code = memory.getVU1Code(),
             .codeSize = PS2_VU1_CODE_SIZE,
             .data = warmup.data.data(),
             .dataSize = PS2_VU1_DATA_SIZE,
-            .sideEffects = warmup.effects,
+            .sideEffects = *sideEffects,
             .memory = &memory,
             .enableInstrumentation = false,
         };
-        if (!runBackend(
-                 interpreter, context,
-                 configuration.maximumPairs)
-                 .valid)
+        const RunSummary run = runBackend(
+            backend, context,
+            configuration.maximumPairs);
+        if (scope == TimingScope::VuPlusPath1)
         {
-            std::cerr
-                << "interpreter warmup failed\n";
-            return 1;
+            path1Transfer.drain();
+            const bool empty =
+                path1Transfer.empty();
+            path1Transfer.end();
+            if (!empty)
+                return false;
         }
+        std::string differenceField;
+        return
+            run.valid &&
+            run.pairs == referenceRun.pairs &&
+            vuExecutionStatesEqual(
+                warmup.state, reference.state,
+                &differenceField) &&
+            warmup.data == reference.data &&
+            warmup.effects == reference.effects;
+    };
 
-        warmup.state = initialState;
-        warmup.data = initialData;
-        warmup.effects.reset();
-        if (!runBackend(
-                 native, context,
-                 configuration.maximumPairs)
-                 .valid)
+    std::vector<TimingScope> scopes;
+    if (configuration.measureVuCore)
+        scopes.push_back(TimingScope::VuCore);
+    if (configuration.measureVuPlusPath1)
+        scopes.push_back(TimingScope::VuPlusPath1);
+    for (uint32_t iteration = 0u;
+         iteration < configuration.warmupIterations;
+         ++iteration)
+    {
+        for (const TimingScope scope : scopes)
         {
-            std::cerr
-                << "recompiler warmup failed\n";
-            return 1;
+            if (configuration.measureInterpreter &&
+                !runWarmup(interpreter, scope))
+            {
+                std::cerr
+                    << "interpreter warmup failed for "
+                    << timingScopeName(scope) << "\n";
+                return 1;
+            }
+            if (configuration.measureRecompiler &&
+                !runWarmup(native, scope))
+            {
+                std::cerr
+                    << "recompiler warmup failed for "
+                    << timingScopeName(scope) << "\n";
+                return 1;
+            }
         }
     }
 
     std::vector<Invocation> invocations(
         configuration.iterations);
-    std::vector<uint64_t> interpreterTimes;
-    std::vector<uint64_t> nativeTimes;
+    std::array<std::vector<uint64_t>, 2u>
+        interpreterTimes;
+    std::array<std::vector<uint64_t>, 2u>
+        nativeTimes;
     bool allValid = true;
     for (uint32_t sample = 0u;
          sample < configuration.samples; ++sample)
     {
         const auto measureInterpreter = [&]
         {
-            const Measurement measurement =
-                measure(
-                    interpreter, nullptr, nullptr,
-                    invocations, initialState, initialData,
-                    reference.state, reference.data,
-                    reference.effects,
-                    memory.getVU1Code(), memory,
-                    configuration.maximumPairs,
-                    referenceRun.pairs);
-            printMeasurement(
-                "interpreter", sample,
-                configuration.iterations,
-                measurement);
-            interpreterTimes.push_back(
-                measurement.nanoseconds);
-            allValid = allValid && measurement.valid;
+            std::vector<TimingScope> orderedScopes =
+                scopes;
+            if ((sample & 1u) != 0u)
+            {
+                std::reverse(
+                    orderedScopes.begin(),
+                    orderedScopes.end());
+            }
+            for (const TimingScope scope :
+                 orderedScopes)
+            {
+                const Measurement measurement =
+                    measure(
+                        scope, interpreter,
+                        nullptr, nullptr,
+                        path1Transfer,
+                        perfControl,
+                        invocations, initialState,
+                        initialData, reference.state,
+                        reference.data,
+                        reference.effects,
+                        memory.getVU1Code(), memory,
+                        configuration.maximumPairs,
+                        referenceRun.pairs,
+                        referenceRun.reason,
+                        false);
+                printMeasurement(
+                    "warm-sample", scope,
+                    "interpreter", sample,
+                    configuration.iterations,
+                    measurement);
+                interpreterTimes[
+                    static_cast<size_t>(scope)]
+                    .push_back(
+                        measurement.hostNanoseconds);
+                allValid =
+                    allValid && measurement.valid;
+            }
         };
         const auto measureRecompiler = [&]
         {
-            const Measurement measurement =
-                measure(
-                    native, &native, &nativeUnit,
-                    invocations, initialState, initialData,
-                    reference.state, reference.data,
-                    reference.effects,
-                    memory.getVU1Code(), memory,
-                    configuration.maximumPairs,
-                    referenceRun.pairs);
-            printMeasurement(
-                "recompiler", sample,
-                configuration.iterations,
-                measurement);
-            nativeTimes.push_back(
-                measurement.nanoseconds);
-            allValid = allValid && measurement.valid;
+            std::vector<TimingScope> orderedScopes =
+                scopes;
+            if ((sample & 1u) != 0u)
+            {
+                std::reverse(
+                    orderedScopes.begin(),
+                    orderedScopes.end());
+            }
+            for (const TimingScope scope :
+                 orderedScopes)
+            {
+                const Measurement measurement =
+                    measure(
+                        scope, native,
+                        &native, &nativeUnit,
+                        path1Transfer,
+                        perfControl,
+                        invocations, initialState,
+                        initialData, reference.state,
+                        reference.data,
+                        reference.effects,
+                        memory.getVU1Code(), memory,
+                        configuration.maximumPairs,
+                        referenceRun.pairs,
+                        referenceRun.reason,
+                        false);
+                printMeasurement(
+                    "warm-sample", scope,
+                    "recompiler", sample,
+                    configuration.iterations,
+                    measurement);
+                nativeTimes[
+                    static_cast<size_t>(scope)]
+                    .push_back(
+                        measurement.hostNanoseconds);
+                allValid =
+                    allValid && measurement.valid;
+            }
         };
-        if ((sample & 1u) == 0u)
+        if (configuration.measureInterpreter &&
+            configuration.measureRecompiler &&
+            (sample & 1u) == 0u)
         {
             measureInterpreter();
             measureRecompiler();
+        }
+        else if (
+            configuration.measureInterpreter &&
+            configuration.measureRecompiler)
+        {
+            measureRecompiler();
+            measureInterpreter();
+        }
+        else if (configuration.measureInterpreter)
+        {
+            measureInterpreter();
         }
         else
         {
             measureRecompiler();
-            measureInterpreter();
         }
     }
 
-    const uint64_t interpreterMedian =
-        median(interpreterTimes);
-    const uint64_t nativeMedian =
-        median(nativeTimes);
+    const bool warmAllValid = allValid;
+    const VuProgramCacheDiagnostics warmCache =
+        nativeUnit.programCache().diagnostics();
+    std::array<std::vector<uint64_t>, 2u>
+        cacheChurnTimes;
+    std::array<bool, 2u> cacheChurnValid{
+        true, true};
+    if (configuration.cacheChurnIterations != 0u)
+    {
+        std::vector<Invocation> cacheChurnInvocations(
+            configuration.cacheChurnIterations);
+        for (uint32_t sample = 0u;
+             sample < configuration.samples; ++sample)
+        {
+            std::vector<TimingScope> orderedScopes =
+                scopes;
+            if ((sample & 1u) != 0u)
+            {
+                std::reverse(
+                    orderedScopes.begin(),
+                    orderedScopes.end());
+            }
+            for (const TimingScope scope :
+                 orderedScopes)
+            {
+                const Measurement measurement =
+                    measure(
+                        scope, native,
+                        &native, &nativeUnit,
+                        path1Transfer,
+                        perfControl,
+                        cacheChurnInvocations,
+                        initialState, initialData,
+                        reference.state,
+                        reference.data,
+                        reference.effects,
+                        memory.getVU1Code(), memory,
+                        configuration.maximumPairs,
+                        referenceRun.pairs,
+                        referenceRun.reason,
+                        true);
+                printMeasurement(
+                    "cache-churn-sample", scope,
+                    "recompiler", sample,
+                    configuration.cacheChurnIterations,
+                    measurement);
+                const size_t scopeIndex =
+                    static_cast<size_t>(scope);
+                cacheChurnTimes[scopeIndex].push_back(
+                    measurement.hostNanoseconds);
+                cacheChurnValid[scopeIndex] =
+                    cacheChurnValid[scopeIndex] &&
+                    measurement.valid;
+                allValid =
+                    allValid && measurement.valid;
+            }
+        }
+    }
+
     const VuProgramCacheDiagnostics finalCache =
         nativeUnit.programCache().diagnostics();
-    std::cout
-        << "{\"schema_version\":1"
-        << ",\"event\":\"summary\""
-        << ",\"fixture\":\""
-        << configuration.fixtureDirectory.filename().string()
-        << "\""
-        << ",\"pairs_per_invocation\":"
-        << referenceRun.pairs
-        << ",\"iterations_per_sample\":"
-        << configuration.iterations
-        << ",\"samples\":"
-        << configuration.samples
-        << ",\"interpreter_median_nanoseconds\":"
-        << interpreterMedian
-        << ",\"recompiler_median_nanoseconds\":"
-        << nativeMedian
-        << ",\"speedup\":"
-        << std::fixed << std::setprecision(6)
-        << (nativeMedian == 0u
+    for (const TimingScope scope : scopes)
+    {
+        const auto &scopeInterpreterTimes =
+            interpreterTimes[
+                static_cast<size_t>(scope)];
+        const auto &scopeNativeTimes =
+            nativeTimes[
+                static_cast<size_t>(scope)];
+        const bool hasInterpreter =
+            !scopeInterpreterTimes.empty();
+        const bool hasNative =
+            !scopeNativeTimes.empty();
+        const uint64_t interpreterMedian =
+            hasInterpreter
+                ? median(scopeInterpreterTimes)
+                : 0u;
+        const uint64_t nativeMedian =
+            hasNative
+                ? median(scopeNativeTimes)
+                : 0u;
+        std::cout
+            << "{\"schema_version\":2"
+            << ",\"event\":\"summary\""
+            << ",\"timing_scope\":\""
+            << timingScopeName(scope) << "\""
+            << ",\"fixture\":\""
+            << configuration.fixtureDirectory
+                   .filename().string()
+            << "\""
+            << ",\"pairs_per_invocation\":"
+            << referenceRun.pairs
+            << ",\"cycles_per_invocation\":"
+            << referenceRun.pairs
+            << ",\"iterations_per_sample\":"
+            << configuration.iterations
+            << ",\"samples\":"
+            << configuration.samples
+            << ",\"interpreter_median_nanoseconds\":";
+        if (hasInterpreter)
+            std::cout << interpreterMedian;
+        else
+            std::cout << "null";
+        std::cout
+            << ",\"recompiler_median_nanoseconds\":";
+        if (hasNative)
+            std::cout << nativeMedian;
+        else
+            std::cout << "null";
+        std::cout << ",\"speedup\":";
+        if (hasInterpreter &&
+            hasNative &&
+            nativeMedian != 0u)
+        {
+            std::cout
+                << std::fixed << std::setprecision(6)
+                << static_cast<double>(
+                       interpreterMedian) /
+                       static_cast<double>(
+                           nativeMedian);
+        }
+        else
+        {
+            std::cout << "null";
+        }
+        std::cout
+            << ",\"cache_hits\":"
+            << warmCache.hits
+            << ",\"cache_misses\":"
+            << warmCache.misses
+            << ",\"compilations\":"
+            << warmCache.compilations
+            << ",\"generated_bytes\":"
+            << warmCache.generatedBytes
+            << ",\"high_water_executable_bytes\":"
+            << warmCache.highWaterExecutableBytes
+            << ",\"valid\":"
+            << (warmAllValid ? "true" : "false")
+            << "}\n";
+    }
+    for (const TimingScope scope : scopes)
+    {
+        const size_t scopeIndex =
+            static_cast<size_t>(scope);
+        const auto &scopeTimes =
+            cacheChurnTimes[scopeIndex];
+        if (scopeTimes.empty())
+            continue;
+        const uint64_t scopeMedian =
+            median(scopeTimes);
+        const uint64_t pairsPerSample =
+            static_cast<uint64_t>(
+                referenceRun.pairs) *
+            configuration.cacheChurnIterations;
+        const double nanosecondsPerPair =
+            pairsPerSample == 0u
                 ? 0.0
                 : static_cast<double>(
-                      interpreterMedian) /
+                      scopeMedian) /
                       static_cast<double>(
-                          nativeMedian))
-        << ",\"cache_hits\":"
-        << finalCache.hits
-        << ",\"cache_misses\":"
-        << finalCache.misses
-        << ",\"compilations\":"
-        << finalCache.compilations
-        << ",\"generated_bytes\":"
-        << finalCache.generatedBytes
-        << ",\"high_water_executable_bytes\":"
-        << finalCache.highWaterExecutableBytes
-        << ",\"valid\":"
-        << (allValid ? "true" : "false")
-        << "}\n";
+                          pairsPerSample);
+        std::cout
+            << "{\"schema_version\":2"
+            << ",\"event\":\"cache-churn-summary\""
+            << ",\"timing_scope\":\""
+            << timingScopeName(scope) << "\""
+            << ",\"fixture\":\""
+            << configuration.fixtureDirectory
+                   .filename().string()
+            << "\""
+            << ",\"pairs_per_invocation\":"
+            << referenceRun.pairs
+            << ",\"cycles_per_invocation\":"
+            << referenceRun.pairs
+            << ",\"iterations_per_sample\":"
+            << configuration.cacheChurnIterations
+            << ",\"samples\":"
+            << configuration.samples
+            << ",\"recompiler_median_nanoseconds\":"
+            << scopeMedian
+            << ",\"host_nanoseconds_per_guest_pair\":"
+            << std::fixed << std::setprecision(6)
+            << nanosecondsPerPair
+            << ",\"valid\":"
+            << (cacheChurnValid[scopeIndex]
+                    ? "true" : "false")
+            << "}\n";
+    }
+    if (configuration.cacheChurnIterations != 0u)
+    {
+        std::cout
+            << "{\"schema_version\":2"
+            << ",\"event\":\"cache-churn-cache-summary\""
+            << ",\"cache_hits\":"
+            << difference(
+                   finalCache.hits, warmCache.hits)
+            << ",\"cache_misses\":"
+            << difference(
+                   finalCache.misses, warmCache.misses)
+            << ",\"cache_compilations\":"
+            << difference(
+                   finalCache.compilations,
+                   warmCache.compilations)
+            << ",\"cache_manual_flushes\":"
+            << difference(
+                   finalCache.manualFlushes,
+                   warmCache.manualFlushes)
+            << ",\"cache_rejected_programs\":"
+            << difference(
+                   finalCache.rejectedPrograms,
+                   warmCache.rejectedPrograms)
+            << ",\"cache_generated_bytes\":"
+            << difference(
+                   finalCache.generatedBytes,
+                   warmCache.generatedBytes)
+            << ",\"cache_compilation_nanoseconds\":"
+            << difference(
+                   finalCache.compilationNanoseconds,
+                   warmCache.compilationNanoseconds)
+            << ",\"cache_resident_programs\":"
+            << finalCache.residentPrograms
+            << ",\"cache_resident_executable_bytes\":"
+            << finalCache.residentExecutableBytes
+            << ",\"cache_high_water_programs\":"
+            << finalCache.highWaterPrograms
+            << ",\"cache_high_water_executable_bytes\":"
+            << finalCache.highWaterExecutableBytes
+            << ",\"valid\":"
+            << (allValid ? "true" : "false")
+            << "}\n";
+    }
     return allValid ? 0 : 1;
 }
