@@ -1426,6 +1426,40 @@ void register_ps2_vu1_tests()
                 "the E-bit delay pair should complete normally");
         });
 
+        tc.Run("EFU lower source observes old VF from its paired upper write", [](TestCase &t)
+        {
+            Vu1Fixture fx;
+            t.IsTrue(fx.initialize(), "VU1 fixture should initialize");
+
+            writeVuInstructionPair(
+                fx.code, 0u, makeVuEleng(1u),
+                makeVuUpper(0x28u, 0xfu, 3u, 2u, 1u));
+            writeVuInstructionPair(
+                fx.code, 8u, makeVuWaitP(), kVuUpperNop);
+
+            VuUnit vu1;
+            vu1.state().vf[1][0] = 3.0f;
+            vu1.state().vf[1][1] = 4.0f;
+            vu1.state().vf[2][0] = 1.0f;
+            vu1.state().vf[2][1] = 2.0f;
+            vu1.state().vf[3][0] = 5.0f;
+            vu1.state().vf[3][1] = 6.0f;
+
+            vu1.execute(
+                fx.code, PS2_VU1_CODE_SIZE,
+                fx.data, PS2_VU1_DATA_SIZE,
+                fx.gs, &fx.mem, 0u, 0u, 0u, 2u);
+            t.Equals(
+                vu1.state().vf[1][0], 6.0f,
+                "the paired upper ADD should publish its x result");
+            t.Equals(
+                vu1.state().vf[1][1], 8.0f,
+                "the paired upper ADD should publish its y result");
+            t.Equals(
+                vu1.state().p, 5.0f,
+                "ELENG should read the pre-upper VF source");
+        });
+
         tc.Run("MPG upload invalidates cached VU1 decode before MSCAL", [](TestCase &t)
         {
             Vu1Fixture fx;

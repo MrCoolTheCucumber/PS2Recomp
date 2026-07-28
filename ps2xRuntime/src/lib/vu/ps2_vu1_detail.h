@@ -120,6 +120,27 @@ static inline void vuLowerVfReadWriteMasks(uint32_t lower, uint32_t &readMask, u
             case 0x64: // MFP
                 vuSetRegBit(writeMask, it);
                 return;
+            case 0x40: // RNEXT
+            case 0x41: // RGET
+                vuSetRegBit(writeMask, it);
+                return;
+            case 0x42: // RINIT
+            case 0x43: // RXOR
+            case 0x70: // ESADD
+            case 0x71: // ERSADD
+            case 0x72: // ELENG
+            case 0x73: // ERLENG
+            case 0x74: // EATANxy
+            case 0x75: // EATANxz
+            case 0x76: // ESUM
+            case 0x78: // ESQRT
+            case 0x79: // ERSQRT
+            case 0x7A: // ERCPR
+            case 0x7C: // ESIN
+            case 0x7D: // EATAN
+            case 0x7E: // EEXP
+                vuSetRegBit(readMask, is);
+                return;
             default:
                 return;
             }
