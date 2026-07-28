@@ -995,6 +995,10 @@ public:
         return m_dmacInterruptDrainPasses.load(
             std::memory_order_acquire);
     }
+    size_t pendingDmacInterruptCountForTesting() const
+    {
+        return m_pendingDmacInterrupts.size();
+    }
 
     uint64_t guestExecutionHandoffTimeouts() const
     {
@@ -1256,6 +1260,8 @@ private:
     void onDmacCompletionReady();
     size_t publishReadyDmacCompletions(
         uint64_t eventSequence);
+    void mergePendingDmacInterrupts(
+        std::vector<DmacPendingInterrupt> pending);
     void collectPendingDmacInterrupts();
     void onDmacInterruptStateChanged();
     [[nodiscard]] ps2x::timing::EeTick

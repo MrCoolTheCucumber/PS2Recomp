@@ -2437,6 +2437,37 @@ void PS2Runtime::requestDmacCompletion(
     (void)m_memory.requestDmacCompletion(transfer);
 }
 
+void PS2Runtime::mergePendingDmacInterrupts(
+    std::vector<DmacPendingInterrupt> pending)
+{
+    for (DmacPendingInterrupt &interrupt : pending)
+    {
+        const auto existing = std::find_if(
+            m_pendingDmacInterrupts.begin(),
+            m_pendingDmacInterrupts.end(),
+            [&interrupt](
+                const DmacPendingInterrupt &candidate)
+            {
+                return candidate.source ==
+                           interrupt.source &&
+                       candidate.cause ==
+                           interrupt.cause;
+            });
+        if (existing == m_pendingDmacInterrupts.end())
+        {
+            m_pendingDmacInterrupts.push_back(
+                std::move(interrupt));
+            continue;
+        }
+
+        // D_STAT exposes one level-latched status bit per channel. Repeated
+        // completions while that level remains asserted do not create
+        // additional interrupt deliveries, but keep the newest publication
+        // metadata for diagnostics and a later unmask.
+        *existing = std::move(interrupt);
+    }
+}
+
 void PS2Runtime::collectPendingDmacInterrupts()
 {
     std::vector<DmacPendingInterrupt> pending =
@@ -2445,10 +2476,8 @@ void PS2Runtime::collectPendingDmacInterrupts()
     {
         return;
     }
-    m_pendingDmacInterrupts.insert(
-        m_pendingDmacInterrupts.end(),
-        std::make_move_iterator(pending.begin()),
-        std::make_move_iterator(pending.end()));
+    mergePendingDmacInterrupts(
+        std::move(pending));
     m_dmacInterruptDeliveryDirty.store(
         true, std::memory_order_release);
 }
@@ -5607,13 +5636,11 @@ void PS2Runtime::drainCompletedDmacHandlers(uint8_t *rdram)
 
     if (!retained.empty())
     {
-        retained.insert(
-            retained.end(),
-            std::make_move_iterator(
-                m_pendingDmacInterrupts.begin()),
-            std::make_move_iterator(
-                m_pendingDmacInterrupts.end()));
+        std::vector<DmacPendingInterrupt> reentrant;
+        reentrant.swap(m_pendingDmacInterrupts);
         m_pendingDmacInterrupts = std::move(retained);
+        mergePendingDmacInterrupts(
+            std::move(reentrant));
     }
 }
 

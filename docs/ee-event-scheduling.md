@@ -77,6 +77,10 @@ Separating completion publication from handler delivery prevents reentrant
 guest callbacks from observing half-published device state. Masking delays
 delivery, not device completion. Reset, cancellation, and restart invalidate
 old generations rather than relying on a synchronous compatibility sweep.
+Because each DMAC channel exposes one level-latched D_STAT cause, repeated
+completions before acknowledgement share one deferred delivery record. The
+runtime retains the newest completion metadata instead of growing a duplicate
+queue while that cause is masked.
 
 Idle waits may advance the canonical timeline directly to the cached next
 deadline only when no runnable guest owns execution. They do not start a
@@ -165,4 +169,3 @@ Before adding another timed source:
 4. Add intermediate-state, generation, reset, and interrupt-order tests.
 5. Verify the no-event benchmark still allocates nothing and the equal-work
    ratio remains within the gate.
-

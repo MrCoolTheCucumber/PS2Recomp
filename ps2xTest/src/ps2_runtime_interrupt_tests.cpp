@@ -1863,6 +1863,85 @@ void register_ps2_runtime_interrupt_tests()
             cleanupRuntime(env);
         });
 
+        tc.Run("repeated masked DMAC completions coalesce per latched cause", [](TestCase &t)
+        {
+            notifyRuntimeStop();
+            TestEnv env;
+            t.IsTrue(
+                env.runtime.memory().initialize(),
+                "runtime memory initialize should succeed");
+
+            constexpr uint32_t kHandlerAddr = 0x00ABD250u;
+            constexpr uint32_t kCompletionCount = 256u;
+            uint8_t *const rdram =
+                env.runtime.memory().getRDRAM();
+
+            g_dmacSendHits.store(0u, std::memory_order_relaxed);
+            g_dmacPublishedAddress.store(
+                0u, std::memory_order_relaxed);
+            env.runtime.registerFunction(
+                kHandlerAddr, &testDmacSendHandler);
+
+            R5900Context addCtx{};
+            setRegU32(addCtx, 4, 1u);
+            setRegU32(addCtx, 5, kHandlerAddr);
+            ps2_syscalls::AddDmacHandler(
+                rdram, &addCtx, &env.runtime);
+
+            R5900Context disableCtx{};
+            setRegU32(disableCtx, 4, 1u);
+            ps2_syscalls::DisableDmac(
+                rdram, &disableCtx, &env.runtime);
+
+            R5900Context eventCtx{};
+            {
+                PS2Runtime::GuestExecutionScope guestExecution(
+                    &env.runtime, &eventCtx);
+                for (uint32_t index = 0u;
+                     index < kCompletionCount;
+                     ++index)
+                {
+                    const DmacTransferToken transfer =
+                        env.runtime.memory().beginDmacTransfer(
+                            DmacChannel::Vif1);
+                    t.IsTrue(
+                        env.runtime.memory().requestDmacCompletion(
+                            transfer),
+                        "masked VIF1 completion should queue");
+                    env.runtime.serviceEeEventsAtBlockBoundary(
+                        rdram, &eventCtx);
+                }
+            }
+
+            t.Equals(
+                env.runtime.pendingDmacInterruptCountForTesting(),
+                static_cast<size_t>(1u),
+                "one latched channel cause should retain one delivery record");
+            t.Equals(
+                g_dmacSendHits.load(std::memory_order_relaxed),
+                0u,
+                "masked duplicate completions must not enter the handler");
+
+            R5900Context enableCtx{};
+            setRegU32(enableCtx, 4, 1u);
+            {
+                PS2Runtime::GuestExecutionScope guestExecution(
+                    &env.runtime, &enableCtx);
+                ps2_syscalls::EnableDmac(
+                    rdram, &enableCtx, &env.runtime);
+            }
+
+            t.Equals(
+                g_dmacSendHits.load(std::memory_order_relaxed),
+                1u,
+                "unmasking one latched cause should deliver one handler call");
+            t.Equals(
+                env.runtime.pendingDmacInterruptCountForTesting(),
+                static_cast<size_t>(0u),
+                "delivering the coalesced cause should clear deferred state");
+            cleanupRuntime(env);
+        });
+
         tc.Run("masked EE counter cause publishes before deferred handler delivery", [](TestCase &t)
         {
             notifyRuntimeStop();
