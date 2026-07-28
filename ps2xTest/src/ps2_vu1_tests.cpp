@@ -849,8 +849,10 @@ void register_ps2_vu1_tests()
                 automatic.vu0().requestedBackend() ==
                         VuBackendKind::Auto &&
                     automatic.vu0().resolvedBackend() ==
-                        VuBackendKind::Interpreter,
-                "VU0 auto should remain interpreted until its integration gate");
+                        (VuRecompilerBackend::supported()
+                             ? VuBackendKind::Recompiler
+                             : VuBackendKind::Interpreter),
+                "VU0 auto should select native execution only on a supported host");
             t.IsTrue(
                 automatic.vu1().requestedBackend() ==
                     VuBackendKind::Auto,

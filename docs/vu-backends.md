@@ -56,10 +56,11 @@ On a supported x86-64 host, an explicit VU0 or VU1 `recompiler` request resolves
 to `x86-64-recompiler`; if native executable memory or the required host
 features are unavailable, the request fails early with a diagnostic. `verify`
 has the same host requirement and resolves to
-`interpreter+x86-64-recompiler`. VU1 `auto` resolves to
-`x86-64-recompiler` when that backend is built and supported, and falls back to
-the interpreter on other hosts. VU0 `auto` deliberately remains on the
-interpreter until its full synchronization and verification matrix passes.
+`interpreter+x86-64-recompiler`. VU0 and VU1 `auto` resolve to
+`x86-64-recompiler` when that backend is built and supported, and fall back to
+the interpreter on other hosts. VU0 was enabled only after its EE
+synchronization, instrumented trace, and transactional verification gates
+passed.
 
 `verify` clones the canonical execution state and complete unit data memory for
 both engines. It advances one pair at a time, compares the public result,

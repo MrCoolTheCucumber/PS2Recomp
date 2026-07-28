@@ -495,7 +495,6 @@ bool VuUnit::setBackend(
         return false;
     }
     const bool automaticNative =
-        m_unitId == VuUnitId::Vu1 &&
         requested == VuBackendKind::Auto &&
         VuRecompilerBackend::supported();
     if (explicitNative || automaticNative || verification)
