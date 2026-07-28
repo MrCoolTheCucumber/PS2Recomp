@@ -21,6 +21,15 @@ Every emitted entry has the stable signature:
 uint64_t block(VuExecutionContext *context, uint32_t maximumCycles);
 ```
 
+The cache also records a separately addressed internal fast entry. The
+recompiler backend builds a `NativeContextView` once for the complete
+backend run, establishes VU floating-point mode around that run, and supplies
+the view to this internal entry. This avoids repeating the out-of-line context
+unpack and MXCSR save/setup/restore at every compiled-block boundary. The
+stable two-argument entry remains available for ABI tests and external native
+callers; it performs the complete unpack and floating-point-mode transition
+itself.
+
 The low 32 result bits are the exact number of retired instruction pairs. The
 high 32 bits contain a `VuNativeBlockExit`. Generated code:
 
@@ -50,20 +59,24 @@ mapping is used.
 
 Blocks embed their owning `VuRecompilerBackend` address. They therefore remain
 valid only while that backend and its unit-owned cache live. The cache key
-includes unit, memory/code identity, extent, entry PC, code generation, native
-feature mask, and compilation mode.
+includes unit, memory/code identity, extent, entry PC, exact whole-code content
+identity, native feature mask, and compilation mode.
 
 The backend resolves a generation-scoped cache handle immediately before each
-native call. It rechecks the unit's code generation after every call because a
-helper may publish an effect which modifies MicroMem. A change invalidates all
-resident blocks and returns `CodeInvalidated`. The current single-GameThread
-ownership contract avoids an unmeasured generation load at each pair.
+native call. Every MicroMem write advances the cache epoch and makes outstanding
+handles stale. A bounded catalog hashes the whole code image as a prefilter and
+then compares all bytes, allowing compiled blocks for an exactly recurring
+image to be rebound safely to the new generation. The backend rechecks the
+unit's code generation after every call because a helper may publish an effect
+which modifies MicroMem. A change returns `CodeInvalidated`. The current
+single-GameThread ownership contract avoids an unmeasured generation load at
+each pair.
 
 ## Instrumentation and tests
 
-An armed instruction observer, progress tracker, VIF trace, or workload profile
-uses the permanent interpreter. Normal native blocks therefore carry no
-per-pair debugger callback.
+An armed instruction observer, VIF trace, or workload profile uses the
+permanent interpreter. Aggregate progress tracking wraps the complete
+scheduler-facing unit call and does not add a per-pair native callback.
 
 An explicit supported VU1 `recompiler` selection executes through `VuUnit`.
 The unit adapter continues within one scheduler budget after an internal

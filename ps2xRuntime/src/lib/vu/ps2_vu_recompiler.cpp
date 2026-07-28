@@ -51,6 +51,18 @@ namespace
         return hash;
     }
 
+    struct NativeContextView
+    {
+        VuExecutionState *state = nullptr;
+        uint8_t *data = nullptr;
+        uint32_t dataSize = 0u;
+    };
+
+    using VuNativeFastBlockEntry = uint64_t (*)(
+        VuExecutionContext *context,
+        uint32_t maximumCycles,
+        const NativeContextView *view);
+
 #if PS2X_HAS_VU_X64_RECOMPILER
     constexpr uint32_t kMxcsrRoundingMask = 3u << 13u;
     constexpr uint32_t kMxcsrRoundTowardZero = 3u << 13u;
@@ -63,13 +75,6 @@ namespace
     constexpr uint64_t kHostFeatureAvx = 1u << 2u;
     constexpr uint64_t kHostFeatureFma = 1u << 4u;
     constexpr size_t kEmitterCapacity = 128u * 1024u;
-
-    struct NativeContextView
-    {
-        VuExecutionState *state = nullptr;
-        uint8_t *data = nullptr;
-        uint32_t dataSize = 0u;
-    };
 
     static_assert(
         std::is_standard_layout_v<VuExecutionState>);
@@ -132,6 +137,11 @@ namespace
             return m_code.getSize();
         }
 
+        [[nodiscard]] size_t fastEntryOffset() const
+        {
+            return m_fastEntryOffset;
+        }
+
     private:
         enum class KnownFmacSlot : uint8_t
         {
@@ -143,6 +153,7 @@ namespace
         std::vector<uint8_t> m_buffer;
         Xbyak::CodeGenerator m_code;
         uint64_t m_hostFeatures = 0u;
+        size_t m_fastEntryOffset = 0u;
         bool m_usesAvx = false;
 
 #if defined(_WIN32)
@@ -158,6 +169,13 @@ namespace
         static constexpr int kResultOffset = 16;
         static constexpr int kContextViewOffset = 32;
 #endif
+        static constexpr int kRawEntryFlagOffset =
+            kStackBytes - 1;
+        static_assert(
+            kContextViewOffset +
+                    static_cast<int>(
+                        sizeof(NativeContextView)) <=
+                kRawEntryFlagOffset);
 
         static constexpr int stateOffset(size_t value)
         {
@@ -2459,20 +2477,9 @@ namespace
                 dynamicExit, m_code.T_NEAR);
         }
 
-        void emit(
-            const VuIrBlock &block,
-            VuRecompilerBackend *backend,
-            const void *pairHelper,
-            const void *xgkickHelper)
+        void emitEntryFrame(
+            VuRecompilerBackend *backend)
         {
-            using namespace Xbyak;
-
-            Label cycleBudgetExit;
-            Label controlFlowExit;
-            Label dynamicExit;
-            Label packResult;
-            Label epilogue;
-
             m_code.push(m_code.rbx);
             m_code.push(m_code.r12);
             m_code.push(m_code.r13);
@@ -2491,7 +2498,17 @@ namespace
             m_code.mov(
                 m_code.r15,
                 reinterpret_cast<uint64_t>(backend));
+        }
 
+        void emitRawEntry(
+            VuRecompilerBackend *backend,
+            Xbyak::Label &body)
+        {
+            emitEntryFrame(backend);
+            m_code.mov(
+                m_code.byte[
+                    m_code.rsp + kRawEntryFlagOffset],
+                1u);
             m_code.stmxcsr(
                 m_code.dword[
                     m_code.rsp + kSavedMxcsrOffset]);
@@ -2537,6 +2554,78 @@ namespace
                     kContextViewOffset +
                     offsetof(
                         NativeContextView, state)]);
+            m_code.jmp(body, m_code.T_NEAR);
+        }
+
+        void emitFastEntry(
+            VuRecompilerBackend *backend,
+            Xbyak::Label &body)
+        {
+            emitEntryFrame(backend);
+            m_code.mov(
+                m_code.byte[
+                    m_code.rsp + kRawEntryFlagOffset],
+                0u);
+#if defined(_WIN32)
+            const Xbyak::Reg64 &view = m_code.r8;
+#else
+            const Xbyak::Reg64 &view = m_code.rdx;
+#endif
+            m_code.mov(
+                m_code.rbx,
+                m_code.qword[
+                    view +
+                    offsetof(
+                        NativeContextView, state)]);
+            m_code.mov(
+                m_code.rax,
+                m_code.qword[
+                    view +
+                    offsetof(
+                        NativeContextView, data)]);
+            m_code.mov(
+                m_code.qword[
+                    m_code.rsp +
+                    kContextViewOffset +
+                    offsetof(
+                        NativeContextView, data)],
+                m_code.rax);
+            m_code.mov(
+                m_code.eax,
+                m_code.dword[
+                    view +
+                    offsetof(
+                        NativeContextView, dataSize)]);
+            m_code.mov(
+                m_code.dword[
+                    m_code.rsp +
+                    kContextViewOffset +
+                    offsetof(
+                        NativeContextView, dataSize)],
+                m_code.eax);
+            m_code.jmp(body, m_code.T_NEAR);
+        }
+
+        void emit(
+            const VuIrBlock &block,
+            VuRecompilerBackend *backend,
+            const void *pairHelper,
+            const void *xgkickHelper)
+        {
+            using namespace Xbyak;
+
+            Label cycleBudgetExit;
+            Label controlFlowExit;
+            Label dynamicExit;
+            Label packResult;
+            Label epilogue;
+            Label body;
+            Label skipFloatModeRestore;
+
+            emitRawEntry(backend, body);
+            m_fastEntryOffset = m_code.getSize();
+            emitFastEntry(backend, body);
+            m_code.L(body);
 
             if (block.pairs.empty())
             {
@@ -2727,9 +2816,15 @@ namespace
             m_code.L(epilogue);
             if (m_usesAvx)
                 m_code.vzeroupper();
+            m_code.cmp(
+                m_code.byte[
+                    m_code.rsp + kRawEntryFlagOffset],
+                0u);
+            m_code.je(skipFloatModeRestore);
             m_code.ldmxcsr(
                 m_code.dword[
                     m_code.rsp + kSavedMxcsrOffset]);
+            m_code.L(skipFloatModeRestore);
             m_code.add(m_code.rsp, kStackBytes);
             m_code.pop(m_code.r15);
             m_code.pop(m_code.r14);
@@ -3041,13 +3136,27 @@ VuRunResult VuRecompilerBackend::run(
     }
 
     const ScopedVuFloatMode vuFloatMode;
+    VuProgramKey key;
+    if (!programKey(
+            context, VuCompilationMode::Normal,
+            key, &m_lastDiagnostic))
+    {
+        ++m_diagnostics.faultExits;
+        return finish(totalExecuted, VuExitReason::Fault);
+    }
+    const NativeContextView nativeContextView{
+        .state = &state,
+        .data = context.data,
+        .dataSize = context.dataSize,
+    };
     while (state.active && totalExecuted < maximumCycles)
     {
-        VuProgramKey key;
-        if (!programKey(
-                context, VuCompilationMode::Normal,
-                key, &m_lastDiagnostic))
+        key.entryPc = state.pc;
+        if ((key.entryPc & 7u) != 0u ||
+            key.entryPc >= key.codeSize)
         {
+            m_lastDiagnostic =
+                "native VU block entry PC is outside its code extent";
             ++m_diagnostics.faultExits;
             return finish(totalExecuted, VuExitReason::Fault);
         }
@@ -3081,8 +3190,9 @@ VuRunResult VuRecompilerBackend::run(
             return finish(totalExecuted, VuExitReason::Fault);
         }
 
-        VuNativeBlockEntry entry = nullptr;
-        const void *const address = program->nativeEntry();
+        VuNativeFastBlockEntry entry = nullptr;
+        const void *const address =
+            program->nativeFastEntry();
         static_assert(sizeof(entry) == sizeof(address));
         std::memcpy(&entry, &address, sizeof(entry));
 
@@ -3092,7 +3202,9 @@ VuRunResult VuRecompilerBackend::run(
             m_helperPairsIssued;
         const VuNativeBlockResult native =
             VuNativeBlockResult::decode(
-                entry(&context, remaining));
+                entry(
+                    &context, remaining,
+                    &nativeContextView));
         const uint64_t helperPairs =
             m_helperPairsIssued - helperPairsBefore;
         ++m_diagnostics.nativeEntries;
@@ -3524,6 +3636,8 @@ bool VuRecompilerBackend::compile(
             .block = std::move(block),
             .nativeCode = std::move(nativeCode),
             .entryOffset = 0u,
+            .fastEntryOffset =
+                emitter.fastEntryOffset(),
             .compilationNanoseconds = nanoseconds,
         };
         diagnostic.clear();

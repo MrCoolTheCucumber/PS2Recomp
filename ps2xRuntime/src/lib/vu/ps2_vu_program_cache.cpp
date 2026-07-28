@@ -83,11 +83,12 @@ VuProgramHandle VuProgramCache::insert(
     }
     if (program.nativeCode.state() !=
             VuExecutableMemoryState::Executable ||
-        !program.nativeEntry())
+        !program.nativeEntry() ||
+        !program.nativeFastEntry())
     {
         ++m_diagnostics.rejectedPrograms;
         fail(
-            "compiled program has no executable entry",
+            "compiled program has no executable entry points",
             diagnostic);
         return {};
     }

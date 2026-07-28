@@ -54,11 +54,17 @@ struct VuCompiledProgram
     VuIrBlock block;
     VuExecutableMemory nativeCode;
     size_t entryOffset = 0u;
+    size_t fastEntryOffset = 0u;
     uint64_t compilationNanoseconds = 0u;
 
     [[nodiscard]] const void *nativeEntry() const
     {
         return nativeCode.executableAddress(entryOffset);
+    }
+
+    [[nodiscard]] const void *nativeFastEntry() const
+    {
+        return nativeCode.executableAddress(fastEntryOffset);
     }
 };
 

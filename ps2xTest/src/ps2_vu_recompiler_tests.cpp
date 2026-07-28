@@ -1880,6 +1880,10 @@ void register_ps2_vu_recompiler_tests()
                     "the compiled ABI block should resolve");
                 if (!program)
                     return;
+                t.IsTrue(
+                    program->nativeFastEntry() !=
+                        program->nativeEntry(),
+                    "the internal fast entry should be distinct from the raw ABI entry");
 
                 VuNativeBlockEntry entry = nullptr;
                 const void *const address =
