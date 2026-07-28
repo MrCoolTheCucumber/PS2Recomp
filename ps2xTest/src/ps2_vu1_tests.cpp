@@ -201,6 +201,21 @@ namespace
         return makeVuLowerSpecial(0x3Bu, 0u);
     }
 
+    uint32_t makeVuMfp(uint8_t targetVf, uint8_t dest)
+    {
+        return makeVuLowerSpecial(0x64u, 0u, targetVf, 0u, dest);
+    }
+
+    uint32_t makeVuEleng(uint8_t fs)
+    {
+        return makeVuLowerSpecial(0x72u, fs);
+    }
+
+    uint32_t makeVuWaitP()
+    {
+        return makeVuLowerSpecial(0x7Bu, 0u);
+    }
+
     void writeVuInstructionPair(uint8_t *code, uint32_t pc, uint32_t lower, uint32_t upper)
     {
         std::memcpy(code + pc, &lower, sizeof(lower));
@@ -272,6 +287,11 @@ void register_ps2_vu1_tests()
                 .result = 3.5f,
                 .cyclesRemaining = 5u,
             };
+            original.pipeline.delayedP = {
+                .active = true,
+                .result = 7.25f,
+                .cyclesRemaining = 11u,
+            };
             original.pipeline.fmacFlags[2] = {
                 .active = true,
                 .mac = 0x1234u,
@@ -283,6 +303,7 @@ void register_ps2_vu1_tests()
             VuExecutionState clone = original;
             original.pipeline.xgkick.packet[0] = 0xffu;
             original.pipeline.delayedQ.result = -1.0f;
+            original.pipeline.delayedP.result = -2.0f;
             original.pipeline.fmacFlags[2].mac = 0u;
 
             t.Equals(clone.pc, uint32_t{0x138u},
@@ -297,6 +318,8 @@ void register_ps2_vu1_tests()
                      "XGKICK packet storage should be deep-copied");
             t.Equals(clone.pipeline.delayedQ.result, 3.5f,
                      "the delayed Q result should be copied");
+            t.Equals(clone.pipeline.delayedP.result, 7.25f,
+                     "the delayed P result should be copied");
             t.Equals(clone.pipeline.fmacFlags[2].mac, uint32_t{0x1234u},
                      "the fixed FMAC pipeline should be copied");
             t.Equals(clone.pipeline.fmacFlagIndex, uint8_t{1u},
@@ -1266,6 +1289,141 @@ void register_ps2_vu1_tests()
 
             vu1.resume(fx.code, PS2_VU1_CODE_SIZE, fx.data, PS2_VU1_DATA_SIZE, fx.gs, &fx.mem, 0u, 0u, 1u);
             t.Equals(vu1.state().q, 6.0f, "Q should commit on the seventh pair after DIV");
+        });
+
+        tc.Run("EFU results remain delayed until WAITP synchronizes P", [](TestCase &t)
+        {
+            Vu1Fixture fx;
+            t.IsTrue(fx.initialize(), "VU1 fixture should initialize");
+
+            writeVuInstructionPair(
+                fx.code, 0u, makeVuEleng(1u), kVuUpperNop);
+            writeVuInstructionPair(
+                fx.code, 8u, makeVuMfp(2u, 0x8u), kVuUpperNop);
+            writeVuInstructionPair(
+                fx.code, 16u, makeVuWaitP(), kVuUpperNop);
+            writeVuInstructionPair(
+                fx.code, 24u, makeVuMfp(3u, 0x8u), kVuUpperNop);
+
+            VuUnit vu1;
+            vu1.state().p = 2.0f;
+            vu1.state().vf[1][0] = 3.0f;
+            vu1.state().vf[1][1] = 4.0f;
+
+            vu1.execute(
+                fx.code, PS2_VU1_CODE_SIZE,
+                fx.data, PS2_VU1_DATA_SIZE,
+                fx.gs, &fx.mem, 0u, 0u, 0u, 1u);
+            t.Equals(
+                vu1.state().p, 2.0f,
+                "ELENG should retain the old architectural P");
+            t.IsTrue(
+                vu1.state().pipeline.delayedP.active,
+                "ELENG should leave its result in the EFU pipeline");
+            t.Equals(
+                vu1.state().pipeline.delayedP.cyclesRemaining,
+                uint32_t{18u},
+                "ELENG should schedule the documented eighteen-cycle latency");
+
+            vu1.resume(
+                fx.code, PS2_VU1_CODE_SIZE,
+                fx.data, PS2_VU1_DATA_SIZE,
+                fx.gs, &fx.mem, 0u, 0u, 1u);
+            t.Equals(
+                vu1.state().vf[2][0], 2.0f,
+                "MFP without WAITP should observe the old P");
+
+            vu1.resume(
+                fx.code, PS2_VU1_CODE_SIZE,
+                fx.data, PS2_VU1_DATA_SIZE,
+                fx.gs, &fx.mem, 0u, 0u, 1u);
+            t.Equals(
+                vu1.state().p, 5.0f,
+                "WAITP should commit the pending ELENG result");
+            t.IsFalse(
+                vu1.state().pipeline.delayedP.active,
+                "WAITP should drain the EFU pipeline");
+
+            vu1.resume(
+                fx.code, PS2_VU1_CODE_SIZE,
+                fx.data, PS2_VU1_DATA_SIZE,
+                fx.gs, &fx.mem, 0u, 0u, 1u);
+            t.Equals(
+                vu1.state().vf[3][0], 5.0f,
+                "MFP after WAITP should observe the ELENG result");
+        });
+
+        tc.Run("ELENG result becomes visible after eighteen following pairs", [](TestCase &t)
+        {
+            Vu1Fixture fx;
+            t.IsTrue(fx.initialize(), "VU1 fixture should initialize");
+
+            writeVuInstructionPair(
+                fx.code, 0u, makeVuEleng(1u), kVuUpperNop);
+            for (uint32_t pc = 8u; pc <= 144u; pc += 8u)
+            {
+                writeVuInstructionPair(
+                    fx.code, pc, 0u, kVuUpperNop);
+            }
+
+            VuUnit vu1;
+            vu1.state().p = 2.0f;
+            vu1.state().vf[1][0] = 3.0f;
+            vu1.state().vf[1][1] = 4.0f;
+
+            vu1.execute(
+                fx.code, PS2_VU1_CODE_SIZE,
+                fx.data, PS2_VU1_DATA_SIZE,
+                fx.gs, &fx.mem, 0u, 0u, 0u, 18u);
+            t.Equals(
+                vu1.state().p, 2.0f,
+                "P should remain old through seventeen following pairs");
+            t.Equals(
+                vu1.state().pipeline.delayedP.cyclesRemaining,
+                uint32_t{1u},
+                "one ELENG latency cycle should remain");
+
+            vu1.resume(
+                fx.code, PS2_VU1_CODE_SIZE,
+                fx.data, PS2_VU1_DATA_SIZE,
+                fx.gs, &fx.mem, 0u, 0u, 1u);
+            t.Equals(
+                vu1.state().p, 5.0f,
+                "P should commit on the eighteenth following pair");
+            t.IsFalse(
+                vu1.state().pipeline.delayedP.active,
+                "natural latency completion should drain the EFU pipeline");
+        });
+
+        tc.Run("E-bit completion drains a pending EFU result", [](TestCase &t)
+        {
+            Vu1Fixture fx;
+            t.IsTrue(fx.initialize(), "VU1 fixture should initialize");
+
+            writeVuInstructionPair(
+                fx.code, 0u, makeVuEleng(1u),
+                kVuUpperNop | kVuUpperEnd);
+            writeVuInstructionPair(
+                fx.code, 8u, 0u, kVuUpperNop);
+
+            VuUnit vu1;
+            vu1.state().p = 2.0f;
+            vu1.state().vf[1][0] = 3.0f;
+            vu1.state().vf[1][1] = 4.0f;
+
+            vu1.execute(
+                fx.code, PS2_VU1_CODE_SIZE,
+                fx.data, PS2_VU1_DATA_SIZE,
+                fx.gs, &fx.mem, 0u, 0u, 0u, 2u);
+            t.Equals(
+                vu1.state().p, 5.0f,
+                "program completion should publish the pending P result");
+            t.IsFalse(
+                vu1.state().pipeline.delayedP.active,
+                "program completion should drain the EFU pipeline");
+            t.IsFalse(
+                vu1.isActive(),
+                "the E-bit delay pair should complete normally");
         });
 
         tc.Run("MPG upload invalidates cached VU1 decode before MSCAL", [](TestCase &t)

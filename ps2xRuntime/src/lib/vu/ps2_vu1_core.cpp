@@ -40,6 +40,23 @@ namespace
         }
     }
 
+    bool vuLowerWaitsForP(uint32_t lower)
+    {
+        switch (vuLowerSpecialOp(lower))
+        {
+        case 0x70u: // ESADD
+        case 0x71u: // ERSADD
+        case 0x72u: // ELENG
+        case 0x73u: // ERLENG
+        case 0x7au: // ERCPR
+        case 0x7bu: // WAITP
+        case 0x7du: // EATAN
+            return true;
+        default:
+            return false;
+        }
+    }
+
     class ScopedVuFloatMode
     {
     public:
@@ -654,15 +671,20 @@ VuRunResult VuInterpreterBackend::run(
         }
 
         // DIV/SQRT results are written to Q seven cycles after issue
-        // (RSQRT takes thirteen). The instruction observer deliberately runs
-        // first because the architectural Q write occurs after the current
-        // pair has been fetched. A new FDIV operation or WAITQ stalls until
-        // the previous result is available, and its paired upper instruction
-        // can consume that result.
+        // (RSQRT takes thirteen). EFU results similarly remain held outside
+        // architectural P for their documented latency. The instruction
+        // observer deliberately runs first because pipeline writes occur
+        // after the current pair has been fetched. A new operation on the
+        // same scalar unit, WAITQ, or WAITP drains the prior result before
+        // the current pair executes. There is no implicit P dependency for
+        // MFP; VU microcode must synchronize it explicitly with WAITP.
         advanceQPipeline();
+        advancePPipeline();
         advanceFmacFlagPipeline();
         if (!decoded.iBit && vuLowerWaitsForQ(decoded.lower))
             flushQPipeline();
+        if (!decoded.iBit && vuLowerWaitsForP(decoded.lower))
+            flushPPipeline();
 
         // Integer writes such as MTIR and auto-incrementing loads/stores expose
         // the pre-update VI value to a branch in the immediately following
@@ -754,6 +776,7 @@ VuRunResult VuInterpreterBackend::run(
                     vuData, dataSize, sideEffects, memory, 0u, true);
             }
             flushQPipeline();
+            flushPPipeline();
             flushFmacFlagPipeline();
             state.viBackupCycles = 0u;
             ended = true;
@@ -821,6 +844,45 @@ void VuInterpreterBackend::scheduleQ(float result, uint32_t latency)
 {
     VuExecutionState &state = *m_state;
     state.pipeline.delayedQ = {
+        .active = true,
+        .result = result,
+        .cyclesRemaining = latency,
+    };
+}
+
+void VuInterpreterBackend::advancePPipeline()
+{
+    VuExecutionState &state = *m_state;
+    VuPipelineState::DelayedP &delayedP =
+        state.pipeline.delayedP;
+    if (!delayedP.active)
+        return;
+
+    if (delayedP.cyclesRemaining != 0u)
+        --delayedP.cyclesRemaining;
+    if (delayedP.cyclesRemaining != 0u)
+        return;
+
+    state.p = delayedP.result;
+    delayedP = {};
+}
+
+void VuInterpreterBackend::flushPPipeline()
+{
+    VuExecutionState &state = *m_state;
+    VuPipelineState::DelayedP &delayedP =
+        state.pipeline.delayedP;
+    if (!delayedP.active)
+        return;
+    state.p = delayedP.result;
+    delayedP = {};
+}
+
+void VuInterpreterBackend::scheduleP(
+    float result, uint32_t latency)
+{
+    VuExecutionState &state = *m_state;
+    state.pipeline.delayedP = {
         .active = true,
         .result = result,
         .cyclesRemaining = latency,

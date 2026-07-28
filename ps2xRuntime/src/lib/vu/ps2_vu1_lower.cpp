@@ -603,21 +603,29 @@ void VuInterpreterBackend::execLower(
             case 0x72: // ELENG
             {
                 float s = state.vf[vfS][0] * state.vf[vfS][0] + state.vf[vfS][1] * state.vf[vfS][1] + state.vf[vfS][2] * state.vf[vfS][2];
-                state.p = std::sqrt(s);
+                scheduleP(std::sqrt(s), 18u);
                 return;
             }
             case 0x73: // ERLENG
             {
                 float s = state.vf[vfS][0] * state.vf[vfS][0] + state.vf[vfS][1] * state.vf[vfS][1] + state.vf[vfS][2] * state.vf[vfS][2];
                 float len = std::sqrt(s);
-                state.p = (len != 0.0f) ? (1.0f / len) : std::numeric_limits<float>::max();
+                scheduleP(
+                    (len != 0.0f)
+                        ? (1.0f / len)
+                        : std::numeric_limits<float>::max(),
+                    24u);
                 return;
             }
             case 0x7A: // ERCPR
             {
                 int fsf = (instr >> 21) & 0x3;
                 float val = state.vf[vfS][fsf];
-                state.p = (val != 0.0f) ? (1.0f / val) : std::numeric_limits<float>::max();
+                scheduleP(
+                    (val != 0.0f)
+                        ? (1.0f / val)
+                        : std::numeric_limits<float>::max(),
+                    12u);
                 return;
             }
             case 0x7B: // WAITP

@@ -33,6 +33,13 @@ struct VuPipelineState
         uint32_t cyclesRemaining = 0;
     };
 
+    struct DelayedP
+    {
+        bool active = false;
+        float result = 0.0f;
+        uint32_t cyclesRemaining = 0;
+    };
+
     struct FmacFlags
     {
         bool active = false;
@@ -44,6 +51,7 @@ struct VuPipelineState
 
     Xgkick xgkick;
     DelayedQ delayedQ;
+    DelayedP delayedP;
     std::array<FmacFlags, kFmacFlagStages> fmacFlags{};
     uint8_t fmacFlagIndex = 0u;
     uint32_t workingMac = 0u;
@@ -295,6 +303,9 @@ private:
     void advanceQPipeline();
     void flushQPipeline();
     void scheduleQ(float result, uint32_t latency);
+    void advancePPipeline();
+    void flushPPipeline();
+    void scheduleP(float result, uint32_t latency);
     void advanceFmacFlagPipeline();
     void flushFmacFlagPipeline();
     void commitFmacFlags(const VuPipelineState::FmacFlags &pending);
