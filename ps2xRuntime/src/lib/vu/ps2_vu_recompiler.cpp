@@ -86,6 +86,8 @@ namespace
         16384u;
     constexpr uint32_t
         kAutomaticVfAccessesPerBoundaryOperation = 5u;
+    constexpr uint8_t
+        kMaximumBlockLocalVfRegisters = 3u;
     std::atomic<uint64_t> g_nextCompilationIdentity{1u};
 
     bool environmentFlagEnabled(const char *value)
@@ -328,6 +330,7 @@ namespace
     public:
         X64VuBlockEmitter(
             const VuIrBlock &block,
+            const VuAnalysisBlock *analysis,
             VuRecompilerBackend *backend,
             const void *pairHelper,
             const void *xgkickHelper,
@@ -352,6 +355,7 @@ namespace
               m_instrumented(
                   compilationMode ==
                   VuCompilationMode::Instrumented),
+              m_analysis(analysis),
               m_backend(backend),
               m_outgoingLinks(outgoingLinks),
               m_chainRuntime(chainRuntime),
@@ -426,6 +430,7 @@ namespace
         uint64_t m_hostFeatures = 0u;
         uint32_t m_codeAddressMask = 0x3fffu;
         bool m_instrumented = false;
+        const VuAnalysisBlock *m_analysis = nullptr;
         VuRecompilerBackend *m_backend = nullptr;
         VuNativeLinkState *m_outgoingLinks = nullptr;
         VuNativeChainRuntime *m_chainRuntime = nullptr;
@@ -441,9 +446,11 @@ namespace
         bool m_usesAvx = false;
 
 #if defined(_WIN32)
-        static constexpr int kBaseStackBytes = 96;
+        static constexpr int kRawEntryFlagOffset = 95;
+        static constexpr int kHelperVfSpillOffset = 96;
+        static constexpr int kBaseStackBytes = 144;
         static constexpr int
-            kSavedVectorRegistersOffset = 96;
+            kSavedVectorRegistersOffset = 144;
         static constexpr int
             kRegisterStackBytes = 176;
         static constexpr int kSavedMxcsrOffset = 32;
@@ -452,7 +459,9 @@ namespace
         static constexpr int kContextViewOffset = 64;
         static constexpr int kPrecisePairCountOffset = 40;
 #else
-        static constexpr int kBaseStackBytes = 64;
+        static constexpr int kRawEntryFlagOffset = 63;
+        static constexpr int kHelperVfSpillOffset = 64;
+        static constexpr int kBaseStackBytes = 112;
         static constexpr int kRegisterStackBytes = 0;
         static constexpr int kSavedMxcsrOffset = 0;
         static constexpr int kVuMxcsrOffset = 4;
@@ -468,25 +477,35 @@ namespace
                      ? 8
                      : 0) +
                 (m_registerAllocation.
-                         vfRegisterCount > 3u
+                         vfRegisterCount >
+                     kMaximumBlockLocalVfRegisters
                      ? kRegisterStackBytes
                      : 0);
         }
 
         [[nodiscard]] int rawEntryFlagOffset() const
         {
-            return stackBytes() - 1;
+            return kRawEntryFlagOffset;
         }
 
+        static_assert(
+            kRawEntryFlagOffset <
+                kHelperVfSpillOffset);
+        static_assert(
+            kHelperVfSpillOffset +
+                    static_cast<int>(
+                        kMaximumBlockLocalVfRegisters) *
+                        16 <=
+                kBaseStackBytes);
         static_assert(
             kContextViewOffset +
                     static_cast<int>(
                         sizeof(NativeContextView)) <=
-                kBaseStackBytes - 1);
+                kRawEntryFlagOffset);
         static_assert(
             kPrecisePairCountOffset +
                     static_cast<int>(sizeof(uint64_t)) <=
-                kBaseStackBytes - 1);
+                kRawEntryFlagOffset);
         static_assert(
             kPrecisePairCountOffset +
                         static_cast<int>(
@@ -571,6 +590,20 @@ namespace
         residentViWord() const
         {
             return m_code.bp;
+        }
+
+        static uint32_t vfResourceMask(
+            const std::array<uint8_t, 32u> &lanes)
+        {
+            uint32_t mask = 0u;
+            for (uint32_t reg = 1u;
+                 reg < lanes.size();
+                 ++reg)
+            {
+                if (lanes[reg] != 0u)
+                    mask |= uint32_t{1u} << reg;
+            }
+            return mask;
         }
 
         void emitReadVi(
@@ -729,15 +762,12 @@ namespace
                             cause)]);
         }
 
-        void emitLoadResidentRegisters(
-            bool reload = false,
-            bool includeVi = true)
+        void emitLoadResidentRegisters()
         {
             if (m_registerAllocation.
                         vfRegisterCount == 0u &&
-                (!includeVi ||
-                 m_registerAllocation.
-                         viRegisterCount == 0u))
+                m_registerAllocation.
+                        viRegisterCount == 0u)
             {
                 return;
             }
@@ -750,15 +780,6 @@ namespace
                     vfRegisterLoads),
                 m_registerAllocation.
                     vfRegisterCount);
-            if (reload)
-            {
-                emitAddBlockProfileCounter(
-                    offsetof(
-                        VuBlockProfileRecord,
-                        vfRegisterReloads),
-                    m_registerAllocation.
-                        vfRegisterCount);
-            }
             for (uint8_t slot = 0u;
                  slot <
                      m_registerAllocation.
@@ -774,9 +795,8 @@ namespace
                         m_code.rbx +
                         vfOffset(reg)]);
             }
-            if (includeVi &&
-                m_registerAllocation.
-                        viRegisterCount != 0u)
+            if (m_registerAllocation.
+                    viRegisterCount != 0u)
             {
                 const uint8_t reg =
                     m_registerAllocation.
@@ -792,11 +812,28 @@ namespace
 
         void emitMaterializeResidentRegisters(
             VuRegisterMaterializationCause cause,
-            bool spill,
-            bool includeVi = true)
+            bool includeVi = true,
+            uint32_t vfMask =
+                std::numeric_limits<uint32_t>::max(),
+            bool recordCause = true)
         {
-            if (m_registerAllocation.
-                        vfRegisterCount == 0u &&
+            uint32_t vfRegisterCount = 0u;
+            for (uint8_t slot = 0u;
+                 slot <
+                     m_registerAllocation.
+                         vfRegisterCount;
+                 ++slot)
+            {
+                const uint8_t reg =
+                    m_registerAllocation.
+                        vfRegisters[slot];
+                vfRegisterCount +=
+                    (vfMask &
+                     (uint32_t{1u} << reg)) != 0u
+                        ? 1u
+                        : 0u;
+            }
+            if (vfRegisterCount == 0u &&
                 (!includeVi ||
                  m_registerAllocation.
                          viRegisterCount == 0u))
@@ -813,6 +850,11 @@ namespace
                 const uint8_t reg =
                     m_registerAllocation.
                         vfRegisters[slot];
+                if ((vfMask &
+                     (uint32_t{1u} << reg)) == 0u)
+                {
+                    continue;
+                }
                 storeCount +=
                     m_registerAllocation.
                             vfDirtyLanes[reg] != 0u
@@ -822,20 +864,13 @@ namespace
             Xbyak::Label done;
             m_code.test(m_code.rbx, m_code.rbx);
             m_code.jz(done, m_code.T_NEAR);
-            emitProfileMaterialization(cause);
+            if (recordCause)
+                emitProfileMaterialization(cause);
             emitAddBlockProfileCounter(
                 offsetof(
                     VuBlockProfileRecord,
                     vfRegisterStores),
                 storeCount);
-            if (spill)
-            {
-                emitAddBlockProfileCounter(
-                    offsetof(
-                        VuBlockProfileRecord,
-                        vfRegisterSpills),
-                    storeCount);
-            }
             for (uint8_t slot = 0u;
                  slot <
                      m_registerAllocation.
@@ -845,6 +880,11 @@ namespace
                 const uint8_t reg =
                     m_registerAllocation.
                         vfRegisters[slot];
+                if ((vfMask &
+                     (uint32_t{1u} << reg)) == 0u)
+                {
+                    continue;
+                }
                 const uint8_t lanes =
                     m_registerAllocation.
                         vfDirtyLanes[reg];
@@ -880,10 +920,247 @@ namespace
             m_code.L(done);
         }
 
+        void emitBeginHelperVfSpill(
+            VuRegisterMaterializationCause cause,
+            uint32_t preservedVfMask)
+        {
+            const uint8_t registerCount =
+                m_registerAllocation.
+                    vfRegisterCount;
+            if (registerCount == 0u)
+                return;
+
+            uint32_t preservedRegisterCount = 0u;
+            for (uint8_t slot = 0u;
+                 slot < registerCount;
+                 ++slot)
+            {
+                const uint8_t reg =
+                    m_registerAllocation.
+                        vfRegisters[slot];
+                preservedRegisterCount +=
+                    (preservedVfMask &
+                     (uint32_t{1u} << reg)) != 0u
+                        ? 1u
+                        : 0u;
+            }
+            emitProfileMaterialization(cause);
+            emitAddBlockProfileCounter(
+                offsetof(
+                    VuBlockProfileRecord,
+                    vfRegisterSpills),
+                preservedRegisterCount);
+            for (uint8_t slot = 0u;
+                 slot < registerCount;
+                 ++slot)
+            {
+                const uint8_t reg =
+                    m_registerAllocation.
+                        vfRegisters[slot];
+                if ((preservedVfMask &
+                     (uint32_t{1u} << reg)) == 0u)
+                {
+                    continue;
+                }
+                m_code.movups(
+                    m_code.ptr[
+                        m_code.rsp +
+                        kHelperVfSpillOffset +
+                        static_cast<int>(
+                            slot * 16u)],
+                    residentVf(reg));
+            }
+        }
+
+        void emitRestoreHelperVfSpill(
+            const std::array<uint8_t, 32u>
+                &writtenLanes,
+            uint32_t preservedVfMask,
+            bool mayNotHaveExecuted)
+        {
+            const uint8_t registerCount =
+                m_registerAllocation.
+                    vfRegisterCount;
+            if (registerCount == 0u)
+                return;
+
+            uint32_t preservedRegisterCount = 0u;
+            uint32_t writtenRegisterCount = 0u;
+            uint32_t executedCanonicalLoads = 0u;
+            uint32_t executedStackReloads = 0u;
+            for (uint8_t slot = 0u;
+                 slot < registerCount;
+                 ++slot)
+            {
+                const uint8_t reg =
+                    m_registerAllocation.
+                        vfRegisters[slot];
+                const bool preserved =
+                    (preservedVfMask &
+                     (uint32_t{1u} << reg)) != 0u;
+                const uint8_t lanes =
+                    writtenLanes[reg];
+                preservedRegisterCount +=
+                    preserved ? 1u : 0u;
+                writtenRegisterCount +=
+                    lanes != 0u ? 1u : 0u;
+                executedCanonicalLoads +=
+                    !preserved || lanes != 0u
+                        ? 1u
+                        : 0u;
+                executedStackReloads +=
+                    preserved && lanes != 0x0fu
+                        ? 1u
+                        : 0u;
+            }
+
+            const auto restoreSaved =
+                [&]()
+                {
+                    emitAddBlockProfileCounter(
+                        offsetof(
+                            VuBlockProfileRecord,
+                            vfRegisterLoads),
+                        registerCount -
+                            preservedRegisterCount);
+                    emitAddBlockProfileCounter(
+                        offsetof(
+                            VuBlockProfileRecord,
+                            vfRegisterReloads),
+                        preservedRegisterCount);
+                    for (uint8_t slot = 0u;
+                         slot < registerCount;
+                         ++slot)
+                    {
+                        const uint8_t reg =
+                            m_registerAllocation.
+                                vfRegisters[slot];
+                        if ((preservedVfMask &
+                             (uint32_t{1u} << reg)) !=
+                            0u)
+                        {
+                            m_code.movups(
+                                residentVf(reg),
+                                m_code.ptr[
+                                    m_code.rsp +
+                                    kHelperVfSpillOffset +
+                                    static_cast<int>(
+                                        slot * 16u)]);
+                        }
+                        else
+                        {
+                            m_code.movups(
+                                residentVf(reg),
+                                m_code.ptr[
+                                    m_code.rbx +
+                                    vfOffset(reg)]);
+                        }
+                    }
+                };
+            const auto restoreExecuted =
+                [&]()
+                {
+                    emitAddBlockProfileCounter(
+                        offsetof(
+                            VuBlockProfileRecord,
+                            vfRegisterLoads),
+                        executedCanonicalLoads);
+                    emitAddBlockProfileCounter(
+                        offsetof(
+                            VuBlockProfileRecord,
+                            vfRegisterReloads),
+                        executedStackReloads);
+                    for (uint8_t slot = 0u;
+                         slot < registerCount;
+                         ++slot)
+                    {
+                        const uint8_t reg =
+                            m_registerAllocation.
+                                vfRegisters[slot];
+                        const uint8_t lanes =
+                            writtenLanes[reg];
+                        const bool preserved =
+                            (preservedVfMask &
+                             (uint32_t{1u} << reg)) !=
+                            0u;
+                        if (!preserved ||
+                            lanes == 0x0fu)
+                        {
+                            m_code.movups(
+                                residentVf(reg),
+                                m_code.ptr[
+                                    m_code.rbx +
+                                    vfOffset(reg)]);
+                        }
+                        else if (lanes == 0u)
+                        {
+                            m_code.movups(
+                                residentVf(reg),
+                                m_code.ptr[
+                                    m_code.rsp +
+                                    kHelperVfSpillOffset +
+                                    static_cast<int>(
+                                        slot * 16u)]);
+                        }
+                        else
+                        {
+                            m_code.movups(
+                                residentVf(reg),
+                                m_code.ptr[
+                                    m_code.rsp +
+                                    kHelperVfSpillOffset +
+                                    static_cast<int>(
+                                        slot * 16u)]);
+                            m_code.movups(
+                                m_code.xmm0,
+                                m_code.ptr[
+                                    m_code.rbx +
+                                    vfOffset(reg)]);
+                            m_code.blendps(
+                                residentVf(reg),
+                                m_code.xmm0,
+                                blendMask(lanes));
+                        }
+                    }
+                };
+
+            if (mayNotHaveExecuted &&
+                writtenRegisterCount != 0u)
+            {
+                Xbyak::Label notExecuted;
+                Xbyak::Label restored;
+                m_code.test(
+                    m_code.r11d,
+                    kNativePairExecuted);
+                m_code.jz(
+                    notExecuted,
+                    m_code.T_NEAR);
+                restoreExecuted();
+                m_code.jmp(
+                    restored, m_code.T_NEAR);
+                m_code.L(notExecuted);
+                restoreSaved();
+                m_code.L(restored);
+            }
+            else
+            {
+                restoreExecuted();
+            }
+        }
+
         void emitLoadVf(
             uint8_t reg,
             const Xbyak::Xmm &destination)
         {
+            if (reg == 0u)
+            {
+                m_code.mov(
+                    m_code.eax, 0x3f800000u);
+                m_code.movd(
+                    destination, m_code.eax);
+                m_code.pslldq(destination, 12u);
+                return;
+            }
             if (hasResidentVf(reg))
             {
                 m_code.movaps(
@@ -2758,13 +3035,28 @@ namespace
                     offsetof(VuExecutionState, i));
 
             emitLoadVf(source, m_code.xmm0);
+            const auto emitLoadRightVf =
+                [&]()
+                {
+                    if (right == source)
+                    {
+                        m_code.movaps(
+                            m_code.xmm1,
+                            m_code.xmm0);
+                    }
+                    else
+                    {
+                        emitLoadVf(
+                            right, m_code.xmm1);
+                    }
+                };
             switch (rightSource)
             {
             case RightSource::Vector:
-                emitLoadVf(right, m_code.xmm1);
+                emitLoadRightVf();
                 break;
             case RightSource::Broadcast:
-                emitLoadVf(right, m_code.xmm1);
+                emitLoadRightVf();
                 m_code.shufps(
                     m_code.xmm1, m_code.xmm1,
                     static_cast<uint8_t>(
@@ -3269,10 +3561,14 @@ namespace
                 noActiveXgkick, m_code.T_NEAR);
 
             m_code.L(callXgkickHelper);
-            emitMaterializeResidentRegisters(
+            const uint32_t preservedVfMask =
+                vfResourceMask(
+                    m_registerAllocation.
+                        vfDirtyLanes);
+            emitBeginHelperVfSpill(
                 VuRegisterMaterializationCause::
                     XgkickHelper,
-                true, false);
+                preservedVfMask);
             if (m_usesAvx)
                 m_code.vzeroupper();
 #if defined(_WIN32)
@@ -3294,8 +3590,10 @@ namespace
                     xgkickHelper));
             m_code.call(m_code.rax);
             m_code.mov(m_code.r11d, m_code.eax);
-            emitLoadResidentRegisters(
-                true, false);
+            emitRestoreHelperVfSpill(
+                std::array<uint8_t, 32u>{},
+                preservedVfMask,
+                false);
             m_code.L(noActiveXgkick);
 
             const uint32_t nextPc =
@@ -3369,15 +3667,29 @@ namespace
 
         void emitHelperPair(
             const VuIrInstructionPair &pair,
+            const VuAnalysisPair &analysis,
             const void *pairHelper,
             Xbyak::Label &dynamicExit,
             bool preciseBudget,
             bool checkedBudget)
         {
+            const uint32_t helperVfReads =
+                vfResourceMask(
+                    analysis.reads.vf);
+            const uint32_t preservedVfMask =
+                vfResourceMask(
+                    m_registerAllocation.
+                        vfDirtyLanes) &
+                ~helperVfReads;
             emitMaterializeResidentRegisters(
                 VuRegisterMaterializationCause::
                     PairHelper,
-                true);
+                true, helperVfReads,
+                false);
+            emitBeginHelperVfSpill(
+                VuRegisterMaterializationCause::
+                    PairHelper,
+                preservedVfMask);
             if (m_usesAvx)
                 m_code.vzeroupper();
             const uint64_t words =
@@ -3409,7 +3721,9 @@ namespace
             m_code.call(m_code.rax);
 
             m_code.mov(m_code.r11d, m_code.eax);
-            emitLoadResidentRegisters(true);
+            emitRestoreHelperVfSpill(
+                analysis.writes.vf,
+                preservedVfMask, true);
             m_code.test(
                 m_code.r11d,
                 kNativePairExecuted);
@@ -4054,6 +4368,10 @@ namespace
             Label skipFloatModeRestore;
             Label inlineXgkickProgression;
 
+            VuAnalysisPair conservativePairAnalysis;
+            conservativePairAnalysis.reads.vf.fill(0x0fu);
+            conservativePairAnalysis.writes.vf.fill(0x0fu);
+
             emitRawEntry(body);
             m_fastEntryOffset = m_code.getSize();
             emitFastEntry(body);
@@ -4174,6 +4492,20 @@ namespace
                     {
                         const VuIrInstructionPair &pair =
                             block.pairs[pairIndex];
+                        const VuAnalysisPair
+                            *const pairAnalysis =
+                                m_analysis &&
+                                        pairIndex <
+                                            m_analysis->
+                                                pairs.size()
+                                    ? &m_analysis->
+                                           pairs[pairIndex]
+                                    : nullptr;
+                        const VuAnalysisPair
+                            &helperAnalysis =
+                                pairAnalysis
+                                    ? *pairAnalysis
+                                    : conservativePairAnalysis;
                         if (checkedBudget)
                         {
                             m_code.cmp(
@@ -4278,7 +4610,9 @@ namespace
                                     done, m_code.T_NEAR);
                                 m_code.L(fallback);
                                 emitHelperPair(
-                                    pair, pairHelper,
+                                    pair,
+                                    helperAnalysis,
+                                    pairHelper,
                                     dynamicExit,
                                     preciseBudget,
                                     checkedBudget);
@@ -4304,7 +4638,9 @@ namespace
                         else
                         {
                             emitHelperPair(
-                                pair, pairHelper, dynamicExit,
+                                pair,
+                                helperAnalysis,
+                                pairHelper, dynamicExit,
                                 preciseBudget,
                                 checkedBudget);
                         }
@@ -4465,15 +4801,13 @@ namespace
                     m_code.L(linkOrComplete);
                     emitMaterializeResidentRegisters(
                         VuRegisterMaterializationCause::
-                            LinkBoundary,
-                        false);
+                            LinkBoundary);
                     emitLinkOrComplete(packResult);
 
                     m_code.L(materializeAndPack);
                     emitMaterializeResidentRegisters(
                         VuRegisterMaterializationCause::
-                            CanonicalExit,
-                        false);
+                            CanonicalExit);
                     m_code.jmp(
                         packResult, m_code.T_NEAR);
                 };
@@ -6180,9 +6514,12 @@ bool VuRecompilerBackend::compile(
         return false;
     }
     VuAnalysisRegisterAllocation registerAllocation;
+    VuAnalysisBlock registerAnalysis;
+    const VuAnalysisBlock *registerAnalysisPointer =
+        nullptr;
     if (key.blockLocalVfRegisters)
     {
-        const VuAnalysisBlock analysis =
+        registerAnalysis =
             analyzeVuIrBlock(
                 block,
                 VuAnalysisConfiguration{
@@ -6200,7 +6537,8 @@ bool VuRecompilerBackend::compile(
             }
             ++retiringPairs;
         }
-        if (analysis.fixedPairs != retiringPairs)
+        if (registerAnalysis.fixedPairs !=
+            retiringPairs)
         {
             diagnostic =
                 "VU register analysis lost the exact IR block extent";
@@ -6208,8 +6546,11 @@ bool VuRecompilerBackend::compile(
         }
         registerAllocation =
             allocateVuAnalysisRegisters(
-                analysis, 3u, 0u,
+                registerAnalysis,
+                kMaximumBlockLocalVfRegisters, 0u,
                 m_blockLocalVfRegistersAutomatic);
+        registerAnalysisPointer =
+            &registerAnalysis;
         if (m_blockLocalVfRegistersAutomatic &&
             !vuAnalysisVfAllocationAmortizesBoundaries(
                 registerAllocation,
@@ -6326,7 +6667,8 @@ bool VuRecompilerBackend::compile(
                       &VuRecompilerBackend::
                           executePairThunk);
         X64VuBlockEmitter emitter(
-            block, this, pairHelper,
+            block, registerAnalysisPointer,
+            this, pairHelper,
             reinterpret_cast<const void *>(
                 &VuRecompilerBackend::
                     advanceXgkickThunk),

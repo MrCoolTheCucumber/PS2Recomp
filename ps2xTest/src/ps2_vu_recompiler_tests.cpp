@@ -323,6 +323,37 @@ namespace
             code, 88u, 0u, kVuUpperNop);
     }
 
+    void configureHelperRegisterProgram(uint8_t *code)
+    {
+        writePair(
+            code, 0u, 0u,
+            makeVuUpper(
+                0x28u, 0xfu, 2u, 1u, 3u));
+        writePair(
+            code, 8u, 0u,
+            makeVuUpper(
+                0x28u, 0xfu, 2u, 2u, 2u));
+        writePair(
+            code, 16u, 0u,
+            makeVuUpper(
+                0x28u, 0xfu, 2u, 3u, 1u));
+
+        const float immediate = 0.5f;
+        uint32_t immediateBits = 0u;
+        std::memcpy(
+            &immediateBits, &immediate,
+            sizeof(immediateBits));
+        writePair(
+            code, 24u, immediateBits,
+            makeVuUpper(
+                0x22u, 0x5u, 0u, 1u, 3u) |
+                0x80000000u);
+        writePair(
+            code, 32u, 0u,
+            makeVuUpper(
+                0x28u, 0xfu, 2u, 3u, 4u));
+    }
+
     VuExecutionState initialSyntheticState()
     {
         VuUnit seed(VuUnitId::Vu1);
@@ -4613,6 +4644,192 @@ void register_ps2_vu_recompiler_tests()
             });
 
         tc.Run(
+            "native constants ignore VF0 and VI0 backing storage",
+            [](TestCase &t)
+            {
+                if (!VuRecompilerBackend::supported())
+                    return;
+
+                VuNativeFixture fixture;
+                t.IsTrue(
+                    fixture.initialize(),
+                    "constant fixture should initialize");
+                writePair(
+                    fixture.code, 0u,
+                    makeVuIaddiu(1u, 0u, 7),
+                    makeVuUpper(
+                        0x28u, 0xfu,
+                        0u, 0u, 1u));
+                fixture.markCodeModified();
+
+                VuUnit unit(VuUnitId::Vu1);
+                VuRecompilerBackend backend(unit);
+                VuExecutionState state =
+                    initialSyntheticState();
+                const std::array<float, 4u> poisonedVf0{
+                    11.0f, 12.0f, 13.0f, 14.0f};
+                std::memcpy(
+                    state.vf[0], poisonedVf0.data(),
+                    sizeof(state.vf[0]));
+                state.vi[0] = 123;
+                VuTransactionalSideEffectSink effects;
+                VuExecutionContext context =
+                    makeContext(state, fixture, effects);
+
+                const VuRunResult result =
+                    backend.run(context, 1u);
+                t.Equals(
+                    result.executedCycles, uint32_t{1u},
+                    "the constant pair should retire");
+                const std::array<float, 4u> expectedVf1{
+                    0.0f, 0.0f, 0.0f, 2.0f};
+                t.IsTrue(
+                    std::memcmp(
+                        state.vf[1],
+                        expectedVf1.data(),
+                        sizeof(state.vf[1])) == 0,
+                    "VF0 should be materialized as [0,0,0,1]");
+                t.Equals(
+                    state.vi[1], int32_t{7},
+                    "VI0 should be materialized as zero");
+                const std::array<float, 4u> expectedVf0{
+                    0.0f, 0.0f, 0.0f, 1.0f};
+                t.IsTrue(
+                    std::memcmp(
+                        state.vf[0],
+                        expectedVf0.data(),
+                        sizeof(state.vf[0])) == 0,
+                    "the pair should restore architectural VF0");
+                t.Equals(
+                    state.vi[0], int32_t{0},
+                    "the pair should restore architectural VI0");
+                t.Equals(
+                    backend.diagnostics().helperPairs,
+                    uint64_t{0u},
+                    "the constant forms should remain inline");
+            });
+
+        tc.Run(
+            "helper barriers preserve selective resident VF state",
+            [](TestCase &t)
+            {
+                if (!VuRecompilerBackend::supported())
+                    return;
+
+                VuNativeFixture referenceFixture;
+                VuNativeFixture nativeFixture;
+                t.IsTrue(
+                    referenceFixture.initialize() &&
+                        nativeFixture.initialize(),
+                    "helper fixtures should initialize");
+                configureHelperRegisterProgram(
+                    referenceFixture.code);
+                configureHelperRegisterProgram(
+                    nativeFixture.code);
+                referenceFixture.markCodeModified();
+                nativeFixture.markCodeModified();
+
+                ScopedEnvironmentVariable registers(
+                    "PS2X_VU_BLOCK_LOCAL_VF_REGISTERS");
+                registers.set("1");
+                VuUnit referenceUnit(VuUnitId::Vu1);
+                VuUnit nativeUnit(VuUnitId::Vu1);
+                VuInterpreterBackend reference(
+                    referenceUnit);
+                VuRecompilerBackend native(
+                    nativeUnit,
+                    VuBlockProfilingConfiguration{
+                        .enabled = true,
+                        .maximumRecords = 16u,
+                    });
+                VuExecutionState referenceState =
+                    initialSyntheticState();
+                VuExecutionState nativeState =
+                    referenceState;
+                VuTransactionalSideEffectSink
+                    referenceEffects;
+                VuTransactionalSideEffectSink
+                    nativeEffects;
+                VuExecutionContext referenceContext =
+                    makeContext(
+                        referenceState,
+                        referenceFixture,
+                        referenceEffects);
+                VuExecutionContext nativeContext =
+                    makeContext(
+                        nativeState, nativeFixture,
+                        nativeEffects);
+
+                const VuRunResult expected =
+                    reference.run(referenceContext, 5u);
+                const VuRunResult actual =
+                    native.run(nativeContext, 5u);
+                t.IsTrue(
+                    sameRunResult(expected, actual),
+                    "selective helper result should match");
+                std::string difference;
+                t.IsTrue(
+                    vuExecutionStatesEqual(
+                        referenceState, nativeState,
+                        &difference),
+                    "selective helper state differs at " +
+                        difference);
+                t.IsTrue(
+                    std::memcmp(
+                        referenceFixture.data,
+                        nativeFixture.data,
+                        PS2_VU1_DATA_SIZE) == 0,
+                    "selective helper VU data should match");
+                t.IsTrue(
+                    referenceEffects.path1Packets() ==
+                        nativeEffects.path1Packets(),
+                    "selective helper PATH1 should match");
+
+                const VuBlockProfilingSnapshot profile =
+                    native
+                        .blockProfilingSnapshotWhileExecutionQuiescent();
+                uint64_t loads = 0u;
+                uint64_t stores = 0u;
+                uint64_t spills = 0u;
+                uint64_t reloads = 0u;
+                uint64_t helperMaterializations = 0u;
+                uint64_t residentBlocks = 0u;
+                for (const VuBlockProfileSnapshot &block :
+                     profile.blocks)
+                {
+                    if (block.residentVfRegisters != 0u)
+                        ++residentBlocks;
+                    loads += block.vfRegisterLoads;
+                    stores += block.vfRegisterStores;
+                    spills += block.vfRegisterSpills;
+                    reloads += block.vfRegisterReloads;
+                    helperMaterializations +=
+                        block.registerMaterializations[
+                            static_cast<size_t>(
+                                VuRegisterMaterializationCause::
+                                    PairHelper)];
+                }
+                t.Equals(
+                    residentBlocks, uint64_t{1u},
+                    "the focused program should allocate one resident block");
+                t.Equals(
+                    loads, uint64_t{5u},
+                    "entry and declared clobber loads should be exact");
+                t.Equals(
+                    stores, uint64_t{4u},
+                    "only one helper-read VF plus three exit VFs should materialize");
+                t.Equals(
+                    spills, uint64_t{2u},
+                    "only dirty non-read host VFs should be preserved");
+                t.Equals(
+                    reloads, uint64_t{2u},
+                    "every preserved host VF should be restored");
+                t.Equals(
+                    helperMaterializations, uint64_t{1u},
+                    "the LOI pair should cross one helper barrier");
+            });
+
+        tc.Run(
             "block-local VF profiles reconcile canonical traffic",
             [](TestCase &t)
             {
@@ -4744,9 +4961,8 @@ void register_ps2_vu_recompiler_tests()
                     spills != 0u && reloads != 0u,
                     "helper traffic should be counted");
                 t.IsTrue(
-                    spills <= stores &&
-                        reloads <= loads,
-                    "helper traffic should be a subset");
+                    spills == reloads,
+                    "every helper-preserved VF should be restored");
                 t.IsTrue(
                     materializations != 0u,
                     "materialization causes should be counted");
