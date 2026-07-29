@@ -1231,6 +1231,200 @@ void register_ps2_memory_tests()
             t.IsTrue(arbiter.empty(), "completed IMAGE should leave no buffered path data");
         });
 
+        tc.Run("GIF arbiter reassembles a tag split across submissions", [](TestCase &t)
+        {
+            std::vector<std::vector<uint8_t>> captured;
+            GifArbiter arbiter([&](const uint8_t *data, uint32_t sizeBytes)
+            {
+                captured.emplace_back(data, data + sizeBytes);
+            });
+
+            std::vector<uint8_t> packet;
+            appendU64(packet, makeGifTag(0u, GIF_FMT_PACKED, 1u, true));
+            appendU64(packet, 0x8877665544332211ull);
+
+            arbiter.submit(GifPathId::Path1, packet.data(), 8u);
+            arbiter.drain();
+            t.Equals(captured.size(), static_cast<size_t>(0u),
+                     "a partial GIFtag should remain buffered");
+            t.IsFalse(arbiter.empty(),
+                      "a partial GIFtag should keep its path non-empty");
+
+            arbiter.submit(GifPathId::Path1, packet.data() + 8u, 8u);
+            arbiter.drain();
+            t.Equals(captured.size(), static_cast<size_t>(1u),
+                     "the completed GIFtag should drain once");
+            t.IsTrue(
+                captured.size() == 1u &&
+                    captured[0] == packet,
+                "the split GIFtag should retain exact bytes");
+            t.IsTrue(arbiter.empty(),
+                     "the completed split tag should release its stream");
+        });
+
+        tc.Run("GIF arbiter drains multiple EOP packets from one backing stream", [](TestCase &t)
+        {
+            std::vector<std::vector<uint8_t>> captured;
+            GifArbiter arbiter([&](const uint8_t *data, uint32_t sizeBytes)
+            {
+                captured.emplace_back(data, data + sizeBytes);
+            });
+
+            auto makePacket = [](uint64_t marker)
+            {
+                std::vector<uint8_t> packet;
+                appendU64(packet, makeGifTag(0u, GIF_FMT_PACKED, 1u, true));
+                appendU64(packet, marker);
+                return packet;
+            };
+            const std::vector<uint8_t> first =
+                makePacket(0x1111111111111111ull);
+            const std::vector<uint8_t> second =
+                makePacket(0x2222222222222222ull);
+            std::vector<uint8_t> stream = first;
+            stream.insert(stream.end(), second.begin(), second.end());
+
+            arbiter.submit(
+                GifPathId::Path3,
+                stream.data(),
+                static_cast<uint32_t>(stream.size()));
+            arbiter.drain();
+
+            t.Equals(captured.size(), static_cast<size_t>(2u),
+                     "both EOP-delimited packets should drain");
+            t.IsTrue(
+                captured.size() == 2u &&
+                    captured[0] == first &&
+                    captured[1] == second,
+                "packet spans should retain byte-exact boundaries");
+            t.IsTrue(arbiter.empty(),
+                     "draining complete spans should reuse an empty backing stream");
+        });
+
+        tc.Run("GIF arbiter compacts only the incomplete suffix after drain", [](TestCase &t)
+        {
+            std::vector<std::vector<uint8_t>> captured;
+            GifArbiter arbiter([&](const uint8_t *data, uint32_t sizeBytes)
+            {
+                captured.emplace_back(data, data + sizeBytes);
+            });
+
+            auto makePacket = [](uint64_t marker)
+            {
+                std::vector<uint8_t> packet;
+                appendU64(packet, makeGifTag(0u, GIF_FMT_PACKED, 1u, true));
+                appendU64(packet, marker);
+                return packet;
+            };
+            const std::vector<uint8_t> first =
+                makePacket(0x3333333333333333ull);
+            const std::vector<uint8_t> second =
+                makePacket(0x4444444444444444ull);
+            std::vector<uint8_t> prefix = first;
+            prefix.insert(prefix.end(), second.begin(), second.begin() + 8);
+
+            arbiter.submit(
+                GifPathId::Path2,
+                prefix.data(),
+                static_cast<uint32_t>(prefix.size()));
+            arbiter.drain();
+            t.Equals(captured.size(), static_cast<size_t>(1u),
+                     "the complete prefix packet should drain immediately");
+            t.IsTrue(
+                captured.size() == 1u &&
+                    captured[0] == first,
+                "draining should not include the following partial tag");
+            t.IsFalse(arbiter.empty(),
+                      "the compacted partial suffix should remain buffered");
+
+            arbiter.submit(
+                GifPathId::Path2,
+                second.data() + 8u,
+                8u);
+            arbiter.drain();
+            t.Equals(captured.size(), static_cast<size_t>(2u),
+                     "the completed suffix should drain once");
+            t.IsTrue(
+                captured.size() == 2u &&
+                    captured[1] == second,
+                "suffix compaction should preserve the next packet exactly");
+            t.IsTrue(arbiter.empty(),
+                     "the completed suffix should leave no buffered bytes");
+        });
+
+        tc.Run("GIF arbiter keeps non-EOP tags in one packet span", [](TestCase &t)
+        {
+            std::vector<std::vector<uint8_t>> captured;
+            GifArbiter arbiter([&](const uint8_t *data, uint32_t sizeBytes)
+            {
+                captured.emplace_back(data, data + sizeBytes);
+            });
+
+            std::vector<uint8_t> packet;
+            appendU64(packet, makeGifTag(0u, GIF_FMT_PACKED, 1u, false));
+            appendU64(packet, 0x5555555555555555ull);
+            appendU64(packet, makeGifTag(0u, GIF_FMT_PACKED, 1u, true));
+            appendU64(packet, 0x6666666666666666ull);
+
+            arbiter.submit(GifPathId::Path1, packet.data(), 16u);
+            arbiter.drain();
+            t.Equals(captured.size(), static_cast<size_t>(0u),
+                     "a non-EOP tag should not complete its packet");
+
+            arbiter.submit(
+                GifPathId::Path1,
+                packet.data() + 16u,
+                16u);
+            arbiter.drain();
+            t.Equals(captured.size(), static_cast<size_t>(1u),
+                     "the following EOP tag should complete one packet");
+            t.IsTrue(
+                captured.size() == 1u &&
+                    captured[0] == packet,
+                "the completed packet should include its non-EOP prefix");
+        });
+
+        tc.Run("GIF arbiter preserves queued packets when an oversized suffix is rejected", [](TestCase &t)
+        {
+            std::vector<std::vector<uint8_t>> captured;
+            GifArbiter arbiter([&](const uint8_t *data, uint32_t sizeBytes)
+            {
+                captured.emplace_back(data, data + sizeBytes);
+            });
+
+            std::vector<uint8_t> complete;
+            appendU64(complete, makeGifTag(0u, GIF_FMT_PACKED, 1u, true));
+            appendU64(complete, 0x7777777777777777ull);
+
+            std::vector<uint8_t> next;
+            appendU64(next, makeGifTag(0u, GIF_FMT_PACKED, 1u, true));
+            appendU64(next, 0x8888888888888888ull);
+
+            std::vector<uint8_t> prefix = complete;
+            prefix.insert(prefix.end(), next.begin(), next.begin() + 8u);
+            arbiter.submit(
+                GifPathId::Path1,
+                prefix.data(),
+                static_cast<uint32_t>(prefix.size()));
+
+            const uint8_t unused = 0u;
+            arbiter.submit(
+                GifPathId::Path1,
+                &unused,
+                (64u * 1024u * 1024u) + 1u);
+            arbiter.drain();
+
+            t.Equals(captured.size(), static_cast<size_t>(1u),
+                     "the valid queued packet should survive suffix rejection");
+            t.IsTrue(
+                captured.size() == 1u &&
+                    captured[0] == complete,
+                "suffix rejection should preserve the queued packet bytes");
+            t.IsTrue(
+                arbiter.empty(),
+                "suffix rejection should discard only the incomplete packet");
+        });
+
         tc.Run("GIF arbiter frames IMAGE2 like IMAGE", [](TestCase &t)
         {
             std::vector<std::vector<uint8_t>> captured;

@@ -7,7 +7,12 @@ namespace
 {
     constexpr size_t kMaxBufferedGifPathBytes = 64u * 1024u * 1024u;
 
-    bool gifTagSize(const uint8_t *data, size_t availableBytes, size_t &outSize, bool &outEop)
+    bool gifTagSize(
+        const uint8_t *data,
+        size_t availableBytes,
+        size_t &outSize,
+        bool &outEop,
+        bool &outImage)
     {
         if (!data || availableBytes < 16u)
             return false;
@@ -34,6 +39,7 @@ namespace
 
         outSize = static_cast<size_t>(totalBytes);
         outEop = ((tagLo >> 15u) & 1u) != 0u;
+        outImage = flg == 2u || flg == 3u;
         return true;
     }
 }
@@ -41,29 +47,6 @@ namespace
 GifArbiter::GifArbiter(ProcessPacketFn processFn)
     : m_processFn(std::move(processFn))
 {
-}
-
-bool GifArbiter::containsImagePacket(const uint8_t *data, uint32_t sizeBytes)
-{
-    if (!data || sizeBytes < 16u)
-        return false;
-
-    size_t offset = 0u;
-    while (offset + 16u <= sizeBytes)
-    {
-        uint64_t tagLo = 0u;
-        std::memcpy(&tagLo, data + offset, sizeof(tagLo));
-        const uint8_t flg = static_cast<uint8_t>((tagLo >> 58u) & 0x3u);
-        if (flg == 2u || flg == 3u)
-            return true;
-
-        size_t tagBytes = 0u;
-        bool eop = false;
-        if (!gifTagSize(data + offset, sizeBytes - offset, tagBytes, eop) || tagBytes > sizeBytes - offset)
-            return false;
-        offset += tagBytes;
-    }
-    return false;
 }
 
 void GifArbiter::submit(GifPathId pathId, const uint8_t *data, uint32_t sizeBytes, bool path2DirectHl)
@@ -76,7 +59,15 @@ void GifArbiter::submit(GifPathId pathId, const uint8_t *data, uint32_t sizeByte
         return;
 
     PathStream &stream = m_pathStreams[pathIndex];
-    if (stream.data.empty())
+    auto dropIncompletePacket = [&stream]()
+    {
+        stream.data.resize(stream.packetStart);
+        stream.parseOffset = stream.packetStart;
+        stream.path2DirectHl = false;
+        stream.packetContainsImage = false;
+    };
+
+    if (stream.packetStart == stream.data.size())
         stream.path2DirectHl = path2DirectHl;
     else
         stream.path2DirectHl = stream.path2DirectHl || path2DirectHl;
@@ -86,47 +77,54 @@ void GifArbiter::submit(GifPathId pathId, const uint8_t *data, uint32_t sizeByte
         RUNTIME_LOG("[gif] dropping malformed path " << pathIndex
                                                        << " stream larger than " << kMaxBufferedGifPathBytes
                                                        << " bytes" << std::endl);
-        stream = {};
+        dropIncompletePacket();
         return;
     }
     stream.data.insert(stream.data.end(), data, data + sizeBytes);
 
-    size_t packetStart = 0u;
-    size_t offset = 0u;
+    size_t offset = stream.parseOffset;
     while (offset + 16u <= stream.data.size())
     {
         size_t tagBytes = 0u;
         bool eop = false;
-        if (!gifTagSize(stream.data.data() + offset, stream.data.size() - offset, tagBytes, eop))
+        bool image = false;
+        if (!gifTagSize(
+                stream.data.data() + offset,
+                stream.data.size() - offset,
+                tagBytes,
+                eop,
+                image))
         {
             RUNTIME_LOG("[gif] dropping malformed tag on path " << pathIndex << std::endl);
-            stream = {};
+            dropIncompletePacket();
             return;
         }
         if (tagBytes > stream.data.size() - offset)
             break;
 
+        stream.packetContainsImage =
+            stream.packetContainsImage || image;
         offset += tagBytes;
+        stream.parseOffset = offset;
         if (!eop)
             continue;
 
         GifArbiterPacket pkt;
         pkt.pathId = pathId;
         pkt.path2DirectHl = (pathId == GifPathId::Path2) && stream.path2DirectHl;
-        pkt.data.assign(stream.data.begin() + static_cast<std::ptrdiff_t>(packetStart),
-                        stream.data.begin() + static_cast<std::ptrdiff_t>(offset));
-        pkt.path3Image = (pathId == GifPathId::Path3) &&
-                         containsImagePacket(pkt.data.data(), static_cast<uint32_t>(pkt.data.size()));
-        m_queue.push_back(std::move(pkt));
+        pkt.path3Image =
+            (pathId == GifPathId::Path3) &&
+            stream.packetContainsImage;
+        pkt.offset = stream.packetStart;
+        pkt.size = offset - stream.packetStart;
+        m_queue.push_back(pkt);
 
-        packetStart = offset;
-        stream.path2DirectHl = path2DirectHl;
-    }
-
-    if (packetStart != 0u)
-    {
-        stream.data.erase(stream.data.begin(),
-                          stream.data.begin() + static_cast<std::ptrdiff_t>(packetStart));
+        stream.packetStart = offset;
+        stream.packetContainsImage = false;
+        stream.path2DirectHl =
+            offset < stream.data.size()
+                ? path2DirectHl
+                : false;
     }
 }
 
@@ -196,13 +194,49 @@ void GifArbiter::drain()
 
     for (size_t i = 0; i < m_queue.size(); ++i)
     {
-        auto &pkt = m_queue[i];
-        if (!pkt.data.empty())
+        const GifArbiterPacket &pkt = m_queue[i];
+        const size_t pathIndex =
+            static_cast<size_t>(pkt.pathId);
+        if (pathIndex >= m_pathStreams.size())
+            continue;
+
+        const PathStream &stream =
+            m_pathStreams[pathIndex];
+        if (pkt.size != 0u &&
+            pkt.offset <= stream.data.size() &&
+            pkt.size <= stream.data.size() - pkt.offset)
         {
-            m_processFn(pkt.data.data(), static_cast<uint32_t>(pkt.data.size()));
+            m_processFn(
+                stream.data.data() + pkt.offset,
+                static_cast<uint32_t>(pkt.size));
         }
     }
     m_queue.clear();
+
+    for (PathStream &stream : m_pathStreams)
+    {
+        const size_t consumed = stream.packetStart;
+        if (consumed == 0u)
+            continue;
+
+        const size_t remaining =
+            stream.data.size() - consumed;
+        if (remaining != 0u)
+        {
+            std::memmove(
+                stream.data.data(),
+                stream.data.data() + consumed,
+                remaining);
+        }
+        stream.data.resize(remaining);
+        stream.packetStart = 0u;
+        stream.parseOffset -= consumed;
+        if (remaining == 0u)
+        {
+            stream.path2DirectHl = false;
+            stream.packetContainsImage = false;
+        }
+    }
 }
 
 uint8_t GifArbiter::pathPriority(GifPathId id)

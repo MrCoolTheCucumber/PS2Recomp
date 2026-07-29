@@ -2,6 +2,7 @@
 #define PS2_GIF_ARBITER_H
 
 #include <array>
+#include <cstddef>
 #include <cstdint>
 #include <functional>
 #include <vector>
@@ -18,7 +19,8 @@ struct GifArbiterPacket
     GifPathId pathId;
     bool path2DirectHl = false;
     bool path3Image = false;
-    std::vector<uint8_t> data;
+    size_t offset = 0u;
+    size_t size = 0u;
 };
 
 class GifArbiter
@@ -48,7 +50,10 @@ private:
     struct PathStream
     {
         std::vector<uint8_t> data;
+        size_t packetStart = 0u;
+        size_t parseOffset = 0u;
         bool path2DirectHl = false;
+        bool packetContainsImage = false;
     };
 
     ProcessPacketFn m_processFn;
@@ -57,7 +62,6 @@ private:
     std::vector<GifArbiterPacket> m_queue;
     std::array<PathStream, 4> m_pathStreams;
 
-    static bool containsImagePacket(const uint8_t *data, uint32_t sizeBytes);
     static uint8_t pathPriority(GifPathId id);
 };
 
