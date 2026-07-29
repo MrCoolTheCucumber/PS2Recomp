@@ -447,6 +447,9 @@ size_t VuProgramCache::KeyHash::operator()(
     hashCombine(
         value, std::hash<bool>{}(
                    key.blockLocalVfRegisters));
+    hashCombine(
+        value, std::hash<bool>{}(
+                   key.inlineXgkick));
     return value;
 }
 
@@ -472,7 +475,9 @@ bool VuProgramCache::sameProgramIdentity(
         left.compilationMode != right.compilationMode ||
         left.blockForm != right.blockForm ||
         left.blockLocalVfRegisters !=
-            right.blockLocalVfRegisters)
+            right.blockLocalVfRegisters ||
+        left.inlineXgkick !=
+            right.inlineXgkick)
     {
         return false;
     }

@@ -1702,6 +1702,7 @@ namespace
         bool blockLinkingEnabled = false;
         bool blockBudgetGuardsEnabled = false;
         bool blockLocalVfRegistersEnabled = false;
+        bool inlineXgkickEnabled = false;
         bool valid = true;
         VuRecompilerDiagnostics nativeDelta{};
         VuProgramCacheDiagnostics cacheDelta{};
@@ -1745,6 +1746,9 @@ namespace
             native &&
             native->
                 blockLocalVfRegistersEnabled();
+        result.inlineXgkickEnabled =
+            native &&
+            native->inlineXgkickEnabled();
         prepareInvocations(
             invocations, initialState, initialData,
             expectedEffects);
@@ -2290,6 +2294,9 @@ namespace
                 << ",\"block_local_vf_registers_enabled\":"
                 << (measurement.
                             blockLocalVfRegistersEnabled
+                        ? "true" : "false")
+                << ",\"inline_xgkick_enabled\":"
+                << (measurement.inlineXgkickEnabled
                         ? "true" : "false")
                 << ",\"native_entries\":"
                 << measurement.nativeDelta.nativeEntries

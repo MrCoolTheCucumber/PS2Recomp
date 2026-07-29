@@ -1989,6 +1989,7 @@ void VuInterpreterBackend::advanceXgkick(uint8_t *vuData,
                 return false;
         }
 
+        xgkick.packet.prepareAppend(tagBytes);
         xgkick.tagBytesRemaining = static_cast<uint32_t>(tagBytes);
         xgkick.tagEop = ((tagLo >> 15u) & 1u) != 0u;
         return true;

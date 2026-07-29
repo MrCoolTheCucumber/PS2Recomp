@@ -1044,6 +1044,14 @@ struct PS2DebugServer::Impl
                     source.blockBudgetGuardsEnabled,
                     allocator);
                 recompiler.AddMember(
+                    "block_local_vf_registers_enabled",
+                    source.blockLocalVfRegistersEnabled,
+                    allocator);
+                recompiler.AddMember(
+                    "inline_xgkick_enabled",
+                    source.inlineXgkickEnabled,
+                    allocator);
+                recompiler.AddMember(
                     "native_entries",
                     source.nativeEntries, allocator);
                 recompiler.AddMember(

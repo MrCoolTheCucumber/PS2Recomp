@@ -254,6 +254,10 @@ public:
     {
         return m_blockLocalVfRegistersEnabled;
     }
+    [[nodiscard]] bool inlineXgkickEnabled() const
+    {
+        return m_inlineXgkickEnabled;
+    }
     // The caller must prove that VU execution is quiescent while copying or
     // resetting these single-owner-thread records.
     [[nodiscard]] VuBlockProfilingSnapshot
@@ -342,6 +346,7 @@ private:
     bool m_blockLinkingEnabled = true;
     bool m_blockBudgetGuardsEnabled = true;
     bool m_blockLocalVfRegistersEnabled = false;
+    bool m_inlineXgkickEnabled = false;
     bool m_blockProfilingEnabled = false;
     size_t m_maximumBlockProfiles = 0u;
     uint64_t m_droppedBlockProfiles = 0u;

@@ -6703,6 +6703,11 @@ void PS2Runtime::debugPublishVuBackendDiagnostics()
                     .blockBudgetGuardsEnabled =
                         backend->
                             blockBudgetGuardsEnabled(),
+                    .blockLocalVfRegistersEnabled =
+                        backend->
+                            blockLocalVfRegistersEnabled(),
+                    .inlineXgkickEnabled =
+                        backend->inlineXgkickEnabled(),
                     .nativeEntries = source.nativeEntries,
                     .nativeBlocks = source.nativeBlocks,
                     .nativePairs = source.nativePairs,

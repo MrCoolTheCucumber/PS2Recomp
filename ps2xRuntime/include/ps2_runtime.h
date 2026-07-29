@@ -607,6 +607,8 @@ public:
 
         bool blockLinkingEnabled = false;
         bool blockBudgetGuardsEnabled = false;
+        bool blockLocalVfRegistersEnabled = false;
+        bool inlineXgkickEnabled = false;
         uint64_t nativeEntries = 0u;
         uint64_t nativeBlocks = 0u;
         uint64_t nativePairs = 0u;

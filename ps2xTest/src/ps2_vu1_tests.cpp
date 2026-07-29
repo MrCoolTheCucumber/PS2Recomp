@@ -738,6 +738,14 @@ void register_ps2_vu1_tests()
                      "issued-cycle bookkeeping should be copied");
             t.Equals(clone.pipeline.xgkick.packet[0], uint8_t{0x11u},
                      "XGKICK packet storage should be deep-copied");
+            t.IsTrue(
+                clone.pipeline.xgkick.packet.nativeData !=
+                    original.pipeline.xgkick.packet.nativeData,
+                "XGKICK native packet cursors should rebase on clone");
+            t.Equals(
+                clone.pipeline.xgkick.packet.nativePreparedBytes,
+                uint32_t{3u},
+                "XGKICK clones should retain their prepared byte range");
             t.Equals(clone.pipeline.delayedQ.result, 3.5f,
                      "the delayed Q result should be copied");
             t.Equals(clone.pipeline.delayedP.result, 7.25f,

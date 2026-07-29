@@ -1,13 +1,19 @@
 #ifndef PS2_VU1_H
 #define PS2_VU1_H
 
+#include <algorithm>
 #include <array>
 #include <atomic>
+#include <cstddef>
 #include <cstdint>
 #include <functional>
+#include <initializer_list>
+#include <limits>
 #include <memory>
+#include <stdexcept>
 #include <string>
 #include <string_view>
+#include <utility>
 #include <vector>
 
 class GS;
@@ -19,6 +25,209 @@ struct VU1NativeEmitterSpikeAccess;
 struct VuVerifyTestAccess;
 struct VuXgkickTestAccess;
 
+// XGKICK builds a PATH1 packet incrementally while VU memory remains live.
+// The backing storage may be prepared for a complete GIF tag, but size()
+// exposes only bytes earned at the current architectural cycle. The three
+// native fields form an explicit generated-code cursor; copy/move operations
+// always rebase nativeData onto the destination storage.
+struct VuXgkickPacket
+{
+    std::vector<uint8_t> storage;
+    uint8_t *nativeData = nullptr;
+    uint32_t nativeSize = 0u;
+    uint32_t nativePreparedBytes = 0u;
+
+    VuXgkickPacket() = default;
+
+    VuXgkickPacket(std::initializer_list<uint8_t> bytes)
+        : storage(bytes),
+          nativeSize(static_cast<uint32_t>(bytes.size())),
+          nativePreparedBytes(
+              static_cast<uint32_t>(bytes.size()))
+    {
+        rebase();
+    }
+
+    VuXgkickPacket(const VuXgkickPacket &other)
+        : storage(other.storage),
+          nativeSize(other.nativeSize),
+          nativePreparedBytes(other.nativePreparedBytes)
+    {
+        rebase();
+    }
+
+    VuXgkickPacket(VuXgkickPacket &&other) noexcept
+        : storage(std::move(other.storage)),
+          nativeSize(other.nativeSize),
+          nativePreparedBytes(other.nativePreparedBytes)
+    {
+        rebase();
+        other.nativeData = nullptr;
+        other.nativeSize = 0u;
+        other.nativePreparedBytes = 0u;
+    }
+
+    VuXgkickPacket &operator=(
+        const VuXgkickPacket &other)
+    {
+        if (this == &other)
+            return *this;
+        storage = other.storage;
+        nativeSize = other.nativeSize;
+        nativePreparedBytes =
+            other.nativePreparedBytes;
+        rebase();
+        return *this;
+    }
+
+    VuXgkickPacket &operator=(
+        VuXgkickPacket &&other) noexcept
+    {
+        if (this == &other)
+            return *this;
+        storage = std::move(other.storage);
+        nativeSize = other.nativeSize;
+        nativePreparedBytes =
+            other.nativePreparedBytes;
+        rebase();
+        other.nativeData = nullptr;
+        other.nativeSize = 0u;
+        other.nativePreparedBytes = 0u;
+        return *this;
+    }
+
+    VuXgkickPacket &operator=(
+        std::initializer_list<uint8_t> bytes)
+    {
+        if (bytes.size() >
+            std::numeric_limits<uint32_t>::max())
+        {
+            throw std::length_error(
+                "XGKICK packet exceeds native cursor range");
+        }
+        storage.assign(bytes);
+        nativeSize =
+            static_cast<uint32_t>(bytes.size());
+        nativePreparedBytes = nativeSize;
+        rebase();
+        return *this;
+    }
+
+    void prepareAppend(size_t byteCount)
+    {
+        if (byteCount >
+            std::numeric_limits<uint32_t>::max() -
+                nativeSize)
+        {
+            throw std::length_error(
+                "XGKICK packet exceeds native cursor range");
+        }
+        const uint32_t required =
+            nativeSize +
+            static_cast<uint32_t>(byteCount);
+        if (storage.size() < required)
+            storage.resize(required);
+        nativePreparedBytes =
+            static_cast<uint32_t>(storage.size());
+        rebase();
+    }
+
+    void resize(size_t byteCount)
+    {
+        if (byteCount >
+            std::numeric_limits<uint32_t>::max())
+        {
+            throw std::length_error(
+                "XGKICK packet exceeds native cursor range");
+        }
+        const uint32_t requested =
+            static_cast<uint32_t>(byteCount);
+        if (storage.size() < requested)
+            storage.resize(requested);
+        nativeSize = requested;
+        nativePreparedBytes =
+            static_cast<uint32_t>(storage.size());
+        rebase();
+    }
+
+    void clear() noexcept
+    {
+        storage.clear();
+        nativeData = nullptr;
+        nativeSize = 0u;
+        nativePreparedBytes = 0u;
+    }
+
+    [[nodiscard]] uint8_t *data() noexcept
+    {
+        return nativeData;
+    }
+
+    [[nodiscard]] const uint8_t *data() const noexcept
+    {
+        return nativeData;
+    }
+
+    [[nodiscard]] size_t size() const noexcept
+    {
+        return nativeSize;
+    }
+
+    [[nodiscard]] bool empty() const noexcept
+    {
+        return nativeSize == 0u;
+    }
+
+    [[nodiscard]] uint8_t &operator[](size_t index)
+    {
+        return storage[index];
+    }
+
+    [[nodiscard]] const uint8_t &operator[](
+        size_t index) const
+    {
+        return storage[index];
+    }
+
+    [[nodiscard]] auto begin() noexcept
+    {
+        return storage.begin();
+    }
+
+    [[nodiscard]] auto end() noexcept
+    {
+        return storage.begin() + nativeSize;
+    }
+
+    [[nodiscard]] auto begin() const noexcept
+    {
+        return storage.begin();
+    }
+
+    [[nodiscard]] auto end() const noexcept
+    {
+        return storage.begin() + nativeSize;
+    }
+
+    bool operator==(
+        const VuXgkickPacket &other) const
+    {
+        return
+            nativeSize == other.nativeSize &&
+            std::equal(
+                begin(), end(), other.begin());
+    }
+
+private:
+    void rebase() noexcept
+    {
+        nativeData =
+            nativePreparedBytes != 0u
+                ? storage.data()
+                : nullptr;
+    }
+};
+
 struct VuPipelineState
 {
     struct Xgkick
@@ -28,7 +237,7 @@ struct VuPipelineState
         uint32_t tagBytesRemaining = 0;
         uint32_t cycleCredit = 0;
         bool tagEop = false;
-        std::vector<uint8_t> packet;
+        VuXgkickPacket packet;
     };
 
     struct DelayedQ

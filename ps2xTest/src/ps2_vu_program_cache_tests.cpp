@@ -235,6 +235,8 @@ void register_ps2_vu_program_cache_tests()
                 VuProgramKey registerKey = firstKey;
                 registerKey.blockLocalVfRegisters =
                     true;
+                VuProgramKey xgkickKey = firstKey;
+                xgkickKey.inlineXgkick = true;
 
                 t.IsFalse(
                     cache.lookup(entryKey).valid(),
@@ -254,6 +256,9 @@ void register_ps2_vu_program_cache_tests()
                 t.IsFalse(
                     cache.lookup(registerKey).valid(),
                     "canonical and register-resident blocks should not alias");
+                t.IsFalse(
+                    cache.lookup(xgkickKey).valid(),
+                    "helper and inline XGKICK blocks should not alias");
                 t.IsNotNull(
                     cache.resolve(first),
                     "same-generation key variants must not invalidate residents");
@@ -264,8 +269,8 @@ void register_ps2_vu_program_cache_tests()
                     stats.hits, uint64_t{1u},
                     "one warm lookup should be recorded");
                 t.Equals(
-                    stats.misses, uint64_t{7u},
-                    "cold and six distinct keys should be misses");
+                    stats.misses, uint64_t{8u},
+                    "cold and seven distinct keys should be misses");
                 t.Equals(
                     stats.compilations, uint64_t{1u},
                     "duplicate insertion should not count as compilation");
@@ -456,6 +461,21 @@ void register_ps2_vu_program_cache_tests()
                         registerTarget) ==
                         VuProgramLinkResult::Incompatible,
                     "canonical links must not enter register-resident blocks");
+                VuProgramKey xgkickTarget =
+                    normalTarget;
+                xgkickTarget.inlineXgkick = true;
+                const VuProgramHandle xgkickTargetHandle =
+                    cache.insert(
+                        makeLinkedProgram(
+                            xgkickTarget,
+                            backendIdentity));
+                t.IsTrue(
+                    cache.populateLink(
+                        normalLinks,
+                        xgkickTargetHandle,
+                        xgkickTarget) ==
+                        VuProgramLinkResult::Incompatible,
+                    "helper links must not enter inline XGKICK blocks");
 
                 const VuNativeLinkSlot &normalSlot =
                     normalLinks->
@@ -493,7 +513,7 @@ void register_ps2_vu_program_cache_tests()
                 t.Equals(
                     cache.diagnostics().
                         linkResolutionFailures,
-                    uint64_t{5u},
+                    uint64_t{6u},
                     "every incompatible attempt should be counted");
             });
 

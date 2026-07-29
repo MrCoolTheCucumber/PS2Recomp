@@ -560,6 +560,72 @@ void register_ps2_vu_recompiler_tests()
                     "detached code should not bypass generation tracking");
             });
 
+        tc.Run(
+            "inline XGKICK applies only to normal VU1 blocks",
+            [](TestCase &t)
+            {
+                if (!VuRecompilerBackend::supported())
+                    return;
+
+                ScopedEnvironmentVariable inlineXgkick(
+                    "PS2X_VU_INLINE_XGKICK");
+                inlineXgkick.set("1");
+                for (const VuUnitId unitId : {
+                         VuUnitId::Vu0,
+                         VuUnitId::Vu1,
+                     })
+                {
+                    VuNativeFixture fixture;
+                    t.IsTrue(
+                        fixture.initialize(unitId),
+                        "VU memory fixture should initialize");
+                    VuUnit unit(unitId);
+                    VuRecompilerBackend backend(unit);
+                    VuExecutionState state =
+                        initialSyntheticState();
+                    VuTransactionalSideEffectSink effects;
+                    VuExecutionContext context =
+                        makeContext(
+                            state, fixture, effects);
+                    VuProgramKey key;
+                    std::string diagnostic;
+                    t.IsTrue(
+                        backend.programKey(
+                            context,
+                            VuCompilationMode::Normal,
+                            key, &diagnostic),
+                        "normal key should be valid: " +
+                            diagnostic);
+                    t.Equals(
+                        key.inlineXgkick,
+                        unitId == VuUnitId::Vu1,
+                        "only VU1 should compile inline XGKICK progression");
+
+                    t.IsTrue(
+                        backend.programKey(
+                            context,
+                            VuCompilationMode::Instrumented,
+                            key, &diagnostic),
+                        "instrumented key should be valid: " +
+                            diagnostic);
+                    t.IsFalse(
+                        key.inlineXgkick,
+                        "instrumented observation should retain helper progression");
+                }
+
+                inlineXgkick.set("0");
+                VuNativeFixture disabledFixture;
+                t.IsTrue(
+                    disabledFixture.initialize(),
+                    "disabled VU1 fixture should initialize");
+                VuUnit disabledUnit(VuUnitId::Vu1);
+                VuRecompilerBackend disabledBackend(
+                    disabledUnit);
+                t.IsFalse(
+                    disabledBackend.inlineXgkickEnabled(),
+                    "the explicit opt-out should retain helper progression");
+            });
+
         tc.Run("synthetic block matches every cycle-budget cut",
             [](TestCase &t)
             {
@@ -3304,6 +3370,435 @@ void register_ps2_vu_recompiler_tests()
             });
 
         tc.Run(
+            "native XGKICK inlines prepared non-wrapping qwords",
+            [](TestCase &t)
+            {
+                if (!VuRecompilerBackend::supported())
+                    return;
+
+                ScopedEnvironmentVariable inlineXgkick(
+                    "PS2X_VU_INLINE_XGKICK");
+                inlineXgkick.set("1");
+                VuNativeFixture referenceFixture;
+                VuNativeFixture nativeFixture;
+                t.IsTrue(
+                    referenceFixture.initialize(),
+                    "reference memory should initialize");
+                t.IsTrue(
+                    nativeFixture.initialize(),
+                    "native memory should initialize");
+                for (uint32_t index = 0u;
+                     index < 32u; ++index)
+                {
+                    const uint8_t value =
+                        static_cast<uint8_t>(
+                            0x40u + index);
+                    referenceFixture.data[index] =
+                        value;
+                    nativeFixture.data[index] =
+                        value;
+                }
+
+                VuExecutionState referenceState =
+                    initialSyntheticState();
+                referenceState.pipeline.xgkick = {
+                    .active = true,
+                    .address = 0u,
+                    .tagBytesRemaining = 32u,
+                    .cycleCredit = 0u,
+                    .tagEop = true,
+                    .packet = {},
+                };
+                referenceState.pipeline.xgkick.packet
+                    .prepareAppend(32u);
+                VuExecutionState nativeState =
+                    referenceState;
+
+                VuUnit referenceUnit(VuUnitId::Vu1);
+                VuUnit nativeUnit(VuUnitId::Vu1);
+                VuInterpreterBackend reference(
+                    referenceUnit);
+                VuRecompilerBackend native(nativeUnit);
+                t.IsTrue(
+                    native.inlineXgkickEnabled(),
+                    "the focused backend should enable inline XGKICK");
+                VuTransactionalSideEffectSink
+                    referenceEffects;
+                VuTransactionalSideEffectSink
+                    nativeEffects;
+                VuExecutionContext referenceContext =
+                    makeContext(
+                        referenceState,
+                        referenceFixture,
+                        referenceEffects);
+                VuExecutionContext nativeContext =
+                    makeContext(
+                        nativeState, nativeFixture,
+                        nativeEffects);
+                const VuRecompilerDiagnostics before =
+                    native.diagnostics();
+
+                std::string difference;
+                for (uint32_t step = 0u;
+                     step < 2u; ++step)
+                {
+                    const VuRunResult referenceResult =
+                        reference.run(
+                            referenceContext, 1u);
+                    const VuRunResult nativeResult =
+                        native.run(
+                            nativeContext, 1u);
+                    t.IsTrue(
+                        sameRunResult(
+                            referenceResult,
+                            nativeResult),
+                        "inline prefix result should match");
+                    t.IsTrue(
+                        vuExecutionStatesEqual(
+                            referenceState,
+                            nativeState,
+                            &difference),
+                        "inline prefix state differs at " +
+                            difference);
+                }
+                const VuRecompilerDiagnostics afterInline =
+                    native.diagnostics();
+                t.Equals(
+                    afterInline.xgkickAdvanceHelperCalls -
+                        before.xgkickAdvanceHelperCalls,
+                    uint64_t{0u},
+                    "the prepared interior qword should stay in generated code");
+                t.Equals(
+                    nativeState.pipeline.xgkick.packet.size(),
+                    size_t{16u},
+                    "the inline path should commit exactly one qword");
+                t.IsTrue(
+                    std::memcmp(
+                        nativeState.pipeline.xgkick.packet.data(),
+                        nativeFixture.data, 16u) == 0,
+                    "the inline path should copy current VU bytes");
+
+                for (uint32_t step = 0u;
+                     step < 2u; ++step)
+                {
+                    const VuRunResult referenceResult =
+                        reference.run(
+                            referenceContext, 1u);
+                    const VuRunResult nativeResult =
+                        native.run(
+                            nativeContext, 1u);
+                    t.IsTrue(
+                        sameRunResult(
+                            referenceResult,
+                            nativeResult),
+                        "terminal slow-path result should match");
+                    t.IsTrue(
+                        vuExecutionStatesEqual(
+                            referenceState,
+                            nativeState,
+                            &difference),
+                        "terminal slow-path state differs at " +
+                            difference);
+                }
+                const VuRecompilerDiagnostics afterFinal =
+                    native.diagnostics();
+                t.Equals(
+                    afterFinal.xgkickAdvanceHelperCalls -
+                        afterInline.xgkickAdvanceHelperCalls,
+                    uint64_t{1u},
+                    "the final qword should retain helper publication");
+                t.IsTrue(
+                    referenceEffects.path1Packets() ==
+                        nativeEffects.path1Packets(),
+                    "terminal PATH1 publication should remain exact");
+            });
+
+        tc.Run(
+            "native inline XGKICK preserves budgets stores and wrap",
+            [](TestCase &t)
+            {
+                if (!VuRecompilerBackend::supported())
+                    return;
+
+                ScopedEnvironmentVariable inlineXgkick(
+                    "PS2X_VU_INLINE_XGKICK");
+                inlineXgkick.set("1");
+                VuNativeFixture referenceFixture;
+                VuNativeFixture nativeFixture;
+                t.IsTrue(
+                    referenceFixture.initialize(),
+                    "reference memory should initialize");
+                t.IsTrue(
+                    nativeFixture.initialize(),
+                    "native memory should initialize");
+                const auto configure =
+                    [](VuNativeFixture &fixture)
+                    {
+                        writePair(
+                            fixture.code, 8u,
+                            makeVuSq(
+                                0xfu, 3u, 1u, 0),
+                            kVuUpperNop);
+                        writePair(
+                            fixture.code, 80u, 0u,
+                            kVuUpperNop | kVuUpperEnd);
+                        writePair(
+                            fixture.code, 88u, 0u,
+                            kVuUpperNop);
+                        fixture.markCodeModified();
+                    };
+                configure(referenceFixture);
+                configure(nativeFixture);
+
+                VuUnit referenceUnit(VuUnitId::Vu1);
+                VuUnit nativeUnit(VuUnitId::Vu1);
+                VuInterpreterBackend reference(
+                    referenceUnit);
+                VuRecompilerBackend native(nativeUnit);
+                t.IsTrue(
+                    native.inlineXgkickEnabled(),
+                    "the focused backend should enable inline XGKICK");
+
+                const auto makeState =
+                    [](uint32_t address,
+                       uint32_t tagBytes)
+                    {
+                        VuExecutionState state =
+                            initialSyntheticState();
+                        state.vi[1] = 0u;
+                        for (uint32_t lane = 0u;
+                             lane < 4u; ++lane)
+                        {
+                            state.vf[3][lane] =
+                                300.0f +
+                                static_cast<float>(lane);
+                        }
+                        state.pipeline.xgkick = {
+                            .active = true,
+                            .address = address,
+                            .tagBytesRemaining =
+                                tagBytes,
+                            .cycleCredit = 0u,
+                            .tagEop = true,
+                            .packet = {},
+                        };
+                        state.pipeline.xgkick.packet
+                            .prepareAppend(tagBytes);
+                        return state;
+                    };
+                const auto resetData =
+                    [](VuNativeFixture &fixture)
+                    {
+                        for (uint32_t index = 0u;
+                             index < fixture.dataSize;
+                             ++index)
+                        {
+                            fixture.data[index] =
+                                static_cast<uint8_t>(
+                                    index * 17u + 3u);
+                        }
+                    };
+
+                for (uint32_t budget = 0u;
+                     budget <= 10u; ++budget)
+                {
+                    resetData(referenceFixture);
+                    resetData(nativeFixture);
+                    VuExecutionState referenceState =
+                        makeState(0u, 64u);
+                    VuExecutionState nativeState =
+                        referenceState;
+                    VuTransactionalSideEffectSink
+                        referenceEffects;
+                    VuTransactionalSideEffectSink
+                        nativeEffects;
+                    VuExecutionContext referenceContext =
+                        makeContext(
+                            referenceState,
+                            referenceFixture,
+                            referenceEffects);
+                    VuExecutionContext nativeContext =
+                        makeContext(
+                            nativeState,
+                            nativeFixture,
+                            nativeEffects);
+
+                    const VuRunResult referenceResult =
+                        reference.run(
+                            referenceContext, budget);
+                    const VuRunResult nativeResult =
+                        native.run(
+                            nativeContext, budget);
+                    const std::string prefix =
+                        "budget " +
+                        std::to_string(budget) + ": ";
+                    std::string difference;
+                    t.IsTrue(
+                        sameRunResult(
+                            referenceResult,
+                            nativeResult),
+                        prefix + "run result differs");
+                    t.IsTrue(
+                        vuExecutionStatesEqual(
+                            referenceState,
+                            nativeState,
+                            &difference),
+                        prefix +
+                            "state differs at " +
+                            difference);
+                    t.IsTrue(
+                        std::memcmp(
+                            referenceFixture.data,
+                            nativeFixture.data,
+                            referenceFixture.dataSize) == 0,
+                        prefix + "VU data differs");
+                    t.IsTrue(
+                        referenceEffects.path1Packets() ==
+                            nativeEffects.path1Packets(),
+                        prefix + "PATH1 effects differ");
+                    if (budget >= 2u &&
+                        budget < 8u)
+                    {
+                        t.IsTrue(
+                            std::memcmp(
+                                nativeState.pipeline.xgkick
+                                    .packet.data(),
+                                nativeState.vf[3],
+                                16u) == 0,
+                            prefix +
+                                "same-pair SQ must precede the copy");
+                    }
+                }
+
+                resetData(referenceFixture);
+                resetData(nativeFixture);
+                VuExecutionState referenceState =
+                    makeState(0u, 64u);
+                VuExecutionState nativeState =
+                    referenceState;
+                VuTransactionalSideEffectSink
+                    referenceEffects;
+                VuTransactionalSideEffectSink
+                    nativeEffects;
+                VuExecutionContext referenceContext =
+                    makeContext(
+                        referenceState, referenceFixture,
+                        referenceEffects);
+                VuExecutionContext nativeContext =
+                    makeContext(
+                        nativeState, nativeFixture,
+                        nativeEffects);
+                std::string difference;
+                for (uint32_t step = 0u;
+                     step < 8u; ++step)
+                {
+                    if (step == 2u)
+                    {
+                        std::memset(
+                            referenceFixture.data + 16u,
+                            0xa5, 16u);
+                        std::memset(
+                            nativeFixture.data + 16u,
+                            0xa5, 16u);
+                    }
+                    const VuRunResult referenceResult =
+                        reference.run(
+                            referenceContext, 1u);
+                    const VuRunResult nativeResult =
+                        native.run(
+                            nativeContext, 1u);
+                    const std::string prefix =
+                        "split step " +
+                        std::to_string(step) + ": ";
+                    t.IsTrue(
+                        sameRunResult(
+                            referenceResult,
+                            nativeResult),
+                        prefix + "run result differs");
+                    t.IsTrue(
+                        vuExecutionStatesEqual(
+                            referenceState,
+                            nativeState,
+                            &difference),
+                        prefix +
+                            "state differs at " +
+                            difference);
+                    t.IsTrue(
+                        referenceEffects.path1Packets() ==
+                            nativeEffects.path1Packets(),
+                        prefix + "PATH1 effects differ");
+                    if (step == 3u)
+                    {
+                        t.IsTrue(
+                            std::all_of(
+                                nativeState.pipeline.xgkick
+                                    .packet.begin() + 16u,
+                                nativeState.pipeline.xgkick
+                                    .packet.begin() + 32u,
+                                [](uint8_t value)
+                                {
+                                    return value == 0xa5u;
+                                }),
+                            "future source mutation must remain visible");
+                    }
+                }
+
+                resetData(referenceFixture);
+                resetData(nativeFixture);
+                referenceState = makeState(
+                    referenceFixture.dataSize - 16u,
+                    32u);
+                nativeState = referenceState;
+                VuTransactionalSideEffectSink
+                    wrappedReferenceEffects;
+                VuTransactionalSideEffectSink
+                    wrappedNativeEffects;
+                VuExecutionContext wrappedReferenceContext =
+                    makeContext(
+                    referenceState, referenceFixture,
+                    wrappedReferenceEffects);
+                VuExecutionContext wrappedNativeContext =
+                    makeContext(
+                    nativeState, nativeFixture,
+                    wrappedNativeEffects);
+                const VuRecompilerDiagnostics beforeWrap =
+                    native.diagnostics();
+                for (uint32_t step = 0u;
+                     step < 4u; ++step)
+                {
+                    const VuRunResult referenceResult =
+                        reference.run(
+                            wrappedReferenceContext, 1u);
+                    const VuRunResult nativeResult =
+                        native.run(
+                            wrappedNativeContext, 1u);
+                    t.IsTrue(
+                        sameRunResult(
+                            referenceResult,
+                            nativeResult),
+                        "wrapped run result should match");
+                    t.IsTrue(
+                        vuExecutionStatesEqual(
+                            referenceState,
+                            nativeState,
+                            &difference),
+                        "wrapped state differs at " +
+                            difference);
+                }
+                const VuRecompilerDiagnostics afterWrap =
+                    native.diagnostics();
+                t.Equals(
+                    afterWrap.xgkickAdvanceHelperCalls -
+                        beforeWrap.xgkickAdvanceHelperCalls,
+                    uint64_t{2u},
+                    "wrap and final publication should use the helper");
+                t.IsTrue(
+                    wrappedReferenceEffects.path1Packets() ==
+                        wrappedNativeEffects.path1Packets(),
+                    "wrapped PATH1 packet should remain exact");
+            });
+
+        tc.Run(
             "helper-side code generation changes exit as invalidated",
             [](TestCase &t)
             {
@@ -3472,6 +3967,10 @@ void register_ps2_vu_recompiler_tests()
                         std::string::npos,
                     "canonical VF state should be explicit");
                 t.IsTrue(
+                    normal.find("-xgkick-helper-") !=
+                        std::string::npos,
+                    "helper XGKICK progression should be explicit");
+                t.IsTrue(
                     normal.find(
                         "compile-0000000000001234") !=
                         std::string::npos,
@@ -3481,6 +3980,7 @@ void register_ps2_vu_recompiler_tests()
                 key.compilationMode =
                     VuCompilationMode::Instrumented;
                 key.blockLocalVfRegisters = true;
+                key.inlineXgkick = true;
                 const std::string instrumented =
                     vuPerfJitSymbolName(
                         key, block, 1u);
@@ -3492,6 +3992,9 @@ void register_ps2_vu_recompiler_tests()
                         std::string::npos &&
                     instrumented.find(
                         "-vfreg-resident-") !=
+                        std::string::npos &&
+                    instrumented.find(
+                        "-xgkick-inline-") !=
                         std::string::npos,
                     "unit and instrumented mode should not alias normal VU1 code");
             });

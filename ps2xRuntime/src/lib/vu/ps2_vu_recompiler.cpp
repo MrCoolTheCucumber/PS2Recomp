@@ -337,6 +337,7 @@ namespace
             bool blockLinkingEnabled,
             bool blockBudgetGuardsEnabled,
             bool preserveResidentViFrame,
+            bool inlineXgkick,
             VuAnalysisRegisterAllocation
                 registerAllocation)
             : m_buffer(kEmitterCapacity),
@@ -359,6 +360,7 @@ namespace
                   blockBudgetGuardsEnabled),
               m_preserveResidentViFrame(
                   preserveResidentViFrame),
+              m_inlineXgkick(inlineXgkick),
               m_registerAllocation(
                   registerAllocation)
         {
@@ -421,6 +423,7 @@ namespace
         bool m_blockLinkingEnabled = false;
         bool m_blockBudgetGuardsEnabled = false;
         bool m_preserveResidentViFrame = false;
+        bool m_inlineXgkick = false;
         VuAnalysisRegisterAllocation
             m_registerAllocation{};
         size_t m_fastEntryOffset = 0u;
@@ -2823,11 +2826,188 @@ namespace
             }
         }
 
+        void emitInlineXgkickProgression(
+            Xbyak::Label &entry)
+        {
+            using namespace Xbyak;
+            constexpr int xgkickAddressOffset =
+                pipelineOffset(
+                    offsetof(
+                        VuPipelineState, xgkick) +
+                    offsetof(
+                        VuPipelineState::Xgkick,
+                        address));
+            constexpr int xgkickTagBytesOffset =
+                pipelineOffset(
+                    offsetof(
+                        VuPipelineState, xgkick) +
+                    offsetof(
+                        VuPipelineState::Xgkick,
+                        tagBytesRemaining));
+            constexpr int xgkickCreditOffset =
+                pipelineOffset(
+                    offsetof(
+                        VuPipelineState, xgkick) +
+                    offsetof(
+                        VuPipelineState::Xgkick,
+                        cycleCredit));
+            constexpr size_t xgkickPacketOffset =
+                offsetof(VuPipelineState, xgkick) +
+                offsetof(
+                    VuPipelineState::Xgkick,
+                    packet);
+            constexpr int xgkickPacketDataOffset =
+                pipelineOffset(
+                    xgkickPacketOffset +
+                    offsetof(
+                        VuXgkickPacket,
+                        nativeData));
+            constexpr int xgkickPacketSizeOffset =
+                pipelineOffset(
+                    xgkickPacketOffset +
+                    offsetof(
+                        VuXgkickPacket,
+                        nativeSize));
+            constexpr int
+                xgkickPacketPreparedBytesOffset =
+                    pipelineOffset(
+                        xgkickPacketOffset +
+                        offsetof(
+                            VuXgkickPacket,
+                            nativePreparedBytes));
+            constexpr int callerContextViewOffset =
+                static_cast<int>(sizeof(uintptr_t)) +
+                kContextViewOffset;
+
+            Label slow;
+            m_code.L(entry);
+            // The slow helper has already parsed the current GIF tag and
+            // prepared backing storage. Accept only a non-final,
+            // non-wrapping qword with the expected one odd cycle of credit.
+            m_code.cmp(
+                m_code.dword[
+                    m_code.rbx +
+                    xgkickCreditOffset],
+                1u);
+            m_code.jne(slow, m_code.T_NEAR);
+            m_code.cmp(
+                m_code.dword[
+                    m_code.rbx +
+                    xgkickTagBytesOffset],
+                16u);
+            m_code.jbe(slow, m_code.T_NEAR);
+
+            m_code.mov(
+                m_code.r9d,
+                m_code.dword[
+                    m_code.rsp +
+                    callerContextViewOffset +
+                    offsetof(
+                        NativeContextView,
+                        dataSize)]);
+            m_code.cmp(m_code.r9d, 16u);
+            m_code.jb(slow, m_code.T_NEAR);
+            m_code.sub(m_code.r9d, 16u);
+            m_code.mov(
+                m_code.eax,
+                m_code.dword[
+                    m_code.rbx +
+                    xgkickAddressOffset]);
+            m_code.cmp(m_code.eax, m_code.r9d);
+            m_code.jae(slow, m_code.T_NEAR);
+
+            m_code.mov(
+                m_code.r10d,
+                m_code.dword[
+                    m_code.rbx +
+                    xgkickPacketSizeOffset]);
+            m_code.mov(
+                m_code.r9d,
+                m_code.dword[
+                    m_code.rbx +
+                    xgkickPacketPreparedBytesOffset]);
+            m_code.cmp(m_code.r9d, 16u);
+            m_code.jb(slow, m_code.T_NEAR);
+            m_code.sub(m_code.r9d, 16u);
+            m_code.cmp(m_code.r10d, m_code.r9d);
+            m_code.ja(slow, m_code.T_NEAR);
+            m_code.mov(
+                m_code.r9,
+                m_code.qword[
+                    m_code.rbx +
+                    xgkickPacketDataOffset]);
+            m_code.test(m_code.r9, m_code.r9);
+            m_code.jz(slow, m_code.T_NEAR);
+            m_code.mov(
+                m_code.r11,
+                m_code.qword[
+                    m_code.rsp +
+                    callerContextViewOffset +
+                    offsetof(
+                        NativeContextView,
+                        data)]);
+            m_code.test(m_code.r11, m_code.r11);
+            m_code.jz(slow, m_code.T_NEAR);
+            if (m_usesAvx)
+            {
+                m_code.vmovups(
+                    m_code.xmm0,
+                    m_code.ptr[
+                        m_code.r11 +
+                        m_code.rax]);
+                m_code.vmovups(
+                    m_code.ptr[
+                        m_code.r9 +
+                        m_code.r10],
+                    m_code.xmm0);
+            }
+            else
+            {
+                m_code.movups(
+                    m_code.xmm0,
+                    m_code.ptr[
+                        m_code.r11 +
+                        m_code.rax]);
+                m_code.movups(
+                    m_code.ptr[
+                        m_code.r9 +
+                        m_code.r10],
+                    m_code.xmm0);
+            }
+            m_code.add(
+                m_code.dword[
+                    m_code.rbx +
+                    xgkickAddressOffset],
+                16u);
+            m_code.sub(
+                m_code.dword[
+                    m_code.rbx +
+                    xgkickTagBytesOffset],
+                16u);
+            m_code.mov(
+                m_code.dword[
+                    m_code.rbx +
+                    xgkickCreditOffset],
+                0u);
+            m_code.add(
+                m_code.dword[
+                    m_code.rbx +
+                    xgkickPacketSizeOffset],
+                16u);
+            m_code.xor_(m_code.r11d, m_code.r11d);
+            m_code.ret();
+
+            m_code.L(slow);
+            m_code.mov(m_code.r11d, 1u);
+            m_code.ret();
+        }
+
         void emitInlinePair(
             const VuIrInstructionPair &pair,
             uint32_t codeSize,
             Xbyak::Label *fallback,
             const void *xgkickHelper,
+            Xbyak::Label *inlineXgkickProgression,
             Xbyak::Label &dynamicExit,
             bool enforceZeroRegisters,
             bool handleBranchState,
@@ -2882,7 +3062,6 @@ namespace
                     offsetof(
                         VuPipelineState::Xgkick,
                         cycleCredit));
-
             if (fallback)
             {
                 m_code.test(m_code.rbx, m_code.rbx);
@@ -2971,12 +3150,38 @@ namespace
                     m_code.rbx +
                     xgkickTagBytesOffset],
                 0u);
-            m_code.je(callXgkickHelper);
+            m_code.je(
+                callXgkickHelper,
+                m_code.T_NEAR);
             m_code.cmp(
                 m_code.dword[
                     m_code.rbx + xgkickCreditOffset],
                 0u);
-            m_code.jne(callXgkickHelper);
+            Xbyak::Label addXgkickCredit;
+            m_code.je(
+                addXgkickCredit,
+                m_code.T_NEAR);
+            if (inlineXgkickProgression)
+            {
+                m_code.call(
+                    *inlineXgkickProgression);
+                m_code.test(
+                    m_code.r11d,
+                    m_code.r11d);
+                m_code.jz(
+                    noActiveXgkick,
+                    m_code.T_NEAR);
+                m_code.jmp(
+                    callXgkickHelper,
+                    m_code.T_NEAR);
+            }
+            else
+            {
+                m_code.jmp(
+                    callXgkickHelper,
+                    m_code.T_NEAR);
+            }
+            m_code.L(addXgkickCredit);
             m_code.mov(
                 m_code.dword[
                     m_code.rbx + xgkickCreditOffset],
@@ -3768,6 +3973,7 @@ namespace
             Label linkedZeroBudget;
             Label linkedZeroProfileDone;
             Label skipFloatModeRestore;
+            Label inlineXgkickProgression;
 
             emitRawEntry(body);
             m_fastEntryOffset = m_code.getSize();
@@ -3973,6 +4179,9 @@ namespace
                                 emitInlinePair(
                                     pair, block.codeSize,
                                     &fallback, xgkickHelper,
+                                    m_inlineXgkick
+                                        ? &inlineXgkickProgression
+                                        : nullptr,
                                     dynamicExit, true,
                                     handleBranchState,
                                     knownFmacSlot,
@@ -3995,6 +4204,9 @@ namespace
                                 emitInlinePair(
                                     pair, block.codeSize,
                                     nullptr, xgkickHelper,
+                                    m_inlineXgkick
+                                        ? &inlineXgkickProgression
+                                        : nullptr,
                                     dynamicExit, false,
                                     handleBranchState,
                                     knownFmacSlot,
@@ -4329,6 +4541,11 @@ namespace
                     packUnprofiledResult,
                     m_code.T_NEAR);
             }
+            if (m_inlineXgkick)
+            {
+                emitInlineXgkickProgression(
+                    inlineXgkickProgression);
+            }
         }
     };
 #endif
@@ -4427,6 +4644,9 @@ std::string vuPerfJitSymbolName(
         << "-vfreg-"
         << (key.blockLocalVfRegisters
                 ? "resident" : "canonical")
+        << "-xgkick-"
+        << (key.inlineXgkick
+                ? "inline" : "helper")
         << "-compile-"
         << std::setw(16)
         << compilationIdentity;
@@ -4463,6 +4683,11 @@ VuRecompilerBackend::VuRecompilerBackend(
         blockLocalVfRegisters &&
         environmentFlagEnabled(
             blockLocalVfRegisters);
+    const char *const inlineXgkick =
+        std::getenv("PS2X_VU_INLINE_XGKICK");
+    m_inlineXgkickEnabled =
+        !inlineXgkick ||
+        environmentFlagEnabled(inlineXgkick);
     m_blockProfilingEnabled = configuration.enabled;
     m_maximumBlockProfiles =
         configuration.maximumRecords;
@@ -4842,6 +5067,10 @@ bool VuRecompilerBackend::programKey(
                 : VuIrBlockForm::LinearTrace,
         .blockLocalVfRegisters =
             m_blockLocalVfRegistersEnabled &&
+            mode == VuCompilationMode::Normal,
+        .inlineXgkick =
+            m_inlineXgkickEnabled &&
+            codeUnit == VuUnitId::Vu1 &&
             mode == VuCompilationMode::Normal,
     };
     return VuProgramCache::validKey(key, diagnostic);
@@ -5987,6 +6216,7 @@ bool VuRecompilerBackend::compile(
                 key.blockForm ==
                     VuIrBlockForm::Basic,
             false,
+            key.inlineXgkick,
             registerAllocation);
         if (emitter.size() == 0u)
         {
