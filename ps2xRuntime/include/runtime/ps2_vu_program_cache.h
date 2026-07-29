@@ -85,6 +85,7 @@ struct VuProgramKey
         VuCompilationMode::Normal;
     VuIrBlockForm blockForm =
         VuIrBlockForm::LinearTrace;
+    bool blockLocalVfRegisters = false;
 
     bool operator==(const VuProgramKey &) const = default;
 };

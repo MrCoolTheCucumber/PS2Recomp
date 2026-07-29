@@ -3468,6 +3468,10 @@ void register_ps2_vu_recompiler_tests()
                         std::string::npos,
                     "normal mode should be explicit");
                 t.IsTrue(
+                    normal.find("-vfreg-canonical-") !=
+                        std::string::npos,
+                    "canonical VF state should be explicit");
+                t.IsTrue(
                     normal.find(
                         "compile-0000000000001234") !=
                         std::string::npos,
@@ -3476,6 +3480,7 @@ void register_ps2_vu_recompiler_tests()
                 key.unit = VuUnitId::Vu0;
                 key.compilationMode =
                     VuCompilationMode::Instrumented;
+                key.blockLocalVfRegisters = true;
                 const std::string instrumented =
                     vuPerfJitSymbolName(
                         key, block, 1u);
@@ -3484,6 +3489,9 @@ void register_ps2_vu_recompiler_tests()
                         std::string::npos &&
                     instrumented.find(
                         "-instrumented-") !=
+                        std::string::npos &&
+                    instrumented.find(
+                        "-vfreg-resident-") !=
                         std::string::npos,
                     "unit and instrumented mode should not alias normal VU1 code");
             });
@@ -3664,6 +3672,170 @@ void register_ps2_vu_recompiler_tests()
             });
 
         tc.Run(
+            "block-local VF profiles reconcile canonical traffic",
+            [](TestCase &t)
+            {
+                if (!VuRecompilerBackend::supported())
+                    return;
+
+                VuNativeFixture referenceFixture;
+                VuNativeFixture nativeFixture;
+                t.IsTrue(
+                    referenceFixture.initialize() &&
+                        nativeFixture.initialize(),
+                    "profile fixtures should initialize");
+                configureSyntheticProgram(
+                    referenceFixture.code);
+                configureSyntheticProgram(
+                    nativeFixture.code);
+                referenceFixture.markCodeModified();
+                nativeFixture.markCodeModified();
+
+                ScopedEnvironmentVariable registers(
+                    "PS2X_VU_BLOCK_LOCAL_VF_REGISTERS");
+                registers.set("1");
+                VuUnit referenceUnit(VuUnitId::Vu1);
+                VuUnit nativeUnit(VuUnitId::Vu1);
+                VuInterpreterBackend reference(
+                    referenceUnit);
+                VuRecompilerBackend native(
+                    nativeUnit,
+                    VuBlockProfilingConfiguration{
+                        .enabled = true,
+                        .maximumRecords = 128u,
+                    });
+                VuExecutionState referenceState =
+                    initialSyntheticState();
+                VuExecutionState nativeState =
+                    referenceState;
+                VuTransactionalSideEffectSink
+                    referenceEffects;
+                VuTransactionalSideEffectSink
+                    nativeEffects;
+                VuExecutionContext referenceContext =
+                    makeContext(
+                        referenceState,
+                        referenceFixture,
+                        referenceEffects);
+                VuExecutionContext nativeContext =
+                    makeContext(
+                        nativeState,
+                        nativeFixture,
+                        nativeEffects);
+
+                const VuRunResult expected =
+                    reference.run(referenceContext, 12u);
+                const VuRunResult actual =
+                    native.run(nativeContext, 12u);
+                t.IsTrue(
+                    sameRunResult(expected, actual),
+                    "register-resident result should match");
+                std::string difference;
+                t.IsTrue(
+                    vuExecutionStatesEqual(
+                        referenceState, nativeState,
+                        &difference),
+                    "register-resident state differs at " +
+                        difference);
+                t.IsTrue(
+                    std::memcmp(
+                        referenceFixture.data,
+                        nativeFixture.data,
+                        PS2_VU1_DATA_SIZE) == 0,
+                    "register-resident VU data should match");
+                t.IsTrue(
+                    referenceEffects.path1Packets() ==
+                        nativeEffects.path1Packets(),
+                    "register-resident PATH1 should match");
+                t.IsTrue(
+                    native.blockLocalVfRegistersEnabled(),
+                    "the opt-in backend should expose its mode");
+
+                const VuBlockProfilingSnapshot profile =
+                    native
+                        .blockProfilingSnapshotWhileExecutionQuiescent();
+                uint64_t loads = 0u;
+                uint64_t stores = 0u;
+                uint64_t spills = 0u;
+                uint64_t reloads = 0u;
+                uint64_t materializations = 0u;
+                uint64_t residentBlocks = 0u;
+                for (const VuBlockProfileSnapshot &block :
+                     profile.blocks)
+                {
+                    if (block.residentVfRegisters != 0u)
+                    {
+                        ++residentBlocks;
+                        t.IsTrue(
+                            block.residentVfRegisters <= 3u,
+                            "allocation should honor the current host limit");
+                        t.IsTrue(
+                            block.allocatedVfAccesses <=
+                                block.vfAccesses,
+                            "allocated accesses should be a subset");
+                        t.IsTrue(
+                            block.residentVfDirtyRegisters <=
+                                block.residentVfRegisters,
+                            "dirty residents should be assigned");
+                        t.IsTrue(
+                            block.residentVfDirtyLanes <=
+                                block.residentVfDirtyRegisters *
+                                    4u,
+                            "dirty lane accounting should be bounded");
+                    }
+                    loads += block.vfRegisterLoads;
+                    stores += block.vfRegisterStores;
+                    spills += block.vfRegisterSpills;
+                    reloads += block.vfRegisterReloads;
+                    for (const uint64_t count :
+                         block.registerMaterializations)
+                    {
+                        materializations += count;
+                    }
+                }
+                t.IsTrue(
+                    residentBlocks != 0u,
+                    "the synthetic block should allocate VFs");
+                t.IsTrue(
+                    loads != 0u && stores != 0u,
+                    "canonical traffic should be counted");
+                t.IsTrue(
+                    spills != 0u && reloads != 0u,
+                    "helper traffic should be counted");
+                t.IsTrue(
+                    spills <= stores &&
+                        reloads <= loads,
+                    "helper traffic should be a subset");
+                t.IsTrue(
+                    materializations != 0u,
+                    "materialization causes should be counted");
+
+                native
+                    .resetBlockProfilingCountersWhileExecutionQuiescent();
+                const VuBlockProfilingSnapshot reset =
+                    native
+                        .blockProfilingSnapshotWhileExecutionQuiescent();
+                for (const VuBlockProfileSnapshot &block :
+                     reset.blocks)
+                {
+                    t.Equals(
+                        block.vfRegisterLoads +
+                            block.vfRegisterStores +
+                            block.vfRegisterSpills +
+                            block.vfRegisterReloads,
+                        uint64_t{0u},
+                        "traffic reset should clear dynamic counts");
+                    for (const uint64_t count :
+                         block.registerMaterializations)
+                    {
+                        t.Equals(
+                            count, uint64_t{0u},
+                            "cause reset should clear dynamic counts");
+                    }
+                }
+            });
+
+        tc.Run(
             "raw entry preserves SysV registers and MXCSR",
             [](TestCase &t)
             {
@@ -3768,6 +3940,96 @@ void register_ps2_vu_recompiler_tests()
 #else
                 (void)t;
 #endif
+            });
+
+        tc.Run(
+            "linked resident VI blocks preserve the shared native frame",
+            [](TestCase &t)
+            {
+                if (!VuRecompilerBackend::supported())
+                    return;
+
+                ScopedEnvironmentVariable registers(
+                    "PS2X_VU_BLOCK_LOCAL_VF_REGISTERS");
+                registers.set("1");
+                ScopedEnvironmentVariable guards(
+                    "PS2X_VU_BLOCK_BUDGET_GUARDS");
+                guards.set("1");
+
+                VuNativeFixture fixture;
+                t.IsTrue(
+                    fixture.initialize(),
+                    "VU memory fixture should initialize");
+                writePair(
+                    fixture.code, 0u,
+                    makeVuBranch(1), kVuUpperNop);
+                writePair(
+                    fixture.code, 8u, 0u,
+                    kVuUpperNop);
+                writePair(
+                    fixture.code, 16u,
+                    makeVuIaddiu(1u, 1u, 1),
+                    kVuUpperNop | kVuUpperEnd);
+                writePair(
+                    fixture.code, 24u, 0u,
+                    kVuUpperNop);
+                fixture.markCodeModified();
+
+                VuUnit unit(VuUnitId::Vu1);
+                VuRecompilerBackend backend(unit);
+                VuExecutionState state =
+                    initialSyntheticState();
+                state.vi[1] = 7;
+                VuTransactionalSideEffectSink effects;
+                VuExecutionContext context =
+                    makeContext(state, fixture, effects);
+
+                VuProgramKey sourceKey;
+                std::string diagnostic;
+                t.IsTrue(
+                    backend.programKey(
+                        context,
+                        VuCompilationMode::Normal,
+                        sourceKey, &diagnostic),
+                    "the linked ABI source key should be valid");
+                const VuRunResult cold =
+                    backend.run(context, 4u);
+                t.IsTrue(
+                    cold.reason ==
+                        VuExitReason::ProgramEnded,
+                    "the cold linked program should complete");
+                t.IsTrue(
+                    backend.diagnostics().
+                            resolvedLinks != 0u,
+                    "the cold run should populate the VI target link");
+
+                state = initialSyntheticState();
+                state.vi[1] = 7;
+                const VuRecompilerDiagnostics
+                    beforeWarm = backend.diagnostics();
+                const VuRunResult warm =
+                    backend.run(context, 4u);
+                const VuRecompilerDiagnostics
+                    afterWarm = backend.diagnostics();
+                t.IsTrue(
+                    warm.reason ==
+                        VuExitReason::ProgramEnded,
+                    "the warm linked VI program should complete");
+                t.Equals(
+                    warm.executedCycles,
+                    uint32_t{4u},
+                    "the warm linked VI chain should report four pairs, got " +
+                        std::to_string(
+                            warm.executedCycles));
+                t.Equals(
+                    state.vi[1], int32_t{8},
+                    "the resident VI target should materialize eight, got " +
+                        std::to_string(state.vi[1]));
+                t.Equals(
+                    afterWarm.linkedEdges -
+                        beforeWarm.linkedEdges,
+                    uint64_t{1u},
+                    "the warm source should enter the resident VI target through its native link");
             });
     });
 }

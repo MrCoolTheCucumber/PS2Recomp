@@ -299,6 +299,33 @@ struct VuControlFlowGraph
     std::vector<VuAnalysisBlock> blocks;
 };
 
+// A deterministic whole-block assignment to abstract host vector slots.
+// Slot zero in vfHostSlots means memory-resident; assigned slots are encoded
+// as one plus their zero-based index so the structure remains aggregate-safe.
+struct VuAnalysisRegisterAllocation
+{
+    std::array<uint8_t, 32u> vfHostSlots{};
+    std::array<uint8_t, 32u> vfDirtyLanes{};
+    std::array<uint8_t, 31u> vfRegisters{};
+    std::array<uint8_t, 16u> viHostSlots{};
+    std::array<uint8_t, 15u> viRegisters{};
+    uint8_t vfRegisterCount = 0u;
+    uint8_t maximumVfRegisters = 0u;
+    uint8_t viRegisterCount = 0u;
+    uint8_t maximumViRegisters = 0u;
+    uint16_t viDirtyRegisters = 0u;
+    uint32_t vfAccesses = 0u;
+    uint32_t allocatedVfAccesses = 0u;
+    uint32_t candidateVfRegisters = 0u;
+    uint32_t spilledVfRegisters = 0u;
+    uint32_t maximumLiveVfRegisters = 0u;
+    uint32_t viAccesses = 0u;
+    uint32_t allocatedViAccesses = 0u;
+    uint32_t candidateViRegisters = 0u;
+    uint32_t spilledViRegisters = 0u;
+    uint32_t maximumLiveViRegisters = 0u;
+};
+
 [[nodiscard]] VuControlFlowGraph analyzeVuControlFlow(
     const uint8_t *code, uint32_t codeSize,
     const VuAnalysisEntryState &entry,
@@ -307,6 +334,14 @@ struct VuControlFlowGraph
     const uint8_t *code, uint32_t codeSize,
     uint32_t entryPc,
     VuAnalysisConfiguration configuration = {});
+[[nodiscard]] VuAnalysisBlock analyzeVuIrBlock(
+    const VuIrBlock &block,
+    VuAnalysisConfiguration configuration = {});
+[[nodiscard]] VuAnalysisRegisterAllocation
+allocateVuAnalysisRegisters(
+    const VuAnalysisBlock &block,
+    uint8_t maximumVfRegisters,
+    uint8_t maximumViRegisters = 0u);
 
 [[nodiscard]] bool vuAnalysisCanInlineUpperOpcode(
     VuIrOpcode opcode, uint64_t hostFeatures);

@@ -7,6 +7,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <bit>
 #include <charconv>
 #include <chrono>
 #include <cstddef>
@@ -1081,6 +1082,30 @@ namespace
         uint64_t staticEdges = 0u;
         uint64_t dynamicEdges = 0u;
         uint64_t xgkickBoundaries = 0u;
+        uint64_t helperPairs = 0u;
+        uint64_t vfReadRegisters = 0u;
+        uint64_t vfWriteRegisters = 0u;
+        uint64_t viReadRegisters = 0u;
+        uint64_t viWriteRegisters = 0u;
+        uint64_t vfLiveInRegisters = 0u;
+        uint64_t viLiveInRegisters = 0u;
+        uint64_t blockVfWorkingSet = 0u;
+        uint64_t blockViWorkingSet = 0u;
+        uint64_t blockVfAccesses = 0u;
+        uint64_t top3BlockVfAccesses = 0u;
+        uint64_t top8BlockVfAccesses = 0u;
+        uint64_t top13BlockVfAccesses = 0u;
+        uint64_t blocksFitting3VfRegisters = 0u;
+        uint64_t blocksFitting8VfRegisters = 0u;
+        uint64_t blocksFitting13VfRegisters = 0u;
+        uint32_t maximumVfLiveInRegisters = 0u;
+        uint32_t maximumViLiveInRegisters = 0u;
+        uint32_t maximumBlockVfWorkingSet = 0u;
+        uint32_t maximumBlockViWorkingSet = 0u;
+        std::array<uint64_t, 32u> vfReads{};
+        std::array<uint64_t, 32u> vfWrites{};
+        std::array<uint64_t, 16u> viReads{};
+        std::array<uint64_t, 16u> viWrites{};
         VuExitReason reason = VuExitReason::Inactive;
         std::string diagnostic;
     };
@@ -1209,6 +1234,90 @@ namespace
             }
 
             ++summary.executedBlocks;
+            uint32_t blockVfRegisters = 0u;
+            uint16_t blockViRegisters = 0u;
+            std::array<uint32_t, 32u>
+                blockVfAccessCounts{};
+            for (const VuAnalysisPair &pair :
+                 block.pairs)
+            {
+                for (uint32_t reg = 1u;
+                     reg < 32u; ++reg)
+                {
+                    if (pair.reads.vf[reg] != 0u ||
+                        pair.writes.vf[reg] != 0u)
+                    {
+                        blockVfRegisters |= 1u << reg;
+                    }
+                    blockVfAccessCounts[reg] +=
+                        pair.reads.vf[reg] != 0u
+                            ? 1u : 0u;
+                    blockVfAccessCounts[reg] +=
+                        pair.writes.vf[reg] != 0u
+                            ? 1u : 0u;
+                }
+                blockViRegisters |= static_cast<uint16_t>(
+                    (pair.reads.vi | pair.writes.vi) &
+                    ~uint16_t{1u});
+            }
+            const uint32_t blockVfWorkingSet =
+                std::popcount(blockVfRegisters);
+            const uint32_t blockViWorkingSet =
+                std::popcount(blockViRegisters);
+            summary.blockVfWorkingSet +=
+                blockVfWorkingSet;
+            summary.blockViWorkingSet +=
+                blockViWorkingSet;
+            summary.maximumBlockVfWorkingSet =
+                std::max(
+                    summary.maximumBlockVfWorkingSet,
+                    blockVfWorkingSet);
+            summary.maximumBlockViWorkingSet =
+                std::max(
+                    summary.maximumBlockViWorkingSet,
+                    blockViWorkingSet);
+            summary.blocksFitting3VfRegisters +=
+                blockVfWorkingSet <= 3u ? 1u : 0u;
+            summary.blocksFitting8VfRegisters +=
+                blockVfWorkingSet <= 8u ? 1u : 0u;
+            summary.blocksFitting13VfRegisters +=
+                blockVfWorkingSet <= 13u ? 1u : 0u;
+            std::array<uint8_t, 31u> vfOrder{};
+            for (uint8_t index = 0u;
+                 index < vfOrder.size(); ++index)
+            {
+                vfOrder[index] =
+                    static_cast<uint8_t>(index + 1u);
+            }
+            std::stable_sort(
+                vfOrder.begin(), vfOrder.end(),
+                [&](uint8_t left, uint8_t right)
+                {
+                    return
+                        blockVfAccessCounts[left] >
+                        blockVfAccessCounts[right];
+                });
+            uint64_t blockAccesses = 0u;
+            for (uint32_t reg = 1u;
+                 reg < 32u; ++reg)
+            {
+                blockAccesses +=
+                    blockVfAccessCounts[reg];
+            }
+            summary.blockVfAccesses += blockAccesses;
+            for (size_t rank = 0u;
+                 rank < vfOrder.size(); ++rank)
+            {
+                const uint64_t accesses =
+                    blockVfAccessCounts[
+                        vfOrder[rank]];
+                if (rank < 3u)
+                    summary.top3BlockVfAccesses += accesses;
+                if (rank < 8u)
+                    summary.top8BlockVfAccesses += accesses;
+                if (rank < 13u)
+                    summary.top13BlockVfAccesses += accesses;
+            }
             uint32_t blockPairs = 0u;
             VuRunResult lastResult{};
             bool sawUnsupported = false;
@@ -1227,6 +1336,58 @@ namespace
                     summary.diagnostic =
                         "interpreter PC diverged inside a static block";
                     return summary;
+                }
+
+                summary.helperPairs +=
+                    pair.usesNativeHelper ? 1u : 0u;
+                uint32_t vfLive = 0u;
+                for (uint32_t reg = 1u;
+                     reg < 32u; ++reg)
+                {
+                    if (pair.reads.vf[reg] != 0u)
+                    {
+                        ++summary.vfReadRegisters;
+                        ++summary.vfReads[reg];
+                    }
+                    if (pair.writes.vf[reg] != 0u)
+                    {
+                        ++summary.vfWriteRegisters;
+                        ++summary.vfWrites[reg];
+                    }
+                    if (pair.liveIn.vf[reg] != 0u)
+                        ++vfLive;
+                }
+                const uint16_t viReads =
+                    pair.reads.vi & ~uint16_t{1u};
+                const uint16_t viWrites =
+                    pair.writes.vi & ~uint16_t{1u};
+                const uint16_t viLive =
+                    pair.liveIn.vi & ~uint16_t{1u};
+                summary.viReadRegisters +=
+                    std::popcount(viReads);
+                summary.viWriteRegisters +=
+                    std::popcount(viWrites);
+                summary.vfLiveInRegisters += vfLive;
+                summary.viLiveInRegisters +=
+                    std::popcount(viLive);
+                summary.maximumVfLiveInRegisters =
+                    std::max(
+                        summary.maximumVfLiveInRegisters,
+                        vfLive);
+                summary.maximumViLiveInRegisters =
+                    std::max(
+                        summary.maximumViLiveInRegisters,
+                        static_cast<uint32_t>(
+                            std::popcount(viLive)));
+                for (uint32_t reg = 1u;
+                     reg < 16u; ++reg)
+                {
+                    const uint16_t bit =
+                        static_cast<uint16_t>(1u << reg);
+                    if ((viReads & bit) != 0u)
+                        ++summary.viReads[reg];
+                    if ((viWrites & bit) != 0u)
+                        ++summary.viWrites[reg];
                 }
 
                 lastResult =
@@ -1540,6 +1701,7 @@ namespace
             VuExitReason::Inactive;
         bool blockLinkingEnabled = false;
         bool blockBudgetGuardsEnabled = false;
+        bool blockLocalVfRegistersEnabled = false;
         bool valid = true;
         VuRecompilerDiagnostics nativeDelta{};
         VuProgramCacheDiagnostics cacheDelta{};
@@ -1579,6 +1741,10 @@ namespace
         result.blockBudgetGuardsEnabled =
             native &&
             native->blockBudgetGuardsEnabled();
+        result.blockLocalVfRegistersEnabled =
+            native &&
+            native->
+                blockLocalVfRegistersEnabled();
         prepareInvocations(
             invocations, initialState, initialData,
             expectedEffects);
@@ -2121,6 +2287,10 @@ namespace
                 << ",\"block_budget_guards_enabled\":"
                 << (measurement.blockBudgetGuardsEnabled
                         ? "true" : "false")
+                << ",\"block_local_vf_registers_enabled\":"
+                << (measurement.
+                            blockLocalVfRegistersEnabled
+                        ? "true" : "false")
                 << ",\"native_entries\":"
                 << measurement.nativeDelta.nativeEntries
                 << ",\"native_blocks\":"
@@ -2273,6 +2443,10 @@ namespace
             << diagnostics.nativeEntries
             << ",\"backend_cumulative_native_blocks\":"
             << diagnostics.nativeBlocks
+            << ",\"backend_cumulative_native_pairs\":"
+            << diagnostics.nativePairs
+            << ",\"backend_cumulative_helper_pairs\":"
+            << diagnostics.helperPairs
             << ",\"backend_cumulative_linked_edges\":"
             << diagnostics.linkedEdges
             << ",\"backend_cumulative_slow_link_exits\":"
@@ -2358,7 +2532,48 @@ namespace
                 << block.linkedEdges
                 << ",\"helper_barriers\":"
                 << block.helperBarriers
-                << ",\"exit_reasons\":{";
+                << ",\"resident_vf_registers\":"
+                << block.residentVfRegisters
+                << ",\"resident_vf_dirty_registers\":"
+                << block.residentVfDirtyRegisters
+                << ",\"resident_vf_dirty_lanes\":"
+                << block.residentVfDirtyLanes
+                << ",\"maximum_live_vf_registers\":"
+                << block.maximumLiveVfRegisters
+                << ",\"vf_accesses\":"
+                << block.vfAccesses
+                << ",\"allocated_vf_accesses\":"
+                << block.allocatedVfAccesses
+                << ",\"vf_register_loads\":"
+                << block.vfRegisterLoads
+                << ",\"vf_register_stores\":"
+                << block.vfRegisterStores
+                << ",\"vf_register_spills\":"
+                << block.vfRegisterSpills
+                << ",\"vf_register_reloads\":"
+                << block.vfRegisterReloads
+                << ",\"register_materializations\":{";
+            for (size_t cause = 0u;
+                 cause <
+                     block.registerMaterializations.
+                         size();
+                 ++cause)
+            {
+                if (cause != 0u)
+                    std::cout << ",";
+                std::cout
+                    << "\""
+                    << vuRegisterMaterializationCauseName(
+                           static_cast<
+                               VuRegisterMaterializationCause>(
+                               cause))
+                    << "\":"
+                    << block.
+                           registerMaterializations[
+                               cause];
+            }
+            std::cout
+                << "},\"exit_reasons\":{";
             for (size_t exit = 0u;
                  exit < block.exitReasons.size();
                  ++exit)
@@ -2540,6 +2755,80 @@ int main(int argc, char **argv)
             << analysis.dynamicEdges
             << ",\"xgkick_boundaries\":"
             << analysis.xgkickBoundaries
+            << ",\"helper_pairs\":"
+            << analysis.helperPairs
+            << ",\"vf_read_registers\":"
+            << analysis.vfReadRegisters
+            << ",\"vf_write_registers\":"
+            << analysis.vfWriteRegisters
+            << ",\"vi_read_registers\":"
+            << analysis.viReadRegisters
+            << ",\"vi_write_registers\":"
+            << analysis.viWriteRegisters
+            << ",\"vf_live_in_registers\":"
+            << analysis.vfLiveInRegisters
+            << ",\"vi_live_in_registers\":"
+            << analysis.viLiveInRegisters
+            << ",\"block_vf_working_set\":"
+            << analysis.blockVfWorkingSet
+            << ",\"block_vi_working_set\":"
+            << analysis.blockViWorkingSet
+            << ",\"block_vf_accesses\":"
+            << analysis.blockVfAccesses
+            << ",\"top3_block_vf_accesses\":"
+            << analysis.top3BlockVfAccesses
+            << ",\"top8_block_vf_accesses\":"
+            << analysis.top8BlockVfAccesses
+            << ",\"top13_block_vf_accesses\":"
+            << analysis.top13BlockVfAccesses
+            << ",\"blocks_fitting_3_vf_registers\":"
+            << analysis.blocksFitting3VfRegisters
+            << ",\"blocks_fitting_8_vf_registers\":"
+            << analysis.blocksFitting8VfRegisters
+            << ",\"blocks_fitting_13_vf_registers\":"
+            << analysis.blocksFitting13VfRegisters
+            << ",\"maximum_vf_live_in_registers\":"
+            << analysis.maximumVfLiveInRegisters
+            << ",\"maximum_vi_live_in_registers\":"
+            << analysis.maximumViLiveInRegisters
+            << ",\"maximum_block_vf_working_set\":"
+            << analysis.maximumBlockVfWorkingSet
+            << ",\"maximum_block_vi_working_set\":"
+            << analysis.maximumBlockViWorkingSet
+            << ",\"vf_reads\":[";
+        for (size_t reg = 0u;
+             reg < analysis.vfReads.size(); ++reg)
+        {
+            if (reg != 0u)
+                std::cout << ",";
+            std::cout << analysis.vfReads[reg];
+        }
+        std::cout << "],\"vf_writes\":[";
+        for (size_t reg = 0u;
+             reg < analysis.vfWrites.size(); ++reg)
+        {
+            if (reg != 0u)
+                std::cout << ",";
+            std::cout << analysis.vfWrites[reg];
+        }
+        std::cout << "],\"vi_reads\":[";
+        for (size_t reg = 0u;
+             reg < analysis.viReads.size(); ++reg)
+        {
+            if (reg != 0u)
+                std::cout << ",";
+            std::cout << analysis.viReads[reg];
+        }
+        std::cout << "],\"vi_writes\":[";
+        for (size_t reg = 0u;
+             reg < analysis.viWrites.size(); ++reg)
+        {
+            if (reg != 0u)
+                std::cout << ",";
+            std::cout << analysis.viWrites[reg];
+        }
+        std::cout
+            << "]"
             << ",\"exit\":\""
             << vuExitReasonName(analysis.reason)
             << "\"}\n";
@@ -2736,7 +3025,14 @@ int main(int argc, char **argv)
     {
         std::cerr
             << "cold recompiler mismatch: "
-            << stateDifference << "\n";
+            << stateDifference;
+        if (!native.lastDiagnostic().empty())
+        {
+            std::cerr
+                << " (" << native.lastDiagnostic()
+                << ")";
+        }
+        std::cerr << "\n";
         return 1;
     }
 

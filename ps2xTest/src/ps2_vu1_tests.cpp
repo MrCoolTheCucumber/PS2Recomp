@@ -2637,6 +2637,173 @@ void register_ps2_vu1_tests()
             }
         });
 
+        tc.Run("VU register allocation is deterministic over analyzed block resources", [](TestCase &t)
+        {
+            VuIrBlock ir{
+                .entryPc = 0x40u,
+                .codeSize = 0x100u,
+                .form = VuIrBlockForm::LinearTrace,
+                .exit = VuIrBlockExit::PairLimit,
+            };
+            const auto makePair =
+                [](uint32_t pc,
+                    uint32_t reads,
+                    uint32_t writes,
+                    uint16_t viReads,
+                    uint16_t viWrites)
+                {
+                    VuIrInstructionPair pair{
+                        .pc = pc,
+                    };
+                    pair.upper.opcode =
+                        VuIrOpcode::Nop;
+                    pair.lower.opcode =
+                        VuIrOpcode::Nop;
+                    pair.upper.vfReadMask = reads;
+                    pair.upper.vfWriteMask = writes;
+                    pair.upper.destinationMask = 0x0fu;
+                    pair.lower.viReadMask = viReads;
+                    pair.lower.viWriteMask = viWrites;
+                    return pair;
+                };
+            ir.pairs = {
+                makePair(
+                    0x40u,
+                    (1u << 1u) | (1u << 2u),
+                    1u << 3u,
+                    static_cast<uint16_t>(
+                        (1u << 1u) | (1u << 2u)),
+                    static_cast<uint16_t>(
+                        1u << 3u)),
+                makePair(
+                    0x48u,
+                    (1u << 1u) | (1u << 3u),
+                    1u << 3u,
+                    static_cast<uint16_t>(
+                        (1u << 1u) | (1u << 3u)),
+                    static_cast<uint16_t>(
+                        1u << 3u)),
+                makePair(
+                    0x50u,
+                    (1u << 1u) | (1u << 3u),
+                    1u << 3u,
+                    static_cast<uint16_t>(
+                        (1u << 1u) | (1u << 3u)),
+                    static_cast<uint16_t>(
+                        1u << 3u)),
+            };
+
+            const VuAnalysisBlock block =
+                analyzeVuIrBlock(ir);
+            t.Equals(
+                block.fixedPairs, uint32_t{3u},
+                "exact IR analysis should retain every retiring pair");
+            t.Equals(
+                block.entry.pc, uint32_t{0x40u},
+                "exact IR analysis should retain its entry");
+            t.IsTrue(
+                !vuAnalysisResourcesEmpty(
+                    block.exitMaterialization),
+                "a canonical native exit should require materialization");
+
+            const VuAnalysisRegisterAllocation allocation =
+                allocateVuAnalysisRegisters(
+                    block, 2u, 1u);
+            t.Equals(
+                allocation.vfRegisterCount,
+                uint8_t{2u},
+                "the assignment should honor the host slot limit");
+            t.Equals(
+                allocation.vfRegisters[0u],
+                uint8_t{3u},
+                "the most frequently accessed VF should receive slot zero");
+            t.Equals(
+                allocation.vfRegisters[1u],
+                uint8_t{1u},
+                "the second-most frequent VF should receive slot one");
+            t.Equals(
+                allocation.vfHostSlots[3u],
+                uint8_t{1u},
+                "VF3 should encode host slot zero");
+            t.Equals(
+                allocation.vfHostSlots[1u],
+                uint8_t{2u},
+                "VF1 should encode host slot one");
+            t.Equals(
+                allocation.vfHostSlots[2u],
+                uint8_t{0u},
+                "the lowest-scoring VF should remain memory-resident");
+            t.Equals(
+                allocation.vfDirtyLanes[3u],
+                uint8_t{0x0fu},
+                "the assignment should retain VF3's written lanes");
+            t.Equals(
+                allocation.vfDirtyLanes[1u],
+                uint8_t{0u},
+                "a read-only resident VF should remain clean");
+            t.Equals(
+                allocation.vfAccesses, uint32_t{9u},
+                "the allocator should count every analyzed read and write");
+            t.Equals(
+                allocation.allocatedVfAccesses,
+                uint32_t{8u},
+                "assigned VFs should cover eight of nine accesses");
+            t.Equals(
+                allocation.candidateVfRegisters,
+                uint32_t{3u},
+                "three nonconstant VFs should be candidates");
+            t.Equals(
+                allocation.spilledVfRegisters,
+                uint32_t{1u},
+                "one candidate should remain in canonical memory");
+            t.Equals(
+                allocation.viRegisterCount,
+                uint8_t{1u},
+                "the VI assignment should honor the host slot limit");
+            t.Equals(
+                allocation.viRegisters[0u],
+                uint8_t{3u},
+                "the most frequently accessed VI should receive the resident slot");
+            t.Equals(
+                allocation.viHostSlots[3u],
+                uint8_t{1u},
+                "VI3 should encode the resident host slot");
+            t.IsTrue(
+                (allocation.viDirtyRegisters &
+                 static_cast<uint16_t>(
+                     1u << 3u)) != 0u,
+                "the assignment should retain VI3's dirty state");
+            t.Equals(
+                allocation.viAccesses, uint32_t{9u},
+                "the allocator should count every analyzed VI read and write");
+            t.Equals(
+                allocation.allocatedViAccesses,
+                uint32_t{5u},
+                "the resident VI should cover five of nine accesses");
+            t.Equals(
+                allocation.candidateViRegisters,
+                uint32_t{3u},
+                "three nonconstant VIs should be candidates");
+            t.Equals(
+                allocation.spilledViRegisters,
+                uint32_t{2u},
+                "two VI candidates should remain in canonical memory");
+
+            const VuAnalysisRegisterAllocation repeated =
+                allocateVuAnalysisRegisters(
+                    block, 2u, 1u);
+            t.IsTrue(
+                repeated.vfHostSlots ==
+                        allocation.vfHostSlots &&
+                    repeated.vfRegisters ==
+                        allocation.vfRegisters &&
+                    repeated.viHostSlots ==
+                        allocation.viHostSlots &&
+                    repeated.viRegisters ==
+                        allocation.viRegisters,
+                "the same block should always receive the same assignment");
+        });
+
         tc.Run("VU block analysis diagnostics and native declarations stay stable", [](TestCase &t)
         {
             t.Equals(

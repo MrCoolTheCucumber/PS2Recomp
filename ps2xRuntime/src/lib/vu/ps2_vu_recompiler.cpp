@@ -2,10 +2,12 @@
 
 #include "runtime/ps2_memory.h"
 #include "runtime/ps2_perf_jitdump.h"
+#include "runtime/ps2_vu_analysis.h"
 #include "ps2_vu_float_mode.h"
 
 #include <algorithm>
 #include <atomic>
+#include <bit>
 #include <charconv>
 #include <chrono>
 #include <cstddef>
@@ -47,6 +49,20 @@ struct VuBlockProfileRecord
     uint64_t boundedEntries = 0u;
     uint64_t linkedEdges = 0u;
     uint64_t helperBarriers = 0u;
+    uint32_t residentVfRegisters = 0u;
+    uint32_t residentVfDirtyRegisters = 0u;
+    uint32_t residentVfDirtyLanes = 0u;
+    uint32_t maximumLiveVfRegisters = 0u;
+    uint32_t vfAccesses = 0u;
+    uint32_t allocatedVfAccesses = 0u;
+    uint64_t vfRegisterLoads = 0u;
+    uint64_t vfRegisterStores = 0u;
+    uint64_t vfRegisterSpills = 0u;
+    uint64_t vfRegisterReloads = 0u;
+    std::array<
+        uint64_t,
+        kVuRegisterMaterializationCauseCount>
+        registerMaterializations{};
     std::array<
         uint64_t,
         kVuNativeBlockExitCount> exitReasons{};
@@ -319,7 +335,10 @@ namespace
             VuNativeChainRuntime *chainRuntime,
             VuBlockProfileRecord *blockProfile,
             bool blockLinkingEnabled,
-            bool blockBudgetGuardsEnabled)
+            bool blockBudgetGuardsEnabled,
+            bool preserveResidentViFrame,
+            VuAnalysisRegisterAllocation
+                registerAllocation)
             : m_buffer(kEmitterCapacity),
               m_code(m_buffer.size(), m_buffer.data()),
               m_hostFeatures(hostFeatures),
@@ -337,7 +356,11 @@ namespace
               m_blockLinkingEnabled(
                   blockLinkingEnabled),
               m_blockBudgetGuardsEnabled(
-                  blockBudgetGuardsEnabled)
+                  blockBudgetGuardsEnabled),
+              m_preserveResidentViFrame(
+                  preserveResidentViFrame),
+              m_registerAllocation(
+                  registerAllocation)
         {
             emit(
                 block, pairHelper, xgkickHelper);
@@ -397,36 +420,60 @@ namespace
         VuBlockProfileRecord *m_blockProfile = nullptr;
         bool m_blockLinkingEnabled = false;
         bool m_blockBudgetGuardsEnabled = false;
+        bool m_preserveResidentViFrame = false;
+        VuAnalysisRegisterAllocation
+            m_registerAllocation{};
         size_t m_fastEntryOffset = 0u;
         size_t m_linkedEntryOffset = 0u;
         bool m_usesAvx = false;
 
 #if defined(_WIN32)
-        static constexpr int kStackBytes = 96;
+        static constexpr int kBaseStackBytes = 96;
+        static constexpr int
+            kSavedVectorRegistersOffset = 96;
+        static constexpr int
+            kRegisterStackBytes = 176;
         static constexpr int kSavedMxcsrOffset = 32;
         static constexpr int kVuMxcsrOffset = 36;
         static constexpr int kResultOffset = 48;
         static constexpr int kContextViewOffset = 64;
         static constexpr int kPrecisePairCountOffset = 40;
 #else
-        static constexpr int kStackBytes = 64;
+        static constexpr int kBaseStackBytes = 64;
+        static constexpr int kRegisterStackBytes = 0;
         static constexpr int kSavedMxcsrOffset = 0;
         static constexpr int kVuMxcsrOffset = 4;
         static constexpr int kResultOffset = 16;
         static constexpr int kContextViewOffset = 32;
         static constexpr int kPrecisePairCountOffset = 8;
 #endif
-        static constexpr int kRawEntryFlagOffset =
-            kStackBytes - 1;
+        [[nodiscard]] int stackBytes() const
+        {
+            return
+                kBaseStackBytes +
+                (m_preserveResidentViFrame
+                     ? 8
+                     : 0) +
+                (m_registerAllocation.
+                         vfRegisterCount > 3u
+                     ? kRegisterStackBytes
+                     : 0);
+        }
+
+        [[nodiscard]] int rawEntryFlagOffset() const
+        {
+            return stackBytes() - 1;
+        }
+
         static_assert(
             kContextViewOffset +
                     static_cast<int>(
                         sizeof(NativeContextView)) <=
-                kRawEntryFlagOffset);
+                kBaseStackBytes - 1);
         static_assert(
             kPrecisePairCountOffset +
                     static_cast<int>(sizeof(uint64_t)) <=
-                kRawEntryFlagOffset);
+                kBaseStackBytes - 1);
         static_assert(
             kPrecisePairCountOffset +
                         static_cast<int>(
@@ -454,6 +501,401 @@ namespace
             return stateOffset(
                 offsetof(VuExecutionState, pipeline) +
                 value);
+        }
+
+        static constexpr int vfOffset(uint8_t reg)
+        {
+            return stateOffset(
+                offsetof(VuExecutionState, vf) +
+                static_cast<size_t>(reg) *
+                    sizeof(float) * 4u);
+        }
+
+        static constexpr int viOffset(uint8_t reg)
+        {
+            return stateOffset(
+                offsetof(VuExecutionState, vi) +
+                static_cast<size_t>(reg) *
+                    sizeof(int32_t));
+        }
+
+        [[nodiscard]] bool hasResidentVf(
+            uint8_t reg) const
+        {
+            return
+                reg < m_registerAllocation.
+                          vfHostSlots.size() &&
+                m_registerAllocation.
+                        vfHostSlots[reg] != 0u;
+        }
+
+        [[nodiscard]] Xbyak::Xmm residentVf(
+            uint8_t reg) const
+        {
+            return Xbyak::Xmm(
+                2 +
+                m_registerAllocation.
+                    vfHostSlots[reg]);
+        }
+
+        [[nodiscard]] bool hasResidentVi(
+            uint8_t reg) const
+        {
+            return
+                reg < m_registerAllocation.
+                          viHostSlots.size() &&
+                m_registerAllocation.
+                        viHostSlots[reg] != 0u;
+        }
+
+        [[nodiscard]] const Xbyak::Reg32 &
+        residentVi() const
+        {
+            return m_code.ebp;
+        }
+
+        [[nodiscard]] const Xbyak::Reg16 &
+        residentViWord() const
+        {
+            return m_code.bp;
+        }
+
+        void emitReadVi(
+            uint8_t reg,
+            const Xbyak::Reg32 &destination)
+        {
+            if (reg == 0u)
+            {
+                m_code.xor_(
+                    destination, destination);
+            }
+            else if (hasResidentVi(reg))
+            {
+                m_code.mov(
+                    destination, residentVi());
+            }
+            else
+            {
+                m_code.mov(
+                    destination,
+                    m_code.dword[
+                        m_code.rbx +
+                        viOffset(reg)]);
+            }
+        }
+
+        void emitReadViWord(
+            uint8_t reg,
+            const Xbyak::Reg32 &destination,
+            bool signExtend)
+        {
+            if (reg == 0u)
+            {
+                m_code.xor_(
+                    destination, destination);
+            }
+            else if (hasResidentVi(reg))
+            {
+                if (signExtend)
+                {
+                    m_code.movsx(
+                        destination,
+                        residentViWord());
+                }
+                else
+                {
+                    m_code.movzx(
+                        destination,
+                        residentViWord());
+                }
+            }
+            else if (signExtend)
+            {
+                m_code.movsx(
+                    destination,
+                    m_code.word[
+                        m_code.rbx +
+                        viOffset(reg)]);
+            }
+            else
+            {
+                m_code.movzx(
+                    destination,
+                    m_code.word[
+                        m_code.rbx +
+                        viOffset(reg)]);
+            }
+        }
+
+        void emitWriteVi(
+            uint8_t reg,
+            const Xbyak::Reg32 &source)
+        {
+            if (reg == 0u)
+                return;
+            if (hasResidentVi(reg))
+            {
+                m_code.mov(residentVi(), source);
+            }
+            else
+            {
+                m_code.mov(
+                    m_code.dword[
+                        m_code.rbx +
+                        viOffset(reg)],
+                    source);
+            }
+        }
+
+        void emitWriteVi(
+            uint8_t reg, uint32_t value)
+        {
+            if (reg == 0u)
+                return;
+            if (hasResidentVi(reg))
+            {
+                m_code.mov(residentVi(), value);
+            }
+            else
+            {
+                m_code.mov(
+                    m_code.dword[
+                        m_code.rbx +
+                        viOffset(reg)],
+                    value);
+            }
+        }
+
+        static constexpr uint8_t blendMask(
+            uint8_t destination)
+        {
+            return static_cast<uint8_t>(
+                ((destination & 0x8u) != 0u
+                     ? 0x1u : 0u) |
+                ((destination & 0x4u) != 0u
+                     ? 0x2u : 0u) |
+                ((destination & 0x2u) != 0u
+                     ? 0x4u : 0u) |
+                ((destination & 0x1u) != 0u
+                        ? 0x8u : 0u));
+        }
+
+        void emitAddBlockProfileCounter(
+            size_t offset, uint32_t amount)
+        {
+            if (!m_blockProfile || amount == 0u)
+                return;
+            m_code.mov(
+                m_code.rax,
+                reinterpret_cast<uint64_t>(
+                    m_blockProfile));
+            m_code.add(
+                m_code.qword[
+                    m_code.rax +
+                    static_cast<int>(offset)],
+                amount);
+        }
+
+        void emitProfileMaterialization(
+            VuRegisterMaterializationCause cause)
+        {
+            if (!m_blockProfile)
+                return;
+            m_code.mov(
+                m_code.rax,
+                reinterpret_cast<uint64_t>(
+                    m_blockProfile));
+            m_code.inc(
+                m_code.qword[
+                    m_code.rax +
+                    offsetof(
+                        VuBlockProfileRecord,
+                        registerMaterializations) +
+                    sizeof(uint64_t) *
+                        static_cast<size_t>(
+                            cause)]);
+        }
+
+        void emitLoadResidentRegisters(
+            bool reload = false,
+            bool includeVi = true)
+        {
+            if (m_registerAllocation.
+                        vfRegisterCount == 0u &&
+                (!includeVi ||
+                 m_registerAllocation.
+                         viRegisterCount == 0u))
+            {
+                return;
+            }
+            Xbyak::Label done;
+            m_code.test(m_code.rbx, m_code.rbx);
+            m_code.jz(done, m_code.T_NEAR);
+            emitAddBlockProfileCounter(
+                offsetof(
+                    VuBlockProfileRecord,
+                    vfRegisterLoads),
+                m_registerAllocation.
+                    vfRegisterCount);
+            if (reload)
+            {
+                emitAddBlockProfileCounter(
+                    offsetof(
+                        VuBlockProfileRecord,
+                        vfRegisterReloads),
+                    m_registerAllocation.
+                        vfRegisterCount);
+            }
+            for (uint8_t slot = 0u;
+                 slot <
+                     m_registerAllocation.
+                         vfRegisterCount;
+                 ++slot)
+            {
+                const uint8_t reg =
+                    m_registerAllocation.
+                        vfRegisters[slot];
+                m_code.movups(
+                    Xbyak::Xmm(3 + slot),
+                    m_code.ptr[
+                        m_code.rbx +
+                        vfOffset(reg)]);
+            }
+            if (includeVi &&
+                m_registerAllocation.
+                        viRegisterCount != 0u)
+            {
+                const uint8_t reg =
+                    m_registerAllocation.
+                        viRegisters[0u];
+                m_code.mov(
+                    residentVi(),
+                    m_code.dword[
+                        m_code.rbx +
+                        viOffset(reg)]);
+            }
+            m_code.L(done);
+        }
+
+        void emitMaterializeResidentRegisters(
+            VuRegisterMaterializationCause cause,
+            bool spill,
+            bool includeVi = true)
+        {
+            if (m_registerAllocation.
+                        vfRegisterCount == 0u &&
+                (!includeVi ||
+                 m_registerAllocation.
+                         viRegisterCount == 0u))
+            {
+                return;
+            }
+            uint32_t storeCount = 0u;
+            for (uint8_t slot = 0u;
+                 slot <
+                     m_registerAllocation.
+                         vfRegisterCount;
+                 ++slot)
+            {
+                const uint8_t reg =
+                    m_registerAllocation.
+                        vfRegisters[slot];
+                storeCount +=
+                    m_registerAllocation.
+                            vfDirtyLanes[reg] != 0u
+                        ? 1u
+                        : 0u;
+            }
+            Xbyak::Label done;
+            m_code.test(m_code.rbx, m_code.rbx);
+            m_code.jz(done, m_code.T_NEAR);
+            emitProfileMaterialization(cause);
+            emitAddBlockProfileCounter(
+                offsetof(
+                    VuBlockProfileRecord,
+                    vfRegisterStores),
+                storeCount);
+            if (spill)
+            {
+                emitAddBlockProfileCounter(
+                    offsetof(
+                        VuBlockProfileRecord,
+                        vfRegisterSpills),
+                    storeCount);
+            }
+            for (uint8_t slot = 0u;
+                 slot <
+                     m_registerAllocation.
+                         vfRegisterCount;
+                 ++slot)
+            {
+                const uint8_t reg =
+                    m_registerAllocation.
+                        vfRegisters[slot];
+                const uint8_t lanes =
+                    m_registerAllocation.
+                        vfDirtyLanes[reg];
+                if (lanes == 0u)
+                    continue;
+                m_code.movups(
+                    m_code.ptr[
+                        m_code.rbx +
+                        vfOffset(reg)],
+                    Xbyak::Xmm(3 + slot));
+            }
+            if (includeVi &&
+                m_registerAllocation.
+                        viRegisterCount != 0u)
+            {
+                const uint8_t reg =
+                    m_registerAllocation.
+                        viRegisters[0u];
+                const uint16_t bit =
+                    static_cast<uint16_t>(
+                        1u << reg);
+                if ((m_registerAllocation.
+                         viDirtyRegisters &
+                     bit) != 0u)
+                {
+                    m_code.mov(
+                        m_code.dword[
+                            m_code.rbx +
+                            viOffset(reg)],
+                        residentVi());
+                }
+            }
+            m_code.L(done);
+        }
+
+        void emitLoadVf(
+            uint8_t reg,
+            const Xbyak::Xmm &destination)
+        {
+            if (hasResidentVf(reg))
+            {
+                m_code.movaps(
+                    destination,
+                    residentVf(reg));
+                return;
+            }
+            m_code.movups(
+                destination,
+                m_code.ptr[
+                    m_code.rbx + vfOffset(reg)]);
+        }
+
+        void emitLoadVfComponent(
+            uint8_t reg, uint8_t component,
+            const Xbyak::Xmm &destination)
+        {
+            emitLoadVf(reg, destination);
+            if (component != 0u)
+            {
+                m_code.shufps(
+                    destination, destination,
+                    static_cast<uint8_t>(
+                        component * 0x55u));
+            }
         }
 
         bool canInlineUpper(
@@ -794,11 +1236,6 @@ namespace
                     offsetof(
                         VuExecutionState,
                         viBackupValue));
-            const int viOffset =
-                stateOffset(
-                    offsetof(VuExecutionState, vi) +
-                    static_cast<size_t>(reg) *
-                        sizeof(int32_t));
             Label replace;
             Label done;
 
@@ -827,10 +1264,8 @@ namespace
                 m_code.byte[
                     m_code.rbx + registerOffset],
                 reg);
-            m_code.movsx(
-                m_code.eax,
-                m_code.word[
-                    m_code.rbx + viOffset]);
+            emitReadViWord(
+                reg, m_code.eax, true);
             m_code.mov(
                 m_code.dword[
                     m_code.rbx + valueOffset],
@@ -864,11 +1299,6 @@ namespace
                     offsetof(
                         VuExecutionState,
                         viBackupValue));
-            const int viOffset =
-                stateOffset(
-                    offsetof(VuExecutionState, vi) +
-                    static_cast<size_t>(reg) *
-                        sizeof(int32_t));
             Label liveValue;
             Label done;
             m_code.cmp(
@@ -889,10 +1319,8 @@ namespace
             m_code.jmp(done);
 
             m_code.L(liveValue);
-            m_code.movsx(
-                result,
-                m_code.word[
-                    m_code.rbx + viOffset]);
+            emitReadViWord(
+                reg, result, true);
             m_code.L(done);
         }
 
@@ -967,11 +1395,29 @@ namespace
             if (target == 0u || destination == 0u)
                 return;
 
+            if (hasResidentVf(target))
+            {
+                if (destination == 0x0fu)
+                {
+                    m_code.movups(
+                        residentVf(target),
+                        m_code.ptr[address]);
+                }
+                else
+                {
+                    m_code.movups(
+                        m_code.xmm0,
+                        m_code.ptr[address]);
+                    m_code.blendps(
+                        residentVf(target),
+                        m_code.xmm0,
+                        blendMask(destination));
+                }
+                return;
+            }
+
             const int targetOffset =
-                stateOffset(
-                    offsetof(VuExecutionState, vf) +
-                    static_cast<size_t>(target) *
-                        sizeof(float) * 4u);
+                vfOffset(target);
             if (destination == 0x0fu)
             {
                 m_code.movups(
@@ -1008,11 +1454,39 @@ namespace
             if (destination == 0u)
                 return;
 
+            if (hasResidentVf(source))
+            {
+                if (destination == 0x0fu)
+                {
+                    m_code.movups(
+                        m_code.ptr[address],
+                        residentVf(source));
+                    return;
+                }
+                for (uint32_t lane = 0u;
+                     lane < 4u; ++lane)
+                {
+                    if ((destination &
+                         (0x8u >> lane)) == 0u)
+                    {
+                        continue;
+                    }
+                    m_code.pextrd(
+                        m_code.eax,
+                        residentVf(source),
+                        static_cast<uint8_t>(lane));
+                    m_code.mov(
+                        m_code.dword[
+                            address +
+                            static_cast<int>(
+                                lane * 4u)],
+                        m_code.eax);
+                }
+                return;
+            }
+
             const int sourceOffset =
-                stateOffset(
-                    offsetof(VuExecutionState, vf) +
-                    static_cast<size_t>(source) *
-                        sizeof(float) * 4u);
+                vfOffset(source);
             if (destination == 0x0fu)
             {
                 m_code.movups(
@@ -1081,13 +1555,61 @@ namespace
         void emitApplyResultToVf(
             uint8_t target, uint8_t destination)
         {
-            if (target == 0u)
+            if (target == 0u || destination == 0u)
                 return;
+            if (hasResidentVf(target))
+            {
+                m_code.movups(
+                    m_code.xmm0,
+                    m_code.ptr[
+                        m_code.rsp + kResultOffset]);
+                if (destination == 0x0fu)
+                {
+                    m_code.movaps(
+                        residentVf(target),
+                        m_code.xmm0);
+                }
+                else
+                {
+                    m_code.blendps(
+                        residentVf(target),
+                        m_code.xmm0,
+                        blendMask(destination));
+                }
+                return;
+            }
             emitApplyResultToOffset(
-                stateOffset(
-                    offsetof(VuExecutionState, vf) +
-                    static_cast<size_t>(target) *
-                        sizeof(float) * 4u),
+                vfOffset(target),
+                destination);
+        }
+
+        void emitApplyXmmToVf(
+            uint8_t target, uint8_t destination,
+            const Xbyak::Xmm &source)
+        {
+            if (target == 0u || destination == 0u)
+                return;
+            if (hasResidentVf(target))
+            {
+                if (destination == 0x0fu)
+                {
+                    m_code.movaps(
+                        residentVf(target), source);
+                }
+                else
+                {
+                    m_code.blendps(
+                        residentVf(target), source,
+                        blendMask(destination));
+                }
+                return;
+            }
+            m_code.movups(
+                m_code.ptr[
+                    m_code.rsp + kResultOffset],
+                source);
+            emitApplyResultToOffset(
+                vfOffset(target),
                 destination);
         }
 
@@ -1095,15 +1617,8 @@ namespace
             uint8_t sourceVi, uint8_t destination,
             const Xbyak::Reg64 &address)
         {
-            const int sourceOffset =
-                stateOffset(
-                    offsetof(VuExecutionState, vi) +
-                    static_cast<size_t>(sourceVi) *
-                        sizeof(int32_t));
-            m_code.movzx(
-                m_code.eax,
-                m_code.word[
-                    m_code.rbx + sourceOffset]);
+            emitReadViWord(
+                sourceVi, m_code.eax, false);
             for (uint32_t lane = 0u; lane < 4u; ++lane)
             {
                 if ((destination & (0x8u >> lane)) == 0u)
@@ -1130,66 +1645,40 @@ namespace
                 lane = 1u;
             else if ((destination & 0x2u) != 0u)
                 lane = 2u;
-            const int targetOffset =
-                stateOffset(
-                    offsetof(VuExecutionState, vi) +
-                    static_cast<size_t>(targetVi) *
-                        sizeof(int32_t));
             m_code.movsx(
                 m_code.eax,
                 m_code.word[
                     address +
                     static_cast<int>(lane * 4u)]);
-            m_code.mov(
-                m_code.dword[
-                    m_code.rbx + targetOffset],
-                m_code.eax);
+            emitWriteVi(
+                targetVi, m_code.eax);
         }
 
         void emitIncrementVi(uint8_t reg)
         {
             if (reg == 0u)
                 return;
-            const int viOffset =
-                stateOffset(
-                    offsetof(VuExecutionState, vi) +
-                    static_cast<size_t>(reg) *
-                        sizeof(int32_t));
-            m_code.movsx(
-                m_code.eax,
-                m_code.word[
-                    m_code.rbx + viOffset]);
+            emitReadViWord(
+                reg, m_code.eax, true);
             m_code.inc(m_code.eax);
             m_code.movsx(
                 m_code.eax, m_code.ax);
-            m_code.mov(
-                m_code.dword[
-                    m_code.rbx + viOffset],
-                m_code.eax);
+            emitWriteVi(reg, m_code.eax);
         }
 
         void emitDataAddress(
             uint8_t base, int32_t immediate,
             bool unsignedBase, Xbyak::Label &outOfBounds)
         {
-            const int viOffset =
-                stateOffset(
-                    offsetof(VuExecutionState, vi) +
-                    static_cast<size_t>(base) *
-                        sizeof(int32_t));
             if (unsignedBase)
             {
-                m_code.movzx(
-                    m_code.eax,
-                    m_code.word[
-                        m_code.rbx + viOffset]);
+                emitReadViWord(
+                    base, m_code.eax, false);
             }
             else
             {
-                m_code.mov(
-                    m_code.eax,
-                    m_code.dword[
-                        m_code.rbx + viOffset]);
+                emitReadVi(
+                    base, m_code.eax);
                 if (immediate != 0)
                     m_code.add(m_code.eax, immediate);
             }
@@ -1259,15 +1748,6 @@ namespace
                           32
                     : static_cast<int32_t>(
                           (word >> 6u) & 0x1fu);
-            const auto viOffset =
-                [](uint8_t reg)
-                {
-                    return stateOffset(
-                        offsetof(VuExecutionState, vi) +
-                        static_cast<size_t>(reg) *
-                            sizeof(int32_t));
-                };
-
             switch (pair.lower.opcode)
             {
             case VuIrOpcode::Nop:
@@ -1321,10 +1801,8 @@ namespace
             {
                 if (viT == 0u)
                     return;
-                m_code.mov(
-                    m_code.eax,
-                    m_code.dword[
-                        m_code.rbx + viOffset(viS)]);
+                emitReadVi(
+                    viS, m_code.eax);
                 if (pair.lower.opcode ==
                     VuIrOpcode::LowerIaddiu)
                 {
@@ -1338,10 +1816,8 @@ namespace
                 }
                 m_code.movsx(
                     m_code.eax, m_code.ax);
-                m_code.mov(
-                    m_code.dword[
-                        m_code.rbx + viOffset(viT)],
-                    m_code.eax);
+                emitWriteVi(
+                    viT, m_code.eax);
                 return;
             }
             case VuIrOpcode::LowerIadd:
@@ -1349,51 +1825,39 @@ namespace
             {
                 if (viD == 0u)
                     return;
-                m_code.mov(
-                    m_code.eax,
-                    m_code.dword[
-                        m_code.rbx + viOffset(viS)]);
+                emitReadVi(
+                    viS, m_code.eax);
+                emitReadVi(
+                    viT, m_code.ecx);
                 if (pair.lower.opcode ==
                     VuIrOpcode::LowerIadd)
                 {
                     m_code.add(
-                        m_code.eax,
-                        m_code.dword[
-                            m_code.rbx +
-                            viOffset(viT)]);
+                        m_code.eax, m_code.ecx);
                 }
                 else
                 {
                     m_code.sub(
-                        m_code.eax,
-                        m_code.dword[
-                            m_code.rbx +
-                            viOffset(viT)]);
+                        m_code.eax, m_code.ecx);
                 }
                 m_code.movsx(
                     m_code.eax, m_code.ax);
-                m_code.mov(
-                    m_code.dword[
-                        m_code.rbx + viOffset(viD)],
-                    m_code.eax);
+                emitWriteVi(
+                    viD, m_code.eax);
                 return;
             }
             case VuIrOpcode::LowerIaddi:
             {
                 if (viT == 0u)
                     return;
-                m_code.mov(
-                    m_code.eax,
-                    m_code.dword[
-                        m_code.rbx + viOffset(viS)]);
+                emitReadVi(
+                    viS, m_code.eax);
                 m_code.add(
                     m_code.eax, immediate5);
                 m_code.movsx(
                     m_code.eax, m_code.ax);
-                m_code.mov(
-                    m_code.dword[
-                        m_code.rbx + viOffset(viT)],
-                    m_code.eax);
+                emitWriteVi(
+                    viT, m_code.eax);
                 return;
             }
             case VuIrOpcode::LowerIand:
@@ -1401,74 +1865,42 @@ namespace
             {
                 if (viD == 0u)
                     return;
-                m_code.mov(
-                    m_code.eax,
-                    m_code.dword[
-                        m_code.rbx + viOffset(viS)]);
+                emitReadVi(
+                    viS, m_code.eax);
+                emitReadVi(
+                    viT, m_code.ecx);
                 if (pair.lower.opcode ==
                     VuIrOpcode::LowerIand)
                 {
                     m_code.and_(
-                        m_code.eax,
-                        m_code.dword[
-                            m_code.rbx +
-                            viOffset(viT)]);
+                        m_code.eax, m_code.ecx);
                 }
                 else
                 {
                     m_code.or_(
-                        m_code.eax,
-                        m_code.dword[
-                            m_code.rbx +
-                            viOffset(viT)]);
+                        m_code.eax, m_code.ecx);
                 }
-                m_code.mov(
-                    m_code.dword[
-                        m_code.rbx + viOffset(viD)],
-                    m_code.eax);
+                emitWriteVi(
+                    viD, m_code.eax);
                 return;
             }
             case VuIrOpcode::LowerMove:
             {
-                const int sourceOffset =
-                    stateOffset(
-                        offsetof(
-                            VuExecutionState, vf) +
-                        static_cast<size_t>(vfS) *
-                            sizeof(float) * 4u);
-                m_code.movups(
-                    m_code.xmm0,
-                    m_code.ptr[
-                        m_code.rbx + sourceOffset]);
-                m_code.movups(
-                    m_code.ptr[
-                        m_code.rsp + kResultOffset],
+                emitLoadVf(vfS, m_code.xmm0);
+                emitApplyXmmToVf(
+                    vfT, destination,
                     m_code.xmm0);
-                emitApplyResultToVf(
-                    vfT, destination);
                 return;
             }
             case VuIrOpcode::LowerMr32:
             {
-                const int sourceOffset =
-                    stateOffset(
-                        offsetof(
-                            VuExecutionState, vf) +
-                        static_cast<size_t>(vfS) *
-                            sizeof(float) * 4u);
-                m_code.movups(
-                    m_code.xmm0,
-                    m_code.ptr[
-                        m_code.rbx + sourceOffset]);
+                emitLoadVf(vfS, m_code.xmm0);
                 m_code.shufps(
                     m_code.xmm0, m_code.xmm0,
                     0x39u);
-                m_code.movups(
-                    m_code.ptr[
-                        m_code.rsp + kResultOffset],
+                emitApplyXmmToVf(
+                    vfT, destination,
                     m_code.xmm0);
-                emitApplyResultToVf(
-                    vfT, destination);
                 return;
             }
             case VuIrOpcode::LowerLqi:
@@ -1503,51 +1935,48 @@ namespace
                 const uint8_t component =
                     static_cast<uint8_t>(
                         (word >> 21u) & 3u);
-                const int sourceOffset =
-                    stateOffset(
-                        offsetof(
-                            VuExecutionState, vf) +
-                        static_cast<size_t>(vfS) *
-                            sizeof(float) * 4u +
-                        static_cast<size_t>(component) *
-                            sizeof(float));
-                const int targetOffset =
-                    stateOffset(
-                        offsetof(
-                            VuExecutionState, vi) +
-                        static_cast<size_t>(viT) *
-                            sizeof(int32_t));
+                emitLoadVfComponent(
+                    vfS, component,
+                    m_code.xmm0);
+                m_code.movd(
+                    m_code.eax, m_code.xmm0);
                 m_code.movsx(
-                    m_code.eax,
-                    m_code.word[
-                        m_code.rbx + sourceOffset]);
-                m_code.mov(
-                    m_code.dword[
-                        m_code.rbx + targetOffset],
-                    m_code.eax);
+                    m_code.eax, m_code.ax);
+                emitWriteVi(
+                    viT, m_code.eax);
                 return;
             }
             case VuIrOpcode::LowerMfir:
             {
-                const int sourceOffset =
-                    viOffset(viS);
-                m_code.movsx(
-                    m_code.eax,
-                    m_code.word[
-                        m_code.rbx + sourceOffset]);
-                for (uint32_t lane = 0u;
-                     lane < 4u; ++lane)
+                emitReadViWord(
+                    viS, m_code.eax, true);
+                if (hasResidentVf(vfT))
                 {
-                    m_code.mov(
-                        m_code.dword[
-                            m_code.rsp +
-                            kResultOffset +
-                            static_cast<int>(
-                                lane * 4u)],
-                        m_code.eax);
+                    m_code.movd(
+                        m_code.xmm0, m_code.eax);
+                    m_code.pshufd(
+                        m_code.xmm0,
+                        m_code.xmm0, 0u);
+                    emitApplyXmmToVf(
+                        vfT, destination,
+                        m_code.xmm0);
                 }
-                emitApplyResultToVf(
-                    vfT, destination);
+                else
+                {
+                    for (uint32_t lane = 0u;
+                         lane < 4u; ++lane)
+                    {
+                        m_code.mov(
+                            m_code.dword[
+                                m_code.rsp +
+                                kResultOffset +
+                                static_cast<int>(
+                                    lane * 4u)],
+                            m_code.eax);
+                    }
+                    emitApplyResultToVf(
+                        vfT, destination);
+                }
                 return;
             }
             case VuIrOpcode::LowerIlwr:
@@ -1588,10 +2017,8 @@ namespace
                         m_code.rbx +
                         stateOffset(source)]);
                 m_code.and_(m_code.eax, 0x3ffu);
-                m_code.mov(
-                    m_code.dword[
-                        m_code.rbx + viOffset(viT)],
-                    m_code.eax);
+                emitWriteVi(
+                    viT, m_code.eax);
                 return;
             }
             case VuIrOpcode::LowerDiv:
@@ -1602,36 +2029,15 @@ namespace
                 const uint8_t denominatorComponent =
                     static_cast<uint8_t>(
                         (word >> 23u) & 3u);
-                const int numeratorOffset =
-                    stateOffset(
-                        offsetof(
-                            VuExecutionState, vf) +
-                        static_cast<size_t>(vfS) *
-                            sizeof(float) * 4u +
-                        static_cast<size_t>(
-                            numeratorComponent) *
-                            sizeof(float));
-                const int denominatorOffset =
-                    stateOffset(
-                        offsetof(
-                            VuExecutionState, vf) +
-                        static_cast<size_t>(vfT) *
-                            sizeof(float) * 4u +
-                        static_cast<size_t>(
-                            denominatorComponent) *
-                            sizeof(float));
                 Label divide;
                 Label negativeSaturation;
                 Label schedule;
-                m_code.movss(
-                    m_code.xmm0,
-                    m_code.dword[
-                        m_code.rbx + numeratorOffset]);
-                m_code.movss(
-                    m_code.xmm1,
-                    m_code.dword[
-                        m_code.rbx +
-                        denominatorOffset]);
+                emitLoadVfComponent(
+                    vfS, numeratorComponent,
+                    m_code.xmm0);
+                emitLoadVfComponent(
+                    vfT, denominatorComponent,
+                    m_code.xmm1);
                 m_code.xorps(
                     m_code.xmm2, m_code.xmm2);
                 m_code.ucomiss(
@@ -1702,10 +2108,8 @@ namespace
                         VuIrOpcode::LowerBal &&
                     viT != 0u)
                 {
-                    m_code.mov(
-                        m_code.dword[
-                            m_code.rbx +
-                            viOffset(viT)],
+                    emitWriteVi(
+                        viT,
                         (pair.pc + 16u) / 8u);
                 }
                 emitArmBranch(target);
@@ -1714,20 +2118,15 @@ namespace
             case VuIrOpcode::LowerJr:
             case VuIrOpcode::LowerJalr:
             {
-                m_code.movzx(
-                    m_code.eax,
-                    m_code.word[
-                        m_code.rbx +
-                        viOffset(viS)]);
+                emitReadViWord(
+                    viS, m_code.eax, false);
                 m_code.shl(m_code.eax, 3u);
                 if (pair.lower.opcode ==
                         VuIrOpcode::LowerJalr &&
                     viT != 0u)
                 {
-                    m_code.mov(
-                        m_code.dword[
-                            m_code.rbx +
-                            viOffset(viT)],
+                    emitWriteVi(
+                        viT,
                         (pair.pc + 16u) / 8u);
                 }
                 emitArmBranchFromEax();
@@ -1804,7 +2203,9 @@ namespace
             }
         }
 
-        void emitScheduleFmacFlags(uint8_t destination)
+        void emitScheduleFmacFlags(
+            uint8_t destination,
+            const Xbyak::Xmm *result = nullptr)
         {
             using Flags = VuPipelineState::FmacFlags;
             using namespace Xbyak;
@@ -1821,11 +2222,22 @@ namespace
                 Label denormal;
                 Label overflow;
                 Label laneDone;
-                m_code.mov(
-                    m_code.eax,
-                    m_code.dword[
-                        m_code.rsp + kResultOffset +
-                        static_cast<int>(lane * 4u)]);
+                if (result)
+                {
+                    m_code.pextrd(
+                        m_code.eax, *result,
+                        static_cast<uint8_t>(lane));
+                }
+                else
+                {
+                    m_code.mov(
+                        m_code.eax,
+                        m_code.dword[
+                            m_code.rsp +
+                            kResultOffset +
+                            static_cast<int>(
+                                lane * 4u)]);
+                }
                 m_code.test(
                     m_code.eax, 0x80000000u);
                 m_code.jz(noSign);
@@ -1939,11 +2351,6 @@ namespace
             const uint8_t source =
                 static_cast<uint8_t>(
                     (word >> 11u) & 0x1fu);
-            const int sourceOffset =
-                stateOffset(
-                    offsetof(VuExecutionState, vf) +
-                    static_cast<size_t>(source) *
-                        sizeof(float) * 4u);
 
             bool integerToFloat = false;
             uint32_t scaleBits = 0x3f800000u;
@@ -1979,10 +2386,7 @@ namespace
                 return;
             }
 
-            m_code.movups(
-                m_code.xmm0,
-                m_code.ptr[
-                    m_code.rbx + sourceOffset]);
+            emitLoadVf(source, m_code.xmm0);
             if (integerToFloat)
             {
                 m_code.cvtdq2ps(
@@ -2029,12 +2433,9 @@ namespace
                     m_code.xmm0, m_code.xmm1);
             }
 
-            m_code.movups(
-                m_code.ptr[
-                    m_code.rsp + kResultOffset],
+            emitApplyXmmToVf(
+                target, destination,
                 m_code.xmm0);
-            emitApplyResultToVf(
-                target, destination);
         }
 
         void emitUpper(
@@ -2283,16 +2684,6 @@ namespace
             const uint8_t target =
                 static_cast<uint8_t>(
                     (word >> 6u) & 0x1fu);
-            const int sourceOffset =
-                stateOffset(
-                    offsetof(VuExecutionState, vf) +
-                    static_cast<size_t>(source) *
-                        sizeof(float) * 4u);
-            const int rightOffset =
-                stateOffset(
-                    offsetof(VuExecutionState, vf) +
-                    static_cast<size_t>(right) *
-                        sizeof(float) * 4u);
             const int qOffset =
                 stateOffset(
                     offsetof(VuExecutionState, q));
@@ -2300,23 +2691,14 @@ namespace
                 stateOffset(
                     offsetof(VuExecutionState, i));
 
-            m_code.movups(
-                m_code.xmm0,
-                m_code.ptr[
-                    m_code.rbx + sourceOffset]);
+            emitLoadVf(source, m_code.xmm0);
             switch (rightSource)
             {
             case RightSource::Vector:
-                m_code.movups(
-                    m_code.xmm1,
-                    m_code.ptr[
-                        m_code.rbx + rightOffset]);
+                emitLoadVf(right, m_code.xmm1);
                 break;
             case RightSource::Broadcast:
-                m_code.movups(
-                    m_code.xmm1,
-                    m_code.ptr[
-                        m_code.rbx + rightOffset]);
+                emitLoadVf(right, m_code.xmm1);
                 m_code.shufps(
                     m_code.xmm1, m_code.xmm1,
                     static_cast<uint8_t>(
@@ -2396,27 +2778,48 @@ namespace
                 m_usesAvx = true;
                 break;
             }
-            m_code.movups(
-                m_code.ptr[
-                    m_code.rsp + kResultOffset],
-                m_code.xmm0);
+            const bool directVectorResult =
+                !accumulatorDestination &&
+                target != 0u &&
+                destination != 0u &&
+                hasResidentVf(target);
             if (accumulatorDestination)
             {
+                m_code.movups(
+                    m_code.ptr[
+                        m_code.rsp +
+                        kResultOffset],
+                    m_code.xmm0);
                 emitApplyResultToOffset(
                     stateOffset(
                         offsetof(
                             VuExecutionState, acc)),
                     destination);
             }
+            else if (directVectorResult)
+            {
+                emitApplyXmmToVf(
+                    target, destination,
+                    m_code.xmm0);
+            }
             else
             {
+                m_code.movups(
+                    m_code.ptr[
+                        m_code.rsp +
+                        kResultOffset],
+                    m_code.xmm0);
                 emitApplyResultToVf(
                     target, destination);
             }
             if (vuIrHasOpFlag(
                     pair.upper, VuIrOpFmac))
             {
-                emitScheduleFmacFlags(destination);
+                emitScheduleFmacFlags(
+                    destination,
+                    directVectorResult
+                        ? &m_code.xmm0
+                        : nullptr);
             }
         }
 
@@ -2560,7 +2963,8 @@ namespace
                 m_code.byte[
                     m_code.rbx + xgkickActiveOffset],
                 0u);
-            m_code.je(noActiveXgkick);
+            m_code.je(
+                noActiveXgkick, m_code.T_NEAR);
             Xbyak::Label callXgkickHelper;
             m_code.cmp(
                 m_code.dword[
@@ -2577,9 +2981,14 @@ namespace
                 m_code.dword[
                     m_code.rbx + xgkickCreditOffset],
                 1u);
-            m_code.jmp(noActiveXgkick);
+            m_code.jmp(
+                noActiveXgkick, m_code.T_NEAR);
 
             m_code.L(callXgkickHelper);
+            emitMaterializeResidentRegisters(
+                VuRegisterMaterializationCause::
+                    XgkickHelper,
+                true, false);
             if (m_usesAvx)
                 m_code.vzeroupper();
 #if defined(_WIN32)
@@ -2601,6 +3010,8 @@ namespace
                     xgkickHelper));
             m_code.call(m_code.rax);
             m_code.mov(m_code.r11d, m_code.eax);
+            emitLoadResidentRegisters(
+                true, false);
             m_code.L(noActiveXgkick);
 
             const uint32_t nextPc =
@@ -2679,6 +3090,10 @@ namespace
             bool preciseBudget,
             bool checkedBudget)
         {
+            emitMaterializeResidentRegisters(
+                VuRegisterMaterializationCause::
+                    PairHelper,
+                true);
             if (m_usesAvx)
                 m_code.vzeroupper();
             const uint64_t words =
@@ -2710,6 +3125,7 @@ namespace
             m_code.call(m_code.rax);
 
             m_code.mov(m_code.r11d, m_code.eax);
+            emitLoadResidentRegisters(true);
             m_code.test(
                 m_code.r11d,
                 kNativePairExecuted);
@@ -2718,7 +3134,8 @@ namespace
             m_code.jz(
                 preciseBudget
                     ? pairNotExecuted
-                    : pairAccounted);
+                    : pairAccounted,
+                m_code.T_NEAR);
             m_code.inc(m_code.r14d);
             if (preciseBudget)
             {
@@ -3191,7 +3608,28 @@ namespace
             m_code.push(m_code.r13);
             m_code.push(m_code.r14);
             m_code.push(m_code.r15);
-            m_code.sub(m_code.rsp, kStackBytes);
+            if (m_preserveResidentViFrame)
+            {
+                m_code.push(m_code.rbp);
+            }
+            m_code.sub(m_code.rsp, stackBytes());
+#if defined(_WIN32)
+            for (uint8_t host = 6u;
+                 host <
+                     3u +
+                         m_registerAllocation.
+                             vfRegisterCount;
+                 ++host)
+            {
+                m_code.movups(
+                    m_code.ptr[
+                        m_code.rsp +
+                        kSavedVectorRegistersOffset +
+                        static_cast<int>(
+                            (host - 6u) * 16u)],
+                    Xbyak::Xmm(host));
+            }
+#endif
 
 #if defined(_WIN32)
             m_code.mov(m_code.r12, m_code.rcx);
@@ -3214,7 +3652,8 @@ namespace
             emitResetChainRuntime(true);
             m_code.mov(
                 m_code.byte[
-                    m_code.rsp + kRawEntryFlagOffset],
+                    m_code.rsp +
+                    rawEntryFlagOffset()],
                 1u);
             m_code.stmxcsr(
                 m_code.dword[
@@ -3271,7 +3710,8 @@ namespace
             emitResetChainRuntime(false);
             m_code.mov(
                 m_code.byte[
-                    m_code.rsp + kRawEntryFlagOffset],
+                    m_code.rsp +
+                    rawEntryFlagOffset()],
                 0u);
 #if defined(_WIN32)
             const Xbyak::Reg64 &view = m_code.r8;
@@ -3401,6 +3841,7 @@ namespace
                     Label controlFlowExit;
                     Label dynamicExit;
                     Label linkOrComplete;
+                    Label materializeAndPack;
                     Label invalidPipelineState;
                     Label pipelineStateValid;
 
@@ -3419,6 +3860,7 @@ namespace
                         invalidPipelineState,
                         m_code.T_NEAR);
                     m_code.L(pipelineStateValid);
+                    emitLoadResidentRegisters();
 
                     if (block.pairs.empty())
                     {
@@ -3429,7 +3871,9 @@ namespace
                         m_code.mov(
                             m_code.r10d,
                             static_cast<uint32_t>(exit));
-                        m_code.jmp(packResult, m_code.T_NEAR);
+                        m_code.jmp(
+                            materializeAndPack,
+                            m_code.T_NEAR);
                     }
 
                     bool viBackupKnown = false;
@@ -3461,7 +3905,9 @@ namespace
                                 static_cast<uint32_t>(
                                     VuNativeBlockExit::
                                         UnsupportedInstruction));
-                            m_code.jmp(packResult, m_code.T_NEAR);
+                            m_code.jmp(
+                                materializeAndPack,
+                                m_code.T_NEAR);
                             break;
                         }
 
@@ -3687,14 +4133,18 @@ namespace
                                 VuNativeBlockExit::Fault));
                         break;
                     }
-                    m_code.jmp(packResult, m_code.T_NEAR);
+                    m_code.jmp(
+                        materializeAndPack,
+                        m_code.T_NEAR);
 
                     m_code.L(cycleBudgetExit);
                     m_code.mov(
                         m_code.r10d,
                         static_cast<uint32_t>(
                             VuNativeBlockExit::CycleBudget));
-                    m_code.jmp(packResult, m_code.T_NEAR);
+                    m_code.jmp(
+                        materializeAndPack,
+                        m_code.T_NEAR);
 
                     m_code.L(controlFlowExit);
                     m_code.jmp(
@@ -3703,7 +4153,9 @@ namespace
                     m_code.L(dynamicExit);
                     m_code.mov(m_code.r10d, m_code.r11d);
 
-                    m_code.jmp(packResult, m_code.T_NEAR);
+                    m_code.jmp(
+                        materializeAndPack,
+                        m_code.T_NEAR);
                     m_code.L(invalidPipelineState);
                     m_code.mov(
                         m_code.r10d,
@@ -3712,7 +4164,19 @@ namespace
                     m_code.jmp(packResult, m_code.T_NEAR);
 
                     m_code.L(linkOrComplete);
+                    emitMaterializeResidentRegisters(
+                        VuRegisterMaterializationCause::
+                            LinkBoundary,
+                        false);
                     emitLinkOrComplete(packResult);
+
+                    m_code.L(materializeAndPack);
+                    emitMaterializeResidentRegisters(
+                        VuRegisterMaterializationCause::
+                            CanonicalExit,
+                        false);
+                    m_code.jmp(
+                        packResult, m_code.T_NEAR);
                 };
 
             emitBody(
@@ -3763,16 +4227,38 @@ namespace
             m_code.L(epilogue);
             if (m_usesAvx)
                 m_code.vzeroupper();
+#if defined(_WIN32)
+            for (uint8_t host = 6u;
+                 host <
+                     3u +
+                         m_registerAllocation.
+                             vfRegisterCount;
+                 ++host)
+            {
+                m_code.movups(
+                    Xbyak::Xmm(host),
+                    m_code.ptr[
+                        m_code.rsp +
+                        kSavedVectorRegistersOffset +
+                        static_cast<int>(
+                            (host - 6u) * 16u)]);
+            }
+#endif
             m_code.cmp(
                 m_code.byte[
-                    m_code.rsp + kRawEntryFlagOffset],
+                    m_code.rsp +
+                    rawEntryFlagOffset()],
                 0u);
             m_code.je(skipFloatModeRestore);
             m_code.ldmxcsr(
                 m_code.dword[
                     m_code.rsp + kSavedMxcsrOffset]);
             m_code.L(skipFloatModeRestore);
-            m_code.add(m_code.rsp, kStackBytes);
+            m_code.add(m_code.rsp, stackBytes());
+            if (m_preserveResidentViFrame)
+            {
+                m_code.pop(m_code.rbp);
+            }
             m_code.pop(m_code.r15);
             m_code.pop(m_code.r14);
             m_code.pop(m_code.r13);
@@ -3877,6 +4363,27 @@ std::string_view vuNativeBlockExitName(
     return "unknown";
 }
 
+std::string_view vuRegisterMaterializationCauseName(
+    VuRegisterMaterializationCause cause)
+{
+    switch (cause)
+    {
+    case VuRegisterMaterializationCause::
+        CanonicalExit:
+        return "canonical-exit";
+    case VuRegisterMaterializationCause::
+        LinkBoundary:
+        return "link-boundary";
+    case VuRegisterMaterializationCause::
+        PairHelper:
+        return "pair-helper";
+    case VuRegisterMaterializationCause::
+        XgkickHelper:
+        return "xgkick-helper";
+    }
+    return "unknown";
+}
+
 std::string vuPerfJitSymbolName(
     const VuProgramKey &key,
     const VuIrBlock &block,
@@ -3917,6 +4424,9 @@ std::string vuPerfJitSymbolName(
         << (key.blockForm ==
                     VuIrBlockForm::Basic
                 ? "basic" : "linear")
+        << "-vfreg-"
+        << (key.blockLocalVfRegisters
+                ? "resident" : "canonical")
         << "-compile-"
         << std::setw(16)
         << compilationIdentity;
@@ -3946,6 +4456,13 @@ VuRecompilerBackend::VuRecompilerBackend(
     m_blockBudgetGuardsEnabled =
         !budgetGuards ||
         environmentFlagEnabled(budgetGuards);
+    const char *const blockLocalVfRegisters =
+        std::getenv(
+            "PS2X_VU_BLOCK_LOCAL_VF_REGISTERS");
+    m_blockLocalVfRegistersEnabled =
+        blockLocalVfRegisters &&
+        environmentFlagEnabled(
+            blockLocalVfRegisters);
     m_blockProfilingEnabled = configuration.enabled;
     m_maximumBlockProfiles =
         configuration.maximumRecords;
@@ -4006,6 +4523,27 @@ VuRecompilerBackend::
             .linkedEdges = source.linkedEdges,
             .helperBarriers =
                 source.helperBarriers,
+            .residentVfRegisters =
+                source.residentVfRegisters,
+            .residentVfDirtyRegisters =
+                source.residentVfDirtyRegisters,
+            .residentVfDirtyLanes =
+                source.residentVfDirtyLanes,
+            .maximumLiveVfRegisters =
+                source.maximumLiveVfRegisters,
+            .vfAccesses = source.vfAccesses,
+            .allocatedVfAccesses =
+                source.allocatedVfAccesses,
+            .vfRegisterLoads =
+                source.vfRegisterLoads,
+            .vfRegisterStores =
+                source.vfRegisterStores,
+            .vfRegisterSpills =
+                source.vfRegisterSpills,
+            .vfRegisterReloads =
+                source.vfRegisterReloads,
+            .registerMaterializations =
+                source.registerMaterializations,
             .exitReasons = source.exitReasons,
             .opcodeOperations =
                 source.opcodeOperations,
@@ -4030,6 +4568,11 @@ void VuRecompilerBackend::
         profile->boundedEntries = 0u;
         profile->linkedEdges = 0u;
         profile->helperBarriers = 0u;
+        profile->vfRegisterLoads = 0u;
+        profile->vfRegisterStores = 0u;
+        profile->vfRegisterSpills = 0u;
+        profile->vfRegisterReloads = 0u;
+        profile->registerMaterializations.fill(0u);
         profile->exitReasons.fill(0u);
     }
 }
@@ -4297,6 +4840,9 @@ bool VuRecompilerBackend::programKey(
             m_blockBudgetGuardsEnabled
                 ? VuIrBlockForm::Basic
                 : VuIrBlockForm::LinearTrace,
+        .blockLocalVfRegisters =
+            m_blockLocalVfRegistersEnabled &&
+            mode == VuCompilationMode::Normal,
     };
     return VuProgramCache::validKey(key, diagnostic);
 }
@@ -5303,6 +5849,37 @@ bool VuRecompilerBackend::compile(
             ": " + verification.message;
         return false;
     }
+    VuAnalysisRegisterAllocation registerAllocation;
+    if (key.blockLocalVfRegisters)
+    {
+        const VuAnalysisBlock analysis =
+            analyzeVuIrBlock(
+                block,
+                VuAnalysisConfiguration{
+                    .hostFeatures =
+                        key.hostFeatures,
+                });
+        uint32_t retiringPairs = 0u;
+        for (const VuIrInstructionPair &pair :
+             block.pairs)
+        {
+            if (vuIrHasPairFlag(
+                    pair, VuIrPairUnsupported))
+            {
+                break;
+            }
+            ++retiringPairs;
+        }
+        if (analysis.fixedPairs != retiringPairs)
+        {
+            diagnostic =
+                "VU register analysis lost the exact IR block extent";
+            return false;
+        }
+        registerAllocation =
+            allocateVuAnalysisRegisters(
+                analysis, 3u, 0u);
+    }
 
     try
     {
@@ -5338,6 +5915,34 @@ bool VuRecompilerBackend::compile(
                 block.pairs.empty()
                     ? key.entryPc
                     : block.pairs.back().pc;
+            blockProfile->residentVfRegisters =
+                registerAllocation.vfRegisterCount;
+            blockProfile->maximumLiveVfRegisters =
+                registerAllocation.
+                    maximumLiveVfRegisters;
+            blockProfile->vfAccesses =
+                registerAllocation.vfAccesses;
+            blockProfile->allocatedVfAccesses =
+                registerAllocation.
+                    allocatedVfAccesses;
+            for (uint8_t slot = 0u;
+                 slot <
+                     registerAllocation.
+                         vfRegisterCount;
+                 ++slot)
+            {
+                const uint8_t reg =
+                    registerAllocation.
+                        vfRegisters[slot];
+                const uint8_t dirtyLanes =
+                    registerAllocation.
+                        vfDirtyLanes[reg];
+                blockProfile->
+                    residentVfDirtyRegisters +=
+                        dirtyLanes != 0u ? 1u : 0u;
+                blockProfile->residentVfDirtyLanes +=
+                    std::popcount(dirtyLanes);
+            }
             for (const VuIrInstructionPair &pair :
                  block.pairs)
             {
@@ -5380,7 +5985,9 @@ bool VuRecompilerBackend::compile(
             m_blockLinkingEnabled,
             m_blockBudgetGuardsEnabled &&
                 key.blockForm ==
-                    VuIrBlockForm::Basic);
+                    VuIrBlockForm::Basic,
+            false,
+            registerAllocation);
         if (emitter.size() == 0u)
         {
             diagnostic =

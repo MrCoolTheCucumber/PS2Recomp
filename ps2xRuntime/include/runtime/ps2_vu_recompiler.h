@@ -31,6 +31,21 @@ inline constexpr size_t kVuNativeBlockExitCount =
 inline constexpr size_t kVuIrOpcodeCount =
     static_cast<size_t>(VuIrOpcode::Unsupported) + 1u;
 
+enum class VuRegisterMaterializationCause : uint8_t
+{
+    CanonicalExit,
+    LinkBoundary,
+    PairHelper,
+    XgkickHelper,
+};
+
+inline constexpr size_t
+    kVuRegisterMaterializationCauseCount =
+        static_cast<size_t>(
+            VuRegisterMaterializationCause::
+                XgkickHelper) +
+        1u;
+
 struct VuNativeBlockResult
 {
     uint32_t executedCycles = 0u;
@@ -142,6 +157,20 @@ struct VuBlockProfileSnapshot
     uint64_t boundedEntries = 0u;
     uint64_t linkedEdges = 0u;
     uint64_t helperBarriers = 0u;
+    uint32_t residentVfRegisters = 0u;
+    uint32_t residentVfDirtyRegisters = 0u;
+    uint32_t residentVfDirtyLanes = 0u;
+    uint32_t maximumLiveVfRegisters = 0u;
+    uint32_t vfAccesses = 0u;
+    uint32_t allocatedVfAccesses = 0u;
+    uint64_t vfRegisterLoads = 0u;
+    uint64_t vfRegisterStores = 0u;
+    uint64_t vfRegisterSpills = 0u;
+    uint64_t vfRegisterReloads = 0u;
+    std::array<
+        uint64_t,
+        kVuRegisterMaterializationCauseCount>
+        registerMaterializations{};
     std::array<
         uint64_t,
         kVuNativeBlockExitCount> exitReasons{};
@@ -151,6 +180,10 @@ struct VuBlockProfileSnapshot
     std::vector<VuBlockJitRegistrationSnapshot>
         jitRegistrations;
 };
+
+[[nodiscard]] std::string_view
+vuRegisterMaterializationCauseName(
+    VuRegisterMaterializationCause cause);
 
 struct VuBlockProfilingSnapshot
 {
@@ -216,6 +249,10 @@ public:
     [[nodiscard]] bool blockBudgetGuardsEnabled() const
     {
         return m_blockBudgetGuardsEnabled;
+    }
+    [[nodiscard]] bool blockLocalVfRegistersEnabled() const
+    {
+        return m_blockLocalVfRegistersEnabled;
     }
     // The caller must prove that VU execution is quiescent while copying or
     // resetting these single-owner-thread records.
@@ -304,6 +341,7 @@ private:
     VuNativeChainRuntime m_chainRuntime{};
     bool m_blockLinkingEnabled = true;
     bool m_blockBudgetGuardsEnabled = true;
+    bool m_blockLocalVfRegistersEnabled = false;
     bool m_blockProfilingEnabled = false;
     size_t m_maximumBlockProfiles = 0u;
     uint64_t m_droppedBlockProfiles = 0u;

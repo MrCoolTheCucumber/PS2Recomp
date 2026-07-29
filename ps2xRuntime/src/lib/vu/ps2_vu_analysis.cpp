@@ -1236,6 +1236,27 @@ namespace
         return {};
     }
 
+    void computePairLiveness(VuAnalysisBlock &block)
+    {
+        VuAnalysisResourceSet live =
+            block.liveOut;
+        vuAnalysisUnionInto(
+            live, terminalObservation(block));
+        for (size_t reverse = block.pairs.size();
+             reverse != 0u; --reverse)
+        {
+            VuAnalysisPair &pair =
+                block.pairs[reverse - 1u];
+            pair.liveOut = live;
+            vuAnalysisSubtractFrom(
+                live, pair.definiteWrites);
+            vuAnalysisUnionInto(
+                live, pair.reads);
+            stripArchitecturalConstants(live);
+            pair.liveIn = live;
+        }
+    }
+
     void computeLiveness(VuControlFlowGraph &graph)
     {
         bool changed = true;
@@ -1289,23 +1310,7 @@ namespace
 
         for (VuAnalysisBlock &block : graph.blocks)
         {
-            VuAnalysisResourceSet live =
-                block.liveOut;
-            vuAnalysisUnionInto(
-                live, terminalObservation(block));
-            for (size_t reverse = block.pairs.size();
-                 reverse != 0u; --reverse)
-            {
-                VuAnalysisPair &pair =
-                    block.pairs[reverse - 1u];
-                pair.liveOut = live;
-                vuAnalysisSubtractFrom(
-                    live, pair.definiteWrites);
-                vuAnalysisUnionInto(
-                    live, pair.reads);
-                stripArchitecturalConstants(live);
-                pair.liveIn = live;
-            }
+            computePairLiveness(block);
         }
     }
 
@@ -1741,6 +1746,241 @@ VuControlFlowGraph analyzeVuControlFlow(
         code, codeSize,
         VuAnalysisEntryState{.pc = entryPc},
         configuration);
+}
+
+VuAnalysisBlock analyzeVuIrBlock(
+    const VuIrBlock &block,
+    VuAnalysisConfiguration configuration)
+{
+    VuAnalysisBlock result;
+    result.entry.pc = block.entryPc;
+    switch (block.exit)
+    {
+    case VuIrBlockExit::PairLimit:
+        result.terminal =
+            VuAnalysisBlockTerminal::PairLimit;
+        break;
+    case VuIrBlockExit::BranchBoundary:
+        result.terminal =
+            VuAnalysisBlockTerminal::BranchBoundary;
+        break;
+    case VuIrBlockExit::ProgramEndBoundary:
+        result.terminal =
+            VuAnalysisBlockTerminal::ProgramEnd;
+        break;
+    case VuIrBlockExit::XgkickBoundary:
+        result.terminal =
+            VuAnalysisBlockTerminal::XgkickBoundary;
+        break;
+    case VuIrBlockExit::UnsupportedInstruction:
+        result.terminal =
+            VuAnalysisBlockTerminal::
+                UnsupportedInstruction;
+        break;
+    case VuIrBlockExit::CodeBounds:
+        result.terminal =
+            VuAnalysisBlockTerminal::CodeBounds;
+        break;
+    }
+
+    bool endPending = false;
+    for (const VuIrInstructionPair &pair :
+         block.pairs)
+    {
+        VuAnalysisPair analysis =
+            analyzePair(
+                pair, configuration, endPending);
+        result.pairs.push_back(std::move(analysis));
+        if (!result.pairs.back().retires)
+            break;
+        ++result.fixedPairs;
+        result.fixedCycles += pair.cycles;
+        endPending =
+            vuIrHasPairFlag(pair, VuIrPairEnd);
+    }
+
+    attachPipelineFacts(result);
+    aggregateBlockResources(result);
+    attachNativeExits(result);
+    result.liveOut =
+        vuAnalysisAllGuestResources();
+    stripArchitecturalConstants(result.liveOut);
+    result.liveIn = result.liveOut;
+    vuAnalysisSubtractFrom(
+        result.liveIn, result.definiteWrites);
+    vuAnalysisUnionInto(
+        result.liveIn, result.uses);
+    stripArchitecturalConstants(result.liveIn);
+    computePairLiveness(result);
+    return result;
+}
+
+VuAnalysisRegisterAllocation
+allocateVuAnalysisRegisters(
+    const VuAnalysisBlock &block,
+    uint8_t maximumVfRegisters,
+    uint8_t maximumViRegisters)
+{
+    VuAnalysisRegisterAllocation allocation;
+    allocation.maximumVfRegisters =
+        std::min<uint8_t>(
+            maximumVfRegisters, 31u);
+    allocation.maximumViRegisters =
+        std::min<uint8_t>(
+            maximumViRegisters, 15u);
+
+    std::array<uint32_t, 32u> accesses{};
+    std::array<uint32_t, 16u> viAccesses{};
+    for (const VuAnalysisPair &pair : block.pairs)
+    {
+        for (uint32_t reg = 1u; reg < 32u; ++reg)
+        {
+            if (!pair.usesNativeHelper &&
+                pair.reads.vf[reg] != 0u)
+            {
+                ++accesses[reg];
+            }
+            if (!pair.usesNativeHelper &&
+                pair.writes.vf[reg] != 0u)
+            {
+                ++accesses[reg];
+                allocation.vfDirtyLanes[reg] |=
+                    pair.writes.vf[reg];
+            }
+        }
+        for (uint32_t reg = 1u; reg < 16u; ++reg)
+        {
+            const uint16_t bit =
+                static_cast<uint16_t>(1u << reg);
+            if (!pair.usesNativeHelper &&
+                (pair.reads.vi & bit) != 0u)
+            {
+                ++viAccesses[reg];
+            }
+            if (!pair.usesNativeHelper &&
+                (pair.writes.vi & bit) != 0u)
+            {
+                ++viAccesses[reg];
+                allocation.viDirtyRegisters |= bit;
+            }
+        }
+    }
+
+    std::array<uint8_t, 31u> order{};
+    for (uint8_t index = 0u;
+         index < order.size(); ++index)
+    {
+        order[index] =
+            static_cast<uint8_t>(index + 1u);
+    }
+    std::stable_sort(
+        order.begin(), order.end(),
+        [&](uint8_t left, uint8_t right)
+        {
+            return accesses[left] > accesses[right];
+        });
+
+    for (uint32_t reg = 1u; reg < 32u; ++reg)
+    {
+        allocation.vfAccesses += accesses[reg];
+        allocation.candidateVfRegisters +=
+            accesses[reg] != 0u ? 1u : 0u;
+    }
+    for (const VuAnalysisPair &pair : block.pairs)
+    {
+        uint32_t liveRegisters = 0u;
+        for (uint32_t reg = 1u; reg < 32u; ++reg)
+        {
+            if (accesses[reg] != 0u &&
+                pair.liveIn.vf[reg] != 0u)
+            {
+                ++liveRegisters;
+            }
+        }
+        allocation.maximumLiveVfRegisters =
+            std::max(
+                allocation.maximumLiveVfRegisters,
+                liveRegisters);
+    }
+    for (const uint8_t reg : order)
+    {
+        if (accesses[reg] == 0u ||
+            allocation.vfRegisterCount >=
+                allocation.maximumVfRegisters)
+        {
+            break;
+        }
+        const uint8_t slot =
+            allocation.vfRegisterCount++;
+        allocation.vfHostSlots[reg] =
+            static_cast<uint8_t>(slot + 1u);
+        allocation.vfRegisters[slot] = reg;
+        allocation.allocatedVfAccesses +=
+            accesses[reg];
+    }
+    allocation.spilledVfRegisters =
+        allocation.candidateVfRegisters -
+        allocation.vfRegisterCount;
+
+    std::array<uint8_t, 15u> viOrder{};
+    for (uint8_t index = 0u;
+         index < viOrder.size(); ++index)
+    {
+        viOrder[index] =
+            static_cast<uint8_t>(index + 1u);
+    }
+    std::stable_sort(
+        viOrder.begin(), viOrder.end(),
+        [&](uint8_t left, uint8_t right)
+        {
+            return
+                viAccesses[left] >
+                viAccesses[right];
+        });
+    for (uint32_t reg = 1u; reg < 16u; ++reg)
+    {
+        allocation.viAccesses += viAccesses[reg];
+        allocation.candidateViRegisters +=
+            viAccesses[reg] != 0u ? 1u : 0u;
+    }
+    for (const VuAnalysisPair &pair : block.pairs)
+    {
+        uint32_t liveRegisters = 0u;
+        for (uint32_t reg = 1u; reg < 16u; ++reg)
+        {
+            if (viAccesses[reg] != 0u &&
+                (pair.liveIn.vi &
+                 static_cast<uint16_t>(
+                     1u << reg)) != 0u)
+            {
+                ++liveRegisters;
+            }
+        }
+        allocation.maximumLiveViRegisters =
+            std::max(
+                allocation.maximumLiveViRegisters,
+                liveRegisters);
+    }
+    for (const uint8_t reg : viOrder)
+    {
+        if (viAccesses[reg] == 0u ||
+            allocation.viRegisterCount >=
+                allocation.maximumViRegisters)
+        {
+            break;
+        }
+        const uint8_t slot =
+            allocation.viRegisterCount++;
+        allocation.viHostSlots[reg] =
+            static_cast<uint8_t>(slot + 1u);
+        allocation.viRegisters[slot] = reg;
+        allocation.allocatedViAccesses +=
+            viAccesses[reg];
+    }
+    allocation.spilledViRegisters =
+        allocation.candidateViRegisters -
+        allocation.viRegisterCount;
+    return allocation;
 }
 
 bool vuAnalysisCanInlineUpperOpcode(

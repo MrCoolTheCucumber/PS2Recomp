@@ -444,6 +444,9 @@ size_t VuProgramCache::KeyHash::operator()(
         value, std::hash<uint8_t>{}(
                    static_cast<uint8_t>(
                        key.blockForm)));
+    hashCombine(
+        value, std::hash<bool>{}(
+                   key.blockLocalVfRegisters));
     return value;
 }
 
@@ -467,7 +470,9 @@ bool VuProgramCache::sameProgramIdentity(
         left.backend != right.backend ||
         left.hostFeatures != right.hostFeatures ||
         left.compilationMode != right.compilationMode ||
-        left.blockForm != right.blockForm)
+        left.blockForm != right.blockForm ||
+        left.blockLocalVfRegisters !=
+            right.blockLocalVfRegisters)
     {
         return false;
     }
