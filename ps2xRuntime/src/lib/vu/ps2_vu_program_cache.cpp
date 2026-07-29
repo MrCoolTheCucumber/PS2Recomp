@@ -16,10 +16,39 @@ namespace
     }
 }
 
+uint64_t VuNativeLinkState::invalidateTargets() noexcept
+{
+    uint64_t invalidated = 0u;
+    const auto invalidate =
+        [&](VuNativeLinkSlot &slot, bool dynamic)
+        {
+            if (slot.targetEntry != 0u)
+                ++invalidated;
+            // Publish the unusable entry before changing its metadata. Cache
+            // mutation and execution share one owner thread, but this order
+            // also makes quiescent diagnostics unambiguous.
+            slot.targetEntry = 0u;
+            slot.codeGeneration = 0u;
+            if (dynamic)
+                slot.targetPc = UINT32_MAX;
+        };
+    for (VuNativeLinkSlot &slot : staticTargets)
+        invalidate(slot, false);
+    for (VuNativeLinkSlot &slot : dynamicTargets)
+        invalidate(slot, true);
+    nextDynamicSlot = 0u;
+    return invalidated;
+}
+
 VuProgramCache::VuProgramCache(
     VuUnitId unit, VuProgramCacheLimits limits)
     : m_unit(unit), m_limits(limits)
 {
+}
+
+VuProgramCache::~VuProgramCache()
+{
+    invalidateAllLinks();
 }
 
 VuProgramHandle VuProgramCache::lookup(
@@ -84,7 +113,9 @@ VuProgramHandle VuProgramCache::insert(
     if (program.nativeCode.state() !=
             VuExecutableMemoryState::Executable ||
         !program.nativeEntry() ||
-        !program.nativeFastEntry())
+        !program.nativeFastEntry() ||
+        (program.outgoingLinks &&
+         !program.nativeLinkedEntry()))
     {
         ++m_diagnostics.rejectedPrograms;
         fail(
@@ -201,6 +232,121 @@ const VuCompiledProgram *VuProgramCache::resolveCurrent(
     }
     ++m_diagnostics.hits;
     return &m_programs[handle.index];
+}
+
+VuProgramLinkResult VuProgramCache::populateLink(
+    const VuNativeLinkState *source,
+    VuProgramHandle targetHandle,
+    const VuProgramKey &currentTargetKey)
+{
+    requireOwnerThread();
+    const auto reject =
+        [&](VuProgramLinkResult result)
+        {
+            ++m_diagnostics.linkResolutionFailures;
+            return result;
+        };
+    if (!source)
+        return reject(VuProgramLinkResult::SourceUnavailable);
+
+    const auto sourceIterator =
+        std::find_if(
+            m_programs.begin(), m_programs.end(),
+            [&](const VuCompiledProgram &program)
+            {
+                return program.outgoingLinks.get() == source;
+            });
+    if (sourceIterator == m_programs.end())
+        return reject(VuProgramLinkResult::SourceUnavailable);
+
+    if (!m_scopeActive ||
+        m_codeGeneration !=
+            currentTargetKey.codeGeneration ||
+        !targetHandle.valid() ||
+        targetHandle.epoch != m_epoch ||
+        targetHandle.index >= m_programs.size())
+    {
+        return reject(VuProgramLinkResult::TargetUnavailable);
+    }
+
+    const VuCompiledProgram &target =
+        m_programs[targetHandle.index];
+    if (!sameProgramIdentity(
+            target.key, currentTargetKey) ||
+        !target.outgoingLinks ||
+        !target.nativeLinkedEntry())
+    {
+        return reject(VuProgramLinkResult::TargetUnavailable);
+    }
+
+    VuNativeLinkState &sourceLinks =
+        *sourceIterator->outgoingLinks;
+    if (!sameLinkIdentity(
+            sourceIterator->key, target.key) ||
+        sourceLinks.backendIdentity == 0u ||
+        sourceLinks.backendIdentity !=
+            target.outgoingLinks->backendIdentity)
+    {
+        return reject(VuProgramLinkResult::Incompatible);
+    }
+
+    VuNativeLinkSlot *slot = nullptr;
+    for (VuNativeLinkSlot &candidate :
+         sourceLinks.staticTargets)
+    {
+        if (candidate.targetPc ==
+            currentTargetKey.entryPc)
+        {
+            slot = &candidate;
+            break;
+        }
+    }
+    if (!slot)
+    {
+        for (VuNativeLinkSlot &candidate :
+             sourceLinks.dynamicTargets)
+        {
+            if (candidate.targetPc ==
+                currentTargetKey.entryPc)
+            {
+                slot = &candidate;
+                break;
+            }
+        }
+    }
+    if (!slot)
+    {
+        for (VuNativeLinkSlot &candidate :
+             sourceLinks.dynamicTargets)
+        {
+            if (candidate.targetEntry == 0u)
+            {
+                slot = &candidate;
+                break;
+            }
+        }
+    }
+    if (!slot)
+    {
+        const size_t index =
+            sourceLinks.nextDynamicSlot %
+            sourceLinks.dynamicTargets.size();
+        slot = &sourceLinks.dynamicTargets[index];
+        sourceLinks.nextDynamicSlot =
+            static_cast<uint32_t>(
+                (index + 1u) %
+                sourceLinks.dynamicTargets.size());
+    }
+
+    slot->targetEntry = 0u;
+    slot->codeGeneration =
+        currentTargetKey.codeGeneration;
+    slot->targetPc = currentTargetKey.entryPc;
+    slot->targetEntry =
+        reinterpret_cast<uintptr_t>(
+            target.nativeLinkedEntry());
+    ++m_diagnostics.linkResolutions;
+    return VuProgramLinkResult::Linked;
 }
 
 void VuProgramCache::flush()
@@ -330,6 +476,17 @@ bool VuProgramCache::sameProgramIdentity(
     return left.codeGeneration == right.codeGeneration;
 }
 
+bool VuProgramCache::sameLinkIdentity(
+    const VuProgramKey &left,
+    const VuProgramKey &right)
+{
+    VuProgramKey leftEntry = left;
+    VuProgramKey rightEntry = right;
+    leftEntry.entryPc = 0u;
+    rightEntry.entryPc = 0u;
+    return sameProgramIdentity(leftEntry, rightEntry);
+}
+
 void VuProgramCache::requireOwnerThread() const
 {
     const std::thread::id current = std::this_thread::get_id();
@@ -403,6 +560,7 @@ void VuProgramCache::retainProgramsForGeneration()
 
 void VuProgramCache::discardPrograms(FlushReason reason)
 {
+    invalidateAllLinks();
     const uint64_t programCount =
         static_cast<uint64_t>(m_programs.size());
     switch (reason)
@@ -425,6 +583,19 @@ void VuProgramCache::discardPrograms(FlushReason reason)
     m_diagnostics.residentPrograms = 0u;
     m_diagnostics.residentExecutableBytes = 0u;
     m_epoch = nextEpoch(m_epoch);
+}
+
+void VuProgramCache::invalidateAllLinks()
+{
+    for (VuCompiledProgram &program : m_programs)
+    {
+        if (program.outgoingLinks)
+        {
+            m_diagnostics.linkInvalidations +=
+                program.outgoingLinks->
+                    invalidateTargets();
+        }
+    }
 }
 
 uint64_t VuProgramCache::nextEpoch(uint64_t epoch)

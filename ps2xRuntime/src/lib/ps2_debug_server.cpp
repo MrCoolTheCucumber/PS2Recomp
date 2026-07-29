@@ -998,6 +998,16 @@ struct PS2DebugServer::Impl
                     "rejected_programs",
                     source.rejectedPrograms, allocator);
                 cache.AddMember(
+                    "link_resolutions",
+                    source.linkResolutions, allocator);
+                cache.AddMember(
+                    "link_resolution_failures",
+                    source.linkResolutionFailures,
+                    allocator);
+                cache.AddMember(
+                    "link_invalidations",
+                    source.linkInvalidations, allocator);
+                cache.AddMember(
                     "generated_bytes",
                     source.generatedBytes, allocator);
                 cache.AddMember(
@@ -1022,14 +1032,25 @@ struct PS2DebugServer::Impl
                 const auto &source = diagnostics.recompiler;
                 Value recompiler(rapidjson::kObjectType);
                 recompiler.AddMember(
+                    "block_linking_enabled",
+                    source.blockLinkingEnabled,
+                    allocator);
+                recompiler.AddMember(
                     "native_entries",
                     source.nativeEntries, allocator);
+                recompiler.AddMember(
+                    "native_blocks",
+                    source.nativeBlocks, allocator);
                 recompiler.AddMember(
                     "native_pairs",
                     source.nativePairs, allocator);
                 recompiler.AddMember(
                     "instrumented_native_entries",
                     source.instrumentedNativeEntries,
+                    allocator);
+                recompiler.AddMember(
+                    "instrumented_native_blocks",
+                    source.instrumentedNativeBlocks,
                     allocator);
                 recompiler.AddMember(
                     "instrumented_native_pairs",
@@ -1041,6 +1062,23 @@ struct PS2DebugServer::Impl
                 recompiler.AddMember(
                     "helper_pairs",
                     source.helperPairs, allocator);
+                recompiler.AddMember(
+                    "linked_edges",
+                    source.linkedEdges, allocator);
+                recompiler.AddMember(
+                    "slow_link_exits",
+                    source.slowLinkExits, allocator);
+                recompiler.AddMember(
+                    "resolved_links",
+                    source.resolvedLinks, allocator);
+                recompiler.AddMember(
+                    "abandoned_link_resolutions",
+                    source.abandonedLinkResolutions,
+                    allocator);
+                recompiler.AddMember(
+                    "incompatible_link_exits",
+                    source.incompatibleLinkExits,
+                    allocator);
                 recompiler.AddMember(
                     "block_completes",
                     source.blockCompletes, allocator);
@@ -1062,6 +1100,33 @@ struct PS2DebugServer::Impl
                 recompiler.AddMember(
                     "fault_exits",
                     source.faultExits, allocator);
+                Value nativeExits(
+                    rapidjson::kObjectType);
+                static_assert(
+                    kVuNativeBlockExitCount ==
+                    std::tuple_size_v<
+                        decltype(
+                            source.nativeExitReasons)>);
+                for (size_t exit = 0u;
+                     exit <
+                         source.nativeExitReasons.size();
+                     ++exit)
+                {
+                    Value exitName =
+                        makeString(
+                            vuNativeBlockExitName(
+                                static_cast<
+                                    VuNativeBlockExit>(
+                                    exit)),
+                            allocator);
+                    nativeExits.AddMember(
+                        exitName,
+                        source.nativeExitReasons[exit],
+                        allocator);
+                }
+                recompiler.AddMember(
+                    "native_exit_reasons",
+                    nativeExits, allocator);
                 recompiler.AddMember(
                     "interpreter_instrumentation_fallbacks",
                     source.interpreterInstrumentationFallbacks,

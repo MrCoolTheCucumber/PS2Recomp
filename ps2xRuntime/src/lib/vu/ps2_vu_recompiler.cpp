@@ -4,6 +4,7 @@
 #include "runtime/ps2_perf_jitdump.h"
 #include "ps2_vu_float_mode.h"
 
+#include <algorithm>
 #include <atomic>
 #include <charconv>
 #include <chrono>
@@ -130,31 +131,6 @@ namespace
         return value;
     }
 
-    void recordBlockExecution(
-        VuBlockProfileRecord *profile,
-        uint32_t remainingCycles,
-        const VuNativeBlockResult &result,
-        uint64_t helperPairs)
-    {
-        if (!profile)
-            return;
-        ++profile->executions;
-        profile->guestPairs += result.executedCycles;
-        if (remainingCycles >= profile->fixedCycles)
-            ++profile->fullBudgetEntries;
-        else
-            ++profile->boundedEntries;
-        profile->helperBarriers += helperPairs;
-        size_t exitIndex =
-            static_cast<size_t>(result.exit);
-        if (exitIndex >= kVuNativeBlockExitCount)
-        {
-            exitIndex = static_cast<size_t>(
-                VuNativeBlockExit::Fault);
-        }
-        ++profile->exitReasons[exitIndex];
-    }
-
     bool fail(
         std::string message, std::string *diagnostic)
     {
@@ -174,6 +150,95 @@ namespace
             hash *= kFnv1a64Prime;
         }
         return hash;
+    }
+
+    bool isStaticVuBranch(VuIrOpcode opcode)
+    {
+        switch (opcode)
+        {
+        case VuIrOpcode::LowerB:
+        case VuIrOpcode::LowerBal:
+        case VuIrOpcode::LowerIbeq:
+        case VuIrOpcode::LowerIbne:
+        case VuIrOpcode::LowerIbltz:
+        case VuIrOpcode::LowerIbgtz:
+        case VuIrOpcode::LowerIblez:
+        case VuIrOpcode::LowerIbgez:
+            return true;
+        default:
+            return false;
+        }
+    }
+
+    uint32_t staticVuBranchTarget(
+        const VuIrInstructionPair &pair,
+        uint32_t addressMask)
+    {
+        const uint32_t encoded =
+            pair.lowerWord & 0x7ffu;
+        const int32_t immediate =
+            encoded < 0x400u
+                ? static_cast<int32_t>(encoded)
+                : static_cast<int32_t>(encoded) -
+                      0x800;
+        return
+            static_cast<uint32_t>(
+                static_cast<int32_t>(pair.pc + 8u) +
+                immediate * 8) &
+            addressMask;
+    }
+
+    std::shared_ptr<VuNativeLinkState>
+    makeNativeLinkState(
+        const VuIrBlock &block,
+        const VuProgramKey &key,
+        const VuRecompilerBackend *backend)
+    {
+        auto links =
+            std::make_shared<VuNativeLinkState>();
+        links->backendIdentity =
+            reinterpret_cast<uintptr_t>(backend);
+        links->sourceEntryPc = key.entryPc;
+
+        std::vector<uint32_t> targets;
+        targets.reserve(block.pairs.size() + 1u);
+        const auto append =
+            [&](uint32_t target)
+            {
+                if (std::find(
+                        targets.begin(), targets.end(),
+                        target) == targets.end())
+                {
+                    targets.push_back(target);
+                }
+            };
+        if (!block.pairs.empty())
+        {
+            const uint32_t nextPc =
+                (block.pairs.back().pc + 8u) &
+                key.addressMask;
+            append(nextPc);
+        }
+        for (const VuIrInstructionPair &pair :
+             block.pairs)
+        {
+            if (isStaticVuBranch(
+                    pair.lower.opcode))
+            {
+                append(
+                    staticVuBranchTarget(
+                        pair, key.addressMask));
+            }
+        }
+
+        links->staticTargets.reserve(targets.size());
+        for (const uint32_t target : targets)
+        {
+            links->staticTargets.push_back({
+                .targetPc = target,
+            });
+        }
+        return links;
     }
 
     struct NativeContextView
@@ -214,6 +279,13 @@ namespace
     static_assert(
         std::is_standard_layout_v<
             VuPipelineState::FmacFlags>);
+    static_assert(
+        std::is_standard_layout_v<VuNativeLinkSlot>);
+    static_assert(sizeof(uintptr_t) == sizeof(uint64_t));
+    static_assert(
+        std::is_standard_layout_v<VuNativeChainRuntime>);
+    static_assert(
+        std::is_standard_layout_v<VuBlockProfileRecord>);
 
     void loadNativeContextView(
         VuExecutionContext *context,
@@ -242,7 +314,11 @@ namespace
             const void *pairHelper,
             const void *xgkickHelper,
             uint64_t hostFeatures,
-            VuCompilationMode compilationMode)
+            VuCompilationMode compilationMode,
+            VuNativeLinkState *outgoingLinks,
+            VuNativeChainRuntime *chainRuntime,
+            VuBlockProfileRecord *blockProfile,
+            bool blockLinkingEnabled)
             : m_buffer(kEmitterCapacity),
               m_code(m_buffer.size(), m_buffer.data()),
               m_hostFeatures(hostFeatures),
@@ -252,11 +328,16 @@ namespace
                       : 0u),
               m_instrumented(
                   compilationMode ==
-                  VuCompilationMode::Instrumented)
+                  VuCompilationMode::Instrumented),
+              m_backend(backend),
+              m_outgoingLinks(outgoingLinks),
+              m_chainRuntime(chainRuntime),
+              m_blockProfile(blockProfile),
+              m_blockLinkingEnabled(
+                  blockLinkingEnabled)
         {
             emit(
-                block, backend, pairHelper,
-                xgkickHelper);
+                block, pairHelper, xgkickHelper);
             m_code.ready();
         }
 
@@ -273,6 +354,11 @@ namespace
         [[nodiscard]] size_t fastEntryOffset() const
         {
             return m_fastEntryOffset;
+        }
+
+        [[nodiscard]] size_t linkedEntryOffset() const
+        {
+            return m_linkedEntryOffset;
         }
 
     private:
@@ -302,7 +388,13 @@ namespace
         uint64_t m_hostFeatures = 0u;
         uint32_t m_codeAddressMask = 0x3fffu;
         bool m_instrumented = false;
+        VuRecompilerBackend *m_backend = nullptr;
+        VuNativeLinkState *m_outgoingLinks = nullptr;
+        VuNativeChainRuntime *m_chainRuntime = nullptr;
+        VuBlockProfileRecord *m_blockProfile = nullptr;
+        bool m_blockLinkingEnabled = false;
         size_t m_fastEntryOffset = 0u;
+        size_t m_linkedEntryOffset = 0u;
         bool m_usesAvx = false;
 
 #if defined(_WIN32)
@@ -2464,10 +2556,16 @@ namespace
             if (m_usesAvx)
                 m_code.vzeroupper();
 #if defined(_WIN32)
-            m_code.mov(m_code.rcx, m_code.r15);
+            m_code.mov(
+                m_code.rcx,
+                reinterpret_cast<uint64_t>(
+                    m_backend));
             m_code.mov(m_code.rdx, m_code.r12);
 #else
-            m_code.mov(m_code.rdi, m_code.r15);
+            m_code.mov(
+                m_code.rdi,
+                reinterpret_cast<uint64_t>(
+                    m_backend));
             m_code.mov(m_code.rsi, m_code.r12);
 #endif
             m_code.mov(
@@ -2553,12 +2651,18 @@ namespace
                      pair.upperWord)
                  << 32u);
 #if defined(_WIN32)
-            m_code.mov(m_code.rcx, m_code.r15);
+            m_code.mov(
+                m_code.rcx,
+                reinterpret_cast<uint64_t>(
+                    m_backend));
             m_code.mov(m_code.rdx, m_code.r12);
             m_code.mov(m_code.r8d, pair.pc);
             m_code.mov(m_code.r9, words);
 #else
-            m_code.mov(m_code.rdi, m_code.r15);
+            m_code.mov(
+                m_code.rdi,
+                reinterpret_cast<uint64_t>(
+                    m_backend));
             m_code.mov(m_code.rsi, m_code.r12);
             m_code.mov(m_code.edx, pair.pc);
             m_code.mov(m_code.rcx, words);
@@ -2576,6 +2680,19 @@ namespace
             Xbyak::Label pairNotExecuted;
             m_code.jz(pairNotExecuted);
             m_code.inc(m_code.r14d);
+            if (m_blockProfile)
+            {
+                m_code.mov(
+                    m_code.rax,
+                    reinterpret_cast<uint64_t>(
+                        m_blockProfile));
+                m_code.inc(
+                    m_code.qword[
+                        m_code.rax +
+                        offsetof(
+                            VuBlockProfileRecord,
+                            helperBarriers)]);
+            }
             m_code.L(pairNotExecuted);
             m_code.and_(
                 m_code.r11d,
@@ -2585,8 +2702,309 @@ namespace
                 dynamicExit, m_code.T_NEAR);
         }
 
-        void emitEntryFrame(
-            VuRecompilerBackend *backend)
+        void emitResetChainRuntime(bool rawEntry)
+        {
+            if (!m_chainRuntime)
+                return;
+            m_code.mov(
+                m_code.rax,
+                reinterpret_cast<uint64_t>(
+                    m_chainRuntime));
+            if (rawEntry)
+            {
+                m_code.mov(
+                    m_code.qword[
+                        m_code.rax +
+                        offsetof(
+                            VuNativeChainRuntime,
+                            codeGeneration)],
+                    0u);
+            }
+            m_code.mov(
+                m_code.qword[
+                    m_code.rax +
+                    offsetof(
+                        VuNativeChainRuntime,
+                        slowLinkSource)],
+                0u);
+            m_code.mov(
+                m_code.dword[
+                    m_code.rax +
+                    offsetof(
+                        VuNativeChainRuntime,
+                        slowLinkTargetPc)],
+                0u);
+        }
+
+        void emitProfileEntry()
+        {
+            if (!m_blockProfile || !m_chainRuntime)
+                return;
+
+            m_code.mov(
+                m_code.rax,
+                reinterpret_cast<uint64_t>(
+                    m_blockProfile));
+            m_code.inc(
+                m_code.qword[
+                    m_code.rax +
+                    offsetof(
+                        VuBlockProfileRecord,
+                        executions)]);
+
+            m_code.mov(
+                m_code.r8,
+                reinterpret_cast<uint64_t>(
+                    m_chainRuntime));
+            m_code.mov(
+                m_code.dword[
+                    m_code.r8 +
+                    offsetof(
+                        VuNativeChainRuntime,
+                        blockStartCycles)],
+                m_code.r14d);
+
+            Xbyak::Label bounded;
+            Xbyak::Label classified;
+            m_code.mov(m_code.r11d, m_code.r13d);
+            m_code.sub(m_code.r11d, m_code.r14d);
+            m_code.cmp(
+                m_code.r11d,
+                m_blockProfile->fixedCycles);
+            m_code.jb(bounded);
+            m_code.inc(
+                m_code.qword[
+                    m_code.rax +
+                    offsetof(
+                        VuBlockProfileRecord,
+                        fullBudgetEntries)]);
+            m_code.jmp(classified);
+            m_code.L(bounded);
+            m_code.inc(
+                m_code.qword[
+                    m_code.rax +
+                    offsetof(
+                        VuBlockProfileRecord,
+                        boundedEntries)]);
+            m_code.L(classified);
+        }
+
+        // r10d contains the native exit and remains valid on return.
+        void emitProfileExit()
+        {
+            if (!m_blockProfile || !m_chainRuntime)
+                return;
+
+            m_code.mov(
+                m_code.r8,
+                reinterpret_cast<uint64_t>(
+                    m_chainRuntime));
+            m_code.mov(m_code.r11d, m_code.r14d);
+            m_code.sub(
+                m_code.r11d,
+                m_code.dword[
+                    m_code.r8 +
+                    offsetof(
+                        VuNativeChainRuntime,
+                        blockStartCycles)]);
+            m_code.mov(
+                m_code.rax,
+                reinterpret_cast<uint64_t>(
+                    m_blockProfile));
+            m_code.add(
+                m_code.qword[
+                    m_code.rax +
+                    offsetof(
+                        VuBlockProfileRecord,
+                        guestPairs)],
+                m_code.r11);
+
+            Xbyak::Label validExit;
+            m_code.cmp(
+                m_code.r10d,
+                static_cast<uint32_t>(
+                    kVuNativeBlockExitCount));
+            m_code.jb(validExit);
+            m_code.mov(
+                m_code.r10d,
+                static_cast<uint32_t>(
+                    VuNativeBlockExit::Fault));
+            m_code.L(validExit);
+            m_code.mov(m_code.r11d, m_code.r10d);
+            m_code.inc(
+                m_code.qword[
+                    m_code.rax +
+                    m_code.r11 * 8 +
+                    offsetof(
+                        VuBlockProfileRecord,
+                        exitReasons)]);
+        }
+
+        void emitProfileLinkedEdge()
+        {
+            if (!m_blockProfile)
+                return;
+            m_code.mov(
+                m_code.rax,
+                reinterpret_cast<uint64_t>(
+                    m_blockProfile));
+            m_code.inc(
+                m_code.qword[
+                    m_code.rax +
+                    offsetof(
+                        VuBlockProfileRecord,
+                        linkedEdges)]);
+        }
+
+        void emitLinkOrComplete(
+            Xbyak::Label &packResult)
+        {
+            using namespace Xbyak;
+            Label complete;
+            Label miss;
+
+            m_code.cmp(m_code.r14d, m_code.r13d);
+            m_code.jae(complete, m_code.T_NEAR);
+            if (!m_blockLinkingEnabled ||
+                !m_outgoingLinks || !m_chainRuntime)
+            {
+                m_code.jmp(complete, m_code.T_NEAR);
+            }
+            else
+            {
+                m_code.bt(m_code.r15, 63u);
+                m_code.jc(complete, m_code.T_NEAR);
+                constexpr int pcOffset =
+                    stateOffset(
+                        offsetof(
+                            VuExecutionState, pc));
+                m_code.mov(
+                    m_code.r9d,
+                    m_code.dword[
+                        m_code.rbx + pcOffset]);
+
+                const auto emitSlot =
+                    [&](VuNativeLinkSlot &slot)
+                    {
+                        Label next;
+                        m_code.mov(
+                            m_code.r10,
+                            reinterpret_cast<uint64_t>(
+                                &slot));
+                        m_code.cmp(
+                            m_code.r9d,
+                            m_code.dword[
+                                m_code.r10 +
+                                offsetof(
+                                    VuNativeLinkSlot,
+                                    targetPc)]);
+                        m_code.jne(
+                            next, m_code.T_NEAR);
+                        m_code.mov(
+                            m_code.r11,
+                            reinterpret_cast<uint64_t>(
+                                m_chainRuntime));
+                        m_code.mov(
+                            m_code.rax,
+                            m_code.qword[
+                                m_code.r11 +
+                                offsetof(
+                                    VuNativeChainRuntime,
+                                    codeGeneration)]);
+                        m_code.cmp(
+                            m_code.qword[
+                                m_code.r10 +
+                                offsetof(
+                                    VuNativeLinkSlot,
+                                    codeGeneration)],
+                            m_code.rax);
+                        m_code.jne(
+                            miss, m_code.T_NEAR);
+                        m_code.mov(
+                            m_code.r11,
+                            m_code.qword[
+                                m_code.r10 +
+                                offsetof(
+                                    VuNativeLinkSlot,
+                                    targetEntry)]);
+                        m_code.test(
+                            m_code.r11, m_code.r11);
+                        m_code.jz(
+                            miss, m_code.T_NEAR);
+
+                        m_code.mov(
+                            m_code.r10d,
+                            static_cast<uint32_t>(
+                                VuNativeBlockExit::
+                                    BlockComplete));
+                        emitProfileExit();
+                        emitProfileLinkedEdge();
+                        m_code.inc(m_code.r15);
+                        if (m_usesAvx)
+                            m_code.vzeroupper();
+                        if (m_blockProfile)
+                        {
+                            m_code.mov(
+                                m_code.r11,
+                                reinterpret_cast<uint64_t>(
+                                    &slot));
+                            m_code.mov(
+                                m_code.r11,
+                                m_code.qword[
+                                    m_code.r11 +
+                                    offsetof(
+                                        VuNativeLinkSlot,
+                                        targetEntry)]);
+                        }
+                        m_code.jmp(m_code.r11);
+                        m_code.L(next);
+                    };
+
+                for (VuNativeLinkSlot &slot :
+                     m_outgoingLinks->staticTargets)
+                {
+                    emitSlot(slot);
+                }
+                for (VuNativeLinkSlot &slot :
+                     m_outgoingLinks->dynamicTargets)
+                {
+                    emitSlot(slot);
+                }
+
+                m_code.L(miss);
+                m_code.mov(
+                    m_code.rax,
+                    reinterpret_cast<uint64_t>(
+                        m_chainRuntime));
+                m_code.mov(
+                    m_code.r11,
+                    reinterpret_cast<uint64_t>(
+                        m_outgoingLinks));
+                m_code.mov(
+                    m_code.qword[
+                        m_code.rax +
+                        offsetof(
+                            VuNativeChainRuntime,
+                            slowLinkSource)],
+                    m_code.r11);
+                m_code.mov(
+                    m_code.dword[
+                        m_code.rax +
+                        offsetof(
+                            VuNativeChainRuntime,
+                            slowLinkTargetPc)],
+                    m_code.r9d);
+            }
+
+            m_code.L(complete);
+            m_code.mov(
+                m_code.r10d,
+                static_cast<uint32_t>(
+                    VuNativeBlockExit::BlockComplete));
+            m_code.jmp(packResult, m_code.T_NEAR);
+        }
+
+        void emitEntryFrame()
         {
             m_code.push(m_code.rbx);
             m_code.push(m_code.r12);
@@ -2603,16 +3021,17 @@ namespace
             m_code.mov(m_code.r13d, m_code.esi);
 #endif
             m_code.xor_(m_code.r14d, m_code.r14d);
-            m_code.mov(
-                m_code.r15,
-                reinterpret_cast<uint64_t>(backend));
+            m_code.xor_(m_code.r15d, m_code.r15d);
         }
 
         void emitRawEntry(
-            VuRecompilerBackend *backend,
             Xbyak::Label &body)
         {
-            emitEntryFrame(backend);
+            emitEntryFrame();
+            m_code.mov(
+                m_code.r15,
+                uint64_t{1u} << 63u);
+            emitResetChainRuntime(true);
             m_code.mov(
                 m_code.byte[
                     m_code.rsp + kRawEntryFlagOffset],
@@ -2666,10 +3085,10 @@ namespace
         }
 
         void emitFastEntry(
-            VuRecompilerBackend *backend,
             Xbyak::Label &body)
         {
-            emitEntryFrame(backend);
+            emitEntryFrame();
+            emitResetChainRuntime(false);
             m_code.mov(
                 m_code.byte[
                     m_code.rsp + kRawEntryFlagOffset],
@@ -2716,7 +3135,6 @@ namespace
 
         void emit(
             const VuIrBlock &block,
-            VuRecompilerBackend *backend,
             const void *pairHelper,
             const void *xgkickHelper)
         {
@@ -2725,6 +3143,7 @@ namespace
             Label cycleBudgetExit;
             Label controlFlowExit;
             Label dynamicExit;
+            Label linkOrComplete;
             Label packResult;
             Label epilogue;
             Label body;
@@ -2732,10 +3151,12 @@ namespace
             Label invalidPipelineState;
             Label pipelineStateValid;
 
-            emitRawEntry(backend, body);
+            emitRawEntry(body);
             m_fastEntryOffset = m_code.getSize();
-            emitFastEntry(backend, body);
+            emitFastEntry(body);
+            m_linkedEntryOffset = m_code.getSize();
             m_code.L(body);
+            emitProfileEntry();
             m_code.test(m_code.rbx, m_code.rbx);
             m_code.jz(pipelineStateValid);
             m_code.cmp(
@@ -2975,10 +3396,8 @@ namespace
             {
             case VuIrBlockExit::PairLimit:
             case VuIrBlockExit::BranchBoundary:
-                m_code.mov(
-                    m_code.r10d,
-                    static_cast<uint32_t>(
-                        VuNativeBlockExit::BlockComplete));
+                m_code.jmp(
+                    linkOrComplete, m_code.T_NEAR);
                 break;
             case VuIrBlockExit::XgkickBoundary:
                 m_code.mov(
@@ -3018,11 +3437,8 @@ namespace
             m_code.jmp(packResult, m_code.T_NEAR);
 
             m_code.L(controlFlowExit);
-            m_code.mov(
-                m_code.r10d,
-                static_cast<uint32_t>(
-                    VuNativeBlockExit::BlockComplete));
-            m_code.jmp(packResult, m_code.T_NEAR);
+            m_code.jmp(
+                linkOrComplete, m_code.T_NEAR);
 
             m_code.L(dynamicExit);
             m_code.mov(m_code.r10d, m_code.r11d);
@@ -3033,8 +3449,30 @@ namespace
                 m_code.r10d,
                 static_cast<uint32_t>(
                     VuNativeBlockExit::Fault));
+            m_code.jmp(packResult, m_code.T_NEAR);
 
+            m_code.L(linkOrComplete);
+            emitLinkOrComplete(packResult);
             m_code.L(packResult);
+            emitProfileExit();
+            if (m_chainRuntime)
+            {
+                m_code.mov(
+                    m_code.rax,
+                    reinterpret_cast<uint64_t>(
+                        m_chainRuntime));
+                m_code.mov(
+                    m_code.r11,
+                    m_code.r15);
+                m_code.btr(m_code.r11, 63u);
+                m_code.mov(
+                    m_code.qword[
+                        m_code.rax +
+                        offsetof(
+                            VuNativeChainRuntime,
+                            linkedEdges)],
+                    m_code.r11);
+            }
             m_code.mov(m_code.eax, m_code.r14d);
             m_code.mov(m_code.r11d, m_code.r10d);
             m_code.shl(m_code.r11, 32u);
@@ -3148,6 +3586,11 @@ VuRecompilerBackend::VuRecompilerBackend(
     VuBlockProfilingConfiguration configuration)
     : m_unit(unit), m_semantics(unit)
 {
+    const char *const linking =
+        std::getenv("PS2X_VU_BLOCK_LINKING");
+    m_blockLinkingEnabled =
+        !linking ||
+        environmentFlagEnabled(linking);
     m_blockProfilingEnabled = configuration.enabled;
     m_maximumBlockProfiles =
         configuration.maximumRecords;
@@ -3652,9 +4095,7 @@ VuRunResult VuRecompilerBackend::run(
     };
     m_instrumentedPairIndex = 0u;
     const auto runNativeBlocks =
-        [&]<bool ProfileBlocks>(
-            std::bool_constant<ProfileBlocks>)
-            -> VuRunResult
+        [&]() -> VuRunResult
     {
         while (state.active &&
                totalExecuted < maximumCycles)
@@ -3712,6 +4153,11 @@ VuRunResult VuRecompilerBackend::run(
                 maximumCycles - totalExecuted;
             const uint64_t helperPairsBefore =
                 m_helperPairsIssued;
+            m_chainRuntime.codeGeneration =
+                key.codeGeneration;
+            m_chainRuntime.slowLinkSource = nullptr;
+            m_chainRuntime.slowLinkTargetPc = 0u;
+            m_chainRuntime.linkedEdges = 0u;
             const VuNativeBlockResult native =
                 VuNativeBlockResult::decode(
                     entry(
@@ -3720,16 +4166,53 @@ VuRunResult VuRecompilerBackend::run(
             const uint64_t helperPairs =
                 m_helperPairsIssued -
                 helperPairsBefore;
+            const VuNativeLinkState *const
+                slowLinkSource =
+                    m_chainRuntime.slowLinkSource;
+            const uint32_t slowLinkTargetPc =
+                m_chainRuntime.slowLinkTargetPc;
+            const uint64_t linkedEdges =
+                m_chainRuntime.linkedEdges;
             ++m_diagnostics.nativeEntries;
-            if constexpr (ProfileBlocks)
+            if (linkedEdges >
+                    native.executedCycles ||
+                (slowLinkSource &&
+                 native.exit !=
+                     VuNativeBlockExit::BlockComplete))
             {
-                recordBlockExecution(
-                    program->blockProfile.get(),
-                    remaining, native, helperPairs);
+                m_lastDiagnostic =
+                    "native VU chain reported inconsistent link accounting";
+                ++m_diagnostics.faultExits;
+                return finish(
+                    totalExecuted, VuExitReason::Fault);
             }
+            m_diagnostics.nativeBlocks +=
+                linkedEdges + 1u;
+            m_diagnostics.linkedEdges +=
+                linkedEdges;
+            m_diagnostics.nativeExitReasons[
+                static_cast<size_t>(
+                    VuNativeBlockExit::
+                        BlockComplete)] +=
+                            linkedEdges;
+            size_t nativeExitIndex =
+                static_cast<size_t>(native.exit);
+            if (nativeExitIndex >=
+                kVuNativeBlockExitCount)
+            {
+                nativeExitIndex =
+                    static_cast<size_t>(
+                        VuNativeBlockExit::Fault);
+            }
+            ++m_diagnostics.
+                nativeExitReasons[nativeExitIndex];
+            m_diagnostics.blockCompletes +=
+                linkedEdges;
             if (nativeInstrumentation)
             {
                 ++m_diagnostics.instrumentedNativeEntries;
+                m_diagnostics.instrumentedNativeBlocks +=
+                    linkedEdges + 1u;
             }
             if (native.executedCycles > remaining)
             {
@@ -3795,6 +4278,65 @@ VuRunResult VuRecompilerBackend::run(
                         totalExecuted,
                         VuExitReason::Fault);
                 }
+                if (slowLinkSource)
+                {
+                    ++m_diagnostics.slowLinkExits;
+                    if (slowLinkTargetPc != state.pc ||
+                        (slowLinkTargetPc & 7u) != 0u ||
+                        slowLinkTargetPc >= key.codeSize)
+                    {
+                        m_lastDiagnostic =
+                            "native VU slow link target is invalid";
+                        ++m_diagnostics.faultExits;
+                        return finish(
+                            totalExecuted,
+                            VuExitReason::Fault);
+                    }
+
+                    VuProgramKey targetKey = key;
+                    targetKey.entryPc =
+                        slowLinkTargetPc;
+                    VuProgramHandle targetHandle =
+                        lookupOrCompile(
+                            context, targetKey);
+                    if (!targetHandle.valid())
+                    {
+                        if (m_lastDiagnostic.empty())
+                        {
+                            m_lastDiagnostic =
+                                "native VU slow link target did not compile";
+                        }
+                        ++m_diagnostics.faultExits;
+                        return finish(
+                            totalExecuted,
+                            VuExitReason::Fault);
+                    }
+                    m_dispatchHandles[
+                        slowLinkTargetPc / 8u] =
+                            targetHandle;
+                    const VuProgramLinkResult linked =
+                        cache.populateLink(
+                            slowLinkSource,
+                            targetHandle, targetKey);
+                    switch (linked)
+                    {
+                    case VuProgramLinkResult::Linked:
+                        ++m_diagnostics.resolvedLinks;
+                        break;
+                    case VuProgramLinkResult::
+                        Incompatible:
+                        ++m_diagnostics.
+                            incompatibleLinkExits;
+                        break;
+                    case VuProgramLinkResult::
+                        SourceUnavailable:
+                    case VuProgramLinkResult::
+                        TargetUnavailable:
+                        ++m_diagnostics.
+                            abandonedLinkResolutions;
+                        break;
+                    }
+                }
                 continue;
             case VuNativeBlockExit::CycleBudget:
                 ++m_diagnostics.cycleBudgetExits;
@@ -3830,9 +4372,7 @@ VuRunResult VuRecompilerBackend::run(
         return finish(
             totalExecuted, VuExitReason::CycleBudget);
     };
-    if (m_blockProfilingEnabled)
-        return runNativeBlocks(std::true_type{});
-    return runNativeBlocks(std::false_type{});
+    return runNativeBlocks();
 }
 
 VuRunResult VuRecompilerBackend::runInterpreterFallback(
@@ -4284,6 +4824,58 @@ bool VuRecompilerBackend::compile(
 
     try
     {
+        const uint64_t compilationIdentity =
+            m_blockProfilingEnabled ||
+                    m_perfJitDumpEnabled
+                ? nextCompilationIdentity()
+                : 0u;
+        std::shared_ptr<VuBlockProfileRecord>
+            blockProfile;
+        std::shared_ptr<void> blockProfileLifetime;
+        if (m_blockProfilingEnabled &&
+            m_blockProfiles.size() <
+                m_maximumBlockProfiles)
+        {
+            blockProfile =
+                std::make_shared<
+                    VuBlockProfileRecord>();
+            blockProfileLifetime =
+                std::make_shared<uint8_t>(0u);
+            blockProfile->key = key;
+            blockProfile->compilationIdentity =
+                compilationIdentity;
+            blockProfile->blockPairs =
+                static_cast<uint32_t>(
+                    block.pairs.size());
+            blockProfile->blockExit = block.exit;
+            blockProfile->firstPc =
+                block.pairs.empty()
+                    ? key.entryPc
+                    : block.pairs.front().pc;
+            blockProfile->lastPc =
+                block.pairs.empty()
+                    ? key.entryPc
+                    : block.pairs.back().pc;
+            for (const VuIrInstructionPair &pair :
+                 block.pairs)
+            {
+                blockProfile->fixedCycles +=
+                    pair.cycles;
+                ++blockProfile->opcodeOperations[
+                    static_cast<size_t>(
+                        pair.upper.opcode)];
+                ++blockProfile->opcodeOperations[
+                    static_cast<size_t>(
+                        pair.lower.opcode)];
+            }
+            blockProfile->codeLifetime =
+                blockProfileLifetime;
+        }
+
+        std::shared_ptr<VuNativeLinkState>
+            outgoingLinks =
+                makeNativeLinkState(
+                    block, key, this);
         const void *const pairHelper =
             key.compilationMode ==
                     VuCompilationMode::Instrumented
@@ -4299,7 +4891,11 @@ bool VuRecompilerBackend::compile(
                 &VuRecompilerBackend::
                     advanceXgkickThunk),
             key.hostFeatures,
-            key.compilationMode);
+            key.compilationMode,
+            outgoingLinks.get(),
+            &m_chainRuntime,
+            blockProfile.get(),
+            m_blockLinkingEnabled);
         if (emitter.size() == 0u)
         {
             diagnostic =
@@ -4320,71 +4916,26 @@ bool VuRecompilerBackend::compile(
             return false;
         }
 
+        if (blockProfile)
+        {
+            blockProfile->nativeAddress =
+                static_cast<uint64_t>(
+                    reinterpret_cast<uintptr_t>(
+                        nativeCode.executableData()));
+            blockProfile->nativeBytes =
+                static_cast<uint64_t>(
+                    nativeCode.usedSize());
+        }
         const uint64_t nanoseconds =
             static_cast<uint64_t>(
                 std::chrono::duration_cast<
                     std::chrono::nanoseconds>(
                     Clock::now() - start)
                     .count());
-        const uint64_t compilationIdentity =
-            m_blockProfilingEnabled ||
-                    m_perfJitDumpEnabled
-                ? nextCompilationIdentity()
-                : 0u;
-        std::shared_ptr<VuBlockProfileRecord>
-            blockProfile;
-        std::shared_ptr<void> blockProfileLifetime;
-        if (m_blockProfilingEnabled)
+        if (m_blockProfilingEnabled &&
+            !blockProfile)
         {
-            if (m_blockProfiles.size() >=
-                m_maximumBlockProfiles)
-            {
-                ++m_droppedBlockProfiles;
-            }
-            else
-            {
-                blockProfile =
-                    std::make_shared<
-                        VuBlockProfileRecord>();
-                blockProfileLifetime =
-                    std::make_shared<uint8_t>(0u);
-                blockProfile->key = key;
-                blockProfile->compilationIdentity =
-                    compilationIdentity;
-                blockProfile->nativeAddress =
-                    static_cast<uint64_t>(
-                        reinterpret_cast<uintptr_t>(
-                            nativeCode.executableData()));
-                blockProfile->nativeBytes =
-                    static_cast<uint64_t>(
-                        nativeCode.usedSize());
-                blockProfile->blockPairs =
-                    static_cast<uint32_t>(
-                        block.pairs.size());
-                blockProfile->blockExit = block.exit;
-                blockProfile->firstPc =
-                    block.pairs.empty()
-                        ? key.entryPc
-                        : block.pairs.front().pc;
-                blockProfile->lastPc =
-                    block.pairs.empty()
-                        ? key.entryPc
-                        : block.pairs.back().pc;
-                for (const VuIrInstructionPair &pair :
-                     block.pairs)
-                {
-                    blockProfile->fixedCycles +=
-                        pair.cycles;
-                    ++blockProfile->opcodeOperations[
-                        static_cast<size_t>(
-                            pair.upper.opcode)];
-                    ++blockProfile->opcodeOperations[
-                        static_cast<size_t>(
-                            pair.lower.opcode)];
-                }
-                blockProfile->codeLifetime =
-                    blockProfileLifetime;
-            }
+            ++m_droppedBlockProfiles;
         }
         program = {
             .key = key,
@@ -4393,9 +4944,13 @@ bool VuRecompilerBackend::compile(
             .entryOffset = 0u,
             .fastEntryOffset =
                 emitter.fastEntryOffset(),
+            .linkedEntryOffset =
+                emitter.linkedEntryOffset(),
             .compilationNanoseconds = nanoseconds,
             .compilationIdentity =
                 compilationIdentity,
+            .outgoingLinks =
+                std::move(outgoingLinks),
             .blockProfile =
                 std::move(blockProfile),
             .blockProfileLifetime =

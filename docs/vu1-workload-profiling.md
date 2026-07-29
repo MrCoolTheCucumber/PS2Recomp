@@ -71,9 +71,11 @@ the requested timing scopes:
 Every sample reports guest pairs and cycles, exit reason, allocation counts,
 PATH1 packet and byte counts, architectural-state and VU-data hashes, a
 per-invocation PATH1 hash, and a full-sample PATH1 hash. Recompiler records
-also include native exit/fallback counters and the complete program-cache
-delta. A sample is valid only when every invocation exactly matches the
-interpreter reference and a warm recompiler sample performs no compilation.
+also distinguish C++ native entries, executed native blocks, linked edges,
+slow-link exits, native exit/fallback counters, and the complete program-cache
+and link delta. A sample is valid only when every invocation exactly matches
+the interpreter reference and a warm recompiler sample performs no
+compilation.
 
 Cold compilation, warm execution, and forced cache churn are distinct events.
 Add cache churn without changing the warm sample:
@@ -164,10 +166,11 @@ reused host address.
 
 The default record limit is 16,384 per VU backend. A positive
 `PS2X_VU_BLOCK_PROFILE_LIMIT` changes it; compilations beyond the limit remain
-correct and increment `dropped_records`. Because enabled counters update the
-hot dispatch loop, use them for attribution rather than production timing.
-When the environment variable is absent, the runtime selects a separately
-instantiated loop with no per-entry profiling branch or counter update.
+correct and increment `dropped_records`. Enabled blocks update their record
+inside generated code at every entry, helper pair, link, and exit, so linked
+successors remain exact without returning through C++. Use this mode for
+attribution rather than production timing. When the environment variable is
+absent, emitted blocks contain none of those profile updates or branches.
 
 With block profiling enabled, `vu_backend_benchmark` appends one
 `block-profile-summary` and one `block-profile` JSON record per retained

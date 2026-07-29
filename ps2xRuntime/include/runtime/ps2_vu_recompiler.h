@@ -61,11 +61,18 @@ using VuNativeBlockEntry = uint64_t (*)(
 struct VuRecompilerDiagnostics
 {
     uint64_t nativeEntries = 0u;
+    uint64_t nativeBlocks = 0u;
     uint64_t nativePairs = 0u;
     uint64_t instrumentedNativeEntries = 0u;
+    uint64_t instrumentedNativeBlocks = 0u;
     uint64_t instrumentedNativePairs = 0u;
     uint64_t inlinePairs = 0u;
     uint64_t helperPairs = 0u;
+    uint64_t linkedEdges = 0u;
+    uint64_t slowLinkExits = 0u;
+    uint64_t resolvedLinks = 0u;
+    uint64_t abandonedLinkResolutions = 0u;
+    uint64_t incompatibleLinkExits = 0u;
     uint64_t blockCompletes = 0u;
     uint64_t cycleBudgetExits = 0u;
     uint64_t xgkickExits = 0u;
@@ -73,6 +80,9 @@ struct VuRecompilerDiagnostics
     uint64_t unsupportedExits = 0u;
     uint64_t codeInvalidationExits = 0u;
     uint64_t faultExits = 0u;
+    std::array<
+        uint64_t,
+        kVuNativeBlockExitCount> nativeExitReasons{};
     uint64_t interpreterInstrumentationFallbacks = 0u;
     uint64_t interpreterFallbackPairs = 0u;
     uint64_t codeImageIdentities = 0u;
@@ -80,6 +90,15 @@ struct VuRecompilerDiagnostics
     uint64_t codeImageCatalogEvictions = 0u;
     uint64_t jitDumpRegistrations = 0u;
     uint64_t jitDumpFailures = 0u;
+};
+
+struct VuNativeChainRuntime
+{
+    uint64_t codeGeneration = 0u;
+    const VuNativeLinkState *slowLinkSource = nullptr;
+    uint32_t slowLinkTargetPc = 0u;
+    uint32_t blockStartCycles = 0u;
+    uint64_t linkedEdges = 0u;
 };
 
 enum class VuRecompilerOpcodeDisposition : uint8_t
@@ -180,6 +199,10 @@ public:
     {
         return m_lastJitDiagnostic;
     }
+    [[nodiscard]] bool blockLinkingEnabled() const
+    {
+        return m_blockLinkingEnabled;
+    }
     // The caller must prove that VU execution is quiescent while copying or
     // resetting these single-owner-thread records.
     [[nodiscard]] VuBlockProfilingSnapshot
@@ -264,6 +287,8 @@ private:
     uint64_t m_nextCodeContentIdentity = 1u;
     uint64_t m_helperPairsIssued = 0u;
     uint64_t m_instrumentedPairIndex = 0u;
+    VuNativeChainRuntime m_chainRuntime{};
+    bool m_blockLinkingEnabled = true;
     bool m_blockProfilingEnabled = false;
     size_t m_maximumBlockProfiles = 0u;
     uint64_t m_droppedBlockProfiles = 0u;

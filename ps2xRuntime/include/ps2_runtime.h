@@ -552,6 +552,9 @@ public:
         uint64_t evictedPrograms = 0u;
         uint64_t manualFlushes = 0u;
         uint64_t rejectedPrograms = 0u;
+        uint64_t linkResolutions = 0u;
+        uint64_t linkResolutionFailures = 0u;
+        uint64_t linkInvalidations = 0u;
         uint64_t generatedBytes = 0u;
         uint64_t compilationNanoseconds = 0u;
         uint64_t residentPrograms = 0u;
@@ -601,12 +604,20 @@ public:
                 jitRegistrations;
         };
 
+        bool blockLinkingEnabled = false;
         uint64_t nativeEntries = 0u;
+        uint64_t nativeBlocks = 0u;
         uint64_t nativePairs = 0u;
         uint64_t instrumentedNativeEntries = 0u;
+        uint64_t instrumentedNativeBlocks = 0u;
         uint64_t instrumentedNativePairs = 0u;
         uint64_t inlinePairs = 0u;
         uint64_t helperPairs = 0u;
+        uint64_t linkedEdges = 0u;
+        uint64_t slowLinkExits = 0u;
+        uint64_t resolvedLinks = 0u;
+        uint64_t abandonedLinkResolutions = 0u;
+        uint64_t incompatibleLinkExits = 0u;
         uint64_t blockCompletes = 0u;
         uint64_t cycleBudgetExits = 0u;
         uint64_t xgkickExits = 0u;
@@ -614,6 +625,7 @@ public:
         uint64_t unsupportedExits = 0u;
         uint64_t codeInvalidationExits = 0u;
         uint64_t faultExits = 0u;
+        std::array<uint64_t, 10u> nativeExitReasons{};
         uint64_t interpreterInstrumentationFallbacks = 0u;
         uint64_t interpreterFallbackPairs = 0u;
         uint64_t codeImageIdentities = 0u;

@@ -6669,6 +6669,12 @@ void PS2Runtime::debugPublishVuBackendDiagnostics()
                     .evictedPrograms = source.evictedPrograms,
                     .manualFlushes = source.manualFlushes,
                     .rejectedPrograms = source.rejectedPrograms,
+                    .linkResolutions =
+                        source.linkResolutions,
+                    .linkResolutionFailures =
+                        source.linkResolutionFailures,
+                    .linkInvalidations =
+                        source.linkInvalidations,
                     .generatedBytes = source.generatedBytes,
                     .compilationNanoseconds =
                         source.compilationNanoseconds,
@@ -6692,14 +6698,28 @@ void PS2Runtime::debugPublishVuBackendDiagnostics()
                     backend->diagnostics();
                 result.recompilerCreated = true;
                 result.recompiler = {
+                    .blockLinkingEnabled =
+                        backend->blockLinkingEnabled(),
                     .nativeEntries = source.nativeEntries,
+                    .nativeBlocks = source.nativeBlocks,
                     .nativePairs = source.nativePairs,
                     .instrumentedNativeEntries =
                         source.instrumentedNativeEntries,
+                    .instrumentedNativeBlocks =
+                        source.instrumentedNativeBlocks,
                     .instrumentedNativePairs =
                         source.instrumentedNativePairs,
                     .inlinePairs = source.inlinePairs,
                     .helperPairs = source.helperPairs,
+                    .linkedEdges = source.linkedEdges,
+                    .slowLinkExits =
+                        source.slowLinkExits,
+                    .resolvedLinks =
+                        source.resolvedLinks,
+                    .abandonedLinkResolutions =
+                        source.abandonedLinkResolutions,
+                    .incompatibleLinkExits =
+                        source.incompatibleLinkExits,
                     .blockCompletes = source.blockCompletes,
                     .cycleBudgetExits =
                         source.cycleBudgetExits,
@@ -6710,6 +6730,8 @@ void PS2Runtime::debugPublishVuBackendDiagnostics()
                     .codeInvalidationExits =
                         source.codeInvalidationExits,
                     .faultExits = source.faultExits,
+                    .nativeExitReasons =
+                        source.nativeExitReasons,
                     .interpreterInstrumentationFallbacks =
                         source.interpreterInstrumentationFallbacks,
                     .interpreterFallbackPairs =

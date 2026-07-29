@@ -41,6 +41,29 @@ high 32 bits contain a `VuNativeBlockExit`. Generated code:
   context;
 - returns only at an instruction-pair boundary.
 
+Every block also has a canonical linked entry. It assumes the original native
+frame, context view, cumulative cycle count, and backend registers are already
+live, but makes no assumptions about guest registers: the predecessor has
+written complete architectural and pipeline state to `VuExecutionState`.
+Consequently, this first linked form isolates C++ dispatch savings from later
+register-state retention.
+
+At a normal block-complete boundary, generated code checks the outgoing
+writable slots for `state.pc` and the active MicroMem generation. A compatible
+hit records the source completion and tail-jumps to the target linked entry.
+A miss records the source and PC, returns canonical state, and lets the slow
+C++ loop resolve or compile only after native code has left the stack. Exact
+budget exhaustion returns without probing a successor. XGKICK, program end,
+unsupported, fault, and invalidation exits continue to return normally.
+
+The linked target reuses the original stack frame, maximum-cycle register,
+cumulative retired-pair register, context, and floating-point scope. A source
+which used AVX executes `vzeroupper` before the transfer so a later non-AVX
+terminal block cannot leak dirty upper lanes through the ABI.
+Set `PS2X_VU_BLOCK_LINKING=0` before backend creation to retain the canonical
+C++ dispatch path for controlled A/B diagnosis; linking is enabled by default
+and its state is exposed in debugger and benchmark diagnostics.
+
 The backend can keep delicate pairs on permanent semantic helpers while
 lowering the measured FMAC/conversion, integer, memory, DIV, and branch
 families directly. Backend-neutral linear traces continue across sequential
@@ -80,14 +103,27 @@ includes unit, memory/code identity, extent, entry PC, exact whole-code content
 identity, native feature mask, and compilation mode.
 
 The backend resolves a generation-scoped cache handle immediately before each
-native call. Every MicroMem write advances the cache epoch and makes outstanding
-handles stale. A bounded catalog hashes the whole code image as a prefilter and
-then compares all bytes, allowing compiled blocks for an exactly recurring
-image to be rebound safely to the new generation. The backend rechecks the
-unit's code generation after every call because a helper may publish an effect
-which modifies MicroMem. A change returns `CodeInvalidated`. The current
-single-GameThread ownership contract avoids an unmeasured generation load at
-each pair.
+native call. Every MicroMem write advances the cache epoch and makes
+outstanding handles and link generations stale in O(1). A bounded catalog
+hashes the whole code image as a prefilter and then compares all bytes,
+allowing compiled blocks for an exactly recurring image to be rebound safely
+to the new generation. Physical slots are cleared before any scope
+invalidation, eviction, flush, or destruction can reclaim a target mapping.
+The backend rechecks the unit's code generation after every call because a
+helper may publish an effect which modifies MicroMem. A change returns
+`CodeInvalidated`. The current single-GameThread ownership contract avoids an
+unmeasured generation load at each pair; every linked edge still compares its
+slot generation.
+
+`nativeEntries` counts literal C++-to-native calls. `nativeBlocks` counts every
+executed block, including linked successors, and therefore equals
+`nativeEntries + linkedEdges`. Slow-link exits, successful resolutions,
+abandoned resolutions after cache churn, incompatible edges, block
+completions, and all ten native exit reasons have separate cumulative
+counters. The native-exit array sums to `nativeBlocks`.
+Opt-in block profiles update executions, pairs, budget classes, helper
+barriers, linked edges, and exits inside generated code, so their totals remain
+exact when the C++ accounting loop is bypassed.
 
 ## Instrumentation and tests
 
@@ -120,6 +156,8 @@ Focused tests cover:
   and E-bit program on both VU0 and VU1;
 - VU0 MicroMem branch wrapping and EE-visible synchronization boundaries;
 - cold compilation, warm hits, generation replacement, and stale handles;
+- static and dynamic self-links, warm host-entry reduction, exact linked
+  profiling, mode incompatibility, and forced pre-eviction unlinking;
 - unsupported-pair no-mutation behavior;
 - instrumentation fallback and exact observer/progress counts;
 - opt-in instrumented-native observer ordering and cache separation;

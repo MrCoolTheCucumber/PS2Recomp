@@ -3,6 +3,7 @@
 #include "runtime/ps2_vu_program_cache.h"
 #include "runtime/ps2_vu1.h"
 
+#include <algorithm>
 #include <array>
 #include <atomic>
 #include <cstdint>
@@ -111,6 +112,37 @@ namespace
             .entryOffset = 0u,
             .compilationNanoseconds = compilationNanoseconds,
         };
+    }
+
+    std::shared_ptr<VuNativeLinkState> makeLinks(
+        const VuProgramKey &key,
+        uintptr_t backendIdentity,
+        std::initializer_list<uint32_t> staticTargets = {})
+    {
+        auto links =
+            std::make_shared<VuNativeLinkState>();
+        links->backendIdentity = backendIdentity;
+        links->sourceEntryPc = key.entryPc;
+        for (const uint32_t target : staticTargets)
+        {
+            links->staticTargets.push_back({
+                .targetPc = target,
+            });
+        }
+        return links;
+    }
+
+    VuCompiledProgram makeLinkedProgram(
+        const VuProgramKey &key,
+        uintptr_t backendIdentity,
+        std::initializer_list<uint32_t> staticTargets = {})
+    {
+        VuCompiledProgram program = makeProgram(key);
+        program.outgoingLinks =
+            makeLinks(
+                key, backendIdentity,
+                staticTargets);
+        return program;
     }
 
     void appendU32(
@@ -276,6 +308,382 @@ void register_ps2_vu_program_cache_tests()
                     cache.diagnostics().hits,
                     uint64_t{1u},
                     "only the exact direct resolution should count as a hit");
+            });
+
+        tc.Run(
+            "link slots accept only compatible compilation namespaces",
+            [](TestCase &t)
+            {
+                int memoryIdentity = 0;
+                int codeIdentity = 0;
+                constexpr uintptr_t backendIdentity =
+                    0x12345678u;
+                VuProgramKey normalSource =
+                    syntheticKey(
+                        VuUnitId::Vu1,
+                        &memoryIdentity, &codeIdentity);
+                normalSource.codeContentIdentity = 7u;
+                VuProgramKey normalTarget = normalSource;
+                normalTarget.entryPc = 8u;
+                VuProgramKey instrumentedSource =
+                    normalSource;
+                instrumentedSource.compilationMode =
+                    VuCompilationMode::Instrumented;
+                VuProgramKey instrumentedTarget =
+                    instrumentedSource;
+                instrumentedTarget.entryPc = 8u;
+
+                VuProgramCache cache(VuUnitId::Vu1);
+                const VuProgramHandle normalSourceHandle =
+                    cache.insert(
+                        makeLinkedProgram(
+                            normalSource,
+                            backendIdentity, {8u}));
+                const VuProgramHandle normalTargetHandle =
+                    cache.insert(
+                        makeLinkedProgram(
+                            normalTarget,
+                            backendIdentity));
+                const VuProgramHandle
+                    instrumentedSourceHandle =
+                        cache.insert(
+                            makeLinkedProgram(
+                                instrumentedSource,
+                                backendIdentity, {8u}));
+                const VuProgramHandle
+                    instrumentedTargetHandle =
+                        cache.insert(
+                            makeLinkedProgram(
+                                instrumentedTarget,
+                                backendIdentity));
+
+                const VuCompiledProgram *const
+                    normalSourceProgram =
+                        cache.resolve(
+                            normalSourceHandle);
+                const VuCompiledProgram *const
+                    instrumentedSourceProgram =
+                        cache.resolve(
+                            instrumentedSourceHandle);
+                t.IsNotNull(
+                    normalSourceProgram,
+                    "the normal source should resolve");
+                t.IsNotNull(
+                    instrumentedSourceProgram,
+                    "the instrumented source should resolve");
+                if (!normalSourceProgram ||
+                    !instrumentedSourceProgram)
+                {
+                    return;
+                }
+                VuNativeLinkState *const normalLinks =
+                    normalSourceProgram->
+                        outgoingLinks.get();
+                VuNativeLinkState *const
+                    instrumentedLinks =
+                        instrumentedSourceProgram->
+                            outgoingLinks.get();
+
+                t.IsTrue(
+                    cache.populateLink(
+                        normalLinks,
+                        normalTargetHandle,
+                        normalTarget) ==
+                        VuProgramLinkResult::Linked,
+                    "normal blocks should link");
+                t.IsTrue(
+                    cache.populateLink(
+                        instrumentedLinks,
+                        instrumentedTargetHandle,
+                        instrumentedTarget) ==
+                        VuProgramLinkResult::Linked,
+                    "instrumented blocks should link separately");
+                t.IsTrue(
+                    cache.populateLink(
+                        normalLinks,
+                        instrumentedTargetHandle,
+                        instrumentedTarget) ==
+                        VuProgramLinkResult::Incompatible,
+                    "normal code must not link to instrumented code");
+                t.IsTrue(
+                    cache.populateLink(
+                        instrumentedLinks,
+                        normalTargetHandle,
+                        normalTarget) ==
+                        VuProgramLinkResult::Incompatible,
+                    "instrumented code must not link to normal code");
+
+                const VuNativeLinkSlot &normalSlot =
+                    normalLinks->
+                        staticTargets.front();
+                t.Equals(
+                    normalSlot.targetPc, uint32_t{8u},
+                    "the known target should use its static slot");
+                t.Equals(
+                    normalSlot.codeGeneration,
+                    normalTarget.codeGeneration,
+                    "the slot should publish its generation");
+                t.IsTrue(
+                    normalSlot.targetEntry != 0u,
+                    "the slot should publish an executable target");
+
+                VuProgramKey foreignBackend =
+                    normalTarget;
+                foreignBackend.hostFeatures ^= 1u;
+                const VuProgramHandle foreignHandle =
+                    cache.insert(
+                        makeLinkedProgram(
+                            foreignBackend,
+                            backendIdentity));
+                t.IsTrue(
+                    cache.populateLink(
+                        normalLinks,
+                        foreignHandle,
+                        foreignBackend) ==
+                        VuProgramLinkResult::Incompatible,
+                    "host-feature namespaces must not link");
+                t.Equals(
+                    cache.diagnostics().linkResolutions,
+                    uint64_t{2u},
+                    "only compatible links should resolve");
+                t.Equals(
+                    cache.diagnostics().
+                        linkResolutionFailures,
+                    uint64_t{3u},
+                    "every incompatible attempt should be counted");
+            });
+
+        tc.Run(
+            "generation and eviction clear links before native storage",
+            [](TestCase &t)
+            {
+                int memoryIdentity = 0;
+                int codeIdentity = 0;
+                constexpr uintptr_t backendIdentity =
+                    0x87654321u;
+                VuProgramKey sourceKey =
+                    syntheticKey(
+                        VuUnitId::Vu1,
+                        &memoryIdentity, &codeIdentity);
+                sourceKey.codeContentIdentity = 0x55u;
+                VuProgramKey targetKey = sourceKey;
+                targetKey.entryPc = 8u;
+                VuProgramCache cache(
+                    VuUnitId::Vu1,
+                    {
+                        .maximumPrograms = 2u,
+                        .maximumExecutableBytes =
+                            VuExecutableMemory::pageSize() *
+                            2u,
+                    });
+                const VuProgramHandle sourceHandle =
+                    cache.insert(
+                        makeLinkedProgram(
+                            sourceKey,
+                            backendIdentity));
+                const VuProgramHandle targetHandle =
+                    cache.insert(
+                        makeLinkedProgram(
+                            targetKey,
+                            backendIdentity));
+                const VuCompiledProgram *const source =
+                    cache.resolve(sourceHandle);
+                t.IsNotNull(
+                    source,
+                    "the source should be resident");
+                if (!source)
+                    return;
+                const std::shared_ptr<VuNativeLinkState>
+                    retainedLinks = source->outgoingLinks;
+                t.IsTrue(
+                    cache.populateLink(
+                        retainedLinks.get(),
+                        targetHandle, targetKey) ==
+                        VuProgramLinkResult::Linked,
+                    "an unknown target should use a dynamic slot");
+                t.IsTrue(
+                    retainedLinks->
+                        dynamicTargets.front().
+                        targetEntry != 0u,
+                    "the dynamic target should be live");
+                const uintptr_t originalTargetEntry =
+                    retainedLinks->
+                        dynamicTargets.front().
+                        targetEntry;
+
+                VuProgramKey nextSource = sourceKey;
+                ++nextSource.codeGeneration;
+                t.IsTrue(
+                    cache.lookup(nextSource).valid(),
+                    "identical content should survive generation activation");
+                t.Equals(
+                    retainedLinks->
+                        dynamicTargets.front().
+                        targetEntry,
+                    originalTargetEntry,
+                    "generation activation should retain storage");
+                t.Equals(
+                    retainedLinks->
+                        dynamicTargets.front().
+                        codeGeneration,
+                    sourceKey.codeGeneration,
+                    "the retained slot must remain generation-stale");
+                t.Equals(
+                    retainedLinks->
+                        dynamicTargets.front().targetPc,
+                    targetKey.entryPc,
+                    "logical invalidation may retain target metadata");
+
+                VuProgramKey nextTarget = targetKey;
+                nextTarget.codeGeneration =
+                    nextSource.codeGeneration;
+                const VuProgramHandle reboundSource =
+                    cache.lookup(nextSource);
+                const VuProgramHandle reboundTarget =
+                    cache.lookup(nextTarget);
+                const VuCompiledProgram *const
+                    reboundSourceProgram =
+                        cache.resolve(reboundSource);
+                t.IsNotNull(
+                    reboundSourceProgram,
+                    "the source should rebind in the new epoch");
+                t.IsTrue(
+                    cache.populateLink(
+                        reboundSourceProgram
+                            ? reboundSourceProgram->
+                                  outgoingLinks.get()
+                            : nullptr,
+                        reboundTarget, nextTarget) ==
+                        VuProgramLinkResult::Linked,
+                    "the current generation should relink");
+
+                VuProgramKey evictionKey = nextSource;
+                evictionKey.hostFeatures ^= 1u;
+                const VuProgramHandle afterEviction =
+                    cache.insert(
+                        makeLinkedProgram(
+                            evictionKey,
+                            backendIdentity));
+                t.IsTrue(
+                    afterEviction.valid(),
+                    "the post-eviction program should be resident");
+                t.Equals(
+                    retainedLinks->
+                        dynamicTargets.front().
+                        targetEntry,
+                    uintptr_t{0u},
+                    "eviction must unlink before releasing target code");
+                const VuProgramCacheDiagnostics diagnostics =
+                    cache.diagnostics();
+                t.Equals(
+                    diagnostics.linkInvalidations,
+                    uint64_t{1u},
+                    "only reclamation should physically clear a live link");
+                t.Equals(
+                    diagnostics.evictionFlushes,
+                    uint64_t{1u},
+                    "the forced cache churn should flush once");
+            });
+
+        tc.Run(
+            "dynamic link targets use bounded deterministic replacement",
+            [](TestCase &t)
+            {
+                int memoryIdentity = 0;
+                int codeIdentity = 0;
+                constexpr uintptr_t backendIdentity =
+                    0x31415926u;
+                VuProgramKey sourceKey =
+                    syntheticKey(
+                        VuUnitId::Vu1,
+                        &memoryIdentity, &codeIdentity);
+                sourceKey.codeSize = 64u;
+                sourceKey.addressMask = 63u;
+                sourceKey.codeContentIdentity = 0x77u;
+
+                VuProgramCache cache(VuUnitId::Vu1);
+                const VuProgramHandle sourceHandle =
+                    cache.insert(
+                        makeLinkedProgram(
+                            sourceKey,
+                            backendIdentity));
+                std::array<VuProgramKey, 6u> targetKeys{};
+                std::array<VuProgramHandle, 6u>
+                    targetHandles{};
+                for (size_t index = 0u;
+                     index < targetKeys.size();
+                     ++index)
+                {
+                    targetKeys[index] = sourceKey;
+                    targetKeys[index].entryPc =
+                        static_cast<uint32_t>(
+                            (index + 1u) * 8u);
+                    targetHandles[index] =
+                        cache.insert(
+                            makeLinkedProgram(
+                                targetKeys[index],
+                                backendIdentity));
+                    t.IsTrue(
+                        targetHandles[index].valid(),
+                        "every dynamic target should be resident");
+                }
+
+                const VuCompiledProgram *const source =
+                    cache.resolve(sourceHandle);
+                t.IsNotNull(
+                    source,
+                    "the dynamic source should remain resident");
+                if (!source || !source->outgoingLinks)
+                    return;
+                VuNativeLinkState &links =
+                    *source->outgoingLinks;
+                for (size_t index = 0u;
+                     index < targetKeys.size();
+                     ++index)
+                {
+                    t.IsTrue(
+                        cache.populateLink(
+                            &links,
+                            targetHandles[index],
+                            targetKeys[index]) ==
+                            VuProgramLinkResult::Linked,
+                        "every dynamic edge should resolve");
+                }
+
+                const auto containsTarget =
+                    [&](uint32_t targetPc)
+                    {
+                        return std::any_of(
+                            links.dynamicTargets.begin(),
+                            links.dynamicTargets.end(),
+                            [&](const VuNativeLinkSlot &slot)
+                            {
+                                return
+                                    slot.targetPc ==
+                                        targetPc &&
+                                    slot.targetEntry != 0u;
+                            });
+                    };
+                t.IsFalse(
+                    containsTarget(8u),
+                    "the oldest dynamic target should be replaced");
+                t.IsFalse(
+                    containsTarget(16u),
+                    "the second-oldest target should be replaced");
+                for (const uint32_t targetPc :
+                     {24u, 32u, 40u, 48u})
+                {
+                    t.IsTrue(
+                        containsTarget(targetPc),
+                        "the four newest dynamic targets should remain");
+                }
+                t.Equals(
+                    links.nextDynamicSlot, uint32_t{2u},
+                    "replacement should advance deterministically");
+                t.Equals(
+                    cache.diagnostics().linkResolutions,
+                    uint64_t{6u},
+                    "every successful replacement should be counted");
             });
 
         tc.Run(

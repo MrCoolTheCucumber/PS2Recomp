@@ -1344,6 +1344,7 @@ namespace
         uint64_t samplePath1Hash = 0u;
         VuExitReason exitReason =
             VuExitReason::Inactive;
+        bool blockLinkingEnabled = false;
         bool valid = true;
         VuRecompilerDiagnostics nativeDelta{};
         VuProgramCacheDiagnostics cacheDelta{};
@@ -1377,6 +1378,9 @@ namespace
         bool churnCache)
     {
         Measurement result;
+        result.blockLinkingEnabled =
+            native &&
+            native->blockLinkingEnabled();
         prepareInvocations(
             invocations, initialState, initialData,
             expectedEffects);
@@ -1607,6 +1611,10 @@ namespace
                 difference(
                     after.nativeEntries,
                     nativeBefore.nativeEntries);
+            result.nativeDelta.nativeBlocks =
+                difference(
+                    after.nativeBlocks,
+                    nativeBefore.nativeBlocks);
             result.nativeDelta.nativePairs =
                 difference(
                     after.nativePairs,
@@ -1619,6 +1627,27 @@ namespace
                 difference(
                     after.helperPairs,
                     nativeBefore.helperPairs);
+            result.nativeDelta.linkedEdges =
+                difference(
+                    after.linkedEdges,
+                    nativeBefore.linkedEdges);
+            result.nativeDelta.slowLinkExits =
+                difference(
+                    after.slowLinkExits,
+                    nativeBefore.slowLinkExits);
+            result.nativeDelta.resolvedLinks =
+                difference(
+                    after.resolvedLinks,
+                    nativeBefore.resolvedLinks);
+            result.nativeDelta.abandonedLinkResolutions =
+                difference(
+                    after.abandonedLinkResolutions,
+                    nativeBefore.
+                        abandonedLinkResolutions);
+            result.nativeDelta.incompatibleLinkExits =
+                difference(
+                    after.incompatibleLinkExits,
+                    nativeBefore.incompatibleLinkExits);
             result.nativeDelta.blockCompletes =
                 difference(
                     after.blockCompletes,
@@ -1647,6 +1676,19 @@ namespace
                 difference(
                     after.faultExits,
                     nativeBefore.faultExits);
+            for (size_t exit = 0u;
+                 exit <
+                     result.nativeDelta.
+                         nativeExitReasons.size();
+                 ++exit)
+            {
+                result.nativeDelta.
+                    nativeExitReasons[exit] =
+                        difference(
+                            after.nativeExitReasons[exit],
+                            nativeBefore.
+                                nativeExitReasons[exit]);
+            }
             result.nativeDelta.interpreterFallbackPairs =
                 difference(
                     after.interpreterFallbackPairs,
@@ -1702,6 +1744,18 @@ namespace
                 difference(
                     after.rejectedPrograms,
                     cacheBefore.rejectedPrograms);
+            result.cacheDelta.linkResolutions =
+                difference(
+                    after.linkResolutions,
+                    cacheBefore.linkResolutions);
+            result.cacheDelta.linkResolutionFailures =
+                difference(
+                    after.linkResolutionFailures,
+                    cacheBefore.linkResolutionFailures);
+            result.cacheDelta.linkInvalidations =
+                difference(
+                    after.linkInvalidations,
+                    cacheBefore.linkInvalidations);
             result.cacheDelta.generatedBytes =
                 difference(
                     after.generatedBytes,
@@ -1830,14 +1884,31 @@ namespace
         if (backend == "recompiler")
         {
             std::cout
+                << ",\"block_linking_enabled\":"
+                << (measurement.blockLinkingEnabled
+                        ? "true" : "false")
                 << ",\"native_entries\":"
                 << measurement.nativeDelta.nativeEntries
+                << ",\"native_blocks\":"
+                << measurement.nativeDelta.nativeBlocks
                 << ",\"native_pairs\":"
                 << measurement.nativeDelta.nativePairs
                 << ",\"inline_pairs\":"
                 << measurement.nativeDelta.inlinePairs
                 << ",\"helper_pairs\":"
                 << measurement.nativeDelta.helperPairs
+                << ",\"linked_edges\":"
+                << measurement.nativeDelta.linkedEdges
+                << ",\"slow_link_exits\":"
+                << measurement.nativeDelta.slowLinkExits
+                << ",\"resolved_links\":"
+                << measurement.nativeDelta.resolvedLinks
+                << ",\"abandoned_link_resolutions\":"
+                << measurement.nativeDelta
+                       .abandonedLinkResolutions
+                << ",\"incompatible_link_exits\":"
+                << measurement.nativeDelta
+                       .incompatibleLinkExits
                 << ",\"block_completes\":"
                 << measurement.nativeDelta.blockCompletes
                 << ",\"cycle_budget_exits\":"
@@ -1852,7 +1923,29 @@ namespace
                 << ",\"code_invalidation_exits\":"
                 << measurement.nativeDelta.codeInvalidationExits
                 << ",\"fault_exits\":"
-                << measurement.nativeDelta.faultExits
+                << measurement.nativeDelta.faultExits;
+            std::cout
+                << ",\"native_exit_reasons\":{";
+            for (size_t exit = 0u;
+                 exit <
+                     measurement.nativeDelta.
+                         nativeExitReasons.size();
+                 ++exit)
+            {
+                if (exit != 0u)
+                    std::cout << ",";
+                std::cout
+                    << "\""
+                    << vuNativeBlockExitName(
+                           static_cast<
+                               VuNativeBlockExit>(
+                               exit))
+                    << "\":"
+                    << measurement.nativeDelta.
+                           nativeExitReasons[exit];
+            }
+            std::cout
+                << "}"
                 << ",\"interpreter_fallback_pairs\":"
                 << measurement.nativeDelta
                        .interpreterFallbackPairs
@@ -1883,6 +1976,13 @@ namespace
                 << measurement.cacheDelta.manualFlushes
                 << ",\"cache_rejected_programs\":"
                 << measurement.cacheDelta.rejectedPrograms
+                << ",\"cache_link_resolutions\":"
+                << measurement.cacheDelta.linkResolutions
+                << ",\"cache_link_resolution_failures\":"
+                << measurement.cacheDelta
+                       .linkResolutionFailures
+                << ",\"cache_link_invalidations\":"
+                << measurement.cacheDelta.linkInvalidations
                 << ",\"cache_generated_bytes\":"
                 << measurement.cacheDelta.generatedBytes
                 << ",\"cache_compilation_nanoseconds\":"
@@ -1917,6 +2017,14 @@ namespace
             << profile.droppedRecords
             << ",\"record_count\":"
             << profile.blocks.size()
+            << ",\"backend_cumulative_native_entries\":"
+            << diagnostics.nativeEntries
+            << ",\"backend_cumulative_native_blocks\":"
+            << diagnostics.nativeBlocks
+            << ",\"backend_cumulative_linked_edges\":"
+            << diagnostics.linkedEdges
+            << ",\"backend_cumulative_slow_link_exits\":"
+            << diagnostics.slowLinkExits
             << ",\"jitdump_registrations\":"
             << diagnostics.jitDumpRegistrations
             << ",\"jitdump_failures\":"

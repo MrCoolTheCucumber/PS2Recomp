@@ -782,12 +782,26 @@ int main(int argc, char **argv)
             << std::dec
             << "\"native_entries\":"
             << recompilerDiagnostics.nativeEntries
+            << ",\"native_blocks\":"
+            << recompilerDiagnostics.nativeBlocks
             << ",\"native_pairs\":"
             << recompilerDiagnostics.nativePairs
             << ",\"inline_pairs\":"
             << recompilerDiagnostics.inlinePairs
             << ",\"helper_pairs\":"
             << recompilerDiagnostics.helperPairs
+            << ",\"linked_edges\":"
+            << recompilerDiagnostics.linkedEdges
+            << ",\"slow_link_exits\":"
+            << recompilerDiagnostics.slowLinkExits
+            << ",\"resolved_links\":"
+            << recompilerDiagnostics.resolvedLinks
+            << ",\"abandoned_link_resolutions\":"
+            << recompilerDiagnostics
+                   .abandonedLinkResolutions
+            << ",\"incompatible_link_exits\":"
+            << recompilerDiagnostics
+                   .incompatibleLinkExits
             << ",\"block_completes\":"
             << recompilerDiagnostics.blockCompletes
             << ",\"cycle_budget_exits\":"
@@ -801,7 +815,29 @@ int main(int argc, char **argv)
             << ",\"code_invalidation_exits\":"
             << recompilerDiagnostics.codeInvalidationExits
             << ",\"fault_exits\":"
-            << recompilerDiagnostics.faultExits
+            << recompilerDiagnostics.faultExits;
+        std::cout
+            << ",\"native_exit_reasons\":{";
+        for (size_t exit = 0u;
+             exit <
+                 recompilerDiagnostics.
+                     nativeExitReasons.size();
+             ++exit)
+        {
+            if (exit != 0u)
+                std::cout << ",";
+            std::cout
+                << "\""
+                << vuNativeBlockExitName(
+                       static_cast<
+                           VuNativeBlockExit>(
+                           exit))
+                << "\":"
+                << recompilerDiagnostics.
+                       nativeExitReasons[exit];
+        }
+        std::cout
+            << "}"
             << ",\"interpreter_fallback_pairs\":"
             << recompilerDiagnostics.interpreterFallbackPairs
             << ",\"code_image_identities\":"

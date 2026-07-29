@@ -65,6 +65,28 @@ Resolved program pointers are valid only until the next non-const cache
 operation on the owner thread. Native callers must not retain an entry pointer
 across cache lookup, insertion, invalidation, or a helper boundary.
 
+Each compiled program owns heap-stable outgoing link storage outside its
+executable mapping. Static slots are assigned known direct/fallthrough target
+PCs at emission; four bounded dynamic slots retain recently observed indirect
+targets. A populated slot contains the current code generation and the
+target's canonical linked-entry address. Generated code checks both the PC and
+generation before using the address.
+
+On a cold edge, generated code returns with canonical architectural state.
+Only then may C++ compile or resolve the target and populate the writable slot:
+compilation is never attempted while a native return address is live. Normal
+and instrumented modes, host features, code identity, unit, and backend owner
+must all be compatible.
+
+Every generation transition advances the handle epoch and immediately makes
+the old slots unusable through their generation guard. Exact-content programs
+and their slot storage remain resident, so this logical invalidation is O(1)
+and a recurring image resolves the edge again under its new generation.
+Scope invalidation, eviction, manual flush, and cache destruction physically
+clear every outgoing slot before executable storage can be released. This
+pre-reclamation all-links walk avoids an incoming-edge graph; no stale target
+can be used or outlive its executable allocation.
+
 The default bounds are 3,072 programs and 96 MiB of executable mappings per VU.
 Crossing either bound performs a deterministic full flush, then inserts the new
 program. A program larger than the byte limit is rejected without disturbing
@@ -108,10 +130,13 @@ external synchronization.
 - exact cross-generation reuse hits;
 - eviction flushes, evicted programs, and manual flushes;
 - rejected programs;
+- successful/failed link resolutions and invalidated live slots;
 - emitted bytes and compilation nanoseconds;
 - current and high-water program/allocated-byte residency.
 
 Focused tests cover VU0/VU1 separation, every key dimension, direct and wrapped
 `MPG` writes, byte-identical uploads, data-only writes, reset, generation
 rollover, deterministic bounds, stale handles, W^X permissions, instruction
-cache visibility, move ownership, malformed programs, and the thread contract.
+cache visibility, compatible and incompatible compilation modes, dynamic
+targets, pre-reclamation link invalidation, move ownership, malformed
+programs, and the thread contract.

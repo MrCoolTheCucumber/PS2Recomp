@@ -3,9 +3,11 @@
 #include "runtime/ps2_vu_recompiler.h"
 
 #include <array>
+#include <cstdlib>
 #include <cstdint>
 #include <cstring>
 #include <limits>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -17,6 +19,49 @@ namespace
 {
     constexpr uint32_t kVuUpperNop = 0x000002ffu;
     constexpr uint32_t kVuUpperEnd = 1u << 30u;
+
+    class ScopedEnvironmentVariable
+    {
+    public:
+        explicit ScopedEnvironmentVariable(
+            const char *name)
+            : m_name(name)
+        {
+            if (const char *const value =
+                    std::getenv(name))
+            {
+                m_original = value;
+            }
+        }
+
+        ~ScopedEnvironmentVariable()
+        {
+            if (m_original)
+            {
+                setenv(
+                    m_name.c_str(),
+                    m_original->c_str(), 1);
+            }
+            else
+            {
+                unsetenv(m_name.c_str());
+            }
+        }
+
+        void set(const char *value)
+        {
+            setenv(m_name.c_str(), value, 1);
+        }
+
+        ScopedEnvironmentVariable(
+            const ScopedEnvironmentVariable &) = delete;
+        ScopedEnvironmentVariable &operator=(
+            const ScopedEnvironmentVariable &) = delete;
+
+    private:
+        std::string m_name;
+        std::optional<std::string> m_original;
+    };
 
     struct VuNativeFixture
     {
@@ -350,6 +395,10 @@ void register_ps2_vu_recompiler_tests()
 {
     MiniTest::Case("PS2VURecompiler", [](TestCase &tc)
     {
+        ScopedEnvironmentVariable linking(
+            "PS2X_VU_BLOCK_LINKING");
+        linking.set("1");
+
         tc.Run(
             "every IR opcode has an explicit native disposition",
             [](TestCase &t)
@@ -664,6 +713,67 @@ void register_ps2_vu_recompiler_tests()
                 t.Equals(
                     nativeState.pc, uint32_t{8u},
                     "native code should wrap the VU0 jump target");
+
+                referenceState = initialSyntheticState();
+                referenceState.vi[1] = 0x201;
+                nativeState = referenceState;
+                referenceEffects.clear();
+                nativeEffects.clear();
+                const VuRunResult resolvingReference =
+                    reference.run(referenceContext, 4u);
+                const VuRunResult resolvingNative =
+                    native.run(nativeContext, 4u);
+                t.IsTrue(
+                    sameRunResult(
+                        resolvingReference,
+                        resolvingNative),
+                    "the resolving VU0 wrap run should match");
+                std::string difference;
+                t.IsTrue(
+                    vuExecutionStatesEqual(
+                        referenceState, nativeState,
+                        &difference),
+                    "the resolving VU0 wrap state differs at " +
+                        difference);
+
+                referenceState = initialSyntheticState();
+                referenceState.vi[1] = 0x201;
+                nativeState = referenceState;
+                referenceEffects.clear();
+                nativeEffects.clear();
+                const VuRecompilerDiagnostics beforeWarm =
+                    native.diagnostics();
+                const VuRunResult warmReference =
+                    reference.run(referenceContext, 4u);
+                const VuRunResult warmNative =
+                    native.run(nativeContext, 4u);
+                const VuRecompilerDiagnostics afterWarm =
+                    native.diagnostics();
+                t.IsTrue(
+                    sameRunResult(
+                        warmReference, warmNative),
+                    "the warm linked VU0 wrap run should match");
+                t.IsTrue(
+                    vuExecutionStatesEqual(
+                        referenceState, nativeState,
+                        &difference),
+                    "the warm linked VU0 wrap state differs at " +
+                        difference);
+                t.Equals(
+                    afterWarm.nativeEntries -
+                        beforeWarm.nativeEntries,
+                    uint64_t{1u},
+                    "the warm wrapped target should stay native");
+                t.Equals(
+                    afterWarm.nativeBlocks -
+                        beforeWarm.nativeBlocks,
+                    uint64_t{2u},
+                    "the warm wrap should execute source and target");
+                t.Equals(
+                    afterWarm.linkedEdges -
+                        beforeWarm.linkedEdges,
+                    uint64_t{1u},
+                    "the wrapped dynamic target should tail-link");
             });
 
         tc.Run(
@@ -1355,6 +1465,698 @@ void register_ps2_vu_recompiler_tests()
                         }
                     }
                 }
+            });
+
+        tc.Run(
+            "canonical self links reduce host entries with exact profiles",
+            [](TestCase &t)
+            {
+                if (!VuRecompilerBackend::supported())
+                    return;
+
+                VuNativeFixture referenceFixture;
+                VuNativeFixture nativeFixture;
+                t.IsTrue(
+                    referenceFixture.initialize(),
+                    "reference memory should initialize");
+                t.IsTrue(
+                    nativeFixture.initialize(),
+                    "native memory should initialize");
+                const uint32_t loop =
+                    makeVuBranchOperation(
+                        0x20u, 0u, 0u, -1);
+                writePair(
+                    referenceFixture.code, 0u,
+                    loop, kVuUpperNop);
+                writePair(
+                    nativeFixture.code, 0u,
+                    loop, kVuUpperNop);
+                writePair(
+                    referenceFixture.code, 8u,
+                    makeVuIaddiu(1u, 1u, 1),
+                    kVuUpperNop);
+                writePair(
+                    nativeFixture.code, 8u,
+                    makeVuIaddiu(1u, 1u, 1),
+                    kVuUpperNop);
+                referenceFixture.markCodeModified();
+                nativeFixture.markCodeModified();
+
+                VuUnit referenceUnit(VuUnitId::Vu1);
+                VuUnit nativeUnit(VuUnitId::Vu1);
+                VuInterpreterBackend reference(
+                    referenceUnit);
+                VuRecompilerBackend native(
+                    nativeUnit,
+                    VuBlockProfilingConfiguration{
+                        .enabled = true,
+                        .maximumRecords = 16u,
+                    });
+                VuExecutionState referenceState =
+                    initialSyntheticState();
+                VuExecutionState nativeState =
+                    referenceState;
+                VuTransactionalSideEffectSink
+                    referenceEffects;
+                VuTransactionalSideEffectSink
+                    nativeEffects;
+                VuExecutionContext referenceContext =
+                    makeContext(
+                        referenceState,
+                        referenceFixture,
+                        referenceEffects);
+                VuExecutionContext nativeContext =
+                    makeContext(
+                        nativeState,
+                        nativeFixture,
+                        nativeEffects);
+                VuProgramKey key;
+                std::string diagnostic;
+                t.IsTrue(
+                    native.programKey(
+                        nativeContext,
+                        VuCompilationMode::Normal,
+                        key, &diagnostic),
+                    "the loop key should be valid: " +
+                        diagnostic);
+
+                constexpr uint32_t budget = 200u;
+                const VuRunResult referenceResult =
+                    reference.run(
+                        referenceContext, budget);
+                const VuRunResult cold =
+                    native.run(nativeContext, budget);
+                t.IsTrue(
+                    sameRunResult(
+                        referenceResult, cold),
+                    "cold linked run result should match");
+                std::string difference;
+                t.IsTrue(
+                    vuExecutionStatesEqual(
+                        referenceState, nativeState,
+                        &difference),
+                    "cold linked state differs at " +
+                        difference);
+
+                const VuRecompilerDiagnostics coldStats =
+                    native.diagnostics();
+                t.Equals(
+                    coldStats.nativePairs,
+                    uint64_t{budget},
+                    "cold linked pairs should be exact");
+                t.Equals(
+                    coldStats.nativeBlocks,
+                    uint64_t{100u},
+                    "two-pair loop blocks should be exact");
+                t.Equals(
+                    coldStats.nativeEntries,
+                    uint64_t{2u},
+                    "one cold miss should require two host entries");
+                t.Equals(
+                    coldStats.linkedEdges,
+                    uint64_t{98u},
+                    "the remainder should tail-link");
+                t.Equals(
+                    coldStats.slowLinkExits,
+                    uint64_t{1u},
+                    "the cold edge should resolve once");
+                t.Equals(
+                    coldStats.resolvedLinks,
+                    uint64_t{1u},
+                    "the self edge should populate once");
+                t.Equals(
+                    coldStats.blockCompletes,
+                    coldStats.nativeBlocks,
+                    "every loop block should complete");
+
+                nativeState = initialSyntheticState();
+                nativeEffects.clear();
+                const VuRecompilerDiagnostics beforeWarm =
+                    native.diagnostics();
+                const VuRunResult warm =
+                    native.run(nativeContext, budget);
+                const VuRecompilerDiagnostics afterWarm =
+                    native.diagnostics();
+                t.IsTrue(
+                    warm.reason ==
+                        VuExitReason::CycleBudget,
+                    "the warm loop should exhaust its budget");
+                t.Equals(
+                    afterWarm.nativeEntries -
+                        beforeWarm.nativeEntries,
+                    uint64_t{1u},
+                    "a warm chain should cross the adapter once");
+                t.Equals(
+                    afterWarm.nativeBlocks -
+                        beforeWarm.nativeBlocks,
+                    uint64_t{100u},
+                    "the warm chain should execute every block");
+                t.Equals(
+                    afterWarm.linkedEdges -
+                        beforeWarm.linkedEdges,
+                    uint64_t{99u},
+                    "every warm inter-block edge should link");
+                t.Equals(
+                    afterWarm.slowLinkExits -
+                        beforeWarm.slowLinkExits,
+                    uint64_t{0u},
+                    "the warm edge should not revisit the resolver");
+                uint64_t nativeExits = 0u;
+                for (const uint64_t count :
+                     afterWarm.nativeExitReasons)
+                {
+                    nativeExits += count;
+                }
+                t.Equals(
+                    nativeExits,
+                    afterWarm.nativeBlocks,
+                    "native exit reasons should cover every block");
+                t.Equals(
+                    afterWarm.nativeExitReasons[
+                        static_cast<size_t>(
+                            VuNativeBlockExit::
+                                BlockComplete)],
+                    afterWarm.nativeBlocks,
+                    "every loop block should report completion");
+
+                const VuBlockProfilingSnapshot profile =
+                    native
+                        .blockProfilingSnapshotWhileExecutionQuiescent();
+                uint64_t executions = 0u;
+                uint64_t pairs = 0u;
+                uint64_t linkedEdges = 0u;
+                uint64_t exits = 0u;
+                for (const VuBlockProfileSnapshot &block :
+                     profile.blocks)
+                {
+                    executions += block.executions;
+                    pairs += block.guestPairs;
+                    linkedEdges += block.linkedEdges;
+                    for (const uint64_t count :
+                         block.exitReasons)
+                    {
+                        exits += count;
+                    }
+                }
+                t.Equals(
+                    executions,
+                    afterWarm.nativeBlocks,
+                    "profile executions should include linked blocks");
+                t.Equals(
+                    pairs, afterWarm.nativePairs,
+                    "profile pairs should include linked blocks");
+                t.Equals(
+                    linkedEdges,
+                    afterWarm.linkedEdges,
+                    "profile links should reconcile globally");
+                t.Equals(
+                    exits, executions,
+                    "every profiled block should have one exit");
+
+                const VuProgramHandle handle =
+                    nativeUnit.programCache().lookup(key);
+                const VuCompiledProgram *const program =
+                    nativeUnit.programCache().resolve(
+                        handle);
+                t.IsNotNull(
+                    program,
+                    "the linked source should remain resident");
+                bool foundStaticSelfLink = false;
+                if (program && program->outgoingLinks)
+                {
+                    for (const VuNativeLinkSlot &slot :
+                         program->outgoingLinks->
+                             staticTargets)
+                    {
+                        if (slot.targetPc == 0u &&
+                            slot.targetEntry != 0u)
+                        {
+                            foundStaticSelfLink = true;
+                        }
+                    }
+                }
+                t.IsTrue(
+                    foundStaticSelfLink,
+                    "the direct branch should use a static slot");
+            });
+
+        tc.Run(
+            "block-linking switch retains canonical dispatch",
+            [](TestCase &t)
+            {
+                if (!VuRecompilerBackend::supported())
+                    return;
+
+                ScopedEnvironmentVariable linking(
+                    "PS2X_VU_BLOCK_LINKING");
+                linking.set("0");
+                VuNativeFixture fixture;
+                t.IsTrue(
+                    fixture.initialize(),
+                    "VU memory fixture should initialize");
+                writePair(
+                    fixture.code, 0u,
+                    makeVuBranchOperation(
+                        0x20u, 0u, 0u, -1),
+                    kVuUpperNop);
+                writePair(
+                    fixture.code, 8u,
+                    makeVuIaddiu(1u, 1u, 1),
+                    kVuUpperNop);
+                fixture.markCodeModified();
+
+                VuUnit unit(VuUnitId::Vu1);
+                VuRecompilerBackend backend(unit);
+                VuExecutionState state =
+                    initialSyntheticState();
+                VuTransactionalSideEffectSink effects;
+                VuExecutionContext context =
+                    makeContext(state, fixture, effects);
+                const VuRunResult result =
+                    backend.run(context, 40u);
+                const VuRecompilerDiagnostics diagnostics =
+                    backend.diagnostics();
+                t.IsFalse(
+                    backend.blockLinkingEnabled(),
+                    "the diagnostic switch should be visible");
+                t.IsTrue(
+                    result.reason ==
+                        VuExitReason::CycleBudget,
+                    "canonical dispatch should preserve the result");
+                t.Equals(
+                    state.vi[1], int32_t{20},
+                    "canonical dispatch should preserve state");
+                t.Equals(
+                    diagnostics.nativeBlocks,
+                    uint64_t{20u},
+                    "canonical blocks should remain exact");
+                t.Equals(
+                    diagnostics.nativeEntries,
+                    diagnostics.nativeBlocks,
+                    "every unlinked block should enter from C++");
+                t.Equals(
+                    diagnostics.linkedEdges,
+                    uint64_t{0u},
+                    "disabled linking must not use a slot");
+                t.Equals(
+                    diagnostics.slowLinkExits,
+                    uint64_t{0u},
+                    "disabled linking must not invoke the resolver");
+            });
+
+        tc.Run(
+            "dynamic jump targets populate bounded writable slots",
+            [](TestCase &t)
+            {
+                if (!VuRecompilerBackend::supported())
+                    return;
+
+                VuNativeFixture fixture;
+                t.IsTrue(
+                    fixture.initialize(),
+                    "VU memory fixture should initialize");
+                writePair(
+                    fixture.code, 0u,
+                    makeVuBranchOperation(
+                        0x24u, 1u, 0u, 0),
+                    kVuUpperNop);
+                writePair(
+                    fixture.code, 8u,
+                    makeVuIaddiu(2u, 2u, 1),
+                    kVuUpperNop);
+                fixture.markCodeModified();
+
+                VuUnit unit(VuUnitId::Vu1);
+                VuRecompilerBackend backend(unit);
+                VuExecutionState state =
+                    initialSyntheticState();
+                state.vi[1] = 0;
+                VuTransactionalSideEffectSink effects;
+                VuExecutionContext context =
+                    makeContext(state, fixture, effects);
+                VuProgramKey key;
+                std::string diagnostic;
+                t.IsTrue(
+                    backend.programKey(
+                        context,
+                        VuCompilationMode::Normal,
+                        key, &diagnostic),
+                    "the dynamic loop key should be valid: " +
+                        diagnostic);
+
+                const VuRunResult cold =
+                    backend.run(context, 40u);
+                t.IsTrue(
+                    cold.reason ==
+                        VuExitReason::CycleBudget,
+                    "the dynamic loop should exhaust its budget");
+                t.Equals(
+                    state.vi[2], int32_t{20},
+                    "every dynamic delay slot should retire");
+                const VuRecompilerDiagnostics coldStats =
+                    backend.diagnostics();
+                t.Equals(
+                    coldStats.nativeEntries,
+                    uint64_t{2u},
+                    "one cold dynamic edge should return twice");
+                t.Equals(
+                    coldStats.linkedEdges,
+                    uint64_t{18u},
+                    "the cold remainder should link");
+
+                const VuProgramHandle handle =
+                    unit.programCache().lookup(key);
+                const VuCompiledProgram *const program =
+                    unit.programCache().resolve(handle);
+                t.IsNotNull(
+                    program,
+                    "the dynamic source should be resident");
+                bool foundDynamicSelfLink = false;
+                if (program && program->outgoingLinks)
+                {
+                    for (const VuNativeLinkSlot &slot :
+                         program->outgoingLinks->
+                             dynamicTargets)
+                    {
+                        if (slot.targetPc == 0u &&
+                            slot.targetEntry != 0u)
+                        {
+                            foundDynamicSelfLink = true;
+                        }
+                    }
+                }
+                t.IsTrue(
+                    foundDynamicSelfLink,
+                    "JR should populate a dynamic slot");
+
+                state = initialSyntheticState();
+                state.vi[1] = 0;
+                effects.clear();
+                const VuRecompilerDiagnostics before =
+                    backend.diagnostics();
+                (void)backend.run(context, 40u);
+                const VuRecompilerDiagnostics after =
+                    backend.diagnostics();
+                t.Equals(
+                    after.nativeEntries -
+                        before.nativeEntries,
+                    uint64_t{1u},
+                    "the warm dynamic target should stay in native code");
+                t.Equals(
+                    after.linkedEdges -
+                        before.linkedEdges,
+                    uint64_t{19u},
+                    "all warm dynamic edges should link");
+            });
+
+        tc.Run(
+            "normal and instrumented chains remain separate",
+            [](TestCase &t)
+            {
+                if (!VuRecompilerBackend::supported())
+                    return;
+
+                VuNativeFixture fixture;
+                t.IsTrue(
+                    fixture.initialize(),
+                    "VU memory fixture should initialize");
+                writePair(
+                    fixture.code, 0u,
+                    makeVuBranchOperation(
+                        0x20u, 0u, 0u, -1),
+                    kVuUpperNop);
+                writePair(
+                    fixture.code, 8u,
+                    makeVuIaddiu(1u, 1u, 1),
+                    kVuUpperNop);
+                fixture.markCodeModified();
+
+                VuUnit unit(VuUnitId::Vu1);
+                std::vector<uint64_t> observedIndices;
+                unit.setInstructionObserver(
+                    [&](uint64_t index, uint32_t,
+                        uint32_t, uint32_t,
+                        const VuExecutionState &)
+                    {
+                        observedIndices.push_back(index);
+                    });
+                unit.setInstructionObserverEnabled(true);
+                VuRecompilerBackend backend(unit);
+                VuExecutionState state =
+                    initialSyntheticState();
+                VuTransactionalSideEffectSink effects;
+                VuExecutionContext context =
+                    makeContext(state, fixture, effects);
+                VuProgramKey normalKey;
+                VuProgramKey instrumentedKey;
+                std::string diagnostic;
+                t.IsTrue(
+                    backend.programKey(
+                        context,
+                        VuCompilationMode::Normal,
+                        normalKey, &diagnostic),
+                    "the normal key should be valid: " +
+                        diagnostic);
+                (void)backend.run(context, 20u);
+                const VuRecompilerDiagnostics
+                    beforeInstrumented =
+                        backend.diagnostics();
+
+                state = initialSyntheticState();
+                effects.clear();
+                context.enableInstrumentation = true;
+                context.enableNativeInstrumentation = true;
+                t.IsTrue(
+                    backend.programKey(
+                        context,
+                        VuCompilationMode::Instrumented,
+                        instrumentedKey, &diagnostic),
+                    "the instrumented key should be valid: " +
+                        diagnostic);
+                const VuRunResult cold =
+                    backend.run(context, 20u);
+                const VuRecompilerDiagnostics afterCold =
+                    backend.diagnostics();
+                t.IsTrue(
+                    cold.reason ==
+                        VuExitReason::CycleBudget,
+                    "the instrumented loop should exhaust its budget");
+                t.Equals(
+                    observedIndices.size(), size_t{20u},
+                    "every linked instrumented pair should be observed");
+                t.Equals(
+                    afterCold.instrumentedNativeEntries -
+                        beforeInstrumented.
+                            instrumentedNativeEntries,
+                    uint64_t{2u},
+                    "one cold instrumented edge should return twice");
+                t.Equals(
+                    afterCold.instrumentedNativeBlocks -
+                        beforeInstrumented.
+                            instrumentedNativeBlocks,
+                    uint64_t{10u},
+                    "instrumented linked blocks should be exact");
+                t.Equals(
+                    afterCold.linkedEdges -
+                        beforeInstrumented.linkedEdges,
+                    uint64_t{8u},
+                    "the cold instrumented remainder should link");
+
+                state = initialSyntheticState();
+                effects.clear();
+                observedIndices.clear();
+                const VuRecompilerDiagnostics beforeWarm =
+                    backend.diagnostics();
+                (void)backend.run(context, 20u);
+                const VuRecompilerDiagnostics afterWarm =
+                    backend.diagnostics();
+                t.Equals(
+                    afterWarm.instrumentedNativeEntries -
+                        beforeWarm.instrumentedNativeEntries,
+                    uint64_t{1u},
+                    "the warm instrumented chain should enter once");
+                t.Equals(
+                    afterWarm.linkedEdges -
+                        beforeWarm.linkedEdges,
+                    uint64_t{9u},
+                    "all warm instrumented edges should link");
+                t.Equals(
+                    observedIndices.size(), size_t{20u},
+                    "warm linked observation should stay exact");
+
+                const VuProgramHandle normalHandle =
+                    unit.programCache().lookup(normalKey);
+                const VuProgramHandle instrumentedHandle =
+                    unit.programCache().lookup(
+                        instrumentedKey);
+                const VuCompiledProgram *const normal =
+                    unit.programCache().resolve(
+                        normalHandle);
+                const VuCompiledProgram *const instrumented =
+                    unit.programCache().resolve(
+                        instrumentedHandle);
+                t.IsNotNull(
+                    normal,
+                    "the normal chain should remain resident");
+                t.IsNotNull(
+                    instrumented,
+                    "the instrumented chain should remain resident");
+                if (normal && instrumented &&
+                    normal->outgoingLinks &&
+                    instrumented->outgoingLinks)
+                {
+                    const auto selfTarget =
+                        [](const VuNativeLinkState &links)
+                        {
+                            for (const VuNativeLinkSlot &slot :
+                                 links.staticTargets)
+                            {
+                                if (slot.targetPc == 0u)
+                                    return slot.targetEntry;
+                            }
+                            return uintptr_t{0u};
+                        };
+                    const uintptr_t normalTarget =
+                        selfTarget(
+                            *normal->outgoingLinks);
+                    const uintptr_t instrumentedTarget =
+                        selfTarget(
+                            *instrumented->
+                                outgoingLinks);
+                    t.IsTrue(
+                        normalTarget != 0u &&
+                        instrumentedTarget != 0u,
+                        "both compilation modes should link");
+                    t.IsTrue(
+                        normalTarget !=
+                            instrumentedTarget,
+                        "the modes must target distinct native code");
+                }
+            });
+
+        tc.Run(
+            "linked generations reject stale targets before reuse",
+            [](TestCase &t)
+            {
+                if (!VuRecompilerBackend::supported())
+                    return;
+
+                VuNativeFixture fixture;
+                t.IsTrue(
+                    fixture.initialize(),
+                    "VU memory fixture should initialize");
+                const uint32_t loop =
+                    makeVuBranchOperation(
+                        0x20u, 0u, 0u, -1);
+                writePair(
+                    fixture.code, 0u,
+                    loop, kVuUpperNop);
+                writePair(
+                    fixture.code, 8u,
+                    makeVuIaddiu(1u, 1u, 1),
+                    kVuUpperNop);
+                fixture.markCodeModified();
+
+                VuUnit unit(VuUnitId::Vu1);
+                VuRecompilerBackend backend(unit);
+                VuExecutionState state =
+                    initialSyntheticState();
+                VuTransactionalSideEffectSink effects;
+                VuExecutionContext context =
+                    makeContext(state, fixture, effects);
+                VuProgramKey originalKey;
+                std::string diagnostic;
+                t.IsTrue(
+                    backend.programKey(
+                        context,
+                        VuCompilationMode::Normal,
+                        originalKey, &diagnostic),
+                    "the original key should be valid: " +
+                        diagnostic);
+                (void)backend.run(context, 40u);
+                const VuProgramHandle originalHandle =
+                    unit.programCache().lookup(
+                        originalKey);
+                const VuProgramCacheDiagnostics
+                    beforeIdentical =
+                        unit.programCache().
+                            diagnostics();
+                const VuRecompilerDiagnostics
+                    nativeBeforeIdentical =
+                        backend.diagnostics();
+
+                fixture.markCodeModified();
+                state = initialSyntheticState();
+                effects.clear();
+                const VuRunResult identical =
+                    backend.run(context, 40u);
+                t.IsTrue(
+                    identical.reason ==
+                        VuExitReason::CycleBudget,
+                    "an identical generation should complete safely");
+                t.Equals(
+                    state.vi[1], int32_t{20},
+                    "identical code should retain loop semantics");
+                t.IsNull(
+                    unit.programCache().resolve(
+                        originalHandle),
+                    "the prior generation handle must be stale");
+                const VuProgramCacheDiagnostics
+                    afterIdentical =
+                        unit.programCache().
+                            diagnostics();
+                const VuRecompilerDiagnostics
+                    nativeAfterIdentical =
+                        backend.diagnostics();
+                t.Equals(
+                    afterIdentical.linkInvalidations -
+                        beforeIdentical.linkInvalidations,
+                    uint64_t{0u},
+                    "generation guards should avoid a physical slot walk");
+                t.Equals(
+                    nativeAfterIdentical.slowLinkExits -
+                        nativeBeforeIdentical.slowLinkExits,
+                    uint64_t{1u},
+                    "the cleared edge should resolve once");
+
+                writePair(
+                    fixture.code, 8u,
+                    makeVuIaddiu(1u, 1u, 2),
+                    kVuUpperNop);
+                fixture.markCodeModified();
+                state = initialSyntheticState();
+                effects.clear();
+                const VuProgramCacheDiagnostics
+                    beforeChanged =
+                        unit.programCache().
+                            diagnostics();
+                const VuRunResult changed =
+                    backend.run(context, 40u);
+                t.IsTrue(
+                    changed.reason ==
+                        VuExitReason::CycleBudget,
+                    "changed code should execute safely");
+                t.Equals(
+                    state.vi[1], int32_t{40},
+                    "the chain must execute replacement code");
+                const VuProgramCacheDiagnostics
+                    afterChanged =
+                        unit.programCache().
+                            diagnostics();
+                t.Equals(
+                    afterChanged.linkInvalidations -
+                        beforeChanged.linkInvalidations,
+                    uint64_t{0u},
+                    "resident replacement images should invalidate logically");
+                t.Equals(
+                    afterChanged.compilations -
+                        beforeChanged.compilations,
+                    uint64_t{1u},
+                    "changed content should compile once");
+                t.Equals(
+                    backend.diagnostics().faultExits,
+                    uint64_t{0u},
+                    "generation churn must not fault");
             });
 
         tc.Run(
@@ -2249,6 +3051,7 @@ void register_ps2_vu_recompiler_tests()
                 uint64_t helperBarriers = 0u;
                 uint64_t fullEntries = 0u;
                 uint64_t boundedEntries = 0u;
+                uint64_t linkedEdges = 0u;
                 uint64_t exits = 0u;
                 for (size_t blockIndex = 0u;
                      blockIndex <
@@ -2296,10 +3099,8 @@ void register_ps2_vu_recompiler_tests()
                         block.fullBudgetEntries;
                     boundedEntries +=
                         block.boundedEntries;
-                    t.Equals(
-                        block.linkedEdges,
-                        uint64_t{0u},
-                        "Phase 0 blocks should not report linked edges");
+                    linkedEdges +=
+                        block.linkedEdges;
                     for (const uint64_t count :
                          block.exitReasons)
                     {
@@ -2307,8 +3108,16 @@ void register_ps2_vu_recompiler_tests()
                     }
                 }
                 t.Equals(
-                    executions, diagnostics.nativeEntries,
-                    "block executions should sum to native entries");
+                    executions, diagnostics.nativeBlocks,
+                    "block executions should include linked blocks");
+                t.Equals(
+                    linkedEdges, diagnostics.linkedEdges,
+                    "profile links should sum to global links");
+                t.Equals(
+                    diagnostics.nativeBlocks,
+                    diagnostics.nativeEntries +
+                        diagnostics.linkedEdges,
+                    "block accounting should reconcile entries and links");
                 t.Equals(
                     guestPairs, diagnostics.nativePairs,
                     "block guest pairs should sum to native pairs");

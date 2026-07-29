@@ -4,6 +4,7 @@
 #include "runtime/ps2_vu_executable_memory.h"
 #include "runtime/ps2_vu_ir.h"
 
+#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <memory>
@@ -32,6 +33,41 @@ enum class VuCompilationMode : uint8_t
 
 struct VuBlockProfileRecord;
 
+inline constexpr size_t kVuNativeDynamicLinkSlotCount = 4u;
+
+struct VuNativeLinkSlot
+{
+    uint64_t codeGeneration = 0u;
+    uintptr_t targetEntry = 0u;
+    uint32_t targetPc = UINT32_MAX;
+    uint32_t reserved = 0u;
+};
+
+// Link storage remains writable after the native image becomes executable.
+// The cache owns all mutation, and generated code only reads these slots on
+// the cache owner thread. Static slots never change size after emission, so
+// every address embedded in generated code remains stable.
+struct VuNativeLinkState
+{
+    uintptr_t backendIdentity = 0u;
+    uint32_t sourceEntryPc = 0u;
+    uint32_t nextDynamicSlot = 0u;
+    std::vector<VuNativeLinkSlot> staticTargets;
+    std::array<
+        VuNativeLinkSlot,
+        kVuNativeDynamicLinkSlotCount> dynamicTargets{};
+
+    [[nodiscard]] uint64_t invalidateTargets() noexcept;
+};
+
+enum class VuProgramLinkResult : uint8_t
+{
+    Linked,
+    SourceUnavailable,
+    TargetUnavailable,
+    Incompatible,
+};
+
 struct VuProgramKey
 {
     VuUnitId unit = VuUnitId::Vu1;
@@ -58,9 +94,11 @@ struct VuCompiledProgram
     VuExecutableMemory nativeCode;
     size_t entryOffset = 0u;
     size_t fastEntryOffset = 0u;
+    size_t linkedEntryOffset = 0u;
     uint64_t compilationNanoseconds = 0u;
     uint64_t compilationIdentity = 0u;
     mutable uint64_t jitCodeIndex = 0u;
+    std::shared_ptr<VuNativeLinkState> outgoingLinks;
     std::shared_ptr<VuBlockProfileRecord> blockProfile;
     std::shared_ptr<void> blockProfileLifetime;
 
@@ -72,6 +110,11 @@ struct VuCompiledProgram
     [[nodiscard]] const void *nativeFastEntry() const
     {
         return nativeCode.executableAddress(fastEntryOffset);
+    }
+
+    [[nodiscard]] const void *nativeLinkedEntry() const
+    {
+        return nativeCode.executableAddress(linkedEntryOffset);
     }
 };
 
@@ -110,6 +153,9 @@ struct VuProgramCacheDiagnostics
     uint64_t evictedPrograms = 0u;
     uint64_t manualFlushes = 0u;
     uint64_t rejectedPrograms = 0u;
+    uint64_t linkResolutions = 0u;
+    uint64_t linkResolutionFailures = 0u;
+    uint64_t linkInvalidations = 0u;
     uint64_t generatedBytes = 0u;
     uint64_t compilationNanoseconds = 0u;
     size_t residentPrograms = 0u;
@@ -129,6 +175,7 @@ public:
     explicit VuProgramCache(
         VuUnitId unit,
         VuProgramCacheLimits limits = {});
+    ~VuProgramCache();
 
     VuProgramCache(const VuProgramCache &) = delete;
     VuProgramCache &operator=(const VuProgramCache &) = delete;
@@ -145,6 +192,10 @@ public:
         const VuProgramKey &expectedKey);
     [[nodiscard]] const VuCompiledProgram *resolve(
         VuProgramHandle handle) const;
+    [[nodiscard]] VuProgramLinkResult populateLink(
+        const VuNativeLinkState *source,
+        VuProgramHandle targetHandle,
+        const VuProgramKey &currentTargetKey);
 
     void flush();
 
@@ -199,7 +250,11 @@ private:
         std::string *diagnostic = nullptr);
     void retainProgramsForGeneration();
     void discardPrograms(FlushReason reason);
+    void invalidateAllLinks();
     [[nodiscard]] static bool sameProgramIdentity(
+        const VuProgramKey &left,
+        const VuProgramKey &right);
+    [[nodiscard]] static bool sameLinkIdentity(
         const VuProgramKey &left,
         const VuProgramKey &right);
     static uint64_t nextEpoch(uint64_t epoch);
