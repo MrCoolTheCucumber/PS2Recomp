@@ -173,6 +173,12 @@ VuProgramHandle VuProgramCache::insert(
         program.nativeCode.usedSize();
     const uint64_t compilationNanoseconds =
         program.compilationNanoseconds;
+    if (program.outgoingLinks)
+    {
+        program.outgoingLinks->ownerCacheIdentity =
+            reinterpret_cast<uintptr_t>(this);
+        program.outgoingLinks->ownerProgramIndex = index;
+    }
     m_programs.push_back(std::move(program));
     m_lookup.emplace(m_programs.back().key, index);
 
@@ -249,15 +255,17 @@ VuProgramLinkResult VuProgramCache::populateLink(
     if (!source)
         return reject(VuProgramLinkResult::SourceUnavailable);
 
-    const auto sourceIterator =
-        std::find_if(
-            m_programs.begin(), m_programs.end(),
-            [&](const VuCompiledProgram &program)
-            {
-                return program.outgoingLinks.get() == source;
-            });
-    if (sourceIterator == m_programs.end())
+    const uint32_t sourceIndex =
+        source->ownerProgramIndex;
+    if (source->ownerCacheIdentity !=
+            reinterpret_cast<uintptr_t>(this) ||
+        sourceIndex >= m_programs.size() ||
+        m_programs[sourceIndex].outgoingLinks.get() != source)
+    {
         return reject(VuProgramLinkResult::SourceUnavailable);
+    }
+    VuCompiledProgram &sourceProgram =
+        m_programs[sourceIndex];
 
     if (!m_scopeActive ||
         m_codeGeneration !=
@@ -280,9 +288,9 @@ VuProgramLinkResult VuProgramCache::populateLink(
     }
 
     VuNativeLinkState &sourceLinks =
-        *sourceIterator->outgoingLinks;
+        *sourceProgram.outgoingLinks;
     if (!sameLinkIdentity(
-            sourceIterator->key, target.key) ||
+            sourceProgram.key, target.key) ||
         sourceLinks.backendIdentity == 0u ||
         sourceLinks.backendIdentity !=
             target.outgoingLinks->backendIdentity)
@@ -609,6 +617,12 @@ void VuProgramCache::invalidateAllLinks()
             m_diagnostics.linkInvalidations +=
                 program.outgoingLinks->
                     invalidateTargets();
+            program.outgoingLinks->
+                ownerCacheIdentity = 0u;
+            program.outgoingLinks->
+                ownerProgramIndex =
+                    VuNativeLinkState::
+                        kUnboundProgramIndex;
         }
     }
 }

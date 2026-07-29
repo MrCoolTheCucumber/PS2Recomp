@@ -429,6 +429,27 @@ void register_ps2_vu_program_cache_tests()
                         normalTarget) ==
                         VuProgramLinkResult::Incompatible,
                     "instrumented code must not link to normal code");
+                VuProgramCache foreignCache(VuUnitId::Vu1);
+                const VuProgramHandle foreignSourceHandle =
+                    foreignCache.insert(
+                        makeLinkedProgram(
+                            normalSource,
+                            backendIdentity, {8u}));
+                const VuCompiledProgram *const
+                    foreignSourceProgram =
+                        foreignCache.resolve(
+                            foreignSourceHandle);
+                t.IsTrue(
+                    cache.populateLink(
+                        foreignSourceProgram
+                            ? foreignSourceProgram->
+                                  outgoingLinks.get()
+                            : nullptr,
+                        normalTargetHandle,
+                        normalTarget) ==
+                        VuProgramLinkResult::
+                            SourceUnavailable,
+                    "a source owned by another cache must not alias");
                 VuProgramKey basicTarget = normalTarget;
                 basicTarget.blockForm =
                     VuIrBlockForm::Basic;
@@ -513,7 +534,7 @@ void register_ps2_vu_program_cache_tests()
                 t.Equals(
                     cache.diagnostics().
                         linkResolutionFailures,
-                    uint64_t{6u},
+                    uint64_t{7u},
                     "every incompatible attempt should be counted");
             });
 
@@ -559,6 +580,14 @@ void register_ps2_vu_program_cache_tests()
                     return;
                 const std::shared_ptr<VuNativeLinkState>
                     retainedLinks = source->outgoingLinks;
+                t.Equals(
+                    retainedLinks->ownerCacheIdentity,
+                    reinterpret_cast<uintptr_t>(&cache),
+                    "insertion should bind the link source to its cache");
+                t.Equals(
+                    retainedLinks->ownerProgramIndex,
+                    sourceHandle.index,
+                    "insertion should bind the stable source index");
                 t.IsTrue(
                     cache.populateLink(
                         retainedLinks.get(),
@@ -597,6 +626,10 @@ void register_ps2_vu_program_cache_tests()
                         dynamicTargets.front().targetPc,
                     targetKey.entryPc,
                     "logical invalidation may retain target metadata");
+                t.Equals(
+                    retainedLinks->ownerProgramIndex,
+                    sourceHandle.index,
+                    "generation retention should preserve source ownership");
 
                 VuProgramKey nextTarget = targetKey;
                 nextTarget.codeGeneration =
@@ -637,6 +670,22 @@ void register_ps2_vu_program_cache_tests()
                         targetEntry,
                     uintptr_t{0u},
                     "eviction must unlink before releasing target code");
+                t.Equals(
+                    retainedLinks->ownerCacheIdentity,
+                    uintptr_t{0u},
+                    "eviction should unbind retained source metadata");
+                t.Equals(
+                    retainedLinks->ownerProgramIndex,
+                    VuNativeLinkState::
+                        kUnboundProgramIndex,
+                    "eviction should invalidate the retained source index");
+                t.IsTrue(
+                    cache.populateLink(
+                        retainedLinks.get(),
+                        afterEviction, evictionKey) ==
+                        VuProgramLinkResult::
+                            SourceUnavailable,
+                    "a retained stale source must not alias a reused index");
                 const VuProgramCacheDiagnostics diagnostics =
                     cache.diagnostics();
                 t.Equals(

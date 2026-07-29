@@ -49,7 +49,13 @@ struct VuNativeLinkSlot
 // every address embedded in generated code remains stable.
 struct VuNativeLinkState
 {
+    static constexpr uint32_t kUnboundProgramIndex = UINT32_MAX;
+
     uintptr_t backendIdentity = 0u;
+    // Cache-owned identity makes slow-link population O(1). It is assigned
+    // only after insertion and cleared before the owning program is removed.
+    uintptr_t ownerCacheIdentity = 0u;
+    uint32_t ownerProgramIndex = kUnboundProgramIndex;
     uint32_t sourceEntryPc = 0u;
     uint32_t nextDynamicSlot = 0u;
     std::vector<VuNativeLinkSlot> staticTargets;
