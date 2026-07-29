@@ -457,10 +457,17 @@ VuUnit::ProgressTracker::ProgressTracker(
     if (!m_enabled)
         return;
 
-    m_unit.m_progressActive.fetch_add(
-        1u, std::memory_order_relaxed);
-    m_unit.m_progressInvocations.fetch_add(
-        1u, std::memory_order_relaxed);
+    // VU execution and reset have one owner. Debugger/watchdog threads only
+    // sample these atomics, so an owner load/store preserves exact cumulative
+    // values without a locked read-modify-write instruction.
+    m_unit.m_progressActive.store(
+        m_unit.m_progressActive.load(
+            std::memory_order_relaxed) + 1u,
+        std::memory_order_relaxed);
+    m_unit.m_progressInvocations.store(
+        m_unit.m_progressInvocations.load(
+            std::memory_order_relaxed) + 1u,
+        std::memory_order_relaxed);
     m_unit.m_progressPc.store(
         m_state.pc, std::memory_order_relaxed);
 }
@@ -473,8 +480,10 @@ VuUnit::ProgressTracker::~ProgressTracker()
     publish();
     m_unit.m_progressPc.store(
         m_state.pc, std::memory_order_relaxed);
-    m_unit.m_progressActive.fetch_sub(
-        1u, std::memory_order_relaxed);
+    m_unit.m_progressActive.store(
+        m_unit.m_progressActive.load(
+            std::memory_order_relaxed) - 1u,
+        std::memory_order_relaxed);
 }
 
 void VuUnit::ProgressTracker::publish()
@@ -485,8 +494,10 @@ void VuUnit::ProgressTracker::publish()
         return;
     }
 
-    m_unit.m_progressCycles.fetch_add(
-        m_executedCycles - m_committedCycles,
+    m_unit.m_progressCycles.store(
+        m_unit.m_progressCycles.load(
+            std::memory_order_relaxed) +
+            m_executedCycles - m_committedCycles,
         std::memory_order_relaxed);
     m_committedCycles = m_executedCycles;
     m_unit.m_progressPc.store(
@@ -1418,9 +1429,14 @@ VuRunResult VuInterpreterBackend::run(
     VuUnit::InterpreterCache &cache = m_unit.m_interpreterCache;
     if (trackProgress)
     {
-        m_unit.m_progressActive.fetch_add(1u, std::memory_order_relaxed);
-        m_unit.m_progressInvocations.fetch_add(
-            1u, std::memory_order_relaxed);
+        m_unit.m_progressActive.store(
+            m_unit.m_progressActive.load(
+                std::memory_order_relaxed) + 1u,
+            std::memory_order_relaxed);
+        m_unit.m_progressInvocations.store(
+            m_unit.m_progressInvocations.load(
+                std::memory_order_relaxed) + 1u,
+            std::memory_order_relaxed);
         m_unit.m_progressPc.store(
             state.pc, std::memory_order_relaxed);
     }
@@ -1440,13 +1456,18 @@ VuRunResult VuInterpreterBackend::run(
             }
             if (executed > committed)
             {
-                unit.m_progressCycles.fetch_add(
-                    executed - committed, std::memory_order_relaxed);
+                unit.m_progressCycles.store(
+                    unit.m_progressCycles.load(
+                        std::memory_order_relaxed) +
+                        executed - committed,
+                    std::memory_order_relaxed);
             }
             unit.m_progressPc.store(
                 state.pc, std::memory_order_relaxed);
-            unit.m_progressActive.fetch_sub(
-                1u, std::memory_order_relaxed);
+            unit.m_progressActive.store(
+                unit.m_progressActive.load(
+                    std::memory_order_relaxed) - 1u,
+                std::memory_order_relaxed);
         }
     };
     uint32_t executedCycles = 0u;
@@ -1528,8 +1549,10 @@ VuRunResult VuInterpreterBackend::run(
         if (trackProgress &&
             executedCycles - committedProgressCycles >= 256u)
         {
-            m_unit.m_progressCycles.fetch_add(
-                executedCycles - committedProgressCycles,
+            m_unit.m_progressCycles.store(
+                m_unit.m_progressCycles.load(
+                    std::memory_order_relaxed) +
+                    executedCycles - committedProgressCycles,
                 std::memory_order_relaxed);
             committedProgressCycles = executedCycles;
             m_unit.m_progressPc.store(

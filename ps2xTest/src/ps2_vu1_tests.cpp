@@ -858,6 +858,16 @@ void register_ps2_vu1_tests()
                       "reset should cancel execution");
             t.Equals(unit.state().issuedCycles, uint64_t{0u},
                      "reset should clear issued-cycle bookkeeping");
+            const VuProgressSnapshot resetProgress =
+                unit.getProgressSnapshot();
+            t.IsFalse(resetProgress.active,
+                      "reset should clear published progress activity");
+            t.Equals(resetProgress.invocations, uint64_t{0u},
+                     "reset should clear progress invocations");
+            t.Equals(resetProgress.cycles, uint64_t{0u},
+                     "reset should clear progress cycles");
+            t.Equals(resetProgress.pc, uint32_t{0u},
+                     "reset should clear the published progress PC");
             unit.state().pc = 8u;
             unit.state().vi[3] = 0x44;
             unit.state().pipeline.delayedQ = {
@@ -878,6 +888,19 @@ void register_ps2_vu1_tests()
                      "resume should update TOP");
             t.Equals(unit.state().itop, uint32_t{13u},
                      "resume should update ITOP");
+
+            const VuRunResult resumed = unit.advance(
+                fx.code, PS2_VU1_CODE_SIZE,
+                fx.data, PS2_VU1_DATA_SIZE,
+                fx.gs, &fx.mem, 1u);
+            t.IsTrue(resumed.reason == VuExitReason::CycleBudget,
+                     "resumed execution should stop at its new budget");
+            const VuProgressSnapshot resumedProgress =
+                unit.getProgressSnapshot();
+            t.Equals(resumedProgress.invocations, uint64_t{1u},
+                     "post-reset progress should restart from one invocation");
+            t.Equals(resumedProgress.cycles, uint64_t{1u},
+                     "post-reset progress should restart from one cycle");
         });
 
         tc.Run("interpreter backend executes a supplied clone", [](TestCase &t)
