@@ -409,6 +409,8 @@ void register_ps2_debug_control_tests()
             context.r[29] = _mm_set_epi64x(0, 0x001ff000u);
             context.r[28] = _mm_set_epi64x(0, 0x00110000u);
 
+            t.IsTrue(runtime.debugPause(std::chrono::milliseconds(50)),
+                     "pausing should enable detailed branch collection");
             (void)runtime.lookupFunction(0x80001000u);
             (void)runtime.lookupFunction(0xa0002000u);
             const auto history = runtime.debugBranchHistory();
@@ -423,6 +425,7 @@ void register_ps2_debug_control_tests()
                 t.IsTrue(history[1].sequence > history[0].sequence,
                          "branch history sequences should be monotonic");
             }
+            runtime.debugResume();
 
             runtime.reportMissingFunction(
                 nullptr, &context, 0x00003180u, 0x00002000u,
@@ -442,6 +445,34 @@ void register_ps2_debug_control_tests()
             runtime.resetMissingFunctionReportOnce();
             t.IsFalse(runtime.debugFaultSnapshot().active,
                       "resetting one-shot reporting should clear the active fault");
+        });
+
+        tc.Run("inactive branch history records outer dispatches instead of nested lookups", [](TestCase &t)
+        {
+            PS2Runtime runtime;
+            runtime.registerFunction(0x00001000u, firstDispatch);
+
+            R5900Context context{};
+            context.pc = 0x00001000u;
+            auto function = runtime.lookupFunction(context.pc);
+            (void)runtime.lookupFunction(context.pc);
+            t.Equals(runtime.debugBranchHistory().size(), static_cast<size_t>(0u),
+                     "ordinary lookup should avoid the shared diagnostic ring");
+
+            {
+                PS2Runtime::GuestExecutionScope guestExecution(
+                    &runtime, &context);
+                runtime.executeGuestStep(nullptr, &context, function);
+            }
+
+            const auto history = runtime.debugBranchHistory();
+            t.Equals(history.size(), static_cast<size_t>(1u),
+                     "an outer guest dispatch should retain one coarse history entry");
+            if (history.size() == 1u)
+            {
+                t.Equals(history[0].pc, 0x00001000u,
+                         "the coarse history should retain the executed entry PC");
+            }
         });
 
         tc.Run("watchdog classification identifies active GS VU and waits", [](TestCase &t)

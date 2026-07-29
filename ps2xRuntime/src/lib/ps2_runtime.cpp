@@ -4210,9 +4210,8 @@ namespace
         return address;
     }
 
-    bool generatedFunctionTableSlot(uint32_t address, uint32_t &slot)
+    bool generatedFunctionTableSlotNormalized(uint32_t address, uint32_t &slot)
     {
-        address = normalizeGuestFunctionAddress(address);
         if ((address & 3u) != 0u || g_ps2RecompiledFunctionTableSlotCount == 0u)
         {
             return false;
@@ -4226,6 +4225,23 @@ namespace
         const uint32_t offset = address - g_ps2RecompiledFunctionTableBase;
         slot = offset >> 2;
         return slot < g_ps2RecompiledFunctionTableSlotCount;
+    }
+
+    bool generatedFunctionTableSlot(uint32_t address, uint32_t &slot)
+    {
+        return generatedFunctionTableSlotNormalized(
+            normalizeGuestFunctionAddress(address), slot);
+    }
+
+    PS2Runtime::RecompiledFunction generatedFunctionAtNormalizedAddress(
+        uint32_t address)
+    {
+        uint32_t slot = 0u;
+        if (!generatedFunctionTableSlotNormalized(address, slot))
+        {
+            return nullptr;
+        }
+        return g_ps2RecompiledFunctionTable[slot];
     }
 
     const PS2GuestFunctionSymbol *findGuestFunctionSymbol(uint32_t address)
@@ -4304,8 +4320,8 @@ bool PS2Runtime::registerFunction(uint32_t address, RecompiledFunction func)
 
 bool PS2Runtime::hasFunction(uint32_t address) const
 {
-    uint32_t slot = 0u;
-    return generatedFunctionTableSlot(address, slot) && g_ps2RecompiledFunctionTable[slot] != nullptr;
+    return generatedFunctionAtNormalizedAddress(
+               normalizeGuestFunctionAddress(address)) != nullptr;
 }
 
 const char *describeGuestBranchKind(PS2Runtime::GuestBranchKind kind)
@@ -4330,34 +4346,34 @@ const char *describeGuestBranchKind(PS2Runtime::GuestBranchKind kind)
 PS2Runtime::RecompiledFunction PS2Runtime::lookupFunction(uint32_t address)
 {
     pushDispatchPc(address);
-    debugRecordBranch(address);
 
     const uint32_t normalizedAddress = normalizeGuestFunctionAddress(address);
-    m_debugPc.store(normalizedAddress, std::memory_order_relaxed);
-    uint32_t slot = 0u;
-    if (generatedFunctionTableSlot(normalizedAddress, slot))
+    if (m_debugControlActive.load(std::memory_order_acquire))
     {
-        RecompiledFunction fn = g_ps2RecompiledFunctionTable[slot];
-        if (fn != nullptr)
-        {
-            if (normalizedAddress != address)
-            {
-                static RecompiledFunction directMappedAlias =
-                    [](uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
-                {
-                    if (!ctx || !runtime)
-                    {
-                        return;
-                    }
+        debugRecordBranch(normalizedAddress);
+    }
 
-                    ctx->pc = normalizeGuestFunctionAddress(ctx->pc);
-                    RecompiledFunction target = runtime->lookupFunction(ctx->pc);
-                    target(rdram, ctx, runtime);
-                };
-                return directMappedAlias;
-            }
-            return fn;
+    RecompiledFunction fn =
+        generatedFunctionAtNormalizedAddress(normalizedAddress);
+    if (fn != nullptr)
+    {
+        if (normalizedAddress != address)
+        {
+            static RecompiledFunction directMappedAlias =
+                [](uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+            {
+                if (!ctx || !runtime)
+                {
+                    return;
+                }
+
+                ctx->pc = normalizeGuestFunctionAddress(ctx->pc);
+                RecompiledFunction target = runtime->lookupFunction(ctx->pc);
+                target(rdram, ctx, runtime);
+            };
+            return directMappedAlias;
         }
+        return fn;
     }
 
     static RecompiledFunction missingFunction = [](uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
@@ -4498,10 +4514,12 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
     targetPc = normalizeGuestFunctionAddress(targetPc);
     ctx->pc = targetPc;
     const bool isCall = (kind == GuestBranchKind::DirectCall || kind == GuestBranchKind::IndirectCall);
+    RecompiledFunction targetFn =
+        generatedFunctionAtNormalizedAddress(targetPc);
 
     if (kind == GuestBranchKind::Return)
     {
-        if (!hasFunction(targetPc))
+        if (targetFn == nullptr)
         {
             reportMissingFunction(rdram, ctx, targetPc, sourcePc, kind, debugName);
         }
@@ -4511,7 +4529,7 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
         return false;
     }
 
-    if (!hasFunction(targetPc))
+    if (targetFn == nullptr)
     {
         reportMissingFunction(rdram, ctx, targetPc, sourcePc, kind, debugName);
 
@@ -4532,7 +4550,11 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
         return false;
     }
 
-    RecompiledFunction targetFn = lookupFunction(targetPc);
+    pushDispatchPc(targetPc);
+    if (m_debugControlActive.load(std::memory_order_acquire))
+    {
+        debugRecordBranch(targetPc);
+    }
     const uint32_t entryPc = ctx->pc;
     const uint64_t preemptionEpoch =
         m_guestExecutionPreemptionEpoch.load(std::memory_order_acquire);
@@ -6958,6 +6980,14 @@ void PS2Runtime::debugBeforeGuestStep(R5900Context *ctx)
 
     const uint32_t pc = normalizeGuestFunctionAddress(ctx->pc);
     ctx->pc = pc;
+    const bool controlActive =
+        m_debugControlActive.load(std::memory_order_acquire);
+    if (!controlActive)
+    {
+        // Keep a useful process-wide trail at outer dispatch boundaries
+        // without making every nested guest call contend on the shared ring.
+        debugRecordBranch(pc);
+    }
     m_debugPc.store(pc, std::memory_order_relaxed);
     m_debugRa.store(static_cast<uint32_t>(_mm_extract_epi32(ctx->r[31], 0)),
                     std::memory_order_relaxed);
@@ -6968,7 +6998,7 @@ void PS2Runtime::debugBeforeGuestStep(R5900Context *ctx)
     m_debugEeInstructions.store(ctx->insn_count, std::memory_order_relaxed);
     m_debugDispatches.fetch_add(1u, std::memory_order_relaxed);
 
-    if (!m_debugControlActive.load(std::memory_order_acquire))
+    if (!controlActive)
     {
         return;
     }
