@@ -1313,6 +1313,172 @@ void register_ps2_vu_recompiler_tests()
             });
 
         tc.Run(
+            "packed native FMAC flags match lane classes and masks",
+            [](TestCase &t)
+            {
+                if (!VuRecompilerBackend::supported())
+                    return;
+
+                constexpr std::array<
+                    std::array<uint32_t, 4u>, 3u>
+                    sources{{
+                        {
+                            0x00000000u,
+                            0xbf800000u,
+                            0x7f800000u,
+                            0xff800000u,
+                        },
+                        {
+                            0x80000000u,
+                            0x3f800000u,
+                            0x7fc12345u,
+                            0xffc54321u,
+                        },
+                        {
+                            0x00000001u,
+                            0x80000001u,
+                            0x7f7fffffu,
+                            0xff7fffffu,
+                        },
+                    }};
+                constexpr std::array<
+                    std::array<uint32_t, 4u>, 3u>
+                    addends{{
+                        {0u, 0u, 0u, 0u},
+                        {0x80000000u, 0u, 0u, 0u},
+                        {0u, 0u, 0u, 0u},
+                    }};
+
+                ScopedEnvironmentVariable blockLocal(
+                    "PS2X_VU_BLOCK_LOCAL_VF_REGISTERS");
+                for (uint32_t unitIndex = 0u;
+                     unitIndex < 2u; ++unitIndex)
+                {
+                    const VuUnitId unit =
+                        unitIndex == 0u
+                            ? VuUnitId::Vu0
+                            : VuUnitId::Vu1;
+                    for (uint32_t resident = 0u;
+                         resident < 2u; ++resident)
+                    {
+                        blockLocal.set(
+                            resident != 0u ? "1" : "0");
+
+                        VuNativeFixture referenceFixture;
+                        VuNativeFixture nativeFixture;
+                        t.IsTrue(
+                            referenceFixture.initialize(unit),
+                            "reference memory should initialize");
+                        t.IsTrue(
+                            nativeFixture.initialize(unit),
+                            "native memory should initialize");
+                        VuUnit referenceUnit(unit);
+                        VuUnit nativeUnit(unit);
+                        VuInterpreterBackend reference(
+                            referenceUnit);
+                        VuRecompilerBackend native(nativeUnit);
+
+                        for (uint32_t destination = 0u;
+                             destination < 16u;
+                             ++destination)
+                        {
+                            const uint32_t add =
+                                makeVuUpper(
+                                    0x28u,
+                                    static_cast<uint8_t>(
+                                        destination),
+                                    2u, 1u, 3u);
+                            const uint32_t consume =
+                                makeVuUpper(
+                                    0x2bu, 0xfu,
+                                    0u, 3u, 4u);
+                            writePair(
+                                referenceFixture.code,
+                                0u, 0u, add);
+                            writePair(
+                                nativeFixture.code,
+                                0u, 0u, add);
+                            writePair(
+                                referenceFixture.code,
+                                8u, 0u, consume);
+                            writePair(
+                                nativeFixture.code,
+                                8u, 0u, consume);
+                            referenceFixture.markCodeModified();
+                            nativeFixture.markCodeModified();
+
+                            for (size_t pattern = 0u;
+                                 pattern < sources.size();
+                                 ++pattern)
+                            {
+                                VuExecutionState referenceState =
+                                    initialSyntheticState();
+                                VuExecutionState nativeState =
+                                    referenceState;
+                                std::memcpy(
+                                    referenceState.vf[1],
+                                    sources[pattern].data(),
+                                    sizeof(referenceState.vf[1]));
+                                std::memcpy(
+                                    referenceState.vf[2],
+                                    addends[pattern].data(),
+                                    sizeof(referenceState.vf[2]));
+                                nativeState = referenceState;
+                                referenceState.mac = 0x55aau;
+                                referenceState.status = 0x05a3u;
+                                referenceState.pipeline.workingMac =
+                                    0xa55au;
+                                nativeState = referenceState;
+
+                                VuTransactionalSideEffectSink
+                                    referenceEffects;
+                                VuTransactionalSideEffectSink
+                                    nativeEffects;
+                                VuExecutionContext referenceContext =
+                                    makeContext(
+                                        referenceState,
+                                        referenceFixture,
+                                        referenceEffects);
+                                VuExecutionContext nativeContext =
+                                    makeContext(
+                                        nativeState,
+                                        nativeFixture,
+                                        nativeEffects);
+                                const VuRunResult referenceResult =
+                                    reference.run(
+                                        referenceContext, 5u);
+                                const VuRunResult nativeResult =
+                                    native.run(
+                                        nativeContext, 5u);
+                                const std::string prefix =
+                                    "unit " +
+                                    std::to_string(unitIndex) +
+                                    ", resident " +
+                                    std::to_string(resident) +
+                                    ", destination " +
+                                    std::to_string(destination) +
+                                    ", pattern " +
+                                    std::to_string(pattern) + ": ";
+                                t.IsTrue(
+                                    sameRunResult(
+                                        referenceResult,
+                                        nativeResult),
+                                    prefix + "run result differs");
+                                std::string difference;
+                                t.IsTrue(
+                                    vuExecutionStatesEqual(
+                                        referenceState,
+                                        nativeState,
+                                        &difference),
+                                    prefix + "state differs at " +
+                                        difference);
+                            }
+                        }
+                    }
+                }
+            });
+
+        tc.Run(
             "native DIV preserves scalar edges Q barriers and pair hazards",
             [](TestCase &t)
             {

@@ -2211,87 +2211,81 @@ namespace
             const Xbyak::Xmm *result = nullptr)
         {
             using Flags = VuPipelineState::FmacFlags;
-            using namespace Xbyak;
-
-            m_code.xor_(m_code.r8d, m_code.r8d);
-            for (uint32_t lane = 0u; lane < 4u; ++lane)
+            if (!result)
             {
-                if ((destination & (0x8u >> lane)) == 0u)
-                    continue;
-
-                const uint32_t shift = 3u - lane;
-                Label noSign;
-                Label zero;
-                Label denormal;
-                Label overflow;
-                Label laneDone;
-                if (result)
-                {
-                    m_code.pextrd(
-                        m_code.eax, *result,
-                        static_cast<uint8_t>(lane));
-                }
-                else
-                {
-                    m_code.mov(
-                        m_code.eax,
-                        m_code.dword[
-                            m_code.rsp +
-                            kResultOffset +
-                            static_cast<int>(
-                                lane * 4u)]);
-                }
-                m_code.test(
-                    m_code.eax, 0x80000000u);
-                m_code.jz(noSign);
-                m_code.or_(
-                    m_code.r8d,
-                    0x0010u << shift);
-                m_code.L(noSign);
-
-                m_code.mov(m_code.ecx, m_code.eax);
-                m_code.and_(
-                    m_code.ecx, 0x7fffffffu);
-                m_code.jz(zero);
-                m_code.mov(m_code.ecx, m_code.eax);
-                m_code.shr(m_code.ecx, 23u);
-                m_code.and_(m_code.ecx, 0xffu);
-                m_code.jz(denormal);
-                m_code.cmp(m_code.ecx, 0xffu);
-                m_code.je(overflow);
-                m_code.jmp(laneDone);
-
-                m_code.L(zero);
-                m_code.or_(
-                    m_code.r8d,
-                    0x0001u << shift);
-                m_code.jmp(laneDone);
-                m_code.L(denormal);
-                m_code.or_(
-                    m_code.r8d,
-                    0x0101u << shift);
-                m_code.jmp(laneDone);
-                m_code.L(overflow);
-                m_code.or_(
-                    m_code.r8d,
-                    0x1000u << shift);
-                m_code.L(laneDone);
+                m_code.movups(
+                    m_code.xmm0,
+                    m_code.ptr[
+                        m_code.rsp + kResultOffset]);
+                result = &m_code.xmm0;
             }
 
-            m_code.xor_(m_code.eax, m_code.eax);
-            constexpr uint32_t masks[] = {
-                0x000fu, 0x00f0u, 0x0f00u, 0xf000u};
-            constexpr uint32_t bits[] = {
-                0x1u, 0x2u, 0x4u, 0x8u};
-            for (size_t index = 0u;
-                 index < std::size(masks); ++index)
-            {
-                Label absent;
-                m_code.test(m_code.r8d, masks[index]);
-                m_code.jz(absent);
-                m_code.or_(m_code.eax, bits[index]);
-                m_code.L(absent);
-            }
+            // MOVMSKPS exposes lanes in vector order. Reverse the lanes
+            // once so its low nibble directly matches the VU xyzw flag
+            // bit order for every classification below.
+            m_code.movaps(m_code.xmm1, *result);
+            m_code.shufps(
+                m_code.xmm1, m_code.xmm1, 0x1bu);
+
+            // Sign flags occupy MAC bits 7:4.
+            m_code.movmskps(
+                m_code.r8d, m_code.xmm1);
+            m_code.and_(m_code.r8d, destination);
+            m_code.shl(m_code.r8d, 4u);
+
+            // Classify absolute zero and retain its lane mask in r9d.
+            m_code.pslld(m_code.xmm1, 1u);
+            m_code.psrld(m_code.xmm1, 1u);
+            m_code.pxor(m_code.xmm2, m_code.xmm2);
+            m_code.pcmpeqd(
+                m_code.xmm2, m_code.xmm1);
+            m_code.movmskps(
+                m_code.r9d, m_code.xmm2);
+            m_code.and_(m_code.r9d, destination);
+            m_code.or_(m_code.r8d, m_code.r9d);
+
+            // Exponent zero includes exact zero. XOR removes exact zero
+            // and leaves only denormal lanes, which set both zero and
+            // underflow flag nibbles.
+            m_code.psrld(m_code.xmm1, 23u);
+            m_code.pxor(m_code.xmm0, m_code.xmm0);
+            m_code.pcmpeqd(
+                m_code.xmm0, m_code.xmm1);
+            m_code.movmskps(
+                m_code.eax, m_code.xmm0);
+            m_code.and_(m_code.eax, destination);
+            m_code.xor_(m_code.eax, m_code.r9d);
+            m_code.or_(m_code.r8d, m_code.eax);
+            m_code.shl(m_code.eax, 8u);
+            m_code.or_(m_code.r8d, m_code.eax);
+
+            // Exponent 0xff covers infinities and NaNs.
+            m_code.pcmpeqd(
+                m_code.xmm2, m_code.xmm2);
+            m_code.psrld(m_code.xmm2, 24u);
+            m_code.pcmpeqd(
+                m_code.xmm1, m_code.xmm2);
+            m_code.movmskps(
+                m_code.eax, m_code.xmm1);
+            m_code.and_(m_code.eax, destination);
+            m_code.shl(m_code.eax, 12u);
+            m_code.or_(m_code.r8d, m_code.eax);
+
+            // Collapse the four MAC nibbles to STATUS bits 3:0. After
+            // folding each nibble into its low bit, multiplication by
+            // 0x249 packs bits 0,4,8,12 into bits 0,1,2,3.
+            m_code.mov(m_code.eax, m_code.r8d);
+            m_code.mov(m_code.edx, m_code.eax);
+            m_code.shr(m_code.edx, 1u);
+            m_code.or_(m_code.eax, m_code.edx);
+            m_code.mov(m_code.edx, m_code.eax);
+            m_code.shr(m_code.edx, 2u);
+            m_code.or_(m_code.eax, m_code.edx);
+            m_code.and_(m_code.eax, 0x1111u);
+            m_code.imul(
+                m_code.eax, m_code.eax, 0x249u);
+            m_code.shr(m_code.eax, 9u);
+            m_code.and_(m_code.eax, 0x0fu);
 
             constexpr int workingMacOffset =
                 pipelineOffset(

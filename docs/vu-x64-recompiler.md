@@ -115,6 +115,15 @@ these counts so adding or reclassifying an IR opcode requires an explicit
 review; the unsupported-pair test separately proves that the side exit retires
 and mutates nothing.
 
+Inline FMAC results are classified four lanes at a time with packed integer
+SSE operations. The lane mask is reversed once into VU `xyzw` flag order,
+then sign, absolute zero, zero exponent, and all-ones exponent masks construct
+the MAC nibbles and STATUS summary without per-lane control flow. This retains
+the architectural distinctions that negative zero sets sign and zero,
+denormals set zero and underflow, and infinities and NaNs set overflow. The
+instruction destination mask is applied to every class, and the existing
+four-stage FMAC flag pipeline remains unchanged.
+
 Entry pipeline values remain architectural data, not cache-key inputs. A block
 therefore advances entry Q, P, and VI-backup state dynamically. Once an
 instruction in that block establishes a delayed-scalar latency or VI-backup
@@ -234,6 +243,9 @@ Focused tests cover:
 
 - every possible cycle-budget cut through a synthetic FMAC, Q, memory, branch,
   and E-bit program on both VU0 and VU1;
+- packed FMAC lane classification for all 16 destination masks, including
+  positive/negative zero, denormals, finite extremes, infinities, and NaNs,
+  through both canonical and block-local VF result paths;
 - guarded/precise selection, linked-target guards, exact linked-boundary
   correction, unsupported-boundary precedence, and coexistence of both block
   forms in one cache;
