@@ -66,6 +66,9 @@ endif()
 option(PS2X_ENABLE_DEBUG_SERVER
     "Build the local ps2dbg JSON-RPC control server"
     ${PS2X_DEBUG_SERVER_DEFAULT})
+option(PS2X_ENABLE_DEBUG_UI
+    "Build the embedded ImGui runtime debugger panel"
+    OFF)
 
 option(PS2X_VITA_CREATE_PACKAGE "Create Vita eboot/vpk targets" ON)
 set(PS2X_VITA_APP_NAME "PS2 Retro X" CACHE STRING "Display name for the Vita bubble")
@@ -127,7 +130,7 @@ else()
         endif()
     endif()
 
-    if(NOT PS2X_IS_ANDROID)
+    if(NOT PS2X_IS_ANDROID AND PS2X_ENABLE_DEBUG_UI)
     FetchContent_Declare(
         imgui
         GIT_REPOSITORY https://github.com/ocornut/imgui.git
@@ -170,7 +173,7 @@ else()
     )
     target_include_directories(rlImGui PUBLIC "${PS2X_RLIMGUI_SOURCE_DIR}")
     target_link_libraries(rlImGui PUBLIC raylib imgui)
-    endif() # NOT PS2X_IS_ANDROID
+    endif() # NOT PS2X_IS_ANDROID AND PS2X_ENABLE_DEBUG_UI
 endif()
 
 add_library(ps2_host_backend INTERFACE)
@@ -620,7 +623,7 @@ target_link_libraries(ps2EntryRunner
     ps2_runtime
 )
 
-if(NOT PS2X_IS_VITA AND NOT PS2X_IS_ANDROID)
+if(PS2X_ENABLE_DEBUG_UI AND NOT PS2X_IS_VITA AND NOT PS2X_IS_ANDROID)
     target_sources(ps2EntryRunner PRIVATE
         src/lib/ps2_debug_panel.cpp
     )
