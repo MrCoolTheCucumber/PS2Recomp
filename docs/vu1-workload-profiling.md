@@ -226,9 +226,11 @@ old name from being confused with new code at a reused host address.
 - linked edges and helper barriers;
 - resident/dirty VF counts, maximum live pressure, and allocated-access
   coverage;
-- canonical loads/stores, helper spill/reload traffic, and materialization
-  counts split by canonical exit, link boundary, pair helper, and XGKICK
-  helper;
+- canonical loads/stores, fixed-frame helper spill/reload traffic, and
+  materialization counts split by canonical exit, link boundary, pair helper,
+  and XGKICK helper. Canonical traffic publishes architectural state, while
+  helper-frame traffic preserves dirty non-read residents through the host
+  ABI;
 - every native exit reason;
 - static IR opcode counts, native range and byte size; and
 - JIT code indices and whether the cache allocation is still resident.

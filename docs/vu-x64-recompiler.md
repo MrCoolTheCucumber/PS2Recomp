@@ -139,10 +139,21 @@ generated code.
 
 Normal blocks can retain a deterministic, pressure-ranked set of up to three
 VF registers in host SIMD registers. Exact block analysis supplies reads,
-writes, dirty lanes, liveness, and access counts. Dirty resident registers are
-written back before a canonical exit, link boundary, pair helper, or XGKICK
-helper; caller-clobbered residents are reloaded after a helper returns.
-Instrumented blocks always use canonical state.
+writes, dirty lanes, liveness, and access counts. Canonical exits and link
+boundaries write every dirty resident value. A semantic pair helper instead
+receives only its declared VF read dependencies: dirty read registers are
+published before the call, while dirty non-read registers are preserved in
+three fixed SIMD slots in the native frame. The call does not adjust the stack.
+On return, declared writes reload canonical state or lane-merge partial
+results into a preserved non-read value as required, and untouched dirty
+values are restored. The conservative analysis fallback declares every VF
+read and written.
+
+The XGKICK advancement helper declares no VF dependency. It therefore
+preserves dirty residents through the host call without publishing them to
+canonical VF storage. Clean caller-clobbered residents may be reloaded from
+canonical storage after either helper. Instrumented blocks always use
+canonical state.
 
 Normal execution uses an automatic profitability policy by default. A
 candidate VF must have more static accesses than its guaranteed entry load
@@ -150,8 +161,13 @@ plus possible dirty exit store. The complete allocation is retained only when
 its allocated accesses are at least five times its boundary load/store count;
 otherwise the block remains canonical. This whole-block screen accounts for
 the fixed boundary cost without adding a runtime guard or guest-specific
-identity. Helper barriers remain conservative and materialize all resident
-VFs.
+identity.
+
+Native VF0 reads synthesize `[0, 0, 0, 1]` directly and VI0 reads/writes use
+zero/no-op forms, so poisoned backing storage cannot affect generated code.
+Instruction immediates and static branch/address masks remain encoded
+directly. When both upper operands name the same VF, the emitter loads or
+materializes it once and reuses the host value.
 
 `PS2X_VU_BLOCK_LOCAL_VF_REGISTERS` is read once when the backend is created:
 
@@ -231,9 +247,10 @@ Budget diagnostics additionally satisfy:
 
 Opt-in block profiles update executions, pairs, budget classes, helper
 barriers, linked edges, exits, resident/dirty VF counts, static access
-coverage, loads/stores, helper spills/reloads, and materialization causes
-inside generated code, so their totals remain exact when the C++ accounting
-loop is bypassed.
+coverage, canonical loads/stores, helper-frame spills/reloads, and
+materialization causes inside generated code, so their totals remain exact
+when the C++ accounting loop is bypassed. A helper spill/reload is host-ABI
+preservation and is deliberately separate from canonical VF traffic.
 
 ## Threading scope
 

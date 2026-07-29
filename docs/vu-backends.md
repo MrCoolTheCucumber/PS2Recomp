@@ -120,8 +120,10 @@ debugger thread while the guest is running.
 The recompiler status distinguishes automatic block-local VF selection from a
 forced diagnostic selection. When block profiling is enabled, each returned
 block also exposes resident and dirty VF counts, maximum live pressure,
-static/allocated accesses, canonical loads/stores, helper spills/reloads, and
-materialization counts split by exit or helper cause.
+static/allocated accesses, canonical loads/stores, fixed-frame helper
+spills/reloads, and materialization counts split by exit or helper cause.
+Canonical traffic records architectural-state publication; helper-frame
+traffic records preservation of dirty non-read residents across the host ABI.
 
 Both units currently execute synchronously under the one guest-execution
 owner. No backend value enables a VU1 worker thread. A future queued mode must
