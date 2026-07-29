@@ -614,7 +614,11 @@ void register_ps2_debug_control_tests()
                         for (const auto &entry :
                              std::filesystem::directory_iterator(crashes))
                         {
+                            // The writer publishes by renaming its partial
+                            // directory. Retaining that transient path after
+                            // manifest creation races the rename.
                             if (entry.is_directory() &&
+                                entry.path().extension() != ".partial" &&
                                 std::filesystem::exists(
                                     entry.path() / "manifest.json"))
                             {
