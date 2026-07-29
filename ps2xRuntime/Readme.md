@@ -47,6 +47,17 @@ The runtime handles PS2's memory addressing, including:
 ## Vector Unit Support
 PS2-specific 128-bit MMI instructions and VU0 macro mode instructions are supported via SSE/AVX intrinsics.
 
+## GS Packed-Sprite ISA Selection
+
+Eligible CT32 sprite draws select the best compiled kernel at runtime. The
+AVX2 kernel is built as a separate translation unit and is entered only after
+host feature detection; configure with `PS2X_ENABLE_GS_AVX2_KERNEL=OFF` to
+omit it.
+
+For validation and benchmarking,
+`PS2X_GS_PACKED_SPRITE_KERNEL=scalar|sse41|avx2` overrides automatic
+selection. An unavailable forced implementation falls back to scalar.
+
 ## Instruction Patching
 You can patch specific instructions in the recompiled code to fix game issues or implement custom behavior.
 

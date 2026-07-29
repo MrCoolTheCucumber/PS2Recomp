@@ -376,6 +376,11 @@ namespace
     {
         std::vector<uint8_t> vram;
         uint64_t packedDispatches = 0u;
+        GSRasterizerDetail::PackedSpriteKernelImplementation
+            implementation =
+                GSRasterizerDetail::
+                    PackedSpriteKernelImplementation::Scalar;
+        uint64_t vectorGroups = 0u;
     };
 
     PackedSpriteRenderResult renderPackedSpriteTest(
@@ -425,6 +430,7 @@ namespace
         GSRasterizerDetail::setPackedSpriteKernelOverride(
             overrideMode);
         GSRasterizerDetail::resetPackedSpriteKernelDispatchCount();
+        GSRasterizerDetail::resetPackedSpriteVectorGroupCount();
 
         gs.writeRegister(GS_REG_FRAME_1, configuration.frame);
         gs.writeRegister(GS_REG_ZBUF_1, configuration.zbuf);
@@ -458,6 +464,9 @@ namespace
         return {
             std::move(vram),
             GSRasterizerDetail::packedSpriteKernelDispatchCount(),
+            GSRasterizerDetail::
+                packedSpriteLastKernelImplementation(),
+            GSRasterizerDetail::packedSpriteVectorGroupCount(),
         };
     }
 
@@ -3357,6 +3366,107 @@ void register_ps2_gs_tests()
             t.IsTrue(
                 optimized.vram == reference.vram,
                 "the packed CT32 DECAL draw must match full reference VRAM");
+        });
+
+        tc.Run("GS packed sprite SIMD kernels match scalar vertical interpolation", [](TestCase &t)
+        {
+            struct ImplementationCase
+            {
+                const char *name;
+                GSRasterizerDetail::PackedSpriteKernelOverride
+                    overrideMode;
+                GSRasterizerDetail::PackedSpriteKernelImplementation
+                    implementation;
+            };
+            const ImplementationCase cases[] = {
+                {
+                    "SSE4.1",
+                    GSRasterizerDetail::
+                        PackedSpriteKernelOverride::ForceSse41,
+                    GSRasterizerDetail::
+                        PackedSpriteKernelImplementation::Sse41,
+                },
+                {
+                    "AVX2",
+                    GSRasterizerDetail::
+                        PackedSpriteKernelOverride::ForceAvx2,
+                    GSRasterizerDetail::
+                        PackedSpriteKernelImplementation::Avx2,
+                },
+            };
+
+            for (uint16_t weight = 0u; weight < 16u; ++weight)
+            {
+                PackedSpriteTestConfiguration configuration;
+                configuration.x0 -= 8u;
+                configuration.x1 -= 8u;
+                configuration.v0 += weight;
+                configuration.v1 += weight;
+
+                const PackedSpriteRenderResult scalar =
+                    renderPackedSpriteTest(
+                        configuration,
+                        GSRasterizerDetail::
+                            PackedSpriteKernelOverride::
+                                ForceScalar);
+                t.Equals(
+                    scalar.packedDispatches,
+                    uint64_t{1u},
+                    "the forced scalar draw must dispatch the packed kernel once");
+                t.Equals(
+                    scalar.implementation,
+                    GSRasterizerDetail::
+                        PackedSpriteKernelImplementation::Scalar,
+                    "the forced scalar draw must report the scalar implementation");
+                t.Equals(
+                    scalar.vectorGroups,
+                    uint64_t{0u},
+                    "the scalar implementation must not report vector groups");
+
+                for (const ImplementationCase &testCase : cases)
+                {
+                    if (!GSRasterizerDetail::
+                            packedSpriteKernelImplementationAvailable(
+                                testCase.implementation))
+                    {
+                        continue;
+                    }
+
+                    const PackedSpriteRenderResult vector =
+                        renderPackedSpriteTest(
+                            configuration,
+                            testCase.overrideMode);
+                    const std::string prefix =
+                        std::string(testCase.name) +
+                        " weight " +
+                        std::to_string(weight) + ": ";
+                    t.Equals(
+                        vector.packedDispatches,
+                        uint64_t{1u},
+                        prefix +
+                            "the forced vector draw must dispatch once");
+                    t.Equals(
+                        vector.implementation,
+                        testCase.implementation,
+                        prefix +
+                            "the requested implementation must be selected");
+                    if (weight != 8u)
+                    {
+                        t.IsTrue(
+                            vector.vectorGroups != 0u,
+                            prefix +
+                                "full vertical-filter groups must enter the vector path");
+                    }
+                    t.IsTrue(
+                        vector.vram == scalar.vram,
+                        prefix +
+                            "vector and scalar packed paths must match full VRAM");
+                }
+            }
+
+            GSRasterizerDetail::setPackedSpriteKernelOverride(
+                GSRasterizerDetail::PackedSpriteKernelOverride::
+                    Automatic);
         });
 
         tc.Run("GS packed sprite selector rejects states with extra pixel work", [](TestCase &t)

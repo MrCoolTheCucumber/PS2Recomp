@@ -19,6 +19,8 @@ option(PS2X_STRICT_RETURN_DIAGNOSTICS "Route generated JR $ra returns through ru
 option(PS2X_SHOW_WINDOWS_CONSOLE "Show a console window for ps2EntryRunner on Windows release builds" ON)
 option(PS2X_ENABLE_VU_X64_RECOMPILER
     "Build the production x86-64 VU dynamic recompiler when supported" ON)
+option(PS2X_ENABLE_GS_AVX2_KERNEL
+    "Build the runtime-dispatched AVX2 GS packed-sprite kernel" ON)
 
 if(PS2X_ENABLE_SCCACHE)
     find_program(PS2X_SCCACHE_PROGRAM sccache)
@@ -450,6 +452,43 @@ add_library(ps2_runtime STATIC
     src/lib/vu/ps2_vu1_lower.cpp
     src/lib/games_database.cpp
 )
+
+set(PS2X_HAS_GS_AVX2_KERNEL OFF)
+if(PS2X_ENABLE_GS_AVX2_KERNEL
+   AND NOT PS2X_IS_ARM_TARGET
+   AND CMAKE_SYSTEM_PROCESSOR MATCHES
+       "^(x86_64|AMD64|amd64|i[3-6]86)$")
+    if(MSVC)
+        set(PS2X_GS_AVX2_COMPILE_OPTION "/arch:AVX2")
+        set(PS2X_HAS_GS_AVX2_KERNEL ON)
+    elseif(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+        include(CheckCXXCompilerFlag)
+        check_cxx_compiler_flag(
+            "-mavx2" PS2X_COMPILER_SUPPORTS_MAVX2)
+        if(PS2X_COMPILER_SUPPORTS_MAVX2)
+            set(PS2X_GS_AVX2_COMPILE_OPTION "-mavx2")
+            set(PS2X_HAS_GS_AVX2_KERNEL ON)
+        endif()
+    endif()
+endif()
+
+if(PS2X_HAS_GS_AVX2_KERNEL)
+    target_sources(ps2_runtime PRIVATE
+        src/lib/ps2_gs_rasterizer_avx2.cpp
+    )
+    set_source_files_properties(
+        src/lib/ps2_gs_rasterizer_avx2.cpp
+        PROPERTIES
+            COMPILE_OPTIONS "${PS2X_GS_AVX2_COMPILE_OPTION}"
+    )
+    target_compile_definitions(ps2_runtime PRIVATE
+        PS2X_GS_HAS_AVX2_KERNEL=1
+    )
+else()
+    target_compile_definitions(ps2_runtime PRIVATE
+        PS2X_GS_HAS_AVX2_KERNEL=0
+    )
+endif()
 
 if(PS2X_ENABLE_DEBUG_SERVER)
     target_sources(ps2_runtime PRIVATE

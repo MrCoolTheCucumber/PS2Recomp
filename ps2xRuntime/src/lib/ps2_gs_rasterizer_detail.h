@@ -11,14 +11,32 @@ namespace GSRasterizerDetail
         Automatic,
         ForceReference,
         ForceOptimized,
+        ForceScalar,
+        ForceSse41,
+        ForceAvx2,
+    };
+
+    enum class PackedSpriteKernelImplementation : uint8_t
+    {
+        Scalar,
+        Sse41,
+        Avx2,
     };
 
     void setPackedSpriteKernelOverride(
         PackedSpriteKernelOverride overrideMode);
     PackedSpriteKernelOverride packedSpriteKernelOverride();
+    bool packedSpriteKernelImplementationAvailable(
+        PackedSpriteKernelImplementation implementation);
     void resetPackedSpriteKernelDispatchCount();
     uint64_t packedSpriteKernelDispatchCount();
-    void recordPackedSpriteKernelDispatch();
+    PackedSpriteKernelImplementation
+        packedSpriteLastKernelImplementation();
+    void recordPackedSpriteKernelDispatch(
+        PackedSpriteKernelImplementation implementation);
+    void resetPackedSpriteVectorGroupCount();
+    uint64_t packedSpriteVectorGroupCount();
+    void recordPackedSpriteVectorGroup();
 
     struct LinearTextureTap
     {

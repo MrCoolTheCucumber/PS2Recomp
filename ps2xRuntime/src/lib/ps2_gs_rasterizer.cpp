@@ -7,6 +7,7 @@
 #include "runtime/ps2_gs_psmt8.h"
 #include "runtime/ps2_gs_memory.h"
 #include "ps2_gs_rasterizer_detail.h"
+#include "ps2_gs_packed_sprite_kernel.h"
 #include "ps2_log.h"
 #include <array>
 #include <atomic>
@@ -28,8 +29,28 @@
 #include <string>
 #include <thread>
 #include <vector>
+#if defined(__i386__) || defined(__x86_64__) || \
+    defined(_M_IX86) || defined(_M_X64)
+#define PS2X_GS_X86 1
+#if defined(_MSC_VER)
+#include <intrin.h>
+#endif
+#else
+#define PS2X_GS_X86 0
+#endif
+
 #if defined(__SSE4_1__)
 #include <smmintrin.h>
+#endif
+
+#if defined(__SSE4_1__)
+#define PS2X_GS_HAS_SSE41_VARIANT 1
+#else
+#define PS2X_GS_HAS_SSE41_VARIANT 0
+#endif
+
+#ifndef PS2X_GS_HAS_AVX2_KERNEL
+#define PS2X_GS_HAS_AVX2_KERNEL 0
 #endif
 
 #if defined(_MSC_VER)
@@ -48,6 +69,71 @@
 
 using namespace GSInternal;
 
+namespace
+{
+    bool hostSupportsAvx2()
+    {
+#if PS2X_GS_HAS_AVX2_KERNEL && PS2X_GS_X86 && \
+    (defined(__GNUC__) || defined(__clang__))
+        static const bool supported = []
+        {
+            __builtin_cpu_init();
+            return __builtin_cpu_supports("avx2") != 0;
+        }();
+        return supported;
+#elif PS2X_GS_HAS_AVX2_KERNEL && PS2X_GS_X86 && \
+    defined(_MSC_VER)
+        static const bool supported = []
+        {
+            int registers[4]{};
+            __cpuid(registers, 0);
+            if (registers[0] < 7)
+                return false;
+
+            __cpuidex(registers, 1, 0);
+            constexpr int kOsXsave = 1 << 27;
+            constexpr int kAvx = 1 << 28;
+            if ((registers[2] & (kOsXsave | kAvx)) !=
+                (kOsXsave | kAvx))
+            {
+                return false;
+            }
+            if ((_xgetbv(0) & 0x6u) != 0x6u)
+                return false;
+
+            __cpuidex(registers, 7, 0);
+            constexpr int kAvx2 = 1 << 5;
+            return (registers[1] & kAvx2) != 0;
+        }();
+        return supported;
+#else
+        return false;
+#endif
+    }
+
+    GSRasterizerDetail::PackedSpriteKernelOverride
+        environmentPackedSpriteKernelOverride()
+    {
+        using Override =
+            GSRasterizerDetail::PackedSpriteKernelOverride;
+        static const Override overrideMode = []
+        {
+            const char *value =
+                std::getenv("PS2X_GS_PACKED_SPRITE_KERNEL");
+            if (value == nullptr)
+                return Override::Automatic;
+            if (std::strcmp(value, "scalar") == 0)
+                return Override::ForceScalar;
+            if (std::strcmp(value, "sse41") == 0)
+                return Override::ForceSse41;
+            if (std::strcmp(value, "avx2") == 0)
+                return Override::ForceAvx2;
+            return Override::Automatic;
+        }();
+        return overrideMode;
+    }
+}
+
 namespace GSRasterizerDetail
 {
     namespace
@@ -57,6 +143,11 @@ namespace GSRasterizerDetail
                 PackedSpriteKernelOverride::Automatic};
         std::atomic<uint64_t>
             s_packedSpriteKernelDispatchCount{0u};
+        std::atomic<PackedSpriteKernelImplementation>
+            s_packedSpriteLastKernelImplementation{
+                PackedSpriteKernelImplementation::Scalar};
+        std::atomic<uint64_t>
+            s_packedSpriteVectorGroupCount{0u};
     }
 
     void setPackedSpriteKernelOverride(
@@ -72,10 +163,28 @@ namespace GSRasterizerDetail
             std::memory_order_relaxed);
     }
 
+    bool packedSpriteKernelImplementationAvailable(
+        PackedSpriteKernelImplementation implementation)
+    {
+        switch (implementation)
+        {
+        case PackedSpriteKernelImplementation::Scalar:
+            return true;
+        case PackedSpriteKernelImplementation::Sse41:
+            return PS2X_GS_HAS_SSE41_VARIANT != 0;
+        case PackedSpriteKernelImplementation::Avx2:
+            return hostSupportsAvx2();
+        }
+        return false;
+    }
+
     void resetPackedSpriteKernelDispatchCount()
     {
         s_packedSpriteKernelDispatchCount.store(
             0u, std::memory_order_relaxed);
+        s_packedSpriteLastKernelImplementation.store(
+            PackedSpriteKernelImplementation::Scalar,
+            std::memory_order_relaxed);
     }
 
     uint64_t packedSpriteKernelDispatchCount()
@@ -84,9 +193,37 @@ namespace GSRasterizerDetail
             std::memory_order_relaxed);
     }
 
-    void recordPackedSpriteKernelDispatch()
+    PackedSpriteKernelImplementation
+        packedSpriteLastKernelImplementation()
     {
+        return s_packedSpriteLastKernelImplementation.load(
+            std::memory_order_relaxed);
+    }
+
+    void recordPackedSpriteKernelDispatch(
+        PackedSpriteKernelImplementation implementation)
+    {
+        s_packedSpriteLastKernelImplementation.store(
+            implementation, std::memory_order_relaxed);
         s_packedSpriteKernelDispatchCount.fetch_add(
+            1u, std::memory_order_relaxed);
+    }
+
+    void resetPackedSpriteVectorGroupCount()
+    {
+        s_packedSpriteVectorGroupCount.store(
+            0u, std::memory_order_relaxed);
+    }
+
+    uint64_t packedSpriteVectorGroupCount()
+    {
+        return s_packedSpriteVectorGroupCount.load(
+            std::memory_order_relaxed);
+    }
+
+    void recordPackedSpriteVectorGroup()
+    {
+        s_packedSpriteVectorGroupCount.fetch_add(
             1u, std::memory_order_relaxed);
     }
 }
@@ -1334,201 +1471,94 @@ namespace
     constexpr uint32_t kGsBlockCount = (4u * 1024u * 1024u) / 256u;
     constexpr uint32_t kRasterStripeHeight = 16u;
 
-    struct PreparedPackedSprite
+    struct PackedSpriteKernelSelection
     {
-        const uint8_t *textureVram = nullptr;
-        uint8_t *framebufferVram = nullptr;
-        uint32_t textureBase = 0u;
-        uint32_t textureWidth = 0u;
-        uint32_t textureMaskU = 0u;
-        uint32_t textureMaskV = 0u;
-        uint32_t framebufferBase = 0u;
-        uint32_t framebufferWidth = 0u;
-        int drawX0 = 0;
-        int drawX1 = 0;
-        int drawY0 = 0;
-        int drawY1 = 0;
-        int alignedDrawX = 0;
-        int32_t fixedBaseU = 0;
-        int32_t fixedBlockStepU = 0;
-        std::array<int32_t, 8> fixedLaneU{};
-        float fixedScanV = 0.0f;
-        float fixedStepV = 0.0f;
-        uint32_t scanlineWorkerIndex = 0u;
-        uint32_t scanlineWorkerCount = 1u;
+        GSRasterizerDetail::PackedSpriteKernelImplementation
+            implementation =
+                GSRasterizerDetail::
+                    PackedSpriteKernelImplementation::Scalar;
+        GSRasterizerPacked::DrawKernel kernel =
+            GSRasterizerPacked::drawScalar;
     };
 
-    PS2X_GS_NOINLINE void drawPackedCt32DecalSprite(
-        const PreparedPackedSprite &sprite)
+    PackedSpriteKernelSelection selectPackedSpriteKernel(
+        GSRasterizerDetail::PackedSpriteKernelOverride overrideMode)
     {
-        constexpr int kPixelsPerLaneGroup = 8;
-        float fixedScanV = sprite.fixedScanV;
-        for (int y = sprite.drawY0;
-             y <= sprite.drawY1;
-             ++y)
+        using Implementation =
+            GSRasterizerDetail::PackedSpriteKernelImplementation;
+        using Override =
+            GSRasterizerDetail::PackedSpriteKernelOverride;
+
+        if (overrideMode == Override::Automatic)
         {
-            const bool ownsScanline =
-                sprite.scanlineWorkerCount <= 1u ||
-                (static_cast<uint32_t>(y) /
-                 kRasterStripeHeight) %
-                        sprite.scanlineWorkerCount ==
-                    sprite.scanlineWorkerIndex;
-            if (!ownsScanline)
-            {
-                fixedScanV += sprite.fixedStepV;
-                continue;
-            }
-
-            const int32_t fixedV =
-                static_cast<int32_t>(fixedScanV);
-            const uint8_t weightV =
-                static_cast<uint8_t>(
-                    (static_cast<uint32_t>(fixedV) >> 12u) &
-                    0xFu);
-            const uint32_t wrappedV0 =
-                static_cast<uint32_t>(
-                    floorFixed16_16(fixedV)) &
-                sprite.textureMaskV;
-            const uint32_t wrappedV1 =
-                weightV != 0u
-                    ? (wrappedV0 + 1u) &
-                          sprite.textureMaskV
-                    : wrappedV0;
-
-            const int firstGroup =
-                sprite.drawX0 &
-                ~(kPixelsPerLaneGroup - 1);
-            for (int groupX = firstGroup;
-                 groupX <= sprite.drawX1;
-                 groupX += kPixelsPerLaneGroup)
-            {
-                std::array<uint32_t,
-                           kPixelsPerLaneGroup> pending{};
-                int pendingCount = 0;
-                const int firstX =
-                    std::max(groupX, sprite.drawX0);
-                const int lastX = std::min(
-                    groupX + kPixelsPerLaneGroup - 1,
-                    sprite.drawX1);
-                for (int x = firstX; x <= lastX; ++x)
-                {
-                    const int block =
-                        (x - sprite.alignedDrawX) /
-                        kPixelsPerLaneGroup;
-                    const int32_t fixedLaneU =
-                        sprite.fixedLaneU[
-                            x &
-                            (kPixelsPerLaneGroup - 1)];
-                    const int32_t fixedU =
-                        static_cast<int32_t>(
-                            static_cast<uint32_t>(
-                                sprite.fixedBaseU) +
-                            static_cast<uint32_t>(
-                                fixedLaneU) +
-                            static_cast<uint32_t>(
-                                sprite.fixedBlockStepU) *
-                                static_cast<uint32_t>(block));
-                    const uint8_t weightU =
-                        static_cast<uint8_t>(
-                            (static_cast<uint32_t>(fixedU) >>
-                             12u) &
-                            0xFu);
-                    const uint32_t wrappedU0 =
-                        static_cast<uint32_t>(
-                            floorFixed16_16(fixedU)) &
-                        sprite.textureMaskU;
-                    const uint32_t wrappedU1 =
-                        weightU != 0u
-                            ? (wrappedU0 + 1u) &
-                                  sprite.textureMaskU
-                            : wrappedU0;
-                    const uint32_t c00 = GSMem::ReadCT32(
-                        const_cast<uint8_t *>(
-                            sprite.textureVram),
-                        sprite.textureBase,
-                        sprite.textureWidth,
-                        wrappedU0,
-                        wrappedV0);
-
-                    uint32_t color = c00;
-                    if (weightU == 0u)
-                    {
-                        if (weightV != 0u)
-                        {
-                            const uint32_t c01 =
-                                GSMem::ReadCT32(
-                                    const_cast<uint8_t *>(
-                                        sprite.textureVram),
-                                    sprite.textureBase,
-                                    sprite.textureWidth,
-                                    wrappedU0,
-                                    wrappedV1);
-                            color = linearColor4(
-                                c00, c01, weightV);
-                        }
-                    }
-                    else
-                    {
-                        const uint32_t c10 =
-                            GSMem::ReadCT32(
-                                const_cast<uint8_t *>(
-                                    sprite.textureVram),
-                                sprite.textureBase,
-                                sprite.textureWidth,
-                                wrappedU1,
-                                wrappedV0);
-                        if (weightV == 0u)
-                        {
-                            color = linearColor4(
-                                c00, c10, weightU);
-                        }
-                        else
-                        {
-                            const uint32_t c01 =
-                                GSMem::ReadCT32(
-                                    const_cast<uint8_t *>(
-                                        sprite.textureVram),
-                                    sprite.textureBase,
-                                    sprite.textureWidth,
-                                    wrappedU0,
-                                    wrappedV1);
-                            const uint32_t c11 =
-                                GSMem::ReadCT32(
-                                    const_cast<uint8_t *>(
-                                        sprite.textureVram),
-                                    sprite.textureBase,
-                                    sprite.textureWidth,
-                                    wrappedU1,
-                                    wrappedV1);
-                            color = bilinearColor4(
-                                c00,
-                                c10,
-                                c01,
-                                c11,
-                                weightU,
-                                weightV);
-                        }
-                    }
-                    pending[pendingCount++] = color;
-                }
-
-                for (int index = 0;
-                     index < pendingCount;
-                     ++index)
-                {
-                    GSMem::WriteCT32(
-                        sprite.framebufferVram,
-                        sprite.framebufferBase,
-                        sprite.framebufferWidth,
-                        firstX + index,
-                        y,
-                        pending[index]);
-                }
-            }
-
-            fixedScanV += sprite.fixedStepV;
+            overrideMode =
+                environmentPackedSpriteKernelOverride();
         }
+
+        if (overrideMode == Override::ForceScalar ||
+            overrideMode == Override::ForceReference)
+        {
+            return {
+                Implementation::Scalar,
+                GSRasterizerPacked::drawScalar,
+            };
+        }
+
+#if PS2X_GS_HAS_SSE41_VARIANT
+        if (overrideMode == Override::ForceSse41)
+        {
+            return {
+                Implementation::Sse41,
+                GSRasterizerPacked::drawSse41,
+            };
+        }
+#endif
+
+#if PS2X_GS_HAS_AVX2_KERNEL
+        if (overrideMode == Override::ForceAvx2 &&
+            hostSupportsAvx2())
+        {
+            return {
+                Implementation::Avx2,
+                GSRasterizerPacked::drawAvx2,
+            };
+        }
+#endif
+
+        if (overrideMode == Override::ForceSse41 ||
+            overrideMode == Override::ForceAvx2)
+        {
+            return {
+                Implementation::Scalar,
+                GSRasterizerPacked::drawScalar,
+            };
+        }
+
+#if PS2X_GS_HAS_AVX2_KERNEL
+        if (hostSupportsAvx2())
+        {
+            return {
+                Implementation::Avx2,
+                GSRasterizerPacked::drawAvx2,
+            };
+        }
+#endif
+
+#if PS2X_GS_HAS_SSE41_VARIANT
+        return {
+            Implementation::Sse41,
+            GSRasterizerPacked::drawSse41,
+        };
+#else
+        return {
+            Implementation::Scalar,
+            GSRasterizerPacked::drawScalar,
+        };
+#endif
     }
+
+    using PreparedPackedSprite =
+        GSRasterizerPacked::PreparedSprite;
 
     struct GSBlockRange
     {
@@ -4151,6 +4181,8 @@ void GSRasterizer::drawSprite(GS *gs)
             !pixelTrace.enabled;
         if (usePackedSprite)
         {
+            const PackedSpriteKernelSelection kernelSelection =
+                selectPackedSpriteKernel(packedOverride);
             PreparedPackedSprite packedSprite{
                 .textureVram =
                     m_textureReadVram
@@ -4183,6 +4215,10 @@ void GSRasterizer::drawSprite(GS *gs)
                     m_scanlineWorkerIndex,
                 .scanlineWorkerCount =
                     m_scanlineWorkerCount,
+                .recordVectorGroups =
+                    packedOverride !=
+                    GSRasterizerDetail::
+                        PackedSpriteKernelOverride::Automatic,
             };
             for (int lane = 0;
                  lane < kPixelsPerLaneGroup;
@@ -4195,15 +4231,16 @@ void GSRasterizer::drawSprite(GS *gs)
                             lane - laneSkip));
             }
 
-            if (packedOverride ==
+            if (packedOverride !=
                 GSRasterizerDetail::PackedSpriteKernelOverride::
-                    ForceOptimized)
+                    Automatic)
             {
                 GSRasterizerDetail::
-                    recordPackedSpriteKernelDispatch();
+                    recordPackedSpriteKernelDispatch(
+                        kernelSelection.implementation);
             }
 
-            drawPackedCt32DecalSprite(packedSprite);
+            kernelSelection.kernel(packedSprite);
             return;
         }
 
