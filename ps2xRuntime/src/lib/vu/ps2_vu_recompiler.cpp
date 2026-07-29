@@ -404,6 +404,14 @@ namespace
             Active,
         };
 
+        struct KnownViBackupState
+        {
+            KnownViBackup state =
+                KnownViBackup::Dynamic;
+            uint8_t cycles = 0u;
+            uint8_t reg = 0u;
+        };
+
         enum class KnownDelayedScalar : uint8_t
         {
             Dynamic,
@@ -1218,7 +1226,9 @@ namespace
             emitAdvanceViBackup(knownViBackup);
         }
 
-        void emitBackupVi(uint8_t reg)
+        void emitBackupVi(
+            uint8_t reg,
+            const KnownViBackupState &knownState)
         {
             if (reg == 0u)
                 return;
@@ -1239,6 +1249,35 @@ namespace
                     offsetof(
                         VuExecutionState,
                         viBackupValue));
+            // The block-local fact removes only the selection tests. Keep
+            // the delayed backup canonical so every side exit observes the
+            // same countdown, register, and value as the interpreter.
+            if (knownState.state !=
+                KnownViBackup::Dynamic)
+            {
+                m_code.mov(
+                    m_code.byte[
+                        m_code.rbx + cyclesOffset],
+                    2u);
+                if (knownState.state ==
+                        KnownViBackup::Active &&
+                    knownState.reg == reg)
+                {
+                    return;
+                }
+                m_code.mov(
+                    m_code.byte[
+                        m_code.rbx + registerOffset],
+                    reg);
+                emitReadViWord(
+                    reg, m_code.eax, true);
+                m_code.mov(
+                    m_code.dword[
+                        m_code.rbx + valueOffset],
+                    m_code.eax);
+                return;
+            }
+
             Label replace;
             Label done;
 
@@ -1278,7 +1317,8 @@ namespace
 
         void emitReadViForBranch(
             uint8_t reg, const Xbyak::Reg32 &result,
-            const Xbyak::Reg32 &scratch)
+            const Xbyak::Reg32 &scratch,
+            const KnownViBackupState &knownState)
         {
             if (reg == 0u)
             {
@@ -1302,6 +1342,26 @@ namespace
                     offsetof(
                         VuExecutionState,
                         viBackupValue));
+            if (knownState.state !=
+                KnownViBackup::Dynamic)
+            {
+                if (knownState.state ==
+                        KnownViBackup::Active &&
+                    knownState.reg == reg)
+                {
+                    m_code.movsx(
+                        result,
+                        m_code.word[
+                            m_code.rbx + valueOffset]);
+                }
+                else
+                {
+                    emitReadViWord(
+                        reg, result, true);
+                }
+                return;
+            }
+
             Label liveValue;
             Label done;
             m_code.cmp(
@@ -1714,7 +1774,8 @@ namespace
         }
 
         void emitLower(
-            const VuIrInstructionPair &pair)
+            const VuIrInstructionPair &pair,
+            const KnownViBackupState &knownViBackup)
         {
             using namespace Xbyak;
             const uint32_t word = pair.lowerWord;
@@ -1909,7 +1970,8 @@ namespace
             case VuIrOpcode::LowerLqi:
             {
                 Label outOfBounds;
-                emitBackupVi(viS);
+                emitBackupVi(
+                    viS, knownViBackup);
                 emitDataAddress(
                     viS, 0, true, outOfBounds);
                 emitApplyVectorFromMemory(
@@ -1921,7 +1983,8 @@ namespace
             case VuIrOpcode::LowerSqi:
             {
                 Label outOfBounds;
-                emitBackupVi(viT);
+                emitBackupVi(
+                    viT, knownViBackup);
                 emitDataAddress(
                     viT, 0, true, outOfBounds);
                 emitApplyVectorToMemory(
@@ -1934,7 +1997,8 @@ namespace
             {
                 if (viT == 0u)
                     return;
-                emitBackupVi(viT);
+                emitBackupVi(
+                    viT, knownViBackup);
                 const uint8_t component =
                     static_cast<uint8_t>(
                         (word >> 21u) & 3u);
@@ -2140,9 +2204,11 @@ namespace
             {
                 Label notTaken;
                 emitReadViForBranch(
-                    viS, m_code.eax, m_code.edx);
+                    viS, m_code.eax, m_code.edx,
+                    knownViBackup);
                 emitReadViForBranch(
-                    viT, m_code.ecx, m_code.edx);
+                    viT, m_code.ecx, m_code.edx,
+                    knownViBackup);
                 m_code.cmp(
                     m_code.eax, m_code.ecx);
                 if (pair.lower.opcode ==
@@ -2171,7 +2237,8 @@ namespace
             {
                 Label notTaken;
                 emitReadViForBranch(
-                    viS, m_code.eax, m_code.ecx);
+                    viS, m_code.eax, m_code.ecx,
+                    knownViBackup);
                 m_code.test(
                     m_code.eax, m_code.eax);
                 switch (pair.lower.opcode)
@@ -3006,7 +3073,7 @@ namespace
             bool enforceZeroRegisters,
             bool handleBranchState,
             KnownFmacSlot knownFmacSlot,
-            KnownViBackup knownViBackup,
+            KnownViBackupState knownViBackup,
             KnownDelayedScalar knownQ,
             uint32_t knownQCyclesRemaining,
             KnownDelayedScalar knownP,
@@ -3076,8 +3143,22 @@ namespace
                     0u);
                 m_code.jne(*fallback, m_code.T_NEAR);
             }
+            // Pipeline state advances before either instruction executes.
+            // Convert the pair-entry fact to the state visible to the lower
+            // instruction before specializing backup schedules and reads.
+            KnownViBackupState instructionViBackup =
+                knownViBackup;
+            if (instructionViBackup.state ==
+                KnownViBackup::Active)
+            {
+                --instructionViBackup.cycles;
+                instructionViBackup.state =
+                    instructionViBackup.cycles != 0u
+                        ? KnownViBackup::Active
+                        : KnownViBackup::Inactive;
+            }
             emitAdvancePipelines(
-                knownFmacSlot, knownViBackup,
+                knownFmacSlot, knownViBackup.state,
                 knownQ, knownQCyclesRemaining,
                 knownP, knownPCyclesRemaining);
             if (vuIrHasOpFlag(
@@ -3091,13 +3172,15 @@ namespace
             if (pair.order ==
                 VuIrPairOrder::LowerThenUpper)
             {
-                emitLower(pair);
+                emitLower(
+                    pair, instructionViBackup);
                 emitUpper(pair);
             }
             else
             {
                 emitUpper(pair);
-                emitLower(pair);
+                emitLower(
+                    pair, instructionViBackup);
             }
 
             if (enforceZeroRegisters)
@@ -4078,6 +4161,7 @@ namespace
 
                     bool viBackupKnown = false;
                     uint8_t viBackupCycles = 2u;
+                    uint8_t viBackupRegister = 0u;
                     bool qKnown = false;
                     uint32_t qCyclesRemaining = 0u;
                     bool pKnown = false;
@@ -4145,12 +4229,17 @@ namespace
                                     ? KnownFmacSlot::Active
                                     : KnownFmacSlot::Inactive;
                         }
-                        const KnownViBackup knownViBackup =
-                            !viBackupKnown
-                                ? KnownViBackup::Dynamic
-                                : viBackupCycles != 0u
-                                      ? KnownViBackup::Active
-                                      : KnownViBackup::Inactive;
+                        const KnownViBackupState
+                            knownViBackup{
+                                .state =
+                                    !viBackupKnown
+                                        ? KnownViBackup::Dynamic
+                                        : viBackupCycles != 0u
+                                              ? KnownViBackup::Active
+                                              : KnownViBackup::Inactive,
+                                .cycles = viBackupCycles,
+                                .reg = viBackupRegister,
+                            };
                         const KnownDelayedScalar knownQ =
                             !qKnown
                                 ? KnownDelayedScalar::Dynamic
@@ -4250,6 +4339,8 @@ namespace
                         {
                             viBackupKnown = true;
                             viBackupCycles = 2u;
+                            viBackupRegister =
+                                backedUpRegister;
                         }
                         if (qKnown &&
                             qCyclesRemaining != 0u)

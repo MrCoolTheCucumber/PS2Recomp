@@ -179,6 +179,14 @@ namespace
             (static_cast<uint32_t>(immediate) & 0x7ffu);
     }
 
+    uint32_t makeVuLqi(
+        uint8_t dest, uint8_t targetVf,
+        uint8_t baseVi)
+    {
+        return makeVuLowerSpecial(
+            0x34u, baseVi, targetVf, 0u, dest);
+    }
+
     uint32_t makeVuSq(
         uint8_t dest, uint8_t sourceVf,
         uint8_t baseVi, int16_t immediate)
@@ -1701,6 +1709,177 @@ void register_ps2_vu_recompiler_tests()
                             nativeState, &difference),
                         prefix + "state differs at " +
                             difference);
+                }
+            });
+
+        tc.Run(
+            "native VI backup specialization preserves known register identity and expiry",
+            [](TestCase &t)
+            {
+                if (!VuRecompilerBackend::supported())
+                    return;
+
+                ScopedEnvironmentVariable budgetGuards(
+                    "PS2X_VU_BLOCK_BUDGET_GUARDS");
+                budgetGuards.set("0");
+                struct BackupCase
+                {
+                    const char *name;
+                    std::array<uint32_t, 3u> setup;
+                    uint8_t setupPairs;
+                    uint8_t branchLeft;
+                    uint8_t branchRight;
+                    std::array<int32_t, 3u> initialVi;
+                };
+                const uint32_t lqiVi1 =
+                    makeVuLqi(0xfu, 4u, 1u);
+                const uint32_t lqiVi2 =
+                    makeVuLqi(0xfu, 5u, 2u);
+                const std::array<BackupCase, 3u> cases{{
+                    {
+                        "refresh same active register",
+                        {lqiVi1, lqiVi1, 0u},
+                        2u, 1u, 2u,
+                        {5, 5, 0},
+                    },
+                    {
+                        "replace active register",
+                        {lqiVi1, lqiVi2, 0u},
+                        2u, 2u, 3u,
+                        {5, 9, 9},
+                    },
+                    {
+                        "replace expired same register",
+                        {lqiVi1, 0u, lqiVi1},
+                        3u, 1u, 2u,
+                        {5, 6, 0},
+                    },
+                }};
+
+                for (const BackupCase &testCase : cases)
+                {
+                    VuNativeFixture referenceFixture;
+                    VuNativeFixture nativeFixture;
+                    t.IsTrue(
+                        referenceFixture.initialize(),
+                        std::string(testCase.name) +
+                            ": reference memory should initialize");
+                    t.IsTrue(
+                        nativeFixture.initialize(),
+                        std::string(testCase.name) +
+                            ": native memory should initialize");
+                    const uint32_t branchPair =
+                        2u + testCase.setupPairs;
+                    const auto configure =
+                        [&](uint8_t *code)
+                        {
+                            for (uint32_t index = 0u;
+                                 index <
+                                     testCase.setupPairs;
+                                 ++index)
+                            {
+                                writePair(
+                                    code,
+                                    (2u + index) * 8u,
+                                    testCase.setup[index],
+                                    kVuUpperNop);
+                            }
+                            writePair(
+                                code, branchPair * 8u,
+                                makeVuBranchOperation(
+                                    0x28u,
+                                    testCase.branchLeft,
+                                    testCase.branchRight,
+                                    3),
+                                kVuUpperNop);
+                            writePair(
+                                code,
+                                (branchPair + 2u) * 8u,
+                                makeVuIaddiu(
+                                    11u, 0u, 1),
+                                kVuUpperNop |
+                                    kVuUpperEnd);
+                            writePair(
+                                code,
+                                (branchPair + 4u) * 8u,
+                                makeVuIaddiu(
+                                    11u, 0u, 2),
+                                kVuUpperNop |
+                                    kVuUpperEnd);
+                        };
+                    configure(referenceFixture.code);
+                    configure(nativeFixture.code);
+                    referenceFixture.markCodeModified();
+                    nativeFixture.markCodeModified();
+
+                    VuUnit referenceUnit(VuUnitId::Vu1);
+                    VuUnit nativeUnit(VuUnitId::Vu1);
+                    VuInterpreterBackend reference(
+                        referenceUnit);
+                    VuRecompilerBackend native(nativeUnit);
+                    const uint32_t fullBudget =
+                        branchPair + 6u;
+                    for (uint32_t budget = 0u;
+                         budget <= fullBudget;
+                         ++budget)
+                    {
+                        VuExecutionState referenceState =
+                            initialSyntheticState();
+                        referenceState.vi[1] =
+                            testCase.initialVi[0u];
+                        referenceState.vi[2] =
+                            testCase.initialVi[1u];
+                        referenceState.vi[3] =
+                            testCase.initialVi[2u];
+                        VuExecutionState nativeState =
+                            referenceState;
+                        VuTransactionalSideEffectSink
+                            referenceEffects;
+                        VuTransactionalSideEffectSink
+                            nativeEffects;
+                        VuExecutionContext referenceContext =
+                            makeContext(
+                                referenceState,
+                                referenceFixture,
+                                referenceEffects);
+                        VuExecutionContext nativeContext =
+                            makeContext(
+                                nativeState,
+                                nativeFixture,
+                                nativeEffects);
+                        const VuRunResult referenceResult =
+                            reference.run(
+                                referenceContext, budget);
+                        const VuRunResult nativeResult =
+                            native.run(
+                                nativeContext, budget);
+                        const std::string prefix =
+                            std::string(testCase.name) +
+                            " budget " +
+                            std::to_string(budget) +
+                            ": ";
+                        t.IsTrue(
+                            sameRunResult(
+                                referenceResult,
+                                nativeResult),
+                            prefix + "run result differs");
+                        std::string difference;
+                        t.IsTrue(
+                            vuExecutionStatesEqual(
+                                referenceState,
+                                nativeState,
+                                &difference),
+                            prefix + "state differs at " +
+                                difference);
+                        if (budget == fullBudget)
+                        {
+                            t.Equals(
+                                referenceState.vi[11],
+                                int32_t{2},
+                                prefix +
+                                    "backup-visible branch marker");
+                        }
+                    }
                 }
             });
 

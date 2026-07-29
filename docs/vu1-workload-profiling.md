@@ -150,6 +150,25 @@ Do not compare timings from an analysis-check process with ordinary benchmark
 samples: CFG construction and the interpreter trace intentionally warm host
 caches before the measured benchmark starts.
 
+### Native pipeline specialization
+
+The native emitter carries exact delayed-pipeline facts forward within a
+compiled block. VU integer load/increment, store/increment, and MTIR
+instructions create a two-pair VI backup used by immediately following
+integer branches. Once the unknown entry countdown has drained, the emitter
+also knows the backed-up register identity. It can then:
+
+- refresh a still-active backup of the same register without testing its
+  countdown and register at runtime;
+- replace an inactive or different-register backup directly; and
+- select the delayed or live value for a branch without runtime state tests.
+
+Pipeline advancement still happens before pair execution, and the countdown,
+register, and value remain canonical in `VuExecutionState` at every point.
+Unknown entry state retains the dynamic checks. Exact budget-cut and split-run
+tests cover same-register refresh, different-register replacement, expiry,
+and backup-visible branch behavior.
+
 ## Generated-block attribution
 
 Two independent, opt-in facilities attribute native VU work. Both are
