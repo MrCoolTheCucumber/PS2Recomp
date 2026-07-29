@@ -6,6 +6,20 @@
 
 namespace GSRasterizerDetail
 {
+    enum class PackedSpriteKernelOverride : uint8_t
+    {
+        Automatic,
+        ForceReference,
+        ForceOptimized,
+    };
+
+    void setPackedSpriteKernelOverride(
+        PackedSpriteKernelOverride overrideMode);
+    PackedSpriteKernelOverride packedSpriteKernelOverride();
+    void resetPackedSpriteKernelDispatchCount();
+    uint64_t packedSpriteKernelDispatchCount();
+    void recordPackedSpriteKernelDispatch();
+
     struct LinearTextureTap
     {
         uint32_t raw = 0u;

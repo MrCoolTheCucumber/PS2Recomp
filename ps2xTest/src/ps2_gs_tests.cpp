@@ -327,6 +327,140 @@ namespace
                (static_cast<uint32_t>(channel(24u)) << 24u);
     }
 
+    struct PackedSpriteTestConfiguration
+    {
+        uint64_t frame =
+            (0ull << 0) |
+            (2ull << 16) |
+            (static_cast<uint64_t>(GS_PSM_CT32) << 24);
+        uint64_t zbuf =
+            (3ull << 0) |
+            (1ull << 32);
+        uint64_t scissor =
+            (0ull << 0) |
+            (127ull << 16) |
+            (0ull << 32) |
+            (63ull << 48);
+        uint64_t tex0 =
+            (96ull << 0) |
+            (2ull << 14) |
+            (static_cast<uint64_t>(GS_PSM_CT32) << 20) |
+            (7ull << 26) |
+            (6ull << 30) |
+            (1ull << 34) |
+            (1ull << 35);
+        uint64_t tex1 =
+            (1ull << 5) |
+            (1ull << 6);
+        uint64_t clamp = 0ull;
+        uint64_t test =
+            (1ull << 16) |
+            (1ull << 17);
+        uint64_t fba = 0ull;
+        uint64_t prim =
+            static_cast<uint64_t>(GS_PRIM_SPRITE) |
+            (1ull << 4) |
+            (1ull << 8);
+        uint64_t rgbaq = 0x3F80000010203040ull;
+        uint16_t x0 = 60u * 16u;
+        uint16_t y0 = 28u * 16u;
+        uint16_t x1 = 76u * 16u;
+        uint16_t y1 = 40u * 16u;
+        uint16_t u0 = 60u * 16u;
+        uint16_t v0 = 28u * 16u;
+        uint16_t u1 = 76u * 16u;
+        uint16_t v1 = 40u * 16u;
+    };
+
+    struct PackedSpriteRenderResult
+    {
+        std::vector<uint8_t> vram;
+        uint64_t packedDispatches = 0u;
+    };
+
+    PackedSpriteRenderResult renderPackedSpriteTest(
+        const PackedSpriteTestConfiguration &configuration,
+        GSRasterizerDetail::PackedSpriteKernelOverride overrideMode)
+    {
+        std::vector<uint8_t> vram(
+            PS2_GS_VRAM_SIZE, 0x5Au);
+        GS gs;
+        gs.init(
+            vram.data(),
+            static_cast<uint32_t>(vram.size()),
+            nullptr);
+
+        const uint32_t textureBase =
+            static_cast<uint32_t>(
+                configuration.tex0 & 0x3FFFu);
+        const uint32_t textureWidth =
+            static_cast<uint32_t>(
+                (configuration.tex0 >> 14u) & 0x3Fu);
+        const uint32_t textureSizeU =
+            1u << ((configuration.tex0 >> 26u) & 0xFu);
+        const uint32_t textureSizeV =
+            1u << ((configuration.tex0 >> 30u) & 0xFu);
+        for (uint32_t y = 0u; y < textureSizeV; ++y)
+        {
+            for (uint32_t x = 0u; x < textureSizeU; ++x)
+            {
+                const uint32_t color =
+                    ((0x40u + x * 17u + y * 3u) & 0xFFu) |
+                    (((0x20u + x * 5u + y * 29u) & 0xFFu)
+                     << 8u) |
+                    (((0xE0u - x * 11u - y * 7u) & 0xFFu)
+                     << 16u) |
+                    (((0x80u + x * 9u + y * 13u) & 0xFFu)
+                     << 24u);
+                gs.WriteVram(
+                    GS_PSM_CT32,
+                    textureBase,
+                    textureWidth,
+                    x,
+                    y,
+                    color);
+            }
+        }
+
+        GSRasterizerDetail::setPackedSpriteKernelOverride(
+            overrideMode);
+        GSRasterizerDetail::resetPackedSpriteKernelDispatchCount();
+
+        gs.writeRegister(GS_REG_FRAME_1, configuration.frame);
+        gs.writeRegister(GS_REG_ZBUF_1, configuration.zbuf);
+        gs.writeRegister(
+            GS_REG_SCISSOR_1, configuration.scissor);
+        gs.writeRegister(GS_REG_XYOFFSET_1, 0ull);
+        gs.writeRegister(GS_REG_TEST_1, configuration.test);
+        gs.writeRegister(GS_REG_FBA_1, configuration.fba);
+        gs.writeRegister(GS_REG_TEX0_1, configuration.tex0);
+        gs.writeRegister(GS_REG_TEX1_1, configuration.tex1);
+        gs.writeRegister(GS_REG_CLAMP_1, configuration.clamp);
+        gs.writeRegister(GS_REG_PRIM, configuration.prim);
+        gs.writeRegister(GS_REG_RGBAQ, configuration.rgbaq);
+        gs.writeRegister(
+            GS_REG_UV,
+            static_cast<uint64_t>(configuration.u0) |
+                (static_cast<uint64_t>(configuration.v0) << 16u));
+        gs.writeRegister(
+            GS_REG_XYZ2,
+            static_cast<uint64_t>(configuration.x0) |
+                (static_cast<uint64_t>(configuration.y0) << 16u));
+        gs.writeRegister(
+            GS_REG_UV,
+            static_cast<uint64_t>(configuration.u1) |
+                (static_cast<uint64_t>(configuration.v1) << 16u));
+        gs.writeRegister(
+            GS_REG_XYZ2,
+            static_cast<uint64_t>(configuration.x1) |
+                (static_cast<uint64_t>(configuration.y1) << 16u));
+
+        return {
+            std::move(vram),
+            GSRasterizerDetail::packedSpriteKernelDispatchCount(),
+        };
+    }
+
     void expectGuestHeapReusable(TestCase &t, PS2Runtime &runtime, const char *message)
     {
         const uint32_t expectedBase = runtime.guestHeapBase();
@@ -3191,6 +3325,334 @@ void register_ps2_gs_tests()
                     }
                 }
             }
+        });
+
+        tc.Run("GS packed CT32 DECAL sprite kernel matches the reference path", [](TestCase &t)
+        {
+            const PackedSpriteTestConfiguration configuration;
+            const PackedSpriteRenderResult reference =
+                renderPackedSpriteTest(
+                    configuration,
+                    GSRasterizerDetail::
+                        PackedSpriteKernelOverride::
+                            ForceReference);
+            const PackedSpriteRenderResult optimized =
+                renderPackedSpriteTest(
+                    configuration,
+                    GSRasterizerDetail::
+                        PackedSpriteKernelOverride::
+                            ForceOptimized);
+            GSRasterizerDetail::setPackedSpriteKernelOverride(
+                GSRasterizerDetail::PackedSpriteKernelOverride::
+                    Automatic);
+
+            t.Equals(
+                reference.packedDispatches,
+                uint64_t{0u},
+                "the forced reference path must not dispatch the packed kernel");
+            t.Equals(
+                optimized.packedDispatches,
+                uint64_t{1u},
+                "the eligible forced optimized draw must dispatch the packed kernel once");
+            t.IsTrue(
+                optimized.vram == reference.vram,
+                "the packed CT32 DECAL draw must match full reference VRAM");
+        });
+
+        tc.Run("GS packed sprite selector rejects states with extra pixel work", [](TestCase &t)
+        {
+            struct RejectionCase
+            {
+                const char *name;
+                void (*mutate)(
+                    PackedSpriteTestConfiguration &configuration);
+            };
+            const RejectionCase cases[] = {
+                {
+                    "point filter",
+                    [](PackedSpriteTestConfiguration &configuration)
+                    {
+                        configuration.tex1 = 0ull;
+                    },
+                },
+                {
+                    "mip level",
+                    [](PackedSpriteTestConfiguration &configuration)
+                    {
+                        configuration.tex1 |= 1ull << 2;
+                    },
+                },
+                {
+                    "U clamp",
+                    [](PackedSpriteTestConfiguration &configuration)
+                    {
+                        configuration.clamp = 1ull;
+                    },
+                },
+                {
+                    "U region clamp",
+                    [](PackedSpriteTestConfiguration &configuration)
+                    {
+                        configuration.clamp =
+                            2ull |
+                            (2ull << 4) |
+                            (100ull << 14);
+                    },
+                },
+                {
+                    "U region repeat",
+                    [](PackedSpriteTestConfiguration &configuration)
+                    {
+                        configuration.clamp =
+                            3ull |
+                            (0x7Full << 4) |
+                            (1ull << 14);
+                    },
+                },
+                {
+                    "V clamp",
+                    [](PackedSpriteTestConfiguration &configuration)
+                    {
+                        configuration.clamp = 1ull << 2;
+                    },
+                },
+                {
+                    "T8 texture",
+                    [](PackedSpriteTestConfiguration &configuration)
+                    {
+                        configuration.tex0 =
+                            (configuration.tex0 &
+                             ~(0x3Full << 20)) |
+                            (static_cast<uint64_t>(GS_PSM_T8)
+                             << 20);
+                    },
+                },
+                {
+                    "texture alpha disabled",
+                    [](PackedSpriteTestConfiguration &configuration)
+                    {
+                        configuration.tex0 &=
+                            ~(1ull << 34);
+                    },
+                },
+                {
+                    "MODULATE",
+                    [](PackedSpriteTestConfiguration &configuration)
+                    {
+                        configuration.tex0 &=
+                            ~(0x3ull << 35);
+                    },
+                },
+                {
+                    "STQ coordinates",
+                    [](PackedSpriteTestConfiguration &configuration)
+                    {
+                        configuration.prim &=
+                            ~(1ull << 8);
+                    },
+                },
+                {
+                    "fog",
+                    [](PackedSpriteTestConfiguration &configuration)
+                    {
+                        configuration.prim |=
+                            1ull << 5;
+                    },
+                },
+                {
+                    "alpha blend",
+                    [](PackedSpriteTestConfiguration &configuration)
+                    {
+                        configuration.prim |=
+                            1ull << 6;
+                    },
+                },
+                {
+                    "alpha test",
+                    [](PackedSpriteTestConfiguration &configuration)
+                    {
+                        configuration.test |=
+                            3ull;
+                    },
+                },
+                {
+                    "destination alpha test",
+                    [](PackedSpriteTestConfiguration &configuration)
+                    {
+                        configuration.test |=
+                            1ull << 14;
+                    },
+                },
+                {
+                    "depth comparison",
+                    [](PackedSpriteTestConfiguration &configuration)
+                    {
+                        configuration.test =
+                            (configuration.test &
+                             ~(0x3ull << 17)) |
+                            (2ull << 17);
+                    },
+                },
+                {
+                    "depth write",
+                    [](PackedSpriteTestConfiguration &configuration)
+                    {
+                        configuration.zbuf &=
+                            ~(1ull << 32);
+                    },
+                },
+                {
+                    "framebuffer mask",
+                    [](PackedSpriteTestConfiguration &configuration)
+                    {
+                        configuration.frame |=
+                            0x00FF0000ull << 32;
+                    },
+                },
+                {
+                    "FBA",
+                    [](PackedSpriteTestConfiguration &configuration)
+                    {
+                        configuration.fba = 1ull;
+                    },
+                },
+                {
+                    "CT16 framebuffer",
+                    [](PackedSpriteTestConfiguration &configuration)
+                    {
+                        configuration.frame =
+                            (configuration.frame &
+                             ~(0x3Full << 24)) |
+                            (static_cast<uint64_t>(
+                                 GS_PSM_CT16)
+                             << 24);
+                    },
+                },
+                {
+                    "untextured sprite",
+                    [](PackedSpriteTestConfiguration &configuration)
+                    {
+                        configuration.prim &=
+                            ~(1ull << 4);
+                    },
+                },
+            };
+
+            for (const RejectionCase &testCase : cases)
+            {
+                PackedSpriteTestConfiguration configuration;
+                testCase.mutate(configuration);
+                const PackedSpriteRenderResult reference =
+                    renderPackedSpriteTest(
+                        configuration,
+                        GSRasterizerDetail::
+                            PackedSpriteKernelOverride::
+                                ForceReference);
+                const PackedSpriteRenderResult optimized =
+                    renderPackedSpriteTest(
+                        configuration,
+                        GSRasterizerDetail::
+                            PackedSpriteKernelOverride::
+                                ForceOptimized);
+                const std::string prefix =
+                    std::string(testCase.name) + ": ";
+                t.Equals(
+                    optimized.packedDispatches,
+                    uint64_t{0u},
+                    prefix +
+                        "the selector must reject this state before dispatch");
+                t.IsTrue(
+                    optimized.vram == reference.vram,
+                    prefix +
+                        "forced optimized mode must fall back to exact reference output");
+            }
+            GSRasterizerDetail::setPackedSpriteKernelOverride(
+                GSRasterizerDetail::PackedSpriteKernelOverride::
+                    Automatic);
+        });
+
+        tc.Run("GS packed sprite kernel covers exact tap and overlap boundaries", [](TestCase &t)
+        {
+            struct DifferentialCase
+            {
+                const char *name;
+                PackedSpriteTestConfiguration configuration;
+            };
+            std::array<DifferentialCase, 6> cases;
+
+            cases[0].name = "four taps with negative biased origin";
+            cases[0].configuration =
+                PackedSpriteTestConfiguration{};
+
+            cases[1] = cases[0];
+            cases[1].name = "zero U weight";
+            cases[1].configuration.x0 -= 8u;
+            cases[1].configuration.x1 -= 8u;
+
+            cases[2] = cases[0];
+            cases[2].name = "zero V weight";
+            cases[2].configuration.y0 -= 8u;
+            cases[2].configuration.y1 -= 8u;
+
+            cases[3] = cases[0];
+            cases[3].name = "one tap";
+            cases[3].configuration.x0 -= 8u;
+            cases[3].configuration.x1 -= 8u;
+            cases[3].configuration.y0 -= 8u;
+            cases[3].configuration.y1 -= 8u;
+
+            cases[4] = cases[0];
+            cases[4].name =
+                "clipped partial lane groups across CT32 pages";
+            cases[4].configuration.scissor =
+                (63ull << 0) |
+                (70ull << 16) |
+                (29ull << 32) |
+                (37ull << 48);
+
+            cases[5] = cases[0];
+            cases[5].name =
+                "recursive framebuffer texture overlap";
+            cases[5].configuration.tex0 &=
+                ~0x3FFFull;
+            cases[5].configuration.x0 = 1u * 16u;
+            cases[5].configuration.x1 = 17u * 16u;
+            cases[5].configuration.y0 = 1u * 16u;
+            cases[5].configuration.y1 = 9u * 16u;
+            cases[5].configuration.u0 = 0u;
+            cases[5].configuration.u1 = 16u * 16u;
+            cases[5].configuration.v0 = 1u * 16u;
+            cases[5].configuration.v1 = 9u * 16u;
+
+            for (const DifferentialCase &testCase : cases)
+            {
+                const PackedSpriteRenderResult reference =
+                    renderPackedSpriteTest(
+                        testCase.configuration,
+                        GSRasterizerDetail::
+                            PackedSpriteKernelOverride::
+                                ForceReference);
+                const PackedSpriteRenderResult optimized =
+                    renderPackedSpriteTest(
+                        testCase.configuration,
+                        GSRasterizerDetail::
+                            PackedSpriteKernelOverride::
+                                ForceOptimized);
+                const std::string prefix =
+                    std::string(testCase.name) + ": ";
+                t.Equals(
+                    optimized.packedDispatches,
+                    uint64_t{1u},
+                    prefix +
+                        "the eligible draw must dispatch exactly once");
+                t.IsTrue(
+                    optimized.vram == reference.vram,
+                    prefix +
+                        "packed and reference paths must match full VRAM");
+            }
+            GSRasterizerDetail::setPackedSpriteKernelOverride(
+                GSRasterizerDetail::PackedSpriteKernelOverride::
+                    Automatic);
         });
 
         tc.Run("GS TEX1 linear filter blends T4 STQ triangle samples", [](TestCase &t)
