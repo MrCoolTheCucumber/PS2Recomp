@@ -126,6 +126,41 @@ than entering code compiled under a false invariant.
 The helper callback catches all exceptions. No C++ exception may unwind through
 generated code.
 
+## Block-local registers and XGKICK progression
+
+Normal blocks can retain a deterministic, pressure-ranked set of up to three
+VF registers in host SIMD registers. Exact block analysis supplies reads,
+writes, dirty lanes, liveness, and access counts. Dirty resident registers are
+written back before a canonical exit, link boundary, pair helper, or XGKICK
+helper; caller-clobbered residents are reloaded after a helper returns.
+Instrumented blocks always use canonical state. This experiment is disabled by
+default because its aggregate fixture gain did not meet the rollout gate. Set
+`PS2X_VU_BLOCK_LOCAL_VF_REGISTERS=1` before backend creation to enable it for
+profiling or controlled A/B work. The selected mode is part of cache and link
+identity.
+
+VU1 normal blocks inline the common retained-XGKICK progression by default.
+The generated path accepts exactly one earned qword when a tag is already
+loaded, more than its final qword remains, both source and destination spans
+are contiguous, and packet storage was prepared by the helper. It copies the
+current VU data, advances the ring address and logical packet size by 16
+bytes, consumes two-cycle credit, and publishes no PATH1 effect.
+
+The packet backing store may be prepared for the complete current GIF tag, but
+its public size and iteration range expose only bytes earned at the current
+pair boundary. Future source bytes are never copied early, so an intervening
+static or dynamic VU store remains visible. Tag parsing, ring wrap, the final
+qword and EOP publication, malformed chains, a second XGKICK, and final flush
+remain in the semantic helper. No multi-pair batching is performed without an
+alias proof.
+
+One shared generated progression subroutine per block bounds code growth and
+avoids duplicating the copy body in the full and precise forms. VU0 and
+instrumented namespaces retain helper progression. Set
+`PS2X_VU_INLINE_XGKICK=0` before backend creation for the exact helper-only
+diagnostic path. The mode is part of cache/link identity and appears in
+benchmark, debugger, and perf-symbol diagnostics.
+
 ## Code ownership and invalidation
 
 Xbyak emits into ordinary read/write vector storage. Final bytes are copied
@@ -215,6 +250,9 @@ Focused tests cover:
 - transactional runtime verification, unsupported-pair fallback, one-time
   PATH1 publication, and compact first-mismatch diagnostics;
 - retained XGKICK progress across a native side exit;
+- prepared non-wrapping XGKICK copies, every budget cut, one-cycle splits,
+  same-pair stores, mutation of future source bytes, wrap fallback, and final
+  PATH1 publication;
 - a code-generation change made by a helper;
 - rejection of an impossible VI-backup countdown before pipeline
   specialization;

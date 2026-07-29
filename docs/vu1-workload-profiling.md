@@ -189,6 +189,11 @@ confused with new code at a reused host address.
 - executions and guest pairs;
 - full-budget and precise bounded entries;
 - linked edges and helper barriers;
+- resident/dirty VF counts, maximum live pressure, and allocated-access
+  coverage;
+- canonical loads/stores, helper spill/reload traffic, and materialization
+  counts split by canonical exit, link boundary, pair helper, and XGKICK
+  helper;
 - every native exit reason;
 - static IR opcode counts, native range and byte size; and
 - JIT code indices and whether the cache allocation is still resident.

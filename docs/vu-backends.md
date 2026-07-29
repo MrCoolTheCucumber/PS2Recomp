@@ -111,7 +111,8 @@ unit's requested mode, resolved mode, backend name, active state, and native
 instrumentation setting. At a debugger pause boundary, the GameThread or the
 quiescent guest-execution lock also publishes the current PC, last exit reason,
 issued cycles, cache/compile counters, normal/instrumented native
-pair/exit/fallback counters, and verify run/comparison/publication/mismatch
-counters. The first mismatch text is included when present. These snapshots
-keep owner-only cache state out of the debugger thread while the guest is
-running.
+pair/exit/fallback counters, block-linking and budget-guard policy,
+block-local-VF and inline-XGKICK policy, and verify
+run/comparison/publication/mismatch counters. The first mismatch text is
+included when present. These snapshots keep owner-only cache state out of the
+debugger thread while the guest is running.
