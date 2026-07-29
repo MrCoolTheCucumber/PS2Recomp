@@ -26,6 +26,10 @@
 #include <string>
 #include <vector>
 
+#if defined(__SSE__)
+#include <xmmintrin.h>
+#endif
+
 struct VuVerifyTestAccess
 {
     static std::string formatSyntheticMismatch(
@@ -3794,7 +3798,47 @@ void register_ps2_vu1_tests()
                 setFloatBits(vu1.state().acc[lane], accBits[lane]);
             }
 
-            const int hostRoundingMode = std::fegetround();
+            const int originalHostRoundingMode =
+                std::fegetround();
+#if defined(__SSE__)
+            const uint32_t originalMxcsr = _mm_getcsr();
+#endif
+            struct HostFloatModeRestore
+            {
+                int roundingMode;
+#if defined(__SSE__)
+                uint32_t mxcsr;
+#endif
+
+                ~HostFloatModeRestore()
+                {
+                    if (roundingMode != -1)
+                        std::fesetround(roundingMode);
+#if defined(__SSE__)
+                    _mm_setcsr(mxcsr);
+#endif
+                }
+            };
+            const HostFloatModeRestore restore{
+                originalHostRoundingMode,
+#if defined(__SSE__)
+                originalMxcsr,
+#endif
+            };
+
+            t.Equals(
+                std::fesetround(FE_UPWARD), 0,
+                "the host upward rounding probe should be supported");
+#if defined(__SSE__)
+            constexpr uint32_t kDenormalsAreZero =
+                1u << 6u;
+            constexpr uint32_t kFlushToZero =
+                1u << 15u;
+            const uint32_t probeMxcsr =
+                _mm_getcsr() &
+                ~(kDenormalsAreZero | kFlushToZero);
+            _mm_setcsr(probeMxcsr);
+#endif
             vu1.execute(fx.code, PS2_VU1_CODE_SIZE,
                         fx.data, PS2_VU1_DATA_SIZE,
                         fx.gs, &fx.mem, 0u, 0u, 0u, 1u);
@@ -3804,8 +3848,14 @@ void register_ps2_vu1_tests()
                 t.Equals(getFloatBits(vu1.state().acc[lane]), expectedBits[lane],
                          "MADDA should truncate its result toward zero");
             }
-            t.Equals(std::fegetround(), hostRoundingMode,
-                     "VU execution should restore the caller's rounding mode");
+            t.Equals(
+                std::fegetround(), FE_UPWARD,
+                "VU execution should restore the caller's x87 rounding mode");
+#if defined(__SSE__)
+            t.Equals(
+                _mm_getcsr(), probeMxcsr,
+                "VU execution should restore the caller's exact MXCSR");
+#endif
         });
 
         tc.Run("VU MADD retains the product through the truncated accumulator add", [](TestCase &t)

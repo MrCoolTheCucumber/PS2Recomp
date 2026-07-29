@@ -169,6 +169,21 @@ Unknown entry state retains the dynamic checks. Exact budget-cut and split-run
 tests cover same-register refresh, different-register replacement, expiry,
 and backup-visible branch behavior.
 
+### Host floating-point scope
+
+VU execution sets round-toward-zero for both the x87 control word and MXCSR,
+and enables MXCSR denormals-are-zero and flush-to-zero. The caller's exact
+state is restored when the backend invocation returns. GNU-family x86 builds
+save and update those two control fields directly; other supported hosts use
+the standard floating-environment interface plus the available SIMD control
+interface.
+
+The internal native fast entry relies on that backend scope. The stable raw
+native entry still establishes and restores its own MXCSR mode because callers
+can invoke it without the backend adapter. Tests begin from a non-default x87
+rounding mode and an MXCSR with DAZ/FTZ clear, verify VU truncation, and require
+both caller states to be restored exactly.
+
 ## Generated-block attribution
 
 Two independent, opt-in facilities attribute native VU work. Both are
