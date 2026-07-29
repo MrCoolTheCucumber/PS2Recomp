@@ -254,6 +254,11 @@ public:
     {
         return m_blockLocalVfRegistersEnabled;
     }
+    [[nodiscard]] bool
+    blockLocalVfRegistersAutomatic() const
+    {
+        return m_blockLocalVfRegistersAutomatic;
+    }
     [[nodiscard]] bool inlineXgkickEnabled() const
     {
         return m_inlineXgkickEnabled;
@@ -345,7 +350,8 @@ private:
     VuNativeChainRuntime m_chainRuntime{};
     bool m_blockLinkingEnabled = true;
     bool m_blockBudgetGuardsEnabled = true;
-    bool m_blockLocalVfRegistersEnabled = false;
+    bool m_blockLocalVfRegistersEnabled = true;
+    bool m_blockLocalVfRegistersAutomatic = true;
     bool m_inlineXgkickEnabled = false;
     bool m_blockProfilingEnabled = false;
     size_t m_maximumBlockProfiles = 0u;

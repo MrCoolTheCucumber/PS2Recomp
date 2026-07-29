@@ -811,6 +811,75 @@ struct PS2DebugServer::Impl
             "helper_barriers",
             block.helperBarriers,
             allocator);
+        result.AddMember(
+            "resident_vf_registers",
+            block.residentVfRegisters,
+            allocator);
+        result.AddMember(
+            "resident_vf_dirty_registers",
+            block.residentVfDirtyRegisters,
+            allocator);
+        result.AddMember(
+            "resident_vf_dirty_lanes",
+            block.residentVfDirtyLanes,
+            allocator);
+        result.AddMember(
+            "maximum_live_vf_registers",
+            block.maximumLiveVfRegisters,
+            allocator);
+        result.AddMember(
+            "vf_accesses",
+            block.vfAccesses,
+            allocator);
+        result.AddMember(
+            "allocated_vf_accesses",
+            block.allocatedVfAccesses,
+            allocator);
+        result.AddMember(
+            "vf_register_loads",
+            block.vfRegisterLoads,
+            allocator);
+        result.AddMember(
+            "vf_register_stores",
+            block.vfRegisterStores,
+            allocator);
+        result.AddMember(
+            "vf_register_spills",
+            block.vfRegisterSpills,
+            allocator);
+        result.AddMember(
+            "vf_register_reloads",
+            block.vfRegisterReloads,
+            allocator);
+
+        Value materializations(
+            rapidjson::kObjectType);
+        static_assert(
+            kVuRegisterMaterializationCauseCount ==
+            std::tuple_size_v<
+                decltype(
+                    block.registerMaterializations)>);
+        for (size_t cause = 0u;
+             cause <
+                 block.registerMaterializations.size();
+             ++cause)
+        {
+            Value causeName =
+                makeString(
+                    vuRegisterMaterializationCauseName(
+                        static_cast<
+                            VuRegisterMaterializationCause>(
+                            cause)),
+                    allocator);
+            materializations.AddMember(
+                causeName,
+                block.registerMaterializations[cause],
+                allocator);
+        }
+        result.AddMember(
+            "register_materializations",
+            materializations,
+            allocator);
 
         Value exits(rapidjson::kObjectType);
         static_assert(
@@ -1046,6 +1115,10 @@ struct PS2DebugServer::Impl
                 recompiler.AddMember(
                     "block_local_vf_registers_enabled",
                     source.blockLocalVfRegistersEnabled,
+                    allocator);
+                recompiler.AddMember(
+                    "block_local_vf_registers_automatic",
+                    source.blockLocalVfRegistersAutomatic,
                     allocator);
                 recompiler.AddMember(
                     "inline_xgkick_enabled",

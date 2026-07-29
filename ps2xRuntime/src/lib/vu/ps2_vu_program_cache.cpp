@@ -404,6 +404,13 @@ bool VuProgramCache::validKey(
             "VU cache entry PC is outside its code extent",
             diagnostic);
     }
+    if (key.blockLocalVfRegistersAutomatic &&
+        !key.blockLocalVfRegisters)
+    {
+        return fail(
+            "automatic VU register allocation requires register-resident code",
+            diagnostic);
+    }
     if (diagnostic)
         diagnostic->clear();
     return true;
@@ -457,6 +464,9 @@ size_t VuProgramCache::KeyHash::operator()(
                    key.blockLocalVfRegisters));
     hashCombine(
         value, std::hash<bool>{}(
+                   key.blockLocalVfRegistersAutomatic));
+    hashCombine(
+        value, std::hash<bool>{}(
                    key.inlineXgkick));
     return value;
 }
@@ -484,6 +494,8 @@ bool VuProgramCache::sameProgramIdentity(
         left.blockForm != right.blockForm ||
         left.blockLocalVfRegisters !=
             right.blockLocalVfRegisters ||
+        left.blockLocalVfRegistersAutomatic !=
+            right.blockLocalVfRegistersAutomatic ||
         left.inlineXgkick !=
             right.inlineXgkick)
     {

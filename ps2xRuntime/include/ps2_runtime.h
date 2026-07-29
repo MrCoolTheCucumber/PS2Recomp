@@ -599,6 +599,18 @@ public:
             uint64_t boundedEntries = 0u;
             uint64_t linkedEdges = 0u;
             uint64_t helperBarriers = 0u;
+            uint32_t residentVfRegisters = 0u;
+            uint32_t residentVfDirtyRegisters = 0u;
+            uint32_t residentVfDirtyLanes = 0u;
+            uint32_t maximumLiveVfRegisters = 0u;
+            uint32_t vfAccesses = 0u;
+            uint32_t allocatedVfAccesses = 0u;
+            uint64_t vfRegisterLoads = 0u;
+            uint64_t vfRegisterStores = 0u;
+            uint64_t vfRegisterSpills = 0u;
+            uint64_t vfRegisterReloads = 0u;
+            std::array<uint64_t, 4u>
+                registerMaterializations{};
             std::array<uint64_t, 10u> exitReasons{};
             std::vector<BlockOpcodeCount> opcodeCounts;
             std::vector<BlockJitRegistration>
@@ -608,6 +620,7 @@ public:
         bool blockLinkingEnabled = false;
         bool blockBudgetGuardsEnabled = false;
         bool blockLocalVfRegistersEnabled = false;
+        bool blockLocalVfRegistersAutomatic = false;
         bool inlineXgkickEnabled = false;
         uint64_t nativeEntries = 0u;
         uint64_t nativeBlocks = 0u;

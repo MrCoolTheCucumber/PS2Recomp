@@ -243,15 +243,32 @@ void register_ps2_debug_control_tests()
                 uint64_t{0u},
                 "the focused debugger profile should not drop blocks");
             uint64_t profiledPairs = 0u;
+            uint64_t profiledRegisterTraffic = 0u;
             for (const auto &block :
                  snapshots[1u].recompiler
                      .blockProfiles)
             {
                 profiledPairs += block.guestPairs;
+                profiledRegisterTraffic +=
+                    block.vfRegisterLoads +
+                    block.vfRegisterStores +
+                    block.vfRegisterSpills +
+                    block.vfRegisterReloads;
+                t.IsTrue(
+                    block.allocatedVfAccesses <=
+                        block.vfAccesses,
+                    "debugger VF allocations should be a subset of accesses");
+                t.IsTrue(
+                    block.residentVfDirtyRegisters <=
+                        block.residentVfRegisters,
+                    "debugger dirty VFs should be resident");
             }
             t.Equals(
                 profiledPairs, uint64_t{2u},
                 "quiescent debugger blocks should report exact native work");
+            t.Equals(
+                profiledRegisterTraffic, uint64_t{0u},
+                "the NOP debugger fixture should report no VF traffic");
             t.Equals(
                 snapshots[1u].verify.runs,
                 uint64_t{1u},

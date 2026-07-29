@@ -341,7 +341,12 @@ struct VuAnalysisRegisterAllocation
 allocateVuAnalysisRegisters(
     const VuAnalysisBlock &block,
     uint8_t maximumVfRegisters,
-    uint8_t maximumViRegisters = 0u);
+    uint8_t maximumViRegisters = 0u,
+    bool requireVfMemoryTrafficReduction = false);
+[[nodiscard]] bool
+vuAnalysisVfAllocationAmortizesBoundaries(
+    const VuAnalysisRegisterAllocation &allocation,
+    uint32_t minimumAccessesPerBoundaryOperation);
 
 [[nodiscard]] bool vuAnalysisCanInlineUpperOpcode(
     VuIrOpcode opcode, uint64_t hostFeatures);

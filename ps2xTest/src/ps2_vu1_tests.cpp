@@ -2791,6 +2791,40 @@ void register_ps2_vu1_tests()
                 allocation.spilledVfRegisters,
                 uint32_t{1u},
                 "one candidate should remain in canonical memory");
+
+            const VuAnalysisRegisterAllocation
+                profitableAllocation =
+                    allocateVuAnalysisRegisters(
+                        block, 3u, 0u, true);
+            t.Equals(
+                profitableAllocation.vfRegisterCount,
+                uint8_t{2u},
+                "automatic assignment should exclude traffic-neutral VFs");
+            t.Equals(
+                profitableAllocation.vfHostSlots[2u],
+                uint8_t{0u},
+                "a one-use read-only VF should remain canonical");
+            t.Equals(
+                profitableAllocation.allocatedVfAccesses,
+                uint32_t{8u},
+                "automatic assignment should retain only profitable accesses");
+            t.Equals(
+                profitableAllocation.spilledVfRegisters,
+                uint32_t{1u},
+                "traffic-neutral candidates should remain counted as spilled");
+            t.IsTrue(
+                vuAnalysisVfAllocationAmortizesBoundaries(
+                    profitableAllocation, 2u),
+                "eight uses should amortize three boundary operations twice");
+            t.IsFalse(
+                vuAnalysisVfAllocationAmortizesBoundaries(
+                    profitableAllocation, 3u),
+                "eight uses should not amortize three boundary operations three times");
+            t.IsFalse(
+                vuAnalysisVfAllocationAmortizesBoundaries(
+                    VuAnalysisRegisterAllocation{},
+                    0u),
+                "an empty allocation should never be profitable");
             t.Equals(
                 allocation.viRegisterCount,
                 uint8_t{1u},

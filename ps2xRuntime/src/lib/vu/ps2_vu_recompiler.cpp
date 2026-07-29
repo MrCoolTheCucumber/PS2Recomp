@@ -84,6 +84,8 @@ namespace
         1099511628211ull;
     constexpr size_t kDefaultMaximumBlockProfiles =
         16384u;
+    constexpr uint32_t
+        kAutomaticVfAccessesPerBoundaryOperation = 5u;
     std::atomic<uint64_t> g_nextCompilationIdentity{1u};
 
     bool environmentFlagEnabled(const char *value)
@@ -4728,7 +4730,10 @@ std::string vuPerfJitSymbolName(
                 ? "basic" : "linear")
         << "-vfreg-"
         << (key.blockLocalVfRegisters
-                ? "resident" : "canonical")
+                ? (key.blockLocalVfRegistersAutomatic
+                        ? "resident-auto"
+                        : "resident-forced")
+                : "canonical")
         << "-xgkick-"
         << (key.inlineXgkick
                 ? "inline" : "helper")
@@ -4764,10 +4769,18 @@ VuRecompilerBackend::VuRecompilerBackend(
     const char *const blockLocalVfRegisters =
         std::getenv(
             "PS2X_VU_BLOCK_LOCAL_VF_REGISTERS");
+    const bool automaticBlockLocalVfRegisters =
+        !blockLocalVfRegisters ||
+        std::strcmp(
+            blockLocalVfRegisters, "auto") == 0 ||
+        std::strcmp(
+            blockLocalVfRegisters, "AUTO") == 0;
     m_blockLocalVfRegistersEnabled =
-        blockLocalVfRegisters &&
+        automaticBlockLocalVfRegisters ||
         environmentFlagEnabled(
             blockLocalVfRegisters);
+    m_blockLocalVfRegistersAutomatic =
+        automaticBlockLocalVfRegisters;
     const char *const inlineXgkick =
         std::getenv("PS2X_VU_INLINE_XGKICK");
     m_inlineXgkickEnabled =
@@ -5152,6 +5165,9 @@ bool VuRecompilerBackend::programKey(
                 : VuIrBlockForm::LinearTrace,
         .blockLocalVfRegisters =
             m_blockLocalVfRegistersEnabled &&
+            mode == VuCompilationMode::Normal,
+        .blockLocalVfRegistersAutomatic =
+            m_blockLocalVfRegistersAutomatic &&
             mode == VuCompilationMode::Normal,
         .inlineXgkick =
             m_inlineXgkickEnabled &&
@@ -6192,7 +6208,30 @@ bool VuRecompilerBackend::compile(
         }
         registerAllocation =
             allocateVuAnalysisRegisters(
-                analysis, 3u, 0u);
+                analysis, 3u, 0u,
+                m_blockLocalVfRegistersAutomatic);
+        if (m_blockLocalVfRegistersAutomatic &&
+            !vuAnalysisVfAllocationAmortizesBoundaries(
+                registerAllocation,
+                kAutomaticVfAccessesPerBoundaryOperation))
+        {
+            for (uint8_t slot = 0u;
+                 slot <
+                     registerAllocation.
+                         vfRegisterCount;
+                 ++slot)
+            {
+                const uint8_t reg =
+                    registerAllocation.
+                        vfRegisters[slot];
+                registerAllocation.
+                    vfHostSlots[reg] = 0u;
+            }
+            registerAllocation.vfRegisterCount = 0u;
+            registerAllocation.allocatedVfAccesses = 0u;
+            registerAllocation.spilledVfRegisters =
+                registerAllocation.candidateVfRegisters;
+        }
     }
 
     try

@@ -634,6 +634,99 @@ void register_ps2_vu_recompiler_tests()
                     "the explicit opt-out should retain helper progression");
             });
 
+        tc.Run(
+            "block-local VF automatic policy remains selectable",
+            [](TestCase &t)
+            {
+                if (!VuRecompilerBackend::supported())
+                    return;
+
+                ScopedEnvironmentVariable registers(
+                    "PS2X_VU_BLOCK_LOCAL_VF_REGISTERS");
+                registers.unset();
+
+                VuNativeFixture fixture;
+                t.IsTrue(
+                    fixture.initialize(),
+                    "VU memory fixture should initialize");
+                VuUnit unit(VuUnitId::Vu1);
+                VuRecompilerBackend backend(unit);
+                VuExecutionState state =
+                    initialSyntheticState();
+                VuTransactionalSideEffectSink effects;
+                VuExecutionContext context =
+                    makeContext(state, fixture, effects);
+                VuProgramKey key;
+                std::string diagnostic;
+
+                t.IsTrue(
+                    backend.programKey(
+                        context,
+                        VuCompilationMode::Normal,
+                        key, &diagnostic),
+                    "XGKICK-free code should produce an automatic key: " +
+                        diagnostic);
+                t.IsTrue(
+                    key.blockLocalVfRegisters,
+                    "automatic mode should select block-local VF analysis");
+                t.IsTrue(
+                    key.blockLocalVfRegistersAutomatic,
+                    "the default key should identify automatic allocation");
+
+                state.pipeline.xgkick.active = true;
+                t.IsTrue(
+                    backend.programKey(
+                        context,
+                        VuCompilationMode::Normal,
+                        key, &diagnostic),
+                    "active XGKICK should produce an automatic key: " +
+                        diagnostic);
+                t.IsTrue(
+                    key.blockLocalVfRegisters,
+                    "automatic policy should be based on block traffic");
+                t.IsTrue(
+                    key.blockLocalVfRegistersAutomatic,
+                    "active XGKICK should not change the automatic policy");
+
+                state.pipeline.xgkick.active = true;
+                registers.set("1");
+                VuUnit forcedUnit(VuUnitId::Vu1);
+                VuRecompilerBackend forcedBackend(
+                    forcedUnit);
+                t.IsTrue(
+                    forcedBackend.programKey(
+                        context,
+                        VuCompilationMode::Normal,
+                        key, &diagnostic),
+                    "forced active XGKICK should produce a key: " +
+                        diagnostic);
+                t.IsTrue(
+                    key.blockLocalVfRegisters,
+                    "explicit opt-in should still cover active XGKICK");
+                t.IsFalse(
+                    key.blockLocalVfRegistersAutomatic,
+                    "explicit opt-in should identify forced allocation");
+
+                registers.set("0");
+                VuUnit disabledUnit(VuUnitId::Vu1);
+                VuRecompilerBackend disabledBackend(
+                    disabledUnit);
+                state.pipeline.xgkick.active = false;
+                t.IsTrue(
+                    disabledBackend.programKey(
+                        context,
+                        VuCompilationMode::Normal,
+                        key, &diagnostic),
+                    "disabled inactive XGKICK should produce a key: " +
+                        diagnostic);
+                t.IsFalse(
+                    key.blockLocalVfRegisters,
+                    "explicit opt-out should keep canonical VF state");
+                t.IsFalse(
+                    key.blockLocalVfRegistersAutomatic,
+                    "explicit opt-out should not carry an allocation policy");
+            });
+
         tc.Run("synthetic block matches every cycle-budget cut",
             [](TestCase &t)
             {

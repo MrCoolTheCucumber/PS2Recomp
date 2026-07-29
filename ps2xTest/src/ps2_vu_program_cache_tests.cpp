@@ -235,6 +235,10 @@ void register_ps2_vu_program_cache_tests()
                 VuProgramKey registerKey = firstKey;
                 registerKey.blockLocalVfRegisters =
                     true;
+                VuProgramKey automaticRegisterKey =
+                    registerKey;
+                automaticRegisterKey.
+                    blockLocalVfRegistersAutomatic = true;
                 VuProgramKey xgkickKey = firstKey;
                 xgkickKey.inlineXgkick = true;
 
@@ -257,6 +261,10 @@ void register_ps2_vu_program_cache_tests()
                     cache.lookup(registerKey).valid(),
                     "canonical and register-resident blocks should not alias");
                 t.IsFalse(
+                    cache.lookup(
+                        automaticRegisterKey).valid(),
+                    "forced and automatic register allocation should not alias");
+                t.IsFalse(
                     cache.lookup(xgkickKey).valid(),
                     "helper and inline XGKICK blocks should not alias");
                 t.IsNotNull(
@@ -269,8 +277,8 @@ void register_ps2_vu_program_cache_tests()
                     stats.hits, uint64_t{1u},
                     "one warm lookup should be recorded");
                 t.Equals(
-                    stats.misses, uint64_t{8u},
-                    "cold and seven distinct keys should be misses");
+                    stats.misses, uint64_t{9u},
+                    "cold and eight distinct keys should be misses");
                 t.Equals(
                     stats.compilations, uint64_t{1u},
                     "duplicate insertion should not count as compilation");
@@ -482,6 +490,27 @@ void register_ps2_vu_program_cache_tests()
                         registerTarget) ==
                         VuProgramLinkResult::Incompatible,
                     "canonical links must not enter register-resident blocks");
+                VuProgramKey automaticRegisterTarget =
+                    registerTarget;
+                automaticRegisterTarget.
+                    blockLocalVfRegistersAutomatic = true;
+                const VuProgramHandle
+                    automaticRegisterTargetHandle =
+                        cache.insert(
+                            makeLinkedProgram(
+                                automaticRegisterTarget,
+                                backendIdentity));
+                t.IsTrue(
+                    cache.populateLink(
+                        registerTargetHandle.valid()
+                            ? cache.resolve(
+                                  registerTargetHandle)->
+                                  outgoingLinks.get()
+                            : nullptr,
+                        automaticRegisterTargetHandle,
+                        automaticRegisterTarget) ==
+                        VuProgramLinkResult::Incompatible,
+                    "forced links must not enter automatic register-allocation blocks");
                 VuProgramKey xgkickTarget =
                     normalTarget;
                 xgkickTarget.inlineXgkick = true;
@@ -534,7 +563,7 @@ void register_ps2_vu_program_cache_tests()
                 t.Equals(
                     cache.diagnostics().
                         linkResolutionFailures,
-                    uint64_t{7u},
+                    uint64_t{8u},
                     "every incompatible attempt should be counted");
             });
 
@@ -833,6 +862,13 @@ void register_ps2_vu_program_cache_tests()
                     VuProgramCache::validKey(
                         invalid, &diagnostic),
                     "unaligned entry PC should be rejected");
+                invalid = key;
+                invalid.blockLocalVfRegistersAutomatic =
+                    true;
+                t.IsFalse(
+                    VuProgramCache::validKey(
+                        invalid, &diagnostic),
+                    "automatic allocation without resident code should be rejected");
 
                 VuProgramCache cache(VuUnitId::Vu1);
                 VuProgramKey wrongUnit = key;

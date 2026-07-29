@@ -1819,7 +1819,8 @@ VuAnalysisRegisterAllocation
 allocateVuAnalysisRegisters(
     const VuAnalysisBlock &block,
     uint8_t maximumVfRegisters,
-    uint8_t maximumViRegisters)
+    uint8_t maximumViRegisters,
+    bool requireVfMemoryTrafficReduction)
 {
     VuAnalysisRegisterAllocation allocation;
     allocation.maximumVfRegisters =
@@ -1910,6 +1911,16 @@ allocateVuAnalysisRegisters(
         {
             break;
         }
+        const uint32_t residentMemoryAccesses =
+            1u +
+            (allocation.vfDirtyLanes[reg] != 0u
+                    ? 1u
+                    : 0u);
+        if (requireVfMemoryTrafficReduction &&
+            accesses[reg] <= residentMemoryAccesses)
+        {
+            continue;
+        }
         const uint8_t slot =
             allocation.vfRegisterCount++;
         allocation.vfHostSlots[reg] =
@@ -1981,6 +1992,32 @@ allocateVuAnalysisRegisters(
         allocation.candidateViRegisters -
         allocation.viRegisterCount;
     return allocation;
+}
+
+bool vuAnalysisVfAllocationAmortizesBoundaries(
+    const VuAnalysisRegisterAllocation &allocation,
+    uint32_t minimumAccessesPerBoundaryOperation)
+{
+    uint32_t boundaryOperations =
+        allocation.vfRegisterCount;
+    for (uint8_t slot = 0u;
+         slot < allocation.vfRegisterCount;
+         ++slot)
+    {
+        const uint8_t reg =
+            allocation.vfRegisters[slot];
+        boundaryOperations +=
+            allocation.vfDirtyLanes[reg] != 0u
+                ? 1u
+                : 0u;
+    }
+    return
+        boundaryOperations != 0u &&
+        static_cast<uint64_t>(
+            allocation.allocatedVfAccesses) >=
+            static_cast<uint64_t>(
+                minimumAccessesPerBoundaryOperation) *
+                boundaryOperations;
 }
 
 bool vuAnalysisCanInlineUpperOpcode(

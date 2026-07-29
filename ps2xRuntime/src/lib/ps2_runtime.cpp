@@ -6706,6 +6706,9 @@ void PS2Runtime::debugPublishVuBackendDiagnostics()
                     .blockLocalVfRegistersEnabled =
                         backend->
                             blockLocalVfRegistersEnabled(),
+                    .blockLocalVfRegistersAutomatic =
+                        backend->
+                            blockLocalVfRegistersAutomatic(),
                     .inlineXgkickEnabled =
                         backend->inlineXgkickEnabled(),
                     .nativeEntries = source.nativeEntries,
@@ -6834,6 +6837,28 @@ void PS2Runtime::debugPublishVuBackendDiagnostics()
                                 block.linkedEdges,
                             .helperBarriers =
                                 block.helperBarriers,
+                            .residentVfRegisters =
+                                block.residentVfRegisters,
+                            .residentVfDirtyRegisters =
+                                block.residentVfDirtyRegisters,
+                            .residentVfDirtyLanes =
+                                block.residentVfDirtyLanes,
+                            .maximumLiveVfRegisters =
+                                block.maximumLiveVfRegisters,
+                            .vfAccesses =
+                                block.vfAccesses,
+                            .allocatedVfAccesses =
+                                block.allocatedVfAccesses,
+                            .vfRegisterLoads =
+                                block.vfRegisterLoads,
+                            .vfRegisterStores =
+                                block.vfRegisterStores,
+                            .vfRegisterSpills =
+                                block.vfRegisterSpills,
+                            .vfRegisterReloads =
+                                block.vfRegisterReloads,
+                            .registerMaterializations =
+                                block.registerMaterializations,
                             .exitReasons =
                                 block.exitReasons,
                         };
