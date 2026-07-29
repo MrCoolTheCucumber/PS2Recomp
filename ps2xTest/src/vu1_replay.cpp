@@ -802,6 +802,19 @@ int main(int argc, char **argv)
             << ",\"incompatible_link_exits\":"
             << recompilerDiagnostics
                    .incompatibleLinkExits
+            << ",\"full_block_guards\":"
+            << recompilerDiagnostics.fullBlockGuards
+            << ",\"precise_tail_entries\":"
+            << recompilerDiagnostics.preciseTailEntries
+            << ",\"full_guard_pairs\":"
+            << recompilerDiagnostics.fullGuardPairs
+            << ",\"precise_tail_pairs\":"
+            << recompilerDiagnostics.preciseTailPairs
+            << ",\"budget_guard_comparisons\":"
+            << recompilerDiagnostics
+                   .budgetGuardComparisons
+            << ",\"native_budget_exits\":"
+            << recompilerDiagnostics.nativeBudgetExits
             << ",\"block_completes\":"
             << recompilerDiagnostics.blockCompletes
             << ",\"cycle_budget_exits\":"

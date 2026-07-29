@@ -53,6 +53,11 @@ namespace
             setenv(m_name.c_str(), value, 1);
         }
 
+        void unset()
+        {
+            unsetenv(m_name.c_str());
+        }
+
         ScopedEnvironmentVariable(
             const ScopedEnvironmentVariable &) = delete;
         ScopedEnvironmentVariable &operator=(
@@ -645,7 +650,302 @@ void register_ps2_vu_recompiler_tests()
                     t.Equals(diagnostics.inlinePairs + diagnostics.helperPairs,
                         diagnostics.nativePairs,
                         "native pair accounting should be complete");
+                    t.Equals(
+                        diagnostics.fullBlockGuards +
+                            diagnostics.preciseTailEntries,
+                        diagnostics.nativeBlocks,
+                        "every native block should select one budget path");
+                    t.Equals(
+                        diagnostics.fullGuardPairs +
+                            diagnostics.preciseTailPairs,
+                        diagnostics.nativePairs,
+                        "every native pair should have one budget class");
+                    if (native.blockBudgetGuardsEnabled())
+                    {
+                        t.IsTrue(
+                            diagnostics.fullBlockGuards > 0u &&
+                                diagnostics.preciseTailEntries > 0u,
+                            "the sweep should exercise full and precise paths");
+                    }
+                    else
+                    {
+                        t.Equals(
+                            diagnostics.fullBlockGuards,
+                            uint64_t{0u},
+                            "the legacy sweep should emit no full guards");
+                    }
                 }
+            });
+
+        tc.Run(
+            "block-budget guard switch retains the precise checked form",
+            [](TestCase &t)
+            {
+                if (!VuRecompilerBackend::supported())
+                    return;
+
+                VuNativeFixture guardedFixture;
+                VuNativeFixture legacyFixture;
+                t.IsTrue(
+                    guardedFixture.initialize(),
+                    "guarded memory should initialize");
+                t.IsTrue(
+                    legacyFixture.initialize(),
+                    "legacy memory should initialize");
+                for (uint32_t pair = 0u;
+                     pair < 64u; ++pair)
+                {
+                    writePair(
+                        guardedFixture.code,
+                        pair * 8u,
+                        makeVuIaddiu(1u, 1u, 1),
+                        kVuUpperNop);
+                    writePair(
+                        legacyFixture.code,
+                        pair * 8u,
+                        makeVuIaddiu(1u, 1u, 1),
+                        kVuUpperNop);
+                }
+                guardedFixture.markCodeModified();
+                legacyFixture.markCodeModified();
+
+                ScopedEnvironmentVariable guards(
+                    "PS2X_VU_BLOCK_BUDGET_GUARDS");
+                guards.unset();
+                VuUnit defaultUnit(VuUnitId::Vu1);
+                VuRecompilerBackend defaultBackend(
+                    defaultUnit);
+                t.IsTrue(
+                    defaultBackend.blockBudgetGuardsEnabled(),
+                    "block-budget guards should default to enabled");
+                guards.set("1");
+                VuUnit guardedUnit(VuUnitId::Vu1);
+                VuRecompilerBackend guarded(guardedUnit);
+                guards.set("0");
+                VuUnit legacyUnit(VuUnitId::Vu1);
+                VuRecompilerBackend legacy(legacyUnit);
+
+                VuExecutionState guardedState =
+                    initialSyntheticState();
+                VuExecutionState legacyState =
+                    guardedState;
+                VuTransactionalSideEffectSink guardedEffects;
+                VuTransactionalSideEffectSink legacyEffects;
+                VuExecutionContext guardedContext =
+                    makeContext(
+                        guardedState, guardedFixture,
+                        guardedEffects);
+                VuExecutionContext legacyContext =
+                    makeContext(
+                        legacyState, legacyFixture,
+                        legacyEffects);
+
+                const VuRunResult guardedFull =
+                    guarded.run(guardedContext, 64u);
+                const VuRunResult legacyFull =
+                    legacy.run(legacyContext, 64u);
+                t.IsTrue(
+                    sameRunResult(
+                        guardedFull, legacyFull),
+                    "full guarded and checked results should match");
+                std::string difference;
+                t.IsTrue(
+                    vuExecutionStatesEqual(
+                        guardedState, legacyState,
+                        &difference),
+                    "full guarded and checked states differ at " +
+                        difference);
+                t.IsTrue(
+                    guarded.blockBudgetGuardsEnabled(),
+                    "the guarded backend should expose its mode");
+                t.IsFalse(
+                    legacy.blockBudgetGuardsEnabled(),
+                    "the checked backend should expose its mode");
+
+                const VuRecompilerDiagnostics guardedFullStats =
+                    guarded.diagnostics();
+                const VuRecompilerDiagnostics legacyFullStats =
+                    legacy.diagnostics();
+                t.Equals(
+                    guardedFullStats.fullBlockGuards,
+                    uint64_t{1u},
+                    "the full block should use one guard");
+                t.Equals(
+                    guardedFullStats.preciseTailEntries,
+                    uint64_t{0u},
+                    "the full block should avoid the precise tail");
+                t.Equals(
+                    guardedFullStats.fullGuardPairs,
+                    uint64_t{64u},
+                    "the full guard should cover all pairs");
+                t.Equals(
+                    guardedFullStats.preciseTailPairs,
+                    uint64_t{0u},
+                    "the full block should retire no precise pairs");
+                t.Equals(
+                    guardedFullStats.budgetGuardComparisons,
+                    uint64_t{2u},
+                    "the cold full block should compare at entry and return");
+                t.Equals(
+                    guardedFullStats.nativeBudgetExits,
+                    uint64_t{1u},
+                    "the exact block boundary should be a budget exit");
+
+                t.Equals(
+                    legacyFullStats.fullBlockGuards,
+                    uint64_t{0u},
+                    "the switch should emit no full guards");
+                t.Equals(
+                    legacyFullStats.preciseTailEntries,
+                    uint64_t{1u},
+                    "the checked form should classify one precise entry");
+                t.Equals(
+                    legacyFullStats.fullGuardPairs,
+                    uint64_t{0u},
+                    "the checked form should classify no full pairs");
+                t.Equals(
+                    legacyFullStats.preciseTailPairs,
+                    uint64_t{64u},
+                    "the checked form should classify every pair as precise");
+                t.Equals(
+                    legacyFullStats.budgetGuardComparisons,
+                    uint64_t{65u},
+                    "the checked form should compare every pair and exit");
+                t.Equals(
+                    legacyFullStats.nativeBudgetExits,
+                    uint64_t{1u},
+                    "the checked form should report the boundary exit");
+
+                guardedState = initialSyntheticState();
+                guardedEffects.clear();
+                const VuRecompilerDiagnostics beforeTail =
+                    guarded.diagnostics();
+                const VuRunResult guardedTail =
+                    guarded.run(guardedContext, 7u);
+                const VuRecompilerDiagnostics afterTail =
+                    guarded.diagnostics();
+                t.IsTrue(
+                    guardedTail.reason ==
+                        VuExitReason::CycleBudget &&
+                        guardedTail.executedCycles == 7u,
+                    "the bounded entry should stop at the exact cut");
+                t.Equals(
+                    afterTail.fullBlockGuards -
+                        beforeTail.fullBlockGuards,
+                    uint64_t{0u},
+                    "the bounded run should not take the full path");
+                t.Equals(
+                    afterTail.preciseTailEntries -
+                        beforeTail.preciseTailEntries,
+                    uint64_t{1u},
+                    "the bounded run should take one precise tail");
+                t.Equals(
+                    afterTail.preciseTailPairs -
+                        beforeTail.preciseTailPairs,
+                    uint64_t{7u},
+                    "the precise tail should retire exactly its budget");
+                t.Equals(
+                    afterTail.budgetGuardComparisons -
+                        beforeTail.budgetGuardComparisons,
+                    uint64_t{9u},
+                    "the tail should include selector and terminal checks");
+                t.Equals(
+                    afterTail.nativeBudgetExits -
+                        beforeTail.nativeBudgetExits,
+                    uint64_t{1u},
+                    "the precise terminal check should be reported");
+
+                guardedState = initialSyntheticState();
+                legacyState = guardedState;
+                guardedEffects.clear();
+                legacyEffects.clear();
+                const VuRecompilerDiagnostics beforeShortSlice =
+                    guarded.diagnostics();
+                const VuRunResult guardedShortSlice =
+                    guarded.run(guardedContext, 255u);
+                const VuRunResult legacyShortSlice =
+                    legacy.run(legacyContext, 255u);
+                const VuRecompilerDiagnostics afterShortSlice =
+                    guarded.diagnostics();
+                t.IsTrue(
+                    sameRunResult(
+                        guardedShortSlice,
+                        legacyShortSlice),
+                    "the last short scheduler slice should match "
+                    "the precise checker");
+                t.IsTrue(
+                    vuExecutionStatesEqual(
+                        guardedState, legacyState,
+                        &difference),
+                    "the last short scheduler slice differs at " +
+                        difference);
+                t.IsTrue(
+                    afterShortSlice.fullBlockGuards >
+                        beforeShortSlice.fullBlockGuards,
+                    "a 255-cycle slice should use guarded basic blocks");
+
+                guardedState = initialSyntheticState();
+                guardedEffects.clear();
+                const VuProgramCacheDiagnostics cacheBeforeLongSlice =
+                    guardedUnit.programCache().diagnostics();
+                for (uint32_t warmup = 0u;
+                     warmup < 8u; ++warmup)
+                {
+                    guardedState = initialSyntheticState();
+                    guardedEffects.clear();
+                    (void)guarded.run(
+                        guardedContext, 256u);
+                }
+                const VuProgramCacheDiagnostics cacheAfterLongSliceWarmup =
+                    guardedUnit.programCache().diagnostics();
+                t.IsTrue(
+                    cacheAfterLongSliceWarmup.compilations >
+                        cacheBeforeLongSlice.compilations,
+                    "guarded basic blocks and precise linear traces "
+                    "should coexist in the cache");
+
+                guardedState = initialSyntheticState();
+                legacyState = guardedState;
+                guardedEffects.clear();
+                legacyEffects.clear();
+                const VuRecompilerDiagnostics beforeLongSlice =
+                    guarded.diagnostics();
+                const VuRunResult guardedLongSlice =
+                    guarded.run(guardedContext, 256u);
+                const VuRunResult legacyLongSlice =
+                    legacy.run(legacyContext, 256u);
+                const VuRecompilerDiagnostics afterLongSlice =
+                    guarded.diagnostics();
+                t.IsTrue(
+                    sameRunResult(
+                        guardedLongSlice,
+                        legacyLongSlice),
+                    "the first long scheduler slice should match "
+                    "the precise checker");
+                t.IsTrue(
+                    vuExecutionStatesEqual(
+                        guardedState, legacyState,
+                        &difference),
+                    "the first long scheduler slice differs at " +
+                        difference);
+                t.Equals(
+                    afterLongSlice.fullBlockGuards -
+                        beforeLongSlice.fullBlockGuards,
+                    uint64_t{0u},
+                    "a 256-cycle slice should retain compact "
+                    "precise linear traces");
+                t.Equals(
+                    afterLongSlice.preciseTailPairs -
+                        beforeLongSlice.preciseTailPairs,
+                    uint64_t{256u},
+                    "the precise linear trace should classify every "
+                    "long-slice pair");
+                t.Equals(
+                    afterLongSlice.preciseTailEntries -
+                        beforeLongSlice.preciseTailEntries,
+                    afterLongSlice.nativeBlocks -
+                        beforeLongSlice.nativeBlocks,
+                    "every long-slice block should use the precise form");
             });
 
         tc.Run(
@@ -1474,13 +1774,18 @@ void register_ps2_vu_recompiler_tests()
                 if (!VuRecompilerBackend::supported())
                     return;
 
+                ScopedEnvironmentVariable guards(
+                    "PS2X_VU_BLOCK_BUDGET_GUARDS");
+                guards.set("1");
                 VuNativeFixture referenceFixture;
                 VuNativeFixture nativeFixture;
                 t.IsTrue(
-                    referenceFixture.initialize(),
+                    referenceFixture.initialize(
+                        VuUnitId::Vu0),
                     "reference memory should initialize");
                 t.IsTrue(
-                    nativeFixture.initialize(),
+                    nativeFixture.initialize(
+                        VuUnitId::Vu0),
                     "native memory should initialize");
                 const uint32_t loop =
                     makeVuBranchOperation(
@@ -1502,8 +1807,8 @@ void register_ps2_vu_recompiler_tests()
                 referenceFixture.markCodeModified();
                 nativeFixture.markCodeModified();
 
-                VuUnit referenceUnit(VuUnitId::Vu1);
-                VuUnit nativeUnit(VuUnitId::Vu1);
+                VuUnit referenceUnit(VuUnitId::Vu0);
+                VuUnit nativeUnit(VuUnitId::Vu0);
                 VuInterpreterBackend reference(
                     referenceUnit);
                 VuRecompilerBackend native(
@@ -1585,9 +1890,10 @@ void register_ps2_vu_recompiler_tests()
                     uint64_t{1u},
                     "the self edge should populate once");
                 t.Equals(
-                    coldStats.blockCompletes,
+                    coldStats.blockCompletes +
+                        coldStats.nativeBudgetExits,
                     coldStats.nativeBlocks,
-                    "every loop block should complete");
+                    "every loop block should complete or exhaust the budget");
 
                 nativeState = initialSyntheticState();
                 nativeEffects.clear();
@@ -1621,6 +1927,31 @@ void register_ps2_vu_recompiler_tests()
                         beforeWarm.slowLinkExits,
                     uint64_t{0u},
                     "the warm edge should not revisit the resolver");
+                t.Equals(
+                    afterWarm.fullBlockGuards -
+                        beforeWarm.fullBlockGuards,
+                    uint64_t{100u},
+                    "every linked successor should run its own guard");
+                t.Equals(
+                    afterWarm.preciseTailEntries -
+                        beforeWarm.preciseTailEntries,
+                    uint64_t{0u},
+                    "the exact full-block loop should avoid precise tails");
+                t.Equals(
+                    afterWarm.fullGuardPairs -
+                        beforeWarm.fullGuardPairs,
+                    uint64_t{budget},
+                    "full guards should cover every linked pair");
+                t.Equals(
+                    afterWarm.budgetGuardComparisons -
+                        beforeWarm.budgetGuardComparisons,
+                    uint64_t{101u},
+                    "the loop should guard each block plus its terminal target");
+                t.Equals(
+                    afterWarm.nativeBudgetExits -
+                        beforeWarm.nativeBudgetExits,
+                    uint64_t{1u},
+                    "the exact linked boundary should report one budget exit");
                 uint64_t nativeExits = 0u;
                 for (const uint64_t count :
                      afterWarm.nativeExitReasons)
@@ -1635,9 +1966,13 @@ void register_ps2_vu_recompiler_tests()
                     afterWarm.nativeExitReasons[
                         static_cast<size_t>(
                             VuNativeBlockExit::
-                                BlockComplete)],
+                                BlockComplete)] +
+                        afterWarm.nativeExitReasons[
+                            static_cast<size_t>(
+                                VuNativeBlockExit::
+                                    CycleBudget)],
                     afterWarm.nativeBlocks,
-                    "every loop block should report completion");
+                    "every loop block should report completion or budget exit");
 
                 const VuBlockProfilingSnapshot profile =
                     native
@@ -2420,6 +2755,163 @@ void register_ps2_vu_recompiler_tests()
                 t.IsTrue(
                     effects.path1Packets().empty(),
                     "unsupported IR published side effects");
+            });
+
+        tc.Run(
+            "unsupported boundary preserves cycle-budget precedence",
+            [](TestCase &t)
+            {
+                if (!VuRecompilerBackend::supported())
+                    return;
+
+                ScopedEnvironmentVariable guards(
+                    "PS2X_VU_BLOCK_BUDGET_GUARDS");
+                guards.set("1");
+                VuNativeFixture checkedFixture;
+                VuNativeFixture guardedFixture;
+                t.IsTrue(
+                    checkedFixture.initialize(),
+                    "checked memory should initialize");
+                t.IsTrue(
+                    guardedFixture.initialize(),
+                    "guarded memory should initialize");
+                const auto configure =
+                    [](uint8_t *code)
+                    {
+                        writePair(
+                            code, 0u,
+                            makeVuIaddiu(
+                                1u, 1u, 1),
+                            kVuUpperNop);
+                        writePair(
+                            code, 8u,
+                            0x04000000u,
+                            makeVuUpper(
+                                0x34u, 0xfu,
+                                2u, 1u, 3u));
+                    };
+                configure(checkedFixture.code);
+                configure(guardedFixture.code);
+                checkedFixture.markCodeModified();
+                guardedFixture.markCodeModified();
+
+                VuUnit guardedUnit(VuUnitId::Vu1);
+                VuRecompilerBackend guarded(
+                    guardedUnit);
+                guards.set("0");
+                VuUnit checkedUnit(VuUnitId::Vu1);
+                VuRecompilerBackend checked(
+                    checkedUnit);
+                for (uint32_t budget = 0u;
+                     budget <= 2u; ++budget)
+                {
+                    VuExecutionState checkedState =
+                        initialSyntheticState();
+                    VuExecutionState guardedState =
+                        checkedState;
+                    VuTransactionalSideEffectSink
+                        checkedEffects;
+                    VuTransactionalSideEffectSink
+                        guardedEffects;
+                    VuExecutionContext checkedContext =
+                        makeContext(
+                            checkedState,
+                            checkedFixture,
+                            checkedEffects);
+                    VuExecutionContext guardedContext =
+                        makeContext(
+                            guardedState,
+                            guardedFixture,
+                            guardedEffects);
+
+                    const VuRunResult checkedResult =
+                        checked.run(
+                            checkedContext, budget);
+                    const VuRunResult guardedResult =
+                        guarded.run(
+                            guardedContext, budget);
+                    const std::string prefix =
+                        "budget " +
+                        std::to_string(budget) +
+                        ": ";
+                    t.IsTrue(
+                        sameRunResult(
+                            checkedResult,
+                            guardedResult),
+                        prefix + "run result differs (" +
+                            std::string(
+                                vuExitReasonName(
+                                    checkedResult.reason)) +
+                            "/" +
+                            std::to_string(
+                                checkedResult.executedCycles) +
+                            " versus " +
+                            std::string(
+                                vuExitReasonName(
+                                    guardedResult.reason)) +
+                            "/" +
+                            std::to_string(
+                                guardedResult.executedCycles) +
+                            ")");
+                    std::string difference;
+                    t.IsTrue(
+                        vuExecutionStatesEqual(
+                            checkedState,
+                            guardedState,
+                            &difference),
+                        prefix + "guarded state differs at " +
+                            difference);
+                    t.IsTrue(
+                        checkedEffects.path1Packets() ==
+                            guardedEffects.path1Packets(),
+                        prefix + "PATH1 effects differ");
+                    if (budget == 1u)
+                    {
+                        t.IsTrue(
+                            guardedResult.reason ==
+                                VuExitReason::CycleBudget &&
+                                guardedResult.executedCycles ==
+                                    1u,
+                            "the exact retiring budget should stop before unsupported");
+                    }
+                    if (budget == 2u)
+                    {
+                        t.IsTrue(
+                            guardedResult.reason ==
+                                VuExitReason::
+                                    UnsupportedInstruction &&
+                                guardedResult.executedCycles ==
+                                    1u,
+                            "spare budget should expose the unsupported boundary");
+                    }
+                }
+
+                const VuRecompilerDiagnostics diagnostics =
+                    guarded.diagnostics();
+                t.Equals(
+                    diagnostics.fullBlockGuards,
+                    uint64_t{1u},
+                    "the unsupported exit with spare budget should use the full guard");
+                t.Equals(
+                    diagnostics.preciseTailEntries,
+                    uint64_t{1u},
+                    "the exact retiring budget should use the precise tail");
+                t.Equals(
+                    diagnostics.fullGuardPairs,
+                    uint64_t{1u},
+                    "the full unsupported path should retire its prefix");
+                t.Equals(
+                    diagnostics.preciseTailPairs,
+                    uint64_t{1u},
+                    "the precise unsupported path should retire its prefix");
+                t.Equals(
+                    diagnostics.budgetGuardComparisons,
+                    uint64_t{4u},
+                    "selector and precise checks should be counted exactly");
+                t.Equals(
+                    diagnostics.nativeBudgetExits,
+                    uint64_t{1u},
+                    "the exact prefix budget should exit before unsupported");
             });
 
         tc.Run(

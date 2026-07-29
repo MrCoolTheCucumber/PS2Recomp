@@ -440,6 +440,10 @@ size_t VuProgramCache::KeyHash::operator()(
         value, std::hash<uint8_t>{}(
                    static_cast<uint8_t>(
                        key.compilationMode)));
+    hashCombine(
+        value, std::hash<uint8_t>{}(
+                   static_cast<uint8_t>(
+                       key.blockForm)));
     return value;
 }
 
@@ -462,7 +466,8 @@ bool VuProgramCache::sameProgramIdentity(
         left.entryPc != right.entryPc ||
         left.backend != right.backend ||
         left.hostFeatures != right.hostFeatures ||
-        left.compilationMode != right.compilationMode)
+        left.compilationMode != right.compilationMode ||
+        left.blockForm != right.blockForm)
     {
         return false;
     }

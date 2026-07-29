@@ -229,6 +229,9 @@ void register_ps2_vu_program_cache_tests()
                 VuProgramKey modeKey = firstKey;
                 modeKey.compilationMode =
                     VuCompilationMode::Instrumented;
+                VuProgramKey formKey = firstKey;
+                formKey.blockForm =
+                    VuIrBlockForm::Basic;
 
                 t.IsFalse(
                     cache.lookup(entryKey).valid(),
@@ -242,6 +245,9 @@ void register_ps2_vu_program_cache_tests()
                 t.IsFalse(
                     cache.lookup(modeKey).valid(),
                     "instrumented and normal blocks should not alias");
+                t.IsFalse(
+                    cache.lookup(formKey).valid(),
+                    "basic blocks and linear traces should not alias");
                 t.IsNotNull(
                     cache.resolve(first),
                     "same-generation key variants must not invalidate residents");
@@ -252,8 +258,8 @@ void register_ps2_vu_program_cache_tests()
                     stats.hits, uint64_t{1u},
                     "one warm lookup should be recorded");
                 t.Equals(
-                    stats.misses, uint64_t{5u},
-                    "cold and four distinct keys should be misses");
+                    stats.misses, uint64_t{6u},
+                    "cold and five distinct keys should be misses");
                 t.Equals(
                     stats.compilations, uint64_t{1u},
                     "duplicate insertion should not count as compilation");
@@ -412,6 +418,21 @@ void register_ps2_vu_program_cache_tests()
                         normalTarget) ==
                         VuProgramLinkResult::Incompatible,
                     "instrumented code must not link to normal code");
+                VuProgramKey basicTarget = normalTarget;
+                basicTarget.blockForm =
+                    VuIrBlockForm::Basic;
+                const VuProgramHandle basicTargetHandle =
+                    cache.insert(
+                        makeLinkedProgram(
+                            basicTarget,
+                            backendIdentity));
+                t.IsTrue(
+                    cache.populateLink(
+                        normalLinks,
+                        basicTargetHandle,
+                        basicTarget) ==
+                        VuProgramLinkResult::Incompatible,
+                    "linear traces must not link to basic blocks");
 
                 const VuNativeLinkSlot &normalSlot =
                     normalLinks->
@@ -449,7 +470,7 @@ void register_ps2_vu_program_cache_tests()
                 t.Equals(
                     cache.diagnostics().
                         linkResolutionFailures,
-                    uint64_t{3u},
+                    uint64_t{4u},
                     "every incompatible attempt should be counted");
             });
 

@@ -590,6 +590,7 @@ public:
             uint32_t blockPairs = 0u;
             uint32_t fixedCycles = 0u;
             std::string compilationMode;
+            std::string blockForm;
             std::string blockExit;
             bool resident = false;
             uint64_t executions = 0u;
@@ -605,6 +606,7 @@ public:
         };
 
         bool blockLinkingEnabled = false;
+        bool blockBudgetGuardsEnabled = false;
         uint64_t nativeEntries = 0u;
         uint64_t nativeBlocks = 0u;
         uint64_t nativePairs = 0u;
@@ -618,6 +620,12 @@ public:
         uint64_t resolvedLinks = 0u;
         uint64_t abandonedLinkResolutions = 0u;
         uint64_t incompatibleLinkExits = 0u;
+        uint64_t fullBlockGuards = 0u;
+        uint64_t preciseTailEntries = 0u;
+        uint64_t fullGuardPairs = 0u;
+        uint64_t preciseTailPairs = 0u;
+        uint64_t budgetGuardComparisons = 0u;
+        uint64_t nativeBudgetExits = 0u;
         uint64_t blockCompletes = 0u;
         uint64_t cycleBudgetExits = 0u;
         uint64_t xgkickExits = 0u;

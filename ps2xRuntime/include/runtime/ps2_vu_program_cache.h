@@ -83,6 +83,8 @@ struct VuProgramKey
     uint64_t hostFeatures = 0u;
     VuCompilationMode compilationMode =
         VuCompilationMode::Normal;
+    VuIrBlockForm blockForm =
+        VuIrBlockForm::LinearTrace;
 
     bool operator==(const VuProgramKey &) const = default;
 };

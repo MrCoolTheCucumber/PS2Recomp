@@ -254,6 +254,7 @@ namespace
         bool measureInterpreter = true;
         bool measureRecompiler = true;
         bool analysisCheck = false;
+        bool budgetSweep = false;
     };
 
     bool parseUnsigned(
@@ -335,6 +336,27 @@ namespace
                     argument == "off")
                 {
                     configuration.analysisCheck = false;
+                }
+                else
+                {
+                    return false;
+                }
+                continue;
+            }
+            if (option == "--budget-sweep")
+            {
+                if (argument == "1" ||
+                    argument == "true" ||
+                    argument == "on")
+                {
+                    configuration.budgetSweep = true;
+                }
+                else if (
+                    argument == "0" ||
+                    argument == "false" ||
+                    argument == "off")
+                {
+                    configuration.budgetSweep = false;
                 }
                 else
                 {
@@ -839,6 +861,10 @@ namespace
         uint32_t maximumPairs)
     {
         RunSummary summary;
+        summary.reason =
+            context.state.active
+                ? VuExitReason::CycleBudget
+                : VuExitReason::Inactive;
         while (context.state.active &&
                summary.pairs < maximumPairs)
         {
@@ -873,6 +899,174 @@ namespace
             }
             break;
         }
+        if (context.state.active &&
+            summary.pairs == maximumPairs &&
+            summary.reason ==
+                VuExitReason::XgkickBoundary)
+        {
+            // XGKICK is an internal native block split. The VU adapter
+            // continues through it and reports the exhausted public budget.
+            summary.reason = VuExitReason::CycleBudget;
+        }
+        return summary;
+    }
+
+    struct BudgetSweepSummary
+    {
+        bool valid = false;
+        uint64_t budgets = 0u;
+        uint64_t pairs = 0u;
+        VuRecompilerDiagnostics diagnostics{};
+        std::string diagnostic;
+    };
+
+    BudgetSweepSummary validateBudgetSweep(
+        const uint8_t *code,
+        const VuExecutionState &initialState,
+        const std::array<
+            uint8_t, PS2_VU1_DATA_SIZE> &initialData,
+        PS2Memory &memory,
+        uint32_t completionPairs)
+    {
+        BudgetSweepSummary summary;
+        VuUnit interpreterUnit(VuUnitId::Vu1);
+        VuUnit nativeUnit(VuUnitId::Vu1);
+        VuInterpreterBackend interpreter(
+            interpreterUnit);
+        VuRecompilerBackend native(nativeUnit);
+        const VuRecompilerDiagnostics before =
+            native.diagnostics();
+
+        for (uint64_t budget = 0u;
+             budget <=
+                 static_cast<uint64_t>(
+                     completionPairs) +
+                     1u;
+             ++budget)
+        {
+            Invocation reference;
+            Invocation recompiled;
+            reference.state = initialState;
+            reference.data = initialData;
+            reference.effects.reset();
+            recompiled.state = initialState;
+            recompiled.data = initialData;
+            recompiled.effects.reset();
+            VuExecutionContext referenceContext{
+                .state = reference.state,
+                .code = code,
+                .codeSize = PS2_VU1_CODE_SIZE,
+                .data = reference.data.data(),
+                .dataSize = PS2_VU1_DATA_SIZE,
+                .sideEffects = reference.effects,
+                .memory = &memory,
+                .enableInstrumentation = false,
+            };
+            VuExecutionContext recompiledContext{
+                .state = recompiled.state,
+                .code = code,
+                .codeSize = PS2_VU1_CODE_SIZE,
+                .data = recompiled.data.data(),
+                .dataSize = PS2_VU1_DATA_SIZE,
+                .sideEffects = recompiled.effects,
+                .memory = &memory,
+                .enableInstrumentation = false,
+            };
+            const uint32_t maximumPairs =
+                static_cast<uint32_t>(budget);
+            const RunSummary referenceRun =
+                runBackend(
+                    interpreter,
+                    referenceContext,
+                    maximumPairs);
+            const RunSummary recompiledRun =
+                runBackend(
+                    native,
+                    recompiledContext,
+                    maximumPairs);
+
+            std::string differenceField;
+            if (!referenceRun.valid ||
+                !recompiledRun.valid ||
+                referenceRun.pairs !=
+                    recompiledRun.pairs ||
+                referenceRun.reason !=
+                    recompiledRun.reason ||
+                !vuExecutionStatesEqual(
+                    reference.state,
+                    recompiled.state,
+                    &differenceField) ||
+                reference.data != recompiled.data ||
+                !(reference.effects ==
+                  recompiled.effects))
+            {
+                summary.diagnostic =
+                    "budget " +
+                    std::to_string(budget) +
+                    " diverged at " +
+                    differenceField +
+                    " (interpreter " +
+                    std::string(
+                        vuExitReasonName(
+                            referenceRun.reason)) +
+                    "/" +
+                    std::to_string(
+                        referenceRun.pairs) +
+                    ", recompiler " +
+                    std::string(
+                        vuExitReasonName(
+                            recompiledRun.reason)) +
+                    "/" +
+                    std::to_string(
+                        recompiledRun.pairs) +
+                    ")";
+                return summary;
+            }
+            ++summary.budgets;
+            summary.pairs += referenceRun.pairs;
+        }
+
+        const VuRecompilerDiagnostics after =
+            native.diagnostics();
+        summary.diagnostics.nativeBlocks =
+            after.nativeBlocks - before.nativeBlocks;
+        summary.diagnostics.nativePairs =
+            after.nativePairs - before.nativePairs;
+        summary.diagnostics.fullBlockGuards =
+            after.fullBlockGuards -
+            before.fullBlockGuards;
+        summary.diagnostics.preciseTailEntries =
+            after.preciseTailEntries -
+            before.preciseTailEntries;
+        summary.diagnostics.fullGuardPairs =
+            after.fullGuardPairs -
+            before.fullGuardPairs;
+        summary.diagnostics.preciseTailPairs =
+            after.preciseTailPairs -
+            before.preciseTailPairs;
+        summary.diagnostics.budgetGuardComparisons =
+            after.budgetGuardComparisons -
+            before.budgetGuardComparisons;
+        summary.diagnostics.nativeBudgetExits =
+            after.nativeBudgetExits -
+            before.nativeBudgetExits;
+        summary.diagnostics.faultExits =
+            after.faultExits - before.faultExits;
+        if (summary.diagnostics.fullBlockGuards +
+                    summary.diagnostics.
+                        preciseTailEntries !=
+                summary.diagnostics.nativeBlocks ||
+            summary.diagnostics.fullGuardPairs +
+                    summary.diagnostics.
+                        preciseTailPairs !=
+                summary.diagnostics.nativePairs ||
+            summary.diagnostics.faultExits != 0u)
+        {
+            summary.diagnostic =
+                "budget-guard diagnostics did not reconcile";
+            return summary;
+        }
+        summary.valid = true;
         return summary;
     }
 
@@ -1345,6 +1539,7 @@ namespace
         VuExitReason exitReason =
             VuExitReason::Inactive;
         bool blockLinkingEnabled = false;
+        bool blockBudgetGuardsEnabled = false;
         bool valid = true;
         VuRecompilerDiagnostics nativeDelta{};
         VuProgramCacheDiagnostics cacheDelta{};
@@ -1381,6 +1576,9 @@ namespace
         result.blockLinkingEnabled =
             native &&
             native->blockLinkingEnabled();
+        result.blockBudgetGuardsEnabled =
+            native &&
+            native->blockBudgetGuardsEnabled();
         prepareInvocations(
             invocations, initialState, initialData,
             expectedEffects);
@@ -1648,6 +1846,31 @@ namespace
                 difference(
                     after.incompatibleLinkExits,
                     nativeBefore.incompatibleLinkExits);
+            result.nativeDelta.fullBlockGuards =
+                difference(
+                    after.fullBlockGuards,
+                    nativeBefore.fullBlockGuards);
+            result.nativeDelta.preciseTailEntries =
+                difference(
+                    after.preciseTailEntries,
+                    nativeBefore.preciseTailEntries);
+            result.nativeDelta.fullGuardPairs =
+                difference(
+                    after.fullGuardPairs,
+                    nativeBefore.fullGuardPairs);
+            result.nativeDelta.preciseTailPairs =
+                difference(
+                    after.preciseTailPairs,
+                    nativeBefore.preciseTailPairs);
+            result.nativeDelta.budgetGuardComparisons =
+                difference(
+                    after.budgetGuardComparisons,
+                    nativeBefore.
+                        budgetGuardComparisons);
+            result.nativeDelta.nativeBudgetExits =
+                difference(
+                    after.nativeBudgetExits,
+                    nativeBefore.nativeBudgetExits);
             result.nativeDelta.blockCompletes =
                 difference(
                     after.blockCompletes,
@@ -1693,6 +1916,14 @@ namespace
                 difference(
                     after.interpreterFallbackPairs,
                     nativeBefore.interpreterFallbackPairs);
+            result.valid =
+                result.valid &&
+                result.nativeDelta.fullBlockGuards +
+                        result.nativeDelta.preciseTailEntries ==
+                    result.nativeDelta.nativeBlocks &&
+                result.nativeDelta.fullGuardPairs +
+                        result.nativeDelta.preciseTailPairs ==
+                    result.nativeDelta.nativePairs;
         }
         if (nativeUnit)
         {
@@ -1887,6 +2118,9 @@ namespace
                 << ",\"block_linking_enabled\":"
                 << (measurement.blockLinkingEnabled
                         ? "true" : "false")
+                << ",\"block_budget_guards_enabled\":"
+                << (measurement.blockBudgetGuardsEnabled
+                        ? "true" : "false")
                 << ",\"native_entries\":"
                 << measurement.nativeDelta.nativeEntries
                 << ",\"native_blocks\":"
@@ -1909,6 +2143,24 @@ namespace
                 << ",\"incompatible_link_exits\":"
                 << measurement.nativeDelta
                        .incompatibleLinkExits
+                << ",\"full_block_guards\":"
+                << measurement.nativeDelta
+                       .fullBlockGuards
+                << ",\"precise_tail_entries\":"
+                << measurement.nativeDelta
+                       .preciseTailEntries
+                << ",\"full_guard_pairs\":"
+                << measurement.nativeDelta
+                       .fullGuardPairs
+                << ",\"precise_tail_pairs\":"
+                << measurement.nativeDelta
+                       .preciseTailPairs
+                << ",\"budget_guard_comparisons\":"
+                << measurement.nativeDelta
+                       .budgetGuardComparisons
+                << ",\"native_budget_exits\":"
+                << measurement.nativeDelta
+                       .nativeBudgetExits
                 << ",\"block_completes\":"
                 << measurement.nativeDelta.blockCompletes
                 << ",\"cycle_budget_exits\":"
@@ -2025,6 +2277,16 @@ namespace
             << diagnostics.linkedEdges
             << ",\"backend_cumulative_slow_link_exits\":"
             << diagnostics.slowLinkExits
+            << ",\"backend_cumulative_full_block_guards\":"
+            << diagnostics.fullBlockGuards
+            << ",\"backend_cumulative_precise_tail_entries\":"
+            << diagnostics.preciseTailEntries
+            << ",\"backend_cumulative_full_guard_pairs\":"
+            << diagnostics.fullGuardPairs
+            << ",\"backend_cumulative_precise_tail_pairs\":"
+            << diagnostics.preciseTailPairs
+            << ",\"backend_cumulative_budget_guard_comparisons\":"
+            << diagnostics.budgetGuardComparisons
             << ",\"jitdump_registrations\":"
             << diagnostics.jitDumpRegistrations
             << ",\"jitdump_failures\":"
@@ -2072,6 +2334,11 @@ namespace
                 << (block.key.compilationMode ==
                             VuCompilationMode::Instrumented
                         ? "instrumented" : "normal")
+                << "\""
+                << ",\"block_form\":\""
+                << (block.key.blockForm ==
+                            VuIrBlockForm::Basic
+                        ? "basic" : "linear-trace")
                 << "\""
                 << ",\"block_exit\":\""
                 << vuIrBlockExitName(block.blockExit)
@@ -2165,6 +2432,7 @@ int main(int argc, char **argv)
                "[--samples N] "
                "[--cache-churn-iterations N] "
                "[--analysis-check on|off] "
+               "[--budget-sweep on|off] "
                "[--scope core|path1|all] "
                "[--backend interpreter|recompiler|both]\n";
         return 2;
@@ -2275,6 +2543,55 @@ int main(int argc, char **argv)
             << ",\"exit\":\""
             << vuExitReasonName(analysis.reason)
             << "\"}\n";
+    }
+
+    if (configuration.budgetSweep)
+    {
+        const BudgetSweepSummary sweep =
+            validateBudgetSweep(
+                memory.getVU1Code(),
+                initialState,
+                initialData,
+                memory,
+                configuration.maximumPairs);
+        if (!sweep.valid)
+        {
+            std::cerr
+                << "VU budget sweep failed: "
+                << sweep.diagnostic << "\n";
+            return 1;
+        }
+        std::cout
+            << "{\"schema_version\":2"
+            << ",\"event\":\"budget-sweep\""
+            << ",\"fixture\":\""
+            << configuration.fixtureDirectory.
+                   filename().string()
+            << "\""
+            << ",\"valid\":true"
+            << ",\"budgets\":" << sweep.budgets
+            << ",\"guest_pairs\":"
+            << sweep.pairs
+            << ",\"native_blocks\":"
+            << sweep.diagnostics.nativeBlocks
+            << ",\"native_pairs\":"
+            << sweep.diagnostics.nativePairs
+            << ",\"full_block_guards\":"
+            << sweep.diagnostics.fullBlockGuards
+            << ",\"precise_tail_entries\":"
+            << sweep.diagnostics.preciseTailEntries
+            << ",\"full_guard_pairs\":"
+            << sweep.diagnostics.fullGuardPairs
+            << ",\"precise_tail_pairs\":"
+            << sweep.diagnostics.preciseTailPairs
+            << ",\"budget_guard_comparisons\":"
+            << sweep.diagnostics.
+                   budgetGuardComparisons
+            << ",\"native_budget_exits\":"
+            << sweep.diagnostics.nativeBudgetExits
+            << ",\"fault_exits\":"
+            << sweep.diagnostics.faultExits
+            << "}\n";
     }
 
     VuUnit interpreterUnit(VuUnitId::Vu1);

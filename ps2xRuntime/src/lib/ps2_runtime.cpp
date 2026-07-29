@@ -6700,6 +6700,9 @@ void PS2Runtime::debugPublishVuBackendDiagnostics()
                 result.recompiler = {
                     .blockLinkingEnabled =
                         backend->blockLinkingEnabled(),
+                    .blockBudgetGuardsEnabled =
+                        backend->
+                            blockBudgetGuardsEnabled(),
                     .nativeEntries = source.nativeEntries,
                     .nativeBlocks = source.nativeBlocks,
                     .nativePairs = source.nativePairs,
@@ -6720,6 +6723,18 @@ void PS2Runtime::debugPublishVuBackendDiagnostics()
                         source.abandonedLinkResolutions,
                     .incompatibleLinkExits =
                         source.incompatibleLinkExits,
+                    .fullBlockGuards =
+                        source.fullBlockGuards,
+                    .preciseTailEntries =
+                        source.preciseTailEntries,
+                    .fullGuardPairs =
+                        source.fullGuardPairs,
+                    .preciseTailPairs =
+                        source.preciseTailPairs,
+                    .budgetGuardComparisons =
+                        source.budgetGuardComparisons,
+                    .nativeBudgetExits =
+                        source.nativeBudgetExits,
                     .blockCompletes = source.blockCompletes,
                     .cycleBudgetExits =
                         source.cycleBudgetExits,
@@ -6791,6 +6806,12 @@ void PS2Runtime::debugPublishVuBackendDiagnostics()
                                             Instrumented
                                     ? "instrumented"
                                     : "normal",
+                            .blockForm =
+                                block.key.blockForm ==
+                                        VuIrBlockForm::
+                                            Basic
+                                    ? "basic"
+                                    : "linear-trace",
                             .blockExit =
                                 std::string(
                                     vuIrBlockExitName(

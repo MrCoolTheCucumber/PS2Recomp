@@ -318,7 +318,8 @@ namespace
             VuNativeLinkState *outgoingLinks,
             VuNativeChainRuntime *chainRuntime,
             VuBlockProfileRecord *blockProfile,
-            bool blockLinkingEnabled)
+            bool blockLinkingEnabled,
+            bool blockBudgetGuardsEnabled)
             : m_buffer(kEmitterCapacity),
               m_code(m_buffer.size(), m_buffer.data()),
               m_hostFeatures(hostFeatures),
@@ -334,7 +335,9 @@ namespace
               m_chainRuntime(chainRuntime),
               m_blockProfile(blockProfile),
               m_blockLinkingEnabled(
-                  blockLinkingEnabled)
+                  blockLinkingEnabled),
+              m_blockBudgetGuardsEnabled(
+                  blockBudgetGuardsEnabled)
         {
             emit(
                 block, pairHelper, xgkickHelper);
@@ -393,6 +396,7 @@ namespace
         VuNativeChainRuntime *m_chainRuntime = nullptr;
         VuBlockProfileRecord *m_blockProfile = nullptr;
         bool m_blockLinkingEnabled = false;
+        bool m_blockBudgetGuardsEnabled = false;
         size_t m_fastEntryOffset = 0u;
         size_t m_linkedEntryOffset = 0u;
         bool m_usesAvx = false;
@@ -403,12 +407,14 @@ namespace
         static constexpr int kVuMxcsrOffset = 36;
         static constexpr int kResultOffset = 48;
         static constexpr int kContextViewOffset = 64;
+        static constexpr int kPrecisePairCountOffset = 40;
 #else
         static constexpr int kStackBytes = 64;
         static constexpr int kSavedMxcsrOffset = 0;
         static constexpr int kVuMxcsrOffset = 4;
         static constexpr int kResultOffset = 16;
         static constexpr int kContextViewOffset = 32;
+        static constexpr int kPrecisePairCountOffset = 8;
 #endif
         static constexpr int kRawEntryFlagOffset =
             kStackBytes - 1;
@@ -417,6 +423,26 @@ namespace
                     static_cast<int>(
                         sizeof(NativeContextView)) <=
                 kRawEntryFlagOffset);
+        static_assert(
+            kPrecisePairCountOffset +
+                    static_cast<int>(sizeof(uint64_t)) <=
+                kRawEntryFlagOffset);
+        static_assert(
+            kPrecisePairCountOffset +
+                        static_cast<int>(
+                            sizeof(uint64_t)) <=
+                    kResultOffset ||
+                kResultOffset + 16 <=
+                    kPrecisePairCountOffset);
+        static_assert(
+            kPrecisePairCountOffset +
+                        static_cast<int>(
+                            sizeof(uint64_t)) <=
+                    kContextViewOffset ||
+                kContextViewOffset +
+                        static_cast<int>(
+                            sizeof(NativeContextView)) <=
+                    kPrecisePairCountOffset);
 
         static constexpr int stateOffset(size_t value)
         {
@@ -2407,7 +2433,8 @@ namespace
             KnownDelayedScalar knownQ,
             uint32_t knownQCyclesRemaining,
             KnownDelayedScalar knownP,
-            uint32_t knownPCyclesRemaining)
+            uint32_t knownPCyclesRemaining,
+            bool preciseBudget)
         {
             using namespace Xbyak;
             constexpr int activeOffset =
@@ -2633,6 +2660,13 @@ namespace
                     1u);
             }
             m_code.inc(m_code.r14d);
+            if (preciseBudget)
+            {
+                m_code.inc(
+                    m_code.qword[
+                        m_code.rsp +
+                        kPrecisePairCountOffset]);
+            }
             m_code.test(m_code.r11d, m_code.r11d);
             m_code.jnz(
                 dynamicExit, m_code.T_NEAR);
@@ -2641,7 +2675,9 @@ namespace
         void emitHelperPair(
             const VuIrInstructionPair &pair,
             const void *pairHelper,
-            Xbyak::Label &dynamicExit)
+            Xbyak::Label &dynamicExit,
+            bool preciseBudget,
+            bool checkedBudget)
         {
             if (m_usesAvx)
                 m_code.vzeroupper();
@@ -2678,8 +2714,19 @@ namespace
                 m_code.r11d,
                 kNativePairExecuted);
             Xbyak::Label pairNotExecuted;
-            m_code.jz(pairNotExecuted);
+            Xbyak::Label pairAccounted;
+            m_code.jz(
+                preciseBudget
+                    ? pairNotExecuted
+                    : pairAccounted);
             m_code.inc(m_code.r14d);
+            if (preciseBudget)
+            {
+                m_code.inc(
+                    m_code.qword[
+                        m_code.rsp +
+                        kPrecisePairCountOffset]);
+            }
             if (m_blockProfile)
             {
                 m_code.mov(
@@ -2693,7 +2740,22 @@ namespace
                             VuBlockProfileRecord,
                             helperBarriers)]);
             }
-            m_code.L(pairNotExecuted);
+            if (checkedBudget)
+            {
+                m_code.jmp(pairAccounted);
+                m_code.L(pairNotExecuted);
+                m_code.mov(
+                    m_code.rax,
+                    reinterpret_cast<uint64_t>(
+                        m_chainRuntime));
+                m_code.inc(
+                    m_code.qword[
+                        m_code.rax +
+                        offsetof(
+                            VuNativeChainRuntime,
+                            preciseNonRetiredChecks)]);
+            }
+            m_code.L(pairAccounted);
             m_code.and_(
                 m_code.r11d,
                 kNativePairExitMask);
@@ -2734,6 +2796,42 @@ namespace
                         VuNativeChainRuntime,
                         slowLinkTargetPc)],
                 0u);
+            if (m_blockBudgetGuardsEnabled)
+            {
+                m_code.mov(
+                    m_code.qword[
+                        m_code.rax +
+                        offsetof(
+                            VuNativeChainRuntime,
+                            preciseTailEntries)],
+                    0u);
+                m_code.mov(
+                    m_code.qword[
+                        m_code.rax +
+                        offsetof(
+                            VuNativeChainRuntime,
+                            preciseTailPairs)],
+                    0u);
+                m_code.mov(
+                    m_code.qword[
+                        m_code.rax +
+                        offsetof(
+                            VuNativeChainRuntime,
+                            preciseNonRetiredChecks)],
+                    0u);
+                m_code.mov(
+                    m_code.qword[
+                        m_code.rax +
+                        offsetof(
+                            VuNativeChainRuntime,
+                            returnBoundaryChecks)],
+                    0u);
+                m_code.mov(
+                    m_code.qword[
+                        m_code.rsp +
+                        kPrecisePairCountOffset],
+                    0u);
+            }
         }
 
         void emitProfileEntry()
@@ -2763,15 +2861,45 @@ namespace
                         VuNativeChainRuntime,
                         blockStartCycles)],
                 m_code.r14d);
+        }
 
-            Xbyak::Label bounded;
+        void emitProfileBudgetClass(bool precise)
+        {
+            if (!m_blockProfile)
+                return;
+            m_code.mov(
+                m_code.rax,
+                reinterpret_cast<uint64_t>(
+                    m_blockProfile));
+            m_code.inc(
+                m_code.qword[
+                    m_code.rax +
+                    (precise
+                         ? offsetof(
+                               VuBlockProfileRecord,
+                               boundedEntries)
+                         : offsetof(
+                               VuBlockProfileRecord,
+                               fullBudgetEntries))]);
+        }
+
+        void emitProfileLegacyBudgetClass()
+        {
+            if (!m_blockProfile)
+                return;
+
+            Xbyak::Label precise;
             Xbyak::Label classified;
+            m_code.mov(
+                m_code.rax,
+                reinterpret_cast<uint64_t>(
+                    m_blockProfile));
             m_code.mov(m_code.r11d, m_code.r13d);
             m_code.sub(m_code.r11d, m_code.r14d);
             m_code.cmp(
                 m_code.r11d,
                 m_blockProfile->fixedCycles);
-            m_code.jb(bounded);
+            m_code.jb(precise);
             m_code.inc(
                 m_code.qword[
                     m_code.rax +
@@ -2779,7 +2907,7 @@ namespace
                         VuBlockProfileRecord,
                         fullBudgetEntries)]);
             m_code.jmp(classified);
-            m_code.L(bounded);
+            m_code.L(precise);
             m_code.inc(
                 m_code.qword[
                     m_code.rax +
@@ -2863,8 +2991,13 @@ namespace
             Label complete;
             Label miss;
 
-            m_code.cmp(m_code.r14d, m_code.r13d);
-            m_code.jae(complete, m_code.T_NEAR);
+            if (!m_blockBudgetGuardsEnabled)
+            {
+                m_code.cmp(
+                    m_code.r14d, m_code.r13d);
+                m_code.jae(
+                    complete, m_code.T_NEAR);
+            }
             if (!m_blockLinkingEnabled ||
                 !m_outgoingLinks || !m_chainRuntime)
             {
@@ -2938,8 +3071,6 @@ namespace
                                 VuNativeBlockExit::
                                     BlockComplete));
                         emitProfileExit();
-                        emitProfileLinkedEdge();
-                        m_code.inc(m_code.r15);
                         if (m_usesAvx)
                             m_code.vzeroupper();
                         if (m_blockProfile)
@@ -2955,6 +3086,20 @@ namespace
                                     offsetof(
                                         VuNativeLinkSlot,
                                         targetEntry)]);
+                        }
+                        if (m_blockBudgetGuardsEnabled)
+                        {
+                            emitProfileLinkedEdge();
+                            m_code.inc(m_code.r15);
+                            m_code.mov(
+                                m_code.r10,
+                                reinterpret_cast<uint64_t>(
+                                    m_blockProfile));
+                        }
+                        else
+                        {
+                            emitProfileLinkedEdge();
+                            m_code.inc(m_code.r15);
                         }
                         m_code.jmp(m_code.r11);
                         m_code.L(next);
@@ -2997,6 +3142,41 @@ namespace
             }
 
             m_code.L(complete);
+            if (m_blockBudgetGuardsEnabled)
+            {
+                Label blockComplete;
+                m_code.mov(
+                    m_code.rax,
+                    reinterpret_cast<uint64_t>(
+                        m_chainRuntime));
+                m_code.inc(
+                    m_code.qword[
+                        m_code.rax +
+                        offsetof(
+                            VuNativeChainRuntime,
+                            returnBoundaryChecks)]);
+                m_code.cmp(
+                    m_code.r14d, m_code.r13d);
+                m_code.jb(blockComplete);
+                if (m_chainRuntime)
+                {
+                    m_code.mov(
+                        m_code.qword[
+                            m_code.rax +
+                            offsetof(
+                                VuNativeChainRuntime,
+                                slowLinkSource)],
+                        0u);
+                }
+                m_code.mov(
+                    m_code.r10d,
+                    static_cast<uint32_t>(
+                        VuNativeBlockExit::
+                            CycleBudget));
+                m_code.jmp(
+                    packResult, m_code.T_NEAR);
+                m_code.L(blockComplete);
+            }
             m_code.mov(
                 m_code.r10d,
                 static_cast<uint32_t>(
@@ -3140,321 +3320,407 @@ namespace
         {
             using namespace Xbyak;
 
-            Label cycleBudgetExit;
-            Label controlFlowExit;
-            Label dynamicExit;
-            Label linkOrComplete;
             Label packResult;
+            Label packUnprofiledResult;
             Label epilogue;
             Label body;
+            Label preciseBody;
+            Label linkedZeroBudget;
+            Label linkedZeroProfileDone;
             Label skipFloatModeRestore;
-            Label invalidPipelineState;
-            Label pipelineStateValid;
 
             emitRawEntry(body);
             m_fastEntryOffset = m_code.getSize();
             emitFastEntry(body);
-            m_linkedEntryOffset = m_code.getSize();
-            m_code.L(body);
-            emitProfileEntry();
-            m_code.test(m_code.rbx, m_code.rbx);
-            m_code.jz(pipelineStateValid);
-            m_code.cmp(
-                m_code.byte[
-                    m_code.rbx +
-                    stateOffset(
-                        offsetof(
-                            VuExecutionState,
-                            viBackupCycles))],
-                2u);
-            m_code.ja(
-                invalidPipelineState,
-                m_code.T_NEAR);
-            m_code.L(pipelineStateValid);
-
-            if (block.pairs.empty())
+            uint32_t retiringCycles = 0u;
+            for (const VuIrInstructionPair &pair :
+                 block.pairs)
             {
-                const VuNativeBlockExit exit =
-                    block.exit == VuIrBlockExit::CodeBounds
-                        ? VuNativeBlockExit::CodeBounds
-                        : VuNativeBlockExit::Fault;
-                m_code.mov(
-                    m_code.r10d,
-                    static_cast<uint32_t>(exit));
-                m_code.jmp(packResult, m_code.T_NEAR);
-            }
-
-            bool viBackupKnown = false;
-            uint8_t viBackupCycles = 2u;
-            bool qKnown = false;
-            uint32_t qCyclesRemaining = 0u;
-            bool pKnown = false;
-            uint32_t pCyclesRemaining = 0u;
-            for (size_t pairIndex = 0u;
-                 pairIndex < block.pairs.size();
-                 ++pairIndex)
-            {
-                const VuIrInstructionPair &pair =
-                    block.pairs[pairIndex];
-                m_code.cmp(m_code.r14d, m_code.r13d);
-                m_code.jae(cycleBudgetExit, m_code.T_NEAR);
-
                 if (vuIrHasPairFlag(
                         pair, VuIrPairUnsupported))
                 {
+                    break;
+                }
+                retiringCycles += pair.cycles;
+            }
+            uint32_t fullGuardCycles =
+                retiringCycles;
+            if (block.exit ==
+                    VuIrBlockExit::
+                        UnsupportedInstruction &&
+                fullGuardCycles !=
+                    std::numeric_limits<uint32_t>::max())
+            {
+                ++fullGuardCycles;
+            }
+            if (m_blockBudgetGuardsEnabled)
+            {
+                Label targetSelector;
+
+                // Public and fast host entries start a fresh native chain.
+                // Keep their setup out of the fall-through linked path.
+                m_code.L(body);
+                m_code.mov(m_code.r11d, m_code.r13d);
+                m_code.sub(m_code.r11d, m_code.r14d);
+                m_code.jmp(
+                    targetSelector, m_code.T_NEAR);
+
+                // Linked entries already have an active native frame. The
+                // accepted nonzero case falls directly into the selector;
+                // terminal correction stays in a cold out-of-line path.
+                m_linkedEntryOffset = m_code.getSize();
+                m_code.mov(m_code.r11d, m_code.r13d);
+                m_code.sub(m_code.r11d, m_code.r14d);
+                m_code.test(
+                    m_code.r11d, m_code.r11d);
+                m_code.jz(
+                    linkedZeroBudget,
+                    m_code.T_NEAR);
+                m_code.L(targetSelector);
+                emitProfileEntry();
+                m_code.cmp(
+                    m_code.r11d,
+                    fullGuardCycles);
+                m_code.jb(
+                    preciseBody, m_code.T_NEAR);
+                emitProfileBudgetClass(false);
+            }
+            else
+            {
+                m_linkedEntryOffset = m_code.getSize();
+                m_code.L(body);
+                emitProfileEntry();
+                emitProfileLegacyBudgetClass();
+            }
+
+            const auto emitBody =
+                [&](bool checkedBudget,
+                    bool preciseBudget)
+                {
+                    Label cycleBudgetExit;
+                    Label controlFlowExit;
+                    Label dynamicExit;
+                    Label linkOrComplete;
+                    Label invalidPipelineState;
+                    Label pipelineStateValid;
+
+                    m_code.test(
+                        m_code.rbx, m_code.rbx);
+                    m_code.jz(pipelineStateValid);
+                    m_code.cmp(
+                        m_code.byte[
+                            m_code.rbx +
+                            stateOffset(
+                                offsetof(
+                                    VuExecutionState,
+                                    viBackupCycles))],
+                        2u);
+                    m_code.ja(
+                        invalidPipelineState,
+                        m_code.T_NEAR);
+                    m_code.L(pipelineStateValid);
+
+                    if (block.pairs.empty())
+                    {
+                        const VuNativeBlockExit exit =
+                            block.exit == VuIrBlockExit::CodeBounds
+                                ? VuNativeBlockExit::CodeBounds
+                                : VuNativeBlockExit::Fault;
+                        m_code.mov(
+                            m_code.r10d,
+                            static_cast<uint32_t>(exit));
+                        m_code.jmp(packResult, m_code.T_NEAR);
+                    }
+
+                    bool viBackupKnown = false;
+                    uint8_t viBackupCycles = 2u;
+                    bool qKnown = false;
+                    uint32_t qCyclesRemaining = 0u;
+                    bool pKnown = false;
+                    uint32_t pCyclesRemaining = 0u;
+                    for (size_t pairIndex = 0u;
+                         pairIndex < block.pairs.size();
+                         ++pairIndex)
+                    {
+                        const VuIrInstructionPair &pair =
+                            block.pairs[pairIndex];
+                        if (checkedBudget)
+                        {
+                            m_code.cmp(
+                                m_code.r14d, m_code.r13d);
+                            m_code.jae(
+                                cycleBudgetExit,
+                                m_code.T_NEAR);
+                        }
+
+                        if (vuIrHasPairFlag(
+                                pair, VuIrPairUnsupported))
+                        {
+                            m_code.mov(
+                                m_code.r10d,
+                                static_cast<uint32_t>(
+                                    VuNativeBlockExit::
+                                        UnsupportedInstruction));
+                            m_code.jmp(packResult, m_code.T_NEAR);
+                            break;
+                        }
+
+                        const bool ebitDelayPair =
+                            pairIndex != 0u &&
+                            vuIrHasPairFlag(
+                                block.pairs[pairIndex - 1u],
+                                VuIrPairEnd);
+                        const bool inlinePair =
+                            !m_instrumented &&
+                            canInlinePair(pair) &&
+                            !ebitDelayPair;
+                        const bool handleBranchState =
+                            pairIndex == 0u ||
+                            vuIrHasPairFlag(
+                                pair, VuIrPairBranch) ||
+                            (pairIndex != 0u &&
+                             vuIrHasPairFlag(
+                                 block.pairs[pairIndex - 1u],
+                                 VuIrPairBranch));
+                        KnownFmacSlot knownFmacSlot =
+                            KnownFmacSlot::Dynamic;
+                        if (pairIndex >=
+                            VuPipelineState::kFmacFlagStages)
+                        {
+                            const VuIrInstructionPair &producer =
+                                block.pairs[
+                                    pairIndex -
+                                    VuPipelineState::
+                                        kFmacFlagStages];
+                            knownFmacSlot =
+                                vuIrHasOpFlag(
+                                    producer.upper,
+                                    VuIrOpFmac)
+                                    ? KnownFmacSlot::Active
+                                    : KnownFmacSlot::Inactive;
+                        }
+                        const KnownViBackup knownViBackup =
+                            !viBackupKnown
+                                ? KnownViBackup::Dynamic
+                                : viBackupCycles != 0u
+                                      ? KnownViBackup::Active
+                                      : KnownViBackup::Inactive;
+                        const KnownDelayedScalar knownQ =
+                            !qKnown
+                                ? KnownDelayedScalar::Dynamic
+                                : qCyclesRemaining != 0u
+                                      ? KnownDelayedScalar::Active
+                                      : KnownDelayedScalar::Inactive;
+                        const KnownDelayedScalar knownP =
+                            !pKnown
+                                ? KnownDelayedScalar::Dynamic
+                                : pCyclesRemaining != 0u
+                                      ? KnownDelayedScalar::Active
+                                      : KnownDelayedScalar::Inactive;
+
+                        if (inlinePair)
+                        {
+                            if (pairIndex == 0u)
+                            {
+                                Label fallback;
+                                Label done;
+                                emitInlinePair(
+                                    pair, block.codeSize,
+                                    &fallback, xgkickHelper,
+                                    dynamicExit, true,
+                                    handleBranchState,
+                                    knownFmacSlot,
+                                    knownViBackup,
+                                    knownQ, qCyclesRemaining,
+                                    knownP, pCyclesRemaining,
+                                    preciseBudget);
+                                m_code.jmp(
+                                    done, m_code.T_NEAR);
+                                m_code.L(fallback);
+                                emitHelperPair(
+                                    pair, pairHelper,
+                                    dynamicExit,
+                                    preciseBudget,
+                                    checkedBudget);
+                                m_code.L(done);
+                            }
+                            else
+                            {
+                                emitInlinePair(
+                                    pair, block.codeSize,
+                                    nullptr, xgkickHelper,
+                                    dynamicExit, false,
+                                    handleBranchState,
+                                    knownFmacSlot,
+                                    knownViBackup,
+                                    knownQ, qCyclesRemaining,
+                                    knownP, pCyclesRemaining,
+                                    preciseBudget);
+                            }
+                        }
+                        else
+                        {
+                            emitHelperPair(
+                                pair, pairHelper, dynamicExit,
+                                preciseBudget,
+                                checkedBudget);
+                        }
+
+                        if (viBackupCycles != 0u)
+                            --viBackupCycles;
+                        if (!viBackupKnown &&
+                            viBackupCycles == 0u)
+                        {
+                            viBackupKnown = true;
+                        }
+                        uint8_t backedUpRegister = 0u;
+                        switch (pair.lower.opcode)
+                        {
+                        case VuIrOpcode::LowerLqi:
+                        case VuIrOpcode::LowerLqd:
+                            backedUpRegister =
+                                static_cast<uint8_t>(
+                                    (pair.lowerWord >> 11u) &
+                                    0x0fu);
+                            break;
+                        case VuIrOpcode::LowerSqi:
+                        case VuIrOpcode::LowerSqd:
+                        case VuIrOpcode::LowerMtir:
+                            backedUpRegister =
+                                static_cast<uint8_t>(
+                                    (pair.lowerWord >> 16u) &
+                                    0x0fu);
+                            break;
+                        default:
+                            break;
+                        }
+                        if (backedUpRegister != 0u)
+                        {
+                            viBackupKnown = true;
+                            viBackupCycles = 2u;
+                        }
+                        if (qKnown &&
+                            qCyclesRemaining != 0u)
+                        {
+                            --qCyclesRemaining;
+                        }
+                        if (vuIrHasOpFlag(
+                                pair.lower, VuIrOpQBarrier))
+                        {
+                            qKnown = true;
+                            qCyclesRemaining =
+                                vuIrHasOpFlag(
+                                    pair.lower,
+                                    VuIrOpWritesQ)
+                                    ? pair.lower.latency
+                                    : 0u;
+                        }
+                        if (pKnown &&
+                            pCyclesRemaining != 0u)
+                        {
+                            --pCyclesRemaining;
+                        }
+                        if (vuIrHasOpFlag(
+                                pair.lower, VuIrOpPBarrier))
+                        {
+                            pKnown = true;
+                            pCyclesRemaining =
+                                vuIrHasOpFlag(
+                                    pair.lower,
+                                    VuIrOpWritesP)
+                                    ? pair.lower.latency
+                                    : 0u;
+                        }
+
+                        if (pairIndex + 1u <
+                                block.pairs.size() &&
+                            (!inlinePair ||
+                             handleBranchState))
+                        {
+                            constexpr int pcOffset =
+                                stateOffset(
+                                    offsetof(
+                                        VuExecutionState, pc));
+                            m_code.cmp(
+                                m_code.dword[
+                                    m_code.rbx + pcOffset],
+                                block.pairs[
+                                    pairIndex + 1u].pc);
+                            m_code.jne(
+                                controlFlowExit,
+                                m_code.T_NEAR);
+                        }
+                    }
+
+                    switch (block.exit)
+                    {
+                    case VuIrBlockExit::PairLimit:
+                    case VuIrBlockExit::BranchBoundary:
+                        m_code.jmp(
+                            linkOrComplete, m_code.T_NEAR);
+                        break;
+                    case VuIrBlockExit::XgkickBoundary:
+                        m_code.mov(
+                            m_code.r10d,
+                            static_cast<uint32_t>(
+                                VuNativeBlockExit::XgkickBoundary));
+                        break;
+                    case VuIrBlockExit::UnsupportedInstruction:
+                        m_code.mov(
+                            m_code.r10d,
+                            static_cast<uint32_t>(
+                                VuNativeBlockExit::
+                                    UnsupportedInstruction));
+                        break;
+                    case VuIrBlockExit::CodeBounds:
+                        m_code.mov(
+                            m_code.r10d,
+                            static_cast<uint32_t>(
+                                VuNativeBlockExit::CodeBounds));
+                        break;
+                    case VuIrBlockExit::ProgramEndBoundary:
+                        // The E-bit delay pair must have returned ProgramEnded.
+                        // Falling through means the helper and verified IR disagree.
+                        m_code.mov(
+                            m_code.r10d,
+                            static_cast<uint32_t>(
+                                VuNativeBlockExit::Fault));
+                        break;
+                    }
+                    m_code.jmp(packResult, m_code.T_NEAR);
+
+                    m_code.L(cycleBudgetExit);
                     m_code.mov(
                         m_code.r10d,
                         static_cast<uint32_t>(
-                            VuNativeBlockExit::
-                                UnsupportedInstruction));
+                            VuNativeBlockExit::CycleBudget));
                     m_code.jmp(packResult, m_code.T_NEAR);
-                    break;
-                }
 
-                const bool ebitDelayPair =
-                    pairIndex != 0u &&
-                    vuIrHasPairFlag(
-                        block.pairs[pairIndex - 1u],
-                        VuIrPairEnd);
-                const bool inlinePair =
-                    !m_instrumented &&
-                    canInlinePair(pair) &&
-                    !ebitDelayPair;
-                const bool handleBranchState =
-                    pairIndex == 0u ||
-                    vuIrHasPairFlag(
-                        pair, VuIrPairBranch) ||
-                    (pairIndex != 0u &&
-                     vuIrHasPairFlag(
-                         block.pairs[pairIndex - 1u],
-                         VuIrPairBranch));
-                KnownFmacSlot knownFmacSlot =
-                    KnownFmacSlot::Dynamic;
-                if (pairIndex >=
-                    VuPipelineState::kFmacFlagStages)
-                {
-                    const VuIrInstructionPair &producer =
-                        block.pairs[
-                            pairIndex -
-                            VuPipelineState::
-                                kFmacFlagStages];
-                    knownFmacSlot =
-                        vuIrHasOpFlag(
-                            producer.upper,
-                            VuIrOpFmac)
-                            ? KnownFmacSlot::Active
-                            : KnownFmacSlot::Inactive;
-                }
-                const KnownViBackup knownViBackup =
-                    !viBackupKnown
-                        ? KnownViBackup::Dynamic
-                        : viBackupCycles != 0u
-                              ? KnownViBackup::Active
-                              : KnownViBackup::Inactive;
-                const KnownDelayedScalar knownQ =
-                    !qKnown
-                        ? KnownDelayedScalar::Dynamic
-                        : qCyclesRemaining != 0u
-                              ? KnownDelayedScalar::Active
-                              : KnownDelayedScalar::Inactive;
-                const KnownDelayedScalar knownP =
-                    !pKnown
-                        ? KnownDelayedScalar::Dynamic
-                        : pCyclesRemaining != 0u
-                              ? KnownDelayedScalar::Active
-                              : KnownDelayedScalar::Inactive;
+                    m_code.L(controlFlowExit);
+                    m_code.jmp(
+                        linkOrComplete, m_code.T_NEAR);
 
-                if (inlinePair)
-                {
-                    if (pairIndex == 0u)
-                    {
-                        Label fallback;
-                        Label done;
-                        emitInlinePair(
-                            pair, block.codeSize,
-                            &fallback, xgkickHelper,
-                            dynamicExit, true,
-                            handleBranchState,
-                            knownFmacSlot,
-                            knownViBackup,
-                            knownQ, qCyclesRemaining,
-                            knownP, pCyclesRemaining);
-                        m_code.jmp(
-                            done, m_code.T_NEAR);
-                        m_code.L(fallback);
-                        emitHelperPair(
-                            pair, pairHelper,
-                            dynamicExit);
-                        m_code.L(done);
-                    }
-                    else
-                    {
-                        emitInlinePair(
-                            pair, block.codeSize,
-                            nullptr, xgkickHelper,
-                            dynamicExit, false,
-                            handleBranchState,
-                            knownFmacSlot,
-                            knownViBackup,
-                            knownQ, qCyclesRemaining,
-                            knownP, pCyclesRemaining);
-                    }
-                }
-                else
-                {
-                    emitHelperPair(
-                        pair, pairHelper, dynamicExit);
-                }
+                    m_code.L(dynamicExit);
+                    m_code.mov(m_code.r10d, m_code.r11d);
 
-                if (viBackupCycles != 0u)
-                    --viBackupCycles;
-                if (!viBackupKnown &&
-                    viBackupCycles == 0u)
-                {
-                    viBackupKnown = true;
-                }
-                uint8_t backedUpRegister = 0u;
-                switch (pair.lower.opcode)
-                {
-                case VuIrOpcode::LowerLqi:
-                case VuIrOpcode::LowerLqd:
-                    backedUpRegister =
-                        static_cast<uint8_t>(
-                            (pair.lowerWord >> 11u) &
-                            0x0fu);
-                    break;
-                case VuIrOpcode::LowerSqi:
-                case VuIrOpcode::LowerSqd:
-                case VuIrOpcode::LowerMtir:
-                    backedUpRegister =
-                        static_cast<uint8_t>(
-                            (pair.lowerWord >> 16u) &
-                            0x0fu);
-                    break;
-                default:
-                    break;
-                }
-                if (backedUpRegister != 0u)
-                {
-                    viBackupKnown = true;
-                    viBackupCycles = 2u;
-                }
-                if (qKnown &&
-                    qCyclesRemaining != 0u)
-                {
-                    --qCyclesRemaining;
-                }
-                if (vuIrHasOpFlag(
-                        pair.lower, VuIrOpQBarrier))
-                {
-                    qKnown = true;
-                    qCyclesRemaining =
-                        vuIrHasOpFlag(
-                            pair.lower,
-                            VuIrOpWritesQ)
-                            ? pair.lower.latency
-                            : 0u;
-                }
-                if (pKnown &&
-                    pCyclesRemaining != 0u)
-                {
-                    --pCyclesRemaining;
-                }
-                if (vuIrHasOpFlag(
-                        pair.lower, VuIrOpPBarrier))
-                {
-                    pKnown = true;
-                    pCyclesRemaining =
-                        vuIrHasOpFlag(
-                            pair.lower,
-                            VuIrOpWritesP)
-                            ? pair.lower.latency
-                            : 0u;
-                }
+                    m_code.jmp(packResult, m_code.T_NEAR);
+                    m_code.L(invalidPipelineState);
+                    m_code.mov(
+                        m_code.r10d,
+                        static_cast<uint32_t>(
+                            VuNativeBlockExit::Fault));
+                    m_code.jmp(packResult, m_code.T_NEAR);
 
-                if (pairIndex + 1u <
-                        block.pairs.size() &&
-                    (!inlinePair ||
-                     handleBranchState))
-                {
-                    constexpr int pcOffset =
-                        stateOffset(
-                            offsetof(
-                                VuExecutionState, pc));
-                    m_code.cmp(
-                        m_code.dword[
-                            m_code.rbx + pcOffset],
-                        block.pairs[
-                            pairIndex + 1u].pc);
-                    m_code.jne(
-                        controlFlowExit,
-                        m_code.T_NEAR);
-                }
-            }
+                    m_code.L(linkOrComplete);
+                    emitLinkOrComplete(packResult);
+                };
 
-            switch (block.exit)
-            {
-            case VuIrBlockExit::PairLimit:
-            case VuIrBlockExit::BranchBoundary:
-                m_code.jmp(
-                    linkOrComplete, m_code.T_NEAR);
-                break;
-            case VuIrBlockExit::XgkickBoundary:
-                m_code.mov(
-                    m_code.r10d,
-                    static_cast<uint32_t>(
-                        VuNativeBlockExit::XgkickBoundary));
-                break;
-            case VuIrBlockExit::UnsupportedInstruction:
-                m_code.mov(
-                    m_code.r10d,
-                    static_cast<uint32_t>(
-                        VuNativeBlockExit::
-                            UnsupportedInstruction));
-                break;
-            case VuIrBlockExit::CodeBounds:
-                m_code.mov(
-                    m_code.r10d,
-                    static_cast<uint32_t>(
-                        VuNativeBlockExit::CodeBounds));
-                break;
-            case VuIrBlockExit::ProgramEndBoundary:
-                // The E-bit delay pair must have returned ProgramEnded.
-                // Falling through means the helper and verified IR disagree.
-                m_code.mov(
-                    m_code.r10d,
-                    static_cast<uint32_t>(
-                        VuNativeBlockExit::Fault));
-                break;
-            }
-            m_code.jmp(packResult, m_code.T_NEAR);
-
-            m_code.L(cycleBudgetExit);
-            m_code.mov(
-                m_code.r10d,
-                static_cast<uint32_t>(
-                    VuNativeBlockExit::CycleBudget));
-            m_code.jmp(packResult, m_code.T_NEAR);
-
-            m_code.L(controlFlowExit);
-            m_code.jmp(
-                linkOrComplete, m_code.T_NEAR);
-
-            m_code.L(dynamicExit);
-            m_code.mov(m_code.r10d, m_code.r11d);
-
-            m_code.jmp(packResult, m_code.T_NEAR);
-            m_code.L(invalidPipelineState);
-            m_code.mov(
-                m_code.r10d,
-                static_cast<uint32_t>(
-                    VuNativeBlockExit::Fault));
-            m_code.jmp(packResult, m_code.T_NEAR);
-
-            m_code.L(linkOrComplete);
-            emitLinkOrComplete(packResult);
+            emitBody(
+                !m_blockBudgetGuardsEnabled,
+                false);
             m_code.L(packResult);
             emitProfileExit();
+            m_code.L(packUnprofiledResult);
             if (m_chainRuntime)
             {
                 m_code.mov(
@@ -3472,6 +3738,21 @@ namespace
                             VuNativeChainRuntime,
                             linkedEdges)],
                     m_code.r11);
+                if (m_blockBudgetGuardsEnabled)
+                {
+                    m_code.mov(
+                        m_code.r11,
+                        m_code.qword[
+                            m_code.rsp +
+                            kPrecisePairCountOffset]);
+                    m_code.mov(
+                        m_code.qword[
+                            m_code.rax +
+                            offsetof(
+                                VuNativeChainRuntime,
+                                preciseTailPairs)],
+                        m_code.r11);
+                }
             }
             m_code.mov(m_code.eax, m_code.r14d);
             m_code.mov(m_code.r11d, m_code.r10d);
@@ -3498,6 +3779,70 @@ namespace
             m_code.pop(m_code.r12);
             m_code.pop(m_code.rbx);
             m_code.ret();
+
+            if (m_blockBudgetGuardsEnabled)
+            {
+                m_code.L(preciseBody);
+                m_code.mov(
+                    m_code.rax,
+                    reinterpret_cast<uint64_t>(
+                        m_chainRuntime));
+                m_code.inc(
+                    m_code.qword[
+                        m_code.rax +
+                        offsetof(
+                            VuNativeChainRuntime,
+                            preciseTailEntries)]);
+                emitProfileBudgetClass(true);
+                emitBody(true, true);
+
+                constexpr int blockCompleteProfileOffset =
+                    static_cast<int>(
+                        offsetof(
+                            VuBlockProfileRecord,
+                            exitReasons) +
+                        sizeof(uint64_t) *
+                            static_cast<size_t>(
+                                VuNativeBlockExit::
+                                    BlockComplete));
+                constexpr int cycleBudgetProfileOffset =
+                    static_cast<int>(
+                        offsetof(
+                            VuBlockProfileRecord,
+                            exitReasons) +
+                        sizeof(uint64_t) *
+                            static_cast<size_t>(
+                                VuNativeBlockExit::
+                                    CycleBudget));
+                m_code.L(linkedZeroBudget);
+                m_code.dec(m_code.r15);
+                m_code.test(
+                    m_code.r10, m_code.r10);
+                m_code.jz(linkedZeroProfileDone);
+                m_code.dec(
+                    m_code.qword[
+                        m_code.r10 +
+                        offsetof(
+                            VuBlockProfileRecord,
+                            linkedEdges)]);
+                m_code.dec(
+                    m_code.qword[
+                        m_code.r10 +
+                        blockCompleteProfileOffset]);
+                m_code.inc(
+                    m_code.qword[
+                        m_code.r10 +
+                        cycleBudgetProfileOffset]);
+                m_code.L(linkedZeroProfileDone);
+                m_code.mov(
+                    m_code.r10d,
+                    static_cast<uint32_t>(
+                        VuNativeBlockExit::
+                            CycleBudget));
+                m_code.jmp(
+                    packUnprofiledResult,
+                    m_code.T_NEAR);
+            }
         }
     };
 #endif
@@ -3568,6 +3913,10 @@ std::string vuPerfJitSymbolName(
         << (key.compilationMode ==
                     VuCompilationMode::Instrumented
                 ? "instrumented" : "normal")
+        << "-"
+        << (key.blockForm ==
+                    VuIrBlockForm::Basic
+                ? "basic" : "linear")
         << "-compile-"
         << std::setw(16)
         << compilationIdentity;
@@ -3591,6 +3940,12 @@ VuRecompilerBackend::VuRecompilerBackend(
     m_blockLinkingEnabled =
         !linking ||
         environmentFlagEnabled(linking);
+    const char *const budgetGuards =
+        std::getenv(
+            "PS2X_VU_BLOCK_BUDGET_GUARDS");
+    m_blockBudgetGuardsEnabled =
+        !budgetGuards ||
+        environmentFlagEnabled(budgetGuards);
     m_blockProfilingEnabled = configuration.enabled;
     m_maximumBlockProfiles =
         configuration.maximumRecords;
@@ -3938,6 +4293,10 @@ bool VuRecompilerBackend::programKey(
         .backend = VuNativeBackendMode::X86_64,
         .hostFeatures = hostFeatures(),
         .compilationMode = mode,
+        .blockForm =
+            m_blockBudgetGuardsEnabled
+                ? VuIrBlockForm::Basic
+                : VuIrBlockForm::LinearTrace,
     };
     return VuProgramCache::validKey(key, diagnostic);
 }
@@ -4100,7 +4459,25 @@ VuRunResult VuRecompilerBackend::run(
         while (state.active &&
                totalExecuted < maximumCycles)
         {
+            const uint32_t remaining =
+                maximumCycles - totalExecuted;
             key.entryPc = state.pc;
+            // Long scheduler slices benefit from fewer native transitions.
+            // Short slices use branch-bounded blocks so most entries can
+            // retire under one exact full-block guard instead of entering
+            // the per-pair precise tail.
+            constexpr uint32_t
+                kLinearTraceBudgetThreshold =
+                    4u * kMaximumBlockPairs;
+            key.blockForm =
+                m_blockBudgetGuardsEnabled &&
+                        remaining <
+                            kLinearTraceBudgetThreshold
+                    ? VuIrBlockForm::Basic
+                    : VuIrBlockForm::LinearTrace;
+            const bool useBlockBudgetGuards =
+                m_blockBudgetGuardsEnabled &&
+                key.blockForm == VuIrBlockForm::Basic;
             if ((key.entryPc & 7u) != 0u ||
                 key.entryPc >= key.codeSize)
             {
@@ -4149,8 +4526,6 @@ VuRunResult VuRecompilerBackend::run(
             std::memcpy(
                 &entry, &address, sizeof(entry));
 
-            const uint32_t remaining =
-                maximumCycles - totalExecuted;
             const uint64_t helperPairsBefore =
                 m_helperPairsIssued;
             m_chainRuntime.codeGeneration =
@@ -4158,6 +4533,10 @@ VuRunResult VuRecompilerBackend::run(
             m_chainRuntime.slowLinkSource = nullptr;
             m_chainRuntime.slowLinkTargetPc = 0u;
             m_chainRuntime.linkedEdges = 0u;
+            m_chainRuntime.preciseTailEntries = 0u;
+            m_chainRuntime.preciseTailPairs = 0u;
+            m_chainRuntime.preciseNonRetiredChecks = 0u;
+            m_chainRuntime.returnBoundaryChecks = 0u;
             const VuNativeBlockResult native =
                 VuNativeBlockResult::decode(
                     entry(
@@ -4173,23 +4552,126 @@ VuRunResult VuRecompilerBackend::run(
                 m_chainRuntime.slowLinkTargetPc;
             const uint64_t linkedEdges =
                 m_chainRuntime.linkedEdges;
+            const uint64_t nativeBlocks =
+                linkedEdges + 1u;
+            const uint64_t preciseTailEntries =
+                useBlockBudgetGuards
+                    ? m_chainRuntime.
+                          preciseTailEntries
+                    : nativeBlocks;
+            const uint64_t preciseTailPairs =
+                useBlockBudgetGuards
+                    ? m_chainRuntime.
+                          preciseTailPairs
+                    : native.executedCycles;
+            const uint64_t
+                preciseNonRetiredChecks =
+                    m_chainRuntime.
+                        preciseNonRetiredChecks;
+            const uint64_t returnBoundaryChecks =
+                m_chainRuntime.
+                    returnBoundaryChecks;
+            const uint64_t blockBoundaryGuards =
+                linkedEdges +
+                (native.exit ==
+                         VuNativeBlockExit::BlockComplete
+                     ? 1u
+                     : 0u);
+            const bool nativeBudgetExit =
+                native.exit ==
+                    VuNativeBlockExit::CycleBudget ||
+                (native.exit ==
+                     VuNativeBlockExit::BlockComplete &&
+                 native.executedCycles == remaining);
             ++m_diagnostics.nativeEntries;
             if (linkedEdges >
-                    native.executedCycles ||
-                (slowLinkSource &&
-                 native.exit !=
-                     VuNativeBlockExit::BlockComplete))
+                native.executedCycles)
             {
                 m_lastDiagnostic =
-                    "native VU chain reported inconsistent link accounting";
+                    "native VU chain reported more links than retired pairs";
+                ++m_diagnostics.faultExits;
+                return finish(
+                    totalExecuted, VuExitReason::Fault);
+            }
+            if (preciseTailEntries > nativeBlocks)
+            {
+                m_lastDiagnostic =
+                    "native VU chain reported too many precise entries";
+                ++m_diagnostics.faultExits;
+                return finish(
+                    totalExecuted, VuExitReason::Fault);
+            }
+            if (preciseTailPairs >
+                native.executedCycles)
+            {
+                m_lastDiagnostic =
+                    "native VU chain reported too many precise pairs";
+                ++m_diagnostics.faultExits;
+                return finish(
+                    totalExecuted, VuExitReason::Fault);
+            }
+            if (slowLinkSource &&
+                native.exit !=
+                    VuNativeBlockExit::BlockComplete)
+            {
+                m_lastDiagnostic =
+                    "native VU chain retained a slow link on a terminal exit";
                 ++m_diagnostics.faultExits;
                 return finish(
                     totalExecuted, VuExitReason::Fault);
             }
             m_diagnostics.nativeBlocks +=
-                linkedEdges + 1u;
+                nativeBlocks;
             m_diagnostics.linkedEdges +=
                 linkedEdges;
+            m_diagnostics.fullBlockGuards +=
+                nativeBlocks -
+                preciseTailEntries;
+            m_diagnostics.preciseTailEntries +=
+                preciseTailEntries;
+            m_diagnostics.fullGuardPairs +=
+                native.executedCycles -
+                preciseTailPairs;
+            m_diagnostics.preciseTailPairs +=
+                preciseTailPairs;
+            if (useBlockBudgetGuards)
+            {
+                m_diagnostics.
+                    budgetGuardComparisons +=
+                        nativeBlocks +
+                        preciseTailPairs +
+                        preciseNonRetiredChecks +
+                        returnBoundaryChecks +
+                        (native.exit ==
+                                 VuNativeBlockExit::
+                                     CycleBudget &&
+                                 returnBoundaryChecks ==
+                                     0u
+                             ? 1u
+                             : 0u);
+            }
+            else
+            {
+                m_diagnostics.
+                    budgetGuardComparisons +=
+                        native.executedCycles +
+                        preciseNonRetiredChecks +
+                        blockBoundaryGuards +
+                        (native.exit ==
+                                 VuNativeBlockExit::
+                                     CycleBudget
+                             ? 1u
+                             : 0u) +
+                        (native.exit ==
+                                 VuNativeBlockExit::
+                                     UnsupportedInstruction
+                             ? 1u
+                             : 0u);
+            }
+            if (nativeBudgetExit)
+            {
+                ++m_diagnostics.nativeBudgetExits;
+            }
             m_diagnostics.nativeExitReasons[
                 static_cast<size_t>(
                     VuNativeBlockExit::
@@ -4212,7 +4694,7 @@ VuRunResult VuRecompilerBackend::run(
             {
                 ++m_diagnostics.instrumentedNativeEntries;
                 m_diagnostics.instrumentedNativeBlocks +=
-                    linkedEdges + 1u;
+                    nativeBlocks;
             }
             if (native.executedCycles > remaining)
             {
@@ -4811,7 +5293,7 @@ bool VuRecompilerBackend::compile(
     VuIrBlock block = decodeVuIrBlock(
         context.code, context.codeSize,
         key.entryPc, kMaximumBlockPairs,
-        VuIrBlockForm::LinearTrace);
+        key.blockForm);
     VuIrVerificationError verification;
     if (!verifyVuIrBlock(block, &verification))
     {
@@ -4895,7 +5377,10 @@ bool VuRecompilerBackend::compile(
             outgoingLinks.get(),
             &m_chainRuntime,
             blockProfile.get(),
-            m_blockLinkingEnabled);
+            m_blockLinkingEnabled,
+            m_blockBudgetGuardsEnabled &&
+                key.blockForm ==
+                    VuIrBlockForm::Basic);
         if (emitter.size() == 0u)
         {
             diagnostic =

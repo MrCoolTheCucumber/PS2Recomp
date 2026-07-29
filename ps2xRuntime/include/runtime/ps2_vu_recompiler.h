@@ -73,6 +73,12 @@ struct VuRecompilerDiagnostics
     uint64_t resolvedLinks = 0u;
     uint64_t abandonedLinkResolutions = 0u;
     uint64_t incompatibleLinkExits = 0u;
+    uint64_t fullBlockGuards = 0u;
+    uint64_t preciseTailEntries = 0u;
+    uint64_t fullGuardPairs = 0u;
+    uint64_t preciseTailPairs = 0u;
+    uint64_t budgetGuardComparisons = 0u;
+    uint64_t nativeBudgetExits = 0u;
     uint64_t blockCompletes = 0u;
     uint64_t cycleBudgetExits = 0u;
     uint64_t xgkickExits = 0u;
@@ -99,6 +105,10 @@ struct VuNativeChainRuntime
     uint32_t slowLinkTargetPc = 0u;
     uint32_t blockStartCycles = 0u;
     uint64_t linkedEdges = 0u;
+    uint64_t preciseTailEntries = 0u;
+    uint64_t preciseTailPairs = 0u;
+    uint64_t preciseNonRetiredChecks = 0u;
+    uint64_t returnBoundaryChecks = 0u;
 };
 
 enum class VuRecompilerOpcodeDisposition : uint8_t
@@ -203,6 +213,10 @@ public:
     {
         return m_blockLinkingEnabled;
     }
+    [[nodiscard]] bool blockBudgetGuardsEnabled() const
+    {
+        return m_blockBudgetGuardsEnabled;
+    }
     // The caller must prove that VU execution is quiescent while copying or
     // resetting these single-owner-thread records.
     [[nodiscard]] VuBlockProfilingSnapshot
@@ -289,6 +303,7 @@ private:
     uint64_t m_instrumentedPairIndex = 0u;
     VuNativeChainRuntime m_chainRuntime{};
     bool m_blockLinkingEnabled = true;
+    bool m_blockBudgetGuardsEnabled = true;
     bool m_blockProfilingEnabled = false;
     size_t m_maximumBlockProfiles = 0u;
     uint64_t m_droppedBlockProfiles = 0u;

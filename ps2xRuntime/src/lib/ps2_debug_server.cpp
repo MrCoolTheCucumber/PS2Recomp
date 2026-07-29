@@ -776,6 +776,10 @@ struct PS2DebugServer::Impl
             block.compilationMode,
             allocator);
         addString(
+            result, "block_form",
+            block.blockForm,
+            allocator);
+        addString(
             result, "block_exit",
             block.blockExit,
             allocator);
@@ -1036,6 +1040,10 @@ struct PS2DebugServer::Impl
                     source.blockLinkingEnabled,
                     allocator);
                 recompiler.AddMember(
+                    "block_budget_guards_enabled",
+                    source.blockBudgetGuardsEnabled,
+                    allocator);
+                recompiler.AddMember(
                     "native_entries",
                     source.nativeEntries, allocator);
                 recompiler.AddMember(
@@ -1078,6 +1086,30 @@ struct PS2DebugServer::Impl
                 recompiler.AddMember(
                     "incompatible_link_exits",
                     source.incompatibleLinkExits,
+                    allocator);
+                recompiler.AddMember(
+                    "full_block_guards",
+                    source.fullBlockGuards,
+                    allocator);
+                recompiler.AddMember(
+                    "precise_tail_entries",
+                    source.preciseTailEntries,
+                    allocator);
+                recompiler.AddMember(
+                    "full_guard_pairs",
+                    source.fullGuardPairs,
+                    allocator);
+                recompiler.AddMember(
+                    "precise_tail_pairs",
+                    source.preciseTailPairs,
+                    allocator);
+                recompiler.AddMember(
+                    "budget_guard_comparisons",
+                    source.budgetGuardComparisons,
+                    allocator);
+                recompiler.AddMember(
+                    "native_budget_exits",
+                    source.nativeBudgetExits,
                     allocator);
                 recompiler.AddMember(
                     "block_completes",
