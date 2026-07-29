@@ -116,3 +116,15 @@ block-local-VF and inline-XGKICK policy, and verify
 run/comparison/publication/mismatch counters. The first mismatch text is
 included when present. These snapshots keep owner-only cache state out of the
 debugger thread while the guest is running.
+
+The recompiler status distinguishes automatic block-local VF selection from a
+forced diagnostic selection. When block profiling is enabled, each returned
+block also exposes resident and dirty VF counts, maximum live pressure,
+static/allocated accesses, canonical loads/stores, helper spills/reloads, and
+materialization counts split by exit or helper cause.
+
+Both units currently execute synchronously under the one guest-execution
+owner. No backend value enables a VU1 worker thread. A future queued mode must
+define ownership and synchronization for VIF/DMAC, MicroMem and data uploads,
+PATH1 ordering, debugger pause, save state, reset, backend switching, and
+shutdown before it can become an independent selectable policy.

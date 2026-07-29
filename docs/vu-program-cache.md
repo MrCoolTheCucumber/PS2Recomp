@@ -24,6 +24,9 @@ A compiled program key contains only inputs which can change compilation:
 | Exact code-content identity | Reuses a recurring MicroMem image safely |
 | Native backend and host features | Separates incompatible emitted code |
 | Compilation mode | Separates normal and instrumented blocks |
+| IR block form | Separates guarded basic blocks from checked linear traces |
+| Block-local VF policy | Separates canonical, forced-resident, and automatically screened code |
+| Inline XGKICK policy | Separates helper-only and inline-progression code |
 
 Architectural registers, pipeline values, and VU data memory are deliberately
 absent. Native code must load those values dynamically through its execution
@@ -75,8 +78,8 @@ generation before using the address.
 On a cold edge, generated code returns with canonical architectural state.
 Only then may C++ compile or resolve the target and populate the writable slot:
 compilation is never attempted while a native return address is live. Normal
-and instrumented modes, host features, code identity, unit, and backend owner
-must all be compatible.
+and instrumented modes, block form, VF-residency policy, inline-XGKICK policy,
+host features, code identity, unit, and backend owner must all be compatible.
 
 Every generation transition advances the handle epoch and immediately makes
 the old slots unusable through their generation guard. Exact-content programs
@@ -121,6 +124,11 @@ The debugger has one read-only exception:
 guest-execution mutex proves that the owner cannot access the cache. It neither
 binds nor changes cache ownership and must not be used without equivalent
 external synchronization.
+
+There is currently no VU1 worker mode. Any future queued execution design must
+transfer cache ownership to one worker rather than sharing the cache between
+the GameThread and worker, and must quiesce that owner before using the
+debugger exception.
 
 `VuProgramCacheDiagnostics` exposes cumulative:
 

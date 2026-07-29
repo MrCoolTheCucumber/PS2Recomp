@@ -142,11 +142,30 @@ VF registers in host SIMD registers. Exact block analysis supplies reads,
 writes, dirty lanes, liveness, and access counts. Dirty resident registers are
 written back before a canonical exit, link boundary, pair helper, or XGKICK
 helper; caller-clobbered residents are reloaded after a helper returns.
-Instrumented blocks always use canonical state. This experiment is disabled by
-default because its aggregate fixture gain did not meet the rollout gate. Set
-`PS2X_VU_BLOCK_LOCAL_VF_REGISTERS=1` before backend creation to enable it for
-profiling or controlled A/B work. The selected mode is part of cache and link
-identity.
+Instrumented blocks always use canonical state.
+
+Normal execution uses an automatic profitability policy by default. A
+candidate VF must have more static accesses than its guaranteed entry load
+plus possible dirty exit store. The complete allocation is retained only when
+its allocated accesses are at least five times its boundary load/store count;
+otherwise the block remains canonical. This whole-block screen accounts for
+the fixed boundary cost without adding a runtime guard or guest-specific
+identity. Helper barriers remain conservative and materialize all resident
+VFs.
+
+`PS2X_VU_BLOCK_LOCAL_VF_REGISTERS` is read once when the backend is created:
+
+- unset, `auto`, or `AUTO` selects the automatic policy;
+- a truthy flag such as `1` forces the hottest-three allocation for diagnostic
+  A/B work; and
+- `0`, `false`, `off`, or `no` disables block-local VF residency.
+
+Automatic, forced, and canonical code have distinct cache/link identities and
+JIT symbol names. This prevents a forced block from aliasing or linking to an
+automatically screened block even when their current guest PC and code image
+match. A symbol's policy name does not promise that the automatic screen
+selected a resident register; inspect the block profile's resident count for
+that fact.
 
 VU1 normal blocks inline the common retained-XGKICK progression by default.
 The generated path accepts exactly one earned qword when a tag is already
@@ -211,8 +230,24 @@ Budget diagnostics additionally satisfy:
   including an exact full-block boundary.
 
 Opt-in block profiles update executions, pairs, budget classes, helper
-barriers, linked edges, and exits inside generated code, so their totals remain
-exact when the C++ accounting loop is bypassed.
+barriers, linked edges, exits, resident/dirty VF counts, static access
+coverage, loads/stores, helper spills/reloads, and materialization causes
+inside generated code, so their totals remain exact when the C++ accounting
+loop is bypassed.
+
+## Threading scope
+
+VU0 and VU1 execution remain synchronous under the runtime's single
+guest-execution owner. There is no optional VU1 worker or queue mode in the
+backend. Cache ownership, debugger snapshots, backend switching, MicroMem
+generation changes, and PATH1 publication all rely on this contract.
+
+A future worker implementation would need an explicit bounded command queue
+and synchronization rules for VIF waits, VU status, DMAC completion,
+MicroMem/data uploads, XGKICK ordering, save state, debugger pause, reset, and
+shutdown. It must preserve the synchronous path and earn rollout through a
+separate measured overlap gate; the recompiler does not implicitly make its
+unit-owned cache or execution state cross-thread.
 
 ## Instrumentation and tests
 

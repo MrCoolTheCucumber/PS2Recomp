@@ -212,11 +212,12 @@ perf report -i perf.jit.data
 Generated names encode the VU unit, whole-code content identity and extent,
 the generation at which that executable was compiled, entry PC, inclusive
 block PC range, normal or instrumented mode, basic or linear block form, and a
-process-unique compilation identity. A cache hit under a later guest
-generation does not duplicate the code-load record: the executable and its
-compilation identity are unchanged. New or replacement executable storage
-always receives a new compilation identity, preventing an old name from being
-confused with new code at a reused host address.
+canonical, forced-resident, or automatically screened VF policy, inline or
+helper XGKICK policy, and a process-unique compilation identity. A cache hit
+under a later guest generation does not duplicate the code-load record: the
+executable and its compilation identity are unchanged. New or replacement
+executable storage always receives a new compilation identity, preventing an
+old name from being confused with new code at a reused host address.
 
 `PS2X_VU_BLOCK_PROFILE` adds cold-created records and dynamic counters for:
 
@@ -243,12 +244,13 @@ absent, emitted blocks contain none of those profile updates or branches.
 With block profiling enabled, `vu_backend_benchmark` appends one
 `block-profile-summary` and one `block-profile` JSON record per retained
 compilation. Each record includes `block_form` so the adaptive basic-block and
-linear-trace populations can be attributed separately. For a live runtime,
-pause the guest before requesting a coherent snapshot. `system.status`
-includes the first 16 records and reports whether they were truncated; the
-`vu.block-profile` debugger method returns pages of up to 256 records. Static
-opcode mixes identify the instruction families present in a sampled block,
-but they are not per-opcode sample attribution.
+linear-trace populations can be attributed separately. Benchmark records and
+live recompiler status also report whether block-local VF selection is
+automatic. For a live runtime, pause the guest before requesting a coherent
+snapshot. `system.status` includes the first 16 records and reports whether
+they were truncated; the `vu.block-profile` debugger method returns pages of
+up to 256 records. Static opcode mixes identify the instruction families
+present in a sampled block, but they are not per-opcode sample attribution.
 
 ### Hardware counters
 
