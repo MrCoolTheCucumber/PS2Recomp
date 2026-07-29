@@ -6,6 +6,7 @@
 #include "runtime/ps2_gs_psmt4.h"
 #include "runtime/ps2_gs_psmt8.h"
 #include "runtime/ps2_gs_memory.h"
+#include "ps2_gs_rasterizer_detail.h"
 #include "ps2_log.h"
 #include <array>
 #include <atomic>
@@ -1104,6 +1105,61 @@ namespace
         const int top = lerp(c00, c10, weightU);
         const int bottom = lerp(c01, c11, weightU);
         return clampU8(lerp(top, bottom, weightV));
+    }
+
+    uint32_t linearColor4(uint32_t from,
+                          uint32_t to,
+                          uint8_t weight)
+    {
+#if defined(__SSE4_1__)
+        const __m128i fromChannels =
+            _mm_cvtepu8_epi32(_mm_cvtsi32_si128(from));
+        const __m128i toChannels =
+            _mm_cvtepu8_epi32(_mm_cvtsi32_si128(to));
+        __m128i result = _mm_add_epi32(
+            fromChannels,
+            _mm_srai_epi32(
+                _mm_mullo_epi32(
+                    _mm_sub_epi32(toChannels, fromChannels),
+                    _mm_set1_epi32(weight)),
+                4));
+        result = _mm_min_epi32(
+            _mm_max_epi32(result, _mm_setzero_si128()),
+            _mm_set1_epi32(255));
+        return static_cast<uint32_t>(_mm_cvtsi128_si32(
+            _mm_packus_epi16(
+                _mm_packus_epi32(result, result),
+                _mm_setzero_si128())));
+#else
+        const uint8_t r = clampU8(
+            static_cast<uint8_t>(from) +
+            arithmeticShiftRight4(
+                (static_cast<uint8_t>(to) -
+                 static_cast<uint8_t>(from)) *
+                weight));
+        const uint8_t g = clampU8(
+            static_cast<uint8_t>(from >> 8u) +
+            arithmeticShiftRight4(
+                (static_cast<uint8_t>(to >> 8u) -
+                 static_cast<uint8_t>(from >> 8u)) *
+                weight));
+        const uint8_t b = clampU8(
+            static_cast<uint8_t>(from >> 16u) +
+            arithmeticShiftRight4(
+                (static_cast<uint8_t>(to >> 16u) -
+                 static_cast<uint8_t>(from >> 16u)) *
+                weight));
+        const uint8_t a = clampU8(
+            static_cast<uint8_t>(from >> 24u) +
+            arithmeticShiftRight4(
+                (static_cast<uint8_t>(to >> 24u) -
+                 static_cast<uint8_t>(from >> 24u)) *
+                weight));
+        return static_cast<uint32_t>(r) |
+               (static_cast<uint32_t>(g) << 8u) |
+               (static_cast<uint32_t>(b) << 16u) |
+               (static_cast<uint32_t>(a) << 24u);
+#endif
     }
 
     uint32_t bilinearColor4(uint32_t c00,
@@ -3105,6 +3161,13 @@ uint32_t GSRasterizer::sampleTextureLinearLevel(
             static_cast<uint32_t>(fixedV) - 0x8000u);
     }
 
+    const uint8_t weightU = static_cast<uint8_t>(
+        (static_cast<uint32_t>(fixedU) >> 12u) & 0xFu);
+    const uint8_t weightV = static_cast<uint8_t>(
+        (static_cast<uint32_t>(fixedV) >> 12u) & 0xFu);
+    const uint8_t sampledTapMask =
+        GSRasterizerDetail::requiredBilinearTapMask(weightU, weightV);
+
     const int u0 = floorFixed16_16(fixedU);
     const int v0 = floorFixed16_16(fixedV);
     const uint64_t clamp = ctx.clamp;
@@ -3133,8 +3196,10 @@ uint32_t GSRasterizer::sampleTextureLinearLevel(
                 ((clamp >> 34u) & 0x3FFu) >> level));
     };
 
-    const int wrappedU[2] = {wrapU(u0), wrapU(u0 + 1)};
-    const int wrappedV[2] = {wrapV(v0), wrapV(v0 + 1)};
+    int wrappedU[2] = {wrapU(u0), 0};
+    int wrappedV[2] = {wrapV(v0), 0};
+    wrappedU[1] = weightU != 0u ? wrapU(u0 + 1) : wrappedU[0];
+    wrappedV[1] = weightV != 0u ? wrapV(v0 + 1) : wrappedV[0];
     uint32_t tbp = tex.tbp0;
     uint8_t tbw = tex.tbw;
     if (level != 0u)
@@ -3151,60 +3216,54 @@ uint32_t GSRasterizer::sampleTextureLinearLevel(
     }
     const uint8_t *textureVram =
         m_textureReadVram ? m_textureReadVram : gs->m_vram;
-    uint32_t raw[4] = {};
-    uint32_t color[4] = {};
+    std::array<GSRasterizerDetail::LinearTextureTap, 4> taps;
     if (tex.psm == GS_PSM_T8)
     {
-        raw[0] = GSMem::ReadP8(
-            const_cast<uint8_t *>(textureVram),
-            tbp, tbw, wrappedU[0], wrappedV[0]);
-        raw[1] = GSMem::ReadP8(
-            const_cast<uint8_t *>(textureVram),
-            tbp, tbw, wrappedU[1], wrappedV[0]);
-        raw[2] = GSMem::ReadP8(
-            const_cast<uint8_t *>(textureVram),
-            tbp, tbw, wrappedU[0], wrappedV[1]);
-        raw[3] = GSMem::ReadP8(
-            const_cast<uint8_t *>(textureVram),
-            tbp, tbw, wrappedU[1], wrappedV[1]);
-        for (int sample = 0; sample < 4; ++sample)
-        {
-            color[sample] =
-                m_decodedClutActive
-                    ? m_decodedClut[static_cast<uint8_t>(raw[sample])]
-                    : lookupCLUT(
-                          gs,
-                          static_cast<uint8_t>(raw[sample]),
-                          tex.cbp,
-                          tex.cpsm,
-                          tex.csm,
-                          tex.csa,
-                          tex.psm);
-        }
+        taps = GSRasterizerDetail::readRequiredBilinearTaps(
+            weightU,
+            weightV,
+            [&](int uIndex, int vIndex)
+            {
+                const uint32_t raw = GSMem::ReadP8(
+                    const_cast<uint8_t *>(textureVram),
+                    tbp, tbw, wrappedU[uIndex], wrappedV[vIndex]);
+                const uint32_t color =
+                    m_decodedClutActive
+                        ? m_decodedClut[static_cast<uint8_t>(raw)]
+                        : lookupCLUT(
+                              gs,
+                              static_cast<uint8_t>(raw),
+                              tex.cbp,
+                              tex.cpsm,
+                              tex.csm,
+                              tex.csa,
+                              tex.psm);
+                return GSRasterizerDetail::LinearTextureTap{raw, color};
+            });
     }
     else
     {
-        raw[0] = GSMem::ReadCT32(
-            const_cast<uint8_t *>(textureVram),
-            tbp, tbw, wrappedU[0], wrappedV[0]);
-        raw[1] = GSMem::ReadCT32(
-            const_cast<uint8_t *>(textureVram),
-            tbp, tbw, wrappedU[1], wrappedV[0]);
-        raw[2] = GSMem::ReadCT32(
-            const_cast<uint8_t *>(textureVram),
-            tbp, tbw, wrappedU[0], wrappedV[1]);
-        raw[3] = GSMem::ReadCT32(
-            const_cast<uint8_t *>(textureVram),
-            tbp, tbw, wrappedU[1], wrappedV[1]);
-        for (int sample = 0; sample < 4; ++sample)
-            color[sample] = raw[sample];
+        taps = GSRasterizerDetail::readRequiredBilinearTaps(
+            weightU,
+            weightV,
+            [&](int uIndex, int vIndex)
+            {
+                const uint32_t color = GSMem::ReadCT32(
+                    const_cast<uint8_t *>(textureVram),
+                    tbp, tbw, wrappedU[uIndex], wrappedV[vIndex]);
+                return GSRasterizerDetail::LinearTextureTap{color, color};
+            });
     }
 
     GSDrawTraceState &trace = drawTrace();
     if (trace.capturing)
     {
+        // textureSamples describes physical reads, so replicated taps do not
+        // contribute to the trace count, page set, or extrema.
         for (int sample = 0; sample < 4; ++sample)
         {
+            if ((sampledTapMask & (1u << sample)) == 0u)
+                continue;
             trace.recordTexturePage(
                 tex.psm,
                 tbp,
@@ -3213,18 +3272,15 @@ uint32_t GSRasterizer::sampleTextureLinearLevel(
                     std::max(wrappedU[sample & 1], 0)),
                 static_cast<uint32_t>(
                     std::max(wrappedV[sample >> 1], 0)));
-        }
-        for (int sample = 0; sample < 4; ++sample)
-        {
             ++trace.textureSamples;
             const uint8_t textureIndex =
-                static_cast<uint8_t>(raw[sample]);
+                static_cast<uint8_t>(taps[sample].raw);
             trace.minTextureIndex =
                 std::min(trace.minTextureIndex, textureIndex);
             trace.maxTextureIndex =
                 std::max(trace.maxTextureIndex, textureIndex);
             const uint8_t alpha =
-                static_cast<uint8_t>(color[sample] >> 24u);
+                static_cast<uint8_t>(taps[sample].color >> 24u);
             trace.minTextureAlpha =
                 std::min(trace.minTextureAlpha, alpha);
             trace.maxTextureAlpha =
@@ -3232,12 +3288,21 @@ uint32_t GSRasterizer::sampleTextureLinearLevel(
         }
     }
 
-    const uint8_t weightU = static_cast<uint8_t>(
-        (static_cast<uint32_t>(fixedU) >> 12u) & 0xFu);
-    const uint8_t weightV = static_cast<uint8_t>(
-        (static_cast<uint32_t>(fixedV) >> 12u) & 0xFu);
+    if (weightU == 0u)
+    {
+        if (weightV == 0u)
+            return taps[0].color;
+        return linearColor4(taps[0].color, taps[2].color, weightV);
+    }
+    if (weightV == 0u)
+        return linearColor4(taps[0].color, taps[1].color, weightU);
     return bilinearColor4(
-        color[0], color[1], color[2], color[3], weightU, weightV);
+        taps[0].color,
+        taps[1].color,
+        taps[2].color,
+        taps[3].color,
+        weightU,
+        weightV);
 }
 
 uint32_t GSRasterizer::sampleTextureFixed(GS *gs,

@@ -5,6 +5,8 @@
 #include "ps2_syscalls.h"
 #include "runtime/ps2_gs_gpu.h"
 #include "runtime/ps2_gs_memory.h"
+#include "runtime/ps2_gs_rasterizer.h"
+#include "ps2_gs_rasterizer_detail.h"
 #include "runtime/ps2_gs_psmct32.h"
 #include "runtime/ps2_gs_psmt4.h"
 #include "runtime/ps2_gs_psmt8.h"
@@ -288,6 +290,41 @@ namespace
                                             uint32_t y)
     {
         return readReferencePSMCT32Pixel(vram, frameBaseToBlock(fbp), fbw, x, y);
+    }
+
+    uint32_t referenceBilinearColor4(uint32_t c00,
+                                     uint32_t c10,
+                                     uint32_t c01,
+                                     uint32_t c11,
+                                     uint8_t weightU,
+                                     uint8_t weightV)
+    {
+        auto shiftRight4 = [](int value)
+        {
+            return value >= 0 ? value / 16 : -((-value + 15) / 16);
+        };
+        auto interpolate = [&](int from, int to, int weight)
+        {
+            return from + shiftRight4((to - from) * weight);
+        };
+        auto channel = [&](uint8_t shift)
+        {
+            const int top = interpolate(
+                static_cast<uint8_t>(c00 >> shift),
+                static_cast<uint8_t>(c10 >> shift),
+                weightU);
+            const int bottom = interpolate(
+                static_cast<uint8_t>(c01 >> shift),
+                static_cast<uint8_t>(c11 >> shift),
+                weightU);
+            return static_cast<uint8_t>(
+                interpolate(top, bottom, weightV));
+        };
+
+        return static_cast<uint32_t>(channel(0u)) |
+               (static_cast<uint32_t>(channel(8u)) << 8u) |
+               (static_cast<uint32_t>(channel(16u)) << 16u) |
+               (static_cast<uint32_t>(channel(24u)) << 24u);
     }
 
     void expectGuestHeapReusable(TestCase &t, PS2Runtime &runtime, const char *message)
@@ -3030,6 +3067,130 @@ void register_ps2_gs_tests()
             const uint32_t pixel = readReferencePSMCT32Pixel(vram, 0u, 1u, 0u, 0u);
             t.Equals(pixel, kExpectedPixel,
                      "HIGHLIGHT2 should add the shaded vertex alpha into RGB while preserving the texture alpha");
+        });
+
+        tc.Run("GS linear CT32 and T8 sampling skips zero-weight taps", [](TestCase &t)
+        {
+            constexpr uint32_t kTextureBase = 64u;
+            constexpr uint32_t kClutBase = 128u;
+            constexpr uint32_t kColors[4] = {
+                0xF02080E0u,
+                0x1080F020u,
+                0xC0E010A0u,
+                0x40A0D060u,
+            };
+
+            for (uint8_t psm : {GS_PSM_CT32, GS_PSM_T8})
+            {
+                std::vector<uint8_t> vram(PS2_GS_VRAM_SIZE, 0u);
+                GS gs;
+                gs.init(vram.data(), static_cast<uint32_t>(vram.size()), nullptr);
+
+                const uint64_t tex0 =
+                    (static_cast<uint64_t>(kTextureBase) << 0) |
+                    (1ull << 14) |
+                    (static_cast<uint64_t>(psm) << 20) |
+                    (2ull << 26) |
+                    (2ull << 30) |
+                    (1ull << 34) |
+                    (1ull << 35) |
+                    (static_cast<uint64_t>(kClutBase) << 37) |
+                    (static_cast<uint64_t>(GS_PSM_CT32) << 51) |
+                    (1ull << 61);
+
+                if (psm == GS_PSM_CT32)
+                {
+                    gs.WriteVram(psm, kTextureBase, 1u, 0u, 0u, kColors[0]);
+                    gs.WriteVram(psm, kTextureBase, 1u, 1u, 0u, kColors[1]);
+                    gs.WriteVram(psm, kTextureBase, 1u, 0u, 1u, kColors[2]);
+                    gs.WriteVram(psm, kTextureBase, 1u, 1u, 1u, kColors[3]);
+                }
+                else
+                {
+                    const uint8_t indices[4] = {1u, 2u, 3u, 4u};
+                    const uint32_t x[4] = {0u, 1u, 0u, 1u};
+                    const uint32_t y[4] = {0u, 0u, 1u, 1u};
+                    for (size_t index = 0u; index < 4u; ++index)
+                    {
+                        vram[GSPSMT8::addrPSMT8(
+                            kTextureBase, 1u, x[index], y[index])] =
+                            indices[index];
+                        writeReferencePSMCT32Pixel(
+                            vram,
+                            kClutBase,
+                            1u,
+                            indices[index],
+                            0u,
+                            kColors[index]);
+                    }
+                }
+
+                constexpr uint64_t kLinearTex1 =
+                    (1ull << 5) |
+                    (1ull << 6);
+                constexpr uint64_t kPrim =
+                    static_cast<uint64_t>(GS_PRIM_SPRITE) |
+                    (1ull << 4) |
+                    (1ull << 8);
+                gs.writeRegister(GS_REG_CLAMP_1, 5ull);
+                gs.writeRegister(GS_REG_TEX0_1, tex0);
+                gs.writeRegister(GS_REG_TEX1_1, kLinearTex1);
+                gs.writeRegister(GS_REG_PRIM, kPrim);
+
+                GSRasterizer rasterizer;
+                for (uint8_t weightV = 0u; weightV < 16u; ++weightV)
+                {
+                    for (uint8_t weightU = 0u; weightU < 16u; ++weightU)
+                    {
+                        size_t requestedReads = 0u;
+                        const auto selectedTaps =
+                            GSRasterizerDetail::readRequiredBilinearTaps(
+                                weightU,
+                                weightV,
+                                [&](int uIndex, int vIndex)
+                                {
+                                    ++requestedReads;
+                                    const size_t index = static_cast<size_t>(
+                                        vIndex * 2 + uIndex);
+                                    return GSRasterizerDetail::LinearTextureTap{
+                                        static_cast<uint32_t>(index),
+                                        kColors[index],
+                                    };
+                                });
+                        const size_t expectedReads =
+                            (weightU == 0u ? 1u : 2u) *
+                            (weightV == 0u ? 1u : 2u);
+                        const uint32_t expectedColor =
+                            referenceBilinearColor4(
+                                kColors[0],
+                                kColors[1],
+                                kColors[2],
+                                kColors[3],
+                                weightU,
+                                weightV);
+                        const uint16_t u =
+                            static_cast<uint16_t>(8u + weightU);
+                        const uint16_t v =
+                            static_cast<uint16_t>(8u + weightV);
+                        const uint32_t publicColor = rasterizer.sampleTexture(
+                            &gs, 0.0f, 0.0f, 1.0f, u, v);
+                        const std::string format =
+                            psm == GS_PSM_CT32 ? "CT32" : "T8";
+                        t.Equals(
+                            requestedReads,
+                            expectedReads,
+                            format + " linear tap selection should request only nonzero-weight taps");
+                        t.Equals(
+                            selectedTaps[0].color,
+                            kColors[0],
+                            format + " linear tap selection should preserve the base sample");
+                        t.Equals(
+                            publicColor,
+                            expectedColor,
+                            format + " linear sampling should match signed nested interpolation");
+                    }
+                }
+            }
         });
 
         tc.Run("GS TEX1 linear filter blends T4 STQ triangle samples", [](TestCase &t)
