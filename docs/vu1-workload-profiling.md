@@ -72,10 +72,20 @@ Every sample reports guest pairs and cycles, exit reason, allocation counts,
 PATH1 packet and byte counts, architectural-state and VU-data hashes, a
 per-invocation PATH1 hash, and a full-sample PATH1 hash. Recompiler records
 also distinguish C++ native entries, executed native blocks, linked edges,
-slow-link exits, native exit/fallback counters, and the complete program-cache
-and link delta. A sample is valid only when every invocation exactly matches
-the interpreter reference and a warm recompiler sample performs no
-compilation.
+slow-link exits, native exit/fallback counters, budget-guard classes, and the
+complete program-cache and link delta. The guard counters reconcile every
+block and pair:
+
+```text
+full_block_guards + precise_tail_entries == native_blocks
+full_guard_pairs + precise_tail_pairs == native_pairs
+```
+
+`budget_guard_comparisons` is the dynamic count of selector, precise-pair, and
+required terminal-boundary comparisons. `native_budget_exits` counts native
+calls which reach an exact scheduler boundary. A sample is valid only when
+every invocation exactly matches the interpreter reference and a warm
+recompiler sample performs no compilation.
 
 Cold compilation, warm execution, and forced cache churn are distinct events.
 Add cache churn without changing the warm sample:
@@ -89,6 +99,25 @@ taskset -c 6 BUILD/ps2xTest/vu_backend_benchmark FIXTURE 4096 \
 Each `cache-churn-sample` flushes the VU program cache before every timed
 invocation. It requires a recompiler-enabled backend selection and verifies
 the exact same output as the warm and cold paths.
+
+### Exact budget sweep
+
+`--budget-sweep on` is a correctness mode, not a timing mode. It resets the
+fixture state, VU data, and PATH1 sink for every budget from zero through one
+past the requested completion length, then compares interpreter and
+recompiler result, architectural state, data, and side effects:
+
+```sh
+BUILD/ps2xTest/vu_backend_benchmark FIXTURE 4096 \
+    --iterations 1 --warmup 1 --samples 1 \
+    --backend recompiler --scope core --budget-sweep on
+```
+
+The `budget-sweep` record reports the number of tested budgets and retired
+pairs plus the aggregate full/precise guard accounting. A nonzero native
+fault, an accounting mismatch, or the first semantic divergence fails the
+command. Ordinary benchmark records are still emitted afterward; do not use
+timings from a sweep process as performance evidence.
 
 ### Static block-analysis validation
 
@@ -148,12 +177,12 @@ perf report -i perf.jit.data
 
 Generated names encode the VU unit, whole-code content identity and extent,
 the generation at which that executable was compiled, entry PC, inclusive
-block PC range, normal or instrumented mode, and a process-unique compilation
-identity. A cache hit under a later guest generation does not duplicate the
-code-load record: the executable and its compilation identity are unchanged.
-New or replacement executable storage always receives a new compilation
-identity, preventing an old name from being confused with new code at a
-reused host address.
+block PC range, normal or instrumented mode, basic or linear block form, and a
+process-unique compilation identity. A cache hit under a later guest
+generation does not duplicate the code-load record: the executable and its
+compilation identity are unchanged. New or replacement executable storage
+always receives a new compilation identity, preventing an old name from being
+confused with new code at a reused host address.
 
 `PS2X_VU_BLOCK_PROFILE` adds cold-created records and dynamic counters for:
 
@@ -174,11 +203,13 @@ absent, emitted blocks contain none of those profile updates or branches.
 
 With block profiling enabled, `vu_backend_benchmark` appends one
 `block-profile-summary` and one `block-profile` JSON record per retained
-compilation. For a live runtime, pause the guest before requesting a coherent
-snapshot. `system.status` includes the first 16 records and reports whether
-they were truncated; the `vu.block-profile` debugger method returns pages of
-up to 256 records. Static opcode mixes identify the instruction families
-present in a sampled block, but they are not per-opcode sample attribution.
+compilation. Each record includes `block_form` so the adaptive basic-block and
+linear-trace populations can be attributed separately. For a live runtime,
+pause the guest before requesting a coherent snapshot. `system.status`
+includes the first 16 records and reports whether they were truncated; the
+`vu.block-profile` debugger method returns pages of up to 256 records. Static
+opcode mixes identify the instruction families present in a sampled block,
+but they are not per-opcode sample attribution.
 
 ### Hardware counters
 

@@ -33,7 +33,8 @@ itself.
 The low 32 result bits are the exact number of retired instruction pairs. The
 high 32 bits contain a `VuNativeBlockExit`. Generated code:
 
-- checks the remaining budget before every pair;
+- selects either a proven full-block budget guard or the precise per-pair
+  checker described below;
 - preserves the platform's nonvolatile registers and call-stack requirements;
 - saves MXCSR, selects round-toward-zero with DAZ and FTZ for VU work, and
   restores the caller's exact value on every exit;
@@ -63,6 +64,41 @@ terminal block cannot leak dirty upper lanes through the ABI.
 Set `PS2X_VU_BLOCK_LINKING=0` before backend creation to retain the canonical
 C++ dispatch path for controlled A/B diagnosis; linking is enabled by default
 and its state is exposed in debugger and benchmark diagnostics.
+
+## Exact block-budget guards
+
+Budget guards are enabled by default. For a branch-bounded basic block, the
+emitter produces an unchecked full body and a checked precise body. Host and
+linked entries compute the remaining scheduler budget and compare it once
+with the block's proven retiring cost. A sufficient budget enters the full
+body; a budget which ends within the block enters the old per-pair checker.
+The executed-pair count remains exact on dynamic helper and control-flow exits.
+An unsupported boundary reserves one additional unit in the selector so exact
+budget exhaustion still takes precedence over the unsupported exit.
+
+Every linked successor runs its own selector. An exact budget ending on a
+linked boundary is corrected before the target is counted or profiled, so no
+phantom target execution is exposed. Branch, E-bit, XGKICK, program-end,
+unsupported, instrumentation, verification, and pipeline barriers remain
+explicit IR block boundaries or native exits.
+
+Duplicating the body of a 64-pair linear trace increased executable footprint
+and hurt branch-heavy workloads. The runtime therefore uses an adaptive form:
+
+- fewer than 256 remaining cycles select branch-bounded basic blocks with the
+  full/precise selector;
+- 256 or more remaining cycles select the compact linear-trace form with its
+  precise per-pair checker.
+
+The threshold is four times the current 64-pair maximum block size. A C++ host
+re-entry may switch forms as its remaining budget changes; a native linked
+chain keeps one form throughout. `VuProgramKey.blockForm` is part of cache
+identity and link compatibility, so basic and linear-trace code cannot alias
+or link to each other. JIT symbols and block-profile JSON include the selected
+form.
+
+Set `PS2X_VU_BLOCK_BUDGET_GUARDS=0` before backend creation to retain the
+Phase-3 linear-trace checker for controlled differential measurements.
 
 The backend can keep delicate pairs on permanent semantic helpers while
 lowering the measured FMAC/conversion, integer, memory, DIV, and branch
@@ -121,6 +157,15 @@ executed block, including linked successors, and therefore equals
 abandoned resolutions after cache churn, incompatible edges, block
 completions, and all ten native exit reasons have separate cumulative
 counters. The native-exit array sums to `nativeBlocks`.
+Budget diagnostics additionally satisfy:
+
+- `fullBlockGuards + preciseTailEntries == nativeBlocks`;
+- `fullGuardPairs + preciseTailPairs == nativePairs`;
+- `budgetGuardComparisons` counts selector, precise-pair, and required
+  terminal-boundary comparisons; and
+- `nativeBudgetExits` counts native calls which reach the scheduler boundary,
+  including an exact full-block boundary.
+
 Opt-in block profiles update executions, pairs, budget classes, helper
 barriers, linked edges, and exits inside generated code, so their totals remain
 exact when the C++ accounting loop is bypassed.
@@ -154,6 +199,12 @@ Focused tests cover:
 
 - every possible cycle-budget cut through a synthetic FMAC, Q, memory, branch,
   and E-bit program on both VU0 and VU1;
+- guarded/precise selection, linked-target guards, exact linked-boundary
+  correction, unsupported-boundary precedence, and coexistence of both block
+  forms in one cache;
+- every budget from zero through one past completion for all prefixes of the
+  four retained RAC1 fixtures, including exact state, data, exit, and PATH1
+  comparison with the interpreter;
 - VU0 MicroMem branch wrapping and EE-visible synchronization boundaries;
 - cold compilation, warm hits, generation replacement, and stale handles;
 - static and dynamic self-links, warm host-entry reduction, exact linked
