@@ -3,13 +3,22 @@
 
 namespace ps2_syscalls
 {
-    std::vector<GuestThreadDebugSnapshot> debugThreadSnapshots()
+    std::vector<GuestThreadDebugSnapshot> debugThreadSnapshots(
+        PS2Runtime *runtime)
     {
+        if (!runtime)
+        {
+            return {};
+        }
+
+        EeThreadRuntimeState &state =
+            runtime->eeThreadRuntimeState();
         std::vector<std::pair<int, std::shared_ptr<ThreadInfo>>> threads;
         {
-            std::lock_guard<std::mutex> lock(g_thread_map_mutex);
-            threads.reserve(g_threads.size());
-            for (const auto &[id, info] : g_threads)
+            std::lock_guard<std::mutex> lock(
+                state.threadMapMutex);
+            threads.reserve(state.threads.size());
+            for (const auto &[id, info] : state.threads)
             {
                 threads.emplace_back(id, info);
             }
@@ -180,7 +189,7 @@ namespace ps2_syscalls
         // The EE bootstrap thread begins at priority 0. The linked helper
         // normally creates its priority-0 top thread and promotes the caller
         // to 1; preserve that caller-visible transition when collapsing it.
-        auto info = ensureCurrentThreadInfo(ctx);
+        auto info = ensureCurrentThreadInfo(runtime, ctx);
         {
             std::lock_guard<std::mutex> lock(info->m);
             info->currentPriority = 1;
@@ -207,6 +216,14 @@ namespace ps2_syscalls
             return;
         }
 
+        if (!runtime)
+        {
+            setReturnS32(ctx, KE_ERROR);
+            return;
+        }
+
+        EeThreadRuntimeState &state =
+            runtime->eeThreadRuntimeState();
         auto info = std::make_shared<ThreadInfo>();
         info->entry = param[1];
         info->stack = param[2];
@@ -225,19 +242,27 @@ namespace ps2_syscalls
 
         int id = 0;
         {
-            std::lock_guard<std::mutex> lock(g_thread_map_mutex);
+            std::lock_guard<std::mutex> lock(
+                state.threadMapMutex);
+            info->generation = state.nextGeneration++;
+            info->boundContext = &info->context;
             // Keep IDs in the classic low range used by patched libkernel helpers.
             for (int attempts = 0; attempts < 0xFE; ++attempts)
             {
-                if (g_nextThreadId < 2 || g_nextThreadId > 0xFF)
+                if (state.nextThreadId < 2 ||
+                    state.nextThreadId > 0xFF)
                 {
-                    g_nextThreadId = 2;
+                    state.nextThreadId = 2;
                 }
 
-                const int candidate = g_nextThreadId;
-                g_nextThreadId = (g_nextThreadId >= 0xFF) ? 2 : (g_nextThreadId + 1);
+                const int candidate = state.nextThreadId;
+                state.nextThreadId =
+                    (state.nextThreadId >= 0xFF)
+                        ? 2
+                        : (state.nextThreadId + 1);
 
-                if (g_threads.find(candidate) == g_threads.end())
+                if (state.threads.find(candidate) ==
+                    state.threads.end())
                 {
                     id = candidate;
                     break;
@@ -250,7 +275,7 @@ namespace ps2_syscalls
                 return;
             }
 
-            g_threads[id] = info;
+            state.threads[id] = info;
         }
 
         RUNTIME_LOG("[CreateThread] id=" << id
@@ -272,7 +297,7 @@ namespace ps2_syscalls
             return;
         }
 
-        auto info = lookupThreadInfo(tid);
+        auto info = lookupThreadInfo(runtime, tid);
         if (!info)
         {
             setReturnS32(ctx, KE_ERROR);
@@ -298,8 +323,11 @@ namespace ps2_syscalls
         }
 
         {
-            std::lock_guard<std::mutex> lock(g_thread_map_mutex);
-            g_threads.erase(tid);
+            EeThreadRuntimeState &state =
+                runtime->eeThreadRuntimeState();
+            std::lock_guard<std::mutex> lock(
+                state.threadMapMutex);
+            state.threads.erase(tid);
         }
 
         {
@@ -325,7 +353,7 @@ namespace ps2_syscalls
             return;
         }
 
-        auto info = lookupThreadInfo(tid);
+        auto info = lookupThreadInfo(runtime, tid);
         if (!info)
         {
             std::cerr << "StartThread error: unknown thread id " << tid << std::endl;
@@ -345,7 +373,7 @@ namespace ps2_syscalls
             return;
         }
 
-        joinHostThreadById(tid);
+        joinHostThreadById(runtime, tid);
 
         const uint32_t callerSp = getRegU32(ctx, 29);
         const uint32_t callerGp = getRegU32(ctx, 28);
@@ -388,7 +416,10 @@ namespace ps2_syscalls
             }
         }
 
-        g_activeThreads.fetch_add(1, std::memory_order_relaxed);
+        EeThreadRuntimeState &threadState =
+            runtime->eeThreadRuntimeState();
+        threadState.activeHostThreads.fetch_add(
+            1, std::memory_order_relaxed);
         try
         {
             std::thread worker([=]() mutable
@@ -397,8 +428,8 @@ namespace ps2_syscalls
                 std::string name = "PS2Thread_" + std::to_string(tid);
                 ThreadNaming::SetCurrentThreadName(name);
             }
-            R5900Context threadCtxCopy{};
-            R5900Context *threadCtx = &threadCtxCopy;
+            R5900Context *threadCtx = &info->context;
+            *threadCtx = R5900Context{};
 
             {
                 std::lock_guard<std::mutex> lock(info->m);
@@ -547,8 +578,13 @@ namespace ps2_syscalls
 
             bool stillRegistered = false;
             {
-                std::lock_guard<std::mutex> lock(g_thread_map_mutex);
-                stillRegistered = (g_threads.find(tid) != g_threads.end());
+                EeThreadRuntimeState &state =
+                    runtime->eeThreadRuntimeState();
+                std::lock_guard<std::mutex> lock(
+                    state.threadMapMutex);
+                stillRegistered =
+                    state.threads.find(tid) !=
+                    state.threads.end();
             }
             if (!stillRegistered)
             {
@@ -571,13 +607,18 @@ namespace ps2_syscalls
             // Notify anybody waiting for termination (like TerminateThread)
             info->cv.notify_all();
 
-            g_activeThreads.fetch_sub(1, std::memory_order_relaxed); });
-            registerHostThread(tid, std::move(worker));
+            runtime->eeThreadRuntimeState()
+                .activeHostThreads.fetch_sub(
+                1, std::memory_order_relaxed); });
+            registerHostThread(
+                runtime, tid, std::move(worker));
         }
         catch (const std::exception &e)
         {
             std::cerr << "[StartThread] failed to spawn host thread for tid=" << tid << ": " << e.what() << std::endl;
-            g_activeThreads.fetch_sub(1, std::memory_order_relaxed);
+            runtime->eeThreadRuntimeState()
+                .activeHostThreads.fetch_sub(
+                1, std::memory_order_relaxed);
             std::lock_guard<std::mutex> lock(info->m);
             info->started = false;
             info->status = THS_DORMANT;
@@ -600,7 +641,7 @@ namespace ps2_syscalls
                                                                      << " RA=0x" << getRegU32(ctx, 31) << std::dec << " tid=" << g_currentThreadId << std::endl);
 
         runExitHandlersForThread(g_currentThreadId, rdram, ctx, runtime);
-        auto info = ensureCurrentThreadInfo(ctx);
+        auto info = ensureCurrentThreadInfo(runtime, ctx);
         if (info)
         {
             std::lock_guard<std::mutex> lock(info->m);
@@ -624,7 +665,7 @@ namespace ps2_syscalls
                                                                                     << " RA=0x" << getRegU32(ctx, 31) << std::dec << " tid=" << tid << std::endl);
 
         runExitHandlersForThread(tid, rdram, ctx, runtime);
-        auto info = ensureCurrentThreadInfo(ctx);
+        auto info = ensureCurrentThreadInfo(runtime, ctx);
         if (info)
         {
             std::lock_guard<std::mutex> lock(info->m);
@@ -639,8 +680,11 @@ namespace ps2_syscalls
             info->cv.notify_all();
         }
         {
-            std::lock_guard<std::mutex> lock(g_thread_map_mutex);
-            g_threads.erase(tid);
+            EeThreadRuntimeState &state =
+                runtime->eeThreadRuntimeState();
+            std::lock_guard<std::mutex> lock(
+                state.threadMapMutex);
+            state.threads.erase(tid);
         }
         throw ThreadExitException();
     }
@@ -655,7 +699,9 @@ namespace ps2_syscalls
         if (tid == 0)
             tid = g_currentThreadId;
 
-        auto info = (tid == g_currentThreadId) ? ensureCurrentThreadInfo(ctx) : lookupThreadInfo(tid);
+        auto info = (tid == g_currentThreadId)
+                        ? ensureCurrentThreadInfo(runtime, ctx)
+                        : lookupThreadInfo(runtime, tid);
         if (!info)
         {
             setReturnS32(ctx, KE_UNKNOWN_THID);
@@ -776,8 +822,8 @@ namespace ps2_syscalls
             tid == g_currentThreadId;
 
         auto info = suspendingCurrentThread
-                        ? ensureCurrentThreadInfo(ctx)
-                        : lookupThreadInfo(tid);
+                        ? ensureCurrentThreadInfo(runtime, ctx)
+                        : lookupThreadInfo(runtime, tid);
         if (!info)
         {
             setReturnS32(ctx, KE_UNKNOWN_THID);
@@ -850,7 +896,9 @@ namespace ps2_syscalls
         if (tid == 0)
             tid = g_currentThreadId;
 
-        auto info = (tid == g_currentThreadId) ? ensureCurrentThreadInfo(ctx) : lookupThreadInfo(tid);
+        auto info = (tid == g_currentThreadId)
+                        ? ensureCurrentThreadInfo(runtime, ctx)
+                        : lookupThreadInfo(runtime, tid);
         if (!info)
         {
             setReturnS32(ctx, KE_UNKNOWN_THID);
@@ -921,7 +969,9 @@ namespace ps2_syscalls
             tid = g_currentThreadId;
         }
 
-        auto info = (tid == g_currentThreadId) ? ensureCurrentThreadInfo(ctx) : lookupThreadInfo(tid);
+        auto info = (tid == g_currentThreadId)
+                        ? ensureCurrentThreadInfo(runtime, ctx)
+                        : lookupThreadInfo(runtime, tid);
         if (!info)
         {
             setReturnS32(ctx, unknownThreadResult);
@@ -966,7 +1016,7 @@ namespace ps2_syscalls
 
     void SleepThread(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
-        auto info = ensureCurrentThreadInfo(ctx);
+        auto info = ensureCurrentThreadInfo(runtime, ctx);
         if (!info)
         {
             setReturnS32(ctx, KE_UNKNOWN_THID);
@@ -1087,7 +1137,7 @@ namespace ps2_syscalls
             return;
         }
 
-        auto info = lookupThreadInfo(tid);
+        auto info = lookupThreadInfo(runtime, tid);
         if (!info)
         {
             // The raw EE wake syscall collapses a deleted ID to generic -1;
@@ -1166,7 +1216,9 @@ namespace ps2_syscalls
         if (tid == 0)
             tid = g_currentThreadId;
 
-        auto info = (tid == g_currentThreadId) ? ensureCurrentThreadInfo(ctx) : lookupThreadInfo(tid);
+        auto info = (tid == g_currentThreadId)
+                        ? ensureCurrentThreadInfo(runtime, ctx)
+                        : lookupThreadInfo(runtime, tid);
         if (!info)
         {
             setReturnS32(ctx, KE_UNKNOWN_THID);
@@ -1191,7 +1243,7 @@ namespace ps2_syscalls
             return;
         }
 
-        auto info = lookupThreadInfo(tid);
+        auto info = lookupThreadInfo(runtime, tid);
         if (!info)
         {
             setReturnS32(ctx, KE_UNKNOWN_THID);
@@ -1220,7 +1272,9 @@ namespace ps2_syscalls
         if (tid == 0)
             tid = g_currentThreadId;
 
-        auto info = (tid == g_currentThreadId) ? ensureCurrentThreadInfo(ctx) : lookupThreadInfo(tid);
+        auto info = (tid == g_currentThreadId)
+                        ? ensureCurrentThreadInfo(runtime, ctx)
+                        : lookupThreadInfo(runtime, tid);
         if (!info)
         {
             setReturnS32(ctx, KE_UNKNOWN_THID);
@@ -1322,7 +1376,7 @@ namespace ps2_syscalls
             return;
         }
 
-        auto info = lookupThreadInfo(tid);
+        auto info = lookupThreadInfo(runtime, tid);
         if (!info)
         {
             setReturnS32(ctx, KE_UNKNOWN_THID);

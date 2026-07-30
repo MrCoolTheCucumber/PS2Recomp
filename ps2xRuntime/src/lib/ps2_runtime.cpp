@@ -11,6 +11,7 @@
 #include "Kernel/Stubs/Audio.h"
 #include "Kernel/Stubs/GS.h"
 #include "Kernel/Stubs/MPEG.h"
+#include "Kernel/Syscalls/Helpers/ThreadRuntimeState.h"
 #include "ps2_host_backend.h"
 #include "ps2_iop_host.h"
 #include "ps2x/iop/iop_subsystem.h"
@@ -846,6 +847,8 @@ PS2Runtime::PS2Runtime(PS2RuntimeConfiguration configuration)
     : m_vu0(VuUnitId::Vu0),
       m_vu1(VuUnitId::Vu1)
 {
+    m_eeThreadRuntimeState =
+        std::make_unique<EeThreadRuntimeState>();
     const auto configureVuBackend =
         [&](VuUnit &unit, VuBackendKind requested,
             const char *environmentName)
@@ -1164,7 +1167,10 @@ PS2Runtime::~PS2Runtime()
             m_debugServer.reset();
         }
 #endif
-        ps2_syscalls::detachAllGuestHostThreads();
+        // Worker contexts and registries are owned by this runtime. Stop
+        // notification releases every kernel wait, so workers must be joined
+        // before those runtime-owned objects are destroyed.
+        ps2_syscalls::joinAllGuestHostThreads(this);
         m_iopSubsystem.reset();
         m_iopHost.reset();
 #if defined(PLATFORM_VITA)
@@ -1199,6 +1205,24 @@ PS2Runtime::~PS2Runtime()
     {
         std::cerr << "[~PS2Runtime] cleanup exception: unknown" << std::endl;
     }
+}
+
+EeThreadRuntimeState &PS2Runtime::eeThreadRuntimeState()
+{
+    return *m_eeThreadRuntimeState;
+}
+
+const EeThreadRuntimeState &PS2Runtime::eeThreadRuntimeState() const
+{
+    return *m_eeThreadRuntimeState;
+}
+
+int PS2Runtime::activeEeHostThreadCount() const
+{
+    return m_eeThreadRuntimeState
+        ? m_eeThreadRuntimeState->activeHostThreads.load(
+              std::memory_order_acquire)
+        : 0;
 }
 
 void PS2Runtime::setIopPluginSearchPaths(std::vector<std::filesystem::path> paths)
@@ -8744,7 +8768,7 @@ void PS2Runtime::requestStop()
     }
     m_debugControlCv.notify_all();
     m_audioBackend.setDebuggerPaused(false);
-    ps2_syscalls::notifyRuntimeStop();
+    ps2_syscalls::notifyRuntimeStop(this);
 }
 
 bool PS2Runtime::isStopRequested() const
@@ -8794,7 +8818,7 @@ void PS2Runtime::run()
     Texture2D frameTex = LoadTextureFromImage(blank);
     UnloadImage(blank);
 
-    g_activeThreads.store(1, std::memory_order_relaxed);
+    m_eeThreadRuntimeState->activeHostThreads.store(1, std::memory_order_relaxed);
     std::atomic<bool> gameThreadFinished{false};
 
     // Arm emulated VSync before the first guest instruction so event mode has
@@ -8820,11 +8844,11 @@ void PS2Runtime::run()
         {
             std::cerr << "Error during program execution: unknown exception" << std::endl;
         }
-        g_activeThreads.fetch_sub(1, std::memory_order_relaxed);
+        m_eeThreadRuntimeState->activeHostThreads.fetch_sub(1, std::memory_order_relaxed);
         gameThreadFinished.store(true, std::memory_order_release); });
 
     uint64_t tick = 0;
-    while (!isStopRequested() && g_activeThreads.load(std::memory_order_relaxed) > 0)
+    while (!isStopRequested() && m_eeThreadRuntimeState->activeHostThreads.load(std::memory_order_relaxed) > 0)
     {
         PS2_IF_AGRESSIVE_LOGS({
             tick++;
@@ -8839,7 +8863,7 @@ void PS2Runtime::run()
                 const uint32_t dbgRa = m_debugRa.load(std::memory_order_relaxed);
                 const uint32_t dbgSp = m_debugSp.load(std::memory_order_relaxed);
                 const uint32_t dbgGp = m_debugGp.load(std::memory_order_relaxed);
-                const int activeThreads = g_activeThreads.load(std::memory_order_relaxed);
+                const int activeThreads = m_eeThreadRuntimeState->activeHostThreads.load(std::memory_order_relaxed);
 
                 RUNTIME_LOG("[run:tick] tick=" << tick
                                                << " pc=0x" << std::hex << dbgPc
@@ -8914,32 +8938,32 @@ void PS2Runtime::run()
     }
 
     const auto workerDeadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(1000);
-    while (g_activeThreads.load(std::memory_order_relaxed) > 0 &&
+    while (m_eeThreadRuntimeState->activeHostThreads.load(std::memory_order_relaxed) > 0 &&
            std::chrono::steady_clock::now() < workerDeadline)
     {
         std::this_thread::sleep_for(std::chrono::milliseconds(1));
     }
 
-    if (g_activeThreads.load(std::memory_order_relaxed) > 0)
+    if (m_eeThreadRuntimeState->activeHostThreads.load(std::memory_order_relaxed) > 0)
     {
         requestStop();
         const auto finalWorkerDeadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(1000);
-        while (g_activeThreads.load(std::memory_order_relaxed) > 0 &&
+        while (m_eeThreadRuntimeState->activeHostThreads.load(std::memory_order_relaxed) > 0 &&
                std::chrono::steady_clock::now() < finalWorkerDeadline)
         {
             std::this_thread::sleep_for(std::chrono::milliseconds(1));
         }
     }
 
-    if (g_activeThreads.load(std::memory_order_relaxed) == 0)
+    if (m_eeThreadRuntimeState->activeHostThreads.load(std::memory_order_relaxed) == 0)
     {
-        ps2_syscalls::joinAllGuestHostThreads();
+        ps2_syscalls::joinAllGuestHostThreads(this);
     }
     else
     {
         std::cerr << "[run] guest host threads did not stop within timeout; detaching remaining worker threads"
                   << std::endl;
-        ps2_syscalls::detachAllGuestHostThreads();
+        ps2_syscalls::detachAllGuestHostThreads(this);
     }
 
     if (m_debugUiInitialized && m_debugUiShutdownCallback)
@@ -9031,7 +9055,7 @@ void PS2Runtime::run()
     UnloadTexture(frameTex);
     CloseWindow();
 
-    const int remainingThreads = g_activeThreads.load(std::memory_order_relaxed);
+    const int remainingThreads = m_eeThreadRuntimeState->activeHostThreads.load(std::memory_order_relaxed);
     RUNTIME_LOG("[run] exiting loop, activeThreads=" << remainingThreads);
     if (remainingThreads > 0)
     {

@@ -319,7 +319,7 @@ namespace ps2_syscalls
             return;
         }
 
-        auto info = ensureCurrentThreadInfo(ctx);
+        auto info = ensureCurrentThreadInfo(runtime, ctx);
         throwIfTerminated(info);
 
         std::unique_lock<std::mutex> lock(sema->m);
@@ -690,7 +690,7 @@ namespace ps2_syscalls
             return;
         }
 
-        auto tInfo = ensureCurrentThreadInfo(ctx);
+        auto tInfo = ensureCurrentThreadInfo(runtime, ctx);
         throwIfTerminated(tInfo);
         int ret = KE_OK;
 

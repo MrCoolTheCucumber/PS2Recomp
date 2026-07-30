@@ -644,7 +644,8 @@ struct PS2DebugServer::Impl
             runtime.vu0().getProgressSnapshot();
         const VuProgressSnapshot vu1 =
             runtime.vu1().getProgressSnapshot();
-        const auto threads = ps2_syscalls::debugThreadSnapshots();
+        const auto threads =
+            ps2_syscalls::debugThreadSnapshots(&runtime);
 
         PS2WatchdogSample sample{};
         sample.dispatches = core.dispatches;
@@ -1626,7 +1627,8 @@ struct PS2DebugServer::Impl
         const PS2Runtime::DebugFaultInfo fault =
             runtime.debugFaultSnapshot();
         const auto branches = runtime.debugBranchHistory(256u);
-        auto threads = ps2_syscalls::debugThreadSnapshots();
+        auto threads =
+            ps2_syscalls::debugThreadSnapshots(&runtime);
         const PS2AudioStreamDebugSnapshot audio =
             runtime.audioBackend().streamDebugSnapshot();
 

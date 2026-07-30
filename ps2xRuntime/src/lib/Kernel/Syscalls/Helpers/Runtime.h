@@ -87,28 +87,53 @@ static void waitWhileSuspended(const std::shared_ptr<ThreadInfo> &info, PS2Runti
     }
 }
 
-static std::shared_ptr<ThreadInfo> lookupThreadInfo(int tid)
+static std::shared_ptr<ThreadInfo> lookupThreadInfo(
+    PS2Runtime *runtime,
+    int tid)
 {
-    std::lock_guard<std::mutex> lock(g_thread_map_mutex);
-    auto it = g_threads.find(tid);
-    if (it != g_threads.end())
+    if (!runtime)
+    {
+        return nullptr;
+    }
+
+    EeThreadRuntimeState &state =
+        runtime->eeThreadRuntimeState();
+    std::lock_guard<std::mutex> lock(
+        state.threadMapMutex);
+    auto it = state.threads.find(tid);
+    if (it != state.threads.end())
     {
         return it->second;
     }
     return nullptr;
 }
 
-static std::shared_ptr<ThreadInfo> ensureCurrentThreadInfo(R5900Context *ctx)
+static std::shared_ptr<ThreadInfo> ensureCurrentThreadInfo(
+    PS2Runtime *runtime,
+    R5900Context *ctx)
 {
-    const int tid = g_currentThreadId;
-    std::lock_guard<std::mutex> lock(g_thread_map_mutex);
-    auto it = g_threads.find(tid);
-    if (it != g_threads.end())
+    if (!runtime)
     {
+        return nullptr;
+    }
+
+    const int tid = g_currentThreadId;
+    EeThreadRuntimeState &state =
+        runtime->eeThreadRuntimeState();
+    std::lock_guard<std::mutex> lock(
+        state.threadMapMutex);
+    auto it = state.threads.find(tid);
+    if (it != state.threads.end())
+    {
+        if (ctx && !it->second->boundContext)
+        {
+            it->second->boundContext = ctx;
+        }
         return it->second;
     }
 
     auto info = std::make_shared<ThreadInfo>();
+    info->generation = state.nextGeneration++;
     info->started = true;
     info->status = THS_RUN;
     info->priority = 0u;
@@ -119,11 +144,12 @@ static std::shared_ptr<ThreadInfo> ensureCurrentThreadInfo(R5900Context *ctx)
         info->entry = ctx->pc;
         info->stack = getRegU32(ctx, 29);
         info->gp = getRegU32(ctx, 28);
+        info->boundContext = ctx;
     }
     info->waitType = TSW_NONE;
     info->waitId = 0;
 
-    g_threads.emplace(tid, info);
+    state.threads.emplace(tid, info);
     return info;
 }
 

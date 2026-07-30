@@ -12,8 +12,6 @@
 
 std::string translatePs2Path(const char *ps2Path);
 
-extern std::atomic<int> g_activeThreads;
-
 inline std::mutex g_sys_fd_mutex;
 
 namespace ps2_syscalls
@@ -55,9 +53,9 @@ namespace ps2_syscalls
     bool isIntcCauseEnabled(uint32_t cause);
     void initializeGuestKernelState(uint8_t *rdram);
     void TODO(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime, uint32_t encodedSyscallId);
-    void notifyRuntimeStop();
-    void joinAllGuestHostThreads();
-    void detachAllGuestHostThreads();
+    void notifyRuntimeStop(PS2Runtime *runtime = nullptr);
+    void joinAllGuestHostThreads(PS2Runtime *runtime);
+    void detachAllGuestHostThreads(PS2Runtime *runtime);
     void EnsureVSyncScheduled(uint8_t *rdram, PS2Runtime *runtime);
     uint64_t GetCurrentVSyncTick();
     uint64_t PublishVSyncStart(uint8_t *rdram, PS2Runtime *runtime);
@@ -71,7 +69,8 @@ namespace ps2_syscalls
         PS2Runtime *runtime,
         R5900Context *ctx = nullptr);
     void WaitVSyncTick(uint8_t *rdram, PS2Runtime *runtime);
-    std::vector<GuestThreadDebugSnapshot> debugThreadSnapshots();
+    std::vector<GuestThreadDebugSnapshot> debugThreadSnapshots(
+        PS2Runtime *runtime);
 }
 
 #endif // PS2_SYSCALLS_H

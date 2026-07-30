@@ -761,7 +761,7 @@ namespace
         }
     }
 
-    void drawThreadsTab()
+    void drawThreadsTab(PS2Runtime &runtime)
     {
         struct ThreadRow
         {
@@ -782,10 +782,13 @@ namespace
         };
 
         std::vector<ThreadRow> rows;
+        EeThreadRuntimeState &threadState =
+            runtime.eeThreadRuntimeState();
         {
-            std::lock_guard<std::mutex> lock(g_thread_map_mutex);
-            rows.reserve(g_threads.size());
-            for (const auto &[id, ptr] : g_threads)
+            std::lock_guard<std::mutex> lock(
+                threadState.threadMapMutex);
+            rows.reserve(threadState.threads.size());
+            for (const auto &[id, ptr] : threadState.threads)
             {
                 if (!ptr)
                 {
@@ -813,7 +816,10 @@ namespace
             }
         }
 
-        ImGui::Text("Threads: %zu activeThreads=%d", rows.size(), g_activeThreads.load(std::memory_order_relaxed));
+        ImGui::Text(
+            "Threads: %zu activeThreads=%d",
+            rows.size(),
+            runtime.activeEeHostThreadCount());
         if (ImGui::BeginTable("threads", 12, ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg | ImGuiTableFlags_Resizable | ImGuiTableFlags_ScrollY, ImVec2(0, 320)))
         {
             ImGui::TableSetupColumn("ID");
@@ -2254,7 +2260,7 @@ void PS2DebugPanel::draw(PS2Runtime &runtime)
             }
             if (ImGui::BeginTabItem("Threads"))
             {
-                drawThreadsTab();
+                drawThreadsTab(runtime);
                 ImGui::EndTabItem();
             }
             if (ImGui::BeginTabItem("Kernel"))

@@ -6,7 +6,7 @@ namespace ps2_syscalls
 {
     using namespace interrupt_state;
 
-    void notifyRuntimeStop()
+    void notifyRuntimeStop(PS2Runtime *runtime)
     {
         {
             std::lock_guard<std::mutex> lock(g_irq_handler_mutex);
@@ -25,17 +25,23 @@ namespace ps2_syscalls
 
         std::vector<std::shared_ptr<ThreadInfo>> threads;
         threads.reserve(32);
+        if (runtime)
         {
-            std::lock_guard<std::mutex> lock(g_thread_map_mutex);
-            for (const auto &entry : g_threads)
+            EeThreadRuntimeState &state =
+                runtime->eeThreadRuntimeState();
+            std::lock_guard<std::mutex> lock(
+                state.threadMapMutex);
+            for (const auto &entry : state.threads)
             {
                 if (entry.second)
                 {
                     threads.push_back(entry.second);
                 }
             }
-            g_threads.clear();
-            g_nextThreadId = 2; // Reserve id 1 for main thread.
+            state.threads.clear();
+            state.nextThreadId = 2;
+            state.currentThreadId.store(
+                1, std::memory_order_release);
         }
         g_currentThreadId = 1;
 
@@ -103,13 +109,13 @@ namespace ps2_syscalls
         }
     }
 
-    void joinAllGuestHostThreads()
+    void joinAllGuestHostThreads(PS2Runtime *runtime)
     {
-        joinAllHostThreads();
+        joinAllHostThreads(runtime);
     }
 
-    void detachAllGuestHostThreads()
+    void detachAllGuestHostThreads(PS2Runtime *runtime)
     {
-        detachAllHostThreads();
+        detachAllHostThreads(runtime);
     }
 }

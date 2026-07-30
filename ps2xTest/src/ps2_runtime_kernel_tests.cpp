@@ -3991,22 +3991,22 @@ void register_ps2_runtime_kernel_tests()
                 [&](PS2Runtime &runtime, const std::string &label)
                 {
                     bool finished = waitUntil(
-                        []()
+                        [&runtime]()
                         {
-                            return g_activeThreads.load(
-                                       std::memory_order_acquire) ==
+                            return runtime
+                                       .activeEeHostThreadCount() ==
                                    0;
                         },
                         std::chrono::milliseconds(500));
                     if (!finished)
                     {
                         runtime.requestStop();
-                        notifyRuntimeStop();
+                        notifyRuntimeStop(&runtime);
                         finished = waitUntil(
-                            []()
+                            [&runtime]()
                             {
-                                return g_activeThreads.load(
-                                           std::memory_order_acquire) ==
+                                return runtime
+                                           .activeEeHostThreadCount() ==
                                        0;
                             },
                             std::chrono::milliseconds(500));
@@ -4017,11 +4017,11 @@ void register_ps2_runtime_kernel_tests()
                             " should retire every guest host worker");
                     if (finished)
                     {
-                        joinAllGuestHostThreads();
+                        joinAllGuestHostThreads(&runtime);
                     }
                     else
                     {
-                        detachAllGuestHostThreads();
+                        detachAllGuestHostThreads(&runtime);
                     }
                 };
 
@@ -4094,7 +4094,7 @@ void register_ps2_runtime_kernel_tests()
                     std::string(expectation.name) +
                         " reset worker should reach its expected state");
 
-                notifyRuntimeStop();
+                notifyRuntimeStop(&env.runtime);
                 t.IsFalse(
                     env.runtime.isStopRequested(),
                     std::string(

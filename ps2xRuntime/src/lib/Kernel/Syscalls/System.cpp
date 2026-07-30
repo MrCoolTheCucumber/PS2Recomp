@@ -1095,7 +1095,7 @@ namespace ps2_syscalls
     // GetThreadTLS (stub): return 0
     void GetThreadTLS(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
-        auto info = ensureCurrentThreadInfo(ctx);
+        auto info = ensureCurrentThreadInfo(runtime, ctx);
         if (!info)
         {
             setReturnU32(ctx, 0);

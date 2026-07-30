@@ -4,38 +4,10 @@
 #include <cstdint>
 #include <thread>
 
+#include "ThreadRuntimeState.h"
+
 inline std::unordered_map<int, FILE *> g_fileDescriptors;
 inline int g_nextFd = 3; // Start after stdin, stdout, stderr
-
-struct ThreadInfo
-{
-    uint32_t entry = 0;
-    uint32_t stack = 0;
-    uint32_t stackSize = 0;
-    uint32_t gp = 0;
-    uint32_t priority = 0;
-    uint32_t attr = 0;
-    uint32_t option = 0;
-    uint32_t arg = 0;
-    bool started = false;
-    bool ownsStack = false;
-    uint32_t tlsBase = 0;
-
-    // Thread Status
-    int status = 0x10; // THS_DORMANT
-    int waitType = 0;  // TSW_NONE
-    int waitId = 0;
-    int wakeupCount = 0;
-    int currentPriority = 0;
-    int suspendCount = 0;
-    std::atomic<uint32_t> currentPc{0};
-
-    std::mutex m;
-    std::condition_variable cv;
-    std::atomic<bool> forceRelease{false};
-    std::atomic<bool> terminated{false};
-    std::atomic<bool> semaWaitLinked{false};
-};
 
 // Thread status
 #define THS_RUN 0x01
@@ -205,12 +177,7 @@ static constexpr uint32_t kFioSoIROth = 0x0004;
 static constexpr uint32_t kFioSoIWOth = 0x0002;
 static constexpr uint32_t kFioSoIXOth = 0x0001;
 
-inline std::unordered_map<int, std::shared_ptr<ThreadInfo>> g_threads;
-inline int g_nextThreadId = 2; // Reserve 1 for the main thread
 inline thread_local int g_currentThreadId = 1;
-inline std::mutex g_thread_map_mutex;
-inline std::unordered_map<int, std::thread> g_hostThreads;
-inline std::mutex g_host_thread_mutex;
 
 inline std::unordered_map<int, std::shared_ptr<SemaInfo>> g_semas;
 inline int g_nextSemaId = 0;
@@ -223,21 +190,35 @@ inline int g_nextAlarmId = 1;
 inline std::mutex g_alarm_mutex;
 inline std::condition_variable g_alarm_cv;
 inline std::once_flag g_alarm_worker_once;
-inline std::atomic<int> g_activeThreads{0};
 inline std::mutex g_fd_mutex;
 
-static void registerHostThread(int tid, std::thread worker)
+static void registerHostThread(
+    PS2Runtime *runtime,
+    int tid,
+    std::thread worker)
 {
+    if (!runtime)
+    {
+        if (worker.joinable())
+        {
+            worker.detach();
+        }
+        return;
+    }
+
+    EeThreadRuntimeState &state =
+        runtime->eeThreadRuntimeState();
     std::thread stale;
     {
-        std::lock_guard<std::mutex> lock(g_host_thread_mutex);
-        auto it = g_hostThreads.find(tid);
-        if (it != g_hostThreads.end())
+        std::lock_guard<std::mutex> lock(
+            state.hostThreadMutex);
+        auto it = state.hostThreads.find(tid);
+        if (it != state.hostThreads.end())
         {
             stale = std::move(it->second);
-            g_hostThreads.erase(it);
+            state.hostThreads.erase(it);
         }
-        g_hostThreads.emplace(tid, std::move(worker));
+        state.hostThreads.emplace(tid, std::move(worker));
     }
 
     if (stale.joinable())
@@ -253,16 +234,26 @@ static void registerHostThread(int tid, std::thread worker)
     }
 }
 
-static void joinHostThreadById(int tid)
+static void joinHostThreadById(
+    PS2Runtime *runtime,
+    int tid)
 {
+    if (!runtime)
+    {
+        return;
+    }
+
+    EeThreadRuntimeState &state =
+        runtime->eeThreadRuntimeState();
     std::thread worker;
     {
-        std::lock_guard<std::mutex> lock(g_host_thread_mutex);
-        auto it = g_hostThreads.find(tid);
-        if (it != g_hostThreads.end())
+        std::lock_guard<std::mutex> lock(
+            state.hostThreadMutex);
+        auto it = state.hostThreads.find(tid);
+        if (it != state.hostThreads.end())
         {
             worker = std::move(it->second);
-            g_hostThreads.erase(it);
+            state.hostThreads.erase(it);
         }
     }
 
@@ -281,57 +272,74 @@ static void joinHostThreadById(int tid)
     }
 }
 
-static void joinAllHostThreads()
+static void joinAllHostThreads(PS2Runtime *runtime)
 {
+    if (!runtime)
+    {
+        return;
+    }
+
+    EeThreadRuntimeState &state =
+        runtime->eeThreadRuntimeState();
     std::vector<std::thread> workers;
     {
-        std::lock_guard<std::mutex> lock(g_host_thread_mutex);
-        workers.reserve(g_hostThreads.size());
-        const std::thread::id selfId = std::this_thread::get_id();
-        for (auto it = g_hostThreads.begin(); it != g_hostThreads.end();)
+        std::lock_guard<std::mutex> lock(
+            state.hostThreadMutex);
+        workers.reserve(state.hostThreads.size());
+        const std::thread::id selfId =
+            std::this_thread::get_id();
+        for (auto it = state.hostThreads.begin();
+             it != state.hostThreads.end();)
         {
             std::thread &worker = it->second;
-            if (worker.joinable() && worker.get_id() == selfId)
+            if (worker.joinable() &&
+                worker.get_id() == selfId)
             {
                 ++it;
                 continue;
             }
 
             workers.push_back(std::move(worker));
-            it = g_hostThreads.erase(it);
+            it = state.hostThreads.erase(it);
         }
     }
 
     for (auto &worker : workers)
     {
-        if (!worker.joinable())
+        if (worker.joinable())
         {
-            continue;
+            worker.join();
         }
-        worker.join();
     }
 }
 
-static void detachAllHostThreads()
+static void detachAllHostThreads(PS2Runtime *runtime)
 {
+    if (!runtime)
+    {
+        return;
+    }
+
+    EeThreadRuntimeState &state =
+        runtime->eeThreadRuntimeState();
     std::vector<std::thread> workers;
     {
-        std::lock_guard<std::mutex> lock(g_host_thread_mutex);
-        workers.reserve(g_hostThreads.size());
-        for (auto &entry : g_hostThreads)
+        std::lock_guard<std::mutex> lock(
+            state.hostThreadMutex);
+        workers.reserve(state.hostThreads.size());
+        for (auto &entry : state.hostThreads)
         {
             workers.push_back(std::move(entry.second));
         }
-        g_hostThreads.clear();
+        state.hostThreads.clear();
     }
 
     for (auto &worker : workers)
     {
-        if (!worker.joinable())
+        if (worker.joinable())
         {
-            continue;
+            worker.detach();
         }
-        worker.detach();
     }
 }
 

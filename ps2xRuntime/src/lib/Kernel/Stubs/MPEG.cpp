@@ -2929,11 +2929,18 @@ namespace ps2_stubs
             }
 
             std::shared_ptr<ThreadInfo> currentThreadInfo = nullptr;
+            if (runtime)
             {
-                std::lock_guard<std::mutex> mapLock(g_thread_map_mutex);
-                auto it = g_threads.find(g_currentThreadId);
-                if (it != g_threads.end())
+                EeThreadRuntimeState &threadState =
+                    runtime->eeThreadRuntimeState();
+                std::lock_guard<std::mutex> mapLock(
+                    threadState.threadMapMutex);
+                auto it = threadState.threads.find(
+                    g_currentThreadId);
+                if (it != threadState.threads.end())
+                {
                     currentThreadInfo = it->second;
+                }
             }
 
             while (runtime &&

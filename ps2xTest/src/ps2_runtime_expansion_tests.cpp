@@ -7131,18 +7131,18 @@ void register_ps2_runtime_expansion_tests()
 
             const bool started = waitUntil([&]()
             {
-                return g_activeThreads.load(std::memory_order_relaxed) > 0;
+                return runtime.activeEeHostThreadCount() > 0;
             }, std::chrono::milliseconds(500));
             t.IsTrue(started, "worker thread should become active");
 
             runtime.requestStop();
             const bool drained = waitUntil([&]()
             {
-                return g_activeThreads.load(std::memory_order_relaxed) == 0;
+                return runtime.activeEeHostThreadCount() == 0;
             }, std::chrono::milliseconds(2000));
             t.IsTrue(drained, "requestStop should drain all guest worker threads");
 
-            notifyRuntimeStop();
+            notifyRuntimeStop(&runtime);
         });
 
         tc.Run("Semaphore poll/signal remains stable under host-thread contention", [](TestCase &t)

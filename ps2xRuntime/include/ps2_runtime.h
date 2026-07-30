@@ -47,6 +47,7 @@ namespace ps2x::iop
 class PS2IopHostAdapter;
 class PS2IopTransport;
 class PS2DebugServer;
+struct EeThreadRuntimeState;
 
 struct PS2RuntimeConfiguration
 {
@@ -1207,6 +1208,9 @@ public:
     {
         return m_guestExecutionWaiters.load(std::memory_order_acquire);
     }
+    EeThreadRuntimeState &eeThreadRuntimeState();
+    const EeThreadRuntimeState &eeThreadRuntimeState() const;
+    int activeEeHostThreadCount() const;
     bool guestPreemptionRequestedForTesting() const
     {
         return m_guestExecutionPreemptionRequested.load(
@@ -1683,6 +1687,7 @@ private:
     std::atomic<uint64_t> m_vu0CurrentInvocation{0u};
     std::atomic<uint64_t> m_vu0CurrentInvocationInstruction{0u};
     R5900Context m_cpuContext;
+    std::unique_ptr<EeThreadRuntimeState> m_eeThreadRuntimeState;
     R5900Context *m_boundEeContext = nullptr;
     mutable std::recursive_timed_mutex m_guestExecutionMutex;
     mutable std::atomic<uint32_t> m_guestExecutionWaiters{0u};
