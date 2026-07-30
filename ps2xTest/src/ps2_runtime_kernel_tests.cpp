@@ -15,9 +15,9 @@
 
 // g_currentThreadId is an `inline thread_local int` defined in the kernel's
 // internal State.h (ps2xRuntime/.../Kernel/Syscalls/Helpers/State.h, default 1).
-// Only sub-case H of the semaphore-return-value test reaches into it: the worker
-// thread sets its own guest tid so ReleaseWaitThread(tid) can target the exact
-// ThreadInfo that the worker's WaitSema put into THS_WAIT.
+// Current-thread authority tests deliberately corrupt this compatibility slot,
+// and sub-case H of the semaphore-return-value test currently uses it to give
+// a synthetic waiter an identity. Both uses disappear with the checked adapter.
 //
 // ODR-safety: this declaration MUST stay byte-for-byte type-compatible with that
 // definition (`thread_local int`, same name, no namespace). It is an `extern`
@@ -73,6 +73,7 @@ namespace
     constexpr uint32_t K_CONTROL_EVENT_PARAM_ADDR = 0x1890u;
     constexpr uint32_t K_CONTROL_SEMA_PARAM_ADDR = 0x18A0u;
     constexpr uint32_t K_RESCHEDULE_STAGE_ADDR = 0x18C0u;
+    constexpr uint32_t K_CURRENT_THREAD_ID_ADDR = 0x18D0u;
 
     struct EeThreadStatus
     {
@@ -377,6 +378,20 @@ namespace
         writeGuestU32(rdram, K_EXIT_DELETE_THREAD_STAGE_ADDR, 99u);
     }
 
+    void poisonedCurrentThreadIdHandler(
+        uint8_t *rdram,
+        R5900Context *ctx,
+        PS2Runtime *runtime)
+    {
+        g_currentThreadId = 0x6A6A;
+        GetThreadId(rdram, ctx, runtime);
+        writeGuestU32(
+            rdram,
+            K_CURRENT_THREAD_ID_ADDR,
+            static_cast<uint32_t>(getRegS32(*ctx, 2)));
+        ctx->pc = 0u;
+    }
+
     void controlSleepWaitHandler(
         uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
@@ -610,6 +625,92 @@ void register_ps2_runtime_kernel_tests()
                 survivingStatus.func,
                 kFirstEntry,
                 "the surviving runtime should retain its thread after peer destruction");
+        });
+
+        tc.Run("runtime context binding owns current EE thread selection", [](TestCase &t)
+        {
+            TestEnv env;
+
+            g_currentThreadId = 0x5A5A;
+            {
+                PS2Runtime::GuestExecutionScope guestExecution(
+                    &env.runtime, &env.ctx);
+                GetThreadId(
+                    env.rdram.data(),
+                    &env.ctx,
+                    &env.runtime);
+            }
+            t.Equals(
+                getRegS32(env.ctx, 2),
+                1,
+                "a bound main context should ignore a corrupted TLS adapter");
+            g_currentThreadId = 1;
+
+            constexpr uint32_t kEntry = 0x00202500u;
+            env.runtime.registerFunction(
+                kEntry, &poisonedCurrentThreadIdHandler);
+            const uint32_t threadParam[9] = {
+                0u,
+                kEntry,
+                0x00302500u,
+                0x00000800u,
+                0u,
+                40u,
+                0u,
+                0u,
+                0u,
+            };
+            writeGuestWords(
+                env.rdram.data(),
+                K_PARAM_ADDR,
+                threadParam,
+                std::size(threadParam));
+
+            R5900Context createCtx{};
+            setRegU32(createCtx, 4, K_PARAM_ADDR);
+            CreateThread(
+                env.rdram.data(),
+                &createCtx,
+                &env.runtime);
+            const int32_t tid = getRegS32(createCtx, 2);
+            t.IsTrue(
+                tid >= 2,
+                "the current-selection worker should be created");
+
+            R5900Context startCtx{};
+            setRegU32(
+                startCtx, 4, static_cast<uint32_t>(tid));
+            StartThread(
+                env.rdram.data(),
+                &startCtx,
+                &env.runtime);
+            t.Equals(
+                getRegS32(startCtx, 2),
+                tid,
+                "the current-selection worker should start");
+
+            const bool dormant = waitUntil([&]()
+            {
+                R5900Context statusCtx{};
+                setRegU32(
+                    statusCtx, 4, static_cast<uint32_t>(tid));
+                setRegU32(statusCtx, 5, K_STATUS_ADDR);
+                ReferThreadStatus(
+                    env.rdram.data(),
+                    &statusCtx,
+                    &env.runtime);
+                return getRegS32(statusCtx, 2) ==
+                       THS_DORMANT;
+            }, std::chrono::milliseconds(500));
+            t.IsTrue(
+                dormant,
+                "the current-selection worker should finish");
+            t.Equals(
+                static_cast<int32_t>(readGuestU32(
+                    env.rdram.data(),
+                    K_CURRENT_THREAD_ID_ADDR)),
+                tid,
+                "a bound worker context should ignore a corrupted TLS adapter");
         });
 
         tc.Run("start thread validates target and entry registration", [](TestCase &t)
