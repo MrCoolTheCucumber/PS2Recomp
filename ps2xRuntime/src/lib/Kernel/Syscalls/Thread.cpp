@@ -1058,6 +1058,10 @@ namespace ps2_syscalls
 
         const uint32_t callerSp = getRegU32(ctx, 29);
         const uint32_t callerGp = getRegU32(ctx, 28);
+        const uint32_t threadRootFunction =
+            runtime->eeKernelRuntimeState()
+                .threadRootFunction.load(
+                    std::memory_order_acquire);
 
         {
             std::lock_guard<std::mutex> lock(info->m);
@@ -1146,14 +1150,18 @@ namespace ps2_syscalls
             SET_GPR_U32(threadCtx, 29, threadSp);
             SET_GPR_U32(threadCtx, 28, threadGp);
             SET_GPR_U32(threadCtx, 4, info->arg);
-            SET_GPR_U32(threadCtx, 31, 0);
+            SET_GPR_U32(
+                threadCtx, 31, threadRootFunction);
             threadCtx->pc = info->entry;
 
             RUNTIME_LOG("[StartThread] id=" << tid
                       << " entry=0x" << std::hex << info->entry
                       << " sp=0x" << GPR_U32(threadCtx, 29)
                       << " gp=0x" << GPR_U32(threadCtx, 28)
-                      << " arg=0x" << info->arg << std::dec << std::endl);
+                      << " arg=0x" << info->arg
+                      << " ra=0x"
+                      << GPR_U32(threadCtx, 31)
+                      << std::dec << std::endl);
 
             bool exited = false;
             try

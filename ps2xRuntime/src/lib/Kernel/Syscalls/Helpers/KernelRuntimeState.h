@@ -1,5 +1,6 @@
 #pragma once
 
+#include <atomic>
 #include <cstdint>
 #include <mutex>
 #include <unordered_map>
@@ -17,6 +18,11 @@ struct ExitHandlerEntry
 // must never run while one is held.
 struct EeKernelRuntimeState
 {
+    // SetupThread installs the process root that the EE kernel writes to $ra
+    // for every subsequently started thread. A normal thread-function return
+    // reaches this root (typically ExitThread).
+    std::atomic<uint32_t> threadRootFunction{0u};
+
     std::mutex exitHandlerMutex;
     std::unordered_map<
         int,

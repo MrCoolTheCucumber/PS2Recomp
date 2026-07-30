@@ -701,6 +701,8 @@ namespace ps2_syscalls
 
         EeKernelRuntimeState &state =
             runtime->eeKernelRuntimeState();
+        state.threadRootFunction.store(
+            0u, std::memory_order_release);
         std::lock_guard<std::mutex> lock(
             state.syscallOverrideMutex);
         for (uint32_t guestAddr :
@@ -755,10 +757,24 @@ namespace ps2_syscalls
     // args: $a0 = gp, $a1 = stack, $a2 = stack_size, $a3 = args, $t0 = root_func
     void SetupThread(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
+        // The retail EE kernel stores its 0x2A0-byte saved thread context at
+        // the top of an explicitly supplied stack and returns the first byte
+        // below that context as the initial main-thread stack pointer.
+        static constexpr uint32_t kThreadContextReserve = 0x2A0u;
+
         const uint32_t gp = getRegU32(ctx, 4);
         const uint32_t stack = getRegU32(ctx, 5);
         const int32_t stackSizeSigned = static_cast<int32_t>(getRegU32(ctx, 6));
+        const uint32_t rootFunction = getRegU32(ctx, 8);
         const uint32_t currentSp = getRegU32(ctx, 29);
+
+        if (runtime)
+        {
+            runtime->eeKernelRuntimeState()
+                .threadRootFunction.store(
+                    rootFunction,
+                    std::memory_order_release);
+        }
 
         if (gp != 0u)
         {
@@ -789,7 +805,10 @@ namespace ps2_syscalls
         {
             if (stackSizeSigned > 0)
             {
-                sp = stack + static_cast<uint32_t>(stackSizeSigned);
+                sp =
+                    stack +
+                    static_cast<uint32_t>(stackSizeSigned) -
+                    kThreadContextReserve;
             }
             else
             {

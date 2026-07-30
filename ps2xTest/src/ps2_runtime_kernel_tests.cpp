@@ -161,6 +161,15 @@ namespace
     constexpr uint32_t
         K_EXECUTOR_ALARM_CALLBACK_ENTRY =
             0x25b700u;
+    constexpr uint32_t
+        K_SETUP_THREAD_ROOT_MAIN_ENTRY =
+            0x25b800u;
+    constexpr uint32_t
+        K_SETUP_THREAD_ROOT_HANDLER_ENTRY =
+            0x25b900u;
+    constexpr uint32_t
+        K_SETUP_THREAD_ROOT_WORKER_ENTRY =
+            0x25ba00u;
     constexpr uint32_t K_EXECUTOR_MPEG_ADDR =
         0x00123000u;
     constexpr uint32_t K_EXECUTOR_MPEG_IMAGE_ADDR =
@@ -187,6 +196,18 @@ namespace
     std::atomic<bool>
         g_executorAlarmCallbackRanWhileSleeping{
             false};
+    std::atomic<uint32_t>
+        g_setupThreadRootObservedRa{0u};
+    std::atomic<uint32_t>
+        g_setupThreadRootHits{0u};
+    std::atomic<int>
+        g_setupThreadRootObservedThreadId{0};
+    std::atomic<int>
+        g_setupThreadRootCreateResult{KE_ERROR};
+    std::atomic<int>
+        g_setupThreadRootStartResult{KE_ERROR};
+    std::atomic<bool>
+        g_setupThreadRootMainReturned{false};
     int g_executorChildThreadId = 0;
     std::array<int, 3u> g_executorWakeCountResults{
         KE_ERROR,
@@ -937,6 +958,77 @@ namespace
             setRegU32(*ctx, 4, 1u);
             WakeupThread(rdram, ctx, runtime);
         }
+        ctx->pc = 0u;
+    }
+
+    void setupThreadRootWorkerHandler(
+        uint8_t *,
+        R5900Context *ctx,
+        PS2Runtime *)
+    {
+        const uint32_t returnAddress =
+            ::getRegU32(ctx, 31);
+        g_setupThreadRootObservedRa.store(
+            returnAddress,
+            std::memory_order_release);
+        ctx->pc = returnAddress;
+    }
+
+    void setupThreadRootExitHandler(
+        uint8_t *rdram,
+        R5900Context *ctx,
+        PS2Runtime *runtime)
+    {
+        g_setupThreadRootObservedThreadId.store(
+            runtime->currentEeThreadId(),
+            std::memory_order_release);
+        g_setupThreadRootHits.fetch_add(
+            1u,
+            std::memory_order_acq_rel);
+        ExitThread(rdram, ctx, runtime);
+    }
+
+    void setupThreadRootMainHandler(
+        uint8_t *rdram,
+        R5900Context *ctx,
+        PS2Runtime *runtime)
+    {
+        setRegU32(*ctx, 4, 0u);
+        setRegU32(*ctx, 5, 0u);
+        setRegU32(*ctx, 6, 0u);
+        setRegU32(*ctx, 7, 0u);
+        setRegU32(
+            *ctx,
+            8,
+            K_SETUP_THREAD_ROOT_HANDLER_ENTRY);
+        SetupThread(rdram, ctx, runtime);
+
+        setRegU32(*ctx, 4, 0u);
+        setRegU32(*ctx, 5, 40u);
+        ChangeThreadPriority(rdram, ctx, runtime);
+
+        setRegU32(
+            *ctx,
+            4,
+            K_EXECUTOR_THREAD_PARAM_ADDR);
+        CreateThread(rdram, ctx, runtime);
+        const int threadId = getRegS32(*ctx, 2);
+        g_setupThreadRootCreateResult.store(
+            threadId,
+            std::memory_order_release);
+
+        setRegU32(
+            *ctx,
+            4,
+            static_cast<uint32_t>(threadId));
+        setRegU32(*ctx, 5, 0u);
+        StartThread(rdram, ctx, runtime);
+        g_setupThreadRootStartResult.store(
+            getRegS32(*ctx, 2),
+            std::memory_order_release);
+        g_setupThreadRootMainReturned.store(
+            true,
+            std::memory_order_release);
         ctx->pc = 0u;
     }
 
@@ -3249,6 +3341,136 @@ void register_ps2_runtime_kernel_tests()
                     size_t{0u},
                     "executor shutdown should destroy "
                     "every runtime-owned continuation");
+            });
+
+        tc.Run(
+            "fiber StartThread returns through the SetupThread root",
+            [](TestCase &t)
+            {
+                if (!eeExecutionBackendBuildInfo()
+                         .boostContextFcontextAvailable)
+                {
+                    return;
+                }
+
+                PS2RuntimeConfiguration configuration{};
+                configuration.eeExecutionBackend =
+                    EeExecutionBackendKind::
+                        LegacyCppFiber;
+                configuration
+                    .useEeExecutionBackendEnvironment =
+                    false;
+                PS2Runtime runtime(configuration);
+                const bool memoryInitialized =
+                    runtime.memory().initialize();
+                t.IsTrue(
+                    memoryInitialized,
+                    "the SetupThread-root fiber fixture should allocate runtime RDRAM");
+                if (!memoryInitialized)
+                {
+                    return;
+                }
+
+                uint8_t *const rdram =
+                    runtime.memory().getRDRAM();
+                const std::array<uint32_t, 9u>
+                    threadParameters{
+                        0u,
+                        K_SETUP_THREAD_ROOT_WORKER_ENTRY,
+                        0x00310000u,
+                        0x800u,
+                        0u,
+                        30u,
+                        0u,
+                        0u,
+                        0u,
+                    };
+                writeGuestWords(
+                    rdram,
+                    K_EXECUTOR_THREAD_PARAM_ADDR,
+                    threadParameters.data(),
+                    threadParameters.size());
+                runtime.registerFunction(
+                    K_SETUP_THREAD_ROOT_MAIN_ENTRY,
+                    &setupThreadRootMainHandler);
+                runtime.registerFunction(
+                    K_SETUP_THREAD_ROOT_HANDLER_ENTRY,
+                    &setupThreadRootExitHandler);
+                runtime.registerFunction(
+                    K_SETUP_THREAD_ROOT_WORKER_ENTRY,
+                    &setupThreadRootWorkerHandler);
+                runtime.cpu().pc =
+                    K_SETUP_THREAD_ROOT_MAIN_ENTRY;
+                setRegU32(
+                    runtime.cpu(),
+                    29,
+                    0x00300000u);
+
+                g_setupThreadRootObservedRa.store(
+                    0u,
+                    std::memory_order_release);
+                g_setupThreadRootHits.store(
+                    0u,
+                    std::memory_order_release);
+                g_setupThreadRootObservedThreadId.store(
+                    0,
+                    std::memory_order_release);
+                g_setupThreadRootCreateResult.store(
+                    KE_ERROR,
+                    std::memory_order_release);
+                g_setupThreadRootStartResult.store(
+                    KE_ERROR,
+                    std::memory_order_release);
+                g_setupThreadRootMainReturned.store(
+                    false,
+                    std::memory_order_release);
+
+                runtime
+                    .startDedicatedEeExecutionForTesting();
+                const bool completed = waitUntil(
+                    [&runtime]()
+                    {
+                        return g_setupThreadRootMainReturned
+                                   .load(
+                                       std::memory_order_acquire) &&
+                               g_setupThreadRootHits.load(
+                                   std::memory_order_acquire) ==
+                                   1u &&
+                               runtime
+                                       .managedEeExecutionThreadCountForTesting() ==
+                                   0u;
+                    },
+                    std::chrono::seconds(2));
+                runtime
+                    .stopDedicatedEeExecutionForTesting();
+
+                const int threadId =
+                    g_setupThreadRootCreateResult.load(
+                        std::memory_order_acquire);
+                t.IsTrue(
+                    completed,
+                    "the fiber worker should return through the configured root before its main continuation finishes");
+                t.IsTrue(
+                    threadId >= 2 &&
+                        g_setupThreadRootStartResult.load(
+                            std::memory_order_acquire) ==
+                            threadId,
+                    "the dedicated executor should create and start the root-return worker");
+                t.Equals(
+                    g_setupThreadRootObservedRa.load(
+                        std::memory_order_acquire),
+                    K_SETUP_THREAD_ROOT_HANDLER_ENTRY,
+                    "the fiber worker should inherit the SetupThread root in $ra");
+                t.Equals(
+                    g_setupThreadRootObservedThreadId.load(
+                        std::memory_order_acquire),
+                    threadId,
+                    "the fiber root should retain the returning worker identity");
+                t.Equals(
+                    runtime
+                        .managedEeExecutionThreadCountForTesting(),
+                    size_t{0u},
+                    "the root-exited worker and main continuation should both be destroyed");
             });
 
         tc.Run(
@@ -6826,6 +7048,147 @@ void register_ps2_runtime_kernel_tests()
             DeleteThread(env.rdram.data(), &env.ctx, &env.runtime);
             t.Equals(getRegS32(env.ctx, 2), tid, "DeleteThread should return the failed-start thread id");
         });
+
+        tc.Run(
+            "SetupThread root handles a normal started-thread return",
+            [](TestCase &t)
+            {
+                TestEnv env;
+                env.runtime.registerFunction(
+                    K_SETUP_THREAD_ROOT_HANDLER_ENTRY,
+                    &setupThreadRootExitHandler);
+                env.runtime.registerFunction(
+                    K_SETUP_THREAD_ROOT_WORKER_ENTRY,
+                    &setupThreadRootWorkerHandler);
+                g_setupThreadRootObservedRa.store(
+                    0u,
+                    std::memory_order_release);
+                g_setupThreadRootHits.store(
+                    0u,
+                    std::memory_order_release);
+                g_setupThreadRootObservedThreadId.store(
+                    0,
+                    std::memory_order_release);
+
+                setRegU32(env.ctx, 29, 0x00300000u);
+                setRegU32(env.ctx, 4, 0u);
+                setRegU32(env.ctx, 5, 0u);
+                setRegU32(env.ctx, 6, 0u);
+                setRegU32(env.ctx, 7, 0u);
+                setRegU32(
+                    env.ctx,
+                    8,
+                    K_SETUP_THREAD_ROOT_HANDLER_ENTRY);
+                SetupThread(
+                    env.rdram.data(),
+                    &env.ctx,
+                    &env.runtime);
+                t.Equals(
+                    getRegU32(&env.ctx, 2),
+                    0x00300000u,
+                    "SetupThread should preserve an aligned current stack when no replacement is supplied");
+
+                setRegU32(env.ctx, 4, 0u);
+                setRegU32(env.ctx, 5, 40u);
+                ChangeThreadPriority(
+                    env.rdram.data(),
+                    &env.ctx,
+                    &env.runtime);
+
+                const uint32_t threadParam[9] = {
+                    0u,
+                    K_SETUP_THREAD_ROOT_WORKER_ENTRY,
+                    0x00310000u,
+                    0x00000800u,
+                    0u,
+                    30u,
+                    0u,
+                    0u,
+                    0u,
+                };
+                writeGuestWords(
+                    env.rdram.data(),
+                    K_PARAM_ADDR,
+                    threadParam,
+                    std::size(threadParam));
+                setRegU32(env.ctx, 4, K_PARAM_ADDR);
+                CreateThread(
+                    env.rdram.data(),
+                    &env.ctx,
+                    &env.runtime);
+                const int32_t threadId =
+                    getRegS32(env.ctx, 2);
+                t.IsTrue(
+                    threadId >= 2,
+                    "the normal-return worker should be created");
+
+                setRegU32(
+                    env.ctx,
+                    4,
+                    static_cast<uint32_t>(threadId));
+                setRegU32(env.ctx, 5, 0u);
+                StartThread(
+                    env.rdram.data(),
+                    &env.ctx,
+                    &env.runtime);
+                t.Equals(
+                    getRegS32(env.ctx, 2),
+                    threadId,
+                    "the normal-return worker should start");
+
+                const bool exitedThroughRoot =
+                    waitUntil(
+                        [&]()
+                        {
+                            R5900Context statusCtx{};
+                            setRegU32(
+                                statusCtx,
+                                4,
+                                static_cast<uint32_t>(
+                                    threadId));
+                            setRegU32(
+                                statusCtx,
+                                5,
+                                K_STATUS_ADDR);
+                            ReferThreadStatus(
+                                env.rdram.data(),
+                                &statusCtx,
+                                &env.runtime);
+                            return g_setupThreadRootHits
+                                           .load(
+                                               std::memory_order_acquire) ==
+                                       1u &&
+                                   getRegS32(statusCtx, 2) ==
+                                       THS_DORMANT;
+                        },
+                        std::chrono::milliseconds(500));
+                t.IsTrue(
+                    exitedThroughRoot,
+                    "a normal worker return should dispatch the SetupThread root and become dormant");
+                t.Equals(
+                    g_setupThreadRootObservedRa.load(
+                        std::memory_order_acquire),
+                    K_SETUP_THREAD_ROOT_HANDLER_ENTRY,
+                    "StartThread should initialize $ra from the SetupThread root");
+                t.Equals(
+                    g_setupThreadRootObservedThreadId.load(
+                        std::memory_order_acquire),
+                    threadId,
+                    "the SetupThread root should execute as the returning worker");
+
+                setRegU32(
+                    env.ctx,
+                    4,
+                    static_cast<uint32_t>(threadId));
+                DeleteThread(
+                    env.rdram.data(),
+                    &env.ctx,
+                    &env.runtime);
+                t.Equals(
+                    getRegS32(env.ctx, 2),
+                    threadId,
+                    "the root-exited worker should remain deletable");
+            });
 
         tc.Run("thread scheduling syscalls preserve EE BIOS success values", [](TestCase &t)
         {
@@ -11844,6 +12207,29 @@ void register_ps2_runtime_kernel_tests()
             const uint32_t setupSp = static_cast<uint32_t>(getRegS32(env.ctx, 2));
             t.Equals(setupSp & 0xFu, 0u, "SetupThread should always return a 16-byte aligned stack pointer");
         });
+
+        tc.Run(
+            "SetupThread reserves the retail EE thread context",
+            [](TestCase &t)
+            {
+                TestEnv env;
+
+                // The strict retail-BIOS oracle returns 0x001202D0 for this
+                // exact 0x00100570 base and 0x20000-byte stack.
+                setRegU32(env.ctx, 5, 0x00100570u);
+                setRegU32(env.ctx, 6, 0x00020000u);
+                t.IsTrue(
+                    callSyscall(
+                        0x3Cu,
+                        env.rdram.data(),
+                        &env.ctx,
+                        &env.runtime),
+                    "SetupThread with an explicit stack should dispatch");
+                t.Equals(
+                    getRegU32(&env.ctx, 2),
+                    0x001202D0u,
+                    "SetupThread should reserve the retail EE thread context at the stack top");
+            });
 
         tc.Run("OSD config2 syscalls round-trip extended config", [](TestCase &t)
         {
