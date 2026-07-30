@@ -54,6 +54,7 @@ struct EeInterruptRuntimeState;
 struct EeKernelRuntimeState;
 struct EeRpcRuntimeState;
 struct EeFileRuntimeState;
+struct Deci2RuntimeState;
 namespace ps2_stubs
 {
     struct AudioRuntimeState;
@@ -1272,6 +1273,8 @@ public:
     const EeRpcRuntimeState &eeRpcRuntimeState() const;
     EeFileRuntimeState &eeFileRuntimeState();
     const EeFileRuntimeState &eeFileRuntimeState() const;
+    Deci2RuntimeState &deci2RuntimeState();
+    const Deci2RuntimeState &deci2RuntimeState() const;
     ps2_stubs::AudioRuntimeState &audioRuntimeState();
     const ps2_stubs::AudioRuntimeState &
     audioRuntimeState() const;
@@ -1969,6 +1972,8 @@ private:
         m_eeRpcRuntimeState;
     std::unique_ptr<EeFileRuntimeState>
         m_eeFileRuntimeState;
+    std::unique_ptr<Deci2RuntimeState>
+        m_deci2RuntimeState;
     std::unique_ptr<ps2_stubs::AudioRuntimeState>
         m_audioRuntimeState;
     std::unique_ptr<ps2_stubs::CdRuntimeState>

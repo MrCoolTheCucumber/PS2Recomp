@@ -24,6 +24,7 @@
 #include "Kernel/Stubs/Helpers/PadRuntimeState.h"
 #include "Kernel/Stubs/Helpers/SifRuntimeState.h"
 #include "Kernel/Syscalls/Helpers/AlarmRuntimeState.h"
+#include "Kernel/Syscalls/Helpers/Deci2RuntimeState.h"
 #include "Kernel/Syscalls/Helpers/FileRuntimeState.h"
 #include "Kernel/Syscalls/Helpers/InterruptRuntimeState.h"
 #include "Kernel/Syscalls/Helpers/KernelRuntimeState.h"
@@ -31,6 +32,7 @@
 #include "Kernel/Syscalls/Helpers/SyncRuntimeState.h"
 #include "Kernel/Syscalls/Helpers/ThreadRuntimeState.h"
 #include "Kernel/Syscalls/FileIO.h"
+#include "Kernel/Syscalls/System.h"
 #include "ps2_host_backend.h"
 #include "ps2_iop_host.h"
 #include "ps2x/iop/iop_subsystem.h"
@@ -922,6 +924,8 @@ PS2Runtime::PS2Runtime(PS2RuntimeConfiguration configuration)
         std::make_unique<EeRpcRuntimeState>();
     m_eeFileRuntimeState =
         std::make_unique<EeFileRuntimeState>();
+    m_deci2RuntimeState =
+        std::make_unique<Deci2RuntimeState>();
     m_audioRuntimeState =
         std::make_unique<ps2_stubs::AudioRuntimeState>();
     m_cdRuntimeState =
@@ -1376,6 +1380,17 @@ const EeFileRuntimeState &
 PS2Runtime::eeFileRuntimeState() const
 {
     return *m_eeFileRuntimeState;
+}
+
+Deci2RuntimeState &PS2Runtime::deci2RuntimeState()
+{
+    return *m_deci2RuntimeState;
+}
+
+const Deci2RuntimeState &
+PS2Runtime::deci2RuntimeState() const
+{
+    return *m_deci2RuntimeState;
 }
 
 ps2_stubs::AudioRuntimeState &
@@ -9233,6 +9248,7 @@ void PS2Runtime::run()
 {
     m_stopRequested.store(false, std::memory_order_relaxed);
     ps2_syscalls::resetFileIoState(this);
+    ps2_syscalls::resetDeci2State(this);
     ps2_stubs::resetCdState(this);
     ps2_stubs::resetDmaState(this);
     ps2_stubs::resetLibCState(this);

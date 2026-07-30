@@ -2,6 +2,7 @@
 #include "FileIO.h"
 #include "Interrupt.h"
 #include "Lifecycle.h"
+#include "System.h"
 #include "../Stubs/Audio.h"
 #include "../Stubs/CD.h"
 #include "../Stubs/DMA.h"
@@ -218,6 +219,7 @@ namespace ps2_syscalls
         }
 
         resetFileIoState(runtime);
+        resetDeci2State(runtime);
         ps2_stubs::resetAudioStubState(runtime);
         ps2_stubs::resetCdState(runtime);
         ps2_stubs::resetDmaState(runtime);
