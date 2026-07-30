@@ -5285,6 +5285,69 @@ void register_ps2_runtime_kernel_tests()
             t.Equals(getRegS32(env.ctx, 2), KE_OK, "DisableCache should succeed as a no-op");
         });
 
+        tc.Run("alarm registries and cancellation are isolated per runtime", [](TestCase &t)
+        {
+            notifyRuntimeStop();
+            TestEnv first;
+            TestEnv second;
+
+            constexpr uint32_t kAlarmHandlerAddr = 0x00270100u;
+            first.runtime.registerFunction(
+                kAlarmHandlerAddr, &alarmNoopHandler);
+            second.runtime.registerFunction(
+                kAlarmHandlerAddr, &alarmNoopHandler);
+
+            const auto setLongAlarm = [&](TestEnv &target)
+            {
+                setRegU32(target.ctx, 4, 0xFFFFu);
+                setRegU32(target.ctx, 5, kAlarmHandlerAddr);
+                setRegU32(target.ctx, 6, 0u);
+                SetAlarm(
+                    target.rdram.data(),
+                    &target.ctx,
+                    &target.runtime);
+                return getRegS32(target.ctx, 2);
+            };
+            const auto cancelAlarm =
+                [&](TestEnv &target, int32_t alarmId)
+            {
+                R5900Context cancelCtx{};
+                setRegU32(
+                    cancelCtx,
+                    4,
+                    static_cast<uint32_t>(alarmId));
+                CancelAlarm(
+                    target.rdram.data(),
+                    &cancelCtx,
+                    &target.runtime);
+                return getRegS32(cancelCtx, 2);
+            };
+
+            const int32_t firstAlarm = setLongAlarm(first);
+            const int32_t secondAlarm = setLongAlarm(second);
+            t.Equals(
+                firstAlarm,
+                1,
+                "the first runtime should allocate alarm id 1");
+            t.Equals(
+                secondAlarm,
+                1,
+                "a second runtime should independently allocate alarm id 1");
+
+            t.Equals(
+                cancelAlarm(first, firstAlarm),
+                KE_OK,
+                "the first runtime should cancel its own alarm");
+            t.Equals(
+                cancelAlarm(first, firstAlarm),
+                KE_ERROR,
+                "the first runtime should no longer contain that alarm");
+            t.Equals(
+                cancelAlarm(second, secondAlarm),
+                KE_OK,
+                "first-runtime cancellation must not consume the second alarm");
+        });
+
         tc.Run("setup heap and thread invalid ids use documented kernel errors", [](TestCase &t)
         {
             TestEnv env;
