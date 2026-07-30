@@ -6,6 +6,7 @@ void register_code_generator_tests();
 void register_cop0_timing_tests();
 void register_ee_counter_tests();
 void register_ee_event_scheduler_tests();
+void register_ee_thread_scheduler_tests();
 void register_r5900_decoder_tests();
 void register_elf_analyzer_tests();
 void register_ps2_audio_tests();
@@ -37,6 +38,7 @@ int main()
     register_cop0_timing_tests();
     register_ee_counter_tests();
     register_ee_event_scheduler_tests();
+    register_ee_thread_scheduler_tests();
     register_r5900_decoder_tests();
     register_elf_analyzer_tests();
     register_ps2_audio_tests();
