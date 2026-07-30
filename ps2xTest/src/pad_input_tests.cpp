@@ -70,6 +70,103 @@ void register_pad_input_tests()
 {
     MiniTest::Case("PadInput", [](TestCase &tc)
                    {
+        tc.Run("cross-runtime pad state is isolated", [](TestCase &t)
+               {
+            PS2Runtime first;
+            PS2Runtime second;
+            std::vector<uint8_t> firstRdram(
+                PS2_RAM_SIZE, 0u);
+            std::vector<uint8_t> secondRdram(
+                PS2_RAM_SIZE, 0u);
+            R5900Context firstCtx{};
+            R5900Context secondCtx{};
+
+            ps2_stubs::scePadInit(
+                firstRdram.data(), &firstCtx, &first);
+            ps2_stubs::scePadInit(
+                secondRdram.data(), &secondCtx, &second);
+
+            constexpr uint32_t kFirstDmaAddr = 0x1200u;
+            constexpr uint32_t kSecondDmaAddr = 0x1400u;
+            setRegU32(firstCtx, 4, 0u);
+            setRegU32(firstCtx, 5, 0u);
+            setRegU32(firstCtx, 6, kFirstDmaAddr);
+            ps2_stubs::scePadPortOpen(
+                firstRdram.data(), &firstCtx, &first);
+
+            setRegU32(secondCtx, 4, 0u);
+            setRegU32(secondCtx, 5, 0u);
+            ps2_stubs::scePadGetState(
+                secondRdram.data(), &secondCtx, &second);
+            t.Equals(
+                static_cast<int32_t>(
+                    getRegU32(&secondCtx, 2)),
+                0,
+                "opening a port in one runtime must not connect it in another runtime");
+
+            setRegU32(secondCtx, 6, kSecondDmaAddr);
+            ps2_stubs::scePadPortOpen(
+                secondRdram.data(), &secondCtx, &second);
+            setRegU32(firstCtx, 4, 0u);
+            setRegU32(firstCtx, 5, 0u);
+            ps2_stubs::scePadGetDmaStr(
+                firstRdram.data(), &firstCtx, &first);
+            t.Equals(
+                getRegU32(&firstCtx, 2),
+                kFirstDmaAddr,
+                "each runtime should retain its own pad DMA address");
+
+            setRegU32(firstCtx, 4, 0u);
+            setRegU32(firstCtx, 5, 0u);
+            setRegU32(firstCtx, 6, 1u);
+            setRegU32(firstCtx, 7, 3u);
+            ps2_stubs::scePadSetMainMode(
+                firstRdram.data(), &firstCtx, &first);
+            setRegU32(secondCtx, 4, 0u);
+            setRegU32(secondCtx, 5, 0u);
+            setRegU32(secondCtx, 6, 1u);
+            setRegU32(
+                secondCtx,
+                7,
+                static_cast<uint32_t>(-1));
+            ps2_stubs::scePadInfoMode(
+                secondRdram.data(), &secondCtx, &second);
+            t.Equals(
+                static_cast<int32_t>(
+                    getRegU32(&secondCtx, 2)),
+                4,
+                "changing one runtime to analog mode must not change another runtime's pad type");
+
+            ps2_stubs::scePadGetFrameCount(
+                firstRdram.data(), &firstCtx, &first);
+            const uint32_t firstFrame =
+                getRegU32(&firstCtx, 2);
+            ps2_stubs::scePadGetFrameCount(
+                secondRdram.data(), &secondCtx, &second);
+            const uint32_t secondFrame =
+                getRegU32(&secondCtx, 2);
+            t.Equals(
+                firstFrame,
+                0u,
+                "the first runtime should start its pad frame count at zero");
+            t.Equals(
+                secondFrame,
+                0u,
+                "the second runtime should independently start its pad frame count at zero");
+
+            ps2_stubs::scePadEnd(
+                firstRdram.data(), &firstCtx, &first);
+            setRegU32(secondCtx, 4, 0u);
+            setRegU32(secondCtx, 5, 0u);
+            ps2_stubs::scePadGetState(
+                secondRdram.data(), &secondCtx, &second);
+            t.Equals(
+                static_cast<int32_t>(
+                    getRegU32(&secondCtx, 2)),
+                6,
+                "ending one runtime's pad library must not disconnect another runtime");
+        });
+
         tc.Run("scePadRead uses override state", [](TestCase &t)
                {
             std::vector<uint8_t> rdram(PS2_RAM_SIZE, 0);
