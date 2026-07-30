@@ -353,8 +353,123 @@ void register_ps2_runtime_kernel_tests()
                 env.rdram.data(), &env.ctx, &env.runtime);
             t.Equals(
                 getRegS32(env.ctx, 2),
+                0,
+                "bare EE bootstrap should begin at priority zero");
+
+            setRegU32(env.ctx, 4, 0u);
+            RotateThreadReadyQueue(
+                env.rdram.data(), &env.ctx, &env.runtime);
+            t.Equals(
+                getRegS32(env.ctx, 2),
+                0,
+                "RotateThreadReadyQueue should treat priority zero literally");
+
+            setRegU32(env.ctx, 4, 0u);
+            setRegU32(env.ctx, 5, 0u);
+            ChangeThreadPriority(
+                env.rdram.data(), &env.ctx, &env.runtime);
+            t.Equals(
+                getRegS32(env.ctx, 2),
+                kPriority,
+                "ChangeThreadPriority should return 40 when changing to priority zero");
+
+            setRegU32(env.ctx, 4, 0u);
+            setRegU32(env.ctx, 5, K_STATUS_ADDR);
+            ReferThreadStatus(
+                env.rdram.data(), &env.ctx, &env.runtime);
+            EeThreadStatus bootstrapStatus{};
+            std::memcpy(
+                &bootstrapStatus,
+                env.rdram.data() + K_STATUS_ADDR,
+                sizeof(bootstrapStatus));
+            t.Equals(
+                bootstrapStatus.current_priority,
+                0,
+                "priority zero should remain the current priority");
+
+            InitThread(env.rdram.data(), &env.ctx, &env.runtime);
+            t.Equals(
+                getRegS32(env.ctx, 2),
                 1,
-                "ChangeThreadPriority should return the previous main-thread priority");
+                "InitThread should preserve its existing helper return");
+
+            setRegU32(env.ctx, 4, 0u);
+            setRegU32(env.ctx, 5, K_STATUS_ADDR);
+            ReferThreadStatus(
+                env.rdram.data(), &env.ctx, &env.runtime);
+            EeThreadStatus initializedStatus{};
+            std::memcpy(
+                &initializedStatus,
+                env.rdram.data() + K_STATUS_ADDR,
+                sizeof(initializedStatus));
+            t.Equals(
+                initializedStatus.initial_priority,
+                0,
+                "InitThread should preserve the bootstrap initial priority");
+            t.Equals(
+                initializedStatus.current_priority,
+                1,
+                "InitThread should promote the current thread to priority one");
+
+            const uint32_t zeroPriorityParam[7] = {
+                0u,
+                kThreadEntry,
+                0x00303000u,
+                0x00000800u,
+                0u,
+                0u,
+                0u
+            };
+            writeGuestWords(
+                env.rdram.data(),
+                K_PARAM_ADDR,
+                zeroPriorityParam,
+                std::size(zeroPriorityParam));
+            setRegU32(env.ctx, 4, K_PARAM_ADDR);
+            CreateThread(
+                env.rdram.data(), &env.ctx, &env.runtime);
+            const int32_t zeroPriorityTid = getRegS32(env.ctx, 2);
+            t.IsTrue(
+                zeroPriorityTid >= 2,
+                "CreateThread should accept priority zero");
+
+            setRegU32(
+                env.ctx, 4, static_cast<uint32_t>(zeroPriorityTid));
+            setRegU32(env.ctx, 5, K_STATUS_ADDR);
+            ReferThreadStatus(
+                env.rdram.data(), &env.ctx, &env.runtime);
+            EeThreadStatus zeroPriorityStatus{};
+            std::memcpy(
+                &zeroPriorityStatus,
+                env.rdram.data() + K_STATUS_ADDR,
+                sizeof(zeroPriorityStatus));
+            t.Equals(
+                zeroPriorityStatus.initial_priority,
+                0,
+                "CreateThread should preserve initial priority zero");
+            t.Equals(
+                zeroPriorityStatus.current_priority,
+                0,
+                "CreateThread should preserve current priority zero");
+
+            setRegU32(
+                env.ctx, 4, static_cast<uint32_t>(zeroPriorityTid));
+            DeleteThread(
+                env.rdram.data(), &env.ctx, &env.runtime);
+            t.Equals(
+                getRegS32(env.ctx, 2),
+                zeroPriorityTid,
+                "DeleteThread should remove the dormant priority-zero thread");
+
+            setRegU32(env.ctx, 4, 0u);
+            setRegU32(
+                env.ctx, 5, static_cast<uint32_t>(kPriority));
+            ChangeThreadPriority(
+                env.rdram.data(), &env.ctx, &env.runtime);
+            t.Equals(
+                getRegS32(env.ctx, 2),
+                1,
+                "ChangeThreadPriority should return the post-InitThread priority");
 
             setRegU32(
                 env.ctx, 4, static_cast<uint32_t>(kPriority));

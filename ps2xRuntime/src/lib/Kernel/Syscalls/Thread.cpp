@@ -156,6 +156,14 @@ namespace ps2_syscalls
     void InitThread(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
         // This is a common ps2sdk helper that some games link against.
+        // The EE bootstrap thread begins at priority 0. The linked helper
+        // normally creates its priority-0 top thread and promotes the caller
+        // to 1; preserve that caller-visible transition when collapsing it.
+        auto info = ensureCurrentThreadInfo(ctx);
+        {
+            std::lock_guard<std::mutex> lock(info->m);
+            info->currentPriority = 1;
+        }
         setReturnS32(ctx, 1);
     }
 
@@ -224,10 +232,6 @@ namespace ps2_syscalls
         }
 
         info->option = param[6];
-        if (info->priority == 0)
-        {
-            info->priority = 1;
-        }
         if (info->priority >= 128)
         {
             info->priority = 127;
@@ -1103,11 +1107,7 @@ namespace ps2_syscalls
                 return;
             }
 
-            if (newPrio == 0)
-            {
-                newPrio = (info->currentPriority > 0) ? info->currentPriority : 1;
-            }
-            if (newPrio <= 0 || newPrio >= 128)
+            if (newPrio < 0 || newPrio >= 128)
             {
                 setReturnS32(ctx, KE_ILLEGAL_PRIORITY);
                 return;
@@ -1130,21 +1130,12 @@ namespace ps2_syscalls
         static int logCount = 0;
         int prio = static_cast<int>(getRegU32(ctx, 4));
         const int requestedPriority = prio;
-        if (prio == 0)
-        {
-            auto current = ensureCurrentThreadInfo(ctx);
-            if (current)
-            {
-                std::lock_guard<std::mutex> lock(current->m);
-                prio = (current->currentPriority > 0) ? current->currentPriority : 1;
-            }
-        }
         if (logCount < 16)
         {
             RUNTIME_LOG("[RotateThreadReadyQueue] prio=" << prio);
             ++logCount;
         }
-        if (prio <= 0 || prio >= 128)
+        if (prio < 0 || prio >= 128)
         {
             runtime->recordEeThreadQueueRotation(
                 g_currentThreadId,
