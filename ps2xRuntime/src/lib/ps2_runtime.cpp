@@ -897,6 +897,8 @@ PS2Runtime::PS2Runtime(PS2RuntimeConfiguration configuration)
     : m_vu0(VuUnitId::Vu0),
       m_vu1(VuUnitId::Vu1)
 {
+    m_mpegRuntimeState =
+        std::make_unique<ps2_stubs::MpegRuntimeState>();
     m_eeAlarmRuntimeState =
         std::make_unique<EeAlarmRuntimeState>();
     m_eeSyncRuntimeState =
@@ -1312,6 +1314,16 @@ EeInterruptRuntimeState &PS2Runtime::eeInterruptRuntimeState()
 const EeInterruptRuntimeState &PS2Runtime::eeInterruptRuntimeState() const
 {
     return *m_eeInterruptRuntimeState;
+}
+
+ps2_stubs::MpegRuntimeState &PS2Runtime::mpegRuntimeState()
+{
+    return *m_mpegRuntimeState;
+}
+
+const ps2_stubs::MpegRuntimeState &PS2Runtime::mpegRuntimeState() const
+{
+    return *m_mpegRuntimeState;
 }
 
 int PS2Runtime::activeEeHostThreadCount() const
@@ -9081,7 +9093,7 @@ void PS2Runtime::run()
     resetIop();
     ps2_stubs::resetAudioStubState();
     ps2_stubs::resetGsSyncVCallbackState(this);
-    ps2_stubs::resetMpegStubState();
+    ps2_stubs::resetMpegStubState(this);
     ps2_syscalls::initializeGuestKernelState(m_memory.getRDRAM());
     m_cpuContext.r[4] = _mm_setzero_si128();
     m_cpuContext.r[5] = _mm_setzero_si128();

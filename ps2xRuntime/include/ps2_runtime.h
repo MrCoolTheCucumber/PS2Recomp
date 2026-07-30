@@ -51,6 +51,10 @@ struct EeThreadRuntimeState;
 struct EeAlarmRuntimeState;
 struct EeSyncRuntimeState;
 struct EeInterruptRuntimeState;
+namespace ps2_stubs
+{
+    class MpegRuntimeState;
+}
 
 struct PS2RuntimeConfiguration
 {
@@ -1252,6 +1256,8 @@ public:
     const EeSyncRuntimeState &eeSyncRuntimeState() const;
     EeInterruptRuntimeState &eeInterruptRuntimeState();
     const EeInterruptRuntimeState &eeInterruptRuntimeState() const;
+    ps2_stubs::MpegRuntimeState &mpegRuntimeState();
+    const ps2_stubs::MpegRuntimeState &mpegRuntimeState() const;
     int activeEeHostThreadCount() const;
     int currentEeThreadId() noexcept;
     uint64_t eeThreadLegacyAdapterMismatchCount() const noexcept;
@@ -1916,6 +1922,8 @@ private:
 #if defined(PS2X_ENABLE_DEBUG_SERVER) && PS2X_ENABLE_DEBUG_SERVER
     std::unique_ptr<PS2DebugServer> m_debugServer;
 #endif
+    std::unique_ptr<ps2_stubs::MpegRuntimeState>
+        m_mpegRuntimeState;
     std::unique_ptr<EeSyncRuntimeState> m_eeSyncRuntimeState;
     std::unique_ptr<EeInterruptRuntimeState>
         m_eeInterruptRuntimeState;

@@ -1731,11 +1731,12 @@ void register_ps2_runtime_expansion_tests()
 
         tc.Run("MPEG init and callback stubs return success instead of TODO errors", [](TestCase &t)
         {
+            PS2Runtime runtime;
             std::vector<uint8_t> rdram(PS2_RAM_SIZE, 0u);
-            ps2_stubs::resetMpegStubState();
+            ps2_stubs::resetMpegStubState(&runtime);
 
             R5900Context initCtx{};
-            ps2_stubs::sceMpegInit(rdram.data(), &initCtx, nullptr);
+            ps2_stubs::sceMpegInit(rdram.data(), &initCtx, &runtime);
             t.Equals(getRegS32(initCtx, 2), 0,
                      "sceMpegInit should succeed so games can continue through movie setup");
 
@@ -1744,7 +1745,7 @@ void register_ps2_runtime_expansion_tests()
             setRegU32(addCtx0, 5, 1u);
             setRegU32(addCtx0, 6, 0x00124000u);
             setRegU32(addCtx0, 7, 0u);
-            ps2_stubs::sceMpegAddCallback(rdram.data(), &addCtx0, nullptr);
+            ps2_stubs::sceMpegAddCallback(rdram.data(), &addCtx0, &runtime);
             t.Equals(getRegS32(addCtx0, 2), 1,
                      "first sceMpegAddCallback should hand back a non-error callback handle");
 
@@ -1753,19 +1754,19 @@ void register_ps2_runtime_expansion_tests()
             setRegU32(addCtx1, 5, 2u);
             setRegU32(addCtx1, 6, 0x00124010u);
             setRegU32(addCtx1, 7, 0u);
-            ps2_stubs::sceMpegAddCallback(rdram.data(), &addCtx1, nullptr);
+            ps2_stubs::sceMpegAddCallback(rdram.data(), &addCtx1, &runtime);
             t.Equals(getRegS32(addCtx1, 2), 2,
                      "subsequent sceMpegAddCallback calls should keep succeeding");
 
             R5900Context reinitCtx{};
-            ps2_stubs::sceMpegInit(rdram.data(), &reinitCtx, nullptr);
+            ps2_stubs::sceMpegInit(rdram.data(), &reinitCtx, &runtime);
 
             R5900Context addAfterReinit{};
             setRegU32(addAfterReinit, 4, 0x00123000u);
             setRegU32(addAfterReinit, 5, 3u);
             setRegU32(addAfterReinit, 6, 0x00124020u);
             setRegU32(addAfterReinit, 7, 0u);
-            ps2_stubs::sceMpegAddCallback(rdram.data(), &addAfterReinit, nullptr);
+            ps2_stubs::sceMpegAddCallback(rdram.data(), &addAfterReinit, &runtime);
             t.Equals(getRegS32(addAfterReinit, 2), 1,
                      "sceMpegInit should reset MPEG callback bookkeeping between runs");
         });
@@ -1778,7 +1779,8 @@ void register_ps2_runtime_expansion_tests()
                 PS2_RAM_SIZE, 0u);
             std::vector<uint8_t> secondRdram(
                 PS2_RAM_SIZE, 0u);
-            ps2_stubs::resetMpegStubState();
+            ps2_stubs::resetMpegStubState(&first);
+            ps2_stubs::resetMpegStubState(&second);
 
             constexpr uint32_t kMpegAddr = 0x00123000u;
             constexpr uint32_t kCallbackEntry = 0x00124000u;
@@ -1847,7 +1849,7 @@ void register_ps2_runtime_expansion_tests()
                 7u,
                 "deleting the second runtime's MPEG object must not erase the first runtime's object");
 
-            ps2_stubs::resetMpegStubState();
+            ps2_stubs::resetMpegStubState(&first);
             first.registerFunction(
                 kCallbackEntry,
                 &testRecordMpegStreamCallback);
@@ -1943,7 +1945,7 @@ void register_ps2_runtime_expansion_tests()
         {
             PS2Runtime runtime;
             std::vector<uint8_t> rdram(PS2_RAM_SIZE, 0u);
-            ps2_stubs::resetMpegStubState();
+            ps2_stubs::resetMpegStubState(&runtime);
 
             constexpr uint32_t kMpegAddr = 0x00123000u;
             constexpr uint32_t kCallbackEntry = 0x00124000u;
@@ -2048,7 +2050,7 @@ void register_ps2_runtime_expansion_tests()
             t.Equals(gMpegStreamCallbackUserData.load(std::memory_order_acquire), kAudioUserData,
                      "audio callback should receive registered user data");
 
-            ps2_stubs::notifyMpegCdStreamEof();
+            ps2_stubs::notifyMpegCdStreamEof(&runtime);
 
             gMpegStreamCallbackCount.store(0u, std::memory_order_release);
             R5900Context afterEofDemuxCtx{};
@@ -2082,7 +2084,7 @@ void register_ps2_runtime_expansion_tests()
             t.Equals(gMpegStreamCallbackCount.load(std::memory_order_acquire), 0u,
                      "post-EOF reset demux should not restart callbacks on stale data");
 
-            ps2_stubs::notifyMpegCdStreamStart();
+            ps2_stubs::notifyMpegCdStreamStart(&runtime);
 
             gMpegStreamCallbackCount.store(0u, std::memory_order_release);
             R5900Context afterNewStreamDemuxCtx{};
@@ -2125,8 +2127,9 @@ void register_ps2_runtime_expansion_tests()
 #if PS2X_HAS_FFMPEG
         tc.Run("MPEG decoder emits the first reference frame without waiting for another GOP", [](TestCase &t)
         {
+            PS2Runtime runtime;
             std::vector<uint8_t> rdram(PS2_RAM_SIZE, 0u);
-            ps2_stubs::resetMpegStubState();
+            ps2_stubs::resetMpegStubState(&runtime);
 
             constexpr uint32_t kMpegAddr = 0x00123000u;
             constexpr uint32_t kMpegWorkAddr = 0x00130000u;
@@ -2157,7 +2160,7 @@ void register_ps2_runtime_expansion_tests()
             setRegU32(createCtx, 4, kMpegAddr);
             setRegU32(createCtx, 5, kMpegWorkAddr);
             setRegU32(createCtx, 6, 0x2000u);
-            ps2_stubs::sceMpegCreate(rdram.data(), &createCtx, nullptr);
+            ps2_stubs::sceMpegCreate(rdram.data(), &createCtx, &runtime);
 
             R5900Context demuxCtx{};
             setRegU32(demuxCtx, 4, kMpegAddr);
@@ -2165,14 +2168,14 @@ void register_ps2_runtime_expansion_tests()
             setRegU32(demuxCtx, 6, static_cast<uint32_t>(packet.size()));
             setRegU32(demuxCtx, 7, kPacketAddr);
             setRegU32(demuxCtx, 8, static_cast<uint32_t>(packet.size()));
-            ps2_stubs::sceMpegDemuxPssRing(rdram.data(), &demuxCtx, nullptr);
+            ps2_stubs::sceMpegDemuxPssRing(rdram.data(), &demuxCtx, &runtime);
             t.Equals(getRegS32(demuxCtx, 2), static_cast<int32_t>(packet.size()),
                      "the synthetic video PES packet should be consumed");
 
             R5900Context pictureCtx{};
             setRegU32(pictureCtx, 4, kMpegAddr);
             setRegU32(pictureCtx, 5, kImageAddr);
-            ps2_stubs::sceMpegGetPicture(rdram.data(), &pictureCtx, nullptr);
+            ps2_stubs::sceMpegGetPicture(rdram.data(), &pictureCtx, &runtime);
             t.Equals(getRegS32(pictureCtx, 2), 1,
                      "the first I picture should be available after the following P reference");
             t.Equals(Ps2FastRead32(rdram.data(), kMpegAddr + 0x00u), 32u,
@@ -2180,14 +2183,14 @@ void register_ps2_runtime_expansion_tests()
             t.Equals(Ps2FastRead32(rdram.data(), kMpegAddr + 0x04u), 16u,
                      "the decoded frame should publish its synthetic height");
 
-            ps2_stubs::resetMpegStubState();
+            ps2_stubs::resetMpegStubState(&runtime);
         });
 
         tc.Run("host-decoded MPEG video is not stalled by a bypassed IPU callback", [](TestCase &t)
         {
             PS2Runtime runtime;
             std::vector<uint8_t> rdram(PS2_RAM_SIZE, 0u);
-            ps2_stubs::resetMpegStubState();
+            ps2_stubs::resetMpegStubState(&runtime);
 
             constexpr uint32_t kMpegAddr = 0x00123000u;
             constexpr uint32_t kCallbackEntry = 0x00124000u;
@@ -2238,7 +2241,7 @@ void register_ps2_runtime_expansion_tests()
         {
             PS2Runtime runtime;
             std::vector<uint8_t> rdram(PS2_RAM_SIZE, 0u);
-            ps2_stubs::resetMpegStubState();
+            ps2_stubs::resetMpegStubState(&runtime);
 
             constexpr uint32_t kMpegAddr = 0x00123000u;
             constexpr uint32_t kCallbackEntry = 0x00124000u;
@@ -2302,7 +2305,7 @@ void register_ps2_runtime_expansion_tests()
         {
             PS2Runtime runtime;
             std::vector<uint8_t> rdram(PS2_RAM_SIZE, 0u);
-            ps2_stubs::resetMpegStubState();
+            ps2_stubs::resetMpegStubState(&runtime);
 
             constexpr uint32_t kMpegAddr = 0x00123000u;
             constexpr uint32_t kCallbackEntry = 0x00124000u;
@@ -2372,7 +2375,7 @@ void register_ps2_runtime_expansion_tests()
         {
             PS2Runtime runtime;
             std::vector<uint8_t> rdram(PS2_RAM_SIZE, 0u);
-            ps2_stubs::resetMpegStubState();
+            ps2_stubs::resetMpegStubState(&runtime);
 
             constexpr uint32_t kMpegAddr = 0x00123000u;
             constexpr uint32_t kCallbackEntry = 0x00124000u;
@@ -2466,7 +2469,7 @@ void register_ps2_runtime_expansion_tests()
         {
             PS2Runtime runtime;
             std::vector<uint8_t> rdram(PS2_RAM_SIZE, 0u);
-            ps2_stubs::resetMpegStubState();
+            ps2_stubs::resetMpegStubState(&runtime);
 
             constexpr uint32_t kMpegAddr = 0x00123000u;
             constexpr uint32_t kCallbackEntry = 0x00124000u;
@@ -2606,8 +2609,9 @@ void register_ps2_runtime_expansion_tests()
 
         tc.Run("MPEG playback stays active during a temporary demux pause before CD EOF", [](TestCase &t)
         {
+            PS2Runtime runtime;
             std::vector<uint8_t> rdram(PS2_RAM_SIZE, 0u);
-            ps2_stubs::resetMpegStubState();
+            ps2_stubs::resetMpegStubState(&runtime);
 
             constexpr uint32_t kMpegAddr = 0x00123000u;
             constexpr uint32_t kPacketAddr = 0x00128000u;
@@ -2642,12 +2646,17 @@ void register_ps2_runtime_expansion_tests()
             setRegU32(demuxCtx, 6, static_cast<uint32_t>(packet.size()));
             setRegU32(demuxCtx, 7, kPacketAddr);
             setRegU32(demuxCtx, 8, static_cast<uint32_t>(packet.size()));
-            ps2_stubs::sceMpegDemuxPssRing(rdram.data(), &demuxCtx, nullptr);
+            ps2_stubs::sceMpegDemuxPssRing(rdram.data(), &demuxCtx, &runtime);
+
+            // This fixture polls decoder state synchronously. A stopped
+            // runtime preserves the old non-blocking direct-stub behavior;
+            // live-runtime starvation is covered by the waiter tests below.
+            runtime.requestStop();
 
             R5900Context pictureCtx{};
             setRegU32(pictureCtx, 4, kMpegAddr);
             setRegU32(pictureCtx, 5, kImageAddr);
-            ps2_stubs::sceMpegGetPicture(rdram.data(), &pictureCtx, nullptr);
+            ps2_stubs::sceMpegGetPicture(rdram.data(), &pictureCtx, &runtime);
             t.Equals(Ps2FastRead32(rdram.data(), kMpegAddr + 0x00u), 16u,
                      "test stream should decode one frame before the pause");
             t.Equals(Ps2FastRead32(rdram.data(), kMpegAddr + 0x08u), 0u,
@@ -2657,15 +2666,15 @@ void register_ps2_runtime_expansion_tests()
 
             R5900Context isEndCtx{};
             setRegU32(isEndCtx, 4, kMpegAddr);
-            ps2_stubs::sceMpegIsEnd(rdram.data(), &isEndCtx, nullptr);
+            ps2_stubs::sceMpegIsEnd(rdram.data(), &isEndCtx, &runtime);
             t.Equals(getRegS32(isEndCtx, 2), 0,
                      "a temporary demux pause must not end an active stream before CD EOF");
 
-            ps2_stubs::sceMpegGetPicture(rdram.data(), &pictureCtx, nullptr);
+            ps2_stubs::sceMpegGetPicture(rdram.data(), &pictureCtx, &runtime);
             t.Equals(Ps2FastRead32(rdram.data(), kMpegAddr + 0x08u), 1u,
                      "temporary non-EOF starvation should keep movie frame progress moving");
 
-            ps2_stubs::sceMpegGetPicture(rdram.data(), &pictureCtx, nullptr);
+            ps2_stubs::sceMpegGetPicture(rdram.data(), &pictureCtx, &runtime);
             t.Equals(Ps2FastRead32(rdram.data(), kMpegAddr + 0x08u), 2u,
                      "repeated temporary starvation should continue advancing from the held frame");
         });
@@ -2674,8 +2683,8 @@ void register_ps2_runtime_expansion_tests()
         {
             PS2Runtime runtime;
             std::vector<uint8_t> rdram(PS2_RAM_SIZE, 0u);
-            ps2_stubs::resetMpegStubState();
-            ps2_stubs::notifyMpegCdStreamStart();
+            ps2_stubs::resetMpegStubState(&runtime);
+            ps2_stubs::notifyMpegCdStreamStart(&runtime);
 
             constexpr uint32_t kMpegAddr = 0x00123000u;
             constexpr uint32_t kImageAddr = 0x00130000u;
@@ -2694,7 +2703,7 @@ void register_ps2_runtime_expansion_tests()
             t.IsFalse(returned.load(std::memory_order_acquire),
                       "sceMpegGetPicture should wait while the current stream still has no frame");
 
-            ps2_stubs::notifyMpegCdStreamStart();
+            ps2_stubs::notifyMpegCdStreamStart(&runtime);
             const bool released = waitUntil(
                 [&]() { return returned.load(std::memory_order_acquire); },
                 std::chrono::milliseconds(30));
@@ -2709,8 +2718,8 @@ void register_ps2_runtime_expansion_tests()
         {
             PS2Runtime runtime;
             std::vector<uint8_t> rdram(PS2_RAM_SIZE, 0u);
-            ps2_stubs::resetMpegStubState();
-            ps2_stubs::notifyMpegCdStreamStart();
+            ps2_stubs::resetMpegStubState(&runtime);
+            ps2_stubs::notifyMpegCdStreamStart(&runtime);
 
             constexpr uint32_t kMpegAddr = 0x00123000u;
             constexpr uint32_t kPssAddr = 0x0012C000u;
@@ -2743,7 +2752,7 @@ void register_ps2_runtime_expansion_tests()
 
             R5900Context isEndCtx{};
             setRegU32(isEndCtx, 4, kMpegAddr);
-            ps2_stubs::sceMpegIsEnd(rdram.data(), &isEndCtx, nullptr);
+            ps2_stubs::sceMpegIsEnd(rdram.data(), &isEndCtx, &runtime);
             t.Equals(getRegS32(isEndCtx, 2), 0,
                      "waiting without a frame must not mark the active stream ended");
 
@@ -2755,13 +2764,14 @@ void register_ps2_runtime_expansion_tests()
 
         tc.Run("movie startup MPEG and audio stubs return safe progress values", [](TestCase &t)
         {
+            PS2Runtime runtime;
             std::vector<uint8_t> rdram(PS2_RAM_SIZE, 0u);
-            ps2_stubs::resetMpegStubState();
+            ps2_stubs::resetMpegStubState(&runtime);
             ps2_stubs::resetAudioStubState();
 
             R5900Context firstIsEndCtx{};
             setRegU32(firstIsEndCtx, 4, 0x00123000u);
-            ps2_stubs::sceMpegIsEnd(rdram.data(), &firstIsEndCtx, nullptr);
+            ps2_stubs::sceMpegIsEnd(rdram.data(), &firstIsEndCtx, &runtime);
             t.Equals(getRegS32(firstIsEndCtx, 2), 0,
                      "sceMpegIsEnd should allow one synthetic frame before reporting end");
 
@@ -2770,15 +2780,20 @@ void register_ps2_runtime_expansion_tests()
             setRegU32(demuxCtx, 5, 0x00400000u);
             setRegU32(demuxCtx, 6, 0x00004000u);
             setRegU32(demuxCtx, 7, 0x00410000u);
-            ps2_stubs::sceMpegDemuxPssRing(rdram.data(), &demuxCtx, nullptr);
+            ps2_stubs::sceMpegDemuxPssRing(rdram.data(), &demuxCtx, &runtime);
             t.Equals(getRegS32(demuxCtx, 2), 0x4000,
                      "sceMpegDemuxPssRing should consume the provided input instead of trapping");
+
+            // This compatibility fixture inspects synthetic output without a
+            // producer. Use stopped-runtime semantics instead of the removed
+            // process-global null-runtime shortcut.
+            runtime.requestStop();
 
             R5900Context getPictureCtx{};
             setRegU32(getPictureCtx, 4, 0x00123000u);
             setRegU32(getPictureCtx, 5, 0x00124000u);
             setRegU32(getPictureCtx, 6, 440u);
-            ps2_stubs::sceMpegGetPicture(rdram.data(), &getPictureCtx, nullptr);
+            ps2_stubs::sceMpegGetPicture(rdram.data(), &getPictureCtx, &runtime);
             t.Equals(Ps2FastRead32(rdram.data(), 0x00123000u + 0x00u), 320u,
                      "sceMpegGetPicture should seed a safe movie width");
             t.Equals(Ps2FastRead32(rdram.data(), 0x00123000u + 0x04u), 240u,
@@ -2788,7 +2803,7 @@ void register_ps2_runtime_expansion_tests()
 
             R5900Context secondIsEndCtx{};
             setRegU32(secondIsEndCtx, 4, 0x00123000u);
-            ps2_stubs::sceMpegIsEnd(rdram.data(), &secondIsEndCtx, nullptr);
+            ps2_stubs::sceMpegIsEnd(rdram.data(), &secondIsEndCtx, &runtime);
             t.Equals(getRegS32(secondIsEndCtx, 2), 0,
                      "sceMpegIsEnd should keep the decode thread alive and let the guest stop playback");
 
@@ -2804,15 +2819,15 @@ void register_ps2_runtime_expansion_tests()
             setRegU32(endDemuxCtx, 5, pssEndAddr);
             setRegU32(endDemuxCtx, 6, sizeof(programEnd));
             setRegU32(endDemuxCtx, 7, pssEndAddr);
-            ps2_stubs::sceMpegDemuxPssRing(rdram.data(), &endDemuxCtx, nullptr);
+            ps2_stubs::sceMpegDemuxPssRing(rdram.data(), &endDemuxCtx, &runtime);
 
             R5900Context endIsEndCtx{};
             setRegU32(endIsEndCtx, 4, 0x00123000u);
-            ps2_stubs::sceMpegIsEnd(rdram.data(), &endIsEndCtx, nullptr);
+            ps2_stubs::sceMpegIsEnd(rdram.data(), &endIsEndCtx, &runtime);
             t.Equals(getRegS32(endIsEndCtx, 2), 1,
                      "sceMpegIsEnd should report end after a demuxed MPEG program end code");
 
-            ps2_stubs::resetMpegStubState();
+            ps2_stubs::resetMpegStubState(&runtime);
             constexpr uint32_t wrappedEndBase = 0x0012A000u;
             rdram[wrappedEndBase + 0u] = 0x00u;
             rdram[wrappedEndBase + 1u] = 0x01u;
@@ -2825,15 +2840,15 @@ void register_ps2_runtime_expansion_tests()
             setRegU32(wrappedEndDemuxCtx, 6, 4u);
             setRegU32(wrappedEndDemuxCtx, 7, wrappedEndBase);
             setRegU32(wrappedEndDemuxCtx, 8, 4u);
-            ps2_stubs::sceMpegDemuxPssRing(rdram.data(), &wrappedEndDemuxCtx, nullptr);
+            ps2_stubs::sceMpegDemuxPssRing(rdram.data(), &wrappedEndDemuxCtx, &runtime);
 
             R5900Context wrappedEndIsEndCtx{};
             setRegU32(wrappedEndIsEndCtx, 4, 0x00123000u);
-            ps2_stubs::sceMpegIsEnd(rdram.data(), &wrappedEndIsEndCtx, nullptr);
+            ps2_stubs::sceMpegIsEnd(rdram.data(), &wrappedEndIsEndCtx, &runtime);
             t.Equals(getRegS32(wrappedEndIsEndCtx, 2), 1,
                      "sceMpegDemuxPssRing should use the ABI fifth argument in t0 for wrapped rings");
 
-            ps2_stubs::resetMpegStubState();
+            ps2_stubs::resetMpegStubState(&runtime);
             constexpr uint32_t eofMpegAddr = 0x0012B000u;
             constexpr uint32_t eofPssAddr = 0x0012C000u;
             const uint8_t incompletePssStart[] = {0x00u, 0x00u, 0x01u};
@@ -2845,22 +2860,22 @@ void register_ps2_runtime_expansion_tests()
             setRegU32(eofDemuxCtx, 6, sizeof(incompletePssStart));
             setRegU32(eofDemuxCtx, 7, eofPssAddr);
             setRegU32(eofDemuxCtx, 8, sizeof(incompletePssStart));
-            ps2_stubs::sceMpegDemuxPssRing(rdram.data(), &eofDemuxCtx, nullptr);
+            ps2_stubs::sceMpegDemuxPssRing(rdram.data(), &eofDemuxCtx, &runtime);
             t.Equals(getRegS32(eofDemuxCtx, 2), static_cast<int32_t>(sizeof(incompletePssStart)),
                      "sceMpegDemuxPssRing should accept partial trailing stream data");
 
             R5900Context eofBeforeStopCtx{};
             setRegU32(eofBeforeStopCtx, 4, eofMpegAddr);
-            ps2_stubs::sceMpegIsEnd(rdram.data(), &eofBeforeStopCtx, nullptr);
+            ps2_stubs::sceMpegIsEnd(rdram.data(), &eofBeforeStopCtx, &runtime);
             t.Equals(getRegS32(eofBeforeStopCtx, 2), 0,
                      "sceMpegIsEnd should not report end until the CD stream terminates");
 
             R5900Context cdStopCtx{};
-            ps2_stubs::sceCdStStop(rdram.data(), &cdStopCtx, nullptr);
+            ps2_stubs::sceCdStStop(rdram.data(), &cdStopCtx, &runtime);
 
             R5900Context eofAfterStopCtx{};
             setRegU32(eofAfterStopCtx, 4, eofMpegAddr);
-            ps2_stubs::sceMpegIsEnd(rdram.data(), &eofAfterStopCtx, nullptr);
+            ps2_stubs::sceMpegIsEnd(rdram.data(), &eofAfterStopCtx, &runtime);
             t.Equals(getRegS32(eofAfterStopCtx, 2), 1,
                      "sceCdStStop should finalize active MPEG playback so movie threads can advance");
 
@@ -2914,8 +2929,9 @@ void register_ps2_runtime_expansion_tests()
 
         tc.Run("sceMpegGetPicture publishes libmpeg end-of-sequence state", [](TestCase &t)
         {
+            PS2Runtime runtime;
             std::vector<uint8_t> rdram(PS2_RAM_SIZE, 0u);
-            ps2_stubs::resetMpegStubState();
+            ps2_stubs::resetMpegStubState(&runtime);
 
             constexpr uint32_t kMpegAddr = 0x00123000u;
             constexpr uint32_t kWorkAddr = 0x00140000u;
@@ -2926,7 +2942,7 @@ void register_ps2_runtime_expansion_tests()
             setRegU32(createCtx, 4, kMpegAddr);
             setRegU32(createCtx, 5, kWorkAddr);
             setRegU32(createCtx, 6, 0x3000u);
-            ps2_stubs::sceMpegCreate(rdram.data(), &createCtx, nullptr);
+            ps2_stubs::sceMpegCreate(rdram.data(), &createCtx, &runtime);
 
             const uint32_t innerAddr = Ps2FastRead32(rdram.data(), kMpegAddr + 0x40u);
             t.IsTrue(innerAddr != 0u, "sceMpegCreate should publish its internal state address");
@@ -2942,13 +2958,13 @@ void register_ps2_runtime_expansion_tests()
             setRegU32(demuxCtx, 6, sizeof(programEnd));
             setRegU32(demuxCtx, 7, kEndCodeAddr);
             setRegU32(demuxCtx, 8, sizeof(programEnd));
-            ps2_stubs::sceMpegDemuxPssRing(rdram.data(), &demuxCtx, nullptr);
+            ps2_stubs::sceMpegDemuxPssRing(rdram.data(), &demuxCtx, &runtime);
 
             R5900Context pictureCtx{};
             setRegU32(pictureCtx, 4, kMpegAddr);
             setRegU32(pictureCtx, 5, kImageAddr);
             setRegU32(pictureCtx, 6, 832u);
-            ps2_stubs::sceMpegGetPicture(rdram.data(), &pictureCtx, nullptr);
+            ps2_stubs::sceMpegGetPicture(rdram.data(), &pictureCtx, &runtime);
 
             t.Equals(Ps2FastRead32(rdram.data(), innerAddr), 1u,
                      "sceMpegGetPicture should publish sequence end through libmpeg state");
