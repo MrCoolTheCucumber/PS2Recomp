@@ -9,6 +9,7 @@
 #include <atomic>
 #include <cstdint>
 #include <cstring>
+#include <memory>
 #include <sstream>
 #include <thread>
 #include <utility>
@@ -5346,6 +5347,76 @@ void register_ps2_runtime_kernel_tests()
                 cancelAlarm(second, secondAlarm),
                 KE_OK,
                 "first-runtime cancellation must not consume the second alarm");
+        });
+
+        tc.Run("alarm shutdown does not join a callback blocked behind guest execution", [](TestCase &t)
+        {
+            TestEnv env;
+
+            constexpr uint32_t kAlarmHandlerAddr = 0x00270200u;
+            env.runtime.registerFunction(
+                kAlarmHandlerAddr, &alarmNoopHandler);
+
+            auto guestExecution =
+                std::make_unique<PS2Runtime::GuestExecutionScope>(
+                    &env.runtime, &env.ctx);
+
+            setRegU32(env.ctx, 4, 1u);
+            setRegU32(env.ctx, 5, kAlarmHandlerAddr);
+            setRegU32(env.ctx, 6, 0u);
+            SetAlarm(
+                env.rdram.data(), &env.ctx, &env.runtime);
+            t.IsTrue(
+                getRegS32(env.ctx, 2) > 0,
+                "the shutdown fixture should create a short alarm");
+
+            const bool callbackWaiting = waitUntil(
+                [&]()
+                {
+                    return env.runtime
+                               .guestExecutionWaiterCountForTesting() >
+                           0u;
+                },
+                std::chrono::milliseconds(1000));
+            t.IsTrue(
+                callbackWaiting,
+                "the expired alarm callback should reach the held guest boundary");
+
+            std::atomic<bool> stopReturned{false};
+            std::thread stopThread;
+            if (callbackWaiting)
+            {
+                stopThread = std::thread(
+                    [&]()
+                    {
+                        env.runtime.requestStop();
+                        stopReturned.store(
+                            true, std::memory_order_release);
+                    });
+            }
+
+            const bool returnedWhileGuestHeld =
+                callbackWaiting &&
+                waitUntil(
+                    [&]()
+                    {
+                        return stopReturned.load(
+                            std::memory_order_acquire);
+                    },
+                    std::chrono::milliseconds(100));
+
+            // Always release the deliberately held boundary before joining,
+            // so the failing implementation reports one bounded assertion
+            // instead of hanging the complete test process.
+            guestExecution.reset();
+            if (stopThread.joinable())
+            {
+                stopThread.join();
+            }
+
+            t.IsTrue(
+                returnedWhileGuestHeld,
+                "requestStop should cancel a blocked alarm callback before joining its worker");
         });
 
         tc.Run("setup heap and thread invalid ids use documented kernel errors", [](TestCase &t)
