@@ -5894,6 +5894,167 @@ void register_ps2_runtime_kernel_tests()
             t.Equals((readConfig1 >> 16) & 0x1Fu, 10u, "SetOsdConfigParam2 should sync ConfigParam.language");
         });
 
+        tc.Run("guest kernel state is isolated per runtime", [](TestCase &t)
+        {
+            notifyRuntimeStop();
+            TestEnv first;
+            TestEnv second;
+
+            constexpr uint32_t kFirstConfigAddr = 0x00005000u;
+            constexpr uint32_t kSecondConfigAddr = 0x00005010u;
+            constexpr uint32_t kFirstConfigOutAddr = 0x00005020u;
+            constexpr uint32_t kFirstConfig =
+                (1u << 0) |
+                (1u << 4) |
+                (1u << 13) |
+                (1u << 16);
+            constexpr uint32_t kSecondConfig =
+                (1u << 0) |
+                (1u << 4) |
+                (2u << 13) |
+                (10u << 16);
+
+            writeGuestU32(
+                first.rdram.data(),
+                kFirstConfigAddr,
+                kFirstConfig);
+            setRegU32(first.ctx, 4, kFirstConfigAddr);
+            SetOsdConfigParam(
+                first.rdram.data(),
+                &first.ctx,
+                &first.runtime);
+
+            writeGuestU32(
+                second.rdram.data(),
+                kSecondConfigAddr,
+                kSecondConfig);
+            setRegU32(second.ctx, 4, kSecondConfigAddr);
+            SetOsdConfigParam(
+                second.rdram.data(),
+                &second.ctx,
+                &second.runtime);
+
+            setRegU32(first.ctx, 4, kFirstConfigOutAddr);
+            GetOsdConfigParam(
+                first.rdram.data(),
+                &first.ctx,
+                &first.runtime);
+            t.Equals(
+                readGuestU32(
+                    first.rdram.data(),
+                    kFirstConfigOutAddr),
+                kFirstConfig,
+                "the second runtime must not replace the first runtime's OSD configuration");
+
+            setRegU32(first.ctx, 4, 3u);
+            QueryBootMode(
+                first.rdram.data(),
+                &first.ctx,
+                &first.runtime);
+            const uint32_t firstBootMode =
+                ::getRegU32(&first.ctx, 2);
+
+            setRegU32(second.ctx, 4, 3u);
+            QueryBootMode(
+                second.rdram.data(),
+                &second.ctx,
+                &second.runtime);
+            const uint32_t secondBootMode =
+                ::getRegU32(&second.ctx, 2);
+
+            t.Equals(
+                secondBootMode,
+                firstBootMode,
+                "each runtime should independently allocate the same guest boot-mode address");
+            t.IsTrue(
+                firstBootMode != 0u &&
+                    readGuestU32(
+                        first.rdram.data(),
+                        firstBootMode) != 0u,
+                "the first runtime should populate its boot-mode table");
+            t.Equals(
+                readGuestU32(
+                    second.rdram.data(),
+                    secondBootMode),
+                readGuestU32(
+                    first.rdram.data(),
+                    firstBootMode),
+                "the second runtime should populate its own boot-mode table");
+
+            GetThreadTLS(
+                first.rdram.data(),
+                &first.ctx,
+                &first.runtime);
+            const uint32_t firstTls =
+                ::getRegU32(&first.ctx, 2);
+            GetThreadTLS(
+                second.rdram.data(),
+                &second.ctx,
+                &second.runtime);
+            const uint32_t secondTls =
+                ::getRegU32(&second.ctx, 2);
+            t.Equals(
+                secondTls,
+                firstTls,
+                "each runtime should independently allocate the first TLS slot");
+
+            constexpr uint32_t kSyscallIndex = 0x91u;
+            constexpr uint32_t kFirstHandler = 0x00200000u;
+            constexpr uint32_t kSecondHandler = 0x00200010u;
+            first.runtime.registerFunction(
+                kFirstHandler,
+                overrideReturnHandler);
+            second.runtime.registerFunction(
+                kSecondHandler,
+                overrideBrokenHandler);
+
+            setRegU32(first.ctx, 4, kSyscallIndex);
+            setRegU32(first.ctx, 5, kFirstHandler);
+            SetSyscall(
+                first.rdram.data(),
+                &first.ctx,
+                &first.runtime);
+            setRegU32(second.ctx, 4, kSyscallIndex);
+            setRegU32(second.ctx, 5, kSecondHandler);
+            SetSyscall(
+                second.rdram.data(),
+                &second.ctx,
+                &second.runtime);
+
+            setRegU32(first.ctx, 4, 7u);
+            setRegU32(first.ctx, 5, 5u);
+            t.IsTrue(
+                callSyscall(
+                    kSyscallIndex,
+                    first.rdram.data(),
+                    &first.ctx,
+                    &first.runtime),
+                "the first runtime's syscall override should dispatch");
+            t.Equals(
+                static_cast<uint32_t>(
+                    getRegS32(first.ctx, 2)),
+                12u,
+                "the second runtime must not replace the first runtime's syscall override");
+
+            notifyRuntimeStop(&second.runtime);
+            setRegU32(first.ctx, 4, 9u);
+            setRegU32(first.ctx, 5, 4u);
+            t.IsTrue(
+                callSyscall(
+                    kSyscallIndex,
+                    first.rdram.data(),
+                    &first.ctx,
+                    &first.runtime),
+                "the first runtime's syscall override should survive stopping the second");
+            t.Equals(
+                static_cast<uint32_t>(
+                    getRegS32(first.ctx, 2)),
+                13u,
+                "stopping the second runtime must not erase the first runtime's syscall override");
+
+            notifyRuntimeStop(&first.runtime);
+        });
+
         tc.Run("numeric syscall 0x83 finds matching table entry", [](TestCase &t)
         {
             TestEnv env;
