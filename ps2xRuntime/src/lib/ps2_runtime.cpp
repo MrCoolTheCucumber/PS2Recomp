@@ -4477,6 +4477,11 @@ const PS2Runtime::IoPaths &PS2Runtime::getIoPaths()
     return runtimeIoPaths();
 }
 
+const PS2Runtime::IoPaths &PS2Runtime::ioPaths() const
+{
+    return getIoPaths();
+}
+
 void PS2Runtime::setIoPaths(const IoPaths &paths)
 {
     IoPaths normalized = paths;
@@ -4506,6 +4511,11 @@ void PS2Runtime::setIoPaths(const IoPaths &paths)
     }
 
     runtimeIoPaths() = normalized;
+}
+
+void PS2Runtime::configureIoPaths(const IoPaths &paths)
+{
+    setIoPaths(paths);
 }
 
 void PS2Runtime::configureIoPathsFromElf(const std::string &elfPath)

@@ -339,6 +339,139 @@ void register_ps2_runtime_io_tests()
                 "stopping one runtime must not reset another runtime's CD initialization state");
         });
 
+        tc.Run("IO path configuration is isolated per runtime", [](TestCase &t)
+        {
+            TempPaths firstPaths = makeTempPaths();
+            TempPaths secondPaths = makeTempPaths();
+            PS2Runtime first;
+            PS2Runtime second;
+            std::vector<uint8_t> firstRdram(
+                PS2_RAM_SIZE, 0u);
+            std::vector<uint8_t> secondRdram(
+                PS2_RAM_SIZE, 0u);
+            R5900Context firstCtx{};
+            R5900Context secondCtx{};
+
+            const std::filesystem::path firstFile =
+                firstPaths.cdRoot / "identity.bin";
+            const std::filesystem::path secondFile =
+                secondPaths.cdRoot / "identity.bin";
+            {
+                std::ofstream out(
+                    firstFile, std::ios::binary);
+                out.put('1');
+            }
+            {
+                std::ofstream out(
+                    secondFile, std::ios::binary);
+                out.put('2');
+            }
+
+            PS2Runtime::IoPaths firstIoPaths;
+            firstIoPaths.elfDirectory =
+                firstPaths.cdRoot;
+            firstIoPaths.hostRoot =
+                firstPaths.cdRoot;
+            firstIoPaths.cdRoot =
+                firstPaths.cdRoot;
+            firstIoPaths.mcRoot =
+                firstPaths.mcRoot;
+            first.configureIoPaths(firstIoPaths);
+
+            PS2Runtime::IoPaths secondIoPaths;
+            secondIoPaths.elfDirectory =
+                secondPaths.cdRoot;
+            secondIoPaths.hostRoot =
+                secondPaths.cdRoot;
+            secondIoPaths.cdRoot =
+                secondPaths.cdRoot;
+            secondIoPaths.mcRoot =
+                secondPaths.mcRoot;
+            second.configureIoPaths(secondIoPaths);
+
+            t.Equals(
+                first.ioPaths().hostRoot.string(),
+                firstPaths.cdRoot.string(),
+                "configuring a peer runtime must not replace the first runtime's host root");
+            t.Equals(
+                second.ioPaths().hostRoot.string(),
+                secondPaths.cdRoot.string(),
+                "the second runtime should retain its own host root");
+
+            constexpr uint32_t kPathAddr =
+                GUEST_STRING_AREA_START + 0xC80u;
+            constexpr uint32_t kReadAddr =
+                GUEST_BUFFER_AREA_START + 0x1E80u;
+            writeGuestString(
+                firstRdram.data(),
+                kPathAddr,
+                "host0:/identity.bin");
+            writeGuestString(
+                secondRdram.data(),
+                kPathAddr,
+                "host0:/identity.bin");
+
+            const auto readIdentity =
+                [&](PS2Runtime &runtime,
+                    std::vector<uint8_t> &rdram,
+                    R5900Context &ctx) -> char
+            {
+                setRegU32(ctx, 4, kPathAddr);
+                setRegU32(ctx, 5, PS2_FIO_O_RDONLY);
+                fioOpen(
+                    rdram.data(),
+                    &ctx,
+                    &runtime);
+                const int32_t fd =
+                    getRegS32(&ctx, 2);
+                if (fd < 0)
+                {
+                    return '\0';
+                }
+
+                setRegU32(
+                    ctx,
+                    4,
+                    static_cast<uint32_t>(fd));
+                setRegU32(ctx, 5, kReadAddr);
+                setRegU32(ctx, 6, 1u);
+                fioRead(
+                    rdram.data(),
+                    &ctx,
+                    &runtime);
+                const int32_t bytesRead =
+                    getRegS32(&ctx, 2);
+
+                setRegU32(
+                    ctx,
+                    4,
+                    static_cast<uint32_t>(fd));
+                fioClose(
+                    rdram.data(),
+                    &ctx,
+                    &runtime);
+                return bytesRead == 1
+                           ? static_cast<char>(
+                                 rdram[kReadAddr])
+                           : '\0';
+            };
+
+            t.Equals(
+                readIdentity(
+                    first,
+                    firstRdram,
+                    firstCtx),
+                '1',
+                "the first runtime should resolve host0 through its own root");
+            t.Equals(
+                readIdentity(
+                    second,
+                    secondRdram,
+                    secondCtx),
+                '2',
+                "the second runtime should resolve host0 through its own root");
+        });
+
         tc.Run("libc and memory-card handles are isolated per runtime", [](TestCase &t)
         {
             TestContext test;

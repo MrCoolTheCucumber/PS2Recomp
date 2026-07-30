@@ -1086,6 +1086,8 @@ public:
     static const IoPaths &getIoPaths();
     static void setIoPaths(const IoPaths &paths);
     static void configureIoPathsFromElf(const std::string &elfPath);
+    const IoPaths &ioPaths() const;
+    void configureIoPaths(const IoPaths &paths);
 
     [[noreturn]] void SignalException(R5900Context *ctx, PS2Exception exception);
     [[noreturn]] void SignalMemoryException(R5900Context *ctx,
