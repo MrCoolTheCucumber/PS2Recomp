@@ -1807,6 +1807,301 @@ void register_ps2_runtime_kernel_tests()
                 "the original keeper thread should remain independently deletable");
         });
 
+        tc.Run("asynchronous EE wake handles reject deleted and aliased threads", [](TestCase &t)
+        {
+            notifyRuntimeStop();
+            TestEnv env;
+
+            constexpr uint32_t kThreadEntry = 0x00255800u;
+            constexpr uint32_t kStackAddr = 0x0030C000u;
+            const uint32_t threadParam[9] = {
+                0u,
+                kThreadEntry,
+                kStackAddr,
+                0x00001000u,
+                0u,
+                30u,
+                0u,
+                0u,
+                0u
+            };
+
+            const auto configureEnv = [&](TestEnv &target)
+            {
+                target.runtime.registerFunction(
+                    kThreadEntry, &idReuseSleepHandler);
+                writeGuestU32(
+                    target.rdram.data(), K_ID_REUSE_STAGE_ADDR, 0u);
+                writeGuestU32(
+                    target.rdram.data(), K_ID_REUSE_RETURN_ADDR, 0u);
+                writeGuestWords(
+                    target.rdram.data(),
+                    K_PARAM_ADDR,
+                    threadParam,
+                    std::size(threadParam));
+
+                setRegU32(target.ctx, 4, 0u);
+                setRegU32(target.ctx, 5, 40u);
+                ChangeThreadPriority(
+                    target.rdram.data(),
+                    &target.ctx,
+                    &target.runtime);
+            };
+            const auto createThread = [&](TestEnv &target)
+            {
+                R5900Context createCtx{};
+                setRegU32(createCtx, 4, K_PARAM_ADDR);
+                CreateThread(
+                    target.rdram.data(),
+                    &createCtx,
+                    &target.runtime);
+                return getRegS32(createCtx, 2);
+            };
+            const auto deleteThread =
+                [&](TestEnv &target, int32_t tid)
+            {
+                R5900Context deleteCtx{};
+                setRegU32(
+                    deleteCtx, 4, static_cast<uint32_t>(tid));
+                DeleteThread(
+                    target.rdram.data(),
+                    &deleteCtx,
+                    &target.runtime);
+                return getRegS32(deleteCtx, 2);
+            };
+            const auto startSleepingThread =
+                [&](TestEnv &target, int32_t tid)
+            {
+                setRegU32(
+                    target.ctx, 4, static_cast<uint32_t>(tid));
+                setRegU32(target.ctx, 5, 0u);
+                StartThread(
+                    target.rdram.data(),
+                    &target.ctx,
+                    &target.runtime);
+                if (getRegS32(target.ctx, 2) != tid)
+                {
+                    return false;
+                }
+
+                return waitUntil([&]()
+                {
+                    R5900Context statusCtx{};
+                    setRegU32(
+                        statusCtx, 4, static_cast<uint32_t>(tid));
+                    setRegU32(statusCtx, 5, K_STATUS_ADDR);
+                    iReferThreadStatus(
+                        target.rdram.data(),
+                        &statusCtx,
+                        &target.runtime);
+                    EeThreadStatus status{};
+                    std::memcpy(
+                        &status,
+                        target.rdram.data() + K_STATUS_ADDR,
+                        sizeof(status));
+                    return readGuestU32(
+                               target.rdram.data(),
+                               K_ID_REUSE_STAGE_ADDR) == 1u &&
+                           getRegS32(statusCtx, 2) == THS_WAIT &&
+                           status.status == THS_WAIT &&
+                           status.waitType == TSW_SLEEP;
+                }, std::chrono::milliseconds(200));
+            };
+            const auto statusOf =
+                [&](TestEnv &target, int32_t tid)
+            {
+                R5900Context statusCtx{};
+                setRegU32(
+                    statusCtx, 4, static_cast<uint32_t>(tid));
+                setRegU32(statusCtx, 5, K_STATUS_ADDR);
+                iReferThreadStatus(
+                    target.rdram.data(),
+                    &statusCtx,
+                    &target.runtime);
+                return getRegS32(statusCtx, 2);
+            };
+            const auto finishReadyThread =
+                [&](TestEnv &target, int32_t tid)
+            {
+                setRegU32(target.ctx, 4, 0u);
+                setRegU32(target.ctx, 5, 60u);
+                ChangeThreadPriority(
+                    target.rdram.data(),
+                    &target.ctx,
+                    &target.runtime);
+                return waitUntil([&]()
+                {
+                    return statusOf(target, tid) == THS_DORMANT;
+                }, std::chrono::milliseconds(200));
+            };
+
+            configureEnv(env);
+            const int32_t firstTid = createThread(env);
+            t.Equals(
+                firstTid,
+                2,
+                "the first asynchronous handle should target id 2");
+            const EeThreadHandle staleHandle =
+                captureEeThreadHandle(&env.runtime, firstTid);
+            t.IsTrue(
+                static_cast<bool>(staleHandle),
+                "a registered thread should produce a valid host handle");
+            t.Equals(
+                staleHandle.threadId,
+                firstTid,
+                "the host handle should retain the numeric thread id");
+            t.Equals(
+                deleteThread(env, firstTid),
+                firstTid,
+                "the captured dormant thread should be deletable");
+            t.IsTrue(
+                publishEeThreadWake(
+                    &env.runtime, staleHandle) ==
+                    EeThreadWakeResult::StaleHandle,
+                "a deleted thread must reject a delayed host wake");
+
+            {
+                TestEnv other;
+                configureEnv(other);
+                const int32_t aliasTid = createThread(other);
+                t.Equals(
+                    aliasTid,
+                    firstTid,
+                    "a second runtime should reuse the same numeric id");
+                const EeThreadHandle aliasHandle =
+                    captureEeThreadHandle(&other.runtime, aliasTid);
+                t.IsTrue(
+                    static_cast<bool>(aliasHandle),
+                    "the second runtime should produce a valid host handle");
+                t.Equals(
+                    aliasHandle.threadGeneration,
+                    staleHandle.threadGeneration,
+                    "fresh runtimes should deliberately alias the per-thread generation");
+                t.IsTrue(
+                    aliasHandle != staleHandle,
+                    "runtime identity must distinguish otherwise identical handles");
+                t.IsTrue(
+                    startSleepingThread(other, aliasTid),
+                    "the aliased second-runtime thread should sleep");
+
+                t.IsTrue(
+                    publishEeThreadWake(
+                        &other.runtime, staleHandle) ==
+                        EeThreadWakeResult::StaleHandle,
+                    "a handle from another runtime must reject publication");
+                t.Equals(
+                    statusOf(other, aliasTid),
+                    THS_WAIT,
+                    "a cross-runtime stale wake must not change the alias");
+                t.Equals(
+                    readGuestU32(
+                        other.rdram.data(), K_ID_REUSE_STAGE_ADDR),
+                    1u,
+                    "a cross-runtime stale wake must not run guest code");
+
+                t.IsTrue(
+                    publishEeThreadWake(
+                        &other.runtime, aliasHandle) ==
+                        EeThreadWakeResult::MadeReady,
+                    "the matching host handle should publish the wake");
+                t.Equals(
+                    statusOf(other, aliasTid),
+                    THS_READY,
+                    "host wake publication should make the sleeper READY");
+                t.Equals(
+                    readGuestU32(
+                        other.rdram.data(), K_ID_REUSE_STAGE_ADDR),
+                    1u,
+                    "host wake publication must not dispatch guest code");
+                t.IsTrue(
+                    finishReadyThread(other, aliasTid),
+                    "a later ordinary boundary should run the published thread");
+                t.Equals(
+                    deleteThread(other, aliasTid),
+                    aliasTid,
+                    "the second-runtime thread should remain cleanly deletable");
+            }
+
+            std::vector<int32_t> dormantIds;
+            dormantIds.reserve(253u);
+            for (int32_t expectedTid = 3;
+                 expectedTid <= 0xFF;
+                 ++expectedTid)
+            {
+                const int32_t tid = createThread(env);
+                t.Equals(
+                    tid,
+                    expectedTid,
+                    "the allocator should advance to the wrap boundary");
+                if (tid > 0)
+                {
+                    dormantIds.push_back(tid);
+                }
+            }
+
+            const int32_t replacementTid = createThread(env);
+            t.Equals(
+                replacementTid,
+                firstTid,
+                "the allocator should reuse the captured numeric id");
+            const EeThreadHandle replacementHandle =
+                captureEeThreadHandle(&env.runtime, replacementTid);
+            t.IsTrue(
+                static_cast<bool>(replacementHandle),
+                "the replacement should produce a valid host handle");
+            t.IsTrue(
+                replacementHandle != staleHandle,
+                "ID reuse must advance the non-guest-visible generation");
+            t.IsTrue(
+                startSleepingThread(env, replacementTid),
+                "the replacement thread should sleep");
+
+            t.IsTrue(
+                publishEeThreadWake(
+                    &env.runtime, staleHandle) ==
+                    EeThreadWakeResult::StaleHandle,
+                "a pre-delete handle must reject the recycled numeric id");
+            t.Equals(
+                statusOf(env, replacementTid),
+                THS_WAIT,
+                "a stale host wake must leave the replacement waiting");
+            t.Equals(
+                readGuestU32(
+                    env.rdram.data(), K_ID_REUSE_STAGE_ADDR),
+                1u,
+                "a stale host wake must not run the replacement");
+
+            t.IsTrue(
+                publishEeThreadWake(
+                    &env.runtime, replacementHandle) ==
+                    EeThreadWakeResult::MadeReady,
+                "the replacement's matching handle should publish a wake");
+            t.Equals(
+                statusOf(env, replacementTid),
+                THS_READY,
+                "matching host publication should make the replacement READY");
+            t.Equals(
+                readGuestU32(
+                    env.rdram.data(), K_ID_REUSE_STAGE_ADDR),
+                1u,
+                "matching host publication must still defer guest execution");
+            t.IsTrue(
+                finishReadyThread(env, replacementTid),
+                "a later ordinary boundary should run the replacement");
+            t.Equals(
+                deleteThread(env, replacementTid),
+                replacementTid,
+                "the replacement should remain cleanly deletable");
+
+            for (const int32_t tid : dormantIds)
+            {
+                t.Equals(
+                    deleteThread(env, tid),
+                    tid,
+                    "each dormant ring entry should remain independently deletable");
+            }
+        });
+
         tc.Run("semaphore wait release and delete match the EE BIOS boundary", [](TestCase &t)
         {
             notifyRuntimeStop();

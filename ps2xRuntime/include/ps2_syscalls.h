@@ -16,6 +16,48 @@ inline std::mutex g_sys_fd_mutex;
 
 namespace ps2_syscalls
 {
+    // Host-side reference for delayed EE-thread work. Guest syscalls continue
+    // to use recyclable numeric IDs; queued host work must retain and validate
+    // both generations before publishing into authoritative thread state.
+    struct EeThreadHandle
+    {
+        uint64_t runtimeGeneration = 0u;
+        uint32_t threadGeneration = 0u;
+        int threadId = 0;
+
+        constexpr explicit operator bool() const noexcept
+        {
+            return runtimeGeneration != 0u &&
+                   threadGeneration != 0u &&
+                   threadId > 0;
+        }
+
+        friend constexpr bool operator==(
+            EeThreadHandle lhs,
+            EeThreadHandle rhs) noexcept
+        {
+            return lhs.runtimeGeneration == rhs.runtimeGeneration &&
+                   lhs.threadGeneration == rhs.threadGeneration &&
+                   lhs.threadId == rhs.threadId;
+        }
+
+        friend constexpr bool operator!=(
+            EeThreadHandle lhs,
+            EeThreadHandle rhs) noexcept
+        {
+            return !(lhs == rhs);
+        }
+    };
+
+    enum class EeThreadWakeResult : uint8_t
+    {
+        InvalidHandle,
+        StaleHandle,
+        Dormant,
+        WakeupCounted,
+        MadeReady,
+    };
+
     struct GuestThreadDebugSnapshot
     {
         int id = 0;
@@ -74,6 +116,14 @@ namespace ps2_syscalls
         PS2Runtime *runtime,
         R5900Context *ctx = nullptr);
     void WaitVSyncTick(uint8_t *rdram, PS2Runtime *runtime);
+    EeThreadHandle captureEeThreadHandle(
+        PS2Runtime *runtime,
+        int threadId);
+    // Publishes only the wake transition and host notification. It never
+    // dispatches a guest thread or runs a guest callback.
+    EeThreadWakeResult publishEeThreadWake(
+        PS2Runtime *runtime,
+        EeThreadHandle handle);
     std::vector<GuestThreadDebugSnapshot> debugThreadSnapshots(
         PS2Runtime *runtime);
 }
