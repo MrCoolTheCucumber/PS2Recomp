@@ -500,6 +500,23 @@ struct ThreadInfo
 
 struct EeThreadRuntimeState
 {
+    explicit EeThreadRuntimeState(uint64_t runtimeGenerationValue)
+        : runtimeGeneration(runtimeGenerationValue)
+    {
+        assert(runtimeGeneration != 0u);
+    }
+
+    uint32_t allocateThreadGenerationLocked() noexcept
+    {
+        uint32_t generation = 0u;
+        do
+        {
+            generation = nextGeneration++;
+        } while (generation == 0u);
+        return generation;
+    }
+
+    const uint64_t runtimeGeneration;
     std::mutex threadMapMutex;
     std::unordered_map<int, std::shared_ptr<ThreadInfo>> threads;
     std::unordered_map<const R5900Context *, int> contextThreadIds;

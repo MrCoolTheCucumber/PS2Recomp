@@ -3,6 +3,129 @@
 
 namespace ps2_syscalls
 {
+    struct EeThreadWakePublication
+    {
+        EeThreadWakeResult result =
+            EeThreadWakeResult::InvalidHandle;
+        int status = THS_DORMANT;
+        int wakeupCount = 0;
+    };
+
+    // The caller retains threadMapMutex so deletion, reset, and publication
+    // have one ordering boundary. This function acquires only the selected
+    // thread's state mutex.
+    static EeThreadWakePublication publishRegisteredEeThreadWake(
+        const std::shared_ptr<ThreadInfo> &info)
+    {
+        EeThreadWakePublication publication{};
+        std::lock_guard<std::mutex> lock(info->m);
+        if (info->guestState.isDormant())
+        {
+            publication.result = EeThreadWakeResult::Dormant;
+        }
+        else if (info->guestState.wakeSleeping())
+        {
+            info->cv.notify_one();
+            publication.result =
+                EeThreadWakeResult::WokeSleeper;
+        }
+        else
+        {
+            info->guestState.incrementWakeup();
+            publication.result =
+                EeThreadWakeResult::WakeupCounted;
+        }
+
+        const EeThreadGuestStateSnapshot &guest =
+            info->guestState.snapshot();
+        publication.status = guest.status;
+        publication.wakeupCount = guest.wakeupCount;
+        return publication;
+    }
+
+    static EeThreadWakePublication publishEeThreadWakeById(
+        PS2Runtime *runtime,
+        int threadId)
+    {
+        if (!runtime || threadId <= 0)
+        {
+            return {};
+        }
+
+        EeThreadRuntimeState &state =
+            runtime->eeThreadRuntimeState();
+        std::lock_guard<std::mutex> lock(
+            state.threadMapMutex);
+        const auto it = state.threads.find(threadId);
+        if (it == state.threads.end() || !it->second)
+        {
+            EeThreadWakePublication publication{};
+            publication.result =
+                EeThreadWakeResult::StaleHandle;
+            return publication;
+        }
+        return publishRegisteredEeThreadWake(it->second);
+    }
+
+    EeThreadHandle captureEeThreadHandle(
+        PS2Runtime *runtime,
+        int threadId)
+    {
+        if (!runtime || threadId <= 0)
+        {
+            return {};
+        }
+
+        EeThreadRuntimeState &state =
+            runtime->eeThreadRuntimeState();
+        std::lock_guard<std::mutex> lock(
+            state.threadMapMutex);
+        const auto it = state.threads.find(threadId);
+        if (it == state.threads.end() || !it->second)
+        {
+            return {};
+        }
+
+        return {
+            state.runtimeGeneration,
+            it->second->generation,
+            threadId,
+        };
+    }
+
+    EeThreadWakeResult publishEeThreadWake(
+        PS2Runtime *runtime,
+        EeThreadHandle handle)
+    {
+        if (!runtime || !handle)
+        {
+            return EeThreadWakeResult::InvalidHandle;
+        }
+
+        EeThreadRuntimeState &state =
+            runtime->eeThreadRuntimeState();
+        std::lock_guard<std::mutex> lock(
+            state.threadMapMutex);
+        if (handle.runtimeGeneration !=
+            state.runtimeGeneration)
+        {
+            return EeThreadWakeResult::StaleHandle;
+        }
+
+        const auto it = state.threads.find(handle.threadId);
+        if (it == state.threads.end() ||
+            !it->second ||
+            it->second->generation !=
+                handle.threadGeneration)
+        {
+            return EeThreadWakeResult::StaleHandle;
+        }
+
+        return publishRegisteredEeThreadWake(
+                   it->second)
+            .result;
+    }
+
     static void eraseThreadContextMappingsLocked(
         EeThreadRuntimeState &state,
         int tid)
@@ -263,7 +386,8 @@ namespace ps2_syscalls
         {
             std::lock_guard<std::mutex> lock(
                 state.threadMapMutex);
-            info->generation = state.nextGeneration++;
+            info->generation =
+                state.allocateThreadGenerationLocked();
             info->boundContext = &info->context;
             // Keep IDs in the classic low range used by patched libkernel helpers.
             for (int attempts = 0; attempts < 0xFE; ++attempts)
@@ -1175,8 +1299,12 @@ namespace ps2_syscalls
             return;
         }
 
-        auto info = lookupThreadInfo(runtime, tid);
-        if (!info)
+        const EeThreadWakePublication publication =
+            publishEeThreadWakeById(runtime, tid);
+        if (publication.result ==
+                EeThreadWakeResult::InvalidHandle ||
+            publication.result ==
+                EeThreadWakeResult::StaleHandle)
         {
             // The raw EE wake syscall collapses a deleted ID to generic -1;
             // the ordinary syscall retains the kernel's unknown-ID result.
@@ -1186,29 +1314,11 @@ namespace ps2_syscalls
             return;
         }
 
-        int newWakeupCount = 0;
-        int statusAfter = THS_DORMANT;
-        bool wokeSleeper = false;
+        if (publication.result ==
+            EeThreadWakeResult::Dormant)
         {
-            std::lock_guard<std::mutex> lock(info->m);
-            if (info->guestState.isDormant())
-            {
-                setReturnS32(ctx, KE_DORMANT);
-                return;
-            }
-            if (info->guestState.wakeSleeping())
-            {
-                info->cv.notify_one();
-                wokeSleeper = true;
-            }
-            else
-            {
-                info->guestState.incrementWakeup();
-            }
-            const EeThreadGuestStateSnapshot &guest =
-                info->guestState.snapshot();
-            newWakeupCount = guest.wakeupCount;
-            statusAfter = guest.status;
+            setReturnS32(ctx, KE_DORMANT);
+            return;
         }
 
         static std::atomic<uint32_t> s_wakeupLogs{0};
@@ -1217,12 +1327,14 @@ namespace ps2_syscalls
         {
             RUNTIME_LOG("[WakeupThread] tid=" << getCurrentThreadId(runtime)
                                               << " target=" << tid
-                                              << " status=" << statusAfter
-                                              << " wakeupCount=" << newWakeupCount
+                                              << " status=" << publication.status
+                                              << " wakeupCount=" << publication.wakeupCount
                                               << std::endl);
         }
         setReturnS32(ctx, tid);
-        if (wokeSleeper && reschedule)
+        if (publication.result ==
+                EeThreadWakeResult::WokeSleeper &&
+            reschedule)
         {
             yieldGuestExecutionAfterWake(runtime);
         }

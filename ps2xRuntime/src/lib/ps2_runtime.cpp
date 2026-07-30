@@ -54,6 +54,19 @@ static constexpr int DEFAULT_DISPLAY_HEIGHT = 448;
 static constexpr uint32_t DEFAULT_FB_SIZE = FB_WIDTH * FB_HEIGHT * 4;
 static constexpr uint32_t DEFAULT_FB_ADDR = (PS2_RAM_SIZE - DEFAULT_FB_SIZE - 0x10000u);
 static constexpr const char *GS_HISTORY_DUMP_ENV = "PS2X_GS_HISTORY_DUMP";
+static std::atomic<uint64_t> g_nextEeThreadRuntimeGeneration{1u};
+
+static uint64_t allocateEeThreadRuntimeGeneration() noexcept
+{
+    uint64_t generation = 0u;
+    do
+    {
+        generation = g_nextEeThreadRuntimeGeneration.fetch_add(
+            1u, std::memory_order_relaxed);
+    } while (generation == 0u);
+    return generation;
+}
+
 #if defined(PLATFORM_VITA)
 static constexpr int HOST_WINDOW_WIDTH = 960;
 static constexpr int HOST_WINDOW_HEIGHT = 544;
@@ -852,7 +865,8 @@ PS2Runtime::PS2Runtime(PS2RuntimeConfiguration configuration)
       m_vu1(VuUnitId::Vu1)
 {
     m_eeThreadRuntimeState =
-        std::make_unique<EeThreadRuntimeState>();
+        std::make_unique<EeThreadRuntimeState>(
+            allocateEeThreadRuntimeGeneration());
     m_eeThreadRuntimeState->contextThreadIds.emplace(
         &m_cpuContext, 1);
     selectEeThread(1);

@@ -6,6 +6,7 @@
 
 #include <chrono>
 #include <array>
+#include <atomic>
 #include <cstdint>
 #include <cstring>
 #include <sstream>
@@ -73,6 +74,7 @@ namespace
     constexpr uint32_t K_CONTROL_SEMA_PARAM_ADDR = 0x18A0u;
     constexpr uint32_t K_RESCHEDULE_STAGE_ADDR = 0x18C0u;
     constexpr uint32_t K_CURRENT_THREAD_ID_ADDR = 0x18D0u;
+    constexpr uint32_t K_ASYNC_EXIT_DELETE_STAGE_ADDR = 0x18D4u;
 
     struct EeThreadStatus
     {
@@ -375,6 +377,21 @@ namespace
         writeGuestU32(rdram, K_EXIT_DELETE_THREAD_STAGE_ADDR, 1u);
         ExitDeleteThread(rdram, ctx, runtime);
         writeGuestU32(rdram, K_EXIT_DELETE_THREAD_STAGE_ADDR, 99u);
+    }
+
+    void asyncExitDeleteThreadHandler(
+        uint8_t *rdram,
+        R5900Context *ctx,
+        PS2Runtime *runtime)
+    {
+        writeGuestU32(
+            rdram, K_ASYNC_EXIT_DELETE_STAGE_ADDR, 1u);
+        SleepThread(rdram, ctx, runtime);
+        writeGuestU32(
+            rdram, K_ASYNC_EXIT_DELETE_STAGE_ADDR, 2u);
+        ExitDeleteThread(rdram, ctx, runtime);
+        writeGuestU32(
+            rdram, K_ASYNC_EXIT_DELETE_STAGE_ADDR, 99u);
     }
 
     void poisonedCurrentThreadIdHandler(
@@ -2002,7 +2019,7 @@ void register_ps2_runtime_kernel_tests()
                 t.IsTrue(
                     publishEeThreadWake(
                         &other.runtime, aliasHandle) ==
-                        EeThreadWakeResult::MadeReady,
+                        EeThreadWakeResult::WokeSleeper,
                     "the matching host handle should publish the wake");
                 t.Equals(
                     statusOf(other, aliasTid),
@@ -2074,7 +2091,7 @@ void register_ps2_runtime_kernel_tests()
             t.IsTrue(
                 publishEeThreadWake(
                     &env.runtime, replacementHandle) ==
-                    EeThreadWakeResult::MadeReady,
+                    EeThreadWakeResult::WokeSleeper,
                 "the replacement's matching handle should publish a wake");
             t.Equals(
                 statusOf(env, replacementTid),
@@ -2100,6 +2117,189 @@ void register_ps2_runtime_kernel_tests()
                     tid,
                     "each dormant ring entry should remain independently deletable");
             }
+        });
+
+        tc.Run("asynchronous wake publication linearizes with exit-delete cleanup", [](TestCase &t)
+        {
+            notifyRuntimeStop();
+            TestEnv env;
+
+            constexpr uint32_t kThreadEntry = 0x00255900u;
+            env.runtime.registerFunction(
+                kThreadEntry, &asyncExitDeleteThreadHandler);
+            writeGuestU32(
+                env.rdram.data(),
+                K_ASYNC_EXIT_DELETE_STAGE_ADDR,
+                0u);
+
+            setRegU32(env.ctx, 4, 0u);
+            setRegU32(env.ctx, 5, 40u);
+            ChangeThreadPriority(
+                env.rdram.data(), &env.ctx, &env.runtime);
+
+            const uint32_t threadParam[9] = {
+                0u,
+                kThreadEntry,
+                0u, // Let StartThread allocate and own the guest stack.
+                0x00001000u,
+                0u,
+                30u,
+                0u,
+                0u,
+                0u
+            };
+            writeGuestWords(
+                env.rdram.data(),
+                K_PARAM_ADDR,
+                threadParam,
+                std::size(threadParam));
+
+            R5900Context createCtx{};
+            setRegU32(createCtx, 4, K_PARAM_ADDR);
+            CreateThread(
+                env.rdram.data(), &createCtx, &env.runtime);
+            const int32_t tid = getRegS32(createCtx, 2);
+            t.Equals(
+                tid,
+                2,
+                "the exit-delete race should create worker id 2");
+
+            const EeThreadHandle handle =
+                captureEeThreadHandle(&env.runtime, tid);
+            t.IsTrue(
+                static_cast<bool>(handle),
+                "the exit-delete worker should produce a host handle");
+
+            setRegU32(
+                env.ctx, 4, static_cast<uint32_t>(tid));
+            setRegU32(env.ctx, 5, 0u);
+            StartThread(
+                env.rdram.data(), &env.ctx, &env.runtime);
+            t.Equals(
+                getRegS32(env.ctx, 2),
+                tid,
+                "the auto-stack worker should start");
+
+            uint32_t autoStackAddr = 0u;
+            const bool sleeping = waitUntil([&]()
+            {
+                R5900Context statusCtx{};
+                setRegU32(
+                    statusCtx, 4, static_cast<uint32_t>(tid));
+                setRegU32(statusCtx, 5, K_STATUS_ADDR);
+                iReferThreadStatus(
+                    env.rdram.data(), &statusCtx, &env.runtime);
+                EeThreadStatus status{};
+                std::memcpy(
+                    &status,
+                    env.rdram.data() + K_STATUS_ADDR,
+                    sizeof(status));
+                if (getRegS32(statusCtx, 2) == THS_WAIT &&
+                    status.status == THS_WAIT &&
+                    status.waitType == TSW_SLEEP)
+                {
+                    autoStackAddr = status.stack;
+                    return readGuestU32(
+                               env.rdram.data(),
+                               K_ASYNC_EXIT_DELETE_STAGE_ADDR) == 1u;
+                }
+                return false;
+            }, std::chrono::milliseconds(200));
+            t.IsTrue(
+                sleeping,
+                "the auto-stack worker should reach its sleep boundary");
+            t.IsTrue(
+                autoStackAddr != 0u,
+                "StartThread should publish its owned guest stack");
+
+            std::atomic<bool> publishedWake{false};
+            std::atomic<bool> observedStale{false};
+            std::atomic<uint32_t> unexpectedResults{0u};
+            std::thread publisher([&]()
+            {
+                for (uint32_t attempt = 0;
+                     attempt < 100000u;
+                     ++attempt)
+                {
+                    const EeThreadWakeResult result =
+                        publishEeThreadWake(
+                            &env.runtime, handle);
+                    switch (result)
+                    {
+                    case EeThreadWakeResult::WokeSleeper:
+                        publishedWake.store(
+                            true, std::memory_order_release);
+                        break;
+                    case EeThreadWakeResult::WakeupCounted:
+                    case EeThreadWakeResult::Dormant:
+                        break;
+                    case EeThreadWakeResult::StaleHandle:
+                        observedStale.store(
+                            true, std::memory_order_release);
+                        return;
+                    case EeThreadWakeResult::InvalidHandle:
+                        unexpectedResults.fetch_add(
+                            1u, std::memory_order_relaxed);
+                        return;
+                    }
+                    std::this_thread::yield();
+                }
+            });
+
+            const bool wakePublished = waitUntil([&]()
+            {
+                return publishedWake.load(
+                    std::memory_order_acquire);
+            }, std::chrono::milliseconds(200));
+            t.IsTrue(
+                wakePublished,
+                "the host publisher should release the sleeping worker");
+
+            setRegU32(env.ctx, 4, 0u);
+            setRegU32(env.ctx, 5, 60u);
+            ChangeThreadPriority(
+                env.rdram.data(), &env.ctx, &env.runtime);
+
+            const bool deleted = waitUntil([&]()
+            {
+                return observedStale.load(
+                           std::memory_order_acquire) &&
+                       readGuestU32(
+                           env.rdram.data(),
+                           K_ASYNC_EXIT_DELETE_STAGE_ADDR) == 2u;
+            }, std::chrono::milliseconds(500));
+            if (!deleted)
+            {
+                notifyRuntimeStop(&env.runtime);
+            }
+            publisher.join();
+            joinAllGuestHostThreads(&env.runtime);
+
+            t.IsTrue(
+                deleted,
+                "publication should become stale after ExitDeleteThread");
+            t.Equals(
+                unexpectedResults.load(
+                    std::memory_order_relaxed),
+                0u,
+                "the publication race should return only modeled outcomes");
+            t.IsTrue(
+                !captureEeThreadHandle(&env.runtime, tid),
+                "ExitDeleteThread should remove the captured generation");
+            t.Equals(
+                readGuestU32(
+                    env.rdram.data(),
+                    K_ASYNC_EXIT_DELETE_STAGE_ADDR),
+                2u,
+                "guest code must not continue after ExitDeleteThread");
+
+            const uint32_t reclaimed =
+                env.runtime.guestMalloc(0x1000u, 16u);
+            t.Equals(
+                reclaimed,
+                autoStackAddr,
+                "exit-delete cleanup should reclaim the owned guest stack");
+            env.runtime.guestFree(reclaimed);
         });
 
         tc.Run("semaphore wait release and delete match the EE BIOS boundary", [](TestCase &t)

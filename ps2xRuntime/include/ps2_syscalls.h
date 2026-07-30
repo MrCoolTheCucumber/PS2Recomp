@@ -55,7 +55,7 @@ namespace ps2_syscalls
         StaleHandle,
         Dormant,
         WakeupCounted,
-        MadeReady,
+        WokeSleeper,
     };
 
     struct GuestThreadDebugSnapshot

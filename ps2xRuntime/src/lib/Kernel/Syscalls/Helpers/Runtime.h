@@ -142,7 +142,8 @@ static std::shared_ptr<ThreadInfo> ensureCurrentThreadInfo(
     }
 
     auto info = std::make_shared<ThreadInfo>();
-    info->generation = state.nextGeneration++;
+    info->generation =
+        state.allocateThreadGenerationLocked();
     info->priority = 0u;
     info->guestState.initializeRunning(
         static_cast<int>(info->priority));
