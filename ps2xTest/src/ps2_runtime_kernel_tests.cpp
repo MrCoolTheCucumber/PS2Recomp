@@ -626,6 +626,106 @@ void register_ps2_runtime_kernel_tests()
                 "the surviving runtime should retain its thread after peer destruction");
         });
 
+        tc.Run("debug thread snapshots expose authoritative valid state", [](TestCase &t)
+        {
+            TestEnv env;
+
+            R5900Context mainStatusCtx{};
+            setRegU32(mainStatusCtx, 4, 0u);
+            setRegU32(mainStatusCtx, 5, K_STATUS_ADDR);
+            ReferThreadStatus(
+                env.rdram.data(),
+                &mainStatusCtx,
+                &env.runtime);
+            t.Equals(
+                getRegS32(mainStatusCtx, 2),
+                1,
+                "the initialized main thread should report RUN");
+
+            constexpr uint32_t kDormantEntry = 0x00202480u;
+            const uint32_t threadParam[9] = {
+                0u,
+                kDormantEntry,
+                0x00302480u,
+                0x00000800u,
+                0u,
+                37u,
+                0u,
+                0u,
+                0u,
+            };
+            writeGuestWords(
+                env.rdram.data(),
+                K_PARAM_ADDR,
+                threadParam,
+                std::size(threadParam));
+            R5900Context createCtx{};
+            setRegU32(createCtx, 4, K_PARAM_ADDR);
+            CreateThread(
+                env.rdram.data(),
+                &createCtx,
+                &env.runtime);
+            const int32_t dormantTid =
+                getRegS32(createCtx, 2);
+
+            const auto snapshots =
+                debugThreadSnapshots(&env.runtime);
+            const GuestThreadDebugSnapshot *mainSnapshot = nullptr;
+            const GuestThreadDebugSnapshot *dormantSnapshot =
+                nullptr;
+            for (const GuestThreadDebugSnapshot &snapshot :
+                 snapshots)
+            {
+                if (snapshot.id == 1)
+                {
+                    mainSnapshot = &snapshot;
+                }
+                else if (snapshot.id == dormantTid)
+                {
+                    dormantSnapshot = &snapshot;
+                }
+            }
+
+            t.IsTrue(
+                mainSnapshot != nullptr,
+                "debug enumeration should include the runtime main thread");
+            if (mainSnapshot)
+            {
+                t.IsTrue(
+                    mainSnapshot->stateValid,
+                    "the debug main-thread state should be valid");
+                t.Equals(
+                    mainSnapshot->status,
+                    1,
+                    "debug enumeration should use the main thread's authoritative RUN state");
+                t.Equals(
+                    mainSnapshot->waitQueue,
+                    0,
+                    "a RUN thread should have no wait-queue membership");
+            }
+
+            t.IsTrue(
+                dormantSnapshot != nullptr,
+                "debug enumeration should include a newly created thread");
+            if (dormantSnapshot)
+            {
+                t.IsTrue(
+                    dormantSnapshot->stateValid,
+                    "the debug dormant-thread state should be valid");
+                t.Equals(
+                    dormantSnapshot->status,
+                    THS_DORMANT,
+                    "a newly created debug thread should be DORMANT");
+                t.IsFalse(
+                    dormantSnapshot->started,
+                    "DORMANT state should authoritatively own the not-started condition");
+                t.Equals(
+                    dormantSnapshot->currentPriority,
+                    37,
+                    "debug enumeration should share authoritative priority state with ReferThreadStatus");
+            }
+        });
+
         tc.Run("runtime context binding owns current EE thread selection", [](TestCase &t)
         {
             TestEnv env;
@@ -2306,6 +2406,45 @@ void register_ps2_runtime_kernel_tests()
                     1u,
                     "raw signal should not dispatch its waiter");
 
+                EeThreadStatus rawSignalStatus{};
+                t.Equals(
+                    referThread(rawSignalTid, rawSignalStatus),
+                    THS_READY,
+                    "raw signal should synchronously publish READY");
+                t.Equals(
+                    rawSignalStatus.status,
+                    THS_READY,
+                    "raw-signaled waiter should be READY before dispatch");
+                t.Equals(
+                    rawSignalStatus.waitType,
+                    0u,
+                    "raw signal should synchronously clear the semaphore wait reason");
+                const auto snapshots =
+                    debugThreadSnapshots(&env.runtime);
+                bool foundRawSignalSnapshot = false;
+                for (const GuestThreadDebugSnapshot &snapshot :
+                     snapshots)
+                {
+                    if (snapshot.id != rawSignalTid)
+                    {
+                        continue;
+                    }
+                    foundRawSignalSnapshot = true;
+                    t.IsTrue(
+                        snapshot.stateValid,
+                        "raw signal should publish one valid authoritative state");
+                    t.Equals(
+                        snapshot.waitQueue,
+                        0,
+                        "raw signal should synchronously detach semaphore queue membership");
+                    t.IsFalse(
+                        snapshot.waitCompletionPending,
+                        "raw signal should not retain a pending wait completion");
+                }
+                t.IsTrue(
+                    foundRawSignalSnapshot,
+                    "debug enumeration should observe the raw-signaled waiter");
+
                 setRegU32(env.ctx, 4, 0u);
                 setRegU32(env.ctx, 5, 60u);
                 ChangeThreadPriority(
@@ -2430,6 +2569,41 @@ void register_ps2_runtime_kernel_tests()
                     rawDeleteStatus.waitId,
                     static_cast<uint32_t>(rawDeleteSid),
                     "raw-deleted READY waiter should retain its semaphore id");
+
+                const auto snapshots =
+                    debugThreadSnapshots(&env.runtime);
+                const GuestThreadDebugSnapshot *rawDeleteSnapshot =
+                    nullptr;
+                for (const GuestThreadDebugSnapshot &snapshot :
+                     snapshots)
+                {
+                    if (snapshot.id == rawDeleteTid)
+                    {
+                        rawDeleteSnapshot = &snapshot;
+                        break;
+                    }
+                }
+                t.IsTrue(
+                    rawDeleteSnapshot != nullptr,
+                    "debug enumeration should observe the raw-deleted waiter");
+                if (rawDeleteSnapshot)
+                {
+                    t.IsTrue(
+                        rawDeleteSnapshot->stateValid,
+                        "raw semaphore deletion should publish one valid authoritative state");
+                    t.Equals(
+                        rawDeleteSnapshot->waitQueue,
+                        0,
+                        "raw semaphore deletion should synchronously unlink wait-queue membership");
+                    t.Equals(
+                        rawDeleteSnapshot->waitQueueId,
+                        0,
+                        "an unlinked raw-delete waiter should expose no queue id");
+                    t.IsTrue(
+                        rawDeleteSnapshot
+                            ->waitCompletionPending,
+                        "the retained raw-delete wait reason should be an explicit pending completion");
+                }
 
                 setRegU32(env.ctx, 4, 0u);
                 setRegU32(env.ctx, 5, 60u);
@@ -4217,6 +4391,61 @@ void register_ps2_runtime_kernel_tests()
 
                 if (waiting)
                 {
+                    const auto snapshots =
+                        debugThreadSnapshots(&env.runtime);
+                    const GuestThreadDebugSnapshot *waitSnapshot =
+                        nullptr;
+                    for (const GuestThreadDebugSnapshot &snapshot :
+                         snapshots)
+                    {
+                        if (snapshot.id == tid)
+                        {
+                            waitSnapshot = &snapshot;
+                            break;
+                        }
+                    }
+                    t.IsTrue(
+                        waitSnapshot != nullptr,
+                        std::string("debug enumeration should include the ") +
+                            expectation.name + " waiter");
+                    if (waitSnapshot)
+                    {
+                        int expectedQueue = 0;
+                        if (expectation.kind == WaitKind::Sleep ||
+                            expectation.kind ==
+                                WaitKind::WaitSuspend)
+                        {
+                            expectedQueue = 1;
+                        }
+                        else if (
+                            expectation.kind == WaitKind::Sema)
+                        {
+                            expectedQueue = 2;
+                        }
+                        else if (
+                            expectation.kind == WaitKind::Event)
+                        {
+                            expectedQueue = 3;
+                        }
+                        t.IsTrue(
+                            waitSnapshot->stateValid,
+                            std::string("the ") +
+                                expectation.name +
+                                " waiter should expose a valid authoritative state");
+                        t.Equals(
+                            waitSnapshot->waitQueue,
+                            expectedQueue,
+                            std::string("the ") +
+                                expectation.name +
+                                " state should own its exact wait-queue membership");
+                        t.IsFalse(
+                            waitSnapshot
+                                ->waitCompletionPending,
+                            std::string("an actively queued ") +
+                                expectation.name +
+                                " waiter should not expose a pending completion");
+                    }
+
                     t.IsTrue(
                         env.runtime.debugPause(
                             std::chrono::milliseconds(200)),
