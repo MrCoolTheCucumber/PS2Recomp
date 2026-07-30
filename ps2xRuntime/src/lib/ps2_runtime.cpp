@@ -90,14 +90,36 @@ struct HostPresentationUploadState
     std::vector<uint8_t> uploadBuffer =
         std::vector<uint8_t>(DEFAULT_FB_SIZE, 0u);
     uint32_t uploadDebugCount = 0u;
-};
 
-static HostPresentationUploadState &
-sharedHostPresentationUploadState()
-{
-    static HostPresentationUploadState state;
-    return state;
-}
+    void reset()
+    {
+        lastPresentationTick =
+            std::numeric_limits<uint64_t>::max();
+        hasLatchedInitialFrame = false;
+        lastDisplayFbp =
+            std::numeric_limits<uint32_t>::max();
+        lastSourceFbp =
+            std::numeric_limits<uint32_t>::max();
+        lastPreferred = false;
+        lastWidth = 0u;
+        lastHeight = 0u;
+        hasUploadedFrame = false;
+        scratch.clear();
+        if (uploadBuffer.size() != DEFAULT_FB_SIZE)
+        {
+            uploadBuffer.assign(
+                DEFAULT_FB_SIZE, 0u);
+        }
+        else
+        {
+            std::fill(
+                uploadBuffer.begin(),
+                uploadBuffer.end(),
+                0u);
+        }
+        uploadDebugCount = 0u;
+    }
+};
 
 static uint64_t allocateEeThreadRuntimeGeneration() noexcept
 {
@@ -822,11 +844,13 @@ PS2Runtime::GuestExecutionTryScope::~GuestExecutionTryScope()
     }
 }
 
-static void UploadFrame(Texture2D &tex, PS2Runtime *rt, uint32_t &outWidth, uint32_t &outHeight)
+static void UploadFrame(
+    Texture2D &tex,
+    PS2Runtime *rt,
+    HostPresentationUploadState &state,
+    uint32_t &outWidth,
+    uint32_t &outHeight)
 {
-    HostPresentationUploadState &state =
-        sharedHostPresentationUploadState();
-
     const uint64_t currentTick =
         ps2_syscalls::GetCurrentVSyncTick(rt);
     const bool needsLatch =
@@ -946,6 +970,9 @@ PS2Runtime::PS2Runtime(PS2RuntimeConfiguration configuration)
     : m_vu0(VuUnitId::Vu0),
       m_vu1(VuUnitId::Vu1)
 {
+    m_hostPresentationUploadState =
+        std::make_unique<
+            HostPresentationUploadState>();
     m_eeExecutionBackend =
         createEeExecutionBackend(
             configuration.eeExecutionBackend);
@@ -1393,7 +1420,7 @@ const void *
 PS2Runtime::hostPresentationUploadStateIdentityForTesting()
     const noexcept
 {
-    return &sharedHostPresentationUploadState();
+    return m_hostPresentationUploadState.get();
 }
 
 size_t
@@ -9436,6 +9463,7 @@ void PS2Runtime::run()
     ps2_stubs::resetAudioStubState(this);
     ps2_stubs::resetGsSyncVCallbackState(this);
     ps2_stubs::resetMpegStubState(this);
+    m_hostPresentationUploadState->reset();
     ps2_syscalls::initializeGuestKernelState(
         m_memory.getRDRAM(), this);
     m_cpuContext.r[4] = _mm_setzero_si128();
@@ -9535,7 +9563,12 @@ void PS2Runtime::run()
         });
         uint32_t presentWidth = FB_WIDTH;
         uint32_t presentHeight = DEFAULT_DISPLAY_HEIGHT;
-        UploadFrame(frameTex, this, presentWidth, presentHeight);
+        UploadFrame(
+            frameTex,
+            this,
+            *m_hostPresentationUploadState,
+            presentWidth,
+            presentHeight);
 
         BeginDrawing();
         ClearBackground(BLACK);

@@ -48,6 +48,7 @@ namespace ps2x::iop
 class PS2IopHostAdapter;
 class PS2IopTransport;
 class PS2DebugServer;
+struct HostPresentationUploadState;
 struct EeThreadRuntimeState;
 struct EeAlarmRuntimeState;
 struct EeSyncRuntimeState;
@@ -1654,6 +1655,8 @@ private:
     PS2Memory m_memory;
     GifArbiter m_gifArbiter;
     GS m_gs;
+    std::unique_ptr<HostPresentationUploadState>
+        m_hostPresentationUploadState;
     std::unique_ptr<PS2IopHostAdapter> m_iopHost;
     std::unique_ptr<ps2x::iop::IopSubsystem> m_iopSubsystem;
     PS2AudioBackend m_audioBackend;
