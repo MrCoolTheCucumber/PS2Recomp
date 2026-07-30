@@ -65,6 +65,10 @@ namespace
     constexpr uint32_t K_SEMA_ORACLE_RETURN_ADDR = 0x1864u;
     constexpr uint32_t K_TERMINATE_CANDIDATE_STAGE_ADDR = 0x1870u;
     constexpr uint32_t K_TERMINATE_TARGET_STAGE_ADDR = 0x1874u;
+    constexpr uint32_t K_EXIT_THREAD_STAGE_ADDR = 0x1880u;
+    constexpr uint32_t K_EXIT_DELETE_THREAD_STAGE_ADDR = 0x1884u;
+    constexpr uint32_t K_EXIT_THREAD_ID_ADDR = 0x1888u;
+    constexpr uint32_t K_EXIT_DELETE_THREAD_ID_ADDR = 0x188Cu;
 
     struct EeThreadStatus
     {
@@ -343,6 +347,30 @@ namespace
 
         writeGuestU32(rdram, K_TERMINATE_TARGET_STAGE_ADDR, 1u);
         ctx->pc = 0u;
+    }
+
+    void selfExitThreadHandler(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        GetThreadId(rdram, ctx, runtime);
+        writeGuestU32(
+            rdram,
+            K_EXIT_THREAD_ID_ADDR,
+            static_cast<uint32_t>(getRegS32(*ctx, 2)));
+        writeGuestU32(rdram, K_EXIT_THREAD_STAGE_ADDR, 1u);
+        ExitThread(rdram, ctx, runtime);
+        writeGuestU32(rdram, K_EXIT_THREAD_STAGE_ADDR, 99u);
+    }
+
+    void selfExitDeleteThreadHandler(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        GetThreadId(rdram, ctx, runtime);
+        writeGuestU32(
+            rdram,
+            K_EXIT_DELETE_THREAD_ID_ADDR,
+            static_cast<uint32_t>(getRegS32(*ctx, 2)));
+        writeGuestU32(rdram, K_EXIT_DELETE_THREAD_STAGE_ADDR, 1u);
+        ExitDeleteThread(rdram, ctx, runtime);
+        writeGuestU32(rdram, K_EXIT_DELETE_THREAD_STAGE_ADDR, 99u);
     }
 
     void alarmNoopHandler(uint8_t *, R5900Context *ctx, PS2Runtime *)
@@ -2566,6 +2594,180 @@ void register_ps2_runtime_kernel_tests()
 
             runCase(true, 0x00313000u, 0x00314000u);
             runCase(false, 0x00315000u, 0x00316000u);
+            notifyRuntimeStop();
+        });
+
+        tc.Run("self exit preserves or deletes the EE thread object", [](TestCase &t)
+        {
+            notifyRuntimeStop();
+            TestEnv env;
+
+            constexpr uint32_t kExitEntry = 0x00260A00u;
+            constexpr uint32_t kExitDeleteEntry = 0x00260B00u;
+            env.runtime.registerFunction(
+                kExitEntry,
+                &selfExitThreadHandler);
+            env.runtime.registerFunction(
+                kExitDeleteEntry,
+                &selfExitDeleteThreadHandler);
+
+            auto createThread = [&](uint32_t entry, uint32_t stack)
+            {
+                const uint32_t threadParam[9] = {
+                    0u,
+                    entry,
+                    stack,
+                    0x00001000u,
+                    0u,
+                    30u,
+                    0u,
+                    0u,
+                    0u
+                };
+                writeGuestWords(
+                    env.rdram.data(),
+                    K_PARAM_ADDR,
+                    threadParam,
+                    std::size(threadParam));
+                R5900Context createCtx{};
+                setRegU32(createCtx, 4, K_PARAM_ADDR);
+                CreateThread(
+                    env.rdram.data(), &createCtx, &env.runtime);
+                return getRegS32(createCtx, 2);
+            };
+            auto startThread = [&](int32_t tid)
+            {
+                R5900Context startCtx{};
+                setRegU32(
+                    startCtx, 4, static_cast<uint32_t>(tid));
+                StartThread(
+                    env.rdram.data(), &startCtx, &env.runtime);
+                return getRegS32(startCtx, 2);
+            };
+            auto rawReferThread = [&](int32_t tid, EeThreadStatus &status)
+            {
+                std::memset(
+                    env.rdram.data() + K_STATUS_ADDR,
+                    0,
+                    sizeof(status));
+                R5900Context statusCtx{};
+                setRegU32(
+                    statusCtx, 4, static_cast<uint32_t>(tid));
+                setRegU32(statusCtx, 5, K_STATUS_ADDR);
+                iReferThreadStatus(
+                    env.rdram.data(), &statusCtx, &env.runtime);
+                std::memcpy(
+                    &status,
+                    env.rdram.data() + K_STATUS_ADDR,
+                    sizeof(status));
+                return getRegS32(statusCtx, 2);
+            };
+            auto deleteThread = [&](int32_t tid)
+            {
+                R5900Context deleteCtx{};
+                setRegU32(
+                    deleteCtx, 4, static_cast<uint32_t>(tid));
+                DeleteThread(
+                    env.rdram.data(), &deleteCtx, &env.runtime);
+                return getRegS32(deleteCtx, 2);
+            };
+
+            writeGuestU32(
+                env.rdram.data(), K_EXIT_THREAD_STAGE_ADDR, 0u);
+            writeGuestU32(
+                env.rdram.data(), K_EXIT_THREAD_ID_ADDR, 0u);
+            const int32_t exitTid =
+                createThread(kExitEntry, 0x00317000u);
+            t.IsTrue(
+                exitTid >= 2,
+                "ExitThread worker creation should return a guest id");
+            t.Equals(
+                startThread(exitTid),
+                exitTid,
+                "ExitThread worker start should return its id");
+
+            EeThreadStatus exitedStatus{};
+            const bool exitedDormant = waitUntil([&]()
+            {
+                return readGuestU32(
+                           env.rdram.data(),
+                           K_EXIT_THREAD_STAGE_ADDR) == 1u &&
+                       rawReferThread(exitTid, exitedStatus) ==
+                           THS_DORMANT;
+            }, std::chrono::milliseconds(200));
+            t.IsTrue(
+                exitedDormant,
+                "ExitThread should synchronously leave a DORMANT object");
+            t.Equals(
+                readGuestU32(
+                    env.rdram.data(),
+                    K_EXIT_THREAD_ID_ADDR),
+                static_cast<uint32_t>(exitTid),
+                "ExitThread worker should observe its own guest id");
+            t.Equals(
+                exitedStatus.status,
+                THS_DORMANT,
+                "ExitThread status payload should be DORMANT");
+            t.Equals(
+                deleteThread(exitTid),
+                exitTid,
+                "an ExitThread object should remain deletable");
+
+            writeGuestU32(
+                env.rdram.data(),
+                K_EXIT_DELETE_THREAD_STAGE_ADDR,
+                0u);
+            writeGuestU32(
+                env.rdram.data(),
+                K_EXIT_DELETE_THREAD_ID_ADDR,
+                0u);
+            const int32_t exitDeleteTid =
+                createThread(kExitDeleteEntry, 0x00318000u);
+            t.IsTrue(
+                exitDeleteTid >= 2,
+                "ExitDeleteThread worker creation should return a guest id");
+            t.Equals(
+                startThread(exitDeleteTid),
+                exitDeleteTid,
+                "ExitDeleteThread worker start should return its id");
+
+            int32_t deletedStatusResult = THS_DORMANT;
+            EeThreadStatus deletedStatus{};
+            const bool exitDeleted = waitUntil([&]()
+            {
+                if (readGuestU32(
+                        env.rdram.data(),
+                        K_EXIT_DELETE_THREAD_STAGE_ADDR) != 1u)
+                {
+                    return false;
+                }
+                deletedStatusResult =
+                    rawReferThread(exitDeleteTid, deletedStatus);
+                return deletedStatusResult == KE_OK ||
+                       deletedStatusResult == KE_UNKNOWN_THID;
+            }, std::chrono::milliseconds(200));
+            t.IsTrue(
+                exitDeleted,
+                "ExitDeleteThread should remove its thread object");
+            t.Equals(
+                readGuestU32(
+                    env.rdram.data(),
+                    K_EXIT_DELETE_THREAD_ID_ADDR),
+                static_cast<uint32_t>(exitDeleteTid),
+                "ExitDeleteThread worker should observe its own guest id");
+            t.Equals(
+                deletedStatusResult,
+                KE_OK,
+                "raw status of an ExitDeleteThread id should return zero");
+            t.Equals(
+                deletedStatus.status,
+                0,
+                "raw missing-id status should leave the zeroed payload untouched");
+            t.Equals(
+                deleteThread(exitDeleteTid),
+                KE_ERROR,
+                "deleting an ExitDeleteThread id should return generic -1");
+
             notifyRuntimeStop();
         });
 

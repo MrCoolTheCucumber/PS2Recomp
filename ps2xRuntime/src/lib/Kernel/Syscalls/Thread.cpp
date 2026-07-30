@@ -275,7 +275,7 @@ namespace ps2_syscalls
         auto info = lookupThreadInfo(tid);
         if (!info)
         {
-            setReturnS32(ctx, KE_UNKNOWN_THID);
+            setReturnS32(ctx, KE_ERROR);
             return;
         }
 
@@ -885,7 +885,11 @@ namespace ps2_syscalls
         setReturnS32(ctx, g_currentThreadId);
     }
 
-    void ReferThreadStatus(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    static void referThreadStatus(
+        uint8_t *rdram,
+        R5900Context *ctx,
+        PS2Runtime *runtime,
+        int unknownThreadResult)
     {
         int tid = static_cast<int>(getRegU32(ctx, 4));
         uint32_t statusAddr = getRegU32(ctx, 5);
@@ -898,7 +902,7 @@ namespace ps2_syscalls
         auto info = (tid == g_currentThreadId) ? ensureCurrentThreadInfo(ctx) : lookupThreadInfo(tid);
         if (!info)
         {
-            setReturnS32(ctx, KE_UNKNOWN_THID);
+            setReturnS32(ctx, unknownThreadResult);
             return;
         }
 
@@ -925,9 +929,17 @@ namespace ps2_syscalls
         setReturnS32(ctx, info->status);
     }
 
+    void ReferThreadStatus(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        referThreadStatus(rdram, ctx, runtime, KE_UNKNOWN_THID);
+    }
+
     void iReferThreadStatus(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
-        ReferThreadStatus(rdram, ctx, runtime);
+        // The retail BIOS exposes status 0 for an ID removed by
+        // ExitDeleteThread through the raw query and leaves the output
+        // buffer untouched.
+        referThreadStatus(rdram, ctx, runtime, KE_OK);
     }
 
     void SleepThread(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
@@ -992,7 +1004,10 @@ namespace ps2_syscalls
                         return;
                     }
 
-                    info->status = THS_RUN;
+                    info->status =
+                        (info->suspendCount > 0)
+                            ? THS_SUSPEND
+                            : THS_RUN;
                     info->waitType = TSW_NONE;
                     info->waitId = 0;
 
