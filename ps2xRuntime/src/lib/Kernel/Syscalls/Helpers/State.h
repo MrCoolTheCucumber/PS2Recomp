@@ -2,8 +2,6 @@
 
 #include <cstddef>
 #include <cstdint>
-#include <thread>
-
 #include "AlarmRuntimeState.h"
 #include "KernelRuntimeState.h"
 #include "RpcRuntimeState.h"
@@ -151,48 +149,6 @@ static constexpr uint32_t kFioSoIROth = 0x0004;
 static constexpr uint32_t kFioSoIWOth = 0x0002;
 static constexpr uint32_t kFioSoIXOth = 0x0001;
 
-static void registerHostThread(
-    PS2Runtime *runtime,
-    int tid,
-    std::thread worker)
-{
-    if (!runtime)
-    {
-        if (worker.joinable())
-        {
-            worker.detach();
-        }
-        return;
-    }
-
-    EeThreadRuntimeState &state =
-        runtime->eeThreadRuntimeState();
-    std::thread stale;
-    {
-        std::lock_guard<std::mutex> lock(
-            state.hostThreadMutex);
-        auto it = state.hostThreads.find(tid);
-        if (it != state.hostThreads.end())
-        {
-            stale = std::move(it->second);
-            state.hostThreads.erase(it);
-        }
-        state.hostThreads.emplace(tid, std::move(worker));
-    }
-
-    if (stale.joinable())
-    {
-        if (stale.get_id() == std::this_thread::get_id())
-        {
-            stale.detach();
-        }
-        else
-        {
-            stale.join();
-        }
-    }
-}
-
 static void joinHostThreadById(
     PS2Runtime *runtime,
     int tid)
@@ -202,33 +158,7 @@ static void joinHostThreadById(
         return;
     }
 
-    EeThreadRuntimeState &state =
-        runtime->eeThreadRuntimeState();
-    std::thread worker;
-    {
-        std::lock_guard<std::mutex> lock(
-            state.hostThreadMutex);
-        auto it = state.hostThreads.find(tid);
-        if (it != state.hostThreads.end())
-        {
-            worker = std::move(it->second);
-            state.hostThreads.erase(it);
-        }
-    }
-
-    if (!worker.joinable())
-    {
-        return;
-    }
-
-    if (worker.get_id() == std::this_thread::get_id())
-    {
-        worker.detach();
-    }
-    else
-    {
-        worker.join();
-    }
+    runtime->eeExecutionBackend().destroy(tid);
 }
 
 static void joinAllHostThreads(PS2Runtime *runtime)
@@ -238,38 +168,7 @@ static void joinAllHostThreads(PS2Runtime *runtime)
         return;
     }
 
-    EeThreadRuntimeState &state =
-        runtime->eeThreadRuntimeState();
-    std::vector<std::thread> workers;
-    {
-        std::lock_guard<std::mutex> lock(
-            state.hostThreadMutex);
-        workers.reserve(state.hostThreads.size());
-        const std::thread::id selfId =
-            std::this_thread::get_id();
-        for (auto it = state.hostThreads.begin();
-             it != state.hostThreads.end();)
-        {
-            std::thread &worker = it->second;
-            if (worker.joinable() &&
-                worker.get_id() == selfId)
-            {
-                ++it;
-                continue;
-            }
-
-            workers.push_back(std::move(worker));
-            it = state.hostThreads.erase(it);
-        }
-    }
-
-    for (auto &worker : workers)
-    {
-        if (worker.joinable())
-        {
-            worker.join();
-        }
-    }
+    runtime->eeExecutionBackend().joinAll();
 }
 
 static void detachAllHostThreads(PS2Runtime *runtime)
@@ -279,27 +178,7 @@ static void detachAllHostThreads(PS2Runtime *runtime)
         return;
     }
 
-    EeThreadRuntimeState &state =
-        runtime->eeThreadRuntimeState();
-    std::vector<std::thread> workers;
-    {
-        std::lock_guard<std::mutex> lock(
-            state.hostThreadMutex);
-        workers.reserve(state.hostThreads.size());
-        for (auto &entry : state.hostThreads)
-        {
-            workers.push_back(std::move(entry.second));
-        }
-        state.hostThreads.clear();
-    }
-
-    for (auto &worker : workers)
-    {
-        if (worker.joinable())
-        {
-            worker.detach();
-        }
-    }
+    runtime->eeExecutionBackend().detachAll();
 }
 
 static constexpr uint32_t kGuestSyscallTableGuestBase = 0x80011F80u;

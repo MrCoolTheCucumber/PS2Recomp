@@ -579,8 +579,10 @@ namespace ps2_syscalls
             1, std::memory_order_relaxed);
         try
         {
-            std::thread worker([=]() mutable
-                               {
+            runtime->eeExecutionBackend().create(
+                tid,
+                [=]() mutable
+                {
             {
                 std::string name = "PS2Thread_" + std::to_string(tid);
                 ThreadNaming::SetCurrentThreadName(name);
@@ -773,9 +775,8 @@ namespace ps2_syscalls
 
             runtime->eeThreadRuntimeState()
                 .activeHostThreads.fetch_sub(
-                1, std::memory_order_relaxed); });
-            registerHostThread(
-                runtime, tid, std::move(worker));
+                1, std::memory_order_relaxed);
+                });
         }
         catch (const std::exception &e)
         {

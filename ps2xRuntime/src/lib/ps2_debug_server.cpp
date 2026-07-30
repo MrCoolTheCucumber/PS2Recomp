@@ -966,6 +966,11 @@ struct PS2DebugServer::Impl
             runtime.debugVuBackendDiagnosticsSnapshot();
         Value result(rapidjson::kObjectType);
         addString(result, "backend", "recomp", allocator);
+        addString(
+            result,
+            "ee_execution_backend",
+            runtime.eeExecutionBackendName(),
+            allocator);
         const char *state = runtime.isStopRequested()
                                 ? "stopped"
                                 : (runtime.debugIsPaused() ? "paused" : "running");
@@ -1635,6 +1640,11 @@ struct PS2DebugServer::Impl
         Value result(rapidjson::kObjectType);
         result.AddMember("schema_version", 1, allocator);
         addString(result, "backend", "recomp", allocator);
+        addString(
+            result,
+            "ee_execution_backend",
+            runtime.eeExecutionBackendName(),
+            allocator);
         addString(result, "reason", reason, allocator);
         result.AddMember("quiescent", quiescent, allocator);
         addString(result, "classification", assessment.name, allocator);

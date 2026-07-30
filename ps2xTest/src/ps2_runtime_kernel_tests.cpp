@@ -550,6 +550,19 @@ void register_ps2_runtime_kernel_tests()
 {
     MiniTest::Case("PS2RuntimeKernel", [](TestCase &tc)
     {
+        tc.Run("runtime selects the legacy host-thread EE backend", [](TestCase &t)
+        {
+            PS2Runtime runtime;
+            t.Equals(
+                std::string(runtime.eeExecutionBackendName()),
+                std::string("legacy-host-thread"),
+                "the transitional EE backend should be explicit");
+            t.Equals(
+                runtime.managedEeExecutionThreadCountForTesting(),
+                size_t{0u},
+                "a fresh backend should not own guest continuations");
+        });
+
 #ifndef NDEBUG
         tc.Run("DECI2 sessions are isolated per runtime", [](TestCase &t)
         {

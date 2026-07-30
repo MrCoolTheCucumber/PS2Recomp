@@ -909,6 +909,9 @@ PS2Runtime::PS2Runtime(PS2RuntimeConfiguration configuration)
     : m_vu0(VuUnitId::Vu0),
       m_vu1(VuUnitId::Vu1)
 {
+    m_eeExecutionBackend =
+        createEeExecutionBackend(
+            configuration.eeExecutionBackend);
     m_ioPaths = defaultRuntimeIoPaths();
     m_mpegRuntimeState =
         std::make_unique<ps2_stubs::MpegRuntimeState>();
@@ -1319,6 +1322,34 @@ EeThreadRuntimeState &PS2Runtime::eeThreadRuntimeState()
 const EeThreadRuntimeState &PS2Runtime::eeThreadRuntimeState() const
 {
     return *m_eeThreadRuntimeState;
+}
+
+IEeExecutionBackend &PS2Runtime::eeExecutionBackend()
+{
+    return *m_eeExecutionBackend;
+}
+
+const IEeExecutionBackend &
+PS2Runtime::eeExecutionBackend() const
+{
+    return *m_eeExecutionBackend;
+}
+
+std::string_view
+PS2Runtime::eeExecutionBackendName() const noexcept
+{
+    return m_eeExecutionBackend
+               ? m_eeExecutionBackend->name()
+               : std::string_view{"uninitialized"};
+}
+
+size_t
+PS2Runtime::managedEeExecutionThreadCountForTesting() const
+{
+    return m_eeExecutionBackend
+               ? m_eeExecutionBackend
+                     ->managedThreadCount()
+               : 0u;
 }
 
 EeAlarmRuntimeState &PS2Runtime::eeAlarmRuntimeState()

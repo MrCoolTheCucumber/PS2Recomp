@@ -8,7 +8,6 @@
 #include <cstdint>
 #include <memory>
 #include <mutex>
-#include <thread>
 #include <unordered_map>
 
 enum class EeThreadWaitQueue : uint8_t
@@ -523,8 +522,6 @@ struct EeThreadRuntimeState
     int nextThreadId = 2;
     uint32_t nextGeneration = 1u;
 
-    std::mutex hostThreadMutex;
-    std::unordered_map<int, std::thread> hostThreads;
     std::atomic<int> activeHostThreads{0};
 
     // This is the runtime authority. The host TLS ID remains a checked

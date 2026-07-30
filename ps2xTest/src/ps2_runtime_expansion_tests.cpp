@@ -7325,6 +7325,10 @@ void register_ps2_runtime_expansion_tests()
                 return runtime.activeEeHostThreadCount() > 0;
             }, std::chrono::milliseconds(500));
             t.IsTrue(started, "worker thread should become active");
+            t.Equals(
+                runtime.managedEeExecutionThreadCountForTesting(),
+                size_t{1u},
+                "the selected EE backend should own the live continuation");
 
             runtime.requestStop();
             const bool drained = waitUntil([&]()
@@ -7334,6 +7338,11 @@ void register_ps2_runtime_expansion_tests()
             t.IsTrue(drained, "requestStop should drain all guest worker threads");
 
             notifyRuntimeStop(&runtime);
+            joinAllGuestHostThreads(&runtime);
+            t.Equals(
+                runtime.managedEeExecutionThreadCountForTesting(),
+                size_t{0u},
+                "teardown should release the backend-owned continuation");
         });
 
         tc.Run("Semaphore poll/signal remains stable under host-thread contention", [](TestCase &t)

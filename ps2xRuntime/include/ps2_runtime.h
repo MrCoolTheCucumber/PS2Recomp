@@ -28,6 +28,7 @@
 
 #include "ps2_log.h"
 #include "runtime/cop0_timing.h"
+#include "runtime/ee_execution_backend.h"
 #include "runtime/ee_event_scheduler.h"
 #include "runtime/ps2_address.h"
 #include "runtime/ps2_gif_arbiter.h"
@@ -69,6 +70,8 @@ namespace ps2_stubs
 
 struct PS2RuntimeConfiguration
 {
+    EeExecutionBackendKind eeExecutionBackend =
+        EeExecutionBackendKind::LegacyHostThread;
     VuBackendKind vu0Backend = VuBackendKind::Auto;
     VuBackendKind vu1Backend = VuBackendKind::Auto;
     bool vu0NativeInstrumentation = false;
@@ -1261,6 +1264,12 @@ public:
     }
     EeThreadRuntimeState &eeThreadRuntimeState();
     const EeThreadRuntimeState &eeThreadRuntimeState() const;
+    IEeExecutionBackend &eeExecutionBackend();
+    const IEeExecutionBackend &eeExecutionBackend() const;
+    [[nodiscard]] std::string_view
+    eeExecutionBackendName() const noexcept;
+    [[nodiscard]] size_t
+    managedEeExecutionThreadCountForTesting() const;
     EeAlarmRuntimeState &eeAlarmRuntimeState();
     const EeAlarmRuntimeState &eeAlarmRuntimeState() const;
     EeSyncRuntimeState &eeSyncRuntimeState();
@@ -1797,6 +1806,8 @@ private:
     std::atomic<uint64_t> m_vu0CurrentInvocationInstruction{0u};
     R5900Context m_cpuContext;
     std::unique_ptr<EeThreadRuntimeState> m_eeThreadRuntimeState;
+    std::unique_ptr<IEeExecutionBackend>
+        m_eeExecutionBackend;
     R5900Context *m_boundEeContext = nullptr;
     int m_boundEeThreadId = 1;
     mutable std::recursive_timed_mutex m_guestExecutionMutex;
