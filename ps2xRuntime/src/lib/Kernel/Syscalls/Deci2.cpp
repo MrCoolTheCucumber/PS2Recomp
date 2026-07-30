@@ -125,7 +125,7 @@ namespace ps2_syscalls
 {
     void Deci2Call(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
-#if defined(_DEBUG) || defined(RUNTIME_DECI2CALL)
+#if !defined(NDEBUG) || defined(RUNTIME_DECI2CALL)
         const int32_t code = static_cast<int32_t>(getRegU32(ctx, 4));
         const uint32_t argsAddr = getRegU32(ctx, 5);
 
