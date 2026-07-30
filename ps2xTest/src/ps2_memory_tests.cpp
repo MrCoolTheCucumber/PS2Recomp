@@ -4,6 +4,7 @@
 #include "runtime/ps2_gs_psmct32.h"
 #include "ps2_runtime.h"
 #include "ps2_runtime_macros.h"
+#include "ps2_syscalls.h"
 #include "Stubs/DMA.h"
 #include "Stubs/GS.h"
 
@@ -3911,6 +3912,26 @@ void register_ps2_memory_tests()
                 firstEnv,
                 "one runtime's DMA environment must not replace another runtime's environment");
 
+            ps2_syscalls::notifyRuntimeStop(&second);
+            setRegU32(secondCtx, 4, kReadbackAddr);
+            ps2_stubs::sceDmaGetEnv(
+                second.memory().getRDRAM(),
+                &secondCtx,
+                &second);
+            std::memcpy(
+                readback.data(),
+                second.memory().getRDRAM() + kReadbackAddr,
+                readback.size());
+            t.Equals(
+                readback,
+                resetEnv,
+                "stopping a runtime should reset its DMA environment");
+
+            setRegU32(secondCtx, 4, kSecondEnvAddr);
+            ps2_stubs::sceDmaPutEnv(
+                second.memory().getRDRAM(),
+                &secondCtx,
+                &second);
             ps2_stubs::sceDmaReset(
                 second.memory().getRDRAM(),
                 &secondCtx,
@@ -3953,16 +3974,23 @@ void register_ps2_memory_tests()
                 0,
                 "one runtime's modeled DMA completion poll must not make another runtime busy");
 
-            setRegU32(firstCtx, 4, kGifChannel);
-            setRegU32(firstCtx, 5, 0u);
-            ps2_stubs::sceDmaSync(
-                first.memory().getRDRAM(),
-                &firstCtx,
-                &first);
             ps2_stubs::sceDmaReset(
                 first.memory().getRDRAM(),
                 &firstCtx,
                 &first);
+            first.memory().writeIORegister(
+                kGifChannel, 0u);
+            setRegU32(firstCtx, 4, kGifChannel);
+            setRegU32(firstCtx, 5, 1u);
+            ps2_stubs::sceDmaSync(
+                first.memory().getRDRAM(),
+                &firstCtx,
+                &first);
+            t.Equals(
+                static_cast<int32_t>(
+                    ::getRegU32(&firstCtx, 2)),
+                0,
+                "resetting a runtime should clear its modeled DMA completion polls");
         });
 
         tc.Run("VIF1 DMA DIRECT image packet reaches GS through arbiter", [](TestCase &t)

@@ -10,9 +10,11 @@
 #include "ThreadNaming.h"
 #include "Kernel/Stubs/Audio.h"
 #include "Kernel/Stubs/CD.h"
+#include "Kernel/Stubs/DMA.h"
 #include "Kernel/Stubs/GS.h"
 #include "Kernel/Stubs/MPEG.h"
 #include "Kernel/Stubs/Helpers/CdRuntimeState.h"
+#include "Kernel/Stubs/Helpers/DmaRuntimeState.h"
 #include "Kernel/Stubs/Helpers/SifRuntimeState.h"
 #include "Kernel/Syscalls/Helpers/AlarmRuntimeState.h"
 #include "Kernel/Syscalls/Helpers/FileRuntimeState.h"
@@ -915,6 +917,8 @@ PS2Runtime::PS2Runtime(PS2RuntimeConfiguration configuration)
         std::make_unique<EeFileRuntimeState>();
     m_cdRuntimeState =
         std::make_unique<ps2_stubs::CdRuntimeState>();
+    m_dmaRuntimeState =
+        std::make_unique<ps2_stubs::DmaRuntimeState>();
     m_sifRuntimeState =
         std::make_unique<ps2_stubs::SifRuntimeState>();
     m_gs.setVSyncTickProvider(
@@ -1368,6 +1372,17 @@ const ps2_stubs::CdRuntimeState &
 PS2Runtime::cdRuntimeState() const
 {
     return *m_cdRuntimeState;
+}
+
+ps2_stubs::DmaRuntimeState &PS2Runtime::dmaRuntimeState()
+{
+    return *m_dmaRuntimeState;
+}
+
+const ps2_stubs::DmaRuntimeState &
+PS2Runtime::dmaRuntimeState() const
+{
+    return *m_dmaRuntimeState;
 }
 
 ps2_stubs::SifRuntimeState &PS2Runtime::sifRuntimeState()
@@ -9156,6 +9171,7 @@ void PS2Runtime::run()
     m_stopRequested.store(false, std::memory_order_relaxed);
     ps2_syscalls::resetFileIoState(this);
     ps2_stubs::resetCdState(this);
+    ps2_stubs::resetDmaState(this);
     ps2_stubs::resetSifState(this);
     resetIop();
     ps2_stubs::resetAudioStubState();

@@ -57,6 +57,7 @@ struct EeFileRuntimeState;
 namespace ps2_stubs
 {
     struct CdRuntimeState;
+    struct DmaRuntimeState;
     class MpegRuntimeState;
     struct SifRuntimeState;
 }
@@ -1269,6 +1270,8 @@ public:
     const EeFileRuntimeState &eeFileRuntimeState() const;
     ps2_stubs::CdRuntimeState &cdRuntimeState();
     const ps2_stubs::CdRuntimeState &cdRuntimeState() const;
+    ps2_stubs::DmaRuntimeState &dmaRuntimeState();
+    const ps2_stubs::DmaRuntimeState &dmaRuntimeState() const;
     ps2_stubs::SifRuntimeState &sifRuntimeState();
     const ps2_stubs::SifRuntimeState &
     sifRuntimeState() const;
@@ -1951,6 +1954,8 @@ private:
         m_eeFileRuntimeState;
     std::unique_ptr<ps2_stubs::CdRuntimeState>
         m_cdRuntimeState;
+    std::unique_ptr<ps2_stubs::DmaRuntimeState>
+        m_dmaRuntimeState;
     std::unique_ptr<ps2_stubs::SifRuntimeState>
         m_sifRuntimeState;
     // Declared last so the alarm worker's fallback join runs before other

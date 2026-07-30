@@ -2,6 +2,7 @@
 #include <cctype>
 
 #include "CdRuntimeState.h"
+#include "DmaRuntimeState.h"
 
 namespace
 {
@@ -1267,9 +1268,6 @@ namespace
     constexpr std::array<uint32_t, 10> kDmaChannelBases = {
         0x10008000u, 0x10009000u, 0x1000A000u, 0x1000B000u, 0x1000B400u,
         0x1000C000u, 0x1000C400u, 0x1000C800u, 0x1000D000u, 0x1000D400u};
-    std::mutex g_dmaStubMutex;
-    std::unordered_map<uint32_t, uint32_t> g_dmaPendingPolls;
-    uint32_t g_dmaStubLogCount = 0;
     constexpr uint32_t kMaxDmaStubLogs = 64;
 
     bool isKnownDmaChannelBase(uint32_t value)
@@ -1417,10 +1415,13 @@ namespace
         mem.writeIORegister(channelBase + 0x00u, chcr);
         mem.processPendingTransfers();
 
+        ps2_stubs::DmaRuntimeState &state =
+            runtime->dmaRuntimeState();
         {
-            std::lock_guard<std::mutex> lock(g_dmaStubMutex);
-            g_dmaPendingPolls[channelBase] = 1;
-            if (g_dmaStubLogCount < kMaxDmaStubLogs)
+            std::lock_guard<std::mutex> lock(
+                state.stubMutex);
+            state.pendingPolls[channelBase] = 1u;
+            if (state.stubLogCount < kMaxDmaStubLogs)
             {
                 RUNTIME_LOG("[sceDmaSend] ch=0x" << std::hex << channelBase
                           << " madr=0x" << madr
@@ -1448,7 +1449,7 @@ namespace
                                   << std::dec << std::endl);
                     }
                 }
-                ++g_dmaStubLogCount;
+                ++state.stubLogCount;
             }
         }
 
@@ -1471,10 +1472,15 @@ namespace
         }
 
         bool modelBusy = false;
+        ps2_stubs::DmaRuntimeState &state =
+            runtime->dmaRuntimeState();
         {
-            std::lock_guard<std::mutex> lock(g_dmaStubMutex);
-            auto it = g_dmaPendingPolls.find(channelBase);
-            if (it != g_dmaPendingPolls.end() && it->second > 0)
+            std::lock_guard<std::mutex> lock(
+                state.stubMutex);
+            auto it = state.pendingPolls.find(
+                channelBase);
+            if (it != state.pendingPolls.end() &&
+                it->second > 0u)
             {
                 modelBusy = true;
                 if (mode != 0)
@@ -1482,13 +1488,13 @@ namespace
                     --it->second;
                     if (it->second == 0)
                     {
-                        g_dmaPendingPolls.erase(it);
+                        state.pendingPolls.erase(it);
                     }
                 }
                 else
                 {
                     // Blocking mode: complete immediately in this runtime.
-                    g_dmaPendingPolls.erase(it);
+                    state.pendingPolls.erase(it);
                 }
             }
         }
