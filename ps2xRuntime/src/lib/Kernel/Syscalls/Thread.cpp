@@ -763,13 +763,21 @@ namespace ps2_syscalls
         terminateThread(rdram, ctx, runtime, false);
     }
 
-    void SuspendThread(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    static void suspendThread(
+        uint8_t *rdram,
+        R5900Context *ctx,
+        PS2Runtime *runtime,
+        bool reschedule)
     {
         int tid = static_cast<int>(getRegU32(ctx, 4));
         if (tid == 0)
             tid = g_currentThreadId;
+        const bool suspendingCurrentThread =
+            tid == g_currentThreadId;
 
-        auto info = (tid == g_currentThreadId) ? ensureCurrentThreadInfo(ctx) : lookupThreadInfo(tid);
+        auto info = suspendingCurrentThread
+                        ? ensureCurrentThreadInfo(ctx)
+                        : lookupThreadInfo(tid);
         if (!info)
         {
             setReturnS32(ctx, KE_UNKNOWN_THID);
@@ -788,7 +796,7 @@ namespace ps2_syscalls
         }
         info->cv.notify_all();
 
-        if (tid == g_currentThreadId)
+        if (suspendingCurrentThread)
         {
             std::unique_lock<std::mutex> lock(info->m);
             bool terminated = false;
@@ -816,6 +824,20 @@ namespace ps2_syscalls
         }
 
         setReturnS32(ctx, tid);
+        if (!suspendingCurrentThread && reschedule)
+        {
+            yieldGuestExecutionAfterWake(runtime);
+        }
+    }
+
+    void SuspendThread(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        suspendThread(rdram, ctx, runtime, true);
+    }
+
+    void iSuspendThread(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        suspendThread(rdram, ctx, runtime, false);
     }
 
     static void resumeThread(
@@ -1185,7 +1207,11 @@ namespace ps2_syscalls
         setReturnS32(ctx, previous);
     }
 
-    void ChangeThreadPriority(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    static void changeThreadPriority(
+        uint8_t *rdram,
+        R5900Context *ctx,
+        PS2Runtime *runtime,
+        bool reschedule)
     {
         int tid = static_cast<int>(getRegU32(ctx, 4));
         int newPrio = static_cast<int>(getRegU32(ctx, 5));
@@ -1220,14 +1246,27 @@ namespace ps2_syscalls
         }
 
         setReturnS32(ctx, previousPriority);
+        if (reschedule)
+        {
+            yieldGuestExecutionAfterWake(runtime);
+        }
+    }
+
+    void ChangeThreadPriority(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        changeThreadPriority(rdram, ctx, runtime, true);
     }
 
     void iChangeThreadPriority(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
-        ChangeThreadPriority(rdram, ctx, runtime);
+        changeThreadPriority(rdram, ctx, runtime, false);
     }
 
-    void RotateThreadReadyQueue(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    static void rotateThreadReadyQueue(
+        uint8_t *rdram,
+        R5900Context *ctx,
+        PS2Runtime *runtime,
+        bool reschedule)
     {
         static int logCount = 0;
         int prio = static_cast<int>(getRegU32(ctx, 4));
@@ -1254,12 +1293,20 @@ namespace ps2_syscalls
             prio,
             true);
         setReturnS32(ctx, prio);
-        yieldGuestExecutionAfterWake(runtime);
+        if (reschedule)
+        {
+            yieldGuestExecutionAfterWake(runtime);
+        }
+    }
+
+    void RotateThreadReadyQueue(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        rotateThreadReadyQueue(rdram, ctx, runtime, true);
     }
 
     void iRotateThreadReadyQueue(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
-        RotateThreadReadyQueue(rdram, ctx, runtime);
+        rotateThreadReadyQueue(rdram, ctx, runtime, false);
     }
 
     static void releaseWaitThread(

@@ -195,7 +195,11 @@ namespace ps2_syscalls
         setReturnS32(ctx, id);
     }
 
-    void DeleteSema(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    static void deleteSema(
+        uint8_t *rdram,
+        R5900Context *ctx,
+        PS2Runtime *runtime,
+        bool reschedule)
     {
         int sid = static_cast<int>(getRegU32(ctx, 4));
         std::shared_ptr<SemaInfo> sema;
@@ -226,18 +230,27 @@ namespace ps2_syscalls
 
         // PS2 EE BIOS returns sid on success.
         setReturnS32(ctx, sid);
-        if (hadWaiters)
+        if (hadWaiters && reschedule)
         {
             yieldGuestExecutionAfterWake(runtime);
         }
     }
 
-    void iDeleteSema(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    void DeleteSema(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
-        DeleteSema(rdram, ctx, runtime);
+        deleteSema(rdram, ctx, runtime, true);
     }
 
-    void SignalSema(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    void iDeleteSema(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        deleteSema(rdram, ctx, runtime, false);
+    }
+
+    static void signalSema(
+        uint8_t *rdram,
+        R5900Context *ctx,
+        PS2Runtime *runtime,
+        bool reschedule)
     {
         int sid = static_cast<int>(getRegU32(ctx, 4));
         auto sema = lookupSemaInfo(sid);
@@ -280,15 +293,20 @@ namespace ps2_syscalls
         }
 
         setReturnS32(ctx, ret);
-        if (wokeWaiter)
+        if (wokeWaiter && reschedule)
         {
             yieldGuestExecutionAfterWake(runtime);
         }
     }
 
+    void SignalSema(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        signalSema(rdram, ctx, runtime, true);
+    }
+
     void iSignalSema(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
-        SignalSema(rdram, ctx, runtime);
+        signalSema(rdram, ctx, runtime, false);
     }
 
     void WaitSema(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)

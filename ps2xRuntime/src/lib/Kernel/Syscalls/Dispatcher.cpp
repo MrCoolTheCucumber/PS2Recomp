@@ -139,8 +139,10 @@ namespace ps2_syscalls
             iCancelWakeupThread(rdram, ctx, runtime);
             return true;
         case 0x37:
-        case static_cast<uint32_t>(-0x38):
             SuspendThread(rdram, ctx, runtime);
+            return true;
+        case static_cast<uint32_t>(-0x38):
+            iSuspendThread(rdram, ctx, runtime);
             return true;
         case 0x39:
             ResumeThread(rdram, ctx, runtime);
