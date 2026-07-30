@@ -19,6 +19,8 @@ namespace ps2x::ee
         Ready,
         Running,
         Waiting,
+        Suspended,
+        WaitSuspended,
     };
 
     enum class EeSchedulerWaitKind : uint8_t
@@ -54,7 +56,23 @@ namespace ps2x::ee
         EeSchedulerThreadState state =
             EeSchedulerThreadState::Dormant;
         EeSchedulerWaitKey wait{};
+        uint32_t suspendCount = 0u;
         uint64_t queueSequence = 0u;
+    };
+
+    struct EeSchedulerThreadHandle
+    {
+        int id = 0;
+        uint32_t generation = 0u;
+
+        [[nodiscard]] bool valid() const noexcept
+        {
+            return id > 0 && generation != 0u;
+        }
+
+        friend bool operator==(
+            const EeSchedulerThreadHandle &,
+            const EeSchedulerThreadHandle &) = default;
     };
 
     enum class EeSchedulerExitReason : uint8_t
@@ -107,6 +125,8 @@ namespace ps2x::ee
             int priority);
 
         [[nodiscard]] bool startThread(int threadId);
+        [[nodiscard]] bool startThread(
+            EeSchedulerThreadHandle thread);
         [[nodiscard]] std::optional<int>
         selectNextThread();
         [[nodiscard]] std::optional<int>
@@ -117,6 +137,19 @@ namespace ps2x::ee
         wakeOne(EeSchedulerWaitKey wait);
         [[nodiscard]] std::optional<int>
         finishCurrentThread();
+        [[nodiscard]] bool suspendThread(
+            EeSchedulerThreadHandle thread);
+        [[nodiscard]] bool resumeThread(
+            EeSchedulerThreadHandle thread);
+        [[nodiscard]] bool terminateThread(
+            EeSchedulerThreadHandle thread);
+        [[nodiscard]] bool exitCurrentThread();
+        [[nodiscard]] bool deleteThread(
+            EeSchedulerThreadHandle thread);
+        [[nodiscard]] std::optional<int>
+        changeThreadPriority(
+            EeSchedulerThreadHandle thread,
+            int priority);
 
         [[nodiscard]] std::optional<EeSchedulerDispatch>
         dispatchOne(
@@ -125,6 +158,9 @@ namespace ps2x::ee
 
         [[nodiscard]] std::optional<int>
         currentThreadId() const noexcept;
+        [[nodiscard]] std::optional<
+            EeSchedulerThreadHandle>
+        threadHandle(int threadId) const;
         [[nodiscard]] std::optional<EeSchedulerThreadSnapshot>
         thread(int threadId) const;
         [[nodiscard]] std::vector<int>
@@ -142,6 +178,7 @@ namespace ps2x::ee
             EeSchedulerThreadState state =
                 EeSchedulerThreadState::Dormant;
             EeSchedulerWaitKey wait{};
+            uint32_t suspendCount = 0u;
             uint64_t queueSequence = 0u;
         };
 
@@ -152,17 +189,28 @@ namespace ps2x::ee
         void enqueueReady(
             int threadId,
             ThreadRecord &thread);
+        [[nodiscard]] ThreadRecord *findThread(
+            EeSchedulerThreadHandle thread);
+        [[nodiscard]] const ThreadRecord *findThread(
+            EeSchedulerThreadHandle thread) const;
+        [[nodiscard]] bool removeReady(
+            EeSchedulerThreadHandle thread,
+            int priority);
+        [[nodiscard]] bool removeWait(
+            EeSchedulerThreadHandle thread,
+            EeSchedulerWaitKey wait);
+        [[nodiscard]] bool retireCurrentThread();
         [[nodiscard]] std::optional<int>
         takeNextReady();
 
         std::unordered_map<int, ThreadRecord> m_threads;
         std::array<
-            std::deque<int>,
+            std::deque<EeSchedulerThreadHandle>,
             kEeThreadPriorityCount>
             m_readyQueues;
         std::map<
             EeSchedulerWaitKey,
-            std::deque<int>>
+            std::deque<EeSchedulerThreadHandle>>
             m_waitQueues;
         std::optional<int> m_currentThreadId;
         uint64_t m_nextQueueSequence = 1u;

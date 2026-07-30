@@ -1,6 +1,7 @@
 #include "runtime/ee_thread_scheduler.h"
 
 #include <algorithm>
+#include <limits>
 #include <tuple>
 #include <unordered_map>
 
@@ -62,6 +63,7 @@ namespace ps2x::ee
                     priority,
                     EeSchedulerThreadState::Dormant,
                     {},
+                    0u,
                     0u})
             .second;
     }
@@ -94,49 +96,60 @@ namespace ps2x::ee
         thread.queueSequence = m_nextQueueSequence++;
         m_readyQueues[
             static_cast<size_t>(thread.priority)]
-            .push_back(threadId);
+            .push_back(
+                EeSchedulerThreadHandle{
+                    threadId,
+                    thread.generation});
     }
 
     bool EeThreadScheduler::startThread(int threadId)
     {
-        const auto it = m_threads.find(threadId);
-        if (it == m_threads.end() ||
-            it->second.state !=
+        const auto handle = threadHandle(threadId);
+        return handle.has_value() &&
+               startThread(*handle);
+    }
+
+    bool EeThreadScheduler::startThread(
+        EeSchedulerThreadHandle handle)
+    {
+        ThreadRecord *thread = findThread(handle);
+        if (!thread ||
+            thread->state !=
                 EeSchedulerThreadState::Dormant)
         {
             return false;
         }
 
-        enqueueReady(threadId, it->second);
+        enqueueReady(handle.id, *thread);
         return true;
     }
 
     std::optional<int>
     EeThreadScheduler::takeNextReady()
     {
-        for (std::deque<int> &queue :
+        for (std::deque<EeSchedulerThreadHandle> &queue :
              m_readyQueues)
         {
-            if (queue.empty())
+            while (!queue.empty())
             {
-                continue;
-            }
+                const EeSchedulerThreadHandle handle =
+                    queue.front();
+                queue.pop_front();
+                ThreadRecord *thread =
+                    findThread(handle);
+                if (!thread ||
+                    thread->state !=
+                        EeSchedulerThreadState::Ready)
+                {
+                    continue;
+                }
 
-            const int threadId = queue.front();
-            queue.pop_front();
-            const auto it = m_threads.find(threadId);
-            if (it == m_threads.end() ||
-                it->second.state !=
-                    EeSchedulerThreadState::Ready)
-            {
-                return std::nullopt;
+                thread->state =
+                    EeSchedulerThreadState::Running;
+                thread->queueSequence = 0u;
+                m_currentThreadId = handle.id;
+                return handle.id;
             }
-
-            it->second.state =
-                EeSchedulerThreadState::Running;
-            it->second.queueSequence = 0u;
-            m_currentThreadId = threadId;
-            return threadId;
         }
         return std::nullopt;
     }
@@ -196,7 +209,10 @@ namespace ps2x::ee
         thread.state = EeSchedulerThreadState::Waiting;
         thread.wait = wait;
         thread.queueSequence = m_nextQueueSequence++;
-        m_waitQueues[wait].push_back(threadId);
+        m_waitQueues[wait].push_back(
+            EeSchedulerThreadHandle{
+                threadId,
+                thread.generation});
         m_currentThreadId.reset();
         return takeNextReady();
     }
@@ -217,32 +233,44 @@ namespace ps2x::ee
             return std::nullopt;
         }
 
-        const int threadId = queueIt->second.front();
+        const EeSchedulerThreadHandle handle =
+            queueIt->second.front();
         queueIt->second.pop_front();
         if (queueIt->second.empty())
         {
             m_waitQueues.erase(queueIt);
         }
 
-        const auto threadIt = m_threads.find(threadId);
-        if (threadIt == m_threads.end() ||
-            threadIt->second.state !=
-                EeSchedulerThreadState::Waiting ||
-            threadIt->second.wait != wait)
+        ThreadRecord *thread = findThread(handle);
+        if (!thread ||
+            (thread->state !=
+                 EeSchedulerThreadState::Waiting &&
+             thread->state !=
+                 EeSchedulerThreadState::WaitSuspended) ||
+            thread->wait != wait)
         {
             return std::nullopt;
         }
 
-        enqueueReady(threadId, threadIt->second);
-        return threadId;
+        thread->wait = {};
+        if (thread->suspendCount != 0u)
+        {
+            thread->state =
+                EeSchedulerThreadState::Suspended;
+            thread->queueSequence = 0u;
+        }
+        else
+        {
+            enqueueReady(handle.id, *thread);
+        }
+        return handle.id;
     }
 
-    std::optional<int>
-    EeThreadScheduler::finishCurrentThread()
+    bool EeThreadScheduler::retireCurrentThread()
     {
         if (!m_currentThreadId.has_value())
         {
-            return std::nullopt;
+            return false;
         }
 
         const int threadId = *m_currentThreadId;
@@ -251,15 +279,312 @@ namespace ps2x::ee
             it->second.state !=
                 EeSchedulerThreadState::Running)
         {
-            return std::nullopt;
+            return false;
         }
 
         it->second.state =
             EeSchedulerThreadState::Dormant;
         it->second.wait = {};
+        it->second.suspendCount = 0u;
         it->second.queueSequence = 0u;
         m_currentThreadId.reset();
+        return true;
+    }
+
+    std::optional<int>
+    EeThreadScheduler::finishCurrentThread()
+    {
+        if (!retireCurrentThread())
+        {
+            return std::nullopt;
+        }
         return takeNextReady();
+    }
+
+    EeThreadScheduler::ThreadRecord *
+    EeThreadScheduler::findThread(
+        EeSchedulerThreadHandle handle)
+    {
+        if (!handle.valid())
+        {
+            return nullptr;
+        }
+        const auto it = m_threads.find(handle.id);
+        if (it == m_threads.end() ||
+            it->second.generation !=
+                handle.generation)
+        {
+            return nullptr;
+        }
+        return &it->second;
+    }
+
+    const EeThreadScheduler::ThreadRecord *
+    EeThreadScheduler::findThread(
+        EeSchedulerThreadHandle handle) const
+    {
+        if (!handle.valid())
+        {
+            return nullptr;
+        }
+        const auto it = m_threads.find(handle.id);
+        if (it == m_threads.end() ||
+            it->second.generation !=
+                handle.generation)
+        {
+            return nullptr;
+        }
+        return &it->second;
+    }
+
+    bool EeThreadScheduler::removeReady(
+        EeSchedulerThreadHandle handle,
+        int priority)
+    {
+        if (!validPriority(priority))
+        {
+            return false;
+        }
+        std::deque<EeSchedulerThreadHandle> &queue =
+            m_readyQueues[
+                static_cast<size_t>(priority)];
+        const auto it =
+            std::find(
+                queue.begin(), queue.end(), handle);
+        if (it == queue.end())
+        {
+            return false;
+        }
+        queue.erase(it);
+        return true;
+    }
+
+    bool EeThreadScheduler::removeWait(
+        EeSchedulerThreadHandle handle,
+        EeSchedulerWaitKey wait)
+    {
+        const auto queueIt = m_waitQueues.find(wait);
+        if (queueIt == m_waitQueues.end())
+        {
+            return false;
+        }
+        std::deque<EeSchedulerThreadHandle> &queue =
+            queueIt->second;
+        const auto it =
+            std::find(
+                queue.begin(), queue.end(), handle);
+        if (it == queue.end())
+        {
+            return false;
+        }
+        queue.erase(it);
+        if (queue.empty())
+        {
+            m_waitQueues.erase(queueIt);
+        }
+        return true;
+    }
+
+    bool EeThreadScheduler::suspendThread(
+        EeSchedulerThreadHandle handle)
+    {
+        ThreadRecord *thread = findThread(handle);
+        if (!thread ||
+            thread->state ==
+                EeSchedulerThreadState::Dormant ||
+            thread->suspendCount ==
+                std::numeric_limits<uint32_t>::max())
+        {
+            return false;
+        }
+
+        bool selectReplacement = false;
+        switch (thread->state)
+        {
+        case EeSchedulerThreadState::Running:
+            if (!m_currentThreadId.has_value() ||
+                *m_currentThreadId != handle.id)
+            {
+                return false;
+            }
+            thread->state =
+                EeSchedulerThreadState::Suspended;
+            m_currentThreadId.reset();
+            selectReplacement = true;
+            break;
+        case EeSchedulerThreadState::Ready:
+            if (!removeReady(
+                    handle, thread->priority))
+            {
+                return false;
+            }
+            thread->state =
+                EeSchedulerThreadState::Suspended;
+            thread->queueSequence = 0u;
+            break;
+        case EeSchedulerThreadState::Waiting:
+            thread->state =
+                EeSchedulerThreadState::WaitSuspended;
+            break;
+        case EeSchedulerThreadState::Suspended:
+        case EeSchedulerThreadState::WaitSuspended:
+            break;
+        case EeSchedulerThreadState::Dormant:
+            return false;
+        }
+        ++thread->suspendCount;
+        if (selectReplacement)
+        {
+            (void)takeNextReady();
+        }
+        return true;
+    }
+
+    bool EeThreadScheduler::resumeThread(
+        EeSchedulerThreadHandle handle)
+    {
+        ThreadRecord *thread = findThread(handle);
+        if (!thread ||
+            thread->suspendCount == 0u ||
+            (thread->state !=
+                 EeSchedulerThreadState::Suspended &&
+             thread->state !=
+                 EeSchedulerThreadState::WaitSuspended))
+        {
+            return false;
+        }
+
+        --thread->suspendCount;
+        if (thread->suspendCount != 0u)
+        {
+            return true;
+        }
+
+        if (thread->state ==
+            EeSchedulerThreadState::WaitSuspended)
+        {
+            thread->state =
+                EeSchedulerThreadState::Waiting;
+        }
+        else
+        {
+            enqueueReady(handle.id, *thread);
+        }
+        return true;
+    }
+
+    bool EeThreadScheduler::terminateThread(
+        EeSchedulerThreadHandle handle)
+    {
+        ThreadRecord *thread = findThread(handle);
+        if (!thread ||
+            thread->state ==
+                EeSchedulerThreadState::Dormant)
+        {
+            return false;
+        }
+
+        switch (thread->state)
+        {
+        case EeSchedulerThreadState::Running:
+            if (!m_currentThreadId.has_value() ||
+                *m_currentThreadId != handle.id)
+            {
+                return false;
+            }
+            m_currentThreadId.reset();
+            break;
+        case EeSchedulerThreadState::Ready:
+            if (!removeReady(
+                    handle, thread->priority))
+            {
+                return false;
+            }
+            break;
+        case EeSchedulerThreadState::Waiting:
+        case EeSchedulerThreadState::WaitSuspended:
+            if (!removeWait(
+                    handle, thread->wait))
+            {
+                return false;
+            }
+            break;
+        case EeSchedulerThreadState::Suspended:
+            break;
+        case EeSchedulerThreadState::Dormant:
+            return false;
+        }
+
+        thread->state =
+            EeSchedulerThreadState::Dormant;
+        thread->wait = {};
+        thread->suspendCount = 0u;
+        thread->queueSequence = 0u;
+        if (!m_currentThreadId.has_value())
+        {
+            (void)takeNextReady();
+        }
+        return true;
+    }
+
+    bool EeThreadScheduler::exitCurrentThread()
+    {
+        if (!retireCurrentThread())
+        {
+            return false;
+        }
+        (void)takeNextReady();
+        return true;
+    }
+
+    bool EeThreadScheduler::deleteThread(
+        EeSchedulerThreadHandle handle)
+    {
+        ThreadRecord *thread = findThread(handle);
+        if (!thread ||
+            thread->state !=
+                EeSchedulerThreadState::Dormant)
+        {
+            return false;
+        }
+        return m_threads.erase(handle.id) == 1u;
+    }
+
+    std::optional<int>
+    EeThreadScheduler::changeThreadPriority(
+        EeSchedulerThreadHandle handle,
+        int priority)
+    {
+        ThreadRecord *thread = findThread(handle);
+        if (!thread ||
+            !validPriority(priority) ||
+            thread->state ==
+                EeSchedulerThreadState::Dormant)
+        {
+            return std::nullopt;
+        }
+
+        const int previous = thread->priority;
+        if (previous == priority)
+        {
+            return previous;
+        }
+
+        if (thread->state ==
+            EeSchedulerThreadState::Ready)
+        {
+            if (!removeReady(handle, previous))
+            {
+                return std::nullopt;
+            }
+            thread->priority = priority;
+            enqueueReady(handle.id, *thread);
+        }
+        else
+        {
+            thread->priority = priority;
+        }
+        return previous;
     }
 
     std::optional<EeSchedulerDispatch>
@@ -311,6 +636,20 @@ namespace ps2x::ee
         return m_currentThreadId;
     }
 
+    std::optional<EeSchedulerThreadHandle>
+    EeThreadScheduler::threadHandle(
+        int threadId) const
+    {
+        const auto it = m_threads.find(threadId);
+        if (it == m_threads.end())
+        {
+            return std::nullopt;
+        }
+        return EeSchedulerThreadHandle{
+            threadId,
+            it->second.generation};
+    }
+
     std::optional<EeSchedulerThreadSnapshot>
     EeThreadScheduler::thread(int threadId) const
     {
@@ -326,6 +665,7 @@ namespace ps2x::ee
             it->second.priority,
             it->second.state,
             it->second.wait,
+            it->second.suspendCount,
             it->second.queueSequence};
     }
 
@@ -338,10 +678,18 @@ namespace ps2x::ee
             return {};
         }
 
-        const std::deque<int> &queue =
+        const std::deque<EeSchedulerThreadHandle>
+            &queue =
             m_readyQueues[
                 static_cast<size_t>(priority)];
-        return {queue.begin(), queue.end()};
+        std::vector<int> order;
+        order.reserve(queue.size());
+        for (EeSchedulerThreadHandle handle :
+             queue)
+        {
+            order.push_back(handle.id);
+        }
+        return order;
     }
 
     std::vector<int>
@@ -353,9 +701,14 @@ namespace ps2x::ee
         {
             return {};
         }
-        return {
-            it->second.begin(),
-            it->second.end()};
+        std::vector<int> order;
+        order.reserve(it->second.size());
+        for (EeSchedulerThreadHandle handle :
+             it->second)
+        {
+            order.push_back(handle.id);
+        }
+        return order;
     }
 
     size_t EeThreadScheduler::threadCount()
@@ -375,13 +728,15 @@ namespace ps2x::ee
              priority < m_readyQueues.size();
              ++priority)
         {
-            for (int threadId :
+            for (EeSchedulerThreadHandle handle :
                  m_readyQueues[priority])
             {
-                ++readyMembership[threadId];
+                ++readyMembership[handle.id];
                 const auto it =
-                    m_threads.find(threadId);
+                    m_threads.find(handle.id);
                 if (it == m_threads.end() ||
+                    it->second.generation !=
+                        handle.generation ||
                     it->second.state !=
                         EeSchedulerThreadState::Ready ||
                     it->second.priority !=
@@ -399,14 +754,19 @@ namespace ps2x::ee
             {
                 return false;
             }
-            for (int threadId : queue)
+            for (EeSchedulerThreadHandle handle :
+                 queue)
             {
-                ++waitMembership[threadId];
+                ++waitMembership[handle.id];
                 const auto it =
-                    m_threads.find(threadId);
+                    m_threads.find(handle.id);
                 if (it == m_threads.end() ||
-                    it->second.state !=
-                        EeSchedulerThreadState::Waiting ||
+                    it->second.generation !=
+                        handle.generation ||
+                    (it->second.state !=
+                         EeSchedulerThreadState::Waiting &&
+                     it->second.state !=
+                         EeSchedulerThreadState::WaitSuspended) ||
                     it->second.wait != wait)
                 {
                     return false;
@@ -428,6 +788,7 @@ namespace ps2x::ee
                 if (readyCount != 0u ||
                     waitCount != 0u ||
                     thread.wait.valid() ||
+                    thread.suspendCount != 0u ||
                     thread.queueSequence != 0u)
                 {
                     return false;
@@ -437,6 +798,7 @@ namespace ps2x::ee
                 if (readyCount != 1u ||
                     waitCount != 0u ||
                     thread.wait.valid() ||
+                    thread.suspendCount != 0u ||
                     thread.queueSequence == 0u)
                 {
                     return false;
@@ -449,6 +811,7 @@ namespace ps2x::ee
                     readyCount != 0u ||
                     waitCount != 0u ||
                     thread.wait.valid() ||
+                    thread.suspendCount != 0u ||
                     thread.queueSequence != 0u)
                 {
                     return false;
@@ -458,6 +821,27 @@ namespace ps2x::ee
                 if (readyCount != 0u ||
                     waitCount != 1u ||
                     !thread.wait.valid() ||
+                    thread.suspendCount != 0u ||
+                    thread.queueSequence == 0u)
+                {
+                    return false;
+                }
+                break;
+            case EeSchedulerThreadState::Suspended:
+                if (readyCount != 0u ||
+                    waitCount != 0u ||
+                    thread.wait.valid() ||
+                    thread.suspendCount == 0u ||
+                    thread.queueSequence != 0u)
+                {
+                    return false;
+                }
+                break;
+            case EeSchedulerThreadState::WaitSuspended:
+                if (readyCount != 0u ||
+                    waitCount != 1u ||
+                    !thread.wait.valid() ||
+                    thread.suspendCount == 0u ||
                     thread.queueSequence == 0u)
                 {
                     return false;

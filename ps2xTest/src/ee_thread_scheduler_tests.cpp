@@ -193,6 +193,261 @@ void register_ee_thread_scheduler_tests()
                 "wait publication should preserve exact queue membership");
         });
 
+        tc.Run("suspend and wake preserve wait-suspended ownership", [](TestCase &t)
+        {
+            EeThreadScheduler scheduler;
+            const EeSchedulerWaitKey semaphore{
+                EeSchedulerWaitKind::Semaphore,
+                7};
+
+            t.IsTrue(
+                scheduler.addRunningThread(1, 1u, 20) &&
+                    scheduler.addDormantThread(2, 1u, 20) &&
+                    scheduler.startThread(2),
+                "the fixture should create one runner and one ready peer");
+            const EeSchedulerThreadHandle first =
+                scheduler.threadHandle(1).value_or(
+                    EeSchedulerThreadHandle{});
+            const EeSchedulerThreadHandle second =
+                scheduler.threadHandle(2).value_or(
+                    EeSchedulerThreadHandle{});
+            t.Equals(
+                scheduler
+                    .blockCurrentThread(semaphore)
+                    .value_or(0),
+                2,
+                "blocking the runner should select its peer");
+            t.IsTrue(
+                scheduler.suspendThread(first) &&
+                    scheduler.suspendThread(first),
+                "nested suspension should retain one wait membership");
+
+            const auto waitSuspended =
+                scheduler.thread(1);
+            t.IsTrue(
+                waitSuspended.has_value() &&
+                    waitSuspended->state ==
+                        EeSchedulerThreadState::WaitSuspended &&
+                    waitSuspended->suspendCount == 2u &&
+                    waitSuspended->wait == semaphore &&
+                    equals(
+                        scheduler.waitOrder(semaphore),
+                        {1}),
+                "a suspended waiter should report WAITSUSPEND without changing queues");
+            t.Equals(
+                scheduler.wakeOne(semaphore).value_or(0),
+                1,
+                "wake should synchronously detach the wait-suspended thread");
+
+            const auto suspended =
+                scheduler.thread(1);
+            t.IsTrue(
+                suspended.has_value() &&
+                    suspended->state ==
+                        EeSchedulerThreadState::Suspended &&
+                    suspended->suspendCount == 2u &&
+                    !suspended->wait.valid() &&
+                    scheduler.waitOrder(semaphore).empty() &&
+                    scheduler.readyOrder(20).empty(),
+                "a woken suspended waiter should become SUSPEND without becoming ready");
+            t.IsTrue(
+                scheduler.resumeThread(first),
+                "the first resume should consume one nested suspend");
+            const auto onceResumed =
+                scheduler.thread(1);
+            t.IsTrue(
+                onceResumed.has_value() &&
+                    onceResumed->state ==
+                        EeSchedulerThreadState::Suspended &&
+                    onceResumed->suspendCount == 1u,
+                "one retained suspension should keep the thread suspended");
+            t.IsTrue(
+                scheduler.resumeThread(first) &&
+                    equals(
+                        scheduler.readyOrder(20),
+                        {1}) &&
+                    scheduler.currentThreadId().value_or(0) ==
+                        2,
+                "the final resume should publish READY without preempting the caller");
+
+            t.IsTrue(
+                scheduler.suspendThread(second),
+                "suspending the running thread should select the ready peer");
+            t.IsTrue(
+                scheduler.currentThreadId().value_or(0) ==
+                        1 &&
+                    scheduler.thread(2)->state ==
+                        EeSchedulerThreadState::Suspended,
+                "a running suspension should leave exactly one replacement RUN thread");
+            t.IsTrue(
+                scheduler.resumeThread(second) &&
+                    equals(
+                        scheduler.readyOrder(20),
+                        {2}),
+                "resuming the former runner should append it to READY");
+            t.IsTrue(
+                scheduler.validate(),
+                "WAIT/SUSPEND composition should preserve exact ownership");
+        });
+
+        tc.Run("terminate exit and delete reject recycled generations", [](TestCase &t)
+        {
+            EeThreadScheduler scheduler;
+            const EeSchedulerWaitKey semaphore{
+                EeSchedulerWaitKind::Semaphore,
+                4};
+
+            t.IsTrue(
+                scheduler.addRunningThread(1, 1u, 40) &&
+                    scheduler.addDormantThread(2, 1u, 40) &&
+                    scheduler.startThread(2),
+                "the fixture should create a RUN/READY pair");
+            const EeSchedulerThreadHandle first =
+                scheduler.threadHandle(1).value_or(
+                    EeSchedulerThreadHandle{});
+            const EeSchedulerThreadHandle staleSecond =
+                scheduler.threadHandle(2).value_or(
+                    EeSchedulerThreadHandle{});
+
+            t.IsTrue(
+                scheduler.terminateThread(staleSecond) &&
+                    scheduler.thread(2)->state ==
+                        EeSchedulerThreadState::Dormant &&
+                    scheduler.readyOrder(40).empty(),
+                "termination should unlink a READY target and retain its dormant object");
+            t.IsTrue(
+                scheduler.deleteThread(staleSecond) &&
+                    !scheduler.thread(2).has_value(),
+                "delete should remove only a dormant generation");
+            t.IsTrue(
+                scheduler.addDormantThread(2, 2u, 40),
+                "the deleted numeric ID should accept a replacement generation");
+            const EeSchedulerThreadHandle replacement =
+                scheduler.threadHandle(2).value_or(
+                    EeSchedulerThreadHandle{});
+            t.IsTrue(
+                !scheduler.startThread(staleSecond) &&
+                    !scheduler.suspendThread(staleSecond) &&
+                    !scheduler.terminateThread(staleSecond) &&
+                    !scheduler.deleteThread(staleSecond),
+                "an internal stale generation must not address the replacement");
+            t.IsTrue(
+                scheduler.startThread(replacement),
+                "the replacement generation should start normally");
+            t.Equals(
+                scheduler
+                    .blockCurrentThread(semaphore)
+                    .value_or(0),
+                2,
+                "blocking the first generation should select the replacement");
+            t.IsTrue(
+                scheduler.terminateThread(first) &&
+                    scheduler.waitOrder(semaphore).empty() &&
+                    scheduler.thread(1)->state ==
+                        EeSchedulerThreadState::Dormant,
+                "termination should synchronously unlink a waiting target");
+            t.IsTrue(
+                scheduler.deleteThread(first),
+                "a terminated waiter should be deletable");
+            t.IsTrue(
+                scheduler.exitCurrentThread() &&
+                    !scheduler.currentThreadId().has_value() &&
+                    scheduler.thread(2)->state ==
+                        EeSchedulerThreadState::Dormant,
+                "self-exit should retain a dormant object and leave an idle executor");
+            t.IsTrue(
+                scheduler.deleteThread(replacement) &&
+                    scheduler.threadCount() == 0u &&
+                    scheduler.validate(),
+                "deleting the exited replacement should leave an empty valid scheduler");
+        });
+
+        tc.Run("priority changes migrate only ready membership", [](TestCase &t)
+        {
+            EeThreadScheduler scheduler;
+            t.IsTrue(
+                scheduler.addRunningThread(1, 1u, 40) &&
+                    scheduler.addDormantThread(2, 1u, 40) &&
+                    scheduler.startThread(2) &&
+                    scheduler.addDormantThread(3, 1u, 40) &&
+                    scheduler.startThread(3),
+                "the fixture should create one runner and two FIFO peers");
+            const EeSchedulerThreadHandle second =
+                scheduler.threadHandle(2).value_or(
+                    EeSchedulerThreadHandle{});
+            const EeSchedulerThreadHandle third =
+                scheduler.threadHandle(3).value_or(
+                    EeSchedulerThreadHandle{});
+
+            t.Equals(
+                scheduler
+                    .changeThreadPriority(third, 10)
+                    .value_or(-1),
+                40,
+                "priority change should return the previous priority");
+            t.IsTrue(
+                equals(
+                    scheduler.readyOrder(10),
+                    {3}) &&
+                    equals(
+                        scheduler.readyOrder(40),
+                        {2}),
+                "a READY target should move between fixed buckets");
+            t.Equals(
+                scheduler.yieldCurrentThread().value_or(0),
+                3,
+                "the promoted READY target should win at the next boundary");
+            t.Equals(
+                scheduler
+                    .changeThreadPriority(third, 50)
+                    .value_or(-1),
+                10,
+                "changing RUN priority should not manufacture queue membership");
+            t.IsTrue(
+                scheduler.currentThreadId().value_or(0) ==
+                        3 &&
+                    scheduler.readyOrder(50).empty(),
+                "a raw RUN priority publication should preserve the caller");
+
+            t.Equals(
+                scheduler
+                    .changeThreadPriority(second, 5)
+                    .value_or(-1),
+                40,
+                "a second READY priority change should retain its old value");
+            t.IsTrue(
+                !scheduler
+                     .changeThreadPriority(second, 128)
+                     .has_value() &&
+                    scheduler.thread(2)->priority == 5,
+                "an invalid priority should leave the target unchanged");
+            t.IsTrue(
+                scheduler.suspendThread(second),
+                "the READY target should be removable into SUSPEND");
+            t.Equals(
+                scheduler
+                    .changeThreadPriority(second, 15)
+                    .value_or(-1),
+                5,
+                "a suspended priority should change without entering READY");
+            t.IsTrue(
+                scheduler.resumeThread(second) &&
+                    equals(
+                        scheduler.readyOrder(15),
+                        {2}),
+                "resume should publish the suspended target at its new priority");
+            t.Equals(
+                scheduler.finishCurrentThread().value_or(0),
+                2,
+                "finishing the runner should select the promoted resumed target");
+            t.IsTrue(
+                !scheduler
+                     .changeThreadPriority(third, 1)
+                     .has_value() &&
+                    scheduler.validate(),
+                "a dormant thread should reject priority changes without corrupting queues");
+        });
+
         tc.Run("scripted backend drives exits without host continuations", [](TestCase &t)
         {
             EeThreadScheduler scheduler;
