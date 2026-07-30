@@ -4,6 +4,7 @@
 #include "runtime/ee_timing.h"
 
 #include <array>
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <optional>
@@ -90,6 +91,13 @@ namespace ps2x::ee
             EeThreadScheduler &scheduler) = 0;
     };
 
+    enum class EeSchedulerExecutorDisposition : uint8_t
+    {
+        ResumeGuest,
+        Paused,
+        StopRequested,
+    };
+
     struct EeSchedulerBoundaryResult
     {
         ps2x::timing::EeTick tick{};
@@ -98,6 +106,8 @@ namespace ps2x::ee
         size_t contextPublications = 0u;
         bool limitExceeded = false;
         bool reentrantBoundaryRejected = false;
+        EeSchedulerExecutorDisposition disposition =
+            EeSchedulerExecutorDisposition::ResumeGuest;
         std::optional<EeSchedulerConsequenceStage>
             offendingStage;
         std::array<
@@ -113,6 +123,9 @@ namespace ps2x::ee
         uint64_t contextPublications = 0u;
         uint64_t consequenceLimitHits = 0u;
         uint64_t reentrantBoundaryRejects = 0u;
+        uint64_t pausedBoundaries = 0u;
+        uint64_t stoppedBoundaries = 0u;
+        uint64_t completedDebugSteps = 0u;
     };
 
     class EeSchedulerExecutor
@@ -133,6 +146,17 @@ namespace ps2x::ee
         now() const noexcept;
         [[nodiscard]] const EeSchedulerExecutorStatistics &
         statistics() const noexcept;
+        void debugRequestPause() noexcept;
+        void debugResume() noexcept;
+        void debugRequestStop() noexcept;
+        [[nodiscard]] bool debugStepBoundaries(
+            uint64_t count) noexcept;
+        [[nodiscard]] bool debugPaused() const noexcept;
+        [[nodiscard]] bool debugStopRequested()
+            const noexcept;
+        [[nodiscard]] uint64_t
+        debugStepBoundariesRemaining()
+            const noexcept;
         void reset() noexcept;
 
     private:
@@ -141,9 +165,15 @@ namespace ps2x::ee
         nextImmediateStage(
             const IEeSchedulerExecutorHooks &hooks,
             ps2x::timing::EeTick now) const;
+        void applyDebugControl(
+            EeSchedulerBoundaryResult &result) noexcept;
 
         ps2x::timing::EeTimeline m_timeline;
         EeSchedulerExecutorStatistics m_statistics{};
         bool m_processingBoundary = false;
+        std::atomic<bool> m_debugPauseRequested{false};
+        std::atomic<bool> m_debugStopRequested{false};
+        std::atomic<uint64_t>
+            m_debugStepBoundariesRemaining{0u};
     };
 }

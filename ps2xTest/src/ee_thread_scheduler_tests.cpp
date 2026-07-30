@@ -1225,8 +1225,151 @@ void register_ee_thread_scheduler_tests()
                             value_or(0) ==
                         1 &&
                         scheduler.validate(),
-                    "storm diagnostics should leave the selected scheduler state valid");
+                "storm diagnostics should leave the selected scheduler state valid");
             }
+        });
+
+        tc.Run("debugger control is resolved only at executor boundaries", [](TestCase &t)
+        {
+            EeThreadScheduler scheduler;
+            EeSchedulerExecutor executor;
+            ScriptedBoundaryHooks hooks;
+            t.IsTrue(
+                scheduler.addRunningThread(1, 1u, 40),
+                "the debugger fixture should have one selected guest");
+
+            executor.debugRequestPause();
+            const EeSchedulerBoundaryResult paused =
+                executor.processBoundary(
+                    scheduler,
+                    hooks,
+                    1,
+                    ps2x::timing::
+                        eeTickDeltaFromRaw(1u),
+                    EeSchedulerReschedulePolicy::
+                        HigherPriorityOnly);
+            t.IsTrue(
+                paused.disposition ==
+                        EeSchedulerExecutorDisposition::
+                            Paused &&
+                    executor.debugPaused() &&
+                    paused.selectedThreadId.value_or(0) ==
+                        1,
+                "a pause request should preserve selection and stop before the next resume");
+
+            executor.debugResume();
+            hooks.queue(
+                EeSchedulerConsequenceStage::HardwareEvent,
+                [&executor](
+                    EeThreadScheduler &,
+                    ScriptedBoundaryHooks &)
+                {
+                    executor.debugRequestPause();
+                });
+            const EeSchedulerBoundaryResult
+                consequencePause =
+                    executor.processBoundary(
+                        scheduler,
+                        hooks,
+                        1,
+                        ps2x::timing::
+                            eeTickDeltaFromRaw(1u),
+                        EeSchedulerReschedulePolicy::
+                            HigherPriorityOnly);
+            t.IsTrue(
+                consequencePause.consequencesProcessed ==
+                        1u &&
+                    consequencePause.disposition ==
+                        EeSchedulerExecutorDisposition::
+                            Paused,
+                "a debugger request published during device service should resolve on the same owner boundary");
+
+            executor.debugResume();
+            t.IsTrue(
+                executor.debugStepBoundaries(2u),
+                "a positive debugger step should arm the executor");
+            const EeSchedulerBoundaryResult stepOne =
+                executor.processBoundary(
+                    scheduler,
+                    hooks,
+                    1,
+                    ps2x::timing::
+                        eeTickDeltaFromRaw(1u),
+                    EeSchedulerReschedulePolicy::
+                        HigherPriorityOnly);
+            const EeSchedulerBoundaryResult stepTwo =
+                executor.processBoundary(
+                    scheduler,
+                    hooks,
+                    1,
+                    ps2x::timing::
+                        eeTickDeltaFromRaw(1u),
+                    EeSchedulerReschedulePolicy::
+                        HigherPriorityOnly);
+            t.IsTrue(
+                stepOne.disposition ==
+                        EeSchedulerExecutorDisposition::
+                            ResumeGuest &&
+                    executor
+                            .debugStepBoundariesRemaining() ==
+                        0u &&
+                    stepTwo.disposition ==
+                        EeSchedulerExecutorDisposition::
+                            Paused &&
+                    executor.debugPaused(),
+                "a two-boundary step should resume once and pause after the second completed boundary");
+
+            executor.debugResume();
+            executor.debugRequestStop();
+            const EeSchedulerBoundaryResult stopped =
+                executor.processBoundary(
+                    scheduler,
+                    hooks,
+                    1,
+                    ps2x::timing::
+                        eeTickDeltaFromRaw(1u),
+                    EeSchedulerReschedulePolicy::
+                        HigherPriorityOnly);
+            executor.debugResume();
+            const EeSchedulerBoundaryResult
+                stillStopped =
+                    executor.processBoundary(
+                        scheduler,
+                        hooks,
+                        1,
+                        ps2x::timing::
+                            eeTickDeltaFromRaw(1u),
+                        EeSchedulerReschedulePolicy::
+                            HigherPriorityOnly);
+            t.IsTrue(
+                stopped.disposition ==
+                        EeSchedulerExecutorDisposition::
+                            StopRequested &&
+                    stillStopped.disposition ==
+                        EeSchedulerExecutorDisposition::
+                            StopRequested &&
+                    executor.debugStopRequested() &&
+                    !executor.debugStepBoundaries(1u),
+                "stop should be persistent and reject later step requests");
+            t.IsTrue(
+                executor.statistics().boundaries == 6u &&
+                    executor.statistics().
+                            pausedBoundaries == 3u &&
+                    executor.statistics().
+                            stoppedBoundaries == 2u &&
+                    executor.statistics().
+                            completedDebugSteps == 1u,
+                "debugger decisions should be counted only when the executor applies a boundary");
+
+            executor.reset();
+            t.IsTrue(
+                executor.now().raw() == 0u &&
+                    !executor.debugPaused() &&
+                    !executor.debugStopRequested() &&
+                    executor.statistics().boundaries ==
+                        0u &&
+                    scheduler.validate(),
+                "executor reset should clear debugger control without changing guest scheduler ownership");
         });
 
         tc.Run("priority changes migrate only ready membership", [](TestCase &t)

@@ -104,6 +104,7 @@ namespace ps2x::ee
                     hooks, result.tick);
             result.limitExceeded =
                 result.offendingStage.has_value();
+            applyDebugControl(result);
         }
         catch (...)
         {
@@ -124,6 +125,56 @@ namespace ps2x::ee
         return result;
     }
 
+    void EeSchedulerExecutor::applyDebugControl(
+        EeSchedulerBoundaryResult &result) noexcept
+    {
+        if (m_debugStopRequested.load(
+                std::memory_order_acquire))
+        {
+            result.disposition =
+                EeSchedulerExecutorDisposition::
+                    StopRequested;
+            ++m_statistics.stoppedBoundaries;
+            return;
+        }
+
+        if (m_debugPauseRequested.load(
+                std::memory_order_acquire))
+        {
+            result.disposition =
+                EeSchedulerExecutorDisposition::Paused;
+            ++m_statistics.pausedBoundaries;
+            return;
+        }
+
+        uint64_t remaining =
+            m_debugStepBoundariesRemaining.load(
+                std::memory_order_acquire);
+        while (remaining != 0u)
+        {
+            if (m_debugStepBoundariesRemaining
+                    .compare_exchange_weak(
+                        remaining,
+                        remaining - 1u,
+                        std::memory_order_acq_rel,
+                        std::memory_order_acquire))
+            {
+                if (remaining == 1u)
+                {
+                    m_debugPauseRequested.store(
+                        true,
+                        std::memory_order_release);
+                    result.disposition =
+                        EeSchedulerExecutorDisposition::
+                            Paused;
+                    ++m_statistics.pausedBoundaries;
+                    ++m_statistics.completedDebugSteps;
+                }
+                return;
+            }
+        }
+    }
+
     ps2x::timing::EeTick
     EeSchedulerExecutor::now() const noexcept
     {
@@ -137,6 +188,70 @@ namespace ps2x::ee
         return m_statistics;
     }
 
+    void EeSchedulerExecutor::debugRequestPause()
+        noexcept
+    {
+        m_debugStepBoundariesRemaining.store(
+            0u, std::memory_order_release);
+        m_debugPauseRequested.store(
+            true, std::memory_order_release);
+    }
+
+    void EeSchedulerExecutor::debugResume() noexcept
+    {
+        m_debugStepBoundariesRemaining.store(
+            0u, std::memory_order_release);
+        m_debugPauseRequested.store(
+            false, std::memory_order_release);
+    }
+
+    void EeSchedulerExecutor::debugRequestStop()
+        noexcept
+    {
+        m_debugStopRequested.store(
+            true, std::memory_order_release);
+    }
+
+    bool EeSchedulerExecutor::debugStepBoundaries(
+        uint64_t count) noexcept
+    {
+        if (count == 0u ||
+            m_debugStopRequested.load(
+                std::memory_order_acquire))
+        {
+            return false;
+        }
+
+        m_debugStepBoundariesRemaining.store(
+            count, std::memory_order_release);
+        m_debugPauseRequested.store(
+            false, std::memory_order_release);
+        return true;
+    }
+
+    bool EeSchedulerExecutor::debugPaused()
+        const noexcept
+    {
+        return m_debugPauseRequested.load(
+            std::memory_order_acquire);
+    }
+
+    bool EeSchedulerExecutor::debugStopRequested()
+        const noexcept
+    {
+        return m_debugStopRequested.load(
+            std::memory_order_acquire);
+    }
+
+    uint64_t
+    EeSchedulerExecutor::
+        debugStepBoundariesRemaining()
+            const noexcept
+    {
+        return m_debugStepBoundariesRemaining.load(
+            std::memory_order_acquire);
+    }
+
     void EeSchedulerExecutor::reset() noexcept
     {
         if (m_processingBoundary)
@@ -145,5 +260,11 @@ namespace ps2x::ee
         }
         m_timeline.reset();
         m_statistics = {};
+        m_debugStepBoundariesRemaining.store(
+            0u, std::memory_order_release);
+        m_debugPauseRequested.store(
+            false, std::memory_order_release);
+        m_debugStopRequested.store(
+            false, std::memory_order_release);
     }
 }
