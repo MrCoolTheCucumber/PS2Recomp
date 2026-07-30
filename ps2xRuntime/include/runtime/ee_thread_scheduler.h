@@ -6,6 +6,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <deque>
+#include <exception>
 #include <map>
 #include <optional>
 #include <string_view>
@@ -227,6 +228,7 @@ namespace ps2x::ee
         Blocked,
         Preempted,
         Finished,
+        Exception,
         StopRequested,
     };
 
@@ -266,6 +268,7 @@ namespace ps2x::ee
             EeSchedulerExitReason::Preempted;
         uint64_t elapsedTicks = 0u;
         EeSchedulerWaitKey wait{};
+        std::exception_ptr failure;
     };
 
     class IEeSchedulerExecutionBackend

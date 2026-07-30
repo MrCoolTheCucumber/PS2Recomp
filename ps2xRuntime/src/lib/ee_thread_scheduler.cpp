@@ -1213,6 +1213,7 @@ namespace ps2x::ee
                     dispatch.result.wait);
             break;
         case EeSchedulerExitReason::Finished:
+        case EeSchedulerExitReason::Exception:
             dispatch.selectedThreadId =
                 finishCurrentThread();
             break;
