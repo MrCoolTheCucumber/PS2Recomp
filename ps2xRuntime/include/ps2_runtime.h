@@ -56,6 +56,7 @@ struct EeRpcRuntimeState;
 struct EeFileRuntimeState;
 namespace ps2_stubs
 {
+    struct AudioRuntimeState;
     struct CdRuntimeState;
     struct DmaRuntimeState;
     struct LibCRuntimeState;
@@ -1271,6 +1272,9 @@ public:
     const EeRpcRuntimeState &eeRpcRuntimeState() const;
     EeFileRuntimeState &eeFileRuntimeState();
     const EeFileRuntimeState &eeFileRuntimeState() const;
+    ps2_stubs::AudioRuntimeState &audioRuntimeState();
+    const ps2_stubs::AudioRuntimeState &
+    audioRuntimeState() const;
     ps2_stubs::CdRuntimeState &cdRuntimeState();
     const ps2_stubs::CdRuntimeState &cdRuntimeState() const;
     ps2_stubs::DmaRuntimeState &dmaRuntimeState();
@@ -1965,6 +1969,8 @@ private:
         m_eeRpcRuntimeState;
     std::unique_ptr<EeFileRuntimeState>
         m_eeFileRuntimeState;
+    std::unique_ptr<ps2_stubs::AudioRuntimeState>
+        m_audioRuntimeState;
     std::unique_ptr<ps2_stubs::CdRuntimeState>
         m_cdRuntimeState;
     std::unique_ptr<ps2_stubs::DmaRuntimeState>

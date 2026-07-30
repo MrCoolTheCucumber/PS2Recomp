@@ -4,7 +4,7 @@
 
 namespace ps2_stubs
 {
-    void resetAudioStubState();
+    void resetAudioStubState(PS2Runtime *runtime);
     void sceSdCallBack(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
     void sceSdRemote(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
     void sceSdRemoteInit(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);

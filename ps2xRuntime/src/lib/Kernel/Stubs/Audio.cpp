@@ -1,5 +1,6 @@
 #include "Common.h"
 #include "Audio.h"
+#include "Helpers/AudioRuntimeState.h"
 
 namespace ps2_stubs
 {
@@ -18,43 +19,8 @@ namespace ps2_stubs
         constexpr uint32_t kLibSdTransStop = 0x02u;
         constexpr uint32_t kLibSdTransLoop = 0x10u;
 
-        struct VoiceTransferState
-        {
-            uint32_t sourceAddress = 0u;
-            uint32_t destinationAddress = 0u;
-            uint32_t size = 0u;
-            uint16_t mode = 0u;
-            bool completed = true;
-        };
-
-        struct BlockTransferState
-        {
-            uint32_t base = 0u;
-            uint32_t size = 0u;
-            uint32_t pauseBase = 0u;
-            uint32_t offset = 0u;
-            uint32_t statusTraceCount = 0u;
-            uint16_t mode = 0u;
-            bool active = false;
-            bool loop = false;
-        };
-
-        struct AudioStubState
-        {
-            bool initialized = false;
-            std::array<VoiceTransferState, kLibSdCoreCount> voiceTransfers{};
-            std::array<BlockTransferState, kLibSdCoreCount> blockTransfers{};
-        };
-
-        std::mutex g_audio_stub_mutex;
-        AudioStubState g_audio_stub_state;
-
-        void resetAudioStubStateUnlocked()
-        {
-            g_audio_stub_state = {};
-        }
-
-        uint32_t currentBlockStatus(const BlockTransferState &transfer)
+        uint32_t currentBlockStatus(
+            const AudioBlockTransferState &transfer)
         {
             const uint32_t position = (transfer.base + transfer.offset) & kAudioPositionMask;
             const uint32_t halfSize = transfer.size / 2u;
@@ -63,10 +29,12 @@ namespace ps2_stubs
         }
     }
 
-    void resetAudioStubState()
+    void resetAudioStubState(PS2Runtime *runtime)
     {
-        std::lock_guard<std::mutex> lock(g_audio_stub_mutex);
-        resetAudioStubStateUnlocked();
+        if (runtime)
+        {
+            runtime->audioRuntimeState().reset();
+        }
     }
 
     void sceSdCallBack(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
@@ -76,8 +44,6 @@ namespace ps2_stubs
 
     void sceSdRemote(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
-        (void)runtime;
-
         const uint32_t cmd = getRegU32(ctx, 5);
         const uint32_t cmdArg0 = getRegU32(ctx, 6);
         const uint32_t cmdArg1 = getRegU32(ctx, 7);
@@ -92,11 +58,23 @@ namespace ps2_stubs
         const uint32_t arg5 = (arg5Reg != 0u) ? arg5Reg : arg5Stk;
         const uint32_t arg6 = (arg6Reg != 0u) ? arg6Reg : arg6Stk;
 
-        std::lock_guard<std::mutex> lock(g_audio_stub_mutex);
-        g_audio_stub_state.initialized = true;
+        if (!runtime)
+        {
+            setReturnU32(
+                ctx,
+                std::numeric_limits<uint32_t>::max());
+            return;
+        }
+
+        AudioRuntimeState &state =
+            runtime->audioRuntimeState();
+        std::lock_guard<std::mutex> lock(state.mutex);
+        state.initialized = true;
         const uint32_t core = cmdArg0 & (kLibSdCoreCount - 1u);
-        VoiceTransferState &voiceTransfer = g_audio_stub_state.voiceTransfers[core];
-        BlockTransferState &blockTransfer = g_audio_stub_state.blockTransfers[core];
+        AudioVoiceTransferState &voiceTransfer =
+            state.voiceTransfers[core];
+        AudioBlockTransferState &blockTransfer =
+            state.blockTransfers[core];
         uint32_t returnValue = 0u;
 
         if (cmd == kLibSdCmdVoiceTrans)
@@ -197,11 +175,17 @@ namespace ps2_stubs
     void sceSdRemoteInit(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
         (void)rdram;
-        (void)runtime;
+        if (!runtime)
+        {
+            setReturnS32(ctx, -1);
+            return;
+        }
 
-        std::lock_guard<std::mutex> lock(g_audio_stub_mutex);
-        resetAudioStubStateUnlocked();
-        g_audio_stub_state.initialized = true;
+        AudioRuntimeState &state =
+            runtime->audioRuntimeState();
+        std::lock_guard<std::mutex> lock(state.mutex);
+        state.resetLocked();
+        state.initialized = true;
         setReturnS32(ctx, 0);
     }
 

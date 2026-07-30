@@ -16,6 +16,7 @@
 #include "Kernel/Stubs/MemoryCard.h"
 #include "Kernel/Stubs/MPEG.h"
 #include "Kernel/Stubs/Pad.h"
+#include "Kernel/Stubs/Helpers/AudioRuntimeState.h"
 #include "Kernel/Stubs/Helpers/CdRuntimeState.h"
 #include "Kernel/Stubs/Helpers/DmaRuntimeState.h"
 #include "Kernel/Stubs/Helpers/LibCRuntimeState.h"
@@ -921,6 +922,8 @@ PS2Runtime::PS2Runtime(PS2RuntimeConfiguration configuration)
         std::make_unique<EeRpcRuntimeState>();
     m_eeFileRuntimeState =
         std::make_unique<EeFileRuntimeState>();
+    m_audioRuntimeState =
+        std::make_unique<ps2_stubs::AudioRuntimeState>();
     m_cdRuntimeState =
         std::make_unique<ps2_stubs::CdRuntimeState>();
     m_dmaRuntimeState =
@@ -1373,6 +1376,18 @@ const EeFileRuntimeState &
 PS2Runtime::eeFileRuntimeState() const
 {
     return *m_eeFileRuntimeState;
+}
+
+ps2_stubs::AudioRuntimeState &
+PS2Runtime::audioRuntimeState()
+{
+    return *m_audioRuntimeState;
+}
+
+const ps2_stubs::AudioRuntimeState &
+PS2Runtime::audioRuntimeState() const
+{
+    return *m_audioRuntimeState;
 }
 
 ps2_stubs::CdRuntimeState &PS2Runtime::cdRuntimeState()
@@ -9225,7 +9240,7 @@ void PS2Runtime::run()
     ps2_stubs::resetPadState(this);
     ps2_stubs::resetSifState(this);
     resetIop();
-    ps2_stubs::resetAudioStubState();
+    ps2_stubs::resetAudioStubState(this);
     ps2_stubs::resetGsSyncVCallbackState(this);
     ps2_stubs::resetMpegStubState(this);
     ps2_syscalls::initializeGuestKernelState(
