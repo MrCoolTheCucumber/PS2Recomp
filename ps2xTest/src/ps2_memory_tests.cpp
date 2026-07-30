@@ -3828,6 +3828,143 @@ void register_ps2_memory_tests()
             t.Equals(mem.readIORegister(kDstadr), 0u, "sceDmaReset should clear D_STADR");
         });
 
+        tc.Run("sceDma state is isolated per runtime", [](TestCase &t)
+        {
+            PS2Runtime first;
+            PS2Runtime second;
+            t.IsTrue(
+                first.memory().initialize(),
+                "first PS2Memory initialize should succeed");
+            t.IsTrue(
+                second.memory().initialize(),
+                "second PS2Memory initialize should succeed");
+
+            constexpr uint32_t kFirstEnvAddr = 0x1000u;
+            constexpr uint32_t kSecondEnvAddr = 0x1100u;
+            constexpr uint32_t kReadbackAddr = 0x1200u;
+            constexpr uint32_t kPayloadAddr = 0x2000u;
+            constexpr uint32_t kGifChannel = 0x1000A000u;
+            constexpr uint32_t kDctrl = 0x1000E000u;
+
+            const std::array<uint8_t, 0x14u> firstEnv = {
+                1u, 2u, 3u, 4u,
+                0x11u, 0x22u, 0x33u, 0x44u,
+                0x55u, 0x66u, 0x77u, 0x88u,
+                0x99u, 0xAAu, 0xBBu, 0xCCu,
+                0xDDu, 0xEEu, 0xF0u, 0x0Fu};
+            const std::array<uint8_t, 0x14u> secondEnv = {
+                2u, 1u, 2u, 3u,
+                0x10u, 0x20u, 0x30u, 0x40u,
+                0x50u, 0x60u, 0x70u, 0x80u,
+                0x90u, 0xA0u, 0xB0u, 0xC0u,
+                0xD0u, 0xE0u, 0xF0u, 0x00u};
+            const std::array<uint8_t, 0x14u> resetEnv{};
+
+            std::memcpy(
+                first.memory().getRDRAM() + kFirstEnvAddr,
+                firstEnv.data(),
+                firstEnv.size());
+            std::memcpy(
+                second.memory().getRDRAM() + kSecondEnvAddr,
+                secondEnv.data(),
+                secondEnv.size());
+
+            R5900Context firstCtx{};
+            R5900Context secondCtx{};
+            setRegU32(firstCtx, 4, kFirstEnvAddr);
+            ps2_stubs::sceDmaPutEnv(
+                first.memory().getRDRAM(),
+                &firstCtx,
+                &first);
+
+            setRegU32(secondCtx, 4, kReadbackAddr);
+            ps2_stubs::sceDmaGetEnv(
+                second.memory().getRDRAM(),
+                &secondCtx,
+                &second);
+            std::array<uint8_t, 0x14u> readback{};
+            std::memcpy(
+                readback.data(),
+                second.memory().getRDRAM() + kReadbackAddr,
+                readback.size());
+            t.Equals(
+                readback,
+                resetEnv,
+                "a fresh runtime should retain the default DMA environment");
+
+            setRegU32(secondCtx, 4, kSecondEnvAddr);
+            ps2_stubs::sceDmaPutEnv(
+                second.memory().getRDRAM(),
+                &secondCtx,
+                &second);
+            setRegU32(firstCtx, 4, kReadbackAddr);
+            ps2_stubs::sceDmaGetEnv(
+                first.memory().getRDRAM(),
+                &firstCtx,
+                &first);
+            std::memcpy(
+                readback.data(),
+                first.memory().getRDRAM() + kReadbackAddr,
+                readback.size());
+            t.Equals(
+                readback,
+                firstEnv,
+                "one runtime's DMA environment must not replace another runtime's environment");
+
+            ps2_stubs::sceDmaReset(
+                second.memory().getRDRAM(),
+                &secondCtx,
+                &second);
+            ps2_stubs::sceDmaGetEnv(
+                first.memory().getRDRAM(),
+                &firstCtx,
+                &first);
+            std::memcpy(
+                readback.data(),
+                first.memory().getRDRAM() + kReadbackAddr,
+                readback.size());
+            t.Equals(
+                readback,
+                firstEnv,
+                "resetting one runtime must not reset another runtime's DMA environment");
+
+            first.memory().writeIORegister(kDctrl, 1u);
+            std::memset(
+                first.memory().getRDRAM() + kPayloadAddr,
+                0,
+                16u);
+            setRegU32(firstCtx, 4, kGifChannel);
+            setRegU32(firstCtx, 5, kPayloadAddr);
+            setRegU32(firstCtx, 6, 1u);
+            ps2_stubs::sceDmaSendN(
+                first.memory().getRDRAM(),
+                &firstCtx,
+                &first);
+
+            setRegU32(secondCtx, 4, kGifChannel);
+            setRegU32(secondCtx, 5, 1u);
+            ps2_stubs::sceDmaSync(
+                second.memory().getRDRAM(),
+                &secondCtx,
+                &second);
+            t.Equals(
+                static_cast<int32_t>(
+                    ::getRegU32(&secondCtx, 2)),
+                0,
+                "one runtime's modeled DMA completion poll must not make another runtime busy");
+
+            setRegU32(firstCtx, 4, kGifChannel);
+            setRegU32(firstCtx, 5, 0u);
+            ps2_stubs::sceDmaSync(
+                first.memory().getRDRAM(),
+                &firstCtx,
+                &first);
+            ps2_stubs::sceDmaReset(
+                first.memory().getRDRAM(),
+                &firstCtx,
+                &first);
+        });
+
         tc.Run("VIF1 DMA DIRECT image packet reaches GS through arbiter", [](TestCase &t)
         {
             PS2Memory mem;
