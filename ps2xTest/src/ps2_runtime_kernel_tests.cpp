@@ -63,6 +63,8 @@ namespace
     constexpr uint32_t K_ID_REUSE_RETURN_ADDR = 0x1854u;
     constexpr uint32_t K_SEMA_ORACLE_STAGE_ADDR = 0x1860u;
     constexpr uint32_t K_SEMA_ORACLE_RETURN_ADDR = 0x1864u;
+    constexpr uint32_t K_TERMINATE_CANDIDATE_STAGE_ADDR = 0x1870u;
+    constexpr uint32_t K_TERMINATE_TARGET_STAGE_ADDR = 0x1874u;
 
     struct EeThreadStatus
     {
@@ -234,6 +236,7 @@ namespace
 
         writeGuestU32(rdram, K_TERMINATE_SEMA_WAIT_READY_ADDR, 1u);
         WaitSema(rdram, ctx, runtime);
+        writeGuestU32(rdram, K_TERMINATE_SEMA_WAIT_READY_ADDR, 2u);
         ctx->pc = 0u;
     }
 
@@ -315,6 +318,30 @@ namespace
             K_SEMA_ORACLE_RETURN_ADDR,
             static_cast<uint32_t>(getRegS32(*ctx, 2)));
         writeGuestU32(rdram, K_SEMA_ORACLE_STAGE_ADDR, 2u);
+        ctx->pc = 0u;
+    }
+
+    void terminateCandidateSleepHandler(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        if (!rdram || !ctx)
+        {
+            return;
+        }
+
+        writeGuestU32(rdram, K_TERMINATE_CANDIDATE_STAGE_ADDR, 1u);
+        SleepThread(rdram, ctx, runtime);
+        writeGuestU32(rdram, K_TERMINATE_CANDIDATE_STAGE_ADDR, 2u);
+        ctx->pc = 0u;
+    }
+
+    void terminateReadyTargetHandler(uint8_t *rdram, R5900Context *ctx, PS2Runtime *)
+    {
+        if (!rdram || !ctx)
+        {
+            return;
+        }
+
+        writeGuestU32(rdram, K_TERMINATE_TARGET_STAGE_ADDR, 1u);
         ctx->pc = 0u;
     }
 
@@ -2318,6 +2345,230 @@ void register_ps2_runtime_kernel_tests()
             t.Equals(getRegS32(env.ctx, 2), tid, "DeleteThread should return the waiter thread id");
         });
 
+        tc.Run("terminate variants preserve the EE raw scheduling boundary", [](TestCase &t)
+        {
+            notifyRuntimeStop();
+            TestEnv env;
+
+            constexpr uint32_t kCandidateEntry = 0x00260800u;
+            constexpr uint32_t kTargetEntry = 0x00260900u;
+            env.runtime.registerFunction(
+                kCandidateEntry,
+                &terminateCandidateSleepHandler);
+            env.runtime.registerFunction(
+                kTargetEntry,
+                &terminateReadyTargetHandler);
+
+            auto createThread = [&](uint32_t entry,
+                                    uint32_t stack,
+                                    uint32_t priority)
+            {
+                const uint32_t threadParam[9] = {
+                    0u,
+                    entry,
+                    stack,
+                    0x00001000u,
+                    0u,
+                    priority,
+                    0u,
+                    0u,
+                    0u
+                };
+                writeGuestWords(
+                    env.rdram.data(),
+                    K_PARAM_ADDR,
+                    threadParam,
+                    std::size(threadParam));
+                R5900Context createCtx{};
+                setRegU32(createCtx, 4, K_PARAM_ADDR);
+                CreateThread(
+                    env.rdram.data(), &createCtx, &env.runtime);
+                return getRegS32(createCtx, 2);
+            };
+            auto startThread = [&](int32_t tid)
+            {
+                R5900Context startCtx{};
+                setRegU32(
+                    startCtx, 4, static_cast<uint32_t>(tid));
+                StartThread(
+                    env.rdram.data(), &startCtx, &env.runtime);
+                return getRegS32(startCtx, 2);
+            };
+            auto referThread = [&](int32_t tid, EeThreadStatus &status)
+            {
+                R5900Context statusCtx{};
+                setRegU32(
+                    statusCtx, 4, static_cast<uint32_t>(tid));
+                setRegU32(statusCtx, 5, K_STATUS_ADDR);
+                iReferThreadStatus(
+                    env.rdram.data(), &statusCtx, &env.runtime);
+                std::memcpy(
+                    &status,
+                    env.rdram.data() + K_STATUS_ADDR,
+                    sizeof(status));
+                return getRegS32(statusCtx, 2);
+            };
+            auto deleteThread = [&](int32_t tid)
+            {
+                R5900Context deleteCtx{};
+                setRegU32(
+                    deleteCtx, 4, static_cast<uint32_t>(tid));
+                DeleteThread(
+                    env.rdram.data(), &deleteCtx, &env.runtime);
+                return getRegS32(deleteCtx, 2);
+            };
+
+            auto runCase = [&](bool raw,
+                               uint32_t candidateStack,
+                               uint32_t targetStack)
+            {
+                writeGuestU32(
+                    env.rdram.data(),
+                    K_TERMINATE_CANDIDATE_STAGE_ADDR,
+                    0u);
+                writeGuestU32(
+                    env.rdram.data(),
+                    K_TERMINATE_TARGET_STAGE_ADDR,
+                    0u);
+
+                const int32_t candidateTid =
+                    createThread(
+                        kCandidateEntry,
+                        candidateStack,
+                        30u);
+                t.IsTrue(
+                    candidateTid >= 2,
+                    "candidate creation should return a guest thread id");
+                t.Equals(
+                    startThread(candidateTid),
+                    candidateTid,
+                    "candidate start should return its thread id");
+
+                const bool candidateSleeping = waitUntil([&]()
+                {
+                    EeThreadStatus status{};
+                    return readGuestU32(
+                               env.rdram.data(),
+                               K_TERMINATE_CANDIDATE_STAGE_ADDR) == 1u &&
+                           referThread(candidateTid, status) == THS_WAIT &&
+                           status.status == THS_WAIT &&
+                           status.waitType == TSW_SLEEP;
+                }, std::chrono::milliseconds(200));
+                t.IsTrue(
+                    candidateSleeping,
+                    "the higher-priority candidate should block in SleepThread");
+
+                const int32_t targetTid =
+                    createThread(
+                        kTargetEntry,
+                        targetStack,
+                        50u);
+                t.IsTrue(
+                    targetTid >= 2,
+                    "termination target creation should return a guest thread id");
+
+                {
+                    PS2Runtime::GuestExecutionScope guestExecution(
+                        &env.runtime, &env.ctx);
+
+                    t.Equals(
+                        startThread(targetTid),
+                        targetTid,
+                        "termination target start should return its thread id");
+
+                    R5900Context wakeCtx{};
+                    setRegU32(
+                        wakeCtx, 4, static_cast<uint32_t>(candidateTid));
+                    iWakeupThread(
+                        env.rdram.data(), &wakeCtx, &env.runtime);
+                    t.Equals(
+                        getRegS32(wakeCtx, 2),
+                        candidateTid,
+                        "raw wake should publish the higher-priority candidate");
+                    t.Equals(
+                        readGuestU32(
+                            env.rdram.data(),
+                            K_TERMINATE_CANDIDATE_STAGE_ADDR),
+                        1u,
+                        "raw wake should not dispatch the candidate");
+
+                    R5900Context terminateCtx{};
+                    setRegU32(
+                        terminateCtx, 4, static_cast<uint32_t>(targetTid));
+                    if (raw)
+                    {
+                        t.IsTrue(
+                            callSyscall(
+                                static_cast<uint32_t>(-0x26),
+                                env.rdram.data(),
+                                &terminateCtx,
+                                &env.runtime),
+                            "raw terminate syscall should dispatch");
+                    }
+                    else
+                    {
+                        TerminateThread(
+                            env.rdram.data(),
+                            &terminateCtx,
+                            &env.runtime);
+                    }
+
+                    t.Equals(
+                        getRegS32(terminateCtx, 2),
+                        targetTid,
+                        "successful termination should return the target id");
+                    t.Equals(
+                        readGuestU32(
+                            env.rdram.data(),
+                            K_TERMINATE_CANDIDATE_STAGE_ADDR),
+                        raw ? 1u : 2u,
+                        raw
+                            ? "raw termination should not dispatch a READY candidate"
+                            : "ordinary termination should dispatch a READY candidate before returning");
+                    t.Equals(
+                        readGuestU32(
+                            env.rdram.data(),
+                            K_TERMINATE_TARGET_STAGE_ADDR),
+                        0u,
+                        "the terminated READY target must not execute its entry");
+
+                    EeThreadStatus targetStatus{};
+                    t.Equals(
+                        referThread(targetTid, targetStatus),
+                        THS_DORMANT,
+                        "terminated target status lookup should return DORMANT");
+                    t.Equals(
+                        targetStatus.status,
+                        THS_DORMANT,
+                        "terminated target should synchronously publish DORMANT");
+                }
+
+                const bool candidateExited = waitUntil([&]()
+                {
+                    EeThreadStatus status{};
+                    return readGuestU32(
+                               env.rdram.data(),
+                               K_TERMINATE_CANDIDATE_STAGE_ADDR) == 2u &&
+                           referThread(candidateTid, status) == THS_DORMANT;
+                }, std::chrono::milliseconds(200));
+                t.IsTrue(
+                    candidateExited,
+                    "released scheduling candidate should exit to DORMANT");
+                t.Equals(
+                    deleteThread(candidateTid),
+                    candidateTid,
+                    "candidate should be deletable after exit");
+                t.Equals(
+                    deleteThread(targetTid),
+                    targetTid,
+                    "terminated target should be immediately deletable");
+            };
+
+            runCase(true, 0x00313000u, 0x00314000u);
+            runCase(false, 0x00315000u, 0x00316000u);
+            notifyRuntimeStop();
+        });
+
         tc.Run("TerminateThread unwinds semaphore wait as a normal thread exit", [](TestCase &t)
         {
             TestEnv env;
@@ -2388,7 +2639,16 @@ void register_ps2_runtime_kernel_tests()
             R5900Context terminateCtx{};
             setRegU32(terminateCtx, 4, static_cast<uint32_t>(tid));
             TerminateThread(env.rdram.data(), &terminateCtx, &env.runtime);
-            t.Equals(getRegS32(terminateCtx, 2), KE_OK, "TerminateThread should join the semaphore waiter");
+            t.Equals(
+                getRegS32(terminateCtx, 2),
+                tid,
+                "TerminateThread should return the semaphore waiter id");
+            t.Equals(
+                readGuestU32(
+                    env.rdram.data(),
+                    K_TERMINATE_SEMA_WAIT_READY_ADDR),
+                1u,
+                "terminated WaitSema must not return into guest code");
 
             std::cerr.rdbuf(oldErr);
             const std::string errText = capturedErr.str();
@@ -2407,6 +2667,25 @@ void register_ps2_runtime_kernel_tests()
             EeThreadStatus dormantStatus{};
             std::memcpy(&dormantStatus, env.rdram.data() + K_STATUS_ADDR, sizeof(dormantStatus));
             t.Equals(dormantStatus.status, THS_DORMANT, "terminated waiter should become dormant");
+
+            R5900Context semaStatusCtx{};
+            setRegU32(semaStatusCtx, 4, static_cast<uint32_t>(sid));
+            setRegU32(semaStatusCtx, 5, K_STATUS_ADDR);
+            iReferSemaStatus(
+                env.rdram.data(), &semaStatusCtx, &env.runtime);
+            EeSemaStatus semaStatus{};
+            std::memcpy(
+                &semaStatus,
+                env.rdram.data() + K_STATUS_ADDR,
+                sizeof(semaStatus));
+            t.Equals(
+                getRegS32(semaStatusCtx, 2),
+                KE_OK,
+                "semaphore should remain queryable after termination");
+            t.Equals(
+                semaStatus.wait_threads,
+                0,
+                "termination should synchronously unlink the semaphore waiter");
 
             setRegU32(env.ctx, 4, static_cast<uint32_t>(tid));
             DeleteThread(env.rdram.data(), &env.ctx, &env.runtime);

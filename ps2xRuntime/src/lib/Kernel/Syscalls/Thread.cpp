@@ -402,7 +402,10 @@ namespace ps2_syscalls
 
             {
                 std::lock_guard<std::mutex> lock(info->m);
-                info->status = THS_RUN;
+                info->status =
+                    info->terminated.load(std::memory_order_relaxed)
+                        ? THS_DORMANT
+                        : THS_RUN;
             }
 
             uint32_t threadSp = callerSp;
@@ -642,7 +645,11 @@ namespace ps2_syscalls
         throw ThreadExitException();
     }
 
-    void TerminateThread(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    static void terminateThread(
+        uint8_t *rdram,
+        R5900Context *ctx,
+        PS2Runtime *runtime,
+        bool reschedule)
     {
         int tid = static_cast<int>(getRegU32(ctx, 4));
         if (tid == 0)
@@ -653,6 +660,26 @@ namespace ps2_syscalls
         {
             setReturnS32(ctx, KE_UNKNOWN_THID);
             return;
+        }
+
+        // Preserve the existing self-termination path. The external-thread
+        // path below models the BIOS's synchronous scheduler transition
+        // without waiting for the legacy host thread to unwind.
+        if (tid == g_currentThreadId)
+        {
+            {
+                std::lock_guard<std::mutex> lock(info->m);
+                if (info->status == THS_DORMANT)
+                {
+                    setReturnS32(ctx, KE_DORMANT);
+                    return;
+                }
+                info->terminated = true;
+                info->forceRelease = true;
+            }
+            info->cv.notify_all();
+            runExitHandlersForThread(tid, rdram, ctx, runtime);
+            throw ThreadExitException();
         }
 
         int waitType = TSW_NONE;
@@ -666,33 +693,74 @@ namespace ps2_syscalls
             }
             waitType = info->waitType;
             waitId = info->waitId;
+        }
+
+        bool transitioned = false;
+        if (waitType == TSW_SEMA)
+        {
+            auto sema = lookupSemaInfo(waitId);
+            if (sema)
+            {
+                std::lock_guard<std::mutex> semaLock(sema->m);
+                std::lock_guard<std::mutex> threadLock(info->m);
+                if (info->status != THS_DORMANT)
+                {
+                    if (info->waitType == TSW_SEMA &&
+                        info->waitId == waitId &&
+                        info->semaWaitLinked.exchange(false) &&
+                        sema->waiters > 0)
+                    {
+                        sema->waiters--;
+                    }
+                    info->terminated = true;
+                    info->forceRelease = true;
+                    info->started = false;
+                    info->status = THS_DORMANT;
+                    info->waitType = TSW_NONE;
+                    info->waitId = 0;
+                    info->wakeupCount = 0;
+                    info->suspendCount = 0;
+                    transitioned = true;
+                }
+            }
+        }
+
+        if (!transitioned)
+        {
+            std::lock_guard<std::mutex> lock(info->m);
+            if (info->status == THS_DORMANT)
+            {
+                setReturnS32(ctx, KE_DORMANT);
+                return;
+            }
             info->terminated = true;
             info->forceRelease = true;
+            info->started = false;
+            info->status = THS_DORMANT;
+            info->waitType = TSW_NONE;
+            info->waitId = 0;
+            info->wakeupCount = 0;
+            info->suspendCount = 0;
         }
+
         info->cv.notify_all();
         notifyThreadWaitObject(waitType, waitId);
+        setReturnS32(ctx, tid);
 
-        if (tid == g_currentThreadId)
+        if (reschedule)
         {
-            runExitHandlersForThread(tid, rdram, ctx, runtime);
-            throw ThreadExitException();
+            yieldGuestExecutionAfterWake(runtime);
         }
-        else
-        {
-            // Block until the target thread actually finishes unwinding and becomes dormant.
-            // Drop the thread mutex before reacquiring GuestExecutionScope to avoid lock inversion.
-            std::unique_lock<std::mutex> lock(info->m);
-            waitWithGuestExecutionReleasedUntilUnlocked(
-                runtime,
-                lock,
-                [&]()
-                {
-                    info->cv.wait(lock, [&]()
-                                  { return !info->started && info->status == THS_DORMANT; });
-                });
-        }
+    }
 
-        setReturnS32(ctx, KE_OK);
+    void TerminateThread(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        terminateThread(rdram, ctx, runtime, true);
+    }
+
+    void iTerminateThread(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        terminateThread(rdram, ctx, runtime, false);
     }
 
     void SuspendThread(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)

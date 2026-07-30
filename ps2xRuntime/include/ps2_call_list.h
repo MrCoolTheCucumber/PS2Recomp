@@ -17,6 +17,7 @@
     X(ExitThread)              \
     X(ExitDeleteThread)        \
     X(TerminateThread)         \
+    X(iTerminateThread)        \
     X(SuspendThread)           \
     X(ResumeThread)            \
     X(iResumeThread)           \

@@ -366,10 +366,18 @@ namespace ps2_syscalls
                     {
                         std::lock_guard<std::mutex> tLock(info->m);
                         terminated = info->terminated.load();
-                        info->status =
-                            (info->suspendCount > 0) ? THS_SUSPEND : THS_READY;
+                        info->status = terminated
+                            ? THS_DORMANT
+                            : ((info->suspendCount > 0)
+                                   ? THS_SUSPEND
+                                   : THS_READY);
                         info->waitType = TSW_NONE;
                         info->waitId = 0;
+                        if (terminated)
+                        {
+                            info->wakeupCount = 0;
+                            info->suspendCount = 0;
+                        }
                         if (info->forceRelease)
                         {
                             info->forceRelease = false;
@@ -759,9 +767,18 @@ namespace ps2_syscalls
                     {
                         std::lock_guard<std::mutex> tLock(tInfo->m);
                         terminated = tInfo->terminated.load();
-                        tInfo->status = (tInfo->suspendCount > 0) ? THS_SUSPEND : THS_RUN;
+                        tInfo->status = terminated
+                            ? THS_DORMANT
+                            : ((tInfo->suspendCount > 0)
+                                   ? THS_SUSPEND
+                                   : THS_RUN);
                         tInfo->waitType = TSW_NONE;
                         tInfo->waitId = 0;
+                        if (terminated)
+                        {
+                            tInfo->wakeupCount = 0;
+                            tInfo->suspendCount = 0;
+                        }
                         if (tInfo->forceRelease)
                         {
                             tInfo->forceRelease = false;
