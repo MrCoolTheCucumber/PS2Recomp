@@ -843,7 +843,7 @@ namespace ps2_syscalls
             info->status = THS_RUN;
             info->waitType = TSW_NONE;
             info->waitId = 0;
-            ret = 0;
+            ret = g_currentThreadId;
             wakeupCountAfter = info->wakeupCount;
         }
         else
@@ -869,7 +869,11 @@ namespace ps2_syscalls
                 [&]()
                 {
                     info->cv.wait(lock, [&]()
-                                  { return info->wakeupCount > 0 || info->forceRelease.load() || info->terminated.load(); });
+                                  {
+                                      return info->waitType != TSW_SLEEP ||
+                                             info->forceRelease.load() ||
+                                             info->terminated.load();
+                                  });
                 },
                 [&]()
                 {
@@ -890,11 +894,7 @@ namespace ps2_syscalls
                     }
                     else
                     {
-                        if (info->wakeupCount > 0)
-                        {
-                            info->wakeupCount--;
-                        }
-                        ret = 0;
+                        ret = g_currentThreadId;
                     }
                     wakeupCountAfter = info->wakeupCount;
                 });
@@ -923,7 +923,11 @@ namespace ps2_syscalls
         setReturnS32(ctx, ret);
     }
 
-    void WakeupThread(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    static void wakeupThread(
+        uint8_t *rdram,
+        R5900Context *ctx,
+        PS2Runtime *runtime,
+        bool reschedule)
     {
         int tid = static_cast<int>(getRegU32(ctx, 4));
         if (tid == 0)
@@ -966,7 +970,6 @@ namespace ps2_syscalls
                 }
                 info->waitType = TSW_NONE;
                 info->waitId = 0;
-                info->wakeupCount++;
                 info->cv.notify_one();
                 wokeSleeper = true;
             }
@@ -988,16 +991,21 @@ namespace ps2_syscalls
                                               << " wakeupCount=" << newWakeupCount
                                               << std::endl);
         }
-        setReturnS32(ctx, KE_OK);
-        if (wokeSleeper)
+        setReturnS32(ctx, tid);
+        if (wokeSleeper && reschedule)
         {
             yieldGuestExecutionAfterWake(runtime);
         }
     }
 
+    void WakeupThread(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        wakeupThread(rdram, ctx, runtime, true);
+    }
+
     void iWakeupThread(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
-        WakeupThread(rdram, ctx, runtime);
+        wakeupThread(rdram, ctx, runtime, false);
     }
 
     void CancelWakeupThread(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)

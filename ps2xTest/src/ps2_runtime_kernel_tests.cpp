@@ -45,15 +45,20 @@ namespace
     constexpr uint32_t K_SEMA_WAIT_READY_ADDR = 0x1900u;
 
     constexpr int THS_WAIT = 0x04;
+    constexpr int THS_READY = 0x02;
     constexpr int THS_SUSPEND = 0x08;
     constexpr int THS_WAITSUSPEND = 0x0C;
     constexpr int THS_DORMANT = 0x10;
+    constexpr uint32_t TSW_SLEEP = 1u;
     constexpr uint32_t TSW_SEMA = 2u;
     constexpr uint32_t TSW_EVENT = 3u;
 
     constexpr uint32_t K_EVENT_WAIT_READY_ADDR = 0x1800u;
     constexpr uint32_t K_EVENT_WAIT_GATE_ADDR = 0x1804u;
     constexpr uint32_t K_TERMINATE_SEMA_WAIT_READY_ADDR = 0x1810u;
+    constexpr uint32_t K_SLEEP_GATE_ADDR = 0x1820u;
+    constexpr uint32_t K_SLEEP_STAGE_ADDR = 0x1824u;
+    constexpr uint32_t K_SLEEP_RETURN_ADDR = 0x1830u;
 
     struct EeThreadStatus
     {
@@ -225,6 +230,36 @@ namespace
 
         writeGuestU32(rdram, K_TERMINATE_SEMA_WAIT_READY_ADDR, 1u);
         WaitSema(rdram, ctx, runtime);
+        ctx->pc = 0u;
+    }
+
+    void sleepWakeCountHandler(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        if (!rdram || !ctx)
+        {
+            return;
+        }
+
+        writeGuestU32(rdram, K_SLEEP_STAGE_ADDR, 1u);
+        while (readGuestU32(rdram, K_SLEEP_GATE_ADDR) == 0u)
+        {
+            if (runtime && runtime->isStopRequested())
+            {
+                ctx->pc = 0u;
+                return;
+            }
+            std::this_thread::yield();
+        }
+
+        for (uint32_t index = 0u; index < 4u; ++index)
+        {
+            SleepThread(rdram, ctx, runtime);
+            writeGuestU32(
+                rdram,
+                K_SLEEP_RETURN_ADDR + index * sizeof(uint32_t),
+                static_cast<uint32_t>(getRegS32(*ctx, 2)));
+            writeGuestU32(rdram, K_SLEEP_STAGE_ADDR, index + 2u);
+        }
         ctx->pc = 0u;
     }
 
@@ -579,6 +614,278 @@ void register_ps2_runtime_kernel_tests()
             setRegU32(env.ctx, 4, 0u);
             CancelWakeupThread(env.rdram.data(), &env.ctx, &env.runtime);
             t.Equals(getRegS32(env.ctx, 2), KE_OK, "CancelWakeupThread(TH_SELF) should return previous count (0)");
+        });
+
+        tc.Run("sleep and wakeup counts follow the EE BIOS contract", [](TestCase &t)
+        {
+            TestEnv env;
+
+            constexpr uint32_t kThreadEntry = 0x00253000u;
+            env.runtime.registerFunction(kThreadEntry, &sleepWakeCountHandler);
+            writeGuestU32(env.rdram.data(), K_SLEEP_GATE_ADDR, 0u);
+            writeGuestU32(env.rdram.data(), K_SLEEP_STAGE_ADDR, 0u);
+
+            setRegU32(env.ctx, 4, 0u);
+            setRegU32(env.ctx, 5, 40u);
+            ChangeThreadPriority(
+                env.rdram.data(), &env.ctx, &env.runtime);
+
+            const uint32_t threadParam[9] = {
+                0u,
+                kThreadEntry,
+                0x00308000u,
+                0x00000800u,
+                0u,
+                30u,
+                0u,
+                0u,
+                0u
+            };
+            writeGuestWords(
+                env.rdram.data(),
+                K_PARAM_ADDR,
+                threadParam,
+                std::size(threadParam));
+            setRegU32(env.ctx, 4, K_PARAM_ADDR);
+            CreateThread(
+                env.rdram.data(), &env.ctx, &env.runtime);
+            const int32_t tid = getRegS32(env.ctx, 2);
+            t.IsTrue(tid >= 2, "CreateThread should return a worker id");
+
+            setRegU32(env.ctx, 4, static_cast<uint32_t>(tid));
+            setRegU32(env.ctx, 5, 0u);
+            StartThread(
+                env.rdram.data(), &env.ctx, &env.runtime);
+            t.Equals(getRegS32(env.ctx, 2), tid, "StartThread should return the worker id");
+
+            const bool entered = waitUntil([&]()
+            {
+                return readGuestU32(env.rdram.data(), K_SLEEP_STAGE_ADDR) == 1u;
+            }, std::chrono::milliseconds(200));
+            t.IsTrue(entered, "worker should reach the pre-sleep gate");
+
+            for (int call = 0; call < 3; ++call)
+            {
+                R5900Context wakeCtx{};
+                setRegU32(wakeCtx, 4, static_cast<uint32_t>(tid));
+                if (call == 1)
+                {
+                    WakeupThread(
+                        env.rdram.data(), &wakeCtx, &env.runtime);
+                }
+                else
+                {
+                    iWakeupThread(
+                        env.rdram.data(), &wakeCtx, &env.runtime);
+                }
+                t.Equals(
+                    getRegS32(wakeCtx, 2),
+                    tid,
+                    "waking a runnable thread should return its id");
+            }
+
+            R5900Context statusCtx{};
+            setRegU32(statusCtx, 4, static_cast<uint32_t>(tid));
+            setRegU32(statusCtx, 5, K_STATUS_ADDR);
+            ReferThreadStatus(
+                env.rdram.data(), &statusCtx, &env.runtime);
+            EeThreadStatus status{};
+            std::memcpy(
+                &status,
+                env.rdram.data() + K_STATUS_ADDR,
+                sizeof(status));
+            t.Equals(status.wakeupCount, 3u, "three early wakes should accumulate");
+
+            R5900Context cancelCtx{};
+            setRegU32(cancelCtx, 4, static_cast<uint32_t>(tid));
+            CancelWakeupThread(
+                env.rdram.data(), &cancelCtx, &env.runtime);
+            t.Equals(
+                getRegS32(cancelCtx, 2),
+                3,
+                "CancelWakeupThread should return and clear the accumulated count");
+
+            for (int call = 0; call < 2; ++call)
+            {
+                R5900Context wakeCtx{};
+                setRegU32(wakeCtx, 4, static_cast<uint32_t>(tid));
+                if (call == 0)
+                {
+                    WakeupThread(
+                        env.rdram.data(), &wakeCtx, &env.runtime);
+                }
+                else
+                {
+                    iWakeupThread(
+                        env.rdram.data(), &wakeCtx, &env.runtime);
+                }
+                t.Equals(
+                    getRegS32(wakeCtx, 2),
+                    tid,
+                    "replenishing the wake count should return the worker id");
+            }
+
+            writeGuestU32(env.rdram.data(), K_SLEEP_GATE_ADDR, 1u);
+            const bool sleeping = waitUntil([&]()
+            {
+                R5900Context currentStatusCtx{};
+                setRegU32(
+                    currentStatusCtx, 4, static_cast<uint32_t>(tid));
+                setRegU32(currentStatusCtx, 5, K_STATUS_ADDR);
+                ReferThreadStatus(
+                    env.rdram.data(),
+                    &currentStatusCtx,
+                    &env.runtime);
+                EeThreadStatus currentStatus{};
+                std::memcpy(
+                    &currentStatus,
+                    env.rdram.data() + K_STATUS_ADDR,
+                    sizeof(currentStatus));
+                return readGuestU32(
+                           env.rdram.data(), K_SLEEP_STAGE_ADDR) == 3u &&
+                       getRegS32(currentStatusCtx, 2) == THS_WAIT &&
+                       currentStatus.status == THS_WAIT &&
+                       currentStatus.waitType == TSW_SLEEP &&
+                       currentStatus.wakeupCount == 0u;
+            }, std::chrono::milliseconds(200));
+            t.IsTrue(
+                sleeping,
+                "two accumulated wakes should satisfy two sleeps before the third blocks");
+            t.Equals(
+                readGuestU32(env.rdram.data(), K_SLEEP_RETURN_ADDR),
+                static_cast<uint32_t>(tid),
+                "an immediate SleepThread should return the current thread id");
+            t.Equals(
+                readGuestU32(
+                    env.rdram.data(),
+                    K_SLEEP_RETURN_ADDR + sizeof(uint32_t)),
+                static_cast<uint32_t>(tid),
+                "the second immediate SleepThread should return the current thread id");
+
+            R5900Context emptyCancelCtx{};
+            setRegU32(emptyCancelCtx, 4, static_cast<uint32_t>(tid));
+            iCancelWakeupThread(
+                env.rdram.data(), &emptyCancelCtx, &env.runtime);
+            t.Equals(
+                getRegS32(emptyCancelCtx, 2),
+                0,
+                "canceling an empty wake count should return zero");
+
+            {
+                PS2Runtime::GuestExecutionScope guestExecution(
+                    &env.runtime, &env.ctx);
+                R5900Context rawWakeCtx{};
+                setRegU32(rawWakeCtx, 4, static_cast<uint32_t>(tid));
+                iWakeupThread(
+                    env.rdram.data(), &rawWakeCtx, &env.runtime);
+                t.Equals(
+                    getRegS32(rawWakeCtx, 2),
+                    tid,
+                    "raw wake should return the worker id");
+
+                R5900Context readyStatusCtx{};
+                setRegU32(
+                    readyStatusCtx, 4, static_cast<uint32_t>(tid));
+                setRegU32(readyStatusCtx, 5, K_STATUS_ADDR);
+                ReferThreadStatus(
+                    env.rdram.data(),
+                    &readyStatusCtx,
+                    &env.runtime);
+                EeThreadStatus readyStatus{};
+                std::memcpy(
+                    &readyStatus,
+                    env.rdram.data() + K_STATUS_ADDR,
+                    sizeof(readyStatus));
+                t.Equals(
+                    getRegS32(readyStatusCtx, 2),
+                    THS_READY,
+                    "raw wake should leave the sleeper ready");
+                t.Equals(
+                    readyStatus.status,
+                    THS_READY,
+                    "raw wake should publish ready status");
+                t.Equals(
+                    readyStatus.waitType,
+                    0u,
+                    "raw wake should clear the sleep wait reason");
+                t.Equals(
+                    readyStatus.wakeupCount,
+                    0u,
+                    "waking a sleeper should not expose an accumulated count");
+                t.Equals(
+                    readGuestU32(env.rdram.data(), K_SLEEP_STAGE_ADDR),
+                    3u,
+                    "raw wake should not dispatch the worker before returning");
+            }
+
+            const bool sleepingAgain = waitUntil([&]()
+            {
+                R5900Context currentStatusCtx{};
+                setRegU32(
+                    currentStatusCtx, 4, static_cast<uint32_t>(tid));
+                setRegU32(currentStatusCtx, 5, K_STATUS_ADDR);
+                ReferThreadStatus(
+                    env.rdram.data(),
+                    &currentStatusCtx,
+                    &env.runtime);
+                return readGuestU32(
+                           env.rdram.data(), K_SLEEP_STAGE_ADDR) == 4u &&
+                       getRegS32(currentStatusCtx, 2) == THS_WAIT;
+            }, std::chrono::milliseconds(200));
+            t.IsTrue(
+                sleepingAgain,
+                "the raw-woken worker should return from sleep and block again");
+            t.Equals(
+                readGuestU32(
+                    env.rdram.data(),
+                    K_SLEEP_RETURN_ADDR + 2u * sizeof(uint32_t)),
+                static_cast<uint32_t>(tid),
+                "a blocking SleepThread should return the current thread id after wake");
+
+            {
+                PS2Runtime::GuestExecutionScope guestExecution(
+                    &env.runtime, &env.ctx);
+                R5900Context wakeCtx{};
+                setRegU32(wakeCtx, 4, static_cast<uint32_t>(tid));
+                WakeupThread(
+                    env.rdram.data(), &wakeCtx, &env.runtime);
+                t.Equals(
+                    getRegS32(wakeCtx, 2),
+                    tid,
+                    "ordinary wake should return the worker id");
+                t.Equals(
+                    readGuestU32(env.rdram.data(), K_SLEEP_STAGE_ADDR),
+                    5u,
+                    "ordinary wake should dispatch the worker before returning");
+            }
+
+            const bool dormant = waitUntil([&]()
+            {
+                R5900Context currentStatusCtx{};
+                setRegU32(
+                    currentStatusCtx, 4, static_cast<uint32_t>(tid));
+                setRegU32(currentStatusCtx, 5, K_STATUS_ADDR);
+                ReferThreadStatus(
+                    env.rdram.data(),
+                    &currentStatusCtx,
+                    &env.runtime);
+                return getRegS32(currentStatusCtx, 2) == THS_DORMANT;
+            }, std::chrono::milliseconds(200));
+            t.IsTrue(dormant, "the worker should finish after its fourth sleep");
+            t.Equals(
+                readGuestU32(
+                    env.rdram.data(),
+                    K_SLEEP_RETURN_ADDR + 3u * sizeof(uint32_t)),
+                static_cast<uint32_t>(tid),
+                "the ordinary-woken SleepThread should return the current thread id");
+
+            setRegU32(env.ctx, 4, static_cast<uint32_t>(tid));
+            DeleteThread(
+                env.rdram.data(), &env.ctx, &env.runtime);
+            t.Equals(
+                getRegS32(env.ctx, 2),
+                tid,
+                "DeleteThread should remove the completed sleep worker");
         });
 
         tc.Run("semaphore EE layout covers poll, signal overflow, and status", [](TestCase &t)
