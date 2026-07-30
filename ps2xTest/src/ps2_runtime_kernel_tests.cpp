@@ -99,6 +99,10 @@ namespace
         0x259c00u;
     constexpr uint32_t K_EXECUTOR_EXTERNAL_CHILD_ENTRY =
         0x259d00u;
+    constexpr uint32_t K_EXECUTOR_SEMA_MAIN_ENTRY =
+        0x259e00u;
+    constexpr uint32_t K_EXECUTOR_SEMA_CHILD_ENTRY =
+        0x259f00u;
 
     std::mutex g_guestWordMutex;
     std::mutex g_alarmCallbackThreadMutex;
@@ -129,6 +133,33 @@ namespace
     int g_executorExternalSleepResult = KE_ERROR;
     bool g_executorExternalMainReturned = false;
     bool g_executorExternalChildReturned = false;
+
+    enum class ExecutorSemaOperation
+    {
+        OrdinarySignal,
+        RawSignal,
+        RawSignalThenDelete,
+        OrdinaryRelease,
+        RawRelease,
+        OrdinaryDelete,
+        RawDelete,
+    };
+
+    std::vector<int> g_executorSemaOrder;
+    ExecutorSemaOperation g_executorSemaOperation =
+        ExecutorSemaOperation::OrdinarySignal;
+    int g_executorSemaId = KE_ERROR;
+    int g_executorSemaChildThreadId = 0;
+    int g_executorSemaWaitResult = KE_ERROR;
+    int g_executorSemaSignalResult = KE_ERROR;
+    int g_executorSemaRawStatus = KE_ERROR;
+    uint32_t g_executorSemaRawWaitType = 0u;
+    uint32_t g_executorSemaRawWaitId = 0u;
+    bool g_executorSemaRawCompletionPending = false;
+    bool g_executorSemaSignalInProgress = false;
+    bool g_executorSemaChildRanInsideSignal = false;
+    bool g_executorSemaMainAttemptedSignal = false;
+    bool g_executorSemaRescued = false;
 
     struct EeThreadStatus
     {
@@ -825,6 +856,240 @@ namespace
         ctx->pc = 0u;
     }
 
+    void dedicatedExecutorSemaChildHandler(
+        uint8_t *rdram,
+        R5900Context *ctx,
+        PS2Runtime *runtime)
+    {
+        {
+            std::lock_guard<std::mutex> lock(
+                g_executorFixtureMutex);
+            g_executorSemaOrder.push_back(1);
+        }
+        WaitSema(rdram, ctx, runtime);
+        {
+            std::lock_guard<std::mutex> lock(
+                g_executorFixtureMutex);
+            g_executorSemaWaitResult =
+                getRegS32(*ctx, 2);
+            g_executorSemaChildRanInsideSignal =
+                g_executorSemaSignalInProgress;
+            g_executorSemaOrder.push_back(2);
+        }
+        ctx->pc = 0u;
+    }
+
+    void dedicatedExecutorSemaMainHandler(
+        uint8_t *rdram,
+        R5900Context *ctx,
+        PS2Runtime *runtime)
+    {
+        InitThread(rdram, ctx, runtime);
+
+        const std::array<uint32_t, 6u>
+            semaphoreParameters{
+                0u,
+                1u,
+                0u,
+                0u,
+                0u,
+                0u,
+            };
+        writeGuestWords(
+            rdram,
+            K_CONTROL_SEMA_PARAM_ADDR,
+            semaphoreParameters.data(),
+            semaphoreParameters.size());
+        setRegU32(
+            *ctx,
+            4,
+            K_CONTROL_SEMA_PARAM_ADDR);
+        CreateSema(rdram, ctx, runtime);
+        const int semaphoreId =
+            getRegS32(*ctx, 2);
+        {
+            std::lock_guard<std::mutex> lock(
+                g_executorFixtureMutex);
+            g_executorSemaId = semaphoreId;
+        }
+
+        setRegU32(
+            *ctx,
+            4,
+            K_EXECUTOR_THREAD_PARAM_ADDR);
+        CreateThread(rdram, ctx, runtime);
+        const int childThreadId =
+            getRegS32(*ctx, 2);
+        {
+            std::lock_guard<std::mutex> lock(
+                g_executorFixtureMutex);
+            g_executorSemaChildThreadId =
+                childThreadId;
+        }
+
+        setRegU32(
+            *ctx,
+            4,
+            static_cast<uint32_t>(
+                childThreadId));
+        setRegU32(
+            *ctx,
+            5,
+            static_cast<uint32_t>(
+                semaphoreId));
+        StartThread(rdram, ctx, runtime);
+
+        {
+            std::lock_guard<std::mutex> lock(
+                g_executorFixtureMutex);
+            g_executorSemaMainAttemptedSignal = true;
+            g_executorSemaSignalInProgress = true;
+        }
+
+        ExecutorSemaOperation operation =
+            ExecutorSemaOperation::OrdinarySignal;
+        {
+            std::lock_guard<std::mutex> lock(
+                g_executorFixtureMutex);
+            operation = g_executorSemaOperation;
+        }
+        const bool raw =
+            operation ==
+                ExecutorSemaOperation::RawSignal ||
+            operation ==
+                ExecutorSemaOperation::
+                    RawSignalThenDelete ||
+            operation ==
+                ExecutorSemaOperation::RawRelease ||
+            operation ==
+                ExecutorSemaOperation::RawDelete;
+        switch (operation)
+        {
+        case ExecutorSemaOperation::OrdinarySignal:
+        case ExecutorSemaOperation::RawSignal:
+            setRegU32(
+                *ctx,
+                4,
+                static_cast<uint32_t>(
+                    semaphoreId));
+            if (raw)
+            {
+                iSignalSema(rdram, ctx, runtime);
+            }
+            else
+            {
+                SignalSema(rdram, ctx, runtime);
+            }
+            break;
+        case ExecutorSemaOperation::
+            RawSignalThenDelete:
+            setRegU32(
+                *ctx,
+                4,
+                static_cast<uint32_t>(
+                    semaphoreId));
+            iSignalSema(rdram, ctx, runtime);
+            setRegU32(
+                *ctx,
+                4,
+                static_cast<uint32_t>(
+                    semaphoreId));
+            iDeleteSema(rdram, ctx, runtime);
+            break;
+        case ExecutorSemaOperation::OrdinaryRelease:
+        case ExecutorSemaOperation::RawRelease:
+            setRegU32(
+                *ctx,
+                4,
+                static_cast<uint32_t>(
+                    childThreadId));
+            if (raw)
+            {
+                iReleaseWaitThread(
+                    rdram, ctx, runtime);
+            }
+            else
+            {
+                ReleaseWaitThread(
+                    rdram, ctx, runtime);
+            }
+            break;
+        case ExecutorSemaOperation::OrdinaryDelete:
+        case ExecutorSemaOperation::RawDelete:
+            setRegU32(
+                *ctx,
+                4,
+                static_cast<uint32_t>(
+                    semaphoreId));
+            if (raw)
+            {
+                iDeleteSema(rdram, ctx, runtime);
+            }
+            else
+            {
+                DeleteSema(rdram, ctx, runtime);
+            }
+            break;
+        }
+
+        int rawStatus = KE_ERROR;
+        uint32_t rawWaitType = 0u;
+        uint32_t rawWaitId = 0u;
+        bool rawCompletionPending = false;
+        if (raw)
+        {
+            R5900Context statusContext{};
+            setRegU32(
+                statusContext,
+                4,
+                static_cast<uint32_t>(
+                    childThreadId));
+            setRegU32(
+                statusContext,
+                5,
+                K_STATUS_ADDR);
+            iReferThreadStatus(
+                rdram,
+                &statusContext,
+                runtime);
+            EeThreadStatus status{};
+            std::memcpy(
+                &status,
+                rdram + K_STATUS_ADDR,
+                sizeof(status));
+            rawStatus = status.status;
+            rawWaitType = status.waitType;
+            rawWaitId = status.waitId;
+            for (const auto &snapshot :
+                 debugThreadSnapshots(runtime))
+            {
+                if (snapshot.id == childThreadId)
+                {
+                    rawCompletionPending =
+                        snapshot
+                            .waitCompletionPending;
+                    break;
+                }
+            }
+        }
+
+        {
+            std::lock_guard<std::mutex> lock(
+                g_executorFixtureMutex);
+            g_executorSemaSignalResult =
+                getRegS32(*ctx, 2);
+            g_executorSemaRawStatus = rawStatus;
+            g_executorSemaRawWaitType =
+                rawWaitType;
+            g_executorSemaRawWaitId = rawWaitId;
+            g_executorSemaRawCompletionPending =
+                rawCompletionPending;
+            g_executorSemaSignalInProgress = false;
+            g_executorSemaOrder.push_back(3);
+        }
+        ctx->pc = 0u;
+    }
+
     struct TestEnv
     {
         std::vector<uint8_t> rdram;
@@ -1377,6 +1642,352 @@ void register_ps2_runtime_kernel_tests()
                     "an external wake should cross the "
                     "executor publication queue and "
                     "resume the sleeping continuation");
+            });
+
+        tc.Run(
+            "fiber semaphore wait preserves signal release and delete boundaries",
+            [](TestCase &t)
+            {
+                if (!eeExecutionBackendBuildInfo()
+                         .boostContextFcontextAvailable)
+                {
+                    return;
+                }
+
+                struct FixtureResult
+                {
+                    bool memoryInitialized = false;
+                    bool completed = false;
+                    bool rescued = false;
+                    std::vector<int> order;
+                    int semaphoreId = KE_ERROR;
+                    int childThreadId = 0;
+                    int waitResult = KE_ERROR;
+                    int operationResult = KE_ERROR;
+                    bool childRanInsideOperation = false;
+                    int rawStatus = KE_ERROR;
+                    uint32_t rawWaitType = 0u;
+                    uint32_t rawWaitId = 0u;
+                    bool rawCompletionPending = false;
+                };
+
+                const auto runFixture =
+                    [](ExecutorSemaOperation operation)
+                    {
+                        FixtureResult result{};
+                        PS2RuntimeConfiguration
+                            configuration{};
+                        configuration.eeExecutionBackend =
+                            EeExecutionBackendKind::
+                                LegacyCppFiber;
+                        PS2Runtime runtime(
+                            configuration);
+                        result.memoryInitialized =
+                            runtime.memory().initialize();
+                        if (!result.memoryInitialized)
+                        {
+                            return result;
+                        }
+                        uint8_t *const rdram =
+                            runtime.memory().getRDRAM();
+                        const std::array<uint32_t, 9u>
+                            threadParameters{
+                                0u,
+                                K_EXECUTOR_SEMA_CHILD_ENTRY,
+                                0x00310000u,
+                                0x800u,
+                                0u,
+                                0u,
+                                0u,
+                                0u,
+                                0u,
+                            };
+                        writeGuestWords(
+                            rdram,
+                            K_EXECUTOR_THREAD_PARAM_ADDR,
+                            threadParameters.data(),
+                            threadParameters.size());
+                        runtime.registerFunction(
+                            K_EXECUTOR_SEMA_MAIN_ENTRY,
+                            &dedicatedExecutorSemaMainHandler);
+                        runtime.registerFunction(
+                            K_EXECUTOR_SEMA_CHILD_ENTRY,
+                            &dedicatedExecutorSemaChildHandler);
+                        runtime.cpu().pc =
+                            K_EXECUTOR_SEMA_MAIN_ENTRY;
+                        setRegU32(
+                            runtime.cpu(),
+                            29,
+                            0x00300000u);
+
+                        {
+                            std::lock_guard<std::mutex>
+                                lock(
+                                    g_executorFixtureMutex);
+                            g_executorSemaOperation =
+                                operation;
+                            g_executorSemaOrder.clear();
+                            g_executorSemaId = KE_ERROR;
+                            g_executorSemaChildThreadId =
+                                0;
+                            g_executorSemaWaitResult =
+                                KE_ERROR;
+                            g_executorSemaSignalResult =
+                                KE_ERROR;
+                            g_executorSemaRawStatus =
+                                KE_ERROR;
+                            g_executorSemaRawWaitType =
+                                0u;
+                            g_executorSemaRawWaitId = 0u;
+                            g_executorSemaRawCompletionPending =
+                                false;
+                            g_executorSemaSignalInProgress =
+                                false;
+                            g_executorSemaChildRanInsideSignal =
+                                false;
+                            g_executorSemaMainAttemptedSignal =
+                                false;
+                            g_executorSemaRescued = false;
+                        }
+
+                        std::thread rescue(
+                            [&runtime, rdram]()
+                            {
+                                const bool created =
+                                    waitUntil(
+                                        []()
+                                        {
+                                            std::lock_guard<
+                                                std::mutex>
+                                                lock(
+                                                    g_executorFixtureMutex);
+                                            return g_executorSemaId >=
+                                                   0;
+                                        },
+                                        std::chrono::
+                                            seconds(1));
+                                if (!created)
+                                {
+                                    return;
+                                }
+                                const bool mainReached =
+                                    waitUntil(
+                                        []()
+                                        {
+                                            std::lock_guard<
+                                                std::mutex>
+                                                lock(
+                                                    g_executorFixtureMutex);
+                                            return g_executorSemaMainAttemptedSignal;
+                                        },
+                                        std::chrono::
+                                            milliseconds(
+                                                200));
+                                if (mainReached)
+                                {
+                                    return;
+                                }
+
+                                int semaphoreId =
+                                    KE_ERROR;
+                                {
+                                    std::lock_guard<
+                                        std::mutex>
+                                        lock(
+                                            g_executorFixtureMutex);
+                                    semaphoreId =
+                                        g_executorSemaId;
+                                }
+                                R5900Context
+                                    signalContext{};
+                                setRegU32(
+                                    signalContext,
+                                    4,
+                                    static_cast<uint32_t>(
+                                        semaphoreId));
+                                iSignalSema(
+                                    rdram,
+                                    &signalContext,
+                                    &runtime);
+                                {
+                                    std::lock_guard<
+                                        std::mutex>
+                                        lock(
+                                            g_executorFixtureMutex);
+                                    g_executorSemaRescued =
+                                        true;
+                                }
+                            });
+
+                        runtime
+                            .startDedicatedEeExecutionForTesting();
+                        result.completed = waitUntil(
+                            []()
+                            {
+                                std::lock_guard<
+                                    std::mutex>
+                                    lock(
+                                        g_executorFixtureMutex);
+                                return g_executorSemaOrder
+                                           .size() == 3u;
+                            },
+                            std::chrono::seconds(2));
+                        rescue.join();
+                        runtime
+                            .stopDedicatedEeExecutionForTesting();
+
+                        {
+                            std::lock_guard<std::mutex>
+                                lock(
+                                    g_executorFixtureMutex);
+                            result.order =
+                                g_executorSemaOrder;
+                            result.semaphoreId =
+                                g_executorSemaId;
+                            result.childThreadId =
+                                g_executorSemaChildThreadId;
+                            result.waitResult =
+                                g_executorSemaWaitResult;
+                            result.operationResult =
+                                g_executorSemaSignalResult;
+                            result.childRanInsideOperation =
+                                g_executorSemaChildRanInsideSignal;
+                            result.rawStatus =
+                                g_executorSemaRawStatus;
+                            result.rawWaitType =
+                                g_executorSemaRawWaitType;
+                            result.rawWaitId =
+                                g_executorSemaRawWaitId;
+                            result.rawCompletionPending =
+                                g_executorSemaRawCompletionPending;
+                            result.rescued =
+                                g_executorSemaRescued;
+                        }
+                        return result;
+                    };
+
+                const std::array<
+                    std::pair<
+                        ExecutorSemaOperation,
+                        const char *>,
+                    7u>
+                    operations{{
+                        {ExecutorSemaOperation::
+                             OrdinarySignal,
+                         "ordinary signal"},
+                        {ExecutorSemaOperation::
+                             RawSignal,
+                         "raw signal"},
+                        {ExecutorSemaOperation::
+                             RawSignalThenDelete,
+                         "raw signal then delete"},
+                        {ExecutorSemaOperation::
+                             OrdinaryRelease,
+                         "ordinary release"},
+                        {ExecutorSemaOperation::
+                             RawRelease,
+                         "raw release"},
+                        {ExecutorSemaOperation::
+                             OrdinaryDelete,
+                         "ordinary delete"},
+                        {ExecutorSemaOperation::
+                             RawDelete,
+                         "raw delete"},
+                    }};
+                for (const auto &[operation, name] :
+                     operations)
+                {
+                    const FixtureResult result =
+                        runFixture(operation);
+                    const bool raw =
+                        operation ==
+                            ExecutorSemaOperation::
+                                RawSignal ||
+                        operation ==
+                            ExecutorSemaOperation::
+                                RawSignalThenDelete ||
+                        operation ==
+                            ExecutorSemaOperation::
+                                RawRelease ||
+                        operation ==
+                            ExecutorSemaOperation::
+                                RawDelete;
+                    const bool signal =
+                        operation ==
+                            ExecutorSemaOperation::
+                                OrdinarySignal ||
+                        operation ==
+                            ExecutorSemaOperation::
+                                RawSignal ||
+                        operation ==
+                            ExecutorSemaOperation::
+                                RawSignalThenDelete;
+                    const bool release =
+                        operation ==
+                            ExecutorSemaOperation::
+                                OrdinaryRelease ||
+                        operation ==
+                            ExecutorSemaOperation::
+                                RawRelease;
+                    const bool rawDelete =
+                        operation ==
+                        ExecutorSemaOperation::
+                            RawDelete;
+
+                    t.IsTrue(
+                        result.memoryInitialized &&
+                            result.completed &&
+                            !result.rescued &&
+                            result.order ==
+                                (raw
+                                     ? std::vector<int>{
+                                           1, 3, 2}
+                                     : std::vector<int>{
+                                           1, 2, 3}),
+                        std::string(name) +
+                            " should release the sole "
+                            "executor with the retained "
+                            "ordinary/raw dispatch order");
+                    t.IsTrue(
+                        result.semaphoreId >= 0 &&
+                            result.waitResult ==
+                                (signal
+                                     ? result.semaphoreId
+                                     : KE_ERROR) &&
+                            result.operationResult ==
+                                (release
+                                     ? result.childThreadId
+                                     : result.semaphoreId) &&
+                            result.childRanInsideOperation ==
+                                !raw,
+                        std::string(name) +
+                            " should preserve syscall "
+                            "results and dispatch timing");
+                    if (raw)
+                    {
+                        t.IsTrue(
+                            result.rawStatus ==
+                                    THS_READY &&
+                                result.rawWaitType ==
+                                    (rawDelete
+                                         ? TSW_SEMA
+                                         : 0u) &&
+                                result.rawWaitId ==
+                                    (rawDelete
+                                         ? static_cast<
+                                               uint32_t>(
+                                               result
+                                                   .semaphoreId)
+                                         : 0u) &&
+                                result
+                                        .rawCompletionPending ==
+                                    rawDelete,
+                            std::string(name) +
+                                " should synchronously "
+                                "publish the retained "
+                                "pre-dispatch status");
+                    }
+                }
             });
 
         tc.Run("host presentation upload state is isolated per runtime", [](TestCase &t)

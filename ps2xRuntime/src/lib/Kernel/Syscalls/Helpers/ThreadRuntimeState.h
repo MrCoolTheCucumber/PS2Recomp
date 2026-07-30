@@ -493,6 +493,12 @@ struct ThreadInfo
 
     std::mutex m;
     std::condition_variable cv;
+    // The dedicated executor consumes the scheduler's completion immediately
+    // before resuming a continuation. Keep one mutex-protected mirror for the
+    // suspended syscall adapter so signal, forced release, deletion, and
+    // timeout remain distinguishable after queue membership is detached.
+    ps2x::ee::EeSchedulerWaitCompletion pendingWaitCompletion =
+        ps2x::ee::EeSchedulerWaitCompletion::None;
     std::atomic<bool> forceRelease{false};
     std::atomic<bool> terminated{false};
 };

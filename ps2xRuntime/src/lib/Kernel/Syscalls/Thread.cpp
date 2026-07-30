@@ -38,6 +38,10 @@ namespace ps2_syscalls
             }
             publication.result =
                 EeThreadWakeResult::WokeSleeper;
+            info->pendingWaitCompletion =
+                ps2x::ee::
+                    EeSchedulerWaitCompletion::
+                        Satisfied;
             info->cv.notify_one();
             break;
         case ps2x::ee::EeSchedulerWakeResult::
@@ -724,6 +728,10 @@ namespace ps2_syscalls
             info->arg = arg;
             info->terminated = false;
             info->forceRelease = false;
+            info->pendingWaitCompletion =
+                ps2x::ee::
+                    EeSchedulerWaitCompletion::
+                        None;
             if (info->stack == 0 && info->stackSize != 0)
             {
                 const uint32_t autoStack = runtime->guestMalloc(info->stackSize, 16u);
@@ -919,6 +927,10 @@ namespace ps2_syscalls
                 std::lock_guard<std::mutex> lock(info->m);
                 info->guestState.makeDormant();
                 info->forceRelease = false;
+                info->pendingWaitCompletion =
+                    ps2x::ee::
+                        EeSchedulerWaitCompletion::
+                            None;
                 info->terminated = false;
             }
 
@@ -1519,6 +1531,10 @@ namespace ps2_syscalls
                                     "wait");
                             }
                             info->forceRelease = false;
+                            info->pendingWaitCompletion =
+                                ps2x::ee::
+                                    EeSchedulerWaitCompletion::
+                                        None;
                             break;
                         case ps2x::ee::
                             EeSchedulerSleepDisposition::
@@ -1564,12 +1580,21 @@ namespace ps2_syscalls
                 terminated = info->terminated.load();
                 if (!terminated)
                 {
+                    const auto completion =
+                        info->pendingWaitCompletion;
+                    info->pendingWaitCompletion =
+                        ps2x::ee::
+                            EeSchedulerWaitCompletion::
+                                None;
                     info->guestState.finishWait(
                         EeThreadWaitQueue::Sleep,
                         TSW_SLEEP,
                         0,
                         false);
-                    if (info->forceRelease.load())
+                    if (completion ==
+                        ps2x::ee::
+                            EeSchedulerWaitCompletion::
+                                Released)
                     {
                         info->forceRelease = false;
                         ret = KE_RELEASE_WAIT;
@@ -2173,6 +2198,145 @@ namespace ps2_syscalls
                 waitType = guest.waitType;
                 waitId = guest.waitId;
             }
+        }
+
+        if (runtime->usesDedicatedEeExecutor() &&
+            (waitType == TSW_SEMA ||
+             waitType == TSW_SLEEP))
+        {
+            const auto sema =
+                waitType == TSW_SEMA
+                    ? lookupSemaInfo(runtime, waitId)
+                    : std::shared_ptr<SemaInfo>{};
+            if (waitType == TSW_SEMA && !sema)
+            {
+                setReturnS32(ctx, KE_NOT_WAIT);
+                return;
+            }
+
+            struct ReleaseTransition
+            {
+                bool released = false;
+                bool applied = false;
+            };
+            const uint32_t generation =
+                info->generation;
+            const auto transition =
+                std::make_shared<ReleaseTransition>();
+            const bool published =
+                runtime->publishEeSchedulerUpdate(
+                    [info,
+                     sema,
+                     tid,
+                     generation,
+                     waitType,
+                     waitId,
+                     transition](
+                        ps2x::ee::EeThreadScheduler
+                            &scheduler)
+                    {
+                        const auto handle =
+                            scheduler.threadHandle(tid);
+                        if (!handle.has_value() ||
+                            handle->generation !=
+                                generation)
+                        {
+                            transition->applied = true;
+                            return;
+                        }
+
+                        const auto applyRelease =
+                            [&]()
+                        {
+                            if (!scheduler
+                                     .releaseWaitThread(
+                                         *handle,
+                                         ps2x::ee::
+                                             EeSchedulerWaitCompletion::
+                                                 Released))
+                            {
+                                return;
+                            }
+
+                            std::lock_guard<std::mutex>
+                                threadLock(info->m);
+                            const EeThreadWaitQueue queue =
+                                waitType == TSW_SEMA
+                                    ? EeThreadWaitQueue::
+                                          Semaphore
+                                    : EeThreadWaitQueue::
+                                          Sleep;
+                            if (!info->guestState
+                                     .releaseWait(
+                                         queue,
+                                         waitType,
+                                         waitId,
+                                         false))
+                            {
+                                throw std::logic_error(
+                                    "ReleaseWaitThread "
+                                    "scheduler and guest "
+                                    "wait queues diverged");
+                            }
+                            info->pendingWaitCompletion =
+                                ps2x::ee::
+                                    EeSchedulerWaitCompletion::
+                                        Released;
+                            info->forceRelease = true;
+                            transition->released = true;
+                        };
+
+                        if (sema)
+                        {
+                            std::lock_guard<std::mutex>
+                                semaLock(sema->m);
+                            applyRelease();
+                            if (transition->released)
+                            {
+                                if (sema->waiters <= 0)
+                                {
+                                    throw std::logic_error(
+                                        "ReleaseWaitThread "
+                                        "lost semaphore "
+                                        "waiter accounting");
+                                }
+                                --sema->waiters;
+                            }
+                        }
+                        else
+                        {
+                            applyRelease();
+                        }
+                        transition->applied = true;
+                    },
+                    reschedule
+                        ? ps2x::ee::
+                              EeSchedulerReschedulePolicy::
+                                  HigherPriorityOnly
+                        : ps2x::ee::
+                              EeSchedulerReschedulePolicy::
+                                  None);
+            if (!published)
+            {
+                setReturnS32(ctx, KE_ERROR);
+                return;
+            }
+
+            runtime->yieldEeExecutorCurrent(
+                ps2x::ee::EeSchedulerExitReason::
+                    Preempted);
+            if (!transition->applied)
+            {
+                throw std::logic_error(
+                    "ReleaseWaitThread resumed before "
+                    "its scheduler transition");
+            }
+            setReturnS32(
+                ctx,
+                transition->released
+                    ? tid
+                    : KE_NOT_WAIT);
+            return;
         }
 
         if (waitType == TSW_SEMA)
