@@ -1438,7 +1438,8 @@ bool PS2Runtime::usesDedicatedEeExecutor() const noexcept
 
 bool PS2Runtime::publishEeSchedulerUpdate(
     std::function<void(
-        ps2x::ee::EeThreadScheduler &)> update)
+        ps2x::ee::EeThreadScheduler &)> update,
+    ps2x::ee::EeSchedulerReschedulePolicy policy)
 {
     if (!m_eeRuntimeExecutor || !update)
     {
@@ -1451,7 +1452,30 @@ bool PS2Runtime::publishEeSchedulerUpdate(
             IEeExecutionBackend &)
         {
             update(scheduler);
-        });
+        },
+        policy);
+}
+
+void PS2Runtime::invokeEeSchedulerUpdateAtBoundary(
+    std::function<void(
+        ps2x::ee::EeThreadScheduler &)> update,
+    ps2x::ee::EeSchedulerReschedulePolicy policy)
+{
+    if (!m_eeRuntimeExecutor || !update)
+    {
+        throw std::logic_error(
+            "EE scheduler boundary invocation requires "
+            "a dedicated executor and a command");
+    }
+
+    m_eeRuntimeExecutor->invokeAtBoundary(
+        [update = std::move(update)](
+            ps2x::ee::EeThreadScheduler &scheduler,
+            IEeExecutionBackend &)
+        {
+            update(scheduler);
+        },
+        policy);
 }
 
 ps2x::timing::EeTickDelta
@@ -1542,6 +1566,16 @@ void PS2Runtime::publishSelectedContext(
     g_currentThreadId = 1;
 }
 
+void PS2Runtime::publishWaitCompletion(
+    int,
+    ps2x::ee::EeSchedulerCompletedWait,
+    ps2x::timing::EeTick)
+{
+    // Live syscall adapters mirror completion while applying the scheduler
+    // transition. The executor consumes the scheduler's retained result here
+    // so a later wait cannot observe the prior completion a second time.
+}
+
 bool PS2Runtime::hasImmediateConsequence(
     ps2x::ee::EeSchedulerConsequenceStage,
     ps2x::timing::EeTick) const
@@ -1549,7 +1583,8 @@ bool PS2Runtime::hasImmediateConsequence(
     return false;
 }
 
-void PS2Runtime::applyNextConsequence(
+ps2x::ee::EeSchedulerReschedulePolicy
+PS2Runtime::applyNextConsequence(
     ps2x::ee::EeSchedulerConsequenceStage,
     ps2x::timing::EeTick,
     ps2x::ee::EeThreadScheduler &)

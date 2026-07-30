@@ -78,10 +78,12 @@ namespace ps2x::ee
                 const std::optional<int>
                     selectionBefore =
                         scheduler.currentThreadId();
-                hooks.applyNextConsequence(
-                    *stage,
-                    result.tick,
-                    scheduler);
+                const EeSchedulerReschedulePolicy
+                    consequencePolicy =
+                        hooks.applyNextConsequence(
+                            *stage,
+                            result.tick,
+                            scheduler);
                 ++result.consequencesProcessed;
                 ++result.stageCounts[
                     eeSchedulerConsequenceStageIndex(
@@ -89,8 +91,7 @@ namespace ps2x::ee
 
                 result.selectedThreadId =
                     scheduler.reschedule(
-                        EeSchedulerReschedulePolicy::
-                            HigherPriorityOnly);
+                        consequencePolicy);
                 if (selectionBefore !=
                     result.selectedThreadId)
                 {

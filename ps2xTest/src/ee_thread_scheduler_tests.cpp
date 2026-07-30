@@ -134,6 +134,13 @@ namespace
                 selectedThreadId.value_or(0));
         }
 
+        void publishWaitCompletion(
+            int,
+            EeSchedulerCompletedWait,
+            ps2x::timing::EeTick) override
+        {
+        }
+
         [[nodiscard]] bool
         hasImmediateConsequence(
             EeSchedulerConsequenceStage stage,
@@ -146,7 +153,9 @@ namespace
                         .empty();
         }
 
-        void applyNextConsequence(
+        [[nodiscard]]
+        EeSchedulerReschedulePolicy
+        applyNextConsequence(
             EeSchedulerConsequenceStage stage,
             ps2x::timing::EeTick,
             EeThreadScheduler &scheduler) override
@@ -158,13 +167,16 @@ namespace
                         stage)];
             if (actions.empty())
             {
-                return;
+                return EeSchedulerReschedulePolicy::
+                    HigherPriorityOnly;
             }
 
             Action action =
                 std::move(actions.front());
             actions.pop_front();
             action(scheduler, *this);
+            return EeSchedulerReschedulePolicy::
+                HigherPriorityOnly;
         }
 
         std::vector<Commit> commits;

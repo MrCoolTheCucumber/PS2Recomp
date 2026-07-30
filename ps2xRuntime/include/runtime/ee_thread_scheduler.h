@@ -234,6 +234,7 @@ namespace ps2x::ee
 
     enum class EeSchedulerReschedulePolicy : uint8_t
     {
+        None,
         HigherPriorityOnly,
         EqualOrHigherPriority,
     };

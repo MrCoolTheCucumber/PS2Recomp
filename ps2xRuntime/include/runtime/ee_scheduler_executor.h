@@ -78,6 +78,14 @@ namespace ps2x::ee
             std::optional<int> selectedThreadId,
             ps2x::timing::EeTick now) = 0;
 
+        // A selected continuation consumes its retained wait completion
+        // immediately before resume. Runtime adapters may mirror the result
+        // into their syscall frame/state, but must not reschedule here.
+        virtual void publishWaitCompletion(
+            int threadId,
+            EeSchedulerCompletedWait completion,
+            ps2x::timing::EeTick now) = 0;
+
         [[nodiscard]] virtual bool
         hasImmediateConsequence(
             EeSchedulerConsequenceStage stage,
@@ -85,7 +93,8 @@ namespace ps2x::ee
 
         // Implementations may publish thread state only through scheduler
         // transitions. Host work is drained here on the one executor.
-        virtual void applyNextConsequence(
+        [[nodiscard]] virtual
+        EeSchedulerReschedulePolicy applyNextConsequence(
             EeSchedulerConsequenceStage stage,
             ps2x::timing::EeTick now,
             EeThreadScheduler &scheduler) = 0;

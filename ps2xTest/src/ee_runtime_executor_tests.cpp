@@ -217,6 +217,112 @@ namespace
             m_plans;
         std::unordered_map<int, Record> m_managed;
     };
+
+    class IdleWakeWindowHooks final
+        : public IEeSchedulerExecutorHooks
+    {
+    public:
+        void commitPriorContext(
+            std::optional<int>,
+            ps2x::timing::EeTickDelta,
+            ps2x::timing::EeTick) override
+        {
+        }
+
+        void publishSelectedContext(
+            std::optional<int>,
+            ps2x::timing::EeTick) override
+        {
+            {
+                std::lock_guard<std::mutex> lock(m_mutex);
+                ++m_boundarySelections;
+            }
+            m_cv.notify_all();
+        }
+
+        void publishWaitCompletion(
+            int,
+            EeSchedulerCompletedWait,
+            ps2x::timing::EeTick) override
+        {
+        }
+
+        [[nodiscard]] bool
+        hasImmediateConsequence(
+            EeSchedulerConsequenceStage stage,
+            ps2x::timing::EeTick) const override
+        {
+            if (stage !=
+                EeSchedulerConsequenceStage::
+                    AsynchronousWake)
+            {
+                return false;
+            }
+
+            std::unique_lock<std::mutex> lock(m_mutex);
+            if (!m_firstProbeEntered)
+            {
+                m_firstProbeEntered = true;
+                m_cv.notify_all();
+                m_cv.wait(
+                    lock,
+                    [this]()
+                    {
+                        return m_releaseFirstProbe;
+                    });
+            }
+            return false;
+        }
+
+        [[nodiscard]]
+        EeSchedulerReschedulePolicy
+        applyNextConsequence(
+            EeSchedulerConsequenceStage,
+            ps2x::timing::EeTick,
+            EeThreadScheduler &) override
+        {
+            throw std::logic_error(
+                "idle wake fixture has no consequence");
+        }
+
+        bool waitForFirstProbe()
+        {
+            return waitFor(
+                m_cv,
+                m_mutex,
+                [this]()
+                {
+                    return m_firstProbeEntered;
+                });
+        }
+
+        void releaseFirstProbe()
+        {
+            {
+                std::lock_guard<std::mutex> lock(m_mutex);
+                m_releaseFirstProbe = true;
+            }
+            m_cv.notify_all();
+        }
+
+        bool waitForSecondBoundary()
+        {
+            return waitFor(
+                m_cv,
+                m_mutex,
+                [this]()
+                {
+                    return m_boundarySelections >= 2;
+                });
+        }
+
+    private:
+        mutable std::mutex m_mutex;
+        mutable std::condition_variable m_cv;
+        mutable bool m_firstProbeEntered = false;
+        mutable bool m_releaseFirstProbe = false;
+        int m_boundarySelections = 0;
+    };
 }
 
 void register_ee_runtime_executor_tests()
@@ -324,6 +430,39 @@ void register_ee_runtime_executor_tests()
                         stats.peakQueuedPublications > 0u,
                     "publication accounting should include "
                     "the final FIFO synchronization command");
+            });
+
+        tc.Run(
+            "idle executor closes notify-before-park window",
+            [](TestCase &t)
+            {
+                ScriptedRuntimeBackend backend;
+                IdleWakeWindowHooks hooks;
+                EeRuntimeExecutor executor(
+                    backend, &hooks);
+                executor.start(
+                    [](EeThreadScheduler &,
+                       IEeExecutionBackend &)
+                    {
+                    });
+
+                const bool reachedWindow =
+                    hooks.waitForFirstProbe();
+                if (reachedWindow)
+                {
+                    executor.notify();
+                }
+                hooks.releaseFirstProbe();
+                const bool processedWake =
+                    hooks.waitForSecondBoundary();
+                executor.requestStop();
+                executor.join();
+                executor.rethrowFailure();
+
+                t.IsTrue(
+                    reachedWindow && processedWake,
+                    "a notify between idle selection and "
+                    "parking must force another boundary");
             });
 
         tc.Run(
@@ -465,6 +604,145 @@ void register_ee_runtime_executor_tests()
                         15u,
                     "both scripted regions should commit "
                     "their elapsed ticks exactly once");
+            });
+
+        tc.Run(
+            "no-reschedule publication returns to its caller",
+            [](TestCase &t)
+            {
+                ScriptedRuntimeBackend backend;
+                EeRuntimeExecutor executor(backend);
+                std::mutex stageMutex;
+                std::condition_variable stageCv;
+                bool callerEntered = false;
+                bool allowBoundary = false;
+                std::vector<int> order;
+
+                backend.plan(
+                    1,
+                    {
+                        [&]()
+                        {
+                            std::unique_lock<std::mutex>
+                                lock(stageMutex);
+                            callerEntered = true;
+                            stageCv.notify_all();
+                            stageCv.wait(
+                                lock,
+                                [&]()
+                                {
+                                    return allowBoundary;
+                                });
+                            return EeSchedulerRunResult{
+                                EeSchedulerExitReason::
+                                    Preempted,
+                                1u,
+                                {},
+                                {}};
+                        },
+                        [&]()
+                        {
+                            {
+                                std::lock_guard<std::mutex>
+                                    lock(stageMutex);
+                                order.push_back(1);
+                            }
+                            stageCv.notify_all();
+                            return EeSchedulerRunResult{
+                                EeSchedulerExitReason::
+                                    Finished,
+                                1u,
+                                {},
+                                {}};
+                        },
+                    });
+                backend.plan(
+                    2,
+                    {
+                        [&]()
+                        {
+                            {
+                                std::lock_guard<std::mutex>
+                                    lock(stageMutex);
+                                order.push_back(2);
+                            }
+                            stageCv.notify_all();
+                            return EeSchedulerRunResult{
+                                EeSchedulerExitReason::
+                                    Finished,
+                                1u,
+                                {},
+                                {}};
+                        },
+                    });
+                executor.start(
+                    [](EeThreadScheduler &scheduler,
+                       IEeExecutionBackend &selectedBackend)
+                    {
+                        selectedBackend.create(1, []()
+                        {
+                        });
+                        selectedBackend.create(2, []()
+                        {
+                        });
+                        if (!scheduler.addRunningThread(
+                                1, 1u, 10) ||
+                            !scheduler.addDormantThread(
+                                2, 1u, 0))
+                        {
+                            throw std::logic_error(
+                                "failed to seed raw "
+                                "publication fixture");
+                        }
+                    });
+                const bool reachedCaller = waitFor(
+                    stageCv,
+                    stageMutex,
+                    [&]()
+                    {
+                        return callerEntered;
+                    });
+                const bool published =
+                    reachedCaller &&
+                    executor.publish(
+                        [](EeThreadScheduler &scheduler,
+                           IEeExecutionBackend &)
+                        {
+                            if (!scheduler.startThread(
+                                    EeSchedulerThreadHandle{
+                                        2,
+                                        1u}))
+                            {
+                                throw std::logic_error(
+                                    "raw publication could "
+                                    "not start target");
+                            }
+                        },
+                        EeSchedulerReschedulePolicy::None);
+                {
+                    std::lock_guard<std::mutex> lock(
+                        stageMutex);
+                    allowBoundary = true;
+                }
+                stageCv.notify_all();
+                const bool completed = waitFor(
+                    stageCv,
+                    stageMutex,
+                    [&]()
+                    {
+                        return order.size() == 2u;
+                    });
+                executor.requestStop();
+                executor.join();
+                executor.rethrowFailure();
+
+                t.IsTrue(
+                    reachedCaller && published &&
+                        completed &&
+                        order == std::vector<int>{1, 2},
+                    "a raw/no-reschedule publication "
+                    "should resume its caller before a "
+                    "new higher-priority target");
             });
 
         tc.Run(

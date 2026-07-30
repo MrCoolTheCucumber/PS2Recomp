@@ -1282,7 +1282,16 @@ public:
     void stopDedicatedEeExecutionForTesting();
     [[nodiscard]] bool publishEeSchedulerUpdate(
         std::function<void(
-            ps2x::ee::EeThreadScheduler &)> update);
+            ps2x::ee::EeThreadScheduler &)> update,
+        ps2x::ee::EeSchedulerReschedulePolicy policy =
+            ps2x::ee::EeSchedulerReschedulePolicy::
+                HigherPriorityOnly);
+    void invokeEeSchedulerUpdateAtBoundary(
+        std::function<void(
+            ps2x::ee::EeThreadScheduler &)> update,
+        ps2x::ee::EeSchedulerReschedulePolicy policy =
+            ps2x::ee::EeSchedulerReschedulePolicy::
+                HigherPriorityOnly);
     void yieldEeExecutorCurrent(
         ps2x::ee::EeSchedulerExitReason reason,
         ps2x::ee::EeSchedulerWaitKey wait = {});
@@ -1405,10 +1414,16 @@ private:
     void publishSelectedContext(
         std::optional<int> selectedThreadId,
         ps2x::timing::EeTick now) override;
+    void publishWaitCompletion(
+        int threadId,
+        ps2x::ee::EeSchedulerCompletedWait completion,
+        ps2x::timing::EeTick now) override;
     [[nodiscard]] bool hasImmediateConsequence(
         ps2x::ee::EeSchedulerConsequenceStage stage,
         ps2x::timing::EeTick now) const override;
-    void applyNextConsequence(
+    [[nodiscard]] ps2x::ee::
+        EeSchedulerReschedulePolicy
+    applyNextConsequence(
         ps2x::ee::EeSchedulerConsequenceStage stage,
         ps2x::timing::EeTick now,
         ps2x::ee::EeThreadScheduler &scheduler) override;

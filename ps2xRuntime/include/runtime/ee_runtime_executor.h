@@ -70,12 +70,20 @@ namespace ps2x::ee
 
         // Queue a host publication without running guest code on the caller.
         // False means stop/failure has closed the executor boundary.
-        [[nodiscard]] bool publish(Command command);
+        [[nodiscard]] bool publish(
+            Command command,
+            EeSchedulerReschedulePolicy policy =
+                EeSchedulerReschedulePolicy::
+                    HigherPriorityOnly);
 
         // Queue one command and wait until the executor applies it at a
         // boundary. This is intended for lifecycle operations and bounded
         // tests, not for a guest continuation running on the executor thread.
-        void invokeAtBoundary(Command command);
+        void invokeAtBoundary(
+            Command command,
+            EeSchedulerReschedulePolicy policy =
+                EeSchedulerReschedulePolicy::
+                    HigherPriorityOnly);
 
         // Wake an idle executor after an external hook published work without
         // using publish(). The hook still applies that work at its declared

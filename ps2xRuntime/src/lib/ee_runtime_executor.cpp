@@ -31,6 +31,13 @@ namespace ps2x::ee
             {
             }
 
+            void publishWaitCompletion(
+                int,
+                EeSchedulerCompletedWait,
+                ps2x::timing::EeTick) override
+            {
+            }
+
             [[nodiscard]] bool
             hasImmediateConsequence(
                 EeSchedulerConsequenceStage,
@@ -39,7 +46,9 @@ namespace ps2x::ee
                 return false;
             }
 
-            void applyNextConsequence(
+            [[nodiscard]]
+            EeSchedulerReschedulePolicy
+            applyNextConsequence(
                 EeSchedulerConsequenceStage,
                 ps2x::timing::EeTick,
                 EeThreadScheduler &) override
@@ -158,7 +167,9 @@ namespace ps2x::ee
             }
         }
 
-        [[nodiscard]] bool publish(Command command)
+        [[nodiscard]] bool publish(
+            Command command,
+            EeSchedulerReschedulePolicy policy)
         {
             if (!command)
             {
@@ -177,7 +188,8 @@ namespace ps2x::ee
                 m_publications.push_back(
                     Publication{
                         std::move(command),
-                        {}});
+                        {},
+                        policy});
                 ++m_statistics.publicationsQueued;
                 m_statistics.peakQueuedPublications =
                     std::max(
@@ -190,7 +202,9 @@ namespace ps2x::ee
             return true;
         }
 
-        void invokeAtBoundary(Command command)
+        void invokeAtBoundary(
+            Command command,
+            EeSchedulerReschedulePolicy policy)
         {
             if (!command)
             {
@@ -223,7 +237,8 @@ namespace ps2x::ee
                 m_publications.push_back(
                     Publication{
                         std::move(command),
-                        completion});
+                        completion,
+                        policy});
                 ++m_statistics.publicationsQueued;
                 m_statistics.peakQueuedPublications =
                     std::max(
@@ -368,6 +383,15 @@ namespace ps2x::ee
                 selectedThreadId, now);
         }
 
+        void publishWaitCompletion(
+            int threadId,
+            EeSchedulerCompletedWait completion,
+            ps2x::timing::EeTick now) override
+        {
+            m_hooks->publishWaitCompletion(
+                threadId, completion, now);
+        }
+
         [[nodiscard]] bool
         hasImmediateConsequence(
             EeSchedulerConsequenceStage stage,
@@ -384,26 +408,32 @@ namespace ps2x::ee
                 stage, now);
         }
 
-        void applyNextConsequence(
+        [[nodiscard]]
+        EeSchedulerReschedulePolicy
+        applyNextConsequence(
             EeSchedulerConsequenceStage stage,
             ps2x::timing::EeTick now,
             EeThreadScheduler &scheduler) override
         {
             if (stage ==
                     EeSchedulerConsequenceStage::
-                        AsynchronousWake &&
-                applyQueuedPublication())
+                        AsynchronousWake)
             {
-                return;
+                const auto publicationPolicy =
+                    applyQueuedPublication();
+                if (publicationPolicy.has_value())
+                {
+                    return *publicationPolicy;
+                }
             }
             if (stage ==
                     EeSchedulerConsequenceStage::
                         AsynchronousWake &&
                 stopRequested())
             {
-                return;
+                return EeSchedulerReschedulePolicy::None;
             }
-            m_hooks->applyNextConsequence(
+            return m_hooks->applyNextConsequence(
                 stage, now, scheduler);
         }
 
@@ -413,6 +443,9 @@ namespace ps2x::ee
             Command command;
             std::shared_ptr<std::promise<void>>
                 completion;
+            EeSchedulerReschedulePolicy policy =
+                EeSchedulerReschedulePolicy::
+                    HigherPriorityOnly;
         };
 
         [[nodiscard]] bool isExecutorThread() const
@@ -432,7 +465,9 @@ namespace ps2x::ee
                    !m_publications.empty();
         }
 
-        [[nodiscard]] bool applyQueuedPublication()
+        [[nodiscard]] std::optional<
+            EeSchedulerReschedulePolicy>
+        applyQueuedPublication()
         {
             Publication publication;
             {
@@ -440,7 +475,7 @@ namespace ps2x::ee
                 if (m_stopRequested ||
                     m_publications.empty())
                 {
-                    return false;
+                    return std::nullopt;
                 }
                 publication =
                     std::move(m_publications.front());
@@ -471,7 +506,7 @@ namespace ps2x::ee
                 }
                 throw;
             }
-            return true;
+            return publication.policy;
         }
 
         void cacheBoundary(
@@ -563,6 +598,8 @@ namespace ps2x::ee
                 std::exception_ptr pendingGuestFailure;
                 for (;;)
                 {
+                    const uint64_t observedWakeGeneration =
+                        wakeGeneration();
                     if (stopRequested() &&
                         !priorThreadId.has_value())
                     {
@@ -615,12 +652,34 @@ namespace ps2x::ee
                         !boundary.selectedThreadId
                              .has_value())
                     {
-                        waitForWork(wakeGeneration());
+                        waitForWork(
+                            observedWakeGeneration);
                         continue;
                     }
                     if (stopRequested())
                     {
                         break;
+                    }
+
+                    const auto selectedHandle =
+                        m_scheduler.threadHandle(
+                            *boundary.selectedThreadId);
+                    if (!selectedHandle.has_value())
+                    {
+                        throw std::logic_error(
+                            "EE executor selected a thread "
+                            "without a valid handle");
+                    }
+                    const auto waitCompletion =
+                        m_scheduler
+                            .consumeWaitCompletion(
+                                *selectedHandle);
+                    if (waitCompletion.has_value())
+                    {
+                        publishWaitCompletion(
+                            selectedHandle->id,
+                            *waitCompletion,
+                            boundary.tick);
                     }
 
                     const auto dispatch =
@@ -805,15 +864,20 @@ namespace ps2x::ee
         m_impl->start(std::move(setup));
     }
 
-    bool EeRuntimeExecutor::publish(Command command)
+    bool EeRuntimeExecutor::publish(
+        Command command,
+        EeSchedulerReschedulePolicy policy)
     {
-        return m_impl->publish(std::move(command));
+        return m_impl->publish(
+            std::move(command), policy);
     }
 
     void EeRuntimeExecutor::invokeAtBoundary(
-        Command command)
+        Command command,
+        EeSchedulerReschedulePolicy policy)
     {
-        m_impl->invokeAtBoundary(std::move(command));
+        m_impl->invokeAtBoundary(
+            std::move(command), policy);
     }
 
     void EeRuntimeExecutor::notify() noexcept

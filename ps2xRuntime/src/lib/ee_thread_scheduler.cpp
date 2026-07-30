@@ -1158,6 +1158,11 @@ namespace ps2x::ee
 
         const int currentPriority =
             currentIt->second.priority;
+        if (policy ==
+            EeSchedulerReschedulePolicy::None)
+        {
+            return threadId;
+        }
         const bool shouldPreempt =
             *readyPriority < currentPriority ||
             (policy ==
