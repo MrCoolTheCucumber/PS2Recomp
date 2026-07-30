@@ -23,3 +23,6 @@ android/app/.cxx/
 android/local.properties
 android/.gradle/ 
 .idea/
+
+# Local ledger for reviews of ran-j/PS2Recomp.
+/UPSTREAM.md
