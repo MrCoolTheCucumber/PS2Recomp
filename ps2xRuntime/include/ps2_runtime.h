@@ -1280,6 +1280,13 @@ public:
     // presentation loop.
     void startDedicatedEeExecutionForTesting();
     void stopDedicatedEeExecutionForTesting();
+    [[nodiscard]] bool publishEeExecutorUpdate(
+        std::function<void(
+            ps2x::ee::EeThreadScheduler &,
+            IEeExecutionBackend &)> update,
+        ps2x::ee::EeSchedulerReschedulePolicy policy =
+            ps2x::ee::EeSchedulerReschedulePolicy::
+                HigherPriorityOnly);
     [[nodiscard]] bool publishEeSchedulerUpdate(
         std::function<void(
             ps2x::ee::EeThreadScheduler &)> update,

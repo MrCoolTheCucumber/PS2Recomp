@@ -1436,9 +1436,10 @@ bool PS2Runtime::usesDedicatedEeExecutor() const noexcept
     return m_eeRuntimeExecutor != nullptr;
 }
 
-bool PS2Runtime::publishEeSchedulerUpdate(
+bool PS2Runtime::publishEeExecutorUpdate(
     std::function<void(
-        ps2x::ee::EeThreadScheduler &)> update,
+        ps2x::ee::EeThreadScheduler &,
+        IEeExecutionBackend &)> update,
     ps2x::ee::EeSchedulerReschedulePolicy policy)
 {
     if (!m_eeRuntimeExecutor || !update)
@@ -1447,6 +1448,20 @@ bool PS2Runtime::publishEeSchedulerUpdate(
     }
 
     return m_eeRuntimeExecutor->publish(
+        std::move(update), policy);
+}
+
+bool PS2Runtime::publishEeSchedulerUpdate(
+    std::function<void(
+        ps2x::ee::EeThreadScheduler &)> update,
+    ps2x::ee::EeSchedulerReschedulePolicy policy)
+{
+    if (!update)
+    {
+        return false;
+    }
+
+    return publishEeExecutorUpdate(
         [update = std::move(update)](
             ps2x::ee::EeThreadScheduler &scheduler,
             IEeExecutionBackend &)

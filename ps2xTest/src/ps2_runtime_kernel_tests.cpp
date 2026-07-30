@@ -125,6 +125,12 @@ namespace
         0x25a500u;
     constexpr uint32_t K_EXECUTOR_SUSPEND_CHILD_ENTRY =
         0x25a600u;
+    constexpr uint32_t K_EXECUTOR_TERMINATE_MAIN_ENTRY =
+        0x25a700u;
+    constexpr uint32_t K_EXECUTOR_TERMINATE_CANDIDATE_ENTRY =
+        0x25a800u;
+    constexpr uint32_t K_EXECUTOR_TERMINATE_TARGET_ENTRY =
+        0x25a900u;
 
     std::mutex g_guestWordMutex;
     std::mutex g_alarmCallbackThreadMutex;
@@ -235,6 +241,26 @@ namespace
     int g_executorSuspendStatusBeforeWake = KE_ERROR;
     int g_executorSuspendStatusAfterWake = KE_ERROR;
 
+    enum class ExecutorTerminateOperation
+    {
+        OrdinarySemaphore,
+        RawSemaphore,
+        OrdinaryEvent,
+        RawEvent,
+    };
+
+    std::vector<int> g_executorTerminateOrder;
+    ExecutorTerminateOperation g_executorTerminateOperation =
+        ExecutorTerminateOperation::OrdinarySemaphore;
+    int g_executorTerminateObjectId = KE_ERROR;
+    int g_executorTerminateCandidateThreadId = 0;
+    int g_executorTerminateTargetThreadId = 0;
+    int g_executorTerminateResult = KE_ERROR;
+    int g_executorTerminateStatus = KE_ERROR;
+    int g_executorTerminateWaiters = -1;
+    int g_executorTerminateDeleteResult = KE_ERROR;
+    bool g_executorTerminateTargetReturned = false;
+
     struct EeThreadStatus
     {
         int32_t status;
@@ -261,8 +287,20 @@ namespace
         uint32_t option;
     };
 
+    struct EeEventStatus
+    {
+        uint32_t attr;
+        uint32_t option;
+        uint32_t initBits;
+        uint32_t currBits;
+        int32_t numThreads;
+        int32_t reserved1;
+        int32_t reserved2;
+    };
+
     static_assert(sizeof(EeThreadStatus) == 0x30u, "Unexpected ee_thread_status_t size.");
     static_assert(sizeof(EeSemaStatus) == 0x18u, "Unexpected ee_sema_t size.");
+    static_assert(sizeof(EeEventStatus) == 0x1Cu, "Unexpected ee_event_status_t size.");
 
     void setRegU32(R5900Context &ctx, int reg, uint32_t value)
     {
@@ -1760,6 +1798,300 @@ namespace
             g_executorSuspendResumeResult =
                 getRegS32(*ctx, 2);
             g_executorSuspendOrder.push_back(4);
+        }
+        ctx->pc = 0u;
+    }
+
+    void dedicatedExecutorTerminateCandidateHandler(
+        uint8_t *rdram,
+        R5900Context *ctx,
+        PS2Runtime *runtime)
+    {
+        {
+            std::lock_guard<std::mutex> lock(
+                g_executorFixtureMutex);
+            g_executorTerminateOrder.push_back(1);
+        }
+        SleepThread(rdram, ctx, runtime);
+        {
+            std::lock_guard<std::mutex> lock(
+                g_executorFixtureMutex);
+            g_executorTerminateOrder.push_back(4);
+        }
+        ctx->pc = 0u;
+    }
+
+    void dedicatedExecutorTerminateTargetHandler(
+        uint8_t *rdram,
+        R5900Context *ctx,
+        PS2Runtime *runtime)
+    {
+        ExecutorTerminateOperation operation;
+        {
+            std::lock_guard<std::mutex> lock(
+                g_executorFixtureMutex);
+            operation = g_executorTerminateOperation;
+            g_executorTerminateOrder.push_back(2);
+        }
+        const bool event =
+            operation ==
+                ExecutorTerminateOperation::OrdinaryEvent ||
+            operation ==
+                ExecutorTerminateOperation::RawEvent;
+        if (event)
+        {
+            const uint32_t eventId = ::getRegU32(ctx, 4);
+            setRegU32(*ctx, 4, eventId);
+            setRegU32(*ctx, 5, 0x4u);
+            setRegU32(*ctx, 6, 1u);
+            setRegU32(*ctx, 7, 0u);
+            WaitEventFlag(rdram, ctx, runtime);
+        }
+        else
+        {
+            WaitSema(rdram, ctx, runtime);
+        }
+
+        {
+            std::lock_guard<std::mutex> lock(
+                g_executorFixtureMutex);
+            g_executorTerminateTargetReturned = true;
+        }
+        ctx->pc = 0u;
+    }
+
+    void dedicatedExecutorTerminateMainHandler(
+        uint8_t *rdram,
+        R5900Context *ctx,
+        PS2Runtime *runtime)
+    {
+        InitThread(rdram, ctx, runtime);
+
+        ExecutorTerminateOperation operation;
+        {
+            std::lock_guard<std::mutex> lock(
+                g_executorFixtureMutex);
+            operation = g_executorTerminateOperation;
+        }
+        const bool event =
+            operation ==
+                ExecutorTerminateOperation::OrdinaryEvent ||
+            operation ==
+                ExecutorTerminateOperation::RawEvent;
+        const bool raw =
+            operation ==
+                ExecutorTerminateOperation::RawSemaphore ||
+            operation ==
+                ExecutorTerminateOperation::RawEvent;
+
+        int objectId = KE_ERROR;
+        if (event)
+        {
+            const std::array<uint32_t, 3u>
+                eventParameters{
+                    0x2u,
+                    0u,
+                    0u,
+                };
+            writeGuestWords(
+                rdram,
+                K_CONTROL_EVENT_PARAM_ADDR,
+                eventParameters.data(),
+                eventParameters.size());
+            setRegU32(
+                *ctx,
+                4,
+                K_CONTROL_EVENT_PARAM_ADDR);
+            CreateEventFlag(rdram, ctx, runtime);
+            objectId = getRegS32(*ctx, 2);
+        }
+        else
+        {
+            const std::array<uint32_t, 6u>
+                semaphoreParameters{
+                    0u,
+                    1u,
+                    0u,
+                    0u,
+                    0u,
+                    0u,
+                };
+            writeGuestWords(
+                rdram,
+                K_CONTROL_SEMA_PARAM_ADDR,
+                semaphoreParameters.data(),
+                semaphoreParameters.size());
+            setRegU32(
+                *ctx,
+                4,
+                K_CONTROL_SEMA_PARAM_ADDR);
+            CreateSema(rdram, ctx, runtime);
+            objectId = getRegS32(*ctx, 2);
+        }
+        {
+            std::lock_guard<std::mutex> lock(
+                g_executorFixtureMutex);
+            g_executorTerminateObjectId = objectId;
+        }
+
+        const auto createThread =
+            [&](uint32_t entry, uint32_t stack)
+            {
+                const std::array<uint32_t, 9u>
+                    threadParameters{
+                        0u,
+                        entry,
+                        stack,
+                        0x800u,
+                        0u,
+                        0u,
+                        0u,
+                        0u,
+                        0u,
+                    };
+                writeGuestWords(
+                    rdram,
+                    K_EXECUTOR_THREAD_PARAM_ADDR,
+                    threadParameters.data(),
+                    threadParameters.size());
+                setRegU32(
+                    *ctx,
+                    4,
+                    K_EXECUTOR_THREAD_PARAM_ADDR);
+                CreateThread(rdram, ctx, runtime);
+                return getRegS32(*ctx, 2);
+            };
+
+        const int candidateThreadId =
+            createThread(
+                K_EXECUTOR_TERMINATE_CANDIDATE_ENTRY,
+                0x00310000u);
+        const int targetThreadId =
+            createThread(
+                K_EXECUTOR_TERMINATE_TARGET_ENTRY,
+                0x00311000u);
+        {
+            std::lock_guard<std::mutex> lock(
+                g_executorFixtureMutex);
+            g_executorTerminateCandidateThreadId =
+                candidateThreadId;
+            g_executorTerminateTargetThreadId =
+                targetThreadId;
+        }
+
+        setRegU32(
+            *ctx,
+            4,
+            static_cast<uint32_t>(candidateThreadId));
+        setRegU32(*ctx, 5, 0u);
+        StartThread(rdram, ctx, runtime);
+        setRegU32(
+            *ctx,
+            4,
+            static_cast<uint32_t>(targetThreadId));
+        setRegU32(
+            *ctx,
+            5,
+            static_cast<uint32_t>(objectId));
+        StartThread(rdram, ctx, runtime);
+
+        setRegU32(
+            *ctx,
+            4,
+            static_cast<uint32_t>(candidateThreadId));
+        iWakeupThread(rdram, ctx, runtime);
+        {
+            std::lock_guard<std::mutex> lock(
+                g_executorFixtureMutex);
+            g_executorTerminateOrder.push_back(3);
+        }
+
+        setRegU32(
+            *ctx,
+            4,
+            static_cast<uint32_t>(targetThreadId));
+        if (raw)
+        {
+            iTerminateThread(rdram, ctx, runtime);
+        }
+        else
+        {
+            TerminateThread(rdram, ctx, runtime);
+        }
+        {
+            std::lock_guard<std::mutex> lock(
+                g_executorFixtureMutex);
+            g_executorTerminateResult =
+                getRegS32(*ctx, 2);
+        }
+
+        R5900Context statusContext{};
+        setRegU32(
+            statusContext,
+            4,
+            static_cast<uint32_t>(targetThreadId));
+        setRegU32(
+            statusContext,
+            5,
+            K_STATUS_ADDR);
+        iReferThreadStatus(
+            rdram,
+            &statusContext,
+            runtime);
+        const int targetStatus =
+            getRegS32(statusContext, 2);
+
+        setRegU32(
+            statusContext,
+            4,
+            static_cast<uint32_t>(objectId));
+        setRegU32(
+            statusContext,
+            5,
+            K_STATUS_ADDR);
+        int waiters = -1;
+        if (event)
+        {
+            iReferEventFlagStatus(
+                rdram,
+                &statusContext,
+                runtime);
+            EeEventStatus status{};
+            std::memcpy(
+                &status,
+                rdram + K_STATUS_ADDR,
+                sizeof(status));
+            waiters = status.numThreads;
+        }
+        else
+        {
+            iReferSemaStatus(
+                rdram,
+                &statusContext,
+                runtime);
+            EeSemaStatus status{};
+            std::memcpy(
+                &status,
+                rdram + K_STATUS_ADDR,
+                sizeof(status));
+            waiters = status.wait_threads;
+        }
+
+        setRegU32(
+            *ctx,
+            4,
+            static_cast<uint32_t>(targetThreadId));
+        DeleteThread(rdram, ctx, runtime);
+        {
+            std::lock_guard<std::mutex> lock(
+                g_executorFixtureMutex);
+            g_executorTerminateStatus =
+                targetStatus;
+            g_executorTerminateWaiters =
+                waiters;
+            g_executorTerminateDeleteResult =
+                getRegS32(*ctx, 2);
+            g_executorTerminateOrder.push_back(5);
         }
         ctx->pc = 0u;
     }
@@ -3309,6 +3641,255 @@ void register_ps2_runtime_kernel_tests()
                                 " should move WAIT through "
                                 "WAITSUSPEND to SUSPEND");
                     }
+                }
+            });
+
+        tc.Run(
+            "fiber termination retires blocked continuations",
+            [](TestCase &t)
+            {
+                if (!eeExecutionBackendBuildInfo()
+                         .boostContextFcontextAvailable)
+                {
+                    return;
+                }
+
+                struct FixtureResult
+                {
+                    bool memoryInitialized = false;
+                    bool completed = false;
+                    std::vector<int> order;
+                    int objectId = KE_ERROR;
+                    int candidateThreadId = 0;
+                    int targetThreadId = 0;
+                    int terminateResult = KE_ERROR;
+                    int targetStatus = KE_ERROR;
+                    int waiters = -1;
+                    int deleteResult = KE_ERROR;
+                    bool targetReturned = false;
+                    bool schedulerTargetPresent = true;
+                    size_t managedContinuations = 1u;
+                };
+
+                const auto runFixture =
+                    [](ExecutorTerminateOperation operation)
+                    {
+                        FixtureResult result{};
+                        PS2RuntimeConfiguration
+                            configuration{};
+                        configuration.eeExecutionBackend =
+                            EeExecutionBackendKind::
+                                LegacyCppFiber;
+                        PS2Runtime runtime(configuration);
+                        result.memoryInitialized =
+                            runtime.memory().initialize();
+                        if (!result.memoryInitialized)
+                        {
+                            return result;
+                        }
+                        uint8_t *const rdram =
+                            runtime.memory().getRDRAM();
+                        runtime.registerFunction(
+                            K_EXECUTOR_TERMINATE_MAIN_ENTRY,
+                            &dedicatedExecutorTerminateMainHandler);
+                        runtime.registerFunction(
+                            K_EXECUTOR_TERMINATE_CANDIDATE_ENTRY,
+                            &dedicatedExecutorTerminateCandidateHandler);
+                        runtime.registerFunction(
+                            K_EXECUTOR_TERMINATE_TARGET_ENTRY,
+                            &dedicatedExecutorTerminateTargetHandler);
+                        runtime.cpu().pc =
+                            K_EXECUTOR_TERMINATE_MAIN_ENTRY;
+                        setRegU32(
+                            runtime.cpu(),
+                            29,
+                            0x00300000u);
+
+                        {
+                            std::lock_guard<std::mutex>
+                                lock(
+                                    g_executorFixtureMutex);
+                            g_executorTerminateOperation =
+                                operation;
+                            g_executorTerminateOrder.clear();
+                            g_executorTerminateObjectId =
+                                KE_ERROR;
+                            g_executorTerminateCandidateThreadId =
+                                0;
+                            g_executorTerminateTargetThreadId =
+                                0;
+                            g_executorTerminateResult =
+                                KE_ERROR;
+                            g_executorTerminateStatus =
+                                KE_ERROR;
+                            g_executorTerminateWaiters =
+                                -1;
+                            g_executorTerminateDeleteResult =
+                                KE_ERROR;
+                            g_executorTerminateTargetReturned =
+                                false;
+                        }
+
+                        runtime
+                            .startDedicatedEeExecutionForTesting();
+                        result.completed = waitUntil(
+                            []()
+                            {
+                                std::lock_guard<
+                                    std::mutex>
+                                    lock(
+                                        g_executorFixtureMutex);
+                                return g_executorTerminateOrder
+                                           .size() == 5u;
+                            },
+                            std::chrono::seconds(2));
+                        const bool continuationsRetired =
+                            waitUntil(
+                                [&runtime]()
+                                {
+                                    return runtime
+                                               .managedEeExecutionThreadCountForTesting() ==
+                                           0u;
+                                },
+                                std::chrono::
+                                    milliseconds(200));
+
+                        int targetThreadId = 0;
+                        {
+                            std::lock_guard<std::mutex>
+                                lock(
+                                    g_executorFixtureMutex);
+                            targetThreadId =
+                                g_executorTerminateTargetThreadId;
+                        }
+                        std::optional<
+                            ps2x::ee::
+                                EeSchedulerThreadSnapshot>
+                            schedulerTarget;
+                        runtime
+                            .invokeEeSchedulerUpdateAtBoundary(
+                                [&schedulerTarget,
+                                 targetThreadId](
+                                    ps2x::ee::
+                                        EeThreadScheduler
+                                            &scheduler)
+                                {
+                                    schedulerTarget =
+                                        scheduler.thread(
+                                            targetThreadId);
+                                },
+                                ps2x::ee::
+                                    EeSchedulerReschedulePolicy::
+                                        None);
+                        result.schedulerTargetPresent =
+                            schedulerTarget.has_value();
+                        result.managedContinuations =
+                            runtime
+                                .managedEeExecutionThreadCountForTesting();
+                        runtime
+                            .stopDedicatedEeExecutionForTesting();
+
+                        {
+                            std::lock_guard<std::mutex>
+                                lock(
+                                    g_executorFixtureMutex);
+                            result.order =
+                                g_executorTerminateOrder;
+                            result.objectId =
+                                g_executorTerminateObjectId;
+                            result.candidateThreadId =
+                                g_executorTerminateCandidateThreadId;
+                            result.targetThreadId =
+                                g_executorTerminateTargetThreadId;
+                            result.terminateResult =
+                                g_executorTerminateResult;
+                            result.targetStatus =
+                                g_executorTerminateStatus;
+                            result.waiters =
+                                g_executorTerminateWaiters;
+                            result.deleteResult =
+                                g_executorTerminateDeleteResult;
+                            result.targetReturned =
+                                g_executorTerminateTargetReturned;
+                        }
+                        if (!continuationsRetired)
+                        {
+                            result.managedContinuations =
+                                std::max<size_t>(
+                                    1u,
+                                    result
+                                        .managedContinuations);
+                        }
+                        return result;
+                    };
+
+                const std::array<
+                    std::pair<
+                        ExecutorTerminateOperation,
+                        const char *>,
+                    4u>
+                    operations{{
+                        {ExecutorTerminateOperation::
+                             OrdinarySemaphore,
+                         "ordinary semaphore termination"},
+                        {ExecutorTerminateOperation::
+                             RawSemaphore,
+                         "raw semaphore termination"},
+                        {ExecutorTerminateOperation::
+                             OrdinaryEvent,
+                         "ordinary event termination"},
+                        {ExecutorTerminateOperation::
+                             RawEvent,
+                         "raw event termination"},
+                    }};
+                for (const auto &[operation, name] :
+                     operations)
+                {
+                    const FixtureResult result =
+                        runFixture(operation);
+                    const bool raw =
+                        operation ==
+                            ExecutorTerminateOperation::
+                                RawSemaphore ||
+                        operation ==
+                            ExecutorTerminateOperation::
+                                RawEvent;
+                    const std::vector<int> expectedOrder =
+                        raw
+                            ? std::vector<int>{
+                                  1, 2, 3, 5, 4}
+                            : std::vector<int>{
+                                  1, 2, 3, 4, 5};
+
+                    t.IsTrue(
+                        result.memoryInitialized &&
+                            result.completed &&
+                            result.order == expectedOrder,
+                        std::string(name) +
+                            " should preserve the "
+                            "ordinary/raw boundary");
+                    t.IsTrue(
+                        result.objectId >= 0 &&
+                            result.candidateThreadId > 1 &&
+                            result.targetThreadId > 1 &&
+                            result.terminateResult ==
+                                result.targetThreadId &&
+                            result.targetStatus ==
+                                THS_DORMANT &&
+                            result.waiters == 0 &&
+                            !result.targetReturned,
+                        std::string(name) +
+                            " should synchronously publish "
+                            "DORMANT and unlink its wait");
+                    t.IsTrue(
+                        result.deleteResult ==
+                                result.targetThreadId &&
+                            !result.schedulerTargetPresent &&
+                            result.managedContinuations ==
+                                0u,
+                        std::string(name) +
+                            " should delete scheduler "
+                            "ownership and its fiber");
                 }
             });
 
