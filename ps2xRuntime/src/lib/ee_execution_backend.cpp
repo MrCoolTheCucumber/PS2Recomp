@@ -1,7 +1,26 @@
 #include "runtime/ee_execution_backend.h"
 
+#ifndef PS2X_HAS_EE_CPP_FIBER_BACKEND
+#define PS2X_HAS_EE_CPP_FIBER_BACKEND 0
+#endif
+
+#if PS2X_HAS_EE_CPP_FIBER_BACKEND
+#include <boost/version.hpp>
+
+#if BOOST_VERSION != 109100
+#error "The EE fiber backend requires exact Boost 1.91.0"
+#endif
+#if defined(BOOST_USE_UCONTEXT)
+#error "Production EE fibers must not select Boost.Context ucontext"
+#endif
+#if defined(BOOST_USE_WINFIB)
+#error "Production EE fibers must not select Boost.Context WinFiber"
+#endif
+#endif
+
 #include <atomic>
 #include <mutex>
+#include <sstream>
 #include <stdexcept>
 #include <thread>
 #include <unordered_map>
@@ -222,4 +241,46 @@ createEeExecutionBackend(EeExecutionBackendKind kind)
 
     throw std::invalid_argument(
         "unsupported EE execution backend");
+}
+
+EeExecutionBackendBuildInfo
+eeExecutionBackendBuildInfo() noexcept
+{
+#if PS2X_HAS_EE_CPP_FIBER_BACKEND
+    return {
+        true,
+        PS2X_EE_BOOST_VERSION,
+        PS2X_EE_BOOST_CONTEXT_ARCHITECTURE,
+        PS2X_EE_BOOST_CONTEXT_BINARY_FORMAT,
+        PS2X_EE_BOOST_CONTEXT_ABI,
+        PS2X_EE_BOOST_CONTEXT_IMPLEMENTATION};
+#else
+    return {};
+#endif
+}
+
+std::string eeExecutionBackendDiagnostics(
+    EeExecutionBackendKind selected)
+{
+    const std::string_view selectedName =
+        selected ==
+                EeExecutionBackendKind::LegacyHostThread
+            ? std::string_view{"legacy-host-thread"}
+            : std::string_view{"unknown"};
+    const EeExecutionBackendBuildInfo build =
+        eeExecutionBackendBuildInfo();
+
+    std::ostringstream out;
+    out << "selected=" << selectedName
+        << ", Boost.Context="
+        << (build.boostContextFcontextAvailable
+                ? "available"
+                : "unavailable")
+        << ", Boost=" << build.boostVersion
+        << ", architecture=" << build.architecture
+        << ", binary-format=" << build.binaryFormat
+        << ", ABI=" << build.abi
+        << ", context-implementation="
+        << build.contextImplementation;
+    return out.str();
 }

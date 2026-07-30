@@ -21,6 +21,9 @@ option(PS2X_ENABLE_VU_X64_RECOMPILER
     "Build the production x86-64 VU dynamic recompiler when supported" ON)
 option(PS2X_ENABLE_GS_AVX2_KERNEL
     "Build the runtime-dispatched AVX2 GS packed-sprite kernel" ON)
+option(PS2X_ENABLE_EE_CPP_FIBER_BACKEND
+    "Build the legacy generated-C++ Boost.Context fiber backend when supported"
+    ON)
 
 if(PS2X_ENABLE_SCCACHE)
     find_program(PS2X_SCCACHE_PROGRAM sccache)
@@ -72,6 +75,15 @@ option(PS2X_ENABLE_DEBUG_UI
     "Build the embedded ImGui runtime debugger panel"
     OFF)
 
+set(PS2X_EE_FCONTEXT_PLATFORM_SUPPORTED OFF)
+if(CMAKE_SIZEOF_VOID_P EQUAL 8
+   AND CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|AMD64|amd64)$"
+   AND (CMAKE_SYSTEM_NAME STREQUAL "Linux" OR
+        (WIN32 AND MSVC)))
+    set(PS2X_EE_FCONTEXT_PLATFORM_SUPPORTED ON)
+endif()
+set(PS2X_HAS_EE_CPP_FIBER_BACKEND OFF)
+
 option(PS2X_VITA_CREATE_PACKAGE "Create Vita eboot/vpk targets" ON)
 set(PS2X_VITA_APP_NAME "PS2 Retro X" CACHE STRING "Display name for the Vita bubble")
 set(PS2X_VITA_TITLEID "RANJ00001" CACHE STRING "9-character Vita title id")
@@ -95,6 +107,55 @@ else()
     set(FETCHCONTENT_QUIET FALSE)
     set(BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
     set(BUILD_GAMES OFF CACHE BOOL "" FORCE)
+
+    if(PS2X_ENABLE_EE_CPP_FIBER_BACKEND
+       AND PS2X_EE_FCONTEXT_PLATFORM_SUPPORTED)
+        # Use the exact official Boost release archive. In particular, do not
+        # resolve Boost.Context through an unversioned system installation.
+        set(BOOST_INCLUDE_LIBRARIES context)
+        set(BOOST_CONTEXT_IMPLEMENTATION
+            fcontext
+            CACHE STRING
+            "Boost.Context implementation used by the EE fiber backend"
+            FORCE)
+        FetchContent_Declare(
+            Boost
+            URL
+                https://archives.boost.io/release/1.91.0/source/boost_1_91_0.tar.gz
+            URL_HASH
+                SHA256=5734305f40a76c30f951c9abd409a45a2a19fb546efe4162119250bbe4d3a463
+            DOWNLOAD_EXTRACT_TIMESTAMP TRUE
+        )
+        FetchContent_MakeAvailable(Boost)
+
+        if(NOT TARGET Boost::context)
+            include(
+                "${CMAKE_CURRENT_SOURCE_DIR}/cmake/BoostContextReleaseArchive.cmake")
+            ps2x_add_boost_context_from_release_archive(
+                "${boost_SOURCE_DIR}")
+        endif()
+        if(NOT BOOST_CONTEXT_IMPLEMENTATION STREQUAL "fcontext")
+            message(FATAL_ERROR
+                "Production EE fibers require Boost.Context fcontext")
+        endif()
+
+        set(PS2X_HAS_EE_CPP_FIBER_BACKEND ON)
+        message(STATUS
+            "PS2X EE fiber backend: Boost 1.91.0, "
+            "architecture ${BOOST_CONTEXT_ARCHITECTURE}, "
+            "binary format ${BOOST_CONTEXT_BINARY_FORMAT}, "
+            "ABI ${BOOST_CONTEXT_ABI}, "
+            "implementation ${BOOST_CONTEXT_IMPLEMENTATION}")
+    elseif(PS2X_ENABLE_EE_CPP_FIBER_BACKEND)
+        message(STATUS
+            "PS2X EE fiber backend unavailable on "
+            "${CMAKE_SYSTEM_NAME}/${CMAKE_SYSTEM_PROCESSOR}; "
+            "retaining legacy-host-thread")
+    else()
+        message(STATUS
+            "PS2X EE fiber backend disabled; "
+            "retaining legacy-host-thread")
+    endif()
 
     if(PS2X_HAS_VU_X64_RECOMPILER)
         FetchContent_Declare(
@@ -455,6 +516,22 @@ add_library(ps2_runtime STATIC
     src/lib/vu/ps2_vu1_lower.cpp
     src/lib/games_database.cpp
 )
+
+if(PS2X_HAS_EE_CPP_FIBER_BACKEND)
+    target_link_libraries(ps2_runtime PRIVATE Boost::context)
+    target_compile_definitions(ps2_runtime PRIVATE
+        PS2X_HAS_EE_CPP_FIBER_BACKEND=1
+        PS2X_EE_BOOST_VERSION="1.91.0"
+        PS2X_EE_BOOST_CONTEXT_ARCHITECTURE="${BOOST_CONTEXT_ARCHITECTURE}"
+        PS2X_EE_BOOST_CONTEXT_BINARY_FORMAT="${BOOST_CONTEXT_BINARY_FORMAT}"
+        PS2X_EE_BOOST_CONTEXT_ABI="${BOOST_CONTEXT_ABI}"
+        PS2X_EE_BOOST_CONTEXT_IMPLEMENTATION="${BOOST_CONTEXT_IMPLEMENTATION}"
+    )
+else()
+    target_compile_definitions(ps2_runtime PRIVATE
+        PS2X_HAS_EE_CPP_FIBER_BACKEND=0
+    )
+endif()
 
 set(PS2X_HAS_GS_AVX2_KERNEL OFF)
 if(PS2X_ENABLE_GS_AVX2_KERNEL

@@ -9486,6 +9486,11 @@ void PS2Runtime::run()
         m_gs.setDebugHistoryPaused(false);
     }
 
+    std::clog
+        << "[ee-execution] "
+        << eeExecutionBackendDiagnostics(
+               m_eeExecutionBackend->kind())
+        << std::endl;
     RUNTIME_LOG(
         "Starting execution at address 0x"
         << std::hex << m_cpuContext.pc << std::dec

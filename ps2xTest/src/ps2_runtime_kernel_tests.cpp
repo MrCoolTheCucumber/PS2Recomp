@@ -569,6 +569,12 @@ void register_ps2_runtime_kernel_tests()
         tc.Run("runtime selects the legacy host-thread EE backend", [](TestCase &t)
         {
             PS2Runtime runtime;
+            const EeExecutionBackendBuildInfo build =
+                eeExecutionBackendBuildInfo();
+            const std::string diagnostics =
+                eeExecutionBackendDiagnostics(
+                    EeExecutionBackendKind::
+                        LegacyHostThread);
             t.Equals(
                 std::string(runtime.eeExecutionBackendName()),
                 std::string("legacy-host-thread"),
@@ -577,6 +583,42 @@ void register_ps2_runtime_kernel_tests()
                 runtime.managedEeExecutionThreadCountForTesting(),
                 size_t{0u},
                 "a fresh backend should not own guest continuations");
+            t.IsTrue(
+                diagnostics.find(
+                    "selected=legacy-host-thread") !=
+                        std::string::npos &&
+                    diagnostics.find(
+                        "Boost.Context=") !=
+                        std::string::npos,
+                "backend diagnostics should identify the selected and optional continuation mechanisms");
+            if (build.boostContextFcontextAvailable)
+            {
+                t.IsTrue(
+                    build.boostVersion == "1.91.0" &&
+                        build.architecture ==
+                            "x86_64" &&
+                        (build.binaryFormat == "elf" ||
+                         build.binaryFormat == "pe") &&
+                        (build.abi == "sysv" ||
+                         build.abi == "ms") &&
+                        build.contextImplementation ==
+                            "fcontext" &&
+                        diagnostics.find(
+                            "Boost=1.91.0") !=
+                            std::string::npos &&
+                        diagnostics.find(
+                            "context-implementation=fcontext") !=
+                            std::string::npos,
+                    "a built fiber backend should expose the exact pinned Boost fcontext contract");
+            }
+            else
+            {
+                t.IsTrue(
+                    build.boostVersion == "not-built" &&
+                        build.contextImplementation ==
+                            "unavailable",
+                    "an unsupported or disabled target should report the explicit host-thread fallback");
+            }
         });
 
         tc.Run("host presentation upload state is isolated per runtime", [](TestCase &t)

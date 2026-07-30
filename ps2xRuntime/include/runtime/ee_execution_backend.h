@@ -3,11 +3,22 @@
 #include <cstddef>
 #include <functional>
 #include <memory>
+#include <string>
 #include <string_view>
 
 enum class EeExecutionBackendKind
 {
     LegacyHostThread,
+};
+
+struct EeExecutionBackendBuildInfo
+{
+    bool boostContextFcontextAvailable = false;
+    std::string_view boostVersion = "not-built";
+    std::string_view architecture = "unavailable";
+    std::string_view binaryFormat = "unavailable";
+    std::string_view abi = "unavailable";
+    std::string_view contextImplementation = "unavailable";
 };
 
 // Owns the native continuation mechanism used to execute EE guest threads.
@@ -38,3 +49,9 @@ public:
 
 std::unique_ptr<IEeExecutionBackend>
 createEeExecutionBackend(EeExecutionBackendKind kind);
+
+[[nodiscard]] EeExecutionBackendBuildInfo
+eeExecutionBackendBuildInfo() noexcept;
+[[nodiscard]] std::string
+eeExecutionBackendDiagnostics(
+    EeExecutionBackendKind selected);
