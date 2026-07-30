@@ -26,6 +26,7 @@ namespace
     constexpr uint32_t WEF_CLEAR_ALL = 0x20u;
     constexpr uint32_t kInterruptIsolationHitAddr = 0x1180u;
     constexpr uint32_t kInterruptIsolationSpAddr = 0x1184u;
+    constexpr uint32_t kInterruptIsolationPcAddr = 0x1188u;
 
     struct Ps2EventFlagInfo
     {
@@ -260,6 +261,10 @@ namespace
             rdram,
             kInterruptIsolationSpAddr,
             getRegU32(ctx, 29));
+        writeGuestU32(
+            rdram,
+            kInterruptIsolationPcAddr,
+            ctx->pc);
         ctx->pc = 0u;
     }
 
@@ -1410,6 +1415,227 @@ void register_ps2_runtime_interrupt_tests()
                 "stopping one runtime must not erase another runtime's interrupt handlers");
 
             cleanupRuntime(first);
+        });
+
+        tc.Run("VSync publication and GS callbacks are isolated per runtime", [](TestCase &t)
+        {
+            notifyRuntimeStop();
+            ps2_stubs::resetGsSyncVCallbackState();
+            TestEnv first;
+            TestEnv second;
+            t.IsTrue(
+                first.runtime.memory().initialize(),
+                "first runtime memory initialize should succeed");
+            t.IsTrue(
+                second.runtime.memory().initialize(),
+                "second runtime memory initialize should succeed");
+
+            constexpr uint32_t kFirstFlagAddr = 0x11A0u;
+            constexpr uint32_t kFirstTickAddr = 0x11B0u;
+            constexpr uint32_t kSecondFlagAddr = 0x11C0u;
+            constexpr uint32_t kSecondTickAddr = 0x11D0u;
+            auto registerFlag =
+                [](TestEnv &env,
+                   uint32_t flagAddr,
+                   uint32_t tickAddr)
+            {
+                R5900Context context{};
+                setRegU32(context, 4, flagAddr);
+                setRegU32(context, 5, tickAddr);
+                SetVSyncFlag(
+                    env.rdram.data(),
+                    &context,
+                    &env.runtime);
+                return getRegS32(context, 2);
+            };
+            t.Equals(
+                registerFlag(
+                    first,
+                    kFirstFlagAddr,
+                    kFirstTickAddr),
+                KE_OK,
+                "first runtime should register its VSync flag");
+            t.Equals(
+                registerFlag(
+                    second,
+                    kSecondFlagAddr,
+                    kSecondTickAddr),
+                KE_OK,
+                "second runtime should register its VSync flag");
+
+            const uint64_t firstTick =
+                PublishVSyncStart(
+                    first.rdram.data(),
+                    &first.runtime);
+            t.Equals(
+                firstTick,
+                1ull,
+                "first runtime should publish VSync tick 1");
+            t.Equals(
+                readGuestU32(
+                    first.rdram.data(),
+                    kFirstFlagAddr),
+                1u,
+                "first publication should consume the first runtime's flag registration");
+            t.Equals(
+                readGuestU64(
+                    first.rdram.data(),
+                    kFirstTickAddr),
+                1ull,
+                "first publication should write the first runtime's tick");
+            t.Equals(
+                readGuestU32(
+                    second.rdram.data(),
+                    kSecondFlagAddr),
+                0u,
+                "first publication must not consume the second runtime's flag registration");
+
+            const uint64_t secondTick =
+                PublishVSyncStart(
+                    second.rdram.data(),
+                    &second.runtime);
+            t.Equals(
+                secondTick,
+                1ull,
+                "second runtime should independently publish VSync tick 1");
+            t.Equals(
+                readGuestU32(
+                    second.rdram.data(),
+                    kSecondFlagAddr),
+                1u,
+                "second publication should consume only its own flag registration");
+            t.Equals(
+                readGuestU64(
+                    second.rdram.data(),
+                    kSecondTickAddr),
+                1ull,
+                "second publication should write its independent tick");
+
+            constexpr uint32_t kFirstHandlerAddr =
+                0x00ABC100u;
+            constexpr uint32_t kSecondHandlerAddr =
+                0x00ABC140u;
+            first.runtime.registerFunction(
+                kFirstHandlerAddr,
+                &testInterruptIsolationHandler);
+            second.runtime.registerFunction(
+                kSecondHandlerAddr,
+                &testInterruptIsolationHandler);
+            auto registerCallback =
+                [](TestEnv &env, uint32_t handler)
+            {
+                R5900Context context{};
+                setRegU32(context, 4, handler);
+                setRegU32(context, 28, 0x12340000u);
+                setRegU32(context, 29, 0x001FFFE0u);
+                ps2_stubs::sceGsSyncVCallback(
+                    env.rdram.data(),
+                    &context,
+                    &env.runtime);
+                return getRegU32(&context, 2);
+            };
+
+            t.Equals(
+                registerCallback(
+                    first, kFirstHandlerAddr),
+                0u,
+                "first runtime should replace an empty GS callback");
+            ps2_stubs::dispatchGsSyncVCallback(
+                first.rdram.data(),
+                &first.runtime,
+                firstTick);
+            t.Equals(
+                readGuestU32(
+                    first.rdram.data(),
+                    kInterruptIsolationHitAddr),
+                1u,
+                "first runtime should dispatch its GS callback");
+            t.Equals(
+                readGuestU32(
+                    first.rdram.data(),
+                    kInterruptIsolationPcAddr),
+                kFirstHandlerAddr,
+                "first runtime should execute its registered callback address");
+
+            t.Equals(
+                registerCallback(
+                    second, kSecondHandlerAddr),
+                0u,
+                "second runtime should independently replace an empty GS callback");
+            ps2_stubs::dispatchGsSyncVCallback(
+                second.rdram.data(),
+                &second.runtime,
+                secondTick);
+            t.Equals(
+                readGuestU32(
+                    second.rdram.data(),
+                    kInterruptIsolationHitAddr),
+                1u,
+                "second runtime should dispatch its GS callback");
+            t.Equals(
+                readGuestU32(
+                    second.rdram.data(),
+                    kInterruptIsolationPcAddr),
+                kSecondHandlerAddr,
+                "second runtime should execute its registered callback address");
+            const uint32_t secondCallbackStack =
+                readGuestU32(
+                    second.rdram.data(),
+                    kInterruptIsolationSpAddr);
+            const uint32_t secondNextStack =
+                second.runtime.reserveAsyncCallbackStack(
+                    0x4000u, 16u);
+            t.IsTrue(
+                secondCallbackStack != 0u &&
+                    secondNextStack !=
+                        secondCallbackStack,
+                "the second callback stack should be reserved by the second runtime");
+
+            ps2_stubs::dispatchGsSyncVCallback(
+                first.rdram.data(),
+                &first.runtime,
+                firstTick);
+            t.Equals(
+                readGuestU32(
+                    first.rdram.data(),
+                    kInterruptIsolationHitAddr),
+                2u,
+                "registering the second runtime must not replace the first callback");
+            t.Equals(
+                readGuestU32(
+                    first.rdram.data(),
+                    kInterruptIsolationPcAddr),
+                kFirstHandlerAddr,
+                "the first runtime should retain its callback address");
+
+            second.runtime.requestStop();
+            const uint64_t firstTickAfterSecondStop =
+                PublishVSyncStart(
+                    first.rdram.data(),
+                    &first.runtime);
+            t.Equals(
+                firstTickAfterSecondStop,
+                2ull,
+                "stopping the second runtime must not rewind the first runtime's VSync tick");
+            ps2_stubs::dispatchGsSyncVCallback(
+                first.rdram.data(),
+                &first.runtime,
+                firstTickAfterSecondStop);
+            t.Equals(
+                readGuestU32(
+                    first.rdram.data(),
+                    kInterruptIsolationHitAddr),
+                3u,
+                "stopping the second runtime must not clear the first GS callback");
+            t.Equals(
+                readGuestU32(
+                    first.rdram.data(),
+                    kInterruptIsolationPcAddr),
+                kFirstHandlerAddr,
+                "stopping the second runtime must not replace the first callback address");
+
+            cleanupRuntime(first);
+            ps2_stubs::resetGsSyncVCallbackState();
         });
 
         tc.Run("interrupt callback stack belongs to the runtime rather than the host thread", [](TestCase &t)
