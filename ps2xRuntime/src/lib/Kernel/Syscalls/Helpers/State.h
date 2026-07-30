@@ -10,9 +10,6 @@
 #include "SyncRuntimeState.h"
 #include "ThreadRuntimeState.h"
 
-inline std::unordered_map<int, FILE *> g_fileDescriptors;
-inline int g_nextFd = 3; // Start after stdin, stdout, stderr
-
 // Thread status
 #define THS_RUN 0x01
 #define THS_READY 0x02
@@ -153,8 +150,6 @@ static constexpr uint32_t kFioSoIfDir = 0x0020;
 static constexpr uint32_t kFioSoIROth = 0x0004;
 static constexpr uint32_t kFioSoIWOth = 0x0002;
 static constexpr uint32_t kFioSoIXOth = 0x0001;
-
-inline std::mutex g_fd_mutex;
 
 static void registerHostThread(
     PS2Runtime *runtime,

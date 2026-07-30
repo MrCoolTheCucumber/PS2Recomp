@@ -89,13 +89,17 @@ namespace
         std::memset(&ctx, 0, sizeof(ctx));
     }
 
-    int32_t syncMc(std::vector<uint8_t> &rdram, int32_t *cmdOut = nullptr)
+    int32_t syncMc(
+        std::vector<uint8_t> &rdram,
+        PS2Runtime *runtime,
+        int32_t *cmdOut = nullptr)
     {
         R5900Context syncCtx{};
         setRegU32(syncCtx, 4, 0u);
         setRegU32(syncCtx, 5, GUEST_MC_SYNC_CMD_ADDR);
         setRegU32(syncCtx, 6, GUEST_MC_SYNC_RESULT_ADDR);
-        ps2_stubs::sceMcSync(rdram.data(), &syncCtx, nullptr);
+        ps2_stubs::sceMcSync(
+            rdram.data(), &syncCtx, runtime);
 
         if (cmdOut)
         {
@@ -135,6 +139,7 @@ namespace
         TempPaths paths;
         std::vector<uint8_t> rdram;
         R5900Context ctx;
+        PS2Runtime runtime;
 
         TestContext() : paths(makeTempPaths()), rdram(PS2_RAM_SIZE, 0)
         {
@@ -206,14 +211,40 @@ void register_ps2_runtime_io_tests()
                 firstFd,
                 "each runtime should independently allocate its first file descriptor");
 
+            ps2_syscalls::notifyRuntimeStop(&first);
+
+            constexpr uint32_t kReadAddr =
+                GUEST_BUFFER_AREA_START + 0x1E00u;
             setRegU32(
                 test.ctx,
                 4,
                 static_cast<uint32_t>(firstFd));
-            fioClose(
+            setRegU32(test.ctx, 5, kReadAddr);
+            setRegU32(test.ctx, 6, 1u);
+            fioRead(
                 test.rdram.data(),
                 &test.ctx,
                 &first);
+            t.Equals(
+                getRegS32(&test.ctx, 2),
+                -1,
+                "stopping a runtime should close its file descriptors");
+
+            setRegU32(
+                secondCtx,
+                4,
+                static_cast<uint32_t>(secondFd));
+            setRegU32(secondCtx, 5, kReadAddr);
+            setRegU32(secondCtx, 6, 1u);
+            fioRead(
+                secondRdram.data(),
+                &secondCtx,
+                &second);
+            t.Equals(
+                getRegS32(&secondCtx, 2),
+                1,
+                "stopping one runtime must not close another runtime's file descriptors");
+
             setRegU32(
                 secondCtx,
                 4,
@@ -237,6 +268,10 @@ void register_ps2_runtime_io_tests()
                 getRegS32(&secondCtx, 2),
                 0,
                 "initializing one runtime must not initialize another runtime's CD device");
+            ps2_stubs::sceCdInit(
+                secondRdram.data(),
+                &secondCtx,
+                &second);
 
             constexpr uint32_t kFirstLbn = 0x1111u;
             constexpr uint32_t kSecondLbn = 0x2222u;
@@ -267,6 +302,41 @@ void register_ps2_runtime_io_tests()
                 ::getRegU32(&secondCtx, 2),
                 kSecondLbn,
                 "the second runtime should retain its CD stream position");
+
+            ps2_syscalls::notifyRuntimeStop(&first);
+            ps2_stubs::sceCdGetReadPos(
+                test.rdram.data(),
+                &test.ctx,
+                &first);
+            t.Equals(
+                ::getRegU32(&test.ctx, 2),
+                0u,
+                "stopping a runtime should reset its CD stream position");
+            ps2_stubs::sceCdGetReadPos(
+                secondRdram.data(),
+                &secondCtx,
+                &second);
+            t.Equals(
+                ::getRegU32(&secondCtx, 2),
+                kSecondLbn,
+                "stopping one runtime must not reset another runtime's CD stream position");
+
+            ps2_stubs::sceCdStatus(
+                test.rdram.data(),
+                &test.ctx,
+                &first);
+            t.Equals(
+                getRegS32(&test.ctx, 2),
+                0,
+                "stopping a runtime should reset its CD initialization state");
+            ps2_stubs::sceCdStatus(
+                secondRdram.data(),
+                &secondCtx,
+                &second);
+            t.Equals(
+                getRegS32(&secondCtx, 2),
+                6,
+                "stopping one runtime must not reset another runtime's CD initialization state");
         });
 
         tc.Run("mc0 directory creation", [](TestCase &t)
@@ -278,7 +348,9 @@ void register_ps2_runtime_io_tests()
             writeGuestString(test.rdram.data(), dirAddr, dirPath);
 
             setRegU32(test.ctx, 4, dirAddr);
-            fioMkdir(test.rdram.data(), &test.ctx, nullptr);
+            fioMkdir(
+                test.rdram.data(), &test.ctx,
+                &test.runtime);
             
             const int32_t result = getRegS32(&test.ctx, 2);
             t.IsTrue(result >= 0, "fioMkdir should succeed for mc0: directory");
@@ -299,7 +371,9 @@ void register_ps2_runtime_io_tests()
             const uint32_t dirAddr = GUEST_STRING_AREA_START;
             writeGuestString(test.rdram.data(), dirAddr, dirPath);
             setRegU32(test.ctx, 4, dirAddr);
-            fioMkdir(test.rdram.data(), &test.ctx, nullptr);
+            fioMkdir(
+                test.rdram.data(), &test.ctx,
+                &test.runtime);
 
             // Test: open file for writing
             const std::string filePath = "mc0:/SAVEDATA/test.txt";
@@ -308,7 +382,9 @@ void register_ps2_runtime_io_tests()
 
             setRegU32(test.ctx, 4, fileAddr);
             setRegU32(test.ctx, 5, PS2_FIO_WRITE_CREATE_TRUNC);
-            fioOpen(test.rdram.data(), &test.ctx, nullptr);
+            fioOpen(
+                test.rdram.data(), &test.ctx,
+                &test.runtime);
             
             const int32_t fd = getRegS32(&test.ctx, 2);
             t.IsTrue(fd >= 0, "fioOpen should return valid file descriptor");
@@ -321,7 +397,9 @@ void register_ps2_runtime_io_tests()
             setRegU32(test.ctx, 4, static_cast<uint32_t>(fd));
             setRegU32(test.ctx, 5, bufAddr);
             setRegU32(test.ctx, 6, static_cast<uint32_t>(payload.size()));
-            fioWrite(test.rdram.data(), &test.ctx, nullptr);
+            fioWrite(
+                test.rdram.data(), &test.ctx,
+                &test.runtime);
             
             const int32_t bytesWritten = getRegS32(&test.ctx, 2);
             t.Equals(bytesWritten, static_cast<int32_t>(payload.size()), 
@@ -329,7 +407,9 @@ void register_ps2_runtime_io_tests()
 
             // Close file
             setRegU32(test.ctx, 4, static_cast<uint32_t>(fd));
-            fioClose(test.rdram.data(), &test.ctx, nullptr);
+            fioClose(
+                test.rdram.data(), &test.ctx,
+                &test.runtime);
             
             const int32_t closeResult = getRegS32(&test.ctx, 2);
             t.IsTrue(closeResult >= 0, "fioClose should succeed");
@@ -356,7 +436,9 @@ void register_ps2_runtime_io_tests()
             const uint32_t dirAddr = GUEST_STRING_AREA_START;
             writeGuestString(test.rdram.data(), dirAddr, dirPath);
             setRegU32(test.ctx, 4, dirAddr);
-            fioMkdir(test.rdram.data(), &test.ctx, nullptr);
+            fioMkdir(
+                test.rdram.data(), &test.ctx,
+                &test.runtime);
 
             const std::string filePath = "mc0:/SAVEDATA/test.txt";
             const uint32_t fileAddr = GUEST_STRING_AREA_START + 0x100;
@@ -369,21 +451,29 @@ void register_ps2_runtime_io_tests()
 
             setRegU32(test.ctx, 4, fileAddr);
             setRegU32(test.ctx, 5, PS2_FIO_WRITE_CREATE_TRUNC);
-            fioOpen(test.rdram.data(), &test.ctx, nullptr);
+            fioOpen(
+                test.rdram.data(), &test.ctx,
+                &test.runtime);
             int32_t fd = getRegS32(&test.ctx, 2);
 
             setRegU32(test.ctx, 4, static_cast<uint32_t>(fd));
             setRegU32(test.ctx, 5, writeBufAddr);
             setRegU32(test.ctx, 6, static_cast<uint32_t>(payload.size()));
-            fioWrite(test.rdram.data(), &test.ctx, nullptr);
+            fioWrite(
+                test.rdram.data(), &test.ctx,
+                &test.runtime);
 
             setRegU32(test.ctx, 4, static_cast<uint32_t>(fd));
-            fioClose(test.rdram.data(), &test.ctx, nullptr);
+            fioClose(
+                test.rdram.data(), &test.ctx,
+                &test.runtime);
 
             // Test: read back via fioRead
             setRegU32(test.ctx, 4, fileAddr);
             setRegU32(test.ctx, 5, PS2_FIO_O_RDONLY);
-            fioOpen(test.rdram.data(), &test.ctx, nullptr);
+            fioOpen(
+                test.rdram.data(), &test.ctx,
+                &test.runtime);
             fd = getRegS32(&test.ctx, 2);
             t.IsTrue(fd >= 0, "fioOpen for reading should succeed");
 
@@ -394,7 +484,9 @@ void register_ps2_runtime_io_tests()
             setRegU32(test.ctx, 4, static_cast<uint32_t>(fd));
             setRegU32(test.ctx, 5, readBufAddr);
             setRegU32(test.ctx, 6, static_cast<uint32_t>(payload.size()));
-            fioRead(test.rdram.data(), &test.ctx, nullptr);
+            fioRead(
+                test.rdram.data(), &test.ctx,
+                &test.runtime);
 
             const int32_t bytesRead = getRegS32(&test.ctx, 2);
             t.Equals(bytesRead, static_cast<int32_t>(payload.size()), 
@@ -407,7 +499,9 @@ void register_ps2_runtime_io_tests()
             t.Equals(readback, payload, "fioRead content should match original");
 
             setRegU32(test.ctx, 4, static_cast<uint32_t>(fd));
-            fioClose(test.rdram.data(), &test.ctx, nullptr);
+            fioClose(
+                test.rdram.data(), &test.ctx,
+                &test.runtime);
         });
 
         tc.Run("mc0 paths isolated from cdRoot", [](TestCase &t)
@@ -424,11 +518,15 @@ void register_ps2_runtime_io_tests()
 
             // Create directory and file on mc0:
             setRegU32(test.ctx, 4, dirAddr);
-            fioMkdir(test.rdram.data(), &test.ctx, nullptr);
+            fioMkdir(
+                test.rdram.data(), &test.ctx,
+                &test.runtime);
 
             setRegU32(test.ctx, 4, fileAddr);
             setRegU32(test.ctx, 5, PS2_FIO_WRITE_CREATE_TRUNC);
-            fioOpen(test.rdram.data(), &test.ctx, nullptr);
+            fioOpen(
+                test.rdram.data(), &test.ctx,
+                &test.runtime);
             const int32_t fd = getRegS32(&test.ctx, 2);
 
             const std::string payload = "isolation test";
@@ -438,10 +536,14 @@ void register_ps2_runtime_io_tests()
             setRegU32(test.ctx, 4, static_cast<uint32_t>(fd));
             setRegU32(test.ctx, 5, bufAddr);
             setRegU32(test.ctx, 6, static_cast<uint32_t>(payload.size()));
-            fioWrite(test.rdram.data(), &test.ctx, nullptr);
+            fioWrite(
+                test.rdram.data(), &test.ctx,
+                &test.runtime);
 
             setRegU32(test.ctx, 4, static_cast<uint32_t>(fd));
-            fioClose(test.rdram.data(), &test.ctx, nullptr);
+            fioClose(
+                test.rdram.data(), &test.ctx,
+                &test.runtime);
 
             // Verify isolation
             const std::filesystem::path expectedMc = 
@@ -479,11 +581,13 @@ void register_ps2_runtime_io_tests()
             setRegU32(test.ctx, 4, 0u);
             setRegU32(test.ctx, 5, 0u);
             setRegU32(test.ctx, 6, dirAddr);
-            ps2_stubs::sceMcMkdir(test.rdram.data(), &test.ctx, nullptr);
+            ps2_stubs::sceMcMkdir(
+                test.rdram.data(), &test.ctx,
+                &test.runtime);
             t.Equals(getRegS32(&test.ctx, 2), 0, "sceMcMkdir should dispatch successfully");
 
             int32_t cmd = 0;
-            t.Equals(syncMc(test.rdram, &cmd), 0, "sceMcMkdir should finish successfully");
+            t.Equals(syncMc(test.rdram, &test.runtime, &cmd), 0, "sceMcMkdir should finish successfully");
             t.Equals(cmd, 0x0B, "sceMcSync should report MKDIR as the last command");
 
             clearContext(test.ctx);
@@ -491,10 +595,13 @@ void register_ps2_runtime_io_tests()
             setRegU32(test.ctx, 5, 0u);
             setRegU32(test.ctx, 6, fileAddr);
             setRegU32(test.ctx, 7, PS2_FIO_O_RDWR | PS2_FIO_O_CREAT | PS2_FIO_O_TRUNC);
-            ps2_stubs::sceMcOpen(test.rdram.data(), &test.ctx, nullptr);
+            ps2_stubs::sceMcOpen(
+                test.rdram.data(), &test.ctx,
+                &test.runtime);
             t.Equals(getRegS32(&test.ctx, 2), 0, "sceMcOpen should dispatch successfully");
 
-            const int32_t fd = syncMc(test.rdram, &cmd);
+            const int32_t fd =
+                syncMc(test.rdram, &test.runtime, &cmd);
             t.IsTrue(fd > 0, "sceMcOpen should produce a positive descriptor in sceMcSync");
             t.Equals(cmd, 0x02, "sceMcSync should report OPEN as the last command");
 
@@ -502,8 +609,10 @@ void register_ps2_runtime_io_tests()
             setRegU32(test.ctx, 4, static_cast<uint32_t>(fd));
             setRegU32(test.ctx, 5, writeBufAddr);
             setRegU32(test.ctx, 6, static_cast<uint32_t>(payload.size()));
-            ps2_stubs::sceMcWrite(test.rdram.data(), &test.ctx, nullptr);
-            t.Equals(syncMc(test.rdram, &cmd), static_cast<int32_t>(payload.size()),
+            ps2_stubs::sceMcWrite(
+                test.rdram.data(), &test.ctx,
+                &test.runtime);
+            t.Equals(syncMc(test.rdram, &test.runtime, &cmd), static_cast<int32_t>(payload.size()),
                      "sceMcWrite should report the full byte count via sceMcSync");
             t.Equals(cmd, 0x06, "sceMcSync should report WRITE as the last command");
 
@@ -511,8 +620,10 @@ void register_ps2_runtime_io_tests()
             setRegU32(test.ctx, 4, static_cast<uint32_t>(fd));
             setRegU32(test.ctx, 5, 0u);
             setRegU32(test.ctx, 6, PS2_FIO_SEEK_SET);
-            ps2_stubs::sceMcSeek(test.rdram.data(), &test.ctx, nullptr);
-            t.Equals(syncMc(test.rdram, &cmd), 0, "sceMcSeek should rewind to offset zero");
+            ps2_stubs::sceMcSeek(
+                test.rdram.data(), &test.ctx,
+                &test.runtime);
+            t.Equals(syncMc(test.rdram, &test.runtime, &cmd), 0, "sceMcSeek should rewind to offset zero");
             t.Equals(cmd, 0x04, "sceMcSync should report SEEK as the last command");
 
             std::memset(test.rdram.data() + readBufAddr, 0, payload.size());
@@ -520,8 +631,10 @@ void register_ps2_runtime_io_tests()
             setRegU32(test.ctx, 4, static_cast<uint32_t>(fd));
             setRegU32(test.ctx, 5, readBufAddr);
             setRegU32(test.ctx, 6, static_cast<uint32_t>(payload.size()));
-            ps2_stubs::sceMcRead(test.rdram.data(), &test.ctx, nullptr);
-            t.Equals(syncMc(test.rdram, &cmd), static_cast<int32_t>(payload.size()),
+            ps2_stubs::sceMcRead(
+                test.rdram.data(), &test.ctx,
+                &test.runtime);
+            t.Equals(syncMc(test.rdram, &test.runtime, &cmd), static_cast<int32_t>(payload.size()),
                      "sceMcRead should report the full byte count via sceMcSync");
             t.Equals(cmd, 0x05, "sceMcSync should report READ as the last command");
 
@@ -530,8 +643,10 @@ void register_ps2_runtime_io_tests()
 
             clearContext(test.ctx);
             setRegU32(test.ctx, 4, static_cast<uint32_t>(fd));
-            ps2_stubs::sceMcClose(test.rdram.data(), &test.ctx, nullptr);
-            t.Equals(syncMc(test.rdram, &cmd), 0, "sceMcClose should finish successfully");
+            ps2_stubs::sceMcClose(
+                test.rdram.data(), &test.ctx,
+                &test.runtime);
+            t.Equals(syncMc(test.rdram, &test.runtime, &cmd), 0, "sceMcClose should finish successfully");
             t.Equals(cmd, 0x03, "sceMcSync should report CLOSE as the last command");
 
             const std::filesystem::path hostPath = test.paths.mcRoot / "SAVEDATA" / "test.bin";
@@ -561,10 +676,13 @@ void register_ps2_runtime_io_tests()
             setRegU32(test.ctx, 8, 8u);
             setRegU32(test.ctx, 9, GUEST_MC_TABLE_ADDR);
 
-            ps2_stubs::sceMcGetDir(test.rdram.data(), &test.ctx, nullptr);
+            ps2_stubs::sceMcGetDir(
+                test.rdram.data(), &test.ctx,
+                &test.runtime);
 
             int32_t cmd = 0;
-            const int32_t entryCount = syncMc(test.rdram, &cmd);
+            const int32_t entryCount =
+                syncMc(test.rdram, &test.runtime, &cmd);
             t.Equals(cmd, 0x0D, "sceMcSync should report GETDIR as the last command");
             t.Equals(entryCount, 3, "sceMcGetDir should return '.', '..', and the matching file");
 
@@ -593,10 +711,12 @@ void register_ps2_runtime_io_tests()
             setRegU32(test.ctx, 7, freeAddr);
             // EE n32 ABI: the fifth argument travels in $t0
             setRegU32(test.ctx, 8, formatAddr);
-            ps2_stubs::sceMcGetInfo(test.rdram.data(), &test.ctx, nullptr);
+            ps2_stubs::sceMcGetInfo(
+                test.rdram.data(), &test.ctx,
+                &test.runtime);
 
             int32_t cmd = 0;
-            t.Equals(syncMc(test.rdram, &cmd), 0, "formatted cards should report success through sceMcSync");
+            t.Equals(syncMc(test.rdram, &test.runtime, &cmd), 0, "formatted cards should report success through sceMcSync");
             t.Equals(cmd, 0x01, "sceMcSync should report GETINFO as the last command");
             t.Equals(readGuestS32(test.rdram.data(), typeAddr), 2, "sceMcGetInfo should report a PS2 memory card");
             t.Equals(readGuestS32(test.rdram.data(), formatAddr), 1, "sceMcGetInfo should report a formatted card");
@@ -604,8 +724,10 @@ void register_ps2_runtime_io_tests()
             clearContext(test.ctx);
             setRegU32(test.ctx, 4, 0u);
             setRegU32(test.ctx, 5, 0u);
-            ps2_stubs::sceMcUnformat(test.rdram.data(), &test.ctx, nullptr);
-            t.Equals(syncMc(test.rdram, &cmd), 0, "sceMcUnformat should complete successfully");
+            ps2_stubs::sceMcUnformat(
+                test.rdram.data(), &test.ctx,
+                &test.runtime);
+            t.Equals(syncMc(test.rdram, &test.runtime, &cmd), 0, "sceMcUnformat should complete successfully");
 
             clearContext(test.ctx);
             setRegU32(test.ctx, 4, 0u);
@@ -613,9 +735,11 @@ void register_ps2_runtime_io_tests()
             setRegU32(test.ctx, 6, typeAddr);
             setRegU32(test.ctx, 7, freeAddr);
             setRegU32(test.ctx, 8, formatAddr);
-            ps2_stubs::sceMcGetInfo(test.rdram.data(), &test.ctx, nullptr);
+            ps2_stubs::sceMcGetInfo(
+                test.rdram.data(), &test.ctx,
+                &test.runtime);
 
-            t.Equals(syncMc(test.rdram, &cmd), -2, "unformatted cards should report sceMcResNoFormat through sceMcSync");
+            t.Equals(syncMc(test.rdram, &test.runtime, &cmd), -2, "unformatted cards should report sceMcResNoFormat through sceMcSync");
             t.Equals(readGuestS32(test.rdram.data(), formatAddr), 0, "sceMcGetInfo should report an unformatted card after sceMcUnformat");
         });
 
@@ -626,7 +750,9 @@ void register_ps2_runtime_io_tests()
             constexpr uint32_t dirAddr = GUEST_STRING_AREA_START + 0xB00;
 
             clearContext(test.ctx);
-            ps2_stubs::sceMcInit(test.rdram.data(), &test.ctx, nullptr);
+            ps2_stubs::sceMcInit(
+                test.rdram.data(), &test.ctx,
+                &test.runtime);
             t.Equals(getRegS32(&test.ctx, 2), 0, "sceMcInit should succeed");
 
             writeGuestString(test.rdram.data(), dirAddr, "/SAVEDATA");
@@ -634,13 +760,17 @@ void register_ps2_runtime_io_tests()
             setRegU32(test.ctx, 4, 0u);
             setRegU32(test.ctx, 5, 0u);
             setRegU32(test.ctx, 6, dirAddr);
-            ps2_stubs::sceMcMkdir(test.rdram.data(), &test.ctx, nullptr);
+            ps2_stubs::sceMcMkdir(
+                test.rdram.data(), &test.ctx,
+                &test.runtime);
             int32_t cmd = 0;
-            t.Equals(syncMc(test.rdram, &cmd), 0, "sceMcMkdir should complete before teardown");
+            t.Equals(syncMc(test.rdram, &test.runtime, &cmd), 0, "sceMcMkdir should complete before teardown");
             t.Equals(cmd, 0x0B, "sceMcSync should report MKDIR before teardown");
 
             clearContext(test.ctx);
-            ps2_stubs::sceMcEnd(test.rdram.data(), &test.ctx, nullptr);
+            ps2_stubs::sceMcEnd(
+                test.rdram.data(), &test.ctx,
+                &test.runtime);
             t.Equals(getRegS32(&test.ctx, 2), 0, "sceMcEnd should succeed");
 
             // libmc semantics: with no async command pending, sceMcSync returns -1
@@ -649,7 +779,9 @@ void register_ps2_runtime_io_tests()
             setRegU32(syncCtx, 4, 0u);
             setRegU32(syncCtx, 5, GUEST_MC_SYNC_CMD_ADDR);
             setRegU32(syncCtx, 6, GUEST_MC_SYNC_RESULT_ADDR);
-            ps2_stubs::sceMcSync(test.rdram.data(), &syncCtx, nullptr);
+            ps2_stubs::sceMcSync(
+                test.rdram.data(), &syncCtx,
+                &test.runtime);
             t.Equals(getRegS32(&syncCtx, 2), -1,
                      "sceMcSync after sceMcEnd should report that no command is active");
         });
@@ -666,7 +798,9 @@ void register_ps2_runtime_io_tests()
             setRegU32(test.ctx, 5, 1u);          // cmd
             setRegU32(test.ctx, 6, statusAddr);  // arg
 
-            ps2_stubs::sceIoctl(test.rdram.data(), &test.ctx, nullptr);
+            ps2_stubs::sceIoctl(
+                test.rdram.data(), &test.ctx,
+                &test.runtime);
 
             t.Equals(getRegS32(&test.ctx, 2), 0, "sceIoctl cmd1 should return success");
 
@@ -693,7 +827,9 @@ void register_ps2_runtime_io_tests()
             clearContext(test.ctx);
             setRegU32(test.ctx, 4, fileAddr);
             setRegU32(test.ctx, 5, pathAddr);
-            ps2_stubs::sceCdSearchFile(test.rdram.data(), &test.ctx, nullptr);
+            ps2_stubs::sceCdSearchFile(
+                test.rdram.data(), &test.ctx,
+                &test.runtime);
 
             t.Equals(getRegS32(&test.ctx, 2), 1, "sceCdSearchFile should resolve the extracted movie file");
             t.Equals(readGuestU32(test.rdram.data(), fileAddr + 4), 3u,
@@ -731,7 +867,9 @@ void register_ps2_runtime_io_tests()
             setRegU32(test.ctx, 4, 0u);
             setRegU32(test.ctx, 5, 1u);
             setRegU32(test.ctx, 6, bufAddr);
-            ps2_stubs::sceCdRead(test.rdram.data(), &test.ctx, nullptr);
+            ps2_stubs::sceCdRead(
+                test.rdram.data(), &test.ctx,
+                &test.runtime);
 
             t.Equals(getRegS32(&test.ctx, 2), 1, "sceCdRead should succeed when cdImage is configured");
             t.Equals(std::memcmp(test.rdram.data() + bufAddr, "cd-image", 8), 0,

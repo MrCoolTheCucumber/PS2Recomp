@@ -1,80 +1,91 @@
 #include "Common.h"
 #include "FileIO.h"
+#include "Helpers/FileRuntimeState.h"
 
 namespace ps2_syscalls
 {
-    static int allocatePs2Fd(FILE *file)
+    namespace
     {
-        if (!file)
-            return -1;
+        constexpr size_t kVagAccumMaxBytes =
+            16u * 1024u * 1024u;
 
-        std::lock_guard<std::mutex> lock(g_fd_mutex);
-        int fd = g_nextFd++;
-        g_fileDescriptors[fd] = file;
-        return fd;
-    }
-
-    static FILE *getHostFile(int ps2Fd)
-    {
-        std::lock_guard<std::mutex> lock(g_fd_mutex);
-        auto it = g_fileDescriptors.find(ps2Fd);
-        if (it != g_fileDescriptors.end())
+        EeFileRuntimeState *getFileRuntimeState(
+            PS2Runtime *runtime)
         {
-            return it->second;
+            return runtime
+                ? &runtime->eeFileRuntimeState()
+                : nullptr;
         }
-        return nullptr;
-    }
 
-    static void releasePs2Fd(int ps2Fd)
-    {
-        std::lock_guard<std::mutex> lock(g_fd_mutex);
-        g_fileDescriptors.erase(ps2Fd);
-    }
-
-    struct VagAccumEntry
-    {
-        std::vector<uint8_t> data;
-        uint32_t firstBufAddr = 0;
-    };
-    static std::unordered_map<int, VagAccumEntry> g_vagAccum;
-    static std::mutex g_vagAccumMutex;
-    static constexpr size_t kVagAccumMaxBytes = 16 * 1024 * 1024;
-
-    static const char *translateFioMode(int ps2Flags)
-    {
-        bool read = (ps2Flags & PS2_FIO_O_RDONLY) || (ps2Flags & PS2_FIO_O_RDWR);
-        bool write = (ps2Flags & PS2_FIO_O_WRONLY) || (ps2Flags & PS2_FIO_O_RDWR);
-        bool append = (ps2Flags & PS2_FIO_O_APPEND);
-        bool create = (ps2Flags & PS2_FIO_O_CREAT);
-        bool truncate = (ps2Flags & PS2_FIO_O_TRUNC);
-
-        if (read && write)
+        int allocatePs2Fd(
+            EeFileRuntimeState &state,
+            FILE *file)
         {
-            if (create && truncate)
-                return "w+b";
-            if (create)
-                return "a+b";
-            return "r+b";
+            if (!file)
+            {
+                return -1;
+            }
+
+            std::lock_guard<std::mutex> lock(
+                state.descriptorMutex);
+            int fd = state.nextDescriptor++;
+            state.descriptors[fd] = file;
+            return fd;
         }
-        else if (write)
+
+        const char *translateFioMode(int ps2Flags)
         {
-            if (append)
-                return "ab";
-            if (create && truncate)
-                return "wb";
-            if (create)
-                return "wx";
-            return "r+b";
-        }
-        else if (read)
-        {
+            bool read = (ps2Flags & PS2_FIO_O_RDONLY) || (ps2Flags & PS2_FIO_O_RDWR);
+            bool write = (ps2Flags & PS2_FIO_O_WRONLY) || (ps2Flags & PS2_FIO_O_RDWR);
+            bool append = (ps2Flags & PS2_FIO_O_APPEND);
+            bool create = (ps2Flags & PS2_FIO_O_CREAT);
+            bool truncate = (ps2Flags & PS2_FIO_O_TRUNC);
+
+            if (read && write)
+            {
+                if (create && truncate)
+                    return "w+b";
+                if (create)
+                    return "a+b";
+                return "r+b";
+            }
+            else if (write)
+            {
+                if (append)
+                    return "ab";
+                if (create && truncate)
+                    return "wb";
+                if (create)
+                    return "wx";
+                return "r+b";
+            }
+            else if (read)
+            {
+                return "rb";
+            }
             return "rb";
         }
-        return "rb";
+    }
+
+    void resetFileIoState(PS2Runtime *runtime)
+    {
+        if (EeFileRuntimeState *const state =
+                getFileRuntimeState(runtime))
+        {
+            state->closeAll();
+        }
     }
 
     void fioOpen(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
+        EeFileRuntimeState *const state =
+            getFileRuntimeState(runtime);
+        if (!state)
+        {
+            setReturnS32(ctx, -1);
+            return;
+        }
+
         uint32_t pathAddr = getRegU32(ctx, 4); // $a0
         int flags = (int)getRegU32(ctx, 5);    // $a1 (PS2 FIO flags)
 
@@ -105,7 +116,7 @@ namespace ps2_syscalls
             return;
         }
 
-        int ps2Fd = allocatePs2Fd(fp);
+        int ps2Fd = allocatePs2Fd(*state, fp);
         if (ps2Fd < 0)
         {
             std::cerr << "fioOpen error: Failed to allocate PS2 file descriptor" << std::endl;
@@ -120,44 +131,85 @@ namespace ps2_syscalls
 
     void fioClose(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
-        int ps2Fd = (int)getRegU32(ctx, 4);
-
-        FILE *fp = getHostFile(ps2Fd);
-        if (!fp)
+        EeFileRuntimeState *const state =
+            getFileRuntimeState(runtime);
+        if (!state)
         {
-            std::cerr << "fioClose warning: Invalid PS2 file descriptor " << ps2Fd << std::endl;
             setReturnS32(ctx, -1);
             return;
         }
 
-        int ret = ::fclose(fp);
-        releasePs2Fd(ps2Fd);
-
+        const int ps2Fd =
+            static_cast<int>(getRegU32(ctx, 4));
+        int ret = -1;
         {
-            std::lock_guard<std::mutex> lock(g_vagAccumMutex);
-            auto it = g_vagAccum.find(ps2Fd);
-            if (it != g_vagAccum.end())
+            std::lock_guard<std::mutex> lock(
+                state->descriptorMutex);
+            const auto it =
+                state->descriptors.find(ps2Fd);
+            if (it == state->descriptors.end() ||
+                !it->second)
             {
-                VagAccumEntry &e = it->second;
-                if (e.data.size() >= 48)
-                {
-                    const uint32_t magic = (static_cast<uint32_t>(e.data[0]) << 24) |
-                                           (static_cast<uint32_t>(e.data[1]) << 16) |
-                                           (static_cast<uint32_t>(e.data[2]) << 8) |
-                                           static_cast<uint32_t>(e.data[3]);
-                    const uint32_t magicLE = (static_cast<uint32_t>(e.data[3]) << 24) |
-                                             (static_cast<uint32_t>(e.data[2]) << 16) |
-                                             (static_cast<uint32_t>(e.data[1]) << 8) |
-                                             static_cast<uint32_t>(e.data[0]);
-                    if (magic == 0x56414770u || magicLE == 0x56414770u)
-                    {
-                        if (runtime)
-                            runtime->audioBackend().onVagTransferFromBuffer(
-                                e.data.data(), static_cast<uint32_t>(e.data.size()),
-                                e.firstBufAddr ? e.firstBufAddr : 0u);
-                    }
-                }
-                g_vagAccum.erase(it);
+                std::cerr
+                    << "fioClose warning: Invalid PS2 file descriptor "
+                    << ps2Fd << std::endl;
+                setReturnS32(ctx, -1);
+                return;
+            }
+            ret = ::fclose(it->second);
+            state->descriptors.erase(it);
+        }
+
+        EeFileVagAccumEntry completedVag{};
+        {
+            std::lock_guard<std::mutex> lock(
+                state->vagMutex);
+            const auto it =
+                state->vagAccum.find(ps2Fd);
+            if (it != state->vagAccum.end())
+            {
+                completedVag = std::move(it->second);
+                state->vagAccum.erase(it);
+            }
+        }
+
+        if (completedVag.data.size() >= 48u)
+        {
+            const uint32_t magic =
+                (static_cast<uint32_t>(
+                     completedVag.data[0])
+                 << 24) |
+                (static_cast<uint32_t>(
+                     completedVag.data[1])
+                 << 16) |
+                (static_cast<uint32_t>(
+                     completedVag.data[2])
+                 << 8) |
+                static_cast<uint32_t>(
+                    completedVag.data[3]);
+            const uint32_t magicLE =
+                (static_cast<uint32_t>(
+                     completedVag.data[3])
+                 << 24) |
+                (static_cast<uint32_t>(
+                     completedVag.data[2])
+                 << 16) |
+                (static_cast<uint32_t>(
+                     completedVag.data[1])
+                 << 8) |
+                static_cast<uint32_t>(
+                    completedVag.data[0]);
+            if (magic == 0x56414770u ||
+                magicLE == 0x56414770u)
+            {
+                runtime->audioBackend()
+                    .onVagTransferFromBuffer(
+                        completedVag.data.data(),
+                        static_cast<uint32_t>(
+                            completedVag.data.size()),
+                        completedVag.firstBufAddr
+                            ? completedVag.firstBufAddr
+                            : 0u);
             }
         }
 
@@ -166,12 +218,19 @@ namespace ps2_syscalls
 
     void fioRead(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
+        EeFileRuntimeState *const state =
+            getFileRuntimeState(runtime);
+        if (!state)
+        {
+            setReturnS32(ctx, -1);
+            return;
+        }
+
         int ps2Fd = (int)getRegU32(ctx, 4);   // $a0
         uint32_t bufAddr = getRegU32(ctx, 5); // $a1
         size_t size = getRegU32(ctx, 6);      // $a2
 
         uint8_t *hostBuf = getMemPtr(rdram, bufAddr);
-        FILE *fp = getHostFile(ps2Fd);
 
         if (!hostBuf)
         {
@@ -179,42 +238,58 @@ namespace ps2_syscalls
             setReturnS32(ctx, -1); // -EFAULT
             return;
         }
-        if (!fp)
-        {
-            std::cerr << "fioRead error: Invalid file descriptor " << ps2Fd << std::endl;
-            setReturnS32(ctx, -1); // -EBADF
-            return;
-        }
-        if (size == 0)
-        {
-            setReturnS32(ctx, 0); // Read 0 bytes
-            return;
-        }
-
         size_t bytesRead = 0;
+        bool readError = false;
         {
-            std::lock_guard<std::mutex> lock(g_sys_fd_mutex);
-            bytesRead = fread(hostBuf, 1, size, fp);
+            std::lock_guard<std::mutex> lock(
+                state->descriptorMutex);
+            const auto it =
+                state->descriptors.find(ps2Fd);
+            if (it == state->descriptors.end() ||
+                !it->second)
+            {
+                std::cerr
+                    << "fioRead error: Invalid file descriptor "
+                    << ps2Fd << std::endl;
+                setReturnS32(ctx, -1);
+                return;
+            }
+            if (size == 0u)
+            {
+                setReturnS32(ctx, 0);
+                return;
+            }
+
+            bytesRead =
+                std::fread(
+                    hostBuf, 1u, size, it->second);
+            readError =
+                bytesRead < size &&
+                std::ferror(it->second);
+            if (readError)
+            {
+                std::clearerr(it->second);
+            }
         }
         if (bytesRead > 0)
         {
             ps2TraceGuestRangeWrite(rdram, bufAddr, static_cast<uint32_t>(bytesRead), "fioRead", ctx);
         }
 
-        if (bytesRead < size && ferror(fp))
+        if (readError)
         {
             std::cerr << "fioRead error: fread failed for fd " << ps2Fd << ": " << strerror(errno) << std::endl;
-            clearerr(fp);
             setReturnS32(ctx, -1);
             return;
         }
 
         {
-            std::lock_guard<std::mutex> lock(g_vagAccumMutex);
-            auto it = g_vagAccum.find(ps2Fd);
-            if (it != g_vagAccum.end())
+            std::lock_guard<std::mutex> lock(
+                state->vagMutex);
+            auto it = state->vagAccum.find(ps2Fd);
+            if (it != state->vagAccum.end())
             {
-                VagAccumEntry &e = it->second;
+                EeFileVagAccumEntry &e = it->second;
                 if (e.data.size() + bytesRead <= kVagAccumMaxBytes)
                     e.data.insert(e.data.end(), hostBuf, hostBuf + bytesRead);
             }
@@ -230,7 +305,8 @@ namespace ps2_syscalls
                                          static_cast<uint32_t>(hostBuf[0]);
                 if (magic == 0x56414770u || magicLE == 0x56414770u)
                 {
-                    VagAccumEntry &e = g_vagAccum[ps2Fd];
+                    EeFileVagAccumEntry &e =
+                        state->vagAccum[ps2Fd];
                     e.firstBufAddr = bufAddr;
                     if (bytesRead <= kVagAccumMaxBytes)
                         e.data.assign(hostBuf, hostBuf + bytesRead);
@@ -243,6 +319,14 @@ namespace ps2_syscalls
 
     void fioWrite(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
+        EeFileRuntimeState *const state =
+            getFileRuntimeState(runtime);
+        if (!state)
+        {
+            setReturnS32(ctx, -1);
+            return;
+        }
+
         int ps2Fd = (int)getRegU32(ctx, 4);   // $a0
         uint32_t bufAddr = getRegU32(ctx, 5); // $a1
         size_t size = getRegU32(ctx, 6);      // $a2
@@ -254,26 +338,31 @@ namespace ps2_syscalls
             return;
         }
 
-        FILE *fp = getHostFile(ps2Fd);
-        if (!fp)
-        {
-            setReturnS32(ctx, -1); // -EFAULT
-            return;
-        }
-
-        if (size == 0)
-        {
-            setReturnS32(ctx, 0); // Wrote 0 bytes
-            return;
-        }
-
         size_t bytesWritten = 0;
         {
-            std::lock_guard<std::mutex> lock(g_sys_fd_mutex);
-            bytesWritten = ::fwrite(hostBuf, 1, size, fp);
-            if (bytesWritten < size && ferror(fp))
+            std::lock_guard<std::mutex> lock(
+                state->descriptorMutex);
+            const auto it =
+                state->descriptors.find(ps2Fd);
+            if (it == state->descriptors.end() ||
+                !it->second)
             {
-                clearerr(fp);
+                setReturnS32(ctx, -1);
+                return;
+            }
+            if (size == 0u)
+            {
+                setReturnS32(ctx, 0);
+                return;
+            }
+
+            bytesWritten =
+                std::fwrite(
+                    hostBuf, 1u, size, it->second);
+            if (bytesWritten < size &&
+                std::ferror(it->second))
+            {
+                std::clearerr(it->second);
                 setReturnS32(ctx, -1); // -EIO, -ENOSPC etc.
                 return;
             }
@@ -285,17 +374,17 @@ namespace ps2_syscalls
 
     void fioLseek(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
+        EeFileRuntimeState *const state =
+            getFileRuntimeState(runtime);
+        if (!state)
+        {
+            setReturnS32(ctx, -1);
+            return;
+        }
+
         int ps2Fd = (int)getRegU32(ctx, 4);  // $a0
         int32_t offset = getRegU32(ctx, 5);  // $a1 (PS2 seems to use 32-bit offset here commonly)
         int whence = (int)getRegU32(ctx, 6); // $a2 (PS2 FIO_SEEK constants)
-
-        FILE *fp = getHostFile(ps2Fd);
-        if (!fp)
-        {
-            std::cerr << "fioLseek error: Invalid file descriptor " << ps2Fd << std::endl;
-            setReturnS32(ctx, -1); // -EBADF
-            return;
-        }
 
         int hostWhence;
         switch (whence)
@@ -315,14 +404,38 @@ namespace ps2_syscalls
             return;
         }
 
-        if (::fseek(fp, static_cast<long>(offset), hostWhence) != 0)
+        long newPos = -1;
         {
-            std::cerr << "fioLseek error: fseek failed for fd " << ps2Fd << ": " << strerror(errno) << std::endl;
-            setReturnS32(ctx, -1); // Return error code
-            return;
+            std::lock_guard<std::mutex> lock(
+                state->descriptorMutex);
+            const auto it =
+                state->descriptors.find(ps2Fd);
+            if (it == state->descriptors.end() ||
+                !it->second)
+            {
+                std::cerr
+                    << "fioLseek error: Invalid file descriptor "
+                    << ps2Fd << std::endl;
+                setReturnS32(ctx, -1);
+                return;
+            }
+
+            if (::fseek(
+                    it->second,
+                    static_cast<long>(offset),
+                    hostWhence) != 0)
+            {
+                std::cerr
+                    << "fioLseek error: fseek failed for fd "
+                    << ps2Fd << ": "
+                    << strerror(errno) << std::endl;
+                setReturnS32(ctx, -1);
+                return;
+            }
+
+            newPos = ::ftell(it->second);
         }
 
-        long newPos = ::ftell(fp);
         if (newPos < 0)
         {
             std::cerr << "fioLseek error: ftell failed after fseek for fd " << ps2Fd << ": " << strerror(errno) << std::endl;

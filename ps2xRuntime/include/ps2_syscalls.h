@@ -3,7 +3,6 @@
 
 #include "ps2_runtime.h"
 #include "ps2_call_list.h"
-#include <mutex>
 #include <atomic>
 #include <cstdint>
 #include <cstring>
@@ -11,8 +10,6 @@
 #include <vector>
 
 std::string translatePs2Path(const char *ps2Path);
-
-inline std::mutex g_sys_fd_mutex;
 
 namespace ps2_syscalls
 {

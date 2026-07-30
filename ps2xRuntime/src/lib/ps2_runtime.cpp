@@ -9,15 +9,19 @@
 #include "runtime/ps2_vu_recompiler.h"
 #include "ThreadNaming.h"
 #include "Kernel/Stubs/Audio.h"
+#include "Kernel/Stubs/CD.h"
 #include "Kernel/Stubs/GS.h"
 #include "Kernel/Stubs/MPEG.h"
+#include "Kernel/Stubs/Helpers/CdRuntimeState.h"
 #include "Kernel/Stubs/Helpers/SifRuntimeState.h"
 #include "Kernel/Syscalls/Helpers/AlarmRuntimeState.h"
+#include "Kernel/Syscalls/Helpers/FileRuntimeState.h"
 #include "Kernel/Syscalls/Helpers/InterruptRuntimeState.h"
 #include "Kernel/Syscalls/Helpers/KernelRuntimeState.h"
 #include "Kernel/Syscalls/Helpers/RpcRuntimeState.h"
 #include "Kernel/Syscalls/Helpers/SyncRuntimeState.h"
 #include "Kernel/Syscalls/Helpers/ThreadRuntimeState.h"
+#include "Kernel/Syscalls/FileIO.h"
 #include "ps2_host_backend.h"
 #include "ps2_iop_host.h"
 #include "ps2x/iop/iop_subsystem.h"
@@ -907,6 +911,10 @@ PS2Runtime::PS2Runtime(PS2RuntimeConfiguration configuration)
         std::make_unique<EeKernelRuntimeState>();
     m_eeRpcRuntimeState =
         std::make_unique<EeRpcRuntimeState>();
+    m_eeFileRuntimeState =
+        std::make_unique<EeFileRuntimeState>();
+    m_cdRuntimeState =
+        std::make_unique<ps2_stubs::CdRuntimeState>();
     m_sifRuntimeState =
         std::make_unique<ps2_stubs::SifRuntimeState>();
     m_gs.setVSyncTickProvider(
@@ -1338,6 +1346,28 @@ EeRpcRuntimeState &PS2Runtime::eeRpcRuntimeState()
 const EeRpcRuntimeState &PS2Runtime::eeRpcRuntimeState() const
 {
     return *m_eeRpcRuntimeState;
+}
+
+EeFileRuntimeState &PS2Runtime::eeFileRuntimeState()
+{
+    return *m_eeFileRuntimeState;
+}
+
+const EeFileRuntimeState &
+PS2Runtime::eeFileRuntimeState() const
+{
+    return *m_eeFileRuntimeState;
+}
+
+ps2_stubs::CdRuntimeState &PS2Runtime::cdRuntimeState()
+{
+    return *m_cdRuntimeState;
+}
+
+const ps2_stubs::CdRuntimeState &
+PS2Runtime::cdRuntimeState() const
+{
+    return *m_cdRuntimeState;
 }
 
 ps2_stubs::SifRuntimeState &PS2Runtime::sifRuntimeState()
@@ -9124,6 +9154,8 @@ bool PS2Runtime::isStopRequested() const
 void PS2Runtime::run()
 {
     m_stopRequested.store(false, std::memory_order_relaxed);
+    ps2_syscalls::resetFileIoState(this);
+    ps2_stubs::resetCdState(this);
     ps2_stubs::resetSifState(this);
     resetIop();
     ps2_stubs::resetAudioStubState();

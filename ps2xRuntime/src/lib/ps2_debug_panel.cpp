@@ -5,6 +5,7 @@
 
 #include <unordered_set>
 #include "Kernel/Syscalls/Helpers/State.h"
+#include "Kernel/Syscalls/Helpers/FileRuntimeState.h"
 #include "Kernel/Stubs/CD.h"
 #include "Kernel/Stubs/MemoryCard.h"
 #include "Kernel/Stubs/Pad.h"
@@ -1842,9 +1843,13 @@ namespace
 
         std::vector<FdRow> fds;
         {
-            std::lock_guard<std::mutex> lock(g_fd_mutex);
-            fds.reserve(g_fileDescriptors.size());
-            for (const auto &[fd, file] : g_fileDescriptors)
+            EeFileRuntimeState &fileState =
+                runtime.eeFileRuntimeState();
+            std::lock_guard<std::mutex> lock(
+                fileState.descriptorMutex);
+            fds.reserve(fileState.descriptors.size());
+            for (const auto &[fd, file] :
+                 fileState.descriptors)
             {
                 fds.push_back(FdRow{fd, file});
             }
@@ -1870,7 +1875,8 @@ namespace
             ImGui::EndTable();
         }
 
-        const ps2_stubs::CdDebugSnapshot cd = ps2_stubs::getCdDebugSnapshot();
+        const ps2_stubs::CdDebugSnapshot cd =
+            ps2_stubs::getCdDebugSnapshot(&runtime);
         ImGui::SeparatorText("CDVD / sceCd state");
         ImGui::Text("initialized=%u lastError=%d mode=0x%08X streamingLbn=0x%08X endLbn=0x%08X nextPseudoLbn=0x%08X",
                     cd.initialized ? 1u : 0u,

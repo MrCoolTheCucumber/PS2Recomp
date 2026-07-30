@@ -39,7 +39,9 @@ namespace ps2_stubs
         std::vector<CdDebugFileEntry> files;
     };
 
-    CdDebugSnapshot getCdDebugSnapshot();
+    void resetCdState(PS2Runtime *runtime);
+    CdDebugSnapshot getCdDebugSnapshot(
+        PS2Runtime *runtime);
     void sceCdRead(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
     void sceCdSync(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
     void sceCdGetError(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);

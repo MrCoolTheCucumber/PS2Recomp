@@ -1,36 +1,71 @@
 #include "Common.h"
 #include "CD.h"
+#include "Helpers/CdRuntimeState.h"
 #include "MPEG.h"
 
 namespace ps2_stubs
 {
     namespace
     {
-        uint32_t g_cdStReadTraceCount = 0u;
+        CdRuntimeState *getCdRuntimeState(
+            PS2Runtime *runtime)
+        {
+            return runtime
+                ? &runtime->cdRuntimeState()
+                : nullptr;
+        }
     }
 
+    void resetCdState(PS2Runtime *runtime)
+    {
+        CdRuntimeState *const state =
+            getCdRuntimeState(runtime);
+        if (!state)
+        {
+            return;
+        }
 
-    CdDebugSnapshot getCdDebugSnapshot()
+        std::lock_guard<std::mutex> lock(state->mutex);
+        state->resetLocked();
+    }
+
+    CdDebugSnapshot getCdDebugSnapshot(
+        PS2Runtime *runtime)
     {
         CdDebugSnapshot snapshot{};
-        snapshot.initialized = g_cdInitialized;
-        snapshot.lastError = g_lastCdError;
-        snapshot.mode = g_cdMode;
-        snapshot.streamingLbn = g_cdStreamingLbn;
-        snapshot.streamingEndLbn = g_cdStreamingEndLbn;
-        snapshot.nextPseudoLbn = g_nextPseudoLbn;
-        snapshot.imageSizeBytes = g_cdImageSizeBytes;
-        snapshot.imageSizeValid = g_cdImageSizeValid;
+        CdRuntimeState *const state =
+            getCdRuntimeState(runtime);
+        if (!state)
+        {
+            return snapshot;
+        }
+
+        std::lock_guard<std::mutex> lock(state->mutex);
+        snapshot.initialized = state->initialized;
+        snapshot.lastError = state->lastError;
+        snapshot.mode = state->mode;
+        snapshot.streamingLbn = state->streamingLbn;
+        snapshot.streamingEndLbn =
+            state->streamingEndLbn;
+        snapshot.nextPseudoLbn =
+            state->nextPseudoLbn;
+        snapshot.imageSizeBytes =
+            state->imageSizeBytes;
+        snapshot.imageSizeValid =
+            state->imageSizeValid;
         snapshot.cdRoot = getCdRootPath();
         snapshot.cdImage = getCdImagePath();
-        snapshot.imageSizePath = g_cdImageSizePath;
-        snapshot.leafIndexRoot = g_cdLeafIndexRoot;
-        snapshot.leafIndexBuilt = g_cdLeafIndexBuilt;
-        snapshot.leafIndexCount = g_cdLeafIndex.size();
-        snapshot.loosePathIndexCount = g_cdLoosePathIndex.size();
+        snapshot.imageSizePath = state->imageSizePath;
+        snapshot.leafIndexRoot = state->leafIndexRoot;
+        snapshot.leafIndexBuilt = state->leafIndexBuilt;
+        snapshot.leafIndexCount =
+            state->leafIndex.size();
+        snapshot.loosePathIndexCount =
+            state->loosePathIndex.size();
 
-        snapshot.files.reserve(g_cdFilesByKey.size());
-        for (const auto &[key, entry] : g_cdFilesByKey)
+        snapshot.files.reserve(state->filesByKey.size());
+        for (const auto &[key, entry] :
+             state->filesByKey)
         {
             CdDebugFileEntry row{};
             row.key = key;
@@ -49,6 +84,16 @@ namespace ps2_stubs
 
     void sceCdRead(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
+        CdRuntimeState *const state =
+            getCdRuntimeState(runtime);
+        if (!state)
+        {
+            setReturnS32(ctx, 0);
+            return;
+        }
+        std::lock_guard<std::mutex> stateLock(
+            state->mutex);
+
         const uint32_t a0 = getRegU32(ctx, 4); // usually lbn
         const uint32_t a1 = getRegU32(ctx, 5); // usually sector count
         const uint32_t a2 = getRegU32(ctx, 6); // usually destination buffer
@@ -83,7 +128,12 @@ namespace ps2_stubs
                 return true;
             }
 
-            return readCdSectors(args.lbn, args.sectors, rdram + offset, bytes);
+            return readCdSectors(
+                *state,
+                args.lbn,
+                args.sectors,
+                rdram + offset,
+                bytes);
         };
 
         CdReadArgs selected{a0, a1, a2, "a0/a1/a2"};
@@ -94,7 +144,8 @@ namespace ps2_stubs
             // Some game-side wrappers use a nonstandard register layout.
             // If primary decode does not resolve to a known LBN, try safe alternatives.
             constexpr uint32_t kMaxReasonableSectors = PS2_RAM_SIZE / kCdSectorSize;
-            if (!isResolvableCdLbn(selected.lbn))
+            if (!isResolvableCdLbn(
+                    *state, selected.lbn))
             {
                 const std::array<CdReadArgs, 5> alternatives = {
                     CdReadArgs{a2, a1, a0, "a2/a1/a0"},
@@ -109,15 +160,16 @@ namespace ps2_stubs
                     {
                         continue;
                     }
-                    if (!isResolvableCdLbn(candidate.lbn))
+                    if (!isResolvableCdLbn(
+                            *state, candidate.lbn))
                     {
                         continue;
                     }
 
                     if (tryRead(candidate))
                     {
-                        static uint32_t recoverLogCount = 0;
-                        if (recoverLogCount < 16)
+                        if (state->readRecoverLogCount <
+                            16u)
                         {
                             RUNTIME_LOG("[sceCdRead] recovered with alternate args " << candidate.tag
                                                                                      << " (pc=0x" << std::hex << ctx->pc
@@ -125,7 +177,7 @@ namespace ps2_stubs
                                                                                      << " a0=0x" << a0
                                                                                      << " a1=0x" << a1
                                                                                      << " a2=0x" << a2 << std::dec << ")" << std::endl);
-                            ++recoverLogCount;
+                            ++state->readRecoverLogCount;
                         }
                         selected = candidate;
                         ok = true;
@@ -143,22 +195,22 @@ namespace ps2_stubs
                     std::memset(rdram + offset, 0, bytes);
                 }
 
-                static uint32_t unresolvedLogCount = 0;
-                if (unresolvedLogCount < 32)
+                if (state->unresolvedReadLogCount < 32u)
                 {
                     std::cerr << "[sceCdRead] unresolved request pc=0x" << std::hex << ctx->pc
                               << " ra=0x" << getRegU32(ctx, 31)
                               << " a0=0x" << a0
                               << " a1=0x" << a1
                               << " a2=0x" << a2 << std::dec << std::endl;
-                    ++unresolvedLogCount;
+                    ++state->unresolvedReadLogCount;
                 }
             }
         }
 
         if (ok)
         {
-            g_cdStreamingLbn = selected.lbn + selected.sectors;
+            state->streamingLbn =
+                selected.lbn + selected.sectors;
             setReturnS32(ctx, 1); // command accepted/success
             return;
         }
@@ -173,7 +225,15 @@ namespace ps2_stubs
 
     void sceCdGetError(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
-        setReturnS32(ctx, g_lastCdError);
+        CdRuntimeState *const state =
+            getCdRuntimeState(runtime);
+        if (!state)
+        {
+            setReturnS32(ctx, -1);
+            return;
+        }
+        std::lock_guard<std::mutex> lock(state->mutex);
+        setReturnS32(ctx, state->lastError);
     }
 
     void sceCdRI(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
@@ -224,7 +284,15 @@ namespace ps2_stubs
 
     void sceCdGetReadPos(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
-        setReturnU32(ctx, g_cdStreamingLbn);
+        CdRuntimeState *const state =
+            getCdRuntimeState(runtime);
+        if (!state)
+        {
+            setReturnU32(ctx, 0u);
+            return;
+        }
+        std::lock_guard<std::mutex> lock(state->mutex);
+        setReturnU32(ctx, state->streamingLbn);
     }
 
     void sceCdGetToc(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
@@ -239,8 +307,16 @@ namespace ps2_stubs
 
     void sceCdInit(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
-        g_cdInitialized = true;
-        g_lastCdError = 0;
+        CdRuntimeState *const state =
+            getCdRuntimeState(runtime);
+        if (!state)
+        {
+            setReturnS32(ctx, 0);
+            return;
+        }
+        std::lock_guard<std::mutex> lock(state->mutex);
+        state->initialized = true;
+        state->lastError = 0;
         setReturnS32(ctx, 1);
     }
 
@@ -275,7 +351,15 @@ namespace ps2_stubs
 
     void sceCdMmode(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
-        g_cdMode = getRegU32(ctx, 4);
+        CdRuntimeState *const state =
+            getCdRuntimeState(runtime);
+        if (!state)
+        {
+            setReturnS32(ctx, 0);
+            return;
+        }
+        std::lock_guard<std::mutex> lock(state->mutex);
+        state->mode = getRegU32(ctx, 4);
         setReturnS32(ctx, 1);
     }
 
@@ -309,6 +393,16 @@ namespace ps2_stubs
 
     void sceCdReadChain(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
+        CdRuntimeState *const state =
+            getCdRuntimeState(runtime);
+        if (!state)
+        {
+            setReturnS32(ctx, 0);
+            return;
+        }
+        std::lock_guard<std::mutex> stateLock(
+            state->mutex);
+
         uint32_t chainAddr = getRegU32(ctx, 4);
         bool ok = true;
 
@@ -337,13 +431,18 @@ namespace ps2_stubs
                 bytes = maxBytes;
             }
 
-            if (!readCdSectors(lbn, sectors, rdram + offset, bytes))
+            if (!readCdSectors(
+                    *state,
+                    lbn,
+                    sectors,
+                    rdram + offset,
+                    bytes))
             {
                 ok = false;
                 break;
             }
 
-            g_cdStreamingLbn = lbn + sectors;
+            state->streamingLbn = lbn + sectors;
         }
 
         setReturnS32(ctx, ok ? 1 : 0);
@@ -386,13 +485,24 @@ namespace ps2_stubs
 
     void sceCdSearchFile(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
+        CdRuntimeState *const state =
+            getCdRuntimeState(runtime);
+        if (!state)
+        {
+            setReturnS32(ctx, 0);
+            return;
+        }
+        std::lock_guard<std::mutex> stateLock(
+            state->mutex);
+
         uint32_t fileAddr = getRegU32(ctx, 4);
         uint32_t pathAddr = getRegU32(ctx, 5);
         const std::string path = readPs2CStringBounded(rdram, pathAddr, 260);
         const std::string normalizedPath = normalizeCdPathNoPrefix(path);
-        static uint32_t traceCount = 0;
         const uint32_t callerRa = getRegU32(ctx, 31);
-        const bool shouldTrace = (traceCount < 128u) || ((traceCount % 512u) == 0u);
+        const bool shouldTrace =
+            (state->searchTraceCount < 128u) ||
+            ((state->searchTraceCount % 512u) == 0u);
         if (shouldTrace)
         {
             RUNTIME_LOG("[sceCdSearchFile] pc=0x" << std::hex << ctx->pc
@@ -402,12 +512,12 @@ namespace ps2_stubs
                                                   << " path=\"" << sanitizeForLog(path) << "\""
                                                   << std::dec << std::endl);
         }
-        ++traceCount;
+        ++state->searchTraceCount;
 
         if (path.empty())
         {
-            static uint32_t emptyPathCount = 0;
-            if (emptyPathCount < 64 || (emptyPathCount % 512u) == 0u)
+            if (state->emptyPathCount < 64u ||
+                (state->emptyPathCount % 512u) == 0u)
             {
                 std::ostringstream preview;
                 preview << std::hex;
@@ -420,51 +530,55 @@ namespace ps2_stubs
                           << " preview=" << preview.str()
                           << " ra=0x" << callerRa << std::dec << std::endl;
             }
-            ++emptyPathCount;
-            g_lastCdError = -1;
+            ++state->emptyPathCount;
+            state->lastError = -1;
             setReturnS32(ctx, 0);
             return;
         }
 
         if (normalizedPath.empty())
         {
-            static uint32_t emptyNormalizedCount = 0;
-            if (emptyNormalizedCount < 64u || (emptyNormalizedCount % 512u) == 0u)
+            if (state->emptyNormalizedCount < 64u ||
+                (state->emptyNormalizedCount % 512u) ==
+                    0u)
             {
                 std::cerr << "sceCdSearchFile failed: " << sanitizeForLog(path)
                           << " (normalized path is empty, root: " << getCdRootPath().string() << ")"
                           << std::endl;
             }
-            ++emptyNormalizedCount;
-            g_lastCdError = -1;
+            ++state->emptyNormalizedCount;
+            state->lastError = -1;
             setReturnS32(ctx, 0);
             return;
         }
 
         CdFileEntry entry;
-        bool found = registerCdFile(path, entry);
+        bool found = registerCdFile(
+            *state, path, entry);
         CdFileEntry resolvedEntry = entry;
         std::string resolvedPath;
 
         if (!found)
         {
-            static std::string lastFailedPath;
-            static uint32_t samePathFailCount = 0;
-            if (path == lastFailedPath)
+            if (path == state->lastFailedPath)
             {
-                ++samePathFailCount;
+                ++state->samePathFailCount;
             }
             else
             {
-                lastFailedPath = path;
-                samePathFailCount = 1;
+                state->lastFailedPath = path;
+                state->samePathFailCount = 1u;
             }
 
-            if (samePathFailCount <= 16u || (samePathFailCount % 512u) == 0u)
+            if (state->samePathFailCount <= 16u ||
+                (state->samePathFailCount % 512u) ==
+                    0u)
             {
                 std::cerr << "sceCdSearchFile failed: " << sanitizeForLog(path)
                           << " (root: " << getCdRootPath().string()
-                          << ", repeat=" << samePathFailCount << ")" << std::endl;
+                          << ", repeat="
+                          << state->samePathFailCount
+                          << ")" << std::endl;
             }
             setReturnS32(ctx, 0);
             return;
@@ -472,13 +586,15 @@ namespace ps2_stubs
 
         if (!writeCdSearchResult(rdram, fileAddr, path, resolvedEntry))
         {
-            g_lastCdError = -1;
+            state->lastError = -1;
             setReturnS32(ctx, 0);
             return;
         }
 
-        g_cdStreamingLbn = resolvedEntry.baseLbn;
-        g_cdStreamingEndLbn = resolvedEntry.baseLbn + resolvedEntry.sectors;
+        state->streamingLbn = resolvedEntry.baseLbn;
+        state->streamingEndLbn =
+            resolvedEntry.baseLbn +
+            resolvedEntry.sectors;
         if (shouldTrace)
         {
             RUNTIME_LOG("[sceCdSearchFile:ok] path=\"" << sanitizeForLog(path)
@@ -492,8 +608,18 @@ namespace ps2_stubs
 
     void sceCdSeek(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
-        g_cdStreamingLbn = getRegU32(ctx, 4);
-        g_cdStreamingEndLbn = cdStreamingEndLbnForStart(g_cdStreamingLbn);
+        CdRuntimeState *const state =
+            getCdRuntimeState(runtime);
+        if (!state)
+        {
+            setReturnS32(ctx, 0);
+            return;
+        }
+        std::lock_guard<std::mutex> lock(state->mutex);
+        state->streamingLbn = getRegU32(ctx, 4);
+        state->streamingEndLbn =
+            cdStreamingEndLbnForStart(
+                *state, state->streamingLbn);
         setReturnS32(ctx, 1);
     }
 
@@ -504,7 +630,15 @@ namespace ps2_stubs
 
     void sceCdStatus(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
-        setReturnS32(ctx, g_cdInitialized ? 6 : 0);
+        CdRuntimeState *const state =
+            getCdRuntimeState(runtime);
+        if (!state)
+        {
+            setReturnS32(ctx, 0);
+            return;
+        }
+        std::lock_guard<std::mutex> lock(state->mutex);
+        setReturnS32(ctx, state->initialized ? 6 : 0);
     }
 
     void sceCdStInit(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
@@ -524,85 +658,138 @@ namespace ps2_stubs
 
     void sceCdStRead(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
-        uint32_t requestedSectors = getRegU32(ctx, 4);
-        uint32_t sectors = requestedSectors;
-        uint32_t buf = getRegU32(ctx, 5);
-        uint32_t errAddr = getRegU32(ctx, 7);
-
-        uint32_t offset = buf & PS2_RAM_MASK;
-        size_t requestedBytes = static_cast<size_t>(requestedSectors) * kCdSectorSize;
-        const size_t maxBytes = PS2_RAM_SIZE - offset;
-        if (requestedBytes > maxBytes)
+        CdRuntimeState *const state =
+            getCdRuntimeState(runtime);
+        if (!state)
         {
-            requestedBytes = maxBytes;
+            setReturnS32(ctx, 0);
+            return;
         }
 
-        bool hitStreamEnd = false;
-        if (g_cdStreamingEndLbn != 0xFFFFFFFFu)
+        bool notifyEof = false;
+        int32_t result = 0;
         {
-            if (g_cdStreamingLbn >= g_cdStreamingEndLbn)
+            std::lock_guard<std::mutex> lock(
+                state->mutex);
+            const uint32_t requestedSectors =
+                getRegU32(ctx, 4);
+            uint32_t sectors = requestedSectors;
+            const uint32_t buf = getRegU32(ctx, 5);
+            const uint32_t errAddr = getRegU32(ctx, 7);
+
+            const uint32_t offset = buf & PS2_RAM_MASK;
+            size_t requestedBytes =
+                static_cast<size_t>(requestedSectors) *
+                kCdSectorSize;
+            const size_t maxBytes =
+                PS2_RAM_SIZE - offset;
+            if (requestedBytes > maxBytes)
             {
-                sectors = 0u;
-                hitStreamEnd = true;
+                requestedBytes = maxBytes;
+            }
+
+            bool hitStreamEnd = false;
+            if (state->streamingEndLbn !=
+                0xFFFFFFFFu)
+            {
+                if (state->streamingLbn >=
+                    state->streamingEndLbn)
+                {
+                    sectors = 0u;
+                    hitStreamEnd = true;
+                }
+                else
+                {
+                    const uint32_t remaining =
+                        state->streamingEndLbn -
+                        state->streamingLbn;
+                    if (sectors > remaining)
+                    {
+                        sectors = remaining;
+                        hitStreamEnd = true;
+                    }
+                }
+            }
+
+            size_t bytes =
+                static_cast<size_t>(sectors) *
+                kCdSectorSize;
+            if (bytes > maxBytes)
+            {
+                bytes = maxBytes;
+            }
+
+            const uint32_t readLbn =
+                state->streamingLbn;
+            const bool ok =
+                sectors > 0u &&
+                readCdSectors(
+                    *state,
+                    readLbn,
+                    sectors,
+                    rdram + offset,
+                    bytes);
+            if (ok)
+            {
+                state->streamingLbn += sectors;
+                if (requestedBytes > bytes)
+                {
+                    std::memset(
+                        rdram + offset + bytes,
+                        0,
+                        requestedBytes - bytes);
+                }
+                notifyEof =
+                    hitStreamEnd ||
+                    state->streamingLbn ==
+                        state->streamingEndLbn;
             }
             else
             {
-                const uint32_t remaining = g_cdStreamingEndLbn - g_cdStreamingLbn;
-                if (sectors > remaining)
+                if (requestedBytes > 0u)
                 {
-                    sectors = remaining;
-                    hitStreamEnd = true;
+                    std::memset(
+                        rdram + offset,
+                        0,
+                        requestedBytes);
                 }
+                notifyEof = true;
             }
+
+            if (int32_t *err =
+                    reinterpret_cast<int32_t *>(
+                        getMemPtr(rdram, errAddr));
+                err)
+            {
+                *err = ok ? 0 : state->lastError;
+            }
+
+            if (state->stReadTraceCount < 32u)
+            {
+                std::cerr
+                    << "[sceCdStRead] sectors="
+                    << requestedSectors
+                    << " read=" << sectors
+                    << " buf=0x" << std::hex << buf
+                    << " lbn=0x" << readLbn
+                    << " end=0x"
+                    << state->streamingEndLbn
+                    << std::dec << " ok=" << ok
+                    << " bytes=" << bytes
+                    << std::endl;
+                ++state->stReadTraceCount;
+            }
+
+            result = ok
+                ? static_cast<int32_t>(sectors)
+                : 0;
         }
 
-        size_t bytes = static_cast<size_t>(sectors) * kCdSectorSize;
-        if (bytes > maxBytes)
+        if (notifyEof)
         {
-            bytes = maxBytes;
-        }
-
-        const uint32_t readLbn = g_cdStreamingLbn;
-        const bool ok = (sectors > 0u) && readCdSectors(readLbn, sectors, rdram + offset, bytes);
-        if (ok)
-        {
-            g_cdStreamingLbn += sectors;
-            if (requestedBytes > bytes)
-            {
-                std::memset(rdram + offset + bytes, 0, requestedBytes - bytes);
-            }
-            if (hitStreamEnd || g_cdStreamingLbn == g_cdStreamingEndLbn)
-            {
-                notifyMpegCdStreamEof(runtime);
-            }
-        }
-        else
-        {
-            if (requestedBytes > 0u)
-            {
-                std::memset(rdram + offset, 0, requestedBytes);
-            }
             notifyMpegCdStreamEof(runtime);
         }
-
-        if (int32_t *err = reinterpret_cast<int32_t *>(getMemPtr(rdram, errAddr)); err)
-        {
-            *err = ok ? 0 : g_lastCdError;
-        }
-
-        if (g_cdStReadTraceCount < 32u)
-        {
-            std::cerr << "[sceCdStRead] sectors=" << requestedSectors
-                      << " read=" << sectors
-                      << " buf=0x" << std::hex << buf
-                      << " lbn=0x" << readLbn
-                      << " end=0x" << g_cdStreamingEndLbn
-                      << std::dec << " ok=" << ok
-                      << " bytes=" << bytes << std::endl;
-            ++g_cdStReadTraceCount;
-        }
-
-        setReturnS32(ctx, ok ? static_cast<int32_t>(sectors) : 0);
+        setReturnS32(ctx, result);
     }
 
     void sceCdStream(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
@@ -617,28 +804,58 @@ namespace ps2_stubs
 
     void sceCdStSeek(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
-        g_cdStreamingLbn = getRegU32(ctx, 4);
-        g_cdStreamingEndLbn = cdStreamingEndLbnForStart(g_cdStreamingLbn);
+        CdRuntimeState *const state =
+            getCdRuntimeState(runtime);
+        if (!state)
+        {
+            setReturnS32(ctx, 0);
+            return;
+        }
+        std::lock_guard<std::mutex> lock(state->mutex);
+        state->streamingLbn = getRegU32(ctx, 4);
+        state->streamingEndLbn =
+            cdStreamingEndLbnForStart(
+                *state, state->streamingLbn);
         setReturnS32(ctx, 1);
     }
 
     void sceCdStSeekF(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
-        g_cdStreamingLbn = getRegU32(ctx, 4);
-        g_cdStreamingEndLbn = cdStreamingEndLbnForStart(g_cdStreamingLbn);
-        setReturnS32(ctx, 1);
+        sceCdStSeek(rdram, ctx, runtime);
     }
 
     void sceCdStStart(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
-        g_cdStreamingLbn = getRegU32(ctx, 4);
-        g_cdStreamingEndLbn = cdStreamingEndLbnForStart(g_cdStreamingLbn);
-        g_cdStReadTraceCount = 0u;
+        CdRuntimeState *const state =
+            getCdRuntimeState(runtime);
+        if (!state)
+        {
+            setReturnS32(ctx, 0);
+            return;
+        }
+
+        uint32_t streamingLbn = 0u;
+        uint32_t streamingEndLbn = 0xFFFFFFFFu;
+        {
+            std::lock_guard<std::mutex> lock(
+                state->mutex);
+            state->streamingLbn = getRegU32(ctx, 4);
+            state->streamingEndLbn =
+                cdStreamingEndLbnForStart(
+                    *state, state->streamingLbn);
+            state->stReadTraceCount = 0u;
+            streamingLbn = state->streamingLbn;
+            streamingEndLbn =
+                state->streamingEndLbn;
+        }
 
         notifyMpegCdStreamStart(runtime);
 
-        std::cerr << "[sceCdStStart] lbn=0x" << std::hex << g_cdStreamingLbn
-                  << " endLbn=0x" << g_cdStreamingEndLbn << std::dec << std::endl;
+        std::cerr << "[sceCdStStart] lbn=0x"
+                  << std::hex << streamingLbn
+                  << " endLbn=0x"
+                  << streamingEndLbn
+                  << std::dec << std::endl;
         setReturnS32(ctx, 1);
     }
 
