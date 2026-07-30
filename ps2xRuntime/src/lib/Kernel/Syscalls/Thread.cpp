@@ -11,6 +11,65 @@ namespace ps2_syscalls
         int wakeupCount = 0;
     };
 
+    static EeThreadWakePublication
+    applyEeExecutorThreadWake(
+        ps2x::ee::EeThreadScheduler &scheduler,
+        const std::shared_ptr<ThreadInfo> &info,
+        int threadId,
+        uint32_t generation)
+    {
+        EeThreadWakePublication publication{};
+        const auto result =
+            scheduler.wakeThread(
+                {
+                    threadId,
+                    generation,
+                });
+        std::lock_guard<std::mutex> lock(info->m);
+        switch (result)
+        {
+        case ps2x::ee::EeSchedulerWakeResult::
+            WokeSleeper:
+            if (!info->guestState.wakeSleeping())
+            {
+                throw std::logic_error(
+                    "EE scheduler and guest sleep state "
+                    "diverged during wake");
+            }
+            publication.result =
+                EeThreadWakeResult::WokeSleeper;
+            info->cv.notify_one();
+            break;
+        case ps2x::ee::EeSchedulerWakeResult::
+            WakeupCounted:
+            info->guestState.incrementWakeup();
+            publication.result =
+                EeThreadWakeResult::WakeupCounted;
+            break;
+        case ps2x::ee::EeSchedulerWakeResult::Dormant:
+            publication.result =
+                EeThreadWakeResult::Dormant;
+            break;
+        case ps2x::ee::EeSchedulerWakeResult::
+            InvalidHandle:
+            publication.result =
+                EeThreadWakeResult::StaleHandle;
+            break;
+        case ps2x::ee::EeSchedulerWakeResult::
+            WakeupCountOverflow:
+            publication.result =
+                EeThreadWakeResult::InvalidHandle;
+            break;
+        }
+
+        const auto &guest =
+            info->guestState.snapshot();
+        publication.status = guest.status;
+        publication.wakeupCount =
+            guest.wakeupCount;
+        return publication;
+    }
+
     // The caller retains threadMapMutex so deletion, reset, and publication
     // have one ordering boundary. This function acquires only the selected
     // thread's state mutex.
@@ -104,26 +163,67 @@ namespace ps2_syscalls
 
         EeThreadRuntimeState &state =
             runtime->eeThreadRuntimeState();
-        std::lock_guard<std::mutex> lock(
-            state.threadMapMutex);
-        if (handle.runtimeGeneration !=
-            state.runtimeGeneration)
+        if (!runtime->usesDedicatedEeExecutor())
         {
-            return EeThreadWakeResult::StaleHandle;
+            std::lock_guard<std::mutex> lock(
+                state.threadMapMutex);
+            if (handle.runtimeGeneration !=
+                state.runtimeGeneration)
+            {
+                return EeThreadWakeResult::StaleHandle;
+            }
+            const auto it =
+                state.threads.find(handle.threadId);
+            if (it == state.threads.end() ||
+                !it->second ||
+                it->second->generation !=
+                    handle.threadGeneration)
+            {
+                return EeThreadWakeResult::StaleHandle;
+            }
+            return publishRegisteredEeThreadWake(
+                       it->second)
+                .result;
         }
 
-        const auto it = state.threads.find(handle.threadId);
-        if (it == state.threads.end() ||
-            !it->second ||
-            it->second->generation !=
-                handle.threadGeneration)
+        std::shared_ptr<ThreadInfo> info;
         {
-            return EeThreadWakeResult::StaleHandle;
+            std::lock_guard<std::mutex> lock(
+                state.threadMapMutex);
+            if (handle.runtimeGeneration !=
+                state.runtimeGeneration)
+            {
+                return EeThreadWakeResult::StaleHandle;
+            }
+
+            const auto it =
+                state.threads.find(handle.threadId);
+            if (it == state.threads.end() ||
+                !it->second ||
+                it->second->generation !=
+                    handle.threadGeneration)
+            {
+                return EeThreadWakeResult::StaleHandle;
+            }
+            info = it->second;
         }
 
-        return publishRegisteredEeThreadWake(
-                   it->second)
-            .result;
+        const auto publication =
+            std::make_shared<
+                EeThreadWakePublication>();
+        runtime->invokeEeSchedulerUpdateAtBoundary(
+            [info, handle, publication](
+                ps2x::ee::EeThreadScheduler
+                    &scheduler)
+            {
+                *publication =
+                    applyEeExecutorThreadWake(
+                        scheduler,
+                        info,
+                        handle.threadId,
+                        handle.threadGeneration);
+            });
+        return publication->result;
     }
 
     static void eraseThreadContextMappingsLocked(
@@ -1346,6 +1446,147 @@ namespace ps2_syscalls
 
         throwIfTerminated(info);
 
+        if (runtime->usesDedicatedEeExecutor())
+        {
+            struct SleepTransition
+            {
+                ps2x::ee::EeSchedulerSleepDisposition
+                    disposition =
+                        ps2x::ee::
+                            EeSchedulerSleepDisposition::
+                                InvalidCurrentThread;
+                bool applied = false;
+            };
+
+            const int threadId =
+                getCurrentThreadId(runtime);
+            const uint32_t generation =
+                info->generation;
+            const auto transition =
+                std::make_shared<SleepTransition>();
+            const bool published =
+                runtime->publishEeSchedulerUpdate(
+                    [info,
+                     threadId,
+                     generation,
+                     transition](
+                        ps2x::ee::EeThreadScheduler
+                            &scheduler)
+                    {
+                        const auto handle =
+                            scheduler.threadHandle(
+                                threadId);
+                        if (!handle.has_value() ||
+                            handle->generation !=
+                                generation)
+                        {
+                            throw std::logic_error(
+                                "SleepThread lost its EE "
+                                "scheduler record");
+                        }
+
+                        const auto result =
+                            scheduler
+                                .sleepCurrentThread();
+                        std::lock_guard<std::mutex> lock(
+                            info->m);
+                        switch (result.disposition)
+                        {
+                        case ps2x::ee::
+                            EeSchedulerSleepDisposition::
+                                WakeupConsumed:
+                            if (!info->guestState
+                                     .consumeWakeup())
+                            {
+                                throw std::logic_error(
+                                    "SleepThread scheduler "
+                                    "and guest wake counts "
+                                    "diverged");
+                            }
+                            break;
+                        case ps2x::ee::
+                            EeSchedulerSleepDisposition::
+                                Blocked:
+                            if (!info->guestState.block(
+                                    EeThreadWaitQueue::
+                                        Sleep,
+                                    TSW_SLEEP,
+                                    0))
+                            {
+                                throw std::logic_error(
+                                    "SleepThread could not "
+                                    "mirror its scheduler "
+                                    "wait");
+                            }
+                            info->forceRelease = false;
+                            break;
+                        case ps2x::ee::
+                            EeSchedulerSleepDisposition::
+                                InvalidCurrentThread:
+                            throw std::logic_error(
+                                "SleepThread has no "
+                                "running scheduler owner");
+                        }
+
+                        transition->disposition =
+                            result.disposition;
+                        transition->applied = true;
+                    },
+                    ps2x::ee::
+                        EeSchedulerReschedulePolicy::
+                            None);
+            if (!published)
+            {
+                throw std::runtime_error(
+                    "SleepThread could not publish its "
+                    "EE scheduler transition");
+            }
+
+            runtime->yieldEeExecutorCurrent(
+                ps2x::ee::EeSchedulerExitReason::
+                    Preempted);
+            if (!transition->applied)
+            {
+                throw std::logic_error(
+                    "SleepThread resumed before its "
+                    "scheduler transition");
+            }
+
+            int ret = threadId;
+            bool terminated = false;
+            if (transition->disposition ==
+                ps2x::ee::
+                    EeSchedulerSleepDisposition::
+                        Blocked)
+            {
+                std::lock_guard<std::mutex> lock(
+                    info->m);
+                terminated = info->terminated.load();
+                if (!terminated)
+                {
+                    info->guestState.finishWait(
+                        EeThreadWaitQueue::Sleep,
+                        TSW_SLEEP,
+                        0,
+                        false);
+                    if (info->forceRelease.load())
+                    {
+                        info->forceRelease = false;
+                        ret = KE_RELEASE_WAIT;
+                    }
+                }
+            }
+            if (terminated)
+            {
+                throw ThreadExitException();
+            }
+
+            waitWhileSuspended(info, runtime);
+            (void)publishRunningAtGuestBoundary(info);
+            setReturnS32(ctx, ret);
+            return;
+        }
+
         int ret = 0;
         int wakeupCountAfter = 0;
         bool terminated = false;
@@ -1469,6 +1710,119 @@ namespace ps2_syscalls
             return;
         }
 
+        if (runtime->usesDedicatedEeExecutor())
+        {
+            auto info = lookupThreadInfo(runtime, tid);
+            if (!info)
+            {
+                setReturnS32(
+                    ctx,
+                    reschedule
+                        ? KE_UNKNOWN_THID
+                        : KE_ERROR);
+                return;
+            }
+
+            {
+                std::lock_guard<std::mutex> lock(
+                    info->m);
+                if (info->guestState.isDormant())
+                {
+                    setReturnS32(ctx, KE_DORMANT);
+                    return;
+                }
+            }
+
+            struct WakeTransition
+            {
+                EeThreadWakePublication publication{};
+                bool applied = false;
+            };
+            const uint32_t generation =
+                info->generation;
+            const auto transition =
+                std::make_shared<WakeTransition>();
+            const bool published =
+                runtime->publishEeSchedulerUpdate(
+                    [info,
+                     tid,
+                     generation,
+                     transition](
+                        ps2x::ee::EeThreadScheduler
+                            &scheduler)
+                    {
+                        transition->publication =
+                            applyEeExecutorThreadWake(
+                                scheduler,
+                                info,
+                                tid,
+                                generation);
+                        transition->applied = true;
+                    },
+                    reschedule
+                        ? ps2x::ee::
+                              EeSchedulerReschedulePolicy::
+                                  HigherPriorityOnly
+                        : ps2x::ee::
+                              EeSchedulerReschedulePolicy::
+                                  None);
+            if (!published)
+            {
+                setReturnS32(ctx, KE_ERROR);
+                return;
+            }
+
+            runtime->yieldEeExecutorCurrent(
+                ps2x::ee::EeSchedulerExitReason::
+                    Preempted);
+            if (!transition->applied)
+            {
+                throw std::logic_error(
+                    "WakeupThread resumed before its "
+                    "scheduler transition");
+            }
+
+            const EeThreadWakePublication &publication =
+                transition->publication;
+            if (publication.result ==
+                    EeThreadWakeResult::InvalidHandle ||
+                publication.result ==
+                    EeThreadWakeResult::StaleHandle)
+            {
+                setReturnS32(
+                    ctx,
+                    reschedule
+                        ? KE_UNKNOWN_THID
+                        : KE_ERROR);
+                return;
+            }
+            if (publication.result ==
+                EeThreadWakeResult::Dormant)
+            {
+                setReturnS32(ctx, KE_DORMANT);
+                return;
+            }
+
+            static std::atomic<uint32_t>
+                s_executorWakeupLogs{0};
+            const uint32_t wakeupLog =
+                s_executorWakeupLogs.fetch_add(
+                    1, std::memory_order_relaxed);
+            if (wakeupLog < 256u)
+            {
+                RUNTIME_LOG(
+                    "[WakeupThread] tid="
+                    << getCurrentThreadId(runtime)
+                    << " target=" << tid
+                    << " status=" << publication.status
+                    << " wakeupCount="
+                    << publication.wakeupCount
+                    << std::endl);
+            }
+            setReturnS32(ctx, tid);
+            return;
+        }
+
         const EeThreadWakePublication publication =
             publishEeThreadWakeById(runtime, tid);
         if (publication.result ==
@@ -1535,6 +1889,63 @@ namespace ps2_syscalls
             return;
         }
 
+        if (runtime->usesDedicatedEeExecutor())
+        {
+            const uint32_t generation =
+                info->generation;
+            const auto previous =
+                std::make_shared<
+                    std::optional<uint32_t>>();
+            const bool published =
+                runtime->publishEeSchedulerUpdate(
+                    [info, tid, generation, previous](
+                        ps2x::ee::EeThreadScheduler
+                            &scheduler)
+                    {
+                        *previous =
+                            scheduler.cancelWakeups(
+                                {
+                                    tid,
+                                    generation,
+                                });
+                        if (!previous->has_value())
+                        {
+                            return;
+                        }
+                        std::lock_guard<std::mutex> lock(
+                            info->m);
+                        const int mirrored =
+                            info->guestState
+                                .cancelWakeups();
+                        if (mirrored !=
+                            static_cast<int>(
+                                **previous))
+                        {
+                            throw std::logic_error(
+                                "CancelWakeupThread "
+                                "scheduler and guest "
+                                "counts diverged");
+                        }
+                    },
+                    ps2x::ee::
+                        EeSchedulerReschedulePolicy::
+                            None);
+            if (!published)
+            {
+                setReturnS32(ctx, KE_ERROR);
+                return;
+            }
+            runtime->yieldEeExecutorCurrent(
+                ps2x::ee::EeSchedulerExitReason::
+                    Preempted);
+            setReturnS32(
+                ctx,
+                previous->has_value()
+                    ? static_cast<int>(**previous)
+                    : KE_UNKNOWN_THID);
+            return;
+        }
+
         int previous = 0;
         {
             std::lock_guard<std::mutex> lock(info->m);
@@ -1556,6 +1967,63 @@ namespace ps2_syscalls
         if (!info)
         {
             setReturnS32(ctx, KE_UNKNOWN_THID);
+            return;
+        }
+
+        if (runtime->usesDedicatedEeExecutor())
+        {
+            const uint32_t generation =
+                info->generation;
+            const auto previous =
+                std::make_shared<
+                    std::optional<uint32_t>>();
+            const bool published =
+                runtime->publishEeSchedulerUpdate(
+                    [info, tid, generation, previous](
+                        ps2x::ee::EeThreadScheduler
+                            &scheduler)
+                    {
+                        *previous =
+                            scheduler.cancelWakeups(
+                                {
+                                    tid,
+                                    generation,
+                                });
+                        if (!previous->has_value())
+                        {
+                            return;
+                        }
+                        std::lock_guard<std::mutex> lock(
+                            info->m);
+                        const int mirrored =
+                            info->guestState
+                                .cancelWakeups();
+                        if (mirrored !=
+                            static_cast<int>(
+                                **previous))
+                        {
+                            throw std::logic_error(
+                                "iCancelWakeupThread "
+                                "scheduler and guest "
+                                "counts diverged");
+                        }
+                    },
+                    ps2x::ee::
+                        EeSchedulerReschedulePolicy::
+                            None);
+            if (!published)
+            {
+                setReturnS32(ctx, KE_ERROR);
+                return;
+            }
+            runtime->yieldEeExecutorCurrent(
+                ps2x::ee::EeSchedulerExitReason::
+                    Preempted);
+            setReturnS32(
+                ctx,
+                previous->has_value()
+                    ? static_cast<int>(**previous)
+                    : KE_UNKNOWN_THID);
             return;
         }
 

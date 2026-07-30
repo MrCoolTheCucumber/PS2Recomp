@@ -91,6 +91,14 @@ namespace
         0x259800u;
     constexpr uint32_t K_EXECUTOR_CHILD_ENTRY =
         0x259900u;
+    constexpr uint32_t K_EXECUTOR_SLEEP_MAIN_ENTRY =
+        0x259a00u;
+    constexpr uint32_t K_EXECUTOR_SLEEP_CHILD_ENTRY =
+        0x259b00u;
+    constexpr uint32_t K_EXECUTOR_EXTERNAL_MAIN_ENTRY =
+        0x259c00u;
+    constexpr uint32_t K_EXECUTOR_EXTERNAL_CHILD_ENTRY =
+        0x259d00u;
 
     std::mutex g_guestWordMutex;
     std::mutex g_alarmCallbackThreadMutex;
@@ -100,6 +108,27 @@ namespace
     std::thread::id g_executorMainHostThread;
     std::thread::id g_executorChildHostThread;
     int g_executorChildThreadId = 0;
+    std::array<int, 3u> g_executorWakeCountResults{
+        KE_ERROR,
+        KE_ERROR,
+        KE_ERROR,
+    };
+    std::vector<int> g_executorSleepOrder;
+    int g_executorSleepChildThreadId = 0;
+    int g_executorSleepResult = KE_ERROR;
+    int g_executorSecondSleepResult = KE_ERROR;
+    int g_executorWakeResult = KE_ERROR;
+    int g_executorRawWakeResult = KE_ERROR;
+    bool g_executorMainAttemptedWake = false;
+    bool g_executorChildRanInsideWake = false;
+    bool g_executorChildRanInsideRawWake = false;
+    bool g_executorWakeInProgress = false;
+    bool g_executorRawWakeInProgress = false;
+    bool g_executorSleepRescued = false;
+    int g_executorExternalChildThreadId = 0;
+    int g_executorExternalSleepResult = KE_ERROR;
+    bool g_executorExternalMainReturned = false;
+    bool g_executorExternalChildReturned = false;
 
     struct EeThreadStatus
     {
@@ -561,7 +590,7 @@ namespace
     }
 
     void dedicatedExecutorChildHandler(
-        uint8_t *,
+        uint8_t *rdram,
         R5900Context *ctx,
         PS2Runtime *runtime)
     {
@@ -572,6 +601,11 @@ namespace
                 std::this_thread::get_id();
             g_executorFixtureOrder.push_back(
                 runtime->currentEeThreadId());
+        }
+        for (int wake = 0; wake < 3; ++wake)
+        {
+            setRegU32(*ctx, 4, 1u);
+            WakeupThread(rdram, ctx, runtime);
         }
         ctx->pc = 0u;
     }
@@ -616,6 +650,177 @@ namespace
                 g_executorFixtureMutex);
             g_executorFixtureOrder.push_back(
                 runtime->currentEeThreadId());
+        }
+        SleepThread(rdram, ctx, runtime);
+        {
+            std::lock_guard<std::mutex> lock(
+                g_executorFixtureMutex);
+            g_executorWakeCountResults[0] =
+                getRegS32(*ctx, 2);
+        }
+        SleepThread(rdram, ctx, runtime);
+        {
+            std::lock_guard<std::mutex> lock(
+                g_executorFixtureMutex);
+            g_executorWakeCountResults[1] =
+                getRegS32(*ctx, 2);
+        }
+        setRegU32(*ctx, 4, 0u);
+        CancelWakeupThread(rdram, ctx, runtime);
+        {
+            std::lock_guard<std::mutex> lock(
+                g_executorFixtureMutex);
+            g_executorWakeCountResults[2] =
+                getRegS32(*ctx, 2);
+        }
+        ctx->pc = 0u;
+    }
+
+    void dedicatedExecutorSleepChildHandler(
+        uint8_t *rdram,
+        R5900Context *ctx,
+        PS2Runtime *runtime)
+    {
+        {
+            std::lock_guard<std::mutex> lock(
+                g_executorFixtureMutex);
+            g_executorSleepOrder.push_back(1);
+        }
+        SleepThread(rdram, ctx, runtime);
+        {
+            std::lock_guard<std::mutex> lock(
+                g_executorFixtureMutex);
+            g_executorSleepResult =
+                getRegS32(*ctx, 2);
+            g_executorChildRanInsideWake =
+                g_executorWakeInProgress;
+            g_executorSleepOrder.push_back(2);
+        }
+        SleepThread(rdram, ctx, runtime);
+        {
+            std::lock_guard<std::mutex> lock(
+                g_executorFixtureMutex);
+            g_executorSecondSleepResult =
+                getRegS32(*ctx, 2);
+            g_executorChildRanInsideRawWake =
+                g_executorRawWakeInProgress;
+            g_executorSleepOrder.push_back(4);
+        }
+        ctx->pc = 0u;
+    }
+
+    void dedicatedExecutorSleepMainHandler(
+        uint8_t *rdram,
+        R5900Context *ctx,
+        PS2Runtime *runtime)
+    {
+        InitThread(rdram, ctx, runtime);
+
+        setRegU32(
+            *ctx,
+            4,
+            K_EXECUTOR_THREAD_PARAM_ADDR);
+        CreateThread(rdram, ctx, runtime);
+        const int childThreadId =
+            getRegS32(*ctx, 2);
+        {
+            std::lock_guard<std::mutex> lock(
+                g_executorFixtureMutex);
+            g_executorSleepChildThreadId =
+                childThreadId;
+        }
+
+        setRegU32(
+            *ctx,
+            4,
+            static_cast<uint32_t>(
+                childThreadId));
+        setRegU32(*ctx, 5, 0u);
+        StartThread(rdram, ctx, runtime);
+
+        {
+            std::lock_guard<std::mutex> lock(
+                g_executorFixtureMutex);
+            g_executorMainAttemptedWake = true;
+            g_executorWakeInProgress = true;
+        }
+        setRegU32(
+            *ctx,
+            4,
+            static_cast<uint32_t>(
+                childThreadId));
+        WakeupThread(rdram, ctx, runtime);
+        {
+            std::lock_guard<std::mutex> lock(
+                g_executorFixtureMutex);
+            g_executorWakeResult =
+                getRegS32(*ctx, 2);
+            g_executorWakeInProgress = false;
+            g_executorRawWakeInProgress = true;
+        }
+        setRegU32(
+            *ctx,
+            4,
+            static_cast<uint32_t>(
+                childThreadId));
+        iWakeupThread(rdram, ctx, runtime);
+        {
+            std::lock_guard<std::mutex> lock(
+                g_executorFixtureMutex);
+            g_executorRawWakeResult =
+                getRegS32(*ctx, 2);
+            g_executorRawWakeInProgress = false;
+            g_executorSleepOrder.push_back(3);
+        }
+        ctx->pc = 0u;
+    }
+
+    void dedicatedExecutorExternalChildHandler(
+        uint8_t *rdram,
+        R5900Context *ctx,
+        PS2Runtime *runtime)
+    {
+        SleepThread(rdram, ctx, runtime);
+        {
+            std::lock_guard<std::mutex> lock(
+                g_executorFixtureMutex);
+            g_executorExternalSleepResult =
+                getRegS32(*ctx, 2);
+            g_executorExternalChildReturned = true;
+        }
+        ctx->pc = 0u;
+    }
+
+    void dedicatedExecutorExternalMainHandler(
+        uint8_t *rdram,
+        R5900Context *ctx,
+        PS2Runtime *runtime)
+    {
+        InitThread(rdram, ctx, runtime);
+        setRegU32(
+            *ctx,
+            4,
+            K_EXECUTOR_THREAD_PARAM_ADDR);
+        CreateThread(rdram, ctx, runtime);
+        const int childThreadId =
+            getRegS32(*ctx, 2);
+        {
+            std::lock_guard<std::mutex> lock(
+                g_executorFixtureMutex);
+            g_executorExternalChildThreadId =
+                childThreadId;
+        }
+        setRegU32(
+            *ctx,
+            4,
+            static_cast<uint32_t>(
+                childThreadId));
+        setRegU32(*ctx, 5, 0u);
+        StartThread(rdram, ctx, runtime);
+        {
+            std::lock_guard<std::mutex> lock(
+                g_executorFixtureMutex);
+            g_executorExternalMainReturned = true;
         }
         ctx->pc = 0u;
     }
@@ -757,6 +962,11 @@ void register_ps2_runtime_kernel_tests()
                     g_executorMainHostThread = {};
                     g_executorChildHostThread = {};
                     g_executorChildThreadId = 0;
+                    g_executorWakeCountResults = {
+                        KE_ERROR,
+                        KE_ERROR,
+                        KE_ERROR,
+                    };
                 }
                 const std::thread::id callerThread =
                     std::this_thread::get_id();
@@ -779,6 +989,7 @@ void register_ps2_runtime_kernel_tests()
                 std::thread::id mainHostThread;
                 std::thread::id childHostThread;
                 int childThreadId = 0;
+                std::array<int, 3u> wakeCountResults{};
                 {
                     std::lock_guard<std::mutex> lock(
                         g_executorFixtureMutex);
@@ -789,6 +1000,8 @@ void register_ps2_runtime_kernel_tests()
                         g_executorChildHostThread;
                     childThreadId =
                         g_executorChildThreadId;
+                    wakeCountResults =
+                        g_executorWakeCountResults;
                 }
 
                 t.IsTrue(
@@ -808,12 +1021,362 @@ void register_ps2_runtime_kernel_tests()
                     "the main and started guest should "
                     "share the runtime-owned executor "
                     "host thread");
+                t.IsTrue(
+                    wakeCountResults ==
+                        std::array<int, 3u>{1, 1, 1},
+                    "three child wakes should let the "
+                    "main consume two SleepThread calls "
+                    "and cancel the final wake count");
                 t.Equals(
                     runtime
                         .managedEeExecutionThreadCountForTesting(),
                     size_t{0u},
                     "executor shutdown should destroy "
                     "every runtime-owned continuation");
+            });
+
+        tc.Run(
+            "fiber sleep yields the executor until ordinary wake",
+            [](TestCase &t)
+            {
+                if (!eeExecutionBackendBuildInfo()
+                         .boostContextFcontextAvailable)
+                {
+                    return;
+                }
+
+                PS2RuntimeConfiguration configuration{};
+                configuration.eeExecutionBackend =
+                    EeExecutionBackendKind::
+                        LegacyCppFiber;
+                PS2Runtime runtime(configuration);
+                const bool memoryInitialized =
+                    runtime.memory().initialize();
+                t.IsTrue(
+                    memoryInitialized,
+                    "the sleep fixture should allocate "
+                    "runtime RDRAM");
+                if (!memoryInitialized)
+                {
+                    return;
+                }
+                uint8_t *const rdram =
+                    runtime.memory().getRDRAM();
+                const std::array<uint32_t, 9u>
+                    threadParameters{
+                        0u,
+                        K_EXECUTOR_SLEEP_CHILD_ENTRY,
+                        0x00310000u,
+                        0x800u,
+                        0u,
+                        0u,
+                        0u,
+                        0u,
+                        0u,
+                    };
+                writeGuestWords(
+                    rdram,
+                    K_EXECUTOR_THREAD_PARAM_ADDR,
+                    threadParameters.data(),
+                    threadParameters.size());
+                runtime.registerFunction(
+                    K_EXECUTOR_SLEEP_MAIN_ENTRY,
+                    &dedicatedExecutorSleepMainHandler);
+                runtime.registerFunction(
+                    K_EXECUTOR_SLEEP_CHILD_ENTRY,
+                    &dedicatedExecutorSleepChildHandler);
+                runtime.cpu().pc =
+                    K_EXECUTOR_SLEEP_MAIN_ENTRY;
+                setRegU32(
+                    runtime.cpu(),
+                    29,
+                    0x00300000u);
+
+                {
+                    std::lock_guard<std::mutex> lock(
+                        g_executorFixtureMutex);
+                    g_executorSleepOrder.clear();
+                    g_executorSleepChildThreadId = 0;
+                    g_executorSleepResult = KE_ERROR;
+                    g_executorSecondSleepResult =
+                        KE_ERROR;
+                    g_executorWakeResult = KE_ERROR;
+                    g_executorRawWakeResult = KE_ERROR;
+                    g_executorMainAttemptedWake = false;
+                    g_executorChildRanInsideWake = false;
+                    g_executorChildRanInsideRawWake =
+                        false;
+                    g_executorWakeInProgress = false;
+                    g_executorRawWakeInProgress = false;
+                    g_executorSleepRescued = false;
+                }
+
+                std::thread rescue([&runtime]()
+                {
+                    const bool childCreated = waitUntil(
+                        []()
+                        {
+                            std::lock_guard<std::mutex>
+                                lock(
+                                    g_executorFixtureMutex);
+                            return g_executorSleepChildThreadId >
+                                   0;
+                        },
+                        std::chrono::seconds(1));
+                    if (!childCreated)
+                    {
+                        return;
+                    }
+
+                    const bool mainReachedWake = waitUntil(
+                        []()
+                        {
+                            std::lock_guard<std::mutex>
+                                lock(
+                                    g_executorFixtureMutex);
+                            return g_executorMainAttemptedWake;
+                        },
+                        std::chrono::milliseconds(200));
+                    if (mainReachedWake)
+                    {
+                        return;
+                    }
+
+                    int childThreadId = 0;
+                    {
+                        std::lock_guard<std::mutex> lock(
+                            g_executorFixtureMutex);
+                        childThreadId =
+                            g_executorSleepChildThreadId;
+                    }
+                    const EeThreadHandle handle =
+                        captureEeThreadHandle(
+                            &runtime, childThreadId);
+                    const bool rescued =
+                        publishEeThreadWake(
+                            &runtime, handle) ==
+                        EeThreadWakeResult::WokeSleeper;
+                    {
+                        std::lock_guard<std::mutex> lock(
+                            g_executorFixtureMutex);
+                        g_executorSleepRescued = rescued;
+                    }
+                });
+
+                runtime
+                    .startDedicatedEeExecutionForTesting();
+                const bool completed = waitUntil(
+                    []()
+                    {
+                        std::lock_guard<std::mutex> lock(
+                            g_executorFixtureMutex);
+                        return g_executorSleepOrder.size() ==
+                               4u;
+                    },
+                    std::chrono::seconds(2));
+                rescue.join();
+                runtime
+                    .stopDedicatedEeExecutionForTesting();
+
+                std::vector<int> order;
+                int childThreadId = 0;
+                int sleepResult = KE_ERROR;
+                int secondSleepResult = KE_ERROR;
+                int wakeResult = KE_ERROR;
+                int rawWakeResult = KE_ERROR;
+                bool childRanInsideWake = false;
+                bool childRanInsideRawWake = false;
+                bool rescued = false;
+                {
+                    std::lock_guard<std::mutex> lock(
+                        g_executorFixtureMutex);
+                    order = g_executorSleepOrder;
+                    childThreadId =
+                        g_executorSleepChildThreadId;
+                    sleepResult = g_executorSleepResult;
+                    secondSleepResult =
+                        g_executorSecondSleepResult;
+                    wakeResult = g_executorWakeResult;
+                    rawWakeResult =
+                        g_executorRawWakeResult;
+                    childRanInsideWake =
+                        g_executorChildRanInsideWake;
+                    childRanInsideRawWake =
+                        g_executorChildRanInsideRawWake;
+                    rescued = g_executorSleepRescued;
+                }
+
+                t.IsTrue(
+                    completed && !rescued &&
+                        order ==
+                            std::vector<int>{1, 2, 3, 4},
+                    "SleepThread should yield the sole "
+                    "executor without requiring a host "
+                    "rescue wake");
+                t.IsTrue(
+                    sleepResult == childThreadId &&
+                        secondSleepResult ==
+                            childThreadId &&
+                        wakeResult == childThreadId &&
+                        rawWakeResult == childThreadId &&
+                        childRanInsideWake &&
+                        !childRanInsideRawWake,
+                    "ordinary WakeupThread should dispatch "
+                    "before returning while raw wake "
+                    "should return to its caller first");
+            });
+
+        tc.Run(
+            "external wake publication resumes an idle fiber executor",
+            [](TestCase &t)
+            {
+                if (!eeExecutionBackendBuildInfo()
+                         .boostContextFcontextAvailable)
+                {
+                    return;
+                }
+
+                PS2RuntimeConfiguration configuration{};
+                configuration.eeExecutionBackend =
+                    EeExecutionBackendKind::
+                        LegacyCppFiber;
+                PS2Runtime runtime(configuration);
+                const bool memoryInitialized =
+                    runtime.memory().initialize();
+                t.IsTrue(
+                    memoryInitialized,
+                    "the external wake fixture should "
+                    "allocate runtime RDRAM");
+                if (!memoryInitialized)
+                {
+                    return;
+                }
+                uint8_t *const rdram =
+                    runtime.memory().getRDRAM();
+                const std::array<uint32_t, 9u>
+                    threadParameters{
+                        0u,
+                        K_EXECUTOR_EXTERNAL_CHILD_ENTRY,
+                        0x00310000u,
+                        0x800u,
+                        0u,
+                        0u,
+                        0u,
+                        0u,
+                        0u,
+                    };
+                writeGuestWords(
+                    rdram,
+                    K_EXECUTOR_THREAD_PARAM_ADDR,
+                    threadParameters.data(),
+                    threadParameters.size());
+                runtime.registerFunction(
+                    K_EXECUTOR_EXTERNAL_MAIN_ENTRY,
+                    &dedicatedExecutorExternalMainHandler);
+                runtime.registerFunction(
+                    K_EXECUTOR_EXTERNAL_CHILD_ENTRY,
+                    &dedicatedExecutorExternalChildHandler);
+                runtime.cpu().pc =
+                    K_EXECUTOR_EXTERNAL_MAIN_ENTRY;
+                setRegU32(
+                    runtime.cpu(),
+                    29,
+                    0x00300000u);
+                {
+                    std::lock_guard<std::mutex> lock(
+                        g_executorFixtureMutex);
+                    g_executorExternalChildThreadId = 0;
+                    g_executorExternalSleepResult =
+                        KE_ERROR;
+                    g_executorExternalMainReturned =
+                        false;
+                    g_executorExternalChildReturned =
+                        false;
+                }
+
+                runtime
+                    .startDedicatedEeExecutionForTesting();
+                const bool reachedIdleWait = waitUntil(
+                    [&runtime]()
+                    {
+                        int childThreadId = 0;
+                        bool mainReturned = false;
+                        {
+                            std::lock_guard<std::mutex>
+                                lock(
+                                    g_executorFixtureMutex);
+                            childThreadId =
+                                g_executorExternalChildThreadId;
+                            mainReturned =
+                                g_executorExternalMainReturned;
+                        }
+                        if (!mainReturned ||
+                            childThreadId <= 0)
+                        {
+                            return false;
+                        }
+                        for (const auto &snapshot :
+                             debugThreadSnapshots(
+                                 &runtime))
+                        {
+                            if (snapshot.id ==
+                                    childThreadId &&
+                                snapshot.status ==
+                                    THS_WAIT &&
+                                snapshot.waitType ==
+                                    TSW_SLEEP)
+                            {
+                                return true;
+                            }
+                        }
+                        return false;
+                    },
+                    std::chrono::seconds(2));
+
+                int childThreadId = 0;
+                {
+                    std::lock_guard<std::mutex> lock(
+                        g_executorFixtureMutex);
+                    childThreadId =
+                        g_executorExternalChildThreadId;
+                }
+                EeThreadWakeResult wakeResult =
+                    EeThreadWakeResult::InvalidHandle;
+                if (reachedIdleWait)
+                {
+                    wakeResult = publishEeThreadWake(
+                        &runtime,
+                        captureEeThreadHandle(
+                            &runtime,
+                            childThreadId));
+                }
+                const bool childReturned = waitUntil(
+                    []()
+                    {
+                        std::lock_guard<std::mutex> lock(
+                            g_executorFixtureMutex);
+                        return g_executorExternalChildReturned;
+                    },
+                    std::chrono::seconds(2));
+                runtime
+                    .stopDedicatedEeExecutionForTesting();
+
+                int sleepResult = KE_ERROR;
+                {
+                    std::lock_guard<std::mutex> lock(
+                        g_executorFixtureMutex);
+                    sleepResult =
+                        g_executorExternalSleepResult;
+                }
+                t.IsTrue(
+                    reachedIdleWait && childReturned &&
+                        wakeResult ==
+                            EeThreadWakeResult::
+                                WokeSleeper &&
+                        sleepResult == childThreadId,
+                    "an external wake should cross the "
+                    "executor publication queue and "
+                    "resume the sleeping continuation");
             });
 
         tc.Run("host presentation upload state is isolated per runtime", [](TestCase &t)
