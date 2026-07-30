@@ -85,10 +85,21 @@ namespace
     constexpr uint32_t K_ALARM_CALLBACK_SP_ADDR = 0x18F4u;
     constexpr uint32_t K_ALARM_SELF_STOP_STAGE_ADDR = 0x18F8u;
     constexpr uint32_t K_ALARM_SELF_STOP_GATE_ADDR = 0x18FCu;
+    constexpr uint32_t K_EXECUTOR_THREAD_PARAM_ADDR =
+        0x1910u;
+    constexpr uint32_t K_EXECUTOR_MAIN_ENTRY =
+        0x259800u;
+    constexpr uint32_t K_EXECUTOR_CHILD_ENTRY =
+        0x259900u;
 
     std::mutex g_guestWordMutex;
     std::mutex g_alarmCallbackThreadMutex;
     std::thread::id g_alarmCallbackThread;
+    std::mutex g_executorFixtureMutex;
+    std::vector<int> g_executorFixtureOrder;
+    std::thread::id g_executorMainHostThread;
+    std::thread::id g_executorChildHostThread;
+    int g_executorChildThreadId = 0;
 
     struct EeThreadStatus
     {
@@ -549,6 +560,66 @@ namespace
         ctx->pc = 0u;
     }
 
+    void dedicatedExecutorChildHandler(
+        uint8_t *,
+        R5900Context *ctx,
+        PS2Runtime *runtime)
+    {
+        {
+            std::lock_guard<std::mutex> lock(
+                g_executorFixtureMutex);
+            g_executorChildHostThread =
+                std::this_thread::get_id();
+            g_executorFixtureOrder.push_back(
+                runtime->currentEeThreadId());
+        }
+        ctx->pc = 0u;
+    }
+
+    void dedicatedExecutorMainHandler(
+        uint8_t *rdram,
+        R5900Context *ctx,
+        PS2Runtime *runtime)
+    {
+        {
+            std::lock_guard<std::mutex> lock(
+                g_executorFixtureMutex);
+            g_executorMainHostThread =
+                std::this_thread::get_id();
+        }
+
+        InitThread(rdram, ctx, runtime);
+
+        setRegU32(
+            *ctx,
+            4,
+            K_EXECUTOR_THREAD_PARAM_ADDR);
+        CreateThread(rdram, ctx, runtime);
+        const int childThreadId =
+            getRegS32(*ctx, 2);
+        {
+            std::lock_guard<std::mutex> lock(
+                g_executorFixtureMutex);
+            g_executorChildThreadId =
+                childThreadId;
+        }
+
+        setRegU32(
+            *ctx,
+            4,
+            static_cast<uint32_t>(
+                childThreadId));
+        setRegU32(*ctx, 5, 0u);
+        StartThread(rdram, ctx, runtime);
+        {
+            std::lock_guard<std::mutex> lock(
+                g_executorFixtureMutex);
+            g_executorFixtureOrder.push_back(
+                runtime->currentEeThreadId());
+        }
+        ctx->pc = 0u;
+    }
+
     struct TestEnv
     {
         std::vector<uint8_t> rdram;
@@ -620,6 +691,130 @@ void register_ps2_runtime_kernel_tests()
                     "an unsupported or disabled target should report the explicit host-thread fallback");
             }
         });
+
+        tc.Run(
+            "fiber runtime owns main and started thread on one executor",
+            [](TestCase &t)
+            {
+                if (!eeExecutionBackendBuildInfo()
+                         .boostContextFcontextAvailable)
+                {
+                    return;
+                }
+
+                PS2RuntimeConfiguration configuration{};
+                configuration.eeExecutionBackend =
+                    EeExecutionBackendKind::
+                        LegacyCppFiber;
+                PS2Runtime runtime(configuration);
+                const bool memoryInitialized =
+                    runtime.memory().initialize();
+                t.IsTrue(
+                    memoryInitialized,
+                    "the executor fixture should allocate "
+                    "runtime RDRAM");
+                if (!memoryInitialized)
+                {
+                    return;
+                }
+                uint8_t *const rdram =
+                    runtime.memory().getRDRAM();
+
+                const std::array<uint32_t, 9u>
+                    threadParameters{
+                        0u,
+                        K_EXECUTOR_CHILD_ENTRY,
+                        0x00310000u,
+                        0x800u,
+                        0u,
+                        0u,
+                        0u,
+                        0u,
+                        0u,
+                    };
+                writeGuestWords(
+                    rdram,
+                    K_EXECUTOR_THREAD_PARAM_ADDR,
+                    threadParameters.data(),
+                    threadParameters.size());
+                runtime.registerFunction(
+                    K_EXECUTOR_MAIN_ENTRY,
+                    &dedicatedExecutorMainHandler);
+                runtime.registerFunction(
+                    K_EXECUTOR_CHILD_ENTRY,
+                    &dedicatedExecutorChildHandler);
+                runtime.cpu().pc =
+                    K_EXECUTOR_MAIN_ENTRY;
+                setRegU32(
+                    runtime.cpu(),
+                    29,
+                    0x00300000u);
+
+                {
+                    std::lock_guard<std::mutex> lock(
+                        g_executorFixtureMutex);
+                    g_executorFixtureOrder.clear();
+                    g_executorMainHostThread = {};
+                    g_executorChildHostThread = {};
+                    g_executorChildThreadId = 0;
+                }
+                const std::thread::id callerThread =
+                    std::this_thread::get_id();
+
+                runtime
+                    .startDedicatedEeExecutionForTesting();
+                const bool completed = waitUntil(
+                    []()
+                    {
+                        std::lock_guard<std::mutex> lock(
+                            g_executorFixtureMutex);
+                        return g_executorFixtureOrder
+                                   .size() == 2u;
+                    },
+                    std::chrono::seconds(2));
+                runtime
+                    .stopDedicatedEeExecutionForTesting();
+
+                std::vector<int> order;
+                std::thread::id mainHostThread;
+                std::thread::id childHostThread;
+                int childThreadId = 0;
+                {
+                    std::lock_guard<std::mutex> lock(
+                        g_executorFixtureMutex);
+                    order = g_executorFixtureOrder;
+                    mainHostThread =
+                        g_executorMainHostThread;
+                    childHostThread =
+                        g_executorChildHostThread;
+                    childThreadId =
+                        g_executorChildThreadId;
+                }
+
+                t.IsTrue(
+                    runtime.usesDedicatedEeExecutor() &&
+                        completed &&
+                        order ==
+                            std::vector<int>{
+                                childThreadId,
+                                1},
+                    "priority-zero StartThread should "
+                    "dispatch the child before returning "
+                    "to the priority-one main thread");
+                t.IsTrue(
+                    mainHostThread != callerThread &&
+                        childHostThread ==
+                            mainHostThread,
+                    "the main and started guest should "
+                    "share the runtime-owned executor "
+                    "host thread");
+                t.Equals(
+                    runtime
+                        .managedEeExecutionThreadCountForTesting(),
+                    size_t{0u},
+                    "executor shutdown should destroy "
+                    "every runtime-owned continuation");
+            });
 
         tc.Run("host presentation upload state is isolated per runtime", [](TestCase &t)
         {

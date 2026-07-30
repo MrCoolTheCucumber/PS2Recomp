@@ -976,6 +976,17 @@ PS2Runtime::PS2Runtime(PS2RuntimeConfiguration configuration)
     m_eeExecutionBackend =
         createEeExecutionBackend(
             configuration.eeExecutionBackend);
+    if (m_eeExecutionBackend->executorResumable())
+    {
+        m_eeRuntimeExecutor =
+            std::make_unique<
+                ps2x::ee::EeRuntimeExecutor>(
+                *m_eeExecutionBackend,
+                static_cast<
+                    ps2x::ee::
+                        IEeSchedulerExecutorHooks *>(
+                    this));
+    }
     m_ioPaths = defaultRuntimeIoPaths();
     m_mpegRuntimeState =
         std::make_unique<ps2_stubs::MpegRuntimeState>();
@@ -1330,6 +1341,10 @@ PS2Runtime::~PS2Runtime()
     try
     {
         requestStop();
+        if (m_eeRuntimeExecutor)
+        {
+            m_eeRuntimeExecutor->join();
+        }
 #if defined(PS2X_ENABLE_DEBUG_SERVER) && PS2X_ENABLE_DEBUG_SERVER
         if (m_debugServer)
         {
@@ -1414,6 +1429,265 @@ PS2Runtime::managedEeExecutionThreadCountForTesting() const
                ? m_eeExecutionBackend
                      ->managedThreadCount()
                : 0u;
+}
+
+bool PS2Runtime::usesDedicatedEeExecutor() const noexcept
+{
+    return m_eeRuntimeExecutor != nullptr;
+}
+
+bool PS2Runtime::publishEeSchedulerUpdate(
+    std::function<void(
+        ps2x::ee::EeThreadScheduler &)> update)
+{
+    if (!m_eeRuntimeExecutor || !update)
+    {
+        return false;
+    }
+
+    return m_eeRuntimeExecutor->publish(
+        [update = std::move(update)](
+            ps2x::ee::EeThreadScheduler &scheduler,
+            IEeExecutionBackend &)
+        {
+            update(scheduler);
+        });
+}
+
+ps2x::timing::EeTickDelta
+PS2Runtime::eeExecutorElapsedSinceSelection()
+    const noexcept
+{
+    return ps2x::timing::elapsedEeTicks(
+        m_eeExecutorDispatchStartTick,
+        currentEeTick());
+}
+
+void PS2Runtime::yieldEeExecutorCurrent(
+    ps2x::ee::EeSchedulerExitReason reason,
+    ps2x::ee::EeSchedulerWaitKey wait)
+{
+    if (!m_eeRuntimeExecutor)
+    {
+        throw std::logic_error(
+            "EE executor yield requested without a "
+            "dedicated executor");
+    }
+
+    R5900Context *releasedContext = nullptr;
+    int releasedThreadId = 1;
+    const uint32_t releasedDepth =
+        releaseGuestExecution(
+            releasedContext,
+            releasedThreadId);
+    const ps2x::timing::EeTickDelta elapsed =
+        eeExecutorElapsedSinceSelection();
+
+    try
+    {
+        m_eeExecutionBackend->yieldCurrent(
+            {
+                reason,
+                elapsed.raw(),
+                wait,
+                {},
+            });
+    }
+    catch (...)
+    {
+        if (releasedDepth != 0u)
+        {
+            reacquireGuestExecution(
+                releasedDepth,
+                releasedContext,
+                releasedThreadId);
+        }
+        throw;
+    }
+
+    if (releasedDepth != 0u)
+    {
+        reacquireGuestExecution(
+            releasedDepth,
+            releasedContext,
+            releasedThreadId);
+    }
+}
+
+void PS2Runtime::commitPriorContext(
+    std::optional<int>,
+    ps2x::timing::EeTickDelta,
+    ps2x::timing::EeTick)
+{
+    // Generated code and runtime helpers already advance the canonical EE
+    // timeline. The executor's relative tick is a consistency/accounting
+    // view and must not advance that timeline a second time.
+}
+
+void PS2Runtime::publishSelectedContext(
+    std::optional<int> selectedThreadId,
+    ps2x::timing::EeTick)
+{
+    m_eeExecutorDispatchStartTick = currentEeTick();
+    if (selectedThreadId.has_value())
+    {
+        selectEeThread(*selectedThreadId);
+        return;
+    }
+
+    m_eeThreadRuntimeState->currentThreadId.store(
+        0, std::memory_order_release);
+    m_boundEeThreadId = 0;
+    g_currentThreadRuntime = this;
+    g_currentThreadId = 1;
+}
+
+bool PS2Runtime::hasImmediateConsequence(
+    ps2x::ee::EeSchedulerConsequenceStage,
+    ps2x::timing::EeTick) const
+{
+    return false;
+}
+
+void PS2Runtime::applyNextConsequence(
+    ps2x::ee::EeSchedulerConsequenceStage,
+    ps2x::timing::EeTick,
+    ps2x::ee::EeThreadScheduler &)
+{
+    throw std::logic_error(
+        "PS2 runtime has no external EE scheduler "
+        "consequence at this stage");
+}
+
+void PS2Runtime::runMainEeContinuation()
+{
+    try
+    {
+        dispatchLoop(
+            m_memory.getRDRAM(),
+            &m_cpuContext);
+    }
+    catch (const ThreadExitException &)
+    {
+    }
+
+    const uint32_t pc = m_cpuContext.pc;
+    RUNTIME_LOG(
+        "Game thread returned. PC=0x"
+        << std::hex << pc
+        << " RA=0x"
+        << static_cast<uint32_t>(
+               _mm_extract_epi32(
+                   m_cpuContext.r[31], 0))
+        << std::dec << std::endl);
+}
+
+void PS2Runtime::startDedicatedEeExecution()
+{
+    if (!m_eeRuntimeExecutor)
+    {
+        throw std::logic_error(
+            "selected EE backend has no dedicated "
+            "executor");
+    }
+
+    std::shared_ptr<ThreadInfo> mainInfo;
+    {
+        EeThreadRuntimeState &state =
+            *m_eeThreadRuntimeState;
+        std::lock_guard<std::mutex> lock(
+            state.threadMapMutex);
+        const auto current = state.threads.find(1);
+        if (current != state.threads.end())
+        {
+            mainInfo = current->second;
+        }
+        else
+        {
+            mainInfo =
+                std::make_shared<ThreadInfo>();
+            mainInfo->generation =
+                state.allocateThreadGenerationLocked();
+            mainInfo->priority = 0u;
+            mainInfo->guestState.initializeRunning(0);
+            mainInfo->entry = m_cpuContext.pc;
+            mainInfo->stack =
+                static_cast<uint32_t>(
+                    _mm_extract_epi32(
+                        m_cpuContext.r[29], 0));
+            mainInfo->gp =
+                static_cast<uint32_t>(
+                    _mm_extract_epi32(
+                        m_cpuContext.r[28], 0));
+            state.threads.emplace(1, mainInfo);
+        }
+        mainInfo->boundContext = &m_cpuContext;
+        state.contextThreadIds[&m_cpuContext] = 1;
+    }
+
+    int mainPriority = 0;
+    {
+        std::lock_guard<std::mutex> lock(mainInfo->m);
+        const EeThreadGuestStateSnapshot guest =
+            mainInfo->guestState.snapshot();
+        mainPriority = guest.currentPriority;
+        if (!guest.started)
+        {
+            mainInfo->guestState.initializeRunning(
+                mainPriority);
+        }
+    }
+
+    const uint32_t generation =
+        mainInfo->generation;
+    m_eeRuntimeExecutor->start(
+        [this, generation, mainPriority](
+            ps2x::ee::EeThreadScheduler &scheduler,
+            IEeExecutionBackend &backend)
+        {
+            ThreadNaming::SetCurrentThreadName(
+                "EeExecutor");
+            backend.create(
+                1,
+                [this]()
+                {
+                    runMainEeContinuation();
+                });
+            if (!scheduler.addRunningThread(
+                    1,
+                    generation,
+                    mainPriority))
+            {
+                throw std::logic_error(
+                    "failed to seed the main EE "
+                    "scheduler record");
+            }
+        });
+}
+
+void PS2Runtime::joinDedicatedEeExecution()
+{
+    if (!m_eeRuntimeExecutor)
+    {
+        return;
+    }
+    m_eeRuntimeExecutor->join();
+    m_eeRuntimeExecutor->rethrowFailure();
+}
+
+void PS2Runtime::
+    startDedicatedEeExecutionForTesting()
+{
+    m_stopRequested.store(
+        false, std::memory_order_relaxed);
+    startDedicatedEeExecution();
+}
+
+void PS2Runtime::
+    stopDedicatedEeExecutionForTesting()
+{
+    requestStop();
+    joinDedicatedEeExecution();
 }
 
 const void *
@@ -7358,6 +7632,18 @@ void PS2Runtime::waitForGuestExecutionHandoff()
 
 void PS2Runtime::waitForGuestExecutionHandoff(uint64_t baselineEpoch)
 {
+    if (m_eeRuntimeExecutor)
+    {
+        static_cast<void>(baselineEpoch);
+        yieldEeExecutorCurrent(
+            isStopRequested()
+                ? ps2x::ee::EeSchedulerExitReason::
+                      StopRequested
+                : ps2x::ee::EeSchedulerExitReason::
+                      Preempted);
+        return;
+    }
+
     if (m_eeThreadDiagnosticsEnabled)
     {
         m_eeThreadDiagnosticHandoffWaitRequests.fetch_add(
@@ -9036,6 +9322,22 @@ PS2Runtime::DeferredGuestYieldScope::~DeferredGuestYieldScope()
 
 void PS2Runtime::yieldGuestExecutionAtBoundary()
 {
+    if (m_eeRuntimeExecutor)
+    {
+        if (g_deferredGuestYieldDepth != 0u)
+        {
+            g_deferredGuestYieldPending = true;
+            return;
+        }
+        yieldEeExecutorCurrent(
+            isStopRequested()
+                ? ps2x::ee::EeSchedulerExitReason::
+                      StopRequested
+                : ps2x::ee::EeSchedulerExitReason::
+                      Preempted);
+        return;
+    }
+
     auto depthIt = g_guestExecutionDepths.find(this);
     if (g_deferredGuestYieldDepth != 0u ||
         depthIt == g_guestExecutionDepths.end() ||
@@ -9118,6 +9420,17 @@ void PS2Runtime::yieldGuestExecutionAfterWake()
                 1u, std::memory_order_relaxed);
         }
         g_deferredGuestYieldPending = true;
+        return;
+    }
+
+    if (m_eeRuntimeExecutor)
+    {
+        yieldEeExecutorCurrent(
+            isStopRequested()
+                ? ps2x::ee::EeSchedulerExitReason::
+                      StopRequested
+                : ps2x::ee::EeSchedulerExitReason::
+                      Preempted);
         return;
     }
 
@@ -9434,6 +9747,10 @@ void PS2Runtime::requestStop()
     }
     m_debugControlCv.notify_all();
     m_audioBackend.setDebuggerPaused(false);
+    if (m_eeRuntimeExecutor)
+    {
+        m_eeRuntimeExecutor->requestStop();
+    }
     ps2_syscalls::notifyRuntimeStop(this);
 }
 
@@ -9502,39 +9819,85 @@ void PS2Runtime::run()
     Texture2D frameTex = LoadTextureFromImage(blank);
     UnloadImage(blank);
 
-    m_eeThreadRuntimeState->activeHostThreads.store(1, std::memory_order_relaxed);
+    const bool dedicatedExecutor =
+        usesDedicatedEeExecutor();
+    m_eeThreadRuntimeState->activeHostThreads.store(
+        dedicatedExecutor ? 0 : 1,
+        std::memory_order_relaxed);
 
     // Arm emulated VSync before the first guest instruction so event mode has
     // a deterministic phase independent of host thread startup.
     ps2_syscalls::EnsureVSyncScheduled(
         m_memory.getRDRAM(), this);
 
-    m_eeExecutionBackend->create(
-        1,
-        [this]()
-        {
-        ThreadNaming::SetCurrentThreadName("GameThread");
-        try
-        {
-            dispatchLoop(m_memory.getRDRAM(), &m_cpuContext);
-            uint32_t pc = m_debugPc.load(std::memory_order_relaxed);
-            RUNTIME_LOG("Game thread returned. PC=0x" << std::hex << pc
-                      << " RA=0x" << static_cast<uint32_t>(_mm_extract_epi32(m_cpuContext.r[31], 0)) << std::dec << std::endl);
-        }
-        catch (const std::exception &e)
-        {
-            std::cerr << "Error during program execution: " << e.what() << std::endl;
-        }
-        catch (...)
-        {
-            std::cerr << "Error during program execution: unknown exception" << std::endl;
-        }
-        m_eeThreadRuntimeState->activeHostThreads.fetch_sub(1, std::memory_order_relaxed);
-        });
+    if (dedicatedExecutor)
+    {
+        startDedicatedEeExecution();
+    }
+    else
+    {
+        m_eeExecutionBackend->create(
+            1,
+            [this]()
+            {
+                ThreadNaming::SetCurrentThreadName(
+                    "GameThread");
+                try
+                {
+                    dispatchLoop(
+                        m_memory.getRDRAM(),
+                        &m_cpuContext);
+                    const uint32_t pc =
+                        m_debugPc.load(
+                            std::memory_order_relaxed);
+                    RUNTIME_LOG(
+                        "Game thread returned. PC=0x"
+                        << std::hex << pc
+                        << " RA=0x"
+                        << static_cast<uint32_t>(
+                               _mm_extract_epi32(
+                                   m_cpuContext.r[31],
+                                   0))
+                        << std::dec << std::endl);
+                }
+                catch (const std::exception &e)
+                {
+                    std::cerr
+                        << "Error during program "
+                           "execution: "
+                        << e.what() << std::endl;
+                }
+                catch (...)
+                {
+                    std::cerr
+                        << "Error during program "
+                           "execution: unknown exception"
+                        << std::endl;
+                }
+                m_eeThreadRuntimeState
+                    ->activeHostThreads.fetch_sub(
+                        1,
+                        std::memory_order_relaxed);
+            });
+    }
 
     uint64_t tick = 0;
-    while (!isStopRequested() && m_eeThreadRuntimeState->activeHostThreads.load(std::memory_order_relaxed) > 0)
+    while (
+        !isStopRequested() &&
+        (dedicatedExecutor
+             ? m_eeRuntimeExecutor->running()
+             : m_eeThreadRuntimeState
+                       ->activeHostThreads.load(
+                           std::memory_order_relaxed) >
+                   0))
     {
+        if (dedicatedExecutor &&
+            m_eeExecutionBackend
+                    ->managedThreadCount() == 0u)
+        {
+            requestStop();
+            break;
+        }
         PS2_IF_AGRESSIVE_LOGS({
             tick++;
             if ((tick % 120) == 0)
@@ -9606,51 +9969,98 @@ void PS2Runtime::run()
     }
 
     requestStop();
-
-    const auto joinDeadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
-    while (!m_eeExecutionBackend->isFinished(1) &&
-           std::chrono::steady_clock::now() < joinDeadline)
+    if (dedicatedExecutor)
     {
-        std::this_thread::sleep_for(std::chrono::milliseconds(1));
-    }
-
-    if (m_eeExecutionBackend->isFinished(1))
-    {
-        m_eeExecutionBackend->destroy(1);
-    }
-    else
-    {
-        std::cerr << "[run] game thread did not stop within timeout; detaching" << std::endl;
-        m_eeExecutionBackend->detach(1);
-    }
-
-    const auto workerDeadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(1000);
-    while (m_eeThreadRuntimeState->activeHostThreads.load(std::memory_order_relaxed) > 0 &&
-           std::chrono::steady_clock::now() < workerDeadline)
-    {
-        std::this_thread::sleep_for(std::chrono::milliseconds(1));
-    }
-
-    if (m_eeThreadRuntimeState->activeHostThreads.load(std::memory_order_relaxed) > 0)
-    {
-        requestStop();
-        const auto finalWorkerDeadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(1000);
-        while (m_eeThreadRuntimeState->activeHostThreads.load(std::memory_order_relaxed) > 0 &&
-               std::chrono::steady_clock::now() < finalWorkerDeadline)
+        try
         {
-            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            joinDedicatedEeExecution();
+        }
+        catch (const std::exception &error)
+        {
+            std::cerr
+                << "[run] EE executor failure: "
+                << error.what() << std::endl;
         }
     }
-
-    if (m_eeThreadRuntimeState->activeHostThreads.load(std::memory_order_relaxed) == 0)
-    {
-        ps2_syscalls::joinAllGuestHostThreads(this);
-    }
     else
     {
-        std::cerr << "[run] guest host threads did not stop within timeout; detaching remaining worker threads"
-                  << std::endl;
-        ps2_syscalls::detachAllGuestHostThreads(this);
+        const auto joinDeadline =
+            std::chrono::steady_clock::now() +
+            std::chrono::seconds(2);
+        while (!m_eeExecutionBackend->isFinished(1) &&
+               std::chrono::steady_clock::now() <
+                   joinDeadline)
+        {
+            std::this_thread::sleep_for(
+                std::chrono::milliseconds(1));
+        }
+
+        if (m_eeExecutionBackend->isFinished(1))
+        {
+            m_eeExecutionBackend->destroy(1);
+        }
+        else
+        {
+            std::cerr
+                << "[run] game thread did not stop within "
+                   "timeout; detaching"
+                << std::endl;
+            m_eeExecutionBackend->detach(1);
+        }
+
+        const auto workerDeadline =
+            std::chrono::steady_clock::now() +
+            std::chrono::milliseconds(1000);
+        while (
+            m_eeThreadRuntimeState
+                    ->activeHostThreads.load(
+                        std::memory_order_relaxed) >
+                0 &&
+            std::chrono::steady_clock::now() <
+                workerDeadline)
+        {
+            std::this_thread::sleep_for(
+                std::chrono::milliseconds(1));
+        }
+
+        if (m_eeThreadRuntimeState
+                ->activeHostThreads.load(
+                    std::memory_order_relaxed) > 0)
+        {
+            requestStop();
+            const auto finalWorkerDeadline =
+                std::chrono::steady_clock::now() +
+                std::chrono::milliseconds(1000);
+            while (
+                m_eeThreadRuntimeState
+                        ->activeHostThreads.load(
+                            std::memory_order_relaxed) >
+                    0 &&
+                std::chrono::steady_clock::now() <
+                    finalWorkerDeadline)
+            {
+                std::this_thread::sleep_for(
+                    std::chrono::milliseconds(1));
+            }
+        }
+
+        if (m_eeThreadRuntimeState
+                ->activeHostThreads.load(
+                    std::memory_order_relaxed) == 0)
+        {
+            ps2_syscalls::joinAllGuestHostThreads(
+                this);
+        }
+        else
+        {
+            std::cerr
+                << "[run] guest host threads did not stop "
+                   "within timeout; detaching remaining "
+                   "worker threads"
+                << std::endl;
+            ps2_syscalls::detachAllGuestHostThreads(
+                this);
+        }
     }
 
     if (m_debugUiInitialized && m_debugUiShutdownCallback)

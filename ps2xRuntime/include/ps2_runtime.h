@@ -30,6 +30,7 @@
 #include "runtime/cop0_timing.h"
 #include "runtime/ee_execution_backend.h"
 #include "runtime/ee_event_scheduler.h"
+#include "runtime/ee_runtime_executor.h"
 #include "runtime/ps2_address.h"
 #include "runtime/ps2_gif_arbiter.h"
 #include "runtime/ps2_memory.h"
@@ -417,6 +418,7 @@ inline void ps2TraceGuestRangeWrite(uint8_t *rdram,
 }
 
 class PS2Runtime
+    : private ps2x::ee::IEeSchedulerExecutorHooks
 {
 public:
     struct IoPaths
@@ -1271,6 +1273,19 @@ public:
     eeExecutionBackendName() const noexcept;
     [[nodiscard]] size_t
     managedEeExecutionThreadCountForTesting() const;
+    [[nodiscard]] bool
+    usesDedicatedEeExecutor() const noexcept;
+    // Headless lifecycle seam used by focused runtime fixtures. Production
+    // run() uses the same private start/join implementation around its
+    // presentation loop.
+    void startDedicatedEeExecutionForTesting();
+    void stopDedicatedEeExecutionForTesting();
+    [[nodiscard]] bool publishEeSchedulerUpdate(
+        std::function<void(
+            ps2x::ee::EeThreadScheduler &)> update);
+    void yieldEeExecutorCurrent(
+        ps2x::ee::EeSchedulerExitReason reason,
+        ps2x::ee::EeSchedulerWaitKey wait = {});
     [[nodiscard]] const void *
     hostPresentationUploadStateIdentityForTesting() const noexcept;
     [[nodiscard]] size_t
@@ -1377,6 +1392,27 @@ public:
     inline const PSPadBackend &padBackend() const { return m_padBackend; }
 
 private:
+    void startDedicatedEeExecution();
+    void joinDedicatedEeExecution();
+    void runMainEeContinuation();
+    [[nodiscard]] ps2x::timing::EeTickDelta
+    eeExecutorElapsedSinceSelection() const noexcept;
+
+    void commitPriorContext(
+        std::optional<int> priorThreadId,
+        ps2x::timing::EeTickDelta elapsed,
+        ps2x::timing::EeTick now) override;
+    void publishSelectedContext(
+        std::optional<int> selectedThreadId,
+        ps2x::timing::EeTick now) override;
+    [[nodiscard]] bool hasImmediateConsequence(
+        ps2x::ee::EeSchedulerConsequenceStage stage,
+        ps2x::timing::EeTick now) const override;
+    void applyNextConsequence(
+        ps2x::ee::EeSchedulerConsequenceStage stage,
+        ps2x::timing::EeTick now,
+        ps2x::ee::EeThreadScheduler &scheduler) override;
+
     struct EeVSyncDurations;
     enum class EeVSyncVideoModeClass : uint8_t;
     struct PendingVSyncDelivery;
@@ -1816,6 +1852,10 @@ private:
     std::unique_ptr<EeThreadRuntimeState> m_eeThreadRuntimeState;
     std::unique_ptr<IEeExecutionBackend>
         m_eeExecutionBackend;
+    std::unique_ptr<ps2x::ee::EeRuntimeExecutor>
+        m_eeRuntimeExecutor;
+    ps2x::timing::EeTick
+        m_eeExecutorDispatchStartTick{};
     R5900Context *m_boundEeContext = nullptr;
     int m_boundEeThreadId = 1;
     mutable std::recursive_timed_mutex m_guestExecutionMutex;

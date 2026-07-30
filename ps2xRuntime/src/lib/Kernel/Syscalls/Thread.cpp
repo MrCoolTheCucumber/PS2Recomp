@@ -343,6 +343,38 @@ namespace ps2_syscalls
             std::lock_guard<std::mutex> lock(info->m);
             info->guestState.setCurrentPriority(1);
         }
+        if (runtime->usesDedicatedEeExecutor())
+        {
+            const int threadId =
+                getCurrentThreadId(runtime);
+            const uint32_t generation =
+                info->generation;
+            if (!runtime->publishEeSchedulerUpdate(
+                    [threadId, generation](
+                        ps2x::ee::EeThreadScheduler
+                            &scheduler)
+                    {
+                        const auto previous =
+                            scheduler
+                                .changeThreadPriority(
+                                    {
+                                        threadId,
+                                        generation,
+                                    },
+                                    1);
+                        if (!previous.has_value())
+                        {
+                            throw std::logic_error(
+                                "InitThread could not "
+                                "update the EE scheduler");
+                        }
+                    }))
+            {
+                throw std::runtime_error(
+                    "InitThread could not publish its "
+                    "EE priority transition");
+            }
+        }
         setReturnS32(ctx, 1);
     }
 
@@ -428,6 +460,41 @@ namespace ps2_syscalls
 
             state.threads[id] = info;
             state.contextThreadIds[info->boundContext] = id;
+        }
+
+        if (runtime->usesDedicatedEeExecutor())
+        {
+            const uint32_t generation =
+                info->generation;
+            const int priority =
+                static_cast<int>(info->priority);
+            if (!runtime->publishEeSchedulerUpdate(
+                    [id, generation, priority](
+                        ps2x::ee::EeThreadScheduler
+                            &scheduler)
+                    {
+                        if (!scheduler.addDormantThread(
+                                id,
+                                generation,
+                                priority))
+                        {
+                            throw std::logic_error(
+                                "CreateThread could not "
+                                "add the EE scheduler "
+                                "record");
+                        }
+                    }))
+            {
+                {
+                    std::lock_guard<std::mutex> lock(
+                        state.threadMapMutex);
+                    eraseThreadContextMappingsLocked(
+                        state, id);
+                    state.threads.erase(id);
+                }
+                setReturnS32(ctx, KE_ERROR);
+                return;
+            }
         }
 
         RUNTIME_LOG("[CreateThread] id=" << id
@@ -532,7 +599,12 @@ namespace ps2_syscalls
             return;
         }
 
-        joinHostThreadById(runtime, tid);
+        const bool dedicatedExecutor =
+            runtime->usesDedicatedEeExecutor();
+        if (!dedicatedExecutor)
+        {
+            joinHostThreadById(runtime, tid);
+        }
 
         const uint32_t callerSp = getRegU32(ctx, 29);
         const uint32_t callerGp = getRegU32(ctx, 28);
@@ -575,14 +647,18 @@ namespace ps2_syscalls
 
         EeThreadRuntimeState &threadState =
             runtime->eeThreadRuntimeState();
-        threadState.activeHostThreads.fetch_add(
-            1, std::memory_order_relaxed);
+        if (!dedicatedExecutor)
+        {
+            threadState.activeHostThreads.fetch_add(
+                1, std::memory_order_relaxed);
+        }
         try
         {
             runtime->eeExecutionBackend().create(
                 tid,
                 [=]() mutable
                 {
+            if (!dedicatedExecutor)
             {
                 std::string name = "PS2Thread_" + std::to_string(tid);
                 ThreadNaming::SetCurrentThreadName(name);
@@ -724,6 +800,10 @@ namespace ps2_syscalls
             catch (const std::exception &e)
             {
                 std::cerr << "[StartThread] id=" << tid << " exception: " << e.what() << std::endl;
+                if (dedicatedExecutor)
+                {
+                    throw;
+                }
             }
 
             if (!exited)
@@ -773,17 +853,89 @@ namespace ps2_syscalls
             // Notify anybody waiting for termination (like TerminateThread)
             info->cv.notify_all();
 
-            runtime->eeThreadRuntimeState()
-                .activeHostThreads.fetch_sub(
-                1, std::memory_order_relaxed);
+            if (!dedicatedExecutor)
+            {
+                runtime->eeThreadRuntimeState()
+                    .activeHostThreads.fetch_sub(
+                    1, std::memory_order_relaxed);
+            }
                 });
+
+            if (dedicatedExecutor)
+            {
+                const uint32_t generation =
+                    info->generation;
+                int priority = 0;
+                {
+                    std::lock_guard<std::mutex> lock(
+                        info->m);
+                    priority =
+                        info->guestState
+                            .snapshot()
+                            .currentPriority;
+                }
+                if (!runtime->publishEeSchedulerUpdate(
+                        [tid, generation, priority](
+                            ps2x::ee::EeThreadScheduler
+                                &scheduler)
+                        {
+                            auto snapshot =
+                                scheduler.thread(tid);
+                            if (!snapshot.has_value())
+                            {
+                                if (!scheduler
+                                         .addDormantThread(
+                                             tid,
+                                             generation,
+                                             priority))
+                                {
+                                    throw std::logic_error(
+                                        "StartThread could "
+                                        "not add its EE "
+                                        "scheduler record");
+                                }
+                                snapshot =
+                                    scheduler.thread(tid);
+                            }
+                            if (!snapshot.has_value() ||
+                                snapshot->generation !=
+                                    generation ||
+                                snapshot->state !=
+                                    ps2x::ee::
+                                        EeSchedulerThreadState::
+                                            Dormant ||
+                                !scheduler.startThread(
+                                    {
+                                        tid,
+                                        generation,
+                                    }))
+                            {
+                                throw std::logic_error(
+                                    "StartThread could not "
+                                    "start its EE scheduler "
+                                    "record");
+                            }
+                        }))
+                {
+                    throw std::runtime_error(
+                        "StartThread could not publish "
+                        "its EE scheduler transition");
+                }
+
+                runtime->yieldGuestExecutionAfterWake();
+            }
         }
         catch (const std::exception &e)
         {
-            std::cerr << "[StartThread] failed to spawn host thread for tid=" << tid << ": " << e.what() << std::endl;
-            runtime->eeThreadRuntimeState()
-                .activeHostThreads.fetch_sub(
-                1, std::memory_order_relaxed);
+            std::cerr
+                << "[StartThread] failed to start tid="
+                << tid << ": " << e.what() << std::endl;
+            if (!dedicatedExecutor)
+            {
+                runtime->eeThreadRuntimeState()
+                    .activeHostThreads.fetch_sub(
+                    1, std::memory_order_relaxed);
+            }
             std::lock_guard<std::mutex> lock(info->m);
             info->guestState.makeDormant();
             info->forceRelease = false;
