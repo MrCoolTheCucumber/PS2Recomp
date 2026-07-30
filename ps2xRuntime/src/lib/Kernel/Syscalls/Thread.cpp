@@ -3,6 +3,29 @@
 
 namespace ps2_syscalls
 {
+    static int schedulerThreadGuestStatus(
+        ps2x::ee::EeSchedulerThreadState state)
+    {
+        switch (state)
+        {
+        case ps2x::ee::EeSchedulerThreadState::Running:
+            return THS_RUN;
+        case ps2x::ee::EeSchedulerThreadState::Ready:
+            return THS_READY;
+        case ps2x::ee::EeSchedulerThreadState::Waiting:
+            return THS_WAIT;
+        case ps2x::ee::EeSchedulerThreadState::Suspended:
+            return THS_SUSPEND;
+        case ps2x::ee::EeSchedulerThreadState::
+            WaitSuspended:
+            return THS_WAITSUSPEND;
+        case ps2x::ee::EeSchedulerThreadState::Dormant:
+            return THS_DORMANT;
+        }
+        throw std::logic_error(
+            "unknown EE scheduler thread state");
+    }
+
     struct EeThreadWakePublication
     {
         EeThreadWakeResult result =
@@ -1272,6 +1295,147 @@ namespace ps2_syscalls
             return;
         }
 
+        if (runtime->usesDedicatedEeExecutor())
+        {
+            {
+                std::lock_guard<std::mutex> lock(info->m);
+                if (info->guestState.isDormant())
+                {
+                    setReturnS32(ctx, KE_DORMANT);
+                    return;
+                }
+            }
+
+            struct SuspendTransition
+            {
+                bool applied = false;
+                bool suspended = false;
+                bool dormant = false;
+                bool stale = false;
+            };
+            const uint32_t generation =
+                info->generation;
+            const auto transition =
+                std::make_shared<SuspendTransition>();
+            const bool published =
+                runtime->publishEeSchedulerUpdate(
+                    [info,
+                     tid,
+                     generation,
+                     transition](
+                        ps2x::ee::EeThreadScheduler
+                            &scheduler)
+                    {
+                        const auto before =
+                            scheduler.thread(tid);
+                        if (!before.has_value() ||
+                            before->generation !=
+                                generation)
+                        {
+                            transition->stale = true;
+                            transition->applied = true;
+                            return;
+                        }
+                        if (before->state ==
+                            ps2x::ee::
+                                EeSchedulerThreadState::
+                                    Dormant)
+                        {
+                            transition->dormant = true;
+                            transition->applied = true;
+                            return;
+                        }
+                        if (!scheduler.suspendThread(
+                                {
+                                    tid,
+                                    generation,
+                                }))
+                        {
+                            throw std::logic_error(
+                                "SuspendThread could not "
+                                "apply its EE scheduler "
+                                "transition");
+                        }
+
+                        {
+                            std::lock_guard<std::mutex>
+                                lock(info->m);
+                            if (!info->guestState.suspend())
+                            {
+                                throw std::logic_error(
+                                    "SuspendThread could "
+                                    "not mirror its EE "
+                                    "scheduler transition");
+                            }
+                            const auto after =
+                                scheduler.thread(tid);
+                            const auto &guest =
+                                info->guestState.snapshot();
+                            if (!after.has_value() ||
+                                after->generation !=
+                                    generation ||
+                                after->suspendCount !=
+                                    static_cast<uint32_t>(
+                                        guest.suspendCount) ||
+                                schedulerThreadGuestStatus(
+                                    after->state) !=
+                                    guest.status)
+                            {
+                                throw std::logic_error(
+                                    "SuspendThread "
+                                    "scheduler and guest "
+                                    "states diverged");
+                            }
+                        }
+                        info->cv.notify_all();
+                        transition->suspended = true;
+                        transition->applied = true;
+                    },
+                    reschedule
+                        ? ps2x::ee::
+                              EeSchedulerReschedulePolicy::
+                                  HigherPriorityOnly
+                        : ps2x::ee::
+                              EeSchedulerReschedulePolicy::
+                                  None);
+            if (!published)
+            {
+                setReturnS32(ctx, KE_ERROR);
+                return;
+            }
+
+            runtime->yieldEeExecutorCurrent(
+                ps2x::ee::EeSchedulerExitReason::
+                    Preempted);
+            if (!transition->applied)
+            {
+                throw std::logic_error(
+                    "SuspendThread resumed before its "
+                    "scheduler transition");
+            }
+            if (transition->stale)
+            {
+                setReturnS32(ctx, KE_UNKNOWN_THID);
+                return;
+            }
+            if (transition->dormant)
+            {
+                setReturnS32(ctx, KE_DORMANT);
+                return;
+            }
+            if (!transition->suspended)
+            {
+                setReturnS32(ctx, KE_ERROR);
+                return;
+            }
+            if (suspendingCurrentThread)
+            {
+                (void)publishRunningAtGuestBoundary(info);
+            }
+            setReturnS32(ctx, tid);
+            return;
+        }
+
         {
             std::lock_guard<std::mutex> lock(info->m);
             if (info->guestState.isDormant())
@@ -1343,6 +1507,178 @@ namespace ps2_syscalls
         if (!info)
         {
             setReturnS32(ctx, KE_UNKNOWN_THID);
+            return;
+        }
+
+        if (runtime->usesDedicatedEeExecutor())
+        {
+            bool becomesRunnable = false;
+            {
+                std::lock_guard<std::mutex> lock(info->m);
+                const EeThreadGuestStateSnapshot &guest =
+                    info->guestState.snapshot();
+                if (guest.status == THS_DORMANT)
+                {
+                    setReturnS32(ctx, KE_DORMANT);
+                    return;
+                }
+                if (guest.suspendCount <= 0)
+                {
+                    setReturnS32(ctx, KE_NOT_SUSPEND);
+                    return;
+                }
+                becomesRunnable =
+                    guest.suspendCount == 1 &&
+                    guest.status == THS_SUSPEND;
+            }
+
+            struct ResumeTransition
+            {
+                bool applied = false;
+                bool resumed = false;
+                bool dormant = false;
+                bool notSuspended = false;
+                bool stale = false;
+            };
+            const uint32_t generation =
+                info->generation;
+            const auto transition =
+                std::make_shared<ResumeTransition>();
+            const bool published =
+                runtime->publishEeSchedulerUpdate(
+                    [info,
+                     tid,
+                     generation,
+                     transition](
+                        ps2x::ee::EeThreadScheduler
+                            &scheduler)
+                    {
+                        const auto before =
+                            scheduler.thread(tid);
+                        if (!before.has_value() ||
+                            before->generation !=
+                                generation)
+                        {
+                            transition->stale = true;
+                            transition->applied = true;
+                            return;
+                        }
+                        if (before->state ==
+                            ps2x::ee::
+                                EeSchedulerThreadState::
+                                    Dormant)
+                        {
+                            transition->dormant = true;
+                            transition->applied = true;
+                            return;
+                        }
+                        if (before->suspendCount == 0u)
+                        {
+                            transition->notSuspended =
+                                true;
+                            transition->applied = true;
+                            return;
+                        }
+                        if (!scheduler.resumeThread(
+                                {
+                                    tid,
+                                    generation,
+                                }))
+                        {
+                            throw std::logic_error(
+                                "ResumeThread could not "
+                                "apply its EE scheduler "
+                                "transition");
+                        }
+
+                        {
+                            std::lock_guard<std::mutex>
+                                lock(info->m);
+                            bool guestBecameRunnable =
+                                false;
+                            if (!info->guestState.resume(
+                                    false,
+                                    guestBecameRunnable))
+                            {
+                                throw std::logic_error(
+                                    "ResumeThread could "
+                                    "not mirror its EE "
+                                    "scheduler transition");
+                            }
+                            const auto after =
+                                scheduler.thread(tid);
+                            const auto &guest =
+                                info->guestState.snapshot();
+                            const bool schedulerBecameRunnable =
+                                before->suspendCount == 1u &&
+                                before->state ==
+                                    ps2x::ee::
+                                        EeSchedulerThreadState::
+                                            Suspended;
+                            if (!after.has_value() ||
+                                after->generation !=
+                                    generation ||
+                                after->suspendCount !=
+                                    static_cast<uint32_t>(
+                                        guest.suspendCount) ||
+                                schedulerThreadGuestStatus(
+                                    after->state) !=
+                                    guest.status ||
+                                schedulerBecameRunnable !=
+                                    guestBecameRunnable)
+                            {
+                                throw std::logic_error(
+                                    "ResumeThread "
+                                    "scheduler and guest "
+                                    "states diverged");
+                            }
+                        }
+                        info->cv.notify_all();
+                        transition->resumed = true;
+                        transition->applied = true;
+                    },
+                    reschedule && becomesRunnable
+                        ? ps2x::ee::
+                              EeSchedulerReschedulePolicy::
+                                  HigherPriorityOnly
+                        : ps2x::ee::
+                              EeSchedulerReschedulePolicy::
+                                  None);
+            if (!published)
+            {
+                setReturnS32(ctx, KE_ERROR);
+                return;
+            }
+
+            runtime->yieldEeExecutorCurrent(
+                ps2x::ee::EeSchedulerExitReason::
+                    Preempted);
+            if (!transition->applied)
+            {
+                throw std::logic_error(
+                    "ResumeThread resumed before its "
+                    "scheduler transition");
+            }
+            if (transition->stale)
+            {
+                setReturnS32(ctx, KE_UNKNOWN_THID);
+                return;
+            }
+            if (transition->dormant)
+            {
+                setReturnS32(ctx, KE_DORMANT);
+                return;
+            }
+            if (transition->notSuspended)
+            {
+                setReturnS32(ctx, KE_NOT_SUSPEND);
+                return;
+            }
+            setReturnS32(
+                ctx,
+                transition->resumed
+                    ? tid
+                    : KE_ERROR);
             return;
         }
 

@@ -85,6 +85,26 @@ static void waitWhileSuspended(const std::shared_ptr<ThreadInfo> &info, PS2Runti
     if (!info)
         return;
 
+    if (runtime && runtime->usesDedicatedEeExecutor())
+    {
+        std::lock_guard<std::mutex> lock(info->m);
+        if (info->terminated.load())
+        {
+            throw ThreadExitException();
+        }
+        const EeThreadGuestStateSnapshot &guest =
+            info->guestState.snapshot();
+        if (guest.suspendCount != 0 ||
+            guest.status == EeThreadGuestState::kSuspend ||
+            guest.status == EeThreadGuestState::kWaitSuspend)
+        {
+            throw std::logic_error(
+                "the EE scheduler resumed a suspended "
+                "dedicated continuation");
+        }
+        return;
+    }
+
     std::unique_lock<std::mutex> lock(info->m);
     if (info->guestState.snapshot().suspendCount > 0)
     {

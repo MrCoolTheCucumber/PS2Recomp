@@ -121,6 +121,10 @@ namespace
         0x1930u;
     constexpr uint32_t K_EXECUTOR_EVENT_RETAIN_RESULT_ADDR =
         0x1934u;
+    constexpr uint32_t K_EXECUTOR_SUSPEND_MAIN_ENTRY =
+        0x25a500u;
+    constexpr uint32_t K_EXECUTOR_SUSPEND_CHILD_ENTRY =
+        0x25a600u;
 
     std::mutex g_guestWordMutex;
     std::mutex g_alarmCallbackThreadMutex;
@@ -211,6 +215,25 @@ namespace
     uint32_t g_executorEventRetainBits = 0u;
     bool g_executorEventRetainWaitedAfterFirstSet =
         false;
+
+    enum class ExecutorSuspendScenario
+    {
+        SelfOrdinaryResume,
+        SelfRawResume,
+        WaitSuspendOrdinary,
+        WaitSuspendRaw,
+    };
+
+    std::vector<int> g_executorSuspendOrder;
+    ExecutorSuspendScenario g_executorSuspendScenario =
+        ExecutorSuspendScenario::SelfOrdinaryResume;
+    int g_executorSuspendChildThreadId = 0;
+    int g_executorSuspendWaitResult = KE_ERROR;
+    int g_executorSuspendResult = KE_ERROR;
+    int g_executorSuspendWakeResult = KE_ERROR;
+    int g_executorSuspendResumeResult = KE_ERROR;
+    int g_executorSuspendStatusBeforeWake = KE_ERROR;
+    int g_executorSuspendStatusAfterWake = KE_ERROR;
 
     struct EeThreadStatus
     {
@@ -1553,6 +1576,194 @@ namespace
         ctx->pc = 0u;
     }
 
+    void dedicatedExecutorSuspendChildHandler(
+        uint8_t *rdram,
+        R5900Context *ctx,
+        PS2Runtime *runtime)
+    {
+        ExecutorSuspendScenario scenario;
+        {
+            std::lock_guard<std::mutex> lock(
+                g_executorFixtureMutex);
+            scenario = g_executorSuspendScenario;
+            g_executorSuspendOrder.push_back(1);
+        }
+
+        if (scenario ==
+                ExecutorSuspendScenario::
+                    SelfOrdinaryResume ||
+            scenario ==
+                ExecutorSuspendScenario::SelfRawResume)
+        {
+            setRegU32(*ctx, 4, 0u);
+            SuspendThread(rdram, ctx, runtime);
+        }
+        else
+        {
+            SleepThread(rdram, ctx, runtime);
+        }
+
+        {
+            std::lock_guard<std::mutex> lock(
+                g_executorFixtureMutex);
+            g_executorSuspendWaitResult =
+                getRegS32(*ctx, 2);
+            g_executorSuspendOrder.push_back(3);
+        }
+        ctx->pc = 0u;
+    }
+
+    void dedicatedExecutorSuspendMainHandler(
+        uint8_t *rdram,
+        R5900Context *ctx,
+        PS2Runtime *runtime)
+    {
+        InitThread(rdram, ctx, runtime);
+
+        setRegU32(
+            *ctx,
+            4,
+            K_EXECUTOR_THREAD_PARAM_ADDR);
+        CreateThread(rdram, ctx, runtime);
+        const int childThreadId =
+            getRegS32(*ctx, 2);
+        ExecutorSuspendScenario scenario;
+        {
+            std::lock_guard<std::mutex> lock(
+                g_executorFixtureMutex);
+            g_executorSuspendChildThreadId =
+                childThreadId;
+            scenario = g_executorSuspendScenario;
+        }
+
+        setRegU32(
+            *ctx,
+            4,
+            static_cast<uint32_t>(childThreadId));
+        setRegU32(*ctx, 5, 0u);
+        StartThread(rdram, ctx, runtime);
+        {
+            std::lock_guard<std::mutex> lock(
+                g_executorFixtureMutex);
+            g_executorSuspendOrder.push_back(2);
+        }
+
+        const bool waitSuspend =
+            scenario ==
+                ExecutorSuspendScenario::
+                    WaitSuspendOrdinary ||
+            scenario ==
+                ExecutorSuspendScenario::WaitSuspendRaw;
+        const bool raw =
+            scenario ==
+                ExecutorSuspendScenario::SelfRawResume ||
+            scenario ==
+                ExecutorSuspendScenario::WaitSuspendRaw;
+        if (waitSuspend)
+        {
+            setRegU32(
+                *ctx,
+                4,
+                static_cast<uint32_t>(childThreadId));
+            if (raw)
+            {
+                iSuspendThread(rdram, ctx, runtime);
+            }
+            else
+            {
+                SuspendThread(rdram, ctx, runtime);
+            }
+            {
+                std::lock_guard<std::mutex> lock(
+                    g_executorFixtureMutex);
+                g_executorSuspendResult =
+                    getRegS32(*ctx, 2);
+            }
+        }
+
+        R5900Context statusContext{};
+        setRegU32(
+            statusContext,
+            4,
+            static_cast<uint32_t>(childThreadId));
+        setRegU32(
+            statusContext,
+            5,
+            K_STATUS_ADDR);
+        iReferThreadStatus(
+            rdram,
+            &statusContext,
+            runtime);
+        {
+            std::lock_guard<std::mutex> lock(
+                g_executorFixtureMutex);
+            g_executorSuspendStatusBeforeWake =
+                getRegS32(statusContext, 2);
+        }
+
+        if (waitSuspend)
+        {
+            setRegU32(
+                *ctx,
+                4,
+                static_cast<uint32_t>(childThreadId));
+            if (raw)
+            {
+                iWakeupThread(rdram, ctx, runtime);
+            }
+            else
+            {
+                WakeupThread(rdram, ctx, runtime);
+            }
+            {
+                std::lock_guard<std::mutex> lock(
+                    g_executorFixtureMutex);
+                g_executorSuspendWakeResult =
+                    getRegS32(*ctx, 2);
+            }
+
+            setRegU32(
+                statusContext,
+                4,
+                static_cast<uint32_t>(childThreadId));
+            setRegU32(
+                statusContext,
+                5,
+                K_STATUS_ADDR);
+            iReferThreadStatus(
+                rdram,
+                &statusContext,
+                runtime);
+            {
+                std::lock_guard<std::mutex> lock(
+                    g_executorFixtureMutex);
+                g_executorSuspendStatusAfterWake =
+                    getRegS32(statusContext, 2);
+            }
+        }
+
+        setRegU32(
+            *ctx,
+            4,
+            static_cast<uint32_t>(childThreadId));
+        if (raw)
+        {
+            iResumeThread(rdram, ctx, runtime);
+        }
+        else
+        {
+            ResumeThread(rdram, ctx, runtime);
+        }
+        {
+            std::lock_guard<std::mutex> lock(
+                g_executorFixtureMutex);
+            g_executorSuspendResumeResult =
+                getRegS32(*ctx, 2);
+            g_executorSuspendOrder.push_back(4);
+        }
+        ctx->pc = 0u;
+    }
+
     struct TestEnv
     {
         std::vector<uint8_t> rdram;
@@ -2885,6 +3096,220 @@ void register_ps2_runtime_kernel_tests()
                     "the first waiter's clear should "
                     "consume the first publication before "
                     "the second predicate is evaluated");
+            });
+
+        tc.Run(
+            "fiber suspend and resume preserve executor ownership",
+            [](TestCase &t)
+            {
+                if (!eeExecutionBackendBuildInfo()
+                         .boostContextFcontextAvailable)
+                {
+                    return;
+                }
+
+                struct FixtureResult
+                {
+                    bool memoryInitialized = false;
+                    bool completed = false;
+                    std::vector<int> order;
+                    int childThreadId = 0;
+                    int waitResult = KE_ERROR;
+                    int suspendResult = KE_ERROR;
+                    int wakeResult = KE_ERROR;
+                    int resumeResult = KE_ERROR;
+                    int statusBeforeWake = KE_ERROR;
+                    int statusAfterWake = KE_ERROR;
+                };
+
+                const auto runFixture =
+                    [](ExecutorSuspendScenario scenario)
+                    {
+                        FixtureResult result{};
+                        PS2RuntimeConfiguration
+                            configuration{};
+                        configuration.eeExecutionBackend =
+                            EeExecutionBackendKind::
+                                LegacyCppFiber;
+                        PS2Runtime runtime(configuration);
+                        result.memoryInitialized =
+                            runtime.memory().initialize();
+                        if (!result.memoryInitialized)
+                        {
+                            return result;
+                        }
+                        uint8_t *const rdram =
+                            runtime.memory().getRDRAM();
+                        const std::array<uint32_t, 9u>
+                            threadParameters{
+                                0u,
+                                K_EXECUTOR_SUSPEND_CHILD_ENTRY,
+                                0x00310000u,
+                                0x800u,
+                                0u,
+                                0u,
+                                0u,
+                                0u,
+                                0u,
+                            };
+                        writeGuestWords(
+                            rdram,
+                            K_EXECUTOR_THREAD_PARAM_ADDR,
+                            threadParameters.data(),
+                            threadParameters.size());
+                        runtime.registerFunction(
+                            K_EXECUTOR_SUSPEND_MAIN_ENTRY,
+                            &dedicatedExecutorSuspendMainHandler);
+                        runtime.registerFunction(
+                            K_EXECUTOR_SUSPEND_CHILD_ENTRY,
+                            &dedicatedExecutorSuspendChildHandler);
+                        runtime.cpu().pc =
+                            K_EXECUTOR_SUSPEND_MAIN_ENTRY;
+                        setRegU32(
+                            runtime.cpu(),
+                            29,
+                            0x00300000u);
+
+                        {
+                            std::lock_guard<std::mutex>
+                                lock(
+                                    g_executorFixtureMutex);
+                            g_executorSuspendScenario =
+                                scenario;
+                            g_executorSuspendOrder.clear();
+                            g_executorSuspendChildThreadId =
+                                0;
+                            g_executorSuspendWaitResult =
+                                KE_ERROR;
+                            g_executorSuspendResult =
+                                KE_ERROR;
+                            g_executorSuspendWakeResult =
+                                KE_ERROR;
+                            g_executorSuspendResumeResult =
+                                KE_ERROR;
+                            g_executorSuspendStatusBeforeWake =
+                                KE_ERROR;
+                            g_executorSuspendStatusAfterWake =
+                                KE_ERROR;
+                        }
+
+                        runtime
+                            .startDedicatedEeExecutionForTesting();
+                        result.completed = waitUntil(
+                            []()
+                            {
+                                std::lock_guard<
+                                    std::mutex>
+                                    lock(
+                                        g_executorFixtureMutex);
+                                return g_executorSuspendOrder
+                                           .size() == 4u;
+                            },
+                            std::chrono::seconds(2));
+                        runtime
+                            .stopDedicatedEeExecutionForTesting();
+
+                        {
+                            std::lock_guard<std::mutex>
+                                lock(
+                                    g_executorFixtureMutex);
+                            result.order =
+                                g_executorSuspendOrder;
+                            result.childThreadId =
+                                g_executorSuspendChildThreadId;
+                            result.waitResult =
+                                g_executorSuspendWaitResult;
+                            result.suspendResult =
+                                g_executorSuspendResult;
+                            result.wakeResult =
+                                g_executorSuspendWakeResult;
+                            result.resumeResult =
+                                g_executorSuspendResumeResult;
+                            result.statusBeforeWake =
+                                g_executorSuspendStatusBeforeWake;
+                            result.statusAfterWake =
+                                g_executorSuspendStatusAfterWake;
+                        }
+                        return result;
+                    };
+
+                const std::array<
+                    std::pair<
+                        ExecutorSuspendScenario,
+                        const char *>,
+                    4u>
+                    scenarios{{
+                        {ExecutorSuspendScenario::
+                             SelfOrdinaryResume,
+                         "self suspend / ordinary resume"},
+                        {ExecutorSuspendScenario::
+                             SelfRawResume,
+                         "self suspend / raw resume"},
+                        {ExecutorSuspendScenario::
+                             WaitSuspendOrdinary,
+                         "wait-suspend / ordinary resume"},
+                        {ExecutorSuspendScenario::
+                             WaitSuspendRaw,
+                         "wait-suspend / raw resume"},
+                    }};
+                for (const auto &[scenario, name] :
+                     scenarios)
+                {
+                    const FixtureResult result =
+                        runFixture(scenario);
+                    const bool waitSuspend =
+                        scenario ==
+                            ExecutorSuspendScenario::
+                                WaitSuspendOrdinary ||
+                        scenario ==
+                            ExecutorSuspendScenario::
+                                WaitSuspendRaw;
+                    const bool raw =
+                        scenario ==
+                            ExecutorSuspendScenario::
+                                SelfRawResume ||
+                        scenario ==
+                            ExecutorSuspendScenario::
+                                WaitSuspendRaw;
+                    const std::vector<int> expectedOrder =
+                        raw
+                            ? std::vector<int>{1, 2, 4, 3}
+                            : std::vector<int>{1, 2, 3, 4};
+
+                    t.IsTrue(
+                        result.memoryInitialized &&
+                            result.completed &&
+                            result.order == expectedOrder,
+                        std::string(name) +
+                            " should switch only through "
+                            "the one executor");
+                    t.IsTrue(
+                        result.childThreadId > 1 &&
+                            result.waitResult ==
+                                result.childThreadId &&
+                            result.resumeResult ==
+                                result.childThreadId &&
+                            result.statusBeforeWake ==
+                                (waitSuspend
+                                     ? THS_WAITSUSPEND
+                                     : THS_SUSPEND),
+                        std::string(name) +
+                            " should preserve syscall "
+                            "results and suspended status");
+                    if (waitSuspend)
+                    {
+                        t.IsTrue(
+                            result.suspendResult ==
+                                    result.childThreadId &&
+                                result.wakeResult ==
+                                    result.childThreadId &&
+                                result.statusAfterWake ==
+                                    THS_SUSPEND,
+                            std::string(name) +
+                                " should move WAIT through "
+                                "WAITSUSPEND to SUSPEND");
+                    }
+                }
             });
 
         tc.Run("host presentation upload state is isolated per runtime", [](TestCase &t)
