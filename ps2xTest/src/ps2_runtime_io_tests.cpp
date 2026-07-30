@@ -152,6 +152,123 @@ void register_ps2_runtime_io_tests()
 {
     MiniTest::Case("PS2RuntimeIO", [](TestCase &tc)
     {
+        tc.Run("file descriptors and CD state are isolated per runtime", [](TestCase &t)
+        {
+            TestContext test;
+            PS2Runtime first;
+            PS2Runtime second;
+            std::vector<uint8_t> secondRdram(
+                PS2_RAM_SIZE, 0u);
+            R5900Context secondCtx{};
+
+            const std::filesystem::path hostFile =
+                test.paths.cdRoot / "shared.bin";
+            {
+                std::ofstream out(
+                    hostFile, std::ios::binary);
+                out << "runtime-io";
+            }
+
+            constexpr uint32_t kPathAddr =
+                GUEST_STRING_AREA_START + 0xC00u;
+            writeGuestString(
+                test.rdram.data(),
+                kPathAddr,
+                "host0:/shared.bin");
+            writeGuestString(
+                secondRdram.data(),
+                kPathAddr,
+                "host0:/shared.bin");
+
+            setRegU32(test.ctx, 4, kPathAddr);
+            setRegU32(test.ctx, 5, PS2_FIO_O_RDONLY);
+            fioOpen(
+                test.rdram.data(),
+                &test.ctx,
+                &first);
+            const int32_t firstFd =
+                getRegS32(&test.ctx, 2);
+
+            setRegU32(secondCtx, 4, kPathAddr);
+            setRegU32(secondCtx, 5, PS2_FIO_O_RDONLY);
+            fioOpen(
+                secondRdram.data(),
+                &secondCtx,
+                &second);
+            const int32_t secondFd =
+                getRegS32(&secondCtx, 2);
+
+            t.IsTrue(
+                firstFd >= 3 && secondFd >= 3,
+                "both runtimes should open the host file");
+            t.Equals(
+                secondFd,
+                firstFd,
+                "each runtime should independently allocate its first file descriptor");
+
+            setRegU32(
+                test.ctx,
+                4,
+                static_cast<uint32_t>(firstFd));
+            fioClose(
+                test.rdram.data(),
+                &test.ctx,
+                &first);
+            setRegU32(
+                secondCtx,
+                4,
+                static_cast<uint32_t>(secondFd));
+            fioClose(
+                secondRdram.data(),
+                &secondCtx,
+                &second);
+
+            clearContext(test.ctx);
+            clearContext(secondCtx);
+            ps2_stubs::sceCdInit(
+                test.rdram.data(),
+                &test.ctx,
+                &first);
+            ps2_stubs::sceCdStatus(
+                secondRdram.data(),
+                &secondCtx,
+                &second);
+            t.Equals(
+                getRegS32(&secondCtx, 2),
+                0,
+                "initializing one runtime must not initialize another runtime's CD device");
+
+            constexpr uint32_t kFirstLbn = 0x1111u;
+            constexpr uint32_t kSecondLbn = 0x2222u;
+            setRegU32(test.ctx, 4, kFirstLbn);
+            ps2_stubs::sceCdSeek(
+                test.rdram.data(),
+                &test.ctx,
+                &first);
+            setRegU32(secondCtx, 4, kSecondLbn);
+            ps2_stubs::sceCdSeek(
+                secondRdram.data(),
+                &secondCtx,
+                &second);
+
+            ps2_stubs::sceCdGetReadPos(
+                test.rdram.data(),
+                &test.ctx,
+                &first);
+            t.Equals(
+                ::getRegU32(&test.ctx, 2),
+                kFirstLbn,
+                "the first runtime should retain its CD stream position");
+            ps2_stubs::sceCdGetReadPos(
+                secondRdram.data(),
+                &secondCtx,
+                &second);
+            t.Equals(
+                ::getRegU32(&secondCtx, 2),
+                kSecondLbn,
+                "the second runtime should retain its CD stream position");
+        });
+
         tc.Run("mc0 directory creation", [](TestCase &t)
         {
             TestContext test;
