@@ -1425,6 +1425,47 @@ namespace ps2_syscalls
 
         runExitHandlersForThread(tid, rdram, ctx, runtime);
         auto info = ensureCurrentThreadInfo(runtime, ctx);
+        if (info &&
+            runtime->usesDedicatedEeExecutor())
+        {
+            const uint32_t generation =
+                info->generation;
+            if (!runtime->publishEeSchedulerUpdate(
+                    [tid, generation](
+                        ps2x::ee::EeThreadScheduler
+                            &scheduler)
+                    {
+                        const auto snapshot =
+                            scheduler.thread(tid);
+                        if (!snapshot.has_value() ||
+                            snapshot->generation !=
+                                generation ||
+                            snapshot->state !=
+                                ps2x::ee::
+                                    EeSchedulerThreadState::
+                                        Dormant ||
+                            !scheduler.deleteThread(
+                                {
+                                    tid,
+                                    generation,
+                                }))
+                        {
+                            throw std::logic_error(
+                                "ExitDeleteThread could "
+                                "not retire its terminal "
+                                "EE scheduler record");
+                        }
+                    },
+                    ps2x::ee::
+                        EeSchedulerReschedulePolicy::
+                            None))
+            {
+                throw std::runtime_error(
+                    "ExitDeleteThread could not publish "
+                    "its terminal EE scheduler "
+                    "transition");
+            }
+        }
         if (info)
         {
             std::lock_guard<std::mutex> lock(info->m);

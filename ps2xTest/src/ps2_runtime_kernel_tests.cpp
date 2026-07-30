@@ -131,6 +131,12 @@ namespace
         0x25a800u;
     constexpr uint32_t K_EXECUTOR_TERMINATE_TARGET_ENTRY =
         0x25a900u;
+    constexpr uint32_t K_EXECUTOR_EXIT_MAIN_ENTRY =
+        0x25aa00u;
+    constexpr uint32_t K_EXECUTOR_EXIT_THREAD_ENTRY =
+        0x25ab00u;
+    constexpr uint32_t K_EXECUTOR_EXIT_DELETE_THREAD_ENTRY =
+        0x25ac00u;
 
     std::mutex g_guestWordMutex;
     std::mutex g_alarmCallbackThreadMutex;
@@ -260,6 +266,17 @@ namespace
     int g_executorTerminateWaiters = -1;
     int g_executorTerminateDeleteResult = KE_ERROR;
     bool g_executorTerminateTargetReturned = false;
+    bool g_executorExitCompleted = false;
+    int g_executorExitThreadId = 0;
+    int g_executorExitDeleteThreadId = 0;
+    int g_executorExitThreadStartResult = KE_ERROR;
+    int g_executorExitDeleteThreadStartResult = KE_ERROR;
+    int g_executorExitThreadStatusResult = KE_ERROR;
+    int32_t g_executorExitThreadStatusPayload = 0;
+    int g_executorExitThreadDeleteResult = KE_ERROR;
+    int g_executorExitDeleteThreadStatusResult = KE_ERROR;
+    int32_t g_executorExitDeleteThreadStatusPayload = 0;
+    int g_executorExitDeleteThreadDeleteResult = KE_ERROR;
 
     struct EeThreadStatus
     {
@@ -2096,6 +2113,144 @@ namespace
         ctx->pc = 0u;
     }
 
+    void dedicatedExecutorExitMainHandler(
+        uint8_t *rdram,
+        R5900Context *ctx,
+        PS2Runtime *runtime)
+    {
+        InitThread(rdram, ctx, runtime);
+
+        const auto createAndStart =
+            [&](uint32_t entry, uint32_t stack)
+            {
+                const std::array<uint32_t, 9u>
+                    threadParameters{
+                        0u,
+                        entry,
+                        stack,
+                        0x800u,
+                        0u,
+                        0u,
+                        0u,
+                        0u,
+                        0u,
+                    };
+                writeGuestWords(
+                    rdram,
+                    K_EXECUTOR_THREAD_PARAM_ADDR,
+                    threadParameters.data(),
+                    threadParameters.size());
+                setRegU32(
+                    *ctx,
+                    4,
+                    K_EXECUTOR_THREAD_PARAM_ADDR);
+                CreateThread(rdram, ctx, runtime);
+                const int threadId =
+                    getRegS32(*ctx, 2);
+                setRegU32(
+                    *ctx,
+                    4,
+                    static_cast<uint32_t>(threadId));
+                setRegU32(*ctx, 5, 0u);
+                StartThread(rdram, ctx, runtime);
+                return std::pair{
+                    threadId,
+                    getRegS32(*ctx, 2),
+                };
+            };
+
+        const auto [exitThreadId, exitThreadStartResult] =
+            createAndStart(
+                K_EXECUTOR_EXIT_THREAD_ENTRY,
+                0x00312000u);
+
+        std::memset(
+            rdram + K_STATUS_ADDR,
+            0xA5,
+            sizeof(EeThreadStatus));
+        setRegU32(
+            *ctx,
+            4,
+            static_cast<uint32_t>(exitThreadId));
+        setRegU32(*ctx, 5, K_STATUS_ADDR);
+        iReferThreadStatus(rdram, ctx, runtime);
+        const int exitThreadStatusResult =
+            getRegS32(*ctx, 2);
+        EeThreadStatus exitThreadStatus{};
+        std::memcpy(
+            &exitThreadStatus,
+            rdram + K_STATUS_ADDR,
+            sizeof(exitThreadStatus));
+
+        setRegU32(
+            *ctx,
+            4,
+            static_cast<uint32_t>(exitThreadId));
+        DeleteThread(rdram, ctx, runtime);
+        const int exitThreadDeleteResult =
+            getRegS32(*ctx, 2);
+
+        const auto [
+            exitDeleteThreadId,
+            exitDeleteThreadStartResult] =
+            createAndStart(
+                K_EXECUTOR_EXIT_DELETE_THREAD_ENTRY,
+                0x00313000u);
+
+        std::memset(
+            rdram + K_STATUS_ADDR,
+            0x5A,
+            sizeof(EeThreadStatus));
+        setRegU32(
+            *ctx,
+            4,
+            static_cast<uint32_t>(exitDeleteThreadId));
+        setRegU32(*ctx, 5, K_STATUS_ADDR);
+        iReferThreadStatus(rdram, ctx, runtime);
+        const int exitDeleteThreadStatusResult =
+            getRegS32(*ctx, 2);
+        EeThreadStatus exitDeleteThreadStatus{};
+        std::memcpy(
+            &exitDeleteThreadStatus,
+            rdram + K_STATUS_ADDR,
+            sizeof(exitDeleteThreadStatus));
+
+        setRegU32(
+            *ctx,
+            4,
+            static_cast<uint32_t>(
+                exitDeleteThreadId));
+        DeleteThread(rdram, ctx, runtime);
+        const int exitDeleteThreadDeleteResult =
+            getRegS32(*ctx, 2);
+
+        {
+            std::lock_guard<std::mutex> lock(
+                g_executorFixtureMutex);
+            g_executorExitThreadId = exitThreadId;
+            g_executorExitDeleteThreadId =
+                exitDeleteThreadId;
+            g_executorExitThreadStartResult =
+                exitThreadStartResult;
+            g_executorExitDeleteThreadStartResult =
+                exitDeleteThreadStartResult;
+            g_executorExitThreadStatusResult =
+                exitThreadStatusResult;
+            g_executorExitThreadStatusPayload =
+                exitThreadStatus.status;
+            g_executorExitThreadDeleteResult =
+                exitThreadDeleteResult;
+            g_executorExitDeleteThreadStatusResult =
+                exitDeleteThreadStatusResult;
+            g_executorExitDeleteThreadStatusPayload =
+                exitDeleteThreadStatus.status;
+            g_executorExitDeleteThreadDeleteResult =
+                exitDeleteThreadDeleteResult;
+            g_executorExitCompleted = true;
+        }
+        ctx->pc = 0u;
+    }
+
     struct TestEnv
     {
         std::vector<uint8_t> rdram;
@@ -3891,6 +4046,244 @@ void register_ps2_runtime_kernel_tests()
                             " should delete scheduler "
                             "ownership and its fiber");
                 }
+            });
+
+        tc.Run(
+            "fiber self exit preserves or removes scheduler objects",
+            [](TestCase &t)
+            {
+                if (!eeExecutionBackendBuildInfo()
+                         .boostContextFcontextAvailable)
+                {
+                    return;
+                }
+
+                struct FixtureResult
+                {
+                    bool memoryInitialized = false;
+                    bool completed = false;
+                    int exitThreadId = 0;
+                    int exitDeleteThreadId = 0;
+                    int exitThreadStartResult = KE_ERROR;
+                    int exitDeleteThreadStartResult =
+                        KE_ERROR;
+                    int exitThreadStatusResult = KE_ERROR;
+                    int32_t exitThreadStatusPayload = 0;
+                    int exitThreadDeleteResult = KE_ERROR;
+                    int exitDeleteThreadStatusResult =
+                        KE_ERROR;
+                    int32_t exitDeleteThreadStatusPayload =
+                        0;
+                    int exitDeleteThreadDeleteResult =
+                        KE_ERROR;
+                    uint32_t exitThreadStage = 0u;
+                    uint32_t exitDeleteThreadStage = 0u;
+                    uint32_t exitThreadObservedId = 0u;
+                    uint32_t exitDeleteThreadObservedId =
+                        0u;
+                    bool schedulerExitThreadPresent = true;
+                    bool schedulerExitDeleteThreadPresent =
+                        true;
+                    size_t managedContinuations = 1u;
+                };
+
+                FixtureResult result{};
+                PS2RuntimeConfiguration configuration{};
+                configuration.eeExecutionBackend =
+                    EeExecutionBackendKind::LegacyCppFiber;
+                PS2Runtime runtime(configuration);
+                result.memoryInitialized =
+                    runtime.memory().initialize();
+                if (!result.memoryInitialized)
+                {
+                    t.IsTrue(
+                        false,
+                        "fiber self-exit fixture memory should initialize");
+                    return;
+                }
+
+                uint8_t *const rdram =
+                    runtime.memory().getRDRAM();
+                runtime.registerFunction(
+                    K_EXECUTOR_EXIT_MAIN_ENTRY,
+                    &dedicatedExecutorExitMainHandler);
+                runtime.registerFunction(
+                    K_EXECUTOR_EXIT_THREAD_ENTRY,
+                    &selfExitThreadHandler);
+                runtime.registerFunction(
+                    K_EXECUTOR_EXIT_DELETE_THREAD_ENTRY,
+                    &selfExitDeleteThreadHandler);
+                runtime.cpu().pc =
+                    K_EXECUTOR_EXIT_MAIN_ENTRY;
+                setRegU32(
+                    runtime.cpu(),
+                    29,
+                    0x00300000u);
+
+                {
+                    std::lock_guard<std::mutex> lock(
+                        g_executorFixtureMutex);
+                    g_executorExitCompleted = false;
+                    g_executorExitThreadId = 0;
+                    g_executorExitDeleteThreadId = 0;
+                    g_executorExitThreadStartResult =
+                        KE_ERROR;
+                    g_executorExitDeleteThreadStartResult =
+                        KE_ERROR;
+                    g_executorExitThreadStatusResult =
+                        KE_ERROR;
+                    g_executorExitThreadStatusPayload = 0;
+                    g_executorExitThreadDeleteResult =
+                        KE_ERROR;
+                    g_executorExitDeleteThreadStatusResult =
+                        KE_ERROR;
+                    g_executorExitDeleteThreadStatusPayload =
+                        0;
+                    g_executorExitDeleteThreadDeleteResult =
+                        KE_ERROR;
+                }
+
+                runtime
+                    .startDedicatedEeExecutionForTesting();
+                result.completed = waitUntil(
+                    []()
+                    {
+                        std::lock_guard<std::mutex> lock(
+                            g_executorFixtureMutex);
+                        return g_executorExitCompleted;
+                    },
+                    std::chrono::seconds(2));
+                const bool continuationsRetired =
+                    waitUntil(
+                        [&runtime]()
+                        {
+                            return runtime
+                                       .managedEeExecutionThreadCountForTesting() ==
+                                   0u;
+                        },
+                        std::chrono::milliseconds(200));
+
+                {
+                    std::lock_guard<std::mutex> lock(
+                        g_executorFixtureMutex);
+                    result.exitThreadId =
+                        g_executorExitThreadId;
+                    result.exitDeleteThreadId =
+                        g_executorExitDeleteThreadId;
+                    result.exitThreadStartResult =
+                        g_executorExitThreadStartResult;
+                    result.exitDeleteThreadStartResult =
+                        g_executorExitDeleteThreadStartResult;
+                    result.exitThreadStatusResult =
+                        g_executorExitThreadStatusResult;
+                    result.exitThreadStatusPayload =
+                        g_executorExitThreadStatusPayload;
+                    result.exitThreadDeleteResult =
+                        g_executorExitThreadDeleteResult;
+                    result.exitDeleteThreadStatusResult =
+                        g_executorExitDeleteThreadStatusResult;
+                    result.exitDeleteThreadStatusPayload =
+                        g_executorExitDeleteThreadStatusPayload;
+                    result.exitDeleteThreadDeleteResult =
+                        g_executorExitDeleteThreadDeleteResult;
+                }
+
+                std::optional<
+                    ps2x::ee::EeSchedulerThreadSnapshot>
+                    schedulerExitThread;
+                std::optional<
+                    ps2x::ee::EeSchedulerThreadSnapshot>
+                    schedulerExitDeleteThread;
+                runtime.invokeEeSchedulerUpdateAtBoundary(
+                    [&schedulerExitThread,
+                     &schedulerExitDeleteThread,
+                     &result](
+                        ps2x::ee::EeThreadScheduler
+                            &scheduler)
+                    {
+                        schedulerExitThread =
+                            scheduler.thread(
+                                result.exitThreadId);
+                        schedulerExitDeleteThread =
+                            scheduler.thread(
+                                result.exitDeleteThreadId);
+                    },
+                    ps2x::ee::
+                        EeSchedulerReschedulePolicy::None);
+                result.schedulerExitThreadPresent =
+                    schedulerExitThread.has_value();
+                result.schedulerExitDeleteThreadPresent =
+                    schedulerExitDeleteThread.has_value();
+                result.managedContinuations =
+                    runtime
+                        .managedEeExecutionThreadCountForTesting();
+                runtime
+                    .stopDedicatedEeExecutionForTesting();
+
+                result.exitThreadStage =
+                    readGuestU32(
+                        rdram,
+                        K_EXIT_THREAD_STAGE_ADDR);
+                result.exitDeleteThreadStage =
+                    readGuestU32(
+                        rdram,
+                        K_EXIT_DELETE_THREAD_STAGE_ADDR);
+                result.exitThreadObservedId =
+                    readGuestU32(
+                        rdram,
+                        K_EXIT_THREAD_ID_ADDR);
+                result.exitDeleteThreadObservedId =
+                    readGuestU32(
+                        rdram,
+                        K_EXIT_DELETE_THREAD_ID_ADDR);
+                if (!continuationsRetired)
+                {
+                    result.managedContinuations =
+                        std::max<size_t>(
+                            1u,
+                            result.managedContinuations);
+                }
+
+                t.IsTrue(
+                    result.memoryInitialized &&
+                        result.completed &&
+                        result.exitThreadId > 1 &&
+                        result.exitDeleteThreadId > 1 &&
+                        result.exitThreadId !=
+                            result.exitDeleteThreadId &&
+                        result.exitThreadStartResult ==
+                            result.exitThreadId &&
+                        result.exitDeleteThreadStartResult ==
+                            result.exitDeleteThreadId &&
+                        result.exitThreadStage == 1u &&
+                        result.exitDeleteThreadStage == 1u &&
+                        result.exitThreadObservedId ==
+                            static_cast<uint32_t>(
+                                result.exitThreadId) &&
+                        result.exitDeleteThreadObservedId ==
+                            static_cast<uint32_t>(
+                                result.exitDeleteThreadId),
+                    "self-exit workers should stop at their syscalls and return control to the executor");
+                t.IsTrue(
+                    result.exitThreadStatusResult ==
+                            THS_DORMANT &&
+                        result.exitThreadStatusPayload ==
+                            THS_DORMANT &&
+                        result.exitThreadDeleteResult ==
+                            result.exitThreadId &&
+                        result.exitDeleteThreadStatusResult ==
+                            KE_OK &&
+                        result.exitDeleteThreadStatusPayload ==
+                            0x5A5A5A5A &&
+                        result.exitDeleteThreadDeleteResult ==
+                            KE_ERROR,
+                    "self exit should preserve the guest object while exit-delete should remove it");
+                t.IsTrue(
+                    !result.schedulerExitThreadPresent &&
+                        !result
+                             .schedulerExitDeleteThreadPresent &&
+                        result.managedContinuations == 0u,
+                    "self-exit lifecycle should retire scheduler and continuation ownership exactly once");
             });
 
         tc.Run("host presentation upload state is isolated per runtime", [](TestCase &t)
