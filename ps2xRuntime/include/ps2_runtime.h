@@ -1881,6 +1881,12 @@ private:
         kMaximumPendingVSyncDeliveries>
         m_pendingVSyncDeliveries{};
     size_t m_pendingVSyncDeliveryCount = 0u;
+    // Executor-only callback publication state. A suspended guest fiber can
+    // retain its outer GuestExecutionScope across many scheduler boundaries,
+    // so the legacy scope destructor is not a boundary for the dedicated
+    // backend. Drain published interrupt work once from each explicit
+    // executor boundary instead.
+    bool m_eeExecutorInterruptPassComplete = false;
     ps2x::timing::EeTick m_vu0CycleTick{};
     std::atomic<uint64_t> m_vu0InvocationSequence{0u};
     std::atomic<uint64_t> m_vu0CurrentInvocation{0u};

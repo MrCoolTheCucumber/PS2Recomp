@@ -244,6 +244,43 @@ namespace
     thread_local uint32_t g_deferredGuestYieldDepth = 0u;
     thread_local bool g_deferredGuestYieldPending = false;
 
+    struct EeExecutorConsequenceContext
+    {
+        PS2Runtime *runtime = nullptr;
+        ps2x::ee::EeThreadScheduler *scheduler =
+            nullptr;
+        IEeExecutionBackend *backend = nullptr;
+        ps2x::ee::EeSchedulerReschedulePolicy
+            reschedulePolicy =
+                ps2x::ee::
+                    EeSchedulerReschedulePolicy::None;
+    };
+
+    thread_local EeExecutorConsequenceContext
+        g_eeExecutorConsequenceContext;
+
+    [[nodiscard]] constexpr
+    ps2x::ee::EeSchedulerReschedulePolicy
+    combineEeReschedulePolicies(
+        ps2x::ee::EeSchedulerReschedulePolicy left,
+        ps2x::ee::EeSchedulerReschedulePolicy right)
+        noexcept
+    {
+        using Policy =
+            ps2x::ee::EeSchedulerReschedulePolicy;
+        if (left == Policy::EqualOrHigherPriority ||
+            right == Policy::EqualOrHigherPriority)
+        {
+            return Policy::EqualOrHigherPriority;
+        }
+        if (left == Policy::HigherPriorityOnly ||
+            right == Policy::HigherPriorityOnly)
+        {
+            return Policy::HigherPriorityOnly;
+        }
+        return Policy::None;
+    }
+
     struct Vif0MmioTrace
     {
         std::FILE *output = nullptr;
@@ -1466,6 +1503,27 @@ bool PS2Runtime::publishEeExecutorUpdate(
         return false;
     }
 
+    EeExecutorConsequenceContext &consequence =
+        g_eeExecutorConsequenceContext;
+    if (consequence.runtime == this)
+    {
+        if (!consequence.scheduler ||
+            !consequence.backend)
+        {
+            throw std::logic_error(
+                "EE callback consequence has no "
+                "scheduler/backend context");
+        }
+        update(
+            *consequence.scheduler,
+            *consequence.backend);
+        consequence.reschedulePolicy =
+            combineEeReschedulePolicies(
+                consequence.reschedulePolicy,
+                policy);
+        return true;
+    }
+
     return m_eeRuntimeExecutor->publish(
         std::move(update), policy);
 }
@@ -1554,6 +1612,25 @@ void PS2Runtime::yieldEeExecutorCurrent(
             "dedicated executor");
     }
 
+    if (g_eeExecutorConsequenceContext.runtime ==
+        this)
+    {
+        if (reason ==
+                ps2x::ee::EeSchedulerExitReason::
+                    Blocked ||
+            wait.valid())
+        {
+            throw std::logic_error(
+                "an EE interrupt/callback consequence "
+                "cannot block the executor");
+        }
+        // Non-blocking interrupt-context syscalls have already applied
+        // their scheduler mutation inline above. The containing consequence
+        // returns the strongest accumulated reschedule policy after all
+        // callback code finishes; there is no guest fiber to suspend here.
+        return;
+    }
+
     R5900Context *releasedContext = nullptr;
     int releasedThreadId = 1;
     const uint32_t releasedDepth =
@@ -1602,6 +1679,7 @@ void PS2Runtime::commitPriorContext(
     // Generated code and runtime helpers already advance the canonical EE
     // timeline. The executor's relative tick is a consistency/accounting
     // view and must not advance that timeline a second time.
+    m_eeExecutorInterruptPassComplete = false;
 }
 
 void PS2Runtime::publishSelectedContext(
@@ -1633,21 +1711,84 @@ void PS2Runtime::publishWaitCompletion(
 }
 
 bool PS2Runtime::hasImmediateConsequence(
-    ps2x::ee::EeSchedulerConsequenceStage,
+    ps2x::ee::EeSchedulerConsequenceStage stage,
     ps2x::timing::EeTick) const
 {
-    return false;
+    if (stage !=
+            ps2x::ee::EeSchedulerConsequenceStage::
+                InterruptCause ||
+        m_eeExecutorInterruptPassComplete)
+    {
+        return false;
+    }
+
+    return m_eeAlarmRuntimeState
+                   ->pendingCallbackPublished.load(
+                       std::memory_order_acquire) ||
+           m_pendingVSyncDeliveryCount != 0u ||
+           m_pendingEeCounterInterrupts != 0u ||
+           m_dmacInterruptDeliveryDirty.load(
+               std::memory_order_acquire);
 }
 
 ps2x::ee::EeSchedulerReschedulePolicy
 PS2Runtime::applyNextConsequence(
-    ps2x::ee::EeSchedulerConsequenceStage,
+    ps2x::ee::EeSchedulerConsequenceStage stage,
     ps2x::timing::EeTick,
-    ps2x::ee::EeThreadScheduler &)
+    ps2x::ee::EeThreadScheduler &scheduler)
 {
-    throw std::logic_error(
-        "PS2 runtime has no external EE scheduler "
-        "consequence at this stage");
+    if (stage !=
+            ps2x::ee::EeSchedulerConsequenceStage::
+                InterruptCause ||
+        m_eeExecutorInterruptPassComplete)
+    {
+        throw std::logic_error(
+            "PS2 runtime has no immediate EE scheduler "
+            "consequence at this stage");
+    }
+
+    // These adapters may execute generated interrupt/callback code. They run
+    // only here on the EE executor, after the prior guest continuation has
+    // yielded and before the next continuation is selected. Mark the pass
+    // complete first so a masked retained cause cannot spin the consequence
+    // loop; a later executor boundary will reconsider retained work.
+    m_eeExecutorInterruptPassComplete = true;
+    EeExecutorConsequenceContext &consequence =
+        g_eeExecutorConsequenceContext;
+    if (consequence.runtime)
+    {
+        throw std::logic_error(
+            "nested EE executor callback consequence");
+    }
+    consequence.runtime = this;
+    consequence.scheduler = &scheduler;
+    consequence.backend =
+        m_eeExecutionBackend.get();
+    consequence.reschedulePolicy =
+        ps2x::ee::
+            EeSchedulerReschedulePolicy::None;
+    try
+    {
+        drainPendingAlarmCallbacks();
+        drainPendingVSyncHandlers(
+            m_memory.getRDRAM());
+        drainPendingEeCounterHandlers(
+            m_memory.getRDRAM());
+        drainCompletedDmacHandlers(
+            m_memory.getRDRAM());
+    }
+    catch (...)
+    {
+        consequence = {};
+        throw;
+    }
+    const ps2x::ee::EeSchedulerReschedulePolicy
+        reschedulePolicy =
+            consequence.reschedulePolicy;
+    consequence = {};
+    m_guestExecutionPreemptionRequested.store(
+        false, std::memory_order_release);
+    return reschedulePolicy;
 }
 
 void PS2Runtime::runMainEeContinuation()
@@ -7617,10 +7758,11 @@ void PS2Runtime::leaveGuestExecution(
         previousContext,
         previousThreadId);
 
-    // Host workers publish alarm/device work only. Run guest handlers after
-    // the outermost recompiled invocation has returned, so they execute on
-    // this EE boundary owner and cannot observe a half-finished guest call.
-    if (it->second == 1u)
+    // The legacy host-thread backend drains published alarm/device work after
+    // the outermost recompiled invocation returns. The dedicated executor
+    // drains the same work from applyNextConsequence instead because a
+    // suspended fiber can retain this scope across scheduler boundaries.
+    if (it->second == 1u && !m_eeRuntimeExecutor)
     {
         drainPendingAlarmCallbacks();
         drainPendingVSyncHandlers(
@@ -7731,6 +7873,15 @@ void PS2Runtime::waitForGuestExecutionHandoff(uint64_t baselineEpoch)
     if (m_eeRuntimeExecutor)
     {
         static_cast<void>(baselineEpoch);
+        if (g_eeExecutorConsequenceContext.runtime ==
+            this)
+        {
+            // Callback code is already running between continuations on the
+            // executor stack. Any scheduler publication it made will be
+            // consumed by this same boundary; there is no guest fiber to
+            // suspend here.
+            return;
+        }
         yieldEeExecutorCurrent(
             isStopRequested()
                 ? ps2x::ee::EeSchedulerExitReason::
@@ -9621,6 +9772,11 @@ void PS2Runtime::yieldGuestExecutionAfterWake()
 
     if (m_eeRuntimeExecutor)
     {
+        if (g_eeExecutorConsequenceContext.runtime ==
+            this)
+        {
+            return;
+        }
         yieldEeExecutorCurrent(
             isStopRequested()
                 ? ps2x::ee::EeSchedulerExitReason::
@@ -9683,6 +9839,13 @@ void PS2Runtime::requestGuestPreemption()
 {
     m_guestExecutionPreemptionRequested.store(
         true, std::memory_order_release);
+    if (m_eeRuntimeExecutor)
+    {
+        // External alarm/device publishers may be the only runnable source
+        // while every guest fiber is waiting. The preemption flag makes the
+        // work visible; this notification releases the executor's idle wait.
+        m_eeRuntimeExecutor->notify();
+    }
 }
 
 PS2GuestCheckpointResult
@@ -9721,6 +9884,19 @@ PS2Runtime::checkpointGuestExecution(
         // returning from generated code, then let the outermost defer scope
         // hand control to the scheduler after that region closes.
         g_deferredGuestYieldPending = true;
+        m_guestExecutionDispatcherExitEpoch.fetch_add(
+            1u, std::memory_order_release);
+        return PS2GuestCheckpointResult::
+            ExitToDispatcher;
+    }
+
+    if (g_eeExecutorConsequenceContext.runtime ==
+        this)
+    {
+        // Inline interrupt/callback generated code runs on the executor
+        // stack, not inside a resumable guest fiber. Materialize its resume
+        // PC for the bounded callback dispatcher instead of attempting a
+        // fiber-to-executor switch with no running continuation.
         m_guestExecutionDispatcherExitEpoch.fetch_add(
             1u, std::memory_order_release);
         return PS2GuestCheckpointResult::

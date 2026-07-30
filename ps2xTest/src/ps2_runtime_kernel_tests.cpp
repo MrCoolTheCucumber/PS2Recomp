@@ -156,6 +156,11 @@ namespace
         0x25b400u;
     constexpr uint32_t K_EXECUTOR_MPEG_PRODUCER_ENTRY =
         0x25b500u;
+    constexpr uint32_t K_EXECUTOR_ALARM_MAIN_ENTRY =
+        0x25b600u;
+    constexpr uint32_t
+        K_EXECUTOR_ALARM_CALLBACK_ENTRY =
+            0x25b700u;
     constexpr uint32_t K_EXECUTOR_MPEG_ADDR =
         0x00123000u;
     constexpr uint32_t K_EXECUTOR_MPEG_IMAGE_ADDR =
@@ -168,6 +173,20 @@ namespace
     std::vector<int> g_executorFixtureOrder;
     std::thread::id g_executorMainHostThread;
     std::thread::id g_executorChildHostThread;
+    std::thread::id g_executorAlarmMainHostThread;
+    std::thread::id
+        g_executorAlarmCallbackHostThread;
+    std::atomic<int> g_executorAlarmSetResult{
+        KE_ERROR};
+    std::atomic<uint32_t>
+        g_executorAlarmCallbackHits{0u};
+    std::atomic<bool>
+        g_executorAlarmMainSleeping{false};
+    std::atomic<bool>
+        g_executorAlarmMainReturned{false};
+    std::atomic<bool>
+        g_executorAlarmCallbackRanWhileSleeping{
+            false};
     int g_executorChildThreadId = 0;
     std::array<int, 3u> g_executorWakeCountResults{
         KE_ERROR,
@@ -834,6 +853,69 @@ namespace
             rdram,
             K_ALARM_SELF_STOP_STAGE_ADDR,
             2u);
+        ctx->pc = 0u;
+    }
+
+    void dedicatedExecutorAlarmCallback(
+        uint8_t *,
+        R5900Context *ctx,
+        PS2Runtime *)
+    {
+        {
+            std::lock_guard<std::mutex> lock(
+                g_executorFixtureMutex);
+            g_executorAlarmCallbackHostThread =
+                std::this_thread::get_id();
+        }
+        g_executorAlarmCallbackRanWhileSleeping.store(
+            g_executorAlarmMainSleeping.load(
+                std::memory_order_acquire) &&
+                !g_executorAlarmMainReturned.load(
+                    std::memory_order_acquire),
+            std::memory_order_release);
+        g_executorAlarmCallbackHits.fetch_add(
+            1u, std::memory_order_acq_rel);
+        ctx->pc = 0u;
+    }
+
+    void dedicatedExecutorAlarmMain(
+        uint8_t *rdram,
+        R5900Context *ctx,
+        PS2Runtime *runtime)
+    {
+        InitThread(rdram, ctx, runtime);
+        {
+            std::lock_guard<std::mutex> lock(
+                g_executorFixtureMutex);
+            g_executorAlarmMainHostThread =
+                std::this_thread::get_id();
+        }
+
+        // One thousand modeled alarm ticks is roughly 64 ms: long enough
+        // for this sole continuation to commit its scheduler WAIT before the
+        // external timer worker publishes the callback.
+        setRegU32(*ctx, 4, 1000u);
+        setRegU32(
+            *ctx,
+            5,
+            K_EXECUTOR_ALARM_CALLBACK_ENTRY);
+        setRegU32(*ctx, 6, 0u);
+        SetAlarm(rdram, ctx, runtime);
+        const int alarmResult = getRegS32(*ctx, 2);
+        g_executorAlarmSetResult.store(
+            alarmResult,
+            std::memory_order_release);
+        if (alarmResult <= 0)
+        {
+            ctx->pc = 0u;
+            return;
+        }
+
+        g_executorAlarmMainSleeping.store(
+            true, std::memory_order_release);
+        SleepThread(rdram, ctx, runtime);
+        g_executorAlarmMainReturned.store(
+            true, std::memory_order_release);
         ctx->pc = 0u;
     }
 
@@ -3042,6 +3124,9 @@ void register_ps2_runtime_kernel_tests()
                 configuration.eeExecutionBackend =
                     EeExecutionBackendKind::
                         LegacyCppFiber;
+                configuration
+                    .useEeExecutionBackendEnvironment =
+                    false;
                 PS2Runtime runtime(configuration);
                 const bool memoryInitialized =
                     runtime.memory().initialize();
@@ -3164,6 +3249,129 @@ void register_ps2_runtime_kernel_tests()
                     size_t{0u},
                     "executor shutdown should destroy "
                     "every runtime-owned continuation");
+            });
+
+        tc.Run(
+            "fiber executor wakes from idle to publish an alarm callback",
+            [](TestCase &t)
+            {
+                if (!eeExecutionBackendBuildInfo()
+                         .boostContextFcontextAvailable)
+                {
+                    return;
+                }
+
+                PS2RuntimeConfiguration configuration{};
+                configuration.eeExecutionBackend =
+                    EeExecutionBackendKind::
+                        LegacyCppFiber;
+                configuration
+                    .useEeExecutionBackendEnvironment =
+                    false;
+                PS2Runtime runtime(configuration);
+                const bool memoryInitialized =
+                    runtime.memory().initialize();
+                t.IsTrue(
+                    memoryInitialized,
+                    "the alarm publication fixture should allocate runtime RDRAM");
+                if (!memoryInitialized)
+                {
+                    return;
+                }
+
+                runtime.registerFunction(
+                    K_EXECUTOR_ALARM_MAIN_ENTRY,
+                    &dedicatedExecutorAlarmMain);
+                runtime.registerFunction(
+                    K_EXECUTOR_ALARM_CALLBACK_ENTRY,
+                    &dedicatedExecutorAlarmCallback);
+                runtime.cpu().pc =
+                    K_EXECUTOR_ALARM_MAIN_ENTRY;
+                setRegU32(
+                    runtime.cpu(),
+                    29,
+                    0x00300000u);
+                g_executorAlarmSetResult.store(
+                    KE_ERROR,
+                    std::memory_order_release);
+                g_executorAlarmCallbackHits.store(
+                    0u,
+                    std::memory_order_release);
+                g_executorAlarmMainSleeping.store(
+                    false,
+                    std::memory_order_release);
+                g_executorAlarmMainReturned.store(
+                    false,
+                    std::memory_order_release);
+                g_executorAlarmCallbackRanWhileSleeping
+                    .store(
+                        false,
+                        std::memory_order_release);
+                {
+                    std::lock_guard<std::mutex> lock(
+                        g_executorFixtureMutex);
+                    g_executorAlarmMainHostThread = {};
+                    g_executorAlarmCallbackHostThread =
+                        {};
+                }
+                const std::thread::id callerThread =
+                    std::this_thread::get_id();
+
+                runtime
+                    .startDedicatedEeExecutionForTesting();
+                const bool callbackRan = waitUntil(
+                    []()
+                    {
+                        return g_executorAlarmCallbackHits
+                                   .load(
+                                       std::memory_order_acquire) ==
+                               1u;
+                    },
+                    std::chrono::seconds(2));
+                const size_t managedBeforeStop =
+                    runtime
+                        .managedEeExecutionThreadCountForTesting();
+                const bool mainReturnedBeforeStop =
+                    g_executorAlarmMainReturned.load(
+                        std::memory_order_acquire);
+                runtime
+                    .stopDedicatedEeExecutionForTesting();
+
+                std::thread::id mainHostThread;
+                std::thread::id callbackHostThread;
+                {
+                    std::lock_guard<std::mutex> lock(
+                        g_executorFixtureMutex);
+                    mainHostThread =
+                        g_executorAlarmMainHostThread;
+                    callbackHostThread =
+                        g_executorAlarmCallbackHostThread;
+                }
+                t.IsTrue(
+                    callbackRan &&
+                        g_executorAlarmSetResult.load(
+                            std::memory_order_acquire) >
+                            0,
+                    "the external alarm worker should publish exactly one callback without another guest boundary");
+                t.IsTrue(
+                    g_executorAlarmMainSleeping.load(
+                        std::memory_order_acquire) &&
+                        g_executorAlarmCallbackRanWhileSleeping
+                            .load(
+                                std::memory_order_acquire) &&
+                        !mainReturnedBeforeStop &&
+                        managedBeforeStop == 1u,
+                    "the callback should run while the sole guest fiber remains scheduler-blocked");
+                t.IsTrue(
+                    mainHostThread != callerThread &&
+                        callbackHostThread ==
+                            mainHostThread,
+                    "the timer worker must wake the one EE executor rather than borrowing guest execution");
+                t.Equals(
+                    runtime
+                        .managedEeExecutionThreadCountForTesting(),
+                    size_t{0u},
+                    "stopping the idle fixture should destroy its suspended continuation");
             });
 
         tc.Run(

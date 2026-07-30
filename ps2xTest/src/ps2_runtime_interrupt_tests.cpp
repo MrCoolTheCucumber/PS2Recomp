@@ -5,6 +5,7 @@
 #include "Stubs/GS.h"
 #include "runtime/ps2_gs_gpu.h"
 
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <cstdint>
@@ -27,6 +28,8 @@ namespace
     constexpr uint32_t kInterruptIsolationHitAddr = 0x1180u;
     constexpr uint32_t kInterruptIsolationSpAddr = 0x1184u;
     constexpr uint32_t kInterruptIsolationPcAddr = 0x1188u;
+    constexpr uint32_t
+        kExecutorBoundaryThreadParamAddr = 0x1200u;
 
     struct Ps2EventFlagInfo
     {
@@ -66,6 +69,31 @@ namespace
     std::atomic<uint32_t> g_eeCounterLastCause{0u};
     std::atomic<uint32_t> g_eeCounterModeAtHandler{0u};
     std::atomic<uint32_t> g_eeCounterIntcAtHandler{0u};
+    std::atomic<uint32_t>
+        g_executorBoundaryVSyncHits{0u};
+    std::atomic<bool>
+        g_executorBoundaryMainWaiting{false};
+    std::atomic<bool>
+        g_executorBoundaryCallbackRanWhileWaiting{
+            false};
+    std::atomic<bool>
+        g_executorBoundaryMainCompleted{false};
+    std::atomic<int>
+        g_executorBoundaryChildThreadId{0};
+    std::atomic<int>
+        g_executorBoundaryWakeResult{-1};
+    std::atomic<bool>
+        g_executorBoundaryCallbackActive{false};
+    std::atomic<bool>
+        g_executorBoundaryChildWaiting{false};
+    std::atomic<bool>
+        g_executorBoundaryChildCompleted{false};
+    std::atomic<bool>
+        g_executorBoundaryChildRanInsideCallback{
+            false};
+    std::atomic<bool>
+        g_executorBoundaryMainResumedBeforeChild{
+            false};
     std::atomic<bool>
         g_interruptIsolationBlockNext{false};
     std::atomic<bool>
@@ -370,6 +398,128 @@ namespace
             getRegU32(ctx, 4), std::memory_order_relaxed);
         ctx->pc = 0u;
     }
+
+    void testExecutorBoundaryVSyncCallback(
+        uint8_t *rdram,
+        R5900Context *ctx,
+        PS2Runtime *runtime)
+    {
+        g_executorBoundaryVSyncHits.fetch_add(
+            1u, std::memory_order_acq_rel);
+        if (g_executorBoundaryMainWaiting.load(
+                std::memory_order_acquire))
+        {
+            g_executorBoundaryCallbackRanWhileWaiting
+                .store(
+                    true,
+                    std::memory_order_release);
+        }
+        g_executorBoundaryCallbackActive.store(
+            true, std::memory_order_release);
+        setRegU32(
+            *ctx,
+            4,
+            static_cast<uint32_t>(
+                g_executorBoundaryChildThreadId.load(
+                    std::memory_order_acquire)));
+        iWakeupThread(rdram, ctx, runtime);
+        g_executorBoundaryWakeResult.store(
+            getRegS32(*ctx, 2),
+            std::memory_order_release);
+        g_executorBoundaryCallbackActive.store(
+            false, std::memory_order_release);
+        ctx->pc = 0u;
+    }
+
+    void testExecutorBoundaryVSyncChild(
+        uint8_t *rdram,
+        R5900Context *ctx,
+        PS2Runtime *runtime)
+    {
+        g_executorBoundaryChildWaiting.store(
+            true, std::memory_order_release);
+        SleepThread(rdram, ctx, runtime);
+        g_executorBoundaryChildRanInsideCallback.store(
+            g_executorBoundaryCallbackActive.load(
+                std::memory_order_acquire),
+            std::memory_order_release);
+        g_executorBoundaryChildCompleted.store(
+            true, std::memory_order_release);
+        ctx->pc = 0u;
+    }
+
+    void testExecutorBoundaryVSyncMain(
+        uint8_t *rdram,
+        R5900Context *ctx,
+        PS2Runtime *runtime)
+    {
+        InitThread(rdram, ctx, runtime);
+        setRegU32(
+            *ctx, 4,
+            kExecutorBoundaryThreadParamAddr);
+        CreateThread(rdram, ctx, runtime);
+        const int childThreadId =
+            getRegS32(*ctx, 2);
+        g_executorBoundaryChildThreadId.store(
+            childThreadId,
+            std::memory_order_release);
+        if (childThreadId <= 1)
+        {
+            g_executorBoundaryMainCompleted.store(
+                true, std::memory_order_release);
+            ctx->pc = 0u;
+            return;
+        }
+        setRegU32(
+            *ctx,
+            4,
+            static_cast<uint32_t>(childThreadId));
+        setRegU32(*ctx, 5, 0u);
+        StartThread(rdram, ctx, runtime);
+
+        const PS2Runtime::DebugEeScheduler scheduler =
+            runtime->debugEeSchedulerSnapshot();
+        if (!scheduler.hasNextDeadline)
+        {
+            g_executorBoundaryMainCompleted.store(
+                true, std::memory_order_release);
+            ctx->pc = 0u;
+            return;
+        }
+
+        const uint64_t now =
+            runtime->currentEeTick().raw();
+        const uint64_t elapsed =
+            scheduler.nextDeadlineTick > now
+                ? scheduler.nextDeadlineTick - now
+                : 0u;
+        if (elapsed >
+            std::numeric_limits<uint32_t>::max())
+        {
+            g_executorBoundaryMainCompleted.store(
+                true, std::memory_order_release);
+            ctx->pc = 0u;
+            return;
+        }
+
+        g_executorBoundaryMainWaiting.store(
+            true, std::memory_order_release);
+        ctx->cop0_config |= 1u << 18u;
+        ctx->advanceEeCycleTicks(
+            static_cast<uint32_t>(elapsed));
+        runtime->serviceEeEventsAtBlockBoundary(
+            rdram, ctx);
+        (void)runtime->checkpointGuestExecution(ctx);
+        g_executorBoundaryMainWaiting.store(
+            false, std::memory_order_release);
+        g_executorBoundaryMainResumedBeforeChild.store(
+            !g_executorBoundaryChildCompleted.load(
+                std::memory_order_acquire),
+            std::memory_order_release);
+        g_executorBoundaryMainCompleted.store(
+            true, std::memory_order_release);
+        ctx->pc = 0u;
+    }
 }
 
 void register_ps2_runtime_interrupt_tests()
@@ -662,6 +812,175 @@ void register_ps2_runtime_interrupt_tests()
             ps2_stubs::resetGsSyncVCallbackState(
                 &env.runtime);
         });
+
+        tc.Run(
+            "fiber executor publishes VSync callbacks at a continuation boundary",
+            [](TestCase &t)
+            {
+                if (!eeExecutionBackendBuildInfo()
+                         .boostContextFcontextAvailable)
+                {
+                    return;
+                }
+
+                constexpr uint32_t kMainAddress =
+                    0x00ABC300u;
+                constexpr uint32_t kCallbackAddress =
+                    0x00ABC340u;
+                constexpr uint32_t kChildAddress =
+                    0x00ABC380u;
+                PS2RuntimeConfiguration configuration{};
+                configuration.eeExecutionBackend =
+                    EeExecutionBackendKind::
+                        LegacyCppFiber;
+                configuration
+                    .useEeExecutionBackendEnvironment =
+                    false;
+                PS2Runtime runtime(configuration);
+                t.IsTrue(
+                    runtime.memory().initialize(),
+                    "the executor callback fixture should allocate runtime RDRAM");
+                uint8_t *const rdram =
+                    runtime.memory().getRDRAM();
+                if (!rdram)
+                {
+                    return;
+                }
+
+                ps2_stubs::resetGsSyncVCallbackState(
+                    &runtime);
+                runtime.configureEeVSyncVideoMode(
+                    0x02u, true);
+                runtime.registerFunction(
+                    kMainAddress,
+                    &testExecutorBoundaryVSyncMain);
+                runtime.registerFunction(
+                    kCallbackAddress,
+                    &testExecutorBoundaryVSyncCallback);
+                runtime.registerFunction(
+                    kChildAddress,
+                    &testExecutorBoundaryVSyncChild);
+                const std::array<uint32_t, 9u>
+                    childParameters{
+                        0u,
+                        kChildAddress,
+                        0x00310000u,
+                        0x800u,
+                        0u,
+                        0u,
+                        0u,
+                        0u,
+                        0u,
+                    };
+                for (size_t index = 0u;
+                     index < childParameters.size();
+                     ++index)
+                {
+                    writeGuestU32(
+                        rdram,
+                        kExecutorBoundaryThreadParamAddr +
+                            static_cast<uint32_t>(
+                                index *
+                                sizeof(uint32_t)),
+                        childParameters[index]);
+                }
+                R5900Context registration{};
+                setRegU32(
+                    registration, 4,
+                    kCallbackAddress);
+                ps2_stubs::sceGsSyncVCallback(
+                    rdram, &registration, &runtime);
+                EnsureVSyncScheduled(rdram, &runtime);
+
+                g_executorBoundaryVSyncHits.store(
+                    0u, std::memory_order_release);
+                g_executorBoundaryMainWaiting.store(
+                    false, std::memory_order_release);
+                g_executorBoundaryCallbackRanWhileWaiting
+                    .store(
+                        false,
+                        std::memory_order_release);
+                g_executorBoundaryMainCompleted.store(
+                    false, std::memory_order_release);
+                g_executorBoundaryChildThreadId.store(
+                    0, std::memory_order_release);
+                g_executorBoundaryWakeResult.store(
+                    -1, std::memory_order_release);
+                g_executorBoundaryCallbackActive.store(
+                    false, std::memory_order_release);
+                g_executorBoundaryChildWaiting.store(
+                    false, std::memory_order_release);
+                g_executorBoundaryChildCompleted.store(
+                    false, std::memory_order_release);
+                g_executorBoundaryChildRanInsideCallback
+                    .store(
+                        false,
+                        std::memory_order_release);
+                g_executorBoundaryMainResumedBeforeChild
+                    .store(
+                        false,
+                        std::memory_order_release);
+                runtime.cpu().pc = kMainAddress;
+                setRegU32(
+                    runtime.cpu(), 29,
+                    0x00300000u);
+
+                runtime
+                    .startDedicatedEeExecutionForTesting();
+                const bool completed = waitUntil(
+                    [&runtime]()
+                    {
+                        return g_executorBoundaryMainCompleted
+                                   .load(
+                                       std::memory_order_acquire) &&
+                               g_executorBoundaryChildCompleted
+                                   .load(
+                                       std::memory_order_acquire) &&
+                               runtime
+                                       .managedEeExecutionThreadCountForTesting() ==
+                                   0u;
+                    },
+                    std::chrono::seconds(2));
+                runtime
+                    .stopDedicatedEeExecutionForTesting();
+
+                t.IsTrue(
+                    completed,
+                    "the main continuation should resume after its VSync boundary");
+                t.Equals(
+                    g_executorBoundaryVSyncHits.load(
+                        std::memory_order_acquire),
+                    1u,
+                    "the due VSync callback should execute exactly once");
+                t.IsTrue(
+                    g_executorBoundaryCallbackRanWhileWaiting
+                        .load(
+                            std::memory_order_acquire),
+                    "the callback should execute at the executor boundary before the suspended continuation resumes");
+                t.IsTrue(
+                    g_executorBoundaryChildWaiting.load(
+                        std::memory_order_acquire),
+                    "the higher-priority child should block before the main continuation reaches VSync");
+                t.Equals(
+                    g_executorBoundaryWakeResult.load(
+                        std::memory_order_acquire),
+                    g_executorBoundaryChildThreadId.load(
+                        std::memory_order_acquire),
+                    "the raw interrupt-context wake should apply synchronously on the executor");
+                t.IsTrue(
+                    g_executorBoundaryMainResumedBeforeChild
+                            .load(
+                                std::memory_order_acquire) &&
+                        !g_executorBoundaryChildRanInsideCallback
+                             .load(
+                                 std::memory_order_acquire),
+                    "a raw callback wake should make the child READY without recursively dispatching it");
+                t.Equals(
+                    runtime
+                        .managedEeExecutionThreadCountForTesting(),
+                    size_t{0u},
+                    "stopping the fixture should retain no callback or guest continuation");
+            });
 
         tc.Run("event VSync preserves the active phase when SetGsCrt selects PAL", [](TestCase &t)
         {
