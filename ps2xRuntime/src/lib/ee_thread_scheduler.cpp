@@ -63,6 +63,9 @@ namespace ps2x::ee
                     priority,
                     EeSchedulerThreadState::Dormant,
                     {},
+                    {},
+                    false,
+                    0u,
                     0u,
                     0u})
             .second;
@@ -144,10 +147,11 @@ namespace ps2x::ee
                     continue;
                 }
 
-                thread->state =
-                    EeSchedulerThreadState::Running;
-                thread->queueSequence = 0u;
-                m_currentThreadId = handle.id;
+            thread->state =
+                EeSchedulerThreadState::Running;
+            thread->retainCompletedWaitReason = false;
+            thread->queueSequence = 0u;
+            m_currentThreadId = handle.id;
                 return handle.id;
             }
         }
@@ -206,6 +210,12 @@ namespace ps2x::ee
         }
 
         ThreadRecord &thread = it->second;
+        if (thread.completedWait.valid() ||
+            (wait.kind == EeSchedulerWaitKind::Sleep &&
+             thread.wakeupCount != 0u))
+        {
+            return std::nullopt;
+        }
         thread.state = EeSchedulerThreadState::Waiting;
         thread.wait = wait;
         thread.queueSequence = m_nextQueueSequence++;
@@ -215,6 +225,46 @@ namespace ps2x::ee
                 thread.generation});
         m_currentThreadId.reset();
         return takeNextReady();
+    }
+
+    EeSchedulerSleepResult
+    EeThreadScheduler::sleepCurrentThread()
+    {
+        EeSchedulerSleepResult result{};
+        if (!m_currentThreadId.has_value())
+        {
+            return result;
+        }
+
+        const int threadId = *m_currentThreadId;
+        const auto it = m_threads.find(threadId);
+        if (it == m_threads.end() ||
+            it->second.state !=
+                EeSchedulerThreadState::Running ||
+            it->second.completedWait.valid())
+        {
+            return result;
+        }
+
+        ThreadRecord &thread = it->second;
+        if (thread.wakeupCount != 0u)
+        {
+            --thread.wakeupCount;
+            result.disposition =
+                EeSchedulerSleepDisposition::
+                    WakeupConsumed;
+            result.selectedThreadId = threadId;
+            return result;
+        }
+
+        result.disposition =
+            EeSchedulerSleepDisposition::Blocked;
+        result.selectedThreadId =
+            blockCurrentThread(
+                EeSchedulerWaitKey{
+                    EeSchedulerWaitKind::Sleep,
+                    0});
+        return result;
     }
 
     std::optional<int>
@@ -253,6 +303,10 @@ namespace ps2x::ee
         }
 
         thread->wait = {};
+        thread->completedWait = {
+            wait,
+            EeSchedulerWaitCompletion::Satisfied};
+        thread->retainCompletedWaitReason = false;
         if (thread->suspendCount != 0u)
         {
             thread->state =
@@ -264,6 +318,136 @@ namespace ps2x::ee
             enqueueReady(handle.id, *thread);
         }
         return handle.id;
+    }
+
+    EeSchedulerWakeResult
+    EeThreadScheduler::wakeThread(
+        EeSchedulerThreadHandle handle)
+    {
+        ThreadRecord *thread = findThread(handle);
+        if (!thread)
+        {
+            return EeSchedulerWakeResult::
+                InvalidHandle;
+        }
+        if (thread->state ==
+            EeSchedulerThreadState::Dormant)
+        {
+            return EeSchedulerWakeResult::Dormant;
+        }
+
+        const EeSchedulerWaitKey sleep{
+            EeSchedulerWaitKind::Sleep,
+            0};
+        if ((thread->state ==
+                 EeSchedulerThreadState::Waiting ||
+             thread->state ==
+                 EeSchedulerThreadState::
+                     WaitSuspended) &&
+            thread->wait == sleep)
+        {
+            if (!releaseWaitThread(
+                    handle,
+                    EeSchedulerWaitCompletion::
+                        Satisfied))
+            {
+                return EeSchedulerWakeResult::
+                    InvalidHandle;
+            }
+            return EeSchedulerWakeResult::
+                WokeSleeper;
+        }
+
+        if (thread->wakeupCount ==
+            std::numeric_limits<uint32_t>::max())
+        {
+            return EeSchedulerWakeResult::
+                WakeupCountOverflow;
+        }
+        ++thread->wakeupCount;
+        return EeSchedulerWakeResult::
+            WakeupCounted;
+    }
+
+    std::optional<uint32_t>
+    EeThreadScheduler::cancelWakeups(
+        EeSchedulerThreadHandle handle)
+    {
+        ThreadRecord *thread = findThread(handle);
+        if (!thread)
+        {
+            return std::nullopt;
+        }
+
+        const uint32_t previous =
+            thread->wakeupCount;
+        thread->wakeupCount = 0u;
+        return previous;
+    }
+
+    bool EeThreadScheduler::releaseWaitThread(
+        EeSchedulerThreadHandle handle,
+        EeSchedulerWaitCompletion completion,
+        bool retainReasonForStatus)
+    {
+        ThreadRecord *thread = findThread(handle);
+        if (!thread ||
+            completion ==
+                EeSchedulerWaitCompletion::None ||
+            (thread->state !=
+                 EeSchedulerThreadState::Waiting &&
+             thread->state !=
+                 EeSchedulerThreadState::
+                     WaitSuspended) ||
+            !thread->wait.valid())
+        {
+            return false;
+        }
+
+        const EeSchedulerWaitKey wait =
+            thread->wait;
+        if (!removeWait(handle, wait))
+        {
+            return false;
+        }
+
+        thread->wait = {};
+        thread->completedWait = {
+            wait,
+            completion};
+        thread->retainCompletedWaitReason =
+            retainReasonForStatus;
+        if (thread->suspendCount != 0u)
+        {
+            thread->state =
+                EeSchedulerThreadState::Suspended;
+            thread->queueSequence = 0u;
+        }
+        else
+        {
+            enqueueReady(handle.id, *thread);
+        }
+        return true;
+    }
+
+    std::optional<EeSchedulerCompletedWait>
+    EeThreadScheduler::consumeWaitCompletion(
+        EeSchedulerThreadHandle handle)
+    {
+        ThreadRecord *thread = findThread(handle);
+        if (!thread ||
+            thread->state !=
+                EeSchedulerThreadState::Running ||
+            !thread->completedWait.valid())
+        {
+            return std::nullopt;
+        }
+
+        const EeSchedulerCompletedWait completed =
+            thread->completedWait;
+        thread->completedWait = {};
+        thread->retainCompletedWaitReason = false;
+        return completed;
     }
 
     bool EeThreadScheduler::retireCurrentThread()
@@ -285,6 +469,9 @@ namespace ps2x::ee
         it->second.state =
             EeSchedulerThreadState::Dormant;
         it->second.wait = {};
+        it->second.completedWait = {};
+        it->second.retainCompletedWaitReason = false;
+        it->second.wakeupCount = 0u;
         it->second.suspendCount = 0u;
         it->second.queueSequence = 0u;
         m_currentThreadId.reset();
@@ -518,6 +705,9 @@ namespace ps2x::ee
         thread->state =
             EeSchedulerThreadState::Dormant;
         thread->wait = {};
+        thread->completedWait = {};
+        thread->retainCompletedWaitReason = false;
+        thread->wakeupCount = 0u;
         thread->suspendCount = 0u;
         thread->queueSequence = 0u;
         if (!m_currentThreadId.has_value())
@@ -759,6 +949,9 @@ namespace ps2x::ee
             it->second.priority,
             it->second.state,
             it->second.wait,
+            it->second.completedWait,
+            it->second.retainCompletedWaitReason,
+            it->second.wakeupCount,
             it->second.suspendCount,
             it->second.queueSequence};
     }
@@ -876,12 +1069,41 @@ namespace ps2x::ee
                 readyMembership[threadId];
             const size_t waitCount =
                 waitMembership[threadId];
+            const bool noCompletedWait =
+                thread.completedWait.completion ==
+                EeSchedulerWaitCompletion::None;
+            const bool knownCompletion =
+                noCompletedWait ||
+                thread.completedWait.completion ==
+                    EeSchedulerWaitCompletion::
+                        Satisfied ||
+                thread.completedWait.completion ==
+                    EeSchedulerWaitCompletion::
+                        Released ||
+                thread.completedWait.completion ==
+                    EeSchedulerWaitCompletion::
+                        ObjectDeleted ||
+                thread.completedWait.completion ==
+                    EeSchedulerWaitCompletion::
+                        TimedOut;
+            if (!knownCompletion ||
+                noCompletedWait ==
+                    thread.completedWait.wait.valid() ||
+                (thread.retainCompletedWaitReason &&
+                 noCompletedWait))
+            {
+                return false;
+            }
+
             switch (thread.state)
             {
             case EeSchedulerThreadState::Dormant:
                 if (readyCount != 0u ||
                     waitCount != 0u ||
                     thread.wait.valid() ||
+                    !noCompletedWait ||
+                    thread.retainCompletedWaitReason ||
+                    thread.wakeupCount != 0u ||
                     thread.suspendCount != 0u ||
                     thread.queueSequence != 0u)
                 {
@@ -905,6 +1127,7 @@ namespace ps2x::ee
                     readyCount != 0u ||
                     waitCount != 0u ||
                     thread.wait.valid() ||
+                    thread.retainCompletedWaitReason ||
                     thread.suspendCount != 0u ||
                     thread.queueSequence != 0u)
                 {
@@ -915,6 +1138,11 @@ namespace ps2x::ee
                 if (readyCount != 0u ||
                     waitCount != 1u ||
                     !thread.wait.valid() ||
+                    !noCompletedWait ||
+                    thread.retainCompletedWaitReason ||
+                    (thread.wait.kind ==
+                         EeSchedulerWaitKind::Sleep &&
+                     thread.wakeupCount != 0u) ||
                     thread.suspendCount != 0u ||
                     thread.queueSequence == 0u)
                 {
@@ -935,6 +1163,11 @@ namespace ps2x::ee
                 if (readyCount != 0u ||
                     waitCount != 1u ||
                     !thread.wait.valid() ||
+                    !noCompletedWait ||
+                    thread.retainCompletedWaitReason ||
+                    (thread.wait.kind ==
+                         EeSchedulerWaitKind::Sleep &&
+                     thread.wakeupCount != 0u) ||
                     thread.suspendCount == 0u ||
                     thread.queueSequence == 0u)
                 {

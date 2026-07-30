@@ -48,6 +48,29 @@ namespace ps2x::ee
             const EeSchedulerWaitKey &right) noexcept;
     };
 
+    enum class EeSchedulerWaitCompletion : uint8_t
+    {
+        None,
+        Satisfied,
+        Released,
+        ObjectDeleted,
+        TimedOut,
+    };
+
+    struct EeSchedulerCompletedWait
+    {
+        EeSchedulerWaitKey wait{};
+        EeSchedulerWaitCompletion completion =
+            EeSchedulerWaitCompletion::None;
+
+        [[nodiscard]] bool valid() const noexcept
+        {
+            return wait.valid() &&
+                   completion !=
+                       EeSchedulerWaitCompletion::None;
+        }
+    };
+
     struct EeSchedulerThreadSnapshot
     {
         int id = 0;
@@ -56,6 +79,9 @@ namespace ps2x::ee
         EeSchedulerThreadState state =
             EeSchedulerThreadState::Dormant;
         EeSchedulerWaitKey wait{};
+        EeSchedulerCompletedWait completedWait{};
+        bool retainCompletedWaitReason = false;
+        uint32_t wakeupCount = 0u;
         uint32_t suspendCount = 0u;
         uint64_t queueSequence = 0u;
     };
@@ -88,6 +114,30 @@ namespace ps2x::ee
     {
         HigherPriorityOnly,
         EqualOrHigherPriority,
+    };
+
+    enum class EeSchedulerSleepDisposition : uint8_t
+    {
+        InvalidCurrentThread,
+        WakeupConsumed,
+        Blocked,
+    };
+
+    struct EeSchedulerSleepResult
+    {
+        EeSchedulerSleepDisposition disposition =
+            EeSchedulerSleepDisposition::
+                InvalidCurrentThread;
+        std::optional<int> selectedThreadId;
+    };
+
+    enum class EeSchedulerWakeResult : uint8_t
+    {
+        InvalidHandle,
+        Dormant,
+        WokeSleeper,
+        WakeupCounted,
+        WakeupCountOverflow,
     };
 
     struct EeSchedulerRunResult
@@ -139,8 +189,23 @@ namespace ps2x::ee
         yieldCurrentThread();
         [[nodiscard]] std::optional<int>
         blockCurrentThread(EeSchedulerWaitKey wait);
+        [[nodiscard]] EeSchedulerSleepResult
+        sleepCurrentThread();
         [[nodiscard]] std::optional<int>
         wakeOne(EeSchedulerWaitKey wait);
+        [[nodiscard]] EeSchedulerWakeResult
+        wakeThread(EeSchedulerThreadHandle thread);
+        [[nodiscard]] std::optional<uint32_t>
+        cancelWakeups(
+            EeSchedulerThreadHandle thread);
+        [[nodiscard]] bool releaseWaitThread(
+            EeSchedulerThreadHandle thread,
+            EeSchedulerWaitCompletion completion,
+            bool retainReasonForStatus = false);
+        [[nodiscard]] std::optional<
+            EeSchedulerCompletedWait>
+        consumeWaitCompletion(
+            EeSchedulerThreadHandle thread);
         [[nodiscard]] std::optional<int>
         finishCurrentThread();
         [[nodiscard]] bool suspendThread(
@@ -189,6 +254,10 @@ namespace ps2x::ee
             EeSchedulerThreadState state =
                 EeSchedulerThreadState::Dormant;
             EeSchedulerWaitKey wait{};
+            EeSchedulerCompletedWait
+                completedWait{};
+            bool retainCompletedWaitReason = false;
+            uint32_t wakeupCount = 0u;
             uint32_t suspendCount = 0u;
             uint64_t queueSequence = 0u;
         };

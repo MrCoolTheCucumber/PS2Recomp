@@ -621,6 +621,15 @@ void register_ee_thread_scheduler_tests()
                     .value_or(0),
                 2,
                 "the ordinary wake boundary should dispatch the higher-priority sleeper");
+            const auto firstWakeCompletion =
+                scheduler.consumeWaitCompletion(worker);
+            t.IsTrue(
+                firstWakeCompletion.has_value() &&
+                    firstWakeCompletion->wait == sleep &&
+                    firstWakeCompletion->completion ==
+                        EeSchedulerWaitCompletion::
+                            Satisfied,
+                "the resumed sleep continuation should consume its exact wake result");
             t.Equals(
                 scheduler
                     .blockCurrentThread(sleep)
@@ -688,6 +697,248 @@ void register_ee_thread_scheduler_tests()
             t.IsTrue(
                 scheduler.validate(),
                 "ordinary/raw publication boundaries should preserve exact queue ownership");
+        });
+
+        tc.Run("sleep consumes wakeup counts before blocking", [](TestCase &t)
+        {
+            EeThreadScheduler scheduler;
+            t.IsTrue(
+                scheduler.addRunningThread(1, 1u, 40) &&
+                    scheduler.addDormantThread(2, 1u, 30) &&
+                    scheduler.startThread(2),
+                "the fixture should create a lower-priority caller and higher-priority worker");
+            const EeSchedulerThreadHandle worker =
+                scheduler.threadHandle(2).value_or(
+                    EeSchedulerThreadHandle{});
+
+            t.IsTrue(
+                scheduler.wakeThread(worker) ==
+                        EeSchedulerWakeResult::
+                            WakeupCounted &&
+                    scheduler.wakeThread(worker) ==
+                        EeSchedulerWakeResult::
+                            WakeupCounted &&
+                    scheduler.wakeThread(worker) ==
+                        EeSchedulerWakeResult::
+                            WakeupCounted &&
+                    scheduler.thread(2)->wakeupCount ==
+                        3u,
+                "wakes of a runnable thread should accumulate exactly");
+            t.Equals(
+                scheduler
+                    .cancelWakeups(worker)
+                    .value_or(0u),
+                3u,
+                "cancel should return and clear the accumulated wake count");
+            t.IsTrue(
+                scheduler.thread(2)->wakeupCount == 0u &&
+                    scheduler.wakeThread(worker) ==
+                        EeSchedulerWakeResult::
+                            WakeupCounted &&
+                    scheduler.wakeThread(worker) ==
+                        EeSchedulerWakeResult::
+                            WakeupCounted,
+                "the worker should accept a fresh pair of counted wakes");
+            t.Equals(
+                scheduler
+                    .reschedule(
+                        EeSchedulerReschedulePolicy::
+                            HigherPriorityOnly)
+                    .value_or(0),
+                2,
+                "the higher-priority worker should run at the ordinary boundary");
+
+            const EeSchedulerSleepResult first =
+                scheduler.sleepCurrentThread();
+            const EeSchedulerSleepResult second =
+                scheduler.sleepCurrentThread();
+            t.IsTrue(
+                first.disposition ==
+                        EeSchedulerSleepDisposition::
+                            WakeupConsumed &&
+                    second.disposition ==
+                        EeSchedulerSleepDisposition::
+                            WakeupConsumed &&
+                    first.selectedThreadId.value_or(0) ==
+                        2 &&
+                    second.selectedThreadId.value_or(0) ==
+                        2 &&
+                    scheduler.thread(2)->wakeupCount ==
+                        0u,
+                "the first two sleeps should return immediately and consume one wake each");
+
+            const EeSchedulerSleepResult third =
+                scheduler.sleepCurrentThread();
+            t.IsTrue(
+                third.disposition ==
+                        EeSchedulerSleepDisposition::
+                            Blocked &&
+                    third.selectedThreadId.value_or(0) ==
+                        1 &&
+                    scheduler.thread(2)->state ==
+                        EeSchedulerThreadState::Waiting &&
+                    scheduler.thread(2)->wait ==
+                        EeSchedulerWaitKey{
+                            EeSchedulerWaitKind::Sleep,
+                            0},
+                "the third sleep should enter the explicit sleep queue");
+            t.IsTrue(
+                scheduler.wakeThread(worker) ==
+                        EeSchedulerWakeResult::
+                            WokeSleeper &&
+                    scheduler.thread(2)->wakeupCount ==
+                        0u &&
+                    scheduler.thread(2)->
+                            completedWait.completion ==
+                        EeSchedulerWaitCompletion::
+                            Satisfied &&
+                    scheduler.currentThreadId().
+                            value_or(0) ==
+                        1,
+                "raw wake should detach the sleeper without a transient wake count or dispatch");
+            t.Equals(
+                scheduler
+                    .reschedule(
+                        EeSchedulerReschedulePolicy::
+                            HigherPriorityOnly)
+                    .value_or(0),
+                2,
+                "the ordinary wake boundary should select the higher-priority sleeper");
+
+            const auto completion =
+                scheduler.consumeWaitCompletion(worker);
+            t.IsTrue(
+                completion.has_value() &&
+                    completion->wait ==
+                        EeSchedulerWaitKey{
+                            EeSchedulerWaitKind::Sleep,
+                            0} &&
+                    completion->completion ==
+                        EeSchedulerWaitCompletion::
+                            Satisfied &&
+                    !scheduler.thread(2)->
+                         completedWait.valid() &&
+                    scheduler.validate(),
+                "the resumed continuation should consume one exact sleep completion");
+        });
+
+        tc.Run("targeted release retains detached wait completion", [](TestCase &t)
+        {
+            EeThreadScheduler scheduler;
+            const EeSchedulerWaitKey semaphore{
+                EeSchedulerWaitKind::Semaphore,
+                7};
+            t.IsTrue(
+                scheduler.addRunningThread(1, 1u, 40) &&
+                    scheduler.addDormantThread(2, 1u, 30) &&
+                    scheduler.startThread(2),
+                "the fixture should create a higher-priority semaphore waiter");
+            const EeSchedulerThreadHandle worker =
+                scheduler.threadHandle(2).value_or(
+                    EeSchedulerThreadHandle{});
+            t.Equals(
+                scheduler
+                    .reschedule(
+                        EeSchedulerReschedulePolicy::
+                            HigherPriorityOnly)
+                    .value_or(0),
+                2,
+                "the worker should run before entering its wait");
+            t.Equals(
+                scheduler
+                    .blockCurrentThread(semaphore)
+                    .value_or(0),
+                1,
+                "the semaphore wait should restore the lower-priority caller");
+
+            t.IsTrue(
+                scheduler.releaseWaitThread(
+                    worker,
+                    EeSchedulerWaitCompletion::
+                        ObjectDeleted,
+                    true),
+                "raw object deletion should synchronously detach its waiter");
+            const auto detached =
+                scheduler.thread(2);
+            t.IsTrue(
+                detached.has_value() &&
+                    detached->state ==
+                        EeSchedulerThreadState::Ready &&
+                    !detached->wait.valid() &&
+                    detached->completedWait.wait ==
+                        semaphore &&
+                    detached->completedWait.completion ==
+                        EeSchedulerWaitCompletion::
+                            ObjectDeleted &&
+                    detached->
+                        retainCompletedWaitReason &&
+                    scheduler.waitOrder(
+                        semaphore).empty(),
+                "a detached READY waiter should retain its deleted-object completion for status");
+            t.Equals(
+                scheduler
+                    .reschedule(
+                        EeSchedulerReschedulePolicy::
+                            HigherPriorityOnly)
+                    .value_or(0),
+                2,
+                "the next ordinary boundary should select the detached higher-priority waiter");
+            t.IsTrue(
+                !scheduler.thread(2)->
+                     retainCompletedWaitReason,
+                "dispatch should stop exposing the retained wait reason");
+            const auto deletedCompletion =
+                scheduler.consumeWaitCompletion(worker);
+            t.IsTrue(
+                deletedCompletion.has_value() &&
+                    deletedCompletion->wait ==
+                        semaphore &&
+                    deletedCompletion->completion ==
+                        EeSchedulerWaitCompletion::
+                            ObjectDeleted &&
+                    !scheduler
+                         .consumeWaitCompletion(worker)
+                         .has_value(),
+                "the guest continuation should consume the deletion result exactly once");
+
+            t.Equals(
+                scheduler
+                    .blockCurrentThread(semaphore)
+                    .value_or(0),
+                1,
+                "the worker should be able to wait again after consuming completion");
+            t.IsTrue(
+                scheduler.suspendThread(worker) &&
+                    scheduler.releaseWaitThread(
+                        worker,
+                        EeSchedulerWaitCompletion::
+                            Released) &&
+                    scheduler.thread(2)->state ==
+                        EeSchedulerThreadState::
+                            Suspended &&
+                    scheduler.resumeThread(worker),
+                "forced release should detach WAITSUSPEND but preserve SUSPEND until resume");
+            t.Equals(
+                scheduler
+                    .reschedule(
+                        EeSchedulerReschedulePolicy::
+                            HigherPriorityOnly)
+                    .value_or(0),
+                2,
+                "resume should make the released higher-priority waiter eligible");
+            const auto releasedCompletion =
+                scheduler.consumeWaitCompletion(worker);
+            t.IsTrue(
+                releasedCompletion.has_value() &&
+                    releasedCompletion->completion ==
+                        EeSchedulerWaitCompletion::
+                            Released &&
+                    !scheduler.releaseWaitThread(
+                        worker,
+                        EeSchedulerWaitCompletion::
+                            None) &&
+                    scheduler.validate(),
+                "forced release should carry one distinct completion and reject invalid repeats");
         });
 
         tc.Run("executor drains same-tick consequences to a stable selection", [](TestCase &t)
