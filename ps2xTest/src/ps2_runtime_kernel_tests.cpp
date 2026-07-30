@@ -3712,6 +3712,139 @@ void register_ps2_runtime_kernel_tests()
                 "raw-suspended target should be deletable");
         });
 
+        tc.Run("semaphore and event registries are isolated per runtime", [](TestCase &t)
+        {
+            notifyRuntimeStop();
+            auto first = std::make_unique<TestEnv>();
+            auto second = std::make_unique<TestEnv>();
+
+            const uint32_t semaParam[6] = {
+                0u,
+                3u,
+                2u,
+                0u,
+                0x11u,
+                0x22u
+            };
+            const uint32_t eventParam[3] = {
+                0x33u,
+                0x44u,
+                0x55u
+            };
+
+            const auto createSema = [&](TestEnv &env)
+            {
+                writeGuestWords(
+                    env.rdram.data(),
+                    K_PARAM_ADDR,
+                    semaParam,
+                    std::size(semaParam));
+                R5900Context createCtx{};
+                setRegU32(createCtx, 4, K_PARAM_ADDR);
+                CreateSema(
+                    env.rdram.data(),
+                    &createCtx,
+                    &env.runtime);
+                return getRegS32(createCtx, 2);
+            };
+            const auto createEvent = [&](TestEnv &env)
+            {
+                writeGuestWords(
+                    env.rdram.data(),
+                    K_PARAM_ADDR,
+                    eventParam,
+                    std::size(eventParam));
+                R5900Context createCtx{};
+                setRegU32(createCtx, 4, K_PARAM_ADDR);
+                CreateEventFlag(
+                    env.rdram.data(),
+                    &createCtx,
+                    &env.runtime);
+                return getRegS32(createCtx, 2);
+            };
+
+            const int32_t firstSema = createSema(*first);
+            const int32_t secondSema = createSema(*second);
+            const int32_t firstEvent = createEvent(*first);
+            const int32_t secondEvent = createEvent(*second);
+            t.Equals(
+                firstSema,
+                0,
+                "the first runtime should allocate semaphore id 0");
+            t.Equals(
+                secondSema,
+                0,
+                "a second runtime should independently allocate semaphore id 0");
+            t.Equals(
+                firstEvent,
+                1,
+                "the first runtime should allocate event id 1");
+            t.Equals(
+                secondEvent,
+                1,
+                "a second runtime should independently allocate event id 1");
+
+            second.reset();
+
+            R5900Context semaStatusCtx{};
+            setRegU32(
+                semaStatusCtx,
+                4,
+                static_cast<uint32_t>(firstSema));
+            setRegU32(semaStatusCtx, 5, K_STATUS_ADDR);
+            ReferSemaStatus(
+                first->rdram.data(),
+                &semaStatusCtx,
+                &first->runtime);
+            t.Equals(
+                getRegS32(semaStatusCtx, 2),
+                KE_OK,
+                "destroying a second runtime must not erase the first runtime semaphore");
+            EeSemaStatus semaStatus{};
+            std::memcpy(
+                &semaStatus,
+                first->rdram.data() + K_STATUS_ADDR,
+                sizeof(semaStatus));
+            t.Equals(
+                semaStatus.count,
+                2,
+                "the surviving runtime should retain its semaphore state");
+
+            struct EventStatus
+            {
+                uint32_t attr;
+                uint32_t option;
+                uint32_t initBits;
+                uint32_t currBits;
+                int32_t numThreads;
+                int32_t reserved1;
+                int32_t reserved2;
+            };
+            R5900Context eventStatusCtx{};
+            setRegU32(
+                eventStatusCtx,
+                4,
+                static_cast<uint32_t>(firstEvent));
+            setRegU32(eventStatusCtx, 5, K_STATUS_ADDR);
+            ReferEventFlagStatus(
+                first->rdram.data(),
+                &eventStatusCtx,
+                &first->runtime);
+            t.Equals(
+                getRegS32(eventStatusCtx, 2),
+                KE_OK,
+                "destroying a second runtime must not erase the first runtime event flag");
+            EventStatus eventStatus{};
+            std::memcpy(
+                &eventStatus,
+                first->rdram.data() + K_STATUS_ADDR,
+                sizeof(eventStatus));
+            t.Equals(
+                eventStatus.currBits,
+                0x55u,
+                "the surviving runtime should retain its event bits");
+        });
+
         tc.Run("semaphore EE layout covers poll, signal overflow, and status", [](TestCase &t)
         {
             TestEnv env;
