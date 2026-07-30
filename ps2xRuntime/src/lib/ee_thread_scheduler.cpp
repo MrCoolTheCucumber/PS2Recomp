@@ -587,6 +587,100 @@ namespace ps2x::ee
         return previous;
     }
 
+    bool EeThreadScheduler::rotateReadyQueue(
+        int priority)
+    {
+        if (!validPriority(priority))
+        {
+            return false;
+        }
+
+        std::deque<EeSchedulerThreadHandle> &queue =
+            m_readyQueues[
+                static_cast<size_t>(priority)];
+        if (queue.size() < 2u)
+        {
+            return true;
+        }
+
+        const EeSchedulerThreadHandle handle =
+            queue.front();
+        ThreadRecord *thread = findThread(handle);
+        if (!thread ||
+            thread->state !=
+                EeSchedulerThreadState::Ready ||
+            thread->priority != priority)
+        {
+            return false;
+        }
+
+        queue.pop_front();
+        thread->queueSequence =
+            m_nextQueueSequence++;
+        queue.push_back(handle);
+        return true;
+    }
+
+    std::optional<int>
+    EeThreadScheduler::highestReadyPriority()
+        const
+    {
+        for (size_t priority = 0u;
+             priority < m_readyQueues.size();
+             ++priority)
+        {
+            if (!m_readyQueues[priority].empty())
+            {
+                return static_cast<int>(priority);
+            }
+        }
+        return std::nullopt;
+    }
+
+    std::optional<int>
+    EeThreadScheduler::reschedule(
+        EeSchedulerReschedulePolicy policy)
+    {
+        if (!m_currentThreadId.has_value())
+        {
+            return takeNextReady();
+        }
+
+        const int threadId = *m_currentThreadId;
+        const auto currentIt =
+            m_threads.find(threadId);
+        if (currentIt == m_threads.end() ||
+            currentIt->second.state !=
+                EeSchedulerThreadState::Running)
+        {
+            return std::nullopt;
+        }
+
+        const std::optional<int> readyPriority =
+            highestReadyPriority();
+        if (!readyPriority.has_value())
+        {
+            return threadId;
+        }
+
+        const int currentPriority =
+            currentIt->second.priority;
+        const bool shouldPreempt =
+            *readyPriority < currentPriority ||
+            (policy ==
+                 EeSchedulerReschedulePolicy::
+                     EqualOrHigherPriority &&
+             *readyPriority == currentPriority);
+        if (!shouldPreempt)
+        {
+            return threadId;
+        }
+
+        m_currentThreadId.reset();
+        enqueueReady(threadId, currentIt->second);
+        return takeNextReady();
+    }
+
     std::optional<EeSchedulerDispatch>
     EeThreadScheduler::dispatchOne(
         IEeSchedulerExecutionBackend &backend,

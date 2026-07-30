@@ -362,6 +362,230 @@ void register_ee_thread_scheduler_tests()
                 "deleting the exited replacement should leave an empty valid scheduler");
         });
 
+        tc.Run("named ready-queue rotation is distinct from rescheduling", [](TestCase &t)
+        {
+            {
+                EeThreadScheduler scheduler;
+                t.IsTrue(
+                    scheduler.addRunningThread(1, 1u, 40) &&
+                        scheduler.addDormantThread(2, 1u, 40) &&
+                        scheduler.startThread(2),
+                    "the current-priority fixture should create one equal-priority peer");
+                t.IsTrue(
+                    scheduler.rotateReadyQueue(40) &&
+                        equals(
+                            scheduler.readyOrder(40),
+                            {2}),
+                    "rotating a singleton READY queue should not pretend RUN belongs to it");
+                t.Equals(
+                    scheduler
+                        .reschedule(
+                            EeSchedulerReschedulePolicy::
+                                HigherPriorityOnly)
+                        .value_or(0),
+                    1,
+                    "a raw current-priority rotation should leave the caller RUN");
+                t.Equals(
+                    scheduler
+                        .reschedule(
+                            EeSchedulerReschedulePolicy::
+                                EqualOrHigherPriority)
+                        .value_or(0),
+                    2,
+                    "the ordinary rotation boundary should dispatch the equal-priority peer");
+                t.IsTrue(
+                    equals(
+                        scheduler.readyOrder(40),
+                        {1}) &&
+                        scheduler.validate(),
+                    "ordinary equal-priority dispatch should append the former runner");
+            }
+
+            {
+                EeThreadScheduler scheduler;
+                t.IsTrue(
+                    scheduler.addRunningThread(1, 1u, 40) &&
+                        scheduler.addDormantThread(2, 1u, 50) &&
+                        scheduler.startThread(2) &&
+                        scheduler.addDormantThread(3, 1u, 50) &&
+                        scheduler.startThread(3),
+                    "the non-current fixture should create two lower-priority waiters");
+                const uint64_t firstSequence =
+                    scheduler.thread(2)->queueSequence;
+                const uint64_t secondSequence =
+                    scheduler.thread(3)->queueSequence;
+                t.IsTrue(
+                    scheduler.rotateReadyQueue(50) &&
+                        equals(
+                            scheduler.readyOrder(50),
+                            {3, 2}),
+                    "named rotation should move only the selected FIFO head");
+                t.IsTrue(
+                    scheduler.thread(2)->queueSequence >
+                            secondSequence &&
+                        secondSequence > firstSequence,
+                    "the rotated tail should receive the newest publication sequence");
+                t.Equals(
+                    scheduler
+                        .reschedule(
+                            EeSchedulerReschedulePolicy::
+                                HigherPriorityOnly)
+                        .value_or(0),
+                    1,
+                    "rotating a lower-priority queue should not run it");
+
+                const EeSchedulerThreadHandle main =
+                    scheduler.threadHandle(1).value_or(
+                        EeSchedulerThreadHandle{});
+                t.Equals(
+                    scheduler
+                        .changeThreadPriority(main, 60)
+                        .value_or(-1),
+                    40,
+                    "lowering the caller should publish its new priority");
+                t.Equals(
+                    scheduler
+                        .reschedule(
+                            EeSchedulerReschedulePolicy::
+                                HigherPriorityOnly)
+                        .value_or(0),
+                    3,
+                    "the next boundary should select the rotated non-current FIFO head");
+                t.IsTrue(
+                    equals(
+                        scheduler.readyOrder(50),
+                        {2}) &&
+                        equals(
+                            scheduler.readyOrder(60),
+                            {1}) &&
+                        !scheduler.rotateReadyQueue(128) &&
+                        scheduler.validate(),
+                    "non-current rotation should preserve every other membership");
+            }
+        });
+
+        tc.Run("raw publications defer ordinary higher-priority dispatch", [](TestCase &t)
+        {
+            EeThreadScheduler scheduler;
+            const EeSchedulerWaitKey sleep{
+                EeSchedulerWaitKind::Sleep,
+                0};
+            t.IsTrue(
+                scheduler.addRunningThread(1, 1u, 40) &&
+                    scheduler.addDormantThread(2, 1u, 30),
+                "the fixture should create a lower-priority caller and dormant worker");
+            const EeSchedulerThreadHandle main =
+                scheduler.threadHandle(1).value_or(
+                    EeSchedulerThreadHandle{});
+            const EeSchedulerThreadHandle worker =
+                scheduler.threadHandle(2).value_or(
+                    EeSchedulerThreadHandle{});
+
+            t.IsTrue(
+                scheduler.startThread(worker) &&
+                    scheduler.currentThreadId().value_or(0) ==
+                        1,
+                "raw start should publish READY without dispatch");
+            t.Equals(
+                scheduler
+                    .reschedule(
+                        EeSchedulerReschedulePolicy::
+                            HigherPriorityOnly)
+                    .value_or(0),
+                2,
+                "the ordinary start boundary should dispatch a higher-priority target");
+            t.Equals(
+                scheduler
+                    .blockCurrentThread(sleep)
+                    .value_or(0),
+                1,
+                "the higher-priority worker should be able to sleep beneath its caller");
+
+            t.Equals(
+                scheduler.wakeOne(sleep).value_or(0),
+                2,
+                "raw wake should synchronously publish the sleeper");
+            t.IsTrue(
+                scheduler.currentThreadId().value_or(0) ==
+                    1,
+                "raw wake should not preempt its caller");
+            t.Equals(
+                scheduler
+                    .reschedule(
+                        EeSchedulerReschedulePolicy::
+                            HigherPriorityOnly)
+                    .value_or(0),
+                2,
+                "the ordinary wake boundary should dispatch the higher-priority sleeper");
+            t.Equals(
+                scheduler
+                    .blockCurrentThread(sleep)
+                    .value_or(0),
+                1,
+                "the worker should re-enter the same explicit sleep queue");
+
+            t.IsTrue(
+                scheduler.suspendThread(worker) &&
+                    scheduler.wakeOne(sleep).value_or(0) ==
+                        2 &&
+                    scheduler.resumeThread(worker),
+                "raw wake and resume should publish a wait-suspended worker as READY");
+            t.IsTrue(
+                scheduler.currentThreadId().value_or(0) ==
+                        1 &&
+                    scheduler.thread(2)->state ==
+                        EeSchedulerThreadState::Ready,
+                "raw resume should preserve the caller until a boundary");
+            t.Equals(
+                scheduler
+                    .reschedule(
+                        EeSchedulerReschedulePolicy::
+                            HigherPriorityOnly)
+                    .value_or(0),
+                2,
+                "the ordinary resume boundary should dispatch the higher-priority worker");
+
+            t.Equals(
+                scheduler
+                    .changeThreadPriority(main, 20)
+                    .value_or(-1),
+                40,
+                "raw priority change should publish a promoted READY target");
+            t.IsTrue(
+                scheduler.currentThreadId().value_or(0) ==
+                    2,
+                "raw priority change should not preempt the worker");
+            t.Equals(
+                scheduler
+                    .reschedule(
+                        EeSchedulerReschedulePolicy::
+                            HigherPriorityOnly)
+                    .value_or(0),
+                1,
+                "the ordinary priority boundary should dispatch the promoted target");
+
+            t.IsTrue(
+                scheduler.addDormantThread(3, 1u, 10) &&
+                    scheduler.startThread(3) &&
+                    scheduler.terminateThread(worker),
+                "raw termination should coexist with an unrelated higher-priority READY thread");
+            t.IsTrue(
+                scheduler.currentThreadId().value_or(0) ==
+                    1,
+                "raw termination should leave its caller in control");
+            t.Equals(
+                scheduler
+                    .reschedule(
+                        EeSchedulerReschedulePolicy::
+                            HigherPriorityOnly)
+                    .value_or(0),
+                3,
+                "the ordinary termination boundary should dispatch unrelated higher-priority work");
+            t.IsTrue(
+                scheduler.validate(),
+                "ordinary/raw publication boundaries should preserve exact queue ownership");
+        });
+
         tc.Run("priority changes migrate only ready membership", [](TestCase &t)
         {
             EeThreadScheduler scheduler;

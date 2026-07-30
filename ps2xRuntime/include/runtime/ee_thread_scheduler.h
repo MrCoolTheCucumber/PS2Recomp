@@ -84,6 +84,12 @@ namespace ps2x::ee
         StopRequested,
     };
 
+    enum class EeSchedulerReschedulePolicy : uint8_t
+    {
+        HigherPriorityOnly,
+        EqualOrHigherPriority,
+    };
+
     struct EeSchedulerRunResult
     {
         EeSchedulerExitReason reason =
@@ -150,6 +156,11 @@ namespace ps2x::ee
         changeThreadPriority(
             EeSchedulerThreadHandle thread,
             int priority);
+        [[nodiscard]] bool rotateReadyQueue(
+            int priority);
+        [[nodiscard]] std::optional<int>
+        reschedule(
+            EeSchedulerReschedulePolicy policy);
 
         [[nodiscard]] std::optional<EeSchedulerDispatch>
         dispatchOne(
@@ -200,6 +211,8 @@ namespace ps2x::ee
             EeSchedulerThreadHandle thread,
             EeSchedulerWaitKey wait);
         [[nodiscard]] bool retireCurrentThread();
+        [[nodiscard]] std::optional<int>
+        highestReadyPriority() const;
         [[nodiscard]] std::optional<int>
         takeNextReady();
 
