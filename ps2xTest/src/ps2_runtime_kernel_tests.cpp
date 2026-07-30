@@ -77,6 +77,12 @@ namespace
     constexpr uint32_t K_RESCHEDULE_STAGE_ADDR = 0x18C0u;
     constexpr uint32_t K_CURRENT_THREAD_ID_ADDR = 0x18D0u;
     constexpr uint32_t K_ASYNC_EXIT_DELETE_STAGE_ADDR = 0x18D4u;
+    constexpr uint32_t K_ALARM_CALLBACK_STAGE_ADDR = 0x18E0u;
+    constexpr uint32_t K_ALARM_CALLBACK_ID_ADDR = 0x18E4u;
+    constexpr uint32_t K_ALARM_CALLBACK_TICKS_ADDR = 0x18E8u;
+    constexpr uint32_t K_ALARM_CALLBACK_ARG_ADDR = 0x18ECu;
+    constexpr uint32_t K_ALARM_CALLBACK_GP_ADDR = 0x18F0u;
+    constexpr uint32_t K_ALARM_CALLBACK_SP_ADDR = 0x18F4u;
 
     std::mutex g_guestWordMutex;
 
@@ -467,6 +473,38 @@ namespace
 
     void alarmNoopHandler(uint8_t *, R5900Context *ctx, PS2Runtime *)
     {
+        ctx->pc = 0u;
+    }
+
+    void alarmCaptureHandler(
+        uint8_t *rdram,
+        R5900Context *ctx,
+        PS2Runtime *)
+    {
+        writeGuestU32(
+            rdram,
+            K_ALARM_CALLBACK_ID_ADDR,
+            ::getRegU32(ctx, 4));
+        writeGuestU32(
+            rdram,
+            K_ALARM_CALLBACK_TICKS_ADDR,
+            ::getRegU32(ctx, 5));
+        writeGuestU32(
+            rdram,
+            K_ALARM_CALLBACK_ARG_ADDR,
+            ::getRegU32(ctx, 6));
+        writeGuestU32(
+            rdram,
+            K_ALARM_CALLBACK_GP_ADDR,
+            ::getRegU32(ctx, 28));
+        writeGuestU32(
+            rdram,
+            K_ALARM_CALLBACK_SP_ADDR,
+            ::getRegU32(ctx, 29));
+        writeGuestU32(
+            rdram,
+            K_ALARM_CALLBACK_STAGE_ADDR,
+            1u);
         ctx->pc = 0u;
     }
 
@@ -5430,6 +5468,95 @@ void register_ps2_runtime_kernel_tests()
             t.IsTrue(
                 returnedWhileGuestHeld,
                 "requestStop should cancel a blocked alarm callback before joining its worker");
+        });
+
+        tc.Run("alarm callbacks use runtime-owned context and ABI arguments", [](TestCase &t)
+        {
+            TestEnv env;
+
+            constexpr uint32_t kAlarmHandlerAddr = 0x00270300u;
+            constexpr uint32_t kAlarmArgument = 0x4A17C0DEu;
+            constexpr uint32_t kAlarmGp = 0x00126000u;
+            env.runtime.registerFunction(
+                kAlarmHandlerAddr, &alarmCaptureHandler);
+
+            writeGuestU32(
+                env.rdram.data(),
+                K_ALARM_CALLBACK_STAGE_ADDR,
+                0u);
+            setRegU32(env.ctx, 4, 1u);
+            setRegU32(env.ctx, 5, kAlarmHandlerAddr);
+            setRegU32(env.ctx, 6, kAlarmArgument);
+            setRegU32(env.ctx, 28, kAlarmGp);
+            SetAlarm(
+                env.rdram.data(), &env.ctx, &env.runtime);
+            const int32_t alarmId = getRegS32(env.ctx, 2);
+            t.Equals(
+                alarmId,
+                1,
+                "a fresh runtime should allocate alarm id 1");
+
+            const bool callbackRan = waitUntil(
+                [&]()
+                {
+                    return readGuestU32(
+                               env.rdram.data(),
+                               K_ALARM_CALLBACK_STAGE_ADDR) ==
+                           1u;
+                },
+                std::chrono::milliseconds(1000));
+            t.IsTrue(
+                callbackRan,
+                "the short alarm should dispatch its guest callback");
+            if (callbackRan)
+            {
+                t.Equals(
+                    readGuestU32(
+                        env.rdram.data(),
+                        K_ALARM_CALLBACK_ID_ADDR),
+                    static_cast<uint32_t>(alarmId),
+                    "alarm callback a0 should contain its id");
+                t.Equals(
+                    readGuestU32(
+                        env.rdram.data(),
+                        K_ALARM_CALLBACK_TICKS_ADDR),
+                    1u,
+                    "alarm callback a1 should contain the requested ticks");
+                t.Equals(
+                    readGuestU32(
+                        env.rdram.data(),
+                        K_ALARM_CALLBACK_ARG_ADDR),
+                    kAlarmArgument,
+                    "alarm callback a2 should contain the common argument");
+                t.Equals(
+                    readGuestU32(
+                        env.rdram.data(),
+                        K_ALARM_CALLBACK_GP_ADDR),
+                    kAlarmGp,
+                    "alarm callback should retain the registering guest gp");
+                const uint32_t callbackSp =
+                    readGuestU32(
+                        env.rdram.data(),
+                        K_ALARM_CALLBACK_SP_ADDR);
+                t.IsTrue(
+                    callbackSp != 0u &&
+                        (callbackSp & 0xFu) == 0u,
+                    "alarm callback should use a nonzero aligned runtime-owned stack");
+            }
+
+            R5900Context cancelCtx{};
+            setRegU32(
+                cancelCtx,
+                4,
+                static_cast<uint32_t>(alarmId));
+            CancelAlarm(
+                env.rdram.data(),
+                &cancelCtx,
+                &env.runtime);
+            t.Equals(
+                getRegS32(cancelCtx, 2),
+                KE_ERROR,
+                "a dispatched alarm should no longer be cancellable");
         });
 
         tc.Run("setup heap and thread invalid ids use documented kernel errors", [](TestCase &t)
