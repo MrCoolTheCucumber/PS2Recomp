@@ -307,14 +307,6 @@ static constexpr uint32_t kGuestSyscallTablePhysBase = kGuestSyscallTableGuestBa
 static constexpr uint32_t kGuestSyscallMirrorLimit = 0x00080000u;
 static constexpr uint32_t kGuestSyscallTableProbeBase = 0x000002F0u;
 
-inline std::mutex g_ps2_path_mutex;
-inline bool g_ps2_paths_initialized = false;
-inline std::filesystem::path g_host_base;
-inline std::filesystem::path g_cdrom_base;
-inline std::filesystem::path g_host_cwd;
-inline std::filesystem::path g_cdrom_cwd;
-inline std::string g_ps2_cwd_device = "host0";
-
 static constexpr uint32_t kRpcPacketSize = 64;
 static constexpr uint32_t kRpcPacketPoolBase = 0x01F00000;
 static constexpr uint32_t kRpcPacketPoolBytes = 0x00010000;

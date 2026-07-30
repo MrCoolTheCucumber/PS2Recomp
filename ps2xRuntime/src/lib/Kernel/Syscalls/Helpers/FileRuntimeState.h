@@ -2,7 +2,9 @@
 
 #include <cstdio>
 #include <cstdint>
+#include <filesystem>
 #include <mutex>
+#include <string>
 #include <unordered_map>
 #include <vector>
 
@@ -40,6 +42,18 @@ struct EeFileRuntimeState
                 vagMutex);
             vagAccum.clear();
         }
+        {
+            std::lock_guard<std::mutex> lock(
+                pathMutex);
+            pathsInitialized = false;
+            hostBase.clear();
+            cdromBase.clear();
+            mcBase.clear();
+            hostCwd.clear();
+            cdromCwd.clear();
+            mcCwd.clear();
+            cwdDevice = "cdrom0";
+        }
     }
 
     std::mutex descriptorMutex;
@@ -49,4 +63,14 @@ struct EeFileRuntimeState
     std::mutex vagMutex;
     std::unordered_map<int, EeFileVagAccumEntry>
         vagAccum;
+
+    std::mutex pathMutex;
+    bool pathsInitialized = false;
+    std::filesystem::path hostBase;
+    std::filesystem::path cdromBase;
+    std::filesystem::path mcBase;
+    std::filesystem::path hostCwd;
+    std::filesystem::path cdromCwd;
+    std::filesystem::path mcCwd;
+    std::string cwdDevice = "cdrom0";
 };

@@ -771,6 +771,8 @@ inline std::string translatePs2Path(
 
     std::string pathStr(ps2Path);
     std::string lower = toLowerAscii(pathStr);
+    const GuestPathResolverSnapshot resolver =
+        guestPathResolverSnapshot(runtime);
 
     auto resolveWithBase = [&](const std::filesystem::path &base, const std::string &suffix) -> std::string
     {
@@ -782,36 +784,59 @@ inline std::string translatePs2Path(
         }
         return resolved.lexically_normal().string();
     };
+    auto resolveDevicePath =
+        [&](const std::filesystem::path &root,
+            const std::filesystem::path &cwd,
+            const std::string &suffix) -> std::string
+    {
+        return resolveWithBase(
+            guestPathSuffixIsAbsolute(suffix)
+                ? root
+                : cwd,
+            suffix);
+    };
 
     if (lower.rfind("host0:", 0) == 0 || lower.rfind("host:", 0) == 0)
     {
         const std::size_t prefixLength = (lower.rfind("host0:", 0) == 0) ? 6 : 5;
-        return resolveWithBase(
-            getConfiguredHostRoot(runtime),
+        return resolveDevicePath(
+            resolver.hostBase,
+            resolver.hostCwd,
             pathStr.substr(prefixLength));
     }
 
     if (lower.rfind("cdrom0:", 0) == 0 || lower.rfind("cdrom:", 0) == 0)
     {
         const std::size_t prefixLength = (lower.rfind("cdrom0:", 0) == 0) ? 7 : 6;
-        return resolveWithBase(
-            getConfiguredCdRoot(runtime),
+        return resolveDevicePath(
+            resolver.cdromBase,
+            resolver.cdromCwd,
             pathStr.substr(prefixLength));
     }
 
     if (lower.rfind(kMc0Prefix, 0) == 0)
     {
         const std::size_t prefixLength = sizeof(kMc0Prefix) - 1;
-        return resolveWithBase(
-            getConfiguredMcRoot(runtime),
+        return resolveDevicePath(
+            resolver.mcBase,
+            resolver.mcCwd,
             pathStr.substr(prefixLength));
     }
 
     if (!pathStr.empty() && (pathStr.front() == '/' || pathStr.front() == '\\'))
     {
+        if (resolver.cwdDevice == "host0")
+        {
+            return resolveWithBase(
+                resolver.hostBase, pathStr);
+        }
+        if (resolver.cwdDevice == "mc0")
+        {
+            return resolveWithBase(
+                resolver.mcBase, pathStr);
+        }
         return resolveWithBase(
-            getConfiguredCdRoot(runtime),
-            pathStr);
+            resolver.cdromBase, pathStr);
     }
 
     if (pathStr.size() > 1 && pathStr[1] == ':')
@@ -819,9 +844,18 @@ inline std::string translatePs2Path(
         return pathStr;
     }
 
+    if (resolver.cwdDevice == "host0")
+    {
+        return resolveWithBase(
+            resolver.hostCwd, pathStr);
+    }
+    if (resolver.cwdDevice == "mc0")
+    {
+        return resolveWithBase(
+            resolver.mcCwd, pathStr);
+    }
     return resolveWithBase(
-        getConfiguredCdRoot(runtime),
-        pathStr);
+        resolver.cdromCwd, pathStr);
 }
 
 static bool localtimeSafe(const std::time_t *t, std::tm *out)

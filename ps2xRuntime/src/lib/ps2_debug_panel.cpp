@@ -1815,25 +1815,35 @@ namespace
         bool pathsInitialized = false;
         std::filesystem::path hostBase;
         std::filesystem::path cdromBase;
+        std::filesystem::path mcBase;
         std::filesystem::path hostCwd;
         std::filesystem::path cdromCwd;
+        std::filesystem::path mcCwd;
         std::string cwdDevice;
+        EeFileRuntimeState &fileState =
+            runtime.eeFileRuntimeState();
         {
-            std::lock_guard<std::mutex> lock(g_ps2_path_mutex);
-            pathsInitialized = g_ps2_paths_initialized;
-            hostBase = g_host_base;
-            cdromBase = g_cdrom_base;
-            hostCwd = g_host_cwd;
-            cdromCwd = g_cdrom_cwd;
-            cwdDevice = g_ps2_cwd_device;
+            std::lock_guard<std::mutex> lock(
+                fileState.pathMutex);
+            pathsInitialized =
+                fileState.pathsInitialized;
+            hostBase = fileState.hostBase;
+            cdromBase = fileState.cdromBase;
+            mcBase = fileState.mcBase;
+            hostCwd = fileState.hostCwd;
+            cdromCwd = fileState.cdromCwd;
+            mcCwd = fileState.mcCwd;
+            cwdDevice = fileState.cwdDevice;
         }
 
         ImGui::SeparatorText("PS2 path resolver");
         ImGui::Text("initialized=%u cwdDevice=%s", pathsInitialized ? 1u : 0u, cwdDevice.c_str());
         textPath("host base", hostBase);
         textPath("cdrom base", cdromBase);
+        textPath("mc base", mcBase);
         textPath("host cwd", hostCwd);
         textPath("cdrom cwd", cdromCwd);
+        textPath("mc cwd", mcCwd);
 
         struct FdRow
         {
@@ -1843,8 +1853,6 @@ namespace
 
         std::vector<FdRow> fds;
         {
-            EeFileRuntimeState &fileState =
-                runtime.eeFileRuntimeState();
             std::lock_guard<std::mutex> lock(
                 fileState.descriptorMutex);
             fds.reserve(fileState.descriptors.size());

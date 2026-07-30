@@ -513,17 +513,28 @@ namespace ps2_syscalls
         }
 
         std::error_code ec;
-        std::filesystem::current_path(hostPath, ec);
+        const bool isDirectory =
+            std::filesystem::is_directory(
+                hostPath, ec);
 
-        if (ec)
+        if (ec || !isDirectory)
         {
-            std::cerr << "fioChdir error: current_path failed for '" << hostPath
-                      << "': " << ec.message() << std::endl;
+            std::cerr << "fioChdir error: directory is unavailable at '"
+                      << hostPath << "'";
+            if (ec)
+            {
+                std::cerr << ": " << ec.message();
+            }
+            std::cerr << std::endl;
             setReturnS32(ctx, -1);
         }
         else
         {
-            RUNTIME_LOG("fioChdir: Changed directory to '" << hostPath << "'");
+            setGuestWorkingDirectory(
+                runtime, ps2Path, hostPath);
+            RUNTIME_LOG(
+                "fioChdir: Changed guest directory to '"
+                << hostPath << "'");
             setReturnS32(ctx, 0); // Success
         }
     }
