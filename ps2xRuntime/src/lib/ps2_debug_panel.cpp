@@ -953,6 +953,8 @@ namespace
     {
         uint8_t *rdram = runtime.memory().getRDRAM();
         const ps2x::iop::DebugSnapshot iopSnapshot = runtime.iopDebugSnapshot();
+        EeRpcRuntimeState &rpcState =
+            runtime.eeRpcRuntimeState();
 
         struct ModuleRow
         {
@@ -967,9 +969,11 @@ namespace
         uint32_t moduleLogCount = 0;
         int32_t nextModuleId = 0;
         {
-            std::lock_guard<std::mutex> lock(g_sif_module_mutex);
-            modules.reserve(g_sif_modules_by_id.size());
-            for (const auto &[id, record] : g_sif_modules_by_id)
+            std::lock_guard<std::mutex> lock(
+                rpcState.moduleMutex);
+            modules.reserve(rpcState.modulesById.size());
+            for (const auto &[id, record] :
+                 rpcState.modulesById)
             {
                 ModuleRow row{};
                 row.id = id;
@@ -979,8 +983,8 @@ namespace
                 row.loaded = record.loaded;
                 modules.push_back(std::move(row));
             }
-            moduleLogCount = g_sif_module_log_count;
-            nextModuleId = g_next_sif_module_id;
+            moduleLogCount = rpcState.moduleLogCount;
+            nextModuleId = rpcState.nextModuleId;
         }
         std::sort(modules.begin(), modules.end(), [](const ModuleRow &a, const ModuleRow &b)
                   { return a.id < b.id; });
@@ -1011,14 +1015,16 @@ namespace
         uint32_t rpcServerIndex = 0;
         uint32_t rpcActiveQueue = 0;
         {
-            std::lock_guard<std::mutex> lock(g_rpc_mutex);
-            rpcInitialized = g_rpc_initialized;
-            rpcNextId = g_rpc_next_id;
-            rpcPacketIndex = g_rpc_packet_index;
-            rpcServerIndex = g_rpc_server_index;
-            rpcActiveQueue = g_rpc_active_queue;
-            servers.reserve(g_rpc_servers.size());
-            for (const auto &[sid, state] : g_rpc_servers)
+            std::lock_guard<std::mutex> lock(
+                rpcState.rpcMutex);
+            rpcInitialized = rpcState.initialized;
+            rpcNextId = rpcState.nextRequestId;
+            rpcPacketIndex = rpcState.packetIndex;
+            rpcServerIndex = rpcState.serverIndex;
+            rpcActiveQueue = rpcState.activeQueue;
+            servers.reserve(rpcState.servers.size());
+            for (const auto &[sid, state] :
+                 rpcState.servers)
             {
                 RpcServerRow row{};
                 row.sid = sid;
@@ -1027,8 +1033,9 @@ namespace
                 servers.push_back(row);
             }
 
-            clients.reserve(g_rpc_clients.size());
-            for (const auto &[clientPtr, state] : g_rpc_clients)
+            clients.reserve(rpcState.clients.size());
+            for (const auto &[clientPtr, state] :
+                 rpcState.clients)
             {
                 RpcClientRow row{};
                 row.clientPtr = clientPtr;
@@ -1265,15 +1272,19 @@ namespace
     void drawRpcHistoryTab(PS2Runtime &runtime)
     {
         const ps2x::iop::DebugSnapshot iopSnapshot = runtime.iopDebugSnapshot();
+        EeRpcRuntimeState &rpcState =
+            runtime.eeRpcRuntimeState();
         std::vector<SifRpcDebugEvent> events;
         uint64_t nextSeq = 0;
         {
-            std::lock_guard<std::mutex> lock(g_rpc_mutex);
-            nextSeq = g_sif_rpc_debug_next_seq;
+            std::lock_guard<std::mutex> lock(
+                rpcState.rpcMutex);
+            nextSeq = rpcState.nextDebugSequence;
             events.reserve(kSifRpcDebugHistoryCount);
             for (size_t i = 0; i < kSifRpcDebugHistoryCount; ++i)
             {
-                const SifRpcDebugEvent &event = g_sif_rpc_debug_history[i];
+                const SifRpcDebugEvent &event =
+                    rpcState.debugHistory[i];
                 if (event.seq != 0u)
                 {
                     events.push_back(event);

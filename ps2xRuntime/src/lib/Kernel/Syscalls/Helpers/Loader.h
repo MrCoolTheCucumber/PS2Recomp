@@ -54,15 +54,23 @@ namespace
         return std::string(key);
     }
 
-    void logSifModuleAction(const char *op, int32_t moduleId, const std::string &path, uint32_t refCount)
+    void logSifModuleAction(
+        PS2Runtime *runtime,
+        const char *op,
+        int32_t moduleId,
+        const std::string &path,
+        uint32_t refCount)
     {
-        if (!op)
+        if (!runtime || !op)
         {
             return;
         }
 
-        std::lock_guard<std::mutex> lock(g_sif_module_mutex);
-        if (g_sif_module_log_count >= kMaxSifModuleLogs)
+        EeRpcRuntimeState &state =
+            runtime->eeRpcRuntimeState();
+        std::lock_guard<std::mutex> lock(
+            state.moduleMutex);
+        if (state.moduleLogCount >= kMaxSifModuleLogs)
         {
             return;
         }
@@ -72,12 +80,14 @@ namespace
                   << " ref=" << refCount
                   << " path=\"" << path << "\""
                   << std::endl);
-        ++g_sif_module_log_count;
+        ++state.moduleLogCount;
     }
 
-    int32_t trackSifModuleLoad(const std::string &path)
+    int32_t trackSifModuleLoad(
+        PS2Runtime *runtime,
+        const std::string &path)
     {
-        if (path.empty())
+        if (!runtime || path.empty())
         {
             return -1;
         }
@@ -88,13 +98,17 @@ namespace
             return -1;
         }
 
-        std::lock_guard<std::mutex> lock(g_sif_module_mutex);
+        EeRpcRuntimeState &state =
+            runtime->eeRpcRuntimeState();
+        std::lock_guard<std::mutex> lock(
+            state.moduleMutex);
 
-        auto byPathIt = g_sif_module_id_by_path.find(pathKey);
-        if (byPathIt != g_sif_module_id_by_path.end())
+        auto byPathIt = state.moduleIdByPath.find(pathKey);
+        if (byPathIt != state.moduleIdByPath.end())
         {
-            auto byIdIt = g_sif_modules_by_id.find(byPathIt->second);
-            if (byIdIt != g_sif_modules_by_id.end())
+            auto byIdIt =
+                state.modulesById.find(byPathIt->second);
+            if (byIdIt != state.modulesById.end())
             {
                 SifModuleRecord &record = byIdIt->second;
                 record.loaded = true;
@@ -103,12 +117,12 @@ namespace
             }
         }
 
-        if (g_next_sif_module_id <= 0)
+        if (state.nextModuleId <= 0)
         {
-            g_next_sif_module_id = 1;
+            state.nextModuleId = 1;
         }
 
-        const int32_t moduleId = g_next_sif_module_id++;
+        const int32_t moduleId = state.nextModuleId++;
         SifModuleRecord record;
         record.id = moduleId;
         record.path = path;
@@ -116,14 +130,17 @@ namespace
         record.refCount = 1;
         record.loaded = true;
 
-        g_sif_module_id_by_path[pathKey] = moduleId;
-        g_sif_modules_by_id[moduleId] = record;
+        state.moduleIdByPath[pathKey] = moduleId;
+        state.modulesById[moduleId] = record;
         return moduleId;
     }
 
-    bool trackSifModuleStop(int32_t moduleId, uint32_t *remainingRefs = nullptr)
+    bool trackSifModuleStop(
+        PS2Runtime *runtime,
+        int32_t moduleId,
+        uint32_t *remainingRefs = nullptr)
     {
-        if (moduleId <= 0)
+        if (!runtime || moduleId <= 0)
         {
             if (remainingRefs)
             {
@@ -132,9 +149,12 @@ namespace
             return false;
         }
 
-        std::lock_guard<std::mutex> lock(g_sif_module_mutex);
-        auto it = g_sif_modules_by_id.find(moduleId);
-        if (it == g_sif_modules_by_id.end())
+        EeRpcRuntimeState &state =
+            runtime->eeRpcRuntimeState();
+        std::lock_guard<std::mutex> lock(
+            state.moduleMutex);
+        auto it = state.modulesById.find(moduleId);
+        if (it == state.modulesById.end())
         {
             if (remainingRefs)
             {

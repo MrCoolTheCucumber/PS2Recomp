@@ -14,6 +14,7 @@
 #include "Kernel/Syscalls/Helpers/AlarmRuntimeState.h"
 #include "Kernel/Syscalls/Helpers/InterruptRuntimeState.h"
 #include "Kernel/Syscalls/Helpers/KernelRuntimeState.h"
+#include "Kernel/Syscalls/Helpers/RpcRuntimeState.h"
 #include "Kernel/Syscalls/Helpers/SyncRuntimeState.h"
 #include "Kernel/Syscalls/Helpers/ThreadRuntimeState.h"
 #include "ps2_host_backend.h"
@@ -908,6 +909,8 @@ PS2Runtime::PS2Runtime(PS2RuntimeConfiguration configuration)
         std::make_unique<EeInterruptRuntimeState>();
     m_eeKernelRuntimeState =
         std::make_unique<EeKernelRuntimeState>();
+    m_eeRpcRuntimeState =
+        std::make_unique<EeRpcRuntimeState>();
     m_gs.setVSyncTickProvider(
         [this]()
         {
@@ -1327,6 +1330,16 @@ EeKernelRuntimeState &PS2Runtime::eeKernelRuntimeState()
 const EeKernelRuntimeState &PS2Runtime::eeKernelRuntimeState() const
 {
     return *m_eeKernelRuntimeState;
+}
+
+EeRpcRuntimeState &PS2Runtime::eeRpcRuntimeState()
+{
+    return *m_eeRpcRuntimeState;
+}
+
+const EeRpcRuntimeState &PS2Runtime::eeRpcRuntimeState() const
+{
+    return *m_eeRpcRuntimeState;
 }
 
 ps2_stubs::MpegRuntimeState &PS2Runtime::mpegRuntimeState()

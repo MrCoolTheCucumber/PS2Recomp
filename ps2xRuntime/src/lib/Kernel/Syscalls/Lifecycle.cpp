@@ -3,6 +3,7 @@
 #include "Lifecycle.h"
 #include "Helpers/InterruptRuntimeState.h"
 #include "Helpers/KernelRuntimeState.h"
+#include "Helpers/RpcRuntimeState.h"
 
 namespace ps2_syscalls
 {
@@ -173,6 +174,39 @@ namespace ps2_syscalls
                 state.osdConfigInitialized = false;
                 state.osdConfigRaw = 0u;
                 state.osdConfig2Raw = 0u;
+            }
+        }
+
+        if (runtime)
+        {
+            EeRpcRuntimeState &state =
+                runtime->eeRpcRuntimeState();
+            {
+                std::lock_guard<std::mutex> lock(
+                    state.rpcMutex);
+                state.initialized = false;
+                state.servers.clear();
+                state.clients.clear();
+                state.debugHistory.fill(
+                    SifRpcDebugEvent{});
+                state.nextDebugSequence = 0u;
+                state.nextRequestId = 1u;
+                state.packetIndex = 0u;
+                state.serverIndex = 0u;
+                state.activeQueue = 0u;
+            }
+            {
+                std::lock_guard<std::mutex> lock(
+                    state.moduleMutex);
+                state.modulesById.clear();
+                state.moduleIdByPath.clear();
+                state.nextModuleId = 1;
+                state.moduleLogCount = 0u;
+            }
+            {
+                std::lock_guard<std::mutex> lock(
+                    state.traceMutex);
+                state.loggedTraceSignatures.clear();
             }
         }
     }

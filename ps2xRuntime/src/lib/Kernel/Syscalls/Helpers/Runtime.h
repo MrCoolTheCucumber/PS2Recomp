@@ -1,3 +1,5 @@
+#include "InterruptRuntimeState.h"
+
 struct ThreadExitException final : public std::exception
 {
     const char *what() const noexcept override
@@ -630,32 +632,19 @@ static bool rpcInvokeFunction(uint8_t *rdram, R5900Context *ctx, PS2Runtime *run
     if (!runtime || !ctx || !funcAddr || !runtime->hasFunction(funcAddr))
         return false;
 
-    constexpr uint32_t kRpcInvokeStackSize = 0x4000u;
     constexpr uint32_t kRpcInvokeReturnSentinel = 0x00FFF000u;
     constexpr uint32_t kRpcInvokeMaxSteps = 0x8000u;
 
-    R5900Context tmp = *ctx;
+    EeAsyncCallbackContextLease callbackContext(
+        runtime->eeInterruptRuntimeState(), *runtime);
+    R5900Context &tmp = callbackContext.context();
+    tmp = *ctx;
     setRegU32(&tmp, 4, a0);
     setRegU32(&tmp, 5, a1);
     setRegU32(&tmp, 6, a2);
     setRegU32(&tmp, 7, a3);
 
-    thread_local uint32_t s_rpcInvokeStackBase = 0u;
-    thread_local uint32_t s_rpcInvokeStackTop = 0u;
-    if (s_rpcInvokeStackTop == 0u)
-    {
-        const uint32_t stackBase = runtime->guestMalloc(kRpcInvokeStackSize, 16u);
-        if (stackBase != 0u)
-        {
-            s_rpcInvokeStackBase = stackBase;
-            s_rpcInvokeStackTop = (stackBase + kRpcInvokeStackSize) & ~0xFu;
-        }
-    }
-    if (s_rpcInvokeStackTop != 0u)
-    {
-        setRegU32(&tmp, 29, s_rpcInvokeStackTop);
-    }
-    (void)s_rpcInvokeStackBase;
+    setRegU32(&tmp, 29, callbackContext.stackTop());
 
     setRegU32(&tmp, 31, kRpcInvokeReturnSentinel);
     tmp.pc = funcAddr;
@@ -737,23 +726,35 @@ static bool rpcInvokeFunction(uint8_t *rdram, R5900Context *ctx, PS2Runtime *run
     return false;
 }
 
-static uint32_t rpcAllocPacketAddr(uint8_t *rdram)
+static uint32_t rpcAllocPacketAddr(
+    uint8_t *rdram,
+    PS2Runtime *runtime)
 {
-    if (kRpcPacketPoolCount == 0)
+    if (!runtime || kRpcPacketPoolCount == 0)
         return 0;
 
-    uint32_t slot = g_rpc_packet_index++ % kRpcPacketPoolCount;
+    EeRpcRuntimeState &state =
+        runtime->eeRpcRuntimeState();
+    std::lock_guard<std::mutex> lock(state.rpcMutex);
+    uint32_t slot =
+        state.packetIndex++ % kRpcPacketPoolCount;
     uint32_t addr = kRpcPacketPoolBase + (slot * kRpcPacketSize);
     rpcZeroRdram(rdram, addr, kRpcPacketSize);
     return addr;
 }
 
-static uint32_t rpcAllocServerAddr(uint8_t *rdram)
+static uint32_t rpcAllocServerAddr(
+    uint8_t *rdram,
+    PS2Runtime *runtime)
 {
-    if (kRpcServerPoolCount == 0)
+    if (!runtime || kRpcServerPoolCount == 0)
         return 0;
 
-    uint32_t slot = g_rpc_server_index++ % kRpcServerPoolCount;
+    EeRpcRuntimeState &state =
+        runtime->eeRpcRuntimeState();
+    std::lock_guard<std::mutex> lock(state.rpcMutex);
+    uint32_t slot =
+        state.serverIndex++ % kRpcServerPoolCount;
     uint32_t addr = kRpcServerPoolBase + (slot * kRpcServerStride);
     rpcZeroRdram(rdram, addr, kRpcServerStride);
     return addr;

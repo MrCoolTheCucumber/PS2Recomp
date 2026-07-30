@@ -361,7 +361,8 @@ namespace ps2_syscalls
 
         // Match buffer-based module loads to stable synthetic tags so module ID lookup remains deterministic.
         const std::string moduleTag = makeSifModuleBufferTag(rdram, bufferAddr);
-        const int32_t moduleId = trackSifModuleLoad(moduleTag);
+        const int32_t moduleId =
+            trackSifModuleLoad(runtime, moduleTag);
         if (moduleId <= 0)
         {
             setReturnS32(ctx, -1);
@@ -370,14 +371,22 @@ namespace ps2_syscalls
 
         uint32_t refs = 0;
         {
-            std::lock_guard<std::mutex> lock(g_sif_module_mutex);
-            auto it = g_sif_modules_by_id.find(moduleId);
-            if (it != g_sif_modules_by_id.end())
+            EeRpcRuntimeState &state =
+                runtime->eeRpcRuntimeState();
+            std::lock_guard<std::mutex> lock(
+                state.moduleMutex);
+            auto it = state.modulesById.find(moduleId);
+            if (it != state.modulesById.end())
             {
                 refs = it->second.refCount;
             }
         }
-        logSifModuleAction("load-buffer", moduleId, moduleTag, refs);
+        logSifModuleAction(
+            runtime,
+            "load-buffer",
+            moduleId,
+            moduleTag,
+            refs);
         setReturnS32(ctx, moduleId);
     }
 
