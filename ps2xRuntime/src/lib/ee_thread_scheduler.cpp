@@ -45,6 +45,7 @@ namespace ps2x::ee
             return objectId == 0;
         case EeSchedulerWaitKind::Semaphore:
         case EeSchedulerWaitKind::EventFlag:
+        case EeSchedulerWaitKind::HleSemaphore:
             return objectId >= 0;
         case EeSchedulerWaitKind::None:
         default:

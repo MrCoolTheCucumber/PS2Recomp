@@ -3,6 +3,7 @@
 #include "ps2_runtime_macros.h"
 #include "ps2_syscalls.h"
 #include "ps2_stubs.h"
+#include "Stubs/MPEG.h"
 
 #include <chrono>
 #include <array>
@@ -151,6 +152,14 @@ namespace
         0x25b200u;
     constexpr uint32_t K_EXECUTOR_NESTED_CHECKPOINT_CHILD =
         0x25b300u;
+    constexpr uint32_t K_EXECUTOR_MPEG_MAIN_ENTRY =
+        0x25b400u;
+    constexpr uint32_t K_EXECUTOR_MPEG_PRODUCER_ENTRY =
+        0x25b500u;
+    constexpr uint32_t K_EXECUTOR_MPEG_ADDR =
+        0x00123000u;
+    constexpr uint32_t K_EXECUTOR_MPEG_IMAGE_ADDR =
+        0x00180000u;
 
     std::mutex g_guestWordMutex;
     std::mutex g_alarmCallbackThreadMutex;
@@ -332,6 +341,30 @@ namespace
         g_executorNestedCheckpointProbeAllowed{false};
     std::atomic<bool>
         g_executorNestedCheckpointContinued{false};
+    std::atomic<uint32_t> g_executorMpegSequence{0u};
+    std::atomic<uint32_t> g_executorMpegProducerSequence{
+        0u};
+    std::atomic<uint32_t> g_executorMpegReturnSequence{
+        0u};
+    std::atomic<int> g_executorMpegResult{KE_ERROR};
+    enum class DedicatedExecutorMpegAction
+    {
+        RestartStream,
+        ReleaseWait,
+        Terminate,
+    };
+    std::atomic<DedicatedExecutorMpegAction>
+        g_executorMpegAction{
+            DedicatedExecutorMpegAction::
+                RestartStream};
+    std::atomic<int> g_executorMpegMainThreadId{0};
+    std::atomic<int> g_executorMpegControlResult{
+        KE_ERROR};
+    std::atomic<int> g_executorMpegObservedStatus{0};
+    std::atomic<uint32_t>
+        g_executorMpegObservedWaitType{0u};
+    std::atomic<uint32_t>
+        g_executorMpegObservedWaitId{0u};
 
     struct EeThreadStatus
     {
@@ -2649,6 +2682,278 @@ namespace
         g_executorNestedCheckpointContinued.store(
             true, std::memory_order_release);
         ctx->pc = 0u;
+    }
+
+    void dedicatedExecutorMpegProducerHandler(
+        uint8_t *rdram,
+        R5900Context *ctx,
+        PS2Runtime *runtime)
+    {
+        g_executorMpegProducerSequence.store(
+            g_executorMpegSequence.fetch_add(
+                1u, std::memory_order_acq_rel) +
+            1u,
+            std::memory_order_release);
+
+        const int mainThreadId =
+            g_executorMpegMainThreadId.load(
+                std::memory_order_acquire);
+        setRegU32(
+            *ctx,
+            4,
+            static_cast<uint32_t>(mainThreadId));
+        setRegU32(*ctx, 5, K_STATUS_ADDR);
+        ReferThreadStatus(rdram, ctx, runtime);
+        EeThreadStatus status{};
+        std::memcpy(
+            &status,
+            rdram + K_STATUS_ADDR,
+            sizeof(status));
+        g_executorMpegObservedStatus.store(
+            status.status,
+            std::memory_order_release);
+        g_executorMpegObservedWaitType.store(
+            status.waitType,
+            std::memory_order_release);
+        g_executorMpegObservedWaitId.store(
+            status.waitId,
+            std::memory_order_release);
+
+        switch (g_executorMpegAction.load(
+            std::memory_order_acquire))
+        {
+        case DedicatedExecutorMpegAction::ReleaseWait:
+            setRegU32(
+                *ctx,
+                4,
+                static_cast<uint32_t>(
+                    mainThreadId));
+            ReleaseWaitThread(rdram, ctx, runtime);
+            g_executorMpegControlResult.store(
+                getRegS32(*ctx, 2),
+                std::memory_order_release);
+            break;
+        case DedicatedExecutorMpegAction::Terminate:
+            setRegU32(
+                *ctx,
+                4,
+                static_cast<uint32_t>(
+                    mainThreadId));
+            TerminateThread(rdram, ctx, runtime);
+            g_executorMpegControlResult.store(
+                getRegS32(*ctx, 2),
+                std::memory_order_release);
+            break;
+        case DedicatedExecutorMpegAction::
+            RestartStream:
+            ps2_stubs::notifyMpegCdStreamStart(
+                runtime);
+            g_executorMpegControlResult.store(
+                0,
+                std::memory_order_release);
+            break;
+        }
+        ctx->pc = 0u;
+    }
+
+    void dedicatedExecutorMpegMainHandler(
+        uint8_t *rdram,
+        R5900Context *ctx,
+        PS2Runtime *runtime)
+    {
+        InitThread(rdram, ctx, runtime);
+        g_executorMpegMainThreadId.store(
+            runtime->currentEeThreadId(),
+            std::memory_order_release);
+        ps2_stubs::notifyMpegCdStreamStart(runtime);
+
+        setRegU32(
+            *ctx,
+            4,
+            K_EXECUTOR_THREAD_PARAM_ADDR);
+        CreateThread(rdram, ctx, runtime);
+        const int producerThreadId =
+            getRegS32(*ctx, 2);
+        if (producerThreadId <= 1)
+        {
+            g_executorMpegResult.store(
+                producerThreadId,
+                std::memory_order_release);
+            ctx->pc = 0u;
+            return;
+        }
+
+        setRegU32(
+            *ctx,
+            4,
+            static_cast<uint32_t>(
+                producerThreadId));
+        setRegU32(*ctx, 5, 0u);
+        StartThread(rdram, ctx, runtime);
+
+        setRegU32(
+            *ctx, 4, K_EXECUTOR_MPEG_ADDR);
+        setRegU32(
+            *ctx, 5, K_EXECUTOR_MPEG_IMAGE_ADDR);
+        setRegU32(*ctx, 6, 832u);
+        ps2_stubs::sceMpegGetPicture(
+            rdram, ctx, runtime);
+        g_executorMpegResult.store(
+            getRegS32(*ctx, 2),
+            std::memory_order_release);
+        g_executorMpegReturnSequence.store(
+            g_executorMpegSequence.fetch_add(
+                1u, std::memory_order_acq_rel) +
+                1u,
+            std::memory_order_release);
+        ctx->pc = 0u;
+    }
+
+    struct DedicatedExecutorMpegFixtureResult
+    {
+        bool memoryInitialized = false;
+        bool completedWithoutRescue = false;
+        bool completedAfterRescue = false;
+        uint32_t producerSequence = 0u;
+        uint32_t returnSequence = 0u;
+        int pictureResult = KE_ERROR;
+        int mainThreadId = 0;
+        int controlResult = KE_ERROR;
+        int observedStatus = 0;
+        uint32_t observedWaitType = 0u;
+        uint32_t observedWaitId = 0u;
+        size_t managedAfterStop = 0u;
+    };
+
+    DedicatedExecutorMpegFixtureResult
+    runDedicatedExecutorMpegFixture(
+        DedicatedExecutorMpegAction action)
+    {
+        DedicatedExecutorMpegFixtureResult result{};
+        PS2RuntimeConfiguration configuration{};
+        configuration.eeExecutionBackend =
+            EeExecutionBackendKind::LegacyCppFiber;
+        configuration
+            .useEeExecutionBackendEnvironment =
+            false;
+        PS2Runtime runtime(configuration);
+        result.memoryInitialized =
+            runtime.memory().initialize();
+        if (!result.memoryInitialized)
+        {
+            return result;
+        }
+
+        uint8_t *const rdram =
+            runtime.memory().getRDRAM();
+        const std::array<uint32_t, 9u>
+            producerParameters{
+                0u,
+                K_EXECUTOR_MPEG_PRODUCER_ENTRY,
+                0x00310000u,
+                0x800u,
+                0u,
+                2u,
+                0u,
+                0u,
+                0u,
+            };
+        writeGuestWords(
+            rdram,
+            K_EXECUTOR_THREAD_PARAM_ADDR,
+            producerParameters.data(),
+            producerParameters.size());
+        runtime.registerFunction(
+            K_EXECUTOR_MPEG_MAIN_ENTRY,
+            &dedicatedExecutorMpegMainHandler);
+        runtime.registerFunction(
+            K_EXECUTOR_MPEG_PRODUCER_ENTRY,
+            &dedicatedExecutorMpegProducerHandler);
+        runtime.cpu().pc =
+            K_EXECUTOR_MPEG_MAIN_ENTRY;
+        setRegU32(
+            runtime.cpu(), 29, 0x00300000u);
+        ps2_stubs::resetMpegStubState(&runtime);
+        g_executorMpegSequence.store(
+            0u, std::memory_order_release);
+        g_executorMpegProducerSequence.store(
+            0u, std::memory_order_release);
+        g_executorMpegReturnSequence.store(
+            0u, std::memory_order_release);
+        g_executorMpegResult.store(
+            KE_ERROR, std::memory_order_release);
+        g_executorMpegAction.store(
+            action, std::memory_order_release);
+        g_executorMpegMainThreadId.store(
+            0, std::memory_order_release);
+        g_executorMpegControlResult.store(
+            KE_ERROR, std::memory_order_release);
+        g_executorMpegObservedStatus.store(
+            0, std::memory_order_release);
+        g_executorMpegObservedWaitType.store(
+            0u, std::memory_order_release);
+        g_executorMpegObservedWaitId.store(
+            0u, std::memory_order_release);
+
+        runtime.startDedicatedEeExecutionForTesting();
+        const auto completed =
+            [&runtime]()
+            {
+                return g_executorMpegProducerSequence
+                               .load(
+                                   std::memory_order_acquire) !=
+                           0u &&
+                       runtime
+                               .managedEeExecutionThreadCountForTesting() ==
+                           0u;
+            };
+        result.completedWithoutRescue =
+            waitUntil(
+                completed,
+                std::chrono::seconds(1));
+        if (!result.completedWithoutRescue)
+        {
+            // Keep a legacy host-condition-variable
+            // regression bounded without making the
+            // guest controller runnable.
+            ps2_stubs::notifyMpegCdStreamStart(
+                &runtime);
+        }
+        result.completedAfterRescue =
+            result.completedWithoutRescue ||
+            waitUntil(
+                completed,
+                std::chrono::seconds(2));
+        runtime.stopDedicatedEeExecutionForTesting();
+
+        result.producerSequence =
+            g_executorMpegProducerSequence.load(
+                std::memory_order_acquire);
+        result.returnSequence =
+            g_executorMpegReturnSequence.load(
+                std::memory_order_acquire);
+        result.pictureResult =
+            g_executorMpegResult.load(
+                std::memory_order_acquire);
+        result.mainThreadId =
+            g_executorMpegMainThreadId.load(
+                std::memory_order_acquire);
+        result.controlResult =
+            g_executorMpegControlResult.load(
+                std::memory_order_acquire);
+        result.observedStatus =
+            g_executorMpegObservedStatus.load(
+                std::memory_order_acquire);
+        result.observedWaitType =
+            g_executorMpegObservedWaitType.load(
+                std::memory_order_acquire);
+        result.observedWaitId =
+            g_executorMpegObservedWaitId.load(
+                std::memory_order_acquire);
+        result.managedAfterStop =
+            runtime
+                .managedEeExecutionThreadCountForTesting();
+        return result;
     }
 
     struct TestEnv
@@ -5346,6 +5651,141 @@ void register_ps2_runtime_kernel_tests()
                                     std::memory_order_acquire) ==
                             1u,
                     "a stackful checkpoint should not re-enter either generated function");
+            });
+
+        tc.Run(
+            "fiber MPEG picture wait leaves the executor available to its guest producer",
+            [](TestCase &t)
+            {
+                if (!eeExecutionBackendBuildInfo()
+                         .boostContextFcontextAvailable)
+                {
+                    return;
+                }
+
+                const auto result =
+                    runDedicatedExecutorMpegFixture(
+                        DedicatedExecutorMpegAction::
+                            RestartStream);
+
+                t.IsTrue(
+                    result.memoryInitialized &&
+                        result.completedAfterRescue,
+                    "the bounded MPEG fixture should retire both continuations");
+                t.IsTrue(
+                    result.completedWithoutRescue,
+                    "sceMpegGetPicture must not park the sole EE executor on its host condition variable");
+                t.IsTrue(
+                    result.producerSequence == 1u &&
+                        result.returnSequence == 2u,
+                    "the lower-priority guest producer should release the picture wait before it returns");
+                t.Equals(
+                    result.pictureResult,
+                    -1,
+                    "a new CD stream generation should interrupt the prior picture wait");
+                t.IsTrue(
+                    result.observedStatus == THS_WAIT &&
+                        result.observedWaitType ==
+                            TSW_SEMA &&
+                        result.observedWaitId ==
+                            K_EXECUTOR_MPEG_ADDR,
+                    "the picture wait should expose the "
+                    "retail internal-semaphore status");
+                t.Equals(
+                    result.managedAfterStop,
+                    size_t{0u},
+                    "the producer wake should leave no "
+                    "managed fiber");
+            });
+
+        tc.Run(
+            "ReleaseWaitThread interrupts a fiber MPEG picture wait",
+            [](TestCase &t)
+            {
+                if (!eeExecutionBackendBuildInfo()
+                         .boostContextFcontextAvailable)
+                {
+                    return;
+                }
+
+                const auto result =
+                    runDedicatedExecutorMpegFixture(
+                        DedicatedExecutorMpegAction::
+                            ReleaseWait);
+                t.IsTrue(
+                    result.memoryInitialized &&
+                        result.completedWithoutRescue,
+                    "forced release should complete without "
+                    "a host rescue");
+                t.IsTrue(
+                    result.observedStatus == THS_WAIT &&
+                        result.observedWaitType ==
+                            TSW_SEMA &&
+                        result.observedWaitId ==
+                            K_EXECUTOR_MPEG_ADDR,
+                    "ReleaseWaitThread should observe the "
+                    "HLE semaphore wait");
+                t.Equals(
+                    result.controlResult,
+                    result.mainThreadId,
+                    "ReleaseWaitThread should return the "
+                    "picture waiter's thread id");
+                t.IsTrue(
+                    result.producerSequence == 1u &&
+                        result.returnSequence == 2u &&
+                        result.pictureResult == -1,
+                    "forced release should resume and "
+                    "interrupt the suspended native call");
+                t.Equals(
+                    result.managedAfterStop,
+                    size_t{0u},
+                    "forced release should leave no managed "
+                    "fiber");
+            });
+
+        tc.Run(
+            "TerminateThread unwinds a fiber MPEG picture wait",
+            [](TestCase &t)
+            {
+                if (!eeExecutionBackendBuildInfo()
+                         .boostContextFcontextAvailable)
+                {
+                    return;
+                }
+
+                const auto result =
+                    runDedicatedExecutorMpegFixture(
+                        DedicatedExecutorMpegAction::
+                            Terminate);
+                t.IsTrue(
+                    result.memoryInitialized &&
+                        result.completedWithoutRescue,
+                    "termination should complete without a "
+                    "host rescue");
+                t.IsTrue(
+                    result.observedStatus == THS_WAIT &&
+                        result.observedWaitType ==
+                            TSW_SEMA &&
+                        result.observedWaitId ==
+                            K_EXECUTOR_MPEG_ADDR,
+                    "TerminateThread should observe the HLE "
+                    "semaphore wait");
+                t.Equals(
+                    result.controlResult,
+                    result.mainThreadId,
+                    "TerminateThread should return the "
+                    "picture waiter's thread id");
+                t.IsTrue(
+                    result.producerSequence == 1u &&
+                        result.returnSequence == 0u &&
+                        result.pictureResult == KE_ERROR,
+                    "termination must unwind the suspended "
+                    "native call without returning through it");
+                t.Equals(
+                    result.managedAfterStop,
+                    size_t{0u},
+                    "termination should destroy the picture "
+                    "waiter's fiber");
             });
 
         tc.Run("host presentation upload state is isolated per runtime", [](TestCase &t)

@@ -15,14 +15,16 @@ extern "C"
 }
 #endif
 
+#include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <condition_variable>
-#include <atomic>
 #include <cstdlib>
 #include <deque>
 #include <filesystem>
 #include <fstream>
 #include <memory>
+#include <optional>
 
 #include "Syscalls/Helpers/State.h"
 #include "Syscalls/Helpers/InterruptRuntimeState.h"
@@ -714,6 +716,14 @@ namespace ps2_stubs
             std::unordered_map<uint32_t, std::vector<MpegRegisteredCallback>> callbacksByMpeg;
             std::unordered_map<uint32_t, MpegPlaybackState> playbackByMpeg;
         };
+
+        struct MpegPictureWaiter
+        {
+            ps2x::ee::EeSchedulerThreadHandle thread;
+            ps2x::ee::EeSchedulerWaitKey wait;
+            std::shared_ptr<ThreadInfo> info;
+            std::shared_ptr<std::atomic<bool>> active;
+        };
     }
 
     struct MpegRuntimeState::Impl
@@ -721,6 +731,7 @@ namespace ps2_stubs
         std::mutex mutex;
         std::condition_variable cv;
         MpegStubState state;
+        std::vector<MpegPictureWaiter> pictureWaiters;
         std::atomic<uint32_t> badCallbackPcLogCount{0u};
         std::atomic<uint32_t> callbackStepLimitLogCount{0u};
         std::atomic<uint32_t> callbackResultLogCount{0u};
@@ -774,8 +785,209 @@ namespace ps2_stubs
         constexpr size_t kStartCodeNotFound = std::numeric_limits<size_t>::max();
         constexpr uint32_t kMpegCallbackDataSize = 0x20u;
         constexpr uint32_t kMpegCallbackMaxSteps = 0x4000u;
+        constexpr std::chrono::milliseconds
+            kMpegPicturePollInterval{8};
         constexpr std::chrono::milliseconds kMpegNoFrameEndTimeout{500};
         constexpr uint32_t kMpegMaxConsecutiveEmptyGetPicture = 60u;
+
+        ps2x::ee::EeSchedulerWaitKey
+        mpegPictureWaitKey(uint32_t mpegAddr) noexcept
+        {
+            return {
+                ps2x::ee::EeSchedulerWaitKind::
+                    HleSemaphore,
+                static_cast<int>(
+                    mpegAddr & PS2_RAM_MASK),
+            };
+        }
+
+        class MpegPictureWaitRegistration
+        {
+        public:
+            MpegPictureWaitRegistration(
+                MpegRuntimeState::Impl &runtimeState,
+                MpegPictureWaiter waiter)
+                : m_runtimeState(&runtimeState),
+                  m_active(waiter.active)
+            {
+                if (!m_active)
+                {
+                    throw std::invalid_argument(
+                        "MPEG picture wait registration "
+                        "requires an activity token");
+                }
+                runtimeState.pictureWaiters.push_back(
+                    std::move(waiter));
+            }
+
+            ~MpegPictureWaitRegistration()
+            {
+                if (!m_runtimeState)
+                {
+                    return;
+                }
+                std::lock_guard<std::mutex> lock(
+                    m_runtimeState->mutex);
+                unregisterUnlocked();
+            }
+
+            MpegPictureWaitRegistration(
+                const MpegPictureWaitRegistration &) =
+                delete;
+            MpegPictureWaitRegistration &operator=(
+                const MpegPictureWaitRegistration &) =
+                delete;
+
+            void unregisterUnlocked() noexcept
+            {
+                if (!m_runtimeState)
+                {
+                    return;
+                }
+                m_active->store(
+                    false, std::memory_order_release);
+                auto &waiters =
+                    m_runtimeState->pictureWaiters;
+                waiters.erase(
+                    std::remove_if(
+                        waiters.begin(),
+                        waiters.end(),
+                        [this](
+                            const MpegPictureWaiter
+                                &waiter)
+                        {
+                            return waiter.active ==
+                                   m_active;
+                        }),
+                    waiters.end());
+                m_runtimeState = nullptr;
+            }
+
+        private:
+            MpegRuntimeState::Impl *m_runtimeState =
+                nullptr;
+            std::shared_ptr<std::atomic<bool>> m_active;
+        };
+
+        bool publishMpegPictureWake(
+            PS2Runtime *runtime,
+            MpegPictureWaiter waiter,
+            std::optional<
+                std::chrono::steady_clock::time_point>
+                deadline = std::nullopt)
+        {
+            if (!runtime || !waiter.active)
+            {
+                return false;
+            }
+
+            auto command =
+                [waiter = std::move(waiter)](
+                    ps2x::ee::EeThreadScheduler
+                        &scheduler)
+            {
+                if (!waiter.active->load(
+                        std::memory_order_acquire))
+                {
+                    return;
+                }
+                const auto before =
+                    scheduler.thread(waiter.thread.id);
+                if (!before.has_value() ||
+                    before->generation !=
+                        waiter.thread.generation ||
+                    (before->state !=
+                         ps2x::ee::
+                             EeSchedulerThreadState::
+                                 Waiting &&
+                     before->state !=
+                         ps2x::ee::
+                             EeSchedulerThreadState::
+                                 WaitSuspended) ||
+                    before->wait != waiter.wait)
+                {
+                    return;
+                }
+                if (!waiter.active->exchange(
+                        false,
+                        std::memory_order_acq_rel))
+                {
+                    return;
+                }
+                if (!scheduler.releaseWaitThread(
+                        waiter.thread,
+                        ps2x::ee::
+                            EeSchedulerWaitCompletion::
+                                Satisfied))
+                {
+                    throw std::logic_error(
+                        "MPEG picture wake could not "
+                        "release its scheduler wait");
+                }
+
+                std::lock_guard<std::mutex>
+                    threadLock(waiter.info->m);
+                if (waiter.info->generation !=
+                        waiter.thread.generation ||
+                    !waiter.info->guestState.releaseWait(
+                        EeThreadWaitQueue::
+                            HleSemaphore,
+                        TSW_SEMA,
+                        waiter.wait.objectId,
+                        false))
+                {
+                    throw std::logic_error(
+                        "MPEG picture wake diverged from "
+                        "guest thread state");
+                }
+                waiter.info->pendingWaitCompletion =
+                    ps2x::ee::
+                        EeSchedulerWaitCompletion::
+                            Satisfied;
+            };
+
+            if (deadline.has_value())
+            {
+                return runtime
+                    ->publishEeSchedulerUpdateAt(
+                        *deadline,
+                        std::move(command),
+                        ps2x::ee::
+                            EeSchedulerReschedulePolicy::
+                                HigherPriorityOnly);
+            }
+            return runtime->publishEeSchedulerUpdate(
+                std::move(command),
+                ps2x::ee::
+                    EeSchedulerReschedulePolicy::
+                        HigherPriorityOnly);
+        }
+
+        void notifyMpegStateChangedUnlocked(
+            PS2Runtime *runtime,
+            MpegRuntimeState::Impl &runtimeState)
+        {
+            runtimeState.cv.notify_all();
+            if (!runtime ||
+                !runtime->usesDedicatedEeExecutor() ||
+                runtimeState.pictureWaiters.empty())
+            {
+                return;
+            }
+
+            std::vector<MpegPictureWaiter> waiters =
+                std::move(
+                    runtimeState.pictureWaiters);
+            runtimeState.pictureWaiters.clear();
+            for (MpegPictureWaiter &waiter :
+                 waiters)
+            {
+                const bool published =
+                    publishMpegPictureWake(
+                        runtime, std::move(waiter));
+                (void)published;
+            }
+        }
 
         uint32_t align16(uint32_t value)
         {
@@ -2046,8 +2258,9 @@ namespace ps2_stubs
                         false,
                         true);
                     decodedCount = playback.decodedFrames.size();
+                    notifyMpegStateChangedUnlocked(
+                        runtime, *runtimeState);
                 }
-                runtimeState->cv.notify_all();
 
                 if (callbackEvents.empty())
                 {
@@ -2490,7 +2703,8 @@ namespace ps2_stubs
         std::lock_guard<std::mutex> lock(
             runtimeState->mutex);
         resetMpegStubStateUnlocked(*runtimeState);
-        runtimeState->cv.notify_all();
+        notifyMpegStateChangedUnlocked(
+            runtime, *runtimeState);
     }
 
     void notifyMpegCdStreamStart(PS2Runtime *runtime)
@@ -2524,7 +2738,8 @@ namespace ps2_stubs
             std::cerr << "[MPEG:CdStreamStart] generation=" << state.cdStreamGeneration
                       << " reopened=" << state.playbackByMpeg.size() << std::endl;
         });
-        runtimeState->cv.notify_all();
+        notifyMpegStateChangedUnlocked(
+            runtime, *runtimeState);
     }
 
     void notifyMpegCdStreamEof(PS2Runtime *runtime)
@@ -2562,7 +2777,8 @@ namespace ps2_stubs
                 });
                 ++state.eofLogCount;
             }
-            runtimeState->cv.notify_all();
+            notifyMpegStateChangedUnlocked(
+                runtime, *runtimeState);
         }
     }
 
@@ -2586,7 +2802,8 @@ namespace ps2_stubs
         {
             playback.decoder->flush(playback.decodedFrames);
         }
-        runtimeState->cv.notify_all();
+        notifyMpegStateChangedUnlocked(
+            runtime, *runtimeState);
         setReturnS32(ctx, 0);
     }
 
@@ -2624,7 +2841,8 @@ namespace ps2_stubs
             copied += chunk;
         }
 
-        runtimeState->cv.notify_all();
+        notifyMpegStateChangedUnlocked(
+            runtime, *runtimeState);
         setReturnS32(ctx, static_cast<int32_t>(copied));
     }
 
@@ -2828,7 +3046,8 @@ namespace ps2_stubs
             mpegAddr);
         runtimeState->state.playbackByMpeg.erase(
             mpegAddr);
-        runtimeState->cv.notify_all();
+        notifyMpegStateChangedUnlocked(
+            runtime, *runtimeState);
         setReturnU32(ctx, 0u);
     }
 
@@ -3230,6 +3449,22 @@ namespace ps2_stubs
                     currentThreadInfo = it->second;
                 }
             }
+            const bool dedicatedExecutor =
+                runtime &&
+                runtime->usesDedicatedEeExecutor();
+            const ps2x::ee::EeSchedulerThreadHandle
+                currentThread{
+                    runtime
+                        ? runtime->currentEeThreadId()
+                        : 0,
+                    currentThreadInfo
+                        ? currentThreadInfo->generation
+                        : 0u,
+                };
+            const ps2x::ee::EeSchedulerWaitKey
+                pictureWait =
+                    mpegPictureWaitKey(mpegAddr);
+            bool pictureWaitInterrupted = false;
 
             while (state.playbackByMpeg.find(mpegAddr) !=
                        state.playbackByMpeg.end() &&
@@ -3247,8 +3482,266 @@ namespace ps2_stubs
                    !runtime->isStopRequested() &&
                    (!currentThreadInfo || !currentThreadInfo->terminated.load(std::memory_order_relaxed)))
             {
-                runtimeState->cv.wait_for(
-                    lock, std::chrono::milliseconds(8));
+                if (!dedicatedExecutor)
+                {
+                    runtimeState->cv.wait_for(
+                        lock,
+                        kMpegPicturePollInterval);
+                }
+                else
+                {
+                    if (!currentThreadInfo ||
+                        !currentThread.valid())
+                    {
+                        throw std::logic_error(
+                            "MPEG picture wait has no "
+                            "dedicated EE thread owner");
+                    }
+
+                    struct PictureBlockTransition
+                    {
+                        bool applied = false;
+                    };
+                    const auto transition =
+                        std::make_shared<
+                            PictureBlockTransition>();
+                    const auto waitActive =
+                        std::make_shared<
+                            std::atomic<bool>>(true);
+                    const MpegPictureWaiter waiter{
+                        currentThread,
+                        pictureWait,
+                        currentThreadInfo,
+                        waitActive,
+                    };
+                    MpegPictureWaitRegistration
+                        registration(
+                            *runtimeState, waiter);
+                    bool published = false;
+                    bool pollPublished = false;
+                    try
+                    {
+                        published =
+                            runtime
+                                ->publishEeSchedulerUpdate(
+                                [currentThreadInfo,
+                                 currentThread,
+                                 pictureWait,
+                                 transition](
+                                    ps2x::ee::
+                                        EeThreadScheduler
+                                            &scheduler)
+                                {
+                                    const auto before =
+                                        scheduler.thread(
+                                            currentThread
+                                                .id);
+                                    if (!before
+                                             .has_value() ||
+                                        before->generation !=
+                                            currentThread
+                                                .generation ||
+                                        before->state !=
+                                            ps2x::ee::
+                                                EeSchedulerThreadState::
+                                                    Running ||
+                                        scheduler
+                                                .currentThreadId() !=
+                                            std::optional<
+                                                int>{
+                                                currentThread
+                                                    .id})
+                                    {
+                                        throw std::logic_error(
+                                            "MPEG picture "
+                                            "wait lost its "
+                                            "running "
+                                            "scheduler "
+                                            "owner");
+                                    }
+
+                                    (void)scheduler
+                                        .blockCurrentThread(
+                                            pictureWait);
+                                    const auto blocked =
+                                        scheduler.thread(
+                                            currentThread
+                                                .id);
+                                    if (!blocked
+                                             .has_value() ||
+                                        blocked->generation !=
+                                            currentThread
+                                                .generation ||
+                                        blocked->state !=
+                                            ps2x::ee::
+                                                EeSchedulerThreadState::
+                                                    Waiting ||
+                                        blocked->wait !=
+                                            pictureWait)
+                                    {
+                                        throw std::logic_error(
+                                            "MPEG picture "
+                                            "wait could not "
+                                            "block its "
+                                            "scheduler "
+                                            "owner");
+                                    }
+
+                                    std::lock_guard<
+                                        std::mutex>
+                                        threadLock(
+                                            currentThreadInfo
+                                                ->m);
+                                    if (!currentThreadInfo
+                                             ->guestState
+                                             .block(
+                                                 EeThreadWaitQueue::
+                                                     HleSemaphore,
+                                                 TSW_SEMA,
+                                                 pictureWait
+                                                     .objectId))
+                                    {
+                                        throw std::logic_error(
+                                            "MPEG picture "
+                                            "wait could not "
+                                            "mirror guest "
+                                            "thread state");
+                                    }
+                                    currentThreadInfo
+                                        ->pendingWaitCompletion =
+                                        ps2x::ee::
+                                            EeSchedulerWaitCompletion::
+                                                None;
+                                    currentThreadInfo
+                                        ->forceRelease =
+                                        false;
+                                    transition->applied =
+                                        true;
+                                },
+                                ps2x::ee::
+                                    EeSchedulerReschedulePolicy::
+                                        None);
+                        if (published)
+                        {
+                            pollPublished =
+                                publishMpegPictureWake(
+                                    runtime,
+                                    waiter,
+                                    std::chrono::
+                                            steady_clock::
+                                                now() +
+                                        kMpegPicturePollInterval);
+                        }
+                    }
+                    catch (...)
+                    {
+                        registration
+                            .unregisterUnlocked();
+                        throw;
+                    }
+                    if (!published || !pollPublished)
+                    {
+                        registration
+                            .unregisterUnlocked();
+                        if (runtime
+                                ->isStopRequested())
+                        {
+                            pictureWaitInterrupted =
+                                true;
+                            break;
+                        }
+                        throw std::runtime_error(
+                            "MPEG picture wait could not "
+                            "publish its scheduler block "
+                            "and timed wake");
+                    }
+
+                    lock.unlock();
+                    runtime->yieldEeExecutorCurrent(
+                        ps2x::ee::
+                            EeSchedulerExitReason::
+                                Preempted);
+                    lock.lock();
+                    registration
+                        .unregisterUnlocked();
+                    if (!transition->applied)
+                    {
+                        throw std::logic_error(
+                            "MPEG picture wait resumed "
+                            "before its scheduler "
+                            "transition");
+                    }
+
+                    {
+                        std::lock_guard<std::mutex>
+                            threadLock(
+                                currentThreadInfo->m);
+                        const auto completion =
+                            currentThreadInfo
+                                ->pendingWaitCompletion;
+                        currentThreadInfo
+                            ->pendingWaitCompletion =
+                            ps2x::ee::
+                                EeSchedulerWaitCompletion::
+                                    None;
+                        const bool forceReleased =
+                            currentThreadInfo
+                                ->forceRelease
+                                .exchange(false);
+                        if (currentThreadInfo
+                                ->terminated.load())
+                        {
+                            pictureWaitInterrupted =
+                                true;
+                        }
+                        else
+                        {
+                            (void)currentThreadInfo
+                                ->guestState
+                                .finishWait(
+                                    EeThreadWaitQueue::
+                                        HleSemaphore,
+                                    TSW_SEMA,
+                                    pictureWait
+                                        .objectId,
+                                    true);
+                            const auto &guest =
+                                currentThreadInfo
+                                    ->guestState
+                                    .snapshot();
+                            if (guest.status !=
+                                    THS_RUN ||
+                                guest.waitType !=
+                                    TSW_NONE ||
+                                guest.waitQueue !=
+                                    EeThreadWaitQueue::
+                                        None)
+                            {
+                                throw std::logic_error(
+                                    "MPEG picture wait "
+                                    "resumed with divergent "
+                                    "guest thread state");
+                            }
+                        }
+                        if (forceReleased ||
+                            completion ==
+                                ps2x::ee::
+                                    EeSchedulerWaitCompletion::
+                                        Released ||
+                            completion ==
+                                ps2x::ee::
+                                    EeSchedulerWaitCompletion::
+                                        ObjectDeleted)
+                        {
+                            pictureWaitInterrupted =
+                                true;
+                        }
+                    }
+                    if (pictureWaitInterrupted)
+                    {
+                        break;
+                    }
+                }
 
                 auto playbackIt =
                     state.playbackByMpeg.find(mpegAddr);
@@ -3267,6 +3760,12 @@ namespace ps2_stubs
                     break;
                 }
 
+            }
+
+            if (pictureWaitInterrupted)
+            {
+                setReturnS32(ctx, -1);
+                return;
             }
 
             if (state.playbackByMpeg.find(mpegAddr) ==
@@ -3422,7 +3921,8 @@ namespace ps2_stubs
             cdStreamGeneration;
         runtimeState->state.currentCdStreamEofSeen =
             currentCdStreamEofSeen;
-        runtimeState->cv.notify_all();
+        notifyMpegStateChangedUnlocked(
+            runtime, *runtimeState);
         setReturnU32(ctx, 0u);
     }
 

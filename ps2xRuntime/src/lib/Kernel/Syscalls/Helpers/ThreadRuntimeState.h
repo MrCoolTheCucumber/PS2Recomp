@@ -16,6 +16,7 @@ enum class EeThreadWaitQueue : uint8_t
     Sleep = 1,
     Semaphore = 2,
     EventFlag = 3,
+    HleSemaphore = 4,
 };
 
 struct EeThreadGuestStateSnapshot
@@ -412,6 +413,9 @@ private:
                  state.waitQueueId == state.waitId) ||
                 (state.waitQueue == EeThreadWaitQueue::EventFlag &&
                  state.waitType == kWaitEvent &&
+                 state.waitQueueId == state.waitId) ||
+                (state.waitQueue == EeThreadWaitQueue::HleSemaphore &&
+                 state.waitType == kWaitSemaphore &&
                  state.waitQueueId == state.waitId);
             if (!queueMatchesReason)
             {

@@ -36,6 +36,7 @@ namespace ps2x::ee
         Sleep,
         Semaphore,
         EventFlag,
+        HleSemaphore,
     };
 
     struct EeSchedulerWaitKey

@@ -139,6 +139,17 @@ namespace ps2_syscalls
                         break;
                     }
                     case ps2x::ee::
+                        EeSchedulerWaitKind::HleSemaphore:
+                        guestQueue =
+                            EeThreadWaitQueue::
+                                HleSemaphore;
+                        // Preserve the guest-visible semaphore
+                        // wait class while keeping HLE-owned
+                        // wait queues distinct from kernel
+                        // semaphore objects.
+                        guestWaitType = TSW_SEMA;
+                        break;
+                    case ps2x::ee::
                         EeSchedulerWaitKind::None:
                         throw std::logic_error(
                             "TerminateThread found a "
@@ -1532,6 +1543,8 @@ namespace ps2_syscalls
         {
             int waitType = TSW_NONE;
             int waitId = 0;
+            EeThreadWaitQueue waitQueue =
+                EeThreadWaitQueue::None;
             {
                 std::lock_guard<std::mutex> lock(info->m);
                 const EeThreadGuestStateSnapshot &guest =
@@ -1543,14 +1556,17 @@ namespace ps2_syscalls
                 }
                 waitType = guest.waitType;
                 waitId = guest.waitId;
+                waitQueue = guest.waitQueue;
             }
 
             const auto sema =
-                waitType == TSW_SEMA
+                waitQueue ==
+                        EeThreadWaitQueue::Semaphore
                     ? lookupSemaInfo(runtime, waitId)
                     : std::shared_ptr<SemaInfo>{};
             const auto eventFlag =
-                waitType == TSW_EVENT
+                waitQueue ==
+                        EeThreadWaitQueue::EventFlag
                     ? lookupEventFlagInfo(
                           runtime, waitId)
                     : std::shared_ptr<
@@ -3167,6 +3183,8 @@ namespace ps2_syscalls
         bool wasWaiting = false;
         int waitType = 0;
         int waitId = 0;
+        EeThreadWaitQueue waitQueue =
+            EeThreadWaitQueue::None;
 
         {
             std::lock_guard<std::mutex> lock(info->m);
@@ -3177,30 +3195,34 @@ namespace ps2_syscalls
             {
                 waitType = guest.waitType;
                 waitId = guest.waitId;
+                waitQueue = guest.waitQueue;
             }
         }
 
         if (runtime->usesDedicatedEeExecutor() &&
-            (waitType == TSW_SEMA ||
-             waitType == TSW_SLEEP ||
-             waitType == TSW_EVENT))
+            waitQueue != EeThreadWaitQueue::None)
         {
             const auto sema =
-                waitType == TSW_SEMA
+                waitQueue ==
+                        EeThreadWaitQueue::Semaphore
                     ? lookupSemaInfo(runtime, waitId)
                     : std::shared_ptr<SemaInfo>{};
             const auto eventFlag =
-                waitType == TSW_EVENT
+                waitQueue ==
+                        EeThreadWaitQueue::EventFlag
                     ? lookupEventFlagInfo(
                           runtime, waitId)
                     : std::shared_ptr<
                           EventFlagInfo>{};
-            if (waitType == TSW_SEMA && !sema)
+            if (waitQueue ==
+                    EeThreadWaitQueue::Semaphore &&
+                !sema)
             {
                 setReturnS32(ctx, KE_NOT_WAIT);
                 return;
             }
-            if (waitType == TSW_EVENT &&
+            if (waitQueue ==
+                    EeThreadWaitQueue::EventFlag &&
                 !eventFlag)
             {
                 setReturnS32(ctx, KE_NOT_WAIT);
@@ -3225,6 +3247,7 @@ namespace ps2_syscalls
                      generation,
                      waitType,
                      waitId,
+                     waitQueue,
                      transition](
                         ps2x::ee::EeThreadScheduler
                             &scheduler)
@@ -3254,19 +3277,9 @@ namespace ps2_syscalls
 
                             std::lock_guard<std::mutex>
                                 threadLock(info->m);
-                            const EeThreadWaitQueue queue =
-                                waitType == TSW_SEMA
-                                    ? EeThreadWaitQueue::
-                                          Semaphore
-                                    : (waitType ==
-                                               TSW_EVENT
-                                           ? EeThreadWaitQueue::
-                                                 EventFlag
-                                           : EeThreadWaitQueue::
-                                                 Sleep);
                             if (!info->guestState
                                      .releaseWait(
-                                         queue,
+                                         waitQueue,
                                          waitType,
                                          waitId,
                                          false))
