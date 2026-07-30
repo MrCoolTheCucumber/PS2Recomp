@@ -304,7 +304,8 @@ uint64_t PS2IopHostAdapter::virtualTimeNanoseconds() const
 
 std::string PS2IopHostAdapter::hostPath(ps2x::iop::HostPathKind kind) const
 {
-    const PS2Runtime::IoPaths &paths = PS2Runtime::getIoPaths();
+    const PS2Runtime::IoPaths paths =
+        m_runtime.ioPaths();
     switch (kind)
     {
     case ps2x::iop::HostPathKind::CdRoot:
@@ -323,7 +324,9 @@ std::string PS2IopHostAdapter::hostPath(ps2x::iop::HostPathKind kind) const
 
 std::string PS2IopHostAdapter::translateGuestPath(std::string_view path) const
 {
-    return translatePs2Path(std::string(path).c_str());
+    return translatePs2Path(
+        std::string(path).c_str(),
+        &m_runtime);
 }
 
 uint64_t PS2IopHostAdapter::openHostFile(std::string_view path)

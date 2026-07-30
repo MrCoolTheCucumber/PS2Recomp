@@ -110,7 +110,12 @@ namespace ps2_stubs
             PS2Runtime *runtime,
             int32_t port)
         {
-            const PS2Runtime::IoPaths &paths = PS2Runtime::getIoPaths();
+            if (!runtime)
+            {
+                return {};
+            }
+            const PS2Runtime::IoPaths paths =
+                runtime->ioPaths();
             std::filesystem::path root = paths.mcRoot;
             if (root.empty())
             {

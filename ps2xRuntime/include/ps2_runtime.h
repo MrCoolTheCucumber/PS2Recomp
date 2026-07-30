@@ -1083,11 +1083,9 @@ public:
     MissingFunctionPolicy missingFunctionPolicy() const;
     void resetMissingFunctionReportOnce();
 
-    static const IoPaths &getIoPaths();
-    static void setIoPaths(const IoPaths &paths);
-    static void configureIoPathsFromElf(const std::string &elfPath);
-    const IoPaths &ioPaths() const;
+    [[nodiscard]] IoPaths ioPaths() const;
     void configureIoPaths(const IoPaths &paths);
+    void configureIoPathsFromElf(const std::string &elfPath);
 
     [[noreturn]] void SignalException(R5900Context *ctx, PS2Exception exception);
     [[noreturn]] void SignalMemoryException(R5900Context *ctx,
@@ -1639,6 +1637,8 @@ private:
     std::unique_ptr<ps2x::iop::IopSubsystem> m_iopSubsystem;
     PS2AudioBackend m_audioBackend;
     PSPadBackend m_padBackend;
+    mutable std::mutex m_ioPathsMutex;
+    IoPaths m_ioPaths;
     VuUnit m_vu0;
     VuUnit m_vu1;
     ps2x::timing::Cop0Timing m_cop0Timing;

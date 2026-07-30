@@ -53,8 +53,8 @@ namespace ps2_stubs
             state->imageSizeBytes;
         snapshot.imageSizeValid =
             state->imageSizeValid;
-        snapshot.cdRoot = getCdRootPath();
-        snapshot.cdImage = getCdImagePath();
+        snapshot.cdRoot = getCdRootPath(runtime);
+        snapshot.cdImage = getCdImagePath(runtime);
         snapshot.imageSizePath = state->imageSizePath;
         snapshot.leafIndexRoot = state->leafIndexRoot;
         snapshot.leafIndexBuilt = state->leafIndexBuilt;
@@ -130,6 +130,7 @@ namespace ps2_stubs
 
             return readCdSectors(
                 *state,
+                runtime,
                 args.lbn,
                 args.sectors,
                 rdram + offset,
@@ -145,7 +146,9 @@ namespace ps2_stubs
             // If primary decode does not resolve to a known LBN, try safe alternatives.
             constexpr uint32_t kMaxReasonableSectors = PS2_RAM_SIZE / kCdSectorSize;
             if (!isResolvableCdLbn(
-                    *state, selected.lbn))
+                    *state,
+                    runtime,
+                    selected.lbn))
             {
                 const std::array<CdReadArgs, 5> alternatives = {
                     CdReadArgs{a2, a1, a0, "a2/a1/a0"},
@@ -161,7 +164,9 @@ namespace ps2_stubs
                         continue;
                     }
                     if (!isResolvableCdLbn(
-                            *state, candidate.lbn))
+                            *state,
+                            runtime,
+                            candidate.lbn))
                     {
                         continue;
                     }
@@ -433,6 +438,7 @@ namespace ps2_stubs
 
             if (!readCdSectors(
                     *state,
+                    runtime,
                     lbn,
                     sectors,
                     rdram + offset,
@@ -543,7 +549,9 @@ namespace ps2_stubs
                     0u)
             {
                 std::cerr << "sceCdSearchFile failed: " << sanitizeForLog(path)
-                          << " (normalized path is empty, root: " << getCdRootPath().string() << ")"
+                          << " (normalized path is empty, root: "
+                          << getCdRootPath(runtime).string()
+                          << ")"
                           << std::endl;
             }
             ++state->emptyNormalizedCount;
@@ -554,7 +562,10 @@ namespace ps2_stubs
 
         CdFileEntry entry;
         bool found = registerCdFile(
-            *state, path, entry);
+            *state,
+            runtime,
+            path,
+            entry);
         CdFileEntry resolvedEntry = entry;
         std::string resolvedPath;
 
@@ -575,7 +586,8 @@ namespace ps2_stubs
                     0u)
             {
                 std::cerr << "sceCdSearchFile failed: " << sanitizeForLog(path)
-                          << " (root: " << getCdRootPath().string()
+                          << " (root: "
+                          << getCdRootPath(runtime).string()
                           << ", repeat="
                           << state->samePathFailCount
                           << ")" << std::endl;
@@ -725,6 +737,7 @@ namespace ps2_stubs
                 sectors > 0u &&
                 readCdSectors(
                     *state,
+                    runtime,
                     readLbn,
                     sectors,
                     rdram + offset,

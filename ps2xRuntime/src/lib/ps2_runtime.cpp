@@ -674,21 +674,20 @@ namespace
         return absolute.lexically_normal();
     }
 
-    PS2Runtime::IoPaths &runtimeIoPaths()
+    PS2Runtime::IoPaths defaultRuntimeIoPaths()
     {
-        static PS2Runtime::IoPaths paths = []()
-        {
-            PS2Runtime::IoPaths defaults;
-            std::error_code ec;
-            const std::filesystem::path cwd = std::filesystem::current_path(ec);
-            defaults.elfDirectory = ec ? std::filesystem::path(".") : cwd.lexically_normal();
-            defaults.hostRoot = defaults.elfDirectory;
-            defaults.cdRoot = defaults.elfDirectory;
-            defaults.mcRoot = defaults.elfDirectory / "mc0";
-            return defaults;
-        }();
-
-        return paths;
+        PS2Runtime::IoPaths defaults;
+        std::error_code ec;
+        const std::filesystem::path cwd =
+            std::filesystem::current_path(ec);
+        defaults.elfDirectory =
+            ec ? std::filesystem::path(".")
+               : cwd.lexically_normal();
+        defaults.hostRoot = defaults.elfDirectory;
+        defaults.cdRoot = defaults.elfDirectory;
+        defaults.mcRoot =
+            defaults.elfDirectory / "mc0";
+        return defaults;
     }
 
     std::string readGuestPrintableString(const uint8_t *rdram, uint32_t addr, size_t maxLen)
@@ -907,6 +906,7 @@ PS2Runtime::PS2Runtime(PS2RuntimeConfiguration configuration)
     : m_vu0(VuUnitId::Vu0),
       m_vu1(VuUnitId::Vu1)
 {
+    m_ioPaths = defaultRuntimeIoPaths();
     m_mpegRuntimeState =
         std::make_unique<ps2_stubs::MpegRuntimeState>();
     m_eeAlarmRuntimeState =
@@ -4472,17 +4472,13 @@ bool PS2Runtime::loadELF(const std::string &elfPath)
     return true;
 }
 
-const PS2Runtime::IoPaths &PS2Runtime::getIoPaths()
+PS2Runtime::IoPaths PS2Runtime::ioPaths() const
 {
-    return runtimeIoPaths();
+    std::lock_guard<std::mutex> lock(m_ioPathsMutex);
+    return m_ioPaths;
 }
 
-const PS2Runtime::IoPaths &PS2Runtime::ioPaths() const
-{
-    return getIoPaths();
-}
-
-void PS2Runtime::setIoPaths(const IoPaths &paths)
+void PS2Runtime::configureIoPaths(const IoPaths &paths)
 {
     IoPaths normalized = paths;
     normalized.elfPath = normalizeAbsolutePath(normalized.elfPath);
@@ -4510,17 +4506,13 @@ void PS2Runtime::setIoPaths(const IoPaths &paths)
         normalized.mcRoot = normalized.elfDirectory / "mc0";
     }
 
-    runtimeIoPaths() = normalized;
-}
-
-void PS2Runtime::configureIoPaths(const IoPaths &paths)
-{
-    setIoPaths(paths);
+    std::lock_guard<std::mutex> lock(m_ioPathsMutex);
+    m_ioPaths = std::move(normalized);
 }
 
 void PS2Runtime::configureIoPathsFromElf(const std::string &elfPath)
 {
-    IoPaths paths = runtimeIoPaths();
+    IoPaths paths = ioPaths();
     paths.elfPath = normalizeAbsolutePath(std::filesystem::path(elfPath));
     if (!paths.elfPath.empty())
     {
@@ -4534,7 +4526,7 @@ void PS2Runtime::configureIoPathsFromElf(const std::string &elfPath)
         paths.mcRoot = paths.elfDirectory / "mc0";
     }
 
-    setIoPaths(paths);
+    configureIoPaths(paths);
 }
 
 namespace

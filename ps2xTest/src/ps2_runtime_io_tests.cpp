@@ -2,6 +2,8 @@
 #include "ps2_runtime.h"
 #include "ps2_syscalls.h"
 #include "ps2_stubs.h"
+#include "Kernel/Stubs/CD.h"
+#include "Kernel/Stubs/MemoryCard.h"
 
 #include <filesystem>
 #include <fstream>
@@ -148,7 +150,7 @@ namespace
             ioPaths.hostRoot = paths.cdRoot;
             ioPaths.cdRoot = paths.cdRoot;
             ioPaths.mcRoot = paths.mcRoot;
-            PS2Runtime::setIoPaths(ioPaths);
+            runtime.configureIoPaths(ioPaths);
         }
     };
 }
@@ -162,6 +164,10 @@ void register_ps2_runtime_io_tests()
             TestContext test;
             PS2Runtime first;
             PS2Runtime second;
+            const PS2Runtime::IoPaths ioPaths =
+                test.runtime.ioPaths();
+            first.configureIoPaths(ioPaths);
+            second.configureIoPaths(ioPaths);
             std::vector<uint8_t> secondRdram(
                 PS2_RAM_SIZE, 0u);
             R5900Context secondCtx{};
@@ -398,6 +404,34 @@ void register_ps2_runtime_io_tests()
                 secondPaths.cdRoot.string(),
                 "the second runtime should retain its own host root");
 
+            const ps2_stubs::CdDebugSnapshot firstCd =
+                ps2_stubs::getCdDebugSnapshot(&first);
+            const ps2_stubs::CdDebugSnapshot secondCd =
+                ps2_stubs::getCdDebugSnapshot(&second);
+            t.Equals(
+                firstCd.cdRoot.string(),
+                firstPaths.cdRoot.string(),
+                "CD inspection should resolve the first runtime's CD root");
+            t.Equals(
+                secondCd.cdRoot.string(),
+                secondPaths.cdRoot.string(),
+                "CD inspection should resolve the second runtime's CD root");
+
+            const ps2_stubs::MemoryCardDebugSnapshot firstMc =
+                ps2_stubs::getMemoryCardDebugSnapshot(
+                    &first);
+            const ps2_stubs::MemoryCardDebugSnapshot secondMc =
+                ps2_stubs::getMemoryCardDebugSnapshot(
+                    &second);
+            t.Equals(
+                firstMc.ports[0].rootPath.string(),
+                firstPaths.mcRoot.string(),
+                "memory-card inspection should resolve the first runtime's card root");
+            t.Equals(
+                secondMc.ports[0].rootPath.string(),
+                secondPaths.mcRoot.string(),
+                "memory-card inspection should resolve the second runtime's card root");
+
             constexpr uint32_t kPathAddr =
                 GUEST_STRING_AREA_START + 0xC80u;
             constexpr uint32_t kReadAddr =
@@ -477,6 +511,10 @@ void register_ps2_runtime_io_tests()
             TestContext test;
             PS2Runtime first;
             PS2Runtime second;
+            const PS2Runtime::IoPaths ioPaths =
+                test.runtime.ioPaths();
+            first.configureIoPaths(ioPaths);
+            second.configureIoPaths(ioPaths);
             std::vector<uint8_t> secondRdram(
                 PS2_RAM_SIZE, 0u);
             R5900Context secondCtx{};
@@ -1333,7 +1371,7 @@ void register_ps2_runtime_io_tests()
             ioPaths.cdRoot = test.paths.cdRoot;
             ioPaths.mcRoot = test.paths.mcRoot;
             ioPaths.cdImage = imagePath;
-            PS2Runtime::setIoPaths(ioPaths);
+            test.runtime.configureIoPaths(ioPaths);
 
             clearContext(test.ctx);
             setRegU32(test.ctx, 4, 0u);

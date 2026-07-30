@@ -760,9 +760,11 @@ static uint32_t rpcAllocServerAddr(
     return addr;
 }
 
-inline std::string translatePs2Path(const char *ps2Path)
+inline std::string translatePs2Path(
+    const char *ps2Path,
+    PS2Runtime *runtime)
 {
-    if (!ps2Path || !*ps2Path)
+    if (!runtime || !ps2Path || !*ps2Path)
     {
         return {};
     }
@@ -784,24 +786,32 @@ inline std::string translatePs2Path(const char *ps2Path)
     if (lower.rfind("host0:", 0) == 0 || lower.rfind("host:", 0) == 0)
     {
         const std::size_t prefixLength = (lower.rfind("host0:", 0) == 0) ? 6 : 5;
-        return resolveWithBase(getConfiguredHostRoot(), pathStr.substr(prefixLength));
+        return resolveWithBase(
+            getConfiguredHostRoot(runtime),
+            pathStr.substr(prefixLength));
     }
 
     if (lower.rfind("cdrom0:", 0) == 0 || lower.rfind("cdrom:", 0) == 0)
     {
         const std::size_t prefixLength = (lower.rfind("cdrom0:", 0) == 0) ? 7 : 6;
-        return resolveWithBase(getConfiguredCdRoot(), pathStr.substr(prefixLength));
+        return resolveWithBase(
+            getConfiguredCdRoot(runtime),
+            pathStr.substr(prefixLength));
     }
 
     if (lower.rfind(kMc0Prefix, 0) == 0)
     {
         const std::size_t prefixLength = sizeof(kMc0Prefix) - 1;
-        return resolveWithBase(getConfiguredMcRoot(), pathStr.substr(prefixLength));
+        return resolveWithBase(
+            getConfiguredMcRoot(runtime),
+            pathStr.substr(prefixLength));
     }
 
     if (!pathStr.empty() && (pathStr.front() == '/' || pathStr.front() == '\\'))
     {
-        return resolveWithBase(getConfiguredCdRoot(), pathStr);
+        return resolveWithBase(
+            getConfiguredCdRoot(runtime),
+            pathStr);
     }
 
     if (pathStr.size() > 1 && pathStr[1] == ':')
@@ -809,7 +819,9 @@ inline std::string translatePs2Path(const char *ps2Path)
         return pathStr;
     }
 
-    return resolveWithBase(getConfiguredCdRoot(), pathStr);
+    return resolveWithBase(
+        getConfiguredCdRoot(runtime),
+        pathStr);
 }
 
 static bool localtimeSafe(const std::time_t *t, std::tm *out)

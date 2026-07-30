@@ -393,7 +393,9 @@ namespace
             return -1;
         }
 
-        const std::string hostPath = translatePs2Path(ps2Path.c_str());
+        const std::string hostPath =
+            translatePs2Path(
+                ps2Path.c_str(), runtime);
         if (hostPath.empty())
         {
             return -1;

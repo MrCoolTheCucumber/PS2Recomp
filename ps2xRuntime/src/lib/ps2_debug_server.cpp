@@ -1593,8 +1593,8 @@ struct PS2DebugServer::Impl
 
     std::string executableDigest() const
     {
-        const std::filesystem::path &path =
-            PS2Runtime::getIoPaths().elfPath;
+        const std::filesystem::path path =
+            runtime.ioPaths().elfPath;
         std::error_code error;
         if (path.empty() || !std::filesystem::is_regular_file(path, error) ||
             error)
@@ -1647,7 +1647,8 @@ struct PS2DebugServer::Impl
         addString(result, "function_map_sha256", functionMapDigest(), allocator);
         addString(result, "executable_sha256", executableDigest(), allocator);
         addString(result, "executable",
-                  PS2Runtime::getIoPaths().elfPath.string(), allocator);
+                  runtime.ioPaths().elfPath.string(),
+                  allocator);
 
         Value progress(rapidjson::kObjectType);
         progress.AddMember("dispatches", sample.dispatches, allocator);

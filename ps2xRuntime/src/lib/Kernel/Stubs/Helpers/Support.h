@@ -136,9 +136,15 @@ namespace
         return cdLoosePathKeyFromRelative(std::filesystem::path(normalizeCdPathNoPrefix(ps2Path)));
     }
 
-    std::filesystem::path getCdRootPath()
+    std::filesystem::path getCdRootPath(
+        PS2Runtime *runtime)
     {
-        const PS2Runtime::IoPaths &paths = PS2Runtime::getIoPaths();
+        if (!runtime)
+        {
+            return {};
+        }
+        const PS2Runtime::IoPaths paths =
+            runtime->ioPaths();
         if (!paths.cdRoot.empty())
         {
             return paths.cdRoot;
@@ -153,16 +159,21 @@ namespace
         return ec ? std::filesystem::path(".") : cwd.lexically_normal();
     }
 
-    std::filesystem::path getCdImagePath()
+    std::filesystem::path getCdImagePath(
+        PS2Runtime *runtime)
     {
-        return PS2Runtime::getIoPaths().cdImage;
+        return runtime
+                   ? runtime->ioPaths().cdImage
+                   : std::filesystem::path{};
     }
 
     bool tryGetCdImageTotalSectors(
         ps2_stubs::CdRuntimeState &state,
+        PS2Runtime *runtime,
         uint64_t &totalSectorsOut)
     {
-        const std::filesystem::path imagePath = getCdImagePath();
+        const std::filesystem::path imagePath =
+            getCdImagePath(runtime);
         if (imagePath.empty())
         {
             return false;
@@ -205,10 +216,13 @@ namespace
         return toLowerAscii(normalizeCdPathNoPrefix(ps2Path));
     }
 
-    std::filesystem::path cdHostPath(const std::string &ps2Path)
+    std::filesystem::path cdHostPath(
+        PS2Runtime *runtime,
+        const std::string &ps2Path)
     {
         const std::string normalized = normalizeCdPathNoPrefix(ps2Path);
-        std::filesystem::path resolved = getCdRootPath();
+        std::filesystem::path resolved =
+            getCdRootPath(runtime);
         if (!normalized.empty())
         {
             resolved /= std::filesystem::path(normalized);
@@ -318,6 +332,7 @@ namespace
 
     bool registerCdFile(
         ps2_stubs::CdRuntimeState &state,
+        PS2Runtime *runtime,
         const std::string &ps2Path,
         ps2_stubs::CdFileEntry &entryOut)
     {
@@ -336,8 +351,10 @@ namespace
             return true;
         }
 
-        const std::filesystem::path root = getCdRootPath();
-        std::filesystem::path path = cdHostPath(ps2Path);
+        const std::filesystem::path root =
+            getCdRootPath(runtime);
+        std::filesystem::path path =
+            cdHostPath(runtime, ps2Path);
         std::error_code ec;
         if (!std::filesystem::exists(path, ec) || ec || !std::filesystem::is_regular_file(path, ec))
         {
@@ -439,6 +456,7 @@ namespace
 
     bool readCdSectors(
         ps2_stubs::CdRuntimeState &state,
+        PS2Runtime *runtime,
         uint32_t lbn,
         uint32_t sectors,
         uint8_t *dst,
@@ -465,12 +483,15 @@ namespace
                 byteCount);
         }
 
-        const std::filesystem::path cdImage = getCdImagePath();
+        const std::filesystem::path cdImage =
+            getCdImagePath(runtime);
         if (!cdImage.empty())
         {
             uint64_t totalSectors = 0;
             if (tryGetCdImageTotalSectors(
-                    state, totalSectors))
+                    state,
+                    runtime,
+                    totalSectors))
             {
                 const uint64_t start = static_cast<uint64_t>(lbn);
                 const uint64_t end = start + static_cast<uint64_t>(sectors);
@@ -501,6 +522,7 @@ namespace
 
     bool isResolvableCdLbn(
         ps2_stubs::CdRuntimeState &state,
+        PS2Runtime *runtime,
         uint32_t lbn)
     {
         for (const auto &[key, entry] :
@@ -515,7 +537,9 @@ namespace
 
         uint64_t totalSectors = 0;
         if (tryGetCdImageTotalSectors(
-                state, totalSectors))
+                state,
+                runtime,
+                totalSectors))
         {
             return static_cast<uint64_t>(lbn) < totalSectors;
         }

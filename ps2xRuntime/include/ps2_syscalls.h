@@ -9,7 +9,9 @@
 #include <string>
 #include <vector>
 
-std::string translatePs2Path(const char *ps2Path);
+std::string translatePs2Path(
+    const char *ps2Path,
+    PS2Runtime *runtime);
 
 namespace ps2_syscalls
 {

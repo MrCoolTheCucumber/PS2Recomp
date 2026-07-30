@@ -563,13 +563,14 @@ void register_ps2_sif_rpc_tests()
             std::memcpy(body.data() + kSectorSize, bodyPayload, sizeof(bodyPayload) - 1u);
             writeFile(temp.path / "img_bd.bin", body);
 
-            const PS2Runtime::IoPaths oldPaths = PS2Runtime::getIoPaths();
+            const PS2Runtime::IoPaths oldPaths =
+                env.runtime.ioPaths();
             PS2Runtime::IoPaths ioPaths;
             ioPaths.elfDirectory = temp.path;
             ioPaths.hostRoot = temp.path;
             ioPaths.cdRoot = temp.path;
             ioPaths.mcRoot = temp.path / "mc0";
-            PS2Runtime::setIoPaths(ioPaths);
+            env.runtime.configureIoPaths(ioPaths);
 
             constexpr uint32_t kSendAddr = 0x00030000u;
             constexpr uint32_t kRecvAddr = 0x00031000u;
@@ -599,7 +600,7 @@ void register_ps2_sif_rpc_tests()
                         static_cast<uint32_t>(commands.size() * sizeof(uint32_t)),
                         kRecvAddr, 0x180u);
 
-            PS2Runtime::setIoPaths(oldPaths);
+            env.runtime.configureIoPaths(oldPaths);
 
             t.IsTrue(result.handled, "Fatal Frame SDRDRV SID should be handled");
             t.Equals(result.resultAddress, kRecvAddr, "SDRDRV RPC should return recv buffer");
@@ -615,13 +616,14 @@ void register_ps2_sif_rpc_tests()
             TestEnv env;
             ScopedTempDir temp("mcserv_rpc");
 
-            const PS2Runtime::IoPaths oldPaths = PS2Runtime::getIoPaths();
+            const PS2Runtime::IoPaths oldPaths =
+                env.runtime.ioPaths();
             PS2Runtime::IoPaths ioPaths;
             ioPaths.elfDirectory = temp.path;
             ioPaths.hostRoot = temp.path;
             ioPaths.cdRoot = temp.path;
             ioPaths.mcRoot = temp.path / "mc0";
-            PS2Runtime::setIoPaths(ioPaths);
+            env.runtime.configureIoPaths(ioPaths);
 
             constexpr uint32_t kSendAddr = 0x00034000u;
             constexpr uint32_t kRecvAddr = 0x00035000u;
@@ -655,7 +657,7 @@ void register_ps2_sif_rpc_tests()
                 callIop(env, IOP_SID_MCSERV, 0x01u,
                         kSendAddr, sizeof(McDescParam), kRecvAddr, 4u);
 
-            PS2Runtime::setIoPaths(oldPaths);
+            env.runtime.configureIoPaths(oldPaths);
 
             t.IsTrue(getInfoResult.handled, "MCSERV get info RPC should be handled");
             t.Equals(readGuestStruct<int32_t>(env.rdram.data(), kRecvAddr), 0,
@@ -1220,10 +1222,11 @@ void register_ps2_sif_rpc_tests()
             const std::filesystem::path discPath = temp.path / "disc.iso";
             writeFile(discPath, disc);
 
-            const PS2Runtime::IoPaths oldPaths = PS2Runtime::getIoPaths();
+            const PS2Runtime::IoPaths oldPaths =
+                env.runtime.ioPaths();
             PS2Runtime::IoPaths ioPaths = oldPaths;
             ioPaths.cdImage = discPath;
-            PS2Runtime::setIoPaths(ioPaths);
+            env.runtime.configureIoPaths(ioPaths);
 
             constexpr uint32_t kSendAddr = 0x00035BE0u;
             constexpr uint32_t kRecvAddr = 0x00035C20u;
@@ -1270,7 +1273,7 @@ void register_ps2_sif_rpc_tests()
                 callIop(env, IOP_SID_SONY_989SND, 0x4Du,
                         kSendAddr, sizeof(kCancelCommand), kRecvAddr, 12u);
 
-            PS2Runtime::setIoPaths(oldPaths);
+            env.runtime.configureIoPaths(oldPaths);
 
             t.IsTrue(cancelResult.handled, "989snd data-read cancel command should be handled");
             t.Equals(readGuestStruct<uint32_t>(env.rdram.data(), kRecvAddr + 4u),
@@ -1287,10 +1290,11 @@ void register_ps2_sif_rpc_tests()
             const std::filesystem::path discPath = temp.path / "disc.iso";
             writeFile(discPath, std::vector<uint8_t>(kSectorSize, 0x5Au));
 
-            const PS2Runtime::IoPaths oldPaths = PS2Runtime::getIoPaths();
+            const PS2Runtime::IoPaths oldPaths =
+                env.runtime.ioPaths();
             PS2Runtime::IoPaths ioPaths = oldPaths;
             ioPaths.cdImage = discPath;
-            PS2Runtime::setIoPaths(ioPaths);
+            env.runtime.configureIoPaths(ioPaths);
 
             constexpr uint32_t kSendAddr = 0x00035BE0u;
             constexpr uint32_t kRecvAddr = 0x00035C20u;
@@ -1316,7 +1320,7 @@ void register_ps2_sif_rpc_tests()
                 callIop(env, IOP_SID_SONY_989SND, 0x4Du,
                         kSendAddr, sizeof(kReadCommand), kRecvAddr, 12u);
 
-            PS2Runtime::setIoPaths(oldPaths);
+            env.runtime.configureIoPaths(oldPaths);
 
             t.IsTrue(startResult.handled, "989snd start RPC should configure data-read completion");
             t.IsFalse(result.handled, "989snd should reject a data read beyond the CD image");
@@ -1367,13 +1371,14 @@ void register_ps2_sif_rpc_tests()
             writeFile(temp.path / "boot.cfg", payload);
             writeFile(temp.path / "load.bin", loadPayload);
 
-            const PS2Runtime::IoPaths oldPaths = PS2Runtime::getIoPaths();
+            const PS2Runtime::IoPaths oldPaths =
+                env.runtime.ioPaths();
             PS2Runtime::IoPaths ioPaths;
             ioPaths.elfDirectory = temp.path;
             ioPaths.hostRoot = temp.path;
             ioPaths.cdRoot = temp.path;
             ioPaths.mcRoot = temp.path / "mc0";
-            PS2Runtime::setIoPaths(ioPaths);
+            env.runtime.configureIoPaths(ioPaths);
 
             constexpr uint32_t kSendAddr = 0x00036000u;
             constexpr uint32_t kRecvAddr = 0x00037000u;
@@ -1465,7 +1470,7 @@ void register_ps2_sif_rpc_tests()
                 callClFileRpc(0x09u, sizeof(uint32_t));
             }
 
-            PS2Runtime::setIoPaths(oldPaths);
+            env.runtime.configureIoPaths(oldPaths);
         });
 
         tc.Run("LotR sound RPC completes HLE callback without invoking guest loop", [](TestCase &t)

@@ -1802,9 +1802,8 @@ namespace
 
     void drawFileCdTab(PS2Runtime &runtime)
     {
-        (void)runtime;
-
-        const PS2Runtime::IoPaths &ioPaths = PS2Runtime::getIoPaths();
+        const PS2Runtime::IoPaths ioPaths =
+            runtime.ioPaths();
         ImGui::SeparatorText("Runtime IO paths");
         textPath("ELF", ioPaths.elfPath);
         textPath("ELF dir", ioPaths.elfDirectory);

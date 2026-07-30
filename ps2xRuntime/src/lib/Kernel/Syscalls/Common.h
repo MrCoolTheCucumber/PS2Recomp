@@ -28,7 +28,9 @@
 #endif
 #include <ThreadNaming.h>
 
-std::string translatePs2Path(const char *ps2Path);
+std::string translatePs2Path(
+    const char *ps2Path,
+    PS2Runtime *runtime);
 
 #include "Helpers/Path.h"
 #include "Helpers/State.h"

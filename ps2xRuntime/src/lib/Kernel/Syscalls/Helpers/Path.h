@@ -46,9 +46,15 @@ namespace
         return suffix;
     }
 
-    std::filesystem::path getConfiguredHostRoot()
+    std::filesystem::path getConfiguredHostRoot(
+        PS2Runtime *runtime)
     {
-        const PS2Runtime::IoPaths &paths = PS2Runtime::getIoPaths();
+        if (!runtime)
+        {
+            return {};
+        }
+        const PS2Runtime::IoPaths paths =
+            runtime->ioPaths();
         if (!paths.hostRoot.empty())
         {
             return paths.hostRoot;
@@ -63,9 +69,15 @@ namespace
         return ec ? std::filesystem::path(".") : cwd.lexically_normal();
     }
 
-    std::filesystem::path getConfiguredCdRoot()
+    std::filesystem::path getConfiguredCdRoot(
+        PS2Runtime *runtime)
     {
-        const PS2Runtime::IoPaths &paths = PS2Runtime::getIoPaths();
+        if (!runtime)
+        {
+            return {};
+        }
+        const PS2Runtime::IoPaths paths =
+            runtime->ioPaths();
         if (!paths.cdRoot.empty())
         {
             return paths.cdRoot;
@@ -80,9 +92,15 @@ namespace
         return ec ? std::filesystem::path(".") : cwd.lexically_normal();
     }
 
-    std::filesystem::path getConfiguredMcRoot()
+    std::filesystem::path getConfiguredMcRoot(
+        PS2Runtime *runtime)
     {
-        const PS2Runtime::IoPaths &paths = PS2Runtime::getIoPaths();
+        if (!runtime)
+        {
+            return {};
+        }
+        const PS2Runtime::IoPaths paths =
+            runtime->ioPaths();
         if (!paths.mcRoot.empty())
         {
             return paths.mcRoot;

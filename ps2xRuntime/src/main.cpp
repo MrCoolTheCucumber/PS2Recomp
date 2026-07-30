@@ -132,18 +132,21 @@ namespace
 #endif
     }
 
-    void configureOptionalCdImage(int argc, char *argv[])
+    void configureOptionalCdImage(
+        PS2Runtime &runtime,
+        int argc,
+        char *argv[])
     {
         if (argc < 3 || !argv[2] || argv[2][0] == '\0')
         {
             return;
         }
 
-        PS2Runtime::IoPaths ioPaths = PS2Runtime::getIoPaths();
+        PS2Runtime::IoPaths ioPaths = runtime.ioPaths();
         ioPaths.cdImage = std::filesystem::path(argv[2]);
-        PS2Runtime::setIoPaths(ioPaths);
+        runtime.configureIoPaths(ioPaths);
         std::cout << "Using argv CD image path: "
-                  << PS2Runtime::getIoPaths().cdImage << std::endl;
+                  << runtime.ioPaths().cdImage << std::endl;
     }
 }
 
@@ -157,7 +160,6 @@ int main(int argc, char *argv[])
     try
     {
         std::filesystem::path pathObj = getExecutablePath(argc, argv);
-        configureOptionalCdImage(argc, argv);
 
         std::string filePathStr = pathObj.string();
         std::string elfName = pathObj.filename().string();
@@ -178,6 +180,7 @@ int main(int argc, char *argv[])
         }
 
         PS2Runtime runtime;
+        configureOptionalCdImage(runtime, argc, argv);
 #if defined(PS2X_ENABLE_DEBUG_UI) && !defined(PLATFORM_VITA)
         // This hook is to prevent leak rlimgui deps to recompiler etc
         PS2DebugPanel debugPanel;
