@@ -1490,6 +1490,28 @@ bool PS2Runtime::publishEeSchedulerUpdate(
         policy);
 }
 
+bool PS2Runtime::publishEeSchedulerUpdateAt(
+    std::chrono::steady_clock::time_point deadline,
+    std::function<void(
+        ps2x::ee::EeThreadScheduler &)> update,
+    ps2x::ee::EeSchedulerReschedulePolicy policy)
+{
+    if (!m_eeRuntimeExecutor || !update)
+    {
+        return false;
+    }
+
+    return m_eeRuntimeExecutor->publishAt(
+        deadline,
+        [update = std::move(update)](
+            ps2x::ee::EeThreadScheduler &scheduler,
+            IEeExecutionBackend &)
+        {
+            update(scheduler);
+        },
+        policy);
+}
+
 void PS2Runtime::invokeEeSchedulerUpdateAtBoundary(
     std::function<void(
         ps2x::ee::EeThreadScheduler &)> update,

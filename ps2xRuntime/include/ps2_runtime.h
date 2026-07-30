@@ -1301,6 +1301,13 @@ public:
         ps2x::ee::EeSchedulerReschedulePolicy policy =
             ps2x::ee::EeSchedulerReschedulePolicy::
                 HigherPriorityOnly);
+    [[nodiscard]] bool publishEeSchedulerUpdateAt(
+        std::chrono::steady_clock::time_point deadline,
+        std::function<void(
+            ps2x::ee::EeThreadScheduler &)> update,
+        ps2x::ee::EeSchedulerReschedulePolicy policy =
+            ps2x::ee::EeSchedulerReschedulePolicy::
+                HigherPriorityOnly);
     void invokeEeSchedulerUpdateAtBoundary(
         std::function<void(
             ps2x::ee::EeThreadScheduler &)> update,

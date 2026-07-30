@@ -128,6 +128,8 @@ namespace ps2x::ee
                 m_executorThreadId = {};
                 m_pausedAtBoundary = false;
                 m_publications.clear();
+                m_delayedPublications.clear();
+                m_nextPublicationSequence = 0u;
                 ++m_statistics.starts;
                 m_statistics.modeledTick = {};
                 m_statistics.boundary = {};
@@ -186,6 +188,8 @@ namespace ps2x::ee
                     return false;
                 }
 
+                promoteReadyDelayedLocked(
+                    std::chrono::steady_clock::now());
                 m_publications.push_back(
                     Publication{
                         std::move(command),
@@ -196,7 +200,74 @@ namespace ps2x::ee
                     std::max(
                         m_statistics
                             .peakQueuedPublications,
-                        m_publications.size());
+                        queuedPublicationCountLocked());
+                ++m_wakeGeneration;
+            }
+            m_cv.notify_all();
+            return true;
+        }
+
+        [[nodiscard]] bool publishAt(
+            std::chrono::steady_clock::time_point deadline,
+            Command command,
+            EeSchedulerReschedulePolicy policy)
+        {
+            if (!command)
+            {
+                return false;
+            }
+
+            const auto now =
+                std::chrono::steady_clock::now();
+            if (deadline <= now)
+            {
+                return publish(
+                    std::move(command), policy);
+            }
+
+            {
+                std::lock_guard<std::mutex> lock(m_mutex);
+                if (!m_acceptingPublications ||
+                    m_stopRequested ||
+                    m_failure)
+                {
+                    return false;
+                }
+
+                DelayedPublication delayed{
+                    deadline,
+                    m_nextPublicationSequence++,
+                    Publication{
+                        std::move(command),
+                        {},
+                        policy,
+                    },
+                };
+                const auto position =
+                    std::upper_bound(
+                        m_delayedPublications.begin(),
+                        m_delayedPublications.end(),
+                        delayed,
+                        [](const DelayedPublication &left,
+                           const DelayedPublication &right)
+                        {
+                            if (left.deadline !=
+                                right.deadline)
+                            {
+                                return left.deadline <
+                                       right.deadline;
+                            }
+                            return left.sequence <
+                                   right.sequence;
+                        });
+                m_delayedPublications.insert(
+                    position, std::move(delayed));
+                ++m_statistics.publicationsQueued;
+                m_statistics.peakQueuedPublications =
+                    std::max(
+                        m_statistics
+                            .peakQueuedPublications,
+                        queuedPublicationCountLocked());
                 ++m_wakeGeneration;
             }
             m_cv.notify_all();
@@ -235,6 +306,8 @@ namespace ps2x::ee
                         "accepting boundary commands");
                 }
 
+                promoteReadyDelayedLocked(
+                    std::chrono::steady_clock::now());
                 m_publications.push_back(
                     Publication{
                         std::move(command),
@@ -245,7 +318,7 @@ namespace ps2x::ee
                     std::max(
                         m_statistics
                             .peakQueuedPublications,
-                        m_publications.size());
+                        queuedPublicationCountLocked());
                 ++m_wakeGeneration;
             }
             m_cv.notify_all();
@@ -468,6 +541,35 @@ namespace ps2x::ee
                     HigherPriorityOnly;
         };
 
+        struct DelayedPublication
+        {
+            std::chrono::steady_clock::time_point deadline;
+            uint64_t sequence = 0u;
+            Publication publication;
+        };
+
+        [[nodiscard]] size_t
+        queuedPublicationCountLocked() const noexcept
+        {
+            return m_publications.size() +
+                   m_delayedPublications.size();
+        }
+
+        void promoteReadyDelayedLocked(
+            std::chrono::steady_clock::time_point now)
+        {
+            while (!m_delayedPublications.empty() &&
+                   m_delayedPublications.front().deadline <=
+                       now)
+            {
+                m_publications.push_back(
+                    std::move(
+                        m_delayedPublications.front()
+                            .publication));
+                m_delayedPublications.pop_front();
+            }
+        }
+
         [[nodiscard]] bool isExecutorThread() const
         {
             std::lock_guard<std::mutex> lock(m_mutex);
@@ -482,7 +584,11 @@ namespace ps2x::ee
         {
             std::lock_guard<std::mutex> lock(m_mutex);
             return !m_stopRequested &&
-                   !m_publications.empty();
+                   (!m_publications.empty() ||
+                    (!m_delayedPublications.empty() &&
+                     m_delayedPublications.front()
+                             .deadline <=
+                         std::chrono::steady_clock::now()));
         }
 
         [[nodiscard]]
@@ -491,7 +597,10 @@ namespace ps2x::ee
         {
             std::lock_guard<std::mutex> lock(m_mutex);
             if (!m_stopRequested &&
-                !m_publications.empty())
+                (!m_publications.empty() ||
+                 (!m_delayedPublications.empty() &&
+                  m_delayedPublications.front().deadline <=
+                      std::chrono::steady_clock::now())))
             {
                 // A queued syscall consequence is part of the operation
                 // which reached this boundary. Apply it before considering
@@ -513,6 +622,8 @@ namespace ps2x::ee
             Publication publication;
             {
                 std::lock_guard<std::mutex> lock(m_mutex);
+                promoteReadyDelayedLocked(
+                    std::chrono::steady_clock::now());
                 if (m_stopRequested ||
                     m_publications.empty())
                 {
@@ -581,14 +692,24 @@ namespace ps2x::ee
         {
             std::unique_lock<std::mutex> lock(m_mutex);
             ++m_statistics.idleWaits;
-            m_cv.wait(
-                lock,
+            const auto wakePredicate =
                 [this, observedGeneration]()
                 {
                     return m_stopRequested ||
                            m_wakeGeneration !=
                                observedGeneration;
-                });
+                };
+            if (m_delayedPublications.empty())
+            {
+                m_cv.wait(lock, wakePredicate);
+            }
+            else
+            {
+                (void)m_cv.wait_until(
+                    lock,
+                    m_delayedPublications.front().deadline,
+                    wakePredicate);
+            }
         }
 
         [[nodiscard]] uint64_t wakeGeneration() const
@@ -842,6 +963,13 @@ namespace ps2x::ee
             {
                 std::lock_guard<std::mutex> lock(m_mutex);
                 pending.swap(m_publications);
+                for (DelayedPublication &delayed :
+                     m_delayedPublications)
+                {
+                    pending.push_back(
+                        std::move(delayed.publication));
+                }
+                m_delayedPublications.clear();
             }
 
             const auto failure = std::make_exception_ptr(
@@ -882,6 +1010,9 @@ namespace ps2x::ee
         uint64_t m_wakeGeneration = 0u;
         std::thread::id m_executorThreadId;
         std::deque<Publication> m_publications;
+        std::deque<DelayedPublication>
+            m_delayedPublications;
+        uint64_t m_nextPublicationSequence = 0u;
         std::exception_ptr m_failure;
         std::exception_ptr m_startFailure;
         EeRuntimeExecutorStatistics m_statistics{};
@@ -921,6 +1052,15 @@ namespace ps2x::ee
     {
         return m_impl->publish(
             std::move(command), policy);
+    }
+
+    bool EeRuntimeExecutor::publishAt(
+        std::chrono::steady_clock::time_point deadline,
+        Command command,
+        EeSchedulerReschedulePolicy policy)
+    {
+        return m_impl->publishAt(
+            deadline, std::move(command), policy);
     }
 
     void EeRuntimeExecutor::invokeAtBoundary(

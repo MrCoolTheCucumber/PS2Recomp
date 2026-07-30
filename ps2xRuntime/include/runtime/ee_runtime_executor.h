@@ -77,6 +77,16 @@ namespace ps2x::ee
                 EeSchedulerReschedulePolicy::
                     HigherPriorityOnly);
 
+        // Queue a host publication which becomes eligible at a steady-clock
+        // deadline. The executor owns the timer wait and still applies the
+        // command only at a scheduler boundary.
+        [[nodiscard]] bool publishAt(
+            std::chrono::steady_clock::time_point deadline,
+            Command command,
+            EeSchedulerReschedulePolicy policy =
+                EeSchedulerReschedulePolicy::
+                    HigherPriorityOnly);
+
         // Queue one command and wait until the executor applies it at a
         // boundary. This is intended for lifecycle operations and bounded
         // tests, not for a guest continuation running on the executor thread.

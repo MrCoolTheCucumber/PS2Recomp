@@ -440,6 +440,130 @@ void register_ee_runtime_executor_tests()
             });
 
         tc.Run(
+            "wakes an idle executor at a delayed publication deadline",
+            [](TestCase &t)
+            {
+                ScriptedRuntimeBackend backend;
+                EeRuntimeExecutor executor(backend);
+                std::mutex mutex;
+                std::condition_variable cv;
+                bool applied = false;
+                std::chrono::steady_clock::time_point
+                    appliedAt{};
+
+                executor.start(
+                    [](EeThreadScheduler &,
+                       IEeExecutionBackend &)
+                    {
+                    });
+                const auto deadline =
+                    std::chrono::steady_clock::now() +
+                    40ms;
+                const bool accepted =
+                    executor.publishAt(
+                        deadline,
+                        [&](EeThreadScheduler &,
+                            IEeExecutionBackend &)
+                        {
+                            {
+                                std::lock_guard<std::mutex>
+                                    lock(mutex);
+                                appliedAt =
+                                    std::chrono::
+                                        steady_clock::now();
+                                applied = true;
+                            }
+                            cv.notify_all();
+                        });
+                const bool completed =
+                    waitFor(
+                        cv,
+                        mutex,
+                        [&]()
+                        {
+                            return applied;
+                        });
+                executor.requestStop();
+                executor.join();
+                executor.rethrowFailure();
+
+                t.IsTrue(
+                    accepted && completed,
+                    "an accepted delayed publication "
+                    "should wake an otherwise idle "
+                    "executor");
+                t.IsTrue(
+                    completed && appliedAt >= deadline,
+                    "a delayed publication must not run "
+                    "before its steady-clock deadline");
+                const EeRuntimeExecutorStatistics stats =
+                    executor.statistics();
+                t.IsTrue(
+                    stats.publicationsQueued == 1u &&
+                        stats.publicationsApplied == 1u,
+                    "delayed publications should use the "
+                    "normal executor accounting");
+            });
+
+        tc.Run(
+            "cancels delayed publications across stop and restart",
+            [](TestCase &t)
+            {
+                ScriptedRuntimeBackend backend;
+                EeRuntimeExecutor executor(backend);
+                std::atomic<bool> staleApplied{false};
+
+                executor.start(
+                    [](EeThreadScheduler &,
+                       IEeExecutionBackend &)
+                    {
+                    });
+                const bool accepted =
+                    executor.publishAt(
+                        std::chrono::steady_clock::now() +
+                            1h,
+                        [&](EeThreadScheduler &,
+                            IEeExecutionBackend &)
+                        {
+                            staleApplied.store(
+                                true,
+                                std::memory_order_release);
+                        });
+                executor.requestStop();
+                executor.join();
+                executor.rethrowFailure();
+
+                executor.start(
+                    [](EeThreadScheduler &,
+                       IEeExecutionBackend &)
+                    {
+                    });
+                executor.invokeAtBoundary(
+                    [](EeThreadScheduler &,
+                       IEeExecutionBackend &)
+                    {
+                    });
+                executor.requestStop();
+                executor.join();
+                executor.rethrowFailure();
+
+                t.IsTrue(
+                    accepted &&
+                        !staleApplied.load(
+                            std::memory_order_acquire),
+                    "stopping an executor should cancel "
+                    "future deadlines before a fresh "
+                    "generation starts");
+                const EeRuntimeExecutorStatistics stats =
+                    executor.statistics();
+                t.IsTrue(
+                    stats.publicationsQueued == 2u &&
+                        stats.publicationsApplied == 1u,
+                    "a cancelled delayed publication "
+                    "should not count as applied");
+            });
+
+        tc.Run(
             "idle executor closes notify-before-park window",
             [](TestCase &t)
             {
