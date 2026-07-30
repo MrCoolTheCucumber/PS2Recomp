@@ -72,6 +72,7 @@ namespace
     constexpr uint32_t K_EXIT_DELETE_THREAD_ID_ADDR = 0x188Cu;
     constexpr uint32_t K_CONTROL_EVENT_PARAM_ADDR = 0x1890u;
     constexpr uint32_t K_CONTROL_SEMA_PARAM_ADDR = 0x18A0u;
+    constexpr uint32_t K_RESCHEDULE_STAGE_ADDR = 0x18C0u;
 
     struct EeThreadStatus
     {
@@ -409,6 +410,16 @@ namespace
     {
         setRegU32(*ctx, 4, 0u);
         SuspendThread(rdram, ctx, runtime);
+        ctx->pc = 0u;
+    }
+
+    void rescheduleMarkerHandler(
+        uint8_t *rdram, R5900Context *ctx, PS2Runtime *)
+    {
+        writeGuestU32(
+            rdram,
+            K_RESCHEDULE_STAGE_ADDR,
+            readGuestU32(rdram, K_RESCHEDULE_STAGE_ADDR) + 1u);
         ctx->pc = 0u;
     }
 
@@ -1896,6 +1907,831 @@ void register_ps2_runtime_kernel_tests()
                 deleteWorker(deleteTid),
                 deleteTid,
                 "deleted-semaphore waiter should be deletable");
+        });
+
+        tc.Run("semaphore signal and raw delete preserve EE reschedule boundaries", [](TestCase &t)
+        {
+            notifyRuntimeStop();
+            TestEnv env;
+
+            constexpr uint32_t kThreadEntry = 0x00256400u;
+            env.runtime.registerFunction(
+                kThreadEntry, &semaWaitOracleHandler);
+
+            R5900Context priorityCtx{};
+            setRegU32(priorityCtx, 4, 0u);
+            setRegU32(priorityCtx, 5, 40u);
+            ChangeThreadPriority(
+                env.rdram.data(), &priorityCtx, &env.runtime);
+
+            const uint32_t semaParam[6] = {
+                0u,
+                1u,
+                0u,
+                0u,
+                0u,
+                0u,
+            };
+            auto createSema = [&]()
+            {
+                writeGuestWords(
+                    env.rdram.data(),
+                    K_PARAM_ADDR,
+                    semaParam,
+                    std::size(semaParam));
+                R5900Context createCtx{};
+                setRegU32(createCtx, 4, K_PARAM_ADDR);
+                CreateSema(
+                    env.rdram.data(), &createCtx, &env.runtime);
+                return getRegS32(createCtx, 2);
+            };
+            auto createWorker = [&](uint32_t stack)
+            {
+                const uint32_t threadParam[9] = {
+                    0u,
+                    kThreadEntry,
+                    stack,
+                    0x00001000u,
+                    0u,
+                    30u,
+                    0u,
+                    0u,
+                    0u,
+                };
+                writeGuestWords(
+                    env.rdram.data(),
+                    K_PARAM_ADDR,
+                    threadParam,
+                    std::size(threadParam));
+                R5900Context createCtx{};
+                setRegU32(createCtx, 4, K_PARAM_ADDR);
+                CreateThread(
+                    env.rdram.data(), &createCtx, &env.runtime);
+                return getRegS32(createCtx, 2);
+            };
+            auto referThread =
+                [&](int32_t tid, EeThreadStatus &status)
+                {
+                    R5900Context statusCtx{};
+                    setRegU32(
+                        statusCtx,
+                        4,
+                        static_cast<uint32_t>(tid));
+                    setRegU32(statusCtx, 5, K_STATUS_ADDR);
+                    iReferThreadStatus(
+                        env.rdram.data(),
+                        &statusCtx,
+                        &env.runtime);
+                    std::memcpy(
+                        &status,
+                        env.rdram.data() + K_STATUS_ADDR,
+                        sizeof(status));
+                    return getRegS32(statusCtx, 2);
+                };
+            auto startAndWait =
+                [&](int32_t tid, int32_t sid)
+                {
+                    writeGuestU32(
+                        env.rdram.data(),
+                        K_SEMA_ORACLE_STAGE_ADDR,
+                        0u);
+                    writeGuestU32(
+                        env.rdram.data(),
+                        K_SEMA_ORACLE_RETURN_ADDR,
+                        0x7f7f7f7fu);
+                    R5900Context startCtx{};
+                    setRegU32(
+                        startCtx,
+                        4,
+                        static_cast<uint32_t>(tid));
+                    setRegU32(
+                        startCtx,
+                        5,
+                        static_cast<uint32_t>(sid));
+                    StartThread(
+                        env.rdram.data(), &startCtx, &env.runtime);
+                    return waitUntil(
+                        [&]()
+                        {
+                            EeThreadStatus status{};
+                            return readGuestU32(
+                                       env.rdram.data(),
+                                       K_SEMA_ORACLE_STAGE_ADDR) ==
+                                       1u &&
+                                   referThread(tid, status) ==
+                                       THS_WAIT &&
+                                   status.status == THS_WAIT &&
+                                   status.waitType == TSW_SEMA;
+                        },
+                        std::chrono::milliseconds(200));
+                };
+            auto waitForDormant = [&](int32_t tid)
+            {
+                return waitUntil(
+                    [&]()
+                    {
+                        EeThreadStatus status{};
+                        return readGuestU32(
+                                   env.rdram.data(),
+                                   K_SEMA_ORACLE_STAGE_ADDR) ==
+                                   2u &&
+                               referThread(tid, status) ==
+                                   THS_DORMANT;
+                    },
+                    std::chrono::milliseconds(200));
+            };
+            auto restoreMainAndDeleteWorker =
+                [&](int32_t tid)
+                {
+                    R5900Context restoreCtx{};
+                    setRegU32(restoreCtx, 4, 0u);
+                    setRegU32(restoreCtx, 5, 40u);
+                    ChangeThreadPriority(
+                        env.rdram.data(),
+                        &restoreCtx,
+                        &env.runtime);
+                    R5900Context deleteCtx{};
+                    setRegU32(
+                        deleteCtx,
+                        4,
+                        static_cast<uint32_t>(tid));
+                    DeleteThread(
+                        env.rdram.data(),
+                        &deleteCtx,
+                        &env.runtime);
+                    return getRegS32(deleteCtx, 2);
+                };
+
+            const int32_t rawSignalSid = createSema();
+            const int32_t rawSignalTid =
+                createWorker(0x0030E000u);
+            t.IsTrue(
+                startAndWait(rawSignalTid, rawSignalSid),
+                "raw-signal worker should block in WaitSema");
+            {
+                PS2Runtime::GuestExecutionScope guestExecution(
+                    &env.runtime, &env.ctx);
+                R5900Context signalCtx{};
+                setRegU32(
+                    signalCtx,
+                    4,
+                    static_cast<uint32_t>(rawSignalSid));
+                iSignalSema(
+                    env.rdram.data(), &signalCtx, &env.runtime);
+                t.Equals(
+                    getRegS32(signalCtx, 2),
+                    rawSignalSid,
+                    "raw signal should return the semaphore id");
+                t.Equals(
+                    readGuestU32(
+                        env.rdram.data(),
+                        K_SEMA_ORACLE_STAGE_ADDR),
+                    1u,
+                    "raw signal should not dispatch its waiter");
+
+                setRegU32(env.ctx, 4, 0u);
+                setRegU32(env.ctx, 5, 60u);
+                ChangeThreadPriority(
+                    env.rdram.data(), &env.ctx, &env.runtime);
+                t.Equals(
+                    readGuestU32(
+                        env.rdram.data(),
+                        K_SEMA_ORACLE_STAGE_ADDR),
+                    2u,
+                    "the next ordinary boundary should dispatch the raw-signaled waiter");
+            }
+            t.IsTrue(
+                waitForDormant(rawSignalTid),
+                "raw-signaled waiter should finish dormant");
+            t.Equals(
+                static_cast<int32_t>(readGuestU32(
+                    env.rdram.data(), K_SEMA_ORACLE_RETURN_ADDR)),
+                rawSignalSid,
+                "raw-signaled WaitSema should return the semaphore id");
+            t.Equals(
+                restoreMainAndDeleteWorker(rawSignalTid),
+                rawSignalTid,
+                "raw-signaled worker should be deletable");
+            R5900Context deleteRawSignalSemaCtx{};
+            setRegU32(
+                deleteRawSignalSemaCtx,
+                4,
+                static_cast<uint32_t>(rawSignalSid));
+            DeleteSema(
+                env.rdram.data(),
+                &deleteRawSignalSemaCtx,
+                &env.runtime);
+
+            const int32_t ordinarySignalSid = createSema();
+            const int32_t ordinarySignalTid =
+                createWorker(0x0030F000u);
+            t.IsTrue(
+                startAndWait(
+                    ordinarySignalTid,
+                    ordinarySignalSid),
+                "ordinary-signal worker should block in WaitSema");
+            {
+                PS2Runtime::GuestExecutionScope guestExecution(
+                    &env.runtime, &env.ctx);
+                R5900Context signalCtx{};
+                setRegU32(
+                    signalCtx,
+                    4,
+                    static_cast<uint32_t>(ordinarySignalSid));
+                SignalSema(
+                    env.rdram.data(), &signalCtx, &env.runtime);
+                t.Equals(
+                    getRegS32(signalCtx, 2),
+                    ordinarySignalSid,
+                    "ordinary signal should return the semaphore id");
+                t.Equals(
+                    readGuestU32(
+                        env.rdram.data(),
+                        K_SEMA_ORACLE_STAGE_ADDR),
+                    2u,
+                    "ordinary signal should dispatch its higher-priority waiter before returning");
+            }
+            t.IsTrue(
+                waitForDormant(ordinarySignalTid),
+                "ordinary-signaled waiter should finish dormant");
+            t.Equals(
+                restoreMainAndDeleteWorker(
+                    ordinarySignalTid),
+                ordinarySignalTid,
+                "ordinary-signaled worker should be deletable");
+            R5900Context deleteOrdinarySignalSemaCtx{};
+            setRegU32(
+                deleteOrdinarySignalSemaCtx,
+                4,
+                static_cast<uint32_t>(ordinarySignalSid));
+            DeleteSema(
+                env.rdram.data(),
+                &deleteOrdinarySignalSemaCtx,
+                &env.runtime);
+
+            const int32_t rawDeleteSid = createSema();
+            const int32_t rawDeleteTid =
+                createWorker(0x00310000u);
+            t.IsTrue(
+                startAndWait(rawDeleteTid, rawDeleteSid),
+                "raw-delete worker should block in WaitSema");
+            {
+                PS2Runtime::GuestExecutionScope guestExecution(
+                    &env.runtime, &env.ctx);
+                R5900Context deleteCtx{};
+                setRegU32(
+                    deleteCtx,
+                    4,
+                    static_cast<uint32_t>(rawDeleteSid));
+                iDeleteSema(
+                    env.rdram.data(), &deleteCtx, &env.runtime);
+                t.Equals(
+                    getRegS32(deleteCtx, 2),
+                    rawDeleteSid,
+                    "raw semaphore deletion should return its id");
+                t.Equals(
+                    readGuestU32(
+                        env.rdram.data(),
+                        K_SEMA_ORACLE_STAGE_ADDR),
+                    1u,
+                    "raw semaphore deletion should not dispatch its waiter");
+
+                setRegU32(env.ctx, 4, 0u);
+                setRegU32(env.ctx, 5, 60u);
+                ChangeThreadPriority(
+                    env.rdram.data(), &env.ctx, &env.runtime);
+                t.Equals(
+                    readGuestU32(
+                        env.rdram.data(),
+                        K_SEMA_ORACLE_STAGE_ADDR),
+                    2u,
+                    "the next ordinary boundary should dispatch the raw-delete waiter");
+            }
+            t.IsTrue(
+                waitForDormant(rawDeleteTid),
+                "raw-delete waiter should finish dormant");
+            t.Equals(
+                static_cast<int32_t>(readGuestU32(
+                    env.rdram.data(), K_SEMA_ORACLE_RETURN_ADDR)),
+                KE_ERROR,
+                "raw-deleted WaitSema should return generic -1");
+            t.Equals(
+                restoreMainAndDeleteWorker(rawDeleteTid),
+                rawDeleteTid,
+                "raw-delete waiter should remain deletable");
+        });
+
+        tc.Run("priority change and suspend resume preserve EE reschedule boundaries", [](TestCase &t)
+        {
+            notifyRuntimeStop();
+            TestEnv env;
+
+            constexpr uint32_t kMarkerEntry = 0x00256800u;
+            constexpr uint32_t kSleeperEntry = 0x00256C00u;
+            env.runtime.registerFunction(
+                kMarkerEntry, &rescheduleMarkerHandler);
+            env.runtime.registerFunction(
+                kSleeperEntry, &waitSuspendSleepHandler);
+
+            R5900Context mainPriorityCtx{};
+            setRegU32(mainPriorityCtx, 4, 0u);
+            setRegU32(mainPriorityCtx, 5, 40u);
+            ChangeThreadPriority(
+                env.rdram.data(), &mainPriorityCtx, &env.runtime);
+            t.Equals(
+                getRegS32(mainPriorityCtx, 2),
+                0,
+                "main should begin the reschedule matrix at priority 40");
+
+            auto createWorker =
+                [&](uint32_t entry,
+                    uint32_t stack,
+                    uint32_t priority)
+                {
+                    const uint32_t threadParam[9] = {
+                        0u,
+                        entry,
+                        stack,
+                        0x00000800u,
+                        0u,
+                        priority,
+                        0u,
+                        0u,
+                        0u,
+                    };
+                    writeGuestWords(
+                        env.rdram.data(),
+                        K_PARAM_ADDR,
+                        threadParam,
+                        std::size(threadParam));
+                    R5900Context createCtx{};
+                    setRegU32(createCtx, 4, K_PARAM_ADDR);
+                    CreateThread(
+                        env.rdram.data(),
+                        &createCtx,
+                        &env.runtime);
+                    return getRegS32(createCtx, 2);
+                };
+            auto startWorker = [&](int32_t tid)
+            {
+                R5900Context startCtx{};
+                setRegU32(
+                    startCtx,
+                    4,
+                    static_cast<uint32_t>(tid));
+                setRegU32(startCtx, 5, 0u);
+                StartThread(
+                    env.rdram.data(), &startCtx, &env.runtime);
+                return getRegS32(startCtx, 2);
+            };
+            auto referThread =
+                [&](int32_t tid, EeThreadStatus &status)
+                {
+                    R5900Context statusCtx{};
+                    setRegU32(
+                        statusCtx,
+                        4,
+                        static_cast<uint32_t>(tid));
+                    setRegU32(statusCtx, 5, K_STATUS_ADDR);
+                    iReferThreadStatus(
+                        env.rdram.data(),
+                        &statusCtx,
+                        &env.runtime);
+                    std::memcpy(
+                        &status,
+                        env.rdram.data() + K_STATUS_ADDR,
+                        sizeof(status));
+                    return getRegS32(statusCtx, 2);
+                };
+            auto waitForDormant = [&](int32_t tid)
+            {
+                return waitUntil(
+                    [&]()
+                    {
+                        EeThreadStatus status{};
+                        return referThread(tid, status) ==
+                               THS_DORMANT;
+                    },
+                    std::chrono::milliseconds(200));
+            };
+            auto deleteWorker = [&](int32_t tid)
+            {
+                R5900Context deleteCtx{};
+                setRegU32(
+                    deleteCtx,
+                    4,
+                    static_cast<uint32_t>(tid));
+                DeleteThread(
+                    env.rdram.data(), &deleteCtx, &env.runtime);
+                return getRegS32(deleteCtx, 2);
+            };
+            auto restoreMainPriority = [&]()
+            {
+                R5900Context restoreCtx{};
+                setRegU32(restoreCtx, 4, 0u);
+                setRegU32(restoreCtx, 5, 40u);
+                ChangeThreadPriority(
+                    env.rdram.data(),
+                    &restoreCtx,
+                    &env.runtime);
+                return getRegS32(restoreCtx, 2);
+            };
+
+            const int32_t rawPriorityTid =
+                createWorker(
+                    kMarkerEntry, 0x00311000u, 50u);
+            writeGuestU32(
+                env.rdram.data(), K_RESCHEDULE_STAGE_ADDR, 0u);
+            {
+                PS2Runtime::GuestExecutionScope guestExecution(
+                    &env.runtime, &env.ctx);
+                t.Equals(
+                    startWorker(rawPriorityTid),
+                    rawPriorityTid,
+                    "raw-priority worker should start READY");
+
+                R5900Context rawPriorityCtx{};
+                setRegU32(
+                    rawPriorityCtx,
+                    4,
+                    static_cast<uint32_t>(rawPriorityTid));
+                setRegU32(rawPriorityCtx, 5, 30u);
+                iChangeThreadPriority(
+                    env.rdram.data(),
+                    &rawPriorityCtx,
+                    &env.runtime);
+                t.Equals(
+                    getRegS32(rawPriorityCtx, 2),
+                    50,
+                    "raw priority change should return the previous priority");
+                t.Equals(
+                    readGuestU32(
+                        env.rdram.data(),
+                        K_RESCHEDULE_STAGE_ADDR),
+                    0u,
+                    "raw priority change should not dispatch its promoted target");
+
+                EeThreadStatus promotedStatus{};
+                referThread(rawPriorityTid, promotedStatus);
+                t.Equals(
+                    promotedStatus.current_priority,
+                    30,
+                    "raw priority change should publish the new priority synchronously");
+
+                setRegU32(env.ctx, 4, 0u);
+                setRegU32(env.ctx, 5, 60u);
+                ChangeThreadPriority(
+                    env.rdram.data(), &env.ctx, &env.runtime);
+                t.Equals(
+                    getRegS32(env.ctx, 2),
+                    40,
+                    "ordinary main priority change should return its old priority");
+                t.Equals(
+                    readGuestU32(
+                        env.rdram.data(),
+                        K_RESCHEDULE_STAGE_ADDR),
+                    1u,
+                    "the next ordinary boundary should dispatch the raw-promoted target");
+            }
+            t.IsTrue(
+                waitForDormant(rawPriorityTid),
+                "raw-promoted target should finish dormant");
+            t.Equals(
+                restoreMainPriority(),
+                60,
+                "main priority should restore after raw promotion");
+            t.Equals(
+                deleteWorker(rawPriorityTid),
+                rawPriorityTid,
+                "raw-promoted target should be deletable");
+
+            const int32_t ordinaryPriorityTid =
+                createWorker(
+                    kMarkerEntry, 0x00312000u, 50u);
+            writeGuestU32(
+                env.rdram.data(), K_RESCHEDULE_STAGE_ADDR, 0u);
+            {
+                PS2Runtime::GuestExecutionScope guestExecution(
+                    &env.runtime, &env.ctx);
+                t.Equals(
+                    startWorker(ordinaryPriorityTid),
+                    ordinaryPriorityTid,
+                    "ordinary-priority worker should start READY");
+
+                R5900Context ordinaryPriorityCtx{};
+                setRegU32(
+                    ordinaryPriorityCtx,
+                    4,
+                    static_cast<uint32_t>(
+                        ordinaryPriorityTid));
+                setRegU32(ordinaryPriorityCtx, 5, 30u);
+                ChangeThreadPriority(
+                    env.rdram.data(),
+                    &ordinaryPriorityCtx,
+                    &env.runtime);
+                t.Equals(
+                    getRegS32(ordinaryPriorityCtx, 2),
+                    50,
+                    "ordinary priority change should return the previous priority");
+                t.Equals(
+                    readGuestU32(
+                        env.rdram.data(),
+                        K_RESCHEDULE_STAGE_ADDR),
+                    1u,
+                    "ordinary priority change should dispatch its promoted target before returning");
+            }
+            t.IsTrue(
+                waitForDormant(ordinaryPriorityTid),
+                "ordinary-promoted target should finish dormant");
+            t.Equals(
+                deleteWorker(ordinaryPriorityTid),
+                ordinaryPriorityTid,
+                "ordinary-promoted target should be deletable");
+
+            auto waitForSuspended = [&](int32_t tid)
+            {
+                return waitUntil(
+                    [&]()
+                    {
+                        EeThreadStatus status{};
+                        return referThread(tid, status) ==
+                                   THS_SUSPEND &&
+                               status.status == THS_SUSPEND;
+                    },
+                    std::chrono::milliseconds(200));
+            };
+            auto suspendAndPromote =
+                [&](int32_t tid)
+                {
+                    R5900Context suspendCtx{};
+                    setRegU32(
+                        suspendCtx,
+                        4,
+                        static_cast<uint32_t>(tid));
+                    SuspendThread(
+                        env.rdram.data(),
+                        &suspendCtx,
+                        &env.runtime);
+                    t.Equals(
+                        getRegS32(suspendCtx, 2),
+                        tid,
+                        "SuspendThread should return its target id");
+                    t.IsTrue(
+                        waitForSuspended(tid),
+                        "target should settle in SUSPEND");
+
+                    R5900Context priorityCtx{};
+                    setRegU32(
+                        priorityCtx,
+                        4,
+                        static_cast<uint32_t>(tid));
+                    setRegU32(priorityCtx, 5, 30u);
+                    iChangeThreadPriority(
+                        env.rdram.data(),
+                        &priorityCtx,
+                        &env.runtime);
+                    t.Equals(
+                        getRegS32(priorityCtx, 2),
+                        50,
+                        "suspended target promotion should return priority 50");
+                };
+
+            const int32_t rawResumeTid =
+                createWorker(
+                    kMarkerEntry, 0x00313000u, 50u);
+            writeGuestU32(
+                env.rdram.data(), K_RESCHEDULE_STAGE_ADDR, 0u);
+            {
+                PS2Runtime::GuestExecutionScope guestExecution(
+                    &env.runtime, &env.ctx);
+                t.Equals(
+                    startWorker(rawResumeTid),
+                    rawResumeTid,
+                    "raw-resume worker should start");
+                suspendAndPromote(rawResumeTid);
+
+                R5900Context resumeCtx{};
+                setRegU32(
+                    resumeCtx,
+                    4,
+                    static_cast<uint32_t>(rawResumeTid));
+                iResumeThread(
+                    env.rdram.data(), &resumeCtx, &env.runtime);
+                t.Equals(
+                    getRegS32(resumeCtx, 2),
+                    rawResumeTid,
+                    "raw resume should return its target id");
+                t.Equals(
+                    readGuestU32(
+                        env.rdram.data(),
+                        K_RESCHEDULE_STAGE_ADDR),
+                    0u,
+                    "raw resume should not dispatch its promoted target");
+
+                setRegU32(env.ctx, 4, 0u);
+                setRegU32(env.ctx, 5, 60u);
+                ChangeThreadPriority(
+                    env.rdram.data(), &env.ctx, &env.runtime);
+                t.Equals(
+                    readGuestU32(
+                        env.rdram.data(),
+                        K_RESCHEDULE_STAGE_ADDR),
+                    1u,
+                    "the next ordinary boundary should dispatch the raw-resumed target");
+            }
+            t.IsTrue(
+                waitForDormant(rawResumeTid),
+                "raw-resumed target should finish dormant");
+            t.Equals(
+                restoreMainPriority(),
+                60,
+                "main priority should restore after raw resume");
+            t.Equals(
+                deleteWorker(rawResumeTid),
+                rawResumeTid,
+                "raw-resumed target should be deletable");
+
+            const int32_t ordinaryResumeTid =
+                createWorker(
+                    kMarkerEntry, 0x00314000u, 50u);
+            writeGuestU32(
+                env.rdram.data(), K_RESCHEDULE_STAGE_ADDR, 0u);
+            {
+                PS2Runtime::GuestExecutionScope guestExecution(
+                    &env.runtime, &env.ctx);
+                t.Equals(
+                    startWorker(ordinaryResumeTid),
+                    ordinaryResumeTid,
+                    "ordinary-resume worker should start");
+                suspendAndPromote(ordinaryResumeTid);
+
+                R5900Context resumeCtx{};
+                setRegU32(
+                    resumeCtx,
+                    4,
+                    static_cast<uint32_t>(
+                        ordinaryResumeTid));
+                ResumeThread(
+                    env.rdram.data(), &resumeCtx, &env.runtime);
+                t.Equals(
+                    getRegS32(resumeCtx, 2),
+                    ordinaryResumeTid,
+                    "ordinary resume should return its target id");
+                t.Equals(
+                    readGuestU32(
+                        env.rdram.data(),
+                        K_RESCHEDULE_STAGE_ADDR),
+                    1u,
+                    "ordinary resume should dispatch its promoted target before returning");
+            }
+            t.IsTrue(
+                waitForDormant(ordinaryResumeTid),
+                "ordinary-resumed target should finish dormant");
+            t.Equals(
+                deleteWorker(ordinaryResumeTid),
+                ordinaryResumeTid,
+                "ordinary-resumed target should be deletable");
+
+            const int32_t sleeperTid =
+                createWorker(
+                    kSleeperEntry, 0x00315000u, 30u);
+            writeGuestU32(
+                env.rdram.data(), K_WAITSUSPEND_STAGE_ADDR, 0u);
+            t.Equals(
+                startWorker(sleeperTid),
+                sleeperTid,
+                "raw-suspend candidate should start");
+            t.IsTrue(
+                waitUntil(
+                    [&]()
+                    {
+                        EeThreadStatus status{};
+                        return readGuestU32(
+                                   env.rdram.data(),
+                                   K_WAITSUSPEND_STAGE_ADDR) ==
+                                   1u &&
+                               referThread(sleeperTid, status) ==
+                                   THS_WAIT &&
+                               status.waitType == TSW_SLEEP;
+                    },
+                    std::chrono::milliseconds(200)),
+                "raw-suspend candidate should block in SleepThread");
+
+            const int32_t rawSuspendTid =
+                createWorker(
+                    kMarkerEntry, 0x00316000u, 50u);
+            writeGuestU32(
+                env.rdram.data(), K_RESCHEDULE_STAGE_ADDR, 0u);
+            {
+                PS2Runtime::GuestExecutionScope guestExecution(
+                    &env.runtime, &env.ctx);
+                t.Equals(
+                    startWorker(rawSuspendTid),
+                    rawSuspendTid,
+                    "raw-suspend target should start");
+
+                R5900Context wakeCtx{};
+                setRegU32(
+                    wakeCtx,
+                    4,
+                    static_cast<uint32_t>(sleeperTid));
+                iWakeupThread(
+                    env.rdram.data(), &wakeCtx, &env.runtime);
+                t.Equals(
+                    getRegS32(wakeCtx, 2),
+                    sleeperTid,
+                    "raw wake should make the scheduling candidate READY");
+                t.Equals(
+                    readGuestU32(
+                        env.rdram.data(),
+                        K_WAITSUSPEND_STAGE_ADDR),
+                    1u,
+                    "raw wake should defer the scheduling candidate");
+
+                R5900Context suspendCtx{};
+                setRegU32(
+                    suspendCtx,
+                    4,
+                    static_cast<uint32_t>(rawSuspendTid));
+                t.IsTrue(
+                    callSyscall(
+                        static_cast<uint32_t>(-0x38),
+                        env.rdram.data(),
+                        &suspendCtx,
+                        &env.runtime),
+                    "raw suspend syscall should dispatch");
+                t.Equals(
+                    getRegS32(suspendCtx, 2),
+                    rawSuspendTid,
+                    "raw suspend should return its target id");
+                t.Equals(
+                    readGuestU32(
+                        env.rdram.data(),
+                        K_WAITSUSPEND_STAGE_ADDR),
+                    1u,
+                    "raw suspend should not dispatch an unrelated READY candidate");
+                t.IsTrue(
+                    waitForSuspended(rawSuspendTid),
+                    "raw suspend target should settle in SUSPEND");
+
+                setRegU32(env.ctx, 4, 0u);
+                setRegU32(env.ctx, 5, 60u);
+                ChangeThreadPriority(
+                    env.rdram.data(), &env.ctx, &env.runtime);
+                t.Equals(
+                    readGuestU32(
+                        env.rdram.data(),
+                        K_WAITSUSPEND_STAGE_ADDR),
+                    2u,
+                    "the next ordinary boundary should dispatch the raw-woken candidate");
+
+                R5900Context resumeCtx{};
+                setRegU32(
+                    resumeCtx,
+                    4,
+                    static_cast<uint32_t>(rawSuspendTid));
+                iResumeThread(
+                    env.rdram.data(), &resumeCtx, &env.runtime);
+                t.Equals(
+                    getRegS32(resumeCtx, 2),
+                    rawSuspendTid,
+                    "raw resume should return the raw-suspended target");
+                t.Equals(
+                    readGuestU32(
+                        env.rdram.data(),
+                        K_RESCHEDULE_STAGE_ADDR),
+                    0u,
+                    "raw resume should keep its own dispatch deferred");
+
+                setRegU32(env.ctx, 4, 0u);
+                setRegU32(env.ctx, 5, 70u);
+                ChangeThreadPriority(
+                    env.rdram.data(), &env.ctx, &env.runtime);
+                t.Equals(
+                    readGuestU32(
+                        env.rdram.data(),
+                        K_RESCHEDULE_STAGE_ADDR),
+                    1u,
+                    "the next ordinary boundary should dispatch the raw-resumed target");
+            }
+            t.IsTrue(
+                waitForDormant(sleeperTid),
+                "raw-woken candidate should finish dormant");
+            t.IsTrue(
+                waitForDormant(rawSuspendTid),
+                "raw-suspended and resumed target should finish dormant");
+            t.Equals(
+                restoreMainPriority(),
+                70,
+                "main priority should restore after raw suspend");
+            t.Equals(
+                deleteWorker(sleeperTid),
+                sleeperTid,
+                "raw-woken candidate should be deletable");
+            t.Equals(
+                deleteWorker(rawSuspendTid),
+                rawSuspendTid,
+                "raw-suspended target should be deletable");
         });
 
         tc.Run("semaphore EE layout covers poll, signal overflow, and status", [](TestCase &t)
