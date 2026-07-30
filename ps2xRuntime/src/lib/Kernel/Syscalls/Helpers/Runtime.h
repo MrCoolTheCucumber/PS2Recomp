@@ -14,6 +14,41 @@ static void throwIfTerminated(const std::shared_ptr<ThreadInfo> &info)
     }
 }
 
+// A legacy host worker may observe READY, SUSPEND, or a retained wait
+// completion before it acquires the one guest-execution boundary. Publish RUN
+// only after that boundary is actually owned, and re-check suspension there
+// so an external suspend cannot race a worker's earlier host-side test.
+static bool publishRunningAtGuestBoundary(
+    const std::shared_ptr<ThreadInfo> &info)
+{
+    if (!info)
+    {
+        return true;
+    }
+
+    std::lock_guard<std::mutex> lock(info->m);
+    if (info->terminated.load())
+    {
+        throw ThreadExitException();
+    }
+
+    const EeThreadGuestStateSnapshot &guest =
+        info->guestState.snapshot();
+    if (guest.suspendCount != 0 ||
+        guest.status == EeThreadGuestState::kSuspend ||
+        guest.status == EeThreadGuestState::kWaitSuspend ||
+        guest.status == EeThreadGuestState::kWait ||
+        guest.status == EeThreadGuestState::kDormant)
+    {
+        return false;
+    }
+    if (guest.status == EeThreadGuestState::kReady)
+    {
+        info->guestState.publishRunning();
+    }
+    return true;
+}
+
 // Condition-variable waits in the EE runtime must release the global guest
 // execution mutex, but must not reacquire it while still holding the local
 // wait-object mutex. Reacquiring guest execution while holding a semaphore,
@@ -73,10 +108,6 @@ static void waitWhileSuspended(const std::shared_ptr<ThreadInfo> &info, PS2Runti
             [&]()
             {
                 terminated = info->terminated.load();
-                if (!terminated)
-                {
-                    info->guestState.publishRunning();
-                }
             });
 
         if (terminated)

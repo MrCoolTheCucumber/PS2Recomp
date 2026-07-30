@@ -444,12 +444,23 @@ namespace ps2_syscalls
                         }
                         else
                         {
-                            wasLinked =
-                                info->guestState.finishWait(
-                                    EeThreadWaitQueue::Semaphore,
-                                    TSW_SEMA,
-                                    sid,
-                                    false);
+                            const EeThreadGuestStateSnapshot
+                                &guest =
+                                    info->guestState.snapshot();
+                            const bool retainedCompletion =
+                                guest.waitCompletionPending &&
+                                guest.waitType == TSW_SEMA &&
+                                guest.waitId == sid;
+                            if (!retainedCompletion)
+                            {
+                                wasLinked =
+                                    info->guestState.finishWait(
+                                        EeThreadWaitQueue::
+                                            Semaphore,
+                                        TSW_SEMA,
+                                        sid,
+                                        false);
+                            }
                         }
                         if (wasLinked &&
                             sema->waiters > 0)
@@ -521,6 +532,7 @@ namespace ps2_syscalls
             lock.unlock();
         }
         waitWhileSuspended(info, runtime);
+        (void)publishRunningAtGuestBoundary(info);
         setReturnS32(ctx, ret);
     }
 
@@ -934,6 +946,7 @@ namespace ps2_syscalls
             }
         }
         waitWhileSuspended(tInfo, runtime);
+        (void)publishRunningAtGuestBoundary(tInfo);
         setReturnS32(ctx, ret);
     }
 

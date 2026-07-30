@@ -584,12 +584,6 @@ namespace ps2_syscalls
                 {
                     info->guestState.makeDormant();
                 }
-                else if (
-                    info->guestState.snapshot().suspendCount ==
-                    0)
-                {
-                    info->guestState.publishRunning();
-                }
             }
 
             uint32_t threadSp = callerSp;
@@ -688,11 +682,24 @@ namespace ps2_syscalls
                         throw ThreadExitException();
                     }
                     uint64_t handoffBaseline = 0u;
+                    bool suspendedAtBoundary = false;
                     {
                         PS2Runtime::GuestExecutionScope guestExecution(
                             runtime, threadCtx);
-                        runtime->executeGuestStep(rdram, threadCtx, step);
-                        handoffBaseline = runtime->guestExecutionHandoffEpochSnapshot();
+                        suspendedAtBoundary =
+                            !publishRunningAtGuestBoundary(info);
+                        if (!suspendedAtBoundary)
+                        {
+                            runtime->executeGuestStep(
+                                rdram, threadCtx, step);
+                            handoffBaseline =
+                                runtime
+                                    ->guestExecutionHandoffEpochSnapshot();
+                        }
+                    }
+                    if (suspendedAtBoundary)
+                    {
+                        continue;
                     }
                     runtime->waitForGuestExecutionHandoff(handoffBaseline);
                 }
@@ -1015,16 +1022,13 @@ namespace ps2_syscalls
                 [&]()
                 {
                     terminated = info->terminated.load();
-                    if (!terminated)
-                    {
-                        info->guestState.publishRunning();
-                    }
                 });
 
             if (terminated)
             {
                 throw ThreadExitException();
             }
+            (void)publishRunningAtGuestBoundary(info);
         }
 
         setReturnS32(ctx, tid);
@@ -1278,6 +1282,7 @@ namespace ps2_syscalls
             }
         }
         waitWhileSuspended(info, runtime);
+        (void)publishRunningAtGuestBoundary(info);
         setReturnS32(ctx, ret);
     }
 
