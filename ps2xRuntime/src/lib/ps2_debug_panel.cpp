@@ -1462,11 +1462,12 @@ namespace
         ImGui::TextUnformatted(bytes);
     }
 
-    void drawPadTab()
+    void drawPadTab(PS2Runtime &runtime)
     {
-        const ps2_stubs::PadDebugSnapshot snapshot = ps2_stubs::getPadDebugSnapshot();
+        const ps2_stubs::PadDebugSnapshot snapshot =
+            ps2_stubs::getPadDebugSnapshot(&runtime);
 
-        ImGui::SeparatorText("PAD global state");
+        ImGui::SeparatorText("PAD runtime state");
         ImGui::Text("override=%u readLogCount=%d", snapshot.overrideEnabled ? 1u : 0u, snapshot.readLogCount);
         ImGui::SameLine();
         ImGui::Text("override buttons=0x%04X lx=%u ly=%u rx=%u ry=%u",
@@ -2303,7 +2304,7 @@ void PS2DebugPanel::draw(PS2Runtime &runtime)
             }
             if (ImGui::BeginTabItem("PAD"))
             {
-                drawPadTab();
+                drawPadTab(runtime);
                 ImGui::EndTabItem();
             }
             if (ImGui::BeginTabItem("File/CD"))

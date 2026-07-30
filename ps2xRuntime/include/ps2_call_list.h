@@ -695,7 +695,8 @@
     /* Game/middleware */
 
 // Test hooks: override pad input for scePadRead.
-#define PS2_TEST_HOOK_LIST(X)                                         \
-    X(setPadOverrideState, (uint16_t buttons, uint8_t lx, uint8_t ly, \
-                            uint8_t rx, uint8_t ry))                  \
-    X(clearPadOverrideState, (void))
+#define PS2_TEST_HOOK_LIST(X)                                      \
+    X(setPadOverrideState, (PS2Runtime *runtime, uint16_t buttons, \
+                            uint8_t lx, uint8_t ly, uint8_t rx,     \
+                            uint8_t ry))                            \
+    X(clearPadOverrideState, (PS2Runtime *runtime))

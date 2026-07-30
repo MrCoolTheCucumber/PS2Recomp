@@ -7,6 +7,7 @@
 
 namespace ps2_stubs
 {
+    void resetPadState(PS2Runtime *runtime);
     void PadSyncCallback(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
     void scePadEnd(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
     void scePadEnterPressMode(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
@@ -79,7 +80,14 @@ namespace ps2_stubs
         PadDebugPortSnapshot ports[kPadDebugPortCount][kPadDebugSlotCount]{};
     };
 
-    PadDebugSnapshot getPadDebugSnapshot();
-    void setPadOverrideState(uint16_t buttons, uint8_t lx, uint8_t ly, uint8_t rx, uint8_t ry);
-    void clearPadOverrideState();
+    PadDebugSnapshot getPadDebugSnapshot(
+        PS2Runtime *runtime);
+    void setPadOverrideState(
+        PS2Runtime *runtime,
+        uint16_t buttons,
+        uint8_t lx,
+        uint8_t ly,
+        uint8_t rx,
+        uint8_t ry);
+    void clearPadOverrideState(PS2Runtime *runtime);
 }

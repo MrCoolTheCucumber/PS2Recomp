@@ -36,27 +36,43 @@ namespace
         ctx.r[reg] = _mm_set_epi64x(0, static_cast<int64_t>(value));
     }
 
-    void openPadPort(R5900Context &ctx, std::vector<uint8_t> &rdram, uint32_t port = 0, uint32_t slot = 0)
+    void openPadPort(
+        PS2Runtime &runtime,
+        R5900Context &ctx,
+        std::vector<uint8_t> &rdram,
+        uint32_t port = 0,
+        uint32_t slot = 0)
     {
         setRegU32(ctx, 4, port);
         setRegU32(ctx, 5, slot);
         setRegU32(ctx, 6, kPadDataAddr + 0x200u);
-        ps2_stubs::scePadPortOpen(rdram.data(), &ctx, nullptr);
+        ps2_stubs::scePadPortOpen(
+            rdram.data(), &ctx, &runtime);
     }
 
-    void closePadPort(R5900Context &ctx, std::vector<uint8_t> &rdram, uint32_t port = 0, uint32_t slot = 0)
+    void closePadPort(
+        PS2Runtime &runtime,
+        R5900Context &ctx,
+        std::vector<uint8_t> &rdram,
+        uint32_t port = 0,
+        uint32_t slot = 0)
     {
         setRegU32(ctx, 4, port);
         setRegU32(ctx, 5, slot);
-        ps2_stubs::scePadPortClose(rdram.data(), &ctx, nullptr);
+        ps2_stubs::scePadPortClose(
+            rdram.data(), &ctx, &runtime);
     }
 
-    void runPadRead(R5900Context &ctx, std::vector<uint8_t> &rdram)
+    void runPadRead(
+        PS2Runtime &runtime,
+        R5900Context &ctx,
+        std::vector<uint8_t> &rdram)
     {
         setRegU32(ctx, 4, 0u);
         setRegU32(ctx, 5, 0u);
         setRegU32(ctx, 6, kPadDataAddr); // a2
-        ps2_stubs::scePadRead(rdram.data(), &ctx, nullptr);
+        ps2_stubs::scePadRead(
+            rdram.data(), &ctx, &runtime);
     }
 
     uint16_t readButtons(const std::vector<uint8_t> &rdram)
@@ -165,20 +181,107 @@ void register_pad_input_tests()
                     getRegU32(&secondCtx, 2)),
                 6,
                 "ending one runtime's pad library must not disconnect another runtime");
+
+            setRegU32(firstCtx, 4, 0u);
+            setRegU32(firstCtx, 5, 0u);
+            setRegU32(firstCtx, 6, kFirstDmaAddr);
+            ps2_stubs::scePadPortOpen(
+                firstRdram.data(), &firstCtx, &first);
+            ps2_stubs::setPadOverrideState(
+                &first,
+                static_cast<uint16_t>(
+                    0xFFFFu & ~kPadBtnCross),
+                0x10u,
+                0x20u,
+                0x30u,
+                0x40u);
+            ps2_stubs::setPadOverrideState(
+                &second,
+                static_cast<uint16_t>(
+                    0xFFFFu & ~kPadBtnStart),
+                0x50u,
+                0x60u,
+                0x70u,
+                0x80u);
+
+            ps2_syscalls::notifyRuntimeStop(&first);
+
+            setRegU32(firstCtx, 4, 0u);
+            setRegU32(firstCtx, 5, 0u);
+            ps2_stubs::scePadGetState(
+                firstRdram.data(), &firstCtx, &first);
+            t.Equals(
+                static_cast<int32_t>(
+                    getRegU32(&firstCtx, 2)),
+                0,
+                "stopping a runtime should disconnect only that runtime's pad ports");
+
+            setRegU32(secondCtx, 4, 0u);
+            setRegU32(secondCtx, 5, 0u);
+            ps2_stubs::scePadGetState(
+                secondRdram.data(), &secondCtx, &second);
+            t.Equals(
+                static_cast<int32_t>(
+                    getRegU32(&secondCtx, 2)),
+                6,
+                "stopping one runtime must preserve another runtime's pad ports");
+
+            const ps2_stubs::PadDebugSnapshot
+                firstSnapshot =
+                    ps2_stubs::getPadDebugSnapshot(
+                        &first);
+            const ps2_stubs::PadDebugSnapshot
+                secondSnapshot =
+                    ps2_stubs::getPadDebugSnapshot(
+                        &second);
+            t.IsTrue(
+                !firstSnapshot.overrideEnabled,
+                "stopping a runtime should clear its pad override");
+            t.IsTrue(
+                secondSnapshot.overrideEnabled,
+                "stopping one runtime must preserve another runtime's pad override");
+            t.Equals(
+                secondSnapshot.overrideButtons,
+                static_cast<uint16_t>(
+                    0xFFFFu & ~kPadBtnStart),
+                "each runtime should retain its own override payload");
+
+            ps2_stubs::scePadGetFrameCount(
+                firstRdram.data(), &firstCtx, &first);
+            ps2_stubs::scePadGetFrameCount(
+                secondRdram.data(), &secondCtx, &second);
+            t.Equals(
+                getRegU32(&firstCtx, 2),
+                0u,
+                "stopping a runtime should reset its pad frame count");
+            t.Equals(
+                getRegU32(&secondCtx, 2),
+                1u,
+                "stopping one runtime must preserve another runtime's pad frame count");
+
+            ps2_syscalls::notifyRuntimeStop(&second);
         });
 
         tc.Run("scePadRead uses override state", [](TestCase &t)
                {
+            PS2Runtime runtime;
             std::vector<uint8_t> rdram(PS2_RAM_SIZE, 0);
             R5900Context ctx;
 
-            ps2_stubs::scePadInit(rdram.data(), &ctx, nullptr);
-            openPadPort(ctx, rdram);
+            ps2_stubs::scePadInit(
+                rdram.data(), &ctx, &runtime);
+            openPadPort(runtime, ctx, rdram);
 
             const uint16_t buttons = static_cast<uint16_t>(0xFFFFu & ~kPadBtnCross & ~kPadBtnStart);
-            ps2_stubs::setPadOverrideState(buttons, 0x00, 0xFF, 0x10, 0xEE);
+            ps2_stubs::setPadOverrideState(
+                &runtime,
+                buttons,
+                0x00,
+                0xFF,
+                0x10,
+                0xEE);
 
-            runPadRead(ctx, rdram);
+            runPadRead(runtime, ctx, rdram);
 
             t.Equals(static_cast<uint32_t>(getRegU32(&ctx, 2)), static_cast<uint32_t>(1), "scePadRead should return 1");
             t.Equals(readButtons(rdram), buttons, "button bitmask should match override state");
@@ -188,12 +291,13 @@ void register_pad_input_tests()
             t.Equals(data[6], static_cast<uint8_t>(0x00), "lx should match override");
             t.Equals(data[7], static_cast<uint8_t>(0xFF), "ly should match override");
 
-            ps2_stubs::clearPadOverrideState();
-            closePadPort(ctx, rdram);
+            ps2_stubs::clearPadOverrideState(&runtime);
+            closePadPort(runtime, ctx, rdram);
         });
 
         tc.Run("scePad2Read emits the 18-byte libpad2 payload", [](TestCase &t)
                {
+            PS2Runtime runtime;
             std::vector<uint8_t> rdram(PS2_RAM_SIZE, 0xCC);
             R5900Context ctx;
 
@@ -201,11 +305,18 @@ void register_pad_input_tests()
                                                             ~kPadBtnStart &
                                                             ~kPadBtnLeft &
                                                             ~kPadBtnCross);
-            ps2_stubs::setPadOverrideState(buttons, 0x11, 0x22, 0x33, 0x44);
+            ps2_stubs::setPadOverrideState(
+                &runtime,
+                buttons,
+                0x11,
+                0x22,
+                0x33,
+                0x44);
 
             setRegU32(ctx, 4, 0u);
             setRegU32(ctx, 5, kPadDataAddr);
-            ps2_stubs::scePad2Read(rdram.data(), &ctx, nullptr);
+            ps2_stubs::scePad2Read(
+                rdram.data(), &ctx, &runtime);
 
             const uint8_t *data = rdram.data() + kPadDataAddr;
             t.Equals(static_cast<uint32_t>(getRegU32(&ctx, 2)), static_cast<uint32_t>(18),
@@ -224,7 +335,7 @@ void register_pad_input_tests()
             t.Equals(data[17], static_cast<uint8_t>(0x00), "the payload should end after twelve pressure bytes");
             t.Equals(data[18], static_cast<uint8_t>(0xCC), "scePad2Read should write exactly 18 bytes");
 
-            ps2_stubs::clearPadOverrideState();
+            ps2_stubs::clearPadOverrideState(&runtime);
         });
 
         tc.Run("scePad2GetState reports a connected host-backed socket", [](TestCase &t)
@@ -284,13 +395,21 @@ void register_pad_input_tests()
 
         tc.Run("scePad2Read matches the neutral PCSX2 packet and rejects null output", [](TestCase &t)
                {
+            PS2Runtime runtime;
             std::vector<uint8_t> rdram(PS2_RAM_SIZE, 0);
             R5900Context ctx;
 
-            ps2_stubs::setPadOverrideState(0xFFFFu, 0x7F, 0x7F, 0x7F, 0x7F);
+            ps2_stubs::setPadOverrideState(
+                &runtime,
+                0xFFFFu,
+                0x7F,
+                0x7F,
+                0x7F,
+                0x7F);
             setRegU32(ctx, 4, 0u);
             setRegU32(ctx, 5, kPadDataAddr);
-            ps2_stubs::scePad2Read(rdram.data(), &ctx, nullptr);
+            ps2_stubs::scePad2Read(
+                rdram.data(), &ctx, &runtime);
 
             const uint8_t *data = rdram.data() + kPadDataAddr;
             t.Equals(data[0], static_cast<uint8_t>(0xFF), "neutral Pad2 packet byte 0 should match PCSX2");
@@ -305,11 +424,12 @@ void register_pad_input_tests()
             }
 
             setRegU32(ctx, 5, 0u);
-            ps2_stubs::scePad2Read(rdram.data(), &ctx, nullptr);
+            ps2_stubs::scePad2Read(
+                rdram.data(), &ctx, &runtime);
             t.Equals(static_cast<uint32_t>(getRegU32(&ctx, 2)), static_cast<uint32_t>(-1),
                      "scePad2Read should reject a null output pointer");
 
-            ps2_stubs::clearPadOverrideState();
+            ps2_stubs::clearPadOverrideState(&runtime);
         });
 
         tc.Run("keyboard buttons remain active when a gamepad is connected", [](TestCase &t)
@@ -366,11 +486,13 @@ void register_pad_input_tests()
 
         tc.Run("scePadRead button bits are active-low", [](TestCase &t)
                {
+            PS2Runtime runtime;
             std::vector<uint8_t> rdram(PS2_RAM_SIZE, 0);
             R5900Context ctx;
 
-            ps2_stubs::scePadInit(rdram.data(), &ctx, nullptr);
-            openPadPort(ctx, rdram);
+            ps2_stubs::scePadInit(
+                rdram.data(), &ctx, &runtime);
+            openPadPort(runtime, ctx, rdram);
 
             struct ButtonCase
             {
@@ -399,52 +521,66 @@ void register_pad_input_tests()
             for (const auto &entry : cases)
             {
                 const uint16_t buttons = static_cast<uint16_t>(0xFFFFu & ~entry.mask);
-                ps2_stubs::setPadOverrideState(buttons, 0x80, 0x80, 0x80, 0x80);
-                runPadRead(ctx, rdram);
+                ps2_stubs::setPadOverrideState(
+                    &runtime,
+                    buttons,
+                    0x80,
+                    0x80,
+                    0x80,
+                    0x80);
+                runPadRead(runtime, ctx, rdram);
 
                 t.Equals(static_cast<uint32_t>(getRegU32(&ctx, 2)), static_cast<uint32_t>(1), "scePadRead should succeed for opened ports");
                 const uint16_t mask = readButtons(rdram);
                 t.IsTrue((mask & entry.mask) == 0, std::string("button should be active-low: ").append(entry.name));
             }
 
-            ps2_stubs::clearPadOverrideState();
-            closePadPort(ctx, rdram);
+            ps2_stubs::clearPadOverrideState(&runtime);
+            closePadPort(runtime, ctx, rdram);
         });
 
         tc.Run("scePadGetButtonMask returns all buttons", [](TestCase &t)
                {
+            PS2Runtime runtime;
             R5900Context ctx;
-            ps2_stubs::scePadGetButtonMask(nullptr, &ctx, nullptr);
+            ps2_stubs::scePadGetButtonMask(
+                nullptr, &ctx, &runtime);
             t.Equals(static_cast<uint32_t>(getRegU32(&ctx, 2)), static_cast<uint32_t>(0xFFFF), "button mask should be 0xFFFF");
         });
 
         tc.Run("basic pad init/port/state functions return expected values", [](TestCase &t)
                {
+            PS2Runtime runtime;
             std::vector<uint8_t> rdram(PS2_RAM_SIZE, 0);
             R5900Context ctx;
 
-            ps2_stubs::scePadInit(rdram.data(), &ctx, nullptr);
+            ps2_stubs::scePadInit(
+                rdram.data(), &ctx, &runtime);
             t.Equals(static_cast<uint32_t>(getRegU32(&ctx, 2)), static_cast<uint32_t>(1), "scePadInit should succeed");
 
-            ps2_stubs::scePadInit2(rdram.data(), &ctx, nullptr);
+            ps2_stubs::scePadInit2(
+                rdram.data(), &ctx, &runtime);
             t.Equals(static_cast<uint32_t>(getRegU32(&ctx, 2)), static_cast<uint32_t>(1), "scePadInit2 should succeed");
 
             setRegU32(ctx, 4, 0u);
             setRegU32(ctx, 5, 0u);
-            ps2_stubs::scePadGetState(rdram.data(), &ctx, nullptr);
+            ps2_stubs::scePadGetState(
+                rdram.data(), &ctx, &runtime);
             t.Equals(static_cast<uint32_t>(getRegU32(&ctx, 2)), static_cast<uint32_t>(0), "closed port should report DISCONNECTED");
 
-            openPadPort(ctx, rdram);
+            openPadPort(runtime, ctx, rdram);
             t.Equals(static_cast<uint32_t>(getRegU32(&ctx, 2)), static_cast<uint32_t>(1), "scePadPortOpen should succeed");
 
             setRegU32(ctx, 4, 0u);
             setRegU32(ctx, 5, 0u);
-            ps2_stubs::scePadGetState(rdram.data(), &ctx, nullptr);
+            ps2_stubs::scePadGetState(
+                rdram.data(), &ctx, &runtime);
             t.Equals(static_cast<uint32_t>(getRegU32(&ctx, 2)), static_cast<uint32_t>(6), "scePadGetState should return STABLE");
 
             setRegU32(ctx, 4, 0u);
             setRegU32(ctx, 5, 0u);
-            ps2_stubs::scePadGetReqState(rdram.data(), &ctx, nullptr);
+            ps2_stubs::scePadGetReqState(
+                rdram.data(), &ctx, &runtime);
             t.Equals(static_cast<uint32_t>(getRegU32(&ctx, 2)), static_cast<uint32_t>(0), "scePadGetReqState should return completed");
 
             ps2_stubs::scePadGetPortMax(rdram.data(), &ctx, nullptr);
@@ -457,68 +593,80 @@ void register_pad_input_tests()
             ps2_stubs::scePadGetModVersion(rdram.data(), &ctx, nullptr);
             t.Equals(static_cast<uint32_t>(getRegU32(&ctx, 2)), static_cast<uint32_t>(0x0200), "scePadGetModVersion should be 0x0200");
 
-            closePadPort(ctx, rdram);
+            closePadPort(runtime, ctx, rdram);
             t.Equals(static_cast<uint32_t>(getRegU32(&ctx, 2)), static_cast<uint32_t>(1), "scePadPortClose should succeed");
 
             setRegU32(ctx, 4, 0u);
             setRegU32(ctx, 5, 0u);
-            ps2_stubs::scePadGetState(rdram.data(), &ctx, nullptr);
+            ps2_stubs::scePadGetState(
+                rdram.data(), &ctx, &runtime);
             t.Equals(static_cast<uint32_t>(getRegU32(&ctx, 2)), static_cast<uint32_t>(0), "closed port should return DISCONNECTED after close");
         });
 
         tc.Run("pad command state reports EXECCMD once before returning STABLE", [](TestCase &t)
                {
+            PS2Runtime runtime;
             std::vector<uint8_t> rdram(PS2_RAM_SIZE, 0);
             R5900Context ctx;
 
-            ps2_stubs::scePadInit(rdram.data(), &ctx, nullptr);
-            openPadPort(ctx, rdram);
+            ps2_stubs::scePadInit(
+                rdram.data(), &ctx, &runtime);
+            openPadPort(runtime, ctx, rdram);
 
             setRegU32(ctx, 4, 0u);
             setRegU32(ctx, 5, 0u);
             setRegU32(ctx, 6, 1u);
             setRegU32(ctx, 7, 3u);
-            ps2_stubs::scePadSetMainMode(rdram.data(), &ctx, nullptr);
+            ps2_stubs::scePadSetMainMode(
+                rdram.data(), &ctx, &runtime);
             t.Equals(static_cast<uint32_t>(getRegU32(&ctx, 2)), static_cast<uint32_t>(1), "scePadSetMainMode should succeed");
 
             setRegU32(ctx, 4, 0u);
             setRegU32(ctx, 5, 0u);
-            ps2_stubs::scePadGetState(rdram.data(), &ctx, nullptr);
+            ps2_stubs::scePadGetState(
+                rdram.data(), &ctx, &runtime);
             t.Equals(static_cast<uint32_t>(getRegU32(&ctx, 2)), static_cast<uint32_t>(5), "first state after mode command should be EXECCMD");
 
             setRegU32(ctx, 4, 0u);
             setRegU32(ctx, 5, 0u);
-            ps2_stubs::scePadGetState(rdram.data(), &ctx, nullptr);
+            ps2_stubs::scePadGetState(
+                rdram.data(), &ctx, &runtime);
             t.Equals(static_cast<uint32_t>(getRegU32(&ctx, 2)), static_cast<uint32_t>(6), "second state after mode command should return STABLE");
 
             setRegU32(ctx, 4, 0u);
             setRegU32(ctx, 5, 0u);
-            ps2_stubs::scePadEnterPressMode(rdram.data(), &ctx, nullptr);
+            ps2_stubs::scePadEnterPressMode(
+                rdram.data(), &ctx, &runtime);
             t.Equals(static_cast<uint32_t>(getRegU32(&ctx, 2)), static_cast<uint32_t>(1), "scePadEnterPressMode should succeed");
 
             setRegU32(ctx, 4, 0u);
             setRegU32(ctx, 5, 0u);
-            ps2_stubs::scePadGetState(rdram.data(), &ctx, nullptr);
+            ps2_stubs::scePadGetState(
+                rdram.data(), &ctx, &runtime);
             t.Equals(static_cast<uint32_t>(getRegU32(&ctx, 2)), static_cast<uint32_t>(5), "first state after press-mode command should be EXECCMD");
 
             setRegU32(ctx, 4, 0u);
             setRegU32(ctx, 5, 0u);
-            ps2_stubs::scePadGetState(rdram.data(), &ctx, nullptr);
+            ps2_stubs::scePadGetState(
+                rdram.data(), &ctx, &runtime);
             t.Equals(static_cast<uint32_t>(getRegU32(&ctx, 2)), static_cast<uint32_t>(6), "second state after press-mode command should return STABLE");
 
-            closePadPort(ctx, rdram);
+            closePadPort(runtime, ctx, rdram);
         });
 
         tc.Run("pad info and mode helpers return consistent values", [](TestCase &t)
                {
+            PS2Runtime runtime;
             std::vector<uint8_t> rdram(PS2_RAM_SIZE, 0);
             R5900Context ctx;
 
-            ps2_stubs::scePadInit(rdram.data(), &ctx, nullptr);
-            openPadPort(ctx, rdram);
+            ps2_stubs::scePadInit(
+                rdram.data(), &ctx, &runtime);
+            openPadPort(runtime, ctx, rdram);
 
             setRegU32(ctx, 6, static_cast<uint32_t>(-1));
-            ps2_stubs::scePadInfoAct(rdram.data(), &ctx, nullptr);
+            ps2_stubs::scePadInfoAct(
+                rdram.data(), &ctx, &runtime);
             t.IsTrue(static_cast<uint32_t>(getRegU32(&ctx, 2)) >= 1u, "scePadInfoAct should report at least one actuator descriptor");
 
             ps2_stubs::scePadInfoComb(rdram.data(), &ctx, nullptr);
@@ -528,73 +676,84 @@ void register_pad_input_tests()
             setRegU32(ctx, 5, 0u);
             setRegU32(ctx, 6, 1);
             setRegU32(ctx, 7, 0);
-            ps2_stubs::scePadInfoMode(rdram.data(), &ctx, nullptr);
+            ps2_stubs::scePadInfoMode(
+                rdram.data(), &ctx, &runtime);
             t.Equals(static_cast<uint32_t>(getRegU32(&ctx, 2)), static_cast<uint32_t>(4), "scePadInfoMode CURID should return digital at open");
 
             setRegU32(ctx, 4, 0u);
             setRegU32(ctx, 5, 0u);
             setRegU32(ctx, 6, 4);
             setRegU32(ctx, 7, static_cast<uint32_t>(-1));
-            ps2_stubs::scePadInfoMode(rdram.data(), &ctx, nullptr);
+            ps2_stubs::scePadInfoMode(
+                rdram.data(), &ctx, &runtime);
             t.IsTrue(static_cast<uint32_t>(getRegU32(&ctx, 2)) >= 1u, "scePadInfoMode table count should be non-zero");
 
             setRegU32(ctx, 4, 0u);
             setRegU32(ctx, 5, 0u);
-            ps2_stubs::scePadInfoPressMode(rdram.data(), &ctx, nullptr);
+            ps2_stubs::scePadInfoPressMode(
+                rdram.data(), &ctx, &runtime);
             t.Equals(static_cast<uint32_t>(getRegU32(&ctx, 2)), static_cast<uint32_t>(1), "scePadInfoPressMode should report pressure support");
 
             setRegU32(ctx, 4, 0u);
             setRegU32(ctx, 5, 0u);
             setRegU32(ctx, 6, 0u);
             setRegU32(ctx, 7, 3u);
-            ps2_stubs::scePadSetMainMode(rdram.data(), &ctx, nullptr);
+            ps2_stubs::scePadSetMainMode(
+                rdram.data(), &ctx, &runtime);
             t.Equals(static_cast<uint32_t>(getRegU32(&ctx, 2)), static_cast<uint32_t>(1), "scePadSetMainMode should accept digital mode");
 
             setRegU32(ctx, 4, 0u);
             setRegU32(ctx, 5, 0u);
             setRegU32(ctx, 6, 1u);
             setRegU32(ctx, 7, 0u);
-            ps2_stubs::scePadInfoMode(rdram.data(), &ctx, nullptr);
+            ps2_stubs::scePadInfoMode(
+                rdram.data(), &ctx, &runtime);
             t.Equals(static_cast<uint32_t>(getRegU32(&ctx, 2)), static_cast<uint32_t>(4), "CURID should switch to digital mode");
 
             setRegU32(ctx, 4, 0u);
             setRegU32(ctx, 5, 0u);
             setRegU32(ctx, 6, 1u);
             setRegU32(ctx, 7, 3u);
-            ps2_stubs::scePadSetMainMode(rdram.data(), &ctx, nullptr);
+            ps2_stubs::scePadSetMainMode(
+                rdram.data(), &ctx, &runtime);
             t.Equals(static_cast<uint32_t>(getRegU32(&ctx, 2)), static_cast<uint32_t>(1), "scePadSetMainMode should accept analog mode");
 
             setRegU32(ctx, 4, 0u);
             setRegU32(ctx, 5, 0u);
             setRegU32(ctx, 6, 4);
             setRegU32(ctx, 7, 0u);
-            ps2_stubs::scePadInfoMode(rdram.data(), &ctx, nullptr);
+            ps2_stubs::scePadInfoMode(
+                rdram.data(), &ctx, &runtime);
             t.Equals(static_cast<uint32_t>(getRegU32(&ctx, 2)), static_cast<uint32_t>(7), "mode table entry should return DualShock in analog mode");
 
-            closePadPort(ctx, rdram);
+            closePadPort(runtime, ctx, rdram);
         });
 
         tc.Run("pads open in digital mode and switch to analog on scePadSetMainMode", [](TestCase &t)
                {
+            PS2Runtime runtime;
             std::vector<uint8_t> rdram(PS2_RAM_SIZE, 0);
             R5900Context ctx;
 
-            ps2_stubs::scePadInit(rdram.data(), &ctx, nullptr);
-            openPadPort(ctx, rdram);
+            ps2_stubs::scePadInit(
+                rdram.data(), &ctx, &runtime);
+            openPadPort(runtime, ctx, rdram);
 
             setRegU32(ctx, 4, 0u);
             setRegU32(ctx, 5, 0u);
-            ps2_stubs::scePadGetState(rdram.data(), &ctx, nullptr);
+            ps2_stubs::scePadGetState(
+                rdram.data(), &ctx, &runtime);
             t.Equals(static_cast<uint32_t>(getRegU32(&ctx, 2)), static_cast<uint32_t>(6), "freshly opened port should report STABLE");
 
             setRegU32(ctx, 4, 0u);
             setRegU32(ctx, 5, 0u);
             setRegU32(ctx, 6, 1);
             setRegU32(ctx, 7, 0);
-            ps2_stubs::scePadInfoMode(rdram.data(), &ctx, nullptr);
+            ps2_stubs::scePadInfoMode(
+                rdram.data(), &ctx, &runtime);
             t.Equals(static_cast<uint32_t>(getRegU32(&ctx, 2)), static_cast<uint32_t>(4), "scePadInfoMode CURID should return digital at open");
 
-            runPadRead(ctx, rdram);
+            runPadRead(runtime, ctx, rdram);
             const uint8_t *data = rdram.data() + kPadDataAddr;
             t.Equals(data[1], static_cast<uint8_t>(0x41), "mode byte should be 0x41 (digital) at open");
 
@@ -602,14 +761,16 @@ void register_pad_input_tests()
             setRegU32(ctx, 5, 0u);
             setRegU32(ctx, 6, 1);
             setRegU32(ctx, 7, 3);
-            ps2_stubs::scePadSetMainMode(rdram.data(), &ctx, nullptr);
+            ps2_stubs::scePadSetMainMode(
+                rdram.data(), &ctx, &runtime);
             t.Equals(static_cast<uint32_t>(getRegU32(&ctx, 2)), static_cast<uint32_t>(1), "scePadSetMainMode should succeed switching to analog");
 
             setRegU32(ctx, 4, 0u);
             setRegU32(ctx, 5, 0u);
             setRegU32(ctx, 6, 1);
             setRegU32(ctx, 7, 0);
-            ps2_stubs::scePadInfoMode(rdram.data(), &ctx, nullptr);
+            ps2_stubs::scePadInfoMode(
+                rdram.data(), &ctx, &runtime);
             t.Equals(static_cast<uint32_t>(getRegU32(&ctx, 2)), static_cast<uint32_t>(7), "scePadInfoMode CURID should return analog after SetMainMode");
 
             // scePadSetMainMode queues a one-shot EXECCMD transient state; pump scePadGetState
@@ -617,21 +778,24 @@ void register_pad_input_tests()
             // "pad command state reports EXECCMD once before returning STABLE" test.
             setRegU32(ctx, 4, 0u);
             setRegU32(ctx, 5, 0u);
-            ps2_stubs::scePadGetState(rdram.data(), &ctx, nullptr);
+            ps2_stubs::scePadGetState(
+                rdram.data(), &ctx, &runtime);
 
-            runPadRead(ctx, rdram);
+            runPadRead(runtime, ctx, rdram);
             t.Equals(data[1], static_cast<uint8_t>(0x73), "mode byte should be 0x73 (analog) after SetMainMode");
 
-            closePadPort(ctx, rdram);
+            closePadPort(runtime, ctx, rdram);
         });
 
         tc.Run("pad setters return success", [](TestCase &t)
                {
+            PS2Runtime runtime;
             std::vector<uint8_t> rdram(PS2_RAM_SIZE, 0);
             R5900Context ctx;
 
-            ps2_stubs::scePadInit(rdram.data(), &ctx, nullptr);
-            openPadPort(ctx, rdram);
+            ps2_stubs::scePadInit(
+                rdram.data(), &ctx, &runtime);
+            openPadPort(runtime, ctx, rdram);
 
             setRegU32(ctx, 4, 0u);
             setRegU32(ctx, 5, 0u);
@@ -646,19 +810,22 @@ void register_pad_input_tests()
             setRegU32(ctx, 4, 0u);
             setRegU32(ctx, 5, 0u);
             setRegU32(ctx, 6, 0xFFFFu);
-            ps2_stubs::scePadSetButtonInfo(rdram.data(), &ctx, nullptr);
+            ps2_stubs::scePadSetButtonInfo(
+                rdram.data(), &ctx, &runtime);
             t.Equals(static_cast<uint32_t>(getRegU32(&ctx, 2)), static_cast<uint32_t>(1), "scePadSetButtonInfo should succeed");
 
             setRegU32(ctx, 4, 0u);
             setRegU32(ctx, 5, 0u);
             setRegU32(ctx, 6, 1u);
             setRegU32(ctx, 7, 3u);
-            ps2_stubs::scePadSetMainMode(rdram.data(), &ctx, nullptr);
+            ps2_stubs::scePadSetMainMode(
+                rdram.data(), &ctx, &runtime);
             t.Equals(static_cast<uint32_t>(getRegU32(&ctx, 2)), static_cast<uint32_t>(1), "scePadSetMainMode should succeed");
 
             setRegU32(ctx, 4, 0u);
             setRegU32(ctx, 5, 0u);
-            ps2_stubs::scePadSetReqState(rdram.data(), &ctx, nullptr);
+            ps2_stubs::scePadSetReqState(
+                rdram.data(), &ctx, &runtime);
             t.Equals(static_cast<uint32_t>(getRegU32(&ctx, 2)), static_cast<uint32_t>(1), "scePadSetReqState should succeed");
 
             setRegU32(ctx, 4, 0u);
@@ -671,40 +838,47 @@ void register_pad_input_tests()
             ps2_stubs::scePadSetWarningLevel(rdram.data(), &ctx, nullptr);
             t.Equals(static_cast<uint32_t>(getRegU32(&ctx, 2)), static_cast<uint32_t>(0), "scePadSetWarningLevel should return 0");
 
-            ps2_stubs::scePadEnd(rdram.data(), &ctx, nullptr);
+            ps2_stubs::scePadEnd(
+                rdram.data(), &ctx, &runtime);
             t.Equals(static_cast<uint32_t>(getRegU32(&ctx, 2)), static_cast<uint32_t>(1), "scePadEnd should succeed");
 
-            openPadPort(ctx, rdram);
+            openPadPort(runtime, ctx, rdram);
             setRegU32(ctx, 4, 0u);
             setRegU32(ctx, 5, 0u);
-            ps2_stubs::scePadEnterPressMode(rdram.data(), &ctx, nullptr);
+            ps2_stubs::scePadEnterPressMode(
+                rdram.data(), &ctx, &runtime);
             t.Equals(static_cast<uint32_t>(getRegU32(&ctx, 2)), static_cast<uint32_t>(1), "scePadEnterPressMode should succeed");
 
             setRegU32(ctx, 4, 0u);
             setRegU32(ctx, 5, 0u);
-            ps2_stubs::scePadExitPressMode(rdram.data(), &ctx, nullptr);
+            ps2_stubs::scePadExitPressMode(
+                rdram.data(), &ctx, &runtime);
             t.Equals(static_cast<uint32_t>(getRegU32(&ctx, 2)), static_cast<uint32_t>(1), "scePadExitPressMode should succeed");
 
-            closePadPort(ctx, rdram);
+            closePadPort(runtime, ctx, rdram);
         });
 
         tc.Run("scePadRead fills pressure bytes and honors button info mask", [](TestCase &t)
                {
+            PS2Runtime runtime;
             std::vector<uint8_t> rdram(PS2_RAM_SIZE, 0);
             R5900Context ctx;
 
-            ps2_stubs::scePadInit(rdram.data(), &ctx, nullptr);
-            openPadPort(ctx, rdram);
+            ps2_stubs::scePadInit(
+                rdram.data(), &ctx, &runtime);
+            openPadPort(runtime, ctx, rdram);
 
             setRegU32(ctx, 4, 0u);
             setRegU32(ctx, 5, 0u);
             setRegU32(ctx, 6, 0xFFFFu);
-            ps2_stubs::scePadSetButtonInfo(rdram.data(), &ctx, nullptr);
+            ps2_stubs::scePadSetButtonInfo(
+                rdram.data(), &ctx, &runtime);
             t.Equals(static_cast<uint32_t>(getRegU32(&ctx, 2)), static_cast<uint32_t>(1), "scePadSetButtonInfo should accept all buttons");
 
             setRegU32(ctx, 4, 0u);
             setRegU32(ctx, 5, 0u);
-            ps2_stubs::scePadEnterPressMode(rdram.data(), &ctx, nullptr);
+            ps2_stubs::scePadEnterPressMode(
+                rdram.data(), &ctx, &runtime);
             t.Equals(static_cast<uint32_t>(getRegU32(&ctx, 2)), static_cast<uint32_t>(1), "scePadEnterPressMode should enable pressure data");
 
             const uint16_t pressedButtons = static_cast<uint16_t>(0xFFFFu &
@@ -714,8 +888,14 @@ void register_pad_input_tests()
                                                                    ~kPadBtnCross &
                                                                    ~kPadBtnL1 &
                                                                    ~kPadBtnR2);
-            ps2_stubs::setPadOverrideState(pressedButtons, 0x80, 0x80, 0x80, 0x80);
-            runPadRead(ctx, rdram);
+            ps2_stubs::setPadOverrideState(
+                &runtime,
+                pressedButtons,
+                0x80,
+                0x80,
+                0x80,
+                0x80);
+            runPadRead(runtime, ctx, rdram);
 
             const uint8_t *data = rdram.data() + kPadDataAddr;
             t.Equals(data[8], static_cast<uint8_t>(0x00), "right pressure should be clear when not pressed");
@@ -734,10 +914,11 @@ void register_pad_input_tests()
             setRegU32(ctx, 4, 0u);
             setRegU32(ctx, 5, 0u);
             setRegU32(ctx, 6, static_cast<uint32_t>(kPadBtnL1 | kPadBtnR2));
-            ps2_stubs::scePadSetButtonInfo(rdram.data(), &ctx, nullptr);
+            ps2_stubs::scePadSetButtonInfo(
+                rdram.data(), &ctx, &runtime);
             t.Equals(static_cast<uint32_t>(getRegU32(&ctx, 2)), static_cast<uint32_t>(1), "scePadSetButtonInfo should narrow the enabled pressure mask");
 
-            runPadRead(ctx, rdram);
+            runPadRead(runtime, ctx, rdram);
 
             t.Equals(data[9], static_cast<uint8_t>(0x00), "masked-out direction pressure should clear");
             t.Equals(data[10], static_cast<uint8_t>(0x00), "masked-out direction pressure should clear");
@@ -746,8 +927,8 @@ void register_pad_input_tests()
             t.Equals(data[16], static_cast<uint8_t>(0xFF), "enabled L1 pressure should remain populated");
             t.Equals(data[19], static_cast<uint8_t>(0xFF), "enabled R2 pressure should remain populated");
 
-            ps2_stubs::clearPadOverrideState();
-            closePadPort(ctx, rdram);
+            ps2_stubs::clearPadOverrideState(&runtime);
+            closePadPort(runtime, ctx, rdram);
         });
 
         tc.Run("pad string helpers map state codes", [](TestCase &t)
@@ -775,10 +956,13 @@ void register_pad_input_tests()
         });
         tc.Run("scePadGetFrameCount increments", [](TestCase &t)
                {
+            PS2Runtime runtime;
             R5900Context ctx;
-            ps2_stubs::scePadGetFrameCount(nullptr, &ctx, nullptr);
+            ps2_stubs::scePadGetFrameCount(
+                nullptr, &ctx, &runtime);
             const uint32_t first = getRegU32(&ctx, 2);
-            ps2_stubs::scePadGetFrameCount(nullptr, &ctx, nullptr);
+            ps2_stubs::scePadGetFrameCount(
+                nullptr, &ctx, &runtime);
             const uint32_t second = getRegU32(&ctx, 2);
             t.Equals(second, first + 1, "frame count should increment");
         });

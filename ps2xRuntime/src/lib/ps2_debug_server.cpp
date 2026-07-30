@@ -2744,7 +2744,7 @@ struct PS2DebugServer::Impl
     Value padStatus(Allocator &allocator)
     {
         const ps2_stubs::PadDebugSnapshot snapshot =
-            ps2_stubs::getPadDebugSnapshot();
+            ps2_stubs::getPadDebugSnapshot(&runtime);
         Value result(rapidjson::kObjectType);
         result.AddMember("override_enabled", snapshot.overrideEnabled, allocator);
         result.AddMember("active_low", true, allocator);
@@ -2827,7 +2827,7 @@ struct PS2DebugServer::Impl
     {
         if (method == "input.pad.clear")
         {
-            ps2_stubs::clearPadOverrideState();
+            ps2_stubs::clearPadOverrideState(&runtime);
             return padStatus(allocator);
         }
 
@@ -2846,6 +2846,7 @@ struct PS2DebugServer::Impl
         }
 
         ps2_stubs::setPadOverrideState(
+            &runtime,
             static_cast<uint16_t>(buttons),
             static_cast<uint8_t>(lx),
             static_cast<uint8_t>(ly),
