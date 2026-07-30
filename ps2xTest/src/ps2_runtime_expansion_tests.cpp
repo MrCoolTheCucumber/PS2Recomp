@@ -1198,6 +1198,75 @@ void register_ps2_runtime_expansion_tests()
                 "repeated MPEG pictures should be reported separately");
         });
 
+        tc.Run("scheduler boundary skips an empty handoff and serves a queued guest", [](TestCase &t)
+        {
+            PS2RuntimeConfiguration configuration{};
+            configuration.eeThreadDiagnostics = true;
+            configuration.useEeThreadDiagnosticsEnvironment = false;
+            PS2Runtime runtime(configuration);
+            std::atomic<bool> peerRan{false};
+            std::thread peer;
+            bool peerWaiting = false;
+
+            {
+                PS2Runtime::GuestExecutionScope mainScope(&runtime);
+                runtime.yieldGuestExecutionAtBoundary();
+                const auto emptyBoundary =
+                    runtime.debugEeThreadDiagnosticsSnapshot();
+                t.Equals(
+                    emptyBoundary.requestedGuestSwitches,
+                    uint64_t{0u},
+                    "an empty scheduler boundary should not request an impossible switch");
+                t.Equals(
+                    emptyBoundary.guestSwitchTimeouts,
+                    uint64_t{0u},
+                    "an empty scheduler boundary should not manufacture a timeout");
+
+                peer = std::thread([&]()
+                {
+                    PS2Runtime::GuestExecutionScope peerScope(
+                        &runtime);
+                    peerRan.store(true, std::memory_order_release);
+                });
+                peerWaiting = waitUntil(
+                    [&]()
+                    {
+                        return runtime
+                                   .guestExecutionWaiterCountForTesting() >
+                               0u;
+                    },
+                    std::chrono::milliseconds(100));
+
+                runtime.yieldGuestExecutionAtBoundary();
+            }
+
+            if (peer.joinable())
+            {
+                peer.join();
+            }
+
+            t.IsTrue(
+                peerWaiting,
+                "a queued peer should be visible at the scheduler boundary");
+            t.IsTrue(
+                peerRan.load(std::memory_order_acquire),
+                "a queued peer should acquire guest execution before the boundary returns");
+            const auto diagnostics =
+                runtime.debugEeThreadDiagnosticsSnapshot();
+            t.Equals(
+                diagnostics.requestedGuestSwitches,
+                uint64_t{1u},
+                "only the boundary with a queued peer should request a switch");
+            t.Equals(
+                diagnostics.completedGuestSwitches,
+                uint64_t{1u},
+                "the queued boundary handoff should complete");
+            t.Equals(
+                diagnostics.guestSwitchTimeouts,
+                uint64_t{0u},
+                "the scheduler boundary should not time out");
+        });
+
         tc.Run("wake handoff lets a contending guest thread acquire before returning", [](TestCase &t)
         {
             PS2RuntimeConfiguration configuration{};

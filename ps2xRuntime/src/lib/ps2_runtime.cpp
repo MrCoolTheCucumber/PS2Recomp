@@ -8344,6 +8344,74 @@ PS2Runtime::DeferredGuestYieldScope::~DeferredGuestYieldScope()
     }
 }
 
+void PS2Runtime::yieldGuestExecutionAtBoundary()
+{
+    auto depthIt = g_guestExecutionDepths.find(this);
+    if (g_deferredGuestYieldDepth != 0u ||
+        depthIt == g_guestExecutionDepths.end() ||
+        depthIt->second == 0u ||
+        m_guestExecutionWaiters.load(
+            std::memory_order_acquire) != 0u)
+    {
+        yieldGuestExecutionAfterWake();
+        return;
+    }
+
+    // Raw operations can publish READY immediately before this ordinary
+    // boundary, while their legacy host worker has not yet reached the guest
+    // mutex. Give that worker the same bounded acquisition window as a wake
+    // handoff. If no worker appears, the boundary had no alternate runnable
+    // guest and must not be classified as a failed switch.
+    if (m_eeThreadDiagnosticsEnabled)
+    {
+        m_eeThreadDiagnosticYieldRequests.fetch_add(
+            1u, std::memory_order_relaxed);
+    }
+
+    const uint64_t handoffEpoch =
+        m_guestExecutionHandoffEpoch.load(
+            std::memory_order_acquire);
+    bool handedOff = false;
+    {
+        GuestExecutionReleaseScope releaseGuestExecution(this);
+        std::unique_lock<std::mutex> lock(
+            m_guestExecutionHandoffMutex);
+        if (m_eeThreadDiagnosticsEnabled)
+        {
+            m_eeThreadDiagnosticGuestSwitchCvWaits.fetch_add(
+                1u, std::memory_order_relaxed);
+        }
+        handedOff = m_guestExecutionHandoffCv.wait_for(
+            lock,
+            std::chrono::milliseconds(2),
+            [&]()
+            {
+                return m_guestExecutionHandoffEpoch.load(
+                           std::memory_order_acquire) !=
+                       handoffEpoch;
+            });
+    }
+
+    if (m_eeThreadDiagnosticsEnabled)
+    {
+        if (handedOff)
+        {
+            m_eeThreadDiagnosticRequestedGuestSwitches.fetch_add(
+                1u, std::memory_order_relaxed);
+            m_eeThreadDiagnosticCompletedGuestSwitches.fetch_add(
+                1u, std::memory_order_relaxed);
+        }
+        else if (m_guestExecutionWaiters.load(
+                     std::memory_order_acquire) != 0u)
+        {
+            m_eeThreadDiagnosticRequestedGuestSwitches.fetch_add(
+                1u, std::memory_order_relaxed);
+            m_eeThreadDiagnosticGuestSwitchTimeouts.fetch_add(
+                1u, std::memory_order_relaxed);
+        }
+    }
+}
+
 void PS2Runtime::yieldGuestExecutionAfterWake()
 {
     if (m_eeThreadDiagnosticsEnabled)

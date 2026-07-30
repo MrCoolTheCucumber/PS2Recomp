@@ -749,7 +749,7 @@ namespace ps2_syscalls
 
         if (reschedule)
         {
-            yieldGuestExecutionAfterWake(runtime);
+            yieldGuestExecutionAtBoundary(runtime);
         }
     }
 
@@ -826,7 +826,7 @@ namespace ps2_syscalls
         setReturnS32(ctx, tid);
         if (!suspendingCurrentThread && reschedule)
         {
-            yieldGuestExecutionAfterWake(runtime);
+            yieldGuestExecutionAtBoundary(runtime);
         }
     }
 
@@ -1248,7 +1248,7 @@ namespace ps2_syscalls
         setReturnS32(ctx, previousPriority);
         if (reschedule)
         {
-            yieldGuestExecutionAfterWake(runtime);
+            yieldGuestExecutionAtBoundary(runtime);
         }
     }
 
@@ -1295,7 +1295,7 @@ namespace ps2_syscalls
         setReturnS32(ctx, prio);
         if (reschedule)
         {
-            yieldGuestExecutionAfterWake(runtime);
+            yieldGuestExecutionAtBoundary(runtime);
         }
     }
 

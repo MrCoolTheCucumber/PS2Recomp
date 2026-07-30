@@ -1128,6 +1128,7 @@ public:
 
     void requestGuestPreemption();
     bool shouldPreemptGuestExecution();
+    void yieldGuestExecutionAtBoundary();
     void yieldGuestExecutionAfterWake();
     void waitForGuestExecutionHandoff();
     void waitForGuestExecutionHandoff(uint64_t baselineEpoch);
