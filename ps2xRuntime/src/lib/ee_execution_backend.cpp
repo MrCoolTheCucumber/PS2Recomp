@@ -1,5 +1,6 @@
 #include "runtime/ee_execution_backend.h"
 
+#include <atomic>
 #include <mutex>
 #include <stdexcept>
 #include <thread>
@@ -34,8 +35,25 @@ namespace
             int threadId,
             ThreadEntry entry) override
         {
-            std::thread worker(std::move(entry));
-            std::thread stale;
+            auto finished =
+                std::make_shared<std::atomic<bool>>(false);
+            std::thread worker(
+                [entry = std::move(entry), finished]() mutable
+                {
+                    struct Completion
+                    {
+                        std::atomic<bool> &finished;
+
+                        ~Completion()
+                        {
+                            finished.store(
+                                true,
+                                std::memory_order_release);
+                        }
+                    } completion{*finished};
+                    entry();
+                });
+            ThreadRecord stale;
             {
                 std::lock_guard<std::mutex> lock(m_mutex);
                 auto it = m_threads.find(threadId);
@@ -45,26 +63,57 @@ namespace
                     m_threads.erase(it);
                 }
                 m_threads.emplace(
-                    threadId, std::move(worker));
+                    threadId,
+                    ThreadRecord{
+                        std::move(worker),
+                        std::move(finished)});
             }
 
-            joinOrDetachSelf(stale);
+            joinOrDetachSelf(stale.worker);
+        }
+
+        [[nodiscard]] bool
+        isFinished(int threadId) const override
+        {
+            std::lock_guard<std::mutex> lock(m_mutex);
+            const auto it = m_threads.find(threadId);
+            return it == m_threads.end() ||
+                   it->second.finished->load(
+                       std::memory_order_acquire);
         }
 
         void destroy(int threadId) override
         {
-            std::thread worker;
+            ThreadRecord record;
             {
                 std::lock_guard<std::mutex> lock(m_mutex);
                 auto it = m_threads.find(threadId);
                 if (it != m_threads.end())
                 {
-                    worker = std::move(it->second);
+                    record = std::move(it->second);
                     m_threads.erase(it);
                 }
             }
 
-            joinOrDetachSelf(worker);
+            joinOrDetachSelf(record.worker);
+        }
+
+        void detach(int threadId) override
+        {
+            ThreadRecord record;
+            {
+                std::lock_guard<std::mutex> lock(m_mutex);
+                auto it = m_threads.find(threadId);
+                if (it != m_threads.end())
+                {
+                    record = std::move(it->second);
+                    m_threads.erase(it);
+                }
+            }
+            if (record.worker.joinable())
+            {
+                record.worker.detach();
+            }
         }
 
         void joinAll() override
@@ -78,7 +127,8 @@ namespace
                 for (auto it = m_threads.begin();
                      it != m_threads.end();)
                 {
-                    std::thread &worker = it->second;
+                    std::thread &worker =
+                        it->second.worker;
                     if (worker.joinable() &&
                         worker.get_id() == selfId)
                     {
@@ -86,7 +136,8 @@ namespace
                         continue;
                     }
 
-                    workers.push_back(std::move(worker));
+                    workers.push_back(
+                        std::move(worker));
                     it = m_threads.erase(it);
                 }
             }
@@ -109,7 +160,7 @@ namespace
                 for (auto &entry : m_threads)
                 {
                     workers.push_back(
-                        std::move(entry.second));
+                        std::move(entry.second.worker));
                 }
                 m_threads.clear();
             }
@@ -148,8 +199,14 @@ namespace
             }
         }
 
+        struct ThreadRecord
+        {
+            std::thread worker;
+            std::shared_ptr<std::atomic<bool>> finished;
+        };
+
         mutable std::mutex m_mutex;
-        std::unordered_map<int, std::thread> m_threads;
+        std::unordered_map<int, ThreadRecord> m_threads;
     };
 }
 

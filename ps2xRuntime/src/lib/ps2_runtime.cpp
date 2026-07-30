@@ -9312,7 +9312,11 @@ void PS2Runtime::run()
         m_gs.setDebugHistoryPaused(false);
     }
 
-    RUNTIME_LOG("Starting execution at address 0x" << std::hex << m_cpuContext.pc << std::dec);
+    RUNTIME_LOG(
+        "Starting execution at address 0x"
+        << std::hex << m_cpuContext.pc << std::dec
+        << " with EE backend "
+        << eeExecutionBackendName());
 
     // A blank image to use as a framebuffer
     Image blank = GenImageColor(FB_WIDTH, FB_HEIGHT, BLANK);
@@ -9320,15 +9324,16 @@ void PS2Runtime::run()
     UnloadImage(blank);
 
     m_eeThreadRuntimeState->activeHostThreads.store(1, std::memory_order_relaxed);
-    std::atomic<bool> gameThreadFinished{false};
 
     // Arm emulated VSync before the first guest instruction so event mode has
     // a deterministic phase independent of host thread startup.
     ps2_syscalls::EnsureVSyncScheduled(
         m_memory.getRDRAM(), this);
 
-    std::thread gameThread([&]()
-                           {
+    m_eeExecutionBackend->create(
+        1,
+        [this]()
+        {
         ThreadNaming::SetCurrentThreadName("GameThread");
         try
         {
@@ -9346,7 +9351,7 @@ void PS2Runtime::run()
             std::cerr << "Error during program execution: unknown exception" << std::endl;
         }
         m_eeThreadRuntimeState->activeHostThreads.fetch_sub(1, std::memory_order_relaxed);
-        gameThreadFinished.store(true, std::memory_order_release); });
+        });
 
     uint64_t tick = 0;
     while (!isStopRequested() && m_eeThreadRuntimeState->activeHostThreads.load(std::memory_order_relaxed) > 0)
@@ -9419,23 +9424,20 @@ void PS2Runtime::run()
     requestStop();
 
     const auto joinDeadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
-    while (!gameThreadFinished.load(std::memory_order_acquire) &&
+    while (!m_eeExecutionBackend->isFinished(1) &&
            std::chrono::steady_clock::now() < joinDeadline)
     {
         std::this_thread::sleep_for(std::chrono::milliseconds(1));
     }
 
-    if (gameThread.joinable())
+    if (m_eeExecutionBackend->isFinished(1))
     {
-        if (gameThreadFinished.load(std::memory_order_acquire))
-        {
-            gameThread.join();
-        }
-        else
-        {
-            std::cerr << "[run] game thread did not stop within timeout; detaching" << std::endl;
-            gameThread.detach();
-        }
+        m_eeExecutionBackend->destroy(1);
+    }
+    else
+    {
+        std::cerr << "[run] game thread did not stop within timeout; detaching" << std::endl;
+        m_eeExecutionBackend->detach(1);
     }
 
     const auto workerDeadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(1000);

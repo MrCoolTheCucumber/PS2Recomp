@@ -971,6 +971,12 @@ struct PS2DebugServer::Impl
             "ee_execution_backend",
             runtime.eeExecutionBackendName(),
             allocator);
+        result.AddMember(
+            "ee_execution_threads",
+            static_cast<uint64_t>(
+                runtime
+                    .managedEeExecutionThreadCountForTesting()),
+            allocator);
         const char *state = runtime.isStopRequested()
                                 ? "stopped"
                                 : (runtime.debugIsPaused() ? "paused" : "running");
@@ -1644,6 +1650,12 @@ struct PS2DebugServer::Impl
             result,
             "ee_execution_backend",
             runtime.eeExecutionBackendName(),
+            allocator);
+        result.AddMember(
+            "ee_execution_threads",
+            static_cast<uint64_t>(
+                runtime
+                    .managedEeExecutionThreadCountForTesting()),
             allocator);
         addString(result, "reason", reason, allocator);
         result.AddMember("quiescent", quiescent, allocator);

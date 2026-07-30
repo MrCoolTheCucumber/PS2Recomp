@@ -26,7 +26,10 @@ public:
     // Legacy continuations begin immediately. A later single-executor
     // backend may split creation from resume without changing guest state.
     virtual void create(int threadId, ThreadEntry entry) = 0;
+    [[nodiscard]] virtual bool
+    isFinished(int threadId) const = 0;
     virtual void destroy(int threadId) = 0;
+    virtual void detach(int threadId) = 0;
     virtual void joinAll() = 0;
     virtual void detachAll() = 0;
 
