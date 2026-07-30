@@ -5681,13 +5681,17 @@ void register_ps2_runtime_kernel_tests()
                 "first-runtime cancellation must not consume the second alarm");
         });
 
-        tc.Run("alarm shutdown does not join a callback blocked behind guest execution", [](TestCase &t)
+        tc.Run("alarm shutdown discards a published callback without a guest-worker join", [](TestCase &t)
         {
             TestEnv env;
 
             constexpr uint32_t kAlarmHandlerAddr = 0x00270200u;
             env.runtime.registerFunction(
-                kAlarmHandlerAddr, &alarmNoopHandler);
+                kAlarmHandlerAddr, &alarmCaptureHandler);
+            writeGuestU32(
+                env.rdram.data(),
+                K_ALARM_CALLBACK_STAGE_ADDR,
+                0u);
 
             auto guestExecution =
                 std::make_unique<PS2Runtime::GuestExecutionScope>(
@@ -5702,21 +5706,21 @@ void register_ps2_runtime_kernel_tests()
                 getRegS32(env.ctx, 2) > 0,
                 "the shutdown fixture should create a short alarm");
 
-            const bool callbackWaiting = waitUntil(
+            const bool callbackPublished = waitUntil(
                 [&]()
                 {
                     return env.runtime
-                               .guestExecutionWaiterCountForTesting() >
+                               .pendingAlarmCallbackCountForTesting() >
                            0u;
                 },
                 std::chrono::milliseconds(1000));
             t.IsTrue(
-                callbackWaiting,
-                "the expired alarm callback should reach the held guest boundary");
+                callbackPublished,
+                "the expired alarm should publish its callback while the guest boundary is held");
 
             std::atomic<bool> stopReturned{false};
             std::thread stopThread;
-            if (callbackWaiting)
+            if (callbackPublished)
             {
                 stopThread = std::thread(
                     [&]()
@@ -5728,7 +5732,7 @@ void register_ps2_runtime_kernel_tests()
             }
 
             const bool returnedWhileGuestHeld =
-                callbackWaiting &&
+                callbackPublished &&
                 waitUntil(
                     [&]()
                     {
@@ -5737,9 +5741,6 @@ void register_ps2_runtime_kernel_tests()
                     },
                     std::chrono::milliseconds(100));
 
-            // Always release the deliberately held boundary before joining,
-            // so the failing implementation reports one bounded assertion
-            // instead of hanging the complete test process.
             guestExecution.reset();
             if (stopThread.joinable())
             {
@@ -5748,7 +5749,13 @@ void register_ps2_runtime_kernel_tests()
 
             t.IsTrue(
                 returnedWhileGuestHeld,
-                "requestStop should cancel a blocked alarm callback before joining its worker");
+                "requestStop should join only the alarm publication worker");
+            t.Equals(
+                readGuestU32(
+                    env.rdram.data(),
+                    K_ALARM_CALLBACK_STAGE_ADDR),
+                0u,
+                "shutdown should discard a published callback before guest execution");
         });
 
         tc.Run("alarm callbacks use runtime-owned context and ABI arguments", [](TestCase &t)
@@ -5780,6 +5787,16 @@ void register_ps2_runtime_kernel_tests()
             const bool callbackRan = waitUntil(
                 [&]()
                 {
+                    {
+                        PS2Runtime::GuestExecutionScope
+                            guestExecution(
+                                &env.runtime,
+                                &env.ctx);
+                        env.runtime.executeGuestStep(
+                            env.rdram.data(),
+                            &env.ctx,
+                            &alarmNoopHandler);
+                    }
                     return readGuestU32(
                                env.rdram.data(),
                                K_ALARM_CALLBACK_STAGE_ADDR) ==
@@ -5906,7 +5923,7 @@ void register_ps2_runtime_kernel_tests()
                 "the alarm timer worker must publish work instead of executing guest code");
         });
 
-        tc.Run("alarm self-stop retains a joinable worker until callback exit", [](TestCase &t)
+        tc.Run("alarm self-stop leaves callback lifetime with the EE boundary", [](TestCase &t)
         {
             TestEnv env;
 
@@ -5930,6 +5947,37 @@ void register_ps2_runtime_kernel_tests()
             t.IsTrue(
                 getRegS32(env.ctx, 2) > 0,
                 "the self-stop fixture should create a short alarm");
+
+            std::atomic<bool> executorReturned{false};
+            std::thread executorThread(
+                [&]()
+                {
+                    const auto deadline =
+                        std::chrono::steady_clock::now() +
+                        std::chrono::seconds(1);
+                    while (
+                        readGuestU32(
+                            env.rdram.data(),
+                            K_ALARM_SELF_STOP_STAGE_ADDR) == 0u &&
+                        std::chrono::steady_clock::now() <
+                            deadline)
+                    {
+                        {
+                            PS2Runtime::GuestExecutionScope
+                                guestExecution(
+                                    &env.runtime,
+                                    &env.ctx);
+                            env.runtime.executeGuestStep(
+                                env.rdram.data(),
+                                &env.ctx,
+                                &alarmNoopHandler);
+                        }
+                        std::this_thread::sleep_for(
+                            std::chrono::milliseconds(1));
+                    }
+                    executorReturned.store(
+                        true, std::memory_order_release);
+                });
 
             const bool selfStopReturned = waitUntil(
                 [&]()
@@ -5975,14 +6023,22 @@ void register_ps2_runtime_kernel_tests()
             {
                 externalStopThread.join();
             }
+            if (executorThread.joinable())
+            {
+                executorThread.join();
+            }
 
-            t.IsFalse(
+            t.IsTrue(
                 returnedWhileCallbackHeld,
-                "an external stop should join a self-stopped callback worker");
+                "an external stop should join only the publication worker");
             t.IsTrue(
                 externalStopReturned.load(
                     std::memory_order_acquire),
-                "external stop should return after the callback exits");
+                "external stop should return while the EE callback is held");
+            t.IsTrue(
+                executorReturned.load(
+                    std::memory_order_acquire),
+                "the EE boundary should return after the callback gate opens");
             t.Equals(
                 readGuestU32(
                     env.rdram.data(),

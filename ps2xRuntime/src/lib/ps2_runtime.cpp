@@ -5,6 +5,7 @@
 #include "game_overrides.h"
 #include "ps2_runtime_macros.h"
 #include "runtime/ps2_gs_gpu.h"
+#include "runtime/ee_guest_exceptions.h"
 #include "runtime/ps2_vu_program_cache.h"
 #include "runtime/ps2_vu_recompiler.h"
 #include "ThreadNaming.h"
@@ -1350,6 +1351,15 @@ PS2Runtime::managedEeExecutionThreadCountForTesting() const
                ? m_eeExecutionBackend
                      ->managedThreadCount()
                : 0u;
+}
+
+size_t
+PS2Runtime::pendingAlarmCallbackCountForTesting()
+{
+    EeAlarmRuntimeState &state =
+        eeAlarmRuntimeState();
+    std::lock_guard<std::mutex> lock(state.mutex);
+    return state.pendingCallbacks.size();
 }
 
 EeAlarmRuntimeState &PS2Runtime::eeAlarmRuntimeState()
@@ -6012,6 +6022,99 @@ void PS2Runtime::handleBreak(uint8_t *rdram, R5900Context *ctx)
         ctx, EXCEPTION_BREAKPOINT);
 }
 
+void PS2Runtime::drainPendingAlarmCallbacks()
+{
+    EeAlarmRuntimeState &state =
+        eeAlarmRuntimeState();
+    if (!state.pendingCallbackPublished.load(
+            std::memory_order_acquire))
+    {
+        return;
+    }
+
+    std::deque<std::shared_ptr<AlarmInfo>> pending;
+    {
+        std::lock_guard<std::mutex> lock(state.mutex);
+        pending.swap(state.pendingCallbacks);
+        state.pendingCallbackPublished.store(
+            false, std::memory_order_release);
+    }
+
+    for (const std::shared_ptr<AlarmInfo> &alarm :
+         pending)
+    {
+        if (isStopRequested())
+        {
+            break;
+        }
+        if (!alarm ||
+            !alarm->rdram ||
+            !alarm->handler ||
+            !hasFunction(alarm->handler))
+        {
+            continue;
+        }
+
+        try
+        {
+            constexpr uint32_t kAlarmCallbackStackSize =
+                0x4000u;
+            if (state.callbackStackTop == 0u)
+            {
+                state.callbackStackTop =
+                    reserveAsyncCallbackStack(
+                        kAlarmCallbackStackSize, 16u);
+            }
+
+            R5900Context &callbackCtx =
+                state.callbackContext;
+            callbackCtx = {};
+            SET_GPR_U32(&callbackCtx, 28, alarm->gp);
+            SET_GPR_U32(
+                &callbackCtx,
+                29,
+                state.callbackStackTop != 0u
+                    ? state.callbackStackTop
+                    : (PS2_RAM_SIZE - 0x10u));
+            SET_GPR_U32(&callbackCtx, 31, 0u);
+            SET_GPR_U32(
+                &callbackCtx,
+                4,
+                static_cast<uint32_t>(alarm->id));
+            SET_GPR_U32(
+                &callbackCtx,
+                5,
+                static_cast<uint32_t>(alarm->ticks));
+            SET_GPR_U32(
+                &callbackCtx, 6, alarm->commonArg);
+            SET_GPR_U32(&callbackCtx, 7, 0u);
+            callbackCtx.pc = alarm->handler;
+
+            RecompiledFunction function =
+                lookupFunction(alarm->handler);
+            GuestExecutionScope guestExecution(
+                this, &callbackCtx);
+            executeGuestStep(
+                alarm->rdram,
+                &callbackCtx,
+                function);
+        }
+        catch (const ThreadExitException &)
+        {
+        }
+        catch (const std::exception &e)
+        {
+            if (state.exceptionLogCount < 8u)
+            {
+                std::cerr
+                    << "[SetAlarm] callback exception: "
+                    << e.what() << std::endl;
+                ++state.exceptionLogCount;
+            }
+        }
+    }
+}
+
 void PS2Runtime::drainPendingVSyncHandlers(uint8_t *rdram)
 {
     if (m_pendingVSyncDeliveryCount == 0u)
@@ -7074,12 +7177,12 @@ void PS2Runtime::leaveGuestExecution(
         previousContext,
         previousThreadId);
 
-    // A completed DMA may not interrupt the guest from inside the instruction
-    // or library call that started it. Deliver queued completions only when the
-    // outermost recompiled invocation has returned, so guest code can publish
-    // its post-submit state before its DMAC handler observes it.
+    // Host workers publish alarm/device work only. Run guest handlers after
+    // the outermost recompiled invocation has returned, so they execute on
+    // this EE boundary owner and cannot observe a half-finished guest call.
     if (it->second == 1u)
     {
+        drainPendingAlarmCallbacks();
         drainPendingVSyncHandlers(
             m_memory.getRDRAM());
         drainPendingEeCounterHandlers(

@@ -1,12 +1,5 @@
 #include "InterruptRuntimeState.h"
-
-struct ThreadExitException final : public std::exception
-{
-    const char *what() const noexcept override
-    {
-        return "PS2 Thread Exit";
-    }
-};
+#include "runtime/ee_guest_exceptions.h"
 
 static void throwIfTerminated(const std::shared_ptr<ThreadInfo> &info)
 {
@@ -273,9 +266,8 @@ static bool ensureAlarmWorkerRunning(PS2Runtime *runtime)
             return true;
         }
 
-        // A stop requested from inside the callback leaves the completed
-        // thread handle owned by the runtime. Reap it before a later run
-        // starts a replacement worker.
+        // Reap a completed publication worker before a later run starts a
+        // replacement.
         std::thread stoppedWorker =
             std::move(state.worker);
         lifecycleLock.unlock();
@@ -367,100 +359,24 @@ static bool ensureAlarmWorkerRunning(PS2Runtime *runtime)
                 }
 
                 if (!readyAlarm ||
-                    runtime->isStopRequested() ||
-                    !readyAlarm->rdram ||
-                    !readyAlarm->handler)
+                    runtime->isStopRequested())
                 {
                     continue;
                 }
-                if (!runtime->hasFunction(readyAlarm->handler))
                 {
-                    continue;
-                }
-
-                try
-                {
-                    constexpr uint32_t kAlarmCallbackStackSize =
-                        0x4000u;
-                    if (state.callbackStackTop == 0u)
+                    std::lock_guard<std::mutex> lock(
+                        state.mutex);
+                    if (state.stopRequested.load(
+                            std::memory_order_acquire))
                     {
-                        state.callbackStackTop =
-                            runtime->reserveAsyncCallbackStack(
-                                kAlarmCallbackStackSize, 16u);
+                        return;
                     }
-
-                    R5900Context &callbackCtx =
-                        state.callbackContext;
-                    callbackCtx = {};
-                    setRegU32(&callbackCtx, 28, readyAlarm->gp);
-                    setRegU32(
-                        &callbackCtx,
-                        29,
-                        state.callbackStackTop != 0u
-                            ? state.callbackStackTop
-                            : (PS2_RAM_SIZE - 0x10u));
-                    setRegU32(&callbackCtx, 31, 0);
-                    setRegU32(
-                        &callbackCtx,
-                        4,
-                        static_cast<uint32_t>(readyAlarm->id));
-                    setRegU32(
-                        &callbackCtx,
-                        5,
-                        static_cast<uint32_t>(readyAlarm->ticks));
-                    setRegU32(
-                        &callbackCtx, 6, readyAlarm->commonArg);
-                    setRegU32(&callbackCtx, 7, 0);
-                    callbackCtx.pc = readyAlarm->handler;
-
-                    PS2Runtime::RecompiledFunction func =
-                        runtime->lookupFunction(
-                            readyAlarm->handler);
-                    for (;;)
-                    {
-                        if (state.stopRequested.load(
-                                std::memory_order_acquire) ||
-                            runtime->isStopRequested())
-                        {
-                            return;
-                        }
-
-                        PS2Runtime::GuestExecutionTryScope
-                            guestExecution(
-                                runtime,
-                                &callbackCtx,
-                                std::chrono::milliseconds(10));
-                        if (!guestExecution.acquired())
-                        {
-                            continue;
-                        }
-                        if (state.stopRequested.load(
-                                std::memory_order_acquire) ||
-                            runtime->isStopRequested())
-                        {
-                            return;
-                        }
-
-                        runtime->executeGuestStep(
-                            readyAlarm->rdram,
-                            &callbackCtx,
-                            func);
-                        break;
-                    }
+                    state.pendingCallbacks.push_back(
+                        std::move(readyAlarm));
+                    state.pendingCallbackPublished.store(
+                        true, std::memory_order_release);
                 }
-                catch (const ThreadExitException &)
-                {
-                }
-                catch (const std::exception &e)
-                {
-                    if (state.exceptionLogCount < 8u)
-                    {
-                        std::cerr
-                            << "[SetAlarm] callback exception: "
-                            << e.what() << std::endl;
-                        ++state.exceptionLogCount;
-                    }
-                }
+                runtime->requestGuestPreemption();
             }
         });
     }
@@ -482,19 +398,18 @@ static void stopAlarmWorker(PS2Runtime *runtime)
     EeAlarmRuntimeState &state =
         runtime->eeAlarmRuntimeState();
     std::thread workerToJoin;
-    bool workerStopped = false;
     {
         std::lock_guard<std::mutex> lock(state.mutex);
         state.stopRequested.store(
             true, std::memory_order_release);
         state.alarms.clear();
+        state.pendingCallbacks.clear();
+        state.pendingCallbackPublished.store(
+            false, std::memory_order_release);
         state.nextAlarmId = 1;
         state.setLogCount = 0u;
-        if (!state.worker.joinable())
-        {
-            workerStopped = true;
-        }
-        else if (state.worker.get_id() !=
+        if (state.worker.joinable() &&
+            state.worker.get_id() !=
                  std::this_thread::get_id())
         {
             workerToJoin = std::move(state.worker);
@@ -505,19 +420,12 @@ static void stopAlarmWorker(PS2Runtime *runtime)
     if (workerToJoin.joinable())
     {
         workerToJoin.join();
-        workerStopped = true;
     }
 
-    // The worker owns these fields while a callback is active. Clear them
-    // only after an external stopper has joined it. A callback that requests
-    // its own stop leaves the joinable handle in runtime-owned state for the
-    // next external stop or destructor.
-    if (workerStopped)
-    {
-        std::lock_guard<std::mutex> lock(state.mutex);
-        state.callbackContext = {};
-        state.exceptionLogCount = 0u;
-    }
+    // Callback continuation state belongs to the EE execution boundary, not
+    // the timer worker. It may still be live when an external stop joins this
+    // publication worker, so leave it intact until the runtime is destroyed
+    // or a later callback initializes it.
 }
 
 static void rpcCopyToRdram(uint8_t *rdram, uint32_t dst, uint32_t src, size_t size)

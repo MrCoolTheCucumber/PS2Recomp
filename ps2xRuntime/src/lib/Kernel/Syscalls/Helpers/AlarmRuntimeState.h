@@ -6,6 +6,7 @@
 #include <chrono>
 #include <condition_variable>
 #include <cstdint>
+#include <deque>
 #include <exception>
 #include <memory>
 #include <mutex>
@@ -37,6 +38,9 @@ struct EeAlarmRuntimeState
             stopRequested.store(
                 true, std::memory_order_release);
             alarms.clear();
+            pendingCallbacks.clear();
+            pendingCallbackPublished.store(
+                false, std::memory_order_release);
             workerToJoin = std::move(worker);
         }
         cv.notify_all();
@@ -57,6 +61,8 @@ struct EeAlarmRuntimeState
     std::mutex mutex;
     std::condition_variable cv;
     std::unordered_map<int, std::shared_ptr<AlarmInfo>> alarms;
+    std::deque<std::shared_ptr<AlarmInfo>> pendingCallbacks;
+    std::atomic<bool> pendingCallbackPublished{false};
     int nextAlarmId = 1;
     std::atomic<bool> stopRequested{false};
     std::thread worker;

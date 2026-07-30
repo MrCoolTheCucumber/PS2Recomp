@@ -1270,6 +1270,8 @@ public:
     eeExecutionBackendName() const noexcept;
     [[nodiscard]] size_t
     managedEeExecutionThreadCountForTesting() const;
+    [[nodiscard]] size_t
+    pendingAlarmCallbackCountForTesting();
     EeAlarmRuntimeState &eeAlarmRuntimeState();
     const EeAlarmRuntimeState &eeAlarmRuntimeState() const;
     EeSyncRuntimeState &eeSyncRuntimeState();
@@ -1570,6 +1572,7 @@ private:
         uint32_t address,
         uint32_t size);
     void drainPendingEeCounterHandlers(uint8_t *rdram);
+    void drainPendingAlarmCallbacks();
     [[nodiscard]] static bool overlapsEeCounterRegister(
         uint32_t address, uint32_t size) noexcept;
     void scheduleEeVSyncEvent(
