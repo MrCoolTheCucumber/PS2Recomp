@@ -40,8 +40,6 @@ namespace
     constexpr int KE_DORMANT = -413;
     constexpr int KE_SEMA_ZERO = -419;
     constexpr int KE_SEMA_OVF = -420;
-    constexpr int KE_WAIT_DELETE = -425;
-    constexpr int KE_RELEASE_WAIT = -418;
     constexpr uint32_t K_SEMA_WAIT_READY_ADDR = 0x1900u;
 
     constexpr int THS_WAIT = 0x04;
@@ -63,6 +61,8 @@ namespace
     constexpr uint32_t K_WAITSUSPEND_RETURN_ADDR = 0x1844u;
     constexpr uint32_t K_ID_REUSE_STAGE_ADDR = 0x1850u;
     constexpr uint32_t K_ID_REUSE_RETURN_ADDR = 0x1854u;
+    constexpr uint32_t K_SEMA_ORACLE_STAGE_ADDR = 0x1860u;
+    constexpr uint32_t K_SEMA_ORACLE_RETURN_ADDR = 0x1864u;
 
     struct EeThreadStatus
     {
@@ -298,6 +298,23 @@ namespace
             K_ID_REUSE_RETURN_ADDR,
             static_cast<uint32_t>(getRegS32(*ctx, 2)));
         writeGuestU32(rdram, K_ID_REUSE_STAGE_ADDR, 2u);
+        ctx->pc = 0u;
+    }
+
+    void semaWaitOracleHandler(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        if (!rdram || !ctx)
+        {
+            return;
+        }
+
+        writeGuestU32(rdram, K_SEMA_ORACLE_STAGE_ADDR, 1u);
+        WaitSema(rdram, ctx, runtime);
+        writeGuestU32(
+            rdram,
+            K_SEMA_ORACLE_RETURN_ADDR,
+            static_cast<uint32_t>(getRegS32(*ctx, 2)));
+        writeGuestU32(rdram, K_SEMA_ORACLE_STAGE_ADDR, 2u);
         ctx->pc = 0u;
     }
 
@@ -1368,6 +1385,425 @@ void register_ps2_runtime_kernel_tests()
                 "the original keeper thread should remain independently deletable");
         });
 
+        tc.Run("semaphore wait release and delete match the EE BIOS boundary", [](TestCase &t)
+        {
+            notifyRuntimeStop();
+            TestEnv env;
+
+            constexpr uint32_t kThreadEntry = 0x00256000u;
+            constexpr uint32_t kRawStackAddr = 0x0030B000u;
+            constexpr uint32_t kOrdinaryStackAddr = 0x0030C000u;
+            constexpr uint32_t kDeleteStackAddr = 0x0030D000u;
+            env.runtime.registerFunction(kThreadEntry, &semaWaitOracleHandler);
+
+            setRegU32(env.ctx, 4, 0u);
+            setRegU32(env.ctx, 5, 40u);
+            ChangeThreadPriority(
+                env.rdram.data(), &env.ctx, &env.runtime);
+            t.Equals(
+                getRegS32(env.ctx, 2),
+                0,
+                "main should change from bootstrap priority zero to 40");
+
+            const uint32_t semaParam[6] = {
+                0u,
+                1u,
+                0u,
+                0u,
+                0x44u,
+                0x12345678u
+            };
+            auto createSema = [&]()
+            {
+                writeGuestWords(
+                    env.rdram.data(),
+                    K_PARAM_ADDR,
+                    semaParam,
+                    std::size(semaParam));
+                R5900Context createCtx{};
+                setRegU32(createCtx, 4, K_PARAM_ADDR);
+                CreateSema(
+                    env.rdram.data(), &createCtx, &env.runtime);
+                return getRegS32(createCtx, 2);
+            };
+            auto referSema = [&](int32_t sid, EeSemaStatus &status)
+            {
+                R5900Context statusCtx{};
+                setRegU32(
+                    statusCtx, 4, static_cast<uint32_t>(sid));
+                setRegU32(statusCtx, 5, K_STATUS_ADDR);
+                iReferSemaStatus(
+                    env.rdram.data(), &statusCtx, &env.runtime);
+                std::memcpy(
+                    &status,
+                    env.rdram.data() + K_STATUS_ADDR,
+                    sizeof(status));
+                return getRegS32(statusCtx, 2);
+            };
+            auto referThread = [&](int32_t tid, EeThreadStatus &status)
+            {
+                R5900Context statusCtx{};
+                setRegU32(
+                    statusCtx, 4, static_cast<uint32_t>(tid));
+                setRegU32(statusCtx, 5, K_STATUS_ADDR);
+                iReferThreadStatus(
+                    env.rdram.data(), &statusCtx, &env.runtime);
+                std::memcpy(
+                    &status,
+                    env.rdram.data() + K_STATUS_ADDR,
+                    sizeof(status));
+                return getRegS32(statusCtx, 2);
+            };
+            auto createWorker = [&](uint32_t stackAddr)
+            {
+                const uint32_t threadParam[9] = {
+                    0u,
+                    kThreadEntry,
+                    stackAddr,
+                    0x00001000u,
+                    0u,
+                    30u,
+                    0u,
+                    0u,
+                    0u
+                };
+                writeGuestWords(
+                    env.rdram.data(),
+                    K_PARAM_ADDR,
+                    threadParam,
+                    std::size(threadParam));
+                R5900Context createCtx{};
+                setRegU32(createCtx, 4, K_PARAM_ADDR);
+                CreateThread(
+                    env.rdram.data(), &createCtx, &env.runtime);
+                return getRegS32(createCtx, 2);
+            };
+            auto startWorker = [&](int32_t tid, int32_t sid)
+            {
+                writeGuestU32(
+                    env.rdram.data(), K_SEMA_ORACLE_STAGE_ADDR, 0u);
+                writeGuestU32(
+                    env.rdram.data(), K_SEMA_ORACLE_RETURN_ADDR, 0u);
+                R5900Context startCtx{};
+                setRegU32(
+                    startCtx, 4, static_cast<uint32_t>(tid));
+                setRegU32(
+                    startCtx, 5, static_cast<uint32_t>(sid));
+                StartThread(
+                    env.rdram.data(), &startCtx, &env.runtime);
+                return getRegS32(startCtx, 2);
+            };
+            auto waitForSemaBlock = [&](int32_t tid, int32_t sid)
+            {
+                return waitUntil([&]()
+                {
+                    EeThreadStatus threadStatus{};
+                    EeSemaStatus semaStatus{};
+                    return readGuestU32(
+                               env.rdram.data(),
+                               K_SEMA_ORACLE_STAGE_ADDR) == 1u &&
+                           referThread(tid, threadStatus) == THS_WAIT &&
+                           threadStatus.status == THS_WAIT &&
+                           threadStatus.waitType == TSW_SEMA &&
+                           threadStatus.waitId ==
+                               static_cast<uint32_t>(sid) &&
+                           referSema(sid, semaStatus) == KE_OK &&
+                           semaStatus.wait_threads == 1;
+                }, std::chrono::milliseconds(200));
+            };
+            auto deleteWorker = [&](int32_t tid)
+            {
+                R5900Context deleteCtx{};
+                setRegU32(
+                    deleteCtx, 4, static_cast<uint32_t>(tid));
+                DeleteThread(
+                    env.rdram.data(), &deleteCtx, &env.runtime);
+                return getRegS32(deleteCtx, 2);
+            };
+
+            const int32_t releaseSid = createSema();
+            t.Equals(
+                releaseSid,
+                0,
+                "the first EE semaphore id should be valid id zero");
+
+            EeSemaStatus initialSemaStatus{};
+            t.Equals(
+                referSema(releaseSid, initialSemaStatus),
+                KE_OK,
+                "ReferSemaStatus should return zero for semaphore zero");
+            t.Equals(initialSemaStatus.count, 0, "initial semaphore count should be zero");
+            t.Equals(initialSemaStatus.max_count, 1, "maximum semaphore count should be one");
+            t.Equals(initialSemaStatus.init_count, 0, "recorded initial count should be zero");
+            t.Equals(initialSemaStatus.wait_threads, 0, "new semaphore should have no waiters");
+            t.Equals(initialSemaStatus.attr, 0x44u, "semaphore attr should be retained");
+            t.Equals(initialSemaStatus.option, 0x12345678u, "semaphore option should be retained");
+
+            const int32_t rawTid = createWorker(kRawStackAddr);
+            t.Equals(rawTid, 2, "the raw-release waiter should use thread id 2");
+            t.Equals(
+                startWorker(rawTid, releaseSid),
+                rawTid,
+                "StartThread should return the raw-release waiter id");
+            t.IsTrue(
+                waitForSemaBlock(rawTid, releaseSid),
+                "raw-release worker should block in WaitSema");
+
+            {
+                PS2Runtime::GuestExecutionScope guestExecution(
+                    &env.runtime, &env.ctx);
+
+                R5900Context releaseCtx{};
+                setRegU32(
+                    releaseCtx, 4, static_cast<uint32_t>(rawTid));
+                iReleaseWaitThread(
+                    env.rdram.data(), &releaseCtx, &env.runtime);
+                t.Equals(
+                    getRegS32(releaseCtx, 2),
+                    rawTid,
+                    "raw release should return the waiter thread id");
+                t.Equals(
+                    readGuestU32(
+                        env.rdram.data(), K_SEMA_ORACLE_STAGE_ADDR),
+                    1u,
+                    "raw release should not dispatch the waiter");
+
+                EeThreadStatus readyStatus{};
+                t.Equals(
+                    referThread(rawTid, readyStatus),
+                    THS_READY,
+                    "raw release should return READY from thread status");
+                t.Equals(readyStatus.status, THS_READY, "raw-released waiter should publish READY");
+                t.Equals(readyStatus.waitType, 0u, "raw release should clear the wait reason");
+                t.Equals(readyStatus.waitId, 0u, "raw release should clear the wait object id");
+                t.Equals(readyStatus.wakeupCount, 0u, "raw release should not change wake count");
+
+                EeSemaStatus releasedSemaStatus{};
+                t.Equals(
+                    referSema(releaseSid, releasedSemaStatus),
+                    KE_OK,
+                    "raw-released semaphore should remain queryable");
+                t.Equals(
+                    releasedSemaStatus.wait_threads,
+                    0,
+                    "raw release should synchronously remove the waiter");
+
+                setRegU32(env.ctx, 4, 0u);
+                setRegU32(env.ctx, 5, 60u);
+                ChangeThreadPriority(
+                    env.rdram.data(), &env.ctx, &env.runtime);
+                t.Equals(
+                    getRegS32(env.ctx, 2),
+                    40,
+                    "forced raw-release dispatch should return old main priority");
+            }
+
+            const bool rawDormant = waitUntil([&]()
+            {
+                EeThreadStatus status{};
+                return readGuestU32(
+                           env.rdram.data(),
+                           K_SEMA_ORACLE_STAGE_ADDR) == 2u &&
+                       referThread(rawTid, status) == THS_DORMANT;
+            }, std::chrono::milliseconds(200));
+            t.IsTrue(
+                rawDormant,
+                "raw-released worker should finish after the scheduling boundary");
+            t.Equals(
+                static_cast<int32_t>(readGuestU32(
+                    env.rdram.data(), K_SEMA_ORACLE_RETURN_ADDR)),
+                KE_ERROR,
+                "force-released WaitSema should return generic -1");
+            EeThreadStatus rawFinalStatus{};
+            t.Equals(
+                referThread(rawTid, rawFinalStatus),
+                THS_DORMANT,
+                "raw-released worker should finish dormant");
+
+            setRegU32(env.ctx, 4, 0u);
+            setRegU32(env.ctx, 5, 40u);
+            ChangeThreadPriority(
+                env.rdram.data(), &env.ctx, &env.runtime);
+            t.Equals(
+                getRegS32(env.ctx, 2),
+                60,
+                "restoring main priority should return 60");
+            t.Equals(
+                deleteWorker(rawTid),
+                rawTid,
+                "raw-released dormant worker should be deletable");
+
+            const int32_t ordinaryTid =
+                createWorker(kOrdinaryStackAddr);
+            t.Equals(ordinaryTid, 3, "ordinary-release waiter should use thread id 3");
+            t.Equals(
+                startWorker(ordinaryTid, releaseSid),
+                ordinaryTid,
+                "StartThread should return the ordinary-release waiter id");
+            t.IsTrue(
+                waitForSemaBlock(ordinaryTid, releaseSid),
+                "ordinary-release worker should block in WaitSema");
+
+            {
+                PS2Runtime::GuestExecutionScope guestExecution(
+                    &env.runtime, &env.ctx);
+                R5900Context releaseCtx{};
+                setRegU32(
+                    releaseCtx,
+                    4,
+                    static_cast<uint32_t>(ordinaryTid));
+                ReleaseWaitThread(
+                    env.rdram.data(), &releaseCtx, &env.runtime);
+                t.Equals(
+                    getRegS32(releaseCtx, 2),
+                    ordinaryTid,
+                    "ordinary release should return the waiter thread id");
+                t.Equals(
+                    readGuestU32(
+                        env.rdram.data(), K_SEMA_ORACLE_STAGE_ADDR),
+                    2u,
+                    "ordinary release should dispatch the higher-priority waiter before returning");
+            }
+
+            t.Equals(
+                static_cast<int32_t>(readGuestU32(
+                    env.rdram.data(), K_SEMA_ORACLE_RETURN_ADDR)),
+                KE_ERROR,
+                "ordinary force-released WaitSema should return generic -1");
+            const bool ordinaryDormant = waitUntil([&]()
+            {
+                EeThreadStatus status{};
+                return referThread(ordinaryTid, status) == THS_DORMANT;
+            }, std::chrono::milliseconds(200));
+            t.IsTrue(
+                ordinaryDormant,
+                "ordinary-released worker should complete its host-thread epilogue");
+            EeThreadStatus ordinaryFinalStatus{};
+            t.Equals(
+                referThread(ordinaryTid, ordinaryFinalStatus),
+                THS_DORMANT,
+                "ordinary-released worker should already be dormant");
+            EeSemaStatus ordinarySemaStatus{};
+            t.Equals(
+                referSema(releaseSid, ordinarySemaStatus),
+                KE_OK,
+                "release-test semaphore should remain queryable");
+            t.Equals(
+                ordinarySemaStatus.wait_threads,
+                0,
+                "ordinary release should remove its waiter");
+            t.Equals(
+                deleteWorker(ordinaryTid),
+                ordinaryTid,
+                "ordinary-released dormant worker should be deletable");
+
+            R5900Context deleteReleaseSemaCtx{};
+            setRegU32(
+                deleteReleaseSemaCtx,
+                4,
+                static_cast<uint32_t>(releaseSid));
+            DeleteSema(
+                env.rdram.data(),
+                &deleteReleaseSemaCtx,
+                &env.runtime);
+            t.Equals(
+                getRegS32(deleteReleaseSemaCtx, 2),
+                releaseSid,
+                "DeleteSema should return valid semaphore id zero");
+
+            const int32_t deleteSid = createSema();
+            t.Equals(
+                deleteSid,
+                0,
+                "the next semaphore should immediately reuse deleted id zero");
+            const int32_t deleteTid =
+                createWorker(kDeleteStackAddr);
+            t.Equals(deleteTid, 4, "delete waiter should use thread id 4");
+            t.Equals(
+                startWorker(deleteTid, deleteSid),
+                deleteTid,
+                "StartThread should return the delete waiter id");
+            t.IsTrue(
+                waitForSemaBlock(deleteTid, deleteSid),
+                "delete worker should block in WaitSema");
+
+            {
+                PS2Runtime::GuestExecutionScope guestExecution(
+                    &env.runtime, &env.ctx);
+                R5900Context deleteSemaCtx{};
+                setRegU32(
+                    deleteSemaCtx,
+                    4,
+                    static_cast<uint32_t>(deleteSid));
+                DeleteSema(
+                    env.rdram.data(), &deleteSemaCtx, &env.runtime);
+                t.Equals(
+                    getRegS32(deleteSemaCtx, 2),
+                    deleteSid,
+                    "DeleteSema should return id zero while waking a waiter");
+                t.Equals(
+                    readGuestU32(
+                        env.rdram.data(), K_SEMA_ORACLE_STAGE_ADDR),
+                    2u,
+                    "DeleteSema should dispatch a higher-priority waiter before returning");
+
+                EeSemaStatus deletedSemaStatus{};
+                t.Equals(
+                    referSema(deleteSid, deletedSemaStatus),
+                    KE_ERROR,
+                    "querying a deleted semaphore should return generic -1");
+
+                setRegU32(env.ctx, 4, 0u);
+                setRegU32(env.ctx, 5, 60u);
+                ChangeThreadPriority(
+                    env.rdram.data(), &env.ctx, &env.runtime);
+                t.Equals(
+                    getRegS32(env.ctx, 2),
+                    40,
+                    "post-delete priority boundary should return old main priority");
+            }
+
+            const bool deleteDormant = waitUntil([&]()
+            {
+                EeThreadStatus status{};
+                return readGuestU32(
+                           env.rdram.data(),
+                           K_SEMA_ORACLE_STAGE_ADDR) == 2u &&
+                       referThread(deleteTid, status) == THS_DORMANT;
+            }, std::chrono::milliseconds(200));
+            t.IsTrue(
+                deleteDormant,
+                "deleted-semaphore waiter should complete its host-thread epilogue");
+            t.Equals(
+                readGuestU32(
+                    env.rdram.data(), K_SEMA_ORACLE_STAGE_ADDR),
+                2u,
+                "delete waiter should finish by the forced boundary");
+            t.Equals(
+                static_cast<int32_t>(readGuestU32(
+                    env.rdram.data(), K_SEMA_ORACLE_RETURN_ADDR)),
+                KE_ERROR,
+                "deleted-semaphore WaitSema should return generic -1");
+            EeThreadStatus deleteFinalStatus{};
+            t.Equals(
+                referThread(deleteTid, deleteFinalStatus),
+                THS_DORMANT,
+                "deleted-semaphore waiter should finish dormant");
+
+            setRegU32(env.ctx, 4, 0u);
+            setRegU32(env.ctx, 5, 40u);
+            ChangeThreadPriority(
+                env.rdram.data(), &env.ctx, &env.runtime);
+            t.Equals(
+                getRegS32(env.ctx, 2),
+                60,
+                "restoring main priority after delete should return 60");
+            t.Equals(
+                deleteWorker(deleteTid),
+                deleteTid,
+                "deleted-semaphore waiter should be deletable");
+        });
+
         tc.Run("semaphore EE layout covers poll, signal overflow, and status", [](TestCase &t)
         {
             TestEnv env;
@@ -1385,7 +1821,7 @@ void register_ps2_runtime_kernel_tests()
             setRegU32(env.ctx, 4, K_PARAM_ADDR);
             CreateSema(env.rdram.data(), &env.ctx, &env.runtime);
             const int32_t sid = getRegS32(env.ctx, 2);
-            t.IsTrue(sid > 0, "CreateSema should return positive semaphore id");
+            t.IsTrue(sid >= 0, "CreateSema should return a valid nonnegative semaphore id");
 
             setRegU32(env.ctx, 4, static_cast<uint32_t>(sid));
             setRegU32(env.ctx, 5, K_STATUS_ADDR);
@@ -1446,7 +1882,7 @@ void register_ps2_runtime_kernel_tests()
             setRegU32(env.ctx, 4, K_PARAM_ADDR);
             CreateSema(env.rdram.data(), &env.ctx, &env.runtime);
             const int32_t sid = getRegS32(env.ctx, 2);
-            t.IsTrue(sid > 0, "CreateSema should still accept legacy-style parameter blocks");
+            t.IsTrue(sid >= 0, "CreateSema should still accept legacy-style parameter blocks");
 
             setRegU32(env.ctx, 4, static_cast<uint32_t>(sid));
             setRegU32(env.ctx, 5, K_STATUS_ADDR);
@@ -1467,7 +1903,7 @@ void register_ps2_runtime_kernel_tests()
 
         tc.Run("semaphore syscalls return sid on success (EE BIOS convention)", [](TestCase &t)
         {
-            // Sub-case A: CreateSema returns positive id (regression guard)
+            // Sub-case A: CreateSema returns a valid nonnegative id.
             {
                 TestEnv env;
                 const uint32_t semaParam[6] = { 0u, 2u, 1u, 0u, 0x11u, 0u };
@@ -1475,7 +1911,7 @@ void register_ps2_runtime_kernel_tests()
                 setRegU32(env.ctx, 4, K_PARAM_ADDR);
                 CreateSema(env.rdram.data(), &env.ctx, &env.runtime);
                 const int32_t sid = getRegS32(env.ctx, 2);
-                t.IsTrue(sid > 0, "CreateSema should return positive semaphore id");
+                t.IsTrue(sid >= 0, "CreateSema should return a valid semaphore id");
             }
 
             // Sub-case B: PollSema success returns sid
@@ -1486,7 +1922,7 @@ void register_ps2_runtime_kernel_tests()
                 setRegU32(env.ctx, 4, K_PARAM_ADDR);
                 CreateSema(env.rdram.data(), &env.ctx, &env.runtime);
                 const int32_t sid = getRegS32(env.ctx, 2);
-                t.IsTrue(sid > 0, "CreateSema should return positive id for PollSema test");
+                t.IsTrue(sid >= 0, "CreateSema should return a valid id for PollSema test");
 
                 setRegU32(env.ctx, 4, static_cast<uint32_t>(sid));
                 PollSema(env.rdram.data(), &env.ctx, &env.runtime);
@@ -1505,7 +1941,7 @@ void register_ps2_runtime_kernel_tests()
                 setRegU32(env.ctx, 4, K_PARAM_ADDR);
                 CreateSema(env.rdram.data(), &env.ctx, &env.runtime);
                 const int32_t sid = getRegS32(env.ctx, 2);
-                t.IsTrue(sid > 0, "CreateSema should return positive id for SignalSema test");
+                t.IsTrue(sid >= 0, "CreateSema should return a valid id for SignalSema test");
 
                 setRegU32(env.ctx, 4, static_cast<uint32_t>(sid));
                 SignalSema(env.rdram.data(), &env.ctx, &env.runtime);
@@ -1524,7 +1960,7 @@ void register_ps2_runtime_kernel_tests()
                 setRegU32(env.ctx, 4, K_PARAM_ADDR);
                 CreateSema(env.rdram.data(), &env.ctx, &env.runtime);
                 const int32_t sid = getRegS32(env.ctx, 2);
-                t.IsTrue(sid > 0, "CreateSema should return positive id for WaitSema test");
+                t.IsTrue(sid >= 0, "CreateSema should return a valid id for WaitSema test");
 
                 setRegU32(env.ctx, 4, static_cast<uint32_t>(sid));
                 WaitSema(env.rdram.data(), &env.ctx, &env.runtime);
@@ -1539,7 +1975,7 @@ void register_ps2_runtime_kernel_tests()
                 t.Equals(semaStatus.count, 0, "WaitSema should decrement count to 0");
             }
 
-            // Sub-case E: WaitSema delete-while-waiting returns KE_WAIT_DELETE
+            // Sub-case E: deleting a semaphore makes its waiter return generic -1.
             {
                 TestEnv env;
                 const uint32_t semaParam[6] = { 0u, 1u, 0u, 0u, 0u, 0u };
@@ -1547,7 +1983,7 @@ void register_ps2_runtime_kernel_tests()
                 setRegU32(env.ctx, 4, K_PARAM_ADDR);
                 CreateSema(env.rdram.data(), &env.ctx, &env.runtime);
                 const int32_t sid = getRegS32(env.ctx, 2);
-                t.IsTrue(sid > 0, "CreateSema should return positive id for delete-while-waiting test");
+                t.IsTrue(sid >= 0, "CreateSema should return a valid id for delete-while-waiting test");
 
                 int32_t workerRet = 0;
                 writeGuestU32(env.rdram.data(), K_SEMA_WAIT_READY_ADDR, 0u);
@@ -1580,7 +2016,7 @@ void register_ps2_runtime_kernel_tests()
                 t.Equals(getRegS32(env.ctx, 2), sid, "DeleteSema should return sid while thread is waiting");
 
                 worker.join();
-                t.Equals(workerRet, KE_WAIT_DELETE, "WaitSema should return KE_WAIT_DELETE when semaphore is deleted");
+                t.Equals(workerRet, KE_ERROR, "WaitSema should return generic -1 when its semaphore is deleted");
             }
 
             // Sub-case F: DeleteSema success returns sid
@@ -1591,7 +2027,7 @@ void register_ps2_runtime_kernel_tests()
                 setRegU32(env.ctx, 4, K_PARAM_ADDR);
                 CreateSema(env.rdram.data(), &env.ctx, &env.runtime);
                 const int32_t sid = getRegS32(env.ctx, 2);
-                t.IsTrue(sid > 0, "CreateSema should return positive id for DeleteSema test");
+                t.IsTrue(sid >= 0, "CreateSema should return a valid id for DeleteSema test");
 
                 setRegU32(env.ctx, 4, static_cast<uint32_t>(sid));
                 DeleteSema(env.rdram.data(), &env.ctx, &env.runtime);
@@ -1620,7 +2056,7 @@ void register_ps2_runtime_kernel_tests()
                 t.Equals(getRegS32(env.ctx, 2), KE_UNKNOWN_SEMID, "DeleteSema should return KE_UNKNOWN_SEMID for invalid sid");
             }
 
-            // Sub-case H: WaitSema force-released via ReleaseWaitThread returns KE_RELEASE_WAIT
+            // Sub-case H: WaitSema force-released via ReleaseWaitThread returns generic -1
             // and the ret >= 0 guard must NOT consume a token (count stays 0, not -1).
             {
                 // Use a tid the sequential allocator (range 2..0xFF) will never produce, so the
@@ -1634,7 +2070,7 @@ void register_ps2_runtime_kernel_tests()
                 setRegU32(env.ctx, 4, K_PARAM_ADDR);
                 CreateSema(env.rdram.data(), &env.ctx, &env.runtime);
                 const int sid = getRegS32(env.ctx, 2);
-                t.IsTrue(sid > 0, "sub-case H: CreateSema must return positive sid");
+                t.IsTrue(sid >= 0, "sub-case H: CreateSema must return a valid sid");
 
                 writeGuestU32(env.rdram.data(), K_SEMA_WAIT_READY_ADDR, 0u);
                 int32_t workerRet = 0;
@@ -1663,12 +2099,12 @@ void register_ps2_runtime_kernel_tests()
                 // Force-release the worker via ReleaseWaitThread.
                 setRegU32(env.ctx, 4, static_cast<uint32_t>(kWorkerTid));
                 ReleaseWaitThread(env.rdram.data(), &env.ctx, &env.runtime);
-                t.Equals(getRegS32(env.ctx, 2), KE_OK,
-                         "sub-case H: ReleaseWaitThread must succeed");
+                t.Equals(getRegS32(env.ctx, 2), kWorkerTid,
+                         "sub-case H: ReleaseWaitThread must return the waiter id");
 
                 worker.join();
-                t.Equals(workerRet, KE_RELEASE_WAIT,
-                         "sub-case H: WaitSema force-released must return KE_RELEASE_WAIT, not sid");
+                t.Equals(workerRet, KE_ERROR,
+                         "sub-case H: force-released WaitSema must return generic -1");
 
                 // Assert the count was NOT decremented (core guard check: ret < 0 skips decrement).
                 {
@@ -1708,7 +2144,7 @@ void register_ps2_runtime_kernel_tests()
                 setRegU32(env.ctx, 4, K_PARAM_ADDR);
                 CreateSema(env.rdram.data(), &env.ctx, &env.runtime);
                 const int sid = getRegS32(env.ctx, 2);
-                t.IsTrue(sid > 0, "sub-case I: CreateSema must return positive sid");
+                t.IsTrue(sid >= 0, "sub-case I: CreateSema must return a valid sid");
 
                 writeGuestU32(env.rdram.data(), K_SEMA_WAIT_READY_ADDR, 0u);
                 int32_t workerRet = 0;
@@ -1901,7 +2337,7 @@ void register_ps2_runtime_kernel_tests()
             setRegU32(createSemaCtx, 4, K_PARAM_ADDR);
             CreateSema(env.rdram.data(), &createSemaCtx, &env.runtime);
             const int32_t sid = getRegS32(createSemaCtx, 2);
-            t.IsTrue(sid > 0, "CreateSema should create a zero-count semaphore");
+            t.IsTrue(sid >= 0, "CreateSema should create a zero-count semaphore");
 
             env.runtime.registerFunction(kWaitThreadEntry, &waitSemaUntilTerminatedHandler);
 

@@ -153,7 +153,7 @@ namespace ps2_syscalls
             init = max;
         }
 
-        int id = 0;
+        int id = -1;
         auto info = std::make_shared<SemaInfo>();
         info->count = init;
         info->maxCount = max;
@@ -165,13 +165,13 @@ namespace ps2_syscalls
             std::lock_guard<std::mutex> lock(g_sema_map_mutex);
             for (int attempts = 0; attempts < 0x7FFF; ++attempts)
             {
-                if (g_nextSemaId <= 0)
+                if (g_nextSemaId < 0)
                 {
-                    g_nextSemaId = 1;
+                    g_nextSemaId = 0;
                 }
 
                 const int candidate = g_nextSemaId++;
-                if (candidate <= 0)
+                if (candidate < 0)
                 {
                     continue;
                 }
@@ -183,7 +183,7 @@ namespace ps2_syscalls
                 }
             }
 
-            if (id <= 0)
+            if (id < 0)
             {
                 setReturnS32(ctx, KE_ERROR);
                 return;
@@ -210,16 +210,26 @@ namespace ps2_syscalls
             }
             sema = it->second;
             g_semas.erase(it);
+            if (sid < g_nextSemaId)
+            {
+                g_nextSemaId = sid;
+            }
         }
 
+        bool hadWaiters = false;
         {
             std::lock_guard<std::mutex> lock(sema->m);
             sema->deleted = true;
+            hadWaiters = sema->waiters > 0;
         }
         sema->cv.notify_all();
 
         // PS2 EE BIOS returns sid on success.
         setReturnS32(ctx, sid);
+        if (hadWaiters)
+        {
+            yieldGuestExecutionAfterWake(runtime);
+        }
     }
 
     void iDeleteSema(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
@@ -323,6 +333,7 @@ namespace ps2_syscalls
                 info->waitType = TSW_SEMA;
                 info->waitId = sid;
                 info->forceRelease = false;
+                info->semaWaitLinked = true;
             }
 
             sema->waiters++;
@@ -340,23 +351,29 @@ namespace ps2_syscalls
                 },
                 [&]()
                 {
-                    sema->waiters--;
+                    const bool linked =
+                        !info || info->semaWaitLinked.exchange(false);
+                    if (linked && sema->waiters > 0)
+                    {
+                        sema->waiters--;
+                    }
                     if (sema->deleted)
                     {
-                        ret = KE_WAIT_DELETE;
+                        ret = KE_ERROR;
                     }
 
                     if (info)
                     {
                         std::lock_guard<std::mutex> tLock(info->m);
                         terminated = info->terminated.load();
-                        info->status = (info->suspendCount > 0) ? THS_SUSPEND : THS_RUN;
+                        info->status =
+                            (info->suspendCount > 0) ? THS_SUSPEND : THS_READY;
                         info->waitType = TSW_NONE;
                         info->waitId = 0;
                         if (info->forceRelease)
                         {
                             info->forceRelease = false;
-                            ret = KE_RELEASE_WAIT;
+                            ret = KE_ERROR;
                         }
                     }
 
@@ -372,6 +389,15 @@ namespace ps2_syscalls
         if (terminated)
         {
             throw ThreadExitException();
+        }
+
+        if (info)
+        {
+            std::lock_guard<std::mutex> tLock(info->m);
+            if (info->suspendCount == 0)
+            {
+                info->status = THS_RUN;
+            }
         }
 
         if (!consumed && lock.owns_lock())
@@ -428,7 +454,11 @@ namespace ps2_syscalls
         PollSema(rdram, ctx, runtime);
     }
 
-    void ReferSemaStatus(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    static void referSemaStatus(
+        uint8_t *rdram,
+        R5900Context *ctx,
+        PS2Runtime *runtime,
+        bool raw)
     {
         int sid = static_cast<int>(getRegU32(ctx, 4));
         uint32_t statusAddr = getRegU32(ctx, 5);
@@ -436,7 +466,7 @@ namespace ps2_syscalls
         auto sema = lookupSemaInfo(sid);
         if (!sema)
         {
-            setReturnS32(ctx, KE_UNKNOWN_SEMID);
+            setReturnS32(ctx, raw ? KE_ERROR : KE_UNKNOWN_SEMID);
             return;
         }
 
@@ -457,9 +487,14 @@ namespace ps2_syscalls
         setReturnS32(ctx, KE_OK);
     }
 
+    void ReferSemaStatus(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        referSemaStatus(rdram, ctx, runtime, false);
+    }
+
     void iReferSemaStatus(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
-        ReferSemaStatus(rdram, ctx, runtime);
+        referSemaStatus(rdram, ctx, runtime, true);
     }
 
     constexpr uint32_t WEF_OR = 1;

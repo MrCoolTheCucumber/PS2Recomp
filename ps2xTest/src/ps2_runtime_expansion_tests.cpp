@@ -7101,7 +7101,7 @@ void register_ps2_runtime_expansion_tests()
             setRegU32(createCtx, 4, kParamAddr);
             CreateSema(rdram.data(), &createCtx, &runtime);
             const int32_t sid = getRegS32(createCtx, 2);
-            t.IsTrue(sid > 0, "CreateSema should return a valid sid");
+            t.IsTrue(sid >= 0, "CreateSema should return a valid nonnegative sid");
 
             std::atomic<int32_t> pollOkCount{0};
             std::atomic<int32_t> signalOkCount{0};

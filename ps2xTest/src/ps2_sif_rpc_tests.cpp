@@ -1294,7 +1294,7 @@ void register_ps2_sif_rpc_tests()
             setRegU32(env.ctx, 4, kSemaParamAddr);
             CreateSema(env.rdram.data(), &env.ctx, &env.runtime);
             const int32_t semaId = getRegS32(env.ctx, 2);
-            t.IsTrue(semaId > 0, "CreateSema should return a positive semaphore id");
+            t.IsTrue(semaId >= 0, "CreateSema should return a valid nonnegative semaphore id");
 
             setRegU32(env.ctx, 4, kClientAddr);
             setRegU32(env.ctx, 5, IOP_SID_LOTR_SOUND);
@@ -1351,7 +1351,7 @@ void register_ps2_sif_rpc_tests()
             setRegU32(env.ctx, 4, kSemaParamAddr);
             CreateSema(env.rdram.data(), &env.ctx, &env.runtime);
             const int32_t semaId = getRegS32(env.ctx, 2);
-            t.IsTrue(semaId > 0, "CreateSema should return a positive semaphore id");
+            t.IsTrue(semaId >= 0, "CreateSema should return a valid nonnegative semaphore id");
 
             setRegU32(env.ctx, 4, kClientAddr);
             setRegU32(env.ctx, 5, IOP_SID_SNDDRV_COMMAND);
@@ -1513,7 +1513,7 @@ void register_ps2_sif_rpc_tests()
             setRegU32(env.ctx, 4, kSemaParamAddr);
             CreateSema(env.rdram.data(), &env.ctx, &env.runtime);
             const int32_t semaId = getRegS32(env.ctx, 2);
-            t.IsTrue(semaId > 0, "CreateSema should return a positive semaphore id");
+            t.IsTrue(semaId >= 0, "CreateSema should return a valid nonnegative semaphore id");
 
             setRegU32(env.ctx, 4, kClientAddr);
             setRegU32(env.ctx, 5, kSid);
@@ -1598,7 +1598,7 @@ void register_ps2_sif_rpc_tests()
             setRegU32(env.ctx, 4, kSemaParamAddr);
             CreateSema(env.rdram.data(), &env.ctx, &env.runtime);
             const int32_t semaId = getRegS32(env.ctx, 2);
-            t.IsTrue(semaId > 0, "CreateSema should return a positive semaphore id");
+            t.IsTrue(semaId >= 0, "CreateSema should return a valid nonnegative semaphore id");
 
             setRegU32(env.ctx, 4, kClientAddr);
             setRegU32(env.ctx, 5, kSid);

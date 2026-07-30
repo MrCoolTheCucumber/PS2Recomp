@@ -34,6 +34,7 @@ struct ThreadInfo
     std::condition_variable cv;
     std::atomic<bool> forceRelease{false};
     std::atomic<bool> terminated{false};
+    std::atomic<bool> semaWaitLinked{false};
 };
 
 // Thread status
@@ -212,7 +213,7 @@ inline std::unordered_map<int, std::thread> g_hostThreads;
 inline std::mutex g_host_thread_mutex;
 
 inline std::unordered_map<int, std::shared_ptr<SemaInfo>> g_semas;
-inline int g_nextSemaId = 1;
+inline int g_nextSemaId = 0;
 inline std::mutex g_sema_map_mutex;
 inline std::unordered_map<int, std::shared_ptr<EventFlagInfo>> g_eventFlags;
 inline int g_nextEventFlagId = 1;

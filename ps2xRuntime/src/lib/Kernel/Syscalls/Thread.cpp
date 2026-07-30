@@ -88,6 +88,27 @@ namespace ps2_syscalls
         }
     }
 
+    static bool transitionReleasedWaitLocked(
+        ThreadInfo &info,
+        int expectedWaitType,
+        int expectedWaitId)
+    {
+        if ((info.status != THS_WAIT &&
+             info.status != THS_WAITSUSPEND) ||
+            info.waitType != expectedWaitType ||
+            info.waitId != expectedWaitId)
+        {
+            return false;
+        }
+
+        info.forceRelease = true;
+        info.waitType = TSW_NONE;
+        info.waitId = 0;
+        info.status =
+            (info.suspendCount > 0) ? THS_SUSPEND : THS_READY;
+        return true;
+    }
+
     static void runExitHandlersForThread(int tid, uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
         if (!runtime || !ctx)
@@ -1158,7 +1179,11 @@ namespace ps2_syscalls
         RotateThreadReadyQueue(rdram, ctx, runtime);
     }
 
-    void ReleaseWaitThread(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    static void releaseWaitThread(
+        uint8_t *rdram,
+        R5900Context *ctx,
+        PS2Runtime *runtime,
+        bool reschedule)
     {
         int tid = static_cast<int>(getRegU32(ctx, 4));
         if (tid == 0 || tid == g_currentThreadId)
@@ -1182,21 +1207,33 @@ namespace ps2_syscalls
             std::lock_guard<std::mutex> lock(info->m);
             if (info->status == THS_WAIT || info->status == THS_WAITSUSPEND)
             {
-                wasWaiting = true;
                 waitType = info->waitType;
                 waitId = info->waitId;
-                info->forceRelease = true;
-                info->waitType = TSW_NONE;
-                info->waitId = 0;
-                if (info->suspendCount > 0)
+            }
+        }
+
+        if (waitType == TSW_SEMA)
+        {
+            auto sema = lookupSemaInfo(waitId);
+            if (sema)
+            {
+                std::lock_guard<std::mutex> semaLock(sema->m);
+                std::lock_guard<std::mutex> threadLock(info->m);
+                wasWaiting = transitionReleasedWaitLocked(
+                    *info, waitType, waitId);
+                if (wasWaiting &&
+                    info->semaWaitLinked.exchange(false) &&
+                    sema->waiters > 0)
                 {
-                    info->status = THS_SUSPEND;
-                }
-                else
-                {
-                    info->status = THS_READY;
+                    sema->waiters--;
                 }
             }
+        }
+        else
+        {
+            std::lock_guard<std::mutex> lock(info->m);
+            wasWaiting = transitionReleasedWaitLocked(
+                *info, waitType, waitId);
         }
 
         if (!wasWaiting)
@@ -1207,12 +1244,20 @@ namespace ps2_syscalls
 
         info->cv.notify_all();
         notifyThreadWaitObject(waitType, waitId);
-        setReturnS32(ctx, KE_OK);
-        yieldGuestExecutionAfterWake(runtime);
+        setReturnS32(ctx, tid);
+        if (reschedule)
+        {
+            yieldGuestExecutionAfterWake(runtime);
+        }
+    }
+
+    void ReleaseWaitThread(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        releaseWaitThread(rdram, ctx, runtime, true);
     }
 
     void iReleaseWaitThread(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
-        ReleaseWaitThread(rdram, ctx, runtime);
+        releaseWaitThread(rdram, ctx, runtime, false);
     }
 }

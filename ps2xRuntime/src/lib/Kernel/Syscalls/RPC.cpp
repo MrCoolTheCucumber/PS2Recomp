@@ -141,7 +141,7 @@ namespace ps2_syscalls
 
         bool signalRpcCompletionSema(uint32_t semaId)
         {
-            if (semaId == 0u || semaId > 0xFFFFu)
+            if (semaId > 0xFFFFu)
             {
                 return false;
             }

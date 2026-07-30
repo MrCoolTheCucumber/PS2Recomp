@@ -61,7 +61,7 @@ namespace ps2_syscalls
                 }
             }
             g_semas.clear();
-            g_nextSemaId = 1;
+            g_nextSemaId = 0;
         }
         for (const auto &sema : semas)
         {
