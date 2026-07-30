@@ -7392,7 +7392,9 @@ R5900Context *PS2Runtime::enterGuestExecution(
         return previousContext;
     }
 
-    if (!m_debugControlActive.load(std::memory_order_acquire))
+    if (m_eeRuntimeExecutor ||
+        !m_debugControlActive.load(
+            std::memory_order_acquire))
     {
         m_guestExecutionWaiters.fetch_add(1u, std::memory_order_acq_rel);
         lockGuestExecutionMutex(true);
@@ -8090,6 +8092,15 @@ void PS2Runtime::debugBlockGuestAtBoundary(R5900Context *ctx, const char *reason
     // before the debugger thread is allowed to inspect the paused runtime.
     debugPublishVuBackendDiagnostics();
 
+    if (m_eeRuntimeExecutor)
+    {
+        m_eeRuntimeExecutor->debugRequestPause();
+        yieldEeExecutorCurrent(
+            ps2x::ee::EeSchedulerExitReason::
+                Preempted);
+        return;
+    }
+
     // executeGuestStep() is called while this host thread owns the recursive
     // guest-execution mutex. Release all levels so debugger snapshots can be
     // proven quiescent while the guest remains stopped.
@@ -8222,6 +8233,8 @@ void PS2Runtime::debugAfterGuestStep(R5900Context *ctx)
 
 bool PS2Runtime::debugPause(std::chrono::milliseconds timeout)
 {
+    const auto deadline =
+        std::chrono::steady_clock::now() + timeout;
     m_debugControlActive.store(true, std::memory_order_release);
     bool newlyRequested = false;
     {
@@ -8240,7 +8253,54 @@ bool PS2Runtime::debugPause(std::chrono::milliseconds timeout)
     m_debugControlCv.notify_all();
     m_audioBackend.setDebuggerPaused(true);
 
-    const bool locked = m_guestExecutionMutex.try_lock_for(timeout);
+    if (m_eeRuntimeExecutor &&
+        m_eeRuntimeExecutor->running())
+    {
+        requestGuestPreemption();
+        m_eeRuntimeExecutor->debugRequestPause();
+        const bool paused =
+            m_eeRuntimeExecutor->debugWaitUntilPaused(
+                timeout);
+        if (paused)
+        {
+            const auto now =
+                std::chrono::steady_clock::now();
+            const auto remaining =
+                now < deadline
+                    ? std::chrono::duration_cast<
+                          std::chrono::milliseconds>(
+                          deadline - now)
+                    : std::chrono::milliseconds{0};
+            const bool locked =
+                m_guestExecutionMutex.try_lock_for(
+                    remaining);
+            if (locked)
+            {
+                debugPublishVuBackendDiagnostics();
+                m_guestExecutionMutex.unlock();
+                return true;
+            }
+        }
+
+        if (newlyRequested)
+        {
+            {
+                std::lock_guard<std::mutex> lock(
+                    m_debugControlMutex);
+                m_debugPauseRequested.store(
+                    false,
+                    std::memory_order_release);
+                debugRefreshControlActiveLocked();
+            }
+            m_eeRuntimeExecutor->debugResume();
+            m_debugControlCv.notify_all();
+            m_audioBackend.setDebuggerPaused(false);
+        }
+        return false;
+    }
+
+    const bool locked =
+        m_guestExecutionMutex.try_lock_for(timeout);
     if (locked)
     {
         debugPublishVuBackendDiagnostics();
@@ -8277,6 +8337,10 @@ void PS2Runtime::debugResume()
         debugRefreshControlActiveLocked();
     }
     m_debugControlCv.notify_all();
+    if (m_eeRuntimeExecutor)
+    {
+        m_eeRuntimeExecutor->debugResume();
+    }
     m_audioBackend.setDebuggerPaused(false);
 }
 
@@ -8366,6 +8430,10 @@ PS2Runtime::DebugStopInfo PS2Runtime::debugRunUntilPc(
         m_debugPauseRequested.store(false, std::memory_order_release);
         debugRefreshControlActiveLocked();
     }
+    if (m_eeRuntimeExecutor)
+    {
+        m_eeRuntimeExecutor->debugResume();
+    }
     m_debugControlCv.notify_all();
     m_audioBackend.setDebuggerPaused(false);
 
@@ -8378,7 +8446,22 @@ PS2Runtime::DebugStopInfo PS2Runtime::debugRunUntilPc(
         {
             if (m_debugStopSequence > baseline)
             {
-                return m_debugLastStop;
+                const DebugStopInfo stop =
+                    m_debugLastStop;
+                lock.unlock();
+                if (m_eeRuntimeExecutor &&
+                    !m_eeRuntimeExecutor
+                         ->debugWaitUntilPaused(
+                             timeout))
+                {
+                    return {
+                        false,
+                        "pause-timeout",
+                        stop.pc,
+                        stop.sequence,
+                    };
+                }
+                return stop;
             }
             return {false, "stopped", m_debugPc.load(std::memory_order_relaxed),
                     m_debugStopSequence};
@@ -8414,6 +8497,10 @@ PS2Runtime::DebugStopInfo PS2Runtime::debugStepDispatches(
         m_debugPauseRequested.store(false, std::memory_order_release);
         debugRefreshControlActiveLocked();
     }
+    if (m_eeRuntimeExecutor)
+    {
+        m_eeRuntimeExecutor->debugResume();
+    }
     m_debugControlCv.notify_all();
     m_audioBackend.setDebuggerPaused(false);
 
@@ -8426,7 +8513,22 @@ PS2Runtime::DebugStopInfo PS2Runtime::debugStepDispatches(
         {
             if (m_debugStopSequence > baseline)
             {
-                return m_debugLastStop;
+                const DebugStopInfo stop =
+                    m_debugLastStop;
+                lock.unlock();
+                if (m_eeRuntimeExecutor &&
+                    !m_eeRuntimeExecutor
+                         ->debugWaitUntilPaused(
+                             timeout))
+                {
+                    return {
+                        false,
+                        "pause-timeout",
+                        stop.pc,
+                        stop.sequence,
+                    };
+                }
+                return stop;
             }
             return {false, "stopped", m_debugPc.load(std::memory_order_relaxed),
                     m_debugStopSequence};

@@ -3,6 +3,7 @@
 #include "runtime/ee_execution_backend.h"
 #include "runtime/ee_scheduler_executor.h"
 
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <exception>
@@ -91,6 +92,11 @@ namespace ps2x::ee
         void notify() noexcept;
 
         void debugRequestPause() noexcept;
+        // Waits for the executor to process a boundary with the paused
+        // disposition. A pause request alone is not an acknowledgement while
+        // a continuation is still running.
+        [[nodiscard]] bool debugWaitUntilPaused(
+            std::chrono::milliseconds timeout);
         void debugResume() noexcept;
         [[nodiscard]] bool debugStepBoundaries(
             uint64_t count) noexcept;

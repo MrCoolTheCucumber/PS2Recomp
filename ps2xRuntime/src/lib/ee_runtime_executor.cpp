@@ -126,6 +126,7 @@ namespace ps2x::ee
                 m_failure = {};
                 m_startFailure = {};
                 m_executorThreadId = {};
+                m_pausedAtBoundary = false;
                 m_publications.clear();
                 ++m_statistics.starts;
                 m_statistics.modeledTick = {};
@@ -266,6 +267,24 @@ namespace ps2x::ee
             notify();
         }
 
+        [[nodiscard]] bool debugWaitUntilPaused(
+            std::chrono::milliseconds timeout)
+        {
+            std::unique_lock<std::mutex> lock(m_mutex);
+            (void)m_cv.wait_for(
+                lock,
+                timeout,
+                [this]()
+                {
+                    return m_pausedAtBoundary ||
+                           m_stopRequested ||
+                           m_failure ||
+                           (!m_running &&
+                            !m_starting);
+                });
+            return m_pausedAtBoundary;
+        }
+
         void debugResume() noexcept
         {
             m_boundaryExecutor.debugResume();
@@ -287,7 +306,8 @@ namespace ps2x::ee
 
         [[nodiscard]] bool debugPaused() const noexcept
         {
-            return m_boundaryExecutor.debugPaused();
+            std::lock_guard<std::mutex> lock(m_mutex);
+            return m_pausedAtBoundary;
         }
 
         void requestStop() noexcept
@@ -637,6 +657,15 @@ namespace ps2x::ee
                     priorThreadId.reset();
                     elapsed = {};
                     cacheBoundary(boundary);
+                    {
+                        std::lock_guard<std::mutex> lock(
+                            m_mutex);
+                        m_pausedAtBoundary =
+                            boundary.disposition ==
+                            EeSchedulerExecutorDisposition::
+                                Paused;
+                    }
+                    m_cv.notify_all();
 
                     if (boundary.limitExceeded)
                     {
@@ -802,6 +831,7 @@ namespace ps2x::ee
                 m_acceptingPublications = false;
                 m_startComplete = true;
                 m_executorThreadId = {};
+                m_pausedAtBoundary = false;
             }
             m_cv.notify_all();
         }
@@ -848,6 +878,7 @@ namespace ps2x::ee
         bool m_running = false;
         bool m_acceptingPublications = false;
         bool m_stopRequested = false;
+        bool m_pausedAtBoundary = false;
         uint64_t m_wakeGeneration = 0u;
         std::thread::id m_executorThreadId;
         std::deque<Publication> m_publications;
@@ -908,6 +939,12 @@ namespace ps2x::ee
     void EeRuntimeExecutor::debugRequestPause() noexcept
     {
         m_impl->debugRequestPause();
+    }
+
+    bool EeRuntimeExecutor::debugWaitUntilPaused(
+        std::chrono::milliseconds timeout)
+    {
+        return m_impl->debugWaitUntilPaused(timeout);
     }
 
     void EeRuntimeExecutor::debugResume() noexcept

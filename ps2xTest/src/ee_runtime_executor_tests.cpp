@@ -466,6 +466,134 @@ void register_ee_runtime_executor_tests()
             });
 
         tc.Run(
+            "debug pause is acknowledged after the running continuation exits",
+            [](TestCase &t)
+            {
+                ScriptedRuntimeBackend backend;
+                EeRuntimeExecutor executor(backend);
+                std::mutex stageMutex;
+                std::condition_variable stageCv;
+                bool resumeEntered = false;
+                bool allowBoundary = false;
+                std::atomic<bool> publicationApplied{
+                    false};
+                std::atomic<bool> completed{false};
+
+                backend.plan(
+                    1,
+                    {
+                        [&]()
+                        {
+                            std::unique_lock<std::mutex>
+                                lock(stageMutex);
+                            resumeEntered = true;
+                            stageCv.notify_all();
+                            stageCv.wait(
+                                lock,
+                                [&]()
+                                {
+                                    return allowBoundary;
+                                });
+                            return EeSchedulerRunResult{
+                                EeSchedulerExitReason::
+                                    Preempted,
+                                1u,
+                                {},
+                                {}};
+                        },
+                        [&]()
+                        {
+                            completed.store(
+                                true,
+                                std::memory_order_release);
+                            stageCv.notify_all();
+                            return EeSchedulerRunResult{
+                                EeSchedulerExitReason::
+                                    Finished,
+                                1u,
+                                {},
+                                {}};
+                        },
+                    });
+                executor.start(
+                    [](EeThreadScheduler &scheduler,
+                       IEeExecutionBackend &selectedBackend)
+                    {
+                        selectedBackend.create(1, []()
+                        {
+                        });
+                        if (!scheduler.addRunningThread(
+                                1, 1u, 10))
+                        {
+                            throw std::logic_error(
+                                "failed to seed debugger "
+                                "pause fixture");
+                        }
+                    });
+                const bool entered = waitFor(
+                    stageCv,
+                    stageMutex,
+                    [&]()
+                    {
+                        return resumeEntered;
+                    });
+                executor.debugRequestPause();
+                const bool didNotAcknowledgeEarly =
+                    !executor.debugWaitUntilPaused(10ms);
+                const bool published =
+                    executor.publish(
+                        [&](EeThreadScheduler &,
+                            IEeExecutionBackend &)
+                        {
+                            publicationApplied.store(
+                                true,
+                                std::memory_order_release);
+                        },
+                        EeSchedulerReschedulePolicy::None);
+                {
+                    std::lock_guard<std::mutex> lock(
+                        stageMutex);
+                    allowBoundary = true;
+                }
+                stageCv.notify_all();
+
+                const bool paused =
+                    executor.debugWaitUntilPaused(2s);
+                const bool reportedPaused =
+                    paused && executor.debugPaused();
+                const bool commandRanWhilePaused =
+                    publicationApplied.load(
+                        std::memory_order_acquire) &&
+                    !completed.load(
+                        std::memory_order_acquire);
+                executor.debugResume();
+                const bool resumed = waitFor(
+                    stageCv,
+                    stageMutex,
+                    [&]()
+                    {
+                        return completed.load(
+                            std::memory_order_acquire);
+                    });
+                executor.requestStop();
+                executor.join();
+                executor.rethrowFailure();
+
+                t.IsTrue(
+                    entered &&
+                        didNotAcknowledgeEarly &&
+                        published && reportedPaused &&
+                        executor.debugPaused() == false,
+                    "pause acknowledgement should follow "
+                    "the running continuation's boundary");
+                t.IsTrue(
+                    commandRanWhilePaused && resumed,
+                    "the paused executor should apply "
+                    "commands and resume the same "
+                    "continuation on request");
+            });
+
+        tc.Run(
             "scripted wake publication observes committed wait",
             [](TestCase &t)
             {

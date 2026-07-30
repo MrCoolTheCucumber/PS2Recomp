@@ -141,6 +141,10 @@ namespace
         0x25ad00u;
     constexpr uint32_t K_EXECUTOR_PRIORITY_MARKER_ENTRY =
         0x25ae00u;
+    constexpr uint32_t K_EXECUTOR_DEBUG_SPIN_ENTRY =
+        0x25af00u;
+    constexpr uint32_t K_EXECUTOR_DEBUG_TARGET_ENTRY =
+        0x25b000u;
 
     std::mutex g_guestWordMutex;
     std::mutex g_alarmCallbackThreadMutex;
@@ -301,6 +305,12 @@ namespace
     int g_executorPriorityStatusValue = -1;
     int g_executorPriorityFirstThreadId = 0;
     int g_executorPrioritySecondThreadId = 0;
+    std::atomic<uint32_t> g_executorDebugSpinCount{0u};
+    std::atomic<bool> g_executorDebugFinish{false};
+    std::atomic<bool> g_executorDebugTargetRequested{
+        false};
+    std::atomic<bool> g_executorDebugBoundaryApplied{
+        false};
 
     struct EeThreadStatus
     {
@@ -2488,6 +2498,47 @@ namespace
             g_executorPriorityCompleted = true;
         }
         ctx->pc = 0u;
+    }
+
+    void dedicatedExecutorDebugSpinHandler(
+        uint8_t *,
+        R5900Context *ctx,
+        PS2Runtime *)
+    {
+        g_executorDebugSpinCount.fetch_add(
+            1u, std::memory_order_relaxed);
+        if (g_executorDebugFinish.load(
+                std::memory_order_acquire))
+        {
+            ctx->pc = 0u;
+        }
+        else if (
+            g_executorDebugTargetRequested.exchange(
+                false,
+                std::memory_order_acq_rel))
+        {
+            ctx->pc =
+                K_EXECUTOR_DEBUG_TARGET_ENTRY;
+        }
+        else
+        {
+            ctx->pc =
+                K_EXECUTOR_DEBUG_SPIN_ENTRY;
+        }
+    }
+
+    void dedicatedExecutorDebugTargetHandler(
+        uint8_t *,
+        R5900Context *ctx,
+        PS2Runtime *)
+    {
+        g_executorDebugSpinCount.fetch_add(
+            1u, std::memory_order_relaxed);
+        ctx->pc =
+            g_executorDebugFinish.load(
+                std::memory_order_acquire)
+                ? 0u
+                : K_EXECUTOR_DEBUG_SPIN_ENTRY;
     }
 
     struct TestEnv
@@ -4824,6 +4875,171 @@ void register_ps2_runtime_kernel_tests()
                             "priority and ownership "
                             "authoritative");
                 }
+            });
+
+        tc.Run(
+            "fiber debugger pause leaves the executor responsive",
+            [](TestCase &t)
+            {
+                if (!eeExecutionBackendBuildInfo()
+                         .boostContextFcontextAvailable)
+                {
+                    return;
+                }
+
+                PS2RuntimeConfiguration configuration{};
+                configuration.eeExecutionBackend =
+                    EeExecutionBackendKind::LegacyCppFiber;
+                PS2Runtime runtime(configuration);
+                const bool memoryInitialized =
+                    runtime.memory().initialize();
+                if (!memoryInitialized)
+                {
+                    t.IsTrue(
+                        false,
+                        "fiber debugger fixture memory should initialize");
+                    return;
+                }
+
+                runtime.registerFunction(
+                    K_EXECUTOR_DEBUG_SPIN_ENTRY,
+                    &dedicatedExecutorDebugSpinHandler);
+                runtime.registerFunction(
+                    K_EXECUTOR_DEBUG_TARGET_ENTRY,
+                    &dedicatedExecutorDebugTargetHandler);
+                runtime.cpu().pc =
+                    K_EXECUTOR_DEBUG_SPIN_ENTRY;
+                setRegU32(
+                    runtime.cpu(),
+                    29,
+                    0x00300000u);
+                g_executorDebugSpinCount.store(
+                    0u, std::memory_order_release);
+                g_executorDebugFinish.store(
+                    false, std::memory_order_release);
+                g_executorDebugTargetRequested.store(
+                    false, std::memory_order_release);
+                g_executorDebugBoundaryApplied.store(
+                    false, std::memory_order_release);
+
+                runtime
+                    .startDedicatedEeExecutionForTesting();
+                const bool guestStarted = waitUntil(
+                    []()
+                    {
+                        return g_executorDebugSpinCount
+                                   .load(
+                                       std::memory_order_acquire) >=
+                               8u;
+                    },
+                    std::chrono::seconds(2));
+                const bool paused =
+                    guestStarted &&
+                    runtime.debugPause(
+                        std::chrono::milliseconds(500));
+                const bool guestQuiesced =
+                    paused &&
+                    waitUntil(
+                        []()
+                        {
+                            const uint32_t before =
+                                g_executorDebugSpinCount
+                                    .load(
+                                        std::memory_order_acquire);
+                            std::this_thread::sleep_for(
+                                std::chrono::
+                                    milliseconds(2));
+                            return before ==
+                                   g_executorDebugSpinCount
+                                       .load(
+                                           std::memory_order_acquire);
+                        },
+                        std::chrono::
+                            milliseconds(200));
+                const bool publicationAccepted =
+                    guestQuiesced &&
+                    runtime.publishEeSchedulerUpdate(
+                        [](
+                            ps2x::ee::
+                                EeThreadScheduler &)
+                        {
+                            g_executorDebugBoundaryApplied
+                                .store(
+                                    true,
+                                    std::memory_order_release);
+                        },
+                        ps2x::ee::
+                            EeSchedulerReschedulePolicy::
+                                None);
+                const bool appliedWhilePaused =
+                    publicationAccepted &&
+                    waitUntil(
+                        []()
+                        {
+                            return g_executorDebugBoundaryApplied
+                                .load(
+                                    std::memory_order_acquire);
+                        },
+                        std::chrono::
+                            milliseconds(100));
+
+                const auto step =
+                    runtime.debugStepDispatches(
+                        1u,
+                        std::chrono::seconds(1));
+                g_executorDebugTargetRequested.store(
+                    true, std::memory_order_release);
+                const auto target =
+                    runtime.debugRunUntilPc(
+                        K_EXECUTOR_DEBUG_TARGET_ENTRY,
+                        std::chrono::seconds(1));
+
+                g_executorDebugFinish.store(
+                    true, std::memory_order_release);
+                runtime.debugResume();
+                const bool continuationRetired =
+                    waitUntil(
+                        [&runtime]()
+                        {
+                            return runtime
+                                       .managedEeExecutionThreadCountForTesting() ==
+                                   0u;
+                        },
+                        std::chrono::seconds(2));
+                runtime
+                    .stopDedicatedEeExecutionForTesting();
+
+                t.IsTrue(
+                    memoryInitialized && guestStarted,
+                    "debugger fixture should start its running fiber");
+                t.IsTrue(
+                    paused,
+                    "debug pause should reach an acknowledged executor boundary");
+                t.IsTrue(
+                    guestQuiesced,
+                    "debug pause should quiesce a running fiber at a guest boundary");
+                t.IsTrue(
+                    publicationAccepted &&
+                        appliedWhilePaused,
+                    "a paused guest fiber should leave the executor free to apply boundary commands");
+                t.IsTrue(
+                    step.completed &&
+                        step.reason == "step" &&
+                        step.pc ==
+                            K_EXECUTOR_DEBUG_SPIN_ENTRY,
+                    "dispatch stepping should resume one fiber step and stop on the executor again");
+                t.IsTrue(
+                    target.completed &&
+                        target.reason == "predicate" &&
+                        target.pc ==
+                            K_EXECUTOR_DEBUG_TARGET_ENTRY,
+                    "run-until should stop before its target handler while leaving the executor responsive");
+                t.IsTrue(
+                    continuationRetired &&
+                        g_executorDebugBoundaryApplied
+                            .load(
+                                std::memory_order_acquire),
+                    "debug resume should finish the guest and retain the paused boundary command");
             });
 
         tc.Run("host presentation upload state is isolated per runtime", [](TestCase &t)
