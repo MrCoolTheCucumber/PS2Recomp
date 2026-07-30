@@ -23,6 +23,17 @@ inline int g_nextFd = 3; // Start after stdin, stdout, stderr
 #define TSW_SEMA 2
 #define TSW_EVENT 3
 
+static_assert(THS_RUN == EeThreadGuestState::kRun);
+static_assert(THS_READY == EeThreadGuestState::kReady);
+static_assert(THS_WAIT == EeThreadGuestState::kWait);
+static_assert(THS_SUSPEND == EeThreadGuestState::kSuspend);
+static_assert(THS_WAITSUSPEND == EeThreadGuestState::kWaitSuspend);
+static_assert(THS_DORMANT == EeThreadGuestState::kDormant);
+static_assert(TSW_NONE == EeThreadGuestState::kWaitNone);
+static_assert(TSW_SLEEP == EeThreadGuestState::kWaitSleep);
+static_assert(TSW_SEMA == EeThreadGuestState::kWaitSemaphore);
+static_assert(TSW_EVENT == EeThreadGuestState::kWaitEvent);
+
 // Common kernel-like error codes used by thread/event/alarm syscalls.
 constexpr int KE_OK = 0;
 constexpr int KE_ERROR = -1;

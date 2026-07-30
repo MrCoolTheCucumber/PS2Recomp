@@ -30,6 +30,11 @@ namespace ps2_syscalls
         int wakeupCount = 0;
         int currentPriority = 0;
         int suspendCount = 0;
+        int waitQueue = 0;
+        int waitQueueId = 0;
+        uint64_t stateRevision = 0u;
+        bool waitCompletionPending = false;
+        bool stateValid = false;
         bool started = false;
         bool forceRelease = false;
         bool terminated = false;

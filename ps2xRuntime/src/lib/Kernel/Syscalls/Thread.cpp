@@ -61,17 +61,26 @@ namespace ps2_syscalls
             snapshot.id = id;
             {
                 std::lock_guard<std::mutex> lock(info->m);
+                const EeThreadGuestStateSnapshot &guest =
+                    info->guestState.snapshot();
                 snapshot.entry = info->entry;
                 snapshot.stack = info->stack;
                 snapshot.stackSize = info->stackSize;
                 snapshot.gp = info->gp;
-                snapshot.status = info->status;
-                snapshot.waitType = info->waitType;
-                snapshot.waitId = info->waitId;
-                snapshot.wakeupCount = info->wakeupCount;
-                snapshot.currentPriority = info->currentPriority;
-                snapshot.suspendCount = info->suspendCount;
-                snapshot.started = info->started;
+                snapshot.status = guest.status;
+                snapshot.waitType = guest.waitType;
+                snapshot.waitId = guest.waitId;
+                snapshot.wakeupCount = guest.wakeupCount;
+                snapshot.currentPriority = guest.currentPriority;
+                snapshot.suspendCount = guest.suspendCount;
+                snapshot.waitQueue =
+                    static_cast<int>(guest.waitQueue);
+                snapshot.waitQueueId = guest.waitQueueId;
+                snapshot.stateRevision = guest.revision;
+                snapshot.waitCompletionPending =
+                    guest.waitCompletionPending;
+                snapshot.stateValid = info->guestState.isValid();
+                snapshot.started = guest.started;
             }
             snapshot.pc = info->currentPc.load(std::memory_order_relaxed);
             snapshot.forceRelease =
@@ -81,18 +90,6 @@ namespace ps2_syscalls
             snapshots.push_back(snapshot);
         }
         return snapshots;
-    }
-
-    static void applySuspendStatusLocked(ThreadInfo &info)
-    {
-        if (info.waitType != TSW_NONE)
-        {
-            info.status = THS_WAITSUSPEND;
-        }
-        else
-        {
-            info.status = THS_SUSPEND;
-        }
     }
 
     static void notifyThreadWaitObject(int waitType, int waitId)
@@ -120,19 +117,22 @@ namespace ps2_syscalls
         int expectedWaitType,
         int expectedWaitId)
     {
-        if ((info.status != THS_WAIT &&
-             info.status != THS_WAITSUSPEND) ||
-            info.waitType != expectedWaitType ||
-            info.waitId != expectedWaitId)
+        const EeThreadWaitQueue queue =
+            expectedWaitType == TSW_SEMA
+                ? EeThreadWaitQueue::Semaphore
+                : (expectedWaitType == TSW_EVENT
+                       ? EeThreadWaitQueue::EventFlag
+                       : EeThreadWaitQueue::Sleep);
+        if (!info.guestState.releaseWait(
+                queue,
+                expectedWaitType,
+                expectedWaitId,
+                false))
         {
             return false;
         }
 
         info.forceRelease = true;
-        info.waitType = TSW_NONE;
-        info.waitId = 0;
-        info.status =
-            (info.suspendCount > 0) ? THS_SUSPEND : THS_READY;
         return true;
     }
 
@@ -210,7 +210,7 @@ namespace ps2_syscalls
         auto info = ensureCurrentThreadInfo(runtime, ctx);
         {
             std::lock_guard<std::mutex> lock(info->m);
-            info->currentPriority = 1;
+            info->guestState.setCurrentPriority(1);
         }
         setReturnS32(ctx, 1);
     }
@@ -256,7 +256,8 @@ namespace ps2_syscalls
         {
             info->priority = 127;
         }
-        info->currentPriority = static_cast<int>(info->priority);
+        info->guestState.setCurrentPriority(
+            static_cast<int>(info->priority));
 
         int id = 0;
         {
@@ -326,7 +327,10 @@ namespace ps2_syscalls
         uint32_t autoStackToFree = 0;
         {
             std::lock_guard<std::mutex> lock(info->m);
-            if (info->started || info->status != THS_DORMANT)
+            const EeThreadGuestStateSnapshot &guest =
+                info->guestState.snapshot();
+            if (guest.started ||
+                guest.status != THS_DORMANT)
             {
                 setReturnS32(ctx, KE_NOT_DORMANT);
                 return;
@@ -400,21 +404,19 @@ namespace ps2_syscalls
 
         {
             std::lock_guard<std::mutex> lock(info->m);
-            if (info->started || info->status != THS_DORMANT)
+            const EeThreadGuestStateSnapshot &guest =
+                info->guestState.snapshot();
+            if (guest.started ||
+                guest.status != THS_DORMANT)
             {
                 setReturnS32(ctx, KE_NOT_DORMANT);
                 return;
             }
 
-            info->started = true;
-            info->status = THS_READY;
+            info->guestState.start();
             info->arg = arg;
             info->terminated = false;
             info->forceRelease = false;
-            info->waitType = TSW_NONE;
-            info->waitId = 0;
-            info->wakeupCount = 0;
-            info->suspendCount = 0;
             if (info->stack == 0 && info->stackSize != 0)
             {
                 const uint32_t autoStack = runtime->guestMalloc(info->stackSize, 16u);
@@ -453,10 +455,17 @@ namespace ps2_syscalls
 
             {
                 std::lock_guard<std::mutex> lock(info->m);
-                info->status =
-                    info->terminated.load(std::memory_order_relaxed)
-                        ? THS_DORMANT
-                        : THS_RUN;
+                if (info->terminated.load(
+                        std::memory_order_relaxed))
+                {
+                    info->guestState.makeDormant();
+                }
+                else if (
+                    info->guestState.snapshot().suspendCount ==
+                    0)
+                {
+                    info->guestState.publishRunning();
+                }
             }
 
             uint32_t threadSp = callerSp;
@@ -584,12 +593,7 @@ namespace ps2_syscalls
             uint32_t detachedAutoStack = 0;
             {
                 std::lock_guard<std::mutex> lock(info->m);
-                info->started = false;
-                info->status = THS_DORMANT;
-                info->waitType = TSW_NONE;
-                info->waitId = 0;
-                info->wakeupCount = 0;
-                info->suspendCount = 0;
+                info->guestState.makeDormant();
                 info->forceRelease = false;
                 info->terminated = false;
             }
@@ -638,12 +642,7 @@ namespace ps2_syscalls
                 .activeHostThreads.fetch_sub(
                 1, std::memory_order_relaxed);
             std::lock_guard<std::mutex> lock(info->m);
-            info->started = false;
-            info->status = THS_DORMANT;
-            info->waitType = TSW_NONE;
-            info->waitId = 0;
-            info->wakeupCount = 0;
-            info->suspendCount = 0;
+            info->guestState.makeDormant();
             info->forceRelease = false;
             info->terminated = false;
             setReturnS32(ctx, KE_ERROR);
@@ -665,9 +664,7 @@ namespace ps2_syscalls
             std::lock_guard<std::mutex> lock(info->m);
             info->terminated = true;
             info->forceRelease = true;
-            info->waitType = TSW_NONE;
-            info->waitId = 0;
-            info->wakeupCount = 0;
+            info->guestState.makeDormant();
         }
         if (info)
         {
@@ -689,9 +686,7 @@ namespace ps2_syscalls
             std::lock_guard<std::mutex> lock(info->m);
             info->terminated = true;
             info->forceRelease = true;
-            info->waitType = TSW_NONE;
-            info->waitId = 0;
-            info->wakeupCount = 0;
+            info->guestState.makeDormant();
         }
         if (info)
         {
@@ -734,13 +729,14 @@ namespace ps2_syscalls
         {
             {
                 std::lock_guard<std::mutex> lock(info->m);
-                if (info->status == THS_DORMANT)
+                if (info->guestState.isDormant())
                 {
                     setReturnS32(ctx, KE_DORMANT);
                     return;
                 }
                 info->terminated = true;
                 info->forceRelease = true;
+                info->guestState.makeDormant();
             }
             info->cv.notify_all();
             runExitHandlersForThread(tid, rdram, ctx, runtime);
@@ -751,13 +747,15 @@ namespace ps2_syscalls
         int waitId = 0;
         {
             std::lock_guard<std::mutex> lock(info->m);
-            if (info->status == THS_DORMANT)
+            const EeThreadGuestStateSnapshot &guest =
+                info->guestState.snapshot();
+            if (guest.status == THS_DORMANT)
             {
                 setReturnS32(ctx, KE_DORMANT);
                 return;
             }
-            waitType = info->waitType;
-            waitId = info->waitId;
+            waitType = guest.waitType;
+            waitId = guest.waitId;
         }
 
         bool transitioned = false;
@@ -768,23 +766,43 @@ namespace ps2_syscalls
             {
                 std::lock_guard<std::mutex> semaLock(sema->m);
                 std::lock_guard<std::mutex> threadLock(info->m);
-                if (info->status != THS_DORMANT)
+                if (!info->guestState.isDormant())
                 {
-                    if (info->waitType == TSW_SEMA &&
-                        info->waitId == waitId &&
-                        info->semaWaitLinked.exchange(false) &&
+                    if (info->guestState.isLinkedTo(
+                            EeThreadWaitQueue::Semaphore,
+                            waitId) &&
                         sema->waiters > 0)
                     {
                         sema->waiters--;
                     }
                     info->terminated = true;
                     info->forceRelease = true;
-                    info->started = false;
-                    info->status = THS_DORMANT;
-                    info->waitType = TSW_NONE;
-                    info->waitId = 0;
-                    info->wakeupCount = 0;
-                    info->suspendCount = 0;
+                    info->guestState.makeDormant();
+                    transitioned = true;
+                }
+            }
+        }
+        else if (waitType == TSW_EVENT)
+        {
+            auto eventFlag = lookupEventFlagInfo(waitId);
+            if (eventFlag)
+            {
+                std::lock_guard<std::mutex> eventLock(
+                    eventFlag->m);
+                std::lock_guard<std::mutex> threadLock(
+                    info->m);
+                if (!info->guestState.isDormant())
+                {
+                    if (info->guestState.isLinkedTo(
+                            EeThreadWaitQueue::EventFlag,
+                            waitId) &&
+                        eventFlag->waiters > 0)
+                    {
+                        --eventFlag->waiters;
+                    }
+                    info->terminated = true;
+                    info->forceRelease = true;
+                    info->guestState.makeDormant();
                     transitioned = true;
                 }
             }
@@ -793,19 +811,14 @@ namespace ps2_syscalls
         if (!transitioned)
         {
             std::lock_guard<std::mutex> lock(info->m);
-            if (info->status == THS_DORMANT)
+            if (info->guestState.isDormant())
             {
                 setReturnS32(ctx, KE_DORMANT);
                 return;
             }
             info->terminated = true;
             info->forceRelease = true;
-            info->started = false;
-            info->status = THS_DORMANT;
-            info->waitType = TSW_NONE;
-            info->waitId = 0;
-            info->wakeupCount = 0;
-            info->suspendCount = 0;
+            info->guestState.makeDormant();
         }
 
         info->cv.notify_all();
@@ -851,13 +864,12 @@ namespace ps2_syscalls
 
         {
             std::lock_guard<std::mutex> lock(info->m);
-            if (info->status == THS_DORMANT)
+            if (info->guestState.isDormant())
             {
                 setReturnS32(ctx, KE_DORMANT);
                 return;
             }
-            info->suspendCount++;
-            applySuspendStatusLocked(*info);
+            info->guestState.suspend();
         }
         info->cv.notify_all();
 
@@ -871,14 +883,17 @@ namespace ps2_syscalls
                 [&]()
                 {
                     info->cv.wait(lock, [&]()
-                                  { return info->suspendCount == 0 || info->terminated.load(); });
+                                  {
+                                      return info->guestState.snapshot().suspendCount == 0 ||
+                                             info->terminated.load();
+                                  });
                 },
                 [&]()
                 {
                     terminated = info->terminated.load();
                     if (!terminated)
                     {
-                        info->status = THS_RUN;
+                        info->guestState.publishRunning();
                     }
                 });
 
@@ -927,29 +942,21 @@ namespace ps2_syscalls
         bool becameRunnable = false;
         {
             std::lock_guard<std::mutex> lock(info->m);
-            if (info->status == THS_DORMANT)
+            const EeThreadGuestStateSnapshot &guest =
+                info->guestState.snapshot();
+            if (guest.status == THS_DORMANT)
             {
                 setReturnS32(ctx, KE_DORMANT);
                 return;
             }
-            if (info->suspendCount <= 0)
+            if (guest.suspendCount <= 0)
             {
                 setReturnS32(ctx, KE_NOT_SUSPEND);
                 return;
             }
-            info->suspendCount--;
-            if (info->suspendCount == 0)
-            {
-                if (info->waitType != TSW_NONE)
-                {
-                    info->status = THS_WAIT;
-                }
-                else
-                {
-                    info->status = (tid == getCurrentThreadId(runtime)) ? THS_RUN : THS_READY;
-                    becameRunnable = tid != getCurrentThreadId(runtime);
-                }
-            }
+            info->guestState.resume(
+                tid == getCurrentThreadId(runtime),
+                becameRunnable);
         }
         info->cv.notify_all();
         setReturnS32(ctx, tid);
@@ -1005,19 +1012,21 @@ namespace ps2_syscalls
         }
 
         std::lock_guard<std::mutex> lock(info->m);
-        status->status = info->status;
+        const EeThreadGuestStateSnapshot &guest =
+            info->guestState.snapshot();
+        status->status = guest.status;
         status->func = info->entry;
         status->stack = info->stack;
         status->stack_size = info->stackSize;
         status->gp_reg = info->gp;
         status->initial_priority = info->priority;
-        status->current_priority = info->currentPriority;
+        status->current_priority = guest.currentPriority;
         status->attr = info->attr;
         status->option = info->option;
-        status->waitType = info->waitType;
-        status->waitId = info->waitId;
-        status->wakeupCount = info->wakeupCount;
-        setReturnS32(ctx, info->status);
+        status->waitType = guest.waitType;
+        status->waitId = guest.waitId;
+        status->wakeupCount = guest.wakeupCount;
+        setReturnS32(ctx, guest.status);
     }
 
     void ReferThreadStatus(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
@@ -1049,14 +1058,11 @@ namespace ps2_syscalls
         bool terminated = false;
         std::unique_lock<std::mutex> lock(info->m);
 
-        if (info->wakeupCount > 0)
+        if (info->guestState.consumeWakeup())
         {
-            info->wakeupCount--;
-            info->status = THS_RUN;
-            info->waitType = TSW_NONE;
-            info->waitId = 0;
             ret = getCurrentThreadId(runtime);
-            wakeupCountAfter = info->wakeupCount;
+            wakeupCountAfter =
+                info->guestState.snapshot().wakeupCount;
         }
         else
         {
@@ -1070,9 +1076,10 @@ namespace ps2_syscalls
                                                        << std::dec << std::endl);
             }
 
-            info->status = THS_WAIT;
-            info->waitType = TSW_SLEEP;
-            info->waitId = 0;
+            info->guestState.block(
+                EeThreadWaitQueue::Sleep,
+                TSW_SLEEP,
+                0);
             info->forceRelease = false;
 
             waitWithGuestExecutionReleasedUntilUnlocked(
@@ -1082,7 +1089,8 @@ namespace ps2_syscalls
                 {
                     info->cv.wait(lock, [&]()
                                   {
-                                      return info->waitType != TSW_SLEEP ||
+                                      return !info->guestState.isWaitingOn(
+                                                 TSW_SLEEP, 0) ||
                                              info->forceRelease.load() ||
                                              info->terminated.load();
                                   });
@@ -1095,12 +1103,11 @@ namespace ps2_syscalls
                         return;
                     }
 
-                    info->status =
-                        (info->suspendCount > 0)
-                            ? THS_SUSPEND
-                            : THS_RUN;
-                    info->waitType = TSW_NONE;
-                    info->waitId = 0;
+                    info->guestState.finishWait(
+                        EeThreadWaitQueue::Sleep,
+                        TSW_SLEEP,
+                        0,
+                        false);
 
                     if (info->forceRelease.load())
                     {
@@ -1111,7 +1118,8 @@ namespace ps2_syscalls
                     {
                         ret = getCurrentThreadId(runtime);
                     }
-                    wakeupCountAfter = info->wakeupCount;
+                    wakeupCountAfter =
+                        info->guestState.snapshot().wakeupCount;
                 });
         }
 
@@ -1133,6 +1141,17 @@ namespace ps2_syscalls
         if (lock.owns_lock())
         {
             lock.unlock();
+        }
+        {
+            std::lock_guard<std::mutex> stateLock(info->m);
+            const EeThreadGuestStateSnapshot &guest =
+                info->guestState.snapshot();
+            if (!info->terminated.load() &&
+                guest.suspendCount == 0 &&
+                guest.status == THS_READY)
+            {
+                info->guestState.publishRunning();
+            }
         }
         waitWhileSuspended(info, runtime);
         setReturnS32(ctx, ret);
@@ -1172,34 +1191,24 @@ namespace ps2_syscalls
         bool wokeSleeper = false;
         {
             std::lock_guard<std::mutex> lock(info->m);
-            if (info->status == THS_DORMANT)
+            if (info->guestState.isDormant())
             {
                 setReturnS32(ctx, KE_DORMANT);
                 return;
             }
-            if ((info->status == THS_WAIT ||
-                 info->status == THS_WAITSUSPEND) &&
-                info->waitType == TSW_SLEEP)
+            if (info->guestState.wakeSleeping())
             {
-                if (info->suspendCount > 0)
-                {
-                    info->status = THS_SUSPEND;
-                }
-                else
-                {
-                    info->status = THS_READY;
-                }
-                info->waitType = TSW_NONE;
-                info->waitId = 0;
                 info->cv.notify_one();
                 wokeSleeper = true;
             }
             else
             {
-                info->wakeupCount++;
+                info->guestState.incrementWakeup();
             }
-            newWakeupCount = info->wakeupCount;
-            statusAfter = info->status;
+            const EeThreadGuestStateSnapshot &guest =
+                info->guestState.snapshot();
+            newWakeupCount = guest.wakeupCount;
+            statusAfter = guest.status;
         }
 
         static std::atomic<uint32_t> s_wakeupLogs{0};
@@ -1247,8 +1256,7 @@ namespace ps2_syscalls
         int previous = 0;
         {
             std::lock_guard<std::mutex> lock(info->m);
-            previous = info->wakeupCount;
-            info->wakeupCount = 0;
+            previous = info->guestState.cancelWakeups();
         }
         setReturnS32(ctx, previous);
     }
@@ -1272,8 +1280,7 @@ namespace ps2_syscalls
         int previous = 0;
         {
             std::lock_guard<std::mutex> lock(info->m);
-            previous = info->wakeupCount;
-            info->wakeupCount = 0;
+            previous = info->guestState.cancelWakeups();
         }
         setReturnS32(ctx, previous);
     }
@@ -1302,7 +1309,7 @@ namespace ps2_syscalls
 
         {
             std::lock_guard<std::mutex> lock(info->m);
-            if (info->status == THS_DORMANT)
+            if (info->guestState.isDormant())
             {
                 setReturnS32(ctx, KE_DORMANT);
                 return;
@@ -1314,8 +1321,8 @@ namespace ps2_syscalls
                 return;
             }
 
-            previousPriority = info->currentPriority;
-            info->currentPriority = newPrio;
+            previousPriority =
+                info->guestState.changeCurrentPriority(newPrio);
         }
 
         setReturnS32(ctx, previousPriority);
@@ -1408,10 +1415,13 @@ namespace ps2_syscalls
 
         {
             std::lock_guard<std::mutex> lock(info->m);
-            if (info->status == THS_WAIT || info->status == THS_WAITSUSPEND)
+            const EeThreadGuestStateSnapshot &guest =
+                info->guestState.snapshot();
+            if (guest.status == THS_WAIT ||
+                guest.status == THS_WAITSUSPEND)
             {
-                waitType = info->waitType;
-                waitId = info->waitId;
+                waitType = guest.waitType;
+                waitId = guest.waitId;
             }
         }
 
@@ -1425,10 +1435,27 @@ namespace ps2_syscalls
                 wasWaiting = transitionReleasedWaitLocked(
                     *info, waitType, waitId);
                 if (wasWaiting &&
-                    info->semaWaitLinked.exchange(false) &&
                     sema->waiters > 0)
                 {
                     sema->waiters--;
+                }
+            }
+        }
+        else if (waitType == TSW_EVENT)
+        {
+            auto eventFlag = lookupEventFlagInfo(waitId);
+            if (eventFlag)
+            {
+                std::lock_guard<std::mutex> eventLock(
+                    eventFlag->m);
+                std::lock_guard<std::mutex> threadLock(
+                    info->m);
+                wasWaiting = transitionReleasedWaitLocked(
+                    *info, waitType, waitId);
+                if (wasWaiting &&
+                    eventFlag->waiters > 0)
+                {
+                    --eventFlag->waiters;
                 }
             }
         }

@@ -1899,6 +1899,17 @@ struct PS2DebugServer::Impl
             entry.AddMember("wakeup_count", thread.wakeupCount, allocator);
             entry.AddMember("priority", thread.currentPriority, allocator);
             entry.AddMember("suspend_count", thread.suspendCount, allocator);
+            entry.AddMember("wait_queue_code", thread.waitQueue, allocator);
+            entry.AddMember("wait_queue_id", thread.waitQueueId, allocator);
+            entry.AddMember(
+                "wait_completion_pending",
+                thread.waitCompletionPending,
+                allocator);
+            entry.AddMember(
+                "state_revision",
+                thread.stateRevision,
+                allocator);
+            entry.AddMember("state_valid", thread.stateValid, allocator);
             entry.AddMember("started", thread.started, allocator);
             entry.AddMember("force_release", thread.forceRelease, allocator);
             entry.AddMember("terminated", thread.terminated, allocator);
@@ -1915,6 +1926,7 @@ struct PS2DebugServer::Impl
             addString(main, "status",
                       runtime.debugIsPaused() ? "paused" : "running",
                       allocator);
+            main.AddMember("state_valid", false, allocator);
             main.AddMember("synthetic", true, allocator);
             threadValues.PushBack(main, allocator);
         }

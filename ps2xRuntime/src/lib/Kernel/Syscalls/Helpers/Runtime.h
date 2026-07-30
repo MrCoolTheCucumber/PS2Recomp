@@ -56,12 +56,8 @@ static void waitWhileSuspended(const std::shared_ptr<ThreadInfo> &info, PS2Runti
         return;
 
     std::unique_lock<std::mutex> lock(info->m);
-    if (info->suspendCount > 0)
+    if (info->guestState.snapshot().suspendCount > 0)
     {
-        info->status = THS_SUSPEND;
-        info->waitType = TSW_NONE;
-        info->waitId = 0;
-
         bool terminated = false;
         waitWithGuestExecutionReleasedUntilUnlocked(
             runtime,
@@ -69,14 +65,17 @@ static void waitWhileSuspended(const std::shared_ptr<ThreadInfo> &info, PS2Runti
             [&]()
             {
                 info->cv.wait(lock, [&]()
-                              { return info->suspendCount == 0 || info->terminated.load(); });
+                              {
+                                  return info->guestState.snapshot().suspendCount == 0 ||
+                                         info->terminated.load();
+                              });
             },
             [&]()
             {
                 terminated = info->terminated.load();
                 if (!terminated)
                 {
-                    info->status = THS_RUN;
+                    info->guestState.publishRunning();
                 }
             });
 
@@ -144,11 +143,9 @@ static std::shared_ptr<ThreadInfo> ensureCurrentThreadInfo(
 
     auto info = std::make_shared<ThreadInfo>();
     info->generation = state.nextGeneration++;
-    info->started = true;
-    info->status = THS_RUN;
     info->priority = 0u;
-    info->currentPriority = info->priority;
-    info->suspendCount = 0;
+    info->guestState.initializeRunning(
+        static_cast<int>(info->priority));
     if (ctx)
     {
         info->entry = ctx->pc;
@@ -159,8 +156,6 @@ static std::shared_ptr<ThreadInfo> ensureCurrentThreadInfo(
         state.contextThreadIds[
             info->boundContext] = tid;
     }
-    info->waitType = TSW_NONE;
-    info->waitId = 0;
 
     state.threads.emplace(tid, info);
     return info;

@@ -108,6 +108,30 @@ namespace ps2_syscalls
         return out;
     }
 
+    static std::vector<std::shared_ptr<ThreadInfo>>
+    snapshotRuntimeThreads(PS2Runtime *runtime)
+    {
+        if (!runtime)
+        {
+            return {};
+        }
+
+        EeThreadRuntimeState &state =
+            runtime->eeThreadRuntimeState();
+        std::vector<std::shared_ptr<ThreadInfo>> result;
+        std::lock_guard<std::mutex> lock(state.threadMapMutex);
+        result.reserve(state.threads.size());
+        for (const auto &[id, info] : state.threads)
+        {
+            (void)id;
+            if (info)
+            {
+                result.push_back(info);
+            }
+        }
+        return result;
+    }
+
     void CreateSema(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
         uint32_t paramAddr = getRegU32(ctx, 4); // $a0
@@ -220,11 +244,27 @@ namespace ps2_syscalls
             }
         }
 
+        const std::vector<std::shared_ptr<ThreadInfo>> threads =
+            snapshotRuntimeThreads(runtime);
         bool hadWaiters = false;
         {
             std::lock_guard<std::mutex> lock(sema->m);
             sema->deleted = true;
             hadWaiters = sema->waiters > 0;
+            for (const std::shared_ptr<ThreadInfo> &info :
+                 threads)
+            {
+                std::lock_guard<std::mutex> threadLock(info->m);
+                if (info->guestState.releaseWait(
+                        EeThreadWaitQueue::Semaphore,
+                        TSW_SEMA,
+                        sid,
+                        true) &&
+                    sema->waiters > 0)
+                {
+                    --sema->waiters;
+                }
+            }
         }
         sema->cv.notify_all();
 
@@ -266,7 +306,7 @@ namespace ps2_syscalls
         int afterCount = 0;
         bool wokeWaiter = false;
         {
-            std::lock_guard<std::mutex> lock(sema->m);
+            std::unique_lock<std::mutex> lock(sema->m);
             beforeCount = sema->count;
             if (sema->count >= sema->maxCount)
             {
@@ -276,7 +316,23 @@ namespace ps2_syscalls
             {
                 sema->count++;
                 wokeWaiter = sema->waiters > 0;
+                const int waitersBeforeWake = sema->waiters;
                 sema->cv.notify_one();
+                if (wokeWaiter)
+                {
+                    // Publication is synchronous even for the interrupt-safe
+                    // variant. The waiter may update guest state while guest
+                    // execution remains owned by this caller, but cannot run
+                    // its continuation until a later scheduling boundary.
+                    sema->cv.wait(
+                        lock,
+                        [&]()
+                        {
+                            return sema->waiters <
+                                       waitersBeforeWake ||
+                                   sema->deleted;
+                        });
+                }
             }
             afterCount = sema->count;
         }
@@ -347,11 +403,11 @@ namespace ps2_syscalls
             if (info)
             {
                 std::lock_guard<std::mutex> tLock(info->m);
-                info->status = (info->suspendCount > 0) ? THS_WAITSUSPEND : THS_WAIT;
-                info->waitType = TSW_SEMA;
-                info->waitId = sid;
+                info->guestState.block(
+                    EeThreadWaitQueue::Semaphore,
+                    TSW_SEMA,
+                    sid);
                 info->forceRelease = false;
-                info->semaWaitLinked = true;
             }
 
             sema->waiters++;
@@ -369,12 +425,6 @@ namespace ps2_syscalls
                 },
                 [&]()
                 {
-                    const bool linked =
-                        !info || info->semaWaitLinked.exchange(false);
-                    if (linked && sema->waiters > 0)
-                    {
-                        sema->waiters--;
-                    }
                     if (sema->deleted)
                     {
                         ret = KE_ERROR;
@@ -384,23 +434,39 @@ namespace ps2_syscalls
                     {
                         std::lock_guard<std::mutex> tLock(info->m);
                         terminated = info->terminated.load();
-                        info->status = terminated
-                            ? THS_DORMANT
-                            : ((info->suspendCount > 0)
-                                   ? THS_SUSPEND
-                                   : THS_READY);
-                        info->waitType = TSW_NONE;
-                        info->waitId = 0;
+                        bool wasLinked =
+                            info->guestState.isLinkedTo(
+                                EeThreadWaitQueue::Semaphore,
+                                sid);
                         if (terminated)
                         {
-                            info->wakeupCount = 0;
-                            info->suspendCount = 0;
+                            info->guestState.makeDormant();
+                        }
+                        else
+                        {
+                            wasLinked =
+                                info->guestState.finishWait(
+                                    EeThreadWaitQueue::Semaphore,
+                                    TSW_SEMA,
+                                    sid,
+                                    false);
+                        }
+                        if (wasLinked &&
+                            sema->waiters > 0)
+                        {
+                            --sema->waiters;
+                            sema->cv.notify_all();
                         }
                         if (info->forceRelease)
                         {
                             info->forceRelease = false;
                             ret = KE_ERROR;
                         }
+                    }
+                    else if (sema->waiters > 0)
+                    {
+                        --sema->waiters;
+                        sema->cv.notify_all();
                     }
 
                     if (!terminated && ret == sid && sema->count > 0)
@@ -420,9 +486,13 @@ namespace ps2_syscalls
         if (info)
         {
             std::lock_guard<std::mutex> tLock(info->m);
-            if (info->suspendCount == 0)
+            const EeThreadGuestStateSnapshot &guest =
+                info->guestState.snapshot();
+            if (!info->terminated.load() &&
+                guest.suspendCount == 0 &&
+                guest.status == THS_READY)
             {
-                info->status = THS_RUN;
+                info->guestState.publishRunning();
             }
         }
 
@@ -762,9 +832,10 @@ namespace ps2_syscalls
             if (tInfo)
             {
                 std::lock_guard<std::mutex> tLock(tInfo->m);
-                tInfo->status = (tInfo->suspendCount > 0) ? THS_WAITSUSPEND : THS_WAIT;
-                tInfo->waitType = TSW_EVENT;
-                tInfo->waitId = eid;
+                tInfo->guestState.block(
+                    EeThreadWaitQueue::EventFlag,
+                    TSW_EVENT,
+                    eid);
                 tInfo->forceRelease = false;
             }
 
@@ -779,29 +850,38 @@ namespace ps2_syscalls
                 },
                 [&]()
                 {
-                    info->waiters--;
+                    bool wasLinked = !tInfo;
 
                     if (tInfo)
                     {
                         std::lock_guard<std::mutex> tLock(tInfo->m);
                         terminated = tInfo->terminated.load();
-                        tInfo->status = terminated
-                            ? THS_DORMANT
-                            : ((tInfo->suspendCount > 0)
-                                   ? THS_SUSPEND
-                                   : THS_RUN);
-                        tInfo->waitType = TSW_NONE;
-                        tInfo->waitId = 0;
+                        wasLinked =
+                            tInfo->guestState.isLinkedTo(
+                                EeThreadWaitQueue::EventFlag,
+                                eid);
                         if (terminated)
                         {
-                            tInfo->wakeupCount = 0;
-                            tInfo->suspendCount = 0;
+                            tInfo->guestState.makeDormant();
+                        }
+                        else
+                        {
+                            wasLinked =
+                                tInfo->guestState.finishWait(
+                                    EeThreadWaitQueue::EventFlag,
+                                    TSW_EVENT,
+                                    eid,
+                                    false);
                         }
                         if (tInfo->forceRelease)
                         {
                             tInfo->forceRelease = false;
                             ret = KE_RELEASE_WAIT;
                         }
+                    }
+                    if (wasLinked && info->waiters > 0)
+                    {
+                        --info->waiters;
                     }
 
                     if (!terminated)
@@ -840,6 +920,18 @@ namespace ps2_syscalls
         if (lock.owns_lock())
         {
             lock.unlock();
+        }
+        if (tInfo)
+        {
+            std::lock_guard<std::mutex> stateLock(tInfo->m);
+            const EeThreadGuestStateSnapshot &guest =
+                tInfo->guestState.snapshot();
+            if (!tInfo->terminated.load() &&
+                guest.suspendCount == 0 &&
+                guest.status == THS_READY)
+            {
+                tInfo->guestState.publishRunning();
+            }
         }
         waitWhileSuspended(tInfo, runtime);
         setReturnS32(ctx, ret);
