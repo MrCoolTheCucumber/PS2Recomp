@@ -269,13 +269,17 @@ namespace ps2_syscalls
             return;
 
         std::vector<ExitHandlerEntry> handlers;
+        EeKernelRuntimeState &kernelState =
+            runtime->eeKernelRuntimeState();
         {
-            std::lock_guard<std::mutex> lock(g_exit_handler_mutex);
-            auto it = g_exit_handlers.find(tid);
-            if (it == g_exit_handlers.end())
+            std::lock_guard<std::mutex> lock(
+                kernelState.exitHandlerMutex);
+            auto it =
+                kernelState.exitHandlers.find(tid);
+            if (it == kernelState.exitHandlers.end())
                 return;
             handlers = std::move(it->second);
-            g_exit_handlers.erase(it);
+            kernelState.exitHandlers.erase(it);
         }
 
         for (const auto &handler : handlers)
@@ -483,8 +487,11 @@ namespace ps2_syscalls
         }
 
         {
-            std::lock_guard<std::mutex> lock(g_exit_handler_mutex);
-            g_exit_handlers.erase(tid);
+            EeKernelRuntimeState &kernelState =
+                runtime->eeKernelRuntimeState();
+            std::lock_guard<std::mutex> lock(
+                kernelState.exitHandlerMutex);
+            kernelState.exitHandlers.erase(tid);
         }
 
         if (runtime && autoStackToFree != 0)

@@ -100,7 +100,8 @@ namespace ps2_syscalls
         PS2Runtime *runtime, uint32_t cause);
     bool isIntcCauseEnabled(
         PS2Runtime *runtime, uint32_t cause);
-    void initializeGuestKernelState(uint8_t *rdram);
+    void initializeGuestKernelState(
+        uint8_t *rdram, PS2Runtime *runtime);
     void TODO(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime, uint32_t encodedSyscallId);
     void notifyRuntimeStop(PS2Runtime *runtime = nullptr);
     void joinAllGuestHostThreads(PS2Runtime *runtime);

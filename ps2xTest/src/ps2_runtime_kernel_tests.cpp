@@ -6126,7 +6126,8 @@ void register_ps2_runtime_kernel_tests()
         {
             notifyRuntimeStop();
             TestEnv env;
-            initializeGuestKernelState(env.rdram.data());
+            initializeGuestKernelState(
+                env.rdram.data(), &env.runtime);
 
             constexpr uint32_t kGuestSyscallTableGuestBase = 0x80011F80u;
             constexpr uint32_t kSyscallIndex = 0x83u;
@@ -6161,7 +6162,8 @@ void register_ps2_runtime_kernel_tests()
         {
             notifyRuntimeStop();
             TestEnv env;
-            initializeGuestKernelState(env.rdram.data());
+            initializeGuestKernelState(
+                env.rdram.data(), &env.runtime);
 
             constexpr uint32_t kPatchIndex = 0xFFFFC402u;
             constexpr uint32_t kHandler = 0xDEADBEEFu;
@@ -6186,7 +6188,8 @@ void register_ps2_runtime_kernel_tests()
         {
             notifyRuntimeStop();
             TestEnv env;
-            initializeGuestKernelState(env.rdram.data());
+            initializeGuestKernelState(
+                env.rdram.data(), &env.runtime);
 
             constexpr uint32_t kGuestSyscallTableGuestBase = 0x80011F80u;
             constexpr uint32_t kGuestSyscallTableProbeBase = 0x000002F0u;
@@ -6199,8 +6202,9 @@ void register_ps2_runtime_kernel_tests()
             t.IsTrue(callSyscall(0x74u, env.rdram.data(), &env.ctx, &env.runtime),
                      "SetSyscall syscall should dispatch");
 
-            notifyRuntimeStop();
-            initializeGuestKernelState(env.rdram.data());
+            notifyRuntimeStop(&env.runtime);
+            initializeGuestKernelState(
+                env.rdram.data(), &env.runtime);
 
             uint32_t mirrored = 1u;
             std::memcpy(&mirrored, env.rdram.data() + kEntryPhysAddr, sizeof(mirrored));
@@ -6387,7 +6391,8 @@ void register_ps2_runtime_kernel_tests()
         {
             notifyRuntimeStop();
             TestEnv env;
-            initializeGuestKernelState(env.rdram.data());
+            initializeGuestKernelState(
+                env.rdram.data(), &env.runtime);
 
             constexpr uint32_t kGuestSyscallTableGuestBase = 0x80011F80u;
             constexpr uint32_t kSyscallIndex = 0x5Au;

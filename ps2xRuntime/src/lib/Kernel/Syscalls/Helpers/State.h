@@ -5,6 +5,7 @@
 #include <thread>
 
 #include "AlarmRuntimeState.h"
+#include "KernelRuntimeState.h"
 #include "SyncRuntimeState.h"
 #include "ThreadRuntimeState.h"
 
@@ -368,36 +369,11 @@ inline uint32_t g_rpc_next_id = 1;
 inline uint32_t g_rpc_packet_index = 0;
 inline uint32_t g_rpc_server_index = 0;
 inline uint32_t g_rpc_active_queue = 0;
-struct ExitHandlerEntry
-{
-    uint32_t func = 0;
-    uint32_t arg = 0;
-};
-
-inline std::mutex g_exit_handler_mutex;
-inline std::unordered_map<int, std::vector<ExitHandlerEntry>> g_exit_handlers;
-
-inline std::mutex g_bootmode_mutex;
-inline bool g_bootmode_initialized = false;
-inline uint32_t g_bootmode_pool_offset = 0;
-inline std::unordered_map<uint8_t, uint32_t> g_bootmode_addresses;
-
-inline std::mutex g_syscall_override_mutex;
-inline std::unordered_map<uint32_t, uint32_t> g_syscall_overrides;
-inline std::unordered_set<uint32_t> g_syscall_mirror_addrs;
 
 static constexpr uint32_t kGuestSyscallTableGuestBase = 0x80011F80u;
 static constexpr uint32_t kGuestSyscallTablePhysBase = kGuestSyscallTableGuestBase & 0x1FFFFFFFu;
 static constexpr uint32_t kGuestSyscallMirrorLimit = 0x00080000u;
 static constexpr uint32_t kGuestSyscallTableProbeBase = 0x000002F0u;
-
-inline std::mutex g_tls_mutex;
-inline uint32_t g_tls_index = 0;
-
-inline std::mutex g_osd_mutex;
-inline bool g_osd_config_initialized = false;
-inline uint32_t g_osd_config_raw = 0;
-inline uint32_t g_osd_config2_raw = 0;
 
 inline std::mutex g_ps2_path_mutex;
 inline bool g_ps2_paths_initialized = false;

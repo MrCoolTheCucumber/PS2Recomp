@@ -963,21 +963,35 @@ static uint32_t syncOsdConfigRawVersionLanguage(uint32_t raw, uint32_t version, 
     return sanitizeOsdConfigRaw(raw);
 }
 
-static uint32_t makeReadableOsdConfig2RawLocked()
+static uint32_t makeReadableOsdConfig2RawLocked(
+    const EeKernelRuntimeState &state)
 {
-    const uint32_t version = (g_osd_config_raw >> 13) & 0x7u;
-    const uint32_t language = (g_osd_config_raw >> 16) & 0x1Fu;
-    uint32_t raw = g_osd_config2_raw & 0x0000FFFFu;
+    const uint32_t version =
+        (state.osdConfigRaw >> 13) & 0x7u;
+    const uint32_t language =
+        (state.osdConfigRaw >> 16) & 0x1Fu;
+    uint32_t raw =
+        state.osdConfig2Raw & 0x0000FFFFu;
     raw |= (version & 0xFFu) << 16;
     raw |= (language & 0xFFu) << 24;
     return sanitizeOsdConfig2Raw(raw);
 }
 
-static void ensureOsdConfigInitialized()
+static bool ensureOsdConfigInitialized(
+    PS2Runtime *runtime)
 {
-    std::lock_guard<std::mutex> lock(g_osd_mutex);
-    if (g_osd_config_initialized)
-        return;
+    if (!runtime)
+    {
+        return false;
+    }
+
+    EeKernelRuntimeState &state =
+        runtime->eeKernelRuntimeState();
+    std::lock_guard<std::mutex> lock(state.osdMutex);
+    if (state.osdConfigInitialized)
+    {
+        return true;
+    }
 
     int tz = clampTimezoneOffset(getTimezoneOffsetMinutes());
     uint32_t spdifMode = 1;   // disabled
@@ -987,43 +1001,66 @@ static void ensureOsdConfigInitialized()
     uint32_t ps1drvConfig = 0;
     uint32_t version = 1;  // OSD2
     uint32_t language = 1; // English
-    g_osd_config_raw = packOsdConfig(spdifMode, screenType, videoOutput, japLanguage, ps1drvConfig, version, language, tz);
-    g_osd_config2_raw = packOsdConfig2(0, 0, 0, 0, version, language);
-    g_osd_config_initialized = true;
+    state.osdConfigRaw = packOsdConfig(
+        spdifMode, screenType, videoOutput,
+        japLanguage, ps1drvConfig, version,
+        language, tz);
+    state.osdConfig2Raw = packOsdConfig2(
+        0, 0, 0, 0, version, language);
+    state.osdConfigInitialized = true;
+    return true;
 }
 
-static uint32_t allocTlsAddr(uint8_t *rdram)
+static uint32_t allocTlsAddr(
+    uint8_t *rdram, PS2Runtime *runtime)
 {
-    if (!rdram || kTlsPoolCount == 0)
+    if (!rdram || !runtime || kTlsPoolCount == 0)
         return 0;
 
-    std::lock_guard<std::mutex> lock(g_tls_mutex);
-    uint32_t slot = g_tls_index++ % kTlsPoolCount;
+    EeKernelRuntimeState &state =
+        runtime->eeKernelRuntimeState();
+    std::lock_guard<std::mutex> lock(state.tlsMutex);
+    uint32_t slot =
+        state.tlsIndex++ % kTlsPoolCount;
     uint32_t addr = kTlsPoolBase + (slot * kTlsBlockSize);
     rpcZeroRdram(rdram, addr, kTlsBlockSize);
     return addr;
 }
 
-static uint32_t allocBootModeAddr(uint8_t *rdram, size_t bytes)
+static uint32_t allocBootModeAddr(
+    uint8_t *rdram,
+    EeKernelRuntimeState &state,
+    size_t bytes)
 {
     if (!rdram)
         return 0;
 
     size_t aligned = (bytes + 15u) & ~15u;
-    if (g_bootmode_pool_offset + aligned > kBootModePoolBytes)
+    if (state.bootModePoolOffset + aligned >
+        kBootModePoolBytes)
         return 0;
 
-    uint32_t addr = kBootModePoolBase + g_bootmode_pool_offset;
-    g_bootmode_pool_offset += static_cast<uint32_t>(aligned);
+    uint32_t addr =
+        kBootModePoolBase + state.bootModePoolOffset;
+    state.bootModePoolOffset +=
+        static_cast<uint32_t>(aligned);
     rpcZeroRdram(rdram, addr, aligned);
     return addr;
 }
 
-static uint32_t createBootModeEntry(uint8_t *rdram, uint8_t id, uint16_t value, uint8_t lenField, const uint32_t *data, uint8_t dataCount)
+static uint32_t createBootModeEntry(
+    uint8_t *rdram,
+    EeKernelRuntimeState &state,
+    uint8_t id,
+    uint16_t value,
+    uint8_t lenField,
+    const uint32_t *data,
+    uint8_t dataCount)
 {
     uint8_t allocCount = (dataCount == 0) ? 1 : dataCount;
     size_t bytes = static_cast<size_t>(1 + allocCount) * sizeof(uint32_t);
-    uint32_t addr = allocBootModeAddr(rdram, bytes);
+    uint32_t addr =
+        allocBootModeAddr(rdram, state, bytes);
     if (!addr)
         return 0;
 
@@ -1044,24 +1081,48 @@ static uint32_t createBootModeEntry(uint8_t *rdram, uint8_t id, uint16_t value, 
     return addr;
 }
 
-static void ensureBootModeTable(uint8_t *rdram)
+static bool ensureBootModeTable(
+    uint8_t *rdram, PS2Runtime *runtime)
 {
-    std::lock_guard<std::mutex> lock(g_bootmode_mutex);
-    if (g_bootmode_initialized)
-        return;
+    if (!runtime)
+    {
+        return false;
+    }
 
-    g_bootmode_pool_offset = 0;
-    g_bootmode_addresses.clear();
+    EeKernelRuntimeState &state =
+        runtime->eeKernelRuntimeState();
+    std::lock_guard<std::mutex> lock(
+        state.bootModeMutex);
+    if (state.bootModeInitialized)
+    {
+        return true;
+    }
+
+    state.bootModePoolOffset = 0u;
+    state.bootModeAddresses.clear();
 
     const uint32_t boot3Data[1] = {0};
     const uint32_t boot5Data[1] = {0};
 
-    g_bootmode_addresses[1] = createBootModeEntry(rdram, 1, 0, 0, nullptr, 0);
-    g_bootmode_addresses[3] = createBootModeEntry(rdram, 3, 0, 1, boot3Data, 1);
-    g_bootmode_addresses[4] = createBootModeEntry(rdram, 4, 0, 0, nullptr, 0);
-    g_bootmode_addresses[5] = createBootModeEntry(rdram, 5, 0, 1, boot5Data, 1);
-    g_bootmode_addresses[6] = createBootModeEntry(rdram, 6, 0, 0, nullptr, 0);
-    g_bootmode_addresses[7] = createBootModeEntry(rdram, 7, 0, 0, nullptr, 0);
+    state.bootModeAddresses[1] =
+        createBootModeEntry(
+            rdram, state, 1, 0, 0, nullptr, 0);
+    state.bootModeAddresses[3] =
+        createBootModeEntry(
+            rdram, state, 3, 0, 1, boot3Data, 1);
+    state.bootModeAddresses[4] =
+        createBootModeEntry(
+            rdram, state, 4, 0, 0, nullptr, 0);
+    state.bootModeAddresses[5] =
+        createBootModeEntry(
+            rdram, state, 5, 0, 1, boot5Data, 1);
+    state.bootModeAddresses[6] =
+        createBootModeEntry(
+            rdram, state, 6, 0, 0, nullptr, 0);
+    state.bootModeAddresses[7] =
+        createBootModeEntry(
+            rdram, state, 7, 0, 0, nullptr, 0);
 
-    g_bootmode_initialized = true;
+    state.bootModeInitialized = true;
+    return true;
 }

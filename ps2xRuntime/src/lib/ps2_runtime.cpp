@@ -13,6 +13,7 @@
 #include "Kernel/Stubs/MPEG.h"
 #include "Kernel/Syscalls/Helpers/AlarmRuntimeState.h"
 #include "Kernel/Syscalls/Helpers/InterruptRuntimeState.h"
+#include "Kernel/Syscalls/Helpers/KernelRuntimeState.h"
 #include "Kernel/Syscalls/Helpers/SyncRuntimeState.h"
 #include "Kernel/Syscalls/Helpers/ThreadRuntimeState.h"
 #include "ps2_host_backend.h"
@@ -905,6 +906,8 @@ PS2Runtime::PS2Runtime(PS2RuntimeConfiguration configuration)
         std::make_unique<EeSyncRuntimeState>();
     m_eeInterruptRuntimeState =
         std::make_unique<EeInterruptRuntimeState>();
+    m_eeKernelRuntimeState =
+        std::make_unique<EeKernelRuntimeState>();
     m_gs.setVSyncTickProvider(
         [this]()
         {
@@ -1314,6 +1317,16 @@ EeInterruptRuntimeState &PS2Runtime::eeInterruptRuntimeState()
 const EeInterruptRuntimeState &PS2Runtime::eeInterruptRuntimeState() const
 {
     return *m_eeInterruptRuntimeState;
+}
+
+EeKernelRuntimeState &PS2Runtime::eeKernelRuntimeState()
+{
+    return *m_eeKernelRuntimeState;
+}
+
+const EeKernelRuntimeState &PS2Runtime::eeKernelRuntimeState() const
+{
+    return *m_eeKernelRuntimeState;
 }
 
 ps2_stubs::MpegRuntimeState &PS2Runtime::mpegRuntimeState()
@@ -9094,7 +9107,8 @@ void PS2Runtime::run()
     ps2_stubs::resetAudioStubState();
     ps2_stubs::resetGsSyncVCallbackState(this);
     ps2_stubs::resetMpegStubState(this);
-    ps2_syscalls::initializeGuestKernelState(m_memory.getRDRAM());
+    ps2_syscalls::initializeGuestKernelState(
+        m_memory.getRDRAM(), this);
     m_cpuContext.r[4] = _mm_setzero_si128();
     m_cpuContext.r[5] = _mm_setzero_si128();
     m_cpuContext.r[29] = _mm_set_epi64x(0, static_cast<int64_t>(PS2_RAM_SIZE - 0x10u));

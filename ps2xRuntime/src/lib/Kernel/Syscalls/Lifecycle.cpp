@@ -2,6 +2,7 @@
 #include "Interrupt.h"
 #include "Lifecycle.h"
 #include "Helpers/InterruptRuntimeState.h"
+#include "Helpers/KernelRuntimeState.h"
 
 namespace ps2_syscalls
 {
@@ -135,13 +136,44 @@ namespace ps2_syscalls
 
         stopAlarmWorker(runtime);
 
+        if (runtime)
         {
-            std::lock_guard<std::mutex> lock(g_exit_handler_mutex);
-            g_exit_handlers.clear();
-        }
-        {
-            std::lock_guard<std::mutex> lock(g_syscall_override_mutex);
-            g_syscall_overrides.clear();
+            EeKernelRuntimeState &state =
+                runtime->eeKernelRuntimeState();
+            {
+                std::lock_guard<std::mutex> lock(
+                    state.exitHandlerMutex);
+                state.exitHandlers.clear();
+            }
+            {
+                std::lock_guard<std::mutex> lock(
+                    state.bootModeMutex);
+                state.bootModeInitialized = false;
+                state.bootModePoolOffset = 0u;
+                state.bootModeAddresses.clear();
+            }
+            {
+                std::lock_guard<std::mutex> lock(
+                    state.syscallOverrideMutex);
+                state.syscallOverrides.clear();
+            }
+            {
+                std::lock_guard<std::mutex> lock(
+                    state.activeSyscallOverrideMutex);
+                state.activeSyscallOverrides.clear();
+            }
+            {
+                std::lock_guard<std::mutex> lock(
+                    state.tlsMutex);
+                state.tlsIndex = 0u;
+            }
+            {
+                std::lock_guard<std::mutex> lock(
+                    state.osdMutex);
+                state.osdConfigInitialized = false;
+                state.osdConfigRaw = 0u;
+                state.osdConfig2Raw = 0u;
+            }
         }
     }
 
