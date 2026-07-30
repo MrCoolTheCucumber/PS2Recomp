@@ -50,6 +50,7 @@ class PS2DebugServer;
 struct EeThreadRuntimeState;
 struct EeAlarmRuntimeState;
 struct EeSyncRuntimeState;
+struct EeInterruptRuntimeState;
 
 struct PS2RuntimeConfiguration
 {
@@ -1249,6 +1250,8 @@ public:
     const EeAlarmRuntimeState &eeAlarmRuntimeState() const;
     EeSyncRuntimeState &eeSyncRuntimeState();
     const EeSyncRuntimeState &eeSyncRuntimeState() const;
+    EeInterruptRuntimeState &eeInterruptRuntimeState();
+    const EeInterruptRuntimeState &eeInterruptRuntimeState() const;
     int activeEeHostThreadCount() const;
     int currentEeThreadId() noexcept;
     uint64_t eeThreadLegacyAdapterMismatchCount() const noexcept;
@@ -1914,6 +1917,8 @@ private:
     std::unique_ptr<PS2DebugServer> m_debugServer;
 #endif
     std::unique_ptr<EeSyncRuntimeState> m_eeSyncRuntimeState;
+    std::unique_ptr<EeInterruptRuntimeState>
+        m_eeInterruptRuntimeState;
     // Declared last so the alarm worker's fallback join runs before other
     // runtime members are destroyed if normal stop cleanup was interrupted.
     std::unique_ptr<EeAlarmRuntimeState> m_eeAlarmRuntimeState;

@@ -1,6 +1,7 @@
 #include "Common.h"
 #include "Interrupt.h"
 #include "Lifecycle.h"
+#include "Helpers/InterruptRuntimeState.h"
 
 namespace ps2_syscalls
 {
@@ -8,14 +9,22 @@ namespace ps2_syscalls
 
     void notifyRuntimeStop(PS2Runtime *runtime)
     {
+        if (runtime)
         {
-            std::lock_guard<std::mutex> lock(g_irq_handler_mutex);
-            g_intcHandlers.clear();
-            g_dmacHandlers.clear();
-            g_nextIntcHandlerId = 1;
-            g_nextDmacHandlerId = 1;
-            g_enabled_intc_mask = 0xFFFFFFFFu;
-            g_enabled_dmac_mask = 0xFFFFFFFFu;
+            EeInterruptRuntimeState &state =
+                runtime->eeInterruptRuntimeState();
+            std::lock_guard<std::mutex> lock(
+                state.handlerMutex);
+            state.intcHandlers.clear();
+            state.dmacHandlers.clear();
+            state.nextIntcHandlerId = 1;
+            state.nextDmacHandlerId = 1;
+            state.intcHeadOrder = 0;
+            state.intcTailOrder = 1000;
+            state.dmacHeadOrder = 0;
+            state.dmacTailOrder = 1000;
+            state.enabledIntcMask = 0xFFFFFFFFu;
+            state.enabledDmacMask = 0xFFFFFFFFu;
         }
         {
             std::lock_guard<std::mutex> lock(g_vsync_flag_mutex);

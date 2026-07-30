@@ -12,6 +12,7 @@
 #include "Kernel/Stubs/GS.h"
 #include "Kernel/Stubs/MPEG.h"
 #include "Kernel/Syscalls/Helpers/AlarmRuntimeState.h"
+#include "Kernel/Syscalls/Helpers/InterruptRuntimeState.h"
 #include "Kernel/Syscalls/Helpers/SyncRuntimeState.h"
 #include "Kernel/Syscalls/Helpers/ThreadRuntimeState.h"
 #include "ps2_host_backend.h"
@@ -899,6 +900,8 @@ PS2Runtime::PS2Runtime(PS2RuntimeConfiguration configuration)
         std::make_unique<EeAlarmRuntimeState>();
     m_eeSyncRuntimeState =
         std::make_unique<EeSyncRuntimeState>();
+    m_eeInterruptRuntimeState =
+        std::make_unique<EeInterruptRuntimeState>();
     m_eeThreadRuntimeState =
         std::make_unique<EeThreadRuntimeState>(
             allocateEeThreadRuntimeGeneration());
@@ -1293,6 +1296,16 @@ const EeSyncRuntimeState &PS2Runtime::eeSyncRuntimeState() const
     return *m_eeSyncRuntimeState;
 }
 
+EeInterruptRuntimeState &PS2Runtime::eeInterruptRuntimeState()
+{
+    return *m_eeInterruptRuntimeState;
+}
+
+const EeInterruptRuntimeState &PS2Runtime::eeInterruptRuntimeState() const
+{
+    return *m_eeInterruptRuntimeState;
+}
+
 int PS2Runtime::activeEeHostThreadCount() const
 {
     return m_eeThreadRuntimeState
@@ -1445,7 +1458,8 @@ void PS2Runtime::onEeCounterInterruptStateChanged(
              (1u << cause)) != 0u &&
             (status & mask &
              (1u << cause)) != 0u &&
-            ps2_syscalls::isIntcCauseEnabled(cause))
+            ps2_syscalls::isIntcCauseEnabled(
+                this, cause))
         {
             requestGuestPreemption();
             return;
@@ -2738,7 +2752,7 @@ void PS2Runtime::onDmacInterruptStateChanged()
             m_memory.dmacInterruptUnmasked(
                 interrupt.source) &&
             ps2_syscalls::isDmacCauseEnabled(
-                interrupt.cause))
+                this, interrupt.cause))
         {
             requestGuestPreemption();
             return;
@@ -5843,7 +5857,8 @@ void PS2Runtime::drainPendingEeCounterHandlers(
         {
             continue;
         }
-        if (!ps2_syscalls::isIntcCauseEnabled(cause))
+        if (!ps2_syscalls::isIntcCauseEnabled(
+                this, cause))
         {
             retained |= bit;
             continue;
@@ -5890,7 +5905,7 @@ void PS2Runtime::drainCompletedDmacHandlers(uint8_t *rdram)
         if (!m_memory.dmacInterruptUnmasked(
                 interrupt.source) ||
             !ps2_syscalls::isDmacCauseEnabled(
-                interrupt.cause))
+                this, interrupt.cause))
         {
             retained.push_back(interrupt);
             continue;

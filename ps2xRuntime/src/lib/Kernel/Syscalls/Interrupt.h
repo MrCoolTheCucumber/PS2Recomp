@@ -12,10 +12,7 @@ namespace ps2_syscalls
             uint32_t tickAddr;
         };
 
-        extern std::mutex g_irq_handler_mutex;
         extern std::mutex g_vsync_flag_mutex;
-        extern uint32_t g_enabled_intc_mask;
-        extern uint32_t g_enabled_dmac_mask;
         extern uint64_t g_vsync_tick_counter;
         extern VSyncFlagRegistration g_vsync_registration;
     }
@@ -23,8 +20,10 @@ namespace ps2_syscalls
     void dispatchDmacHandlersForCause(uint8_t *rdram, PS2Runtime *runtime, uint32_t cause);
     void dispatchIntcHandlersForCause(
         uint8_t *rdram, PS2Runtime *runtime, uint32_t cause);
-    bool isDmacCauseEnabled(uint32_t cause);
-    bool isIntcCauseEnabled(uint32_t cause);
+    bool isDmacCauseEnabled(
+        PS2Runtime *runtime, uint32_t cause);
+    bool isIntcCauseEnabled(
+        PS2Runtime *runtime, uint32_t cause);
     void EnsureVSyncScheduled(uint8_t *rdram, PS2Runtime *runtime);
     uint64_t GetCurrentVSyncTick();
     uint64_t PublishVSyncStart(uint8_t *rdram, PS2Runtime *runtime);
