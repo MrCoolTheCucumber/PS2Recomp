@@ -254,14 +254,16 @@ void register_ps2_runtime_kernel_tests()
         {
             TestEnv env;
 
-            const uint32_t threadParam[7] = {
-                0x00000002u, // attr
+            const uint32_t threadParam[9] = {
+                0x11223344u, // status (ignored by CreateThread)
                 0x00200000u, // entry
                 0x00300000u, // stack
                 0x00000800u, // stack size
                 0x00120000u, // gp
                 5u,          // initial priority
-                0xABCD0001u  // option
+                77u,         // current priority (ignored)
+                0x55667788u, // attr (ignored)
+                0x19AABBCCu  // option (ignored)
             };
 
             writeGuestWords(env.rdram.data(), K_PARAM_ADDR, threadParam, std::size(threadParam));
@@ -274,7 +276,10 @@ void register_ps2_runtime_kernel_tests()
             setRegU32(env.ctx, 4, static_cast<uint32_t>(tid));
             setRegU32(env.ctx, 5, K_STATUS_ADDR);
             ReferThreadStatus(env.rdram.data(), &env.ctx, &env.runtime);
-            t.Equals(getRegS32(env.ctx, 2), KE_OK, "ReferThreadStatus should succeed for created thread");
+            t.Equals(
+                getRegS32(env.ctx, 2),
+                THS_DORMANT,
+                "ReferThreadStatus should return the dormant status");
 
             EeThreadStatus status{};
             std::memcpy(&status, env.rdram.data() + K_STATUS_ADDR, sizeof(status));
@@ -285,8 +290,8 @@ void register_ps2_runtime_kernel_tests()
             t.Equals(status.gp_reg, threadParam[4], "status.gp_reg should match configured gp");
             t.Equals(status.initial_priority, 5, "status.initial_priority should match thread param");
             t.Equals(status.current_priority, 5, "status.current_priority should start at initial priority");
-            t.Equals(status.attr, threadParam[0], "status.attr should match thread param");
-            t.Equals(status.option, threadParam[6], "status.option should match thread param");
+            t.Equals(status.attr, 0u, "CreateThread should ignore input attr");
+            t.Equals(status.option, 0u, "CreateThread should ignore input option");
 
             setRegU32(env.ctx, 4, static_cast<uint32_t>(tid));
             DeleteThread(env.rdram.data(), &env.ctx, &env.runtime);
@@ -326,7 +331,10 @@ void register_ps2_runtime_kernel_tests()
             setRegU32(env.ctx, 4, static_cast<uint32_t>(tid));
             setRegU32(env.ctx, 5, K_STATUS_ADDR);
             ReferThreadStatus(env.rdram.data(), &env.ctx, &env.runtime);
-            t.Equals(getRegS32(env.ctx, 2), KE_OK, "ReferThreadStatus should still succeed after failed StartThread");
+            t.Equals(
+                getRegS32(env.ctx, 2),
+                THS_DORMANT,
+                "failed StartThread should retain the dormant status return");
 
             EeThreadStatus status{};
             std::memcpy(&status, env.rdram.data() + K_STATUS_ADDR, sizeof(status));
@@ -522,7 +530,7 @@ void register_ps2_runtime_kernel_tests()
                     env.rdram.data(),
                     &statusCtx,
                     &env.runtime);
-                if (getRegS32(statusCtx, 2) != KE_OK)
+                if (getRegS32(statusCtx, 2) != THS_DORMANT)
                 {
                     return false;
                 }
@@ -1029,14 +1037,10 @@ void register_ps2_runtime_kernel_tests()
                 setRegU32(statusCtx, 4, static_cast<uint32_t>(tid));
                 setRegU32(statusCtx, 5, K_STATUS_ADDR);
                 ReferThreadStatus(env.rdram.data(), &statusCtx, &env.runtime);
-                if (getRegS32(statusCtx, 2) != KE_OK)
-                {
-                    return false;
-                }
-
                 EeThreadStatus status{};
                 std::memcpy(&status, env.rdram.data() + K_STATUS_ADDR, sizeof(status));
-                return status.waitType == TSW_EVENT;
+                return getRegS32(statusCtx, 2) == status.status &&
+                       status.waitType == TSW_EVENT;
             }, std::chrono::milliseconds(200));
             t.IsTrue(waiting, "waiter thread should block on the event flag");
 
@@ -1057,14 +1061,11 @@ void register_ps2_runtime_kernel_tests()
                 setRegU32(statusCtx, 4, static_cast<uint32_t>(tid));
                 setRegU32(statusCtx, 5, K_STATUS_ADDR);
                 ReferThreadStatus(env.rdram.data(), &statusCtx, &env.runtime);
-                if (getRegS32(statusCtx, 2) != KE_OK)
-                {
-                    return false;
-                }
-
                 EeThreadStatus status{};
                 std::memcpy(&status, env.rdram.data() + K_STATUS_ADDR, sizeof(status));
-                return status.status == THS_SUSPEND && status.waitType == 0u;
+                return getRegS32(statusCtx, 2) == status.status &&
+                       status.status == THS_SUSPEND &&
+                       status.waitType == 0u;
             }, std::chrono::milliseconds(200));
             t.IsTrue(suspended, "after wake, a still-suspended waiter should move to THS_SUSPEND");
 
@@ -1078,14 +1079,10 @@ void register_ps2_runtime_kernel_tests()
                 setRegU32(statusCtx, 4, static_cast<uint32_t>(tid));
                 setRegU32(statusCtx, 5, K_STATUS_ADDR);
                 ReferThreadStatus(env.rdram.data(), &statusCtx, &env.runtime);
-                if (getRegS32(statusCtx, 2) != KE_OK)
-                {
-                    return false;
-                }
-
                 EeThreadStatus status{};
                 std::memcpy(&status, env.rdram.data() + K_STATUS_ADDR, sizeof(status));
-                return status.status == THS_DORMANT;
+                return getRegS32(statusCtx, 2) == status.status &&
+                       status.status == THS_DORMANT;
             }, std::chrono::milliseconds(200));
             t.IsTrue(dormant, "waiter thread should return to dormant after the event is signaled and resumed");
 
@@ -1157,14 +1154,11 @@ void register_ps2_runtime_kernel_tests()
                 setRegU32(statusCtx, 4, static_cast<uint32_t>(tid));
                 setRegU32(statusCtx, 5, K_STATUS_ADDR);
                 ReferThreadStatus(env.rdram.data(), &statusCtx, &env.runtime);
-                if (getRegS32(statusCtx, 2) != KE_OK)
-                {
-                    return false;
-                }
-
                 EeThreadStatus status{};
                 std::memcpy(&status, env.rdram.data() + K_STATUS_ADDR, sizeof(status));
-                return status.status == THS_WAIT && status.waitType == TSW_SEMA;
+                return getRegS32(statusCtx, 2) == status.status &&
+                       status.status == THS_WAIT &&
+                       status.waitType == TSW_SEMA;
             }, std::chrono::milliseconds(200));
             t.IsTrue(waiting, "worker should block inside WaitSema before termination");
 
@@ -1182,7 +1176,10 @@ void register_ps2_runtime_kernel_tests()
             setRegU32(dormantCtx, 4, static_cast<uint32_t>(tid));
             setRegU32(dormantCtx, 5, K_STATUS_ADDR);
             ReferThreadStatus(env.rdram.data(), &dormantCtx, &env.runtime);
-            t.Equals(getRegS32(dormantCtx, 2), KE_OK, "terminated waiter should still have readable status");
+            t.Equals(
+                getRegS32(dormantCtx, 2),
+                THS_DORMANT,
+                "terminated waiter should return dormant status");
 
             EeThreadStatus dormantStatus{};
             std::memcpy(&dormantStatus, env.rdram.data() + K_STATUS_ADDR, sizeof(dormantStatus));

@@ -187,51 +187,15 @@ namespace ps2_syscalls
         }
 
         auto info = std::make_shared<ThreadInfo>();
-        info->attr = param[0];
         info->entry = param[1];
         info->stack = param[2];
         info->stackSize = param[3];
-
-        auto looksLikeGuestPtr = [](uint32_t v) -> bool
-        {
-            if (v == 0)
-            {
-                return true;
-            }
-            const uint32_t norm = v & 0x1FFFFFFFu;
-            return norm < PS2_RAM_SIZE && norm >= 0x10000u;
-        };
-
-        auto looksLikePriority = [](uint32_t v) -> bool
-        {
-            // Typical EE priorities are very small integers (1..127).
-            return v <= 0x400u;
-        };
-
-        const uint32_t gpA = param[4];
-        const uint32_t prioA = param[5];
-        const uint32_t gpB = param[5];
-        const uint32_t prioB = param[4];
-
-        // Prefer the standard EE layout (gp at +0x10, priority at +0x14),
-        // but keep a fallback for callsites that used the swapped decode.
-        if (looksLikeGuestPtr(gpA) && looksLikePriority(prioA))
-        {
-            info->gp = gpA;
-            info->priority = prioA;
-        }
-        else if (looksLikeGuestPtr(gpB) && looksLikePriority(prioB))
-        {
-            info->gp = gpB;
-            info->priority = prioB;
-        }
-        else
-        {
-            info->gp = gpA;
-            info->priority = prioA;
-        }
-
-        info->option = param[6];
+        info->gp = param[4];
+        info->priority = param[5];
+        // The EE BIOS ignores the input status, current-priority, attr, and
+        // option fields. ReferThreadStatus reports zero for attr and option.
+        info->attr = 0;
+        info->option = 0;
         if (info->priority >= 128)
         {
             info->priority = 127;
@@ -849,7 +813,7 @@ namespace ps2_syscalls
         status->waitType = info->waitType;
         status->waitId = info->waitId;
         status->wakeupCount = info->wakeupCount;
-        setReturnS32(ctx, KE_OK);
+        setReturnS32(ctx, info->status);
     }
 
     void iReferThreadStatus(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
