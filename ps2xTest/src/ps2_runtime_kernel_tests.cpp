@@ -83,6 +83,8 @@ namespace
     constexpr uint32_t K_ALARM_CALLBACK_ARG_ADDR = 0x18ECu;
     constexpr uint32_t K_ALARM_CALLBACK_GP_ADDR = 0x18F0u;
     constexpr uint32_t K_ALARM_CALLBACK_SP_ADDR = 0x18F4u;
+    constexpr uint32_t K_ALARM_SELF_STOP_STAGE_ADDR = 0x18F8u;
+    constexpr uint32_t K_ALARM_SELF_STOP_GATE_ADDR = 0x18FCu;
 
     std::mutex g_guestWordMutex;
 
@@ -505,6 +507,29 @@ namespace
             rdram,
             K_ALARM_CALLBACK_STAGE_ADDR,
             1u);
+        ctx->pc = 0u;
+    }
+
+    void alarmSelfStopHandler(
+        uint8_t *rdram,
+        R5900Context *ctx,
+        PS2Runtime *runtime)
+    {
+        runtime->requestStop();
+        writeGuestU32(
+            rdram,
+            K_ALARM_SELF_STOP_STAGE_ADDR,
+            1u);
+        while (readGuestU32(
+                   rdram,
+                   K_ALARM_SELF_STOP_GATE_ADDR) == 0u)
+        {
+            std::this_thread::yield();
+        }
+        writeGuestU32(
+            rdram,
+            K_ALARM_SELF_STOP_STAGE_ADDR,
+            2u);
         ctx->pc = 0u;
     }
 
@@ -5557,6 +5582,91 @@ void register_ps2_runtime_kernel_tests()
                 getRegS32(cancelCtx, 2),
                 KE_ERROR,
                 "a dispatched alarm should no longer be cancellable");
+        });
+
+        tc.Run("alarm self-stop retains a joinable worker until callback exit", [](TestCase &t)
+        {
+            TestEnv env;
+
+            constexpr uint32_t kAlarmHandlerAddr = 0x00270400u;
+            env.runtime.registerFunction(
+                kAlarmHandlerAddr, &alarmSelfStopHandler);
+            writeGuestU32(
+                env.rdram.data(),
+                K_ALARM_SELF_STOP_STAGE_ADDR,
+                0u);
+            writeGuestU32(
+                env.rdram.data(),
+                K_ALARM_SELF_STOP_GATE_ADDR,
+                0u);
+
+            setRegU32(env.ctx, 4, 1u);
+            setRegU32(env.ctx, 5, kAlarmHandlerAddr);
+            setRegU32(env.ctx, 6, 0u);
+            SetAlarm(
+                env.rdram.data(), &env.ctx, &env.runtime);
+            t.IsTrue(
+                getRegS32(env.ctx, 2) > 0,
+                "the self-stop fixture should create a short alarm");
+
+            const bool selfStopReturned = waitUntil(
+                [&]()
+                {
+                    return readGuestU32(
+                               env.rdram.data(),
+                               K_ALARM_SELF_STOP_STAGE_ADDR) ==
+                           1u;
+                },
+                std::chrono::milliseconds(1000));
+            t.IsTrue(
+                selfStopReturned,
+                "the callback should return from its own stop request");
+
+            std::atomic<bool> externalStopReturned{false};
+            std::thread externalStopThread;
+            if (selfStopReturned)
+            {
+                externalStopThread = std::thread(
+                    [&]()
+                    {
+                        env.runtime.requestStop();
+                        externalStopReturned.store(
+                            true, std::memory_order_release);
+                    });
+            }
+
+            const bool returnedWhileCallbackHeld =
+                selfStopReturned &&
+                waitUntil(
+                    [&]()
+                    {
+                        return externalStopReturned.load(
+                            std::memory_order_acquire);
+                    },
+                    std::chrono::milliseconds(100));
+
+            writeGuestU32(
+                env.rdram.data(),
+                K_ALARM_SELF_STOP_GATE_ADDR,
+                1u);
+            if (externalStopThread.joinable())
+            {
+                externalStopThread.join();
+            }
+
+            t.IsFalse(
+                returnedWhileCallbackHeld,
+                "an external stop should join a self-stopped callback worker");
+            t.IsTrue(
+                externalStopReturned.load(
+                    std::memory_order_acquire),
+                "external stop should return after the callback exits");
+            t.Equals(
+                readGuestU32(
+                    env.rdram.data(),
+                    K_ALARM_SELF_STOP_STAGE_ADDR),
+                2u,
+                "the callback should exit after its gate is released");
         });
 
         tc.Run("setup heap and thread invalid ids use documented kernel errors", [](TestCase &t)
