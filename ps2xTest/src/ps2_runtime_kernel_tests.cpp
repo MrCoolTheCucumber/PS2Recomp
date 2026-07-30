@@ -59,6 +59,8 @@ namespace
     constexpr uint32_t K_SLEEP_GATE_ADDR = 0x1820u;
     constexpr uint32_t K_SLEEP_STAGE_ADDR = 0x1824u;
     constexpr uint32_t K_SLEEP_RETURN_ADDR = 0x1830u;
+    constexpr uint32_t K_WAITSUSPEND_STAGE_ADDR = 0x1840u;
+    constexpr uint32_t K_WAITSUSPEND_RETURN_ADDR = 0x1844u;
 
     struct EeThreadStatus
     {
@@ -260,6 +262,23 @@ namespace
                 static_cast<uint32_t>(getRegS32(*ctx, 2)));
             writeGuestU32(rdram, K_SLEEP_STAGE_ADDR, index + 2u);
         }
+        ctx->pc = 0u;
+    }
+
+    void waitSuspendSleepHandler(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        if (!rdram || !ctx)
+        {
+            return;
+        }
+
+        writeGuestU32(rdram, K_WAITSUSPEND_STAGE_ADDR, 1u);
+        SleepThread(rdram, ctx, runtime);
+        writeGuestU32(
+            rdram,
+            K_WAITSUSPEND_RETURN_ADDR,
+            static_cast<uint32_t>(getRegS32(*ctx, 2)));
+        writeGuestU32(rdram, K_WAITSUSPEND_STAGE_ADDR, 2u);
         ctx->pc = 0u;
     }
 
@@ -888,6 +907,219 @@ void register_ps2_runtime_kernel_tests()
                 "DeleteThread should remove the completed sleep worker");
         });
 
+        tc.Run("sleeping suspended thread follows the EE state transitions", [](TestCase &t)
+        {
+            TestEnv env;
+
+            constexpr uint32_t kThreadEntry = 0x00254000u;
+            env.runtime.registerFunction(kThreadEntry, &waitSuspendSleepHandler);
+            writeGuestU32(env.rdram.data(), K_WAITSUSPEND_STAGE_ADDR, 0u);
+
+            setRegU32(env.ctx, 4, 0u);
+            setRegU32(env.ctx, 5, 40u);
+            ChangeThreadPriority(
+                env.rdram.data(), &env.ctx, &env.runtime);
+
+            const uint32_t threadParam[9] = {
+                0u,
+                kThreadEntry,
+                0x00309000u,
+                0x00000800u,
+                0u,
+                30u,
+                0u,
+                0u,
+                0u
+            };
+            writeGuestWords(
+                env.rdram.data(),
+                K_PARAM_ADDR,
+                threadParam,
+                std::size(threadParam));
+            setRegU32(env.ctx, 4, K_PARAM_ADDR);
+            CreateThread(
+                env.rdram.data(), &env.ctx, &env.runtime);
+            const int32_t tid = getRegS32(env.ctx, 2);
+            t.IsTrue(tid >= 2, "CreateThread should return a worker id");
+
+            setRegU32(env.ctx, 4, static_cast<uint32_t>(tid));
+            setRegU32(env.ctx, 5, 0u);
+            StartThread(
+                env.rdram.data(), &env.ctx, &env.runtime);
+            t.Equals(getRegS32(env.ctx, 2), tid, "StartThread should return the worker id");
+
+            const bool sleeping = waitUntil([&]()
+            {
+                R5900Context statusCtx{};
+                setRegU32(statusCtx, 4, static_cast<uint32_t>(tid));
+                setRegU32(statusCtx, 5, K_STATUS_ADDR);
+                ReferThreadStatus(
+                    env.rdram.data(), &statusCtx, &env.runtime);
+                EeThreadStatus status{};
+                std::memcpy(
+                    &status,
+                    env.rdram.data() + K_STATUS_ADDR,
+                    sizeof(status));
+                return readGuestU32(
+                           env.rdram.data(), K_WAITSUSPEND_STAGE_ADDR) == 1u &&
+                       getRegS32(statusCtx, 2) == THS_WAIT &&
+                       status.status == THS_WAIT &&
+                       status.waitType == TSW_SLEEP;
+            }, std::chrono::milliseconds(200));
+            t.IsTrue(sleeping, "worker should block in SleepThread");
+
+            setRegU32(env.ctx, 4, static_cast<uint32_t>(tid));
+            SuspendThread(
+                env.rdram.data(), &env.ctx, &env.runtime);
+            t.Equals(
+                getRegS32(env.ctx, 2),
+                tid,
+                "SuspendThread should return the suspended worker id");
+
+            R5900Context waitSuspendStatusCtx{};
+            setRegU32(
+                waitSuspendStatusCtx, 4, static_cast<uint32_t>(tid));
+            setRegU32(waitSuspendStatusCtx, 5, K_STATUS_ADDR);
+            ReferThreadStatus(
+                env.rdram.data(),
+                &waitSuspendStatusCtx,
+                &env.runtime);
+            EeThreadStatus waitSuspendStatus{};
+            std::memcpy(
+                &waitSuspendStatus,
+                env.rdram.data() + K_STATUS_ADDR,
+                sizeof(waitSuspendStatus));
+            t.Equals(
+                getRegS32(waitSuspendStatusCtx, 2),
+                THS_WAITSUSPEND,
+                "a suspended sleeper status query should return WAITSUSPEND");
+            t.Equals(
+                waitSuspendStatus.status,
+                THS_WAITSUSPEND,
+                "a suspended sleeper should publish WAITSUSPEND");
+            t.Equals(
+                waitSuspendStatus.waitType,
+                TSW_SLEEP,
+                "WAITSUSPEND should retain the sleep wait reason");
+            t.Equals(
+                waitSuspendStatus.wakeupCount,
+                0u,
+                "WAITSUSPEND should retain a zero wake count");
+
+            {
+                PS2Runtime::GuestExecutionScope guestExecution(
+                    &env.runtime, &env.ctx);
+
+                R5900Context rawWakeCtx{};
+                setRegU32(rawWakeCtx, 4, static_cast<uint32_t>(tid));
+                iWakeupThread(
+                    env.rdram.data(), &rawWakeCtx, &env.runtime);
+                t.Equals(
+                    getRegS32(rawWakeCtx, 2),
+                    tid,
+                    "raw wake should return the wait-suspended worker id");
+                t.Equals(
+                    readGuestU32(
+                        env.rdram.data(), K_WAITSUSPEND_STAGE_ADDR),
+                    1u,
+                    "raw wake should not dispatch a wait-suspended worker");
+
+                R5900Context suspendedStatusCtx{};
+                setRegU32(
+                    suspendedStatusCtx, 4, static_cast<uint32_t>(tid));
+                setRegU32(suspendedStatusCtx, 5, K_STATUS_ADDR);
+                iReferThreadStatus(
+                    env.rdram.data(),
+                    &suspendedStatusCtx,
+                    &env.runtime);
+                EeThreadStatus suspendedStatus{};
+                std::memcpy(
+                    &suspendedStatus,
+                    env.rdram.data() + K_STATUS_ADDR,
+                    sizeof(suspendedStatus));
+                t.Equals(
+                    getRegS32(suspendedStatusCtx, 2),
+                    THS_SUSPEND,
+                    "raw wake should leave a wait-suspended worker suspended");
+                t.Equals(
+                    suspendedStatus.status,
+                    THS_SUSPEND,
+                    "raw wake should publish SUSPEND");
+                t.Equals(
+                    suspendedStatus.waitType,
+                    0u,
+                    "raw wake should clear the sleep wait reason");
+                t.Equals(
+                    suspendedStatus.wakeupCount,
+                    0u,
+                    "raw wake should not expose an accumulated count");
+
+                R5900Context resumeCtx{};
+                setRegU32(resumeCtx, 4, static_cast<uint32_t>(tid));
+                ResumeThread(
+                    env.rdram.data(), &resumeCtx, &env.runtime);
+                t.Equals(
+                    getRegS32(resumeCtx, 2),
+                    tid,
+                    "ResumeThread should return the resumed worker id");
+                t.Equals(
+                    readGuestU32(
+                        env.rdram.data(), K_WAITSUSPEND_STAGE_ADDR),
+                    2u,
+                    "ordinary resume should dispatch the higher-priority worker before returning");
+            }
+
+            const bool dormant = waitUntil([&]()
+            {
+                R5900Context statusCtx{};
+                setRegU32(statusCtx, 4, static_cast<uint32_t>(tid));
+                setRegU32(statusCtx, 5, K_STATUS_ADDR);
+                ReferThreadStatus(
+                    env.rdram.data(), &statusCtx, &env.runtime);
+                return getRegS32(statusCtx, 2) == THS_DORMANT;
+            }, std::chrono::milliseconds(200));
+            t.IsTrue(
+                dormant,
+                "the resumed higher-priority worker should finish before cleanup");
+
+            if (!dormant)
+            {
+                PS2Runtime::GuestExecutionScope guestExecution(
+                    &env.runtime, &env.ctx);
+                R5900Context cleanupWakeCtx{};
+                setRegU32(
+                    cleanupWakeCtx, 4, static_cast<uint32_t>(tid));
+                WakeupThread(
+                    env.rdram.data(),
+                    &cleanupWakeCtx,
+                    &env.runtime);
+            }
+
+            const bool cleanedUp = waitUntil([&]()
+            {
+                R5900Context statusCtx{};
+                setRegU32(statusCtx, 4, static_cast<uint32_t>(tid));
+                setRegU32(statusCtx, 5, K_STATUS_ADDR);
+                ReferThreadStatus(
+                    env.rdram.data(), &statusCtx, &env.runtime);
+                return getRegS32(statusCtx, 2) == THS_DORMANT;
+            }, std::chrono::milliseconds(200));
+            t.IsTrue(cleanedUp, "worker should be dormant before deletion");
+            t.Equals(
+                readGuestU32(
+                    env.rdram.data(), K_WAITSUSPEND_RETURN_ADDR),
+                static_cast<uint32_t>(tid),
+                "the resumed SleepThread should return the current thread id");
+
+            setRegU32(env.ctx, 4, static_cast<uint32_t>(tid));
+            DeleteThread(
+                env.rdram.data(), &env.ctx, &env.runtime);
+            t.Equals(
+                getRegS32(env.ctx, 2),
+                tid,
+                "DeleteThread should remove the resumed sleep worker");
+        });
+
         tc.Run("semaphore EE layout covers poll, signal overflow, and status", [](TestCase &t)
         {
             TestEnv env;
@@ -1334,7 +1566,7 @@ void register_ps2_runtime_kernel_tests()
 
             setRegU32(env.ctx, 4, static_cast<uint32_t>(tid));
             SuspendThread(env.rdram.data(), &env.ctx, &env.runtime);
-            t.Equals(getRegS32(env.ctx, 2), KE_OK, "SuspendThread should succeed for the running waiter");
+            t.Equals(getRegS32(env.ctx, 2), tid, "SuspendThread should return the running waiter's id");
 
             writeGuestU32(env.rdram.data(), K_EVENT_WAIT_GATE_ADDR, 1u);
 
@@ -1378,7 +1610,7 @@ void register_ps2_runtime_kernel_tests()
 
             setRegU32(env.ctx, 4, static_cast<uint32_t>(tid));
             ResumeThread(env.rdram.data(), &env.ctx, &env.runtime);
-            t.Equals(getRegS32(env.ctx, 2), KE_OK, "ResumeThread should release the waiter after the event is set");
+            t.Equals(getRegS32(env.ctx, 2), tid, "ResumeThread should return the released waiter's id");
 
             const bool dormant = waitUntil([&]()
             {

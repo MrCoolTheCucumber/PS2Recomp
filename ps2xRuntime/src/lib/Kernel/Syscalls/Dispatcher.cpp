@@ -141,8 +141,10 @@ namespace ps2_syscalls
             SuspendThread(rdram, ctx, runtime);
             return true;
         case 0x39:
-        case static_cast<uint32_t>(-0x3A):
             ResumeThread(rdram, ctx, runtime);
+            return true;
+        case static_cast<uint32_t>(-0x3A):
+            iResumeThread(rdram, ctx, runtime);
             return true;
         case 0x3C:
             SetupThread(rdram, ctx, runtime);

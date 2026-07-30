@@ -726,10 +726,14 @@ namespace ps2_syscalls
             }
         }
 
-        setReturnS32(ctx, KE_OK);
+        setReturnS32(ctx, tid);
     }
 
-    void ResumeThread(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    static void resumeThread(
+        uint8_t *rdram,
+        R5900Context *ctx,
+        PS2Runtime *runtime,
+        bool reschedule)
     {
         int tid = static_cast<int>(getRegU32(ctx, 4));
         if (tid == 0)
@@ -742,6 +746,7 @@ namespace ps2_syscalls
             return;
         }
 
+        bool becameRunnable = false;
         {
             std::lock_guard<std::mutex> lock(info->m);
             if (info->status == THS_DORMANT)
@@ -764,11 +769,26 @@ namespace ps2_syscalls
                 else
                 {
                     info->status = (tid == g_currentThreadId) ? THS_RUN : THS_READY;
+                    becameRunnable = tid != g_currentThreadId;
                 }
             }
         }
         info->cv.notify_all();
-        setReturnS32(ctx, KE_OK);
+        setReturnS32(ctx, tid);
+        if (becameRunnable && reschedule)
+        {
+            yieldGuestExecutionAfterWake(runtime);
+        }
+    }
+
+    void ResumeThread(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        resumeThread(rdram, ctx, runtime, true);
+    }
+
+    void iResumeThread(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        resumeThread(rdram, ctx, runtime, false);
     }
 
     void GetThreadId(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
@@ -958,7 +978,9 @@ namespace ps2_syscalls
                 setReturnS32(ctx, KE_DORMANT);
                 return;
             }
-            if (info->status == THS_WAIT && info->waitType == TSW_SLEEP)
+            if ((info->status == THS_WAIT ||
+                 info->status == THS_WAITSUSPEND) &&
+                info->waitType == TSW_SLEEP)
             {
                 if (info->suspendCount > 0)
                 {

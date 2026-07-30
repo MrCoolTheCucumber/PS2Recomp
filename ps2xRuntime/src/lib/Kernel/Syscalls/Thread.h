@@ -19,6 +19,7 @@ namespace ps2_syscalls
     void TerminateThread(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
     void SuspendThread(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
     void ResumeThread(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
+    void iResumeThread(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
     void GetThreadId(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
     void ReferThreadStatus(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
     void iReferThreadStatus(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);

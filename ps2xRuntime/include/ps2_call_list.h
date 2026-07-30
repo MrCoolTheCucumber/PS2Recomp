@@ -19,6 +19,7 @@
     X(TerminateThread)         \
     X(SuspendThread)           \
     X(ResumeThread)            \
+    X(iResumeThread)           \
     X(GetThreadId)             \
     X(ReferThreadStatus)       \
     X(iReferThreadStatus)      \
