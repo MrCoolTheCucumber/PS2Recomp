@@ -1,9 +1,13 @@
 #include "MiniTest.h"
 
+#include "runtime/ee_scheduler_executor.h"
 #include "runtime/ee_thread_scheduler.h"
 
+#include <array>
 #include <cstdint>
 #include <deque>
+#include <functional>
+#include <optional>
 #include <thread>
 #include <utility>
 #include <vector>
@@ -76,6 +80,106 @@ namespace
         return actual ==
                std::vector<int>(expected);
     }
+
+    class ScriptedBoundaryHooks final
+        : public IEeSchedulerExecutorHooks
+    {
+    public:
+        struct Commit
+        {
+            std::optional<int> priorThreadId;
+            uint64_t elapsed = 0u;
+            uint64_t tick = 0u;
+        };
+
+        using Action = std::function<
+            void(
+                EeThreadScheduler &,
+                ScriptedBoundaryHooks &)>;
+
+        void queue(
+            EeSchedulerConsequenceStage stage,
+            Action action)
+        {
+            m_actions[
+                eeSchedulerConsequenceStageIndex(stage)]
+                .push_back(std::move(action));
+        }
+
+        void setStorm(
+            std::optional<
+                EeSchedulerConsequenceStage>
+                stage)
+        {
+            m_stormStage = stage;
+        }
+
+        void commitPriorContext(
+            std::optional<int> priorThreadId,
+            ps2x::timing::EeTickDelta elapsed,
+            ps2x::timing::EeTick now) override
+        {
+            commits.push_back(
+                Commit{
+                    priorThreadId,
+                    elapsed.raw(),
+                    now.raw()});
+        }
+
+        void publishSelectedContext(
+            std::optional<int> selectedThreadId,
+            ps2x::timing::EeTick) override
+        {
+            publishedThreads.push_back(
+                selectedThreadId.value_or(0));
+        }
+
+        [[nodiscard]] bool
+        hasImmediateConsequence(
+            EeSchedulerConsequenceStage stage,
+            ps2x::timing::EeTick) const override
+        {
+            return m_stormStage == stage ||
+                   !m_actions[
+                        eeSchedulerConsequenceStageIndex(
+                            stage)]
+                        .empty();
+        }
+
+        void applyNextConsequence(
+            EeSchedulerConsequenceStage stage,
+            ps2x::timing::EeTick,
+            EeThreadScheduler &scheduler) override
+        {
+            appliedStages.push_back(stage);
+            std::deque<Action> &actions =
+                m_actions[
+                    eeSchedulerConsequenceStageIndex(
+                        stage)];
+            if (actions.empty())
+            {
+                return;
+            }
+
+            Action action =
+                std::move(actions.front());
+            actions.pop_front();
+            action(scheduler, *this);
+        }
+
+        std::vector<Commit> commits;
+        std::vector<int> publishedThreads;
+        std::vector<EeSchedulerConsequenceStage>
+            appliedStages;
+
+    private:
+        std::array<
+            std::deque<Action>,
+            kEeSchedulerConsequenceStageCount>
+            m_actions;
+        std::optional<EeSchedulerConsequenceStage>
+            m_stormStage;
+    };
 }
 
 void register_ee_thread_scheduler_tests()
@@ -584,6 +688,294 @@ void register_ee_thread_scheduler_tests()
             t.IsTrue(
                 scheduler.validate(),
                 "ordinary/raw publication boundaries should preserve exact queue ownership");
+        });
+
+        tc.Run("executor drains same-tick consequences to a stable selection", [](TestCase &t)
+        {
+            EeThreadScheduler scheduler;
+            EeSchedulerExecutor executor;
+            ScriptedBoundaryHooks hooks;
+            const EeSchedulerWaitKey wakeWait{
+                EeSchedulerWaitKind::Semaphore,
+                1};
+            const EeSchedulerWaitKey timeoutWait{
+                EeSchedulerWaitKind::Semaphore,
+                2};
+
+            t.IsTrue(
+                scheduler.addRunningThread(3, 1u, 20) &&
+                    scheduler.addDormantThread(1, 1u, 40) &&
+                    scheduler.startThread(1) &&
+                    scheduler.addDormantThread(2, 1u, 40) &&
+                    scheduler.startThread(2),
+                "the fixture should create its first high-priority waiter");
+            t.Equals(
+                scheduler
+                    .blockCurrentThread(wakeWait)
+                    .value_or(0),
+                1,
+                "the first high-priority thread should wait for an asynchronous wake");
+            t.IsTrue(
+                scheduler.addDormantThread(4, 1u, 10) &&
+                    scheduler.startThread(4),
+                "the fixture should publish a timeout target");
+            t.Equals(
+                scheduler
+                    .reschedule(
+                        EeSchedulerReschedulePolicy::
+                            HigherPriorityOnly)
+                    .value_or(0),
+                4,
+                "the timeout target should run before it blocks");
+            t.Equals(
+                scheduler
+                    .blockCurrentThread(timeoutWait)
+                    .value_or(0),
+                2,
+                "blocking the timeout target should restore a priority-40 runner");
+            t.IsTrue(
+                scheduler.addDormantThread(5, 1u, 40) &&
+                    scheduler.startThread(5) &&
+                    scheduler.rotateReadyQueue(40) &&
+                    equals(
+                        scheduler.readyOrder(40),
+                        {5, 1}),
+                "the explicit same-tick rotation should occur before boundary consequences");
+
+            hooks.queue(
+                EeSchedulerConsequenceStage::
+                    AsynchronousWake,
+                [wakeWait](
+                    EeThreadScheduler &target,
+                    ScriptedBoundaryHooks &)
+                {
+                    (void)target.wakeOne(wakeWait);
+                });
+            hooks.queue(
+                EeSchedulerConsequenceStage::WaitTimeout,
+                [timeoutWait](
+                    EeThreadScheduler &target,
+                    ScriptedBoundaryHooks &)
+                {
+                    (void)target.wakeOne(timeoutWait);
+                });
+            hooks.queue(
+                EeSchedulerConsequenceStage::HardwareEvent,
+                [](
+                    EeThreadScheduler &,
+                    ScriptedBoundaryHooks &targetHooks)
+                {
+                    targetHooks.queue(
+                        EeSchedulerConsequenceStage::
+                            AsynchronousWake,
+                        [](
+                            EeThreadScheduler &,
+                            ScriptedBoundaryHooks &)
+                        {
+                        });
+                });
+            hooks.queue(
+                EeSchedulerConsequenceStage::InterruptCause,
+                [](
+                    EeThreadScheduler &target,
+                    ScriptedBoundaryHooks &)
+                {
+                    (void)target.rotateReadyQueue(40);
+                });
+
+            const EeSchedulerBoundaryResult first =
+                executor.processBoundary(
+                    scheduler,
+                    hooks,
+                    2,
+                    ps2x::timing::eeTickDeltaFromRaw(
+                        8u),
+                    EeSchedulerReschedulePolicy::
+                        EqualOrHigherPriority);
+            t.IsTrue(
+                first.tick.raw() == 8u &&
+                    first.selectedThreadId.value_or(0) ==
+                        4 &&
+                    first.consequencesProcessed == 5u &&
+                    first.contextPublications == 3u &&
+                    !first.limitExceeded,
+                "one boundary should commit time and drain every immediate consequence");
+            t.IsTrue(
+                hooks.appliedStages ==
+                    std::vector<
+                        EeSchedulerConsequenceStage>({
+                        EeSchedulerConsequenceStage::
+                            AsynchronousWake,
+                        EeSchedulerConsequenceStage::
+                            WaitTimeout,
+                        EeSchedulerConsequenceStage::
+                            HardwareEvent,
+                        EeSchedulerConsequenceStage::
+                            AsynchronousWake,
+                        EeSchedulerConsequenceStage::
+                            InterruptCause,
+                    }),
+                "same-tick stages should use fixed priority and restart after recursive publication");
+            t.IsTrue(
+                equals(
+                    hooks.publishedThreads,
+                    {5, 3, 4}),
+                "context mirrors should publish the provisional and each newly selected thread");
+            t.IsTrue(
+                equals(
+                    scheduler.readyOrder(40),
+                    {2, 5, 1}) &&
+                    equals(
+                        scheduler.readyOrder(20),
+                        {3}),
+                "the same-tick interrupt rotation should preserve all prior wake selections");
+            t.IsTrue(
+                first.stageCounts[
+                    eeSchedulerConsequenceStageIndex(
+                        EeSchedulerConsequenceStage::
+                            AsynchronousWake)] == 2u &&
+                    first.stageCounts[
+                        eeSchedulerConsequenceStageIndex(
+                            EeSchedulerConsequenceStage::
+                                WaitTimeout)] == 1u &&
+                    first.stageCounts[
+                        eeSchedulerConsequenceStageIndex(
+                            EeSchedulerConsequenceStage::
+                                HardwareEvent)] == 1u &&
+                    first.stageCounts[
+                        eeSchedulerConsequenceStageIndex(
+                            EeSchedulerConsequenceStage::
+                                InterruptCause)] == 1u,
+                "the boundary result should retain exact stage diagnostics");
+
+            const EeSchedulerBoundaryResult second =
+                executor.processBoundary(
+                    scheduler,
+                    hooks,
+                    4,
+                    ps2x::timing::eeTickDeltaFromRaw(
+                        12u),
+                    EeSchedulerReschedulePolicy::
+                        HigherPriorityOnly);
+            t.IsTrue(
+                second.tick.raw() == 20u &&
+                    second.consequencesProcessed == 0u &&
+                    second.selectedThreadId.value_or(0) ==
+                        4 &&
+                    hooks.commits.size() == 2u &&
+                    hooks.commits[0].priorThreadId ==
+                        std::optional<int>(2) &&
+                    hooks.commits[0].elapsed == 8u &&
+                    hooks.commits[0].tick == 8u &&
+                    hooks.commits[1].priorThreadId ==
+                        std::optional<int>(4) &&
+                    hooks.commits[1].elapsed == 12u &&
+                    hooks.commits[1].tick == 20u,
+                "successive boundaries should commit each prior context without rewinding time");
+            t.IsTrue(
+                executor.statistics().boundaries == 2u &&
+                    executor.statistics().consequences ==
+                        5u &&
+                    executor.statistics().
+                            contextPublications == 4u &&
+                    scheduler.validate(),
+                "stable-boundary statistics and scheduler invariants should agree");
+        });
+
+        tc.Run("executor rejects recursion and bounds consequence storms", [](TestCase &t)
+        {
+            {
+                EeThreadScheduler scheduler;
+                EeSchedulerExecutor executor;
+                ScriptedBoundaryHooks hooks;
+                std::optional<
+                    EeSchedulerBoundaryResult>
+                    nested;
+                t.IsTrue(
+                    scheduler.addRunningThread(
+                        1, 1u, 40),
+                    "the recursion fixture should have one runner");
+                hooks.queue(
+                    EeSchedulerConsequenceStage::
+                        AsynchronousWake,
+                    [&executor, &nested](
+                        EeThreadScheduler &target,
+                        ScriptedBoundaryHooks &targetHooks)
+                    {
+                        nested =
+                            executor.processBoundary(
+                                target,
+                                targetHooks,
+                                1,
+                                ps2x::timing::
+                                    eeTickDeltaFromRaw(
+                                        99u),
+                                EeSchedulerReschedulePolicy::
+                                    HigherPriorityOnly);
+                    });
+
+                const EeSchedulerBoundaryResult outer =
+                    executor.processBoundary(
+                        scheduler,
+                        hooks,
+                        1,
+                        ps2x::timing::
+                            eeTickDeltaFromRaw(4u),
+                        EeSchedulerReschedulePolicy::
+                            HigherPriorityOnly);
+                t.IsTrue(
+                    !outer.reentrantBoundaryRejected &&
+                        nested.has_value() &&
+                        nested->
+                            reentrantBoundaryRejected &&
+                        nested->tick.raw() == 4u &&
+                        executor.now().raw() == 4u &&
+                        executor.statistics().
+                                reentrantBoundaryRejects ==
+                            1u,
+                    "a nested boundary should be rejected without committing its elapsed time");
+            }
+
+            {
+                EeThreadScheduler scheduler;
+                EeSchedulerExecutor executor;
+                ScriptedBoundaryHooks hooks;
+                t.IsTrue(
+                    scheduler.addRunningThread(
+                        1, 1u, 40),
+                    "the storm fixture should have one runner");
+                hooks.setStorm(
+                    EeSchedulerConsequenceStage::
+                        AsynchronousWake);
+                const EeSchedulerBoundaryResult result =
+                    executor.processBoundary(
+                        scheduler,
+                        hooks,
+                        1,
+                        ps2x::timing::
+                            eeTickDeltaFromRaw(1u),
+                        EeSchedulerReschedulePolicy::
+                            HigherPriorityOnly);
+
+                t.IsTrue(
+                    result.limitExceeded &&
+                        result.consequencesProcessed ==
+                            EeSchedulerExecutor::
+                                kMaximumConsequencesPerBoundary &&
+                        result.offendingStage ==
+                            EeSchedulerConsequenceStage::
+                                AsynchronousWake &&
+                        executor.statistics().
+                                consequenceLimitHits ==
+                            1u,
+                    "an immediate consequence storm should stop at the fixed bound with its stage");
+                t.IsTrue(
+                    scheduler.currentThreadId().
+                            value_or(0) ==
+                        1 &&
+                        scheduler.validate(),
+                    "storm diagnostics should leave the selected scheduler state valid");
+            }
         });
 
         tc.Run("priority changes migrate only ready membership", [](TestCase &t)
