@@ -73,6 +73,32 @@ static constexpr uint32_t DEFAULT_FB_ADDR = (PS2_RAM_SIZE - DEFAULT_FB_SIZE - 0x
 static constexpr const char *GS_HISTORY_DUMP_ENV = "PS2X_GS_HISTORY_DUMP";
 static std::atomic<uint64_t> g_nextEeThreadRuntimeGeneration{1u};
 
+struct HostPresentationUploadState
+{
+    uint64_t lastPresentationTick =
+        std::numeric_limits<uint64_t>::max();
+    bool hasLatchedInitialFrame = false;
+    uint32_t lastDisplayFbp =
+        std::numeric_limits<uint32_t>::max();
+    uint32_t lastSourceFbp =
+        std::numeric_limits<uint32_t>::max();
+    bool lastPreferred = false;
+    uint32_t lastWidth = 0u;
+    uint32_t lastHeight = 0u;
+    bool hasUploadedFrame = false;
+    std::vector<uint8_t> scratch;
+    std::vector<uint8_t> uploadBuffer =
+        std::vector<uint8_t>(DEFAULT_FB_SIZE, 0u);
+    uint32_t uploadDebugCount = 0u;
+};
+
+static HostPresentationUploadState &
+sharedHostPresentationUploadState()
+{
+    static HostPresentationUploadState state;
+    return state;
+}
+
 static uint64_t allocateEeThreadRuntimeGeneration() noexcept
 {
     uint64_t generation = 0u;
@@ -798,40 +824,40 @@ PS2Runtime::GuestExecutionTryScope::~GuestExecutionTryScope()
 
 static void UploadFrame(Texture2D &tex, PS2Runtime *rt, uint32_t &outWidth, uint32_t &outHeight)
 {
-    static uint64_t s_lastPresentationTick = std::numeric_limits<uint64_t>::max();
-    static bool s_hasLatchedInitialFrame = false;
-    static uint32_t s_lastDisplayFbp = std::numeric_limits<uint32_t>::max();
-    static uint32_t s_lastSourceFbp = std::numeric_limits<uint32_t>::max();
-    static bool s_lastPreferred = false;
-    static uint32_t s_lastWidth = 0u;
-    static uint32_t s_lastHeight = 0u;
-    static bool s_hasUploadedFrame = false;
-    static std::vector<uint8_t> s_scratch;
-    static std::vector<uint8_t> s_uploadBuffer(DEFAULT_FB_SIZE, 0u);
+    HostPresentationUploadState &state =
+        sharedHostPresentationUploadState();
 
     const uint64_t currentTick =
         ps2_syscalls::GetCurrentVSyncTick(rt);
-    const bool needsLatch = !s_hasLatchedInitialFrame || currentTick != s_lastPresentationTick;
+    const bool needsLatch =
+        !state.hasLatchedInitialFrame ||
+        currentTick != state.lastPresentationTick;
     if (needsLatch)
     {
         rt->gs().latchHostPresentationFrame();
-        s_lastPresentationTick = currentTick;
-        s_hasLatchedInitialFrame = true;
+        state.lastPresentationTick = currentTick;
+        state.hasLatchedInitialFrame = true;
     }
-    else if (s_hasUploadedFrame)
+    else if (state.hasUploadedFrame)
     {
-        outWidth = (s_lastWidth != 0u) ? s_lastWidth : FB_WIDTH;
-        outHeight = (s_lastHeight != 0u) ? s_lastHeight : DEFAULT_DISPLAY_HEIGHT;
+        outWidth =
+            (state.lastWidth != 0u)
+                ? state.lastWidth
+                : FB_WIDTH;
+        outHeight =
+            (state.lastHeight != 0u)
+                ? state.lastHeight
+                : DEFAULT_DISPLAY_HEIGHT;
         return;
     }
 
-    s_scratch.clear();
+    state.scratch.clear();
     uint32_t width = 0u;
     uint32_t height = 0u;
     uint32_t displayFbp = 0u;
     uint32_t sourceFbp = 0u;
     bool usedPreferredDisplaySource = false;
-    if (!rt->gs().copyLatchedHostPresentationFrame(s_scratch,
+    if (!rt->gs().copyLatchedHostPresentationFrame(state.scratch,
                                                    width,
                                                    height,
                                                    &displayFbp,
@@ -843,22 +869,22 @@ static void UploadFrame(Texture2D &tex, PS2Runtime *rt, uint32_t &outWidth, uint
         UnloadImage(blank);
         outWidth = FB_WIDTH;
         outHeight = DEFAULT_DISPLAY_HEIGHT;
-        s_lastWidth = outWidth;
-        s_lastHeight = outHeight;
-        s_hasUploadedFrame = true;
+        state.lastWidth = outWidth;
+        state.lastHeight = outHeight;
+        state.hasUploadedFrame = true;
         return;
     }
 
     PS2_IF_AGRESSIVE_LOGS({
-        static uint32_t s_uploadDebugCount = 0u;
-        if (s_uploadDebugCount < 128u ||
-            displayFbp != s_lastDisplayFbp ||
-            sourceFbp != s_lastSourceFbp ||
-            usedPreferredDisplaySource != s_lastPreferred ||
-            width != s_lastWidth ||
-            height != s_lastHeight)
+        if (state.uploadDebugCount < 128u ||
+            displayFbp != state.lastDisplayFbp ||
+            sourceFbp != state.lastSourceFbp ||
+            usedPreferredDisplaySource != state.lastPreferred ||
+            width != state.lastWidth ||
+            height != state.lastHeight)
         {
-            std::cout << "[frame:upload] idx=" << s_uploadDebugCount
+            std::cout << "[frame:upload] idx="
+                      << state.uploadDebugCount
                       << " tick=" << currentTick
                       << " displayFbp=" << displayFbp
                       << " sourceFbp=" << sourceFbp
@@ -866,16 +892,21 @@ static void UploadFrame(Texture2D &tex, PS2Runtime *rt, uint32_t &outWidth, uint
                       << " preferred=" << static_cast<uint32_t>(usedPreferredDisplaySource ? 1u : 0u)
                       << std::endl;
         }
-        ++s_uploadDebugCount;
+        ++state.uploadDebugCount;
     });
-    s_lastDisplayFbp = displayFbp;
-    s_lastSourceFbp = sourceFbp;
-    s_lastPreferred = usedPreferredDisplaySource;
-    s_lastWidth = width;
-    s_lastHeight = height;
+    state.lastDisplayFbp = displayFbp;
+    state.lastSourceFbp = sourceFbp;
+    state.lastPreferred = usedPreferredDisplaySource;
+    state.lastWidth = width;
+    state.lastHeight = height;
 
-    std::fill(s_uploadBuffer.begin(), s_uploadBuffer.end(), 0u);
-    if (!s_scratch.empty() && width != 0u && height != 0u)
+    std::fill(
+        state.uploadBuffer.begin(),
+        state.uploadBuffer.end(),
+        0u);
+    if (!state.scratch.empty() &&
+        width != 0u &&
+        height != 0u)
     {
         const uint32_t copyWidth = std::min<uint32_t>(width, FB_WIDTH);
         const uint32_t copyHeight = std::min<uint32_t>(height, FB_HEIGHT);
@@ -886,19 +917,24 @@ static void UploadFrame(Texture2D &tex, PS2Runtime *rt, uint32_t &outWidth, uint
         {
             const size_t srcOffset = static_cast<size_t>(y) * srcRowBytes;
             const size_t dstOffset = static_cast<size_t>(y) * dstRowBytes;
-            if (srcOffset + copyRowBytes > s_scratch.size() ||
-                dstOffset + copyRowBytes > s_uploadBuffer.size())
+            if (srcOffset + copyRowBytes >
+                    state.scratch.size() ||
+                dstOffset + copyRowBytes >
+                    state.uploadBuffer.size())
             {
                 break;
             }
-            std::memcpy(s_uploadBuffer.data() + dstOffset, s_scratch.data() + srcOffset, copyRowBytes);
+            std::memcpy(
+                state.uploadBuffer.data() + dstOffset,
+                state.scratch.data() + srcOffset,
+                copyRowBytes);
         }
     }
 
-    UpdateTexture(tex, s_uploadBuffer.data());
+    UpdateTexture(tex, state.uploadBuffer.data());
     outWidth = width;
     outHeight = height;
-    s_hasUploadedFrame = true;
+    state.hasUploadedFrame = true;
 }
 
 PS2Runtime::PS2Runtime()
@@ -1351,6 +1387,13 @@ PS2Runtime::managedEeExecutionThreadCountForTesting() const
                ? m_eeExecutionBackend
                      ->managedThreadCount()
                : 0u;
+}
+
+const void *
+PS2Runtime::hostPresentationUploadStateIdentityForTesting()
+    const noexcept
+{
+    return &sharedHostPresentationUploadState();
 }
 
 size_t

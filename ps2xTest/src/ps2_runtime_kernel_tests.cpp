@@ -579,6 +579,19 @@ void register_ps2_runtime_kernel_tests()
                 "a fresh backend should not own guest continuations");
         });
 
+        tc.Run("host presentation upload state is isolated per runtime", [](TestCase &t)
+        {
+            PS2Runtime first;
+            PS2Runtime second;
+
+            t.IsTrue(
+                first
+                        .hostPresentationUploadStateIdentityForTesting() !=
+                    second
+                        .hostPresentationUploadStateIdentityForTesting(),
+                "runtime restart must not inherit another texture's upload latch");
+        });
+
 #ifndef NDEBUG
         tc.Run("DECI2 sessions are isolated per runtime", [](TestCase &t)
         {

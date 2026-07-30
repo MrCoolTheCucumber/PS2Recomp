@@ -1270,6 +1270,8 @@ public:
     eeExecutionBackendName() const noexcept;
     [[nodiscard]] size_t
     managedEeExecutionThreadCountForTesting() const;
+    [[nodiscard]] const void *
+    hostPresentationUploadStateIdentityForTesting() const noexcept;
     [[nodiscard]] size_t
     pendingAlarmCallbackCountForTesting();
     EeAlarmRuntimeState &eeAlarmRuntimeState();
