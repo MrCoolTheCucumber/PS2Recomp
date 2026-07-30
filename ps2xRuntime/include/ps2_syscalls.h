@@ -106,7 +106,8 @@ namespace ps2_syscalls
     void joinAllGuestHostThreads(PS2Runtime *runtime);
     void detachAllGuestHostThreads(PS2Runtime *runtime);
     void EnsureVSyncScheduled(uint8_t *rdram, PS2Runtime *runtime);
-    uint64_t GetCurrentVSyncTick();
+    uint64_t GetCurrentVSyncTick(
+        PS2Runtime *runtime);
     uint64_t PublishVSyncStart(uint8_t *rdram, PS2Runtime *runtime);
     void PublishVSyncField(PS2Runtime *runtime, uint64_t tick);
     void DispatchVSyncStartHandlers(

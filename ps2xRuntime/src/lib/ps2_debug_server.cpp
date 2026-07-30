@@ -2118,7 +2118,9 @@ struct PS2DebugServer::Impl
             "cycle_ticks", timing.currentTick, allocator);
         result.AddMember(
             "vsync_tick",
-            ps2_syscalls::GetCurrentVSyncTick(), allocator);
+            ps2_syscalls::GetCurrentVSyncTick(
+                &runtime),
+            allocator);
         result.AddMember(
             "local_block_cycle_ticks",
             timing.localBlockTicks, allocator);

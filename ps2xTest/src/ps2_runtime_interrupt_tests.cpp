@@ -379,8 +379,9 @@ void register_ps2_runtime_interrupt_tests()
         tc.Run("event VSync follows emulated NTSC phases and defers guest callbacks", [](TestCase &t)
         {
             notifyRuntimeStop();
-            ps2_stubs::resetGsSyncVCallbackState();
             TestEnv env;
+            ps2_stubs::resetGsSyncVCallbackState(
+                &env.runtime);
             t.IsTrue(
                 env.runtime.memory().initialize(),
                 "runtime memory initialize should succeed");
@@ -441,7 +442,7 @@ void register_ps2_runtime_interrupt_tests()
                 &env.runtime);
 
             const uint64_t initialVSyncTick =
-                GetCurrentVSyncTick();
+                GetCurrentVSyncTick(&env.runtime);
             const PS2Runtime::DebugEeScheduler initial =
                 env.runtime.debugEeSchedulerSnapshot();
             const auto &initialSlot =
@@ -468,7 +469,8 @@ void register_ps2_runtime_interrupt_tests()
             std::this_thread::sleep_for(
                 std::chrono::milliseconds(25));
             t.Equals(
-                GetCurrentVSyncTick(), initialVSyncTick,
+                GetCurrentVSyncTick(&env.runtime),
+                initialVSyncTick,
                 "host wall time must not service event-mode VSync");
             t.Equals(
                 readGuestU32(
@@ -492,7 +494,7 @@ void register_ps2_runtime_interrupt_tests()
                 env.runtime.serviceEeEventsAtBlockBoundary(
                     env.rdram.data(), &timingCtx);
                 t.Equals(
-                    GetCurrentVSyncTick(),
+                    GetCurrentVSyncTick(&env.runtime),
                     initialVSyncTick,
                     "VSync must remain pending immediately before its deadline");
 
@@ -516,7 +518,8 @@ void register_ps2_runtime_interrupt_tests()
             const uint64_t firstVSyncTick =
                 initialVSyncTick + 1u;
             t.Equals(
-                GetCurrentVSyncTick(), firstVSyncTick,
+                GetCurrentVSyncTick(&env.runtime),
+                firstVSyncTick,
                 "VBlank start should publish exactly one VSync tick");
             t.Equals(
                 readGuestU32(
@@ -656,7 +659,8 @@ void register_ps2_runtime_interrupt_tests()
             }
 
             cleanupRuntime(env);
-            ps2_stubs::resetGsSyncVCallbackState();
+            ps2_stubs::resetGsSyncVCallbackState(
+                &env.runtime);
         });
 
         tc.Run("event VSync preserves the active phase when SetGsCrt selects PAL", [](TestCase &t)
@@ -901,7 +905,7 @@ void register_ps2_runtime_interrupt_tests()
             R5900Context ctx{};
             ctx.cop0_config = 1u << 18u;
             const uint64_t tickBefore =
-                GetCurrentVSyncTick();
+                GetCurrentVSyncTick(&env.runtime);
             const auto hostStart =
                 std::chrono::steady_clock::now();
             uint64_t firstTick = 0u;
@@ -997,7 +1001,7 @@ void register_ps2_runtime_interrupt_tests()
             R5900Context ctx{};
             ctx.cop0_config = 1u << 18u;
             const uint64_t tickBefore =
-                GetCurrentVSyncTick();
+                GetCurrentVSyncTick(&env.runtime);
             const auto hostStart =
                 std::chrono::steady_clock::now();
             uint64_t secondTick = 0u;
@@ -1045,7 +1049,7 @@ void register_ps2_runtime_interrupt_tests()
             constexpr uint64_t kTicksPerEeCycle = 8u;
             constexpr uint64_t kRenderCycles = 4'498'396u;
             const uint64_t observedTick =
-                GetCurrentVSyncTick();
+                GetCurrentVSyncTick(&env.runtime);
 
             R5900Context firstWaitCtx{};
             R5900Context secondWaitCtx{};
@@ -1084,7 +1088,7 @@ void register_ps2_runtime_interrupt_tests()
                 "two waiters must not advance through two VSync fields");
 
             const uint64_t secondObservedTick =
-                GetCurrentVSyncTick();
+                GetCurrentVSyncTick(&env.runtime);
             std::atomic<bool> ordinaryEntered{false};
             std::atomic<bool> allowOrdinaryExit{false};
             std::atomic<bool> thirdWaitDone{false};
@@ -1161,7 +1165,7 @@ void register_ps2_runtime_interrupt_tests()
                     std::memory_order_acquire),
                 "VSync must not skip emulated time while ordinary guest work is runnable");
             t.Equals(
-                GetCurrentVSyncTick(),
+                GetCurrentVSyncTick(&env.runtime),
                 secondObservedTick,
                 "the next VSync should remain pending while ordinary work owns the token");
 
@@ -1234,7 +1238,8 @@ void register_ps2_runtime_interrupt_tests()
             setRegU32(ctx, 4, kFlagAddr);
             setRegU32(ctx, 5, kTickAddr);
             t.IsTrue(callSyscall(0x73u, env.rdram.data(), &ctx, &env.runtime), "SetVSyncFlag syscall should dispatch");
-            const uint64_t tickBefore = GetCurrentVSyncTick();
+            const uint64_t tickBefore =
+                GetCurrentVSyncTick(&env.runtime);
 
             std::atomic<uint32_t> setAnomaliesA{0u}, clearAnomaliesA{0u};
             std::atomic<uint32_t> setAnomaliesB{0u}, clearAnomaliesB{0u};
@@ -1287,7 +1292,9 @@ void register_ps2_runtime_interrupt_tests()
 
             racerA.join();
             racerB.join();
-            const uint64_t ticksElapsed = GetCurrentVSyncTick() - tickBefore;
+            const uint64_t ticksElapsed =
+                GetCurrentVSyncTick(&env.runtime) -
+                tickBefore;
 
             t.Equals(setAnomaliesA.load(), 0u, "racer A: SIGNAL set must never be lost to a concurrent whole-word CSR RMW");
             t.Equals(clearAnomaliesA.load(), 0u, "racer A: SIGNAL W1C-clear must never be lost to a concurrent whole-word CSR RMW");
@@ -1420,9 +1427,12 @@ void register_ps2_runtime_interrupt_tests()
         tc.Run("VSync publication and GS callbacks are isolated per runtime", [](TestCase &t)
         {
             notifyRuntimeStop();
-            ps2_stubs::resetGsSyncVCallbackState();
             TestEnv first;
             TestEnv second;
+            ps2_stubs::resetGsSyncVCallbackState(
+                &first.runtime);
+            ps2_stubs::resetGsSyncVCallbackState(
+                &second.runtime);
             t.IsTrue(
                 first.runtime.memory().initialize(),
                 "first runtime memory initialize should succeed");
@@ -1591,6 +1601,33 @@ void register_ps2_runtime_interrupt_tests()
                         secondCallbackStack,
                 "the second callback stack should be reserved by the second runtime");
 
+            auto resetGsVideo =
+                [](TestEnv &env, uint32_t interlace)
+            {
+                R5900Context context{};
+                setRegU32(context, 4, 0u);
+                setRegU32(context, 5, interlace);
+                setRegU32(context, 6, 2u);
+                setRegU32(context, 7, 1u);
+                ps2_stubs::sceGsResetGraph(
+                    env.rdram.data(),
+                    &context,
+                    &env.runtime);
+            };
+            resetGsVideo(first, 0u);
+            resetGsVideo(second, 1u);
+            R5900Context firstParameters{};
+            ps2_stubs::sceGsGetGParam(
+                first.rdram.data(),
+                &firstParameters,
+                &first.runtime);
+            t.Equals(
+                static_cast<uint32_t>(
+                    first.runtime.memory()
+                        .getScratchpad()[0x100u]),
+                0u,
+                "the second runtime's interlace mode must not replace the first runtime's GS parameters");
+
             ps2_stubs::dispatchGsSyncVCallback(
                 first.rdram.data(),
                 &first.runtime,
@@ -1635,7 +1672,8 @@ void register_ps2_runtime_interrupt_tests()
                 "stopping the second runtime must not replace the first callback address");
 
             cleanupRuntime(first);
-            ps2_stubs::resetGsSyncVCallbackState();
+            ps2_stubs::resetGsSyncVCallbackState(
+                &first.runtime);
         });
 
         tc.Run("interrupt callback stack belongs to the runtime rather than the host thread", [](TestCase &t)

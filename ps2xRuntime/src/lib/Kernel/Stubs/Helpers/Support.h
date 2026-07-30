@@ -1467,14 +1467,6 @@ namespace
 
 namespace
 {
-    struct GsGParam
-    {
-        uint8_t interlace;
-        uint8_t omode;
-        uint8_t ffmode;
-        uint8_t version;
-    };
-
     struct GsDispEnvMem
     {
         uint64_t pmode;
@@ -1573,9 +1565,6 @@ namespace
     static_assert(sizeof(GsDrawEnv2Mem) == 128, "GsDrawEnv2Mem size mismatch");
     static_assert(sizeof(GsClearMem) == 96, "GsClearMem size mismatch");
     static_assert(sizeof(GsDBuffDcMem) == 0x330, "GsDBuffDcMem size mismatch");
-
-    constexpr uint32_t kGsParamScratchOffset = 0x100;
-    GsGParam g_gparam{1, 2, 1, 3}; // Default: interlaced NTSC, frame mode.
 
     static uint64_t makePmode(uint32_t en1, uint32_t en2, uint32_t mmod, uint32_t amod, uint32_t slbg, uint32_t alp)
     {
@@ -1919,14 +1908,4 @@ namespace
         env.test2 = {makeTest(ztest), GS_REG_TEST_2};
     }
 
-    static uint32_t writeGsGParamToScratch(PS2Runtime *runtime)
-    {
-        if (!runtime)
-            return 0;
-        uint8_t *scratch = runtime->memory().getScratchpad();
-        if (!scratch)
-            return 0;
-        std::memcpy(scratch + kGsParamScratchOffset, &g_gparam, sizeof(g_gparam));
-        return PS2_SCRATCHPAD_BASE + kGsParamScratchOffset;
-    }
 }

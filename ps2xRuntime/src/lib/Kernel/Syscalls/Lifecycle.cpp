@@ -5,8 +5,6 @@
 
 namespace ps2_syscalls
 {
-    using namespace interrupt_state;
-
     void notifyRuntimeStop(PS2Runtime *runtime)
     {
         if (runtime)
@@ -26,10 +24,31 @@ namespace ps2_syscalls
             state.enabledIntcMask = 0xFFFFFFFFu;
             state.enabledDmacMask = 0xFFFFFFFFu;
         }
+        if (runtime)
         {
-            std::lock_guard<std::mutex> lock(g_vsync_flag_mutex);
-            g_vsync_registration = {};
-            g_vsync_tick_counter = 0u;
+            EeInterruptRuntimeState &state =
+                runtime->eeInterruptRuntimeState();
+            {
+                std::lock_guard<std::mutex> lock(
+                    state.vsyncMutex);
+                state.vsyncRegistration = {};
+                state.vsyncTick = 0u;
+                state.gsSyncVBaseTick = 0u;
+                state.gsVideoParameters = {};
+                state.gsSyncVCallback = 0u;
+                state.gsSyncVCallbackGp = 0u;
+                state.gsSyncVCallbackSp = 0u;
+            }
+            state.gsSyncVCallbackSetLogCount.store(
+                0u, std::memory_order_relaxed);
+            state.gsSyncVCallbackMissingLogCount.store(
+                0u, std::memory_order_relaxed);
+            state.gsSyncVCallbackDispatchLogCount.store(
+                0u, std::memory_order_relaxed);
+            state.gsSyncVCallbackBadPcLogCount.store(
+                0u, std::memory_order_relaxed);
+            state.gsSyncVCallbackWarningCount.store(
+                0u, std::memory_order_relaxed);
         }
 
         std::vector<std::shared_ptr<ThreadInfo>> threads;

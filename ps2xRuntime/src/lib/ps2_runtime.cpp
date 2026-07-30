@@ -796,7 +796,8 @@ static void UploadFrame(Texture2D &tex, PS2Runtime *rt, uint32_t &outWidth, uint
     static std::vector<uint8_t> s_scratch;
     static std::vector<uint8_t> s_uploadBuffer(DEFAULT_FB_SIZE, 0u);
 
-    const uint64_t currentTick = ps2_syscalls::GetCurrentVSyncTick();
+    const uint64_t currentTick =
+        ps2_syscalls::GetCurrentVSyncTick(rt);
     const bool needsLatch = !s_hasLatchedInitialFrame || currentTick != s_lastPresentationTick;
     if (needsLatch)
     {
@@ -902,6 +903,12 @@ PS2Runtime::PS2Runtime(PS2RuntimeConfiguration configuration)
         std::make_unique<EeSyncRuntimeState>();
     m_eeInterruptRuntimeState =
         std::make_unique<EeInterruptRuntimeState>();
+    m_gs.setVSyncTickProvider(
+        [this]()
+        {
+            return ps2_syscalls::GetCurrentVSyncTick(
+                this);
+        });
     m_eeThreadRuntimeState =
         std::make_unique<EeThreadRuntimeState>(
             allocateEeThreadRuntimeGeneration());
@@ -1254,6 +1261,7 @@ PS2Runtime::~PS2Runtime()
             CloseWindow();
         }
 
+        m_gs.setVSyncTickProvider({});
         m_loadedModules.clear();
     }
     catch (const std::exception &e)
@@ -2083,7 +2091,7 @@ uint64_t PS2Runtime::waitForNextScheduledVSync(
     while (!isStopRequested())
     {
         const uint64_t currentVSyncTick =
-            ps2_syscalls::GetCurrentVSyncTick();
+            ps2_syscalls::GetCurrentVSyncTick(this);
         if (currentVSyncTick > observedVSyncTick)
         {
             return currentVSyncTick;
@@ -2095,7 +2103,8 @@ uint64_t PS2Runtime::waitForNextScheduledVSync(
             GuestExecutionScope guestExecution(
                 this, serviceContext);
 
-            if (ps2_syscalls::GetCurrentVSyncTick() >
+            if (ps2_syscalls::GetCurrentVSyncTick(
+                    this) >
                 observedVSyncTick)
             {
                 continue;
@@ -2156,7 +2165,7 @@ uint64_t PS2Runtime::waitForNextScheduledVSync(
         }
     }
 
-    return ps2_syscalls::GetCurrentVSyncTick();
+    return ps2_syscalls::GetCurrentVSyncTick(this);
 }
 
 ps2x::timing::EeTick PS2Runtime::publishEeElapsed(
@@ -4930,7 +4939,7 @@ void PS2Runtime::debugArmVu0Traces(const R5900Context *ctx)
         const DebugEeScheduler scheduler =
             debugEeSchedulerSnapshot();
         const uint64_t vsyncTick =
-            ps2_syscalls::GetCurrentVSyncTick();
+            ps2_syscalls::GetCurrentVSyncTick(this);
         {
             std::lock_guard<std::mutex> lock(
                 m_debugVu0SyncTraceMutex);
@@ -5671,7 +5680,7 @@ void PS2Runtime::synchronizeVU0MicroprogramAtTick(
                 std::memory_order_relaxed);
         traceEntry.eeCycleTicks = eeCycleTick.raw();
         traceEntry.vsyncTick =
-            ps2_syscalls::GetCurrentVSyncTick();
+            ps2_syscalls::GetCurrentVSyncTick(this);
         traceEntry.vuCycleTicks = m_vu0CycleTick.raw();
         traceEntry.nextEventCycleTicks =
             nextEventTick.raw();
@@ -9071,7 +9080,7 @@ void PS2Runtime::run()
     ps2_stubs::resetSifState();
     resetIop();
     ps2_stubs::resetAudioStubState();
-    ps2_stubs::resetGsSyncVCallbackState();
+    ps2_stubs::resetGsSyncVCallbackState(this);
     ps2_stubs::resetMpegStubState();
     ps2_syscalls::initializeGuestKernelState(m_memory.getRDRAM());
     m_cpuContext.r[4] = _mm_setzero_si128();

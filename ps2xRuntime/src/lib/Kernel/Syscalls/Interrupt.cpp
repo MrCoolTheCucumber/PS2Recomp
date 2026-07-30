@@ -11,10 +11,6 @@ namespace ps2_syscalls
         constexpr uint32_t kIntcVblankStart = 2u;
         constexpr uint32_t kIntcVblankEnd = 3u;
         constexpr uint32_t kMaxIrqHandlerSteps = 4096u;
-
-        std::mutex g_vsync_flag_mutex;
-        uint64_t g_vsync_tick_counter = 0u;
-        VSyncFlagRegistration g_vsync_registration{};
     }
 
     using namespace interrupt_state;
@@ -66,44 +62,6 @@ namespace ps2_syscalls
         std::memcpy(&value, src, sizeof(value));
         return value;
     }
-
-    class InterruptCallbackContextLease
-    {
-    public:
-        InterruptCallbackContextLease(
-            EeInterruptRuntimeState &state,
-            PS2Runtime &runtime)
-            : m_state(state),
-              m_slot(state.acquireCallbackContext(runtime))
-        {
-        }
-
-        ~InterruptCallbackContextLease()
-        {
-            m_state.releaseCallbackContext(m_slot);
-        }
-
-        R5900Context &context()
-        {
-            return m_slot->context;
-        }
-
-        uint32_t stackTop() const
-        {
-            return m_slot->stackTop != 0u
-                       ? m_slot->stackTop
-                       : (PS2_RAM_SIZE - 0x10u);
-        }
-
-        InterruptCallbackContextLease(
-            const InterruptCallbackContextLease &) = delete;
-        InterruptCallbackContextLease &operator=(
-            const InterruptCallbackContextLease &) = delete;
-
-    private:
-        EeInterruptRuntimeState &m_state;
-        EeInterruptCallbackContext *m_slot = nullptr;
-    };
 
     void dispatchIntcHandlersForCause(uint8_t *rdram, PS2Runtime *runtime, uint32_t cause)
     {
@@ -174,7 +132,7 @@ namespace ps2_syscalls
 
             try
             {
-                InterruptCallbackContextLease callback(
+                EeAsyncCallbackContextLease callback(
                     state, *runtime);
                 R5900Context &irqCtx =
                     callback.context();
@@ -307,7 +265,7 @@ namespace ps2_syscalls
 
             try
             {
-                InterruptCallbackContextLease callback(
+                EeAsyncCallbackContextLease callback(
                     state, *runtime);
                 R5900Context &irqCtx =
                     callback.context();
@@ -409,13 +367,21 @@ namespace ps2_syscalls
 
     static uint64_t signalVSyncFlag(uint8_t *rdram, PS2Runtime *runtime)
     {
-        VSyncFlagRegistration reg{};
+        if (!runtime)
+        {
+            return 0u;
+        }
+
+        EeInterruptRuntimeState &state =
+            runtime->eeInterruptRuntimeState();
+        EeVSyncFlagRegistration reg{};
         uint64_t tickValue = 0u;
         {
-            std::lock_guard<std::mutex> lock(g_vsync_flag_mutex);
-            reg = g_vsync_registration;
-            g_vsync_registration = {};
-            tickValue = ++g_vsync_tick_counter;
+            std::lock_guard<std::mutex> lock(
+                state.vsyncMutex);
+            reg = state.vsyncRegistration;
+            state.vsyncRegistration = {};
+            tickValue = ++state.vsyncTick;
         }
 
         if (reg.flagAddr != 0u)
@@ -467,10 +433,19 @@ namespace ps2_syscalls
         }
     }
 
-    uint64_t GetCurrentVSyncTick()
+    uint64_t GetCurrentVSyncTick(
+        PS2Runtime *runtime)
     {
-        std::lock_guard<std::mutex> lock(g_vsync_flag_mutex);
-        return g_vsync_tick_counter;
+        if (!runtime)
+        {
+            return 0u;
+        }
+
+        EeInterruptRuntimeState &state =
+            runtime->eeInterruptRuntimeState();
+        std::lock_guard<std::mutex> lock(
+            state.vsyncMutex);
+        return state.vsyncTick;
     }
 
     uint64_t WaitForNextVSyncTick(
@@ -481,14 +456,16 @@ namespace ps2_syscalls
         EnsureVSyncScheduled(rdram, runtime);
         if (!runtime)
         {
-            return GetCurrentVSyncTick();
+            return 0u;
         }
 
+        EeInterruptRuntimeState &state =
+            runtime->eeInterruptRuntimeState();
         uint64_t current = 0u;
         {
             std::lock_guard<std::mutex> lock(
-                g_vsync_flag_mutex);
-            current = g_vsync_tick_counter;
+                state.vsyncMutex);
+            current = state.vsyncTick;
         }
         return runtime->waitForNextScheduledVSync(
             rdram, ctx, current);
@@ -501,13 +478,22 @@ namespace ps2_syscalls
 
     void SetVSyncFlag(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
+        if (!runtime)
+        {
+            setReturnS32(ctx, KE_ERROR);
+            return;
+        }
+
+        EeInterruptRuntimeState &state =
+            runtime->eeInterruptRuntimeState();
         const uint32_t flagAddr = getRegU32(ctx, 4);
         const uint32_t tickAddr = getRegU32(ctx, 5);
 
         {
-            std::lock_guard<std::mutex> lock(g_vsync_flag_mutex);
-            g_vsync_registration.flagAddr = flagAddr;
-            g_vsync_registration.tickAddr = tickAddr;
+            std::lock_guard<std::mutex> lock(
+                state.vsyncMutex);
+            state.vsyncRegistration.flagAddr = flagAddr;
+            state.vsyncRegistration.tickAddr = tickAddr;
         }
 
         writeGuestU32NoThrow(rdram, flagAddr, 0u);

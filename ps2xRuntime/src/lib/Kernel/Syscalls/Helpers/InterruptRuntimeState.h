@@ -2,6 +2,7 @@
 
 #include "ps2_runtime.h"
 
+#include <atomic>
 #include <cstdint>
 #include <memory>
 #include <mutex>
@@ -25,6 +26,20 @@ struct EeInterruptCallbackContext
     R5900Context context{};
     uint32_t stackTop = 0u;
     bool active = false;
+};
+
+struct EeVSyncFlagRegistration
+{
+    uint32_t flagAddr = 0u;
+    uint32_t tickAddr = 0u;
+};
+
+struct EeGsVideoParameters
+{
+    uint8_t interlace = 1u;
+    uint8_t outputMode = 2u;
+    uint8_t frameMode = 1u;
+    uint8_t version = 3u;
 };
 
 // Guest interrupt registration, masks, and callback continuations belong to
@@ -94,8 +109,60 @@ struct EeInterruptRuntimeState
     uint32_t enabledIntcMask = 0xFFFFFFFFu;
     uint32_t enabledDmacMask = 0xFFFFFFFFu;
 
+    std::mutex vsyncMutex;
+    EeVSyncFlagRegistration vsyncRegistration{};
+    uint64_t vsyncTick = 0u;
+    uint64_t gsSyncVBaseTick = 0u;
+    EeGsVideoParameters gsVideoParameters{};
+    uint32_t gsSyncVCallback = 0u;
+    uint32_t gsSyncVCallbackGp = 0u;
+    uint32_t gsSyncVCallbackSp = 0u;
+    std::atomic<uint32_t> gsSyncVCallbackSetLogCount{0u};
+    std::atomic<uint32_t> gsSyncVCallbackMissingLogCount{0u};
+    std::atomic<uint32_t> gsSyncVCallbackDispatchLogCount{0u};
+    std::atomic<uint32_t> gsSyncVCallbackBadPcLogCount{0u};
+    std::atomic<uint32_t> gsSyncVCallbackWarningCount{0u};
+
     std::mutex callbackContextMutex;
     std::vector<
         std::unique_ptr<EeInterruptCallbackContext>>
         callbackContexts;
+};
+
+class EeAsyncCallbackContextLease
+{
+public:
+    EeAsyncCallbackContextLease(
+        EeInterruptRuntimeState &state,
+        PS2Runtime &runtime)
+        : m_state(state),
+          m_slot(state.acquireCallbackContext(runtime))
+    {
+    }
+
+    ~EeAsyncCallbackContextLease()
+    {
+        m_state.releaseCallbackContext(m_slot);
+    }
+
+    R5900Context &context()
+    {
+        return m_slot->context;
+    }
+
+    uint32_t stackTop() const
+    {
+        return m_slot->stackTop != 0u
+                   ? m_slot->stackTop
+                   : (PS2_RAM_SIZE - 0x10u);
+    }
+
+    EeAsyncCallbackContextLease(
+        const EeAsyncCallbackContextLease &) = delete;
+    EeAsyncCallbackContextLease &operator=(
+        const EeAsyncCallbackContextLease &) = delete;
+
+private:
+    EeInterruptRuntimeState &m_state;
+    EeInterruptCallbackContext *m_slot = nullptr;
 };

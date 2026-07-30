@@ -1700,7 +1700,8 @@ void register_ps2_runtime_expansion_tests()
 
             runtime.configureGuestHeap(kAsyncStackFloor, kAsyncStackFloor);
             runtime.registerFunction(kCallbackEntry, &testRecordAsyncCallbackStack);
-            ps2_stubs::resetGsSyncVCallbackState();
+            ps2_stubs::resetGsSyncVCallbackState(
+                &runtime);
             gAsyncCallbackObservedSp.store(0u, std::memory_order_release);
             gAsyncCallbackObservedGp.store(0u, std::memory_order_release);
 
@@ -6842,7 +6843,8 @@ void register_ps2_runtime_expansion_tests()
                 "the trigger snapshot should use the canonical EE timeline");
             t.Equals(
                 trace.triggerVsyncTick,
-                ps2_syscalls::GetCurrentVSyncTick(),
+                ps2_syscalls::GetCurrentVSyncTick(
+                    &runtime),
                 "the trigger snapshot should correlate the host VSync count");
             t.Equals(
                 trace.entries.size(), static_cast<size_t>(0u),

@@ -290,7 +290,8 @@ uint64_t PS2IopHostAdapter::virtualTimeNanoseconds() const
 {
     constexpr uint64_t kTicksPerSecond = 60u;
     constexpr uint64_t kNanosecondsPerSecond = 1'000'000'000u;
-    const uint64_t tick = ps2_syscalls::GetCurrentVSyncTick();
+    const uint64_t tick =
+        ps2_syscalls::GetCurrentVSyncTick(&m_runtime);
     const uint64_t wholeSeconds = tick / kTicksPerSecond;
     if (wholeSeconds > std::numeric_limits<uint64_t>::max() / kNanosecondsPerSecond)
     {
