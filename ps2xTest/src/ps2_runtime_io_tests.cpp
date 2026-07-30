@@ -136,6 +136,24 @@ namespace
         return paths;
     }
 
+    struct HostWorkingDirectoryGuard
+    {
+        HostWorkingDirectoryGuard()
+            : original(
+                  std::filesystem::current_path())
+        {
+        }
+
+        ~HostWorkingDirectoryGuard()
+        {
+            std::error_code ec;
+            std::filesystem::current_path(
+                original, ec);
+        }
+
+        std::filesystem::path original;
+    };
+
     struct TestContext
     {
         TempPaths paths;
@@ -504,6 +522,214 @@ void register_ps2_runtime_io_tests()
                     secondCtx),
                 '2',
                 "the second runtime should resolve host0 through its own root");
+        });
+
+        tc.Run("guest working directories are isolated per runtime", [](TestCase &t)
+        {
+            HostWorkingDirectoryGuard hostCwd;
+            TempPaths firstPaths = makeTempPaths();
+            TempPaths secondPaths = makeTempPaths();
+            PS2Runtime first;
+            PS2Runtime second;
+            std::vector<uint8_t> firstRdram(
+                PS2_RAM_SIZE, 0u);
+            std::vector<uint8_t> secondRdram(
+                PS2_RAM_SIZE, 0u);
+            R5900Context firstCtx{};
+            R5900Context secondCtx{};
+
+            std::filesystem::create_directories(
+                firstPaths.cdRoot / "subdir");
+            std::filesystem::create_directories(
+                secondPaths.cdRoot / "subdir");
+            {
+                std::ofstream out(
+                    firstPaths.cdRoot /
+                        "relative.bin",
+                    std::ios::binary);
+                out.put('r');
+            }
+            {
+                std::ofstream out(
+                    firstPaths.cdRoot / "subdir" /
+                        "relative.bin",
+                    std::ios::binary);
+                out.put('1');
+            }
+            {
+                std::ofstream out(
+                    secondPaths.cdRoot /
+                        "relative.bin",
+                    std::ios::binary);
+                out.put('2');
+            }
+            {
+                std::ofstream out(
+                    secondPaths.cdRoot / "subdir" /
+                        "relative.bin",
+                    std::ios::binary);
+                out.put('3');
+            }
+
+            PS2Runtime::IoPaths firstIoPaths;
+            firstIoPaths.elfDirectory =
+                firstPaths.cdRoot;
+            firstIoPaths.hostRoot =
+                firstPaths.cdRoot;
+            firstIoPaths.cdRoot =
+                firstPaths.cdRoot;
+            firstIoPaths.mcRoot =
+                firstPaths.mcRoot;
+            first.configureIoPaths(firstIoPaths);
+
+            PS2Runtime::IoPaths secondIoPaths;
+            secondIoPaths.elfDirectory =
+                secondPaths.cdRoot;
+            secondIoPaths.hostRoot =
+                secondPaths.cdRoot;
+            secondIoPaths.cdRoot =
+                secondPaths.cdRoot;
+            secondIoPaths.mcRoot =
+                secondPaths.mcRoot;
+            second.configureIoPaths(secondIoPaths);
+
+            constexpr uint32_t kDirectoryAddr =
+                GUEST_STRING_AREA_START + 0xD80u;
+            constexpr uint32_t kPathAddr =
+                GUEST_STRING_AREA_START + 0xE80u;
+            constexpr uint32_t kReadAddr =
+                GUEST_BUFFER_AREA_START + 0x1F80u;
+            writeGuestString(
+                firstRdram.data(),
+                kDirectoryAddr,
+                "host0:/subdir");
+            writeGuestString(
+                secondRdram.data(),
+                kDirectoryAddr,
+                "host0:/subdir");
+            writeGuestString(
+                firstRdram.data(),
+                kPathAddr,
+                "host0:relative.bin");
+            writeGuestString(
+                secondRdram.data(),
+                kPathAddr,
+                "host0:relative.bin");
+
+            const auto changeDirectory =
+                [&](PS2Runtime &runtime,
+                    std::vector<uint8_t> &rdram,
+                    R5900Context &ctx)
+            {
+                clearContext(ctx);
+                setRegU32(
+                    ctx, 4, kDirectoryAddr);
+                fioChdir(
+                    rdram.data(),
+                    &ctx,
+                    &runtime);
+                return getRegS32(&ctx, 2);
+            };
+            const auto readRelative =
+                [&](PS2Runtime &runtime,
+                    std::vector<uint8_t> &rdram,
+                    R5900Context &ctx) -> char
+            {
+                clearContext(ctx);
+                setRegU32(ctx, 4, kPathAddr);
+                setRegU32(
+                    ctx, 5, PS2_FIO_O_RDONLY);
+                fioOpen(
+                    rdram.data(),
+                    &ctx,
+                    &runtime);
+                const int32_t fd =
+                    getRegS32(&ctx, 2);
+                if (fd < 0)
+                {
+                    return '\0';
+                }
+
+                setRegU32(
+                    ctx,
+                    4,
+                    static_cast<uint32_t>(fd));
+                setRegU32(ctx, 5, kReadAddr);
+                setRegU32(ctx, 6, 1u);
+                fioRead(
+                    rdram.data(),
+                    &ctx,
+                    &runtime);
+                const int32_t bytesRead =
+                    getRegS32(&ctx, 2);
+
+                setRegU32(
+                    ctx,
+                    4,
+                    static_cast<uint32_t>(fd));
+                fioClose(
+                    rdram.data(),
+                    &ctx,
+                    &runtime);
+                return bytesRead == 1
+                           ? static_cast<char>(
+                                 rdram[kReadAddr])
+                           : '\0';
+            };
+
+            t.Equals(
+                changeDirectory(
+                    first,
+                    firstRdram,
+                    firstCtx),
+                0,
+                "the first runtime should accept its guest directory");
+            t.Equals(
+                std::filesystem::current_path().string(),
+                hostCwd.original.string(),
+                "fioChdir must not change the host process working directory");
+            t.Equals(
+                readRelative(
+                    first,
+                    firstRdram,
+                    firstCtx),
+                '1',
+                "the first runtime should resolve relative host paths through its guest directory");
+            t.Equals(
+                readRelative(
+                    second,
+                    secondRdram,
+                    secondCtx),
+                '2',
+                "changing one runtime's guest directory must not affect its peer");
+
+            t.Equals(
+                changeDirectory(
+                    second,
+                    secondRdram,
+                    secondCtx),
+                0,
+                "the second runtime should accept its own guest directory");
+            ps2_syscalls::notifyRuntimeStop(&first);
+            t.Equals(
+                readRelative(
+                    first,
+                    firstRdram,
+                    firstCtx),
+                'r',
+                "stopping a runtime should reset its guest directory");
+            t.Equals(
+                readRelative(
+                    second,
+                    secondRdram,
+                    secondCtx),
+                '3',
+                "stopping one runtime must preserve its peer's guest directory");
+
+            std::error_code restoreError;
+            std::filesystem::current_path(
+                hostCwd.original,
+                restoreError);
         });
 
         tc.Run("libc and memory-card handles are isolated per runtime", [](TestCase &t)
