@@ -339,6 +339,210 @@ void register_ps2_runtime_io_tests()
                 "stopping one runtime must not reset another runtime's CD initialization state");
         });
 
+        tc.Run("libc and memory-card handles are isolated per runtime", [](TestCase &t)
+        {
+            TestContext test;
+            PS2Runtime first;
+            PS2Runtime second;
+            std::vector<uint8_t> secondRdram(
+                PS2_RAM_SIZE, 0u);
+            R5900Context secondCtx{};
+
+            constexpr uint32_t kLibcPathAddr =
+                GUEST_STRING_AREA_START + 0xD00u;
+            constexpr uint32_t kLibcModeAddr =
+                GUEST_STRING_AREA_START + 0xE00u;
+            constexpr uint32_t kLibcReadAddr =
+                GUEST_BUFFER_AREA_START + 0x1F00u;
+            const std::filesystem::path libcPath =
+                test.paths.base / "libc-shared.bin";
+            {
+                std::ofstream out(libcPath, std::ios::binary);
+                out << "runtime-libc";
+            }
+
+            writeGuestString(
+                test.rdram.data(),
+                kLibcPathAddr,
+                libcPath.string());
+            writeGuestString(
+                secondRdram.data(),
+                kLibcPathAddr,
+                libcPath.string());
+            writeGuestString(
+                test.rdram.data(),
+                kLibcModeAddr,
+                "rb");
+            writeGuestString(
+                secondRdram.data(),
+                kLibcModeAddr,
+                "rb");
+
+            setRegU32(test.ctx, 4, kLibcPathAddr);
+            setRegU32(test.ctx, 5, kLibcModeAddr);
+            ps2_stubs::fopen(
+                test.rdram.data(),
+                &test.ctx,
+                &first);
+            const uint32_t firstLibcHandle =
+                ::getRegU32(&test.ctx, 2);
+
+            setRegU32(secondCtx, 4, kLibcPathAddr);
+            setRegU32(secondCtx, 5, kLibcModeAddr);
+            ps2_stubs::fopen(
+                secondRdram.data(),
+                &secondCtx,
+                &second);
+            const uint32_t secondLibcHandle =
+                ::getRegU32(&secondCtx, 2);
+
+            t.IsTrue(
+                firstLibcHandle != 0u &&
+                    secondLibcHandle != 0u,
+                "both runtimes should open a libc stream");
+            t.Equals(
+                secondLibcHandle,
+                firstLibcHandle,
+                "each runtime should independently allocate its first libc stream handle");
+
+            constexpr uint32_t kFirstMcPathAddr =
+                GUEST_STRING_AREA_START + 0xF00u;
+            constexpr uint32_t kSecondMcPathAddr =
+                GUEST_STRING_AREA_START + 0x1000u;
+            writeGuestString(
+                test.rdram.data(),
+                kFirstMcPathAddr,
+                "/first-runtime.bin");
+            writeGuestString(
+                secondRdram.data(),
+                kSecondMcPathAddr,
+                "/second-runtime.bin");
+
+            clearContext(test.ctx);
+            setRegU32(test.ctx, 4, 0u);
+            setRegU32(test.ctx, 5, 0u);
+            setRegU32(test.ctx, 6, kFirstMcPathAddr);
+            setRegU32(
+                test.ctx,
+                7,
+                PS2_FIO_O_RDWR |
+                    PS2_FIO_O_CREAT |
+                    PS2_FIO_O_TRUNC);
+            ps2_stubs::sceMcOpen(
+                test.rdram.data(),
+                &test.ctx,
+                &first);
+            const int32_t firstMcFd =
+                syncMc(test.rdram, &first);
+
+            clearContext(secondCtx);
+            setRegU32(secondCtx, 4, 0u);
+            setRegU32(secondCtx, 5, 0u);
+            setRegU32(secondCtx, 6, kSecondMcPathAddr);
+            setRegU32(
+                secondCtx,
+                7,
+                PS2_FIO_O_RDWR |
+                    PS2_FIO_O_CREAT |
+                    PS2_FIO_O_TRUNC);
+            ps2_stubs::sceMcOpen(
+                secondRdram.data(),
+                &secondCtx,
+                &second);
+            const int32_t secondMcFd =
+                syncMc(secondRdram, &second);
+
+            t.IsTrue(
+                firstMcFd > 0 && secondMcFd > 0,
+                "both runtimes should open a memory-card file");
+            t.Equals(
+                secondMcFd,
+                firstMcFd,
+                "each runtime should independently allocate its first memory-card descriptor");
+
+            clearContext(test.ctx);
+            ps2_stubs::sceMcEnd(
+                test.rdram.data(),
+                &test.ctx,
+                &first);
+
+            clearContext(secondCtx);
+            setRegU32(
+                secondCtx,
+                4,
+                static_cast<uint32_t>(secondMcFd));
+            setRegU32(secondCtx, 5, 0u);
+            setRegU32(secondCtx, 6, PS2_FIO_SEEK_SET);
+            ps2_stubs::sceMcSeek(
+                secondRdram.data(),
+                &secondCtx,
+                &second);
+            t.Equals(
+                syncMc(secondRdram, &second),
+                0,
+                "ending one runtime's memory-card session must not close another runtime's files");
+
+            ps2_syscalls::notifyRuntimeStop(&first);
+
+            clearContext(test.ctx);
+            setRegU32(test.ctx, 4, kLibcReadAddr);
+            setRegU32(test.ctx, 5, 1u);
+            setRegU32(test.ctx, 6, 1u);
+            setRegU32(test.ctx, 7, firstLibcHandle);
+            ps2_stubs::fread(
+                test.rdram.data(),
+                &test.ctx,
+                &first);
+            const uint32_t firstItemsRead =
+                ::getRegU32(&test.ctx, 2);
+            t.Equals(
+                firstItemsRead,
+                0u,
+                "stopping a runtime should close its libc streams");
+
+            clearContext(secondCtx);
+            setRegU32(secondCtx, 4, kLibcReadAddr);
+            setRegU32(secondCtx, 5, 1u);
+            setRegU32(secondCtx, 6, 1u);
+            setRegU32(secondCtx, 7, secondLibcHandle);
+            ps2_stubs::fread(
+                secondRdram.data(),
+                &secondCtx,
+                &second);
+            t.Equals(
+                ::getRegU32(&secondCtx, 2),
+                1u,
+                "stopping one runtime must not close another runtime's libc streams");
+
+            if (firstItemsRead != 0u)
+            {
+                clearContext(test.ctx);
+                setRegU32(
+                    test.ctx,
+                    4,
+                    firstLibcHandle);
+                ps2_stubs::fclose(
+                    test.rdram.data(),
+                    &test.ctx,
+                    &first);
+            }
+
+            clearContext(secondCtx);
+            setRegU32(
+                secondCtx,
+                4,
+                secondLibcHandle);
+            ps2_stubs::fclose(
+                secondRdram.data(),
+                &secondCtx,
+                &second);
+            clearContext(secondCtx);
+            ps2_stubs::sceMcEnd(
+                secondRdram.data(),
+                &secondCtx,
+                &second);
+        });
+
         tc.Run("mc0 directory creation", [](TestCase &t)
         {
             TestContext test;
