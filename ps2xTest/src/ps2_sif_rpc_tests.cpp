@@ -13,6 +13,7 @@
 #include <string>
 #include <string_view>
 #include <stdexcept>
+#include <thread>
 #include <vector>
 
 using namespace ps2_syscalls;
@@ -160,9 +161,31 @@ namespace
     std::atomic<uint32_t> g_dtxDispatcherRpcNum{0u};
     std::atomic<uint32_t> g_dtxDispatcherSendBuf{0u};
     std::atomic<uint32_t> g_dtxDispatcherSendSize{0u};
+    std::atomic<uint32_t> g_rpcInvokeFirstSp{0u};
+    std::atomic<uint32_t> g_rpcInvokeSecondSp{0u};
 
     constexpr uint32_t K_DTX_DISPATCH_RESULT_ADDR = 0x0002D800u;
     constexpr uint32_t K_DTX_DISPATCH_RESULT_MARKER = 0xD15CA7C1u;
+
+    void recordRpcInvokeStack(
+        uint8_t *,
+        R5900Context *ctx,
+        PS2Runtime *)
+    {
+        const uint32_t marker = ::getRegU32(ctx, 4);
+        const uint32_t stack = ::getRegU32(ctx, 29);
+        if (marker == 1u)
+        {
+            g_rpcInvokeFirstSp.store(
+                stack, std::memory_order_release);
+        }
+        else if (marker == 2u)
+        {
+            g_rpcInvokeSecondSp.store(
+                stack, std::memory_order_release);
+        }
+        ctx->pc = ::getRegU32(ctx, 31);
+    }
 
     void lotrSoundEndCallbackShouldNotRun(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
@@ -259,6 +282,183 @@ void register_ps2_sif_rpc_tests()
 {
     MiniTest::Case("PS2SifRpc", [](TestCase &tc)
     {
+        tc.Run("RPC registries allocators and callback stacks are isolated per runtime", [](TestCase &t)
+        {
+            TestEnv first;
+            TestEnv second;
+
+            SifInitRpc(
+                first.rdram.data(),
+                &first.ctx,
+                &first.runtime);
+            SifInitRpc(
+                second.rdram.data(),
+                &second.ctx,
+                &second.runtime);
+
+            constexpr uint32_t kClientAddr =
+                0x00021000u;
+            constexpr uint32_t kSecondClientAddr =
+                0x00021100u;
+            constexpr uint32_t kSid = 0x2F00ABCDu;
+
+            auto bind =
+                [&](TestEnv &env, uint32_t clientAddr)
+            {
+                setRegU32(env.ctx, 4, clientAddr);
+                setRegU32(env.ctx, 5, kSid);
+                setRegU32(env.ctx, 6, 0u);
+                SifBindRpc(
+                    env.rdram.data(),
+                    &env.ctx,
+                    &env.runtime);
+                return readGuestStruct<SifRpcClientData>(
+                    env.rdram.data(), clientAddr);
+            };
+
+            const SifRpcClientData firstClient =
+                bind(first, kClientAddr);
+            const SifRpcClientData secondClient =
+                bind(second, kClientAddr);
+
+            t.Equals(
+                secondClient.hdr.rpc_id,
+                firstClient.hdr.rpc_id,
+                "each runtime should independently allocate its first RPC request ID");
+            t.Equals(
+                secondClient.server,
+                firstClient.server,
+                "each runtime should independently allocate the same first placeholder server address");
+            t.Equals(
+                static_cast<uint32_t>(
+                    readGuestStruct<SifRpcServerData>(
+                        first.rdram.data(),
+                        firstClient.server)
+                        .sid),
+                kSid,
+                "the first runtime should populate its placeholder server");
+            t.Equals(
+                static_cast<uint32_t>(
+                    readGuestStruct<SifRpcServerData>(
+                        second.rdram.data(),
+                        secondClient.server)
+                        .sid),
+                kSid,
+                "the second runtime should populate its own placeholder server");
+
+            constexpr uint32_t kFirstPathAddr =
+                0x00021200u;
+            constexpr uint32_t kSecondPathAddr =
+                0x00021300u;
+            constexpr char kFirstPath[] =
+                "host0:runtime_one.irx";
+            constexpr char kSecondPath[] =
+                "host0:runtime_two.irx";
+            std::memcpy(
+                first.rdram.data() + kFirstPathAddr,
+                kFirstPath,
+                sizeof(kFirstPath));
+            std::memcpy(
+                second.rdram.data() + kSecondPathAddr,
+                kSecondPath,
+                sizeof(kSecondPath));
+
+            setRegU32(first.ctx, 4, kFirstPathAddr);
+            SifLoadModule(
+                first.rdram.data(),
+                &first.ctx,
+                &first.runtime);
+            const int32_t firstModuleId =
+                getRegS32(first.ctx, 2);
+            setRegU32(second.ctx, 4, kSecondPathAddr);
+            SifLoadModule(
+                second.rdram.data(),
+                &second.ctx,
+                &second.runtime);
+            const int32_t secondModuleId =
+                getRegS32(second.ctx, 2);
+            t.Equals(
+                secondModuleId,
+                firstModuleId,
+                "each runtime should independently allocate its first SIF module ID");
+
+            second.runtime.requestStop();
+            const SifRpcClientData firstClientAfterStop =
+                bind(first, kSecondClientAddr);
+            t.Equals(
+                firstClientAfterStop.hdr.rpc_id,
+                firstClient.hdr.rpc_id + 1u,
+                "stopping the second runtime must not advance or reset the first runtime's RPC allocator");
+
+            TestEnv callbackEnv;
+            constexpr uint32_t kSyscallIndex = 0x9Bu;
+            constexpr uint32_t kCallbackEntry =
+                0x002F0000u;
+            callbackEnv.runtime.registerFunction(
+                kCallbackEntry,
+                recordRpcInvokeStack);
+            setRegU32(
+                callbackEnv.ctx, 4, kSyscallIndex);
+            setRegU32(
+                callbackEnv.ctx, 5, kCallbackEntry);
+            SetSyscall(
+                callbackEnv.rdram.data(),
+                &callbackEnv.ctx,
+                &callbackEnv.runtime);
+
+            g_rpcInvokeFirstSp.store(
+                0u, std::memory_order_release);
+            g_rpcInvokeSecondSp.store(
+                0u, std::memory_order_release);
+            std::atomic<bool> firstDispatched{false};
+            std::atomic<bool> secondDispatched{false};
+            auto invokeOverride =
+                [&](uint32_t marker,
+                    std::atomic<bool> &dispatched)
+            {
+                R5900Context context{};
+                setRegU32(context, 4, marker);
+                dispatched.store(
+                    dispatchNumericSyscall(
+                        kSyscallIndex,
+                        callbackEnv.rdram.data(),
+                        &context,
+                        &callbackEnv.runtime),
+                    std::memory_order_release);
+            };
+
+            std::thread firstPublisher(
+                invokeOverride,
+                1u,
+                std::ref(firstDispatched));
+            firstPublisher.join();
+            std::thread secondPublisher(
+                invokeOverride,
+                2u,
+                std::ref(secondDispatched));
+            secondPublisher.join();
+
+            const uint32_t firstSp =
+                g_rpcInvokeFirstSp.load(
+                    std::memory_order_acquire);
+            const uint32_t secondSp =
+                g_rpcInvokeSecondSp.load(
+                    std::memory_order_acquire);
+            t.IsTrue(
+                firstDispatched.load(
+                    std::memory_order_acquire) &&
+                    secondDispatched.load(
+                        std::memory_order_acquire),
+                "both cross-host-thread guest callbacks should dispatch");
+            t.IsTrue(
+                firstSp != 0u,
+                "the first guest callback should receive a dedicated stack");
+            t.Equals(
+                secondSp,
+                firstSp,
+                "guest callback stack ownership should follow the runtime rather than the publishing host thread");
+        });
+
         tc.Run("register bind call updates descriptors and payload", [](TestCase &t)
         {
             TestEnv env;
