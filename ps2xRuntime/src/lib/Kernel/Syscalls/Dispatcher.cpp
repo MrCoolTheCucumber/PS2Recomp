@@ -200,30 +200,13 @@ namespace ps2_syscalls
         case 0x52:
             SetEventFlag(rdram, ctx, runtime);
             return true;
-        case static_cast<uint32_t>(-0x53):
+        case 0x53:
             iSetEventFlag(rdram, ctx, runtime);
             return true;
-        case 0x54:
-            ClearEventFlag(rdram, ctx, runtime);
-            return true;
-        case static_cast<uint32_t>(-0x55):
-            iClearEventFlag(rdram, ctx, runtime);
-            return true;
-        case 0x56:
-            WaitEventFlag(rdram, ctx, runtime);
-            return true;
-        case 0x57:
-            PollEventFlag(rdram, ctx, runtime);
-            return true;
-        case static_cast<uint32_t>(-0x58):
-            iPollEventFlag(rdram, ctx, runtime);
-            return true;
-        case 0x59:
-            ReferEventFlagStatus(rdram, ctx, runtime);
-            return true;
-        case static_cast<uint32_t>(-0x5A):
-            iReferEventFlagStatus(rdram, ctx, runtime);
-            return true;
+        // Retail EE kernels repurpose 0x54-0x59 for xlaunch and the
+        // dynamically installed TLB helpers. The event clear/wait/poll/status
+        // names describe obsolete protokernel entries and must not alias
+        // those retail syscall numbers.
         case 0x5A:
             Copy(rdram, ctx, runtime);
             return true;

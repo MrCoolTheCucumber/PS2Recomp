@@ -2062,7 +2062,7 @@ void register_ps2_runtime_interrupt_tests()
             cleanupRuntime(env);
         });
 
-        tc.Run("negative interrupt-safe EE syscall ids dispatch", [](TestCase &t)
+        tc.Run("interrupt-safe EE syscall ids follow the retail sign table", [](TestCase &t)
         {
             notifyRuntimeStop();
             TestEnv env;
@@ -2110,9 +2110,9 @@ void register_ps2_runtime_interrupt_tests()
             R5900Context setEventFlagCtx{};
             setRegU32(setEventFlagCtx, 4, static_cast<uint32_t>(eid));
             setRegU32(setEventFlagCtx, 5, 0x6u);
-            t.IsTrue(callSyscall(static_cast<uint32_t>(-0x53), env.rdram.data(), &setEventFlagCtx, &env.runtime),
-                     "negative iSetEventFlag syscall id should dispatch");
-            t.Equals(getRegS32(setEventFlagCtx, 2), KE_OK, "negative iSetEventFlag should return KE_OK");
+            t.IsTrue(callSyscall(0x53u, env.rdram.data(), &setEventFlagCtx, &env.runtime),
+                     "positive retail iSetEventFlag syscall id should dispatch");
+            t.Equals(getRegS32(setEventFlagCtx, 2), KE_OK, "retail iSetEventFlag should return KE_OK");
 
             R5900Context referCtx{};
             setRegU32(referCtx, 4, static_cast<uint32_t>(eid));
@@ -2120,11 +2120,42 @@ void register_ps2_runtime_interrupt_tests()
             ReferEventFlagStatus(env.rdram.data(), &referCtx, &env.runtime);
             t.Equals(getRegS32(referCtx, 2), KE_OK, "ReferEventFlagStatus should succeed after iSetEventFlag");
             t.Equals(readGuestU32(env.rdram.data(), kStatusAddr + 12u), 0x6u,
-                     "negative iSetEventFlag should publish the requested bits");
+                     "retail iSetEventFlag should publish the requested bits");
+
+            R5900Context obsoleteSetCtx{};
+            setRegU32(obsoleteSetCtx, 4, static_cast<uint32_t>(eid));
+            setRegU32(obsoleteSetCtx, 5, 0x8u);
+            t.IsFalse(callSyscall(static_cast<uint32_t>(-0x53), env.rdram.data(), &obsoleteSetCtx, &env.runtime),
+                      "obsolete negative iSetEventFlag id must not alias the retail syscall");
 
             R5900Context deleteCtx{};
             setRegU32(deleteCtx, 4, static_cast<uint32_t>(eid));
             DeleteEventFlag(env.rdram.data(), &deleteCtx, &env.runtime);
+
+            cleanupRuntime(env);
+        });
+
+        tc.Run("retail TLB syscall ids do not dispatch obsolete event-flag handlers", [](TestCase &t)
+        {
+            notifyRuntimeStop();
+            TestEnv env;
+
+            constexpr uint32_t kRetailNonEventSyscalls[] = {
+                0x54u,
+                static_cast<uint32_t>(-0x55),
+                0x56u,
+                0x57u,
+                static_cast<uint32_t>(-0x58),
+                0x59u,
+                static_cast<uint32_t>(-0x5A)
+            };
+
+            for (const uint32_t syscallNumber : kRetailNonEventSyscalls)
+            {
+                R5900Context syscallCtx{};
+                t.IsFalse(callSyscall(syscallNumber, env.rdram.data(), &syscallCtx, &env.runtime),
+                          "unimplemented retail xlaunch/TLB ids must not fall through to legacy event handlers");
+            }
 
             cleanupRuntime(env);
         });
