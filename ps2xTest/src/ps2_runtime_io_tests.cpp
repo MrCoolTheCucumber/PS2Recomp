@@ -732,6 +732,144 @@ void register_ps2_runtime_io_tests()
                 restoreError);
         });
 
+        tc.Run("audio transfer state is isolated per runtime", [](TestCase &t)
+        {
+            PS2Runtime first;
+            PS2Runtime second;
+            std::vector<uint8_t> firstRdram(
+                PS2_RAM_SIZE, 0u);
+            std::vector<uint8_t> secondRdram(
+                PS2_RAM_SIZE, 0u);
+
+            constexpr uint32_t kStackAddr =
+                GUEST_STACK_AREA_START + 0x800u;
+            constexpr uint32_t kBlockTransfer =
+                0x80E0u;
+            constexpr uint32_t kBlockStatus =
+                0x8100u;
+
+            const auto initialize =
+                [](PS2Runtime &runtime,
+                   std::vector<uint8_t> &rdram)
+            {
+                R5900Context ctx{};
+                ps2_stubs::sceSdRemoteInit(
+                    rdram.data(),
+                    &ctx,
+                    &runtime);
+                return getRegS32(&ctx, 2);
+            };
+            const auto remote =
+                [&](PS2Runtime &runtime,
+                    std::vector<uint8_t> &rdram,
+                    uint32_t command,
+                    uint32_t base = 0u,
+                    uint32_t size = 0u)
+            {
+                R5900Context ctx{};
+                setRegU32(ctx, 29, kStackAddr);
+                setRegU32(ctx, 4, 1u);
+                setRegU32(ctx, 5, command);
+                setRegU32(ctx, 6, 0u);
+                setRegU32(ctx, 7, 0x01u);
+                setRegU32(ctx, 8, base);
+                setRegU32(ctx, 9, size);
+                setRegU32(ctx, 10, base);
+                ps2_stubs::sceSdRemote(
+                    rdram.data(),
+                    &ctx,
+                    &runtime);
+                return ::getRegU32(&ctx, 2);
+            };
+
+            t.Equals(
+                initialize(first, firstRdram),
+                0,
+                "the first runtime should initialize its audio stub");
+            t.Equals(
+                remote(
+                    first,
+                    firstRdram,
+                    kBlockTransfer,
+                    0x00010000u,
+                    0x00001000u),
+                0u,
+                "the first runtime should start a block transfer");
+            t.Equals(
+                remote(
+                    first,
+                    firstRdram,
+                    kBlockStatus),
+                0x00010400u,
+                "the first runtime should advance its own block cursor");
+
+            t.Equals(
+                initialize(second, secondRdram),
+                0,
+                "the second runtime should initialize independently");
+            t.Equals(
+                remote(
+                    first,
+                    firstRdram,
+                    kBlockStatus),
+                0x00010800u,
+                "initializing a peer must not reset the first runtime's block cursor");
+
+            t.Equals(
+                remote(
+                    second,
+                    secondRdram,
+                    kBlockTransfer,
+                    0x00020000u,
+                    0x00001000u),
+                0u,
+                "the second runtime should start its own block transfer");
+            t.Equals(
+                remote(
+                    second,
+                    secondRdram,
+                    kBlockStatus),
+                0x00020400u,
+                "the second runtime should advance its own block cursor");
+            initialize(first, firstRdram);
+            t.Equals(
+                remote(
+                    second,
+                    secondRdram,
+                    kBlockStatus),
+                0x00020800u,
+                "guest init in one runtime must not reset its peer's block cursor");
+
+            remote(
+                first,
+                firstRdram,
+                kBlockTransfer,
+                0x00010000u,
+                0x00001000u);
+            initialize(second, secondRdram);
+            remote(
+                second,
+                secondRdram,
+                kBlockTransfer,
+                0x00020000u,
+                0x00001000u);
+            ps2_syscalls::notifyRuntimeStop(&first);
+            t.Equals(
+                remote(
+                    first,
+                    firstRdram,
+                    kBlockStatus),
+                0u,
+                "stopping a runtime should reset its audio transfer state");
+            t.Equals(
+                remote(
+                    second,
+                    secondRdram,
+                    kBlockStatus),
+                0x00020400u,
+                "stopping one runtime must preserve its peer's audio transfer state");
+        });
+
         tc.Run("libc and memory-card handles are isolated per runtime", [](TestCase &t)
         {
             TestContext test;
