@@ -504,7 +504,9 @@ int32_t PS2IopHostAdapter::memoryCard(const ps2x::iop::MemoryCardRequest &reques
     handler(m_activeRdram ? m_activeRdram : m_runtime.memory().getRDRAM(),
             &context,
             &m_runtime);
-    return ps2_stubs::getMemoryCardDebugSnapshot().lastResult;
+    return ps2_stubs::getMemoryCardDebugSnapshot(
+               &m_runtime)
+        .lastResult;
 }
 
 bool PS2IopHostAdapter::hasGuestFunction(uint32_t address) const

@@ -12,10 +12,14 @@
 #include "Kernel/Stubs/CD.h"
 #include "Kernel/Stubs/DMA.h"
 #include "Kernel/Stubs/GS.h"
+#include "Kernel/Stubs/LibC.h"
+#include "Kernel/Stubs/MemoryCard.h"
 #include "Kernel/Stubs/MPEG.h"
 #include "Kernel/Stubs/Pad.h"
 #include "Kernel/Stubs/Helpers/CdRuntimeState.h"
 #include "Kernel/Stubs/Helpers/DmaRuntimeState.h"
+#include "Kernel/Stubs/Helpers/LibCRuntimeState.h"
+#include "Kernel/Stubs/Helpers/MemoryCardRuntimeState.h"
 #include "Kernel/Stubs/Helpers/PadRuntimeState.h"
 #include "Kernel/Stubs/Helpers/SifRuntimeState.h"
 #include "Kernel/Syscalls/Helpers/AlarmRuntimeState.h"
@@ -921,6 +925,10 @@ PS2Runtime::PS2Runtime(PS2RuntimeConfiguration configuration)
         std::make_unique<ps2_stubs::CdRuntimeState>();
     m_dmaRuntimeState =
         std::make_unique<ps2_stubs::DmaRuntimeState>();
+    m_libcRuntimeState =
+        std::make_unique<ps2_stubs::LibCRuntimeState>();
+    m_memoryCardRuntimeState =
+        std::make_unique<ps2_stubs::MemoryCardRuntimeState>();
     m_padRuntimeState =
         std::make_unique<ps2_stubs::PadRuntimeState>();
     m_sifRuntimeState =
@@ -1387,6 +1395,29 @@ const ps2_stubs::DmaRuntimeState &
 PS2Runtime::dmaRuntimeState() const
 {
     return *m_dmaRuntimeState;
+}
+
+ps2_stubs::LibCRuntimeState &PS2Runtime::libcRuntimeState()
+{
+    return *m_libcRuntimeState;
+}
+
+const ps2_stubs::LibCRuntimeState &
+PS2Runtime::libcRuntimeState() const
+{
+    return *m_libcRuntimeState;
+}
+
+ps2_stubs::MemoryCardRuntimeState &
+PS2Runtime::memoryCardRuntimeState()
+{
+    return *m_memoryCardRuntimeState;
+}
+
+const ps2_stubs::MemoryCardRuntimeState &
+PS2Runtime::memoryCardRuntimeState() const
+{
+    return *m_memoryCardRuntimeState;
 }
 
 ps2_stubs::PadRuntimeState &PS2Runtime::padRuntimeState()
@@ -9187,6 +9218,8 @@ void PS2Runtime::run()
     ps2_syscalls::resetFileIoState(this);
     ps2_stubs::resetCdState(this);
     ps2_stubs::resetDmaState(this);
+    ps2_stubs::resetLibCState(this);
+    ps2_stubs::resetMemoryCardState(this);
     ps2_stubs::resetPadState(this);
     ps2_stubs::resetSifState(this);
     resetIop();

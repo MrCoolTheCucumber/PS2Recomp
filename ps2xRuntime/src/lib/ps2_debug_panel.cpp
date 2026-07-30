@@ -1928,7 +1928,9 @@ namespace
             ImGui::EndTable();
         }
 
-        const ps2_stubs::MemoryCardDebugSnapshot mc = ps2_stubs::getMemoryCardDebugSnapshot();
+        const ps2_stubs::MemoryCardDebugSnapshot mc =
+            ps2_stubs::getMemoryCardDebugSnapshot(
+                &runtime);
         ImGui::SeparatorText("Memory card state");
         ImGui::Text("lastCmd=0x%X lastResult=%d nextFd=%d cvCursor=%d openFiles=%zu",
                     mc.lastCmd,

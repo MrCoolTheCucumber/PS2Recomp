@@ -1,5 +1,6 @@
 #include "Common.h"
 #include "MemoryCard.h"
+#include "Helpers/MemoryCardRuntimeState.h"
 
 namespace ps2_stubs
 {
@@ -69,28 +70,6 @@ namespace ps2_stubs
 
         static_assert(sizeof(SceMcTblGetDir) == 64, "sceMcTblGetDir size mismatch");
 
-        struct McOpenFile
-        {
-            FILE *file = nullptr;
-            int32_t port = 0;
-            std::filesystem::path hostPath;
-        };
-
-        struct McPortState
-        {
-            std::string currentDir = "/";
-            bool formatted = true;
-        };
-
-        std::mutex g_mcStateMutex;
-        int32_t g_mcNextFd = 1;
-        int32_t g_mcLastCmd = 0;
-        bool g_mcCommandPending = false;
-        int32_t g_mcLastResult = 0;
-        std::unordered_map<int32_t, McOpenFile> g_mcFiles;
-        std::array<McPortState, 2> g_mcPorts{};
-        int32_t g_cvMcFileCursor = 0;
-
         constexpr int32_t kCvMcSaveFileBytes = 0x838;
         constexpr int32_t kCvMcConfigFileBytes = 0x34;
         constexpr int32_t kCvMcIconInfoBytes = 0x3C4;
@@ -107,12 +86,29 @@ namespace ps2_stubs
             cvMcKilobytes(kCvMcIconInfoBytes) +
             cvMcKilobytes(kCvMcIconFileBytes) + 11;
 
-        bool isValidMcPortSlot(int32_t port, int32_t slot)
+        MemoryCardRuntimeState *getMemoryCardRuntimeState(
+            PS2Runtime *runtime)
         {
-            return port >= 0 && port < static_cast<int32_t>(g_mcPorts.size()) && slot == 0;
+            return runtime
+                       ? &runtime->memoryCardRuntimeState()
+                       : nullptr;
         }
 
-        std::filesystem::path getMcRootPath(int32_t port)
+        bool isValidMcPortSlot(
+            const MemoryCardRuntimeState &state,
+            int32_t port,
+            int32_t slot)
+        {
+            return port >= 0 &&
+                   port <
+                       static_cast<int32_t>(
+                           state.ports.size()) &&
+                   slot == 0;
+        }
+
+        std::filesystem::path getMcRootPath(
+            PS2Runtime *runtime,
+            int32_t port)
         {
             const PS2Runtime::IoPaths &paths = PS2Runtime::getIoPaths();
             std::filesystem::path root = paths.mcRoot;
@@ -151,10 +147,13 @@ namespace ps2_stubs
             return (parent / (leaf + "_slot" + std::to_string(port))).lexically_normal();
         }
 
-        void ensureMcRootExists(int32_t port)
+        void ensureMcRootExists(
+            PS2Runtime *runtime,
+            int32_t port)
         {
             std::error_code ec;
-            std::filesystem::create_directories(getMcRootPath(port), ec);
+            std::filesystem::create_directories(
+                getMcRootPath(runtime, port), ec);
         }
 
         std::vector<std::string> splitMcPathComponents(const std::string &value)
@@ -204,7 +203,10 @@ namespace ps2_stubs
             return joined;
         }
 
-        std::string normalizeGuestMcPathLocked(int32_t port, std::string path)
+        std::string normalizeGuestMcPathLocked(
+            const MemoryCardRuntimeState &state,
+            int32_t port,
+            std::string path)
         {
             std::replace(path.begin(), path.end(), '\\', '/');
             const std::string lower = toLowerAscii(path);
@@ -215,9 +217,15 @@ namespace ps2_stubs
 
             const bool absolute = !path.empty() && path.front() == '/';
             std::vector<std::string> parts;
-            if (!absolute && port >= 0 && port < static_cast<int32_t>(g_mcPorts.size()))
+            if (!absolute &&
+                port >= 0 &&
+                port <
+                    static_cast<int32_t>(
+                        state.ports.size()))
             {
-                parts = splitMcPathComponents(g_mcPorts[static_cast<size_t>(port)].currentDir);
+                parts = splitMcPathComponents(
+                    state.ports[static_cast<size_t>(port)]
+                        .currentDir);
             }
 
             for (const std::string &part : splitMcPathComponents(path))
@@ -242,9 +250,13 @@ namespace ps2_stubs
             return joinMcPathComponents(parts);
         }
 
-        std::filesystem::path guestMcPathToHostPath(int32_t port, const std::string &guestPath)
+        std::filesystem::path guestMcPathToHostPath(
+            PS2Runtime *runtime,
+            int32_t port,
+            const std::string &guestPath)
         {
-            std::filesystem::path resolved = getMcRootPath(port);
+            std::filesystem::path resolved =
+                getMcRootPath(runtime, port);
             if (guestPath.size() > 1u)
             {
                 resolved /= std::filesystem::path(guestPath.substr(1));
@@ -360,29 +372,22 @@ namespace ps2_stubs
             return patternPos == pattern.size();
         }
 
-        void setMcCommandResultLocked(int32_t cmd, int32_t result)
+        void setMcCommandResultLocked(
+            MemoryCardRuntimeState &state,
+            int32_t cmd,
+            int32_t result)
         {
-            g_mcLastCmd = cmd;
-            g_mcLastResult = result;
-            g_mcCommandPending = true;
+            state.lastCmd = cmd;
+            state.lastResult = result;
+            state.commandPending = true;
         }
 
-        void closeMcFilesLocked()
+        void closeMcFilesForPortLocked(
+            MemoryCardRuntimeState &state,
+            int32_t port)
         {
-            for (auto &[fd, openFile] : g_mcFiles)
-            {
-                if (openFile.file)
-                {
-                    std::fclose(openFile.file);
-                    openFile.file = nullptr;
-                }
-            }
-            g_mcFiles.clear();
-        }
-
-        void closeMcFilesForPortLocked(int32_t port)
-        {
-            for (auto it = g_mcFiles.begin(); it != g_mcFiles.end();)
+            for (auto it = state.files.begin();
+                 it != state.files.end();)
             {
                 if (it->second.port == port)
                 {
@@ -390,7 +395,7 @@ namespace ps2_stubs
                     {
                         std::fclose(it->second.file);
                     }
-                    it = g_mcFiles.erase(it);
+                    it = state.files.erase(it);
                 }
                 else
                 {
@@ -399,31 +404,39 @@ namespace ps2_stubs
             }
         }
 
-        int32_t allocateMcFdLocked(FILE *file, int32_t port, const std::filesystem::path &hostPath)
+        int32_t allocateMcFdLocked(
+            MemoryCardRuntimeState &state,
+            FILE *file,
+            int32_t port,
+            const std::filesystem::path &hostPath)
         {
             if (!file)
             {
                 return kMcResultDeniedPermit;
             }
-            if (g_mcFiles.size() >= kMcMaxOpenFiles)
+            if (state.files.size() >= kMcMaxOpenFiles)
             {
                 return kMcResultUpLimitHandle;
             }
 
             for (int attempt = 0; attempt < 0x10000; ++attempt)
             {
-                if (g_mcNextFd <= 0)
+                if (state.nextFd <= 0)
                 {
-                    g_mcNextFd = 1;
+                    state.nextFd = 1;
                 }
 
-                const int32_t fd = g_mcNextFd++;
-                if (g_mcFiles.find(fd) != g_mcFiles.end())
+                const int32_t fd = state.nextFd++;
+                if (state.files.find(fd) !=
+                    state.files.end())
                 {
                     continue;
                 }
 
-                g_mcFiles.emplace(fd, McOpenFile{file, port, hostPath});
+                state.files.emplace(
+                    fd,
+                    MemoryCardOpenFile{
+                        file, port, hostPath});
                 return fd;
             }
 
@@ -478,25 +491,46 @@ namespace ps2_stubs
         }
     }
 
-    MemoryCardDebugSnapshot getMemoryCardDebugSnapshot()
+    void resetMemoryCardState(PS2Runtime *runtime)
+    {
+        if (MemoryCardRuntimeState *state =
+                getMemoryCardRuntimeState(runtime))
+        {
+            state->reset();
+        }
+    }
+
+    MemoryCardDebugSnapshot getMemoryCardDebugSnapshot(
+        PS2Runtime *runtime)
     {
         MemoryCardDebugSnapshot snapshot{};
-        std::lock_guard<std::mutex> lock(g_mcStateMutex);
-        snapshot.nextFd = g_mcNextFd;
-        snapshot.lastCmd = g_mcLastCmd;
-        snapshot.lastResult = g_mcLastResult;
-        snapshot.cvFileCursor = g_cvMcFileCursor;
+        MemoryCardRuntimeState *state =
+            getMemoryCardRuntimeState(runtime);
+        if (!state)
+        {
+            return snapshot;
+        }
+        std::lock_guard<std::mutex> lock(state->mutex);
+        snapshot.nextFd = state->nextFd;
+        snapshot.lastCmd = state->lastCmd;
+        snapshot.lastResult = state->lastResult;
+        snapshot.cvFileCursor = state->cvFileCursor;
 
-        for (size_t i = 0; i < g_mcPorts.size(); ++i)
+        for (size_t i = 0; i < state->ports.size(); ++i)
         {
             snapshot.ports[i].port = static_cast<int32_t>(i);
-            snapshot.ports[i].currentDir = g_mcPorts[i].currentDir;
-            snapshot.ports[i].formatted = g_mcPorts[i].formatted;
-            snapshot.ports[i].rootPath = getMcRootPath(static_cast<int32_t>(i));
+            snapshot.ports[i].currentDir =
+                state->ports[i].currentDir;
+            snapshot.ports[i].formatted =
+                state->ports[i].formatted;
+            snapshot.ports[i].rootPath =
+                getMcRootPath(
+                    runtime,
+                    static_cast<int32_t>(i));
         }
 
-        snapshot.openFiles.reserve(g_mcFiles.size());
-        for (const auto &[fd, file] : g_mcFiles)
+        snapshot.openFiles.reserve(state->files.size());
+        for (const auto &[fd, file] : state->files)
         {
             MemoryCardDebugOpenFile row{};
             row.fd = fd;
@@ -516,6 +550,13 @@ namespace ps2_stubs
 
     void sceMcChdir(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
+        MemoryCardRuntimeState *runtimeState =
+            getMemoryCardRuntimeState(runtime);
+        if (!runtimeState)
+        {
+            setReturnS32(ctx, 0);
+            return;
+        }
         const int32_t port = static_cast<int32_t>(getRegU32(ctx, 4));
         const int32_t slot = static_cast<int32_t>(getRegU32(ctx, 5));
         const uint32_t pathAddr = getRegU32(ctx, 6);
@@ -526,33 +567,45 @@ namespace ps2_stubs
         std::string currentDir = "/";
         int32_t result = kMcResultNoEntry;
         {
-            std::lock_guard<std::mutex> lock(g_mcStateMutex);
-            if (isValidMcPortSlot(port, slot))
+            std::lock_guard<std::mutex> lock(
+                runtimeState->mutex);
+            if (isValidMcPortSlot(
+                    *runtimeState, port, slot))
             {
-                McPortState &state = g_mcPorts[static_cast<size_t>(port)];
-                currentDir = state.currentDir;
-                if (!state.formatted)
+                MemoryCardPortState &portState =
+                    runtimeState->ports[
+                        static_cast<size_t>(port)];
+                currentDir = portState.currentDir;
+                if (!portState.formatted)
                 {
                     result = kMcResultNoFormat;
                 }
                 else
                 {
-                    ensureMcRootExists(port);
+                    ensureMcRootExists(runtime, port);
                     const std::string resolvedDir =
-                        requestedDir.empty() ? state.currentDir : normalizeGuestMcPathLocked(port, requestedDir);
-                    const std::filesystem::path hostDir = guestMcPathToHostPath(port, resolvedDir);
+                        requestedDir.empty()
+                            ? portState.currentDir
+                            : normalizeGuestMcPathLocked(
+                                  *runtimeState,
+                                  port,
+                                  requestedDir);
+                    const std::filesystem::path hostDir =
+                        guestMcPathToHostPath(
+                            runtime, port, resolvedDir);
                     std::error_code ec;
                     if (std::filesystem::exists(hostDir, ec) && !ec &&
                         std::filesystem::is_directory(hostDir, ec))
                     {
-                        state.currentDir = resolvedDir;
+                        portState.currentDir = resolvedDir;
                         currentDir = resolvedDir;
                         result = kMcResultSucceed;
                     }
                 }
             }
 
-            setMcCommandResultLocked(kMcCmdChdir, result);
+            setMcCommandResultLocked(
+                *runtimeState, kMcCmdChdir, result);
         }
 
         RUNTIME_LOG("[MC] Chdir port=" << port << " '" << requestedDir
@@ -563,46 +616,70 @@ namespace ps2_stubs
 
     void sceMcClose(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
+        MemoryCardRuntimeState *runtimeState =
+            getMemoryCardRuntimeState(runtime);
+        if (!runtimeState)
+        {
+            setReturnS32(ctx, 0);
+            return;
+        }
         const int32_t fd = static_cast<int32_t>(getRegU32(ctx, 4));
         int32_t result = kMcResultNoEntry;
         {
-            std::lock_guard<std::mutex> lock(g_mcStateMutex);
-            auto it = g_mcFiles.find(fd);
-            if (it != g_mcFiles.end())
+            std::lock_guard<std::mutex> lock(
+                runtimeState->mutex);
+            auto it = runtimeState->files.find(fd);
+            if (it != runtimeState->files.end())
             {
                 if (!it->second.file || std::fclose(it->second.file) == 0)
                 {
                     result = kMcResultSucceed;
                 }
-                g_mcFiles.erase(it);
+                runtimeState->files.erase(it);
             }
-            setMcCommandResultLocked(kMcCmdClose, result);
+            setMcCommandResultLocked(
+                *runtimeState, kMcCmdClose, result);
         }
         setReturnS32(ctx, 0);
     }
 
     void sceMcDelete(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
+        MemoryCardRuntimeState *runtimeState =
+            getMemoryCardRuntimeState(runtime);
+        if (!runtimeState)
+        {
+            setReturnS32(ctx, 0);
+            return;
+        }
         const int32_t port = static_cast<int32_t>(getRegU32(ctx, 4));
         const int32_t slot = static_cast<int32_t>(getRegU32(ctx, 5));
         const std::string path = readPs2CStringBounded(rdram, getRegU32(ctx, 6), kMcMaxPathLen);
 
         int32_t result = kMcResultNoEntry;
         {
-            std::lock_guard<std::mutex> lock(g_mcStateMutex);
-            if (isValidMcPortSlot(port, slot))
+            std::lock_guard<std::mutex> lock(
+                runtimeState->mutex);
+            if (isValidMcPortSlot(
+                    *runtimeState, port, slot))
             {
-                McPortState &state = g_mcPorts[static_cast<size_t>(port)];
-                if (!state.formatted)
+                MemoryCardPortState &portState =
+                    runtimeState->ports[
+                        static_cast<size_t>(port)];
+                if (!portState.formatted)
                 {
                     result = kMcResultNoFormat;
                 }
                 else
                 {
-                    const std::string guestPath = normalizeGuestMcPathLocked(port, path);
+                    const std::string guestPath =
+                        normalizeGuestMcPathLocked(
+                            *runtimeState, port, path);
                     if (guestPath != "/")
                     {
-                        const std::filesystem::path hostPath = guestMcPathToHostPath(port, guestPath);
+                        const std::filesystem::path hostPath =
+                            guestMcPathToHostPath(
+                                runtime, port, guestPath);
                         std::error_code ec;
                         if (std::filesystem::exists(hostPath, ec) && !ec)
                         {
@@ -624,23 +701,33 @@ namespace ps2_stubs
                 }
             }
 
-            setMcCommandResultLocked(kMcCmdDelete, result);
+            setMcCommandResultLocked(
+                *runtimeState, kMcCmdDelete, result);
         }
         setReturnS32(ctx, 0);
     }
 
     void sceMcEnd(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
+        MemoryCardRuntimeState *runtimeState =
+            getMemoryCardRuntimeState(runtime);
+        if (!runtimeState)
         {
-            std::lock_guard<std::mutex> lock(g_mcStateMutex);
-            closeMcFilesLocked();
-            g_mcNextFd = 1;
-            g_mcLastCmd = 0;
-            g_mcLastResult = 0;
-            g_mcCommandPending = false;
-            for (McPortState &state : g_mcPorts)
+            setReturnS32(ctx, 0);
+            return;
+        }
+        {
+            std::lock_guard<std::mutex> lock(
+                runtimeState->mutex);
+            runtimeState->closeFilesLocked();
+            runtimeState->nextFd = 1;
+            runtimeState->lastCmd = 0;
+            runtimeState->lastResult = 0;
+            runtimeState->commandPending = false;
+            for (MemoryCardPortState &portState :
+                 runtimeState->ports)
             {
-                state.currentDir = "/";
+                portState.currentDir = "/";
             }
         }
 
@@ -650,52 +737,83 @@ namespace ps2_stubs
 
     void sceMcFlush(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
+        MemoryCardRuntimeState *runtimeState =
+            getMemoryCardRuntimeState(runtime);
+        if (!runtimeState)
+        {
+            setReturnS32(ctx, 0);
+            return;
+        }
         const int32_t fd = static_cast<int32_t>(getRegU32(ctx, 4));
         int32_t result = kMcResultNoEntry;
         {
-            std::lock_guard<std::mutex> lock(g_mcStateMutex);
-            auto it = g_mcFiles.find(fd);
-            if (it != g_mcFiles.end() && it->second.file)
+            std::lock_guard<std::mutex> lock(
+                runtimeState->mutex);
+            auto it = runtimeState->files.find(fd);
+            if (it != runtimeState->files.end() &&
+                it->second.file)
             {
                 result = (std::fflush(it->second.file) == 0) ? kMcResultSucceed : kMcResultDeniedPermit;
             }
-            setMcCommandResultLocked(kMcCmdFlush, result);
+            setMcCommandResultLocked(
+                *runtimeState, kMcCmdFlush, result);
         }
         setReturnS32(ctx, 0);
     }
 
     void sceMcFormat(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
+        MemoryCardRuntimeState *runtimeState =
+            getMemoryCardRuntimeState(runtime);
+        if (!runtimeState)
+        {
+            setReturnS32(ctx, 0);
+            return;
+        }
         const int32_t port = static_cast<int32_t>(getRegU32(ctx, 4));
         const int32_t slot = static_cast<int32_t>(getRegU32(ctx, 5));
 
         int32_t result = kMcResultNoEntry;
         {
-            std::lock_guard<std::mutex> lock(g_mcStateMutex);
-            if (isValidMcPortSlot(port, slot))
+            std::lock_guard<std::mutex> lock(
+                runtimeState->mutex);
+            if (isValidMcPortSlot(
+                    *runtimeState, port, slot))
             {
-                closeMcFilesForPortLocked(port);
-                const std::filesystem::path root = getMcRootPath(port);
+                closeMcFilesForPortLocked(
+                    *runtimeState, port);
+                const std::filesystem::path root =
+                    getMcRootPath(runtime, port);
                 std::error_code ec;
                 std::filesystem::remove_all(root, ec);
                 ec.clear();
                 std::filesystem::create_directories(root, ec);
                 if (!ec)
                 {
-                    McPortState &state = g_mcPorts[static_cast<size_t>(port)];
-                    state.currentDir = "/";
-                    state.formatted = true;
+                    MemoryCardPortState &portState =
+                        runtimeState->ports[
+                            static_cast<size_t>(port)];
+                    portState.currentDir = "/";
+                    portState.formatted = true;
                     result = kMcResultSucceed;
                 }
             }
 
-            setMcCommandResultLocked(kMcCmdFormat, result);
+            setMcCommandResultLocked(
+                *runtimeState, kMcCmdFormat, result);
         }
         setReturnS32(ctx, 0);
     }
 
     void sceMcGetDir(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
+        MemoryCardRuntimeState *runtimeState =
+            getMemoryCardRuntimeState(runtime);
+        if (!runtimeState)
+        {
+            setReturnS32(ctx, 0);
+            return;
+        }
         const int32_t port = static_cast<int32_t>(getRegU32(ctx, 4));
         const int32_t slot = static_cast<int32_t>(getRegU32(ctx, 5));
         const std::string rawPath = readPs2CStringBounded(rdram, getRegU32(ctx, 6), kMcMaxPathLen);
@@ -705,19 +823,26 @@ namespace ps2_stubs
         std::vector<SceMcTblGetDir> entries;
         int32_t result = kMcResultNoEntry;
         {
-            std::lock_guard<std::mutex> lock(g_mcStateMutex);
-            if (isValidMcPortSlot(port, slot))
+            std::lock_guard<std::mutex> lock(
+                runtimeState->mutex);
+            if (isValidMcPortSlot(
+                    *runtimeState, port, slot))
             {
-                McPortState &state = g_mcPorts[static_cast<size_t>(port)];
-                if (!state.formatted)
+                MemoryCardPortState &portState =
+                    runtimeState->ports[
+                        static_cast<size_t>(port)];
+                if (!portState.formatted)
                 {
                     result = kMcResultNoFormat;
                 }
                 else
                 {
-                    ensureMcRootExists(port);
+                    ensureMcRootExists(runtime, port);
                     const std::string guestQuery =
-                        normalizeGuestMcPathLocked(port, rawPath.empty() ? "." : rawPath);
+                        normalizeGuestMcPathLocked(
+                            *runtimeState,
+                            port,
+                            rawPath.empty() ? "." : rawPath);
                     const bool hasWildcard =
                         guestQuery.find('*') != std::string::npos || guestQuery.find('?') != std::string::npos;
 
@@ -733,7 +858,9 @@ namespace ps2_stubs
                     }
                     else
                     {
-                        const std::filesystem::path queryHostPath = guestMcPathToHostPath(port, guestQuery);
+                        const std::filesystem::path queryHostPath =
+                            guestMcPathToHostPath(
+                                runtime, port, guestQuery);
                         std::error_code queryEc;
                         if (std::filesystem::exists(queryHostPath, queryEc) && !queryEc &&
                             std::filesystem::is_directory(queryHostPath, queryEc))
@@ -753,7 +880,8 @@ namespace ps2_stubs
                         pattern = "*";
                     }
 
-                    std::filesystem::path hostDir = getMcRootPath(port);
+                    std::filesystem::path hostDir =
+                        getMcRootPath(runtime, port);
                     if (!parentRel.empty())
                     {
                         hostDir /= parentRel;
@@ -840,7 +968,8 @@ namespace ps2_stubs
                 }
             }
 
-            setMcCommandResultLocked(kMcCmdGetDir, result);
+            setMcCommandResultLocked(
+                *runtimeState, kMcCmdGetDir, result);
         }
         RUNTIME_LOG("[MC] GetDir port=" << port << " '" << rawPath
                                         << "' maxent=" << maxEntries << " -> result=" << result);
@@ -849,15 +978,33 @@ namespace ps2_stubs
 
     void sceMcGetEntSpace(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
+        MemoryCardRuntimeState *runtimeState =
+            getMemoryCardRuntimeState(runtime);
+        if (!runtimeState)
         {
-            std::lock_guard<std::mutex> lock(g_mcStateMutex);
-            setMcCommandResultLocked(kMcCmdGetEntSpace, 1024);
+            setReturnS32(ctx, 0);
+            return;
+        }
+        {
+            std::lock_guard<std::mutex> lock(
+                runtimeState->mutex);
+            setMcCommandResultLocked(
+                *runtimeState,
+                kMcCmdGetEntSpace,
+                1024);
         }
         setReturnS32(ctx, 0);
     }
 
     void sceMcGetInfo(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
+        MemoryCardRuntimeState *runtimeState =
+            getMemoryCardRuntimeState(runtime);
+        if (!runtimeState)
+        {
+            setReturnS32(ctx, 0);
+            return;
+        }
         const int32_t port = static_cast<int32_t>(getRegU32(ctx, 4));
         const int32_t slot = static_cast<int32_t>(getRegU32(ctx, 5));
         const uint32_t typePtr = getRegU32(ctx, 6);
@@ -870,17 +1017,31 @@ namespace ps2_stubs
         int32_t result = kMcResultNoEntry;
 
         {
-            std::lock_guard<std::mutex> lock(g_mcStateMutex);
-            if (isValidMcPortSlot(port, slot))
+            std::lock_guard<std::mutex> lock(
+                runtimeState->mutex);
+            if (isValidMcPortSlot(
+                    *runtimeState, port, slot))
             {
-                McPortState &state = g_mcPorts[static_cast<size_t>(port)];
+                MemoryCardPortState &portState =
+                    runtimeState->ports[
+                        static_cast<size_t>(port)];
                 cardType = kMcTypePs2;
-                freeBlocks = state.formatted ? kMcFreeClusters : 0;
-                format = state.formatted ? kMcFormatted : kMcUnformatted;
-                result = state.formatted ? kMcResultSucceed : kMcResultNoFormat;
+                freeBlocks =
+                    portState.formatted
+                        ? kMcFreeClusters
+                        : 0;
+                format =
+                    portState.formatted
+                        ? kMcFormatted
+                        : kMcUnformatted;
+                result =
+                    portState.formatted
+                        ? kMcResultSucceed
+                        : kMcResultNoFormat;
             }
 
-            setMcCommandResultLocked(kMcCmdGetInfo, result);
+            setMcCommandResultLocked(
+                *runtimeState, kMcCmdGetInfo, result);
         }
 
         if (typePtr != 0u)
@@ -918,45 +1079,69 @@ namespace ps2_stubs
 
     void sceMcInit(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
+        MemoryCardRuntimeState *runtimeState =
+            getMemoryCardRuntimeState(runtime);
+        if (!runtimeState)
         {
-            std::lock_guard<std::mutex> lock(g_mcStateMutex);
-            closeMcFilesLocked();
-            g_mcNextFd = 1;
-            g_mcLastCmd = 0;
-            g_mcLastResult = 0;
-            g_mcCommandPending = false;
-            for (McPortState &state : g_mcPorts)
+            setReturnS32(ctx, 0);
+            return;
+        }
+        {
+            std::lock_guard<std::mutex> lock(
+                runtimeState->mutex);
+            runtimeState->closeFilesLocked();
+            runtimeState->nextFd = 1;
+            runtimeState->lastCmd = 0;
+            runtimeState->lastResult = 0;
+            runtimeState->commandPending = false;
+            for (MemoryCardPortState &portState :
+                 runtimeState->ports)
             {
-                state.currentDir = "/";
-                state.formatted = true;
+                portState.currentDir = "/";
+                portState.formatted = true;
             }
         }
-        ensureMcRootExists(0);
-        ensureMcRootExists(1);
+        ensureMcRootExists(runtime, 0);
+        ensureMcRootExists(runtime, 1);
         setReturnS32(ctx, 0);
     }
 
     void sceMcMkdir(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
+        MemoryCardRuntimeState *runtimeState =
+            getMemoryCardRuntimeState(runtime);
+        if (!runtimeState)
+        {
+            setReturnS32(ctx, 0);
+            return;
+        }
         const int32_t port = static_cast<int32_t>(getRegU32(ctx, 4));
         const int32_t slot = static_cast<int32_t>(getRegU32(ctx, 5));
         const std::string path = readPs2CStringBounded(rdram, getRegU32(ctx, 6), kMcMaxPathLen);
 
         int32_t result = kMcResultNoEntry;
         {
-            std::lock_guard<std::mutex> lock(g_mcStateMutex);
-            if (isValidMcPortSlot(port, slot))
+            std::lock_guard<std::mutex> lock(
+                runtimeState->mutex);
+            if (isValidMcPortSlot(
+                    *runtimeState, port, slot))
             {
-                McPortState &state = g_mcPorts[static_cast<size_t>(port)];
-                if (!state.formatted)
+                MemoryCardPortState &portState =
+                    runtimeState->ports[
+                        static_cast<size_t>(port)];
+                if (!portState.formatted)
                 {
                     result = kMcResultNoFormat;
                 }
                 else
                 {
-                    ensureMcRootExists(port);
-                    const std::string guestPath = normalizeGuestMcPathLocked(port, path);
-                    const std::filesystem::path hostPath = guestMcPathToHostPath(port, guestPath);
+                    ensureMcRootExists(runtime, port);
+                    const std::string guestPath =
+                        normalizeGuestMcPathLocked(
+                            *runtimeState, port, path);
+                    const std::filesystem::path hostPath =
+                        guestMcPathToHostPath(
+                            runtime, port, guestPath);
                     std::error_code ec;
                     if (std::filesystem::exists(hostPath, ec) && !ec)
                     {
@@ -975,13 +1160,21 @@ namespace ps2_stubs
                 }
             }
 
-            setMcCommandResultLocked(kMcCmdMkdir, result);
+            setMcCommandResultLocked(
+                *runtimeState, kMcCmdMkdir, result);
         }
         setReturnS32(ctx, 0);
     }
 
     void sceMcOpen(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
+        MemoryCardRuntimeState *runtimeState =
+            getMemoryCardRuntimeState(runtime);
+        if (!runtimeState)
+        {
+            setReturnS32(ctx, 0);
+            return;
+        }
         const int32_t port = static_cast<int32_t>(getRegU32(ctx, 4));
         const int32_t slot = static_cast<int32_t>(getRegU32(ctx, 5));
         const std::string path = readPs2CStringBounded(rdram, getRegU32(ctx, 6), kMcMaxPathLen);
@@ -989,18 +1182,26 @@ namespace ps2_stubs
 
         int32_t result = kMcResultNoEntry;
         {
-            std::lock_guard<std::mutex> lock(g_mcStateMutex);
-            if (isValidMcPortSlot(port, slot))
+            std::lock_guard<std::mutex> lock(
+                runtimeState->mutex);
+            if (isValidMcPortSlot(
+                    *runtimeState, port, slot))
             {
-                McPortState &state = g_mcPorts[static_cast<size_t>(port)];
-                if (!state.formatted)
+                MemoryCardPortState &portState =
+                    runtimeState->ports[
+                        static_cast<size_t>(port)];
+                if (!portState.formatted)
                 {
                     result = kMcResultNoFormat;
                 }
                 else
                 {
-                    const std::string guestPath = normalizeGuestMcPathLocked(port, path);
-                    const std::filesystem::path hostPath = guestMcPathToHostPath(port, guestPath);
+                    const std::string guestPath =
+                        normalizeGuestMcPathLocked(
+                            *runtimeState, port, path);
+                    const std::filesystem::path hostPath =
+                        guestMcPathToHostPath(
+                            runtime, port, guestPath);
                     std::error_code ec;
                     const bool create = (flags & PS2_FIO_O_CREAT) != 0u;
                     const bool exists = std::filesystem::exists(hostPath, ec) && !ec;
@@ -1029,7 +1230,11 @@ namespace ps2_stubs
                         }
                         else
                         {
-                            result = allocateMcFdLocked(file, port, hostPath);
+                            result = allocateMcFdLocked(
+                                *runtimeState,
+                                file,
+                                port,
+                                hostPath);
                             if (result < 0)
                             {
                                 std::fclose(file);
@@ -1038,13 +1243,21 @@ namespace ps2_stubs
                     }
                 }
             }
-            setMcCommandResultLocked(kMcCmdOpen, result);
+            setMcCommandResultLocked(
+                *runtimeState, kMcCmdOpen, result);
         }
         setReturnS32(ctx, 0);
     }
 
     void sceMcRead(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
+        MemoryCardRuntimeState *runtimeState =
+            getMemoryCardRuntimeState(runtime);
+        if (!runtimeState)
+        {
+            setReturnS32(ctx, 0);
+            return;
+        }
         const int32_t fd = static_cast<int32_t>(getRegU32(ctx, 4));
         const uint32_t dstAddr = getRegU32(ctx, 5);
         const int32_t size = static_cast<int32_t>(getRegU32(ctx, 6));
@@ -1052,13 +1265,16 @@ namespace ps2_stubs
 
         int32_t result = kMcResultNoEntry;
         {
-            std::lock_guard<std::mutex> lock(g_mcStateMutex);
-            auto it = g_mcFiles.find(fd);
+            std::lock_guard<std::mutex> lock(
+                runtimeState->mutex);
+            auto it = runtimeState->files.find(fd);
             if (size <= 0)
             {
                 result = 0;
             }
-            else if (it == g_mcFiles.end() || !it->second.file)
+            else if (
+                it == runtimeState->files.end() ||
+                !it->second.file)
             {
                 result = kMcResultNoEntry;
             }
@@ -1076,13 +1292,21 @@ namespace ps2_stubs
                 }
             }
 
-            setMcCommandResultLocked(kMcCmdRead, result);
+            setMcCommandResultLocked(
+                *runtimeState, kMcCmdRead, result);
         }
         setReturnS32(ctx, 0);
     }
 
     void sceMcRename(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
+        MemoryCardRuntimeState *runtimeState =
+            getMemoryCardRuntimeState(runtime);
+        if (!runtimeState)
+        {
+            setReturnS32(ctx, 0);
+            return;
+        }
         const int32_t port = static_cast<int32_t>(getRegU32(ctx, 4));
         const int32_t slot = static_cast<int32_t>(getRegU32(ctx, 5));
         const std::string oldPath = readPs2CStringBounded(rdram, getRegU32(ctx, 6), kMcMaxPathLen);
@@ -1090,20 +1314,36 @@ namespace ps2_stubs
 
         int32_t result = kMcResultNoEntry;
         {
-            std::lock_guard<std::mutex> lock(g_mcStateMutex);
-            if (isValidMcPortSlot(port, slot))
+            std::lock_guard<std::mutex> lock(
+                runtimeState->mutex);
+            if (isValidMcPortSlot(
+                    *runtimeState, port, slot))
             {
-                McPortState &state = g_mcPorts[static_cast<size_t>(port)];
-                if (!state.formatted)
+                MemoryCardPortState &portState =
+                    runtimeState->ports[
+                        static_cast<size_t>(port)];
+                if (!portState.formatted)
                 {
                     result = kMcResultNoFormat;
                 }
                 else
                 {
                     const std::filesystem::path oldHostPath =
-                        guestMcPathToHostPath(port, normalizeGuestMcPathLocked(port, oldPath));
+                        guestMcPathToHostPath(
+                            runtime,
+                            port,
+                            normalizeGuestMcPathLocked(
+                                *runtimeState,
+                                port,
+                                oldPath));
                     const std::filesystem::path newHostPath =
-                        guestMcPathToHostPath(port, normalizeGuestMcPathLocked(port, newPath));
+                        guestMcPathToHostPath(
+                            runtime,
+                            port,
+                            normalizeGuestMcPathLocked(
+                                *runtimeState,
+                                port,
+                                newPath));
                     std::error_code ec;
                     if (std::filesystem::exists(oldHostPath, ec) && !ec &&
                         std::filesystem::exists(newHostPath.parent_path(), ec) && !ec)
@@ -1114,22 +1354,32 @@ namespace ps2_stubs
                 }
             }
 
-            setMcCommandResultLocked(kMcCmdRename, result);
+            setMcCommandResultLocked(
+                *runtimeState, kMcCmdRename, result);
         }
         setReturnS32(ctx, 0);
     }
 
     void sceMcSeek(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
+        MemoryCardRuntimeState *runtimeState =
+            getMemoryCardRuntimeState(runtime);
+        if (!runtimeState)
+        {
+            setReturnS32(ctx, 0);
+            return;
+        }
         const int32_t fd = static_cast<int32_t>(getRegU32(ctx, 4));
         const int32_t offset = static_cast<int32_t>(getRegU32(ctx, 5));
         const int32_t origin = static_cast<int32_t>(getRegU32(ctx, 6));
 
         int32_t result = kMcResultNoEntry;
         {
-            std::lock_guard<std::mutex> lock(g_mcStateMutex);
-            auto it = g_mcFiles.find(fd);
-            if (it != g_mcFiles.end() && it->second.file)
+            std::lock_guard<std::mutex> lock(
+                runtimeState->mutex);
+            auto it = runtimeState->files.find(fd);
+            if (it != runtimeState->files.end() &&
+                it->second.file)
             {
                 int whence = SEEK_SET;
                 if (origin == PS2_FIO_SEEK_CUR)
@@ -1152,31 +1402,49 @@ namespace ps2_stubs
                 }
             }
 
-            setMcCommandResultLocked(kMcCmdSeek, result);
+            setMcCommandResultLocked(
+                *runtimeState, kMcCmdSeek, result);
         }
         setReturnS32(ctx, 0);
     }
 
     void sceMcSetFileInfo(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
+        MemoryCardRuntimeState *runtimeState =
+            getMemoryCardRuntimeState(runtime);
+        if (!runtimeState)
+        {
+            setReturnS32(ctx, 0);
+            return;
+        }
         const int32_t port = static_cast<int32_t>(getRegU32(ctx, 4));
         const int32_t slot = static_cast<int32_t>(getRegU32(ctx, 5));
         const std::string path = readPs2CStringBounded(rdram, getRegU32(ctx, 6), kMcMaxPathLen);
 
         int32_t result = kMcResultNoEntry;
         {
-            std::lock_guard<std::mutex> lock(g_mcStateMutex);
-            if (isValidMcPortSlot(port, slot))
+            std::lock_guard<std::mutex> lock(
+                runtimeState->mutex);
+            if (isValidMcPortSlot(
+                    *runtimeState, port, slot))
             {
-                McPortState &state = g_mcPorts[static_cast<size_t>(port)];
-                if (!state.formatted)
+                MemoryCardPortState &portState =
+                    runtimeState->ports[
+                        static_cast<size_t>(port)];
+                if (!portState.formatted)
                 {
                     result = kMcResultNoFormat;
                 }
                 else
                 {
                     const std::filesystem::path hostPath =
-                        guestMcPathToHostPath(port, normalizeGuestMcPathLocked(port, path));
+                        guestMcPathToHostPath(
+                            runtime,
+                            port,
+                            normalizeGuestMcPathLocked(
+                                *runtimeState,
+                                port,
+                                path));
                     std::error_code ec;
                     if (std::filesystem::exists(hostPath, ec) && !ec)
                     {
@@ -1185,24 +1453,35 @@ namespace ps2_stubs
                 }
             }
 
-            setMcCommandResultLocked(kMcCmdSetFileInfo, result);
+            setMcCommandResultLocked(
+                *runtimeState,
+                kMcCmdSetFileInfo,
+                result);
         }
         setReturnS32(ctx, 0);
     }
 
     void sceMcSync(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
+        MemoryCardRuntimeState *runtimeState =
+            getMemoryCardRuntimeState(runtime);
+        if (!runtimeState)
+        {
+            setReturnS32(ctx, -1);
+            return;
+        }
         const uint32_t cmdPtr = getRegU32(ctx, 5);
         const uint32_t resultPtr = getRegU32(ctx, 6);
         int32_t cmd = 0;
         int32_t result = 0;
         bool hadPending = false;
         {
-            std::lock_guard<std::mutex> lock(g_mcStateMutex);
-            hadPending = g_mcCommandPending;
-            g_mcCommandPending = false;
-            cmd = g_mcLastCmd;
-            result = g_mcLastResult;
+            std::lock_guard<std::mutex> lock(
+                runtimeState->mutex);
+            hadPending = runtimeState->commandPending;
+            runtimeState->commandPending = false;
+            cmd = runtimeState->lastCmd;
+            result = runtimeState->lastResult;
         }
 
         // libmc semantics: -1 means no async operation was executing; games rely
@@ -1236,36 +1515,57 @@ namespace ps2_stubs
 
     void sceMcUnformat(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
+        MemoryCardRuntimeState *runtimeState =
+            getMemoryCardRuntimeState(runtime);
+        if (!runtimeState)
+        {
+            setReturnS32(ctx, 0);
+            return;
+        }
         const int32_t port = static_cast<int32_t>(getRegU32(ctx, 4));
         const int32_t slot = static_cast<int32_t>(getRegU32(ctx, 5));
 
         int32_t result = kMcResultNoEntry;
         {
-            std::lock_guard<std::mutex> lock(g_mcStateMutex);
-            if (isValidMcPortSlot(port, slot))
+            std::lock_guard<std::mutex> lock(
+                runtimeState->mutex);
+            if (isValidMcPortSlot(
+                    *runtimeState, port, slot))
             {
-                closeMcFilesForPortLocked(port);
-                const std::filesystem::path root = getMcRootPath(port);
+                closeMcFilesForPortLocked(
+                    *runtimeState, port);
+                const std::filesystem::path root =
+                    getMcRootPath(runtime, port);
                 std::error_code ec;
                 std::filesystem::remove_all(root, ec);
                 ec.clear();
                 std::filesystem::create_directories(root, ec);
                 if (!ec)
                 {
-                    McPortState &state = g_mcPorts[static_cast<size_t>(port)];
-                    state.currentDir = "/";
-                    state.formatted = false;
+                    MemoryCardPortState &portState =
+                        runtimeState->ports[
+                            static_cast<size_t>(port)];
+                    portState.currentDir = "/";
+                    portState.formatted = false;
                     result = kMcResultSucceed;
                 }
             }
 
-            setMcCommandResultLocked(kMcCmdUnformat, result);
+            setMcCommandResultLocked(
+                *runtimeState, kMcCmdUnformat, result);
         }
         setReturnS32(ctx, 0);
     }
 
     void sceMcWrite(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
+        MemoryCardRuntimeState *runtimeState =
+            getMemoryCardRuntimeState(runtime);
+        if (!runtimeState)
+        {
+            setReturnS32(ctx, 0);
+            return;
+        }
         const int32_t fd = static_cast<int32_t>(getRegU32(ctx, 4));
         const uint32_t srcAddr = getRegU32(ctx, 5);
         const int32_t size = static_cast<int32_t>(getRegU32(ctx, 6));
@@ -1273,13 +1573,16 @@ namespace ps2_stubs
 
         int32_t result = kMcResultNoEntry;
         {
-            std::lock_guard<std::mutex> lock(g_mcStateMutex);
-            auto it = g_mcFiles.find(fd);
+            std::lock_guard<std::mutex> lock(
+                runtimeState->mutex);
+            auto it = runtimeState->files.find(fd);
             if (size <= 0)
             {
                 result = 0;
             }
-            else if (it == g_mcFiles.end() || !it->second.file)
+            else if (
+                it == runtimeState->files.end() ||
+                !it->second.file)
             {
                 result = kMcResultNoEntry;
             }
@@ -1301,7 +1604,8 @@ namespace ps2_stubs
                 }
             }
 
-            setMcCommandResultLocked(kMcCmdWrite, result);
+            setMcCommandResultLocked(
+                *runtimeState, kMcCmdWrite, result);
         }
         setReturnS32(ctx, 0);
     }
@@ -1408,7 +1712,15 @@ namespace ps2_stubs
 
     void mcGetFileSelectWindowCursol(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
-        setReturnS32(ctx, g_cvMcFileCursor);
+        int32_t cursor = 0;
+        if (MemoryCardRuntimeState *state =
+                getMemoryCardRuntimeState(runtime))
+        {
+            std::lock_guard<std::mutex> lock(
+                state->mutex);
+            cursor = state->cvFileCursor;
+        }
+        setReturnS32(ctx, cursor);
     }
 
     void mcGetFreeCapacitySize(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
@@ -1446,8 +1758,14 @@ namespace ps2_stubs
     void mcMoveFileSelectWindowCursor(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
         const int32_t delta = static_cast<int32_t>(getRegU32(ctx, 5));
-        g_cvMcFileCursor += delta;
-        g_cvMcFileCursor = std::clamp(g_cvMcFileCursor, -1, 15);
+        if (MemoryCardRuntimeState *state =
+                getMemoryCardRuntimeState(runtime))
+        {
+            std::lock_guard<std::mutex> lock(
+                state->mutex);
+            state->cvFileCursor = std::clamp(
+                state->cvFileCursor + delta, -1, 15);
+        }
         setReturnS32(ctx, 0);
     }
 
@@ -1483,7 +1801,13 @@ namespace ps2_stubs
 
     void mcSelectFileInfoInit(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
-        g_cvMcFileCursor = 0;
+        if (MemoryCardRuntimeState *state =
+                getMemoryCardRuntimeState(runtime))
+        {
+            std::lock_guard<std::mutex> lock(
+                state->mutex);
+            state->cvFileCursor = 0;
+        }
         setReturnS32(ctx, 1);
     }
 
@@ -1494,14 +1818,29 @@ namespace ps2_stubs
 
     void mcSetFileSelectWindowCursol(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
-        g_cvMcFileCursor = static_cast<int32_t>(getRegU32(ctx, 5));
-        g_cvMcFileCursor = std::clamp(g_cvMcFileCursor, -1, 15);
+        if (MemoryCardRuntimeState *state =
+                getMemoryCardRuntimeState(runtime))
+        {
+            std::lock_guard<std::mutex> lock(
+                state->mutex);
+            state->cvFileCursor = std::clamp(
+                static_cast<int32_t>(
+                    getRegU32(ctx, 5)),
+                -1,
+                15);
+        }
         setReturnS32(ctx, 0);
     }
 
     void mcSetFileSelectWindowCursolInit(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
-        g_cvMcFileCursor = 0;
+        if (MemoryCardRuntimeState *state =
+                getMemoryCardRuntimeState(runtime))
+        {
+            std::lock_guard<std::mutex> lock(
+                state->mutex);
+            state->cvFileCursor = 0;
+        }
         setReturnS32(ctx, 0);
     }
 

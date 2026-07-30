@@ -1,11 +1,49 @@
 #include "Common.h"
 #include "LibC.h"
+#include "Helpers/LibCRuntimeState.h"
 #include "ps2_log.h"
 
 namespace ps2_stubs
 {
     namespace
     {
+        LibCRuntimeState *getLibCRuntimeState(
+            PS2Runtime *runtime)
+        {
+            return runtime ? &runtime->libcRuntimeState() : nullptr;
+        }
+
+        uint32_t generateFileHandleLocked(
+            LibCRuntimeState &state)
+        {
+            uint32_t handle = 0u;
+            do
+            {
+                handle = state.nextFileHandle++;
+                if (state.nextFileHandle == 0u)
+                {
+                    state.nextFileHandle = 1u;
+                }
+            } while (
+                handle == 0u ||
+                state.files.contains(handle));
+            return handle;
+        }
+
+        FILE *findFileLocked(
+            LibCRuntimeState &state,
+            uint32_t handle)
+        {
+            if (handle == 0u)
+            {
+                return nullptr;
+            }
+            const auto it = state.files.find(handle);
+            return it != state.files.end()
+                       ? it->second
+                       : nullptr;
+        }
+
         uint32_t sanitizeMemTransferSize(uint32_t size, const char *op)
         {
             constexpr uint32_t kMaxTransfer = PS2_RAM_SIZE;
@@ -45,6 +83,15 @@ namespace ps2_stubs
             return (offset < PS2_RAM_SIZE) ? (PS2_RAM_SIZE - offset) : 0u;
         }
 
+    }
+
+    void resetLibCState(PS2Runtime *runtime)
+    {
+        if (LibCRuntimeState *state =
+                getLibCRuntimeState(runtime))
+        {
+            state->reset();
+        }
     }
 
     void malloc(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
@@ -705,10 +752,20 @@ namespace ps2_stubs
             FILE *fp = ::fopen(hostPath, hostMode);
             if (fp)
             {
-                std::lock_guard<std::mutex> lock(g_file_mutex);
-                file_handle = generate_file_handle();
-                g_file_map[file_handle] = fp;
-                RUNTIME_LOG("  -> handle=0x" << std::hex << file_handle << std::dec);
+                if (LibCRuntimeState *state =
+                        getLibCRuntimeState(runtime))
+                {
+                    std::lock_guard<std::mutex> lock(
+                        state->mutex);
+                    file_handle =
+                        generateFileHandleLocked(*state);
+                    state->files[file_handle] = fp;
+                    RUNTIME_LOG("  -> handle=0x" << std::hex << file_handle << std::dec);
+                }
+                else
+                {
+                    ::fclose(fp);
+                }
             }
             else
             {
@@ -733,18 +790,22 @@ namespace ps2_stubs
 
         if (file_handle != 0)
         {
-            std::lock_guard<std::mutex> lock(g_file_mutex);
-            auto it = g_file_map.find(file_handle);
-            if (it != g_file_map.end())
+            LibCRuntimeState *state =
+                getLibCRuntimeState(runtime);
+            if (state)
             {
-                FILE *fp = it->second;
-                ret = ::fclose(fp);
-                g_file_map.erase(it);
+                std::lock_guard<std::mutex> lock(
+                    state->mutex);
+                auto it = state->files.find(file_handle);
+                if (it != state->files.end())
+                {
+                    FILE *fp = it->second;
+                    ret = ::fclose(fp);
+                    state->files.erase(it);
+                }
             }
-            else
-            {
+            if (ret == EOF)
                 std::cerr << "ps2_stub fclose error: Invalid file handle 0x" << std::hex << file_handle << std::dec << std::endl;
-            }
         }
         else
         {
@@ -765,17 +826,26 @@ namespace ps2_stubs
         size_t items_read = 0;
 
         uint8_t *hostPtr = getMemPtr(rdram, ptrAddr);
-        FILE *fp = get_file_ptr(file_handle);
-
-        if (hostPtr && fp && size > 0 && count > 0)
+        bool fileValid = false;
+        if (LibCRuntimeState *state =
+                getLibCRuntimeState(runtime);
+            hostPtr && state && size > 0 && count > 0)
         {
-            items_read = ::fread(hostPtr, size, count, fp);
+            std::lock_guard<std::mutex> lock(
+                state->mutex);
+            if (FILE *fp =
+                    findFileLocked(*state, file_handle))
+            {
+                fileValid = true;
+                items_read = ::fread(
+                    hostPtr, size, count, fp);
+            }
         }
-        else
+        if (!hostPtr || !fileValid || size == 0 || count == 0)
         {
             std::cerr << "fread error: Invalid arguments."
                       << " Ptr: 0x" << std::hex << ptrAddr << " (host ptr valid: " << (hostPtr != nullptr) << ")"
-                      << ", Handle: 0x" << file_handle << " (file valid: " << (fp != nullptr) << ")" << std::dec
+                      << ", Handle: 0x" << file_handle << " (file valid: " << fileValid << ")" << std::dec
                       << ", Size: " << size << ", Count: " << count << std::endl;
         }
         // returns the number of items successfully read.
@@ -791,17 +861,26 @@ namespace ps2_stubs
         size_t items_written = 0;
 
         const uint8_t *hostPtr = getConstMemPtr(rdram, ptrAddr);
-        FILE *fp = get_file_ptr(file_handle);
-
-        if (hostPtr && fp && size > 0 && count > 0)
+        bool fileValid = false;
+        if (LibCRuntimeState *state =
+                getLibCRuntimeState(runtime);
+            hostPtr && state && size > 0 && count > 0)
         {
-            items_written = ::fwrite(hostPtr, size, count, fp);
+            std::lock_guard<std::mutex> lock(
+                state->mutex);
+            if (FILE *fp =
+                    findFileLocked(*state, file_handle))
+            {
+                fileValid = true;
+                items_written = ::fwrite(
+                    hostPtr, size, count, fp);
+            }
         }
-        else
+        if (!hostPtr || !fileValid || size == 0 || count == 0)
         {
             std::cerr << "fwrite error: Invalid arguments."
                       << " Ptr: 0x" << std::hex << ptrAddr << " (host ptr valid: " << (hostPtr != nullptr) << ")"
-                      << ", Handle: 0x" << file_handle << " (file valid: " << (fp != nullptr) << ")" << std::dec
+                      << ", Handle: 0x" << file_handle << " (file valid: " << fileValid << ")" << std::dec
                       << ", Size: " << size << ", Count: " << count << std::endl;
         }
         // returns the number of items successfully written.
@@ -812,19 +891,29 @@ namespace ps2_stubs
     {
         uint32_t file_handle = getRegU32(ctx, 4); // $a0
         uint32_t format_addr = getRegU32(ctx, 5); // $a1
-        FILE *fp = get_file_ptr(file_handle);
         const std::string formatOwned = readPs2CStringBounded(rdram, runtime, format_addr, 1024);
         int ret = -1;
+        bool fileValid = false;
 
-        if (fp && format_addr != 0)
+        if (LibCRuntimeState *state =
+                getLibCRuntimeState(runtime);
+            state && format_addr != 0)
         {
             std::string rendered = formatPs2StringWithArgs(rdram, ctx, runtime, formatOwned.c_str(), 2);
-            ret = std::fprintf(fp, "%s", rendered.c_str());
+            std::lock_guard<std::mutex> lock(
+                state->mutex);
+            if (FILE *fp =
+                    findFileLocked(*state, file_handle))
+            {
+                fileValid = true;
+                ret = std::fprintf(
+                    fp, "%s", rendered.c_str());
+            }
         }
-        else
+        if (!fileValid || format_addr == 0)
         {
             std::cerr << "fprintf error: Invalid file handle or format address."
-                      << " Handle: 0x" << std::hex << file_handle << " (file valid: " << (fp != nullptr) << ")"
+                      << " Handle: 0x" << std::hex << file_handle << " (file valid: " << fileValid << ")"
                       << ", Format: 0x" << format_addr << std::dec
                       << std::endl;
         }
@@ -840,21 +929,28 @@ namespace ps2_stubs
         int whence = (int)getRegU32(ctx, 6);      // $a2 (SEEK_SET, SEEK_CUR, SEEK_END)
         int ret = -1;                             // Default error
 
-        FILE *fp = get_file_ptr(file_handle);
-
-        if (fp)
+        bool fileValid = false;
+        if (LibCRuntimeState *state =
+                getLibCRuntimeState(runtime))
         {
-            // Ensure whence is valid (0, 1, 2)
-            if (whence >= 0 && whence <= 2)
+            std::lock_guard<std::mutex> lock(
+                state->mutex);
+            if (FILE *fp =
+                    findFileLocked(*state, file_handle))
             {
-                ret = ::fseek(fp, offset, whence);
-            }
-            else
-            {
-                std::cerr << "fseek error: Invalid whence value: " << whence << std::endl;
+                fileValid = true;
+                // Ensure whence is valid (0, 1, 2)
+                if (whence >= 0 && whence <= 2)
+                {
+                    ret = ::fseek(fp, offset, whence);
+                }
+                else
+                {
+                    std::cerr << "fseek error: Invalid whence value: " << whence << std::endl;
+                }
             }
         }
-        else
+        if (!fileValid)
         {
             std::cerr << "fseek error: Invalid file handle 0x" << std::hex << file_handle << std::dec << std::endl;
         }
@@ -868,16 +964,19 @@ namespace ps2_stubs
         uint32_t file_handle = getRegU32(ctx, 4); // $a0
         long ret = -1L;
 
-        FILE *fp = get_file_ptr(file_handle);
-
-        if (fp)
+        if (LibCRuntimeState *state =
+                getLibCRuntimeState(runtime))
         {
-            ret = ::ftell(fp);
+            std::lock_guard<std::mutex> lock(
+                state->mutex);
+            if (FILE *fp =
+                    findFileLocked(*state, file_handle))
+            {
+                ret = ::ftell(fp);
+            }
         }
-        else
-        {
+        if (ret < 0)
             std::cerr << "ftell error: Invalid file handle 0x" << std::hex << file_handle << std::dec << std::endl;
-        }
 
         // returns the current position, or -1L on error.
         if (ret > 0xFFFFFFFFL || ret < 0)
@@ -895,23 +994,34 @@ namespace ps2_stubs
         uint32_t file_handle = getRegU32(ctx, 4); // $a0
         int ret = EOF;                            // Default error
 
-        // If handle is 0 fflush flushes *all* output streams.
-        if (file_handle == 0)
+        if (LibCRuntimeState *state =
+                getLibCRuntimeState(runtime))
         {
-            ret = ::fflush(NULL);
-        }
-        else
-        {
-            FILE *fp = get_file_ptr(file_handle);
-            if (fp)
+            std::lock_guard<std::mutex> lock(
+                state->mutex);
+            // A null guest stream flushes all streams owned by this runtime.
+            if (file_handle == 0)
+            {
+                ret = 0;
+                for (const auto &[handle, fp] :
+                     state->files)
+                {
+                    (void)handle;
+                    if (fp && ::fflush(fp) != 0)
+                    {
+                        ret = EOF;
+                    }
+                }
+            }
+            else if (FILE *fp =
+                         findFileLocked(
+                             *state, file_handle))
             {
                 ret = ::fflush(fp);
             }
-            else
-            {
-                std::cerr << "fflush error: Invalid file handle 0x" << std::hex << file_handle << std::dec << std::endl;
-            }
         }
+        if (ret == EOF)
+            std::cerr << "fflush error: Invalid file handle 0x" << std::hex << file_handle << std::dec << std::endl;
         // returns 0 on success, EOF on error.
         setReturnS32(ctx, ret);
     }
@@ -1082,12 +1192,29 @@ namespace ps2_stubs
 
     void rand(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
-        setReturnS32(ctx, std::rand() & 0x7FFF);
+        uint32_t result = 0u;
+        if (LibCRuntimeState *state =
+                getLibCRuntimeState(runtime))
+        {
+            std::lock_guard<std::mutex> lock(
+                state->mutex);
+            state->randomSeed =
+                state->randomSeed * 0x41C64E6Du +
+                0x3039u;
+            result = state->randomSeed & 0x7FFFFFFFu;
+        }
+        setReturnU32(ctx, result);
     }
 
     void srand(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
-        std::srand(getRegU32(ctx, 4));
+        if (LibCRuntimeState *state =
+                getLibCRuntimeState(runtime))
+        {
+            std::lock_guard<std::mutex> lock(
+                state->mutex);
+            state->randomSeed = getRegU32(ctx, 4);
+        }
         setReturnS32(ctx, 0);
     }
 
@@ -1118,19 +1245,29 @@ namespace ps2_stubs
         uint32_t file_handle = getRegU32(ctx, 4);  // $a0
         uint32_t format_addr = getRegU32(ctx, 5);  // $a1
         uint32_t va_list_addr = getRegU32(ctx, 6); // $a2
-        FILE *fp = get_file_ptr(file_handle);
         const std::string formatOwned = readPs2CStringBounded(rdram, runtime, format_addr, 1024);
         int ret = -1;
+        bool fileValid = false;
 
-        if (fp && format_addr != 0)
+        if (LibCRuntimeState *state =
+                getLibCRuntimeState(runtime);
+            state && format_addr != 0)
         {
             std::string rendered = formatPs2StringWithVaList(rdram, runtime, formatOwned.c_str(), va_list_addr);
-            ret = std::fprintf(fp, "%s", rendered.c_str());
+            std::lock_guard<std::mutex> lock(
+                state->mutex);
+            if (FILE *fp =
+                    findFileLocked(*state, file_handle))
+            {
+                fileValid = true;
+                ret = std::fprintf(
+                    fp, "%s", rendered.c_str());
+            }
         }
-        else
+        if (!fileValid || format_addr == 0)
         {
             std::cerr << "vfprintf error: Invalid file handle or format address."
-                      << " Handle: 0x" << std::hex << file_handle << " (file valid: " << (fp != nullptr) << ")"
+                      << " Handle: 0x" << std::hex << file_handle << " (file valid: " << fileValid << ")"
                       << ", Format: 0x" << format_addr << std::dec
                       << std::endl;
         }

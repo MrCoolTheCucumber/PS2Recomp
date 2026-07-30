@@ -405,6 +405,85 @@ void register_ps2_runtime_io_tests()
                 firstLibcHandle,
                 "each runtime should independently allocate its first libc stream handle");
 
+            clearContext(test.ctx);
+            setRegU32(test.ctx, 4, 1u);
+            ps2_stubs::srand(
+                test.rdram.data(),
+                &test.ctx,
+                &first);
+            clearContext(secondCtx);
+            setRegU32(secondCtx, 4, 1u);
+            ps2_stubs::srand(
+                secondRdram.data(),
+                &secondCtx,
+                &second);
+
+            clearContext(test.ctx);
+            ps2_stubs::rand(
+                test.rdram.data(),
+                &test.ctx,
+                &first);
+            const uint32_t firstRandom =
+                ::getRegU32(&test.ctx, 2);
+            clearContext(test.ctx);
+            ps2_stubs::rand(
+                test.rdram.data(),
+                &test.ctx,
+                &first);
+            const uint32_t firstNextRandom =
+                ::getRegU32(&test.ctx, 2);
+            clearContext(secondCtx);
+            ps2_stubs::rand(
+                secondRdram.data(),
+                &secondCtx,
+                &second);
+            const uint32_t secondRandom =
+                ::getRegU32(&secondCtx, 2);
+
+            t.Equals(
+                firstRandom,
+                0x41C67EA6u,
+                "libc rand should match the guest LCG from seed one");
+            t.Equals(
+                secondRandom,
+                firstRandom,
+                "each runtime should independently produce its first libc random value");
+            t.IsTrue(
+                firstNextRandom != firstRandom,
+                "advancing one runtime should advance its own libc random sequence");
+
+            clearContext(test.ctx);
+            setRegU32(test.ctx, 5, 7u);
+            ps2_stubs::mcSetFileSelectWindowCursol(
+                test.rdram.data(),
+                &test.ctx,
+                &first);
+            clearContext(secondCtx);
+            setRegU32(secondCtx, 5, 4u);
+            ps2_stubs::mcSetFileSelectWindowCursol(
+                secondRdram.data(),
+                &secondCtx,
+                &second);
+
+            clearContext(test.ctx);
+            ps2_stubs::mcGetFileSelectWindowCursol(
+                test.rdram.data(),
+                &test.ctx,
+                &first);
+            t.Equals(
+                getRegS32(&test.ctx, 2),
+                7,
+                "the first runtime should retain its memory-card UI cursor");
+            clearContext(secondCtx);
+            ps2_stubs::mcGetFileSelectWindowCursol(
+                secondRdram.data(),
+                &secondCtx,
+                &second);
+            t.Equals(
+                getRegS32(&secondCtx, 2),
+                4,
+                "the second runtime should retain its memory-card UI cursor");
+
             constexpr uint32_t kFirstMcPathAddr =
                 GUEST_STRING_AREA_START + 0xF00u;
             constexpr uint32_t kSecondMcPathAddr =
@@ -432,6 +511,24 @@ void register_ps2_runtime_io_tests()
                 test.rdram.data(),
                 &test.ctx,
                 &first);
+            R5900Context peerSyncCtx{};
+            setRegU32(peerSyncCtx, 4, 0u);
+            setRegU32(
+                peerSyncCtx,
+                5,
+                GUEST_MC_SYNC_CMD_ADDR);
+            setRegU32(
+                peerSyncCtx,
+                6,
+                GUEST_MC_SYNC_RESULT_ADDR);
+            ps2_stubs::sceMcSync(
+                secondRdram.data(),
+                &peerSyncCtx,
+                &second);
+            t.Equals(
+                getRegS32(&peerSyncCtx, 2),
+                -1,
+                "one runtime must not consume another runtime's pending memory-card command");
             const int32_t firstMcFd =
                 syncMc(test.rdram, &first);
 
@@ -513,6 +610,44 @@ void register_ps2_runtime_io_tests()
                 ::getRegU32(&secondCtx, 2),
                 1u,
                 "stopping one runtime must not close another runtime's libc streams");
+
+            clearContext(test.ctx);
+            ps2_stubs::rand(
+                test.rdram.data(),
+                &test.ctx,
+                &first);
+            t.Equals(
+                ::getRegU32(&test.ctx, 2),
+                firstRandom,
+                "stopping a runtime should reset its libc random sequence");
+            clearContext(secondCtx);
+            ps2_stubs::rand(
+                secondRdram.data(),
+                &secondCtx,
+                &second);
+            t.Equals(
+                ::getRegU32(&secondCtx, 2),
+                firstNextRandom,
+                "stopping one runtime must not reset another runtime's libc random sequence");
+
+            clearContext(test.ctx);
+            ps2_stubs::mcGetFileSelectWindowCursol(
+                test.rdram.data(),
+                &test.ctx,
+                &first);
+            t.Equals(
+                getRegS32(&test.ctx, 2),
+                0,
+                "stopping a runtime should reset its memory-card UI cursor");
+            clearContext(secondCtx);
+            ps2_stubs::mcGetFileSelectWindowCursol(
+                secondRdram.data(),
+                &secondCtx,
+                &second);
+            t.Equals(
+                getRegS32(&secondCtx, 2),
+                4,
+                "stopping one runtime must not reset another runtime's memory-card UI cursor");
 
             if (firstItemsRead != 0u)
             {

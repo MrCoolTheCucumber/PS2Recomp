@@ -36,7 +36,9 @@ namespace ps2_stubs
         std::vector<MemoryCardDebugOpenFile> openFiles;
     };
 
-    MemoryCardDebugSnapshot getMemoryCardDebugSnapshot();
+    void resetMemoryCardState(PS2Runtime *runtime);
+    MemoryCardDebugSnapshot getMemoryCardDebugSnapshot(
+        PS2Runtime *runtime);
     void sceMcChangeThreadPriority(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
     void sceMcChdir(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
     void sceMcClose(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);

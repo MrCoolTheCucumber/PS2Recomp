@@ -58,6 +58,8 @@ namespace ps2_stubs
 {
     struct CdRuntimeState;
     struct DmaRuntimeState;
+    struct LibCRuntimeState;
+    struct MemoryCardRuntimeState;
     struct PadRuntimeState;
     class MpegRuntimeState;
     struct SifRuntimeState;
@@ -1273,6 +1275,12 @@ public:
     const ps2_stubs::CdRuntimeState &cdRuntimeState() const;
     ps2_stubs::DmaRuntimeState &dmaRuntimeState();
     const ps2_stubs::DmaRuntimeState &dmaRuntimeState() const;
+    ps2_stubs::LibCRuntimeState &libcRuntimeState();
+    const ps2_stubs::LibCRuntimeState &libcRuntimeState() const;
+    ps2_stubs::MemoryCardRuntimeState &
+    memoryCardRuntimeState();
+    const ps2_stubs::MemoryCardRuntimeState &
+    memoryCardRuntimeState() const;
     ps2_stubs::PadRuntimeState &padRuntimeState();
     const ps2_stubs::PadRuntimeState &padRuntimeState() const;
     ps2_stubs::SifRuntimeState &sifRuntimeState();
@@ -1959,6 +1967,10 @@ private:
         m_cdRuntimeState;
     std::unique_ptr<ps2_stubs::DmaRuntimeState>
         m_dmaRuntimeState;
+    std::unique_ptr<ps2_stubs::LibCRuntimeState>
+        m_libcRuntimeState;
+    std::unique_ptr<ps2_stubs::MemoryCardRuntimeState>
+        m_memoryCardRuntimeState;
     std::unique_ptr<ps2_stubs::PadRuntimeState>
         m_padRuntimeState;
     std::unique_ptr<ps2_stubs::SifRuntimeState>

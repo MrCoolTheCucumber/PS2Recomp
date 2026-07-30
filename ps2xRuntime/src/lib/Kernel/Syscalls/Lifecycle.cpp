@@ -4,6 +4,8 @@
 #include "Lifecycle.h"
 #include "../Stubs/CD.h"
 #include "../Stubs/DMA.h"
+#include "../Stubs/LibC.h"
+#include "../Stubs/MemoryCard.h"
 #include "../Stubs/Pad.h"
 #include "Helpers/InterruptRuntimeState.h"
 #include "Helpers/KernelRuntimeState.h"
@@ -217,6 +219,8 @@ namespace ps2_syscalls
         resetFileIoState(runtime);
         ps2_stubs::resetCdState(runtime);
         ps2_stubs::resetDmaState(runtime);
+        ps2_stubs::resetLibCState(runtime);
+        ps2_stubs::resetMemoryCardState(runtime);
         ps2_stubs::resetPadState(runtime);
         ps2_stubs::resetSifState(runtime);
     }
