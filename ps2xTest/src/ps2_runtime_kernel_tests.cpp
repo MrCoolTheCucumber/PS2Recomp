@@ -87,6 +87,8 @@ namespace
     constexpr uint32_t K_ALARM_SELF_STOP_GATE_ADDR = 0x18FCu;
 
     std::mutex g_guestWordMutex;
+    std::mutex g_alarmCallbackThreadMutex;
+    std::thread::id g_alarmCallbackThread;
 
     struct EeThreadStatus
     {
@@ -507,6 +509,20 @@ namespace
             rdram,
             K_ALARM_CALLBACK_STAGE_ADDR,
             1u);
+        ctx->pc = 0u;
+    }
+
+    void alarmThreadCaptureHandler(
+        uint8_t *,
+        R5900Context *ctx,
+        PS2Runtime *)
+    {
+        {
+            std::lock_guard<std::mutex> lock(
+                g_alarmCallbackThreadMutex);
+            g_alarmCallbackThread =
+                std::this_thread::get_id();
+        }
         ctx->pc = 0u;
     }
 
@@ -5822,6 +5838,72 @@ void register_ps2_runtime_kernel_tests()
                 getRegS32(cancelCtx, 2),
                 KE_ERROR,
                 "a dispatched alarm should no longer be cancellable");
+        });
+
+        tc.Run("alarm workers publish callbacks to an EE execution boundary", [](TestCase &t)
+        {
+            TestEnv env;
+
+            constexpr uint32_t kAlarmHandlerAddr = 0x00270380u;
+            env.runtime.registerFunction(
+                kAlarmHandlerAddr,
+                &alarmThreadCaptureHandler);
+            {
+                std::lock_guard<std::mutex> lock(
+                    g_alarmCallbackThreadMutex);
+                g_alarmCallbackThread = {};
+            }
+
+            setRegU32(env.ctx, 4, 1u);
+            setRegU32(env.ctx, 5, kAlarmHandlerAddr);
+            setRegU32(env.ctx, 6, 0u);
+            SetAlarm(
+                env.rdram.data(),
+                &env.ctx,
+                &env.runtime);
+            t.IsTrue(
+                getRegS32(env.ctx, 2) > 0,
+                "the executor-dispatch fixture should create a short alarm");
+
+            const std::thread::id boundaryThread =
+                std::this_thread::get_id();
+            std::thread::id callbackThread;
+            const auto deadline =
+                std::chrono::steady_clock::now() +
+                std::chrono::seconds(1);
+            while (std::chrono::steady_clock::now() <
+                   deadline)
+            {
+                {
+                    PS2Runtime::GuestExecutionScope
+                        guestExecution(
+                            &env.runtime,
+                            &env.ctx);
+                    env.runtime.executeGuestStep(
+                        env.rdram.data(),
+                        &env.ctx,
+                        &alarmNoopHandler);
+                }
+                {
+                    std::lock_guard<std::mutex> lock(
+                        g_alarmCallbackThreadMutex);
+                    callbackThread =
+                        g_alarmCallbackThread;
+                }
+                if (callbackThread != std::thread::id{})
+                {
+                    break;
+                }
+                std::this_thread::sleep_for(
+                    std::chrono::milliseconds(1));
+            }
+
+            t.IsTrue(
+                callbackThread != std::thread::id{},
+                "the short alarm should reach an EE execution boundary");
+            t.IsTrue(
+                callbackThread == boundaryThread,
+                "the alarm timer worker must publish work instead of executing guest code");
         });
 
         tc.Run("alarm self-stop retains a joinable worker until callback exit", [](TestCase &t)
