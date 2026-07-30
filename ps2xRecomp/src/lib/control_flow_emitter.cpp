@@ -193,7 +193,10 @@ namespace ps2recomp
         m_ss << fmt::format("{}ctx->pc = 0x{:X}u;\n", indent, target);
         if (target <= sourcePc && !isCallLikeEdge())
         {
-            m_ss << fmt::format("{}if (runtime->shouldPreemptGuestExecution()) {{\n", indent);
+            m_ss << fmt::format(
+                "{}if (runtime->checkpointGuestExecution(ctx) == "
+                "PS2GuestCheckpointResult::ExitToDispatcher) {{\n",
+                indent);
             m_ss << fmt::format("{}    return;\n", indent);
             m_ss << fmt::format("{}}}\n", indent);
         }

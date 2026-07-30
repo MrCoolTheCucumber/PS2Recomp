@@ -145,6 +145,12 @@ namespace
         0x25af00u;
     constexpr uint32_t K_EXECUTOR_DEBUG_TARGET_ENTRY =
         0x25b000u;
+    constexpr uint32_t K_EXECUTOR_CHECKPOINT_ENTRY =
+        0x25b100u;
+    constexpr uint32_t K_EXECUTOR_NESTED_CHECKPOINT_ENTRY =
+        0x25b200u;
+    constexpr uint32_t K_EXECUTOR_NESTED_CHECKPOINT_CHILD =
+        0x25b300u;
 
     std::mutex g_guestWordMutex;
     std::mutex g_alarmCallbackThreadMutex;
@@ -311,6 +317,21 @@ namespace
         false};
     std::atomic<bool> g_executorDebugBoundaryApplied{
         false};
+    std::atomic<uint32_t> g_executorCheckpointEntries{
+        0u};
+    std::atomic<bool> g_executorCheckpointProbeAllowed{
+        false};
+    std::atomic<bool> g_executorCheckpointReturned{
+        false};
+    std::atomic<bool> g_executorCheckpointFinish{false};
+    std::atomic<uint32_t>
+        g_executorNestedCheckpointEntries{0u};
+    std::atomic<uint32_t>
+        g_executorNestedCheckpointChildEntries{0u};
+    std::atomic<bool>
+        g_executorNestedCheckpointProbeAllowed{false};
+    std::atomic<bool>
+        g_executorNestedCheckpointContinued{false};
 
     struct EeThreadStatus
     {
@@ -2539,6 +2560,95 @@ namespace
                 std::memory_order_acquire)
                 ? 0u
                 : K_EXECUTOR_DEBUG_SPIN_ENTRY;
+    }
+
+    void dedicatedExecutorCheckpointHandler(
+        uint8_t *,
+        R5900Context *ctx,
+        PS2Runtime *runtime)
+    {
+        g_executorCheckpointEntries.fetch_add(
+            1u, std::memory_order_relaxed);
+        while (!g_executorCheckpointProbeAllowed.load(
+            std::memory_order_acquire))
+        {
+            std::this_thread::yield();
+        }
+
+        for (uint32_t probe = 0u;
+             probe < 300u;
+             ++probe)
+        {
+            ctx->pc = K_EXECUTOR_CHECKPOINT_ENTRY;
+            if (runtime->checkpointGuestExecution(
+                    ctx) ==
+                PS2GuestCheckpointResult::
+                    ExitToDispatcher)
+            {
+                return;
+            }
+        }
+        g_executorCheckpointReturned.store(
+            true, std::memory_order_release);
+
+        while (!g_executorCheckpointFinish.load(
+            std::memory_order_acquire))
+        {
+            std::this_thread::yield();
+        }
+        ctx->pc = 0u;
+    }
+
+    void dedicatedExecutorNestedCheckpointChild(
+        uint8_t *,
+        R5900Context *ctx,
+        PS2Runtime *runtime)
+    {
+        g_executorNestedCheckpointChildEntries
+            .fetch_add(
+                1u, std::memory_order_relaxed);
+        while (!g_executorNestedCheckpointProbeAllowed
+                    .load(std::memory_order_acquire))
+        {
+            std::this_thread::yield();
+        }
+
+        ctx->pc =
+            K_EXECUTOR_NESTED_CHECKPOINT_CHILD;
+        if (runtime->checkpointGuestExecution(ctx) ==
+            PS2GuestCheckpointResult::
+                ExitToDispatcher)
+        {
+            return;
+        }
+    }
+
+    void dedicatedExecutorNestedCheckpointHandler(
+        uint8_t *rdram,
+        R5900Context *ctx,
+        PS2Runtime *runtime)
+    {
+        g_executorNestedCheckpointEntries.fetch_add(
+            1u, std::memory_order_relaxed);
+        ctx->pc =
+            K_EXECUTOR_NESTED_CHECKPOINT_CHILD;
+        if (!runtime->dispatchGuestBranch(
+                rdram,
+                ctx,
+                K_EXECUTOR_NESTED_CHECKPOINT_CHILD,
+                K_EXECUTOR_NESTED_CHECKPOINT_ENTRY,
+                K_EXECUTOR_NESTED_CHECKPOINT_ENTRY +
+                    8u,
+                PS2Runtime::GuestBranchKind::
+                    DirectCall,
+                "nested-checkpoint"))
+        {
+            return;
+        }
+
+        g_executorNestedCheckpointContinued.store(
+            true, std::memory_order_release);
+        ctx->pc = 0u;
     }
 
     struct TestEnv
@@ -5040,6 +5150,202 @@ void register_ps2_runtime_kernel_tests()
                             .load(
                                 std::memory_order_acquire),
                     "debug resume should finish the guest and retain the paused boundary command");
+            });
+
+        tc.Run(
+            "fiber backedge checkpoint preserves its native continuation",
+            [](TestCase &t)
+            {
+                if (!eeExecutionBackendBuildInfo()
+                         .boostContextFcontextAvailable)
+                {
+                    return;
+                }
+
+                PS2RuntimeConfiguration configuration{};
+                configuration.eeExecutionBackend =
+                    EeExecutionBackendKind::LegacyCppFiber;
+                PS2Runtime runtime(configuration);
+                const bool memoryInitialized =
+                    runtime.memory().initialize();
+                if (!memoryInitialized)
+                {
+                    t.IsTrue(
+                        false,
+                        "checkpoint fixture memory should initialize");
+                    return;
+                }
+
+                runtime.registerFunction(
+                    K_EXECUTOR_CHECKPOINT_ENTRY,
+                    &dedicatedExecutorCheckpointHandler);
+                runtime.cpu().pc =
+                    K_EXECUTOR_CHECKPOINT_ENTRY;
+                setRegU32(
+                    runtime.cpu(),
+                    29,
+                    0x00300000u);
+                g_executorCheckpointEntries.store(
+                    0u, std::memory_order_release);
+                g_executorCheckpointProbeAllowed.store(
+                    false, std::memory_order_release);
+                g_executorCheckpointReturned.store(
+                    false, std::memory_order_release);
+                g_executorCheckpointFinish.store(
+                    false, std::memory_order_release);
+
+                runtime
+                    .startDedicatedEeExecutionForTesting();
+                const bool entered = waitUntil(
+                    []()
+                    {
+                        return g_executorCheckpointEntries
+                                   .load(
+                                       std::memory_order_acquire) >=
+                               1u;
+                    },
+                    std::chrono::seconds(2));
+                runtime.requestGuestPreemption();
+                g_executorCheckpointProbeAllowed.store(
+                    true, std::memory_order_release);
+                const bool checkpointed = waitUntil(
+                    []()
+                    {
+                        return g_executorCheckpointReturned
+                            .load(
+                                std::memory_order_acquire);
+                    },
+                    std::chrono::seconds(2));
+                const uint32_t entriesBeforeFinish =
+                    g_executorCheckpointEntries.load(
+                        std::memory_order_acquire);
+                g_executorCheckpointFinish.store(
+                    true, std::memory_order_release);
+                const bool continuationRetired =
+                    waitUntil(
+                        [&runtime]()
+                        {
+                            return runtime
+                                       .managedEeExecutionThreadCountForTesting() ==
+                                   0u;
+                        },
+                        std::chrono::seconds(2));
+                runtime
+                    .stopDedicatedEeExecutionForTesting();
+
+                t.IsTrue(
+                    memoryInitialized && entered &&
+                        checkpointed &&
+                        continuationRetired,
+                    "checkpoint fixture should run and retire its production fiber");
+                t.Equals(
+                    entriesBeforeFinish,
+                    1u,
+                    "a stackful backedge checkpoint should resume at the call instead of re-entering the generated function");
+            });
+
+        tc.Run(
+            "fiber checkpoint preserves nested generated callers",
+            [](TestCase &t)
+            {
+                if (!eeExecutionBackendBuildInfo()
+                         .boostContextFcontextAvailable)
+                {
+                    return;
+                }
+
+                PS2RuntimeConfiguration configuration{};
+                configuration.eeExecutionBackend =
+                    EeExecutionBackendKind::LegacyCppFiber;
+                PS2Runtime runtime(configuration);
+                const bool memoryInitialized =
+                    runtime.memory().initialize();
+                if (!memoryInitialized)
+                {
+                    t.IsTrue(
+                        false,
+                        "nested checkpoint fixture memory should initialize");
+                    return;
+                }
+
+                runtime.registerFunction(
+                    K_EXECUTOR_NESTED_CHECKPOINT_ENTRY,
+                    &dedicatedExecutorNestedCheckpointHandler);
+                runtime.registerFunction(
+                    K_EXECUTOR_NESTED_CHECKPOINT_CHILD,
+                    &dedicatedExecutorNestedCheckpointChild);
+                runtime.cpu().pc =
+                    K_EXECUTOR_NESTED_CHECKPOINT_ENTRY;
+                setRegU32(
+                    runtime.cpu(),
+                    29,
+                    0x00300000u);
+                g_executorNestedCheckpointEntries.store(
+                    0u, std::memory_order_release);
+                g_executorNestedCheckpointChildEntries
+                    .store(
+                        0u, std::memory_order_release);
+                g_executorNestedCheckpointProbeAllowed
+                    .store(
+                        false,
+                        std::memory_order_release);
+                g_executorNestedCheckpointContinued
+                    .store(
+                        false,
+                        std::memory_order_release);
+
+                runtime
+                    .startDedicatedEeExecutionForTesting();
+                const bool childEntered = waitUntil(
+                    []()
+                    {
+                        return g_executorNestedCheckpointChildEntries
+                                   .load(
+                                       std::memory_order_acquire) >=
+                               1u;
+                    },
+                    std::chrono::seconds(2));
+                runtime.requestGuestPreemption();
+                g_executorNestedCheckpointProbeAllowed
+                    .store(
+                        true,
+                        std::memory_order_release);
+                const bool callerContinued = waitUntil(
+                    []()
+                    {
+                        return g_executorNestedCheckpointContinued
+                            .load(
+                                std::memory_order_acquire);
+                    },
+                    std::chrono::seconds(2));
+                const bool continuationRetired =
+                    callerContinued &&
+                    waitUntil(
+                        [&runtime]()
+                        {
+                            return runtime
+                                       .managedEeExecutionThreadCountForTesting() ==
+                                   0u;
+                        },
+                        std::chrono::seconds(2));
+                runtime
+                    .stopDedicatedEeExecutionForTesting();
+
+                t.IsTrue(
+                    memoryInitialized && childEntered &&
+                        callerContinued &&
+                        continuationRetired,
+                    "a nested checkpoint should resume through its native generated callers and retire");
+                t.IsTrue(
+                    g_executorNestedCheckpointEntries
+                                .load(
+                                    std::memory_order_acquire) ==
+                            1u &&
+                        g_executorNestedCheckpointChildEntries
+                                .load(
+                                    std::memory_order_acquire) ==
+                            1u,
+                    "a stackful checkpoint should not re-enter either generated function");
             });
 
         tc.Run("host presentation upload state is isolated per runtime", [](TestCase &t)

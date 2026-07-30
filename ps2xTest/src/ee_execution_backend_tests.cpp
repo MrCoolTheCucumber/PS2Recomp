@@ -33,6 +33,16 @@ void register_ee_execution_backend_tests()
                         std::string::npos,
                     "diagnostics should retain the requested mode");
 
+                auto hostBackend =
+                    createEeExecutionBackend(
+                        EeExecutionBackendKind::
+                            LegacyHostThread);
+                t.Equals(
+                    hostBackend->checkpointMode(),
+                    EeExecutionCheckpointMode::
+                        DispatcherExit,
+                    "the host-thread backend should exit generated code at a checkpoint");
+
                 if (!build.boostContextFcontextAvailable)
                 {
                     bool rejected = false;
@@ -66,6 +76,11 @@ void register_ee_execution_backend_tests()
                     std::string(backend->name()),
                     std::string("legacy-cpp-fiber"),
                     "the selected mode should have a stable artifact name");
+                t.Equals(
+                    backend->checkpointMode(),
+                    EeExecutionCheckpointMode::
+                        SuspendContinuation,
+                    "the stackful backend should suspend and resume inside a checkpoint");
                 t.Equals(
                     backend->managedThreadCount(),
                     size_t{0u},

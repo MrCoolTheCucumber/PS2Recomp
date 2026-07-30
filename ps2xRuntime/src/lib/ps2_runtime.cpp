@@ -5352,8 +5352,9 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
         debugRecordBranch(targetPc);
     }
     const uint32_t entryPc = ctx->pc;
-    const uint64_t preemptionEpoch =
-        m_guestExecutionPreemptionEpoch.load(std::memory_order_acquire);
+    const uint64_t dispatcherExitEpoch =
+        m_guestExecutionDispatcherExitEpoch.load(
+            std::memory_order_acquire);
     targetFn(rdram, ctx, this);
 
     if (isStopRequested() || ctx->pc == 0u)
@@ -5361,14 +5362,16 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
         return false;
     }
 
-    // A generated back edge returns to the outer dispatcher when the runtime
-    // requests cooperative preemption.  In a nested call, the resume PC can
-    // legitimately equal the callee entry, which is otherwise also how an
-    // empty implicit-return handler is represented.  Preserve the resume PC
-    // instead of converting it to the call fallthrough when any nested target
-    // observed a preemption request.
-    if (m_guestExecutionPreemptionEpoch.load(std::memory_order_acquire) !=
-        preemptionEpoch)
+    // A stackless checkpoint returns generated code to the outer dispatcher.
+    // In a nested call, the resume PC can legitimately equal the callee
+    // entry, which is otherwise also how an empty implicit-return handler is
+    // represented. Preserve the resume PC instead of converting it to the
+    // call fallthrough when any nested target requested a dispatcher exit.
+    // A stackful checkpoint suspends and resumes in place, so it does not
+    // advance this epoch or unwind native callers.
+    if (m_guestExecutionDispatcherExitEpoch.load(
+            std::memory_order_acquire) !=
+        dispatcherExitEpoch)
     {
         return false;
     }
@@ -9639,37 +9642,78 @@ void PS2Runtime::requestGuestPreemption()
 {
     m_guestExecutionPreemptionRequested.store(
         true, std::memory_order_release);
-    m_guestExecutionPreemptionEpoch.fetch_add(
-        1u, std::memory_order_release);
 }
 
-bool PS2Runtime::shouldPreemptGuestExecution()
+PS2GuestCheckpointResult
+PS2Runtime::checkpointGuestExecution(
+    R5900Context *ctx)
 {
-    if (m_guestExecutionPreemptionRequested.exchange(
-            false, std::memory_order_acq_rel))
-    {
-        return true;
-    }
+    static_cast<void>(ctx);
+    const bool explicitlyRequested =
+        m_guestExecutionPreemptionRequested.exchange(
+            false, std::memory_order_acq_rel);
 
     thread_local uint32_t s_backEdgeYieldCounter = 0u;
-    const uint32_t waiterCount = m_guestExecutionWaiters.load(std::memory_order_acquire);
-    const uint32_t yieldInterval = (waiterCount != 0u) ? 64u : 100u;
-    if (++s_backEdgeYieldCounter < yieldInterval)
+    const uint32_t waiterCount =
+        m_guestExecutionWaiters.load(
+            std::memory_order_acquire);
+    const uint32_t yieldInterval =
+        waiterCount != 0u ? 64u : 100u;
+    const bool periodicCheckpoint =
+        !explicitlyRequested &&
+        ++s_backEdgeYieldCounter >= yieldInterval;
+    if (!explicitlyRequested &&
+        !periodicCheckpoint)
     {
-        return false;
+        return PS2GuestCheckpointResult::Continue;
     }
 
-    s_backEdgeYieldCounter = 0u;
-    if (waiterCount != 0u)
+    if (periodicCheckpoint)
     {
-        // Returning to the dispatcher is not itself a fair handoff: the current
-        // host thread can release and immediately reacquire the recursive mutex,
-        // indefinitely starving a guest thread that is already queued. Transfer
-        // ownership here before asking generated code to return to its dispatcher.
+        s_backEdgeYieldCounter = 0u;
+    }
+
+    if (g_deferredGuestYieldDepth != 0u)
+    {
+        // Interrupt and callback adapters may temporarily require one
+        // uninterrupted guest-safe region. Materialize the resume PC by
+        // returning from generated code, then let the outermost defer scope
+        // hand control to the scheduler after that region closes.
+        g_deferredGuestYieldPending = true;
+        m_guestExecutionDispatcherExitEpoch.fetch_add(
+            1u, std::memory_order_release);
+        return PS2GuestCheckpointResult::
+            ExitToDispatcher;
+    }
+
+    if (m_eeExecutionBackend &&
+        m_eeExecutionBackend->checkpointMode() ==
+            EeExecutionCheckpointMode::
+                SuspendContinuation)
+    {
+        yieldEeExecutorCurrent(
+            isStopRequested()
+                ? ps2x::ee::EeSchedulerExitReason::
+                      StopRequested
+                : ps2x::ee::EeSchedulerExitReason::
+                      Preempted);
+        return PS2GuestCheckpointResult::Continue;
+    }
+
+    if (periodicCheckpoint &&
+        waiterCount != 0u)
+    {
+        // Returning to the dispatcher is not itself a fair handoff: the
+        // current host thread can release and immediately reacquire the
+        // recursive mutex, indefinitely starving a guest thread which is
+        // already queued. Transfer ownership before asking generated code to
+        // return to its dispatcher.
         yieldGuestExecutionAfterWake();
     }
-    m_guestExecutionPreemptionEpoch.fetch_add(1u, std::memory_order_release);
-    return true;
+    m_guestExecutionDispatcherExitEpoch.fetch_add(
+        1u, std::memory_order_release);
+    return PS2GuestCheckpointResult::
+        ExitToDispatcher;
 }
 
 uint8_t PS2Runtime::Load8(uint8_t *rdram, R5900Context *ctx, uint32_t vaddr)

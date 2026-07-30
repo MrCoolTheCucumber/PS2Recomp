@@ -2212,7 +2212,7 @@ void register_code_generator_tests()
                      "backward internal JAL should still set RA");
             t.IsTrue(generated.find("goto label_c100;") != std::string::npos,
                      "backward internal JAL should still re-enter the internal target directly");
-            t.IsTrue(generated.find("if (runtime->shouldPreemptGuestExecution())") == std::string::npos,
+            t.IsTrue(generated.find("runtime->checkpointGuestExecution(ctx)") == std::string::npos,
                      "backward internal JAL should not expose a mid-call dispatcher return");
         });
 
@@ -2282,8 +2282,12 @@ void register_code_generator_tests()
                      "mid-function backward loop head should be re-enterable after returning to the dispatcher");
             t.IsTrue(generated.find("ctx->pc = 0x1104u;") != std::string::npos,
                      "backward internal branch should preserve the loop target in ctx->pc");
-            t.IsTrue(generated.find("if (runtime->shouldPreemptGuestExecution()) {") != std::string::npos,
-                     "backward internal branch should consult the runtime preemption policy before re-entering the loop");
+            t.IsTrue(
+                generated.find(
+                    "runtime->checkpointGuestExecution(ctx) == "
+                    "PS2GuestCheckpointResult::ExitToDispatcher") !=
+                    std::string::npos,
+                "backward internal branch should reach the backend-neutral checkpoint before re-entering the loop");
             t.IsTrue(generated.find("return;") != std::string::npos,
                      "backward internal branch should return to the dispatcher when the runtime preemption policy requests it");
             t.IsTrue(generated.find("runtime->cooperativeGuestYield();") == std::string::npos,

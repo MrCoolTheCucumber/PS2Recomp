@@ -312,7 +312,11 @@ namespace
                                   !shouldPreempt;
                  ++attempt)
             {
-                shouldPreempt = runtime->shouldPreemptGuestExecution();
+                shouldPreempt =
+                    runtime->checkpointGuestExecution(
+                        ctx) ==
+                    PS2GuestCheckpointResult::
+                        ExitToDispatcher;
             }
             setRegU32(*ctx, 2, shouldPreempt ? 1u : 0u);
         }
@@ -375,7 +379,10 @@ namespace
         while (probes < 256u)
         {
             ++probes;
-            if (runtime->shouldPreemptGuestExecution())
+            if (runtime->checkpointGuestExecution(
+                    ctx) ==
+                PS2GuestCheckpointResult::
+                    ExitToDispatcher)
             {
                 setRegU32(*ctx, 2, probes);
                 return;
@@ -433,7 +440,11 @@ namespace
                     runtime->yieldGuestExecutionAfterWake();
                 }
                 std::this_thread::sleep_for(std::chrono::milliseconds(1));
-                if (runtime && runtime->shouldPreemptGuestExecution())
+                if (runtime &&
+                    runtime->checkpointGuestExecution(
+                        ctx) ==
+                        PS2GuestCheckpointResult::
+                            ExitToDispatcher)
                 {
                     // Generated back edges return to the dispatcher at this
                     // point, allowing a pending interrupt to acquire the
@@ -1460,6 +1471,38 @@ void register_ps2_runtime_expansion_tests()
             t.IsFalse(innerPending, "inner scope must stay untouched");
         });
 
+        tc.Run(
+            "guest checkpoint materializes a deferred callback exit",
+            [](TestCase &t)
+            {
+                PS2Runtime runtime;
+                R5900Context ctx{};
+                ctx.pc = 0x190000u;
+                bool pending = false;
+                PS2GuestCheckpointResult result =
+                    PS2GuestCheckpointResult::Continue;
+
+                runtime.requestGuestPreemption();
+                {
+                    PS2Runtime::DeferredGuestYieldScope
+                        defer(pending);
+                    result =
+                        runtime
+                            .checkpointGuestExecution(
+                                &ctx);
+                    t.IsFalse(
+                        pending,
+                        "the defer scope should retain its pending exit until destruction");
+                }
+
+                t.IsTrue(
+                    result ==
+                            PS2GuestCheckpointResult::
+                                ExitToDispatcher &&
+                        pending,
+                    "a checkpoint inside a callback-safe region should return generated code and defer scheduling");
+            });
+
         tc.Run("guest preemption policy requests a dispatcher handoff when another guest thread contends", [](TestCase &t)
         {
             PS2Runtime runtime;
@@ -1645,6 +1688,7 @@ void register_ps2_runtime_expansion_tests()
             R5900Context ctx{};
             ctx.pc = 0x2000u;
 
+            runtime.requestGuestPreemption();
             const bool returnedToFallthrough = runtime.dispatchGuestBranch(
                 nullptr,
                 &ctx,

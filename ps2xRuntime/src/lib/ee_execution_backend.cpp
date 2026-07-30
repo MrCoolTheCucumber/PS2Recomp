@@ -59,6 +59,13 @@ namespace
             return false;
         }
 
+        [[nodiscard]] EeExecutionCheckpointMode
+        checkpointMode() const noexcept override
+        {
+            return EeExecutionCheckpointMode::
+                DispatcherExit;
+        }
+
         void create(
             int threadId,
             ThreadEntry entry) override
@@ -298,6 +305,13 @@ namespace
         executorResumable() const noexcept override
         {
             return true;
+        }
+
+        [[nodiscard]] EeExecutionCheckpointMode
+        checkpointMode() const noexcept override
+        {
+            return EeExecutionCheckpointMode::
+                SuspendContinuation;
         }
 
         void create(

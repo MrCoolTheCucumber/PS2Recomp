@@ -14,6 +14,17 @@ enum class EeExecutionBackendKind
     LegacyCppFiber,
 };
 
+enum class EeExecutionCheckpointMode
+{
+    // Generated code returns with its architectural resume PC materialized.
+    // This is also the contract for a future stackless explicit-exit backend.
+    DispatcherExit,
+
+    // The runtime may suspend the backend continuation at the checkpoint and
+    // later return normally from the same call.
+    SuspendContinuation,
+};
+
 struct EeExecutionBackendBuildInfo
 {
     bool boostContextFcontextAvailable = false;
@@ -39,6 +50,8 @@ public:
     [[nodiscard]] virtual std::string_view name() const noexcept = 0;
     [[nodiscard]] virtual bool
     executorResumable() const noexcept = 0;
+    [[nodiscard]] virtual EeExecutionCheckpointMode
+    checkpointMode() const noexcept = 0;
 
     // Legacy host-thread continuations begin immediately. Executor-owned
     // continuations are created dormant and entered only through resume().

@@ -105,6 +105,12 @@ struct PS2GuestException final
 {
 };
 
+enum class PS2GuestCheckpointResult : uint8_t
+{
+    Continue,
+    ExitToDispatcher,
+};
+
 struct PS2GuestFunctionSymbol
 {
     uint32_t start;
@@ -1185,7 +1191,8 @@ public:
         uint32_t transferId) const noexcept;
 
     void requestGuestPreemption();
-    bool shouldPreemptGuestExecution();
+    [[nodiscard]] PS2GuestCheckpointResult
+    checkpointGuestExecution(R5900Context *ctx);
     void yieldGuestExecutionAtBoundary();
     void yieldGuestExecutionAfterWake();
     void waitForGuestExecutionHandoff();
@@ -1887,7 +1894,8 @@ private:
     mutable std::mutex m_eeIdleAdvanceMutex;
     std::atomic<uint64_t> m_guestExecutionHandoffEpoch{0u};
     std::atomic<uint64_t> m_guestExecutionHandoffTimeouts{0u};
-    std::atomic<uint64_t> m_guestExecutionPreemptionEpoch{0u};
+    std::atomic<uint64_t>
+        m_guestExecutionDispatcherExitEpoch{0u};
     std::atomic<bool> m_guestExecutionPreemptionRequested{false};
     bool m_eeThreadDiagnosticsEnabled = false;
     bool m_eeThreadDiagnosticsHasLastOuterContext = false;
