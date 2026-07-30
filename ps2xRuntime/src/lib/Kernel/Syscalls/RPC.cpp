@@ -143,14 +143,18 @@ namespace ps2_syscalls
         }
 #endif
 
-        bool signalRpcCompletionSema(uint32_t semaId)
+        bool signalRpcCompletionSema(
+            PS2Runtime *runtime,
+            uint32_t semaId)
         {
             if (semaId > 0xFFFFu)
             {
                 return false;
             }
 
-            auto sema = lookupSemaInfo(static_cast<int>(semaId));
+            auto sema = lookupSemaInfo(
+                runtime,
+                static_cast<int>(semaId));
             if (!sema)
             {
                 return false;
@@ -587,11 +591,15 @@ namespace ps2_syscalls
             if (iopResult.signalNowaitCompletion &&
                 (mode & kSifRpcModeNowait) != 0u)
             {
-                (void)signalRpcCompletionSema(completionSemaphore());
+                (void)signalRpcCompletionSema(
+                    runtime,
+                    completionSemaphore());
             }
             if (iopResult.signalCompletion)
             {
-                (void)signalRpcCompletionSema(completionSemaphore());
+                (void)signalRpcCompletionSema(
+                    runtime,
+                    completionSemaphore());
             }
         }
 
@@ -682,7 +690,10 @@ namespace ps2_syscalls
 
             if (!callbackCompleted)
             {
-                const bool signaled = signalRpcCompletionSema(completionSemaphore());
+                const bool signaled =
+                    signalRpcCompletionSema(
+                        runtime,
+                        completionSemaphore());
                 static uint32_t unresolvedCallbackWarnings = 0u;
                 if (unresolvedCallbackWarnings < 32u)
                 {

@@ -60,18 +60,22 @@ namespace ps2_syscalls
         }
 
         std::vector<std::shared_ptr<SemaInfo>> semas;
+        if (runtime)
         {
-            std::lock_guard<std::mutex> lock(g_sema_map_mutex);
-            semas.reserve(g_semas.size());
-            for (const auto &entry : g_semas)
+            EeSyncRuntimeState &state =
+                runtime->eeSyncRuntimeState();
+            std::lock_guard<std::mutex> lock(
+                state.semaMapMutex);
+            semas.reserve(state.semas.size());
+            for (const auto &entry : state.semas)
             {
                 if (entry.second)
                 {
                     semas.push_back(entry.second);
                 }
             }
-            g_semas.clear();
-            g_nextSemaId = 0;
+            state.semas.clear();
+            state.nextSemaId = 0;
         }
         for (const auto &sema : semas)
         {
@@ -79,18 +83,22 @@ namespace ps2_syscalls
         }
 
         std::vector<std::shared_ptr<EventFlagInfo>> eventFlags;
+        if (runtime)
         {
-            std::lock_guard<std::mutex> lock(g_event_flag_map_mutex);
-            eventFlags.reserve(g_eventFlags.size());
-            for (const auto &entry : g_eventFlags)
+            EeSyncRuntimeState &state =
+                runtime->eeSyncRuntimeState();
+            std::lock_guard<std::mutex> lock(
+                state.eventFlagMapMutex);
+            eventFlags.reserve(state.eventFlags.size());
+            for (const auto &entry : state.eventFlags)
             {
                 if (entry.second)
                 {
                     eventFlags.push_back(entry.second);
                 }
             }
-            g_eventFlags.clear();
-            g_nextEventFlagId = 1;
+            state.eventFlags.clear();
+            state.nextEventFlagId = 1;
         }
         for (const auto &eventFlag : eventFlags)
         {

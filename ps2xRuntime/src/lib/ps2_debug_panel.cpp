@@ -867,11 +867,14 @@ namespace
         }
     }
 
-    void drawKernelTab()
+    void drawKernelTab(PS2Runtime &runtime)
     {
+        EeSyncRuntimeState &syncState =
+            runtime.eeSyncRuntimeState();
         ImGui::SeparatorText("Semaphores");
         {
-            std::lock_guard<std::mutex> lock(g_sema_map_mutex);
+            std::lock_guard<std::mutex> lock(
+                syncState.semaMapMutex);
             if (ImGui::BeginTable("semas", 7, ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg | ImGuiTableFlags_Resizable))
             {
                 ImGui::TableSetupColumn("ID");
@@ -882,7 +885,8 @@ namespace
                 ImGui::TableSetupColumn("Attr");
                 ImGui::TableSetupColumn("Deleted");
                 ImGui::TableHeadersRow();
-                for (const auto &[id, sema] : g_semas)
+                for (const auto &[id, sema] :
+                     syncState.semas)
                 {
                     if (!sema)
                         continue;
@@ -909,7 +913,8 @@ namespace
 
         ImGui::SeparatorText("Event flags");
         {
-            std::lock_guard<std::mutex> lock(g_event_flag_map_mutex);
+            std::lock_guard<std::mutex> lock(
+                syncState.eventFlagMapMutex);
             if (ImGui::BeginTable("evf", 6, ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg | ImGuiTableFlags_Resizable))
             {
                 ImGui::TableSetupColumn("ID");
@@ -919,7 +924,8 @@ namespace
                 ImGui::TableSetupColumn("Attr");
                 ImGui::TableSetupColumn("Deleted");
                 ImGui::TableHeadersRow();
-                for (const auto &[id, evf] : g_eventFlags)
+                for (const auto &[id, evf] :
+                     syncState.eventFlags)
                 {
                     if (!evf)
                         continue;
@@ -2265,7 +2271,7 @@ void PS2DebugPanel::draw(PS2Runtime &runtime)
             }
             if (ImGui::BeginTabItem("Kernel"))
             {
-                drawKernelTab();
+                drawKernelTab(runtime);
                 ImGui::EndTabItem();
             }
             if (ImGui::BeginTabItem("IOP/SIF"))

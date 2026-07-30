@@ -193,22 +193,42 @@ static std::shared_ptr<ThreadInfo> ensureCurrentThreadInfo(
     return info;
 }
 
-static std::shared_ptr<SemaInfo> lookupSemaInfo(int sid)
+static std::shared_ptr<SemaInfo> lookupSemaInfo(
+    PS2Runtime *runtime,
+    int sid)
 {
-    std::lock_guard<std::mutex> lock(g_sema_map_mutex);
-    auto it = g_semas.find(sid);
-    if (it != g_semas.end())
+    if (!runtime)
+    {
+        return nullptr;
+    }
+
+    EeSyncRuntimeState &state =
+        runtime->eeSyncRuntimeState();
+    std::lock_guard<std::mutex> lock(
+        state.semaMapMutex);
+    auto it = state.semas.find(sid);
+    if (it != state.semas.end())
     {
         return it->second;
     }
     return nullptr;
 }
 
-static std::shared_ptr<EventFlagInfo> lookupEventFlagInfo(int eid)
+static std::shared_ptr<EventFlagInfo> lookupEventFlagInfo(
+    PS2Runtime *runtime,
+    int eid)
 {
-    std::lock_guard<std::mutex> lock(g_event_flag_map_mutex);
-    auto it = g_eventFlags.find(eid);
-    if (it != g_eventFlags.end())
+    if (!runtime)
+    {
+        return nullptr;
+    }
+
+    EeSyncRuntimeState &state =
+        runtime->eeSyncRuntimeState();
+    std::lock_guard<std::mutex> lock(
+        state.eventFlagMapMutex);
+    auto it = state.eventFlags.find(eid);
+    if (it != state.eventFlags.end())
     {
         return it->second;
     }

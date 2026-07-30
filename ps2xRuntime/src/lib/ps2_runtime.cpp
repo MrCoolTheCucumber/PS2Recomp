@@ -12,6 +12,7 @@
 #include "Kernel/Stubs/GS.h"
 #include "Kernel/Stubs/MPEG.h"
 #include "Kernel/Syscalls/Helpers/AlarmRuntimeState.h"
+#include "Kernel/Syscalls/Helpers/SyncRuntimeState.h"
 #include "Kernel/Syscalls/Helpers/ThreadRuntimeState.h"
 #include "ps2_host_backend.h"
 #include "ps2_iop_host.h"
@@ -896,6 +897,8 @@ PS2Runtime::PS2Runtime(PS2RuntimeConfiguration configuration)
 {
     m_eeAlarmRuntimeState =
         std::make_unique<EeAlarmRuntimeState>();
+    m_eeSyncRuntimeState =
+        std::make_unique<EeSyncRuntimeState>();
     m_eeThreadRuntimeState =
         std::make_unique<EeThreadRuntimeState>(
             allocateEeThreadRuntimeGeneration());
@@ -1278,6 +1281,16 @@ EeAlarmRuntimeState &PS2Runtime::eeAlarmRuntimeState()
 const EeAlarmRuntimeState &PS2Runtime::eeAlarmRuntimeState() const
 {
     return *m_eeAlarmRuntimeState;
+}
+
+EeSyncRuntimeState &PS2Runtime::eeSyncRuntimeState()
+{
+    return *m_eeSyncRuntimeState;
+}
+
+const EeSyncRuntimeState &PS2Runtime::eeSyncRuntimeState() const
+{
+    return *m_eeSyncRuntimeState;
 }
 
 int PS2Runtime::activeEeHostThreadCount() const

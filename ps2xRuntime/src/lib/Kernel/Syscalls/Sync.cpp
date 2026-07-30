@@ -135,7 +135,7 @@ namespace ps2_syscalls
     void CreateSema(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
         uint32_t paramAddr = getRegU32(ctx, 4); // $a0
-        if (paramAddr == 0u)
+        if (!runtime || paramAddr == 0u)
         {
             setReturnS32(ctx, KE_ERROR);
             return;
@@ -185,22 +185,27 @@ namespace ps2_syscalls
         info->attr = attr;
         info->option = option;
 
+        EeSyncRuntimeState &syncState =
+            runtime->eeSyncRuntimeState();
         {
-            std::lock_guard<std::mutex> lock(g_sema_map_mutex);
+            std::lock_guard<std::mutex> lock(
+                syncState.semaMapMutex);
             for (int attempts = 0; attempts < 0x7FFF; ++attempts)
             {
-                if (g_nextSemaId < 0)
+                if (syncState.nextSemaId < 0)
                 {
-                    g_nextSemaId = 0;
+                    syncState.nextSemaId = 0;
                 }
 
-                const int candidate = g_nextSemaId++;
+                const int candidate =
+                    syncState.nextSemaId++;
                 if (candidate < 0)
                 {
                     continue;
                 }
 
-                if (g_semas.find(candidate) == g_semas.end())
+                if (syncState.semas.find(candidate) ==
+                    syncState.semas.end())
                 {
                     id = candidate;
                     break;
@@ -213,7 +218,7 @@ namespace ps2_syscalls
                 return;
             }
 
-            g_semas.emplace(id, info);
+            syncState.semas.emplace(id, info);
         }
         RUNTIME_LOG("[CreateSema] id=" << id << " init=" << init << " max=" << max);
         setReturnS32(ctx, id);
@@ -228,19 +233,27 @@ namespace ps2_syscalls
         int sid = static_cast<int>(getRegU32(ctx, 4));
         std::shared_ptr<SemaInfo> sema;
 
+        if (!runtime)
         {
-            std::lock_guard<std::mutex> lock(g_sema_map_mutex);
-            auto it = g_semas.find(sid);
-            if (it == g_semas.end())
+            setReturnS32(ctx, KE_UNKNOWN_SEMID);
+            return;
+        }
+        EeSyncRuntimeState &syncState =
+            runtime->eeSyncRuntimeState();
+        {
+            std::lock_guard<std::mutex> lock(
+                syncState.semaMapMutex);
+            auto it = syncState.semas.find(sid);
+            if (it == syncState.semas.end())
             {
                 setReturnS32(ctx, KE_UNKNOWN_SEMID);
                 return;
             }
             sema = it->second;
-            g_semas.erase(it);
-            if (sid < g_nextSemaId)
+            syncState.semas.erase(it);
+            if (sid < syncState.nextSemaId)
             {
-                g_nextSemaId = sid;
+                syncState.nextSemaId = sid;
             }
         }
 
@@ -293,7 +306,7 @@ namespace ps2_syscalls
         bool reschedule)
     {
         int sid = static_cast<int>(getRegU32(ctx, 4));
-        auto sema = lookupSemaInfo(sid);
+        auto sema = lookupSemaInfo(runtime, sid);
         if (!sema)
         {
             setReturnS32(ctx, KE_UNKNOWN_SEMID);
@@ -368,7 +381,7 @@ namespace ps2_syscalls
     void WaitSema(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
         int sid = static_cast<int>(getRegU32(ctx, 4));
-        auto sema = lookupSemaInfo(sid);
+        auto sema = lookupSemaInfo(runtime, sid);
         if (!sema)
         {
             setReturnS32(ctx, KE_UNKNOWN_SEMID);
@@ -539,7 +552,7 @@ namespace ps2_syscalls
     void PollSema(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
         int sid = static_cast<int>(getRegU32(ctx, 4));
-        auto sema = lookupSemaInfo(sid);
+        auto sema = lookupSemaInfo(runtime, sid);
         if (!sema)
         {
             setReturnS32(ctx, KE_UNKNOWN_SEMID);
@@ -571,7 +584,7 @@ namespace ps2_syscalls
         int sid = static_cast<int>(getRegU32(ctx, 4));
         uint32_t statusAddr = getRegU32(ctx, 5);
 
-        auto sema = lookupSemaInfo(sid);
+        auto sema = lookupSemaInfo(runtime, sid);
         if (!sema)
         {
             setReturnS32(ctx, raw ? KE_ERROR : KE_UNKNOWN_SEMID);
@@ -613,6 +626,12 @@ namespace ps2_syscalls
 
     void CreateEventFlag(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
+        if (!runtime)
+        {
+            setReturnS32(ctx, KE_ERROR);
+            return;
+        }
+
         uint32_t paramAddr = getRegU32(ctx, 4); // $a0
         const uint32_t *param = reinterpret_cast<const uint32_t *>(getConstMemPtr(rdram, paramAddr));
 
@@ -626,10 +645,13 @@ namespace ps2_syscalls
         }
 
         int id = 0;
+        EeSyncRuntimeState &syncState =
+            runtime->eeSyncRuntimeState();
         {
-            std::lock_guard<std::mutex> mapLock(g_event_flag_map_mutex);
-            id = g_nextEventFlagId++;
-            g_eventFlags[id] = info;
+            std::lock_guard<std::mutex> mapLock(
+                syncState.eventFlagMapMutex);
+            id = syncState.nextEventFlagId++;
+            syncState.eventFlags[id] = info;
         }
         setReturnS32(ctx, id);
     }
@@ -638,16 +660,24 @@ namespace ps2_syscalls
     {
         int eid = static_cast<int>(getRegU32(ctx, 4));
         std::shared_ptr<EventFlagInfo> info;
+        if (!runtime)
         {
-            std::lock_guard<std::mutex> mapLock(g_event_flag_map_mutex);
-            auto it = g_eventFlags.find(eid);
-            if (it == g_eventFlags.end())
+            setReturnS32(ctx, KE_UNKNOWN_EVFID);
+            return;
+        }
+        EeSyncRuntimeState &syncState =
+            runtime->eeSyncRuntimeState();
+        {
+            std::lock_guard<std::mutex> mapLock(
+                syncState.eventFlagMapMutex);
+            auto it = syncState.eventFlags.find(eid);
+            if (it == syncState.eventFlags.end())
             {
                 setReturnS32(ctx, KE_UNKNOWN_EVFID);
                 return;
             }
             info = it->second;
-            g_eventFlags.erase(it);
+            syncState.eventFlags.erase(it);
         }
 
         if (!info)
@@ -668,7 +698,7 @@ namespace ps2_syscalls
     {
         int eid = static_cast<int>(getRegU32(ctx, 4));
         uint32_t bits = getRegU32(ctx, 5);
-        auto info = lookupEventFlagInfo(eid);
+        auto info = lookupEventFlagInfo(runtime, eid);
         if (!info)
         {
             setReturnS32(ctx, KE_UNKNOWN_EVFID);
@@ -717,7 +747,7 @@ namespace ps2_syscalls
     {
         int eid = static_cast<int>(getRegU32(ctx, 4));
         uint32_t bits = getRegU32(ctx, 5);
-        auto info = lookupEventFlagInfo(eid);
+        auto info = lookupEventFlagInfo(runtime, eid);
         if (!info)
         {
             setReturnS32(ctx, KE_UNKNOWN_EVFID);
@@ -756,7 +786,7 @@ namespace ps2_syscalls
             return;
         }
 
-        auto info = lookupEventFlagInfo(eid);
+        auto info = lookupEventFlagInfo(runtime, eid);
         if (!info)
         {
             setReturnS32(ctx, KE_UNKNOWN_EVFID);
@@ -969,7 +999,7 @@ namespace ps2_syscalls
             return;
         }
 
-        auto info = lookupEventFlagInfo(eid);
+        auto info = lookupEventFlagInfo(runtime, eid);
         if (!info)
         {
             setReturnS32(ctx, KE_UNKNOWN_EVFID);
@@ -1039,7 +1069,7 @@ namespace ps2_syscalls
             int32_t reserved2;
         };
 
-        auto info = lookupEventFlagInfo(eid);
+        auto info = lookupEventFlagInfo(runtime, eid);
         if (!info)
         {
             setReturnS32(ctx, KE_UNKNOWN_EVFID);

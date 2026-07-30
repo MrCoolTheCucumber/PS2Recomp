@@ -215,11 +215,14 @@ namespace ps2_syscalls
         return snapshots;
     }
 
-    static void notifyThreadWaitObject(int waitType, int waitId)
+    static void notifyThreadWaitObject(
+        PS2Runtime *runtime,
+        int waitType,
+        int waitId)
     {
         if (waitType == TSW_SEMA)
         {
-            auto sema = lookupSemaInfo(waitId);
+            auto sema = lookupSemaInfo(runtime, waitId);
             if (sema)
             {
                 sema->cv.notify_all();
@@ -227,7 +230,8 @@ namespace ps2_syscalls
         }
         else if (waitType == TSW_EVENT)
         {
-            auto eventFlag = lookupEventFlagInfo(waitId);
+            auto eventFlag =
+                lookupEventFlagInfo(runtime, waitId);
             if (eventFlag)
             {
                 eventFlag->cv.notify_all();
@@ -892,7 +896,7 @@ namespace ps2_syscalls
         bool transitioned = false;
         if (waitType == TSW_SEMA)
         {
-            auto sema = lookupSemaInfo(waitId);
+            auto sema = lookupSemaInfo(runtime, waitId);
             if (sema)
             {
                 std::lock_guard<std::mutex> semaLock(sema->m);
@@ -915,7 +919,8 @@ namespace ps2_syscalls
         }
         else if (waitType == TSW_EVENT)
         {
-            auto eventFlag = lookupEventFlagInfo(waitId);
+            auto eventFlag =
+                lookupEventFlagInfo(runtime, waitId);
             if (eventFlag)
             {
                 std::lock_guard<std::mutex> eventLock(
@@ -953,7 +958,7 @@ namespace ps2_syscalls
         }
 
         info->cv.notify_all();
-        notifyThreadWaitObject(waitType, waitId);
+        notifyThreadWaitObject(runtime, waitType, waitId);
         setReturnS32(ctx, tid);
 
         if (reschedule)
@@ -1544,7 +1549,7 @@ namespace ps2_syscalls
 
         if (waitType == TSW_SEMA)
         {
-            auto sema = lookupSemaInfo(waitId);
+            auto sema = lookupSemaInfo(runtime, waitId);
             if (sema)
             {
                 std::lock_guard<std::mutex> semaLock(sema->m);
@@ -1560,7 +1565,8 @@ namespace ps2_syscalls
         }
         else if (waitType == TSW_EVENT)
         {
-            auto eventFlag = lookupEventFlagInfo(waitId);
+            auto eventFlag =
+                lookupEventFlagInfo(runtime, waitId);
             if (eventFlag)
             {
                 std::lock_guard<std::mutex> eventLock(
@@ -1590,7 +1596,7 @@ namespace ps2_syscalls
         }
 
         info->cv.notify_all();
-        notifyThreadWaitObject(waitType, waitId);
+        notifyThreadWaitObject(runtime, waitType, waitId);
         setReturnS32(ctx, tid);
         if (reschedule)
         {

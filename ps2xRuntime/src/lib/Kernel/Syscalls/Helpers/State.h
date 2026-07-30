@@ -5,6 +5,7 @@
 #include <thread>
 
 #include "AlarmRuntimeState.h"
+#include "SyncRuntimeState.h"
 #include "ThreadRuntimeState.h"
 
 inline std::unordered_map<int, FILE *> g_fileDescriptors;
@@ -133,31 +134,6 @@ struct ee_sema_t
     uint32_t option;
 };
 
-struct SemaInfo
-{
-    int count = 0;
-    int maxCount = 0;
-    int initCount = 0;
-    uint32_t attr = 0;
-    uint32_t option = 0;
-    int waiters = 0;
-    bool deleted = false;
-    std::mutex m;
-    std::condition_variable cv;
-};
-
-struct EventFlagInfo
-{
-    uint32_t attr = 0;
-    uint32_t option = 0;
-    uint32_t initBits = 0;
-    uint32_t bits = 0;
-    int waiters = 0;
-    bool deleted = false;
-    std::mutex m;
-    std::condition_variable cv;
-};
-
 struct io_stat_t
 {
     uint32_t mode;
@@ -176,12 +152,6 @@ static constexpr uint32_t kFioSoIROth = 0x0004;
 static constexpr uint32_t kFioSoIWOth = 0x0002;
 static constexpr uint32_t kFioSoIXOth = 0x0001;
 
-inline std::unordered_map<int, std::shared_ptr<SemaInfo>> g_semas;
-inline int g_nextSemaId = 0;
-inline std::mutex g_sema_map_mutex;
-inline std::unordered_map<int, std::shared_ptr<EventFlagInfo>> g_eventFlags;
-inline int g_nextEventFlagId = 1;
-inline std::mutex g_event_flag_map_mutex;
 inline std::mutex g_fd_mutex;
 
 static void registerHostThread(
