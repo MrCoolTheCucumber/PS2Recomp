@@ -964,7 +964,11 @@ namespace ps2_syscalls
         auto info = lookupThreadInfo(tid);
         if (!info)
         {
-            setReturnS32(ctx, KE_UNKNOWN_THID);
+            // The raw EE wake syscall collapses a deleted ID to generic -1;
+            // the ordinary syscall retains the kernel's unknown-ID result.
+            setReturnS32(
+                ctx,
+                reschedule ? KE_UNKNOWN_THID : KE_ERROR);
             return;
         }
 

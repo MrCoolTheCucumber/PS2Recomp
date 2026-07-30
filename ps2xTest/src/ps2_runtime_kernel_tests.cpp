@@ -61,6 +61,8 @@ namespace
     constexpr uint32_t K_SLEEP_RETURN_ADDR = 0x1830u;
     constexpr uint32_t K_WAITSUSPEND_STAGE_ADDR = 0x1840u;
     constexpr uint32_t K_WAITSUSPEND_RETURN_ADDR = 0x1844u;
+    constexpr uint32_t K_ID_REUSE_STAGE_ADDR = 0x1850u;
+    constexpr uint32_t K_ID_REUSE_RETURN_ADDR = 0x1854u;
 
     struct EeThreadStatus
     {
@@ -279,6 +281,23 @@ namespace
             K_WAITSUSPEND_RETURN_ADDR,
             static_cast<uint32_t>(getRegS32(*ctx, 2)));
         writeGuestU32(rdram, K_WAITSUSPEND_STAGE_ADDR, 2u);
+        ctx->pc = 0u;
+    }
+
+    void idReuseSleepHandler(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        if (!rdram || !ctx)
+        {
+            return;
+        }
+
+        writeGuestU32(rdram, K_ID_REUSE_STAGE_ADDR, 1u);
+        SleepThread(rdram, ctx, runtime);
+        writeGuestU32(
+            rdram,
+            K_ID_REUSE_RETURN_ADDR,
+            static_cast<uint32_t>(getRegS32(*ctx, 2)));
+        writeGuestU32(rdram, K_ID_REUSE_STAGE_ADDR, 2u);
         ctx->pc = 0u;
     }
 
@@ -1118,6 +1137,235 @@ void register_ps2_runtime_kernel_tests()
                 getRegS32(env.ctx, 2),
                 tid,
                 "DeleteThread should remove the resumed sleep worker");
+        });
+
+        tc.Run("thread ids wrap and stale numeric ids address their replacement", [](TestCase &t)
+        {
+            notifyRuntimeStop();
+            TestEnv env;
+
+            constexpr uint32_t kThreadEntry = 0x00255000u;
+            constexpr uint32_t kStackAddr = 0x0030A000u;
+            env.runtime.registerFunction(kThreadEntry, &idReuseSleepHandler);
+            writeGuestU32(env.rdram.data(), K_ID_REUSE_STAGE_ADDR, 0u);
+            writeGuestU32(env.rdram.data(), K_ID_REUSE_RETURN_ADDR, 0u);
+
+            setRegU32(env.ctx, 4, 0u);
+            setRegU32(env.ctx, 5, 40u);
+            ChangeThreadPriority(
+                env.rdram.data(), &env.ctx, &env.runtime);
+
+            const uint32_t threadParam[9] = {
+                0u,
+                kThreadEntry,
+                kStackAddr,
+                0x00001000u,
+                0u,
+                30u,
+                0u,
+                0u,
+                0u
+            };
+            writeGuestWords(
+                env.rdram.data(),
+                K_PARAM_ADDR,
+                threadParam,
+                std::size(threadParam));
+
+            auto createThread = [&]()
+            {
+                R5900Context createCtx{};
+                setRegU32(createCtx, 4, K_PARAM_ADDR);
+                CreateThread(
+                    env.rdram.data(), &createCtx, &env.runtime);
+                return getRegS32(createCtx, 2);
+            };
+            auto deleteThread = [&](int32_t tid)
+            {
+                R5900Context deleteCtx{};
+                setRegU32(
+                    deleteCtx, 4, static_cast<uint32_t>(tid));
+                DeleteThread(
+                    env.rdram.data(), &deleteCtx, &env.runtime);
+                return getRegS32(deleteCtx, 2);
+            };
+
+            const int32_t firstTid = createThread();
+            const int32_t keeperTid = createThread();
+            t.Equals(firstTid, 2, "the first allocatable thread id should be 2");
+            t.Equals(keeperTid, 3, "the next allocatable thread id should be 3");
+            t.Equals(
+                deleteThread(firstTid),
+                firstTid,
+                "deleting the first dormant thread should return id 2");
+
+            R5900Context staleBeforeReuseCtx{};
+            setRegU32(
+                staleBeforeReuseCtx,
+                4,
+                static_cast<uint32_t>(firstTid));
+            iWakeupThread(
+                env.rdram.data(),
+                &staleBeforeReuseCtx,
+                &env.runtime);
+            t.Equals(
+                getRegS32(staleBeforeReuseCtx, 2),
+                KE_ERROR,
+                "a deleted thread id should reject a raw wake before reuse");
+
+            std::vector<int32_t> dormantIds;
+            dormantIds.reserve(252u);
+            for (int32_t expectedTid = 4;
+                 expectedTid <= 0xFF;
+                 ++expectedTid)
+            {
+                const int32_t tid = createThread();
+                t.Equals(
+                    tid,
+                    expectedTid,
+                    "thread ids should advance through the remaining EE id ring");
+                if (tid > 0)
+                {
+                    dormantIds.push_back(tid);
+                }
+            }
+
+            const int32_t replacementTid = createThread();
+            t.Equals(
+                replacementTid,
+                firstTid,
+                "the allocator should wrap and reuse deleted id 2");
+
+            setRegU32(
+                env.ctx, 4, static_cast<uint32_t>(replacementTid));
+            setRegU32(env.ctx, 5, 0u);
+            StartThread(
+                env.rdram.data(), &env.ctx, &env.runtime);
+            t.Equals(
+                getRegS32(env.ctx, 2),
+                replacementTid,
+                "StartThread should return the replacement id");
+
+            const bool sleeping = waitUntil([&]()
+            {
+                R5900Context statusCtx{};
+                setRegU32(
+                    statusCtx,
+                    4,
+                    static_cast<uint32_t>(replacementTid));
+                setRegU32(statusCtx, 5, K_STATUS_ADDR);
+                ReferThreadStatus(
+                    env.rdram.data(), &statusCtx, &env.runtime);
+                EeThreadStatus status{};
+                std::memcpy(
+                    &status,
+                    env.rdram.data() + K_STATUS_ADDR,
+                    sizeof(status));
+                return readGuestU32(
+                           env.rdram.data(), K_ID_REUSE_STAGE_ADDR) == 1u &&
+                       getRegS32(statusCtx, 2) == THS_WAIT &&
+                       status.waitType == TSW_SLEEP;
+            }, std::chrono::milliseconds(200));
+            t.IsTrue(sleeping, "the replacement thread should block in SleepThread");
+
+            {
+                PS2Runtime::GuestExecutionScope guestExecution(
+                    &env.runtime, &env.ctx);
+                R5900Context staleAfterReuseCtx{};
+                setRegU32(
+                    staleAfterReuseCtx,
+                    4,
+                    static_cast<uint32_t>(firstTid));
+                iWakeupThread(
+                    env.rdram.data(),
+                    &staleAfterReuseCtx,
+                    &env.runtime);
+                t.Equals(
+                    getRegS32(staleAfterReuseCtx, 2),
+                    replacementTid,
+                    "the old numeric id should address its replacement after reuse");
+                t.Equals(
+                    readGuestU32(
+                        env.rdram.data(), K_ID_REUSE_STAGE_ADDR),
+                    1u,
+                    "raw wake through the reused id should not dispatch");
+
+                R5900Context readyStatusCtx{};
+                setRegU32(
+                    readyStatusCtx,
+                    4,
+                    static_cast<uint32_t>(replacementTid));
+                setRegU32(readyStatusCtx, 5, K_STATUS_ADDR);
+                iReferThreadStatus(
+                    env.rdram.data(),
+                    &readyStatusCtx,
+                    &env.runtime);
+                EeThreadStatus readyStatus{};
+                std::memcpy(
+                    &readyStatus,
+                    env.rdram.data() + K_STATUS_ADDR,
+                    sizeof(readyStatus));
+                t.Equals(
+                    getRegS32(readyStatusCtx, 2),
+                    THS_READY,
+                    "raw stale-id wake should make the replacement READY");
+                t.Equals(
+                    readyStatus.status,
+                    THS_READY,
+                    "the replacement should publish READY");
+                t.Equals(
+                    readyStatus.waitType,
+                    0u,
+                    "the replacement wake should clear its sleep reason");
+                t.Equals(
+                    readyStatus.wakeupCount,
+                    0u,
+                    "the replacement wake should not accumulate a count");
+            }
+
+            setRegU32(env.ctx, 4, 0u);
+            setRegU32(env.ctx, 5, 60u);
+            ChangeThreadPriority(
+                env.rdram.data(), &env.ctx, &env.runtime);
+            t.Equals(
+                getRegS32(env.ctx, 2),
+                40,
+                "lowering the main priority should return its previous priority");
+
+            const bool dormant = waitUntil([&]()
+            {
+                R5900Context statusCtx{};
+                setRegU32(
+                    statusCtx,
+                    4,
+                    static_cast<uint32_t>(replacementTid));
+                setRegU32(statusCtx, 5, K_STATUS_ADDR);
+                ReferThreadStatus(
+                    env.rdram.data(), &statusCtx, &env.runtime);
+                return getRegS32(statusCtx, 2) == THS_DORMANT;
+            }, std::chrono::milliseconds(200));
+            t.IsTrue(dormant, "the replacement worker should finish after its wake");
+            t.Equals(
+                readGuestU32(
+                    env.rdram.data(), K_ID_REUSE_RETURN_ADDR),
+                static_cast<uint32_t>(replacementTid),
+                "the replacement SleepThread should return reused id 2");
+            t.Equals(
+                deleteThread(replacementTid),
+                replacementTid,
+                "the dormant replacement should be deletable");
+
+            for (const int32_t tid : dormantIds)
+            {
+                t.Equals(
+                    deleteThread(tid),
+                    tid,
+                    "every unreused dormant id should remain independently deletable");
+            }
+            t.Equals(
+                deleteThread(keeperTid),
+                keeperTid,
+                "the original keeper thread should remain independently deletable");
         });
 
         tc.Run("semaphore EE layout covers poll, signal overflow, and status", [](TestCase &t)
