@@ -10,6 +10,7 @@
 #include <cstring>
 #include <sstream>
 #include <thread>
+#include <utility>
 #include <vector>
 
 // g_currentThreadId is an `inline thread_local int` defined in the kernel's
@@ -69,6 +70,8 @@ namespace
     constexpr uint32_t K_EXIT_DELETE_THREAD_STAGE_ADDR = 0x1884u;
     constexpr uint32_t K_EXIT_THREAD_ID_ADDR = 0x1888u;
     constexpr uint32_t K_EXIT_DELETE_THREAD_ID_ADDR = 0x188Cu;
+    constexpr uint32_t K_CONTROL_EVENT_PARAM_ADDR = 0x1890u;
+    constexpr uint32_t K_CONTROL_SEMA_PARAM_ADDR = 0x18A0u;
 
     struct EeThreadStatus
     {
@@ -371,6 +374,42 @@ namespace
         writeGuestU32(rdram, K_EXIT_DELETE_THREAD_STAGE_ADDR, 1u);
         ExitDeleteThread(rdram, ctx, runtime);
         writeGuestU32(rdram, K_EXIT_DELETE_THREAD_STAGE_ADDR, 99u);
+    }
+
+    void controlSleepWaitHandler(
+        uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        SleepThread(rdram, ctx, runtime);
+        ctx->pc = 0u;
+    }
+
+    void controlSemaWaitHandler(
+        uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        const uint32_t sid = ::getRegU32(ctx, 4);
+        setRegU32(*ctx, 4, sid);
+        WaitSema(rdram, ctx, runtime);
+        ctx->pc = 0u;
+    }
+
+    void controlEventWaitHandler(
+        uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        const uint32_t eid = ::getRegU32(ctx, 4);
+        setRegU32(*ctx, 4, eid);
+        setRegU32(*ctx, 5, 1u);
+        setRegU32(*ctx, 6, 1u); // WEF_OR
+        setRegU32(*ctx, 7, 0u);
+        WaitEventFlag(rdram, ctx, runtime);
+        ctx->pc = 0u;
+    }
+
+    void controlSuspendWaitHandler(
+        uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        setRegU32(*ctx, 4, 0u);
+        SuspendThread(rdram, ctx, runtime);
+        ctx->pc = 0u;
     }
 
     void alarmNoopHandler(uint8_t *, R5900Context *ctx, PS2Runtime *)
@@ -2767,6 +2806,364 @@ void register_ps2_runtime_kernel_tests()
                 deleteThread(exitDeleteTid),
                 KE_ERROR,
                 "deleting an ExitDeleteThread id should return generic -1");
+
+            notifyRuntimeStop();
+        });
+
+        tc.Run("debug controls remain bounded across every EE kernel wait state", [](TestCase &t)
+        {
+            enum class WaitKind
+            {
+                Sleep,
+                Sema,
+                Event,
+                Suspend,
+                WaitSuspend,
+            };
+
+            struct WaitExpectation
+            {
+                WaitKind kind;
+                const char *name;
+                int32_t status;
+                uint32_t waitType;
+            };
+
+            constexpr std::array<WaitExpectation, 5u> expectations{{
+                {WaitKind::Sleep, "sleep", THS_WAIT, TSW_SLEEP},
+                {WaitKind::Sema, "semaphore", THS_WAIT, TSW_SEMA},
+                {WaitKind::Event, "event", THS_WAIT, TSW_EVENT},
+                {WaitKind::Suspend, "suspend", THS_SUSPEND, 0u},
+                {WaitKind::WaitSuspend, "wait-suspend", THS_WAITSUSPEND, TSW_SLEEP},
+            }};
+
+            constexpr uint32_t kSleepEntry = 0x00259000u;
+            constexpr uint32_t kSemaEntry = 0x00259100u;
+            constexpr uint32_t kEventEntry = 0x00259200u;
+            constexpr uint32_t kSuspendEntry = 0x00259300u;
+
+            auto readThreadStatus =
+                [&](TestEnv &env, int32_t tid)
+                {
+                    EeThreadStatus status{};
+                    std::memset(
+                        env.rdram.data() + K_STATUS_ADDR,
+                        0,
+                        sizeof(status));
+                    R5900Context statusCtx{};
+                    setRegU32(
+                        statusCtx,
+                        4,
+                        static_cast<uint32_t>(tid));
+                    setRegU32(statusCtx, 5, K_STATUS_ADDR);
+                    ReferThreadStatus(
+                        env.rdram.data(),
+                        &statusCtx,
+                        &env.runtime);
+                    std::memcpy(
+                        &status,
+                        env.rdram.data() + K_STATUS_ADDR,
+                        sizeof(status));
+                    return std::pair{
+                        getRegS32(statusCtx, 2),
+                        status};
+                };
+
+            auto startWaiter =
+                [&](TestEnv &env, const WaitExpectation &expectation)
+                {
+                    env.runtime.registerFunction(
+                        kSleepEntry, &controlSleepWaitHandler);
+                    env.runtime.registerFunction(
+                        kSemaEntry, &controlSemaWaitHandler);
+                    env.runtime.registerFunction(
+                        kEventEntry, &controlEventWaitHandler);
+                    env.runtime.registerFunction(
+                        kSuspendEntry, &controlSuspendWaitHandler);
+
+                    R5900Context priorityCtx{};
+                    setRegU32(priorityCtx, 4, 0u);
+                    setRegU32(priorityCtx, 5, 40u);
+                    ChangeThreadPriority(
+                        env.rdram.data(),
+                        &priorityCtx,
+                        &env.runtime);
+
+                    uint32_t entry = kSleepEntry;
+                    uint32_t argument = 0u;
+                    if (expectation.kind == WaitKind::Sema)
+                    {
+                        const uint32_t semaParam[6] = {
+                            0u,
+                            1u,
+                            0u,
+                            0u,
+                            0u,
+                            0u,
+                        };
+                        writeGuestWords(
+                            env.rdram.data(),
+                            K_CONTROL_SEMA_PARAM_ADDR,
+                            semaParam,
+                            std::size(semaParam));
+                        R5900Context createCtx{};
+                        setRegU32(
+                            createCtx,
+                            4,
+                            K_CONTROL_SEMA_PARAM_ADDR);
+                        CreateSema(
+                            env.rdram.data(),
+                            &createCtx,
+                            &env.runtime);
+                        argument = static_cast<uint32_t>(
+                            getRegS32(createCtx, 2));
+                        entry = kSemaEntry;
+                    }
+                    else if (expectation.kind == WaitKind::Event)
+                    {
+                        const uint32_t eventParam[3] = {
+                            0u,
+                            0u,
+                            0u,
+                        };
+                        writeGuestWords(
+                            env.rdram.data(),
+                            K_CONTROL_EVENT_PARAM_ADDR,
+                            eventParam,
+                            std::size(eventParam));
+                        R5900Context createCtx{};
+                        setRegU32(
+                            createCtx,
+                            4,
+                            K_CONTROL_EVENT_PARAM_ADDR);
+                        CreateEventFlag(
+                            env.rdram.data(),
+                            &createCtx,
+                            &env.runtime);
+                        argument = static_cast<uint32_t>(
+                            getRegS32(createCtx, 2));
+                        entry = kEventEntry;
+                    }
+                    else if (expectation.kind == WaitKind::Suspend)
+                    {
+                        entry = kSuspendEntry;
+                    }
+
+                    const uint32_t threadParam[9] = {
+                        0u,
+                        entry,
+                        0x00319000u,
+                        0x00001000u,
+                        0u,
+                        30u,
+                        0u,
+                        0u,
+                        0u,
+                    };
+                    writeGuestWords(
+                        env.rdram.data(),
+                        K_PARAM_ADDR,
+                        threadParam,
+                        std::size(threadParam));
+
+                    R5900Context createCtx{};
+                    setRegU32(createCtx, 4, K_PARAM_ADDR);
+                    CreateThread(
+                        env.rdram.data(),
+                        &createCtx,
+                        &env.runtime);
+                    const int32_t tid =
+                        getRegS32(createCtx, 2);
+
+                    R5900Context startCtx{};
+                    setRegU32(
+                        startCtx,
+                        4,
+                        static_cast<uint32_t>(tid));
+                    setRegU32(startCtx, 5, argument);
+                    StartThread(
+                        env.rdram.data(),
+                        &startCtx,
+                        &env.runtime);
+
+                    if (expectation.kind ==
+                        WaitKind::WaitSuspend)
+                    {
+                        const bool sleeping = waitUntil(
+                            [&]()
+                            {
+                                const auto [result, status] =
+                                    readThreadStatus(env, tid);
+                                return result == THS_WAIT &&
+                                       status.status == THS_WAIT &&
+                                       status.waitType == TSW_SLEEP;
+                            },
+                            std::chrono::milliseconds(500));
+                        t.IsTrue(
+                            sleeping,
+                            std::string(expectation.name) +
+                                " worker should enter WAIT before suspension");
+                        if (sleeping)
+                        {
+                            R5900Context suspendCtx{};
+                            setRegU32(
+                                suspendCtx,
+                                4,
+                                static_cast<uint32_t>(tid));
+                            SuspendThread(
+                                env.rdram.data(),
+                                &suspendCtx,
+                                &env.runtime);
+                        }
+                    }
+                    return tid;
+                };
+
+            auto waitForExpectedState =
+                [&](TestEnv &env,
+                    int32_t tid,
+                    const WaitExpectation &expectation)
+                {
+                    return waitUntil(
+                        [&]()
+                        {
+                            const auto [result, status] =
+                                readThreadStatus(env, tid);
+                            return result == expectation.status &&
+                                   status.status == expectation.status &&
+                                   status.waitType ==
+                                       expectation.waitType;
+                        },
+                        std::chrono::milliseconds(500));
+                };
+
+            auto finishWorkers =
+                [&](PS2Runtime &runtime, const std::string &label)
+                {
+                    bool finished = waitUntil(
+                        []()
+                        {
+                            return g_activeThreads.load(
+                                       std::memory_order_acquire) ==
+                                   0;
+                        },
+                        std::chrono::milliseconds(500));
+                    if (!finished)
+                    {
+                        runtime.requestStop();
+                        notifyRuntimeStop();
+                        finished = waitUntil(
+                            []()
+                            {
+                                return g_activeThreads.load(
+                                           std::memory_order_acquire) ==
+                                       0;
+                            },
+                            std::chrono::milliseconds(500));
+                    }
+                    t.IsTrue(
+                        finished,
+                        label +
+                            " should retire every guest host worker");
+                    if (finished)
+                    {
+                        joinAllGuestHostThreads();
+                    }
+                    else
+                    {
+                        detachAllGuestHostThreads();
+                    }
+                };
+
+            for (const WaitExpectation &expectation :
+                 expectations)
+            {
+                notifyRuntimeStop();
+                TestEnv env;
+                const int32_t tid =
+                    startWaiter(env, expectation);
+                const bool waiting =
+                    waitForExpectedState(
+                        env, tid, expectation);
+                t.IsTrue(
+                    waiting,
+                    std::string(expectation.name) +
+                        " worker should reach its expected state");
+
+                if (waiting)
+                {
+                    t.IsTrue(
+                        env.runtime.debugPause(
+                            std::chrono::milliseconds(200)),
+                        std::string("debug pause should quiesce a ") +
+                            expectation.name + " waiter");
+                    const auto [pausedResult, pausedStatus] =
+                        readThreadStatus(env, tid);
+                    t.Equals(
+                        pausedResult,
+                        expectation.status,
+                        std::string("debug pause should preserve the ") +
+                            expectation.name + " status result");
+                    t.Equals(
+                        pausedStatus.status,
+                        expectation.status,
+                        std::string("debug pause should preserve the ") +
+                            expectation.name + " state");
+                    t.Equals(
+                        pausedStatus.waitType,
+                        expectation.waitType,
+                        std::string("debug pause should preserve the ") +
+                            expectation.name + " wait reason");
+                    env.runtime.debugResume();
+                }
+
+                env.runtime.requestStop();
+                t.IsTrue(
+                    env.runtime.isStopRequested(),
+                    std::string(
+                        "runtime stop/debugger shutdown should publish while ") +
+                        expectation.name + " is waiting");
+                finishWorkers(
+                    env.runtime,
+                    std::string("runtime stop/debugger shutdown from ") +
+                        expectation.name);
+            }
+
+            for (const WaitExpectation &expectation :
+                 expectations)
+            {
+                notifyRuntimeStop();
+                TestEnv env;
+                const int32_t tid =
+                    startWaiter(env, expectation);
+                const bool waiting =
+                    waitForExpectedState(
+                        env, tid, expectation);
+                t.IsTrue(
+                    waiting,
+                    std::string(expectation.name) +
+                        " reset worker should reach its expected state");
+
+                notifyRuntimeStop();
+                t.IsFalse(
+                    env.runtime.isStopRequested(),
+                    std::string(
+                        "kernel reset should not become runtime stop for ") +
+                        expectation.name);
+                finishWorkers(
+                    env.runtime,
+                    std::string("kernel reset from ") +
+                        expectation.name);
+
+                const auto [resetResult, resetStatus] =
+                    readThreadStatus(env, tid);
+                (void)resetStatus;
+                t.Equals(
+                    resetResult,
+                    KE_UNKNOWN_THID,
+                    std::string("kernel reset should remove the ") +
+                        expectation.name + " thread object");
+            }
 
             notifyRuntimeStop();
         });
