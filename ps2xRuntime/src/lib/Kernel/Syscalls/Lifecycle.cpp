@@ -209,6 +209,8 @@ namespace ps2_syscalls
                 state.loggedTraceSignatures.clear();
             }
         }
+
+        ps2_stubs::resetSifState(runtime);
     }
 
     void joinAllGuestHostThreads(PS2Runtime *runtime)

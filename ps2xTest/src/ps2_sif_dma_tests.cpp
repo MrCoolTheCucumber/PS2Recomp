@@ -13,11 +13,6 @@
 #include <string_view>
 #include <vector>
 
-namespace ps2_stubs
-{
-    void resetSifState();
-}
-
 namespace
 {
     constexpr int KE_OK = 0;
@@ -30,7 +25,7 @@ namespace
 
         TestEnv() : rdram(PS2_RAM_SIZE, 0u)
         {
-            ps2_stubs::resetSifState();
+            ps2_stubs::resetSifState(&runtime);
             std::memset(&ctx, 0, sizeof(ctx));
             if (!runtime.memory().initialize())
             {

@@ -29,11 +29,6 @@ namespace
     uint32_t g_cdStreamingEndLbn = 0xFFFFFFFFu;
     bool g_cdInitialized = false;
 
-    constexpr uint32_t kIopHeapBase = 0x01A00000;
-    constexpr uint32_t kIopHeapLimit = 0x01F00000;
-    constexpr uint32_t kIopHeapAlign = 64;
-    uint32_t g_iopHeapNext = kIopHeapBase;
-
     std::string toLowerAscii(std::string value)
     {
         std::transform(value.begin(), value.end(), value.begin(),

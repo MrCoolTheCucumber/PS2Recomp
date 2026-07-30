@@ -56,6 +56,7 @@ struct EeRpcRuntimeState;
 namespace ps2_stubs
 {
     class MpegRuntimeState;
+    struct SifRuntimeState;
 }
 
 struct PS2RuntimeConfiguration
@@ -1262,6 +1263,9 @@ public:
     const EeKernelRuntimeState &eeKernelRuntimeState() const;
     EeRpcRuntimeState &eeRpcRuntimeState();
     const EeRpcRuntimeState &eeRpcRuntimeState() const;
+    ps2_stubs::SifRuntimeState &sifRuntimeState();
+    const ps2_stubs::SifRuntimeState &
+    sifRuntimeState() const;
     ps2_stubs::MpegRuntimeState &mpegRuntimeState();
     const ps2_stubs::MpegRuntimeState &mpegRuntimeState() const;
     int activeEeHostThreadCount() const;
@@ -1937,6 +1941,8 @@ private:
         m_eeKernelRuntimeState;
     std::unique_ptr<EeRpcRuntimeState>
         m_eeRpcRuntimeState;
+    std::unique_ptr<ps2_stubs::SifRuntimeState>
+        m_sifRuntimeState;
     // Declared last so the alarm worker's fallback join runs before other
     // runtime members are destroyed if normal stop cleanup was interrupted.
     std::unique_ptr<EeAlarmRuntimeState> m_eeAlarmRuntimeState;

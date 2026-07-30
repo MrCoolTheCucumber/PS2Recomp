@@ -1,5 +1,6 @@
 #include "Common.h"
 #include "SIF.h"
+#include "Helpers/SifRuntimeState.h"
 #include "../Syscalls/RPC.h"
 #include "../../ps2_iop_transport.h"
 #include "runtime/ps2_address.h"
@@ -65,41 +66,12 @@ namespace ps2_stubs
             uint32_t iopOffset = 0u;
         };
 
-        std::mutex g_sifDmaTransferMutex;
-        uint32_t g_nextSifDmaTransferId = 1u;
-        std::mutex g_sifCmdStateMutex;
-        std::mutex g_sifHeapMutex;
-        std::unordered_map<uint32_t, uint32_t> g_sifRegs;
-        std::unordered_map<uint32_t, uint32_t> g_sifSregs;
-        std::unordered_map<uint32_t, uint32_t> g_sifCmdHandlers;
-        std::map<uint32_t, uint32_t> g_sifHeapAllocations;
-        uint32_t g_sifCmdBuffer = 0u;
-        uint32_t g_sifSysCmdBuffer = 0u;
-        bool g_sifCmdInitialized = false;
-        uint32_t g_sifGetRegLogCount = 0u;
-        uint32_t g_sifSetRegLogCount = 0u;
-
-        constexpr uint32_t kSifRegBootStatus = 0x4u;
-        constexpr uint32_t kSifRegMainAddr = 0x80000000u;
-        constexpr uint32_t kSifRegSubAddr = 0x80000001u;
-        constexpr uint32_t kSifRegMsCom = 0x80000002u;
-        constexpr uint32_t kSifBootReadyMask = 0x00020000u;
-
-        void seedDefaultSifRegsLocked()
+        SifRuntimeState *getSifRuntimeState(
+            PS2Runtime *runtime)
         {
-            g_sifRegs.clear();
-            g_sifSregs.clear();
-            g_sifCmdHandlers.clear();
-            g_sifCmdBuffer = 0u;
-            g_sifSysCmdBuffer = 0u;
-            g_sifCmdInitialized = false;
-            g_sifGetRegLogCount = 0u;
-            g_sifSetRegLogCount = 0u;
-
-            g_sifRegs[kSifRegBootStatus] = kSifBootReadyMask;
-            g_sifRegs[kSifRegMainAddr] = 0u;
-            g_sifRegs[kSifRegSubAddr] = 0u;
-            g_sifRegs[kSifRegMsCom] = 0u;
+            return runtime
+                ? &runtime->sifRuntimeState()
+                : nullptr;
         }
 
         bool shouldTraceSifReg(uint32_t reg)
@@ -117,32 +89,36 @@ namespace ps2_stubs
             }
         }
 
-        struct SifStateInitializer
+        bool claimSifWarning(
+            std::atomic<uint32_t> &counter)
         {
-            SifStateInitializer()
-            {
-                std::lock_guard<std::mutex> lock(g_sifCmdStateMutex);
-                seedDefaultSifRegsLocked();
-            }
-        } g_sifStateInitializer;
+            return counter.fetch_add(
+                       1u, std::memory_order_relaxed) <
+                   32u;
+        }
 
-        uint32_t allocateSifDmaTransferId()
+        uint32_t allocateSifDmaTransferId(
+            SifRuntimeState &state)
         {
-            std::lock_guard<std::mutex> lock(g_sifDmaTransferMutex);
-            uint32_t id = g_nextSifDmaTransferId++;
+            std::lock_guard<std::mutex> lock(
+                state.dmaTransferMutex);
+            uint32_t id = state.nextDmaTransferId++;
             if (id == 0u)
             {
-                id = g_nextSifDmaTransferId++;
+                id = state.nextDmaTransferId++;
             }
             return id;
         }
 
         uint32_t alignIopHeapSize(uint32_t size)
         {
-            return (size + (kIopHeapAlign - 1u)) & ~(kIopHeapAlign - 1u);
+            return (size + (kSifIopHeapAlign - 1u)) &
+                   ~(kSifIopHeapAlign - 1u);
         }
 
-        uint32_t allocateSifHeapBlock(uint32_t requestSize)
+        uint32_t allocateSifHeapBlock(
+            SifRuntimeState &state,
+            uint32_t requestSize)
         {
             const uint32_t alignedSize = alignIopHeapSize(requestSize);
             if (alignedSize == 0u)
@@ -150,9 +126,11 @@ namespace ps2_stubs
                 return 0u;
             }
 
-            std::lock_guard<std::mutex> lock(g_sifHeapMutex);
-            uint32_t candidate = kIopHeapBase;
-            for (const auto &[addr, size] : g_sifHeapAllocations)
+            std::lock_guard<std::mutex> lock(
+                state.heapMutex);
+            uint32_t candidate = kSifIopHeapBase;
+            for (const auto &[addr, size] :
+                 state.heapAllocations)
             {
                 if (candidate + alignedSize <= addr)
                 {
@@ -166,38 +144,49 @@ namespace ps2_stubs
                 }
             }
 
-            if (candidate < kIopHeapBase || candidate + alignedSize > kIopHeapLimit)
+            if (candidate < kSifIopHeapBase ||
+                candidate + alignedSize >
+                    kSifIopHeapLimit)
             {
                 return 0u;
             }
 
-            g_sifHeapAllocations[candidate] = alignedSize;
-            g_iopHeapNext = candidate + alignedSize;
+            state.heapAllocations[candidate] =
+                alignedSize;
+            state.iopHeapNext =
+                candidate + alignedSize;
             return candidate;
         }
 
-        bool freeSifHeapBlock(uint32_t addr)
+        bool freeSifHeapBlock(
+            SifRuntimeState &state,
+            uint32_t addr)
         {
-            std::lock_guard<std::mutex> lock(g_sifHeapMutex);
-            const auto it = g_sifHeapAllocations.find(addr);
-            if (it == g_sifHeapAllocations.end())
+            std::lock_guard<std::mutex> lock(
+                state.heapMutex);
+            const auto it =
+                state.heapAllocations.find(addr);
+            if (it == state.heapAllocations.end())
             {
                 return false;
             }
 
-            g_sifHeapAllocations.erase(it);
-            if (g_sifHeapAllocations.empty())
+            state.heapAllocations.erase(it);
+            if (state.heapAllocations.empty())
             {
-                g_iopHeapNext = kIopHeapBase;
+                state.iopHeapNext =
+                    kSifIopHeapBase;
             }
             return true;
         }
 
-        void resetSifHeapState()
+        void resetSifHeapState(
+            SifRuntimeState &state)
         {
-            std::lock_guard<std::mutex> lock(g_sifHeapMutex);
-            g_sifHeapAllocations.clear();
-            g_iopHeapNext = kIopHeapBase;
+            std::lock_guard<std::mutex> lock(
+                state.heapMutex);
+            state.heapAllocations.clear();
+            state.iopHeapNext = kSifIopHeapBase;
         }
 
         bool isCopyableGuestAddress(uint32_t addr)
@@ -281,7 +270,10 @@ namespace ps2_stubs
                    sizeBytes <= (PS2_IOP_RAM_SIZE - offset);
         }
 
-        bool isAllocatedSyntheticIopRange(uint32_t guestAddr, uint32_t sizeBytes)
+        bool isAllocatedSyntheticIopRange(
+            SifRuntimeState &state,
+            uint32_t guestAddr,
+            uint32_t sizeBytes)
         {
             uint32_t offset = 0u;
             if (!ps2ResolveDirectRdramOffset(guestAddr, offset))
@@ -291,9 +283,11 @@ namespace ps2_stubs
 
             const uint64_t rangeEnd =
                 static_cast<uint64_t>(offset) + static_cast<uint64_t>(sizeBytes);
-            std::lock_guard<std::mutex> lock(g_sifHeapMutex);
-            const auto upper = g_sifHeapAllocations.upper_bound(offset);
-            if (upper == g_sifHeapAllocations.begin())
+            std::lock_guard<std::mutex> lock(
+                state.heapMutex);
+            const auto upper =
+                state.heapAllocations.upper_bound(offset);
+            if (upper == state.heapAllocations.begin())
             {
                 return false;
             }
@@ -354,38 +348,75 @@ namespace ps2_stubs
         }
     }
 
-    void resetSifState()
+    void resetSifState(PS2Runtime *runtime)
     {
-        std::lock_guard<std::mutex> lock(g_sifCmdStateMutex);
-        seedDefaultSifRegsLocked();
-        resetSifHeapState();
+        SifRuntimeState *const state =
+            getSifRuntimeState(runtime);
+        if (!state)
+        {
+            return;
+        }
+
+        {
+            std::lock_guard<std::mutex> lock(
+                state->commandMutex);
+            state->resetCommandStateLocked();
+        }
+        resetSifHeapState(*state);
+        {
+            std::lock_guard<std::mutex> lock(
+                state->dmaTransferMutex);
+            state->nextDmaTransferId = 1u;
+        }
+        state->oversizedTransferWarnings.store(
+            0u, std::memory_order_relaxed);
+        state->failedCopyWarnings.store(
+            0u, std::memory_order_relaxed);
+        state->failedDmaWarnings.store(
+            0u, std::memory_order_relaxed);
     }
 
     void sceSifAddCmdHandler(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
         const uint32_t cid = getRegU32(ctx, 4);
         const uint32_t handler = getRegU32(ctx, 5);
-        std::lock_guard<std::mutex> lock(g_sifCmdStateMutex);
-        g_sifCmdHandlers[cid] = handler;
+        if (SifRuntimeState *const state =
+                getSifRuntimeState(runtime))
+        {
+            std::lock_guard<std::mutex> lock(
+                state->commandMutex);
+            state->cmdHandlers[cid] = handler;
+        }
         setReturnS32(ctx, 0);
     }
 
     void sceSifAllocIopHeap(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
         (void)rdram;
-        (void)runtime;
 
         const uint32_t reqSize = getRegU32(ctx, 4);
-        setReturnU32(ctx, allocateSifHeapBlock(reqSize));
+        SifRuntimeState *const state =
+            getSifRuntimeState(runtime);
+        setReturnU32(
+            ctx,
+            state
+                ? allocateSifHeapBlock(
+                      *state, reqSize)
+                : 0u);
     }
 
     void sceSifAllocSysMemory(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
         (void)rdram;
-        (void)runtime;
 
         const uint32_t size = getRegU32(ctx, 5);
-        setReturnU32(ctx, allocateSifHeapBlock(size));
+        SifRuntimeState *const state =
+            getSifRuntimeState(runtime);
+        setReturnU32(
+            ctx,
+            state
+                ? allocateSifHeapBlock(*state, size)
+                : 0u);
     }
 
     void sceSifBindRpc(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
@@ -416,8 +447,13 @@ namespace ps2_stubs
 
     void sceSifExitCmd(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
-        std::lock_guard<std::mutex> lock(g_sifCmdStateMutex);
-        seedDefaultSifRegsLocked();
+        if (SifRuntimeState *const state =
+                getSifRuntimeState(runtime))
+        {
+            std::lock_guard<std::mutex> lock(
+                state->commandMutex);
+            state->resetCommandStateLocked();
+        }
         setReturnS32(ctx, 0);
     }
 
@@ -429,25 +465,42 @@ namespace ps2_stubs
     void sceSifFreeIopHeap(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
         (void)rdram;
-        (void)runtime;
 
         const uint32_t addr = getRegU32(ctx, 4);
-        setReturnS32(ctx, freeSifHeapBlock(addr) ? 0 : -1);
+        SifRuntimeState *const state =
+            getSifRuntimeState(runtime);
+        setReturnS32(
+            ctx,
+            state && freeSifHeapBlock(*state, addr)
+                ? 0
+                : -1);
     }
 
     void sceSifFreeSysMemory(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
         (void)rdram;
-        (void)runtime;
 
         const uint32_t addr = getRegU32(ctx, 4);
-        setReturnS32(ctx, freeSifHeapBlock(addr) ? 0 : -1);
+        SifRuntimeState *const state =
+            getSifRuntimeState(runtime);
+        setReturnS32(
+            ctx,
+            state && freeSifHeapBlock(*state, addr)
+                ? 0
+                : -1);
     }
 
     void sceSifGetDataTable(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
-        std::lock_guard<std::mutex> lock(g_sifCmdStateMutex);
-        setReturnU32(ctx, g_sifCmdBuffer);
+        uint32_t cmdBuffer = 0u;
+        if (SifRuntimeState *const state =
+                getSifRuntimeState(runtime))
+        {
+            std::lock_guard<std::mutex> lock(
+                state->commandMutex);
+            cmdBuffer = state->cmdBuffer;
+        }
+        setReturnU32(ctx, cmdBuffer);
     }
 
     void sceSifGetIopAddr(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
@@ -462,6 +515,8 @@ namespace ps2_stubs
 
     void sceSifGetOtherData(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
+        SifRuntimeState *const state =
+            getSifRuntimeState(runtime);
         const uint32_t rdAddr = getRegU32(ctx, 4);
         const uint32_t srcAddr = getRegU32(ctx, 5);
         const uint32_t dstAddr = getRegU32(ctx, 6);
@@ -476,12 +531,12 @@ namespace ps2_stubs
         const uint32_t size = static_cast<uint32_t>(sizeSigned);
         if (size > PS2_RAM_SIZE)
         {
-            static uint32_t warnCount = 0;
-            if (warnCount < 32u)
+            if (state &&
+                claimSifWarning(
+                    state->oversizedTransferWarnings))
             {
                 std::cerr << "sceSifGetOtherData rejected oversized transfer size=0x"
                           << std::hex << size << std::dec << std::endl;
-                ++warnCount;
             }
             setReturnS32(ctx, -1);
             return;
@@ -500,8 +555,9 @@ namespace ps2_stubs
 
         if (!copyGuestByteRange(rdram, dstAddr, srcAddr, size))
         {
-            static uint32_t warnCount = 0;
-            if (warnCount < 32u)
+            if (state &&
+                claimSifWarning(
+                    state->failedCopyWarnings))
             {
                 PS2_IF_AGRESSIVE_LOGS({
                     std::cerr << "sceSifGetOtherData copy failed src=0x" << std::hex << srcAddr
@@ -509,7 +565,6 @@ namespace ps2_stubs
                               << " size=0x" << size
                               << std::dec << std::endl;
                 });
-                ++warnCount;
             }
             setReturnS32(ctx, -1);
             return;
@@ -539,20 +594,26 @@ namespace ps2_stubs
 
     void sceSifGetReg(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
+        SifRuntimeState *const state =
+            getSifRuntimeState(runtime);
         const uint32_t reg = getRegU32(ctx, 4);
         uint32_t value = 0u;
         bool shouldLog = false;
+        if (state)
         {
-            std::lock_guard<std::mutex> lock(g_sifCmdStateMutex);
-            auto it = g_sifRegs.find(reg);
-            if (it != g_sifRegs.end())
+            std::lock_guard<std::mutex> lock(
+                state->commandMutex);
+            auto it = state->regs.find(reg);
+            if (it != state->regs.end())
             {
                 value = it->second;
             }
-            shouldLog = shouldTraceSifReg(reg) && g_sifGetRegLogCount < 128u;
+            shouldLog =
+                shouldTraceSifReg(reg) &&
+                state->getRegLogCount < 128u;
             if (shouldLog)
             {
-                ++g_sifGetRegLogCount;
+                ++state->getRegLogCount;
             }
         }
         if (shouldLog)
@@ -572,12 +633,16 @@ namespace ps2_stubs
 
     void sceSifGetSreg(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
+        SifRuntimeState *const state =
+            getSifRuntimeState(runtime);
         const uint32_t reg = getRegU32(ctx, 4);
         uint32_t value = 0u;
+        if (state)
         {
-            std::lock_guard<std::mutex> lock(g_sifCmdStateMutex);
-            auto it = g_sifSregs.find(reg);
-            if (it != g_sifSregs.end())
+            std::lock_guard<std::mutex> lock(
+                state->commandMutex);
+            auto it = state->sregs.find(reg);
+            if (it != state->sregs.end())
             {
                 value = it->second;
             }
@@ -587,14 +652,23 @@ namespace ps2_stubs
 
     void sceSifInitCmd(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
-        std::lock_guard<std::mutex> lock(g_sifCmdStateMutex);
-        g_sifCmdInitialized = true;
+        if (SifRuntimeState *const state =
+                getSifRuntimeState(runtime))
+        {
+            std::lock_guard<std::mutex> lock(
+                state->commandMutex);
+            state->cmdInitialized = true;
+        }
         setReturnS32(ctx, 0);
     }
 
     void sceSifInitIopHeap(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
-        resetSifHeapState();
+        if (SifRuntimeState *const state =
+                getSifRuntimeState(runtime))
+        {
+            resetSifHeapState(*state);
+        }
         setReturnS32(ctx, 0);
     }
 
@@ -646,8 +720,13 @@ namespace ps2_stubs
     void sceSifRemoveCmdHandler(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
         const uint32_t cid = getRegU32(ctx, 4);
-        std::lock_guard<std::mutex> lock(g_sifCmdStateMutex);
-        g_sifCmdHandlers.erase(cid);
+        if (SifRuntimeState *const state =
+                getSifRuntimeState(runtime))
+        {
+            std::lock_guard<std::mutex> lock(
+                state->commandMutex);
+            state->cmdHandlers.erase(cid);
+        }
         setReturnS32(ctx, 0);
     }
 
@@ -673,12 +752,16 @@ namespace ps2_stubs
 
     void sceSifSetCmdBuffer(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
+        SifRuntimeState *const state =
+            getSifRuntimeState(runtime);
         const uint32_t newBuffer = getRegU32(ctx, 4);
         uint32_t prev = 0u;
+        if (state)
         {
-            std::lock_guard<std::mutex> lock(g_sifCmdStateMutex);
-            prev = g_sifCmdBuffer;
-            g_sifCmdBuffer = newBuffer;
+            std::lock_guard<std::mutex> lock(
+                state->commandMutex);
+            prev = state->cmdBuffer;
+            state->cmdBuffer = newBuffer;
         }
         setReturnU32(ctx, prev);
     }
@@ -702,6 +785,8 @@ namespace ps2_stubs
 
     void sceSifSetDma(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
+        SifRuntimeState *const state =
+            getSifRuntimeState(runtime);
         const uint32_t dmatAddr = getRegU32(ctx, 4);
         const uint32_t count = getRegU32(ctx, 5);
 
@@ -792,7 +877,9 @@ namespace ps2_stubs
             // synthetic pointers backed by unused EE RAM. Keep that extension
             // only for ranges explicitly allocated by the SIF heap; arbitrary
             // IOP destinations must never alias and overwrite EE memory.
-            if (!isAllocatedSyntheticIopRange(xfer.dest, sizeBytes) ||
+            if (!state ||
+                !isAllocatedSyntheticIopRange(
+                    *state, xfer.dest, sizeBytes) ||
                 !canCopyGuestByteRange(rdram, xfer.dest, xfer.src, sizeBytes))
             {
                 ok = false;
@@ -834,28 +921,28 @@ namespace ps2_stubs
 
         if (!ok)
         {
-            static uint32_t warnCount = 0;
-            if (warnCount < 32u)
+            if (state &&
+                claimSifWarning(
+                    state->failedDmaWarnings))
             {
                 PS2_IF_AGRESSIVE_LOGS({
                     std::cerr << "sceSifSetDma failed dmat=0x" << std::hex << dmatAddr
                               << " count=0x" << count
                               << std::dec << std::endl;
                 });
-                ++warnCount;
             }
             setReturnS32(ctx, 0);
             return;
         }
 
-        if (!runtime)
+        if (!runtime || !state)
         {
             setReturnS32(ctx, 0);
             return;
         }
 
         submission.transferId =
-            allocateSifDmaTransferId();
+            allocateSifDmaTransferId(*state);
         if (!runtime->submitHleSifDma(
                 rdram, ctx, submission))
         {
@@ -876,22 +963,28 @@ namespace ps2_stubs
 
     void sceSifSetReg(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
+        SifRuntimeState *const state =
+            getSifRuntimeState(runtime);
         const uint32_t reg = getRegU32(ctx, 4);
         const uint32_t value = getRegU32(ctx, 5);
         uint32_t prev = 0u;
         bool shouldLog = false;
+        if (state)
         {
-            std::lock_guard<std::mutex> lock(g_sifCmdStateMutex);
-            auto it = g_sifRegs.find(reg);
-            if (it != g_sifRegs.end())
+            std::lock_guard<std::mutex> lock(
+                state->commandMutex);
+            auto it = state->regs.find(reg);
+            if (it != state->regs.end())
             {
                 prev = it->second;
             }
-            g_sifRegs[reg] = value;
-            shouldLog = shouldTraceSifReg(reg) && g_sifSetRegLogCount < 128u;
+            state->regs[reg] = value;
+            shouldLog =
+                shouldTraceSifReg(reg) &&
+                state->setRegLogCount < 128u;
             if (shouldLog)
             {
-                ++g_sifSetRegLogCount;
+                ++state->setRegLogCount;
             }
         }
         if (shouldLog)
@@ -917,29 +1010,37 @@ namespace ps2_stubs
 
     void sceSifSetSreg(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
+        SifRuntimeState *const state =
+            getSifRuntimeState(runtime);
         const uint32_t reg = getRegU32(ctx, 4);
         const uint32_t value = getRegU32(ctx, 5);
         uint32_t prev = 0u;
+        if (state)
         {
-            std::lock_guard<std::mutex> lock(g_sifCmdStateMutex);
-            auto it = g_sifSregs.find(reg);
-            if (it != g_sifSregs.end())
+            std::lock_guard<std::mutex> lock(
+                state->commandMutex);
+            auto it = state->sregs.find(reg);
+            if (it != state->sregs.end())
             {
                 prev = it->second;
             }
-            g_sifSregs[reg] = value;
+            state->sregs[reg] = value;
         }
         setReturnU32(ctx, prev);
     }
 
     void sceSifSetSysCmdBuffer(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
+        SifRuntimeState *const state =
+            getSifRuntimeState(runtime);
         const uint32_t newBuffer = getRegU32(ctx, 4);
         uint32_t prev = 0u;
+        if (state)
         {
-            std::lock_guard<std::mutex> lock(g_sifCmdStateMutex);
-            prev = g_sifSysCmdBuffer;
-            g_sifSysCmdBuffer = newBuffer;
+            std::lock_guard<std::mutex> lock(
+                state->commandMutex);
+            prev = state->sysCmdBuffer;
+            state->sysCmdBuffer = newBuffer;
         }
         setReturnU32(ctx, prev);
     }

@@ -14,5 +14,5 @@ namespace ps2_stubs
     PS2_STUB_LIST(PS2_DECLARE_STUB)
 #undef PS2_DECLARE_STUB
 
-    void resetSifState();
+    void resetSifState(PS2Runtime *runtime);
 }

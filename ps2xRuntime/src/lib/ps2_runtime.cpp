@@ -11,6 +11,7 @@
 #include "Kernel/Stubs/Audio.h"
 #include "Kernel/Stubs/GS.h"
 #include "Kernel/Stubs/MPEG.h"
+#include "Kernel/Stubs/Helpers/SifRuntimeState.h"
 #include "Kernel/Syscalls/Helpers/AlarmRuntimeState.h"
 #include "Kernel/Syscalls/Helpers/InterruptRuntimeState.h"
 #include "Kernel/Syscalls/Helpers/KernelRuntimeState.h"
@@ -42,11 +43,6 @@
 #include <thread>
 #include <unordered_map>
 #include <sstream>
-
-namespace ps2_stubs
-{
-    void resetSifState();
-}
 
 #define ELF_MAGIC 0x464C457F // "\x7FELF" in little endian
 #define ET_EXEC 2            // Executable file
@@ -911,6 +907,8 @@ PS2Runtime::PS2Runtime(PS2RuntimeConfiguration configuration)
         std::make_unique<EeKernelRuntimeState>();
     m_eeRpcRuntimeState =
         std::make_unique<EeRpcRuntimeState>();
+    m_sifRuntimeState =
+        std::make_unique<ps2_stubs::SifRuntimeState>();
     m_gs.setVSyncTickProvider(
         [this]()
         {
@@ -1340,6 +1338,17 @@ EeRpcRuntimeState &PS2Runtime::eeRpcRuntimeState()
 const EeRpcRuntimeState &PS2Runtime::eeRpcRuntimeState() const
 {
     return *m_eeRpcRuntimeState;
+}
+
+ps2_stubs::SifRuntimeState &PS2Runtime::sifRuntimeState()
+{
+    return *m_sifRuntimeState;
+}
+
+const ps2_stubs::SifRuntimeState &
+PS2Runtime::sifRuntimeState() const
+{
+    return *m_sifRuntimeState;
 }
 
 ps2_stubs::MpegRuntimeState &PS2Runtime::mpegRuntimeState()
@@ -9115,7 +9124,7 @@ bool PS2Runtime::isStopRequested() const
 void PS2Runtime::run()
 {
     m_stopRequested.store(false, std::memory_order_relaxed);
-    ps2_stubs::resetSifState();
+    ps2_stubs::resetSifState(this);
     resetIop();
     ps2_stubs::resetAudioStubState();
     ps2_stubs::resetGsSyncVCallbackState(this);
