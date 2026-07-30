@@ -1704,6 +1704,9 @@ void register_ee_runtime_executor_tests()
                     0};
                 std::atomic<int> unwindCount{0};
                 std::atomic<bool> neverRunEntered{false};
+                std::mutex blockedMutex;
+                std::condition_variable blockedCv;
+                bool reachedBlock = false;
                 bool observedWaiting = false;
 
                 executor.start(
@@ -1713,6 +1716,12 @@ void register_ee_runtime_executor_tests()
                         selectedBackend.create(10, [&]()
                         {
                             UnwindMarker marker{unwindCount};
+                            {
+                                std::lock_guard<std::mutex>
+                                    lock(blockedMutex);
+                                reachedBlock = true;
+                            }
+                            blockedCv.notify_all();
                             selectedBackend.yieldCurrent(
                                 {
                                     EeSchedulerExitReason::
@@ -1738,25 +1747,36 @@ void register_ee_runtime_executor_tests()
                                 "executor fixture");
                         }
                     });
-                executor.invokeAtBoundary(
-                    [&](EeThreadScheduler &scheduler,
-                        IEeExecutionBackend &)
+                const bool reachedBlockingExit = waitFor(
+                    blockedCv,
+                    blockedMutex,
+                    [&]()
                     {
-                        const auto snapshot =
-                            scheduler.thread(10);
-                        observedWaiting =
-                            snapshot.has_value() &&
-                            snapshot->state ==
-                                EeSchedulerThreadState::
-                                    Waiting &&
-                            snapshot->wait == wait;
+                        return reachedBlock;
                     });
+                if (reachedBlockingExit)
+                {
+                    executor.invokeAtBoundary(
+                        [&](EeThreadScheduler &scheduler,
+                            IEeExecutionBackend &)
+                        {
+                            const auto snapshot =
+                                scheduler.thread(10);
+                            observedWaiting =
+                                snapshot.has_value() &&
+                                snapshot->state ==
+                                    EeSchedulerThreadState::
+                                        Waiting &&
+                                snapshot->wait == wait;
+                        });
+                }
                 executor.requestStop();
                 executor.join();
                 executor.rethrowFailure();
 
                 t.IsTrue(
-                    observedWaiting &&
+                    reachedBlockingExit &&
+                        observedWaiting &&
                         unwindCount.load(
                             std::memory_order_acquire) == 1 &&
                         !neverRunEntered.load(
