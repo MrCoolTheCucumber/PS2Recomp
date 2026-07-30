@@ -4,6 +4,7 @@
 #include <cstdint>
 #include <thread>
 
+#include "AlarmRuntimeState.h"
 #include "ThreadRuntimeState.h"
 
 inline std::unordered_map<int, FILE *> g_fileDescriptors;
@@ -157,19 +158,6 @@ struct EventFlagInfo
     std::condition_variable cv;
 };
 
-struct AlarmInfo
-{
-    int id = 0;
-    uint16_t ticks = 0;
-    uint32_t handler = 0;
-    uint32_t commonArg = 0;
-    uint32_t gp = 0;
-    uint32_t sp = 0;
-    uint8_t *rdram = nullptr;
-    PS2Runtime *runtime = nullptr;
-    std::chrono::steady_clock::time_point dueAt;
-};
-
 struct io_stat_t
 {
     uint32_t mode;
@@ -194,11 +182,6 @@ inline std::mutex g_sema_map_mutex;
 inline std::unordered_map<int, std::shared_ptr<EventFlagInfo>> g_eventFlags;
 inline int g_nextEventFlagId = 1;
 inline std::mutex g_event_flag_map_mutex;
-inline std::unordered_map<int, std::shared_ptr<AlarmInfo>> g_alarms;
-inline int g_nextAlarmId = 1;
-inline std::mutex g_alarm_mutex;
-inline std::condition_variable g_alarm_cv;
-inline std::once_flag g_alarm_worker_once;
 inline std::mutex g_fd_mutex;
 
 static void registerHostThread(

@@ -1075,15 +1075,6 @@ namespace ps2_syscalls
         uint32_t handler = getRegU32(ctx, 5);
         uint32_t arg = getRegU32(ctx, 6);
 
-        static int logCount = 0;
-        if (logCount < 5)
-        {
-            RUNTIME_LOG("[SetAlarm] ticks=" << ticks
-                                            << " handler=0x" << std::hex << handler
-                                            << " arg=0x" << arg << std::dec << std::endl);
-            ++logCount;
-        }
-
         if (!runtime || !handler || !runtime->hasFunction(handler))
         {
             setReturnS32(ctx, KE_ERROR);
@@ -1097,23 +1088,54 @@ namespace ps2_syscalls
         info->gp = getRegU32(ctx, 28);
         info->sp = getRegU32(ctx, 29);
         info->rdram = rdram;
-        info->runtime = runtime;
         info->dueAt = std::chrono::steady_clock::now() + alarmTicksToDuration(ticks);
 
+        EeAlarmRuntimeState &alarmState =
+            runtime->eeAlarmRuntimeState();
         int alarmId = 0;
         {
-            std::lock_guard<std::mutex> lock(g_alarm_mutex);
-            alarmId = g_nextAlarmId++;
-            if (g_nextAlarmId <= 0)
+            std::lock_guard<std::mutex> lock(
+                alarmState.mutex);
+            if (alarmState.stopRequested.load(
+                    std::memory_order_acquire))
             {
-                g_nextAlarmId = 1;
+                if (runtime->isStopRequested())
+                {
+                    setReturnS32(ctx, KE_ERROR);
+                    return;
+                }
+                // requestStop joins synchronously. A later run or direct
+                // test reuse may start a fresh worker and ID namespace.
+                alarmState.stopRequested.store(
+                    false, std::memory_order_release);
+            }
+
+            if (alarmState.setLogCount < 5u)
+            {
+                RUNTIME_LOG("[SetAlarm] ticks=" << ticks
+                                                << " handler=0x" << std::hex << handler
+                                                << " arg=0x" << arg << std::dec << std::endl);
+                ++alarmState.setLogCount;
+            }
+
+            alarmId = alarmState.nextAlarmId++;
+            if (alarmState.nextAlarmId <= 0)
+            {
+                alarmState.nextAlarmId = 1;
             }
             info->id = alarmId;
-            g_alarms[alarmId] = info;
+            alarmState.alarms[alarmId] = info;
         }
 
-        ensureAlarmWorkerRunning();
-        g_alarm_cv.notify_all();
+        if (!ensureAlarmWorkerRunning(runtime))
+        {
+            std::lock_guard<std::mutex> lock(
+                alarmState.mutex);
+            alarmState.alarms.erase(alarmId);
+            setReturnS32(ctx, KE_ERROR);
+            return;
+        }
+        alarmState.cv.notify_all();
         setReturnS32(ctx, alarmId);
     }
 
@@ -1130,21 +1152,25 @@ namespace ps2_syscalls
     void CancelAlarm(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
         int alarmId = static_cast<int>(getRegU32(ctx, 4));
-        if (alarmId <= 0)
+        if (!runtime || alarmId <= 0)
         {
             setReturnS32(ctx, KE_ERROR);
             return;
         }
 
+        EeAlarmRuntimeState &alarmState =
+            runtime->eeAlarmRuntimeState();
         bool removed = false;
         {
-            std::lock_guard<std::mutex> lock(g_alarm_mutex);
-            removed = g_alarms.erase(alarmId) != 0;
+            std::lock_guard<std::mutex> lock(
+                alarmState.mutex);
+            removed =
+                alarmState.alarms.erase(alarmId) != 0;
         }
 
         if (removed)
         {
-            g_alarm_cv.notify_all();
+            alarmState.cv.notify_all();
             setReturnS32(ctx, KE_OK);
             return;
         }

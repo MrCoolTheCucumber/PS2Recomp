@@ -11,6 +11,7 @@
 #include "Kernel/Stubs/Audio.h"
 #include "Kernel/Stubs/GS.h"
 #include "Kernel/Stubs/MPEG.h"
+#include "Kernel/Syscalls/Helpers/AlarmRuntimeState.h"
 #include "Kernel/Syscalls/Helpers/ThreadRuntimeState.h"
 #include "ps2_host_backend.h"
 #include "ps2_iop_host.h"
@@ -751,6 +752,35 @@ PS2Runtime::GuestExecutionReleaseScope::~GuestExecutionReleaseScope()
     }
 }
 
+PS2Runtime::GuestExecutionTryScope::GuestExecutionTryScope(
+    PS2Runtime *runtime,
+    R5900Context *context,
+    std::chrono::milliseconds timeout) noexcept
+    : m_runtime(runtime),
+      m_context(context)
+{
+    if (m_runtime)
+    {
+        m_acquired =
+            m_runtime->tryEnterGuestExecution(
+                m_context,
+                timeout,
+                m_previousContext,
+                m_previousThreadId);
+    }
+}
+
+PS2Runtime::GuestExecutionTryScope::~GuestExecutionTryScope()
+{
+    if (m_runtime && m_acquired)
+    {
+        m_runtime->leaveGuestExecution(
+            m_context,
+            m_previousContext,
+            m_previousThreadId);
+    }
+}
+
 static void UploadFrame(Texture2D &tex, PS2Runtime *rt, uint32_t &outWidth, uint32_t &outHeight)
 {
     static uint64_t s_lastPresentationTick = std::numeric_limits<uint64_t>::max();
@@ -864,6 +894,8 @@ PS2Runtime::PS2Runtime(PS2RuntimeConfiguration configuration)
     : m_vu0(VuUnitId::Vu0),
       m_vu1(VuUnitId::Vu1)
 {
+    m_eeAlarmRuntimeState =
+        std::make_unique<EeAlarmRuntimeState>();
     m_eeThreadRuntimeState =
         std::make_unique<EeThreadRuntimeState>(
             allocateEeThreadRuntimeGeneration());
@@ -1236,6 +1268,16 @@ EeThreadRuntimeState &PS2Runtime::eeThreadRuntimeState()
 const EeThreadRuntimeState &PS2Runtime::eeThreadRuntimeState() const
 {
     return *m_eeThreadRuntimeState;
+}
+
+EeAlarmRuntimeState &PS2Runtime::eeAlarmRuntimeState()
+{
+    return *m_eeAlarmRuntimeState;
+}
+
+const EeAlarmRuntimeState &PS2Runtime::eeAlarmRuntimeState() const
+{
+    return *m_eeAlarmRuntimeState;
 }
 
 int PS2Runtime::activeEeHostThreadCount() const
@@ -6670,6 +6712,68 @@ R5900Context *PS2Runtime::enterGuestExecution(
     switchGuestExecutionContext(
         context, selectionHint);
     return previousContext;
+}
+
+bool PS2Runtime::tryEnterGuestExecution(
+    R5900Context *context,
+    std::chrono::milliseconds timeout,
+    R5900Context *&previousContext,
+    int &previousThreadId,
+    int selectionHint)
+{
+    previousContext = nullptr;
+    previousThreadId = 1;
+
+    auto depthIt = g_guestExecutionDepths.find(this);
+    if (depthIt != g_guestExecutionDepths.end() &&
+        depthIt->second != 0u)
+    {
+        if (!m_guestExecutionMutex.try_lock_for(timeout))
+        {
+            return false;
+        }
+        ++depthIt->second;
+        previousContext = m_boundEeContext;
+        previousThreadId = m_boundEeThreadId;
+        switchGuestExecutionContext(
+            context, selectionHint);
+        return true;
+    }
+
+    if (m_debugControlActive.load(std::memory_order_acquire) &&
+        m_debugPauseRequested.load(std::memory_order_acquire))
+    {
+        return false;
+    }
+
+    m_guestExecutionWaiters.fetch_add(
+        1u, std::memory_order_acq_rel);
+    const bool acquired =
+        m_guestExecutionMutex.try_lock_for(timeout);
+    m_guestExecutionWaiters.fetch_sub(
+        1u, std::memory_order_acq_rel);
+    if (!acquired)
+    {
+        return false;
+    }
+
+    // Close the same debugger-pause race as the blocking acquisition path.
+    // The caller owns no guest state until after this check.
+    if (m_debugControlActive.load(std::memory_order_acquire) &&
+        m_debugPauseRequested.load(std::memory_order_acquire))
+    {
+        m_guestExecutionMutex.unlock();
+        return false;
+    }
+
+    g_guestExecutionDepths[this] = 1u;
+    recordOuterGuestExecutionAcquisition(context);
+    markGuestExecutionAcquired();
+    previousContext = m_boundEeContext;
+    previousThreadId = m_boundEeThreadId;
+    switchGuestExecutionContext(
+        context, selectionHint);
+    return true;
 }
 
 void PS2Runtime::lockGuestExecutionMutex(bool mayContend)

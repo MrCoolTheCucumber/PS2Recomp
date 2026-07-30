@@ -229,98 +229,273 @@ static std::chrono::microseconds alarmTicksToDuration(uint16_t ticks)
     return std::chrono::microseconds(clampedTicks * kAlarmTickUsec);
 }
 
-static void ensureAlarmWorkerRunning()
+static bool ensureAlarmWorkerRunning(PS2Runtime *runtime)
 {
-    std::call_once(g_alarm_worker_once, []()
-                   { std::thread([]()
-                                 {
+    if (!runtime)
+    {
+        return false;
+    }
+
+    EeAlarmRuntimeState &state =
+        runtime->eeAlarmRuntimeState();
+    std::unique_lock<std::mutex> lifecycleLock(state.mutex);
+    if (state.stopRequested.load(
+            std::memory_order_acquire))
+    {
+        return false;
+    }
+    if (state.worker.joinable())
+    {
+        if (state.workerRunning)
+        {
+            return true;
+        }
+
+        // A stop requested from inside the callback leaves the completed
+        // thread handle owned by the runtime. Reap it before a later run
+        // starts a replacement worker.
+        std::thread stoppedWorker =
+            std::move(state.worker);
+        lifecycleLock.unlock();
+        stoppedWorker.join();
+        lifecycleLock.lock();
+
+        if (state.stopRequested.load(
+                std::memory_order_acquire))
+        {
+            return false;
+        }
+        if (state.worker.joinable())
+        {
+            return state.workerRunning;
+        }
+    }
+
+    state.workerRunning = true;
+    try
+    {
+        state.worker = std::thread([runtime, &state]()
+        {
+            struct WorkerExit
+            {
+                EeAlarmRuntimeState &state;
+
+                ~WorkerExit()
+                {
+                    {
+                        std::lock_guard<std::mutex> lock(
+                            state.mutex);
+                        state.workerRunning = false;
+                    }
+                    state.cv.notify_all();
+                }
+            } workerExit{state};
+
             for (;;)
             {
                 std::shared_ptr<AlarmInfo> readyAlarm;
                 {
-                    std::unique_lock<std::mutex> lock(g_alarm_mutex);
-                    while (!readyAlarm)
+                    std::unique_lock<std::mutex> lock(state.mutex);
+                    while (!state.stopRequested.load(
+                               std::memory_order_acquire) &&
+                           !readyAlarm)
                     {
-                        if (g_alarms.empty())
+                        if (state.alarms.empty())
                         {
-                            g_alarm_cv.wait(lock);
+                            state.cv.wait(lock);
                             continue;
                         }
 
-                        auto nextIt = std::min_element(g_alarms.begin(), g_alarms.end(),
-                                                       [](const auto &a, const auto &b)
-                                                       {
-                                                           return a.second->dueAt < b.second->dueAt;
-                                                       });
-                        if (nextIt == g_alarms.end())
+                        const auto nextIt = std::min_element(
+                            state.alarms.begin(),
+                            state.alarms.end(),
+                            [](const auto &a, const auto &b)
+                            {
+                                return a.second->dueAt <
+                                       b.second->dueAt;
+                            });
+                        if (nextIt == state.alarms.end())
                         {
-                            g_alarm_cv.wait(lock);
+                            state.cv.wait(lock);
                             continue;
                         }
 
-                        const auto now = std::chrono::steady_clock::now();
-                        if (nextIt->second->dueAt > now)
+                        const auto now =
+                            std::chrono::steady_clock::now();
+                        const auto dueAt =
+                            nextIt->second->dueAt;
+                        if (dueAt > now)
                         {
-                            g_alarm_cv.wait_until(lock, nextIt->second->dueAt);
+                            // Keep the deadline by value. Cancellation may
+                            // erase the final shared owner as soon as
+                            // wait_until unlocks.
+                            state.cv.wait_until(lock, dueAt);
                             continue;
                         }
 
                         readyAlarm = nextIt->second;
-                        g_alarms.erase(nextIt);
+                        state.alarms.erase(nextIt);
+                    }
+
+                    if (state.stopRequested.load(
+                            std::memory_order_acquire))
+                    {
+                        return;
                     }
                 }
 
-                if (!readyAlarm || !readyAlarm->runtime || !readyAlarm->rdram || !readyAlarm->handler)
+                if (!readyAlarm ||
+                    runtime->isStopRequested() ||
+                    !readyAlarm->rdram ||
+                    !readyAlarm->handler)
                 {
                     continue;
                 }
-                if (!readyAlarm->runtime->hasFunction(readyAlarm->handler))
+                if (!runtime->hasFunction(readyAlarm->handler))
                 {
                     continue;
                 }
 
                 try
                 {
-                    constexpr uint32_t kAlarmCallbackStackSize = 0x4000u;
-                    thread_local PS2Runtime *s_alarmStackRuntime = nullptr;
-                    thread_local uint32_t s_alarmStackTop = 0u;
-                    if (s_alarmStackRuntime != readyAlarm->runtime || s_alarmStackTop == 0u)
+                    constexpr uint32_t kAlarmCallbackStackSize =
+                        0x4000u;
+                    if (state.callbackStackTop == 0u)
                     {
-                        s_alarmStackRuntime = readyAlarm->runtime;
-                        s_alarmStackTop = readyAlarm->runtime->reserveAsyncCallbackStack(kAlarmCallbackStackSize, 16u);
+                        state.callbackStackTop =
+                            runtime->reserveAsyncCallbackStack(
+                                kAlarmCallbackStackSize, 16u);
                     }
 
-                    R5900Context callbackCtx{};
+                    R5900Context &callbackCtx =
+                        state.callbackContext;
+                    callbackCtx = {};
                     setRegU32(&callbackCtx, 28, readyAlarm->gp);
-                    setRegU32(&callbackCtx, 29,
-                              (s_alarmStackTop != 0u) ? s_alarmStackTop : (PS2_RAM_SIZE - 0x10u));
+                    setRegU32(
+                        &callbackCtx,
+                        29,
+                        state.callbackStackTop != 0u
+                            ? state.callbackStackTop
+                            : (PS2_RAM_SIZE - 0x10u));
                     setRegU32(&callbackCtx, 31, 0);
-                    setRegU32(&callbackCtx, 4, static_cast<uint32_t>(readyAlarm->id));
-                    setRegU32(&callbackCtx, 5, static_cast<uint32_t>(readyAlarm->ticks));
-                    setRegU32(&callbackCtx, 6, readyAlarm->commonArg);
+                    setRegU32(
+                        &callbackCtx,
+                        4,
+                        static_cast<uint32_t>(readyAlarm->id));
+                    setRegU32(
+                        &callbackCtx,
+                        5,
+                        static_cast<uint32_t>(readyAlarm->ticks));
+                    setRegU32(
+                        &callbackCtx, 6, readyAlarm->commonArg);
                     setRegU32(&callbackCtx, 7, 0);
                     callbackCtx.pc = readyAlarm->handler;
 
-                    PS2Runtime::RecompiledFunction func = readyAlarm->runtime->lookupFunction(readyAlarm->handler);
-                    PS2Runtime::GuestExecutionScope guestExecution(
-                        readyAlarm->runtime, &callbackCtx);
-                    readyAlarm->runtime->executeGuestStep(
-                        readyAlarm->rdram, &callbackCtx, func);
+                    PS2Runtime::RecompiledFunction func =
+                        runtime->lookupFunction(
+                            readyAlarm->handler);
+                    for (;;)
+                    {
+                        if (state.stopRequested.load(
+                                std::memory_order_acquire) ||
+                            runtime->isStopRequested())
+                        {
+                            return;
+                        }
+
+                        PS2Runtime::GuestExecutionTryScope
+                            guestExecution(
+                                runtime,
+                                &callbackCtx,
+                                std::chrono::milliseconds(10));
+                        if (!guestExecution.acquired())
+                        {
+                            continue;
+                        }
+                        if (state.stopRequested.load(
+                                std::memory_order_acquire) ||
+                            runtime->isStopRequested())
+                        {
+                            return;
+                        }
+
+                        runtime->executeGuestStep(
+                            readyAlarm->rdram,
+                            &callbackCtx,
+                            func);
+                        break;
+                    }
                 }
                 catch (const ThreadExitException &)
                 {
                 }
                 catch (const std::exception &e)
                 {
-                    static int alarmExceptionLogs = 0;
-                    if (alarmExceptionLogs < 8)
+                    if (state.exceptionLogCount < 8u)
                     {
-                        std::cerr << "[SetAlarm] callback exception: " << e.what() << std::endl;
-                        ++alarmExceptionLogs;
+                        std::cerr
+                            << "[SetAlarm] callback exception: "
+                            << e.what() << std::endl;
+                        ++state.exceptionLogCount;
                     }
                 }
-            } })
-                         .detach(); });
+            }
+        });
+    }
+    catch (...)
+    {
+        state.workerRunning = false;
+        return false;
+    }
+    return true;
+}
+
+static void stopAlarmWorker(PS2Runtime *runtime)
+{
+    if (!runtime)
+    {
+        return;
+    }
+
+    EeAlarmRuntimeState &state =
+        runtime->eeAlarmRuntimeState();
+    std::thread workerToJoin;
+    bool workerStopped = false;
+    {
+        std::lock_guard<std::mutex> lock(state.mutex);
+        state.stopRequested.store(
+            true, std::memory_order_release);
+        state.alarms.clear();
+        state.nextAlarmId = 1;
+        state.setLogCount = 0u;
+        if (!state.worker.joinable())
+        {
+            workerStopped = true;
+        }
+        else if (state.worker.get_id() !=
+                 std::this_thread::get_id())
+        {
+            workerToJoin = std::move(state.worker);
+        }
+    }
+    state.cv.notify_all();
+
+    if (workerToJoin.joinable())
+    {
+        workerToJoin.join();
+        workerStopped = true;
+    }
+
+    // The worker owns these fields while a callback is active. Clear them
+    // only after an external stopper has joined it. A callback that requests
+    // its own stop leaves the joinable handle in runtime-owned state for the
+    // next external stop or destructor.
+    if (workerStopped)
+    {
+        std::lock_guard<std::mutex> lock(state.mutex);
+        state.callbackContext = {};
+        state.exceptionLogCount = 0u;
+    }
 }
 
 static void rpcCopyToRdram(uint8_t *rdram, uint32_t dst, uint32_t src, size_t size)

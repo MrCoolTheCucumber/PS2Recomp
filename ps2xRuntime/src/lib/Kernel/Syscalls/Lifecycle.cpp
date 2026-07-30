@@ -97,11 +97,7 @@ namespace ps2_syscalls
             eventFlag->cv.notify_all();
         }
 
-        {
-            std::lock_guard<std::mutex> lock(g_alarm_mutex);
-            g_alarms.clear();
-        }
-        g_alarm_cv.notify_all();
+        stopAlarmWorker(runtime);
 
         {
             std::lock_guard<std::mutex> lock(g_exit_handler_mutex);
