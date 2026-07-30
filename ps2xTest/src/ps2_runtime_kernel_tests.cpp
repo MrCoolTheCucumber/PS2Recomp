@@ -10,6 +10,7 @@
 #include <cstdint>
 #include <cstring>
 #include <memory>
+#include <mutex>
 #include <sstream>
 #include <thread>
 #include <utility>
@@ -77,6 +78,8 @@ namespace
     constexpr uint32_t K_CURRENT_THREAD_ID_ADDR = 0x18D0u;
     constexpr uint32_t K_ASYNC_EXIT_DELETE_STAGE_ADDR = 0x18D4u;
 
+    std::mutex g_guestWordMutex;
+
     struct EeThreadStatus
     {
         int32_t status;
@@ -118,6 +121,12 @@ namespace
 
     void writeGuestU32(uint8_t *rdram, uint32_t addr, uint32_t value)
     {
+        // Several scheduler fixtures deliberately use guest words as
+        // host/guest stage gates. Serialize only these harness helpers so
+        // their publications are defined under TSAN; production guest-memory
+        // accesses remain non-atomic and concurrent EE execution is still
+        // forbidden.
+        std::lock_guard<std::mutex> lock(g_guestWordMutex);
         std::memcpy(rdram + addr, &value, sizeof(value));
     }
 
@@ -131,6 +140,7 @@ namespace
 
     uint32_t readGuestU32(const uint8_t *rdram, uint32_t addr)
     {
+        std::lock_guard<std::mutex> lock(g_guestWordMutex);
         uint32_t value = 0;
         std::memcpy(&value, rdram + addr, sizeof(value));
         return value;
@@ -5068,7 +5078,10 @@ void register_ps2_runtime_kernel_tests()
 
             const bool waiting = waitUntil([&]()
             {
-                if (readGuestU32(env.rdram.data(), K_TERMINATE_SEMA_WAIT_READY_ADDR) != 1u)
+                if (readGuestU32(
+                        env.rdram.data(),
+                        K_TERMINATE_SEMA_WAIT_READY_ADDR) !=
+                    1u)
                 {
                     return false;
                 }
