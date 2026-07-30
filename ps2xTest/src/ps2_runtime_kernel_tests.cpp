@@ -550,6 +550,100 @@ void register_ps2_runtime_kernel_tests()
 {
     MiniTest::Case("PS2RuntimeKernel", [](TestCase &tc)
     {
+#ifndef NDEBUG
+        tc.Run("DECI2 sessions are isolated per runtime", [](TestCase &t)
+        {
+            TestEnv first;
+            TestEnv second;
+            constexpr uint32_t kDeci2ArgsAddr = 0x1A00u;
+
+            const auto deci2Call =
+                [&](TestEnv &env,
+                    int32_t code,
+                    const std::array<uint32_t, 4u> &args)
+            {
+                writeGuestWords(
+                    env.rdram.data(),
+                    kDeci2ArgsAddr,
+                    args.data(),
+                    args.size());
+                R5900Context ctx{};
+                setRegU32(
+                    ctx,
+                    4,
+                    static_cast<uint32_t>(code));
+                setRegU32(ctx, 5, kDeci2ArgsAddr);
+                callSyscall(
+                    0x7Cu,
+                    env.rdram.data(),
+                    &ctx,
+                    &env.runtime);
+                return getRegS32(ctx, 2);
+            };
+            const auto open =
+                [&](TestEnv &env)
+            {
+                return deci2Call(
+                    env,
+                    1,
+                    {0x1234u, 0u, 0u, 0u});
+            };
+            const auto close =
+                [&](TestEnv &env, int32_t socket)
+            {
+                return deci2Call(
+                    env,
+                    2,
+                    {static_cast<uint32_t>(socket),
+                     0u,
+                     0u,
+                     0u});
+            };
+            const auto lock =
+                [&](TestEnv &env, int32_t socket)
+            {
+                return deci2Call(
+                    env,
+                    -8,
+                    {static_cast<uint32_t>(socket),
+                     0u,
+                     0u,
+                     0u});
+            };
+
+            const int32_t firstSocket = open(first);
+            const int32_t secondSocket = open(second);
+            t.Equals(
+                firstSocket,
+                1,
+                "the first runtime should allocate its first DECI2 socket");
+            t.Equals(
+                secondSocket,
+                1,
+                "the second runtime should allocate its own first DECI2 socket");
+            t.Equals(
+                close(first, firstSocket),
+                KE_OK,
+                "the first runtime should close its DECI2 socket");
+            t.Equals(
+                lock(second, secondSocket),
+                KE_OK,
+                "closing one runtime's socket must preserve its peer's session");
+
+            const int32_t restartedFirstSocket = open(first);
+            const int32_t restartedSecondSocket = open(second);
+            notifyRuntimeStop(&first.runtime);
+            t.Equals(
+                close(first, restartedFirstSocket),
+                KE_ERROR,
+                "stopping a runtime should discard its DECI2 sessions");
+            t.Equals(
+                lock(second, restartedSecondSocket),
+                KE_OK,
+                "stopping one runtime must preserve its peer's DECI2 sessions");
+        });
+#endif
+
         tc.Run("thread create/refer/delete follows EE status layout", [](TestCase &t)
         {
             TestEnv env;
