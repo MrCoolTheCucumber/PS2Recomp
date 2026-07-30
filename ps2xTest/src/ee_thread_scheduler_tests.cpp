@@ -192,6 +192,71 @@ namespace
         std::optional<EeSchedulerConsequenceStage>
             m_stormStage;
     };
+
+    class LatePublicationBoundaryHooks final
+        : public IEeSchedulerExecutorHooks
+    {
+    public:
+        void commitPriorContext(
+            std::optional<int>,
+            ps2x::timing::EeTickDelta,
+            ps2x::timing::EeTick) override
+        {
+        }
+
+        void publishSelectedContext(
+            std::optional<int>,
+            ps2x::timing::EeTick) override
+        {
+        }
+
+        void publishWaitCompletion(
+            int,
+            EeSchedulerCompletedWait,
+            ps2x::timing::EeTick) override
+        {
+        }
+
+        [[nodiscard]] bool
+        hasImmediateConsequence(
+            EeSchedulerConsequenceStage stage,
+            ps2x::timing::EeTick) const override
+        {
+            const size_t probe = m_probes++;
+            return probe >=
+                       kEeSchedulerConsequenceStageCount &&
+                   stage ==
+                       EeSchedulerConsequenceStage::
+                           AsynchronousWake;
+        }
+
+        [[nodiscard]]
+        EeSchedulerReschedulePolicy
+        applyNextConsequence(
+            EeSchedulerConsequenceStage,
+            ps2x::timing::EeTick,
+            EeThreadScheduler &) override
+        {
+            ++m_applications;
+            return EeSchedulerReschedulePolicy::
+                HigherPriorityOnly;
+        }
+
+        [[nodiscard]] size_t probes() const noexcept
+        {
+            return m_probes;
+        }
+
+        [[nodiscard]] size_t applications()
+            const noexcept
+        {
+            return m_applications;
+        }
+
+    private:
+        mutable size_t m_probes = 0u;
+        size_t m_applications = 0u;
+    };
 }
 
 void register_ee_thread_scheduler_tests()
@@ -1239,6 +1304,38 @@ void register_ee_thread_scheduler_tests()
                         scheduler.validate(),
                 "storm diagnostics should leave the selected scheduler state valid");
             }
+        });
+
+        tc.Run("stable boundary defers a publication visible after its scan", [](TestCase &t)
+        {
+            EeThreadScheduler scheduler;
+            EeSchedulerExecutor executor;
+            LatePublicationBoundaryHooks hooks;
+            t.IsTrue(
+                scheduler.addRunningThread(1, 1u, 40),
+                "the late-publication fixture should have one runner");
+
+            const EeSchedulerBoundaryResult result =
+                executor.processBoundary(
+                    scheduler,
+                    hooks,
+                    1,
+                    ps2x::timing::
+                        eeTickDeltaFromRaw(1u),
+                    EeSchedulerReschedulePolicy::
+                        HigherPriorityOnly);
+
+            t.IsTrue(
+                !result.limitExceeded &&
+                    !result.offendingStage.has_value() &&
+                    result.consequencesProcessed == 0u &&
+                    hooks.probes() ==
+                        kEeSchedulerConsequenceStageCount &&
+                    hooks.applications() == 0u &&
+                    executor.statistics().
+                            consequenceLimitHits ==
+                        0u,
+                "a publication becoming visible after one stable scan should wake a future boundary, not impersonate a consequence storm");
         });
 
         tc.Run("debugger control is resolved only at executor boundaries", [](TestCase &t)

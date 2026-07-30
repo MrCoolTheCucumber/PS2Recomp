@@ -102,11 +102,15 @@ namespace ps2x::ee
                 }
             }
 
-            result.offendingStage =
-                nextImmediateStage(
-                    hooks, result.tick);
-            result.limitExceeded =
-                result.offendingStage.has_value();
+            if (result.consequencesProcessed ==
+                kMaximumConsequencesPerBoundary)
+            {
+                result.offendingStage =
+                    nextImmediateStage(
+                        hooks, result.tick);
+                result.limitExceeded =
+                    result.offendingStage.has_value();
+            }
             applyDebugControl(result);
         }
         catch (...)
