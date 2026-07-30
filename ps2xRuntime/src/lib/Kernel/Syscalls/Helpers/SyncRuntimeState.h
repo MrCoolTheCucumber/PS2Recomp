@@ -21,12 +21,21 @@ struct SemaInfo
 
 struct EventFlagInfo
 {
+    struct SchedulerWaiter
+    {
+        uint32_t generation = 0u;
+        uint32_t waitBits = 0u;
+        uint32_t mode = 0u;
+    };
+
     uint32_t attr = 0;
     uint32_t option = 0;
     uint32_t initBits = 0;
     uint32_t bits = 0;
     int waiters = 0;
     bool deleted = false;
+    std::unordered_map<int, SchedulerWaiter>
+        schedulerWaiters;
     std::mutex m;
     std::condition_variable cv;
 };

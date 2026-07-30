@@ -43,6 +43,8 @@ namespace
     constexpr int KE_DORMANT = -413;
     constexpr int KE_SEMA_ZERO = -419;
     constexpr int KE_SEMA_OVF = -420;
+    constexpr int KE_RELEASE_WAIT = -418;
+    constexpr int KE_WAIT_DELETE = -425;
     constexpr uint32_t K_SEMA_WAIT_READY_ADDR = 0x1900u;
 
     constexpr int THS_WAIT = 0x04;
@@ -103,6 +105,22 @@ namespace
         0x259e00u;
     constexpr uint32_t K_EXECUTOR_SEMA_CHILD_ENTRY =
         0x259f00u;
+    constexpr uint32_t K_EXECUTOR_EVENT_MAIN_ENTRY =
+        0x25a000u;
+    constexpr uint32_t K_EXECUTOR_EVENT_CHILD_ENTRY =
+        0x25a100u;
+    constexpr uint32_t K_EXECUTOR_EVENT_RESULT_ADDR =
+        0x1920u;
+    constexpr uint32_t K_EXECUTOR_EVENT_MULTI_MAIN_ENTRY =
+        0x25a200u;
+    constexpr uint32_t K_EXECUTOR_EVENT_CLEAR_CHILD_ENTRY =
+        0x25a300u;
+    constexpr uint32_t K_EXECUTOR_EVENT_RETAIN_CHILD_ENTRY =
+        0x25a400u;
+    constexpr uint32_t K_EXECUTOR_EVENT_CLEAR_RESULT_ADDR =
+        0x1930u;
+    constexpr uint32_t K_EXECUTOR_EVENT_RETAIN_RESULT_ADDR =
+        0x1934u;
 
     std::mutex g_guestWordMutex;
     std::mutex g_alarmCallbackThreadMutex;
@@ -160,6 +178,39 @@ namespace
     bool g_executorSemaChildRanInsideSignal = false;
     bool g_executorSemaMainAttemptedSignal = false;
     bool g_executorSemaRescued = false;
+
+    enum class ExecutorEventOperation
+    {
+        OrdinarySet,
+        RawSet,
+        RawSetThenClear,
+        OrdinaryRelease,
+        RawRelease,
+        Delete,
+    };
+
+    std::vector<int> g_executorEventOrder;
+    ExecutorEventOperation g_executorEventOperation =
+        ExecutorEventOperation::OrdinarySet;
+    int g_executorEventId = KE_ERROR;
+    int g_executorEventChildThreadId = 0;
+    int g_executorEventWaitResult = KE_ERROR;
+    int g_executorEventOperationResult = KE_ERROR;
+    uint32_t g_executorEventResultBits = 0u;
+    int g_executorEventRawStatus = KE_ERROR;
+    uint32_t g_executorEventRawWaitType = 0u;
+    bool g_executorEventOperationInProgress = false;
+    bool g_executorEventChildRanInsideOperation = false;
+    bool g_executorEventMainAttemptedOperation = false;
+    bool g_executorEventRescued = false;
+    std::vector<int> g_executorEventMultiOrder;
+    int g_executorEventMultiId = KE_ERROR;
+    int g_executorEventClearResult = KE_ERROR;
+    int g_executorEventRetainResult = KE_ERROR;
+    uint32_t g_executorEventClearBits = 0u;
+    uint32_t g_executorEventRetainBits = 0u;
+    bool g_executorEventRetainWaitedAfterFirstSet =
+        false;
 
     struct EeThreadStatus
     {
@@ -1090,6 +1141,418 @@ namespace
         ctx->pc = 0u;
     }
 
+    void dedicatedExecutorEventChildHandler(
+        uint8_t *rdram,
+        R5900Context *ctx,
+        PS2Runtime *runtime)
+    {
+        {
+            std::lock_guard<std::mutex> lock(
+                g_executorFixtureMutex);
+            g_executorEventOrder.push_back(1);
+        }
+        const uint32_t eventId =
+            ::getRegU32(ctx, 4);
+        writeGuestU32(
+            rdram,
+            K_EXECUTOR_EVENT_RESULT_ADDR,
+            0x7f7f7f7fu);
+        setRegU32(*ctx, 4, eventId);
+        setRegU32(*ctx, 5, 0x4u);
+        setRegU32(*ctx, 6, 1u);
+        setRegU32(
+            *ctx,
+            7,
+            K_EXECUTOR_EVENT_RESULT_ADDR);
+        WaitEventFlag(rdram, ctx, runtime);
+        {
+            std::lock_guard<std::mutex> lock(
+                g_executorFixtureMutex);
+            g_executorEventWaitResult =
+                getRegS32(*ctx, 2);
+            g_executorEventResultBits =
+                readGuestU32(
+                    rdram,
+                    K_EXECUTOR_EVENT_RESULT_ADDR);
+            g_executorEventChildRanInsideOperation =
+                g_executorEventOperationInProgress;
+            g_executorEventOrder.push_back(2);
+        }
+        ctx->pc = 0u;
+    }
+
+    void dedicatedExecutorEventMainHandler(
+        uint8_t *rdram,
+        R5900Context *ctx,
+        PS2Runtime *runtime)
+    {
+        InitThread(rdram, ctx, runtime);
+
+        const std::array<uint32_t, 3u>
+            eventParameters{
+                0x2u,
+                0u,
+                0u,
+            };
+        writeGuestWords(
+            rdram,
+            K_CONTROL_EVENT_PARAM_ADDR,
+            eventParameters.data(),
+            eventParameters.size());
+        setRegU32(
+            *ctx,
+            4,
+            K_CONTROL_EVENT_PARAM_ADDR);
+        CreateEventFlag(rdram, ctx, runtime);
+        const int eventId = getRegS32(*ctx, 2);
+        {
+            std::lock_guard<std::mutex> lock(
+                g_executorFixtureMutex);
+            g_executorEventId = eventId;
+        }
+
+        setRegU32(
+            *ctx,
+            4,
+            K_EXECUTOR_THREAD_PARAM_ADDR);
+        CreateThread(rdram, ctx, runtime);
+        const int childThreadId =
+            getRegS32(*ctx, 2);
+        {
+            std::lock_guard<std::mutex> lock(
+                g_executorFixtureMutex);
+            g_executorEventChildThreadId =
+                childThreadId;
+        }
+
+        setRegU32(
+            *ctx,
+            4,
+            static_cast<uint32_t>(
+                childThreadId));
+        setRegU32(
+            *ctx,
+            5,
+            static_cast<uint32_t>(
+                eventId));
+        StartThread(rdram, ctx, runtime);
+
+        ExecutorEventOperation operation =
+            ExecutorEventOperation::OrdinarySet;
+        {
+            std::lock_guard<std::mutex> lock(
+                g_executorFixtureMutex);
+            operation = g_executorEventOperation;
+            g_executorEventMainAttemptedOperation =
+                true;
+            g_executorEventOperationInProgress =
+                true;
+        }
+        const bool raw =
+            operation ==
+                ExecutorEventOperation::RawSet ||
+            operation ==
+                ExecutorEventOperation::
+                    RawSetThenClear ||
+            operation ==
+                ExecutorEventOperation::RawRelease;
+        switch (operation)
+        {
+        case ExecutorEventOperation::OrdinarySet:
+        case ExecutorEventOperation::RawSet:
+            setRegU32(
+                *ctx,
+                4,
+                static_cast<uint32_t>(eventId));
+            setRegU32(*ctx, 5, 0x4u);
+            if (raw)
+            {
+                iSetEventFlag(rdram, ctx, runtime);
+            }
+            else
+            {
+                SetEventFlag(rdram, ctx, runtime);
+            }
+            break;
+        case ExecutorEventOperation::
+            RawSetThenClear:
+            setRegU32(
+                *ctx,
+                4,
+                static_cast<uint32_t>(eventId));
+            setRegU32(*ctx, 5, 0x4u);
+            iSetEventFlag(rdram, ctx, runtime);
+            setRegU32(
+                *ctx,
+                4,
+                static_cast<uint32_t>(eventId));
+            setRegU32(*ctx, 5, 0u);
+            iClearEventFlag(rdram, ctx, runtime);
+            break;
+        case ExecutorEventOperation::OrdinaryRelease:
+        case ExecutorEventOperation::RawRelease:
+            setRegU32(
+                *ctx,
+                4,
+                static_cast<uint32_t>(
+                    childThreadId));
+            if (raw)
+            {
+                iReleaseWaitThread(
+                    rdram, ctx, runtime);
+            }
+            else
+            {
+                ReleaseWaitThread(
+                    rdram, ctx, runtime);
+            }
+            break;
+        case ExecutorEventOperation::Delete:
+            setRegU32(
+                *ctx,
+                4,
+                static_cast<uint32_t>(eventId));
+            DeleteEventFlag(rdram, ctx, runtime);
+            break;
+        }
+
+        int rawStatus = KE_ERROR;
+        uint32_t rawWaitType = 0u;
+        if (raw)
+        {
+            R5900Context statusContext{};
+            setRegU32(
+                statusContext,
+                4,
+                static_cast<uint32_t>(
+                    childThreadId));
+            setRegU32(
+                statusContext,
+                5,
+                K_STATUS_ADDR);
+            iReferThreadStatus(
+                rdram,
+                &statusContext,
+                runtime);
+            EeThreadStatus status{};
+            std::memcpy(
+                &status,
+                rdram + K_STATUS_ADDR,
+                sizeof(status));
+            rawStatus = status.status;
+            rawWaitType = status.waitType;
+        }
+
+        {
+            std::lock_guard<std::mutex> lock(
+                g_executorFixtureMutex);
+            g_executorEventOperationResult =
+                getRegS32(*ctx, 2);
+            g_executorEventRawStatus = rawStatus;
+            g_executorEventRawWaitType =
+                rawWaitType;
+            g_executorEventOperationInProgress =
+                false;
+            g_executorEventOrder.push_back(3);
+        }
+        ctx->pc = 0u;
+    }
+
+    void dedicatedExecutorEventClearChildHandler(
+        uint8_t *rdram,
+        R5900Context *ctx,
+        PS2Runtime *runtime)
+    {
+        {
+            std::lock_guard<std::mutex> lock(
+                g_executorFixtureMutex);
+            g_executorEventMultiOrder.push_back(1);
+        }
+        const uint32_t eventId =
+            ::getRegU32(ctx, 4);
+        setRegU32(*ctx, 4, eventId);
+        setRegU32(*ctx, 5, 0x4u);
+        setRegU32(*ctx, 6, 0x11u);
+        setRegU32(
+            *ctx,
+            7,
+            K_EXECUTOR_EVENT_CLEAR_RESULT_ADDR);
+        WaitEventFlag(rdram, ctx, runtime);
+        {
+            std::lock_guard<std::mutex> lock(
+                g_executorFixtureMutex);
+            g_executorEventClearResult =
+                getRegS32(*ctx, 2);
+            g_executorEventClearBits =
+                readGuestU32(
+                    rdram,
+                    K_EXECUTOR_EVENT_CLEAR_RESULT_ADDR);
+            g_executorEventMultiOrder.push_back(3);
+        }
+        ctx->pc = 0u;
+    }
+
+    void dedicatedExecutorEventRetainChildHandler(
+        uint8_t *rdram,
+        R5900Context *ctx,
+        PS2Runtime *runtime)
+    {
+        {
+            std::lock_guard<std::mutex> lock(
+                g_executorFixtureMutex);
+            g_executorEventMultiOrder.push_back(2);
+        }
+        const uint32_t eventId =
+            ::getRegU32(ctx, 4);
+        setRegU32(*ctx, 4, eventId);
+        setRegU32(*ctx, 5, 0x4u);
+        setRegU32(*ctx, 6, 0x1u);
+        setRegU32(
+            *ctx,
+            7,
+            K_EXECUTOR_EVENT_RETAIN_RESULT_ADDR);
+        WaitEventFlag(rdram, ctx, runtime);
+        {
+            std::lock_guard<std::mutex> lock(
+                g_executorFixtureMutex);
+            g_executorEventRetainResult =
+                getRegS32(*ctx, 2);
+            g_executorEventRetainBits =
+                readGuestU32(
+                    rdram,
+                    K_EXECUTOR_EVENT_RETAIN_RESULT_ADDR);
+            g_executorEventMultiOrder.push_back(5);
+        }
+        ctx->pc = 0u;
+    }
+
+    void dedicatedExecutorEventMultiMainHandler(
+        uint8_t *rdram,
+        R5900Context *ctx,
+        PS2Runtime *runtime)
+    {
+        InitThread(rdram, ctx, runtime);
+        const std::array<uint32_t, 3u>
+            eventParameters{
+                0x2u,
+                0u,
+                0u,
+            };
+        writeGuestWords(
+            rdram,
+            K_CONTROL_EVENT_PARAM_ADDR,
+            eventParameters.data(),
+            eventParameters.size());
+        setRegU32(
+            *ctx,
+            4,
+            K_CONTROL_EVENT_PARAM_ADDR);
+        CreateEventFlag(rdram, ctx, runtime);
+        const int eventId = getRegS32(*ctx, 2);
+        {
+            std::lock_guard<std::mutex> lock(
+                g_executorFixtureMutex);
+            g_executorEventMultiId = eventId;
+        }
+
+        const auto createAndStart =
+            [&](uint32_t entry, uint32_t stack)
+        {
+            const std::array<uint32_t, 9u>
+                threadParameters{
+                    0u,
+                    entry,
+                    stack,
+                    0x800u,
+                    0u,
+                    0u,
+                    0u,
+                    0u,
+                    0u,
+                };
+            writeGuestWords(
+                rdram,
+                K_EXECUTOR_THREAD_PARAM_ADDR,
+                threadParameters.data(),
+                threadParameters.size());
+            setRegU32(
+                *ctx,
+                4,
+                K_EXECUTOR_THREAD_PARAM_ADDR);
+            CreateThread(rdram, ctx, runtime);
+            const int threadId =
+                getRegS32(*ctx, 2);
+            setRegU32(
+                *ctx,
+                4,
+                static_cast<uint32_t>(
+                    threadId));
+            setRegU32(
+                *ctx,
+                5,
+                static_cast<uint32_t>(
+                    eventId));
+            StartThread(rdram, ctx, runtime);
+            return threadId;
+        };
+
+        (void)createAndStart(
+            K_EXECUTOR_EVENT_CLEAR_CHILD_ENTRY,
+            0x00310000u);
+        const int retainThreadId =
+            createAndStart(
+                K_EXECUTOR_EVENT_RETAIN_CHILD_ENTRY,
+                0x00311000u);
+
+        setRegU32(
+            *ctx,
+            4,
+            static_cast<uint32_t>(eventId));
+        setRegU32(*ctx, 5, 0x4u);
+        SetEventFlag(rdram, ctx, runtime);
+
+        R5900Context statusContext{};
+        setRegU32(
+            statusContext,
+            4,
+            static_cast<uint32_t>(
+                retainThreadId));
+        setRegU32(
+            statusContext,
+            5,
+            K_STATUS_ADDR);
+        iReferThreadStatus(
+            rdram,
+            &statusContext,
+            runtime);
+        EeThreadStatus status{};
+        std::memcpy(
+            &status,
+            rdram + K_STATUS_ADDR,
+            sizeof(status));
+        {
+            std::lock_guard<std::mutex> lock(
+                g_executorFixtureMutex);
+            g_executorEventRetainWaitedAfterFirstSet =
+                status.status == THS_WAIT &&
+                status.waitType == TSW_EVENT;
+            g_executorEventMultiOrder.push_back(4);
+        }
+
+        setRegU32(
+            *ctx,
+            4,
+            static_cast<uint32_t>(eventId));
+        setRegU32(*ctx, 5, 0x4u);
+        SetEventFlag(rdram, ctx, runtime);
+        {
+            std::lock_guard<std::mutex> lock(
+                g_executorFixtureMutex);
+            g_executorEventMultiOrder.push_back(6);
+        }
+        ctx->pc = 0u;
+    }
+
     struct TestEnv
     {
         std::vector<uint8_t> rdram;
@@ -1988,6 +2451,440 @@ void register_ps2_runtime_kernel_tests()
                                 "pre-dispatch status");
                     }
                 }
+            });
+
+        tc.Run(
+            "fiber event wait preserves set release and delete boundaries",
+            [](TestCase &t)
+            {
+                if (!eeExecutionBackendBuildInfo()
+                         .boostContextFcontextAvailable)
+                {
+                    return;
+                }
+
+                struct FixtureResult
+                {
+                    bool memoryInitialized = false;
+                    bool completed = false;
+                    bool rescued = false;
+                    std::vector<int> order;
+                    int eventId = KE_ERROR;
+                    int childThreadId = 0;
+                    int waitResult = KE_ERROR;
+                    int operationResult = KE_ERROR;
+                    uint32_t resultBits = 0u;
+                    bool childRanInsideOperation = false;
+                    int rawStatus = KE_ERROR;
+                    uint32_t rawWaitType = 0u;
+                };
+
+                const auto runFixture =
+                    [](ExecutorEventOperation operation)
+                    {
+                        FixtureResult result{};
+                        PS2RuntimeConfiguration
+                            configuration{};
+                        configuration.eeExecutionBackend =
+                            EeExecutionBackendKind::
+                                LegacyCppFiber;
+                        PS2Runtime runtime(
+                            configuration);
+                        result.memoryInitialized =
+                            runtime.memory().initialize();
+                        if (!result.memoryInitialized)
+                        {
+                            return result;
+                        }
+                        uint8_t *const rdram =
+                            runtime.memory().getRDRAM();
+                        const std::array<uint32_t, 9u>
+                            threadParameters{
+                                0u,
+                                K_EXECUTOR_EVENT_CHILD_ENTRY,
+                                0x00310000u,
+                                0x800u,
+                                0u,
+                                0u,
+                                0u,
+                                0u,
+                                0u,
+                            };
+                        writeGuestWords(
+                            rdram,
+                            K_EXECUTOR_THREAD_PARAM_ADDR,
+                            threadParameters.data(),
+                            threadParameters.size());
+                        runtime.registerFunction(
+                            K_EXECUTOR_EVENT_MAIN_ENTRY,
+                            &dedicatedExecutorEventMainHandler);
+                        runtime.registerFunction(
+                            K_EXECUTOR_EVENT_CHILD_ENTRY,
+                            &dedicatedExecutorEventChildHandler);
+                        runtime.cpu().pc =
+                            K_EXECUTOR_EVENT_MAIN_ENTRY;
+                        setRegU32(
+                            runtime.cpu(),
+                            29,
+                            0x00300000u);
+
+                        {
+                            std::lock_guard<std::mutex>
+                                lock(
+                                    g_executorFixtureMutex);
+                            g_executorEventOperation =
+                                operation;
+                            g_executorEventOrder.clear();
+                            g_executorEventId = KE_ERROR;
+                            g_executorEventChildThreadId =
+                                0;
+                            g_executorEventWaitResult =
+                                KE_ERROR;
+                            g_executorEventOperationResult =
+                                KE_ERROR;
+                            g_executorEventResultBits =
+                                0u;
+                            g_executorEventRawStatus =
+                                KE_ERROR;
+                            g_executorEventRawWaitType =
+                                0u;
+                            g_executorEventOperationInProgress =
+                                false;
+                            g_executorEventChildRanInsideOperation =
+                                false;
+                            g_executorEventMainAttemptedOperation =
+                                false;
+                            g_executorEventRescued = false;
+                        }
+
+                        std::thread rescue(
+                            [&runtime, rdram]()
+                            {
+                                const bool created =
+                                    waitUntil(
+                                        []()
+                                        {
+                                            std::lock_guard<
+                                                std::mutex>
+                                                lock(
+                                                    g_executorFixtureMutex);
+                                            return g_executorEventId >
+                                                   0;
+                                        },
+                                        std::chrono::
+                                            seconds(1));
+                                if (!created)
+                                {
+                                    return;
+                                }
+                                const bool mainReached =
+                                    waitUntil(
+                                        []()
+                                        {
+                                            std::lock_guard<
+                                                std::mutex>
+                                                lock(
+                                                    g_executorFixtureMutex);
+                                            return g_executorEventMainAttemptedOperation;
+                                        },
+                                        std::chrono::
+                                            milliseconds(
+                                                200));
+                                if (mainReached)
+                                {
+                                    return;
+                                }
+
+                                int eventId = KE_ERROR;
+                                {
+                                    std::lock_guard<
+                                        std::mutex>
+                                        lock(
+                                            g_executorFixtureMutex);
+                                    eventId =
+                                        g_executorEventId;
+                                }
+                                R5900Context
+                                    deleteContext{};
+                                setRegU32(
+                                    deleteContext,
+                                    4,
+                                    static_cast<uint32_t>(
+                                        eventId));
+                                DeleteEventFlag(
+                                    rdram,
+                                    &deleteContext,
+                                    &runtime);
+                                {
+                                    std::lock_guard<
+                                        std::mutex>
+                                        lock(
+                                            g_executorFixtureMutex);
+                                    g_executorEventRescued =
+                                        true;
+                                }
+                            });
+
+                        runtime
+                            .startDedicatedEeExecutionForTesting();
+                        result.completed = waitUntil(
+                            []()
+                            {
+                                std::lock_guard<
+                                    std::mutex>
+                                    lock(
+                                        g_executorFixtureMutex);
+                                return g_executorEventOrder
+                                           .size() == 3u;
+                            },
+                            std::chrono::seconds(2));
+                        rescue.join();
+                        runtime
+                            .stopDedicatedEeExecutionForTesting();
+
+                        {
+                            std::lock_guard<std::mutex>
+                                lock(
+                                    g_executorFixtureMutex);
+                            result.order =
+                                g_executorEventOrder;
+                            result.eventId =
+                                g_executorEventId;
+                            result.childThreadId =
+                                g_executorEventChildThreadId;
+                            result.waitResult =
+                                g_executorEventWaitResult;
+                            result.operationResult =
+                                g_executorEventOperationResult;
+                            result.resultBits =
+                                g_executorEventResultBits;
+                            result.childRanInsideOperation =
+                                g_executorEventChildRanInsideOperation;
+                            result.rawStatus =
+                                g_executorEventRawStatus;
+                            result.rawWaitType =
+                                g_executorEventRawWaitType;
+                            result.rescued =
+                                g_executorEventRescued;
+                        }
+                        return result;
+                    };
+
+                const std::array<
+                    std::pair<
+                        ExecutorEventOperation,
+                        const char *>,
+                    6u>
+                    operations{{
+                        {ExecutorEventOperation::
+                             OrdinarySet,
+                         "ordinary set"},
+                        {ExecutorEventOperation::RawSet,
+                         "raw set"},
+                        {ExecutorEventOperation::
+                             RawSetThenClear,
+                         "raw set then clear"},
+                        {ExecutorEventOperation::
+                             OrdinaryRelease,
+                         "ordinary release"},
+                        {ExecutorEventOperation::
+                             RawRelease,
+                         "raw release"},
+                        {ExecutorEventOperation::Delete,
+                         "delete"},
+                    }};
+                for (const auto &[operation, name] :
+                     operations)
+                {
+                    const FixtureResult result =
+                        runFixture(operation);
+                    const bool raw =
+                        operation ==
+                            ExecutorEventOperation::
+                                RawSet ||
+                        operation ==
+                            ExecutorEventOperation::
+                                RawSetThenClear ||
+                        operation ==
+                            ExecutorEventOperation::
+                                RawRelease;
+                    const bool set =
+                        operation ==
+                            ExecutorEventOperation::
+                                OrdinarySet ||
+                        operation ==
+                            ExecutorEventOperation::
+                                RawSet ||
+                        operation ==
+                            ExecutorEventOperation::
+                                RawSetThenClear;
+                    const bool release =
+                        operation ==
+                            ExecutorEventOperation::
+                                OrdinaryRelease ||
+                        operation ==
+                            ExecutorEventOperation::
+                                RawRelease;
+
+                    t.IsTrue(
+                        result.memoryInitialized &&
+                            result.completed &&
+                            !result.rescued &&
+                            result.order ==
+                                (raw
+                                     ? std::vector<int>{
+                                           1, 3, 2}
+                                     : std::vector<int>{
+                                           1, 2, 3}),
+                        std::string(name) +
+                            " should release the sole "
+                            "executor with ordinary/raw "
+                            "dispatch order");
+                    t.IsTrue(
+                        result.eventId > 0 &&
+                            result.waitResult ==
+                                (set
+                                     ? KE_OK
+                                     : (release
+                                            ? KE_RELEASE_WAIT
+                                            : KE_WAIT_DELETE)) &&
+                            result.operationResult ==
+                                (release
+                                     ? result.childThreadId
+                                     : KE_OK) &&
+                            result.resultBits ==
+                                (set
+                                     ? 0x4u
+                                     : 0x7f7f7f7fu) &&
+                            result.childRanInsideOperation ==
+                                !raw,
+                        std::string(name) +
+                            " should preserve event "
+                            "results and dispatch timing");
+                    if (raw)
+                    {
+                        t.IsTrue(
+                            result.rawStatus ==
+                                    THS_READY &&
+                                result.rawWaitType == 0u,
+                            std::string(name) +
+                                " should synchronously "
+                                "publish READY with no "
+                                "retained wait reason");
+                    }
+                }
+            });
+
+        tc.Run(
+            "fiber event wait applies FIFO clear effects",
+            [](TestCase &t)
+            {
+                if (!eeExecutionBackendBuildInfo()
+                         .boostContextFcontextAvailable)
+                {
+                    return;
+                }
+
+                PS2RuntimeConfiguration configuration{};
+                configuration.eeExecutionBackend =
+                    EeExecutionBackendKind::
+                        LegacyCppFiber;
+                PS2Runtime runtime(configuration);
+                const bool memoryInitialized =
+                    runtime.memory().initialize();
+                t.IsTrue(
+                    memoryInitialized,
+                    "the multi-wait event fixture should "
+                    "allocate runtime RDRAM");
+                if (!memoryInitialized)
+                {
+                    return;
+                }
+                runtime.registerFunction(
+                    K_EXECUTOR_EVENT_MULTI_MAIN_ENTRY,
+                    &dedicatedExecutorEventMultiMainHandler);
+                runtime.registerFunction(
+                    K_EXECUTOR_EVENT_CLEAR_CHILD_ENTRY,
+                    &dedicatedExecutorEventClearChildHandler);
+                runtime.registerFunction(
+                    K_EXECUTOR_EVENT_RETAIN_CHILD_ENTRY,
+                    &dedicatedExecutorEventRetainChildHandler);
+                runtime.cpu().pc =
+                    K_EXECUTOR_EVENT_MULTI_MAIN_ENTRY;
+                setRegU32(
+                    runtime.cpu(),
+                    29,
+                    0x00300000u);
+                {
+                    std::lock_guard<std::mutex> lock(
+                        g_executorFixtureMutex);
+                    g_executorEventMultiOrder.clear();
+                    g_executorEventMultiId = KE_ERROR;
+                    g_executorEventClearResult =
+                        KE_ERROR;
+                    g_executorEventRetainResult =
+                        KE_ERROR;
+                    g_executorEventClearBits = 0u;
+                    g_executorEventRetainBits = 0u;
+                    g_executorEventRetainWaitedAfterFirstSet =
+                        false;
+                }
+
+                runtime
+                    .startDedicatedEeExecutionForTesting();
+                const bool completed = waitUntil(
+                    []()
+                    {
+                        std::lock_guard<std::mutex> lock(
+                            g_executorFixtureMutex);
+                        return g_executorEventMultiOrder
+                                   .size() == 6u;
+                    },
+                    std::chrono::seconds(2));
+                runtime
+                    .stopDedicatedEeExecutionForTesting();
+
+                std::vector<int> order;
+                int eventId = KE_ERROR;
+                int clearResult = KE_ERROR;
+                int retainResult = KE_ERROR;
+                uint32_t clearBits = 0u;
+                uint32_t retainBits = 0u;
+                bool retainedWait = false;
+                {
+                    std::lock_guard<std::mutex> lock(
+                        g_executorFixtureMutex);
+                    order = g_executorEventMultiOrder;
+                    eventId = g_executorEventMultiId;
+                    clearResult =
+                        g_executorEventClearResult;
+                    retainResult =
+                        g_executorEventRetainResult;
+                    clearBits =
+                        g_executorEventClearBits;
+                    retainBits =
+                        g_executorEventRetainBits;
+                    retainedWait =
+                        g_executorEventRetainWaitedAfterFirstSet;
+                }
+
+                t.IsTrue(
+                    completed && eventId > 0 &&
+                        order ==
+                            std::vector<int>{
+                                1, 2, 3, 4, 5, 6},
+                    "the first FIFO waiter should run "
+                    "inside the first set and the second "
+                    "inside the second set");
+                t.IsTrue(
+                    clearResult == KE_OK &&
+                        retainResult == KE_OK &&
+                        clearBits == 0x4u &&
+                        retainBits == 0x4u &&
+                        retainedWait,
+                    "the first waiter's clear should "
+                    "consume the first publication before "
+                    "the second predicate is evaluated");
             });
 
         tc.Run("host presentation upload state is isolated per runtime", [](TestCase &t)

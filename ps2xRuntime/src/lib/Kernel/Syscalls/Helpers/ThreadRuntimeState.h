@@ -499,6 +499,7 @@ struct ThreadInfo
     // timeout remain distinguishable after queue membership is detached.
     ps2x::ee::EeSchedulerWaitCompletion pendingWaitCompletion =
         ps2x::ee::EeSchedulerWaitCompletion::None;
+    uint32_t pendingEventFlagResultBits = 0u;
     std::atomic<bool> forceRelease{false};
     std::atomic<bool> terminated{false};
 };

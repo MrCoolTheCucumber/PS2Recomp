@@ -732,6 +732,7 @@ namespace ps2_syscalls
                 ps2x::ee::
                     EeSchedulerWaitCompletion::
                         None;
+            info->pendingEventFlagResultBits = 0u;
             if (info->stack == 0 && info->stackSize != 0)
             {
                 const uint32_t autoStack = runtime->guestMalloc(info->stackSize, 16u);
@@ -931,6 +932,7 @@ namespace ps2_syscalls
                     ps2x::ee::
                         EeSchedulerWaitCompletion::
                             None;
+                info->pendingEventFlagResultBits = 0u;
                 info->terminated = false;
             }
 
@@ -2202,13 +2204,26 @@ namespace ps2_syscalls
 
         if (runtime->usesDedicatedEeExecutor() &&
             (waitType == TSW_SEMA ||
-             waitType == TSW_SLEEP))
+             waitType == TSW_SLEEP ||
+             waitType == TSW_EVENT))
         {
             const auto sema =
                 waitType == TSW_SEMA
                     ? lookupSemaInfo(runtime, waitId)
                     : std::shared_ptr<SemaInfo>{};
+            const auto eventFlag =
+                waitType == TSW_EVENT
+                    ? lookupEventFlagInfo(
+                          runtime, waitId)
+                    : std::shared_ptr<
+                          EventFlagInfo>{};
             if (waitType == TSW_SEMA && !sema)
+            {
+                setReturnS32(ctx, KE_NOT_WAIT);
+                return;
+            }
+            if (waitType == TSW_EVENT &&
+                !eventFlag)
             {
                 setReturnS32(ctx, KE_NOT_WAIT);
                 return;
@@ -2227,6 +2242,7 @@ namespace ps2_syscalls
                 runtime->publishEeSchedulerUpdate(
                     [info,
                      sema,
+                     eventFlag,
                      tid,
                      generation,
                      waitType,
@@ -2264,8 +2280,12 @@ namespace ps2_syscalls
                                 waitType == TSW_SEMA
                                     ? EeThreadWaitQueue::
                                           Semaphore
-                                    : EeThreadWaitQueue::
-                                          Sleep;
+                                    : (waitType ==
+                                               TSW_EVENT
+                                           ? EeThreadWaitQueue::
+                                                 EventFlag
+                                           : EeThreadWaitQueue::
+                                                 Sleep);
                             if (!info->guestState
                                      .releaseWait(
                                          queue,
@@ -2282,6 +2302,8 @@ namespace ps2_syscalls
                                 ps2x::ee::
                                     EeSchedulerWaitCompletion::
                                         Released;
+                            info->pendingEventFlagResultBits =
+                                0u;
                             info->forceRelease = true;
                             transition->released = true;
                         };
@@ -2301,6 +2323,44 @@ namespace ps2_syscalls
                                         "waiter accounting");
                                 }
                                 --sema->waiters;
+                            }
+                        }
+                        else if (eventFlag)
+                        {
+                            std::lock_guard<std::mutex>
+                                eventLock(eventFlag->m);
+                            const auto request =
+                                eventFlag
+                                    ->schedulerWaiters
+                                    .find(tid);
+                            if (request ==
+                                    eventFlag
+                                        ->schedulerWaiters
+                                        .end() ||
+                                request->second
+                                        .generation !=
+                                    generation)
+                            {
+                                throw std::logic_error(
+                                    "ReleaseWaitThread "
+                                    "lost event wait "
+                                    "predicate");
+                            }
+                            applyRelease();
+                            if (transition->released)
+                            {
+                                if (eventFlag->waiters <=
+                                    0)
+                                {
+                                    throw std::logic_error(
+                                        "ReleaseWaitThread "
+                                        "lost event waiter "
+                                        "accounting");
+                                }
+                                eventFlag
+                                    ->schedulerWaiters
+                                    .erase(request);
+                                --eventFlag->waiters;
                             }
                         }
                         else
