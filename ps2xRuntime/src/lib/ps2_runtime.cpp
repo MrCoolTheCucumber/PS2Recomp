@@ -911,6 +911,33 @@ PS2Runtime::PS2Runtime(PS2RuntimeConfiguration configuration)
         m_vu1, configuration.vu1NativeInstrumentation,
         "PS2X_VU1_NATIVE_INSTRUMENTATION");
 
+    m_eeThreadDiagnosticsEnabled =
+        configuration.eeThreadDiagnostics;
+    if (configuration.useEeThreadDiagnosticsEnvironment)
+    {
+        if (const char *const value =
+                std::getenv("PS2X_EE_THREAD_DIAGNOSTICS"))
+        {
+            const std::string_view text(value);
+            if (text == "1" || text == "true" ||
+                text == "on")
+            {
+                m_eeThreadDiagnosticsEnabled = true;
+            }
+            else if (text == "0" || text == "false" ||
+                     text == "off")
+            {
+                m_eeThreadDiagnosticsEnabled = false;
+            }
+            else
+            {
+                throw std::invalid_argument(
+                    "PS2X_EE_THREAD_DIAGNOSTICS must be "
+                    "0, 1, false, true, off, or on");
+            }
+        }
+    }
+
     m_memory.setEeCounterCycleCallback(
         [this]()
         {
@@ -1844,6 +1871,8 @@ void PS2Runtime::publishEeVSyncField() noexcept
             kGsCsrFieldMask,
             std::memory_order_relaxed);
     }
+    m_debugVSyncFields.fetch_add(
+        1u, std::memory_order_relaxed);
 }
 
 bool PS2Runtime::queuePendingVSyncDelivery(
@@ -6433,7 +6462,7 @@ R5900Context *PS2Runtime::enterGuestExecution(
 
     if (depth != 0u)
     {
-        m_guestExecutionMutex.lock();
+        lockGuestExecutionMutex(false);
         ++depth;
         R5900Context *const previousContext =
             m_boundEeContext;
@@ -6444,9 +6473,10 @@ R5900Context *PS2Runtime::enterGuestExecution(
     if (!m_debugControlActive.load(std::memory_order_acquire))
     {
         m_guestExecutionWaiters.fetch_add(1u, std::memory_order_acq_rel);
-        m_guestExecutionMutex.lock();
+        lockGuestExecutionMutex(true);
         m_guestExecutionWaiters.fetch_sub(1u, std::memory_order_acq_rel);
         depth = 1u;
+        recordOuterGuestExecutionAcquisition(context);
         markGuestExecutionAcquired();
         R5900Context *const previousContext =
             m_boundEeContext;
@@ -6464,7 +6494,7 @@ R5900Context *PS2Runtime::enterGuestExecution(
         }
 
         m_guestExecutionWaiters.fetch_add(1u, std::memory_order_acq_rel);
-        m_guestExecutionMutex.lock();
+        lockGuestExecutionMutex(true);
         m_guestExecutionWaiters.fetch_sub(1u, std::memory_order_acq_rel);
 
         // Close the race where a pause is requested after the condition check
@@ -6477,11 +6507,56 @@ R5900Context *PS2Runtime::enterGuestExecution(
         m_guestExecutionMutex.unlock();
     }
     depth = 1u;
+    recordOuterGuestExecutionAcquisition(context);
     markGuestExecutionAcquired();
     R5900Context *const previousContext =
         m_boundEeContext;
     switchGuestExecutionContext(context);
     return previousContext;
+}
+
+void PS2Runtime::lockGuestExecutionMutex(bool mayContend)
+{
+    if (!m_eeThreadDiagnosticsEnabled)
+    {
+        m_guestExecutionMutex.lock();
+        return;
+    }
+
+    m_eeThreadDiagnosticGuestLockRequests.fetch_add(
+        1u, std::memory_order_relaxed);
+    if (mayContend && !m_guestExecutionMutex.try_lock())
+    {
+        m_eeThreadDiagnosticGuestLockContentions.fetch_add(
+            1u, std::memory_order_relaxed);
+        m_guestExecutionMutex.lock();
+    }
+    else if (!mayContend)
+    {
+        m_guestExecutionMutex.lock();
+    }
+    m_eeThreadDiagnosticGuestLockAcquisitions.fetch_add(
+        1u, std::memory_order_relaxed);
+}
+
+void PS2Runtime::recordOuterGuestExecutionAcquisition(
+    R5900Context *context) noexcept
+{
+    if (!m_eeThreadDiagnosticsEnabled)
+    {
+        return;
+    }
+
+    m_eeThreadDiagnosticOuterGuestExecutionAcquisitions.fetch_add(
+        1u, std::memory_order_relaxed);
+    if (m_eeThreadDiagnosticsHasLastOuterContext &&
+        m_eeThreadDiagnosticsLastOuterContext != context)
+    {
+        m_eeThreadDiagnosticGuestContextChanges.fetch_add(
+            1u, std::memory_order_relaxed);
+    }
+    m_eeThreadDiagnosticsLastOuterContext = context;
+    m_eeThreadDiagnosticsHasLastOuterContext = true;
 }
 
 void PS2Runtime::leaveGuestExecution(
@@ -6572,13 +6647,18 @@ void PS2Runtime::reacquireGuestExecution(
 
     for (uint32_t i = 0; i < remaining; ++i)
     {
-        m_guestExecutionMutex.lock();
+        lockGuestExecutionMutex(false);
         ++heldDepth;
     }
 }
 
 void PS2Runtime::markGuestExecutionAcquired()
 {
+    if (m_eeThreadDiagnosticsEnabled)
+    {
+        m_eeThreadDiagnosticHandoffNotifications.fetch_add(
+            1u, std::memory_order_relaxed);
+    }
     {
         std::lock_guard<std::mutex> lock(m_guestExecutionHandoffMutex);
         m_guestExecutionHandoffEpoch.fetch_add(1u, std::memory_order_acq_rel);
@@ -6593,9 +6673,20 @@ void PS2Runtime::waitForGuestExecutionHandoff()
 
 void PS2Runtime::waitForGuestExecutionHandoff(uint64_t baselineEpoch)
 {
+    if (m_eeThreadDiagnosticsEnabled)
+    {
+        m_eeThreadDiagnosticHandoffWaitRequests.fetch_add(
+            1u, std::memory_order_relaxed);
+    }
+
     // Lock-free fast path
     if (m_guestExecutionWaiters.load(std::memory_order_acquire) == 0u)
     {
+        if (m_eeThreadDiagnosticsEnabled)
+        {
+            m_eeThreadDiagnosticHandoffWaitFastPaths.fetch_add(
+                1u, std::memory_order_relaxed);
+        }
         return;
     }
 
@@ -6603,9 +6694,19 @@ void PS2Runtime::waitForGuestExecutionHandoff(uint64_t baselineEpoch)
 
     if (m_guestExecutionWaiters.load(std::memory_order_acquire) == 0u)
     {
+        if (m_eeThreadDiagnosticsEnabled)
+        {
+            m_eeThreadDiagnosticHandoffWaitFastPaths.fetch_add(
+                1u, std::memory_order_relaxed);
+        }
         return;
     }
 
+    if (m_eeThreadDiagnosticsEnabled)
+    {
+        m_eeThreadDiagnosticHandoffCvWaits.fetch_add(
+            1u, std::memory_order_relaxed);
+    }
     const bool handedOff = m_guestExecutionHandoffCv.wait_for(
         lock,
         std::chrono::milliseconds(2),
@@ -6619,6 +6720,16 @@ void PS2Runtime::waitForGuestExecutionHandoff(uint64_t baselineEpoch)
     if (!handedOff)
     {
         m_guestExecutionHandoffTimeouts.fetch_add(1u, std::memory_order_relaxed);
+        if (m_eeThreadDiagnosticsEnabled)
+        {
+            m_eeThreadDiagnosticHandoffTimeouts.fetch_add(
+                1u, std::memory_order_relaxed);
+        }
+    }
+    else if (m_eeThreadDiagnosticsEnabled)
+    {
+        m_eeThreadDiagnosticHandoffCompletions.fetch_add(
+            1u, std::memory_order_relaxed);
     }
 }
 
@@ -7469,12 +7580,86 @@ bool PS2Runtime::debugCopyGsVram(std::vector<uint8_t> &output)
     return true;
 }
 
+void PS2Runtime::recordEeThreadQueueRotation(
+    int threadId,
+    int requestedPriority,
+    int effectivePriority,
+    bool accepted) noexcept
+{
+    if (!m_eeThreadDiagnosticsEnabled)
+    {
+        return;
+    }
+
+    m_eeThreadDiagnosticRotationRequests.fetch_add(
+        1u, std::memory_order_relaxed);
+    if (requestedPriority == 0)
+    {
+        m_eeThreadDiagnosticPriorityZeroRotationRequests.fetch_add(
+            1u, std::memory_order_relaxed);
+    }
+    if (!accepted)
+    {
+        m_eeThreadDiagnosticRejectedRotationRequests.fetch_add(
+            1u, std::memory_order_relaxed);
+        return;
+    }
+
+    m_eeThreadDiagnosticAcceptedRotationRequests.fetch_add(
+        1u, std::memory_order_relaxed);
+    if (effectivePriority >= 0 &&
+        static_cast<size_t>(effectivePriority) <
+            m_eeThreadDiagnosticAcceptedRotationsByPriority.size())
+    {
+        m_eeThreadDiagnosticAcceptedRotationsByPriority[
+            static_cast<size_t>(effectivePriority)]
+            .fetch_add(1u, std::memory_order_relaxed);
+    }
+    if (threadId >= 0 &&
+        static_cast<size_t>(threadId) <
+            m_eeThreadDiagnosticAcceptedRotationsByThread.size())
+    {
+        m_eeThreadDiagnosticAcceptedRotationsByThread[
+            static_cast<size_t>(threadId)]
+            .fetch_add(1u, std::memory_order_relaxed);
+    }
+    else
+    {
+        m_eeThreadDiagnosticUntrackedThreadRotationRequests.fetch_add(
+            1u, std::memory_order_relaxed);
+    }
+}
+
+void PS2Runtime::recordMpegPictureServed(bool repeated) noexcept
+{
+    m_debugMpegPicturesServed.fetch_add(
+        1u, std::memory_order_relaxed);
+    if (repeated)
+    {
+        m_debugMpegRepeatedPicturesServed.fetch_add(
+            1u, std::memory_order_relaxed);
+    }
+    else
+    {
+        m_debugMpegUniquePicturesServed.fetch_add(
+            1u, std::memory_order_relaxed);
+    }
+}
+
 PS2Runtime::DebugRuntimeProgress PS2Runtime::debugRuntimeProgress() const
 {
     DebugRuntimeProgress progress{};
     progress.dispatches = m_debugDispatches.load(std::memory_order_relaxed);
     progress.eeInstructions =
         m_debugEeInstructions.load(std::memory_order_relaxed);
+    progress.vsyncFields =
+        m_debugVSyncFields.load(std::memory_order_relaxed);
+    progress.mpegPicturesServed =
+        m_debugMpegPicturesServed.load(std::memory_order_relaxed);
+    progress.mpegUniquePicturesServed =
+        m_debugMpegUniquePicturesServed.load(std::memory_order_relaxed);
+    progress.mpegRepeatedPicturesServed =
+        m_debugMpegRepeatedPicturesServed.load(std::memory_order_relaxed);
     progress.pc = m_debugPc.load(std::memory_order_relaxed);
     progress.ra = m_debugRa.load(std::memory_order_relaxed);
     progress.sp = m_debugSp.load(std::memory_order_relaxed);
@@ -7484,6 +7669,99 @@ PS2Runtime::DebugRuntimeProgress PS2Runtime::debugRuntimeProgress() const
     progress.guestExecutionHandoffTimeouts =
         m_guestExecutionHandoffTimeouts.load(std::memory_order_relaxed);
     return progress;
+}
+
+PS2Runtime::DebugEeThreadDiagnostics
+PS2Runtime::debugEeThreadDiagnosticsSnapshot() const
+{
+    DebugEeThreadDiagnostics result{};
+    result.enabled = m_eeThreadDiagnosticsEnabled;
+    result.guestLockRequests =
+        m_eeThreadDiagnosticGuestLockRequests.load(
+            std::memory_order_relaxed);
+    result.guestLockAcquisitions =
+        m_eeThreadDiagnosticGuestLockAcquisitions.load(
+            std::memory_order_relaxed);
+    result.guestLockContentions =
+        m_eeThreadDiagnosticGuestLockContentions.load(
+            std::memory_order_relaxed);
+    result.outerGuestExecutionAcquisitions =
+        m_eeThreadDiagnosticOuterGuestExecutionAcquisitions.load(
+            std::memory_order_relaxed);
+    result.guestContextChanges =
+        m_eeThreadDiagnosticGuestContextChanges.load(
+            std::memory_order_relaxed);
+    result.handoffNotifications =
+        m_eeThreadDiagnosticHandoffNotifications.load(
+            std::memory_order_relaxed);
+    result.handoffWaitRequests =
+        m_eeThreadDiagnosticHandoffWaitRequests.load(
+            std::memory_order_relaxed);
+    result.handoffWaitFastPaths =
+        m_eeThreadDiagnosticHandoffWaitFastPaths.load(
+            std::memory_order_relaxed);
+    result.handoffCvWaits =
+        m_eeThreadDiagnosticHandoffCvWaits.load(
+            std::memory_order_relaxed);
+    result.handoffCompletions =
+        m_eeThreadDiagnosticHandoffCompletions.load(
+            std::memory_order_relaxed);
+    result.handoffTimeouts =
+        m_eeThreadDiagnosticHandoffTimeouts.load(
+            std::memory_order_relaxed);
+    result.yieldRequests =
+        m_eeThreadDiagnosticYieldRequests.load(
+            std::memory_order_relaxed);
+    result.deferredYields =
+        m_eeThreadDiagnosticDeferredYields.load(
+            std::memory_order_relaxed);
+    result.hostThreadYields =
+        m_eeThreadDiagnosticHostThreadYields.load(
+            std::memory_order_relaxed);
+    result.requestedGuestSwitches =
+        m_eeThreadDiagnosticRequestedGuestSwitches.load(
+            std::memory_order_relaxed);
+    result.guestSwitchCvWaits =
+        m_eeThreadDiagnosticGuestSwitchCvWaits.load(
+            std::memory_order_relaxed);
+    result.completedGuestSwitches =
+        m_eeThreadDiagnosticCompletedGuestSwitches.load(
+            std::memory_order_relaxed);
+    result.guestSwitchTimeouts =
+        m_eeThreadDiagnosticGuestSwitchTimeouts.load(
+            std::memory_order_relaxed);
+    result.rotationRequests =
+        m_eeThreadDiagnosticRotationRequests.load(
+            std::memory_order_relaxed);
+    result.acceptedRotationRequests =
+        m_eeThreadDiagnosticAcceptedRotationRequests.load(
+            std::memory_order_relaxed);
+    result.rejectedRotationRequests =
+        m_eeThreadDiagnosticRejectedRotationRequests.load(
+            std::memory_order_relaxed);
+    result.priorityZeroRotationRequests =
+        m_eeThreadDiagnosticPriorityZeroRotationRequests.load(
+            std::memory_order_relaxed);
+    result.untrackedThreadRotationRequests =
+        m_eeThreadDiagnosticUntrackedThreadRotationRequests.load(
+            std::memory_order_relaxed);
+    for (size_t priority = 0u;
+         priority < result.acceptedRotationsByPriority.size();
+         ++priority)
+    {
+        result.acceptedRotationsByPriority[priority] =
+            m_eeThreadDiagnosticAcceptedRotationsByPriority[priority]
+                .load(std::memory_order_relaxed);
+    }
+    for (size_t thread = 0u;
+         thread < result.acceptedRotationsByThread.size();
+         ++thread)
+    {
+        result.acceptedRotationsByThread[thread] =
+            m_eeThreadDiagnosticAcceptedRotationsByThread[thread]
+                .load(std::memory_order_relaxed);
+    }
+    return result;
 }
 
 void PS2Runtime::debugRecordBranch(uint32_t pc)
@@ -8068,8 +8346,19 @@ PS2Runtime::DeferredGuestYieldScope::~DeferredGuestYieldScope()
 
 void PS2Runtime::yieldGuestExecutionAfterWake()
 {
+    if (m_eeThreadDiagnosticsEnabled)
+    {
+        m_eeThreadDiagnosticYieldRequests.fetch_add(
+            1u, std::memory_order_relaxed);
+    }
+
     if (g_deferredGuestYieldDepth != 0u)
     {
+        if (m_eeThreadDiagnosticsEnabled)
+        {
+            m_eeThreadDiagnosticDeferredYields.fetch_add(
+                1u, std::memory_order_relaxed);
+        }
         g_deferredGuestYieldPending = true;
         return;
     }
@@ -8077,16 +8366,49 @@ void PS2Runtime::yieldGuestExecutionAfterWake()
     auto it = g_guestExecutionDepths.find(this);
     if (it == g_guestExecutionDepths.end() || it->second == 0u)
     {
+        if (m_eeThreadDiagnosticsEnabled)
+        {
+            m_eeThreadDiagnosticHostThreadYields.fetch_add(
+                1u, std::memory_order_relaxed);
+        }
         std::this_thread::yield();
         return;
     }
 
+    if (m_eeThreadDiagnosticsEnabled)
+    {
+        m_eeThreadDiagnosticRequestedGuestSwitches.fetch_add(
+            1u, std::memory_order_relaxed);
+    }
     const uint64_t handoffEpoch = m_guestExecutionHandoffEpoch.load(std::memory_order_acquire);
+    bool handedOff = false;
     {
         GuestExecutionReleaseScope releaseGuestExecution(this);
         std::unique_lock<std::mutex> lock(m_guestExecutionHandoffMutex);
-        m_guestExecutionHandoffCv.wait_for(lock, std::chrono::milliseconds(2), [&]()
-                                           { return m_guestExecutionHandoffEpoch.load(std::memory_order_acquire) != handoffEpoch; });
+        if (m_eeThreadDiagnosticsEnabled)
+        {
+            m_eeThreadDiagnosticGuestSwitchCvWaits.fetch_add(
+                1u, std::memory_order_relaxed);
+        }
+        handedOff = m_guestExecutionHandoffCv.wait_for(
+            lock, std::chrono::milliseconds(2), [&]()
+            {
+                return m_guestExecutionHandoffEpoch.load(
+                           std::memory_order_acquire) != handoffEpoch;
+            });
+    }
+    if (m_eeThreadDiagnosticsEnabled)
+    {
+        if (handedOff)
+        {
+            m_eeThreadDiagnosticCompletedGuestSwitches.fetch_add(
+                1u, std::memory_order_relaxed);
+        }
+        else
+        {
+            m_eeThreadDiagnosticGuestSwitchTimeouts.fetch_add(
+                1u, std::memory_order_relaxed);
+        }
     }
 }
 

@@ -35,8 +35,14 @@ struct PS2AudioStreamDebugSnapshot
     uint64_t submissionCount = 0;
     uint64_t submittedBytes = 0;
     uint64_t lastSubmissionHash = 0;
+    uint64_t producedFrames = 0;
+    uint64_t requestedFrames = 0;
+    uint64_t consumedFrames = 0;
+    uint64_t zeroFilledFrames = 0;
     size_t queuedSamples = 0;
 };
+
+struct PS2AudioBackendTestAccess;
 
 class PS2AudioBackend
 {
@@ -82,8 +88,13 @@ private:
                                   uint32_t sendSize,
                                   const uint8_t *streamData,
                                   uint32_t streamDataSize);
+    void renderSpuAdpcmFramesForTesting(
+        void *bufferData,
+        unsigned int frameCount);
     void destroySpuAdpcmHostStream();
     void closeSpuAdpcmStream();
+
+    friend struct PS2AudioBackendTestAccess;
 };
 
 #endif

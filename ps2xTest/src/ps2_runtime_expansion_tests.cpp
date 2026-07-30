@@ -1077,9 +1077,133 @@ void register_ps2_runtime_expansion_tests()
                      "dispatchLoop should not execute guest code concurrently on one runtime");
         });
 
+        tc.Run("EE thread diagnostics are disabled by default and classify rotations when enabled", [](TestCase &t)
+        {
+            {
+                PS2RuntimeConfiguration configuration{};
+                configuration.useEeThreadDiagnosticsEnvironment =
+                    false;
+                PS2Runtime runtime(configuration);
+                R5900Context context{};
+                runtime.recordEeThreadQueueRotation(
+                    2, 1, 1, true);
+                {
+                    PS2Runtime::GuestExecutionScope scope(
+                        &runtime, &context);
+                }
+                const auto disabled =
+                    runtime.debugEeThreadDiagnosticsSnapshot();
+                t.IsFalse(
+                    disabled.enabled,
+                    "scheduler diagnostics must be opt-in");
+                t.Equals(
+                    disabled.rotationRequests,
+                    uint64_t{0u},
+                    "disabled scheduler diagnostics must not update rotation counters");
+                t.Equals(
+                    disabled.guestLockAcquisitions,
+                    uint64_t{0u},
+                    "disabled scheduler diagnostics must not update lock counters");
+            }
+
+            PS2RuntimeConfiguration configuration{};
+            configuration.eeThreadDiagnostics = true;
+            configuration.useEeThreadDiagnosticsEnvironment = false;
+            PS2Runtime runtime(configuration);
+            R5900Context first{};
+            R5900Context second{};
+            {
+                PS2Runtime::GuestExecutionScope scope(
+                    &runtime, &first);
+            }
+            {
+                PS2Runtime::GuestExecutionScope scope(
+                    &runtime, &second);
+            }
+            runtime.recordEeThreadQueueRotation(
+                2, 0, 1, true);
+            runtime.recordEeThreadQueueRotation(
+                2, 1, 1, true);
+            runtime.recordEeThreadQueueRotation(
+                3, 128, 128, false);
+
+            const auto diagnostics =
+                runtime.debugEeThreadDiagnosticsSnapshot();
+            t.IsTrue(
+                diagnostics.enabled,
+                "the explicit runtime configuration should enable scheduler diagnostics");
+            t.Equals(
+                diagnostics.guestLockRequests,
+                uint64_t{2u},
+                "two outer scopes should request the guest lock twice");
+            t.Equals(
+                diagnostics.guestLockAcquisitions,
+                uint64_t{2u},
+                "two uncontended outer scopes should acquire the guest lock twice");
+            t.Equals(
+                diagnostics.guestLockContentions,
+                uint64_t{0u},
+                "sequential scopes should not report lock contention");
+            t.Equals(
+                diagnostics.outerGuestExecutionAcquisitions,
+                uint64_t{2u},
+                "both outer scopes should be classified");
+            t.Equals(
+                diagnostics.guestContextChanges,
+                uint64_t{1u},
+                "switching from the first context to the second should count once");
+            t.Equals(
+                diagnostics.handoffNotifications,
+                uint64_t{2u},
+                "each outer acquisition should publish one handoff epoch");
+            t.Equals(
+                diagnostics.rotationRequests,
+                uint64_t{3u},
+                "accepted and rejected rotations should all be counted");
+            t.Equals(
+                diagnostics.acceptedRotationRequests,
+                uint64_t{2u},
+                "accepted rotations should be counted separately");
+            t.Equals(
+                diagnostics.rejectedRotationRequests,
+                uint64_t{1u},
+                "invalid-priority rotations should be retained");
+            t.Equals(
+                diagnostics.priorityZeroRotationRequests,
+                uint64_t{1u},
+                "priority-zero requests should remain visible after resolution");
+            t.Equals(
+                diagnostics.acceptedRotationsByPriority[1u],
+                uint64_t{2u},
+                "resolved priority buckets should include both accepted requests");
+            t.Equals(
+                diagnostics.acceptedRotationsByThread[2u],
+                uint64_t{2u},
+                "thread buckets should include both accepted requests");
+
+            runtime.recordMpegPictureServed(false);
+            runtime.recordMpegPictureServed(true);
+            const auto progress = runtime.debugRuntimeProgress();
+            t.Equals(
+                progress.mpegPicturesServed,
+                uint64_t{2u},
+                "all successfully served MPEG pictures should be counted");
+            t.Equals(
+                progress.mpegUniquePicturesServed,
+                uint64_t{1u},
+                "decoded MPEG pictures should be distinguished from repeats");
+            t.Equals(
+                progress.mpegRepeatedPicturesServed,
+                uint64_t{1u},
+                "repeated MPEG pictures should be reported separately");
+        });
+
         tc.Run("wake handoff lets a contending guest thread acquire before returning", [](TestCase &t)
         {
-            PS2Runtime runtime;
+            PS2RuntimeConfiguration configuration{};
+            configuration.eeThreadDiagnostics = true;
+            configuration.useEeThreadDiagnosticsEnvironment = false;
+            PS2Runtime runtime(configuration);
             std::atomic<bool> peerRan{false};
             std::thread peer;
             bool peerWaiting = false;
@@ -1112,6 +1236,27 @@ void register_ps2_runtime_expansion_tests()
             t.IsTrue(peerWaiting, "peer guest thread should contend while the waker owns guest execution");
             t.IsFalse(peerRanWhileMainHeld, "peer guest thread should not run before the waker yields execution");
             t.IsTrue(peerRanAfterHandoff, "wake handoff should let the peer acquire guest execution before returning");
+            const auto diagnostics =
+                runtime.debugEeThreadDiagnosticsSnapshot();
+            t.Equals(
+                diagnostics.requestedGuestSwitches,
+                uint64_t{1u},
+                "one in-scope yield should request one guest switch");
+            t.Equals(
+                diagnostics.completedGuestSwitches,
+                uint64_t{1u},
+                "the contending peer should complete the requested guest switch");
+            t.Equals(
+                diagnostics.guestSwitchCvWaits,
+                uint64_t{1u},
+                "the requested switch should perform one bounded CV wait");
+            t.Equals(
+                diagnostics.guestSwitchTimeouts,
+                uint64_t{0u},
+                "the completed handoff should not be classified as a timeout");
+            t.IsTrue(
+                diagnostics.guestLockContentions >= 1u,
+                "the waiting peer should be observed as a contended guest lock");
         });
 
         tc.Run("recursive guest execution acquisition does not advance the handoff epoch", [](TestCase &t)

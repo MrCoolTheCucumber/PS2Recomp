@@ -55,6 +55,8 @@ struct PS2RuntimeConfiguration
     bool vu0NativeInstrumentation = false;
     bool vu1NativeInstrumentation = false;
     bool useVuBackendEnvironment = true;
+    bool eeThreadDiagnostics = false;
+    bool useEeThreadDiagnosticsEnvironment = true;
 };
 
 enum PS2Exception
@@ -507,12 +509,57 @@ public:
     {
         uint64_t dispatches = 0u;
         uint64_t eeInstructions = 0u;
+        uint64_t vsyncFields = 0u;
+        uint64_t mpegPicturesServed = 0u;
+        uint64_t mpegUniquePicturesServed = 0u;
+        uint64_t mpegRepeatedPicturesServed = 0u;
         uint32_t pc = 0u;
         uint32_t ra = 0u;
         uint32_t sp = 0u;
         uint32_t gp = 0u;
         uint32_t guestExecutionWaiters = 0u;
         uint64_t guestExecutionHandoffTimeouts = 0u;
+    };
+
+    static constexpr size_t
+        kEeThreadDiagnosticPriorityCount = 128u;
+    static constexpr size_t
+        kEeThreadDiagnosticThreadCount = 256u;
+
+    struct DebugEeThreadDiagnostics
+    {
+        bool enabled = false;
+        uint64_t guestLockRequests = 0u;
+        uint64_t guestLockAcquisitions = 0u;
+        uint64_t guestLockContentions = 0u;
+        uint64_t outerGuestExecutionAcquisitions = 0u;
+        uint64_t guestContextChanges = 0u;
+        uint64_t handoffNotifications = 0u;
+        uint64_t handoffWaitRequests = 0u;
+        uint64_t handoffWaitFastPaths = 0u;
+        uint64_t handoffCvWaits = 0u;
+        uint64_t handoffCompletions = 0u;
+        uint64_t handoffTimeouts = 0u;
+        uint64_t yieldRequests = 0u;
+        uint64_t deferredYields = 0u;
+        uint64_t hostThreadYields = 0u;
+        uint64_t requestedGuestSwitches = 0u;
+        uint64_t guestSwitchCvWaits = 0u;
+        uint64_t completedGuestSwitches = 0u;
+        uint64_t guestSwitchTimeouts = 0u;
+        uint64_t rotationRequests = 0u;
+        uint64_t acceptedRotationRequests = 0u;
+        uint64_t rejectedRotationRequests = 0u;
+        uint64_t priorityZeroRotationRequests = 0u;
+        uint64_t untrackedThreadRotationRequests = 0u;
+        std::array<
+            uint64_t,
+            kEeThreadDiagnosticPriorityCount>
+            acceptedRotationsByPriority{};
+        std::array<
+            uint64_t,
+            kEeThreadDiagnosticThreadCount>
+            acceptedRotationsByThread{};
     };
 
     struct DebugEeTiming
@@ -1089,6 +1136,13 @@ public:
         return m_guestExecutionHandoffEpoch.load(std::memory_order_acquire);
     }
 
+    void recordEeThreadQueueRotation(
+        int threadId,
+        int requestedPriority,
+        int effectivePriority,
+        bool accepted) noexcept;
+    void recordMpegPictureServed(bool repeated) noexcept;
+
     void requestStop();
     bool isStopRequested() const;
 
@@ -1111,6 +1165,7 @@ public:
     bool debugReadMemory(uint32_t address, uint32_t size, std::vector<uint8_t> &output);
     bool debugCopyGsVram(std::vector<uint8_t> &output);
     DebugRuntimeProgress debugRuntimeProgress() const;
+    DebugEeThreadDiagnostics debugEeThreadDiagnosticsSnapshot() const;
     DebugVu1Timing debugVu1TimingSnapshot();
     std::array<DebugVuBackendDiagnostics, 2u>
     debugVuBackendDiagnosticsSnapshot() const;
@@ -1239,6 +1294,9 @@ private:
     void freeGuestBlockLocked(uint32_t guestAddr);
     void coalesceGuestHeapLocked();
     R5900Context *enterGuestExecution(R5900Context *context);
+    void lockGuestExecutionMutex(bool mayContend);
+    void recordOuterGuestExecutionAcquisition(
+        R5900Context *context) noexcept;
     void leaveGuestExecution(
         R5900Context *context,
         R5900Context *previousContext);
@@ -1634,6 +1692,47 @@ private:
     std::atomic<uint64_t> m_guestExecutionHandoffTimeouts{0u};
     std::atomic<uint64_t> m_guestExecutionPreemptionEpoch{0u};
     std::atomic<bool> m_guestExecutionPreemptionRequested{false};
+    bool m_eeThreadDiagnosticsEnabled = false;
+    bool m_eeThreadDiagnosticsHasLastOuterContext = false;
+    R5900Context *m_eeThreadDiagnosticsLastOuterContext = nullptr;
+    std::atomic<uint64_t> m_eeThreadDiagnosticGuestLockRequests{0u};
+    std::atomic<uint64_t> m_eeThreadDiagnosticGuestLockAcquisitions{0u};
+    std::atomic<uint64_t> m_eeThreadDiagnosticGuestLockContentions{0u};
+    std::atomic<uint64_t>
+        m_eeThreadDiagnosticOuterGuestExecutionAcquisitions{0u};
+    std::atomic<uint64_t> m_eeThreadDiagnosticGuestContextChanges{0u};
+    std::atomic<uint64_t> m_eeThreadDiagnosticHandoffNotifications{0u};
+    std::atomic<uint64_t> m_eeThreadDiagnosticHandoffWaitRequests{0u};
+    std::atomic<uint64_t> m_eeThreadDiagnosticHandoffWaitFastPaths{0u};
+    std::atomic<uint64_t> m_eeThreadDiagnosticHandoffCvWaits{0u};
+    std::atomic<uint64_t> m_eeThreadDiagnosticHandoffCompletions{0u};
+    std::atomic<uint64_t> m_eeThreadDiagnosticHandoffTimeouts{0u};
+    std::atomic<uint64_t> m_eeThreadDiagnosticYieldRequests{0u};
+    std::atomic<uint64_t> m_eeThreadDiagnosticDeferredYields{0u};
+    std::atomic<uint64_t> m_eeThreadDiagnosticHostThreadYields{0u};
+    std::atomic<uint64_t> m_eeThreadDiagnosticRequestedGuestSwitches{0u};
+    std::atomic<uint64_t> m_eeThreadDiagnosticGuestSwitchCvWaits{0u};
+    std::atomic<uint64_t> m_eeThreadDiagnosticCompletedGuestSwitches{0u};
+    std::atomic<uint64_t> m_eeThreadDiagnosticGuestSwitchTimeouts{0u};
+    std::atomic<uint64_t> m_eeThreadDiagnosticRotationRequests{0u};
+    std::atomic<uint64_t> m_eeThreadDiagnosticAcceptedRotationRequests{0u};
+    std::atomic<uint64_t> m_eeThreadDiagnosticRejectedRotationRequests{0u};
+    std::atomic<uint64_t>
+        m_eeThreadDiagnosticPriorityZeroRotationRequests{0u};
+    std::atomic<uint64_t>
+        m_eeThreadDiagnosticUntrackedThreadRotationRequests{0u};
+    std::array<
+        std::atomic<uint64_t>,
+        kEeThreadDiagnosticPriorityCount>
+        m_eeThreadDiagnosticAcceptedRotationsByPriority{};
+    std::array<
+        std::atomic<uint64_t>,
+        kEeThreadDiagnosticThreadCount>
+        m_eeThreadDiagnosticAcceptedRotationsByThread{};
+    std::atomic<uint64_t> m_debugVSyncFields{0u};
+    std::atomic<uint64_t> m_debugMpegPicturesServed{0u};
+    std::atomic<uint64_t> m_debugMpegUniquePicturesServed{0u};
+    std::atomic<uint64_t> m_debugMpegRepeatedPicturesServed{0u};
     std::atomic<bool> m_dmacCompletionReady{false};
     std::atomic<bool> m_dmacInterruptDeliveryDirty{false};
     std::atomic<uint64_t> m_dmacInterruptDrainPasses{0u};

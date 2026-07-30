@@ -1127,6 +1127,7 @@ namespace ps2_syscalls
     {
         static int logCount = 0;
         int prio = static_cast<int>(getRegU32(ctx, 4));
+        const int requestedPriority = prio;
         if (prio == 0)
         {
             auto current = ensureCurrentThreadInfo(ctx);
@@ -1143,10 +1144,20 @@ namespace ps2_syscalls
         }
         if (prio <= 0 || prio >= 128)
         {
+            runtime->recordEeThreadQueueRotation(
+                g_currentThreadId,
+                requestedPriority,
+                prio,
+                false);
             setReturnS32(ctx, KE_ILLEGAL_PRIORITY);
             return;
         }
 
+        runtime->recordEeThreadQueueRotation(
+            g_currentThreadId,
+            requestedPriority,
+            prio,
+            true);
         setReturnS32(ctx, KE_OK);
         yieldGuestExecutionAfterWake(runtime);
     }

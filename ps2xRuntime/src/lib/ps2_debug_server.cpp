@@ -1618,6 +1618,11 @@ struct PS2DebugServer::Impl
     {
         const PS2Runtime::DebugRuntimeProgress core =
             runtime.debugRuntimeProgress();
+        const PS2Runtime::DebugEeTiming eeTiming =
+            runtime.debugEeTimingSnapshot();
+        const PS2Runtime::DebugEeThreadDiagnostics
+            eeThreadDiagnostics =
+                runtime.debugEeThreadDiagnosticsSnapshot();
         const PS2Runtime::DebugFaultInfo fault =
             runtime.debugFaultSnapshot();
         const auto branches = runtime.debugBranchHistory(256u);
@@ -1645,6 +1650,21 @@ struct PS2DebugServer::Impl
         Value progress(rapidjson::kObjectType);
         progress.AddMember("dispatches", sample.dispatches, allocator);
         progress.AddMember("ee_instructions", sample.eeInstructions, allocator);
+        progress.AddMember("ee_tick", eeTiming.currentTick, allocator);
+        progress.AddMember("ee_cycle", eeTiming.currentCycle, allocator);
+        progress.AddMember("vsync_fields", core.vsyncFields, allocator);
+        progress.AddMember(
+            "mpeg_pictures_served",
+            core.mpegPicturesServed,
+            allocator);
+        progress.AddMember(
+            "mpeg_unique_pictures_served",
+            core.mpegUniquePicturesServed,
+            allocator);
+        progress.AddMember(
+            "mpeg_repeated_pictures_served",
+            core.mpegRepeatedPicturesServed,
+            allocator);
         progress.AddMember("dma_starts", sample.dmaStarts, allocator);
         progress.AddMember("gif_copies", sample.gifCopies, allocator);
         progress.AddMember("gs_writes", sample.gsWrites, allocator);
@@ -1663,6 +1683,158 @@ struct PS2DebugServer::Impl
         progress.AddMember("guest_execution_handoff_timeouts",
                            core.guestExecutionHandoffTimeouts, allocator);
         result.AddMember("progress", progress, allocator);
+
+        Value eeThreadValue(rapidjson::kObjectType);
+        eeThreadValue.AddMember(
+            "enabled", eeThreadDiagnostics.enabled, allocator);
+        eeThreadValue.AddMember(
+            "guest_lock_requests",
+            eeThreadDiagnostics.guestLockRequests,
+            allocator);
+        eeThreadValue.AddMember(
+            "guest_lock_acquisitions",
+            eeThreadDiagnostics.guestLockAcquisitions,
+            allocator);
+        eeThreadValue.AddMember(
+            "guest_lock_contentions",
+            eeThreadDiagnostics.guestLockContentions,
+            allocator);
+        eeThreadValue.AddMember(
+            "outer_guest_execution_acquisitions",
+            eeThreadDiagnostics.outerGuestExecutionAcquisitions,
+            allocator);
+        eeThreadValue.AddMember(
+            "guest_context_changes",
+            eeThreadDiagnostics.guestContextChanges,
+            allocator);
+        eeThreadValue.AddMember(
+            "handoff_notifications",
+            eeThreadDiagnostics.handoffNotifications,
+            allocator);
+        eeThreadValue.AddMember(
+            "handoff_wait_requests",
+            eeThreadDiagnostics.handoffWaitRequests,
+            allocator);
+        eeThreadValue.AddMember(
+            "handoff_wait_fast_paths",
+            eeThreadDiagnostics.handoffWaitFastPaths,
+            allocator);
+        eeThreadValue.AddMember(
+            "handoff_cv_waits",
+            eeThreadDiagnostics.handoffCvWaits,
+            allocator);
+        eeThreadValue.AddMember(
+            "handoff_completions",
+            eeThreadDiagnostics.handoffCompletions,
+            allocator);
+        eeThreadValue.AddMember(
+            "handoff_timeouts",
+            eeThreadDiagnostics.handoffTimeouts,
+            allocator);
+        eeThreadValue.AddMember(
+            "yield_requests",
+            eeThreadDiagnostics.yieldRequests,
+            allocator);
+        eeThreadValue.AddMember(
+            "deferred_yields",
+            eeThreadDiagnostics.deferredYields,
+            allocator);
+        eeThreadValue.AddMember(
+            "host_thread_yields",
+            eeThreadDiagnostics.hostThreadYields,
+            allocator);
+        eeThreadValue.AddMember(
+            "requested_guest_switches",
+            eeThreadDiagnostics.requestedGuestSwitches,
+            allocator);
+        eeThreadValue.AddMember(
+            "guest_switch_cv_waits",
+            eeThreadDiagnostics.guestSwitchCvWaits,
+            allocator);
+        eeThreadValue.AddMember(
+            "completed_guest_switches",
+            eeThreadDiagnostics.completedGuestSwitches,
+            allocator);
+        eeThreadValue.AddMember(
+            "guest_switch_timeouts",
+            eeThreadDiagnostics.guestSwitchTimeouts,
+            allocator);
+        eeThreadValue.AddMember(
+            "rotation_requests",
+            eeThreadDiagnostics.rotationRequests,
+            allocator);
+        eeThreadValue.AddMember(
+            "accepted_rotation_requests",
+            eeThreadDiagnostics.acceptedRotationRequests,
+            allocator);
+        eeThreadValue.AddMember(
+            "rejected_rotation_requests",
+            eeThreadDiagnostics.rejectedRotationRequests,
+            allocator);
+        eeThreadValue.AddMember(
+            "priority_zero_rotation_requests",
+            eeThreadDiagnostics.priorityZeroRotationRequests,
+            allocator);
+        eeThreadValue.AddMember(
+            "untracked_thread_rotation_requests",
+            eeThreadDiagnostics.untrackedThreadRotationRequests,
+            allocator);
+
+        Value rotationsByPriority(rapidjson::kArrayType);
+        for (size_t priority = 0u;
+             priority <
+                 eeThreadDiagnostics.acceptedRotationsByPriority.size();
+             ++priority)
+        {
+            const uint64_t count =
+                eeThreadDiagnostics
+                    .acceptedRotationsByPriority[priority];
+            if (count == 0u)
+            {
+                continue;
+            }
+            Value entry(rapidjson::kObjectType);
+            entry.AddMember(
+                "priority",
+                static_cast<uint32_t>(priority),
+                allocator);
+            entry.AddMember("count", count, allocator);
+            rotationsByPriority.PushBack(entry, allocator);
+        }
+        eeThreadValue.AddMember(
+            "accepted_rotations_by_priority",
+            rotationsByPriority,
+            allocator);
+
+        Value rotationsByThread(rapidjson::kArrayType);
+        for (size_t thread = 0u;
+             thread <
+                 eeThreadDiagnostics.acceptedRotationsByThread.size();
+             ++thread)
+        {
+            const uint64_t count =
+                eeThreadDiagnostics
+                    .acceptedRotationsByThread[thread];
+            if (count == 0u)
+            {
+                continue;
+            }
+            Value entry(rapidjson::kObjectType);
+            entry.AddMember(
+                "thread_id",
+                static_cast<uint32_t>(thread),
+                allocator);
+            entry.AddMember("count", count, allocator);
+            rotationsByThread.PushBack(entry, allocator);
+        }
+        eeThreadValue.AddMember(
+            "accepted_rotations_by_thread",
+            rotationsByThread,
+            allocator);
+        result.AddMember(
+            "ee_thread_diagnostics",
+            eeThreadValue,
+            allocator);
 
         Value faultValue(rapidjson::kObjectType);
         faultValue.AddMember("active", fault.active, allocator);
@@ -1758,6 +1930,14 @@ struct PS2DebugServer::Impl
         audioValue.AddMember("submitted_bytes", audio.submittedBytes, allocator);
         audioValue.AddMember("last_submission_hash",
                              audio.lastSubmissionHash, allocator);
+        audioValue.AddMember(
+            "produced_frames", audio.producedFrames, allocator);
+        audioValue.AddMember(
+            "requested_frames", audio.requestedFrames, allocator);
+        audioValue.AddMember(
+            "consumed_frames", audio.consumedFrames, allocator);
+        audioValue.AddMember(
+            "zero_filled_frames", audio.zeroFilledFrames, allocator);
         audioValue.AddMember(
             "queued_samples", static_cast<uint64_t>(audio.queuedSamples), allocator);
         result.AddMember("audio", audioValue, allocator);

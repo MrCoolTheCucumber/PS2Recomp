@@ -108,6 +108,10 @@ struct PS2AudioBackend::Impl
         uint64_t submissionCount = 0;
         uint64_t submittedBytes = 0;
         uint64_t lastSubmissionHash = 0;
+        uint64_t producedFrames = 0;
+        uint64_t requestedFrames = 0;
+        uint64_t consumedFrames = 0;
+        uint64_t zeroFilledFrames = 0;
         bool opened = false;
         bool hostStreamLoaded = false;
         bool playing = false;
@@ -121,6 +125,7 @@ struct PS2AudioBackend::Impl
 
     static void flushChannelPcm(SpuAdpcmStream &stream)
     {
+        uint64_t producedFrames = 0u;
         if (stream.channelCount == 1u)
         {
             auto &mono = stream.channelPcm[0];
@@ -128,6 +133,7 @@ struct PS2AudioBackend::Impl
             {
                 stream.interleavedPcm.push_back(mono.front());
                 mono.pop_front();
+                ++producedFrames;
             }
         }
         else if (stream.channelCount == 2u)
@@ -140,8 +146,10 @@ struct PS2AudioBackend::Impl
                 stream.interleavedPcm.push_back(right.front());
                 left.pop_front();
                 right.pop_front();
+                ++producedFrames;
             }
         }
+        stream.producedFrames += producedFrames;
 
         if (stream.channelCount != 0u && stream.sampleRate != 0u)
         {
@@ -159,6 +167,35 @@ struct PS2AudioBackend::Impl
         }
     }
 
+    static void renderStreamFramesLocked(
+        SpuAdpcmStream &stream,
+        void *bufferData,
+        unsigned int frameCount)
+    {
+        const uint32_t channels = stream.channelCount;
+        if (channels == 0u || channels > 2u)
+            return;
+
+        int16_t *const output = static_cast<int16_t *>(bufferData);
+        const size_t requestedSamples =
+            static_cast<size_t>(frameCount) * channels;
+        size_t written = 0u;
+        while (written < requestedSamples &&
+               !stream.interleavedPcm.empty())
+        {
+            output[written++] = stream.interleavedPcm.front();
+            stream.interleavedPcm.pop_front();
+        }
+        std::fill(output + written, output + requestedSamples, 0);
+
+        const uint64_t consumedFrames =
+            static_cast<uint64_t>(written / channels);
+        stream.requestedFrames += frameCount;
+        stream.consumedFrames += consumedFrames;
+        stream.zeroFilledFrames +=
+            static_cast<uint64_t>(frameCount) - consumedFrames;
+    }
+
     static void streamCallback(void *bufferData, unsigned int frameCount)
     {
         SpuAdpcmStream *const stream =
@@ -167,19 +204,7 @@ struct PS2AudioBackend::Impl
             return;
 
         std::lock_guard<std::mutex> lock(stream->mutex);
-        const uint32_t channels = stream->channelCount;
-        if (channels == 0u || channels > 2u)
-            return;
-
-        int16_t *const output = static_cast<int16_t *>(bufferData);
-        const size_t requestedSamples = static_cast<size_t>(frameCount) * channels;
-        size_t written = 0u;
-        while (written < requestedSamples && !stream->interleavedPcm.empty())
-        {
-            output[written++] = stream->interleavedPcm.front();
-            stream->interleavedPcm.pop_front();
-        }
-        std::fill(output + written, output + requestedSamples, 0);
+        renderStreamFramesLocked(*stream, bufferData, frameCount);
     }
 };
 
@@ -354,6 +379,10 @@ void PS2AudioBackend::closeSpuAdpcmStream()
     stream.submissionCount = 0u;
     stream.submittedBytes = 0u;
     stream.lastSubmissionHash = 0u;
+    stream.producedFrames = 0u;
+    stream.requestedFrames = 0u;
+    stream.consumedFrames = 0u;
+    stream.zeroFilledFrames = 0u;
     stream.opened = false;
 }
 
@@ -681,6 +710,19 @@ void PS2AudioBackend::setDebuggerPaused(bool paused)
 #endif
 }
 
+void PS2AudioBackend::renderSpuAdpcmFramesForTesting(
+    void *bufferData,
+    unsigned int frameCount)
+{
+    if (!m_impl || !bufferData)
+        return;
+
+    Impl::SpuAdpcmStream &stream = m_impl->spuAdpcmStream;
+    std::lock_guard<std::mutex> lock(stream.mutex);
+    Impl::renderStreamFramesLocked(
+        stream, bufferData, frameCount);
+}
+
 PS2AudioStreamDebugSnapshot PS2AudioBackend::streamDebugSnapshot() const
 {
     PS2AudioStreamDebugSnapshot snapshot;
@@ -698,6 +740,10 @@ PS2AudioStreamDebugSnapshot PS2AudioBackend::streamDebugSnapshot() const
     snapshot.submissionCount = stream.submissionCount;
     snapshot.submittedBytes = stream.submittedBytes;
     snapshot.lastSubmissionHash = stream.lastSubmissionHash;
+    snapshot.producedFrames = stream.producedFrames;
+    snapshot.requestedFrames = stream.requestedFrames;
+    snapshot.consumedFrames = stream.consumedFrames;
+    snapshot.zeroFilledFrames = stream.zeroFilledFrames;
     snapshot.queuedSamples = stream.interleavedPcm.size();
     for (const auto &channel : stream.channelPcm)
         snapshot.queuedSamples += channel.size();

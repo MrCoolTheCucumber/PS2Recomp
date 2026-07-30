@@ -2903,6 +2903,7 @@ namespace ps2_stubs
         uint32_t height = kStubMovieHeight;
         uint32_t frameCount = 0u;
         bool haveFrame = false;
+        bool repeatedFrame = false;
         bool endOfSequence = false;
         MpegDecodedFrame frame;
         {
@@ -3011,6 +3012,7 @@ namespace ps2_stubs
                 playback.picturesServed += 1u;
                 playback.consecutiveEmptyGetPicture = 0u;
                 haveFrame = true;
+                repeatedFrame = true;
 
                 static uint32_t s_duplicateFrameLogCount = 0u;
                 if (s_duplicateFrameLogCount < 16u)
@@ -3035,6 +3037,10 @@ namespace ps2_stubs
             endOfSequence = playback.streamEnded && playback.decodedFrames.empty();
         }
 
+        if (haveFrame && runtime)
+        {
+            runtime->recordMpegPictureServed(repeatedFrame);
+        }
         mpegGuestWrite32(rdram, mpegAddr + 0x00u, width);
         mpegGuestWrite32(rdram, mpegAddr + 0x04u, height);
         mpegGuestWrite32(rdram, mpegAddr + 0x08u, frameCount);
