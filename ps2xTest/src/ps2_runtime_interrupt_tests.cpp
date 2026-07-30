@@ -65,6 +65,12 @@ namespace
     std::atomic<uint32_t> g_eeCounterLastCause{0u};
     std::atomic<uint32_t> g_eeCounterModeAtHandler{0u};
     std::atomic<uint32_t> g_eeCounterIntcAtHandler{0u};
+    std::atomic<bool>
+        g_interruptIsolationBlockNext{false};
+    std::atomic<bool>
+        g_interruptIsolationBlockEntered{false};
+    std::atomic<bool>
+        g_interruptIsolationBlockRelease{false};
 
     void setRegU32(R5900Context &ctx, int reg, uint32_t value)
     {
@@ -227,6 +233,22 @@ namespace
         PS2Runtime *runtime)
     {
         (void)runtime;
+        if (g_interruptIsolationBlockNext.exchange(
+                false, std::memory_order_acq_rel))
+        {
+            g_interruptIsolationBlockEntered.store(
+                true, std::memory_order_release);
+            const auto deadline =
+                std::chrono::steady_clock::now() +
+                std::chrono::seconds(2);
+            while (!g_interruptIsolationBlockRelease.load(
+                       std::memory_order_acquire) &&
+                   std::chrono::steady_clock::now() <
+                       deadline)
+            {
+                std::this_thread::yield();
+            }
+        }
         writeGuestU32(
             rdram,
             kInterruptIsolationHitAddr,
@@ -1446,6 +1468,51 @@ void register_ps2_runtime_interrupt_tests()
                 secondStack,
                 firstStack,
                 "changing host threads must reuse the runtime-owned callback stack");
+
+            const uint32_t beforeConcurrent =
+                readGuestU32(
+                    env.rdram.data(),
+                    kInterruptIsolationHitAddr);
+            g_interruptIsolationBlockEntered.store(
+                false, std::memory_order_relaxed);
+            g_interruptIsolationBlockRelease.store(
+                false, std::memory_order_relaxed);
+            g_interruptIsolationBlockNext.store(
+                true, std::memory_order_release);
+            std::thread blockedDispatch(dispatch);
+            const bool entered = waitUntil(
+                []()
+                {
+                    return g_interruptIsolationBlockEntered.load(
+                        std::memory_order_acquire);
+                },
+                std::chrono::seconds(2));
+            t.IsTrue(
+                entered,
+                "first concurrent callback should enter its bounded gate");
+
+            std::thread waitingDispatch(dispatch);
+            const bool waiting = waitUntil(
+                [&]()
+                {
+                    return env.runtime
+                               .guestExecutionWaiterCountForTesting() !=
+                           0u;
+                },
+                std::chrono::seconds(2));
+            g_interruptIsolationBlockRelease.store(
+                true, std::memory_order_release);
+            blockedDispatch.join();
+            waitingDispatch.join();
+            t.IsTrue(
+                waiting,
+                "second callback should wait behind the active guest boundary");
+            t.Equals(
+                readGuestU32(
+                    env.rdram.data(),
+                    kInterruptIsolationHitAddr),
+                beforeConcurrent + 2u,
+                "concurrent host delivery should complete both callbacks");
 
             cleanupRuntime(env);
         });
