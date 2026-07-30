@@ -481,6 +481,7 @@ namespace
     std::atomic<uint32_t> gMpegStreamCallbackDataAddr{0u};
     std::atomic<uint32_t> gMpegStreamCallbackLen{0u};
     std::atomic<uint32_t> gMpegStreamCallbackUserData{0u};
+    std::atomic<uint32_t> gMpegStreamCallbackSp{0u};
     std::atomic<uint32_t> gMpegStreamCallbackReturn{1u};
     std::mutex gMpegStreamCallbackPayloadMutex;
     std::vector<uint8_t> gMpegStreamCallbackPayload;
@@ -521,6 +522,7 @@ namespace
         gMpegStreamCallbackDataAddr.store(dataAddr, std::memory_order_release);
         gMpegStreamCallbackLen.store(len, std::memory_order_release);
         gMpegStreamCallbackUserData.store(::getRegU32(ctx, 6), std::memory_order_release);
+        gMpegStreamCallbackSp.store(::getRegU32(ctx, 29), std::memory_order_release);
         gMpegStreamCallbackCount.fetch_add(1u, std::memory_order_acq_rel);
         setRegU32(*ctx, 2, gMpegStreamCallbackReturn.load(std::memory_order_acquire));
         ctx->pc = 0u;
@@ -1766,6 +1768,175 @@ void register_ps2_runtime_expansion_tests()
             ps2_stubs::sceMpegAddCallback(rdram.data(), &addAfterReinit, nullptr);
             t.Equals(getRegS32(addAfterReinit, 2), 1,
                      "sceMpegInit should reset MPEG callback bookkeeping between runs");
+        });
+
+        tc.Run("MPEG state and callback stacks are isolated per runtime", [](TestCase &t)
+        {
+            PS2Runtime first;
+            PS2Runtime second;
+            std::vector<uint8_t> firstRdram(
+                PS2_RAM_SIZE, 0u);
+            std::vector<uint8_t> secondRdram(
+                PS2_RAM_SIZE, 0u);
+            ps2_stubs::resetMpegStubState();
+
+            constexpr uint32_t kMpegAddr = 0x00123000u;
+            constexpr uint32_t kCallbackEntry = 0x00124000u;
+            constexpr uint32_t kPacketAddr = 0x00128000u;
+
+            auto addCallback =
+                [&](PS2Runtime &runtime,
+                    std::vector<uint8_t> &rdram,
+                    uint32_t callbackType)
+            {
+                R5900Context context{};
+                setRegU32(context, 4, kMpegAddr);
+                setRegU32(context, 5, callbackType);
+                setRegU32(context, 6, kCallbackEntry);
+                ps2_stubs::sceMpegAddCallback(
+                    rdram.data(), &context, &runtime);
+                return ::getRegU32(&context, 2);
+            };
+
+            t.Equals(
+                addCallback(first, firstRdram, 1u),
+                1u,
+                "the first runtime should allocate MPEG callback handle 1");
+            t.Equals(
+                addCallback(second, secondRdram, 2u),
+                1u,
+                "the second runtime should independently allocate MPEG callback handle 1");
+
+            auto setDecodeMode =
+                [&](PS2Runtime &runtime,
+                    std::vector<uint8_t> &rdram,
+                    uint32_t mode)
+            {
+                R5900Context context{};
+                setRegU32(context, 4, kMpegAddr);
+                setRegU32(context, 5, mode);
+                ps2_stubs::sceMpegSetDecodeMode(
+                    rdram.data(), &context, &runtime);
+            };
+            auto getDecodeMode =
+                [&](PS2Runtime &runtime,
+                    std::vector<uint8_t> &rdram)
+            {
+                R5900Context context{};
+                setRegU32(context, 4, kMpegAddr);
+                ps2_stubs::sceMpegGetDecodeMode(
+                    rdram.data(), &context, &runtime);
+                return ::getRegU32(&context, 2);
+            };
+
+            setDecodeMode(first, firstRdram, 7u);
+            setDecodeMode(second, secondRdram, 9u);
+            t.Equals(
+                getDecodeMode(first, firstRdram),
+                7u,
+                "the second runtime must not replace the first runtime's MPEG playback state");
+
+            R5900Context deleteContext{};
+            setRegU32(deleteContext, 4, kMpegAddr);
+            ps2_stubs::sceMpegDelete(
+                secondRdram.data(),
+                &deleteContext,
+                &second);
+            t.Equals(
+                getDecodeMode(first, firstRdram),
+                7u,
+                "deleting the second runtime's MPEG object must not erase the first runtime's object");
+
+            ps2_stubs::resetMpegStubState();
+            first.registerFunction(
+                kCallbackEntry,
+                &testRecordMpegStreamCallback);
+
+            R5900Context addStreamContext{};
+            setRegU32(addStreamContext, 4, kMpegAddr);
+            setRegU32(addStreamContext, 5, 3u);
+            setRegU32(addStreamContext, 7, kCallbackEntry);
+            setRegU32(addStreamContext, 8, 0x55667788u);
+            ps2_stubs::sceMpegAddStrCallback(
+                firstRdram.data(),
+                &addStreamContext,
+                &first);
+
+            const std::vector<uint8_t> payload = {
+                0x11u, 0x22u, 0x33u, 0x44u};
+            const uint16_t packetLength =
+                static_cast<uint16_t>(
+                    payload.size() + 3u);
+            std::vector<uint8_t> packet = {
+                0x00u, 0x00u, 0x01u, 0xBDu,
+                static_cast<uint8_t>(
+                    packetLength >> 8u),
+                static_cast<uint8_t>(
+                    packetLength & 0xFFu),
+                0x80u, 0x00u, 0x00u};
+            packet.insert(
+                packet.end(),
+                payload.begin(),
+                payload.end());
+            std::memcpy(
+                firstRdram.data() + kPacketAddr,
+                packet.data(),
+                packet.size());
+
+            auto dispatchPacket = [&]()
+            {
+                R5900Context context{};
+                setRegU32(context, 4, kMpegAddr);
+                setRegU32(context, 5, kPacketAddr);
+                setRegU32(
+                    context,
+                    6,
+                    static_cast<uint32_t>(
+                        packet.size()));
+                setRegU32(context, 7, kPacketAddr);
+                setRegU32(
+                    context,
+                    8,
+                    static_cast<uint32_t>(
+                        packet.size()));
+                ps2_stubs::sceMpegDemuxPssRing(
+                    firstRdram.data(),
+                    &context,
+                    &first);
+            };
+
+            gMpegStreamCallbackCount.store(
+                0u, std::memory_order_release);
+            gMpegStreamCallbackSp.store(
+                0u, std::memory_order_release);
+            std::thread firstPublisher(dispatchPacket);
+            firstPublisher.join();
+            const uint32_t firstCallbackSp =
+                gMpegStreamCallbackSp.load(
+                    std::memory_order_acquire);
+
+            R5900Context resetContext{};
+            setRegU32(resetContext, 4, kMpegAddr);
+            ps2_stubs::sceMpegReset(
+                firstRdram.data(),
+                &resetContext,
+                &first);
+            std::thread secondPublisher(dispatchPacket);
+            secondPublisher.join();
+            const uint32_t secondCallbackSp =
+                gMpegStreamCallbackSp.load(
+                    std::memory_order_acquire);
+
+            t.IsTrue(
+                firstCallbackSp != 0u,
+                "the first host publisher should dispatch the MPEG callback");
+            t.Equals(
+                secondCallbackSp,
+                firstCallbackSp,
+                "the MPEG callback stack should belong to the runtime rather than the publishing host thread");
+
+            first.requestStop();
+            second.requestStop();
         });
 
         tc.Run("sceMpegDemuxPssRing dispatches registered video and audio stream callbacks", [](TestCase &t)
