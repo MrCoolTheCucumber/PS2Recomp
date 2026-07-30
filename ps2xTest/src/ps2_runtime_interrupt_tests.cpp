@@ -24,6 +24,8 @@ namespace
     constexpr uint32_t WEF_OR = 1u;
     constexpr uint32_t WEF_CLEAR = 0x10u;
     constexpr uint32_t WEF_CLEAR_ALL = 0x20u;
+    constexpr uint32_t kInterruptIsolationHitAddr = 0x1180u;
+    constexpr uint32_t kInterruptIsolationSpAddr = 0x1184u;
 
     struct Ps2EventFlagInfo
     {
@@ -216,6 +218,26 @@ namespace
             g_vblankEndHits.fetch_add(1u, std::memory_order_relaxed);
         }
 
+        ctx->pc = 0u;
+    }
+
+    void testInterruptIsolationHandler(
+        uint8_t *rdram,
+        R5900Context *ctx,
+        PS2Runtime *runtime)
+    {
+        (void)runtime;
+        writeGuestU32(
+            rdram,
+            kInterruptIsolationHitAddr,
+            readGuestU32(
+                rdram,
+                kInterruptIsolationHitAddr) +
+                1u);
+        writeGuestU32(
+            rdram,
+            kInterruptIsolationSpAddr,
+            getRegU32(ctx, 29));
         ctx->pc = 0u;
     }
 
@@ -1250,6 +1272,180 @@ void register_ps2_runtime_interrupt_tests()
             {
                 t.IsTrue(fieldFlipped, "VSync worker should toggle GS CSR FIELD while the racers run");
             }
+
+            cleanupRuntime(env);
+        });
+
+        tc.Run("interrupt handler registries and masks are isolated per runtime", [](TestCase &t)
+        {
+            notifyRuntimeStop();
+            TestEnv first;
+            TestEnv second;
+            t.IsTrue(
+                first.runtime.memory().initialize(),
+                "first runtime memory initialize should succeed");
+            t.IsTrue(
+                second.runtime.memory().initialize(),
+                "second runtime memory initialize should succeed");
+
+            constexpr uint32_t kIntcCause = 7u;
+            constexpr uint32_t kDmacCause = 5u;
+            constexpr uint32_t kHandlerAddr =
+                0x00ABC0C0u;
+            first.runtime.registerFunction(
+                kHandlerAddr,
+                &testInterruptIsolationHandler);
+            second.runtime.registerFunction(
+                kHandlerAddr,
+                &testInterruptIsolationHandler);
+
+            auto addIntc = [&](TestEnv &env)
+            {
+                R5900Context context{};
+                setRegU32(context, 4, kIntcCause);
+                setRegU32(context, 5, kHandlerAddr);
+                AddIntcHandler(
+                    env.rdram.data(),
+                    &context,
+                    &env.runtime);
+                return getRegS32(context, 2);
+            };
+            auto addDmac = [&](TestEnv &env)
+            {
+                R5900Context context{};
+                setRegU32(context, 4, kDmacCause);
+                setRegU32(context, 5, kHandlerAddr);
+                AddDmacHandler(
+                    env.rdram.data(),
+                    &context,
+                    &env.runtime);
+                return getRegS32(context, 2);
+            };
+
+            t.Equals(
+                addIntc(first),
+                1,
+                "first runtime should allocate INTC handler ID 1");
+            t.Equals(
+                addIntc(second),
+                1,
+                "second runtime should independently allocate INTC handler ID 1");
+            t.Equals(
+                addDmac(first),
+                1,
+                "first runtime should allocate DMAC handler ID 1");
+            t.Equals(
+                addDmac(second),
+                1,
+                "second runtime should independently allocate DMAC handler ID 1");
+
+            R5900Context disable{};
+            setRegU32(disable, 4, kIntcCause);
+            DisableIntc(
+                second.rdram.data(),
+                &disable,
+                &second.runtime);
+            dispatchIntcHandlersForCause(
+                first.rdram.data(),
+                &first.runtime,
+                kIntcCause);
+            t.Equals(
+                readGuestU32(
+                    first.rdram.data(),
+                    kInterruptIsolationHitAddr),
+                1u,
+                "masking one runtime must not suppress another runtime's INTC handler");
+
+            R5900Context enable{};
+            setRegU32(enable, 4, kIntcCause);
+            EnableIntc(
+                first.rdram.data(),
+                &enable,
+                &first.runtime);
+            dispatchDmacHandlersForCause(
+                first.rdram.data(),
+                &first.runtime,
+                kDmacCause);
+            const uint32_t beforeSecondStop =
+                readGuestU32(
+                    first.rdram.data(),
+                    kInterruptIsolationHitAddr);
+
+            second.runtime.requestStop();
+            dispatchIntcHandlersForCause(
+                first.rdram.data(),
+                &first.runtime,
+                kIntcCause);
+            dispatchDmacHandlersForCause(
+                first.rdram.data(),
+                &first.runtime,
+                kDmacCause);
+            t.Equals(
+                readGuestU32(
+                    first.rdram.data(),
+                    kInterruptIsolationHitAddr),
+                beforeSecondStop + 2u,
+                "stopping one runtime must not erase another runtime's interrupt handlers");
+
+            cleanupRuntime(first);
+        });
+
+        tc.Run("interrupt callback stack belongs to the runtime rather than the host thread", [](TestCase &t)
+        {
+            notifyRuntimeStop();
+            TestEnv env;
+            t.IsTrue(
+                env.runtime.memory().initialize(),
+                "runtime memory initialize should succeed");
+
+            constexpr uint32_t kCause = 7u;
+            constexpr uint32_t kHandlerAddr =
+                0x00ABC0C0u;
+            env.runtime.registerFunction(
+                kHandlerAddr,
+                &testInterruptIsolationHandler);
+
+            R5900Context add{};
+            setRegU32(add, 4, kCause);
+            setRegU32(add, 5, kHandlerAddr);
+            AddIntcHandler(
+                env.rdram.data(),
+                &add,
+                &env.runtime);
+            t.Equals(
+                getRegS32(add, 2),
+                1,
+                "fixture should allocate INTC handler ID 1");
+
+            auto dispatch = [&]()
+            {
+                dispatchIntcHandlersForCause(
+                    env.rdram.data(),
+                    &env.runtime,
+                    kCause);
+            };
+            std::thread firstDispatch(dispatch);
+            firstDispatch.join();
+            const uint32_t firstStack =
+                readGuestU32(
+                    env.rdram.data(),
+                    kInterruptIsolationSpAddr);
+
+            std::thread secondDispatch(dispatch);
+            secondDispatch.join();
+            const uint32_t secondStack =
+                readGuestU32(
+                    env.rdram.data(),
+                    kInterruptIsolationSpAddr);
+
+            t.IsTrue(
+                firstStack != 0u &&
+                    (firstStack & 0xFu) == 0u,
+                "interrupt callback stack should be nonzero and 16-byte aligned");
+            t.Equals(
+                secondStack,
+                firstStack,
+                "changing host threads must reuse the runtime-owned callback stack");
 
             cleanupRuntime(env);
         });
