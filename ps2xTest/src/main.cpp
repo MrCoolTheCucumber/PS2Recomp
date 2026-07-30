@@ -3,6 +3,7 @@
 #include <iostream>
 
 void register_code_generator_tests();
+void register_boost_ee_fiber_tests();
 void register_cop0_timing_tests();
 void register_ee_counter_tests();
 void register_ee_event_scheduler_tests();
@@ -35,6 +36,7 @@ int main()
     MiniTest::BeforeEach(reset_ps2_test_function_table);
 
     register_code_generator_tests();
+    register_boost_ee_fiber_tests();
     register_cop0_timing_tests();
     register_ee_counter_tests();
     register_ee_event_scheduler_tests();

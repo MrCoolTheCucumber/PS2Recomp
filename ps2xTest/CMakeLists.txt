@@ -43,6 +43,7 @@ target_include_directories(ps2_test_function_table PRIVATE
 )
 
 add_library(ps2_test_lib STATIC
+    src/boost_ee_fiber_tests.cpp
     src/code_generator_tests.cpp
     src/cop0_timing_tests.cpp
     src/ee_counter_tests.cpp
@@ -115,6 +116,23 @@ endif()
 add_executable(ps2x_tests
     src/main.cpp
     $<TARGET_OBJECTS:ps2_test_function_table>
+)
+
+add_executable(ee_fiber_guard_probe
+    src/ee_fiber_guard_probe.cpp
+)
+
+target_include_directories(ee_fiber_guard_probe PRIVATE
+    ${CMAKE_SOURCE_DIR}/ps2xRuntime/include
+)
+
+target_link_libraries(ee_fiber_guard_probe PRIVATE
+    ps2_runtime
+)
+
+add_dependencies(ps2x_tests ee_fiber_guard_probe)
+target_compile_definitions(ps2_test_lib PRIVATE
+    PS2X_TEST_EE_FIBER_GUARD_PROBE="$<TARGET_FILE:ee_fiber_guard_probe>"
 )
 
 add_executable(vu1_replay
@@ -257,3 +275,7 @@ if(CMAKE_BUILD_TYPE STREQUAL "Release" OR CMAKE_BUILD_TYPE STREQUAL "RelWithDebI
         EnableFastReleaseMode(vu_native_emitter_spike)
     endif()
 endif()
+
+ConfigureEeFcontextSuspendedFrames(ps2_test_lib)
+ConfigureEeFcontextSuspendedFrames(ps2x_tests)
+ConfigureEeFcontextSuspendedFrames(ee_fiber_guard_probe)

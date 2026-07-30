@@ -486,6 +486,7 @@ function(ps2x_stage_ffmpeg_runtime_dlls target_name)
 endfunction()
 
 add_library(ps2_runtime STATIC
+    src/lib/boost_ee_fiber.cpp
     src/lib/cop0_timing.cpp
     src/lib/ee_counters.cpp
     src/lib/ee_execution_backend.cpp
@@ -800,6 +801,13 @@ if(CMAKE_BUILD_TYPE STREQUAL "Release" OR CMAKE_BUILD_TYPE STREQUAL "RelWithDebI
             )
         endif()
     endif()
+endif()
+
+ConfigureEeFcontextSuspendedFrames(ps2_runtime)
+ConfigureEeFcontextSuspendedFrames(ps2EntryRunner)
+
+if(WIN32 AND PS2X_HAS_EE_CPP_FIBER_BACKEND)
+    target_link_libraries(ps2_runtime PRIVATE Psapi)
 endif()
 
 # Work around WinAPI vs raylib symbol clash for CloseWindow on x64
