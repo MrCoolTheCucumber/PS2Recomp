@@ -498,6 +498,120 @@ void register_ps2_runtime_kernel_tests()
             t.Equals(getRegS32(env.ctx, 2), KE_UNKNOWN_THID, "deleted thread id should no longer be referable");
         });
 
+        tc.Run("EE thread registries are isolated per runtime lifetime", [](TestCase &t)
+        {
+            notifyRuntimeStop();
+            auto first = std::make_unique<TestEnv>();
+
+            auto createDormantThread =
+                [&](TestEnv &env,
+                    uint32_t entry,
+                    uint32_t stack)
+                {
+                    const uint32_t threadParam[9] = {
+                        0u,
+                        entry,
+                        stack,
+                        0x00000800u,
+                        0u,
+                        40u,
+                        0u,
+                        0u,
+                        0u,
+                    };
+                    writeGuestWords(
+                        env.rdram.data(),
+                        K_PARAM_ADDR,
+                        threadParam,
+                        std::size(threadParam));
+                    R5900Context createCtx{};
+                    setRegU32(createCtx, 4, K_PARAM_ADDR);
+                    CreateThread(
+                        env.rdram.data(),
+                        &createCtx,
+                        &env.runtime);
+                    return getRegS32(createCtx, 2);
+                };
+            auto referThread =
+                [&](TestEnv &env,
+                    int32_t tid,
+                    EeThreadStatus &status)
+                {
+                    std::memset(&status, 0, sizeof(status));
+                    R5900Context statusCtx{};
+                    setRegU32(
+                        statusCtx,
+                        4,
+                        static_cast<uint32_t>(tid));
+                    setRegU32(statusCtx, 5, K_STATUS_ADDR);
+                    ReferThreadStatus(
+                        env.rdram.data(),
+                        &statusCtx,
+                        &env.runtime);
+                    std::memcpy(
+                        &status,
+                        env.rdram.data() + K_STATUS_ADDR,
+                        sizeof(status));
+                    return getRegS32(statusCtx, 2);
+                };
+
+            constexpr uint32_t kFirstEntry = 0x00201000u;
+            constexpr uint32_t kSecondEntry = 0x00202000u;
+            const int32_t firstTid =
+                createDormantThread(
+                    *first, kFirstEntry, 0x00301000u);
+            t.Equals(
+                firstTid,
+                2,
+                "the first runtime should allocate thread id 2");
+
+            {
+                auto second = std::make_unique<TestEnv>();
+                const int32_t secondTid =
+                    createDormantThread(
+                        *second,
+                        kSecondEntry,
+                        0x00302000u);
+                t.Equals(
+                    secondTid,
+                    2,
+                    "an independent runtime should own an independent id ring");
+
+                EeThreadStatus firstStatus{};
+                t.Equals(
+                    referThread(
+                        *first, firstTid, firstStatus),
+                    THS_DORMANT,
+                    "the first runtime's thread should remain queryable");
+                t.Equals(
+                    firstStatus.func,
+                    kFirstEntry,
+                    "the first runtime should retain its own thread payload");
+
+                EeThreadStatus secondStatus{};
+                t.Equals(
+                    referThread(
+                        *second, secondTid, secondStatus),
+                    THS_DORMANT,
+                    "the second runtime's thread should be queryable");
+                t.Equals(
+                    secondStatus.func,
+                    kSecondEntry,
+                    "the second runtime should retain its own thread payload");
+            }
+
+            EeThreadStatus survivingStatus{};
+            t.Equals(
+                referThread(
+                    *first, firstTid, survivingStatus),
+                THS_DORMANT,
+                "destroying a second runtime must not reset the first runtime");
+            t.Equals(
+                survivingStatus.func,
+                kFirstEntry,
+                "the surviving runtime should retain its thread after peer destruction");
+        });
+
         tc.Run("start thread validates target and entry registration", [](TestCase &t)
         {
             TestEnv env;
