@@ -14,10 +14,9 @@
 #include <vector>
 
 // g_currentThreadId is an `inline thread_local int` defined in the kernel's
-// internal State.h (ps2xRuntime/.../Kernel/Syscalls/Helpers/State.h, default 1).
-// Current-thread authority tests deliberately corrupt this compatibility slot,
-// and sub-case H of the semaphore-return-value test currently uses it to give
-// a synthetic waiter an identity. Both uses disappear with the checked adapter.
+// internal ThreadRuntimeState.h (default 1).
+// The current-thread authority test deliberately corrupts this compatibility
+// slot to prove that runtime context binding detects and repairs divergence.
 //
 // ODR-safety: this declaration MUST stay byte-for-byte type-compatible with that
 // definition (`thread_local int`, same name, no namespace). It is an `extern`
@@ -711,6 +710,9 @@ void register_ps2_runtime_kernel_tests()
                     K_CURRENT_THREAD_ID_ADDR)),
                 tid,
                 "a bound worker context should ignore a corrupted TLS adapter");
+            t.IsTrue(
+                env.runtime.eeThreadLegacyAdapterMismatchCount() >= 1u,
+                "the runtime should detect TLS adapter divergence");
         });
 
         tc.Run("start thread validates target and entry registration", [](TestCase &t)
@@ -3204,11 +3206,6 @@ void register_ps2_runtime_kernel_tests()
             // Sub-case H: WaitSema force-released via ReleaseWaitThread returns generic -1
             // and the ret >= 0 guard must NOT consume a token (count stays 0, not -1).
             {
-                // Use a tid the sequential allocator (range 2..0xFF) will never produce, so the
-                // worker's WaitSema creates a fresh ThreadInfo that ReleaseWaitThread can target.
-                // Prior tests leave stale entries at low tids (2, 3, ...), which would make
-                // ReleaseWaitThread find a non-waiting ThreadInfo and return KE_NOT_WAIT.
-                constexpr int kWorkerTid = 0x7FFE;
                 TestEnv env;
                 const uint32_t semaParam[6] = {0u, 2u, 0u, 0u, 0u, 0u};
                 writeGuestWords(env.rdram.data(), K_PARAM_ADDR, semaParam, 6);
@@ -3217,17 +3214,62 @@ void register_ps2_runtime_kernel_tests()
                 const int sid = getRegS32(env.ctx, 2);
                 t.IsTrue(sid >= 0, "sub-case H: CreateSema must return a valid sid");
 
-                writeGuestU32(env.rdram.data(), K_SEMA_WAIT_READY_ADDR, 0u);
-                int32_t workerRet = 0;
+                constexpr uint32_t kWorkerEntry = 0x00260600u;
+                env.runtime.registerFunction(
+                    kWorkerEntry, &semaWaitOracleHandler);
+                writeGuestU32(
+                    env.rdram.data(),
+                    K_SEMA_ORACLE_STAGE_ADDR,
+                    0u);
+                writeGuestU32(
+                    env.rdram.data(),
+                    K_SEMA_ORACLE_RETURN_ADDR,
+                    0u);
+                const uint32_t threadParam[9] = {
+                    0u,
+                    kWorkerEntry,
+                    0x0031A000u,
+                    0x00000800u,
+                    0u,
+                    30u,
+                    0u,
+                    0u,
+                    0u,
+                };
+                writeGuestWords(
+                    env.rdram.data(),
+                    K_PARAM_ADDR,
+                    threadParam,
+                    std::size(threadParam));
+                R5900Context createCtx{};
+                setRegU32(createCtx, 4, K_PARAM_ADDR);
+                CreateThread(
+                    env.rdram.data(),
+                    &createCtx,
+                    &env.runtime);
+                const int32_t workerTid =
+                    getRegS32(createCtx, 2);
+                t.IsTrue(
+                    workerTid >= 2,
+                    "sub-case H: CreateThread must return a worker id");
 
-                std::thread worker([&]() {
-                    g_currentThreadId = kWorkerTid;
-                    R5900Context wctx{};
-                    setRegU32(wctx, 4, static_cast<uint32_t>(sid));
-                    writeGuestU32(env.rdram.data(), K_SEMA_WAIT_READY_ADDR, 1u);
-                    WaitSema(env.rdram.data(), &wctx, &env.runtime);
-                    workerRet = getRegS32(wctx, 2);
-                });
+                R5900Context startCtx{};
+                setRegU32(
+                    startCtx,
+                    4,
+                    static_cast<uint32_t>(workerTid));
+                setRegU32(
+                    startCtx,
+                    5,
+                    static_cast<uint32_t>(sid));
+                StartThread(
+                    env.rdram.data(),
+                    &startCtx,
+                    &env.runtime);
+                t.Equals(
+                    getRegS32(startCtx, 2),
+                    workerTid,
+                    "sub-case H: StartThread must launch the waiter");
 
                 // Wait until the worker is confirmed blocking in WaitSema.
                 const bool waiterBlocking = waitUntil([&]() {
@@ -3242,12 +3284,27 @@ void register_ps2_runtime_kernel_tests()
                 t.IsTrue(waiterBlocking, "sub-case H: worker must be blocking in WaitSema before force-release");
 
                 // Force-release the worker via ReleaseWaitThread.
-                setRegU32(env.ctx, 4, static_cast<uint32_t>(kWorkerTid));
+                setRegU32(
+                    env.ctx,
+                    4,
+                    static_cast<uint32_t>(workerTid));
                 ReleaseWaitThread(env.rdram.data(), &env.ctx, &env.runtime);
-                t.Equals(getRegS32(env.ctx, 2), kWorkerTid,
+                t.Equals(getRegS32(env.ctx, 2), workerTid,
                          "sub-case H: ReleaseWaitThread must return the waiter id");
 
-                worker.join();
+                const bool workerFinished = waitUntil([&]()
+                {
+                    return readGuestU32(
+                               env.rdram.data(),
+                               K_SEMA_ORACLE_STAGE_ADDR) == 2u;
+                }, std::chrono::milliseconds(500));
+                t.IsTrue(
+                    workerFinished,
+                    "sub-case H: force-released waiter must finish");
+                const int32_t workerRet =
+                    static_cast<int32_t>(readGuestU32(
+                        env.rdram.data(),
+                        K_SEMA_ORACLE_RETURN_ADDR));
                 t.Equals(workerRet, KE_ERROR,
                          "sub-case H: force-released WaitSema must return generic -1");
 
@@ -3280,8 +3337,7 @@ void register_ps2_runtime_kernel_tests()
             }
 
             // Sub-case I: blocking WaitSema woken by SignalSema returns sid (the DQ8 scenario).
-            // init=0 forces the worker to block; SignalSema uses cv.notify_one() (not
-            // ReleaseWaitThread), so the worker needs no g_currentThreadId identity.
+            // init=0 forces the worker to block; SignalSema uses cv.notify_one().
             {
                 TestEnv env;
                 const uint32_t semaParam[6] = {0u, 1u, 0u, 0u, 0u, 0u};

@@ -1153,7 +1153,7 @@ namespace ps2_syscalls
             return;
         }
 
-        int tid = g_currentThreadId;
+        int tid = getCurrentThreadId(runtime);
         {
             std::lock_guard<std::mutex> lock(g_exit_handler_mutex);
             g_exit_handlers[tid].push_back({func, arg});

@@ -177,8 +177,6 @@ static constexpr uint32_t kFioSoIROth = 0x0004;
 static constexpr uint32_t kFioSoIWOth = 0x0002;
 static constexpr uint32_t kFioSoIXOth = 0x0001;
 
-inline thread_local int g_currentThreadId = 1;
-
 inline std::unordered_map<int, std::shared_ptr<SemaInfo>> g_semas;
 inline int g_nextSemaId = 0;
 inline std::mutex g_sema_map_mutex;

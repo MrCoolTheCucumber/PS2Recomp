@@ -39,10 +39,14 @@ namespace ps2_syscalls
                 }
             }
             state.threads.clear();
+            state.contextThreadIds.clear();
+            state.contextThreadIds.emplace(
+                &runtime->cpu(), 1);
             state.nextThreadId = 2;
             state.currentThreadId.store(
                 1, std::memory_order_release);
         }
+        g_currentThreadRuntime = runtime;
         g_currentThreadId = 1;
 
         for (const auto &threadInfo : threads)

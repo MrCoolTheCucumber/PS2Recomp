@@ -108,6 +108,13 @@ static std::shared_ptr<ThreadInfo> lookupThreadInfo(
     return nullptr;
 }
 
+static int getCurrentThreadId(PS2Runtime *runtime)
+{
+    return runtime
+               ? runtime->currentEeThreadId()
+               : g_currentThreadId;
+}
+
 static std::shared_ptr<ThreadInfo> ensureCurrentThreadInfo(
     PS2Runtime *runtime,
     R5900Context *ctx)
@@ -117,7 +124,7 @@ static std::shared_ptr<ThreadInfo> ensureCurrentThreadInfo(
         return nullptr;
     }
 
-    const int tid = g_currentThreadId;
+    const int tid = getCurrentThreadId(runtime);
     EeThreadRuntimeState &state =
         runtime->eeThreadRuntimeState();
     std::lock_guard<std::mutex> lock(
@@ -127,7 +134,10 @@ static std::shared_ptr<ThreadInfo> ensureCurrentThreadInfo(
     {
         if (ctx && !it->second->boundContext)
         {
-            it->second->boundContext = ctx;
+            it->second->boundContext =
+                tid == 1 ? &runtime->cpu() : ctx;
+            state.contextThreadIds[
+                it->second->boundContext] = tid;
         }
         return it->second;
     }
@@ -144,7 +154,10 @@ static std::shared_ptr<ThreadInfo> ensureCurrentThreadInfo(
         info->entry = ctx->pc;
         info->stack = getRegU32(ctx, 29);
         info->gp = getRegU32(ctx, 28);
-        info->boundContext = ctx;
+        info->boundContext =
+            tid == 1 ? &runtime->cpu() : ctx;
+        state.contextThreadIds[
+            info->boundContext] = tid;
     }
     info->waitType = TSW_NONE;
     info->waitId = 0;

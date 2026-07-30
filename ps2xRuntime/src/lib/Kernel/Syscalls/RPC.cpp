@@ -6,13 +6,17 @@ namespace ps2_syscalls
 {
     namespace
     {
-        SifRpcDebugEvent makeRpcDebugEvent(const char *op, R5900Context *ctx)
+        SifRpcDebugEvent makeRpcDebugEvent(
+            const char *op,
+            R5900Context *ctx,
+            PS2Runtime *runtime)
         {
             SifRpcDebugEvent event{};
             event.op = op;
             event.pc = ctx ? ctx->pc : 0u;
             event.ra = ctx ? getRegU32(ctx, 31) : 0u;
-            event.threadId = static_cast<uint32_t>(g_currentThreadId);
+            event.threadId = static_cast<uint32_t>(
+                getCurrentThreadId(runtime));
             return event;
         }
 
@@ -264,7 +268,8 @@ namespace ps2_syscalls
             RUNTIME_LOG("[SifInitRpc] Initialized");
         }
 
-        SifRpcDebugEvent event = makeRpcDebugEvent("InitRpc", ctx);
+        SifRpcDebugEvent event =
+            makeRpcDebugEvent("InitRpc", ctx, runtime);
         event.result = 0;
         pushSifRpcDebugEventLocked(event);
         setReturnS32(ctx, 0);
@@ -280,7 +285,8 @@ namespace ps2_syscalls
 
         if (!client)
         {
-            SifRpcDebugEvent event = makeRpcDebugEvent("BindRpc", ctx);
+            SifRpcDebugEvent event =
+                makeRpcDebugEvent("BindRpc", ctx, runtime);
             event.clientPtr = clientPtr;
             event.sid = rpcId;
             event.mode = mode;
@@ -345,7 +351,8 @@ namespace ps2_syscalls
             client->cbuf = 0;
         }
 
-        SifRpcDebugEvent event = makeRpcDebugEvent("BindRpc", ctx);
+        SifRpcDebugEvent event =
+            makeRpcDebugEvent("BindRpc", ctx, runtime);
         event.clientPtr = clientPtr;
         event.serverPtr = serverPtr;
         event.sid = rpcId;
@@ -476,7 +483,8 @@ namespace ps2_syscalls
         auto *client = reinterpret_cast<t_SifRpcClientData *>(getMemPtr(rdram, clientPtr));
         if (!client)
         {
-            SifRpcDebugEvent event = makeRpcDebugEvent("CallRpc", ctx);
+            SifRpcDebugEvent event =
+                makeRpcDebugEvent("CallRpc", ctx, runtime);
             event.clientPtr = clientPtr;
             event.sid = sidHint;
             event.rpcNum = rpcNum;
@@ -694,7 +702,8 @@ namespace ps2_syscalls
             g_rpc_clients[clientPtr].busy = false;
         }
 
-        SifRpcDebugEvent event = makeRpcDebugEvent("CallRpc", ctx);
+        SifRpcDebugEvent event =
+            makeRpcDebugEvent("CallRpc", ctx, runtime);
         event.clientPtr = clientPtr;
         event.serverPtr = serverPtr;
         event.sid = sid;
@@ -757,7 +766,9 @@ namespace ps2_syscalls
         t_SifRpcServerData *sd = reinterpret_cast<t_SifRpcServerData *>(getMemPtr(rdram, sdPtr));
         if (!sd)
         {
-            SifRpcDebugEvent event = makeRpcDebugEvent("RegisterRpc", ctx);
+            SifRpcDebugEvent event =
+                makeRpcDebugEvent(
+                    "RegisterRpc", ctx, runtime);
             event.serverPtr = sdPtr;
             event.sid = sid;
             event.sendBuf = buf;
@@ -839,7 +850,9 @@ namespace ps2_syscalls
         }
 
         RUNTIME_LOG("[SifRegisterRpc] sid=0x" << std::hex << sid << " sd=0x" << sdPtr << std::dec);
-        SifRpcDebugEvent event = makeRpcDebugEvent("RegisterRpc", ctx);
+        SifRpcDebugEvent event =
+            makeRpcDebugEvent(
+                "RegisterRpc", ctx, runtime);
         event.serverPtr = sdPtr;
         event.sid = sid;
         event.sendBuf = buf;

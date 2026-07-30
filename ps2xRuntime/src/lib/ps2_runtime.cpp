@@ -702,7 +702,8 @@ PS2Runtime::GuestExecutionScope::GuestExecutionScope(
     if (m_runtime)
     {
         m_previousContext =
-            m_runtime->enterGuestExecution(m_context);
+            m_runtime->enterGuestExecution(
+                m_context, &m_previousThreadId);
     }
 }
 
@@ -711,7 +712,9 @@ PS2Runtime::GuestExecutionScope::~GuestExecutionScope()
     if (m_runtime)
     {
         m_runtime->leaveGuestExecution(
-            m_context, m_previousContext);
+            m_context,
+            m_previousContext,
+            m_previousThreadId);
     }
 }
 
@@ -721,7 +724,8 @@ PS2Runtime::GuestExecutionReleaseScope::GuestExecutionReleaseScope(PS2Runtime *r
     if (m_runtime)
     {
         m_depth =
-            m_runtime->releaseGuestExecution(m_context);
+            m_runtime->releaseGuestExecution(
+                m_context, m_threadId);
     }
 }
 
@@ -730,7 +734,7 @@ PS2Runtime::GuestExecutionReleaseScope::~GuestExecutionReleaseScope()
     if (m_runtime && m_depth != 0u)
     {
         m_runtime->reacquireGuestExecution(
-            m_depth, m_context);
+            m_depth, m_context, m_threadId);
     }
 }
 
@@ -849,6 +853,9 @@ PS2Runtime::PS2Runtime(PS2RuntimeConfiguration configuration)
 {
     m_eeThreadRuntimeState =
         std::make_unique<EeThreadRuntimeState>();
+    m_eeThreadRuntimeState->contextThreadIds.emplace(
+        &m_cpuContext, 1);
+    selectEeThread(1);
     const auto configureVuBackend =
         [&](VuUnit &unit, VuBackendKind requested,
             const char *environmentName)
@@ -1223,6 +1230,45 @@ int PS2Runtime::activeEeHostThreadCount() const
         ? m_eeThreadRuntimeState->activeHostThreads.load(
               std::memory_order_acquire)
         : 0;
+}
+
+int PS2Runtime::currentEeThreadId() noexcept
+{
+    const auto depthIt =
+        g_guestExecutionDepths.find(this);
+    const bool ownsGuestExecution =
+        depthIt != g_guestExecutionDepths.end() &&
+        depthIt->second != 0u;
+    if (!ownsGuestExecution)
+    {
+        // Direct syscall tests and legacy host callbacks can still enter
+        // without a GuestExecutionScope. Their TLS slot is only a
+        // compatibility identity; it may never override a bound guest.
+        if (g_currentThreadRuntime != this)
+        {
+            g_currentThreadRuntime = this;
+            g_currentThreadId = 1;
+        }
+        return g_currentThreadId;
+    }
+
+    const int selected = m_boundEeThreadId;
+    if (g_currentThreadRuntime != this ||
+        g_currentThreadId != selected)
+    {
+        m_eeThreadRuntimeState->legacyAdapterMismatches.fetch_add(
+            1u, std::memory_order_relaxed);
+        g_currentThreadRuntime = this;
+        g_currentThreadId = selected;
+    }
+    return selected;
+}
+
+uint64_t
+PS2Runtime::eeThreadLegacyAdapterMismatchCount() const noexcept
+{
+    return m_eeThreadRuntimeState->legacyAdapterMismatches.load(
+        std::memory_order_relaxed);
 }
 
 void PS2Runtime::setIopPluginSearchPaths(std::vector<std::filesystem::path> paths)
@@ -6429,8 +6475,40 @@ void PS2Runtime::dispatchLoop(uint8_t *rdram, R5900Context *ctx)
     }
 }
 
+int PS2Runtime::threadIdForEeContext(
+    const R5900Context *context) noexcept
+{
+    if (!context)
+    {
+        return 0;
+    }
+
+    std::lock_guard<std::mutex> lock(
+        m_eeThreadRuntimeState->threadMapMutex);
+    const auto it =
+        m_eeThreadRuntimeState->contextThreadIds.find(context);
+    return it !=
+                   m_eeThreadRuntimeState->contextThreadIds.end()
+               ? it->second
+               : 0;
+}
+
+void PS2Runtime::selectEeThread(int threadId) noexcept
+{
+    if (threadId <= 0)
+    {
+        threadId = 1;
+    }
+    m_eeThreadRuntimeState->currentThreadId.store(
+        threadId, std::memory_order_release);
+    m_boundEeThreadId = threadId;
+    g_currentThreadRuntime = this;
+    g_currentThreadId = threadId;
+}
+
 void PS2Runtime::switchGuestExecutionContext(
-    R5900Context *context) noexcept
+    R5900Context *context,
+    int selectionHint) noexcept
 {
     if (!context || context == m_boundEeContext)
     {
@@ -6439,6 +6517,24 @@ void PS2Runtime::switchGuestExecutionContext(
 
     R5900Context *const previous =
         m_boundEeContext;
+    int selectedThreadId =
+        threadIdForEeContext(context);
+    if (selectedThreadId <= 0)
+    {
+        if (selectionHint > 0)
+        {
+            selectedThreadId = selectionHint;
+        }
+        else if (previous)
+        {
+            selectedThreadId = m_boundEeThreadId;
+        }
+        else
+        {
+            selectedThreadId = 1;
+        }
+    }
+
     const ps2x::timing::EeTick now =
         finishEeContextBlock(previous);
     synchronizeCop0Timing(
@@ -6447,6 +6543,7 @@ void PS2Runtime::switchGuestExecutionContext(
             now));
     context->resetEeBlockTiming();
     m_boundEeContext = context;
+    selectEeThread(selectedThreadId);
     publishCop0TimingMirrors(context);
     refreshCop0EventSchedules(
         context,
@@ -6456,7 +6553,8 @@ void PS2Runtime::switchGuestExecutionContext(
 
 void PS2Runtime::restoreGuestExecutionContext(
     R5900Context *context,
-    R5900Context *previousContext) noexcept
+    R5900Context *previousContext,
+    int previousThreadId) noexcept
 {
     if (!context ||
         context == previousContext ||
@@ -6472,6 +6570,7 @@ void PS2Runtime::restoreGuestExecutionContext(
         ps2x::timing::eeTickToCyclesFloor(
             now));
     m_boundEeContext = previousContext;
+    selectEeThread(previousThreadId);
     publishCop0TimingMirrors(previousContext);
     refreshCop0EventSchedules(
         previousContext,
@@ -6480,7 +6579,9 @@ void PS2Runtime::restoreGuestExecutionContext(
 }
 
 R5900Context *PS2Runtime::enterGuestExecution(
-    R5900Context *context)
+    R5900Context *context,
+    int *previousThreadId,
+    int selectionHint)
 {
     uint32_t &depth = g_guestExecutionDepths[this];
 
@@ -6490,7 +6591,13 @@ R5900Context *PS2Runtime::enterGuestExecution(
         ++depth;
         R5900Context *const previousContext =
             m_boundEeContext;
-        switchGuestExecutionContext(context);
+        if (previousThreadId)
+        {
+            *previousThreadId =
+                m_boundEeThreadId;
+        }
+        switchGuestExecutionContext(
+            context, selectionHint);
         return previousContext;
     }
 
@@ -6504,7 +6611,13 @@ R5900Context *PS2Runtime::enterGuestExecution(
         markGuestExecutionAcquired();
         R5900Context *const previousContext =
             m_boundEeContext;
-        switchGuestExecutionContext(context);
+        if (previousThreadId)
+        {
+            *previousThreadId =
+                m_boundEeThreadId;
+        }
+        switchGuestExecutionContext(
+            context, selectionHint);
         return previousContext;
     }
 
@@ -6535,7 +6648,13 @@ R5900Context *PS2Runtime::enterGuestExecution(
     markGuestExecutionAcquired();
     R5900Context *const previousContext =
         m_boundEeContext;
-    switchGuestExecutionContext(context);
+    if (previousThreadId)
+    {
+        *previousThreadId =
+            m_boundEeThreadId;
+    }
+    switchGuestExecutionContext(
+        context, selectionHint);
     return previousContext;
 }
 
@@ -6585,7 +6704,8 @@ void PS2Runtime::recordOuterGuestExecutionAcquisition(
 
 void PS2Runtime::leaveGuestExecution(
     R5900Context *context,
-    R5900Context *previousContext)
+    R5900Context *previousContext,
+    int previousThreadId)
 {
     auto it = g_guestExecutionDepths.find(this);
     if (it == g_guestExecutionDepths.end() || it->second == 0u)
@@ -6593,7 +6713,10 @@ void PS2Runtime::leaveGuestExecution(
         return;
     }
 
-    restoreGuestExecutionContext(context, previousContext);
+    restoreGuestExecutionContext(
+        context,
+        previousContext,
+        previousThreadId);
 
     // A completed DMA may not interrupt the guest from inside the instruction
     // or library call that started it. Deliver queued completions only when the
@@ -6624,9 +6747,11 @@ void PS2Runtime::leaveGuestExecution(
 }
 
 uint32_t PS2Runtime::releaseGuestExecution(
-    R5900Context *&context)
+    R5900Context *&context,
+    int &threadId)
 {
     context = nullptr;
+    threadId = 1;
     auto it = g_guestExecutionDepths.find(this);
     if (it == g_guestExecutionDepths.end() || it->second == 0u)
     {
@@ -6634,8 +6759,12 @@ uint32_t PS2Runtime::releaseGuestExecution(
     }
 
     context = m_boundEeContext;
+    threadId = m_boundEeThreadId;
     (void)finishEeContextBlock(m_boundEeContext);
     m_boundEeContext = nullptr;
+    m_boundEeThreadId = 1;
+    m_eeThreadRuntimeState->currentThreadId.store(
+        1, std::memory_order_release);
 
     const uint32_t depth = it->second;
     for (uint32_t i = 0; i < depth; ++i)
@@ -6648,7 +6777,8 @@ uint32_t PS2Runtime::releaseGuestExecution(
 
 void PS2Runtime::reacquireGuestExecution(
     uint32_t depth,
-    R5900Context *context)
+    R5900Context *context,
+    int threadId)
 {
     if (depth == 0u)
     {
@@ -6660,13 +6790,15 @@ void PS2Runtime::reacquireGuestExecution(
 
     if (heldDepth == 0u)
     {
-        (void)enterGuestExecution(context);
+        (void)enterGuestExecution(
+            context, nullptr, threadId);
         heldDepth = g_guestExecutionDepths[this];
         --remaining;
     }
     else
     {
-        switchGuestExecutionContext(context);
+        switchGuestExecutionContext(
+            context, threadId);
     }
 
     for (uint32_t i = 0; i < remaining; ++i)
@@ -7097,12 +7229,17 @@ void PS2Runtime::debugBlockGuestAtBoundary(R5900Context *ctx, const char *reason
     // guest-execution mutex. Release all levels so debugger snapshots can be
     // proven quiescent while the guest remains stopped.
     R5900Context *releasedContext = nullptr;
+    int releasedThreadId = 1;
     const uint32_t depth =
-        releaseGuestExecution(releasedContext);
+        releaseGuestExecution(
+            releasedContext, releasedThreadId);
     debugWaitUntilResumed();
     if (depth != 0u)
     {
-        reacquireGuestExecution(depth, releasedContext);
+        reacquireGuestExecution(
+            depth,
+            releasedContext,
+            releasedThreadId);
     }
 }
 

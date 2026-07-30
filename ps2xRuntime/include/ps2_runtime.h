@@ -981,6 +981,7 @@ public:
         PS2Runtime *m_runtime = nullptr;
         R5900Context *m_context = nullptr;
         R5900Context *m_previousContext = nullptr;
+        int m_previousThreadId = 1;
     };
 
     class GuestExecutionReleaseScope
@@ -995,6 +996,7 @@ public:
     private:
         PS2Runtime *m_runtime = nullptr;
         R5900Context *m_context = nullptr;
+        int m_threadId = 1;
         uint32_t m_depth = 0u;
     };
 
@@ -1211,6 +1213,8 @@ public:
     EeThreadRuntimeState &eeThreadRuntimeState();
     const EeThreadRuntimeState &eeThreadRuntimeState() const;
     int activeEeHostThreadCount() const;
+    int currentEeThreadId() noexcept;
+    uint64_t eeThreadLegacyAdapterMismatchCount() const noexcept;
     bool guestPreemptionRequestedForTesting() const
     {
         return m_guestExecutionPreemptionRequested.load(
@@ -1298,17 +1302,24 @@ private:
     uint32_t allocateGuestBlockLocked(uint32_t size, uint32_t alignment);
     void freeGuestBlockLocked(uint32_t guestAddr);
     void coalesceGuestHeapLocked();
-    R5900Context *enterGuestExecution(R5900Context *context);
+    R5900Context *enterGuestExecution(
+        R5900Context *context,
+        int *previousThreadId = nullptr,
+        int selectionHint = 0);
     void lockGuestExecutionMutex(bool mayContend);
     void recordOuterGuestExecutionAcquisition(
         R5900Context *context) noexcept;
     void leaveGuestExecution(
         R5900Context *context,
-        R5900Context *previousContext);
-    uint32_t releaseGuestExecution(R5900Context *&context);
+        R5900Context *previousContext,
+        int previousThreadId);
+    uint32_t releaseGuestExecution(
+        R5900Context *&context,
+        int &threadId);
     void reacquireGuestExecution(
         uint32_t depth,
-        R5900Context *context);
+        R5900Context *context,
+        int threadId);
     void markGuestExecutionAcquired();
     void debugBeforeGuestStep(R5900Context *ctx);
     void debugAfterGuestStep(R5900Context *ctx);
@@ -1524,10 +1535,16 @@ private:
         R5900Context *context) noexcept;
     [[nodiscard]] ps2x::timing::EeTick finishEeContextBlock(
         R5900Context *context) noexcept;
-    void switchGuestExecutionContext(R5900Context *context) noexcept;
+    int threadIdForEeContext(
+        const R5900Context *context) noexcept;
+    void selectEeThread(int threadId) noexcept;
+    void switchGuestExecutionContext(
+        R5900Context *context,
+        int selectionHint = 0) noexcept;
     void restoreGuestExecutionContext(
         R5900Context *context,
-        R5900Context *previousContext) noexcept;
+        R5900Context *previousContext,
+        int previousThreadId) noexcept;
     void resetEeTimingUnlocked(R5900Context *context) noexcept;
 
     PS2Memory m_memory;
@@ -1689,6 +1706,7 @@ private:
     R5900Context m_cpuContext;
     std::unique_ptr<EeThreadRuntimeState> m_eeThreadRuntimeState;
     R5900Context *m_boundEeContext = nullptr;
+    int m_boundEeThreadId = 1;
     mutable std::recursive_timed_mutex m_guestExecutionMutex;
     mutable std::atomic<uint32_t> m_guestExecutionWaiters{0u};
     mutable std::mutex m_guestExecutionHandoffMutex;

@@ -3,6 +3,24 @@
 
 namespace ps2_syscalls
 {
+    static void eraseThreadContextMappingsLocked(
+        EeThreadRuntimeState &state,
+        int tid)
+    {
+        for (auto it = state.contextThreadIds.begin();
+             it != state.contextThreadIds.end();)
+        {
+            if (it->second == tid)
+            {
+                it = state.contextThreadIds.erase(it);
+            }
+            else
+            {
+                ++it;
+            }
+        }
+    }
+
     std::vector<GuestThreadDebugSnapshot> debugThreadSnapshots(
         PS2Runtime *runtime)
     {
@@ -276,6 +294,7 @@ namespace ps2_syscalls
             }
 
             state.threads[id] = info;
+            state.contextThreadIds[info->boundContext] = id;
         }
 
         RUNTIME_LOG("[CreateThread] id=" << id
@@ -327,6 +346,7 @@ namespace ps2_syscalls
                 runtime->eeThreadRuntimeState();
             std::lock_guard<std::mutex> lock(
                 state.threadMapMutex);
+            eraseThreadContextMappingsLocked(state, tid);
             state.threads.erase(tid);
         }
 
@@ -457,8 +477,6 @@ namespace ps2_syscalls
             SET_GPR_U32(threadCtx, 4, info->arg);
             SET_GPR_U32(threadCtx, 31, 0);
             threadCtx->pc = info->entry;
-
-            g_currentThreadId = tid;
 
             RUNTIME_LOG("[StartThread] id=" << tid
                       << " entry=0x" << std::hex << info->entry
@@ -638,9 +656,9 @@ namespace ps2_syscalls
     void ExitThread(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
         RUNTIME_LOG("[ExitThread] Game requested thread exit! PC=0x" << std::hex << ctx->pc
-                                                                     << " RA=0x" << getRegU32(ctx, 31) << std::dec << " tid=" << g_currentThreadId << std::endl);
+                                                                     << " RA=0x" << getRegU32(ctx, 31) << std::dec << " tid=" << getCurrentThreadId(runtime) << std::endl);
 
-        runExitHandlersForThread(g_currentThreadId, rdram, ctx, runtime);
+        runExitHandlersForThread(getCurrentThreadId(runtime), rdram, ctx, runtime);
         auto info = ensureCurrentThreadInfo(runtime, ctx);
         if (info)
         {
@@ -660,7 +678,7 @@ namespace ps2_syscalls
 
     void ExitDeleteThread(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
-        int tid = g_currentThreadId;
+        int tid = getCurrentThreadId(runtime);
         RUNTIME_LOG("[ExitDeleteThread] Game requested thread exit & delete! PC=0x" << std::hex << ctx->pc
                                                                                     << " RA=0x" << getRegU32(ctx, 31) << std::dec << " tid=" << tid << std::endl);
 
@@ -684,6 +702,7 @@ namespace ps2_syscalls
                 runtime->eeThreadRuntimeState();
             std::lock_guard<std::mutex> lock(
                 state.threadMapMutex);
+            eraseThreadContextMappingsLocked(state, tid);
             state.threads.erase(tid);
         }
         throw ThreadExitException();
@@ -697,9 +716,9 @@ namespace ps2_syscalls
     {
         int tid = static_cast<int>(getRegU32(ctx, 4));
         if (tid == 0)
-            tid = g_currentThreadId;
+            tid = getCurrentThreadId(runtime);
 
-        auto info = (tid == g_currentThreadId)
+        auto info = (tid == getCurrentThreadId(runtime))
                         ? ensureCurrentThreadInfo(runtime, ctx)
                         : lookupThreadInfo(runtime, tid);
         if (!info)
@@ -711,7 +730,7 @@ namespace ps2_syscalls
         // Preserve the existing self-termination path. The external-thread
         // path below models the BIOS's synchronous scheduler transition
         // without waiting for the legacy host thread to unwind.
-        if (tid == g_currentThreadId)
+        if (tid == getCurrentThreadId(runtime))
         {
             {
                 std::lock_guard<std::mutex> lock(info->m);
@@ -817,9 +836,9 @@ namespace ps2_syscalls
     {
         int tid = static_cast<int>(getRegU32(ctx, 4));
         if (tid == 0)
-            tid = g_currentThreadId;
+            tid = getCurrentThreadId(runtime);
         const bool suspendingCurrentThread =
-            tid == g_currentThreadId;
+            tid == getCurrentThreadId(runtime);
 
         auto info = suspendingCurrentThread
                         ? ensureCurrentThreadInfo(runtime, ctx)
@@ -894,9 +913,9 @@ namespace ps2_syscalls
     {
         int tid = static_cast<int>(getRegU32(ctx, 4));
         if (tid == 0)
-            tid = g_currentThreadId;
+            tid = getCurrentThreadId(runtime);
 
-        auto info = (tid == g_currentThreadId)
+        auto info = (tid == getCurrentThreadId(runtime))
                         ? ensureCurrentThreadInfo(runtime, ctx)
                         : lookupThreadInfo(runtime, tid);
         if (!info)
@@ -927,8 +946,8 @@ namespace ps2_syscalls
                 }
                 else
                 {
-                    info->status = (tid == g_currentThreadId) ? THS_RUN : THS_READY;
-                    becameRunnable = tid != g_currentThreadId;
+                    info->status = (tid == getCurrentThreadId(runtime)) ? THS_RUN : THS_READY;
+                    becameRunnable = tid != getCurrentThreadId(runtime);
                 }
             }
         }
@@ -952,7 +971,7 @@ namespace ps2_syscalls
 
     void GetThreadId(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
-        setReturnS32(ctx, g_currentThreadId);
+        setReturnS32(ctx, getCurrentThreadId(runtime));
     }
 
     static void referThreadStatus(
@@ -966,10 +985,10 @@ namespace ps2_syscalls
 
         if (tid == 0) // TH_SELF
         {
-            tid = g_currentThreadId;
+            tid = getCurrentThreadId(runtime);
         }
 
-        auto info = (tid == g_currentThreadId)
+        auto info = (tid == getCurrentThreadId(runtime))
                         ? ensureCurrentThreadInfo(runtime, ctx)
                         : lookupThreadInfo(runtime, tid);
         if (!info)
@@ -1036,7 +1055,7 @@ namespace ps2_syscalls
             info->status = THS_RUN;
             info->waitType = TSW_NONE;
             info->waitId = 0;
-            ret = g_currentThreadId;
+            ret = getCurrentThreadId(runtime);
             wakeupCountAfter = info->wakeupCount;
         }
         else
@@ -1045,7 +1064,7 @@ namespace ps2_syscalls
             const uint32_t sleepBlockLog = s_sleepBlockLogs.fetch_add(1, std::memory_order_relaxed);
             if (sleepBlockLog < 256u)
             {
-                RUNTIME_LOG("[SleepThread:block] tid=" << g_currentThreadId
+                RUNTIME_LOG("[SleepThread:block] tid=" << getCurrentThreadId(runtime)
                                                        << " pc=0x" << std::hex << ctx->pc
                                                        << " ra=0x" << getRegU32(ctx, 31)
                                                        << std::dec << std::endl);
@@ -1090,7 +1109,7 @@ namespace ps2_syscalls
                     }
                     else
                     {
-                        ret = g_currentThreadId;
+                        ret = getCurrentThreadId(runtime);
                     }
                     wakeupCountAfter = info->wakeupCount;
                 });
@@ -1105,7 +1124,7 @@ namespace ps2_syscalls
         const uint32_t sleepWakeLog = s_sleepWakeLogs.fetch_add(1, std::memory_order_relaxed);
         if (sleepWakeLog < 256u)
         {
-            RUNTIME_LOG("[SleepThread:wake] tid=" << g_currentThreadId
+            RUNTIME_LOG("[SleepThread:wake] tid=" << getCurrentThreadId(runtime)
                                                   << " ret=" << ret
                                                   << " wakeupCount=" << wakeupCountAfter
                                                   << std::endl);
@@ -1131,7 +1150,7 @@ namespace ps2_syscalls
             setReturnS32(ctx, KE_ILLEGAL_THID);
             return;
         }
-        if (tid == g_currentThreadId)
+        if (tid == getCurrentThreadId(runtime))
         {
             setReturnS32(ctx, KE_ILLEGAL_THID);
             return;
@@ -1187,7 +1206,7 @@ namespace ps2_syscalls
         const uint32_t wakeupLog = s_wakeupLogs.fetch_add(1, std::memory_order_relaxed);
         if (wakeupLog < 256u)
         {
-            RUNTIME_LOG("[WakeupThread] tid=" << g_currentThreadId
+            RUNTIME_LOG("[WakeupThread] tid=" << getCurrentThreadId(runtime)
                                               << " target=" << tid
                                               << " status=" << statusAfter
                                               << " wakeupCount=" << newWakeupCount
@@ -1214,9 +1233,9 @@ namespace ps2_syscalls
     {
         int tid = static_cast<int>(getRegU32(ctx, 4));
         if (tid == 0)
-            tid = g_currentThreadId;
+            tid = getCurrentThreadId(runtime);
 
-        auto info = (tid == g_currentThreadId)
+        auto info = (tid == getCurrentThreadId(runtime))
                         ? ensureCurrentThreadInfo(runtime, ctx)
                         : lookupThreadInfo(runtime, tid);
         if (!info)
@@ -1270,9 +1289,9 @@ namespace ps2_syscalls
         int previousPriority = 0;
 
         if (tid == 0)
-            tid = g_currentThreadId;
+            tid = getCurrentThreadId(runtime);
 
-        auto info = (tid == g_currentThreadId)
+        auto info = (tid == getCurrentThreadId(runtime))
                         ? ensureCurrentThreadInfo(runtime, ctx)
                         : lookupThreadInfo(runtime, tid);
         if (!info)
@@ -1333,7 +1352,7 @@ namespace ps2_syscalls
         if (prio < 0 || prio >= 128)
         {
             runtime->recordEeThreadQueueRotation(
-                g_currentThreadId,
+                getCurrentThreadId(runtime),
                 requestedPriority,
                 prio,
                 false);
@@ -1342,7 +1361,7 @@ namespace ps2_syscalls
         }
 
         runtime->recordEeThreadQueueRotation(
-            g_currentThreadId,
+            getCurrentThreadId(runtime),
             requestedPriority,
             prio,
             true);
@@ -1370,7 +1389,7 @@ namespace ps2_syscalls
         bool reschedule)
     {
         int tid = static_cast<int>(getRegU32(ctx, 4));
-        if (tid == 0 || tid == g_currentThreadId)
+        if (tid == 0 || tid == getCurrentThreadId(runtime))
         {
             setReturnS32(ctx, KE_ILLEGAL_THID);
             return;

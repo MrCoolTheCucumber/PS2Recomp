@@ -2936,7 +2936,7 @@ namespace ps2_stubs
                 std::lock_guard<std::mutex> mapLock(
                     threadState.threadMapMutex);
                 auto it = threadState.threads.find(
-                    g_currentThreadId);
+                    runtime->currentEeThreadId());
                 if (it != threadState.threads.end())
                 {
                     currentThreadInfo = it->second;

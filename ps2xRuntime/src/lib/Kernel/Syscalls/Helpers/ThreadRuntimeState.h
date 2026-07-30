@@ -51,6 +51,7 @@ struct EeThreadRuntimeState
 {
     std::mutex threadMapMutex;
     std::unordered_map<int, std::shared_ptr<ThreadInfo>> threads;
+    std::unordered_map<const R5900Context *, int> contextThreadIds;
     int nextThreadId = 2;
     uint32_t nextGeneration = 1u;
 
@@ -61,4 +62,11 @@ struct EeThreadRuntimeState
     // This is the runtime authority. The host TLS ID remains a checked
     // adapter until all legacy direct-call sites bind through the executor.
     std::atomic<int> currentThreadId{1};
+    std::atomic<uint64_t> legacyAdapterMismatches{0u};
 };
+
+// Compatibility view for legacy code that still observes a host TLS slot.
+// Runtime context binding owns the value; syscall code must use
+// PS2Runtime::currentEeThreadId() instead.
+inline thread_local PS2Runtime *g_currentThreadRuntime = nullptr;
+inline thread_local int g_currentThreadId = 1;

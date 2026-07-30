@@ -285,7 +285,7 @@ namespace ps2_syscalls
         const uint32_t sigLog = s_signalSemaLogs.fetch_add(1, std::memory_order_relaxed);
         if (sigLog < 256u)
         {
-            RUNTIME_LOG("[SignalSema] tid=" << g_currentThreadId
+            RUNTIME_LOG("[SignalSema] tid=" << getCurrentThreadId(runtime)
                                             << " sid=" << sid
                                             << " count=" << beforeCount << "->" << afterCount
                                             << " ret=" << ret
@@ -336,7 +336,7 @@ namespace ps2_syscalls
             const uint32_t blockLog = s_waitSemaBlockLogs.fetch_add(1, std::memory_order_relaxed);
             if (blockLog < 256u)
             {
-                RUNTIME_LOG("[WaitSema:block] tid=" << g_currentThreadId
+                RUNTIME_LOG("[WaitSema:block] tid=" << getCurrentThreadId(runtime)
                                                     << " sid=" << sid
                                                     << " pc=0x" << std::hex << ctx->pc
                                                     << " ra=0x" << getRegU32(ctx, 31)
@@ -440,7 +440,7 @@ namespace ps2_syscalls
         const uint32_t wakeLog = s_waitSemaWakeLogs.fetch_add(1, std::memory_order_relaxed);
         if (wakeLog < 256u)
         {
-            RUNTIME_LOG("[WaitSema:wake] tid=" << g_currentThreadId
+            RUNTIME_LOG("[WaitSema:wake] tid=" << getCurrentThreadId(runtime)
                                                << " sid=" << sid
                                                << " ret=" << ret
                                                << " count=" << countAfter
@@ -612,7 +612,7 @@ namespace ps2_syscalls
         const uint32_t setLog = s_setEventFlagLogs.fetch_add(1, std::memory_order_relaxed);
         if (setLog < 256u)
         {
-            RUNTIME_LOG("[SetEventFlag] tid=" << g_currentThreadId
+            RUNTIME_LOG("[SetEventFlag] tid=" << getCurrentThreadId(runtime)
                                               << " eid=" << eid
                                               << " bits=0x" << std::hex << bits
                                               << " newBits=0x" << newBits
@@ -748,7 +748,7 @@ namespace ps2_syscalls
             const uint32_t evBlockLog = s_waitEventBlockLogs.fetch_add(1, std::memory_order_relaxed);
             if (evBlockLog < 256u)
             {
-                RUNTIME_LOG("[WaitEventFlag:block] tid=" << g_currentThreadId
+                RUNTIME_LOG("[WaitEventFlag:block] tid=" << getCurrentThreadId(runtime)
                                                          << " eid=" << eid
                                                          << " waitBits=0x" << std::hex << waitBits
                                                          << " mode=0x" << mode
@@ -829,7 +829,7 @@ namespace ps2_syscalls
         const uint32_t evWakeLog = s_waitEventWakeLogs.fetch_add(1, std::memory_order_relaxed);
         if (evWakeLog < 256u)
         {
-            RUNTIME_LOG("[WaitEventFlag:wake] tid=" << g_currentThreadId
+            RUNTIME_LOG("[WaitEventFlag:wake] tid=" << getCurrentThreadId(runtime)
                                                     << " eid=" << eid
                                                     << " ret=" << ret
                                                     << " bits=0x" << std::hex << bitsAfter
