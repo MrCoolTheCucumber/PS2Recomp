@@ -491,6 +491,7 @@ add_library(ps2_runtime STATIC
     src/lib/ee_counters.cpp
     src/lib/ee_execution_backend.cpp
     src/lib/ee_event_scheduler.cpp
+    src/lib/ee_runtime_executor.cpp
     src/lib/ee_scheduler_executor.cpp
     src/lib/ee_thread_scheduler.cpp
     src/lib/game_overrides.cpp

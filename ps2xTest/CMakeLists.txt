@@ -49,6 +49,7 @@ add_library(ps2_test_lib STATIC
     src/ee_counter_tests.cpp
     src/ee_execution_backend_tests.cpp
     src/ee_event_scheduler_tests.cpp
+    src/ee_runtime_executor_tests.cpp
     src/ee_thread_scheduler_tests.cpp
     src/r5900_decoder_tests.cpp
     src/elf_analyzer_tests.cpp
@@ -116,6 +117,11 @@ endif()
 
 add_executable(ps2x_tests
     src/main.cpp
+    $<TARGET_OBJECTS:ps2_test_function_table>
+)
+
+add_executable(ee_runtime_executor_tests
+    src/ee_runtime_executor_test_main.cpp
     $<TARGET_OBJECTS:ps2_test_function_table>
 )
 
@@ -213,7 +219,21 @@ target_include_directories(ps2x_tests PRIVATE
     ${CMAKE_SOURCE_DIR}/ps2xRuntime/include
 )
 
+target_include_directories(ee_runtime_executor_tests PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/include
+    ${CMAKE_SOURCE_DIR}/ps2xRecomp/include
+    ${CMAKE_SOURCE_DIR}/ps2xAnalyzer/include
+    ${CMAKE_SOURCE_DIR}/ps2xRuntime/include
+)
+
 target_link_libraries(ps2x_tests PRIVATE
+    ps2_test_lib
+    ps2_recomp_lib
+    ps2_analyzer_lib
+    ps2_runtime
+)
+
+target_link_libraries(ee_runtime_executor_tests PRIVATE
     ps2_test_lib
     ps2_recomp_lib
     ps2_analyzer_lib
@@ -269,6 +289,7 @@ include("${CMAKE_SOURCE_DIR}/ps2xRuntime/cmake/ReleaseMode.cmake")
 if(CMAKE_BUILD_TYPE STREQUAL "Release" OR CMAKE_BUILD_TYPE STREQUAL "RelWithDebInfo")
     EnableFastReleaseMode(ps2_test_lib)
     EnableFastReleaseMode(ps2x_tests)
+    EnableFastReleaseMode(ee_runtime_executor_tests)
     EnableFastReleaseMode(ee_timing_benchmark)
     EnableFastReleaseMode(ee_thread_scheduler_benchmark)
     EnableFastReleaseMode(vu_backend_benchmark)
@@ -279,4 +300,5 @@ endif()
 
 ConfigureEeFcontextSuspendedFrames(ps2_test_lib)
 ConfigureEeFcontextSuspendedFrames(ps2x_tests)
+ConfigureEeFcontextSuspendedFrames(ee_runtime_executor_tests)
 ConfigureEeFcontextSuspendedFrames(ee_fiber_guard_probe)

@@ -37,6 +37,8 @@ public:
 
     [[nodiscard]] virtual EeExecutionBackendKind kind() const noexcept = 0;
     [[nodiscard]] virtual std::string_view name() const noexcept = 0;
+    [[nodiscard]] virtual bool
+    executorResumable() const noexcept = 0;
 
     // Legacy host-thread continuations begin immediately. Executor-owned
     // continuations are created dormant and entered only through resume().

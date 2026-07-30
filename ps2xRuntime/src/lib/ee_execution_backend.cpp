@@ -53,6 +53,12 @@ namespace
             return "legacy-host-thread";
         }
 
+        [[nodiscard]] bool
+        executorResumable() const noexcept override
+        {
+            return false;
+        }
+
         void create(
             int threadId,
             ThreadEntry entry) override
@@ -286,6 +292,12 @@ namespace
         name() const noexcept override
         {
             return "legacy-cpp-fiber";
+        }
+
+        [[nodiscard]] bool
+        executorResumable() const noexcept override
+        {
+            return true;
         }
 
         void create(
