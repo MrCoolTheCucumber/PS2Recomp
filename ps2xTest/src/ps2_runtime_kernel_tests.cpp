@@ -2413,6 +2413,24 @@ void register_ps2_runtime_kernel_tests()
                     1u,
                     "raw semaphore deletion should not dispatch its waiter");
 
+                EeThreadStatus rawDeleteStatus{};
+                t.Equals(
+                    referThread(rawDeleteTid, rawDeleteStatus),
+                    THS_READY,
+                    "raw semaphore deletion should synchronously publish READY");
+                t.Equals(
+                    rawDeleteStatus.status,
+                    THS_READY,
+                    "raw-deleted waiter should be READY before dispatch");
+                t.Equals(
+                    rawDeleteStatus.waitType,
+                    TSW_SEMA,
+                    "raw-deleted READY waiter should retain its semaphore wait reason");
+                t.Equals(
+                    rawDeleteStatus.waitId,
+                    static_cast<uint32_t>(rawDeleteSid),
+                    "raw-deleted READY waiter should retain its semaphore id");
+
                 setRegU32(env.ctx, 4, 0u);
                 setRegU32(env.ctx, 5, 60u);
                 ChangeThreadPriority(
