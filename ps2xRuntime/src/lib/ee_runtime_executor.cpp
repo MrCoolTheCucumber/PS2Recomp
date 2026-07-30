@@ -465,6 +465,24 @@ namespace ps2x::ee
                    !m_publications.empty();
         }
 
+        [[nodiscard]]
+        EeSchedulerReschedulePolicy
+        initialBoundaryPolicy() const
+        {
+            std::lock_guard<std::mutex> lock(m_mutex);
+            if (!m_stopRequested &&
+                !m_publications.empty())
+            {
+                // A guest raw syscall publishes before it exits to this
+                // boundary. Its no-reschedule contract covers the whole
+                // atomic boundary, including a target that was already READY
+                // before the command is applied.
+                return m_publications.front().policy;
+            }
+            return EeSchedulerReschedulePolicy::
+                HigherPriorityOnly;
+        }
+
         [[nodiscard]] std::optional<
             EeSchedulerReschedulePolicy>
         applyQueuedPublication()
@@ -612,8 +630,7 @@ namespace ps2x::ee
                             *this,
                             priorThreadId,
                             elapsed,
-                            EeSchedulerReschedulePolicy::
-                                HigherPriorityOnly);
+                            initialBoundaryPolicy());
                     priorThreadId.reset();
                     elapsed = {};
                     cacheBoundary(boundary);
