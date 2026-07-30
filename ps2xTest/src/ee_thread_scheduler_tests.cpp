@@ -1372,6 +1372,233 @@ void register_ee_thread_scheduler_tests()
                 "executor reset should clear debugger control without changing guest scheduler ownership");
         });
 
+        tc.Run("transition traces use canonical ticks and bounded storage", [](TestCase &t)
+        {
+            EeThreadScheduler scheduler;
+            EeSchedulerExecutor executor;
+            ScriptedBoundaryHooks hooks;
+            t.IsTrue(
+                scheduler.addRunningThread(1, 1u, 40) &&
+                    scheduler
+                        .transitionTraceSnapshot()
+                        .empty(),
+                "transition tracing should be disabled by default");
+
+            scheduler.enableTransitionTracing(64u);
+            t.IsTrue(
+                scheduler.addDormantThread(2, 1u, 40) &&
+                    scheduler.startThread(2),
+                "the trace fixture should publish one equal-priority peer");
+            const EeSchedulerThreadHandle second =
+                scheduler.threadHandle(2).value_or(
+                    EeSchedulerThreadHandle{});
+            const EeSchedulerBoundaryResult selected =
+                executor.processBoundary(
+                    scheduler,
+                    hooks,
+                    1,
+                    ps2x::timing::
+                        eeTickDeltaFromRaw(8u),
+                    EeSchedulerReschedulePolicy::
+                        EqualOrHigherPriority);
+            const EeSchedulerWaitKey semaphore{
+                EeSchedulerWaitKind::Semaphore,
+                7};
+            t.IsTrue(
+                selected.selectedThreadId.value_or(0) ==
+                        2 &&
+                    scheduler
+                            .blockCurrentThread(semaphore)
+                            .value_or(0) ==
+                        1 &&
+                    scheduler
+                            .changeThreadPriority(
+                                second, 30)
+                            .value_or(-1) ==
+                        40,
+                "the traced peer should run, block, and publish its new wait priority");
+
+            hooks.queue(
+                EeSchedulerConsequenceStage::
+                    AsynchronousWake,
+                [semaphore](
+                    EeThreadScheduler &target,
+                    ScriptedBoundaryHooks &)
+                {
+                    (void)target.wakeOne(semaphore);
+                });
+            const EeSchedulerBoundaryResult woke =
+                executor.processBoundary(
+                    scheduler,
+                    hooks,
+                    1,
+                    ps2x::timing::
+                        eeTickDeltaFromRaw(5u),
+                    EeSchedulerReschedulePolicy::
+                        HigherPriorityOnly);
+            t.IsTrue(
+                woke.selectedThreadId.value_or(0) ==
+                        2 &&
+                    scheduler.terminateThread(second) &&
+                    scheduler.deleteThread(second),
+                "the same executor should apply the wake, higher-priority selection, termination, and deletion");
+
+            const std::vector<
+                EeSchedulerTransitionTrace>
+                trace =
+                    scheduler
+                        .transitionTraceSnapshot();
+            t.IsTrue(
+                trace.size() == 9u &&
+                    trace[0].sequence == 1u &&
+                    trace[0].tick.raw() == 0u &&
+                    trace[0].reason ==
+                        EeSchedulerTransitionReason::
+                            ThreadAdded &&
+                    trace[0].oldThreadId ==
+                        std::optional<int>(1) &&
+                    trace[0].newThreadId ==
+                        std::optional<int>(1) &&
+                    trace[0].threadId == 2 &&
+                    trace[0].generation == 1u &&
+                    trace[0].priority == 40 &&
+                    trace[0].state ==
+                        EeSchedulerThreadState::
+                            Dormant &&
+                    trace[0].queueSequence == 0u,
+                "a trace record should identify its tick, reason, owner pair, target generation, priority, state, and queue sequence");
+            t.IsTrue(
+                trace[1].reason ==
+                        EeSchedulerTransitionReason::
+                            Started &&
+                    trace[1].state ==
+                        EeSchedulerThreadState::Ready &&
+                    trace[1].queueSequence != 0u &&
+                    trace[2].tick.raw() == 8u &&
+                    trace[2].reason ==
+                        EeSchedulerTransitionReason::
+                            Rescheduled &&
+                    trace[2].oldThreadId ==
+                        std::optional<int>(1) &&
+                    trace[2].newThreadId ==
+                        std::optional<int>(2) &&
+                    trace[2].state ==
+                        EeSchedulerThreadState::
+                            Running,
+                "start and selection should expose ready membership and the executor's committed tick");
+            t.IsTrue(
+                trace[3].reason ==
+                        EeSchedulerTransitionReason::
+                            Blocked &&
+                    trace[3].oldThreadId ==
+                        std::optional<int>(2) &&
+                    trace[3].newThreadId ==
+                        std::optional<int>(1) &&
+                    trace[3].state ==
+                        EeSchedulerThreadState::
+                            Waiting &&
+                    trace[3].wait == semaphore &&
+                    trace[3].queueSequence != 0u &&
+                    trace[4].reason ==
+                        EeSchedulerTransitionReason::
+                            PriorityChanged &&
+                    trace[4].priority == 30 &&
+                    trace[4].wait == semaphore,
+                "blocking and in-wait priority publication should retain the exact wait object");
+            t.IsTrue(
+                trace[5].tick.raw() == 13u &&
+                    trace[5].reason ==
+                        EeSchedulerTransitionReason::
+                            WaitSatisfied &&
+                    trace[5].oldThreadId ==
+                        std::optional<int>(1) &&
+                    trace[5].newThreadId ==
+                        std::optional<int>(1) &&
+                    trace[5].priority == 30 &&
+                    trace[5].state ==
+                        EeSchedulerThreadState::Ready &&
+                    trace[5].wait == semaphore &&
+                    trace[5].queueSequence != 0u &&
+                    trace[6].reason ==
+                        EeSchedulerTransitionReason::
+                            Rescheduled &&
+                    trace[6].oldThreadId ==
+                        std::optional<int>(1) &&
+                    trace[6].newThreadId ==
+                        std::optional<int>(2) &&
+                    trace[6].state ==
+                        EeSchedulerThreadState::
+                            Running,
+                "a same-boundary wake should be traced before its resulting higher-priority selection");
+            t.IsTrue(
+                trace[7].reason ==
+                        EeSchedulerTransitionReason::
+                            Terminated &&
+                    trace[7].oldThreadId ==
+                        std::optional<int>(2) &&
+                    trace[7].newThreadId ==
+                        std::optional<int>(1) &&
+                    trace[7].state ==
+                        EeSchedulerThreadState::
+                            Dormant &&
+                    trace[8].reason ==
+                        EeSchedulerTransitionReason::
+                            Deleted &&
+                    trace[8].tick.raw() == 13u &&
+                    eeSchedulerTransitionReasonName(
+                        trace[8].reason) ==
+                        "deleted" &&
+                    scheduler.validate(),
+                "terminal transitions should retain the last valid target snapshot and never rewind the canonical tick");
+
+            scheduler.enableTransitionTracing(3u);
+            t.IsTrue(
+                scheduler.addDormantThread(3, 1u, 50) &&
+                    scheduler.startThread(3) &&
+                    scheduler.addDormantThread(4, 1u, 50) &&
+                    scheduler.startThread(4),
+                "the bounded trace fixture should create a rotatable named queue");
+            scheduler.clearTransitionTrace();
+            for (size_t rotation = 0u;
+                 rotation < 5u;
+                 ++rotation)
+            {
+                t.IsTrue(
+                    scheduler.rotateReadyQueue(50),
+                    "each bounded trace rotation should succeed");
+            }
+            const auto bounded =
+                scheduler.transitionTraceSnapshot();
+            t.IsTrue(
+                bounded.size() == 3u &&
+                    scheduler.transitionTraceCapacity() ==
+                        3u &&
+                    scheduler
+                            .droppedTransitionTraceCount() ==
+                        2u &&
+                    bounded.front().sequence == 3u &&
+                    bounded.back().sequence == 5u &&
+                    bounded.front().tick.raw() == 13u &&
+                    bounded.front().reason ==
+                        EeSchedulerTransitionReason::
+                            ReadyQueueRotated,
+                "the opt-in ring should retain the newest records and report exact overflow");
+
+            scheduler.disableTransitionTracing();
+            t.IsTrue(
+                scheduler.rotateReadyQueue(50) &&
+                    scheduler
+                            .transitionTraceSnapshot()
+                            .size() ==
+                        3u &&
+                    scheduler
+                            .droppedTransitionTraceCount() ==
+                        2u &&
+                    !scheduler
+                         .transitionTracingEnabled(),
+                "disabling tracing should preserve the captured snapshot without recording later transitions");
+        });
+
         tc.Run("priority changes migrate only ready membership", [](TestCase &t)
         {
             EeThreadScheduler scheduler;

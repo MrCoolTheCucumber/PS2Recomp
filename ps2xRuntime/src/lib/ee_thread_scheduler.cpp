@@ -7,6 +7,36 @@
 
 namespace ps2x::ee
 {
+    namespace
+    {
+        [[nodiscard]]
+        EeSchedulerTransitionReason
+        transitionReasonForWaitCompletion(
+            EeSchedulerWaitCompletion completion)
+        {
+            switch (completion)
+            {
+            case EeSchedulerWaitCompletion::Satisfied:
+                return EeSchedulerTransitionReason::
+                    WaitSatisfied;
+            case EeSchedulerWaitCompletion::Released:
+                return EeSchedulerTransitionReason::
+                    WaitReleased;
+            case EeSchedulerWaitCompletion::
+                ObjectDeleted:
+                return EeSchedulerTransitionReason::
+                    WaitObjectDeleted;
+            case EeSchedulerWaitCompletion::TimedOut:
+                return EeSchedulerTransitionReason::
+                    WaitTimedOut;
+            case EeSchedulerWaitCompletion::None:
+                break;
+            }
+            return EeSchedulerTransitionReason::
+                WaitReleased;
+        }
+    }
+
     bool EeSchedulerWaitKey::valid() const noexcept
     {
         switch (kind)
@@ -28,6 +58,117 @@ namespace ps2x::ee
     {
         return std::tie(left.kind, left.objectId) <
                std::tie(right.kind, right.objectId);
+    }
+
+    void EeThreadScheduler::enableTransitionTracing(
+        size_t capacity) noexcept
+    {
+        m_transitionTracingEnabled = capacity != 0u;
+        m_transitionTraceCapacity = capacity;
+        clearTransitionTrace();
+    }
+
+    void EeThreadScheduler::disableTransitionTracing()
+        noexcept
+    {
+        m_transitionTracingEnabled = false;
+    }
+
+    void EeThreadScheduler::clearTransitionTrace()
+        noexcept
+    {
+        m_transitionTrace.clear();
+        m_nextTransitionTraceSequence = 1u;
+        m_droppedTransitionTraceCount = 0u;
+    }
+
+    bool EeThreadScheduler::transitionTracingEnabled()
+        const noexcept
+    {
+        return m_transitionTracingEnabled;
+    }
+
+    size_t EeThreadScheduler::transitionTraceCapacity()
+        const noexcept
+    {
+        return m_transitionTraceCapacity;
+    }
+
+    uint64_t
+    EeThreadScheduler::droppedTransitionTraceCount()
+        const noexcept
+    {
+        return m_droppedTransitionTraceCount;
+    }
+
+    std::vector<EeSchedulerTransitionTrace>
+    EeThreadScheduler::transitionTraceSnapshot() const
+    {
+        return {
+            m_transitionTrace.begin(),
+            m_transitionTrace.end()};
+    }
+
+    void EeThreadScheduler::publishCanonicalTick(
+        ps2x::timing::EeTick tick) noexcept
+    {
+        if (tick >= m_canonicalTick)
+        {
+            m_canonicalTick = tick;
+        }
+    }
+
+    void EeThreadScheduler::recordTransition(
+        EeSchedulerTransitionReason reason,
+        std::optional<int> oldThreadId,
+        int threadId,
+        EeSchedulerWaitKey wait)
+    {
+        if (!m_transitionTracingEnabled ||
+            m_transitionTraceCapacity == 0u)
+        {
+            return;
+        }
+
+        const auto it = m_threads.find(threadId);
+        if (it == m_threads.end())
+        {
+            return;
+        }
+
+        if (!wait.valid())
+        {
+            wait = it->second.wait;
+            if (!wait.valid() &&
+                it->second.completedWait.valid())
+            {
+                wait =
+                    it->second.completedWait.wait;
+            }
+        }
+
+        EeSchedulerTransitionTrace trace{};
+        trace.tick = m_canonicalTick;
+        trace.sequence =
+            m_nextTransitionTraceSequence++;
+        trace.reason = reason;
+        trace.oldThreadId = oldThreadId;
+        trace.newThreadId = m_currentThreadId;
+        trace.threadId = threadId;
+        trace.generation = it->second.generation;
+        trace.priority = it->second.priority;
+        trace.state = it->second.state;
+        trace.wait = wait;
+        trace.queueSequence =
+            it->second.queueSequence;
+
+        if (m_transitionTrace.size() ==
+            m_transitionTraceCapacity)
+        {
+            m_transitionTrace.pop_front();
+            ++m_droppedTransitionTraceCount;
+        }
+        m_transitionTrace.push_back(trace);
     }
 
     bool EeThreadScheduler::validThreadId(
@@ -55,20 +196,30 @@ namespace ps2x::ee
             return false;
         }
 
-        return m_threads
-            .emplace(
-                threadId,
-                ThreadRecord{
-                    generation,
-                    priority,
-                    EeSchedulerThreadState::Dormant,
-                    {},
-                    {},
-                    false,
-                    0u,
-                    0u,
-                    0u})
-            .second;
+        const bool added =
+            m_threads
+                .emplace(
+                    threadId,
+                    ThreadRecord{
+                        generation,
+                        priority,
+                        EeSchedulerThreadState::Dormant,
+                        {},
+                        {},
+                        false,
+                        0u,
+                        0u,
+                        0u})
+                .second;
+        if (added)
+        {
+            recordTransition(
+                EeSchedulerTransitionReason::
+                    ThreadAdded,
+                m_currentThreadId,
+                threadId);
+        }
+        return added;
     }
 
     bool EeThreadScheduler::addRunningThread(
@@ -76,6 +227,8 @@ namespace ps2x::ee
         uint32_t generation,
         int priority)
     {
+        const std::optional<int> oldThreadId =
+            m_currentThreadId;
         if (m_currentThreadId.has_value() ||
             !addDormantThread(
                 threadId, generation, priority))
@@ -87,6 +240,11 @@ namespace ps2x::ee
             m_threads.at(threadId);
         thread.state = EeSchedulerThreadState::Running;
         m_currentThreadId = threadId;
+        recordTransition(
+            EeSchedulerTransitionReason::
+                RunningThreadAdded,
+            oldThreadId,
+            threadId);
         return true;
     }
 
@@ -115,6 +273,8 @@ namespace ps2x::ee
     bool EeThreadScheduler::startThread(
         EeSchedulerThreadHandle handle)
     {
+        const std::optional<int> oldThreadId =
+            m_currentThreadId;
         ThreadRecord *thread = findThread(handle);
         if (!thread ||
             thread->state !=
@@ -124,6 +284,10 @@ namespace ps2x::ee
         }
 
         enqueueReady(handle.id, *thread);
+        recordTransition(
+            EeSchedulerTransitionReason::Started,
+            oldThreadId,
+            handle.id);
         return true;
     }
 
@@ -165,7 +329,16 @@ namespace ps2x::ee
         {
             return m_currentThreadId;
         }
-        return takeNextReady();
+        const std::optional<int> selected =
+            takeNextReady();
+        if (selected.has_value())
+        {
+            recordTransition(
+                EeSchedulerTransitionReason::Selected,
+                std::nullopt,
+                *selected);
+        }
+        return selected;
     }
 
     std::optional<int>
@@ -177,6 +350,8 @@ namespace ps2x::ee
         }
 
         const int threadId = *m_currentThreadId;
+        const std::optional<int> oldThreadId =
+            m_currentThreadId;
         const auto it = m_threads.find(threadId);
         if (it == m_threads.end() ||
             it->second.state !=
@@ -187,7 +362,13 @@ namespace ps2x::ee
 
         m_currentThreadId.reset();
         enqueueReady(threadId, it->second);
-        return takeNextReady();
+        const std::optional<int> selected =
+            takeNextReady();
+        recordTransition(
+            EeSchedulerTransitionReason::Yielded,
+            oldThreadId,
+            threadId);
+        return selected;
     }
 
     std::optional<int>
@@ -201,6 +382,8 @@ namespace ps2x::ee
         }
 
         const int threadId = *m_currentThreadId;
+        const std::optional<int> oldThreadId =
+            m_currentThreadId;
         const auto it = m_threads.find(threadId);
         if (it == m_threads.end() ||
             it->second.state !=
@@ -224,7 +407,14 @@ namespace ps2x::ee
                 threadId,
                 thread.generation});
         m_currentThreadId.reset();
-        return takeNextReady();
+        const std::optional<int> selected =
+            takeNextReady();
+        recordTransition(
+            EeSchedulerTransitionReason::Blocked,
+            oldThreadId,
+            threadId,
+            wait);
+        return selected;
     }
 
     EeSchedulerSleepResult
@@ -254,6 +444,14 @@ namespace ps2x::ee
                 EeSchedulerSleepDisposition::
                     WakeupConsumed;
             result.selectedThreadId = threadId;
+            recordTransition(
+                EeSchedulerTransitionReason::
+                    WakeupConsumed,
+                m_currentThreadId,
+                threadId,
+                EeSchedulerWaitKey{
+                    EeSchedulerWaitKind::Sleep,
+                    0});
             return result;
         }
 
@@ -271,6 +469,8 @@ namespace ps2x::ee
     EeThreadScheduler::wakeOne(
         EeSchedulerWaitKey wait)
     {
+        const std::optional<int> oldThreadId =
+            m_currentThreadId;
         if (!wait.valid())
         {
             return std::nullopt;
@@ -317,6 +517,12 @@ namespace ps2x::ee
         {
             enqueueReady(handle.id, *thread);
         }
+        recordTransition(
+            EeSchedulerTransitionReason::
+                WaitSatisfied,
+            oldThreadId,
+            handle.id,
+            wait);
         return handle.id;
     }
 
@@ -365,6 +571,12 @@ namespace ps2x::ee
                 WakeupCountOverflow;
         }
         ++thread->wakeupCount;
+        recordTransition(
+            EeSchedulerTransitionReason::
+                WakeupCounted,
+            m_currentThreadId,
+            handle.id,
+            sleep);
         return EeSchedulerWakeResult::
             WakeupCounted;
     }
@@ -382,6 +594,14 @@ namespace ps2x::ee
         const uint32_t previous =
             thread->wakeupCount;
         thread->wakeupCount = 0u;
+        recordTransition(
+            EeSchedulerTransitionReason::
+                WakeupsCancelled,
+            m_currentThreadId,
+            handle.id,
+            EeSchedulerWaitKey{
+                EeSchedulerWaitKind::Sleep,
+                0});
         return previous;
     }
 
@@ -390,6 +610,8 @@ namespace ps2x::ee
         EeSchedulerWaitCompletion completion,
         bool retainReasonForStatus)
     {
+        const std::optional<int> oldThreadId =
+            m_currentThreadId;
         ThreadRecord *thread = findThread(handle);
         if (!thread ||
             completion ==
@@ -427,6 +649,12 @@ namespace ps2x::ee
         {
             enqueueReady(handle.id, *thread);
         }
+        recordTransition(
+            transitionReasonForWaitCompletion(
+                completion),
+            oldThreadId,
+            handle.id,
+            wait);
         return true;
     }
 
@@ -447,6 +675,12 @@ namespace ps2x::ee
             thread->completedWait;
         thread->completedWait = {};
         thread->retainCompletedWaitReason = false;
+        recordTransition(
+            EeSchedulerTransitionReason::
+                WaitCompletionConsumed,
+            m_currentThreadId,
+            handle.id,
+            completed.wait);
         return completed;
     }
 
@@ -481,11 +715,21 @@ namespace ps2x::ee
     std::optional<int>
     EeThreadScheduler::finishCurrentThread()
     {
+        const std::optional<int> oldThreadId =
+            m_currentThreadId;
+        const int threadId =
+            oldThreadId.value_or(0);
         if (!retireCurrentThread())
         {
             return std::nullopt;
         }
-        return takeNextReady();
+        const std::optional<int> selected =
+            takeNextReady();
+        recordTransition(
+            EeSchedulerTransitionReason::Finished,
+            oldThreadId,
+            threadId);
+        return selected;
     }
 
     EeThreadScheduler::ThreadRecord *
@@ -575,6 +819,8 @@ namespace ps2x::ee
     bool EeThreadScheduler::suspendThread(
         EeSchedulerThreadHandle handle)
     {
+        const std::optional<int> oldThreadId =
+            m_currentThreadId;
         ThreadRecord *thread = findThread(handle);
         if (!thread ||
             thread->state ==
@@ -624,12 +870,18 @@ namespace ps2x::ee
         {
             (void)takeNextReady();
         }
+        recordTransition(
+            EeSchedulerTransitionReason::Suspended,
+            oldThreadId,
+            handle.id);
         return true;
     }
 
     bool EeThreadScheduler::resumeThread(
         EeSchedulerThreadHandle handle)
     {
+        const std::optional<int> oldThreadId =
+            m_currentThreadId;
         ThreadRecord *thread = findThread(handle);
         if (!thread ||
             thread->suspendCount == 0u ||
@@ -644,6 +896,10 @@ namespace ps2x::ee
         --thread->suspendCount;
         if (thread->suspendCount != 0u)
         {
+            recordTransition(
+                EeSchedulerTransitionReason::Resumed,
+                oldThreadId,
+                handle.id);
             return true;
         }
 
@@ -657,12 +913,18 @@ namespace ps2x::ee
         {
             enqueueReady(handle.id, *thread);
         }
+        recordTransition(
+            EeSchedulerTransitionReason::Resumed,
+            oldThreadId,
+            handle.id);
         return true;
     }
 
     bool EeThreadScheduler::terminateThread(
         EeSchedulerThreadHandle handle)
     {
+        const std::optional<int> oldThreadId =
+            m_currentThreadId;
         ThreadRecord *thread = findThread(handle);
         if (!thread ||
             thread->state ==
@@ -671,6 +933,8 @@ namespace ps2x::ee
             return false;
         }
 
+        const EeSchedulerWaitKey previousWait =
+            thread->wait;
         switch (thread->state)
         {
         case EeSchedulerThreadState::Running:
@@ -714,16 +978,29 @@ namespace ps2x::ee
         {
             (void)takeNextReady();
         }
+        recordTransition(
+            EeSchedulerTransitionReason::Terminated,
+            oldThreadId,
+            handle.id,
+            previousWait);
         return true;
     }
 
     bool EeThreadScheduler::exitCurrentThread()
     {
+        const std::optional<int> oldThreadId =
+            m_currentThreadId;
+        const int threadId =
+            oldThreadId.value_or(0);
         if (!retireCurrentThread())
         {
             return false;
         }
         (void)takeNextReady();
+        recordTransition(
+            EeSchedulerTransitionReason::Exited,
+            oldThreadId,
+            threadId);
         return true;
     }
 
@@ -737,6 +1014,10 @@ namespace ps2x::ee
         {
             return false;
         }
+        recordTransition(
+            EeSchedulerTransitionReason::Deleted,
+            m_currentThreadId,
+            handle.id);
         return m_threads.erase(handle.id) == 1u;
     }
 
@@ -774,6 +1055,11 @@ namespace ps2x::ee
         {
             thread->priority = priority;
         }
+        recordTransition(
+            EeSchedulerTransitionReason::
+                PriorityChanged,
+            m_currentThreadId,
+            handle.id);
         return previous;
     }
 
@@ -808,6 +1094,11 @@ namespace ps2x::ee
         thread->queueSequence =
             m_nextQueueSequence++;
         queue.push_back(handle);
+        recordTransition(
+            EeSchedulerTransitionReason::
+                ReadyQueueRotated,
+            m_currentThreadId,
+            handle.id);
         return true;
     }
 
@@ -831,9 +1122,21 @@ namespace ps2x::ee
     EeThreadScheduler::reschedule(
         EeSchedulerReschedulePolicy policy)
     {
+        const std::optional<int> oldThreadId =
+            m_currentThreadId;
         if (!m_currentThreadId.has_value())
         {
-            return takeNextReady();
+            const std::optional<int> selected =
+                takeNextReady();
+            if (selected.has_value())
+            {
+                recordTransition(
+                    EeSchedulerTransitionReason::
+                        Rescheduled,
+                    oldThreadId,
+                    *selected);
+            }
+            return selected;
         }
 
         const int threadId = *m_currentThreadId;
@@ -868,7 +1171,17 @@ namespace ps2x::ee
 
         m_currentThreadId.reset();
         enqueueReady(threadId, currentIt->second);
-        return takeNextReady();
+        const std::optional<int> selected =
+            takeNextReady();
+        if (selected.has_value())
+        {
+            recordTransition(
+                EeSchedulerTransitionReason::
+                    Rescheduled,
+                oldThreadId,
+                *selected);
+        }
+        return selected;
     }
 
     std::optional<EeSchedulerDispatch>

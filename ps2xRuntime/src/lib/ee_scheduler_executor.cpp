@@ -49,6 +49,8 @@ namespace ps2x::ee
         {
             result.tick =
                 m_timeline.advance(elapsed);
+            scheduler.publishCanonicalTick(
+                result.tick);
             hooks.commitPriorContext(
                 priorThreadId,
                 elapsed,

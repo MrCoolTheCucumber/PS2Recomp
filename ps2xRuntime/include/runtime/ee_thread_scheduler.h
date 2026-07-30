@@ -1,17 +1,23 @@
 #pragma once
 
+#include "runtime/ee_timing.h"
+
 #include <array>
 #include <cstddef>
 #include <cstdint>
 #include <deque>
 #include <map>
 #include <optional>
+#include <string_view>
 #include <unordered_map>
 #include <vector>
 
 namespace ps2x::ee
 {
     constexpr int kEeThreadPriorityCount = 128;
+    inline constexpr size_t
+        kDefaultEeSchedulerTransitionTraceCapacity =
+            4096u;
 
     enum class EeSchedulerThreadState : uint8_t
     {
@@ -57,6 +63,99 @@ namespace ps2x::ee
         TimedOut,
     };
 
+    enum class EeSchedulerTransitionReason : uint8_t
+    {
+        ThreadAdded,
+        RunningThreadAdded,
+        Started,
+        Selected,
+        Yielded,
+        Blocked,
+        WakeupConsumed,
+        WaitSatisfied,
+        WakeupCounted,
+        WakeupsCancelled,
+        WaitReleased,
+        WaitObjectDeleted,
+        WaitTimedOut,
+        WaitCompletionConsumed,
+        Finished,
+        Suspended,
+        Resumed,
+        Terminated,
+        Exited,
+        Deleted,
+        PriorityChanged,
+        ReadyQueueRotated,
+        Rescheduled,
+    };
+
+    [[nodiscard]] constexpr std::string_view
+    eeSchedulerTransitionReasonName(
+        EeSchedulerTransitionReason reason) noexcept
+    {
+        switch (reason)
+        {
+        case EeSchedulerTransitionReason::ThreadAdded:
+            return "thread_added";
+        case EeSchedulerTransitionReason::
+            RunningThreadAdded:
+            return "running_thread_added";
+        case EeSchedulerTransitionReason::Started:
+            return "started";
+        case EeSchedulerTransitionReason::Selected:
+            return "selected";
+        case EeSchedulerTransitionReason::Yielded:
+            return "yielded";
+        case EeSchedulerTransitionReason::Blocked:
+            return "blocked";
+        case EeSchedulerTransitionReason::
+            WakeupConsumed:
+            return "wakeup_consumed";
+        case EeSchedulerTransitionReason::
+            WaitSatisfied:
+            return "wait_satisfied";
+        case EeSchedulerTransitionReason::
+            WakeupCounted:
+            return "wakeup_counted";
+        case EeSchedulerTransitionReason::
+            WakeupsCancelled:
+            return "wakeups_cancelled";
+        case EeSchedulerTransitionReason::
+            WaitReleased:
+            return "wait_released";
+        case EeSchedulerTransitionReason::
+            WaitObjectDeleted:
+            return "wait_object_deleted";
+        case EeSchedulerTransitionReason::WaitTimedOut:
+            return "wait_timed_out";
+        case EeSchedulerTransitionReason::
+            WaitCompletionConsumed:
+            return "wait_completion_consumed";
+        case EeSchedulerTransitionReason::Finished:
+            return "finished";
+        case EeSchedulerTransitionReason::Suspended:
+            return "suspended";
+        case EeSchedulerTransitionReason::Resumed:
+            return "resumed";
+        case EeSchedulerTransitionReason::Terminated:
+            return "terminated";
+        case EeSchedulerTransitionReason::Exited:
+            return "exited";
+        case EeSchedulerTransitionReason::Deleted:
+            return "deleted";
+        case EeSchedulerTransitionReason::
+            PriorityChanged:
+            return "priority_changed";
+        case EeSchedulerTransitionReason::
+            ReadyQueueRotated:
+            return "ready_queue_rotated";
+        case EeSchedulerTransitionReason::Rescheduled:
+            return "rescheduled";
+        }
+        return "unknown";
+    }
+
     struct EeSchedulerCompletedWait
     {
         EeSchedulerWaitKey wait{};
@@ -83,6 +182,27 @@ namespace ps2x::ee
         bool retainCompletedWaitReason = false;
         uint32_t wakeupCount = 0u;
         uint32_t suspendCount = 0u;
+        uint64_t queueSequence = 0u;
+    };
+
+    // oldThreadId/newThreadId are the selected RUN owner before and after
+    // the transition. threadId identifies the affected record; its remaining
+    // fields are the post-transition snapshot. wait retains the affected wait
+    // object even when the transition detached it from the active wait queue.
+    struct EeSchedulerTransitionTrace
+    {
+        ps2x::timing::EeTick tick{};
+        uint64_t sequence = 0u;
+        EeSchedulerTransitionReason reason =
+            EeSchedulerTransitionReason::ThreadAdded;
+        std::optional<int> oldThreadId;
+        std::optional<int> newThreadId;
+        int threadId = 0;
+        uint32_t generation = 0u;
+        int priority = 0;
+        EeSchedulerThreadState state =
+            EeSchedulerThreadState::Dormant;
+        EeSchedulerWaitKey wait{};
         uint64_t queueSequence = 0u;
     };
 
@@ -245,8 +365,28 @@ namespace ps2x::ee
         waitOrder(EeSchedulerWaitKey wait) const;
         [[nodiscard]] size_t threadCount() const noexcept;
         [[nodiscard]] bool validate() const;
+        // Enabling starts a fresh bounded capture. Overflow retains the newest
+        // records and increments droppedTransitionTraceCount. Disabling stops
+        // publication without discarding the captured snapshot.
+        void enableTransitionTracing(
+            size_t capacity =
+                kDefaultEeSchedulerTransitionTraceCapacity)
+            noexcept;
+        void disableTransitionTracing() noexcept;
+        void clearTransitionTrace() noexcept;
+        [[nodiscard]] bool transitionTracingEnabled()
+            const noexcept;
+        [[nodiscard]] size_t transitionTraceCapacity()
+            const noexcept;
+        [[nodiscard]] uint64_t
+        droppedTransitionTraceCount() const noexcept;
+        [[nodiscard]] std::vector<
+            EeSchedulerTransitionTrace>
+        transitionTraceSnapshot() const;
 
     private:
+        friend class EeSchedulerExecutor;
+
         struct ThreadRecord
         {
             uint32_t generation = 0u;
@@ -284,6 +424,13 @@ namespace ps2x::ee
         highestReadyPriority() const;
         [[nodiscard]] std::optional<int>
         takeNextReady();
+        void publishCanonicalTick(
+            ps2x::timing::EeTick tick) noexcept;
+        void recordTransition(
+            EeSchedulerTransitionReason reason,
+            std::optional<int> oldThreadId,
+            int threadId,
+            EeSchedulerWaitKey wait = {});
 
         std::unordered_map<int, ThreadRecord> m_threads;
         std::array<
@@ -296,5 +443,13 @@ namespace ps2x::ee
             m_waitQueues;
         std::optional<int> m_currentThreadId;
         uint64_t m_nextQueueSequence = 1u;
+        bool m_transitionTracingEnabled = false;
+        size_t m_transitionTraceCapacity =
+            kDefaultEeSchedulerTransitionTraceCapacity;
+        std::deque<EeSchedulerTransitionTrace>
+            m_transitionTrace;
+        uint64_t m_nextTransitionTraceSequence = 1u;
+        uint64_t m_droppedTransitionTraceCount = 0u;
+        ps2x::timing::EeTick m_canonicalTick{};
     };
 }
