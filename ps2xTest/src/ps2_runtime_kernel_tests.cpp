@@ -840,6 +840,332 @@ void register_ps2_runtime_kernel_tests()
                 "the surviving runtime should retain its thread after peer destruction");
         });
 
+        tc.Run("repeated runtime construction and targeted reset restore EE ownership roots", [](TestCase &t)
+        {
+            struct OwnershipIds
+            {
+                int32_t thread = -1;
+                int32_t sema = -1;
+                int32_t event = -1;
+                int32_t alarm = -1;
+            };
+
+            constexpr uint32_t kAlarmHandlerAddr = 0x00202380u;
+            constexpr uint32_t kThreadEntry = 0x00202400u;
+            constexpr uint32_t kThreadStack = 0x00302400u;
+            constexpr int kRuntimeLifetimes = 4;
+
+            for (int lifetime = 0;
+                 lifetime < kRuntimeLifetimes;
+                 ++lifetime)
+            {
+                auto env = std::make_unique<TestEnv>();
+                env->runtime.registerFunction(
+                    kAlarmHandlerAddr, &alarmNoopHandler);
+
+                const auto label =
+                    [&](const char *epoch,
+                        const char *expectation)
+                {
+                    std::ostringstream stream;
+                    stream << "runtime lifetime "
+                           << lifetime
+                           << ", "
+                           << epoch
+                           << ": "
+                           << expectation;
+                    return stream.str();
+                };
+
+                const auto populateOwnershipRoots =
+                    [&](const char *epoch)
+                {
+                    initializeGuestKernelState(
+                        env->rdram.data(),
+                        &env->runtime);
+
+                    R5900Context mainStatusCtx{};
+                    setRegU32(mainStatusCtx, 4, 0u);
+                    setRegU32(
+                        mainStatusCtx,
+                        5,
+                        K_STATUS_ADDR);
+                    ReferThreadStatus(
+                        env->rdram.data(),
+                        &mainStatusCtx,
+                        &env->runtime);
+                    t.Equals(
+                        getRegS32(mainStatusCtx, 2),
+                        1,
+                        label(
+                            epoch,
+                            "the main thread should be selected as RUN"));
+
+                    const uint32_t threadParam[9] = {
+                        0u,
+                        kThreadEntry,
+                        kThreadStack,
+                        0x00000800u,
+                        0u,
+                        40u,
+                        0u,
+                        0u,
+                        0u,
+                    };
+                    writeGuestWords(
+                        env->rdram.data(),
+                        K_PARAM_ADDR,
+                        threadParam,
+                        std::size(threadParam));
+                    R5900Context createThreadCtx{};
+                    setRegU32(
+                        createThreadCtx,
+                        4,
+                        K_PARAM_ADDR);
+                    CreateThread(
+                        env->rdram.data(),
+                        &createThreadCtx,
+                        &env->runtime);
+
+                    const uint32_t semaParam[6] = {
+                        0u,
+                        3u,
+                        2u,
+                        0u,
+                        0x11u,
+                        0x22u,
+                    };
+                    writeGuestWords(
+                        env->rdram.data(),
+                        K_PARAM_ADDR,
+                        semaParam,
+                        std::size(semaParam));
+                    R5900Context createSemaCtx{};
+                    setRegU32(
+                        createSemaCtx,
+                        4,
+                        K_PARAM_ADDR);
+                    CreateSema(
+                        env->rdram.data(),
+                        &createSemaCtx,
+                        &env->runtime);
+
+                    const uint32_t eventParam[3] = {
+                        0x33u,
+                        0x44u,
+                        0x55u,
+                    };
+                    writeGuestWords(
+                        env->rdram.data(),
+                        K_PARAM_ADDR,
+                        eventParam,
+                        std::size(eventParam));
+                    R5900Context createEventCtx{};
+                    setRegU32(
+                        createEventCtx,
+                        4,
+                        K_PARAM_ADDR);
+                    CreateEventFlag(
+                        env->rdram.data(),
+                        &createEventCtx,
+                        &env->runtime);
+
+                    R5900Context setAlarmCtx{};
+                    setRegU32(setAlarmCtx, 4, 0xFFFFu);
+                    setRegU32(
+                        setAlarmCtx,
+                        5,
+                        kAlarmHandlerAddr);
+                    SetAlarm(
+                        env->rdram.data(),
+                        &setAlarmCtx,
+                        &env->runtime);
+
+                    env->ctx.cop0_config =
+                        0x00073443u;
+                    env->ctx.advanceEeCycleTicks(16u);
+                    env->runtime
+                        .serviceEeEventsAtBlockBoundary(
+                            env->rdram.data(),
+                            &env->ctx);
+
+                    OwnershipIds ids{
+                        getRegS32(createThreadCtx, 2),
+                        getRegS32(createSemaCtx, 2),
+                        getRegS32(createEventCtx, 2),
+                        getRegS32(setAlarmCtx, 2),
+                    };
+                    t.Equals(
+                        ids.thread,
+                        2,
+                        label(
+                            epoch,
+                            "thread allocation should restart at id 2"));
+                    t.Equals(
+                        ids.sema,
+                        0,
+                        label(
+                            epoch,
+                            "semaphore allocation should restart at id 0"));
+                    t.Equals(
+                        ids.event,
+                        1,
+                        label(
+                            epoch,
+                            "event allocation should restart at id 1"));
+                    t.Equals(
+                        ids.alarm,
+                        1,
+                        label(
+                            epoch,
+                            "alarm allocation should restart at id 1"));
+                    t.Equals(
+                        env->runtime.currentEeThreadId(),
+                        1,
+                        label(
+                            epoch,
+                            "the runtime should retain main-thread ownership"));
+                    t.Equals(
+                        env->runtime.currentEeTick().raw(),
+                        uint64_t{16u},
+                        label(
+                            epoch,
+                            "the canonical timeline should accept local work"));
+                    t.Equals(
+                        env->runtime
+                            .pendingAlarmCallbackCountForTesting(),
+                        size_t{0u},
+                        label(
+                            epoch,
+                            "the long alarm should remain with its publisher"));
+                    return ids;
+                };
+
+                const auto resetOwnershipRoots =
+                    [&](const OwnershipIds &oldIds,
+                        const char *epoch)
+                {
+                    notifyRuntimeStop(&env->runtime);
+                    env->runtime.resetEeTiming(&env->ctx);
+                    initializeGuestKernelState(
+                        env->rdram.data(),
+                        &env->runtime);
+
+                    t.Equals(
+                        env->runtime.currentEeThreadId(),
+                        1,
+                        label(
+                            epoch,
+                            "targeted reset should restore main-thread selection"));
+                    t.Equals(
+                        env->runtime.currentEeTick().raw(),
+                        uint64_t{0u},
+                        label(
+                            epoch,
+                            "targeted timing reset should clear canonical time"));
+                    t.Equals(
+                        env->runtime
+                            .managedEeExecutionThreadCountForTesting(),
+                        size_t{0u},
+                        label(
+                            epoch,
+                            "targeted reset should leave no managed continuation"));
+                    t.Equals(
+                        env->runtime
+                            .pendingAlarmCallbackCountForTesting(),
+                        size_t{0u},
+                        label(
+                            epoch,
+                            "targeted reset should discard alarm publications"));
+                    t.Equals(
+                        debugThreadSnapshots(
+                            &env->runtime)
+                            .size(),
+                        size_t{0u},
+                        label(
+                            epoch,
+                            "targeted reset should clear the thread registry"));
+
+                    R5900Context staleThreadCtx{};
+                    setRegU32(
+                        staleThreadCtx,
+                        4,
+                        static_cast<uint32_t>(
+                            oldIds.thread));
+                    setRegU32(
+                        staleThreadCtx,
+                        5,
+                        K_STATUS_ADDR);
+                    ReferThreadStatus(
+                        env->rdram.data(),
+                        &staleThreadCtx,
+                        &env->runtime);
+                    t.Equals(
+                        getRegS32(staleThreadCtx, 2),
+                        KE_UNKNOWN_THID,
+                        label(
+                            epoch,
+                            "a pre-reset thread id should be stale"));
+
+                    R5900Context staleSemaCtx{};
+                    setRegU32(
+                        staleSemaCtx,
+                        4,
+                        static_cast<uint32_t>(
+                            oldIds.sema));
+                    setRegU32(
+                        staleSemaCtx,
+                        5,
+                        K_STATUS_ADDR);
+                    ReferSemaStatus(
+                        env->rdram.data(),
+                        &staleSemaCtx,
+                        &env->runtime);
+                    t.Equals(
+                        getRegS32(staleSemaCtx, 2),
+                        KE_UNKNOWN_SEMID,
+                        label(
+                            epoch,
+                            "a pre-reset semaphore id should be stale"));
+
+                    R5900Context staleAlarmCtx{};
+                    setRegU32(
+                        staleAlarmCtx,
+                        4,
+                        static_cast<uint32_t>(
+                            oldIds.alarm));
+                    CancelAlarm(
+                        env->rdram.data(),
+                        &staleAlarmCtx,
+                        &env->runtime);
+                    t.Equals(
+                        getRegS32(staleAlarmCtx, 2),
+                        KE_ERROR,
+                        label(
+                            epoch,
+                            "a pre-reset alarm id should be stale"));
+                };
+
+                const OwnershipIds firstIds =
+                    populateOwnershipRoots(
+                        "first epoch");
+                resetOwnershipRoots(
+                    firstIds,
+                    "first reset");
+
+                const OwnershipIds secondIds =
+                    populateOwnershipRoots(
+                        "second epoch");
+                resetOwnershipRoots(
+                    secondIds,
+                    "second reset");
+
+                env.reset();
+            }
+
+            notifyRuntimeStop();
+        });
+
         tc.Run("debug thread snapshots expose authoritative valid state", [](TestCase &t)
         {
             TestEnv env;
