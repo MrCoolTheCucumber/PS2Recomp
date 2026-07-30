@@ -79,6 +79,10 @@ public:
 std::unique_ptr<IEeExecutionBackend>
 createEeExecutionBackend(EeExecutionBackendKind kind);
 
+[[nodiscard]] bool parseEeExecutionBackendKind(
+    std::string_view text,
+    EeExecutionBackendKind &kind) noexcept;
+
 [[nodiscard]] EeExecutionBackendBuildInfo
 eeExecutionBackendBuildInfo() noexcept;
 [[nodiscard]] std::string

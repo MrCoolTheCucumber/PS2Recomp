@@ -973,9 +973,28 @@ PS2Runtime::PS2Runtime(PS2RuntimeConfiguration configuration)
     m_hostPresentationUploadState =
         std::make_unique<
             HostPresentationUploadState>();
+    EeExecutionBackendKind eeExecutionBackend =
+        configuration.eeExecutionBackend;
+    if (configuration
+            .useEeExecutionBackendEnvironment)
+    {
+        if (const char *const value =
+                std::getenv(
+                    "PS2X_EE_EXECUTION_BACKEND"))
+        {
+            if (!parseEeExecutionBackendKind(
+                    value, eeExecutionBackend))
+            {
+                throw std::invalid_argument(
+                    "PS2X_EE_EXECUTION_BACKEND must be "
+                    "legacy-host-thread or "
+                    "legacy-cpp-fiber");
+            }
+        }
+    }
     m_eeExecutionBackend =
         createEeExecutionBackend(
-            configuration.eeExecutionBackend);
+            eeExecutionBackend);
     if (m_eeExecutionBackend->executorResumable())
     {
         m_eeRuntimeExecutor =

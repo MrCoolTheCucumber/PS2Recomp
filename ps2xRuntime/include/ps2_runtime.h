@@ -74,6 +74,7 @@ struct PS2RuntimeConfiguration
 {
     EeExecutionBackendKind eeExecutionBackend =
         EeExecutionBackendKind::LegacyHostThread;
+    bool useEeExecutionBackendEnvironment = true;
     VuBackendKind vu0Backend = VuBackendKind::Auto;
     VuBackendKind vu1Backend = VuBackendKind::Auto;
     bool vu0NativeInstrumentation = false;

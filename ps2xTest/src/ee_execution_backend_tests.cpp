@@ -18,6 +18,38 @@ void register_ee_execution_backend_tests()
     MiniTest::Case("EeExecutionBackend", [](TestCase &tc)
     {
         tc.Run(
+            "backend names parse without changing invalid selections",
+            [](TestCase &t)
+            {
+                EeExecutionBackendKind parsed =
+                    EeExecutionBackendKind::
+                        LegacyHostThread;
+                t.IsTrue(
+                    parseEeExecutionBackendKind(
+                        "legacy-cpp-fiber", parsed) &&
+                        parsed ==
+                            EeExecutionBackendKind::
+                                LegacyCppFiber,
+                    "the fiber artifact name should select the fiber backend");
+                t.IsTrue(
+                    parseEeExecutionBackendKind(
+                        "legacy-host-thread", parsed) &&
+                        parsed ==
+                            EeExecutionBackendKind::
+                                LegacyHostThread,
+                    "the host-thread artifact name should select the compatibility backend");
+                t.IsFalse(
+                    parseEeExecutionBackendKind(
+                        "fiber", parsed),
+                    "an abbreviated or unknown backend name should be rejected");
+                t.Equals(
+                    parsed,
+                    EeExecutionBackendKind::
+                        LegacyHostThread,
+                    "a rejected name should preserve the caller's selection");
+            });
+
+        tc.Run(
             "fiber selection is explicit and never silently falls back",
             [](TestCase &t)
             {

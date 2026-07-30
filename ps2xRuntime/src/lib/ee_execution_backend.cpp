@@ -678,6 +678,25 @@ createEeExecutionBackend(EeExecutionBackendKind kind)
         "unsupported EE execution backend");
 }
 
+bool parseEeExecutionBackendKind(
+    std::string_view text,
+    EeExecutionBackendKind &kind) noexcept
+{
+    if (text == "legacy-host-thread")
+    {
+        kind =
+            EeExecutionBackendKind::LegacyHostThread;
+        return true;
+    }
+    if (text == "legacy-cpp-fiber")
+    {
+        kind =
+            EeExecutionBackendKind::LegacyCppFiber;
+        return true;
+    }
+    return false;
+}
+
 EeExecutionBackendBuildInfo
 eeExecutionBackendBuildInfo() noexcept
 {
