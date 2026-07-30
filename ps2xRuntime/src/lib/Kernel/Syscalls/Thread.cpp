@@ -323,7 +323,7 @@ namespace ps2_syscalls
             runtime->guestFree(autoStackToFree);
         }
 
-        setReturnS32(ctx, KE_OK);
+        setReturnS32(ctx, tid);
     }
 
     void StartThread(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
@@ -599,7 +599,7 @@ namespace ps2_syscalls
             return;
         }
 
-        setReturnS32(ctx, KE_OK);
+        setReturnS32(ctx, tid);
     }
 
     void ExitThread(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
@@ -1083,6 +1083,7 @@ namespace ps2_syscalls
     {
         int tid = static_cast<int>(getRegU32(ctx, 4));
         int newPrio = static_cast<int>(getRegU32(ctx, 5));
+        int previousPriority = 0;
 
         if (tid == 0)
             tid = g_currentThreadId;
@@ -1112,10 +1113,11 @@ namespace ps2_syscalls
                 return;
             }
 
+            previousPriority = info->currentPriority;
             info->currentPriority = newPrio;
         }
 
-        setReturnS32(ctx, KE_OK);
+        setReturnS32(ctx, previousPriority);
     }
 
     void iChangeThreadPriority(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
@@ -1158,7 +1160,7 @@ namespace ps2_syscalls
             requestedPriority,
             prio,
             true);
-        setReturnS32(ctx, KE_OK);
+        setReturnS32(ctx, prio);
         yieldGuestExecutionAfterWake(runtime);
     }
 

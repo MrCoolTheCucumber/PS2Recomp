@@ -111,6 +111,7 @@ static std::shared_ptr<ThreadInfo> ensureCurrentThreadInfo(R5900Context *ctx)
     auto info = std::make_shared<ThreadInfo>();
     info->started = true;
     info->status = THS_RUN;
+    info->priority = 1u;
     info->currentPriority = info->priority;
     info->suspendCount = 0;
     if (ctx)

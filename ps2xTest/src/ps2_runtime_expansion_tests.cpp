@@ -7058,7 +7058,7 @@ void register_ps2_runtime_expansion_tests()
             setRegU32(startCtx, 4, static_cast<uint32_t>(tid));
             setRegU32(startCtx, 5, 0u);
             StartThread(rdram.data(), &startCtx, &runtime);
-            t.Equals(getRegS32(startCtx, 2), KE_OK, "StartThread should launch worker");
+            t.Equals(getRegS32(startCtx, 2), tid, "StartThread should return the launched worker id");
 
             const bool started = waitUntil([&]()
             {

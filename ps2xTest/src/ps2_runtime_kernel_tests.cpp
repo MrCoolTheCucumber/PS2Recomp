@@ -290,7 +290,7 @@ void register_ps2_runtime_kernel_tests()
 
             setRegU32(env.ctx, 4, static_cast<uint32_t>(tid));
             DeleteThread(env.rdram.data(), &env.ctx, &env.runtime);
-            t.Equals(getRegS32(env.ctx, 2), KE_OK, "DeleteThread should succeed for dormant thread");
+            t.Equals(getRegS32(env.ctx, 2), tid, "DeleteThread should return the dormant thread id");
 
             setRegU32(env.ctx, 4, static_cast<uint32_t>(tid));
             setRegU32(env.ctx, 5, K_STATUS_ADDR);
@@ -334,7 +334,103 @@ void register_ps2_runtime_kernel_tests()
 
             setRegU32(env.ctx, 4, static_cast<uint32_t>(tid));
             DeleteThread(env.rdram.data(), &env.ctx, &env.runtime);
-            t.Equals(getRegS32(env.ctx, 2), KE_OK, "DeleteThread should clean up failed-start thread");
+            t.Equals(getRegS32(env.ctx, 2), tid, "DeleteThread should return the failed-start thread id");
+        });
+
+        tc.Run("thread scheduling syscalls preserve EE BIOS success values", [](TestCase &t)
+        {
+            TestEnv env;
+
+            constexpr uint32_t kThreadEntry = 0x00252000u;
+            constexpr int32_t kPriority = 40;
+            env.runtime.registerFunction(
+                kThreadEntry, &alarmNoopHandler);
+
+            setRegU32(env.ctx, 4, 0u);
+            setRegU32(
+                env.ctx, 5, static_cast<uint32_t>(kPriority));
+            ChangeThreadPriority(
+                env.rdram.data(), &env.ctx, &env.runtime);
+            t.Equals(
+                getRegS32(env.ctx, 2),
+                1,
+                "ChangeThreadPriority should return the previous main-thread priority");
+
+            setRegU32(
+                env.ctx, 4, static_cast<uint32_t>(kPriority));
+            RotateThreadReadyQueue(
+                env.rdram.data(), &env.ctx, &env.runtime);
+            t.Equals(
+                getRegS32(env.ctx, 2),
+                kPriority,
+                "RotateThreadReadyQueue should return the requested priority");
+
+            const uint32_t threadParam[7] = {
+                0u,
+                kThreadEntry,
+                0x00304000u,
+                0x00000800u,
+                0u,
+                static_cast<uint32_t>(kPriority),
+                0u
+            };
+            writeGuestWords(
+                env.rdram.data(),
+                K_PARAM_ADDR,
+                threadParam,
+                std::size(threadParam));
+            setRegU32(env.ctx, 4, K_PARAM_ADDR);
+            CreateThread(
+                env.rdram.data(), &env.ctx, &env.runtime);
+            const int32_t tid = getRegS32(env.ctx, 2);
+            t.IsTrue(
+                tid >= 2,
+                "CreateThread should return a worker thread id");
+
+            setRegU32(
+                env.ctx, 4, static_cast<uint32_t>(tid));
+            setRegU32(env.ctx, 5, 0u);
+            StartThread(
+                env.rdram.data(), &env.ctx, &env.runtime);
+            t.Equals(
+                getRegS32(env.ctx, 2),
+                tid,
+                "StartThread should return the started thread id");
+
+            const bool dormant = waitUntil([&]()
+            {
+                R5900Context statusCtx{};
+                setRegU32(
+                    statusCtx, 4, static_cast<uint32_t>(tid));
+                setRegU32(statusCtx, 5, K_STATUS_ADDR);
+                ReferThreadStatus(
+                    env.rdram.data(),
+                    &statusCtx,
+                    &env.runtime);
+                if (getRegS32(statusCtx, 2) != KE_OK)
+                {
+                    return false;
+                }
+
+                EeThreadStatus status{};
+                std::memcpy(
+                    &status,
+                    env.rdram.data() + K_STATUS_ADDR,
+                    sizeof(status));
+                return status.status == THS_DORMANT;
+            }, std::chrono::milliseconds(200));
+            t.IsTrue(
+                dormant,
+                "the no-op worker should return to dormant");
+
+            setRegU32(
+                env.ctx, 4, static_cast<uint32_t>(tid));
+            DeleteThread(
+                env.rdram.data(), &env.ctx, &env.runtime);
+            t.Equals(
+                getRegS32(env.ctx, 2),
+                tid,
+                "DeleteThread should return the deleted thread id");
         });
 
         tc.Run("thread id and wakeup guard rails match kernel-style errors", [](TestCase &t)
@@ -798,7 +894,7 @@ void register_ps2_runtime_kernel_tests()
             setRegU32(env.ctx, 4, static_cast<uint32_t>(tid));
             setRegU32(env.ctx, 5, static_cast<uint32_t>(eid));
             StartThread(env.rdram.data(), &env.ctx, &env.runtime);
-            t.Equals(getRegS32(env.ctx, 2), KE_OK, "StartThread should launch the event waiter");
+            t.Equals(getRegS32(env.ctx, 2), tid, "StartThread should return the event waiter id");
 
             const bool ready = waitUntil([&]()
             {
@@ -884,7 +980,7 @@ void register_ps2_runtime_kernel_tests()
 
             setRegU32(env.ctx, 4, static_cast<uint32_t>(tid));
             DeleteThread(env.rdram.data(), &env.ctx, &env.runtime);
-            t.Equals(getRegS32(env.ctx, 2), KE_OK, "DeleteThread should clean up the waiter thread");
+            t.Equals(getRegS32(env.ctx, 2), tid, "DeleteThread should return the waiter thread id");
         });
 
         tc.Run("TerminateThread unwinds semaphore wait as a normal thread exit", [](TestCase &t)
@@ -933,7 +1029,7 @@ void register_ps2_runtime_kernel_tests()
             setRegU32(env.ctx, 4, static_cast<uint32_t>(tid));
             setRegU32(env.ctx, 5, static_cast<uint32_t>(sid));
             StartThread(env.rdram.data(), &env.ctx, &env.runtime);
-            t.Equals(getRegS32(env.ctx, 2), KE_OK, "StartThread should launch the semaphore waiter");
+            t.Equals(getRegS32(env.ctx, 2), tid, "StartThread should return the semaphore waiter id");
 
             const bool waiting = waitUntil([&]()
             {
@@ -979,7 +1075,7 @@ void register_ps2_runtime_kernel_tests()
 
             setRegU32(env.ctx, 4, static_cast<uint32_t>(tid));
             DeleteThread(env.rdram.data(), &env.ctx, &env.runtime);
-            t.Equals(getRegS32(env.ctx, 2), KE_OK, "DeleteThread should clean up the terminated waiter");
+            t.Equals(getRegS32(env.ctx, 2), tid, "DeleteThread should return the terminated waiter id");
 
             setRegU32(env.ctx, 4, static_cast<uint32_t>(sid));
             DeleteSema(env.rdram.data(), &env.ctx, &env.runtime);
