@@ -746,6 +746,147 @@ void register_ee_runtime_executor_tests()
             });
 
         tc.Run(
+            "publication applies before equal-priority reschedule",
+            [](TestCase &t)
+            {
+                ScriptedRuntimeBackend backend;
+                EeRuntimeExecutor executor(backend);
+                std::mutex stageMutex;
+                std::condition_variable stageCv;
+                bool callerEntered = false;
+                bool allowBoundary = false;
+                bool rotationApplied = false;
+                std::vector<int> order;
+
+                backend.plan(
+                    1,
+                    {
+                        [&]()
+                        {
+                            std::unique_lock<std::mutex>
+                                lock(stageMutex);
+                            callerEntered = true;
+                            stageCv.notify_all();
+                            stageCv.wait(
+                                lock,
+                                [&]()
+                                {
+                                    return allowBoundary;
+                                });
+                            return EeSchedulerRunResult{
+                                EeSchedulerExitReason::
+                                    Preempted,
+                                1u,
+                                {},
+                                {}};
+                        },
+                        [&]()
+                        {
+                            {
+                                std::lock_guard<std::mutex>
+                                    lock(stageMutex);
+                                order.push_back(1);
+                            }
+                            stageCv.notify_all();
+                            return EeSchedulerRunResult{
+                                EeSchedulerExitReason::
+                                    Finished,
+                                1u,
+                                {},
+                                {}};
+                        },
+                    });
+                backend.plan(
+                    2,
+                    {
+                        [&]()
+                        {
+                            {
+                                std::lock_guard<std::mutex>
+                                    lock(stageMutex);
+                                order.push_back(2);
+                            }
+                            stageCv.notify_all();
+                            return EeSchedulerRunResult{
+                                EeSchedulerExitReason::
+                                    Finished,
+                                1u,
+                                {},
+                                {}};
+                        },
+                    });
+                executor.start(
+                    [](EeThreadScheduler &scheduler,
+                       IEeExecutionBackend &selectedBackend)
+                    {
+                        selectedBackend.create(1, []()
+                        {
+                        });
+                        selectedBackend.create(2, []()
+                        {
+                        });
+                        if (!scheduler.addRunningThread(
+                                1, 1u, 40) ||
+                            !scheduler.addDormantThread(
+                                2, 1u, 40) ||
+                            !scheduler.startThread(
+                                EeSchedulerThreadHandle{
+                                    2,
+                                    1u}))
+                        {
+                            throw std::logic_error(
+                                "failed to seed equal-"
+                                "priority publication "
+                                "fixture");
+                        }
+                    });
+                const bool reachedCaller = waitFor(
+                    stageCv,
+                    stageMutex,
+                    [&]()
+                    {
+                        return callerEntered;
+                    });
+                const bool published =
+                    reachedCaller &&
+                    executor.publish(
+                        [&](EeThreadScheduler &scheduler,
+                            IEeExecutionBackend &)
+                        {
+                            rotationApplied =
+                                scheduler
+                                    .rotateReadyQueue(
+                                        40);
+                        },
+                        EeSchedulerReschedulePolicy::
+                            EqualOrHigherPriority);
+                {
+                    std::lock_guard<std::mutex> lock(
+                        stageMutex);
+                    allowBoundary = true;
+                }
+                stageCv.notify_all();
+                const bool completed = waitFor(
+                    stageCv,
+                    stageMutex,
+                    [&]()
+                    {
+                        return order.size() == 2u;
+                    });
+                executor.requestStop();
+                executor.join();
+                executor.rethrowFailure();
+
+                t.IsTrue(
+                    reachedCaller && published &&
+                        rotationApplied && completed &&
+                        order == std::vector<int>{2, 1},
+                    "the command should rotate the named "
+                    "READY queue before its ordinary "
+                    "equal-priority selection");
+            });
+
+        tc.Run(
             "no-reschedule publication preserves an already-ready caller",
             [](TestCase &t)
             {

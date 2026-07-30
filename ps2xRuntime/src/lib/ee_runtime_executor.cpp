@@ -473,11 +473,14 @@ namespace ps2x::ee
             if (!m_stopRequested &&
                 !m_publications.empty())
             {
-                // A guest raw syscall publishes before it exits to this
-                // boundary. Its no-reschedule contract covers the whole
-                // atomic boundary, including a target that was already READY
-                // before the command is applied.
-                return m_publications.front().policy;
+                // A queued syscall consequence is part of the operation
+                // which reached this boundary. Apply it before considering
+                // any alternate READY thread, then use the publication's
+                // policy exactly once after the command. This preserves raw
+                // atomicity and prevents an equal-priority ordinary rotation
+                // from selecting a peer both before and after rotating the
+                // named queue.
+                return EeSchedulerReschedulePolicy::None;
             }
             return EeSchedulerReschedulePolicy::
                 HigherPriorityOnly;

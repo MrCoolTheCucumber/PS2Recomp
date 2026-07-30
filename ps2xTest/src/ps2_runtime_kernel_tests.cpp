@@ -137,6 +137,10 @@ namespace
         0x25ab00u;
     constexpr uint32_t K_EXECUTOR_EXIT_DELETE_THREAD_ENTRY =
         0x25ac00u;
+    constexpr uint32_t K_EXECUTOR_PRIORITY_MAIN_ENTRY =
+        0x25ad00u;
+    constexpr uint32_t K_EXECUTOR_PRIORITY_MARKER_ENTRY =
+        0x25ae00u;
 
     std::mutex g_guestWordMutex;
     std::mutex g_alarmCallbackThreadMutex;
@@ -277,6 +281,26 @@ namespace
     int g_executorExitDeleteThreadStatusResult = KE_ERROR;
     int32_t g_executorExitDeleteThreadStatusPayload = 0;
     int g_executorExitDeleteThreadDeleteResult = KE_ERROR;
+
+    enum class ExecutorPriorityScenario
+    {
+        RawPriority,
+        OrdinaryPriority,
+        RawCurrentRotation,
+        OrdinaryCurrentRotation,
+        NamedRotation,
+    };
+
+    ExecutorPriorityScenario g_executorPriorityScenario =
+        ExecutorPriorityScenario::RawPriority;
+    bool g_executorPriorityCompleted = false;
+    std::vector<int> g_executorPriorityOrder;
+    int g_executorPrioritySetupResult = KE_ERROR;
+    int g_executorPriorityOperationResult = KE_ERROR;
+    int g_executorPriorityTriggerResult = KE_ERROR;
+    int g_executorPriorityStatusValue = -1;
+    int g_executorPriorityFirstThreadId = 0;
+    int g_executorPrioritySecondThreadId = 0;
 
     struct EeThreadStatus
     {
@@ -2247,6 +2271,221 @@ namespace
             g_executorExitDeleteThreadDeleteResult =
                 exitDeleteThreadDeleteResult;
             g_executorExitCompleted = true;
+        }
+        ctx->pc = 0u;
+    }
+
+    void dedicatedExecutorPriorityMarkerHandler(
+        uint8_t *,
+        R5900Context *ctx,
+        PS2Runtime *)
+    {
+        const int marker =
+            static_cast<int>(::getRegU32(ctx, 4));
+        {
+            std::lock_guard<std::mutex> lock(
+                g_executorFixtureMutex);
+            g_executorPriorityOrder.push_back(marker);
+        }
+        ctx->pc = 0u;
+    }
+
+    void dedicatedExecutorPriorityMainHandler(
+        uint8_t *rdram,
+        R5900Context *ctx,
+        PS2Runtime *runtime)
+    {
+        InitThread(rdram, ctx, runtime);
+        setRegU32(*ctx, 4, 0u);
+        setRegU32(*ctx, 5, 40u);
+        ChangeThreadPriority(rdram, ctx, runtime);
+        const int setupResult = getRegS32(*ctx, 2);
+
+        const auto createAndStart =
+            [&](uint32_t stack,
+                uint32_t priority,
+                uint32_t marker)
+            {
+                const std::array<uint32_t, 9u>
+                    threadParameters{
+                        0u,
+                        K_EXECUTOR_PRIORITY_MARKER_ENTRY,
+                        stack,
+                        0x800u,
+                        0u,
+                        priority,
+                        0u,
+                        0u,
+                        0u,
+                    };
+                writeGuestWords(
+                    rdram,
+                    K_EXECUTOR_THREAD_PARAM_ADDR,
+                    threadParameters.data(),
+                    threadParameters.size());
+                setRegU32(
+                    *ctx,
+                    4,
+                    K_EXECUTOR_THREAD_PARAM_ADDR);
+                CreateThread(rdram, ctx, runtime);
+                const int threadId =
+                    getRegS32(*ctx, 2);
+                setRegU32(
+                    *ctx,
+                    4,
+                    static_cast<uint32_t>(threadId));
+                setRegU32(*ctx, 5, marker);
+                StartThread(rdram, ctx, runtime);
+                return threadId;
+            };
+        const auto recordMain =
+            [](int marker)
+            {
+                std::lock_guard<std::mutex> lock(
+                    g_executorFixtureMutex);
+                g_executorPriorityOrder.push_back(
+                    marker);
+            };
+
+        ExecutorPriorityScenario scenario;
+        {
+            std::lock_guard<std::mutex> lock(
+                g_executorFixtureMutex);
+            scenario = g_executorPriorityScenario;
+        }
+
+        int operationResult = KE_ERROR;
+        int triggerResult = KE_ERROR;
+        int statusValue = -1;
+        int firstThreadId = 0;
+        int secondThreadId = 0;
+
+        switch (scenario)
+        {
+        case ExecutorPriorityScenario::RawPriority:
+            firstThreadId =
+                createAndStart(
+                    0x00314000u, 50u, 2u);
+            recordMain(1);
+            setRegU32(
+                *ctx,
+                4,
+                static_cast<uint32_t>(firstThreadId));
+            setRegU32(*ctx, 5, 30u);
+            iChangeThreadPriority(
+                rdram, ctx, runtime);
+            operationResult = getRegS32(*ctx, 2);
+            recordMain(3);
+            setRegU32(
+                *ctx,
+                4,
+                static_cast<uint32_t>(firstThreadId));
+            setRegU32(*ctx, 5, K_STATUS_ADDR);
+            iReferThreadStatus(rdram, ctx, runtime);
+            {
+                EeThreadStatus status{};
+                std::memcpy(
+                    &status,
+                    rdram + K_STATUS_ADDR,
+                    sizeof(status));
+                statusValue =
+                    status.current_priority;
+            }
+            setRegU32(*ctx, 4, 0u);
+            setRegU32(*ctx, 5, 60u);
+            ChangeThreadPriority(
+                rdram, ctx, runtime);
+            triggerResult = getRegS32(*ctx, 2);
+            recordMain(4);
+            break;
+
+        case ExecutorPriorityScenario::
+            OrdinaryPriority:
+            firstThreadId =
+                createAndStart(
+                    0x00315000u, 50u, 2u);
+            recordMain(1);
+            setRegU32(
+                *ctx,
+                4,
+                static_cast<uint32_t>(firstThreadId));
+            setRegU32(*ctx, 5, 30u);
+            ChangeThreadPriority(
+                rdram, ctx, runtime);
+            operationResult = getRegS32(*ctx, 2);
+            recordMain(3);
+            break;
+
+        case ExecutorPriorityScenario::
+            RawCurrentRotation:
+            firstThreadId =
+                createAndStart(
+                    0x00316000u, 40u, 2u);
+            recordMain(1);
+            setRegU32(*ctx, 4, 40u);
+            iRotateThreadReadyQueue(
+                rdram, ctx, runtime);
+            operationResult = getRegS32(*ctx, 2);
+            recordMain(3);
+            setRegU32(*ctx, 4, 0u);
+            setRegU32(*ctx, 5, 60u);
+            ChangeThreadPriority(
+                rdram, ctx, runtime);
+            triggerResult = getRegS32(*ctx, 2);
+            recordMain(4);
+            break;
+
+        case ExecutorPriorityScenario::
+            OrdinaryCurrentRotation:
+            firstThreadId =
+                createAndStart(
+                    0x00317000u, 40u, 2u);
+            recordMain(1);
+            setRegU32(*ctx, 4, 40u);
+            RotateThreadReadyQueue(
+                rdram, ctx, runtime);
+            operationResult = getRegS32(*ctx, 2);
+            recordMain(3);
+            break;
+
+        case ExecutorPriorityScenario::NamedRotation:
+            firstThreadId =
+                createAndStart(
+                    0x00318000u, 50u, 2u);
+            secondThreadId =
+                createAndStart(
+                    0x00319000u, 50u, 3u);
+            recordMain(1);
+            setRegU32(*ctx, 4, 50u);
+            RotateThreadReadyQueue(
+                rdram, ctx, runtime);
+            operationResult = getRegS32(*ctx, 2);
+            recordMain(4);
+            setRegU32(*ctx, 4, 0u);
+            setRegU32(*ctx, 5, 60u);
+            ChangeThreadPriority(
+                rdram, ctx, runtime);
+            triggerResult = getRegS32(*ctx, 2);
+            recordMain(5);
+            break;
+        }
+
+        {
+            std::lock_guard<std::mutex> lock(
+                g_executorFixtureMutex);
+            g_executorPrioritySetupResult =
+                setupResult;
+            g_executorPriorityOperationResult =
+                operationResult;
+            g_executorPriorityTriggerResult =
+                triggerResult;
+            g_executorPriorityStatusValue =
+                statusValue;
+            g_executorPriorityFirstThreadId =
+                firstThreadId;
+            g_executorPrioritySecondThreadId =
+                secondThreadId;
+            g_executorPriorityCompleted = true;
         }
         ctx->pc = 0u;
     }
@@ -4284,6 +4523,307 @@ void register_ps2_runtime_kernel_tests()
                              .schedulerExitDeleteThreadPresent &&
                         result.managedContinuations == 0u,
                     "self-exit lifecycle should retire scheduler and continuation ownership exactly once");
+            });
+
+        tc.Run(
+            "fiber priority and rotation preserve ordinary and raw boundaries",
+            [](TestCase &t)
+            {
+                if (!eeExecutionBackendBuildInfo()
+                         .boostContextFcontextAvailable)
+                {
+                    return;
+                }
+
+                struct FixtureResult
+                {
+                    bool memoryInitialized = false;
+                    bool completed = false;
+                    std::vector<int> order;
+                    int setupResult = KE_ERROR;
+                    int operationResult = KE_ERROR;
+                    int triggerResult = KE_ERROR;
+                    int statusValue = -1;
+                    int firstThreadId = 0;
+                    int secondThreadId = 0;
+                    int schedulerMainPriority = -1;
+                    int schedulerFirstPriority = -1;
+                    int schedulerSecondPriority = -1;
+                    bool schedulerValid = false;
+                    size_t managedContinuations = 1u;
+                };
+
+                const auto runFixture =
+                    [](ExecutorPriorityScenario scenario)
+                    {
+                        FixtureResult result{};
+                        PS2RuntimeConfiguration
+                            configuration{};
+                        configuration.eeExecutionBackend =
+                            EeExecutionBackendKind::
+                                LegacyCppFiber;
+                        PS2Runtime runtime(configuration);
+                        result.memoryInitialized =
+                            runtime.memory().initialize();
+                        if (!result.memoryInitialized)
+                        {
+                            return result;
+                        }
+
+                        runtime.registerFunction(
+                            K_EXECUTOR_PRIORITY_MAIN_ENTRY,
+                            &dedicatedExecutorPriorityMainHandler);
+                        runtime.registerFunction(
+                            K_EXECUTOR_PRIORITY_MARKER_ENTRY,
+                            &dedicatedExecutorPriorityMarkerHandler);
+                        runtime.cpu().pc =
+                            K_EXECUTOR_PRIORITY_MAIN_ENTRY;
+                        setRegU32(
+                            runtime.cpu(),
+                            29,
+                            0x00300000u);
+                        {
+                            std::lock_guard<std::mutex>
+                                lock(
+                                    g_executorFixtureMutex);
+                            g_executorPriorityScenario =
+                                scenario;
+                            g_executorPriorityCompleted =
+                                false;
+                            g_executorPriorityOrder.clear();
+                            g_executorPrioritySetupResult =
+                                KE_ERROR;
+                            g_executorPriorityOperationResult =
+                                KE_ERROR;
+                            g_executorPriorityTriggerResult =
+                                KE_ERROR;
+                            g_executorPriorityStatusValue =
+                                -1;
+                            g_executorPriorityFirstThreadId =
+                                0;
+                            g_executorPrioritySecondThreadId =
+                                0;
+                        }
+
+                        runtime
+                            .startDedicatedEeExecutionForTesting();
+                        result.completed = waitUntil(
+                            []()
+                            {
+                                std::lock_guard<
+                                    std::mutex>
+                                    lock(
+                                        g_executorFixtureMutex);
+                                return g_executorPriorityCompleted;
+                            },
+                            std::chrono::seconds(2));
+                        const bool continuationsRetired =
+                            waitUntil(
+                                [&runtime]()
+                                {
+                                    return runtime
+                                               .managedEeExecutionThreadCountForTesting() ==
+                                           0u;
+                                },
+                                std::chrono::
+                                    milliseconds(200));
+
+                        {
+                            std::lock_guard<std::mutex>
+                                lock(
+                                    g_executorFixtureMutex);
+                            result.order =
+                                g_executorPriorityOrder;
+                            result.setupResult =
+                                g_executorPrioritySetupResult;
+                            result.operationResult =
+                                g_executorPriorityOperationResult;
+                            result.triggerResult =
+                                g_executorPriorityTriggerResult;
+                            result.statusValue =
+                                g_executorPriorityStatusValue;
+                            result.firstThreadId =
+                                g_executorPriorityFirstThreadId;
+                            result.secondThreadId =
+                                g_executorPrioritySecondThreadId;
+                        }
+
+                        runtime
+                            .invokeEeSchedulerUpdateAtBoundary(
+                                [&result](
+                                    ps2x::ee::
+                                        EeThreadScheduler
+                                            &scheduler)
+                                {
+                                    const auto main =
+                                        scheduler.thread(1);
+                                    const auto first =
+                                        scheduler.thread(
+                                            result
+                                                .firstThreadId);
+                                    const auto second =
+                                        scheduler.thread(
+                                            result
+                                                .secondThreadId);
+                                    result.schedulerMainPriority =
+                                        main.has_value()
+                                            ? main->priority
+                                            : -1;
+                                    result.schedulerFirstPriority =
+                                        first.has_value()
+                                            ? first->priority
+                                            : -1;
+                                    result.schedulerSecondPriority =
+                                        second.has_value()
+                                            ? second->priority
+                                            : -1;
+                                    result.schedulerValid =
+                                        scheduler.validate();
+                                },
+                                ps2x::ee::
+                                    EeSchedulerReschedulePolicy::
+                                        None);
+                        result.managedContinuations =
+                            runtime
+                                .managedEeExecutionThreadCountForTesting();
+                        runtime
+                            .stopDedicatedEeExecutionForTesting();
+                        if (!continuationsRetired)
+                        {
+                            result.managedContinuations =
+                                std::max<size_t>(
+                                    1u,
+                                    result
+                                        .managedContinuations);
+                        }
+                        return result;
+                    };
+
+                struct ScenarioExpectation
+                {
+                    ExecutorPriorityScenario scenario;
+                    const char *name;
+                    std::vector<int> order;
+                    int operationResult;
+                    int triggerResult;
+                    int statusValue;
+                    int mainPriority;
+                    int firstPriority;
+                    int secondPriority;
+                };
+                const std::array<
+                    ScenarioExpectation,
+                    5u>
+                    expectations{{
+                        {
+                            ExecutorPriorityScenario::
+                                RawPriority,
+                            "raw priority promotion",
+                            {1, 3, 2, 4},
+                            50,
+                            40,
+                            30,
+                            60,
+                            30,
+                            -1,
+                        },
+                        {
+                            ExecutorPriorityScenario::
+                                OrdinaryPriority,
+                            "ordinary priority promotion",
+                            {1, 2, 3},
+                            50,
+                            KE_ERROR,
+                            -1,
+                            40,
+                            30,
+                            -1,
+                        },
+                        {
+                            ExecutorPriorityScenario::
+                                RawCurrentRotation,
+                            "raw current-priority rotation",
+                            {1, 3, 2, 4},
+                            40,
+                            40,
+                            -1,
+                            60,
+                            40,
+                            -1,
+                        },
+                        {
+                            ExecutorPriorityScenario::
+                                OrdinaryCurrentRotation,
+                            "ordinary current-priority rotation",
+                            {1, 2, 3},
+                            40,
+                            KE_ERROR,
+                            -1,
+                            40,
+                            40,
+                            -1,
+                        },
+                        {
+                            ExecutorPriorityScenario::
+                                NamedRotation,
+                            "named lower-priority rotation",
+                            {1, 4, 3, 2, 5},
+                            50,
+                            40,
+                            -1,
+                            60,
+                            50,
+                            50,
+                        },
+                    }};
+
+                for (const auto &expectation :
+                     expectations)
+                {
+                    const FixtureResult result =
+                        runFixture(
+                            expectation.scenario);
+                    t.IsTrue(
+                        result.memoryInitialized &&
+                            result.completed &&
+                            result.setupResult == 1 &&
+                            result.firstThreadId > 1 &&
+                            (expectation.secondPriority < 0 ||
+                             result.secondThreadId > 1) &&
+                            result.order ==
+                                expectation.order,
+                        std::string(expectation.name) +
+                            " should preserve the PCSX2 "
+                            "ordinary/raw order");
+                    t.IsTrue(
+                        result.operationResult ==
+                                expectation
+                                    .operationResult &&
+                            result.triggerResult ==
+                                expectation.triggerResult &&
+                            result.statusValue ==
+                                expectation.statusValue,
+                        std::string(expectation.name) +
+                            " should preserve syscall "
+                            "results and synchronous "
+                            "guest status");
+                    t.IsTrue(
+                        result.schedulerMainPriority ==
+                                expectation.mainPriority &&
+                            result.schedulerFirstPriority ==
+                                expectation
+                                    .firstPriority &&
+                            result.schedulerSecondPriority ==
+                                expectation
+                                    .secondPriority &&
+                            result.schedulerValid &&
+                            result.managedContinuations ==
+                                0u,
+                        std::string(expectation.name) +
+                            " should keep scheduler "
+                            "priority and ownership "
+                            "authoritative");
+                }
             });
 
         tc.Run("host presentation upload state is isolated per runtime", [](TestCase &t)

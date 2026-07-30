@@ -2881,17 +2881,152 @@ namespace ps2_syscalls
             return;
         }
 
+        if (newPrio < 0 || newPrio >= 128)
+        {
+            setReturnS32(ctx, KE_ILLEGAL_PRIORITY);
+            return;
+        }
+
+        if (runtime->usesDedicatedEeExecutor())
+        {
+            {
+                std::lock_guard<std::mutex> lock(
+                    info->m);
+                if (info->guestState.isDormant())
+                {
+                    setReturnS32(ctx, KE_DORMANT);
+                    return;
+                }
+            }
+
+            struct PriorityTransition
+            {
+                bool applied = false;
+                bool dormant = false;
+                bool stale = false;
+                std::optional<int> previous;
+            };
+            const uint32_t generation =
+                info->generation;
+            const auto transition =
+                std::make_shared<PriorityTransition>();
+            const bool published =
+                runtime->publishEeSchedulerUpdate(
+                    [info,
+                     tid,
+                     generation,
+                     newPrio,
+                     transition](
+                        ps2x::ee::EeThreadScheduler
+                            &scheduler)
+                    {
+                        const auto before =
+                            scheduler.thread(tid);
+                        if (!before.has_value() ||
+                            before->generation !=
+                                generation)
+                        {
+                            transition->stale = true;
+                            transition->applied = true;
+                            return;
+                        }
+                        if (before->state ==
+                            ps2x::ee::
+                                EeSchedulerThreadState::
+                                    Dormant)
+                        {
+                            transition->dormant = true;
+                            transition->applied = true;
+                            return;
+                        }
+
+                        transition->previous =
+                            scheduler
+                                .changeThreadPriority(
+                                    {
+                                        tid,
+                                        generation,
+                                    },
+                                    newPrio);
+                        if (!transition->previous
+                                 .has_value())
+                        {
+                            throw std::logic_error(
+                                "ChangeThreadPriority "
+                                "could not apply its EE "
+                                "scheduler transition");
+                        }
+
+                        std::lock_guard<std::mutex> lock(
+                            info->m);
+                        const int guestPrevious =
+                            info->guestState
+                                .changeCurrentPriority(
+                                    newPrio);
+                        const auto after =
+                            scheduler.thread(tid);
+                        if (guestPrevious !=
+                                *transition->previous ||
+                            !after.has_value() ||
+                            after->generation !=
+                                generation ||
+                            after->priority != newPrio ||
+                            info->guestState
+                                    .snapshot()
+                                    .currentPriority !=
+                                newPrio)
+                        {
+                            throw std::logic_error(
+                                "ChangeThreadPriority "
+                                "scheduler and guest "
+                                "priorities diverged");
+                        }
+                        transition->applied = true;
+                    },
+                    reschedule
+                        ? ps2x::ee::
+                              EeSchedulerReschedulePolicy::
+                                  HigherPriorityOnly
+                        : ps2x::ee::
+                              EeSchedulerReschedulePolicy::
+                                  None);
+            if (!published)
+            {
+                setReturnS32(ctx, KE_ERROR);
+                return;
+            }
+
+            runtime->yieldEeExecutorCurrent(
+                ps2x::ee::EeSchedulerExitReason::
+                    Preempted);
+            if (!transition->applied)
+            {
+                throw std::logic_error(
+                    "ChangeThreadPriority resumed before "
+                    "its scheduler transition");
+            }
+            if (transition->stale)
+            {
+                setReturnS32(ctx, KE_UNKNOWN_THID);
+                return;
+            }
+            if (transition->dormant)
+            {
+                setReturnS32(ctx, KE_DORMANT);
+                return;
+            }
+            setReturnS32(
+                ctx,
+                transition->previous.value_or(
+                    KE_ERROR));
+            return;
+        }
+
         {
             std::lock_guard<std::mutex> lock(info->m);
             if (info->guestState.isDormant())
             {
                 setReturnS32(ctx, KE_DORMANT);
-                return;
-            }
-
-            if (newPrio < 0 || newPrio >= 128)
-            {
-                setReturnS32(ctx, KE_ILLEGAL_PRIORITY);
                 return;
             }
 
@@ -2946,6 +3081,52 @@ namespace ps2_syscalls
             requestedPriority,
             prio,
             true);
+
+        if (runtime->usesDedicatedEeExecutor())
+        {
+            const auto applied =
+                std::make_shared<bool>(false);
+            const bool published =
+                runtime->publishEeSchedulerUpdate(
+                    [prio, applied](
+                        ps2x::ee::EeThreadScheduler
+                            &scheduler)
+                    {
+                        if (!scheduler.rotateReadyQueue(
+                                prio))
+                        {
+                            throw std::logic_error(
+                                "RotateThreadReadyQueue "
+                                "could not rotate its EE "
+                                "scheduler queue");
+                        }
+                        *applied = true;
+                    },
+                    reschedule
+                        ? ps2x::ee::
+                              EeSchedulerReschedulePolicy::
+                                  EqualOrHigherPriority
+                        : ps2x::ee::
+                              EeSchedulerReschedulePolicy::
+                                  None);
+            if (!published)
+            {
+                setReturnS32(ctx, KE_ERROR);
+                return;
+            }
+            runtime->yieldEeExecutorCurrent(
+                ps2x::ee::EeSchedulerExitReason::
+                    Preempted);
+            if (!*applied)
+            {
+                throw std::logic_error(
+                    "RotateThreadReadyQueue resumed "
+                    "before its scheduler transition");
+            }
+            setReturnS32(ctx, prio);
+            return;
+        }
+
         setReturnS32(ctx, prio);
         if (reschedule)
         {
