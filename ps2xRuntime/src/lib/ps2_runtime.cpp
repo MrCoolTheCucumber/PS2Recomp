@@ -69,6 +69,7 @@ static constexpr int FB_WIDTH = 640;
 static constexpr int FB_HEIGHT = 512;
 static constexpr int DEFAULT_DISPLAY_HEIGHT = 448;
 static constexpr uint32_t DEFAULT_FB_SIZE = FB_WIDTH * FB_HEIGHT * 4;
+static constexpr uint64_t EE_CYCLES_PER_SECOND = 294'912'000u;
 static constexpr uint32_t DEFAULT_FB_ADDR = (PS2_RAM_SIZE - DEFAULT_FB_SIZE - 0x10000u);
 static constexpr const char *GS_HISTORY_DUMP_ENV = "PS2X_GS_HISTORY_DUMP";
 static std::atomic<uint64_t> g_nextEeThreadRuntimeGeneration{1u};
@@ -2907,6 +2908,9 @@ void PS2Runtime::configureEeVSyncVideoMode(
     m_eeVSyncTiming.durations =
         eeVSyncDurationsForVideoMode(
             videoMode, interlaced);
+    m_debugVSyncPeriodCycles.store(
+        m_eeVSyncTiming.durations.periodCycles,
+        std::memory_order_relaxed);
     m_hostPresentationVideoModeClass.store(
         videoModeClass,
         std::memory_order_relaxed);
@@ -2989,10 +2993,8 @@ PS2Runtime::hostDurationForEeTicks(
     // The default Emotion Engine clock is 294.912 MHz. This conversion only
     // rate-limits already-scheduled work; its result never feeds back into
     // the emulated timeline.
-    constexpr uint64_t kEeCyclesPerSecond =
-        294'912'000u;
     constexpr uint64_t kEeTicksPerSecond =
-        kEeCyclesPerSecond *
+        EE_CYCLES_PER_SECOND *
         ps2x::timing::kEeTicksPerCycle;
     constexpr uint64_t kNanosecondsPerSecond =
         1'000'000'000u;
@@ -5094,11 +5096,15 @@ bool PS2Runtime::initialize(const char *title)
             return false;
         }
 #endif
+        m_windowTitle =
+            title && title[0] != '\0'
+                ? title
+                : "PS2 Game";
 #if defined(PLATFORM_VITA)
-        InitWindow(HOST_WINDOW_WIDTH, HOST_WINDOW_HEIGHT, title); // raylib vita does not support audio
+        InitWindow(HOST_WINDOW_WIDTH, HOST_WINDOW_HEIGHT, m_windowTitle.c_str()); // raylib vita does not support audio
 #else
         SetConfigFlags(FLAG_WINDOW_RESIZABLE);
-        InitWindow(HOST_WINDOW_WIDTH, HOST_WINDOW_HEIGHT, title);
+        InitWindow(HOST_WINDOW_WIDTH, HOST_WINDOW_HEIGHT, m_windowTitle.c_str());
         InitAudioDevice();
         m_audioBackend.setAudioReady(IsAudioDeviceReady());
 #endif
@@ -10894,6 +10900,19 @@ void PS2Runtime::run()
     }
 
     uint64_t tick = 0;
+    using WindowRateClock = std::chrono::steady_clock;
+    constexpr auto windowTitleUpdateInterval =
+        std::chrono::seconds(2);
+    auto windowTitleSampleTime =
+        WindowRateClock::now();
+    uint64_t windowTitleSampleFields =
+        m_debugVSyncFields.load(
+            std::memory_order_relaxed);
+    uint64_t windowTitleSamplePresentations =
+        m_gs.getProgressSnapshot().presentations;
+    uint64_t windowTitleSamplePeriodCycles =
+        m_debugVSyncPeriodCycles.load(
+            std::memory_order_relaxed);
     while (
         !isStopRequested() &&
         (dedicatedExecutor
@@ -10990,6 +11009,75 @@ void PS2Runtime::run()
             m_debugUiDrawCallback(*this, m_debugUiUserData);
         }
         EndDrawing();
+
+        const WindowRateClock::time_point windowTitleNow =
+            WindowRateClock::now();
+        const WindowRateClock::duration windowTitleElapsed =
+            windowTitleNow - windowTitleSampleTime;
+        if (windowTitleElapsed >=
+            windowTitleUpdateInterval)
+        {
+            const uint64_t currentFields =
+                m_debugVSyncFields.load(
+                    std::memory_order_relaxed);
+            const uint64_t currentPresentations =
+                m_gs.getProgressSnapshot()
+                    .presentations;
+            const uint64_t currentPeriodCycles =
+                m_debugVSyncPeriodCycles.load(
+                    std::memory_order_relaxed);
+
+            if (currentPeriodCycles != 0u &&
+                currentPeriodCycles ==
+                    windowTitleSamplePeriodCycles &&
+                currentFields >=
+                    windowTitleSampleFields &&
+                currentPresentations >=
+                    windowTitleSamplePresentations)
+            {
+                const double elapsedSeconds =
+                    std::chrono::duration<double>(
+                        windowTitleElapsed)
+                        .count();
+                const double guestFramesPerSecond =
+                    static_cast<double>(
+                        currentPresentations -
+                        windowTitleSamplePresentations) /
+                    elapsedSeconds;
+                const double expectedFields =
+                    elapsedSeconds *
+                    static_cast<double>(
+                        EE_CYCLES_PER_SECOND) /
+                    static_cast<double>(
+                        currentPeriodCycles);
+                const double runRatePercent =
+                    expectedFields > 0.0
+                        ? static_cast<double>(
+                              currentFields -
+                              windowTitleSampleFields) *
+                              100.0 /
+                              expectedFields
+                        : 0.0;
+                std::array<char, 512u> title{};
+                std::snprintf(
+                    title.data(),
+                    title.size(),
+                    "%s | %.1f FPS | %.1f%% speed",
+                    m_windowTitle.c_str(),
+                    guestFramesPerSecond,
+                    runRatePercent);
+                SetWindowTitle(title.data());
+            }
+
+            windowTitleSampleTime =
+                windowTitleNow;
+            windowTitleSampleFields =
+                currentFields;
+            windowTitleSamplePresentations =
+                currentPresentations;
+            windowTitleSamplePeriodCycles =
+                currentPeriodCycles;
+        }
 
         if (WindowShouldClose())
         {

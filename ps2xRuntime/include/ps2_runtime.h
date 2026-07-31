@@ -1895,6 +1895,7 @@ private:
                 kMaximumServicesPerBoundary;
     EeVSyncTiming m_eeVSyncTiming{};
     EeVSyncPacing m_eeVSyncPacing{};
+    std::atomic<uint64_t> m_debugVSyncPeriodCycles{4'915'200u};
     std::atomic<EeVSyncVideoModeClass>
         m_hostPresentationVideoModeClass{
             EeVSyncVideoModeClass::Ntsc};
@@ -2080,6 +2081,8 @@ private:
     DebugUiCallback m_debugUiDrawCallback = nullptr;
     DebugUiCallback m_debugUiShutdownCallback = nullptr;
     void *m_debugUiUserData = nullptr;
+    std::string m_windowTitle{"PS2 Game"};
+
     bool m_debugUiInitialized = false;
 
 public:
