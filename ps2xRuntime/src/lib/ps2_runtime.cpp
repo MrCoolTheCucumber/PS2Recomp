@@ -74,6 +74,21 @@ static constexpr uint32_t DEFAULT_FB_ADDR = (PS2_RAM_SIZE - DEFAULT_FB_SIZE - 0x
 static constexpr const char *GS_HISTORY_DUMP_ENV = "PS2X_GS_HISTORY_DUMP";
 static std::atomic<uint64_t> g_nextEeThreadRuntimeGeneration{1u};
 
+#if !defined(PS2X_DEFAULT_EE_EXECUTION_BACKEND_CPP_FIBER)
+#define PS2X_DEFAULT_EE_EXECUTION_BACKEND_CPP_FIBER 0
+#endif
+
+static PS2RuntimeConfiguration
+defaultPs2RuntimeConfiguration() noexcept
+{
+    PS2RuntimeConfiguration configuration{};
+#if PS2X_DEFAULT_EE_EXECUTION_BACKEND_CPP_FIBER
+    configuration.eeExecutionBackend =
+        EeExecutionBackendKind::LegacyCppFiber;
+#endif
+    return configuration;
+}
+
 struct HostPresentationUploadState
 {
     uint64_t lastPresentationTick =
@@ -1008,7 +1023,7 @@ static void UploadFrame(
 }
 
 PS2Runtime::PS2Runtime()
-    : PS2Runtime(PS2RuntimeConfiguration{})
+    : PS2Runtime(defaultPs2RuntimeConfiguration())
 {
 }
 

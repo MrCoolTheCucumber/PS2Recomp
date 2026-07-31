@@ -1,8 +1,17 @@
 # EE execution backends
 
-The native runtime currently keeps `legacy-host-thread` as its default while
-the one-executor fiber mode is stabilized. Select the fiber backend explicitly
-for testing or differential runs:
+PS2Recomp keeps `legacy-host-thread` as its default. A project can instead
+make a default-constructed runtime select the fiber backend when configuring
+its runner:
+
+```sh
+cmake -S . -B build \
+  -DPS2X_DEFAULT_EE_EXECUTION_BACKEND=legacy-cpp-fiber
+```
+
+This configuration fails when the validated Boost.Context `fcontext` backend
+is unavailable. The launch environment can override the compiled default for
+testing or differential runs:
 
 ```sh
 PS2X_EE_EXECUTION_BACKEND=legacy-cpp-fiber ps2EntryRunner game.elf disc.iso

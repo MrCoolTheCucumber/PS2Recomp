@@ -24,6 +24,26 @@ option(PS2X_ENABLE_GS_AVX2_KERNEL
 option(PS2X_ENABLE_EE_CPP_FIBER_BACKEND
     "Build the legacy generated-C++ Boost.Context fiber backend when supported"
     ON)
+set(PS2X_DEFAULT_EE_EXECUTION_BACKEND
+    "legacy-host-thread"
+    CACHE STRING
+    "Default EE execution backend: legacy-host-thread or legacy-cpp-fiber")
+set_property(
+    CACHE PS2X_DEFAULT_EE_EXECUTION_BACKEND
+    PROPERTY STRINGS
+        legacy-host-thread
+        legacy-cpp-fiber)
+
+set(PS2X_EE_EXECUTION_BACKENDS
+    legacy-host-thread
+    legacy-cpp-fiber)
+if(NOT PS2X_DEFAULT_EE_EXECUTION_BACKEND IN_LIST
+   PS2X_EE_EXECUTION_BACKENDS)
+    message(FATAL_ERROR
+        "Unknown PS2X_DEFAULT_EE_EXECUTION_BACKEND="
+        "${PS2X_DEFAULT_EE_EXECUTION_BACKEND}; expected "
+        "legacy-host-thread or legacy-cpp-fiber")
+endif()
 
 if(PS2X_ENABLE_SCCACHE)
     find_program(PS2X_SCCACHE_PROGRAM sccache)
@@ -586,6 +606,14 @@ add_library(ps2_runtime STATIC
     src/lib/games_database.cpp
 )
 
+if(PS2X_DEFAULT_EE_EXECUTION_BACKEND STREQUAL
+   "legacy-cpp-fiber" AND
+   NOT PS2X_HAS_EE_CPP_FIBER_BACKEND)
+    message(FATAL_ERROR
+        "PS2X_DEFAULT_EE_EXECUTION_BACKEND=legacy-cpp-fiber requires "
+        "the validated Boost.Context fcontext backend")
+endif()
+
 if(PS2X_HAS_EE_CPP_FIBER_BACKEND)
     target_link_libraries(ps2_runtime PRIVATE Boost::context)
     target_compile_definitions(ps2_runtime PRIVATE
@@ -604,6 +632,16 @@ endif()
 target_compile_definitions(ps2_runtime PRIVATE
     PS2X_EE_CONTEXT_BUILD_MODE="${PS2X_EE_CONTEXT_BUILD_MODE}"
 )
+if(PS2X_DEFAULT_EE_EXECUTION_BACKEND STREQUAL
+   "legacy-cpp-fiber")
+    target_compile_definitions(ps2_runtime PRIVATE
+        PS2X_DEFAULT_EE_EXECUTION_BACKEND_CPP_FIBER=1
+    )
+else()
+    target_compile_definitions(ps2_runtime PRIVATE
+        PS2X_DEFAULT_EE_EXECUTION_BACKEND_CPP_FIBER=0
+    )
+endif()
 
 set(PS2X_HAS_GS_AVX2_KERNEL OFF)
 if(PS2X_ENABLE_GS_AVX2_KERNEL
