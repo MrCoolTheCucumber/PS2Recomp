@@ -51,6 +51,7 @@ class PS2IopHostAdapter;
 class PS2IopTransport;
 class PS2DebugServer;
 struct HostPresentationUploadState;
+struct ThreadInfo;
 struct EeThreadRuntimeState;
 struct EeAlarmRuntimeState;
 struct EeSyncRuntimeState;
@@ -1199,6 +1200,14 @@ public:
     void yieldGuestExecutionAfterWake();
     void waitForGuestExecutionHandoff();
     void waitForGuestExecutionHandoff(uint64_t baselineEpoch);
+    // A raw i* wake publishes READY synchronously but cannot release its
+    // legacy host waiter until the interrupted owner reaches a boundary.
+    // This preserves the same non-rescheduling policy as the EE scheduler.
+    [[nodiscard]] bool
+    shouldDeferLegacyEeWakeNotification() const noexcept;
+    void deferLegacyEeWakeNotification(
+        const std::shared_ptr<ThreadInfo> &thread);
+    void flushDeferredLegacyEeWakeNotifications();
     uint64_t guestExecutionHandoffEpochSnapshot() const
     {
         return m_guestExecutionHandoffEpoch.load(std::memory_order_acquire);
@@ -1283,6 +1292,14 @@ public:
     [[nodiscard]] size_t
     managedEeExecutionThreadCountForTesting() const;
     [[nodiscard]] bool
+    eeExecutionQuiescentForTesting() const noexcept;
+    using EeThreadContextImageForTesting = std::pair<
+        int,
+        std::array<uint8_t, sizeof(R5900Context)>>;
+    [[nodiscard]] std::vector<
+        EeThreadContextImageForTesting>
+    eeThreadContextsForTesting();
+    [[nodiscard]] bool
     usesDedicatedEeExecutor() const noexcept;
     // Headless lifecycle seams used by focused runtime fixtures. The generic
     // pair starts whichever production backend was selected; the dedicated
@@ -1292,6 +1309,11 @@ public:
     void stopEeExecutionForTesting();
     void startDedicatedEeExecutionForTesting();
     void stopDedicatedEeExecutionForTesting();
+    // Complete a kernel reset after guest thread state has been released.
+    // Unlike requestStop(), this retires native EE continuations without
+    // publishing runtime shutdown, so a fresh execution epoch may start on
+    // the same runtime.
+    void completeEeExecutionKernelReset();
     [[nodiscard]] bool publishEeExecutorUpdate(
         std::function<void(
             ps2x::ee::EeThreadScheduler &,
@@ -1914,6 +1936,9 @@ private:
     int m_boundEeThreadId = 1;
     mutable std::recursive_timed_mutex m_guestExecutionMutex;
     mutable std::atomic<uint32_t> m_guestExecutionWaiters{0u};
+    mutable std::mutex m_legacyDeferredEeWakeMutex;
+    std::vector<std::weak_ptr<ThreadInfo>>
+        m_legacyDeferredEeWakeNotifications;
     mutable std::mutex m_guestExecutionHandoffMutex;
     mutable std::condition_variable m_guestExecutionHandoffCv;
     mutable std::mutex m_eeIdleAdvanceMutex;

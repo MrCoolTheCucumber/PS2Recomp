@@ -1487,6 +1487,95 @@ PS2Runtime::managedEeExecutionThreadCountForTesting() const
                : 0u;
 }
 
+bool PS2Runtime::eeExecutionQuiescentForTesting()
+    const noexcept
+{
+    if (usesDedicatedEeExecutor())
+    {
+        return managedEeExecutionThreadCountForTesting() ==
+               0u;
+    }
+    return m_eeThreadRuntimeState
+               ->activeHostThreads.load(
+                   std::memory_order_acquire) == 0;
+}
+
+std::vector<PS2Runtime::EeThreadContextImageForTesting>
+PS2Runtime::eeThreadContextsForTesting()
+{
+    std::vector<EeThreadContextImageForTesting> result;
+    const auto capture =
+        [this, &result]()
+        {
+            EeThreadRuntimeState &state =
+                *m_eeThreadRuntimeState;
+            std::vector<
+                std::pair<
+                    int,
+                    std::shared_ptr<ThreadInfo>>>
+                threads;
+            {
+                std::lock_guard<std::mutex> lock(
+                    state.threadMapMutex);
+                threads.reserve(state.threads.size());
+                for (const auto &[id, info] :
+                     state.threads)
+                {
+                    threads.emplace_back(id, info);
+                }
+            }
+            std::sort(
+                threads.begin(),
+                threads.end(),
+                [](const auto &lhs, const auto &rhs)
+                {
+                    return lhs.first < rhs.first;
+                });
+
+            result.clear();
+            result.reserve(threads.size());
+            for (const auto &[id, info] : threads)
+            {
+                if (!info)
+                {
+                    continue;
+                }
+                EeThreadContextImageForTesting image{};
+                image.first = id;
+                {
+                    std::lock_guard<std::mutex> lock(
+                        info->m);
+                    const R5900Context *const context =
+                        info->boundContext
+                            ? info->boundContext
+                            : &info->context;
+                    std::memcpy(
+                        image.second.data(),
+                        context,
+                        image.second.size());
+                }
+                result.push_back(std::move(image));
+            }
+        };
+
+    if (m_eeRuntimeExecutor &&
+        m_eeRuntimeExecutor->running())
+    {
+        if (!invokeEeExecutorTaskAtBoundary(capture))
+        {
+            throw std::runtime_error(
+                "could not capture EE thread contexts "
+                "at an executor boundary");
+        }
+        return result;
+    }
+
+    std::lock_guard<std::recursive_timed_mutex> lock(
+        m_guestExecutionMutex);
+    capture();
+    return result;
+}
+
 bool PS2Runtime::usesDedicatedEeExecutor() const noexcept
 {
     return m_eeRuntimeExecutor != nullptr;
@@ -2074,6 +2163,38 @@ void PS2Runtime::stopEeExecutionForTesting()
     if (failure)
     {
         std::rethrow_exception(failure);
+    }
+}
+
+void PS2Runtime::completeEeExecutionKernelReset()
+{
+    if (isStopRequested())
+    {
+        return;
+    }
+
+    if (usesDedicatedEeExecutor())
+    {
+        if (m_eeRuntimeExecutor->ownsCurrentThread())
+        {
+            throw std::logic_error(
+                "EE kernel reset cannot join its own "
+                "executor thread");
+        }
+        m_eeRuntimeExecutor->requestStop();
+        joinDedicatedEeExecution();
+        return;
+    }
+
+    m_eeExecutionBackend->joinAll();
+    if (m_eeThreadRuntimeState->activeHostThreads.load(
+            std::memory_order_acquire) != 0 ||
+        m_eeExecutionBackend->managedThreadCount() !=
+            0u)
+    {
+        throw std::logic_error(
+            "EE kernel reset left host continuations "
+            "active");
     }
 }
 
@@ -7806,6 +7927,7 @@ R5900Context *PS2Runtime::enterGuestExecution(
         depth = 1u;
         recordOuterGuestExecutionAcquisition(context);
         markGuestExecutionAcquired();
+        flushDeferredLegacyEeWakeNotifications();
         R5900Context *const previousContext =
             m_boundEeContext;
         if (previousThreadId)
@@ -7843,6 +7965,7 @@ R5900Context *PS2Runtime::enterGuestExecution(
     depth = 1u;
     recordOuterGuestExecutionAcquisition(context);
     markGuestExecutionAcquired();
+    flushDeferredLegacyEeWakeNotifications();
     R5900Context *const previousContext =
         m_boundEeContext;
     if (previousThreadId)
@@ -7924,6 +8047,7 @@ bool PS2Runtime::tryEnterGuestExecution(
     g_guestExecutionDepths[this] = 1u;
     recordOuterGuestExecutionAcquisition(context);
     markGuestExecutionAcquired();
+    flushDeferredLegacyEeWakeNotifications();
     previousContext = m_boundEeContext;
     previousThreadId = m_boundEeThreadId;
     switchGuestExecutionContext(
@@ -8012,6 +8136,14 @@ void PS2Runtime::leaveGuestExecution(
         }
     }
 
+    if (it->second == 1u &&
+        !m_eeRuntimeExecutor &&
+        (isStopRequested() ||
+         (context && context->pc == 0u)))
+    {
+        flushDeferredLegacyEeWakeNotifications();
+    }
+
     --it->second;
     if (!m_eeRuntimeExecutor)
     {
@@ -8033,6 +8165,11 @@ uint32_t PS2Runtime::releaseGuestExecution(
     if (it == g_guestExecutionDepths.end() || it->second == 0u)
     {
         return 0u;
+    }
+
+    if (!m_eeRuntimeExecutor)
+    {
+        flushDeferredLegacyEeWakeNotifications();
     }
 
     context = m_boundEeContext;
@@ -8115,6 +8252,56 @@ void PS2Runtime::markGuestExecutionAcquired()
         m_guestExecutionHandoffEpoch.fetch_add(1u, std::memory_order_acq_rel);
     }
     m_guestExecutionHandoffCv.notify_all();
+}
+
+bool PS2Runtime::shouldDeferLegacyEeWakeNotification()
+    const noexcept
+{
+    if (m_eeRuntimeExecutor)
+    {
+        return false;
+    }
+    const auto it = g_guestExecutionDepths.find(
+        const_cast<PS2Runtime *>(this));
+    return it != g_guestExecutionDepths.end() &&
+           it->second != 0u;
+}
+
+void PS2Runtime::deferLegacyEeWakeNotification(
+    const std::shared_ptr<ThreadInfo> &thread)
+{
+    if (!thread || m_eeRuntimeExecutor)
+    {
+        return;
+    }
+    std::lock_guard<std::mutex> lock(
+        m_legacyDeferredEeWakeMutex);
+    m_legacyDeferredEeWakeNotifications.emplace_back(
+        thread);
+}
+
+void PS2Runtime::flushDeferredLegacyEeWakeNotifications()
+{
+    if (m_eeRuntimeExecutor)
+    {
+        return;
+    }
+
+    std::vector<std::weak_ptr<ThreadInfo>> pending;
+    {
+        std::lock_guard<std::mutex> lock(
+            m_legacyDeferredEeWakeMutex);
+        pending.swap(
+            m_legacyDeferredEeWakeNotifications);
+    }
+    for (const std::weak_ptr<ThreadInfo> &entry : pending)
+    {
+        if (const std::shared_ptr<ThreadInfo> thread =
+                entry.lock())
+        {
+            thread->cv.notify_one();
+        }
+    }
 }
 
 void PS2Runtime::waitForGuestExecutionHandoff()

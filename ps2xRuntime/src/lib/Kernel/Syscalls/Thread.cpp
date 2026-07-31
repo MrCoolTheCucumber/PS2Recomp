@@ -588,39 +588,64 @@ namespace ps2_syscalls
     // have one ordering boundary. This function acquires only the selected
     // thread's state mutex.
     static EeThreadWakePublication publishRegisteredEeThreadWake(
-        const std::shared_ptr<ThreadInfo> &info)
+        PS2Runtime *runtime,
+        const std::shared_ptr<ThreadInfo> &info,
+        bool deferHostNotification = false)
     {
         EeThreadWakePublication publication{};
-        std::lock_guard<std::mutex> lock(info->m);
-        if (info->guestState.isDormant())
         {
-            publication.result = EeThreadWakeResult::Dormant;
-        }
-        else if (info->guestState.wakeSleeping())
-        {
-            info->cv.notify_one();
-            publication.result =
-                EeThreadWakeResult::WokeSleeper;
-        }
-        else
-        {
-            info->guestState.incrementWakeup();
-            publication.result =
-                EeThreadWakeResult::WakeupCounted;
+            std::lock_guard<std::mutex> lock(info->m);
+            if (info->guestState.isDormant())
+            {
+                publication.result =
+                    EeThreadWakeResult::Dormant;
+            }
+            else if (info->guestState.wakeSleeping())
+            {
+                publication.result =
+                    EeThreadWakeResult::WokeSleeper;
+            }
+            else
+            {
+                info->guestState.incrementWakeup();
+                publication.result =
+                    EeThreadWakeResult::WakeupCounted;
+            }
+
+            const EeThreadGuestStateSnapshot &guest =
+                info->guestState.snapshot();
+            publication.status = guest.status;
+            publication.priority =
+                guest.currentPriority;
+            publication.wakeupCount =
+                guest.wakeupCount;
         }
 
-        const EeThreadGuestStateSnapshot &guest =
-            info->guestState.snapshot();
-        publication.status = guest.status;
-        publication.priority =
-            guest.currentPriority;
-        publication.wakeupCount = guest.wakeupCount;
+        if (publication.result ==
+            EeThreadWakeResult::WokeSleeper)
+        {
+            if (deferHostNotification)
+            {
+                runtime->deferLegacyEeWakeNotification(
+                    info);
+            }
+            else
+            {
+                info->cv.notify_one();
+            }
+        }
+        if (!deferHostNotification)
+        {
+            runtime
+                ->flushDeferredLegacyEeWakeNotifications();
+        }
         return publication;
     }
 
     static EeThreadWakePublication publishEeThreadWakeById(
         PS2Runtime *runtime,
-        int threadId)
+        int threadId,
+        bool deferHostNotification = false)
     {
         if (!runtime || threadId <= 0)
         {
@@ -639,7 +664,10 @@ namespace ps2_syscalls
                 EeThreadWakeResult::StaleHandle;
             return publication;
         }
-        return publishRegisteredEeThreadWake(it->second);
+        return publishRegisteredEeThreadWake(
+            runtime,
+            it->second,
+            deferHostNotification);
     }
 
     EeThreadHandle captureEeThreadHandle(
@@ -698,6 +726,7 @@ namespace ps2_syscalls
                 return EeThreadWakeResult::StaleHandle;
             }
             return publishRegisteredEeThreadWake(
+                       runtime,
                        it->second)
                 .result;
         }
@@ -727,18 +756,38 @@ namespace ps2_syscalls
         const auto publication =
             std::make_shared<
                 EeThreadWakePublication>();
-        runtime->invokeEeSchedulerUpdateAtBoundary(
-            [info, handle, publication](
-                ps2x::ee::EeThreadScheduler
-                    &scheduler)
+        try
+        {
+            runtime->invokeEeSchedulerUpdateAtBoundary(
+                [info, handle, publication](
+                    ps2x::ee::EeThreadScheduler
+                        &scheduler)
+                {
+                    *publication =
+                        applyEeExecutorThreadWake(
+                            scheduler,
+                            info,
+                            handle.threadId,
+                            handle.threadGeneration);
+                });
+        }
+        catch (...)
+        {
+            std::lock_guard<std::mutex> lock(
+                state.threadMapMutex);
+            const auto it =
+                state.threads.find(handle.threadId);
+            if (handle.runtimeGeneration !=
+                    state.runtimeGeneration ||
+                it == state.threads.end() ||
+                !it->second ||
+                it->second->generation !=
+                    handle.threadGeneration)
             {
-                *publication =
-                    applyEeExecutorThreadWake(
-                        scheduler,
-                        info,
-                        handle.threadId,
-                        handle.threadGeneration);
-            });
+                return EeThreadWakeResult::StaleHandle;
+            }
+            throw;
+        }
         return publication->result;
     }
 
@@ -2645,6 +2694,10 @@ namespace ps2_syscalls
 
     void SleepThread(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
+        if (runtime && runtime->isStopRequested())
+        {
+            throw ThreadExitException();
+        }
         auto info = ensureCurrentThreadInfo(runtime, ctx);
         if (!info)
         {
@@ -3044,8 +3097,15 @@ namespace ps2_syscalls
             return;
         }
 
+        const bool deferHostNotification =
+            !reschedule &&
+            runtime
+                ->shouldDeferLegacyEeWakeNotification();
         const EeThreadWakePublication publication =
-            publishEeThreadWakeById(runtime, tid);
+            publishEeThreadWakeById(
+                runtime,
+                tid,
+                deferHostNotification);
         if (publication.result ==
                 EeThreadWakeResult::InvalidHandle ||
             publication.result ==
@@ -3528,13 +3588,22 @@ namespace ps2_syscalls
         {
             const auto applied =
                 std::make_shared<bool>(false);
+            const int callerThreadId =
+                getCurrentThreadId(runtime);
             const bool published =
                 runtime->publishEeSchedulerUpdate(
-                    [prio, applied](
+                    [prio, callerThreadId, applied](
                         ps2x::ee::EeThreadScheduler
                             &scheduler)
                     {
-                        if (!scheduler.rotateReadyQueue(
+                        const auto caller =
+                            scheduler.thread(
+                                callerThreadId);
+                        const bool currentPriority =
+                            caller.has_value() &&
+                            caller->priority == prio;
+                        if (!currentPriority &&
+                            !scheduler.rotateReadyQueue(
                                 prio))
                         {
                             throw std::logic_error(
@@ -3569,24 +3638,26 @@ namespace ps2_syscalls
             return;
         }
 
-        rotateLegacyReadyQueue(runtime, prio);
+        const std::shared_ptr<ThreadInfo>
+            callerInfo =
+                ensureCurrentThreadInfo(runtime, ctx);
+        int callerPriority = prio;
+        if (callerInfo)
+        {
+            std::lock_guard<std::mutex> lock(
+                callerInfo->m);
+            callerPriority =
+                callerInfo->guestState
+                    .snapshot()
+                    .currentPriority;
+        }
+        if (callerPriority != prio)
+        {
+            rotateLegacyReadyQueue(runtime, prio);
+        }
         setReturnS32(ctx, prio);
         if (reschedule)
         {
-            const std::shared_ptr<ThreadInfo>
-                callerInfo =
-                    ensureCurrentThreadInfo(
-                        runtime, ctx);
-            int callerPriority = prio;
-            if (callerInfo)
-            {
-                std::lock_guard<std::mutex> lock(
-                    callerInfo->m);
-                callerPriority =
-                    callerInfo->guestState
-                        .snapshot()
-                        .currentPriority;
-            }
             (void)drainEligibleLegacyReadyThreads(
                 runtime,
                 callerPriority,

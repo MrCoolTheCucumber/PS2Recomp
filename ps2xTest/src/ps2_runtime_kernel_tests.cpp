@@ -178,6 +178,45 @@ namespace
         K_EXECUTOR_GUEST_STACK_ENTRY =
             0x25bc00u;
     constexpr uint32_t
+        K_BACKEND_CONTROL_MAIN_ENTRY =
+            0x25bd00u;
+    constexpr uint32_t
+        K_BACKEND_CONTROL_CHILD_ENTRY =
+            0x25be00u;
+    constexpr uint32_t
+        K_BACKEND_CONTROL_RESULT_ADDR =
+            0x1980u;
+    constexpr size_t
+        K_BACKEND_CONTROL_RESULT_WORDS =
+            5u;
+    constexpr uint32_t
+        K_BACKEND_CONTROL_STAGE_ADDR =
+            0x1994u;
+    constexpr uint32_t
+        K_BACKEND_ID_REUSE_MAIN_ENTRY =
+            0x25bf00u;
+    constexpr uint32_t
+        K_BACKEND_ID_REUSE_CHILD_ENTRY =
+            0x25c000u;
+    constexpr uint32_t
+        K_BACKEND_ID_REUSE_RESULT_ADDR =
+            0x19a0u;
+    constexpr size_t
+        K_BACKEND_ID_REUSE_RESULT_WORDS =
+            20u;
+    constexpr uint32_t
+        K_BACKEND_WAKE_RACE_MAIN_ENTRY =
+            0x25c100u;
+    constexpr uint32_t
+        K_BACKEND_WAKE_RACE_CHILD_ENTRY =
+            0x25c200u;
+    constexpr uint32_t
+        K_BACKEND_WAKE_RACE_RESULT_ADDR =
+            0x1a00u;
+    constexpr size_t
+        K_BACKEND_WAKE_RACE_RESULT_WORDS =
+            5u;
+    constexpr uint32_t
         K_EXECUTOR_GUEST_STACK_INITIAL_SP =
             0x00300000u;
     constexpr uint32_t
@@ -246,6 +285,95 @@ namespace
         g_backendDifferentialChildContext{};
     bool g_backendDifferentialMainCompleted = false;
     bool g_backendDifferentialChildCompleted = false;
+    enum class BackendControlWaitKind : uint32_t
+    {
+        Sleep,
+        Semaphore,
+        Event,
+        Suspend,
+        WaitSuspend,
+    };
+    enum class BackendControlTransition : uint32_t
+    {
+        MainEntered = 1u,
+        ChildEntered,
+        StartReturned,
+        SuspendReturned,
+        MainReturned,
+    };
+    BackendControlWaitKind g_backendControlWaitKind =
+        BackendControlWaitKind::Sleep;
+    std::vector<uint64_t> g_backendControlTransitions;
+    int g_backendControlResourceId = KE_ERROR;
+    int g_backendControlChildThreadId = 0;
+    int g_backendControlCreateResult = KE_ERROR;
+    int g_backendControlStartResult = KE_ERROR;
+    int g_backendControlSuspendResult = KE_ERROR;
+    bool g_backendControlMainCompleted = false;
+    std::array<
+        uint8_t,
+        sizeof(R5900Context)>
+        g_backendControlMainContext{};
+    std::array<
+        uint8_t,
+        sizeof(R5900Context)>
+        g_backendControlChildContext{};
+    enum class BackendIdReuseTransition : uint32_t
+    {
+        MainEntered = 1u,
+        ChildEntered,
+        ChildReturned,
+        MainReturned,
+    };
+    std::vector<uint64_t>
+        g_backendIdReuseTransitions;
+    EeThreadHandle g_backendIdReuseStaleHandle{};
+    EeThreadHandle g_backendIdReuseReplacementHandle{};
+    std::atomic<bool>
+        g_backendIdReuseAtPublicationGate{false};
+    std::atomic<bool>
+        g_backendIdReuseReleasePublicationGate{false};
+    bool g_backendIdReuseMainCompleted = false;
+    bool g_backendIdReuseChildCompleted = false;
+    std::array<
+        uint8_t,
+        sizeof(R5900Context)>
+        g_backendIdReuseMainContext{};
+    std::array<
+        uint8_t,
+        sizeof(R5900Context)>
+        g_backendIdReuseChildContext{};
+    enum class BackendWakeRaceScenario : uint32_t
+    {
+        BeforePark,
+        DuringPark,
+    };
+    enum class BackendWakeRaceTransition : uint32_t
+    {
+        MainEntered = 1u,
+        ChildEntered,
+        ChildReturned,
+        MainReturned,
+    };
+    BackendWakeRaceScenario g_backendWakeRaceScenario =
+        BackendWakeRaceScenario::BeforePark;
+    std::vector<uint64_t>
+        g_backendWakeRaceTransitions;
+    std::atomic<bool>
+        g_backendWakeRaceReleaseBeforePark{false};
+    bool g_backendWakeRaceMainCompleted = false;
+    bool g_backendWakeRaceChildCompleted = false;
+    int g_backendWakeRaceChildThreadId = 0;
+    int g_backendWakeRaceStartResult = KE_ERROR;
+    int g_backendWakeRaceSleepResult = KE_ERROR;
+    std::array<
+        uint8_t,
+        sizeof(R5900Context)>
+        g_backendWakeRaceMainContext{};
+    std::array<
+        uint8_t,
+        sizeof(R5900Context)>
+        g_backendWakeRaceChildContext{};
     std::atomic<int> g_executorAlarmSetResult{
         KE_ERROR};
     std::atomic<uint32_t>
@@ -408,6 +536,7 @@ namespace
         OrdinaryPriority,
         RawCurrentRotation,
         OrdinaryCurrentRotation,
+        OrdinaryThreeCurrentRotation,
         NamedRotation,
     };
 
@@ -589,6 +718,93 @@ namespace
             mainContext
                 ? g_backendDifferentialMainContext
                 : g_backendDifferentialChildContext;
+        std::memcpy(
+            destination.data(),
+            &context,
+            destination.size());
+    }
+
+    void recordBackendControlTransition(
+        BackendControlTransition transition,
+        int32_t value)
+    {
+        const uint64_t encoded =
+            (static_cast<uint64_t>(transition) << 32u) |
+            static_cast<uint32_t>(value);
+        std::lock_guard<std::mutex> lock(
+            g_executorFixtureMutex);
+        g_backendControlTransitions.push_back(
+            encoded);
+    }
+
+    void captureBackendControlContext(
+        const R5900Context &context,
+        bool mainContext)
+    {
+        std::lock_guard<std::mutex> lock(
+            g_executorFixtureMutex);
+        auto &destination =
+            mainContext
+                ? g_backendControlMainContext
+                : g_backendControlChildContext;
+        std::memcpy(
+            destination.data(),
+            &context,
+            destination.size());
+    }
+
+    void recordBackendIdReuseTransition(
+        BackendIdReuseTransition transition,
+        int32_t value)
+    {
+        const uint64_t encoded =
+            (static_cast<uint64_t>(transition) << 32u) |
+            static_cast<uint32_t>(value);
+        std::lock_guard<std::mutex> lock(
+            g_executorFixtureMutex);
+        g_backendIdReuseTransitions.push_back(
+            encoded);
+    }
+
+    void captureBackendIdReuseContext(
+        const R5900Context &context,
+        bool mainContext)
+    {
+        std::lock_guard<std::mutex> lock(
+            g_executorFixtureMutex);
+        auto &destination =
+            mainContext
+                ? g_backendIdReuseMainContext
+                : g_backendIdReuseChildContext;
+        std::memcpy(
+            destination.data(),
+            &context,
+            destination.size());
+    }
+
+    void recordBackendWakeRaceTransition(
+        BackendWakeRaceTransition transition,
+        int32_t value)
+    {
+        const uint64_t encoded =
+            (static_cast<uint64_t>(transition) << 32u) |
+            static_cast<uint32_t>(value);
+        std::lock_guard<std::mutex> lock(
+            g_executorFixtureMutex);
+        g_backendWakeRaceTransitions.push_back(
+            encoded);
+    }
+
+    void captureBackendWakeRaceContext(
+        const R5900Context &context,
+        bool mainContext)
+    {
+        std::lock_guard<std::mutex> lock(
+            g_executorFixtureMutex);
+        auto &destination =
+            mainContext
+                ? g_backendWakeRaceMainContext
+                : g_backendWakeRaceChildContext;
         std::memcpy(
             destination.data(),
             &context,
@@ -902,6 +1118,721 @@ namespace
         setRegU32(*ctx, 4, 0u);
         SuspendThread(rdram, ctx, runtime);
         ctx->pc = 0u;
+    }
+
+    void backendControlWaitChildHandler(
+        uint8_t *rdram,
+        R5900Context *ctx,
+        PS2Runtime *runtime)
+    {
+        BackendControlWaitKind waitKind =
+            BackendControlWaitKind::Sleep;
+        int resourceId = KE_ERROR;
+        {
+            std::lock_guard<std::mutex> lock(
+                g_executorFixtureMutex);
+            waitKind = g_backendControlWaitKind;
+            resourceId =
+                g_backendControlResourceId;
+        }
+        recordBackendControlTransition(
+            BackendControlTransition::ChildEntered,
+            runtime->currentEeThreadId());
+        writeGuestU32(
+            rdram,
+            K_BACKEND_CONTROL_STAGE_ADDR,
+            1u);
+
+        switch (waitKind)
+        {
+        case BackendControlWaitKind::Sleep:
+        case BackendControlWaitKind::WaitSuspend:
+            captureBackendControlContext(
+                *ctx, false);
+            SleepThread(rdram, ctx, runtime);
+            break;
+        case BackendControlWaitKind::Semaphore:
+            setRegU32(
+                *ctx,
+                4,
+                static_cast<uint32_t>(
+                    resourceId));
+            captureBackendControlContext(
+                *ctx, false);
+            WaitSema(rdram, ctx, runtime);
+            break;
+        case BackendControlWaitKind::Event:
+            setRegU32(
+                *ctx,
+                4,
+                static_cast<uint32_t>(
+                    resourceId));
+            setRegU32(*ctx, 5, 1u);
+            setRegU32(*ctx, 6, 1u);
+            setRegU32(*ctx, 7, 0u);
+            captureBackendControlContext(
+                *ctx, false);
+            WaitEventFlag(rdram, ctx, runtime);
+            break;
+        case BackendControlWaitKind::Suspend:
+            setRegU32(*ctx, 4, 0u);
+            captureBackendControlContext(
+                *ctx, false);
+            SuspendThread(rdram, ctx, runtime);
+            break;
+        }
+
+        writeGuestU32(
+            rdram,
+            K_BACKEND_CONTROL_STAGE_ADDR,
+            2u);
+        ctx->pc = 0u;
+    }
+
+    void backendControlWaitMainHandler(
+        uint8_t *rdram,
+        R5900Context *ctx,
+        PS2Runtime *runtime)
+    {
+        recordBackendControlTransition(
+            BackendControlTransition::MainEntered,
+            runtime->currentEeThreadId());
+        InitThread(rdram, ctx, runtime);
+        setRegU32(*ctx, 4, 0u);
+        setRegU32(*ctx, 5, 40u);
+        ChangeThreadPriority(
+            rdram, ctx, runtime);
+
+        BackendControlWaitKind waitKind =
+            BackendControlWaitKind::Sleep;
+        {
+            std::lock_guard<std::mutex> lock(
+                g_executorFixtureMutex);
+            waitKind = g_backendControlWaitKind;
+        }
+
+        int resourceId = KE_ERROR;
+        if (waitKind ==
+            BackendControlWaitKind::Semaphore)
+        {
+            const std::array<uint32_t, 6u>
+                semaphoreParameters{
+                    0u,
+                    1u,
+                    0u,
+                    0u,
+                    0u,
+                    0u,
+                };
+            writeGuestWords(
+                rdram,
+                K_CONTROL_SEMA_PARAM_ADDR,
+                semaphoreParameters.data(),
+                semaphoreParameters.size());
+            setRegU32(
+                *ctx,
+                4,
+                K_CONTROL_SEMA_PARAM_ADDR);
+            CreateSema(rdram, ctx, runtime);
+            resourceId = getRegS32(*ctx, 2);
+        }
+        else if (
+            waitKind ==
+            BackendControlWaitKind::Event)
+        {
+            const std::array<uint32_t, 3u>
+                eventParameters{
+                    0u,
+                    0u,
+                    0u,
+                };
+            writeGuestWords(
+                rdram,
+                K_CONTROL_EVENT_PARAM_ADDR,
+                eventParameters.data(),
+                eventParameters.size());
+            setRegU32(
+                *ctx,
+                4,
+                K_CONTROL_EVENT_PARAM_ADDR);
+            CreateEventFlag(rdram, ctx, runtime);
+            resourceId = getRegS32(*ctx, 2);
+        }
+        {
+            std::lock_guard<std::mutex> lock(
+                g_executorFixtureMutex);
+            g_backendControlResourceId =
+                resourceId;
+        }
+        writeGuestU32(
+            rdram,
+            K_BACKEND_CONTROL_RESULT_ADDR,
+            static_cast<uint32_t>(
+                resourceId));
+
+        const std::array<uint32_t, 9u>
+            threadParameters{
+                0u,
+                K_BACKEND_CONTROL_CHILD_ENTRY,
+                0x00320000u,
+                0x1000u,
+                0u,
+                30u,
+                0u,
+                0u,
+                0u,
+            };
+        writeGuestWords(
+            rdram,
+            K_EXECUTOR_THREAD_PARAM_ADDR,
+            threadParameters.data(),
+            threadParameters.size());
+        setRegU32(
+            *ctx,
+            4,
+            K_EXECUTOR_THREAD_PARAM_ADDR);
+        CreateThread(rdram, ctx, runtime);
+        const int childThreadId =
+            getRegS32(*ctx, 2);
+        {
+            std::lock_guard<std::mutex> lock(
+                g_executorFixtureMutex);
+            g_backendControlChildThreadId =
+                childThreadId;
+            g_backendControlCreateResult =
+                childThreadId;
+        }
+        writeGuestU32(
+            rdram,
+            K_BACKEND_CONTROL_RESULT_ADDR +
+                sizeof(uint32_t),
+            static_cast<uint32_t>(
+                childThreadId));
+
+        setRegU32(
+            *ctx,
+            4,
+            static_cast<uint32_t>(
+                childThreadId));
+        setRegU32(
+            *ctx,
+            5,
+            static_cast<uint32_t>(
+                resourceId));
+        StartThread(rdram, ctx, runtime);
+        const int startResult =
+            getRegS32(*ctx, 2);
+        {
+            std::lock_guard<std::mutex> lock(
+                g_executorFixtureMutex);
+            g_backendControlStartResult =
+                startResult;
+        }
+        writeGuestU32(
+            rdram,
+            K_BACKEND_CONTROL_RESULT_ADDR +
+                2u * sizeof(uint32_t),
+            static_cast<uint32_t>(
+                startResult));
+        recordBackendControlTransition(
+            BackendControlTransition::StartReturned,
+            startResult);
+
+        int suspendResult = KE_ERROR;
+        if (waitKind ==
+            BackendControlWaitKind::WaitSuspend)
+        {
+            setRegU32(
+                *ctx,
+                4,
+                static_cast<uint32_t>(
+                    childThreadId));
+            SuspendThread(rdram, ctx, runtime);
+            suspendResult =
+                getRegS32(*ctx, 2);
+            recordBackendControlTransition(
+                BackendControlTransition::
+                    SuspendReturned,
+                suspendResult);
+        }
+        {
+            std::lock_guard<std::mutex> lock(
+                g_executorFixtureMutex);
+            g_backendControlSuspendResult =
+                suspendResult;
+        }
+        writeGuestU32(
+            rdram,
+            K_BACKEND_CONTROL_RESULT_ADDR +
+                3u * sizeof(uint32_t),
+            static_cast<uint32_t>(
+                suspendResult));
+        writeGuestU32(
+            rdram,
+            K_BACKEND_CONTROL_RESULT_ADDR +
+                4u * sizeof(uint32_t),
+            static_cast<uint32_t>(
+                runtime->currentEeThreadId()));
+        ctx->pc = 0u;
+        captureBackendControlContext(
+            *ctx, true);
+        recordBackendControlTransition(
+            BackendControlTransition::MainReturned,
+            runtime->currentEeThreadId());
+        {
+            std::lock_guard<std::mutex> lock(
+                g_executorFixtureMutex);
+            g_backendControlMainCompleted =
+                true;
+        }
+    }
+
+    void backendIdReuseChildHandler(
+        uint8_t *rdram,
+        R5900Context *ctx,
+        PS2Runtime *runtime)
+    {
+        const int threadId =
+            runtime->currentEeThreadId();
+        recordBackendIdReuseTransition(
+            BackendIdReuseTransition::ChildEntered,
+            threadId);
+        writeGuestU32(
+            rdram,
+            K_BACKEND_ID_REUSE_RESULT_ADDR +
+                18u * sizeof(uint32_t),
+            static_cast<uint32_t>(
+                threadId));
+        SleepThread(rdram, ctx, runtime);
+        writeGuestU32(
+            rdram,
+            K_BACKEND_ID_REUSE_RESULT_ADDR +
+                15u * sizeof(uint32_t),
+            static_cast<uint32_t>(
+                getRegS32(*ctx, 2)));
+        ctx->pc = 0u;
+        captureBackendIdReuseContext(
+            *ctx, false);
+        recordBackendIdReuseTransition(
+            BackendIdReuseTransition::ChildReturned,
+            threadId);
+        {
+            std::lock_guard<std::mutex> lock(
+                g_executorFixtureMutex);
+            g_backendIdReuseChildCompleted =
+                true;
+        }
+    }
+
+    void backendIdReuseMainHandler(
+        uint8_t *rdram,
+        R5900Context *ctx,
+        PS2Runtime *runtime)
+    {
+        const auto writeResult =
+            [rdram](size_t index, int32_t value)
+            {
+                writeGuestU32(
+                    rdram,
+                    K_BACKEND_ID_REUSE_RESULT_ADDR +
+                        static_cast<uint32_t>(
+                            index *
+                            sizeof(uint32_t)),
+                    static_cast<uint32_t>(
+                        value));
+            };
+        recordBackendIdReuseTransition(
+            BackendIdReuseTransition::MainEntered,
+            runtime->currentEeThreadId());
+        InitThread(rdram, ctx, runtime);
+        setRegU32(*ctx, 4, 0u);
+        setRegU32(*ctx, 5, 40u);
+        ChangeThreadPriority(
+            rdram, ctx, runtime);
+
+        const std::array<uint32_t, 9u>
+            threadParameters{
+                0u,
+                K_BACKEND_ID_REUSE_CHILD_ENTRY,
+                0x00330000u,
+                0x1000u,
+                0u,
+                30u,
+                0u,
+                0u,
+                0u,
+            };
+        writeGuestWords(
+            rdram,
+            K_EXECUTOR_THREAD_PARAM_ADDR,
+            threadParameters.data(),
+            threadParameters.size());
+        const auto createThread =
+            [rdram, ctx, runtime]()
+            {
+                setRegU32(
+                    *ctx,
+                    4,
+                    K_EXECUTOR_THREAD_PARAM_ADDR);
+                CreateThread(rdram, ctx, runtime);
+                return getRegS32(*ctx, 2);
+            };
+        const auto deleteThread =
+            [rdram, ctx, runtime](int threadId)
+            {
+                setRegU32(
+                    *ctx,
+                    4,
+                    static_cast<uint32_t>(
+                        threadId));
+                DeleteThread(rdram, ctx, runtime);
+                return getRegS32(*ctx, 2);
+            };
+
+        const int firstThreadId =
+            createThread();
+        const int keeperThreadId =
+            createThread();
+        {
+            std::lock_guard<std::mutex> lock(
+                g_executorFixtureMutex);
+            g_backendIdReuseStaleHandle =
+                captureEeThreadHandle(
+                    runtime,
+                    firstThreadId);
+        }
+        writeResult(0u, firstThreadId);
+        writeResult(1u, keeperThreadId);
+        writeResult(
+            2u,
+            deleteThread(firstThreadId));
+
+        setRegU32(
+            *ctx,
+            4,
+            static_cast<uint32_t>(
+                firstThreadId));
+        iWakeupThread(rdram, ctx, runtime);
+        writeResult(
+            3u,
+            getRegS32(*ctx, 2));
+
+        std::vector<int> dormantThreadIds;
+        dormantThreadIds.reserve(252u);
+        uint32_t ringErrors = 0u;
+        for (int expectedThreadId = 4;
+             expectedThreadId <= 0xFF;
+             ++expectedThreadId)
+        {
+            const int threadId =
+                createThread();
+            if (threadId != expectedThreadId)
+            {
+                ++ringErrors;
+            }
+            if (threadId > 0)
+            {
+                dormantThreadIds.push_back(
+                    threadId);
+            }
+        }
+        writeResult(
+            4u,
+            static_cast<int32_t>(
+                dormantThreadIds.size()));
+        writeResult(
+            5u,
+            dormantThreadIds.empty()
+                ? KE_ERROR
+                : dormantThreadIds.front());
+        writeResult(
+            6u,
+            dormantThreadIds.empty()
+                ? KE_ERROR
+                : dormantThreadIds.back());
+
+        const int replacementThreadId =
+            createThread();
+        writeResult(
+            7u,
+            replacementThreadId);
+        setRegU32(
+            *ctx,
+            4,
+            static_cast<uint32_t>(
+                replacementThreadId));
+        setRegU32(*ctx, 5, 0u);
+        StartThread(rdram, ctx, runtime);
+        writeResult(
+            8u,
+            getRegS32(*ctx, 2));
+        {
+            std::lock_guard<std::mutex> lock(
+                g_executorFixtureMutex);
+            g_backendIdReuseReplacementHandle =
+                captureEeThreadHandle(
+                    runtime,
+                    replacementThreadId);
+        }
+        g_backendIdReuseAtPublicationGate.store(
+            true, std::memory_order_release);
+        while (!g_backendIdReuseReleasePublicationGate
+                    .load(
+                        std::memory_order_acquire))
+        {
+            std::this_thread::yield();
+        }
+
+        setRegU32(
+            *ctx,
+            4,
+            static_cast<uint32_t>(
+                firstThreadId));
+        iWakeupThread(rdram, ctx, runtime);
+        writeResult(
+            9u,
+            getRegS32(*ctx, 2));
+
+        std::memset(
+            rdram + K_STATUS_ADDR,
+            0,
+            sizeof(EeThreadStatus));
+        setRegU32(
+            *ctx,
+            4,
+            static_cast<uint32_t>(
+                replacementThreadId));
+        setRegU32(
+            *ctx,
+            5,
+            K_STATUS_ADDR);
+        iReferThreadStatus(
+            rdram, ctx, runtime);
+        writeResult(
+            10u,
+            getRegS32(*ctx, 2));
+        EeThreadStatus readyStatus{};
+        std::memcpy(
+            &readyStatus,
+            rdram + K_STATUS_ADDR,
+            sizeof(readyStatus));
+        writeResult(
+            11u,
+            readyStatus.status);
+        writeResult(
+            12u,
+            static_cast<int32_t>(
+                readyStatus.waitType));
+        writeResult(
+            13u,
+            static_cast<int32_t>(
+                readyStatus.wakeupCount));
+
+        setRegU32(*ctx, 4, 0u);
+        setRegU32(*ctx, 5, 60u);
+        ChangeThreadPriority(
+            rdram, ctx, runtime);
+        writeResult(
+            14u,
+            getRegS32(*ctx, 2));
+
+        uint32_t cleanupErrors =
+            ringErrors;
+        const int replacementDeleteResult =
+            deleteThread(
+                replacementThreadId);
+        writeResult(
+            16u,
+            replacementDeleteResult);
+        if (replacementDeleteResult !=
+            replacementThreadId)
+        {
+            ++cleanupErrors;
+        }
+        for (const int threadId :
+             dormantThreadIds)
+        {
+            if (deleteThread(threadId) !=
+                threadId)
+            {
+                ++cleanupErrors;
+            }
+        }
+        if (deleteThread(keeperThreadId) !=
+            keeperThreadId)
+        {
+            ++cleanupErrors;
+        }
+        writeResult(
+            17u,
+            static_cast<int32_t>(
+                cleanupErrors));
+        writeResult(
+            19u,
+            runtime->currentEeThreadId());
+
+        ctx->pc = 0u;
+        captureBackendIdReuseContext(
+            *ctx, true);
+        recordBackendIdReuseTransition(
+            BackendIdReuseTransition::MainReturned,
+            runtime->currentEeThreadId());
+        {
+            std::lock_guard<std::mutex> lock(
+                g_executorFixtureMutex);
+            g_backendIdReuseMainCompleted =
+                true;
+        }
+    }
+
+    void backendWakeRaceChildHandler(
+        uint8_t *rdram,
+        R5900Context *ctx,
+        PS2Runtime *runtime)
+    {
+        BackendWakeRaceScenario scenario =
+            BackendWakeRaceScenario::BeforePark;
+        {
+            std::lock_guard<std::mutex> lock(
+                g_executorFixtureMutex);
+            scenario =
+                g_backendWakeRaceScenario;
+        }
+        const int threadId =
+            runtime->currentEeThreadId();
+        recordBackendWakeRaceTransition(
+            BackendWakeRaceTransition::ChildEntered,
+            threadId);
+        writeGuestU32(
+            rdram,
+            K_BACKEND_WAKE_RACE_RESULT_ADDR +
+                4u * sizeof(uint32_t),
+            static_cast<uint32_t>(
+                threadId));
+        if (scenario ==
+            BackendWakeRaceScenario::BeforePark)
+        {
+            while (!g_backendWakeRaceReleaseBeforePark
+                        .load(
+                            std::memory_order_acquire))
+            {
+                std::this_thread::yield();
+            }
+        }
+        captureBackendWakeRaceContext(
+            *ctx, false);
+        SleepThread(rdram, ctx, runtime);
+        const int sleepResult =
+            getRegS32(*ctx, 2);
+        writeGuestU32(
+            rdram,
+            K_BACKEND_WAKE_RACE_RESULT_ADDR +
+                2u * sizeof(uint32_t),
+            static_cast<uint32_t>(
+                sleepResult));
+        ctx->pc = 0u;
+        captureBackendWakeRaceContext(
+            *ctx, false);
+        recordBackendWakeRaceTransition(
+            BackendWakeRaceTransition::ChildReturned,
+            threadId);
+        {
+            std::lock_guard<std::mutex> lock(
+                g_executorFixtureMutex);
+            g_backendWakeRaceSleepResult =
+                sleepResult;
+            g_backendWakeRaceChildCompleted =
+                true;
+        }
+    }
+
+    void backendWakeRaceMainHandler(
+        uint8_t *rdram,
+        R5900Context *ctx,
+        PS2Runtime *runtime)
+    {
+        recordBackendWakeRaceTransition(
+            BackendWakeRaceTransition::MainEntered,
+            runtime->currentEeThreadId());
+        InitThread(rdram, ctx, runtime);
+        setRegU32(*ctx, 4, 0u);
+        setRegU32(*ctx, 5, 40u);
+        ChangeThreadPriority(
+            rdram, ctx, runtime);
+        const std::array<uint32_t, 9u>
+            threadParameters{
+                0u,
+                K_BACKEND_WAKE_RACE_CHILD_ENTRY,
+                0x00340000u,
+                0x1000u,
+                0u,
+                30u,
+                0u,
+                0u,
+                0u,
+            };
+        writeGuestWords(
+            rdram,
+            K_EXECUTOR_THREAD_PARAM_ADDR,
+            threadParameters.data(),
+            threadParameters.size());
+        setRegU32(
+            *ctx,
+            4,
+            K_EXECUTOR_THREAD_PARAM_ADDR);
+        CreateThread(rdram, ctx, runtime);
+        const int childThreadId =
+            getRegS32(*ctx, 2);
+        writeGuestU32(
+            rdram,
+            K_BACKEND_WAKE_RACE_RESULT_ADDR,
+            static_cast<uint32_t>(
+                childThreadId));
+        {
+            std::lock_guard<std::mutex> lock(
+                g_executorFixtureMutex);
+            g_backendWakeRaceChildThreadId =
+                childThreadId;
+        }
+        setRegU32(
+            *ctx,
+            4,
+            static_cast<uint32_t>(
+                childThreadId));
+        setRegU32(*ctx, 5, 0u);
+        StartThread(rdram, ctx, runtime);
+        const int startResult =
+            getRegS32(*ctx, 2);
+        writeGuestU32(
+            rdram,
+            K_BACKEND_WAKE_RACE_RESULT_ADDR +
+                sizeof(uint32_t),
+            static_cast<uint32_t>(
+                startResult));
+        writeGuestU32(
+            rdram,
+            K_BACKEND_WAKE_RACE_RESULT_ADDR +
+                3u * sizeof(uint32_t),
+            static_cast<uint32_t>(
+                runtime->currentEeThreadId()));
+        {
+            std::lock_guard<std::mutex> lock(
+                g_executorFixtureMutex);
+            g_backendWakeRaceStartResult =
+                startResult;
+        }
+        ctx->pc = 0u;
+        captureBackendWakeRaceContext(
+            *ctx, true);
+        recordBackendWakeRaceTransition(
+            BackendWakeRaceTransition::MainReturned,
+            runtime->currentEeThreadId());
+        {
+            std::lock_guard<std::mutex> lock(
+                g_executorFixtureMutex);
+            g_backendWakeRaceMainCompleted =
+                true;
+        }
     }
 
     void rescheduleMarkerHandler(
@@ -2923,6 +3854,22 @@ namespace
             recordMain(3);
             break;
 
+        case ExecutorPriorityScenario::
+            OrdinaryThreeCurrentRotation:
+            firstThreadId =
+                createAndStart(
+                    0x00317000u, 40u, 2u);
+            secondThreadId =
+                createAndStart(
+                    0x00317800u, 40u, 3u);
+            recordMain(1);
+            setRegU32(*ctx, 4, 40u);
+            RotateThreadReadyQueue(
+                rdram, ctx, runtime);
+            operationResult = getRegS32(*ctx, 2);
+            recordMain(4);
+            break;
+
         case ExecutorPriorityScenario::NamedRotation:
             firstThreadId =
                 createAndStart(
@@ -3727,6 +4674,62 @@ namespace
             runtime
                 .managedEeExecutionThreadCountForTesting();
         return result;
+    }
+
+    struct BackendFixtureEvidence
+    {
+        bool executionQuiescent = false;
+        bool memoryCaptured = false;
+        std::vector<
+            PS2Runtime::EeThreadContextImageForTesting>
+            contexts;
+        std::vector<uint8_t> memory;
+        uint64_t eventCount = 0u;
+        uint64_t modeledTick = 0u;
+    };
+
+    void beginBackendFixtureEvidence(
+        PS2Runtime &runtime)
+    {
+        runtime.debugStartEeEventTrace(64u);
+    }
+
+    BackendFixtureEvidence captureBackendFixtureEvidence(
+        PS2Runtime &runtime)
+    {
+        BackendFixtureEvidence evidence{};
+        evidence.executionQuiescent = waitUntil(
+            [&runtime]()
+            {
+                return runtime
+                    .eeExecutionQuiescentForTesting();
+            },
+            std::chrono::seconds(2));
+        evidence.contexts =
+            runtime.eeThreadContextsForTesting();
+        evidence.memoryCaptured =
+            runtime.debugReadRdram(
+                0u, PS2_RAM_SIZE, evidence.memory);
+        evidence.eventCount =
+            runtime.debugEeEventTraceSnapshot(true)
+                .totalEntries;
+        evidence.modeledTick =
+            runtime.currentEeTick().raw();
+        return evidence;
+    }
+
+    bool sameBackendFixtureEvidence(
+        const BackendFixtureEvidence &lhs,
+        const BackendFixtureEvidence &rhs)
+    {
+        return lhs.executionQuiescent &&
+               rhs.executionQuiescent &&
+               lhs.memoryCaptured &&
+               rhs.memoryCaptured &&
+               lhs.contexts == rhs.contexts &&
+               lhs.memory == rhs.memory &&
+               lhs.eventCount == rhs.eventCount &&
+               lhs.modeledTick == rhs.modeledTick;
     }
 
     struct TestEnv
@@ -4885,6 +5888,7 @@ void register_ps2_runtime_kernel_tests()
                     uint32_t rawWaitType = 0u;
                     uint32_t rawWaitId = 0u;
                     bool rawCompletionPending = false;
+                    BackendFixtureEvidence evidence;
                 };
 
                 const auto runFixture =
@@ -5038,6 +6042,7 @@ void register_ps2_runtime_kernel_tests()
                                 }
                             });
 
+                        beginBackendFixtureEvidence(runtime);
                         runtime
                             .startEeExecutionForTesting();
                         result.completed = waitUntil(
@@ -5052,6 +6057,9 @@ void register_ps2_runtime_kernel_tests()
                             },
                             std::chrono::seconds(2));
                         rescue.join();
+                        result.evidence =
+                            captureBackendFixtureEvidence(
+                                runtime);
                         runtime
                             .stopEeExecutionForTesting();
 
@@ -5205,6 +6213,15 @@ void register_ps2_runtime_kernel_tests()
                             " should preserve identical "
                             "syscall results and dispatch "
                             "timing");
+                    t.IsTrue(
+                        sameBackendFixtureEvidence(
+                            host.evidence,
+                            fiber.evidence),
+                        std::string(name) +
+                            " should leave identical "
+                            "surviving contexts, full "
+                            "RDRAM, event totals, and "
+                            "modeled ticks");
                     if (raw)
                     {
                         t.IsTrue(
@@ -5266,6 +6283,7 @@ void register_ps2_runtime_kernel_tests()
                     bool childRanInsideOperation = false;
                     int rawStatus = KE_ERROR;
                     uint32_t rawWaitType = 0u;
+                    BackendFixtureEvidence evidence;
                 };
 
                 const auto runFixture =
@@ -5417,6 +6435,7 @@ void register_ps2_runtime_kernel_tests()
                                 }
                             });
 
+                        beginBackendFixtureEvidence(runtime);
                         runtime
                             .startEeExecutionForTesting();
                         result.completed = waitUntil(
@@ -5431,6 +6450,9 @@ void register_ps2_runtime_kernel_tests()
                             },
                             std::chrono::seconds(2));
                         rescue.join();
+                        result.evidence =
+                            captureBackendFixtureEvidence(
+                                runtime);
                         runtime
                             .stopEeExecutionForTesting();
 
@@ -5578,6 +6600,15 @@ void register_ps2_runtime_kernel_tests()
                             " should preserve identical "
                             "event results and dispatch "
                             "timing");
+                    t.IsTrue(
+                        sameBackendFixtureEvidence(
+                            host.evidence,
+                            fiber.evidence),
+                        std::string(name) +
+                            " should leave identical "
+                            "surviving contexts, full "
+                            "RDRAM, event totals, and "
+                            "modeled ticks");
                     if (raw)
                     {
                         t.IsTrue(
@@ -5618,6 +6649,7 @@ void register_ps2_runtime_kernel_tests()
                     uint32_t clearBits = 0u;
                     uint32_t retainBits = 0u;
                     bool retainedWait = false;
+                    BackendFixtureEvidence evidence;
                 };
 
                 const auto runFixture =
@@ -5671,6 +6703,7 @@ void register_ps2_runtime_kernel_tests()
                                 false;
                         }
 
+                        beginBackendFixtureEvidence(runtime);
                         runtime
                             .startEeExecutionForTesting();
                         result.completed = waitUntil(
@@ -5684,6 +6717,9 @@ void register_ps2_runtime_kernel_tests()
                                            .size() == 6u;
                             },
                             std::chrono::seconds(2));
+                        result.evidence =
+                            captureBackendFixtureEvidence(
+                                runtime);
                         runtime
                             .stopEeExecutionForTesting();
 
@@ -5750,6 +6786,14 @@ void register_ps2_runtime_kernel_tests()
                     "consume the first publication before "
                     "the second predicate is evaluated "
                     "under both backends");
+                t.IsTrue(
+                    sameBackendFixtureEvidence(
+                        host.evidence,
+                        fiber.evidence),
+                    "event FIFO clear should leave "
+                    "identical surviving contexts, full "
+                    "RDRAM, event totals, and modeled "
+                    "ticks");
             });
 
         tc.Run(
@@ -5774,6 +6818,7 @@ void register_ps2_runtime_kernel_tests()
                     int resumeResult = KE_ERROR;
                     int statusBeforeWake = KE_ERROR;
                     int statusAfterWake = KE_ERROR;
+                    BackendFixtureEvidence evidence;
                 };
 
                 const auto runFixture =
@@ -5850,6 +6895,7 @@ void register_ps2_runtime_kernel_tests()
                                 KE_ERROR;
                         }
 
+                        beginBackendFixtureEvidence(runtime);
                         runtime
                             .startEeExecutionForTesting();
                         result.completed = waitUntil(
@@ -5863,6 +6909,9 @@ void register_ps2_runtime_kernel_tests()
                                            .size() == 4u;
                             },
                             std::chrono::seconds(2));
+                        result.evidence =
+                            captureBackendFixtureEvidence(
+                                runtime);
                         runtime
                             .stopEeExecutionForTesting();
 
@@ -5974,6 +7023,15 @@ void register_ps2_runtime_kernel_tests()
                             " should preserve identical "
                             "syscall results and suspended "
                             "status");
+                    t.IsTrue(
+                        sameBackendFixtureEvidence(
+                            host.evidence,
+                            fiber.evidence),
+                        std::string(name) +
+                            " should leave identical "
+                            "surviving contexts, full "
+                            "RDRAM, event totals, and "
+                            "modeled ticks");
                     if (waitSuspend)
                     {
                         t.IsTrue(
@@ -6022,6 +7080,7 @@ void register_ps2_runtime_kernel_tests()
                     bool targetReturned = false;
                     bool schedulerTargetPresent = true;
                     size_t managedContinuations = 1u;
+                    BackendFixtureEvidence evidence;
                 };
 
                 const auto runFixture =
@@ -6086,6 +7145,7 @@ void register_ps2_runtime_kernel_tests()
                                 false;
                         }
 
+                        beginBackendFixtureEvidence(runtime);
                         runtime
                             .startEeExecutionForTesting();
                         result.completed = waitUntil(
@@ -6153,6 +7213,9 @@ void register_ps2_runtime_kernel_tests()
                                 .schedulerTargetPresent =
                                 false;
                         }
+                        result.evidence =
+                            captureBackendFixtureEvidence(
+                                runtime);
                         runtime
                             .stopEeExecutionForTesting();
                         result.managedContinuations =
@@ -6292,6 +7355,15 @@ void register_ps2_runtime_kernel_tests()
                             " should delete backend "
                             "ownership and its "
                             "continuation");
+                    t.IsTrue(
+                        sameBackendFixtureEvidence(
+                            host.evidence,
+                            fiber.evidence),
+                        std::string(name) +
+                            " should leave identical "
+                            "surviving contexts, full "
+                            "RDRAM, event totals, and "
+                            "modeled ticks");
                 }
             });
 
@@ -6332,6 +7404,7 @@ void register_ps2_runtime_kernel_tests()
                     bool schedulerExitDeleteThreadPresent =
                         true;
                     size_t managedContinuations = 1u;
+                    BackendFixtureEvidence evidence;
                 };
 
                 const auto runFixture =
@@ -6393,6 +7466,7 @@ void register_ps2_runtime_kernel_tests()
                             KE_ERROR;
                     }
 
+                    beginBackendFixtureEvidence(runtime);
                     runtime
                         .startEeExecutionForTesting();
                     result.completed = waitUntil(
@@ -6491,6 +7565,9 @@ void register_ps2_runtime_kernel_tests()
                             false;
                     }
 
+                    result.evidence =
+                        captureBackendFixtureEvidence(
+                            runtime);
                     runtime.stopEeExecutionForTesting();
                     result.managedContinuations =
                         runtime
@@ -6628,6 +7705,14 @@ void register_ps2_runtime_kernel_tests()
                     "self-exit lifecycle should retire "
                     "backend continuation ownership "
                     "exactly once");
+                t.IsTrue(
+                    sameBackendFixtureEvidence(
+                        host.evidence,
+                        fiber.evidence),
+                    "self-exit lifecycle should leave "
+                    "identical surviving contexts, full "
+                    "RDRAM, event totals, and modeled "
+                    "ticks");
             });
 
         tc.Run(
@@ -6657,6 +7742,7 @@ void register_ps2_runtime_kernel_tests()
                     bool schedulerValid = false;
                     bool schedulerInspected = false;
                     size_t managedContinuations = 1u;
+                    BackendFixtureEvidence evidence;
                 };
 
                 const auto runFixture =
@@ -6714,6 +7800,7 @@ void register_ps2_runtime_kernel_tests()
                                 0;
                         }
 
+                        beginBackendFixtureEvidence(runtime);
                         runtime
                             .startEeExecutionForTesting();
                         result.completed = waitUntil(
@@ -6809,6 +7896,9 @@ void register_ps2_runtime_kernel_tests()
                                         EeSchedulerReschedulePolicy::
                                             None);
                         }
+                        result.evidence =
+                            captureBackendFixtureEvidence(
+                                runtime);
                         runtime
                             .stopEeExecutionForTesting();
                         result.managedContinuations =
@@ -6837,9 +7927,27 @@ void register_ps2_runtime_kernel_tests()
                     int firstPriority;
                     int secondPriority;
                 };
+                const auto describeOrder =
+                    [](const std::vector<int> &order)
+                    {
+                        std::ostringstream stream;
+                        stream << '[';
+                        for (size_t index = 0u;
+                             index < order.size();
+                             ++index)
+                        {
+                            if (index != 0u)
+                            {
+                                stream << ',';
+                            }
+                            stream << order[index];
+                        }
+                        stream << ']';
+                        return stream.str();
+                    };
                 const std::array<
                     ScenarioExpectation,
-                    5u>
+                    6u>
                     expectations{{
                         {
                             ExecutorPriorityScenario::
@@ -6891,6 +7999,18 @@ void register_ps2_runtime_kernel_tests()
                         },
                         {
                             ExecutorPriorityScenario::
+                                OrdinaryThreeCurrentRotation,
+                            "ordinary three-thread current-priority rotation",
+                            {1, 2, 3, 4},
+                            40,
+                            KE_ERROR,
+                            -1,
+                            40,
+                            40,
+                            40,
+                        },
+                        {
+                            ExecutorPriorityScenario::
                                 NamedRotation,
                             "named lower-priority rotation",
                             {1, 4, 3, 2, 5},
@@ -6934,11 +8054,19 @@ void register_ps2_runtime_kernel_tests()
                                       .secondThreadId)) &&
                             host.order ==
                                 expectation.order &&
-                            fiber.order == host.order,
+                        fiber.order == host.order,
                         std::string(expectation.name) +
                             " should preserve the same "
                             "PCSX2 ordinary/raw order "
-                            "under both backends");
+                            "under both backends "
+                            "(expected=" +
+                            describeOrder(
+                                expectation.order) +
+                            ", host=" +
+                            describeOrder(host.order) +
+                            ", fiber=" +
+                            describeOrder(fiber.order) +
+                            ")");
                     t.IsTrue(
                         host.operationResult ==
                                 expectation
@@ -6979,7 +8107,1793 @@ void register_ps2_runtime_kernel_tests()
                             " should keep scheduler "
                             "priority and ownership "
                             "authoritative");
+                    t.IsTrue(
+                        sameBackendFixtureEvidence(
+                            host.evidence,
+                            fiber.evidence),
+                        std::string(expectation.name) +
+                            " should leave identical "
+                            "surviving contexts, full "
+                            "RDRAM, event totals, and "
+                            "modeled ticks");
                 }
+            });
+
+        tc.Run(
+            "legacy EE backends agree on debugger control across every Phase-0 wait state",
+            [](TestCase &t)
+            {
+                if (!eeExecutionBackendBuildInfo()
+                         .boostContextFcontextAvailable)
+                {
+                    return;
+                }
+
+                struct WaitExpectation
+                {
+                    BackendControlWaitKind kind;
+                    const char *name;
+                    int status;
+                    uint32_t waitType;
+                    int waitQueue;
+                    int resourceId;
+                };
+                constexpr std::array<
+                    WaitExpectation,
+                    5u>
+                    expectations{{
+                        {
+                            BackendControlWaitKind::
+                                Sleep,
+                            "sleep",
+                            THS_WAIT,
+                            TSW_SLEEP,
+                            1,
+                            KE_ERROR,
+                        },
+                        {
+                            BackendControlWaitKind::
+                                Semaphore,
+                            "semaphore",
+                            THS_WAIT,
+                            TSW_SEMA,
+                            2,
+                            0,
+                        },
+                        {
+                            BackendControlWaitKind::
+                                Event,
+                            "event",
+                            THS_WAIT,
+                            TSW_EVENT,
+                            3,
+                            1,
+                        },
+                        {
+                            BackendControlWaitKind::
+                                Suspend,
+                            "suspend",
+                            THS_SUSPEND,
+                            0u,
+                            0,
+                            KE_ERROR,
+                        },
+                        {
+                            BackendControlWaitKind::
+                                WaitSuspend,
+                            "wait-suspend",
+                            THS_WAITSUSPEND,
+                            TSW_SLEEP,
+                            1,
+                            KE_ERROR,
+                        },
+                    }};
+                enum class TeardownKind
+                {
+                    Shutdown,
+                    KernelReset,
+                };
+                constexpr std::array<
+                    std::pair<
+                        TeardownKind,
+                        const char *>,
+                    2u>
+                    teardowns{{
+                        {
+                            TeardownKind::Shutdown,
+                            "shutdown",
+                        },
+                        {
+                            TeardownKind::KernelReset,
+                            "kernel reset",
+                        },
+                    }};
+
+                struct FixtureResult
+                {
+                    bool memoryInitialized = false;
+                    bool reachedWait = false;
+                    bool paused = false;
+                    bool snapshotBeforeFound = false;
+                    bool snapshotPausedFound = false;
+                    std::string backendName;
+                    int resourceId = KE_ERROR;
+                    int childThreadId = 0;
+                    int createResult = KE_ERROR;
+                    int startResult = KE_ERROR;
+                    int suspendResult = KE_ERROR;
+                    GuestThreadDebugSnapshot before{};
+                    GuestThreadDebugSnapshot pausedSnapshot{};
+                    std::vector<uint64_t> transitions;
+                    std::array<
+                        uint32_t,
+                        K_BACKEND_CONTROL_RESULT_WORDS>
+                        memory{};
+                    std::array<
+                        uint8_t,
+                        sizeof(R5900Context)>
+                        mainContext{};
+                    std::array<
+                        uint8_t,
+                        sizeof(R5900Context)>
+                        childContext{};
+                    uint32_t stageBeforeTeardown = 0u;
+                    uint32_t stageAfterTeardown = 0u;
+                    uint64_t eventCount = 0u;
+                    uint64_t modeledTick = 0u;
+                    bool stopRequestedAfterTeardown =
+                        true;
+                    bool teardownCompleted = false;
+                    size_t managedAfterTeardown = 1u;
+                    size_t threadsAfterTeardown = 1u;
+                };
+
+                const auto sameSnapshot =
+                    [](const GuestThreadDebugSnapshot &lhs,
+                       const GuestThreadDebugSnapshot &rhs)
+                    {
+                        return lhs.id == rhs.id &&
+                               lhs.entry == rhs.entry &&
+                               lhs.stack == rhs.stack &&
+                               lhs.stackSize ==
+                                   rhs.stackSize &&
+                               lhs.gp == rhs.gp &&
+                               lhs.pc == rhs.pc &&
+                               lhs.status == rhs.status &&
+                               lhs.waitType ==
+                                   rhs.waitType &&
+                               lhs.waitId == rhs.waitId &&
+                               lhs.wakeupCount ==
+                                   rhs.wakeupCount &&
+                               lhs.currentPriority ==
+                                   rhs.currentPriority &&
+                               lhs.suspendCount ==
+                                   rhs.suspendCount &&
+                               lhs.waitQueue ==
+                                   rhs.waitQueue &&
+                               lhs.waitQueueId ==
+                                   rhs.waitQueueId &&
+                               lhs.waitCompletionPending ==
+                                   rhs
+                                       .waitCompletionPending &&
+                               lhs.stateValid ==
+                                   rhs.stateValid &&
+                               lhs.started == rhs.started &&
+                               lhs.forceRelease ==
+                                   rhs.forceRelease &&
+                               lhs.terminated ==
+                                   rhs.terminated;
+                    };
+
+                const auto runFixture =
+                    [](BackendControlWaitKind waitKind,
+                       int expectedStatus,
+                       uint32_t expectedWaitType,
+                       EeExecutionBackendKind backendKind,
+                       TeardownKind teardownKind)
+                    {
+                        FixtureResult result{};
+                        PS2RuntimeConfiguration
+                            configuration{};
+                        configuration.eeExecutionBackend =
+                            backendKind;
+                        configuration
+                            .useEeExecutionBackendEnvironment =
+                            false;
+                        PS2Runtime runtime(configuration);
+                        result.backendName =
+                            runtime.eeExecutionBackendName();
+                        result.memoryInitialized =
+                            runtime.memory().initialize();
+                        if (!result.memoryInitialized)
+                        {
+                            return result;
+                        }
+                        uint8_t *const rdram =
+                            runtime.memory().getRDRAM();
+                        runtime.registerFunction(
+                            K_BACKEND_CONTROL_MAIN_ENTRY,
+                            &backendControlWaitMainHandler);
+                        runtime.registerFunction(
+                            K_BACKEND_CONTROL_CHILD_ENTRY,
+                            &backendControlWaitChildHandler);
+                        runtime.cpu().pc =
+                            K_BACKEND_CONTROL_MAIN_ENTRY;
+                        setRegU32(
+                            runtime.cpu(),
+                            29,
+                            0x00300000u);
+                        const std::array<
+                            uint32_t,
+                            K_BACKEND_CONTROL_RESULT_WORDS>
+                            initialMemory{
+                                0xfeed1000u,
+                                0xfeed1001u,
+                                0xfeed1002u,
+                                0xfeed1003u,
+                                0xfeed1004u,
+                            };
+                        writeGuestWords(
+                            rdram,
+                            K_BACKEND_CONTROL_RESULT_ADDR,
+                            initialMemory.data(),
+                            initialMemory.size());
+                        writeGuestU32(
+                            rdram,
+                            K_BACKEND_CONTROL_STAGE_ADDR,
+                            0u);
+                        {
+                            std::lock_guard<std::mutex>
+                                lock(
+                                    g_executorFixtureMutex);
+                            g_backendControlWaitKind =
+                                waitKind;
+                            g_backendControlTransitions
+                                .clear();
+                            g_backendControlResourceId =
+                                KE_ERROR;
+                            g_backendControlChildThreadId =
+                                0;
+                            g_backendControlCreateResult =
+                                KE_ERROR;
+                            g_backendControlStartResult =
+                                KE_ERROR;
+                            g_backendControlSuspendResult =
+                                KE_ERROR;
+                            g_backendControlMainCompleted =
+                                false;
+                            g_backendControlMainContext
+                                .fill(0u);
+                            g_backendControlChildContext
+                                .fill(0u);
+                        }
+                        runtime.debugStartEeEventTrace(
+                            16u);
+                        runtime
+                            .startEeExecutionForTesting();
+
+                        const auto captureChild =
+                            [&runtime](
+                                int childThreadId,
+                                GuestThreadDebugSnapshot
+                                    &snapshot)
+                            {
+                                for (const auto &candidate :
+                                     debugThreadSnapshots(
+                                         &runtime))
+                                {
+                                    if (candidate.id ==
+                                        childThreadId)
+                                    {
+                                        snapshot =
+                                            candidate;
+                                        return true;
+                                    }
+                                }
+                                return false;
+                            };
+                        result.reachedWait =
+                            waitUntil(
+                                [&]()
+                                {
+                                    int childThreadId =
+                                        0;
+                                    bool mainCompleted =
+                                        false;
+                                    {
+                                        std::lock_guard<
+                                            std::mutex>
+                                            lock(
+                                                g_executorFixtureMutex);
+                                        childThreadId =
+                                            g_backendControlChildThreadId;
+                                        mainCompleted =
+                                            g_backendControlMainCompleted;
+                                    }
+                                    GuestThreadDebugSnapshot
+                                        snapshot{};
+                                    if (!mainCompleted ||
+                                        childThreadId <=
+                                            1 ||
+                                        readGuestU32(
+                                            rdram,
+                                            K_BACKEND_CONTROL_STAGE_ADDR) !=
+                                            1u ||
+                                        !captureChild(
+                                            childThreadId,
+                                            snapshot))
+                                    {
+                                        return false;
+                                    }
+                                    return snapshot.status ==
+                                               expectedStatus &&
+                                           snapshot.waitType ==
+                                               expectedWaitType;
+                                },
+                                std::chrono::seconds(
+                                    2));
+                        {
+                            std::lock_guard<std::mutex>
+                                lock(
+                                    g_executorFixtureMutex);
+                            result.resourceId =
+                                g_backendControlResourceId;
+                            result.childThreadId =
+                                g_backendControlChildThreadId;
+                            result.createResult =
+                                g_backendControlCreateResult;
+                            result.startResult =
+                                g_backendControlStartResult;
+                            result.suspendResult =
+                                g_backendControlSuspendResult;
+                        }
+                        if (result.reachedWait)
+                        {
+                            result.snapshotBeforeFound =
+                                captureChild(
+                                    result.childThreadId,
+                                    result.before);
+                            result.paused =
+                                runtime.debugPause(
+                                    std::chrono::
+                                        milliseconds(
+                                            500));
+                            if (result.paused)
+                            {
+                                result
+                                    .snapshotPausedFound =
+                                    captureChild(
+                                        result.childThreadId,
+                                        result
+                                            .pausedSnapshot);
+                                runtime.debugResume();
+                            }
+                        }
+
+                        {
+                            std::lock_guard<std::mutex>
+                                lock(
+                                    g_executorFixtureMutex);
+                            result.transitions =
+                                g_backendControlTransitions;
+                            result.mainContext =
+                                g_backendControlMainContext;
+                            result.childContext =
+                                g_backendControlChildContext;
+                        }
+                        for (size_t index = 0u;
+                             index < result.memory.size();
+                             ++index)
+                        {
+                            result.memory[index] =
+                                readGuestU32(
+                                    rdram,
+                                    K_BACKEND_CONTROL_RESULT_ADDR +
+                                        static_cast<
+                                            uint32_t>(
+                                            index *
+                                            sizeof(
+                                                uint32_t)));
+                        }
+                        result.stageBeforeTeardown =
+                            readGuestU32(
+                                rdram,
+                                K_BACKEND_CONTROL_STAGE_ADDR);
+                        result.eventCount =
+                            runtime
+                                .debugEeEventTraceSnapshot(
+                                    true)
+                                .totalEntries;
+                        result.modeledTick =
+                            runtime.currentEeTick().raw();
+                        if (teardownKind ==
+                            TeardownKind::KernelReset)
+                        {
+                            notifyRuntimeStop(&runtime);
+                            result
+                                .stopRequestedAfterTeardown =
+                                runtime.isStopRequested();
+                            result.teardownCompleted =
+                                waitUntil(
+                                    [&runtime]()
+                                    {
+                                        return runtime
+                                                       .managedEeExecutionThreadCountForTesting() ==
+                                                   0u &&
+                                               debugThreadSnapshots(
+                                                   &runtime)
+                                                   .empty();
+                                    },
+                                    std::chrono::
+                                        milliseconds(
+                                            500));
+                            result
+                                .managedAfterTeardown =
+                                runtime
+                                    .managedEeExecutionThreadCountForTesting();
+                            result.threadsAfterTeardown =
+                                debugThreadSnapshots(
+                                    &runtime)
+                                    .size();
+                            result.stageAfterTeardown =
+                                readGuestU32(
+                                    rdram,
+                                    K_BACKEND_CONTROL_STAGE_ADDR);
+                            runtime
+                                .stopEeExecutionForTesting();
+                        }
+                        else
+                        {
+                            runtime
+                                .stopEeExecutionForTesting();
+                            result
+                                .stopRequestedAfterTeardown =
+                                runtime.isStopRequested();
+                            result
+                                .managedAfterTeardown =
+                                runtime
+                                    .managedEeExecutionThreadCountForTesting();
+                            result.threadsAfterTeardown =
+                                debugThreadSnapshots(
+                                    &runtime)
+                                    .size();
+                            result.teardownCompleted =
+                                result
+                                        .managedAfterTeardown ==
+                                    0u &&
+                                result
+                                        .threadsAfterTeardown ==
+                                    0u;
+                            result.stageAfterTeardown =
+                                readGuestU32(
+                                    rdram,
+                                    K_BACKEND_CONTROL_STAGE_ADDR);
+                        }
+                        return result;
+                    };
+
+                for (const WaitExpectation &expectation :
+                     expectations)
+                {
+                    for (const auto &[teardownKind,
+                                      teardownName] :
+                         teardowns)
+                    {
+                        const std::string label =
+                            std::string(expectation.name) +
+                            " / " + teardownName;
+                        const FixtureResult host =
+                            runFixture(
+                                expectation.kind,
+                                expectation.status,
+                                expectation.waitType,
+                                EeExecutionBackendKind::
+                                    LegacyHostThread,
+                                teardownKind);
+                        const FixtureResult fiber =
+                            runFixture(
+                                expectation.kind,
+                                expectation.status,
+                                expectation.waitType,
+                                EeExecutionBackendKind::
+                                    LegacyCppFiber,
+                                teardownKind);
+
+                        t.IsTrue(
+                            host.memoryInitialized &&
+                                fiber.memoryInitialized &&
+                                host.reachedWait &&
+                                fiber.reachedWait &&
+                                host.paused &&
+                                fiber.paused &&
+                                host.snapshotBeforeFound &&
+                                fiber.snapshotBeforeFound &&
+                                host.snapshotPausedFound &&
+                                fiber.snapshotPausedFound,
+                            label +
+                                " should reach and pause "
+                                "the same wait state under "
+                                "both production backends");
+                        t.IsTrue(
+                            host.backendName ==
+                                    "legacy-host-thread" &&
+                                fiber.backendName ==
+                                    "legacy-cpp-fiber" &&
+                                host.childThreadId == 2 &&
+                                fiber.childThreadId ==
+                                    host.childThreadId &&
+                                host.createResult ==
+                                    host.childThreadId &&
+                                fiber.createResult ==
+                                    host.createResult &&
+                                host.startResult ==
+                                    host.childThreadId &&
+                                fiber.startResult ==
+                                    host.startResult &&
+                                host.resourceId ==
+                                    expectation.resourceId &&
+                                fiber.resourceId ==
+                                    host.resourceId &&
+                                host.suspendResult ==
+                                    (expectation.kind ==
+                                             BackendControlWaitKind::
+                                                 WaitSuspend
+                                         ? host.childThreadId
+                                         : KE_ERROR) &&
+                                fiber.suspendResult ==
+                                    host.suspendResult,
+                            label +
+                                " should return identical "
+                                "creation, start, "
+                                "resource, and suspension "
+                                "results");
+                        t.IsTrue(
+                            host.before.status ==
+                                    expectation.status &&
+                                host.before.waitType ==
+                                    expectation.waitType &&
+                                host.before.waitQueue ==
+                                    expectation.waitQueue &&
+                                host.before.stateValid &&
+                                host.before.started &&
+                                !host.before
+                                     .waitCompletionPending &&
+                                sameSnapshot(
+                                    host.before,
+                                    fiber.before) &&
+                                sameSnapshot(
+                                    host.before,
+                                    host.pausedSnapshot) &&
+                                sameSnapshot(
+                                    fiber.before,
+                                    fiber.pausedSnapshot),
+                            label +
+                                " pause should preserve "
+                                "the same authoritative "
+                                "state, wait reason, and "
+                                "queue membership");
+                        t.IsTrue(
+                            host.transitions ==
+                                    fiber.transitions &&
+                                host.memory ==
+                                    fiber.memory &&
+                                host.mainContext ==
+                                    fiber.mainContext &&
+                                host.childContext ==
+                                    fiber.childContext &&
+                                host.eventCount ==
+                                    fiber.eventCount &&
+                                host.modeledTick ==
+                                    fiber.modeledTick,
+                            label +
+                                " should retain identical "
+                                "transition traces, "
+                                "return memory, contexts, "
+                                "event counts, and "
+                                "modeled ticks");
+                        const bool expectedStopRequested =
+                            teardownKind ==
+                            TeardownKind::Shutdown;
+                        t.IsTrue(
+                            host.stageBeforeTeardown ==
+                                    1u &&
+                                fiber
+                                        .stageBeforeTeardown ==
+                                    host
+                                        .stageBeforeTeardown &&
+                                host
+                                        .stageAfterTeardown ==
+                                    fiber
+                                        .stageAfterTeardown &&
+                                host
+                                        .stopRequestedAfterTeardown ==
+                                    expectedStopRequested &&
+                                fiber
+                                        .stopRequestedAfterTeardown ==
+                                    expectedStopRequested &&
+                                host.teardownCompleted &&
+                                fiber.teardownCompleted &&
+                                host
+                                        .managedAfterTeardown ==
+                                    0u &&
+                                fiber
+                                        .managedAfterTeardown ==
+                                    0u &&
+                                host
+                                        .threadsAfterTeardown ==
+                                    0u &&
+                                fiber
+                                        .threadsAfterTeardown ==
+                                    0u,
+                            label +
+                                " should retire the "
+                                "waiter, clear the "
+                                "registry, preserve the "
+                                "reset/stop distinction, "
+                                "and leave no "
+                                "continuation "
+                                "(host_stop=" +
+                                std::to_string(
+                                    host
+                                        .stopRequestedAfterTeardown) +
+                                ", fiber_stop=" +
+                                std::to_string(
+                                    fiber
+                                        .stopRequestedAfterTeardown) +
+                                ", host_done=" +
+                                std::to_string(
+                                    host
+                                        .teardownCompleted) +
+                                ", fiber_done=" +
+                                std::to_string(
+                                    fiber
+                                        .teardownCompleted) +
+                                ", host_managed=" +
+                                std::to_string(
+                                    host
+                                        .managedAfterTeardown) +
+                                ", fiber_managed=" +
+                                std::to_string(
+                                    fiber
+                                        .managedAfterTeardown) +
+                                ", host_threads=" +
+                                std::to_string(
+                                    host
+                                        .threadsAfterTeardown) +
+                                ", fiber_threads=" +
+                                std::to_string(
+                                    fiber
+                                        .threadsAfterTeardown) +
+                                ")");
+                    }
+                }
+            });
+
+        tc.Run(
+            "legacy EE backends agree on full thread-ID wrap and numeric reuse",
+            [](TestCase &t)
+            {
+                if (!eeExecutionBackendBuildInfo()
+                         .boostContextFcontextAvailable)
+                {
+                    return;
+                }
+
+                struct FixtureResult
+                {
+                    bool memoryInitialized = false;
+                    bool reachedPublicationGate = false;
+                    bool completed = false;
+                    bool handleGenerationAdvanced =
+                        false;
+                    std::string backendName;
+                    EeThreadWakeResult
+                        stalePublicationResult =
+                            EeThreadWakeResult::
+                                InvalidHandle;
+                    std::vector<uint64_t> transitions;
+                    std::array<
+                        uint32_t,
+                        K_BACKEND_ID_REUSE_RESULT_WORDS>
+                        memory{};
+                    std::array<
+                        uint8_t,
+                        sizeof(R5900Context)>
+                        mainContext{};
+                    std::array<
+                        uint8_t,
+                        sizeof(R5900Context)>
+                        childContext{};
+                    uint64_t eventCount = 0u;
+                    uint64_t modeledTick = 0u;
+                    size_t managedAfterStop = 1u;
+                    size_t threadsAfterStop = 1u;
+                };
+
+                const auto runFixture =
+                    [](EeExecutionBackendKind backendKind)
+                    {
+                        FixtureResult result{};
+                        PS2RuntimeConfiguration
+                            configuration{};
+                        configuration.eeExecutionBackend =
+                            backendKind;
+                        configuration
+                            .useEeExecutionBackendEnvironment =
+                            false;
+                        PS2Runtime runtime(configuration);
+                        result.backendName =
+                            runtime.eeExecutionBackendName();
+                        result.memoryInitialized =
+                            runtime.memory().initialize();
+                        if (!result.memoryInitialized)
+                        {
+                            return result;
+                        }
+                        uint8_t *const rdram =
+                            runtime.memory().getRDRAM();
+                        runtime.registerFunction(
+                            K_BACKEND_ID_REUSE_MAIN_ENTRY,
+                            &backendIdReuseMainHandler);
+                        runtime.registerFunction(
+                            K_BACKEND_ID_REUSE_CHILD_ENTRY,
+                            &backendIdReuseChildHandler);
+                        runtime.cpu().pc =
+                            K_BACKEND_ID_REUSE_MAIN_ENTRY;
+                        setRegU32(
+                            runtime.cpu(),
+                            29,
+                            0x00300000u);
+                        for (size_t index = 0u;
+                             index <
+                             K_BACKEND_ID_REUSE_RESULT_WORDS;
+                             ++index)
+                        {
+                            writeGuestU32(
+                                rdram,
+                                K_BACKEND_ID_REUSE_RESULT_ADDR +
+                                    static_cast<uint32_t>(
+                                        index *
+                                        sizeof(uint32_t)),
+                                0xfeed2000u +
+                                    static_cast<uint32_t>(
+                                        index));
+                        }
+                        {
+                            std::lock_guard<std::mutex>
+                                lock(
+                                    g_executorFixtureMutex);
+                            g_backendIdReuseTransitions
+                                .clear();
+                            g_backendIdReuseStaleHandle =
+                                {};
+                            g_backendIdReuseReplacementHandle =
+                                {};
+                            g_backendIdReuseMainCompleted =
+                                false;
+                            g_backendIdReuseChildCompleted =
+                                false;
+                            g_backendIdReuseMainContext
+                                .fill(0u);
+                            g_backendIdReuseChildContext
+                                .fill(0u);
+                        }
+                        g_backendIdReuseAtPublicationGate
+                            .store(
+                                false,
+                                std::memory_order_release);
+                        g_backendIdReuseReleasePublicationGate
+                            .store(
+                                false,
+                                std::memory_order_release);
+                        runtime.debugStartEeEventTrace(
+                            16u);
+                        runtime
+                            .startEeExecutionForTesting();
+                        result.reachedPublicationGate =
+                            waitUntil(
+                                []()
+                                {
+                                    return g_backendIdReuseAtPublicationGate
+                                        .load(
+                                            std::memory_order_acquire);
+                                },
+                                std::chrono::seconds(
+                                    5));
+                        EeThreadHandle staleHandle{};
+                        EeThreadHandle replacementHandle{};
+                        {
+                            std::lock_guard<std::mutex>
+                                lock(
+                                    g_executorFixtureMutex);
+                            staleHandle =
+                                g_backendIdReuseStaleHandle;
+                            replacementHandle =
+                                g_backendIdReuseReplacementHandle;
+                        }
+                        result.handleGenerationAdvanced =
+                            staleHandle &&
+                            replacementHandle &&
+                            staleHandle.threadId ==
+                                replacementHandle
+                                    .threadId &&
+                            staleHandle !=
+                                replacementHandle;
+                        if (result.reachedPublicationGate)
+                        {
+                            result.stalePublicationResult =
+                                publishEeThreadWake(
+                                    &runtime,
+                                    staleHandle);
+                        }
+                        g_backendIdReuseReleasePublicationGate
+                            .store(
+                                true,
+                                std::memory_order_release);
+                        result.completed =
+                            waitUntil(
+                                []()
+                                {
+                                    std::lock_guard<
+                                        std::mutex>
+                                        lock(
+                                            g_executorFixtureMutex);
+                                    return g_backendIdReuseMainCompleted &&
+                                           g_backendIdReuseChildCompleted;
+                                },
+                                std::chrono::seconds(
+                                    5));
+                        {
+                            std::lock_guard<std::mutex>
+                                lock(
+                                    g_executorFixtureMutex);
+                            result.transitions =
+                                g_backendIdReuseTransitions;
+                            result.mainContext =
+                                g_backendIdReuseMainContext;
+                            result.childContext =
+                                g_backendIdReuseChildContext;
+                        }
+                        for (size_t index = 0u;
+                             index < result.memory.size();
+                             ++index)
+                        {
+                            result.memory[index] =
+                                readGuestU32(
+                                    rdram,
+                                    K_BACKEND_ID_REUSE_RESULT_ADDR +
+                                        static_cast<
+                                            uint32_t>(
+                                            index *
+                                            sizeof(
+                                                uint32_t)));
+                        }
+                        result.eventCount =
+                            runtime
+                                .debugEeEventTraceSnapshot(
+                                    true)
+                                .totalEntries;
+                        result.modeledTick =
+                            runtime.currentEeTick().raw();
+                        runtime
+                            .stopEeExecutionForTesting();
+                        result.managedAfterStop =
+                            runtime
+                                .managedEeExecutionThreadCountForTesting();
+                        result.threadsAfterStop =
+                            debugThreadSnapshots(
+                                &runtime)
+                                .size();
+                        return result;
+                    };
+
+                const FixtureResult host =
+                    runFixture(
+                        EeExecutionBackendKind::
+                            LegacyHostThread);
+                const FixtureResult fiber =
+                    runFixture(
+                        EeExecutionBackendKind::
+                            LegacyCppFiber);
+                const std::array<
+                    uint32_t,
+                    K_BACKEND_ID_REUSE_RESULT_WORDS>
+                    expectedMemory{
+                        2u,
+                        3u,
+                        2u,
+                        static_cast<uint32_t>(
+                            KE_ERROR),
+                        252u,
+                        4u,
+                        0xFFu,
+                        2u,
+                        2u,
+                        2u,
+                        THS_READY,
+                        THS_READY,
+                        0u,
+                        0u,
+                        40u,
+                        2u,
+                        2u,
+                        0u,
+                        2u,
+                        1u,
+                    };
+
+                t.IsTrue(
+                    host.memoryInitialized &&
+                        fiber.memoryInitialized &&
+                        host.reachedPublicationGate &&
+                        fiber.reachedPublicationGate &&
+                        host.completed &&
+                        fiber.completed &&
+                        host.backendName ==
+                            "legacy-host-thread" &&
+                        fiber.backendName ==
+                            "legacy-cpp-fiber",
+                    "both production backends should "
+                    "complete the full 8-bit thread-ID "
+                    "ring lifecycle");
+                t.IsTrue(
+                    host.handleGenerationAdvanced &&
+                        fiber.handleGenerationAdvanced &&
+                        host.stalePublicationResult ==
+                            EeThreadWakeResult::
+                                StaleHandle &&
+                        fiber.stalePublicationResult ==
+                            host.stalePublicationResult,
+                    "a captured pre-delete handle "
+                    "should reject the recycled numeric "
+                    "ID under both production "
+                    "backends");
+                t.IsTrue(
+                    host.memory == expectedMemory &&
+                        fiber.memory == host.memory,
+                    "deleted ID 2 should remain invalid "
+                    "until wrap, then address the "
+                    "sleeping replacement with the same "
+                    "raw READY result under both "
+                    "backends");
+                t.IsTrue(
+                    host.transitions ==
+                            fiber.transitions &&
+                        host.mainContext ==
+                            fiber.mainContext &&
+                        host.childContext ==
+                            fiber.childContext &&
+                        host.eventCount ==
+                            fiber.eventCount &&
+                        host.modeledTick ==
+                            fiber.modeledTick,
+                    "ID reuse should retain identical "
+                    "transition traces, final contexts, "
+                    "event counts, and modeled ticks");
+                t.IsTrue(
+                    host.managedAfterStop == 0u &&
+                        fiber.managedAfterStop == 0u &&
+                        host.threadsAfterStop == 0u &&
+                        fiber.threadsAfterStop == 0u,
+                    "ID-ring shutdown should clear all "
+                    "thread records and backend "
+                    "continuations");
+            });
+
+        tc.Run(
+            "legacy EE backends preserve forced wakes before and during guest park",
+            [](TestCase &t)
+            {
+                if (!eeExecutionBackendBuildInfo()
+                         .boostContextFcontextAvailable)
+                {
+                    return;
+                }
+
+                struct FixtureResult
+                {
+                    bool memoryInitialized = false;
+                    bool reachedPublicationPoint = false;
+                    bool completed = false;
+                    bool publisherReturnedBeforeRelease =
+                        false;
+                    std::string backendName;
+                    EeThreadWakeResult publicationResult =
+                        EeThreadWakeResult::InvalidHandle;
+                    int childThreadId = 0;
+                    int startResult = KE_ERROR;
+                    int sleepResult = KE_ERROR;
+                    std::vector<uint64_t> transitions;
+                    std::array<
+                        uint32_t,
+                        K_BACKEND_WAKE_RACE_RESULT_WORDS>
+                        memory{};
+                    std::array<
+                        uint8_t,
+                        sizeof(R5900Context)>
+                        mainContext{};
+                    std::array<
+                        uint8_t,
+                        sizeof(R5900Context)>
+                        childContext{};
+                    uint64_t eventCount = 0u;
+                    uint64_t modeledTick = 0u;
+                    size_t managedAfterStop = 1u;
+                    size_t threadsAfterStop = 1u;
+                };
+
+                const auto runFixture =
+                    [](BackendWakeRaceScenario scenario,
+                       EeExecutionBackendKind backendKind)
+                    {
+                        FixtureResult result{};
+                        PS2RuntimeConfiguration
+                            configuration{};
+                        configuration.eeExecutionBackend =
+                            backendKind;
+                        configuration
+                            .useEeExecutionBackendEnvironment =
+                            false;
+                        PS2Runtime runtime(configuration);
+                        result.backendName =
+                            runtime.eeExecutionBackendName();
+                        result.memoryInitialized =
+                            runtime.memory().initialize();
+                        if (!result.memoryInitialized)
+                        {
+                            return result;
+                        }
+                        uint8_t *const rdram =
+                            runtime.memory().getRDRAM();
+                        runtime.registerFunction(
+                            K_BACKEND_WAKE_RACE_MAIN_ENTRY,
+                            &backendWakeRaceMainHandler);
+                        runtime.registerFunction(
+                            K_BACKEND_WAKE_RACE_CHILD_ENTRY,
+                            &backendWakeRaceChildHandler);
+                        runtime.cpu().pc =
+                            K_BACKEND_WAKE_RACE_MAIN_ENTRY;
+                        setRegU32(
+                            runtime.cpu(),
+                            29,
+                            0x00300000u);
+                        for (size_t index = 0u;
+                             index <
+                             K_BACKEND_WAKE_RACE_RESULT_WORDS;
+                             ++index)
+                        {
+                            writeGuestU32(
+                                rdram,
+                                K_BACKEND_WAKE_RACE_RESULT_ADDR +
+                                    static_cast<uint32_t>(
+                                        index *
+                                        sizeof(uint32_t)),
+                                0xfeed3000u +
+                                    static_cast<uint32_t>(
+                                        index));
+                        }
+                        {
+                            std::lock_guard<std::mutex>
+                                lock(
+                                    g_executorFixtureMutex);
+                            g_backendWakeRaceScenario =
+                                scenario;
+                            g_backendWakeRaceTransitions
+                                .clear();
+                            g_backendWakeRaceMainCompleted =
+                                false;
+                            g_backendWakeRaceChildCompleted =
+                                false;
+                            g_backendWakeRaceChildThreadId =
+                                0;
+                            g_backendWakeRaceStartResult =
+                                KE_ERROR;
+                            g_backendWakeRaceSleepResult =
+                                KE_ERROR;
+                            g_backendWakeRaceMainContext
+                                .fill(0u);
+                            g_backendWakeRaceChildContext
+                                .fill(0u);
+                        }
+                        g_backendWakeRaceReleaseBeforePark
+                            .store(
+                                scenario ==
+                                    BackendWakeRaceScenario::
+                                        DuringPark,
+                                std::memory_order_release);
+                        runtime.debugStartEeEventTrace(
+                            16u);
+                        runtime
+                            .startEeExecutionForTesting();
+
+                        result.reachedPublicationPoint =
+                            waitUntil(
+                                [&]()
+                                {
+                                    int childThreadId =
+                                        0;
+                                    {
+                                        std::lock_guard<
+                                            std::mutex>
+                                            lock(
+                                                g_executorFixtureMutex);
+                                        childThreadId =
+                                            g_backendWakeRaceChildThreadId;
+                                    }
+                                    if (childThreadId <=
+                                            1 ||
+                                        readGuestU32(
+                                            rdram,
+                                            K_BACKEND_WAKE_RACE_RESULT_ADDR +
+                                                4u *
+                                                    sizeof(
+                                                        uint32_t)) !=
+                                            static_cast<
+                                                uint32_t>(
+                                                childThreadId))
+                                    {
+                                        return false;
+                                    }
+                                    if (scenario ==
+                                        BackendWakeRaceScenario::
+                                            BeforePark)
+                                    {
+                                        return true;
+                                    }
+                                    for (const auto &snapshot :
+                                         debugThreadSnapshots(
+                                             &runtime))
+                                    {
+                                        if (snapshot.id ==
+                                                childThreadId &&
+                                            snapshot.status ==
+                                                THS_WAIT &&
+                                            snapshot.waitType ==
+                                                TSW_SLEEP)
+                                        {
+                                            return true;
+                                        }
+                                    }
+                                    return false;
+                                },
+                                std::chrono::seconds(
+                                    2));
+
+                        int childThreadId = 0;
+                        {
+                            std::lock_guard<std::mutex>
+                                lock(
+                                    g_executorFixtureMutex);
+                            childThreadId =
+                                g_backendWakeRaceChildThreadId;
+                        }
+                        const EeThreadHandle handle =
+                            captureEeThreadHandle(
+                                &runtime,
+                                childThreadId);
+                        if (result.reachedPublicationPoint &&
+                            handle)
+                        {
+                            if (scenario ==
+                                BackendWakeRaceScenario::
+                                    BeforePark)
+                            {
+                                std::atomic<bool>
+                                    publisherEntered{
+                                        false};
+                                std::atomic<bool>
+                                    publisherReturned{
+                                        false};
+                                std::thread publisher(
+                                    [&]()
+                                    {
+                                        publisherEntered
+                                            .store(
+                                                true,
+                                                std::memory_order_release);
+                                        result.publicationResult =
+                                            publishEeThreadWake(
+                                                &runtime,
+                                                handle);
+                                        publisherReturned
+                                            .store(
+                                                true,
+                                                std::memory_order_release);
+                                    });
+                                (void)waitUntil(
+                                    [&]()
+                                    {
+                                        return publisherEntered
+                                            .load(
+                                                std::memory_order_acquire);
+                                    },
+                                    std::chrono::
+                                        milliseconds(
+                                            200));
+                                result
+                                    .publisherReturnedBeforeRelease =
+                                    waitUntil(
+                                        [&]()
+                                        {
+                                            return publisherReturned
+                                                .load(
+                                                    std::memory_order_acquire);
+                                        },
+                                        backendKind ==
+                                                EeExecutionBackendKind::
+                                                    LegacyHostThread
+                                            ? std::chrono::
+                                                  milliseconds(
+                                                      500)
+                                            : std::chrono::
+                                                  milliseconds(
+                                                      50));
+                                g_backendWakeRaceReleaseBeforePark
+                                    .store(
+                                        true,
+                                        std::memory_order_release);
+                                publisher.join();
+                            }
+                            else
+                            {
+                                result.publicationResult =
+                                    publishEeThreadWake(
+                                        &runtime,
+                                        handle);
+                            }
+                        }
+                        else
+                        {
+                            g_backendWakeRaceReleaseBeforePark
+                                .store(
+                                    true,
+                                    std::memory_order_release);
+                        }
+
+                        result.completed =
+                            waitUntil(
+                                []()
+                                {
+                                    std::lock_guard<
+                                        std::mutex>
+                                        lock(
+                                            g_executorFixtureMutex);
+                                    return g_backendWakeRaceMainCompleted &&
+                                           g_backendWakeRaceChildCompleted;
+                                },
+                                std::chrono::seconds(
+                                    2));
+                        {
+                            std::lock_guard<std::mutex>
+                                lock(
+                                    g_executorFixtureMutex);
+                            result.childThreadId =
+                                g_backendWakeRaceChildThreadId;
+                            result.startResult =
+                                g_backendWakeRaceStartResult;
+                            result.sleepResult =
+                                g_backendWakeRaceSleepResult;
+                            result.transitions =
+                                g_backendWakeRaceTransitions;
+                            result.mainContext =
+                                g_backendWakeRaceMainContext;
+                            result.childContext =
+                                g_backendWakeRaceChildContext;
+                        }
+                        for (size_t index = 0u;
+                             index < result.memory.size();
+                             ++index)
+                        {
+                            result.memory[index] =
+                                readGuestU32(
+                                    rdram,
+                                    K_BACKEND_WAKE_RACE_RESULT_ADDR +
+                                        static_cast<
+                                            uint32_t>(
+                                            index *
+                                            sizeof(
+                                                uint32_t)));
+                        }
+                        result.eventCount =
+                            runtime
+                                .debugEeEventTraceSnapshot(
+                                    true)
+                                .totalEntries;
+                        result.modeledTick =
+                            runtime.currentEeTick().raw();
+                        runtime
+                            .stopEeExecutionForTesting();
+                        result.managedAfterStop =
+                            runtime
+                                .managedEeExecutionThreadCountForTesting();
+                        result.threadsAfterStop =
+                            debugThreadSnapshots(
+                                &runtime)
+                                .size();
+                        return result;
+                    };
+
+                constexpr std::array<
+                    std::pair<
+                        BackendWakeRaceScenario,
+                        const char *>,
+                    2u>
+                    scenarios{{
+                        {
+                            BackendWakeRaceScenario::
+                                BeforePark,
+                            "wake-before-park",
+                        },
+                        {
+                            BackendWakeRaceScenario::
+                                DuringPark,
+                            "wake-during-park",
+                        },
+                    }};
+                const std::array<
+                    uint32_t,
+                    K_BACKEND_WAKE_RACE_RESULT_WORDS>
+                    expectedMemory{
+                        2u,
+                        2u,
+                        2u,
+                        1u,
+                        2u,
+                    };
+
+                for (const auto &[scenario, name] :
+                     scenarios)
+                {
+                    const FixtureResult host =
+                        runFixture(
+                            scenario,
+                            EeExecutionBackendKind::
+                                LegacyHostThread);
+                    const FixtureResult fiber =
+                        runFixture(
+                            scenario,
+                            EeExecutionBackendKind::
+                                LegacyCppFiber);
+
+                    t.IsTrue(
+                        host.memoryInitialized &&
+                            fiber.memoryInitialized &&
+                            host
+                                .reachedPublicationPoint &&
+                            fiber
+                                .reachedPublicationPoint &&
+                            host.completed &&
+                            fiber.completed &&
+                            host.backendName ==
+                                "legacy-host-thread" &&
+                            fiber.backendName ==
+                                "legacy-cpp-fiber",
+                        std::string(name) +
+                            " should complete under both "
+                            "production backends");
+                    t.IsTrue(
+                        host.childThreadId == 2 &&
+                            fiber.childThreadId ==
+                                host.childThreadId &&
+                            host.startResult == 2 &&
+                            fiber.startResult ==
+                                host.startResult &&
+                            host.sleepResult == 2 &&
+                            fiber.sleepResult ==
+                                host.sleepResult &&
+                            host.memory ==
+                                expectedMemory &&
+                            fiber.memory == host.memory,
+                        std::string(name) +
+                            " should preserve the same "
+                            "guest-visible start, sleep, "
+                            "and RDRAM results");
+                    if (scenario ==
+                        BackendWakeRaceScenario::
+                            BeforePark)
+                    {
+                        t.IsTrue(
+                            host
+                                .publisherReturnedBeforeRelease &&
+                                !fiber
+                                     .publisherReturnedBeforeRelease &&
+                                host.publicationResult ==
+                                    EeThreadWakeResult::
+                                        WakeupCounted &&
+                                fiber.publicationResult ==
+                                    EeThreadWakeResult::
+                                        WakeupCounted,
+                            "wake-before-park should count "
+                            "immediately on the host "
+                            "worker and queue at the "
+                            "fiber boundary ahead of its "
+                            "later sleep transition "
+                            "without losing the wake "
+                            "(host_returned=" +
+                                std::to_string(
+                                    host.publisherReturnedBeforeRelease) +
+                                ", host_result=" +
+                                std::to_string(
+                                    static_cast<int>(
+                                        host.publicationResult)) +
+                                ", fiber_returned=" +
+                                std::to_string(
+                                    fiber.publisherReturnedBeforeRelease) +
+                                ", fiber_result=" +
+                                std::to_string(
+                                    static_cast<int>(
+                                        fiber.publicationResult)) +
+                                ")");
+                    }
+                    else
+                    {
+                        t.IsTrue(
+                            host.publicationResult ==
+                                    EeThreadWakeResult::
+                                        WokeSleeper &&
+                                fiber.publicationResult ==
+                                    host
+                                        .publicationResult,
+                            "wake-during-park should "
+                            "release the committed "
+                            "sleeper under both backends");
+                    }
+                    t.IsTrue(
+                        host.transitions ==
+                                fiber.transitions &&
+                            host.mainContext ==
+                                fiber.mainContext &&
+                            host.childContext ==
+                                fiber.childContext &&
+                            host.eventCount ==
+                                fiber.eventCount &&
+                            host.modeledTick ==
+                                fiber.modeledTick,
+                        std::string(name) +
+                            " should retain identical "
+                            "guest traces, final "
+                            "contexts, event counts, and "
+                            "modeled ticks");
+                    t.IsTrue(
+                        host.managedAfterStop == 0u &&
+                            fiber.managedAfterStop == 0u &&
+                            host.threadsAfterStop == 0u &&
+                            fiber.threadsAfterStop == 0u,
+                        std::string(name) +
+                            " shutdown should leave no "
+                            "thread record or managed "
+                            "continuation");
+                }
+            });
+
+        tc.Run(
+            "legacy EE backends linearize an in-flight wake against shutdown",
+            [](TestCase &t)
+            {
+                if (!eeExecutionBackendBuildInfo()
+                         .boostContextFcontextAvailable)
+                {
+                    return;
+                }
+
+                struct FixtureResult
+                {
+                    bool memoryInitialized = false;
+                    bool reachedPublicationGate = false;
+                    bool publisherEntered = false;
+                    bool publisherReturnedBeforeStop =
+                        false;
+                    bool publisherReturned = false;
+                    bool publisherThrew = false;
+                    bool stopCompleted = false;
+                    std::string backendName;
+                    EeThreadWakeResult publicationResult =
+                        EeThreadWakeResult::
+                            InvalidHandle;
+                    EeThreadWakeResult staleAfterStop =
+                        EeThreadWakeResult::
+                            InvalidHandle;
+                    size_t managedAfterStop = 1u;
+                    size_t threadsAfterStop = 1u;
+                };
+
+                const auto runFixture =
+                    [](EeExecutionBackendKind backendKind)
+                    {
+                        FixtureResult result{};
+                        PS2RuntimeConfiguration
+                            configuration{};
+                        configuration.eeExecutionBackend =
+                            backendKind;
+                        configuration
+                            .useEeExecutionBackendEnvironment =
+                            false;
+                        PS2Runtime runtime(configuration);
+                        result.backendName =
+                            runtime.eeExecutionBackendName();
+                        result.memoryInitialized =
+                            runtime.memory().initialize();
+                        if (!result.memoryInitialized)
+                        {
+                            return result;
+                        }
+                        uint8_t *const rdram =
+                            runtime.memory().getRDRAM();
+                        runtime.registerFunction(
+                            K_BACKEND_WAKE_RACE_MAIN_ENTRY,
+                            &backendWakeRaceMainHandler);
+                        runtime.registerFunction(
+                            K_BACKEND_WAKE_RACE_CHILD_ENTRY,
+                            &backendWakeRaceChildHandler);
+                        runtime.cpu().pc =
+                            K_BACKEND_WAKE_RACE_MAIN_ENTRY;
+                        setRegU32(
+                            runtime.cpu(),
+                            29,
+                            0x00300000u);
+                        for (size_t index = 0u;
+                             index <
+                             K_BACKEND_WAKE_RACE_RESULT_WORDS;
+                             ++index)
+                        {
+                            writeGuestU32(
+                                rdram,
+                                K_BACKEND_WAKE_RACE_RESULT_ADDR +
+                                    static_cast<
+                                        uint32_t>(
+                                        index *
+                                        sizeof(
+                                            uint32_t)),
+                                0xfeed4000u +
+                                    static_cast<
+                                        uint32_t>(
+                                        index));
+                        }
+                        {
+                            std::lock_guard<std::mutex>
+                                lock(
+                                    g_executorFixtureMutex);
+                            g_backendWakeRaceScenario =
+                                BackendWakeRaceScenario::
+                                    BeforePark;
+                            g_backendWakeRaceTransitions
+                                .clear();
+                            g_backendWakeRaceMainCompleted =
+                                false;
+                            g_backendWakeRaceChildCompleted =
+                                false;
+                            g_backendWakeRaceChildThreadId =
+                                0;
+                            g_backendWakeRaceStartResult =
+                                KE_ERROR;
+                            g_backendWakeRaceSleepResult =
+                                KE_ERROR;
+                            g_backendWakeRaceMainContext
+                                .fill(0u);
+                            g_backendWakeRaceChildContext
+                                .fill(0u);
+                        }
+                        g_backendWakeRaceReleaseBeforePark
+                            .store(
+                                false,
+                                std::memory_order_release);
+                        runtime
+                            .startEeExecutionForTesting();
+
+                        result.reachedPublicationGate =
+                            waitUntil(
+                                [&]()
+                                {
+                                    int childThreadId =
+                                        0;
+                                    {
+                                        std::lock_guard<
+                                            std::mutex>
+                                            lock(
+                                                g_executorFixtureMutex);
+                                        childThreadId =
+                                            g_backendWakeRaceChildThreadId;
+                                    }
+                                    return childThreadId >
+                                               1 &&
+                                           readGuestU32(
+                                               rdram,
+                                               K_BACKEND_WAKE_RACE_RESULT_ADDR +
+                                                   4u *
+                                                       sizeof(
+                                                           uint32_t)) ==
+                                               static_cast<
+                                                   uint32_t>(
+                                                   childThreadId);
+                                },
+                                std::chrono::seconds(
+                                    2));
+                        int childThreadId = 0;
+                        {
+                            std::lock_guard<std::mutex>
+                                lock(
+                                    g_executorFixtureMutex);
+                            childThreadId =
+                                g_backendWakeRaceChildThreadId;
+                        }
+                        const EeThreadHandle handle =
+                            captureEeThreadHandle(
+                                &runtime,
+                                childThreadId);
+                        std::atomic<bool>
+                            publisherEntered{false};
+                        std::atomic<bool>
+                            publisherReturned{false};
+                        std::thread publisher;
+                        if (result.reachedPublicationGate &&
+                            handle)
+                        {
+                            publisher = std::thread(
+                                [&]()
+                                {
+                                    publisherEntered.store(
+                                        true,
+                                        std::memory_order_release);
+                                    try
+                                    {
+                                        result
+                                            .publicationResult =
+                                            publishEeThreadWake(
+                                                &runtime,
+                                                handle);
+                                    }
+                                    catch (...)
+                                    {
+                                        result.publisherThrew =
+                                            true;
+                                    }
+                                    publisherReturned.store(
+                                        true,
+                                        std::memory_order_release);
+                                });
+                            result.publisherEntered =
+                                waitUntil(
+                                    [&]()
+                                    {
+                                        return publisherEntered
+                                            .load(
+                                                std::memory_order_acquire);
+                                    },
+                                    std::chrono::
+                                        milliseconds(
+                                            500));
+                            result
+                                .publisherReturnedBeforeStop =
+                                waitUntil(
+                                    [&]()
+                                    {
+                                        return publisherReturned
+                                            .load(
+                                                std::memory_order_acquire);
+                                    },
+                                    backendKind ==
+                                            EeExecutionBackendKind::
+                                                LegacyHostThread
+                                        ? std::chrono::
+                                              milliseconds(
+                                                  500)
+                                        : std::chrono::
+                                              milliseconds(
+                                                  50));
+                        }
+
+                        runtime.requestStop();
+                        g_backendWakeRaceReleaseBeforePark
+                            .store(
+                                true,
+                                std::memory_order_release);
+                        if (publisher.joinable())
+                        {
+                            publisher.join();
+                        }
+                        result.publisherReturned =
+                            publisherReturned.load(
+                                std::memory_order_acquire);
+                        try
+                        {
+                            runtime
+                                .stopEeExecutionForTesting();
+                            result.stopCompleted = true;
+                        }
+                        catch (...)
+                        {
+                            result.stopCompleted = false;
+                        }
+                        result.staleAfterStop =
+                            publishEeThreadWake(
+                                &runtime,
+                                handle);
+                        result.managedAfterStop =
+                            runtime
+                                .managedEeExecutionThreadCountForTesting();
+                        result.threadsAfterStop =
+                            debugThreadSnapshots(
+                                &runtime)
+                                .size();
+                        return result;
+                    };
+
+                const FixtureResult host =
+                    runFixture(
+                        EeExecutionBackendKind::
+                            LegacyHostThread);
+                const FixtureResult fiber =
+                    runFixture(
+                        EeExecutionBackendKind::
+                            LegacyCppFiber);
+                const auto modeledShutdownOutcome =
+                    [](EeThreadWakeResult result)
+                    {
+                        return result ==
+                                   EeThreadWakeResult::
+                                       WakeupCounted ||
+                               result ==
+                                   EeThreadWakeResult::
+                                       WokeSleeper ||
+                               result ==
+                                   EeThreadWakeResult::
+                                       Dormant ||
+                               result ==
+                                   EeThreadWakeResult::
+                                       StaleHandle;
+                    };
+
+                t.IsTrue(
+                    host.memoryInitialized &&
+                        fiber.memoryInitialized &&
+                        host.reachedPublicationGate &&
+                        fiber.reachedPublicationGate &&
+                        host.publisherEntered &&
+                        fiber.publisherEntered &&
+                        host.backendName ==
+                            "legacy-host-thread" &&
+                        fiber.backendName ==
+                            "legacy-cpp-fiber",
+                    "the shutdown race should enter the "
+                    "same pre-park guest window under "
+                    "both production backends");
+                t.IsTrue(
+                    host.publisherReturnedBeforeStop &&
+                        !fiber
+                             .publisherReturnedBeforeStop &&
+                        host.publisherReturned &&
+                        fiber.publisherReturned,
+                    "the host wake should linearize "
+                    "synchronously while the fiber wake "
+                    "remains queued until the executor "
+                    "reaches or cancels its boundary");
+                t.IsTrue(
+                    !host.publisherThrew &&
+                        !fiber.publisherThrew &&
+                        host.publicationResult ==
+                            EeThreadWakeResult::
+                                WakeupCounted &&
+                        modeledShutdownOutcome(
+                            fiber.publicationResult),
+                    "an in-flight wake should finish with "
+                    "a modeled result rather than expose "
+                    "executor cancellation as an "
+                    "exception");
+                t.IsTrue(
+                    host.stopCompleted &&
+                        fiber.stopCompleted &&
+                        host.staleAfterStop ==
+                            EeThreadWakeResult::
+                                StaleHandle &&
+                        fiber.staleAfterStop ==
+                            host.staleAfterStop &&
+                        host.managedAfterStop == 0u &&
+                        fiber.managedAfterStop == 0u &&
+                        host.threadsAfterStop == 0u &&
+                        fiber.threadsAfterStop == 0u,
+                    "shutdown should make the captured "
+                    "generation stale and leave no guest "
+                    "thread or native continuation");
             });
 
         tc.Run(

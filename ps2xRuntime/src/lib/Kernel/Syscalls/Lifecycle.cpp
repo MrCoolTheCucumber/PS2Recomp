@@ -239,6 +239,11 @@ namespace ps2_syscalls
         ps2_stubs::resetMemoryCardState(runtime);
         ps2_stubs::resetPadState(runtime);
         ps2_stubs::resetSifState(runtime);
+
+        if (runtime && !runtime->isStopRequested())
+        {
+            runtime->completeEeExecutionKernelReset();
+        }
     }
 
     void joinAllGuestHostThreads(PS2Runtime *runtime)
