@@ -89,6 +89,22 @@ void register_ee_execution_backend_tests()
                             build.contextImplementation ==
                                 "fcontext",
                         "production-fcontext must expose the pinned production context switch");
+#if defined(_WIN32) && \
+    (defined(_M_X64) || defined(__x86_64__))
+                    t.IsTrue(
+                        build.architecture ==
+                                "x86_64" &&
+                            build.binaryFormat == "pe" &&
+                            build.abi == "ms",
+                        "Windows x64 production CI must execute the PE/MS fcontext implementation");
+#elif defined(__linux__) && defined(__x86_64__)
+                    t.IsTrue(
+                        build.architecture ==
+                                "x86_64" &&
+                            build.binaryFormat == "elf" &&
+                            build.abi == "sysv",
+                        "Linux x86-64 production CI must execute the ELF/SysV fcontext implementation");
+#endif
                 }
                 else
                 {
