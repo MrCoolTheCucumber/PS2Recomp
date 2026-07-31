@@ -20,6 +20,7 @@
 #include <mutex>
 #include <condition_variable>
 #include <chrono>
+#include <exception>
 #include <filesystem>
 #include <iostream>
 #include <iomanip>
@@ -1283,9 +1284,12 @@ public:
     managedEeExecutionThreadCountForTesting() const;
     [[nodiscard]] bool
     usesDedicatedEeExecutor() const noexcept;
-    // Headless lifecycle seam used by focused runtime fixtures. Production
-    // run() uses the same private start/join implementation around its
-    // presentation loop.
+    // Headless lifecycle seams used by focused runtime fixtures. The generic
+    // pair starts whichever production backend was selected; the dedicated
+    // pair retains the stricter executor-only contract used by fiber-specific
+    // tests.
+    void startEeExecutionForTesting();
+    void stopEeExecutionForTesting();
     void startDedicatedEeExecutionForTesting();
     void stopDedicatedEeExecutionForTesting();
     [[nodiscard]] bool publishEeExecutorUpdate(
@@ -1900,6 +1904,10 @@ private:
         m_eeExecutionBackend;
     std::unique_ptr<ps2x::ee::EeRuntimeExecutor>
         m_eeRuntimeExecutor;
+    mutable std::mutex
+        m_headlessEeExecutionFailureMutex;
+    std::exception_ptr
+        m_headlessEeExecutionFailure;
     ps2x::timing::EeTick
         m_eeExecutorDispatchStartTick{};
     R5900Context *m_boundEeContext = nullptr;

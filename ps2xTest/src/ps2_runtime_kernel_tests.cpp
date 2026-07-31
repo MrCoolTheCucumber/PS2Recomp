@@ -193,6 +193,12 @@ namespace
     constexpr uint32_t
         K_EXECUTOR_GUEST_STACK_TAIL =
             0xfdb97531u;
+    constexpr uint32_t
+        K_EXECUTOR_DIFFERENTIAL_RESULT_ADDR =
+            0x1940u;
+    constexpr size_t
+        K_EXECUTOR_DIFFERENTIAL_RESULT_WORDS =
+            10u;
     constexpr uint32_t K_EXECUTOR_MPEG_ADDR =
         0x00123000u;
     constexpr uint32_t K_EXECUTOR_MPEG_IMAGE_ADDR =
@@ -208,6 +214,38 @@ namespace
     std::thread::id g_executorAlarmMainHostThread;
     std::thread::id
         g_executorAlarmCallbackHostThread;
+    enum class BackendDifferentialTransition
+        : uint32_t
+    {
+        MainEntered = 1u,
+        MainInitialized,
+        MainCreatedChild,
+        ChildEntered,
+        ChildWakeReturned,
+        ChildReturned,
+        MainStartReturned,
+        MainSleepReturned,
+        MainCancelWakeReturned,
+        MainReturned,
+    };
+    std::vector<uint64_t>
+        g_backendDifferentialTransitions;
+    std::array<int, 3u>
+        g_backendDifferentialChildWakeResults{
+            KE_ERROR,
+            KE_ERROR,
+            KE_ERROR,
+        };
+    std::array<
+        uint8_t,
+        sizeof(R5900Context)>
+        g_backendDifferentialMainContext{};
+    std::array<
+        uint8_t,
+        sizeof(R5900Context)>
+        g_backendDifferentialChildContext{};
+    bool g_backendDifferentialMainCompleted = false;
+    bool g_backendDifferentialChildCompleted = false;
     std::atomic<int> g_executorAlarmSetResult{
         KE_ERROR};
     std::atomic<uint32_t>
@@ -526,6 +564,35 @@ namespace
         uint32_t value = 0;
         std::memcpy(&value, rdram + addr, sizeof(value));
         return value;
+    }
+
+    void recordBackendDifferentialTransition(
+        BackendDifferentialTransition transition,
+        int32_t value)
+    {
+        const uint64_t encoded =
+            (static_cast<uint64_t>(transition) << 32u) |
+            static_cast<uint32_t>(value);
+        std::lock_guard<std::mutex> lock(
+            g_executorFixtureMutex);
+        g_backendDifferentialTransitions.push_back(
+            encoded);
+    }
+
+    void captureBackendDifferentialContext(
+        const R5900Context &context,
+        bool mainContext)
+    {
+        std::lock_guard<std::mutex> lock(
+            g_executorFixtureMutex);
+        auto &destination =
+            mainContext
+                ? g_backendDifferentialMainContext
+                : g_backendDifferentialChildContext;
+        std::memcpy(
+            destination.data(),
+            &context,
+            destination.size());
     }
 
     template <typename Predicate>
@@ -989,20 +1056,62 @@ namespace
         R5900Context *ctx,
         PS2Runtime *runtime)
     {
+        const int threadId =
+            runtime->currentEeThreadId();
         {
             std::lock_guard<std::mutex> lock(
                 g_executorFixtureMutex);
             g_executorChildHostThread =
                 std::this_thread::get_id();
             g_executorFixtureOrder.push_back(
-                runtime->currentEeThreadId());
+                threadId);
         }
+        recordBackendDifferentialTransition(
+            BackendDifferentialTransition::
+                ChildEntered,
+            threadId);
+        writeGuestU32(
+            rdram,
+            K_EXECUTOR_DIFFERENTIAL_RESULT_ADDR +
+                2u * sizeof(uint32_t),
+            static_cast<uint32_t>(threadId));
         for (int wake = 0; wake < 3; ++wake)
         {
             setRegU32(*ctx, 4, 1u);
             WakeupThread(rdram, ctx, runtime);
+            const int result = getRegS32(*ctx, 2);
+            {
+                std::lock_guard<std::mutex> lock(
+                    g_executorFixtureMutex);
+                g_backendDifferentialChildWakeResults
+                    [static_cast<size_t>(wake)] =
+                        result;
+            }
+            writeGuestU32(
+                rdram,
+                K_EXECUTOR_DIFFERENTIAL_RESULT_ADDR +
+                    static_cast<uint32_t>(
+                        3 + wake) *
+                        sizeof(uint32_t),
+                static_cast<uint32_t>(result));
+            recordBackendDifferentialTransition(
+                BackendDifferentialTransition::
+                    ChildWakeReturned,
+                result);
         }
         ctx->pc = 0u;
+        captureBackendDifferentialContext(
+            *ctx, false);
+        recordBackendDifferentialTransition(
+            BackendDifferentialTransition::
+                ChildReturned,
+            threadId);
+        {
+            std::lock_guard<std::mutex> lock(
+                g_executorFixtureMutex);
+            g_backendDifferentialChildCompleted =
+                true;
+        }
     }
 
     void setupThreadRootWorkerHandler(
@@ -1081,6 +1190,10 @@ namespace
         R5900Context *ctx,
         PS2Runtime *runtime)
     {
+        recordBackendDifferentialTransition(
+            BackendDifferentialTransition::
+                MainEntered,
+            runtime->currentEeThreadId());
         {
             std::lock_guard<std::mutex> lock(
                 g_executorFixtureMutex);
@@ -1089,6 +1202,10 @@ namespace
         }
 
         InitThread(rdram, ctx, runtime);
+        recordBackendDifferentialTransition(
+            BackendDifferentialTransition::
+                MainInitialized,
+            getRegS32(*ctx, 2));
 
         setRegU32(
             *ctx,
@@ -1097,6 +1214,15 @@ namespace
         CreateThread(rdram, ctx, runtime);
         const int childThreadId =
             getRegS32(*ctx, 2);
+        writeGuestU32(
+            rdram,
+            K_EXECUTOR_DIFFERENTIAL_RESULT_ADDR,
+            static_cast<uint32_t>(
+                childThreadId));
+        recordBackendDifferentialTransition(
+            BackendDifferentialTransition::
+                MainCreatedChild,
+            childThreadId);
         {
             std::lock_guard<std::mutex> lock(
                 g_executorFixtureMutex);
@@ -1111,6 +1237,17 @@ namespace
                 childThreadId));
         setRegU32(*ctx, 5, 0u);
         StartThread(rdram, ctx, runtime);
+        const int startResult =
+            getRegS32(*ctx, 2);
+        writeGuestU32(
+            rdram,
+            K_EXECUTOR_DIFFERENTIAL_RESULT_ADDR +
+                sizeof(uint32_t),
+            static_cast<uint32_t>(startResult));
+        recordBackendDifferentialTransition(
+            BackendDifferentialTransition::
+                MainStartReturned,
+            startResult);
         {
             std::lock_guard<std::mutex> lock(
                 g_executorFixtureMutex);
@@ -1118,28 +1255,84 @@ namespace
                 runtime->currentEeThreadId());
         }
         SleepThread(rdram, ctx, runtime);
+        const int firstSleepResult =
+            getRegS32(*ctx, 2);
         {
             std::lock_guard<std::mutex> lock(
                 g_executorFixtureMutex);
             g_executorWakeCountResults[0] =
-                getRegS32(*ctx, 2);
+                firstSleepResult;
         }
+        writeGuestU32(
+            rdram,
+            K_EXECUTOR_DIFFERENTIAL_RESULT_ADDR +
+                6u * sizeof(uint32_t),
+            static_cast<uint32_t>(
+                firstSleepResult));
+        recordBackendDifferentialTransition(
+            BackendDifferentialTransition::
+                MainSleepReturned,
+            firstSleepResult);
         SleepThread(rdram, ctx, runtime);
+        const int secondSleepResult =
+            getRegS32(*ctx, 2);
         {
             std::lock_guard<std::mutex> lock(
                 g_executorFixtureMutex);
             g_executorWakeCountResults[1] =
-                getRegS32(*ctx, 2);
+                secondSleepResult;
         }
+        writeGuestU32(
+            rdram,
+            K_EXECUTOR_DIFFERENTIAL_RESULT_ADDR +
+                7u * sizeof(uint32_t),
+            static_cast<uint32_t>(
+                secondSleepResult));
+        recordBackendDifferentialTransition(
+            BackendDifferentialTransition::
+                MainSleepReturned,
+            secondSleepResult);
         setRegU32(*ctx, 4, 0u);
         CancelWakeupThread(rdram, ctx, runtime);
+        const int cancelResult =
+            getRegS32(*ctx, 2);
         {
             std::lock_guard<std::mutex> lock(
                 g_executorFixtureMutex);
             g_executorWakeCountResults[2] =
-                getRegS32(*ctx, 2);
+                cancelResult;
         }
+        writeGuestU32(
+            rdram,
+            K_EXECUTOR_DIFFERENTIAL_RESULT_ADDR +
+                8u * sizeof(uint32_t),
+            static_cast<uint32_t>(
+                cancelResult));
+        recordBackendDifferentialTransition(
+            BackendDifferentialTransition::
+                MainCancelWakeReturned,
+            cancelResult);
         ctx->pc = 0u;
+        const int mainThreadId =
+            runtime->currentEeThreadId();
+        writeGuestU32(
+            rdram,
+            K_EXECUTOR_DIFFERENTIAL_RESULT_ADDR +
+                9u * sizeof(uint32_t),
+            static_cast<uint32_t>(
+                mainThreadId));
+        captureBackendDifferentialContext(
+            *ctx, true);
+        recordBackendDifferentialTransition(
+            BackendDifferentialTransition::
+                MainReturned,
+            mainThreadId);
+        {
+            std::lock_guard<std::mutex> lock(
+                g_executorFixtureMutex);
+            g_backendDifferentialMainCompleted =
+                true;
+        }
     }
 
     void dedicatedExecutorSleepChildHandler(
@@ -3354,6 +3547,188 @@ namespace
         return result;
     }
 
+    struct BackendDifferentialFixtureResult
+    {
+        bool memoryInitialized = false;
+        bool completed = false;
+        std::string backendName;
+        std::vector<uint64_t> transitions;
+        std::vector<int> order;
+        std::array<int, 3u> childWakeResults{};
+        std::array<int, 3u> wakeCountResults{};
+        std::array<
+            uint32_t,
+            K_EXECUTOR_DIFFERENTIAL_RESULT_WORDS>
+            memory{};
+        std::array<
+            uint8_t,
+            sizeof(R5900Context)>
+            mainContext{};
+        std::array<
+            uint8_t,
+            sizeof(R5900Context)>
+            childContext{};
+        std::thread::id mainHostThread;
+        std::thread::id childHostThread;
+        uint64_t eeEventCount = 0u;
+        uint64_t modeledTick = 0u;
+        size_t managedAfterStop = 0u;
+    };
+
+    BackendDifferentialFixtureResult
+    runBackendDifferentialFixture(
+        EeExecutionBackendKind backendKind,
+        int childPriority)
+    {
+        BackendDifferentialFixtureResult result{};
+        PS2RuntimeConfiguration configuration{};
+        configuration.eeExecutionBackend =
+            backendKind;
+        configuration
+            .useEeExecutionBackendEnvironment =
+            false;
+        PS2Runtime runtime(configuration);
+        result.backendName =
+            runtime.eeExecutionBackendName();
+        result.memoryInitialized =
+            runtime.memory().initialize();
+        if (!result.memoryInitialized)
+        {
+            return result;
+        }
+
+        uint8_t *const rdram =
+            runtime.memory().getRDRAM();
+        const std::array<uint32_t, 9u>
+            threadParameters{
+                0u,
+                K_EXECUTOR_CHILD_ENTRY,
+                0x00310000u,
+                0x800u,
+                0u,
+                static_cast<uint32_t>(
+                    childPriority),
+                0u,
+                0u,
+                0u,
+            };
+        writeGuestWords(
+            rdram,
+            K_EXECUTOR_THREAD_PARAM_ADDR,
+            threadParameters.data(),
+            threadParameters.size());
+        const std::array<
+            uint32_t,
+            K_EXECUTOR_DIFFERENTIAL_RESULT_WORDS>
+            initialMemory{
+                0xfeed0000u,
+                0xfeed0001u,
+                0xfeed0002u,
+                0xfeed0003u,
+                0xfeed0004u,
+                0xfeed0005u,
+                0xfeed0006u,
+                0xfeed0007u,
+                0xfeed0008u,
+                0xfeed0009u,
+            };
+        writeGuestWords(
+            rdram,
+            K_EXECUTOR_DIFFERENTIAL_RESULT_ADDR,
+            initialMemory.data(),
+            initialMemory.size());
+        runtime.registerFunction(
+            K_EXECUTOR_MAIN_ENTRY,
+            &dedicatedExecutorMainHandler);
+        runtime.registerFunction(
+            K_EXECUTOR_CHILD_ENTRY,
+            &dedicatedExecutorChildHandler);
+        runtime.cpu().pc =
+            K_EXECUTOR_MAIN_ENTRY;
+        setRegU32(
+            runtime.cpu(), 29, 0x00300000u);
+
+        {
+            std::lock_guard<std::mutex> lock(
+                g_executorFixtureMutex);
+            g_executorFixtureOrder.clear();
+            g_executorMainHostThread = {};
+            g_executorChildHostThread = {};
+            g_executorChildThreadId = 0;
+            g_executorWakeCountResults = {
+                KE_ERROR,
+                KE_ERROR,
+                KE_ERROR,
+            };
+            g_backendDifferentialTransitions.clear();
+            g_backendDifferentialChildWakeResults = {
+                KE_ERROR,
+                KE_ERROR,
+                KE_ERROR,
+            };
+            g_backendDifferentialMainContext.fill(0u);
+            g_backendDifferentialChildContext.fill(0u);
+            g_backendDifferentialMainCompleted =
+                false;
+            g_backendDifferentialChildCompleted =
+                false;
+        }
+
+        runtime.debugStartEeEventTrace(32u);
+        runtime.startEeExecutionForTesting();
+        result.completed = waitUntil(
+            []()
+            {
+                std::lock_guard<std::mutex> lock(
+                    g_executorFixtureMutex);
+                return
+                    g_backendDifferentialMainCompleted &&
+                    g_backendDifferentialChildCompleted;
+            },
+            std::chrono::seconds(2));
+        runtime.stopEeExecutionForTesting();
+
+        {
+            std::lock_guard<std::mutex> lock(
+                g_executorFixtureMutex);
+            result.transitions =
+                g_backendDifferentialTransitions;
+            result.order =
+                g_executorFixtureOrder;
+            result.childWakeResults =
+                g_backendDifferentialChildWakeResults;
+            result.wakeCountResults =
+                g_executorWakeCountResults;
+            result.mainContext =
+                g_backendDifferentialMainContext;
+            result.childContext =
+                g_backendDifferentialChildContext;
+            result.mainHostThread =
+                g_executorMainHostThread;
+            result.childHostThread =
+                g_executorChildHostThread;
+        }
+        for (size_t index = 0u;
+             index < result.memory.size();
+             ++index)
+        {
+            result.memory[index] = readGuestU32(
+                rdram,
+                K_EXECUTOR_DIFFERENTIAL_RESULT_ADDR +
+                    static_cast<uint32_t>(
+                        index * sizeof(uint32_t)));
+        }
+        result.eeEventCount =
+            runtime.debugEeEventTraceSnapshot(true)
+                .totalEntries;
+        result.modeledTick =
+            runtime.currentEeTick().raw();
+        result.managedAfterStop =
+            runtime
+                .managedEeExecutionThreadCountForTesting();
+        return result;
+    }
+
     struct TestEnv
     {
         std::vector<uint8_t> rdram;
@@ -3425,6 +3800,299 @@ void register_ps2_runtime_kernel_tests()
                     "an unsupported or disabled target should report the explicit host-thread fallback");
             }
         });
+
+        tc.Run(
+            "legacy EE backends agree on wake-count lifecycle",
+            [](TestCase &t)
+            {
+                if (!eeExecutionBackendBuildInfo()
+                         .boostContextFcontextAvailable)
+                {
+                    return;
+                }
+
+                const BackendDifferentialFixtureResult
+                    host =
+                        runBackendDifferentialFixture(
+                            EeExecutionBackendKind::
+                                LegacyHostThread,
+                            0);
+                const BackendDifferentialFixtureResult
+                    fiber =
+                        runBackendDifferentialFixture(
+                            EeExecutionBackendKind::
+                                LegacyCppFiber,
+                            0);
+
+                t.IsTrue(
+                    host.memoryInitialized &&
+                        fiber.memoryInitialized &&
+                        host.completed &&
+                        fiber.completed,
+                    "both production backends should "
+                    "complete the same bounded guest "
+                    "lifecycle");
+                t.IsTrue(
+                    host.backendName ==
+                            "legacy-host-thread" &&
+                        fiber.backendName ==
+                            "legacy-cpp-fiber",
+                    "the differential fixture should "
+                    "record both explicit production "
+                    "backend selections");
+                t.IsTrue(
+                    host.transitions ==
+                        fiber.transitions,
+                    "both backends should publish the "
+                    "same guest-visible transition "
+                    "trace");
+                t.IsTrue(
+                    host.order == fiber.order &&
+                        host.order ==
+                            std::vector<int>{2, 1},
+                    "higher-priority child dispatch "
+                    "should precede return to the main "
+                    "thread under both backends");
+                t.IsTrue(
+                    host.childWakeResults ==
+                            fiber.childWakeResults &&
+                        host.childWakeResults ==
+                            std::array<int, 3u>{
+                                1, 1, 1},
+                    "both backends should return the "
+                    "same three WakeupThread results");
+                t.IsTrue(
+                    host.wakeCountResults ==
+                            fiber.wakeCountResults &&
+                        host.wakeCountResults ==
+                            std::array<int, 3u>{
+                                1, 1, 1},
+                    "both backends should consume two "
+                    "wake counts and cancel the third");
+                t.IsTrue(
+                    host.memory == fiber.memory &&
+                        host.memory ==
+                            std::array<
+                                uint32_t,
+                                K_EXECUTOR_DIFFERENTIAL_RESULT_WORDS>{
+                                2u,
+                                2u,
+                                2u,
+                                1u,
+                                1u,
+                                1u,
+                                1u,
+                                1u,
+                                1u,
+                                1u,
+                            },
+                    "return values and thread IDs "
+                    "should leave identical RDRAM "
+                    "results");
+                t.IsTrue(
+                    host.mainContext ==
+                            fiber.mainContext &&
+                        host.childContext ==
+                            fiber.childContext,
+                    "both backends should leave "
+                    "identical final main and child "
+                    "R5900 contexts");
+                t.IsTrue(
+                    host.eeEventCount ==
+                            fiber.eeEventCount &&
+                        host.modeledTick ==
+                            fiber.modeledTick,
+                    "both backends should retire the "
+                    "same device-event count and "
+                    "modeled EE ticks");
+                t.IsTrue(
+                    host.managedAfterStop == 0u &&
+                        fiber.managedAfterStop == 0u,
+                    "both backends should release all "
+                    "managed guest executions");
+                t.IsTrue(
+                    host.mainHostThread !=
+                            std::thread::id{} &&
+                        host.childHostThread !=
+                            std::thread::id{} &&
+                        host.mainHostThread !=
+                            host.childHostThread &&
+                        fiber.mainHostThread !=
+                            std::thread::id{} &&
+                        fiber.mainHostThread ==
+                            fiber.childHostThread,
+                    "the oracle should use two legacy "
+                    "host workers while the fiber mode "
+                    "uses one executor thread");
+            });
+
+        tc.Run(
+            "legacy EE backends agree on equal-priority wake publication",
+            [](TestCase &t)
+            {
+                if (!eeExecutionBackendBuildInfo()
+                         .boostContextFcontextAvailable)
+                {
+                    return;
+                }
+
+                const BackendDifferentialFixtureResult
+                    host =
+                        runBackendDifferentialFixture(
+                            EeExecutionBackendKind::
+                                LegacyHostThread,
+                            1);
+                const BackendDifferentialFixtureResult
+                    fiber =
+                        runBackendDifferentialFixture(
+                            EeExecutionBackendKind::
+                                LegacyCppFiber,
+                            1);
+
+                t.IsTrue(
+                    host.memoryInitialized &&
+                        fiber.memoryInitialized &&
+                        host.completed &&
+                        fiber.completed,
+                    "both production backends should "
+                    "complete the equal-priority "
+                    "lifecycle");
+                t.IsTrue(
+                    host.transitions ==
+                        fiber.transitions,
+                    "an equal-priority wake should "
+                    "produce the same non-preempting "
+                    "transition trace");
+                t.IsTrue(
+                    host.order == fiber.order &&
+                        host.order ==
+                            std::vector<int>{1, 2},
+                    "equal-priority StartThread should "
+                    "return to the main thread before "
+                    "its child runs");
+                t.IsTrue(
+                    host.childWakeResults ==
+                            fiber.childWakeResults &&
+                        host.wakeCountResults ==
+                            fiber.wakeCountResults &&
+                        host.memory ==
+                            fiber.memory,
+                    "equal-priority execution should "
+                    "return the same syscall values and "
+                    "RDRAM results");
+                t.IsTrue(
+                    host.mainContext ==
+                            fiber.mainContext &&
+                        host.childContext ==
+                            fiber.childContext,
+                    "equal-priority execution should "
+                    "leave identical final R5900 "
+                    "contexts");
+                t.IsTrue(
+                    host.eeEventCount ==
+                            fiber.eeEventCount &&
+                        host.modeledTick ==
+                            fiber.modeledTick &&
+                        host.managedAfterStop == 0u &&
+                        fiber.managedAfterStop == 0u,
+                    "equal-priority execution should "
+                    "match event/tick totals and "
+                    "release both backends");
+            });
+
+        tc.Run(
+            "legacy EE backends agree when wake promotes a higher-priority target",
+            [](TestCase &t)
+            {
+                if (!eeExecutionBackendBuildInfo()
+                         .boostContextFcontextAvailable)
+                {
+                    return;
+                }
+
+                const BackendDifferentialFixtureResult
+                    host =
+                        runBackendDifferentialFixture(
+                            EeExecutionBackendKind::
+                                LegacyHostThread,
+                            2);
+                const BackendDifferentialFixtureResult
+                    fiber =
+                        runBackendDifferentialFixture(
+                            EeExecutionBackendKind::
+                                LegacyCppFiber,
+                            2);
+
+                t.IsTrue(
+                    host.memoryInitialized &&
+                        fiber.memoryInitialized &&
+                        host.completed &&
+                        fiber.completed,
+                    "both production backends should "
+                    "complete the higher-priority wake "
+                    "lifecycle");
+                t.IsTrue(
+                    host.transitions ==
+                            fiber.transitions &&
+                        host.order ==
+                            fiber.order &&
+                        host.order ==
+                            std::vector<int>{1, 2},
+                    "the lower-priority child should "
+                    "start after its caller, then yield "
+                    "inside each wake of the "
+                    "higher-priority main thread");
+                t.IsTrue(
+                    host.childWakeResults ==
+                            fiber.childWakeResults &&
+                        host.childWakeResults ==
+                            std::array<int, 3u>{
+                                1,
+                                1,
+                                KE_DORMANT} &&
+                        host.wakeCountResults ==
+                            fiber.wakeCountResults &&
+                        host.wakeCountResults ==
+                            std::array<int, 3u>{
+                                1, 1, 0} &&
+                        host.memory ==
+                            fiber.memory &&
+                        host.memory ==
+                            std::array<
+                                uint32_t,
+                                K_EXECUTOR_DIFFERENTIAL_RESULT_WORDS>{
+                                2u,
+                                2u,
+                                2u,
+                                1u,
+                                1u,
+                                static_cast<uint32_t>(
+                                    KE_DORMANT),
+                                1u,
+                                1u,
+                                0u,
+                                1u,
+                            } &&
+                        host.mainContext ==
+                            fiber.mainContext &&
+                        host.childContext ==
+                            fiber.childContext,
+                    "two higher-priority wakes should "
+                    "preempt before a late wake observes "
+                    "the returned main thread as "
+                    "dormant, with identical memory and "
+                    "contexts");
+                t.IsTrue(
+                    host.eeEventCount ==
+                            fiber.eeEventCount &&
+                        host.modeledTick ==
+                            fiber.modeledTick &&
+                        host.managedAfterStop == 0u &&
+                        fiber.managedAfterStop == 0u,
+                    "the higher-priority wake sequence "
+                    "should match event/tick totals and "
+                    "release both backends");
+            });
 
         tc.Run(
             "fiber runtime owns main and started thread on one executor",

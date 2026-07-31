@@ -275,6 +275,7 @@ namespace ps2_syscalls
         EeThreadWakeResult result =
             EeThreadWakeResult::InvalidHandle;
         int status = THS_DORMANT;
+        int priority = 0;
         int wakeupCount = 0;
     };
 
@@ -336,6 +337,8 @@ namespace ps2_syscalls
         const auto &guest =
             info->guestState.snapshot();
         publication.status = guest.status;
+        publication.priority =
+            guest.currentPriority;
         publication.wakeupCount =
             guest.wakeupCount;
         return publication;
@@ -369,6 +372,8 @@ namespace ps2_syscalls
         const EeThreadGuestStateSnapshot &guest =
             info->guestState.snapshot();
         publication.status = guest.status;
+        publication.priority =
+            guest.currentPriority;
         publication.wakeupCount = guest.wakeupCount;
         return publication;
     }
@@ -1063,6 +1068,7 @@ namespace ps2_syscalls
                 .threadRootFunction.load(
                     std::memory_order_acquire);
 
+        int startedPriority = 0;
         {
             std::lock_guard<std::mutex> lock(info->m);
             const EeThreadGuestStateSnapshot &guest =
@@ -1075,6 +1081,9 @@ namespace ps2_syscalls
             }
 
             info->guestState.start();
+            startedPriority =
+                info->guestState.snapshot()
+                    .currentPriority;
             info->arg = arg;
             info->terminated = false;
             info->forceRelease = false;
@@ -1102,6 +1111,29 @@ namespace ps2_syscalls
                 // buffer is supplied; use a conservative default instead of caller SP.
                 info->stackSize = 0x800u;
             }
+        }
+
+        bool hostStartPreempts = false;
+        if (!dedicatedExecutor)
+        {
+            // The legacy backend has no ready queue, but an ordinary start
+            // still has the retail higher-priority dispatch boundary.
+            const std::shared_ptr<ThreadInfo>
+                callerInfo =
+                    ensureCurrentThreadInfo(
+                        runtime, ctx);
+            int callerPriority = startedPriority;
+            if (callerInfo)
+            {
+                std::lock_guard<std::mutex> lock(
+                    callerInfo->m);
+                callerPriority =
+                    callerInfo->guestState
+                        .snapshot()
+                        .currentPriority;
+            }
+            hostStartPreempts =
+                startedPriority < callerPriority;
         }
 
         EeThreadRuntimeState &threadState =
@@ -1389,8 +1421,12 @@ namespace ps2_syscalls
                         "StartThread could not publish "
                         "its EE scheduler transition");
                 }
-
-                runtime->yieldGuestExecutionAfterWake();
+            }
+            if (dedicatedExecutor ||
+                hostStartPreempts)
+            {
+                runtime
+                    ->yieldGuestExecutionAfterWake();
             }
         }
         catch (const std::exception &e)
@@ -2708,7 +2744,31 @@ namespace ps2_syscalls
                 EeThreadWakeResult::WokeSleeper &&
             reschedule)
         {
-            yieldGuestExecutionAfterWake(runtime);
+            // Releasing an equal- or lower-priority waiter publishes READY
+            // without preempting the ordinary caller. The dedicated
+            // scheduler applies this policy itself; retain it explicitly for
+            // the legacy host-thread oracle.
+            const std::shared_ptr<ThreadInfo>
+                callerInfo =
+                    ensureCurrentThreadInfo(
+                        runtime, ctx);
+            int callerPriority =
+                publication.priority;
+            if (callerInfo)
+            {
+                std::lock_guard<std::mutex> lock(
+                    callerInfo->m);
+                callerPriority =
+                    callerInfo->guestState
+                        .snapshot()
+                        .currentPriority;
+            }
+            if (publication.priority <
+                callerPriority)
+            {
+                yieldGuestExecutionAfterWake(
+                    runtime);
+            }
         }
     }
 

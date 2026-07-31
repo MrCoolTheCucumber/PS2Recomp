@@ -1833,6 +1833,31 @@ void PS2Runtime::runMainEeContinuation()
     {
     }
 
+    std::shared_ptr<ThreadInfo> mainInfo;
+    {
+        EeThreadRuntimeState &state =
+            *m_eeThreadRuntimeState;
+        std::lock_guard<std::mutex> lock(
+            state.threadMapMutex);
+        const auto current = state.threads.find(1);
+        if (current != state.threads.end())
+        {
+            mainInfo = current->second;
+        }
+    }
+    if (mainInfo)
+    {
+        // Started guest workers already make their ThreadInfo dormant when
+        // their entry returns. Mirror that lifecycle for the bootstrap
+        // continuation before any surviving worker can target thread 1.
+        {
+            std::lock_guard<std::mutex> lock(
+                mainInfo->m);
+            mainInfo->guestState.makeDormant();
+        }
+        mainInfo->cv.notify_all();
+    }
+
     const uint32_t pc = m_cpuContext.pc;
     RUNTIME_LOG(
         "Game thread returned. PC=0x"
@@ -1950,6 +1975,106 @@ void PS2Runtime::
 {
     requestStop();
     joinDedicatedEeExecution();
+}
+
+void PS2Runtime::startEeExecutionForTesting()
+{
+    if (usesDedicatedEeExecutor())
+    {
+        startDedicatedEeExecutionForTesting();
+        return;
+    }
+
+    if (m_eeThreadRuntimeState->activeHostThreads.load(
+            std::memory_order_acquire) != 0 ||
+        m_eeExecutionBackend->managedThreadCount() !=
+            0u)
+    {
+        throw std::logic_error(
+            "headless EE execution is already active");
+    }
+
+    {
+        std::lock_guard<std::mutex> lock(
+            m_headlessEeExecutionFailureMutex);
+        m_headlessEeExecutionFailure = nullptr;
+    }
+    m_stopRequested.store(
+        false, std::memory_order_relaxed);
+    m_eeThreadRuntimeState->activeHostThreads.store(
+        1, std::memory_order_release);
+    try
+    {
+        m_eeExecutionBackend->create(
+            1,
+            [this]()
+            {
+                struct ActiveThreadCompletion
+                {
+                    EeThreadRuntimeState &state;
+
+                    ~ActiveThreadCompletion()
+                    {
+                        state.activeHostThreads.fetch_sub(
+                            1, std::memory_order_release);
+                    }
+                } completion{*m_eeThreadRuntimeState};
+
+                ThreadNaming::SetCurrentThreadName(
+                    "GameThread");
+                try
+                {
+                    runMainEeContinuation();
+                }
+                catch (...)
+                {
+                    {
+                        std::lock_guard<std::mutex> lock(
+                            m_headlessEeExecutionFailureMutex);
+                        m_headlessEeExecutionFailure =
+                            std::current_exception();
+                    }
+                    requestStop();
+                }
+            });
+    }
+    catch (...)
+    {
+        m_eeThreadRuntimeState->activeHostThreads.fetch_sub(
+            1, std::memory_order_release);
+        throw;
+    }
+}
+
+void PS2Runtime::stopEeExecutionForTesting()
+{
+    if (usesDedicatedEeExecutor())
+    {
+        stopDedicatedEeExecutionForTesting();
+        return;
+    }
+
+    requestStop();
+    ps2_syscalls::joinAllGuestHostThreads(this);
+    if (m_eeThreadRuntimeState->activeHostThreads.load(
+            std::memory_order_acquire) != 0)
+    {
+        throw std::logic_error(
+            "headless EE host threads remained active "
+            "after join");
+    }
+
+    std::exception_ptr failure;
+    {
+        std::lock_guard<std::mutex> lock(
+            m_headlessEeExecutionFailureMutex);
+        failure = std::exchange(
+            m_headlessEeExecutionFailure, nullptr);
+    }
+    if (failure)
+    {
+        std::rethrow_exception(failure);
+    }
 }
 
 const void *
