@@ -1592,6 +1592,36 @@ void PS2Runtime::invokeEeSchedulerUpdateAtBoundary(
         policy);
 }
 
+bool PS2Runtime::invokeEeExecutorTaskAtBoundary(
+    std::function<void()> task)
+{
+    if (!m_eeRuntimeExecutor ||
+        !m_eeRuntimeExecutor->running() ||
+        m_eeRuntimeExecutor->ownsCurrentThread())
+    {
+        return false;
+    }
+    if (!task)
+    {
+        throw std::invalid_argument(
+            "EE executor boundary task is empty");
+    }
+
+    // The executor publication wakes an idle or paused owner. Ask a running
+    // continuation to reach its backend-neutral checkpoint as well, then
+    // execute the task before that or any other continuation resumes.
+    requestGuestPreemption();
+    m_eeRuntimeExecutor->invokeAtBoundary(
+        [task = std::move(task)](
+            ps2x::ee::EeThreadScheduler &,
+            IEeExecutionBackend &)
+        {
+            task();
+        },
+        ps2x::ee::EeSchedulerReschedulePolicy::None);
+    return true;
+}
+
 ps2x::timing::EeTickDelta
 PS2Runtime::eeExecutorElapsedSinceSelection()
     const noexcept
@@ -7561,6 +7591,33 @@ R5900Context *PS2Runtime::enterGuestExecution(
 {
     uint32_t &depth = g_guestExecutionDepths[this];
 
+    if (m_eeRuntimeExecutor)
+    {
+        if (!m_eeRuntimeExecutor->ownsCurrentThread())
+        {
+            throw std::logic_error(
+                "dedicated EE guest execution must run "
+                "on its executor thread");
+        }
+
+        R5900Context *const previousContext =
+            m_boundEeContext;
+        if (previousThreadId)
+        {
+            *previousThreadId =
+                m_boundEeThreadId;
+        }
+        ++depth;
+        if (depth == 1u)
+        {
+            recordOuterGuestExecutionAcquisition(
+                context);
+        }
+        switchGuestExecutionContext(
+            context, selectionHint);
+        return previousContext;
+    }
+
     if (depth != 0u)
     {
         lockGuestExecutionMutex(false);
@@ -7577,8 +7634,7 @@ R5900Context *PS2Runtime::enterGuestExecution(
         return previousContext;
     }
 
-    if (m_eeRuntimeExecutor ||
-        !m_debugControlActive.load(
+    if (!m_debugControlActive.load(
             std::memory_order_acquire))
     {
         m_guestExecutionWaiters.fetch_add(1u, std::memory_order_acq_rel);
@@ -7645,6 +7701,20 @@ bool PS2Runtime::tryEnterGuestExecution(
 {
     previousContext = nullptr;
     previousThreadId = 1;
+
+    if (m_eeRuntimeExecutor)
+    {
+        if (!m_eeRuntimeExecutor->ownsCurrentThread())
+        {
+            return false;
+        }
+        previousContext =
+            enterGuestExecution(
+                context,
+                &previousThreadId,
+                selectionHint);
+        return true;
+    }
 
     auto depthIt = g_guestExecutionDepths.find(this);
     if (depthIt != g_guestExecutionDepths.end() &&
@@ -7780,7 +7850,10 @@ void PS2Runtime::leaveGuestExecution(
     }
 
     --it->second;
-    m_guestExecutionMutex.unlock();
+    if (!m_eeRuntimeExecutor)
+    {
+        m_guestExecutionMutex.unlock();
+    }
     if (it->second == 0u)
     {
         g_guestExecutionDepths.erase(it);
@@ -7808,9 +7881,12 @@ uint32_t PS2Runtime::releaseGuestExecution(
         1, std::memory_order_release);
 
     const uint32_t depth = it->second;
-    for (uint32_t i = 0; i < depth; ++i)
+    if (!m_eeRuntimeExecutor)
     {
-        m_guestExecutionMutex.unlock();
+        for (uint32_t i = 0; i < depth; ++i)
+        {
+            m_guestExecutionMutex.unlock();
+        }
     }
     g_guestExecutionDepths.erase(it);
     return depth;
@@ -7827,6 +7903,21 @@ void PS2Runtime::reacquireGuestExecution(
     }
 
     uint32_t &heldDepth = g_guestExecutionDepths[this];
+    if (m_eeRuntimeExecutor)
+    {
+        if (!m_eeRuntimeExecutor->ownsCurrentThread() ||
+            heldDepth != 0u)
+        {
+            throw std::logic_error(
+                "dedicated EE logical ownership could "
+                "not be restored");
+        }
+        heldDepth = depth;
+        switchGuestExecutionContext(
+            context, threadId);
+        return;
+    }
+
     uint32_t remaining = depth;
 
     if (heldDepth == 0u)
@@ -8428,8 +8519,6 @@ void PS2Runtime::debugAfterGuestStep(R5900Context *ctx)
 
 bool PS2Runtime::debugPause(std::chrono::milliseconds timeout)
 {
-    const auto deadline =
-        std::chrono::steady_clock::now() + timeout;
     m_debugControlActive.store(true, std::memory_order_release);
     bool newlyRequested = false;
     {
@@ -8449,7 +8538,8 @@ bool PS2Runtime::debugPause(std::chrono::milliseconds timeout)
     m_audioBackend.setDebuggerPaused(true);
 
     if (m_eeRuntimeExecutor &&
-        m_eeRuntimeExecutor->running())
+        m_eeRuntimeExecutor->running() &&
+        !m_eeRuntimeExecutor->ownsCurrentThread())
     {
         requestGuestPreemption();
         m_eeRuntimeExecutor->debugRequestPause();
@@ -8458,23 +8548,8 @@ bool PS2Runtime::debugPause(std::chrono::milliseconds timeout)
                 timeout);
         if (paused)
         {
-            const auto now =
-                std::chrono::steady_clock::now();
-            const auto remaining =
-                now < deadline
-                    ? std::chrono::duration_cast<
-                          std::chrono::milliseconds>(
-                          deadline - now)
-                    : std::chrono::milliseconds{0};
-            const bool locked =
-                m_guestExecutionMutex.try_lock_for(
-                    remaining);
-            if (locked)
-            {
-                debugPublishVuBackendDiagnostics();
-                m_guestExecutionMutex.unlock();
-                return true;
-            }
+            debugPublishVuBackendDiagnostics();
+            return true;
         }
 
         if (newlyRequested)
@@ -8560,6 +8635,65 @@ bool PS2Runtime::debugSetVuBackend(
     {
         return fail(
             "VU backend changes require paused guest execution");
+    }
+
+    if (m_eeRuntimeExecutor &&
+        m_eeRuntimeExecutor->running() &&
+        !m_eeRuntimeExecutor->ownsCurrentThread())
+    {
+        bool changed = false;
+        const bool invoked =
+            invokeEeExecutorTaskAtBoundary(
+                [this, unit, backend, diagnostic, &changed]()
+                {
+                    if (!debugIsPaused())
+                    {
+                        return;
+                    }
+
+                    VuUnit *target = nullptr;
+                    switch (unit)
+                    {
+                    case VuUnitId::Vu0:
+                        target = &m_vu0;
+                        break;
+                    case VuUnitId::Vu1:
+                        target = &m_vu1;
+                        break;
+                    }
+                    if (!target)
+                    {
+                        if (diagnostic)
+                        {
+                            *diagnostic =
+                                "unknown VU unit";
+                        }
+                        return;
+                    }
+                    changed =
+                        target->setBackend(
+                            backend, diagnostic);
+                    if (changed)
+                    {
+                        debugPublishVuBackendDiagnostics();
+                        if (diagnostic)
+                        {
+                            diagnostic->clear();
+                        }
+                    }
+                });
+        if (!invoked)
+        {
+            return fail(
+                "VU backend change could not reach "
+                "the EE executor boundary");
+        }
+        if (!debugIsPaused())
+        {
+            return fail(
+                "guest execution resumed before the VU backend change");
+        }
+        return changed;
     }
 
     std::unique_lock<std::recursive_timed_mutex> lock(
@@ -8739,100 +8873,162 @@ PS2Runtime::DebugStopInfo PS2Runtime::debugStepDispatches(
 
 R5900Context PS2Runtime::debugCpuSnapshot()
 {
-    std::lock_guard<std::recursive_timed_mutex> lock(m_guestExecutionMutex);
-    R5900Context *const context =
-        m_boundEeContext
-            ? m_boundEeContext
-            : &m_cpuContext;
-    synchronizeCop0Timing(
-        context,
-        ps2x::timing::eeTickToCyclesFloor(
-            currentEeTick()));
-    return m_cpuContext;
+    R5900Context result{};
+    const auto capture =
+        [this, &result]()
+        {
+            R5900Context *const context =
+                m_boundEeContext
+                    ? m_boundEeContext
+                    : &m_cpuContext;
+            synchronizeCop0Timing(
+                context,
+                ps2x::timing::eeTickToCyclesFloor(
+                    currentEeTick()));
+            result = m_cpuContext;
+        };
+    if (invokeEeExecutorTaskAtBoundary(capture))
+    {
+        return result;
+    }
+
+    std::lock_guard<std::recursive_timed_mutex> lock(
+        m_guestExecutionMutex);
+    capture();
+    return result;
 }
 
 PS2Runtime::DebugEeTiming PS2Runtime::debugEeTimingSnapshot()
 {
+    DebugEeTiming result{};
+    const auto capture =
+        [this, &result]()
+        {
+            const R5900Context *const context =
+                m_boundEeContext
+                    ? m_boundEeContext
+                    : &m_cpuContext;
+            result.currentTick =
+                currentEeTick().raw();
+            result.currentCycle =
+                ps2x::timing::eeTickToCyclesFloor(
+                    currentEeTick());
+            result.localBlockTicks =
+                context->ee_block_cycle_ticks;
+            result.localBlockActive =
+                context->ee_block_cycle_active;
+            result.contextBound =
+                m_boundEeContext != nullptr;
+        };
+    if (invokeEeExecutorTaskAtBoundary(capture))
+    {
+        return result;
+    }
+
     std::lock_guard<std::recursive_timed_mutex> lock(
         m_guestExecutionMutex);
-    const R5900Context *const context =
-        m_boundEeContext ? m_boundEeContext : &m_cpuContext;
-    const uint64_t currentTick = currentEeTick().raw();
-
-    DebugEeTiming result{};
-    result.currentTick = currentTick;
-    result.currentCycle =
-        ps2x::timing::eeTickToCyclesFloor(
-            currentEeTick());
-    result.localBlockTicks = context->ee_block_cycle_ticks;
-    result.localBlockActive = context->ee_block_cycle_active;
-    result.contextBound = m_boundEeContext != nullptr;
+    capture();
     return result;
 }
 
 PS2Runtime::DebugEeScheduler
 PS2Runtime::debugEeSchedulerSnapshot()
 {
+    DebugEeScheduler result{};
+    const auto capture =
+        [this, &result]()
+        {
+            result.currentTick = currentEeTick().raw();
+            const auto next =
+                m_eeEventScheduler.nextDeadline();
+            if (next.has_value())
+            {
+                result.hasNextDeadline = true;
+                result.nextDeadlineTick = next->raw();
+            }
+            result.statistics =
+                m_eeEventScheduler.statistics();
+
+            for (size_t index = 0u;
+                 index < result.slots.size(); ++index)
+            {
+                DebugEeEventSlot &target =
+                    result.slots[index];
+                target.source =
+                    static_cast<
+                        ps2x::timing::EeEventSource>(
+                        index);
+                target.device =
+                    debugEeEventDeviceState(
+                        target.source);
+                const auto source =
+                    m_eeEventScheduler.event(
+                        target.source);
+                if (!source.has_value())
+                {
+                    continue;
+                }
+                target.pending = true;
+                target.deadlineTick =
+                    source->deadline.raw();
+                target.generation =
+                    source->token.generation;
+                target.sequence = source->sequence;
+            }
+        };
+    if (invokeEeExecutorTaskAtBoundary(capture))
+    {
+        return result;
+    }
+
     std::lock_guard<std::recursive_timed_mutex> lock(
         m_guestExecutionMutex);
-    DebugEeScheduler result{};
-    result.currentTick = currentEeTick().raw();
-    const auto next = m_eeEventScheduler.nextDeadline();
-    if (next.has_value())
-    {
-        result.hasNextDeadline = true;
-        result.nextDeadlineTick = next->raw();
-    }
-    result.statistics = m_eeEventScheduler.statistics();
-
-    for (size_t index = 0u;
-         index < result.slots.size(); ++index)
-    {
-        DebugEeEventSlot &target = result.slots[index];
-        target.source =
-            static_cast<ps2x::timing::EeEventSource>(index);
-        target.device =
-            debugEeEventDeviceState(target.source);
-        const auto source = m_eeEventScheduler.event(
-            target.source);
-        if (!source.has_value())
-        {
-            continue;
-        }
-        target.pending = true;
-        target.deadlineTick = source->deadline.raw();
-        target.generation = source->token.generation;
-        target.sequence = source->sequence;
-    }
+    capture();
     return result;
 }
 
 PS2Runtime::DebugVu1Timing
 PS2Runtime::debugVu1TimingSnapshot()
 {
+    DebugVu1Timing result{};
+    const auto capture =
+        [this, &result]()
+        {
+            result.currentTick =
+                currentEeTick().raw();
+            result.generation =
+                m_vu1ExecutionTiming.generation;
+            result.lastAdvancedTick =
+                m_vu1ExecutionTiming
+                    .lastAdvancedTick.raw();
+            result.totalAdvancedCycles =
+                m_vu1ExecutionTiming
+                    .totalAdvancedCycles;
+            result.pc = m_vu1.state().pc;
+            result.active = m_vu1.isActive();
+            result.vifWaitingForVu =
+                m_memory.vif1WaitingForVu();
+            const auto event =
+                m_eeEventScheduler.event(
+                    ps2x::timing::EeEventSource::
+                        VifVu1Finish);
+            if (event.has_value())
+            {
+                result.eventPending = true;
+                result.eventGeneration =
+                    event->token.generation;
+                result.eventDeadlineTick =
+                    event->deadline.raw();
+            }
+        };
+    if (invokeEeExecutorTaskAtBoundary(capture))
+    {
+        return result;
+    }
+
     std::lock_guard<std::recursive_timed_mutex> lock(
         m_guestExecutionMutex);
-    DebugVu1Timing result{};
-    result.currentTick = currentEeTick().raw();
-    result.generation = m_vu1ExecutionTiming.generation;
-    result.lastAdvancedTick =
-        m_vu1ExecutionTiming.lastAdvancedTick.raw();
-    result.totalAdvancedCycles =
-        m_vu1ExecutionTiming.totalAdvancedCycles;
-    result.pc = m_vu1.state().pc;
-    result.active = m_vu1.isActive();
-    result.vifWaitingForVu =
-        m_memory.vif1WaitingForVu();
-    const auto event = m_eeEventScheduler.event(
-        ps2x::timing::EeEventSource::VifVu1Finish);
-    if (event.has_value())
-    {
-        result.eventPending = true;
-        result.eventGeneration =
-            event->token.generation;
-        result.eventDeadlineTick =
-            event->deadline.raw();
-    }
+    capture();
     return result;
 }
 
@@ -8857,9 +9053,21 @@ bool PS2Runtime::debugReadRdram(uint32_t address,
         return false;
     }
 
-    std::lock_guard<std::recursive_timed_mutex> lock(m_guestExecutionMutex);
-    output.assign(m_memory.getRDRAM() + offset,
-                  m_memory.getRDRAM() + offset + size);
+    const auto capture =
+        [this, offset, size, &output]()
+        {
+            output.assign(
+                m_memory.getRDRAM() + offset,
+                m_memory.getRDRAM() + offset + size);
+        };
+    if (invokeEeExecutorTaskAtBoundary(capture))
+    {
+        return true;
+    }
+
+    std::lock_guard<std::recursive_timed_mutex> lock(
+        m_guestExecutionMutex);
+    capture();
     return true;
 }
 
@@ -8887,20 +9095,49 @@ bool PS2Runtime::debugReadMemory(uint32_t address,
         return false;
     }
 
-    std::lock_guard<std::recursive_timed_mutex> lock(m_guestExecutionMutex);
-    output.assign(base + offset, base + offset + size);
+    const auto capture =
+        [base, offset, size, &output]()
+        {
+            output.assign(
+                base + offset,
+                base + offset + size);
+        };
+    if (invokeEeExecutorTaskAtBoundary(capture))
+    {
+        return true;
+    }
+
+    std::lock_guard<std::recursive_timed_mutex> lock(
+        m_guestExecutionMutex);
+    capture();
     return true;
 }
 
 bool PS2Runtime::debugCopyGsVram(std::vector<uint8_t> &output)
 {
-    std::lock_guard<std::recursive_timed_mutex> lock(m_guestExecutionMutex);
-    if (!m_boundGSVram)
+    bool copied = false;
+    const auto capture =
+        [this, &output, &copied]()
+        {
+            if (!m_boundGSVram)
+            {
+                return;
+            }
+            output.assign(
+                m_boundGSVram,
+                m_boundGSVram +
+                    PS2_GS_VRAM_SIZE);
+            copied = true;
+        };
+    if (invokeEeExecutorTaskAtBoundary(capture))
     {
-        return false;
+        return copied;
     }
-    output.assign(m_boundGSVram, m_boundGSVram + PS2_GS_VRAM_SIZE);
-    return true;
+
+    std::lock_guard<std::recursive_timed_mutex> lock(
+        m_guestExecutionMutex);
+    capture();
+    return copied;
 }
 
 void PS2Runtime::recordEeThreadQueueRotation(

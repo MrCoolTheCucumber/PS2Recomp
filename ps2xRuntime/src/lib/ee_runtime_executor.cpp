@@ -436,6 +436,16 @@ namespace ps2x::ee
             return m_executorThreadId;
         }
 
+        [[nodiscard]] bool
+        ownsCurrentThread() const noexcept
+        {
+            std::lock_guard<std::mutex> lock(m_mutex);
+            return m_executorThreadId !=
+                       std::thread::id{} &&
+                   m_executorThreadId ==
+                       std::this_thread::get_id();
+        }
+
         [[nodiscard]] EeRuntimeExecutorStatistics
         statistics() const noexcept
         {
@@ -572,11 +582,7 @@ namespace ps2x::ee
 
         [[nodiscard]] bool isExecutorThread() const
         {
-            std::lock_guard<std::mutex> lock(m_mutex);
-            return m_executorThreadId !=
-                       std::thread::id{} &&
-                   m_executorThreadId ==
-                       std::this_thread::get_id();
+            return ownsCurrentThread();
         }
 
         [[nodiscard]] bool
@@ -1128,6 +1134,12 @@ namespace ps2x::ee
     EeRuntimeExecutor::executorThreadId() const noexcept
     {
         return m_impl->executorThreadId();
+    }
+
+    bool EeRuntimeExecutor::ownsCurrentThread()
+        const noexcept
+    {
+        return m_impl->ownsCurrentThread();
     }
 
     EeRuntimeExecutorStatistics

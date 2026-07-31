@@ -1497,6 +1497,9 @@ private:
         R5900Context *context,
         int threadId);
     void markGuestExecutionAcquired();
+    [[nodiscard]] bool
+    invokeEeExecutorTaskAtBoundary(
+        std::function<void()> task);
     void debugBeforeGuestStep(R5900Context *ctx);
     void debugAfterGuestStep(R5900Context *ctx);
     void debugBlockGuestAtBoundary(R5900Context *ctx, const char *reason);

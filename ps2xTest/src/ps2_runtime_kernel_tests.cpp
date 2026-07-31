@@ -170,6 +170,9 @@ namespace
     constexpr uint32_t
         K_SETUP_THREAD_ROOT_WORKER_ENTRY =
             0x25ba00u;
+    constexpr uint32_t
+        K_EXECUTOR_BOUNDARY_SNAPSHOT_ENTRY =
+            0x25bb00u;
     constexpr uint32_t K_EXECUTOR_MPEG_ADDR =
         0x00123000u;
     constexpr uint32_t K_EXECUTOR_MPEG_IMAGE_ADDR =
@@ -366,6 +369,12 @@ namespace
         false};
     std::atomic<bool> g_executorDebugBoundaryApplied{
         false};
+    std::atomic<bool>
+        g_executorBoundarySnapshotEntered{false};
+    std::atomic<bool>
+        g_executorBoundarySnapshotRelease{false};
+    std::atomic<bool>
+        g_executorBoundarySnapshotCompleted{false};
     std::atomic<uint32_t> g_executorCheckpointEntries{
         0u};
     std::atomic<bool> g_executorCheckpointProbeAllowed{
@@ -2769,6 +2778,27 @@ namespace
                 : K_EXECUTOR_DEBUG_SPIN_ENTRY;
     }
 
+    void dedicatedExecutorBoundarySnapshotHandler(
+        uint8_t *,
+        R5900Context *ctx,
+        PS2Runtime *runtime)
+    {
+        g_executorBoundarySnapshotEntered.store(
+            true, std::memory_order_release);
+        while (!g_executorBoundarySnapshotRelease.load(
+            std::memory_order_acquire))
+        {
+            std::this_thread::yield();
+        }
+
+        ctx->pc =
+            K_EXECUTOR_BOUNDARY_SNAPSHOT_ENTRY;
+        (void)runtime->checkpointGuestExecution(ctx);
+        g_executorBoundarySnapshotCompleted.store(
+            true, std::memory_order_release);
+        ctx->pc = 0u;
+    }
+
     void dedicatedExecutorCheckpointHandler(
         uint8_t *,
         R5900Context *ctx,
@@ -3219,6 +3249,10 @@ void register_ps2_runtime_kernel_tests()
                 configuration
                     .useEeExecutionBackendEnvironment =
                     false;
+                configuration.eeThreadDiagnostics = true;
+                configuration
+                    .useEeThreadDiagnosticsEnvironment =
+                    false;
                 PS2Runtime runtime(configuration);
                 const bool memoryInitialized =
                     runtime.memory().initialize();
@@ -3341,6 +3375,30 @@ void register_ps2_runtime_kernel_tests()
                     size_t{0u},
                     "executor shutdown should destroy "
                     "every runtime-owned continuation");
+                const PS2Runtime::DebugEeThreadDiagnostics
+                    diagnostics =
+                        runtime
+                            .debugEeThreadDiagnosticsSnapshot();
+                t.Equals(
+                    diagnostics.guestLockRequests,
+                    0u,
+                    "fiber handoffs should not request the legacy guest-execution mutex");
+                t.Equals(
+                    diagnostics.guestLockAcquisitions,
+                    0u,
+                    "fiber handoffs should not acquire the legacy guest-execution mutex");
+                t.Equals(
+                    diagnostics.handoffNotifications,
+                    0u,
+                    "fiber handoffs should not notify the legacy guest-execution condition variable");
+                t.Equals(
+                    diagnostics.handoffCvWaits,
+                    0u,
+                    "fiber handoffs should not wait on the legacy guest-execution condition variable");
+                t.Equals(
+                    diagnostics.guestSwitchCvWaits,
+                    0u,
+                    "fiber scheduling should not wait on a legacy guest-switch condition variable");
             });
 
         tc.Run(
@@ -5720,6 +5778,121 @@ void register_ps2_runtime_kernel_tests()
                             "priority and ownership "
                             "authoritative");
                 }
+            });
+
+        tc.Run(
+            "fiber debug snapshots execute at an acknowledged boundary",
+            [](TestCase &t)
+            {
+                if (!eeExecutionBackendBuildInfo()
+                         .boostContextFcontextAvailable)
+                {
+                    return;
+                }
+
+                PS2RuntimeConfiguration configuration{};
+                configuration.eeExecutionBackend =
+                    EeExecutionBackendKind::
+                        LegacyCppFiber;
+                configuration
+                    .useEeExecutionBackendEnvironment =
+                    false;
+                PS2Runtime runtime(configuration);
+                const bool memoryInitialized =
+                    runtime.memory().initialize();
+                if (!memoryInitialized)
+                {
+                    t.IsTrue(
+                        false,
+                        "fiber snapshot fixture memory should initialize");
+                    return;
+                }
+
+                runtime.registerFunction(
+                    K_EXECUTOR_BOUNDARY_SNAPSHOT_ENTRY,
+                    &dedicatedExecutorBoundarySnapshotHandler);
+                runtime.cpu().pc =
+                    K_EXECUTOR_BOUNDARY_SNAPSHOT_ENTRY;
+                setRegU32(
+                    runtime.cpu(),
+                    29,
+                    0x00300000u);
+                g_executorBoundarySnapshotEntered.store(
+                    false, std::memory_order_release);
+                g_executorBoundarySnapshotRelease.store(
+                    false, std::memory_order_release);
+                g_executorBoundarySnapshotCompleted.store(
+                    false, std::memory_order_release);
+
+                runtime
+                    .startDedicatedEeExecutionForTesting();
+                const bool guestEntered = waitUntil(
+                    []()
+                    {
+                        return g_executorBoundarySnapshotEntered
+                            .load(
+                                std::memory_order_acquire);
+                    },
+                    std::chrono::seconds(2));
+
+                std::atomic<bool> snapshotReturned{
+                    false};
+                std::thread snapshotThread;
+                if (guestEntered)
+                {
+                    snapshotThread = std::thread(
+                        [&runtime, &snapshotReturned]()
+                        {
+                            (void)runtime
+                                .debugCpuSnapshot();
+                            snapshotReturned.store(
+                                true,
+                                std::memory_order_release);
+                        });
+                }
+                const bool returnedBeforeBoundary =
+                    guestEntered &&
+                    waitUntil(
+                        [&snapshotReturned]()
+                        {
+                            return snapshotReturned.load(
+                                std::memory_order_acquire);
+                        },
+                        std::chrono::milliseconds(100));
+
+                g_executorBoundarySnapshotRelease.store(
+                    true, std::memory_order_release);
+                const bool completed =
+                    guestEntered &&
+                    waitUntil(
+                        [&runtime, &snapshotReturned]()
+                        {
+                            return snapshotReturned.load(
+                                       std::memory_order_acquire) &&
+                                   g_executorBoundarySnapshotCompleted
+                                       .load(
+                                           std::memory_order_acquire) &&
+                                   runtime
+                                           .managedEeExecutionThreadCountForTesting() ==
+                                       0u;
+                        },
+                        std::chrono::seconds(2));
+                if (snapshotThread.joinable())
+                {
+                    snapshotThread.join();
+                }
+                runtime
+                    .stopDedicatedEeExecutionForTesting();
+
+                t.IsTrue(
+                    guestEntered,
+                    "the guest should enter its deliberately uncheckpointed region");
+                t.IsFalse(
+                    returnedBeforeBoundary,
+                    "an external snapshot must not read guest state while a continuation is between scheduler boundaries");
+                t.IsTrue(
+                    completed,
+                    "the snapshot should complete after the guest reaches its explicit checkpoint");
             });
 
         tc.Run(

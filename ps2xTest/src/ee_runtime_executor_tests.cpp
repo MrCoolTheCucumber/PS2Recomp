@@ -1532,9 +1532,16 @@ void register_ee_runtime_executor_tests()
                 std::thread::id firstEntryThread;
                 std::thread::id firstResumeThread;
                 std::thread::id secondEntryThread;
+                bool setupOwnsExecutor = false;
+                bool firstEntryOwnsExecutor = false;
+                bool firstResumeOwnsExecutor = false;
+                bool secondEntryOwnsExecutor = false;
+                bool boundaryOwnsExecutor = false;
                 std::mutex completionMutex;
                 std::condition_variable completionCv;
                 int completions = 0;
+                const bool callerOwnedBeforeStart =
+                    executor.ownsCurrentThread();
 
                 executor.start(
                     [&](EeThreadScheduler &scheduler,
@@ -1542,10 +1549,14 @@ void register_ee_runtime_executor_tests()
                     {
                         setupThread =
                             std::this_thread::get_id();
+                        setupOwnsExecutor =
+                            executor.ownsCurrentThread();
                         selectedBackend.create(1, [&]()
                         {
                             firstEntryThread =
                                 std::this_thread::get_id();
+                            firstEntryOwnsExecutor =
+                                executor.ownsCurrentThread();
                             selectedBackend.yieldCurrent(
                                 {
                                     EeSchedulerExitReason::
@@ -1556,6 +1567,8 @@ void register_ee_runtime_executor_tests()
                                 });
                             firstResumeThread =
                                 std::this_thread::get_id();
+                            firstResumeOwnsExecutor =
+                                executor.ownsCurrentThread();
                             {
                                 std::lock_guard<std::mutex>
                                     lock(completionMutex);
@@ -1567,6 +1580,8 @@ void register_ee_runtime_executor_tests()
                         {
                             secondEntryThread =
                                 std::this_thread::get_id();
+                            secondEntryOwnsExecutor =
+                                executor.ownsCurrentThread();
                             {
                                 std::lock_guard<std::mutex>
                                     lock(completionMutex);
@@ -1602,6 +1617,8 @@ void register_ee_runtime_executor_tests()
                             IEeExecutionBackend &
                                 selectedBackend)
                         {
+                            boundaryOwnsExecutor =
+                                executor.ownsCurrentThread();
                             const auto first =
                                 scheduler.thread(1);
                             const auto second =
@@ -1625,6 +1642,8 @@ void register_ee_runtime_executor_tests()
                 executor.requestStop();
                 executor.join();
                 executor.rethrowFailure();
+                const bool callerOwnedAfterJoin =
+                    executor.ownsCurrentThread();
 
                 const EeRuntimeExecutorStatistics stats =
                     executor.statistics();
@@ -1642,6 +1661,16 @@ void register_ee_runtime_executor_tests()
                     "setup, entry, yield resume, and peer "
                     "entry should share one dedicated host "
                     "thread");
+                t.IsTrue(
+                    !callerOwnedBeforeStart &&
+                        setupOwnsExecutor &&
+                        firstEntryOwnsExecutor &&
+                        firstResumeOwnsExecutor &&
+                        secondEntryOwnsExecutor &&
+                        boundaryOwnsExecutor &&
+                        !callerOwnedAfterJoin,
+                    "executor ownership should be true only "
+                    "on its live dedicated host thread");
                 t.IsTrue(
                     validFinalState &&
                         managedAtBoundary == 0u &&

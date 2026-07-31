@@ -123,6 +123,8 @@ namespace ps2x::ee
         acceptingPublications() const noexcept;
         [[nodiscard]] std::thread::id
         executorThreadId() const noexcept;
+        [[nodiscard]] bool
+        ownsCurrentThread() const noexcept;
         [[nodiscard]] EeRuntimeExecutorStatistics
         statistics() const noexcept;
         [[nodiscard]] std::exception_ptr
