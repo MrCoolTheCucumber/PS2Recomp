@@ -17,12 +17,43 @@ Accepted values are:
 An unknown value fails runtime construction. Selecting `legacy-cpp-fiber` on
 a build without the validated Boost.Context `fcontext` implementation also
 fails instead of silently selecting host threads. Runtime diagnostics report
-the selected backend, Boost version, target architecture, ABI, and context
-implementation.
+the context build mode, selected backend, Boost version, target architecture,
+ABI, and context implementation.
 
-Production Linux x86-64 and Windows x64 builds use `fcontext`. Sanitizer
-results must identify their context mode explicitly: the no-fcontext fallback
-can validate scheduler, executor, and publication code, but it is not
-coverage of a production context switch. A sanitizer-only `ucontext` build
-may supplement production testing in the future; it must not replace
-`fcontext` correctness or performance gates.
+## Context build modes
+
+`PS2X_EE_CONTEXT_BUILD_MODE` makes the continuation contract explicit:
+
+| Mode | Supported target | Context contract |
+| --- | --- | --- |
+| `production-fcontext` | Linux x86-64 or Windows x64 MSVC | Requires `PS2X_ENABLE_EE_CPP_FIBER_BACKEND=ON` and exact Boost 1.91.0 `fcontext`. This is the production, performance, and platform-CI mode. |
+| `host-fallback` | Any target | Uses `legacy-host-thread`. On a supported `fcontext` target, the fiber backend must be explicitly disabled. |
+| `sanitizer-no-fcontext` | Linux only | Requires the fiber backend to be explicitly disabled. It covers host-thread, scheduler, publication, reset, and leak behavior, but not the production context switch. |
+
+Contradictory combinations fail configuration. The build never changes from
+`fcontext` to `ucontext`, WinFiber, or host threads silently.
+
+Linux sanitizer runs currently use `sanitizer-no-fcontext` and must retain
+their compiler sanitizer flags in the recorded configure command. For example:
+
+```sh
+cmake -S . -B build-asan \
+  -DCMAKE_BUILD_TYPE=Debug \
+  -DPS2X_EE_CONTEXT_BUILD_MODE=sanitizer-no-fcontext \
+  -DPS2X_ENABLE_EE_CPP_FIBER_BACKEND=OFF \
+  -DCMAKE_C_FLAGS="-fsanitize=address,undefined -fno-omit-frame-pointer" \
+  -DCMAKE_CXX_FLAGS="-fsanitize=address,undefined -fno-omit-frame-pointer"
+```
+
+Boost documents sanitizer integration through `ucontext`. A future
+Linux-only, sanitizer-only `ucontext` mode may supplement these checks, but
+it must have a distinct build-mode diagnostic and may never count as
+production `fcontext` correctness or performance coverage. No such mode is
+currently provided.
+
+Windows x64 production CI uses `production-fcontext`. Every Windows x64
+configuration that includes the fiber backend uses `/EHs` and disables
+IPO/LTCG across suspended frames. Windows MSVC ASan with the production Boost
+`fcontext` switch is not a supported project configuration, and the MSVC
+toolchain does not provide TSan. The Linux-only sanitizer mode therefore
+fails configuration on Windows instead of changing the context implementation.

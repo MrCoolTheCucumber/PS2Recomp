@@ -30,12 +30,12 @@ jobs:
             export CC=clang
             export CXX=clang++
           fi
-          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_C_FLAGS=-msse4.1 -DCMAKE_CXX_FLAGS=-msse4.1
+          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DPS2X_EE_CONTEXT_BUILD_MODE=production-fcontext -DPS2X_ENABLE_EE_CPP_FIBER_BACKEND=ON -DCMAKE_C_FLAGS=-msse4.1 -DCMAKE_CXX_FLAGS=-msse4.1
 
       - name: Build
         run: cmake --build build --config Release
 
-      - name: Tests
+      - name: Tests (production fcontext)
         run: ./build/ps2xTest/ps2x_tests
 
   windows-msvc:
@@ -63,10 +63,10 @@ jobs:
       - name: Build
         shell: cmd
         run: |
-          cmake -B build
+          cmake -B build -DPS2X_EE_CONTEXT_BUILD_MODE=production-fcontext -DPS2X_ENABLE_EE_CPP_FIBER_BACKEND=ON
           cmake --build build --config Release
 
-      - name: Tests
+      - name: Tests (production fcontext)
         shell: cmd
         run: |
           .\build\ps2xTest\Release\ps2x_tests.exe

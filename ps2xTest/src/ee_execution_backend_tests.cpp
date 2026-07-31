@@ -50,6 +50,61 @@ void register_ee_execution_backend_tests()
             });
 
         tc.Run(
+            "context build mode identifies the production and sanitizer contracts",
+            [](TestCase &t)
+            {
+                const EeExecutionBackendBuildInfo build =
+                    eeExecutionBackendBuildInfo();
+                const std::string diagnostics =
+                    eeExecutionBackendDiagnostics(
+                        EeExecutionBackendKind::
+                            LegacyHostThread);
+                const bool production =
+                    build.buildMode ==
+                    "production-fcontext";
+                const bool fallback =
+                    build.buildMode ==
+                    "host-fallback";
+                const bool sanitizer =
+                    build.buildMode ==
+                    "sanitizer-no-fcontext";
+                t.IsTrue(
+                    production || fallback ||
+                        sanitizer,
+                    "the EE context build mode should be one of the configured contracts");
+                t.IsTrue(
+                    diagnostics.find(
+                        std::string("build-mode=") +
+                        std::string(build.buildMode)) !=
+                        std::string::npos,
+                    "runtime diagnostics should preserve the exact configured context build mode");
+
+                if (production)
+                {
+                    t.IsTrue(
+                        build
+                                .boostContextFcontextAvailable &&
+                            build.boostVersion ==
+                                "1.91.0" &&
+                            build.contextImplementation ==
+                                "fcontext",
+                        "production-fcontext must expose the pinned production context switch");
+                }
+                else
+                {
+                    t.IsFalse(
+                        build
+                            .boostContextFcontextAvailable,
+                        "fallback and sanitizer-no-fcontext modes must not report production switch coverage");
+                    t.Equals(
+                        build.contextImplementation,
+                        std::string_view{
+                            "unavailable"},
+                        "non-production modes should report no Boost.Context implementation");
+                }
+            });
+
+        tc.Run(
             "fiber selection is explicit and never silently falls back",
             [](TestCase &t)
             {

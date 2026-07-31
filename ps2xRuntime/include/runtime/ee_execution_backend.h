@@ -33,6 +33,7 @@ struct EeExecutionBackendBuildInfo
     std::string_view binaryFormat = "unavailable";
     std::string_view abi = "unavailable";
     std::string_view contextImplementation = "unavailable";
+    std::string_view buildMode = "unidentified";
 };
 
 // Owns the native continuation mechanism used to execute EE guest threads.

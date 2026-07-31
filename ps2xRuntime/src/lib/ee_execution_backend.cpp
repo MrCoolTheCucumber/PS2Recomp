@@ -5,6 +5,10 @@
 #define PS2X_HAS_EE_CPP_FIBER_BACKEND 0
 #endif
 
+#ifndef PS2X_EE_CONTEXT_BUILD_MODE
+#define PS2X_EE_CONTEXT_BUILD_MODE "unidentified"
+#endif
+
 #if PS2X_HAS_EE_CPP_FIBER_BACKEND
 #include <boost/version.hpp>
 
@@ -700,17 +704,21 @@ bool parseEeExecutionBackendKind(
 EeExecutionBackendBuildInfo
 eeExecutionBackendBuildInfo() noexcept
 {
+    EeExecutionBackendBuildInfo build{};
+    build.buildMode =
+        PS2X_EE_CONTEXT_BUILD_MODE;
 #if PS2X_HAS_EE_CPP_FIBER_BACKEND
-    return {
-        true,
-        PS2X_EE_BOOST_VERSION,
-        PS2X_EE_BOOST_CONTEXT_ARCHITECTURE,
-        PS2X_EE_BOOST_CONTEXT_BINARY_FORMAT,
-        PS2X_EE_BOOST_CONTEXT_ABI,
-        PS2X_EE_BOOST_CONTEXT_IMPLEMENTATION};
-#else
-    return {};
+    build.boostContextFcontextAvailable = true;
+    build.boostVersion = PS2X_EE_BOOST_VERSION;
+    build.architecture =
+        PS2X_EE_BOOST_CONTEXT_ARCHITECTURE;
+    build.binaryFormat =
+        PS2X_EE_BOOST_CONTEXT_BINARY_FORMAT;
+    build.abi = PS2X_EE_BOOST_CONTEXT_ABI;
+    build.contextImplementation =
+        PS2X_EE_BOOST_CONTEXT_IMPLEMENTATION;
 #endif
+    return build;
 }
 
 std::string eeExecutionBackendDiagnostics(
@@ -730,7 +738,8 @@ std::string eeExecutionBackendDiagnostics(
         eeExecutionBackendBuildInfo();
 
     std::ostringstream out;
-    out << "selected=" << selectedName
+    out << "build-mode=" << build.buildMode
+        << ", selected=" << selectedName
         << ", Boost.Context="
         << (build.boostContextFcontextAvailable
                 ? "available"

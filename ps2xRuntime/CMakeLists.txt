@@ -84,6 +84,73 @@ if(CMAKE_SIZEOF_VOID_P EQUAL 8
 endif()
 set(PS2X_HAS_EE_CPP_FIBER_BACKEND OFF)
 
+if(NOT DEFINED PS2X_EE_CONTEXT_BUILD_MODE)
+    if(PS2X_ENABLE_EE_CPP_FIBER_BACKEND
+       AND PS2X_EE_FCONTEXT_PLATFORM_SUPPORTED)
+        set(PS2X_EE_CONTEXT_BUILD_MODE "production-fcontext")
+    else()
+        set(PS2X_EE_CONTEXT_BUILD_MODE "host-fallback")
+    endif()
+endif()
+set(PS2X_EE_CONTEXT_BUILD_MODE
+    "${PS2X_EE_CONTEXT_BUILD_MODE}"
+    CACHE STRING
+    "EE continuation contract: production-fcontext, host-fallback, or sanitizer-no-fcontext")
+set_property(
+    CACHE PS2X_EE_CONTEXT_BUILD_MODE
+    PROPERTY STRINGS
+        production-fcontext
+        host-fallback
+        sanitizer-no-fcontext)
+
+set(PS2X_EE_CONTEXT_BUILD_MODES
+    production-fcontext
+    host-fallback
+    sanitizer-no-fcontext)
+if(NOT PS2X_EE_CONTEXT_BUILD_MODE IN_LIST
+   PS2X_EE_CONTEXT_BUILD_MODES)
+    message(FATAL_ERROR
+        "Unknown PS2X_EE_CONTEXT_BUILD_MODE="
+        "${PS2X_EE_CONTEXT_BUILD_MODE}; expected production-fcontext, "
+        "host-fallback, or sanitizer-no-fcontext")
+endif()
+
+if(PS2X_EE_CONTEXT_BUILD_MODE STREQUAL
+   "production-fcontext")
+    if(NOT PS2X_EE_FCONTEXT_PLATFORM_SUPPORTED)
+        message(FATAL_ERROR
+            "production-fcontext requires Linux x86-64 or Windows x64 MSVC")
+    endif()
+    if(NOT PS2X_ENABLE_EE_CPP_FIBER_BACKEND)
+        message(FATAL_ERROR
+            "production-fcontext requires "
+            "PS2X_ENABLE_EE_CPP_FIBER_BACKEND=ON")
+    endif()
+elseif(PS2X_EE_CONTEXT_BUILD_MODE STREQUAL
+       "sanitizer-no-fcontext")
+    if(NOT CMAKE_SYSTEM_NAME STREQUAL "Linux")
+        message(FATAL_ERROR
+            "sanitizer-no-fcontext is supported only on Linux; "
+            "Windows MSVC ASan with suspended Boost fcontext frames and "
+            "Windows TSan are unsupported project configurations")
+    endif()
+    if(PS2X_ENABLE_EE_CPP_FIBER_BACKEND)
+        message(FATAL_ERROR
+            "sanitizer-no-fcontext requires "
+            "PS2X_ENABLE_EE_CPP_FIBER_BACKEND=OFF; "
+            "the context implementation is never changed silently")
+    endif()
+elseif(PS2X_EE_FCONTEXT_PLATFORM_SUPPORTED
+       AND PS2X_ENABLE_EE_CPP_FIBER_BACKEND)
+    message(FATAL_ERROR
+        "host-fallback on a supported fcontext platform requires "
+        "PS2X_ENABLE_EE_CPP_FIBER_BACKEND=OFF")
+endif()
+
+message(STATUS
+    "PS2X EE context build mode: "
+    "${PS2X_EE_CONTEXT_BUILD_MODE}")
+
 option(PS2X_VITA_CREATE_PACKAGE "Create Vita eboot/vpk targets" ON)
 set(PS2X_VITA_APP_NAME "PS2 Retro X" CACHE STRING "Display name for the Vita bubble")
 set(PS2X_VITA_TITLEID "RANJ00001" CACHE STRING "9-character Vita title id")
@@ -534,6 +601,9 @@ else()
         PS2X_HAS_EE_CPP_FIBER_BACKEND=0
     )
 endif()
+target_compile_definitions(ps2_runtime PRIVATE
+    PS2X_EE_CONTEXT_BUILD_MODE="${PS2X_EE_CONTEXT_BUILD_MODE}"
+)
 
 set(PS2X_HAS_GS_AVX2_KERNEL OFF)
 if(PS2X_ENABLE_GS_AVX2_KERNEL
