@@ -1,5 +1,6 @@
 #include "Common.h"
 #include "Interrupt.h"
+#include "Helpers/InterruptRuntimeState.h"
 #include "ps2_log.h"
 #include "Stubs/GS.h"
 
@@ -10,13 +11,6 @@ namespace ps2_syscalls
         constexpr uint32_t kIntcVblankStart = 2u;
         constexpr uint32_t kIntcVblankEnd = 3u;
         constexpr uint32_t kMaxIrqHandlerSteps = 4096u;
-
-        std::mutex g_irq_handler_mutex;
-        std::mutex g_vsync_flag_mutex;
-        uint32_t g_enabled_intc_mask = 0xFFFFFFFFu;
-        uint32_t g_enabled_dmac_mask = 0xFFFFFFFFu;
-        uint64_t g_vsync_tick_counter = 0u;
-        VSyncFlagRegistration g_vsync_registration{};
     }
 
     using namespace interrupt_state;
@@ -69,26 +63,6 @@ namespace ps2_syscalls
         return value;
     }
 
-    static uint32_t getAsyncHandlerStackTop(PS2Runtime *runtime)
-    {
-        constexpr uint32_t kAsyncHandlerStackSize = 0x4000u;
-        thread_local PS2Runtime *s_cachedRuntime = nullptr;
-        thread_local uint32_t s_cachedStackTop = 0u;
-
-        if (runtime == nullptr)
-        {
-            return PS2_RAM_SIZE - 0x10u;
-        }
-
-        if (s_cachedRuntime != runtime || s_cachedStackTop == 0u)
-        {
-            s_cachedRuntime = runtime;
-            s_cachedStackTop = runtime->reserveAsyncCallbackStack(kAsyncHandlerStackSize, 16u);
-        }
-
-        return (s_cachedStackTop != 0u) ? s_cachedStackTop : (PS2_RAM_SIZE - 0x10u);
-    }
-
     void dispatchIntcHandlersForCause(uint8_t *rdram, PS2Runtime *runtime, uint32_t cause)
     {
         if (!rdram || !runtime)
@@ -96,16 +70,22 @@ namespace ps2_syscalls
             return;
         }
 
+        EeInterruptRuntimeState &state =
+            runtime->eeInterruptRuntimeState();
         std::vector<IrqHandlerInfo> handlers;
         {
-            std::lock_guard<std::mutex> lock(g_irq_handler_mutex);
-            if (cause < 32u && (g_enabled_intc_mask & (1u << cause)) == 0u)
+            std::lock_guard<std::mutex> lock(
+                state.handlerMutex);
+            if (cause < 32u &&
+                (state.enabledIntcMask &
+                 (1u << cause)) == 0u)
             {
                 return;
             }
 
-            handlers.reserve(g_intcHandlers.size());
-            for (const auto &[id, info] : g_intcHandlers)
+            handlers.reserve(state.intcHandlers.size());
+            for (const auto &[id, info] :
+                 state.intcHandlers)
             {
                 (void)id;
                 if (!info.enabled)
@@ -152,9 +132,13 @@ namespace ps2_syscalls
 
             try
             {
-                R5900Context irqCtx{};
+                EeAsyncCallbackContextLease callback(
+                    state, *runtime);
+                R5900Context &irqCtx =
+                    callback.context();
                 SET_GPR_U32(&irqCtx, 28, info.gp);
-                SET_GPR_U32(&irqCtx, 29, getAsyncHandlerStackTop(runtime));
+                SET_GPR_U32(
+                    &irqCtx, 29, callback.stackTop());
                 SET_GPR_U32(&irqCtx, 31, 0u);
                 SET_GPR_U32(&irqCtx, 4, cause);
                 SET_GPR_U32(&irqCtx, 5, info.arg);
@@ -213,12 +197,19 @@ namespace ps2_syscalls
         }
     }
 
-    bool isIntcCauseEnabled(uint32_t cause)
+    bool isIntcCauseEnabled(
+        PS2Runtime *runtime, uint32_t cause)
     {
+        if (!runtime)
+        {
+            return false;
+        }
+        EeInterruptRuntimeState &state =
+            runtime->eeInterruptRuntimeState();
         std::lock_guard<std::mutex> lock(
-            g_irq_handler_mutex);
+            state.handlerMutex);
         return cause < 32u &&
-               (g_enabled_intc_mask &
+               (state.enabledIntcMask &
                 (1u << cause)) != 0u;
     }
 
@@ -229,16 +220,22 @@ namespace ps2_syscalls
             return;
         }
 
+        EeInterruptRuntimeState &state =
+            runtime->eeInterruptRuntimeState();
         std::vector<IrqHandlerInfo> handlers;
         {
-            std::lock_guard<std::mutex> lock(g_irq_handler_mutex);
-            if (cause < 32u && (g_enabled_dmac_mask & (1u << cause)) == 0u)
+            std::lock_guard<std::mutex> lock(
+                state.handlerMutex);
+            if (cause < 32u &&
+                (state.enabledDmacMask &
+                 (1u << cause)) == 0u)
             {
                 return;
             }
 
-            handlers.reserve(g_dmacHandlers.size());
-            for (const auto &[id, info] : g_dmacHandlers)
+            handlers.reserve(state.dmacHandlers.size());
+            for (const auto &[id, info] :
+                 state.dmacHandlers)
             {
                 (void)id;
                 if (!info.enabled)
@@ -268,9 +265,13 @@ namespace ps2_syscalls
 
             try
             {
-                R5900Context irqCtx{};
+                EeAsyncCallbackContextLease callback(
+                    state, *runtime);
+                R5900Context &irqCtx =
+                    callback.context();
                 SET_GPR_U32(&irqCtx, 28, info.gp);
-                SET_GPR_U32(&irqCtx, 29, getAsyncHandlerStackTop(runtime));
+                SET_GPR_U32(
+                    &irqCtx, 29, callback.stackTop());
                 SET_GPR_U32(&irqCtx, 31, 0u);
                 SET_GPR_U32(&irqCtx, 4, cause);
                 SET_GPR_U32(&irqCtx, 5, info.arg);
@@ -330,15 +331,18 @@ namespace ps2_syscalls
         }
     }
 
-    bool isDmacCauseEnabled(uint32_t cause)
+    bool isDmacCauseEnabled(
+        PS2Runtime *runtime, uint32_t cause)
     {
-        if (cause >= 32u)
+        if (!runtime || cause >= 32u)
         {
             return false;
         }
+        EeInterruptRuntimeState &state =
+            runtime->eeInterruptRuntimeState();
         std::lock_guard<std::mutex> lock(
-            g_irq_handler_mutex);
-        return (g_enabled_dmac_mask &
+            state.handlerMutex);
+        return (state.enabledDmacMask &
                 (1u << cause)) != 0u;
     }
 
@@ -363,13 +367,21 @@ namespace ps2_syscalls
 
     static uint64_t signalVSyncFlag(uint8_t *rdram, PS2Runtime *runtime)
     {
-        VSyncFlagRegistration reg{};
+        if (!runtime)
+        {
+            return 0u;
+        }
+
+        EeInterruptRuntimeState &state =
+            runtime->eeInterruptRuntimeState();
+        EeVSyncFlagRegistration reg{};
         uint64_t tickValue = 0u;
         {
-            std::lock_guard<std::mutex> lock(g_vsync_flag_mutex);
-            reg = g_vsync_registration;
-            g_vsync_registration = {};
-            tickValue = ++g_vsync_tick_counter;
+            std::lock_guard<std::mutex> lock(
+                state.vsyncMutex);
+            reg = state.vsyncRegistration;
+            state.vsyncRegistration = {};
+            tickValue = ++state.vsyncTick;
         }
 
         if (reg.flagAddr != 0u)
@@ -421,10 +433,19 @@ namespace ps2_syscalls
         }
     }
 
-    uint64_t GetCurrentVSyncTick()
+    uint64_t GetCurrentVSyncTick(
+        PS2Runtime *runtime)
     {
-        std::lock_guard<std::mutex> lock(g_vsync_flag_mutex);
-        return g_vsync_tick_counter;
+        if (!runtime)
+        {
+            return 0u;
+        }
+
+        EeInterruptRuntimeState &state =
+            runtime->eeInterruptRuntimeState();
+        std::lock_guard<std::mutex> lock(
+            state.vsyncMutex);
+        return state.vsyncTick;
     }
 
     uint64_t WaitForNextVSyncTick(
@@ -435,14 +456,16 @@ namespace ps2_syscalls
         EnsureVSyncScheduled(rdram, runtime);
         if (!runtime)
         {
-            return GetCurrentVSyncTick();
+            return 0u;
         }
 
+        EeInterruptRuntimeState &state =
+            runtime->eeInterruptRuntimeState();
         uint64_t current = 0u;
         {
             std::lock_guard<std::mutex> lock(
-                g_vsync_flag_mutex);
-            current = g_vsync_tick_counter;
+                state.vsyncMutex);
+            current = state.vsyncTick;
         }
         return runtime->waitForNextScheduledVSync(
             rdram, ctx, current);
@@ -455,13 +478,22 @@ namespace ps2_syscalls
 
     void SetVSyncFlag(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
+        if (!runtime)
+        {
+            setReturnS32(ctx, KE_ERROR);
+            return;
+        }
+
+        EeInterruptRuntimeState &state =
+            runtime->eeInterruptRuntimeState();
         const uint32_t flagAddr = getRegU32(ctx, 4);
         const uint32_t tickAddr = getRegU32(ctx, 5);
 
         {
-            std::lock_guard<std::mutex> lock(g_vsync_flag_mutex);
-            g_vsync_registration.flagAddr = flagAddr;
-            g_vsync_registration.tickAddr = tickAddr;
+            std::lock_guard<std::mutex> lock(
+                state.vsyncMutex);
+            state.vsyncRegistration.flagAddr = flagAddr;
+            state.vsyncRegistration.tickAddr = tickAddr;
         }
 
         writeGuestU32NoThrow(rdram, flagAddr, 0u);
@@ -472,17 +504,24 @@ namespace ps2_syscalls
 
     void EnableIntc(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
+        if (!runtime)
+        {
+            setReturnS32(ctx, KE_ERROR);
+            return;
+        }
+
+        EeInterruptRuntimeState &state =
+            runtime->eeInterruptRuntimeState();
         const uint32_t cause = getRegU32(ctx, 4);
         if (cause < 32u)
         {
-            std::lock_guard<std::mutex> lock(g_irq_handler_mutex);
-            g_enabled_intc_mask |= (1u << cause);
+            std::lock_guard<std::mutex> lock(
+                state.handlerMutex);
+            state.enabledIntcMask |=
+                (1u << cause);
         }
-        if (runtime)
-        {
-            runtime->memory().setIntcInterruptMask(
-                cause, true);
-        }
+        runtime->memory().setIntcInterruptMask(
+            cause, true);
         if (cause == kIntcVblankStart || cause == kIntcVblankEnd)
         {
             PS2_IF_AGRESSIVE_LOGS({
@@ -504,17 +543,24 @@ namespace ps2_syscalls
 
     void DisableIntc(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
+        if (!runtime)
+        {
+            setReturnS32(ctx, KE_ERROR);
+            return;
+        }
+
+        EeInterruptRuntimeState &state =
+            runtime->eeInterruptRuntimeState();
         const uint32_t cause = getRegU32(ctx, 4);
         if (cause < 32u)
         {
-            std::lock_guard<std::mutex> lock(g_irq_handler_mutex);
-            g_enabled_intc_mask &= ~(1u << cause);
+            std::lock_guard<std::mutex> lock(
+                state.handlerMutex);
+            state.enabledIntcMask &=
+                ~(1u << cause);
         }
-        if (runtime)
-        {
-            runtime->memory().setIntcInterruptMask(
-                cause, false);
-        }
+        runtime->memory().setIntcInterruptMask(
+            cause, false);
         if (cause == kIntcVblankStart || cause == kIntcVblankEnd)
         {
             PS2_IF_AGRESSIVE_LOGS({
@@ -536,6 +582,14 @@ namespace ps2_syscalls
 
     void AddIntcHandler(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
+        if (!runtime)
+        {
+            setReturnS32(ctx, KE_ERROR);
+            return;
+        }
+
+        EeInterruptRuntimeState &state =
+            runtime->eeInterruptRuntimeState();
         IrqHandlerInfo info{};
         info.cause = getRegU32(ctx, 4);
         info.handler = getRegU32(ctx, 5);
@@ -547,11 +601,15 @@ namespace ps2_syscalls
 
         int handlerId = 0;
         {
-            std::lock_guard<std::mutex> lock(g_irq_handler_mutex);
-            info.order = (next == 0) ? --g_intc_head_order : ++g_intc_tail_order;
-            handlerId = g_nextIntcHandlerId++;
+            std::lock_guard<std::mutex> lock(
+                state.handlerMutex);
+            info.order =
+                (next == 0)
+                    ? --state.intcHeadOrder
+                    : ++state.intcTailOrder;
+            handlerId = state.nextIntcHandlerId++;
             info.id = handlerId;
-            g_intcHandlers[handlerId] = info;
+            state.intcHandlers[handlerId] = info;
         }
 
         if (info.cause == kIntcVblankStart)
@@ -586,15 +644,25 @@ namespace ps2_syscalls
 
     void RemoveIntcHandler(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
+        if (!runtime)
+        {
+            setReturnS32(ctx, KE_ERROR);
+            return;
+        }
+
+        EeInterruptRuntimeState &state =
+            runtime->eeInterruptRuntimeState();
         const uint32_t cause = getRegU32(ctx, 4);
         const int handlerId = static_cast<int>(getRegU32(ctx, 5));
         if (handlerId > 0)
         {
-            std::lock_guard<std::mutex> lock(g_irq_handler_mutex);
-            auto it = g_intcHandlers.find(handlerId);
-            if (it != g_intcHandlers.end() && it->second.cause == cause)
+            std::lock_guard<std::mutex> lock(
+                state.handlerMutex);
+            auto it = state.intcHandlers.find(handlerId);
+            if (it != state.intcHandlers.end() &&
+                it->second.cause == cause)
             {
-                g_intcHandlers.erase(it);
+                state.intcHandlers.erase(it);
             }
         }
         setReturnS32(ctx, KE_OK);
@@ -602,6 +670,14 @@ namespace ps2_syscalls
 
     void AddDmacHandler(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
+        if (!runtime)
+        {
+            setReturnS32(ctx, KE_ERROR);
+            return;
+        }
+
+        EeInterruptRuntimeState &state =
+            runtime->eeInterruptRuntimeState();
         IrqHandlerInfo info{};
         info.cause = getRegU32(ctx, 4);
         info.handler = getRegU32(ctx, 5);
@@ -613,11 +689,15 @@ namespace ps2_syscalls
 
         int handlerId = 0;
         {
-            std::lock_guard<std::mutex> lock(g_irq_handler_mutex);
-            info.order = (next == 0) ? --g_dmac_head_order : ++g_dmac_tail_order;
-            handlerId = g_nextDmacHandlerId++;
+            std::lock_guard<std::mutex> lock(
+                state.handlerMutex);
+            info.order =
+                (next == 0)
+                    ? --state.dmacHeadOrder
+                    : ++state.dmacTailOrder;
+            handlerId = state.nextDmacHandlerId++;
             info.id = handlerId;
-            g_dmacHandlers[handlerId] = info;
+            state.dmacHandlers[handlerId] = info;
         }
         setReturnS32(ctx, handlerId);
     }
@@ -629,15 +709,25 @@ namespace ps2_syscalls
 
     void RemoveDmacHandler(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
+        if (!runtime)
+        {
+            setReturnS32(ctx, KE_ERROR);
+            return;
+        }
+
+        EeInterruptRuntimeState &state =
+            runtime->eeInterruptRuntimeState();
         const uint32_t cause = getRegU32(ctx, 4);
         const int handlerId = static_cast<int>(getRegU32(ctx, 5));
         if (handlerId > 0)
         {
-            std::lock_guard<std::mutex> lock(g_irq_handler_mutex);
-            auto it = g_dmacHandlers.find(handlerId);
-            if (it != g_dmacHandlers.end() && it->second.cause == cause)
+            std::lock_guard<std::mutex> lock(
+                state.handlerMutex);
+            auto it = state.dmacHandlers.find(handlerId);
+            if (it != state.dmacHandlers.end() &&
+                it->second.cause == cause)
             {
-                g_dmacHandlers.erase(it);
+                state.dmacHandlers.erase(it);
             }
         }
         setReturnS32(ctx, KE_OK);
@@ -645,10 +735,21 @@ namespace ps2_syscalls
 
     void EnableIntcHandler(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
+        if (!runtime)
+        {
+            setReturnS32(ctx, KE_ERROR);
+            return;
+        }
+
+        EeInterruptRuntimeState &state =
+            runtime->eeInterruptRuntimeState();
         const int handlerId = static_cast<int>(getRegU32(ctx, 5));
         {
-            std::lock_guard<std::mutex> lock(g_irq_handler_mutex);
-            if (auto it = g_intcHandlers.find(handlerId); it != g_intcHandlers.end())
+            std::lock_guard<std::mutex> lock(
+                state.handlerMutex);
+            if (auto it =
+                    state.intcHandlers.find(handlerId);
+                it != state.intcHandlers.end())
             {
                 it->second.enabled = true;
             }
@@ -658,10 +759,21 @@ namespace ps2_syscalls
 
     void DisableIntcHandler(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
+        if (!runtime)
+        {
+            setReturnS32(ctx, KE_ERROR);
+            return;
+        }
+
+        EeInterruptRuntimeState &state =
+            runtime->eeInterruptRuntimeState();
         const int handlerId = static_cast<int>(getRegU32(ctx, 5));
         {
-            std::lock_guard<std::mutex> lock(g_irq_handler_mutex);
-            if (auto it = g_intcHandlers.find(handlerId); it != g_intcHandlers.end())
+            std::lock_guard<std::mutex> lock(
+                state.handlerMutex);
+            if (auto it =
+                    state.intcHandlers.find(handlerId);
+                it != state.intcHandlers.end())
             {
                 it->second.enabled = false;
             }
@@ -671,10 +783,21 @@ namespace ps2_syscalls
 
     void EnableDmacHandler(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
+        if (!runtime)
+        {
+            setReturnS32(ctx, KE_ERROR);
+            return;
+        }
+
+        EeInterruptRuntimeState &state =
+            runtime->eeInterruptRuntimeState();
         const int handlerId = static_cast<int>(getRegU32(ctx, 5));
         {
-            std::lock_guard<std::mutex> lock(g_irq_handler_mutex);
-            if (auto it = g_dmacHandlers.find(handlerId); it != g_dmacHandlers.end())
+            std::lock_guard<std::mutex> lock(
+                state.handlerMutex);
+            if (auto it =
+                    state.dmacHandlers.find(handlerId);
+                it != state.dmacHandlers.end())
             {
                 it->second.enabled = true;
             }
@@ -684,10 +807,21 @@ namespace ps2_syscalls
 
     void DisableDmacHandler(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
+        if (!runtime)
+        {
+            setReturnS32(ctx, KE_ERROR);
+            return;
+        }
+
+        EeInterruptRuntimeState &state =
+            runtime->eeInterruptRuntimeState();
         const int handlerId = static_cast<int>(getRegU32(ctx, 5));
         {
-            std::lock_guard<std::mutex> lock(g_irq_handler_mutex);
-            if (auto it = g_dmacHandlers.find(handlerId); it != g_dmacHandlers.end())
+            std::lock_guard<std::mutex> lock(
+                state.handlerMutex);
+            if (auto it =
+                    state.dmacHandlers.find(handlerId);
+                it != state.dmacHandlers.end())
             {
                 it->second.enabled = false;
             }
@@ -697,13 +831,22 @@ namespace ps2_syscalls
 
     void EnableDmac(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
+        if (!runtime)
+        {
+            setReturnS32(ctx, KE_ERROR);
+            return;
+        }
+
+        EeInterruptRuntimeState &state =
+            runtime->eeInterruptRuntimeState();
         const uint32_t cause = getRegU32(ctx, 4);
         if (cause < 32u)
         {
-            std::lock_guard<std::mutex> lock(g_irq_handler_mutex);
-            g_enabled_dmac_mask |= (1u << cause);
+            std::lock_guard<std::mutex> lock(
+                state.handlerMutex);
+            state.enabledDmacMask |= (1u << cause);
         }
-        if (runtime && cause < PS2_DMAC_CHANNEL_COUNT)
+        if (cause < PS2_DMAC_CHANNEL_COUNT)
         {
             runtime->memory().setDmacInterruptMask(
                 static_cast<DmacChannel>(cause), true);
@@ -718,13 +861,22 @@ namespace ps2_syscalls
 
     void DisableDmac(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
+        if (!runtime)
+        {
+            setReturnS32(ctx, KE_ERROR);
+            return;
+        }
+
+        EeInterruptRuntimeState &state =
+            runtime->eeInterruptRuntimeState();
         const uint32_t cause = getRegU32(ctx, 4);
         if (cause < 32u)
         {
-            std::lock_guard<std::mutex> lock(g_irq_handler_mutex);
-            g_enabled_dmac_mask &= ~(1u << cause);
+            std::lock_guard<std::mutex> lock(
+                state.handlerMutex);
+            state.enabledDmacMask &= ~(1u << cause);
         }
-        if (runtime && cause < PS2_DMAC_CHANNEL_COUNT)
+        if (cause < PS2_DMAC_CHANNEL_COUNT)
         {
             runtime->memory().setDmacInterruptMask(
                 static_cast<DmacChannel>(cause), false);

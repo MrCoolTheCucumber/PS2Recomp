@@ -6,26 +6,44 @@ namespace ps2_syscalls
 {
     namespace
     {
-        SifRpcDebugEvent makeRpcDebugEvent(const char *op, R5900Context *ctx)
+        SifRpcDebugEvent makeRpcDebugEvent(
+            const char *op,
+            R5900Context *ctx,
+            PS2Runtime *runtime)
         {
             SifRpcDebugEvent event{};
             event.op = op;
             event.pc = ctx ? ctx->pc : 0u;
             event.ra = ctx ? getRegU32(ctx, 31) : 0u;
-            event.threadId = static_cast<uint32_t>(g_currentThreadId);
+            event.threadId = static_cast<uint32_t>(
+                getCurrentThreadId(runtime));
             return event;
         }
 
-        void pushSifRpcDebugEventLocked(SifRpcDebugEvent event)
+        void pushSifRpcDebugEventLocked(
+            EeRpcRuntimeState &state,
+            SifRpcDebugEvent event)
         {
-            event.seq = ++g_sif_rpc_debug_next_seq;
-            g_sif_rpc_debug_history[event.seq % kSifRpcDebugHistoryCount] = event;
+            event.seq = ++state.nextDebugSequence;
+            state.debugHistory[
+                event.seq % kSifRpcDebugHistoryCount] =
+                event;
         }
 
-        void pushSifRpcDebugEvent(SifRpcDebugEvent event)
+        void pushSifRpcDebugEvent(
+            PS2Runtime *runtime,
+            SifRpcDebugEvent event)
         {
-            std::lock_guard<std::mutex> lock(g_rpc_mutex);
-            pushSifRpcDebugEventLocked(event);
+            if (!runtime)
+            {
+                return;
+            }
+
+            EeRpcRuntimeState &state =
+                runtime->eeRpcRuntimeState();
+            std::lock_guard<std::mutex> lock(
+                state.rpcMutex);
+            pushSifRpcDebugEventLocked(state, event);
         }
 
         void fillRpcDebugPreview(const uint8_t *rdram, uint32_t addr, uint32_t size, uint8_t *preview, uint32_t &previewSize)
@@ -75,12 +93,21 @@ namespace ps2_syscalls
 #endif
 
 #if PS2X_ENABLE_IOP_RPC_TRACE
-        std::string loadedIopModuleTraceSummary()
+        std::string loadedIopModuleTraceSummary(
+            PS2Runtime *runtime)
         {
-            std::lock_guard<std::mutex> lock(g_sif_module_mutex);
+            if (!runtime)
+            {
+                return {};
+            }
+
+            EeRpcRuntimeState &state =
+                runtime->eeRpcRuntimeState();
+            std::lock_guard<std::mutex> lock(
+                state.moduleMutex);
             std::string out;
             uint32_t count = 0u;
-            for (const auto &entry : g_sif_modules_by_id)
+            for (const auto &entry : state.modulesById)
             {
                 const SifModuleRecord &module = entry.second;
                 if (!module.loaded)
@@ -102,10 +129,14 @@ namespace ps2_syscalls
             return out;
         }
 
-        void logUnhandledRpcTrace(const SifRpcDebugEvent &event)
+        void logUnhandledRpcTrace(
+            PS2Runtime *runtime,
+            const SifRpcDebugEvent &event)
         {
-            static std::unordered_set<uint64_t> loggedSignatures;
-            if (std::strcmp(event.op ? event.op : "", "CallRpc") != 0)
+            if (!runtime ||
+                std::strcmp(
+                    event.op ? event.op : "",
+                    "CallRpc") != 0)
             {
                 return;
             }
@@ -120,12 +151,22 @@ namespace ps2_syscalls
             mixSignature(event.rpcNum);
             mixSignature(event.sendSize);
             mixSignature(event.recvSize);
-            if (!loggedSignatures.insert(signature).second || loggedSignatures.size() > 128u)
             {
-                return;
+                EeRpcRuntimeState &state =
+                    runtime->eeRpcRuntimeState();
+                std::lock_guard<std::mutex> lock(
+                    state.traceMutex);
+                if (!state.loggedTraceSignatures
+                         .insert(signature)
+                         .second ||
+                    state.loggedTraceSignatures.size() > 128u)
+                {
+                    return;
+                }
             }
 
-            const std::string modules = loadedIopModuleTraceSummary();
+            const std::string modules =
+                loadedIopModuleTraceSummary(runtime);
             std::cerr << "[IOP/RPC trace:unhandled]"
                       << " sid=0x" << std::hex << event.sid
                       << " rpc=0x" << event.rpcNum
@@ -139,14 +180,18 @@ namespace ps2_syscalls
         }
 #endif
 
-        bool signalRpcCompletionSema(uint32_t semaId)
+        bool signalRpcCompletionSema(
+            PS2Runtime *runtime,
+            uint32_t semaId)
         {
-            if (semaId == 0u || semaId > 0xFFFFu)
+            if (semaId > 0xFFFFu)
             {
                 return false;
             }
 
-            auto sema = lookupSemaInfo(static_cast<int>(semaId));
+            auto sema = lookupSemaInfo(
+                runtime,
+                static_cast<int>(semaId));
             if (!sema)
             {
                 return false;
@@ -177,7 +222,9 @@ namespace ps2_syscalls
         const uint32_t resultAddr = getRegU32(ctx, 7);                    // $a3 (int* result, optional)
 
         uint32_t refsLeft = 0;
-        const bool knownModule = trackSifModuleStop(moduleId, &refsLeft);
+        const bool knownModule =
+            trackSifModuleStop(
+                runtime, moduleId, &refsLeft);
         const int32_t ret = knownModule ? 0 : -1;
 
         if (resultAddr != 0)
@@ -193,14 +240,22 @@ namespace ps2_syscalls
         {
             std::string modulePath;
             {
-                std::lock_guard<std::mutex> lock(g_sif_module_mutex);
-                auto it = g_sif_modules_by_id.find(moduleId);
-                if (it != g_sif_modules_by_id.end())
+                EeRpcRuntimeState &state =
+                    runtime->eeRpcRuntimeState();
+                std::lock_guard<std::mutex> lock(
+                    state.moduleMutex);
+                auto it = state.modulesById.find(moduleId);
+                if (it != state.modulesById.end())
                 {
                     modulePath = it->second.path;
                 }
             }
-            logSifModuleAction("stop", moduleId, modulePath, refsLeft);
+            logSifModuleAction(
+                runtime,
+                "stop",
+                moduleId,
+                modulePath,
+                refsLeft);
         }
 
         setReturnS32(ctx, ret);
@@ -216,7 +271,8 @@ namespace ps2_syscalls
             return;
         }
 
-        const int32_t moduleId = trackSifModuleLoad(modulePath);
+        const int32_t moduleId =
+            trackSifModuleLoad(runtime, modulePath);
         if (moduleId <= 0)
         {
             setReturnS32(ctx, -1);
@@ -225,53 +281,90 @@ namespace ps2_syscalls
 
         uint32_t refs = 0;
         {
-            std::lock_guard<std::mutex> lock(g_sif_module_mutex);
-            auto it = g_sif_modules_by_id.find(moduleId);
-            if (it != g_sif_modules_by_id.end())
+            EeRpcRuntimeState &state =
+                runtime->eeRpcRuntimeState();
+            std::lock_guard<std::mutex> lock(
+                state.moduleMutex);
+            auto it = state.modulesById.find(moduleId);
+            if (it != state.modulesById.end())
             {
                 refs = it->second.refCount;
             }
         }
-        logSifModuleAction("load", moduleId, modulePath, refs);
+        logSifModuleAction(
+            runtime,
+            "load",
+            moduleId,
+            modulePath,
+            refs);
 
         setReturnS32(ctx, moduleId);
     }
 
     void SifInitRpc(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
-        std::lock_guard<std::mutex> lock(g_rpc_mutex);
-        if (!g_rpc_initialized)
+        if (!runtime)
+        {
+            setReturnS32(ctx, -1);
+            return;
+        }
+
+        EeRpcRuntimeState &rpcState =
+            runtime->eeRpcRuntimeState();
+        std::lock_guard<std::recursive_mutex>
+            rpcCallLock(rpcState.callMutex);
+
+        bool needsInitialization = false;
+        {
+            std::lock_guard<std::mutex> lock(
+                rpcState.rpcMutex);
+            needsInitialization =
+                !rpcState.initialized;
+        }
+
+        if (needsInitialization)
         {
             // sceSifInitRpc is idempotent.  Games and libraries can call it
             // independently after the IOP modules they use are already
             // running; doing so must not reset those modules' state.
-            if (runtime)
-            {
-                PS2IopTransport::reset(runtime);
-            }
-            g_rpc_servers.clear();
-            g_rpc_clients.clear();
-            g_rpc_next_id = 1;
-            g_rpc_packet_index = 0;
-            g_rpc_server_index = 0;
-            g_rpc_active_queue = 0;
-            g_sif_rpc_debug_next_seq = 0;
-            for (size_t i = 0; i < kSifRpcDebugHistoryCount; ++i)
-            {
-                g_sif_rpc_debug_history[i] = SifRpcDebugEvent{};
-            }
-            g_rpc_initialized = true;
+            PS2IopTransport::reset(runtime);
+        }
+
+        std::lock_guard<std::mutex> lock(
+            rpcState.rpcMutex);
+        if (needsInitialization &&
+            !rpcState.initialized)
+        {
+            rpcState.servers.clear();
+            rpcState.clients.clear();
+            rpcState.nextRequestId = 1;
+            rpcState.packetIndex = 0;
+            rpcState.serverIndex = 0;
+            rpcState.activeQueue = 0;
+            rpcState.nextDebugSequence = 0;
+            rpcState.debugHistory.fill(
+                SifRpcDebugEvent{});
+            rpcState.initialized = true;
             RUNTIME_LOG("[SifInitRpc] Initialized");
         }
 
-        SifRpcDebugEvent event = makeRpcDebugEvent("InitRpc", ctx);
+        SifRpcDebugEvent event =
+            makeRpcDebugEvent("InitRpc", ctx, runtime);
         event.result = 0;
-        pushSifRpcDebugEventLocked(event);
+        pushSifRpcDebugEventLocked(rpcState, event);
         setReturnS32(ctx, 0);
     }
 
     void SifBindRpc(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
+        if (!runtime)
+        {
+            setReturnS32(ctx, -1);
+            return;
+        }
+
+        EeRpcRuntimeState &rpcState =
+            runtime->eeRpcRuntimeState();
         uint32_t clientPtr = getRegU32(ctx, 4);
         uint32_t rpcId = getRegU32(ctx, 5);
         uint32_t mode = getRegU32(ctx, 6);
@@ -280,13 +373,14 @@ namespace ps2_syscalls
 
         if (!client)
         {
-            SifRpcDebugEvent event = makeRpcDebugEvent("BindRpc", ctx);
+            SifRpcDebugEvent event =
+                makeRpcDebugEvent("BindRpc", ctx, runtime);
             event.clientPtr = clientPtr;
             event.sid = rpcId;
             event.mode = mode;
             event.flags = kSifRpcDebugFlagMissingClient;
             event.result = -1;
-            pushSifRpcDebugEvent(event);
+            pushSifRpcDebugEvent(runtime, event);
             setReturnS32(ctx, -1);
             return;
         }
@@ -303,21 +397,24 @@ namespace ps2_syscalls
 
         uint32_t serverPtr = 0;
         {
-            std::lock_guard<std::mutex> lock(g_rpc_mutex);
-            client->hdr.rpc_id = g_rpc_next_id++;
-            auto it = g_rpc_servers.find(rpcId);
-            if (it != g_rpc_servers.end())
+            std::lock_guard<std::mutex> lock(
+                rpcState.rpcMutex);
+            client->hdr.rpc_id =
+                rpcState.nextRequestId++;
+            auto it = rpcState.servers.find(rpcId);
+            if (it != rpcState.servers.end())
             {
                 serverPtr = it->second.sd_ptr;
             }
-            g_rpc_clients[clientPtr] = {};
-            g_rpc_clients[clientPtr].sid = rpcId;
+            rpcState.clients[clientPtr] = {};
+            rpcState.clients[clientPtr].sid = rpcId;
         }
 
         if (!serverPtr)
         {
             // Allocate a dummy server so bind loops can proceed.
-            serverPtr = rpcAllocServerAddr(rdram);
+            serverPtr =
+                rpcAllocServerAddr(rdram, runtime);
             if (serverPtr)
             {
                 t_SifRpcServerData *dummy = reinterpret_cast<t_SifRpcServerData *>(getMemPtr(rdram, serverPtr));
@@ -326,8 +423,10 @@ namespace ps2_syscalls
                     std::memset(dummy, 0, sizeof(*dummy));
                     dummy->sid = static_cast<int>(rpcId);
                 }
-                std::lock_guard<std::mutex> lock(g_rpc_mutex);
-                g_rpc_servers[rpcId] = {rpcId, serverPtr};
+                std::lock_guard<std::mutex> lock(
+                    rpcState.rpcMutex);
+                rpcState.servers[rpcId] = {
+                    rpcId, serverPtr};
             }
         }
 
@@ -345,19 +444,29 @@ namespace ps2_syscalls
             client->cbuf = 0;
         }
 
-        SifRpcDebugEvent event = makeRpcDebugEvent("BindRpc", ctx);
+        SifRpcDebugEvent event =
+            makeRpcDebugEvent("BindRpc", ctx, runtime);
         event.clientPtr = clientPtr;
         event.serverPtr = serverPtr;
         event.sid = rpcId;
         event.mode = mode;
         event.result = 0;
-        pushSifRpcDebugEvent(event);
+        pushSifRpcDebugEvent(runtime, event);
         setReturnS32(ctx, 0);
     }
 
     void SifCallRpc(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
-        std::lock_guard<std::recursive_mutex> rpcCallLock(g_sif_call_rpc_mutex);
+        if (!runtime)
+        {
+            setReturnS32(ctx, -1);
+            return;
+        }
+
+        EeRpcRuntimeState &rpcState =
+            runtime->eeRpcRuntimeState();
+        std::lock_guard<std::recursive_mutex>
+            rpcCallLock(rpcState.callMutex);
 
         const uint32_t clientPtr = getRegU32(ctx, 4);
         const uint32_t rpcNum = getRegU32(ctx, 5);
@@ -420,9 +529,11 @@ namespace ps2_syscalls
 
         uint32_t sidHint = 0u;
         {
-            std::lock_guard<std::mutex> lock(g_rpc_mutex);
-            const auto clientIt = g_rpc_clients.find(clientPtr);
-            if (clientIt != g_rpc_clients.end())
+            std::lock_guard<std::mutex> lock(
+                rpcState.rpcMutex);
+            const auto clientIt =
+                rpcState.clients.find(clientPtr);
+            if (clientIt != rpcState.clients.end())
             {
                 sidHint = clientIt->second.sid;
             }
@@ -476,7 +587,8 @@ namespace ps2_syscalls
         auto *client = reinterpret_cast<t_SifRpcClientData *>(getMemPtr(rdram, clientPtr));
         if (!client)
         {
-            SifRpcDebugEvent event = makeRpcDebugEvent("CallRpc", ctx);
+            SifRpcDebugEvent event =
+                makeRpcDebugEvent("CallRpc", ctx, runtime);
             event.clientPtr = clientPtr;
             event.sid = sidHint;
             event.rpcNum = rpcNum;
@@ -489,7 +601,7 @@ namespace ps2_syscalls
             event.endParam = endParameter;
             event.flags = kSifRpcDebugFlagMissingClient | ((mode & kSifRpcModeNowait) ? kSifRpcDebugFlagNowait : 0u);
             event.result = -1;
-            pushSifRpcDebugEvent(event);
+            pushSifRpcDebugEvent(runtime, event);
             setReturnS32(ctx, -1);
             return;
         }
@@ -501,15 +613,18 @@ namespace ps2_syscalls
 
         uint32_t sid = 0u;
         {
-            std::lock_guard<std::mutex> lock(g_rpc_mutex);
-            auto &state = g_rpc_clients[clientPtr];
-            state.busy = true;
-            state.last_rpc = rpcNum;
-            sid = state.sid;
+            std::lock_guard<std::mutex> lock(
+                rpcState.rpcMutex);
+            auto &clientState =
+                rpcState.clients[clientPtr];
+            clientState.busy = true;
+            clientState.last_rpc = rpcNum;
+            sid = clientState.sid;
             if (sid != 0u)
             {
-                const auto serverIt = g_rpc_servers.find(sid);
-                if (serverIt != g_rpc_servers.end() &&
+                const auto serverIt =
+                    rpcState.servers.find(sid);
+                if (serverIt != rpcState.servers.end() &&
                     serverIt->second.sd_ptr != 0u)
                 {
                     client->server = serverIt->second.sd_ptr;
@@ -579,11 +694,15 @@ namespace ps2_syscalls
             if (iopResult.signalNowaitCompletion &&
                 (mode & kSifRpcModeNowait) != 0u)
             {
-                (void)signalRpcCompletionSema(completionSemaphore());
+                (void)signalRpcCompletionSema(
+                    runtime,
+                    completionSemaphore());
             }
             if (iopResult.signalCompletion)
             {
-                (void)signalRpcCompletionSema(completionSemaphore());
+                (void)signalRpcCompletionSema(
+                    runtime,
+                    completionSemaphore());
             }
         }
 
@@ -674,9 +793,16 @@ namespace ps2_syscalls
 
             if (!callbackCompleted)
             {
-                const bool signaled = signalRpcCompletionSema(completionSemaphore());
-                static uint32_t unresolvedCallbackWarnings = 0u;
-                if (unresolvedCallbackWarnings < 32u)
+                const bool signaled =
+                    signalRpcCompletionSema(
+                        runtime,
+                        completionSemaphore());
+                static std::atomic<uint32_t>
+                    unresolvedCallbackWarnings{0u};
+                const uint32_t warningIndex =
+                    unresolvedCallbackWarnings.fetch_add(
+                        1u, std::memory_order_relaxed);
+                if (warningIndex < 32u)
                 {
                     std::cerr
                         << "[SifCallRpc] unresolved end callback endFunc=0x"
@@ -684,17 +810,18 @@ namespace ps2_syscalls
                         << " semaId=0x" << completionSemaphore()
                         << " fallbackSignal=" << std::dec
                         << (signaled ? 1 : 0) << std::endl;
-                    ++unresolvedCallbackWarnings;
                 }
             }
         }
 
         {
-            std::lock_guard<std::mutex> lock(g_rpc_mutex);
-            g_rpc_clients[clientPtr].busy = false;
+            std::lock_guard<std::mutex> lock(
+                rpcState.rpcMutex);
+            rpcState.clients[clientPtr].busy = false;
         }
 
-        SifRpcDebugEvent event = makeRpcDebugEvent("CallRpc", ctx);
+        SifRpcDebugEvent event =
+            makeRpcDebugEvent("CallRpc", ctx, runtime);
         event.clientPtr = clientPtr;
         event.serverPtr = serverPtr;
         event.sid = sid;
@@ -731,16 +858,24 @@ namespace ps2_syscalls
 #if PS2X_ENABLE_IOP_RPC_TRACE
         if ((event.flags & kSifRpcDebugFlagUnhandled) != 0u)
         {
-            logUnhandledRpcTrace(event);
+            logUnhandledRpcTrace(runtime, event);
         }
 #endif
-        pushSifRpcDebugEvent(event);
+        pushSifRpcDebugEvent(runtime, event);
 
         setReturnS32(ctx, 0);
     }
 
     void SifRegisterRpc(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
+        if (!runtime)
+        {
+            setReturnS32(ctx, -1);
+            return;
+        }
+
+        EeRpcRuntimeState &rpcState =
+            runtime->eeRpcRuntimeState();
         uint32_t sdPtr = getRegU32(ctx, 4);
         uint32_t sid = getRegU32(ctx, 5);
         uint32_t func = getRegU32(ctx, 6);
@@ -757,7 +892,9 @@ namespace ps2_syscalls
         t_SifRpcServerData *sd = reinterpret_cast<t_SifRpcServerData *>(getMemPtr(rdram, sdPtr));
         if (!sd)
         {
-            SifRpcDebugEvent event = makeRpcDebugEvent("RegisterRpc", ctx);
+            SifRpcDebugEvent event =
+                makeRpcDebugEvent(
+                    "RegisterRpc", ctx, runtime);
             event.serverPtr = sdPtr;
             event.sid = sid;
             event.sendBuf = buf;
@@ -766,7 +903,7 @@ namespace ps2_syscalls
             event.endFunc = cfunc;
             event.flags = kSifRpcDebugFlagMissingClient;
             event.result = -1;
-            pushSifRpcDebugEvent(event);
+            pushSifRpcDebugEvent(runtime, event);
             setReturnS32(ctx, -1);
             return;
         }
@@ -790,7 +927,8 @@ namespace ps2_syscalls
         sd->next = 0;
 
         {
-            std::lock_guard<std::mutex> lock(g_rpc_mutex);
+            std::lock_guard<std::mutex> lock(
+                rpcState.rpcMutex);
 
             if (qd)
             {
@@ -822,8 +960,8 @@ namespace ps2_syscalls
                 }
             }
 
-            g_rpc_servers[sid] = {sid, sdPtr};
-            for (auto &entry : g_rpc_clients)
+            rpcState.servers[sid] = {sid, sdPtr};
+            for (auto &entry : rpcState.clients)
             {
                 if (entry.second.sid == sid)
                 {
@@ -839,7 +977,9 @@ namespace ps2_syscalls
         }
 
         RUNTIME_LOG("[SifRegisterRpc] sid=0x" << std::hex << sid << " sd=0x" << sdPtr << std::dec);
-        SifRpcDebugEvent event = makeRpcDebugEvent("RegisterRpc", ctx);
+        SifRpcDebugEvent event =
+            makeRpcDebugEvent(
+                "RegisterRpc", ctx, runtime);
         event.serverPtr = sdPtr;
         event.sid = sid;
         event.sendBuf = buf;
@@ -847,16 +987,25 @@ namespace ps2_syscalls
         event.resultPtr = qd;
         event.endFunc = cfunc;
         event.result = 0;
-        pushSifRpcDebugEvent(event);
+        pushSifRpcDebugEvent(runtime, event);
         setReturnS32(ctx, 0);
     }
 
     void SifCheckStatRpc(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
+        if (!runtime)
+        {
+            setReturnS32(ctx, 0);
+            return;
+        }
+
+        EeRpcRuntimeState &rpcState =
+            runtime->eeRpcRuntimeState();
         uint32_t clientPtr = getRegU32(ctx, 4);
-        std::lock_guard<std::mutex> lock(g_rpc_mutex);
-        auto it = g_rpc_clients.find(clientPtr);
-        if (it == g_rpc_clients.end())
+        std::lock_guard<std::mutex> lock(
+            rpcState.rpcMutex);
+        auto it = rpcState.clients.find(clientPtr);
+        if (it == rpcState.clients.end())
         {
             setReturnS32(ctx, 0);
             return;
@@ -866,6 +1015,14 @@ namespace ps2_syscalls
 
     void SifSetRpcQueue(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
+        if (!runtime)
+        {
+            setReturnS32(ctx, -1);
+            return;
+        }
+
+        EeRpcRuntimeState &rpcState =
+            runtime->eeRpcRuntimeState();
         uint32_t qdPtr = getRegU32(ctx, 4);
         int threadId = static_cast<int>(getRegU32(ctx, 5));
 
@@ -884,14 +1041,15 @@ namespace ps2_syscalls
         qd->next = 0;
 
         {
-            std::lock_guard<std::mutex> lock(g_rpc_mutex);
-            if (!g_rpc_active_queue)
+            std::lock_guard<std::mutex> lock(
+                rpcState.rpcMutex);
+            if (!rpcState.activeQueue)
             {
-                g_rpc_active_queue = qdPtr;
+                rpcState.activeQueue = qdPtr;
             }
             else
             {
-                uint32_t curPtr = g_rpc_active_queue;
+                uint32_t curPtr = rpcState.activeQueue;
                 for (int guard = 0; guard < 1024 && curPtr; ++guard)
                 {
                     if (curPtr == qdPtr)
@@ -914,6 +1072,14 @@ namespace ps2_syscalls
 
     void SifRemoveRpcQueue(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
+        if (!runtime)
+        {
+            setReturnU32(ctx, 0);
+            return;
+        }
+
+        EeRpcRuntimeState &rpcState =
+            runtime->eeRpcRuntimeState();
         uint32_t qdPtr = getRegU32(ctx, 4);
         if (!qdPtr)
         {
@@ -921,22 +1087,23 @@ namespace ps2_syscalls
             return;
         }
 
-        std::lock_guard<std::mutex> lock(g_rpc_mutex);
-        if (!g_rpc_active_queue)
+        std::lock_guard<std::mutex> lock(
+            rpcState.rpcMutex);
+        if (!rpcState.activeQueue)
         {
             setReturnU32(ctx, 0);
             return;
         }
 
-        if (g_rpc_active_queue == qdPtr)
+        if (rpcState.activeQueue == qdPtr)
         {
             t_SifRpcDataQueue *qd = reinterpret_cast<t_SifRpcDataQueue *>(getMemPtr(rdram, qdPtr));
-            g_rpc_active_queue = qd ? qd->next : 0;
+            rpcState.activeQueue = qd ? qd->next : 0;
             setReturnU32(ctx, qdPtr);
             return;
         }
 
-        uint32_t curPtr = g_rpc_active_queue;
+        uint32_t curPtr = rpcState.activeQueue;
         for (int guard = 0; guard < 1024 && curPtr; ++guard)
         {
             t_SifRpcDataQueue *cur = reinterpret_cast<t_SifRpcDataQueue *>(getMemPtr(rdram, curPtr));
@@ -957,6 +1124,14 @@ namespace ps2_syscalls
 
     void SifRemoveRpc(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
+        if (!runtime)
+        {
+            setReturnU32(ctx, 0);
+            return;
+        }
+
+        EeRpcRuntimeState &rpcState =
+            runtime->eeRpcRuntimeState();
         uint32_t sdPtr = getRegU32(ctx, 4);
         uint32_t qdPtr = getRegU32(ctx, 5);
 
@@ -967,7 +1142,8 @@ namespace ps2_syscalls
             return;
         }
 
-        std::lock_guard<std::mutex> lock(g_rpc_mutex);
+        std::lock_guard<std::mutex> lock(
+            rpcState.rpcMutex);
 
         if (qd->link == sdPtr)
         {

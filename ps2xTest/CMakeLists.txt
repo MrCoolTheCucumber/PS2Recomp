@@ -43,10 +43,14 @@ target_include_directories(ps2_test_function_table PRIVATE
 )
 
 add_library(ps2_test_lib STATIC
+    src/boost_ee_fiber_tests.cpp
     src/code_generator_tests.cpp
     src/cop0_timing_tests.cpp
     src/ee_counter_tests.cpp
+    src/ee_execution_backend_tests.cpp
     src/ee_event_scheduler_tests.cpp
+    src/ee_runtime_executor_tests.cpp
+    src/ee_thread_scheduler_tests.cpp
     src/r5900_decoder_tests.cpp
     src/elf_analyzer_tests.cpp
     src/ps2_audio_tests.cpp
@@ -116,6 +120,28 @@ add_executable(ps2x_tests
     $<TARGET_OBJECTS:ps2_test_function_table>
 )
 
+add_executable(ee_runtime_executor_tests
+    src/ee_runtime_executor_test_main.cpp
+    $<TARGET_OBJECTS:ps2_test_function_table>
+)
+
+add_executable(ee_fiber_guard_probe
+    src/ee_fiber_guard_probe.cpp
+)
+
+target_include_directories(ee_fiber_guard_probe PRIVATE
+    ${CMAKE_SOURCE_DIR}/ps2xRuntime/include
+)
+
+target_link_libraries(ee_fiber_guard_probe PRIVATE
+    ps2_runtime
+)
+
+add_dependencies(ps2x_tests ee_fiber_guard_probe)
+target_compile_definitions(ps2_test_lib PRIVATE
+    PS2X_TEST_EE_FIBER_GUARD_PROBE="$<TARGET_FILE:ee_fiber_guard_probe>"
+)
+
 add_executable(vu1_replay
     src/vu1_replay.cpp
     $<TARGET_OBJECTS:ps2_test_function_table>
@@ -169,6 +195,11 @@ add_executable(ee_timing_benchmark
     $<TARGET_OBJECTS:ps2_test_function_table>
 )
 
+add_executable(ee_thread_scheduler_benchmark
+    src/ee_thread_scheduler_benchmark.cpp
+    $<TARGET_OBJECTS:ps2_test_function_table>
+)
+
 add_executable(gs_replay
     src/gs_replay.cpp
     src/standalone_runtime_function_table.cpp
@@ -188,7 +219,21 @@ target_include_directories(ps2x_tests PRIVATE
     ${CMAKE_SOURCE_DIR}/ps2xRuntime/include
 )
 
+target_include_directories(ee_runtime_executor_tests PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/include
+    ${CMAKE_SOURCE_DIR}/ps2xRecomp/include
+    ${CMAKE_SOURCE_DIR}/ps2xAnalyzer/include
+    ${CMAKE_SOURCE_DIR}/ps2xRuntime/include
+)
+
 target_link_libraries(ps2x_tests PRIVATE
+    ps2_test_lib
+    ps2_recomp_lib
+    ps2_analyzer_lib
+    ps2_runtime
+)
+
+target_link_libraries(ee_runtime_executor_tests PRIVATE
     ps2_test_lib
     ps2_recomp_lib
     ps2_analyzer_lib
@@ -219,6 +264,14 @@ target_link_libraries(ee_timing_benchmark PRIVATE
     ps2_runtime
 )
 
+target_include_directories(ee_thread_scheduler_benchmark PRIVATE
+    ${CMAKE_SOURCE_DIR}/ps2xRuntime/include
+)
+
+target_link_libraries(ee_thread_scheduler_benchmark PRIVATE
+    ps2_runtime
+)
+
 target_include_directories(gs_replay PRIVATE
     ${CMAKE_SOURCE_DIR}/ps2xRuntime/include
 )
@@ -236,9 +289,16 @@ include("${CMAKE_SOURCE_DIR}/ps2xRuntime/cmake/ReleaseMode.cmake")
 if(CMAKE_BUILD_TYPE STREQUAL "Release" OR CMAKE_BUILD_TYPE STREQUAL "RelWithDebInfo")
     EnableFastReleaseMode(ps2_test_lib)
     EnableFastReleaseMode(ps2x_tests)
+    EnableFastReleaseMode(ee_runtime_executor_tests)
     EnableFastReleaseMode(ee_timing_benchmark)
+    EnableFastReleaseMode(ee_thread_scheduler_benchmark)
     EnableFastReleaseMode(vu_backend_benchmark)
     if(TARGET vu_native_emitter_spike)
         EnableFastReleaseMode(vu_native_emitter_spike)
     endif()
 endif()
+
+ConfigureEeFcontextSuspendedFrames(ps2_test_lib)
+ConfigureEeFcontextSuspendedFrames(ps2x_tests)
+ConfigureEeFcontextSuspendedFrames(ee_runtime_executor_tests)
+ConfigureEeFcontextSuspendedFrames(ee_fiber_guard_probe)

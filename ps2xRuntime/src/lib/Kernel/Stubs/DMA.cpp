@@ -1,5 +1,6 @@
 #include "Common.h"
 #include "DMA.h"
+#include "Helpers/DmaRuntimeState.h"
 
 #include <cinttypes>
 
@@ -7,20 +8,6 @@ namespace ps2_stubs
 {
     namespace
     {
-        struct SceDmaEnv
-        {
-            uint8_t sts = 0;
-            uint8_t std = 0;
-            uint8_t mfd = 0;
-            uint8_t rele = 0;
-            uint32_t pcr = 0;
-            uint32_t sqwc = 0;
-            uint32_t rbor = 0;
-            uint32_t rbsr = 0;
-        };
-
-        static_assert(sizeof(SceDmaEnv) == 0x14, "sceDmaEnv must match the guest ABI");
-
         constexpr uint32_t DMA_REG_CTRL = 0x1000E000u;
         constexpr uint32_t DMA_REG_PCR = 0x1000E020u;
         constexpr uint32_t DMA_REG_SQWC = 0x1000E030u;
@@ -31,9 +18,6 @@ namespace ps2_stubs
         constexpr std::array<uint8_t, 10> kStsTable = {0u, 0u, 0u, 3u, 0u, 1u, 0u, 0u, 2u, 0u};
         constexpr std::array<uint8_t, 10> kStdTable = {0u, 1u, 2u, 0u, 0u, 0u, 3u, 0u, 0u, 0u};
         constexpr std::array<uint8_t, 10> kMfdTable = {0u, 2u, 3u, 0u, 0u, 0u, 0u, 0u, 0u, 0u};
-
-        std::mutex g_dmaEnvMutex;
-        SceDmaEnv g_dmaCurrentEnv;
 
         struct Vif0DmaTrace
         {
@@ -104,6 +88,14 @@ namespace ps2_stubs
         }
     }
 
+    void resetDmaState(PS2Runtime *runtime)
+    {
+        if (runtime)
+        {
+            runtime->dmaRuntimeState().reset();
+        }
+    }
+
     void DmaAddr(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
         setReturnU32(ctx, getRegU32(ctx, 4));
@@ -129,10 +121,17 @@ namespace ps2_stubs
     void sceDmaGetEnv(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
         const uint32_t envAddr = getRegU32(ctx, 4);
-        if (uint8_t *dst = getMemPtr(rdram, envAddr))
+        if (uint8_t *dst = getMemPtr(rdram, envAddr);
+            dst && runtime)
         {
-            std::lock_guard<std::mutex> lock(g_dmaEnvMutex);
-            std::memcpy(dst, &g_dmaCurrentEnv, sizeof(g_dmaCurrentEnv));
+            DmaRuntimeState &state =
+                runtime->dmaRuntimeState();
+            std::lock_guard<std::mutex> lock(
+                state.environmentMutex);
+            std::memcpy(
+                dst,
+                &state.currentEnvironment,
+                sizeof(state.currentEnvironment));
         }
         setReturnU32(ctx, envAddr);
     }
@@ -202,8 +201,11 @@ namespace ps2_stubs
         mem.writeIORegister(DMA_REG_RBSR, env.rbsr);
 
         {
-            std::lock_guard<std::mutex> lock(g_dmaEnvMutex);
-            g_dmaCurrentEnv = env;
+            DmaRuntimeState &state =
+                runtime->dmaRuntimeState();
+            std::lock_guard<std::mutex> lock(
+                state.environmentMutex);
+            state.currentEnvironment = env;
         }
 
         setReturnS32(ctx, 0);
@@ -256,10 +258,7 @@ namespace ps2_stubs
             mem.writeIORegister(DMA_REG_CTRL, 1u);
         }
 
-        {
-            std::lock_guard<std::mutex> lock(g_dmaEnvMutex);
-            g_dmaCurrentEnv = {};
-        }
+        resetDmaState(runtime);
 
         setReturnS32(ctx, 0);
     }

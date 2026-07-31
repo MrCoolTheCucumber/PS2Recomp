@@ -28,7 +28,9 @@
 #endif
 #include <ThreadNaming.h>
 
-std::string translatePs2Path(const char *ps2Path);
+std::string translatePs2Path(
+    const char *ps2Path,
+    PS2Runtime *runtime);
 
 #include "Helpers/Path.h"
 #include "Helpers/State.h"
@@ -37,6 +39,11 @@ std::string translatePs2Path(const char *ps2Path);
 
 namespace ps2_syscalls
 {
+    inline void yieldGuestExecutionAtBoundary(PS2Runtime *runtime)
+    {
+        runtime->yieldGuestExecutionAtBoundary();
+    }
+
     inline void yieldGuestExecutionAfterWake(PS2Runtime *runtime)
     {
         runtime->yieldGuestExecutionAfterWake();

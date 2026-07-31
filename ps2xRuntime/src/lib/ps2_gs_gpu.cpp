@@ -5,7 +5,6 @@
 #include "runtime/ps2_gs_psmt4.h"
 #include "runtime/ps2_gs_psmt8.h"
 #include "ps2_log.h"
-#include "ps2_syscalls.h"
 #include "runtime/ps2_memory.h"
 #include "runtime/ps2_gs_memory.h"
 #include <atomic>
@@ -629,6 +628,21 @@ void GS::init(uint8_t *vram, uint32_t vramSize, GSRegisters *privRegs)
     reset();
 }
 
+void GS::setVSyncTickProvider(
+    std::function<uint64_t()> provider)
+{
+    std::lock_guard<std::recursive_mutex> lock(
+        m_stateMutex);
+    m_vsyncTickProvider = std::move(provider);
+}
+
+uint64_t GS::currentVSyncTickUnlocked() const
+{
+    return m_vsyncTickProvider
+               ? m_vsyncTickProvider()
+               : 0u;
+}
+
 void GS::reset()
 {
     std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
@@ -885,7 +899,8 @@ void GS::recordDebugEventUnlocked(GSDebugHistoryEntry entry)
         return;
     }
 
-    const uint64_t tick = ps2_syscalls::GetCurrentVSyncTick();
+    const uint64_t tick =
+        currentVSyncTickUnlocked();
     if (m_debugLastVsyncTick == UINT64_MAX)
     {
         m_debugLastVsyncTick = tick;
@@ -1228,7 +1243,8 @@ void GS::latchHostPresentationFrameUnlocked()
     const GSPmodeState pmode = decodePmode(m_privRegs->pmode);
     const GSSmode2State smode2 = decodeSMode2(m_privRegs->smode2);
     const bool applyFieldMode = smode2.interlaced && !smode2.frameMode;
-    const bool oddField = (ps2_syscalls::GetCurrentVSyncTick() & 1ull) != 0ull;
+    const bool oddField =
+        (currentVSyncTickUnlocked() & 1ull) != 0ull;
     const GSFrameReg displayFrame1 = decodeDisplayFrame(m_privRegs->dispfb1);
     const GSFrameReg displayFrame2 = decodeDisplayFrame(m_privRegs->dispfb2);
     const GSDisplayReadOrigin displayOrigin1 = decodeDisplayReadOrigin(m_privRegs->dispfb1);

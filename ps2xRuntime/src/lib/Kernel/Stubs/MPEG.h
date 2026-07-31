@@ -2,11 +2,33 @@
 
 #include "ps2_stubs.h"
 
+#include <memory>
+
 namespace ps2_stubs
 {
-    void resetMpegStubState();
-    void notifyMpegCdStreamStart();
-    void notifyMpegCdStreamEof();
+    class MpegRuntimeState
+    {
+    public:
+        struct Impl;
+
+        MpegRuntimeState();
+        ~MpegRuntimeState();
+
+        Impl &implementation() noexcept;
+        const Impl &implementation() const noexcept;
+
+        MpegRuntimeState(
+            const MpegRuntimeState &) = delete;
+        MpegRuntimeState &operator=(
+            const MpegRuntimeState &) = delete;
+
+    private:
+        std::unique_ptr<Impl> m_impl;
+    };
+
+    void resetMpegStubState(PS2Runtime *runtime);
+    void notifyMpegCdStreamStart(PS2Runtime *runtime);
+    void notifyMpegCdStreamEof(PS2Runtime *runtime);
     void sceMpegFlush(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
     void sceMpegAddBs(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
     void sceMpegAddCallback(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);

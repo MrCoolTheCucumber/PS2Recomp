@@ -108,10 +108,34 @@ namespace ps2_syscalls
         return out;
     }
 
+    static std::vector<std::shared_ptr<ThreadInfo>>
+    snapshotRuntimeThreads(PS2Runtime *runtime)
+    {
+        if (!runtime)
+        {
+            return {};
+        }
+
+        EeThreadRuntimeState &state =
+            runtime->eeThreadRuntimeState();
+        std::vector<std::shared_ptr<ThreadInfo>> result;
+        std::lock_guard<std::mutex> lock(state.threadMapMutex);
+        result.reserve(state.threads.size());
+        for (const auto &[id, info] : state.threads)
+        {
+            (void)id;
+            if (info)
+            {
+                result.push_back(info);
+            }
+        }
+        return result;
+    }
+
     void CreateSema(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
         uint32_t paramAddr = getRegU32(ctx, 4); // $a0
-        if (paramAddr == 0u)
+        if (!runtime || paramAddr == 0u)
         {
             setReturnS32(ctx, KE_ERROR);
             return;
@@ -153,7 +177,7 @@ namespace ps2_syscalls
             init = max;
         }
 
-        int id = 0;
+        int id = -1;
         auto info = std::make_shared<SemaInfo>();
         info->count = init;
         info->maxCount = max;
@@ -161,79 +185,403 @@ namespace ps2_syscalls
         info->attr = attr;
         info->option = option;
 
+        EeSyncRuntimeState &syncState =
+            runtime->eeSyncRuntimeState();
         {
-            std::lock_guard<std::mutex> lock(g_sema_map_mutex);
+            std::lock_guard<std::mutex> lock(
+                syncState.semaMapMutex);
             for (int attempts = 0; attempts < 0x7FFF; ++attempts)
             {
-                if (g_nextSemaId <= 0)
+                if (syncState.nextSemaId < 0)
                 {
-                    g_nextSemaId = 1;
+                    syncState.nextSemaId = 0;
                 }
 
-                const int candidate = g_nextSemaId++;
-                if (candidate <= 0)
+                const int candidate =
+                    syncState.nextSemaId++;
+                if (candidate < 0)
                 {
                     continue;
                 }
 
-                if (g_semas.find(candidate) == g_semas.end())
+                if (syncState.semas.find(candidate) ==
+                    syncState.semas.end())
                 {
                     id = candidate;
                     break;
                 }
             }
 
-            if (id <= 0)
+            if (id < 0)
             {
                 setReturnS32(ctx, KE_ERROR);
                 return;
             }
 
-            g_semas.emplace(id, info);
+            syncState.semas.emplace(id, info);
         }
         RUNTIME_LOG("[CreateSema] id=" << id << " init=" << init << " max=" << max);
         setReturnS32(ctx, id);
     }
 
-    void DeleteSema(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    static void deleteSema(
+        uint8_t *rdram,
+        R5900Context *ctx,
+        PS2Runtime *runtime,
+        bool reschedule)
     {
         int sid = static_cast<int>(getRegU32(ctx, 4));
         std::shared_ptr<SemaInfo> sema;
 
+        if (!runtime)
         {
-            std::lock_guard<std::mutex> lock(g_sema_map_mutex);
-            auto it = g_semas.find(sid);
-            if (it == g_semas.end())
+            setReturnS32(ctx, KE_UNKNOWN_SEMID);
+            return;
+        }
+
+        if (runtime->usesDedicatedEeExecutor())
+        {
+            sema = lookupSemaInfo(runtime, sid);
+            if (!sema)
+            {
+                setReturnS32(ctx, KE_UNKNOWN_SEMID);
+                return;
+            }
+
+            struct DeleteTransition
+            {
+                int result = KE_ERROR;
+                bool applied = false;
+            };
+            const auto transition =
+                std::make_shared<DeleteTransition>();
+            const bool published =
+                runtime->publishEeSchedulerUpdate(
+                    [runtime,
+                     sema,
+                     sid,
+                     transition](
+                        ps2x::ee::EeThreadScheduler
+                            &scheduler)
+                    {
+                        EeSyncRuntimeState &syncState =
+                            runtime
+                                ->eeSyncRuntimeState();
+                        {
+                            std::lock_guard<std::mutex>
+                                mapLock(
+                                    syncState
+                                        .semaMapMutex);
+                            const auto it =
+                                syncState.semas.find(
+                                    sid);
+                            if (it ==
+                                    syncState.semas.end() ||
+                                it->second != sema)
+                            {
+                                transition->result =
+                                    KE_UNKNOWN_SEMID;
+                                transition->applied =
+                                    true;
+                                return;
+                            }
+                            syncState.semas.erase(it);
+                            if (sid <
+                                syncState.nextSemaId)
+                            {
+                                syncState.nextSemaId =
+                                    sid;
+                            }
+                        }
+
+                        std::lock_guard<std::mutex> lock(
+                            sema->m);
+                        sema->deleted = true;
+                        const ps2x::ee::
+                            EeSchedulerWaitKey wait{
+                                ps2x::ee::
+                                    EeSchedulerWaitKind::
+                                        Semaphore,
+                                sid,
+                            };
+                        const std::vector<int> waiters =
+                            scheduler.waitOrder(wait);
+                        for (const int threadId :
+                             waiters)
+                        {
+                            const auto handle =
+                                scheduler.threadHandle(
+                                    threadId);
+                            if (!handle.has_value() ||
+                                !scheduler
+                                     .releaseWaitThread(
+                                         *handle,
+                                         ps2x::ee::
+                                             EeSchedulerWaitCompletion::
+                                                 ObjectDeleted,
+                                         true))
+                            {
+                                throw std::logic_error(
+                                    "DeleteSema could not "
+                                    "detach an EE scheduler "
+                                    "waiter");
+                            }
+
+                            const auto waiter =
+                                lookupThreadInfo(
+                                    runtime,
+                                    threadId);
+                            if (!waiter)
+                            {
+                                throw std::logic_error(
+                                    "DeleteSema detached a "
+                                    "missing EE thread");
+                            }
+                            std::lock_guard<std::mutex>
+                                threadLock(waiter->m);
+                            if (!waiter->guestState
+                                     .releaseWait(
+                                         EeThreadWaitQueue::
+                                             Semaphore,
+                                         TSW_SEMA,
+                                         sid,
+                                         true) ||
+                                sema->waiters <= 0)
+                            {
+                                throw std::logic_error(
+                                    "DeleteSema scheduler "
+                                    "and guest wait queues "
+                                    "diverged");
+                            }
+                            waiter->pendingWaitCompletion =
+                                ps2x::ee::
+                                    EeSchedulerWaitCompletion::
+                                        ObjectDeleted;
+                            --sema->waiters;
+                        }
+                        if (sema->waiters != 0)
+                        {
+                            throw std::logic_error(
+                                "DeleteSema left an "
+                                "unmodeled executor waiter");
+                        }
+                        transition->result = sid;
+                        transition->applied = true;
+                    },
+                    reschedule
+                        ? ps2x::ee::
+                              EeSchedulerReschedulePolicy::
+                                  HigherPriorityOnly
+                        : ps2x::ee::
+                              EeSchedulerReschedulePolicy::
+                                  None);
+            if (!published)
+            {
+                setReturnS32(ctx, KE_ERROR);
+                return;
+            }
+
+            runtime->yieldEeExecutorCurrent(
+                ps2x::ee::EeSchedulerExitReason::
+                    Preempted);
+            if (!transition->applied)
+            {
+                throw std::logic_error(
+                    "DeleteSema resumed before its "
+                    "scheduler transition");
+            }
+            setReturnS32(ctx, transition->result);
+            return;
+        }
+
+        EeSyncRuntimeState &syncState =
+            runtime->eeSyncRuntimeState();
+        {
+            std::lock_guard<std::mutex> lock(
+                syncState.semaMapMutex);
+            auto it = syncState.semas.find(sid);
+            if (it == syncState.semas.end())
             {
                 setReturnS32(ctx, KE_UNKNOWN_SEMID);
                 return;
             }
             sema = it->second;
-            g_semas.erase(it);
+            syncState.semas.erase(it);
+            if (sid < syncState.nextSemaId)
+            {
+                syncState.nextSemaId = sid;
+            }
         }
 
+        const std::vector<std::shared_ptr<ThreadInfo>> threads =
+            snapshotRuntimeThreads(runtime);
+        bool hadWaiters = false;
         {
             std::lock_guard<std::mutex> lock(sema->m);
             sema->deleted = true;
+            hadWaiters = sema->waiters > 0;
+            for (const std::shared_ptr<ThreadInfo> &info :
+                 threads)
+            {
+                std::lock_guard<std::mutex> threadLock(info->m);
+                if (info->guestState.releaseWait(
+                        EeThreadWaitQueue::Semaphore,
+                        TSW_SEMA,
+                        sid,
+                        true) &&
+                    sema->waiters > 0)
+                {
+                    --sema->waiters;
+                }
+            }
         }
         sema->cv.notify_all();
 
         // PS2 EE BIOS returns sid on success.
         setReturnS32(ctx, sid);
+        if (hadWaiters && reschedule)
+        {
+            yieldGuestExecutionAfterWake(runtime);
+        }
+    }
+
+    void DeleteSema(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        deleteSema(rdram, ctx, runtime, true);
     }
 
     void iDeleteSema(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
-        DeleteSema(rdram, ctx, runtime);
+        deleteSema(rdram, ctx, runtime, false);
     }
 
-    void SignalSema(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    static void signalSema(
+        uint8_t *rdram,
+        R5900Context *ctx,
+        PS2Runtime *runtime,
+        bool reschedule)
     {
         int sid = static_cast<int>(getRegU32(ctx, 4));
-        auto sema = lookupSemaInfo(sid);
+        auto sema = lookupSemaInfo(runtime, sid);
         if (!sema)
         {
             setReturnS32(ctx, KE_UNKNOWN_SEMID);
+            return;
+        }
+
+        if (runtime->usesDedicatedEeExecutor())
+        {
+            struct SignalTransition
+            {
+                int result = KE_ERROR;
+                bool applied = false;
+            };
+
+            const auto transition =
+                std::make_shared<SignalTransition>();
+            const bool published =
+                runtime->publishEeSchedulerUpdate(
+                    [runtime, sema, sid, transition](
+                        ps2x::ee::EeThreadScheduler
+                            &scheduler)
+                    {
+                        std::lock_guard<std::mutex> lock(
+                            sema->m);
+                        transition->result = sid;
+                        if (sema->deleted)
+                        {
+                            transition->result =
+                                KE_UNKNOWN_SEMID;
+                        }
+                        else if (
+                            sema->count >=
+                            sema->maxCount)
+                        {
+                            transition->result =
+                                KE_SEMA_OVF;
+                        }
+                        else
+                        {
+                            const auto wokenThreadId =
+                                scheduler.wakeOne(
+                                    {
+                                        ps2x::ee::
+                                            EeSchedulerWaitKind::
+                                                Semaphore,
+                                        sid,
+                                    });
+                            if (wokenThreadId.has_value())
+                            {
+                                const auto waiter =
+                                    lookupThreadInfo(
+                                        runtime,
+                                        *wokenThreadId);
+                                if (!waiter)
+                                {
+                                    throw std::logic_error(
+                                        "SignalSema woke a "
+                                        "missing EE thread");
+                                }
+                                std::lock_guard<std::mutex>
+                                    threadLock(waiter->m);
+                                if (!waiter->guestState
+                                         .releaseWait(
+                                             EeThreadWaitQueue::
+                                                 Semaphore,
+                                             TSW_SEMA,
+                                             sid,
+                                             false) ||
+                                    sema->waiters <= 0)
+                                {
+                                    throw std::logic_error(
+                                        "SignalSema "
+                                        "scheduler and "
+                                        "guest wait queues "
+                                        "diverged");
+                                }
+                                waiter->pendingWaitCompletion =
+                                    ps2x::ee::
+                                        EeSchedulerWaitCompletion::
+                                            Satisfied;
+                                --sema->waiters;
+                            }
+                            else
+                            {
+                                if (sema->waiters != 0)
+                                {
+                                    throw std::logic_error(
+                                        "SignalSema found "
+                                        "an unmodeled "
+                                        "executor waiter");
+                                }
+                                ++sema->count;
+                            }
+                        }
+                        transition->applied = true;
+                    },
+                    reschedule
+                        ? ps2x::ee::
+                              EeSchedulerReschedulePolicy::
+                                  HigherPriorityOnly
+                        : ps2x::ee::
+                              EeSchedulerReschedulePolicy::
+                                  None);
+            if (!published)
+            {
+                setReturnS32(ctx, KE_ERROR);
+                return;
+            }
+
+            runtime->yieldEeExecutorCurrent(
+                ps2x::ee::EeSchedulerExitReason::
+                    Preempted);
+            if (!transition->applied)
+            {
+                throw std::logic_error(
+                    "SignalSema resumed before its "
+                    "scheduler transition");
+            }
+            setReturnS32(ctx, transition->result);
             return;
         }
 
@@ -243,7 +591,7 @@ namespace ps2_syscalls
         int afterCount = 0;
         bool wokeWaiter = false;
         {
-            std::lock_guard<std::mutex> lock(sema->m);
+            std::unique_lock<std::mutex> lock(sema->m);
             beforeCount = sema->count;
             if (sema->count >= sema->maxCount)
             {
@@ -253,7 +601,23 @@ namespace ps2_syscalls
             {
                 sema->count++;
                 wokeWaiter = sema->waiters > 0;
+                const int waitersBeforeWake = sema->waiters;
                 sema->cv.notify_one();
+                if (wokeWaiter)
+                {
+                    // Publication is synchronous even for the interrupt-safe
+                    // variant. The waiter may update guest state while guest
+                    // execution remains owned by this caller, but cannot run
+                    // its continuation until a later scheduling boundary.
+                    sema->cv.wait(
+                        lock,
+                        [&]()
+                        {
+                            return sema->waiters <
+                                       waitersBeforeWake ||
+                                   sema->deleted;
+                        });
+                }
             }
             afterCount = sema->count;
         }
@@ -262,7 +626,7 @@ namespace ps2_syscalls
         const uint32_t sigLog = s_signalSemaLogs.fetch_add(1, std::memory_order_relaxed);
         if (sigLog < 256u)
         {
-            RUNTIME_LOG("[SignalSema] tid=" << g_currentThreadId
+            RUNTIME_LOG("[SignalSema] tid=" << getCurrentThreadId(runtime)
                                             << " sid=" << sid
                                             << " count=" << beforeCount << "->" << afterCount
                                             << " ret=" << ret
@@ -270,29 +634,210 @@ namespace ps2_syscalls
         }
 
         setReturnS32(ctx, ret);
-        if (wokeWaiter)
+        if (wokeWaiter && reschedule)
         {
             yieldGuestExecutionAfterWake(runtime);
         }
     }
 
+    void SignalSema(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        signalSema(rdram, ctx, runtime, true);
+    }
+
     void iSignalSema(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
-        SignalSema(rdram, ctx, runtime);
+        signalSema(rdram, ctx, runtime, false);
     }
 
     void WaitSema(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
         int sid = static_cast<int>(getRegU32(ctx, 4));
-        auto sema = lookupSemaInfo(sid);
+        auto sema = lookupSemaInfo(runtime, sid);
         if (!sema)
         {
             setReturnS32(ctx, KE_UNKNOWN_SEMID);
             return;
         }
 
-        auto info = ensureCurrentThreadInfo(ctx);
+        auto info = ensureCurrentThreadInfo(runtime, ctx);
         throwIfTerminated(info);
+
+        if (runtime->usesDedicatedEeExecutor())
+        {
+            struct WaitTransition
+            {
+                bool blocked = false;
+                bool applied = false;
+            };
+
+            const int threadId =
+                getCurrentThreadId(runtime);
+            const uint32_t generation =
+                info->generation;
+            const auto transition =
+                std::make_shared<WaitTransition>();
+            const bool published =
+                runtime->publishEeSchedulerUpdate(
+                    [sema,
+                     info,
+                     sid,
+                     threadId,
+                     generation,
+                     transition](
+                        ps2x::ee::EeThreadScheduler
+                            &scheduler)
+                    {
+                        const auto handle =
+                            scheduler.threadHandle(
+                                threadId);
+                        if (!handle.has_value() ||
+                            handle->generation !=
+                                generation)
+                        {
+                            throw std::logic_error(
+                                "WaitSema lost its EE "
+                                "scheduler record");
+                        }
+
+                        std::lock_guard<std::mutex> lock(
+                            sema->m);
+                        {
+                            std::lock_guard<std::mutex>
+                                threadLock(info->m);
+                            info->pendingWaitCompletion =
+                                ps2x::ee::
+                                    EeSchedulerWaitCompletion::
+                                        None;
+                        }
+                        if (sema->deleted)
+                        {
+                            transition->applied = true;
+                            return;
+                        }
+                        if (sema->count > 0)
+                        {
+                            --sema->count;
+                            transition->applied = true;
+                            return;
+                        }
+
+                        (void)scheduler
+                            .blockCurrentThread(
+                                {
+                                    ps2x::ee::
+                                        EeSchedulerWaitKind::
+                                            Semaphore,
+                                    sid,
+                                });
+                        const auto blocked =
+                            scheduler.thread(
+                                threadId);
+                        if (!blocked.has_value() ||
+                            blocked->generation !=
+                                generation ||
+                            (blocked->state !=
+                                 ps2x::ee::
+                                     EeSchedulerThreadState::
+                                         Waiting &&
+                             blocked->state !=
+                                 ps2x::ee::
+                                     EeSchedulerThreadState::
+                                         WaitSuspended))
+                        {
+                            throw std::logic_error(
+                                "WaitSema could not block "
+                                "its running scheduler "
+                                "owner");
+                        }
+
+                        std::lock_guard<std::mutex>
+                            threadLock(info->m);
+                        if (!info->guestState.block(
+                                EeThreadWaitQueue::
+                                    Semaphore,
+                                TSW_SEMA,
+                                sid))
+                        {
+                            throw std::logic_error(
+                                "WaitSema could not mirror "
+                                "its scheduler wait");
+                        }
+                        info->forceRelease = false;
+                        ++sema->waiters;
+                        transition->blocked = true;
+                        transition->applied = true;
+                    },
+                    ps2x::ee::
+                        EeSchedulerReschedulePolicy::
+                            None);
+            if (!published)
+            {
+                setReturnS32(ctx, KE_ERROR);
+                return;
+            }
+
+            runtime->yieldEeExecutorCurrent(
+                ps2x::ee::EeSchedulerExitReason::
+                    Preempted);
+            if (!transition->applied)
+            {
+                throw std::logic_error(
+                    "WaitSema resumed before its "
+                    "scheduler transition");
+            }
+
+            int ret = sid;
+            bool terminated = false;
+            if (transition->blocked)
+            {
+                std::lock_guard<std::mutex> semaLock(
+                    sema->m);
+                std::lock_guard<std::mutex> threadLock(
+                    info->m);
+                terminated = info->terminated.load();
+                if (!terminated)
+                {
+                    const auto completion =
+                        info->pendingWaitCompletion;
+                    info->pendingWaitCompletion =
+                        ps2x::ee::
+                            EeSchedulerWaitCompletion::
+                                None;
+                    info->guestState.finishWait(
+                        EeThreadWaitQueue::Semaphore,
+                        TSW_SEMA,
+                        sid,
+                        false);
+                    if (completion !=
+                        ps2x::ee::
+                            EeSchedulerWaitCompletion::
+                                Satisfied)
+                    {
+                        info->forceRelease = false;
+                        ret = KE_ERROR;
+                    }
+                }
+            }
+            else
+            {
+                std::lock_guard<std::mutex> lock(
+                    sema->m);
+                if (sema->deleted)
+                {
+                    ret = KE_ERROR;
+                }
+            }
+
+            if (terminated)
+            {
+                throw ThreadExitException();
+            }
+            waitWhileSuspended(info, runtime);
+            (void)publishRunningAtGuestBoundary(info);
+            setReturnS32(ctx, ret);
+            return;
+        }
 
         std::unique_lock<std::mutex> lock(sema->m);
 
@@ -308,7 +853,7 @@ namespace ps2_syscalls
             const uint32_t blockLog = s_waitSemaBlockLogs.fetch_add(1, std::memory_order_relaxed);
             if (blockLog < 256u)
             {
-                RUNTIME_LOG("[WaitSema:block] tid=" << g_currentThreadId
+                RUNTIME_LOG("[WaitSema:block] tid=" << getCurrentThreadId(runtime)
                                                     << " sid=" << sid
                                                     << " pc=0x" << std::hex << ctx->pc
                                                     << " ra=0x" << getRegU32(ctx, 31)
@@ -319,9 +864,10 @@ namespace ps2_syscalls
             if (info)
             {
                 std::lock_guard<std::mutex> tLock(info->m);
-                info->status = (info->suspendCount > 0) ? THS_WAITSUSPEND : THS_WAIT;
-                info->waitType = TSW_SEMA;
-                info->waitId = sid;
+                info->guestState.block(
+                    EeThreadWaitQueue::Semaphore,
+                    TSW_SEMA,
+                    sid);
                 info->forceRelease = false;
             }
 
@@ -340,24 +886,59 @@ namespace ps2_syscalls
                 },
                 [&]()
                 {
-                    sema->waiters--;
                     if (sema->deleted)
                     {
-                        ret = KE_WAIT_DELETE;
+                        ret = KE_ERROR;
                     }
 
                     if (info)
                     {
                         std::lock_guard<std::mutex> tLock(info->m);
                         terminated = info->terminated.load();
-                        info->status = (info->suspendCount > 0) ? THS_SUSPEND : THS_RUN;
-                        info->waitType = TSW_NONE;
-                        info->waitId = 0;
+                        bool wasLinked =
+                            info->guestState.isLinkedTo(
+                                EeThreadWaitQueue::Semaphore,
+                                sid);
+                        if (terminated)
+                        {
+                            info->guestState.makeDormant();
+                        }
+                        else
+                        {
+                            const EeThreadGuestStateSnapshot
+                                &guest =
+                                    info->guestState.snapshot();
+                            const bool retainedCompletion =
+                                guest.waitCompletionPending &&
+                                guest.waitType == TSW_SEMA &&
+                                guest.waitId == sid;
+                            if (!retainedCompletion)
+                            {
+                                wasLinked =
+                                    info->guestState.finishWait(
+                                        EeThreadWaitQueue::
+                                            Semaphore,
+                                        TSW_SEMA,
+                                        sid,
+                                        false);
+                            }
+                        }
+                        if (wasLinked &&
+                            sema->waiters > 0)
+                        {
+                            --sema->waiters;
+                            sema->cv.notify_all();
+                        }
                         if (info->forceRelease)
                         {
                             info->forceRelease = false;
-                            ret = KE_RELEASE_WAIT;
+                            ret = KE_ERROR;
                         }
+                    }
+                    else if (sema->waiters > 0)
+                    {
+                        --sema->waiters;
+                        sema->cv.notify_all();
                     }
 
                     if (!terminated && ret == sid && sema->count > 0)
@@ -374,6 +955,19 @@ namespace ps2_syscalls
             throw ThreadExitException();
         }
 
+        if (info)
+        {
+            std::lock_guard<std::mutex> tLock(info->m);
+            const EeThreadGuestStateSnapshot &guest =
+                info->guestState.snapshot();
+            if (!info->terminated.load() &&
+                guest.suspendCount == 0 &&
+                guest.status == THS_READY)
+            {
+                info->guestState.publishRunning();
+            }
+        }
+
         if (!consumed && lock.owns_lock())
         {
             if (ret == sid && sema->count > 0)
@@ -388,7 +982,7 @@ namespace ps2_syscalls
         const uint32_t wakeLog = s_waitSemaWakeLogs.fetch_add(1, std::memory_order_relaxed);
         if (wakeLog < 256u)
         {
-            RUNTIME_LOG("[WaitSema:wake] tid=" << g_currentThreadId
+            RUNTIME_LOG("[WaitSema:wake] tid=" << getCurrentThreadId(runtime)
                                                << " sid=" << sid
                                                << " ret=" << ret
                                                << " count=" << countAfter
@@ -399,13 +993,14 @@ namespace ps2_syscalls
             lock.unlock();
         }
         waitWhileSuspended(info, runtime);
+        (void)publishRunningAtGuestBoundary(info);
         setReturnS32(ctx, ret);
     }
 
     void PollSema(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
         int sid = static_cast<int>(getRegU32(ctx, 4));
-        auto sema = lookupSemaInfo(sid);
+        auto sema = lookupSemaInfo(runtime, sid);
         if (!sema)
         {
             setReturnS32(ctx, KE_UNKNOWN_SEMID);
@@ -428,15 +1023,19 @@ namespace ps2_syscalls
         PollSema(rdram, ctx, runtime);
     }
 
-    void ReferSemaStatus(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    static void referSemaStatus(
+        uint8_t *rdram,
+        R5900Context *ctx,
+        PS2Runtime *runtime,
+        bool raw)
     {
         int sid = static_cast<int>(getRegU32(ctx, 4));
         uint32_t statusAddr = getRegU32(ctx, 5);
 
-        auto sema = lookupSemaInfo(sid);
+        auto sema = lookupSemaInfo(runtime, sid);
         if (!sema)
         {
-            setReturnS32(ctx, KE_UNKNOWN_SEMID);
+            setReturnS32(ctx, raw ? KE_ERROR : KE_UNKNOWN_SEMID);
             return;
         }
 
@@ -457,9 +1056,14 @@ namespace ps2_syscalls
         setReturnS32(ctx, KE_OK);
     }
 
+    void ReferSemaStatus(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        referSemaStatus(rdram, ctx, runtime, false);
+    }
+
     void iReferSemaStatus(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
-        ReferSemaStatus(rdram, ctx, runtime);
+        referSemaStatus(rdram, ctx, runtime, true);
     }
 
     constexpr uint32_t WEF_OR = 1;
@@ -468,8 +1072,42 @@ namespace ps2_syscalls
     constexpr uint32_t WEF_MODE_MASK = WEF_OR | WEF_CLEAR | WEF_CLEAR_ALL;
     constexpr uint32_t EA_MULTI = 0x2;
 
+    static bool eventFlagSatisfied(
+        uint32_t currentBits,
+        uint32_t waitBits,
+        uint32_t mode)
+    {
+        if ((mode & WEF_OR) != 0u)
+        {
+            return (currentBits & waitBits) != 0u;
+        }
+        return (currentBits & waitBits) ==
+               waitBits;
+    }
+
+    static void applyEventFlagClear(
+        EventFlagInfo &info,
+        uint32_t waitBits,
+        uint32_t mode)
+    {
+        if ((mode & WEF_CLEAR_ALL) != 0u)
+        {
+            info.bits = 0u;
+        }
+        else if ((mode & WEF_CLEAR) != 0u)
+        {
+            info.bits &= ~waitBits;
+        }
+    }
+
     void CreateEventFlag(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
+        if (!runtime)
+        {
+            setReturnS32(ctx, KE_ERROR);
+            return;
+        }
+
         uint32_t paramAddr = getRegU32(ctx, 4); // $a0
         const uint32_t *param = reinterpret_cast<const uint32_t *>(getConstMemPtr(rdram, paramAddr));
 
@@ -483,10 +1121,13 @@ namespace ps2_syscalls
         }
 
         int id = 0;
+        EeSyncRuntimeState &syncState =
+            runtime->eeSyncRuntimeState();
         {
-            std::lock_guard<std::mutex> mapLock(g_event_flag_map_mutex);
-            id = g_nextEventFlagId++;
-            g_eventFlags[id] = info;
+            std::lock_guard<std::mutex> mapLock(
+                syncState.eventFlagMapMutex);
+            id = syncState.nextEventFlagId++;
+            syncState.eventFlags[id] = info;
         }
         setReturnS32(ctx, id);
     }
@@ -495,16 +1136,189 @@ namespace ps2_syscalls
     {
         int eid = static_cast<int>(getRegU32(ctx, 4));
         std::shared_ptr<EventFlagInfo> info;
+        if (!runtime)
         {
-            std::lock_guard<std::mutex> mapLock(g_event_flag_map_mutex);
-            auto it = g_eventFlags.find(eid);
-            if (it == g_eventFlags.end())
+            setReturnS32(ctx, KE_UNKNOWN_EVFID);
+            return;
+        }
+
+        if (runtime->usesDedicatedEeExecutor())
+        {
+            info = lookupEventFlagInfo(runtime, eid);
+            if (!info)
+            {
+                setReturnS32(ctx, KE_UNKNOWN_EVFID);
+                return;
+            }
+
+            struct DeleteTransition
+            {
+                int result = KE_ERROR;
+                bool applied = false;
+            };
+            const auto transition =
+                std::make_shared<DeleteTransition>();
+            const bool published =
+                runtime->publishEeSchedulerUpdate(
+                    [runtime,
+                     info,
+                     eid,
+                     transition](
+                        ps2x::ee::EeThreadScheduler
+                            &scheduler)
+                    {
+                        EeSyncRuntimeState &syncState =
+                            runtime
+                                ->eeSyncRuntimeState();
+                        {
+                            std::lock_guard<std::mutex>
+                                mapLock(
+                                    syncState
+                                        .eventFlagMapMutex);
+                            const auto it =
+                                syncState.eventFlags.find(
+                                    eid);
+                            if (it ==
+                                    syncState.eventFlags
+                                        .end() ||
+                                it->second != info)
+                            {
+                                transition->result =
+                                    KE_UNKNOWN_EVFID;
+                                transition->applied =
+                                    true;
+                                return;
+                            }
+                            syncState.eventFlags.erase(
+                                it);
+                        }
+
+                        std::lock_guard<std::mutex> lock(
+                            info->m);
+                        info->deleted = true;
+                        const ps2x::ee::
+                            EeSchedulerWaitKey wait{
+                                ps2x::ee::
+                                    EeSchedulerWaitKind::
+                                        EventFlag,
+                                eid,
+                            };
+                        const std::vector<int> waiters =
+                            scheduler.waitOrder(wait);
+                        for (const int threadId :
+                             waiters)
+                        {
+                            const auto request =
+                                info->schedulerWaiters
+                                    .find(threadId);
+                            const auto handle =
+                                scheduler.threadHandle(
+                                    threadId);
+                            if (request ==
+                                    info->schedulerWaiters
+                                        .end() ||
+                                !handle.has_value() ||
+                                handle->generation !=
+                                    request->second
+                                        .generation ||
+                                !scheduler
+                                     .releaseWaitThread(
+                                         *handle,
+                                         ps2x::ee::
+                                             EeSchedulerWaitCompletion::
+                                                 ObjectDeleted))
+                            {
+                                throw std::logic_error(
+                                    "DeleteEventFlag could "
+                                    "not detach an EE "
+                                    "scheduler waiter");
+                            }
+
+                            const auto waiter =
+                                lookupThreadInfo(
+                                    runtime,
+                                    threadId);
+                            if (!waiter)
+                            {
+                                throw std::logic_error(
+                                    "DeleteEventFlag "
+                                    "detached a missing EE "
+                                    "thread");
+                            }
+                            std::lock_guard<std::mutex>
+                                threadLock(waiter->m);
+                            if (!waiter->guestState
+                                     .releaseWait(
+                                         EeThreadWaitQueue::
+                                             EventFlag,
+                                         TSW_EVENT,
+                                         eid,
+                                         false) ||
+                                info->waiters <= 0)
+                            {
+                                throw std::logic_error(
+                                    "DeleteEventFlag "
+                                    "scheduler and guest "
+                                    "wait queues diverged");
+                            }
+                            waiter->pendingWaitCompletion =
+                                ps2x::ee::
+                                    EeSchedulerWaitCompletion::
+                                        ObjectDeleted;
+                            waiter
+                                ->pendingEventFlagResultBits =
+                                0u;
+                            info->schedulerWaiters.erase(
+                                request);
+                            --info->waiters;
+                        }
+                        if (info->waiters != 0 ||
+                            !info->schedulerWaiters
+                                 .empty())
+                        {
+                            throw std::logic_error(
+                                "DeleteEventFlag left an "
+                                "unmodeled executor "
+                                "waiter");
+                        }
+                        transition->result = KE_OK;
+                        transition->applied = true;
+                    },
+                    ps2x::ee::
+                        EeSchedulerReschedulePolicy::
+                            HigherPriorityOnly);
+            if (!published)
+            {
+                setReturnS32(ctx, KE_ERROR);
+                return;
+            }
+
+            runtime->yieldEeExecutorCurrent(
+                ps2x::ee::EeSchedulerExitReason::
+                    Preempted);
+            if (!transition->applied)
+            {
+                throw std::logic_error(
+                    "DeleteEventFlag resumed before its "
+                    "scheduler transition");
+            }
+            setReturnS32(ctx, transition->result);
+            return;
+        }
+
+        EeSyncRuntimeState &syncState =
+            runtime->eeSyncRuntimeState();
+        {
+            std::lock_guard<std::mutex> mapLock(
+                syncState.eventFlagMapMutex);
+            auto it = syncState.eventFlags.find(eid);
+            if (it == syncState.eventFlags.end())
             {
                 setReturnS32(ctx, KE_UNKNOWN_EVFID);
                 return;
             }
             info = it->second;
-            g_eventFlags.erase(it);
+            syncState.eventFlags.erase(it);
         }
 
         if (!info)
@@ -513,19 +1327,87 @@ namespace ps2_syscalls
             return;
         }
 
+        int callerPriority = 128;
+        if (const auto caller =
+                ensureCurrentThreadInfo(runtime, ctx))
+        {
+            std::lock_guard<std::mutex> callerLock(
+                caller->m);
+            callerPriority =
+                caller->guestState.snapshot()
+                    .currentPriority;
+        }
+
+        bool wokeHigherPriorityWaiter = false;
         {
             std::lock_guard<std::mutex> lock(info->m);
             info->deleted = true;
+            for (const int threadId :
+                 info->legacyWaitOrder)
+            {
+                const auto request =
+                    info->schedulerWaiters.find(
+                        threadId);
+                const auto waiter =
+                    lookupThreadInfo(runtime, threadId);
+                if (request ==
+                        info->schedulerWaiters.end() ||
+                    !waiter ||
+                    waiter->generation !=
+                        request->second.generation)
+                {
+                    throw std::logic_error(
+                        "DeleteEventFlag found a stale "
+                        "legacy event waiter");
+                }
+                std::lock_guard<std::mutex> threadLock(
+                    waiter->m);
+                const int waiterPriority =
+                    waiter->guestState.snapshot()
+                        .currentPriority;
+                if (!waiter->guestState.releaseWait(
+                        EeThreadWaitQueue::EventFlag,
+                        TSW_EVENT,
+                        eid,
+                        false) ||
+                    info->waiters <= 0)
+                {
+                    throw std::logic_error(
+                        "DeleteEventFlag could not "
+                        "detach a legacy event waiter");
+                }
+                --info->waiters;
+                wokeHigherPriorityWaiter =
+                    wokeHigherPriorityWaiter ||
+                    waiterPriority <
+                        callerPriority;
+            }
+            info->schedulerWaiters.clear();
+            info->legacyWaitOrder.clear();
+            if (info->waiters != 0)
+            {
+                throw std::logic_error(
+                    "DeleteEventFlag legacy waiter "
+                    "accounting diverged");
+            }
         }
         info->cv.notify_all();
         setReturnS32(ctx, 0);
+        if (wokeHigherPriorityWaiter)
+        {
+            yieldGuestExecutionAfterWake(runtime);
+        }
     }
 
-    void SetEventFlag(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    static void setEventFlag(
+        uint8_t *rdram,
+        R5900Context *ctx,
+        PS2Runtime *runtime,
+        bool reschedule)
     {
         int eid = static_cast<int>(getRegU32(ctx, 4));
         uint32_t bits = getRegU32(ctx, 5);
-        auto info = lookupEventFlagInfo(eid);
+        auto info = lookupEventFlagInfo(runtime, eid);
         if (!info)
         {
             setReturnS32(ctx, KE_UNKNOWN_EVFID);
@@ -538,20 +1420,284 @@ namespace ps2_syscalls
             return;
         }
 
+        if (runtime->usesDedicatedEeExecutor())
+        {
+            struct SetTransition
+            {
+                int result = KE_ERROR;
+                uint32_t newBits = 0u;
+                bool applied = false;
+            };
+            const auto transition =
+                std::make_shared<SetTransition>();
+            const bool published =
+                runtime->publishEeSchedulerUpdate(
+                    [runtime,
+                     info,
+                     eid,
+                     bits,
+                     transition](
+                        ps2x::ee::EeThreadScheduler
+                            &scheduler)
+                    {
+                        std::lock_guard<std::mutex> lock(
+                            info->m);
+                        if (info->deleted)
+                        {
+                            transition->result =
+                                KE_UNKNOWN_EVFID;
+                            transition->applied = true;
+                            return;
+                        }
+
+                        info->bits |= bits;
+                        const ps2x::ee::
+                            EeSchedulerWaitKey wait{
+                                ps2x::ee::
+                                    EeSchedulerWaitKind::
+                                        EventFlag,
+                                eid,
+                            };
+                        const std::vector<int> waiters =
+                            scheduler.waitOrder(wait);
+                        for (const int threadId :
+                             waiters)
+                        {
+                            const auto request =
+                                info->schedulerWaiters
+                                    .find(threadId);
+                            if (request ==
+                                info->schedulerWaiters
+                                    .end())
+                            {
+                                throw std::logic_error(
+                                    "SetEventFlag lost an "
+                                    "executor wait "
+                                    "predicate");
+                            }
+                            if (!eventFlagSatisfied(
+                                    info->bits,
+                                    request->second
+                                        .waitBits,
+                                    request->second.mode))
+                            {
+                                continue;
+                            }
+
+                            const auto handle =
+                                scheduler.threadHandle(
+                                    threadId);
+                            if (!handle.has_value() ||
+                                handle->generation !=
+                                    request->second
+                                        .generation ||
+                                !scheduler
+                                     .releaseWaitThread(
+                                         *handle,
+                                         ps2x::ee::
+                                             EeSchedulerWaitCompletion::
+                                                 Satisfied))
+                            {
+                                throw std::logic_error(
+                                    "SetEventFlag could not "
+                                    "satisfy an EE "
+                                    "scheduler waiter");
+                            }
+
+                            const uint32_t resultBits =
+                                info->bits;
+                            applyEventFlagClear(
+                                *info,
+                                request->second.waitBits,
+                                request->second.mode);
+                            const auto waiter =
+                                lookupThreadInfo(
+                                    runtime,
+                                    threadId);
+                            if (!waiter)
+                            {
+                                throw std::logic_error(
+                                    "SetEventFlag woke a "
+                                    "missing EE thread");
+                            }
+                            std::lock_guard<std::mutex>
+                                threadLock(waiter->m);
+                            if (!waiter->guestState
+                                     .releaseWait(
+                                         EeThreadWaitQueue::
+                                             EventFlag,
+                                         TSW_EVENT,
+                                         eid,
+                                         false) ||
+                                info->waiters <= 0)
+                            {
+                                throw std::logic_error(
+                                    "SetEventFlag "
+                                    "scheduler and guest "
+                                    "wait queues diverged");
+                            }
+                            waiter->pendingWaitCompletion =
+                                ps2x::ee::
+                                    EeSchedulerWaitCompletion::
+                                        Satisfied;
+                            waiter
+                                ->pendingEventFlagResultBits =
+                                resultBits;
+                            info->schedulerWaiters.erase(
+                                request);
+                            --info->waiters;
+                        }
+                        if (static_cast<size_t>(
+                                info->waiters) !=
+                            info->schedulerWaiters.size())
+                        {
+                            throw std::logic_error(
+                                "SetEventFlag waiter "
+                                "accounting diverged");
+                        }
+                        transition->newBits =
+                            info->bits;
+                        transition->result = KE_OK;
+                        transition->applied = true;
+                    },
+                    reschedule
+                        ? ps2x::ee::
+                              EeSchedulerReschedulePolicy::
+                                  HigherPriorityOnly
+                        : ps2x::ee::
+                              EeSchedulerReschedulePolicy::
+                                  None);
+            if (!published)
+            {
+                setReturnS32(ctx, KE_ERROR);
+                return;
+            }
+
+            runtime->yieldEeExecutorCurrent(
+                ps2x::ee::EeSchedulerExitReason::
+                    Preempted);
+            if (!transition->applied)
+            {
+                throw std::logic_error(
+                    "SetEventFlag resumed before its "
+                    "scheduler transition");
+            }
+            setReturnS32(ctx, transition->result);
+            return;
+        }
+
+        int callerPriority = 128;
+        if (const auto caller =
+                ensureCurrentThreadInfo(runtime, ctx))
+        {
+            std::lock_guard<std::mutex> callerLock(
+                caller->m);
+            callerPriority =
+                caller->guestState.snapshot()
+                    .currentPriority;
+        }
+
         uint32_t newBits = 0u;
-        bool hadWaiters = false;
+        bool wokeWaiter = false;
+        bool wokeHigherPriorityWaiter = false;
         {
             std::lock_guard<std::mutex> lock(info->m);
             info->bits |= bits;
+            for (auto order =
+                     info->legacyWaitOrder.begin();
+                 order !=
+                 info->legacyWaitOrder.end();)
+            {
+                const int threadId = *order;
+                const auto request =
+                    info->schedulerWaiters.find(
+                        threadId);
+                if (request ==
+                    info->schedulerWaiters.end())
+                {
+                    throw std::logic_error(
+                        "SetEventFlag lost a legacy "
+                        "event-wait predicate");
+                }
+                if (!eventFlagSatisfied(
+                        info->bits,
+                        request->second.waitBits,
+                        request->second.mode))
+                {
+                    ++order;
+                    continue;
+                }
+
+                const auto waiter =
+                    lookupThreadInfo(runtime, threadId);
+                if (!waiter ||
+                    waiter->generation !=
+                        request->second.generation)
+                {
+                    throw std::logic_error(
+                        "SetEventFlag found a stale "
+                        "legacy event waiter");
+                }
+                const uint32_t resultBits =
+                    info->bits;
+                {
+                    std::lock_guard<std::mutex>
+                        threadLock(waiter->m);
+                    const int waiterPriority =
+                        waiter->guestState.snapshot()
+                            .currentPriority;
+                    if (!waiter->guestState.releaseWait(
+                            EeThreadWaitQueue::
+                                EventFlag,
+                            TSW_EVENT,
+                            eid,
+                            false) ||
+                        info->waiters <= 0)
+                    {
+                        throw std::logic_error(
+                            "SetEventFlag could not "
+                            "detach a legacy event "
+                            "waiter");
+                    }
+                    waiter->pendingWaitCompletion =
+                        ps2x::ee::
+                            EeSchedulerWaitCompletion::
+                                Satisfied;
+                    waiter
+                        ->pendingEventFlagResultBits =
+                        resultBits;
+                    wokeHigherPriorityWaiter =
+                        wokeHigherPriorityWaiter ||
+                        waiterPriority <
+                            callerPriority;
+                }
+                applyEventFlagClear(
+                    *info,
+                    request->second.waitBits,
+                    request->second.mode);
+                --info->waiters;
+                info->schedulerWaiters.erase(
+                    request);
+                order =
+                    info->legacyWaitOrder.erase(
+                        order);
+                wokeWaiter = true;
+            }
+            if (static_cast<size_t>(info->waiters) !=
+                info->schedulerWaiters.size())
+            {
+                throw std::logic_error(
+                    "SetEventFlag legacy waiter "
+                    "accounting diverged");
+            }
             newBits = info->bits;
-            hadWaiters = info->waiters > 0;
         }
 
         static std::atomic<uint32_t> s_setEventFlagLogs{0};
         const uint32_t setLog = s_setEventFlagLogs.fetch_add(1, std::memory_order_relaxed);
         if (setLog < 256u)
         {
-            RUNTIME_LOG("[SetEventFlag] tid=" << g_currentThreadId
+            RUNTIME_LOG("[SetEventFlag] tid=" << getCurrentThreadId(runtime)
                                               << " eid=" << eid
                                               << " bits=0x" << std::hex << bits
                                               << " newBits=0x" << newBits
@@ -559,22 +1705,28 @@ namespace ps2_syscalls
         }
         info->cv.notify_all();
         setReturnS32(ctx, 0);
-        if (hadWaiters)
+        if (wokeWaiter && reschedule &&
+            wokeHigherPriorityWaiter)
         {
             yieldGuestExecutionAfterWake(runtime);
         }
     }
 
+    void SetEventFlag(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        setEventFlag(rdram, ctx, runtime, true);
+    }
+
     void iSetEventFlag(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
-        SetEventFlag(rdram, ctx, runtime);
+        setEventFlag(rdram, ctx, runtime, false);
     }
 
     void ClearEventFlag(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
         int eid = static_cast<int>(getRegU32(ctx, 4));
         uint32_t bits = getRegU32(ctx, 5);
-        auto info = lookupEventFlagInfo(eid);
+        auto info = lookupEventFlagInfo(runtime, eid);
         if (!info)
         {
             setReturnS32(ctx, KE_UNKNOWN_EVFID);
@@ -613,7 +1765,7 @@ namespace ps2_syscalls
             return;
         }
 
-        auto info = lookupEventFlagInfo(eid);
+        auto info = lookupEventFlagInfo(runtime, eid);
         if (!info)
         {
             setReturnS32(ctx, KE_UNKNOWN_EVFID);
@@ -622,6 +1774,250 @@ namespace ps2_syscalls
 
         uint32_t *resBitsPtr = resBitsAddr ? reinterpret_cast<uint32_t *>(getMemPtr(rdram, resBitsAddr)) : nullptr;
 
+        if (runtime->usesDedicatedEeExecutor())
+        {
+            auto tInfo =
+                ensureCurrentThreadInfo(runtime, ctx);
+            throwIfTerminated(tInfo);
+
+            struct WaitTransition
+            {
+                int result = KE_OK;
+                uint32_t resultBits = 0u;
+                bool blocked = false;
+                bool applied = false;
+            };
+            const int threadId =
+                getCurrentThreadId(runtime);
+            const uint32_t generation =
+                tInfo->generation;
+            const auto transition =
+                std::make_shared<WaitTransition>();
+            const bool published =
+                runtime->publishEeSchedulerUpdate(
+                    [info,
+                     tInfo,
+                     eid,
+                     waitBits,
+                     mode,
+                     threadId,
+                     generation,
+                     transition](
+                        ps2x::ee::EeThreadScheduler
+                            &scheduler)
+                    {
+                        const auto handle =
+                            scheduler.threadHandle(
+                                threadId);
+                        if (!handle.has_value() ||
+                            handle->generation !=
+                                generation)
+                        {
+                            throw std::logic_error(
+                                "WaitEventFlag lost its EE "
+                                "scheduler record");
+                        }
+
+                        std::lock_guard<std::mutex> lock(
+                            info->m);
+                        {
+                            std::lock_guard<std::mutex>
+                                threadLock(tInfo->m);
+                            tInfo->pendingWaitCompletion =
+                                ps2x::ee::
+                                    EeSchedulerWaitCompletion::
+                                        None;
+                            tInfo
+                                ->pendingEventFlagResultBits =
+                                0u;
+                        }
+                        if (info->deleted)
+                        {
+                            transition->result =
+                                KE_WAIT_DELETE;
+                            transition->applied = true;
+                            return;
+                        }
+                        if ((info->attr & EA_MULTI) ==
+                                0u &&
+                            info->waiters > 0)
+                        {
+                            transition->result =
+                                KE_EVF_MULTI;
+                            transition->applied = true;
+                            return;
+                        }
+                        if (eventFlagSatisfied(
+                                info->bits,
+                                waitBits,
+                                mode))
+                        {
+                            transition->resultBits =
+                                info->bits;
+                            applyEventFlagClear(
+                                *info,
+                                waitBits,
+                                mode);
+                            transition->applied = true;
+                            return;
+                        }
+
+                        (void)scheduler
+                            .blockCurrentThread(
+                                {
+                                    ps2x::ee::
+                                        EeSchedulerWaitKind::
+                                            EventFlag,
+                                    eid,
+                                });
+                        const auto blocked =
+                            scheduler.thread(
+                                threadId);
+                        if (!blocked.has_value() ||
+                            blocked->generation !=
+                                generation ||
+                            (blocked->state !=
+                                 ps2x::ee::
+                                     EeSchedulerThreadState::
+                                         Waiting &&
+                             blocked->state !=
+                                 ps2x::ee::
+                                     EeSchedulerThreadState::
+                                         WaitSuspended))
+                        {
+                            throw std::logic_error(
+                                "WaitEventFlag could not "
+                                "block its running "
+                                "scheduler owner");
+                        }
+
+                        std::lock_guard<std::mutex>
+                            threadLock(tInfo->m);
+                        if (!tInfo->guestState.block(
+                                EeThreadWaitQueue::
+                                    EventFlag,
+                                TSW_EVENT,
+                                eid))
+                        {
+                            throw std::logic_error(
+                                "WaitEventFlag could not "
+                                "mirror its scheduler "
+                                "wait");
+                        }
+                        tInfo->forceRelease = false;
+                        const auto [it, inserted] =
+                            info->schedulerWaiters.emplace(
+                                threadId,
+                                EventFlagInfo::
+                                    SchedulerWaiter{
+                                        generation,
+                                        waitBits,
+                                        mode,
+                                    });
+                        (void)it;
+                        if (!inserted)
+                        {
+                            throw std::logic_error(
+                                "WaitEventFlag duplicated "
+                                "an executor waiter");
+                        }
+                        ++info->waiters;
+                        transition->blocked = true;
+                        transition->applied = true;
+                    },
+                    ps2x::ee::
+                        EeSchedulerReschedulePolicy::
+                            None);
+            if (!published)
+            {
+                setReturnS32(ctx, KE_ERROR);
+                return;
+            }
+
+            runtime->yieldEeExecutorCurrent(
+                ps2x::ee::EeSchedulerExitReason::
+                    Preempted);
+            if (!transition->applied)
+            {
+                throw std::logic_error(
+                    "WaitEventFlag resumed before its "
+                    "scheduler transition");
+            }
+
+            int ret = transition->result;
+            uint32_t resultBits =
+                transition->resultBits;
+            bool terminated = false;
+            if (transition->blocked)
+            {
+                std::lock_guard<std::mutex> eventLock(
+                    info->m);
+                std::lock_guard<std::mutex> threadLock(
+                    tInfo->m);
+                terminated = tInfo->terminated.load();
+                if (!terminated)
+                {
+                    const auto completion =
+                        tInfo->pendingWaitCompletion;
+                    resultBits =
+                        tInfo
+                            ->pendingEventFlagResultBits;
+                    tInfo->pendingWaitCompletion =
+                        ps2x::ee::
+                            EeSchedulerWaitCompletion::
+                                None;
+                    tInfo->pendingEventFlagResultBits =
+                        0u;
+                    tInfo->guestState.finishWait(
+                        EeThreadWaitQueue::EventFlag,
+                        TSW_EVENT,
+                        eid,
+                        false);
+                    switch (completion)
+                    {
+                    case ps2x::ee::
+                        EeSchedulerWaitCompletion::
+                            Satisfied:
+                        ret = KE_OK;
+                        break;
+                    case ps2x::ee::
+                        EeSchedulerWaitCompletion::
+                            Released:
+                        tInfo->forceRelease = false;
+                        ret = KE_RELEASE_WAIT;
+                        break;
+                    case ps2x::ee::
+                        EeSchedulerWaitCompletion::
+                            ObjectDeleted:
+                        ret = KE_WAIT_DELETE;
+                        break;
+                    case ps2x::ee::
+                        EeSchedulerWaitCompletion::
+                            TimedOut:
+                    case ps2x::ee::
+                        EeSchedulerWaitCompletion::None:
+                        throw std::logic_error(
+                            "WaitEventFlag resumed "
+                            "without a modeled "
+                            "completion");
+                    }
+                }
+            }
+
+            if (terminated)
+            {
+                throw ThreadExitException();
+            }
+            if (ret == KE_OK && resBitsPtr)
+            {
+                *resBitsPtr = resultBits;
+            }
+            waitWhileSuspended(tInfo, runtime);
+            (void)publishRunningAtGuestBoundary(tInfo);
+            setReturnS32(ctx, ret);
+            return;
+        }
+
         std::unique_lock<std::mutex> lock(info->m);
         if ((info->attr & EA_MULTI) == 0 && info->waiters > 0)
         {
@@ -629,16 +2025,26 @@ namespace ps2_syscalls
             return;
         }
 
-        auto tInfo = ensureCurrentThreadInfo(ctx);
+        auto tInfo = ensureCurrentThreadInfo(runtime, ctx);
         throwIfTerminated(tInfo);
         int ret = KE_OK;
 
         auto satisfied = [&]()
         {
-            if (tInfo && tInfo->forceRelease.load())
-                return true;
-            if (tInfo && tInfo->terminated.load())
-                return true;
+            if (tInfo)
+            {
+                std::lock_guard<std::mutex> threadLock(
+                    tInfo->m);
+                if (tInfo->forceRelease.load() ||
+                    tInfo->terminated.load() ||
+                    tInfo->pendingWaitCompletion !=
+                        ps2x::ee::
+                            EeSchedulerWaitCompletion::
+                                None)
+                {
+                    return true;
+                }
+            }
             if (info->deleted)
             {
                 return true;
@@ -652,6 +2058,7 @@ namespace ps2_syscalls
 
         bool waitedWithGuestRelease = false;
         bool terminated = false;
+        bool consumedPublishedCompletion = false;
         uint32_t bitsAfter = info->bits;
 
         auto finishEventFlagWaitLocked = [&]()
@@ -687,7 +2094,7 @@ namespace ps2_syscalls
             const uint32_t evBlockLog = s_waitEventBlockLogs.fetch_add(1, std::memory_order_relaxed);
             if (evBlockLog < 256u)
             {
-                RUNTIME_LOG("[WaitEventFlag:block] tid=" << g_currentThreadId
+                RUNTIME_LOG("[WaitEventFlag:block] tid=" << getCurrentThreadId(runtime)
                                                          << " eid=" << eid
                                                          << " waitBits=0x" << std::hex << waitBits
                                                          << " mode=0x" << mode
@@ -701,10 +2108,39 @@ namespace ps2_syscalls
             if (tInfo)
             {
                 std::lock_guard<std::mutex> tLock(tInfo->m);
-                tInfo->status = (tInfo->suspendCount > 0) ? THS_WAITSUSPEND : THS_WAIT;
-                tInfo->waitType = TSW_EVENT;
-                tInfo->waitId = eid;
+                if (!tInfo->guestState.block(
+                        EeThreadWaitQueue::EventFlag,
+                        TSW_EVENT,
+                        eid))
+                {
+                    throw std::logic_error(
+                        "WaitEventFlag could not publish "
+                        "its legacy wait");
+                }
                 tInfo->forceRelease = false;
+                tInfo->pendingWaitCompletion =
+                    ps2x::ee::
+                        EeSchedulerWaitCompletion::None;
+                tInfo->pendingEventFlagResultBits = 0u;
+                const int threadId =
+                    getCurrentThreadId(runtime);
+                const auto [request, inserted] =
+                    info->schedulerWaiters.emplace(
+                        threadId,
+                        EventFlagInfo::SchedulerWaiter{
+                            tInfo->generation,
+                            waitBits,
+                            mode,
+                        });
+                (void)request;
+                if (!inserted)
+                {
+                    throw std::logic_error(
+                        "WaitEventFlag duplicated a "
+                        "legacy waiter");
+                }
+                info->legacyWaitOrder.push_back(
+                    threadId);
             }
 
             info->waiters++;
@@ -718,25 +2154,129 @@ namespace ps2_syscalls
                 },
                 [&]()
                 {
-                    info->waiters--;
+                    bool wasLinked = !tInfo;
 
                     if (tInfo)
                     {
                         std::lock_guard<std::mutex> tLock(tInfo->m);
                         terminated = tInfo->terminated.load();
-                        tInfo->status = (tInfo->suspendCount > 0) ? THS_SUSPEND : THS_RUN;
-                        tInfo->waitType = TSW_NONE;
-                        tInfo->waitId = 0;
+                        const int threadId =
+                            getCurrentThreadId(runtime);
+                        wasLinked =
+                            tInfo->guestState.isLinkedTo(
+                                EeThreadWaitQueue::EventFlag,
+                                eid);
+                        if (terminated)
+                        {
+                            tInfo->guestState.makeDormant();
+                        }
+                        else
+                        {
+                            const auto completion =
+                                tInfo
+                                    ->pendingWaitCompletion;
+                            const uint32_t completionBits =
+                                tInfo
+                                    ->pendingEventFlagResultBits;
+                            const bool finishedLinked =
+                                tInfo->guestState
+                                    .finishWait(
+                                        EeThreadWaitQueue::
+                                            EventFlag,
+                                        TSW_EVENT,
+                                        eid,
+                                        false);
+                            if (finishedLinked !=
+                                wasLinked)
+                            {
+                                throw std::logic_error(
+                                    "WaitEventFlag could "
+                                    "not finish its legacy "
+                                    "wait publication");
+                            }
+                            if (completion !=
+                                ps2x::ee::
+                                    EeSchedulerWaitCompletion::
+                                        None)
+                            {
+                                consumedPublishedCompletion =
+                                    true;
+                                tInfo
+                                    ->pendingWaitCompletion =
+                                    ps2x::ee::
+                                        EeSchedulerWaitCompletion::
+                                            None;
+                                tInfo
+                                    ->pendingEventFlagResultBits =
+                                    0u;
+                                switch (completion)
+                                {
+                                case ps2x::ee::
+                                    EeSchedulerWaitCompletion::
+                                        Satisfied:
+                                    if (resBitsPtr)
+                                    {
+                                        *resBitsPtr =
+                                            completionBits;
+                                    }
+                                    ret = KE_OK;
+                                    break;
+                                case ps2x::ee::
+                                    EeSchedulerWaitCompletion::
+                                        Released:
+                                    ret =
+                                        KE_RELEASE_WAIT;
+                                    break;
+                                case ps2x::ee::
+                                    EeSchedulerWaitCompletion::
+                                        ObjectDeleted:
+                                    ret =
+                                        KE_WAIT_DELETE;
+                                    break;
+                                case ps2x::ee::
+                                    EeSchedulerWaitCompletion::
+                                        TimedOut:
+                                case ps2x::ee::
+                                    EeSchedulerWaitCompletion::
+                                        None:
+                                    throw std::logic_error(
+                                        "WaitEventFlag "
+                                        "received an "
+                                        "invalid legacy "
+                                        "completion");
+                                }
+                            }
+                        }
                         if (tInfo->forceRelease)
                         {
                             tInfo->forceRelease = false;
                             ret = KE_RELEASE_WAIT;
                         }
+                        if (wasLinked)
+                        {
+                            info->schedulerWaiters.erase(
+                                threadId);
+                            std::erase(
+                                info->legacyWaitOrder,
+                                threadId);
+                        }
+                    }
+                    if (wasLinked && info->waiters > 0)
+                    {
+                        --info->waiters;
+                        info->cv.notify_all();
                     }
 
                     if (!terminated)
                     {
-                        finishEventFlagWaitLocked();
+                        if (!consumedPublishedCompletion)
+                        {
+                            finishEventFlagWaitLocked();
+                        }
+                        else
+                        {
+                            bitsAfter = info->bits;
+                        }
                     }
                     else
                     {
@@ -759,7 +2299,7 @@ namespace ps2_syscalls
         const uint32_t evWakeLog = s_waitEventWakeLogs.fetch_add(1, std::memory_order_relaxed);
         if (evWakeLog < 256u)
         {
-            RUNTIME_LOG("[WaitEventFlag:wake] tid=" << g_currentThreadId
+            RUNTIME_LOG("[WaitEventFlag:wake] tid=" << getCurrentThreadId(runtime)
                                                     << " eid=" << eid
                                                     << " ret=" << ret
                                                     << " bits=0x" << std::hex << bitsAfter
@@ -771,7 +2311,20 @@ namespace ps2_syscalls
         {
             lock.unlock();
         }
+        if (tInfo)
+        {
+            std::lock_guard<std::mutex> stateLock(tInfo->m);
+            const EeThreadGuestStateSnapshot &guest =
+                tInfo->guestState.snapshot();
+            if (!tInfo->terminated.load() &&
+                guest.suspendCount == 0 &&
+                guest.status == THS_READY)
+            {
+                tInfo->guestState.publishRunning();
+            }
+        }
         waitWhileSuspended(tInfo, runtime);
+        (void)publishRunningAtGuestBoundary(tInfo);
         setReturnS32(ctx, ret);
     }
 
@@ -794,7 +2347,7 @@ namespace ps2_syscalls
             return;
         }
 
-        auto info = lookupEventFlagInfo(eid);
+        auto info = lookupEventFlagInfo(runtime, eid);
         if (!info)
         {
             setReturnS32(ctx, KE_UNKNOWN_EVFID);
@@ -864,7 +2417,7 @@ namespace ps2_syscalls
             int32_t reserved2;
         };
 
-        auto info = lookupEventFlagInfo(eid);
+        auto info = lookupEventFlagInfo(runtime, eid);
         if (!info)
         {
             setReturnS32(ctx, KE_UNKNOWN_EVFID);
@@ -900,15 +2453,6 @@ namespace ps2_syscalls
         uint32_t handler = getRegU32(ctx, 5);
         uint32_t arg = getRegU32(ctx, 6);
 
-        static int logCount = 0;
-        if (logCount < 5)
-        {
-            RUNTIME_LOG("[SetAlarm] ticks=" << ticks
-                                            << " handler=0x" << std::hex << handler
-                                            << " arg=0x" << arg << std::dec << std::endl);
-            ++logCount;
-        }
-
         if (!runtime || !handler || !runtime->hasFunction(handler))
         {
             setReturnS32(ctx, KE_ERROR);
@@ -922,23 +2466,54 @@ namespace ps2_syscalls
         info->gp = getRegU32(ctx, 28);
         info->sp = getRegU32(ctx, 29);
         info->rdram = rdram;
-        info->runtime = runtime;
         info->dueAt = std::chrono::steady_clock::now() + alarmTicksToDuration(ticks);
 
+        EeAlarmRuntimeState &alarmState =
+            runtime->eeAlarmRuntimeState();
         int alarmId = 0;
         {
-            std::lock_guard<std::mutex> lock(g_alarm_mutex);
-            alarmId = g_nextAlarmId++;
-            if (g_nextAlarmId <= 0)
+            std::lock_guard<std::mutex> lock(
+                alarmState.mutex);
+            if (alarmState.stopRequested.load(
+                    std::memory_order_acquire))
             {
-                g_nextAlarmId = 1;
+                if (runtime->isStopRequested())
+                {
+                    setReturnS32(ctx, KE_ERROR);
+                    return;
+                }
+                // requestStop joins synchronously. A later run or direct
+                // test reuse may start a fresh worker and ID namespace.
+                alarmState.stopRequested.store(
+                    false, std::memory_order_release);
+            }
+
+            if (alarmState.setLogCount < 5u)
+            {
+                RUNTIME_LOG("[SetAlarm] ticks=" << ticks
+                                                << " handler=0x" << std::hex << handler
+                                                << " arg=0x" << arg << std::dec << std::endl);
+                ++alarmState.setLogCount;
+            }
+
+            alarmId = alarmState.nextAlarmId++;
+            if (alarmState.nextAlarmId <= 0)
+            {
+                alarmState.nextAlarmId = 1;
             }
             info->id = alarmId;
-            g_alarms[alarmId] = info;
+            alarmState.alarms[alarmId] = info;
         }
 
-        ensureAlarmWorkerRunning();
-        g_alarm_cv.notify_all();
+        if (!ensureAlarmWorkerRunning(runtime))
+        {
+            std::lock_guard<std::mutex> lock(
+                alarmState.mutex);
+            alarmState.alarms.erase(alarmId);
+            setReturnS32(ctx, KE_ERROR);
+            return;
+        }
+        alarmState.cv.notify_all();
         setReturnS32(ctx, alarmId);
     }
 
@@ -955,21 +2530,25 @@ namespace ps2_syscalls
     void CancelAlarm(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
         int alarmId = static_cast<int>(getRegU32(ctx, 4));
-        if (alarmId <= 0)
+        if (!runtime || alarmId <= 0)
         {
             setReturnS32(ctx, KE_ERROR);
             return;
         }
 
+        EeAlarmRuntimeState &alarmState =
+            runtime->eeAlarmRuntimeState();
         bool removed = false;
         {
-            std::lock_guard<std::mutex> lock(g_alarm_mutex);
-            removed = g_alarms.erase(alarmId) != 0;
+            std::lock_guard<std::mutex> lock(
+                alarmState.mutex);
+            removed =
+                alarmState.alarms.erase(alarmId) != 0;
         }
 
         if (removed)
         {
-            g_alarm_cv.notify_all();
+            alarmState.cv.notify_all();
             setReturnS32(ctx, KE_OK);
             return;
         }

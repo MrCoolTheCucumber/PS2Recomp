@@ -37,6 +37,66 @@ static Instruction makeAbsJump(uint32_t address, uint32_t target, uint32_t opcod
     return inst;
 }
 
+static Instruction makeAddiu(
+    uint32_t address,
+    uint32_t targetRegister,
+    uint32_t sourceRegister,
+    int16_t immediate)
+{
+    Instruction inst{};
+    inst.address = address;
+    inst.opcode = OPCODE_ADDIU;
+    inst.rs = sourceRegister;
+    inst.rt = targetRegister;
+    inst.immediate =
+        static_cast<uint16_t>(immediate);
+    inst.simmediate = static_cast<uint32_t>(
+        static_cast<int32_t>(immediate));
+    inst.raw =
+        (OPCODE_ADDIU << 26) |
+        (sourceRegister << 21) |
+        (targetRegister << 16) |
+        static_cast<uint16_t>(immediate);
+    inst.modificationInfo.modifiesGPR =
+        targetRegister != 0u;
+    return inst;
+}
+
+static Instruction makeLui(
+    uint32_t address,
+    uint32_t targetRegister,
+    uint16_t immediate)
+{
+    Instruction inst{};
+    inst.address = address;
+    inst.opcode = OPCODE_LUI;
+    inst.rt = targetRegister;
+    inst.immediate = immediate;
+    inst.simmediate = immediate;
+    inst.raw =
+        (OPCODE_LUI << 26) |
+        (targetRegister << 16) |
+        immediate;
+    inst.modificationInfo.modifiesGPR =
+        targetRegister != 0u;
+    return inst;
+}
+
+static Instruction makeSyscall(
+    uint32_t address,
+    uint32_t encodedId = 0u)
+{
+    Instruction inst{};
+    inst.address = address;
+    inst.opcode = OPCODE_SPECIAL;
+    inst.function = SPECIAL_SYSCALL;
+    inst.raw =
+        ((encodedId & 0xFFFFFu) << 6) |
+        SPECIAL_SYSCALL;
+    inst.modificationInfo.modifiesControl = true;
+    return inst;
+}
+
 static Instruction makeJrRa(uint32_t address)
 {
     Instruction inst{};
@@ -661,6 +721,48 @@ void register_ps2_recompiler_tests()
                 t.Equals(decoded100CIt->second.size(), static_cast<size_t>(3),
                          "entry 0x100C slice should keep remaining instructions");
             }
+        });
+
+        tc.Run("SetupThread root is an architectural entry point", [](TestCase &t) {
+            std::vector<Section> sections = {
+                {".text", 0x1000u, 0x2000u, 0u, true, false, false, true, nullptr}
+            };
+            CodeGenerator generator({}, sections);
+            const Function startup =
+                makeFunction("startup", 0x1000u, 0x1014u);
+            const std::vector<Instruction> instructions = {
+                makeLui(0x1000u, 8u, 0u),
+                makeAddiu(0x1004u, 8u, 8u, 0x1800),
+                makeAddiu(0x1008u, 3u, 0u, 0x003C),
+                makeSyscall(0x100Cu),
+            };
+
+            const CodeGenerator::AnalysisResult result =
+                generator.collectInternalBranchTargets(
+                    startup,
+                    instructions);
+            t.IsTrue(
+                result.architecturalEntryPoints.contains(
+                    0x1800u),
+                "the constant SetupThread root should be dispatchable after a worker returns");
+
+            const std::vector<Instruction> clobbered = {
+                makeLui(0x1000u, 8u, 0u),
+                makeAddiu(0x1004u, 8u, 8u, 0x1800),
+                makeAddiu(0x1008u, 3u, 0u, 0x003C),
+                makeAddiu(0x100Cu, 3u, 0u, 0x0020),
+                makeSyscall(0x1010u),
+            };
+            const CodeGenerator::AnalysisResult
+                clobberedResult =
+                    generator
+                        .collectInternalBranchTargets(
+                            startup,
+                            clobbered);
+            t.IsTrue(
+                clobberedResult
+                    .architecturalEntryPoints.empty(),
+                "a later syscall-number definition should prevent a false SetupThread root");
         });
 
         tc.Run("non-executable section targets are ignored", [](TestCase &t) {

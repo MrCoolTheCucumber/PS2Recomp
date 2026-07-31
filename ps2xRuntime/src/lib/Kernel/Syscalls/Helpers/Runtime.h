@@ -1,10 +1,5 @@
-struct ThreadExitException final : public std::exception
-{
-    const char *what() const noexcept override
-    {
-        return "PS2 Thread Exit";
-    }
-};
+#include "InterruptRuntimeState.h"
+#include "runtime/ee_guest_exceptions.h"
 
 static void throwIfTerminated(const std::shared_ptr<ThreadInfo> &info)
 {
@@ -12,6 +7,41 @@ static void throwIfTerminated(const std::shared_ptr<ThreadInfo> &info)
     {
         throw ThreadExitException();
     }
+}
+
+// A legacy host worker may observe READY, SUSPEND, or a retained wait
+// completion before it acquires the one guest-execution boundary. Publish RUN
+// only after that boundary is actually owned, and re-check suspension there
+// so an external suspend cannot race a worker's earlier host-side test.
+static bool publishRunningAtGuestBoundary(
+    const std::shared_ptr<ThreadInfo> &info)
+{
+    if (!info)
+    {
+        return true;
+    }
+
+    std::lock_guard<std::mutex> lock(info->m);
+    if (info->terminated.load())
+    {
+        throw ThreadExitException();
+    }
+
+    const EeThreadGuestStateSnapshot &guest =
+        info->guestState.snapshot();
+    if (guest.suspendCount != 0 ||
+        guest.status == EeThreadGuestState::kSuspend ||
+        guest.status == EeThreadGuestState::kWaitSuspend ||
+        guest.status == EeThreadGuestState::kWait ||
+        guest.status == EeThreadGuestState::kDormant)
+    {
+        return false;
+    }
+    if (guest.status == EeThreadGuestState::kReady)
+    {
+        info->guestState.publishRunning();
+    }
+    return true;
 }
 
 // Condition-variable waits in the EE runtime must release the global guest
@@ -55,13 +85,29 @@ static void waitWhileSuspended(const std::shared_ptr<ThreadInfo> &info, PS2Runti
     if (!info)
         return;
 
-    std::unique_lock<std::mutex> lock(info->m);
-    if (info->suspendCount > 0)
+    if (runtime && runtime->usesDedicatedEeExecutor())
     {
-        info->status = THS_SUSPEND;
-        info->waitType = TSW_NONE;
-        info->waitId = 0;
+        std::lock_guard<std::mutex> lock(info->m);
+        if (info->terminated.load())
+        {
+            throw ThreadExitException();
+        }
+        const EeThreadGuestStateSnapshot &guest =
+            info->guestState.snapshot();
+        if (guest.suspendCount != 0 ||
+            guest.status == EeThreadGuestState::kSuspend ||
+            guest.status == EeThreadGuestState::kWaitSuspend)
+        {
+            throw std::logic_error(
+                "the EE scheduler resumed a suspended "
+                "dedicated continuation");
+        }
+        return;
+    }
 
+    std::unique_lock<std::mutex> lock(info->m);
+    if (info->guestState.snapshot().suspendCount > 0)
+    {
         bool terminated = false;
         waitWithGuestExecutionReleasedUntilUnlocked(
             runtime,
@@ -69,15 +115,14 @@ static void waitWhileSuspended(const std::shared_ptr<ThreadInfo> &info, PS2Runti
             [&]()
             {
                 info->cv.wait(lock, [&]()
-                              { return info->suspendCount == 0 || info->terminated.load(); });
+                              {
+                                  return info->guestState.snapshot().suspendCount == 0 ||
+                                         info->terminated.load();
+                              });
             },
             [&]()
             {
                 terminated = info->terminated.load();
-                if (!terminated)
-                {
-                    info->status = THS_RUN;
-                }
             });
 
         if (terminated)
@@ -87,61 +132,118 @@ static void waitWhileSuspended(const std::shared_ptr<ThreadInfo> &info, PS2Runti
     }
 }
 
-static std::shared_ptr<ThreadInfo> lookupThreadInfo(int tid)
+static std::shared_ptr<ThreadInfo> lookupThreadInfo(
+    PS2Runtime *runtime,
+    int tid)
 {
-    std::lock_guard<std::mutex> lock(g_thread_map_mutex);
-    auto it = g_threads.find(tid);
-    if (it != g_threads.end())
+    if (!runtime)
+    {
+        return nullptr;
+    }
+
+    EeThreadRuntimeState &state =
+        runtime->eeThreadRuntimeState();
+    std::lock_guard<std::mutex> lock(
+        state.threadMapMutex);
+    auto it = state.threads.find(tid);
+    if (it != state.threads.end())
     {
         return it->second;
     }
     return nullptr;
 }
 
-static std::shared_ptr<ThreadInfo> ensureCurrentThreadInfo(R5900Context *ctx)
+static int getCurrentThreadId(PS2Runtime *runtime)
 {
-    const int tid = g_currentThreadId;
-    std::lock_guard<std::mutex> lock(g_thread_map_mutex);
-    auto it = g_threads.find(tid);
-    if (it != g_threads.end())
+    return runtime
+               ? runtime->currentEeThreadId()
+               : g_currentThreadId;
+}
+
+static std::shared_ptr<ThreadInfo> ensureCurrentThreadInfo(
+    PS2Runtime *runtime,
+    R5900Context *ctx)
+{
+    if (!runtime)
     {
+        return nullptr;
+    }
+
+    const int tid = getCurrentThreadId(runtime);
+    EeThreadRuntimeState &state =
+        runtime->eeThreadRuntimeState();
+    std::lock_guard<std::mutex> lock(
+        state.threadMapMutex);
+    auto it = state.threads.find(tid);
+    if (it != state.threads.end())
+    {
+        if (ctx && !it->second->boundContext)
+        {
+            it->second->boundContext =
+                tid == 1 ? &runtime->cpu() : ctx;
+            state.contextThreadIds[
+                it->second->boundContext] = tid;
+        }
         return it->second;
     }
 
     auto info = std::make_shared<ThreadInfo>();
-    info->started = true;
-    info->status = THS_RUN;
-    info->currentPriority = info->priority;
-    info->suspendCount = 0;
+    info->generation =
+        state.allocateThreadGenerationLocked();
+    info->priority = 0u;
+    info->guestState.initializeRunning(
+        static_cast<int>(info->priority));
     if (ctx)
     {
         info->entry = ctx->pc;
         info->stack = getRegU32(ctx, 29);
         info->gp = getRegU32(ctx, 28);
+        info->boundContext =
+            tid == 1 ? &runtime->cpu() : ctx;
+        state.contextThreadIds[
+            info->boundContext] = tid;
     }
-    info->waitType = TSW_NONE;
-    info->waitId = 0;
 
-    g_threads.emplace(tid, info);
+    state.threads.emplace(tid, info);
     return info;
 }
 
-static std::shared_ptr<SemaInfo> lookupSemaInfo(int sid)
+static std::shared_ptr<SemaInfo> lookupSemaInfo(
+    PS2Runtime *runtime,
+    int sid)
 {
-    std::lock_guard<std::mutex> lock(g_sema_map_mutex);
-    auto it = g_semas.find(sid);
-    if (it != g_semas.end())
+    if (!runtime)
+    {
+        return nullptr;
+    }
+
+    EeSyncRuntimeState &state =
+        runtime->eeSyncRuntimeState();
+    std::lock_guard<std::mutex> lock(
+        state.semaMapMutex);
+    auto it = state.semas.find(sid);
+    if (it != state.semas.end())
     {
         return it->second;
     }
     return nullptr;
 }
 
-static std::shared_ptr<EventFlagInfo> lookupEventFlagInfo(int eid)
+static std::shared_ptr<EventFlagInfo> lookupEventFlagInfo(
+    PS2Runtime *runtime,
+    int eid)
 {
-    std::lock_guard<std::mutex> lock(g_event_flag_map_mutex);
-    auto it = g_eventFlags.find(eid);
-    if (it != g_eventFlags.end())
+    if (!runtime)
+    {
+        return nullptr;
+    }
+
+    EeSyncRuntimeState &state =
+        runtime->eeSyncRuntimeState();
+    std::lock_guard<std::mutex> lock(
+        state.eventFlagMapMutex);
+    auto it = state.eventFlags.find(eid);
+    if (it != state.eventFlags.end())
     {
         return it->second;
     }
@@ -162,98 +264,188 @@ static std::chrono::microseconds alarmTicksToDuration(uint16_t ticks)
     return std::chrono::microseconds(clampedTicks * kAlarmTickUsec);
 }
 
-static void ensureAlarmWorkerRunning()
+static bool ensureAlarmWorkerRunning(PS2Runtime *runtime)
 {
-    std::call_once(g_alarm_worker_once, []()
-                   { std::thread([]()
-                                 {
+    if (!runtime)
+    {
+        return false;
+    }
+
+    EeAlarmRuntimeState &state =
+        runtime->eeAlarmRuntimeState();
+    std::unique_lock<std::mutex> lifecycleLock(state.mutex);
+    if (state.stopRequested.load(
+            std::memory_order_acquire))
+    {
+        return false;
+    }
+    if (state.worker.joinable())
+    {
+        if (state.workerRunning)
+        {
+            return true;
+        }
+
+        // Reap a completed publication worker before a later run starts a
+        // replacement.
+        std::thread stoppedWorker =
+            std::move(state.worker);
+        lifecycleLock.unlock();
+        stoppedWorker.join();
+        lifecycleLock.lock();
+
+        if (state.stopRequested.load(
+                std::memory_order_acquire))
+        {
+            return false;
+        }
+        if (state.worker.joinable())
+        {
+            return state.workerRunning;
+        }
+    }
+
+    state.workerRunning = true;
+    try
+    {
+        state.worker = std::thread([runtime, &state]()
+        {
+            struct WorkerExit
+            {
+                EeAlarmRuntimeState &state;
+
+                ~WorkerExit()
+                {
+                    {
+                        std::lock_guard<std::mutex> lock(
+                            state.mutex);
+                        state.workerRunning = false;
+                    }
+                    state.cv.notify_all();
+                }
+            } workerExit{state};
+
             for (;;)
             {
                 std::shared_ptr<AlarmInfo> readyAlarm;
                 {
-                    std::unique_lock<std::mutex> lock(g_alarm_mutex);
-                    while (!readyAlarm)
+                    std::unique_lock<std::mutex> lock(state.mutex);
+                    while (!state.stopRequested.load(
+                               std::memory_order_acquire) &&
+                           !readyAlarm)
                     {
-                        if (g_alarms.empty())
+                        if (state.alarms.empty())
                         {
-                            g_alarm_cv.wait(lock);
+                            state.cv.wait(lock);
                             continue;
                         }
 
-                        auto nextIt = std::min_element(g_alarms.begin(), g_alarms.end(),
-                                                       [](const auto &a, const auto &b)
-                                                       {
-                                                           return a.second->dueAt < b.second->dueAt;
-                                                       });
-                        if (nextIt == g_alarms.end())
+                        const auto nextIt = std::min_element(
+                            state.alarms.begin(),
+                            state.alarms.end(),
+                            [](const auto &a, const auto &b)
+                            {
+                                return a.second->dueAt <
+                                       b.second->dueAt;
+                            });
+                        if (nextIt == state.alarms.end())
                         {
-                            g_alarm_cv.wait(lock);
+                            state.cv.wait(lock);
                             continue;
                         }
 
-                        const auto now = std::chrono::steady_clock::now();
-                        if (nextIt->second->dueAt > now)
+                        const auto now =
+                            std::chrono::steady_clock::now();
+                        const auto dueAt =
+                            nextIt->second->dueAt;
+                        if (dueAt > now)
                         {
-                            g_alarm_cv.wait_until(lock, nextIt->second->dueAt);
+                            // Keep the deadline by value. Cancellation may
+                            // erase the final shared owner as soon as
+                            // wait_until unlocks.
+                            state.cv.wait_until(lock, dueAt);
                             continue;
                         }
 
                         readyAlarm = nextIt->second;
-                        g_alarms.erase(nextIt);
+                        state.alarms.erase(nextIt);
+                    }
+
+                    if (state.stopRequested.load(
+                            std::memory_order_acquire))
+                    {
+                        return;
                     }
                 }
 
-                if (!readyAlarm || !readyAlarm->runtime || !readyAlarm->rdram || !readyAlarm->handler)
+                if (!readyAlarm ||
+                    runtime->isStopRequested())
                 {
                     continue;
                 }
-                if (!readyAlarm->runtime->hasFunction(readyAlarm->handler))
                 {
-                    continue;
-                }
-
-                try
-                {
-                    constexpr uint32_t kAlarmCallbackStackSize = 0x4000u;
-                    thread_local PS2Runtime *s_alarmStackRuntime = nullptr;
-                    thread_local uint32_t s_alarmStackTop = 0u;
-                    if (s_alarmStackRuntime != readyAlarm->runtime || s_alarmStackTop == 0u)
+                    std::lock_guard<std::mutex> lock(
+                        state.mutex);
+                    if (state.stopRequested.load(
+                            std::memory_order_acquire))
                     {
-                        s_alarmStackRuntime = readyAlarm->runtime;
-                        s_alarmStackTop = readyAlarm->runtime->reserveAsyncCallbackStack(kAlarmCallbackStackSize, 16u);
+                        return;
                     }
+                    state.pendingCallbacks.push_back(
+                        std::move(readyAlarm));
+                    state.pendingCallbackPublished.store(
+                        true, std::memory_order_release);
+                }
+                runtime->requestGuestPreemption();
+            }
+        });
+    }
+    catch (...)
+    {
+        state.workerRunning = false;
+        return false;
+    }
+    return true;
+}
 
-                    R5900Context callbackCtx{};
-                    setRegU32(&callbackCtx, 28, readyAlarm->gp);
-                    setRegU32(&callbackCtx, 29,
-                              (s_alarmStackTop != 0u) ? s_alarmStackTop : (PS2_RAM_SIZE - 0x10u));
-                    setRegU32(&callbackCtx, 31, 0);
-                    setRegU32(&callbackCtx, 4, static_cast<uint32_t>(readyAlarm->id));
-                    setRegU32(&callbackCtx, 5, static_cast<uint32_t>(readyAlarm->ticks));
-                    setRegU32(&callbackCtx, 6, readyAlarm->commonArg);
-                    setRegU32(&callbackCtx, 7, 0);
-                    callbackCtx.pc = readyAlarm->handler;
+static void stopAlarmWorker(PS2Runtime *runtime)
+{
+    if (!runtime)
+    {
+        return;
+    }
 
-                    PS2Runtime::RecompiledFunction func = readyAlarm->runtime->lookupFunction(readyAlarm->handler);
-                    PS2Runtime::GuestExecutionScope guestExecution(
-                        readyAlarm->runtime, &callbackCtx);
-                    readyAlarm->runtime->executeGuestStep(
-                        readyAlarm->rdram, &callbackCtx, func);
-                }
-                catch (const ThreadExitException &)
-                {
-                }
-                catch (const std::exception &e)
-                {
-                    static int alarmExceptionLogs = 0;
-                    if (alarmExceptionLogs < 8)
-                    {
-                        std::cerr << "[SetAlarm] callback exception: " << e.what() << std::endl;
-                        ++alarmExceptionLogs;
-                    }
-                }
-            } })
-                         .detach(); });
+    EeAlarmRuntimeState &state =
+        runtime->eeAlarmRuntimeState();
+    std::thread workerToJoin;
+    {
+        std::lock_guard<std::mutex> lock(state.mutex);
+        state.stopRequested.store(
+            true, std::memory_order_release);
+        state.alarms.clear();
+        state.pendingCallbacks.clear();
+        state.pendingCallbackPublished.store(
+            false, std::memory_order_release);
+        state.nextAlarmId = 1;
+        state.setLogCount = 0u;
+        if (state.worker.joinable() &&
+            state.worker.get_id() !=
+                 std::this_thread::get_id())
+        {
+            workerToJoin = std::move(state.worker);
+        }
+    }
+    state.cv.notify_all();
+
+    if (workerToJoin.joinable())
+    {
+        workerToJoin.join();
+    }
+
+    // Callback continuation state belongs to the EE execution boundary, not
+    // the timer worker. It may still be live when an external stop joins this
+    // publication worker, so leave it intact until the runtime is destroyed
+    // or a later callback initializes it.
 }
 
 static void rpcCopyToRdram(uint8_t *rdram, uint32_t dst, uint32_t src, size_t size)
@@ -368,32 +560,19 @@ static bool rpcInvokeFunction(uint8_t *rdram, R5900Context *ctx, PS2Runtime *run
     if (!runtime || !ctx || !funcAddr || !runtime->hasFunction(funcAddr))
         return false;
 
-    constexpr uint32_t kRpcInvokeStackSize = 0x4000u;
     constexpr uint32_t kRpcInvokeReturnSentinel = 0x00FFF000u;
     constexpr uint32_t kRpcInvokeMaxSteps = 0x8000u;
 
-    R5900Context tmp = *ctx;
+    EeAsyncCallbackContextLease callbackContext(
+        runtime->eeInterruptRuntimeState(), *runtime);
+    R5900Context &tmp = callbackContext.context();
+    tmp = *ctx;
     setRegU32(&tmp, 4, a0);
     setRegU32(&tmp, 5, a1);
     setRegU32(&tmp, 6, a2);
     setRegU32(&tmp, 7, a3);
 
-    thread_local uint32_t s_rpcInvokeStackBase = 0u;
-    thread_local uint32_t s_rpcInvokeStackTop = 0u;
-    if (s_rpcInvokeStackTop == 0u)
-    {
-        const uint32_t stackBase = runtime->guestMalloc(kRpcInvokeStackSize, 16u);
-        if (stackBase != 0u)
-        {
-            s_rpcInvokeStackBase = stackBase;
-            s_rpcInvokeStackTop = (stackBase + kRpcInvokeStackSize) & ~0xFu;
-        }
-    }
-    if (s_rpcInvokeStackTop != 0u)
-    {
-        setRegU32(&tmp, 29, s_rpcInvokeStackTop);
-    }
-    (void)s_rpcInvokeStackBase;
+    setRegU32(&tmp, 29, callbackContext.stackTop());
 
     setRegU32(&tmp, 31, kRpcInvokeReturnSentinel);
     tmp.pc = funcAddr;
@@ -475,59 +654,53 @@ static bool rpcInvokeFunction(uint8_t *rdram, R5900Context *ctx, PS2Runtime *run
     return false;
 }
 
-static uint32_t rpcAllocPacketAddr(uint8_t *rdram)
+static uint32_t rpcAllocPacketAddr(
+    uint8_t *rdram,
+    PS2Runtime *runtime)
 {
-    if (kRpcPacketPoolCount == 0)
+    if (!runtime || kRpcPacketPoolCount == 0)
         return 0;
 
-    uint32_t slot = g_rpc_packet_index++ % kRpcPacketPoolCount;
+    EeRpcRuntimeState &state =
+        runtime->eeRpcRuntimeState();
+    std::lock_guard<std::mutex> lock(state.rpcMutex);
+    uint32_t slot =
+        state.packetIndex++ % kRpcPacketPoolCount;
     uint32_t addr = kRpcPacketPoolBase + (slot * kRpcPacketSize);
     rpcZeroRdram(rdram, addr, kRpcPacketSize);
     return addr;
 }
 
-static uint32_t rpcAllocServerAddr(uint8_t *rdram)
+static uint32_t rpcAllocServerAddr(
+    uint8_t *rdram,
+    PS2Runtime *runtime)
 {
-    if (kRpcServerPoolCount == 0)
+    if (!runtime || kRpcServerPoolCount == 0)
         return 0;
 
-    uint32_t slot = g_rpc_server_index++ % kRpcServerPoolCount;
+    EeRpcRuntimeState &state =
+        runtime->eeRpcRuntimeState();
+    std::lock_guard<std::mutex> lock(state.rpcMutex);
+    uint32_t slot =
+        state.serverIndex++ % kRpcServerPoolCount;
     uint32_t addr = kRpcServerPoolBase + (slot * kRpcServerStride);
     rpcZeroRdram(rdram, addr, kRpcServerStride);
     return addr;
 }
 
-struct IrqHandlerInfo
+inline std::string translatePs2Path(
+    const char *ps2Path,
+    PS2Runtime *runtime)
 {
-    int id = 0;
-    uint32_t cause = 0;
-    uint32_t handler = 0;
-    uint32_t arg = 0;
-    uint32_t gp = 0;
-    uint32_t sp = 0;
-    bool enabled = true;
-    int order = 0;
-};
-
-static std::unordered_map<int, IrqHandlerInfo> g_intcHandlers;
-static std::unordered_map<int, IrqHandlerInfo> g_dmacHandlers;
-static int g_nextIntcHandlerId = 1;
-static int g_nextDmacHandlerId = 1;
-
-static int g_intc_head_order = 0;
-static int g_intc_tail_order = 1000;
-static int g_dmac_head_order = 0;
-static int g_dmac_tail_order = 1000;
-
-inline std::string translatePs2Path(const char *ps2Path)
-{
-    if (!ps2Path || !*ps2Path)
+    if (!runtime || !ps2Path || !*ps2Path)
     {
         return {};
     }
 
     std::string pathStr(ps2Path);
     std::string lower = toLowerAscii(pathStr);
+    const GuestPathResolverSnapshot resolver =
+        guestPathResolverSnapshot(runtime);
 
     auto resolveWithBase = [&](const std::filesystem::path &base, const std::string &suffix) -> std::string
     {
@@ -539,28 +712,59 @@ inline std::string translatePs2Path(const char *ps2Path)
         }
         return resolved.lexically_normal().string();
     };
+    auto resolveDevicePath =
+        [&](const std::filesystem::path &root,
+            const std::filesystem::path &cwd,
+            const std::string &suffix) -> std::string
+    {
+        return resolveWithBase(
+            guestPathSuffixIsAbsolute(suffix)
+                ? root
+                : cwd,
+            suffix);
+    };
 
     if (lower.rfind("host0:", 0) == 0 || lower.rfind("host:", 0) == 0)
     {
         const std::size_t prefixLength = (lower.rfind("host0:", 0) == 0) ? 6 : 5;
-        return resolveWithBase(getConfiguredHostRoot(), pathStr.substr(prefixLength));
+        return resolveDevicePath(
+            resolver.hostBase,
+            resolver.hostCwd,
+            pathStr.substr(prefixLength));
     }
 
     if (lower.rfind("cdrom0:", 0) == 0 || lower.rfind("cdrom:", 0) == 0)
     {
         const std::size_t prefixLength = (lower.rfind("cdrom0:", 0) == 0) ? 7 : 6;
-        return resolveWithBase(getConfiguredCdRoot(), pathStr.substr(prefixLength));
+        return resolveDevicePath(
+            resolver.cdromBase,
+            resolver.cdromCwd,
+            pathStr.substr(prefixLength));
     }
 
     if (lower.rfind(kMc0Prefix, 0) == 0)
     {
         const std::size_t prefixLength = sizeof(kMc0Prefix) - 1;
-        return resolveWithBase(getConfiguredMcRoot(), pathStr.substr(prefixLength));
+        return resolveDevicePath(
+            resolver.mcBase,
+            resolver.mcCwd,
+            pathStr.substr(prefixLength));
     }
 
     if (!pathStr.empty() && (pathStr.front() == '/' || pathStr.front() == '\\'))
     {
-        return resolveWithBase(getConfiguredCdRoot(), pathStr);
+        if (resolver.cwdDevice == "host0")
+        {
+            return resolveWithBase(
+                resolver.hostBase, pathStr);
+        }
+        if (resolver.cwdDevice == "mc0")
+        {
+            return resolveWithBase(
+                resolver.mcBase, pathStr);
+        }
+        return resolveWithBase(
+            resolver.cdromBase, pathStr);
     }
 
     if (pathStr.size() > 1 && pathStr[1] == ':')
@@ -568,7 +772,18 @@ inline std::string translatePs2Path(const char *ps2Path)
         return pathStr;
     }
 
-    return resolveWithBase(getConfiguredCdRoot(), pathStr);
+    if (resolver.cwdDevice == "host0")
+    {
+        return resolveWithBase(
+            resolver.hostCwd, pathStr);
+    }
+    if (resolver.cwdDevice == "mc0")
+    {
+        return resolveWithBase(
+            resolver.mcCwd, pathStr);
+    }
+    return resolveWithBase(
+        resolver.cdromCwd, pathStr);
 }
 
 static bool localtimeSafe(const std::time_t *t, std::tm *out)
@@ -723,21 +938,35 @@ static uint32_t syncOsdConfigRawVersionLanguage(uint32_t raw, uint32_t version, 
     return sanitizeOsdConfigRaw(raw);
 }
 
-static uint32_t makeReadableOsdConfig2RawLocked()
+static uint32_t makeReadableOsdConfig2RawLocked(
+    const EeKernelRuntimeState &state)
 {
-    const uint32_t version = (g_osd_config_raw >> 13) & 0x7u;
-    const uint32_t language = (g_osd_config_raw >> 16) & 0x1Fu;
-    uint32_t raw = g_osd_config2_raw & 0x0000FFFFu;
+    const uint32_t version =
+        (state.osdConfigRaw >> 13) & 0x7u;
+    const uint32_t language =
+        (state.osdConfigRaw >> 16) & 0x1Fu;
+    uint32_t raw =
+        state.osdConfig2Raw & 0x0000FFFFu;
     raw |= (version & 0xFFu) << 16;
     raw |= (language & 0xFFu) << 24;
     return sanitizeOsdConfig2Raw(raw);
 }
 
-static void ensureOsdConfigInitialized()
+static bool ensureOsdConfigInitialized(
+    PS2Runtime *runtime)
 {
-    std::lock_guard<std::mutex> lock(g_osd_mutex);
-    if (g_osd_config_initialized)
-        return;
+    if (!runtime)
+    {
+        return false;
+    }
+
+    EeKernelRuntimeState &state =
+        runtime->eeKernelRuntimeState();
+    std::lock_guard<std::mutex> lock(state.osdMutex);
+    if (state.osdConfigInitialized)
+    {
+        return true;
+    }
 
     int tz = clampTimezoneOffset(getTimezoneOffsetMinutes());
     uint32_t spdifMode = 1;   // disabled
@@ -747,43 +976,66 @@ static void ensureOsdConfigInitialized()
     uint32_t ps1drvConfig = 0;
     uint32_t version = 1;  // OSD2
     uint32_t language = 1; // English
-    g_osd_config_raw = packOsdConfig(spdifMode, screenType, videoOutput, japLanguage, ps1drvConfig, version, language, tz);
-    g_osd_config2_raw = packOsdConfig2(0, 0, 0, 0, version, language);
-    g_osd_config_initialized = true;
+    state.osdConfigRaw = packOsdConfig(
+        spdifMode, screenType, videoOutput,
+        japLanguage, ps1drvConfig, version,
+        language, tz);
+    state.osdConfig2Raw = packOsdConfig2(
+        0, 0, 0, 0, version, language);
+    state.osdConfigInitialized = true;
+    return true;
 }
 
-static uint32_t allocTlsAddr(uint8_t *rdram)
+static uint32_t allocTlsAddr(
+    uint8_t *rdram, PS2Runtime *runtime)
 {
-    if (!rdram || kTlsPoolCount == 0)
+    if (!rdram || !runtime || kTlsPoolCount == 0)
         return 0;
 
-    std::lock_guard<std::mutex> lock(g_tls_mutex);
-    uint32_t slot = g_tls_index++ % kTlsPoolCount;
+    EeKernelRuntimeState &state =
+        runtime->eeKernelRuntimeState();
+    std::lock_guard<std::mutex> lock(state.tlsMutex);
+    uint32_t slot =
+        state.tlsIndex++ % kTlsPoolCount;
     uint32_t addr = kTlsPoolBase + (slot * kTlsBlockSize);
     rpcZeroRdram(rdram, addr, kTlsBlockSize);
     return addr;
 }
 
-static uint32_t allocBootModeAddr(uint8_t *rdram, size_t bytes)
+static uint32_t allocBootModeAddr(
+    uint8_t *rdram,
+    EeKernelRuntimeState &state,
+    size_t bytes)
 {
     if (!rdram)
         return 0;
 
     size_t aligned = (bytes + 15u) & ~15u;
-    if (g_bootmode_pool_offset + aligned > kBootModePoolBytes)
+    if (state.bootModePoolOffset + aligned >
+        kBootModePoolBytes)
         return 0;
 
-    uint32_t addr = kBootModePoolBase + g_bootmode_pool_offset;
-    g_bootmode_pool_offset += static_cast<uint32_t>(aligned);
+    uint32_t addr =
+        kBootModePoolBase + state.bootModePoolOffset;
+    state.bootModePoolOffset +=
+        static_cast<uint32_t>(aligned);
     rpcZeroRdram(rdram, addr, aligned);
     return addr;
 }
 
-static uint32_t createBootModeEntry(uint8_t *rdram, uint8_t id, uint16_t value, uint8_t lenField, const uint32_t *data, uint8_t dataCount)
+static uint32_t createBootModeEntry(
+    uint8_t *rdram,
+    EeKernelRuntimeState &state,
+    uint8_t id,
+    uint16_t value,
+    uint8_t lenField,
+    const uint32_t *data,
+    uint8_t dataCount)
 {
     uint8_t allocCount = (dataCount == 0) ? 1 : dataCount;
     size_t bytes = static_cast<size_t>(1 + allocCount) * sizeof(uint32_t);
-    uint32_t addr = allocBootModeAddr(rdram, bytes);
+    uint32_t addr =
+        allocBootModeAddr(rdram, state, bytes);
     if (!addr)
         return 0;
 
@@ -804,24 +1056,48 @@ static uint32_t createBootModeEntry(uint8_t *rdram, uint8_t id, uint16_t value, 
     return addr;
 }
 
-static void ensureBootModeTable(uint8_t *rdram)
+static bool ensureBootModeTable(
+    uint8_t *rdram, PS2Runtime *runtime)
 {
-    std::lock_guard<std::mutex> lock(g_bootmode_mutex);
-    if (g_bootmode_initialized)
-        return;
+    if (!runtime)
+    {
+        return false;
+    }
 
-    g_bootmode_pool_offset = 0;
-    g_bootmode_addresses.clear();
+    EeKernelRuntimeState &state =
+        runtime->eeKernelRuntimeState();
+    std::lock_guard<std::mutex> lock(
+        state.bootModeMutex);
+    if (state.bootModeInitialized)
+    {
+        return true;
+    }
+
+    state.bootModePoolOffset = 0u;
+    state.bootModeAddresses.clear();
 
     const uint32_t boot3Data[1] = {0};
     const uint32_t boot5Data[1] = {0};
 
-    g_bootmode_addresses[1] = createBootModeEntry(rdram, 1, 0, 0, nullptr, 0);
-    g_bootmode_addresses[3] = createBootModeEntry(rdram, 3, 0, 1, boot3Data, 1);
-    g_bootmode_addresses[4] = createBootModeEntry(rdram, 4, 0, 0, nullptr, 0);
-    g_bootmode_addresses[5] = createBootModeEntry(rdram, 5, 0, 1, boot5Data, 1);
-    g_bootmode_addresses[6] = createBootModeEntry(rdram, 6, 0, 0, nullptr, 0);
-    g_bootmode_addresses[7] = createBootModeEntry(rdram, 7, 0, 0, nullptr, 0);
+    state.bootModeAddresses[1] =
+        createBootModeEntry(
+            rdram, state, 1, 0, 0, nullptr, 0);
+    state.bootModeAddresses[3] =
+        createBootModeEntry(
+            rdram, state, 3, 0, 1, boot3Data, 1);
+    state.bootModeAddresses[4] =
+        createBootModeEntry(
+            rdram, state, 4, 0, 0, nullptr, 0);
+    state.bootModeAddresses[5] =
+        createBootModeEntry(
+            rdram, state, 5, 0, 1, boot5Data, 1);
+    state.bootModeAddresses[6] =
+        createBootModeEntry(
+            rdram, state, 6, 0, 0, nullptr, 0);
+    state.bootModeAddresses[7] =
+        createBootModeEntry(
+            rdram, state, 7, 0, 0, nullptr, 0);
 
-    g_bootmode_initialized = true;
+    state.bootModeInitialized = true;
+    return true;
 }

@@ -644,7 +644,8 @@ struct PS2DebugServer::Impl
             runtime.vu0().getProgressSnapshot();
         const VuProgressSnapshot vu1 =
             runtime.vu1().getProgressSnapshot();
-        const auto threads = ps2_syscalls::debugThreadSnapshots();
+        const auto threads =
+            ps2_syscalls::debugThreadSnapshots(&runtime);
 
         PS2WatchdogSample sample{};
         sample.dispatches = core.dispatches;
@@ -965,6 +966,17 @@ struct PS2DebugServer::Impl
             runtime.debugVuBackendDiagnosticsSnapshot();
         Value result(rapidjson::kObjectType);
         addString(result, "backend", "recomp", allocator);
+        addString(
+            result,
+            "ee_execution_backend",
+            runtime.eeExecutionBackendName(),
+            allocator);
+        result.AddMember(
+            "ee_execution_threads",
+            static_cast<uint64_t>(
+                runtime
+                    .managedEeExecutionThreadCountForTesting()),
+            allocator);
         const char *state = runtime.isStopRequested()
                                 ? "stopped"
                                 : (runtime.debugIsPaused() ? "paused" : "running");
@@ -1592,8 +1604,8 @@ struct PS2DebugServer::Impl
 
     std::string executableDigest() const
     {
-        const std::filesystem::path &path =
-            PS2Runtime::getIoPaths().elfPath;
+        const std::filesystem::path path =
+            runtime.ioPaths().elfPath;
         std::error_code error;
         if (path.empty() || !std::filesystem::is_regular_file(path, error) ||
             error)
@@ -1618,16 +1630,33 @@ struct PS2DebugServer::Impl
     {
         const PS2Runtime::DebugRuntimeProgress core =
             runtime.debugRuntimeProgress();
+        const PS2Runtime::DebugEeTiming eeTiming =
+            runtime.debugEeTimingSnapshot();
+        const PS2Runtime::DebugEeThreadDiagnostics
+            eeThreadDiagnostics =
+                runtime.debugEeThreadDiagnosticsSnapshot();
         const PS2Runtime::DebugFaultInfo fault =
             runtime.debugFaultSnapshot();
         const auto branches = runtime.debugBranchHistory(256u);
-        auto threads = ps2_syscalls::debugThreadSnapshots();
+        auto threads =
+            ps2_syscalls::debugThreadSnapshots(&runtime);
         const PS2AudioStreamDebugSnapshot audio =
             runtime.audioBackend().streamDebugSnapshot();
 
         Value result(rapidjson::kObjectType);
         result.AddMember("schema_version", 1, allocator);
         addString(result, "backend", "recomp", allocator);
+        addString(
+            result,
+            "ee_execution_backend",
+            runtime.eeExecutionBackendName(),
+            allocator);
+        result.AddMember(
+            "ee_execution_threads",
+            static_cast<uint64_t>(
+                runtime
+                    .managedEeExecutionThreadCountForTesting()),
+            allocator);
         addString(result, "reason", reason, allocator);
         result.AddMember("quiescent", quiescent, allocator);
         addString(result, "classification", assessment.name, allocator);
@@ -1640,11 +1669,27 @@ struct PS2DebugServer::Impl
         addString(result, "function_map_sha256", functionMapDigest(), allocator);
         addString(result, "executable_sha256", executableDigest(), allocator);
         addString(result, "executable",
-                  PS2Runtime::getIoPaths().elfPath.string(), allocator);
+                  runtime.ioPaths().elfPath.string(),
+                  allocator);
 
         Value progress(rapidjson::kObjectType);
         progress.AddMember("dispatches", sample.dispatches, allocator);
         progress.AddMember("ee_instructions", sample.eeInstructions, allocator);
+        progress.AddMember("ee_tick", eeTiming.currentTick, allocator);
+        progress.AddMember("ee_cycle", eeTiming.currentCycle, allocator);
+        progress.AddMember("vsync_fields", core.vsyncFields, allocator);
+        progress.AddMember(
+            "mpeg_pictures_served",
+            core.mpegPicturesServed,
+            allocator);
+        progress.AddMember(
+            "mpeg_unique_pictures_served",
+            core.mpegUniquePicturesServed,
+            allocator);
+        progress.AddMember(
+            "mpeg_repeated_pictures_served",
+            core.mpegRepeatedPicturesServed,
+            allocator);
         progress.AddMember("dma_starts", sample.dmaStarts, allocator);
         progress.AddMember("gif_copies", sample.gifCopies, allocator);
         progress.AddMember("gs_writes", sample.gsWrites, allocator);
@@ -1663,6 +1708,158 @@ struct PS2DebugServer::Impl
         progress.AddMember("guest_execution_handoff_timeouts",
                            core.guestExecutionHandoffTimeouts, allocator);
         result.AddMember("progress", progress, allocator);
+
+        Value eeThreadValue(rapidjson::kObjectType);
+        eeThreadValue.AddMember(
+            "enabled", eeThreadDiagnostics.enabled, allocator);
+        eeThreadValue.AddMember(
+            "guest_lock_requests",
+            eeThreadDiagnostics.guestLockRequests,
+            allocator);
+        eeThreadValue.AddMember(
+            "guest_lock_acquisitions",
+            eeThreadDiagnostics.guestLockAcquisitions,
+            allocator);
+        eeThreadValue.AddMember(
+            "guest_lock_contentions",
+            eeThreadDiagnostics.guestLockContentions,
+            allocator);
+        eeThreadValue.AddMember(
+            "outer_guest_execution_acquisitions",
+            eeThreadDiagnostics.outerGuestExecutionAcquisitions,
+            allocator);
+        eeThreadValue.AddMember(
+            "guest_context_changes",
+            eeThreadDiagnostics.guestContextChanges,
+            allocator);
+        eeThreadValue.AddMember(
+            "handoff_notifications",
+            eeThreadDiagnostics.handoffNotifications,
+            allocator);
+        eeThreadValue.AddMember(
+            "handoff_wait_requests",
+            eeThreadDiagnostics.handoffWaitRequests,
+            allocator);
+        eeThreadValue.AddMember(
+            "handoff_wait_fast_paths",
+            eeThreadDiagnostics.handoffWaitFastPaths,
+            allocator);
+        eeThreadValue.AddMember(
+            "handoff_cv_waits",
+            eeThreadDiagnostics.handoffCvWaits,
+            allocator);
+        eeThreadValue.AddMember(
+            "handoff_completions",
+            eeThreadDiagnostics.handoffCompletions,
+            allocator);
+        eeThreadValue.AddMember(
+            "handoff_timeouts",
+            eeThreadDiagnostics.handoffTimeouts,
+            allocator);
+        eeThreadValue.AddMember(
+            "yield_requests",
+            eeThreadDiagnostics.yieldRequests,
+            allocator);
+        eeThreadValue.AddMember(
+            "deferred_yields",
+            eeThreadDiagnostics.deferredYields,
+            allocator);
+        eeThreadValue.AddMember(
+            "host_thread_yields",
+            eeThreadDiagnostics.hostThreadYields,
+            allocator);
+        eeThreadValue.AddMember(
+            "requested_guest_switches",
+            eeThreadDiagnostics.requestedGuestSwitches,
+            allocator);
+        eeThreadValue.AddMember(
+            "guest_switch_cv_waits",
+            eeThreadDiagnostics.guestSwitchCvWaits,
+            allocator);
+        eeThreadValue.AddMember(
+            "completed_guest_switches",
+            eeThreadDiagnostics.completedGuestSwitches,
+            allocator);
+        eeThreadValue.AddMember(
+            "guest_switch_timeouts",
+            eeThreadDiagnostics.guestSwitchTimeouts,
+            allocator);
+        eeThreadValue.AddMember(
+            "rotation_requests",
+            eeThreadDiagnostics.rotationRequests,
+            allocator);
+        eeThreadValue.AddMember(
+            "accepted_rotation_requests",
+            eeThreadDiagnostics.acceptedRotationRequests,
+            allocator);
+        eeThreadValue.AddMember(
+            "rejected_rotation_requests",
+            eeThreadDiagnostics.rejectedRotationRequests,
+            allocator);
+        eeThreadValue.AddMember(
+            "priority_zero_rotation_requests",
+            eeThreadDiagnostics.priorityZeroRotationRequests,
+            allocator);
+        eeThreadValue.AddMember(
+            "untracked_thread_rotation_requests",
+            eeThreadDiagnostics.untrackedThreadRotationRequests,
+            allocator);
+
+        Value rotationsByPriority(rapidjson::kArrayType);
+        for (size_t priority = 0u;
+             priority <
+                 eeThreadDiagnostics.acceptedRotationsByPriority.size();
+             ++priority)
+        {
+            const uint64_t count =
+                eeThreadDiagnostics
+                    .acceptedRotationsByPriority[priority];
+            if (count == 0u)
+            {
+                continue;
+            }
+            Value entry(rapidjson::kObjectType);
+            entry.AddMember(
+                "priority",
+                static_cast<uint32_t>(priority),
+                allocator);
+            entry.AddMember("count", count, allocator);
+            rotationsByPriority.PushBack(entry, allocator);
+        }
+        eeThreadValue.AddMember(
+            "accepted_rotations_by_priority",
+            rotationsByPriority,
+            allocator);
+
+        Value rotationsByThread(rapidjson::kArrayType);
+        for (size_t thread = 0u;
+             thread <
+                 eeThreadDiagnostics.acceptedRotationsByThread.size();
+             ++thread)
+        {
+            const uint64_t count =
+                eeThreadDiagnostics
+                    .acceptedRotationsByThread[thread];
+            if (count == 0u)
+            {
+                continue;
+            }
+            Value entry(rapidjson::kObjectType);
+            entry.AddMember(
+                "thread_id",
+                static_cast<uint32_t>(thread),
+                allocator);
+            entry.AddMember("count", count, allocator);
+            rotationsByThread.PushBack(entry, allocator);
+        }
+        eeThreadValue.AddMember(
+            "accepted_rotations_by_thread",
+            rotationsByThread,
+            allocator);
+        result.AddMember(
+            "ee_thread_diagnostics",
+            eeThreadValue,
+            allocator);
 
         Value faultValue(rapidjson::kObjectType);
         faultValue.AddMember("active", fault.active, allocator);
@@ -1725,6 +1922,17 @@ struct PS2DebugServer::Impl
             entry.AddMember("wakeup_count", thread.wakeupCount, allocator);
             entry.AddMember("priority", thread.currentPriority, allocator);
             entry.AddMember("suspend_count", thread.suspendCount, allocator);
+            entry.AddMember("wait_queue_code", thread.waitQueue, allocator);
+            entry.AddMember("wait_queue_id", thread.waitQueueId, allocator);
+            entry.AddMember(
+                "wait_completion_pending",
+                thread.waitCompletionPending,
+                allocator);
+            entry.AddMember(
+                "state_revision",
+                thread.stateRevision,
+                allocator);
+            entry.AddMember("state_valid", thread.stateValid, allocator);
             entry.AddMember("started", thread.started, allocator);
             entry.AddMember("force_release", thread.forceRelease, allocator);
             entry.AddMember("terminated", thread.terminated, allocator);
@@ -1741,6 +1949,7 @@ struct PS2DebugServer::Impl
             addString(main, "status",
                       runtime.debugIsPaused() ? "paused" : "running",
                       allocator);
+            main.AddMember("state_valid", false, allocator);
             main.AddMember("synthetic", true, allocator);
             threadValues.PushBack(main, allocator);
         }
@@ -1758,6 +1967,14 @@ struct PS2DebugServer::Impl
         audioValue.AddMember("submitted_bytes", audio.submittedBytes, allocator);
         audioValue.AddMember("last_submission_hash",
                              audio.lastSubmissionHash, allocator);
+        audioValue.AddMember(
+            "produced_frames", audio.producedFrames, allocator);
+        audioValue.AddMember(
+            "requested_frames", audio.requestedFrames, allocator);
+        audioValue.AddMember(
+            "consumed_frames", audio.consumedFrames, allocator);
+        audioValue.AddMember(
+            "zero_filled_frames", audio.zeroFilledFrames, allocator);
         audioValue.AddMember(
             "queued_samples", static_cast<uint64_t>(audio.queuedSamples), allocator);
         result.AddMember("audio", audioValue, allocator);
@@ -1924,7 +2141,9 @@ struct PS2DebugServer::Impl
             "cycle_ticks", timing.currentTick, allocator);
         result.AddMember(
             "vsync_tick",
-            ps2_syscalls::GetCurrentVSyncTick(), allocator);
+            ps2_syscalls::GetCurrentVSyncTick(
+                &runtime),
+            allocator);
         result.AddMember(
             "local_block_cycle_ticks",
             timing.localBlockTicks, allocator);
@@ -2548,7 +2767,7 @@ struct PS2DebugServer::Impl
     Value padStatus(Allocator &allocator)
     {
         const ps2_stubs::PadDebugSnapshot snapshot =
-            ps2_stubs::getPadDebugSnapshot();
+            ps2_stubs::getPadDebugSnapshot(&runtime);
         Value result(rapidjson::kObjectType);
         result.AddMember("override_enabled", snapshot.overrideEnabled, allocator);
         result.AddMember("active_low", true, allocator);
@@ -2631,7 +2850,7 @@ struct PS2DebugServer::Impl
     {
         if (method == "input.pad.clear")
         {
-            ps2_stubs::clearPadOverrideState();
+            ps2_stubs::clearPadOverrideState(&runtime);
             return padStatus(allocator);
         }
 
@@ -2650,6 +2869,7 @@ struct PS2DebugServer::Impl
         }
 
         ps2_stubs::setPadOverrideState(
+            &runtime,
             static_cast<uint16_t>(buttons),
             static_cast<uint8_t>(lx),
             static_cast<uint8_t>(ly),

@@ -2,39 +2,11 @@
 
 #include <cstddef>
 #include <cstdint>
-#include <thread>
-
-inline std::unordered_map<int, FILE *> g_fileDescriptors;
-inline int g_nextFd = 3; // Start after stdin, stdout, stderr
-
-struct ThreadInfo
-{
-    uint32_t entry = 0;
-    uint32_t stack = 0;
-    uint32_t stackSize = 0;
-    uint32_t gp = 0;
-    uint32_t priority = 0;
-    uint32_t attr = 0;
-    uint32_t option = 0;
-    uint32_t arg = 0;
-    bool started = false;
-    bool ownsStack = false;
-    uint32_t tlsBase = 0;
-
-    // Thread Status
-    int status = 0x10; // THS_DORMANT
-    int waitType = 0;  // TSW_NONE
-    int waitId = 0;
-    int wakeupCount = 0;
-    int currentPriority = 0;
-    int suspendCount = 0;
-    std::atomic<uint32_t> currentPc{0};
-
-    std::mutex m;
-    std::condition_variable cv;
-    std::atomic<bool> forceRelease{false};
-    std::atomic<bool> terminated{false};
-};
+#include "AlarmRuntimeState.h"
+#include "KernelRuntimeState.h"
+#include "RpcRuntimeState.h"
+#include "SyncRuntimeState.h"
+#include "ThreadRuntimeState.h"
 
 // Thread status
 #define THS_RUN 0x01
@@ -49,6 +21,17 @@ struct ThreadInfo
 #define TSW_SLEEP 1
 #define TSW_SEMA 2
 #define TSW_EVENT 3
+
+static_assert(THS_RUN == EeThreadGuestState::kRun);
+static_assert(THS_READY == EeThreadGuestState::kReady);
+static_assert(THS_WAIT == EeThreadGuestState::kWait);
+static_assert(THS_SUSPEND == EeThreadGuestState::kSuspend);
+static_assert(THS_WAITSUSPEND == EeThreadGuestState::kWaitSuspend);
+static_assert(THS_DORMANT == EeThreadGuestState::kDormant);
+static_assert(TSW_NONE == EeThreadGuestState::kWaitNone);
+static_assert(TSW_SLEEP == EeThreadGuestState::kWaitSleep);
+static_assert(TSW_SEMA == EeThreadGuestState::kWaitSemaphore);
+static_assert(TSW_EVENT == EeThreadGuestState::kWaitEvent);
 
 // Common kernel-like error codes used by thread/event/alarm syscalls.
 constexpr int KE_OK = 0;
@@ -148,44 +131,6 @@ struct ee_sema_t
     uint32_t option;
 };
 
-struct SemaInfo
-{
-    int count = 0;
-    int maxCount = 0;
-    int initCount = 0;
-    uint32_t attr = 0;
-    uint32_t option = 0;
-    int waiters = 0;
-    bool deleted = false;
-    std::mutex m;
-    std::condition_variable cv;
-};
-
-struct EventFlagInfo
-{
-    uint32_t attr = 0;
-    uint32_t option = 0;
-    uint32_t initBits = 0;
-    uint32_t bits = 0;
-    int waiters = 0;
-    bool deleted = false;
-    std::mutex m;
-    std::condition_variable cv;
-};
-
-struct AlarmInfo
-{
-    int id = 0;
-    uint16_t ticks = 0;
-    uint32_t handler = 0;
-    uint32_t commonArg = 0;
-    uint32_t gp = 0;
-    uint32_t sp = 0;
-    uint8_t *rdram = nullptr;
-    PS2Runtime *runtime = nullptr;
-    std::chrono::steady_clock::time_point dueAt;
-};
-
 struct io_stat_t
 {
     uint32_t mode;
@@ -204,237 +149,42 @@ static constexpr uint32_t kFioSoIROth = 0x0004;
 static constexpr uint32_t kFioSoIWOth = 0x0002;
 static constexpr uint32_t kFioSoIXOth = 0x0001;
 
-inline std::unordered_map<int, std::shared_ptr<ThreadInfo>> g_threads;
-inline int g_nextThreadId = 2; // Reserve 1 for the main thread
-inline thread_local int g_currentThreadId = 1;
-inline std::mutex g_thread_map_mutex;
-inline std::unordered_map<int, std::thread> g_hostThreads;
-inline std::mutex g_host_thread_mutex;
-
-inline std::unordered_map<int, std::shared_ptr<SemaInfo>> g_semas;
-inline int g_nextSemaId = 1;
-inline std::mutex g_sema_map_mutex;
-inline std::unordered_map<int, std::shared_ptr<EventFlagInfo>> g_eventFlags;
-inline int g_nextEventFlagId = 1;
-inline std::mutex g_event_flag_map_mutex;
-inline std::unordered_map<int, std::shared_ptr<AlarmInfo>> g_alarms;
-inline int g_nextAlarmId = 1;
-inline std::mutex g_alarm_mutex;
-inline std::condition_variable g_alarm_cv;
-inline std::once_flag g_alarm_worker_once;
-inline std::atomic<int> g_activeThreads{0};
-inline std::mutex g_fd_mutex;
-
-static void registerHostThread(int tid, std::thread worker)
+static void joinHostThreadById(
+    PS2Runtime *runtime,
+    int tid)
 {
-    std::thread stale;
-    {
-        std::lock_guard<std::mutex> lock(g_host_thread_mutex);
-        auto it = g_hostThreads.find(tid);
-        if (it != g_hostThreads.end())
-        {
-            stale = std::move(it->second);
-            g_hostThreads.erase(it);
-        }
-        g_hostThreads.emplace(tid, std::move(worker));
-    }
-
-    if (stale.joinable())
-    {
-        if (stale.get_id() == std::this_thread::get_id())
-        {
-            stale.detach();
-        }
-        else
-        {
-            stale.join();
-        }
-    }
-}
-
-static void joinHostThreadById(int tid)
-{
-    std::thread worker;
-    {
-        std::lock_guard<std::mutex> lock(g_host_thread_mutex);
-        auto it = g_hostThreads.find(tid);
-        if (it != g_hostThreads.end())
-        {
-            worker = std::move(it->second);
-            g_hostThreads.erase(it);
-        }
-    }
-
-    if (!worker.joinable())
+    if (!runtime)
     {
         return;
     }
 
-    if (worker.get_id() == std::this_thread::get_id())
-    {
-        worker.detach();
-    }
-    else
-    {
-        worker.join();
-    }
+    runtime->eeExecutionBackend().destroy(tid);
 }
 
-static void joinAllHostThreads()
+static void joinAllHostThreads(PS2Runtime *runtime)
 {
-    std::vector<std::thread> workers;
+    if (!runtime)
     {
-        std::lock_guard<std::mutex> lock(g_host_thread_mutex);
-        workers.reserve(g_hostThreads.size());
-        const std::thread::id selfId = std::this_thread::get_id();
-        for (auto it = g_hostThreads.begin(); it != g_hostThreads.end();)
-        {
-            std::thread &worker = it->second;
-            if (worker.joinable() && worker.get_id() == selfId)
-            {
-                ++it;
-                continue;
-            }
-
-            workers.push_back(std::move(worker));
-            it = g_hostThreads.erase(it);
-        }
+        return;
     }
 
-    for (auto &worker : workers)
-    {
-        if (!worker.joinable())
-        {
-            continue;
-        }
-        worker.join();
-    }
+    runtime->eeExecutionBackend().joinAll();
 }
 
-static void detachAllHostThreads()
+static void detachAllHostThreads(PS2Runtime *runtime)
 {
-    std::vector<std::thread> workers;
+    if (!runtime)
     {
-        std::lock_guard<std::mutex> lock(g_host_thread_mutex);
-        workers.reserve(g_hostThreads.size());
-        for (auto &entry : g_hostThreads)
-        {
-            workers.push_back(std::move(entry.second));
-        }
-        g_hostThreads.clear();
+        return;
     }
 
-    for (auto &worker : workers)
-    {
-        if (!worker.joinable())
-        {
-            continue;
-        }
-        worker.detach();
-    }
+    runtime->eeExecutionBackend().detachAll();
 }
-
-struct RpcServerState
-{
-    uint32_t sid = 0;
-    uint32_t sd_ptr = 0; // PS2 address
-};
-
-struct RpcClientState
-{
-    bool busy = false;
-    uint32_t last_rpc = 0;
-    uint32_t sid = 0;
-};
-
-struct SifRpcDebugEvent
-{
-    uint64_t seq = 0;
-    const char *op = "";
-    uint32_t pc = 0;
-    uint32_t ra = 0;
-    uint32_t threadId = 0;
-    uint32_t sid = 0;
-    uint32_t rpcNum = 0;
-    uint32_t clientPtr = 0;
-    uint32_t serverPtr = 0;
-    uint32_t sendBuf = 0;
-    uint32_t sendSize = 0;
-    uint32_t recvBuf = 0;
-    uint32_t recvSize = 0;
-    uint32_t resultPtr = 0;
-    uint32_t mode = 0;
-    uint32_t endFunc = 0;
-    uint32_t endParam = 0;
-    uint32_t semaId = 0;
-    uint32_t flags = 0;
-    uint32_t sendPreviewSize = 0;
-    uint32_t recvPreviewSize = 0;
-    uint8_t sendPreview[64]{};
-    uint8_t recvPreview[64]{};
-    int32_t result = 0;
-};
-
-static constexpr size_t kSifRpcDebugHistoryCount = 256u;
-static constexpr size_t kSifRpcDebugPreviewBytes = 64u;
-static constexpr uint32_t kSifRpcDebugFlagNowait = 1u << 0;
-static constexpr uint32_t kSifRpcDebugFlagHandledByHle = 1u << 1;
-static constexpr uint32_t kSifRpcDebugFlagCallback = 1u << 2;
-static constexpr uint32_t kSifRpcDebugFlagMissingClient = 1u << 3;
-static constexpr uint32_t kSifRpcDebugFlagServerDispatch = 1u << 4;
-static constexpr uint32_t kSifRpcDebugFlagUnhandled = 1u << 6;
-static constexpr uint32_t kSifRpcDebugFlagFallbackCopy = 1u << 7;
-static constexpr uint32_t kSifRpcDebugFlagFallbackZero = 1u << 8;
-
-inline std::unordered_map<uint32_t, RpcServerState> g_rpc_servers;
-inline std::unordered_map<uint32_t, RpcClientState> g_rpc_clients;
-inline SifRpcDebugEvent g_sif_rpc_debug_history[kSifRpcDebugHistoryCount]{};
-inline uint64_t g_sif_rpc_debug_next_seq = 0;
-inline std::mutex g_rpc_mutex;
-inline std::recursive_mutex g_sif_call_rpc_mutex;
-inline bool g_rpc_initialized = false;
-inline uint32_t g_rpc_next_id = 1;
-inline uint32_t g_rpc_packet_index = 0;
-inline uint32_t g_rpc_server_index = 0;
-inline uint32_t g_rpc_active_queue = 0;
-struct ExitHandlerEntry
-{
-    uint32_t func = 0;
-    uint32_t arg = 0;
-};
-
-inline std::mutex g_exit_handler_mutex;
-inline std::unordered_map<int, std::vector<ExitHandlerEntry>> g_exit_handlers;
-
-inline std::mutex g_bootmode_mutex;
-inline bool g_bootmode_initialized = false;
-inline uint32_t g_bootmode_pool_offset = 0;
-inline std::unordered_map<uint8_t, uint32_t> g_bootmode_addresses;
-
-inline std::mutex g_syscall_override_mutex;
-inline std::unordered_map<uint32_t, uint32_t> g_syscall_overrides;
-inline std::unordered_set<uint32_t> g_syscall_mirror_addrs;
 
 static constexpr uint32_t kGuestSyscallTableGuestBase = 0x80011F80u;
 static constexpr uint32_t kGuestSyscallTablePhysBase = kGuestSyscallTableGuestBase & 0x1FFFFFFFu;
 static constexpr uint32_t kGuestSyscallMirrorLimit = 0x00080000u;
 static constexpr uint32_t kGuestSyscallTableProbeBase = 0x000002F0u;
-
-inline std::mutex g_tls_mutex;
-inline uint32_t g_tls_index = 0;
-
-inline std::mutex g_osd_mutex;
-inline bool g_osd_config_initialized = false;
-inline uint32_t g_osd_config_raw = 0;
-inline uint32_t g_osd_config2_raw = 0;
-
-inline std::mutex g_ps2_path_mutex;
-inline bool g_ps2_paths_initialized = false;
-inline std::filesystem::path g_host_base;
-inline std::filesystem::path g_cdrom_base;
-inline std::filesystem::path g_host_cwd;
-inline std::filesystem::path g_cdrom_cwd;
-inline std::string g_ps2_cwd_device = "host0";
 
 static constexpr uint32_t kRpcPacketSize = 64;
 static constexpr uint32_t kRpcPacketPoolBase = 0x01F00000;
@@ -531,18 +281,3 @@ static_assert(sizeof(Elf32Header) == 52u, "Unexpected ELF32 header layout.");
 static_assert(sizeof(Elf32ProgramHeader) == 32u, "Unexpected ELF32 program header layout.");
 static_assert(sizeof(Elf32SectionHeader) == 40u, "Unexpected ELF32 section header layout.");
 static_assert(sizeof(GuestExecData) == 16u, "Unexpected GuestExecData layout.");
-
-struct SifModuleRecord
-{
-    int32_t id = 0;
-    std::string path;
-    std::string pathKey;
-    uint32_t refCount = 0;
-    bool loaded = false;
-};
-
-inline std::mutex g_sif_module_mutex;
-inline std::unordered_map<int32_t, SifModuleRecord> g_sif_modules_by_id;
-inline std::unordered_map<std::string, int32_t> g_sif_module_id_by_path;
-inline int32_t g_next_sif_module_id = 1;
-inline uint32_t g_sif_module_log_count = 0;

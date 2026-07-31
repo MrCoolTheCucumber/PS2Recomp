@@ -5,12 +5,35 @@
 #include "game_overrides.h"
 #include "ps2_runtime_macros.h"
 #include "runtime/ps2_gs_gpu.h"
+#include "runtime/ee_guest_exceptions.h"
 #include "runtime/ps2_vu_program_cache.h"
 #include "runtime/ps2_vu_recompiler.h"
 #include "ThreadNaming.h"
 #include "Kernel/Stubs/Audio.h"
+#include "Kernel/Stubs/CD.h"
+#include "Kernel/Stubs/DMA.h"
 #include "Kernel/Stubs/GS.h"
+#include "Kernel/Stubs/LibC.h"
+#include "Kernel/Stubs/MemoryCard.h"
 #include "Kernel/Stubs/MPEG.h"
+#include "Kernel/Stubs/Pad.h"
+#include "Kernel/Stubs/Helpers/AudioRuntimeState.h"
+#include "Kernel/Stubs/Helpers/CdRuntimeState.h"
+#include "Kernel/Stubs/Helpers/DmaRuntimeState.h"
+#include "Kernel/Stubs/Helpers/LibCRuntimeState.h"
+#include "Kernel/Stubs/Helpers/MemoryCardRuntimeState.h"
+#include "Kernel/Stubs/Helpers/PadRuntimeState.h"
+#include "Kernel/Stubs/Helpers/SifRuntimeState.h"
+#include "Kernel/Syscalls/Helpers/AlarmRuntimeState.h"
+#include "Kernel/Syscalls/Helpers/Deci2RuntimeState.h"
+#include "Kernel/Syscalls/Helpers/FileRuntimeState.h"
+#include "Kernel/Syscalls/Helpers/InterruptRuntimeState.h"
+#include "Kernel/Syscalls/Helpers/KernelRuntimeState.h"
+#include "Kernel/Syscalls/Helpers/RpcRuntimeState.h"
+#include "Kernel/Syscalls/Helpers/SyncRuntimeState.h"
+#include "Kernel/Syscalls/Helpers/ThreadRuntimeState.h"
+#include "Kernel/Syscalls/FileIO.h"
+#include "Kernel/Syscalls/System.h"
 #include "ps2_host_backend.h"
 #include "ps2_iop_host.h"
 #include "ps2x/iop/iop_subsystem.h"
@@ -37,11 +60,6 @@
 #include <unordered_map>
 #include <sstream>
 
-namespace ps2_stubs
-{
-    void resetSifState();
-}
-
 #define ELF_MAGIC 0x464C457F // "\x7FELF" in little endian
 #define ET_EXEC 2            // Executable file
 #define EM_MIPS 8            // MIPS architecture
@@ -53,6 +71,67 @@ static constexpr int DEFAULT_DISPLAY_HEIGHT = 448;
 static constexpr uint32_t DEFAULT_FB_SIZE = FB_WIDTH * FB_HEIGHT * 4;
 static constexpr uint32_t DEFAULT_FB_ADDR = (PS2_RAM_SIZE - DEFAULT_FB_SIZE - 0x10000u);
 static constexpr const char *GS_HISTORY_DUMP_ENV = "PS2X_GS_HISTORY_DUMP";
+static std::atomic<uint64_t> g_nextEeThreadRuntimeGeneration{1u};
+
+struct HostPresentationUploadState
+{
+    uint64_t lastPresentationTick =
+        std::numeric_limits<uint64_t>::max();
+    bool hasLatchedInitialFrame = false;
+    uint32_t lastDisplayFbp =
+        std::numeric_limits<uint32_t>::max();
+    uint32_t lastSourceFbp =
+        std::numeric_limits<uint32_t>::max();
+    bool lastPreferred = false;
+    uint32_t lastWidth = 0u;
+    uint32_t lastHeight = 0u;
+    bool hasUploadedFrame = false;
+    std::vector<uint8_t> scratch;
+    std::vector<uint8_t> uploadBuffer =
+        std::vector<uint8_t>(DEFAULT_FB_SIZE, 0u);
+    uint32_t uploadDebugCount = 0u;
+
+    void reset()
+    {
+        lastPresentationTick =
+            std::numeric_limits<uint64_t>::max();
+        hasLatchedInitialFrame = false;
+        lastDisplayFbp =
+            std::numeric_limits<uint32_t>::max();
+        lastSourceFbp =
+            std::numeric_limits<uint32_t>::max();
+        lastPreferred = false;
+        lastWidth = 0u;
+        lastHeight = 0u;
+        hasUploadedFrame = false;
+        scratch.clear();
+        if (uploadBuffer.size() != DEFAULT_FB_SIZE)
+        {
+            uploadBuffer.assign(
+                DEFAULT_FB_SIZE, 0u);
+        }
+        else
+        {
+            std::fill(
+                uploadBuffer.begin(),
+                uploadBuffer.end(),
+                0u);
+        }
+        uploadDebugCount = 0u;
+    }
+};
+
+static uint64_t allocateEeThreadRuntimeGeneration() noexcept
+{
+    uint64_t generation = 0u;
+    do
+    {
+        generation = g_nextEeThreadRuntimeGeneration.fetch_add(
+            1u, std::memory_order_relaxed);
+    } while (generation == 0u);
+    return generation;
+}
+
 #if defined(PLATFORM_VITA)
 static constexpr int HOST_WINDOW_WIDTH = 960;
 static constexpr int HOST_WINDOW_HEIGHT = 544;
@@ -164,6 +243,43 @@ namespace
     thread_local std::unordered_map<PS2Runtime *, uint32_t> g_guestExecutionDepths;
     thread_local uint32_t g_deferredGuestYieldDepth = 0u;
     thread_local bool g_deferredGuestYieldPending = false;
+
+    struct EeExecutorConsequenceContext
+    {
+        PS2Runtime *runtime = nullptr;
+        ps2x::ee::EeThreadScheduler *scheduler =
+            nullptr;
+        IEeExecutionBackend *backend = nullptr;
+        ps2x::ee::EeSchedulerReschedulePolicy
+            reschedulePolicy =
+                ps2x::ee::
+                    EeSchedulerReschedulePolicy::None;
+    };
+
+    thread_local EeExecutorConsequenceContext
+        g_eeExecutorConsequenceContext;
+
+    [[nodiscard]] constexpr
+    ps2x::ee::EeSchedulerReschedulePolicy
+    combineEeReschedulePolicies(
+        ps2x::ee::EeSchedulerReschedulePolicy left,
+        ps2x::ee::EeSchedulerReschedulePolicy right)
+        noexcept
+    {
+        using Policy =
+            ps2x::ee::EeSchedulerReschedulePolicy;
+        if (left == Policy::EqualOrHigherPriority ||
+            right == Policy::EqualOrHigherPriority)
+        {
+            return Policy::EqualOrHigherPriority;
+        }
+        if (left == Policy::HigherPriorityOnly ||
+            right == Policy::HigherPriorityOnly)
+        {
+            return Policy::HigherPriorityOnly;
+        }
+        return Policy::None;
+    }
 
     struct Vif0MmioTrace
     {
@@ -647,21 +763,20 @@ namespace
         return absolute.lexically_normal();
     }
 
-    PS2Runtime::IoPaths &runtimeIoPaths()
+    PS2Runtime::IoPaths defaultRuntimeIoPaths()
     {
-        static PS2Runtime::IoPaths paths = []()
-        {
-            PS2Runtime::IoPaths defaults;
-            std::error_code ec;
-            const std::filesystem::path cwd = std::filesystem::current_path(ec);
-            defaults.elfDirectory = ec ? std::filesystem::path(".") : cwd.lexically_normal();
-            defaults.hostRoot = defaults.elfDirectory;
-            defaults.cdRoot = defaults.elfDirectory;
-            defaults.mcRoot = defaults.elfDirectory / "mc0";
-            return defaults;
-        }();
-
-        return paths;
+        PS2Runtime::IoPaths defaults;
+        std::error_code ec;
+        const std::filesystem::path cwd =
+            std::filesystem::current_path(ec);
+        defaults.elfDirectory =
+            ec ? std::filesystem::path(".")
+               : cwd.lexically_normal();
+        defaults.hostRoot = defaults.elfDirectory;
+        defaults.cdRoot = defaults.elfDirectory;
+        defaults.mcRoot =
+            defaults.elfDirectory / "mc0";
+        return defaults;
     }
 
     std::string readGuestPrintableString(const uint8_t *rdram, uint32_t addr, size_t maxLen)
@@ -701,7 +816,8 @@ PS2Runtime::GuestExecutionScope::GuestExecutionScope(
     if (m_runtime)
     {
         m_previousContext =
-            m_runtime->enterGuestExecution(m_context);
+            m_runtime->enterGuestExecution(
+                m_context, &m_previousThreadId);
     }
 }
 
@@ -710,7 +826,9 @@ PS2Runtime::GuestExecutionScope::~GuestExecutionScope()
     if (m_runtime)
     {
         m_runtime->leaveGuestExecution(
-            m_context, m_previousContext);
+            m_context,
+            m_previousContext,
+            m_previousThreadId);
     }
 }
 
@@ -720,7 +838,8 @@ PS2Runtime::GuestExecutionReleaseScope::GuestExecutionReleaseScope(PS2Runtime *r
     if (m_runtime)
     {
         m_depth =
-            m_runtime->releaseGuestExecution(m_context);
+            m_runtime->releaseGuestExecution(
+                m_context, m_threadId);
     }
 }
 
@@ -729,45 +848,77 @@ PS2Runtime::GuestExecutionReleaseScope::~GuestExecutionReleaseScope()
     if (m_runtime && m_depth != 0u)
     {
         m_runtime->reacquireGuestExecution(
-            m_depth, m_context);
+            m_depth, m_context, m_threadId);
     }
 }
 
-static void UploadFrame(Texture2D &tex, PS2Runtime *rt, uint32_t &outWidth, uint32_t &outHeight)
+PS2Runtime::GuestExecutionTryScope::GuestExecutionTryScope(
+    PS2Runtime *runtime,
+    R5900Context *context,
+    std::chrono::milliseconds timeout) noexcept
+    : m_runtime(runtime),
+      m_context(context)
 {
-    static uint64_t s_lastPresentationTick = std::numeric_limits<uint64_t>::max();
-    static bool s_hasLatchedInitialFrame = false;
-    static uint32_t s_lastDisplayFbp = std::numeric_limits<uint32_t>::max();
-    static uint32_t s_lastSourceFbp = std::numeric_limits<uint32_t>::max();
-    static bool s_lastPreferred = false;
-    static uint32_t s_lastWidth = 0u;
-    static uint32_t s_lastHeight = 0u;
-    static bool s_hasUploadedFrame = false;
-    static std::vector<uint8_t> s_scratch;
-    static std::vector<uint8_t> s_uploadBuffer(DEFAULT_FB_SIZE, 0u);
+    if (m_runtime)
+    {
+        m_acquired =
+            m_runtime->tryEnterGuestExecution(
+                m_context,
+                timeout,
+                m_previousContext,
+                m_previousThreadId);
+    }
+}
 
-    const uint64_t currentTick = ps2_syscalls::GetCurrentVSyncTick();
-    const bool needsLatch = !s_hasLatchedInitialFrame || currentTick != s_lastPresentationTick;
+PS2Runtime::GuestExecutionTryScope::~GuestExecutionTryScope()
+{
+    if (m_runtime && m_acquired)
+    {
+        m_runtime->leaveGuestExecution(
+            m_context,
+            m_previousContext,
+            m_previousThreadId);
+    }
+}
+
+static void UploadFrame(
+    Texture2D &tex,
+    PS2Runtime *rt,
+    HostPresentationUploadState &state,
+    uint32_t &outWidth,
+    uint32_t &outHeight)
+{
+    const uint64_t currentTick =
+        ps2_syscalls::GetCurrentVSyncTick(rt);
+    const bool needsLatch =
+        !state.hasLatchedInitialFrame ||
+        currentTick != state.lastPresentationTick;
     if (needsLatch)
     {
         rt->gs().latchHostPresentationFrame();
-        s_lastPresentationTick = currentTick;
-        s_hasLatchedInitialFrame = true;
+        state.lastPresentationTick = currentTick;
+        state.hasLatchedInitialFrame = true;
     }
-    else if (s_hasUploadedFrame)
+    else if (state.hasUploadedFrame)
     {
-        outWidth = (s_lastWidth != 0u) ? s_lastWidth : FB_WIDTH;
-        outHeight = (s_lastHeight != 0u) ? s_lastHeight : DEFAULT_DISPLAY_HEIGHT;
+        outWidth =
+            (state.lastWidth != 0u)
+                ? state.lastWidth
+                : FB_WIDTH;
+        outHeight =
+            (state.lastHeight != 0u)
+                ? state.lastHeight
+                : DEFAULT_DISPLAY_HEIGHT;
         return;
     }
 
-    s_scratch.clear();
+    state.scratch.clear();
     uint32_t width = 0u;
     uint32_t height = 0u;
     uint32_t displayFbp = 0u;
     uint32_t sourceFbp = 0u;
     bool usedPreferredDisplaySource = false;
-    if (!rt->gs().copyLatchedHostPresentationFrame(s_scratch,
+    if (!rt->gs().copyLatchedHostPresentationFrame(state.scratch,
                                                    width,
                                                    height,
                                                    &displayFbp,
@@ -779,22 +930,22 @@ static void UploadFrame(Texture2D &tex, PS2Runtime *rt, uint32_t &outWidth, uint
         UnloadImage(blank);
         outWidth = FB_WIDTH;
         outHeight = DEFAULT_DISPLAY_HEIGHT;
-        s_lastWidth = outWidth;
-        s_lastHeight = outHeight;
-        s_hasUploadedFrame = true;
+        state.lastWidth = outWidth;
+        state.lastHeight = outHeight;
+        state.hasUploadedFrame = true;
         return;
     }
 
     PS2_IF_AGRESSIVE_LOGS({
-        static uint32_t s_uploadDebugCount = 0u;
-        if (s_uploadDebugCount < 128u ||
-            displayFbp != s_lastDisplayFbp ||
-            sourceFbp != s_lastSourceFbp ||
-            usedPreferredDisplaySource != s_lastPreferred ||
-            width != s_lastWidth ||
-            height != s_lastHeight)
+        if (state.uploadDebugCount < 128u ||
+            displayFbp != state.lastDisplayFbp ||
+            sourceFbp != state.lastSourceFbp ||
+            usedPreferredDisplaySource != state.lastPreferred ||
+            width != state.lastWidth ||
+            height != state.lastHeight)
         {
-            std::cout << "[frame:upload] idx=" << s_uploadDebugCount
+            std::cout << "[frame:upload] idx="
+                      << state.uploadDebugCount
                       << " tick=" << currentTick
                       << " displayFbp=" << displayFbp
                       << " sourceFbp=" << sourceFbp
@@ -802,16 +953,21 @@ static void UploadFrame(Texture2D &tex, PS2Runtime *rt, uint32_t &outWidth, uint
                       << " preferred=" << static_cast<uint32_t>(usedPreferredDisplaySource ? 1u : 0u)
                       << std::endl;
         }
-        ++s_uploadDebugCount;
+        ++state.uploadDebugCount;
     });
-    s_lastDisplayFbp = displayFbp;
-    s_lastSourceFbp = sourceFbp;
-    s_lastPreferred = usedPreferredDisplaySource;
-    s_lastWidth = width;
-    s_lastHeight = height;
+    state.lastDisplayFbp = displayFbp;
+    state.lastSourceFbp = sourceFbp;
+    state.lastPreferred = usedPreferredDisplaySource;
+    state.lastWidth = width;
+    state.lastHeight = height;
 
-    std::fill(s_uploadBuffer.begin(), s_uploadBuffer.end(), 0u);
-    if (!s_scratch.empty() && width != 0u && height != 0u)
+    std::fill(
+        state.uploadBuffer.begin(),
+        state.uploadBuffer.end(),
+        0u);
+    if (!state.scratch.empty() &&
+        width != 0u &&
+        height != 0u)
     {
         const uint32_t copyWidth = std::min<uint32_t>(width, FB_WIDTH);
         const uint32_t copyHeight = std::min<uint32_t>(height, FB_HEIGHT);
@@ -822,19 +978,24 @@ static void UploadFrame(Texture2D &tex, PS2Runtime *rt, uint32_t &outWidth, uint
         {
             const size_t srcOffset = static_cast<size_t>(y) * srcRowBytes;
             const size_t dstOffset = static_cast<size_t>(y) * dstRowBytes;
-            if (srcOffset + copyRowBytes > s_scratch.size() ||
-                dstOffset + copyRowBytes > s_uploadBuffer.size())
+            if (srcOffset + copyRowBytes >
+                    state.scratch.size() ||
+                dstOffset + copyRowBytes >
+                    state.uploadBuffer.size())
             {
                 break;
             }
-            std::memcpy(s_uploadBuffer.data() + dstOffset, s_scratch.data() + srcOffset, copyRowBytes);
+            std::memcpy(
+                state.uploadBuffer.data() + dstOffset,
+                state.scratch.data() + srcOffset,
+                copyRowBytes);
         }
     }
 
-    UpdateTexture(tex, s_uploadBuffer.data());
+    UpdateTexture(tex, state.uploadBuffer.data());
     outWidth = width;
     outHeight = height;
-    s_hasUploadedFrame = true;
+    state.hasUploadedFrame = true;
 }
 
 PS2Runtime::PS2Runtime()
@@ -846,6 +1007,85 @@ PS2Runtime::PS2Runtime(PS2RuntimeConfiguration configuration)
     : m_vu0(VuUnitId::Vu0),
       m_vu1(VuUnitId::Vu1)
 {
+    m_hostPresentationUploadState =
+        std::make_unique<
+            HostPresentationUploadState>();
+    EeExecutionBackendKind eeExecutionBackend =
+        configuration.eeExecutionBackend;
+    if (configuration
+            .useEeExecutionBackendEnvironment)
+    {
+        if (const char *const value =
+                std::getenv(
+                    "PS2X_EE_EXECUTION_BACKEND"))
+        {
+            if (!parseEeExecutionBackendKind(
+                    value, eeExecutionBackend))
+            {
+                throw std::invalid_argument(
+                    "PS2X_EE_EXECUTION_BACKEND must be "
+                    "legacy-host-thread or "
+                    "legacy-cpp-fiber");
+            }
+        }
+    }
+    m_eeExecutionBackend =
+        createEeExecutionBackend(
+            eeExecutionBackend);
+    if (m_eeExecutionBackend->executorResumable())
+    {
+        m_eeRuntimeExecutor =
+            std::make_unique<
+                ps2x::ee::EeRuntimeExecutor>(
+                *m_eeExecutionBackend,
+                static_cast<
+                    ps2x::ee::
+                        IEeSchedulerExecutorHooks *>(
+                    this));
+    }
+    m_ioPaths = defaultRuntimeIoPaths();
+    m_mpegRuntimeState =
+        std::make_unique<ps2_stubs::MpegRuntimeState>();
+    m_eeAlarmRuntimeState =
+        std::make_unique<EeAlarmRuntimeState>();
+    m_eeSyncRuntimeState =
+        std::make_unique<EeSyncRuntimeState>();
+    m_eeInterruptRuntimeState =
+        std::make_unique<EeInterruptRuntimeState>();
+    m_eeKernelRuntimeState =
+        std::make_unique<EeKernelRuntimeState>();
+    m_eeRpcRuntimeState =
+        std::make_unique<EeRpcRuntimeState>();
+    m_eeFileRuntimeState =
+        std::make_unique<EeFileRuntimeState>();
+    m_deci2RuntimeState =
+        std::make_unique<Deci2RuntimeState>();
+    m_audioRuntimeState =
+        std::make_unique<ps2_stubs::AudioRuntimeState>();
+    m_cdRuntimeState =
+        std::make_unique<ps2_stubs::CdRuntimeState>();
+    m_dmaRuntimeState =
+        std::make_unique<ps2_stubs::DmaRuntimeState>();
+    m_libcRuntimeState =
+        std::make_unique<ps2_stubs::LibCRuntimeState>();
+    m_memoryCardRuntimeState =
+        std::make_unique<ps2_stubs::MemoryCardRuntimeState>();
+    m_padRuntimeState =
+        std::make_unique<ps2_stubs::PadRuntimeState>();
+    m_sifRuntimeState =
+        std::make_unique<ps2_stubs::SifRuntimeState>();
+    m_gs.setVSyncTickProvider(
+        [this]()
+        {
+            return ps2_syscalls::GetCurrentVSyncTick(
+                this);
+        });
+    m_eeThreadRuntimeState =
+        std::make_unique<EeThreadRuntimeState>(
+            allocateEeThreadRuntimeGeneration());
+    m_eeThreadRuntimeState->contextThreadIds.emplace(
+        &m_cpuContext, 1);
+    selectEeThread(1);
     const auto configureVuBackend =
         [&](VuUnit &unit, VuBackendKind requested,
             const char *environmentName)
@@ -910,6 +1150,33 @@ PS2Runtime::PS2Runtime(PS2RuntimeConfiguration configuration)
     configureNativeInstrumentation(
         m_vu1, configuration.vu1NativeInstrumentation,
         "PS2X_VU1_NATIVE_INSTRUMENTATION");
+
+    m_eeThreadDiagnosticsEnabled =
+        configuration.eeThreadDiagnostics;
+    if (configuration.useEeThreadDiagnosticsEnvironment)
+    {
+        if (const char *const value =
+                std::getenv("PS2X_EE_THREAD_DIAGNOSTICS"))
+        {
+            const std::string_view text(value);
+            if (text == "1" || text == "true" ||
+                text == "on")
+            {
+                m_eeThreadDiagnosticsEnabled = true;
+            }
+            else if (text == "0" || text == "false" ||
+                     text == "off")
+            {
+                m_eeThreadDiagnosticsEnabled = false;
+            }
+            else
+            {
+                throw std::invalid_argument(
+                    "PS2X_EE_THREAD_DIAGNOSTICS must be "
+                    "0, 1, false, true, off, or on");
+            }
+        }
+    }
 
     m_memory.setEeCounterCycleCallback(
         [this]()
@@ -1130,6 +1397,10 @@ PS2Runtime::~PS2Runtime()
     try
     {
         requestStop();
+        if (m_eeRuntimeExecutor)
+        {
+            m_eeRuntimeExecutor->join();
+        }
 #if defined(PS2X_ENABLE_DEBUG_SERVER) && PS2X_ENABLE_DEBUG_SERVER
         if (m_debugServer)
         {
@@ -1137,7 +1408,10 @@ PS2Runtime::~PS2Runtime()
             m_debugServer.reset();
         }
 #endif
-        ps2_syscalls::detachAllGuestHostThreads();
+        // Worker contexts and registries are owned by this runtime. Stop
+        // notification releases every kernel wait, so workers must be joined
+        // before those runtime-owned objects are destroyed.
+        ps2_syscalls::joinAllGuestHostThreads(this);
         m_iopSubsystem.reset();
         m_iopHost.reset();
 #if defined(PLATFORM_VITA)
@@ -1162,6 +1436,7 @@ PS2Runtime::~PS2Runtime()
             CloseWindow();
         }
 
+        m_gs.setVSyncTickProvider({});
         m_loadedModules.clear();
     }
     catch (const std::exception &e)
@@ -1172,6 +1447,979 @@ PS2Runtime::~PS2Runtime()
     {
         std::cerr << "[~PS2Runtime] cleanup exception: unknown" << std::endl;
     }
+}
+
+EeThreadRuntimeState &PS2Runtime::eeThreadRuntimeState()
+{
+    return *m_eeThreadRuntimeState;
+}
+
+const EeThreadRuntimeState &PS2Runtime::eeThreadRuntimeState() const
+{
+    return *m_eeThreadRuntimeState;
+}
+
+IEeExecutionBackend &PS2Runtime::eeExecutionBackend()
+{
+    return *m_eeExecutionBackend;
+}
+
+const IEeExecutionBackend &
+PS2Runtime::eeExecutionBackend() const
+{
+    return *m_eeExecutionBackend;
+}
+
+std::string_view
+PS2Runtime::eeExecutionBackendName() const noexcept
+{
+    return m_eeExecutionBackend
+               ? m_eeExecutionBackend->name()
+               : std::string_view{"uninitialized"};
+}
+
+size_t
+PS2Runtime::managedEeExecutionThreadCountForTesting() const
+{
+    return m_eeExecutionBackend
+               ? m_eeExecutionBackend
+                     ->managedThreadCount()
+               : 0u;
+}
+
+bool PS2Runtime::eeExecutionQuiescentForTesting()
+    const noexcept
+{
+    if (usesDedicatedEeExecutor())
+    {
+        return managedEeExecutionThreadCountForTesting() ==
+               0u;
+    }
+    return m_eeThreadRuntimeState
+               ->activeHostThreads.load(
+                   std::memory_order_acquire) == 0;
+}
+
+std::vector<PS2Runtime::EeThreadContextImageForTesting>
+PS2Runtime::eeThreadContextsForTesting()
+{
+    std::vector<EeThreadContextImageForTesting> result;
+    const auto capture =
+        [this, &result]()
+        {
+            EeThreadRuntimeState &state =
+                *m_eeThreadRuntimeState;
+            std::vector<
+                std::pair<
+                    int,
+                    std::shared_ptr<ThreadInfo>>>
+                threads;
+            {
+                std::lock_guard<std::mutex> lock(
+                    state.threadMapMutex);
+                threads.reserve(state.threads.size());
+                for (const auto &[id, info] :
+                     state.threads)
+                {
+                    threads.emplace_back(id, info);
+                }
+            }
+            std::sort(
+                threads.begin(),
+                threads.end(),
+                [](const auto &lhs, const auto &rhs)
+                {
+                    return lhs.first < rhs.first;
+                });
+
+            result.clear();
+            result.reserve(threads.size());
+            for (const auto &[id, info] : threads)
+            {
+                if (!info)
+                {
+                    continue;
+                }
+                EeThreadContextImageForTesting image{};
+                image.first = id;
+                {
+                    std::lock_guard<std::mutex> lock(
+                        info->m);
+                    const R5900Context *const context =
+                        info->boundContext
+                            ? info->boundContext
+                            : &info->context;
+                    std::memcpy(
+                        image.second.data(),
+                        context,
+                        image.second.size());
+                }
+                result.push_back(std::move(image));
+            }
+        };
+
+    if (m_eeRuntimeExecutor &&
+        m_eeRuntimeExecutor->running())
+    {
+        if (!invokeEeExecutorTaskAtBoundary(capture))
+        {
+            throw std::runtime_error(
+                "could not capture EE thread contexts "
+                "at an executor boundary");
+        }
+        return result;
+    }
+
+    std::lock_guard<std::recursive_timed_mutex> lock(
+        m_guestExecutionMutex);
+    capture();
+    return result;
+}
+
+bool PS2Runtime::usesDedicatedEeExecutor() const noexcept
+{
+    return m_eeRuntimeExecutor != nullptr;
+}
+
+bool PS2Runtime::publishEeExecutorUpdate(
+    std::function<void(
+        ps2x::ee::EeThreadScheduler &,
+        IEeExecutionBackend &)> update,
+    ps2x::ee::EeSchedulerReschedulePolicy policy)
+{
+    if (!m_eeRuntimeExecutor || !update)
+    {
+        return false;
+    }
+
+    EeExecutorConsequenceContext &consequence =
+        g_eeExecutorConsequenceContext;
+    if (consequence.runtime == this)
+    {
+        if (!consequence.scheduler ||
+            !consequence.backend)
+        {
+            throw std::logic_error(
+                "EE callback consequence has no "
+                "scheduler/backend context");
+        }
+        update(
+            *consequence.scheduler,
+            *consequence.backend);
+        consequence.reschedulePolicy =
+            combineEeReschedulePolicies(
+                consequence.reschedulePolicy,
+                policy);
+        return true;
+    }
+
+    return m_eeRuntimeExecutor->publish(
+        std::move(update), policy);
+}
+
+bool PS2Runtime::publishEeSchedulerUpdate(
+    std::function<void(
+        ps2x::ee::EeThreadScheduler &)> update,
+    ps2x::ee::EeSchedulerReschedulePolicy policy)
+{
+    if (!update)
+    {
+        return false;
+    }
+
+    return publishEeExecutorUpdate(
+        [update = std::move(update)](
+            ps2x::ee::EeThreadScheduler &scheduler,
+            IEeExecutionBackend &)
+        {
+            update(scheduler);
+        },
+        policy);
+}
+
+bool PS2Runtime::publishEeSchedulerUpdateAt(
+    std::chrono::steady_clock::time_point deadline,
+    std::function<void(
+        ps2x::ee::EeThreadScheduler &)> update,
+    ps2x::ee::EeSchedulerReschedulePolicy policy)
+{
+    if (!m_eeRuntimeExecutor || !update)
+    {
+        return false;
+    }
+
+    return m_eeRuntimeExecutor->publishAt(
+        deadline,
+        [update = std::move(update)](
+            ps2x::ee::EeThreadScheduler &scheduler,
+            IEeExecutionBackend &)
+        {
+            update(scheduler);
+        },
+        policy);
+}
+
+void PS2Runtime::invokeEeSchedulerUpdateAtBoundary(
+    std::function<void(
+        ps2x::ee::EeThreadScheduler &)> update,
+    ps2x::ee::EeSchedulerReschedulePolicy policy)
+{
+    if (!m_eeRuntimeExecutor || !update)
+    {
+        throw std::logic_error(
+            "EE scheduler boundary invocation requires "
+            "a dedicated executor and a command");
+    }
+
+    m_eeRuntimeExecutor->invokeAtBoundary(
+        [update = std::move(update)](
+            ps2x::ee::EeThreadScheduler &scheduler,
+            IEeExecutionBackend &)
+        {
+            update(scheduler);
+        },
+        policy);
+}
+
+bool PS2Runtime::invokeEeExecutorTaskAtBoundary(
+    std::function<void()> task)
+{
+    if (!m_eeRuntimeExecutor ||
+        !m_eeRuntimeExecutor->running() ||
+        m_eeRuntimeExecutor->ownsCurrentThread())
+    {
+        return false;
+    }
+    if (!task)
+    {
+        throw std::invalid_argument(
+            "EE executor boundary task is empty");
+    }
+
+    // The executor publication wakes an idle or paused owner. Ask a running
+    // continuation to reach its backend-neutral checkpoint as well, then
+    // execute the task before that or any other continuation resumes.
+    requestGuestPreemption();
+    m_eeRuntimeExecutor->invokeAtBoundary(
+        [task = std::move(task)](
+            ps2x::ee::EeThreadScheduler &,
+            IEeExecutionBackend &)
+        {
+            task();
+        },
+        ps2x::ee::EeSchedulerReschedulePolicy::None);
+    return true;
+}
+
+ps2x::timing::EeTickDelta
+PS2Runtime::eeExecutorElapsedSinceSelection()
+    const noexcept
+{
+    return ps2x::timing::elapsedEeTicks(
+        m_eeExecutorDispatchStartTick,
+        currentEeTick());
+}
+
+void PS2Runtime::yieldEeExecutorCurrent(
+    ps2x::ee::EeSchedulerExitReason reason,
+    ps2x::ee::EeSchedulerWaitKey wait)
+{
+    if (!m_eeRuntimeExecutor)
+    {
+        throw std::logic_error(
+            "EE executor yield requested without a "
+            "dedicated executor");
+    }
+
+    if (g_eeExecutorConsequenceContext.runtime ==
+        this)
+    {
+        if (reason ==
+                ps2x::ee::EeSchedulerExitReason::
+                    Blocked ||
+            wait.valid())
+        {
+            throw std::logic_error(
+                "an EE interrupt/callback consequence "
+                "cannot block the executor");
+        }
+        // Non-blocking interrupt-context syscalls have already applied
+        // their scheduler mutation inline above. The containing consequence
+        // returns the strongest accumulated reschedule policy after all
+        // callback code finishes; there is no guest fiber to suspend here.
+        return;
+    }
+
+    R5900Context *releasedContext = nullptr;
+    int releasedThreadId = 1;
+    const uint32_t releasedDepth =
+        releaseGuestExecution(
+            releasedContext,
+            releasedThreadId);
+    const ps2x::timing::EeTickDelta elapsed =
+        eeExecutorElapsedSinceSelection();
+
+    try
+    {
+        m_eeExecutionBackend->yieldCurrent(
+            {
+                reason,
+                elapsed.raw(),
+                wait,
+                {},
+            });
+    }
+    catch (...)
+    {
+        if (releasedDepth != 0u)
+        {
+            reacquireGuestExecution(
+                releasedDepth,
+                releasedContext,
+                releasedThreadId);
+        }
+        throw;
+    }
+
+    if (releasedDepth != 0u)
+    {
+        reacquireGuestExecution(
+            releasedDepth,
+            releasedContext,
+            releasedThreadId);
+    }
+}
+
+void PS2Runtime::commitPriorContext(
+    std::optional<int>,
+    ps2x::timing::EeTickDelta,
+    ps2x::timing::EeTick)
+{
+    // Generated code and runtime helpers already advance the canonical EE
+    // timeline. The executor's relative tick is a consistency/accounting
+    // view and must not advance that timeline a second time.
+    m_eeExecutorInterruptPassComplete = false;
+}
+
+void PS2Runtime::publishSelectedContext(
+    std::optional<int> selectedThreadId,
+    ps2x::timing::EeTick)
+{
+    m_eeExecutorDispatchStartTick = currentEeTick();
+    if (selectedThreadId.has_value())
+    {
+        selectEeThread(*selectedThreadId);
+        return;
+    }
+
+    m_eeThreadRuntimeState->currentThreadId.store(
+        0, std::memory_order_release);
+    m_boundEeThreadId = 0;
+    g_currentThreadRuntime = this;
+    g_currentThreadId = 1;
+}
+
+void PS2Runtime::publishWaitCompletion(
+    int,
+    ps2x::ee::EeSchedulerCompletedWait,
+    ps2x::timing::EeTick)
+{
+    // Live syscall adapters mirror completion while applying the scheduler
+    // transition. The executor consumes the scheduler's retained result here
+    // so a later wait cannot observe the prior completion a second time.
+}
+
+bool PS2Runtime::hasImmediateConsequence(
+    ps2x::ee::EeSchedulerConsequenceStage stage,
+    ps2x::timing::EeTick) const
+{
+    if (stage !=
+            ps2x::ee::EeSchedulerConsequenceStage::
+                InterruptCause ||
+        m_eeExecutorInterruptPassComplete)
+    {
+        return false;
+    }
+
+    return m_eeAlarmRuntimeState
+                   ->pendingCallbackPublished.load(
+                       std::memory_order_acquire) ||
+           m_pendingVSyncDeliveryCount != 0u ||
+           m_pendingEeCounterInterrupts != 0u ||
+           m_dmacInterruptDeliveryDirty.load(
+               std::memory_order_acquire);
+}
+
+ps2x::ee::EeSchedulerReschedulePolicy
+PS2Runtime::applyNextConsequence(
+    ps2x::ee::EeSchedulerConsequenceStage stage,
+    ps2x::timing::EeTick,
+    ps2x::ee::EeThreadScheduler &scheduler)
+{
+    if (stage !=
+            ps2x::ee::EeSchedulerConsequenceStage::
+                InterruptCause ||
+        m_eeExecutorInterruptPassComplete)
+    {
+        throw std::logic_error(
+            "PS2 runtime has no immediate EE scheduler "
+            "consequence at this stage");
+    }
+
+    // These adapters may execute generated interrupt/callback code. They run
+    // only here on the EE executor, after the prior guest continuation has
+    // yielded and before the next continuation is selected. Mark the pass
+    // complete first so a masked retained cause cannot spin the consequence
+    // loop; a later executor boundary will reconsider retained work.
+    m_eeExecutorInterruptPassComplete = true;
+    EeExecutorConsequenceContext &consequence =
+        g_eeExecutorConsequenceContext;
+    if (consequence.runtime)
+    {
+        throw std::logic_error(
+            "nested EE executor callback consequence");
+    }
+    consequence.runtime = this;
+    consequence.scheduler = &scheduler;
+    consequence.backend =
+        m_eeExecutionBackend.get();
+    consequence.reschedulePolicy =
+        ps2x::ee::
+            EeSchedulerReschedulePolicy::None;
+    try
+    {
+        drainPendingAlarmCallbacks();
+        drainPendingVSyncHandlers(
+            m_memory.getRDRAM());
+        drainPendingEeCounterHandlers(
+            m_memory.getRDRAM());
+        drainCompletedDmacHandlers(
+            m_memory.getRDRAM());
+    }
+    catch (...)
+    {
+        consequence = {};
+        throw;
+    }
+    const ps2x::ee::EeSchedulerReschedulePolicy
+        reschedulePolicy =
+            consequence.reschedulePolicy;
+    consequence = {};
+    m_guestExecutionPreemptionRequested.store(
+        false, std::memory_order_release);
+    return reschedulePolicy;
+}
+
+void PS2Runtime::runMainEeContinuation()
+{
+    try
+    {
+        dispatchLoop(
+            m_memory.getRDRAM(),
+            &m_cpuContext);
+    }
+    catch (const ThreadExitException &)
+    {
+    }
+
+    std::shared_ptr<ThreadInfo> mainInfo;
+    {
+        EeThreadRuntimeState &state =
+            *m_eeThreadRuntimeState;
+        std::lock_guard<std::mutex> lock(
+            state.threadMapMutex);
+        const auto current = state.threads.find(1);
+        if (current != state.threads.end())
+        {
+            mainInfo = current->second;
+        }
+    }
+    if (mainInfo)
+    {
+        // Started guest workers already make their ThreadInfo dormant when
+        // their entry returns. Mirror that lifecycle for the bootstrap
+        // continuation before any surviving worker can target thread 1.
+        {
+            std::lock_guard<std::mutex> lock(
+                mainInfo->m);
+            mainInfo->guestState.makeDormant();
+        }
+        mainInfo->cv.notify_all();
+    }
+
+    const uint32_t pc = m_cpuContext.pc;
+    RUNTIME_LOG(
+        "Game thread returned. PC=0x"
+        << std::hex << pc
+        << " RA=0x"
+        << static_cast<uint32_t>(
+               _mm_extract_epi32(
+                   m_cpuContext.r[31], 0))
+        << std::dec << std::endl);
+}
+
+void PS2Runtime::startDedicatedEeExecution()
+{
+    if (!m_eeRuntimeExecutor)
+    {
+        throw std::logic_error(
+            "selected EE backend has no dedicated "
+            "executor");
+    }
+
+    std::shared_ptr<ThreadInfo> mainInfo;
+    {
+        EeThreadRuntimeState &state =
+            *m_eeThreadRuntimeState;
+        std::lock_guard<std::mutex> lock(
+            state.threadMapMutex);
+        const auto current = state.threads.find(1);
+        if (current != state.threads.end())
+        {
+            mainInfo = current->second;
+        }
+        else
+        {
+            mainInfo =
+                std::make_shared<ThreadInfo>();
+            mainInfo->generation =
+                state.allocateThreadGenerationLocked();
+            mainInfo->priority = 0u;
+            mainInfo->guestState.initializeRunning(0);
+            mainInfo->entry = m_cpuContext.pc;
+            mainInfo->stack =
+                static_cast<uint32_t>(
+                    _mm_extract_epi32(
+                        m_cpuContext.r[29], 0));
+            mainInfo->gp =
+                static_cast<uint32_t>(
+                    _mm_extract_epi32(
+                        m_cpuContext.r[28], 0));
+            state.threads.emplace(1, mainInfo);
+        }
+        mainInfo->boundContext = &m_cpuContext;
+        state.contextThreadIds[&m_cpuContext] = 1;
+    }
+
+    int mainPriority = 0;
+    {
+        std::lock_guard<std::mutex> lock(mainInfo->m);
+        const EeThreadGuestStateSnapshot guest =
+            mainInfo->guestState.snapshot();
+        mainPriority = guest.currentPriority;
+        if (!guest.started)
+        {
+            mainInfo->guestState.initializeRunning(
+                mainPriority);
+        }
+    }
+
+    const uint32_t generation =
+        mainInfo->generation;
+    m_eeRuntimeExecutor->start(
+        [this, generation, mainPriority](
+            ps2x::ee::EeThreadScheduler &scheduler,
+            IEeExecutionBackend &backend)
+        {
+            ThreadNaming::SetCurrentThreadName(
+                "EeExecutor");
+            backend.create(
+                1,
+                [this]()
+                {
+                    runMainEeContinuation();
+                });
+            if (!scheduler.addRunningThread(
+                    1,
+                    generation,
+                    mainPriority))
+            {
+                throw std::logic_error(
+                    "failed to seed the main EE "
+                    "scheduler record");
+            }
+        });
+}
+
+void PS2Runtime::joinDedicatedEeExecution()
+{
+    if (!m_eeRuntimeExecutor)
+    {
+        return;
+    }
+    m_eeRuntimeExecutor->join();
+    m_eeRuntimeExecutor->rethrowFailure();
+}
+
+void PS2Runtime::
+    startDedicatedEeExecutionForTesting()
+{
+    m_stopRequested.store(
+        false, std::memory_order_relaxed);
+    startDedicatedEeExecution();
+}
+
+void PS2Runtime::
+    stopDedicatedEeExecutionForTesting()
+{
+    requestStop();
+    joinDedicatedEeExecution();
+}
+
+void PS2Runtime::startEeExecutionForTesting()
+{
+    if (usesDedicatedEeExecutor())
+    {
+        startDedicatedEeExecutionForTesting();
+        return;
+    }
+
+    if (m_eeThreadRuntimeState->activeHostThreads.load(
+            std::memory_order_acquire) != 0 ||
+        m_eeExecutionBackend->managedThreadCount() !=
+            0u)
+    {
+        throw std::logic_error(
+            "headless EE execution is already active");
+    }
+
+    {
+        std::lock_guard<std::mutex> lock(
+            m_headlessEeExecutionFailureMutex);
+        m_headlessEeExecutionFailure = nullptr;
+    }
+    m_stopRequested.store(
+        false, std::memory_order_relaxed);
+    m_eeThreadRuntimeState->activeHostThreads.store(
+        1, std::memory_order_release);
+    try
+    {
+        m_eeExecutionBackend->create(
+            1,
+            [this]()
+            {
+                struct ActiveThreadCompletion
+                {
+                    EeThreadRuntimeState &state;
+
+                    ~ActiveThreadCompletion()
+                    {
+                        state.activeHostThreads.fetch_sub(
+                            1, std::memory_order_release);
+                    }
+                } completion{*m_eeThreadRuntimeState};
+
+                ThreadNaming::SetCurrentThreadName(
+                    "GameThread");
+                try
+                {
+                    runMainEeContinuation();
+                }
+                catch (...)
+                {
+                    {
+                        std::lock_guard<std::mutex> lock(
+                            m_headlessEeExecutionFailureMutex);
+                        m_headlessEeExecutionFailure =
+                            std::current_exception();
+                    }
+                    requestStop();
+                }
+            });
+    }
+    catch (...)
+    {
+        m_eeThreadRuntimeState->activeHostThreads.fetch_sub(
+            1, std::memory_order_release);
+        throw;
+    }
+}
+
+void PS2Runtime::stopEeExecutionForTesting()
+{
+    if (usesDedicatedEeExecutor())
+    {
+        stopDedicatedEeExecutionForTesting();
+        return;
+    }
+
+    requestStop();
+    ps2_syscalls::joinAllGuestHostThreads(this);
+    if (m_eeThreadRuntimeState->activeHostThreads.load(
+            std::memory_order_acquire) != 0)
+    {
+        throw std::logic_error(
+            "headless EE host threads remained active "
+            "after join");
+    }
+
+    std::exception_ptr failure;
+    {
+        std::lock_guard<std::mutex> lock(
+            m_headlessEeExecutionFailureMutex);
+        failure = std::exchange(
+            m_headlessEeExecutionFailure, nullptr);
+    }
+    if (failure)
+    {
+        std::rethrow_exception(failure);
+    }
+}
+
+void PS2Runtime::completeEeExecutionKernelReset()
+{
+    if (isStopRequested())
+    {
+        return;
+    }
+
+    if (usesDedicatedEeExecutor())
+    {
+        if (m_eeRuntimeExecutor->ownsCurrentThread())
+        {
+            throw std::logic_error(
+                "EE kernel reset cannot join its own "
+                "executor thread");
+        }
+        m_eeRuntimeExecutor->requestStop();
+        joinDedicatedEeExecution();
+        return;
+    }
+
+    m_eeExecutionBackend->joinAll();
+    if (m_eeThreadRuntimeState->activeHostThreads.load(
+            std::memory_order_acquire) != 0 ||
+        m_eeExecutionBackend->managedThreadCount() !=
+            0u)
+    {
+        throw std::logic_error(
+            "EE kernel reset left host continuations "
+            "active");
+    }
+}
+
+const void *
+PS2Runtime::hostPresentationUploadStateIdentityForTesting()
+    const noexcept
+{
+    return m_hostPresentationUploadState.get();
+}
+
+size_t
+PS2Runtime::pendingAlarmCallbackCountForTesting()
+{
+    EeAlarmRuntimeState &state =
+        eeAlarmRuntimeState();
+    std::lock_guard<std::mutex> lock(state.mutex);
+    return state.pendingCallbacks.size();
+}
+
+EeAlarmRuntimeState &PS2Runtime::eeAlarmRuntimeState()
+{
+    return *m_eeAlarmRuntimeState;
+}
+
+const EeAlarmRuntimeState &PS2Runtime::eeAlarmRuntimeState() const
+{
+    return *m_eeAlarmRuntimeState;
+}
+
+EeSyncRuntimeState &PS2Runtime::eeSyncRuntimeState()
+{
+    return *m_eeSyncRuntimeState;
+}
+
+const EeSyncRuntimeState &PS2Runtime::eeSyncRuntimeState() const
+{
+    return *m_eeSyncRuntimeState;
+}
+
+EeInterruptRuntimeState &PS2Runtime::eeInterruptRuntimeState()
+{
+    return *m_eeInterruptRuntimeState;
+}
+
+const EeInterruptRuntimeState &PS2Runtime::eeInterruptRuntimeState() const
+{
+    return *m_eeInterruptRuntimeState;
+}
+
+EeKernelRuntimeState &PS2Runtime::eeKernelRuntimeState()
+{
+    return *m_eeKernelRuntimeState;
+}
+
+const EeKernelRuntimeState &PS2Runtime::eeKernelRuntimeState() const
+{
+    return *m_eeKernelRuntimeState;
+}
+
+EeRpcRuntimeState &PS2Runtime::eeRpcRuntimeState()
+{
+    return *m_eeRpcRuntimeState;
+}
+
+const EeRpcRuntimeState &PS2Runtime::eeRpcRuntimeState() const
+{
+    return *m_eeRpcRuntimeState;
+}
+
+EeFileRuntimeState &PS2Runtime::eeFileRuntimeState()
+{
+    return *m_eeFileRuntimeState;
+}
+
+const EeFileRuntimeState &
+PS2Runtime::eeFileRuntimeState() const
+{
+    return *m_eeFileRuntimeState;
+}
+
+Deci2RuntimeState &PS2Runtime::deci2RuntimeState()
+{
+    return *m_deci2RuntimeState;
+}
+
+const Deci2RuntimeState &
+PS2Runtime::deci2RuntimeState() const
+{
+    return *m_deci2RuntimeState;
+}
+
+ps2_stubs::AudioRuntimeState &
+PS2Runtime::audioRuntimeState()
+{
+    return *m_audioRuntimeState;
+}
+
+const ps2_stubs::AudioRuntimeState &
+PS2Runtime::audioRuntimeState() const
+{
+    return *m_audioRuntimeState;
+}
+
+ps2_stubs::CdRuntimeState &PS2Runtime::cdRuntimeState()
+{
+    return *m_cdRuntimeState;
+}
+
+const ps2_stubs::CdRuntimeState &
+PS2Runtime::cdRuntimeState() const
+{
+    return *m_cdRuntimeState;
+}
+
+ps2_stubs::DmaRuntimeState &PS2Runtime::dmaRuntimeState()
+{
+    return *m_dmaRuntimeState;
+}
+
+const ps2_stubs::DmaRuntimeState &
+PS2Runtime::dmaRuntimeState() const
+{
+    return *m_dmaRuntimeState;
+}
+
+ps2_stubs::LibCRuntimeState &PS2Runtime::libcRuntimeState()
+{
+    return *m_libcRuntimeState;
+}
+
+const ps2_stubs::LibCRuntimeState &
+PS2Runtime::libcRuntimeState() const
+{
+    return *m_libcRuntimeState;
+}
+
+ps2_stubs::MemoryCardRuntimeState &
+PS2Runtime::memoryCardRuntimeState()
+{
+    return *m_memoryCardRuntimeState;
+}
+
+const ps2_stubs::MemoryCardRuntimeState &
+PS2Runtime::memoryCardRuntimeState() const
+{
+    return *m_memoryCardRuntimeState;
+}
+
+ps2_stubs::PadRuntimeState &PS2Runtime::padRuntimeState()
+{
+    return *m_padRuntimeState;
+}
+
+const ps2_stubs::PadRuntimeState &
+PS2Runtime::padRuntimeState() const
+{
+    return *m_padRuntimeState;
+}
+
+ps2_stubs::SifRuntimeState &PS2Runtime::sifRuntimeState()
+{
+    return *m_sifRuntimeState;
+}
+
+const ps2_stubs::SifRuntimeState &
+PS2Runtime::sifRuntimeState() const
+{
+    return *m_sifRuntimeState;
+}
+
+ps2_stubs::MpegRuntimeState &PS2Runtime::mpegRuntimeState()
+{
+    return *m_mpegRuntimeState;
+}
+
+const ps2_stubs::MpegRuntimeState &PS2Runtime::mpegRuntimeState() const
+{
+    return *m_mpegRuntimeState;
+}
+
+int PS2Runtime::activeEeHostThreadCount() const
+{
+    return m_eeThreadRuntimeState
+        ? m_eeThreadRuntimeState->activeHostThreads.load(
+              std::memory_order_acquire)
+        : 0;
+}
+
+int PS2Runtime::currentEeThreadId() noexcept
+{
+    const auto depthIt =
+        g_guestExecutionDepths.find(this);
+    const bool ownsGuestExecution =
+        depthIt != g_guestExecutionDepths.end() &&
+        depthIt->second != 0u;
+    if (!ownsGuestExecution)
+    {
+        // Direct syscall tests and legacy host callbacks can still enter
+        // without a GuestExecutionScope. Their TLS slot is only a
+        // compatibility identity; it may never override a bound guest.
+        if (g_currentThreadRuntime != this)
+        {
+            g_currentThreadRuntime = this;
+            g_currentThreadId = 1;
+        }
+        return g_currentThreadId;
+    }
+
+    const int selected = m_boundEeThreadId;
+    if (g_currentThreadRuntime != this ||
+        g_currentThreadId != selected)
+    {
+        m_eeThreadRuntimeState->legacyAdapterMismatches.fetch_add(
+            1u, std::memory_order_relaxed);
+        g_currentThreadRuntime = this;
+        g_currentThreadId = selected;
+    }
+    return selected;
+}
+
+uint64_t
+PS2Runtime::eeThreadLegacyAdapterMismatchCount() const noexcept
+{
+    return m_eeThreadRuntimeState->legacyAdapterMismatches.load(
+        std::memory_order_relaxed);
 }
 
 void PS2Runtime::setIopPluginSearchPaths(std::vector<std::filesystem::path> paths)
@@ -1279,7 +2527,8 @@ void PS2Runtime::onEeCounterInterruptStateChanged(
              (1u << cause)) != 0u &&
             (status & mask &
              (1u << cause)) != 0u &&
-            ps2_syscalls::isIntcCauseEnabled(cause))
+            ps2_syscalls::isIntcCauseEnabled(
+                this, cause))
         {
             requestGuestPreemption();
             return;
@@ -1844,6 +3093,8 @@ void PS2Runtime::publishEeVSyncField() noexcept
             kGsCsrFieldMask,
             std::memory_order_relaxed);
     }
+    m_debugVSyncFields.fetch_add(
+        1u, std::memory_order_relaxed);
 }
 
 bool PS2Runtime::queuePendingVSyncDelivery(
@@ -1901,7 +3152,7 @@ uint64_t PS2Runtime::waitForNextScheduledVSync(
     while (!isStopRequested())
     {
         const uint64_t currentVSyncTick =
-            ps2_syscalls::GetCurrentVSyncTick();
+            ps2_syscalls::GetCurrentVSyncTick(this);
         if (currentVSyncTick > observedVSyncTick)
         {
             return currentVSyncTick;
@@ -1913,7 +3164,8 @@ uint64_t PS2Runtime::waitForNextScheduledVSync(
             GuestExecutionScope guestExecution(
                 this, serviceContext);
 
-            if (ps2_syscalls::GetCurrentVSyncTick() >
+            if (ps2_syscalls::GetCurrentVSyncTick(
+                    this) >
                 observedVSyncTick)
             {
                 continue;
@@ -1974,7 +3226,7 @@ uint64_t PS2Runtime::waitForNextScheduledVSync(
         }
     }
 
-    return ps2_syscalls::GetCurrentVSyncTick();
+    return ps2_syscalls::GetCurrentVSyncTick(this);
 }
 
 ps2x::timing::EeTick PS2Runtime::publishEeElapsed(
@@ -2570,7 +3822,7 @@ void PS2Runtime::onDmacInterruptStateChanged()
             m_memory.dmacInterruptUnmasked(
                 interrupt.source) &&
             ps2_syscalls::isDmacCauseEnabled(
-                interrupt.cause))
+                this, interrupt.cause))
         {
             requestGuestPreemption();
             return;
@@ -4143,12 +5395,13 @@ bool PS2Runtime::loadELF(const std::string &elfPath)
     return true;
 }
 
-const PS2Runtime::IoPaths &PS2Runtime::getIoPaths()
+PS2Runtime::IoPaths PS2Runtime::ioPaths() const
 {
-    return runtimeIoPaths();
+    std::lock_guard<std::mutex> lock(m_ioPathsMutex);
+    return m_ioPaths;
 }
 
-void PS2Runtime::setIoPaths(const IoPaths &paths)
+void PS2Runtime::configureIoPaths(const IoPaths &paths)
 {
     IoPaths normalized = paths;
     normalized.elfPath = normalizeAbsolutePath(normalized.elfPath);
@@ -4176,12 +5429,13 @@ void PS2Runtime::setIoPaths(const IoPaths &paths)
         normalized.mcRoot = normalized.elfDirectory / "mc0";
     }
 
-    runtimeIoPaths() = normalized;
+    std::lock_guard<std::mutex> lock(m_ioPathsMutex);
+    m_ioPaths = std::move(normalized);
 }
 
 void PS2Runtime::configureIoPathsFromElf(const std::string &elfPath)
 {
-    IoPaths paths = runtimeIoPaths();
+    IoPaths paths = ioPaths();
     paths.elfPath = normalizeAbsolutePath(std::filesystem::path(elfPath));
     if (!paths.elfPath.empty())
     {
@@ -4195,7 +5449,7 @@ void PS2Runtime::configureIoPathsFromElf(const std::string &elfPath)
         paths.mcRoot = paths.elfDirectory / "mc0";
     }
 
-    setIoPaths(paths);
+    configureIoPaths(paths);
 }
 
 namespace
@@ -4556,8 +5810,9 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
         debugRecordBranch(targetPc);
     }
     const uint32_t entryPc = ctx->pc;
-    const uint64_t preemptionEpoch =
-        m_guestExecutionPreemptionEpoch.load(std::memory_order_acquire);
+    const uint64_t dispatcherExitEpoch =
+        m_guestExecutionDispatcherExitEpoch.load(
+            std::memory_order_acquire);
     targetFn(rdram, ctx, this);
 
     if (isStopRequested() || ctx->pc == 0u)
@@ -4565,14 +5820,16 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
         return false;
     }
 
-    // A generated back edge returns to the outer dispatcher when the runtime
-    // requests cooperative preemption.  In a nested call, the resume PC can
-    // legitimately equal the callee entry, which is otherwise also how an
-    // empty implicit-return handler is represented.  Preserve the resume PC
-    // instead of converting it to the call fallthrough when any nested target
-    // observed a preemption request.
-    if (m_guestExecutionPreemptionEpoch.load(std::memory_order_acquire) !=
-        preemptionEpoch)
+    // A stackless checkpoint returns generated code to the outer dispatcher.
+    // In a nested call, the resume PC can legitimately equal the callee
+    // entry, which is otherwise also how an empty implicit-return handler is
+    // represented. Preserve the resume PC instead of converting it to the
+    // call fallthrough when any nested target requested a dispatcher exit.
+    // A stackful checkpoint suspends and resumes in place, so it does not
+    // advance this epoch or unwind native callers.
+    if (m_guestExecutionDispatcherExitEpoch.load(
+            std::memory_order_acquire) !=
+        dispatcherExitEpoch)
     {
         return false;
     }
@@ -4748,7 +6005,7 @@ void PS2Runtime::debugArmVu0Traces(const R5900Context *ctx)
         const DebugEeScheduler scheduler =
             debugEeSchedulerSnapshot();
         const uint64_t vsyncTick =
-            ps2_syscalls::GetCurrentVSyncTick();
+            ps2_syscalls::GetCurrentVSyncTick(this);
         {
             std::lock_guard<std::mutex> lock(
                 m_debugVu0SyncTraceMutex);
@@ -5489,7 +6746,7 @@ void PS2Runtime::synchronizeVU0MicroprogramAtTick(
                 std::memory_order_relaxed);
         traceEntry.eeCycleTicks = eeCycleTick.raw();
         traceEntry.vsyncTick =
-            ps2_syscalls::GetCurrentVSyncTick();
+            ps2_syscalls::GetCurrentVSyncTick(this);
         traceEntry.vuCycleTicks = m_vu0CycleTick.raw();
         traceEntry.nextEventCycleTicks =
             nextEventTick.raw();
@@ -5620,6 +6877,99 @@ void PS2Runtime::handleBreak(uint8_t *rdram, R5900Context *ctx)
         ctx, EXCEPTION_BREAKPOINT);
 }
 
+void PS2Runtime::drainPendingAlarmCallbacks()
+{
+    EeAlarmRuntimeState &state =
+        eeAlarmRuntimeState();
+    if (!state.pendingCallbackPublished.load(
+            std::memory_order_acquire))
+    {
+        return;
+    }
+
+    std::deque<std::shared_ptr<AlarmInfo>> pending;
+    {
+        std::lock_guard<std::mutex> lock(state.mutex);
+        pending.swap(state.pendingCallbacks);
+        state.pendingCallbackPublished.store(
+            false, std::memory_order_release);
+    }
+
+    for (const std::shared_ptr<AlarmInfo> &alarm :
+         pending)
+    {
+        if (isStopRequested())
+        {
+            break;
+        }
+        if (!alarm ||
+            !alarm->rdram ||
+            !alarm->handler ||
+            !hasFunction(alarm->handler))
+        {
+            continue;
+        }
+
+        try
+        {
+            constexpr uint32_t kAlarmCallbackStackSize =
+                0x4000u;
+            if (state.callbackStackTop == 0u)
+            {
+                state.callbackStackTop =
+                    reserveAsyncCallbackStack(
+                        kAlarmCallbackStackSize, 16u);
+            }
+
+            R5900Context &callbackCtx =
+                state.callbackContext;
+            callbackCtx = {};
+            SET_GPR_U32(&callbackCtx, 28, alarm->gp);
+            SET_GPR_U32(
+                &callbackCtx,
+                29,
+                state.callbackStackTop != 0u
+                    ? state.callbackStackTop
+                    : (PS2_RAM_SIZE - 0x10u));
+            SET_GPR_U32(&callbackCtx, 31, 0u);
+            SET_GPR_U32(
+                &callbackCtx,
+                4,
+                static_cast<uint32_t>(alarm->id));
+            SET_GPR_U32(
+                &callbackCtx,
+                5,
+                static_cast<uint32_t>(alarm->ticks));
+            SET_GPR_U32(
+                &callbackCtx, 6, alarm->commonArg);
+            SET_GPR_U32(&callbackCtx, 7, 0u);
+            callbackCtx.pc = alarm->handler;
+
+            RecompiledFunction function =
+                lookupFunction(alarm->handler);
+            GuestExecutionScope guestExecution(
+                this, &callbackCtx);
+            executeGuestStep(
+                alarm->rdram,
+                &callbackCtx,
+                function);
+        }
+        catch (const ThreadExitException &)
+        {
+        }
+        catch (const std::exception &e)
+        {
+            if (state.exceptionLogCount < 8u)
+            {
+                std::cerr
+                    << "[SetAlarm] callback exception: "
+                    << e.what() << std::endl;
+                ++state.exceptionLogCount;
+            }
+        }
+    }
+}
+
 void PS2Runtime::drainPendingVSyncHandlers(uint8_t *rdram)
 {
     if (m_pendingVSyncDeliveryCount == 0u)
@@ -5675,7 +7025,8 @@ void PS2Runtime::drainPendingEeCounterHandlers(
         {
             continue;
         }
-        if (!ps2_syscalls::isIntcCauseEnabled(cause))
+        if (!ps2_syscalls::isIntcCauseEnabled(
+                this, cause))
         {
             retained |= bit;
             continue;
@@ -5722,7 +7073,7 @@ void PS2Runtime::drainCompletedDmacHandlers(uint8_t *rdram)
         if (!m_memory.dmacInterruptUnmasked(
                 interrupt.source) ||
             !ps2_syscalls::isDmacCauseEnabled(
-                interrupt.cause))
+                this, interrupt.cause))
         {
             retained.push_back(interrupt);
             continue;
@@ -6346,10 +7697,48 @@ void PS2Runtime::dispatchLoop(uint8_t *rdram, R5900Context *ctx)
         const uint32_t dispatchedRa = static_cast<uint32_t>(_mm_extract_epi32(ctx->r[31], 0));
 
         uint64_t handoffBaseline = 0u;
+        std::shared_ptr<ThreadInfo>
+            returnedThreadInfo;
         {
             GuestExecutionScope guestExecution(this, ctx);
             executeGuestStep(rdram, ctx, fn);
+            if (!m_eeRuntimeExecutor &&
+                ctx->pc == 0u)
+            {
+                EeThreadRuntimeState &state =
+                    *m_eeThreadRuntimeState;
+                {
+                    std::lock_guard<std::mutex> lock(
+                        state.threadMapMutex);
+                    const auto context =
+                        state.contextThreadIds.find(ctx);
+                    if (context !=
+                        state.contextThreadIds.end())
+                    {
+                        const auto thread =
+                            state.threads.find(
+                                context->second);
+                        if (thread !=
+                            state.threads.end())
+                        {
+                            returnedThreadInfo =
+                                thread->second;
+                        }
+                    }
+                }
+                if (returnedThreadInfo)
+                {
+                    std::lock_guard<std::mutex> lock(
+                        returnedThreadInfo->m);
+                    returnedThreadInfo->guestState
+                        .makeDormant();
+                }
+            }
             handoffBaseline = guestExecutionHandoffEpochSnapshot();
+        }
+        if (returnedThreadInfo)
+        {
+            returnedThreadInfo->cv.notify_all();
         }
 
         waitForGuestExecutionHandoff(handoffBaseline);
@@ -6376,8 +7765,40 @@ void PS2Runtime::dispatchLoop(uint8_t *rdram, R5900Context *ctx)
     }
 }
 
+int PS2Runtime::threadIdForEeContext(
+    const R5900Context *context) noexcept
+{
+    if (!context)
+    {
+        return 0;
+    }
+
+    std::lock_guard<std::mutex> lock(
+        m_eeThreadRuntimeState->threadMapMutex);
+    const auto it =
+        m_eeThreadRuntimeState->contextThreadIds.find(context);
+    return it !=
+                   m_eeThreadRuntimeState->contextThreadIds.end()
+               ? it->second
+               : 0;
+}
+
+void PS2Runtime::selectEeThread(int threadId) noexcept
+{
+    if (threadId <= 0)
+    {
+        threadId = 1;
+    }
+    m_eeThreadRuntimeState->currentThreadId.store(
+        threadId, std::memory_order_release);
+    m_boundEeThreadId = threadId;
+    g_currentThreadRuntime = this;
+    g_currentThreadId = threadId;
+}
+
 void PS2Runtime::switchGuestExecutionContext(
-    R5900Context *context) noexcept
+    R5900Context *context,
+    int selectionHint) noexcept
 {
     if (!context || context == m_boundEeContext)
     {
@@ -6386,6 +7807,24 @@ void PS2Runtime::switchGuestExecutionContext(
 
     R5900Context *const previous =
         m_boundEeContext;
+    int selectedThreadId =
+        threadIdForEeContext(context);
+    if (selectedThreadId <= 0)
+    {
+        if (selectionHint > 0)
+        {
+            selectedThreadId = selectionHint;
+        }
+        else if (previous)
+        {
+            selectedThreadId = m_boundEeThreadId;
+        }
+        else
+        {
+            selectedThreadId = 1;
+        }
+    }
+
     const ps2x::timing::EeTick now =
         finishEeContextBlock(previous);
     synchronizeCop0Timing(
@@ -6394,6 +7833,7 @@ void PS2Runtime::switchGuestExecutionContext(
             now));
     context->resetEeBlockTiming();
     m_boundEeContext = context;
+    selectEeThread(selectedThreadId);
     publishCop0TimingMirrors(context);
     refreshCop0EventSchedules(
         context,
@@ -6403,7 +7843,8 @@ void PS2Runtime::switchGuestExecutionContext(
 
 void PS2Runtime::restoreGuestExecutionContext(
     R5900Context *context,
-    R5900Context *previousContext) noexcept
+    R5900Context *previousContext,
+    int previousThreadId) noexcept
 {
     if (!context ||
         context == previousContext ||
@@ -6419,6 +7860,7 @@ void PS2Runtime::restoreGuestExecutionContext(
         ps2x::timing::eeTickToCyclesFloor(
             now));
     m_boundEeContext = previousContext;
+    selectEeThread(previousThreadId);
     publishCop0TimingMirrors(previousContext);
     refreshCop0EventSchedules(
         previousContext,
@@ -6427,30 +7869,74 @@ void PS2Runtime::restoreGuestExecutionContext(
 }
 
 R5900Context *PS2Runtime::enterGuestExecution(
-    R5900Context *context)
+    R5900Context *context,
+    int *previousThreadId,
+    int selectionHint)
 {
     uint32_t &depth = g_guestExecutionDepths[this];
 
-    if (depth != 0u)
+    if (m_eeRuntimeExecutor)
     {
-        m_guestExecutionMutex.lock();
-        ++depth;
+        if (!m_eeRuntimeExecutor->ownsCurrentThread())
+        {
+            throw std::logic_error(
+                "dedicated EE guest execution must run "
+                "on its executor thread");
+        }
+
         R5900Context *const previousContext =
             m_boundEeContext;
-        switchGuestExecutionContext(context);
+        if (previousThreadId)
+        {
+            *previousThreadId =
+                m_boundEeThreadId;
+        }
+        ++depth;
+        if (depth == 1u)
+        {
+            recordOuterGuestExecutionAcquisition(
+                context);
+        }
+        switchGuestExecutionContext(
+            context, selectionHint);
         return previousContext;
     }
 
-    if (!m_debugControlActive.load(std::memory_order_acquire))
+    if (depth != 0u)
     {
-        m_guestExecutionWaiters.fetch_add(1u, std::memory_order_acq_rel);
-        m_guestExecutionMutex.lock();
-        m_guestExecutionWaiters.fetch_sub(1u, std::memory_order_acq_rel);
-        depth = 1u;
-        markGuestExecutionAcquired();
+        lockGuestExecutionMutex(false);
+        ++depth;
         R5900Context *const previousContext =
             m_boundEeContext;
-        switchGuestExecutionContext(context);
+        if (previousThreadId)
+        {
+            *previousThreadId =
+                m_boundEeThreadId;
+        }
+        switchGuestExecutionContext(
+            context, selectionHint);
+        return previousContext;
+    }
+
+    if (!m_debugControlActive.load(
+            std::memory_order_acquire))
+    {
+        m_guestExecutionWaiters.fetch_add(1u, std::memory_order_acq_rel);
+        lockGuestExecutionMutex(true);
+        m_guestExecutionWaiters.fetch_sub(1u, std::memory_order_acq_rel);
+        depth = 1u;
+        recordOuterGuestExecutionAcquisition(context);
+        markGuestExecutionAcquired();
+        flushDeferredLegacyEeWakeNotifications();
+        R5900Context *const previousContext =
+            m_boundEeContext;
+        if (previousThreadId)
+        {
+            *previousThreadId =
+                m_boundEeThreadId;
+        }
+        switchGuestExecutionContext(
+            context, selectionHint);
         return previousContext;
     }
 
@@ -6464,7 +7950,7 @@ R5900Context *PS2Runtime::enterGuestExecution(
         }
 
         m_guestExecutionWaiters.fetch_add(1u, std::memory_order_acq_rel);
-        m_guestExecutionMutex.lock();
+        lockGuestExecutionMutex(true);
         m_guestExecutionWaiters.fetch_sub(1u, std::memory_order_acq_rel);
 
         // Close the race where a pause is requested after the condition check
@@ -6477,16 +7963,146 @@ R5900Context *PS2Runtime::enterGuestExecution(
         m_guestExecutionMutex.unlock();
     }
     depth = 1u;
+    recordOuterGuestExecutionAcquisition(context);
     markGuestExecutionAcquired();
+    flushDeferredLegacyEeWakeNotifications();
     R5900Context *const previousContext =
         m_boundEeContext;
-    switchGuestExecutionContext(context);
+    if (previousThreadId)
+    {
+        *previousThreadId =
+            m_boundEeThreadId;
+    }
+    switchGuestExecutionContext(
+        context, selectionHint);
     return previousContext;
+}
+
+bool PS2Runtime::tryEnterGuestExecution(
+    R5900Context *context,
+    std::chrono::milliseconds timeout,
+    R5900Context *&previousContext,
+    int &previousThreadId,
+    int selectionHint)
+{
+    previousContext = nullptr;
+    previousThreadId = 1;
+
+    if (m_eeRuntimeExecutor)
+    {
+        if (!m_eeRuntimeExecutor->ownsCurrentThread())
+        {
+            return false;
+        }
+        previousContext =
+            enterGuestExecution(
+                context,
+                &previousThreadId,
+                selectionHint);
+        return true;
+    }
+
+    auto depthIt = g_guestExecutionDepths.find(this);
+    if (depthIt != g_guestExecutionDepths.end() &&
+        depthIt->second != 0u)
+    {
+        if (!m_guestExecutionMutex.try_lock_for(timeout))
+        {
+            return false;
+        }
+        ++depthIt->second;
+        previousContext = m_boundEeContext;
+        previousThreadId = m_boundEeThreadId;
+        switchGuestExecutionContext(
+            context, selectionHint);
+        return true;
+    }
+
+    if (m_debugControlActive.load(std::memory_order_acquire) &&
+        m_debugPauseRequested.load(std::memory_order_acquire))
+    {
+        return false;
+    }
+
+    m_guestExecutionWaiters.fetch_add(
+        1u, std::memory_order_acq_rel);
+    const bool acquired =
+        m_guestExecutionMutex.try_lock_for(timeout);
+    m_guestExecutionWaiters.fetch_sub(
+        1u, std::memory_order_acq_rel);
+    if (!acquired)
+    {
+        return false;
+    }
+
+    // Close the same debugger-pause race as the blocking acquisition path.
+    // The caller owns no guest state until after this check.
+    if (m_debugControlActive.load(std::memory_order_acquire) &&
+        m_debugPauseRequested.load(std::memory_order_acquire))
+    {
+        m_guestExecutionMutex.unlock();
+        return false;
+    }
+
+    g_guestExecutionDepths[this] = 1u;
+    recordOuterGuestExecutionAcquisition(context);
+    markGuestExecutionAcquired();
+    flushDeferredLegacyEeWakeNotifications();
+    previousContext = m_boundEeContext;
+    previousThreadId = m_boundEeThreadId;
+    switchGuestExecutionContext(
+        context, selectionHint);
+    return true;
+}
+
+void PS2Runtime::lockGuestExecutionMutex(bool mayContend)
+{
+    if (!m_eeThreadDiagnosticsEnabled)
+    {
+        m_guestExecutionMutex.lock();
+        return;
+    }
+
+    m_eeThreadDiagnosticGuestLockRequests.fetch_add(
+        1u, std::memory_order_relaxed);
+    if (mayContend && !m_guestExecutionMutex.try_lock())
+    {
+        m_eeThreadDiagnosticGuestLockContentions.fetch_add(
+            1u, std::memory_order_relaxed);
+        m_guestExecutionMutex.lock();
+    }
+    else if (!mayContend)
+    {
+        m_guestExecutionMutex.lock();
+    }
+    m_eeThreadDiagnosticGuestLockAcquisitions.fetch_add(
+        1u, std::memory_order_relaxed);
+}
+
+void PS2Runtime::recordOuterGuestExecutionAcquisition(
+    R5900Context *context) noexcept
+{
+    if (!m_eeThreadDiagnosticsEnabled)
+    {
+        return;
+    }
+
+    m_eeThreadDiagnosticOuterGuestExecutionAcquisitions.fetch_add(
+        1u, std::memory_order_relaxed);
+    if (m_eeThreadDiagnosticsHasLastOuterContext &&
+        m_eeThreadDiagnosticsLastOuterContext != context)
+    {
+        m_eeThreadDiagnosticGuestContextChanges.fetch_add(
+            1u, std::memory_order_relaxed);
+    }
+    m_eeThreadDiagnosticsLastOuterContext = context;
+    m_eeThreadDiagnosticsHasLastOuterContext = true;
 }
 
 void PS2Runtime::leaveGuestExecution(
     R5900Context *context,
-    R5900Context *previousContext)
+    R5900Context *previousContext,
+    int previousThreadId)
 {
     auto it = g_guestExecutionDepths.find(this);
     if (it == g_guestExecutionDepths.end() || it->second == 0u)
@@ -6494,14 +8110,18 @@ void PS2Runtime::leaveGuestExecution(
         return;
     }
 
-    restoreGuestExecutionContext(context, previousContext);
+    restoreGuestExecutionContext(
+        context,
+        previousContext,
+        previousThreadId);
 
-    // A completed DMA may not interrupt the guest from inside the instruction
-    // or library call that started it. Deliver queued completions only when the
-    // outermost recompiled invocation has returned, so guest code can publish
-    // its post-submit state before its DMAC handler observes it.
-    if (it->second == 1u)
+    // The legacy host-thread backend drains published alarm/device work after
+    // the outermost recompiled invocation returns. The dedicated executor
+    // drains the same work from applyNextConsequence instead because a
+    // suspended fiber can retain this scope across scheduler boundaries.
+    if (it->second == 1u && !m_eeRuntimeExecutor)
     {
+        drainPendingAlarmCallbacks();
         drainPendingVSyncHandlers(
             m_memory.getRDRAM());
         drainPendingEeCounterHandlers(
@@ -6516,8 +8136,19 @@ void PS2Runtime::leaveGuestExecution(
         }
     }
 
+    if (it->second == 1u &&
+        !m_eeRuntimeExecutor &&
+        (isStopRequested() ||
+         (context && context->pc == 0u)))
+    {
+        flushDeferredLegacyEeWakeNotifications();
+    }
+
     --it->second;
-    m_guestExecutionMutex.unlock();
+    if (!m_eeRuntimeExecutor)
+    {
+        m_guestExecutionMutex.unlock();
+    }
     if (it->second == 0u)
     {
         g_guestExecutionDepths.erase(it);
@@ -6525,23 +8156,37 @@ void PS2Runtime::leaveGuestExecution(
 }
 
 uint32_t PS2Runtime::releaseGuestExecution(
-    R5900Context *&context)
+    R5900Context *&context,
+    int &threadId)
 {
     context = nullptr;
+    threadId = 1;
     auto it = g_guestExecutionDepths.find(this);
     if (it == g_guestExecutionDepths.end() || it->second == 0u)
     {
         return 0u;
     }
 
+    if (!m_eeRuntimeExecutor)
+    {
+        flushDeferredLegacyEeWakeNotifications();
+    }
+
     context = m_boundEeContext;
+    threadId = m_boundEeThreadId;
     (void)finishEeContextBlock(m_boundEeContext);
     m_boundEeContext = nullptr;
+    m_boundEeThreadId = 1;
+    m_eeThreadRuntimeState->currentThreadId.store(
+        1, std::memory_order_release);
 
     const uint32_t depth = it->second;
-    for (uint32_t i = 0; i < depth; ++i)
+    if (!m_eeRuntimeExecutor)
     {
-        m_guestExecutionMutex.unlock();
+        for (uint32_t i = 0; i < depth; ++i)
+        {
+            m_guestExecutionMutex.unlock();
+        }
     }
     g_guestExecutionDepths.erase(it);
     return depth;
@@ -6549,7 +8194,8 @@ uint32_t PS2Runtime::releaseGuestExecution(
 
 void PS2Runtime::reacquireGuestExecution(
     uint32_t depth,
-    R5900Context *context)
+    R5900Context *context,
+    int threadId)
 {
     if (depth == 0u)
     {
@@ -6557,33 +8203,105 @@ void PS2Runtime::reacquireGuestExecution(
     }
 
     uint32_t &heldDepth = g_guestExecutionDepths[this];
+    if (m_eeRuntimeExecutor)
+    {
+        if (!m_eeRuntimeExecutor->ownsCurrentThread() ||
+            heldDepth != 0u)
+        {
+            throw std::logic_error(
+                "dedicated EE logical ownership could "
+                "not be restored");
+        }
+        heldDepth = depth;
+        switchGuestExecutionContext(
+            context, threadId);
+        return;
+    }
+
     uint32_t remaining = depth;
 
     if (heldDepth == 0u)
     {
-        (void)enterGuestExecution(context);
+        (void)enterGuestExecution(
+            context, nullptr, threadId);
         heldDepth = g_guestExecutionDepths[this];
         --remaining;
     }
     else
     {
-        switchGuestExecutionContext(context);
+        switchGuestExecutionContext(
+            context, threadId);
     }
 
     for (uint32_t i = 0; i < remaining; ++i)
     {
-        m_guestExecutionMutex.lock();
+        lockGuestExecutionMutex(false);
         ++heldDepth;
     }
 }
 
 void PS2Runtime::markGuestExecutionAcquired()
 {
+    if (m_eeThreadDiagnosticsEnabled)
+    {
+        m_eeThreadDiagnosticHandoffNotifications.fetch_add(
+            1u, std::memory_order_relaxed);
+    }
     {
         std::lock_guard<std::mutex> lock(m_guestExecutionHandoffMutex);
         m_guestExecutionHandoffEpoch.fetch_add(1u, std::memory_order_acq_rel);
     }
     m_guestExecutionHandoffCv.notify_all();
+}
+
+bool PS2Runtime::shouldDeferLegacyEeWakeNotification()
+    const noexcept
+{
+    if (m_eeRuntimeExecutor)
+    {
+        return false;
+    }
+    const auto it = g_guestExecutionDepths.find(
+        const_cast<PS2Runtime *>(this));
+    return it != g_guestExecutionDepths.end() &&
+           it->second != 0u;
+}
+
+void PS2Runtime::deferLegacyEeWakeNotification(
+    const std::shared_ptr<ThreadInfo> &thread)
+{
+    if (!thread || m_eeRuntimeExecutor)
+    {
+        return;
+    }
+    std::lock_guard<std::mutex> lock(
+        m_legacyDeferredEeWakeMutex);
+    m_legacyDeferredEeWakeNotifications.emplace_back(
+        thread);
+}
+
+void PS2Runtime::flushDeferredLegacyEeWakeNotifications()
+{
+    if (m_eeRuntimeExecutor)
+    {
+        return;
+    }
+
+    std::vector<std::weak_ptr<ThreadInfo>> pending;
+    {
+        std::lock_guard<std::mutex> lock(
+            m_legacyDeferredEeWakeMutex);
+        pending.swap(
+            m_legacyDeferredEeWakeNotifications);
+    }
+    for (const std::weak_ptr<ThreadInfo> &entry : pending)
+    {
+        if (const std::shared_ptr<ThreadInfo> thread =
+                entry.lock())
+        {
+            thread->cv.notify_one();
+        }
+    }
 }
 
 void PS2Runtime::waitForGuestExecutionHandoff()
@@ -6593,9 +8311,41 @@ void PS2Runtime::waitForGuestExecutionHandoff()
 
 void PS2Runtime::waitForGuestExecutionHandoff(uint64_t baselineEpoch)
 {
+    if (m_eeRuntimeExecutor)
+    {
+        static_cast<void>(baselineEpoch);
+        if (g_eeExecutorConsequenceContext.runtime ==
+            this)
+        {
+            // Callback code is already running between continuations on the
+            // executor stack. Any scheduler publication it made will be
+            // consumed by this same boundary; there is no guest fiber to
+            // suspend here.
+            return;
+        }
+        yieldEeExecutorCurrent(
+            isStopRequested()
+                ? ps2x::ee::EeSchedulerExitReason::
+                      StopRequested
+                : ps2x::ee::EeSchedulerExitReason::
+                      Preempted);
+        return;
+    }
+
+    if (m_eeThreadDiagnosticsEnabled)
+    {
+        m_eeThreadDiagnosticHandoffWaitRequests.fetch_add(
+            1u, std::memory_order_relaxed);
+    }
+
     // Lock-free fast path
     if (m_guestExecutionWaiters.load(std::memory_order_acquire) == 0u)
     {
+        if (m_eeThreadDiagnosticsEnabled)
+        {
+            m_eeThreadDiagnosticHandoffWaitFastPaths.fetch_add(
+                1u, std::memory_order_relaxed);
+        }
         return;
     }
 
@@ -6603,9 +8353,19 @@ void PS2Runtime::waitForGuestExecutionHandoff(uint64_t baselineEpoch)
 
     if (m_guestExecutionWaiters.load(std::memory_order_acquire) == 0u)
     {
+        if (m_eeThreadDiagnosticsEnabled)
+        {
+            m_eeThreadDiagnosticHandoffWaitFastPaths.fetch_add(
+                1u, std::memory_order_relaxed);
+        }
         return;
     }
 
+    if (m_eeThreadDiagnosticsEnabled)
+    {
+        m_eeThreadDiagnosticHandoffCvWaits.fetch_add(
+            1u, std::memory_order_relaxed);
+    }
     const bool handedOff = m_guestExecutionHandoffCv.wait_for(
         lock,
         std::chrono::milliseconds(2),
@@ -6619,6 +8379,16 @@ void PS2Runtime::waitForGuestExecutionHandoff(uint64_t baselineEpoch)
     if (!handedOff)
     {
         m_guestExecutionHandoffTimeouts.fetch_add(1u, std::memory_order_relaxed);
+        if (m_eeThreadDiagnosticsEnabled)
+        {
+            m_eeThreadDiagnosticHandoffTimeouts.fetch_add(
+                1u, std::memory_order_relaxed);
+        }
+    }
+    else if (m_eeThreadDiagnosticsEnabled)
+    {
+        m_eeThreadDiagnosticHandoffCompletions.fetch_add(
+            1u, std::memory_order_relaxed);
     }
 }
 
@@ -6958,16 +8728,30 @@ void PS2Runtime::debugBlockGuestAtBoundary(R5900Context *ctx, const char *reason
     // before the debugger thread is allowed to inspect the paused runtime.
     debugPublishVuBackendDiagnostics();
 
+    if (m_eeRuntimeExecutor)
+    {
+        m_eeRuntimeExecutor->debugRequestPause();
+        yieldEeExecutorCurrent(
+            ps2x::ee::EeSchedulerExitReason::
+                Preempted);
+        return;
+    }
+
     // executeGuestStep() is called while this host thread owns the recursive
     // guest-execution mutex. Release all levels so debugger snapshots can be
     // proven quiescent while the guest remains stopped.
     R5900Context *releasedContext = nullptr;
+    int releasedThreadId = 1;
     const uint32_t depth =
-        releaseGuestExecution(releasedContext);
+        releaseGuestExecution(
+            releasedContext, releasedThreadId);
     debugWaitUntilResumed();
     if (depth != 0u)
     {
-        reacquireGuestExecution(depth, releasedContext);
+        reacquireGuestExecution(
+            depth,
+            releasedContext,
+            releasedThreadId);
     }
 }
 
@@ -7103,7 +8887,40 @@ bool PS2Runtime::debugPause(std::chrono::milliseconds timeout)
     m_debugControlCv.notify_all();
     m_audioBackend.setDebuggerPaused(true);
 
-    const bool locked = m_guestExecutionMutex.try_lock_for(timeout);
+    if (m_eeRuntimeExecutor &&
+        m_eeRuntimeExecutor->running() &&
+        !m_eeRuntimeExecutor->ownsCurrentThread())
+    {
+        requestGuestPreemption();
+        m_eeRuntimeExecutor->debugRequestPause();
+        const bool paused =
+            m_eeRuntimeExecutor->debugWaitUntilPaused(
+                timeout);
+        if (paused)
+        {
+            debugPublishVuBackendDiagnostics();
+            return true;
+        }
+
+        if (newlyRequested)
+        {
+            {
+                std::lock_guard<std::mutex> lock(
+                    m_debugControlMutex);
+                m_debugPauseRequested.store(
+                    false,
+                    std::memory_order_release);
+                debugRefreshControlActiveLocked();
+            }
+            m_eeRuntimeExecutor->debugResume();
+            m_debugControlCv.notify_all();
+            m_audioBackend.setDebuggerPaused(false);
+        }
+        return false;
+    }
+
+    const bool locked =
+        m_guestExecutionMutex.try_lock_for(timeout);
     if (locked)
     {
         debugPublishVuBackendDiagnostics();
@@ -7140,6 +8957,10 @@ void PS2Runtime::debugResume()
         debugRefreshControlActiveLocked();
     }
     m_debugControlCv.notify_all();
+    if (m_eeRuntimeExecutor)
+    {
+        m_eeRuntimeExecutor->debugResume();
+    }
     m_audioBackend.setDebuggerPaused(false);
 }
 
@@ -7164,6 +8985,65 @@ bool PS2Runtime::debugSetVuBackend(
     {
         return fail(
             "VU backend changes require paused guest execution");
+    }
+
+    if (m_eeRuntimeExecutor &&
+        m_eeRuntimeExecutor->running() &&
+        !m_eeRuntimeExecutor->ownsCurrentThread())
+    {
+        bool changed = false;
+        const bool invoked =
+            invokeEeExecutorTaskAtBoundary(
+                [this, unit, backend, diagnostic, &changed]()
+                {
+                    if (!debugIsPaused())
+                    {
+                        return;
+                    }
+
+                    VuUnit *target = nullptr;
+                    switch (unit)
+                    {
+                    case VuUnitId::Vu0:
+                        target = &m_vu0;
+                        break;
+                    case VuUnitId::Vu1:
+                        target = &m_vu1;
+                        break;
+                    }
+                    if (!target)
+                    {
+                        if (diagnostic)
+                        {
+                            *diagnostic =
+                                "unknown VU unit";
+                        }
+                        return;
+                    }
+                    changed =
+                        target->setBackend(
+                            backend, diagnostic);
+                    if (changed)
+                    {
+                        debugPublishVuBackendDiagnostics();
+                        if (diagnostic)
+                        {
+                            diagnostic->clear();
+                        }
+                    }
+                });
+        if (!invoked)
+        {
+            return fail(
+                "VU backend change could not reach "
+                "the EE executor boundary");
+        }
+        if (!debugIsPaused())
+        {
+            return fail(
+                "guest execution resumed before the VU backend change");
+        }
+        return changed;
     }
 
     std::unique_lock<std::recursive_timed_mutex> lock(
@@ -7229,6 +9109,10 @@ PS2Runtime::DebugStopInfo PS2Runtime::debugRunUntilPc(
         m_debugPauseRequested.store(false, std::memory_order_release);
         debugRefreshControlActiveLocked();
     }
+    if (m_eeRuntimeExecutor)
+    {
+        m_eeRuntimeExecutor->debugResume();
+    }
     m_debugControlCv.notify_all();
     m_audioBackend.setDebuggerPaused(false);
 
@@ -7241,7 +9125,22 @@ PS2Runtime::DebugStopInfo PS2Runtime::debugRunUntilPc(
         {
             if (m_debugStopSequence > baseline)
             {
-                return m_debugLastStop;
+                const DebugStopInfo stop =
+                    m_debugLastStop;
+                lock.unlock();
+                if (m_eeRuntimeExecutor &&
+                    !m_eeRuntimeExecutor
+                         ->debugWaitUntilPaused(
+                             timeout))
+                {
+                    return {
+                        false,
+                        "pause-timeout",
+                        stop.pc,
+                        stop.sequence,
+                    };
+                }
+                return stop;
             }
             return {false, "stopped", m_debugPc.load(std::memory_order_relaxed),
                     m_debugStopSequence};
@@ -7277,6 +9176,10 @@ PS2Runtime::DebugStopInfo PS2Runtime::debugStepDispatches(
         m_debugPauseRequested.store(false, std::memory_order_release);
         debugRefreshControlActiveLocked();
     }
+    if (m_eeRuntimeExecutor)
+    {
+        m_eeRuntimeExecutor->debugResume();
+    }
     m_debugControlCv.notify_all();
     m_audioBackend.setDebuggerPaused(false);
 
@@ -7289,7 +9192,22 @@ PS2Runtime::DebugStopInfo PS2Runtime::debugStepDispatches(
         {
             if (m_debugStopSequence > baseline)
             {
-                return m_debugLastStop;
+                const DebugStopInfo stop =
+                    m_debugLastStop;
+                lock.unlock();
+                if (m_eeRuntimeExecutor &&
+                    !m_eeRuntimeExecutor
+                         ->debugWaitUntilPaused(
+                             timeout))
+                {
+                    return {
+                        false,
+                        "pause-timeout",
+                        stop.pc,
+                        stop.sequence,
+                    };
+                }
+                return stop;
             }
             return {false, "stopped", m_debugPc.load(std::memory_order_relaxed),
                     m_debugStopSequence};
@@ -7305,100 +9223,162 @@ PS2Runtime::DebugStopInfo PS2Runtime::debugStepDispatches(
 
 R5900Context PS2Runtime::debugCpuSnapshot()
 {
-    std::lock_guard<std::recursive_timed_mutex> lock(m_guestExecutionMutex);
-    R5900Context *const context =
-        m_boundEeContext
-            ? m_boundEeContext
-            : &m_cpuContext;
-    synchronizeCop0Timing(
-        context,
-        ps2x::timing::eeTickToCyclesFloor(
-            currentEeTick()));
-    return m_cpuContext;
+    R5900Context result{};
+    const auto capture =
+        [this, &result]()
+        {
+            R5900Context *const context =
+                m_boundEeContext
+                    ? m_boundEeContext
+                    : &m_cpuContext;
+            synchronizeCop0Timing(
+                context,
+                ps2x::timing::eeTickToCyclesFloor(
+                    currentEeTick()));
+            result = m_cpuContext;
+        };
+    if (invokeEeExecutorTaskAtBoundary(capture))
+    {
+        return result;
+    }
+
+    std::lock_guard<std::recursive_timed_mutex> lock(
+        m_guestExecutionMutex);
+    capture();
+    return result;
 }
 
 PS2Runtime::DebugEeTiming PS2Runtime::debugEeTimingSnapshot()
 {
+    DebugEeTiming result{};
+    const auto capture =
+        [this, &result]()
+        {
+            const R5900Context *const context =
+                m_boundEeContext
+                    ? m_boundEeContext
+                    : &m_cpuContext;
+            result.currentTick =
+                currentEeTick().raw();
+            result.currentCycle =
+                ps2x::timing::eeTickToCyclesFloor(
+                    currentEeTick());
+            result.localBlockTicks =
+                context->ee_block_cycle_ticks;
+            result.localBlockActive =
+                context->ee_block_cycle_active;
+            result.contextBound =
+                m_boundEeContext != nullptr;
+        };
+    if (invokeEeExecutorTaskAtBoundary(capture))
+    {
+        return result;
+    }
+
     std::lock_guard<std::recursive_timed_mutex> lock(
         m_guestExecutionMutex);
-    const R5900Context *const context =
-        m_boundEeContext ? m_boundEeContext : &m_cpuContext;
-    const uint64_t currentTick = currentEeTick().raw();
-
-    DebugEeTiming result{};
-    result.currentTick = currentTick;
-    result.currentCycle =
-        ps2x::timing::eeTickToCyclesFloor(
-            currentEeTick());
-    result.localBlockTicks = context->ee_block_cycle_ticks;
-    result.localBlockActive = context->ee_block_cycle_active;
-    result.contextBound = m_boundEeContext != nullptr;
+    capture();
     return result;
 }
 
 PS2Runtime::DebugEeScheduler
 PS2Runtime::debugEeSchedulerSnapshot()
 {
+    DebugEeScheduler result{};
+    const auto capture =
+        [this, &result]()
+        {
+            result.currentTick = currentEeTick().raw();
+            const auto next =
+                m_eeEventScheduler.nextDeadline();
+            if (next.has_value())
+            {
+                result.hasNextDeadline = true;
+                result.nextDeadlineTick = next->raw();
+            }
+            result.statistics =
+                m_eeEventScheduler.statistics();
+
+            for (size_t index = 0u;
+                 index < result.slots.size(); ++index)
+            {
+                DebugEeEventSlot &target =
+                    result.slots[index];
+                target.source =
+                    static_cast<
+                        ps2x::timing::EeEventSource>(
+                        index);
+                target.device =
+                    debugEeEventDeviceState(
+                        target.source);
+                const auto source =
+                    m_eeEventScheduler.event(
+                        target.source);
+                if (!source.has_value())
+                {
+                    continue;
+                }
+                target.pending = true;
+                target.deadlineTick =
+                    source->deadline.raw();
+                target.generation =
+                    source->token.generation;
+                target.sequence = source->sequence;
+            }
+        };
+    if (invokeEeExecutorTaskAtBoundary(capture))
+    {
+        return result;
+    }
+
     std::lock_guard<std::recursive_timed_mutex> lock(
         m_guestExecutionMutex);
-    DebugEeScheduler result{};
-    result.currentTick = currentEeTick().raw();
-    const auto next = m_eeEventScheduler.nextDeadline();
-    if (next.has_value())
-    {
-        result.hasNextDeadline = true;
-        result.nextDeadlineTick = next->raw();
-    }
-    result.statistics = m_eeEventScheduler.statistics();
-
-    for (size_t index = 0u;
-         index < result.slots.size(); ++index)
-    {
-        DebugEeEventSlot &target = result.slots[index];
-        target.source =
-            static_cast<ps2x::timing::EeEventSource>(index);
-        target.device =
-            debugEeEventDeviceState(target.source);
-        const auto source = m_eeEventScheduler.event(
-            target.source);
-        if (!source.has_value())
-        {
-            continue;
-        }
-        target.pending = true;
-        target.deadlineTick = source->deadline.raw();
-        target.generation = source->token.generation;
-        target.sequence = source->sequence;
-    }
+    capture();
     return result;
 }
 
 PS2Runtime::DebugVu1Timing
 PS2Runtime::debugVu1TimingSnapshot()
 {
+    DebugVu1Timing result{};
+    const auto capture =
+        [this, &result]()
+        {
+            result.currentTick =
+                currentEeTick().raw();
+            result.generation =
+                m_vu1ExecutionTiming.generation;
+            result.lastAdvancedTick =
+                m_vu1ExecutionTiming
+                    .lastAdvancedTick.raw();
+            result.totalAdvancedCycles =
+                m_vu1ExecutionTiming
+                    .totalAdvancedCycles;
+            result.pc = m_vu1.state().pc;
+            result.active = m_vu1.isActive();
+            result.vifWaitingForVu =
+                m_memory.vif1WaitingForVu();
+            const auto event =
+                m_eeEventScheduler.event(
+                    ps2x::timing::EeEventSource::
+                        VifVu1Finish);
+            if (event.has_value())
+            {
+                result.eventPending = true;
+                result.eventGeneration =
+                    event->token.generation;
+                result.eventDeadlineTick =
+                    event->deadline.raw();
+            }
+        };
+    if (invokeEeExecutorTaskAtBoundary(capture))
+    {
+        return result;
+    }
+
     std::lock_guard<std::recursive_timed_mutex> lock(
         m_guestExecutionMutex);
-    DebugVu1Timing result{};
-    result.currentTick = currentEeTick().raw();
-    result.generation = m_vu1ExecutionTiming.generation;
-    result.lastAdvancedTick =
-        m_vu1ExecutionTiming.lastAdvancedTick.raw();
-    result.totalAdvancedCycles =
-        m_vu1ExecutionTiming.totalAdvancedCycles;
-    result.pc = m_vu1.state().pc;
-    result.active = m_vu1.isActive();
-    result.vifWaitingForVu =
-        m_memory.vif1WaitingForVu();
-    const auto event = m_eeEventScheduler.event(
-        ps2x::timing::EeEventSource::VifVu1Finish);
-    if (event.has_value())
-    {
-        result.eventPending = true;
-        result.eventGeneration =
-            event->token.generation;
-        result.eventDeadlineTick =
-            event->deadline.raw();
-    }
+    capture();
     return result;
 }
 
@@ -7423,9 +9403,21 @@ bool PS2Runtime::debugReadRdram(uint32_t address,
         return false;
     }
 
-    std::lock_guard<std::recursive_timed_mutex> lock(m_guestExecutionMutex);
-    output.assign(m_memory.getRDRAM() + offset,
-                  m_memory.getRDRAM() + offset + size);
+    const auto capture =
+        [this, offset, size, &output]()
+        {
+            output.assign(
+                m_memory.getRDRAM() + offset,
+                m_memory.getRDRAM() + offset + size);
+        };
+    if (invokeEeExecutorTaskAtBoundary(capture))
+    {
+        return true;
+    }
+
+    std::lock_guard<std::recursive_timed_mutex> lock(
+        m_guestExecutionMutex);
+    capture();
     return true;
 }
 
@@ -7453,20 +9445,115 @@ bool PS2Runtime::debugReadMemory(uint32_t address,
         return false;
     }
 
-    std::lock_guard<std::recursive_timed_mutex> lock(m_guestExecutionMutex);
-    output.assign(base + offset, base + offset + size);
+    const auto capture =
+        [base, offset, size, &output]()
+        {
+            output.assign(
+                base + offset,
+                base + offset + size);
+        };
+    if (invokeEeExecutorTaskAtBoundary(capture))
+    {
+        return true;
+    }
+
+    std::lock_guard<std::recursive_timed_mutex> lock(
+        m_guestExecutionMutex);
+    capture();
     return true;
 }
 
 bool PS2Runtime::debugCopyGsVram(std::vector<uint8_t> &output)
 {
-    std::lock_guard<std::recursive_timed_mutex> lock(m_guestExecutionMutex);
-    if (!m_boundGSVram)
+    bool copied = false;
+    const auto capture =
+        [this, &output, &copied]()
+        {
+            if (!m_boundGSVram)
+            {
+                return;
+            }
+            output.assign(
+                m_boundGSVram,
+                m_boundGSVram +
+                    PS2_GS_VRAM_SIZE);
+            copied = true;
+        };
+    if (invokeEeExecutorTaskAtBoundary(capture))
     {
-        return false;
+        return copied;
     }
-    output.assign(m_boundGSVram, m_boundGSVram + PS2_GS_VRAM_SIZE);
-    return true;
+
+    std::lock_guard<std::recursive_timed_mutex> lock(
+        m_guestExecutionMutex);
+    capture();
+    return copied;
+}
+
+void PS2Runtime::recordEeThreadQueueRotation(
+    int threadId,
+    int requestedPriority,
+    int effectivePriority,
+    bool accepted) noexcept
+{
+    if (!m_eeThreadDiagnosticsEnabled)
+    {
+        return;
+    }
+
+    m_eeThreadDiagnosticRotationRequests.fetch_add(
+        1u, std::memory_order_relaxed);
+    if (requestedPriority == 0)
+    {
+        m_eeThreadDiagnosticPriorityZeroRotationRequests.fetch_add(
+            1u, std::memory_order_relaxed);
+    }
+    if (!accepted)
+    {
+        m_eeThreadDiagnosticRejectedRotationRequests.fetch_add(
+            1u, std::memory_order_relaxed);
+        return;
+    }
+
+    m_eeThreadDiagnosticAcceptedRotationRequests.fetch_add(
+        1u, std::memory_order_relaxed);
+    if (effectivePriority >= 0 &&
+        static_cast<size_t>(effectivePriority) <
+            m_eeThreadDiagnosticAcceptedRotationsByPriority.size())
+    {
+        m_eeThreadDiagnosticAcceptedRotationsByPriority[
+            static_cast<size_t>(effectivePriority)]
+            .fetch_add(1u, std::memory_order_relaxed);
+    }
+    if (threadId >= 0 &&
+        static_cast<size_t>(threadId) <
+            m_eeThreadDiagnosticAcceptedRotationsByThread.size())
+    {
+        m_eeThreadDiagnosticAcceptedRotationsByThread[
+            static_cast<size_t>(threadId)]
+            .fetch_add(1u, std::memory_order_relaxed);
+    }
+    else
+    {
+        m_eeThreadDiagnosticUntrackedThreadRotationRequests.fetch_add(
+            1u, std::memory_order_relaxed);
+    }
+}
+
+void PS2Runtime::recordMpegPictureServed(bool repeated) noexcept
+{
+    m_debugMpegPicturesServed.fetch_add(
+        1u, std::memory_order_relaxed);
+    if (repeated)
+    {
+        m_debugMpegRepeatedPicturesServed.fetch_add(
+            1u, std::memory_order_relaxed);
+    }
+    else
+    {
+        m_debugMpegUniquePicturesServed.fetch_add(
+            1u, std::memory_order_relaxed);
+    }
 }
 
 PS2Runtime::DebugRuntimeProgress PS2Runtime::debugRuntimeProgress() const
@@ -7475,6 +9562,14 @@ PS2Runtime::DebugRuntimeProgress PS2Runtime::debugRuntimeProgress() const
     progress.dispatches = m_debugDispatches.load(std::memory_order_relaxed);
     progress.eeInstructions =
         m_debugEeInstructions.load(std::memory_order_relaxed);
+    progress.vsyncFields =
+        m_debugVSyncFields.load(std::memory_order_relaxed);
+    progress.mpegPicturesServed =
+        m_debugMpegPicturesServed.load(std::memory_order_relaxed);
+    progress.mpegUniquePicturesServed =
+        m_debugMpegUniquePicturesServed.load(std::memory_order_relaxed);
+    progress.mpegRepeatedPicturesServed =
+        m_debugMpegRepeatedPicturesServed.load(std::memory_order_relaxed);
     progress.pc = m_debugPc.load(std::memory_order_relaxed);
     progress.ra = m_debugRa.load(std::memory_order_relaxed);
     progress.sp = m_debugSp.load(std::memory_order_relaxed);
@@ -7484,6 +9579,99 @@ PS2Runtime::DebugRuntimeProgress PS2Runtime::debugRuntimeProgress() const
     progress.guestExecutionHandoffTimeouts =
         m_guestExecutionHandoffTimeouts.load(std::memory_order_relaxed);
     return progress;
+}
+
+PS2Runtime::DebugEeThreadDiagnostics
+PS2Runtime::debugEeThreadDiagnosticsSnapshot() const
+{
+    DebugEeThreadDiagnostics result{};
+    result.enabled = m_eeThreadDiagnosticsEnabled;
+    result.guestLockRequests =
+        m_eeThreadDiagnosticGuestLockRequests.load(
+            std::memory_order_relaxed);
+    result.guestLockAcquisitions =
+        m_eeThreadDiagnosticGuestLockAcquisitions.load(
+            std::memory_order_relaxed);
+    result.guestLockContentions =
+        m_eeThreadDiagnosticGuestLockContentions.load(
+            std::memory_order_relaxed);
+    result.outerGuestExecutionAcquisitions =
+        m_eeThreadDiagnosticOuterGuestExecutionAcquisitions.load(
+            std::memory_order_relaxed);
+    result.guestContextChanges =
+        m_eeThreadDiagnosticGuestContextChanges.load(
+            std::memory_order_relaxed);
+    result.handoffNotifications =
+        m_eeThreadDiagnosticHandoffNotifications.load(
+            std::memory_order_relaxed);
+    result.handoffWaitRequests =
+        m_eeThreadDiagnosticHandoffWaitRequests.load(
+            std::memory_order_relaxed);
+    result.handoffWaitFastPaths =
+        m_eeThreadDiagnosticHandoffWaitFastPaths.load(
+            std::memory_order_relaxed);
+    result.handoffCvWaits =
+        m_eeThreadDiagnosticHandoffCvWaits.load(
+            std::memory_order_relaxed);
+    result.handoffCompletions =
+        m_eeThreadDiagnosticHandoffCompletions.load(
+            std::memory_order_relaxed);
+    result.handoffTimeouts =
+        m_eeThreadDiagnosticHandoffTimeouts.load(
+            std::memory_order_relaxed);
+    result.yieldRequests =
+        m_eeThreadDiagnosticYieldRequests.load(
+            std::memory_order_relaxed);
+    result.deferredYields =
+        m_eeThreadDiagnosticDeferredYields.load(
+            std::memory_order_relaxed);
+    result.hostThreadYields =
+        m_eeThreadDiagnosticHostThreadYields.load(
+            std::memory_order_relaxed);
+    result.requestedGuestSwitches =
+        m_eeThreadDiagnosticRequestedGuestSwitches.load(
+            std::memory_order_relaxed);
+    result.guestSwitchCvWaits =
+        m_eeThreadDiagnosticGuestSwitchCvWaits.load(
+            std::memory_order_relaxed);
+    result.completedGuestSwitches =
+        m_eeThreadDiagnosticCompletedGuestSwitches.load(
+            std::memory_order_relaxed);
+    result.guestSwitchTimeouts =
+        m_eeThreadDiagnosticGuestSwitchTimeouts.load(
+            std::memory_order_relaxed);
+    result.rotationRequests =
+        m_eeThreadDiagnosticRotationRequests.load(
+            std::memory_order_relaxed);
+    result.acceptedRotationRequests =
+        m_eeThreadDiagnosticAcceptedRotationRequests.load(
+            std::memory_order_relaxed);
+    result.rejectedRotationRequests =
+        m_eeThreadDiagnosticRejectedRotationRequests.load(
+            std::memory_order_relaxed);
+    result.priorityZeroRotationRequests =
+        m_eeThreadDiagnosticPriorityZeroRotationRequests.load(
+            std::memory_order_relaxed);
+    result.untrackedThreadRotationRequests =
+        m_eeThreadDiagnosticUntrackedThreadRotationRequests.load(
+            std::memory_order_relaxed);
+    for (size_t priority = 0u;
+         priority < result.acceptedRotationsByPriority.size();
+         ++priority)
+    {
+        result.acceptedRotationsByPriority[priority] =
+            m_eeThreadDiagnosticAcceptedRotationsByPriority[priority]
+                .load(std::memory_order_relaxed);
+    }
+    for (size_t thread = 0u;
+         thread < result.acceptedRotationsByThread.size();
+         ++thread)
+    {
+        result.acceptedRotationsByThread[thread] =
+            m_eeThreadDiagnosticAcceptedRotationsByThread[thread]
+                .load(std::memory_order_relaxed);
+    }
+    return result;
 }
 
 void PS2Runtime::debugRecordBranch(uint32_t pc)
@@ -8066,27 +10254,171 @@ PS2Runtime::DeferredGuestYieldScope::~DeferredGuestYieldScope()
     }
 }
 
+void PS2Runtime::yieldGuestExecutionAtBoundary()
+{
+    if (m_eeRuntimeExecutor)
+    {
+        if (g_deferredGuestYieldDepth != 0u)
+        {
+            g_deferredGuestYieldPending = true;
+            return;
+        }
+        yieldEeExecutorCurrent(
+            isStopRequested()
+                ? ps2x::ee::EeSchedulerExitReason::
+                      StopRequested
+                : ps2x::ee::EeSchedulerExitReason::
+                      Preempted);
+        return;
+    }
+
+    auto depthIt = g_guestExecutionDepths.find(this);
+    if (g_deferredGuestYieldDepth != 0u ||
+        depthIt == g_guestExecutionDepths.end() ||
+        depthIt->second == 0u ||
+        m_guestExecutionWaiters.load(
+            std::memory_order_acquire) != 0u)
+    {
+        yieldGuestExecutionAfterWake();
+        return;
+    }
+
+    // Raw operations can publish READY immediately before this ordinary
+    // boundary, while their legacy host worker has not yet reached the guest
+    // mutex. Give that worker the same bounded acquisition window as a wake
+    // handoff. If no worker appears, the boundary had no alternate runnable
+    // guest and must not be classified as a failed switch.
+    if (m_eeThreadDiagnosticsEnabled)
+    {
+        m_eeThreadDiagnosticYieldRequests.fetch_add(
+            1u, std::memory_order_relaxed);
+    }
+
+    const uint64_t handoffEpoch =
+        m_guestExecutionHandoffEpoch.load(
+            std::memory_order_acquire);
+    bool handedOff = false;
+    {
+        GuestExecutionReleaseScope releaseGuestExecution(this);
+        std::unique_lock<std::mutex> lock(
+            m_guestExecutionHandoffMutex);
+        if (m_eeThreadDiagnosticsEnabled)
+        {
+            m_eeThreadDiagnosticGuestSwitchCvWaits.fetch_add(
+                1u, std::memory_order_relaxed);
+        }
+        handedOff = m_guestExecutionHandoffCv.wait_for(
+            lock,
+            std::chrono::milliseconds(2),
+            [&]()
+            {
+                return m_guestExecutionHandoffEpoch.load(
+                           std::memory_order_acquire) !=
+                       handoffEpoch;
+            });
+    }
+
+    if (m_eeThreadDiagnosticsEnabled)
+    {
+        if (handedOff)
+        {
+            m_eeThreadDiagnosticRequestedGuestSwitches.fetch_add(
+                1u, std::memory_order_relaxed);
+            m_eeThreadDiagnosticCompletedGuestSwitches.fetch_add(
+                1u, std::memory_order_relaxed);
+        }
+        else if (m_guestExecutionWaiters.load(
+                     std::memory_order_acquire) != 0u)
+        {
+            m_eeThreadDiagnosticRequestedGuestSwitches.fetch_add(
+                1u, std::memory_order_relaxed);
+            m_eeThreadDiagnosticGuestSwitchTimeouts.fetch_add(
+                1u, std::memory_order_relaxed);
+        }
+    }
+}
+
 void PS2Runtime::yieldGuestExecutionAfterWake()
 {
+    if (m_eeThreadDiagnosticsEnabled)
+    {
+        m_eeThreadDiagnosticYieldRequests.fetch_add(
+            1u, std::memory_order_relaxed);
+    }
+
     if (g_deferredGuestYieldDepth != 0u)
     {
+        if (m_eeThreadDiagnosticsEnabled)
+        {
+            m_eeThreadDiagnosticDeferredYields.fetch_add(
+                1u, std::memory_order_relaxed);
+        }
         g_deferredGuestYieldPending = true;
+        return;
+    }
+
+    if (m_eeRuntimeExecutor)
+    {
+        if (g_eeExecutorConsequenceContext.runtime ==
+            this)
+        {
+            return;
+        }
+        yieldEeExecutorCurrent(
+            isStopRequested()
+                ? ps2x::ee::EeSchedulerExitReason::
+                      StopRequested
+                : ps2x::ee::EeSchedulerExitReason::
+                      Preempted);
         return;
     }
 
     auto it = g_guestExecutionDepths.find(this);
     if (it == g_guestExecutionDepths.end() || it->second == 0u)
     {
+        if (m_eeThreadDiagnosticsEnabled)
+        {
+            m_eeThreadDiagnosticHostThreadYields.fetch_add(
+                1u, std::memory_order_relaxed);
+        }
         std::this_thread::yield();
         return;
     }
 
+    if (m_eeThreadDiagnosticsEnabled)
+    {
+        m_eeThreadDiagnosticRequestedGuestSwitches.fetch_add(
+            1u, std::memory_order_relaxed);
+    }
     const uint64_t handoffEpoch = m_guestExecutionHandoffEpoch.load(std::memory_order_acquire);
+    bool handedOff = false;
     {
         GuestExecutionReleaseScope releaseGuestExecution(this);
         std::unique_lock<std::mutex> lock(m_guestExecutionHandoffMutex);
-        m_guestExecutionHandoffCv.wait_for(lock, std::chrono::milliseconds(2), [&]()
-                                           { return m_guestExecutionHandoffEpoch.load(std::memory_order_acquire) != handoffEpoch; });
+        if (m_eeThreadDiagnosticsEnabled)
+        {
+            m_eeThreadDiagnosticGuestSwitchCvWaits.fetch_add(
+                1u, std::memory_order_relaxed);
+        }
+        handedOff = m_guestExecutionHandoffCv.wait_for(
+            lock, std::chrono::milliseconds(2), [&]()
+            {
+                return m_guestExecutionHandoffEpoch.load(
+                           std::memory_order_acquire) != handoffEpoch;
+            });
+    }
+    if (m_eeThreadDiagnosticsEnabled)
+    {
+        if (handedOff)
+        {
+            m_eeThreadDiagnosticCompletedGuestSwitches.fetch_add(
+                1u, std::memory_order_relaxed);
+        }
+        else
+        {
+            m_eeThreadDiagnosticGuestSwitchTimeouts.fetch_add(
+                1u, std::memory_order_relaxed);
+        }
     }
 }
 
@@ -8094,37 +10426,98 @@ void PS2Runtime::requestGuestPreemption()
 {
     m_guestExecutionPreemptionRequested.store(
         true, std::memory_order_release);
-    m_guestExecutionPreemptionEpoch.fetch_add(
-        1u, std::memory_order_release);
+    if (m_eeRuntimeExecutor)
+    {
+        // External alarm/device publishers may be the only runnable source
+        // while every guest fiber is waiting. The preemption flag makes the
+        // work visible; this notification releases the executor's idle wait.
+        m_eeRuntimeExecutor->notify();
+    }
 }
 
-bool PS2Runtime::shouldPreemptGuestExecution()
+PS2GuestCheckpointResult
+PS2Runtime::checkpointGuestExecution(
+    R5900Context *ctx)
 {
-    if (m_guestExecutionPreemptionRequested.exchange(
-            false, std::memory_order_acq_rel))
-    {
-        return true;
-    }
+    static_cast<void>(ctx);
+    const bool explicitlyRequested =
+        m_guestExecutionPreemptionRequested.exchange(
+            false, std::memory_order_acq_rel);
 
     thread_local uint32_t s_backEdgeYieldCounter = 0u;
-    const uint32_t waiterCount = m_guestExecutionWaiters.load(std::memory_order_acquire);
-    const uint32_t yieldInterval = (waiterCount != 0u) ? 64u : 100u;
-    if (++s_backEdgeYieldCounter < yieldInterval)
+    const uint32_t waiterCount =
+        m_guestExecutionWaiters.load(
+            std::memory_order_acquire);
+    const uint32_t yieldInterval =
+        waiterCount != 0u ? 64u : 100u;
+    const bool periodicCheckpoint =
+        !explicitlyRequested &&
+        ++s_backEdgeYieldCounter >= yieldInterval;
+    if (!explicitlyRequested &&
+        !periodicCheckpoint)
     {
-        return false;
+        return PS2GuestCheckpointResult::Continue;
     }
 
-    s_backEdgeYieldCounter = 0u;
-    if (waiterCount != 0u)
+    if (periodicCheckpoint)
     {
-        // Returning to the dispatcher is not itself a fair handoff: the current
-        // host thread can release and immediately reacquire the recursive mutex,
-        // indefinitely starving a guest thread that is already queued. Transfer
-        // ownership here before asking generated code to return to its dispatcher.
+        s_backEdgeYieldCounter = 0u;
+    }
+
+    if (g_deferredGuestYieldDepth != 0u)
+    {
+        // Interrupt and callback adapters may temporarily require one
+        // uninterrupted guest-safe region. Materialize the resume PC by
+        // returning from generated code, then let the outermost defer scope
+        // hand control to the scheduler after that region closes.
+        g_deferredGuestYieldPending = true;
+        m_guestExecutionDispatcherExitEpoch.fetch_add(
+            1u, std::memory_order_release);
+        return PS2GuestCheckpointResult::
+            ExitToDispatcher;
+    }
+
+    if (g_eeExecutorConsequenceContext.runtime ==
+        this)
+    {
+        // Inline interrupt/callback generated code runs on the executor
+        // stack, not inside a resumable guest fiber. Materialize its resume
+        // PC for the bounded callback dispatcher instead of attempting a
+        // fiber-to-executor switch with no running continuation.
+        m_guestExecutionDispatcherExitEpoch.fetch_add(
+            1u, std::memory_order_release);
+        return PS2GuestCheckpointResult::
+            ExitToDispatcher;
+    }
+
+    if (m_eeExecutionBackend &&
+        m_eeExecutionBackend->checkpointMode() ==
+            EeExecutionCheckpointMode::
+                SuspendContinuation)
+    {
+        yieldEeExecutorCurrent(
+            isStopRequested()
+                ? ps2x::ee::EeSchedulerExitReason::
+                      StopRequested
+                : ps2x::ee::EeSchedulerExitReason::
+                      Preempted);
+        return PS2GuestCheckpointResult::Continue;
+    }
+
+    if (periodicCheckpoint &&
+        waiterCount != 0u)
+    {
+        // Returning to the dispatcher is not itself a fair handoff: the
+        // current host thread can release and immediately reacquire the
+        // recursive mutex, indefinitely starving a guest thread which is
+        // already queued. Transfer ownership before asking generated code to
+        // return to its dispatcher.
         yieldGuestExecutionAfterWake();
     }
-    m_guestExecutionPreemptionEpoch.fetch_add(1u, std::memory_order_release);
-    return true;
+    m_guestExecutionDispatcherExitEpoch.fetch_add(
+        1u, std::memory_order_release);
+    return PS2GuestCheckpointResult::
+        ExitToDispatcher;
 }
 
 uint8_t PS2Runtime::Load8(uint8_t *rdram, R5900Context *ctx, uint32_t vaddr)
@@ -8354,7 +10747,11 @@ void PS2Runtime::requestStop()
     }
     m_debugControlCv.notify_all();
     m_audioBackend.setDebuggerPaused(false);
-    ps2_syscalls::notifyRuntimeStop();
+    if (m_eeRuntimeExecutor)
+    {
+        m_eeRuntimeExecutor->requestStop();
+    }
+    ps2_syscalls::notifyRuntimeStop(this);
 }
 
 bool PS2Runtime::isStopRequested() const
@@ -8371,12 +10768,21 @@ bool PS2Runtime::isStopRequested() const
 void PS2Runtime::run()
 {
     m_stopRequested.store(false, std::memory_order_relaxed);
-    ps2_stubs::resetSifState();
+    ps2_syscalls::resetFileIoState(this);
+    ps2_syscalls::resetDeci2State(this);
+    ps2_stubs::resetCdState(this);
+    ps2_stubs::resetDmaState(this);
+    ps2_stubs::resetLibCState(this);
+    ps2_stubs::resetMemoryCardState(this);
+    ps2_stubs::resetPadState(this);
+    ps2_stubs::resetSifState(this);
     resetIop();
-    ps2_stubs::resetAudioStubState();
-    ps2_stubs::resetGsSyncVCallbackState();
-    ps2_stubs::resetMpegStubState();
-    ps2_syscalls::initializeGuestKernelState(m_memory.getRDRAM());
+    ps2_stubs::resetAudioStubState(this);
+    ps2_stubs::resetGsSyncVCallbackState(this);
+    ps2_stubs::resetMpegStubState(this);
+    m_hostPresentationUploadState->reset();
+    ps2_syscalls::initializeGuestKernelState(
+        m_memory.getRDRAM(), this);
     m_cpuContext.r[4] = _mm_setzero_si128();
     m_cpuContext.r[5] = _mm_setzero_si128();
     m_cpuContext.r[29] = _mm_set_epi64x(0, static_cast<int64_t>(PS2_RAM_SIZE - 0x10u));
@@ -8397,45 +10803,101 @@ void PS2Runtime::run()
         m_gs.setDebugHistoryPaused(false);
     }
 
-    RUNTIME_LOG("Starting execution at address 0x" << std::hex << m_cpuContext.pc << std::dec);
+    std::clog
+        << "[ee-execution] "
+        << eeExecutionBackendDiagnostics(
+               m_eeExecutionBackend->kind())
+        << std::endl;
+    RUNTIME_LOG(
+        "Starting execution at address 0x"
+        << std::hex << m_cpuContext.pc << std::dec
+        << " with EE backend "
+        << eeExecutionBackendName());
 
     // A blank image to use as a framebuffer
     Image blank = GenImageColor(FB_WIDTH, FB_HEIGHT, BLANK);
     Texture2D frameTex = LoadTextureFromImage(blank);
     UnloadImage(blank);
 
-    g_activeThreads.store(1, std::memory_order_relaxed);
-    std::atomic<bool> gameThreadFinished{false};
+    const bool dedicatedExecutor =
+        usesDedicatedEeExecutor();
+    m_eeThreadRuntimeState->activeHostThreads.store(
+        dedicatedExecutor ? 0 : 1,
+        std::memory_order_relaxed);
 
     // Arm emulated VSync before the first guest instruction so event mode has
     // a deterministic phase independent of host thread startup.
     ps2_syscalls::EnsureVSyncScheduled(
         m_memory.getRDRAM(), this);
 
-    std::thread gameThread([&]()
-                           {
-        ThreadNaming::SetCurrentThreadName("GameThread");
-        try
-        {
-            dispatchLoop(m_memory.getRDRAM(), &m_cpuContext);
-            uint32_t pc = m_debugPc.load(std::memory_order_relaxed);
-            RUNTIME_LOG("Game thread returned. PC=0x" << std::hex << pc
-                      << " RA=0x" << static_cast<uint32_t>(_mm_extract_epi32(m_cpuContext.r[31], 0)) << std::dec << std::endl);
-        }
-        catch (const std::exception &e)
-        {
-            std::cerr << "Error during program execution: " << e.what() << std::endl;
-        }
-        catch (...)
-        {
-            std::cerr << "Error during program execution: unknown exception" << std::endl;
-        }
-        g_activeThreads.fetch_sub(1, std::memory_order_relaxed);
-        gameThreadFinished.store(true, std::memory_order_release); });
+    if (dedicatedExecutor)
+    {
+        startDedicatedEeExecution();
+    }
+    else
+    {
+        m_eeExecutionBackend->create(
+            1,
+            [this]()
+            {
+                ThreadNaming::SetCurrentThreadName(
+                    "GameThread");
+                try
+                {
+                    dispatchLoop(
+                        m_memory.getRDRAM(),
+                        &m_cpuContext);
+                    const uint32_t pc =
+                        m_debugPc.load(
+                            std::memory_order_relaxed);
+                    RUNTIME_LOG(
+                        "Game thread returned. PC=0x"
+                        << std::hex << pc
+                        << " RA=0x"
+                        << static_cast<uint32_t>(
+                               _mm_extract_epi32(
+                                   m_cpuContext.r[31],
+                                   0))
+                        << std::dec << std::endl);
+                }
+                catch (const std::exception &e)
+                {
+                    std::cerr
+                        << "Error during program "
+                           "execution: "
+                        << e.what() << std::endl;
+                }
+                catch (...)
+                {
+                    std::cerr
+                        << "Error during program "
+                           "execution: unknown exception"
+                        << std::endl;
+                }
+                m_eeThreadRuntimeState
+                    ->activeHostThreads.fetch_sub(
+                        1,
+                        std::memory_order_relaxed);
+            });
+    }
 
     uint64_t tick = 0;
-    while (!isStopRequested() && g_activeThreads.load(std::memory_order_relaxed) > 0)
+    while (
+        !isStopRequested() &&
+        (dedicatedExecutor
+             ? m_eeRuntimeExecutor->running()
+             : m_eeThreadRuntimeState
+                       ->activeHostThreads.load(
+                           std::memory_order_relaxed) >
+                   0))
     {
+        if (dedicatedExecutor &&
+            m_eeExecutionBackend
+                    ->managedThreadCount() == 0u)
+        {
+            requestStop();
+            break;
+        }
         PS2_IF_AGRESSIVE_LOGS({
             tick++;
             if ((tick % 120) == 0)
@@ -8449,7 +10911,7 @@ void PS2Runtime::run()
                 const uint32_t dbgRa = m_debugRa.load(std::memory_order_relaxed);
                 const uint32_t dbgSp = m_debugSp.load(std::memory_order_relaxed);
                 const uint32_t dbgGp = m_debugGp.load(std::memory_order_relaxed);
-                const int activeThreads = g_activeThreads.load(std::memory_order_relaxed);
+                const int activeThreads = m_eeThreadRuntimeState->activeHostThreads.load(std::memory_order_relaxed);
 
                 RUNTIME_LOG("[run:tick] tick=" << tick
                                                << " pc=0x" << std::hex << dbgPc
@@ -8469,7 +10931,12 @@ void PS2Runtime::run()
         });
         uint32_t presentWidth = FB_WIDTH;
         uint32_t presentHeight = DEFAULT_DISPLAY_HEIGHT;
-        UploadFrame(frameTex, this, presentWidth, presentHeight);
+        UploadFrame(
+            frameTex,
+            this,
+            *m_hostPresentationUploadState,
+            presentWidth,
+            presentHeight);
 
         BeginDrawing();
         ClearBackground(BLACK);
@@ -8502,54 +10969,98 @@ void PS2Runtime::run()
     }
 
     requestStop();
-
-    const auto joinDeadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
-    while (!gameThreadFinished.load(std::memory_order_acquire) &&
-           std::chrono::steady_clock::now() < joinDeadline)
+    if (dedicatedExecutor)
     {
-        std::this_thread::sleep_for(std::chrono::milliseconds(1));
-    }
-
-    if (gameThread.joinable())
-    {
-        if (gameThreadFinished.load(std::memory_order_acquire))
+        try
         {
-            gameThread.join();
+            joinDedicatedEeExecution();
         }
-        else
+        catch (const std::exception &error)
         {
-            std::cerr << "[run] game thread did not stop within timeout; detaching" << std::endl;
-            gameThread.detach();
+            std::cerr
+                << "[run] EE executor failure: "
+                << error.what() << std::endl;
         }
-    }
-
-    const auto workerDeadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(1000);
-    while (g_activeThreads.load(std::memory_order_relaxed) > 0 &&
-           std::chrono::steady_clock::now() < workerDeadline)
-    {
-        std::this_thread::sleep_for(std::chrono::milliseconds(1));
-    }
-
-    if (g_activeThreads.load(std::memory_order_relaxed) > 0)
-    {
-        requestStop();
-        const auto finalWorkerDeadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(1000);
-        while (g_activeThreads.load(std::memory_order_relaxed) > 0 &&
-               std::chrono::steady_clock::now() < finalWorkerDeadline)
-        {
-            std::this_thread::sleep_for(std::chrono::milliseconds(1));
-        }
-    }
-
-    if (g_activeThreads.load(std::memory_order_relaxed) == 0)
-    {
-        ps2_syscalls::joinAllGuestHostThreads();
     }
     else
     {
-        std::cerr << "[run] guest host threads did not stop within timeout; detaching remaining worker threads"
-                  << std::endl;
-        ps2_syscalls::detachAllGuestHostThreads();
+        const auto joinDeadline =
+            std::chrono::steady_clock::now() +
+            std::chrono::seconds(2);
+        while (!m_eeExecutionBackend->isFinished(1) &&
+               std::chrono::steady_clock::now() <
+                   joinDeadline)
+        {
+            std::this_thread::sleep_for(
+                std::chrono::milliseconds(1));
+        }
+
+        if (m_eeExecutionBackend->isFinished(1))
+        {
+            m_eeExecutionBackend->destroy(1);
+        }
+        else
+        {
+            std::cerr
+                << "[run] game thread did not stop within "
+                   "timeout; detaching"
+                << std::endl;
+            m_eeExecutionBackend->detach(1);
+        }
+
+        const auto workerDeadline =
+            std::chrono::steady_clock::now() +
+            std::chrono::milliseconds(1000);
+        while (
+            m_eeThreadRuntimeState
+                    ->activeHostThreads.load(
+                        std::memory_order_relaxed) >
+                0 &&
+            std::chrono::steady_clock::now() <
+                workerDeadline)
+        {
+            std::this_thread::sleep_for(
+                std::chrono::milliseconds(1));
+        }
+
+        if (m_eeThreadRuntimeState
+                ->activeHostThreads.load(
+                    std::memory_order_relaxed) > 0)
+        {
+            requestStop();
+            const auto finalWorkerDeadline =
+                std::chrono::steady_clock::now() +
+                std::chrono::milliseconds(1000);
+            while (
+                m_eeThreadRuntimeState
+                        ->activeHostThreads.load(
+                            std::memory_order_relaxed) >
+                    0 &&
+                std::chrono::steady_clock::now() <
+                    finalWorkerDeadline)
+            {
+                std::this_thread::sleep_for(
+                    std::chrono::milliseconds(1));
+            }
+        }
+
+        if (m_eeThreadRuntimeState
+                ->activeHostThreads.load(
+                    std::memory_order_relaxed) == 0)
+        {
+            ps2_syscalls::joinAllGuestHostThreads(
+                this);
+        }
+        else
+        {
+            std::cerr
+                << "[run] guest host threads did not stop "
+                   "within timeout; detaching remaining "
+                   "worker threads"
+                << std::endl;
+            ps2_syscalls::detachAllGuestHostThreads(
+                this);
+        }
     }
 
     if (m_debugUiInitialized && m_debugUiShutdownCallback)
@@ -8641,7 +11152,7 @@ void PS2Runtime::run()
     UnloadTexture(frameTex);
     CloseWindow();
 
-    const int remainingThreads = g_activeThreads.load(std::memory_order_relaxed);
+    const int remainingThreads = m_eeThreadRuntimeState->activeHostThreads.load(std::memory_order_relaxed);
     RUNTIME_LOG("[run] exiting loop, activeThreads=" << remainingThreads);
     if (remainingThreads > 0)
     {

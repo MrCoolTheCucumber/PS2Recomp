@@ -1,39 +1,11 @@
 #include <algorithm>
 #include <cctype>
 
+#include "CdRuntimeState.h"
+#include "DmaRuntimeState.h"
+
 namespace
 {
-    constexpr uint32_t kCdSectorSize = 2048;
-    constexpr uint32_t kCdPseudoLbnStart = 0x00100000;
-
-    struct CdFileEntry
-    {
-        std::filesystem::path hostPath;
-        uint32_t sizeBytes = 0;
-        uint32_t baseLbn = 0;
-        uint32_t sectors = 0;
-    };
-
-    std::unordered_map<std::string, CdFileEntry> g_cdFilesByKey;
-    std::unordered_map<std::string, std::filesystem::path> g_cdLeafIndex;
-    std::unordered_map<std::string, std::filesystem::path> g_cdLoosePathIndex;
-    std::filesystem::path g_cdLeafIndexRoot;
-    bool g_cdLeafIndexBuilt = false;
-    uint32_t g_nextPseudoLbn = kCdPseudoLbnStart;
-    std::filesystem::path g_cdImageSizePath;
-    uint64_t g_cdImageSizeBytes = 0;
-    bool g_cdImageSizeValid = false;
-    int32_t g_lastCdError = 0;
-    uint32_t g_cdMode = 0;
-    uint32_t g_cdStreamingLbn = 0;
-    uint32_t g_cdStreamingEndLbn = 0xFFFFFFFFu;
-    bool g_cdInitialized = false;
-
-    constexpr uint32_t kIopHeapBase = 0x01A00000;
-    constexpr uint32_t kIopHeapLimit = 0x01F00000;
-    constexpr uint32_t kIopHeapAlign = 64;
-    uint32_t g_iopHeapNext = kIopHeapBase;
-
     std::string toLowerAscii(std::string value)
     {
         std::transform(value.begin(), value.end(), value.begin(),
@@ -164,9 +136,15 @@ namespace
         return cdLoosePathKeyFromRelative(std::filesystem::path(normalizeCdPathNoPrefix(ps2Path)));
     }
 
-    std::filesystem::path getCdRootPath()
+    std::filesystem::path getCdRootPath(
+        PS2Runtime *runtime)
     {
-        const PS2Runtime::IoPaths &paths = PS2Runtime::getIoPaths();
+        if (!runtime)
+        {
+            return {};
+        }
+        const PS2Runtime::IoPaths paths =
+            runtime->ioPaths();
         if (!paths.cdRoot.empty())
         {
             return paths.cdRoot;
@@ -181,38 +159,55 @@ namespace
         return ec ? std::filesystem::path(".") : cwd.lexically_normal();
     }
 
-    std::filesystem::path getCdImagePath()
+    std::filesystem::path getCdImagePath(
+        PS2Runtime *runtime)
     {
-        return PS2Runtime::getIoPaths().cdImage;
+        return runtime
+                   ? runtime->ioPaths().cdImage
+                   : std::filesystem::path{};
     }
 
-    bool tryGetCdImageTotalSectors(uint64_t &totalSectorsOut)
+    bool tryGetCdImageTotalSectors(
+        ps2_stubs::CdRuntimeState &state,
+        PS2Runtime *runtime,
+        uint64_t &totalSectorsOut)
     {
-        const std::filesystem::path imagePath = getCdImagePath();
+        const std::filesystem::path imagePath =
+            getCdImagePath(runtime);
         if (imagePath.empty())
         {
             return false;
         }
 
-        if (!g_cdImageSizeValid || g_cdImageSizePath != imagePath)
+        if (!state.imageSizeValid ||
+            state.imageSizePath != imagePath)
         {
             std::error_code ec;
-            g_cdImageSizeBytes = static_cast<uint64_t>(std::filesystem::file_size(imagePath, ec));
-            g_cdImageSizePath = imagePath;
-            g_cdImageSizeValid = !ec;
+            state.imageSizeBytes =
+                static_cast<uint64_t>(
+                    std::filesystem::file_size(
+                        imagePath, ec));
+            state.imageSizePath = imagePath;
+            state.imageSizeValid = !ec;
         }
-        if (!g_cdImageSizeValid)
+        if (!state.imageSizeValid)
         {
             return false;
         }
 
-        totalSectorsOut = g_cdImageSizeBytes / static_cast<uint64_t>(kCdSectorSize);
+        totalSectorsOut =
+            state.imageSizeBytes /
+            static_cast<uint64_t>(
+                ps2_stubs::kCdSectorSize);
         return true;
     }
 
     uint32_t sectorsForBytes(uint64_t byteCount)
     {
-        const uint64_t sectors = (byteCount + (kCdSectorSize - 1)) / kCdSectorSize;
+        const uint64_t sectors =
+            (byteCount +
+             (ps2_stubs::kCdSectorSize - 1u)) /
+            ps2_stubs::kCdSectorSize;
         return sectors > 0 ? static_cast<uint32_t>(sectors) : 1;
     }
 
@@ -221,10 +216,13 @@ namespace
         return toLowerAscii(normalizeCdPathNoPrefix(ps2Path));
     }
 
-    std::filesystem::path cdHostPath(const std::string &ps2Path)
+    std::filesystem::path cdHostPath(
+        PS2Runtime *runtime,
+        const std::string &ps2Path)
     {
         const std::string normalized = normalizeCdPathNoPrefix(ps2Path);
-        std::filesystem::path resolved = getCdRootPath();
+        std::filesystem::path resolved =
+            getCdRootPath(runtime);
         if (!normalized.empty())
         {
             resolved /= std::filesystem::path(normalized);
@@ -281,17 +279,20 @@ namespace
         return false;
     }
 
-    void ensureCdLeafIndex(const std::filesystem::path &root)
+    void ensureCdLeafIndex(
+        ps2_stubs::CdRuntimeState &state,
+        const std::filesystem::path &root)
     {
-        if (g_cdLeafIndexBuilt && g_cdLeafIndexRoot == root)
+        if (state.leafIndexBuilt &&
+            state.leafIndexRoot == root)
         {
             return;
         }
 
-        g_cdLeafIndex.clear();
-        g_cdLoosePathIndex.clear();
-        g_cdLeafIndexRoot = root;
-        g_cdLeafIndexBuilt = true;
+        state.leafIndex.clear();
+        state.loosePathIndex.clear();
+        state.leafIndexRoot = root;
+        state.leafIndexBuilt = true;
 
         std::error_code ec;
         if (!std::filesystem::exists(root, ec) || ec)
@@ -312,7 +313,8 @@ namespace
             }
 
             const std::string leaf = toLowerAscii(entry.path().filename().string());
-            g_cdLeafIndex.emplace(leaf, entry.path());
+            state.leafIndex.emplace(
+                leaf, entry.path());
 
             std::error_code relEc;
             const std::filesystem::path relative = std::filesystem::relative(entry.path(), root, relEc);
@@ -321,31 +323,38 @@ namespace
                 const std::string looseKey = cdLoosePathKeyFromRelative(relative);
                 if (!looseKey.empty())
                 {
-                    g_cdLoosePathIndex.emplace(looseKey, entry.path());
+                    state.loosePathIndex.emplace(
+                        looseKey, entry.path());
                 }
             }
         }
     }
 
-    bool registerCdFile(const std::string &ps2Path, CdFileEntry &entryOut)
+    bool registerCdFile(
+        ps2_stubs::CdRuntimeState &state,
+        PS2Runtime *runtime,
+        const std::string &ps2Path,
+        ps2_stubs::CdFileEntry &entryOut)
     {
         const std::string key = cdPathKey(ps2Path);
         if (key.empty())
         {
-            g_lastCdError = -1;
+            state.lastError = -1;
             return false;
         }
 
-        auto existing = g_cdFilesByKey.find(key);
-        if (existing != g_cdFilesByKey.end())
+        auto existing = state.filesByKey.find(key);
+        if (existing != state.filesByKey.end())
         {
             entryOut = existing->second;
-            g_lastCdError = 0;
+            state.lastError = 0;
             return true;
         }
 
-        const std::filesystem::path root = getCdRootPath();
-        std::filesystem::path path = cdHostPath(ps2Path);
+        const std::filesystem::path root =
+            getCdRootPath(runtime);
+        std::filesystem::path path =
+            cdHostPath(runtime, ps2Path);
         std::error_code ec;
         if (!std::filesystem::exists(path, ec) || ec || !std::filesystem::is_regular_file(path, ec))
         {
@@ -358,10 +367,10 @@ namespace
             }
             else
             {
-                ensureCdLeafIndex(root);
+                ensureCdLeafIndex(state, root);
                 const std::string leaf = toLowerAscii(relative.filename().string());
-                auto it = g_cdLeafIndex.find(leaf);
-                if (it != g_cdLeafIndex.end())
+                auto it = state.leafIndex.find(leaf);
+                if (it != state.leafIndex.end())
                 {
                     path = it->second;
                     ec.clear();
@@ -369,15 +378,18 @@ namespace
                 else
                 {
                     const std::string looseKey = cdLoosePathKey(ps2Path);
-                    auto looseIt = g_cdLoosePathIndex.find(looseKey);
-                    if (looseIt != g_cdLoosePathIndex.end())
+                    auto looseIt =
+                        state.loosePathIndex.find(
+                            looseKey);
+                    if (looseIt !=
+                        state.loosePathIndex.end())
                     {
                         path = looseIt->second;
                         ec.clear();
                     }
                     else
                     {
-                        g_lastCdError = -1;
+                        state.lastError = -1;
                         return false;
                     }
                 }
@@ -387,33 +399,38 @@ namespace
         const uint64_t sizeBytes = std::filesystem::file_size(path, ec);
         if (ec)
         {
-            g_lastCdError = -1;
+            state.lastError = -1;
             return false;
         }
 
-        CdFileEntry entry;
+        ps2_stubs::CdFileEntry entry;
         entry.hostPath = path;
         entry.sizeBytes = static_cast<uint32_t>(std::min<uint64_t>(sizeBytes, 0xFFFFFFFFu));
-        entry.baseLbn = g_nextPseudoLbn;
+        entry.baseLbn = state.nextPseudoLbn;
         entry.sectors = sectorsForBytes(sizeBytes);
 
-        g_nextPseudoLbn += entry.sectors + 1;
-        g_cdFilesByKey.emplace(key, entry);
+        state.nextPseudoLbn += entry.sectors + 1u;
+        state.filesByKey.emplace(key, entry);
         entryOut = entry;
-        g_lastCdError = 0;
+        state.lastError = 0;
         return true;
     }
 
-    bool readHostRange(const std::filesystem::path &path, uint64_t offsetBytes, uint8_t *dst, size_t byteCount)
+    bool readHostRange(
+        ps2_stubs::CdRuntimeState &state,
+        const std::filesystem::path &path,
+        uint64_t offsetBytes,
+        uint8_t *dst,
+        size_t byteCount)
     {
         if (!dst)
         {
-            g_lastCdError = -1;
+            state.lastError = -1;
             return false;
         }
         if (byteCount == 0)
         {
-            g_lastCdError = 0;
+            state.lastError = 0;
             return true;
         }
 
@@ -421,25 +438,32 @@ namespace
         std::ifstream file(path, std::ios::binary);
         if (!file.is_open())
         {
-            g_lastCdError = -1;
+            state.lastError = -1;
             return false;
         }
 
         file.seekg(static_cast<std::streamoff>(offsetBytes), std::ios::beg);
         if (!file.good())
         {
-            g_lastCdError = -1;
+            state.lastError = -1;
             return false;
         }
 
         file.read(reinterpret_cast<char *>(dst), static_cast<std::streamsize>(byteCount));
-        g_lastCdError = 0;
+        state.lastError = 0;
         return true;
     }
 
-    bool readCdSectors(uint32_t lbn, uint32_t sectors, uint8_t *dst, size_t byteCount)
+    bool readCdSectors(
+        ps2_stubs::CdRuntimeState &state,
+        PS2Runtime *runtime,
+        uint32_t lbn,
+        uint32_t sectors,
+        uint8_t *dst,
+        size_t byteCount)
     {
-        for (const auto &[key, entry] : g_cdFilesByKey)
+        for (const auto &[key, entry] :
+             state.filesByKey)
         {
             const uint32_t endLbn = entry.baseLbn + entry.sectors;
             if (lbn < entry.baseLbn || lbn >= endLbn)
@@ -448,39 +472,61 @@ namespace
             }
 
             const uint64_t relativeLbn = static_cast<uint64_t>(lbn - entry.baseLbn);
-            const uint64_t offset = relativeLbn * kCdSectorSize;
-            return readHostRange(entry.hostPath, offset, dst, byteCount);
+            const uint64_t offset =
+                relativeLbn *
+                ps2_stubs::kCdSectorSize;
+            return readHostRange(
+                state,
+                entry.hostPath,
+                offset,
+                dst,
+                byteCount);
         }
 
-        const std::filesystem::path cdImage = getCdImagePath();
+        const std::filesystem::path cdImage =
+            getCdImagePath(runtime);
         if (!cdImage.empty())
         {
             uint64_t totalSectors = 0;
-            if (tryGetCdImageTotalSectors(totalSectors))
+            if (tryGetCdImageTotalSectors(
+                    state,
+                    runtime,
+                    totalSectors))
             {
                 const uint64_t start = static_cast<uint64_t>(lbn);
                 const uint64_t end = start + static_cast<uint64_t>(sectors);
                 if (start >= totalSectors || end > totalSectors)
                 {
-                    g_lastCdError = -1;
+                    state.lastError = -1;
                     return false;
                 }
             }
 
-            const uint64_t offset = static_cast<uint64_t>(lbn) * kCdSectorSize;
-            return readHostRange(cdImage, offset, dst, byteCount);
+            const uint64_t offset =
+                static_cast<uint64_t>(lbn) *
+                ps2_stubs::kCdSectorSize;
+            return readHostRange(
+                state,
+                cdImage,
+                offset,
+                dst,
+                byteCount);
         }
 
         std::cerr << "sceCdRead unresolved LBN 0x" << std::hex << lbn
                   << " sectors=" << std::dec << sectors
                   << " (no mapped file and no configured CD image)" << std::endl;
-        g_lastCdError = -1;
+        state.lastError = -1;
         return false;
     }
 
-    bool isResolvableCdLbn(uint32_t lbn)
+    bool isResolvableCdLbn(
+        ps2_stubs::CdRuntimeState &state,
+        PS2Runtime *runtime,
+        uint32_t lbn)
     {
-        for (const auto &[key, entry] : g_cdFilesByKey)
+        for (const auto &[key, entry] :
+             state.filesByKey)
         {
             const uint32_t endLbn = entry.baseLbn + entry.sectors;
             if (lbn >= entry.baseLbn && lbn < endLbn)
@@ -490,7 +536,10 @@ namespace
         }
 
         uint64_t totalSectors = 0;
-        if (tryGetCdImageTotalSectors(totalSectors))
+        if (tryGetCdImageTotalSectors(
+                state,
+                runtime,
+                totalSectors))
         {
             return static_cast<uint64_t>(lbn) < totalSectors;
         }
@@ -498,9 +547,13 @@ namespace
         return false;
     }
 
-    bool findRegisteredCdFileForLbn(uint32_t lbn, CdFileEntry &entryOut)
+    bool findRegisteredCdFileForLbn(
+        ps2_stubs::CdRuntimeState &state,
+        uint32_t lbn,
+        ps2_stubs::CdFileEntry &entryOut)
     {
-        for (const auto &[key, entry] : g_cdFilesByKey)
+        for (const auto &[key, entry] :
+             state.filesByKey)
         {
             const uint32_t endLbn = entry.baseLbn + entry.sectors;
             if (lbn >= entry.baseLbn && lbn < endLbn)
@@ -512,17 +565,24 @@ namespace
         return false;
     }
 
-    uint32_t cdStreamingEndLbnForStart(uint32_t lbn)
+    uint32_t cdStreamingEndLbnForStart(
+        ps2_stubs::CdRuntimeState &state,
+        uint32_t lbn)
     {
-        CdFileEntry entry{};
-        if (findRegisteredCdFileForLbn(lbn, entry))
+        ps2_stubs::CdFileEntry entry{};
+        if (findRegisteredCdFileForLbn(
+                state, lbn, entry))
         {
             return entry.baseLbn + entry.sectors;
         }
         return 0xFFFFFFFFu;
     }
 
-    bool writeCdSearchResult(uint8_t *rdram, uint32_t fileAddr, const std::string &ps2Path, const CdFileEntry &entry)
+    bool writeCdSearchResult(
+        uint8_t *rdram,
+        uint32_t fileAddr,
+        const std::string &ps2Path,
+        const ps2_stubs::CdFileEntry &entry)
     {
         // sceCdlFILE layout: u32 lsn, u32 size, char name[16], u8 date[8]
         uint8_t *fileStruct = getMemPtr(rdram, fileAddr);
@@ -555,30 +615,6 @@ namespace
         return static_cast<uint32_t>(((value >> 4) & 0x0F) * 10 + (value & 0x0F));
     }
 
-    std::unordered_map<uint32_t, FILE *> g_file_map;
-    uint32_t g_next_file_handle = 1; // Start file handles > 0 (0 is NULL)
-    std::mutex g_file_mutex;
-
-    uint32_t generate_file_handle()
-    {
-        uint32_t handle = 0;
-        do
-        {
-            handle = g_next_file_handle++;
-            if (g_next_file_handle == 0)
-                g_next_file_handle = 1;
-        } while (handle == 0 || g_file_map.count(handle));
-        return handle;
-    }
-
-    FILE *get_file_ptr(uint32_t handle)
-    {
-        if (handle == 0)
-            return nullptr;
-        std::lock_guard<std::mutex> lock(g_file_mutex);
-        auto it = g_file_map.find(handle);
-        return (it != g_file_map.end()) ? it->second : nullptr;
-    }
 }
 
 namespace
@@ -1232,9 +1268,6 @@ namespace
     constexpr std::array<uint32_t, 10> kDmaChannelBases = {
         0x10008000u, 0x10009000u, 0x1000A000u, 0x1000B000u, 0x1000B400u,
         0x1000C000u, 0x1000C400u, 0x1000C800u, 0x1000D000u, 0x1000D400u};
-    std::mutex g_dmaStubMutex;
-    std::unordered_map<uint32_t, uint32_t> g_dmaPendingPolls;
-    uint32_t g_dmaStubLogCount = 0;
     constexpr uint32_t kMaxDmaStubLogs = 64;
 
     bool isKnownDmaChannelBase(uint32_t value)
@@ -1382,10 +1415,13 @@ namespace
         mem.writeIORegister(channelBase + 0x00u, chcr);
         mem.processPendingTransfers();
 
+        ps2_stubs::DmaRuntimeState &state =
+            runtime->dmaRuntimeState();
         {
-            std::lock_guard<std::mutex> lock(g_dmaStubMutex);
-            g_dmaPendingPolls[channelBase] = 1;
-            if (g_dmaStubLogCount < kMaxDmaStubLogs)
+            std::lock_guard<std::mutex> lock(
+                state.stubMutex);
+            state.pendingPolls[channelBase] = 1u;
+            if (state.stubLogCount < kMaxDmaStubLogs)
             {
                 RUNTIME_LOG("[sceDmaSend] ch=0x" << std::hex << channelBase
                           << " madr=0x" << madr
@@ -1413,7 +1449,7 @@ namespace
                                   << std::dec << std::endl);
                     }
                 }
-                ++g_dmaStubLogCount;
+                ++state.stubLogCount;
             }
         }
 
@@ -1436,10 +1472,15 @@ namespace
         }
 
         bool modelBusy = false;
+        ps2_stubs::DmaRuntimeState &state =
+            runtime->dmaRuntimeState();
         {
-            std::lock_guard<std::mutex> lock(g_dmaStubMutex);
-            auto it = g_dmaPendingPolls.find(channelBase);
-            if (it != g_dmaPendingPolls.end() && it->second > 0)
+            std::lock_guard<std::mutex> lock(
+                state.stubMutex);
+            auto it = state.pendingPolls.find(
+                channelBase);
+            if (it != state.pendingPolls.end() &&
+                it->second > 0u)
             {
                 modelBusy = true;
                 if (mode != 0)
@@ -1447,13 +1488,13 @@ namespace
                     --it->second;
                     if (it->second == 0)
                     {
-                        g_dmaPendingPolls.erase(it);
+                        state.pendingPolls.erase(it);
                     }
                 }
                 else
                 {
                     // Blocking mode: complete immediately in this runtime.
-                    g_dmaPendingPolls.erase(it);
+                    state.pendingPolls.erase(it);
                 }
             }
         }
@@ -1467,14 +1508,6 @@ namespace
 
 namespace
 {
-    struct GsGParam
-    {
-        uint8_t interlace;
-        uint8_t omode;
-        uint8_t ffmode;
-        uint8_t version;
-    };
-
     struct GsDispEnvMem
     {
         uint64_t pmode;
@@ -1573,9 +1606,6 @@ namespace
     static_assert(sizeof(GsDrawEnv2Mem) == 128, "GsDrawEnv2Mem size mismatch");
     static_assert(sizeof(GsClearMem) == 96, "GsClearMem size mismatch");
     static_assert(sizeof(GsDBuffDcMem) == 0x330, "GsDBuffDcMem size mismatch");
-
-    constexpr uint32_t kGsParamScratchOffset = 0x100;
-    GsGParam g_gparam{1, 2, 1, 3}; // Default: interlaced NTSC, frame mode.
 
     static uint64_t makePmode(uint32_t en1, uint32_t en2, uint32_t mmod, uint32_t amod, uint32_t slbg, uint32_t alp)
     {
@@ -1919,14 +1949,4 @@ namespace
         env.test2 = {makeTest(ztest), GS_REG_TEST_2};
     }
 
-    static uint32_t writeGsGParamToScratch(PS2Runtime *runtime)
-    {
-        if (!runtime)
-            return 0;
-        uint8_t *scratch = runtime->memory().getScratchpad();
-        if (!scratch)
-            return 0;
-        std::memcpy(scratch + kGsParamScratchOffset, &g_gparam, sizeof(g_gparam));
-        return PS2_SCRATCHPAD_BASE + kGsParamScratchOffset;
-    }
 }

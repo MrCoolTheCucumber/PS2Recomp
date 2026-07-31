@@ -17,6 +17,7 @@ namespace ps2recomp
     {
         std::unordered_set<uint32_t> entryPoints;
         std::unordered_set<uint32_t> externalEntryPoints;
+        std::unordered_set<uint32_t> architecturalEntryPoints;
         std::unordered_set<uint32_t> resumeEntryPoints;
         std::unordered_set<uint32_t> indirectFallbackEntryPoints;
         std::unordered_map<uint32_t, std::vector<uint32_t>> jumpTableTargets;

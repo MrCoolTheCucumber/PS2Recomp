@@ -19,6 +19,7 @@
 #include <optional>
 #include <limits>
 #include <functional>
+#include <iterator>
 #include <thread>
 
 namespace fs = std::filesystem;
@@ -1794,6 +1795,196 @@ namespace ps2recomp
             return best;
         };
 
+        std::vector<uint32_t>
+            architecturalTargets;
+        for (const Function &function :
+             m_functions)
+        {
+            if (!function.isRecompiled ||
+                function.isStub ||
+                function.isSkipped ||
+                isEntryFunctionName(
+                    function.name))
+            {
+                continue;
+            }
+
+            const auto decodedIt =
+                m_decodedFunctions.find(
+                    function.start);
+            if (decodedIt ==
+                m_decodedFunctions.end())
+            {
+                continue;
+            }
+
+            const CodeGenerator::AnalysisResult
+                analysisResult =
+                    m_codeGenerator
+                        ->collectInternalBranchTargets(
+                            function,
+                            decodedIt->second,
+                            &m_functions);
+            architecturalTargets.insert(
+                architecturalTargets.end(),
+                analysisResult
+                    .architecturalEntryPoints
+                    .begin(),
+                analysisResult
+                    .architecturalEntryPoints
+                    .end());
+        }
+        std::sort(
+            architecturalTargets.begin(),
+            architecturalTargets.end());
+        architecturalTargets.erase(
+            std::unique(
+                architecturalTargets.begin(),
+                architecturalTargets.end()),
+            architecturalTargets.end());
+
+        std::vector<Function>
+            materializedEntries;
+        for (uint32_t target :
+             architecturalTargets)
+        {
+            const bool alreadyRegistered =
+                std::any_of(
+                    m_functions.begin(),
+                    m_functions.end(),
+                    [&](const Function &candidate)
+                    {
+                        return candidate.start ==
+                                   target &&
+                               shouldGenerateCodeForFunction(
+                                   candidate);
+                    });
+            if (alreadyRegistered ||
+                findContainingFunction(target))
+            {
+                continue;
+            }
+
+            const Section *targetSection =
+                nullptr;
+            for (const Section &section :
+                 m_sections)
+            {
+                const uint64_t sectionEnd =
+                    static_cast<uint64_t>(
+                        section.address) +
+                    static_cast<uint64_t>(
+                        section.size);
+                if (section.isCode &&
+                    target >= section.address &&
+                    static_cast<uint64_t>(
+                        target) <
+                        sectionEnd)
+                {
+                    targetSection =
+                        &section;
+                    break;
+                }
+            }
+            if (!targetSection)
+            {
+                m_reporter.errorAt(
+                    "architectural-entry",
+                    "SetupThread",
+                    target,
+                    "the constant thread root is outside executable ELF sections");
+                continue;
+            }
+
+            const uint64_t sectionEnd64 =
+                static_cast<uint64_t>(
+                    targetSection->address) +
+                static_cast<uint64_t>(
+                    targetSection->size);
+            uint32_t entryEnd =
+                sectionEnd64 >
+                        std::numeric_limits<
+                            uint32_t>::max()
+                    ? std::numeric_limits<
+                          uint32_t>::max()
+                    : static_cast<uint32_t>(
+                          sectionEnd64);
+            for (const Function &candidate :
+                 m_functions)
+            {
+                if (candidate.start > target &&
+                    candidate.start < entryEnd)
+                {
+                    entryEnd =
+                        candidate.start;
+                }
+            }
+
+            if (entryEnd <= target)
+            {
+                m_reporter.errorAt(
+                    "architectural-entry",
+                    "SetupThread",
+                    target,
+                    "the constant thread root has no decodable range before the next boundary");
+                continue;
+            }
+
+            Function entry{};
+            std::ostringstream name;
+            name << "entry_"
+                 << std::hex
+                 << target;
+            entry.name = name.str();
+            entry.start = target;
+            entry.end = entryEnd;
+            entry.isRecompiled = true;
+            entry.isStub = false;
+            entry.isSkipped = false;
+            if (!decodeFunction(entry))
+            {
+                m_reporter.errorAt(
+                    "architectural-entry",
+                    entry.name,
+                    target,
+                    "failed to decode a constant SetupThread root");
+                continue;
+            }
+
+            materializedEntries.push_back(
+                std::move(entry));
+        }
+
+        if (!materializedEntries.empty())
+        {
+            const size_t materializedCount =
+                materializedEntries.size();
+            m_functions.insert(
+                m_functions.end(),
+                std::make_move_iterator(
+                    materializedEntries.begin()),
+                std::make_move_iterator(
+                    materializedEntries.end()));
+            std::sort(
+                m_functions.begin(),
+                m_functions.end(),
+                [](const Function &lhs,
+                   const Function &rhs)
+                {
+                    return lhs.start <
+                           rhs.start;
+                });
+            m_reporter.recordAdditionalEntryPoints(
+                materializedCount);
+            std::ostringstream message;
+            message
+                << "materialized "
+                << materializedCount
+                << " architectural continuation entry point(s)";
+            m_reporter.progress(
+                message.str());
+        }
+
         for (const auto &function : m_functions)
         {
             if (!function.isRecompiled || function.isStub || function.isSkipped)
@@ -1816,29 +2007,42 @@ namespace ps2recomp
             CodeGenerator::AnalysisResult analysisResult =
                 m_codeGenerator->collectInternalBranchTargets(function, instructions, &m_functions);
 
-            auto &ownerTargets = m_resumeEntryTargetsByOwner[function.start];
-            ownerTargets.insert(ownerTargets.end(),
-                                analysisResult.resumeEntryPoints.begin(),
-                                analysisResult.resumeEntryPoints.end());
-            ownerTargets.insert(ownerTargets.end(),
-                                analysisResult.indirectFallbackEntryPoints.begin(),
-                                analysisResult.indirectFallbackEntryPoints.end());
-
-            for (uint32_t target : analysisResult.externalEntryPoints)
+            auto mapTargetToOwner =
+                [&](uint32_t target)
             {
                 const Function *owner = findContainingFunction(target);
                 if (!owner)
                 {
-                    continue;
-                }
-
-                if (owner->start == target)
-                {
-                    continue;
+                    return;
                 }
 
                 auto &targets = m_resumeEntryTargetsByOwner[owner->start];
                 targets.push_back(target);
+            };
+
+            for (uint32_t target :
+                 analysisResult
+                     .resumeEntryPoints)
+            {
+                mapTargetToOwner(target);
+            }
+            for (uint32_t target :
+                 analysisResult
+                     .indirectFallbackEntryPoints)
+            {
+                mapTargetToOwner(target);
+            }
+            for (uint32_t target :
+                 analysisResult
+                     .externalEntryPoints)
+            {
+                mapTargetToOwner(target);
+            }
+            for (uint32_t target :
+                 analysisResult
+                     .architecturalEntryPoints)
+            {
+                mapTargetToOwner(target);
             }
         }
 

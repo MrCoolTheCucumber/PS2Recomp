@@ -4,6 +4,7 @@
 
 namespace ps2_syscalls
 {
+    void resetFileIoState(PS2Runtime *runtime);
     void fioOpen(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
     void fioClose(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
     void fioRead(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);

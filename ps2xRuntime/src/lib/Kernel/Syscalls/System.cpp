@@ -109,11 +109,18 @@ namespace ps2_syscalls
 
         uint32_t *param = reinterpret_cast<uint32_t *>(getMemPtr(rdram, paramAddr));
 
-        ensureOsdConfigInitialized();
+        if (!ensureOsdConfigInitialized(runtime))
+        {
+            setReturnS32(ctx, -1);
+            return;
+        }
+        EeKernelRuntimeState &state =
+            runtime->eeKernelRuntimeState();
         uint32_t raw;
         {
-            std::lock_guard<std::mutex> lock(g_osd_mutex);
-            raw = g_osd_config_raw;
+            std::lock_guard<std::mutex> lock(
+                state.osdMutex);
+            raw = state.osdConfigRaw;
         }
 
         *param = raw;
@@ -136,11 +143,20 @@ namespace ps2_syscalls
         const uint32_t *param = reinterpret_cast<const uint32_t *>(getConstMemPtr(rdram, paramAddr));
         uint32_t raw = param ? *param : 0;
         raw = sanitizeOsdConfigRaw(raw);
+        if (!runtime)
         {
-            std::lock_guard<std::mutex> lock(g_osd_mutex);
-            g_osd_config_raw = raw;
-            g_osd_config2_raw = makeReadableOsdConfig2RawLocked();
-            g_osd_config_initialized = true;
+            setReturnS32(ctx, -1);
+            return;
+        }
+        EeKernelRuntimeState &state =
+            runtime->eeKernelRuntimeState();
+        {
+            std::lock_guard<std::mutex> lock(
+                state.osdMutex);
+            state.osdConfigRaw = raw;
+            state.osdConfig2Raw =
+                makeReadableOsdConfig2RawLocked(state);
+            state.osdConfigInitialized = true;
         }
 
         setReturnS32(ctx, 0);
@@ -148,11 +164,16 @@ namespace ps2_syscalls
 
     void SetOsdConfigParam2(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
-        (void)runtime;
         const uint32_t paramAddr = getRegU32(ctx, 4); // $a0 - Config2Param*
         const uint32_t size = getRegU32(ctx, 5);      // $a1 - sizeof(Config2Param), normally 4
 
-        ensureOsdConfigInitialized();
+        if (!ensureOsdConfigInitialized(runtime))
+        {
+            setReturnS32(ctx, -1);
+            return;
+        }
+        EeKernelRuntimeState &state =
+            runtime->eeKernelRuntimeState();
 
         if (size == 0u)
         {
@@ -162,8 +183,9 @@ namespace ps2_syscalls
 
         uint32_t raw = 0;
         {
-            std::lock_guard<std::mutex> lock(g_osd_mutex);
-            raw = makeReadableOsdConfig2RawLocked();
+            std::lock_guard<std::mutex> lock(
+                state.osdMutex);
+            raw = makeReadableOsdConfig2RawLocked(state);
         }
 
         const uint32_t copyBytes = std::min<uint32_t>(size, 4u);
@@ -194,17 +216,24 @@ namespace ps2_syscalls
         raw = sanitizeOsdConfig2Raw(raw);
 
         {
-            std::lock_guard<std::mutex> lock(g_osd_mutex);
-            g_osd_config2_raw = raw;
+            std::lock_guard<std::mutex> lock(
+                state.osdMutex);
+            state.osdConfig2Raw = raw;
 
-            uint32_t version = (g_osd_config_raw >> 13) & 0x7u;
-            uint32_t language = (g_osd_config_raw >> 16) & 0x1Fu;
+            uint32_t version =
+                (state.osdConfigRaw >> 13) & 0x7u;
+            uint32_t language =
+                (state.osdConfigRaw >> 16) & 0x1Fu;
             if (copyBytes >= 3u)
                 version = (raw >> 16) & 0xFFu;
             if (copyBytes >= 4u)
                 language = (raw >> 24) & 0xFFu;
-            g_osd_config_raw = syncOsdConfigRawVersionLanguage(g_osd_config_raw, version, language);
-            g_osd_config_initialized = true;
+            state.osdConfigRaw =
+                syncOsdConfigRawVersionLanguage(
+                    state.osdConfigRaw,
+                    version,
+                    language);
+            state.osdConfigInitialized = true;
         }
 
         setReturnS32(ctx, 0);
@@ -212,11 +241,16 @@ namespace ps2_syscalls
 
     void GetOsdConfigParam2(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
-        (void)runtime;
         const uint32_t paramAddr = getRegU32(ctx, 4); // $a0 - Config2Param*
         const uint32_t size = getRegU32(ctx, 5);      // $a1 - sizeof(Config2Param), normally 4
 
-        ensureOsdConfigInitialized();
+        if (!ensureOsdConfigInitialized(runtime))
+        {
+            setReturnS32(ctx, -1);
+            return;
+        }
+        EeKernelRuntimeState &state =
+            runtime->eeKernelRuntimeState();
 
         if (size == 0u)
         {
@@ -226,8 +260,9 @@ namespace ps2_syscalls
 
         uint32_t raw = 0;
         {
-            std::lock_guard<std::mutex> lock(g_osd_mutex);
-            raw = makeReadableOsdConfig2RawLocked();
+            std::lock_guard<std::mutex> lock(
+                state.osdMutex);
+            raw = makeReadableOsdConfig2RawLocked(state);
         }
 
         const uint8_t rawBytes[4] = {
@@ -326,7 +361,8 @@ namespace ps2_syscalls
 
         // Match buffer-based module loads to stable synthetic tags so module ID lookup remains deterministic.
         const std::string moduleTag = makeSifModuleBufferTag(rdram, bufferAddr);
-        const int32_t moduleId = trackSifModuleLoad(moduleTag);
+        const int32_t moduleId =
+            trackSifModuleLoad(runtime, moduleTag);
         if (moduleId <= 0)
         {
             setReturnS32(ctx, -1);
@@ -335,14 +371,22 @@ namespace ps2_syscalls
 
         uint32_t refs = 0;
         {
-            std::lock_guard<std::mutex> lock(g_sif_module_mutex);
-            auto it = g_sif_modules_by_id.find(moduleId);
-            if (it != g_sif_modules_by_id.end())
+            EeRpcRuntimeState &state =
+                runtime->eeRpcRuntimeState();
+            std::lock_guard<std::mutex> lock(
+                state.moduleMutex);
+            auto it = state.modulesById.find(moduleId);
+            if (it != state.modulesById.end())
             {
                 refs = it->second.refCount;
             }
         }
-        logSifModuleAction("load-buffer", moduleId, moduleTag, refs);
+        logSifModuleAction(
+            runtime,
+            "load-buffer",
+            moduleId,
+            moduleTag,
+            refs);
         setReturnS32(ctx, moduleId);
     }
 
@@ -416,18 +460,27 @@ namespace ps2_syscalls
 
     bool dispatchSyscallOverride(uint32_t syscallNumber, uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
+        if (!runtime || !ctx)
+        {
+            return false;
+        }
+
+        EeKernelRuntimeState &state =
+            runtime->eeKernelRuntimeState();
         uint32_t handler = 0u;
         {
-            std::lock_guard<std::mutex> lock(g_syscall_override_mutex);
-            auto it = g_syscall_overrides.find(syscallNumber);
-            if (it == g_syscall_overrides.end())
+            std::lock_guard<std::mutex> lock(
+                state.syscallOverrideMutex);
+            auto it =
+                state.syscallOverrides.find(syscallNumber);
+            if (it == state.syscallOverrides.end())
             {
                 return false;
             }
             handler = it->second;
         }
 
-        if (!runtime || !ctx || handler == 0u)
+        if (handler == 0u)
         {
             return false;
         }
@@ -439,38 +492,65 @@ namespace ps2_syscalls
         const uint32_t overridePc = ctx->pc;
         const uint32_t overrideRa = getRegU32(ctx, 31);
 
-        thread_local std::vector<uint32_t> s_activeSyscallOverrides;
-        if (std::find(s_activeSyscallOverrides.begin(), s_activeSyscallOverrides.end(), syscallNumber) != s_activeSyscallOverrides.end())
         {
-            static std::atomic<uint32_t> s_reentrantLogs{0u};
-            constexpr uint32_t kMaxReentrantLogs = 32u;
-            const uint32_t logIndex = s_reentrantLogs.fetch_add(1u, std::memory_order_relaxed);
-            if (logIndex < kMaxReentrantLogs)
+            std::lock_guard<std::mutex> lock(
+                state.activeSyscallOverrideMutex);
+            if (std::find(
+                    state.activeSyscallOverrides.begin(),
+                    state.activeSyscallOverrides.end(),
+                    syscallNumber) ==
+                state.activeSyscallOverrides.end())
             {
-                PS2_IF_AGRESSIVE_LOGS({
-                    std::cerr << "[SyscallOverride:reentrant]"
-                              << " syscall=0x" << std::hex << syscallNumber
-                              << " handler=0x" << handler
-                              << " pc=0x" << ctx->pc
-                              << " ra=0x" << getRegU32(ctx, 31)
-                              << std::dec << std::endl;
-                });
+                state.activeSyscallOverrides.push_back(
+                    syscallNumber);
             }
-            return false;
+            else
+            {
+                static std::atomic<uint32_t>
+                    s_reentrantLogs{0u};
+                constexpr uint32_t
+                    kMaxReentrantLogs = 32u;
+                const uint32_t logIndex =
+                    s_reentrantLogs.fetch_add(
+                        1u,
+                        std::memory_order_relaxed);
+                if (logIndex < kMaxReentrantLogs)
+                {
+                    PS2_IF_AGRESSIVE_LOGS({
+                        std::cerr
+                            << "[SyscallOverride:reentrant]"
+                            << " syscall=0x" << std::hex
+                            << syscallNumber
+                            << " handler=0x" << handler
+                            << " pc=0x" << ctx->pc
+                            << " ra=0x"
+                            << getRegU32(ctx, 31)
+                            << std::dec << std::endl;
+                    });
+                }
+                return false;
+            }
         }
 
-        s_activeSyscallOverrides.push_back(syscallNumber);
         struct ScopedActiveOverride
         {
-            std::vector<uint32_t> &active;
+            EeKernelRuntimeState &state;
+            uint32_t syscallNumber;
             ~ScopedActiveOverride()
             {
-                if (!active.empty())
+                std::lock_guard<std::mutex> lock(
+                    state.activeSyscallOverrideMutex);
+                auto it = std::find(
+                    state.activeSyscallOverrides.rbegin(),
+                    state.activeSyscallOverrides.rend(),
+                    syscallNumber);
+                if (it != state.activeSyscallOverrides.rend())
                 {
-                    active.pop_back();
+                    state.activeSyscallOverrides.erase(
+                        std::next(it).base());
                 }
             }
-        } scopedActiveOverride{s_activeSyscallOverrides};
+        } scopedActiveOverride{state, syscallNumber};
 
         uint32_t retV0 = 0u;
         const bool invoked = rpcInvokeFunction(rdram,
@@ -577,15 +657,23 @@ namespace ps2_syscalls
         }
     }
 
-    static void seedGuestSyscallTableProbeLocked(uint8_t *rdram)
+    static void seedGuestSyscallTableProbeLocked(
+        uint8_t *rdram,
+        EeKernelRuntimeState &state)
     {
         writeGuestKernelWord(rdram, kGuestSyscallTableProbeBase + 0u, kGuestSyscallTableGuestBase >> 16);
         writeGuestKernelWord(rdram, kGuestSyscallTableProbeBase + 8u, kGuestSyscallTableGuestBase & 0xFFFFu);
-        g_syscall_mirror_addrs.insert(kGuestSyscallTableProbeBase + 0u);
-        g_syscall_mirror_addrs.insert(kGuestSyscallTableProbeBase + 8u);
+        state.syscallMirrorAddresses.insert(
+            kGuestSyscallTableProbeBase + 0u);
+        state.syscallMirrorAddresses.insert(
+            kGuestSyscallTableProbeBase + 8u);
     }
 
-    static void mirrorGuestSyscallEntryLocked(uint8_t *rdram, uint32_t syscallIndex, uint32_t handler)
+    static void mirrorGuestSyscallEntryLocked(
+        uint8_t *rdram,
+        EeKernelRuntimeState &state,
+        uint32_t syscallIndex,
+        uint32_t handler)
     {
         uint32_t guestAddr = 0u;
         if (!tryResolveGuestSyscallMirrorAddr(syscallIndex, guestAddr))
@@ -596,53 +684,70 @@ namespace ps2_syscalls
         writeGuestKernelWord(rdram, guestAddr, handler);
         if (handler == 0u)
         {
-            g_syscall_mirror_addrs.erase(guestAddr);
+            state.syscallMirrorAddresses.erase(guestAddr);
             return;
         }
 
-        g_syscall_mirror_addrs.insert(guestAddr);
+        state.syscallMirrorAddresses.insert(guestAddr);
     }
 
-    void initializeGuestKernelState(uint8_t *rdram)
+    void initializeGuestKernelState(
+        uint8_t *rdram, PS2Runtime *runtime)
     {
-        if (!rdram)
+        if (!rdram || !runtime)
         {
             return;
         }
 
-        std::lock_guard<std::mutex> lock(g_syscall_override_mutex);
-        for (uint32_t guestAddr : g_syscall_mirror_addrs)
+        EeKernelRuntimeState &state =
+            runtime->eeKernelRuntimeState();
+        state.threadRootFunction.store(
+            0u, std::memory_order_release);
+        std::lock_guard<std::mutex> lock(
+            state.syscallOverrideMutex);
+        for (uint32_t guestAddr :
+             state.syscallMirrorAddresses)
         {
             writeGuestKernelWord(rdram, guestAddr, 0u);
         }
-        g_syscall_mirror_addrs.clear();
+        state.syscallMirrorAddresses.clear();
 
-        seedGuestSyscallTableProbeLocked(rdram);
+        seedGuestSyscallTableProbeLocked(rdram, state);
 
-        for (const auto &entry : g_syscall_overrides)
+        for (const auto &entry : state.syscallOverrides)
         {
-            mirrorGuestSyscallEntryLocked(rdram, entry.first, entry.second);
+            mirrorGuestSyscallEntryLocked(
+                rdram, state, entry.first, entry.second);
         }
     }
 
     void SetSyscall(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
-        (void)runtime;
         const uint32_t syscallIndex = getRegU32(ctx, 4);
         const uint32_t handler = getRegU32(ctx, 5);
-
+        if (!runtime)
         {
-            std::lock_guard<std::mutex> lock(g_syscall_override_mutex);
+            setReturnS32(ctx, -1);
+            return;
+        }
+
+        EeKernelRuntimeState &state =
+            runtime->eeKernelRuntimeState();
+        {
+            std::lock_guard<std::mutex> lock(
+                state.syscallOverrideMutex);
             if (handler == 0u)
             {
-                g_syscall_overrides.erase(syscallIndex);
+                state.syscallOverrides.erase(syscallIndex);
             }
             else
             {
-                g_syscall_overrides[syscallIndex] = handler;
+                state.syscallOverrides[syscallIndex] =
+                    handler;
             }
 
-            mirrorGuestSyscallEntryLocked(rdram, syscallIndex, handler);
+            mirrorGuestSyscallEntryLocked(
+                rdram, state, syscallIndex, handler);
         }
 
         setReturnS32(ctx, 0);
@@ -652,10 +757,24 @@ namespace ps2_syscalls
     // args: $a0 = gp, $a1 = stack, $a2 = stack_size, $a3 = args, $t0 = root_func
     void SetupThread(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
+        // The retail EE kernel stores its 0x2A0-byte saved thread context at
+        // the top of an explicitly supplied stack and returns the first byte
+        // below that context as the initial main-thread stack pointer.
+        static constexpr uint32_t kThreadContextReserve = 0x2A0u;
+
         const uint32_t gp = getRegU32(ctx, 4);
         const uint32_t stack = getRegU32(ctx, 5);
         const int32_t stackSizeSigned = static_cast<int32_t>(getRegU32(ctx, 6));
+        const uint32_t rootFunction = getRegU32(ctx, 8);
         const uint32_t currentSp = getRegU32(ctx, 29);
+
+        if (runtime)
+        {
+            runtime->eeKernelRuntimeState()
+                .threadRootFunction.store(
+                    rootFunction,
+                    std::memory_order_release);
+        }
 
         if (gp != 0u)
         {
@@ -686,7 +805,10 @@ namespace ps2_syscalls
         {
             if (stackSizeSigned > 0)
             {
-                sp = stack + static_cast<uint32_t>(stackSizeSigned);
+                sp =
+                    stack +
+                    static_cast<uint32_t>(stackSizeSigned) -
+                    kThreadContextReserve;
             }
             else
             {
@@ -1081,12 +1203,20 @@ namespace ps2_syscalls
     void QueryBootMode(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
         uint32_t mode = getRegU32(ctx, 4);
-        ensureBootModeTable(rdram);
+        if (!ensureBootModeTable(rdram, runtime))
+        {
+            setReturnU32(ctx, 0u);
+            return;
+        }
+        EeKernelRuntimeState &state =
+            runtime->eeKernelRuntimeState();
         uint32_t addr = 0;
         {
-            std::lock_guard<std::mutex> lock(g_bootmode_mutex);
-            auto it = g_bootmode_addresses.find(static_cast<uint8_t>(mode));
-            if (it != g_bootmode_addresses.end())
+            std::lock_guard<std::mutex> lock(
+                state.bootModeMutex);
+            auto it = state.bootModeAddresses.find(
+                static_cast<uint8_t>(mode));
+            if (it != state.bootModeAddresses.end())
                 addr = it->second;
         }
         setReturnU32(ctx, addr);
@@ -1095,7 +1225,7 @@ namespace ps2_syscalls
     // GetThreadTLS (stub): return 0
     void GetThreadTLS(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
-        auto info = ensureCurrentThreadInfo(ctx);
+        auto info = ensureCurrentThreadInfo(runtime, ctx);
         if (!info)
         {
             setReturnU32(ctx, 0);
@@ -1104,7 +1234,8 @@ namespace ps2_syscalls
 
         if (info->tlsBase == 0)
         {
-            info->tlsBase = allocTlsAddr(rdram);
+            info->tlsBase =
+                allocTlsAddr(rdram, runtime);
         }
 
         setReturnU32(ctx, info->tlsBase);
@@ -1153,10 +1284,19 @@ namespace ps2_syscalls
             return;
         }
 
-        int tid = g_currentThreadId;
+        if (!runtime)
         {
-            std::lock_guard<std::mutex> lock(g_exit_handler_mutex);
-            g_exit_handlers[tid].push_back({func, arg});
+            setReturnS32(ctx, -1);
+            return;
+        }
+        const int tid = getCurrentThreadId(runtime);
+        EeKernelRuntimeState &state =
+            runtime->eeKernelRuntimeState();
+        {
+            std::lock_guard<std::mutex> lock(
+                state.exitHandlerMutex);
+            state.exitHandlers[tid].push_back(
+                {func, arg});
         }
 
         setReturnS32(ctx, 0);

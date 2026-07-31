@@ -1,23 +1,10 @@
 #include "System.h"
 #include "Common.h"
 #include "ps2_runtime.h"
+#include "Helpers/Deci2RuntimeState.h"
 
 namespace
 {
-    struct Deci2Session
-    {
-        uint16_t protocol = 0;
-        uint32_t opt = 0;
-        uint32_t handler = 0;
-        uint32_t userArea = 0;
-        bool locked = false;
-    };
-
-    std::mutex g_deci2Mutex;
-    std::unordered_map<int32_t, Deci2Session> g_deci2Sessions;
-    int32_t g_nextDeci2Socket = 1;
-    std::atomic<uint32_t> g_deci2LogCount{0};
-
     static bool readDeci2U32(uint8_t *rdram, uint32_t guestAddr, uint32_t &value)
     {
         value = 0;
@@ -62,10 +49,15 @@ namespace
         return text;
     }
 
-    static void logDeci2Text(const char *prefix, const std::string &text)
+    static void logDeci2Text(
+        Deci2RuntimeState &state,
+        const char *prefix,
+        const std::string &text)
     {
         constexpr uint32_t kMaxDeci2TextLogs = 256u;
-        const uint32_t logIndex = g_deci2LogCount.fetch_add(1u, std::memory_order_relaxed);
+        const uint32_t logIndex =
+            state.textLogCount.fetch_add(
+                1u, std::memory_order_relaxed);
         if (logIndex >= kMaxDeci2TextLogs)
         {
             return;
@@ -79,16 +71,22 @@ namespace
         }
     }
 
-    static int32_t allocateDeci2Socket(uint16_t protocol, uint32_t opt, uint32_t handler, uint32_t userArea)
+    static int32_t allocateDeci2Socket(
+        Deci2RuntimeState &state,
+        uint16_t protocol,
+        uint32_t opt,
+        uint32_t handler,
+        uint32_t userArea)
     {
-        std::lock_guard<std::mutex> lock(g_deci2Mutex);
+        std::lock_guard<std::mutex> lock(
+            state.sessionMutex);
 
-        if (g_nextDeci2Socket <= 0)
+        if (state.nextSocket <= 0)
         {
-            g_nextDeci2Socket = 1;
+            state.nextSocket = 1;
         }
 
-        const int32_t socket = g_nextDeci2Socket;
+        const int32_t socket = state.nextSocket;
         Deci2Session session;
         session.protocol = protocol;
         session.opt = opt;
@@ -96,16 +94,20 @@ namespace
         session.userArea = userArea;
         session.locked = false;
 
-        g_deci2Sessions[socket] = session;
+        state.sessions[socket] = session;
         return socket;
     }
 
-    static bool updateDeci2LockState(int32_t socket, bool locked)
+    static bool updateDeci2LockState(
+        Deci2RuntimeState &state,
+        int32_t socket,
+        bool locked)
     {
-        std::lock_guard<std::mutex> lock(g_deci2Mutex);
+        std::lock_guard<std::mutex> lock(
+            state.sessionMutex);
 
-        auto sessionIt = g_deci2Sessions.find(socket);
-        if (sessionIt == g_deci2Sessions.end())
+        auto sessionIt = state.sessions.find(socket);
+        if (sessionIt == state.sessions.end())
         {
             return false;
         }
@@ -114,18 +116,37 @@ namespace
         return true;
     }
 
-    static bool closeDeci2Socket(int32_t socket)
+    static bool closeDeci2Socket(
+        Deci2RuntimeState &state,
+        int32_t socket)
     {
-        std::lock_guard<std::mutex> lock(g_deci2Mutex);
-        return g_deci2Sessions.erase(socket) != 0;
+        std::lock_guard<std::mutex> lock(
+            state.sessionMutex);
+        return state.sessions.erase(socket) != 0u;
     }
 }
 
 namespace ps2_syscalls
 {
+    void resetDeci2State(PS2Runtime *runtime)
+    {
+        if (runtime)
+        {
+            runtime->deci2RuntimeState().reset();
+        }
+    }
+
     void Deci2Call(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
-#if defined(_DEBUG) || defined(RUNTIME_DECI2CALL)
+#if !defined(NDEBUG) || defined(RUNTIME_DECI2CALL)
+        if (!runtime)
+        {
+            setReturnS32(ctx, KE_ERROR);
+            return;
+        }
+
+        Deci2RuntimeState &state =
+            runtime->deci2RuntimeState();
         const int32_t code = static_cast<int32_t>(getRegU32(ctx, 4));
         const uint32_t argsAddr = getRegU32(ctx, 5);
 
@@ -141,14 +162,24 @@ namespace ps2_syscalls
             const uint32_t handler = args[2];
             const uint32_t userArea = args[3];
 
-            const int32_t socket = allocateDeci2Socket(protocol, opt, handler, userArea);
+            const int32_t socket =
+                allocateDeci2Socket(
+                    state,
+                    protocol,
+                    opt,
+                    handler,
+                    userArea);
             setReturnS32(ctx, socket);
             return;
         }
         case 2: // sceDeci2Close(socket)
         {
             const int32_t socket = static_cast<int32_t>(args[0]);
-            setReturnS32(ctx, closeDeci2Socket(socket) ? KE_OK : KE_ERROR);
+            setReturnS32(
+                ctx,
+                closeDeci2Socket(state, socket)
+                    ? KE_OK
+                    : KE_ERROR);
             return;
         }
         // WE dont need to do thouses
@@ -179,7 +210,10 @@ namespace ps2_syscalls
                 {
                     text.push_back(static_cast<char>(rdram[(bufferAddr + byteIndex) & PS2_RAM_MASK]));
                 }
-                logDeci2Text("[Deci2Call:send] ", text);
+                logDeci2Text(
+                    state,
+                    "[Deci2Call:send] ",
+                    text);
             }
 
             // Treat send as successful and return the amount accepted.
@@ -189,13 +223,23 @@ namespace ps2_syscalls
         case -8: // sceDeci2ExLock(socket)
         {
             const int32_t socket = static_cast<int32_t>(args[0]);
-            setReturnS32(ctx, updateDeci2LockState(socket, true) ? KE_OK : KE_ERROR);
+            setReturnS32(
+                ctx,
+                updateDeci2LockState(
+                    state, socket, true)
+                    ? KE_OK
+                    : KE_ERROR);
             return;
         }
         case -9: // sceDeci2ExUnLock(socket)
         {
             const int32_t socket = static_cast<int32_t>(args[0]);
-            setReturnS32(ctx, updateDeci2LockState(socket, false) ? KE_OK : KE_ERROR);
+            setReturnS32(
+                ctx,
+                updateDeci2LockState(
+                    state, socket, false)
+                    ? KE_OK
+                    : KE_ERROR);
             return;
         }
         case 16: // kputs(char *s)
@@ -204,15 +248,19 @@ namespace ps2_syscalls
             const uint32_t textAddr = args[0];
             const std::string text = readGuestCStringBounded(rdram, textAddr, kMaxDeci2KputsBytes);
 
-            logDeci2Text("[Deci2Call:kputs] ", text);
+            logDeci2Text(
+                state,
+                "[Deci2Call:kputs] ",
+                text);
             setReturnS32(ctx, static_cast<int32_t>(text.size()));
             return;
         }
         default:
         {
-            static std::atomic<uint32_t> s_unknownDeci2Logs{0u};
             constexpr uint32_t kMaxUnknownDeci2Logs = 64u;
-            const uint32_t logIndex = s_unknownDeci2Logs.fetch_add(1u, std::memory_order_relaxed);
+            const uint32_t logIndex =
+                state.unknownLogCount.fetch_add(
+                    1u, std::memory_order_relaxed);
             if (logIndex < kMaxUnknownDeci2Logs)
             {
                 std::cerr << "[Deci2Call:unknown]"

@@ -1,4 +1,5 @@
 #include "ps2recomp/control_flow_analyzer.h"
+#include "ps2recomp/gif_dma_kick_analyzer.h"
 #include "ps2recomp/types.h"
 #include "ps2recomp/instructions.h"
 #include "ps2recomp/control_flow_utils.h"
@@ -192,6 +193,69 @@ namespace ps2recomp
                         queueResumeEntryTarget(inst.address + 8u);
                     }
                 }
+            }
+        }
+
+        // SetupThread installs a guest function pointer which the kernel later
+        // copies into every started thread's $ra. That target is control flow
+        // even though the ELF contains no J/JAL reference to it. Track only
+        // constants proven within one basic block so alternate paths or calls
+        // cannot manufacture a false entry point.
+        {
+            constexpr uint32_t kSyscallRegister = 3u;
+            constexpr uint32_t kThreadRootRegister = 8u;
+            constexpr uint32_t kSetupThreadSyscall = 0x3Cu;
+
+            ConstantRegisterState constants;
+            bool clearAfterDelaySlot = false;
+            for (const Instruction &inst : instructions)
+            {
+                const bool isDelaySlot =
+                    clearAfterDelaySlot;
+                if (inst.address != function.start &&
+                    result.entryPoints.contains(
+                        inst.address))
+                {
+                    constants.clear();
+                }
+
+                if (inst.opcode == OPCODE_SPECIAL &&
+                    inst.function == SPECIAL_SYSCALL)
+                {
+                    const uint32_t encodedSyscall =
+                        (inst.raw >> 6) & 0xFFFFFu;
+                    uint32_t syscallNumber =
+                        encodedSyscall;
+                    const bool syscallKnown =
+                        encodedSyscall != 0u ||
+                        constants.read(
+                            kSyscallRegister,
+                            syscallNumber);
+                    uint32_t root = 0u;
+                    if (syscallKnown &&
+                        syscallNumber ==
+                            kSetupThreadSyscall &&
+                        constants.read(
+                            kThreadRootRegister,
+                            root) &&
+                        (root & 3u) == 0u &&
+                        isExecutableAddress(root))
+                    {
+                        result
+                            .architecturalEntryPoints
+                            .insert(root);
+                    }
+                }
+
+                updateConstantRegisters(
+                    inst,
+                    constants);
+                if (isDelaySlot)
+                {
+                    constants.clear();
+                }
+                clearAfterDelaySlot =
+                    inst.hasDelaySlot;
             }
         }
 

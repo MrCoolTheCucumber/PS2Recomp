@@ -1,5 +1,6 @@
 #include "Common.h"
 #include "GS.h"
+#include "Syscalls/Helpers/InterruptRuntimeState.h"
 #include "ps2_log.h"
 #include "runtime/ps2_gs_common.h"
 #include "runtime/ps2_gs_psmct16.h"
@@ -8,15 +9,51 @@ namespace ps2_stubs
 {
     namespace
     {
-        std::mutex g_gs_sync_v_mutex;
-        uint64_t g_gs_sync_v_base_tick = 0u;
-        std::mutex g_gs_sync_v_callback_mutex;
-        uint32_t g_gs_sync_v_callback_func = 0u;
-        uint32_t g_gs_sync_v_callback_gp = 0u;
-        uint32_t g_gs_sync_v_callback_sp = 0u;
-        uint32_t g_gs_sync_v_callback_stack_base = 0u;
-        uint32_t g_gs_sync_v_callback_stack_top = 0u;
-        uint32_t g_gs_sync_v_callback_bad_pc_logs = 0u;
+        constexpr uint32_t kGsParamScratchOffset =
+            0x100u;
+        static_assert(
+            sizeof(EeGsVideoParameters) == 4u,
+            "Unexpected GS video parameter layout.");
+
+        EeGsVideoParameters gsVideoParameters(
+            PS2Runtime *runtime)
+        {
+            if (!runtime)
+            {
+                return {};
+            }
+
+            EeInterruptRuntimeState &state =
+                runtime->eeInterruptRuntimeState();
+            std::lock_guard<std::mutex> lock(
+                state.vsyncMutex);
+            return state.gsVideoParameters;
+        }
+
+        uint32_t writeGsVideoParametersToScratch(
+            PS2Runtime *runtime)
+        {
+            if (!runtime)
+            {
+                return 0u;
+            }
+            uint8_t *scratch =
+                runtime->memory().getScratchpad();
+            if (!scratch)
+            {
+                return 0u;
+            }
+
+            const EeGsVideoParameters parameters =
+                gsVideoParameters(runtime);
+            std::memcpy(
+                scratch + kGsParamScratchOffset,
+                &parameters,
+                sizeof(parameters));
+            return PS2_SCRATCHPAD_BASE +
+                   kGsParamScratchOffset;
+        }
+
         uint64_t makeClearPrim(bool useContext2)
         {
             return static_cast<uint64_t>(GS_PRIM_SPRITE) |
@@ -598,35 +635,76 @@ namespace ps2_stubs
         setReturnU32(ctx, terminatePacketBuilderState(rdram, ctx, runtime));
     }
 
-    static void resetGsSyncVState()
+    static void resetGsSyncVState(
+        PS2Runtime *runtime)
     {
-        std::lock_guard<std::mutex> lock(g_gs_sync_v_mutex);
-        g_gs_sync_v_base_tick = ps2_syscalls::GetCurrentVSyncTick();
+        if (!runtime)
+        {
+            return;
+        }
+
+        const uint64_t currentTick =
+            ps2_syscalls::GetCurrentVSyncTick(runtime);
+        EeInterruptRuntimeState &state =
+            runtime->eeInterruptRuntimeState();
+        std::lock_guard<std::mutex> lock(
+            state.vsyncMutex);
+        state.gsSyncVBaseTick = currentTick;
     }
 
-    static int32_t getGsSyncVFieldForTick(uint64_t tick)
+    static int32_t getGsSyncVFieldForTick(
+        PS2Runtime *runtime, uint64_t tick)
     {
-        std::lock_guard<std::mutex> lock(g_gs_sync_v_mutex);
-        if (tick <= g_gs_sync_v_base_tick)
+        if (!runtime)
         {
             return 0;
         }
 
-        return static_cast<int32_t>((tick - g_gs_sync_v_base_tick - 1u) & 1u);
+        EeInterruptRuntimeState &state =
+            runtime->eeInterruptRuntimeState();
+        std::lock_guard<std::mutex> lock(
+            state.vsyncMutex);
+        if (tick <= state.gsSyncVBaseTick)
+        {
+            return 0;
+        }
+
+        return static_cast<int32_t>(
+            (tick - state.gsSyncVBaseTick - 1u) &
+            1u);
     }
 
-    void resetGsSyncVCallbackState()
+    void resetGsSyncVCallbackState(
+        PS2Runtime *runtime)
     {
+        if (!runtime)
         {
-            std::lock_guard<std::mutex> lock(g_gs_sync_v_callback_mutex);
-            g_gs_sync_v_callback_func = 0u;
-            g_gs_sync_v_callback_gp = 0u;
-            g_gs_sync_v_callback_sp = 0u;
-            g_gs_sync_v_callback_stack_base = 0u;
-            g_gs_sync_v_callback_stack_top = 0u;
-            g_gs_sync_v_callback_bad_pc_logs = 0u;
+            return;
         }
-        resetGsSyncVState();
+
+        const uint64_t currentTick =
+            ps2_syscalls::GetCurrentVSyncTick(runtime);
+        EeInterruptRuntimeState &state =
+            runtime->eeInterruptRuntimeState();
+        {
+            std::lock_guard<std::mutex> lock(
+                state.vsyncMutex);
+            state.gsSyncVBaseTick = currentTick;
+            state.gsVideoParameters = {};
+            state.gsSyncVCallback = 0u;
+            state.gsSyncVCallbackGp = 0u;
+            state.gsSyncVCallbackSp = 0u;
+        }
+        state.gsSyncVCallbackSetLogCount.store(
+            0u, std::memory_order_relaxed);
+        state.gsSyncVCallbackMissingLogCount.store(
+            0u, std::memory_order_relaxed);
+        state.gsSyncVCallbackDispatchLogCount.store(
+            0u, std::memory_order_relaxed);
+        state.gsSyncVCallbackBadPcLogCount.store(
+            0u, std::memory_order_relaxed);
+        state.gsSyncVCallbackWarningCount.store(
+            0u, std::memory_order_relaxed);
     }
 
     void dispatchGsSyncVCallback(uint8_t *rdram, PS2Runtime *runtime, uint64_t tick)
@@ -638,13 +716,18 @@ namespace ps2_stubs
 
         uint32_t callback = 0u;
         uint32_t gp = 0u;
-        uint32_t callbackStackTop = 0u;
-        const uint64_t callbackTick = (tick != 0u) ? tick : ps2_syscalls::GetCurrentVSyncTick();
+        const uint64_t callbackTick =
+            (tick != 0u)
+                ? tick
+                : ps2_syscalls::GetCurrentVSyncTick(
+                      runtime);
+        EeInterruptRuntimeState &state =
+            runtime->eeInterruptRuntimeState();
         {
-            std::lock_guard<std::mutex> lock(g_gs_sync_v_callback_mutex);
-            callback = g_gs_sync_v_callback_func;
-            gp = g_gs_sync_v_callback_gp;
-            callbackStackTop = g_gs_sync_v_callback_stack_top;
+            std::lock_guard<std::mutex> lock(
+                state.vsyncMutex);
+            callback = state.gsSyncVCallback;
+            gp = state.gsSyncVCallbackGp;
             if (callback == 0u)
             {
                 return;
@@ -653,8 +736,12 @@ namespace ps2_stubs
 
         if (!runtime->hasFunction(callback))
         {
-            static uint32_t s_missingCallbackLogCount = 0u;
-            if (s_missingCallbackLogCount < 32u)
+            const uint32_t logIndex =
+                state.gsSyncVCallbackMissingLogCount
+                    .fetch_add(
+                        1u,
+                        std::memory_order_relaxed);
+            if (logIndex < 32u)
             {
                 PS2_IF_AGRESSIVE_LOGS({
                     std::cerr << "[sceGsSyncVCallback:missing] cb=0x" << std::hex << callback
@@ -662,38 +749,32 @@ namespace ps2_stubs
                               << " tick=0x" << callbackTick
                               << std::dec << std::endl;
                 });
-                ++s_missingCallbackLogCount;
             }
             return;
         }
 
-        if (callbackStackTop == 0u)
-        {
-            constexpr uint32_t kCallbackStackSize = 0x4000u;
-            const uint32_t stackTop = runtime->reserveAsyncCallbackStack(kCallbackStackSize, 16u);
-            if (stackTop != 0u)
-            {
-                std::lock_guard<std::mutex> lock(g_gs_sync_v_callback_mutex);
-                if (g_gs_sync_v_callback_stack_top == 0u)
-                {
-                    g_gs_sync_v_callback_stack_base = stackTop - (kCallbackStackSize - 0x10u);
-                    g_gs_sync_v_callback_stack_top = stackTop;
-                }
-                callbackStackTop = g_gs_sync_v_callback_stack_top;
-            }
-        }
-
         try
         {
-            R5900Context callbackCtx{};
+            EeAsyncCallbackContextLease callbackLease(
+                state, *runtime);
+            R5900Context &callbackCtx =
+                callbackLease.context();
             SET_GPR_U32(&callbackCtx, 28, gp);
-            SET_GPR_U32(&callbackCtx, 29, (callbackStackTop != 0u) ? callbackStackTop : (PS2_RAM_SIZE - 0x10u));
+            SET_GPR_U32(
+                &callbackCtx,
+                29,
+                callbackLease.stackTop());
             SET_GPR_U32(&callbackCtx, 31, 0u);
             SET_GPR_U32(&callbackCtx, 4, static_cast<uint32_t>(callbackTick));
             callbackCtx.pc = callback;
 
-            static uint32_t s_dispatchLogCount = 0u;
-            const bool shouldLogDispatch = (s_dispatchLogCount < 64u);
+            const uint32_t dispatchLogIndex =
+                state.gsSyncVCallbackDispatchLogCount
+                    .fetch_add(
+                        1u,
+                        std::memory_order_relaxed);
+            const bool shouldLogDispatch =
+                dispatchLogIndex < 64u;
             if (shouldLogDispatch)
             {
                 PS2_IF_AGRESSIVE_LOGS({
@@ -717,14 +798,18 @@ namespace ps2_stubs
                 {
                     if (!runtime->hasFunction(callbackCtx.pc))
                     {
-                        if (g_gs_sync_v_callback_bad_pc_logs < 16u)
+                        const uint32_t logIndex =
+                            state.gsSyncVCallbackBadPcLogCount
+                                .fetch_add(
+                                    1u,
+                                    std::memory_order_relaxed);
+                        if (logIndex < 16u)
                         {
                             std::cerr << "[sceGsSyncVCallback:bad-pc] pc=0x" << std::hex << callbackCtx.pc
                                       << " ra=0x" << getRegU32(&callbackCtx, 31)
                                       << " sp=0x" << getRegU32(&callbackCtx, 29)
                                       << " gp=0x" << getRegU32(&callbackCtx, 28)
                                       << std::dec << std::endl;
-                            ++g_gs_sync_v_callback_bad_pc_logs;
                         }
                         callbackCtx.pc = 0u;
                         break;
@@ -755,16 +840,18 @@ namespace ps2_stubs
                                                                     << " steps=0x" << steps
                                                                     << std::dec << std::endl);
                 });
-                ++s_dispatchLogCount;
             }
         }
         catch (const std::exception &e)
         {
-            static uint32_t warnCount = 0u;
-            if (warnCount < 8u)
+            const uint32_t logIndex =
+                state.gsSyncVCallbackWarningCount
+                    .fetch_add(
+                        1u,
+                        std::memory_order_relaxed);
+            if (logIndex < 8u)
             {
                 std::cerr << "[sceGsSyncVCallback] callback exception: " << e.what() << std::endl;
-                ++warnCount;
             }
         }
     }
@@ -895,7 +982,8 @@ namespace ps2_stubs
 
     void sceGsGetGParam(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
-        uint32_t addr = writeGsGParamToScratch(runtime);
+        uint32_t addr =
+            writeGsVideoParametersToScratch(runtime);
         setReturnU32(ctx, addr);
     }
 
@@ -940,13 +1028,25 @@ namespace ps2_stubs
                 return;
             }
 
-            g_gparam.interlace = static_cast<uint8_t>(interlace & 0x1);
-            g_gparam.omode = static_cast<uint8_t>(omode & 0xFF);
-            g_gparam.ffmode = static_cast<uint8_t>(ffmode & 0x1);
-            writeGsGParamToScratch(runtime);
-            resetGsSyncVState();
             if (runtime)
             {
+                EeInterruptRuntimeState &state =
+                    runtime->eeInterruptRuntimeState();
+                {
+                    std::lock_guard<std::mutex> lock(
+                        state.vsyncMutex);
+                    state.gsVideoParameters.interlace =
+                        static_cast<uint8_t>(
+                            interlace & 0x1u);
+                    state.gsVideoParameters.outputMode =
+                        static_cast<uint8_t>(
+                            omode & 0xFFu);
+                    state.gsVideoParameters.frameMode =
+                        static_cast<uint8_t>(
+                            ffmode & 0x1u);
+                }
+                writeGsVideoParametersToScratch(runtime);
+                resetGsSyncVState(runtime);
                 runtime->configureEeVSyncVideoMode(
                     omode, interlace != 0u);
             }
@@ -1037,9 +1137,15 @@ namespace ps2_stubs
 
         const uint32_t fbw = std::max<uint32_t>(1u, (w + 63u) / 64u);
         const uint64_t pmode = makePmode(0u, 1u, 0u, 0u, 0u, 0x80u);
+        const EeGsVideoParameters parameters =
+            gsVideoParameters(runtime);
         const uint64_t smode2 =
-            (static_cast<uint64_t>(g_gparam.interlace & 0x1u) << 0) |
-            (static_cast<uint64_t>(g_gparam.ffmode & 0x1u) << 1);
+            (static_cast<uint64_t>(
+                 parameters.interlace & 0x1u)
+             << 0) |
+            (static_cast<uint64_t>(
+                 parameters.frameMode & 0x1u)
+             << 1);
         const uint64_t display = makeDisplay(636u, 32u, 0u, 0u, w - 1u, h - 1u);
 
         const int32_t drawWidth = static_cast<int32_t>(w);
@@ -1108,9 +1214,15 @@ namespace ps2_stubs
 
         const uint32_t fbw = std::max<uint32_t>(1u, (w + 63u) / 64u);
         const uint64_t pmode = makePmode(0u, 1u, 0u, 0u, 0u, 0x80u);
+        const EeGsVideoParameters parameters =
+            gsVideoParameters(runtime);
         const uint64_t smode2 =
-            (static_cast<uint64_t>(g_gparam.interlace & 0x1u) << 0) |
-            (static_cast<uint64_t>(g_gparam.ffmode & 0x1u) << 1);
+            (static_cast<uint64_t>(
+                 parameters.interlace & 0x1u)
+             << 0) |
+            (static_cast<uint64_t>(
+                 parameters.frameMode & 0x1u)
+             << 1);
         const uint64_t dispfb = makeDispFb(0u, fbw, psm, 0u, 0u);
         const uint64_t display = makeDisplay(636u, 32u, 0u, 0u, w - 1u, h - 1u);
 
@@ -1162,11 +1274,16 @@ namespace ps2_stubs
 
         const uint32_t fbw = (w + 63u) / 64u;
         GsDispEnvMem env{};
+        const EeGsVideoParameters parameters =
+            gsVideoParameters(runtime);
         // This matches the complete default environment produced by Sony's
         // libgraph: circuit 2 is enabled and mixed as the display source.
         env.pmode = makePmode(0u, 1u, 1u, 1u, 0u, 0u);
-        env.smode2 = g_gparam.interlace != 0u
-                         ? (1ull | (static_cast<uint64_t>(g_gparam.ffmode & 0x1u) << 1))
+        env.smode2 = parameters.interlace != 0u
+                         ? (1ull | (static_cast<uint64_t>(
+                                            parameters.frameMode &
+                                            0x1u)
+                                        << 1))
                          : 2ull;
         env.dispfb = makeDispFb(0u, fbw, psm, 0u, 0u);
         env.display = makeDisplay(dx, dy, 0u, 0u, w - 1u, h - 1u);
@@ -1506,9 +1623,11 @@ namespace ps2_stubs
         const uint64_t tick =
             ps2_syscalls::WaitForNextVSyncTick(
                 rdram, runtime, ctx);
-        if (g_gparam.interlace != 0u)
+        if (gsVideoParameters(runtime).interlace != 0u)
         {
-            setReturnS32(ctx, getGsSyncVFieldForTick(tick));
+            setReturnS32(
+                ctx,
+                getGsSyncVFieldForTick(runtime, tick));
             return;
         }
 
@@ -1517,6 +1636,14 @@ namespace ps2_stubs
 
     void sceGsSyncVCallback(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
+        if (!runtime)
+        {
+            setReturnU32(ctx, 0u);
+            return;
+        }
+
+        EeInterruptRuntimeState &state =
+            runtime->eeInterruptRuntimeState();
         const uint32_t newCallback = getRegU32(ctx, 4);
         const uint32_t callerPc = ctx ? ctx->pc : 0u;
         const uint32_t callerRa = ctx ? getRegU32(ctx, 31) : 0u;
@@ -1525,18 +1652,21 @@ namespace ps2_stubs
 
         uint32_t oldCallback = 0u;
         {
-            std::lock_guard<std::mutex> lock(g_gs_sync_v_callback_mutex);
-            oldCallback = g_gs_sync_v_callback_func;
-            g_gs_sync_v_callback_func = newCallback;
+            std::lock_guard<std::mutex> lock(
+                state.vsyncMutex);
+            oldCallback = state.gsSyncVCallback;
+            state.gsSyncVCallback = newCallback;
             if (newCallback != 0u)
             {
-                g_gs_sync_v_callback_gp = gp;
-                g_gs_sync_v_callback_sp = sp;
+                state.gsSyncVCallbackGp = gp;
+                state.gsSyncVCallbackSp = sp;
             }
         }
 
-        static uint32_t s_syncVCallbackLogCount = 0u;
-        if (s_syncVCallbackLogCount < 128u)
+        const uint32_t logIndex =
+            state.gsSyncVCallbackSetLogCount.fetch_add(
+                1u, std::memory_order_relaxed);
+        if (logIndex < 128u)
         {
             PS2_IF_AGRESSIVE_LOGS({
                 RUNTIME_LOG("[sceGsSyncVCallback:set] new=0x" << std::hex << newCallback
@@ -1547,7 +1677,6 @@ namespace ps2_stubs
                                                               << " sp=0x" << sp
                                                               << std::dec << std::endl);
             });
-            ++s_syncVCallbackLogCount;
         }
 
         if (newCallback != 0u)

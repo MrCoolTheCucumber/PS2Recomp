@@ -5,6 +5,7 @@
 
 #include <unordered_set>
 #include "Kernel/Syscalls/Helpers/State.h"
+#include "Kernel/Syscalls/Helpers/FileRuntimeState.h"
 #include "Kernel/Stubs/CD.h"
 #include "Kernel/Stubs/MemoryCard.h"
 #include "Kernel/Stubs/Pad.h"
@@ -761,7 +762,7 @@ namespace
         }
     }
 
-    void drawThreadsTab()
+    void drawThreadsTab(PS2Runtime &runtime)
     {
         struct ThreadRow
         {
@@ -782,10 +783,13 @@ namespace
         };
 
         std::vector<ThreadRow> rows;
+        EeThreadRuntimeState &threadState =
+            runtime.eeThreadRuntimeState();
         {
-            std::lock_guard<std::mutex> lock(g_thread_map_mutex);
-            rows.reserve(g_threads.size());
-            for (const auto &[id, ptr] : g_threads)
+            std::lock_guard<std::mutex> lock(
+                threadState.threadMapMutex);
+            rows.reserve(threadState.threads.size());
+            for (const auto &[id, ptr] : threadState.threads)
             {
                 if (!ptr)
                 {
@@ -813,7 +817,10 @@ namespace
             }
         }
 
-        ImGui::Text("Threads: %zu activeThreads=%d", rows.size(), g_activeThreads.load(std::memory_order_relaxed));
+        ImGui::Text(
+            "Threads: %zu activeThreads=%d",
+            rows.size(),
+            runtime.activeEeHostThreadCount());
         if (ImGui::BeginTable("threads", 12, ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg | ImGuiTableFlags_Resizable | ImGuiTableFlags_ScrollY, ImVec2(0, 320)))
         {
             ImGui::TableSetupColumn("ID");
@@ -861,11 +868,14 @@ namespace
         }
     }
 
-    void drawKernelTab()
+    void drawKernelTab(PS2Runtime &runtime)
     {
+        EeSyncRuntimeState &syncState =
+            runtime.eeSyncRuntimeState();
         ImGui::SeparatorText("Semaphores");
         {
-            std::lock_guard<std::mutex> lock(g_sema_map_mutex);
+            std::lock_guard<std::mutex> lock(
+                syncState.semaMapMutex);
             if (ImGui::BeginTable("semas", 7, ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg | ImGuiTableFlags_Resizable))
             {
                 ImGui::TableSetupColumn("ID");
@@ -876,7 +886,8 @@ namespace
                 ImGui::TableSetupColumn("Attr");
                 ImGui::TableSetupColumn("Deleted");
                 ImGui::TableHeadersRow();
-                for (const auto &[id, sema] : g_semas)
+                for (const auto &[id, sema] :
+                     syncState.semas)
                 {
                     if (!sema)
                         continue;
@@ -903,7 +914,8 @@ namespace
 
         ImGui::SeparatorText("Event flags");
         {
-            std::lock_guard<std::mutex> lock(g_event_flag_map_mutex);
+            std::lock_guard<std::mutex> lock(
+                syncState.eventFlagMapMutex);
             if (ImGui::BeginTable("evf", 6, ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg | ImGuiTableFlags_Resizable))
             {
                 ImGui::TableSetupColumn("ID");
@@ -913,7 +925,8 @@ namespace
                 ImGui::TableSetupColumn("Attr");
                 ImGui::TableSetupColumn("Deleted");
                 ImGui::TableHeadersRow();
-                for (const auto &[id, evf] : g_eventFlags)
+                for (const auto &[id, evf] :
+                     syncState.eventFlags)
                 {
                     if (!evf)
                         continue;
@@ -941,6 +954,8 @@ namespace
     {
         uint8_t *rdram = runtime.memory().getRDRAM();
         const ps2x::iop::DebugSnapshot iopSnapshot = runtime.iopDebugSnapshot();
+        EeRpcRuntimeState &rpcState =
+            runtime.eeRpcRuntimeState();
 
         struct ModuleRow
         {
@@ -955,9 +970,11 @@ namespace
         uint32_t moduleLogCount = 0;
         int32_t nextModuleId = 0;
         {
-            std::lock_guard<std::mutex> lock(g_sif_module_mutex);
-            modules.reserve(g_sif_modules_by_id.size());
-            for (const auto &[id, record] : g_sif_modules_by_id)
+            std::lock_guard<std::mutex> lock(
+                rpcState.moduleMutex);
+            modules.reserve(rpcState.modulesById.size());
+            for (const auto &[id, record] :
+                 rpcState.modulesById)
             {
                 ModuleRow row{};
                 row.id = id;
@@ -967,8 +984,8 @@ namespace
                 row.loaded = record.loaded;
                 modules.push_back(std::move(row));
             }
-            moduleLogCount = g_sif_module_log_count;
-            nextModuleId = g_next_sif_module_id;
+            moduleLogCount = rpcState.moduleLogCount;
+            nextModuleId = rpcState.nextModuleId;
         }
         std::sort(modules.begin(), modules.end(), [](const ModuleRow &a, const ModuleRow &b)
                   { return a.id < b.id; });
@@ -999,14 +1016,16 @@ namespace
         uint32_t rpcServerIndex = 0;
         uint32_t rpcActiveQueue = 0;
         {
-            std::lock_guard<std::mutex> lock(g_rpc_mutex);
-            rpcInitialized = g_rpc_initialized;
-            rpcNextId = g_rpc_next_id;
-            rpcPacketIndex = g_rpc_packet_index;
-            rpcServerIndex = g_rpc_server_index;
-            rpcActiveQueue = g_rpc_active_queue;
-            servers.reserve(g_rpc_servers.size());
-            for (const auto &[sid, state] : g_rpc_servers)
+            std::lock_guard<std::mutex> lock(
+                rpcState.rpcMutex);
+            rpcInitialized = rpcState.initialized;
+            rpcNextId = rpcState.nextRequestId;
+            rpcPacketIndex = rpcState.packetIndex;
+            rpcServerIndex = rpcState.serverIndex;
+            rpcActiveQueue = rpcState.activeQueue;
+            servers.reserve(rpcState.servers.size());
+            for (const auto &[sid, state] :
+                 rpcState.servers)
             {
                 RpcServerRow row{};
                 row.sid = sid;
@@ -1015,8 +1034,9 @@ namespace
                 servers.push_back(row);
             }
 
-            clients.reserve(g_rpc_clients.size());
-            for (const auto &[clientPtr, state] : g_rpc_clients)
+            clients.reserve(rpcState.clients.size());
+            for (const auto &[clientPtr, state] :
+                 rpcState.clients)
             {
                 RpcClientRow row{};
                 row.clientPtr = clientPtr;
@@ -1253,15 +1273,19 @@ namespace
     void drawRpcHistoryTab(PS2Runtime &runtime)
     {
         const ps2x::iop::DebugSnapshot iopSnapshot = runtime.iopDebugSnapshot();
+        EeRpcRuntimeState &rpcState =
+            runtime.eeRpcRuntimeState();
         std::vector<SifRpcDebugEvent> events;
         uint64_t nextSeq = 0;
         {
-            std::lock_guard<std::mutex> lock(g_rpc_mutex);
-            nextSeq = g_sif_rpc_debug_next_seq;
+            std::lock_guard<std::mutex> lock(
+                rpcState.rpcMutex);
+            nextSeq = rpcState.nextDebugSequence;
             events.reserve(kSifRpcDebugHistoryCount);
             for (size_t i = 0; i < kSifRpcDebugHistoryCount; ++i)
             {
-                const SifRpcDebugEvent &event = g_sif_rpc_debug_history[i];
+                const SifRpcDebugEvent &event =
+                    rpcState.debugHistory[i];
                 if (event.seq != 0u)
                 {
                     events.push_back(event);
@@ -1438,11 +1462,12 @@ namespace
         ImGui::TextUnformatted(bytes);
     }
 
-    void drawPadTab()
+    void drawPadTab(PS2Runtime &runtime)
     {
-        const ps2_stubs::PadDebugSnapshot snapshot = ps2_stubs::getPadDebugSnapshot();
+        const ps2_stubs::PadDebugSnapshot snapshot =
+            ps2_stubs::getPadDebugSnapshot(&runtime);
 
-        ImGui::SeparatorText("PAD global state");
+        ImGui::SeparatorText("PAD runtime state");
         ImGui::Text("override=%u readLogCount=%d", snapshot.overrideEnabled ? 1u : 0u, snapshot.readLogCount);
         ImGui::SameLine();
         ImGui::Text("override buttons=0x%04X lx=%u ly=%u rx=%u ry=%u",
@@ -1777,9 +1802,8 @@ namespace
 
     void drawFileCdTab(PS2Runtime &runtime)
     {
-        (void)runtime;
-
-        const PS2Runtime::IoPaths &ioPaths = PS2Runtime::getIoPaths();
+        const PS2Runtime::IoPaths ioPaths =
+            runtime.ioPaths();
         ImGui::SeparatorText("Runtime IO paths");
         textPath("ELF", ioPaths.elfPath);
         textPath("ELF dir", ioPaths.elfDirectory);
@@ -1791,25 +1815,35 @@ namespace
         bool pathsInitialized = false;
         std::filesystem::path hostBase;
         std::filesystem::path cdromBase;
+        std::filesystem::path mcBase;
         std::filesystem::path hostCwd;
         std::filesystem::path cdromCwd;
+        std::filesystem::path mcCwd;
         std::string cwdDevice;
+        EeFileRuntimeState &fileState =
+            runtime.eeFileRuntimeState();
         {
-            std::lock_guard<std::mutex> lock(g_ps2_path_mutex);
-            pathsInitialized = g_ps2_paths_initialized;
-            hostBase = g_host_base;
-            cdromBase = g_cdrom_base;
-            hostCwd = g_host_cwd;
-            cdromCwd = g_cdrom_cwd;
-            cwdDevice = g_ps2_cwd_device;
+            std::lock_guard<std::mutex> lock(
+                fileState.pathMutex);
+            pathsInitialized =
+                fileState.pathsInitialized;
+            hostBase = fileState.hostBase;
+            cdromBase = fileState.cdromBase;
+            mcBase = fileState.mcBase;
+            hostCwd = fileState.hostCwd;
+            cdromCwd = fileState.cdromCwd;
+            mcCwd = fileState.mcCwd;
+            cwdDevice = fileState.cwdDevice;
         }
 
         ImGui::SeparatorText("PS2 path resolver");
         ImGui::Text("initialized=%u cwdDevice=%s", pathsInitialized ? 1u : 0u, cwdDevice.c_str());
         textPath("host base", hostBase);
         textPath("cdrom base", cdromBase);
+        textPath("mc base", mcBase);
         textPath("host cwd", hostCwd);
         textPath("cdrom cwd", cdromCwd);
+        textPath("mc cwd", mcCwd);
 
         struct FdRow
         {
@@ -1819,9 +1853,11 @@ namespace
 
         std::vector<FdRow> fds;
         {
-            std::lock_guard<std::mutex> lock(g_fd_mutex);
-            fds.reserve(g_fileDescriptors.size());
-            for (const auto &[fd, file] : g_fileDescriptors)
+            std::lock_guard<std::mutex> lock(
+                fileState.descriptorMutex);
+            fds.reserve(fileState.descriptors.size());
+            for (const auto &[fd, file] :
+                 fileState.descriptors)
             {
                 fds.push_back(FdRow{fd, file});
             }
@@ -1847,7 +1883,8 @@ namespace
             ImGui::EndTable();
         }
 
-        const ps2_stubs::CdDebugSnapshot cd = ps2_stubs::getCdDebugSnapshot();
+        const ps2_stubs::CdDebugSnapshot cd =
+            ps2_stubs::getCdDebugSnapshot(&runtime);
         ImGui::SeparatorText("CDVD / sceCd state");
         ImGui::Text("initialized=%u lastError=%d mode=0x%08X streamingLbn=0x%08X endLbn=0x%08X nextPseudoLbn=0x%08X",
                     cd.initialized ? 1u : 0u,
@@ -1898,7 +1935,9 @@ namespace
             ImGui::EndTable();
         }
 
-        const ps2_stubs::MemoryCardDebugSnapshot mc = ps2_stubs::getMemoryCardDebugSnapshot();
+        const ps2_stubs::MemoryCardDebugSnapshot mc =
+            ps2_stubs::getMemoryCardDebugSnapshot(
+                &runtime);
         ImGui::SeparatorText("Memory card state");
         ImGui::Text("lastCmd=0x%X lastResult=%d nextFd=%d cvCursor=%d openFiles=%zu",
                     mc.lastCmd,
@@ -2254,12 +2293,12 @@ void PS2DebugPanel::draw(PS2Runtime &runtime)
             }
             if (ImGui::BeginTabItem("Threads"))
             {
-                drawThreadsTab();
+                drawThreadsTab(runtime);
                 ImGui::EndTabItem();
             }
             if (ImGui::BeginTabItem("Kernel"))
             {
-                drawKernelTab();
+                drawKernelTab(runtime);
                 ImGui::EndTabItem();
             }
             if (ImGui::BeginTabItem("IOP/SIF"))
@@ -2274,7 +2313,7 @@ void PS2DebugPanel::draw(PS2Runtime &runtime)
             }
             if (ImGui::BeginTabItem("PAD"))
             {
-                drawPadTab();
+                drawPadTab(runtime);
                 ImGui::EndTabItem();
             }
             if (ImGui::BeginTabItem("File/CD"))

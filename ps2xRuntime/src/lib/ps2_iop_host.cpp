@@ -249,8 +249,8 @@ uint32_t PS2IopHostAdapter::allocateIopHandle(ps2x::iop::IopHandleKind kind)
         return 0;
     }
     return kind == ps2x::iop::IopHandleKind::RpcPacket
-               ? rpcAllocPacketAddr(rdram)
-               : rpcAllocServerAddr(rdram);
+               ? rpcAllocPacketAddr(rdram, &m_runtime)
+               : rpcAllocServerAddr(rdram, &m_runtime);
 }
 
 uint32_t PS2IopHostAdapter::allocateGuest(uint32_t size, uint32_t alignment)
@@ -290,7 +290,8 @@ uint64_t PS2IopHostAdapter::virtualTimeNanoseconds() const
 {
     constexpr uint64_t kTicksPerSecond = 60u;
     constexpr uint64_t kNanosecondsPerSecond = 1'000'000'000u;
-    const uint64_t tick = ps2_syscalls::GetCurrentVSyncTick();
+    const uint64_t tick =
+        ps2_syscalls::GetCurrentVSyncTick(&m_runtime);
     const uint64_t wholeSeconds = tick / kTicksPerSecond;
     if (wholeSeconds > std::numeric_limits<uint64_t>::max() / kNanosecondsPerSecond)
     {
@@ -303,7 +304,8 @@ uint64_t PS2IopHostAdapter::virtualTimeNanoseconds() const
 
 std::string PS2IopHostAdapter::hostPath(ps2x::iop::HostPathKind kind) const
 {
-    const PS2Runtime::IoPaths &paths = PS2Runtime::getIoPaths();
+    const PS2Runtime::IoPaths paths =
+        m_runtime.ioPaths();
     switch (kind)
     {
     case ps2x::iop::HostPathKind::CdRoot:
@@ -322,7 +324,9 @@ std::string PS2IopHostAdapter::hostPath(ps2x::iop::HostPathKind kind) const
 
 std::string PS2IopHostAdapter::translateGuestPath(std::string_view path) const
 {
-    return translatePs2Path(std::string(path).c_str());
+    return translatePs2Path(
+        std::string(path).c_str(),
+        &m_runtime);
 }
 
 uint64_t PS2IopHostAdapter::openHostFile(std::string_view path)
@@ -503,7 +507,9 @@ int32_t PS2IopHostAdapter::memoryCard(const ps2x::iop::MemoryCardRequest &reques
     handler(m_activeRdram ? m_activeRdram : m_runtime.memory().getRDRAM(),
             &context,
             &m_runtime);
-    return ps2_stubs::getMemoryCardDebugSnapshot().lastResult;
+    return ps2_stubs::getMemoryCardDebugSnapshot(
+               &m_runtime)
+        .lastResult;
 }
 
 bool PS2IopHostAdapter::hasGuestFunction(uint32_t address) const

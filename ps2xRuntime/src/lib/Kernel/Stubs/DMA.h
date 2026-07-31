@@ -4,6 +4,7 @@
 
 namespace ps2_stubs
 {
+    void resetDmaState(PS2Runtime *runtime);
     void DmaAddr(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
     void sceDmaCallback(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
     void sceDmaDebug(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);

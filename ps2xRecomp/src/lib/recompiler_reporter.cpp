@@ -113,6 +113,18 @@ namespace ps2recomp
         m_counters.generatedFunctions += count;
     }
 
+    void RecompilerReporter::recordResumeEntryTargetsAudited(size_t count)
+    {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        m_counters.resumeEntryTargetsAudited += count;
+    }
+
+    void RecompilerReporter::recordResumeEntryTargetsRegistered(size_t count)
+    {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        m_counters.resumeEntryTargetsRegistered += count;
+    }
+
     void RecompilerReporter::recordIndirectFallbackPromotion(const std::string &functionName,
                                                              const std::vector<uint32_t> &jumpAddresses,
                                                              size_t promotedEntryCount)
@@ -147,8 +159,9 @@ namespace ps2recomp
         }
     }
 
-    const RecompilerReporter::Counters &RecompilerReporter::counters() const
+    RecompilerReporter::Counters RecompilerReporter::counters() const
     {
+        std::lock_guard<std::mutex> lock(m_mutex);
         return m_counters;
     }
 
@@ -180,6 +193,9 @@ namespace ps2recomp
            << ", decode failures: " << m_counters.decodeFailures << std::endl;
         os << "Additional entrypoints: " << m_counters.additionalEntryPoints << std::endl;
         os << "Generated functions: " << m_counters.generatedFunctions << std::endl;
+        os << "Internal resume targets: " << m_counters.resumeEntryTargetsAudited
+           << " audited, " << m_counters.resumeEntryTargetsRegistered
+           << " registered" << std::endl;
         os << "Indirect fallback promotions: " << m_counters.indirectFallbackPromotions
            << " (" << m_counters.indirectFallbackEntries << " fallback entries)" << std::endl;
         os << "Unhandled instructions: " << m_counters.unhandledInstructions << std::endl;

@@ -7,6 +7,7 @@
 #include <cstdint>
 #include <cstring>
 #include <deque>
+#include <functional>
 #include <mutex>
 #include <vector>
 
@@ -336,6 +337,8 @@ public:
 
     void init(uint8_t *vram, uint32_t vramSize, struct GSRegisters *privRegs = nullptr);
     void reset();
+    void setVSyncTickProvider(
+        std::function<uint64_t()> provider);
 
     void processGIFPacket(const uint8_t *data, uint32_t sizeBytes);
     bool processNativePackedGIFPacket(const uint8_t *data, uint32_t sizeBytes);
@@ -400,6 +403,7 @@ private:
     void writeRegisterPacked(uint8_t regDesc, uint64_t lo, uint64_t hi);
     void vertexKick(bool drawing);
     void latchHostPresentationFrameUnlocked();
+    uint64_t currentVSyncTickUnlocked() const;
 
     void recordDebugEventUnlocked(GSDebugHistoryEntry entry);
     GSDebugHistoryEntry makeDebugEventUnlocked(GSDebugEventKind kind) const;
@@ -429,6 +433,7 @@ private:
     uint32_t m_vramSize = 0;
     struct GSRegisters *m_privRegs = nullptr;
     mutable std::recursive_mutex m_stateMutex;
+    std::function<uint64_t()> m_vsyncTickProvider;
 
     GSContext m_ctx[2];
     GSPrimReg m_prim{};

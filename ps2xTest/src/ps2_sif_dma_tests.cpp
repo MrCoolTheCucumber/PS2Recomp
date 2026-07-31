@@ -13,11 +13,6 @@
 #include <string_view>
 #include <vector>
 
-namespace ps2_stubs
-{
-    void resetSifState();
-}
-
 namespace
 {
     constexpr int KE_OK = 0;
@@ -30,7 +25,7 @@ namespace
 
         TestEnv() : rdram(PS2_RAM_SIZE, 0u)
         {
-            ps2_stubs::resetSifState();
+            ps2_stubs::resetSifState(&runtime);
             std::memset(&ctx, 0, sizeof(ctx));
             if (!runtime.memory().initialize())
             {
@@ -220,6 +215,136 @@ void register_ps2_sif_dma_tests()
 {
     MiniTest::Case("PS2SifDma", [](TestCase &tc)
     {
+        tc.Run("SIF command heap and DMA state is isolated per runtime", [](TestCase &t)
+        {
+            TestEnv first;
+            TestEnv second;
+
+            constexpr uint32_t kTransientReg = 0x80000002u;
+            constexpr uint32_t kFirstRegValue = 0x11112222u;
+            constexpr uint32_t kSecondRegValue = 0x33334444u;
+            constexpr uint32_t kFirstCmdBuffer = 0x00024000u;
+            constexpr uint32_t kSecondCmdBuffer = 0x00028000u;
+
+            const auto setSifReg =
+                [](TestEnv &env, uint32_t reg, uint32_t value)
+            {
+                setRegU32(env.ctx, 4, reg);
+                setRegU32(env.ctx, 5, value);
+                ps2_stubs::sceSifSetReg(
+                    env.rdram.data(),
+                    &env.ctx,
+                    &env.runtime);
+            };
+            const auto getSifReg =
+                [](TestEnv &env, uint32_t reg)
+            {
+                setRegU32(env.ctx, 4, reg);
+                ps2_stubs::sceSifGetReg(
+                    env.rdram.data(),
+                    &env.ctx,
+                    &env.runtime);
+                return ::getRegU32(&env.ctx, 2);
+            };
+            const auto setCmdBuffer =
+                [](TestEnv &env, uint32_t address)
+            {
+                setRegU32(env.ctx, 4, address);
+                ps2_stubs::sceSifSetCmdBuffer(
+                    env.rdram.data(),
+                    &env.ctx,
+                    &env.runtime);
+            };
+            const auto getCmdBuffer =
+                [](TestEnv &env)
+            {
+                ps2_stubs::sceSifGetDataTable(
+                    env.rdram.data(),
+                    &env.ctx,
+                    &env.runtime);
+                return ::getRegU32(&env.ctx, 2);
+            };
+            const auto allocateHeap =
+                [](TestEnv &env, uint32_t size)
+            {
+                setRegU32(env.ctx, 4, size);
+                ps2_stubs::sceSifAllocIopHeap(
+                    env.rdram.data(),
+                    &env.ctx,
+                    &env.runtime);
+                return ::getRegU32(&env.ctx, 2);
+            };
+
+            setSifReg(
+                first, kTransientReg, kFirstRegValue);
+            setSifReg(
+                second, kTransientReg, kSecondRegValue);
+            t.Equals(
+                getSifReg(first, kTransientReg),
+                kFirstRegValue,
+                "the second runtime must not replace the first SIF register");
+            t.Equals(
+                getSifReg(second, kTransientReg),
+                kSecondRegValue,
+                "the second runtime should retain its own SIF register");
+
+            setCmdBuffer(first, kFirstCmdBuffer);
+            setCmdBuffer(second, kSecondCmdBuffer);
+            t.Equals(
+                getCmdBuffer(first),
+                kFirstCmdBuffer,
+                "the first runtime must retain its SIF command buffer");
+            t.Equals(
+                getCmdBuffer(second),
+                kSecondCmdBuffer,
+                "the second runtime must retain its SIF command buffer");
+
+            const uint32_t firstHeap =
+                allocateHeap(first, 0x40u);
+            const uint32_t secondHeap =
+                allocateHeap(second, 0x40u);
+            t.IsTrue(
+                firstHeap != 0u && secondHeap != 0u,
+                "both runtimes should allocate SIF heap storage");
+            t.Equals(
+                secondHeap,
+                firstHeap,
+                "each runtime should independently allocate the first SIF heap block");
+
+            constexpr uint32_t kDescAddr = 0x00020000u;
+            constexpr uint32_t kSrcAddr = 0x00020100u;
+            constexpr uint32_t kIopDstAddr = 0x00001000u;
+            const Ps2SifDmaTransfer descriptor{
+                kSrcAddr,
+                kIopDstAddr,
+                4,
+                0};
+            std::memcpy(
+                first.rdram.data() + kDescAddr,
+                &descriptor,
+                sizeof(descriptor));
+            std::memcpy(
+                second.rdram.data() + kDescAddr,
+                &descriptor,
+                sizeof(descriptor));
+            writeGuestU32(
+                first.rdram.data(), kSrcAddr, 0xA1A2A3A4u);
+            writeGuestU32(
+                second.rdram.data(), kSrcAddr, 0xB1B2B3B4u);
+
+            const int32_t firstDma =
+                submitSifDma(first, kDescAddr, 1u);
+            const int32_t secondDma =
+                submitSifDma(second, kDescAddr, 1u);
+            t.IsTrue(
+                firstDma > 0 && secondDma > 0,
+                "both runtimes should submit SIF DMA work");
+            t.Equals(
+                secondDma,
+                firstDma,
+                "each runtime should independently allocate the first SIF DMA ID");
+        });
+
         tc.Run("scheduled sceSifSetDma copies into IOP RAM without aliasing EE memory", [](TestCase &t)
         {
             TestEnv env;

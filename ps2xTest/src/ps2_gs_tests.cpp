@@ -5399,9 +5399,10 @@ void register_ps2_gs_tests()
         tc.Run("sceGsSyncV waits on VBlank and reports interlaced field parity", [](TestCase &t)
         {
             notifyRuntimeStop();
-            ps2_stubs::resetGsSyncVCallbackState();
 
             PS2Runtime runtime;
+            ps2_stubs::resetGsSyncVCallbackState(
+                &runtime);
             t.IsTrue(runtime.memory().initialize(), "runtime memory initialize should succeed");
             std::vector<uint8_t> rdram(PS2_RAM_SIZE, 0u);
 
@@ -5433,7 +5434,8 @@ void register_ps2_gs_tests()
 
             runtime.requestStop();
             notifyRuntimeStop();
-            ps2_stubs::resetGsSyncVCallbackState();
+            ps2_stubs::resetGsSyncVCallbackState(
+                &runtime);
         });
 
 

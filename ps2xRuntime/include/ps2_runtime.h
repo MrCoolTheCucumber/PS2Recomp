@@ -20,6 +20,7 @@
 #include <mutex>
 #include <condition_variable>
 #include <chrono>
+#include <exception>
 #include <filesystem>
 #include <iostream>
 #include <iomanip>
@@ -28,7 +29,9 @@
 
 #include "ps2_log.h"
 #include "runtime/cop0_timing.h"
+#include "runtime/ee_execution_backend.h"
 #include "runtime/ee_event_scheduler.h"
+#include "runtime/ee_runtime_executor.h"
 #include "runtime/ps2_address.h"
 #include "runtime/ps2_gif_arbiter.h"
 #include "runtime/ps2_memory.h"
@@ -47,14 +50,40 @@ namespace ps2x::iop
 class PS2IopHostAdapter;
 class PS2IopTransport;
 class PS2DebugServer;
+struct HostPresentationUploadState;
+struct ThreadInfo;
+struct EeThreadRuntimeState;
+struct EeAlarmRuntimeState;
+struct EeSyncRuntimeState;
+struct EeInterruptRuntimeState;
+struct EeKernelRuntimeState;
+struct EeRpcRuntimeState;
+struct EeFileRuntimeState;
+struct Deci2RuntimeState;
+namespace ps2_stubs
+{
+    struct AudioRuntimeState;
+    struct CdRuntimeState;
+    struct DmaRuntimeState;
+    struct LibCRuntimeState;
+    struct MemoryCardRuntimeState;
+    struct PadRuntimeState;
+    class MpegRuntimeState;
+    struct SifRuntimeState;
+}
 
 struct PS2RuntimeConfiguration
 {
+    EeExecutionBackendKind eeExecutionBackend =
+        EeExecutionBackendKind::LegacyHostThread;
+    bool useEeExecutionBackendEnvironment = true;
     VuBackendKind vu0Backend = VuBackendKind::Auto;
     VuBackendKind vu1Backend = VuBackendKind::Auto;
     bool vu0NativeInstrumentation = false;
     bool vu1NativeInstrumentation = false;
     bool useVuBackendEnvironment = true;
+    bool eeThreadDiagnostics = false;
+    bool useEeThreadDiagnosticsEnvironment = true;
 };
 
 enum PS2Exception
@@ -77,6 +106,12 @@ enum PS2Exception
 // after the runtime has entered an EE exception.
 struct PS2GuestException final
 {
+};
+
+enum class PS2GuestCheckpointResult : uint8_t
+{
+    Continue,
+    ExitToDispatcher,
 };
 
 struct PS2GuestFunctionSymbol
@@ -392,6 +427,7 @@ inline void ps2TraceGuestRangeWrite(uint8_t *rdram,
 }
 
 class PS2Runtime
+    : private ps2x::ee::IEeSchedulerExecutorHooks
 {
 public:
     struct IoPaths
@@ -507,12 +543,57 @@ public:
     {
         uint64_t dispatches = 0u;
         uint64_t eeInstructions = 0u;
+        uint64_t vsyncFields = 0u;
+        uint64_t mpegPicturesServed = 0u;
+        uint64_t mpegUniquePicturesServed = 0u;
+        uint64_t mpegRepeatedPicturesServed = 0u;
         uint32_t pc = 0u;
         uint32_t ra = 0u;
         uint32_t sp = 0u;
         uint32_t gp = 0u;
         uint32_t guestExecutionWaiters = 0u;
         uint64_t guestExecutionHandoffTimeouts = 0u;
+    };
+
+    static constexpr size_t
+        kEeThreadDiagnosticPriorityCount = 128u;
+    static constexpr size_t
+        kEeThreadDiagnosticThreadCount = 256u;
+
+    struct DebugEeThreadDiagnostics
+    {
+        bool enabled = false;
+        uint64_t guestLockRequests = 0u;
+        uint64_t guestLockAcquisitions = 0u;
+        uint64_t guestLockContentions = 0u;
+        uint64_t outerGuestExecutionAcquisitions = 0u;
+        uint64_t guestContextChanges = 0u;
+        uint64_t handoffNotifications = 0u;
+        uint64_t handoffWaitRequests = 0u;
+        uint64_t handoffWaitFastPaths = 0u;
+        uint64_t handoffCvWaits = 0u;
+        uint64_t handoffCompletions = 0u;
+        uint64_t handoffTimeouts = 0u;
+        uint64_t yieldRequests = 0u;
+        uint64_t deferredYields = 0u;
+        uint64_t hostThreadYields = 0u;
+        uint64_t requestedGuestSwitches = 0u;
+        uint64_t guestSwitchCvWaits = 0u;
+        uint64_t completedGuestSwitches = 0u;
+        uint64_t guestSwitchTimeouts = 0u;
+        uint64_t rotationRequests = 0u;
+        uint64_t acceptedRotationRequests = 0u;
+        uint64_t rejectedRotationRequests = 0u;
+        uint64_t priorityZeroRotationRequests = 0u;
+        uint64_t untrackedThreadRotationRequests = 0u;
+        std::array<
+            uint64_t,
+            kEeThreadDiagnosticPriorityCount>
+            acceptedRotationsByPriority{};
+        std::array<
+            uint64_t,
+            kEeThreadDiagnosticThreadCount>
+            acceptedRotationsByThread{};
     };
 
     struct DebugEeTiming
@@ -933,6 +1014,7 @@ public:
         PS2Runtime *m_runtime = nullptr;
         R5900Context *m_context = nullptr;
         R5900Context *m_previousContext = nullptr;
+        int m_previousThreadId = 1;
     };
 
     class GuestExecutionReleaseScope
@@ -947,7 +1029,39 @@ public:
     private:
         PS2Runtime *m_runtime = nullptr;
         R5900Context *m_context = nullptr;
+        int m_threadId = 1;
         uint32_t m_depth = 0u;
+    };
+
+    // Transitional worker paths must never block runtime shutdown while
+    // waiting to enter legacy guest execution. Normal guest dispatch uses
+    // GuestExecutionScope; this bounded form lets a worker re-check its
+    // runtime-owned cancellation state between acquisition attempts.
+    class GuestExecutionTryScope
+    {
+    public:
+        GuestExecutionTryScope(
+            PS2Runtime *runtime,
+            R5900Context *context,
+            std::chrono::milliseconds timeout) noexcept;
+        ~GuestExecutionTryScope();
+
+        GuestExecutionTryScope(
+            const GuestExecutionTryScope &) = delete;
+        GuestExecutionTryScope &operator=(
+            const GuestExecutionTryScope &) = delete;
+
+        [[nodiscard]] bool acquired() const noexcept
+        {
+            return m_acquired;
+        }
+
+    private:
+        PS2Runtime *m_runtime = nullptr;
+        R5900Context *m_context = nullptr;
+        R5900Context *m_previousContext = nullptr;
+        int m_previousThreadId = 1;
+        bool m_acquired = false;
     };
 
     class DeferredGuestYieldScope
@@ -986,9 +1100,9 @@ public:
     MissingFunctionPolicy missingFunctionPolicy() const;
     void resetMissingFunctionReportOnce();
 
-    static const IoPaths &getIoPaths();
-    static void setIoPaths(const IoPaths &paths);
-    static void configureIoPathsFromElf(const std::string &elfPath);
+    [[nodiscard]] IoPaths ioPaths() const;
+    void configureIoPaths(const IoPaths &paths);
+    void configureIoPathsFromElf(const std::string &elfPath);
 
     [[noreturn]] void SignalException(R5900Context *ctx, PS2Exception exception);
     [[noreturn]] void SignalMemoryException(R5900Context *ctx,
@@ -1080,14 +1194,31 @@ public:
         uint32_t transferId) const noexcept;
 
     void requestGuestPreemption();
-    bool shouldPreemptGuestExecution();
+    [[nodiscard]] PS2GuestCheckpointResult
+    checkpointGuestExecution(R5900Context *ctx);
+    void yieldGuestExecutionAtBoundary();
     void yieldGuestExecutionAfterWake();
     void waitForGuestExecutionHandoff();
     void waitForGuestExecutionHandoff(uint64_t baselineEpoch);
+    // A raw i* wake publishes READY synchronously but cannot release its
+    // legacy host waiter until the interrupted owner reaches a boundary.
+    // This preserves the same non-rescheduling policy as the EE scheduler.
+    [[nodiscard]] bool
+    shouldDeferLegacyEeWakeNotification() const noexcept;
+    void deferLegacyEeWakeNotification(
+        const std::shared_ptr<ThreadInfo> &thread);
+    void flushDeferredLegacyEeWakeNotifications();
     uint64_t guestExecutionHandoffEpochSnapshot() const
     {
         return m_guestExecutionHandoffEpoch.load(std::memory_order_acquire);
     }
+
+    void recordEeThreadQueueRotation(
+        int threadId,
+        int requestedPriority,
+        int effectivePriority,
+        bool accepted) noexcept;
+    void recordMpegPictureServed(bool repeated) noexcept;
 
     void requestStop();
     bool isStopRequested() const;
@@ -1111,6 +1242,7 @@ public:
     bool debugReadMemory(uint32_t address, uint32_t size, std::vector<uint8_t> &output);
     bool debugCopyGsVram(std::vector<uint8_t> &output);
     DebugRuntimeProgress debugRuntimeProgress() const;
+    DebugEeThreadDiagnostics debugEeThreadDiagnosticsSnapshot() const;
     DebugVu1Timing debugVu1TimingSnapshot();
     std::array<DebugVuBackendDiagnostics, 2u>
     debugVuBackendDiagnosticsSnapshot() const;
@@ -1151,6 +1283,107 @@ public:
     {
         return m_guestExecutionWaiters.load(std::memory_order_acquire);
     }
+    EeThreadRuntimeState &eeThreadRuntimeState();
+    const EeThreadRuntimeState &eeThreadRuntimeState() const;
+    IEeExecutionBackend &eeExecutionBackend();
+    const IEeExecutionBackend &eeExecutionBackend() const;
+    [[nodiscard]] std::string_view
+    eeExecutionBackendName() const noexcept;
+    [[nodiscard]] size_t
+    managedEeExecutionThreadCountForTesting() const;
+    [[nodiscard]] bool
+    eeExecutionQuiescentForTesting() const noexcept;
+    using EeThreadContextImageForTesting = std::pair<
+        int,
+        std::array<uint8_t, sizeof(R5900Context)>>;
+    [[nodiscard]] std::vector<
+        EeThreadContextImageForTesting>
+    eeThreadContextsForTesting();
+    [[nodiscard]] bool
+    usesDedicatedEeExecutor() const noexcept;
+    // Headless lifecycle seams used by focused runtime fixtures. The generic
+    // pair starts whichever production backend was selected; the dedicated
+    // pair retains the stricter executor-only contract used by fiber-specific
+    // tests.
+    void startEeExecutionForTesting();
+    void stopEeExecutionForTesting();
+    void startDedicatedEeExecutionForTesting();
+    void stopDedicatedEeExecutionForTesting();
+    // Complete a kernel reset after guest thread state has been released.
+    // Unlike requestStop(), this retires native EE continuations without
+    // publishing runtime shutdown, so a fresh execution epoch may start on
+    // the same runtime.
+    void completeEeExecutionKernelReset();
+    [[nodiscard]] bool publishEeExecutorUpdate(
+        std::function<void(
+            ps2x::ee::EeThreadScheduler &,
+            IEeExecutionBackend &)> update,
+        ps2x::ee::EeSchedulerReschedulePolicy policy =
+            ps2x::ee::EeSchedulerReschedulePolicy::
+                HigherPriorityOnly);
+    [[nodiscard]] bool publishEeSchedulerUpdate(
+        std::function<void(
+            ps2x::ee::EeThreadScheduler &)> update,
+        ps2x::ee::EeSchedulerReschedulePolicy policy =
+            ps2x::ee::EeSchedulerReschedulePolicy::
+                HigherPriorityOnly);
+    [[nodiscard]] bool publishEeSchedulerUpdateAt(
+        std::chrono::steady_clock::time_point deadline,
+        std::function<void(
+            ps2x::ee::EeThreadScheduler &)> update,
+        ps2x::ee::EeSchedulerReschedulePolicy policy =
+            ps2x::ee::EeSchedulerReschedulePolicy::
+                HigherPriorityOnly);
+    void invokeEeSchedulerUpdateAtBoundary(
+        std::function<void(
+            ps2x::ee::EeThreadScheduler &)> update,
+        ps2x::ee::EeSchedulerReschedulePolicy policy =
+            ps2x::ee::EeSchedulerReschedulePolicy::
+                HigherPriorityOnly);
+    void yieldEeExecutorCurrent(
+        ps2x::ee::EeSchedulerExitReason reason,
+        ps2x::ee::EeSchedulerWaitKey wait = {});
+    [[nodiscard]] const void *
+    hostPresentationUploadStateIdentityForTesting() const noexcept;
+    [[nodiscard]] size_t
+    pendingAlarmCallbackCountForTesting();
+    EeAlarmRuntimeState &eeAlarmRuntimeState();
+    const EeAlarmRuntimeState &eeAlarmRuntimeState() const;
+    EeSyncRuntimeState &eeSyncRuntimeState();
+    const EeSyncRuntimeState &eeSyncRuntimeState() const;
+    EeInterruptRuntimeState &eeInterruptRuntimeState();
+    const EeInterruptRuntimeState &eeInterruptRuntimeState() const;
+    EeKernelRuntimeState &eeKernelRuntimeState();
+    const EeKernelRuntimeState &eeKernelRuntimeState() const;
+    EeRpcRuntimeState &eeRpcRuntimeState();
+    const EeRpcRuntimeState &eeRpcRuntimeState() const;
+    EeFileRuntimeState &eeFileRuntimeState();
+    const EeFileRuntimeState &eeFileRuntimeState() const;
+    Deci2RuntimeState &deci2RuntimeState();
+    const Deci2RuntimeState &deci2RuntimeState() const;
+    ps2_stubs::AudioRuntimeState &audioRuntimeState();
+    const ps2_stubs::AudioRuntimeState &
+    audioRuntimeState() const;
+    ps2_stubs::CdRuntimeState &cdRuntimeState();
+    const ps2_stubs::CdRuntimeState &cdRuntimeState() const;
+    ps2_stubs::DmaRuntimeState &dmaRuntimeState();
+    const ps2_stubs::DmaRuntimeState &dmaRuntimeState() const;
+    ps2_stubs::LibCRuntimeState &libcRuntimeState();
+    const ps2_stubs::LibCRuntimeState &libcRuntimeState() const;
+    ps2_stubs::MemoryCardRuntimeState &
+    memoryCardRuntimeState();
+    const ps2_stubs::MemoryCardRuntimeState &
+    memoryCardRuntimeState() const;
+    ps2_stubs::PadRuntimeState &padRuntimeState();
+    const ps2_stubs::PadRuntimeState &padRuntimeState() const;
+    ps2_stubs::SifRuntimeState &sifRuntimeState();
+    const ps2_stubs::SifRuntimeState &
+    sifRuntimeState() const;
+    ps2_stubs::MpegRuntimeState &mpegRuntimeState();
+    const ps2_stubs::MpegRuntimeState &mpegRuntimeState() const;
+    int activeEeHostThreadCount() const;
+    int currentEeThreadId() noexcept;
+    uint64_t eeThreadLegacyAdapterMismatchCount() const noexcept;
     bool guestPreemptionRequestedForTesting() const
     {
         return m_guestExecutionPreemptionRequested.load(
@@ -1216,6 +1449,33 @@ public:
     inline const PSPadBackend &padBackend() const { return m_padBackend; }
 
 private:
+    void startDedicatedEeExecution();
+    void joinDedicatedEeExecution();
+    void runMainEeContinuation();
+    [[nodiscard]] ps2x::timing::EeTickDelta
+    eeExecutorElapsedSinceSelection() const noexcept;
+
+    void commitPriorContext(
+        std::optional<int> priorThreadId,
+        ps2x::timing::EeTickDelta elapsed,
+        ps2x::timing::EeTick now) override;
+    void publishSelectedContext(
+        std::optional<int> selectedThreadId,
+        ps2x::timing::EeTick now) override;
+    void publishWaitCompletion(
+        int threadId,
+        ps2x::ee::EeSchedulerCompletedWait completion,
+        ps2x::timing::EeTick now) override;
+    [[nodiscard]] bool hasImmediateConsequence(
+        ps2x::ee::EeSchedulerConsequenceStage stage,
+        ps2x::timing::EeTick now) const override;
+    [[nodiscard]] ps2x::ee::
+        EeSchedulerReschedulePolicy
+    applyNextConsequence(
+        ps2x::ee::EeSchedulerConsequenceStage stage,
+        ps2x::timing::EeTick now,
+        ps2x::ee::EeThreadScheduler &scheduler) override;
+
     struct EeVSyncDurations;
     enum class EeVSyncVideoModeClass : uint8_t;
     struct PendingVSyncDelivery;
@@ -1238,15 +1498,34 @@ private:
     uint32_t allocateGuestBlockLocked(uint32_t size, uint32_t alignment);
     void freeGuestBlockLocked(uint32_t guestAddr);
     void coalesceGuestHeapLocked();
-    R5900Context *enterGuestExecution(R5900Context *context);
+    R5900Context *enterGuestExecution(
+        R5900Context *context,
+        int *previousThreadId = nullptr,
+        int selectionHint = 0);
+    bool tryEnterGuestExecution(
+        R5900Context *context,
+        std::chrono::milliseconds timeout,
+        R5900Context *&previousContext,
+        int &previousThreadId,
+        int selectionHint = 0);
+    void lockGuestExecutionMutex(bool mayContend);
+    void recordOuterGuestExecutionAcquisition(
+        R5900Context *context) noexcept;
     void leaveGuestExecution(
         R5900Context *context,
-        R5900Context *previousContext);
-    uint32_t releaseGuestExecution(R5900Context *&context);
+        R5900Context *previousContext,
+        int previousThreadId);
+    uint32_t releaseGuestExecution(
+        R5900Context *&context,
+        int &threadId);
     void reacquireGuestExecution(
         uint32_t depth,
-        R5900Context *context);
+        R5900Context *context,
+        int threadId);
     void markGuestExecutionAcquired();
+    [[nodiscard]] bool
+    invokeEeExecutorTaskAtBoundary(
+        std::function<void()> task);
     void debugBeforeGuestStep(R5900Context *ctx);
     void debugAfterGuestStep(R5900Context *ctx);
     void debugBlockGuestAtBoundary(R5900Context *ctx, const char *reason);
@@ -1274,6 +1553,7 @@ private:
 
     friend class GuestExecutionScope;
     friend class GuestExecutionReleaseScope;
+    friend class GuestExecutionTryScope;
     friend class PS2IopTransport;
     friend class PS2DebugServer;
 
@@ -1397,6 +1677,7 @@ private:
         uint32_t address,
         uint32_t size);
     void drainPendingEeCounterHandlers(uint8_t *rdram);
+    void drainPendingAlarmCallbacks();
     [[nodiscard]] static bool overlapsEeCounterRegister(
         uint32_t address, uint32_t size) noexcept;
     void scheduleEeVSyncEvent(
@@ -1461,19 +1742,29 @@ private:
         R5900Context *context) noexcept;
     [[nodiscard]] ps2x::timing::EeTick finishEeContextBlock(
         R5900Context *context) noexcept;
-    void switchGuestExecutionContext(R5900Context *context) noexcept;
+    int threadIdForEeContext(
+        const R5900Context *context) noexcept;
+    void selectEeThread(int threadId) noexcept;
+    void switchGuestExecutionContext(
+        R5900Context *context,
+        int selectionHint = 0) noexcept;
     void restoreGuestExecutionContext(
         R5900Context *context,
-        R5900Context *previousContext) noexcept;
+        R5900Context *previousContext,
+        int previousThreadId) noexcept;
     void resetEeTimingUnlocked(R5900Context *context) noexcept;
 
     PS2Memory m_memory;
     GifArbiter m_gifArbiter;
     GS m_gs;
+    std::unique_ptr<HostPresentationUploadState>
+        m_hostPresentationUploadState;
     std::unique_ptr<PS2IopHostAdapter> m_iopHost;
     std::unique_ptr<ps2x::iop::IopSubsystem> m_iopSubsystem;
     PS2AudioBackend m_audioBackend;
     PSPadBackend m_padBackend;
+    mutable std::mutex m_ioPathsMutex;
+    IoPaths m_ioPaths;
     VuUnit m_vu0;
     VuUnit m_vu1;
     ps2x::timing::Cop0Timing m_cop0Timing;
@@ -1619,21 +1910,84 @@ private:
         kMaximumPendingVSyncDeliveries>
         m_pendingVSyncDeliveries{};
     size_t m_pendingVSyncDeliveryCount = 0u;
+    // Executor-only callback publication state. A suspended guest fiber can
+    // retain its outer GuestExecutionScope across many scheduler boundaries,
+    // so the legacy scope destructor is not a boundary for the dedicated
+    // backend. Drain published interrupt work once from each explicit
+    // executor boundary instead.
+    bool m_eeExecutorInterruptPassComplete = false;
     ps2x::timing::EeTick m_vu0CycleTick{};
     std::atomic<uint64_t> m_vu0InvocationSequence{0u};
     std::atomic<uint64_t> m_vu0CurrentInvocation{0u};
     std::atomic<uint64_t> m_vu0CurrentInvocationInstruction{0u};
     R5900Context m_cpuContext;
+    std::unique_ptr<EeThreadRuntimeState> m_eeThreadRuntimeState;
+    std::unique_ptr<IEeExecutionBackend>
+        m_eeExecutionBackend;
+    std::unique_ptr<ps2x::ee::EeRuntimeExecutor>
+        m_eeRuntimeExecutor;
+    mutable std::mutex
+        m_headlessEeExecutionFailureMutex;
+    std::exception_ptr
+        m_headlessEeExecutionFailure;
+    ps2x::timing::EeTick
+        m_eeExecutorDispatchStartTick{};
     R5900Context *m_boundEeContext = nullptr;
+    int m_boundEeThreadId = 1;
     mutable std::recursive_timed_mutex m_guestExecutionMutex;
     mutable std::atomic<uint32_t> m_guestExecutionWaiters{0u};
+    mutable std::mutex m_legacyDeferredEeWakeMutex;
+    std::vector<std::weak_ptr<ThreadInfo>>
+        m_legacyDeferredEeWakeNotifications;
     mutable std::mutex m_guestExecutionHandoffMutex;
     mutable std::condition_variable m_guestExecutionHandoffCv;
     mutable std::mutex m_eeIdleAdvanceMutex;
     std::atomic<uint64_t> m_guestExecutionHandoffEpoch{0u};
     std::atomic<uint64_t> m_guestExecutionHandoffTimeouts{0u};
-    std::atomic<uint64_t> m_guestExecutionPreemptionEpoch{0u};
+    std::atomic<uint64_t>
+        m_guestExecutionDispatcherExitEpoch{0u};
     std::atomic<bool> m_guestExecutionPreemptionRequested{false};
+    bool m_eeThreadDiagnosticsEnabled = false;
+    bool m_eeThreadDiagnosticsHasLastOuterContext = false;
+    R5900Context *m_eeThreadDiagnosticsLastOuterContext = nullptr;
+    std::atomic<uint64_t> m_eeThreadDiagnosticGuestLockRequests{0u};
+    std::atomic<uint64_t> m_eeThreadDiagnosticGuestLockAcquisitions{0u};
+    std::atomic<uint64_t> m_eeThreadDiagnosticGuestLockContentions{0u};
+    std::atomic<uint64_t>
+        m_eeThreadDiagnosticOuterGuestExecutionAcquisitions{0u};
+    std::atomic<uint64_t> m_eeThreadDiagnosticGuestContextChanges{0u};
+    std::atomic<uint64_t> m_eeThreadDiagnosticHandoffNotifications{0u};
+    std::atomic<uint64_t> m_eeThreadDiagnosticHandoffWaitRequests{0u};
+    std::atomic<uint64_t> m_eeThreadDiagnosticHandoffWaitFastPaths{0u};
+    std::atomic<uint64_t> m_eeThreadDiagnosticHandoffCvWaits{0u};
+    std::atomic<uint64_t> m_eeThreadDiagnosticHandoffCompletions{0u};
+    std::atomic<uint64_t> m_eeThreadDiagnosticHandoffTimeouts{0u};
+    std::atomic<uint64_t> m_eeThreadDiagnosticYieldRequests{0u};
+    std::atomic<uint64_t> m_eeThreadDiagnosticDeferredYields{0u};
+    std::atomic<uint64_t> m_eeThreadDiagnosticHostThreadYields{0u};
+    std::atomic<uint64_t> m_eeThreadDiagnosticRequestedGuestSwitches{0u};
+    std::atomic<uint64_t> m_eeThreadDiagnosticGuestSwitchCvWaits{0u};
+    std::atomic<uint64_t> m_eeThreadDiagnosticCompletedGuestSwitches{0u};
+    std::atomic<uint64_t> m_eeThreadDiagnosticGuestSwitchTimeouts{0u};
+    std::atomic<uint64_t> m_eeThreadDiagnosticRotationRequests{0u};
+    std::atomic<uint64_t> m_eeThreadDiagnosticAcceptedRotationRequests{0u};
+    std::atomic<uint64_t> m_eeThreadDiagnosticRejectedRotationRequests{0u};
+    std::atomic<uint64_t>
+        m_eeThreadDiagnosticPriorityZeroRotationRequests{0u};
+    std::atomic<uint64_t>
+        m_eeThreadDiagnosticUntrackedThreadRotationRequests{0u};
+    std::array<
+        std::atomic<uint64_t>,
+        kEeThreadDiagnosticPriorityCount>
+        m_eeThreadDiagnosticAcceptedRotationsByPriority{};
+    std::array<
+        std::atomic<uint64_t>,
+        kEeThreadDiagnosticThreadCount>
+        m_eeThreadDiagnosticAcceptedRotationsByThread{};
+    std::atomic<uint64_t> m_debugVSyncFields{0u};
+    std::atomic<uint64_t> m_debugMpegPicturesServed{0u};
+    std::atomic<uint64_t> m_debugMpegUniquePicturesServed{0u};
+    std::atomic<uint64_t> m_debugMpegRepeatedPicturesServed{0u};
     std::atomic<bool> m_dmacCompletionReady{false};
     std::atomic<bool> m_dmacInterruptDeliveryDirty{false};
     std::atomic<uint64_t> m_dmacInterruptDrainPasses{0u};
@@ -1746,6 +2100,36 @@ private:
 #if defined(PS2X_ENABLE_DEBUG_SERVER) && PS2X_ENABLE_DEBUG_SERVER
     std::unique_ptr<PS2DebugServer> m_debugServer;
 #endif
+    std::unique_ptr<ps2_stubs::MpegRuntimeState>
+        m_mpegRuntimeState;
+    std::unique_ptr<EeSyncRuntimeState> m_eeSyncRuntimeState;
+    std::unique_ptr<EeInterruptRuntimeState>
+        m_eeInterruptRuntimeState;
+    std::unique_ptr<EeKernelRuntimeState>
+        m_eeKernelRuntimeState;
+    std::unique_ptr<EeRpcRuntimeState>
+        m_eeRpcRuntimeState;
+    std::unique_ptr<EeFileRuntimeState>
+        m_eeFileRuntimeState;
+    std::unique_ptr<Deci2RuntimeState>
+        m_deci2RuntimeState;
+    std::unique_ptr<ps2_stubs::AudioRuntimeState>
+        m_audioRuntimeState;
+    std::unique_ptr<ps2_stubs::CdRuntimeState>
+        m_cdRuntimeState;
+    std::unique_ptr<ps2_stubs::DmaRuntimeState>
+        m_dmaRuntimeState;
+    std::unique_ptr<ps2_stubs::LibCRuntimeState>
+        m_libcRuntimeState;
+    std::unique_ptr<ps2_stubs::MemoryCardRuntimeState>
+        m_memoryCardRuntimeState;
+    std::unique_ptr<ps2_stubs::PadRuntimeState>
+        m_padRuntimeState;
+    std::unique_ptr<ps2_stubs::SifRuntimeState>
+        m_sifRuntimeState;
+    // Declared last so the alarm worker's fallback join runs before other
+    // runtime members are destroyed if normal stop cleanup was interrupted.
+    std::unique_ptr<EeAlarmRuntimeState> m_eeAlarmRuntimeState;
 };
 
 // Generated by ps2xRecomp in ps2xRuntime/src/runner/register_functions.cpp.
