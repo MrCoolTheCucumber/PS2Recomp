@@ -1895,6 +1895,9 @@ private:
                 kMaximumServicesPerBoundary;
     EeVSyncTiming m_eeVSyncTiming{};
     EeVSyncPacing m_eeVSyncPacing{};
+    std::atomic<EeVSyncVideoModeClass>
+        m_hostPresentationVideoModeClass{
+            EeVSyncVideoModeClass::Ntsc};
     ps2x::timing::EeEventToken m_eeCounterEventToken{
         ps2x::timing::EeEventSource::EeCounters, 0u};
     ps2x::timing::EeEventToken m_cop0TimerEventToken{

@@ -87,8 +87,6 @@ struct HostPresentationUploadState
     uint32_t lastHeight = 0u;
     bool hasUploadedFrame = false;
     std::vector<uint8_t> scratch;
-    std::vector<uint8_t> uploadBuffer =
-        std::vector<uint8_t>(DEFAULT_FB_SIZE, 0u);
     uint32_t uploadDebugCount = 0u;
 
     void reset()
@@ -105,18 +103,6 @@ struct HostPresentationUploadState
         lastHeight = 0u;
         hasUploadedFrame = false;
         scratch.clear();
-        if (uploadBuffer.size() != DEFAULT_FB_SIZE)
-        {
-            uploadBuffer.assign(
-                DEFAULT_FB_SIZE, 0u);
-        }
-        else
-        {
-            std::fill(
-                uploadBuffer.begin(),
-                uploadBuffer.end(),
-                0u);
-        }
         uploadDebugCount = 0u;
     }
 };
@@ -881,6 +867,41 @@ PS2Runtime::GuestExecutionTryScope::~GuestExecutionTryScope()
     }
 }
 
+static bool UploadPresentationTexture(
+    Texture2D &texture,
+    const uint8_t *pixels,
+    uint32_t width,
+    uint32_t height)
+{
+    if (!pixels || width == 0u || height == 0u)
+    {
+        return false;
+    }
+
+    if (texture.width == static_cast<int>(width) &&
+        texture.height == static_cast<int>(height))
+    {
+        UpdateTexture(texture, pixels);
+        return true;
+    }
+
+    Image image{};
+    image.data = const_cast<uint8_t *>(pixels);
+    image.width = static_cast<int>(width);
+    image.height = static_cast<int>(height);
+    image.mipmaps = 1;
+    image.format = PIXELFORMAT_UNCOMPRESSED_R8G8B8A8;
+    Texture2D replacement = LoadTextureFromImage(image);
+    if (replacement.id == 0u)
+    {
+        return false;
+    }
+
+    UnloadTexture(texture);
+    texture = replacement;
+    return true;
+}
+
 static void UploadFrame(
     Texture2D &tex,
     PS2Runtime *rt,
@@ -925,9 +946,19 @@ static void UploadFrame(
                                                    &sourceFbp,
                                                    &usedPreferredDisplaySource))
     {
-        Image blank = GenImageColor(FB_WIDTH, FB_HEIGHT, MAGENTA);
-        UpdateTexture(tex, blank.data);
+        Image blank = GenImageColor(
+            FB_WIDTH, DEFAULT_DISPLAY_HEIGHT, MAGENTA);
+        const bool uploaded = UploadPresentationTexture(
+            tex,
+            static_cast<const uint8_t *>(blank.data),
+            FB_WIDTH,
+            DEFAULT_DISPLAY_HEIGHT);
         UnloadImage(blank);
+        if (!uploaded)
+        {
+            return;
+        }
+
         outWidth = FB_WIDTH;
         outHeight = DEFAULT_DISPLAY_HEIGHT;
         state.lastWidth = outWidth;
@@ -955,44 +986,21 @@ static void UploadFrame(
         }
         ++state.uploadDebugCount;
     });
+
+    const size_t expectedBytes =
+        static_cast<size_t>(width) * height * 4u;
+    if (state.scratch.size() < expectedBytes ||
+        !UploadPresentationTexture(
+            tex, state.scratch.data(), width, height))
+    {
+        return;
+    }
+
     state.lastDisplayFbp = displayFbp;
     state.lastSourceFbp = sourceFbp;
     state.lastPreferred = usedPreferredDisplaySource;
     state.lastWidth = width;
     state.lastHeight = height;
-
-    std::fill(
-        state.uploadBuffer.begin(),
-        state.uploadBuffer.end(),
-        0u);
-    if (!state.scratch.empty() &&
-        width != 0u &&
-        height != 0u)
-    {
-        const uint32_t copyWidth = std::min<uint32_t>(width, FB_WIDTH);
-        const uint32_t copyHeight = std::min<uint32_t>(height, FB_HEIGHT);
-        const size_t srcRowBytes = static_cast<size_t>(width) * 4u;
-        const size_t dstRowBytes = static_cast<size_t>(FB_WIDTH) * 4u;
-        const size_t copyRowBytes = static_cast<size_t>(copyWidth) * 4u;
-        for (uint32_t y = 0; y < copyHeight; ++y)
-        {
-            const size_t srcOffset = static_cast<size_t>(y) * srcRowBytes;
-            const size_t dstOffset = static_cast<size_t>(y) * dstRowBytes;
-            if (srcOffset + copyRowBytes >
-                    state.scratch.size() ||
-                dstOffset + copyRowBytes >
-                    state.uploadBuffer.size())
-            {
-                break;
-            }
-            std::memcpy(
-                state.uploadBuffer.data() + dstOffset,
-                state.scratch.data() + srcOffset,
-                copyRowBytes);
-        }
-    }
-
-    UpdateTexture(tex, state.uploadBuffer.data());
     outWidth = width;
     outHeight = height;
     state.hasUploadedFrame = true;
@@ -2899,6 +2907,9 @@ void PS2Runtime::configureEeVSyncVideoMode(
     m_eeVSyncTiming.durations =
         eeVSyncDurationsForVideoMode(
             videoMode, interlaced);
+    m_hostPresentationVideoModeClass.store(
+        videoModeClass,
+        std::memory_order_relaxed);
     m_eeVSyncTiming.videoMode = videoMode & 0xFFu;
     m_eeVSyncTiming.videoModeClass = videoModeClass;
     m_eeVSyncTiming.videoModeConfigured = true;
@@ -10815,7 +10826,8 @@ void PS2Runtime::run()
         << eeExecutionBackendName());
 
     // A blank image to use as a framebuffer
-    Image blank = GenImageColor(FB_WIDTH, FB_HEIGHT, BLANK);
+    Image blank = GenImageColor(
+        FB_WIDTH, DEFAULT_DISPLAY_HEIGHT, BLANK);
     Texture2D frameTex = LoadTextureFromImage(blank);
     UnloadImage(blank);
 
@@ -10940,13 +10952,32 @@ void PS2Runtime::run()
 
         BeginDrawing();
         ClearBackground(BLACK);
-        const float srcWidth = static_cast<float>(std::max<uint32_t>(1u, presentWidth));
-        const float srcHeight = static_cast<float>(std::max<uint32_t>(1u, presentHeight));
-        const float screenWidth = static_cast<float>(GetScreenWidth());
-        const float screenHeight = static_cast<float>(GetScreenHeight());
-        const float scale = std::min(screenWidth / srcWidth, screenHeight / srcHeight);
-        const float dstWidth = srcWidth * scale;
-        const float dstHeight = srcHeight * scale;
+        const float srcWidth = static_cast<float>(
+            std::max<uint32_t>(1u, presentWidth));
+        const float srcHeight = static_cast<float>(
+            std::max<uint32_t>(1u, presentHeight));
+        const float screenWidth =
+            static_cast<float>(GetScreenWidth());
+        const float screenHeight =
+            static_cast<float>(GetScreenHeight());
+        float presentationAspect = 4.0f / 3.0f;
+        switch (m_hostPresentationVideoModeClass.load(
+            std::memory_order_relaxed))
+        {
+        case EeVSyncVideoModeClass::Vesa:
+            presentationAspect = srcWidth / srcHeight;
+            break;
+        case EeVSyncVideoModeClass::Hdtv720P:
+        case EeVSyncVideoModeClass::Hdtv1080I:
+        case EeVSyncVideoModeClass::Hdtv1080P:
+            presentationAspect = 16.0f / 9.0f;
+            break;
+        default:
+            break;
+        }
+        const float dstWidth = std::min(
+            screenWidth, screenHeight * presentationAspect);
+        const float dstHeight = dstWidth / presentationAspect;
         const Rectangle srcRect{0.0f, 0.0f, srcWidth, srcHeight};
         const Rectangle dstRect{
             (screenWidth - dstWidth) * 0.5f,
