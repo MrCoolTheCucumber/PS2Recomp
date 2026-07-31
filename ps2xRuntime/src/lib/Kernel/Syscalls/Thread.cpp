@@ -33,6 +33,246 @@ namespace ps2_syscalls
         Stale,
     };
 
+    static bool removeLegacyReadyThreadLocked(
+        EeThreadRuntimeState &state,
+        int threadId)
+    {
+        bool removed = false;
+        for (auto &queue : state.legacyReadyQueues)
+        {
+            const auto before = queue.size();
+            std::erase(queue, threadId);
+            removed =
+                removed || queue.size() != before;
+        }
+        return removed;
+    }
+
+    static void enqueueLegacyReadyThread(
+        PS2Runtime *runtime,
+        int threadId,
+        int priority)
+    {
+        if (!runtime || priority < 0 ||
+            priority >= 128)
+        {
+            throw std::logic_error(
+                "invalid legacy EE ready-queue "
+                "publication");
+        }
+        EeThreadRuntimeState &state =
+            runtime->eeThreadRuntimeState();
+        std::lock_guard<std::mutex> lock(
+            state.legacyReadyMutex);
+        if (removeLegacyReadyThreadLocked(
+                state, threadId))
+        {
+            throw std::logic_error(
+                "duplicate legacy EE ready-queue "
+                "publication");
+        }
+        state.legacyReadyQueues
+            [static_cast<size_t>(priority)]
+                .push_back(threadId);
+    }
+
+    static void removeLegacyReadyThread(
+        PS2Runtime *runtime,
+        int threadId)
+    {
+        if (!runtime)
+        {
+            return;
+        }
+        EeThreadRuntimeState &state =
+            runtime->eeThreadRuntimeState();
+        std::lock_guard<std::mutex> lock(
+            state.legacyReadyMutex);
+        (void)removeLegacyReadyThreadLocked(
+            state, threadId);
+    }
+
+    static void moveLegacyReadyThread(
+        PS2Runtime *runtime,
+        int threadId,
+        int priority)
+    {
+        if (!runtime || priority < 0 ||
+            priority >= 128)
+        {
+            return;
+        }
+        EeThreadRuntimeState &state =
+            runtime->eeThreadRuntimeState();
+        std::lock_guard<std::mutex> lock(
+            state.legacyReadyMutex);
+        if (!removeLegacyReadyThreadLocked(
+                state, threadId))
+        {
+            return;
+        }
+        state.legacyReadyQueues
+            [static_cast<size_t>(priority)]
+                .push_back(threadId);
+    }
+
+    static void rotateLegacyReadyQueue(
+        PS2Runtime *runtime,
+        int priority)
+    {
+        if (!runtime || priority < 0 ||
+            priority >= 128)
+        {
+            return;
+        }
+        EeThreadRuntimeState &state =
+            runtime->eeThreadRuntimeState();
+        std::lock_guard<std::mutex> lock(
+            state.legacyReadyMutex);
+        auto &queue =
+            state.legacyReadyQueues
+                [static_cast<size_t>(priority)];
+        if (queue.size() > 1u)
+        {
+            const int front = queue.front();
+            queue.pop_front();
+            queue.push_back(front);
+        }
+    }
+
+    static bool admitLegacyReadyThread(
+        PS2Runtime *runtime,
+        int threadId)
+    {
+        if (!runtime)
+        {
+            return true;
+        }
+        EeThreadRuntimeState &state =
+            runtime->eeThreadRuntimeState();
+        std::lock_guard<std::mutex> lock(
+            state.legacyReadyMutex);
+        bool queued = false;
+        int highestReadyPriority = -1;
+        for (size_t priority = 0u;
+             priority < state.legacyReadyQueues.size();
+             ++priority)
+        {
+            const auto &queue =
+                state.legacyReadyQueues[priority];
+            if (highestReadyPriority < 0 &&
+                !queue.empty())
+            {
+                highestReadyPriority =
+                    static_cast<int>(priority);
+            }
+            queued =
+                queued ||
+                std::find(
+                    queue.begin(),
+                    queue.end(),
+                    threadId) != queue.end();
+        }
+        if (!queued)
+        {
+            return true;
+        }
+        if (highestReadyPriority < 0)
+        {
+            throw std::logic_error(
+                "legacy EE ready queue lost a "
+                "queued worker");
+        }
+
+        auto &highestReadyQueue =
+            state.legacyReadyQueues[
+                static_cast<size_t>(
+                    highestReadyPriority)];
+        if (highestReadyQueue.front() != threadId)
+        {
+            return false;
+        }
+        highestReadyQueue.pop_front();
+        return true;
+    }
+
+    static bool hasEligibleLegacyReadyThread(
+        PS2Runtime *runtime,
+        int callerPriority,
+        bool includeEqual)
+    {
+        if (!runtime)
+        {
+            return false;
+        }
+        const int lastPriority = std::min(
+            127,
+            includeEqual
+                ? callerPriority
+                : callerPriority - 1);
+        if (lastPriority < 0)
+        {
+            return false;
+        }
+        std::vector<std::shared_ptr<ThreadInfo>>
+            threads;
+        {
+            EeThreadRuntimeState &state =
+                runtime->eeThreadRuntimeState();
+            std::lock_guard<std::mutex> lock(
+                state.threadMapMutex);
+            threads.reserve(state.threads.size());
+            for (const auto &[threadId, info] :
+                 state.threads)
+            {
+                static_cast<void>(threadId);
+                if (info)
+                {
+                    threads.push_back(info);
+                }
+            }
+        }
+        for (const auto &info : threads)
+        {
+            std::lock_guard<std::mutex> lock(
+                info->m);
+            const EeThreadGuestStateSnapshot &guest =
+                info->guestState.snapshot();
+            if (guest.status == THS_READY &&
+                guest.currentPriority <= lastPriority)
+            {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    static bool drainEligibleLegacyReadyThreads(
+        PS2Runtime *runtime,
+        int callerPriority,
+        bool includeEqual)
+    {
+        constexpr size_t kMaximumHandoffs = 1024u;
+        bool handedOff = false;
+        for (size_t handoff = 0u;
+             hasEligibleLegacyReadyThread(
+                 runtime,
+                 callerPriority,
+                 includeEqual);
+             ++handoff)
+        {
+            if (handoff == kMaximumHandoffs)
+            {
+                throw std::logic_error(
+                    "legacy EE ready queue did not "
+                    "reach a scheduling boundary");
+            }
+            handedOff = true;
+            runtime->yieldGuestExecutionAtBoundary();
+        }
+        return handedOff;
+    }
+
     static EeExecutorTerminateDisposition
     applyEeExecutorThreadTermination(
         ps2x::ee::EeThreadScheduler &scheduler,
@@ -1092,6 +1332,8 @@ namespace ps2_syscalls
                     EeSchedulerWaitCompletion::
                         None;
             info->pendingEventFlagResultBits = 0u;
+            info->legacyAdmissionPending =
+                !dedicatedExecutor;
             if (info->stack == 0 && info->stackSize != 0)
             {
                 const uint32_t autoStack = runtime->guestMalloc(info->stackSize, 16u);
@@ -1116,8 +1358,9 @@ namespace ps2_syscalls
         bool hostStartPreempts = false;
         if (!dedicatedExecutor)
         {
-            // The legacy backend has no ready queue, but an ordinary start
-            // still has the retail higher-priority dispatch boundary.
+            // The compatibility ready queue below controls only a host
+            // worker's first guest instruction. Ordinary StartThread still
+            // enters a boundary only for a strictly higher-priority child.
             const std::shared_ptr<ThreadInfo>
                 callerInfo =
                     ensureCurrentThreadInfo(
@@ -1134,6 +1377,8 @@ namespace ps2_syscalls
             }
             hostStartPreempts =
                 startedPriority < callerPriority;
+            enqueueLegacyReadyThread(
+                runtime, tid, startedPriority);
         }
 
         EeThreadRuntimeState &threadState =
@@ -1267,15 +1512,40 @@ namespace ps2_syscalls
                     }
                     uint64_t handoffBaseline = 0u;
                     bool suspendedAtBoundary = false;
+                    bool admissionDeferred = false;
+                    bool returnedAtBoundary = false;
                     {
                         PS2Runtime::GuestExecutionScope guestExecution(
                             runtime, threadCtx);
+                        admissionDeferred =
+                            !dedicatedExecutor &&
+                            !admitLegacyReadyThread(
+                                runtime, tid);
+                        if (!admissionDeferred &&
+                            !dedicatedExecutor)
+                        {
+                            std::lock_guard<std::mutex>
+                                lock(info->m);
+                            info->legacyAdmissionPending =
+                                false;
+                        }
                         suspendedAtBoundary =
+                            admissionDeferred ||
                             !publishRunningAtGuestBoundary(info);
                         if (!suspendedAtBoundary)
                         {
                             runtime->executeGuestStep(
                                 rdram, threadCtx, step);
+                            returnedAtBoundary =
+                                !dedicatedExecutor &&
+                                threadCtx->pc == 0u;
+                            if (returnedAtBoundary)
+                            {
+                                std::lock_guard<std::mutex>
+                                    lock(info->m);
+                                info->guestState
+                                    .makeDormant();
+                            }
                             handoffBaseline =
                                 runtime
                                     ->guestExecutionHandoffEpochSnapshot();
@@ -1283,7 +1553,15 @@ namespace ps2_syscalls
                     }
                     if (suspendedAtBoundary)
                     {
+                        if (admissionDeferred)
+                        {
+                            std::this_thread::yield();
+                        }
                         continue;
+                    }
+                    if (returnedAtBoundary)
+                    {
+                        info->cv.notify_all();
                     }
                     runtime->waitForGuestExecutionHandoff(handoffBaseline);
                 }
@@ -1308,6 +1586,11 @@ namespace ps2_syscalls
             }
 
             runExitHandlersForThread(tid, rdram, threadCtx, runtime);
+            if (!dedicatedExecutor)
+            {
+                removeLegacyReadyThread(
+                    runtime, tid);
+            }
 
             uint32_t detachedAutoStack = 0;
             {
@@ -1319,6 +1602,7 @@ namespace ps2_syscalls
                         EeSchedulerWaitCompletion::
                             None;
                 info->pendingEventFlagResultBits = 0u;
+                info->legacyAdmissionPending = false;
                 info->terminated = false;
             }
 
@@ -1436,6 +1720,8 @@ namespace ps2_syscalls
                 << tid << ": " << e.what() << std::endl;
             if (!dedicatedExecutor)
             {
+                removeLegacyReadyThread(
+                    runtime, tid);
                 runtime->eeThreadRuntimeState()
                     .activeHostThreads.fetch_sub(
                     1, std::memory_order_relaxed);
@@ -1443,6 +1729,7 @@ namespace ps2_syscalls
             std::lock_guard<std::mutex> lock(info->m);
             info->guestState.makeDormant();
             info->forceRelease = false;
+            info->legacyAdmissionPending = false;
             info->terminated = false;
             setReturnS32(ctx, KE_ERROR);
             return;
@@ -1728,10 +2015,11 @@ namespace ps2_syscalls
                     {
                         sema->waiters--;
                     }
-                    info->terminated = true;
-                    info->forceRelease = true;
-                    info->guestState.makeDormant();
-                    transitioned = true;
+                info->terminated = true;
+                info->forceRelease = true;
+                info->guestState.makeDormant();
+                info->legacyAdmissionPending = false;
+                transitioned = true;
                 }
             }
         }
@@ -1752,11 +2040,20 @@ namespace ps2_syscalls
                             waitId) &&
                         eventFlag->waiters > 0)
                     {
+                        eventFlag
+                            ->schedulerWaiters.erase(
+                                tid);
+                        std::erase(
+                            eventFlag
+                                ->legacyWaitOrder,
+                            tid);
                         --eventFlag->waiters;
                     }
                     info->terminated = true;
                     info->forceRelease = true;
                     info->guestState.makeDormant();
+                    info->legacyAdmissionPending =
+                        false;
                     transitioned = true;
                 }
             }
@@ -1773,15 +2070,34 @@ namespace ps2_syscalls
             info->terminated = true;
             info->forceRelease = true;
             info->guestState.makeDormant();
+            info->legacyAdmissionPending = false;
         }
 
         info->cv.notify_all();
         notifyThreadWaitObject(runtime, waitType, waitId);
+        removeLegacyReadyThread(runtime, tid);
         setReturnS32(ctx, tid);
 
         if (reschedule)
         {
-            yieldGuestExecutionAtBoundary(runtime);
+            const std::shared_ptr<ThreadInfo>
+                callerInfo =
+                    ensureCurrentThreadInfo(
+                        runtime, ctx);
+            int callerPriority = 127;
+            if (callerInfo)
+            {
+                std::lock_guard<std::mutex> lock(
+                    callerInfo->m);
+                callerPriority =
+                    callerInfo->guestState
+                        .snapshot()
+                        .currentPriority;
+            }
+            (void)drainEligibleLegacyReadyThreads(
+                runtime,
+                callerPriority,
+                false);
         }
     }
 
@@ -1957,6 +2273,7 @@ namespace ps2_syscalls
             return;
         }
 
+        bool removePendingAdmission = false;
         {
             std::lock_guard<std::mutex> lock(info->m);
             if (info->guestState.isDormant())
@@ -1965,6 +2282,12 @@ namespace ps2_syscalls
                 return;
             }
             info->guestState.suspend();
+            removePendingAdmission =
+                info->legacyAdmissionPending;
+        }
+        if (removePendingAdmission)
+        {
+            removeLegacyReadyThread(runtime, tid);
         }
         info->cv.notify_all();
 
@@ -2204,6 +2527,8 @@ namespace ps2_syscalls
         }
 
         bool becameRunnable = false;
+        bool republishPendingAdmission = false;
+        int resumedPriority = 0;
         {
             std::lock_guard<std::mutex> lock(info->m);
             const EeThreadGuestStateSnapshot &guest =
@@ -2221,6 +2546,18 @@ namespace ps2_syscalls
             info->guestState.resume(
                 tid == getCurrentThreadId(runtime),
                 becameRunnable);
+            const EeThreadGuestStateSnapshot &after =
+                info->guestState.snapshot();
+            republishPendingAdmission =
+                becameRunnable &&
+                info->legacyAdmissionPending;
+            resumedPriority =
+                after.currentPriority;
+        }
+        if (republishPendingAdmission)
+        {
+            enqueueLegacyReadyThread(
+                runtime, tid, resumedPriority);
         }
         info->cv.notify_all();
         setReturnS32(ctx, tid);
@@ -2766,8 +3103,10 @@ namespace ps2_syscalls
             if (publication.priority <
                 callerPriority)
             {
-                yieldGuestExecutionAfterWake(
-                    runtime);
+                (void)drainEligibleLegacyReadyThreads(
+                    runtime,
+                    callerPriority,
+                    false);
             }
         }
     }
@@ -3118,10 +3457,29 @@ namespace ps2_syscalls
                 info->guestState.changeCurrentPriority(newPrio);
         }
 
+        moveLegacyReadyThread(
+            runtime, tid, newPrio);
         setReturnS32(ctx, previousPriority);
         if (reschedule)
         {
-            yieldGuestExecutionAtBoundary(runtime);
+            const std::shared_ptr<ThreadInfo>
+                callerInfo =
+                    ensureCurrentThreadInfo(
+                        runtime, ctx);
+            int callerPriority = newPrio;
+            if (callerInfo)
+            {
+                std::lock_guard<std::mutex> lock(
+                    callerInfo->m);
+                callerPriority =
+                    callerInfo->guestState
+                        .snapshot()
+                        .currentPriority;
+            }
+            (void)drainEligibleLegacyReadyThreads(
+                runtime,
+                callerPriority,
+                false);
         }
     }
 
@@ -3211,10 +3569,28 @@ namespace ps2_syscalls
             return;
         }
 
+        rotateLegacyReadyQueue(runtime, prio);
         setReturnS32(ctx, prio);
         if (reschedule)
         {
-            yieldGuestExecutionAtBoundary(runtime);
+            const std::shared_ptr<ThreadInfo>
+                callerInfo =
+                    ensureCurrentThreadInfo(
+                        runtime, ctx);
+            int callerPriority = prio;
+            if (callerInfo)
+            {
+                std::lock_guard<std::mutex> lock(
+                    callerInfo->m);
+                callerPriority =
+                    callerInfo->guestState
+                        .snapshot()
+                        .currentPriority;
+            }
+            (void)drainEligibleLegacyReadyThreads(
+                runtime,
+                callerPriority,
+                true);
         }
     }
 
@@ -3489,6 +3865,11 @@ namespace ps2_syscalls
                 if (wasWaiting &&
                     eventFlag->waiters > 0)
                 {
+                    eventFlag->schedulerWaiters.erase(
+                        tid);
+                    std::erase(
+                        eventFlag->legacyWaitOrder,
+                        tid);
                     --eventFlag->waiters;
                 }
             }

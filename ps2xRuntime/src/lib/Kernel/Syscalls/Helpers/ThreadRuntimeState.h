@@ -3,9 +3,11 @@
 #include "ps2_runtime.h"
 
 #include <cassert>
+#include <array>
 #include <atomic>
 #include <condition_variable>
 #include <cstdint>
+#include <deque>
 #include <memory>
 #include <mutex>
 #include <unordered_map>
@@ -504,6 +506,10 @@ struct ThreadInfo
     ps2x::ee::EeSchedulerWaitCompletion pendingWaitCompletion =
         ps2x::ee::EeSchedulerWaitCompletion::None;
     uint32_t pendingEventFlagResultBits = 0u;
+    // Guarded by m. A started legacy host worker retains this while it has
+    // not yet executed its first guest instruction. Suspension temporarily
+    // removes it from the compatibility ready queue; resume republishes it.
+    bool legacyAdmissionPending = false;
     std::atomic<bool> forceRelease{false};
     std::atomic<bool> terminated{false};
 };
@@ -534,6 +540,15 @@ struct EeThreadRuntimeState
     uint32_t nextGeneration = 1u;
 
     std::atomic<int> activeHostThreads{0};
+
+    // The legacy host backend still uses one native worker per guest thread,
+    // but admission to a thread's first guest instruction must preserve the
+    // BIOS ready-queue FIFO. This small compatibility queue does not own
+    // running or blocked workers; it is consumed exactly once when a started
+    // READY worker first acquires guest execution.
+    std::mutex legacyReadyMutex;
+    std::array<std::deque<int>, 128u>
+        legacyReadyQueues;
 
     // This is the runtime authority. The host TLS ID remains a checked
     // adapter until all legacy direct-call sites bind through the executor.

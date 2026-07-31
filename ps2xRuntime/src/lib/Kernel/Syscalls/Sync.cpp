@@ -1327,12 +1327,76 @@ namespace ps2_syscalls
             return;
         }
 
+        int callerPriority = 128;
+        if (const auto caller =
+                ensureCurrentThreadInfo(runtime, ctx))
+        {
+            std::lock_guard<std::mutex> callerLock(
+                caller->m);
+            callerPriority =
+                caller->guestState.snapshot()
+                    .currentPriority;
+        }
+
+        bool wokeHigherPriorityWaiter = false;
         {
             std::lock_guard<std::mutex> lock(info->m);
             info->deleted = true;
+            for (const int threadId :
+                 info->legacyWaitOrder)
+            {
+                const auto request =
+                    info->schedulerWaiters.find(
+                        threadId);
+                const auto waiter =
+                    lookupThreadInfo(runtime, threadId);
+                if (request ==
+                        info->schedulerWaiters.end() ||
+                    !waiter ||
+                    waiter->generation !=
+                        request->second.generation)
+                {
+                    throw std::logic_error(
+                        "DeleteEventFlag found a stale "
+                        "legacy event waiter");
+                }
+                std::lock_guard<std::mutex> threadLock(
+                    waiter->m);
+                const int waiterPriority =
+                    waiter->guestState.snapshot()
+                        .currentPriority;
+                if (!waiter->guestState.releaseWait(
+                        EeThreadWaitQueue::EventFlag,
+                        TSW_EVENT,
+                        eid,
+                        false) ||
+                    info->waiters <= 0)
+                {
+                    throw std::logic_error(
+                        "DeleteEventFlag could not "
+                        "detach a legacy event waiter");
+                }
+                --info->waiters;
+                wokeHigherPriorityWaiter =
+                    wokeHigherPriorityWaiter ||
+                    waiterPriority <
+                        callerPriority;
+            }
+            info->schedulerWaiters.clear();
+            info->legacyWaitOrder.clear();
+            if (info->waiters != 0)
+            {
+                throw std::logic_error(
+                    "DeleteEventFlag legacy waiter "
+                    "accounting diverged");
+            }
         }
         info->cv.notify_all();
         setReturnS32(ctx, 0);
+        if (wokeHigherPriorityWaiter)
+        {
+            yieldGuestExecutionAfterWake(runtime);
+        }
     }
 
     static void setEventFlag(
@@ -1522,13 +1586,111 @@ namespace ps2_syscalls
             return;
         }
 
+        int callerPriority = 128;
+        if (const auto caller =
+                ensureCurrentThreadInfo(runtime, ctx))
+        {
+            std::lock_guard<std::mutex> callerLock(
+                caller->m);
+            callerPriority =
+                caller->guestState.snapshot()
+                    .currentPriority;
+        }
+
         uint32_t newBits = 0u;
-        bool hadWaiters = false;
+        bool wokeWaiter = false;
+        bool wokeHigherPriorityWaiter = false;
         {
             std::lock_guard<std::mutex> lock(info->m);
             info->bits |= bits;
+            for (auto order =
+                     info->legacyWaitOrder.begin();
+                 order !=
+                 info->legacyWaitOrder.end();)
+            {
+                const int threadId = *order;
+                const auto request =
+                    info->schedulerWaiters.find(
+                        threadId);
+                if (request ==
+                    info->schedulerWaiters.end())
+                {
+                    throw std::logic_error(
+                        "SetEventFlag lost a legacy "
+                        "event-wait predicate");
+                }
+                if (!eventFlagSatisfied(
+                        info->bits,
+                        request->second.waitBits,
+                        request->second.mode))
+                {
+                    ++order;
+                    continue;
+                }
+
+                const auto waiter =
+                    lookupThreadInfo(runtime, threadId);
+                if (!waiter ||
+                    waiter->generation !=
+                        request->second.generation)
+                {
+                    throw std::logic_error(
+                        "SetEventFlag found a stale "
+                        "legacy event waiter");
+                }
+                const uint32_t resultBits =
+                    info->bits;
+                {
+                    std::lock_guard<std::mutex>
+                        threadLock(waiter->m);
+                    const int waiterPriority =
+                        waiter->guestState.snapshot()
+                            .currentPriority;
+                    if (!waiter->guestState.releaseWait(
+                            EeThreadWaitQueue::
+                                EventFlag,
+                            TSW_EVENT,
+                            eid,
+                            false) ||
+                        info->waiters <= 0)
+                    {
+                        throw std::logic_error(
+                            "SetEventFlag could not "
+                            "detach a legacy event "
+                            "waiter");
+                    }
+                    waiter->pendingWaitCompletion =
+                        ps2x::ee::
+                            EeSchedulerWaitCompletion::
+                                Satisfied;
+                    waiter
+                        ->pendingEventFlagResultBits =
+                        resultBits;
+                    wokeHigherPriorityWaiter =
+                        wokeHigherPriorityWaiter ||
+                        waiterPriority <
+                            callerPriority;
+                }
+                applyEventFlagClear(
+                    *info,
+                    request->second.waitBits,
+                    request->second.mode);
+                --info->waiters;
+                info->schedulerWaiters.erase(
+                    request);
+                order =
+                    info->legacyWaitOrder.erase(
+                        order);
+                wokeWaiter = true;
+            }
+            if (static_cast<size_t>(info->waiters) !=
+                info->schedulerWaiters.size())
+            {
+                throw std::logic_error(
+                    "SetEventFlag legacy waiter "
+                    "accounting diverged");
+            }
             newBits = info->bits;
-            hadWaiters = info->waiters > 0;
         }
 
         static std::atomic<uint32_t> s_setEventFlagLogs{0};
@@ -1543,7 +1705,8 @@ namespace ps2_syscalls
         }
         info->cv.notify_all();
         setReturnS32(ctx, 0);
-        if (hadWaiters)
+        if (wokeWaiter && reschedule &&
+            wokeHigherPriorityWaiter)
         {
             yieldGuestExecutionAfterWake(runtime);
         }
@@ -1868,10 +2031,20 @@ namespace ps2_syscalls
 
         auto satisfied = [&]()
         {
-            if (tInfo && tInfo->forceRelease.load())
-                return true;
-            if (tInfo && tInfo->terminated.load())
-                return true;
+            if (tInfo)
+            {
+                std::lock_guard<std::mutex> threadLock(
+                    tInfo->m);
+                if (tInfo->forceRelease.load() ||
+                    tInfo->terminated.load() ||
+                    tInfo->pendingWaitCompletion !=
+                        ps2x::ee::
+                            EeSchedulerWaitCompletion::
+                                None)
+                {
+                    return true;
+                }
+            }
             if (info->deleted)
             {
                 return true;
@@ -1885,6 +2058,7 @@ namespace ps2_syscalls
 
         bool waitedWithGuestRelease = false;
         bool terminated = false;
+        bool consumedPublishedCompletion = false;
         uint32_t bitsAfter = info->bits;
 
         auto finishEventFlagWaitLocked = [&]()
@@ -1934,11 +2108,39 @@ namespace ps2_syscalls
             if (tInfo)
             {
                 std::lock_guard<std::mutex> tLock(tInfo->m);
-                tInfo->guestState.block(
-                    EeThreadWaitQueue::EventFlag,
-                    TSW_EVENT,
-                    eid);
+                if (!tInfo->guestState.block(
+                        EeThreadWaitQueue::EventFlag,
+                        TSW_EVENT,
+                        eid))
+                {
+                    throw std::logic_error(
+                        "WaitEventFlag could not publish "
+                        "its legacy wait");
+                }
                 tInfo->forceRelease = false;
+                tInfo->pendingWaitCompletion =
+                    ps2x::ee::
+                        EeSchedulerWaitCompletion::None;
+                tInfo->pendingEventFlagResultBits = 0u;
+                const int threadId =
+                    getCurrentThreadId(runtime);
+                const auto [request, inserted] =
+                    info->schedulerWaiters.emplace(
+                        threadId,
+                        EventFlagInfo::SchedulerWaiter{
+                            tInfo->generation,
+                            waitBits,
+                            mode,
+                        });
+                (void)request;
+                if (!inserted)
+                {
+                    throw std::logic_error(
+                        "WaitEventFlag duplicated a "
+                        "legacy waiter");
+                }
+                info->legacyWaitOrder.push_back(
+                    threadId);
             }
 
             info->waiters++;
@@ -1958,6 +2160,8 @@ namespace ps2_syscalls
                     {
                         std::lock_guard<std::mutex> tLock(tInfo->m);
                         terminated = tInfo->terminated.load();
+                        const int threadId =
+                            getCurrentThreadId(runtime);
                         wasLinked =
                             tInfo->guestState.isLinkedTo(
                                 EeThreadWaitQueue::EventFlag,
@@ -1968,27 +2172,111 @@ namespace ps2_syscalls
                         }
                         else
                         {
-                            wasLinked =
-                                tInfo->guestState.finishWait(
-                                    EeThreadWaitQueue::EventFlag,
-                                    TSW_EVENT,
-                                    eid,
-                                    false);
+                            const auto completion =
+                                tInfo
+                                    ->pendingWaitCompletion;
+                            const uint32_t completionBits =
+                                tInfo
+                                    ->pendingEventFlagResultBits;
+                            const bool finishedLinked =
+                                tInfo->guestState
+                                    .finishWait(
+                                        EeThreadWaitQueue::
+                                            EventFlag,
+                                        TSW_EVENT,
+                                        eid,
+                                        false);
+                            if (finishedLinked !=
+                                wasLinked)
+                            {
+                                throw std::logic_error(
+                                    "WaitEventFlag could "
+                                    "not finish its legacy "
+                                    "wait publication");
+                            }
+                            if (completion !=
+                                ps2x::ee::
+                                    EeSchedulerWaitCompletion::
+                                        None)
+                            {
+                                consumedPublishedCompletion =
+                                    true;
+                                tInfo
+                                    ->pendingWaitCompletion =
+                                    ps2x::ee::
+                                        EeSchedulerWaitCompletion::
+                                            None;
+                                tInfo
+                                    ->pendingEventFlagResultBits =
+                                    0u;
+                                switch (completion)
+                                {
+                                case ps2x::ee::
+                                    EeSchedulerWaitCompletion::
+                                        Satisfied:
+                                    if (resBitsPtr)
+                                    {
+                                        *resBitsPtr =
+                                            completionBits;
+                                    }
+                                    ret = KE_OK;
+                                    break;
+                                case ps2x::ee::
+                                    EeSchedulerWaitCompletion::
+                                        Released:
+                                    ret =
+                                        KE_RELEASE_WAIT;
+                                    break;
+                                case ps2x::ee::
+                                    EeSchedulerWaitCompletion::
+                                        ObjectDeleted:
+                                    ret =
+                                        KE_WAIT_DELETE;
+                                    break;
+                                case ps2x::ee::
+                                    EeSchedulerWaitCompletion::
+                                        TimedOut:
+                                case ps2x::ee::
+                                    EeSchedulerWaitCompletion::
+                                        None:
+                                    throw std::logic_error(
+                                        "WaitEventFlag "
+                                        "received an "
+                                        "invalid legacy "
+                                        "completion");
+                                }
+                            }
                         }
                         if (tInfo->forceRelease)
                         {
                             tInfo->forceRelease = false;
                             ret = KE_RELEASE_WAIT;
                         }
+                        if (wasLinked)
+                        {
+                            info->schedulerWaiters.erase(
+                                threadId);
+                            std::erase(
+                                info->legacyWaitOrder,
+                                threadId);
+                        }
                     }
                     if (wasLinked && info->waiters > 0)
                     {
                         --info->waiters;
+                        info->cv.notify_all();
                     }
 
                     if (!terminated)
                     {
-                        finishEventFlagWaitLocked();
+                        if (!consumedPublishedCompletion)
+                        {
+                            finishEventFlagWaitLocked();
+                        }
+                        else
+                        {
+                            bitsAfter = info->bits;
+                        }
                     }
                     else
                     {

@@ -4861,7 +4861,7 @@ void register_ps2_runtime_kernel_tests()
             });
 
         tc.Run(
-            "fiber semaphore wait preserves signal release and delete boundaries",
+            "legacy EE backends agree on semaphore signal release and delete boundaries",
             [](TestCase &t)
             {
                 if (!eeExecutionBackendBuildInfo()
@@ -4888,14 +4888,17 @@ void register_ps2_runtime_kernel_tests()
                 };
 
                 const auto runFixture =
-                    [](ExecutorSemaOperation operation)
+                    [](ExecutorSemaOperation operation,
+                       EeExecutionBackendKind backendKind)
                     {
                         FixtureResult result{};
                         PS2RuntimeConfiguration
                             configuration{};
                         configuration.eeExecutionBackend =
-                            EeExecutionBackendKind::
-                                LegacyCppFiber;
+                            backendKind;
+                        configuration
+                            .useEeExecutionBackendEnvironment =
+                            false;
                         PS2Runtime runtime(
                             configuration);
                         result.memoryInitialized =
@@ -5036,7 +5039,7 @@ void register_ps2_runtime_kernel_tests()
                             });
 
                         runtime
-                            .startDedicatedEeExecutionForTesting();
+                            .startEeExecutionForTesting();
                         result.completed = waitUntil(
                             []()
                             {
@@ -5050,7 +5053,7 @@ void register_ps2_runtime_kernel_tests()
                             std::chrono::seconds(2));
                         rescue.join();
                         runtime
-                            .stopDedicatedEeExecutionForTesting();
+                            .stopEeExecutionForTesting();
 
                         {
                             std::lock_guard<std::mutex>
@@ -5113,8 +5116,16 @@ void register_ps2_runtime_kernel_tests()
                 for (const auto &[operation, name] :
                      operations)
                 {
-                    const FixtureResult result =
-                        runFixture(operation);
+                    const FixtureResult host =
+                        runFixture(
+                            operation,
+                            EeExecutionBackendKind::
+                                LegacyHostThread);
+                    const FixtureResult fiber =
+                        runFixture(
+                            operation,
+                            EeExecutionBackendKind::
+                                LegacyCppFiber);
                     const bool raw =
                         operation ==
                             ExecutorSemaOperation::
@@ -5151,63 +5162,88 @@ void register_ps2_runtime_kernel_tests()
                             RawDelete;
 
                     t.IsTrue(
-                        result.memoryInitialized &&
-                            result.completed &&
-                            !result.rescued &&
-                            result.order ==
+                        host.memoryInitialized &&
+                            fiber.memoryInitialized &&
+                            host.completed &&
+                            fiber.completed &&
+                            !host.rescued &&
+                            !fiber.rescued &&
+                            host.order ==
                                 (raw
                                      ? std::vector<int>{
                                            1, 3, 2}
                                      : std::vector<int>{
-                                           1, 2, 3}),
+                                           1, 2, 3}) &&
+                            fiber.order == host.order,
                         std::string(name) +
-                            " should release the sole "
-                            "executor with the retained "
-                            "ordinary/raw dispatch order");
+                            " should retain the same "
+                            "ordinary/raw dispatch order "
+                            "under both backends");
                     t.IsTrue(
-                        result.semaphoreId >= 0 &&
-                            result.waitResult ==
+                        host.semaphoreId >= 0 &&
+                            fiber.semaphoreId ==
+                                host.semaphoreId &&
+                            host.childThreadId ==
+                                fiber.childThreadId &&
+                            host.waitResult ==
                                 (signal
-                                     ? result.semaphoreId
+                                     ? host.semaphoreId
                                      : KE_ERROR) &&
-                            result.operationResult ==
+                            fiber.waitResult ==
+                                host.waitResult &&
+                            host.operationResult ==
                                 (release
-                                     ? result.childThreadId
-                                     : result.semaphoreId) &&
-                            result.childRanInsideOperation ==
-                                !raw,
+                                     ? host.childThreadId
+                                     : host.semaphoreId) &&
+                            fiber.operationResult ==
+                                host.operationResult &&
+                            host.childRanInsideOperation ==
+                                !raw &&
+                            fiber.childRanInsideOperation ==
+                                host.childRanInsideOperation,
                         std::string(name) +
-                            " should preserve syscall "
-                            "results and dispatch timing");
+                            " should preserve identical "
+                            "syscall results and dispatch "
+                            "timing");
                     if (raw)
                     {
                         t.IsTrue(
-                            result.rawStatus ==
+                            host.rawStatus ==
                                     THS_READY &&
-                                result.rawWaitType ==
+                                host.rawWaitType ==
                                     (rawDelete
                                          ? TSW_SEMA
                                          : 0u) &&
-                                result.rawWaitId ==
+                                host.rawWaitId ==
                                     (rawDelete
                                          ? static_cast<
                                                uint32_t>(
-                                               result
+                                               host
                                                    .semaphoreId)
                                          : 0u) &&
-                                result
+                                host
                                         .rawCompletionPending ==
-                                    rawDelete,
+                                    rawDelete &&
+                                fiber.rawStatus ==
+                                    host.rawStatus &&
+                                fiber.rawWaitType ==
+                                    host.rawWaitType &&
+                                fiber.rawWaitId ==
+                                    host.rawWaitId &&
+                                fiber
+                                        .rawCompletionPending ==
+                                    host
+                                        .rawCompletionPending,
                             std::string(name) +
                                 " should synchronously "
-                                "publish the retained "
+                                "publish the same retained "
                                 "pre-dispatch status");
                     }
                 }
             });
 
         tc.Run(
-            "fiber event wait preserves set release and delete boundaries",
+            "legacy EE backends agree on event set release and delete boundaries",
             [](TestCase &t)
             {
                 if (!eeExecutionBackendBuildInfo()
@@ -5233,14 +5269,17 @@ void register_ps2_runtime_kernel_tests()
                 };
 
                 const auto runFixture =
-                    [](ExecutorEventOperation operation)
+                    [](ExecutorEventOperation operation,
+                       EeExecutionBackendKind backendKind)
                     {
                         FixtureResult result{};
                         PS2RuntimeConfiguration
                             configuration{};
                         configuration.eeExecutionBackend =
-                            EeExecutionBackendKind::
-                                LegacyCppFiber;
+                            backendKind;
+                        configuration
+                            .useEeExecutionBackendEnvironment =
+                            false;
                         PS2Runtime runtime(
                             configuration);
                         result.memoryInitialized =
@@ -5379,7 +5418,7 @@ void register_ps2_runtime_kernel_tests()
                             });
 
                         runtime
-                            .startDedicatedEeExecutionForTesting();
+                            .startEeExecutionForTesting();
                         result.completed = waitUntil(
                             []()
                             {
@@ -5393,7 +5432,7 @@ void register_ps2_runtime_kernel_tests()
                             std::chrono::seconds(2));
                         rescue.join();
                         runtime
-                            .stopDedicatedEeExecutionForTesting();
+                            .stopEeExecutionForTesting();
 
                         {
                             std::lock_guard<std::mutex>
@@ -5449,8 +5488,16 @@ void register_ps2_runtime_kernel_tests()
                 for (const auto &[operation, name] :
                      operations)
                 {
-                    const FixtureResult result =
-                        runFixture(operation);
+                    const FixtureResult host =
+                        runFixture(
+                            operation,
+                            EeExecutionBackendKind::
+                                LegacyHostThread);
+                    const FixtureResult fiber =
+                        runFixture(
+                            operation,
+                            EeExecutionBackendKind::
+                                LegacyCppFiber);
                     const bool raw =
                         operation ==
                             ExecutorEventOperation::
@@ -5480,56 +5527,78 @@ void register_ps2_runtime_kernel_tests()
                                 RawRelease;
 
                     t.IsTrue(
-                        result.memoryInitialized &&
-                            result.completed &&
-                            !result.rescued &&
-                            result.order ==
+                        host.memoryInitialized &&
+                            fiber.memoryInitialized &&
+                            host.completed &&
+                            fiber.completed &&
+                            !host.rescued &&
+                            !fiber.rescued &&
+                            host.order ==
                                 (raw
                                      ? std::vector<int>{
                                            1, 3, 2}
                                      : std::vector<int>{
-                                           1, 2, 3}),
+                                           1, 2, 3}) &&
+                            fiber.order == host.order,
                         std::string(name) +
-                            " should release the sole "
-                            "executor with ordinary/raw "
-                            "dispatch order");
+                            " should retain the same "
+                            "ordinary/raw dispatch order "
+                            "under both backends");
                     t.IsTrue(
-                        result.eventId > 0 &&
-                            result.waitResult ==
+                        host.eventId > 0 &&
+                            fiber.eventId ==
+                                host.eventId &&
+                            fiber.childThreadId ==
+                                host.childThreadId &&
+                            host.waitResult ==
                                 (set
                                      ? KE_OK
                                      : (release
                                             ? KE_RELEASE_WAIT
                                             : KE_WAIT_DELETE)) &&
-                            result.operationResult ==
+                            fiber.waitResult ==
+                                host.waitResult &&
+                            host.operationResult ==
                                 (release
-                                     ? result.childThreadId
+                                     ? host.childThreadId
                                      : KE_OK) &&
-                            result.resultBits ==
+                            fiber.operationResult ==
+                                host.operationResult &&
+                            host.resultBits ==
                                 (set
                                      ? 0x4u
                                      : 0x7f7f7f7fu) &&
-                            result.childRanInsideOperation ==
-                                !raw,
+                            fiber.resultBits ==
+                                host.resultBits &&
+                            host.childRanInsideOperation ==
+                                !raw &&
+                            fiber.childRanInsideOperation ==
+                                host.childRanInsideOperation,
                         std::string(name) +
-                            " should preserve event "
-                            "results and dispatch timing");
+                            " should preserve identical "
+                            "event results and dispatch "
+                            "timing");
                     if (raw)
                     {
                         t.IsTrue(
-                            result.rawStatus ==
+                            host.rawStatus ==
                                     THS_READY &&
-                                result.rawWaitType == 0u,
+                                host.rawWaitType == 0u &&
+                                fiber.rawStatus ==
+                                    host.rawStatus &&
+                                fiber.rawWaitType ==
+                                    host.rawWaitType,
                             std::string(name) +
                                 " should synchronously "
-                                "publish READY with no "
-                                "retained wait reason");
+                                "publish the same READY "
+                                "state with no retained "
+                                "wait reason");
                     }
                 }
             });
 
         tc.Run(
-            "fiber event wait applies FIFO clear effects",
+            "legacy EE backends agree on event FIFO clear effects",
             [](TestCase &t)
             {
                 if (!eeExecutionBackendBuildInfo()
@@ -5538,110 +5607,153 @@ void register_ps2_runtime_kernel_tests()
                     return;
                 }
 
-                PS2RuntimeConfiguration configuration{};
-                configuration.eeExecutionBackend =
-                    EeExecutionBackendKind::
-                        LegacyCppFiber;
-                PS2Runtime runtime(configuration);
-                const bool memoryInitialized =
-                    runtime.memory().initialize();
-                t.IsTrue(
-                    memoryInitialized,
-                    "the multi-wait event fixture should "
-                    "allocate runtime RDRAM");
-                if (!memoryInitialized)
+                struct FixtureResult
                 {
-                    return;
-                }
-                runtime.registerFunction(
-                    K_EXECUTOR_EVENT_MULTI_MAIN_ENTRY,
-                    &dedicatedExecutorEventMultiMainHandler);
-                runtime.registerFunction(
-                    K_EXECUTOR_EVENT_CLEAR_CHILD_ENTRY,
-                    &dedicatedExecutorEventClearChildHandler);
-                runtime.registerFunction(
-                    K_EXECUTOR_EVENT_RETAIN_CHILD_ENTRY,
-                    &dedicatedExecutorEventRetainChildHandler);
-                runtime.cpu().pc =
-                    K_EXECUTOR_EVENT_MULTI_MAIN_ENTRY;
-                setRegU32(
-                    runtime.cpu(),
-                    29,
-                    0x00300000u);
-                {
-                    std::lock_guard<std::mutex> lock(
-                        g_executorFixtureMutex);
-                    g_executorEventMultiOrder.clear();
-                    g_executorEventMultiId = KE_ERROR;
-                    g_executorEventClearResult =
-                        KE_ERROR;
-                    g_executorEventRetainResult =
-                        KE_ERROR;
-                    g_executorEventClearBits = 0u;
-                    g_executorEventRetainBits = 0u;
-                    g_executorEventRetainWaitedAfterFirstSet =
-                        false;
-                }
+                    bool memoryInitialized = false;
+                    bool completed = false;
+                    std::vector<int> order;
+                    int eventId = KE_ERROR;
+                    int clearResult = KE_ERROR;
+                    int retainResult = KE_ERROR;
+                    uint32_t clearBits = 0u;
+                    uint32_t retainBits = 0u;
+                    bool retainedWait = false;
+                };
 
-                runtime
-                    .startDedicatedEeExecutionForTesting();
-                const bool completed = waitUntil(
-                    []()
+                const auto runFixture =
+                    [](EeExecutionBackendKind backendKind)
                     {
+                        FixtureResult result{};
+                        PS2RuntimeConfiguration
+                            configuration{};
+                        configuration.eeExecutionBackend =
+                            backendKind;
+                        configuration
+                            .useEeExecutionBackendEnvironment =
+                            false;
+                        PS2Runtime runtime(configuration);
+                        result.memoryInitialized =
+                            runtime.memory().initialize();
+                        if (!result.memoryInitialized)
+                        {
+                            return result;
+                        }
+                        runtime.registerFunction(
+                            K_EXECUTOR_EVENT_MULTI_MAIN_ENTRY,
+                            &dedicatedExecutorEventMultiMainHandler);
+                        runtime.registerFunction(
+                            K_EXECUTOR_EVENT_CLEAR_CHILD_ENTRY,
+                            &dedicatedExecutorEventClearChildHandler);
+                        runtime.registerFunction(
+                            K_EXECUTOR_EVENT_RETAIN_CHILD_ENTRY,
+                            &dedicatedExecutorEventRetainChildHandler);
+                        runtime.cpu().pc =
+                            K_EXECUTOR_EVENT_MULTI_MAIN_ENTRY;
+                        setRegU32(
+                            runtime.cpu(),
+                            29,
+                            0x00300000u);
+                        {
+                            std::lock_guard<std::mutex>
+                                lock(
+                                    g_executorFixtureMutex);
+                            g_executorEventMultiOrder
+                                .clear();
+                            g_executorEventMultiId =
+                                KE_ERROR;
+                            g_executorEventClearResult =
+                                KE_ERROR;
+                            g_executorEventRetainResult =
+                                KE_ERROR;
+                            g_executorEventClearBits = 0u;
+                            g_executorEventRetainBits = 0u;
+                            g_executorEventRetainWaitedAfterFirstSet =
+                                false;
+                        }
+
+                        runtime
+                            .startEeExecutionForTesting();
+                        result.completed = waitUntil(
+                            []()
+                            {
+                                std::lock_guard<
+                                    std::mutex>
+                                    lock(
+                                        g_executorFixtureMutex);
+                                return g_executorEventMultiOrder
+                                           .size() == 6u;
+                            },
+                            std::chrono::seconds(2));
+                        runtime
+                            .stopEeExecutionForTesting();
+
                         std::lock_guard<std::mutex> lock(
                             g_executorFixtureMutex);
-                        return g_executorEventMultiOrder
-                                   .size() == 6u;
-                    },
-                    std::chrono::seconds(2));
-                runtime
-                    .stopDedicatedEeExecutionForTesting();
+                        result.order =
+                            g_executorEventMultiOrder;
+                        result.eventId =
+                            g_executorEventMultiId;
+                        result.clearResult =
+                            g_executorEventClearResult;
+                        result.retainResult =
+                            g_executorEventRetainResult;
+                        result.clearBits =
+                            g_executorEventClearBits;
+                        result.retainBits =
+                            g_executorEventRetainBits;
+                        result.retainedWait =
+                            g_executorEventRetainWaitedAfterFirstSet;
+                        return result;
+                    };
 
-                std::vector<int> order;
-                int eventId = KE_ERROR;
-                int clearResult = KE_ERROR;
-                int retainResult = KE_ERROR;
-                uint32_t clearBits = 0u;
-                uint32_t retainBits = 0u;
-                bool retainedWait = false;
-                {
-                    std::lock_guard<std::mutex> lock(
-                        g_executorFixtureMutex);
-                    order = g_executorEventMultiOrder;
-                    eventId = g_executorEventMultiId;
-                    clearResult =
-                        g_executorEventClearResult;
-                    retainResult =
-                        g_executorEventRetainResult;
-                    clearBits =
-                        g_executorEventClearBits;
-                    retainBits =
-                        g_executorEventRetainBits;
-                    retainedWait =
-                        g_executorEventRetainWaitedAfterFirstSet;
-                }
+                const FixtureResult host =
+                    runFixture(
+                        EeExecutionBackendKind::
+                            LegacyHostThread);
+                const FixtureResult fiber =
+                    runFixture(
+                        EeExecutionBackendKind::
+                            LegacyCppFiber);
 
                 t.IsTrue(
-                    completed && eventId > 0 &&
-                        order ==
+                    host.memoryInitialized &&
+                        fiber.memoryInitialized &&
+                        host.completed &&
+                        fiber.completed &&
+                        host.eventId > 0 &&
+                        fiber.eventId == host.eventId &&
+                        host.order ==
                             std::vector<int>{
-                                1, 2, 3, 4, 5, 6},
+                                1, 2, 3, 4, 5, 6} &&
+                        fiber.order == host.order,
                     "the first FIFO waiter should run "
                     "inside the first set and the second "
-                    "inside the second set");
+                    "inside the second set under both "
+                    "backends");
                 t.IsTrue(
-                    clearResult == KE_OK &&
-                        retainResult == KE_OK &&
-                        clearBits == 0x4u &&
-                        retainBits == 0x4u &&
-                        retainedWait,
+                    host.clearResult == KE_OK &&
+                        host.retainResult == KE_OK &&
+                        host.clearBits == 0x4u &&
+                        host.retainBits == 0x4u &&
+                        host.retainedWait &&
+                        fiber.clearResult ==
+                            host.clearResult &&
+                        fiber.retainResult ==
+                            host.retainResult &&
+                        fiber.clearBits ==
+                            host.clearBits &&
+                        fiber.retainBits ==
+                            host.retainBits &&
+                        fiber.retainedWait ==
+                            host.retainedWait,
                     "the first waiter's clear should "
                     "consume the first publication before "
-                    "the second predicate is evaluated");
+                    "the second predicate is evaluated "
+                    "under both backends");
             });
 
         tc.Run(
-            "fiber suspend and resume preserve executor ownership",
+            "legacy EE backends agree on suspend and resume boundaries",
             [](TestCase &t)
             {
                 if (!eeExecutionBackendBuildInfo()
@@ -5665,14 +5777,17 @@ void register_ps2_runtime_kernel_tests()
                 };
 
                 const auto runFixture =
-                    [](ExecutorSuspendScenario scenario)
+                    [](ExecutorSuspendScenario scenario,
+                       EeExecutionBackendKind backendKind)
                     {
                         FixtureResult result{};
                         PS2RuntimeConfiguration
                             configuration{};
                         configuration.eeExecutionBackend =
-                            EeExecutionBackendKind::
-                                LegacyCppFiber;
+                            backendKind;
+                        configuration
+                            .useEeExecutionBackendEnvironment =
+                            false;
                         PS2Runtime runtime(configuration);
                         result.memoryInitialized =
                             runtime.memory().initialize();
@@ -5736,7 +5851,7 @@ void register_ps2_runtime_kernel_tests()
                         }
 
                         runtime
-                            .startDedicatedEeExecutionForTesting();
+                            .startEeExecutionForTesting();
                         result.completed = waitUntil(
                             []()
                             {
@@ -5749,7 +5864,7 @@ void register_ps2_runtime_kernel_tests()
                             },
                             std::chrono::seconds(2));
                         runtime
-                            .stopDedicatedEeExecutionForTesting();
+                            .stopEeExecutionForTesting();
 
                         {
                             std::lock_guard<std::mutex>
@@ -5797,8 +5912,16 @@ void register_ps2_runtime_kernel_tests()
                 for (const auto &[scenario, name] :
                      scenarios)
                 {
-                    const FixtureResult result =
-                        runFixture(scenario);
+                    const FixtureResult host =
+                        runFixture(
+                            scenario,
+                            EeExecutionBackendKind::
+                                LegacyHostThread);
+                    const FixtureResult fiber =
+                        runFixture(
+                            scenario,
+                            EeExecutionBackendKind::
+                                LegacyCppFiber);
                     const bool waitSuspend =
                         scenario ==
                             ExecutorSuspendScenario::
@@ -5819,43 +5942,63 @@ void register_ps2_runtime_kernel_tests()
                             : std::vector<int>{1, 2, 3, 4};
 
                     t.IsTrue(
-                        result.memoryInitialized &&
-                            result.completed &&
-                            result.order == expectedOrder,
+                        host.memoryInitialized &&
+                            fiber.memoryInitialized &&
+                            host.completed &&
+                            fiber.completed &&
+                            host.order == expectedOrder &&
+                            fiber.order == host.order,
                         std::string(name) +
-                            " should switch only through "
-                            "the one executor");
+                            " should retain the same "
+                            "ordinary/raw dispatch order "
+                            "under both backends");
                     t.IsTrue(
-                        result.childThreadId > 1 &&
-                            result.waitResult ==
-                                result.childThreadId &&
-                            result.resumeResult ==
-                                result.childThreadId &&
-                            result.statusBeforeWake ==
+                        host.childThreadId > 1 &&
+                            fiber.childThreadId ==
+                                host.childThreadId &&
+                            host.waitResult ==
+                                host.childThreadId &&
+                            fiber.waitResult ==
+                                host.waitResult &&
+                            host.resumeResult ==
+                                host.childThreadId &&
+                            fiber.resumeResult ==
+                                host.resumeResult &&
+                            host.statusBeforeWake ==
                                 (waitSuspend
                                      ? THS_WAITSUSPEND
-                                     : THS_SUSPEND),
+                                     : THS_SUSPEND) &&
+                            fiber.statusBeforeWake ==
+                                host.statusBeforeWake,
                         std::string(name) +
-                            " should preserve syscall "
-                            "results and suspended status");
+                            " should preserve identical "
+                            "syscall results and suspended "
+                            "status");
                     if (waitSuspend)
                     {
                         t.IsTrue(
-                            result.suspendResult ==
-                                    result.childThreadId &&
-                                result.wakeResult ==
-                                    result.childThreadId &&
-                                result.statusAfterWake ==
-                                    THS_SUSPEND,
+                            host.suspendResult ==
+                                    host.childThreadId &&
+                                fiber.suspendResult ==
+                                    host.suspendResult &&
+                                host.wakeResult ==
+                                    host.childThreadId &&
+                                fiber.wakeResult ==
+                                    host.wakeResult &&
+                                host.statusAfterWake ==
+                                    THS_SUSPEND &&
+                                fiber.statusAfterWake ==
+                                    host.statusAfterWake,
                             std::string(name) +
                                 " should move WAIT through "
-                                "WAITSUSPEND to SUSPEND");
+                                "WAITSUSPEND to SUSPEND "
+                                "under both backends");
                     }
                 }
             });
 
         tc.Run(
-            "fiber termination retires blocked continuations",
+            "legacy EE backends agree on blocked-thread termination",
             [](TestCase &t)
             {
                 if (!eeExecutionBackendBuildInfo()
@@ -5882,14 +6025,17 @@ void register_ps2_runtime_kernel_tests()
                 };
 
                 const auto runFixture =
-                    [](ExecutorTerminateOperation operation)
+                    [](ExecutorTerminateOperation operation,
+                       EeExecutionBackendKind backendKind)
                     {
                         FixtureResult result{};
                         PS2RuntimeConfiguration
                             configuration{};
                         configuration.eeExecutionBackend =
-                            EeExecutionBackendKind::
-                                LegacyCppFiber;
+                            backendKind;
+                        configuration
+                            .useEeExecutionBackendEnvironment =
+                            false;
                         PS2Runtime runtime(configuration);
                         result.memoryInitialized =
                             runtime.memory().initialize();
@@ -5941,7 +6087,7 @@ void register_ps2_runtime_kernel_tests()
                         }
 
                         runtime
-                            .startDedicatedEeExecutionForTesting();
+                            .startEeExecutionForTesting();
                         result.completed = waitUntil(
                             []()
                             {
@@ -5954,6 +6100,8 @@ void register_ps2_runtime_kernel_tests()
                             },
                             std::chrono::seconds(2));
                         const bool continuationsRetired =
+                            !runtime
+                                 .usesDedicatedEeExecutor() ||
                             waitUntil(
                                 [&runtime]()
                                 {
@@ -5972,32 +6120,44 @@ void register_ps2_runtime_kernel_tests()
                             targetThreadId =
                                 g_executorTerminateTargetThreadId;
                         }
-                        std::optional<
-                            ps2x::ee::
-                                EeSchedulerThreadSnapshot>
-                            schedulerTarget;
-                        runtime
-                            .invokeEeSchedulerUpdateAtBoundary(
-                                [&schedulerTarget,
-                                 targetThreadId](
-                                    ps2x::ee::
-                                        EeThreadScheduler
-                                            &scheduler)
-                                {
-                                    schedulerTarget =
-                                        scheduler.thread(
-                                            targetThreadId);
-                                },
+                        if (runtime
+                                .usesDedicatedEeExecutor())
+                        {
+                            std::optional<
                                 ps2x::ee::
-                                    EeSchedulerReschedulePolicy::
-                                        None);
-                        result.schedulerTargetPresent =
-                            schedulerTarget.has_value();
+                                    EeSchedulerThreadSnapshot>
+                                schedulerTarget;
+                            runtime
+                                .invokeEeSchedulerUpdateAtBoundary(
+                                    [&schedulerTarget,
+                                     targetThreadId](
+                                        ps2x::ee::
+                                            EeThreadScheduler
+                                                &scheduler)
+                                    {
+                                        schedulerTarget =
+                                            scheduler.thread(
+                                                targetThreadId);
+                                    },
+                                    ps2x::ee::
+                                        EeSchedulerReschedulePolicy::
+                                            None);
+                            result
+                                .schedulerTargetPresent =
+                                schedulerTarget
+                                    .has_value();
+                        }
+                        else
+                        {
+                            result
+                                .schedulerTargetPresent =
+                                false;
+                        }
+                        runtime
+                            .stopEeExecutionForTesting();
                         result.managedContinuations =
                             runtime
                                 .managedEeExecutionThreadCountForTesting();
-                        runtime
-                            .stopDedicatedEeExecutionForTesting();
 
                         {
                             std::lock_guard<std::mutex>
@@ -6055,8 +6215,16 @@ void register_ps2_runtime_kernel_tests()
                 for (const auto &[operation, name] :
                      operations)
                 {
-                    const FixtureResult result =
-                        runFixture(operation);
+                    const FixtureResult host =
+                        runFixture(
+                            operation,
+                            EeExecutionBackendKind::
+                                LegacyHostThread);
+                    const FixtureResult fiber =
+                        runFixture(
+                            operation,
+                            EeExecutionBackendKind::
+                                LegacyCppFiber);
                     const bool raw =
                         operation ==
                             ExecutorTerminateOperation::
@@ -6072,39 +6240,63 @@ void register_ps2_runtime_kernel_tests()
                                   1, 2, 3, 4, 5};
 
                     t.IsTrue(
-                        result.memoryInitialized &&
-                            result.completed &&
-                            result.order == expectedOrder,
+                        host.memoryInitialized &&
+                            fiber.memoryInitialized &&
+                            host.completed &&
+                            fiber.completed &&
+                            host.order == expectedOrder &&
+                            fiber.order == host.order,
                         std::string(name) +
-                            " should preserve the "
-                            "ordinary/raw boundary");
+                            " should preserve the same "
+                            "ordinary/raw boundary under "
+                            "both backends");
                     t.IsTrue(
-                        result.objectId >= 0 &&
-                            result.candidateThreadId > 1 &&
-                            result.targetThreadId > 1 &&
-                            result.terminateResult ==
-                                result.targetThreadId &&
-                            result.targetStatus ==
+                        host.objectId >= 0 &&
+                            fiber.objectId ==
+                                host.objectId &&
+                            host.candidateThreadId > 1 &&
+                            fiber.candidateThreadId ==
+                                host.candidateThreadId &&
+                            host.targetThreadId > 1 &&
+                            fiber.targetThreadId ==
+                                host.targetThreadId &&
+                            host.terminateResult ==
+                                host.targetThreadId &&
+                            fiber.terminateResult ==
+                                host.terminateResult &&
+                            host.targetStatus ==
                                 THS_DORMANT &&
-                            result.waiters == 0 &&
-                            !result.targetReturned,
+                            fiber.targetStatus ==
+                                host.targetStatus &&
+                            host.waiters == 0 &&
+                            fiber.waiters ==
+                                host.waiters &&
+                            !host.targetReturned &&
+                            !fiber.targetReturned,
                         std::string(name) +
                             " should synchronously publish "
-                            "DORMANT and unlink its wait");
+                            "identical DORMANT state and "
+                            "unlink its wait");
                     t.IsTrue(
-                        result.deleteResult ==
-                                result.targetThreadId &&
-                            !result.schedulerTargetPresent &&
-                            result.managedContinuations ==
+                        host.deleteResult ==
+                                host.targetThreadId &&
+                            fiber.deleteResult ==
+                                host.deleteResult &&
+                            !host.schedulerTargetPresent &&
+                            !fiber.schedulerTargetPresent &&
+                            host.managedContinuations ==
+                                0u &&
+                            fiber.managedContinuations ==
                                 0u,
                         std::string(name) +
-                            " should delete scheduler "
-                            "ownership and its fiber");
+                            " should delete backend "
+                            "ownership and its "
+                            "continuation");
                 }
             });
 
         tc.Run(
-            "fiber self exit preserves or removes scheduler objects",
+            "legacy EE backends agree on self-exit object lifecycle",
             [](TestCase &t)
             {
                 if (!eeExecutionBackendBuildInfo()
@@ -6142,207 +6334,304 @@ void register_ps2_runtime_kernel_tests()
                     size_t managedContinuations = 1u;
                 };
 
-                FixtureResult result{};
-                PS2RuntimeConfiguration configuration{};
-                configuration.eeExecutionBackend =
-                    EeExecutionBackendKind::LegacyCppFiber;
-                PS2Runtime runtime(configuration);
-                result.memoryInitialized =
-                    runtime.memory().initialize();
-                if (!result.memoryInitialized)
+                const auto runFixture =
+                    [](EeExecutionBackendKind backendKind)
                 {
-                    t.IsTrue(
-                        false,
-                        "fiber self-exit fixture memory should initialize");
-                    return;
-                }
+                    FixtureResult result{};
+                    PS2RuntimeConfiguration configuration{};
+                    configuration.eeExecutionBackend =
+                        backendKind;
+                    configuration
+                        .useEeExecutionBackendEnvironment =
+                        false;
+                    PS2Runtime runtime(configuration);
+                    result.memoryInitialized =
+                        runtime.memory().initialize();
+                    if (!result.memoryInitialized)
+                    {
+                        return result;
+                    }
 
-                uint8_t *const rdram =
-                    runtime.memory().getRDRAM();
-                runtime.registerFunction(
-                    K_EXECUTOR_EXIT_MAIN_ENTRY,
-                    &dedicatedExecutorExitMainHandler);
-                runtime.registerFunction(
-                    K_EXECUTOR_EXIT_THREAD_ENTRY,
-                    &selfExitThreadHandler);
-                runtime.registerFunction(
-                    K_EXECUTOR_EXIT_DELETE_THREAD_ENTRY,
-                    &selfExitDeleteThreadHandler);
-                runtime.cpu().pc =
-                    K_EXECUTOR_EXIT_MAIN_ENTRY;
-                setRegU32(
-                    runtime.cpu(),
-                    29,
-                    0x00300000u);
+                    uint8_t *const rdram =
+                        runtime.memory().getRDRAM();
+                    runtime.registerFunction(
+                        K_EXECUTOR_EXIT_MAIN_ENTRY,
+                        &dedicatedExecutorExitMainHandler);
+                    runtime.registerFunction(
+                        K_EXECUTOR_EXIT_THREAD_ENTRY,
+                        &selfExitThreadHandler);
+                    runtime.registerFunction(
+                        K_EXECUTOR_EXIT_DELETE_THREAD_ENTRY,
+                        &selfExitDeleteThreadHandler);
+                    runtime.cpu().pc =
+                        K_EXECUTOR_EXIT_MAIN_ENTRY;
+                    setRegU32(
+                        runtime.cpu(),
+                        29,
+                        0x00300000u);
 
-                {
-                    std::lock_guard<std::mutex> lock(
-                        g_executorFixtureMutex);
-                    g_executorExitCompleted = false;
-                    g_executorExitThreadId = 0;
-                    g_executorExitDeleteThreadId = 0;
-                    g_executorExitThreadStartResult =
-                        KE_ERROR;
-                    g_executorExitDeleteThreadStartResult =
-                        KE_ERROR;
-                    g_executorExitThreadStatusResult =
-                        KE_ERROR;
-                    g_executorExitThreadStatusPayload = 0;
-                    g_executorExitThreadDeleteResult =
-                        KE_ERROR;
-                    g_executorExitDeleteThreadStatusResult =
-                        KE_ERROR;
-                    g_executorExitDeleteThreadStatusPayload =
-                        0;
-                    g_executorExitDeleteThreadDeleteResult =
-                        KE_ERROR;
-                }
-
-                runtime
-                    .startDedicatedEeExecutionForTesting();
-                result.completed = waitUntil(
-                    []()
                     {
                         std::lock_guard<std::mutex> lock(
                             g_executorFixtureMutex);
-                        return g_executorExitCompleted;
-                    },
-                    std::chrono::seconds(2));
-                const bool continuationsRetired =
-                    waitUntil(
-                        [&runtime]()
-                        {
-                            return runtime
-                                       .managedEeExecutionThreadCountForTesting() ==
-                                   0u;
-                        },
-                        std::chrono::milliseconds(200));
+                        g_executorExitCompleted = false;
+                        g_executorExitThreadId = 0;
+                        g_executorExitDeleteThreadId = 0;
+                        g_executorExitThreadStartResult =
+                            KE_ERROR;
+                        g_executorExitDeleteThreadStartResult =
+                            KE_ERROR;
+                        g_executorExitThreadStatusResult =
+                            KE_ERROR;
+                        g_executorExitThreadStatusPayload = 0;
+                        g_executorExitThreadDeleteResult =
+                            KE_ERROR;
+                        g_executorExitDeleteThreadStatusResult =
+                            KE_ERROR;
+                        g_executorExitDeleteThreadStatusPayload =
+                            0;
+                        g_executorExitDeleteThreadDeleteResult =
+                            KE_ERROR;
+                    }
 
-                {
-                    std::lock_guard<std::mutex> lock(
-                        g_executorFixtureMutex);
-                    result.exitThreadId =
-                        g_executorExitThreadId;
-                    result.exitDeleteThreadId =
-                        g_executorExitDeleteThreadId;
-                    result.exitThreadStartResult =
-                        g_executorExitThreadStartResult;
-                    result.exitDeleteThreadStartResult =
-                        g_executorExitDeleteThreadStartResult;
-                    result.exitThreadStatusResult =
-                        g_executorExitThreadStatusResult;
-                    result.exitThreadStatusPayload =
-                        g_executorExitThreadStatusPayload;
-                    result.exitThreadDeleteResult =
-                        g_executorExitThreadDeleteResult;
-                    result.exitDeleteThreadStatusResult =
-                        g_executorExitDeleteThreadStatusResult;
-                    result.exitDeleteThreadStatusPayload =
-                        g_executorExitDeleteThreadStatusPayload;
-                    result.exitDeleteThreadDeleteResult =
-                        g_executorExitDeleteThreadDeleteResult;
-                }
-
-                std::optional<
-                    ps2x::ee::EeSchedulerThreadSnapshot>
-                    schedulerExitThread;
-                std::optional<
-                    ps2x::ee::EeSchedulerThreadSnapshot>
-                    schedulerExitDeleteThread;
-                runtime.invokeEeSchedulerUpdateAtBoundary(
-                    [&schedulerExitThread,
-                     &schedulerExitDeleteThread,
-                     &result](
-                        ps2x::ee::EeThreadScheduler
-                            &scheduler)
-                    {
-                        schedulerExitThread =
-                            scheduler.thread(
-                                result.exitThreadId);
-                        schedulerExitDeleteThread =
-                            scheduler.thread(
-                                result.exitDeleteThreadId);
-                    },
-                    ps2x::ee::
-                        EeSchedulerReschedulePolicy::None);
-                result.schedulerExitThreadPresent =
-                    schedulerExitThread.has_value();
-                result.schedulerExitDeleteThreadPresent =
-                    schedulerExitDeleteThread.has_value();
-                result.managedContinuations =
                     runtime
-                        .managedEeExecutionThreadCountForTesting();
-                runtime
-                    .stopDedicatedEeExecutionForTesting();
+                        .startEeExecutionForTesting();
+                    result.completed = waitUntil(
+                        []()
+                        {
+                            std::lock_guard<std::mutex> lock(
+                                g_executorFixtureMutex);
+                            return g_executorExitCompleted;
+                        },
+                        std::chrono::seconds(2));
+                    const bool continuationsRetired =
+                        !runtime
+                             .usesDedicatedEeExecutor() ||
+                        waitUntil(
+                            [&runtime]()
+                            {
+                                return runtime
+                                           .managedEeExecutionThreadCountForTesting() ==
+                                       0u;
+                            },
+                            std::chrono::
+                                milliseconds(200));
 
-                result.exitThreadStage =
-                    readGuestU32(
-                        rdram,
-                        K_EXIT_THREAD_STAGE_ADDR);
-                result.exitDeleteThreadStage =
-                    readGuestU32(
-                        rdram,
-                        K_EXIT_DELETE_THREAD_STAGE_ADDR);
-                result.exitThreadObservedId =
-                    readGuestU32(
-                        rdram,
-                        K_EXIT_THREAD_ID_ADDR);
-                result.exitDeleteThreadObservedId =
-                    readGuestU32(
-                        rdram,
-                        K_EXIT_DELETE_THREAD_ID_ADDR);
-                if (!continuationsRetired)
-                {
+                    {
+                        std::lock_guard<std::mutex> lock(
+                            g_executorFixtureMutex);
+                        result.exitThreadId =
+                            g_executorExitThreadId;
+                        result.exitDeleteThreadId =
+                            g_executorExitDeleteThreadId;
+                        result.exitThreadStartResult =
+                            g_executorExitThreadStartResult;
+                        result.exitDeleteThreadStartResult =
+                            g_executorExitDeleteThreadStartResult;
+                        result.exitThreadStatusResult =
+                            g_executorExitThreadStatusResult;
+                        result.exitThreadStatusPayload =
+                            g_executorExitThreadStatusPayload;
+                        result.exitThreadDeleteResult =
+                            g_executorExitThreadDeleteResult;
+                        result.exitDeleteThreadStatusResult =
+                            g_executorExitDeleteThreadStatusResult;
+                        result.exitDeleteThreadStatusPayload =
+                            g_executorExitDeleteThreadStatusPayload;
+                        result.exitDeleteThreadDeleteResult =
+                            g_executorExitDeleteThreadDeleteResult;
+                    }
+
+                    if (runtime
+                            .usesDedicatedEeExecutor())
+                    {
+                        std::optional<
+                            ps2x::ee::
+                                EeSchedulerThreadSnapshot>
+                            schedulerExitThread;
+                        std::optional<
+                            ps2x::ee::
+                                EeSchedulerThreadSnapshot>
+                            schedulerExitDeleteThread;
+                        runtime
+                            .invokeEeSchedulerUpdateAtBoundary(
+                                [&schedulerExitThread,
+                                 &schedulerExitDeleteThread,
+                                 &result](
+                                    ps2x::ee::
+                                        EeThreadScheduler
+                                            &scheduler)
+                                {
+                                    schedulerExitThread =
+                                        scheduler.thread(
+                                            result
+                                                .exitThreadId);
+                                    schedulerExitDeleteThread =
+                                        scheduler.thread(
+                                            result
+                                                .exitDeleteThreadId);
+                                },
+                                ps2x::ee::
+                                    EeSchedulerReschedulePolicy::
+                                        None);
+                        result
+                            .schedulerExitThreadPresent =
+                            schedulerExitThread
+                                .has_value();
+                        result
+                            .schedulerExitDeleteThreadPresent =
+                            schedulerExitDeleteThread
+                                .has_value();
+                    }
+                    else
+                    {
+                        result.schedulerExitThreadPresent =
+                            false;
+                        result
+                            .schedulerExitDeleteThreadPresent =
+                            false;
+                    }
+
+                    runtime.stopEeExecutionForTesting();
                     result.managedContinuations =
-                        std::max<size_t>(
-                            1u,
-                            result.managedContinuations);
+                        runtime
+                            .managedEeExecutionThreadCountForTesting();
+
+                    result.exitThreadStage =
+                        readGuestU32(
+                            rdram,
+                            K_EXIT_THREAD_STAGE_ADDR);
+                    result.exitDeleteThreadStage =
+                        readGuestU32(
+                            rdram,
+                            K_EXIT_DELETE_THREAD_STAGE_ADDR);
+                    result.exitThreadObservedId =
+                        readGuestU32(
+                            rdram,
+                            K_EXIT_THREAD_ID_ADDR);
+                    result.exitDeleteThreadObservedId =
+                        readGuestU32(
+                            rdram,
+                            K_EXIT_DELETE_THREAD_ID_ADDR);
+                    if (!continuationsRetired)
+                    {
+                        result.managedContinuations =
+                            std::max<size_t>(
+                                1u,
+                                result.managedContinuations);
+                    }
+                    return result;
+                };
+
+                const FixtureResult host =
+                    runFixture(
+                        EeExecutionBackendKind::
+                            LegacyHostThread);
+                const FixtureResult fiber =
+                    runFixture(
+                        EeExecutionBackendKind::
+                            LegacyCppFiber);
+
+                if (!host.memoryInitialized ||
+                    !fiber.memoryInitialized)
+                {
+                    t.IsTrue(
+                        false,
+                        "both self-exit fixtures should "
+                        "initialize memory");
+                    return;
                 }
 
                 t.IsTrue(
-                    result.memoryInitialized &&
-                        result.completed &&
-                        result.exitThreadId > 1 &&
-                        result.exitDeleteThreadId > 1 &&
-                        result.exitThreadId !=
-                            result.exitDeleteThreadId &&
-                        result.exitThreadStartResult ==
-                            result.exitThreadId &&
-                        result.exitDeleteThreadStartResult ==
-                            result.exitDeleteThreadId &&
-                        result.exitThreadStage == 1u &&
-                        result.exitDeleteThreadStage == 1u &&
-                        result.exitThreadObservedId ==
+                    host.completed &&
+                        fiber.completed &&
+                        host.exitThreadId > 1 &&
+                        fiber.exitThreadId ==
+                            host.exitThreadId &&
+                        host.exitDeleteThreadId > 1 &&
+                        fiber.exitDeleteThreadId ==
+                            host.exitDeleteThreadId &&
+                        host.exitThreadId !=
+                            host.exitDeleteThreadId &&
+                        host.exitThreadStartResult ==
+                            host.exitThreadId &&
+                        fiber.exitThreadStartResult ==
+                            host.exitThreadStartResult &&
+                        host.exitDeleteThreadStartResult ==
+                            host.exitDeleteThreadId &&
+                        fiber.exitDeleteThreadStartResult ==
+                            host
+                                .exitDeleteThreadStartResult &&
+                        host.exitThreadStage == 1u &&
+                        fiber.exitThreadStage ==
+                            host.exitThreadStage &&
+                        host.exitDeleteThreadStage == 1u &&
+                        fiber.exitDeleteThreadStage ==
+                            host.exitDeleteThreadStage &&
+                        host.exitThreadObservedId ==
                             static_cast<uint32_t>(
-                                result.exitThreadId) &&
-                        result.exitDeleteThreadObservedId ==
+                                host.exitThreadId) &&
+                        fiber.exitThreadObservedId ==
+                            host.exitThreadObservedId &&
+                        host.exitDeleteThreadObservedId ==
                             static_cast<uint32_t>(
-                                result.exitDeleteThreadId),
-                    "self-exit workers should stop at their syscalls and return control to the executor");
+                                host.exitDeleteThreadId) &&
+                        fiber
+                                .exitDeleteThreadObservedId ==
+                            host
+                                .exitDeleteThreadObservedId,
+                    "self-exit workers should stop at "
+                    "their syscalls with identical "
+                    "guest-visible lifecycle data");
                 t.IsTrue(
-                    result.exitThreadStatusResult ==
+                    host.exitThreadStatusResult ==
                             THS_DORMANT &&
-                        result.exitThreadStatusPayload ==
+                        host.exitThreadStatusPayload ==
                             THS_DORMANT &&
-                        result.exitThreadDeleteResult ==
-                            result.exitThreadId &&
-                        result.exitDeleteThreadStatusResult ==
+                        host.exitThreadDeleteResult ==
+                            host.exitThreadId &&
+                        host.exitDeleteThreadStatusResult ==
                             KE_OK &&
-                        result.exitDeleteThreadStatusPayload ==
+                        host.exitDeleteThreadStatusPayload ==
                             0x5A5A5A5A &&
-                        result.exitDeleteThreadDeleteResult ==
-                            KE_ERROR,
-                    "self exit should preserve the guest object while exit-delete should remove it");
+                        host.exitDeleteThreadDeleteResult ==
+                            KE_ERROR &&
+                        fiber.exitThreadStatusResult ==
+                            host.exitThreadStatusResult &&
+                        fiber.exitThreadStatusPayload ==
+                            host.exitThreadStatusPayload &&
+                        fiber.exitThreadDeleteResult ==
+                            host.exitThreadDeleteResult &&
+                        fiber
+                                .exitDeleteThreadStatusResult ==
+                            host
+                                .exitDeleteThreadStatusResult &&
+                        fiber
+                                .exitDeleteThreadStatusPayload ==
+                            host
+                                .exitDeleteThreadStatusPayload &&
+                        fiber
+                                .exitDeleteThreadDeleteResult ==
+                            host
+                                .exitDeleteThreadDeleteResult,
+                    "self exit should preserve the guest "
+                    "object while exit-delete removes it "
+                    "under both backends");
                 t.IsTrue(
-                    !result.schedulerExitThreadPresent &&
-                        !result
+                    !host.schedulerExitThreadPresent &&
+                        !host
                              .schedulerExitDeleteThreadPresent &&
-                        result.managedContinuations == 0u,
-                    "self-exit lifecycle should retire scheduler and continuation ownership exactly once");
+                        !fiber.schedulerExitThreadPresent &&
+                        !fiber
+                             .schedulerExitDeleteThreadPresent &&
+                        host.managedContinuations == 0u &&
+                        fiber.managedContinuations == 0u,
+                    "self-exit lifecycle should retire "
+                    "backend continuation ownership "
+                    "exactly once");
             });
 
         tc.Run(
-            "fiber priority and rotation preserve ordinary and raw boundaries",
+            "legacy EE backends agree on priority and rotation boundaries",
             [](TestCase &t)
             {
                 if (!eeExecutionBackendBuildInfo()
@@ -6366,18 +6655,22 @@ void register_ps2_runtime_kernel_tests()
                     int schedulerFirstPriority = -1;
                     int schedulerSecondPriority = -1;
                     bool schedulerValid = false;
+                    bool schedulerInspected = false;
                     size_t managedContinuations = 1u;
                 };
 
                 const auto runFixture =
-                    [](ExecutorPriorityScenario scenario)
+                    [](ExecutorPriorityScenario scenario,
+                       EeExecutionBackendKind backendKind)
                     {
                         FixtureResult result{};
                         PS2RuntimeConfiguration
                             configuration{};
                         configuration.eeExecutionBackend =
-                            EeExecutionBackendKind::
-                                LegacyCppFiber;
+                            backendKind;
+                        configuration
+                            .useEeExecutionBackendEnvironment =
+                            false;
                         PS2Runtime runtime(configuration);
                         result.memoryInitialized =
                             runtime.memory().initialize();
@@ -6422,7 +6715,7 @@ void register_ps2_runtime_kernel_tests()
                         }
 
                         runtime
-                            .startDedicatedEeExecutionForTesting();
+                            .startEeExecutionForTesting();
                         result.completed = waitUntil(
                             []()
                             {
@@ -6434,6 +6727,8 @@ void register_ps2_runtime_kernel_tests()
                             },
                             std::chrono::seconds(2));
                         const bool continuationsRetired =
+                            !runtime
+                                 .usesDedicatedEeExecutor() ||
                             waitUntil(
                                 [&runtime]()
                                 {
@@ -6464,46 +6759,61 @@ void register_ps2_runtime_kernel_tests()
                                 g_executorPrioritySecondThreadId;
                         }
 
-                        runtime
-                            .invokeEeSchedulerUpdateAtBoundary(
-                                [&result](
+                        if (runtime
+                                .usesDedicatedEeExecutor())
+                        {
+                            runtime
+                                .invokeEeSchedulerUpdateAtBoundary(
+                                    [&result](
+                                        ps2x::ee::
+                                            EeThreadScheduler
+                                                &scheduler)
+                                    {
+                                        const auto main =
+                                            scheduler
+                                                .thread(1);
+                                        const auto first =
+                                            scheduler.thread(
+                                                result
+                                                    .firstThreadId);
+                                        const auto second =
+                                            scheduler.thread(
+                                                result
+                                                    .secondThreadId);
+                                        result
+                                            .schedulerMainPriority =
+                                            main.has_value()
+                                                ? main
+                                                      ->priority
+                                                : -1;
+                                        result
+                                            .schedulerFirstPriority =
+                                            first.has_value()
+                                                ? first
+                                                      ->priority
+                                                : -1;
+                                        result
+                                            .schedulerSecondPriority =
+                                            second.has_value()
+                                                ? second
+                                                      ->priority
+                                                : -1;
+                                        result.schedulerValid =
+                                            scheduler
+                                                .validate();
+                                        result
+                                            .schedulerInspected =
+                                            true;
+                                    },
                                     ps2x::ee::
-                                        EeThreadScheduler
-                                            &scheduler)
-                                {
-                                    const auto main =
-                                        scheduler.thread(1);
-                                    const auto first =
-                                        scheduler.thread(
-                                            result
-                                                .firstThreadId);
-                                    const auto second =
-                                        scheduler.thread(
-                                            result
-                                                .secondThreadId);
-                                    result.schedulerMainPriority =
-                                        main.has_value()
-                                            ? main->priority
-                                            : -1;
-                                    result.schedulerFirstPriority =
-                                        first.has_value()
-                                            ? first->priority
-                                            : -1;
-                                    result.schedulerSecondPriority =
-                                        second.has_value()
-                                            ? second->priority
-                                            : -1;
-                                    result.schedulerValid =
-                                        scheduler.validate();
-                                },
-                                ps2x::ee::
-                                    EeSchedulerReschedulePolicy::
-                                        None);
+                                        EeSchedulerReschedulePolicy::
+                                            None);
+                        }
+                        runtime
+                            .stopEeExecutionForTesting();
                         result.managedContinuations =
                             runtime
                                 .managedEeExecutionThreadCountForTesting();
-                        runtime
-                            .stopDedicatedEeExecutionForTesting();
                         if (!continuationsRetired)
                         {
                             result.managedContinuations =
@@ -6596,44 +6906,74 @@ void register_ps2_runtime_kernel_tests()
                 for (const auto &expectation :
                      expectations)
                 {
-                    const FixtureResult result =
+                    const FixtureResult host =
                         runFixture(
-                            expectation.scenario);
+                            expectation.scenario,
+                            EeExecutionBackendKind::
+                                LegacyHostThread);
+                    const FixtureResult fiber =
+                        runFixture(
+                            expectation.scenario,
+                            EeExecutionBackendKind::
+                                LegacyCppFiber);
                     t.IsTrue(
-                        result.memoryInitialized &&
-                            result.completed &&
-                            result.setupResult == 1 &&
-                            result.firstThreadId > 1 &&
+                        host.memoryInitialized &&
+                            fiber.memoryInitialized &&
+                            host.completed &&
+                            fiber.completed &&
+                            host.setupResult == 1 &&
+                            fiber.setupResult ==
+                                host.setupResult &&
+                            host.firstThreadId > 1 &&
+                            fiber.firstThreadId ==
+                                host.firstThreadId &&
                             (expectation.secondPriority < 0 ||
-                             result.secondThreadId > 1) &&
-                            result.order ==
-                                expectation.order,
+                             (host.secondThreadId > 1 &&
+                              fiber.secondThreadId ==
+                                  host
+                                      .secondThreadId)) &&
+                            host.order ==
+                                expectation.order &&
+                            fiber.order == host.order,
                         std::string(expectation.name) +
-                            " should preserve the PCSX2 "
-                            "ordinary/raw order");
+                            " should preserve the same "
+                            "PCSX2 ordinary/raw order "
+                            "under both backends");
                     t.IsTrue(
-                        result.operationResult ==
+                        host.operationResult ==
                                 expectation
                                     .operationResult &&
-                            result.triggerResult ==
+                            fiber.operationResult ==
+                                host.operationResult &&
+                            host.triggerResult ==
                                 expectation.triggerResult &&
-                            result.statusValue ==
-                                expectation.statusValue,
+                            fiber.triggerResult ==
+                                host.triggerResult &&
+                            host.statusValue ==
+                                expectation.statusValue &&
+                            fiber.statusValue ==
+                                host.statusValue,
                         std::string(expectation.name) +
-                            " should preserve syscall "
-                            "results and synchronous "
-                            "guest status");
+                            " should preserve identical "
+                            "syscall results and "
+                            "synchronous guest status");
                     t.IsTrue(
-                        result.schedulerMainPriority ==
+                        fiber.schedulerInspected &&
+                            fiber
+                                    .schedulerMainPriority ==
                                 expectation.mainPriority &&
-                            result.schedulerFirstPriority ==
+                            fiber
+                                    .schedulerFirstPriority ==
                                 expectation
                                     .firstPriority &&
-                            result.schedulerSecondPriority ==
+                            fiber
+                                    .schedulerSecondPriority ==
                                 expectation
                                     .secondPriority &&
-                            result.schedulerValid &&
-                            result.managedContinuations ==
+                            fiber.schedulerValid &&
+                            host.managedContinuations ==
+                                0u &&
+                            fiber.managedContinuations ==
                                 0u,
                         std::string(expectation.name) +
                             " should keep scheduler "
@@ -11867,6 +12207,20 @@ void register_ps2_runtime_kernel_tests()
             env.runtime.registerFunction(
                 kTargetEntry,
                 &terminateReadyTargetHandler);
+
+            R5900Context mainPriorityContext{};
+            setRegU32(
+                mainPriorityContext, 4, 0u);
+            setRegU32(
+                mainPriorityContext, 5, 40u);
+            ChangeThreadPriority(
+                env.rdram.data(),
+                &mainPriorityContext,
+                &env.runtime);
+            t.Equals(
+                getRegS32(mainPriorityContext, 2),
+                0,
+                "termination main should begin below its priority-30 candidate");
 
             auto createThread = [&](uint32_t entry,
                                     uint32_t stack,

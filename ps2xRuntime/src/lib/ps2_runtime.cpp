@@ -7576,10 +7576,48 @@ void PS2Runtime::dispatchLoop(uint8_t *rdram, R5900Context *ctx)
         const uint32_t dispatchedRa = static_cast<uint32_t>(_mm_extract_epi32(ctx->r[31], 0));
 
         uint64_t handoffBaseline = 0u;
+        std::shared_ptr<ThreadInfo>
+            returnedThreadInfo;
         {
             GuestExecutionScope guestExecution(this, ctx);
             executeGuestStep(rdram, ctx, fn);
+            if (!m_eeRuntimeExecutor &&
+                ctx->pc == 0u)
+            {
+                EeThreadRuntimeState &state =
+                    *m_eeThreadRuntimeState;
+                {
+                    std::lock_guard<std::mutex> lock(
+                        state.threadMapMutex);
+                    const auto context =
+                        state.contextThreadIds.find(ctx);
+                    if (context !=
+                        state.contextThreadIds.end())
+                    {
+                        const auto thread =
+                            state.threads.find(
+                                context->second);
+                        if (thread !=
+                            state.threads.end())
+                        {
+                            returnedThreadInfo =
+                                thread->second;
+                        }
+                    }
+                }
+                if (returnedThreadInfo)
+                {
+                    std::lock_guard<std::mutex> lock(
+                        returnedThreadInfo->m);
+                    returnedThreadInfo->guestState
+                        .makeDormant();
+                }
+            }
             handoffBaseline = guestExecutionHandoffEpochSnapshot();
+        }
+        if (returnedThreadInfo)
+        {
+            returnedThreadInfo->cv.notify_all();
         }
 
         waitForGuestExecutionHandoff(handoffBaseline);

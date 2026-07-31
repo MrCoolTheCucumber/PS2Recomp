@@ -67,22 +67,34 @@ namespace ps2_syscalls
         {
             EeThreadRuntimeState &state =
                 runtime->eeThreadRuntimeState();
-            std::lock_guard<std::mutex> lock(
-                state.threadMapMutex);
-            for (const auto &entry : state.threads)
             {
-                if (entry.second)
+                std::lock_guard<std::mutex> lock(
+                    state.threadMapMutex);
+                for (const auto &entry : state.threads)
                 {
-                    threads.push_back(entry.second);
+                    if (entry.second)
+                    {
+                        threads.push_back(
+                            entry.second);
+                    }
+                }
+                state.threads.clear();
+                state.contextThreadIds.clear();
+                state.contextThreadIds.emplace(
+                    &runtime->cpu(), 1);
+                state.nextThreadId = 2;
+                state.currentThreadId.store(
+                    1, std::memory_order_release);
+            }
+            {
+                std::lock_guard<std::mutex> lock(
+                    state.legacyReadyMutex);
+                for (auto &queue :
+                     state.legacyReadyQueues)
+                {
+                    queue.clear();
                 }
             }
-            state.threads.clear();
-            state.contextThreadIds.clear();
-            state.contextThreadIds.emplace(
-                &runtime->cpu(), 1);
-            state.nextThreadId = 2;
-            state.currentThreadId.store(
-                1, std::memory_order_release);
         }
         g_currentThreadRuntime = runtime;
         g_currentThreadId = 1;

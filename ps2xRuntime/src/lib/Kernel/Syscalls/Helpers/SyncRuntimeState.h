@@ -5,6 +5,7 @@
 #include <memory>
 #include <mutex>
 #include <unordered_map>
+#include <vector>
 
 struct SemaInfo
 {
@@ -36,6 +37,11 @@ struct EventFlagInfo
     bool deleted = false;
     std::unordered_map<int, SchedulerWaiter>
         schedulerWaiters;
+    // The dedicated scheduler owns its event-wait FIFO. The legacy
+    // host-thread backend retains the equivalent order here so synchronous
+    // raw publications can apply predicates and clear modes before a worker
+    // reacquires guest execution.
+    std::vector<int> legacyWaitOrder;
     std::mutex m;
     std::condition_variable cv;
 };
