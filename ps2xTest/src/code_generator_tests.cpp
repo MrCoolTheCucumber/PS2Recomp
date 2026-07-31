@@ -3,6 +3,7 @@
 #include "ps2recomp/ee_cycle_model.h"
 #include "ps2recomp/instructions.h"
 #include "ps2recomp/ps2_recompiler.h"
+#include "ps2recomp/recompiler_reporter.h"
 #include "ps2recomp/types.h"
 #include <filesystem>
 #include <fstream>
@@ -977,6 +978,81 @@ void register_code_generator_tests()
                  "resume pc should force label emission for that instruction");
     });
 
+    tc.Run("resume entry audit rejects missing labels owners and collisions", [](TestCase &t) {
+        Function func;
+        func.name = "resume_owner";
+        func.start = 0x6000u;
+        func.end = 0x6010u;
+        func.isRecompiled = true;
+        func.isStub = false;
+
+        const std::vector<Instruction> instructions{
+            makeNop(0x6000u),
+            makeNop(0x6004u),
+            makeNop(0x6008u),
+            makeNop(0x600Cu),
+        };
+
+        CodeGenerator missingLabel({}, {});
+        missingLabel.setResumeEntryTargets(
+            {{0x6000u, {0x6010u}}});
+        bool rejectedMissingLabel = false;
+        try
+        {
+            (void)missingLabel.generateFunction(
+                func, instructions, false);
+        }
+        catch (const std::runtime_error &)
+        {
+            rejectedMissingLabel = true;
+        }
+        t.IsTrue(
+            rejectedMissingLabel,
+            "a resume entry outside the owner's decoded instructions should fail generation");
+
+        CodeGenerator missingOwner({}, {});
+        missingOwner.setResumeEntryTargets(
+            {{0x7000u, {0x7008u}}});
+        bool rejectedMissingOwner = false;
+        try
+        {
+            (void)missingOwner.generateFunctionRegistration(
+                {func}, {});
+        }
+        catch (const std::runtime_error &)
+        {
+            rejectedMissingOwner = true;
+        }
+        t.IsTrue(
+            rejectedMissingOwner,
+            "a resume-entry table mapping without a generated owner should fail generation");
+
+        Function conflictingOwner = func;
+        conflictingOwner.name = "conflicting_owner";
+        conflictingOwner.start = 0x7000u;
+        conflictingOwner.end = 0x7010u;
+
+        CodeGenerator conflictingMapping({}, {});
+        conflictingMapping.setRenamedFunctions(
+            {{0x6000u, "resume_owner_0x6000"},
+             {0x7000u, "conflicting_owner_0x7000"}});
+        conflictingMapping.setResumeEntryTargets(
+            {{0x7000u, {0x6000u}}});
+        bool rejectedOwnerCollision = false;
+        try
+        {
+            (void)conflictingMapping.generateFunctionRegistration(
+                {func, conflictingOwner}, {});
+        }
+        catch (const std::runtime_error &)
+        {
+            rejectedOwnerCollision = true;
+        }
+        t.IsTrue(
+            rejectedOwnerCollision,
+            "a resume entry already mapped to a different wrapper should fail generation");
+    });
+
     tc.Run("resume entry targets register to the owner wrapper", [](TestCase &t) {
         Function func;
         func.name = "resume_owner";
@@ -986,8 +1062,19 @@ void register_code_generator_tests()
         func.isStub = false;
 
         CodeGenerator gen({}, {});
+        RecompilerReporter reporter;
         gen.setRenamedFunctions({{0x7000u, "resume_owner_0x7000"}});
-        gen.setResumeEntryTargets({{0x7000u, {0x7008u, 0x700Cu}}});
+        gen.setResumeEntryTargets(
+            {{0x7000u, {0x7000u, 0x7008u, 0x700Cu}}});
+        gen.setReporter(&reporter);
+
+        const std::vector<Instruction> instructions{
+            makeNop(0x7000u),
+            makeNop(0x7004u),
+            makeNop(0x7008u),
+            makeNop(0x700Cu),
+        };
+        (void)gen.generateFunction(func, instructions, false);
 
         std::string registration = gen.generateFunctionRegistration({func}, {});
         printGeneratedCode("resume entry targets register to the owner wrapper", registration);
@@ -996,6 +1083,11 @@ void register_code_generator_tests()
                  "resume entry pc should register to the owner wrapper");
         t.IsTrue(registration.find("g_ps2RecompiledFunctionTable[3] = resume_owner_0x7000; // 0x700c") != std::string::npos,
                  "multiple resume pcs should register to the same owner wrapper");
+        const RecompilerReporter::Counters counters = reporter.counters();
+        t.Equals(counters.resumeEntryTargetsAudited, size_t{3},
+                 "the owner emitter should audit every mapped resume target");
+        t.Equals(counters.resumeEntryTargetsRegistered, size_t{3},
+                 "the function table should register every audited resume target");
     });
 
     tc.Run("function registration emits guest symbol ranges", [](TestCase &t) {

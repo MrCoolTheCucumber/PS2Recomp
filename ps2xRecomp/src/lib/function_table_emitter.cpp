@@ -70,7 +70,7 @@ namespace ps2recomp
 
         CodeGenerator &cg = m_codeGenerator;
         std::vector<std::pair<uint32_t, std::string>> entries;
-        std::unordered_set<uint32_t> registeredAddresses;
+        std::map<uint32_t, std::string> registeredEntries;
 
         auto addEntry = [&](uint32_t address, const std::string &name)
         {
@@ -90,7 +90,7 @@ namespace ps2recomp
 
                 throw std::runtime_error(oss.str());
             }
-            if (!registeredAddresses.insert(address).second)
+            if (!registeredEntries.emplace(address, name).second)
             {
                 return;
             }
@@ -101,6 +101,7 @@ namespace ps2recomp
         std::vector<std::pair<uint32_t, std::string>> stubFunctions;
         std::vector<std::pair<uint32_t, std::string>> systemCallFunctions;
         std::vector<std::pair<uint32_t, std::string>> libraryFunctions;
+        std::unordered_set<uint32_t> resumeOwnerStarts;
 
         for (const auto &function : functions)
         {
@@ -128,6 +129,7 @@ namespace ps2recomp
             else
             {
                 normalFunctions.emplace_back(function.start, generatedName);
+                resumeOwnerStarts.insert(function.start);
             }
         }
 
@@ -150,17 +152,62 @@ namespace ps2recomp
             addEntry(address, name);
         }
 
+        size_t registeredResumeTargets = 0u;
         for (const auto &[ownerStart, targets] : cg.m_resumeEntryTargetsByOwner)
         {
             const std::string ownerName = cg.getFunctionName(ownerStart);
-            if (ownerName.empty())
+            if (!resumeOwnerStarts.contains(ownerStart) || ownerName.empty())
             {
-                continue;
+                std::ostringstream oss;
+                oss << "Resume-entry owner 0x" << std::hex << ownerStart
+                    << " is not a generated recompiled function";
+                if (cg.m_reporter)
+                {
+                    cg.m_reporter->errorAt(
+                        "function-table", ownerName, ownerStart, oss.str());
+                }
+                throw std::runtime_error(oss.str());
             }
 
             for (uint32_t target : targets)
             {
+                const auto existing = registeredEntries.find(target);
+                if (existing != registeredEntries.end() &&
+                    existing->second != ownerName)
+                {
+                    std::ostringstream oss;
+                    oss << "Resume entry 0x" << std::hex << target
+                        << " for owner " << ownerName
+                        << " collides with function-table owner "
+                        << existing->second;
+                    if (cg.m_reporter)
+                    {
+                        cg.m_reporter->errorAt(
+                            "function-table", ownerName, target, oss.str());
+                    }
+                    throw std::runtime_error(oss.str());
+                }
                 addEntry(target, ownerName);
+                ++registeredResumeTargets;
+            }
+        }
+        if (cg.m_reporter)
+        {
+            cg.m_reporter->recordResumeEntryTargetsRegistered(
+                registeredResumeTargets);
+            const RecompilerReporter::Counters counters =
+                cg.m_reporter->counters();
+            if (counters.resumeEntryTargetsAudited !=
+                counters.resumeEntryTargetsRegistered)
+            {
+                std::ostringstream oss;
+                oss << "Internal resume-entry audit mismatch: "
+                    << counters.resumeEntryTargetsAudited
+                    << " target(s) audited but "
+                    << counters.resumeEntryTargetsRegistered
+                    << " registered";
+                cg.m_reporter->error("resume-entry", oss.str());
+                throw std::runtime_error(oss.str());
             }
         }
 

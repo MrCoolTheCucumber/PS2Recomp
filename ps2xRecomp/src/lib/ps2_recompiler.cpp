@@ -2007,14 +2007,6 @@ namespace ps2recomp
             CodeGenerator::AnalysisResult analysisResult =
                 m_codeGenerator->collectInternalBranchTargets(function, instructions, &m_functions);
 
-            auto &ownerTargets = m_resumeEntryTargetsByOwner[function.start];
-            ownerTargets.insert(ownerTargets.end(),
-                                analysisResult.resumeEntryPoints.begin(),
-                                analysisResult.resumeEntryPoints.end());
-            ownerTargets.insert(ownerTargets.end(),
-                                analysisResult.indirectFallbackEntryPoints.begin(),
-                                analysisResult.indirectFallbackEntryPoints.end());
-
             auto mapTargetToOwner =
                 [&](uint32_t target)
             {
@@ -2024,15 +2016,22 @@ namespace ps2recomp
                     return;
                 }
 
-                if (owner->start == target)
-                {
-                    return;
-                }
-
                 auto &targets = m_resumeEntryTargetsByOwner[owner->start];
                 targets.push_back(target);
             };
 
+            for (uint32_t target :
+                 analysisResult
+                     .resumeEntryPoints)
+            {
+                mapTargetToOwner(target);
+            }
+            for (uint32_t target :
+                 analysisResult
+                     .indirectFallbackEntryPoints)
+            {
+                mapTargetToOwner(target);
+            }
             for (uint32_t target :
                  analysisResult
                      .externalEntryPoints)

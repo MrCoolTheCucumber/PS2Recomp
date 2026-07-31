@@ -66,9 +66,35 @@ namespace ps2recomp
         }
         std::sort(resumeTargets.begin(), resumeTargets.end());
         resumeTargets.erase(std::unique(resumeTargets.begin(), resumeTargets.end()), resumeTargets.end());
+
+        std::unordered_set<uint32_t> instructionAddresses;
+        instructionAddresses.reserve(instructions.size());
+        for (const Instruction &instruction : instructions)
+        {
+            instructionAddresses.insert(instruction.address);
+        }
+
         for (uint32_t target : resumeTargets)
         {
+            if (!instructionAddresses.contains(target))
+            {
+                std::ostringstream msg;
+                msg << "Resume entry 0x" << std::hex << target
+                    << " has no decoded instruction in owner "
+                    << function.name << " at 0x" << function.start;
+                if (cg.m_reporter)
+                {
+                    cg.m_reporter->errorAt(
+                        "resume-entry", function.name, target, msg.str());
+                }
+                throw std::runtime_error(msg.str());
+            }
             analysisResult.entryPoints.insert(target);
+        }
+        if (cg.m_reporter && resumeIt != cg.m_resumeEntryTargetsByOwner.end())
+        {
+            cg.m_reporter->recordResumeEntryTargetsAudited(
+                resumeIt->second.size());
         }
 
         std::vector<Instruction> scheduledInstructions = instructions;

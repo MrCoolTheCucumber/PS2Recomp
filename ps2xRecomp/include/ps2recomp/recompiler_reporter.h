@@ -46,6 +46,8 @@ namespace ps2recomp
             size_t unhandledInstructions = 0;
             size_t indirectFallbackPromotions = 0;
             size_t indirectFallbackEntries = 0;
+            size_t resumeEntryTargetsAudited = 0;
+            size_t resumeEntryTargetsRegistered = 0;
         };
 
         void progress(const std::string &message);
@@ -63,6 +65,8 @@ namespace ps2recomp
         void recordDecodeFailure();
         void recordAdditionalEntryPoints(size_t count);
         void recordGeneratedFunctions(size_t count);
+        void recordResumeEntryTargetsAudited(size_t count);
+        void recordResumeEntryTargetsRegistered(size_t count);
         void recordIndirectFallbackPromotion(const std::string &functionName,
                                              const std::vector<uint32_t> &jumpAddresses,
                                              size_t promotedEntryCount);
@@ -71,7 +75,7 @@ namespace ps2recomp
                                         uint32_t raw,
                                         const std::string &message);
 
-        const Counters &counters() const;
+        Counters counters() const;
         bool hasErrors() const;
         bool hasWarnings() const;
         void printSummary(std::ostream &os) const;
