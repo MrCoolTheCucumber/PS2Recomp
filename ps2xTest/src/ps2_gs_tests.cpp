@@ -1719,14 +1719,13 @@ void register_ps2_gs_tests()
                      "single-circuit presentation should normalize the last row alpha");
         });
 
-        tc.Run("latched host presentation line-doubles interlaced field output", [](TestCase &t)
+        tc.Run("latched host presentation preserves both interlaced field scanlines", [](TestCase &t)
         {
             std::vector<uint8_t> vram(PS2_GS_VRAM_SIZE, 0u);
             GSRegisters regs{};
             regs.pmode = 0x0001ull;
             regs.smode2 = 0x0001ull; // interlaced, field mode
             regs.dispfb1 =
-                0ull |
                 (10ull << 9) |
                 (static_cast<uint64_t>(GS_PSM_CT32) << 15);
             regs.display1 =
@@ -1740,10 +1739,10 @@ void register_ps2_gs_tests()
             constexpr uint32_t kLine1 = 0x0000FF00u;
             constexpr uint32_t kLine2 = 0x00FF0000u;
             constexpr uint32_t kLine3 = 0x00FFFF00u;
-            writeReferencePSMCT32Pixel(vram, 0u, 10u, 0u, 0u, kLine0);
-            writeReferencePSMCT32Pixel(vram, 0u, 10u, 0u, 1u, kLine1);
-            writeReferencePSMCT32Pixel(vram, 0u, 10u, 0u, 2u, kLine2);
-            writeReferencePSMCT32Pixel(vram, 0u, 10u, 0u, 3u, kLine3);
+            writeReferenceFramePSMCT32Pixel(vram, 0u, 10u, 0u, 0u, kLine0);
+            writeReferenceFramePSMCT32Pixel(vram, 0u, 10u, 0u, 1u, kLine1);
+            writeReferenceFramePSMCT32Pixel(vram, 0u, 10u, 0u, 2u, kLine2);
+            writeReferenceFramePSMCT32Pixel(vram, 0u, 10u, 0u, 3u, kLine3);
 
             gs.latchHostPresentationFrame();
 
@@ -1759,23 +1758,151 @@ void register_ps2_gs_tests()
 
             auto pixelAtRow = [&](uint32_t row) -> uint32_t
             {
-                const size_t off = static_cast<size_t>(row) * 640u * 4u;
+                const size_t off = static_cast<size_t>(row) * latchedWidth * 4u;
                 return static_cast<uint32_t>(latchedFrame[off + 0u]) |
                        (static_cast<uint32_t>(latchedFrame[off + 1u]) << 8) |
                        (static_cast<uint32_t>(latchedFrame[off + 2u]) << 16);
             };
 
-            const uint32_t row0 = pixelAtRow(0u);
-            const uint32_t row1 = pixelAtRow(1u);
-            const uint32_t row2 = pixelAtRow(2u);
-            const uint32_t row3 = pixelAtRow(3u);
+            t.Equals(pixelAtRow(0u), kLine0,
+                     "field presentation should retain the first even scanline");
+            t.Equals(pixelAtRow(1u), kLine1,
+                     "field presentation should retain the first odd scanline");
+            t.Equals(pixelAtRow(2u), kLine2,
+                     "field presentation should retain the second even scanline");
+            t.Equals(pixelAtRow(3u), kLine3,
+                     "field presentation should retain the second odd scanline");
+        });
 
-            t.Equals(row0, row1,
-                     "field presentation should duplicate the active field into the next scanline");
-            t.Equals(row2, row3,
-                     "field presentation should duplicate later field scanlines as well");
-            t.IsTrue(row0 != row2,
-                     "field presentation should still preserve different source content across field rows");
+        tc.Run("latched host presentation applies DISPLAY vertical magnification", [](TestCase &t)
+        {
+            std::vector<uint8_t> vram(PS2_GS_VRAM_SIZE, 0u);
+            GSRegisters regs{};
+            regs.pmode = 0x0001ull;
+            regs.dispfb1 =
+                (10ull << 9) |
+                (static_cast<uint64_t>(GS_PSM_CT32) << 15);
+            regs.display1 =
+                (1ull << 27) |
+                (639ull << 32) |
+                (127ull << 44);
+
+            GS gs;
+            gs.init(vram.data(), static_cast<uint32_t>(vram.size()), &regs);
+
+            constexpr uint32_t kLastVisiblePixel = 0x00665544u;
+            writeReferenceFramePSMCT32Pixel(
+                vram, 0u, 10u, 0u, 63u, kLastVisiblePixel);
+
+            gs.latchHostPresentationFrame();
+
+            std::vector<uint8_t> latchedFrame;
+            uint32_t latchedWidth = 0u;
+            uint32_t latchedHeight = 0u;
+            t.IsTrue(gs.copyLatchedHostPresentationFrame(
+                         latchedFrame, latchedWidth, latchedHeight),
+                     "vertically magnified presentation should produce a host frame");
+            t.Equals(latchedWidth, 640u,
+                     "vertical magnification should not change source width");
+            t.Equals(latchedHeight, 64u,
+                     "MAGV=1 should reduce 128 display lines to 64 source rows");
+            t.Equals(latchedFrame.size(), static_cast<size_t>(640u * 64u * 4u),
+                     "vertically magnified presentation should stay tightly packed");
+
+            uint32_t lastPixel = 0u;
+            std::memcpy(
+                &lastPixel,
+                latchedFrame.data() +
+                    (static_cast<size_t>(latchedHeight - 1u) * latchedWidth * 4u),
+                sizeof(lastPixel));
+            t.Equals(lastPixel, kLastVisiblePixel | 0xFF000000u,
+                     "vertical magnification should retain the last source row");
+        });
+
+        tc.Run("latched host presentation supports display widths above 640 pixels", [](TestCase &t)
+        {
+            std::vector<uint8_t> vram(PS2_GS_VRAM_SIZE, 0u);
+            GSRegisters regs{};
+            regs.pmode = 0x0001ull;
+            regs.dispfb1 =
+                (13ull << 9) |
+                (static_cast<uint64_t>(GS_PSM_CT32) << 15);
+            regs.display1 =
+                (799ull << 32) |
+                (63ull << 44);
+
+            GS gs;
+            gs.init(vram.data(), static_cast<uint32_t>(vram.size()), &regs);
+
+            constexpr uint32_t kRightmostPixel = 0x00332211u;
+            writeReferenceFramePSMCT32Pixel(
+                vram, 0u, 13u, 799u, 0u, kRightmostPixel);
+
+            gs.latchHostPresentationFrame();
+
+            std::vector<uint8_t> latchedFrame;
+            uint32_t latchedWidth = 0u;
+            uint32_t latchedHeight = 0u;
+            t.IsTrue(gs.copyLatchedHostPresentationFrame(
+                         latchedFrame, latchedWidth, latchedHeight),
+                     "wide presentation should produce a host frame");
+            t.Equals(latchedWidth, 800u,
+                     "DISPLAY should preserve source widths above the NTSC maximum");
+            t.Equals(latchedHeight, 64u,
+                     "wide presentation should preserve display height");
+            t.Equals(latchedFrame.size(), static_cast<size_t>(800u * 64u * 4u),
+                     "wide presentation should stay tightly packed");
+
+            uint32_t rightmostPixel = 0u;
+            std::memcpy(
+                &rightmostPixel,
+                latchedFrame.data() + (799u * 4u),
+                sizeof(rightmostPixel));
+            t.Equals(rightmostPixel, kRightmostPixel | 0xFF000000u,
+                     "wide presentation should retain pixels beyond column 639");
+        });
+
+        tc.Run("latched host presentation halves interlaced frame-mode source height", [](TestCase &t)
+        {
+            std::vector<uint8_t> vram(PS2_GS_VRAM_SIZE, 0u);
+            GSRegisters regs{};
+            regs.pmode = 0x0001ull;
+            regs.smode2 = 0x0003ull; // interlaced, frame mode
+            regs.dispfb1 =
+                (10ull << 9) |
+                (static_cast<uint64_t>(GS_PSM_CT32) << 15);
+            regs.display1 =
+                (639ull << 32) |
+                (447ull << 44);
+
+            GS gs;
+            gs.init(vram.data(), static_cast<uint32_t>(vram.size()), &regs);
+
+            constexpr uint32_t kLastFieldPixel = 0x00654321u;
+            writeReferenceFramePSMCT32Pixel(
+                vram, 0u, 10u, 0u, 223u, kLastFieldPixel);
+
+            gs.latchHostPresentationFrame();
+
+            std::vector<uint8_t> latchedFrame;
+            uint32_t latchedWidth = 0u;
+            uint32_t latchedHeight = 0u;
+            t.IsTrue(gs.copyLatchedHostPresentationFrame(
+                         latchedFrame, latchedWidth, latchedHeight),
+                     "interlaced frame mode should produce a host field");
+            t.Equals(latchedWidth, 640u,
+                     "interlaced frame mode should preserve source width");
+            t.Equals(latchedHeight, 224u,
+                     "interlaced frame mode should read half the display height");
+
+            uint32_t lastPixel = 0u;
+            std::memcpy(
+                &lastPixel,
+                latchedFrame.data() +
+                    (static_cast<size_t>(latchedHeight - 1u) * latchedWidth * 4u),
+                sizeof(lastPixel));
+            t.Equals(lastPixel, kLastFieldPixel | 0xFF000000u,
+                     "interlaced frame mode should retain the last field row");
         });
 
         tc.Run("GIF PACKED A+D ignores reserved register addresses", [](TestCase &t)

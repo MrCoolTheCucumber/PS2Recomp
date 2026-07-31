@@ -21,8 +21,8 @@ namespace
 {
     static constexpr uint32_t kDefaultDisplayWidth = 640u;
     static constexpr uint32_t kDefaultDisplayHeight = 448u;
-    static constexpr uint32_t kHostFrameWidth = 640u;
-    static constexpr uint32_t kHostFrameHeight = 512u;
+    static constexpr uint32_t kMaxPresentationWidth = 2048u;
+    static constexpr uint32_t kMaxPresentationHeight = 2048u;
 
     uint16_t encodeFramePixelPSMCT16(uint8_t r, uint8_t g, uint8_t b, uint8_t a)
     {
@@ -303,14 +303,13 @@ namespace
 
     void decodeDisplaySize(uint64_t display64, uint32_t &outWidth, uint32_t &outHeight)
     {
-        const uint32_t dx = static_cast<uint32_t>((display64 >> 0) & 0x0FFFu);
-        const uint32_t dy = static_cast<uint32_t>((display64 >> 12) & 0x07FFu);
         const uint32_t dw = static_cast<uint32_t>((display64 >> 32) & 0x0FFFu);
         const uint32_t dh = static_cast<uint32_t>((display64 >> 44) & 0x07FFu);
         const uint32_t magh = static_cast<uint32_t>((display64 >> 23) & 0x0Fu);
+        const uint32_t magv = static_cast<uint32_t>((display64 >> 27) & 0x03u);
 
         outWidth = (dw + 1u) / (magh + 1u);
-        outHeight = dh + 1u;
+        outHeight = (dh + 1u) / (magv + 1u);
 
         if (outWidth < 64u || outHeight < 64u)
         {
@@ -318,8 +317,10 @@ namespace
             outHeight = kDefaultDisplayHeight;
         }
 
-        outWidth = std::min<uint32_t>(outWidth, kHostFrameWidth);
-        outHeight = std::min<uint32_t>(outHeight, kHostFrameHeight);
+        outWidth = std::min<uint32_t>(
+            outWidth, kMaxPresentationWidth);
+        outHeight = std::min<uint32_t>(
+            outHeight, kMaxPresentationHeight);
     }
 
     GSFrameReg decodeDisplayFrame(uint64_t dispfb64)
@@ -389,27 +390,6 @@ namespace
         return smode2;
     }
 
-    void applyFieldPresentation(std::vector<uint8_t> &pixels, uint32_t width, uint32_t height, bool oddField)
-    {
-        if (pixels.empty() || width == 0u || height < 2u)
-        {
-            return;
-        }
-
-        const std::vector<uint8_t> source = pixels;
-        for (uint32_t y = 0; y < height; ++y)
-        {
-            uint32_t sourceY = ((y >> 1u) << 1u) + (oddField ? 1u : 0u);
-            if (sourceY >= height)
-            {
-                sourceY = height - 1u;
-            }
-
-            const uint8_t *srcRow = source.data() + (sourceY * kHostFrameWidth * 4u);
-            uint8_t *dstRow = pixels.data() + (y * kHostFrameWidth * 4u);
-            std::memcpy(dstRow, srcRow, width * 4u);
-        }
-    }
 
     void normalizePresentationAlpha(std::vector<uint8_t> &pixels, uint32_t width, uint32_t height)
     {
@@ -420,7 +400,7 @@ namespace
 
         for (uint32_t y = 0; y < height; ++y)
         {
-            uint8_t *row = pixels.data() + (y * kHostFrameWidth * 4u);
+            uint8_t *row = pixels.data() + (static_cast<size_t>(y) * width * 4u);
             for (uint32_t x = 0; x < width; ++x)
             {
                 row[x * 4u + 3u] = 255u;
@@ -439,7 +419,7 @@ namespace
         uint32_t count = 0u;
         for (uint32_t y = 0; y < height; ++y)
         {
-            const uint8_t *row = pixels.data() + (y * kHostFrameWidth * 4u);
+            const uint8_t *row = pixels.data() + (static_cast<size_t>(y) * width * 4u);
             for (uint32_t x = 0; x < width; ++x)
             {
                 const uint8_t r = row[x * 4u + 0u];
@@ -1086,12 +1066,19 @@ bool GS::copyFrameToHostRgbaUnlocked(const GSFrameReg &frame,
                                      uint32_t sourceOriginX,
                                      uint32_t sourceOriginY) const
 {
-    if (!m_vram || m_vramSize == 0u)
+    if (!m_vram ||
+        m_vramSize == 0u ||
+        width == 0u ||
+        height == 0u ||
+        width > kMaxPresentationWidth ||
+        height > kMaxPresentationHeight)
     {
+        outPixels.clear();
         return false;
     }
 
-    outPixels.resize(kHostFrameWidth * kHostFrameHeight * 4u);
+    outPixels.resize(
+        static_cast<size_t>(width) * height * 4u);
     auto failCopy = [&outPixels]() -> bool
     {
         outPixels.clear();
@@ -1100,7 +1087,8 @@ bool GS::copyFrameToHostRgbaUnlocked(const GSFrameReg &frame,
 
     const uint32_t baseBytes = frameBaseIsPages ? (frame.fbp * 8192u) : (frame.fbp * 256u);
     const uint32_t basePtr = frameBaseIsPages ? GSInternal::framePageBaseToBlock(frame.fbp) : frame.fbp;
-    const uint32_t fbwBlocks = frame.fbw ? frame.fbw : (kHostFrameWidth / 64u);
+    const uint32_t fbwBlocks =
+        frame.fbw ? frame.fbw : std::max<uint32_t>(1u, (width + 63u) / 64u);
     const uint32_t bytesPerPixel = (frame.psm == GS_PSM_CT16 || frame.psm == GS_PSM_CT16S) ? 2u : 4u;
     const uint32_t strideBytes = fbwBlocks * 64u * bytesPerPixel;
 
@@ -1111,7 +1099,7 @@ bool GS::copyFrameToHostRgbaUnlocked(const GSFrameReg &frame,
         {
             for (uint32_t y = 0; y < height; ++y)
             {
-                uint8_t *dstRow = outPixels.data() + (y * kHostFrameWidth * 4u);
+                uint8_t *dstRow = outPixels.data() + (static_cast<size_t>(y) * width * 4u);
                 for (uint32_t x = 0; x < width; ++x)
                 {
                     const uint32_t srcX = sourceOriginX + x;
@@ -1140,7 +1128,7 @@ bool GS::copyFrameToHostRgbaUnlocked(const GSFrameReg &frame,
 
         for (uint32_t y = 0; y < height; ++y)
         {
-            const uint32_t dstOff = y * kHostFrameWidth * 4u;
+            const size_t dstOff = static_cast<size_t>(y) * width * 4u;
             uint8_t *dstRow = outPixels.data() + dstOff;
             for (uint32_t x = 0; x < width; ++x)
             {
@@ -1168,7 +1156,7 @@ bool GS::copyFrameToHostRgbaUnlocked(const GSFrameReg &frame,
         {
             for (uint32_t y = 0; y < height; ++y)
             {
-                const uint32_t dstOff = y * kHostFrameWidth * 4u;
+                const size_t dstOff = static_cast<size_t>(y) * width * 4u;
                 uint8_t *dst = outPixels.data() + dstOff;
                 for (uint32_t x = 0; x < width; ++x)
                 {
@@ -1191,7 +1179,7 @@ bool GS::copyFrameToHostRgbaUnlocked(const GSFrameReg &frame,
 
         for (uint32_t y = 0; y < height; ++y)
         {
-            const uint32_t dstOff = y * kHostFrameWidth * 4u;
+            const size_t dstOff = static_cast<size_t>(y) * width * 4u;
             uint8_t *dst = outPixels.data() + dstOff;
             for (uint32_t x = 0; x < width; ++x)
             {
@@ -1242,9 +1230,6 @@ void GS::latchHostPresentationFrameUnlocked()
 
     const GSPmodeState pmode = decodePmode(m_privRegs->pmode);
     const GSSmode2State smode2 = decodeSMode2(m_privRegs->smode2);
-    const bool applyFieldMode = smode2.interlaced && !smode2.frameMode;
-    const bool oddField =
-        (currentVSyncTickUnlocked() & 1ull) != 0ull;
     const GSFrameReg displayFrame1 = decodeDisplayFrame(m_privRegs->dispfb1);
     const GSFrameReg displayFrame2 = decodeDisplayFrame(m_privRegs->dispfb2);
     const GSDisplayReadOrigin displayOrigin1 = decodeDisplayReadOrigin(m_privRegs->dispfb1);
@@ -1256,6 +1241,11 @@ void GS::latchHostPresentationFrameUnlocked()
     uint32_t height2 = 0u;
     decodeDisplaySize(m_privRegs->display1, width1, height1);
     decodeDisplaySize(m_privRegs->display2, width2, height2);
+    if (smode2.interlaced && smode2.frameMode)
+    {
+        height1 = (height1 + 1u) / 2u;
+        height2 = (height2 + 1u) / 2u;
+    }
 
     const bool validCrt1 = pmode.enableCrt1 && hasDisplaySetup(m_privRegs->display1, displayFrame1);
     const bool validCrt2 = pmode.enableCrt2 && hasDisplaySetup(m_privRegs->display2, displayFrame2);
@@ -1388,10 +1378,11 @@ void GS::latchHostPresentationFrameUnlocked()
             const uint8_t bgB = static_cast<uint8_t>((m_privRegs->bgcolor >> 16) & 0xFFu);
             const uint8_t bgA = pmode.alp;
 
-            std::vector<uint8_t> merged(kHostFrameWidth * kHostFrameHeight * 4u, 0u);
+            std::vector<uint8_t> merged(
+                static_cast<size_t>(width) * height * 4u, 0u);
             for (uint32_t y = 0; y < height; ++y)
             {
-                uint8_t *dstRow = merged.data() + (y * kHostFrameWidth * 4u);
+                uint8_t *dstRow = merged.data() + (static_cast<size_t>(y) * width * 4u);
                 for (uint32_t x = 0; x < width; ++x)
                 {
                     dstRow[x * 4u + 0u] = bgR;
@@ -1405,8 +1396,8 @@ void GS::latchHostPresentationFrameUnlocked()
             {
                 for (uint32_t y = 0; y < height2; ++y)
                 {
-                    const uint8_t *srcRow = rc2.data() + (y * kHostFrameWidth * 4u);
-                    uint8_t *dstRow = merged.data() + (y * kHostFrameWidth * 4u);
+                    const uint8_t *srcRow = rc2.data() + (static_cast<size_t>(y) * width2 * 4u);
+                    uint8_t *dstRow = merged.data() + (static_cast<size_t>(y) * width * 4u);
                     for (uint32_t x = 0; x < width2; ++x)
                     {
                         dstRow[x * 4u + 0u] = srcRow[x * 4u + 0u];
@@ -1419,8 +1410,8 @@ void GS::latchHostPresentationFrameUnlocked()
 
             for (uint32_t y = 0; y < height1; ++y)
             {
-                const uint8_t *srcRow = rc1.data() + (y * kHostFrameWidth * 4u);
-                uint8_t *dstRow = merged.data() + (y * kHostFrameWidth * 4u);
+                const uint8_t *srcRow = rc1.data() + (static_cast<size_t>(y) * width1 * 4u);
+                uint8_t *dstRow = merged.data() + (static_cast<size_t>(y) * width * 4u);
                 for (uint32_t x = 0; x < width1; ++x)
                 {
                     const uint8_t srcR = srcRow[x * 4u + 0u];
@@ -1444,17 +1435,13 @@ void GS::latchHostPresentationFrameUnlocked()
 
             for (uint32_t y = 0; y < height; ++y)
             {
-                uint8_t *row = merged.data() + (y * kHostFrameWidth * 4u);
+                uint8_t *row = merged.data() + (static_cast<size_t>(y) * width * 4u);
                 for (uint32_t x = 0; x < width; ++x)
                 {
                     row[x * 4u + 3u] = 255u;
                 }
             }
 
-            if (applyFieldMode)
-            {
-                applyFieldPresentation(merged, width, height, oddField);
-            }
 
             m_hostPresentationFrame.swap(merged);
             m_hostPresentationWidth = width;
@@ -1493,10 +1480,6 @@ void GS::latchHostPresentationFrameUnlocked()
         return;
     }
 
-    if (applyFieldMode)
-    {
-        applyFieldPresentation(scratch, width, height, oddField);
-    }
 
     normalizePresentationAlpha(scratch, width, height);
 
@@ -1546,35 +1529,7 @@ bool GS::copyLatchedHostPresentationFrame(std::vector<uint8_t> &outPixels,
     if (outUsedPreferred)
         *outUsedPreferred = m_hostPresentationUsedPreferred;
 
-    const size_t packedRowBytes = static_cast<size_t>(outWidth) * 4u;
-    outPixels.resize(packedRowBytes * static_cast<size_t>(outHeight));
-    if (outWidth != 0u && outHeight != 0u)
-    {
-        const size_t sourceRowBytes = static_cast<size_t>(kHostFrameWidth) * 4u;
-        for (uint32_t y = 0; y < outHeight; ++y)
-        {
-            const size_t srcOffset = static_cast<size_t>(y) * sourceRowBytes;
-            const size_t dstOffset = static_cast<size_t>(y) * packedRowBytes;
-            if (srcOffset + packedRowBytes > m_hostPresentationFrame.size() ||
-                dstOffset + packedRowBytes > outPixels.size())
-            {
-                outPixels.clear();
-                outWidth = 0u;
-                outHeight = 0u;
-                if (outDisplayFbp)
-                    *outDisplayFbp = 0u;
-                if (outSourceFbp)
-                    *outSourceFbp = 0u;
-                if (outUsedPreferred)
-                    *outUsedPreferred = false;
-                return false;
-            }
-
-            std::memcpy(outPixels.data() + dstOffset,
-                        m_hostPresentationFrame.data() + srcOffset,
-                        packedRowBytes);
-        }
-    }
+    outPixels = m_hostPresentationFrame;
     return true;
 }
 
