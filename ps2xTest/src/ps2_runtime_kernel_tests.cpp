@@ -3,6 +3,7 @@
 #include "ps2_runtime_macros.h"
 #include "ps2_syscalls.h"
 #include "ps2_stubs.h"
+#include "runtime/boost_ee_fiber.h"
 #include "Stubs/MPEG.h"
 
 #include <chrono>
@@ -173,6 +174,25 @@ namespace
     constexpr uint32_t
         K_EXECUTOR_BOUNDARY_SNAPSHOT_ENTRY =
             0x25bb00u;
+    constexpr uint32_t
+        K_EXECUTOR_GUEST_STACK_ENTRY =
+            0x25bc00u;
+    constexpr uint32_t
+        K_EXECUTOR_GUEST_STACK_INITIAL_SP =
+            0x00300000u;
+    constexpr uint32_t
+        K_EXECUTOR_GUEST_STACK_FRAME_BYTES =
+            0x40u;
+    constexpr uint32_t
+        K_EXECUTOR_GUEST_STACK_FRAME_SP =
+            K_EXECUTOR_GUEST_STACK_INITIAL_SP -
+            K_EXECUTOR_GUEST_STACK_FRAME_BYTES;
+    constexpr uint32_t
+        K_EXECUTOR_GUEST_STACK_HEAD =
+            0x13579bdfu;
+    constexpr uint32_t
+        K_EXECUTOR_GUEST_STACK_TAIL =
+            0xfdb97531u;
     constexpr uint32_t K_EXECUTOR_MPEG_ADDR =
         0x00123000u;
     constexpr uint32_t K_EXECUTOR_MPEG_IMAGE_ADDR =
@@ -375,6 +395,21 @@ namespace
         g_executorBoundarySnapshotRelease{false};
     std::atomic<bool>
         g_executorBoundarySnapshotCompleted{false};
+    std::atomic<bool>
+        g_executorGuestStackReady{false};
+    std::atomic<bool>
+        g_executorGuestStackRelease{false};
+    std::atomic<bool>
+        g_executorGuestStackBoundaryRan{false};
+    std::atomic<bool>
+        g_executorGuestStackBoundaryHadNoFiber{
+            false};
+    std::atomic<bool>
+        g_executorGuestStackResumed{false};
+    std::atomic<uint32_t>
+        g_executorGuestStackObservedInitialSp{0u};
+    std::atomic<uint32_t>
+        g_executorGuestStackChecks{0u};
     std::atomic<uint32_t> g_executorCheckpointEntries{
         0u};
     std::atomic<bool> g_executorCheckpointProbeAllowed{
@@ -2795,6 +2830,165 @@ namespace
             K_EXECUTOR_BOUNDARY_SNAPSHOT_ENTRY;
         (void)runtime->checkpointGuestExecution(ctx);
         g_executorBoundarySnapshotCompleted.store(
+            true, std::memory_order_release);
+        ctx->pc = 0u;
+    }
+
+    enum ExecutorGuestStackCheck : uint32_t
+    {
+        ExecutorGuestStackNativeBefore =
+            1u << 0u,
+        ExecutorGuestStackRdramOutsideBefore =
+            1u << 1u,
+        ExecutorGuestStackContextOutsideBefore =
+            1u << 2u,
+        ExecutorGuestStackNativeAfter =
+            1u << 3u,
+        ExecutorGuestStackRdramOutsideAfter =
+            1u << 4u,
+        ExecutorGuestStackNativePreserved =
+            1u << 5u,
+        ExecutorGuestStackSpPreserved =
+            1u << 6u,
+        ExecutorGuestStackRdramPreserved =
+            1u << 7u,
+        ExecutorGuestStackCrossedBoundary =
+            1u << 8u,
+    };
+
+    constexpr uint32_t
+        K_EXECUTOR_GUEST_STACK_ALL_CHECKS =
+            ExecutorGuestStackNativeBefore |
+            ExecutorGuestStackRdramOutsideBefore |
+            ExecutorGuestStackContextOutsideBefore |
+            ExecutorGuestStackNativeAfter |
+            ExecutorGuestStackRdramOutsideAfter |
+            ExecutorGuestStackNativePreserved |
+            ExecutorGuestStackSpPreserved |
+            ExecutorGuestStackRdramPreserved |
+            ExecutorGuestStackCrossedBoundary;
+
+    void dedicatedExecutorGuestStackHandler(
+        uint8_t *rdram,
+        R5900Context *ctx,
+        PS2Runtime *runtime)
+    {
+        std::array<uint64_t, 64u> nativeFrame{};
+        nativeFrame.front() =
+            0x0123456789abcdefull;
+        nativeFrame.back() =
+            0xfedcba9876543210ull;
+
+        uint32_t checks = 0u;
+        const uint32_t initialSp =
+            ::getRegU32(ctx, 29);
+        g_executorGuestStackObservedInitialSp.store(
+            initialSp, std::memory_order_release);
+        setRegU32(
+            *ctx,
+            29,
+            K_EXECUTOR_GUEST_STACK_FRAME_SP);
+        writeGuestU32(
+            rdram,
+            K_EXECUTOR_GUEST_STACK_FRAME_SP,
+            K_EXECUTOR_GUEST_STACK_HEAD);
+        writeGuestU32(
+            rdram,
+            K_EXECUTOR_GUEST_STACK_FRAME_SP +
+                K_EXECUTOR_GUEST_STACK_FRAME_BYTES -
+                sizeof(uint32_t),
+            K_EXECUTOR_GUEST_STACK_TAIL);
+
+        if (BoostEeFiber::
+                currentStackContainsAddressForTesting(
+                    nativeFrame.data()))
+        {
+            checks |=
+                ExecutorGuestStackNativeBefore;
+        }
+        if (!BoostEeFiber::
+                currentStackContainsAddressForTesting(
+                    rdram +
+                    K_EXECUTOR_GUEST_STACK_FRAME_SP))
+        {
+            checks |=
+                ExecutorGuestStackRdramOutsideBefore;
+        }
+        if (!BoostEeFiber::
+                currentStackContainsAddressForTesting(
+                    ctx))
+        {
+            checks |=
+                ExecutorGuestStackContextOutsideBefore;
+        }
+
+        g_executorGuestStackReady.store(
+            true, std::memory_order_release);
+        while (!g_executorGuestStackRelease.load(
+            std::memory_order_acquire))
+        {
+            std::this_thread::yield();
+        }
+
+        ctx->pc =
+            K_EXECUTOR_GUEST_STACK_ENTRY;
+        runtime->yieldEeExecutorCurrent(
+            ps2x::ee::EeSchedulerExitReason::
+                Preempted);
+
+        if (BoostEeFiber::
+                currentStackContainsAddressForTesting(
+                    nativeFrame.data()))
+        {
+            checks |=
+                ExecutorGuestStackNativeAfter;
+        }
+        if (!BoostEeFiber::
+                currentStackContainsAddressForTesting(
+                    rdram +
+                    K_EXECUTOR_GUEST_STACK_FRAME_SP))
+        {
+            checks |=
+                ExecutorGuestStackRdramOutsideAfter;
+        }
+        if (nativeFrame.front() ==
+                0x0123456789abcdefull &&
+            nativeFrame.back() ==
+                0xfedcba9876543210ull)
+        {
+            checks |=
+                ExecutorGuestStackNativePreserved;
+        }
+        if (::getRegU32(ctx, 29) ==
+            K_EXECUTOR_GUEST_STACK_FRAME_SP)
+        {
+            checks |=
+                ExecutorGuestStackSpPreserved;
+        }
+        if (readGuestU32(
+                rdram,
+                K_EXECUTOR_GUEST_STACK_FRAME_SP) ==
+                K_EXECUTOR_GUEST_STACK_HEAD &&
+            readGuestU32(
+                rdram,
+                K_EXECUTOR_GUEST_STACK_FRAME_SP +
+                    K_EXECUTOR_GUEST_STACK_FRAME_BYTES -
+                    sizeof(uint32_t)) ==
+                K_EXECUTOR_GUEST_STACK_TAIL)
+        {
+            checks |=
+                ExecutorGuestStackRdramPreserved;
+        }
+        if (g_executorGuestStackBoundaryRan.load(
+                std::memory_order_acquire))
+        {
+            checks |=
+                ExecutorGuestStackCrossedBoundary;
+        }
+
+        g_executorGuestStackChecks.store(
+            checks, std::memory_order_release);
+        g_executorGuestStackResumed.store(
             true, std::memory_order_release);
         ctx->pc = 0u;
     }
@@ -5778,6 +5972,170 @@ void register_ps2_runtime_kernel_tests()
                             "priority and ownership "
                             "authoritative");
                 }
+            });
+
+        tc.Run(
+            "fiber keeps guest stack in RDRAM and native frames in its protected mapping",
+            [](TestCase &t)
+            {
+                if (!eeExecutionBackendBuildInfo()
+                         .boostContextFcontextAvailable)
+                {
+                    return;
+                }
+
+                PS2RuntimeConfiguration configuration{};
+                configuration.eeExecutionBackend =
+                    EeExecutionBackendKind::
+                        LegacyCppFiber;
+                configuration
+                    .useEeExecutionBackendEnvironment =
+                    false;
+                PS2Runtime runtime(configuration);
+                const bool memoryInitialized =
+                    runtime.memory().initialize();
+                if (!memoryInitialized)
+                {
+                    t.IsTrue(
+                        false,
+                        "fiber guest-stack fixture memory should initialize");
+                    return;
+                }
+
+                uint8_t *const rdram =
+                    runtime.memory().getRDRAM();
+                runtime.registerFunction(
+                    K_EXECUTOR_GUEST_STACK_ENTRY,
+                    &dedicatedExecutorGuestStackHandler);
+                runtime.cpu().pc =
+                    K_EXECUTOR_GUEST_STACK_ENTRY;
+                setRegU32(
+                    runtime.cpu(),
+                    29,
+                    K_EXECUTOR_GUEST_STACK_INITIAL_SP);
+                writeGuestU32(
+                    rdram,
+                    K_EXECUTOR_GUEST_STACK_FRAME_SP,
+                    0u);
+                writeGuestU32(
+                    rdram,
+                    K_EXECUTOR_GUEST_STACK_FRAME_SP +
+                        K_EXECUTOR_GUEST_STACK_FRAME_BYTES -
+                        sizeof(uint32_t),
+                    0u);
+                g_executorGuestStackReady.store(
+                    false, std::memory_order_release);
+                g_executorGuestStackRelease.store(
+                    false, std::memory_order_release);
+                g_executorGuestStackBoundaryRan.store(
+                    false, std::memory_order_release);
+                g_executorGuestStackBoundaryHadNoFiber.store(
+                    false, std::memory_order_release);
+                g_executorGuestStackResumed.store(
+                    false, std::memory_order_release);
+                g_executorGuestStackObservedInitialSp.store(
+                    0u, std::memory_order_release);
+                g_executorGuestStackChecks.store(
+                    0u, std::memory_order_release);
+
+                runtime
+                    .startDedicatedEeExecutionForTesting();
+                const bool guestReady = waitUntil(
+                    []()
+                    {
+                        return g_executorGuestStackReady
+                            .load(
+                                std::memory_order_acquire);
+                    },
+                    std::chrono::seconds(2));
+
+                bool boundaryQueued = false;
+                if (guestReady)
+                {
+                    boundaryQueued =
+                        runtime.publishEeSchedulerUpdate(
+                            [](
+                                ps2x::ee::
+                                    EeThreadScheduler &)
+                            {
+                                unsigned char
+                                    executorFrame = 0u;
+                                g_executorGuestStackBoundaryHadNoFiber
+                                    .store(
+                                        !BoostEeFiber::
+                                            currentStackContainsAddressForTesting(
+                                                &executorFrame),
+                                        std::memory_order_release);
+                                g_executorGuestStackBoundaryRan
+                                    .store(
+                                        true,
+                                        std::memory_order_release);
+                            },
+                            ps2x::ee::
+                                EeSchedulerReschedulePolicy::
+                                    None);
+                }
+                g_executorGuestStackRelease.store(
+                    true, std::memory_order_release);
+
+                const bool completed =
+                    guestReady &&
+                    waitUntil(
+                        [&runtime]()
+                        {
+                            return g_executorGuestStackResumed
+                                       .load(
+                                           std::memory_order_acquire) &&
+                                   runtime
+                                           .managedEeExecutionThreadCountForTesting() ==
+                                       0u;
+                        },
+                        std::chrono::seconds(2));
+                runtime
+                    .stopDedicatedEeExecutionForTesting();
+
+                t.IsTrue(
+                    guestReady && boundaryQueued &&
+                        completed,
+                    "the guest should suspend at a real executor boundary and finish after resumption");
+                t.IsTrue(
+                    g_executorGuestStackBoundaryRan.load(
+                        std::memory_order_acquire) &&
+                        g_executorGuestStackBoundaryHadNoFiber
+                            .load(
+                                std::memory_order_acquire),
+                    "the queued boundary task should run on the executor stack with no active guest fiber");
+                t.Equals(
+                    g_executorGuestStackObservedInitialSp
+                        .load(
+                            std::memory_order_acquire),
+                    K_EXECUTOR_GUEST_STACK_INITIAL_SP,
+                    "the guest should enter with a 32-bit RDRAM stack address");
+                t.Equals(
+                    g_executorGuestStackChecks.load(
+                        std::memory_order_acquire),
+                    K_EXECUTOR_GUEST_STACK_ALL_CHECKS,
+                    "native-frame, guest-RDRAM, and cross-boundary ownership checks should all hold");
+                t.Equals(
+                    ::getRegU32(
+                        &runtime.cpu(),
+                        29),
+                    K_EXECUTOR_GUEST_STACK_FRAME_SP,
+                    "the canonical guest context should retain its RDRAM stack pointer");
+                t.Equals(
+                    readGuestU32(
+                        rdram,
+                        K_EXECUTOR_GUEST_STACK_FRAME_SP),
+                    K_EXECUTOR_GUEST_STACK_HEAD,
+                    "the guest stack head should reside in runtime RDRAM");
+                t.Equals(
+                    readGuestU32(
+                        rdram,
+                        K_EXECUTOR_GUEST_STACK_FRAME_SP +
+                            K_EXECUTOR_GUEST_STACK_FRAME_BYTES -
+                            sizeof(uint32_t)),
+                    K_EXECUTOR_GUEST_STACK_TAIL,
+                    "the guest stack tail should reside in runtime RDRAM");
             });
 
         tc.Run(

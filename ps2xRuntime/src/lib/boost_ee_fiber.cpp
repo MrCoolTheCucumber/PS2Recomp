@@ -4,6 +4,7 @@
 #define PS2X_HAS_EE_CPP_FIBER_BACKEND 0
 #endif
 
+#include <cstdint>
 #include <stdexcept>
 #include <utility>
 
@@ -49,6 +50,27 @@ namespace
         unsigned char *mappingBase = nullptr;
         unsigned char *usableBase = nullptr;
         unsigned char *stackTop = nullptr;
+
+        [[nodiscard]] bool containsAddress(
+            const void *address) const noexcept
+        {
+            if (address == nullptr ||
+                usableBase == nullptr ||
+                stackTop == nullptr)
+            {
+                return false;
+            }
+
+            const std::uintptr_t probe =
+                reinterpret_cast<std::uintptr_t>(address);
+            const std::uintptr_t begin =
+                reinterpret_cast<std::uintptr_t>(
+                    usableBase);
+            const std::uintptr_t end =
+                reinterpret_cast<std::uintptr_t>(
+                    stackTop);
+            return probe >= begin && probe < end;
+        }
 
         void requireOwner(const char *operation) const
         {
@@ -436,6 +458,15 @@ public:
         current->m_state = State::Running;
     }
 
+    [[nodiscard]] static bool
+    currentStackContainsAddressForTesting(
+        const void *address) noexcept
+    {
+        return s_current != nullptr &&
+               s_current->m_stack->containsAddress(
+                   address);
+    }
+
     void destroy()
     {
         requireOwner("destroy");
@@ -546,6 +577,20 @@ BoostEeFiber::~BoostEeFiber() noexcept = default;
 bool BoostEeFiber::available() noexcept
 {
     return PS2X_HAS_EE_CPP_FIBER_BACKEND != 0;
+}
+
+bool BoostEeFiber::
+    currentStackContainsAddressForTesting(
+        const void *address) noexcept
+{
+#if PS2X_HAS_EE_CPP_FIBER_BACKEND
+    return Impl::
+        currentStackContainsAddressForTesting(
+            address);
+#else
+    static_cast<void>(address);
+    return false;
+#endif
 }
 
 void BoostEeFiber::resume()

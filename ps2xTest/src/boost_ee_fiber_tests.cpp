@@ -209,6 +209,91 @@ void register_boost_ee_fiber_tests()
             });
 
         tc.Run(
+            "native stack ownership distinguishes fiber frames from external storage",
+            [](TestCase &t)
+            {
+                unsigned char executorFrame = 0u;
+                t.IsFalse(
+                    BoostEeFiber::
+                        currentStackContainsAddressForTesting(
+                            &executorFrame),
+                    "the executor stack must not be reported as a running fiber stack");
+
+                if (!BoostEeFiber::available())
+                {
+                    return;
+                }
+
+                std::vector<unsigned char>
+                    externalStorage(256u, 0u);
+                bool nativeFrameInsideBeforeYield = false;
+                bool nativeFrameInsideAfterYield = false;
+                bool externalStorageOutsideBeforeYield =
+                    false;
+                bool externalStorageOutsideAfterYield =
+                    false;
+                bool nativeFramePreserved = false;
+
+                BoostEeFiber fiber([&]()
+                {
+                    unsigned char nativeFrame[256u]{};
+                    nativeFrame[0u] = 0x3cu;
+                    nativeFrame[255u] = 0xc3u;
+
+                    nativeFrameInsideBeforeYield =
+                        BoostEeFiber::
+                            currentStackContainsAddressForTesting(
+                                nativeFrame);
+                    externalStorageOutsideBeforeYield =
+                        !BoostEeFiber::
+                            currentStackContainsAddressForTesting(
+                                externalStorage.data());
+
+                    BoostEeFiber::yieldCurrent();
+
+                    nativeFrameInsideAfterYield =
+                        BoostEeFiber::
+                            currentStackContainsAddressForTesting(
+                                nativeFrame);
+                    externalStorageOutsideAfterYield =
+                        !BoostEeFiber::
+                            currentStackContainsAddressForTesting(
+                                externalStorage.data());
+                    nativeFramePreserved =
+                        nativeFrame[0u] == 0x3cu &&
+                        nativeFrame[255u] == 0xc3u;
+                });
+
+                fiber.resume();
+                t.Equals(
+                    fiber.state(),
+                    BoostEeFiber::State::Suspended,
+                    "the native frame should remain suspended on its protected stack");
+                t.IsFalse(
+                    BoostEeFiber::
+                        currentStackContainsAddressForTesting(
+                            externalStorage.data()),
+                    "the executor must report no current fiber while the continuation is suspended");
+
+                fiber.resume();
+                t.Equals(
+                    fiber.state(),
+                    BoostEeFiber::State::Finished,
+                    "the ownership probe continuation should finish");
+                t.IsTrue(
+                    nativeFrameInsideBeforeYield &&
+                        nativeFrameInsideAfterYield,
+                    "a materialized native frame should stay in the fiber mapping across a yield");
+                t.IsTrue(
+                    externalStorageOutsideBeforeYield &&
+                        externalStorageOutsideAfterYield,
+                    "external storage must stay outside the fiber mapping");
+                t.IsTrue(
+                    nativeFramePreserved,
+                    "the protected native frame should retain its contents across a yield");
+            });
+
+        tc.Run(
             "continuation moves survive repeated and nested yields",
             [](TestCase &t)
             {

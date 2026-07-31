@@ -71,6 +71,13 @@ public:
 
     [[nodiscard]] static bool available() noexcept;
 
+    // Test-only ownership probe. This deliberately exposes no mapping bounds:
+    // it answers only whether an address belongs to the currently running
+    // legacy C++ fiber's protected native stack.
+    [[nodiscard]] static bool
+    currentStackContainsAddressForTesting(
+        const void *address) noexcept;
+
     // Resume is legal only on the constructing executor thread and only from
     // the executor stack. It returns after one yield, normal completion, or
     // a caught guest exception.
