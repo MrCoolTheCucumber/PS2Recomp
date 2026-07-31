@@ -11,6 +11,7 @@
 #include <atomic>
 #include <cstdint>
 #include <cstring>
+#include <iostream>
 #include <memory>
 #include <mutex>
 #include <sstream>
@@ -11270,6 +11271,271 @@ void register_ps2_runtime_kernel_tests()
 
             notifyRuntimeStop();
         });
+
+        tc.Run(
+            "repeated EE start exit and reset cycles retire every continuation",
+            [](TestCase &t)
+            {
+                constexpr int kEpochCount = 16;
+                std::vector<EeExecutionBackendKind>
+                    backendKinds{
+                        EeExecutionBackendKind::
+                            LegacyHostThread,
+                    };
+                if (eeExecutionBackendBuildInfo()
+                        .boostContextFcontextAvailable)
+                {
+                    backendKinds.push_back(
+                        EeExecutionBackendKind::
+                            LegacyCppFiber);
+                }
+
+                for (const EeExecutionBackendKind
+                         backendKind : backendKinds)
+                {
+                    PS2RuntimeConfiguration configuration{};
+                    configuration.eeExecutionBackend =
+                        backendKind;
+                    configuration
+                        .useEeExecutionBackendEnvironment =
+                        false;
+                    PS2Runtime runtime(configuration);
+                    const std::string diagnostics =
+                        eeExecutionBackendDiagnostics(
+                            backendKind);
+                    std::clog
+                        << "[phase3-lifecycle] "
+                        << diagnostics
+                        << ", epochs=" << kEpochCount
+                        << std::endl;
+
+                    const bool memoryInitialized =
+                        runtime.memory().initialize();
+                    t.IsTrue(
+                        memoryInitialized,
+                        diagnostics +
+                            ": runtime memory should initialize");
+                    if (!memoryInitialized)
+                    {
+                        continue;
+                    }
+
+                    uint8_t *const rdram =
+                        runtime.memory().getRDRAM();
+                    runtime.registerFunction(
+                        K_BACKEND_CONTROL_MAIN_ENTRY,
+                        &backendControlWaitMainHandler);
+                    runtime.registerFunction(
+                        K_BACKEND_CONTROL_CHILD_ENTRY,
+                        &backendControlWaitChildHandler);
+
+                    const auto label =
+                        [&diagnostics](
+                            int epoch,
+                            const char *expectation)
+                    {
+                        std::ostringstream stream;
+                        stream << diagnostics
+                               << ", epoch " << epoch
+                               << ": " << expectation;
+                        return stream.str();
+                    };
+
+                    for (int epoch = 0;
+                         epoch < kEpochCount;
+                         ++epoch)
+                    {
+                        runtime.cpu() = R5900Context{};
+                        runtime.cpu().pc =
+                            K_BACKEND_CONTROL_MAIN_ENTRY;
+                        setRegU32(
+                            runtime.cpu(),
+                            29,
+                            0x00300000u);
+                        runtime.resetEeTiming(
+                            &runtime.cpu());
+                        initializeGuestKernelState(
+                            rdram, &runtime);
+
+                        const std::array<
+                            uint32_t,
+                            K_BACKEND_CONTROL_RESULT_WORDS>
+                            initialMemory{
+                                0xfeed2000u,
+                                0xfeed2001u,
+                                0xfeed2002u,
+                                0xfeed2003u,
+                                0xfeed2004u,
+                            };
+                        writeGuestWords(
+                            rdram,
+                            K_BACKEND_CONTROL_RESULT_ADDR,
+                            initialMemory.data(),
+                            initialMemory.size());
+                        writeGuestU32(
+                            rdram,
+                            K_BACKEND_CONTROL_STAGE_ADDR,
+                            0u);
+                        {
+                            std::lock_guard<std::mutex>
+                                lock(
+                                    g_executorFixtureMutex);
+                            g_backendControlWaitKind =
+                                BackendControlWaitKind::
+                                    Sleep;
+                            g_backendControlTransitions
+                                .clear();
+                            g_backendControlResourceId =
+                                KE_ERROR;
+                            g_backendControlChildThreadId =
+                                0;
+                            g_backendControlCreateResult =
+                                KE_ERROR;
+                            g_backendControlStartResult =
+                                KE_ERROR;
+                            g_backendControlSuspendResult =
+                                KE_ERROR;
+                            g_backendControlMainCompleted =
+                                false;
+                            g_backendControlMainContext
+                                .fill(0u);
+                            g_backendControlChildContext
+                                .fill(0u);
+                        }
+
+                        runtime.startEeExecutionForTesting();
+                        const bool reachedExitAndWait =
+                            waitUntil(
+                                [&]()
+                                {
+                                    int childThreadId = 0;
+                                    bool mainCompleted =
+                                        false;
+                                    {
+                                        std::lock_guard<
+                                            std::mutex>
+                                            lock(
+                                                g_executorFixtureMutex);
+                                        childThreadId =
+                                            g_backendControlChildThreadId;
+                                        mainCompleted =
+                                            g_backendControlMainCompleted;
+                                    }
+                                    if (!mainCompleted ||
+                                        childThreadId != 2 ||
+                                        readGuestU32(
+                                            rdram,
+                                            K_BACKEND_CONTROL_STAGE_ADDR) !=
+                                            1u)
+                                    {
+                                        return false;
+                                    }
+
+                                    bool mainDormant = false;
+                                    bool childSleeping = false;
+                                    for (const auto &snapshot :
+                                         debugThreadSnapshots(
+                                             &runtime))
+                                    {
+                                        if (snapshot.id ==
+                                            1)
+                                        {
+                                            mainDormant =
+                                                snapshot.status ==
+                                                THS_DORMANT;
+                                        }
+                                        else if (
+                                            snapshot.id ==
+                                            childThreadId)
+                                        {
+                                            childSleeping =
+                                                snapshot.status ==
+                                                    THS_WAIT &&
+                                                snapshot.waitType ==
+                                                    TSW_SLEEP &&
+                                                snapshot.waitQueue ==
+                                                    1 &&
+                                                snapshot.stateValid;
+                                        }
+                                    }
+                                    return mainDormant &&
+                                           childSleeping;
+                                },
+                                std::chrono::seconds(2));
+                        t.IsTrue(
+                            reachedExitAndWait,
+                            label(
+                                epoch,
+                                "the main continuation should exit normally while its child remains asleep"));
+
+                        int childThreadId = 0;
+                        int createResult = KE_ERROR;
+                        int startResult = KE_ERROR;
+                        {
+                            std::lock_guard<std::mutex>
+                                lock(
+                                    g_executorFixtureMutex);
+                            childThreadId =
+                                g_backendControlChildThreadId;
+                            createResult =
+                                g_backendControlCreateResult;
+                            startResult =
+                                g_backendControlStartResult;
+                        }
+                        t.IsTrue(
+                            childThreadId == 2 &&
+                                createResult == 2 &&
+                                startResult == 2,
+                            label(
+                                epoch,
+                                "the fresh epoch should reuse thread id 2 and complete StartThread"));
+                        t.IsFalse(
+                            runtime.isStopRequested(),
+                            label(
+                                epoch,
+                                "normal main exit should not publish runtime shutdown"));
+                        t.IsTrue(
+                            runtime
+                                    .managedEeExecutionThreadCountForTesting() >=
+                                1u,
+                            label(
+                                epoch,
+                                "the sleeping child should remain a managed continuation before reset"));
+
+                        notifyRuntimeStop(&runtime);
+                        t.IsFalse(
+                            runtime.isStopRequested(),
+                            label(
+                                epoch,
+                                "kernel reset should not become runtime shutdown"));
+                        t.Equals(
+                            runtime
+                                .managedEeExecutionThreadCountForTesting(),
+                            size_t{0u},
+                            label(
+                                epoch,
+                                "kernel reset should retire every native continuation"));
+                        t.Equals(
+                            debugThreadSnapshots(
+                                &runtime)
+                                .size(),
+                            size_t{0u},
+                            label(
+                                epoch,
+                                "kernel reset should clear every guest thread record"));
+                        t.Equals(
+                            readGuestU32(
+                                rdram,
+                                K_BACKEND_CONTROL_STAGE_ADDR),
+                            uint32_t{1u},
+                            label(
+                                epoch,
+                                "forced unwind should not resume the sleeping guest past its wait"));
+                    }
+                }
+
+                notifyRuntimeStop();
+            });
 
         tc.Run("debug thread snapshots expose authoritative valid state", [](TestCase &t)
         {
