@@ -21,6 +21,8 @@ option(PS2X_ENABLE_VU_X64_RECOMPILER
     "Build the production x86-64 VU dynamic recompiler when supported" ON)
 option(PS2X_ENABLE_GS_AVX2_KERNEL
     "Build the runtime-dispatched AVX2 GS packed-sprite kernel" ON)
+option(PS2X_ENABLE_GS_VULKAN
+    "Build the optional dynamically loaded desktop Vulkan GS backend" ON)
 option(PS2X_ENABLE_EE_CPP_FIBER_BACKEND
     "Build the legacy generated-C++ Boost.Context fiber backend when supported"
     ON)
@@ -73,6 +75,26 @@ set(PS2X_IS_ANDROID OFF)
 
 if(ANDROID)
     set(PS2X_IS_ANDROID ON)
+endif()
+
+set(PS2X_HAS_GS_VULKAN OFF)
+if(PS2X_ENABLE_GS_VULKAN AND
+   NOT PS2X_IS_VITA AND
+   NOT PS2X_IS_ANDROID)
+    find_path(PS2X_GS_VULKAN_INCLUDE_DIR
+        NAMES vulkan/vulkan.h)
+    mark_as_advanced(PS2X_GS_VULKAN_INCLUDE_DIR)
+    if(PS2X_GS_VULKAN_INCLUDE_DIR)
+        set(PS2X_HAS_GS_VULKAN ON)
+        message(STATUS
+            "GS Vulkan capability path enabled: ${PS2X_GS_VULKAN_INCLUDE_DIR}")
+    else()
+        message(STATUS
+            "Vulkan headers not found; GS Vulkan capability path disabled")
+    endif()
+elseif(PS2X_ENABLE_GS_VULKAN)
+    message(STATUS
+        "GS Vulkan capability path is currently desktop-only; using software GS")
 endif()
 
 set(PS2X_HAS_VU_X64_RECOMPILER OFF)
@@ -590,6 +612,7 @@ add_library(ps2_runtime STATIC
     src/lib/ps2_gs_memory.cpp
     src/lib/ps2_gs_rasterizer.cpp
     src/lib/ps2_gs_replay.cpp
+    src/lib/ps2_gs_vulkan.cpp
     src/lib/ps2_iop_host.cpp
     src/lib/ps2_memory.cpp
     src/lib/ps2_pad.cpp
@@ -679,6 +702,22 @@ if(PS2X_HAS_GS_AVX2_KERNEL)
 else()
     target_compile_definitions(ps2_runtime PRIVATE
         PS2X_GS_HAS_AVX2_KERNEL=0
+    )
+endif()
+
+if(PS2X_HAS_GS_VULKAN)
+    target_include_directories(ps2_runtime PRIVATE
+        "${PS2X_GS_VULKAN_INCLUDE_DIR}"
+    )
+    target_compile_definitions(ps2_runtime PUBLIC
+        PS2X_HAS_GS_VULKAN=1
+    )
+    if(CMAKE_DL_LIBS)
+        target_link_libraries(ps2_runtime PRIVATE ${CMAKE_DL_LIBS})
+    endif()
+else()
+    target_compile_definitions(ps2_runtime PUBLIC
+        PS2X_HAS_GS_VULKAN=0
     )
 endif()
 

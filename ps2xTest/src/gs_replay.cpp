@@ -1,4 +1,5 @@
 #include "runtime/ps2_gs_gpu.h"
+#include "runtime/ps2_gs_vulkan.h"
 #include "runtime/ps2_memory.h"
 
 #include <cerrno>
@@ -52,6 +53,9 @@ namespace
     void printUsage()
     {
         std::cerr
+            << "usage: gs_replay --vulkan-info [--vulkan-validation] "
+               "[--vulkan-loader FILE] [--vulkan-vendor ID] "
+               "[--vulkan-device ID]\n"
             << "usage: gs_replay [--vram-in FILE] [--vram-out FILE] "
                "[--register ADDRESS=VALUE] [--register-file FILE] "
                "[--state-in FILE] "
@@ -166,6 +170,135 @@ namespace
                    << counters.flushReasons[index];
         }
         output << "}}";
+    }
+
+    void writeJsonString(std::ostream &output, std::string_view value)
+    {
+        static constexpr char hex[] = "0123456789abcdef";
+        output << '"';
+        for (const unsigned char ch : value)
+        {
+            switch (ch)
+            {
+            case '"':
+                output << "\\\"";
+                break;
+            case '\\':
+                output << "\\\\";
+                break;
+            case '\b':
+                output << "\\b";
+                break;
+            case '\f':
+                output << "\\f";
+                break;
+            case '\n':
+                output << "\\n";
+                break;
+            case '\r':
+                output << "\\r";
+                break;
+            case '\t':
+                output << "\\t";
+                break;
+            default:
+                if (ch < 0x20u)
+                {
+                    output << "\\u00" << hex[ch >> 4u]
+                           << hex[ch & 0xFu];
+                }
+                else
+                {
+                    output << static_cast<char>(ch);
+                }
+                break;
+            }
+        }
+        output << '"';
+    }
+
+    void writeVulkanCapabilityReport(
+        std::ostream &output,
+        const GsVulkanCapabilityReport &report)
+    {
+        output << "{\"schema_version\":1,\"mode\":\"vulkan-info\","
+               << "\"status\":";
+        writeJsonString(output, gsVulkanProbeStatusName(report.status));
+        output << ",\"compiled\":"
+               << (report.compiled ? "true" : "false")
+               << ",\"loader_available\":"
+               << (report.loaderAvailable ? "true" : "false")
+               << ",\"loader_api_version\":"
+               << report.loaderApiVersion
+               << ",\"loader_api_version_text\":";
+        writeJsonString(
+            output, gsVulkanVersionString(report.loaderApiVersion));
+        output << ",\"validation_requested\":"
+               << (report.validationRequested ? "true" : "false")
+               << ",\"validation_layer_available\":"
+               << (report.validationLayerAvailable ? "true" : "false")
+               << ",\"debug_utils_available\":"
+               << (report.debugUtilsAvailable ? "true" : "false")
+               << ",\"validation_enabled\":"
+               << (report.validationEnabled ? "true" : "false")
+               << ",\"validation_warnings\":"
+               << report.validationWarnings
+               << ",\"validation_errors\":"
+               << report.validationErrors
+               << ",\"selected_device_index\":"
+               << report.selectedDeviceIndex
+               << ",\"devices\":[";
+
+        for (size_t index = 0u; index < report.devices.size(); ++index)
+        {
+            if (index != 0u)
+                output << ',';
+            const GsVulkanDeviceReport &device = report.devices[index];
+            output << "{\"name\":";
+            writeJsonString(output, device.name);
+            output << ",\"vendor_id\":" << device.vendorId
+                   << ",\"device_id\":" << device.deviceId
+                   << ",\"api_version\":" << device.apiVersion
+                   << ",\"api_version_text\":";
+            writeJsonString(
+                output, gsVulkanVersionString(device.apiVersion));
+            output << ",\"driver_version\":" << device.driverVersion
+                   << ",\"kind\":";
+            writeJsonString(output, gsVulkanDeviceKindName(device.kind));
+            output << ",\"max_storage_buffer_range\":"
+                   << device.maxStorageBufferRange
+                   << ",\"max_compute_work_group_count_x\":"
+                   << device.maxComputeWorkGroupCountX
+                   << ",\"max_compute_work_group_invocations\":"
+                   << device.maxComputeWorkGroupInvocations
+                   << ",\"max_compute_work_group_size_x\":"
+                   << device.maxComputeWorkGroupSizeX
+                   << ",\"queue_family_index\":"
+                   << device.queueFamilyIndex
+                   << ",\"compute_queue\":"
+                   << (device.computeQueue ? "true" : "false")
+                   << ",\"dedicated_compute_queue\":"
+                   << (device.dedicatedComputeQueue ? "true" : "false")
+                   << ",\"device_local_memory\":"
+                   << (device.deviceLocalMemory ? "true" : "false")
+                   << ",\"host_visible_memory\":"
+                   << (device.hostVisibleMemory ? "true" : "false")
+                   << ",\"shader_int16\":"
+                   << (device.shaderInt16 ? "true" : "false")
+                   << ",\"shader_int64\":"
+                   << (device.shaderInt64 ? "true" : "false")
+                   << ",\"exact_vram_storage\":"
+                   << (device.exactVramStorage ? "true" : "false")
+                   << ",\"suitable\":"
+                   << (device.suitable ? "true" : "false")
+                   << ",\"rejection_reason\":";
+            writeJsonString(output, device.rejectionReason);
+            output << '}';
+        }
+
+        output << "],\"detail\":";
+        writeJsonString(output, report.detail);
+        output << "}\n";
     }
 
     bool readPacketSizes(const std::string &path,
@@ -310,6 +443,10 @@ int main(int argc, char **argv)
     std::string registerStatePath;
     bool batchStream = false;
     bool backendStats = false;
+    bool replayOptionUsed = false;
+    bool vulkanInfo = false;
+    bool vulkanOptionUsed = false;
+    GsVulkanProbeConfig vulkanConfig{};
     bool commandLimitSet = false;
     bool packetLimitSet = false;
     uint64_t commandLimit = 0u;
@@ -324,10 +461,21 @@ int main(int argc, char **argv)
         if (argument == "--batch-stream")
         {
             batchStream = true;
+            replayOptionUsed = true;
         }
         else if (argument == "--backend-stats")
         {
             backendStats = true;
+            replayOptionUsed = true;
+        }
+        else if (argument == "--vulkan-info")
+        {
+            vulkanInfo = true;
+        }
+        else if (argument == "--vulkan-validation")
+        {
+            vulkanConfig.enableValidation = true;
+            vulkanOptionUsed = true;
         }
         else if (argument == "--vram-in" ||
             argument == "--vram-out" ||
@@ -339,7 +487,10 @@ int main(int argc, char **argv)
             argument == "--renderer" ||
             argument == "--stop-after-command" ||
             argument == "--stop-after-packet" ||
-            argument == "--compare-vram")
+            argument == "--compare-vram" ||
+            argument == "--vulkan-loader" ||
+            argument == "--vulkan-vendor" ||
+            argument == "--vulkan-device")
         {
             if (++index >= argc)
             {
@@ -347,20 +498,63 @@ int main(int argc, char **argv)
                 return 2;
             }
 
-            if (argument == "--vram-in")
+            if (argument == "--vulkan-loader")
+            {
+                vulkanConfig.loaderPath = argv[index];
+                vulkanOptionUsed = true;
+            }
+            else if (argument == "--vulkan-vendor" ||
+                     argument == "--vulkan-device")
+            {
+                uint64_t id = 0u;
+                if (!parseCount(argv[index], id) ||
+                    id > std::numeric_limits<uint32_t>::max())
+                {
+                    std::cerr << "invalid Vulkan device ID: "
+                              << argv[index] << '\n';
+                    return 2;
+                }
+                if (argument == "--vulkan-vendor")
+                    vulkanConfig.preferredVendorId =
+                        static_cast<uint32_t>(id);
+                else
+                    vulkanConfig.preferredDeviceId =
+                        static_cast<uint32_t>(id);
+                vulkanOptionUsed = true;
+            }
+            else if (argument == "--vram-in")
+            {
                 vramInputPath = argv[index];
+                replayOptionUsed = true;
+            }
             else if (argument == "--vram-out")
+            {
                 vramOutputPath = argv[index];
+                replayOptionUsed = true;
+            }
             else if (argument == "--packet-sizes")
+            {
                 packetSizesPath = argv[index];
+                replayOptionUsed = true;
+            }
             else if (argument == "--hash-trace")
+            {
                 hashTracePath = argv[index];
+                replayOptionUsed = true;
+            }
             else if (argument == "--state-in")
+            {
                 explicitStatePath = argv[index];
+                replayOptionUsed = true;
+            }
             else if (argument == "--compare-vram")
+            {
                 compareVramPath = argv[index];
+                replayOptionUsed = true;
+            }
             else if (argument == "--renderer")
             {
+                replayOptionUsed = true;
                 if (!parseRendererMode(argv[index], rendererMode))
                 {
                     std::cerr << "invalid renderer mode: "
@@ -370,6 +564,7 @@ int main(int argc, char **argv)
             }
             else if (argument == "--stop-after-command")
             {
+                replayOptionUsed = true;
                 if (!parseCount(argv[index], commandLimit))
                 {
                     std::cerr << "invalid command limit: "
@@ -380,6 +575,7 @@ int main(int argc, char **argv)
             }
             else if (argument == "--stop-after-packet")
             {
+                replayOptionUsed = true;
                 if (!parseCount(argv[index], packetLimit))
                 {
                     std::cerr << "invalid packet limit: "
@@ -390,6 +586,7 @@ int main(int argc, char **argv)
             }
             else if (argument == "--register-file")
             {
+                replayOptionUsed = true;
                 if (!readRegisterFile(
                         argv[index],
                         fileRegisters,
@@ -402,6 +599,7 @@ int main(int argc, char **argv)
             }
             else
             {
+                replayOptionUsed = true;
                 std::pair<uint8_t, uint64_t> assignment{};
                 if (!parseRegisterAssignment(argv[index], assignment))
                 {
@@ -427,6 +625,24 @@ int main(int argc, char **argv)
         {
             packetPaths.push_back(argument);
         }
+    }
+
+    if (vulkanInfo)
+    {
+        if (replayOptionUsed || !packetPaths.empty())
+        {
+            std::cerr << "--vulkan-info cannot be combined with GIF replay inputs\n";
+            return 2;
+        }
+        const GsVulkanCapabilityReport report =
+            probeGsVulkanCapabilities(vulkanConfig);
+        writeVulkanCapabilityReport(std::cout, report);
+        return report.ready() ? 0 : 1;
+    }
+    if (vulkanOptionUsed)
+    {
+        std::cerr << "Vulkan probe options require --vulkan-info\n";
+        return 2;
     }
 
     if (packetPaths.empty())

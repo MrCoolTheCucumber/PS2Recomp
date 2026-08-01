@@ -66,6 +66,7 @@ add_library(ps2_test_lib STATIC
     src/ps2_vu_recompiler_tests.cpp
     src/ps2_vu1_tests.cpp
     src/ps2_gs_tests.cpp
+    src/ps2_gs_vulkan_tests.cpp
     src/ps2_iop_tests.cpp
     src/ps2_sif_rpc_tests.cpp
     src/ps2_sif_dma_tests.cpp
