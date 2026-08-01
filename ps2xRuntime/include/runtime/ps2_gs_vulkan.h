@@ -106,6 +106,10 @@ struct GsVulkanDeviceReport
     // 64-bit shader arithmetic for full-range GS 12.4 edge equations.
     bool exactCt32Triangle = false;
 
+    // Exact flat CT32 plus Z32/Z24 depth uses only the permanent raw-VRAM
+    // contract and 32-bit storage-buffer atomics.
+    bool exactDepthCt32Sprite = false;
+
     // The first textured-sprite kernel needs only the permanent exact raw-VRAM
     // storage contract; the separate bit lets routing fail closed if that
     // semantic pipeline is unavailable on a future platform.
@@ -189,6 +193,9 @@ struct GsVulkanServiceStatistics
     uint64_t spriteDrawsCompleted = 0u;
     uint64_t spriteDrawsFailed = 0u;
     uint64_t spritePixelsExecuted = 0u;
+    uint64_t depthCt32SpriteDrawsCompleted = 0u;
+    uint64_t depthCt32SpriteDrawsFailed = 0u;
+    uint64_t depthCt32SpritePixelsExecuted = 0u;
     uint64_t nearestCt32SpriteDrawsCompleted = 0u;
     uint64_t nearestCt32SpriteDrawsFailed = 0u;
     uint64_t nearestCt32SpritePixelsExecuted = 0u;
@@ -664,6 +671,14 @@ public:
         const GsVulkanCt32Sprite &sprite,
         std::vector<uint8_t> &output,
         std::string *error = nullptr) override;
+
+    // Uploads canonical VRAM, executes one exact flat CT32 plus Z32/Z24
+    // depth sprite, and publishes the complete synchronized image.
+    [[nodiscard]] bool executeDepthCt32Sprite(
+        std::span<const uint8_t> input,
+        const GsVulkanDepthCt32Sprite &sprite,
+        std::vector<uint8_t> &output,
+        std::string *error = nullptr);
 
     // Uploads canonical VRAM, executes one prepared nearest CT32 texture
     // sprite through raw GS-local-memory reads, and publishes the synchronized

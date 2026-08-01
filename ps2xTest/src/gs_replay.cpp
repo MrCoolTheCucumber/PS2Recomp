@@ -313,6 +313,8 @@ namespace
                    << (device.exactVramStorage ? "true" : "false")
                    << ",\"exact_ct32_triangle\":"
                    << (device.exactCt32Triangle ? "true" : "false")
+                   << ",\"exact_depth_ct32_sprite\":"
+                   << (device.exactDepthCt32Sprite ? "true" : "false")
                    << ",\"exact_nearest_ct32_sprite\":"
                    << (device.exactNearestCt32Sprite ? "true" : "false")
                    << ",\"exact_linear_ct32_sprite\":"
@@ -379,6 +381,12 @@ namespace
                << statistics.spriteDrawsFailed
                << ",\"sprite_pixels_executed\":"
                << statistics.spritePixelsExecuted
+               << ",\"depth_ct32_sprite_draws_completed\":"
+               << statistics.depthCt32SpriteDrawsCompleted
+               << ",\"depth_ct32_sprite_draws_failed\":"
+               << statistics.depthCt32SpriteDrawsFailed
+               << ",\"depth_ct32_sprite_pixels_executed\":"
+               << statistics.depthCt32SpritePixelsExecuted
                << ",\"nearest_ct32_sprite_draws_completed\":"
                << statistics.nearestCt32SpriteDrawsCompleted
                << ",\"nearest_ct32_sprite_draws_failed\":"

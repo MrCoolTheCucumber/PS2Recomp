@@ -1716,6 +1716,7 @@ GsVulkanCapabilityReport probeGsVulkanCapabilities(
             device.kind != GsVulkanDeviceKind::Cpu;
         device.exactCt32Triangle =
             device.suitable && device.shaderInt64;
+        device.exactDepthCt32Sprite = device.suitable;
         device.exactNearestCt32Sprite = device.suitable;
         device.exactLinearCt32Sprite = device.suitable;
 
@@ -1761,6 +1762,7 @@ GsVulkanCapabilityReport probeGsVulkanCapabilities(
 namespace
 {
 #include "shaders/ps2_gs_ct32_sprite_spv.inc"
+#include "shaders/ps2_gs_depth_ct32_sprite_spv.inc"
 #include "shaders/ps2_gs_ct32_triangle_spv.inc"
 #include "shaders/ps2_gs_linear_ct32_sprite_spv.inc"
 #include "shaders/ps2_gs_memory_cases_spv.inc"
@@ -1769,6 +1771,8 @@ namespace
 
     static_assert(sizeof(kGsCt32SpriteShaderSpv) == 7536u);
     static_assert(kGsCt32SpriteShaderSpv[0] == 0x07230203u);
+    static_assert(sizeof(kGsDepthCt32SpriteShaderSpv) == 14852u);
+    static_assert(kGsDepthCt32SpriteShaderSpv[0] == 0x07230203u);
     static_assert(sizeof(kGsCt32TriangleShaderSpv) == 10200u);
     static_assert(kGsCt32TriangleShaderSpv[0] == 0x07230203u);
     static_assert(sizeof(kGsLinearCt32SpriteShaderSpv) == 38900u);
@@ -2050,6 +2054,13 @@ namespace
             GsVulkanCapabilityReport &report,
             GsVulkanServiceStatistics &statistics,
             std::string &error);
+        bool executeDepthCt32Sprite(
+            std::span<const uint8_t> input,
+            const GsVulkanDepthCt32Sprite &sprite,
+            std::vector<uint8_t> &output,
+            GsVulkanCapabilityReport &report,
+            GsVulkanServiceStatistics &statistics,
+            std::string &error);
         bool executeNearestCt32Sprite(
             std::span<const uint8_t> input,
             const GsVulkanNearestCt32Sprite &sprite,
@@ -2203,6 +2214,8 @@ namespace
         VkPipeline m_memoryPipeline = VK_NULL_HANDLE;
         VkShaderModule m_spriteShaderModule = VK_NULL_HANDLE;
         VkPipeline m_spritePipeline = VK_NULL_HANDLE;
+        VkShaderModule m_depthCt32SpriteShaderModule = VK_NULL_HANDLE;
+        VkPipeline m_depthCt32SpritePipeline = VK_NULL_HANDLE;
         VkShaderModule m_nearestCt32SpriteShaderModule = VK_NULL_HANDLE;
         VkPipeline m_nearestCt32SpritePipeline = VK_NULL_HANDLE;
         VkShaderModule m_linearCt32SpriteShaderModule = VK_NULL_HANDLE;
@@ -2873,6 +2886,12 @@ namespace
                 m_spriteShaderModule, m_spritePipeline,
                 "CT32 sprite") ||
             !createComputePipeline(
+                kGsDepthCt32SpriteShaderSpv,
+                sizeof(kGsDepthCt32SpriteShaderSpv),
+                m_depthCt32SpriteShaderModule,
+                m_depthCt32SpritePipeline,
+                "depth CT32 sprite") ||
+            !createComputePipeline(
                 kGsNearestCt32SpriteShaderSpv,
                 sizeof(kGsNearestCt32SpriteShaderSpv),
                 m_nearestCt32SpriteShaderModule,
@@ -3166,6 +3185,52 @@ namespace
             groupCountX, groupCountY,
             &sprite, sizeof(sprite), output, nullptr,
             "CT32 sprite", report, statistics, error);
+    }
+
+    bool VulkanExecutionContext::executeDepthCt32Sprite(
+        std::span<const uint8_t> input,
+        const GsVulkanDepthCt32Sprite &sprite,
+        std::vector<uint8_t> &output,
+        GsVulkanCapabilityReport &report,
+        GsVulkanServiceStatistics &statistics,
+        std::string &error)
+    {
+        if (!m_healthy)
+        {
+            error = "Vulkan GS service is not healthy";
+            return false;
+        }
+        if (m_depthCt32SpritePipeline == VK_NULL_HANDLE)
+        {
+            error =
+                "Vulkan device does not support exact depth CT32 sprites";
+            return false;
+        }
+        if (input.size() != GS_VULKAN_VRAM_SIZE)
+        {
+            error =
+                "Vulkan depth CT32 sprite requires exactly 4 MiB of VRAM";
+            return false;
+        }
+        if (const char *validationError =
+                depthCt32SpriteValidationError(sprite))
+        {
+            error = validationError;
+            return false;
+        }
+
+        constexpr uint32_t localSize = 8u;
+        const uint32_t width = sprite.boundsX1 - sprite.boundsX0;
+        const uint32_t height = sprite.boundsY1 - sprite.boundsY0;
+        const uint32_t groupCountX =
+            (width + localSize - 1u) / localSize;
+        const uint32_t groupCountY =
+            (height + localSize - 1u) / localSize;
+        return executeKernel(
+            input, {}, m_depthCt32SpritePipeline,
+            groupCountX, groupCountY,
+            &sprite, sizeof(sprite), output, nullptr,
+            "depth CT32 sprite", report, statistics, error);
     }
 
     bool VulkanExecutionContext::executeNearestCt32Sprite(
@@ -4416,6 +4481,20 @@ namespace
                 m_device, m_nearestCt32SpriteShaderModule, nullptr);
         }
         m_nearestCt32SpriteShaderModule = VK_NULL_HANDLE;
+        if (m_depthCt32SpritePipeline != VK_NULL_HANDLE &&
+            m_functions.destroyPipeline)
+        {
+            m_functions.destroyPipeline(
+                m_device, m_depthCt32SpritePipeline, nullptr);
+        }
+        m_depthCt32SpritePipeline = VK_NULL_HANDLE;
+        if (m_depthCt32SpriteShaderModule != VK_NULL_HANDLE &&
+            m_functions.destroyShaderModule)
+        {
+            m_functions.destroyShaderModule(
+                m_device, m_depthCt32SpriteShaderModule, nullptr);
+        }
+        m_depthCt32SpriteShaderModule = VK_NULL_HANDLE;
         if (m_spritePipeline != VK_NULL_HANDLE &&
             m_functions.destroyPipeline)
         {
@@ -4514,6 +4593,7 @@ enum class GsVulkanRequestKind : uint8_t
     RoundTrip,
     MemoryCases,
     Ct32Sprite,
+    DepthCt32Sprite,
     NearestCt32Sprite,
     LinearCt32Sprite,
     Ct32Triangle,
@@ -4575,6 +4655,11 @@ struct GsVulkanService::Impl final
                          GsVulkanRequestKind::Ct32Sprite)
                 {
                     ++statistics.spriteDrawsFailed;
+                }
+                else if (activeRequestKind ==
+                         GsVulkanRequestKind::DepthCt32Sprite)
+                {
+                    ++statistics.depthCt32SpriteDrawsFailed;
                 }
                 else if (activeRequestKind ==
                          GsVulkanRequestKind::NearestCt32Sprite)
@@ -4681,6 +4766,7 @@ struct GsVulkanService::Impl final
             std::vector<uint8_t> input;
             std::vector<GsVulkanMemoryCase> memoryCases;
             std::vector<GsVulkanCt32Sprite> sprites;
+            std::vector<GsVulkanDepthCt32Sprite> depthCt32Sprites;
             std::vector<GsVulkanNearestCt32Sprite> nearestCt32Sprites;
             std::vector<GsVulkanLinearCt32Sprite> linearCt32Sprites;
             std::vector<GsVulkanCt32Triangle> triangles;
@@ -4698,6 +4784,8 @@ struct GsVulkanService::Impl final
                 input = std::move(requestInput);
                 memoryCases = std::move(requestMemoryCases);
                 sprites = std::move(requestSprites);
+                depthCt32Sprites =
+                    std::move(requestDepthCt32Sprites);
                 nearestCt32Sprites =
                     std::move(requestNearestCt32Sprites);
                 linearCt32Sprites =
@@ -4731,6 +4819,13 @@ struct GsVulkanService::Impl final
             {
                 succeeded = context.executeCt32Sprite(
                     input, sprites.front(), output,
+                    localCapabilities, localStatistics,
+                    operationError);
+            }
+            else if (kind == GsVulkanRequestKind::DepthCt32Sprite)
+            {
+                succeeded = context.executeDepthCt32Sprite(
+                    input, depthCt32Sprites.front(), output,
                     localCapabilities, localStatistics,
                     operationError);
             }
@@ -4826,6 +4921,24 @@ struct GsVulkanService::Impl final
                 else
                 {
                     ++localStatistics.spriteDrawsFailed;
+                }
+            }
+            else if (kind == GsVulkanRequestKind::DepthCt32Sprite)
+            {
+                if (succeeded)
+                {
+                    const GsVulkanDepthCt32Sprite &sprite =
+                        depthCt32Sprites.front();
+                    ++localStatistics.depthCt32SpriteDrawsCompleted;
+                    localStatistics.depthCt32SpritePixelsExecuted +=
+                        static_cast<uint64_t>(
+                            sprite.boundsX1 - sprite.boundsX0) *
+                        static_cast<uint64_t>(
+                            sprite.boundsY1 - sprite.boundsY0);
+                }
+                else
+                {
+                    ++localStatistics.depthCt32SpriteDrawsFailed;
                 }
             }
             else if (kind == GsVulkanRequestKind::NearestCt32Sprite)
@@ -5059,6 +5172,7 @@ struct GsVulkanService::Impl final
         std::vector<uint8_t> input,
         std::vector<GsVulkanMemoryCase> memoryCases,
         std::vector<GsVulkanCt32Sprite> sprites,
+        std::vector<GsVulkanDepthCt32Sprite> depthCt32Sprites,
         std::vector<GsVulkanNearestCt32Sprite> nearestCt32Sprites,
         std::vector<GsVulkanLinearCt32Sprite> linearCt32Sprites,
         std::vector<GsVulkanCt32Triangle> triangles,
@@ -5089,6 +5203,7 @@ struct GsVulkanService::Impl final
         requestInput = std::move(input);
         requestMemoryCases = std::move(memoryCases);
         requestSprites = std::move(sprites);
+        requestDepthCt32Sprites = std::move(depthCt32Sprites);
         requestNearestCt32Sprites = std::move(nearestCt32Sprites);
         requestLinearCt32Sprites = std::move(linearCt32Sprites);
         requestTriangles = std::move(triangles);
@@ -5161,6 +5276,7 @@ struct GsVulkanService::Impl final
     std::vector<uint8_t> requestInput;
     std::vector<GsVulkanMemoryCase> requestMemoryCases;
     std::vector<GsVulkanCt32Sprite> requestSprites;
+    std::vector<GsVulkanDepthCt32Sprite> requestDepthCt32Sprites;
     std::vector<GsVulkanNearestCt32Sprite> requestNearestCt32Sprites;
     std::vector<GsVulkanLinearCt32Sprite> requestLinearCt32Sprites;
     std::vector<GsVulkanCt32Triangle> requestTriangles;
@@ -5293,7 +5409,7 @@ bool GsVulkanService::roundTripVram(
     return m_impl->executeRequest(
         GsVulkanRequestKind::RoundTrip,
         std::vector<uint8_t>(input.begin(), input.end()), {},
-        {}, {}, {}, {}, {}, output, nullptr, error);
+        {}, {}, {}, {}, {}, {}, output, nullptr, error);
 #endif
 }
 
@@ -5377,7 +5493,7 @@ bool GsVulkanService::executeMemoryCases(
         std::vector<uint8_t>(input.begin(), input.end()),
         std::vector<GsVulkanMemoryCase>(
             cases.begin(), cases.end()),
-        {}, {}, {}, {}, {}, output, &results, error);
+        {}, {}, {}, {}, {}, {}, output, &results, error);
 #endif
 }
 
@@ -5413,8 +5529,61 @@ bool GsVulkanService::executeCt32Sprite(
     return m_impl->executeRequest(
         GsVulkanRequestKind::Ct32Sprite,
         std::vector<uint8_t>(input.begin(), input.end()), {},
-        std::vector<GsVulkanCt32Sprite>{sprite}, {}, {}, {}, {},
+        std::vector<GsVulkanCt32Sprite>{sprite}, {}, {}, {}, {}, {},
         output, nullptr, error);
+#endif
+}
+
+bool GsVulkanService::executeDepthCt32Sprite(
+    std::span<const uint8_t> input,
+    const GsVulkanDepthCt32Sprite &sprite,
+    std::vector<uint8_t> &output,
+    std::string *error)
+{
+#if !PS2X_HAS_GS_VULKAN
+    (void)input;
+    (void)sprite;
+    (void)output;
+    if (error)
+        *error = "Vulkan GS support was compiled out";
+    return false;
+#else
+    if (input.size() != GS_VULKAN_VRAM_SIZE)
+    {
+        if (error)
+        {
+            *error =
+                "Vulkan depth CT32 sprite requires exactly 4 MiB of VRAM";
+        }
+        return false;
+    }
+    if (const char *validationError =
+            depthCt32SpriteValidationError(sprite))
+    {
+        if (error)
+            *error = validationError;
+        return false;
+    }
+    {
+        std::lock_guard lock(m_impl->stateMutex);
+        const GsVulkanDeviceReport *selected =
+            m_impl->capabilities.selectedDevice();
+        if (!selected || !selected->exactDepthCt32Sprite)
+        {
+            if (error)
+            {
+                *error =
+                    "Vulkan device does not support exact depth CT32 sprites";
+            }
+            return false;
+        }
+    }
+
+    return m_impl->executeRequest(
+        GsVulkanRequestKind::DepthCt32Sprite,
+        std::vector<uint8_t>(input.begin(), input.end()),
+        {}, {}, std::vector<GsVulkanDepthCt32Sprite>{sprite},
+        {}, {}, {}, {}, output, nullptr, error);
 #endif
 }
 
@@ -5466,7 +5635,7 @@ bool GsVulkanService::executeNearestCt32Sprite(
     return m_impl->executeRequest(
         GsVulkanRequestKind::NearestCt32Sprite,
         std::vector<uint8_t>(input.begin(), input.end()),
-        {}, {}, std::vector<GsVulkanNearestCt32Sprite>{sprite},
+        {}, {}, {}, std::vector<GsVulkanNearestCt32Sprite>{sprite},
         {}, {}, {}, output, nullptr, error);
 #endif
 }
@@ -5519,7 +5688,7 @@ bool GsVulkanService::executeLinearCt32Sprite(
     return m_impl->executeRequest(
         GsVulkanRequestKind::LinearCt32Sprite,
         std::vector<uint8_t>(input.begin(), input.end()),
-        {}, {}, {}, std::vector<GsVulkanLinearCt32Sprite>{sprite},
+        {}, {}, {}, {}, std::vector<GsVulkanLinearCt32Sprite>{sprite},
         {}, {}, output, nullptr, error);
 #endif
 }
@@ -5572,7 +5741,7 @@ bool GsVulkanService::executeCt32Triangle(
     return m_impl->executeRequest(
         GsVulkanRequestKind::Ct32Triangle,
         std::vector<uint8_t>(input.begin(), input.end()),
-        {}, {}, {}, {}, std::vector<GsVulkanCt32Triangle>{triangle}, {},
+        {}, {}, {}, {}, {}, std::vector<GsVulkanCt32Triangle>{triangle}, {},
         output, nullptr, error);
 #endif
 }
@@ -5619,7 +5788,7 @@ bool GsVulkanService::uploadVramPages(
     std::vector<uint8_t> unusedOutput;
     return m_impl->executeRequest(
         GsVulkanRequestKind::UploadPages,
-        std::move(packed), {}, {}, {}, {}, {}, pages,
+        std::move(packed), {}, {}, {}, {}, {}, {}, pages,
         unusedOutput, nullptr, error);
 #endif
 }
@@ -5652,7 +5821,7 @@ bool GsVulkanService::downloadVramPages(
     std::vector<uint8_t> packed;
     if (!m_impl->executeRequest(
             GsVulkanRequestKind::DownloadPages,
-            {}, {}, {}, {}, {}, {}, pages, packed, nullptr, error))
+            {}, {}, {}, {}, {}, {}, {}, pages, packed, nullptr, error))
     {
         return false;
     }
@@ -5713,7 +5882,7 @@ bool GsVulkanService::executeResidentCt32Sprites(
         {}, {},
         std::vector<GsVulkanCt32Sprite>(
             sprites.begin(), sprites.end()),
-        {}, {}, {}, {}, unusedOutput, nullptr, error);
+        {}, {}, {}, {}, {}, unusedOutput, nullptr, error);
 #endif
 }
 
@@ -5762,7 +5931,7 @@ bool GsVulkanService::executeResidentNearestCt32Sprites(
     std::vector<uint8_t> unusedOutput;
     return m_impl->executeRequest(
         GsVulkanRequestKind::ResidentNearestCt32Sprites,
-        {}, {}, {},
+        {}, {}, {}, {},
         std::vector<GsVulkanNearestCt32Sprite>(
             sprites.begin(), sprites.end()),
         {}, {}, {}, unusedOutput, nullptr, error);
@@ -5814,7 +5983,7 @@ bool GsVulkanService::executeResidentLinearCt32Sprites(
     std::vector<uint8_t> unusedOutput;
     return m_impl->executeRequest(
         GsVulkanRequestKind::ResidentLinearCt32Sprites,
-        {}, {}, {}, {},
+        {}, {}, {}, {}, {},
         std::vector<GsVulkanLinearCt32Sprite>(
             sprites.begin(), sprites.end()),
         {}, {}, unusedOutput, nullptr, error);
@@ -5864,7 +6033,7 @@ bool GsVulkanService::executeResidentCt32Triangles(
     std::vector<uint8_t> unusedOutput;
     return m_impl->executeRequest(
         GsVulkanRequestKind::ResidentCt32Triangles,
-        {}, {}, {}, {}, {},
+        {}, {}, {}, {}, {}, {},
         std::vector<GsVulkanCt32Triangle>(
             triangles.begin(), triangles.end()),
         {}, unusedOutput, nullptr, error);

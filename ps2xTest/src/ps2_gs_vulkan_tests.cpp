@@ -9959,6 +9959,10 @@ void register_ps2_gs_vulkan_tests()
                     device.suitable && device.shaderInt64,
                     "the exact triangle capability should expose its complete hard gate");
                 t.Equals(
+                    device.exactDepthCt32Sprite,
+                    device.suitable,
+                    "the depth CT32 capability should expose its raw-VRAM hard gate");
+                t.Equals(
                     device.exactNearestCt32Sprite,
                     device.suitable,
                     "the nearest CT32 capability should expose its raw-VRAM hard gate");
@@ -10800,6 +10804,247 @@ void register_ps2_gs_vulkan_tests()
                       "a stopped service must reject nearest CT32 work");
             t.IsTrue(shutdownOutput == shutdownSentinel,
                      "post-shutdown texture rejection must preserve output");
+        });
+
+        tc.Run("Vulkan depth CT32 sprites match Z32 Z24 compare and packed writes", [](TestCase &t)
+        {
+            GSMem::InitLookupTables();
+            const std::array<GsDrawCommand, 6> commands{{
+                makeDepthCt32SpriteCommand(
+                    30'000u, 511u, 1u, 200u, GS_PSM_Z24, false, 1u,
+                    {1u, 16u, 2u, 13u}, {0u, 0u},
+                    17u, 33u, 273u, 225u,
+                    0x11223344u, 0xFEDCBA98u),
+                makeDepthCt32SpriteCommand(
+                    30'001u, 40u, 2u, 511u, GS_PSM_Z32, false, 1u,
+                    {3u, 20u, 1u, 15u}, {0u, 0u},
+                    321u, 241u, 49u, 17u,
+                    0x55667788u, 0x89ABCDEFu),
+                makeDepthCt32SpriteCommand(
+                    30'002u, 41u, 2u, 201u, GS_PSM_Z24, true, 2u,
+                    {2u, 18u, 3u, 17u}, {0u, 0u},
+                    33u, 49u, 305u, 289u,
+                    0x99AABBCCu, 0x007FFF00u),
+                makeDepthCt32SpriteCommand(
+                    30'003u, 42u, 2u, 202u, GS_PSM_Z24, false, 3u,
+                    {4u, 19u, 2u, 14u}, {0u, 0u},
+                    65u, 33u, 321u, 241u,
+                    0xDDEEFF10u, 0x00800100u),
+                makeDepthCt32SpriteCommand(
+                    30'004u, 43u, 2u, 203u, GS_PSM_Z32, true, 2u,
+                    {1u, 17u, 4u, 18u}, {0u, 0u},
+                    17u, 65u, 289u, 305u,
+                    0x20304050u, 0x7FFFFF00u),
+                makeDepthCt32SpriteCommand(
+                    30'005u, 44u, 2u, 204u, GS_PSM_Z32, false, 3u,
+                    {5u, 21u, 3u, 16u}, {0u, 0u},
+                    81u, 49u, 353u, 273u,
+                    0x60708090u, 0x80000100u),
+            }};
+
+            std::vector<GsVulkanDepthCt32Sprite> sprites;
+            for (const GsDrawCommand &command : commands)
+            {
+                GsVulkanDepthCt32Sprite sprite{};
+                const GsBackendDecision decision =
+                    prepareGsVulkanDepthCt32Sprite(command, sprite);
+                if (!decision.supported)
+                {
+                    t.Fail(
+                        "synthetic depth CT32 sprite was rejected as " +
+                        std::string(gsFallbackReasonName(decision.reason)));
+                    return;
+                }
+                sprites.push_back(sprite);
+            }
+
+            GsVulkanServiceConfig config{};
+            config.probe.enableValidation = true;
+            GsVulkanCapabilityReport preflight =
+                probeGsVulkanCapabilities(config.probe);
+            if (preflight.status ==
+                GsVulkanProbeStatus::ValidationUnavailable)
+            {
+                config.probe.enableValidation = false;
+                preflight = probeGsVulkanCapabilities(config.probe);
+            }
+
+            GsVulkanCapabilityReport creationReport{};
+            std::string creationError;
+            std::unique_ptr<GsVulkanService> service =
+                GsVulkanService::create(
+                    config, &creationReport, &creationError);
+            if (!preflight.ready())
+            {
+                t.IsNull(service.get(),
+                         "an unavailable host should skip the depth shader cleanly");
+                return;
+            }
+            t.IsNotNull(service.get(),
+                        "a suitable device should create the depth sprite service");
+            if (!service)
+                return;
+            const GsVulkanDeviceReport *selected =
+                creationReport.selectedDevice();
+            t.IsNotNull(selected,
+                        "the depth service should retain its selected device");
+            if (!selected)
+                return;
+            t.IsTrue(selected->exactDepthCt32Sprite,
+                     "the selected device should publish exact Z32/Z24 depth");
+            if (!selected->exactDepthCt32Sprite)
+                return;
+
+            std::vector<uint8_t> gpu = makeVramPattern(0x44335054u);
+            uint64_t expectedPixels = 0u;
+            bool coveredEquality = false;
+            bool coveredPass = false;
+            bool coveredFail = false;
+            for (size_t index = 0u; index < sprites.size(); ++index)
+            {
+                const GsVulkanDepthCt32Sprite &sprite = sprites[index];
+                if (sprite.depthTestMethod >= 2u)
+                {
+                    for (uint32_t y = sprite.boundsY0;
+                         y < sprite.boundsY1; ++y)
+                    {
+                        for (uint32_t x = sprite.boundsX0;
+                             x < sprite.boundsX1; ++x)
+                        {
+                            const uint32_t selector = (x + y) % 3u;
+                            const uint32_t current = selector == 0u
+                                ? sprite.depth - 1u
+                                : selector == 1u
+                                    ? sprite.depth
+                                    : sprite.depth + 1u;
+                            if (sprite.depthPsm == GS_PSM_Z24)
+                            {
+                                GSMem::WriteZ24(
+                                    gpu.data(), sprite.depthBaseBlock,
+                                    sprite.framebufferWidth, x, y, current);
+                            }
+                            else
+                            {
+                                GSMem::WriteZ32(
+                                    gpu.data(), sprite.depthBaseBlock,
+                                    sprite.framebufferWidth, x, y, current);
+                            }
+                            coveredPass = coveredPass || selector == 0u;
+                            coveredEquality = coveredEquality || selector == 1u;
+                            coveredFail = coveredFail || selector == 2u;
+                        }
+                    }
+                }
+
+                std::vector<uint8_t> expected = gpu;
+                applyDepthCt32SpriteCpu(expected, sprite);
+                std::vector<uint8_t> actual = {0xA5u};
+                std::string error;
+                if (!service->executeDepthCt32Sprite(
+                        gpu, sprite, actual, &error))
+                {
+                    t.Fail(
+                        "GPU depth CT32 sprite " +
+                        std::to_string(index) + " failed: " + error);
+                    return;
+                }
+                if (actual != expected)
+                {
+                    t.Fail(
+                        "GPU depth CT32 sprite " +
+                        std::to_string(index) +
+                        " disagreed with the complete CPU VRAM image");
+                    return;
+                }
+                gpu = std::move(actual);
+                expectedPixels +=
+                    static_cast<uint64_t>(
+                        sprite.boundsX1 - sprite.boundsX0) *
+                    static_cast<uint64_t>(
+                        sprite.boundsY1 - sprite.boundsY0);
+            }
+            t.IsTrue(coveredEquality && coveredPass && coveredFail,
+                     "the depth corpus should cover equality, pass, and fail inputs");
+
+            const auto expectRejected = [&t, &service](
+                std::span<const uint8_t> input,
+                const GsVulkanDepthCt32Sprite &sprite,
+                const std::string &label)
+            {
+                std::vector<uint8_t> output = {0x12u, 0x34u};
+                const std::vector<uint8_t> sentinel = output;
+                std::string error;
+                t.IsFalse(
+                    service->executeDepthCt32Sprite(
+                        input, sprite, output, &error),
+                    label + " should fail closed");
+                t.IsTrue(output == sentinel,
+                         label + " must preserve caller output");
+                t.IsFalse(error.empty(),
+                          label + " should retain a diagnostic");
+            };
+            const std::vector<uint8_t> shortInput(
+                GS_VULKAN_VRAM_SIZE - 1u, 0u);
+            expectRejected(shortInput, sprites.front(),
+                           "short depth sprite VRAM input");
+            GsVulkanDepthCt32Sprite invalid = sprites.front();
+            invalid.reserved0 = 1u;
+            expectRejected(gpu, invalid, "depth sprite reserved data");
+            invalid = sprites.front();
+            invalid.depthPsm = GS_PSM_Z16;
+            expectRejected(gpu, invalid, "unsupported depth sprite format");
+            invalid = sprites.front();
+            invalid.depthTestMethod = 0u;
+            expectRejected(gpu, invalid, "unsupported depth sprite method");
+            invalid = sprites.front();
+            invalid.depthWrite = 0u;
+            expectRejected(gpu, invalid, "redundant masked ALWAYS depth sprite");
+            invalid = sprites.front();
+            invalid.depthBaseBlock = invalid.framebufferBaseBlock;
+            expectRejected(gpu, invalid, "aliased depth and color surfaces");
+
+            const GsVulkanServiceStatistics statistics =
+                service->statistics();
+            t.Equals(
+                statistics.depthCt32SpriteDrawsCompleted,
+                static_cast<uint64_t>(sprites.size()),
+                "every depth sprite should complete exactly once");
+            t.Equals(statistics.depthCt32SpriteDrawsFailed, 0ull,
+                     "caller-side depth rejection should not count as GPU failure");
+            t.Equals(statistics.depthCt32SpritePixelsExecuted,
+                     expectedPixels,
+                     "depth statistics should count exact candidate pixels");
+            t.Equals(statistics.queueSubmissions,
+                     static_cast<uint64_t>(sprites.size()),
+                     "each depth request should use one queue submission");
+            t.Equals(statistics.shaderDispatches,
+                     static_cast<uint64_t>(sprites.size()),
+                     "each depth request should use one compute dispatch");
+            t.Equals(statistics.pipelineBarriers,
+                     static_cast<uint64_t>(sprites.size()) * 4u,
+                     "each depth request should retain the bounded barrier plan");
+            t.Equals(statistics.validationErrors, 0u,
+                     "depth shader execution must remain validation-clean");
+            t.Equals(statistics.validationWarnings, 0u,
+                     "depth shader execution should emit no validation warnings");
+            t.IsTrue(service->healthy(),
+                     "successful and rejected depth work should leave the service healthy");
+
+            service->shutdown();
+            service->shutdown();
+            const GsVulkanServiceStatistics shutdownStatistics =
+                service->statistics();
+            t.Equals(shutdownStatistics.validationErrors, 0u,
+                     "depth pipeline destruction must remain validation-clean");
+            std::vector<uint8_t> shutdownOutput = {0xABu};
+            const std::vector<uint8_t> shutdownSentinel = shutdownOutput;
+            std::string shutdownError;
+            t.IsFalse(
+                service->executeDepthCt32Sprite(
+                    gpu, sprites.front(), shutdownOutput, &shutdownError),
+                "a stopped service must reject depth sprite work");
+            t.IsTrue(shutdownOutput == shutdownSentinel,
+                     "post-shutdown depth rejection must preserve output");
         });
 
         tc.Run("Vulkan linear CT32 repeat and clamp sprites match the prepared DDA", [](TestCase &t)

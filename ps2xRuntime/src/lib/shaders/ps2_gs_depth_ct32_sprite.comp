@@ -1,0 +1,93 @@
+#version 450
+#extension GL_GOOGLE_include_directive : require
+
+#include "ps2_gs_memory.glsl"
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+layout(set = 0, binding = 0, std430) buffer GsVram
+{
+    uint words[];
+} gs_vram;
+
+layout(push_constant) uniform DepthSpriteParameters
+{
+    uint framebuffer_base_block;
+    uint framebuffer_width;
+    uint depth_base_block;
+    uint depth_psm;
+    uint bounds_x0;
+    uint bounds_y0;
+    uint bounds_x1;
+    uint bounds_y1;
+    uint rgba;
+    uint depth;
+    uint depth_test_method;
+    uint depth_write;
+    uint reserved0;
+    uint reserved1;
+    uint reserved2;
+    uint reserved3;
+} sprite;
+
+uint gs_word_index(uint psm, uint base_block, uint x, uint y)
+{
+    uint bit_address = gs_pixel_bit_address(
+        psm, base_block, sprite.framebuffer_width, x, y);
+    return (bit_address >> 5u) & (GS_MEMORY_WORD_COUNT - 1u);
+}
+
+void write_z24(uint word_index, uint initial_word)
+{
+    uint expected = initial_word;
+    for (;;)
+    {
+        uint replacement =
+            (expected & 0xff000000u) | (sprite.depth & 0x00ffffffu);
+        uint observed = atomicCompSwap(
+            gs_vram.words[word_index], expected, replacement);
+        if (observed == expected)
+            return;
+        expected = observed;
+    }
+}
+
+void main()
+{
+    uint x = sprite.bounds_x0 + gl_GlobalInvocationID.x;
+    uint y = sprite.bounds_y0 + gl_GlobalInvocationID.y;
+    if (x >= sprite.bounds_x1 || y >= sprite.bounds_y1)
+        return;
+
+    uint depth_word_index = gs_word_index(
+        sprite.depth_psm, sprite.depth_base_block, x, y);
+    bool packed_z24 = sprite.depth_psm == 0x31u;
+    bool needs_depth_word =
+        sprite.depth_test_method >= 2u ||
+        (packed_z24 && sprite.depth_write != 0u);
+    uint depth_word = needs_depth_word
+        ? atomicAdd(gs_vram.words[depth_word_index], 0u)
+        : 0u;
+    uint current_depth = packed_z24
+        ? depth_word & 0x00ffffffu
+        : depth_word;
+    bool passes =
+        sprite.depth_test_method == 1u ||
+        (sprite.depth_test_method == 2u &&
+         sprite.depth >= current_depth) ||
+        (sprite.depth_test_method == 3u &&
+         sprite.depth > current_depth);
+    if (!passes)
+        return;
+
+    uint framebuffer_word_index = gs_word_index(
+        0x00u, sprite.framebuffer_base_block, x, y);
+    atomicExchange(gs_vram.words[framebuffer_word_index], sprite.rgba);
+    if (sprite.depth_write == 0u)
+        return;
+
+    if (packed_z24)
+        write_z24(depth_word_index, depth_word);
+    else
+        atomicExchange(gs_vram.words[depth_word_index], sprite.depth);
+}
