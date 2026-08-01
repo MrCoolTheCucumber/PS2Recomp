@@ -120,6 +120,10 @@ struct GsVulkanDeviceReport
     // The first exact linear pipeline uses the same raw-VRAM contract and a
     // 96-byte push-constant record, below Vulkan 1.0's required minimum.
     bool exactLinearCt32Sprite = false;
+
+    // Recursive linear/depth execution additionally requires a separately
+    // bound immutable 4 MiB texture snapshot and the exact 128-byte record.
+    bool exactFeedbackLinearDepthCt32Sprite = false;
     bool suitable = false;
     std::string rejectionReason;
 };
@@ -207,6 +211,9 @@ struct GsVulkanServiceStatistics
     uint64_t linearCt32SpriteDrawsCompleted = 0u;
     uint64_t linearCt32SpriteDrawsFailed = 0u;
     uint64_t linearCt32SpritePixelsExecuted = 0u;
+    uint64_t feedbackLinearDepthCt32SpriteDrawsCompleted = 0u;
+    uint64_t feedbackLinearDepthCt32SpriteDrawsFailed = 0u;
+    uint64_t feedbackLinearDepthCt32SpritePixelsExecuted = 0u;
     uint64_t residentLinearCt32SpriteBatchesCompleted = 0u;
     uint64_t residentLinearCt32SpriteBatchesFailed = 0u;
     uint64_t largestResidentLinearCt32SpriteBatch = 0u;
@@ -737,6 +744,12 @@ public:
         const GsVulkanLinearCt32Sprite &sprite,
         std::vector<uint8_t> &output,
         std::string *error = nullptr) = 0;
+    [[nodiscard]] virtual bool executeFeedbackLinearDepthCt32Sprite(
+        std::span<const uint8_t> input,
+        std::span<const uint8_t> feedbackSnapshot,
+        const GsVulkanFeedbackLinearDepthCt32Sprite &sprite,
+        std::vector<uint8_t> &output,
+        std::string *error = nullptr) = 0;
     [[nodiscard]] virtual bool executeCt32Triangle(
         std::span<const uint8_t> input,
         const GsVulkanCt32Triangle &triangle,
@@ -851,6 +864,15 @@ public:
     [[nodiscard]] bool executeLinearCt32Sprite(
         std::span<const uint8_t> input,
         const GsVulkanLinearCt32Sprite &sprite,
+        std::vector<uint8_t> &output,
+        std::string *error = nullptr) override;
+
+    // Uploads canonical writable VRAM and a distinct immutable texture
+    // snapshot, then executes one recursive linear CT32 plus depth sprite.
+    [[nodiscard]] bool executeFeedbackLinearDepthCt32Sprite(
+        std::span<const uint8_t> input,
+        std::span<const uint8_t> feedbackSnapshot,
+        const GsVulkanFeedbackLinearDepthCt32Sprite &sprite,
         std::vector<uint8_t> &output,
         std::string *error = nullptr) override;
 

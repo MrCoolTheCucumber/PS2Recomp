@@ -1983,6 +1983,7 @@ GsVulkanCapabilityReport probeGsVulkanCapabilities(
         device.exactDepthCt32Sprite = device.suitable;
         device.exactNearestCt32Sprite = device.suitable;
         device.exactLinearCt32Sprite = device.suitable;
+        device.exactFeedbackLinearDepthCt32Sprite = device.suitable;
 
         if (device.kind == GsVulkanDeviceKind::Cpu)
             device.rejectionReason = "CPU Vulkan implementations are not hardware-GS targets";
@@ -2027,6 +2028,7 @@ namespace
 {
 #include "shaders/ps2_gs_ct32_sprite_spv.inc"
 #include "shaders/ps2_gs_depth_ct32_sprite_spv.inc"
+#include "shaders/ps2_gs_feedback_linear_depth_ct32_sprite_spv.inc"
 #include "shaders/ps2_gs_ct32_triangle_spv.inc"
 #include "shaders/ps2_gs_linear_ct32_sprite_spv.inc"
 #include "shaders/ps2_gs_memory_cases_spv.inc"
@@ -2037,6 +2039,10 @@ namespace
     static_assert(kGsCt32SpriteShaderSpv[0] == 0x07230203u);
     static_assert(sizeof(kGsDepthCt32SpriteShaderSpv) == 15820u);
     static_assert(kGsDepthCt32SpriteShaderSpv[0] == 0x07230203u);
+    static_assert(
+        sizeof(kGsFeedbackLinearDepthCt32SpriteShaderSpv) == 46420u);
+    static_assert(
+        kGsFeedbackLinearDepthCt32SpriteShaderSpv[0] == 0x07230203u);
     static_assert(sizeof(kGsCt32TriangleShaderSpv) == 10200u);
     static_assert(kGsCt32TriangleShaderSpv[0] == 0x07230203u);
     static_assert(sizeof(kGsLinearCt32SpriteShaderSpv) == 38900u);
@@ -2339,6 +2345,14 @@ namespace
             GsVulkanCapabilityReport &report,
             GsVulkanServiceStatistics &statistics,
             std::string &error);
+        bool executeFeedbackLinearDepthCt32Sprite(
+            std::span<const uint8_t> input,
+            std::span<const uint8_t> feedbackSnapshot,
+            const GsVulkanFeedbackLinearDepthCt32Sprite &sprite,
+            std::vector<uint8_t> &output,
+            GsVulkanCapabilityReport &report,
+            GsVulkanServiceStatistics &statistics,
+            std::string &error);
         bool executeCt32Triangle(
             std::span<const uint8_t> input,
             const GsVulkanCt32Triangle &triangle,
@@ -2410,6 +2424,7 @@ namespace
         bool executeKernel(
             std::span<const uint8_t> input,
             std::span<const GsVulkanMemoryCase> cases,
+            std::span<const uint8_t> feedbackSnapshot,
             VkPipeline pipeline,
             uint32_t groupCountX,
             uint32_t groupCountY,
@@ -2470,9 +2485,12 @@ namespace
         uint32_t m_queueFamilyIndex = 0u;
         BufferAllocation m_vram;
         BufferAllocation m_staging;
+        BufferAllocation m_feedbackSnapshot;
+        BufferAllocation m_feedbackStaging;
         BufferAllocation m_memoryCases;
         BufferAllocation m_memoryResults;
         void *m_stagingMap = nullptr;
+        void *m_feedbackStagingMap = nullptr;
         void *m_memoryCasesMap = nullptr;
         void *m_memoryResultsMap = nullptr;
         VkDescriptorSetLayout m_descriptorSetLayout = VK_NULL_HANDLE;
@@ -2489,6 +2507,10 @@ namespace
         VkPipeline m_nearestCt32SpritePipeline = VK_NULL_HANDLE;
         VkShaderModule m_linearCt32SpriteShaderModule = VK_NULL_HANDLE;
         VkPipeline m_linearCt32SpritePipeline = VK_NULL_HANDLE;
+        VkShaderModule m_feedbackLinearDepthCt32SpriteShaderModule =
+            VK_NULL_HANDLE;
+        VkPipeline m_feedbackLinearDepthCt32SpritePipeline =
+            VK_NULL_HANDLE;
         VkShaderModule m_triangleShaderModule = VK_NULL_HANDLE;
         VkPipeline m_trianglePipeline = VK_NULL_HANDLE;
         VkDescriptorPool m_descriptorPool = VK_NULL_HANDLE;
@@ -3000,6 +3022,20 @@ namespace
                     VK_MEMORY_PROPERTY_HOST_CACHED_BIT,
                 m_staging, report, error) ||
             !createBuffer(
+                GS_VULKAN_VRAM_SIZE,
+                VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
+                    VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+                VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
+                VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
+                m_feedbackSnapshot, report, error) ||
+            !createBuffer(
+                GS_VULKAN_VRAM_SIZE,
+                VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+                VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT,
+                VK_MEMORY_PROPERTY_HOST_COHERENT_BIT |
+                    VK_MEMORY_PROPERTY_HOST_CACHED_BIT,
+                m_feedbackStaging, report, error) ||
+            !createBuffer(
                 memoryCaseBytes,
                 VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
                 VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT,
@@ -3030,6 +3066,17 @@ namespace
             return false;
         }
         result = m_functions.mapMemory(
+            m_device, m_feedbackStaging.memory,
+            0u, VK_WHOLE_SIZE, 0u,
+            &m_feedbackStagingMap);
+        if (!checkResult(
+                result, "vkMapMemory(feedback snapshot)",
+                report, error,
+                GsVulkanProbeStatus::ResourceCreationFailed))
+        {
+            return false;
+        }
+        result = m_functions.mapMemory(
             m_device, m_memoryCases.memory, 0u, VK_WHOLE_SIZE, 0u,
             &m_memoryCasesMap);
         if (!checkResult(result, "vkMapMemory(memory cases)",
@@ -3048,7 +3095,7 @@ namespace
             return false;
         }
 
-        std::array<VkDescriptorSetLayoutBinding, 3> bindings{};
+        std::array<VkDescriptorSetLayoutBinding, 4> bindings{};
         for (uint32_t index = 0u; index < bindings.size(); ++index)
         {
             bindings[index].binding = index;
@@ -3076,7 +3123,8 @@ namespace
         VkPushConstantRange pushConstantRange{};
         pushConstantRange.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
         pushConstantRange.offset = 0u;
-        pushConstantRange.size = sizeof(GsVulkanLinearCt32Sprite);
+        pushConstantRange.size =
+            sizeof(GsVulkanFeedbackLinearDepthCt32Sprite);
         VkPipelineLayoutCreateInfo pipelineLayoutInfo{};
         pipelineLayoutInfo.sType =
             VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
@@ -3171,7 +3219,13 @@ namespace
                 sizeof(kGsLinearCt32SpriteShaderSpv),
                 m_linearCt32SpriteShaderModule,
                 m_linearCt32SpritePipeline,
-                "linear CT32 texture sprite"))
+                "linear CT32 texture sprite") ||
+            !createComputePipeline(
+                kGsFeedbackLinearDepthCt32SpriteShaderSpv,
+                sizeof(kGsFeedbackLinearDepthCt32SpriteShaderSpv),
+                m_feedbackLinearDepthCt32SpriteShaderModule,
+                m_feedbackLinearDepthCt32SpritePipeline,
+                "feedback linear depth CT32 texture sprite"))
         {
             return false;
         }
@@ -3187,7 +3241,7 @@ namespace
 
         VkDescriptorPoolSize poolSize{};
         poolSize.type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-        poolSize.descriptorCount = 3u;
+        poolSize.descriptorCount = 4u;
         VkDescriptorPoolCreateInfo poolInfo{};
         poolInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
         poolInfo.maxSets = 1u;
@@ -3217,14 +3271,16 @@ namespace
             return false;
         }
 
-        std::array<VkDescriptorBufferInfo, 3> descriptorBuffers{};
+        std::array<VkDescriptorBufferInfo, 4> descriptorBuffers{};
         descriptorBuffers[0].buffer = m_vram.buffer;
         descriptorBuffers[0].range = GS_VULKAN_VRAM_SIZE;
         descriptorBuffers[1].buffer = m_memoryCases.buffer;
         descriptorBuffers[1].range = memoryCaseBytes;
         descriptorBuffers[2].buffer = m_memoryResults.buffer;
         descriptorBuffers[2].range = memoryResultBytes;
-        std::array<VkWriteDescriptorSet, 3> descriptorWrites{};
+        descriptorBuffers[3].buffer = m_feedbackSnapshot.buffer;
+        descriptorBuffers[3].range = GS_VULKAN_VRAM_SIZE;
+        std::array<VkWriteDescriptorSet, 4> descriptorWrites{};
         for (uint32_t index = 0u;
              index < descriptorWrites.size(); ++index)
         {
@@ -3369,7 +3425,7 @@ namespace
             0u,
         };
         return executeKernel(
-            input, {}, m_noopPipeline,
+            input, {}, {}, m_noopPipeline,
             GS_VULKAN_NOOP_GROUP_COUNT, 1u,
             &parameters, sizeof(parameters),
             output, nullptr, "VRAM round trip",
@@ -3411,7 +3467,7 @@ namespace
             GS_VULKAN_NOOP_LOCAL_SIZE;
         const GsVulkanElementParameters parameters{caseCount, 0u};
         return executeKernel(
-            input, cases, m_memoryPipeline, groupCount, 1u,
+            input, cases, {}, m_memoryPipeline, groupCount, 1u,
             &parameters, sizeof(parameters),
             output, &results, "memory-case batch",
             report, statistics, error);
@@ -3450,7 +3506,7 @@ namespace
         const uint32_t groupCountY =
             (height + localSize - 1u) / localSize;
         return executeKernel(
-            input, {}, m_spritePipeline,
+            input, {}, {}, m_spritePipeline,
             groupCountX, groupCountY,
             &sprite, sizeof(sprite), output, nullptr,
             "CT32 sprite", report, statistics, error);
@@ -3496,7 +3552,7 @@ namespace
         const uint32_t groupCountY =
             (height + localSize - 1u) / localSize;
         return executeKernel(
-            input, {}, m_depthCt32SpritePipeline,
+            input, {}, {}, m_depthCt32SpritePipeline,
             groupCountX, groupCountY,
             &sprite, sizeof(sprite), output, nullptr,
             "depth CT32 sprite", report, statistics, error);
@@ -3542,7 +3598,7 @@ namespace
         const uint32_t groupCountY =
             (height + localSize - 1u) / localSize;
         return executeKernel(
-            input, {}, m_nearestCt32SpritePipeline,
+            input, {}, {}, m_nearestCt32SpritePipeline,
             groupCountX, groupCountY,
             &sprite, sizeof(sprite), output, nullptr,
             "nearest CT32 texture sprite",
@@ -3589,10 +3645,65 @@ namespace
         const uint32_t groupCountY =
             (height + localSize - 1u) / localSize;
         return executeKernel(
-            input, {}, m_linearCt32SpritePipeline,
+            input, {}, {}, m_linearCt32SpritePipeline,
             groupCountX, groupCountY,
             &sprite, sizeof(sprite), output, nullptr,
             "linear CT32 texture sprite",
+            report, statistics, error);
+    }
+
+    bool VulkanExecutionContext::executeFeedbackLinearDepthCt32Sprite(
+        std::span<const uint8_t> input,
+        std::span<const uint8_t> feedbackSnapshot,
+        const GsVulkanFeedbackLinearDepthCt32Sprite &sprite,
+        std::vector<uint8_t> &output,
+        GsVulkanCapabilityReport &report,
+        GsVulkanServiceStatistics &statistics,
+        std::string &error)
+    {
+        if (!m_healthy)
+        {
+            error = "Vulkan GS service is not healthy";
+            return false;
+        }
+        if (m_feedbackLinearDepthCt32SpritePipeline == VK_NULL_HANDLE)
+        {
+            error =
+                "Vulkan device does not support exact feedback linear depth CT32 sprites";
+            return false;
+        }
+        if (input.size() != GS_VULKAN_VRAM_SIZE)
+        {
+            error =
+                "Vulkan feedback linear depth CT32 sprite requires exactly 4 MiB of canonical VRAM";
+            return false;
+        }
+        if (feedbackSnapshot.size() != GS_VULKAN_VRAM_SIZE)
+        {
+            error =
+                "Vulkan feedback linear depth CT32 sprite requires exactly 4 MiB of snapshot VRAM";
+            return false;
+        }
+        if (const char *validationError =
+                feedbackLinearDepthCt32SpriteValidationError(sprite))
+        {
+            error = validationError;
+            return false;
+        }
+
+        constexpr uint32_t localSize = 8u;
+        const uint32_t width = sprite.boundsX1 - sprite.boundsX0;
+        const uint32_t height = sprite.boundsY1 - sprite.boundsY0;
+        const uint32_t groupCountX =
+            (width + localSize - 1u) / localSize;
+        const uint32_t groupCountY =
+            (height + localSize - 1u) / localSize;
+        return executeKernel(
+            input, {}, feedbackSnapshot,
+            m_feedbackLinearDepthCt32SpritePipeline,
+            groupCountX, groupCountY,
+            &sprite, sizeof(sprite), output, nullptr,
+            "feedback linear depth CT32 texture sprite",
             report, statistics, error);
     }
 
@@ -3637,7 +3748,7 @@ namespace
         const uint32_t groupCountY =
             (height + localSize - 1u) / localSize;
         return executeKernel(
-            input, {}, m_trianglePipeline,
+            input, {}, {}, m_trianglePipeline,
             groupCountX, groupCountY,
             &triangle, sizeof(triangle), output, nullptr,
             "CT32 triangle", report, statistics, error);
@@ -4575,6 +4686,7 @@ namespace
     bool VulkanExecutionContext::executeKernel(
         std::span<const uint8_t> input,
         std::span<const GsVulkanMemoryCase> cases,
+        std::span<const uint8_t> feedbackSnapshot,
         VkPipeline pipeline,
         uint32_t groupCountX,
         uint32_t groupCountY,
@@ -4588,12 +4700,16 @@ namespace
         std::string &error)
     {
         const bool memoryOperation = results != nullptr;
+        const bool feedbackOperation = !feedbackSnapshot.empty();
         if (pipeline == VK_NULL_HANDLE ||
             groupCountX == 0u || groupCountY == 0u ||
             !pushConstants || pushConstantSize == 0u ||
-            pushConstantSize > sizeof(GsVulkanLinearCt32Sprite) ||
+            pushConstantSize >
+                sizeof(GsVulkanFeedbackLinearDepthCt32Sprite) ||
             (pushConstantSize & 3u) != 0u ||
-            memoryOperation != !cases.empty())
+            memoryOperation != !cases.empty() ||
+            (feedbackOperation &&
+             feedbackSnapshot.size() != GS_VULKAN_VRAM_SIZE))
         {
             error = "invalid Vulkan GS kernel request";
             return false;
@@ -4602,6 +4718,13 @@ namespace
         const uint32_t validationErrorsBefore =
             m_validation.errors.load(std::memory_order_relaxed);
         std::memcpy(m_stagingMap, input.data(), input.size());
+        if (feedbackOperation)
+        {
+            std::memcpy(
+                m_feedbackStagingMap,
+                feedbackSnapshot.data(),
+                feedbackSnapshot.size());
+        }
         const VkDeviceSize caseBytes =
             sizeof(GsVulkanMemoryCase) * cases.size();
         const VkDeviceSize resultBytes =
@@ -4615,6 +4738,10 @@ namespace
 
         if (!flushMappedAllocation(
                 m_staging, "VRAM", report, error) ||
+            (feedbackOperation &&
+             !flushMappedAllocation(
+                 m_feedbackStaging,
+                 "feedback snapshot", report, error)) ||
             (memoryOperation &&
              !flushMappedAllocation(
                  m_memoryCases, "memory cases", report, error)) ||
@@ -4641,6 +4768,33 @@ namespace
             VK_PIPELINE_STAGE_TRANSFER_BIT,
             0u, 0u, nullptr, 1u, &stagingUploadBarrier,
             0u, nullptr);
+
+        if (feedbackOperation)
+        {
+            VkBufferMemoryBarrier feedbackStagingUploadBarrier{};
+            feedbackStagingUploadBarrier.sType =
+                VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
+            feedbackStagingUploadBarrier.srcAccessMask =
+                VK_ACCESS_HOST_WRITE_BIT;
+            feedbackStagingUploadBarrier.dstAccessMask =
+                VK_ACCESS_TRANSFER_READ_BIT;
+            feedbackStagingUploadBarrier.srcQueueFamilyIndex =
+                VK_QUEUE_FAMILY_IGNORED;
+            feedbackStagingUploadBarrier.dstQueueFamilyIndex =
+                VK_QUEUE_FAMILY_IGNORED;
+            feedbackStagingUploadBarrier.buffer =
+                m_feedbackStaging.buffer;
+            feedbackStagingUploadBarrier.offset = 0u;
+            feedbackStagingUploadBarrier.size =
+                GS_VULKAN_VRAM_SIZE;
+            m_functions.cmdPipelineBarrier(
+                m_commandBuffer,
+                VK_PIPELINE_STAGE_HOST_BIT,
+                VK_PIPELINE_STAGE_TRANSFER_BIT,
+                0u, 0u, nullptr, 1u,
+                &feedbackStagingUploadBarrier,
+                0u, nullptr);
+        }
 
         if (memoryOperation)
         {
@@ -4669,6 +4823,14 @@ namespace
         m_functions.cmdCopyBuffer(
             m_commandBuffer, m_staging.buffer, m_vram.buffer,
             1u, &copyRegion);
+        if (feedbackOperation)
+        {
+            m_functions.cmdCopyBuffer(
+                m_commandBuffer,
+                m_feedbackStaging.buffer,
+                m_feedbackSnapshot.buffer,
+                1u, &copyRegion);
+        }
 
         VkBufferMemoryBarrier uploadComputeBarrier{};
         uploadComputeBarrier.sType =
@@ -4689,6 +4851,33 @@ namespace
             VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
             0u, 0u, nullptr, 1u, &uploadComputeBarrier,
             0u, nullptr);
+
+        if (feedbackOperation)
+        {
+            VkBufferMemoryBarrier feedbackUploadComputeBarrier{};
+            feedbackUploadComputeBarrier.sType =
+                VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
+            feedbackUploadComputeBarrier.srcAccessMask =
+                VK_ACCESS_TRANSFER_WRITE_BIT;
+            feedbackUploadComputeBarrier.dstAccessMask =
+                VK_ACCESS_SHADER_READ_BIT;
+            feedbackUploadComputeBarrier.srcQueueFamilyIndex =
+                VK_QUEUE_FAMILY_IGNORED;
+            feedbackUploadComputeBarrier.dstQueueFamilyIndex =
+                VK_QUEUE_FAMILY_IGNORED;
+            feedbackUploadComputeBarrier.buffer =
+                m_feedbackSnapshot.buffer;
+            feedbackUploadComputeBarrier.offset = 0u;
+            feedbackUploadComputeBarrier.size =
+                GS_VULKAN_VRAM_SIZE;
+            m_functions.cmdPipelineBarrier(
+                m_commandBuffer,
+                VK_PIPELINE_STAGE_TRANSFER_BIT,
+                VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                0u, 0u, nullptr, 1u,
+                &feedbackUploadComputeBarrier,
+                0u, nullptr);
+        }
 
         m_functions.cmdBindPipeline(
             m_commandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE,
@@ -4773,7 +4962,9 @@ namespace
 
         if (!submitCommands(
                 operationName, 1u,
-                memoryOperation ? 6u : 4u, 1u,
+                (memoryOperation ? 6u : 4u) +
+                    (feedbackOperation ? 2u : 0u),
+                1u,
                 report, statistics, error) ||
             !invalidateMappedAllocation(
                 m_staging, "VRAM", report, error) ||
@@ -4804,6 +4995,8 @@ namespace
         if (results)
             *results = std::move(completedResults);
         statistics.bytesUploaded += GS_VULKAN_VRAM_SIZE;
+        if (feedbackOperation)
+            statistics.bytesUploaded += GS_VULKAN_VRAM_SIZE;
         statistics.bytesDownloaded += GS_VULKAN_VRAM_SIZE;
         error.clear();
         return true;
@@ -4825,6 +5018,12 @@ namespace
         if (m_stagingMap && m_functions.unmapMemory)
             m_functions.unmapMemory(m_device, m_staging.memory);
         m_stagingMap = nullptr;
+        if (m_feedbackStagingMap && m_functions.unmapMemory)
+        {
+            m_functions.unmapMemory(
+                m_device, m_feedbackStaging.memory);
+        }
+        m_feedbackStagingMap = nullptr;
         if (m_fence != VK_NULL_HANDLE && m_functions.destroyFence)
             m_functions.destroyFence(m_device, m_fence, nullptr);
         m_fence = VK_NULL_HANDLE;
@@ -4858,6 +5057,25 @@ namespace
                 m_device, m_triangleShaderModule, nullptr);
         }
         m_triangleShaderModule = VK_NULL_HANDLE;
+        if (m_feedbackLinearDepthCt32SpritePipeline != VK_NULL_HANDLE &&
+            m_functions.destroyPipeline)
+        {
+            m_functions.destroyPipeline(
+                m_device,
+                m_feedbackLinearDepthCt32SpritePipeline,
+                nullptr);
+        }
+        m_feedbackLinearDepthCt32SpritePipeline = VK_NULL_HANDLE;
+        if (m_feedbackLinearDepthCt32SpriteShaderModule !=
+                VK_NULL_HANDLE &&
+            m_functions.destroyShaderModule)
+        {
+            m_functions.destroyShaderModule(
+                m_device,
+                m_feedbackLinearDepthCt32SpriteShaderModule,
+                nullptr);
+        }
+        m_feedbackLinearDepthCt32SpriteShaderModule = VK_NULL_HANDLE;
         if (m_linearCt32SpritePipeline != VK_NULL_HANDLE &&
             m_functions.destroyPipeline)
         {
@@ -4978,6 +5196,8 @@ namespace
         };
         destroyAllocation(m_memoryResults);
         destroyAllocation(m_memoryCases);
+        destroyAllocation(m_feedbackStaging);
+        destroyAllocation(m_feedbackSnapshot);
         destroyAllocation(m_staging);
         destroyAllocation(m_vram);
 
@@ -5001,6 +5221,7 @@ enum class GsVulkanRequestKind : uint8_t
     DepthCt32Sprite,
     NearestCt32Sprite,
     LinearCt32Sprite,
+    FeedbackLinearDepthCt32Sprite,
     Ct32Triangle,
     UploadPages,
     DownloadPages,
@@ -5076,6 +5297,12 @@ struct GsVulkanService::Impl final
                          GsVulkanRequestKind::LinearCt32Sprite)
                 {
                     ++statistics.linearCt32SpriteDrawsFailed;
+                }
+                else if (activeRequestKind ==
+                         GsVulkanRequestKind::FeedbackLinearDepthCt32Sprite)
+                {
+                    ++statistics
+                          .feedbackLinearDepthCt32SpriteDrawsFailed;
                 }
                 else if (activeRequestKind ==
                          GsVulkanRequestKind::Ct32Triangle)
@@ -5177,11 +5404,14 @@ struct GsVulkanService::Impl final
         for (;;)
         {
             std::vector<uint8_t> input;
+            std::vector<uint8_t> feedbackSnapshot;
             std::vector<GsVulkanMemoryCase> memoryCases;
             std::vector<GsVulkanCt32Sprite> sprites;
             std::vector<GsVulkanDepthCt32Sprite> depthCt32Sprites;
             std::vector<GsVulkanNearestCt32Sprite> nearestCt32Sprites;
             std::vector<GsVulkanLinearCt32Sprite> linearCt32Sprites;
+            std::vector<GsVulkanFeedbackLinearDepthCt32Sprite>
+                feedbackLinearDepthCt32Sprites;
             std::vector<GsVulkanCt32Triangle> triangles;
             GsVramPageMask pages;
             GsVulkanRequestKind kind =
@@ -5195,6 +5425,8 @@ struct GsVulkanService::Impl final
                 if (stopping && !requestPending)
                     break;
                 input = std::move(requestInput);
+                feedbackSnapshot =
+                    std::move(requestFeedbackSnapshot);
                 memoryCases = std::move(requestMemoryCases);
                 sprites = std::move(requestSprites);
                 depthCt32Sprites =
@@ -5203,6 +5435,9 @@ struct GsVulkanService::Impl final
                     std::move(requestNearestCt32Sprites);
                 linearCt32Sprites =
                     std::move(requestLinearCt32Sprites);
+                feedbackLinearDepthCt32Sprites =
+                    std::move(
+                        requestFeedbackLinearDepthCt32Sprites);
                 triangles = std::move(requestTriangles);
                 pages = requestPages;
                 kind = requestKind;
@@ -5257,6 +5492,19 @@ struct GsVulkanService::Impl final
                     input, linearCt32Sprites.front(), output,
                     localCapabilities, localStatistics,
                     operationError);
+            }
+            else if (kind ==
+                     GsVulkanRequestKind::FeedbackLinearDepthCt32Sprite)
+            {
+                succeeded =
+                    context.executeFeedbackLinearDepthCt32Sprite(
+                        input,
+                        feedbackSnapshot,
+                        feedbackLinearDepthCt32Sprites.front(),
+                        output,
+                        localCapabilities,
+                        localStatistics,
+                        operationError);
             }
             else if (kind == GsVulkanRequestKind::Ct32Triangle)
             {
@@ -5397,6 +5645,28 @@ struct GsVulkanService::Impl final
                 else
                 {
                     ++localStatistics.linearCt32SpriteDrawsFailed;
+                }
+            }
+            else if (kind ==
+                     GsVulkanRequestKind::FeedbackLinearDepthCt32Sprite)
+            {
+                if (succeeded)
+                {
+                    const GsVulkanFeedbackLinearDepthCt32Sprite &sprite =
+                        feedbackLinearDepthCt32Sprites.front();
+                    ++localStatistics
+                          .feedbackLinearDepthCt32SpriteDrawsCompleted;
+                    localStatistics
+                        .feedbackLinearDepthCt32SpritePixelsExecuted +=
+                        static_cast<uint64_t>(
+                            sprite.boundsX1 - sprite.boundsX0) *
+                        static_cast<uint64_t>(
+                            sprite.boundsY1 - sprite.boundsY0);
+                }
+                else
+                {
+                    ++localStatistics
+                          .feedbackLinearDepthCt32SpriteDrawsFailed;
                 }
             }
             else if (kind == GsVulkanRequestKind::Ct32Triangle)
@@ -5625,11 +5895,14 @@ struct GsVulkanService::Impl final
     bool executeRequest(
         GsVulkanRequestKind kind,
         std::vector<uint8_t> input,
+        std::vector<uint8_t> feedbackSnapshot,
         std::vector<GsVulkanMemoryCase> memoryCases,
         std::vector<GsVulkanCt32Sprite> sprites,
         std::vector<GsVulkanDepthCt32Sprite> depthCt32Sprites,
         std::vector<GsVulkanNearestCt32Sprite> nearestCt32Sprites,
         std::vector<GsVulkanLinearCt32Sprite> linearCt32Sprites,
+        std::vector<GsVulkanFeedbackLinearDepthCt32Sprite>
+            feedbackLinearDepthCt32Sprites,
         std::vector<GsVulkanCt32Triangle> triangles,
         GsVramPageMask pages,
         std::vector<uint8_t> &output,
@@ -5656,11 +5929,14 @@ struct GsVulkanService::Impl final
 
         requestKind = kind;
         requestInput = std::move(input);
+        requestFeedbackSnapshot = std::move(feedbackSnapshot);
         requestMemoryCases = std::move(memoryCases);
         requestSprites = std::move(sprites);
         requestDepthCt32Sprites = std::move(depthCt32Sprites);
         requestNearestCt32Sprites = std::move(nearestCt32Sprites);
         requestLinearCt32Sprites = std::move(linearCt32Sprites);
+        requestFeedbackLinearDepthCt32Sprites =
+            std::move(feedbackLinearDepthCt32Sprites);
         requestTriangles = std::move(triangles);
         requestPages = pages;
         responseOutput.clear();
@@ -5729,11 +6005,14 @@ struct GsVulkanService::Impl final
     GsVulkanServiceStatistics statistics;
     std::string initializationError;
     std::vector<uint8_t> requestInput;
+    std::vector<uint8_t> requestFeedbackSnapshot;
     std::vector<GsVulkanMemoryCase> requestMemoryCases;
     std::vector<GsVulkanCt32Sprite> requestSprites;
     std::vector<GsVulkanDepthCt32Sprite> requestDepthCt32Sprites;
     std::vector<GsVulkanNearestCt32Sprite> requestNearestCt32Sprites;
     std::vector<GsVulkanLinearCt32Sprite> requestLinearCt32Sprites;
+    std::vector<GsVulkanFeedbackLinearDepthCt32Sprite>
+        requestFeedbackLinearDepthCt32Sprites;
     std::vector<GsVulkanCt32Triangle> requestTriangles;
     GsVramPageMask requestPages;
     std::vector<uint8_t> responseOutput;
@@ -5864,8 +6143,9 @@ bool GsVulkanService::roundTripVram(
 
     return m_impl->executeRequest(
         GsVulkanRequestKind::RoundTrip,
-        std::vector<uint8_t>(input.begin(), input.end()), {},
-        {}, {}, {}, {}, {}, {}, output, nullptr, error);
+        std::vector<uint8_t>(input.begin(), input.end()),
+        {}, {}, {}, {}, {}, {}, {}, {}, {},
+        output, nullptr, error);
 #endif
 }
 
@@ -5947,9 +6227,11 @@ bool GsVulkanService::executeMemoryCases(
     return m_impl->executeRequest(
         GsVulkanRequestKind::MemoryCases,
         std::vector<uint8_t>(input.begin(), input.end()),
+        {},
         std::vector<GsVulkanMemoryCase>(
             cases.begin(), cases.end()),
-        {}, {}, {}, {}, {}, {}, output, &results, error);
+        {}, {}, {}, {}, {}, {}, {},
+        output, &results, error);
 #endif
 }
 
@@ -5984,8 +6266,9 @@ bool GsVulkanService::executeCt32Sprite(
 
     return m_impl->executeRequest(
         GsVulkanRequestKind::Ct32Sprite,
-        std::vector<uint8_t>(input.begin(), input.end()), {},
-        std::vector<GsVulkanCt32Sprite>{sprite}, {}, {}, {}, {}, {},
+        std::vector<uint8_t>(input.begin(), input.end()),
+        {}, {}, std::vector<GsVulkanCt32Sprite>{sprite},
+        {}, {}, {}, {}, {}, {},
         output, nullptr, error);
 #endif
 }
@@ -6038,8 +6321,9 @@ bool GsVulkanService::executeDepthCt32Sprite(
     return m_impl->executeRequest(
         GsVulkanRequestKind::DepthCt32Sprite,
         std::vector<uint8_t>(input.begin(), input.end()),
-        {}, {}, std::vector<GsVulkanDepthCt32Sprite>{sprite},
-        {}, {}, {}, {}, output, nullptr, error);
+        {}, {}, {}, std::vector<GsVulkanDepthCt32Sprite>{sprite},
+        {}, {}, {}, {}, {},
+        output, nullptr, error);
 #endif
 }
 
@@ -6091,8 +6375,10 @@ bool GsVulkanService::executeNearestCt32Sprite(
     return m_impl->executeRequest(
         GsVulkanRequestKind::NearestCt32Sprite,
         std::vector<uint8_t>(input.begin(), input.end()),
-        {}, {}, {}, std::vector<GsVulkanNearestCt32Sprite>{sprite},
-        {}, {}, {}, output, nullptr, error);
+        {}, {}, {}, {},
+        std::vector<GsVulkanNearestCt32Sprite>{sprite},
+        {}, {}, {}, {},
+        output, nullptr, error);
 #endif
 }
 
@@ -6144,8 +6430,79 @@ bool GsVulkanService::executeLinearCt32Sprite(
     return m_impl->executeRequest(
         GsVulkanRequestKind::LinearCt32Sprite,
         std::vector<uint8_t>(input.begin(), input.end()),
-        {}, {}, {}, {}, std::vector<GsVulkanLinearCt32Sprite>{sprite},
-        {}, {}, output, nullptr, error);
+        {}, {}, {}, {}, {},
+        std::vector<GsVulkanLinearCt32Sprite>{sprite},
+        {}, {}, {},
+        output, nullptr, error);
+#endif
+}
+
+bool GsVulkanService::executeFeedbackLinearDepthCt32Sprite(
+    std::span<const uint8_t> input,
+    std::span<const uint8_t> feedbackSnapshot,
+    const GsVulkanFeedbackLinearDepthCt32Sprite &sprite,
+    std::vector<uint8_t> &output,
+    std::string *error)
+{
+#if !PS2X_HAS_GS_VULKAN
+    (void)input;
+    (void)feedbackSnapshot;
+    (void)sprite;
+    (void)output;
+    if (error)
+        *error = "Vulkan GS support was compiled out";
+    return false;
+#else
+    if (input.size() != GS_VULKAN_VRAM_SIZE)
+    {
+        if (error)
+        {
+            *error =
+                "Vulkan feedback linear depth CT32 sprite requires exactly 4 MiB of canonical VRAM";
+        }
+        return false;
+    }
+    if (feedbackSnapshot.size() != GS_VULKAN_VRAM_SIZE)
+    {
+        if (error)
+        {
+            *error =
+                "Vulkan feedback linear depth CT32 sprite requires exactly 4 MiB of snapshot VRAM";
+        }
+        return false;
+    }
+    if (const char *validationError =
+            feedbackLinearDepthCt32SpriteValidationError(sprite))
+    {
+        if (error)
+            *error = validationError;
+        return false;
+    }
+    {
+        std::lock_guard lock(m_impl->stateMutex);
+        const GsVulkanDeviceReport *selected =
+            m_impl->capabilities.selectedDevice();
+        if (!selected ||
+            !selected->exactFeedbackLinearDepthCt32Sprite)
+        {
+            if (error)
+            {
+                *error =
+                    "Vulkan device does not support exact feedback linear depth CT32 sprites";
+            }
+            return false;
+        }
+    }
+
+    return m_impl->executeRequest(
+        GsVulkanRequestKind::FeedbackLinearDepthCt32Sprite,
+        std::vector<uint8_t>(input.begin(), input.end()),
+        std::vector<uint8_t>(
+            feedbackSnapshot.begin(), feedbackSnapshot.end()),
+        {}, {}, {}, {}, {},
+        std::vector<GsVulkanFeedbackLinearDepthCt32Sprite>{sprite},
+        {}, {},
+        output, nullptr, error);
 #endif
 }
 
@@ -6197,7 +6554,8 @@ bool GsVulkanService::executeCt32Triangle(
     return m_impl->executeRequest(
         GsVulkanRequestKind::Ct32Triangle,
         std::vector<uint8_t>(input.begin(), input.end()),
-        {}, {}, {}, {}, {}, std::vector<GsVulkanCt32Triangle>{triangle}, {},
+        {}, {}, {}, {}, {}, {}, {},
+        std::vector<GsVulkanCt32Triangle>{triangle}, {},
         output, nullptr, error);
 #endif
 }
@@ -6244,7 +6602,8 @@ bool GsVulkanService::uploadVramPages(
     std::vector<uint8_t> unusedOutput;
     return m_impl->executeRequest(
         GsVulkanRequestKind::UploadPages,
-        std::move(packed), {}, {}, {}, {}, {}, {}, pages,
+        std::move(packed),
+        {}, {}, {}, {}, {}, {}, {}, {}, pages,
         unusedOutput, nullptr, error);
 #endif
 }
@@ -6277,7 +6636,8 @@ bool GsVulkanService::downloadVramPages(
     std::vector<uint8_t> packed;
     if (!m_impl->executeRequest(
             GsVulkanRequestKind::DownloadPages,
-            {}, {}, {}, {}, {}, {}, {}, pages, packed, nullptr, error))
+            {}, {}, {}, {}, {}, {}, {}, {}, {}, pages,
+            packed, nullptr, error))
     {
         return false;
     }
@@ -6335,10 +6695,11 @@ bool GsVulkanService::executeResidentCt32Sprites(
     std::vector<uint8_t> unusedOutput;
     return m_impl->executeRequest(
         GsVulkanRequestKind::ResidentCt32Sprites,
-        {}, {},
+        {}, {}, {},
         std::vector<GsVulkanCt32Sprite>(
             sprites.begin(), sprites.end()),
-        {}, {}, {}, {}, {}, unusedOutput, nullptr, error);
+        {}, {}, {}, {}, {}, {},
+        unusedOutput, nullptr, error);
 #endif
 }
 
@@ -6387,10 +6748,11 @@ bool GsVulkanService::executeResidentNearestCt32Sprites(
     std::vector<uint8_t> unusedOutput;
     return m_impl->executeRequest(
         GsVulkanRequestKind::ResidentNearestCt32Sprites,
-        {}, {}, {}, {},
+        {}, {}, {}, {}, {},
         std::vector<GsVulkanNearestCt32Sprite>(
             sprites.begin(), sprites.end()),
-        {}, {}, {}, unusedOutput, nullptr, error);
+        {}, {}, {}, {},
+        unusedOutput, nullptr, error);
 #endif
 }
 
@@ -6447,10 +6809,11 @@ bool GsVulkanService::executeResidentDepthCt32Sprites(
     std::vector<uint8_t> unusedOutput;
     return m_impl->executeRequest(
         GsVulkanRequestKind::ResidentDepthCt32Sprites,
-        {}, {}, {},
+        {}, {}, {}, {},
         std::vector<GsVulkanDepthCt32Sprite>(
             sprites.begin(), sprites.end()),
-        {}, {}, {}, {}, unusedOutput, nullptr, error);
+        {}, {}, {}, {}, {},
+        unusedOutput, nullptr, error);
 #endif
 }
 
@@ -6490,10 +6853,11 @@ bool GsVulkanService::executeResidentLinearCt32Sprites(
     std::vector<uint8_t> unusedOutput;
     return m_impl->executeRequest(
         GsVulkanRequestKind::ResidentLinearCt32Sprites,
-        {}, {}, {}, {}, {},
+        {}, {}, {}, {}, {}, {},
         std::vector<GsVulkanLinearCt32Sprite>(
             sprites.begin(), sprites.end()),
-        {}, {}, unusedOutput, nullptr, error);
+        {}, {}, {},
+        unusedOutput, nullptr, error);
 #endif
 }
 
@@ -6540,7 +6904,7 @@ bool GsVulkanService::executeResidentCt32Triangles(
     std::vector<uint8_t> unusedOutput;
     return m_impl->executeRequest(
         GsVulkanRequestKind::ResidentCt32Triangles,
-        {}, {}, {}, {}, {}, {},
+        {}, {}, {}, {}, {}, {}, {}, {},
         std::vector<GsVulkanCt32Triangle>(
             triangles.begin(), triangles.end()),
         {}, unusedOutput, nullptr, error);

@@ -1652,6 +1652,8 @@ namespace
                 exactLinearCt32Sprite_;
             report.devices[0].exactDepthCt32Sprite =
                 exactDepthCt32Sprite_;
+            report.devices[0].exactFeedbackLinearDepthCt32Sprite =
+                exactLinearCt32Sprite_ && exactDepthCt32Sprite_;
         }
 
         bool executeCt32Sprite(
@@ -1829,6 +1831,54 @@ namespace
             ++serviceStatistics.queueSubmissions;
             ++serviceStatistics.shaderDispatches;
             serviceStatistics.pipelineBarriers += 4u;
+            ++serviceStatistics.pipelineBinds;
+            ++serviceStatistics.pipelineCacheHits;
+            ++serviceStatistics.fenceWaits;
+            if (error)
+                error->clear();
+            return true;
+        }
+
+        bool executeFeedbackLinearDepthCt32Sprite(
+            std::span<const uint8_t> input,
+            std::span<const uint8_t> feedbackSnapshot,
+            const GsVulkanFeedbackLinearDepthCt32Sprite &sprite,
+            std::vector<uint8_t> &output,
+            std::string *error) override
+        {
+            if (!isHealthy || behavior == Behavior::Fail ||
+                !report.devices[0]
+                     .exactFeedbackLinearDepthCt32Sprite ||
+                input.size() != GS_VULKAN_VRAM_SIZE ||
+                feedbackSnapshot.size() != GS_VULKAN_VRAM_SIZE)
+            {
+                ++serviceStatistics
+                      .feedbackLinearDepthCt32SpriteDrawsFailed;
+                if (error)
+                    *error = "injected feedback linear depth executor failure";
+                return false;
+            }
+
+            residentVram.assign(input.begin(), input.end());
+            if (behavior == Behavior::Exact)
+            {
+                applyFeedbackLinearDepthCt32SpriteCpu(
+                    residentVram, feedbackSnapshot, sprite);
+            }
+            output = residentVram;
+            if (behavior == Behavior::InvalidOutput)
+                output.resize(1u);
+            ++serviceStatistics
+                  .feedbackLinearDepthCt32SpriteDrawsCompleted;
+            serviceStatistics
+                .feedbackLinearDepthCt32SpritePixelsExecuted +=
+                static_cast<uint64_t>(
+                    sprite.boundsX1 - sprite.boundsX0) *
+                static_cast<uint64_t>(
+                    sprite.boundsY1 - sprite.boundsY0);
+            ++serviceStatistics.queueSubmissions;
+            ++serviceStatistics.shaderDispatches;
+            serviceStatistics.pipelineBarriers += 6u;
             ++serviceStatistics.pipelineBinds;
             ++serviceStatistics.pipelineCacheHits;
             ++serviceStatistics.fenceWaits;
@@ -12816,6 +12866,10 @@ void register_ps2_gs_vulkan_tests()
                     device.exactLinearCt32Sprite,
                     device.suitable,
                     "the linear CT32 capability should expose its raw-VRAM hard gate");
+                t.Equals(
+                    device.exactFeedbackLinearDepthCt32Sprite,
+                    device.suitable,
+                    "the feedback linear/depth capability should expose its snapshot-buffer hard gate");
                 if (!device.suitable)
                     continue;
                 t.IsTrue(device.exactVramStorage && device.computeQueue &&
@@ -14030,6 +14084,240 @@ void register_ps2_gs_vulkan_tests()
                 statistics.validationWarnings, 0u,
                 "source-over depth execution should emit no validation warnings");
             service->shutdown();
+        });
+
+        tc.Run("Vulkan feedback linear depth sprites use an immutable texture snapshot", [](TestCase &t)
+        {
+            GSMem::InitLookupTables();
+            const std::array<GsDrawCommand, 2> commands{{
+                makeFeedbackLinearDepthCt32SpriteCommand(
+                    30'200u, 4u, 1u, 200u, GS_PSM_Z24, false, 1u,
+                    6u, 5u,
+                    {0u, 63u, 0u, 31u}, {0u, 0u},
+                    {0u, 128u}, {0u, 128u},
+                    {128u, 256u}, {0u, 128u},
+                    0x00123456u),
+                makeFeedbackLinearDepthCt32SpriteCommand(
+                    30'201u, 4u, 1u, 200u, GS_PSM_Z24, false, 1u,
+                    6u, 5u,
+                    {0u, 63u, 0u, 31u}, {0u, 0u},
+                    {128u, 256u}, {0u, 128u},
+                    {0u, 128u}, {0u, 128u},
+                    0x00654321u),
+            }};
+            std::array<GsVulkanFeedbackLinearDepthCt32Sprite, 2> sprites{};
+            for (size_t index = 0u; index < commands.size(); ++index)
+            {
+                const GsBackendDecision decision =
+                    prepareGsVulkanFeedbackLinearDepthCt32Sprite(
+                        commands[index], sprites[index]);
+                if (!decision.supported)
+                {
+                    t.Fail(
+                        "synthetic feedback linear depth sprite was rejected as " +
+                        std::string(gsFallbackReasonName(decision.reason)));
+                    return;
+                }
+            }
+
+            GsVulkanCapabilityReport preflight{};
+            const GsVulkanServiceConfig config =
+                makeRendererServiceConfig(preflight);
+            GsVulkanCapabilityReport creationReport{};
+            std::string creationError;
+            std::unique_ptr<GsVulkanService> service =
+                GsVulkanService::create(
+                    config, &creationReport, &creationError);
+            if (!preflight.ready())
+            {
+                t.IsNull(
+                    service.get(),
+                    "an unavailable host should skip feedback execution cleanly");
+                return;
+            }
+            t.IsNotNull(
+                service.get(),
+                "a suitable device should create the feedback sprite service");
+            if (!service)
+                return;
+            const GsVulkanDeviceReport *selected =
+                creationReport.selectedDevice();
+            t.IsNotNull(
+                selected,
+                "the feedback service should retain its selected device");
+            if (!selected)
+                return;
+            t.IsTrue(
+                selected->exactFeedbackLinearDepthCt32Sprite,
+                "the selected device should publish immutable feedback execution");
+            if (!selected->exactFeedbackLinearDepthCt32Sprite)
+            {
+                service->shutdown();
+                return;
+            }
+
+            const std::vector<uint8_t> initial =
+                makeVramPattern(0x46424750u);
+            const std::vector<uint8_t> feedbackSnapshot = initial;
+            std::vector<uint8_t> expected = initial;
+            std::vector<uint8_t> actual = initial;
+            uint64_t expectedPixels = 0u;
+            for (size_t index = 0u; index < sprites.size(); ++index)
+            {
+                applyFeedbackLinearDepthCt32SpriteCpu(
+                    expected, feedbackSnapshot, sprites[index]);
+                std::vector<uint8_t> completed = {0xA5u};
+                std::string operationError;
+                if (!service->executeFeedbackLinearDepthCt32Sprite(
+                        actual, feedbackSnapshot, sprites[index],
+                        completed, &operationError))
+                {
+                    t.Fail(
+                        "GPU feedback linear depth sprite " +
+                        std::to_string(index) + " failed: " +
+                        operationError);
+                    service->shutdown();
+                    return;
+                }
+                if (completed != expected)
+                {
+                    t.Fail(
+                        "GPU feedback linear depth sprite " +
+                        std::to_string(index) +
+                        " disagreed with the complete immutable-snapshot oracle");
+                    service->shutdown();
+                    return;
+                }
+                actual = std::move(completed);
+                expectedPixels +=
+                    static_cast<uint64_t>(
+                        sprites[index].boundsX1 -
+                        sprites[index].boundsX0) *
+                    static_cast<uint64_t>(
+                        sprites[index].boundsY1 -
+                        sprites[index].boundsY0);
+            }
+
+            const auto expectRejected = [&t, &service](
+                std::span<const uint8_t> input,
+                std::span<const uint8_t> snapshot,
+                const GsVulkanFeedbackLinearDepthCt32Sprite &sprite,
+                const std::string &label)
+            {
+                std::vector<uint8_t> output = {0x12u, 0x34u};
+                const std::vector<uint8_t> sentinel = output;
+                std::string error;
+                t.IsFalse(
+                    service->executeFeedbackLinearDepthCt32Sprite(
+                        input, snapshot, sprite, output, &error),
+                    label + " should fail closed");
+                t.IsTrue(
+                    output == sentinel,
+                    label + " must preserve caller output");
+                t.IsFalse(
+                    error.empty(),
+                    label + " should retain a diagnostic");
+            };
+            const std::vector<uint8_t> shortVram(
+                GS_VULKAN_VRAM_SIZE - 1u, 0u);
+            expectRejected(
+                shortVram, feedbackSnapshot, sprites.front(),
+                "short canonical feedback VRAM input");
+            expectRejected(
+                actual, shortVram, sprites.front(),
+                "short immutable feedback snapshot");
+            GsVulkanFeedbackLinearDepthCt32Sprite invalid =
+                sprites.front();
+            invalid.textureSource = 0u;
+            expectRejected(
+                actual, feedbackSnapshot, invalid,
+                "in-place feedback texture source");
+            invalid = sprites.front();
+            invalid.reserved1 = 1u;
+            expectRejected(
+                actual, feedbackSnapshot, invalid,
+                "feedback reserved data");
+            invalid = sprites.front();
+            invalid.depthBaseBlock = invalid.framebufferBaseBlock;
+            expectRejected(
+                actual, feedbackSnapshot, invalid,
+                "feedback depth and color alias");
+
+            const GsVulkanServiceStatistics statistics =
+                service->statistics();
+            t.Equals(
+                statistics.feedbackLinearDepthCt32SpriteDrawsCompleted,
+                static_cast<uint64_t>(sprites.size()),
+                "every feedback sprite should complete exactly once");
+            t.Equals(
+                statistics.feedbackLinearDepthCt32SpriteDrawsFailed,
+                0ull,
+                "caller-side feedback rejection should not count as GPU work");
+            t.Equals(
+                statistics.feedbackLinearDepthCt32SpritePixelsExecuted,
+                expectedPixels,
+                "feedback statistics should count exact candidate pixels");
+            t.Equals(
+                statistics.linearCt32SpriteDrawsCompleted,
+                0ull,
+                "feedback execution should not pollute disjoint linear counters");
+            t.Equals(
+                statistics.depthCt32SpriteDrawsCompleted,
+                0ull,
+                "feedback execution should not pollute flat depth counters");
+            t.Equals(
+                statistics.queueSubmissions,
+                static_cast<uint64_t>(sprites.size()),
+                "each raw feedback request should submit once");
+            t.Equals(
+                statistics.shaderDispatches,
+                static_cast<uint64_t>(sprites.size()),
+                "each raw feedback request should dispatch once");
+            t.Equals(
+                statistics.pipelineBarriers,
+                static_cast<uint64_t>(sprites.size()) * 6u,
+                "each raw feedback request should synchronize both uploads");
+            t.Equals(
+                statistics.bytesUploaded,
+                static_cast<uint64_t>(sprites.size()) *
+                    GS_VULKAN_VRAM_SIZE * 2u,
+                "each feedback request should upload canonical and snapshot VRAM");
+            t.Equals(
+                statistics.bytesDownloaded,
+                static_cast<uint64_t>(sprites.size()) *
+                    GS_VULKAN_VRAM_SIZE,
+                "each feedback request should download only canonical VRAM");
+            t.Equals(
+                statistics.validationErrors,
+                0u,
+                "feedback execution must remain validation-clean");
+            t.Equals(
+                statistics.validationWarnings,
+                0u,
+                "feedback execution should emit no validation warnings");
+            t.IsTrue(
+                service->healthy(),
+                "successful and rejected feedback work should leave the service healthy");
+
+            service->shutdown();
+            service->shutdown();
+            const GsVulkanServiceStatistics shutdownStatistics =
+                service->statistics();
+            t.Equals(
+                shutdownStatistics.validationErrors,
+                0u,
+                "feedback pipeline destruction must remain validation-clean");
+            std::vector<uint8_t> shutdownOutput = {0xABu};
+            const std::vector<uint8_t> shutdownSentinel = shutdownOutput;
+            std::string shutdownError;
+            t.IsFalse(
+                service->executeFeedbackLinearDepthCt32Sprite(
+                    actual, feedbackSnapshot, sprites.front(),
+                    shutdownOutput, &shutdownError),
+                "a stopped service must reject feedback work");
+            t.IsTrue(
+                shutdownOutput == shutdownSentinel,
+                "post-shutdown feedback rejection must preserve output");
         });
 
         tc.Run("Vulkan linear CT32 repeat and clamp sprites match the prepared DDA", [](TestCase &t)
