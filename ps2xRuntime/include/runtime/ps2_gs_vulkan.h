@@ -27,6 +27,8 @@ inline constexpr uint32_t GS_VULKAN_MAX_MEMORY_CASES = 65536u;
 inline constexpr size_t GS_VULKAN_MAX_RESIDENT_SPRITE_BATCH = 64u;
 inline constexpr size_t GS_VULKAN_MAX_RESIDENT_NEAREST_CT32_BATCH =
     GS_VULKAN_MAX_RESIDENT_SPRITE_BATCH;
+inline constexpr size_t GS_VULKAN_MAX_RESIDENT_LINEAR_CT32_BATCH =
+    GS_VULKAN_MAX_RESIDENT_SPRITE_BATCH;
 inline constexpr size_t GS_VULKAN_MAX_RESIDENT_TRIANGLE_BATCH =
     GS_VRAM_PAGE_COUNT;
 
@@ -193,6 +195,9 @@ struct GsVulkanServiceStatistics
     uint64_t linearCt32SpriteDrawsCompleted = 0u;
     uint64_t linearCt32SpriteDrawsFailed = 0u;
     uint64_t linearCt32SpritePixelsExecuted = 0u;
+    uint64_t residentLinearCt32SpriteBatchesCompleted = 0u;
+    uint64_t residentLinearCt32SpriteBatchesFailed = 0u;
+    uint64_t largestResidentLinearCt32SpriteBatch = 0u;
     uint64_t residentNearestCt32SpriteBatchesCompleted = 0u;
     uint64_t residentNearestCt32SpriteBatchesFailed = 0u;
     uint64_t largestResidentNearestCt32SpriteBatch = 0u;
@@ -550,6 +555,12 @@ public:
     [[nodiscard]] virtual bool executeResidentNearestCt32Sprites(
         std::span<const GsVulkanNearestCt32Sprite> sprites,
         std::string *error = nullptr) = 0;
+    [[nodiscard]] virtual bool executeResidentLinearCt32Sprite(
+        const GsVulkanLinearCt32Sprite &sprite,
+        std::string *error = nullptr) = 0;
+    [[nodiscard]] virtual bool executeResidentLinearCt32Sprites(
+        std::span<const GsVulkanLinearCt32Sprite> sprites,
+        std::string *error = nullptr) = 0;
     [[nodiscard]] virtual bool executeResidentCt32Triangle(
         const GsVulkanCt32Triangle &triangle,
         std::string *error = nullptr) = 0;
@@ -667,6 +678,15 @@ public:
         std::string *error = nullptr) override;
     [[nodiscard]] bool executeResidentNearestCt32Sprites(
         std::span<const GsVulkanNearestCt32Sprite> sprites,
+        std::string *error = nullptr) override;
+
+    // Records a bounded linear-texture batch against resident raw VRAM with
+    // the same pairwise dependency contract as nearest texture batches.
+    [[nodiscard]] bool executeResidentLinearCt32Sprite(
+        const GsVulkanLinearCt32Sprite &sprite,
+        std::string *error = nullptr) override;
+    [[nodiscard]] bool executeResidentLinearCt32Sprites(
+        std::span<const GsVulkanLinearCt32Sprite> sprites,
         std::string *error = nullptr) override;
 
     // Uses the exact 64-bit triangle pipeline against already-resident VRAM.

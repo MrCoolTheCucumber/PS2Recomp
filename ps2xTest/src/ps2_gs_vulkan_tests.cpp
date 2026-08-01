@@ -1490,6 +1490,69 @@ namespace
             return true;
         }
 
+        bool executeResidentLinearCt32Sprite(
+            const GsVulkanLinearCt32Sprite &sprite,
+            std::string *error) override
+        {
+            return executeResidentLinearCt32Sprites(
+                std::span<const GsVulkanLinearCt32Sprite>(
+                    &sprite, 1u),
+                error);
+        }
+
+        bool executeResidentLinearCt32Sprites(
+            std::span<const GsVulkanLinearCt32Sprite> sprites,
+            std::string *error) override
+        {
+            if (!isHealthy || behavior == Behavior::Fail ||
+                behavior == Behavior::FailResidentDraw ||
+                behavior == Behavior::InvalidOutput ||
+                sprites.empty() ||
+                sprites.size() >
+                    GS_VULKAN_MAX_RESIDENT_LINEAR_CT32_BATCH ||
+                !report.devices[0].exactLinearCt32Sprite)
+            {
+                serviceStatistics.linearCt32SpriteDrawsFailed +=
+                    sprites.size();
+                ++serviceStatistics
+                      .residentLinearCt32SpriteBatchesFailed;
+                if (error)
+                {
+                    *error =
+                        "injected resident linear CT32 executor failure";
+                }
+                return false;
+            }
+            for (const GsVulkanLinearCt32Sprite &sprite : sprites)
+            {
+                if (behavior == Behavior::Exact)
+                    applyLinearCt32SpriteCpu(residentVram, sprite);
+                serviceStatistics.linearCt32SpritePixelsExecuted +=
+                    static_cast<uint64_t>(
+                        sprite.boundsX1 - sprite.boundsX0) *
+                    static_cast<uint64_t>(
+                        sprite.boundsY1 - sprite.boundsY0);
+            }
+            serviceStatistics.linearCt32SpriteDrawsCompleted +=
+                sprites.size();
+            ++serviceStatistics
+                  .residentLinearCt32SpriteBatchesCompleted;
+            serviceStatistics.largestResidentLinearCt32SpriteBatch =
+                std::max(
+                    serviceStatistics
+                        .largestResidentLinearCt32SpriteBatch,
+                    static_cast<uint64_t>(sprites.size()));
+            ++serviceStatistics.queueSubmissions;
+            serviceStatistics.shaderDispatches += sprites.size();
+            serviceStatistics.pipelineBarriers += 2u;
+            ++serviceStatistics.pipelineBinds;
+            ++serviceStatistics.pipelineCacheHits;
+            ++serviceStatistics.fenceWaits;
+            if (error)
+                error->clear();
+            return true;
+        }
+
         bool executeResidentCt32Triangle(
             const GsVulkanCt32Triangle &triangle,
             std::string *error) override
@@ -1631,6 +1694,9 @@ void register_ps2_gs_vulkan_tests()
             t.Equals(GS_VULKAN_MAX_RESIDENT_NEAREST_CT32_BATCH,
                      GS_VULKAN_MAX_RESIDENT_SPRITE_BATCH,
                      "resident texture batches should share the bounded sprite limit");
+            t.Equals(GS_VULKAN_MAX_RESIDENT_LINEAR_CT32_BATCH,
+                     GS_VULKAN_MAX_RESIDENT_SPRITE_BATCH,
+                     "resident linear batches should share the bounded sprite limit");
             t.Equals(GS_VULKAN_MAX_RESIDENT_TRIANGLE_BATCH,
                      GS_VRAM_PAGE_COUNT,
                      "disjoint triangle batches cannot exceed physical pages");
@@ -10091,6 +10157,258 @@ void register_ps2_gs_vulkan_tests()
                       "a stopped service must reject resident texture batches");
             t.IsFalse(operationError.empty(),
                       "post-shutdown texture rejection should retain a diagnostic");
+        });
+
+        tc.Run("Vulkan resident linear CT32 batches preserve texture dependencies", [](TestCase &t)
+        {
+            GSMem::InitLookupTables();
+            GsVulkanCapabilityReport preflight{};
+            const GsVulkanServiceConfig config =
+                makeRendererServiceConfig(preflight);
+            GsVulkanCapabilityReport creationReport{};
+            std::string creationError;
+            std::unique_ptr<GsVulkanService> service =
+                GsVulkanService::create(
+                    config, &creationReport, &creationError);
+            if (!preflight.ready())
+            {
+                t.IsNull(service.get(),
+                         "an unavailable host should skip resident linear batching cleanly");
+                t.IsFalse(creationReport.ready(),
+                          "a skipped linear batch service should retain its capability result");
+                return;
+            }
+            t.IsNotNull(service.get(),
+                        "a suitable device should create the resident linear batch service");
+            t.IsTrue(creationError.empty(),
+                     "successful linear batch service creation should clear its diagnostic");
+            if (!service)
+                return;
+
+            constexpr std::array<uint32_t, 4> framebufferPages{{
+                40u, 41u, 197u, 509u,
+            }};
+            std::vector<GsVulkanLinearCt32Sprite> sprites;
+            for (size_t index = 0u; index < framebufferPages.size(); ++index)
+            {
+                const GsDrawCommand command =
+                    makeLinearCt32RepeatSpriteCommand(
+                        36'000u + index,
+                        framebufferPages[index], 2u,
+                        512u, 2u, 6u, 5u,
+                        {3u, 12u, 2u, 13u}, {128u, 96u},
+                        {120u, 376u}, {88u, 344u},
+                        {0u, 249u}, {0u, 137u});
+                GsVulkanLinearCt32Sprite sprite{};
+                const GsBackendDecision decision =
+                    prepareGsVulkanLinearCt32Sprite(command, sprite);
+                if (!decision.supported)
+                {
+                    t.Fail(
+                        "resident linear CT32 fixture was rejected as " +
+                        std::string(gsFallbackReasonName(decision.reason)));
+                    return;
+                }
+                sprites.push_back(sprite);
+            }
+
+            const GsVramPageMask sharedReadPages =
+                gsVramPagesForSurfaceRect(
+                    sprites.front().textureBaseBlock,
+                    sprites.front().textureWidth,
+                    static_cast<uint8_t>(GSMem::C32),
+                    0u, 0u,
+                    sprites.front().textureMaskU + 1u,
+                    sprites.front().textureMaskV + 1u);
+            t.Equals(sharedReadPages.count(), size_t{1u},
+                     "the shared linear texture should conservatively read one page");
+            t.IsTrue(sharedReadPages.test(16u),
+                     "the shared linear texture should retain its physical page");
+
+            std::string operationError;
+            const GsVulkanServiceStatistics beforeRejections =
+                service->statistics();
+            const auto expectRejected =
+                [&](std::span<const GsVulkanLinearCt32Sprite> rejected,
+                    const std::string &label)
+            {
+                operationError.clear();
+                t.IsFalse(service->executeResidentLinearCt32Sprites(
+                              rejected, &operationError),
+                          label + " should fail before worker submission");
+                t.IsFalse(operationError.empty(),
+                          label + " should retain a diagnostic");
+            };
+            const auto expectDependencyRejected =
+                [&](std::span<const GsVulkanLinearCt32Sprite> rejected,
+                    const std::string &label)
+            {
+                expectRejected(rejected, label);
+                t.IsTrue(
+                    operationError.find("memory dependency") !=
+                        std::string::npos,
+                    label + " should identify an inter-draw dependency");
+            };
+            expectRejected({}, "empty resident linear batch");
+            std::vector<GsVulkanLinearCt32Sprite> oversized(
+                GS_VULKAN_MAX_RESIDENT_LINEAR_CT32_BATCH + 1u,
+                sprites.front());
+            expectRejected(oversized, "oversized resident linear batch");
+            std::vector<GsVulkanLinearCt32Sprite> invalid = sprites;
+            invalid[2].textureWrapU |= 1u << 31u;
+            expectRejected(invalid, "invalid resident linear batch member");
+
+            const std::array<GsVulkanLinearCt32Sprite, 2> writeWrite{{
+                sprites.front(), sprites.front(),
+            }};
+            expectDependencyRejected(
+                writeWrite, "write/write-dependent linear batch");
+
+            GsVulkanLinearCt32Sprite writeThenRead = sprites[1];
+            writeThenRead.textureBaseBlock =
+                sprites.front().framebufferBaseBlock;
+            const std::array<GsVulkanLinearCt32Sprite, 2> writeRead{{
+                sprites.front(), writeThenRead,
+            }};
+            expectDependencyRejected(
+                writeRead, "write/read-dependent linear batch");
+
+            GsVulkanLinearCt32Sprite readThenWrite = sprites[1];
+            readThenWrite.framebufferBaseBlock =
+                sprites.front().textureBaseBlock;
+            readThenWrite.textureBaseBlock = 60u * 32u;
+            const std::array<GsVulkanLinearCt32Sprite, 2> readWrite{{
+                sprites.front(), readThenWrite,
+            }};
+            expectDependencyRejected(
+                readWrite, "read/write-dependent linear batch");
+
+            const GsVulkanServiceStatistics afterRejections =
+                service->statistics();
+            t.Equals(afterRejections.queueSubmissions,
+                     beforeRejections.queueSubmissions,
+                     "caller-rejected linear batches must not submit GPU work");
+            t.Equals(afterRejections.linearCt32SpriteDrawsFailed,
+                     beforeRejections.linearCt32SpriteDrawsFailed,
+                     "caller-rejected linear batches must not count worker failures");
+            t.Equals(
+                afterRejections.residentLinearCt32SpriteBatchesFailed,
+                beforeRejections.residentLinearCt32SpriteBatchesFailed,
+                "caller-rejected linear batches must not count failed worker batches");
+
+            const GsVulkanDeviceReport *selected =
+                creationReport.selectedDevice();
+            t.IsNotNull(selected,
+                        "the linear batch service should retain its selected device");
+            if (!selected)
+                return;
+            if (!selected->exactLinearCt32Sprite)
+            {
+                expectRejected(sprites,
+                               "capability-gated resident linear batch");
+                t.Equals(
+                    service->statistics().linearCt32SpriteDrawsFailed,
+                    0ull,
+                    "linear capability rejection must not enter the worker");
+                t.IsTrue(service->healthy(),
+                         "unsupported linear batching must not poison the base service");
+                service->shutdown();
+                return;
+            }
+
+            const std::vector<uint8_t> initial =
+                makeVramPattern(0x524C4931u);
+            std::vector<uint8_t> expected = initial;
+            uint64_t expectedPixels = 0u;
+            for (const GsVulkanLinearCt32Sprite &sprite : sprites)
+            {
+                applyLinearCt32SpriteCpu(expected, sprite);
+                expectedPixels +=
+                    static_cast<uint64_t>(
+                        sprite.boundsX1 - sprite.boundsX0) *
+                    static_cast<uint64_t>(
+                        sprite.boundsY1 - sprite.boundsY0);
+            }
+            GsVramPageMask allPages;
+            allPages.setAll();
+            t.IsTrue(service->uploadVramPages(
+                         initial, allPages, &operationError),
+                     "the linear batch fixture should establish resident VRAM");
+            if (!operationError.empty())
+                t.Fail("resident linear batch upload failed: " + operationError);
+
+            const GsVulkanServiceStatistics beforeBatch =
+                service->statistics();
+            operationError.clear();
+            t.IsTrue(service->executeResidentLinearCt32Sprites(
+                         sprites, &operationError),
+                     "shared-read resident linear sprites should execute as one batch");
+            t.IsTrue(operationError.empty(),
+                     "successful resident linear batching should clear its diagnostic");
+            const GsVulkanServiceStatistics afterBatch =
+                service->statistics();
+            t.Equals(afterBatch.queueSubmissions -
+                         beforeBatch.queueSubmissions,
+                     1ull,
+                     "one linear batch should use one Vulkan queue submission");
+            t.Equals(afterBatch.shaderDispatches -
+                         beforeBatch.shaderDispatches,
+                     static_cast<uint64_t>(sprites.size()),
+                     "each linear batch member should retain one compute dispatch");
+            t.Equals(afterBatch.pipelineBarriers -
+                         beforeBatch.pipelineBarriers,
+                     2ull,
+                     "one linear batch should use one prepare and one completion barrier");
+            t.Equals(afterBatch.pipelineBinds - beforeBatch.pipelineBinds,
+                     1ull,
+                     "one linear batch should bind the exact pipeline once");
+            t.Equals(afterBatch.pipelineCacheHits -
+                         beforeBatch.pipelineCacheHits,
+                     1ull,
+                     "one linear batch should reuse its prebuilt pipeline once");
+            t.Equals(afterBatch.fenceWaits - beforeBatch.fenceWaits,
+                     1ull,
+                     "one linear batch should wait on one submitted fence");
+            t.Equals(afterBatch.linearCt32SpriteDrawsCompleted -
+                         beforeBatch.linearCt32SpriteDrawsCompleted,
+                     static_cast<uint64_t>(sprites.size()),
+                     "linear batch statistics should count every completed sprite");
+            t.Equals(afterBatch.linearCt32SpritePixelsExecuted -
+                         beforeBatch.linearCt32SpritePixelsExecuted,
+                     expectedPixels,
+                     "linear batch statistics should count every covered pixel");
+            t.Equals(
+                afterBatch.residentLinearCt32SpriteBatchesCompleted -
+                    beforeBatch.residentLinearCt32SpriteBatchesCompleted,
+                1ull,
+                "the worker should complete one resident linear batch");
+            t.Equals(afterBatch.largestResidentLinearCt32SpriteBatch,
+                     static_cast<uint64_t>(sprites.size()),
+                     "the service should retain its largest linear batch");
+
+            std::vector<uint8_t> actual(
+                GS_VULKAN_VRAM_SIZE, 0xA5u);
+            t.IsTrue(service->downloadVramPages(
+                         actual, allPages, &operationError),
+                     "the completed resident linear batch should be observable");
+            t.IsTrue(actual == expected,
+                     "one resident linear batch must match sequential CPU draws exactly");
+            const GsVulkanServiceStatistics finalStatistics =
+                service->statistics();
+            t.Equals(finalStatistics.validationErrors, 0u,
+                     "resident linear batching must remain validation-clean");
+            t.Equals(finalStatistics.validationWarnings, 0u,
+                     "resident linear batching should emit no validation warnings");
+            t.IsTrue(service->healthy(),
+                     "accepted and rejected linear batches should leave the service healthy");
+
+            service->shutdown();
+            operationError.clear();
+            t.IsFalse(service->executeResidentLinearCt32Sprites(
+                          sprites, &operationError),
+                      "a stopped service must reject resident linear batches");
+            t.IsFalse(operationError.empty(),
+                      "post-shutdown linear rejection should retain a diagnostic");
         });
 
         tc.Run("Vulkan resident triangle batches require disjoint pages", [](TestCase &t)
