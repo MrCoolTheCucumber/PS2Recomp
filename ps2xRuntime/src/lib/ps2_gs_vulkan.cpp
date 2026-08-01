@@ -124,14 +124,9 @@ namespace
         return nullptr;
     }
 
-    const char *depthCt32SpriteValidationError(
+    const char *depthCt32SpriteShapeValidationError(
         const GsVulkanDepthCt32Sprite &sprite) noexcept
     {
-        if ((sprite.reserved0 | sprite.reserved1 |
-             sprite.reserved2 | sprite.reserved3) != 0u)
-        {
-            return "Vulkan depth CT32 sprite has non-zero reserved data";
-        }
         if (sprite.framebufferBaseBlock > 0x3FFFu ||
             sprite.depthBaseBlock > 0x3FFFu)
         {
@@ -194,6 +189,25 @@ namespace
         if (framebufferPages.intersects(depthPages))
             return "Vulkan depth CT32 sprite framebuffer aliases depth";
         return nullptr;
+    }
+
+    const char *depthCt32SpriteValidationError(
+        const GsVulkanDepthCt32Sprite &sprite) noexcept
+    {
+        if ((sprite.reserved1 | sprite.reserved2 |
+             sprite.reserved3) != 0u)
+        {
+            return "Vulkan depth CT32 sprite has non-zero reserved data";
+        }
+        // The source-over record is CPU-contract-only until its matching
+        // shader lands; do not let the existing source-copy pipeline silently
+        // consume a mode it does not implement.
+        if (sprite.colorBlendMode !=
+            GS_VULKAN_DEPTH_CT32_COLOR_SOURCE_COPY)
+        {
+            return "Vulkan depth CT32 sprite has unsupported color operation";
+        }
+        return depthCt32SpriteShapeValidationError(sprite);
     }
 
     struct DepthCt32SpriteAccessPages
@@ -825,7 +839,49 @@ GsBackendDecision prepareGsVulkanDepthCt32Sprite(
     prepared.depthTestMethod =
         static_cast<uint32_t>((context.test >> 17u) & 0x3u);
     prepared.depthWrite = context.zbuf.zmask ? 0u : 1u;
+    prepared.colorBlendMode =
+        GS_VULKAN_DEPTH_CT32_COLOR_SOURCE_COPY;
     if (depthCt32SpriteValidationError(prepared))
+        return {false, GsFallbackReason::UnknownMemoryLayout};
+
+    sprite = prepared;
+    return decision;
+}
+
+GsBackendDecision prepareGsVulkanSourceOverDepthCt32Sprite(
+    const GsDrawCommand &command,
+    GsVulkanDepthCt32Sprite &sprite) noexcept
+{
+    const GsBackendDecision decision =
+        classifyGsSourceOverDepthCt32Sprite(command);
+    if (!decision.supported)
+        return decision;
+
+    const GSContext &context = command.context();
+    const GsDrawBounds &bounds = command.bounds();
+    const GSVertex &vertex = command.vertices()[1];
+    GsVulkanDepthCt32Sprite prepared{};
+    prepared.framebufferBaseBlock = context.frame.fbp << 5u;
+    prepared.framebufferWidth =
+        std::max<uint32_t>(context.frame.fbw, 1u);
+    prepared.depthBaseBlock = context.zbuf.zbp << 5u;
+    prepared.depthPsm = context.zbuf.psm;
+    prepared.boundsX0 = static_cast<uint32_t>(bounds.x0);
+    prepared.boundsY0 = static_cast<uint32_t>(bounds.y0);
+    prepared.boundsX1 = static_cast<uint32_t>(bounds.x1);
+    prepared.boundsY1 = static_cast<uint32_t>(bounds.y1);
+    prepared.rgba =
+        static_cast<uint32_t>(vertex.r) |
+        (static_cast<uint32_t>(vertex.g) << 8u) |
+        (static_cast<uint32_t>(vertex.b) << 16u) |
+        (static_cast<uint32_t>(vertex.a) << 24u);
+    prepared.depth = vertex.zInteger;
+    prepared.depthTestMethod =
+        static_cast<uint32_t>((context.test >> 17u) & 0x3u);
+    prepared.depthWrite = context.zbuf.zmask ? 0u : 1u;
+    prepared.colorBlendMode =
+        GS_VULKAN_DEPTH_CT32_COLOR_SOURCE_OVER;
+    if (depthCt32SpriteShapeValidationError(prepared))
         return {false, GsFallbackReason::UnknownMemoryLayout};
 
     sprite = prepared;

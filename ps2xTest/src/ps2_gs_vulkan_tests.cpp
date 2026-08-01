@@ -342,7 +342,8 @@ namespace
         const GsDrawCommand &command,
         uint64_t sequence,
         uint64_t alpha,
-        bool pabe = false)
+        bool pabe = false,
+        bool colorClamp = false)
     {
         GSPrimReg primitive = command.primitive();
         primitive.abe = true;
@@ -350,6 +351,7 @@ namespace
         context.alpha = alpha;
         GsDrawGlobalState global = command.globalState();
         global.pabe = pabe;
+        global.colorClamp = colorClamp;
         return buildGsDrawCommand(
             sequence,
             primitive,
@@ -662,6 +664,28 @@ namespace
         std::vector<uint8_t> &vram,
         const GsVulkanDepthCt32Sprite &sprite)
     {
+        const auto blendSourceOver = [](
+            uint32_t source, uint32_t destination)
+        {
+            uint32_t result = source & 0xFF000000u;
+            const int alpha = static_cast<int>(source >> 24u);
+            for (uint32_t shift = 0u; shift < 24u; shift += 8u)
+            {
+                const int sourceChannel = static_cast<int>(
+                    (source >> shift) & 0xFFu);
+                const int destinationChannel = static_cast<int>(
+                    (destination >> shift) & 0xFFu);
+                const int product =
+                    (sourceChannel - destinationChannel) * alpha;
+                const int scaled = product >= 0
+                    ? product / 128
+                    : -((-product + 127) / 128);
+                const int blended = std::clamp(
+                    scaled + destinationChannel, 0, 255);
+                result |= static_cast<uint32_t>(blended) << shift;
+            }
+            return result;
+        };
         const auto readDepth = [&](uint32_t x, uint32_t y)
         {
             return sprite.depthPsm == GS_PSM_Z24
@@ -702,11 +726,22 @@ namespace
                      sprite.depth > currentDepth);
                 if (!passes)
                     continue;
+                const uint32_t color =
+                    sprite.colorBlendMode ==
+                            GS_VULKAN_DEPTH_CT32_COLOR_SOURCE_OVER
+                        ? blendSourceOver(
+                              sprite.rgba,
+                              GSMem::ReadCT32(
+                                  vram.data(),
+                                  sprite.framebufferBaseBlock,
+                                  sprite.framebufferWidth,
+                                  x, y))
+                        : sprite.rgba;
                 GSMem::WriteCT32(
                     vram.data(),
                     sprite.framebufferBaseBlock,
                     sprite.framebufferWidth,
-                    x, y, sprite.rgba);
+                    x, y, color);
                 if (sprite.depthWrite != 0u)
                     writeDepth(x, y);
             }
@@ -1218,7 +1253,11 @@ namespace
         gs.writeRegister(GS_REG_SCISSOR_1, scissor);
         gs.writeRegister(GS_REG_XYOFFSET_1, xyoffset);
         gs.writeRegister(GS_REG_TEST_1, context.test);
+        gs.writeRegister(GS_REG_ALPHA_1, context.alpha);
         gs.writeRegister(GS_REG_FBA_1, context.fba);
+        gs.writeRegister(GS_REG_PABE, global.pabe ? 1u : 0u);
+        gs.writeRegister(
+            GS_REG_COLCLAMP, global.colorClamp ? 1u : 0u);
         gs.writeRegister(GS_REG_SCANMSK, global.scanMask);
         gs.writeRegister(GS_REG_DTHE, global.dither ? 1u : 0u);
         gs.writeRegister(GS_REG_TEX0_1, tex0);
@@ -2322,7 +2361,7 @@ void register_ps2_gs_vulkan_tests()
                      "the GS ALWAYS method should remain explicit");
             t.Equals(sprite.depthWrite, 1u,
                      "an unmasked depth surface should remain writable");
-            t.Equals(sprite.reserved0 | sprite.reserved1 |
+            t.Equals(sprite.colorBlendMode | sprite.reserved1 |
                          sprite.reserved2 | sprite.reserved3,
                      0u,
                      "all reserved depth ABI words should be deterministic");
@@ -2538,6 +2577,183 @@ void register_ps2_gs_vulkan_tests()
                 t.IsTrue(
                     sentinel == expectedSentinel,
                     "rejected alpha depth preparation must preserve caller output");
+            }
+        });
+
+        tc.Run("source-over alpha depth has an exact prepared CPU contract", [](TestCase &t)
+        {
+            GSMem::InitLookupTables();
+            const std::array<GsDrawCommand, 3> opaque{{
+                makeDepthCt32SpriteCommand(
+                    35u, 112u, 8u, 216u, GS_PSM_Z24, false, 1u,
+                    {0u, 511u, 0u, 415u},
+                    {1792u * 16u, 1840u * 16u},
+                    1792u * 16u - 8u, 1840u * 16u - 8u,
+                    (1792u + 32u) * 16u - 8u,
+                    (1840u + 416u) * 16u - 8u,
+                    0x78000000u, 0u),
+                makeDepthCt32SpriteCommand(
+                    36u, 40u, 2u, 200u, GS_PSM_Z32, true, 2u,
+                    {3u, 30u, 2u, 25u}, {16u, 32u},
+                    49u, 65u, 449u, 353u,
+                    0x80F02010u, 0x80000000u),
+                makeDepthCt32SpriteCommand(
+                    37u, 41u, 3u, 201u, GS_PSM_Z24, false, 3u,
+                    {4u, 29u, 3u, 26u}, {0u, 0u},
+                    65u, 49u, 465u, 369u,
+                    0xFF10E0F0u, 0x00700000u),
+            }};
+            const std::array<uint64_t, 3> alphaRegisters{{
+                0x0000000000000044ull,
+                0x0000008000000044ull,
+                0x000000FF00000044ull,
+            }};
+
+            for (size_t index = 0u; index < opaque.size(); ++index)
+            {
+                const GsDrawCommand sourceOver = makeAlphaBlendCommand(
+                    opaque[index], 38u + index,
+                    alphaRegisters[index], false, true);
+                t.IsTrue(
+                    sourceOver.resources().framebufferReadPages.any(),
+                    "source-over depth should retain its framebuffer read");
+                t.IsTrue(
+                    sourceOver.resources().readsDestination,
+                    "source-over depth should expose its true destination dependency");
+                t.IsTrue(
+                    sourceOver.resources().depthReadPages ==
+                        opaque[index].resources().depthReadPages,
+                    "source-over should preserve exact depth reads");
+                t.IsTrue(
+                    sourceOver.resources().depthWritePages ==
+                        opaque[index].resources().depthWritePages,
+                    "source-over should preserve exact depth writes");
+
+                const GsBackendDecision opaqueDepthDecision =
+                    classifyGsDepthCt32Sprite(sourceOver);
+                t.IsFalse(
+                    opaqueDepthDecision.supported,
+                    "source-over must not widen the source-copy depth contract");
+                t.Equals(
+                    opaqueDepthDecision.reason,
+                    GsFallbackReason::AlphaBlend,
+                    "the existing depth contract should retain alpha-blend reason");
+
+                const GsBackendDecision sourceOverDecision =
+                    classifyGsSourceOverDepthCt32Sprite(sourceOver);
+                t.IsTrue(
+                    sourceOverDecision.supported,
+                    "standard clamped source-over depth should be semantic");
+                t.Equals(
+                    sourceOverDecision.reason,
+                    GsFallbackReason::Supported,
+                    "accepted source-over should retain the canonical reason");
+
+                GsVulkanDepthCt32Sprite opaqueRecord{};
+                t.IsTrue(
+                    prepareGsVulkanDepthCt32Sprite(
+                        opaque[index], opaqueRecord).supported,
+                    "the opaque comparison depth record should prepare");
+                GsVulkanDepthCt32Sprite sourceOverRecord{
+                    1u, 2u, 3u, 4u, 5u, 6u, 7u, 8u,
+                    9u, 10u, 11u, 12u, 13u, 14u, 15u, 16u};
+                const GsBackendDecision prepareDecision =
+                    prepareGsVulkanSourceOverDepthCt32Sprite(
+                        sourceOver, sourceOverRecord);
+                t.IsTrue(
+                    prepareDecision.supported,
+                    "source-over should publish an exact depth record");
+                t.Equals(
+                    sourceOverRecord.colorBlendMode,
+                    GS_VULKAN_DEPTH_CT32_COLOR_SOURCE_OVER,
+                    "the record should name only the source-over color operation");
+                GsVulkanDepthCt32Sprite normalizedRecord = sourceOverRecord;
+                normalizedRecord.colorBlendMode =
+                    GS_VULKAN_DEPTH_CT32_COLOR_SOURCE_COPY;
+                t.IsTrue(
+                    normalizedRecord == opaqueRecord,
+                    "source-over should differ from opaque depth only by color operation");
+
+                if (!prepareDecision.supported)
+                    continue;
+                std::vector<uint8_t> actual = makeVramPattern(
+                    0x50A0D000u + static_cast<uint32_t>(index));
+                std::vector<uint8_t> expected = actual;
+                std::vector<uint8_t> sourceCopy = actual;
+                applyDepthCt32SpriteCpu(expected, sourceOverRecord);
+                applyDepthCt32SpriteCpu(sourceCopy, opaqueRecord);
+                if ((sourceOverRecord.rgba >> 24u) != 128u)
+                {
+                    t.IsFalse(
+                        expected == sourceCopy,
+                        "non-unit source-over should depend on prior framebuffer RGB");
+                }
+
+                GS gs;
+                gs.init(
+                    actual.data(),
+                    static_cast<uint32_t>(actual.size()),
+                    nullptr);
+                gs.setDebugHistoryPaused(true);
+                drawNearestCt32SpriteCommand(gs, sourceOver);
+                gs.flushRenderBatch();
+                if (actual != expected)
+                {
+                    const auto mismatch = std::mismatch(
+                        actual.begin(), actual.end(), expected.begin());
+                    std::ostringstream message;
+                    message
+                        << "prepared source-over depth diverged from software case "
+                        << index << " at byte "
+                        << (mismatch.first - actual.begin())
+                        << ": actual="
+                        << static_cast<uint32_t>(*mismatch.first)
+                        << " expected="
+                        << static_cast<uint32_t>(*mismatch.second);
+                    t.Fail(message.str());
+                }
+            }
+
+            const GsDrawCommand sourceOverBase = makeAlphaBlendCommand(
+                opaque.front(), 50u, 0x0000008000000044ull,
+                false, true);
+            const std::array<GsDrawCommand, 5> rejected{{
+                opaque.front(),
+                makeAlphaBlendCommand(
+                    opaque.front(), 51u, 0u, false, true),
+                makeAlphaBlendCommand(
+                    opaque.front(), 52u,
+                    0x0000008000000054ull, false, true),
+                makeAlphaBlendCommand(
+                    opaque.front(), 53u,
+                    0x0000008000000044ull, true, true),
+                makeAlphaBlendCommand(
+                    opaque.front(), 54u,
+                    0x0000008000000044ull, false, false),
+            }};
+            t.IsTrue(
+                classifyGsSourceOverDepthCt32Sprite(
+                    sourceOverBase).supported,
+                "the rejection fixture baseline should remain semantic");
+            for (const GsDrawCommand &command : rejected)
+            {
+                GsVulkanDepthCt32Sprite sentinel{
+                    1u, 2u, 3u, 4u, 5u, 6u, 7u, 8u,
+                    9u, 10u, 11u, 12u, 13u, 14u, 15u, 16u};
+                const GsVulkanDepthCt32Sprite expectedSentinel = sentinel;
+                const GsBackendDecision decision =
+                    prepareGsVulkanSourceOverDepthCt32Sprite(
+                        command, sentinel);
+                t.IsFalse(
+                    decision.supported,
+                    "non-source-over or ambiguous global state must stay closed");
+                t.Equals(
+                    decision.reason,
+                    GsFallbackReason::AlphaBlend,
+                    "source-over contract rejection should retain alpha-blend reason");
+                t.IsTrue(
+                    sentinel == expectedSentinel,
+                    "rejected source-over preparation must preserve caller output");
             }
         });
 
@@ -13115,7 +13331,7 @@ void register_ps2_gs_vulkan_tests()
             expectRejected(shortInput, sprites.front(),
                            "short depth sprite VRAM input");
             GsVulkanDepthCt32Sprite invalid = sprites.front();
-            invalid.reserved0 = 1u;
+            invalid.reserved1 = 1u;
             expectRejected(gpu, invalid, "depth sprite reserved data");
             invalid = sprites.front();
             invalid.depthPsm = GS_PSM_Z16;
@@ -14179,7 +14395,7 @@ void register_ps2_gs_vulkan_tests()
                 sprites.front());
             expectRejected(oversized, "oversized resident depth batch");
             std::vector<GsVulkanDepthCt32Sprite> invalid = sprites;
-            invalid[3].reserved0 = 1u;
+            invalid[3].reserved1 = 1u;
             expectRejected(invalid, "invalid resident depth batch member");
             const GsVulkanServiceStatistics afterRejections =
                 service->statistics();

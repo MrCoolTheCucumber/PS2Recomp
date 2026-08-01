@@ -31,6 +31,19 @@ namespace
         return a <= 2u && a == b && d == 0u;
     }
 
+    bool isSourceOverAlphaBlend(
+        const GSPrimReg &primitive,
+        const GSContext &context,
+        const GsDrawGlobalState &global) noexcept
+    {
+        // A=Cs, B=Cd, C=As, D=Cd. FIX is irrelevant because C does not
+        // select it. Keep PABE and wraparound color arithmetic outside this
+        // first exact destination-dependent contract.
+        return primitive.abe &&
+               (context.alpha & 0xFFu) == 0x44u &&
+               !global.pabe && global.colorClamp;
+    }
+
     struct PageGeometry
     {
         uint32_t width;
@@ -804,6 +817,13 @@ namespace
         Z32OrZ24,
     };
 
+    enum class AlphaRequirement : uint8_t
+    {
+        Disabled,
+        DisabledOrSourceCopy,
+        SourceOver,
+    };
+
     bool hasOneToOneIntegerTextureAxis(
         int32_t fixed0,
         int32_t fixed1,
@@ -853,7 +873,8 @@ namespace
         uint8_t expectedVertices,
         TextureRequirement textureRequirement,
         DepthRequirement depthRequirement = DepthRequirement::None,
-        bool allowSourceCopyAlphaBlend = false) noexcept
+        AlphaRequirement alphaRequirement =
+            AlphaRequirement::Disabled) noexcept
     {
         const GSPrimReg &primitive = command.primitive();
         const GSContext &context = command.context();
@@ -886,9 +907,14 @@ namespace
             return {false, GsFallbackReason::GouraudShading};
         if (primitive.fge)
             return {false, GsFallbackReason::Fog};
-        if (primitive.abe &&
-            !(allowSourceCopyAlphaBlend &&
-              isSourceCopyAlphaBlend(primitive, context)))
+        const bool acceptedAlpha =
+            alphaRequirement == AlphaRequirement::SourceOver
+                ? isSourceOverAlphaBlend(primitive, context, global)
+                : !primitive.abe ||
+                      (alphaRequirement ==
+                           AlphaRequirement::DisabledOrSourceCopy &&
+                       isSourceCopyAlphaBlend(primitive, context));
+        if (!acceptedAlpha)
             return {false, GsFallbackReason::AlphaBlend};
         if ((context.test & 1u) != 0u)
             return {false, GsFallbackReason::AlphaTest};
@@ -1035,7 +1061,8 @@ namespace
                 return {false, GsFallbackReason::UnknownMemoryLayout};
             }
         }
-        if (resources.readsDestination)
+        if (resources.readsDestination &&
+            alphaRequirement != AlphaRequirement::SourceOver)
             return {false, GsFallbackReason::DestinationRead};
         if (resources.aliasesAnotherView())
             return {false, GsFallbackReason::ResourceAlias};
@@ -1050,7 +1077,7 @@ GsBackendDecision classifyGsInitialCt32Sprite(
         command, GS_PRIM_SPRITE, 2u,
         TextureRequirement::Disabled,
         DepthRequirement::None,
-        true);
+        AlphaRequirement::DisabledOrSourceCopy);
 }
 
 GsBackendDecision classifyGsDepthCt32Sprite(
@@ -1060,7 +1087,17 @@ GsBackendDecision classifyGsDepthCt32Sprite(
         command, GS_PRIM_SPRITE, 2u,
         TextureRequirement::Disabled,
         DepthRequirement::Z32OrZ24,
-        true);
+        AlphaRequirement::DisabledOrSourceCopy);
+}
+
+GsBackendDecision classifyGsSourceOverDepthCt32Sprite(
+    const GsDrawCommand &command) noexcept
+{
+    return classifyFlatCt32State(
+        command, GS_PRIM_SPRITE, 2u,
+        TextureRequirement::Disabled,
+        DepthRequirement::Z32OrZ24,
+        AlphaRequirement::SourceOver);
 }
 
 GsBackendDecision classifyGsNearestCt32TexturedSprite(

@@ -375,6 +375,13 @@ private:
 [[nodiscard]] GsBackendDecision classifyGsDepthCt32Sprite(
     const GsDrawCommand &command) noexcept;
 
+// Exact flat CT32 depth subset for the standard GS source-over equation
+// (Cs-Cd)*As/128+Cd. Unlike source-copy alpha, this contract retains the real
+// framebuffer read. Its first slice requires PABE disabled and COLCLAMP
+// enabled so the prepared record has one unambiguous integer blend operation.
+[[nodiscard]] GsBackendDecision classifyGsSourceOverDepthCt32Sprite(
+    const GsDrawCommand &command) noexcept;
+
 // Phase 6's first texture predicate deliberately covers only direct CT32
 // point sampling whose integer FST coordinates advance exactly one texel per
 // framebuffer pixel. Repeat wrap and disjoint source/destination pages keep

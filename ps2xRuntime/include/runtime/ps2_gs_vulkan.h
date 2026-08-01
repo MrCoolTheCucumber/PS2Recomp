@@ -326,6 +326,11 @@ static_assert(offsetof(GsVulkanCt32Sprite, reserved) == 28u);
 // Fixed record for exact flat CT32 color plus Z32/Z24 depth execution. The
 // depth method uses GS ZTST values (ALWAYS=1, GEQUAL=2, GREATER=3); depthWrite
 // is normalized from ZMASK. Z24 writes preserve the unrelated high byte.
+// colorBlendMode 0 writes RGBA directly. Mode 1 applies the clamped standard
+// GS source-over equation to RGB and still writes source alpha.
+inline constexpr uint32_t GS_VULKAN_DEPTH_CT32_COLOR_SOURCE_COPY = 0u;
+inline constexpr uint32_t GS_VULKAN_DEPTH_CT32_COLOR_SOURCE_OVER = 1u;
+
 struct alignas(16) GsVulkanDepthCt32Sprite
 {
     uint32_t framebufferBaseBlock = 0u;
@@ -340,7 +345,7 @@ struct alignas(16) GsVulkanDepthCt32Sprite
     uint32_t depth = 0u;
     uint32_t depthTestMethod = 0u;
     uint32_t depthWrite = 0u;
-    uint32_t reserved0 = 0u;
+    uint32_t colorBlendMode = GS_VULKAN_DEPTH_CT32_COLOR_SOURCE_COPY;
     uint32_t reserved1 = 0u;
     uint32_t reserved2 = 0u;
     uint32_t reserved3 = 0u;
@@ -363,11 +368,18 @@ static_assert(offsetof(GsVulkanDepthCt32Sprite, rgba) == 32u);
 static_assert(offsetof(GsVulkanDepthCt32Sprite, depth) == 36u);
 static_assert(offsetof(GsVulkanDepthCt32Sprite, depthTestMethod) == 40u);
 static_assert(offsetof(GsVulkanDepthCt32Sprite, depthWrite) == 44u);
-static_assert(offsetof(GsVulkanDepthCt32Sprite, reserved0) == 48u);
+static_assert(offsetof(GsVulkanDepthCt32Sprite, colorBlendMode) == 48u);
 static_assert(offsetof(GsVulkanDepthCt32Sprite, reserved3) == 60u);
 
 // Rejection leaves the caller's record untouched.
 [[nodiscard]] GsBackendDecision prepareGsVulkanDepthCt32Sprite(
+    const GsDrawCommand &command,
+    GsVulkanDepthCt32Sprite &sprite) noexcept;
+
+// Publishes the same depth ABI with its exact source-over color operation.
+// Rejection leaves the caller's record untouched. Device execution remains
+// independently capability-gated by the Vulkan service.
+[[nodiscard]] GsBackendDecision prepareGsVulkanSourceOverDepthCt32Sprite(
     const GsDrawCommand &command,
     GsVulkanDepthCt32Sprite &sprite) noexcept;
 
