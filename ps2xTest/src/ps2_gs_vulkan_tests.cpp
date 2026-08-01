@@ -9961,10 +9961,10 @@ void register_ps2_gs_vulkan_tests()
                      "post-shutdown texture rejection must preserve output");
         });
 
-        tc.Run("Vulkan linear CT32 repeat sprites match the prepared DDA", [](TestCase &t)
+        tc.Run("Vulkan linear CT32 repeat and clamp sprites match the prepared DDA", [](TestCase &t)
         {
             GSMem::InitLookupTables();
-            const std::array<GsDrawCommand, 4> commands{{
+            const std::array<GsDrawCommand, 8> commands{{
                 makeLinearCt32RepeatSpriteCommand(
                     31'000u, 0u, 8u, 3584u, 8u, 10u, 10u,
                     {0u, 511u, 0u, 447u}, {28672u, 29184u},
@@ -9985,6 +9985,26 @@ void register_ps2_gs_vulkan_tests()
                     {0u, 7u, 0u, 7u}, {128u, 96u},
                     {120u, 248u}, {88u, 216u},
                     {0u, 128u}, {0u, 128u}),
+                makeLinearCt32SpriteCommand(
+                    31'004u, 0u, 8u, 3584u, 8u, 10u, 10u,
+                    {0u, 511u, 0u, 447u}, {28672u, 29184u},
+                    {28664u, 29176u}, {29176u, 36344u},
+                    {0u, 512u}, {0u, 6656u}, 1u, 1u),
+                makeLinearCt32SpriteCommand(
+                    31'005u, 44u, 1u, 512u, 1u, 3u, 3u,
+                    {0u, 7u, 0u, 7u}, {128u, 96u},
+                    {128u, 256u}, {96u, 224u},
+                    {0u, 128u}, {0u, 128u}, 1u, 0u),
+                makeLinearCt32SpriteCommand(
+                    31'006u, 45u, 1u, 512u, 1u, 3u, 3u,
+                    {0u, 7u, 0u, 7u}, {128u, 96u},
+                    {128u, 256u}, {96u, 224u},
+                    {0u, 128u}, {0u, 128u}, 0u, 1u),
+                makeLinearCt32SpriteCommand(
+                    31'007u, 46u, 1u, 512u, 1u, 3u, 3u,
+                    {0u, 7u, 0u, 7u}, {128u, 96u},
+                    {128u, 256u}, {96u, 224u},
+                    {128u, 256u}, {128u, 256u}, 1u, 1u),
             }};
             std::vector<GsVulkanLinearCt32Sprite> sprites;
             for (const GsDrawCommand &command : commands)
@@ -10092,9 +10112,9 @@ void register_ps2_gs_vulkan_tests()
             expectRejected(shortInput, sprites.front(),
                            "short linear sprite VRAM input");
             GsVulkanLinearCt32Sprite invalid = sprites.front();
-            invalid.textureWrapU = packGsVulkanTextureWrap(1u, 0u, 0u);
+            invalid.textureWrapU = packGsVulkanTextureWrap(2u, 0u, 0u);
             expectRejected(gpu, invalid,
-                           "non-repeat linear sprite wrap");
+                           "unsupported linear region wrap");
             invalid = sprites.front();
             invalid.textureMaskU = 6u;
             expectRejected(gpu, invalid,
@@ -10110,8 +10130,10 @@ void register_ps2_gs_vulkan_tests()
 
             const GsVulkanServiceStatistics statistics =
                 service->statistics();
-            t.Equals(statistics.linearCt32SpriteDrawsCompleted, 4ull,
-                     "every linear sprite should complete exactly once");
+            t.Equals(
+                statistics.linearCt32SpriteDrawsCompleted,
+                static_cast<uint64_t>(sprites.size()),
+                "every linear sprite should complete exactly once");
             t.Equals(statistics.linearCt32SpriteDrawsFailed, 0ull,
                      "caller-side linear rejection should not count as GPU failure");
             t.Equals(statistics.linearCt32SpritePixelsExecuted,

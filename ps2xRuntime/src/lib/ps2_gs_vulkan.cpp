@@ -344,17 +344,7 @@ namespace
     const char *linearCt32SpriteValidationError(
         const GsVulkanLinearCt32Sprite &sprite) noexcept
     {
-        if (const char *recordError =
-                linearCt32SpriteRecordValidationError(sprite))
-        {
-            return recordError;
-        }
-        if (gsVulkanTextureWrapMode(sprite.textureWrapU) != 0u ||
-            gsVulkanTextureWrapMode(sprite.textureWrapV) != 0u)
-        {
-            return "Vulkan linear CT32 sprite execution requires repeat wrap";
-        }
-        return nullptr;
+        return linearCt32SpriteRecordValidationError(sprite);
     }
 
     struct FixedTriangleVertex
@@ -1664,7 +1654,7 @@ namespace
     static_assert(kGsCt32SpriteShaderSpv[0] == 0x07230203u);
     static_assert(sizeof(kGsCt32TriangleShaderSpv) == 10200u);
     static_assert(kGsCt32TriangleShaderSpv[0] == 0x07230203u);
-    static_assert(sizeof(kGsLinearCt32SpriteShaderSpv) == 37916u);
+    static_assert(sizeof(kGsLinearCt32SpriteShaderSpv) == 38900u);
     static_assert(kGsLinearCt32SpriteShaderSpv[0] == 0x07230203u);
     static_assert(sizeof(kGsMemoryCasesShaderSpv) == 10988u);
     static_assert(kGsMemoryCasesShaderSpv[0] == 0x07230203u);

@@ -70,6 +70,14 @@ int floor_fixed_16_16(int value)
     return quotient;
 }
 
+uint wrap_texture_coordinate(int coordinate, uint mask, uint wrap)
+{
+    uint mode = wrap & 0x3u;
+    if (mode == 0u)
+        return uint(coordinate) & mask;
+    return uint(clamp(coordinate, 0, int(mask)));
+}
+
 int floor_divide_16(int value)
 {
     return value >= 0 ? value / 16 : -((-value + 15) / 16);
@@ -143,18 +151,28 @@ void main()
         uint(sprite.fixed_block_step_u) * block;
     int fixed_u = int(fixed_u_bits);
     uint weight_u = (fixed_u_bits >> 12u) & 0x0fu;
-    uint u0 = uint(floor_fixed_16_16(fixed_u)) & sprite.texture_mask_u;
+    int unwrapped_u0 = floor_fixed_16_16(fixed_u);
+    uint u0 = wrap_texture_coordinate(
+        unwrapped_u0, sprite.texture_mask_u, sprite.texture_wrap_u);
     uint u1 = weight_u == 0u
         ? u0
-        : (u0 + 1u) & sprite.texture_mask_u;
+        : wrap_texture_coordinate(
+              unwrapped_u0 + 1,
+              sprite.texture_mask_u,
+              sprite.texture_wrap_u);
 
     int fixed_v = int(fixed_v_rows[gl_LocalInvocationID.y]);
     uint fixed_v_bits = uint(fixed_v);
     uint weight_v = (fixed_v_bits >> 12u) & 0x0fu;
-    uint v0 = uint(floor_fixed_16_16(fixed_v)) & sprite.texture_mask_v;
+    int unwrapped_v0 = floor_fixed_16_16(fixed_v);
+    uint v0 = wrap_texture_coordinate(
+        unwrapped_v0, sprite.texture_mask_v, sprite.texture_wrap_v);
     uint v1 = weight_v == 0u
         ? v0
-        : (v0 + 1u) & sprite.texture_mask_v;
+        : wrap_texture_coordinate(
+              unwrapped_v0 + 1,
+              sprite.texture_mask_v,
+              sprite.texture_wrap_v);
 
     uint c00 = read_ct32(u0, v0);
     uint color = c00;
