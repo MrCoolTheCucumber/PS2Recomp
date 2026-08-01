@@ -338,6 +338,27 @@ namespace
             global);
     }
 
+    GsDrawCommand makeAlphaBlendCommand(
+        const GsDrawCommand &command,
+        uint64_t sequence,
+        uint64_t alpha,
+        bool pabe = false)
+    {
+        GSPrimReg primitive = command.primitive();
+        primitive.abe = true;
+        GSContext context = command.context();
+        context.alpha = alpha;
+        GsDrawGlobalState global = command.globalState();
+        global.pabe = pabe;
+        return buildGsDrawCommand(
+            sequence,
+            primitive,
+            context,
+            std::span<const GSVertex>(command.vertices()).first(
+                command.vertexCount()),
+            global);
+    }
+
     GsDrawCommand makeDepthCt32SpriteCommand(
         uint64_t sequence,
         uint32_t framebufferPage,
@@ -4456,12 +4477,15 @@ void register_ps2_gs_vulkan_tests()
         tc.Run("Vulkan raster backend verifies exact CT32 depth sprites behind capability", [](TestCase &t)
         {
             GSMem::InitLookupTables();
-            const std::array<GsDrawCommand, 2> commands{{
+            const GsDrawCommand opaqueZ24 =
                 makeDepthCt32SpriteCommand(
                     30'100u, 40u, 2u, 200u, GS_PSM_Z24, false, 1u,
                     {3u, 30u, 2u, 25u}, {16u, 32u},
                     49u, 65u, 449u, 353u,
-                    0x88776655u, 0xFEDCBA98u),
+                    0x88776655u, 0xFEDCBA98u);
+            const std::array<GsDrawCommand, 2> commands{{
+                makeAlphaBlendCommand(
+                    opaqueZ24, 30'100u, 0u),
                 makeDepthCt32SpriteCommand(
                     30'101u, 41u, 2u, 201u, GS_PSM_Z32, true, 2u,
                     {4u, 27u, 3u, 22u}, {0u, 0u},
@@ -4476,6 +4500,10 @@ void register_ps2_gs_vulkan_tests()
                         commands[index], prepared[index]).supported,
                     "the Verify depth fixture should satisfy its narrow predicate");
             }
+            t.IsTrue(commands.front().primitive().abe,
+                     "the first Verify depth command should exercise source-copy alpha");
+            t.IsFalse(commands.front().resources().framebufferReadPages.any(),
+                      "source-copy Verify should not invent a color dependency");
 
             std::vector<uint8_t> initial =
                 makeVramPattern(0x44565246u);
@@ -4564,7 +4592,7 @@ void register_ps2_gs_vulkan_tests()
             t.IsTrue(backend->setMode(GsRendererMode::Hybrid),
                      "the fixture should also enter Hybrid cleanly");
             t.IsFalse(backend->classify(commands.front()).supported,
-                      "Hybrid routing should remain closed before measurement");
+                      "small source-copy depth should retain the measured depth cost gate");
             t.IsTrue(backend->setMode(GsRendererMode::Verify),
                      "the fixture should restore Verify for failure checks");
 
@@ -5005,6 +5033,18 @@ void register_ps2_gs_vulkan_tests()
                     (1792u + 32u) * 16u - 8u,
                     (1840u + 416u) * 16u - 8u,
                     0x80000000u, 0u);
+            const GsDrawCommand sourceCopyBelow =
+                makeAlphaBlendCommand(
+                    belowThreshold, 39'106u, 0u);
+            const GsDrawCommand sourceCopyAtThreshold =
+                makeAlphaBlendCommand(
+                    atThreshold, 39'107u, 0u);
+            const GsDrawCommand sourceCopyRetainedTitle =
+                makeAlphaBlendCommand(
+                    retainedTitle, 39'108u, 0u);
+            const GsDrawCommand sourceOverAtThreshold =
+                makeAlphaBlendCommand(
+                    atThreshold, 39'109u, 0x8000000044ull);
             const std::array<GsDrawCommand, 5> admittedStates{{
                 atThreshold,
                 makeDepthCt32SpriteCommand(
@@ -5042,12 +5082,39 @@ void register_ps2_gs_vulkan_tests()
             }
             GsVulkanDepthCt32Sprite belowPrepared{};
             GsVulkanDepthCt32Sprite retainedPrepared{};
+            GsVulkanDepthCt32Sprite sourceCopyBelowPrepared{};
+            GsVulkanDepthCt32Sprite sourceCopyAtThresholdPrepared{};
+            GsVulkanDepthCt32Sprite sourceCopyRetainedPrepared{};
             t.IsTrue(prepareGsVulkanDepthCt32Sprite(
                          belowThreshold, belowPrepared).supported,
                      "the below-threshold depth fixture should be semantic");
             t.IsTrue(prepareGsVulkanDepthCt32Sprite(
                          retainedTitle, retainedPrepared).supported,
                      "the retained title depth fixture should be semantic");
+            t.IsTrue(prepareGsVulkanDepthCt32Sprite(
+                         sourceCopyBelow,
+                         sourceCopyBelowPrepared).supported,
+                     "below-threshold source-copy depth should be semantic");
+            t.IsTrue(prepareGsVulkanDepthCt32Sprite(
+                         sourceCopyAtThreshold,
+                         sourceCopyAtThresholdPrepared).supported,
+                     "threshold source-copy depth should be semantic");
+            t.IsTrue(prepareGsVulkanDepthCt32Sprite(
+                         sourceCopyRetainedTitle,
+                         sourceCopyRetainedPrepared).supported,
+                     "retained source-copy depth should be semantic");
+            t.IsTrue(sourceCopyBelowPrepared == belowPrepared,
+                     "source-copy alpha should preserve the below-threshold record");
+            t.IsTrue(sourceCopyAtThresholdPrepared == prepared.front(),
+                     "source-copy alpha should preserve the threshold record");
+            t.IsTrue(sourceCopyRetainedPrepared == retainedPrepared,
+                     "source-copy alpha should preserve the retained title record");
+            t.IsFalse(sourceCopyRetainedTitle.resources()
+                          .framebufferReadPages.any(),
+                      "retained source-copy depth should not add a color read");
+            t.IsTrue(sourceOverAtThreshold.resources()
+                         .framebufferReadPages.any(),
+                     "genuine source-over depth should retain its color read");
             const auto pixels = [](const GsVulkanDepthCt32Sprite &sprite)
             {
                 return static_cast<uint64_t>(
@@ -5091,6 +5158,17 @@ void register_ps2_gs_vulkan_tests()
             t.Equals(backend->classify(retainedTitle).reason,
                      GsFallbackReason::CostModel,
                      "the retained 13312-pixel title draw should stay on CPU");
+            t.Equals(backend->classify(sourceCopyBelow).reason,
+                     GsFallbackReason::CostModel,
+                     "small source-copy depth should share the depth cost gate");
+            t.Equals(backend->classify(sourceCopyRetainedTitle).reason,
+                     GsFallbackReason::CostModel,
+                     "the retained source-copy title draw should stay on CPU");
+            t.IsTrue(backend->classify(sourceCopyAtThreshold).supported,
+                     "source-copy depth should meet the depth floor exactly");
+            t.Equals(backend->classify(sourceOverAtThreshold).reason,
+                     GsFallbackReason::AlphaBlend,
+                     "the cost policy must not admit genuine source-over depth");
             for (const GsDrawCommand &command : admittedStates)
             {
                 t.IsTrue(backend->classify(command).supported,
@@ -5100,10 +5178,14 @@ void register_ps2_gs_vulkan_tests()
                      "the depth policy fixture should enter strict mode");
             t.IsTrue(backend->classify(belowThreshold).supported,
                      "strict mode should ignore the depth cost policy");
+            t.IsTrue(backend->classify(sourceCopyBelow).supported,
+                     "strict mode should ignore source-copy depth cost policy");
             t.IsTrue(backend->setMode(GsRendererMode::Verify),
                      "the depth policy fixture should enter Verify");
             t.IsTrue(backend->classify(retainedTitle).supported,
                      "Verify should exercise the retained depth candidate");
+            t.IsTrue(backend->classify(sourceCopyRetainedTitle).supported,
+                     "Verify should exercise retained source-copy depth");
             t.IsTrue(backend->setMode(GsRendererMode::Hybrid),
                      "the depth policy fixture should restore Hybrid");
 
@@ -5165,6 +5247,9 @@ void register_ps2_gs_vulkan_tests()
             {
                 t.IsTrue(disabled->classify(retainedTitle).supported,
                          "zero should disable only the depth cost policy");
+                t.IsTrue(
+                    disabled->classify(sourceCopyRetainedTitle).supported,
+                    "zero should admit retained source-copy depth too");
             }
         });
 
@@ -9484,11 +9569,14 @@ void register_ps2_gs_vulkan_tests()
                      "strict texture routing should emit no validation warnings");
         });
 
-        tc.Run("GS Vulkan strict depth CT32 survives ownership and frame checkpoints", [](TestCase &t)
+        tc.Run("GS Vulkan strict source-copy depth survives ownership and frame checkpoints", [](TestCase &t)
         {
             GSMem::InitLookupTables();
-            const std::array<GsDrawCommand, 6> commands =
+            std::array<GsDrawCommand, 6> commands =
                 makeOrderedDepthCt32SpriteCommands(40'000u);
+            const GsDrawCommand opaqueFirst = commands[0];
+            commands[0] = makeAlphaBlendCommand(
+                opaqueFirst, 40'000u, 0u);
             std::array<GsVulkanDepthCt32Sprite, 6> prepared{};
             for (size_t index = 0u; index < commands.size(); ++index)
             {
@@ -9497,6 +9585,17 @@ void register_ps2_gs_vulkan_tests()
                         commands[index], prepared[index]).supported,
                     "every strict depth checkpoint should satisfy the narrow predicate");
             }
+            GsVulkanDepthCt32Sprite opaqueFirstPrepared{};
+            t.IsTrue(
+                prepareGsVulkanDepthCt32Sprite(
+                    opaqueFirst, opaqueFirstPrepared).supported,
+                "the checkpoint comparison record should prepare");
+            t.IsTrue(
+                prepared[0] == opaqueFirstPrepared,
+                "source-copy alpha should retain the opaque checkpoint record");
+            t.IsFalse(
+                commands[0].resources().framebufferReadPages.any(),
+                "source-copy checkpoints should not claim a color read");
             const GsDrawCommand flat = makeCt32SpriteCommand(
                 40'010u, 43u, 1u,
                 {0u, 31u, 0u, 31u}, {0u, 0u},
