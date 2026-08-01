@@ -660,6 +660,21 @@ namespace
         }
     }
 
+    GsBackendDecision prepareAnyDepthCt32Sprite(
+        const GsDrawCommand &command,
+        GsVulkanDepthCt32Sprite &sprite)
+    {
+        GsBackendDecision decision =
+            prepareGsVulkanDepthCt32Sprite(command, sprite);
+        if (!decision.supported &&
+            decision.reason == GsFallbackReason::AlphaBlend)
+        {
+            decision = prepareGsVulkanSourceOverDepthCt32Sprite(
+                command, sprite);
+        }
+        return decision;
+    }
+
     void applyDepthCt32SpriteCpu(
         std::vector<uint8_t> &vram,
         const GsVulkanDepthCt32Sprite &sprite)
@@ -4720,25 +4735,11 @@ void register_ps2_gs_vulkan_tests()
                     sourceOverZ24, 30'102u,
                     0x0000008000000044ull, false, true),
             }};
-            const auto prepareDepth = [](
-                const GsDrawCommand &command,
-                GsVulkanDepthCt32Sprite &sprite)
-            {
-                GsBackendDecision decision =
-                    prepareGsVulkanDepthCt32Sprite(command, sprite);
-                if (!decision.supported &&
-                    decision.reason == GsFallbackReason::AlphaBlend)
-                {
-                    decision = prepareGsVulkanSourceOverDepthCt32Sprite(
-                        command, sprite);
-                }
-                return decision;
-            };
             std::array<GsVulkanDepthCt32Sprite, 3> prepared{};
             for (size_t index = 0u; index < commands.size(); ++index)
             {
                 t.IsTrue(
-                    prepareDepth(
+                    prepareAnyDepthCt32Sprite(
                         commands[index], prepared[index]).supported,
                     "the Verify depth fixture should satisfy its narrow predicate");
             }
@@ -4789,7 +4790,8 @@ void register_ps2_gs_vulkan_tests()
                     {
                         ++softwareCalls;
                         GsVulkanDepthCt32Sprite sprite{};
-                        if (prepareDepth(draw, sprite).supported)
+                        if (prepareAnyDepthCt32Sprite(
+                                draw, sprite).supported)
                         {
                             applyDepthCt32SpriteCpu(vram, sprite);
                         }
@@ -4844,9 +4846,9 @@ void register_ps2_gs_vulkan_tests()
                      "the synchronized Verify fixture should enter strict mode");
             t.IsTrue(backend->classify(commands.front()).supported,
                      "strict should expose the resident-qualified depth class");
-            t.IsFalse(
+            t.IsTrue(
                 backend->classify(commands.back()).supported,
-                "strict source-over routing should remain closed in the Verify slice");
+                "strict should expose resident-qualified source-over depth");
             t.IsTrue(backend->setMode(GsRendererMode::Hybrid),
                      "the fixture should also enter Hybrid cleanly");
             t.IsFalse(backend->classify(commands.front()).supported,
@@ -4936,7 +4938,8 @@ void register_ps2_gs_vulkan_tests()
                     [&](const GsDrawCommand &draw)
                     {
                         GsVulkanDepthCt32Sprite sprite{};
-                        if (prepareDepth(draw, sprite).supported)
+                        if (prepareAnyDepthCt32Sprite(
+                                draw, sprite).supported)
                         {
                             applyDepthCt32SpriteCpu(
                                 mismatchVram, sprite);
@@ -5006,16 +5009,26 @@ void register_ps2_gs_vulkan_tests()
         tc.Run("Vulkan strict backend keeps ordered depth CT32 sprites resident", [](TestCase &t)
         {
             GSMem::InitLookupTables();
-            const std::array<GsDrawCommand, 6> commands =
+            std::array<GsDrawCommand, 6> commands =
                 makeOrderedDepthCt32SpriteCommands(39'000u);
+            commands[1] = makeAlphaBlendCommand(
+                commands[1], 39'001u,
+                0x0000008000000044ull, false, true);
             std::array<GsVulkanDepthCt32Sprite, 6> prepared{};
             for (size_t index = 0u; index < commands.size(); ++index)
             {
                 t.IsTrue(
-                    prepareGsVulkanDepthCt32Sprite(
+                    prepareAnyDepthCt32Sprite(
                         commands[index], prepared[index]).supported,
                     "the strict depth fixture should satisfy its narrow predicate");
             }
+            t.Equals(
+                prepared[1].colorBlendMode,
+                GS_VULKAN_DEPTH_CT32_COLOR_SOURCE_OVER,
+                "the overlapping strict pair should retain source-over");
+            t.IsTrue(
+                commands[1].resources().framebufferReadPages.any(),
+                "source-over strict work should retain its framebuffer read");
 
             const std::vector<uint8_t> initial =
                 makeVramPattern(0x44535431u);
@@ -5193,6 +5206,10 @@ void register_ps2_gs_vulkan_tests()
             t.Equals(backend->classify(commands.front()).reason,
                      GsFallbackReason::CostModel,
                      "small strict fixtures should stay on the CPU in Hybrid");
+            t.Equals(
+                backend->classify(commands[1]).reason,
+                GsFallbackReason::AlphaBlend,
+                "Hybrid source-over should remain closed before measurement");
 
             std::vector<uint8_t> unavailableVram = initial;
             std::unique_ptr<GsVulkanRasterBackend> unavailable =
@@ -14505,14 +14522,17 @@ void register_ps2_gs_vulkan_tests()
             if (!service)
                 return;
 
-            const std::array<GsDrawCommand, 6> commands =
+            std::array<GsDrawCommand, 6> commands =
                 makeOrderedDepthCt32SpriteCommands(38'000u);
+            commands[1] = makeAlphaBlendCommand(
+                commands[1], 38'001u,
+                0x0000008000000044ull, false, true);
             std::vector<GsVulkanDepthCt32Sprite> sprites;
             for (const GsDrawCommand &command : commands)
             {
                 GsVulkanDepthCt32Sprite sprite{};
                 const GsBackendDecision decision =
-                    prepareGsVulkanDepthCt32Sprite(command, sprite);
+                    prepareAnyDepthCt32Sprite(command, sprite);
                 if (!decision.supported)
                 {
                     t.Fail(
@@ -14522,6 +14542,10 @@ void register_ps2_gs_vulkan_tests()
                 }
                 sprites.push_back(sprite);
             }
+            t.Equals(
+                sprites[1].colorBlendMode,
+                GS_VULKAN_DEPTH_CT32_COLOR_SOURCE_OVER,
+                "the overlapping resident pair should retain source-over");
 
             const auto colorPages = [](
                 const GsVulkanDepthCt32Sprite &sprite)

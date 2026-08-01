@@ -952,7 +952,8 @@ GsBackendDecision GsVulkanRasterBackend::classify(
             prepareGsVulkanDepthCt32Sprite(command, depthSprite);
         if (!depthDecision.supported &&
             depthDecision.reason == GsFallbackReason::AlphaBlend &&
-            m_impl->config.mode == GsRendererMode::Verify)
+            (m_impl->config.mode == GsRendererMode::Verify ||
+             m_impl->config.mode == GsRendererMode::GpuStrict))
         {
             depthDecision =
                 prepareGsVulkanSourceOverDepthCt32Sprite(
