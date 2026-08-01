@@ -788,7 +788,8 @@ GsBackendDecision GsVulkanRasterBackend::classify(
 
     if (command.primitive().type == GS_PRIM_SPRITE &&
         command.primitive().tme &&
-        m_impl->config.mode == GsRendererMode::Verify)
+        (m_impl->config.mode == GsRendererMode::Verify ||
+         m_impl->config.mode == GsRendererMode::GpuStrict))
     {
         GsVulkanNearestCt32Sprite texturedSprite{};
         const GsBackendDecision textureDecision =
@@ -985,6 +986,54 @@ void GsVulkanRasterBackend::submit(
             // GPU pages now contain the same generation as the CPU oracle.
             m_impl->coherency.completeCpuToGpu(resources.writePages);
             ++m_impl->statistics.verifiedCommands;
+        }
+        else if (isTexturedSprite)
+        {
+            // The first strict texture slice deliberately retains the
+            // independently qualified whole-image service transaction. It
+            // publishes only after the executor has returned one complete
+            // image; resident texture submission is a separate gate.
+            GsVramPageMask allPages;
+            allPages.setAll();
+            prepareCpuVramAccess(
+                allPages, GsFlushReason::BackendSwitch);
+            std::vector<uint8_t> initial(
+                m_impl->canonicalVram.begin(),
+                m_impl->canonicalVram.end());
+            std::vector<uint8_t> gpuOutput;
+            std::string executionError;
+            if (!m_impl->executor->executeNearestCt32Sprite(
+                    initial, texturedSprite, gpuOutput,
+                    &executionError) ||
+                gpuOutput.size() != GS_VULKAN_VRAM_SIZE)
+            {
+                if (executionError.empty())
+                {
+                    executionError =
+                        "executor returned an invalid VRAM image";
+                }
+                m_impl->failRequest(
+                    "nearest CT32 strict draw " +
+                        std::to_string(command.sequence()),
+                    std::move(executionError));
+            }
+
+            // The request uploads the complete canonical input, writes the
+            // qualified destination pages, and returns the complete resulting
+            // device image. Publish it as one synchronous transaction so no
+            // observer can see a partial strict draw.
+            const GsVramPageMask initiallyCpuNewer =
+                m_impl->coherency.cpuNewerPages(allPages);
+            m_impl->coherency.completeCpuToGpu(initiallyCpuNewer);
+            m_impl->coherency.noteGpuWrite(resources.writePages);
+            std::copy(
+                gpuOutput.begin(), gpuOutput.end(),
+                m_impl->canonicalVram.begin());
+            m_impl->coherency.completeGpuToCpu(resources.writePages);
+            ++m_impl->statistics.committedGpuCommands;
+            ++m_impl->statistics.commandsCompleted;
+            if (m_impl->acceleratedCommit)
+                m_impl->acceleratedCommit(command);
         }
         else
         {

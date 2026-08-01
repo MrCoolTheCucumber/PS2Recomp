@@ -50,11 +50,13 @@ struct GsVulkanRasterBackendStatistics
 };
 
 // Verify mode retains Phase 3's independent whole-image transaction and full
-// 4 MiB comparison. Hybrid and strict modes keep device VRAM resident and use
-// the page-coherency hooks inherited from IGsRasterBackend; canonical CPU VRAM
-// may therefore be stale until the router prepares an overlapping CPU access.
-// The caller must keep the canonical VRAM address and extent stable for the
-// backend's lifetime.
+// 4 MiB comparison. Hybrid and resident-capable strict classes use the
+// page-coherency hooks inherited from IGsRasterBackend; newly qualified strict
+// classes may retain a synchronous whole-image transaction until their
+// resident path is independently proven. Canonical CPU VRAM may therefore be
+// stale only for resident work until the router prepares an overlapping CPU
+// access. The caller must keep the canonical VRAM address and extent stable for
+// the backend's lifetime.
 class GsVulkanRasterBackend final : public IGsRasterBackend
 {
 public:

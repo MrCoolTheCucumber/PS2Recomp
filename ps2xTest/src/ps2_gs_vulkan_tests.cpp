@@ -2003,8 +2003,8 @@ void register_ps2_gs_vulkan_tests()
                     command.vertices().data(), command.vertexCount()),
                 command.globalState());
             t.Equals(backend->classify(unsupported).reason,
-                     GsFallbackReason::Textured,
-                     "the backend should reuse the canonical reason");
+                     GsFallbackReason::UnsupportedTextureFunction,
+                     "strict should retain the first unmet texture invariant");
             const std::vector<uint8_t> unsupportedSentinel = vram;
             bool unsupportedThrew = false;
             try
@@ -2116,6 +2116,7 @@ void register_ps2_gs_vulkan_tests()
             std::vector<uint8_t> expected = initial;
             applyNearestCt32SpriteCpu(expected, prepared);
             uint64_t softwareCalls = 0u;
+            uint64_t commitCalls = 0u;
             GsVulkanRasterBackendConfig config{};
             config.mode = GsRendererMode::Verify;
             std::unique_ptr<GsVulkanRasterBackend> backend =
@@ -2133,7 +2134,8 @@ void register_ps2_gs_vulkan_tests()
                             applyNearestCt32SpriteCpu(vram, sprite);
                         }
                     },
-                    {}, nullptr);
+                    [&](const GsDrawCommand &) { ++commitCalls; },
+                    nullptr);
             t.IsNotNull(backend.get(),
                         "an exact texture executor should create Verify");
             if (!backend)
@@ -2169,9 +2171,40 @@ void register_ps2_gs_vulkan_tests()
 
             t.IsTrue(backend->setMode(GsRendererMode::GpuStrict),
                      "the synchronized backend should accept strict mode");
-            t.Equals(backend->classify(command).reason,
-                     GsFallbackReason::Textured,
-                     "strict routing should remain closed around the new texture class");
+            t.IsTrue(backend->classify(command).supported,
+                     "strict should expose the qualified nearest texture class");
+            std::copy(initial.begin(), initial.end(), vram.begin());
+            GsVramPageMask allPages;
+            allPages.setAll();
+            backend->noteCpuVramWrite(allPages);
+            backend->submit(
+                std::span<const GsDrawCommand>(&command, 1u));
+            t.IsTrue(vram == expected,
+                     "strict should publish the complete exact GPU image");
+            t.Equals(softwareCalls, 1ull,
+                     "strict texture execution must not call the software oracle");
+            t.Equals(commitCalls, 1ull,
+                     "strict texture execution should publish one commit callback");
+            t.Equals(backend->pendingCommandCount(), size_t{0u},
+                     "strict textures should remain synchronous until resident qualification");
+            const GsVulkanRasterBackendStatistics strictStatistics =
+                backend->backendStatistics();
+            t.Equals(strictStatistics.commandsAttempted, 2ull,
+                     "Verify and strict should each attempt the texture draw");
+            t.Equals(strictStatistics.commandsCompleted, 2ull,
+                     "Verify and strict should each complete the texture draw");
+            t.Equals(strictStatistics.verifiedCommands, 1ull,
+                     "strict should not increment verification accounting");
+            t.Equals(strictStatistics.committedGpuCommands, 1ull,
+                     "strict should commit the GPU result exactly once");
+            t.Equals(strictStatistics.residentCommands, 0ull,
+                     "strict should not claim resident texture execution");
+            t.Equals(strictStatistics.pageOwnership.cpuNewerPages,
+                     size_t{0u},
+                     "the complete strict upload should consume CPU-newer pages");
+            t.Equals(strictStatistics.pageOwnership.gpuNewerPages,
+                     size_t{0u},
+                     "synchronous strict publication should leave no stale CPU page");
             t.IsTrue(backend->setMode(GsRendererMode::Hybrid),
                      "the synchronized backend should accept Hybrid mode");
             t.Equals(backend->classify(command).reason,
@@ -2193,12 +2226,60 @@ void register_ps2_gs_vulkan_tests()
                 t.Equals(unavailable->classify(command).reason,
                          GsFallbackReason::BackendUnavailable,
                          "missing exact texture capability should fail before submission");
+                t.IsTrue(unavailable->setMode(GsRendererMode::GpuStrict),
+                         "the base-capable executor should still enter strict mode");
+                t.Equals(unavailable->classify(command).reason,
+                         GsFallbackReason::BackendUnavailable,
+                         "strict should preserve the missing texture capability reason");
                 t.Equals(
                     unavailable->serviceStatistics()
                         .nearestCt32SpriteDrawsFailed,
                     0ull,
-                    "capability fallback must not post texture work");
+                         "capability fallback must not post texture work");
             }
+
+            std::vector<uint8_t> failureVram = initial;
+            uint64_t failedSoftwareCalls = 0u;
+            std::unique_ptr<GsVulkanRasterBackend> failing =
+                GsVulkanRasterBackend::createWithExecutor(
+                    std::make_unique<FakeCt32Executor>(
+                        FakeCt32Executor::Behavior::Fail),
+                    GsVulkanRasterBackendConfig{
+                        GsRendererMode::GpuStrict, {}},
+                    failureVram,
+                    [&](const GsDrawCommand &)
+                    {
+                        ++failedSoftwareCalls;
+                    },
+                    {}, nullptr);
+            t.IsNotNull(failing.get(),
+                        "an initially healthy failing texture executor should construct");
+            bool executionThrew = false;
+            if (failing)
+            {
+                try
+                {
+                    failing->submit(
+                        std::span<const GsDrawCommand>(&command, 1u));
+                }
+                catch (const std::runtime_error &error)
+                {
+                    executionThrew =
+                        std::string(error.what()).find(
+                            "before canonical VRAM mutation") !=
+                        std::string::npos;
+                }
+                t.Equals(
+                    failing->backendStatistics().gpuRequestsFailed,
+                    1ull,
+                    "strict texture execution failure should be counted once");
+            }
+            t.IsTrue(executionThrew,
+                     "strict texture failure should identify its atomic boundary");
+            t.IsTrue(failureVram == initial,
+                     "strict texture failure must preserve canonical VRAM");
+            t.Equals(failedSoftwareCalls, 0ull,
+                     "strict texture failure must not invoke software fallback");
         });
 
         tc.Run("Vulkan raster backend routes exact triangles behind capability", [](TestCase &t)
@@ -4600,6 +4681,158 @@ void register_ps2_gs_vulkan_tests()
                      "integrated texture Verify should remain validation-clean");
             t.Equals(service.validationWarnings, 0u,
                      "integrated texture Verify should emit no validation warnings");
+        });
+
+        tc.Run("GS Vulkan routes nearest CT32 texture sprites in strict mode", [](TestCase &t)
+        {
+            GSMem::InitLookupTables();
+            const GsDrawCommand command = makeNearestCt32SpriteCommand(
+                95u, 40u, 2u, 64u, 2u, 6u, 5u,
+                {6u, 15u, 5u, 12u}, {32u, 16u},
+                {352u, 96u}, {48u, 304u},
+                {480u, 224u}, {64u, 320u});
+            GsVulkanNearestCt32Sprite prepared{};
+            t.IsTrue(
+                prepareGsVulkanNearestCt32Sprite(
+                    command, prepared).supported,
+                "the strict frontend fixture should satisfy the texture predicate");
+
+            GSContext filteredContext = command.context();
+            filteredContext.tex1 |= 1ull << 5u;
+            const GsDrawCommand filtered = buildGsDrawCommand(
+                96u, command.primitive(), filteredContext,
+                std::span<const GSVertex>(
+                    command.vertices().data(), command.vertexCount()),
+                command.globalState());
+            t.Equals(
+                prepareGsVulkanNearestCt32Sprite(
+                    filtered, prepared).reason,
+                GsFallbackReason::UnsupportedTextureFilter,
+                "the rejected strict fixture should name its first invariant");
+
+            std::vector<uint8_t> softwareVram =
+                makeVramPattern(0x54585331u);
+            std::vector<uint8_t> strictVram = softwareVram;
+            GS software;
+            GS strict;
+            software.init(
+                softwareVram.data(),
+                static_cast<uint32_t>(softwareVram.size()), nullptr);
+            strict.init(
+                strictVram.data(),
+                static_cast<uint32_t>(strictVram.size()), nullptr);
+
+            GsVulkanCapabilityReport preflight{};
+            const GsVulkanServiceConfig config =
+                makeRendererServiceConfig(preflight);
+            t.IsTrue(strict.configureVulkanRenderer(config),
+                     "the strict texture fixture should accept Vulkan configuration");
+            if (!preflight.ready())
+            {
+                t.IsFalse(strict.setRendererMode(
+                              GsRendererMode::GpuStrict),
+                          "an unavailable host should decline texture strict cleanly");
+                return;
+            }
+
+            const GsVulkanDeviceReport *selected =
+                preflight.selectedDevice();
+            t.IsNotNull(selected,
+                        "a ready strict texture preflight should select one device");
+            if (!selected)
+                return;
+            t.IsTrue(selected->exactNearestCt32Sprite,
+                     "the selected device should expose the exact texture kernel");
+            if (!selected->exactNearestCt32Sprite)
+                return;
+
+            t.IsTrue(strict.setRendererMode(
+                         GsRendererMode::GpuStrict),
+                     "the qualified host should enter texture strict mode");
+            if (strict.rendererMode() != GsRendererMode::GpuStrict)
+                return;
+            strict.setBackendCountersEnabled(true);
+            strict.resetBackendCounters();
+
+            drawNearestCt32SpriteCommand(software, command);
+            drawNearestCt32SpriteCommand(strict, command);
+            (void)software.getDebugSnapshot();
+            (void)strict.getDebugSnapshot();
+            t.IsTrue(strictVram == softwareVram,
+                     "strict texture routing should match complete software VRAM");
+
+            const std::vector<uint8_t> rejectionSentinel = strictVram;
+            std::string rejection;
+            try
+            {
+                drawNearestCt32SpriteCommand(strict, filtered);
+            }
+            catch (const std::runtime_error &error)
+            {
+                rejection = error.what();
+            }
+            t.IsTrue(rejection.find("unsupported-texture-filter") !=
+                         std::string::npos,
+                     "strict should expose the exact unsupported filter reason");
+            t.IsTrue(strictVram == rejectionSentinel,
+                     "strict texture rejection must precede canonical mutation");
+
+            const GsBackendCounters counters = strict.backendCounters();
+            t.Equals(counters.commands, 2ull,
+                     "strict should classify one accepted and one rejected texture draw");
+            t.Equals(counters.acceleratedCommands, 1ull,
+                     "the qualified strict texture should reach Vulkan");
+            t.Equals(counters.softwareCommands, 0ull,
+                     "strict texture routing must never use software fallback");
+            t.Equals(counters.fallbackCommands, 0ull,
+                     "strict rejection should not be counted as Hybrid fallback");
+            t.Equals(counters.strictFailures, 1ull,
+                     "the unsupported filter should fail strict exactly once");
+            t.Equals(counters.decisions[static_cast<size_t>(
+                         GsFallbackReason::UnsupportedTextureFilter)],
+                     1ull,
+                     "the router should retain the exact strict texture reason");
+
+            const GsVulkanRasterBackendStatistics backend =
+                strict.vulkanRendererBackendStatistics();
+            t.Equals(backend.commandsAttempted, 1ull,
+                     "only the supported strict texture should be submitted");
+            t.Equals(backend.commandsCompleted, 1ull,
+                     "the strict texture should complete exactly once");
+            t.Equals(backend.committedGpuCommands, 1ull,
+                     "the strict texture should publish one GPU result");
+            t.Equals(backend.verifiedCommands, 0ull,
+                     "strict texture routing should not run the Verify oracle");
+            t.Equals(backend.bytesCompared, 0ull,
+                     "strict texture routing should not claim a comparison");
+            t.Equals(backend.residentCommands, 0ull,
+                     "strict texture routing should stay outside residency for now");
+            t.Equals(backend.pageOwnership.gpuNewerPages, size_t{0u},
+                     "synchronous strict texture publication should update CPU VRAM");
+            t.Equals(backend.coherency.rejectedTransitions, 0ull,
+                     "strict texture publication should preserve page ownership");
+
+            const GsVulkanServiceStatistics service =
+                strict.vulkanRendererServiceStatistics();
+            t.Equals(service.nearestCt32SpriteDrawsCompleted, 1ull,
+                     "the service should execute one strict texture request");
+            t.Equals(service.nearestCt32SpriteDrawsFailed, 0ull,
+                     "classification rejection must not post service work");
+            t.Equals(
+                service.nearestCt32SpritePixelsExecuted,
+                static_cast<uint64_t>(
+                    prepared.boundsX1 - prepared.boundsX0) *
+                    static_cast<uint64_t>(
+                        prepared.boundsY1 - prepared.boundsY0),
+                "the service should retain strict texture pixel accounting");
+            t.Equals(service.spriteDrawsCompleted, 0ull,
+                     "strict texture routing must not alias the flat sprite request");
+            t.Equals(service.triangleDrawsCompleted, 0ull,
+                     "strict texture routing must not alias the triangle request");
+            t.Equals(service.validationErrors, 0u,
+                     "strict texture routing should remain validation-clean");
+            t.Equals(service.validationWarnings, 0u,
+                     "strict texture routing should emit no validation warnings");
         });
 
         tc.Run("GS Vulkan nearest CT32 Verify survives every frame checkpoint", [](TestCase &t)
