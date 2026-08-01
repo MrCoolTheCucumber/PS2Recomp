@@ -4611,8 +4611,9 @@ void register_ps2_gs_vulkan_tests()
 
             t.IsTrue(backend->setMode(GsRendererMode::Hybrid),
                      "a synchronized strict depth backend should enter Hybrid");
-            t.IsFalse(backend->classify(commands.front()).supported,
-                      "Hybrid should remain closed before depth measurement");
+            t.Equals(backend->classify(commands.front()).reason,
+                     GsFallbackReason::CostModel,
+                     "small strict fixtures should stay on the CPU in Hybrid");
 
             std::vector<uint8_t> unavailableVram = initial;
             std::unique_ptr<GsVulkanRasterBackend> unavailable =
@@ -4685,6 +4686,196 @@ void register_ps2_gs_vulkan_tests()
                      "strict depth failure must preserve canonical VRAM");
             t.Equals(failedSoftwareCalls, 0ull,
                      "strict depth failure must not invoke software fallback");
+        });
+
+        tc.Run("Vulkan Hybrid admits measured depth CT32 work", [](TestCase &t)
+        {
+            GSMem::InitLookupTables();
+            constexpr uint64_t thresholdPixels = 262'144u;
+            const GsDrawCommand belowThreshold =
+                makeDepthCt32SpriteCommand(
+                    39'099u, 0u, 8u, 256u,
+                    GS_PSM_Z24, false, 1u,
+                    {0u, 511u, 0u, 510u}, {0u, 0u},
+                    0u, 0u, 512u * 16u, 511u * 16u,
+                    0x40302010u, 0x00444444u);
+            const GsDrawCommand atThreshold = makeDepthCt32SpriteCommand(
+                39'100u, 0u, 8u, 256u,
+                GS_PSM_Z24, false, 1u,
+                {0u, 511u, 0u, 511u}, {0u, 0u},
+                0u, 0u, 512u * 16u, 512u * 16u,
+                0x80706050u, 0x00555555u);
+            const GsDrawCommand retainedTitle =
+                makeDepthCt32SpriteCommand(
+                    39'101u, 112u, 8u, 216u,
+                    GS_PSM_Z24, false, 1u,
+                    {0u, 511u, 0u, 415u},
+                    {1792u * 16u, 1840u * 16u},
+                    1792u * 16u - 8u, 1840u * 16u - 8u,
+                    (1792u + 32u) * 16u - 8u,
+                    (1840u + 416u) * 16u - 8u,
+                    0x80000000u, 0u);
+            const std::array<GsDrawCommand, 5> admittedStates{{
+                atThreshold,
+                makeDepthCt32SpriteCommand(
+                    39'102u, 0u, 8u, 256u,
+                    GS_PSM_Z32, false, 1u,
+                    {0u, 511u, 0u, 511u}, {0u, 0u},
+                    0u, 0u, 512u * 16u, 512u * 16u,
+                    0x90807060u, 0x55555555u),
+                makeDepthCt32SpriteCommand(
+                    39'103u, 0u, 8u, 256u,
+                    GS_PSM_Z24, true, 2u,
+                    {0u, 511u, 0u, 511u}, {0u, 0u},
+                    0u, 0u, 512u * 16u, 512u * 16u,
+                    0xA0908070u, 0x007FFFFFu),
+                makeDepthCt32SpriteCommand(
+                    39'104u, 0u, 8u, 256u,
+                    GS_PSM_Z32, true, 3u,
+                    {0u, 511u, 0u, 511u}, {0u, 0u},
+                    0u, 0u, 512u * 16u, 512u * 16u,
+                    0xB0A09080u, 0x7FFFFFFFu),
+                makeDepthCt32SpriteCommand(
+                    39'105u, 0u, 8u, 256u,
+                    GS_PSM_Z24, false, 2u,
+                    {0u, 511u, 0u, 511u}, {0u, 0u},
+                    0u, 0u, 512u * 16u, 512u * 16u,
+                    0xC0B0A090u, 0x007FFFFFu),
+            }};
+            std::array<GsVulkanDepthCt32Sprite, 5> prepared{};
+            for (size_t index = 0u; index < admittedStates.size(); ++index)
+            {
+                t.IsTrue(
+                    prepareGsVulkanDepthCt32Sprite(
+                        admittedStates[index], prepared[index]).supported,
+                    "every measured depth state should remain exact");
+            }
+            GsVulkanDepthCt32Sprite belowPrepared{};
+            GsVulkanDepthCt32Sprite retainedPrepared{};
+            t.IsTrue(prepareGsVulkanDepthCt32Sprite(
+                         belowThreshold, belowPrepared).supported,
+                     "the below-threshold depth fixture should be semantic");
+            t.IsTrue(prepareGsVulkanDepthCt32Sprite(
+                         retainedTitle, retainedPrepared).supported,
+                     "the retained title depth fixture should be semantic");
+            const auto pixels = [](const GsVulkanDepthCt32Sprite &sprite)
+            {
+                return static_cast<uint64_t>(
+                           sprite.boundsX1 - sprite.boundsX0) *
+                       static_cast<uint64_t>(
+                           sprite.boundsY1 - sprite.boundsY0);
+            };
+            t.Equals(pixels(belowPrepared), 261'632ull,
+                     "the smaller fixture should be one row below policy");
+            t.Equals(pixels(prepared.front()), thresholdPixels,
+                     "the admitted fixture should meet policy exactly");
+            t.Equals(pixels(retainedPrepared), 13'312ull,
+                     "the retained title fixture should preserve exact work");
+
+            const std::vector<uint8_t> initial =
+                makeVramPattern(0x4448434Fu);
+            std::vector<uint8_t> expected = initial;
+            applyDepthCt32SpriteCpu(expected, prepared.front());
+            std::vector<uint8_t> vram = initial;
+            uint64_t softwareCalls = 0u;
+            uint64_t commitCalls = 0u;
+            GsVulkanRasterBackendConfig config{};
+            config.mode = GsRendererMode::Hybrid;
+            t.Equals(config.minimumHybridDepthCt32SpritePixels,
+                     thresholdPixels,
+                     "depth Hybrid should retain the measured default");
+            std::unique_ptr<GsVulkanRasterBackend> backend =
+                GsVulkanRasterBackend::createWithExecutor(
+                    std::make_unique<FakeCt32Executor>(
+                        FakeCt32Executor::Behavior::Exact),
+                    config, vram,
+                    [&](const GsDrawCommand &) { ++softwareCalls; },
+                    [&](const GsDrawCommand &) { ++commitCalls; }, nullptr);
+            t.IsNotNull(backend.get(),
+                        "an exact executor should create depth Hybrid mode");
+            if (!backend)
+                return;
+            t.Equals(backend->classify(belowThreshold).reason,
+                     GsFallbackReason::CostModel,
+                     "depth work below the measured envelope should use CPU");
+            t.Equals(backend->classify(retainedTitle).reason,
+                     GsFallbackReason::CostModel,
+                     "the retained 13312-pixel title draw should stay on CPU");
+            for (const GsDrawCommand &command : admittedStates)
+            {
+                t.IsTrue(backend->classify(command).supported,
+                         "every exact state at the threshold should use Vulkan");
+            }
+            t.IsTrue(backend->setMode(GsRendererMode::GpuStrict),
+                     "the depth policy fixture should enter strict mode");
+            t.IsTrue(backend->classify(belowThreshold).supported,
+                     "strict mode should ignore the depth cost policy");
+            t.IsTrue(backend->setMode(GsRendererMode::Verify),
+                     "the depth policy fixture should enter Verify");
+            t.IsTrue(backend->classify(retainedTitle).supported,
+                     "Verify should exercise the retained depth candidate");
+            t.IsTrue(backend->setMode(GsRendererMode::Hybrid),
+                     "the depth policy fixture should restore Hybrid");
+
+            backend->submit(
+                std::span<const GsDrawCommand>(&atThreshold, 1u));
+            t.Equals(backend->pendingCommandCount(), size_t{1u},
+                     "the admitted depth draw should remain resident");
+            backend->flush(GsFlushReason::Explicit);
+            backend->prepareCpuVramAccess(
+                atThreshold.resources().writePages,
+                GsFlushReason::CpuReadback);
+            t.IsTrue(vram == expected,
+                     "the admitted Hybrid depth draw should remain exact");
+            t.Equals(softwareCalls, 0ull,
+                     "admitted Hybrid depth must not call its oracle");
+            t.Equals(commitCalls, 1ull,
+                     "admitted Hybrid depth should commit once");
+            const GsVulkanServiceStatistics service =
+                backend->serviceStatistics();
+            t.Equals(service.depthCt32SpriteDrawsCompleted, 1ull,
+                     "the admitted draw should reach the depth executor");
+            t.Equals(service.residentDepthCt32SpriteBatchesCompleted, 1ull,
+                     "the admitted draw should use resident depth execution");
+
+            std::vector<uint8_t> unavailableVram = initial;
+            std::unique_ptr<GsVulkanRasterBackend> unavailable =
+                GsVulkanRasterBackend::createWithExecutor(
+                    std::make_unique<FakeCt32Executor>(
+                        FakeCt32Executor::Behavior::Exact,
+                        true, true, true, false),
+                    config, unavailableVram,
+                    [](const GsDrawCommand &) {}, {}, nullptr);
+            t.IsNotNull(unavailable.get(),
+                        "a base-capable executor should retain depth fallback");
+            if (unavailable)
+            {
+                t.Equals(unavailable->classify(belowThreshold).reason,
+                         GsFallbackReason::BackendUnavailable,
+                         "missing depth capability should precede cost policy");
+                t.Equals(
+                    unavailable->serviceStatistics()
+                        .residentDepthCt32SpriteBatchesFailed,
+                    0ull,
+                    "capability fallback must not post depth work");
+            }
+
+            GsVulkanRasterBackendConfig disabledConfig = config;
+            disabledConfig.minimumHybridDepthCt32SpritePixels = 0u;
+            std::vector<uint8_t> disabledVram = initial;
+            std::unique_ptr<GsVulkanRasterBackend> disabled =
+                GsVulkanRasterBackend::createWithExecutor(
+                    std::make_unique<FakeCt32Executor>(
+                        FakeCt32Executor::Behavior::Exact),
+                    disabledConfig, disabledVram,
+                    [](const GsDrawCommand &) {}, {}, nullptr);
+            t.IsNotNull(disabled.get(),
+                        "a zero-threshold depth Hybrid should construct");
+            if (disabled)
+            {
+                t.IsTrue(disabled->classify(retainedTitle).supported,
+                         "zero should disable only the depth cost policy");
+            }
         });
 
         tc.Run("Vulkan strict backend keeps linear CT32 textures resident", [](TestCase &t)
@@ -9315,6 +9506,206 @@ void register_ps2_gs_vulkan_tests()
                      "strict depth checkpoints should remain validation-clean");
             t.Equals(service.validationWarnings, 0u,
                      "strict depth checkpoints should emit no validation warnings");
+        });
+
+        tc.Run("GS Vulkan Hybrid keeps retained depth on CPU and orders admitted work", [](TestCase &t)
+        {
+            GSMem::InitLookupTables();
+            constexpr uint64_t thresholdPixels = 262'144u;
+            const GsDrawCommand retainedTitle =
+                makeDepthCt32SpriteCommand(
+                    41'000u, 112u, 8u, 216u,
+                    GS_PSM_Z24, false, 1u,
+                    {0u, 511u, 0u, 415u},
+                    {1792u * 16u, 1840u * 16u},
+                    1792u * 16u - 8u, 1840u * 16u - 8u,
+                    (1792u + 32u) * 16u - 8u,
+                    (1840u + 416u) * 16u - 8u,
+                    0x80000000u, 0u);
+            const GsDrawCommand admitted =
+                makeDepthCt32SpriteCommand(
+                    41'001u, 0u, 8u, 256u,
+                    GS_PSM_Z32, false, 1u,
+                    {0u, 511u, 0u, 511u}, {0u, 0u},
+                    0u, 0u, 512u * 16u, 512u * 16u,
+                    0xC0A08060u, 0x55667788u);
+            GsVulkanDepthCt32Sprite retainedPrepared{};
+            GsVulkanDepthCt32Sprite admittedPrepared{};
+            t.IsTrue(prepareGsVulkanDepthCt32Sprite(
+                         retainedTitle, retainedPrepared).supported,
+                     "the retained Hybrid title fixture should be exact");
+            t.IsTrue(prepareGsVulkanDepthCt32Sprite(
+                         admitted, admittedPrepared).supported,
+                     "the admitted Hybrid depth fixture should be exact");
+            const auto pixels = [](const GsVulkanDepthCt32Sprite &sprite)
+            {
+                return static_cast<uint64_t>(
+                           sprite.boundsX1 - sprite.boundsX0) *
+                       static_cast<uint64_t>(
+                           sprite.boundsY1 - sprite.boundsY0);
+            };
+            t.Equals(pixels(retainedPrepared), 13'312ull,
+                     "the retained fixture should preserve title work");
+            t.Equals(pixels(admittedPrepared), thresholdPixels,
+                     "the broad fixture should meet depth policy exactly");
+
+            const std::vector<uint8_t> initial =
+                makeVramPattern(0x44485942u);
+            std::vector<uint8_t> softwareVram = initial;
+            std::vector<uint8_t> defaultVram = initial;
+            std::vector<uint8_t> forcedVram = initial;
+            GS software;
+            GS defaultHybrid;
+            GS forcedHybrid;
+            software.init(
+                softwareVram.data(),
+                static_cast<uint32_t>(softwareVram.size()), nullptr);
+            defaultHybrid.init(
+                defaultVram.data(),
+                static_cast<uint32_t>(defaultVram.size()), nullptr);
+            forcedHybrid.init(
+                forcedVram.data(),
+                static_cast<uint32_t>(forcedVram.size()), nullptr);
+
+            GsVulkanCapabilityReport preflight{};
+            const GsVulkanServiceConfig serviceConfig =
+                makeRendererServiceConfig(preflight);
+            GsVulkanRasterBackendConfig defaultConfig{};
+            GsVulkanRasterBackendConfig forcedConfig{};
+            forcedConfig.minimumHybridDepthCt32SpritePixels = 0u;
+            t.Equals(defaultConfig.minimumHybridDepthCt32SpritePixels,
+                     thresholdPixels,
+                     "the integrated depth fixture should use measured policy");
+            t.IsTrue(defaultHybrid.configureVulkanRenderer(
+                         serviceConfig, defaultConfig),
+                     "the default depth Hybrid should accept configuration");
+            t.IsTrue(forcedHybrid.configureVulkanRenderer(
+                         serviceConfig, forcedConfig),
+                     "the forced depth Hybrid should accept configuration");
+            if (!preflight.ready())
+            {
+                t.IsFalse(defaultHybrid.setRendererMode(
+                              GsRendererMode::Hybrid),
+                          "an unavailable host should decline default Hybrid");
+                t.IsFalse(forcedHybrid.setRendererMode(
+                              GsRendererMode::Hybrid),
+                          "an unavailable host should decline forced Hybrid");
+                return;
+            }
+            const GsVulkanDeviceReport *selected =
+                preflight.selectedDevice();
+            t.IsNotNull(selected,
+                        "a ready depth Hybrid preflight should select a device");
+            if (!selected)
+                return;
+            t.IsTrue(selected->exactDepthCt32Sprite,
+                     "the selected device should expose exact depth sprites");
+            if (!selected->exactDepthCt32Sprite)
+                return;
+
+            t.IsTrue(defaultHybrid.setRendererMode(
+                         GsRendererMode::Hybrid),
+                     "the qualified host should enter default depth Hybrid");
+            t.IsTrue(forcedHybrid.setRendererMode(
+                         GsRendererMode::Hybrid),
+                     "the qualified host should enter forced depth Hybrid");
+            if (defaultHybrid.rendererMode() != GsRendererMode::Hybrid ||
+                forcedHybrid.rendererMode() != GsRendererMode::Hybrid)
+            {
+                return;
+            }
+            defaultHybrid.setBackendCountersEnabled(true);
+            defaultHybrid.resetBackendCounters();
+            forcedHybrid.setBackendCountersEnabled(true);
+            forcedHybrid.resetBackendCounters();
+
+            const auto drawAll = [&](const GsDrawCommand &command)
+            {
+                drawNearestCt32SpriteCommand(software, command);
+                drawNearestCt32SpriteCommand(defaultHybrid, command);
+                drawNearestCt32SpriteCommand(forcedHybrid, command);
+            };
+            drawAll(retainedTitle);
+            drawAll(admitted);
+            drawAll(retainedTitle);
+            (void)software.getDebugSnapshot();
+            (void)defaultHybrid.getDebugSnapshot();
+            (void)forcedHybrid.getDebugSnapshot();
+            t.IsTrue(defaultVram == softwareVram,
+                     "default mixed depth routing should match full software VRAM");
+            t.IsTrue(forcedVram == softwareVram,
+                     "forced resident depth routing should match full software VRAM");
+
+            const GsBackendCounters defaultCounters =
+                defaultHybrid.backendCounters();
+            t.Equals(defaultCounters.commands, 3ull,
+                     "default Hybrid should classify all three depth draws");
+            t.Equals(defaultCounters.softwareCommands, 2ull,
+                     "both retained title draws should use software");
+            t.Equals(defaultCounters.fallbackCommands, 2ull,
+                     "both retained draws should record cost fallback");
+            t.Equals(defaultCounters.acceleratedCommands, 1ull,
+                     "only measured broad work should use default Vulkan");
+            t.Equals(defaultCounters.decisions[static_cast<size_t>(
+                         GsFallbackReason::CostModel)],
+                     2ull,
+                     "default Hybrid should retain both cost decisions");
+            t.Equals(defaultCounters.decisions[static_cast<size_t>(
+                         GsFallbackReason::Supported)],
+                     1ull,
+                     "default Hybrid should retain the admitted decision");
+
+            const GsBackendCounters forcedCounters =
+                forcedHybrid.backendCounters();
+            t.Equals(forcedCounters.commands, 3ull,
+                     "forced Hybrid should classify all depth draws");
+            t.Equals(forcedCounters.softwareCommands, 0ull,
+                     "zero threshold should avoid software depth work");
+            t.Equals(forcedCounters.fallbackCommands, 0ull,
+                     "zero threshold should avoid cost fallback");
+            t.Equals(forcedCounters.acceleratedCommands, 3ull,
+                     "zero threshold should accelerate the complete sequence");
+
+            const GsVulkanRasterBackendStatistics defaultBackend =
+                defaultHybrid.vulkanRendererBackendStatistics();
+            t.Equals(defaultBackend.commandsCompleted, 1ull,
+                     "default Hybrid should complete one GPU depth draw");
+            t.Equals(defaultBackend.committedGpuCommands, 1ull,
+                     "default Hybrid should commit one GPU depth draw");
+            t.Equals(defaultBackend.coherency.rejectedTransitions, 0ull,
+                     "mixed default depth ownership should remain valid");
+            const GsVulkanRasterBackendStatistics forcedBackend =
+                forcedHybrid.vulkanRendererBackendStatistics();
+            t.Equals(forcedBackend.commandsCompleted, 3ull,
+                     "forced Hybrid should complete every depth draw");
+            t.Equals(forcedBackend.committedGpuCommands, 3ull,
+                     "forced Hybrid should commit every depth draw");
+            t.Equals(forcedBackend.residentBatchesCompleted, 1ull,
+                     "the ordered depth service should retain one batch");
+            t.Equals(forcedBackend.largestResidentBatch, 3ull,
+                     "the ordered batch should retain all dependencies");
+            t.Equals(forcedBackend.coherency.rejectedTransitions, 0ull,
+                     "forced depth ownership should remain valid");
+
+            const GsVulkanServiceStatistics defaultService =
+                defaultHybrid.vulkanRendererServiceStatistics();
+            t.Equals(defaultService.depthCt32SpriteDrawsCompleted, 1ull,
+                     "default Hybrid should execute one depth dispatch");
+            const GsVulkanServiceStatistics forcedService =
+                forcedHybrid.vulkanRendererServiceStatistics();
+            t.Equals(forcedService.depthCt32SpriteDrawsCompleted, 3ull,
+                     "forced Hybrid should execute all depth dispatches");
+            t.Equals(
+                forcedService.residentDepthCt32SpriteBatchesCompleted,
+                1ull,
+                "forced Hybrid should use one ordered service batch");
+            t.Equals(forcedService.largestResidentDepthCt32SpriteBatch,
+                     3ull,
+                     "the service should retain the complete depth batch");
+            t.Equals(forcedService.validationErrors, 0u,
+                     "depth Hybrid transitions should remain validation-clean");
+            t.Equals(forcedService.validationWarnings, 0u,
+                     "depth Hybrid transitions should emit no warnings");
         });
 
         tc.Run("GS Vulkan strict linear CT32 survives frame and reset checkpoints", [](TestCase &t)

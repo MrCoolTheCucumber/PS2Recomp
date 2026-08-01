@@ -934,10 +934,12 @@ GsBackendDecision GsVulkanRasterBackend::classify(
     }
 
     // Depth is exact through full-image Verify and ordered resident execution.
-    // Keep Hybrid closed until its production cost is measured independently.
+    // Hybrid uses the conservative isolated-draw crossover measured across
+    // Z32/Z24 ALWAYS and comparison states.
     if (command.primitive().type == GS_PRIM_SPRITE &&
         !command.primitive().tme &&
-        (m_impl->config.mode == GsRendererMode::Verify ||
+        (m_impl->config.mode == GsRendererMode::Hybrid ||
+         m_impl->config.mode == GsRendererMode::Verify ||
          m_impl->config.mode == GsRendererMode::GpuStrict))
     {
         GsVulkanDepthCt32Sprite depthSprite{};
@@ -947,6 +949,19 @@ GsBackendDecision GsVulkanRasterBackend::classify(
             return depthDecision;
         if (!m_impl->exactDepthCt32Sprite)
             return {false, GsFallbackReason::BackendUnavailable};
+        if (m_impl->config.mode == GsRendererMode::Hybrid)
+        {
+            const uint64_t pixels =
+                static_cast<uint64_t>(
+                    depthSprite.boundsX1 - depthSprite.boundsX0) *
+                static_cast<uint64_t>(
+                    depthSprite.boundsY1 - depthSprite.boundsY0);
+            if (pixels <
+                m_impl->config.minimumHybridDepthCt32SpritePixels)
+            {
+                return {false, GsFallbackReason::CostModel};
+            }
+        }
         return depthDecision;
     }
 

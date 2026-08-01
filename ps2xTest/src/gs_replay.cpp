@@ -69,6 +69,7 @@ namespace
                "[--verify-dump-dir DIRECTORY] "
                "[--vulkan-max-resident-batch COUNT] "
                "[--vulkan-min-hybrid-pixels COUNT] "
+               "[--vulkan-min-hybrid-depth-ct32-pixels COUNT] "
                "[--vulkan-min-hybrid-nearest-ct32-pixels COUNT] "
                "[--vulkan-min-hybrid-linear-ct32-pixels COUNT] "
                "[--vulkan-min-hybrid-linear-ct32-clamp-pixels COUNT] "
@@ -387,6 +388,12 @@ namespace
                << statistics.depthCt32SpriteDrawsFailed
                << ",\"depth_ct32_sprite_pixels_executed\":"
                << statistics.depthCt32SpritePixelsExecuted
+               << ",\"resident_depth_ct32_sprite_batches_completed\":"
+               << statistics.residentDepthCt32SpriteBatchesCompleted
+               << ",\"resident_depth_ct32_sprite_batches_failed\":"
+               << statistics.residentDepthCt32SpriteBatchesFailed
+               << ",\"largest_resident_depth_ct32_sprite_batch\":"
+               << statistics.largestResidentDepthCt32SpriteBatch
                << ",\"nearest_ct32_sprite_draws_completed\":"
                << statistics.nearestCt32SpriteDrawsCompleted
                << ",\"nearest_ct32_sprite_draws_failed\":"
@@ -813,6 +820,7 @@ int main(int argc, char **argv)
             argument == "--verify-dump-dir" ||
             argument == "--vulkan-max-resident-batch" ||
             argument == "--vulkan-min-hybrid-pixels" ||
+            argument == "--vulkan-min-hybrid-depth-ct32-pixels" ||
             argument == "--vulkan-min-hybrid-nearest-ct32-pixels" ||
             argument == "--vulkan-min-hybrid-linear-ct32-pixels" ||
             argument == "--vulkan-min-hybrid-linear-ct32-clamp-pixels" ||
@@ -892,6 +900,26 @@ int main(int argc, char **argv)
                     return 2;
                 }
                 vulkanBackendConfig.minimumHybridSpritePixels = minimum;
+                vulkanOptionUsed = true;
+                replayOptionUsed = true;
+                gifReplayOptionUsed = true;
+            }
+            else if (argument ==
+                     "--vulkan-min-hybrid-depth-ct32-pixels")
+            {
+                uint64_t minimum = 0u;
+                constexpr uint64_t maximumPixels = 2048ull * 2048ull;
+                if (!parseCount(argv[index], minimum) ||
+                    minimum > maximumPixels)
+                {
+                    std::cerr
+                        << "Vulkan hybrid depth CT32 pixel threshold "
+                           "must be between 0 and "
+                        << maximumPixels << '\n';
+                    return 2;
+                }
+                vulkanBackendConfig.minimumHybridDepthCt32SpritePixels =
+                    minimum;
                 vulkanOptionUsed = true;
                 replayOptionUsed = true;
                 gifReplayOptionUsed = true;
