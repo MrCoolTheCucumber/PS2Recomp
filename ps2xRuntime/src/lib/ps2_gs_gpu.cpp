@@ -517,6 +517,41 @@ namespace
         return false;
     }
 
+    GsVramPageMask clearFramebufferPages(const GSContext &ctx)
+    {
+        if (ctx.frame.fbw == 0u ||
+            (ctx.frame.psm != GS_PSM_CT32 &&
+             ctx.frame.psm != GS_PSM_CT24 &&
+             ctx.frame.psm != GS_PSM_CT16 &&
+             ctx.frame.psm != GS_PSM_CT16S))
+        {
+            return {};
+        }
+
+        const uint32_t x0 = static_cast<uint32_t>(
+            std::max<int>(0, ctx.scissor.x0));
+        const uint32_t x1 = static_cast<uint32_t>(
+            std::max<int>(x0, ctx.scissor.x1));
+        const uint32_t y0 = static_cast<uint32_t>(
+            std::max<int>(0, ctx.scissor.y0));
+        const uint32_t y1 = static_cast<uint32_t>(
+            std::max<int>(y0, ctx.scissor.y1));
+        return gsVramPagesForSurfaceRect(
+            GSInternal::framePageBaseToBlock(ctx.frame.fbp),
+            ctx.frame.fbw,
+            ctx.frame.psm,
+            x0, y0,
+            x1 - x0 + 1u,
+            y1 - y0 + 1u);
+    }
+
+    bool isPackedFourBitPsm(uint8_t psm) noexcept
+    {
+        return psm == GS_PSM_T4 ||
+               psm == GS_PSM_T4HL ||
+               psm == GS_PSM_T4HH;
+    }
+
     std::atomic<uint32_t> s_debugGifPacketCount{0};
     std::atomic<uint32_t> s_debugGsRegisterCount{0};
     std::atomic<uint32_t> s_debugGsPackedVertexCount{0};
@@ -2688,8 +2723,6 @@ void GS::writeRegister(uint8_t regAddr, uint64_t value)
 
 void GS::performLocalToLocalTransfer()
 {
-    m_rasterizer.flushDrawBatch(this, GsFlushReason::Transfer);
-
     if (!m_vram)
         return;
 
@@ -2714,6 +2747,17 @@ void GS::performLocalToLocalTransfer()
         m_trxdir = 3;
         return;
     }
+
+    const GsVramPageMask readPages =
+        gsVramPagesForSurfaceRect(
+            sbp, sbw, spsm,
+            ssax, ssay, rrw, rrh);
+    const GsVramPageMask writePages =
+        gsVramPagesForSurfaceRect(
+            dbp, dbw, dpsm,
+            dsax, dsay, rrw, rrh);
+    m_rasterizer.beginCpuVramAccess(
+        this, readPages, writePages, GsFlushReason::Transfer);
 
     // TODO: clean this up / optimize
     switch (dir)
@@ -2809,6 +2853,7 @@ void GS::performLocalToLocalTransfer()
         break;
     }
 
+    m_rasterizer.endCpuVramAccess(this, writePages);
     m_trxdir = 3;
 }
 
@@ -2903,8 +2948,6 @@ void GS::vertexKick(bool drawing)
 
 void GS::processImageData(const uint8_t *data, uint32_t sizeBytes)
 {
-    m_rasterizer.flushDrawBatch(this, GsFlushReason::Transfer);
-
     // wrong direction set
     if (m_trxdir != 0 || !m_vram)
     {
@@ -2950,6 +2993,28 @@ void GS::processImageData(const uint8_t *data, uint32_t sizeBytes)
     u32 dsay = m_trxpos.dsay;
 
     u32 data_offset = 0;
+
+    GsVramPageMask writePages;
+    const bool hasCpuWrite = sizeBytes != 0u;
+    if (hasCpuWrite)
+    {
+        if (isPackedFourBitPsm(dpsm) && (rrw & 1u) != 0u)
+        {
+            // The current packed transfer loop consumes two pixels per byte;
+            // odd row widths do not wrap on the declared row boundary and can
+            // touch pixels outside the rectangle. Fail closed until that loop
+            // is corrected.
+            writePages.setAll();
+        }
+        else
+        {
+            writePages = gsVramPagesForSurfaceRect(
+                dbp, dbw, dpsm,
+                dsax, dsay, rrw, rrh);
+        }
+        m_rasterizer.beginCpuVramAccess(
+            this, {}, writePages, GsFlushReason::Transfer);
+    }
 
     // remove the format branching from the loops
     // TODO: fixup copypasta
@@ -3318,6 +3383,9 @@ void GS::processImageData(const uint8_t *data, uint32_t sizeBytes)
         break;
     }
 
+    if (hasCpuWrite)
+        m_rasterizer.endCpuVramAccess(this, writePages);
+
     transferTrace().record("payload",
                            transferDirection,
                            m_bitbltbuf,
@@ -3332,8 +3400,6 @@ void GS::processImageData(const uint8_t *data, uint32_t sizeBytes)
 
 void GS::performLocalToHostToBuffer()
 {
-    m_rasterizer.flushDrawBatch(this, GsFlushReason::CpuReadback);
-
     m_localToHostBuffer.clear();
     m_localToHostReadPos = 0;
 
@@ -3347,6 +3413,21 @@ void GS::performLocalToHostToBuffer()
     uint32_t rrh = m_trxreg.rrh;
     uint32_t ssax = m_trxpos.ssax;
     uint32_t ssay = m_trxpos.ssay;
+
+    GsVramPageMask readPages;
+    if (isPackedFourBitPsm(spsm) && (rrw & 1u) != 0u)
+    {
+        // The paired read loop samples one pixel beyond each odd-width row.
+        readPages.setAll();
+    }
+    else
+    {
+        readPages = gsVramPagesForSurfaceRect(
+            sbp, sbw, spsm,
+            ssax, ssay, rrw, rrh);
+    }
+    m_rasterizer.beginCpuVramAccess(
+        this, readPages, {}, GsFlushReason::CpuReadback);
 
     u32 bpp = GSMem::BitsPerPixel(static_cast<GSMem::PixelStorageMode>(spsm));
 
@@ -3402,15 +3483,30 @@ void GS::performLocalToHostToBuffer()
 bool GS::clearFramebufferContext(uint32_t contextIndex, uint32_t rgba)
 {
     std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
-    m_rasterizer.flushDrawBatch(this, GsFlushReason::Transfer);
-    return clearFramebufferRect(this, m_ctx[(contextIndex != 0u) ? 1 : 0], rgba);
+    const GSContext &context =
+        m_ctx[(contextIndex != 0u) ? 1 : 0];
+    const GsVramPageMask writePages =
+        clearFramebufferPages(context);
+    m_rasterizer.beginCpuVramAccess(
+        this, {}, writePages, GsFlushReason::Transfer);
+    const bool cleared = clearFramebufferRect(this, context, rgba);
+    if (cleared)
+        m_rasterizer.endCpuVramAccess(this, writePages);
+    return cleared;
 }
 
 bool GS::clearActiveFramebuffer(uint32_t rgba)
 {
     std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
-    m_rasterizer.flushDrawBatch(this, GsFlushReason::Transfer);
-    return clearFramebufferRect(this, activeContext(), rgba);
+    GSContext &context = activeContext();
+    const GsVramPageMask writePages =
+        clearFramebufferPages(context);
+    m_rasterizer.beginCpuVramAccess(
+        this, {}, writePages, GsFlushReason::Transfer);
+    const bool cleared = clearFramebufferRect(this, context, rgba);
+    if (cleared)
+        m_rasterizer.endCpuVramAccess(this, writePages);
+    return cleared;
 }
 
 bool GS::configureVulkanRenderer(

@@ -2333,7 +2333,12 @@ bool GSRasterizer::tryQueuePrimitive(
             m_feedbackFrameWidth == ctx.frame.fbw;
         if (!sameFeedbackSurface)
         {
-            flushDrawBatch(gs, GsFlushReason::FeedbackSnapshot);
+            const GsDrawResources resources = command.resources();
+            beginCpuVramAccess(
+                gs,
+                resources.readPages,
+                {},
+                GsFlushReason::FeedbackSnapshot);
             m_textureSnapshot.resize(gs->m_vramSize);
             std::memcpy(
                 m_textureSnapshot.data(),
@@ -2590,6 +2595,27 @@ void GSRasterizer::flushDrawBatch(
     if (gs && gs != m_owner)
         return;
     m_backendState->router.flush(reason);
+}
+
+void GSRasterizer::beginCpuVramAccess(
+    GS *gs,
+    const GsVramPageMask &readPages,
+    const GsVramPageMask &writePages,
+    GsFlushReason reason)
+{
+    if (gs && gs != m_owner)
+        return;
+    m_backendState->router.beginCpuVramAccess(
+        readPages, writePages, reason);
+}
+
+void GSRasterizer::endCpuVramAccess(
+    GS *gs,
+    const GsVramPageMask &writePages)
+{
+    if (gs && gs != m_owner)
+        return;
+    m_backendState->router.endCpuVramAccess(writePages);
 }
 
 size_t GSRasterizer::softwarePendingCommandCount() const noexcept
@@ -3634,22 +3660,17 @@ void GSRasterizer::updateClutCache(GS *gs, int contextIndex)
             ? static_cast<uint32_t>(gs->m_texclut.cov) +
                   ((entryCount - 1u) >> 4u)
             : 15u;
-    const GSBlockRange clutRange{
-        tex.cbp,
-        surfaceBlockCount(tex.cpsm,
-                          clutWidth,
-                          maximumClutX,
-                          maximumClutY),
-    };
-    ParallelState *state = m_parallelState.get();
-    if (state && !state->commands.empty() &&
-        (blockRangesOverlap(
-             clutRange, state->groupFrameRange) ||
-         blockRangesOverlap(
-             clutRange, state->groupDepthRange)))
-    {
-        flushDrawBatch(gs, GsFlushReason::ClutHazard);
-    }
+    const GsVramPageMask clutPages =
+        gsVramPagesForSurfaceRect(
+            tex.cbp,
+            clutWidth,
+            tex.cpsm,
+            0u,
+            0u,
+            maximumClutX + 1u,
+            maximumClutY + 1u);
+    beginCpuVramAccess(
+        gs, clutPages, {}, GsFlushReason::ClutHazard);
 
     GSClutTraceState &trace = clutTrace();
     uint32_t rawNonzeroBytes = 0u;

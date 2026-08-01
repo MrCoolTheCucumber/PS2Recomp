@@ -27,6 +27,14 @@ public:
     void flushDrawBatch(
         GS *gs,
         GsFlushReason reason = GsFlushReason::Explicit);
+    void beginCpuVramAccess(
+        GS *gs,
+        const GsVramPageMask &readPages,
+        const GsVramPageMask &writePages,
+        GsFlushReason reason);
+    void endCpuVramAccess(
+        GS *gs,
+        const GsVramPageMask &writePages);
     void endDrawBatch(GS *gs);
     void drawPrimitive(GS *gs);
     [[nodiscard]] bool configureVulkanRenderer(

@@ -496,10 +496,6 @@ namespace
         switch (reason)
         {
         case GsFlushReason::Explicit:
-        case GsFlushReason::Transfer:
-        case GsFlushReason::CpuReadback:
-        case GsFlushReason::FeedbackSnapshot:
-        case GsFlushReason::ClutHazard:
         case GsFlushReason::Finish:
         case GsFlushReason::PresentationLatch:
         case GsFlushReason::DebuggerObservation:
@@ -510,6 +506,10 @@ namespace
         case GsFlushReason::BackendSwitch:
         case GsFlushReason::QueueBackpressure:
         case GsFlushReason::ResourceHazard:
+        case GsFlushReason::Transfer:
+        case GsFlushReason::CpuReadback:
+        case GsFlushReason::FeedbackSnapshot:
+        case GsFlushReason::ClutHazard:
         case GsFlushReason::Count:
             return false;
         }

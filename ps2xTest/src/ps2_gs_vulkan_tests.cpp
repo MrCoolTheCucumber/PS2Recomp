@@ -367,6 +367,29 @@ namespace
         gs.writeRegister(GS_REG_XYZ2, packXyz2(x, y));
     }
 
+    void drawRecursiveCt32Sprite(
+        GS &gs,
+        uint16_t x0,
+        uint16_t y0,
+        uint16_t x1,
+        uint16_t y1,
+        uint32_t rgba)
+    {
+        gs.writeRegister(
+            GS_REG_PRIM,
+            static_cast<uint64_t>(GS_PRIM_SPRITE) |
+                (1ull << 4u) |  // TME
+                (1ull << 8u));  // FST
+        gs.writeRegister(GS_REG_RGBAQ, rgba);
+        gs.writeRegister(GS_REG_UV, 0u);
+        gs.writeRegister(GS_REG_XYZ2, packXyz2(x0, y0));
+        gs.writeRegister(
+            GS_REG_UV,
+            static_cast<uint64_t>(x1 - x0) |
+                (static_cast<uint64_t>(y1 - y0) << 16u));
+        gs.writeRegister(GS_REG_XYZ2, packXyz2(x1, y1));
+    }
+
     void uploadCt32Pixels(
         GS &gs,
         uint32_t destinationBlock,
@@ -389,6 +412,38 @@ namespace
             bitbltbuf, trxpos, trxreg, 0u,
             reinterpret_cast<const uint8_t *>(pixels.data()),
             static_cast<uint32_t>(pixels.size_bytes()));
+    }
+
+    std::vector<uint8_t> readCt32Pixels(
+        GS &gs,
+        uint32_t sourceBlock,
+        uint32_t sourceWidth,
+        uint16_t x,
+        uint16_t y,
+        uint16_t width,
+        uint16_t height)
+    {
+        const uint64_t bitbltbuf =
+            static_cast<uint64_t>(sourceBlock) |
+            (static_cast<uint64_t>(sourceWidth) << 16u) |
+            (static_cast<uint64_t>(GS_PSM_CT32) << 24u);
+        const uint64_t trxpos =
+            static_cast<uint64_t>(x) |
+            (static_cast<uint64_t>(y) << 16u);
+        const uint64_t trxreg =
+            static_cast<uint64_t>(width) |
+            (static_cast<uint64_t>(height) << 32u);
+        gs.writeRegister(GS_REG_BITBLTBUF, bitbltbuf);
+        gs.writeRegister(GS_REG_TRXPOS, trxpos);
+        gs.writeRegister(GS_REG_TRXREG, trxreg);
+        gs.writeRegister(GS_REG_TRXDIR, 1u);
+
+        std::vector<uint8_t> bytes(
+            static_cast<size_t>(width) * height * sizeof(uint32_t));
+        const uint32_t consumed = gs.consumeLocalToHostBytes(
+            bytes.data(), static_cast<uint32_t>(bytes.size()));
+        bytes.resize(consumed);
+        return bytes;
     }
 
     GsVulkanServiceConfig makeRendererServiceConfig(
@@ -1312,6 +1367,298 @@ void register_ps2_gs_vulkan_tests()
                      "integrated transitions should remain validation-clean");
             t.Equals(serviceStatistics.validationWarnings, 0u,
                      "integrated transitions should emit no validation warnings");
+        });
+
+        tc.Run("GS Vulkan hybrid scopes host transfers and readbacks to overlapping pages", [](TestCase &t)
+        {
+            GSMem::InitLookupTables();
+            std::vector<uint8_t> softwareVram =
+                makeVramPattern(0x5452414Eu);
+            std::vector<uint8_t> acceleratedVram = softwareVram;
+            const std::vector<uint8_t> initial = softwareVram;
+            GS software;
+            GS accelerated;
+            software.init(
+                softwareVram.data(),
+                static_cast<uint32_t>(softwareVram.size()), nullptr);
+            accelerated.init(
+                acceleratedVram.data(),
+                static_cast<uint32_t>(acceleratedVram.size()), nullptr);
+
+            GsVulkanCapabilityReport preflight{};
+            const GsVulkanServiceConfig config =
+                makeRendererServiceConfig(preflight);
+            t.IsTrue(accelerated.configureVulkanRenderer(config),
+                     "the scoped transfer fixture should accept Vulkan configuration");
+            if (!preflight.ready())
+            {
+                t.IsFalse(accelerated.setRendererMode(
+                              GsRendererMode::Hybrid),
+                          "an unavailable host should skip scoped transfer execution cleanly");
+                return;
+            }
+
+            t.IsTrue(accelerated.setRendererMode(
+                         GsRendererMode::Hybrid),
+                     "a capable host should create the hybrid transfer fixture");
+            if (accelerated.rendererMode() != GsRendererMode::Hybrid)
+                return;
+            accelerated.setBackendCountersEnabled(true);
+            accelerated.resetBackendCounters();
+
+            constexpr uint32_t firstPage = 5u;
+            constexpr uint32_t secondPage = 20u;
+            configureFlatCt32Draws(software, firstPage, 1u);
+            configureFlatCt32Draws(accelerated, firstPage, 1u);
+            drawFlatCt32Sprite(
+                software, 2u * 16u, 3u * 16u,
+                15u * 16u, 14u * 16u, 0xA043210Fu);
+            drawFlatCt32Sprite(
+                accelerated, 2u * 16u, 3u * 16u,
+                15u * 16u, 14u * 16u, 0xA043210Fu);
+
+            configureFlatCt32Draws(software, secondPage, 1u);
+            configureFlatCt32Draws(accelerated, secondPage, 1u);
+            drawFlatCt32Sprite(
+                software, 4u * 16u, 5u * 16u,
+                18u * 16u, 16u * 16u, 0xB0876543u);
+            drawFlatCt32Sprite(
+                accelerated, 4u * 16u, 5u * 16u,
+                18u * 16u, 16u * 16u, 0xB0876543u);
+
+            GsVulkanServiceStatistics service =
+                accelerated.vulkanRendererServiceStatistics();
+            t.Equals(service.pageUploadOperationsCompleted, 2ull,
+                     "two first-use draw pages should issue two uploads");
+            t.Equals(service.pagesUploaded, 2ull,
+                     "the two draws should upload exactly two 8 KiB pages");
+            t.Equals(service.pageDownloadOperationsCompleted, 0ull,
+                     "resident draws should not publish either page to CPU");
+
+            constexpr std::array<uint32_t, 3> uploadPixels{
+                0xC0010203u, 0xD0040506u, 0xE0070809u};
+            uploadCt32Pixels(
+                software, firstPage * 32u, 1u, 6u, 8u,
+                uploadPixels);
+            uploadCt32Pixels(
+                accelerated, firstPage * 32u, 1u, 6u, 8u,
+                uploadPixels);
+
+            service = accelerated.vulkanRendererServiceStatistics();
+            t.Equals(service.pageDownloadOperationsCompleted, 1ull,
+                     "a partial host upload should preserve one overlapping GPU page");
+            t.Equals(service.pagesDownloaded, 1ull,
+                     "the upload must not publish an unrelated resident page");
+            GsVulkanRasterBackendStatistics backend =
+                accelerated.vulkanRendererBackendStatistics();
+            t.Equals(backend.pageOwnership.gpuNewerPages,
+                     static_cast<size_t>(1u),
+                     "the disjoint draw page should remain GPU-newer after the upload");
+            t.IsTrue(std::equal(
+                         acceleratedVram.begin() +
+                             firstPage * GS_VRAM_PAGE_SIZE,
+                         acceleratedVram.begin() +
+                             (firstPage + 1u) * GS_VRAM_PAGE_SIZE,
+                         softwareVram.begin() +
+                             firstPage * GS_VRAM_PAGE_SIZE),
+                     "the overlapping page should contain the GPU draw plus host upload");
+            t.IsTrue(std::equal(
+                         acceleratedVram.begin() +
+                             secondPage * GS_VRAM_PAGE_SIZE,
+                         acceleratedVram.begin() +
+                             (secondPage + 1u) * GS_VRAM_PAGE_SIZE,
+                         initial.begin() +
+                             secondPage * GS_VRAM_PAGE_SIZE),
+                     "the unrelated GPU-newer page should remain stale on canonical CPU VRAM");
+
+            const std::vector<uint8_t> softwareReadback =
+                readCt32Pixels(
+                    software, secondPage * 32u, 1u,
+                    6u, 7u, 3u, 2u);
+            const std::vector<uint8_t> acceleratedReadback =
+                readCt32Pixels(
+                    accelerated, secondPage * 32u, 1u,
+                    6u, 7u, 3u, 2u);
+            t.IsTrue(acceleratedReadback == softwareReadback,
+                     "local-to-host should observe the resident GPU result exactly");
+            t.IsTrue(acceleratedVram == softwareVram,
+                     "the two scoped CPU accesses should reconstruct the complete image");
+
+            service = accelerated.vulkanRendererServiceStatistics();
+            t.Equals(service.pageDownloadOperationsCompleted, 2ull,
+                     "upload preservation and readback should issue separate downloads");
+            t.Equals(service.pagesDownloaded, 2ull,
+                     "each disjoint GPU-newer page should publish exactly once");
+            backend = accelerated.vulkanRendererBackendStatistics();
+            t.Equals(backend.pageOwnership.gpuNewerPages,
+                     static_cast<size_t>(0u),
+                     "the final scoped readback should leave no hidden GPU writer");
+            t.Equals(backend.coherency.gpuToCpuPages, 2ull,
+                     "coherency accounting should match the exact observed pages");
+
+            const GsBackendCounters counters =
+                accelerated.backendCounters();
+            t.Equals(
+                counters.flushReasons[static_cast<size_t>(
+                    GsFlushReason::Transfer)],
+                1ull,
+                "the host upload should retain one named transfer boundary");
+            t.Equals(
+                counters.flushReasons[static_cast<size_t>(
+                    GsFlushReason::CpuReadback)],
+                1ull,
+                "the local-to-host operation should retain one named readback boundary");
+            t.Equals(service.validationErrors, 0u,
+                     "scoped transfer synchronization should remain validation-clean");
+            t.Equals(service.validationWarnings, 0u,
+                     "scoped transfer synchronization should emit no validation warnings");
+        });
+
+        tc.Run("GS Vulkan hybrid scopes CLUT and feedback snapshots to sampled pages", [](TestCase &t)
+        {
+            GSMem::InitLookupTables();
+            std::vector<uint8_t> softwareVram =
+                makeVramPattern(0x434C5554u);
+            std::vector<uint8_t> acceleratedVram = softwareVram;
+            const std::vector<uint8_t> initial = softwareVram;
+            GS software;
+            GS accelerated;
+            software.init(
+                softwareVram.data(),
+                static_cast<uint32_t>(softwareVram.size()), nullptr);
+            accelerated.init(
+                acceleratedVram.data(),
+                static_cast<uint32_t>(acceleratedVram.size()), nullptr);
+
+            GsVulkanCapabilityReport preflight{};
+            const GsVulkanServiceConfig config =
+                makeRendererServiceConfig(preflight);
+            t.IsTrue(accelerated.configureVulkanRenderer(config),
+                     "the scoped sampler fixture should accept Vulkan configuration");
+            if (!preflight.ready())
+            {
+                t.IsFalse(accelerated.setRendererMode(
+                              GsRendererMode::Hybrid),
+                          "an unavailable host should skip scoped sampler execution cleanly");
+                return;
+            }
+
+            t.IsTrue(accelerated.setRendererMode(
+                         GsRendererMode::Hybrid),
+                     "a capable host should create the hybrid sampler fixture");
+            if (accelerated.rendererMode() != GsRendererMode::Hybrid)
+                return;
+            accelerated.setBackendCountersEnabled(true);
+            accelerated.resetBackendCounters();
+
+            constexpr uint32_t clutPage = 9u;
+            constexpr uint32_t feedbackPage = 27u;
+            configureFlatCt32Draws(software, clutPage, 1u);
+            configureFlatCt32Draws(accelerated, clutPage, 1u);
+            drawFlatCt32Sprite(
+                software, 0u, 0u,
+                16u * 16u, 16u * 16u, 0xA0112233u);
+            drawFlatCt32Sprite(
+                accelerated, 0u, 0u,
+                16u * 16u, 16u * 16u, 0xA0112233u);
+
+            configureFlatCt32Draws(software, feedbackPage, 1u);
+            configureFlatCt32Draws(accelerated, feedbackPage, 1u);
+            drawFlatCt32Sprite(
+                software, 3u * 16u, 4u * 16u,
+                19u * 16u, 18u * 16u, 0xB0445566u);
+            drawFlatCt32Sprite(
+                accelerated, 3u * 16u, 4u * 16u,
+                19u * 16u, 18u * 16u, 0xB0445566u);
+
+            const uint64_t indexedTex0 =
+                (1ull << 14u) |
+                (static_cast<uint64_t>(GS_PSM_T8) << 20u) |
+                (5ull << 26u) |
+                (5ull << 30u) |
+                (1ull << 34u) |
+                (static_cast<uint64_t>(clutPage * 32u) << 37u) |
+                (static_cast<uint64_t>(GS_PSM_CT32) << 51u) |
+                (1ull << 61u);
+            software.writeRegister(GS_REG_TEX0_1, indexedTex0);
+            accelerated.writeRegister(GS_REG_TEX0_1, indexedTex0);
+
+            GsVulkanServiceStatistics service =
+                accelerated.vulkanRendererServiceStatistics();
+            t.Equals(service.pageDownloadOperationsCompleted, 1ull,
+                     "CLUT loading should publish its one overlapping page");
+            t.Equals(service.pagesDownloaded, 1ull,
+                     "CLUT loading must leave the feedback page resident");
+            t.IsTrue(std::equal(
+                         acceleratedVram.begin() +
+                             clutPage * GS_VRAM_PAGE_SIZE,
+                         acceleratedVram.begin() +
+                             (clutPage + 1u) * GS_VRAM_PAGE_SIZE,
+                         softwareVram.begin() +
+                             clutPage * GS_VRAM_PAGE_SIZE),
+                     "the CLUT page should expose the completed GPU draw");
+            t.IsTrue(std::equal(
+                         acceleratedVram.begin() +
+                             feedbackPage * GS_VRAM_PAGE_SIZE,
+                         acceleratedVram.begin() +
+                             (feedbackPage + 1u) * GS_VRAM_PAGE_SIZE,
+                         initial.begin() +
+                             feedbackPage * GS_VRAM_PAGE_SIZE),
+                     "CLUT loading should not publish an unrelated GPU page");
+
+            const uint64_t feedbackTex0 =
+                static_cast<uint64_t>(feedbackPage * 32u) |
+                (1ull << 14u) |
+                (static_cast<uint64_t>(GS_PSM_CT32) << 20u) |
+                (5ull << 26u) |
+                (5ull << 30u) |
+                (1ull << 34u) |
+                (1ull << 35u);
+            software.writeRegister(GS_REG_TEX0_1, feedbackTex0);
+            accelerated.writeRegister(GS_REG_TEX0_1, feedbackTex0);
+            software.beginRenderBatch();
+            accelerated.beginRenderBatch();
+            drawRecursiveCt32Sprite(
+                software, 5u * 16u, 6u * 16u,
+                13u * 16u, 12u * 16u, 0x80808080u);
+            drawRecursiveCt32Sprite(
+                accelerated, 5u * 16u, 6u * 16u,
+                13u * 16u, 12u * 16u, 0x80808080u);
+
+            service = accelerated.vulkanRendererServiceStatistics();
+            t.Equals(service.pageDownloadOperationsCompleted, 2ull,
+                     "recursive feedback should publish its sampled page once");
+            t.Equals(service.pagesDownloaded, 2ull,
+                     "CLUT and feedback should publish exactly two disjoint pages");
+            GsVulkanRasterBackendStatistics backend =
+                accelerated.vulkanRendererBackendStatistics();
+            t.Equals(backend.pageOwnership.gpuNewerPages,
+                     static_cast<size_t>(0u),
+                     "feedback fallback should leave no unrelated GPU writer");
+
+            software.endRenderBatch();
+            accelerated.endRenderBatch();
+            t.IsTrue(acceleratedVram == softwareVram,
+                     "scoped CLUT and feedback boundaries should retain exact software semantics");
+
+            const GsBackendCounters counters =
+                accelerated.backendCounters();
+            t.Equals(counters.fallbackCommands, 1ull,
+                     "the recursive textured draw should remain one explicit fallback");
+            t.Equals(
+                counters.flushReasons[static_cast<size_t>(
+                    GsFlushReason::ClutHazard)],
+                1ull,
+                "the indexed TEX0 write should retain one named CLUT boundary");
+            t.Equals(
+                counters.flushReasons[static_cast<size_t>(
+                    GsFlushReason::FeedbackSnapshot)],
+                1ull,
+                "snapshot creation should retain one named feedback boundary");
+            t.Equals(service.validationErrors, 0u,
+                     "scoped sampler synchronization should remain validation-clean");
+            t.Equals(service.validationWarnings, 0u,
+                     "scoped sampler synchronization should emit no validation warnings");
         });
 
         tc.Run("GS Vulkan strict rejects before mutation and survives reset", [](TestCase &t)
