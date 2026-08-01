@@ -102,6 +102,30 @@ namespace
 
     void writePreparedRecord(
         std::ostream &output,
+        const GsVulkanDepthCt32Sprite &sprite)
+    {
+        output
+            << "  \"depth_ct32_sprite\": {"
+            << "\"framebuffer_base_block\":"
+            << sprite.framebufferBaseBlock << ','
+            << "\"framebuffer_width\":"
+            << sprite.framebufferWidth << ','
+            << "\"depth_base_block\":"
+            << sprite.depthBaseBlock << ','
+            << "\"depth_psm\":" << sprite.depthPsm << ','
+            << "\"bounds_x0\":" << sprite.boundsX0 << ','
+            << "\"bounds_y0\":" << sprite.boundsY0 << ','
+            << "\"bounds_x1\":" << sprite.boundsX1 << ','
+            << "\"bounds_y1\":" << sprite.boundsY1 << ','
+            << "\"rgba\":" << sprite.rgba << ','
+            << "\"depth\":" << sprite.depth << ','
+            << "\"depth_test_method\":"
+            << sprite.depthTestMethod << ','
+            << "\"depth_write\":" << sprite.depthWrite << '}';
+    }
+
+    void writePreparedRecord(
+        std::ostream &output,
         const GsVulkanCt32Triangle &triangle)
     {
         output
@@ -544,6 +568,7 @@ struct GsVulkanRasterBackend::Impl final
     GsVramPageMask pendingResidentReadPages;
     GsVramPageMask pendingResidentWritePages;
     bool exactCt32Triangle = false;
+    bool exactDepthCt32Sprite = false;
     bool exactNearestCt32Sprite = false;
     bool exactLinearCt32Sprite = false;
     bool failed = false;
@@ -834,6 +859,8 @@ GsVulkanRasterBackend::createWithExecutor(
         executorCapabilities.selectedDevice();
     impl->exactCt32Triangle =
         selectedDevice && selectedDevice->exactCt32Triangle;
+    impl->exactDepthCt32Sprite =
+        selectedDevice && selectedDevice->exactDepthCt32Sprite;
     impl->exactNearestCt32Sprite =
         selectedDevice && selectedDevice->exactNearestCt32Sprite;
     impl->exactLinearCt32Sprite =
@@ -889,6 +916,22 @@ GsBackendDecision GsVulkanRasterBackend::classify(
         if (pixels < m_impl->config.minimumHybridSpritePixels)
             return {false, GsFallbackReason::CostModel};
         return decision;
+    }
+
+    // Qualify depth through full-image Verify before opening any resident or
+    // cost-selected production path.
+    if (command.primitive().type == GS_PRIM_SPRITE &&
+        !command.primitive().tme &&
+        m_impl->config.mode == GsRendererMode::Verify)
+    {
+        GsVulkanDepthCt32Sprite depthSprite{};
+        const GsBackendDecision depthDecision =
+            prepareGsVulkanDepthCt32Sprite(command, depthSprite);
+        if (!depthDecision.supported)
+            return depthDecision;
+        if (!m_impl->exactDepthCt32Sprite)
+            return {false, GsFallbackReason::BackendUnavailable};
+        return depthDecision;
     }
 
     if (command.primitive().type == GS_PRIM_SPRITE &&
@@ -1010,6 +1053,7 @@ void GsVulkanRasterBackend::submit(
     for (const GsDrawCommand &command : commands)
     {
         GsVulkanCt32Sprite sprite{};
+        GsVulkanDepthCt32Sprite depthSprite{};
         GsVulkanNearestCt32Sprite texturedSprite{};
         GsVulkanLinearCt32Sprite linearTexturedSprite{};
         GsVulkanCt32Triangle triangle{};
@@ -1018,6 +1062,7 @@ void GsVulkanRasterBackend::submit(
         const bool isTexturedSprite =
             command.primitive().type == GS_PRIM_SPRITE &&
             command.primitive().tme;
+        bool isDepthSprite = false;
         bool isLinearTexturedSprite = false;
         if (isTriangle)
             (void)prepareGsVulkanCt32Triangle(command, triangle);
@@ -1034,7 +1079,16 @@ void GsVulkanRasterBackend::submit(
             }
         }
         else
-            (void)prepareGsVulkanCt32Sprite(command, sprite);
+        {
+            const GsBackendDecision spriteDecision =
+                prepareGsVulkanCt32Sprite(command, sprite);
+            if (!spriteDecision.supported)
+            {
+                (void)prepareGsVulkanDepthCt32Sprite(
+                    command, depthSprite);
+                isDepthSprite = true;
+            }
+        }
         const GsDrawResources resources = command.resources();
 
         ++m_impl->statistics.commandsAttempted;
@@ -1054,6 +1108,11 @@ void GsVulkanRasterBackend::submit(
             {
                 executed = m_impl->executor->executeCt32Triangle(
                     initial, triangle, gpuOutput, &executionError);
+            }
+            else if (isDepthSprite)
+            {
+                executed = m_impl->executor->executeDepthCt32Sprite(
+                    initial, depthSprite, gpuOutput, &executionError);
             }
             else if (isLinearTexturedSprite)
             {
@@ -1117,6 +1176,14 @@ void GsVulkanRasterBackend::submit(
                     artifactWritten = writeVerificationArtifact(
                         m_impl->config.verificationArtifactDirectory,
                         command, triangle, firstDifference,
+                        initial, m_impl->canonicalVram, gpuOutput,
+                        artifactPath, artifactError);
+                }
+                else if (isDepthSprite)
+                {
+                    artifactWritten = writeVerificationArtifact(
+                        m_impl->config.verificationArtifactDirectory,
+                        command, depthSprite, firstDifference,
                         initial, m_impl->canonicalVram, gpuOutput,
                         artifactPath, artifactError);
                 }

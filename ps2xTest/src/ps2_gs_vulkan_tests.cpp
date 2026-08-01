@@ -1326,7 +1326,8 @@ namespace
             Behavior behavior_,
             bool exactCt32Triangle_ = true,
             bool exactNearestCt32Sprite_ = true,
-            bool exactLinearCt32Sprite_ = true)
+            bool exactLinearCt32Sprite_ = true,
+            bool exactDepthCt32Sprite_ = true)
             : behavior(behavior_)
         {
             report.compiled = true;
@@ -1341,6 +1342,8 @@ namespace
                 exactNearestCt32Sprite_;
             report.devices[0].exactLinearCt32Sprite =
                 exactLinearCt32Sprite_;
+            report.devices[0].exactDepthCt32Sprite =
+                exactDepthCt32Sprite_;
         }
 
         bool executeCt32Sprite(
@@ -1401,6 +1404,44 @@ namespace
                     triangle.boundsX1 - triangle.boundsX0) *
                 static_cast<uint64_t>(
                     triangle.boundsY1 - triangle.boundsY0);
+            ++serviceStatistics.queueSubmissions;
+            ++serviceStatistics.shaderDispatches;
+            serviceStatistics.pipelineBarriers += 4u;
+            ++serviceStatistics.pipelineBinds;
+            ++serviceStatistics.pipelineCacheHits;
+            ++serviceStatistics.fenceWaits;
+            if (error)
+                error->clear();
+            return true;
+        }
+
+        bool executeDepthCt32Sprite(
+            std::span<const uint8_t> input,
+            const GsVulkanDepthCt32Sprite &sprite,
+            std::vector<uint8_t> &output,
+            std::string *error) override
+        {
+            if (!isHealthy || behavior == Behavior::Fail ||
+                !report.devices[0].exactDepthCt32Sprite)
+            {
+                ++serviceStatistics.depthCt32SpriteDrawsFailed;
+                if (error)
+                    *error = "injected depth CT32 executor failure";
+                return false;
+            }
+
+            residentVram.assign(input.begin(), input.end());
+            if (behavior == Behavior::Exact)
+                applyDepthCt32SpriteCpu(residentVram, sprite);
+            output = residentVram;
+            if (behavior == Behavior::InvalidOutput)
+                output.resize(1u);
+            ++serviceStatistics.depthCt32SpriteDrawsCompleted;
+            serviceStatistics.depthCt32SpritePixelsExecuted +=
+                static_cast<uint64_t>(
+                    sprite.boundsX1 - sprite.boundsX0) *
+                static_cast<uint64_t>(
+                    sprite.boundsY1 - sprite.boundsY0);
             ++serviceStatistics.queueSubmissions;
             ++serviceStatistics.shaderDispatches;
             serviceStatistics.pipelineBarriers += 4u;
@@ -4014,6 +4055,267 @@ void register_ps2_gs_vulkan_tests()
                      "the injected no-op linear result should stop Verify");
             t.IsTrue(mismatchVram == expected,
                      "the software oracle should remain canonical on mismatch");
+        });
+
+        tc.Run("Vulkan raster backend verifies exact CT32 depth sprites behind capability", [](TestCase &t)
+        {
+            GSMem::InitLookupTables();
+            const std::array<GsDrawCommand, 2> commands{{
+                makeDepthCt32SpriteCommand(
+                    30'100u, 40u, 2u, 200u, GS_PSM_Z24, false, 1u,
+                    {3u, 30u, 2u, 25u}, {16u, 32u},
+                    49u, 65u, 449u, 353u,
+                    0x88776655u, 0xFEDCBA98u),
+                makeDepthCt32SpriteCommand(
+                    30'101u, 41u, 2u, 201u, GS_PSM_Z32, true, 2u,
+                    {4u, 27u, 3u, 22u}, {0u, 0u},
+                    65u, 49u, 433u, 337u,
+                    0x10203040u, 0x7FFFFF00u),
+            }};
+            std::array<GsVulkanDepthCt32Sprite, 2> prepared{};
+            for (size_t index = 0u; index < commands.size(); ++index)
+            {
+                t.IsTrue(
+                    prepareGsVulkanDepthCt32Sprite(
+                        commands[index], prepared[index]).supported,
+                    "the Verify depth fixture should satisfy its narrow predicate");
+            }
+
+            std::vector<uint8_t> initial =
+                makeVramPattern(0x44565246u);
+            for (uint32_t y = prepared[1].boundsY0;
+                 y < prepared[1].boundsY1; ++y)
+            {
+                for (uint32_t x = prepared[1].boundsX0;
+                     x < prepared[1].boundsX1; ++x)
+                {
+                    const uint32_t selector = (x + y) % 3u;
+                    const uint32_t current = selector == 0u
+                        ? prepared[1].depth - 1u
+                        : selector == 1u
+                            ? prepared[1].depth
+                            : prepared[1].depth + 1u;
+                    GSMem::WriteZ32(
+                        initial.data(), prepared[1].depthBaseBlock,
+                        prepared[1].framebufferWidth, x, y, current);
+                }
+            }
+            std::vector<uint8_t> expected = initial;
+            for (const GsVulkanDepthCt32Sprite &sprite : prepared)
+                applyDepthCt32SpriteCpu(expected, sprite);
+
+            std::vector<uint8_t> vram = initial;
+            uint64_t softwareCalls = 0u;
+            GsVulkanRasterBackendConfig config{};
+            config.mode = GsRendererMode::Verify;
+            std::unique_ptr<GsVulkanRasterBackend> backend =
+                GsVulkanRasterBackend::createWithExecutor(
+                    std::make_unique<FakeCt32Executor>(
+                        FakeCt32Executor::Behavior::Exact),
+                    config, vram,
+                    [&](const GsDrawCommand &draw)
+                    {
+                        ++softwareCalls;
+                        GsVulkanDepthCt32Sprite sprite{};
+                        if (prepareGsVulkanDepthCt32Sprite(
+                                draw, sprite).supported)
+                        {
+                            applyDepthCt32SpriteCpu(vram, sprite);
+                        }
+                    },
+                    {}, nullptr);
+            t.IsNotNull(backend.get(),
+                        "an exact depth executor should create Verify");
+            if (!backend)
+                return;
+
+            for (const GsDrawCommand &command : commands)
+            {
+                const GsBackendDecision route = backend->classify(command);
+                t.IsTrue(route.supported,
+                         "Verify should expose capability-gated depth sprites");
+                if (!route.supported)
+                    return;
+            }
+            backend->submit(commands);
+            t.IsTrue(vram == expected,
+                     "depth Verify should retain the agreed software image");
+            t.Equals(softwareCalls, 2ull,
+                     "depth Verify should run each independent oracle once");
+            const GsVulkanRasterBackendStatistics statistics =
+                backend->backendStatistics();
+            t.Equals(statistics.commandsAttempted, 2ull,
+                     "depth Verify should attempt both commands");
+            t.Equals(statistics.commandsCompleted, 2ull,
+                     "agreeing depth commands should complete once each");
+            t.Equals(statistics.verifiedCommands, 2ull,
+                     "both full depth comparisons should be counted");
+            t.Equals(statistics.bytesCompared,
+                     2ull * GS_VULKAN_VRAM_SIZE,
+                     "depth Verify should compare two complete VRAM images");
+            const GsVulkanServiceStatistics serviceStatistics =
+                backend->serviceStatistics();
+            t.Equals(serviceStatistics.depthCt32SpriteDrawsCompleted,
+                     2ull,
+                     "the executor should receive two depth requests");
+            t.Equals(serviceStatistics.spriteDrawsCompleted, 0ull,
+                     "depth Verify must not alias the no-depth request");
+
+            t.IsTrue(backend->setMode(GsRendererMode::GpuStrict),
+                     "the synchronized Verify fixture should enter strict mode");
+            t.IsFalse(backend->classify(commands.front()).supported,
+                      "strict routing should remain closed in the Verify slice");
+            t.IsTrue(backend->setMode(GsRendererMode::Hybrid),
+                     "the fixture should also enter Hybrid cleanly");
+            t.IsFalse(backend->classify(commands.front()).supported,
+                      "Hybrid routing should remain closed before measurement");
+            t.IsTrue(backend->setMode(GsRendererMode::Verify),
+                     "the fixture should restore Verify for failure checks");
+
+            std::vector<uint8_t> unavailableVram = initial;
+            std::unique_ptr<GsVulkanRasterBackend> unavailable =
+                GsVulkanRasterBackend::createWithExecutor(
+                    std::make_unique<FakeCt32Executor>(
+                        FakeCt32Executor::Behavior::Exact,
+                        true, true, true, false),
+                    config, unavailableVram,
+                    [](const GsDrawCommand &) {}, {}, nullptr);
+            t.IsNotNull(unavailable.get(),
+                        "a base-capable executor should retain depth fallback");
+            if (unavailable)
+            {
+                t.Equals(unavailable->classify(commands.front()).reason,
+                         GsFallbackReason::BackendUnavailable,
+                         "a missing exact depth capability should fail closed");
+                t.Equals(
+                    unavailable->serviceStatistics()
+                        .depthCt32SpriteDrawsFailed,
+                    0ull,
+                    "capability fallback must not post depth work");
+            }
+
+            std::vector<uint8_t> failureVram = initial;
+            uint64_t failedSoftwareCalls = 0u;
+            std::unique_ptr<GsVulkanRasterBackend> failing =
+                GsVulkanRasterBackend::createWithExecutor(
+                    std::make_unique<FakeCt32Executor>(
+                        FakeCt32Executor::Behavior::Fail),
+                    config, failureVram,
+                    [&](const GsDrawCommand &)
+                    {
+                        ++failedSoftwareCalls;
+                    },
+                    {}, nullptr);
+            t.IsNotNull(failing.get(),
+                        "an initially healthy failing depth executor should construct");
+            bool executionThrew = false;
+            if (failing)
+            {
+                try
+                {
+                    failing->submit(std::span<const GsDrawCommand>(
+                        &commands.front(), 1u));
+                }
+                catch (const std::runtime_error &error)
+                {
+                    executionThrew =
+                        std::string(error.what()).find(
+                            "before canonical VRAM mutation") !=
+                        std::string::npos;
+                }
+                t.Equals(failing->backendStatistics().gpuRequestsFailed,
+                         1ull,
+                         "depth executor failure should be counted once");
+                t.Equals(
+                    failing->serviceStatistics()
+                        .depthCt32SpriteDrawsFailed,
+                    1ull,
+                    "the failed depth request should retain its class counter");
+            }
+            t.IsTrue(executionThrew,
+                     "depth executor failure should identify its atomic boundary");
+            t.IsTrue(failureVram == initial,
+                     "depth executor failure must preserve canonical VRAM");
+            t.Equals(failedSoftwareCalls, 0ull,
+                     "depth executor failure must precede the software oracle");
+
+            ScopedArtifactDirectory artifacts;
+            std::vector<uint8_t> mismatchVram = initial;
+            std::vector<uint8_t> mismatchExpected = initial;
+            applyDepthCt32SpriteCpu(mismatchExpected, prepared.front());
+            GsVulkanRasterBackendConfig mismatchConfig = config;
+            mismatchConfig.verificationArtifactDirectory =
+                artifacts.path.string();
+            std::unique_ptr<GsVulkanRasterBackend> mismatchBackend =
+                GsVulkanRasterBackend::createWithExecutor(
+                    std::make_unique<FakeCt32Executor>(
+                        FakeCt32Executor::Behavior::Noop),
+                    mismatchConfig, mismatchVram,
+                    [&](const GsDrawCommand &draw)
+                    {
+                        GsVulkanDepthCt32Sprite sprite{};
+                        if (prepareGsVulkanDepthCt32Sprite(
+                                draw, sprite).supported)
+                        {
+                            applyDepthCt32SpriteCpu(
+                                mismatchVram, sprite);
+                        }
+                    },
+                    {}, nullptr);
+            t.IsNotNull(mismatchBackend.get(),
+                        "the depth mismatch backend should construct");
+            bool mismatchThrew = false;
+            if (mismatchBackend)
+            {
+                try
+                {
+                    mismatchBackend->submit(std::span<const GsDrawCommand>(
+                        &commands.front(), 1u));
+                }
+                catch (const std::runtime_error &)
+                {
+                    mismatchThrew = true;
+                }
+                const GsVulkanRasterBackendStatistics mismatchStatistics =
+                    mismatchBackend->backendStatistics();
+                t.Equals(mismatchStatistics.verificationMismatches,
+                         1ull,
+                         "the injected no-op depth result should disagree once");
+                const std::filesystem::path bundle =
+                    mismatchStatistics.lastVerificationArtifact;
+                t.IsTrue(std::filesystem::is_directory(bundle),
+                         "the depth reproducer should be published atomically");
+                std::ifstream manifest(bundle / "command.json");
+                const std::string manifestText{
+                    std::istreambuf_iterator<char>(manifest),
+                    std::istreambuf_iterator<char>()};
+                t.IsTrue(
+                    manifestText.find("\"depth_ct32_sprite\"") !=
+                        std::string::npos,
+                    "the manifest should identify the depth record");
+                t.IsTrue(
+                    manifestText.find(
+                        "\"depth_psm\":" +
+                        std::to_string(prepared.front().depthPsm)) !=
+                        std::string::npos,
+                    "the manifest should retain the exact depth format");
+                t.IsTrue(
+                    manifestText.find(
+                        "\"depth\":" +
+                        std::to_string(prepared.front().depth)) !=
+                        std::string::npos,
+                    "the manifest should retain the integer Z payload");
+                t.IsTrue(
+                    manifestText.find("\"depth_test_method\":1") !=
+                        std::string::npos &&
+                    manifestText.find("\"depth_write\":1") !=
+                        std::string::npos,
+                    "the manifest should retain ALWAYS plus write state");
+            }
+            t.IsTrue(mismatchThrew,
+                     "the injected no-op depth result should stop Verify");
+            t.IsTrue(mismatchVram == mismatchExpected,
+                     "the software depth oracle should remain canonical on mismatch");
         });
 
         tc.Run("Vulkan strict backend keeps linear CT32 textures resident", [](TestCase &t)

@@ -576,6 +576,11 @@ public:
         const GsVulkanCt32Sprite &sprite,
         std::vector<uint8_t> &output,
         std::string *error = nullptr) = 0;
+    [[nodiscard]] virtual bool executeDepthCt32Sprite(
+        std::span<const uint8_t> input,
+        const GsVulkanDepthCt32Sprite &sprite,
+        std::vector<uint8_t> &output,
+        std::string *error = nullptr) = 0;
     [[nodiscard]] virtual bool executeNearestCt32Sprite(
         std::span<const uint8_t> input,
         const GsVulkanNearestCt32Sprite &sprite,
@@ -678,7 +683,7 @@ public:
         std::span<const uint8_t> input,
         const GsVulkanDepthCt32Sprite &sprite,
         std::vector<uint8_t> &output,
-        std::string *error = nullptr);
+        std::string *error = nullptr) override;
 
     // Uploads canonical VRAM, executes one prepared nearest CT32 texture
     // sprite through raw GS-local-memory reads, and publishes the synchronized
