@@ -4,6 +4,7 @@
 #include "runtime/ps2_gs_vulkan.h"
 #include "runtime/ps2_gs_vulkan_backend.h"
 
+#include <algorithm>
 #include <array>
 #include <atomic>
 #include <chrono>
@@ -767,9 +768,22 @@ void register_ps2_gs_vulkan_tests()
             t.IsFalse(backend->setMode(GsRendererMode::Software),
                       "the accelerated backend should reject software mode");
             std::copy(initial.begin(), initial.end(), vram.begin());
+            GsVramPageMask allPages;
+            allPages.setAll();
+            backend->noteCpuVramWrite(allPages);
             backend->submit(commands);
+            t.IsTrue(vram == initial,
+                     "strict mode should leave resident GPU-newer pages off the CPU hot path");
+            const GsVramPageMask writtenPages =
+                command.resources().writePages;
+            t.IsTrue(
+                backend->backendStatistics().pageOwnership.gpuNewerPages ==
+                    writtenPages.count(),
+                "strict mode should transfer ownership of every conservative write page");
+            backend->prepareCpuVramAccess(
+                writtenPages, GsFlushReason::CpuReadback);
             t.IsTrue(vram == expected,
-                     "strict mode should publish the exact GPU result");
+                     "an overlapping CPU observation should publish the exact resident result");
             t.Equals(softwareCalls, 1ull,
                      "strict execution must not invoke the software oracle");
             t.Equals(commitCalls, 1ull,
@@ -805,6 +819,7 @@ void register_ps2_gs_vulkan_tests()
                      "unsupported direct submission must not mutate VRAM");
 
             std::copy(initial.begin(), initial.end(), vram.begin());
+            backend->noteCpuVramWrite(allPages);
             const std::array<GsDrawCommand, 2> mixedBatch{
                 command, unsupported};
             bool batchThrew = false;
@@ -873,6 +888,147 @@ void register_ps2_gs_vulkan_tests()
                      "post-shutdown classification should fail closed");
             t.Equals(backend->pendingCommandCount(), static_cast<size_t>(0u),
                      "Phase 3 requests should remain synchronous");
+        });
+
+        tc.Run("Vulkan hybrid backend keeps disjoint pages resident until scoped CPU access", [](TestCase &t)
+        {
+            GSMem::InitLookupTables();
+            const GsDrawCommand first = makeCt32SpriteCommand(
+                101u, 5u, 1u,
+                {0u, 31u, 0u, 31u}, {0u, 0u},
+                2u * 16u, 3u * 16u,
+                11u * 16u, 13u * 16u,
+                0x44332211u);
+            const GsDrawCommand second = makeCt32SpriteCommand(
+                102u, 511u, 1u,
+                {0u, 31u, 0u, 31u}, {0u, 0u},
+                4u * 16u, 5u * 16u,
+                14u * 16u, 15u * 16u,
+                0x88776655u);
+            const GsDrawCommand firstAgain = makeCt32SpriteCommand(
+                103u, 5u, 1u,
+                {0u, 31u, 0u, 31u}, {0u, 0u},
+                6u * 16u, 7u * 16u,
+                15u * 16u, 16u * 16u,
+                0xCCBBAA99u);
+
+            const GsVramPageMask firstPages =
+                first.resources().writePages;
+            const GsVramPageMask secondPages =
+                second.resources().writePages;
+            t.Equals(firstPages.count(), static_cast<size_t>(1u),
+                     "the first resident fixture should own one page");
+            t.IsTrue(firstPages.test(5u),
+                     "the first fixture should resolve FRAME page 5");
+            t.Equals(secondPages.count(), static_cast<size_t>(1u),
+                     "the wrap-edge resident fixture should own one page");
+            t.IsTrue(secondPages.test(511u),
+                     "the second fixture should resolve FRAME page 511");
+
+            std::vector<uint8_t> vram = makeVramPattern(0xC0E3E17u);
+            const std::vector<uint8_t> initial = vram;
+            std::vector<uint8_t> expected = initial;
+            for (const GsDrawCommand *draw :
+                 std::array<const GsDrawCommand *, 3>{
+                     &first, &second, &firstAgain})
+            {
+                GsVulkanCt32Sprite sprite{};
+                t.IsTrue(prepareGsVulkanCt32Sprite(*draw, sprite).supported,
+                         "every resident fixture should satisfy the exact predicate");
+                applyCt32SpriteCpu(expected, sprite);
+            }
+
+            uint64_t softwareCalls = 0u;
+            uint64_t commitCalls = 0u;
+            std::unique_ptr<GsVulkanRasterBackend> backend =
+                GsVulkanRasterBackend::createWithExecutor(
+                    std::make_unique<FakeCt32Executor>(
+                        FakeCt32Executor::Behavior::Exact),
+                    GsVulkanRasterBackendConfig{
+                        GsRendererMode::Hybrid, {}},
+                    vram,
+                    [&](const GsDrawCommand &)
+                    {
+                        ++softwareCalls;
+                    },
+                    [&](const GsDrawCommand &)
+                    {
+                        ++commitCalls;
+                    },
+                    nullptr);
+            t.IsNotNull(backend.get(),
+                        "the resident fake backend should construct");
+            if (!backend)
+                return;
+
+            backend->submit(std::span<const GsDrawCommand>(&first, 1u));
+            backend->submit(std::span<const GsDrawCommand>(&second, 1u));
+            backend->submit(std::span<const GsDrawCommand>(&firstAgain, 1u));
+            t.IsTrue(vram == initial,
+                     "three resident draws should avoid every implicit CPU publication");
+            t.Equals(softwareCalls, 0ull,
+                     "hybrid resident execution must not invoke the oracle");
+            t.Equals(commitCalls, 3ull,
+                     "each resident draw should still publish its metadata commit");
+
+            GsVulkanServiceStatistics service = backend->serviceStatistics();
+            t.Equals(service.pageUploadOperationsCompleted, 2ull,
+                     "only the first touch of each disjoint page should upload");
+            t.Equals(service.pagesUploaded, 2ull,
+                     "resident setup should transfer exactly two 8 KiB pages");
+            t.Equals(service.pageDownloadOperationsCompleted, 0ull,
+                     "no CPU observer means no resident page download");
+            t.Equals(service.spriteDrawsCompleted, 3ull,
+                     "all three commands should execute against resident VRAM");
+
+            GsVulkanRasterBackendStatistics statistics =
+                backend->backendStatistics();
+            t.Equals(statistics.residentCommands, 3ull,
+                     "backend counters should distinguish resident commands");
+            t.Equals(statistics.pageOwnership.gpuNewerPages,
+                     static_cast<size_t>(2u),
+                     "both touched pages should remain GPU-newer");
+            t.Equals(statistics.pageOwnership.cpuNewerPages,
+                     static_cast<size_t>(510u),
+                     "untouched initial pages should remain explicitly CPU-owned");
+
+            backend->prepareCpuVramAccess(
+                firstPages, GsFlushReason::CpuReadback);
+            const size_t firstOffset = 5u * GS_VRAM_PAGE_SIZE;
+            const size_t secondOffset = 511u * GS_VRAM_PAGE_SIZE;
+            t.IsTrue(std::equal(
+                         vram.begin() + firstOffset,
+                         vram.begin() + firstOffset + GS_VRAM_PAGE_SIZE,
+                         expected.begin() + firstOffset),
+                     "a scoped readback should publish the requested GPU-newer page");
+            t.IsTrue(std::equal(
+                         vram.begin() + secondOffset,
+                         vram.begin() + secondOffset + GS_VRAM_PAGE_SIZE,
+                         initial.begin() + secondOffset),
+                     "a scoped readback must leave an unrelated GPU-newer page stale on CPU");
+
+            GsVramPageMask allPages;
+            allPages.setAll();
+            backend->prepareCpuVramAccess(
+                allPages, GsFlushReason::DebuggerObservation);
+            t.IsTrue(vram == expected,
+                     "a forced full observation should reconstruct the exact CPU image");
+
+            service = backend->serviceStatistics();
+            t.Equals(service.pageDownloadOperationsCompleted, 2ull,
+                     "two differently scoped observers should issue two downloads");
+            t.Equals(service.pagesDownloaded, 2ull,
+                     "each GPU-newer page should download exactly once");
+            statistics = backend->backendStatistics();
+            t.Equals(statistics.coherency.gpuWriteOperations, 3ull,
+                     "every resident command should advance GPU ownership");
+            t.Equals(statistics.coherency.cpuToGpuPages, 2ull,
+                     "only first-use CPU-newer pages should become resident");
+            t.Equals(statistics.coherency.gpuToCpuPages, 2ull,
+                     "forced observations should publish only GPU-newer pages");
+            t.Equals(statistics.pageOwnership.gpuNewerPages,
+                     static_cast<size_t>(0u),
+                     "the final observation should leave no hidden GPU writer");
         });
 
         tc.Run("Vulkan verify mismatch writes a complete bounded reproducer", [](TestCase &t)

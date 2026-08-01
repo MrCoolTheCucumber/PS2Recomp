@@ -2570,9 +2570,9 @@ void GSRasterizer::recordAcceleratedCommit(
             static_cast<uint64_t>(bounds.y1 - bounds.y0);
     }
 
-    // A strict/hybrid GPU write is already synchronized into canonical CPU
-    // VRAM, but it invalidates software-only snapshots derived from the prior
-    // image. The narrow predicate rules out CLUT and texture aliases.
+    // A strict/hybrid GPU write invalidates software-only snapshots derived
+    // from the prior image. Canonical CPU VRAM may remain stale until a later
+    // overlapping access; the narrow predicate rules out CLUT/texture aliases.
     m_textureReadVram = nullptr;
     m_feedbackSnapshotValid = false;
     if (gs->m_hasPreferredDisplaySource &&

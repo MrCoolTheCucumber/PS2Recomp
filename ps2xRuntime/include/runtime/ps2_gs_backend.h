@@ -243,6 +243,23 @@ public:
     virtual void submit(std::span<const GsDrawCommand> commands) = 0;
     virtual void flush(GsFlushReason reason) = 0;
     [[nodiscard]] virtual size_t pendingCommandCount() const noexcept = 0;
+
+    // Device-backed implementations use these hooks to keep their private GS
+    // memory image coherent with the canonical CPU image. The default no-op
+    // keeps software-only and diagnostic backends source-compatible. A CPU
+    // access includes write pages because page-granular ownership must preserve
+    // every byte not overwritten by the eventual operation.
+    virtual void prepareCpuVramAccess(
+        const GsVramPageMask &pages,
+        GsFlushReason reason)
+    {
+        (void)pages;
+        (void)reason;
+    }
+    virtual void noteCpuVramWrite(const GsVramPageMask &pages)
+    {
+        (void)pages;
+    }
 };
 
 // Selects a backend before submission, so unsupported commands cannot
@@ -263,6 +280,16 @@ public:
         const GsDrawCommand &command);
     void flush(GsFlushReason reason);
 
+    // Brackets a non-rasterizer CPU access to GS local memory. begin drains
+    // already-submitted work, downloads only affected device-newer pages, and
+    // leaves both copies safe for the access. end publishes the pages actually
+    // written by the CPU. Empty write masks are valid for read-only observers.
+    void beginCpuVramAccess(
+        const GsVramPageMask &readPages,
+        const GsVramPageMask &writePages,
+        GsFlushReason reason);
+    void endCpuVramAccess(const GsVramPageMask &writePages);
+
     void setCountersEnabled(bool enabled) noexcept;
     [[nodiscard]] bool countersEnabled() const noexcept;
     [[nodiscard]] const GsBackendCounters &counters() const noexcept;
@@ -277,6 +304,10 @@ private:
     };
 
     void transitionTo(ActiveBackend backend);
+    void drainActive(GsFlushReason reason);
+    void synchronizeCpuVram(
+        const GsVramPageMask &pages,
+        GsFlushReason reason);
     void recordDecision(GsFallbackReason reason) noexcept;
     void recordFlush(GsFlushReason reason) noexcept;
     void updateQueueDepth(const IGsRasterBackend &backend) noexcept;

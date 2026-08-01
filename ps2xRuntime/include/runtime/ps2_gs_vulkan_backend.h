@@ -1,6 +1,7 @@
 #pragma once
 
 #include "runtime/ps2_gs_backend.h"
+#include "runtime/ps2_gs_coherency.h"
 #include "runtime/ps2_gs_vulkan.h"
 
 #include <cstdint>
@@ -27,13 +28,17 @@ struct GsVulkanRasterBackendStatistics
     uint64_t verificationMismatches = 0u;
     uint64_t bytesCompared = 0u;
     uint64_t flushes = 0u;
+    uint64_t residentCommands = 0u;
+    uint64_t cpuAccessPreparations = 0u;
+    GsVramCoherencySummary pageOwnership{};
+    GsVramCoherencyStatistics coherency{};
     std::string lastVerificationArtifact;
 };
 
-// Phase 3 backend: each command starts from canonical CPU VRAM and completes a
-// synchronous whole-buffer GPU transaction. Verify mode executes the supplied
-// software oracle only after the independent GPU result is complete, compares
-// all 4 MiB, and leaves the software result canonical on agreement.
+// Verify mode retains Phase 3's independent whole-image transaction and full
+// 4 MiB comparison. Hybrid and strict modes keep device VRAM resident and use
+// the page-coherency hooks inherited from IGsRasterBackend; canonical CPU VRAM
+// may therefore be stale until the router prepares an overlapping CPU access.
 // The caller must keep the canonical VRAM address and extent stable for the
 // backend's lifetime.
 class GsVulkanRasterBackend final : public IGsRasterBackend
@@ -75,6 +80,10 @@ public:
     void submit(std::span<const GsDrawCommand> commands) override;
     void flush(GsFlushReason reason) override;
     [[nodiscard]] size_t pendingCommandCount() const noexcept override;
+    void prepareCpuVramAccess(
+        const GsVramPageMask &pages,
+        GsFlushReason reason) override;
+    void noteCpuVramWrite(const GsVramPageMask &pages) override;
 
     [[nodiscard]] GsVulkanRasterBackendStatistics
     backendStatistics() const;

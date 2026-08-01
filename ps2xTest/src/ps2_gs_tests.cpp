@@ -676,6 +676,9 @@ void register_ps2_gs_tests()
                     true, GsFallbackReason::Supported};
                 std::vector<uint64_t> sequences;
                 std::vector<GsFlushReason> flushReasons;
+                std::vector<GsVramPageMask> cpuAccessPages;
+                std::vector<GsFlushReason> cpuAccessReasons;
+                std::vector<GsVramPageMask> cpuWritePages;
                 size_t pending = 0u;
 
                 [[nodiscard]] GsBackendDecision classify(
@@ -702,6 +705,20 @@ void register_ps2_gs_tests()
                     const noexcept override
                 {
                     return pending;
+                }
+
+                void prepareCpuVramAccess(
+                    const GsVramPageMask &pages,
+                    GsFlushReason reason) override
+                {
+                    cpuAccessPages.push_back(pages);
+                    cpuAccessReasons.push_back(reason);
+                }
+
+                void noteCpuVramWrite(
+                    const GsVramPageMask &pages) override
+                {
+                    cpuWritePages.push_back(pages);
                 }
             } software, accelerated;
 
@@ -739,6 +756,9 @@ void register_ps2_gs_tests()
             router.setAcceleratedBackend(&accelerated);
             t.IsTrue(router.setMode(GsRendererMode::Hybrid),
                      "hybrid mode should become selectable after backend attachment");
+            accelerated.cpuAccessPages.clear();
+            accelerated.cpuAccessReasons.clear();
+            accelerated.cpuWritePages.clear();
             accelerated.decision = {
                 false, GsFallbackReason::Textured};
             const GsSubmissionResult fallback = router.submit(command);
@@ -753,6 +773,23 @@ void register_ps2_gs_tests()
                     static_cast<size_t>(GsFallbackReason::Textured)],
                 1ull,
                 "the classifier's single reason should be counted");
+            const GsDrawResources commandResources = command.resources();
+            GsVramPageMask commandAccess = commandResources.readPages;
+            commandAccess.unionWith(commandResources.writePages);
+            t.Equals(accelerated.cpuAccessPages.size(),
+                     static_cast<size_t>(1u),
+                     "software fallback should prepare one scoped CPU access");
+            t.IsTrue(accelerated.cpuAccessPages[0] == commandAccess,
+                     "fallback should synchronize exactly its conservative resource pages");
+            t.Equals(accelerated.cpuAccessReasons[0],
+                     GsFlushReason::BackendSwitch,
+                     "draw fallback should retain the backend-switch transition reason");
+            t.Equals(accelerated.cpuWritePages.size(),
+                     static_cast<size_t>(1u),
+                     "software fallback should publish one CPU writer mask");
+            t.IsTrue(accelerated.cpuWritePages[0] ==
+                         commandResources.writePages,
+                     "software publication should exclude read-only resource pages");
 
             accelerated.decision = {
                 true, GsFallbackReason::Supported};
@@ -794,6 +831,32 @@ void register_ps2_gs_tests()
                      "verification backend should receive supported work");
             t.Equals(router.counters().verifiedCommands, 1ull,
                      "verify submissions should be counted separately");
+
+            accelerated.cpuAccessPages.clear();
+            accelerated.cpuAccessReasons.clear();
+            accelerated.cpuWritePages.clear();
+            GsVramPageMask cpuReads;
+            cpuReads.set(7u);
+            GsVramPageMask cpuWrites;
+            cpuWrites.set(511u);
+            router.beginCpuVramAccess(
+                cpuReads, cpuWrites, GsFlushReason::Transfer);
+            router.endCpuVramAccess(cpuWrites);
+            GsVramPageMask combinedCpuAccess = cpuReads;
+            combinedCpuAccess.unionWith(cpuWrites);
+            t.Equals(accelerated.cpuAccessPages.size(),
+                     static_cast<size_t>(1u),
+                     "an external CPU transaction should prepare one access");
+            t.IsTrue(accelerated.cpuAccessPages[0] == combinedCpuAccess,
+                     "external CPU access should synchronize the read/write union only");
+            t.Equals(accelerated.cpuAccessReasons[0],
+                     GsFlushReason::Transfer,
+                     "external CPU access should preserve its named boundary");
+            t.Equals(accelerated.cpuWritePages.size(),
+                     static_cast<size_t>(1u),
+                     "external CPU transaction should publish its writer mask once");
+            t.IsTrue(accelerated.cpuWritePages[0] == cpuWrites,
+                     "external CPU publication should not dirty read-only pages");
         });
 
         tc.Run("GS frontend routes draws and visibility boundaries through the software backend", [](TestCase &t)

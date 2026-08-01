@@ -490,6 +490,31 @@ namespace
         hash.append(g.colorClamp);
         return hash.value();
     }
+
+    bool flushRequiresCanonicalCpuVram(GsFlushReason reason) noexcept
+    {
+        switch (reason)
+        {
+        case GsFlushReason::Explicit:
+        case GsFlushReason::Transfer:
+        case GsFlushReason::CpuReadback:
+        case GsFlushReason::FeedbackSnapshot:
+        case GsFlushReason::ClutHazard:
+        case GsFlushReason::Finish:
+        case GsFlushReason::PresentationLatch:
+        case GsFlushReason::DebuggerObservation:
+        case GsFlushReason::Reset:
+        case GsFlushReason::SaveLoad:
+        case GsFlushReason::Shutdown:
+            return true;
+        case GsFlushReason::BackendSwitch:
+        case GsFlushReason::QueueBackpressure:
+        case GsFlushReason::ResourceHazard:
+        case GsFlushReason::Count:
+            return false;
+        }
+        return true;
+    }
 }
 
 void GsVramPageMask::clear() noexcept
@@ -697,6 +722,12 @@ void GsBackendRouter::setAcceleratedBackend(
         return;
 
     flush(GsFlushReason::BackendSwitch);
+    if (m_acceleratedBackend)
+    {
+        GsVramPageMask allPages;
+        allPages.setAll();
+        synchronizeCpuVram(allPages, GsFlushReason::BackendSwitch);
+    }
     m_acceleratedBackend = backend;
     if (!m_acceleratedBackend && m_mode != GsRendererMode::Software)
         m_mode = GsRendererMode::Software;
@@ -710,6 +741,9 @@ bool GsBackendRouter::setMode(GsRendererMode mode)
         return false;
 
     flush(GsFlushReason::BackendSwitch);
+    GsVramPageMask allPages;
+    allPages.setAll();
+    synchronizeCpuVram(allPages, GsFlushReason::BackendSwitch);
     m_mode = mode;
     return true;
 }
@@ -733,8 +767,15 @@ GsSubmissionResult GsBackendRouter::submit(
     if (m_mode == GsRendererMode::Software)
     {
         transitionTo(ActiveBackend::Software);
+        const GsDrawResources resources = command.resources();
+        GsVramPageMask accessPages = resources.readPages;
+        accessPages.unionWith(resources.writePages);
+        synchronizeCpuVram(
+            accessPages, GsFlushReason::BackendSwitch);
         m_softwareBackend->submit(
             std::span<const GsDrawCommand>(&command, 1u));
+        if (m_acceleratedBackend)
+            m_acceleratedBackend->noteCpuVramWrite(resources.writePages);
         m_activeBackend = ActiveBackend::Software;
         if (m_countersEnabled)
         {
@@ -781,8 +822,15 @@ GsSubmissionResult GsBackendRouter::submit(
     }
 
     transitionTo(ActiveBackend::Software);
+    const GsDrawResources resources = command.resources();
+    GsVramPageMask accessPages = resources.readPages;
+    accessPages.unionWith(resources.writePages);
+    synchronizeCpuVram(
+        accessPages, GsFlushReason::BackendSwitch);
     m_softwareBackend->submit(
         std::span<const GsDrawCommand>(&command, 1u));
+    if (m_acceleratedBackend)
+        m_acceleratedBackend->noteCpuVramWrite(resources.writePages);
     m_activeBackend = ActiveBackend::Software;
     if (m_countersEnabled)
     {
@@ -795,17 +843,45 @@ GsSubmissionResult GsBackendRouter::submit(
 
 void GsBackendRouter::flush(GsFlushReason reason)
 {
-    switch (m_activeBackend)
+    if (reason == GsFlushReason::Shutdown)
     {
-    case ActiveBackend::Software:
-        m_softwareBackend->flush(reason);
-        break;
-    case ActiveBackend::Accelerated:
+        if (m_activeBackend == ActiveBackend::Software)
+            m_softwareBackend->flush(reason);
         if (m_acceleratedBackend)
             m_acceleratedBackend->flush(reason);
-        break;
-    case ActiveBackend::None:
-        break;
+
+        m_activeBackend = ActiveBackend::None;
+        if (m_countersEnabled)
+        {
+            m_counters.queueDepth = 0u;
+            recordFlush(reason);
+        }
+        return;
+    }
+
+    const bool requiresCpuVram =
+        flushRequiresCanonicalCpuVram(reason);
+
+    // Software commands must materialize their reserved CPU writes before a
+    // device-to-CPU copy can publish unrelated GPU-newer pages. Accelerated
+    // synchronization drains its own work as part of prepareCpuVramAccess.
+    if (requiresCpuVram && m_activeBackend == ActiveBackend::Software)
+        m_softwareBackend->flush(reason);
+
+    if (requiresCpuVram)
+    {
+        GsVramPageMask allPages;
+        allPages.setAll();
+        synchronizeCpuVram(allPages, reason);
+        if (m_activeBackend == ActiveBackend::Accelerated &&
+            m_acceleratedBackend)
+        {
+            m_acceleratedBackend->flush(reason);
+        }
+    }
+    else
+    {
+        drainActive(reason);
     }
 
     m_activeBackend = ActiveBackend::None;
@@ -814,6 +890,32 @@ void GsBackendRouter::flush(GsFlushReason reason)
         m_counters.queueDepth = 0u;
         recordFlush(reason);
     }
+}
+
+void GsBackendRouter::beginCpuVramAccess(
+    const GsVramPageMask &readPages,
+    const GsVramPageMask &writePages,
+    GsFlushReason reason)
+{
+    drainActive(reason);
+    m_activeBackend = ActiveBackend::None;
+
+    GsVramPageMask accessPages = readPages;
+    accessPages.unionWith(writePages);
+    synchronizeCpuVram(accessPages, reason);
+
+    if (m_countersEnabled)
+    {
+        m_counters.queueDepth = 0u;
+        recordFlush(reason);
+    }
+}
+
+void GsBackendRouter::endCpuVramAccess(
+    const GsVramPageMask &writePages)
+{
+    if (m_acceleratedBackend)
+        m_acceleratedBackend->noteCpuVramWrite(writePages);
 }
 
 void GsBackendRouter::setCountersEnabled(bool enabled) noexcept
@@ -845,14 +947,7 @@ void GsBackendRouter::transitionTo(ActiveBackend backend)
         return;
     }
 
-    if (m_activeBackend == ActiveBackend::Software)
-    {
-        m_softwareBackend->flush(GsFlushReason::BackendSwitch);
-    }
-    else if (m_acceleratedBackend)
-    {
-        m_acceleratedBackend->flush(GsFlushReason::BackendSwitch);
-    }
+    drainActive(GsFlushReason::BackendSwitch);
     m_activeBackend = backend;
     if (m_countersEnabled)
     {
@@ -860,6 +955,30 @@ void GsBackendRouter::transitionTo(ActiveBackend backend)
         m_counters.queueDepth = 0u;
         recordFlush(GsFlushReason::BackendSwitch);
     }
+}
+
+void GsBackendRouter::drainActive(GsFlushReason reason)
+{
+    switch (m_activeBackend)
+    {
+    case ActiveBackend::Software:
+        m_softwareBackend->flush(reason);
+        break;
+    case ActiveBackend::Accelerated:
+        if (m_acceleratedBackend)
+            m_acceleratedBackend->flush(reason);
+        break;
+    case ActiveBackend::None:
+        break;
+    }
+}
+
+void GsBackendRouter::synchronizeCpuVram(
+    const GsVramPageMask &pages,
+    GsFlushReason reason)
+{
+    if (m_acceleratedBackend && pages.any())
+        m_acceleratedBackend->prepareCpuVramAccess(pages, reason);
 }
 
 void GsBackendRouter::recordDecision(

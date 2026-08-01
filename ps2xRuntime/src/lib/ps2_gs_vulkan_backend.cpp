@@ -407,7 +407,66 @@ struct GsVulkanRasterBackend::Impl final
     DrawCallback softwareOracle;
     DrawCallback acceleratedCommit;
     GsVulkanRasterBackendStatistics statistics;
+    GsVramCoherency coherency;
+    bool failed = false;
     bool shutDown = false;
+
+    [[noreturn]] void failRequest(
+        std::string_view operation,
+        std::string detail)
+    {
+        ++statistics.gpuRequestsFailed;
+        failed = true;
+        if (detail.empty())
+            detail = "executor rejected the request";
+        throw std::runtime_error(
+            "Vulkan GS " + std::string(operation) +
+            " failed before canonical VRAM mutation: " + detail);
+    }
+
+    void uploadCpuNewer(
+        const GsVramPageMask &within,
+        std::string_view operation)
+    {
+        const GsVramPageMask pages = coherency.cpuNewerPages(within);
+        if (!pages.any())
+            return;
+
+        std::string executionError;
+        if (!executor->uploadVramPages(
+                canonicalVram, pages, &executionError))
+        {
+            failRequest(operation, std::move(executionError));
+        }
+        coherency.completeCpuToGpu(pages);
+    }
+
+    void downloadGpuNewer(
+        const GsVramPageMask &within,
+        GsFlushReason reason)
+    {
+        const GsVramPageMask pages = coherency.gpuNewerPages(within);
+        if (!pages.any())
+            return;
+        if (failed || shutDown || !executor->healthy())
+        {
+            failRequest(
+                "page download at " +
+                    std::string(gsFlushReasonName(reason)),
+                "resident GPU-newer VRAM is unavailable");
+        }
+
+        std::string executionError;
+        if (!executor->downloadVramPages(
+                canonicalVram, pages, &executionError))
+        {
+            failRequest(
+                "page download at " +
+                    std::string(gsFlushReasonName(reason)),
+                std::move(executionError));
+        }
+        coherency.completeGpuToCpu(pages);
+    }
 };
 
 GsVulkanRasterBackend::GsVulkanRasterBackend(
@@ -419,7 +478,17 @@ GsVulkanRasterBackend::GsVulkanRasterBackend(
 GsVulkanRasterBackend::~GsVulkanRasterBackend()
 {
     if (m_impl && !m_impl->shutDown)
-        flush(GsFlushReason::Shutdown);
+    {
+        try
+        {
+            flush(GsFlushReason::Shutdown);
+        }
+        catch (...)
+        {
+            m_impl->executor->shutdown();
+            m_impl->shutDown = true;
+        }
+    }
 }
 
 std::unique_ptr<GsVulkanRasterBackend>
@@ -476,6 +545,12 @@ GsVulkanRasterBackend::createWithExecutor(
     impl->canonicalVram = canonicalVram;
     impl->softwareOracle = std::move(softwareOracle);
     impl->acceleratedCommit = std::move(acceleratedCommit);
+    GsVramPageMask allPages;
+    allPages.setAll();
+    // The canonical image predates the device allocation. Start with explicit
+    // CPU ownership so the first resident draw uploads only what it can touch.
+    impl->coherency.noteCpuWrite(allPages);
+    impl->coherency.resetStatistics();
     if (error)
         error->clear();
     return std::unique_ptr<GsVulkanRasterBackend>(
@@ -484,7 +559,7 @@ GsVulkanRasterBackend::createWithExecutor(
 
 bool GsVulkanRasterBackend::setMode(GsRendererMode mode) noexcept
 {
-    if (!isAcceleratedMode(mode) || m_impl->shutDown)
+    if (!isAcceleratedMode(mode) || m_impl->shutDown || m_impl->failed)
         return false;
     m_impl->config.mode = mode;
     return true;
@@ -498,7 +573,8 @@ GsRendererMode GsVulkanRasterBackend::mode() const noexcept
 GsBackendDecision GsVulkanRasterBackend::classify(
     const GsDrawCommand &command) const
 {
-    if (m_impl->shutDown || !m_impl->executor->healthy())
+    if (m_impl->shutDown || m_impl->failed ||
+        !m_impl->executor->healthy())
         return {false, GsFallbackReason::BackendUnavailable};
     GsVulkanCt32Sprite sprite{};
     return prepareGsVulkanCt32Sprite(command, sprite);
@@ -526,33 +602,42 @@ void GsVulkanRasterBackend::submit(
     {
         GsVulkanCt32Sprite sprite{};
         (void)prepareGsVulkanCt32Sprite(command, sprite);
+        const GsDrawResources resources = command.resources();
 
         ++m_impl->statistics.commandsAttempted;
-        std::vector<uint8_t> initial(
-            m_impl->canonicalVram.begin(),
-            m_impl->canonicalVram.end());
-        std::vector<uint8_t> gpuOutput;
-        std::string executionError;
-        if (!m_impl->executor->executeCt32Sprite(
-                initial, sprite, gpuOutput, &executionError) ||
-            gpuOutput.size() != GS_VULKAN_VRAM_SIZE)
-        {
-            ++m_impl->statistics.gpuRequestsFailed;
-            if (executionError.empty())
-            {
-                executionError =
-                    "executor returned an invalid VRAM image";
-            }
-            throw std::runtime_error(
-                "Vulkan CT32 draw " +
-                std::to_string(command.sequence()) +
-                " failed before canonical VRAM mutation: " +
-                executionError);
-        }
-
         if (m_impl->config.mode == GsRendererMode::Verify)
         {
+            GsVramPageMask allPages;
+            allPages.setAll();
+            prepareCpuVramAccess(
+                allPages, GsFlushReason::BackendSwitch);
+            std::vector<uint8_t> initial(
+                m_impl->canonicalVram.begin(),
+                m_impl->canonicalVram.end());
+            std::vector<uint8_t> gpuOutput;
+            std::string executionError;
+            if (!m_impl->executor->executeCt32Sprite(
+                    initial, sprite, gpuOutput, &executionError) ||
+                gpuOutput.size() != GS_VULKAN_VRAM_SIZE)
+            {
+                if (executionError.empty())
+                {
+                    executionError =
+                        "executor returned an invalid VRAM image";
+                }
+                m_impl->failRequest(
+                    "CT32 verification draw " +
+                        std::to_string(command.sequence()),
+                    std::move(executionError));
+            }
+
+            // executeCt32Sprite uploaded the entire initial image. Record that
+            // fact before the independent CPU oracle creates its newer result.
+            const GsVramPageMask initiallyCpuNewer =
+                m_impl->coherency.cpuNewerPages(allPages);
+            m_impl->coherency.completeCpuToGpu(initiallyCpuNewer);
             m_impl->softwareOracle(command);
+            m_impl->coherency.noteCpuWrite(resources.writePages);
             m_impl->statistics.bytesCompared += GS_VULKAN_VRAM_SIZE;
             const auto difference = std::mismatch(
                 m_impl->canonicalVram.begin(),
@@ -565,6 +650,7 @@ void GsVulkanRasterBackend::submit(
                         difference.first -
                         m_impl->canonicalVram.begin());
                 ++m_impl->statistics.verificationMismatches;
+                m_impl->failed = true;
                 std::string artifactPath;
                 std::string artifactError;
                 const bool artifactWritten = writeVerificationArtifact(
@@ -591,16 +677,34 @@ void GsVulkanRasterBackend::submit(
                     message << "; artifact failure=" << artifactError;
                 throw std::runtime_error(message.str());
             }
+            // A complete byte comparison proves that the independently written
+            // GPU pages now contain the same generation as the CPU oracle.
+            m_impl->coherency.completeCpuToGpu(resources.writePages);
             ++m_impl->statistics.verifiedCommands;
         }
         else
         {
-            std::memcpy(
-                m_impl->canonicalVram.data(), gpuOutput.data(),
-                GS_VULKAN_VRAM_SIZE);
+            GsVramPageMask accessPages = resources.readPages;
+            accessPages.unionWith(resources.writePages);
+            m_impl->uploadCpuNewer(
+                accessPages,
+                "page upload for CT32 draw " +
+                    std::to_string(command.sequence()));
+
+            std::string executionError;
+            if (!m_impl->executor->executeResidentCt32Sprite(
+                    sprite, &executionError))
+            {
+                m_impl->failRequest(
+                    "resident CT32 draw " +
+                        std::to_string(command.sequence()),
+                    std::move(executionError));
+            }
+            m_impl->coherency.noteGpuWrite(resources.writePages);
             if (m_impl->acceleratedCommit)
                 m_impl->acceleratedCommit(command);
             ++m_impl->statistics.committedGpuCommands;
+            ++m_impl->statistics.residentCommands;
         }
         ++m_impl->statistics.commandsCompleted;
     }
@@ -611,6 +715,18 @@ void GsVulkanRasterBackend::flush(GsFlushReason reason)
     ++m_impl->statistics.flushes;
     if (reason == GsFlushReason::Shutdown && !m_impl->shutDown)
     {
+        GsVramPageMask allPages;
+        allPages.setAll();
+        try
+        {
+            prepareCpuVramAccess(allPages, reason);
+        }
+        catch (...)
+        {
+            // Shutdown is commonly reached from a noexcept owner destructor.
+            // The failed flag and request counters retain the diagnosis; an
+            // unavailable GPU-newer image cannot be repaired during teardown.
+        }
         m_impl->executor->shutdown();
         m_impl->shutDown = true;
     }
@@ -621,10 +737,29 @@ size_t GsVulkanRasterBackend::pendingCommandCount() const noexcept
     return 0u;
 }
 
+void GsVulkanRasterBackend::prepareCpuVramAccess(
+    const GsVramPageMask &pages,
+    GsFlushReason reason)
+{
+    if (!pages.any())
+        return;
+    ++m_impl->statistics.cpuAccessPreparations;
+    m_impl->downloadGpuNewer(pages, reason);
+}
+
+void GsVulkanRasterBackend::noteCpuVramWrite(
+    const GsVramPageMask &pages)
+{
+    m_impl->coherency.noteCpuWrite(pages);
+}
+
 GsVulkanRasterBackendStatistics
 GsVulkanRasterBackend::backendStatistics() const
 {
-    return m_impl->statistics;
+    GsVulkanRasterBackendStatistics statistics = m_impl->statistics;
+    statistics.pageOwnership = m_impl->coherency.summary();
+    statistics.coherency = m_impl->coherency.statistics();
+    return statistics;
 }
 
 GsVulkanCapabilityReport GsVulkanRasterBackend::capabilities() const
@@ -640,5 +775,6 @@ GsVulkanRasterBackend::serviceStatistics() const
 
 bool GsVulkanRasterBackend::healthy() const
 {
-    return !m_impl->shutDown && m_impl->executor->healthy();
+    return !m_impl->shutDown && !m_impl->failed &&
+           m_impl->executor->healthy();
 }
