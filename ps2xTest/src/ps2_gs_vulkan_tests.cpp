@@ -1,4 +1,5 @@
 #include "MiniTest.h"
+#include "runtime/ps2_gs_gpu.h"
 #include "runtime/ps2_gs_memory.h"
 #include "runtime/ps2_gs_vulkan.h"
 #include "runtime/ps2_gs_vulkan_backend.h"
@@ -309,6 +310,99 @@ namespace
                     x, y, sprite.rgba);
             }
         }
+    }
+
+    uint64_t packXyz2(
+        uint16_t x12_4, uint16_t y12_4, uint32_t z = 0u)
+    {
+        return static_cast<uint64_t>(x12_4) |
+               (static_cast<uint64_t>(y12_4) << 16u) |
+               (static_cast<uint64_t>(z) << 32u);
+    }
+
+    void configureFlatCt32Draws(
+        GS &gs,
+        uint32_t framebufferPage = 3u,
+        uint32_t framebufferWidth = 2u)
+    {
+        const uint64_t frame =
+            static_cast<uint64_t>(framebufferPage) |
+            (static_cast<uint64_t>(framebufferWidth) << 16u) |
+            (static_cast<uint64_t>(GS_PSM_CT32) << 24u);
+        const uint64_t scissor =
+            (127ull << 16u) |
+            (63ull << 48u);
+        gs.writeRegister(GS_REG_FRAME_1, frame);
+        gs.writeRegister(GS_REG_ZBUF_1, 1ull << 32u);
+        gs.writeRegister(GS_REG_SCISSOR_1, scissor);
+        gs.writeRegister(GS_REG_XYOFFSET_1, 0u);
+        gs.writeRegister(GS_REG_TEST_1, 0x30000u);
+        gs.writeRegister(GS_REG_FBA_1, 0u);
+        gs.writeRegister(GS_REG_SCANMSK, 0u);
+        gs.writeRegister(GS_REG_DTHE, 0u);
+    }
+
+    void drawFlatCt32Sprite(
+        GS &gs,
+        uint16_t x0,
+        uint16_t y0,
+        uint16_t x1,
+        uint16_t y1,
+        uint32_t rgba)
+    {
+        gs.writeRegister(
+            GS_REG_PRIM, static_cast<uint64_t>(GS_PRIM_SPRITE));
+        gs.writeRegister(GS_REG_RGBAQ, rgba);
+        gs.writeRegister(GS_REG_XYZ2, packXyz2(x0, y0));
+        gs.writeRegister(GS_REG_XYZ2, packXyz2(x1, y1));
+    }
+
+    void drawFlatCt32Point(
+        GS &gs, uint16_t x, uint16_t y, uint32_t rgba)
+    {
+        gs.writeRegister(
+            GS_REG_PRIM, static_cast<uint64_t>(GS_PRIM_POINT));
+        gs.writeRegister(GS_REG_RGBAQ, rgba);
+        gs.writeRegister(GS_REG_XYZ2, packXyz2(x, y));
+    }
+
+    void uploadCt32Pixels(
+        GS &gs,
+        uint32_t destinationBlock,
+        uint32_t destinationWidth,
+        uint16_t x,
+        uint16_t y,
+        std::span<const uint32_t> pixels)
+    {
+        const uint64_t bitbltbuf =
+            (static_cast<uint64_t>(destinationBlock) << 32u) |
+            (static_cast<uint64_t>(destinationWidth) << 48u) |
+            (static_cast<uint64_t>(GS_PSM_CT32) << 56u);
+        const uint64_t trxpos =
+            (static_cast<uint64_t>(x) << 32u) |
+            (static_cast<uint64_t>(y) << 48u);
+        const uint64_t trxreg =
+            static_cast<uint64_t>(pixels.size()) |
+            (1ull << 32u);
+        gs.uploadImageNative(
+            bitbltbuf, trxpos, trxreg, 0u,
+            reinterpret_cast<const uint8_t *>(pixels.data()),
+            static_cast<uint32_t>(pixels.size_bytes()));
+    }
+
+    GsVulkanServiceConfig makeRendererServiceConfig(
+        GsVulkanCapabilityReport &preflight)
+    {
+        GsVulkanServiceConfig config{};
+        config.probe.enableValidation = true;
+        preflight = probeGsVulkanCapabilities(config.probe);
+        if (preflight.status ==
+            GsVulkanProbeStatus::ValidationUnavailable)
+        {
+            config.probe.enableValidation = false;
+            preflight = probeGsVulkanCapabilities(config.probe);
+        }
+        return config;
     }
 
     class FakeCt32Executor final : public IGsVulkanDrawExecutor
@@ -809,6 +903,317 @@ void register_ps2_gs_vulkan_tests()
             applyCt32SpriteCpu(expected, sprite);
             t.IsTrue(vram == expected,
                      "the software oracle should remain canonical on mismatch");
+        });
+
+        tc.Run("GS Vulkan verify and hybrid preserve fallback transfer ordering", [](TestCase &t)
+        {
+            GSMem::InitLookupTables();
+            std::vector<uint8_t> softwareVram =
+                makeVramPattern(0x52545231u);
+            std::vector<uint8_t> acceleratedVram = softwareVram;
+            GS software;
+            GS accelerated;
+            software.init(
+                softwareVram.data(),
+                static_cast<uint32_t>(softwareVram.size()), nullptr);
+            accelerated.init(
+                acceleratedVram.data(),
+                static_cast<uint32_t>(acceleratedVram.size()), nullptr);
+            configureFlatCt32Draws(software);
+            configureFlatCt32Draws(accelerated);
+
+            GsVulkanCapabilityReport preflight{};
+            const GsVulkanServiceConfig config =
+                makeRendererServiceConfig(preflight);
+            ScopedArtifactDirectory artifacts;
+            t.IsTrue(accelerated.configureVulkanRenderer(
+                         config, artifacts.path.string()),
+                     "a software-mode GS should accept Vulkan configuration before creation");
+            if (!preflight.ready())
+            {
+                t.IsFalse(accelerated.setRendererMode(
+                              GsRendererMode::Verify),
+                          "an unavailable host should decline verify mode cleanly");
+                t.Equals(accelerated.rendererMode(),
+                         GsRendererMode::Software,
+                         "failed opt-in selection must preserve software mode");
+                t.IsFalse(accelerated.rendererDiagnostic().empty(),
+                          "failed renderer creation should retain a diagnostic");
+                return;
+            }
+
+            t.IsTrue(accelerated.setRendererMode(
+                         GsRendererMode::Verify),
+                     "a capable host should create the integrated verify backend");
+            if (accelerated.rendererMode() != GsRendererMode::Verify)
+                return;
+            t.IsTrue(accelerated.rendererDiagnostic().empty(),
+                     "successful renderer selection should clear diagnostics");
+            t.IsFalse(accelerated.configureVulkanRenderer(config),
+                      "renderer configuration should lock after backend creation");
+
+            accelerated.setBackendCountersEnabled(true);
+            accelerated.resetBackendCounters();
+
+            drawFlatCt32Sprite(
+                software, 4u * 16u, 5u * 16u,
+                26u * 16u, 18u * 16u, 0xA0123456u);
+            drawFlatCt32Sprite(
+                accelerated, 4u * 16u, 5u * 16u,
+                26u * 16u, 18u * 16u, 0xA0123456u);
+            t.IsTrue(acceleratedVram == softwareVram,
+                     "an integrated verified sprite should preserve the complete software image");
+
+            drawFlatCt32Point(
+                software, 9u * 16u, 7u * 16u, 0xB0654321u);
+            drawFlatCt32Point(
+                accelerated, 9u * 16u, 7u * 16u, 0xB0654321u);
+            t.IsTrue(acceleratedVram == softwareVram,
+                     "verify fallback should execute after the synchronized GPU draw");
+
+            constexpr std::array<uint32_t, 3> transferPixels{
+                0xC0010203u, 0xD0040506u, 0xE0070809u};
+            constexpr uint32_t framebufferBlock = 3u << 5u;
+            uploadCt32Pixels(
+                software, framebufferBlock, 2u, 12u, 9u,
+                transferPixels);
+            uploadCt32Pixels(
+                accelerated, framebufferBlock, 2u, 12u, 9u,
+                transferPixels);
+            t.IsTrue(acceleratedVram == softwareVram,
+                     "a host transfer after GPU-to-software fallback should preserve canonical VRAM");
+
+            drawFlatCt32Sprite(
+                software, 10u * 16u, 8u * 16u,
+                31u * 16u, 23u * 16u, 0xF0ABCDEFu);
+            drawFlatCt32Sprite(
+                accelerated, 10u * 16u, 8u * 16u,
+                31u * 16u, 23u * 16u, 0xF0ABCDEFu);
+            (void)software.getDebugSnapshot();
+            (void)accelerated.getDebugSnapshot();
+            t.IsTrue(acceleratedVram == softwareVram,
+                     "the post-transfer verified overlap should remain exact at a forced observation");
+
+            const GsBackendCounters verifyCounters =
+                accelerated.backendCounters();
+            t.Equals(verifyCounters.commands, 3ull,
+                     "the verify sequence should route all three assembled draws");
+            t.Equals(verifyCounters.acceleratedCommands, 2ull,
+                     "both eligible sprites should use the Vulkan backend");
+            t.Equals(verifyCounters.verifiedCommands, 2ull,
+                     "both Vulkan sprites should be independently verified");
+            t.Equals(verifyCounters.softwareCommands, 1ull,
+                     "the unsupported point should execute once in software");
+            t.Equals(verifyCounters.fallbackCommands, 1ull,
+                     "the unsupported point should be an explicit fallback");
+            t.Equals(verifyCounters.backendSwitches, 1ull,
+                     "the adjacent supported-to-fallback transition should synchronize once");
+            t.Equals(
+                verifyCounters.flushReasons[static_cast<size_t>(
+                    GsFlushReason::Transfer)],
+                1ull,
+                "the host upload should remain a named transfer boundary");
+
+            t.IsTrue(accelerated.setRendererMode(
+                         GsRendererMode::Hybrid),
+                     "the proven synchronized backend should opt into hybrid mode");
+            t.Equals(accelerated.rendererMode(), GsRendererMode::Hybrid,
+                     "hybrid selection should be externally observable");
+            accelerated.resetBackendCounters();
+
+            drawFlatCt32Sprite(
+                software, 2u * 16u, 24u * 16u,
+                18u * 16u, 35u * 16u, 0x81726354u);
+            drawFlatCt32Sprite(
+                accelerated, 2u * 16u, 24u * 16u,
+                18u * 16u, 35u * 16u, 0x81726354u);
+            drawFlatCt32Point(
+                software, 17u * 16u, 34u * 16u, 0x91FEDCBAu);
+            drawFlatCt32Point(
+                accelerated, 17u * 16u, 34u * 16u, 0x91FEDCBAu);
+            (void)software.getDebugSnapshot();
+            (void)accelerated.getDebugSnapshot();
+            t.IsTrue(acceleratedVram == softwareVram,
+                     "hybrid GPU and software work should share exact canonical VRAM");
+
+            const GsBackendCounters hybridCounters =
+                accelerated.backendCounters();
+            t.Equals(hybridCounters.commands, 2ull,
+                     "hybrid should observe both commands");
+            t.Equals(hybridCounters.acceleratedCommands, 1ull,
+                     "hybrid should accelerate the eligible sprite");
+            t.Equals(hybridCounters.softwareCommands, 1ull,
+                     "hybrid should retain transparent software fallback");
+            t.Equals(hybridCounters.fallbackCommands, 1ull,
+                     "hybrid fallback should remain explicit");
+            t.Equals(hybridCounters.backendSwitches, 1ull,
+                     "hybrid should synchronize the adjacent backend transition");
+
+            const GsVulkanRasterBackendStatistics backendStatistics =
+                accelerated.vulkanRendererBackendStatistics();
+            t.Equals(backendStatistics.commandsCompleted, 3ull,
+                     "three total GPU commands should complete across verify and hybrid");
+            t.Equals(backendStatistics.verifiedCommands, 2ull,
+                     "verify should retain its two complete comparisons");
+            t.Equals(backendStatistics.committedGpuCommands, 1ull,
+                     "hybrid should publish one GPU result to canonical VRAM");
+            t.Equals(backendStatistics.verificationMismatches, 0ull,
+                     "the integrated sequence should have no byte mismatch");
+            const GsVulkanServiceStatistics serviceStatistics =
+                accelerated.vulkanRendererServiceStatistics();
+            t.Equals(serviceStatistics.spriteDrawsCompleted, 3ull,
+                     "the service should execute exactly the eligible draws");
+            t.Equals(serviceStatistics.validationErrors, 0u,
+                     "integrated transitions should remain validation-clean");
+            t.Equals(serviceStatistics.validationWarnings, 0u,
+                     "integrated transitions should emit no validation warnings");
+        });
+
+        tc.Run("GS Vulkan strict rejects before mutation and survives reset", [](TestCase &t)
+        {
+            GSMem::InitLookupTables();
+            std::vector<uint8_t> softwareVram =
+                makeVramPattern(0x53545231u);
+            std::vector<uint8_t> strictVram = softwareVram;
+            GS software;
+            GS strict;
+            software.init(
+                softwareVram.data(),
+                static_cast<uint32_t>(softwareVram.size()), nullptr);
+            strict.init(
+                strictVram.data(),
+                static_cast<uint32_t>(strictVram.size()), nullptr);
+            configureFlatCt32Draws(software);
+            configureFlatCt32Draws(strict);
+
+            GsVulkanCapabilityReport preflight{};
+            const GsVulkanServiceConfig config =
+                makeRendererServiceConfig(preflight);
+            t.IsTrue(strict.configureVulkanRenderer(config),
+                     "strict fixture configuration should succeed before creation");
+            if (!preflight.ready())
+            {
+                t.IsFalse(strict.setRendererMode(
+                              GsRendererMode::GpuStrict),
+                          "an unavailable host should decline strict mode cleanly");
+                t.Equals(strict.rendererMode(), GsRendererMode::Software,
+                         "failed strict selection must preserve software mode");
+                return;
+            }
+
+            t.IsTrue(strict.setRendererMode(
+                         GsRendererMode::GpuStrict),
+                     "a capable host should create the strict Vulkan backend");
+            if (strict.rendererMode() != GsRendererMode::GpuStrict)
+                return;
+            strict.setBackendCountersEnabled(true);
+            strict.resetBackendCounters();
+
+            drawFlatCt32Sprite(
+                software, 6u * 16u, 4u * 16u,
+                23u * 16u, 16u * 16u, 0xC0112233u);
+            drawFlatCt32Sprite(
+                strict, 6u * 16u, 4u * 16u,
+                23u * 16u, 16u * 16u, 0xC0112233u);
+            (void)strict.getDebugSnapshot();
+            t.IsTrue(strictVram == softwareVram,
+                     "strict GPU publication should match the software oracle");
+
+            const std::vector<uint8_t> rejectionSentinel = strictVram;
+            std::string pointFailure;
+            try
+            {
+                drawFlatCt32Point(
+                    strict, 9u * 16u, 9u * 16u, 0xD0445566u);
+            }
+            catch (const std::runtime_error &error)
+            {
+                pointFailure = error.what();
+            }
+            t.IsTrue(pointFailure.find("unsupported-primitive") !=
+                         std::string::npos,
+                     "strict should name the first unsupported primitive");
+            t.IsTrue(strictVram == rejectionSentinel,
+                     "strict point rejection must occur before VRAM mutation");
+
+            std::string emptyFailure;
+            try
+            {
+                strict.writeRegister(
+                    GS_REG_PRIM,
+                    static_cast<uint64_t>(GS_PRIM_SPRITE));
+                strict.writeRegister(GS_REG_RGBAQ, 0xE0778899u);
+                strict.writeRegister(
+                    GS_REG_XYZ2, packXyz2(14u * 16u, 12u * 16u));
+                strict.writeRegister(
+                    GS_REG_XYZ2, packXyz2(14u * 16u, 12u * 16u));
+            }
+            catch (const std::runtime_error &error)
+            {
+                emptyFailure = error.what();
+            }
+            t.IsTrue(emptyFailure.find("empty-bounds") !=
+                         std::string::npos,
+                     "strict should reject empty bounds before submission");
+            t.IsTrue(strictVram == rejectionSentinel,
+                     "strict empty rejection must preserve all canonical VRAM");
+
+            strict.reset();
+            software.reset();
+            t.Equals(strict.rendererMode(), GsRendererMode::GpuStrict,
+                     "GS reset should preserve the selected renderer service and mode");
+            configureFlatCt32Draws(software);
+            configureFlatCt32Draws(strict);
+            drawFlatCt32Sprite(
+                software, 19u * 16u, 20u * 16u,
+                39u * 16u, 31u * 16u, 0xF0AABBCCu);
+            drawFlatCt32Sprite(
+                strict, 19u * 16u, 20u * 16u,
+                39u * 16u, 31u * 16u, 0xF0AABBCCu);
+            strict.writeRegister(GS_REG_FINISH, 0u);
+            (void)strict.getDebugSnapshot();
+            t.IsTrue(strictVram == softwareVram,
+                     "strict execution after reset and forced drain should remain exact");
+
+            const GsBackendCounters counters = strict.backendCounters();
+            t.Equals(counters.commands, 4ull,
+                     "strict should classify two accepted and two rejected commands");
+            t.Equals(counters.acceleratedCommands, 2ull,
+                     "both eligible strict sprites should reach Vulkan");
+            t.Equals(counters.softwareCommands, 0ull,
+                     "strict must never hide rejection behind software");
+            t.Equals(counters.strictFailures, 2ull,
+                     "both pre-mutation rejections should be explicit");
+            t.Equals(
+                counters.flushReasons[static_cast<size_t>(
+                    GsFlushReason::Reset)],
+                1ull,
+                "reset should drain the active accelerated backend once");
+            t.Equals(
+                counters.decisions[static_cast<size_t>(
+                    GsFallbackReason::UnsupportedPrimitive)],
+                1ull,
+                "the strict point should retain its canonical reason");
+            t.Equals(
+                counters.decisions[static_cast<size_t>(
+                    GsFallbackReason::EmptyBounds)],
+                1ull,
+                "the strict degenerate sprite should retain its canonical reason");
+
+            const GsVulkanRasterBackendStatistics backendStatistics =
+                strict.vulkanRendererBackendStatistics();
+            t.Equals(backendStatistics.commandsCompleted, 2ull,
+                     "only accepted strict draws should execute");
+            t.Equals(backendStatistics.committedGpuCommands, 2ull,
+                     "both accepted strict draws should publish GPU VRAM");
+            const GsVulkanServiceStatistics serviceStatistics =
+                strict.vulkanRendererServiceStatistics();
+            t.Equals(serviceStatistics.spriteDrawsCompleted, 2ull,
+                     "strict rejections should not become service requests");
+            t.Equals(serviceStatistics.validationErrors, 0u,
+                     "strict reset and drain should remain validation-clean");
+            t.Equals(serviceStatistics.validationWarnings, 0u,
+                     "strict reset and drain should emit no validation warnings");
         });
 
         tc.Run("Compact PSM addresses match the CPU memory oracle", [](TestCase &t)

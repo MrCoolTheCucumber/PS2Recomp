@@ -3,11 +3,13 @@
 
 #include "runtime/ps2_gs_backend.h"
 #include "runtime/ps2_gs_replay.h"
+#include "runtime/ps2_gs_vulkan_backend.h"
 
 #include <array>
 #include <cstddef>
 #include <cstdint>
 #include <memory>
+#include <string>
 #include <vector>
 
 class GS;
@@ -27,8 +29,18 @@ public:
         GsFlushReason reason = GsFlushReason::Explicit);
     void endDrawBatch(GS *gs);
     void drawPrimitive(GS *gs);
+    [[nodiscard]] bool configureVulkanRenderer(
+        const GsVulkanServiceConfig &config,
+        std::string verificationArtifactDirectory = {});
     [[nodiscard]] bool setRendererMode(GsRendererMode mode);
     [[nodiscard]] GsRendererMode rendererMode() const noexcept;
+    [[nodiscard]] std::string rendererDiagnostic() const;
+    [[nodiscard]] GsVulkanCapabilityReport
+    vulkanRendererCapabilities() const;
+    [[nodiscard]] GsVulkanServiceStatistics
+    vulkanRendererServiceStatistics() const;
+    [[nodiscard]] GsVulkanRasterBackendStatistics
+    vulkanRendererBackendStatistics() const;
     void setBackendCountersEnabled(bool enabled) noexcept;
     [[nodiscard]] GsBackendCounters backendCounters() const noexcept;
     void resetBackendCounters() noexcept;
@@ -68,6 +80,9 @@ private:
 
     bool tryQueuePrimitive(GS *gs, const GsDrawCommand &command);
     void submitSoftwareCommand(GS *gs, const GsDrawCommand &command);
+    void recordAcceleratedCommit(
+        GS *gs,
+        const GsDrawCommand &command);
     void flushSoftwareDrawBatch(GS *gs);
     [[nodiscard]] size_t softwarePendingCommandCount() const noexcept;
     void renderSoftwarePrimitive(GS *gs, const GsDrawCommand &command);

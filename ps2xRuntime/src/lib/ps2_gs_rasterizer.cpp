@@ -7,6 +7,7 @@
 #include "runtime/ps2_gs_psmt4.h"
 #include "runtime/ps2_gs_psmt8.h"
 #include "runtime/ps2_gs_memory.h"
+#include "runtime/ps2_gs_vulkan_backend.h"
 #include "ps2_gs_rasterizer_detail.h"
 #include "ps2_gs_packed_sprite_kernel.h"
 #include "ps2_log.h"
@@ -1994,7 +1995,12 @@ struct GSRasterizer::BackendState
     }
 
     SoftwareBackend software;
+    std::unique_ptr<GsVulkanRasterBackend> accelerated;
     GsBackendRouter router;
+    GsVulkanServiceConfig serviceConfig{};
+    GsVulkanCapabilityReport capabilityReport{};
+    std::string verificationArtifactDirectory;
+    std::string diagnostic;
 };
 
 GSRasterizer::GSRasterizer(GS *owner)
@@ -2551,6 +2557,32 @@ void GSRasterizer::submitSoftwareCommand(
     renderSoftwarePrimitive(gs, command);
 }
 
+void GSRasterizer::recordAcceleratedCommit(
+    GS *gs,
+    const GsDrawCommand &command)
+{
+    DebugProgressScope progress(*this, gs);
+    const GsDrawBounds &bounds = command.bounds();
+    if (!bounds.empty())
+    {
+        m_debugCandidatePixelBatch +=
+            static_cast<uint64_t>(bounds.x1 - bounds.x0) *
+            static_cast<uint64_t>(bounds.y1 - bounds.y0);
+    }
+
+    // A strict/hybrid GPU write is already synchronized into canonical CPU
+    // VRAM, but it invalidates software-only snapshots derived from the prior
+    // image. The narrow predicate rules out CLUT and texture aliases.
+    m_textureReadVram = nullptr;
+    m_feedbackSnapshotValid = false;
+    if (gs->m_hasPreferredDisplaySource &&
+        command.context().frame.fbp ==
+            gs->m_preferredDisplayDestFbp)
+    {
+        gs->m_hasPreferredDisplaySource = false;
+    }
+}
+
 void GSRasterizer::flushDrawBatch(
     GS *gs,
     GsFlushReason reason)
@@ -2565,14 +2597,130 @@ size_t GSRasterizer::softwarePendingCommandCount() const noexcept
     return m_parallelState ? m_parallelState->commands.size() : 0u;
 }
 
+bool GSRasterizer::configureVulkanRenderer(
+    const GsVulkanServiceConfig &config,
+    std::string verificationArtifactDirectory)
+{
+    BackendState &state = *m_backendState;
+    if (state.router.mode() != GsRendererMode::Software ||
+        state.accelerated)
+    {
+        state.diagnostic =
+            "Vulkan renderer configuration is locked after backend creation";
+        return false;
+    }
+
+    state.serviceConfig = config;
+    state.verificationArtifactDirectory =
+        std::move(verificationArtifactDirectory);
+    state.capabilityReport = {};
+    state.diagnostic.clear();
+    return true;
+}
+
 bool GSRasterizer::setRendererMode(GsRendererMode mode)
 {
-    return m_backendState->router.setMode(mode);
+    BackendState &state = *m_backendState;
+    if (mode == GsRendererMode::Software)
+    {
+        const bool selected = state.router.setMode(mode);
+        if (selected)
+            state.diagnostic.clear();
+        return selected;
+    }
+    if (mode != GsRendererMode::Hybrid &&
+        mode != GsRendererMode::Verify &&
+        mode != GsRendererMode::GpuStrict)
+    {
+        state.diagnostic = "unknown GS renderer mode";
+        return false;
+    }
+
+    if (!state.accelerated)
+    {
+        if (!m_owner || !m_owner->m_vram ||
+            m_owner->m_vramSize != GS_VULKAN_VRAM_SIZE)
+        {
+            state.diagnostic =
+                "Vulkan renderer requires initialized exact 4 MiB GS VRAM";
+            return false;
+        }
+
+        GsVulkanRasterBackendConfig backendConfig{};
+        backendConfig.mode = mode;
+        backendConfig.verificationArtifactDirectory =
+            state.verificationArtifactDirectory;
+        std::unique_ptr<GsVulkanRasterBackend> accelerated =
+            GsVulkanRasterBackend::create(
+                state.serviceConfig, backendConfig,
+                std::span<uint8_t>(
+                    m_owner->m_vram, m_owner->m_vramSize),
+                [this](const GsDrawCommand &command)
+                {
+                    renderSoftwarePrimitive(m_owner, command);
+                },
+                [this](const GsDrawCommand &command)
+                {
+                    recordAcceleratedCommit(m_owner, command);
+                },
+                &state.capabilityReport,
+                &state.diagnostic);
+        if (!accelerated)
+            return false;
+        state.accelerated = std::move(accelerated);
+        state.router.setAcceleratedBackend(state.accelerated.get());
+    }
+
+    if (!state.accelerated->healthy())
+    {
+        state.diagnostic = "Vulkan renderer backend is not healthy";
+        return false;
+    }
+    if (!state.accelerated->setMode(mode) ||
+        !state.router.setMode(mode))
+    {
+        state.diagnostic = "failed to select synchronized Vulkan renderer mode";
+        return false;
+    }
+    state.diagnostic.clear();
+    return true;
 }
 
 GsRendererMode GSRasterizer::rendererMode() const noexcept
 {
     return m_backendState->router.mode();
+}
+
+std::string GSRasterizer::rendererDiagnostic() const
+{
+    return m_backendState->diagnostic;
+}
+
+GsVulkanCapabilityReport
+GSRasterizer::vulkanRendererCapabilities() const
+{
+    const BackendState &state = *m_backendState;
+    return state.accelerated
+        ? state.accelerated->capabilities()
+        : state.capabilityReport;
+}
+
+GsVulkanServiceStatistics
+GSRasterizer::vulkanRendererServiceStatistics() const
+{
+    const BackendState &state = *m_backendState;
+    return state.accelerated
+        ? state.accelerated->serviceStatistics()
+        : GsVulkanServiceStatistics{};
+}
+
+GsVulkanRasterBackendStatistics
+GSRasterizer::vulkanRendererBackendStatistics() const
+{
+    const BackendState &state = *m_backendState;
+    return state.accelerated
+        ? state.accelerated->backendStatistics()
+        : GsVulkanRasterBackendStatistics{};
 }
 
 void GSRasterizer::setBackendCountersEnabled(bool enabled) noexcept

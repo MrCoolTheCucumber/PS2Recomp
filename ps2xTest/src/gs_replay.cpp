@@ -6,6 +6,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <cstdint>
+#include <exception>
 #include <filesystem>
 #include <fstream>
 #include <iomanip>
@@ -65,6 +66,9 @@ namespace
                "[--state-in FILE] "
                "[--packet-sizes FILE] [--hash-trace FILE] "
                "[--renderer software|hybrid|verify|gpu-strict] "
+               "[--verify-dump-dir DIRECTORY] "
+               "[--vulkan-validation] [--vulkan-loader FILE] "
+               "[--vulkan-vendor ID] [--vulkan-device ID] "
                "[--backend-stats] [--stop-after-command COUNT] "
                "[--stop-after-packet COUNT] [--compare-vram FILE] "
                "[--batch-stream] "
@@ -330,6 +334,18 @@ namespace
                << statistics.bytesDownloaded
                << ",\"fence_wait_nanoseconds\":"
                << statistics.fenceWaitNanoseconds
+               << ",\"memory_batches_completed\":"
+               << statistics.memoryBatchesCompleted
+               << ",\"memory_batches_failed\":"
+               << statistics.memoryBatchesFailed
+               << ",\"memory_cases_executed\":"
+               << statistics.memoryCasesExecuted
+               << ",\"sprite_draws_completed\":"
+               << statistics.spriteDrawsCompleted
+               << ",\"sprite_draws_failed\":"
+               << statistics.spriteDrawsFailed
+               << ",\"sprite_pixels_executed\":"
+               << statistics.spritePixelsExecuted
                << ",\"validation_warnings\":"
                << statistics.validationWarnings
                << ",\"validation_errors\":"
@@ -337,6 +353,31 @@ namespace
                << ",\"device_lost\":"
                << (statistics.deviceLost ? "true" : "false")
                << '}';
+    }
+
+    void writeVulkanRasterBackendStatistics(
+        std::ostream &output,
+        const GsVulkanRasterBackendStatistics &statistics)
+    {
+        output << "{\"commands_attempted\":"
+               << statistics.commandsAttempted
+               << ",\"commands_completed\":"
+               << statistics.commandsCompleted
+               << ",\"gpu_requests_failed\":"
+               << statistics.gpuRequestsFailed
+               << ",\"verified_commands\":"
+               << statistics.verifiedCommands
+               << ",\"committed_gpu_commands\":"
+               << statistics.committedGpuCommands
+               << ",\"verification_mismatches\":"
+               << statistics.verificationMismatches
+               << ",\"bytes_compared\":"
+               << statistics.bytesCompared
+               << ",\"flushes\":" << statistics.flushes
+               << ",\"last_verification_artifact\":";
+        writeJsonString(
+            output, statistics.lastVerificationArtifact);
+        output << '}';
     }
 
     bool readPacketSizes(const std::string &path,
@@ -560,6 +601,7 @@ int main(int argc, char **argv)
     std::string compareVramPath;
     std::string explicitStatePath;
     std::string registerStatePath;
+    std::string verificationArtifactDirectory;
     bool batchStream = false;
     bool backendStats = false;
     bool replayOptionUsed = false;
@@ -630,6 +672,7 @@ int main(int argc, char **argv)
             argument == "--stop-after-command" ||
             argument == "--stop-after-packet" ||
             argument == "--compare-vram" ||
+            argument == "--verify-dump-dir" ||
             argument == "--vulkan-loader" ||
             argument == "--vulkan-vendor" ||
             argument == "--vulkan-device")
@@ -668,6 +711,12 @@ int main(int argc, char **argv)
             {
                 vramInputPath = argv[index];
                 replayOptionUsed = true;
+            }
+            else if (argument == "--verify-dump-dir")
+            {
+                verificationArtifactDirectory = argv[index];
+                replayOptionUsed = true;
+                gifReplayOptionUsed = true;
             }
             else if (argument == "--vram-out")
             {
@@ -905,9 +954,16 @@ int main(int argc, char **argv)
             operationError);
         return exact ? 0 : 1;
     }
-    if (vulkanOptionUsed)
+    if (vulkanOptionUsed && rendererMode == GsRendererMode::Software)
     {
-        std::cerr << "Vulkan options require --vulkan-info or --vulkan-roundtrip\n";
+        std::cerr << "Vulkan options require a Vulkan probe, round trip, "
+                     "or accelerated renderer mode\n";
+        return 2;
+    }
+    if (!verificationArtifactDirectory.empty() &&
+        rendererMode != GsRendererMode::Verify)
+    {
+        std::cerr << "--verify-dump-dir requires --renderer verify\n";
         return 2;
     }
 
@@ -970,10 +1026,26 @@ int main(int argc, char **argv)
     gs.init(memory.getGSVRAM(), static_cast<uint32_t>(PS2_GS_VRAM_SIZE),
             &memory.gs());
 
+    if (rendererMode != GsRendererMode::Software)
+    {
+        GsVulkanServiceConfig serviceConfig{};
+        serviceConfig.probe = vulkanConfig;
+        if (!gs.configureVulkanRenderer(
+                serviceConfig, verificationArtifactDirectory))
+        {
+            std::cerr << "failed to configure Vulkan renderer: "
+                      << gs.rendererDiagnostic() << '\n';
+            return 2;
+        }
+    }
     if (!gs.setRendererMode(rendererMode))
     {
         std::cerr << "renderer mode is unavailable: "
-                  << gsRendererModeName(rendererMode) << '\n';
+                  << gsRendererModeName(rendererMode);
+        const std::string diagnostic = gs.rendererDiagnostic();
+        if (!diagnostic.empty())
+            std::cerr << ": " << diagnostic;
+        std::cerr << '\n';
         return 2;
     }
 
@@ -1063,6 +1135,7 @@ int main(int argc, char **argv)
 
     uint64_t totalBytes = 0u;
     uint64_t packetIndex = 0u;
+    std::string executionError;
     bool stopped = false;
     bool stoppedWithinPacket = false;
     const char *stopReason = "complete";
@@ -1085,7 +1158,18 @@ int main(int argc, char **argv)
             return false;
         }
 
-        gs.processGIFPacket(data, static_cast<uint32_t>(size));
+        try
+        {
+            gs.processGIFPacket(data, static_cast<uint32_t>(size));
+        }
+        catch (const std::exception &error)
+        {
+            executionError =
+                "GS replay failed at packet " +
+                std::to_string(packetIndex) + ": " + error.what();
+            std::cerr << executionError << '\n';
+            return false;
+        }
         totalBytes += size;
         if (hashTrace)
         {
@@ -1127,7 +1211,7 @@ int main(int argc, char **argv)
         if (packetSizes.empty())
         {
             if (!processPacket(packet.data(), packet.size()))
-                return 2;
+                return executionError.empty() ? 2 : 1;
             continue;
         }
 
@@ -1140,7 +1224,7 @@ int main(int argc, char **argv)
                 return 2;
             }
             if (!processPacket(packet.data() + offset, size))
-                return 2;
+                return executionError.empty() ? 2 : 1;
             offset += size;
             if (stopped)
                 break;
@@ -1209,6 +1293,20 @@ int main(int argc, char **argv)
     {
         std::cout << ",\"backend_counters\":";
         writeBackendCounters(std::cout, gs.backendCounters());
+        if (gs.rendererMode() != GsRendererMode::Software)
+        {
+            std::cout << ",\"vulkan_capabilities\":{";
+            writeVulkanCapabilityFields(
+                std::cout, gs.vulkanRendererCapabilities());
+            std::cout << "},\"vulkan_service_statistics\":";
+            writeVulkanServiceStatistics(
+                std::cout,
+                gs.vulkanRendererServiceStatistics());
+            std::cout << ",\"vulkan_backend_statistics\":";
+            writeVulkanRasterBackendStatistics(
+                std::cout,
+                gs.vulkanRendererBackendStatistics());
+        }
     }
 
     std::cout << "}\n";

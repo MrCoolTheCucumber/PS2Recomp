@@ -16,6 +16,7 @@
 #include <fstream>
 #include <iostream>
 #include <sstream>
+#include <utility>
 
 namespace
 {
@@ -3412,6 +3413,15 @@ bool GS::clearActiveFramebuffer(uint32_t rgba)
     return clearFramebufferRect(this, activeContext(), rgba);
 }
 
+bool GS::configureVulkanRenderer(
+    const GsVulkanServiceConfig &config,
+    std::string verificationArtifactDirectory)
+{
+    std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
+    return m_rasterizer.configureVulkanRenderer(
+        config, std::move(verificationArtifactDirectory));
+}
+
 bool GS::setRendererMode(GsRendererMode mode)
 {
     std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
@@ -3422,6 +3432,32 @@ GsRendererMode GS::rendererMode() const
 {
     std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
     return m_rasterizer.rendererMode();
+}
+
+std::string GS::rendererDiagnostic() const
+{
+    std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
+    return m_rasterizer.rendererDiagnostic();
+}
+
+GsVulkanCapabilityReport GS::vulkanRendererCapabilities() const
+{
+    std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
+    return m_rasterizer.vulkanRendererCapabilities();
+}
+
+GsVulkanServiceStatistics
+GS::vulkanRendererServiceStatistics() const
+{
+    std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
+    return m_rasterizer.vulkanRendererServiceStatistics();
+}
+
+GsVulkanRasterBackendStatistics
+GS::vulkanRendererBackendStatistics() const
+{
+    std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
+    return m_rasterizer.vulkanRendererBackendStatistics();
 }
 
 void GS::setBackendCountersEnabled(bool enabled)

@@ -174,8 +174,18 @@ public:
     bool clearActiveFramebuffer(uint32_t rgba);
     uint64_t nativeImageUploadCount() const { return m_nativeImageUploadCount; }
     uint64_t nativePackedGIFPacketCount() const { return m_nativePackedGIFPacketCount; }
+    [[nodiscard]] bool configureVulkanRenderer(
+        const GsVulkanServiceConfig &config,
+        std::string verificationArtifactDirectory = {});
     [[nodiscard]] bool setRendererMode(GsRendererMode mode);
     [[nodiscard]] GsRendererMode rendererMode() const;
+    [[nodiscard]] std::string rendererDiagnostic() const;
+    [[nodiscard]] GsVulkanCapabilityReport
+    vulkanRendererCapabilities() const;
+    [[nodiscard]] GsVulkanServiceStatistics
+    vulkanRendererServiceStatistics() const;
+    [[nodiscard]] GsVulkanRasterBackendStatistics
+    vulkanRendererBackendStatistics() const;
     void setBackendCountersEnabled(bool enabled);
     [[nodiscard]] GsBackendCounters backendCounters() const;
     void resetBackendCounters();

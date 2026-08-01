@@ -807,8 +807,13 @@ void register_ps2_gs_tests()
 
             t.Equals(gs.rendererMode(), GsRendererMode::Software,
                      "software should remain the permanent default mode");
+            GsVulkanServiceConfig unavailableConfig{};
+            unavailableConfig.probe.loaderPath =
+                "/ps2recomp-test-loader-does-not-exist/libvulkan.so";
+            t.IsTrue(gs.configureVulkanRenderer(unavailableConfig),
+                     "the frontend should accept an explicit unavailable backend fixture");
             t.IsFalse(gs.setRendererMode(GsRendererMode::Hybrid),
-                      "missing accelerated backend should fail selection cleanly");
+                      "an unavailable accelerated backend should fail selection cleanly");
 
             gs.setBackendCountersEnabled(true);
             gs.writeRegister(GS_REG_FRAME_1, 1ull << 16u);
