@@ -56,6 +56,10 @@ namespace
             << "usage: gs_replay --vulkan-info [--vulkan-validation] "
                "[--vulkan-loader FILE] [--vulkan-vendor ID] "
                "[--vulkan-device ID]\n"
+            << "usage: gs_replay --vulkan-roundtrip COUNT "
+               "[--vram-in FILE] [--vram-out FILE] "
+               "[--vulkan-validation] [--vulkan-loader FILE] "
+               "[--vulkan-vendor ID] [--vulkan-device ID]\n"
             << "usage: gs_replay [--vram-in FILE] [--vram-out FILE] "
                "[--register ADDRESS=VALUE] [--register-file FILE] "
                "[--state-in FILE] "
@@ -217,12 +221,11 @@ namespace
         output << '"';
     }
 
-    void writeVulkanCapabilityReport(
+    void writeVulkanCapabilityFields(
         std::ostream &output,
         const GsVulkanCapabilityReport &report)
     {
-        output << "{\"schema_version\":1,\"mode\":\"vulkan-info\","
-               << "\"status\":";
+        output << "\"status\":";
         writeJsonString(output, gsVulkanProbeStatusName(report.status));
         output << ",\"compiled\":"
                << (report.compiled ? "true" : "false")
@@ -298,7 +301,42 @@ namespace
 
         output << "],\"detail\":";
         writeJsonString(output, report.detail);
+    }
+
+    void writeVulkanCapabilityReport(
+        std::ostream &output,
+        const GsVulkanCapabilityReport &report)
+    {
+        output << "{\"schema_version\":1,\"mode\":\"vulkan-info\",";
+        writeVulkanCapabilityFields(output, report);
         output << "}\n";
+    }
+
+    void writeVulkanServiceStatistics(
+        std::ostream &output,
+        const GsVulkanServiceStatistics &statistics)
+    {
+        output << "{\"round_trips_completed\":"
+               << statistics.roundTripsCompleted
+               << ",\"round_trips_failed\":"
+               << statistics.roundTripsFailed
+               << ",\"queue_submissions\":"
+               << statistics.queueSubmissions
+               << ",\"shader_dispatches\":"
+               << statistics.shaderDispatches
+               << ",\"bytes_uploaded\":"
+               << statistics.bytesUploaded
+               << ",\"bytes_downloaded\":"
+               << statistics.bytesDownloaded
+               << ",\"fence_wait_nanoseconds\":"
+               << statistics.fenceWaitNanoseconds
+               << ",\"validation_warnings\":"
+               << statistics.validationWarnings
+               << ",\"validation_errors\":"
+               << statistics.validationErrors
+               << ",\"device_lost\":"
+               << (statistics.deviceLost ? "true" : "false")
+               << '}';
     }
 
     bool readPacketSizes(const std::string &path,
@@ -348,6 +386,87 @@ namespace
             hash *= 1099511628211ull;
         }
         return hash;
+    }
+
+    void fillDeterministicVram(std::vector<uint8_t> &vram)
+    {
+        vram.resize(GS_VULKAN_VRAM_SIZE);
+        uint32_t state = 0x52414331u;
+        for (uint8_t &byte : vram)
+        {
+            state ^= state << 13u;
+            state ^= state >> 17u;
+            state ^= state << 5u;
+            byte = static_cast<uint8_t>(state >> 24u);
+        }
+    }
+
+    void writeHex64(std::ostream &output, uint64_t value)
+    {
+        output << "\"0x" << std::hex << std::setw(16)
+               << std::setfill('0') << value << '"' << std::dec
+               << std::setfill(' ');
+    }
+
+    void writeVulkanRoundTripReport(
+        std::ostream &output,
+        const GsVulkanCapabilityReport &capabilities,
+        const GsVulkanServiceStatistics &statistics,
+        uint64_t requested,
+        uint64_t completed,
+        bool exact,
+        bool serviceHealthyAfterWork,
+        bool shutdownComplete,
+        uint64_t inputHash,
+        const std::vector<uint8_t> *completedOutput,
+        uint64_t failureIteration,
+        const VramDifference *difference,
+        std::string_view error)
+    {
+        output << "{\"schema_version\":1,"
+               << "\"mode\":\"vulkan-roundtrip\",";
+        writeVulkanCapabilityFields(output, capabilities);
+        output << ",\"vram_bytes\":" << GS_VULKAN_VRAM_SIZE
+               << ",\"iterations_requested\":" << requested
+               << ",\"iterations_completed\":" << completed
+               << ",\"exact\":" << (exact ? "true" : "false")
+               << ",\"service_healthy_after_work\":"
+               << (serviceHealthyAfterWork ? "true" : "false")
+               << ",\"shutdown_complete\":"
+               << (shutdownComplete ? "true" : "false")
+               << ",\"input_fnv1a64\":";
+        writeHex64(output, inputHash);
+        output << ",\"output_fnv1a64\":";
+        if (completedOutput)
+        {
+            writeHex64(output, fnv1a64(
+                completedOutput->data(), completedOutput->size()));
+        }
+        else
+        {
+            output << "null";
+        }
+        output << ",\"failure_iteration\":";
+        if (failureIteration != 0u)
+            output << failureIteration;
+        else
+            output << "null";
+        if (difference && !difference->matches)
+        {
+            output << ",\"first_differing_byte_offset\":"
+                   << difference->byteOffset
+                   << ",\"first_differing_page\":"
+                   << difference->page
+                   << ",\"expected_byte\":"
+                   << static_cast<uint32_t>(difference->expected)
+                   << ",\"actual_byte\":"
+                   << static_cast<uint32_t>(difference->actual);
+        }
+        output << ",\"statistics\":";
+        writeVulkanServiceStatistics(output, statistics);
+        output << ",\"error\":";
+        writeJsonString(output, error);
+        output << "}\n";
     }
 
     bool parseRegisterAssignment(
@@ -444,8 +563,11 @@ int main(int argc, char **argv)
     bool batchStream = false;
     bool backendStats = false;
     bool replayOptionUsed = false;
+    bool gifReplayOptionUsed = false;
     bool vulkanInfo = false;
+    bool vulkanRoundTrip = false;
     bool vulkanOptionUsed = false;
+    uint64_t vulkanRoundTripCount = 0u;
     GsVulkanProbeConfig vulkanConfig{};
     bool commandLimitSet = false;
     bool packetLimitSet = false;
@@ -462,15 +584,35 @@ int main(int argc, char **argv)
         {
             batchStream = true;
             replayOptionUsed = true;
+            gifReplayOptionUsed = true;
         }
         else if (argument == "--backend-stats")
         {
             backendStats = true;
             replayOptionUsed = true;
+            gifReplayOptionUsed = true;
         }
         else if (argument == "--vulkan-info")
         {
             vulkanInfo = true;
+        }
+        else if (argument == "--vulkan-roundtrip")
+        {
+            if (++index >= argc || vulkanRoundTrip)
+            {
+                printUsage();
+                return 2;
+            }
+            constexpr uint64_t maxRoundTrips = 1024u;
+            if (!parseCount(argv[index], vulkanRoundTripCount) ||
+                vulkanRoundTripCount == 0u ||
+                vulkanRoundTripCount > maxRoundTrips)
+            {
+                std::cerr << "Vulkan round-trip count must be between 1 and "
+                          << maxRoundTrips << '\n';
+                return 2;
+            }
+            vulkanRoundTrip = true;
         }
         else if (argument == "--vulkan-validation")
         {
@@ -536,25 +678,30 @@ int main(int argc, char **argv)
             {
                 packetSizesPath = argv[index];
                 replayOptionUsed = true;
+                gifReplayOptionUsed = true;
             }
             else if (argument == "--hash-trace")
             {
                 hashTracePath = argv[index];
                 replayOptionUsed = true;
+                gifReplayOptionUsed = true;
             }
             else if (argument == "--state-in")
             {
                 explicitStatePath = argv[index];
                 replayOptionUsed = true;
+                gifReplayOptionUsed = true;
             }
             else if (argument == "--compare-vram")
             {
                 compareVramPath = argv[index];
                 replayOptionUsed = true;
+                gifReplayOptionUsed = true;
             }
             else if (argument == "--renderer")
             {
                 replayOptionUsed = true;
+                gifReplayOptionUsed = true;
                 if (!parseRendererMode(argv[index], rendererMode))
                 {
                     std::cerr << "invalid renderer mode: "
@@ -565,6 +712,7 @@ int main(int argc, char **argv)
             else if (argument == "--stop-after-command")
             {
                 replayOptionUsed = true;
+                gifReplayOptionUsed = true;
                 if (!parseCount(argv[index], commandLimit))
                 {
                     std::cerr << "invalid command limit: "
@@ -576,6 +724,7 @@ int main(int argc, char **argv)
             else if (argument == "--stop-after-packet")
             {
                 replayOptionUsed = true;
+                gifReplayOptionUsed = true;
                 if (!parseCount(argv[index], packetLimit))
                 {
                     std::cerr << "invalid packet limit: "
@@ -587,6 +736,7 @@ int main(int argc, char **argv)
             else if (argument == "--register-file")
             {
                 replayOptionUsed = true;
+                gifReplayOptionUsed = true;
                 if (!readRegisterFile(
                         argv[index],
                         fileRegisters,
@@ -600,6 +750,7 @@ int main(int argc, char **argv)
             else
             {
                 replayOptionUsed = true;
+                gifReplayOptionUsed = true;
                 std::pair<uint8_t, uint64_t> assignment{};
                 if (!parseRegisterAssignment(argv[index], assignment))
                 {
@@ -627,6 +778,11 @@ int main(int argc, char **argv)
         }
     }
 
+    if (vulkanInfo && vulkanRoundTrip)
+    {
+        std::cerr << "--vulkan-info and --vulkan-roundtrip are mutually exclusive\n";
+        return 2;
+    }
     if (vulkanInfo)
     {
         if (replayOptionUsed || !packetPaths.empty())
@@ -639,9 +795,119 @@ int main(int argc, char **argv)
         writeVulkanCapabilityReport(std::cout, report);
         return report.ready() ? 0 : 1;
     }
+    if (vulkanRoundTrip)
+    {
+        if (gifReplayOptionUsed || !packetPaths.empty())
+        {
+            std::cerr << "--vulkan-roundtrip cannot be combined with GIF replay inputs\n";
+            return 2;
+        }
+
+        std::vector<uint8_t> inputVram;
+        if (vramInputPath.empty())
+        {
+            fillDeterministicVram(inputVram);
+        }
+        else if (!readFile(vramInputPath, inputVram))
+        {
+            std::cerr << "failed to read initial GS memory: "
+                      << vramInputPath << '\n';
+            return 2;
+        }
+        if (inputVram.size() != GS_VULKAN_VRAM_SIZE)
+        {
+            std::cerr << "initial GS memory must be exactly "
+                      << GS_VULKAN_VRAM_SIZE << " bytes\n";
+            return 2;
+        }
+
+        GsVulkanServiceConfig serviceConfig{};
+        serviceConfig.probe = vulkanConfig;
+        GsVulkanCapabilityReport report{};
+        std::string operationError;
+        std::unique_ptr<GsVulkanService> service =
+            GsVulkanService::create(
+                serviceConfig, &report, &operationError);
+        GsVulkanServiceStatistics statistics{};
+        std::vector<uint8_t> completedOutput;
+        bool outputAvailable = false;
+        bool serviceHealthyAfterWork = false;
+        bool shutdownComplete = false;
+        bool exact = false;
+        uint64_t iterationsCompleted = 0u;
+        uint64_t failureIteration = 0u;
+        VramDifference difference{};
+        bool hasDifference = false;
+
+        if (service)
+        {
+            operationError.clear();
+            for (uint64_t iteration = 0u;
+                 iteration < vulkanRoundTripCount;
+                 ++iteration)
+            {
+                std::vector<uint8_t> iterationOutput;
+                if (!service->roundTripVram(
+                        inputVram, iterationOutput, &operationError))
+                {
+                    failureIteration = iteration + 1u;
+                    break;
+                }
+                iterationsCompleted = iteration + 1u;
+                completedOutput = std::move(iterationOutput);
+                outputAvailable = true;
+                if (completedOutput != inputVram)
+                {
+                    difference = compareVram(
+                        completedOutput.data(), inputVram);
+                    hasDifference = true;
+                    failureIteration = iteration + 1u;
+                    operationError =
+                        "Vulkan round trip changed GS VRAM";
+                    break;
+                }
+            }
+            exact = iterationsCompleted == vulkanRoundTripCount &&
+                    !hasDifference && operationError.empty();
+            serviceHealthyAfterWork = service->healthy();
+            service->shutdown();
+            shutdownComplete = true;
+            report = service->capabilities();
+            statistics = service->statistics();
+            if (exact &&
+                (!report.ready() || statistics.validationErrors != 0u ||
+                 statistics.deviceLost))
+            {
+                exact = false;
+                operationError = report.detail.empty()
+                    ? "Vulkan service failed during shutdown"
+                    : report.detail;
+            }
+        }
+
+        if (!vramOutputPath.empty() && outputAvailable &&
+            !writeFile(vramOutputPath,
+                       completedOutput.data(), completedOutput.size()))
+        {
+            std::cerr << "failed to write final GS memory: "
+                      << vramOutputPath << '\n';
+            return 2;
+        }
+
+        writeVulkanRoundTripReport(
+            std::cout, report, statistics,
+            vulkanRoundTripCount, iterationsCompleted,
+            exact, serviceHealthyAfterWork, shutdownComplete,
+            fnv1a64(inputVram.data(), inputVram.size()),
+            outputAvailable ? &completedOutput : nullptr,
+            failureIteration,
+            hasDifference ? &difference : nullptr,
+            operationError);
+        return exact ? 0 : 1;
+    }
     if (vulkanOptionUsed)
     {
-        std::cerr << "Vulkan probe options require --vulkan-info\n";
+        std::cerr << "Vulkan options require --vulkan-info or --vulkan-roundtrip\n";
         return 2;
     }
 

@@ -631,6 +631,16 @@ add_library(ps2_runtime STATIC
     src/lib/games_database.cpp
 )
 
+target_sources(ps2_runtime PRIVATE
+    src/lib/shaders/ps2_gs_vram_noop.comp
+    src/lib/shaders/ps2_gs_vram_noop_spv.inc
+)
+set_source_files_properties(
+    src/lib/shaders/ps2_gs_vram_noop.comp
+    src/lib/shaders/ps2_gs_vram_noop_spv.inc
+    PROPERTIES HEADER_FILE_ONLY TRUE
+)
+
 if(PS2X_DEFAULT_EE_EXECUTION_BACKEND STREQUAL
    "legacy-cpp-fiber" AND
    NOT PS2X_HAS_EE_CPP_FIBER_BACKEND)

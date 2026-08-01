@@ -2,8 +2,13 @@
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
+#include <condition_variable>
 #include <cstring>
+#include <exception>
+#include <mutex>
 #include <sstream>
+#include <thread>
 #include <tuple>
 #include <utility>
 
@@ -40,6 +45,14 @@ std::string_view gsVulkanProbeStatusName(
         return "no-physical-devices";
     case GsVulkanProbeStatus::NoSuitableDevice:
         return "no-suitable-device";
+    case GsVulkanProbeStatus::DeviceCreationFailed:
+        return "device-creation-failed";
+    case GsVulkanProbeStatus::ResourceCreationFailed:
+        return "resource-creation-failed";
+    case GsVulkanProbeStatus::ExecutionTimeout:
+        return "execution-timeout";
+    case GsVulkanProbeStatus::DeviceLost:
+        return "device-lost";
     case GsVulkanProbeStatus::ValidationError:
         return "validation-error";
     case GsVulkanProbeStatus::Ready:
@@ -834,5 +847,1730 @@ GsVulkanCapabilityReport probeGsVulkanCapabilities(
         selected
             ? "selected " + selected->name
             : "selected a suitable Vulkan device");
+#endif
+}
+
+#if PS2X_HAS_GS_VULKAN
+namespace
+{
+#include "shaders/ps2_gs_vram_noop_spv.inc"
+
+    static_assert(sizeof(kGsVramNoopShaderSpv) == 1112u);
+    static_assert(kGsVramNoopShaderSpv[0] == 0x07230203u);
+
+    template <typename T>
+    T loadDeviceProc(PFN_vkGetDeviceProcAddr getDeviceProcAddr,
+                     VkDevice device,
+                     const char *name) noexcept
+    {
+        return reinterpret_cast<T>(getDeviceProcAddr(device, name));
+    }
+
+    struct DeviceFunctions
+    {
+        PFN_vkDestroyDevice destroyDevice = nullptr;
+        PFN_vkDeviceWaitIdle deviceWaitIdle = nullptr;
+        PFN_vkGetDeviceQueue getDeviceQueue = nullptr;
+        PFN_vkCreateBuffer createBuffer = nullptr;
+        PFN_vkDestroyBuffer destroyBuffer = nullptr;
+        PFN_vkGetBufferMemoryRequirements getBufferMemoryRequirements = nullptr;
+        PFN_vkAllocateMemory allocateMemory = nullptr;
+        PFN_vkFreeMemory freeMemory = nullptr;
+        PFN_vkBindBufferMemory bindBufferMemory = nullptr;
+        PFN_vkMapMemory mapMemory = nullptr;
+        PFN_vkUnmapMemory unmapMemory = nullptr;
+        PFN_vkFlushMappedMemoryRanges flushMappedMemoryRanges = nullptr;
+        PFN_vkInvalidateMappedMemoryRanges invalidateMappedMemoryRanges = nullptr;
+        PFN_vkCreateDescriptorSetLayout createDescriptorSetLayout = nullptr;
+        PFN_vkDestroyDescriptorSetLayout destroyDescriptorSetLayout = nullptr;
+        PFN_vkCreatePipelineLayout createPipelineLayout = nullptr;
+        PFN_vkDestroyPipelineLayout destroyPipelineLayout = nullptr;
+        PFN_vkCreateShaderModule createShaderModule = nullptr;
+        PFN_vkDestroyShaderModule destroyShaderModule = nullptr;
+        PFN_vkCreateComputePipelines createComputePipelines = nullptr;
+        PFN_vkDestroyPipeline destroyPipeline = nullptr;
+        PFN_vkCreateDescriptorPool createDescriptorPool = nullptr;
+        PFN_vkDestroyDescriptorPool destroyDescriptorPool = nullptr;
+        PFN_vkAllocateDescriptorSets allocateDescriptorSets = nullptr;
+        PFN_vkUpdateDescriptorSets updateDescriptorSets = nullptr;
+        PFN_vkCreateCommandPool createCommandPool = nullptr;
+        PFN_vkDestroyCommandPool destroyCommandPool = nullptr;
+        PFN_vkAllocateCommandBuffers allocateCommandBuffers = nullptr;
+        PFN_vkResetCommandBuffer resetCommandBuffer = nullptr;
+        PFN_vkBeginCommandBuffer beginCommandBuffer = nullptr;
+        PFN_vkEndCommandBuffer endCommandBuffer = nullptr;
+        PFN_vkCreateFence createFence = nullptr;
+        PFN_vkDestroyFence destroyFence = nullptr;
+        PFN_vkResetFences resetFences = nullptr;
+        PFN_vkWaitForFences waitForFences = nullptr;
+        PFN_vkQueueSubmit queueSubmit = nullptr;
+        PFN_vkCmdPipelineBarrier cmdPipelineBarrier = nullptr;
+        PFN_vkCmdCopyBuffer cmdCopyBuffer = nullptr;
+        PFN_vkCmdBindPipeline cmdBindPipeline = nullptr;
+        PFN_vkCmdBindDescriptorSets cmdBindDescriptorSets = nullptr;
+        PFN_vkCmdPushConstants cmdPushConstants = nullptr;
+        PFN_vkCmdDispatch cmdDispatch = nullptr;
+
+        bool load(PFN_vkGetDeviceProcAddr getDeviceProcAddr,
+                  VkDevice device,
+                  std::string &error)
+        {
+#define PS2X_LOAD_DEVICE_PROC(member, type, name)                         \
+            member = loadDeviceProc<type>(                               \
+                getDeviceProcAddr, device, #name);                       \
+            if (!member)                                                 \
+            {                                                            \
+                error = "Vulkan device is missing " #name;              \
+                return false;                                            \
+            }
+            PS2X_LOAD_DEVICE_PROC(destroyDevice, PFN_vkDestroyDevice,
+                                  vkDestroyDevice)
+            PS2X_LOAD_DEVICE_PROC(deviceWaitIdle, PFN_vkDeviceWaitIdle,
+                                  vkDeviceWaitIdle)
+            PS2X_LOAD_DEVICE_PROC(getDeviceQueue, PFN_vkGetDeviceQueue,
+                                  vkGetDeviceQueue)
+            PS2X_LOAD_DEVICE_PROC(createBuffer, PFN_vkCreateBuffer,
+                                  vkCreateBuffer)
+            PS2X_LOAD_DEVICE_PROC(destroyBuffer, PFN_vkDestroyBuffer,
+                                  vkDestroyBuffer)
+            PS2X_LOAD_DEVICE_PROC(
+                getBufferMemoryRequirements,
+                PFN_vkGetBufferMemoryRequirements,
+                vkGetBufferMemoryRequirements)
+            PS2X_LOAD_DEVICE_PROC(allocateMemory, PFN_vkAllocateMemory,
+                                  vkAllocateMemory)
+            PS2X_LOAD_DEVICE_PROC(freeMemory, PFN_vkFreeMemory,
+                                  vkFreeMemory)
+            PS2X_LOAD_DEVICE_PROC(bindBufferMemory, PFN_vkBindBufferMemory,
+                                  vkBindBufferMemory)
+            PS2X_LOAD_DEVICE_PROC(mapMemory, PFN_vkMapMemory, vkMapMemory)
+            PS2X_LOAD_DEVICE_PROC(unmapMemory, PFN_vkUnmapMemory,
+                                  vkUnmapMemory)
+            PS2X_LOAD_DEVICE_PROC(
+                flushMappedMemoryRanges,
+                PFN_vkFlushMappedMemoryRanges,
+                vkFlushMappedMemoryRanges)
+            PS2X_LOAD_DEVICE_PROC(
+                invalidateMappedMemoryRanges,
+                PFN_vkInvalidateMappedMemoryRanges,
+                vkInvalidateMappedMemoryRanges)
+            PS2X_LOAD_DEVICE_PROC(
+                createDescriptorSetLayout,
+                PFN_vkCreateDescriptorSetLayout,
+                vkCreateDescriptorSetLayout)
+            PS2X_LOAD_DEVICE_PROC(
+                destroyDescriptorSetLayout,
+                PFN_vkDestroyDescriptorSetLayout,
+                vkDestroyDescriptorSetLayout)
+            PS2X_LOAD_DEVICE_PROC(createPipelineLayout,
+                                  PFN_vkCreatePipelineLayout,
+                                  vkCreatePipelineLayout)
+            PS2X_LOAD_DEVICE_PROC(destroyPipelineLayout,
+                                  PFN_vkDestroyPipelineLayout,
+                                  vkDestroyPipelineLayout)
+            PS2X_LOAD_DEVICE_PROC(createShaderModule,
+                                  PFN_vkCreateShaderModule,
+                                  vkCreateShaderModule)
+            PS2X_LOAD_DEVICE_PROC(destroyShaderModule,
+                                  PFN_vkDestroyShaderModule,
+                                  vkDestroyShaderModule)
+            PS2X_LOAD_DEVICE_PROC(createComputePipelines,
+                                  PFN_vkCreateComputePipelines,
+                                  vkCreateComputePipelines)
+            PS2X_LOAD_DEVICE_PROC(destroyPipeline, PFN_vkDestroyPipeline,
+                                  vkDestroyPipeline)
+            PS2X_LOAD_DEVICE_PROC(createDescriptorPool,
+                                  PFN_vkCreateDescriptorPool,
+                                  vkCreateDescriptorPool)
+            PS2X_LOAD_DEVICE_PROC(destroyDescriptorPool,
+                                  PFN_vkDestroyDescriptorPool,
+                                  vkDestroyDescriptorPool)
+            PS2X_LOAD_DEVICE_PROC(allocateDescriptorSets,
+                                  PFN_vkAllocateDescriptorSets,
+                                  vkAllocateDescriptorSets)
+            PS2X_LOAD_DEVICE_PROC(updateDescriptorSets,
+                                  PFN_vkUpdateDescriptorSets,
+                                  vkUpdateDescriptorSets)
+            PS2X_LOAD_DEVICE_PROC(createCommandPool,
+                                  PFN_vkCreateCommandPool,
+                                  vkCreateCommandPool)
+            PS2X_LOAD_DEVICE_PROC(destroyCommandPool,
+                                  PFN_vkDestroyCommandPool,
+                                  vkDestroyCommandPool)
+            PS2X_LOAD_DEVICE_PROC(allocateCommandBuffers,
+                                  PFN_vkAllocateCommandBuffers,
+                                  vkAllocateCommandBuffers)
+            PS2X_LOAD_DEVICE_PROC(resetCommandBuffer,
+                                  PFN_vkResetCommandBuffer,
+                                  vkResetCommandBuffer)
+            PS2X_LOAD_DEVICE_PROC(beginCommandBuffer,
+                                  PFN_vkBeginCommandBuffer,
+                                  vkBeginCommandBuffer)
+            PS2X_LOAD_DEVICE_PROC(endCommandBuffer,
+                                  PFN_vkEndCommandBuffer,
+                                  vkEndCommandBuffer)
+            PS2X_LOAD_DEVICE_PROC(createFence, PFN_vkCreateFence,
+                                  vkCreateFence)
+            PS2X_LOAD_DEVICE_PROC(destroyFence, PFN_vkDestroyFence,
+                                  vkDestroyFence)
+            PS2X_LOAD_DEVICE_PROC(resetFences, PFN_vkResetFences,
+                                  vkResetFences)
+            PS2X_LOAD_DEVICE_PROC(waitForFences, PFN_vkWaitForFences,
+                                  vkWaitForFences)
+            PS2X_LOAD_DEVICE_PROC(queueSubmit, PFN_vkQueueSubmit,
+                                  vkQueueSubmit)
+            PS2X_LOAD_DEVICE_PROC(cmdPipelineBarrier,
+                                  PFN_vkCmdPipelineBarrier,
+                                  vkCmdPipelineBarrier)
+            PS2X_LOAD_DEVICE_PROC(cmdCopyBuffer, PFN_vkCmdCopyBuffer,
+                                  vkCmdCopyBuffer)
+            PS2X_LOAD_DEVICE_PROC(cmdBindPipeline,
+                                  PFN_vkCmdBindPipeline,
+                                  vkCmdBindPipeline)
+            PS2X_LOAD_DEVICE_PROC(cmdBindDescriptorSets,
+                                  PFN_vkCmdBindDescriptorSets,
+                                  vkCmdBindDescriptorSets)
+            PS2X_LOAD_DEVICE_PROC(cmdPushConstants,
+                                  PFN_vkCmdPushConstants,
+                                  vkCmdPushConstants)
+            PS2X_LOAD_DEVICE_PROC(cmdDispatch, PFN_vkCmdDispatch,
+                                  vkCmdDispatch)
+#undef PS2X_LOAD_DEVICE_PROC
+            return true;
+        }
+    };
+
+    struct BufferAllocation
+    {
+        VkBuffer buffer = VK_NULL_HANDLE;
+        VkDeviceMemory memory = VK_NULL_HANDLE;
+        VkDeviceSize allocationSize = 0u;
+        bool coherent = false;
+    };
+
+    class VulkanExecutionContext final
+    {
+    public:
+        VulkanExecutionContext() = default;
+        ~VulkanExecutionContext()
+        {
+            shutdown();
+        }
+
+        VulkanExecutionContext(const VulkanExecutionContext &) = delete;
+        VulkanExecutionContext &operator=(
+            const VulkanExecutionContext &) = delete;
+
+        bool initialize(const GsVulkanServiceConfig &config,
+                        GsVulkanCapabilityReport &report,
+                        std::string &error);
+        bool roundTrip(std::span<const uint8_t> input,
+                       std::vector<uint8_t> &output,
+                       GsVulkanCapabilityReport &report,
+                       GsVulkanServiceStatistics &statistics,
+                       std::string &error);
+        void refreshDiagnostics(GsVulkanCapabilityReport &report,
+                                GsVulkanServiceStatistics &statistics) const;
+        void shutdown() noexcept;
+        [[nodiscard]] bool healthy() const noexcept
+        {
+            return m_healthy;
+        }
+
+    private:
+        bool createInstance(const GsVulkanProbeConfig &config,
+                            GsVulkanCapabilityReport &report,
+                            std::string &error);
+        bool createDevice(const GsVulkanDeviceReport &selected,
+                          GsVulkanCapabilityReport &report,
+                          std::string &error);
+        bool createResources(GsVulkanCapabilityReport &report,
+                             std::string &error);
+        bool createBuffer(VkBufferUsageFlags usage,
+                          VkMemoryPropertyFlags required,
+                          VkMemoryPropertyFlags preferred,
+                          BufferAllocation &allocation,
+                          GsVulkanCapabilityReport &report,
+                          std::string &error);
+        int32_t findMemoryType(uint32_t typeBits,
+                               VkMemoryPropertyFlags required,
+                               VkMemoryPropertyFlags preferred) const noexcept;
+        bool checkResult(VkResult result,
+                         std::string_view operation,
+                         GsVulkanCapabilityReport &report,
+                         std::string &error,
+                         GsVulkanProbeStatus failureStatus);
+
+        DynamicLibrary m_library;
+        ValidationCounters m_validation;
+        InstanceOwner m_instance;
+        PFN_vkGetInstanceProcAddr m_getInstanceProcAddr = nullptr;
+        PFN_vkGetDeviceProcAddr m_getDeviceProcAddr = nullptr;
+        VkPhysicalDevice m_physicalDevice = VK_NULL_HANDLE;
+        VkPhysicalDeviceMemoryProperties m_memoryProperties{};
+        VkDevice m_device = VK_NULL_HANDLE;
+        DeviceFunctions m_functions{};
+        VkQueue m_queue = VK_NULL_HANDLE;
+        uint32_t m_queueFamilyIndex = 0u;
+        BufferAllocation m_vram;
+        BufferAllocation m_staging;
+        void *m_stagingMap = nullptr;
+        VkDescriptorSetLayout m_descriptorSetLayout = VK_NULL_HANDLE;
+        VkPipelineLayout m_pipelineLayout = VK_NULL_HANDLE;
+        VkShaderModule m_shaderModule = VK_NULL_HANDLE;
+        VkPipeline m_pipeline = VK_NULL_HANDLE;
+        VkDescriptorPool m_descriptorPool = VK_NULL_HANDLE;
+        VkDescriptorSet m_descriptorSet = VK_NULL_HANDLE;
+        VkCommandPool m_commandPool = VK_NULL_HANDLE;
+        VkCommandBuffer m_commandBuffer = VK_NULL_HANDLE;
+        VkFence m_fence = VK_NULL_HANDLE;
+        uint64_t m_fenceTimeoutNanoseconds = 0u;
+        bool m_healthy = false;
+    };
+
+    bool VulkanExecutionContext::checkResult(
+        VkResult result,
+        std::string_view operation,
+        GsVulkanCapabilityReport &report,
+        std::string &error,
+        GsVulkanProbeStatus failureStatus)
+    {
+        if (result == VK_SUCCESS)
+            return true;
+        error = std::string(operation) + " failed: " +
+                resultDescription(result);
+        report.status = result == VK_ERROR_DEVICE_LOST
+            ? GsVulkanProbeStatus::DeviceLost
+            : failureStatus;
+        report.detail = error;
+        if (result == VK_ERROR_DEVICE_LOST)
+            m_healthy = false;
+        return false;
+    }
+
+    bool VulkanExecutionContext::createInstance(
+        const GsVulkanProbeConfig &config,
+        GsVulkanCapabilityReport &report,
+        std::string &error)
+    {
+        if (!openVulkanLoader(config, m_library, error))
+        {
+            report.status = GsVulkanProbeStatus::LoaderUnavailable;
+            report.detail = error;
+            return false;
+        }
+
+        m_getInstanceProcAddr =
+            reinterpret_cast<PFN_vkGetInstanceProcAddr>(
+                m_library.symbol("vkGetInstanceProcAddr"));
+        if (!m_getInstanceProcAddr)
+        {
+            error = "Vulkan loader does not export vkGetInstanceProcAddr";
+            report.status = GsVulkanProbeStatus::LoaderInvalid;
+            report.detail = error;
+            return false;
+        }
+
+        const auto enumerateExtensions =
+            loadInstanceProc<PFN_vkEnumerateInstanceExtensionProperties>(
+                m_getInstanceProcAddr, VK_NULL_HANDLE,
+                "vkEnumerateInstanceExtensionProperties");
+        const auto createInstanceProc =
+            loadInstanceProc<PFN_vkCreateInstance>(
+                m_getInstanceProcAddr, VK_NULL_HANDLE,
+                "vkCreateInstance");
+        if (!enumerateExtensions || !createInstanceProc)
+        {
+            error = "Vulkan loader is missing instance-creation entry points";
+            report.status = GsVulkanProbeStatus::LoaderInvalid;
+            report.detail = error;
+            return false;
+        }
+
+        std::vector<VkExtensionProperties> extensions;
+        const VkResult extensionResult =
+            enumerateValues<VkExtensionProperties>(
+                [&](uint32_t *count, VkExtensionProperties *values)
+                {
+                    return enumerateExtensions(nullptr, count, values);
+                },
+                extensions);
+        if (!checkResult(extensionResult,
+                         "instance-extension enumeration",
+                         report, error,
+                         GsVulkanProbeStatus::LoaderInvalid))
+        {
+            return false;
+        }
+
+        const bool debugUtilsAvailable = std::any_of(
+            extensions.begin(), extensions.end(),
+            [](const VkExtensionProperties &extension)
+            {
+                return std::strcmp(
+                           extension.extensionName,
+                           VK_EXT_DEBUG_UTILS_EXTENSION_NAME) == 0;
+            });
+        if (config.enableValidation && !debugUtilsAvailable)
+        {
+            error = "validation requested but debug-utils is unavailable during service creation";
+            report.status = GsVulkanProbeStatus::ValidationUnavailable;
+            report.detail = error;
+            return false;
+        }
+
+        std::vector<const char *> enabledExtensions;
+        if (config.enableValidation)
+            enabledExtensions.push_back(VK_EXT_DEBUG_UTILS_EXTENSION_NAME);
+#if defined(VK_KHR_portability_enumeration)
+        const bool portabilityEnumerationAvailable = std::any_of(
+            extensions.begin(), extensions.end(),
+            [](const VkExtensionProperties &extension)
+            {
+                return std::strcmp(
+                           extension.extensionName,
+                           VK_KHR_PORTABILITY_ENUMERATION_EXTENSION_NAME) == 0;
+            });
+        if (portabilityEnumerationAvailable)
+        {
+            enabledExtensions.push_back(
+                VK_KHR_PORTABILITY_ENUMERATION_EXTENSION_NAME);
+        }
+#endif
+
+        VkApplicationInfo applicationInfo{};
+        applicationInfo.sType = VK_STRUCTURE_TYPE_APPLICATION_INFO;
+        applicationInfo.pApplicationName = "PS2Recomp GS Vulkan service";
+        applicationInfo.applicationVersion = 1u;
+        applicationInfo.pEngineName = "PS2Recomp";
+        applicationInfo.engineVersion = 1u;
+        applicationInfo.apiVersion = VK_API_VERSION_1_0;
+
+        VkDebugUtilsMessengerCreateInfoEXT debugCreateInfo =
+            makeDebugCreateInfo(m_validation);
+        const char *validationLayer = "VK_LAYER_KHRONOS_validation";
+        VkInstanceCreateInfo instanceInfo{};
+        instanceInfo.sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO;
+        instanceInfo.pApplicationInfo = &applicationInfo;
+        instanceInfo.enabledExtensionCount =
+            static_cast<uint32_t>(enabledExtensions.size());
+        instanceInfo.ppEnabledExtensionNames = enabledExtensions.empty()
+            ? nullptr
+            : enabledExtensions.data();
+        if (config.enableValidation)
+        {
+            instanceInfo.pNext = &debugCreateInfo;
+            instanceInfo.enabledLayerCount = 1u;
+            instanceInfo.ppEnabledLayerNames = &validationLayer;
+        }
+#if defined(VK_KHR_portability_enumeration)
+        if (portabilityEnumerationAvailable)
+        {
+            instanceInfo.flags |=
+                VK_INSTANCE_CREATE_ENUMERATE_PORTABILITY_BIT_KHR;
+        }
+#endif
+
+        const VkResult instanceResult = createInstanceProc(
+            &instanceInfo, nullptr, &m_instance.instance);
+        if (!checkResult(instanceResult, "vkCreateInstance",
+                         report, error,
+                         GsVulkanProbeStatus::InstanceCreationFailed))
+        {
+            return false;
+        }
+        m_instance.destroyInstance =
+            loadInstanceProc<PFN_vkDestroyInstance>(
+                m_getInstanceProcAddr, m_instance.instance,
+                "vkDestroyInstance");
+        if (!m_instance.destroyInstance)
+        {
+            error = "Vulkan instance is missing vkDestroyInstance";
+            report.status = GsVulkanProbeStatus::LoaderInvalid;
+            report.detail = error;
+            return false;
+        }
+
+        if (config.enableValidation)
+        {
+            const auto createDebugMessenger =
+                loadInstanceProc<PFN_vkCreateDebugUtilsMessengerEXT>(
+                    m_getInstanceProcAddr, m_instance.instance,
+                    "vkCreateDebugUtilsMessengerEXT");
+            m_instance.destroyMessenger =
+                loadInstanceProc<PFN_vkDestroyDebugUtilsMessengerEXT>(
+                    m_getInstanceProcAddr, m_instance.instance,
+                    "vkDestroyDebugUtilsMessengerEXT");
+            if (!createDebugMessenger || !m_instance.destroyMessenger)
+            {
+                error = "Vulkan instance is missing debug-utils entry points";
+                report.status = GsVulkanProbeStatus::LoaderInvalid;
+                report.detail = error;
+                return false;
+            }
+            const VkResult debugResult = createDebugMessenger(
+                m_instance.instance, &debugCreateInfo, nullptr,
+                &m_instance.messenger);
+            if (!checkResult(debugResult, "debug messenger creation",
+                             report, error,
+                             GsVulkanProbeStatus::InstanceCreationFailed))
+            {
+                return false;
+            }
+            report.validationEnabled = true;
+        }
+        return true;
+    }
+
+    bool VulkanExecutionContext::createDevice(
+        const GsVulkanDeviceReport &selected,
+        GsVulkanCapabilityReport &report,
+        std::string &error)
+    {
+        const auto enumeratePhysicalDevices =
+            loadInstanceProc<PFN_vkEnumeratePhysicalDevices>(
+                m_getInstanceProcAddr, m_instance.instance,
+                "vkEnumeratePhysicalDevices");
+        const auto getPhysicalDeviceProperties =
+            loadInstanceProc<PFN_vkGetPhysicalDeviceProperties>(
+                m_getInstanceProcAddr, m_instance.instance,
+                "vkGetPhysicalDeviceProperties");
+        const auto getQueueFamilyProperties =
+            loadInstanceProc<PFN_vkGetPhysicalDeviceQueueFamilyProperties>(
+                m_getInstanceProcAddr, m_instance.instance,
+                "vkGetPhysicalDeviceQueueFamilyProperties");
+        const auto getMemoryProperties =
+            loadInstanceProc<PFN_vkGetPhysicalDeviceMemoryProperties>(
+                m_getInstanceProcAddr, m_instance.instance,
+                "vkGetPhysicalDeviceMemoryProperties");
+        const auto enumerateDeviceExtensions =
+            loadInstanceProc<PFN_vkEnumerateDeviceExtensionProperties>(
+                m_getInstanceProcAddr, m_instance.instance,
+                "vkEnumerateDeviceExtensionProperties");
+        const auto createDeviceProc =
+            loadInstanceProc<PFN_vkCreateDevice>(
+                m_getInstanceProcAddr, m_instance.instance,
+                "vkCreateDevice");
+        m_getDeviceProcAddr =
+            loadInstanceProc<PFN_vkGetDeviceProcAddr>(
+                m_getInstanceProcAddr, m_instance.instance,
+                "vkGetDeviceProcAddr");
+        if (!enumeratePhysicalDevices || !getPhysicalDeviceProperties ||
+            !getQueueFamilyProperties || !getMemoryProperties ||
+            !enumerateDeviceExtensions || !createDeviceProc ||
+            !m_getDeviceProcAddr)
+        {
+            error = "Vulkan instance is missing logical-device entry points";
+            report.status = GsVulkanProbeStatus::LoaderInvalid;
+            report.detail = error;
+            return false;
+        }
+
+        std::vector<VkPhysicalDevice> physicalDevices;
+        const VkResult enumerateResult =
+            enumerateValues<VkPhysicalDevice>(
+                [&](uint32_t *count, VkPhysicalDevice *values)
+                {
+                    return enumeratePhysicalDevices(
+                        m_instance.instance, count, values);
+                },
+                physicalDevices);
+        if (!checkResult(enumerateResult,
+                         "physical-device enumeration",
+                         report, error,
+                         GsVulkanProbeStatus::DeviceEnumerationFailed))
+        {
+            return false;
+        }
+
+        for (VkPhysicalDevice candidate : physicalDevices)
+        {
+            VkPhysicalDeviceProperties properties{};
+            getPhysicalDeviceProperties(candidate, &properties);
+            if (properties.vendorID == selected.vendorId &&
+                properties.deviceID == selected.deviceId &&
+                selected.name == properties.deviceName)
+            {
+                m_physicalDevice = candidate;
+                break;
+            }
+        }
+        if (m_physicalDevice == VK_NULL_HANDLE)
+        {
+            error = "the selected Vulkan device disappeared before service creation";
+            report.status = GsVulkanProbeStatus::NoSuitableDevice;
+            report.detail = error;
+            return false;
+        }
+
+        uint32_t queueCount = 0u;
+        getQueueFamilyProperties(m_physicalDevice, &queueCount, nullptr);
+        std::vector<VkQueueFamilyProperties> queues(queueCount);
+        if (queueCount != 0u)
+        {
+            getQueueFamilyProperties(
+                m_physicalDevice, &queueCount, queues.data());
+            queues.resize(queueCount);
+        }
+        m_queueFamilyIndex = selected.queueFamilyIndex;
+        if (m_queueFamilyIndex >= queues.size() ||
+            queues[m_queueFamilyIndex].queueCount == 0u ||
+            (queues[m_queueFamilyIndex].queueFlags &
+             VK_QUEUE_COMPUTE_BIT) == 0u)
+        {
+            error = "the selected Vulkan compute queue is no longer available";
+            report.status = GsVulkanProbeStatus::NoSuitableDevice;
+            report.detail = error;
+            return false;
+        }
+
+        std::vector<VkExtensionProperties> deviceExtensions;
+        const VkResult extensionResult =
+            enumerateValues<VkExtensionProperties>(
+                [&](uint32_t *count, VkExtensionProperties *values)
+                {
+                    return enumerateDeviceExtensions(
+                        m_physicalDevice, nullptr, count, values);
+                },
+                deviceExtensions);
+        if (!checkResult(extensionResult,
+                         "device-extension enumeration",
+                         report, error,
+                         GsVulkanProbeStatus::DeviceCreationFailed))
+        {
+            return false;
+        }
+
+        std::vector<const char *> enabledDeviceExtensions;
+#if defined(VK_KHR_portability_subset)
+        const bool portabilitySubsetAvailable = std::any_of(
+            deviceExtensions.begin(), deviceExtensions.end(),
+            [](const VkExtensionProperties &extension)
+            {
+                return std::strcmp(
+                           extension.extensionName,
+                           VK_KHR_PORTABILITY_SUBSET_EXTENSION_NAME) == 0;
+            });
+        if (portabilitySubsetAvailable)
+        {
+            enabledDeviceExtensions.push_back(
+                VK_KHR_PORTABILITY_SUBSET_EXTENSION_NAME);
+        }
+#endif
+
+        const float priority = 1.0f;
+        VkDeviceQueueCreateInfo queueInfo{};
+        queueInfo.sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO;
+        queueInfo.queueFamilyIndex = m_queueFamilyIndex;
+        queueInfo.queueCount = 1u;
+        queueInfo.pQueuePriorities = &priority;
+
+        VkPhysicalDeviceFeatures enabledFeatures{};
+        VkDeviceCreateInfo deviceInfo{};
+        deviceInfo.sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO;
+        deviceInfo.queueCreateInfoCount = 1u;
+        deviceInfo.pQueueCreateInfos = &queueInfo;
+        deviceInfo.enabledExtensionCount =
+            static_cast<uint32_t>(enabledDeviceExtensions.size());
+        deviceInfo.ppEnabledExtensionNames =
+            enabledDeviceExtensions.empty()
+                ? nullptr
+                : enabledDeviceExtensions.data();
+        deviceInfo.pEnabledFeatures = &enabledFeatures;
+
+        const VkResult deviceResult = createDeviceProc(
+            m_physicalDevice, &deviceInfo, nullptr, &m_device);
+        if (!checkResult(deviceResult, "vkCreateDevice",
+                         report, error,
+                         GsVulkanProbeStatus::DeviceCreationFailed))
+        {
+            return false;
+        }
+        if (!m_functions.load(
+                m_getDeviceProcAddr, m_device, error))
+        {
+            report.status = GsVulkanProbeStatus::LoaderInvalid;
+            report.detail = error;
+            return false;
+        }
+        m_functions.getDeviceQueue(
+            m_device, m_queueFamilyIndex, 0u, &m_queue);
+        if (m_queue == VK_NULL_HANDLE)
+        {
+            error = "vkGetDeviceQueue returned a null compute queue";
+            report.status = GsVulkanProbeStatus::DeviceCreationFailed;
+            report.detail = error;
+            return false;
+        }
+        getMemoryProperties(m_physicalDevice, &m_memoryProperties);
+        return true;
+    }
+
+    int32_t VulkanExecutionContext::findMemoryType(
+        uint32_t typeBits,
+        VkMemoryPropertyFlags required,
+        VkMemoryPropertyFlags preferred) const noexcept
+    {
+        int32_t bestIndex = -1;
+        uint32_t bestScore = 0u;
+        for (uint32_t index = 0u;
+             index < m_memoryProperties.memoryTypeCount;
+             ++index)
+        {
+            if ((typeBits & (1u << index)) == 0u)
+                continue;
+            const VkMemoryPropertyFlags flags =
+                m_memoryProperties.memoryTypes[index].propertyFlags;
+            if ((flags & required) != required)
+                continue;
+
+            uint32_t score = 0u;
+            VkMemoryPropertyFlags remaining = flags & preferred;
+            while (remaining != 0u)
+            {
+                score += remaining & 1u;
+                remaining >>= 1u;
+            }
+            if (bestIndex < 0 || score > bestScore)
+            {
+                bestIndex = static_cast<int32_t>(index);
+                bestScore = score;
+            }
+        }
+        return bestIndex;
+    }
+
+    bool VulkanExecutionContext::createBuffer(
+        VkBufferUsageFlags usage,
+        VkMemoryPropertyFlags required,
+        VkMemoryPropertyFlags preferred,
+        BufferAllocation &allocation,
+        GsVulkanCapabilityReport &report,
+        std::string &error)
+    {
+        VkBufferCreateInfo bufferInfo{};
+        bufferInfo.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
+        bufferInfo.size = GS_VULKAN_VRAM_SIZE;
+        bufferInfo.usage = usage;
+        bufferInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+        VkResult result = m_functions.createBuffer(
+            m_device, &bufferInfo, nullptr, &allocation.buffer);
+        if (!checkResult(result, "vkCreateBuffer", report, error,
+                         GsVulkanProbeStatus::ResourceCreationFailed))
+            return false;
+
+        VkMemoryRequirements requirements{};
+        m_functions.getBufferMemoryRequirements(
+            m_device, allocation.buffer, &requirements);
+        const int32_t memoryType = findMemoryType(
+            requirements.memoryTypeBits, required, preferred);
+        if (memoryType < 0)
+        {
+            error = "no compatible Vulkan memory type satisfies the buffer requirements";
+            return false;
+        }
+
+        VkMemoryAllocateInfo allocationInfo{};
+        allocationInfo.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+        allocationInfo.allocationSize = requirements.size;
+        allocationInfo.memoryTypeIndex =
+            static_cast<uint32_t>(memoryType);
+        result = m_functions.allocateMemory(
+            m_device, &allocationInfo, nullptr, &allocation.memory);
+        if (!checkResult(result, "vkAllocateMemory", report, error,
+                         GsVulkanProbeStatus::ResourceCreationFailed))
+            return false;
+        allocation.allocationSize = requirements.size;
+        allocation.coherent =
+            (m_memoryProperties
+                 .memoryTypes[static_cast<uint32_t>(memoryType)]
+                 .propertyFlags &
+             VK_MEMORY_PROPERTY_HOST_COHERENT_BIT) != 0u;
+
+        result = m_functions.bindBufferMemory(
+            m_device, allocation.buffer, allocation.memory, 0u);
+        if (!checkResult(result, "vkBindBufferMemory", report, error,
+                         GsVulkanProbeStatus::ResourceCreationFailed))
+            return false;
+        return true;
+    }
+
+    bool VulkanExecutionContext::createResources(
+        GsVulkanCapabilityReport &report,
+        std::string &error)
+    {
+        if (!createBuffer(
+                VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
+                    VK_BUFFER_USAGE_TRANSFER_SRC_BIT |
+                    VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+                VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
+                VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
+                m_vram, report, error) ||
+            !createBuffer(
+                VK_BUFFER_USAGE_TRANSFER_SRC_BIT |
+                    VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+                VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT,
+                VK_MEMORY_PROPERTY_HOST_COHERENT_BIT |
+                    VK_MEMORY_PROPERTY_HOST_CACHED_BIT,
+                m_staging, report, error))
+        {
+            if (report.status != GsVulkanProbeStatus::DeviceLost)
+                report.status =
+                    GsVulkanProbeStatus::ResourceCreationFailed;
+            report.detail = error;
+            return false;
+        }
+
+        VkResult result = m_functions.mapMemory(
+            m_device, m_staging.memory, 0u, VK_WHOLE_SIZE, 0u,
+            &m_stagingMap);
+        if (!checkResult(result, "vkMapMemory", report, error,
+                         GsVulkanProbeStatus::ResourceCreationFailed))
+        {
+            return false;
+        }
+
+        VkDescriptorSetLayoutBinding binding{};
+        binding.binding = 0u;
+        binding.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+        binding.descriptorCount = 1u;
+        binding.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+        VkDescriptorSetLayoutCreateInfo descriptorLayoutInfo{};
+        descriptorLayoutInfo.sType =
+            VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
+        descriptorLayoutInfo.bindingCount = 1u;
+        descriptorLayoutInfo.pBindings = &binding;
+        result = m_functions.createDescriptorSetLayout(
+            m_device, &descriptorLayoutInfo, nullptr,
+            &m_descriptorSetLayout);
+        if (!checkResult(result, "vkCreateDescriptorSetLayout",
+                         report, error,
+                         GsVulkanProbeStatus::ResourceCreationFailed))
+        {
+            return false;
+        }
+
+        VkPushConstantRange pushConstantRange{};
+        pushConstantRange.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+        pushConstantRange.offset = 0u;
+        pushConstantRange.size = sizeof(uint32_t) * 2u;
+        VkPipelineLayoutCreateInfo pipelineLayoutInfo{};
+        pipelineLayoutInfo.sType =
+            VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
+        pipelineLayoutInfo.setLayoutCount = 1u;
+        pipelineLayoutInfo.pSetLayouts = &m_descriptorSetLayout;
+        pipelineLayoutInfo.pushConstantRangeCount = 1u;
+        pipelineLayoutInfo.pPushConstantRanges = &pushConstantRange;
+        result = m_functions.createPipelineLayout(
+            m_device, &pipelineLayoutInfo, nullptr, &m_pipelineLayout);
+        if (!checkResult(result, "vkCreatePipelineLayout",
+                         report, error,
+                         GsVulkanProbeStatus::ResourceCreationFailed))
+        {
+            return false;
+        }
+
+        VkShaderModuleCreateInfo shaderInfo{};
+        shaderInfo.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;
+        shaderInfo.codeSize = sizeof(kGsVramNoopShaderSpv);
+        shaderInfo.pCode = kGsVramNoopShaderSpv;
+        result = m_functions.createShaderModule(
+            m_device, &shaderInfo, nullptr, &m_shaderModule);
+        if (!checkResult(result, "vkCreateShaderModule",
+                         report, error,
+                         GsVulkanProbeStatus::ResourceCreationFailed))
+        {
+            return false;
+        }
+
+        VkPipelineShaderStageCreateInfo stageInfo{};
+        stageInfo.sType =
+            VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+        stageInfo.stage = VK_SHADER_STAGE_COMPUTE_BIT;
+        stageInfo.module = m_shaderModule;
+        stageInfo.pName = "main";
+        VkComputePipelineCreateInfo pipelineInfo{};
+        pipelineInfo.sType =
+            VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO;
+        pipelineInfo.stage = stageInfo;
+        pipelineInfo.layout = m_pipelineLayout;
+        result = m_functions.createComputePipelines(
+            m_device, VK_NULL_HANDLE, 1u, &pipelineInfo, nullptr,
+            &m_pipeline);
+        if (!checkResult(result, "vkCreateComputePipelines",
+                         report, error,
+                         GsVulkanProbeStatus::ResourceCreationFailed))
+        {
+            return false;
+        }
+
+        VkDescriptorPoolSize poolSize{};
+        poolSize.type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+        poolSize.descriptorCount = 1u;
+        VkDescriptorPoolCreateInfo poolInfo{};
+        poolInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
+        poolInfo.maxSets = 1u;
+        poolInfo.poolSizeCount = 1u;
+        poolInfo.pPoolSizes = &poolSize;
+        result = m_functions.createDescriptorPool(
+            m_device, &poolInfo, nullptr, &m_descriptorPool);
+        if (!checkResult(result, "vkCreateDescriptorPool",
+                         report, error,
+                         GsVulkanProbeStatus::ResourceCreationFailed))
+        {
+            return false;
+        }
+
+        VkDescriptorSetAllocateInfo descriptorSetInfo{};
+        descriptorSetInfo.sType =
+            VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
+        descriptorSetInfo.descriptorPool = m_descriptorPool;
+        descriptorSetInfo.descriptorSetCount = 1u;
+        descriptorSetInfo.pSetLayouts = &m_descriptorSetLayout;
+        result = m_functions.allocateDescriptorSets(
+            m_device, &descriptorSetInfo, &m_descriptorSet);
+        if (!checkResult(result, "vkAllocateDescriptorSets",
+                         report, error,
+                         GsVulkanProbeStatus::ResourceCreationFailed))
+        {
+            return false;
+        }
+
+        VkDescriptorBufferInfo descriptorBuffer{};
+        descriptorBuffer.buffer = m_vram.buffer;
+        descriptorBuffer.offset = 0u;
+        descriptorBuffer.range = GS_VULKAN_VRAM_SIZE;
+        VkWriteDescriptorSet descriptorWrite{};
+        descriptorWrite.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        descriptorWrite.dstSet = m_descriptorSet;
+        descriptorWrite.dstBinding = 0u;
+        descriptorWrite.descriptorCount = 1u;
+        descriptorWrite.descriptorType =
+            VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+        descriptorWrite.pBufferInfo = &descriptorBuffer;
+        m_functions.updateDescriptorSets(
+            m_device, 1u, &descriptorWrite, 0u, nullptr);
+
+        VkCommandPoolCreateInfo commandPoolInfo{};
+        commandPoolInfo.sType =
+            VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO;
+        commandPoolInfo.flags =
+            VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
+        commandPoolInfo.queueFamilyIndex = m_queueFamilyIndex;
+        result = m_functions.createCommandPool(
+            m_device, &commandPoolInfo, nullptr, &m_commandPool);
+        if (!checkResult(result, "vkCreateCommandPool",
+                         report, error,
+                         GsVulkanProbeStatus::ResourceCreationFailed))
+        {
+            return false;
+        }
+
+        VkCommandBufferAllocateInfo commandBufferInfo{};
+        commandBufferInfo.sType =
+            VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
+        commandBufferInfo.commandPool = m_commandPool;
+        commandBufferInfo.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+        commandBufferInfo.commandBufferCount = 1u;
+        result = m_functions.allocateCommandBuffers(
+            m_device, &commandBufferInfo, &m_commandBuffer);
+        if (!checkResult(result, "vkAllocateCommandBuffers",
+                         report, error,
+                         GsVulkanProbeStatus::ResourceCreationFailed))
+        {
+            return false;
+        }
+
+        VkFenceCreateInfo fenceInfo{};
+        fenceInfo.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
+        result = m_functions.createFence(
+            m_device, &fenceInfo, nullptr, &m_fence);
+        if (!checkResult(result, "vkCreateFence", report, error,
+                         GsVulkanProbeStatus::ResourceCreationFailed))
+        {
+            return false;
+        }
+        return true;
+    }
+
+    bool VulkanExecutionContext::initialize(
+        const GsVulkanServiceConfig &config,
+        GsVulkanCapabilityReport &report,
+        std::string &error)
+    {
+        const GsVulkanDeviceReport *selectedDevice =
+            report.selectedDevice();
+        if (!report.ready() || !selectedDevice)
+        {
+            error = report.detail.empty()
+                ? "Vulkan capability discovery did not select a device"
+                : report.detail;
+            return false;
+        }
+        if (config.fenceTimeoutNanoseconds == 0u)
+        {
+            error = "the Vulkan fence timeout must be non-zero";
+            report.status = GsVulkanProbeStatus::ResourceCreationFailed;
+            report.detail = error;
+            return false;
+        }
+        const GsVulkanDeviceReport selected = *selectedDevice;
+        m_fenceTimeoutNanoseconds = config.fenceTimeoutNanoseconds;
+        if (!createInstance(config.probe, report, error) ||
+            !createDevice(selected, report, error) ||
+            !createResources(report, error))
+        {
+            return false;
+        }
+
+        GsVulkanServiceStatistics diagnostics{};
+        refreshDiagnostics(report, diagnostics);
+        if (report.validationErrors != 0u)
+        {
+            error = "Vulkan validation reported errors during service creation";
+            report.status = GsVulkanProbeStatus::ValidationError;
+            report.detail = error;
+            return false;
+        }
+        report.status = GsVulkanProbeStatus::Ready;
+        report.detail = "Vulkan GS service ready on " + selected.name;
+        m_healthy = true;
+        return true;
+    }
+
+    void VulkanExecutionContext::refreshDiagnostics(
+        GsVulkanCapabilityReport &report,
+        GsVulkanServiceStatistics &statistics) const
+    {
+        report.validationWarnings =
+            m_validation.warnings.load(std::memory_order_relaxed);
+        report.validationErrors =
+            m_validation.errors.load(std::memory_order_relaxed);
+        statistics.validationWarnings = report.validationWarnings;
+        statistics.validationErrors = report.validationErrors;
+        statistics.deviceLost =
+            report.status == GsVulkanProbeStatus::DeviceLost;
+    }
+
+    bool VulkanExecutionContext::roundTrip(
+        std::span<const uint8_t> input,
+        std::vector<uint8_t> &output,
+        GsVulkanCapabilityReport &report,
+        GsVulkanServiceStatistics &statistics,
+        std::string &error)
+    {
+        if (!m_healthy)
+        {
+            error = "Vulkan GS service is not healthy";
+            return false;
+        }
+        if (input.size() != GS_VULKAN_VRAM_SIZE)
+        {
+            error = "Vulkan VRAM round trip requires exactly 4 MiB";
+            return false;
+        }
+
+        const uint32_t validationErrorsBefore =
+            m_validation.errors.load(std::memory_order_relaxed);
+        std::memcpy(m_stagingMap, input.data(), input.size());
+        if (!m_staging.coherent)
+        {
+            VkMappedMemoryRange mappedRange{};
+            mappedRange.sType = VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE;
+            mappedRange.memory = m_staging.memory;
+            mappedRange.offset = 0u;
+            mappedRange.size = VK_WHOLE_SIZE;
+            const VkResult flushResult =
+                m_functions.flushMappedMemoryRanges(
+                    m_device, 1u, &mappedRange);
+            if (!checkResult(flushResult,
+                             "vkFlushMappedMemoryRanges",
+                             report, error,
+                             GsVulkanProbeStatus::ResourceCreationFailed))
+            {
+                m_healthy = false;
+                return false;
+            }
+        }
+
+        VkResult result = m_functions.resetFences(
+            m_device, 1u, &m_fence);
+        if (!checkResult(result, "vkResetFences", report, error,
+                         GsVulkanProbeStatus::ResourceCreationFailed))
+        {
+            m_healthy = false;
+            return false;
+        }
+        result = m_functions.resetCommandBuffer(m_commandBuffer, 0u);
+        if (!checkResult(result, "vkResetCommandBuffer", report, error,
+                         GsVulkanProbeStatus::ResourceCreationFailed))
+        {
+            m_healthy = false;
+            return false;
+        }
+
+        VkCommandBufferBeginInfo beginInfo{};
+        beginInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+        beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+        result = m_functions.beginCommandBuffer(
+            m_commandBuffer, &beginInfo);
+        if (!checkResult(result, "vkBeginCommandBuffer", report, error,
+                         GsVulkanProbeStatus::ResourceCreationFailed))
+        {
+            m_healthy = false;
+            return false;
+        }
+
+        VkBufferMemoryBarrier stagingUploadBarrier{};
+        stagingUploadBarrier.sType =
+            VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
+        stagingUploadBarrier.srcAccessMask = VK_ACCESS_HOST_WRITE_BIT;
+        stagingUploadBarrier.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+        stagingUploadBarrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        stagingUploadBarrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        stagingUploadBarrier.buffer = m_staging.buffer;
+        stagingUploadBarrier.offset = 0u;
+        stagingUploadBarrier.size = GS_VULKAN_VRAM_SIZE;
+        m_functions.cmdPipelineBarrier(
+            m_commandBuffer,
+            VK_PIPELINE_STAGE_HOST_BIT,
+            VK_PIPELINE_STAGE_TRANSFER_BIT,
+            0u, 0u, nullptr, 1u, &stagingUploadBarrier,
+            0u, nullptr);
+
+        VkBufferCopy copyRegion{};
+        copyRegion.size = GS_VULKAN_VRAM_SIZE;
+        m_functions.cmdCopyBuffer(
+            m_commandBuffer, m_staging.buffer, m_vram.buffer,
+            1u, &copyRegion);
+
+        VkBufferMemoryBarrier uploadComputeBarrier{};
+        uploadComputeBarrier.sType =
+            VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
+        uploadComputeBarrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+        uploadComputeBarrier.dstAccessMask =
+            VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+        uploadComputeBarrier.srcQueueFamilyIndex =
+            VK_QUEUE_FAMILY_IGNORED;
+        uploadComputeBarrier.dstQueueFamilyIndex =
+            VK_QUEUE_FAMILY_IGNORED;
+        uploadComputeBarrier.buffer = m_vram.buffer;
+        uploadComputeBarrier.offset = 0u;
+        uploadComputeBarrier.size = GS_VULKAN_VRAM_SIZE;
+        m_functions.cmdPipelineBarrier(
+            m_commandBuffer,
+            VK_PIPELINE_STAGE_TRANSFER_BIT,
+            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+            0u, 0u, nullptr, 1u, &uploadComputeBarrier,
+            0u, nullptr);
+
+        m_functions.cmdBindPipeline(
+            m_commandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE,
+            m_pipeline);
+        m_functions.cmdBindDescriptorSets(
+            m_commandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE,
+            m_pipelineLayout, 0u, 1u, &m_descriptorSet,
+            0u, nullptr);
+        struct NoopParameters
+        {
+            uint32_t wordCount;
+            uint32_t xorMask;
+        };
+        const NoopParameters parameters{
+            static_cast<uint32_t>(
+                GS_VULKAN_VRAM_SIZE / sizeof(uint32_t)),
+            0u,
+        };
+        m_functions.cmdPushConstants(
+            m_commandBuffer, m_pipelineLayout,
+            VK_SHADER_STAGE_COMPUTE_BIT, 0u,
+            sizeof(parameters), &parameters);
+        m_functions.cmdDispatch(
+            m_commandBuffer, GS_VULKAN_NOOP_GROUP_COUNT, 1u, 1u);
+
+        VkBufferMemoryBarrier computeDownloadBarrier{};
+        computeDownloadBarrier.sType =
+            VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
+        computeDownloadBarrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+        computeDownloadBarrier.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+        computeDownloadBarrier.srcQueueFamilyIndex =
+            VK_QUEUE_FAMILY_IGNORED;
+        computeDownloadBarrier.dstQueueFamilyIndex =
+            VK_QUEUE_FAMILY_IGNORED;
+        computeDownloadBarrier.buffer = m_vram.buffer;
+        computeDownloadBarrier.offset = 0u;
+        computeDownloadBarrier.size = GS_VULKAN_VRAM_SIZE;
+        m_functions.cmdPipelineBarrier(
+            m_commandBuffer,
+            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+            VK_PIPELINE_STAGE_TRANSFER_BIT,
+            0u, 0u, nullptr, 1u, &computeDownloadBarrier,
+            0u, nullptr);
+
+        m_functions.cmdCopyBuffer(
+            m_commandBuffer, m_vram.buffer, m_staging.buffer,
+            1u, &copyRegion);
+
+        VkBufferMemoryBarrier stagingDownloadBarrier{};
+        stagingDownloadBarrier.sType =
+            VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
+        stagingDownloadBarrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+        stagingDownloadBarrier.dstAccessMask = VK_ACCESS_HOST_READ_BIT;
+        stagingDownloadBarrier.srcQueueFamilyIndex =
+            VK_QUEUE_FAMILY_IGNORED;
+        stagingDownloadBarrier.dstQueueFamilyIndex =
+            VK_QUEUE_FAMILY_IGNORED;
+        stagingDownloadBarrier.buffer = m_staging.buffer;
+        stagingDownloadBarrier.offset = 0u;
+        stagingDownloadBarrier.size = GS_VULKAN_VRAM_SIZE;
+        m_functions.cmdPipelineBarrier(
+            m_commandBuffer,
+            VK_PIPELINE_STAGE_TRANSFER_BIT,
+            VK_PIPELINE_STAGE_HOST_BIT,
+            0u, 0u, nullptr, 1u, &stagingDownloadBarrier,
+            0u, nullptr);
+
+        result = m_functions.endCommandBuffer(m_commandBuffer);
+        if (!checkResult(result, "vkEndCommandBuffer", report, error,
+                         GsVulkanProbeStatus::ResourceCreationFailed))
+        {
+            m_healthy = false;
+            return false;
+        }
+
+        VkSubmitInfo submitInfo{};
+        submitInfo.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+        submitInfo.commandBufferCount = 1u;
+        submitInfo.pCommandBuffers = &m_commandBuffer;
+        result = m_functions.queueSubmit(
+            m_queue, 1u, &submitInfo, m_fence);
+        if (!checkResult(result, "vkQueueSubmit", report, error,
+                         GsVulkanProbeStatus::ResourceCreationFailed))
+        {
+            m_healthy = false;
+            return false;
+        }
+        ++statistics.queueSubmissions;
+        ++statistics.shaderDispatches;
+
+        const auto waitStart = std::chrono::steady_clock::now();
+        result = m_functions.waitForFences(
+            m_device, 1u, &m_fence, VK_TRUE,
+            m_fenceTimeoutNanoseconds);
+        const auto waitEnd = std::chrono::steady_clock::now();
+        statistics.fenceWaitNanoseconds +=
+            static_cast<uint64_t>(
+                std::chrono::duration_cast<std::chrono::nanoseconds>(
+                    waitEnd - waitStart)
+                    .count());
+        if (result == VK_TIMEOUT)
+        {
+            error = "Vulkan GS round-trip fence timed out";
+            report.status = GsVulkanProbeStatus::ExecutionTimeout;
+            report.detail = error;
+            m_healthy = false;
+            return false;
+        }
+        if (!checkResult(result, "vkWaitForFences", report, error,
+                         GsVulkanProbeStatus::ResourceCreationFailed))
+        {
+            m_healthy = false;
+            return false;
+        }
+
+        if (!m_staging.coherent)
+        {
+            VkMappedMemoryRange mappedRange{};
+            mappedRange.sType = VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE;
+            mappedRange.memory = m_staging.memory;
+            mappedRange.offset = 0u;
+            mappedRange.size = VK_WHOLE_SIZE;
+            const VkResult invalidateResult =
+                m_functions.invalidateMappedMemoryRanges(
+                    m_device, 1u, &mappedRange);
+            if (!checkResult(invalidateResult,
+                             "vkInvalidateMappedMemoryRanges",
+                             report, error,
+                             GsVulkanProbeStatus::ResourceCreationFailed))
+            {
+                m_healthy = false;
+                return false;
+            }
+        }
+
+        refreshDiagnostics(report, statistics);
+        if (report.validationErrors != validationErrorsBefore)
+        {
+            error = "Vulkan validation reported an error during the VRAM round trip";
+            report.status = GsVulkanProbeStatus::ValidationError;
+            report.detail = error;
+            m_healthy = false;
+            return false;
+        }
+
+        std::vector<uint8_t> completed(GS_VULKAN_VRAM_SIZE);
+        std::memcpy(completed.data(), m_stagingMap, completed.size());
+        output = std::move(completed);
+        statistics.bytesUploaded += GS_VULKAN_VRAM_SIZE;
+        statistics.bytesDownloaded += GS_VULKAN_VRAM_SIZE;
+        return true;
+    }
+
+    void VulkanExecutionContext::shutdown() noexcept
+    {
+        if (m_device != VK_NULL_HANDLE && m_functions.deviceWaitIdle)
+            (void)m_functions.deviceWaitIdle(m_device);
+        if (m_stagingMap && m_functions.unmapMemory)
+            m_functions.unmapMemory(m_device, m_staging.memory);
+        m_stagingMap = nullptr;
+        if (m_fence != VK_NULL_HANDLE && m_functions.destroyFence)
+            m_functions.destroyFence(m_device, m_fence, nullptr);
+        m_fence = VK_NULL_HANDLE;
+        if (m_commandPool != VK_NULL_HANDLE &&
+            m_functions.destroyCommandPool)
+        {
+            m_functions.destroyCommandPool(
+                m_device, m_commandPool, nullptr);
+        }
+        m_commandPool = VK_NULL_HANDLE;
+        m_commandBuffer = VK_NULL_HANDLE;
+        if (m_descriptorPool != VK_NULL_HANDLE &&
+            m_functions.destroyDescriptorPool)
+        {
+            m_functions.destroyDescriptorPool(
+                m_device, m_descriptorPool, nullptr);
+        }
+        m_descriptorPool = VK_NULL_HANDLE;
+        m_descriptorSet = VK_NULL_HANDLE;
+        if (m_pipeline != VK_NULL_HANDLE && m_functions.destroyPipeline)
+            m_functions.destroyPipeline(m_device, m_pipeline, nullptr);
+        m_pipeline = VK_NULL_HANDLE;
+        if (m_shaderModule != VK_NULL_HANDLE &&
+            m_functions.destroyShaderModule)
+        {
+            m_functions.destroyShaderModule(
+                m_device, m_shaderModule, nullptr);
+        }
+        m_shaderModule = VK_NULL_HANDLE;
+        if (m_pipelineLayout != VK_NULL_HANDLE &&
+            m_functions.destroyPipelineLayout)
+        {
+            m_functions.destroyPipelineLayout(
+                m_device, m_pipelineLayout, nullptr);
+        }
+        m_pipelineLayout = VK_NULL_HANDLE;
+        if (m_descriptorSetLayout != VK_NULL_HANDLE &&
+            m_functions.destroyDescriptorSetLayout)
+        {
+            m_functions.destroyDescriptorSetLayout(
+                m_device, m_descriptorSetLayout, nullptr);
+        }
+        m_descriptorSetLayout = VK_NULL_HANDLE;
+
+        auto destroyAllocation = [&](BufferAllocation &allocation)
+        {
+            if (allocation.buffer != VK_NULL_HANDLE &&
+                m_functions.destroyBuffer)
+            {
+                m_functions.destroyBuffer(
+                    m_device, allocation.buffer, nullptr);
+            }
+            allocation.buffer = VK_NULL_HANDLE;
+            if (allocation.memory != VK_NULL_HANDLE &&
+                m_functions.freeMemory)
+            {
+                m_functions.freeMemory(
+                    m_device, allocation.memory, nullptr);
+            }
+            allocation.memory = VK_NULL_HANDLE;
+        };
+        destroyAllocation(m_staging);
+        destroyAllocation(m_vram);
+
+        if (m_device != VK_NULL_HANDLE && m_functions.destroyDevice)
+            m_functions.destroyDevice(m_device, nullptr);
+        m_device = VK_NULL_HANDLE;
+        m_queue = VK_NULL_HANDLE;
+        m_physicalDevice = VK_NULL_HANDLE;
+        m_instance.reset();
+        m_healthy = false;
+    }
+}
+#endif
+
+#if PS2X_HAS_GS_VULKAN
+struct GsVulkanService::Impl final
+{
+    explicit Impl(const GsVulkanServiceConfig &serviceConfig)
+        : config(serviceConfig)
+    {
+    }
+
+    void threadMain()
+    {
+        try
+        {
+            threadMainImpl();
+        }
+        catch (const std::exception &exception)
+        {
+            failUnexpectedWorkerExit(
+                std::string("Vulkan GS worker exception: ") +
+                exception.what());
+        }
+        catch (...)
+        {
+            failUnexpectedWorkerExit(
+                "Vulkan GS worker exited with an unknown exception");
+        }
+    }
+
+    void failUnexpectedWorkerExit(std::string message)
+    {
+        {
+            std::lock_guard lock(stateMutex);
+            capabilities.compiled = true;
+            capabilities.status =
+                GsVulkanProbeStatus::ResourceCreationFailed;
+            capabilities.detail = message;
+            initializationError = message;
+            healthy = false;
+            initialized = true;
+            workerFinished = true;
+            requestPending = false;
+            if (requestInFlight)
+            {
+                ++statistics.roundTripsFailed;
+                responseOutput.clear();
+                responseError = message;
+                responseSucceeded = false;
+                responseReady = true;
+                requestInFlight = false;
+            }
+        }
+        stateChanged.notify_all();
+    }
+
+    void threadMainImpl()
+    {
+        VulkanExecutionContext context;
+        GsVulkanCapabilityReport localCapabilities =
+            probeGsVulkanCapabilities(config.probe);
+        GsVulkanServiceStatistics localStatistics{};
+        std::string localError = localCapabilities.ready()
+            ? std::string{}
+            : localCapabilities.detail;
+        const bool initializedSuccessfully =
+            localCapabilities.ready() &&
+            context.initialize(config, localCapabilities, localError);
+
+        if (!initializedSuccessfully)
+        {
+            context.shutdown();
+            context.refreshDiagnostics(
+                localCapabilities, localStatistics);
+        }
+
+        {
+            std::lock_guard lock(stateMutex);
+            capabilities = localCapabilities;
+            statistics = localStatistics;
+            initializationError = localError;
+            healthy = initializedSuccessfully;
+            initialized = true;
+            if (!initializedSuccessfully)
+                workerFinished = true;
+        }
+        stateChanged.notify_all();
+        if (!initializedSuccessfully)
+            return;
+
+        for (;;)
+        {
+            std::vector<uint8_t> input;
+            {
+                std::unique_lock lock(stateMutex);
+                stateChanged.wait(lock, [this]
+                {
+                    return stopping || requestPending;
+                });
+                if (stopping && !requestPending)
+                    break;
+                input = std::move(requestInput);
+                requestPending = false;
+                requestInFlight = true;
+            }
+
+            std::vector<uint8_t> output;
+            std::string operationError;
+            const bool succeeded = context.roundTrip(
+                input, output, localCapabilities, localStatistics,
+                operationError);
+            if (succeeded)
+                ++localStatistics.roundTripsCompleted;
+            else
+                ++localStatistics.roundTripsFailed;
+            context.refreshDiagnostics(
+                localCapabilities, localStatistics);
+
+            {
+                std::lock_guard lock(stateMutex);
+                capabilities = localCapabilities;
+                statistics = localStatistics;
+                healthy = context.healthy();
+                responseOutput = std::move(output);
+                responseError = std::move(operationError);
+                responseSucceeded = succeeded;
+                responseReady = true;
+                requestInFlight = false;
+            }
+            stateChanged.notify_all();
+        }
+
+        context.refreshDiagnostics(localCapabilities, localStatistics);
+        context.shutdown();
+        context.refreshDiagnostics(localCapabilities, localStatistics);
+        if (localCapabilities.status == GsVulkanProbeStatus::Ready &&
+            localStatistics.validationErrors != 0u)
+        {
+            localCapabilities.status =
+                GsVulkanProbeStatus::ValidationError;
+            localCapabilities.detail =
+                "Vulkan validation reported an error during service shutdown";
+        }
+        {
+            std::lock_guard lock(stateMutex);
+            capabilities = std::move(localCapabilities);
+            statistics = localStatistics;
+            healthy = false;
+            workerFinished = true;
+        }
+        stateChanged.notify_all();
+    }
+
+    void stopAndJoin() noexcept
+    {
+        {
+            std::lock_guard lock(stateMutex);
+            stopping = true;
+        }
+        stateChanged.notify_all();
+        if (worker.joinable())
+            worker.join();
+    }
+
+    GsVulkanServiceConfig config;
+    mutable std::mutex stateMutex;
+    std::mutex callMutex;
+    std::condition_variable stateChanged;
+    std::thread worker;
+    GsVulkanCapabilityReport capabilities;
+    GsVulkanServiceStatistics statistics;
+    std::string initializationError;
+    std::vector<uint8_t> requestInput;
+    std::vector<uint8_t> responseOutput;
+    std::string responseError;
+    bool initialized = false;
+    bool healthy = false;
+    bool stopping = false;
+    bool workerFinished = false;
+    bool requestPending = false;
+    bool requestInFlight = false;
+    bool responseReady = false;
+    bool responseSucceeded = false;
+};
+#else
+struct GsVulkanService::Impl final
+{
+};
+#endif
+
+GsVulkanService::GsVulkanService(std::unique_ptr<Impl> impl)
+    : m_impl(std::move(impl))
+{
+}
+
+GsVulkanService::~GsVulkanService()
+{
+    shutdown();
+}
+
+void GsVulkanService::shutdown() noexcept
+{
+#if PS2X_HAS_GS_VULKAN
+    if (m_impl)
+        m_impl->stopAndJoin();
+#endif
+}
+
+std::unique_ptr<GsVulkanService> GsVulkanService::create(
+    const GsVulkanServiceConfig &config,
+    GsVulkanCapabilityReport *report,
+    std::string *error)
+{
+#if !PS2X_HAS_GS_VULKAN
+    GsVulkanCapabilityReport unavailable =
+        probeGsVulkanCapabilities(config.probe);
+    if (report)
+        *report = unavailable;
+    if (error)
+        *error = unavailable.detail;
+    return nullptr;
+#else
+    auto impl = std::make_unique<Impl>(config);
+    try
+    {
+        impl->worker = std::thread(&Impl::threadMain, impl.get());
+    }
+    catch (const std::exception &exception)
+    {
+        GsVulkanCapabilityReport failed{};
+        failed.compiled = true;
+        failed.status = GsVulkanProbeStatus::ResourceCreationFailed;
+        failed.detail =
+            std::string("failed to start Vulkan GS worker: ") +
+            exception.what();
+        if (report)
+            *report = failed;
+        if (error)
+            *error = failed.detail;
+        return nullptr;
+    }
+
+    GsVulkanCapabilityReport initializedCapabilities;
+    std::string initializationError;
+    bool initializedSuccessfully = false;
+    {
+        std::unique_lock lock(impl->stateMutex);
+        impl->stateChanged.wait(lock, [&impl]
+        {
+            return impl->initialized;
+        });
+        initializedCapabilities = impl->capabilities;
+        initializationError = impl->initializationError;
+        initializedSuccessfully = impl->healthy;
+    }
+
+    if (report)
+        *report = initializedCapabilities;
+    if (error)
+        *error = initializationError;
+    if (!initializedSuccessfully)
+    {
+        impl->stopAndJoin();
+        return nullptr;
+    }
+    return std::unique_ptr<GsVulkanService>(
+        new GsVulkanService(std::move(impl)));
+#endif
+}
+
+bool GsVulkanService::roundTripVram(
+    std::span<const uint8_t> input,
+    std::vector<uint8_t> &output,
+    std::string *error)
+{
+#if !PS2X_HAS_GS_VULKAN
+    (void)input;
+    (void)output;
+    if (error)
+        *error = "Vulkan GS support was compiled out";
+    return false;
+#else
+    if (input.size() != GS_VULKAN_VRAM_SIZE)
+    {
+        if (error)
+            *error = "Vulkan VRAM round trip requires exactly 4 MiB";
+        return false;
+    }
+
+    std::vector<uint8_t> ownedInput(input.begin(), input.end());
+    std::lock_guard callLock(m_impl->callMutex);
+    std::unique_lock stateLock(m_impl->stateMutex);
+    if (!m_impl->healthy || m_impl->stopping ||
+        m_impl->workerFinished)
+    {
+        if (error)
+        {
+            if (m_impl->stopping || m_impl->workerFinished)
+                *error = "Vulkan GS service is shut down";
+            else
+            {
+                *error = m_impl->capabilities.detail.empty()
+                    ? "Vulkan GS service is not healthy"
+                    : m_impl->capabilities.detail;
+            }
+        }
+        return false;
+    }
+
+    m_impl->requestInput = std::move(ownedInput);
+    m_impl->responseOutput.clear();
+    m_impl->responseError.clear();
+    m_impl->responseSucceeded = false;
+    m_impl->responseReady = false;
+    m_impl->requestPending = true;
+    stateLock.unlock();
+    m_impl->stateChanged.notify_all();
+    stateLock.lock();
+    m_impl->stateChanged.wait(stateLock, [this]
+    {
+        return m_impl->responseReady || m_impl->workerFinished;
+    });
+
+    if (!m_impl->responseReady)
+    {
+        if (error)
+            *error = "Vulkan GS worker stopped before completing the request";
+        return false;
+    }
+    const bool succeeded = m_impl->responseSucceeded;
+    std::vector<uint8_t> completed =
+        std::move(m_impl->responseOutput);
+    std::string operationError = std::move(m_impl->responseError);
+    m_impl->responseReady = false;
+    stateLock.unlock();
+
+    if (!succeeded)
+    {
+        if (error)
+            *error = std::move(operationError);
+        return false;
+    }
+    output = std::move(completed);
+    if (error)
+        error->clear();
+    return true;
+#endif
+}
+
+GsVulkanCapabilityReport GsVulkanService::capabilities() const
+{
+#if !PS2X_HAS_GS_VULKAN
+    return probeGsVulkanCapabilities();
+#else
+    std::lock_guard lock(m_impl->stateMutex);
+    return m_impl->capabilities;
+#endif
+}
+
+GsVulkanServiceStatistics GsVulkanService::statistics() const
+{
+#if !PS2X_HAS_GS_VULKAN
+    return {};
+#else
+    std::lock_guard lock(m_impl->stateMutex);
+    return m_impl->statistics;
+#endif
+}
+
+bool GsVulkanService::healthy() const
+{
+#if !PS2X_HAS_GS_VULKAN
+    return false;
+#else
+    std::lock_guard lock(m_impl->stateMutex);
+    return m_impl->healthy && !m_impl->stopping &&
+           !m_impl->workerFinished;
 #endif
 }
