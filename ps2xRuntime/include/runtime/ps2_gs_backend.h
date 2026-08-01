@@ -236,6 +236,10 @@ struct GsBackendCounters
     uint64_t verifiedPixels = 0;
     uint64_t fallbackPixels = 0;
     uint64_t strictFailurePixels = 0;
+    // Sum of host elapsed time spent in software raster kernels. Parallel
+    // worker durations are accumulated, so this is a CPU-cost signal rather
+    // than a batch wall-clock measurement.
+    uint64_t softwareRasterHostNanoseconds = 0;
     std::array<uint64_t, GS_FALLBACK_REASON_COUNT> decisions{};
     std::array<uint64_t, GS_FLUSH_REASON_COUNT> flushReasons{};
 };

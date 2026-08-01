@@ -162,6 +162,8 @@ namespace
                << ",\"fallback_pixels\":" << counters.fallbackPixels
                << ",\"strict_failure_pixels\":"
                << counters.strictFailurePixels
+               << ",\"software_raster_host_nanoseconds\":"
+               << counters.softwareRasterHostNanoseconds
                << ",\"decisions\":{";
 
         for (size_t index = 0u;

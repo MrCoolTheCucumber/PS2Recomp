@@ -6,6 +6,7 @@
 #include "runtime/ps2_gs_vulkan_backend.h"
 
 #include <array>
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <memory>
@@ -147,6 +148,8 @@ private:
     GS *m_debugProgressOwner = nullptr;
     uint64_t m_debugCandidatePixelBatch = 0u;
     bool m_trackDebugProgress = false;
+    std::atomic<bool> m_backendTimingEnabled{false};
+    std::atomic<uint64_t> m_softwareRasterHostNanoseconds{0u};
 };
 
 #endif

@@ -1053,6 +1053,9 @@ void register_ps2_gs_tests()
                      "frontend should submit each assembled draw to the router");
             t.Equals(drawCounters.softwareCommands, 1ull,
                      "default routing should reach the software adapter once");
+            t.IsTrue(
+                drawCounters.softwareRasterHostNanoseconds > 0u,
+                "enabled counters should measure the software raster kernel");
 
             gs.writeRegister(GS_REG_FINISH, 0ull);
             const GsBackendCounters finishCounters =
@@ -1072,6 +1075,12 @@ void register_ps2_gs_tests()
                         GsFlushReason::DebuggerObservation)],
                 1ull,
                 "debugger state observation should be an explicit synchronization boundary");
+
+            gs.resetBackendCounters();
+            t.Equals(
+                gs.backendCounters().softwareRasterHostNanoseconds,
+                0ull,
+                "resetting backend counters should clear software raster time");
         });
 
         tc.Run("GS draw command limit pauses within a GIF packet", [](TestCase &t)

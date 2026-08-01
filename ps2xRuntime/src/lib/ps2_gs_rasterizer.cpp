@@ -2508,10 +2508,24 @@ void GSRasterizer::renderQueuedPrimitive(GS *renderGs,
     {
         rasterizer.m_decodedClutActive = false;
     }
+    const bool measureRaster =
+        m_backendTimingEnabled.load(std::memory_order_relaxed);
+    const auto rasterStart = measureRaster
+        ? std::chrono::steady_clock::now()
+        : std::chrono::steady_clock::time_point{};
     if (primitive.type == GS_PRIM_SPRITE)
         rasterizer.drawSprite(renderGs);
     else
         rasterizer.drawTriangle(renderGs);
+    if (measureRaster)
+    {
+        m_softwareRasterHostNanoseconds.fetch_add(
+            static_cast<uint64_t>(
+                std::chrono::duration_cast<std::chrono::nanoseconds>(
+                    std::chrono::steady_clock::now() - rasterStart)
+                    .count()),
+            std::memory_order_relaxed);
+    }
 }
 
 bool GSRasterizer::ownsScanline(int y) const
@@ -2759,17 +2773,22 @@ GSRasterizer::vulkanRendererBackendStatistics() const
 
 void GSRasterizer::setBackendCountersEnabled(bool enabled) noexcept
 {
+    m_backendTimingEnabled.store(enabled, std::memory_order_relaxed);
     m_backendState->router.setCountersEnabled(enabled);
 }
 
 GsBackendCounters GSRasterizer::backendCounters() const noexcept
 {
-    return m_backendState->router.counters();
+    GsBackendCounters counters = m_backendState->router.counters();
+    counters.softwareRasterHostNanoseconds =
+        m_softwareRasterHostNanoseconds.load(std::memory_order_relaxed);
+    return counters;
 }
 
 void GSRasterizer::resetBackendCounters() noexcept
 {
     m_backendState->router.resetCounters();
+    m_softwareRasterHostNanoseconds.store(0u, std::memory_order_relaxed);
 }
 
 GsReplayRasterizerState GSRasterizer::captureReplayState() const
@@ -3022,6 +3041,11 @@ void GSRasterizer::renderSoftwarePrimitive(
     std::copy_n(command.fixedX().data(), 3u, m_queuedFixedX);
     std::copy_n(command.fixedY().data(), 3u, m_queuedFixedY);
     m_queuedFixedVerticesValid = true;
+    const bool measureRaster =
+        m_backendTimingEnabled.load(std::memory_order_relaxed);
+    const auto rasterStart = measureRaster
+        ? std::chrono::steady_clock::now()
+        : std::chrono::steady_clock::time_point{};
     switch (primitive.type)
     {
     case GS_PRIM_SPRITE:
@@ -3051,6 +3075,15 @@ void GSRasterizer::renderSoftwarePrimitive(
     }
     default:
         break;
+    }
+    if (measureRaster)
+    {
+        m_softwareRasterHostNanoseconds.fetch_add(
+            static_cast<uint64_t>(
+                std::chrono::duration_cast<std::chrono::nanoseconds>(
+                    std::chrono::steady_clock::now() - rasterStart)
+                    .count()),
+            std::memory_order_relaxed);
     }
     m_queuedFixedVerticesValid = false;
     m_textureReadVram = nullptr;
