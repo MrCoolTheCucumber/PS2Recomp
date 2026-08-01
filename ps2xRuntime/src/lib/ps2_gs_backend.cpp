@@ -902,7 +902,11 @@ namespace
                     false,
                     GsFallbackReason::UnsupportedTextureFilter};
             }
-            if ((context.clamp & 0xFu) != 0u)
+            const uint8_t wrapModeU =
+                static_cast<uint8_t>(context.clamp & 0x3u);
+            const uint8_t wrapModeV =
+                static_cast<uint8_t>((context.clamp >> 2u) & 0x3u);
+            if (wrapModeU > 1u || wrapModeV > 1u)
             {
                 return {
                     false,

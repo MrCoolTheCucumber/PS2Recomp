@@ -147,7 +147,11 @@ namespace
             << "\"texture_origin_u\":" << sprite.textureOriginU << ','
             << "\"texture_origin_v\":" << sprite.textureOriginV << ','
             << "\"texture_step_u\":" << sprite.textureStepU << ','
-            << "\"texture_step_v\":" << sprite.textureStepV << '}';
+            << "\"texture_step_v\":" << sprite.textureStepV << ','
+            << "\"texture_wrap_mode_u\":"
+            << sprite.textureWrapModeU << ','
+            << "\"texture_wrap_mode_v\":"
+            << sprite.textureWrapModeV << '}';
     }
 
     template <typename PreparedRecord>

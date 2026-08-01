@@ -26,9 +26,16 @@ layout(push_constant) uniform TextureSpriteParameters
     int texture_origin_v;
     int texture_step_u;
     int texture_step_v;
-    uint reserved0;
-    uint reserved1;
+    uint texture_wrap_mode_u;
+    uint texture_wrap_mode_v;
 } sprite;
+
+uint wrap_texture_coordinate(int coordinate, uint mask, uint mode)
+{
+    if (mode == 0u)
+        return uint(coordinate) & mask;
+    return uint(clamp(coordinate, 0, int(mask)));
+}
 
 void main()
 {
@@ -43,8 +50,10 @@ void main()
                     int(offset_x) * sprite.texture_step_u;
     int texture_v = sprite.texture_origin_v +
                     int(offset_y) * sprite.texture_step_v;
-    uint wrapped_u = uint(texture_u) & sprite.texture_mask_u;
-    uint wrapped_v = uint(texture_v) & sprite.texture_mask_v;
+    uint wrapped_u = wrap_texture_coordinate(
+        texture_u, sprite.texture_mask_u, sprite.texture_wrap_mode_u);
+    uint wrapped_v = wrap_texture_coordinate(
+        texture_v, sprite.texture_mask_v, sprite.texture_wrap_mode_v);
     uint texture_bit_address = gs_pixel_bit_address(
         0x00u,
         sprite.texture_base_block,

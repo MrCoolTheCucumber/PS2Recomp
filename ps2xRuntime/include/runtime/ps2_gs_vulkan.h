@@ -300,9 +300,10 @@ static_assert(offsetof(GsVulkanCt32Sprite, reserved) == 28u);
 
 // Fixed record for Phase 6's first textured-sprite semantic slice. Texture
 // coordinates name the texel sampled at boundsX0/boundsY0 and advance by one
-// signed texel per output pixel. Power-of-two masks implement GS REPEAT before
-// raw CT32 local-memory addressing. Source and destination are guaranteed
-// disjoint by the backend-neutral classifier.
+// signed texel per output pixel. Power-of-two masks and the per-axis wrap modes
+// implement GS REPEAT or standard CLAMP before raw CT32 local-memory
+// addressing. Region modes remain a separate semantic slice. Source and
+// destination are guaranteed disjoint by the backend-neutral classifier.
 struct alignas(16) GsVulkanNearestCt32Sprite
 {
     uint32_t framebufferBaseBlock = 0u;
@@ -319,8 +320,8 @@ struct alignas(16) GsVulkanNearestCt32Sprite
     int32_t textureOriginV = 0;
     int32_t textureStepU = 0;
     int32_t textureStepV = 0;
-    uint32_t reserved0 = 0u;
-    uint32_t reserved1 = 0u;
+    uint32_t textureWrapModeU = 0u;
+    uint32_t textureWrapModeV = 0u;
 
     bool operator==(const GsVulkanNearestCt32Sprite &) const = default;
 };
@@ -342,8 +343,8 @@ static_assert(offsetof(GsVulkanNearestCt32Sprite, textureOriginU) == 40u);
 static_assert(offsetof(GsVulkanNearestCt32Sprite, textureOriginV) == 44u);
 static_assert(offsetof(GsVulkanNearestCt32Sprite, textureStepU) == 48u);
 static_assert(offsetof(GsVulkanNearestCt32Sprite, textureStepV) == 52u);
-static_assert(offsetof(GsVulkanNearestCt32Sprite, reserved0) == 56u);
-static_assert(offsetof(GsVulkanNearestCt32Sprite, reserved1) == 60u);
+static_assert(offsetof(GsVulkanNearestCt32Sprite, textureWrapModeU) == 56u);
+static_assert(offsetof(GsVulkanNearestCt32Sprite, textureWrapModeV) == 60u);
 
 // Publishes only fully validated records. Rejection leaves the caller's
 // record untouched, matching the established sprite/triangle preparation

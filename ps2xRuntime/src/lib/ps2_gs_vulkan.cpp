@@ -144,8 +144,11 @@ namespace
     const char *nearestCt32SpriteValidationError(
         const GsVulkanNearestCt32Sprite &sprite) noexcept
     {
-        if (sprite.reserved0 != 0u || sprite.reserved1 != 0u)
-            return "Vulkan nearest CT32 sprite has non-zero reserved data";
+        if (sprite.textureWrapModeU > 1u ||
+            sprite.textureWrapModeV > 1u)
+        {
+            return "Vulkan nearest CT32 sprite wrap mode is unsupported";
+        }
         if (sprite.framebufferBaseBlock > 0x3FFFu ||
             sprite.textureBaseBlock > 0x3FFFu)
         {
@@ -544,6 +547,10 @@ GsBackendDecision prepareGsVulkanNearestCt32Sprite(
         textureStepV * (bounds.y0 - unclippedY0);
     prepared.textureStepU = textureStepU;
     prepared.textureStepV = textureStepV;
+    prepared.textureWrapModeU =
+        static_cast<uint32_t>(context.clamp & 0x3u);
+    prepared.textureWrapModeV =
+        static_cast<uint32_t>((context.clamp >> 2u) & 0x3u);
     if (nearestCt32SpriteValidationError(prepared))
         return {false, GsFallbackReason::UnknownMemoryLayout};
 
@@ -1376,7 +1383,7 @@ namespace
     static_assert(kGsCt32TriangleShaderSpv[0] == 0x07230203u);
     static_assert(sizeof(kGsMemoryCasesShaderSpv) == 10988u);
     static_assert(kGsMemoryCasesShaderSpv[0] == 0x07230203u);
-    static_assert(sizeof(kGsNearestCt32SpriteShaderSpv) == 12328u);
+    static_assert(sizeof(kGsNearestCt32SpriteShaderSpv) == 12872u);
     static_assert(kGsNearestCt32SpriteShaderSpv[0] == 0x07230203u);
     static_assert(sizeof(kGsVramNoopShaderSpv) == 1112u);
     static_assert(kGsVramNoopShaderSpv[0] == 0x07230203u);
