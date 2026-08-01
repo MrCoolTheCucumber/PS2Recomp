@@ -5208,8 +5208,8 @@ void register_ps2_gs_vulkan_tests()
                      "small strict fixtures should stay on the CPU in Hybrid");
             t.Equals(
                 backend->classify(commands[1]).reason,
-                GsFallbackReason::AlphaBlend,
-                "Hybrid source-over should remain closed before measurement");
+                GsFallbackReason::CostModel,
+                "small source-over should retain the measured depth gate");
 
             std::vector<uint8_t> unavailableVram = initial;
             std::unique_ptr<GsVulkanRasterBackend> unavailable =
@@ -5320,9 +5320,18 @@ void register_ps2_gs_vulkan_tests()
             const GsDrawCommand sourceCopyRetainedTitle =
                 makeAlphaBlendCommand(
                     retainedTitle, 39'108u, 0u);
+            const GsDrawCommand sourceOverBelow =
+                makeAlphaBlendCommand(
+                    belowThreshold, 39'109u,
+                    0x8000000044ull, false, true);
             const GsDrawCommand sourceOverAtThreshold =
                 makeAlphaBlendCommand(
-                    atThreshold, 39'109u, 0x8000000044ull);
+                    atThreshold, 39'110u,
+                    0x8000000044ull, false, true);
+            const GsDrawCommand sourceOverRetainedTitle =
+                makeAlphaBlendCommand(
+                    retainedTitle, 39'111u,
+                    0x8000000044ull, false, true);
             const std::array<GsDrawCommand, 5> admittedStates{{
                 atThreshold,
                 makeDepthCt32SpriteCommand(
@@ -5363,6 +5372,9 @@ void register_ps2_gs_vulkan_tests()
             GsVulkanDepthCt32Sprite sourceCopyBelowPrepared{};
             GsVulkanDepthCt32Sprite sourceCopyAtThresholdPrepared{};
             GsVulkanDepthCt32Sprite sourceCopyRetainedPrepared{};
+            GsVulkanDepthCt32Sprite sourceOverBelowPrepared{};
+            GsVulkanDepthCt32Sprite sourceOverAtThresholdPrepared{};
+            GsVulkanDepthCt32Sprite sourceOverRetainedPrepared{};
             t.IsTrue(prepareGsVulkanDepthCt32Sprite(
                          belowThreshold, belowPrepared).supported,
                      "the below-threshold depth fixture should be semantic");
@@ -5381,6 +5393,18 @@ void register_ps2_gs_vulkan_tests()
                          sourceCopyRetainedTitle,
                          sourceCopyRetainedPrepared).supported,
                      "retained source-copy depth should be semantic");
+            t.IsTrue(prepareGsVulkanSourceOverDepthCt32Sprite(
+                         sourceOverBelow,
+                         sourceOverBelowPrepared).supported,
+                     "below-threshold source-over depth should be semantic");
+            t.IsTrue(prepareGsVulkanSourceOverDepthCt32Sprite(
+                         sourceOverAtThreshold,
+                         sourceOverAtThresholdPrepared).supported,
+                     "threshold source-over depth should be semantic");
+            t.IsTrue(prepareGsVulkanSourceOverDepthCt32Sprite(
+                         sourceOverRetainedTitle,
+                         sourceOverRetainedPrepared).supported,
+                     "retained source-over depth should be semantic");
             t.IsTrue(sourceCopyBelowPrepared == belowPrepared,
                      "source-copy alpha should preserve the below-threshold record");
             t.IsTrue(sourceCopyAtThresholdPrepared == prepared.front(),
@@ -5406,11 +5430,18 @@ void register_ps2_gs_vulkan_tests()
                      "the admitted fixture should meet policy exactly");
             t.Equals(pixels(retainedPrepared), 13'312ull,
                      "the retained title fixture should preserve exact work");
+            t.Equals(pixels(sourceOverBelowPrepared), 261'632ull,
+                     "source-over should share the below-threshold shape");
+            t.Equals(pixels(sourceOverAtThresholdPrepared), thresholdPixels,
+                     "source-over should meet the shared depth floor exactly");
+            t.Equals(pixels(sourceOverRetainedPrepared), 13'312ull,
+                     "source-over should preserve retained title work");
 
             const std::vector<uint8_t> initial =
                 makeVramPattern(0x4448434Fu);
             std::vector<uint8_t> expected = initial;
-            applyDepthCt32SpriteCpu(expected, prepared.front());
+            applyDepthCt32SpriteCpu(
+                expected, sourceOverAtThresholdPrepared);
             std::vector<uint8_t> vram = initial;
             uint64_t softwareCalls = 0u;
             uint64_t commitCalls = 0u;
@@ -5444,9 +5475,14 @@ void register_ps2_gs_vulkan_tests()
                      "the retained source-copy title draw should stay on CPU");
             t.IsTrue(backend->classify(sourceCopyAtThreshold).supported,
                      "source-copy depth should meet the depth floor exactly");
-            t.Equals(backend->classify(sourceOverAtThreshold).reason,
-                     GsFallbackReason::AlphaBlend,
-                     "the cost policy must not admit genuine source-over depth");
+            t.Equals(backend->classify(sourceOverBelow).reason,
+                     GsFallbackReason::CostModel,
+                     "small source-over depth should share the depth cost gate");
+            t.Equals(backend->classify(sourceOverRetainedTitle).reason,
+                     GsFallbackReason::CostModel,
+                     "retained source-over should stay on CPU after measurement");
+            t.IsTrue(backend->classify(sourceOverAtThreshold).supported,
+                     "measured source-over should meet the depth floor exactly");
             for (const GsDrawCommand &command : admittedStates)
             {
                 t.IsTrue(backend->classify(command).supported,
@@ -5458,22 +5494,27 @@ void register_ps2_gs_vulkan_tests()
                      "strict mode should ignore the depth cost policy");
             t.IsTrue(backend->classify(sourceCopyBelow).supported,
                      "strict mode should ignore source-copy depth cost policy");
+            t.IsTrue(backend->classify(sourceOverBelow).supported,
+                     "strict mode should ignore source-over depth cost policy");
             t.IsTrue(backend->setMode(GsRendererMode::Verify),
                      "the depth policy fixture should enter Verify");
             t.IsTrue(backend->classify(retainedTitle).supported,
                      "Verify should exercise the retained depth candidate");
             t.IsTrue(backend->classify(sourceCopyRetainedTitle).supported,
                      "Verify should exercise retained source-copy depth");
+            t.IsTrue(backend->classify(sourceOverRetainedTitle).supported,
+                     "Verify should exercise retained source-over depth");
             t.IsTrue(backend->setMode(GsRendererMode::Hybrid),
                      "the depth policy fixture should restore Hybrid");
 
             backend->submit(
-                std::span<const GsDrawCommand>(&atThreshold, 1u));
+                std::span<const GsDrawCommand>(
+                    &sourceOverAtThreshold, 1u));
             t.Equals(backend->pendingCommandCount(), size_t{1u},
                      "the admitted depth draw should remain resident");
             backend->flush(GsFlushReason::Explicit);
             backend->prepareCpuVramAccess(
-                atThreshold.resources().writePages,
+                sourceOverAtThreshold.resources().writePages,
                 GsFlushReason::CpuReadback);
             t.IsTrue(vram == expected,
                      "the admitted Hybrid depth draw should remain exact");
@@ -5504,6 +5545,10 @@ void register_ps2_gs_vulkan_tests()
                          GsFallbackReason::BackendUnavailable,
                          "missing depth capability should precede cost policy");
                 t.Equals(
+                    unavailable->classify(sourceOverAtThreshold).reason,
+                    GsFallbackReason::BackendUnavailable,
+                    "source-over capability rejection should precede cost policy");
+                t.Equals(
                     unavailable->serviceStatistics()
                         .residentDepthCt32SpriteBatchesFailed,
                     0ull,
@@ -5528,6 +5573,9 @@ void register_ps2_gs_vulkan_tests()
                 t.IsTrue(
                     disabled->classify(sourceCopyRetainedTitle).supported,
                     "zero should admit retained source-copy depth too");
+                t.IsTrue(
+                    disabled->classify(sourceOverRetainedTitle).supported,
+                    "zero should admit retained source-over depth too");
             }
         });
 
@@ -10449,7 +10497,7 @@ void register_ps2_gs_vulkan_tests()
         {
             GSMem::InitLookupTables();
             constexpr uint64_t thresholdPixels = 262'144u;
-            const GsDrawCommand retainedTitle =
+            const GsDrawCommand retainedBase =
                 makeDepthCt32SpriteCommand(
                     41'000u, 112u, 8u, 216u,
                     GS_PSM_Z24, false, 1u,
@@ -10458,22 +10506,36 @@ void register_ps2_gs_vulkan_tests()
                     1792u * 16u - 8u, 1840u * 16u - 8u,
                     (1792u + 32u) * 16u - 8u,
                     (1840u + 416u) * 16u - 8u,
-                    0x80000000u, 0u);
-            const GsDrawCommand admitted =
+                    0x78000000u, 0u);
+            const GsDrawCommand admittedBase =
                 makeDepthCt32SpriteCommand(
                     41'001u, 0u, 8u, 256u,
                     GS_PSM_Z32, false, 1u,
                     {0u, 511u, 0u, 511u}, {0u, 0u},
                     0u, 0u, 512u * 16u, 512u * 16u,
                     0xC0A08060u, 0x55667788u);
+            const GsDrawCommand retainedTitle = makeAlphaBlendCommand(
+                retainedBase, 41'000u,
+                0x8000000044ull, false, true);
+            const GsDrawCommand admitted = makeAlphaBlendCommand(
+                admittedBase, 41'001u,
+                0x8000000044ull, false, true);
             GsVulkanDepthCt32Sprite retainedPrepared{};
             GsVulkanDepthCt32Sprite admittedPrepared{};
-            t.IsTrue(prepareGsVulkanDepthCt32Sprite(
+            t.IsTrue(prepareAnyDepthCt32Sprite(
                          retainedTitle, retainedPrepared).supported,
-                     "the retained Hybrid title fixture should be exact");
-            t.IsTrue(prepareGsVulkanDepthCt32Sprite(
+                     "the retained source-over Hybrid fixture should be exact");
+            t.IsTrue(prepareAnyDepthCt32Sprite(
                          admitted, admittedPrepared).supported,
-                     "the admitted Hybrid depth fixture should be exact");
+                     "the admitted source-over Hybrid fixture should be exact");
+            t.Equals(
+                retainedPrepared.colorBlendMode,
+                GS_VULKAN_DEPTH_CT32_COLOR_SOURCE_OVER,
+                "the retained Hybrid fixture should retain source-over");
+            t.Equals(
+                admittedPrepared.colorBlendMode,
+                GS_VULKAN_DEPTH_CT32_COLOR_SOURCE_OVER,
+                "the admitted Hybrid fixture should retain source-over");
             const auto pixels = [](const GsVulkanDepthCt32Sprite &sprite)
             {
                 return static_cast<uint64_t>(
