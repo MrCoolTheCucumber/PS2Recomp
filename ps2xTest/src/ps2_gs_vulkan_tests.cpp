@@ -4369,6 +4369,10 @@ void register_ps2_gs_vulkan_tests()
                          "failed strict selection must preserve software mode");
                 return;
             }
+            const GsVulkanDeviceReport *selected =
+                preflight.selectedDevice();
+            const bool exactTriangle =
+                selected && selected->exactCt32Triangle;
 
             t.IsTrue(strict.setRendererMode(
                          GsRendererMode::GpuStrict),
@@ -4433,12 +4437,32 @@ void register_ps2_gs_vulkan_tests()
                      "GS reset should preserve the selected renderer service and mode");
             configureFlatCt32Draws(software);
             configureFlatCt32Draws(strict);
-            drawFlatCt32Sprite(
-                software, 19u * 16u, 20u * 16u,
-                39u * 16u, 31u * 16u, 0xF0AABBCCu);
-            drawFlatCt32Sprite(
-                strict, 19u * 16u, 20u * 16u,
-                39u * 16u, 31u * 16u, 0xF0AABBCCu);
+            if (exactTriangle)
+            {
+                constexpr std::array<uint16_t, 3> x{{
+                    19u * 16u + 1u,
+                    43u * 16u + 11u,
+                    25u * 16u + 7u,
+                }};
+                constexpr std::array<uint16_t, 3> y{{
+                    7u * 16u + 3u,
+                    13u * 16u + 9u,
+                    29u * 16u + 5u,
+                }};
+                drawFlatCt32Triangle(
+                    software, x, y, 0xF0AABBCCu);
+                drawFlatCt32Triangle(
+                    strict, x, y, 0xF0AABBCCu);
+            }
+            else
+            {
+                drawFlatCt32Sprite(
+                    software, 19u * 16u, 20u * 16u,
+                    39u * 16u, 31u * 16u, 0xF0AABBCCu);
+                drawFlatCt32Sprite(
+                    strict, 19u * 16u, 20u * 16u,
+                    39u * 16u, 31u * 16u, 0xF0AABBCCu);
+            }
             strict.writeRegister(GS_REG_FINISH, 0u);
             (void)strict.getDebugSnapshot();
             t.IsTrue(strictVram == softwareVram,
@@ -4448,7 +4472,7 @@ void register_ps2_gs_vulkan_tests()
             t.Equals(counters.commands, 4ull,
                      "strict should classify two accepted and two rejected commands");
             t.Equals(counters.acceleratedCommands, 2ull,
-                     "both eligible strict sprites should reach Vulkan");
+                     "both eligible strict draws should reach Vulkan");
             t.Equals(counters.softwareCommands, 0ull,
                      "strict must never hide rejection behind software");
             t.Equals(counters.strictFailures, 2ull,
@@ -4477,8 +4501,15 @@ void register_ps2_gs_vulkan_tests()
                      "both accepted strict draws should publish GPU VRAM");
             const GsVulkanServiceStatistics serviceStatistics =
                 strict.vulkanRendererServiceStatistics();
-            t.Equals(serviceStatistics.spriteDrawsCompleted, 2ull,
-                     "strict rejections should not become service requests");
+            t.Equals(serviceStatistics.spriteDrawsCompleted,
+                     exactTriangle ? 1ull : 2ull,
+                     "strict reset should preserve exact sprite accounting");
+            t.Equals(serviceStatistics.triangleDrawsCompleted,
+                     exactTriangle ? 1ull : 0ull,
+                     "a qualified host should execute the post-reset triangle");
+            t.Equals(serviceStatistics.residentTriangleBatchesCompleted,
+                     exactTriangle ? 1ull : 0ull,
+                     "the qualified post-reset triangle should use resident execution");
             t.Equals(serviceStatistics.validationErrors, 0u,
                      "strict reset and drain should remain validation-clean");
             t.Equals(serviceStatistics.validationWarnings, 0u,
