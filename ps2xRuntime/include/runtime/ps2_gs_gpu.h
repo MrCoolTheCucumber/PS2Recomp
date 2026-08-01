@@ -175,6 +175,12 @@ public:
     void setBackendCountersEnabled(bool enabled);
     [[nodiscard]] GsBackendCounters backendCounters() const;
     void resetBackendCounters();
+    // Replay control: pause GIF decoding immediately after this many
+    // draw commands have been submitted. A limit of zero pauses before input.
+    void setDrawCommandLimit(uint64_t maximumCommands);
+    void clearDrawCommandLimit();
+    [[nodiscard]] bool drawCommandLimitReached() const;
+    [[nodiscard]] uint64_t submittedDrawCommandCount() const;
 
     uint32_t consumeLocalToHostBytes(uint8_t *dst, uint32_t maxBytes);
 
@@ -269,6 +275,8 @@ private:
     int m_vtxCount = 0;
     int m_vtxIndex = 0;
     uint64_t m_nextDrawSequence = 1;
+    uint64_t m_drawCommandLimit = UINT64_MAX;
+    bool m_drawCommandLimitReached = false;
 
     std::vector<uint8_t> m_displaySnapshot;
     std::mutex m_snapshotMutex;

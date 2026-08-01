@@ -53,8 +53,116 @@ namespace
             << "usage: gs_replay [--vram-in FILE] [--vram-out FILE] "
                "[--register ADDRESS=VALUE] [--register-file FILE] "
                "[--packet-sizes FILE] [--hash-trace FILE] "
+               "[--renderer software|hybrid|verify|gpu-strict] "
+               "[--backend-stats] [--stop-after-command COUNT] "
+               "[--stop-after-packet COUNT] [--compare-vram FILE] "
                "[--batch-stream] "
                "GIF_PACKET [GIF_PACKET ...]\n";
+    }
+
+    bool parseUnsigned(const std::string &text, uint64_t &value)
+    {
+        errno = 0;
+        char *end = nullptr;
+        const unsigned long long parsed =
+            std::strtoull(text.c_str(), &end, 0);
+        if (errno != 0 || end == text.c_str() || !end || *end != '\0')
+            return false;
+        value = static_cast<uint64_t>(parsed);
+        return true;
+    }
+
+    bool parseCount(const std::string &text, uint64_t &value)
+    {
+        return !text.empty() && text[0] != '-' &&
+               parseUnsigned(text, value);
+    }
+
+    bool parseRendererMode(
+        const std::string &text,
+        GsRendererMode &mode)
+    {
+        if (text == "software")
+            mode = GsRendererMode::Software;
+        else if (text == "hybrid")
+            mode = GsRendererMode::Hybrid;
+        else if (text == "verify")
+            mode = GsRendererMode::Verify;
+        else if (text == "gpu-strict")
+            mode = GsRendererMode::GpuStrict;
+        else
+            return false;
+        return true;
+    }
+
+    struct VramDifference
+    {
+        bool matches = true;
+        size_t byteOffset = 0u;
+        size_t page = 0u;
+        uint8_t expected = 0u;
+        uint8_t actual = 0u;
+    };
+
+    VramDifference compareVram(
+        const uint8_t *actual,
+        const std::vector<uint8_t> &expected)
+    {
+        for (size_t offset = 0u; offset < expected.size(); ++offset)
+        {
+            if (actual[offset] == expected[offset])
+                continue;
+            return {
+                false,
+                offset,
+                offset / GS_VRAM_PAGE_SIZE,
+                expected[offset],
+                actual[offset],
+            };
+        }
+        return {};
+    }
+
+    void writeBackendCounters(
+        std::ostream &output,
+        const GsBackendCounters &counters)
+    {
+        output << "{\"commands\":" << counters.commands
+               << ",\"software_commands\":" << counters.softwareCommands
+               << ",\"accelerated_commands\":" << counters.acceleratedCommands
+               << ",\"verified_commands\":" << counters.verifiedCommands
+               << ",\"fallback_commands\":" << counters.fallbackCommands
+               << ",\"strict_failures\":" << counters.strictFailures
+               << ",\"flushes\":" << counters.flushes
+               << ",\"backend_switches\":" << counters.backendSwitches
+               << ",\"queue_depth\":" << counters.queueDepth
+               << ",\"queue_high_watermark\":"
+               << counters.queueHighWatermark
+               << ",\"decisions\":{";
+
+        for (size_t index = 0u;
+             index < GS_FALLBACK_REASON_COUNT;
+             ++index)
+        {
+            if (index != 0u)
+                output << ',';
+            const auto reason = static_cast<GsFallbackReason>(index);
+            output << '\"' << gsFallbackReasonName(reason) << "\":"
+                   << counters.decisions[index];
+        }
+
+        output << "},\"flush_reasons\":{";
+        for (size_t index = 0u;
+             index < GS_FLUSH_REASON_COUNT;
+             ++index)
+        {
+            if (index != 0u)
+                output << ',';
+            const auto reason = static_cast<GsFlushReason>(index);
+            output << '\"' << gsFlushReasonName(reason) << "\":"
+                   << counters.flushReasons[index];
+        }
+        output << "}}";
     }
 
     bool readPacketSizes(const std::string &path,
@@ -118,24 +226,10 @@ namespace
             return false;
         }
 
-        auto parseInteger = [](const std::string &part,
-                               uint64_t &value) -> bool
-        {
-            errno = 0;
-            char *end = nullptr;
-            const unsigned long long parsed =
-                std::strtoull(part.c_str(), &end, 0);
-            if (errno != 0 || end == part.c_str() || !end || *end != '\0')
-                return false;
-
-            value = static_cast<uint64_t>(parsed);
-            return true;
-        };
-
         uint64_t address = 0u;
         uint64_t value = 0u;
-        if (!parseInteger(text.substr(0u, equals), address) ||
-            !parseInteger(text.substr(equals + 1u), value) ||
+        if (!parseUnsigned(text.substr(0u, equals), address) ||
+            !parseUnsigned(text.substr(equals + 1u), value) ||
             address > 0xFFu)
         {
             return false;
@@ -189,7 +283,14 @@ int main(int argc, char **argv)
     std::string vramOutputPath;
     std::string packetSizesPath;
     std::string hashTracePath;
+    std::string compareVramPath;
     bool batchStream = false;
+    bool backendStats = false;
+    bool commandLimitSet = false;
+    bool packetLimitSet = false;
+    uint64_t commandLimit = 0u;
+    uint64_t packetLimit = 0u;
+    GsRendererMode rendererMode = GsRendererMode::Software;
     std::vector<std::pair<uint8_t, uint64_t>> initialRegisters;
     std::vector<std::string> packetPaths;
     for (int index = 1; index < argc; ++index)
@@ -199,12 +300,20 @@ int main(int argc, char **argv)
         {
             batchStream = true;
         }
+        else if (argument == "--backend-stats")
+        {
+            backendStats = true;
+        }
         else if (argument == "--vram-in" ||
             argument == "--vram-out" ||
             argument == "--register" ||
             argument == "--register-file" ||
             argument == "--packet-sizes" ||
-            argument == "--hash-trace")
+            argument == "--hash-trace" ||
+            argument == "--renderer" ||
+            argument == "--stop-after-command" ||
+            argument == "--stop-after-packet" ||
+            argument == "--compare-vram")
         {
             if (++index >= argc)
             {
@@ -220,6 +329,37 @@ int main(int argc, char **argv)
                 packetSizesPath = argv[index];
             else if (argument == "--hash-trace")
                 hashTracePath = argv[index];
+            else if (argument == "--compare-vram")
+                compareVramPath = argv[index];
+            else if (argument == "--renderer")
+            {
+                if (!parseRendererMode(argv[index], rendererMode))
+                {
+                    std::cerr << "invalid renderer mode: "
+                              << argv[index] << '\n';
+                    return 2;
+                }
+            }
+            else if (argument == "--stop-after-command")
+            {
+                if (!parseCount(argv[index], commandLimit))
+                {
+                    std::cerr << "invalid command limit: "
+                              << argv[index] << '\n';
+                    return 2;
+                }
+                commandLimitSet = true;
+            }
+            else if (argument == "--stop-after-packet")
+            {
+                if (!parseCount(argv[index], packetLimit))
+                {
+                    std::cerr << "invalid packet limit: "
+                              << argv[index] << '\n';
+                    return 2;
+                }
+                packetLimitSet = true;
+            }
             else if (argument == "--register-file")
             {
                 if (!readRegisterFile(argv[index], initialRegisters))
@@ -264,6 +404,23 @@ int main(int argc, char **argv)
         return 2;
     }
 
+    std::vector<uint8_t> expectedVram;
+    if (!compareVramPath.empty())
+    {
+        if (!readFile(compareVramPath, expectedVram))
+        {
+            std::cerr << "failed to read comparison GS memory: "
+                      << compareVramPath << '\n';
+            return 2;
+        }
+        if (expectedVram.size() != PS2_GS_VRAM_SIZE)
+        {
+            std::cerr << "comparison GS memory must be exactly "
+                      << PS2_GS_VRAM_SIZE << " bytes\n";
+            return 2;
+        }
+    }
+
     PS2Memory memory;
     if (!memory.initialize())
     {
@@ -274,6 +431,13 @@ int main(int argc, char **argv)
     GS gs;
     gs.init(memory.getGSVRAM(), static_cast<uint32_t>(PS2_GS_VRAM_SIZE),
             &memory.gs());
+
+    if (!gs.setRendererMode(rendererMode))
+    {
+        std::cerr << "renderer mode is unavailable: "
+                  << gsRendererModeName(rendererMode) << '\n';
+        return 2;
+    }
 
     if (!vramInputPath.empty())
     {
@@ -297,6 +461,14 @@ int main(int argc, char **argv)
 
     for (const auto &[address, value] : initialRegisters)
         gs.writeRegister(address, value);
+
+    if (backendStats)
+    {
+        gs.resetBackendCounters();
+        gs.setBackendCountersEnabled(true);
+    }
+    if (commandLimitSet)
+        gs.setDrawCommandLimit(commandLimit);
 
     if (batchStream)
         gs.beginRenderBatch();
@@ -339,6 +511,20 @@ int main(int argc, char **argv)
 
     uint64_t totalBytes = 0u;
     uint64_t packetIndex = 0u;
+    bool stopped = false;
+    bool stoppedWithinPacket = false;
+    const char *stopReason = "complete";
+    if (commandLimitSet && gs.drawCommandLimitReached())
+    {
+        stopped = true;
+        stopReason = "command-limit";
+    }
+    else if (packetLimitSet && packetLimit == 0u)
+    {
+        stopped = true;
+        stopReason = "packet-limit";
+    }
+
     auto processPacket = [&](const uint8_t *data, size_t size) -> bool
     {
         if (size > std::numeric_limits<uint32_t>::max())
@@ -360,11 +546,25 @@ int main(int argc, char **argv)
                       << std::dec << '\n';
         }
         ++packetIndex;
+        if (commandLimitSet && gs.drawCommandLimitReached())
+        {
+            stopped = true;
+            stoppedWithinPacket = true;
+            stopReason = "command-limit";
+        }
+        else if (packetLimitSet && packetIndex >= packetLimit)
+        {
+            stopped = true;
+            stopReason = "packet-limit";
+        }
         return true;
     };
 
     for (const std::string &packetPath : packetPaths)
     {
+        if (stopped)
+            break;
+
         std::vector<uint8_t> packet;
         if (!readFile(packetPath, packet))
         {
@@ -390,8 +590,10 @@ int main(int argc, char **argv)
             if (!processPacket(packet.data() + offset, size))
                 return 2;
             offset += size;
+            if (stopped)
+                break;
         }
-        if (offset != packet.size())
+        if (!stopped && offset != packet.size())
         {
             std::cerr << "packet sizes do not consume GIF stream\n";
             return 2;
@@ -399,7 +601,14 @@ int main(int argc, char **argv)
     }
 
     if (batchStream)
-        gs.flushRenderBatch();
+    {
+        gs.endRenderBatch();
+        renderBatchScope.gs = nullptr;
+    }
+
+    const VramDifference difference = expectedVram.empty()
+        ? VramDifference{}
+        : compareVram(memory.getGSVRAM(), expectedVram);
 
     if (!vramOutputPath.empty() &&
         !writeFile(vramOutputPath, memory.getGSVRAM(), PS2_GS_VRAM_SIZE))
@@ -409,11 +618,45 @@ int main(int argc, char **argv)
         return 2;
     }
 
-    std::cout << "{\"schema_version\":1,\"packets\":" << packetIndex
+    std::cout << "{\"schema_version\":1,\"renderer\":\""
+              << gsRendererModeName(gs.rendererMode())
+              << "\",\"packets\":" << packetIndex
               << ",\"bytes\":" << totalBytes
+              << ",\"commands\":" << gs.submittedDrawCommandCount()
+              << ",\"stopped\":" << (stopped ? "true" : "false")
+              << ",\"stop_reason\":\"" << stopReason << '\"'
+              << ",\"stopped_within_packet\":"
+              << (stoppedWithinPacket ? "true" : "false")
               << ",\"final_vram_fnv1a64\":\"0x"
               << std::hex << std::setw(16) << std::setfill('0')
               << fnv1a64(memory.getGSVRAM(), PS2_GS_VRAM_SIZE)
-              << "\"}\n";
-    return 0;
+              << '\"' << std::dec;
+
+    if (!expectedVram.empty())
+    {
+        std::cout << ",\"vram_matches\":"
+                  << (difference.matches ? "true" : "false");
+        if (!difference.matches)
+        {
+            std::cout << ",\"first_differing_page\":"
+                      << difference.page
+                      << ",\"first_differing_byte_offset\":"
+                      << difference.byteOffset
+                      << ",\"first_differing_page_byte_offset\":"
+                      << difference.byteOffset % GS_VRAM_PAGE_SIZE
+                      << ",\"expected_byte\":"
+                      << static_cast<uint32_t>(difference.expected)
+                      << ",\"actual_byte\":"
+                      << static_cast<uint32_t>(difference.actual);
+        }
+    }
+
+    if (backendStats)
+    {
+        std::cout << ",\"backend_counters\":";
+        writeBackendCounters(std::cout, gs.backendCounters());
+    }
+
+    std::cout << "}\n";
+    return !expectedVram.empty() && !difference.matches ? 1 : 0;
 }

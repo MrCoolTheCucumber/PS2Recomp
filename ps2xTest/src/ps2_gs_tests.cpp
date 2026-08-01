@@ -848,6 +848,99 @@ void register_ps2_gs_tests()
                 "debugger state observation should be an explicit synchronization boundary");
         });
 
+        tc.Run("GS draw command limit pauses within a GIF packet", [](TestCase &t)
+        {
+            std::vector<uint8_t> vram(PS2_GS_VRAM_SIZE, 0u);
+            GS gs;
+            gs.init(
+                vram.data(),
+                static_cast<uint32_t>(vram.size()),
+                nullptr);
+
+            auto configurePointDraws = [](GS &target)
+            {
+                target.writeRegister(GS_REG_FRAME_1, 1ull << 16u);
+                target.writeRegister(GS_REG_ZBUF_1, 1ull << 32u);
+                target.writeRegister(GS_REG_SCISSOR_1, 1ull << 16u);
+                target.writeRegister(GS_REG_TEST_1, 0x30000ull);
+                target.writeRegister(
+                    GS_REG_PRIM,
+                    static_cast<uint64_t>(GS_PRIM_POINT));
+            };
+            configurePointDraws(gs);
+
+            constexpr uint32_t kFirstColor = 0x80112233u;
+            constexpr uint32_t kSecondColor = 0x80445566u;
+            std::vector<uint8_t> packet;
+            appendU64(packet, makeGifTag(4u, GIF_FMT_PACKED, 1u));
+            appendU64(packet, 0x0Eull);
+            appendGifAd(packet, kFirstColor, GS_REG_RGBAQ);
+            appendGifAd(packet, 0ull, GS_REG_XYZ2);
+            appendGifAd(packet, kSecondColor, GS_REG_RGBAQ);
+            appendGifAd(packet, 16ull, GS_REG_XYZ2);
+
+            gs.setDrawCommandLimit(1u);
+            gs.processGIFPacket(
+                packet.data(),
+                static_cast<uint32_t>(packet.size()));
+
+            t.IsTrue(gs.drawCommandLimitReached(),
+                     "the configured draw boundary should be observable");
+            t.Equals(gs.submittedDrawCommandCount(), 1ull,
+                     "only the first complete command should be submitted");
+            t.Equals(
+                gs.ReadVram(GS_PSM_CT32, 0u, 1u, 0u, 0u),
+                kFirstColor,
+                "the boundary draw should complete before packet decoding pauses");
+            t.Equals(
+                gs.ReadVram(GS_PSM_CT32, 0u, 1u, 1u, 0u),
+                0u,
+                "registers after the boundary should not partially execute");
+
+            std::vector<uint8_t> resumePacket;
+            appendU64(
+                resumePacket,
+                makeGifTag(2u, GIF_FMT_PACKED, 1u));
+            appendU64(resumePacket, 0x0Eull);
+            appendGifAd(resumePacket, kSecondColor, GS_REG_RGBAQ);
+            appendGifAd(resumePacket, 16ull, GS_REG_XYZ2);
+
+            gs.clearDrawCommandLimit();
+            gs.processGIFPacket(
+                resumePacket.data(),
+                static_cast<uint32_t>(resumePacket.size()));
+            t.IsFalse(gs.drawCommandLimitReached(),
+                      "clearing the limit should resume packet decoding");
+            t.Equals(gs.submittedDrawCommandCount(), 2ull,
+                     "resumed decoding should submit the next command");
+            t.Equals(
+                gs.ReadVram(GS_PSM_CT32, 0u, 1u, 1u, 0u),
+                kSecondColor,
+                "resumed decoding should render subsequent commands");
+
+            std::vector<uint8_t> nativeVram(PS2_GS_VRAM_SIZE, 0u);
+            GS nativeGs;
+            nativeGs.init(
+                nativeVram.data(),
+                static_cast<uint32_t>(nativeVram.size()),
+                nullptr);
+            configurePointDraws(nativeGs);
+            nativeGs.setDrawCommandLimit(1u);
+            t.IsTrue(
+                nativeGs.processNativePackedGIFPacket(
+                    packet.data(),
+                    static_cast<uint32_t>(packet.size())),
+                "the native packed path should claim an intentional bounded stop");
+            t.IsTrue(nativeGs.drawCommandLimitReached(),
+                     "the native packed path should observe the same boundary");
+            t.Equals(nativeGs.submittedDrawCommandCount(), 1ull,
+                     "native packet decoding should stop after the boundary command");
+            t.Equals(
+                nativeGs.ReadVram(GS_PSM_CT32, 0u, 1u, 1u, 0u),
+                0u,
+                "native packet decoding should not execute the packet suffix");
+        });
+
         tc.Run("GS CSR/IMR support coherent 64-bit and 32-bit access", [](TestCase &t)
         {
             PS2Memory mem;

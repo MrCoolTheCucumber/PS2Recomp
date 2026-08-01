@@ -675,6 +675,8 @@ void GS::reset()
     m_vtxCount = 0;
     m_vtxIndex = 0;
     m_nextDrawSequence = 1u;
+    m_drawCommandLimit = UINT64_MAX;
+    m_drawCommandLimitReached = false;
     m_localToHostBuffer.clear();
     m_localToHostReadPos = 0;
     m_preferredDisplaySourceFrame = {};
@@ -1587,7 +1589,8 @@ void GS::endRenderBatch()
 void GS::processGIFPacket(const uint8_t *data, uint32_t sizeBytes)
 {
     std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
-    if (!data || sizeBytes < 16 || !m_vram)
+    if (!data || sizeBytes < 16 || !m_vram ||
+        m_drawCommandLimitReached)
         return;
 
     if (!m_debugHistoryPaused &&
@@ -1686,6 +1689,8 @@ void GS::processGIFPacket(const uint8_t *data, uint32_t sizeBytes)
                     uint64_t hi = loadLE64(data + offset + 8);
                     offset += 16;
                     writeRegisterPacked(regs[r], lo, hi);
+                    if (m_drawCommandLimitReached)
+                        return;
                 }
             }
         }
@@ -1699,6 +1704,8 @@ void GS::processGIFPacket(const uint8_t *data, uint32_t sizeBytes)
                         return;
                     writeRegister(regs[r], loadLE64(data + offset));
                     offset += 8;
+                    if (m_drawCommandLimitReached)
+                        return;
                 }
             }
             if ((nloop * nreg) & 1)
@@ -1723,6 +1730,8 @@ bool GS::processNativePackedGIFPacket(const uint8_t *data, uint32_t sizeBytes)
 
     if (!validatePackedGifPacket(data, sizeBytes))
         return false;
+    if (m_drawCommandLimitReached)
+        return true;
 
     const bool ownsDrawBatch =
         m_rasterizer.beginDrawBatch(this);
@@ -1757,13 +1766,15 @@ bool GS::processNativePackedGIFPacket(const uint8_t *data, uint32_t sizeBytes)
                 const uint64_t hi = loadLE64(data + offset + 8u);
                 offset += 16u;
                 writeRegisterPacked(tag.regs[r], lo, hi);
+                if (m_drawCommandLimitReached)
+                    return false;
             }
         }
 
         return true;
     });
 
-    if (!processed)
+    if (!processed && !m_drawCommandLimitReached)
         return false;
 
     ++m_nativePackedGIFPacketCount;
@@ -2681,10 +2692,13 @@ void GS::vertexKick(bool drawing)
     if (m_vtxCount < needed)
         return;
 
-    if (drawing)
+    if (drawing && !m_drawCommandLimitReached)
     {
         m_rasterizer.drawPrimitive(this);
         recordDrawDebugEventUnlocked(needed);
+        if (m_drawCommandLimit != UINT64_MAX &&
+            m_nextDrawSequence - 1u >= m_drawCommandLimit)
+            m_drawCommandLimitReached = true;
     }
 
     // XYZ3/XYZF3 and packed XYZ2/XYZF2 with ADC set suppress the current
@@ -3259,6 +3273,33 @@ void GS::resetBackendCounters()
 {
     std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
     m_rasterizer.resetBackendCounters();
+}
+
+void GS::setDrawCommandLimit(uint64_t maximumCommands)
+{
+    std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
+    m_drawCommandLimit = maximumCommands;
+    m_drawCommandLimitReached =
+        m_nextDrawSequence - 1u >= maximumCommands;
+}
+
+void GS::clearDrawCommandLimit()
+{
+    std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
+    m_drawCommandLimit = UINT64_MAX;
+    m_drawCommandLimitReached = false;
+}
+
+bool GS::drawCommandLimitReached() const
+{
+    std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
+    return m_drawCommandLimitReached;
+}
+
+uint64_t GS::submittedDrawCommandCount() const
+{
+    std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
+    return m_nextDrawSequence - 1u;
 }
 
 uint32_t GS::consumeLocalToHostBytes(uint8_t *dst, uint32_t maxBytes)
