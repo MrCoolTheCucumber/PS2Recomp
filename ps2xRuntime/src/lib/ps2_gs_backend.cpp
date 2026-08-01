@@ -1059,7 +1059,8 @@ GsBackendDecision classifyGsDepthCt32Sprite(
     return classifyFlatCt32State(
         command, GS_PRIM_SPRITE, 2u,
         TextureRequirement::Disabled,
-        DepthRequirement::Z32OrZ24);
+        DepthRequirement::Z32OrZ24,
+        true);
 }
 
 GsBackendDecision classifyGsNearestCt32TexturedSprite(

@@ -368,9 +368,10 @@ private:
 [[nodiscard]] GsBackendDecision classifyGsInitialCt32Sprite(
     const GsDrawCommand &command) noexcept;
 
-// Exact flat CT32 sprite subset with an enabled Z32/Z24 depth test. It keeps
-// packed Z24 read-modify-write dependencies explicit and rejects framebuffer /
-// depth aliases before a device record can be published.
+// Exact flat CT32 sprite subset with an enabled Z32/Z24 depth test. Opaque and
+// cancelling source-copy alpha writes publish the same record. Packed Z24
+// read-modify-write dependencies remain explicit, and framebuffer/depth aliases
+// are rejected before a device record can be published.
 [[nodiscard]] GsBackendDecision classifyGsDepthCt32Sprite(
     const GsDrawCommand &command) noexcept;
 

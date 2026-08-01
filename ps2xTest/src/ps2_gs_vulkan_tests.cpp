@@ -2385,6 +2385,141 @@ void register_ps2_gs_vulkan_tests()
                 "framebuffer/depth aliases should remain outside the independent kernel");
         });
 
+        tc.Run("source-copy alpha depth sprites reuse opaque depth records exactly", [](TestCase &t)
+        {
+            GSMem::InitLookupTables();
+            const std::array<GsDrawCommand, 2> opaque{{
+                makeDepthCt32SpriteCommand(
+                    30u, 112u, 8u, 216u, GS_PSM_Z24, false, 1u,
+                    {0u, 511u, 0u, 415u},
+                    {1792u * 16u, 1840u * 16u},
+                    1792u * 16u - 8u,
+                    1840u * 16u - 8u,
+                    (1792u + 32u) * 16u - 8u,
+                    (1840u + 416u) * 16u - 8u,
+                    0x80000000u, 0u),
+                makeDepthCt32SpriteCommand(
+                    31u, 40u, 2u, 200u, GS_PSM_Z32, true, 2u,
+                    {0u, 31u, 0u, 31u}, {0u, 0u},
+                    16u, 16u, 272u, 272u,
+                    0x88776655u, 0x80000000u),
+            }};
+            const auto withAlpha = [](const GsDrawCommand &command,
+                                      uint64_t sequence,
+                                      uint64_t alpha,
+                                      bool pabe = false)
+            {
+                GSPrimReg primitive = command.primitive();
+                primitive.abe = true;
+                GSContext context = command.context();
+                context.alpha = alpha;
+                GsDrawGlobalState global = command.globalState();
+                global.pabe = pabe;
+                return buildGsDrawCommand(
+                    sequence,
+                    primitive,
+                    context,
+                    std::span<const GSVertex>(command.vertices()).first(2u),
+                    global);
+            };
+            const std::array<GsDrawCommand, 2> sourceCopies{{
+                withAlpha(opaque[0], 32u, 0u),
+                // A=Cd, B=Cd, C=Ad, D=Cs with nonzero FIX and PABE.
+                withAlpha(opaque[1], 33u, 0xA500000015ull, true),
+            }};
+
+            for (size_t index = 0u; index < sourceCopies.size(); ++index)
+            {
+                GsVulkanDepthCt32Sprite opaqueRecord{};
+                t.IsTrue(
+                    prepareGsVulkanDepthCt32Sprite(
+                        opaque[index], opaqueRecord).supported,
+                    "the comparison opaque depth record should prepare");
+
+                const GsDrawResources opaqueResources =
+                    opaque[index].resources();
+                const GsDrawResources sourceResources =
+                    sourceCopies[index].resources();
+                t.IsFalse(
+                    sourceResources.framebufferReadPages.any(),
+                    "cancelling alpha must not add a framebuffer read to depth work");
+                t.IsFalse(
+                    sourceResources.readsDestination,
+                    "source-copy depth must have no effective color destination read");
+                t.IsTrue(
+                    sourceResources.depthReadPages ==
+                        opaqueResources.depthReadPages,
+                    "source-copy alpha must preserve exact depth read resources");
+                t.IsTrue(
+                    sourceResources.depthWritePages ==
+                        opaqueResources.depthWritePages,
+                    "source-copy alpha must preserve exact depth write resources");
+
+                GsVulkanDepthCt32Sprite sourceRecord{
+                    1u, 2u, 3u, 4u, 5u, 6u, 7u, 8u,
+                    9u, 10u, 11u, 12u, 13u, 14u, 15u, 16u};
+                const GsBackendDecision decision =
+                    prepareGsVulkanDepthCt32Sprite(
+                        sourceCopies[index], sourceRecord);
+                t.IsTrue(
+                    decision.supported,
+                    "source-copy alpha should reuse the exact depth contract");
+                t.Equals(
+                    decision.reason,
+                    GsFallbackReason::Supported,
+                    "accepted source-copy depth should retain the canonical reason");
+                t.IsTrue(
+                    sourceRecord == opaqueRecord,
+                    "alpha cancellation must publish the identical depth record");
+
+                std::vector<uint8_t> actual = makeVramPattern(
+                    0xA17AD000u + static_cast<uint32_t>(index));
+                std::vector<uint8_t> expected = actual;
+                applyDepthCt32SpriteCpu(expected, opaqueRecord);
+                GS gs;
+                gs.init(
+                    actual.data(),
+                    static_cast<uint32_t>(actual.size()),
+                    nullptr);
+                gs.setDebugHistoryPaused(true);
+                drawNearestCt32SpriteCommand(gs, sourceCopies[index]);
+                gs.flushRenderBatch();
+                t.IsTrue(
+                    actual == expected,
+                    "source-copy alpha plus depth must equal the opaque record over all VRAM");
+            }
+
+            const std::array<uint64_t, 3> rejectedAlpha{{
+                0x8000000044ull, // (Cs-Cd)*As/128+Cd: retained source-over.
+                0x40u,          // A=B but D=Cd: destination copy.
+                0x0Fu,          // Reserved A/B selectors remain undefined.
+            }};
+            for (uint64_t alpha : rejectedAlpha)
+            {
+                const GsDrawCommand rejected =
+                    withAlpha(opaque[0], 34u, alpha);
+                t.IsTrue(
+                    rejected.resources().framebufferReadPages.any(),
+                    "destination-dependent depth blending must retain its color read");
+                GsVulkanDepthCt32Sprite sentinel{
+                    1u, 2u, 3u, 4u, 5u, 6u, 7u, 8u,
+                    9u, 10u, 11u, 12u, 13u, 14u, 15u, 16u};
+                const GsVulkanDepthCt32Sprite expectedSentinel = sentinel;
+                const GsBackendDecision decision =
+                    prepareGsVulkanDepthCt32Sprite(rejected, sentinel);
+                t.IsFalse(
+                    decision.supported,
+                    "genuine or undefined blending must stay outside depth execution");
+                t.Equals(
+                    decision.reason,
+                    GsFallbackReason::AlphaBlend,
+                    "rejected source-over depth should retain alpha-blend reason");
+                t.IsTrue(
+                    sentinel == expectedSentinel,
+                    "rejected alpha depth preparation must preserve caller output");
+            }
+        });
+
         tc.Run("depth CT32 prepared record matches the production software GS", [](TestCase &t)
         {
             GSMem::InitLookupTables();
