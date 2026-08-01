@@ -538,8 +538,6 @@ namespace
             return false;
         }
 
-        GsVramPageMask priorReadPages;
-        GsVramPageMask priorWritePages;
         for (size_t index = 0u; index < sprites.size(); ++index)
         {
             const GsVulkanLinearCt32Sprite &sprite = sprites[index];
@@ -550,29 +548,6 @@ namespace
                         std::to_string(index) + ": " + validationError;
                 return false;
             }
-
-            const GsVramPageMask readPages =
-                linearCt32TexturePages(sprite);
-            const GsVramPageMask writePages =
-                gsVramPagesForSurfaceRect(
-                    sprite.framebufferBaseBlock,
-                    sprite.framebufferWidth,
-                    static_cast<uint8_t>(GSMem::C32),
-                    sprite.boundsX0,
-                    sprite.boundsY0,
-                    sprite.boundsX1 - sprite.boundsX0,
-                    sprite.boundsY1 - sprite.boundsY0);
-            if (priorWritePages.intersects(readPages) ||
-                priorWritePages.intersects(writePages) ||
-                priorReadPages.intersects(writePages))
-            {
-                error = "Vulkan resident linear CT32 sprite " +
-                        std::to_string(index) +
-                        " has a memory dependency on an earlier batch member";
-                return false;
-            }
-            priorReadPages.unionWith(readPages);
-            priorWritePages.unionWith(writePages);
         }
         error.clear();
         return true;
@@ -1673,7 +1648,7 @@ namespace
     static_assert(kGsCt32SpriteShaderSpv[0] == 0x07230203u);
     static_assert(sizeof(kGsCt32TriangleShaderSpv) == 10200u);
     static_assert(kGsCt32TriangleShaderSpv[0] == 0x07230203u);
-    static_assert(sizeof(kGsLinearCt32SpriteShaderSpv) == 37052u);
+    static_assert(sizeof(kGsLinearCt32SpriteShaderSpv) == 37916u);
     static_assert(kGsLinearCt32SpriteShaderSpv[0] == 0x07230203u);
     static_assert(sizeof(kGsMemoryCasesShaderSpv) == 10988u);
     static_assert(kGsMemoryCasesShaderSpv[0] == 0x07230203u);
@@ -3149,13 +3124,16 @@ namespace
             return false;
         }
 
-        constexpr uint32_t localSize = 64u;
+        constexpr uint32_t localSize = 8u;
         const uint32_t width = sprite.boundsX1 - sprite.boundsX0;
+        const uint32_t height = sprite.boundsY1 - sprite.boundsY0;
         const uint32_t groupCountX =
             (width + localSize - 1u) / localSize;
+        const uint32_t groupCountY =
+            (height + localSize - 1u) / localSize;
         return executeKernel(
             input, {}, m_linearCt32SpritePipeline,
-            groupCountX, 1u,
+            groupCountX, groupCountY,
             &sprite, sizeof(sprite), output, nullptr,
             "linear CT32 texture sprite",
             report, statistics, error);
@@ -3783,7 +3761,7 @@ namespace
         if (!validateResidentLinearCt32SpriteBatch(sprites, error))
             return false;
 
-        constexpr uint32_t localSize = 64u;
+        constexpr uint32_t localSize = 8u;
         const uint32_t validationErrorsBefore =
             m_validation.errors.load(std::memory_order_relaxed);
         if (!beginCommands(report, error))
@@ -3812,17 +3790,68 @@ namespace
             m_commandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE,
             m_pipelineLayout, 0u, 1u, &m_descriptorSet,
             0u, nullptr);
+        uint64_t dependencyBarrierCount = 0u;
+        GsVramPageMask priorReadPages;
+        GsVramPageMask priorWritePages;
         for (const GsVulkanLinearCt32Sprite &sprite : sprites)
         {
+            const GsVramPageMask readPages =
+                linearCt32TexturePages(sprite);
+            const GsVramPageMask writePages =
+                gsVramPagesForSurfaceRect(
+                    sprite.framebufferBaseBlock,
+                    sprite.framebufferWidth,
+                    static_cast<uint8_t>(GSMem::C32),
+                    sprite.boundsX0,
+                    sprite.boundsY0,
+                    sprite.boundsX1 - sprite.boundsX0,
+                    sprite.boundsY1 - sprite.boundsY0);
+            const bool hasDependency =
+                priorWritePages.intersects(readPages) ||
+                priorWritePages.intersects(writePages) ||
+                priorReadPages.intersects(writePages);
+            if (hasDependency)
+            {
+                VkBufferMemoryBarrier dependencyBarrier{};
+                dependencyBarrier.sType =
+                    VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
+                dependencyBarrier.srcAccessMask =
+                    VK_ACCESS_SHADER_READ_BIT |
+                    VK_ACCESS_SHADER_WRITE_BIT;
+                dependencyBarrier.dstAccessMask =
+                    VK_ACCESS_SHADER_READ_BIT |
+                    VK_ACCESS_SHADER_WRITE_BIT;
+                dependencyBarrier.srcQueueFamilyIndex =
+                    VK_QUEUE_FAMILY_IGNORED;
+                dependencyBarrier.dstQueueFamilyIndex =
+                    VK_QUEUE_FAMILY_IGNORED;
+                dependencyBarrier.buffer = m_vram.buffer;
+                dependencyBarrier.offset = 0u;
+                dependencyBarrier.size = GS_VULKAN_VRAM_SIZE;
+                m_functions.cmdPipelineBarrier(
+                    m_commandBuffer,
+                    VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                    VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                    0u, 0u, nullptr, 1u, &dependencyBarrier,
+                    0u, nullptr);
+                ++dependencyBarrierCount;
+                priorReadPages.clear();
+                priorWritePages.clear();
+            }
             const uint32_t groupCountX =
                 (sprite.boundsX1 - sprite.boundsX0 +
+                 localSize - 1u) / localSize;
+            const uint32_t groupCountY =
+                (sprite.boundsY1 - sprite.boundsY0 +
                  localSize - 1u) / localSize;
             m_functions.cmdPushConstants(
                 m_commandBuffer, m_pipelineLayout,
                 VK_SHADER_STAGE_COMPUTE_BIT, 0u,
                 sizeof(sprite), &sprite);
             m_functions.cmdDispatch(
-                m_commandBuffer, groupCountX, 1u, 1u);
+                m_commandBuffer, groupCountX, groupCountY, 1u);
+            priorReadPages.unionWith(readPages);
+            priorWritePages.unionWith(writePages);
         }
 
         VkBufferMemoryBarrier completeBarrier{};
@@ -3843,7 +3872,7 @@ namespace
 
         if (!submitCommands(
                 "resident linear CT32 sprite batch",
-                sprites.size(), 2u, 1u,
+                sprites.size(), 2u + dependencyBarrierCount, 1u,
                 report, statistics, error) ||
             !finishOperation(
                 "resident linear CT32 sprite batch",

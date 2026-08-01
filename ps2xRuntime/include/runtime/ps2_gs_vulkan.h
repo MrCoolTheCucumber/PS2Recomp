@@ -680,8 +680,9 @@ public:
         std::span<const GsVulkanNearestCt32Sprite> sprites,
         std::string *error = nullptr) override;
 
-    // Records a bounded linear-texture batch against resident raw VRAM with
-    // the same pairwise dependency contract as nearest texture batches.
+    // Records a bounded linear-texture batch against resident raw VRAM.
+    // Records execute in guest order; the service inserts barriers between
+    // dependent dispatch segments while allowing independent work to batch.
     [[nodiscard]] bool executeResidentLinearCt32Sprite(
         const GsVulkanLinearCt32Sprite &sprite,
         std::string *error = nullptr) override;

@@ -3,10 +3,11 @@
 
 #include "ps2_gs_memory.glsl"
 
-// One invocation owns one destination column. Keeping the complete Y walk in
-// one invocation preserves the software renderer's sequential binary32
-// fixedScanV += fixedStepV recurrence exactly.
-layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+// Each 8x8 workgroup reconstructs the exact sequential binary32 V recurrence
+// for its row tile in one lane, then shades all 64 destination pixels in
+// parallel. Replaying the recurrence from its original seed preserves the
+// software renderer's independently rounded fixedScanV += fixedStepV values.
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
 
 layout(set = 0, binding = 0, std430) buffer GsVram
 {
@@ -43,6 +44,8 @@ layout(push_constant) uniform LinearTextureSpriteParameters
     uint texture_wrap_u;
     uint texture_wrap_v;
 } sprite;
+
+shared float fixed_v_rows[8];
 
 int fixed_lane_u(uint lane)
 {
@@ -104,12 +107,34 @@ uint read_ct32(uint u, uint v)
 
 void main()
 {
+    if (gl_LocalInvocationIndex == 0u)
+    {
+        precise float fixed_scan_v =
+            uintBitsToFloat(sprite.fixed_scan_v_bits);
+        precise float fixed_step_v =
+            uintBitsToFloat(sprite.fixed_step_v_bits);
+        uint tile_y = gl_WorkGroupID.y * 8u;
+        for (uint offset_y = 0u; offset_y < tile_y; ++offset_y)
+        {
+            fixed_scan_v = fixed_scan_v + fixed_step_v;
+        }
+        for (uint row = 0u; row < 8u; ++row)
+        {
+            fixed_v_rows[row] = fixed_scan_v;
+            fixed_scan_v = fixed_scan_v + fixed_step_v;
+        }
+    }
+    barrier();
+
     uint offset_x = gl_GlobalInvocationID.x;
+    uint offset_y = gl_GlobalInvocationID.y;
     uint width = sprite.bounds_x1 - sprite.bounds_x0;
-    if (offset_x >= width)
+    uint height = sprite.bounds_y1 - sprite.bounds_y0;
+    if (offset_x >= width || offset_y >= height)
         return;
 
     uint x = sprite.bounds_x0 + offset_x;
+    uint y = sprite.bounds_y0 + offset_y;
     uint aligned_draw_x = sprite.bounds_x0 & ~7u;
     uint block = (x - aligned_draw_x) / 8u;
     uint fixed_u_bits =
@@ -123,55 +148,46 @@ void main()
         ? u0
         : (u0 + 1u) & sprite.texture_mask_u;
 
-    precise float fixed_scan_v = uintBitsToFloat(sprite.fixed_scan_v_bits);
-    precise float fixed_step_v = uintBitsToFloat(sprite.fixed_step_v_bits);
-    for (uint y = sprite.bounds_y0; y < sprite.bounds_y1; ++y)
-    {
-        int fixed_v = int(fixed_scan_v);
-        uint fixed_v_bits = uint(fixed_v);
-        uint weight_v = (fixed_v_bits >> 12u) & 0x0fu;
-        uint v0 = uint(floor_fixed_16_16(fixed_v)) & sprite.texture_mask_v;
-        uint v1 = weight_v == 0u
-            ? v0
-            : (v0 + 1u) & sprite.texture_mask_v;
+    int fixed_v = int(fixed_v_rows[gl_LocalInvocationID.y]);
+    uint fixed_v_bits = uint(fixed_v);
+    uint weight_v = (fixed_v_bits >> 12u) & 0x0fu;
+    uint v0 = uint(floor_fixed_16_16(fixed_v)) & sprite.texture_mask_v;
+    uint v1 = weight_v == 0u
+        ? v0
+        : (v0 + 1u) & sprite.texture_mask_v;
 
-        uint c00 = read_ct32(u0, v0);
-        uint color = c00;
-        if (weight_u == 0u)
-        {
-            if (weight_v != 0u)
-            {
-                color = linear_color_4(
-                    c00, read_ct32(u0, v1), weight_v);
-            }
-        }
-        else if (weight_v == 0u)
+    uint c00 = read_ct32(u0, v0);
+    uint color = c00;
+    if (weight_u == 0u)
+    {
+        if (weight_v != 0u)
         {
             color = linear_color_4(
-                c00, read_ct32(u1, v0), weight_u);
+                c00, read_ct32(u0, v1), weight_v);
         }
-        else
-        {
-            uint top = linear_color_4(
-                c00, read_ct32(u1, v0), weight_u);
-            uint bottom = linear_color_4(
-                read_ct32(u0, v1), read_ct32(u1, v1), weight_u);
-            color = linear_color_4(top, bottom, weight_v);
-        }
-
-        uint framebuffer_bit_address = gs_pixel_bit_address(
-            0x00u,
-            sprite.framebuffer_base_block,
-            sprite.framebuffer_width,
-            x,
-            y);
-        uint framebuffer_word_index =
-            (framebuffer_bit_address >> 5u) &
-            (GS_MEMORY_WORD_COUNT - 1u);
-        atomicExchange(gs_vram.words[framebuffer_word_index], color);
-
-        // `precise` forces an independently rounded FAdd (NoContraction in
-        // SPIR-V), matching the prepared software DDA one scanline at a time.
-        fixed_scan_v = fixed_scan_v + fixed_step_v;
     }
+    else if (weight_v == 0u)
+    {
+        color = linear_color_4(
+            c00, read_ct32(u1, v0), weight_u);
+    }
+    else
+    {
+        uint top = linear_color_4(
+            c00, read_ct32(u1, v0), weight_u);
+        uint bottom = linear_color_4(
+            read_ct32(u0, v1), read_ct32(u1, v1), weight_u);
+        color = linear_color_4(top, bottom, weight_v);
+    }
+
+    uint framebuffer_bit_address = gs_pixel_bit_address(
+        0x00u,
+        sprite.framebuffer_base_block,
+        sprite.framebuffer_width,
+        x,
+        y);
+    uint framebuffer_word_index =
+        (framebuffer_bit_address >> 5u) &
+        (GS_MEMORY_WORD_COUNT - 1u);
+    atomicExchange(gs_vram.words[framebuffer_word_index], color);
 }

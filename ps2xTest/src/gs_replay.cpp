@@ -70,6 +70,7 @@ namespace
                "[--vulkan-max-resident-batch COUNT] "
                "[--vulkan-min-hybrid-pixels COUNT] "
                "[--vulkan-min-hybrid-nearest-ct32-pixels COUNT] "
+               "[--vulkan-min-hybrid-linear-ct32-pixels COUNT] "
                "[--vulkan-min-hybrid-triangle-pixels COUNT] "
                "[--vulkan-validation] [--vulkan-loader FILE] "
                "[--vulkan-vendor ID] [--vulkan-device ID] "
@@ -389,6 +390,18 @@ namespace
                << statistics.residentNearestCt32SpriteBatchesFailed
                << ",\"largest_resident_nearest_ct32_sprite_batch\":"
                << statistics.largestResidentNearestCt32SpriteBatch
+               << ",\"linear_ct32_sprite_draws_completed\":"
+               << statistics.linearCt32SpriteDrawsCompleted
+               << ",\"linear_ct32_sprite_draws_failed\":"
+               << statistics.linearCt32SpriteDrawsFailed
+               << ",\"linear_ct32_sprite_pixels_executed\":"
+               << statistics.linearCt32SpritePixelsExecuted
+               << ",\"resident_linear_ct32_sprite_batches_completed\":"
+               << statistics.residentLinearCt32SpriteBatchesCompleted
+               << ",\"resident_linear_ct32_sprite_batches_failed\":"
+               << statistics.residentLinearCt32SpriteBatchesFailed
+               << ",\"largest_resident_linear_ct32_sprite_batch\":"
+               << statistics.largestResidentLinearCt32SpriteBatch
                << ",\"triangle_draws_completed\":"
                << statistics.triangleDrawsCompleted
                << ",\"triangle_draws_failed\":"
@@ -792,6 +805,7 @@ int main(int argc, char **argv)
             argument == "--vulkan-max-resident-batch" ||
             argument == "--vulkan-min-hybrid-pixels" ||
             argument == "--vulkan-min-hybrid-nearest-ct32-pixels" ||
+            argument == "--vulkan-min-hybrid-linear-ct32-pixels" ||
             argument == "--vulkan-min-hybrid-triangle-pixels" ||
             argument == "--vulkan-loader" ||
             argument == "--vulkan-vendor" ||
@@ -887,6 +901,26 @@ int main(int argc, char **argv)
                     return 2;
                 }
                 vulkanBackendConfig.minimumHybridNearestCt32SpritePixels =
+                    minimum;
+                vulkanOptionUsed = true;
+                replayOptionUsed = true;
+                gifReplayOptionUsed = true;
+            }
+            else if (argument ==
+                     "--vulkan-min-hybrid-linear-ct32-pixels")
+            {
+                uint64_t minimum = 0u;
+                constexpr uint64_t maximumPixels = 2048ull * 2048ull;
+                if (!parseCount(argv[index], minimum) ||
+                    minimum > maximumPixels)
+                {
+                    std::cerr
+                        << "Vulkan hybrid linear CT32 pixel threshold "
+                           "must be between 0 and "
+                        << maximumPixels << '\n';
+                    return 2;
+                }
+                vulkanBackendConfig.minimumHybridLinearCt32SpritePixels =
                     minimum;
                 vulkanOptionUsed = true;
                 replayOptionUsed = true;

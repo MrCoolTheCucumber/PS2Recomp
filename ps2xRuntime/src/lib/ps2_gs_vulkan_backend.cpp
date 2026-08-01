@@ -922,10 +922,14 @@ GsBackendDecision GsVulkanRasterBackend::classify(
             return textureDecision;
         }
 
-        // Hybrid remains closed until the resident linear path has an
-        // independently measured cost threshold.
-        if (m_impl->config.mode == GsRendererMode::Hybrid)
+        const uint64_t textureFilter = command.context().tex1;
+        const bool requestsExactLinearFilter =
+            ((textureFilter >> 2u) & 0x7u) == 0u &&
+            ((textureFilter >> 5u) & 0x1u) == 1u &&
+            ((textureFilter >> 6u) & 0x7u) == 1u;
+        if (!requestsExactLinearFilter)
             return textureDecision;
+
         GsVulkanLinearCt32Sprite linearSprite{};
         const GsBackendDecision linearDecision =
             prepareGsVulkanLinearCt32Sprite(command, linearSprite);
@@ -933,6 +937,21 @@ GsBackendDecision GsVulkanRasterBackend::classify(
             return linearDecision;
         if (!m_impl->exactLinearCt32Sprite)
             return {false, GsFallbackReason::BackendUnavailable};
+        if (m_impl->config.mode == GsRendererMode::Hybrid)
+        {
+            const uint32_t columns =
+                linearSprite.boundsX1 - linearSprite.boundsX0;
+            const uint64_t pixels =
+                static_cast<uint64_t>(columns) *
+                static_cast<uint64_t>(
+                    linearSprite.boundsY1 - linearSprite.boundsY0);
+            if (m_impl->config.minimumHybridLinearCt32SpritePixels != 0u &&
+                pixels <
+                    m_impl->config.minimumHybridLinearCt32SpritePixels)
+            {
+                return {false, GsFallbackReason::CostModel};
+            }
+        }
         return linearDecision;
     }
 
@@ -1169,7 +1188,9 @@ void GsVulkanRasterBackend::submit(
                     resources.writePages) ||
                 m_impl->pendingResidentReadPages.intersects(
                     resources.writePages);
-            if (hasDependency)
+            const bool ordersDependenciesInBatch =
+                pipeline == Impl::ResidentPipeline::LinearCt32Sprite;
+            if (hasDependency && !ordersDependenciesInBatch)
             {
                 m_impl->drainPendingResidentCommands(
                     GsFlushReason::ResourceHazard);

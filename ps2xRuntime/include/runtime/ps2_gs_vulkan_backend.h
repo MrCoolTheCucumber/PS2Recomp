@@ -24,6 +24,9 @@ struct GsVulkanRasterBackendConfig
     uint64_t minimumHybridSpritePixels = 64u;
     // Nearest texture work is the exact clipped sample/write rectangle.
     uint64_t minimumHybridNearestCt32SpritePixels = 8'192u;
+    // Linear texture work is the exact clipped sample/write rectangle. Zero
+    // disables the policy; tiled execution preserves the binary32 V DDA.
+    uint64_t minimumHybridLinearCt32SpritePixels = 131'072u;
     // Triangle work is the conservative clipped bounding box dispatched by the
     // compute kernel, including samples rejected by its exact edge tests.
     uint64_t minimumHybridTriangleCandidatePixels = 32'768u;

@@ -4530,6 +4530,149 @@ void register_ps2_gs_vulkan_tests()
             }
         });
 
+        tc.Run("Vulkan hybrid linear CT32 cost policy uses exact work", [](TestCase &t)
+        {
+            GSMem::InitLookupTables();
+            constexpr uint64_t thresholdPixels = 131'072u;
+            constexpr uint32_t width = 136u;
+            const auto makeCommand = [](uint64_t sequence, uint32_t height)
+            {
+                return makeLinearCt32RepeatSpriteCommand(
+                    sequence, 0u, 3u, 400u * 32u, 1u, 6u, 5u,
+                    {0u, static_cast<uint16_t>(width - 1u),
+                     0u, static_cast<uint16_t>(height - 1u)},
+                    {0u, 0u},
+                    {0u, static_cast<uint16_t>(width * 16u)},
+                    {0u, static_cast<uint16_t>(height * 16u)},
+                    {3u, static_cast<uint16_t>(width * 16u + 3u)},
+                    {5u, static_cast<uint16_t>(height * 16u + 5u)});
+            };
+            const GsDrawCommand belowThreshold = makeCommand(305u, 963u);
+            const GsDrawCommand admitted = makeCommand(306u, 964u);
+
+            std::array<GsVulkanLinearCt32Sprite, 2> prepared{};
+            const std::array<const GsDrawCommand *, 2> commands{{
+                &belowThreshold, &admitted,
+            }};
+            for (size_t index = 0u; index < commands.size(); ++index)
+            {
+                t.IsTrue(
+                    prepareGsVulkanLinearCt32Sprite(
+                        *commands[index], prepared[index]).supported,
+                    "every linear cost fixture should be semantically eligible");
+            }
+            const auto pixels = [](const GsVulkanLinearCt32Sprite &sprite)
+            {
+                return static_cast<uint64_t>(
+                           sprite.boundsX1 - sprite.boundsX0) *
+                       static_cast<uint64_t>(
+                           sprite.boundsY1 - sprite.boundsY0);
+            };
+            t.Equals(pixels(prepared[0]), 130'968ull,
+                     "the smaller fixture should be 104 pixels below policy");
+            t.Equals(pixels(prepared[1]), 131'104ull,
+                     "the first integral row above policy should be admitted");
+
+            std::vector<uint8_t> vram = makeVramPattern(0x4C48434Fu);
+            std::vector<uint8_t> expected = vram;
+            applyLinearCt32SpriteCpu(expected, prepared[1]);
+            uint64_t softwareCalls = 0u;
+            uint64_t commitCalls = 0u;
+            GsVulkanRasterBackendConfig config{};
+            config.mode = GsRendererMode::Hybrid;
+            t.Equals(config.minimumHybridLinearCt32SpritePixels,
+                     thresholdPixels,
+                     "the measured linear work threshold should be the default");
+            std::unique_ptr<GsVulkanRasterBackend> backend =
+                GsVulkanRasterBackend::createWithExecutor(
+                    std::make_unique<FakeCt32Executor>(
+                        FakeCt32Executor::Behavior::Exact),
+                    config, vram,
+                    [&](const GsDrawCommand &) { ++softwareCalls; },
+                    [&](const GsDrawCommand &) { ++commitCalls; }, nullptr);
+            t.IsNotNull(backend.get(),
+                        "an exact executor should create Hybrid linear policy");
+            if (!backend)
+                return;
+
+            t.Equals(backend->classify(belowThreshold).reason,
+                     GsFallbackReason::CostModel,
+                     "insufficient linear work should stay on the CPU");
+            t.IsTrue(backend->classify(admitted).supported,
+                     "the measured linear envelope should use the GPU");
+            t.IsTrue(backend->setMode(GsRendererMode::GpuStrict),
+                     "the fixture should switch to strict mode");
+            t.IsTrue(backend->classify(belowThreshold).supported,
+                     "strict mode should ignore linear cost policy");
+            t.IsTrue(backend->setMode(GsRendererMode::Verify),
+                     "the fixture should switch to Verify mode");
+            t.IsTrue(backend->classify(belowThreshold).supported,
+                     "Verify should exercise every semantic linear candidate");
+            t.IsTrue(backend->setMode(GsRendererMode::Hybrid),
+                     "the fixture should restore Hybrid linear routing");
+
+            backend->submit(std::span<const GsDrawCommand>(&admitted, 1u));
+            t.Equals(backend->pendingCommandCount(), size_t{1u},
+                     "the admitted linear draw should remain resident");
+            backend->flush(GsFlushReason::Explicit);
+            backend->prepareCpuVramAccess(
+                admitted.resources().writePages,
+                GsFlushReason::CpuReadback);
+            t.IsTrue(vram == expected,
+                     "the admitted Hybrid linear draw should remain byte-exact");
+            t.Equals(softwareCalls, 0ull,
+                     "an admitted Hybrid linear draw must not call the oracle");
+            t.Equals(commitCalls, 1ull,
+                     "the admitted Hybrid linear draw should commit once");
+            const GsVulkanServiceStatistics service =
+                backend->serviceStatistics();
+            t.Equals(service.linearCt32SpriteDrawsCompleted, 1ull,
+                     "the admitted Hybrid draw should reach the linear executor");
+            t.Equals(service.residentLinearCt32SpriteBatchesCompleted, 1ull,
+                     "the admitted Hybrid draw should use one resident batch");
+
+            std::vector<uint8_t> unavailableVram =
+                makeVramPattern(0x4C484355u);
+            std::unique_ptr<GsVulkanRasterBackend> unavailable =
+                GsVulkanRasterBackend::createWithExecutor(
+                    std::make_unique<FakeCt32Executor>(
+                        FakeCt32Executor::Behavior::Exact,
+                        true, true, false),
+                    config, unavailableVram,
+                    [](const GsDrawCommand &) {}, {}, nullptr);
+            t.IsNotNull(unavailable.get(),
+                        "a base-capable executor should retain linear fallback");
+            if (unavailable)
+            {
+                t.Equals(unavailable->classify(belowThreshold).reason,
+                         GsFallbackReason::BackendUnavailable,
+                         "missing linear capability should precede cost policy");
+                t.Equals(
+                    unavailable->serviceStatistics()
+                        .linearCt32SpriteDrawsFailed,
+                    0ull,
+                    "capability fallback must not post linear work");
+            }
+
+            GsVulkanRasterBackendConfig disabledConfig = config;
+            disabledConfig.minimumHybridLinearCt32SpritePixels = 0u;
+            std::vector<uint8_t> disabledVram =
+                makeVramPattern(0x4C48435Au);
+            std::unique_ptr<GsVulkanRasterBackend> disabled =
+                GsVulkanRasterBackend::createWithExecutor(
+                    std::make_unique<FakeCt32Executor>(
+                        FakeCt32Executor::Behavior::Exact),
+                    disabledConfig, disabledVram,
+                    [](const GsDrawCommand &) {}, {}, nullptr);
+            t.IsNotNull(disabled.get(),
+                        "a zero-threshold Hybrid linear backend should construct");
+            if (disabled)
+            {
+                t.IsTrue(disabled->classify(belowThreshold).supported,
+                         "zero should disable the Hybrid linear cost policy");
+            }
+        });
+
         tc.Run("Vulkan hybrid triangle cost policy uses candidate bounds", [](TestCase &t)
         {
             GSMem::InitLookupTables();
@@ -6674,6 +6817,168 @@ void register_ps2_gs_vulkan_tests()
                      "real Hybrid texture routing should remain validation-clean");
             t.Equals(service.validationWarnings, 0u,
                      "real Hybrid texture routing should emit no validation warnings");
+        });
+
+        tc.Run("GS Vulkan Hybrid qualifies linear CT32 textures at measured work", [](TestCase &t)
+        {
+            GSMem::InitLookupTables();
+            constexpr uint64_t thresholdPixels = 131'072u;
+            constexpr uint32_t width = 136u;
+            const auto makeCommand = [](
+                uint64_t sequence, uint32_t height,
+                uint16_t uFraction = 3u)
+            {
+                return makeLinearCt32RepeatSpriteCommand(
+                    sequence, 0u, 3u, 400u * 32u, 1u, 6u, 5u,
+                    {0u, static_cast<uint16_t>(width - 1u),
+                     0u, static_cast<uint16_t>(height - 1u)},
+                    {0u, 0u},
+                    {0u, static_cast<uint16_t>(width * 16u)},
+                    {0u, static_cast<uint16_t>(height * 16u)},
+                    {uFraction,
+                     static_cast<uint16_t>(width * 16u + uFraction)},
+                    {5u, static_cast<uint16_t>(height * 16u + 5u)});
+            };
+            const GsDrawCommand belowThreshold = makeCommand(97u, 963u);
+            const GsDrawCommand admittedA = makeCommand(98u, 964u);
+            const GsDrawCommand admittedB = makeCommand(99u, 964u, 11u);
+            GsVulkanLinearCt32Sprite belowPrepared{};
+            GsVulkanLinearCt32Sprite admittedPrepared{};
+            t.IsTrue(
+                prepareGsVulkanLinearCt32Sprite(
+                    belowThreshold, belowPrepared).supported,
+                "the real below-threshold linear fixture should be eligible");
+            t.IsTrue(
+                prepareGsVulkanLinearCt32Sprite(
+                    admittedA, admittedPrepared).supported,
+                "the real admitted linear fixture should be eligible");
+            const auto pixels = [](const GsVulkanLinearCt32Sprite &sprite)
+            {
+                return static_cast<uint64_t>(
+                           sprite.boundsX1 - sprite.boundsX0) *
+                       static_cast<uint64_t>(
+                           sprite.boundsY1 - sprite.boundsY0);
+            };
+            t.Equals(pixels(belowPrepared), 130'968ull,
+                     "the real fallback should remain below measured work");
+            t.Equals(pixels(admittedPrepared), 131'104ull,
+                     "the first integral admitted row should clear measured work");
+
+            std::vector<uint8_t> softwareVram =
+                makeVramPattern(0x4C484759u);
+            std::vector<uint8_t> acceleratedVram = softwareVram;
+            GS software;
+            GS accelerated;
+            software.init(
+                softwareVram.data(),
+                static_cast<uint32_t>(softwareVram.size()), nullptr);
+            accelerated.init(
+                acceleratedVram.data(),
+                static_cast<uint32_t>(acceleratedVram.size()), nullptr);
+
+            GsVulkanCapabilityReport preflight{};
+            const GsVulkanServiceConfig serviceConfig =
+                makeRendererServiceConfig(preflight);
+            GsVulkanRasterBackendConfig backendConfig{};
+            t.Equals(backendConfig.minimumHybridLinearCt32SpritePixels,
+                     thresholdPixels,
+                     "the integrated linear fixture should use measured work");
+            t.IsTrue(accelerated.configureVulkanRenderer(
+                         serviceConfig, backendConfig),
+                     "the Hybrid linear fixture should accept Vulkan configuration");
+            if (!preflight.ready())
+            {
+                t.IsFalse(accelerated.setRendererMode(
+                              GsRendererMode::Hybrid),
+                          "an unavailable host should decline linear Hybrid cleanly");
+                return;
+            }
+
+            const GsVulkanDeviceReport *selected =
+                preflight.selectedDevice();
+            t.IsNotNull(selected,
+                        "a ready Hybrid linear preflight should select one device");
+            if (!selected)
+                return;
+            t.IsTrue(selected->exactLinearCt32Sprite,
+                     "the selected device should expose exact linear textures");
+            if (!selected->exactLinearCt32Sprite)
+                return;
+
+            t.IsTrue(accelerated.setRendererMode(GsRendererMode::Hybrid),
+                     "the qualified host should enter linear Hybrid mode");
+            if (accelerated.rendererMode() != GsRendererMode::Hybrid)
+                return;
+            accelerated.setBackendCountersEnabled(true);
+            accelerated.resetBackendCounters();
+
+            drawNearestCt32SpriteCommand(software, belowThreshold);
+            drawNearestCt32SpriteCommand(accelerated, belowThreshold);
+            drawNearestCt32SpriteCommand(software, admittedA);
+            drawNearestCt32SpriteCommand(accelerated, admittedA);
+            drawNearestCt32SpriteCommand(software, admittedB);
+            drawNearestCt32SpriteCommand(accelerated, admittedB);
+
+            GsBackendCounters counters = accelerated.backendCounters();
+            t.Equals(counters.queueDepth, 2ull,
+                     "ordered admitted linear draws should remain resident together");
+            t.Equals(counters.softwareCommands, 1ull,
+                     "the smaller linear draw should execute in software");
+            t.Equals(counters.acceleratedCommands, 2ull,
+                     "both measured linear draws should route to Vulkan");
+
+            (void)software.getDebugSnapshot();
+            (void)accelerated.getDebugSnapshot();
+            t.IsTrue(acceleratedVram == softwareVram,
+                     "mixed Hybrid linear routing should match all 4 MiB");
+
+            counters = accelerated.backendCounters();
+            t.Equals(counters.commands, 3ull,
+                     "Hybrid should classify all three linear fixtures");
+            t.Equals(counters.fallbackCommands, 1ull,
+                     "the smaller linear draw should record one fallback");
+            t.Equals(counters.softwarePixels, 130'968ull,
+                     "software accounting should retain sub-threshold work");
+            t.Equals(counters.acceleratedPixels, 262'208ull,
+                     "accelerated accounting should retain both admitted draws");
+            t.Equals(counters.decisions[static_cast<size_t>(
+                         GsFallbackReason::CostModel)],
+                     1ull,
+                     "Hybrid should retain one named linear cost decision");
+            t.Equals(counters.decisions[static_cast<size_t>(
+                         GsFallbackReason::Supported)],
+                     2ull,
+                     "Hybrid should retain two supported linear decisions");
+
+            const GsVulkanRasterBackendStatistics backend =
+                accelerated.vulkanRendererBackendStatistics();
+            t.Equals(backend.commandsAttempted, 2ull,
+                     "linear cost fallback must not reach the backend");
+            t.Equals(backend.committedGpuCommands, 2ull,
+                     "both admitted linear draws should publish once");
+            t.Equals(backend.residentCommands, 2ull,
+                     "both admitted linear draws should remain resident");
+            t.Equals(backend.resourceHazardDrains, 0ull,
+                     "ordered linear writes should not force a queue drain");
+            t.Equals(backend.coherency.rejectedTransitions, 0ull,
+                     "mixed linear routing should preserve page ownership");
+
+            const GsVulkanServiceStatistics service =
+                accelerated.vulkanRendererServiceStatistics();
+            t.Equals(service.linearCt32SpriteDrawsCompleted, 2ull,
+                     "the service should execute both admitted linear draws");
+            t.Equals(service.linearCt32SpritePixelsExecuted, 262'208ull,
+                     "the service should retain both admitted pixel counts");
+            t.Equals(service.residentLinearCt32SpriteBatchesCompleted, 1ull,
+                     "ordered linear writes should use one service batch");
+            t.Equals(service.largestResidentLinearCt32SpriteBatch, 2ull,
+                     "the real linear cost fixture should expose batch size two");
+            t.Equals(service.nearestCt32SpriteDrawsCompleted, 0ull,
+                     "linear Hybrid must not alias nearest execution");
+            t.Equals(service.validationErrors, 0u,
+                     "real Hybrid linear routing should remain validation-clean");
+            t.Equals(service.validationWarnings, 0u,
+                     "real Hybrid linear routing should emit no warnings");
         });
 
         tc.Run("GS Vulkan routes nearest CT32 texture sprites in strict mode", [](TestCase &t)
@@ -10693,16 +10998,6 @@ void register_ps2_gs_vulkan_tests()
                 t.IsFalse(operationError.empty(),
                           label + " should retain a diagnostic");
             };
-            const auto expectDependencyRejected =
-                [&](std::span<const GsVulkanLinearCt32Sprite> rejected,
-                    const std::string &label)
-            {
-                expectRejected(rejected, label);
-                t.IsTrue(
-                    operationError.find("memory dependency") !=
-                        std::string::npos,
-                    label + " should identify an inter-draw dependency");
-            };
             expectRejected({}, "empty resident linear batch");
             std::vector<GsVulkanLinearCt32Sprite> oversized(
                 GS_VULKAN_MAX_RESIDENT_LINEAR_CT32_BATCH + 1u,
@@ -10711,31 +11006,6 @@ void register_ps2_gs_vulkan_tests()
             std::vector<GsVulkanLinearCt32Sprite> invalid = sprites;
             invalid[2].textureWrapU |= 1u << 31u;
             expectRejected(invalid, "invalid resident linear batch member");
-
-            const std::array<GsVulkanLinearCt32Sprite, 2> writeWrite{{
-                sprites.front(), sprites.front(),
-            }};
-            expectDependencyRejected(
-                writeWrite, "write/write-dependent linear batch");
-
-            GsVulkanLinearCt32Sprite writeThenRead = sprites[1];
-            writeThenRead.textureBaseBlock =
-                sprites.front().framebufferBaseBlock;
-            const std::array<GsVulkanLinearCt32Sprite, 2> writeRead{{
-                sprites.front(), writeThenRead,
-            }};
-            expectDependencyRejected(
-                writeRead, "write/read-dependent linear batch");
-
-            GsVulkanLinearCt32Sprite readThenWrite = sprites[1];
-            readThenWrite.framebufferBaseBlock =
-                sprites.front().textureBaseBlock;
-            readThenWrite.textureBaseBlock = 60u * 32u;
-            const std::array<GsVulkanLinearCt32Sprite, 2> readWrite{{
-                sprites.front(), readThenWrite,
-            }};
-            expectDependencyRejected(
-                readWrite, "read/write-dependent linear batch");
 
             const GsVulkanServiceStatistics afterRejections =
                 service->statistics();
@@ -10847,6 +11117,66 @@ void register_ps2_gs_vulkan_tests()
                      "the completed resident linear batch should be observable");
             t.IsTrue(actual == expected,
                      "one resident linear batch must match sequential CPU draws exactly");
+
+            GsVulkanLinearCt32Sprite secondWrite = sprites.front();
+            secondWrite.fixedBaseU += 65'536;
+            GsVulkanLinearCt32Sprite writeThenRead = sprites[1];
+            writeThenRead.textureBaseBlock =
+                sprites.front().framebufferBaseBlock;
+            GsVulkanLinearCt32Sprite readThenWrite = sprites[1];
+            readThenWrite.framebufferBaseBlock =
+                sprites.front().textureBaseBlock;
+            readThenWrite.textureBaseBlock = 60u * 32u;
+            const std::array<GsVulkanLinearCt32Sprite, 4> ordered{{
+                sprites.front(), secondWrite,
+                writeThenRead, readThenWrite,
+            }};
+            std::vector<uint8_t> orderedExpected = initial;
+            for (const GsVulkanLinearCt32Sprite &sprite : ordered)
+                applyLinearCt32SpriteCpu(orderedExpected, sprite);
+            operationError.clear();
+            t.IsTrue(service->uploadVramPages(
+                         initial, allPages, &operationError),
+                     "the ordered linear fixture should restore resident VRAM");
+            if (!operationError.empty())
+                t.Fail("ordered linear batch upload failed: " + operationError);
+
+            const GsVulkanServiceStatistics beforeOrdered =
+                service->statistics();
+            operationError.clear();
+            t.IsTrue(service->executeResidentLinearCt32Sprites(
+                         ordered, &operationError),
+                     "dependent linear draws should execute in guest order");
+            t.IsTrue(operationError.empty(),
+                     "ordered dependent execution should clear its diagnostic");
+            const GsVulkanServiceStatistics afterOrdered =
+                service->statistics();
+            t.Equals(afterOrdered.queueSubmissions -
+                         beforeOrdered.queueSubmissions,
+                     1ull,
+                     "one ordered linear batch should submit once");
+            t.Equals(afterOrdered.shaderDispatches -
+                         beforeOrdered.shaderDispatches,
+                     static_cast<uint64_t>(ordered.size()),
+                     "ordered batching should retain one dispatch per draw");
+            t.Equals(afterOrdered.pipelineBarriers -
+                         beforeOrdered.pipelineBarriers,
+                     4ull,
+                     "two dependencies should add two barriers to the batch envelope");
+            t.Equals(afterOrdered.pipelineBinds -
+                         beforeOrdered.pipelineBinds,
+                     1ull,
+                     "ordered batching should bind the linear pipeline once");
+            t.Equals(afterOrdered.fenceWaits - beforeOrdered.fenceWaits,
+                     1ull,
+                     "ordered batching should wait on one fence");
+            std::vector<uint8_t> orderedActual(
+                GS_VULKAN_VRAM_SIZE, 0xA5u);
+            t.IsTrue(service->downloadVramPages(
+                         orderedActual, allPages, &operationError),
+                     "the ordered dependent image should be observable");
+            t.IsTrue(orderedActual == orderedExpected,
+                     "dependency barriers must preserve sequential CPU order");
             const GsVulkanServiceStatistics finalStatistics =
                 service->statistics();
             t.Equals(finalStatistics.validationErrors, 0u,
