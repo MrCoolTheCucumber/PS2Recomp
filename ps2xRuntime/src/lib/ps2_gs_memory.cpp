@@ -191,6 +191,94 @@ namespace GSMem
         { 401, 409, 433, 441, 465, 473, 497, 505, 403, 411, 435, 443, 467, 475, 499, 507, 405, 413, 437, 445, 469, 477, 501, 509, 407, 415, 439, 447, 471, 479, 503, 511 },
     }};
 
+    template<PixelStorageMode psm, typename BlockTable, typename ColumnTable>
+    PixelAddress ResolvePixelAddressImpl(
+        const BlockTable& blockTable,
+        const ColumnTable& columnTable,
+        u32 bp, u32 bw, u32 x, u32 y) noexcept
+    {
+        using Traits = PixelStorageTraits<psm>;
+        const u32 page = static_cast<u32>(Traits::PageId(bp, bw, x, y));
+        const u32 pixel =
+            page * static_cast<u32>(Traits::PixelsPerPage()) +
+            (bp % static_cast<u32>(Traits::BlocksPerPage()) +
+             static_cast<u32>(Traits::BlockId(blockTable, x, y))) *
+                static_cast<u32>(Traits::PixelsPerBlock()) +
+            static_cast<u32>(Traits::ColumnId(columnTable, x, y));
+        const u32 bitAddress =
+            pixel * static_cast<u32>(UnpackedBitWidth(psm)) +
+            static_cast<u32>(Traits::BitOffset());
+        return {
+            (bitAddress / 32u) &
+                static_cast<u32>(MEMORY_SIZE / sizeof(u32) - 1u),
+            bitAddress % 32u,
+            static_cast<u32>(BitsPerPixel(psm)),
+        };
+    }
+
+    bool ResolvePixelAddress(PixelStorageMode psm, u32 bp, u32 bw,
+        u32 x, u32 y, PixelAddress& address) noexcept
+    {
+        switch (psm)
+        {
+        case C32:
+            address = ResolvePixelAddressImpl<C32>(
+                BlockTableC32, ColumnTable32, bp, bw, x, y);
+            return true;
+        case C24:
+            address = ResolvePixelAddressImpl<C24>(
+                BlockTableC32, ColumnTable32, bp, bw, x, y);
+            return true;
+        case C16:
+            address = ResolvePixelAddressImpl<C16>(
+                BlockTableC16, ColumnTable16, bp, bw, x, y);
+            return true;
+        case C16S:
+            address = ResolvePixelAddressImpl<C16S>(
+                BlockTableC16S, ColumnTable16, bp, bw, x, y);
+            return true;
+        case P8:
+            address = ResolvePixelAddressImpl<P8>(
+                BlockTableP8, ColumnTable8, bp, bw, x, y);
+            return true;
+        case P4:
+            address = ResolvePixelAddressImpl<P4>(
+                BlockTableP4, ColumnTable4, bp, bw, x, y);
+            return true;
+        case P8H:
+            address = ResolvePixelAddressImpl<P8H>(
+                BlockTableC32, ColumnTable32, bp, bw, x, y);
+            return true;
+        case P4HL:
+            address = ResolvePixelAddressImpl<P4HL>(
+                BlockTableC32, ColumnTable32, bp, bw, x, y);
+            return true;
+        case P4HH:
+            address = ResolvePixelAddressImpl<P4HH>(
+                BlockTableC32, ColumnTable32, bp, bw, x, y);
+            return true;
+        case Z32:
+            address = ResolvePixelAddressImpl<Z32>(
+                BlockTableZ32, ColumnTable32, bp, bw, x, y);
+            return true;
+        case Z24:
+            address = ResolvePixelAddressImpl<Z24>(
+                BlockTableZ32, ColumnTable32, bp, bw, x, y);
+            return true;
+        case Z16:
+            address = ResolvePixelAddressImpl<Z16>(
+                BlockTableZ16, ColumnTable16, bp, bw, x, y);
+            return true;
+        case Z16S:
+            address = ResolvePixelAddressImpl<Z16S>(
+                BlockTableZ16S, ColumnTable16, bp, bw, x, y);
+            return true;
+        default:
+            address = {};
+            return false;
+        }
+    }
+
     // this is going to be massive (an entire page of addess lookups)
     static C32PageLookupTable  PageTableC32{ };
     static Z32PageLookupTableT PageTableZ32{ };
@@ -359,4 +447,3 @@ namespace GSMem
         return 0;
     }
 }
-

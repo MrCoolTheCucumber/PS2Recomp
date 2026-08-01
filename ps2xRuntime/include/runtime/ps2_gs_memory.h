@@ -59,6 +59,17 @@ namespace GSMem
 		u32 y{ 0 };
 	};
 
+	// Canonical physical location of a GS pixel within the 4 MiB local-memory
+	// ring. word_index addresses a 32-bit storage word and bit_shift selects the
+	// packed field within it. This representation maps directly to integer
+	// storage-buffer access without exposing a host pointer.
+	struct PixelAddress
+	{
+		u32 word_index{ 0 };
+		u32 bit_shift{ 0 };
+		u32 packed_bit_width{ 0 };
+	};
+
 	template<typename T, usz Width, usz Height>
 	using LookupTable = std::array<std::array<T, Width>, Height>;
 
@@ -327,6 +338,7 @@ namespace GSMem
 		case C32:
 		case Z32:
 		case C24:
+		case Z24:
 		case P8H:
 		case P4HL:
 		case P4HH:
@@ -537,6 +549,11 @@ namespace GSMem
 	}
 
 	void InitLookupTables();
+
+	// Resolves every PSM implemented by Read*/Write*. Unlike the large CPU page
+	// lookup tables, this compact oracle does not require InitLookupTables().
+	bool ResolvePixelAddress(PixelStorageMode psm, u32 bp, u32 bw,
+		u32 x, u32 y, PixelAddress& address) noexcept;
 
 	void WriteCT32(u8* data, u32 bp, u32 bw, u32 x, u32 y, u32 value);
 	void WriteZ32(u8* data, u32 bp, u32 bw, u32 x, u32 y, u32 value);

@@ -1,0 +1,99 @@
+#version 450
+#extension GL_GOOGLE_include_directive : require
+
+#include "ps2_gs_memory.glsl"
+
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0, std430) buffer GsVram
+{
+    uint words[];
+} gs_vram;
+
+struct MemoryCase
+{
+    uint pixel_storage_mode;
+    uint base_block;
+    uint buffer_width;
+    uint x;
+    uint y;
+    uint operation;
+    uint value;
+    uint reserved;
+};
+
+layout(set = 0, binding = 1, std430) readonly buffer MemoryCases
+{
+    MemoryCase items[];
+} memory_cases;
+
+struct MemoryResult
+{
+    uint word_index;
+    uint bit_shift;
+    uint value_before;
+    uint value_after;
+};
+
+layout(set = 0, binding = 2, std430) writeonly buffer MemoryResults
+{
+    MemoryResult items[];
+} memory_results;
+
+layout(push_constant) uniform MemoryParameters
+{
+    uint case_count;
+    uint reserved;
+} parameters;
+
+void main()
+{
+    uint case_index = gl_GlobalInvocationID.x;
+    if (case_index >= parameters.case_count)
+        return;
+
+    MemoryCase item = memory_cases.items[case_index];
+    uint bit_address = gs_pixel_bit_address(
+        item.pixel_storage_mode,
+        item.base_block,
+        item.buffer_width,
+        item.x,
+        item.y);
+    uint word_index = (bit_address >> 5u) & (GS_MEMORY_WORD_COUNT - 1u);
+    uint bit_shift = bit_address & 31u;
+    uint bit_width = gs_packed_bit_width(item.pixel_storage_mode);
+    uint before_word;
+    uint after_word;
+
+    if (item.operation != 0u)
+    {
+        uint value_mask = gs_value_mask(bit_width);
+        if (bit_width == 32u)
+        {
+            before_word = atomicExchange(
+                gs_vram.words[word_index], item.value);
+            after_word = item.value;
+        }
+        else
+        {
+            uint field_mask = value_mask << bit_shift;
+            before_word = atomicAnd(
+                gs_vram.words[word_index], ~field_mask);
+            uint cleared_word = atomicOr(
+                gs_vram.words[word_index],
+                (item.value & value_mask) << bit_shift);
+            after_word = cleared_word |
+                ((item.value & value_mask) << bit_shift);
+        }
+    }
+    else
+    {
+        before_word = gs_vram.words[word_index];
+        after_word = before_word;
+    }
+
+    uint before = gs_extract_value(before_word, bit_shift, bit_width);
+    uint after = gs_extract_value(after_word, bit_shift, bit_width);
+    memory_results.items[case_index] = MemoryResult(
+        word_index, bit_shift, before, after);
+}
