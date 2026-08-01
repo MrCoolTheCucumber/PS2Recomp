@@ -25,6 +25,8 @@ inline constexpr uint32_t GS_VULKAN_NOOP_GROUP_COUNT =
         GS_VULKAN_NOOP_LOCAL_SIZE);
 inline constexpr uint32_t GS_VULKAN_MAX_MEMORY_CASES = 65536u;
 inline constexpr size_t GS_VULKAN_MAX_RESIDENT_SPRITE_BATCH = 64u;
+inline constexpr size_t GS_VULKAN_MAX_RESIDENT_DEPTH_CT32_BATCH =
+    GS_VULKAN_MAX_RESIDENT_SPRITE_BATCH;
 inline constexpr size_t GS_VULKAN_MAX_RESIDENT_NEAREST_CT32_BATCH =
     GS_VULKAN_MAX_RESIDENT_SPRITE_BATCH;
 inline constexpr size_t GS_VULKAN_MAX_RESIDENT_LINEAR_CT32_BATCH =
@@ -196,6 +198,9 @@ struct GsVulkanServiceStatistics
     uint64_t depthCt32SpriteDrawsCompleted = 0u;
     uint64_t depthCt32SpriteDrawsFailed = 0u;
     uint64_t depthCt32SpritePixelsExecuted = 0u;
+    uint64_t residentDepthCt32SpriteBatchesCompleted = 0u;
+    uint64_t residentDepthCt32SpriteBatchesFailed = 0u;
+    uint64_t largestResidentDepthCt32SpriteBatch = 0u;
     uint64_t nearestCt32SpriteDrawsCompleted = 0u;
     uint64_t nearestCt32SpriteDrawsFailed = 0u;
     uint64_t nearestCt32SpritePixelsExecuted = 0u;
@@ -610,6 +615,12 @@ public:
     [[nodiscard]] virtual bool executeResidentCt32Sprites(
         std::span<const GsVulkanCt32Sprite> sprites,
         std::string *error = nullptr) = 0;
+    [[nodiscard]] virtual bool executeResidentDepthCt32Sprite(
+        const GsVulkanDepthCt32Sprite &sprite,
+        std::string *error = nullptr) = 0;
+    [[nodiscard]] virtual bool executeResidentDepthCt32Sprites(
+        std::span<const GsVulkanDepthCt32Sprite> sprites,
+        std::string *error = nullptr) = 0;
     [[nodiscard]] virtual bool executeResidentNearestCt32Sprite(
         const GsVulkanNearestCt32Sprite &sprite,
         std::string *error = nullptr) = 0;
@@ -737,6 +748,15 @@ public:
     // overlapping batches before they enter the worker slot.
     [[nodiscard]] bool executeResidentCt32Sprites(
         std::span<const GsVulkanCt32Sprite> sprites,
+        std::string *error = nullptr) override;
+
+    // Records a bounded depth batch in guest order. Color and depth surfaces
+    // share raw VRAM; dependent dispatch segments are separated explicitly.
+    [[nodiscard]] bool executeResidentDepthCt32Sprite(
+        const GsVulkanDepthCt32Sprite &sprite,
+        std::string *error = nullptr) override;
+    [[nodiscard]] bool executeResidentDepthCt32Sprites(
+        std::span<const GsVulkanDepthCt32Sprite> sprites,
         std::string *error = nullptr) override;
 
     // Records a bounded nearest-texture batch against resident raw VRAM.

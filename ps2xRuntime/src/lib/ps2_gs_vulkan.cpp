@@ -196,6 +196,42 @@ namespace
         return nullptr;
     }
 
+    struct DepthCt32SpriteAccessPages
+    {
+        GsVramPageMask readPages;
+        GsVramPageMask writePages;
+    };
+
+    DepthCt32SpriteAccessPages depthCt32SpriteAccessPages(
+        const GsVulkanDepthCt32Sprite &sprite) noexcept
+    {
+        const uint32_t width = sprite.boundsX1 - sprite.boundsX0;
+        const uint32_t height = sprite.boundsY1 - sprite.boundsY0;
+        DepthCt32SpriteAccessPages access{};
+        access.writePages = gsVramPagesForSurfaceRect(
+            sprite.framebufferBaseBlock,
+            sprite.framebufferWidth,
+            static_cast<uint8_t>(GSMem::C32),
+            sprite.boundsX0,
+            sprite.boundsY0,
+            width,
+            height);
+        const GsVramPageMask depthPages =
+            gsVramPagesForSurfaceRect(
+                sprite.depthBaseBlock,
+                sprite.framebufferWidth,
+                static_cast<uint8_t>(sprite.depthPsm),
+                sprite.boundsX0,
+                sprite.boundsY0,
+                width,
+                height);
+        if (sprite.depthTestMethod >= 2u)
+            access.readPages.unionWith(depthPages);
+        if (sprite.depthWrite != 0u)
+            access.writePages.unionWith(depthPages);
+        return access;
+    }
+
     bool isPowerOfTwoMask(uint32_t mask) noexcept
     {
         return mask <= 1023u && (mask & (mask + 1u)) == 0u;
@@ -603,6 +639,35 @@ namespace
             }
             priorReadPages.unionWith(readPages);
             priorWritePages.unionWith(writePages);
+        }
+        error.clear();
+        return true;
+    }
+
+    bool validateResidentDepthCt32SpriteBatch(
+        std::span<const GsVulkanDepthCt32Sprite> sprites,
+        std::string &error)
+    {
+        if (sprites.empty() ||
+            sprites.size() > GS_VULKAN_MAX_RESIDENT_DEPTH_CT32_BATCH)
+        {
+            error =
+                "Vulkan resident depth CT32 sprite batches require between 1 and " +
+                std::to_string(
+                    GS_VULKAN_MAX_RESIDENT_DEPTH_CT32_BATCH) +
+                " records";
+            return false;
+        }
+
+        for (size_t index = 0u; index < sprites.size(); ++index)
+        {
+            if (const char *validationError =
+                    depthCt32SpriteValidationError(sprites[index]))
+            {
+                error = "Vulkan resident depth CT32 sprite " +
+                        std::to_string(index) + ": " + validationError;
+                return false;
+            }
         }
         error.clear();
         return true;
@@ -2096,6 +2161,11 @@ namespace
             std::string &error);
         bool executeResidentCt32Sprites(
             std::span<const GsVulkanCt32Sprite> sprites,
+            GsVulkanCapabilityReport &report,
+            GsVulkanServiceStatistics &statistics,
+            std::string &error);
+        bool executeResidentDepthCt32Sprites(
+            std::span<const GsVulkanDepthCt32Sprite> sprites,
             GsVulkanCapabilityReport &report,
             GsVulkanServiceStatistics &statistics,
             std::string &error);
@@ -3833,6 +3903,142 @@ namespace
         return true;
     }
 
+    bool VulkanExecutionContext::executeResidentDepthCt32Sprites(
+        std::span<const GsVulkanDepthCt32Sprite> sprites,
+        GsVulkanCapabilityReport &report,
+        GsVulkanServiceStatistics &statistics,
+        std::string &error)
+    {
+        if (!m_healthy)
+        {
+            error = "Vulkan GS service is not healthy";
+            return false;
+        }
+        if (m_depthCt32SpritePipeline == VK_NULL_HANDLE)
+        {
+            error =
+                "Vulkan device does not support exact depth CT32 sprites";
+            return false;
+        }
+        if (!validateResidentDepthCt32SpriteBatch(sprites, error))
+            return false;
+
+        constexpr uint32_t localSize = 8u;
+        const uint32_t validationErrorsBefore =
+            m_validation.errors.load(std::memory_order_relaxed);
+        if (!beginCommands(report, error))
+            return false;
+
+        VkBufferMemoryBarrier prepareBarrier{};
+        prepareBarrier.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
+        prepareBarrier.srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT;
+        prepareBarrier.dstAccessMask =
+            VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+        prepareBarrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        prepareBarrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        prepareBarrier.buffer = m_vram.buffer;
+        prepareBarrier.offset = 0u;
+        prepareBarrier.size = GS_VULKAN_VRAM_SIZE;
+        m_functions.cmdPipelineBarrier(
+            m_commandBuffer,
+            VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+            0u, 0u, nullptr, 1u, &prepareBarrier, 0u, nullptr);
+
+        m_functions.cmdBindPipeline(
+            m_commandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE,
+            m_depthCt32SpritePipeline);
+        m_functions.cmdBindDescriptorSets(
+            m_commandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE,
+            m_pipelineLayout, 0u, 1u, &m_descriptorSet,
+            0u, nullptr);
+        uint64_t dependencyBarrierCount = 0u;
+        GsVramPageMask priorReadPages;
+        GsVramPageMask priorWritePages;
+        for (const GsVulkanDepthCt32Sprite &sprite : sprites)
+        {
+            const DepthCt32SpriteAccessPages access =
+                depthCt32SpriteAccessPages(sprite);
+            const bool hasDependency =
+                priorWritePages.intersects(access.readPages) ||
+                priorWritePages.intersects(access.writePages) ||
+                priorReadPages.intersects(access.writePages);
+            if (hasDependency)
+            {
+                VkBufferMemoryBarrier dependencyBarrier{};
+                dependencyBarrier.sType =
+                    VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
+                dependencyBarrier.srcAccessMask =
+                    VK_ACCESS_SHADER_READ_BIT |
+                    VK_ACCESS_SHADER_WRITE_BIT;
+                dependencyBarrier.dstAccessMask =
+                    VK_ACCESS_SHADER_READ_BIT |
+                    VK_ACCESS_SHADER_WRITE_BIT;
+                dependencyBarrier.srcQueueFamilyIndex =
+                    VK_QUEUE_FAMILY_IGNORED;
+                dependencyBarrier.dstQueueFamilyIndex =
+                    VK_QUEUE_FAMILY_IGNORED;
+                dependencyBarrier.buffer = m_vram.buffer;
+                dependencyBarrier.offset = 0u;
+                dependencyBarrier.size = GS_VULKAN_VRAM_SIZE;
+                m_functions.cmdPipelineBarrier(
+                    m_commandBuffer,
+                    VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                    VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                    0u, 0u, nullptr, 1u, &dependencyBarrier,
+                    0u, nullptr);
+                ++dependencyBarrierCount;
+                priorReadPages.clear();
+                priorWritePages.clear();
+            }
+
+            const uint32_t groupCountX =
+                (sprite.boundsX1 - sprite.boundsX0 +
+                 localSize - 1u) / localSize;
+            const uint32_t groupCountY =
+                (sprite.boundsY1 - sprite.boundsY0 +
+                 localSize - 1u) / localSize;
+            m_functions.cmdPushConstants(
+                m_commandBuffer, m_pipelineLayout,
+                VK_SHADER_STAGE_COMPUTE_BIT, 0u,
+                sizeof(sprite), &sprite);
+            m_functions.cmdDispatch(
+                m_commandBuffer, groupCountX, groupCountY, 1u);
+            priorReadPages.unionWith(access.readPages);
+            priorWritePages.unionWith(access.writePages);
+        }
+
+        VkBufferMemoryBarrier completeBarrier{};
+        completeBarrier.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
+        completeBarrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+        completeBarrier.dstAccessMask =
+            VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
+        completeBarrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        completeBarrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        completeBarrier.buffer = m_vram.buffer;
+        completeBarrier.offset = 0u;
+        completeBarrier.size = GS_VULKAN_VRAM_SIZE;
+        m_functions.cmdPipelineBarrier(
+            m_commandBuffer,
+            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+            VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+            0u, 0u, nullptr, 1u, &completeBarrier, 0u, nullptr);
+
+        if (!submitCommands(
+                "resident depth CT32 sprite batch",
+                sprites.size(), 2u + dependencyBarrierCount, 1u,
+                report, statistics, error) ||
+            !finishOperation(
+                "resident depth CT32 sprite batch",
+                validationErrorsBefore,
+                report, statistics, error))
+        {
+            return false;
+        }
+        error.clear();
+        return true;
+    }
+
     bool VulkanExecutionContext::executeResidentNearestCt32Sprites(
         std::span<const GsVulkanNearestCt32Sprite> sprites,
         GsVulkanCapabilityReport &report,
@@ -4600,6 +4806,7 @@ enum class GsVulkanRequestKind : uint8_t
     UploadPages,
     DownloadPages,
     ResidentCt32Sprites,
+    ResidentDepthCt32Sprites,
     ResidentNearestCt32Sprites,
     ResidentLinearCt32Sprites,
     ResidentCt32Triangles,
@@ -4682,6 +4889,13 @@ struct GsVulkanService::Impl final
                     statistics.spriteDrawsFailed +=
                         activeRequestSpriteCount;
                     ++statistics.residentSpriteBatchesFailed;
+                }
+                else if (activeRequestKind ==
+                         GsVulkanRequestKind::ResidentDepthCt32Sprites)
+                {
+                    statistics.depthCt32SpriteDrawsFailed +=
+                        activeRequestDepthCt32SpriteCount;
+                    ++statistics.residentDepthCt32SpriteBatchesFailed;
                 }
                 else if (activeRequestKind ==
                          GsVulkanRequestKind::ResidentNearestCt32Sprites)
@@ -4795,6 +5009,8 @@ struct GsVulkanService::Impl final
                 kind = requestKind;
                 activeRequestKind = kind;
                 activeRequestSpriteCount = sprites.size();
+                activeRequestDepthCt32SpriteCount =
+                    depthCt32Sprites.size();
                 activeRequestNearestCt32SpriteCount =
                     nearestCt32Sprites.size();
                 activeRequestLinearCt32SpriteCount =
@@ -4867,6 +5083,13 @@ struct GsVulkanService::Impl final
                 succeeded = context.executeResidentCt32Sprites(
                     sprites, localCapabilities, localStatistics,
                     operationError);
+            }
+            else if (kind ==
+                     GsVulkanRequestKind::ResidentDepthCt32Sprites)
+            {
+                succeeded = context.executeResidentDepthCt32Sprites(
+                    depthCt32Sprites, localCapabilities,
+                    localStatistics, operationError);
             }
             else if (kind ==
                      GsVulkanRequestKind::ResidentNearestCt32Sprites)
@@ -5014,6 +5237,39 @@ struct GsVulkanService::Impl final
                 {
                     localStatistics.spriteDrawsFailed += sprites.size();
                     ++localStatistics.residentSpriteBatchesFailed;
+                }
+            }
+            else if (kind ==
+                     GsVulkanRequestKind::ResidentDepthCt32Sprites)
+            {
+                if (succeeded)
+                {
+                    localStatistics.depthCt32SpriteDrawsCompleted +=
+                        depthCt32Sprites.size();
+                    for (const GsVulkanDepthCt32Sprite &sprite :
+                         depthCt32Sprites)
+                    {
+                        localStatistics.depthCt32SpritePixelsExecuted +=
+                            static_cast<uint64_t>(
+                                sprite.boundsX1 - sprite.boundsX0) *
+                            static_cast<uint64_t>(
+                                sprite.boundsY1 - sprite.boundsY0);
+                    }
+                    ++localStatistics
+                          .residentDepthCt32SpriteBatchesCompleted;
+                    localStatistics.largestResidentDepthCt32SpriteBatch =
+                        std::max(
+                            localStatistics
+                                .largestResidentDepthCt32SpriteBatch,
+                            static_cast<uint64_t>(
+                                depthCt32Sprites.size()));
+                }
+                else
+                {
+                    localStatistics.depthCt32SpriteDrawsFailed +=
+                        depthCt32Sprites.size();
+                    ++localStatistics
+                          .residentDepthCt32SpriteBatchesFailed;
                 }
             }
             else if (kind ==
@@ -5289,6 +5545,7 @@ struct GsVulkanService::Impl final
     GsVulkanRequestKind activeRequestKind =
         GsVulkanRequestKind::RoundTrip;
     size_t activeRequestSpriteCount = 0u;
+    size_t activeRequestDepthCt32SpriteCount = 0u;
     size_t activeRequestNearestCt32SpriteCount = 0u;
     size_t activeRequestLinearCt32SpriteCount = 0u;
     size_t activeRequestTriangleCount = 0u;
@@ -5945,6 +6202,57 @@ bool GsVulkanService::executeResidentLinearCt32Sprite(
     return executeResidentLinearCt32Sprites(
         std::span<const GsVulkanLinearCt32Sprite>(&sprite, 1u),
         error);
+}
+
+bool GsVulkanService::executeResidentDepthCt32Sprite(
+    const GsVulkanDepthCt32Sprite &sprite,
+    std::string *error)
+{
+    return executeResidentDepthCt32Sprites(
+        std::span<const GsVulkanDepthCt32Sprite>(&sprite, 1u),
+        error);
+}
+
+bool GsVulkanService::executeResidentDepthCt32Sprites(
+    std::span<const GsVulkanDepthCt32Sprite> sprites,
+    std::string *error)
+{
+#if !PS2X_HAS_GS_VULKAN
+    (void)sprites;
+    if (error)
+        *error = "Vulkan GS support was compiled out";
+    return false;
+#else
+    std::string validationError;
+    if (!validateResidentDepthCt32SpriteBatch(sprites, validationError))
+    {
+        if (error)
+            *error = std::move(validationError);
+        return false;
+    }
+    {
+        std::lock_guard lock(m_impl->stateMutex);
+        const GsVulkanDeviceReport *selected =
+            m_impl->capabilities.selectedDevice();
+        if (!selected || !selected->exactDepthCt32Sprite)
+        {
+            if (error)
+            {
+                *error =
+                    "Vulkan device does not support exact depth CT32 sprites";
+            }
+            return false;
+        }
+    }
+
+    std::vector<uint8_t> unusedOutput;
+    return m_impl->executeRequest(
+        GsVulkanRequestKind::ResidentDepthCt32Sprites,
+        {}, {}, {},
+        std::vector<GsVulkanDepthCt32Sprite>(
+            sprites.begin(), sprites.end()),
+        {}, {}, {}, {}, unusedOutput, nullptr, error);
+#endif
 }
 
 bool GsVulkanService::executeResidentLinearCt32Sprites(

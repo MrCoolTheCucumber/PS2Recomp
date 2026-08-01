@@ -1711,6 +1711,69 @@ namespace
             return true;
         }
 
+        bool executeResidentDepthCt32Sprite(
+            const GsVulkanDepthCt32Sprite &sprite,
+            std::string *error) override
+        {
+            return executeResidentDepthCt32Sprites(
+                std::span<const GsVulkanDepthCt32Sprite>(
+                    &sprite, 1u),
+                error);
+        }
+
+        bool executeResidentDepthCt32Sprites(
+            std::span<const GsVulkanDepthCt32Sprite> sprites,
+            std::string *error) override
+        {
+            if (!isHealthy || behavior == Behavior::Fail ||
+                behavior == Behavior::FailResidentDraw ||
+                behavior == Behavior::InvalidOutput ||
+                sprites.empty() ||
+                sprites.size() >
+                    GS_VULKAN_MAX_RESIDENT_DEPTH_CT32_BATCH ||
+                !report.devices[0].exactDepthCt32Sprite)
+            {
+                serviceStatistics.depthCt32SpriteDrawsFailed +=
+                    sprites.size();
+                ++serviceStatistics
+                      .residentDepthCt32SpriteBatchesFailed;
+                if (error)
+                {
+                    *error =
+                        "injected resident depth CT32 executor failure";
+                }
+                return false;
+            }
+            for (const GsVulkanDepthCt32Sprite &sprite : sprites)
+            {
+                if (behavior == Behavior::Exact)
+                    applyDepthCt32SpriteCpu(residentVram, sprite);
+                serviceStatistics.depthCt32SpritePixelsExecuted +=
+                    static_cast<uint64_t>(
+                        sprite.boundsX1 - sprite.boundsX0) *
+                    static_cast<uint64_t>(
+                        sprite.boundsY1 - sprite.boundsY0);
+            }
+            serviceStatistics.depthCt32SpriteDrawsCompleted +=
+                sprites.size();
+            ++serviceStatistics
+                  .residentDepthCt32SpriteBatchesCompleted;
+            serviceStatistics.largestResidentDepthCt32SpriteBatch =
+                std::max(
+                    serviceStatistics
+                        .largestResidentDepthCt32SpriteBatch,
+                    static_cast<uint64_t>(sprites.size()));
+            ++serviceStatistics.queueSubmissions;
+            serviceStatistics.shaderDispatches += sprites.size();
+            serviceStatistics.pipelineBarriers += 2u;
+            ++serviceStatistics.pipelineBinds;
+            ++serviceStatistics.pipelineCacheHits;
+            ++serviceStatistics.fenceWaits;
+            if (error)
+                error->clear();
+            return true;
+        }
+
         bool executeResidentLinearCt32Sprite(
             const GsVulkanLinearCt32Sprite &sprite,
             std::string *error) override
@@ -12252,6 +12315,285 @@ void register_ps2_gs_vulkan_tests()
             t.IsTrue(service->healthy(),
                      "accepted and caller-rejected batches should leave the service healthy");
             service->shutdown();
+        });
+
+        tc.Run("Vulkan resident depth CT32 batches preserve ordered Z32 Z24 dependencies", [](TestCase &t)
+        {
+            GSMem::InitLookupTables();
+            GsVulkanCapabilityReport preflight{};
+            const GsVulkanServiceConfig config =
+                makeRendererServiceConfig(preflight);
+            GsVulkanCapabilityReport creationReport{};
+            std::string creationError;
+            std::unique_ptr<GsVulkanService> service =
+                GsVulkanService::create(
+                    config, &creationReport, &creationError);
+            if (!preflight.ready())
+            {
+                t.IsNull(service.get(),
+                         "an unavailable host should skip resident depth batching cleanly");
+                t.IsFalse(creationReport.ready(),
+                          "a skipped depth batch service should retain its capability result");
+                return;
+            }
+            t.IsNotNull(service.get(),
+                        "a suitable device should create the resident depth batch service");
+            t.IsTrue(creationError.empty(),
+                     "successful depth batch service creation should clear its diagnostic");
+            if (!service)
+                return;
+
+            const std::array<GsDrawCommand, 6> commands{{
+                makeDepthCt32SpriteCommand(
+                    38'000u, 40u, 1u, 200u, GS_PSM_Z24, false, 1u,
+                    {0u, 31u, 0u, 31u}, {0u, 0u},
+                    17u, 17u, 257u, 257u,
+                    0x10203040u, 0x00ABCDEFu),
+                makeDepthCt32SpriteCommand(
+                    38'001u, 40u, 1u, 200u, GS_PSM_Z24, false, 2u,
+                    {0u, 31u, 0u, 31u}, {0u, 0u},
+                    17u, 17u, 257u, 257u,
+                    0x50607080u, 0x00BCDEF0u),
+                makeDepthCt32SpriteCommand(
+                    38'002u, 41u, 1u, 201u, GS_PSM_Z32, false, 1u,
+                    {0u, 31u, 0u, 31u}, {0u, 0u},
+                    17u, 17u, 257u, 257u,
+                    0x90A0B0C0u, 0x7FFFF000u),
+                makeDepthCt32SpriteCommand(
+                    38'003u, 41u, 1u, 201u, GS_PSM_Z32, false, 3u,
+                    {0u, 31u, 0u, 31u}, {0u, 0u},
+                    17u, 17u, 257u, 257u,
+                    0xD0E0F001u, 0x80000000u),
+                makeDepthCt32SpriteCommand(
+                    38'004u, 201u, 1u, 202u, GS_PSM_Z24, false, 1u,
+                    {0u, 31u, 0u, 31u}, {0u, 0u},
+                    17u, 17u, 257u, 257u,
+                    0x12345678u, 0x00555555u),
+                makeDepthCt32SpriteCommand(
+                    38'005u, 42u, 1u, 202u, GS_PSM_Z24, true, 2u,
+                    {0u, 31u, 0u, 31u}, {0u, 0u},
+                    17u, 17u, 257u, 257u,
+                    0x89ABCDEFu, 0x00555555u),
+            }};
+            std::vector<GsVulkanDepthCt32Sprite> sprites;
+            for (const GsDrawCommand &command : commands)
+            {
+                GsVulkanDepthCt32Sprite sprite{};
+                const GsBackendDecision decision =
+                    prepareGsVulkanDepthCt32Sprite(command, sprite);
+                if (!decision.supported)
+                {
+                    t.Fail(
+                        "resident depth CT32 fixture was rejected as " +
+                        std::string(gsFallbackReasonName(decision.reason)));
+                    return;
+                }
+                sprites.push_back(sprite);
+            }
+
+            const auto colorPages = [](
+                const GsVulkanDepthCt32Sprite &sprite)
+            {
+                return gsVramPagesForSurfaceRect(
+                    sprite.framebufferBaseBlock,
+                    sprite.framebufferWidth,
+                    static_cast<uint8_t>(GSMem::C32),
+                    sprite.boundsX0, sprite.boundsY0,
+                    sprite.boundsX1 - sprite.boundsX0,
+                    sprite.boundsY1 - sprite.boundsY0);
+            };
+            const auto depthPages = [](
+                const GsVulkanDepthCt32Sprite &sprite)
+            {
+                return gsVramPagesForSurfaceRect(
+                    sprite.depthBaseBlock,
+                    sprite.framebufferWidth,
+                    static_cast<uint8_t>(sprite.depthPsm),
+                    sprite.boundsX0, sprite.boundsY0,
+                    sprite.boundsX1 - sprite.boundsX0,
+                    sprite.boundsY1 - sprite.boundsY0);
+            };
+            t.IsTrue(colorPages(sprites[0]).intersects(colorPages(sprites[1])) &&
+                         depthPages(sprites[0]).intersects(depthPages(sprites[1])),
+                     "the Z24 pair should overlap both raw surfaces");
+            t.IsFalse(colorPages(sprites[1]).intersects(colorPages(sprites[2])) ||
+                          depthPages(sprites[1]).intersects(depthPages(sprites[2])),
+                      "the Z24 and Z32 pairs should contain a disjoint segment");
+            t.IsTrue(colorPages(sprites[2]).intersects(colorPages(sprites[3])) &&
+                         depthPages(sprites[2]).intersects(depthPages(sprites[3])),
+                     "the Z32 pair should overlap both raw surfaces");
+            t.IsTrue(depthPages(sprites[3]).intersects(colorPages(sprites[4])),
+                     "the cross-view draw should write an earlier Z32 page as CT32");
+            t.IsTrue(depthPages(sprites[4]).intersects(depthPages(sprites[5])),
+                     "the masked comparison should read the preceding Z24 write");
+
+            std::string operationError;
+            const GsVulkanServiceStatistics beforeRejections =
+                service->statistics();
+            const auto expectRejected =
+                [&](std::span<const GsVulkanDepthCt32Sprite> rejected,
+                    const std::string &label)
+            {
+                operationError.clear();
+                t.IsFalse(service->executeResidentDepthCt32Sprites(
+                              rejected, &operationError),
+                          label + " should fail before worker submission");
+                t.IsFalse(operationError.empty(),
+                          label + " should retain a diagnostic");
+            };
+            expectRejected({}, "empty resident depth batch");
+            std::vector<GsVulkanDepthCt32Sprite> oversized(
+                GS_VULKAN_MAX_RESIDENT_DEPTH_CT32_BATCH + 1u,
+                sprites.front());
+            expectRejected(oversized, "oversized resident depth batch");
+            std::vector<GsVulkanDepthCt32Sprite> invalid = sprites;
+            invalid[3].reserved0 = 1u;
+            expectRejected(invalid, "invalid resident depth batch member");
+            const GsVulkanServiceStatistics afterRejections =
+                service->statistics();
+            t.Equals(afterRejections.queueSubmissions,
+                     beforeRejections.queueSubmissions,
+                     "caller-rejected depth batches must not submit GPU work");
+            t.Equals(afterRejections.depthCt32SpriteDrawsFailed,
+                     beforeRejections.depthCt32SpriteDrawsFailed,
+                     "caller-rejected depth batches must not count worker failures");
+            t.Equals(
+                afterRejections.residentDepthCt32SpriteBatchesFailed,
+                beforeRejections.residentDepthCt32SpriteBatchesFailed,
+                "caller-rejected depth batches must not count failed worker batches");
+
+            const GsVulkanDeviceReport *selected =
+                creationReport.selectedDevice();
+            t.IsNotNull(selected,
+                        "the depth batch service should retain its selected device");
+            if (!selected)
+                return;
+            if (!selected->exactDepthCt32Sprite)
+            {
+                expectRejected(sprites,
+                               "capability-gated resident depth batch");
+                t.Equals(service->statistics().depthCt32SpriteDrawsFailed,
+                         0ull,
+                         "depth capability rejection must not enter the worker");
+                t.IsTrue(service->healthy(),
+                         "unsupported depth batching must not poison the base service");
+                service->shutdown();
+                return;
+            }
+
+            const std::vector<uint8_t> initial =
+                makeVramPattern(0x44505448u);
+            std::vector<uint8_t> expected = initial;
+            uint64_t expectedPixels = 0u;
+            for (const GsVulkanDepthCt32Sprite &sprite : sprites)
+            {
+                applyDepthCt32SpriteCpu(expected, sprite);
+                expectedPixels +=
+                    static_cast<uint64_t>(
+                        sprite.boundsX1 - sprite.boundsX0) *
+                    static_cast<uint64_t>(
+                        sprite.boundsY1 - sprite.boundsY0);
+            }
+            GsVramPageMask allPages;
+            allPages.setAll();
+            t.IsTrue(service->uploadVramPages(
+                         initial, allPages, &operationError),
+                     "the depth batch fixture should establish resident VRAM");
+            if (!operationError.empty())
+                t.Fail("resident depth batch upload failed: " + operationError);
+
+            const GsVulkanServiceStatistics beforeBatch =
+                service->statistics();
+            operationError.clear();
+            if (!service->executeResidentDepthCt32Sprites(
+                    sprites, &operationError))
+            {
+                t.Fail(
+                    "ordered resident depth batch failed: " +
+                    operationError);
+                service->shutdown();
+                return;
+            }
+            const GsVulkanServiceStatistics afterBatch =
+                service->statistics();
+            t.IsTrue(operationError.empty(),
+                     "successful resident depth batching should clear its diagnostic");
+            t.Equals(afterBatch.queueSubmissions -
+                         beforeBatch.queueSubmissions,
+                     1ull,
+                     "one depth batch should use one Vulkan queue submission");
+            t.Equals(afterBatch.shaderDispatches -
+                         beforeBatch.shaderDispatches,
+                     static_cast<uint64_t>(sprites.size()),
+                     "each depth batch member should retain one compute dispatch");
+            t.Equals(afterBatch.pipelineBarriers -
+                         beforeBatch.pipelineBarriers,
+                     6ull,
+                     "four dependencies should join the two batch-envelope barriers");
+            t.Equals(afterBatch.pipelineBinds - beforeBatch.pipelineBinds,
+                     1ull,
+                     "one depth batch should bind the exact pipeline once");
+            t.Equals(afterBatch.pipelineCacheHits -
+                         beforeBatch.pipelineCacheHits,
+                     1ull,
+                     "one depth batch should reuse its prebuilt pipeline once");
+            t.Equals(afterBatch.fenceWaits - beforeBatch.fenceWaits,
+                     1ull,
+                     "one depth batch should wait on one submitted fence");
+            t.Equals(afterBatch.depthCt32SpriteDrawsCompleted -
+                         beforeBatch.depthCt32SpriteDrawsCompleted,
+                     static_cast<uint64_t>(sprites.size()),
+                     "depth batch statistics should count every completed sprite");
+            t.Equals(afterBatch.depthCt32SpritePixelsExecuted -
+                         beforeBatch.depthCt32SpritePixelsExecuted,
+                     expectedPixels,
+                     "depth batch statistics should count every candidate pixel");
+            t.Equals(
+                afterBatch.residentDepthCt32SpriteBatchesCompleted -
+                    beforeBatch.residentDepthCt32SpriteBatchesCompleted,
+                1ull,
+                "the worker should complete one resident depth batch");
+            t.Equals(afterBatch.largestResidentDepthCt32SpriteBatch,
+                     static_cast<uint64_t>(sprites.size()),
+                     "the service should retain its largest depth batch");
+
+            std::vector<uint8_t> actual(
+                GS_VULKAN_VRAM_SIZE, 0xA5u);
+            t.IsTrue(service->downloadVramPages(
+                         actual, allPages, &operationError),
+                     "the completed resident depth batch should be observable");
+            t.IsTrue(actual == expected,
+                     "ordered resident depth draws must match the sequential CPU oracle");
+
+            std::vector<uint8_t> singletonExpected = expected;
+            applyDepthCt32SpriteCpu(singletonExpected, sprites.front());
+            operationError.clear();
+            t.IsTrue(service->executeResidentDepthCt32Sprite(
+                         sprites.front(), &operationError),
+                     "the resident depth singleton wrapper should execute");
+            std::fill(actual.begin(), actual.end(), 0xA5u);
+            t.IsTrue(service->downloadVramPages(
+                         actual, allPages, &operationError),
+                     "the resident depth singleton should be observable");
+            t.IsTrue(actual == singletonExpected,
+                     "the singleton wrapper should preserve exact depth semantics");
+
+            const GsVulkanServiceStatistics finalStatistics =
+                service->statistics();
+            t.Equals(finalStatistics.validationErrors, 0u,
+                     "resident depth batching must remain validation-clean");
+            t.Equals(finalStatistics.validationWarnings, 0u,
+                     "resident depth batching should emit no validation warnings");
+            t.IsTrue(service->healthy(),
+                     "accepted and rejected depth batches should leave the service healthy");
+
+            service->shutdown();
+            operationError.clear();
+            t.IsFalse(service->executeResidentDepthCt32Sprites(
+                          sprites, &operationError),
+                      "a stopped service must reject resident depth batches");
+            t.IsFalse(operationError.empty(),
+                      "post-shutdown depth rejection should retain a diagnostic");
         });
 
         tc.Run("Vulkan resident nearest CT32 batches preserve texture dependencies", [](TestCase &t)
