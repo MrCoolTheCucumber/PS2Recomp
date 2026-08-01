@@ -51,6 +51,26 @@ static inline int clampInt(int v, int lo, int hi)
     return v;
 }
 
+static inline uint32_t maximumWrappedTextureCoordinate(
+    uint32_t textureSize,
+    uint8_t mode,
+    uint16_t regionMin,
+    uint16_t regionMax)
+{
+    const uint32_t size = textureSize != 0u ? textureSize : 1u;
+    const uint32_t textureMask = size - 1u;
+    switch (mode)
+    {
+    case 2: // REGION_CLAMP
+        return regionMin > regionMax ? regionMin : regionMax;
+    case 3: // REGION_REPEAT
+        return static_cast<uint32_t>(regionMax) |
+               (static_cast<uint32_t>(regionMin) & textureMask);
+    default: // REPEAT or CLAMP
+        return textureMask;
+    }
+}
+
 static inline uint8_t clampU8(int v)
 {
     if (v < 0) return 0;

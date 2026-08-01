@@ -1,4 +1,5 @@
 #include "runtime/ps2_gs_backend.h"
+#include "runtime/ps2_gs_common.h"
 
 #include <algorithm>
 #include <bit>
@@ -329,14 +330,31 @@ namespace
                     std::max(1u, (1u << context.tex0.tw) >> level);
                 const uint32_t textureHeight =
                     std::max(1u, (1u << context.tex0.th) >> level);
+                const uint64_t clamp = context.clamp;
+                const uint32_t maximumTextureX =
+                    GSInternal::maximumWrappedTextureCoordinate(
+                        textureWidth,
+                        static_cast<uint8_t>(clamp & 0x3u),
+                        static_cast<uint16_t>(
+                            ((clamp >> 4u) & 0x3FFu) >> level),
+                        static_cast<uint16_t>(
+                            ((clamp >> 14u) & 0x3FFu) >> level));
+                const uint32_t maximumTextureY =
+                    GSInternal::maximumWrappedTextureCoordinate(
+                        textureHeight,
+                        static_cast<uint8_t>((clamp >> 2u) & 0x3u),
+                        static_cast<uint16_t>(
+                            ((clamp >> 24u) & 0x3FFu) >> level),
+                        static_cast<uint16_t>(
+                            ((clamp >> 34u) & 0x3FFu) >> level));
                 GsVramPageMask &pages =
                     level == 0u ? resources.texturePages : resources.mipPages;
                 if (!addSurfaceRange(pages,
                                      base,
                                      width,
                                      context.tex0.psm,
-                                     textureWidth - 1u,
-                                     textureHeight - 1u))
+                                     maximumTextureX,
+                                     maximumTextureY))
                 {
                     resources.unknownMemoryLayout = true;
                 }

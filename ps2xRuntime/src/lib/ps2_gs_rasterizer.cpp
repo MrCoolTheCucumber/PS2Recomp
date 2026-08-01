@@ -1241,11 +1241,7 @@ namespace
         case 1: // CLAMP
             return clampInt(coordinate, 0, size - 1);
         case 2: // REGION_CLAMP
-        {
-            const int minimum = std::min<int>(regionMin, size - 1);
-            const int maximum = std::min<int>(regionMax, size - 1);
-            return clampInt(coordinate, minimum, maximum);
-        }
+            return clampInt(coordinate, regionMin, regionMax);
         case 3: // REGION_REPEAT
         {
             const uint32_t mask = static_cast<uint32_t>(regionMin) & textureMask;
@@ -1716,12 +1712,29 @@ namespace
             std::max(1u, (1u << ctx.tex0.tw) >> level);
         const uint32_t textureHeight =
             std::max(1u, (1u << ctx.tex0.th) >> level);
+        const uint64_t clamp = ctx.clamp;
+        const uint32_t maximumTextureX =
+            GSInternal::maximumWrappedTextureCoordinate(
+                textureWidth,
+                static_cast<uint8_t>(clamp & 0x3u),
+                static_cast<uint16_t>(
+                    ((clamp >> 4u) & 0x3FFu) >> level),
+                static_cast<uint16_t>(
+                    ((clamp >> 14u) & 0x3FFu) >> level));
+        const uint32_t maximumTextureY =
+            GSInternal::maximumWrappedTextureCoordinate(
+                textureHeight,
+                static_cast<uint8_t>((clamp >> 2u) & 0x3u),
+                static_cast<uint16_t>(
+                    ((clamp >> 24u) & 0x3FFu) >> level),
+                static_cast<uint16_t>(
+                    ((clamp >> 34u) & 0x3FFu) >> level));
         return {
             base,
             surfaceBlockCount(ctx.tex0.psm,
                               width,
-                              textureWidth - 1u,
-                              textureHeight - 1u),
+                              maximumTextureX,
+                              maximumTextureY),
         };
     }
 
@@ -2227,6 +2240,7 @@ bool GSRasterizer::tryQueuePrimitive(
             cached.tex1 == ctx.tex1 &&
             cached.miptbp1 == ctx.miptbp1 &&
             cached.miptbp2 == ctx.miptbp2 &&
+            cached.clamp == ctx.clamp &&
             cached.test == ctx.test &&
             cached.alpha == ctx.alpha &&
             cachedPrim.tme == primitive.tme &&

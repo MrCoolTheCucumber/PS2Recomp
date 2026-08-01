@@ -590,6 +590,126 @@ void register_ps2_gs_tests()
                       "opaque CT32 draw with disabled depth should not claim a read dependency");
         });
 
+        tc.Run("GS region texture resource masks contain post-wrap coordinates", [](TestCase &t)
+        {
+            GSMem::InitLookupTables();
+
+            constexpr uint32_t kTextureBase = 64u;
+            constexpr uint32_t kMipBase = 256u;
+            constexpr uint8_t kTextureWidth = 2u;
+
+            GSContext context{};
+            context.frame.fbp = 400u;
+            context.frame.fbw = 1u;
+            context.frame.psm = GS_PSM_CT32;
+            context.scissor = {0u, 15u, 0u, 15u};
+            context.zbuf.zmask = true;
+            context.tex0.tbp0 = kTextureBase;
+            context.tex0.tbw = kTextureWidth;
+            context.tex0.psm = GS_PSM_CT32;
+            context.tex0.tw = 3u;
+            context.tex0.th = 3u;
+            context.tex1 = (1ull << 2u) | (2ull << 6u);
+            context.miptbp1 =
+                static_cast<uint64_t>(kMipBase) |
+                (static_cast<uint64_t>(kTextureWidth) << 14u);
+
+            GSPrimReg primitive{};
+            primitive.type = GS_PRIM_SPRITE;
+            primitive.tme = true;
+            std::array<GSVertex, 2> vertices{};
+            vertices[1].x12_4 = 16u * 16u;
+            vertices[1].y12_4 = 16u * 16u;
+
+            const auto resourcesForClamp = [&](uint64_t clamp)
+            {
+                GSContext drawContext = context;
+                drawContext.clamp = clamp;
+                return buildGsDrawCommand(
+                           1u,
+                           primitive,
+                           drawContext,
+                           std::span<const GSVertex>(vertices),
+                           GsDrawGlobalState{})
+                    .resources();
+            };
+            const auto expectCoordinatePage =
+                [&](const GsVramPageMask &pages,
+                    uint32_t base,
+                    uint32_t x,
+                    uint32_t y,
+                    const std::string &message)
+            {
+                GSMem::PixelAddress address{};
+                if (!GSMem::ResolvePixelAddress(
+                        GSMem::PixelStorageMode::C32,
+                        base,
+                        kTextureWidth,
+                        x,
+                        y,
+                        address))
+                {
+                    t.Fail("canonical CT32 resolver rejected a region coordinate");
+                    return;
+                }
+                const size_t page =
+                    (static_cast<size_t>(address.word_index) *
+                     sizeof(uint32_t)) /
+                    GS_VRAM_PAGE_SIZE;
+                t.IsTrue(pages.test(page), message);
+            };
+
+            constexpr uint64_t kRegionClamp =
+                2ull |
+                (2ull << 2u) |
+                (136ull << 4u) |
+                (140ull << 14u) |
+                (76ull << 24u) |
+                (80ull << 34u);
+            const GsDrawResources regionClamp =
+                resourcesForClamp(kRegionClamp);
+            expectCoordinatePage(
+                regionClamp.texturePages,
+                kTextureBase,
+                140u,
+                80u,
+                "REGION_CLAMP base-level pages should include raw MAXU/MAXV");
+            expectCoordinatePage(
+                regionClamp.mipPages,
+                kMipBase,
+                70u,
+                40u,
+                "REGION_CLAMP mip pages should include level-shifted raw bounds");
+
+            constexpr uint64_t kRegionRepeat =
+                3ull |
+                (3ull << 2u) |
+                (7ull << 4u) |
+                (128ull << 14u) |
+                (7ull << 24u) |
+                (64ull << 34u);
+            const GsDrawResources regionRepeat =
+                resourcesForClamp(kRegionRepeat);
+            expectCoordinatePage(
+                regionRepeat.texturePages,
+                kTextureBase,
+                135u,
+                71u,
+                "REGION_REPEAT base-level pages should include masked MIN or raw MAX");
+            expectCoordinatePage(
+                regionRepeat.mipPages,
+                kMipBase,
+                67u,
+                35u,
+                "REGION_REPEAT mip pages should include shifted mask and offset bounds");
+
+            t.IsFalse(regionClamp.texturePages.all() ||
+                          regionClamp.mipPages.all() ||
+                          regionRepeat.texturePages.all() ||
+                          regionRepeat.mipPages.all(),
+                      "bounded region coordinates should retain scoped page masks");
+        });
+
         tc.Run("GS surface rectangle masks contain every canonical PSM address", [](TestCase &t)
         {
             struct SurfaceSpec
@@ -5559,7 +5679,10 @@ void register_ps2_gs_tests()
 
         tc.Run("GS CLAMP modes transform out-of-range texture coordinates", [](TestCase &t)
         {
-            auto renderSamplePixel = [](uint64_t clampReg) -> uint32_t
+            auto renderSamplePixel = [](
+                uint64_t clampReg,
+                uint16_t sampleU,
+                uint16_t sampleV) -> uint32_t
             {
                 std::vector<uint8_t> vram(PS2_GS_VRAM_SIZE, 0u);
                 GS gs;
@@ -5577,7 +5700,7 @@ void register_ps2_gs_tests()
                     (1ull << 14) |
                     (static_cast<uint64_t>(GS_PSM_CT32) << 20) |
                     (3ull << 26) |
-                    (0ull << 30) |
+                    (3ull << 30) |
                     (1ull << 34) |
                     (1ull << 35);
                 constexpr uint64_t kPrim =
@@ -5585,14 +5708,26 @@ void register_ps2_gs_tests()
                     (1ull << 4) |
                     (1ull << 8);
                 constexpr uint64_t kRgbaq = 0x3F80000080808080ull;
-                constexpr uint16_t kOutOfRangeU = 10u * 16u;
 
-                for (uint32_t x = 0u; x < 8u; ++x)
+                for (uint32_t y = 0u; y < 32u; ++y)
                 {
-                    const uint32_t color = 0x80000010u + x;
-                    const uint32_t offset = GSPSMCT32::addrPSMCT32(kTexTbp, 1u, x, 0u);
-                    std::memcpy(vram.data() + offset, &color, sizeof(color));
+                    for (uint32_t x = 0u; x < 32u; ++x)
+                    {
+                        const uint32_t color =
+                            0x80000010u + x + (y << 8u);
+                        const uint32_t offset =
+                            GSPSMCT32::addrPSMCT32(
+                                kTexTbp, 1u, x, y);
+                        std::memcpy(
+                            vram.data() + offset,
+                            &color,
+                            sizeof(color));
+                    }
                 }
+
+                const uint64_t uv =
+                    static_cast<uint64_t>(sampleU * 16u) |
+                    (static_cast<uint64_t>(sampleV * 16u) << 16u);
 
                 gs.writeRegister(GS_REG_FRAME_1, kFrame);
                 gs.writeRegister(GS_REG_ZBUF_1, kZbuf);
@@ -5604,11 +5739,11 @@ void register_ps2_gs_tests()
                 gs.writeRegister(GS_REG_PRIM, kPrim);
                 gs.writeRegister(GS_REG_RGBAQ, kRgbaq);
 
-                gs.writeRegister(GS_REG_UV, kOutOfRangeU);
+                gs.writeRegister(GS_REG_UV, uv);
                 gs.writeRegister(GS_REG_XYZ2, 0ull);
-                gs.writeRegister(GS_REG_UV, kOutOfRangeU);
+                gs.writeRegister(GS_REG_UV, uv);
                 gs.writeRegister(GS_REG_XYZ2, 32ull);
-                gs.writeRegister(GS_REG_UV, kOutOfRangeU);
+                gs.writeRegister(GS_REG_UV, uv);
                 gs.writeRegister(GS_REG_XYZ2, (32ull << 16));
 
                 return readReferencePSMCT32Pixel(vram, 0u, 1u, 0u, 0u);
@@ -5625,14 +5760,56 @@ void register_ps2_gs_tests()
                 (6ull << 4) |
                 (1ull << 14);
 
-            t.Equals(renderSamplePixel(kRepeat), 0x80000012u,
+            t.Equals(renderSamplePixel(kRepeat, 10u, 0u), 0x80000012u,
                      "REPEAT should wrap coordinate 10 to texel 2 in an eight-wide texture");
-            t.Equals(renderSamplePixel(kClamp), 0x80000017u,
+            t.Equals(renderSamplePixel(kClamp, 10u, 0u), 0x80000017u,
                      "CLAMP should saturate coordinate 10 to the last texel");
-            t.Equals(renderSamplePixel(kRegionClamp), 0x80000015u,
+            t.Equals(renderSamplePixel(kRegionClamp, 10u, 0u), 0x80000015u,
                      "REGION_CLAMP should saturate coordinate 10 to MAXU");
-            t.Equals(renderSamplePixel(kRegionRepeat), 0x80000013u,
+            t.Equals(renderSamplePixel(kRegionRepeat, 10u, 0u), 0x80000013u,
                      "REGION_REPEAT should apply (coordinate & MINU) | MAXU");
+
+            constexpr uint64_t kRawRegionClampU =
+                2ull |
+                (10ull << 4u) |
+                (12ull << 14u);
+            t.Equals(renderSamplePixel(kRawRegionClampU, 20u, 0u), 0x8000001Cu,
+                     "REGION_CLAMP U should preserve a raw MAXU beyond nominal width");
+            t.Equals(renderSamplePixel(kRawRegionClampU, 0u, 0u), 0x8000001Au,
+                     "REGION_CLAMP U should preserve a raw MINU beyond nominal width");
+
+            constexpr uint64_t kRawRegionClampV =
+                (2ull << 2u) |
+                (10ull << 24u) |
+                (12ull << 34u);
+            t.Equals(renderSamplePixel(kRawRegionClampV, 0u, 20u), 0x80000C10u,
+                     "REGION_CLAMP V should preserve a raw MAXV beyond nominal height");
+            t.Equals(renderSamplePixel(kRawRegionClampV, 0u, 0u), 0x80000A10u,
+                     "REGION_CLAMP V should preserve a raw MINV beyond nominal height");
+
+            constexpr uint64_t kMaskedRegionRepeatU =
+                3ull |
+                (15ull << 4u);
+            constexpr uint64_t kOffsetRegionRepeatU =
+                3ull |
+                (7ull << 4u) |
+                (16ull << 14u);
+            t.Equals(renderSamplePixel(kMaskedRegionRepeatU, 10u, 0u), 0x80000012u,
+                     "REGION_REPEAT U should mask MINU by nominal width");
+            t.Equals(renderSamplePixel(kOffsetRegionRepeatU, 3u, 0u), 0x80000023u,
+                     "REGION_REPEAT U should preserve a raw MAXU offset");
+
+            constexpr uint64_t kMaskedRegionRepeatV =
+                (3ull << 2u) |
+                (15ull << 24u);
+            constexpr uint64_t kOffsetRegionRepeatV =
+                (3ull << 2u) |
+                (7ull << 24u) |
+                (16ull << 34u);
+            t.Equals(renderSamplePixel(kMaskedRegionRepeatV, 0u, 10u), 0x80000210u,
+                     "REGION_REPEAT V should mask MINV by nominal height");
+            t.Equals(renderSamplePixel(kOffsetRegionRepeatV, 0u, 3u), 0x80001310u,
+                     "REGION_REPEAT V should preserve a raw MAXV offset");
         });
 
         tc.Run("GS STQ triangles interpolate S T and Q before perspective division", [](TestCase &t)
