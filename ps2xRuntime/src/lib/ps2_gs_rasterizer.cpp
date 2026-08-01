@@ -3028,6 +3028,13 @@ void GSRasterizer::renderSoftwarePrimitive(
             << ',' << gsFallbackReasonName(decision.reason);
         trace.output << '\n';
         ++trace.written;
+        if (trace.written == trace.limit)
+        {
+            // ps2EntryRunner performs an explicit std::_Exit after runtime
+            // shutdown, so static stream destructors cannot commit the tail
+            // of a bounded trace. The limit is the natural durable boundary.
+            trace.output.flush();
+        }
     }
     ++trace.index;
 }
