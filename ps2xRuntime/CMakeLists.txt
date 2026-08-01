@@ -641,6 +641,8 @@ target_sources(ps2_runtime PRIVATE
     src/lib/shaders/ps2_gs_memory.glsl
     src/lib/shaders/ps2_gs_memory_cases.comp
     src/lib/shaders/ps2_gs_memory_cases_spv.inc
+    src/lib/shaders/ps2_gs_nearest_ct32_sprite.comp
+    src/lib/shaders/ps2_gs_nearest_ct32_sprite_spv.inc
     src/lib/shaders/ps2_gs_vram_noop.comp
     src/lib/shaders/ps2_gs_vram_noop_spv.inc
 )
@@ -652,6 +654,8 @@ set_source_files_properties(
     src/lib/shaders/ps2_gs_memory.glsl
     src/lib/shaders/ps2_gs_memory_cases.comp
     src/lib/shaders/ps2_gs_memory_cases_spv.inc
+    src/lib/shaders/ps2_gs_nearest_ct32_sprite.comp
+    src/lib/shaders/ps2_gs_nearest_ct32_sprite_spv.inc
     src/lib/shaders/ps2_gs_vram_noop.comp
     src/lib/shaders/ps2_gs_vram_noop_spv.inc
     PROPERTIES HEADER_FILE_ONLY TRUE

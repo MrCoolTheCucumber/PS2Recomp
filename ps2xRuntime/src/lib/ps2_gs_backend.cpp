@@ -776,6 +776,29 @@ namespace
                std::abs(textureDelta) == std::abs(screenDelta);
     }
 
+    bool ct32RectangleHasUniqueWords(
+        const GsDrawBounds &bounds,
+        uint32_t framebufferWidth) noexcept
+    {
+        const uint32_t x0 = static_cast<uint32_t>(bounds.x0);
+        const uint32_t y0 = static_cast<uint32_t>(bounds.y0);
+        const uint32_t x1 = static_cast<uint32_t>(bounds.x1 - 1);
+        const uint32_t y1 = static_cast<uint32_t>(bounds.y1 - 1);
+        const uint32_t minimumColumn = x0 / 64u;
+        const uint32_t maximumColumn = x1 / 64u;
+        const uint32_t minimumRow = y0 / 32u;
+        const uint32_t maximumRow = y1 / 32u;
+        const uint32_t columns = maximumColumn - minimumColumn + 1u;
+        if (columns > framebufferWidth)
+            return false;
+
+        const uint64_t logicalPageSpan =
+            static_cast<uint64_t>(maximumRow - minimumRow) *
+                framebufferWidth +
+            (maximumColumn - minimumColumn);
+        return logicalPageSpan < GS_VRAM_PAGE_COUNT;
+    }
+
     GsBackendDecision classifyFlatCt32NoDepth(
         const GsDrawCommand &command,
         GSPrimType expectedPrimitive,
@@ -884,6 +907,14 @@ namespace
                 return {
                     false,
                     GsFallbackReason::UnsupportedTextureWrap};
+            }
+            if (!ct32RectangleHasUniqueWords(
+                    command.bounds(),
+                    std::max<uint32_t>(context.frame.fbw, 1u)))
+            {
+                return {
+                    false,
+                    GsFallbackReason::UnknownMemoryLayout};
             }
         }
 

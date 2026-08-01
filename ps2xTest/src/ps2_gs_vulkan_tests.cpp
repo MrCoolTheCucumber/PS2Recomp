@@ -1470,6 +1470,17 @@ void register_ps2_gs_vulkan_tests()
                 GsFallbackReason::ResourceAlias,
                 "raw texture reads must not overlap framebuffer writes");
 
+            const GsDrawCommand selfAliased =
+                makeNearestCt32SpriteCommand(
+                    34u, 40u, 1u, 64u, 2u, 7u, 0u,
+                    {0u, 64u, 0u, 0u}, {0u, 0u},
+                    {0u, 65u * 16u}, {0u, 16u},
+                    {0u, 65u * 16u}, {0u, 16u});
+            expectRejected(
+                selfAliased,
+                GsFallbackReason::UnknownMemoryLayout,
+                "textured destinations must not wrap onto their own CT32 words");
+
             t.Equals(
                 gsFallbackReasonName(
                     GsFallbackReason::UnsupportedTextureCoordinates),
@@ -5333,6 +5344,10 @@ void register_ps2_gs_vulkan_tests()
                     device.exactCt32Triangle,
                     device.suitable && device.shaderInt64,
                     "the exact triangle capability should expose its complete hard gate");
+                t.Equals(
+                    device.exactNearestCt32Sprite,
+                    device.suitable,
+                    "the nearest CT32 capability should expose its raw-VRAM hard gate");
                 if (!device.suitable)
                     continue;
                 t.IsTrue(device.exactVramStorage && device.computeQueue &&
@@ -5781,6 +5796,266 @@ void register_ps2_gs_vulkan_tests()
                       "a stopped service must reject sprite work");
             t.IsTrue(shutdownOutput == shutdownSentinel,
                      "post-shutdown sprite rejection must preserve output");
+        });
+
+        tc.Run("Vulkan nearest CT32 sprites match raw VRAM point sampling", [](TestCase &t)
+        {
+            GSMem::InitLookupTables();
+            std::vector<GsVulkanNearestCt32Sprite> sprites;
+            const auto addSprite = [&](GsDrawCommand command)
+            {
+                GsVulkanNearestCt32Sprite sprite{};
+                const GsBackendDecision decision =
+                    prepareGsVulkanNearestCt32Sprite(command, sprite);
+                if (!decision.supported)
+                {
+                    t.Fail(
+                        "synthetic nearest CT32 sprite was rejected as " +
+                        std::string(gsFallbackReasonName(
+                            decision.reason)));
+                    return false;
+                }
+                sprites.push_back(sprite);
+                return true;
+            };
+
+            if (!addSprite(makeNearestCt32SpriteCommand(
+                    30'000u, 40u, 2u, 64u, 2u, 6u, 5u,
+                    {6u, 15u, 5u, 12u}, {32u, 16u},
+                    {352u, 96u}, {48u, 304u},
+                    {480u, 224u}, {64u, 320u})) ||
+                !addSprite(makeNearestCt32SpriteCommand(
+                    30'001u, 40u, 2u, 64u, 2u, 6u, 5u,
+                    {3u, 14u, 2u, 6u}, {0u, 0u},
+                    {0u, 256u}, {0u, 128u},
+                    {992u, 1248u}, {480u, 608u})) ||
+                !addSprite(makeNearestCt32SpriteCommand(
+                    30'002u, 40u, 2u, 64u, 2u, 5u, 5u,
+                    {10u, 20u, 7u, 17u}, {16u, 32u},
+                    {400u, 144u}, {352u, 96u},
+                    {80u, 336u}, {32u, 288u})) ||
+                !addSprite(makeNearestCt32SpriteCommand(
+                    30'003u, 40u, 2u, 64u, 2u, 5u, 4u,
+                    {5u, 10u, 6u, 10u}, {48u, 16u},
+                    {112u, 240u}, {208u, 80u},
+                    {320u, 192u}, {320u, 192u})) ||
+                !addSprite(makeNearestCt32SpriteCommand(
+                    30'004u, 40u, 2u, 0x3FFFu, 1u, 0u, 0u,
+                    {7u, 7u, 11u, 11u}, {0u, 0u},
+                    {112u, 128u}, {176u, 192u},
+                    {0u, 16u}, {0u, 16u})) ||
+                !addSprite(makeNearestCt32SpriteCommand(
+                    30'005u, 511u, 2u, 256u, 4u, 7u, 6u,
+                    {60u, 67u, 29u, 35u}, {0u, 0u},
+                    {960u, 1088u}, {464u, 576u},
+                    {1984u, 2112u}, {992u, 1104u})) ||
+                !addSprite(makeNearestCt32SpriteCommand(
+                    30'006u, 100u, 4u, 512u, 8u, 8u, 7u,
+                    {20u, 31u, 14u, 22u}, {0u, 0u},
+                    {320u, 512u}, {224u, 368u},
+                    {4000u, 4192u}, {2000u, 2144u})))
+            {
+                return;
+            }
+
+            t.Equals(sprites.size(), static_cast<size_t>(7u),
+                     "the GPU texture corpus should retain every semantic fixture");
+            t.Equals(sprites[4].textureBaseBlock, 0x3FFFu,
+                     "the source-wrap fixture should begin at the last GS block");
+            t.Equals(sprites[5].framebufferBaseBlock, 0x3FE0u,
+                     "the destination-wrap fixture should begin at the last GS page");
+            t.Equals(sprites[5].textureMaskU, 127u,
+                     "the varied-stride fixture should retain its larger U mask");
+
+            GsVulkanServiceConfig config{};
+            config.probe.enableValidation = true;
+            GsVulkanCapabilityReport preflight =
+                probeGsVulkanCapabilities(config.probe);
+            if (preflight.status ==
+                GsVulkanProbeStatus::ValidationUnavailable)
+            {
+                config.probe.enableValidation = false;
+                preflight = probeGsVulkanCapabilities(config.probe);
+            }
+
+            GsVulkanCapabilityReport creationReport{};
+            std::string creationError;
+            std::unique_ptr<GsVulkanService> service =
+                GsVulkanService::create(
+                    config, &creationReport, &creationError);
+            if (!preflight.ready())
+            {
+                t.IsNull(service.get(),
+                         "an unavailable host should skip nearest CT32 execution cleanly");
+                t.IsFalse(creationReport.ready(),
+                          "the skipped texture service must retain its capability result");
+                return;
+            }
+
+            t.IsNotNull(service.get(),
+                        "a suitable device should create the nearest CT32 service");
+            t.IsTrue(creationError.empty(),
+                     "successful texture service creation should clear its diagnostic");
+            if (!service)
+                return;
+            const GsVulkanDeviceReport *selected =
+                creationReport.selectedDevice();
+            t.IsNotNull(selected,
+                        "the texture service should retain its selected device");
+            if (selected)
+            {
+                t.IsTrue(selected->exactNearestCt32Sprite,
+                         "the selected device should publish the exact texture capability");
+            }
+
+            uint64_t expectedPixels = 0u;
+            for (size_t index = 0u; index < sprites.size(); ++index)
+            {
+                const GsVulkanNearestCt32Sprite &sprite =
+                    sprites[index];
+                const std::vector<uint8_t> input = makeVramPattern(
+                    0x54455830u + static_cast<uint32_t>(index));
+                std::vector<uint8_t> expected = input;
+                applyNearestCt32SpriteCpu(expected, sprite);
+                std::vector<uint8_t> actual = {0xA5u};
+                std::string error;
+                if (!service->executeNearestCt32Sprite(
+                        input, sprite, actual, &error))
+                {
+                    t.Fail(
+                        "GPU nearest CT32 sprite " +
+                        std::to_string(index) + " failed: " + error);
+                    return;
+                }
+                if (actual != expected)
+                {
+                    t.Fail(
+                        "GPU nearest CT32 sprite " +
+                        std::to_string(index) +
+                        " disagreed with the complete CPU VRAM image");
+                    return;
+                }
+                expectedPixels +=
+                    static_cast<uint64_t>(
+                        sprite.boundsX1 - sprite.boundsX0) *
+                    static_cast<uint64_t>(
+                        sprite.boundsY1 - sprite.boundsY0);
+            }
+
+            const std::vector<uint8_t> repeatedInput =
+                makeVramPattern(0x52505431u);
+            std::vector<uint8_t> repeatedExpected = repeatedInput;
+            applyNearestCt32SpriteCpu(repeatedExpected, sprites[5]);
+            std::vector<uint8_t> repeatedOutput = {0x5Au};
+            std::string repeatedError;
+            t.IsTrue(service->executeNearestCt32Sprite(
+                         repeatedInput, sprites[5], repeatedOutput,
+                         &repeatedError),
+                     "the repeated destination-wrap dispatch should complete");
+            t.IsTrue(repeatedOutput == repeatedExpected,
+                     "repeated raw texture execution should remain byte-exact");
+            expectedPixels +=
+                static_cast<uint64_t>(
+                    sprites[5].boundsX1 - sprites[5].boundsX0) *
+                static_cast<uint64_t>(
+                    sprites[5].boundsY1 - sprites[5].boundsY0);
+
+            const std::vector<uint8_t> validInput =
+                makeVramPattern(0x56414C31u);
+            const auto expectRejected =
+                [&](std::span<const uint8_t> rejectedInput,
+                    GsVulkanNearestCt32Sprite rejectedSprite,
+                    const std::string &label)
+            {
+                std::vector<uint8_t> output = {0x12u, 0x34u};
+                const std::vector<uint8_t> sentinel = output;
+                std::string error;
+                t.IsFalse(service->executeNearestCt32Sprite(
+                              rejectedInput, rejectedSprite,
+                              output, &error),
+                          label + " should fail closed");
+                t.IsTrue(output == sentinel,
+                         label + " must preserve caller output");
+                t.IsFalse(error.empty(),
+                          label + " should retain a diagnostic");
+            };
+
+            const std::vector<uint8_t> shortInput(
+                GS_VULKAN_VRAM_SIZE - 1u, 0u);
+            expectRejected(shortInput, sprites.front(),
+                           "short texture VRAM input");
+            GsVulkanNearestCt32Sprite invalid = sprites.front();
+            invalid.reserved0 = 1u;
+            expectRejected(validInput, invalid,
+                           "non-zero texture reserved data");
+            invalid = sprites.front();
+            invalid.textureMaskU = 2u;
+            expectRejected(validInput, invalid,
+                           "non-power-of-two texture repeat mask");
+            invalid = sprites.front();
+            invalid.textureStepU = 0;
+            expectRejected(validInput, invalid,
+                           "zero texture coordinate step");
+            invalid = sprites.front();
+            invalid.boundsX1 = invalid.boundsX0 +
+                               invalid.framebufferWidth * 64u + 1u;
+            expectRejected(validInput, invalid,
+                           "self-aliasing texture destination");
+            invalid = sprites.front();
+            invalid.textureBaseBlock = invalid.framebufferBaseBlock;
+            expectRejected(validInput, invalid,
+                           "aliased texture source and destination");
+
+            const GsVulkanServiceStatistics statistics =
+                service->statistics();
+            const uint64_t acceptedDraws = sprites.size() + 1u;
+            t.Equals(statistics.nearestCt32SpriteDrawsCompleted,
+                     acceptedDraws,
+                     "every accepted nearest CT32 sprite should complete exactly once");
+            t.Equals(statistics.nearestCt32SpriteDrawsFailed, 0ull,
+                     "caller-side texture rejection should not count as failed GPU work");
+            t.Equals(statistics.nearestCt32SpritePixelsExecuted,
+                     expectedPixels,
+                     "texture statistics should count exact covered pixels");
+            t.Equals(statistics.spriteDrawsCompleted, 0ull,
+                     "textured execution should not pollute flat-sprite counters");
+            t.Equals(statistics.queueSubmissions, acceptedDraws,
+                     "each texture request should use one queue submission");
+            t.Equals(statistics.shaderDispatches, acceptedDraws,
+                     "each texture request should use one compute dispatch");
+            t.Equals(statistics.pipelineBarriers, acceptedDraws * 4u,
+                     "each raw texture request should retain the bounded barrier plan");
+            t.Equals(statistics.bytesUploaded,
+                     acceptedDraws * GS_VULKAN_VRAM_SIZE,
+                     "each texture request should upload canonical CPU VRAM");
+            t.Equals(statistics.bytesDownloaded,
+                     acceptedDraws * GS_VULKAN_VRAM_SIZE,
+                     "each texture request should download canonical CPU VRAM");
+            t.Equals(statistics.validationErrors, 0u,
+                     "nearest CT32 execution must remain validation-clean");
+            t.Equals(statistics.validationWarnings, 0u,
+                     "nearest CT32 execution should emit no validation warnings");
+            t.IsTrue(service->healthy(),
+                     "successful and rejected texture draws should leave the service healthy");
+
+            service->shutdown();
+            service->shutdown();
+            const GsVulkanServiceStatistics shutdownStatistics =
+                service->statistics();
+            t.Equals(shutdownStatistics.validationErrors, 0u,
+                     "texture pipeline destruction must remain validation-clean");
+            t.Equals(shutdownStatistics.validationWarnings, 0u,
+                     "texture pipeline destruction should emit no validation warnings");
+
+            std::vector<uint8_t> shutdownOutput = {0xABu};
+            const std::vector<uint8_t> shutdownSentinel = shutdownOutput;
+            std::string shutdownError;
+            t.IsFalse(service->executeNearestCt32Sprite(
+                          validInput, sprites.front(), shutdownOutput,
+                          &shutdownError),
+                      "a stopped service must reject nearest CT32 work");
+            t.IsTrue(shutdownOutput == shutdownSentinel,
+                     "post-shutdown texture rejection must preserve output");
         });
 
         tc.Run("Vulkan CT32 triangles match CPU fixed-point edges and wrap", [](TestCase &t)

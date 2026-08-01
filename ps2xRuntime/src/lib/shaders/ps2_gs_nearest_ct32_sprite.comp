@@ -1,0 +1,72 @@
+#version 450
+#extension GL_GOOGLE_include_directive : require
+
+#include "ps2_gs_memory.glsl"
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+layout(set = 0, binding = 0, std430) buffer GsVram
+{
+    uint words[];
+} gs_vram;
+
+layout(push_constant) uniform TextureSpriteParameters
+{
+    uint framebuffer_base_block;
+    uint framebuffer_width;
+    uint bounds_x0;
+    uint bounds_y0;
+    uint bounds_x1;
+    uint bounds_y1;
+    uint texture_base_block;
+    uint texture_width;
+    uint texture_mask_u;
+    uint texture_mask_v;
+    int texture_origin_u;
+    int texture_origin_v;
+    int texture_step_u;
+    int texture_step_v;
+    uint reserved0;
+    uint reserved1;
+} sprite;
+
+void main()
+{
+    uint offset_x = gl_GlobalInvocationID.x;
+    uint offset_y = gl_GlobalInvocationID.y;
+    uint x = sprite.bounds_x0 + offset_x;
+    uint y = sprite.bounds_y0 + offset_y;
+    if (x >= sprite.bounds_x1 || y >= sprite.bounds_y1)
+        return;
+
+    int texture_u = sprite.texture_origin_u +
+                    int(offset_x) * sprite.texture_step_u;
+    int texture_v = sprite.texture_origin_v +
+                    int(offset_y) * sprite.texture_step_v;
+    uint wrapped_u = uint(texture_u) & sprite.texture_mask_u;
+    uint wrapped_v = uint(texture_v) & sprite.texture_mask_v;
+    uint texture_bit_address = gs_pixel_bit_address(
+        0x00u,
+        sprite.texture_base_block,
+        sprite.texture_width,
+        wrapped_u,
+        wrapped_v);
+    uint texture_word_index =
+        (texture_bit_address >> 5u) & (GS_MEMORY_WORD_COUNT - 1u);
+    uint texel = gs_vram.words[texture_word_index];
+
+    uint framebuffer_bit_address = gs_pixel_bit_address(
+        0x00u,
+        sprite.framebuffer_base_block,
+        sprite.framebuffer_width,
+        x,
+        y);
+    uint framebuffer_word_index =
+        (framebuffer_bit_address >> 5u) & (GS_MEMORY_WORD_COUNT - 1u);
+
+    // Eligibility proves that source and destination page sets are disjoint
+    // and that covered framebuffer coordinates map to unique physical words.
+    // Atomic exchange keeps the raw CT32 store defined even if a malformed
+    // driver executes duplicate invocations.
+    atomicExchange(gs_vram.words[framebuffer_word_index], texel);
+}

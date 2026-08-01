@@ -100,6 +100,11 @@ struct GsVulkanDeviceReport
     // The initial exact triangle kernel additionally requires native signed
     // 64-bit shader arithmetic for full-range GS 12.4 edge equations.
     bool exactCt32Triangle = false;
+
+    // The first textured-sprite kernel needs only the permanent exact raw-VRAM
+    // storage contract; the separate bit lets routing fail closed if that
+    // semantic pipeline is unavailable on a future platform.
+    bool exactNearestCt32Sprite = false;
     bool suitable = false;
     std::string rejectionReason;
 };
@@ -175,6 +180,9 @@ struct GsVulkanServiceStatistics
     uint64_t spriteDrawsCompleted = 0u;
     uint64_t spriteDrawsFailed = 0u;
     uint64_t spritePixelsExecuted = 0u;
+    uint64_t nearestCt32SpriteDrawsCompleted = 0u;
+    uint64_t nearestCt32SpriteDrawsFailed = 0u;
+    uint64_t nearestCt32SpritePixelsExecuted = 0u;
     uint64_t triangleDrawsCompleted = 0u;
     uint64_t triangleDrawsFailed = 0u;
     uint64_t triangleCandidatePixelsExecuted = 0u;
@@ -478,6 +486,15 @@ public:
         const GsVulkanCt32Sprite &sprite,
         std::vector<uint8_t> &output,
         std::string *error = nullptr) override;
+
+    // Uploads canonical VRAM, executes one prepared nearest CT32 texture
+    // sprite through raw GS-local-memory reads, and publishes the synchronized
+    // 4 MiB result. This qualification seam is not yet used by live routing.
+    [[nodiscard]] bool executeNearestCt32Sprite(
+        std::span<const uint8_t> input,
+        const GsVulkanNearestCt32Sprite &sprite,
+        std::vector<uint8_t> &output,
+        std::string *error = nullptr);
 
     // Uploads canonical 4 MiB CPU VRAM, executes one prepared exact flat
     // CT32 triangle, and publishes the complete synchronized image. Devices
