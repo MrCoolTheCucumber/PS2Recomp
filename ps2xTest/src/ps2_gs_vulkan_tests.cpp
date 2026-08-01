@@ -371,6 +371,51 @@ namespace
             GsDrawGlobalState{});
     }
 
+    GsDrawCommand makeLinearCt32SpriteCommand(
+        uint64_t sequence,
+        uint32_t framebufferPage,
+        uint8_t framebufferWidth,
+        uint32_t textureBaseBlock,
+        uint8_t textureWidth,
+        uint8_t textureWidthLog2,
+        uint8_t textureHeightLog2,
+        GSScissorReg scissor,
+        GSXYOffsetReg xyoffset,
+        const std::array<uint16_t, 2> &rawX,
+        const std::array<uint16_t, 2> &rawY,
+        const std::array<uint16_t, 2> &rawU,
+        const std::array<uint16_t, 2> &rawV,
+        uint8_t textureWrapModeU,
+        uint8_t textureWrapModeV)
+    {
+        const GsDrawCommand nearest = makeNearestCt32SpriteCommand(
+            sequence,
+            framebufferPage,
+            framebufferWidth,
+            textureBaseBlock,
+            textureWidth,
+            textureWidthLog2,
+            textureHeightLog2,
+            scissor,
+            xyoffset,
+            rawX,
+            rawY,
+            rawU,
+            rawV,
+            textureWrapModeU,
+            textureWrapModeV);
+        GSContext context = nearest.context();
+        context.tex1 &=
+            ~((0x7ull << 2u) | (1ull << 5u) | (0x7ull << 6u));
+        context.tex1 |= (1ull << 5u) | (1ull << 6u);
+        return buildGsDrawCommand(
+            sequence,
+            nearest.primitive(),
+            context,
+            std::span<const GSVertex>(nearest.vertices()).first(2u),
+            nearest.globalState());
+    }
+
     GsDrawCommand makeLinearCt32RepeatSpriteCommand(
         uint64_t sequence,
         uint32_t framebufferPage,
@@ -386,7 +431,7 @@ namespace
         const std::array<uint16_t, 2> &rawU,
         const std::array<uint16_t, 2> &rawV)
     {
-        const GsDrawCommand nearest = makeNearestCt32SpriteCommand(
+        return makeLinearCt32SpriteCommand(
             sequence,
             framebufferPage,
             framebufferWidth,
@@ -399,17 +444,9 @@ namespace
             rawX,
             rawY,
             rawU,
-            rawV);
-        GSContext context = nearest.context();
-        context.tex1 &=
-            ~((0x7ull << 2u) | (1ull << 5u) | (0x7ull << 6u));
-        context.tex1 |= (1ull << 5u) | (1ull << 6u);
-        return buildGsDrawCommand(
-            sequence,
-            nearest.primitive(),
-            context,
-            std::span<const GSVertex>(nearest.vertices()).first(2u),
-            nearest.globalState());
+            rawV,
+            0u,
+            0u);
     }
 
     GsDrawCommand makeCt32TriangleCommand(
@@ -595,6 +632,37 @@ namespace
         std::vector<uint8_t> &vram,
         const GsVulkanLinearCt32Sprite &sprite)
     {
+        const auto wrapCoordinate = [](
+            int32_t coordinate,
+            uint32_t mask,
+            uint32_t wrap)
+        {
+            const uint8_t mode = gsVulkanTextureWrapMode(wrap);
+            if (mode == 0u)
+                return static_cast<uint32_t>(coordinate) & mask;
+            if (mode == 1u)
+            {
+                return static_cast<uint32_t>(std::clamp(
+                    coordinate, 0, static_cast<int32_t>(mask)));
+            }
+            if (mode == 3u)
+            {
+                const uint32_t regionMask =
+                    gsVulkanTextureRegionMin(wrap) & mask;
+                return
+                    (static_cast<uint32_t>(coordinate) & regionMask) |
+                    gsVulkanTextureRegionMax(wrap);
+            }
+            const int32_t minimum =
+                gsVulkanTextureRegionMin(wrap);
+            const int32_t maximum =
+                gsVulkanTextureRegionMax(wrap);
+            if (coordinate < minimum)
+                return static_cast<uint32_t>(minimum);
+            if (coordinate > maximum)
+                return static_cast<uint32_t>(maximum);
+            return static_cast<uint32_t>(coordinate);
+        };
         const int alignedDrawX =
             static_cast<int>(sprite.boundsX0) & ~7;
         float fixedScanV =
@@ -608,11 +676,17 @@ namespace
             const int32_t fixedV = static_cast<int32_t>(fixedScanV);
             const uint8_t weightV = static_cast<uint8_t>(
                 (static_cast<uint32_t>(fixedV) >> 12u) & 0xFu);
-            const uint32_t v0 =
-                static_cast<uint32_t>(floorLinearFixed16_16(fixedV)) &
-                sprite.textureMaskV;
-            const uint32_t v1 =
-                weightV == 0u ? v0 : (v0 + 1u) & sprite.textureMaskV;
+            const int32_t unwrappedV0 = floorLinearFixed16_16(fixedV);
+            const uint32_t v0 = wrapCoordinate(
+                unwrappedV0,
+                sprite.textureMaskV,
+                sprite.textureWrapV);
+            const uint32_t v1 = weightV == 0u
+                ? v0
+                : wrapCoordinate(
+                      unwrappedV0 + 1,
+                      sprite.textureMaskV,
+                      sprite.textureWrapV);
 
             for (uint32_t x = sprite.boundsX0;
                  x < sprite.boundsX1;
@@ -627,11 +701,18 @@ namespace
                         static_cast<uint32_t>(block));
                 const uint8_t weightU = static_cast<uint8_t>(
                     (static_cast<uint32_t>(fixedU) >> 12u) & 0xFu);
-                const uint32_t u0 =
-                    static_cast<uint32_t>(floorLinearFixed16_16(fixedU)) &
-                    sprite.textureMaskU;
-                const uint32_t u1 =
-                    weightU == 0u ? u0 : (u0 + 1u) & sprite.textureMaskU;
+                const int32_t unwrappedU0 =
+                    floorLinearFixed16_16(fixedU);
+                const uint32_t u0 = wrapCoordinate(
+                    unwrappedU0,
+                    sprite.textureMaskU,
+                    sprite.textureWrapU);
+                const uint32_t u1 = weightU == 0u
+                    ? u0
+                    : wrapCoordinate(
+                          unwrappedU0 + 1,
+                          sprite.textureMaskU,
+                          sprite.textureWrapU);
 
                 const uint32_t c00 = GSMem::ReadCT32(
                     vram.data(),
@@ -2306,22 +2387,43 @@ void register_ps2_gs_vulkan_tests()
 
             GSContext clamp = command.context();
             clamp.clamp = (clamp.clamp & ~0xFull) | 0x5u;
+            const GsDrawCommand clamped =
+                rebuild(142u, command.primitive(), clamp);
+            GsVulkanLinearCt32Sprite clampedSprite{};
+            const GsBackendDecision clampedDecision =
+                prepareGsVulkanLinearCt32Sprite(
+                    clamped, clampedSprite);
+            t.IsTrue(
+                clampedDecision.supported,
+                "standard clamp should extend the same exact linear DDA");
+            t.Equals(
+                gsVulkanTextureWrapMode(clampedSprite.textureWrapU),
+                1u,
+                "linear U clamp should reach the prepared record");
+            t.Equals(
+                gsVulkanTextureWrapMode(clampedSprite.textureWrapV),
+                1u,
+                "linear V clamp should reach the prepared record");
+
+            GSContext regionClamp = command.context();
+            regionClamp.clamp =
+                (regionClamp.clamp & ~0xFull) | 0xAu;
             expectRejected(
-                rebuild(142u, command.primitive(), clamp),
+                rebuild(143u, command.primitive(), regionClamp),
                 GsFallbackReason::UnsupportedTextureWrap,
-                "linear clamp should remain a later independent slice");
+                "linear region clamp should remain a later slice");
 
             GSPrimReg stq = command.primitive();
             stq.fst = false;
             expectRejected(
-                rebuild(143u, stq, command.context()),
+                rebuild(144u, stq, command.context()),
                 GsFallbackReason::UnsupportedTextureCoordinates,
                 "linear STQ should remain outside the prepared FST DDA");
 
             GSContext aliased = command.context();
             aliased.tex0.tbp0 = command.context().frame.fbp << 5u;
             expectRejected(
-                rebuild(144u, command.primitive(), aliased),
+                rebuild(145u, command.primitive(), aliased),
                 GsFallbackReason::ResourceAlias,
                 "linear raw texture reads must remain disjoint from writes");
 
@@ -2434,6 +2536,88 @@ void register_ps2_gs_vulkan_tests()
                     std::ostringstream message;
                     message
                         << "linear CT32 record diverged from software case "
+                        << index;
+                    t.Fail(message.str());
+                    return;
+                }
+            }
+        });
+
+        tc.Run("Linear CT32 standard clamp records match software bilinear edges", [](TestCase &t)
+        {
+            GSMem::InitLookupTables();
+            struct ClampCase
+            {
+                uint8_t wrapU;
+                uint8_t wrapV;
+                std::array<uint16_t, 2> u;
+                std::array<uint16_t, 2> v;
+            };
+            const std::array<ClampCase, 4> cases{{
+                {1u, 0u, {0u, 128u}, {0u, 128u}},
+                {0u, 1u, {0u, 128u}, {0u, 128u}},
+                {1u, 1u, {0u, 128u}, {0u, 128u}},
+                {1u, 1u, {128u, 256u}, {128u, 256u}},
+            }};
+
+            uint64_t sequence = 160u;
+            for (size_t index = 0u; index < cases.size(); ++index)
+            {
+                const ClampCase &clampCase = cases[index];
+                const GsDrawCommand command = makeLinearCt32SpriteCommand(
+                    sequence++,
+                    0u,
+                    1u,
+                    512u,
+                    1u,
+                    3u,
+                    3u,
+                    {0u, 7u, 0u, 7u},
+                    {128u, 96u},
+                    {128u, 256u},
+                    {96u, 224u},
+                    clampCase.u,
+                    clampCase.v,
+                    clampCase.wrapU,
+                    clampCase.wrapV);
+                GsVulkanLinearCt32Sprite sprite{};
+                const GsBackendDecision decision =
+                    prepareGsVulkanLinearCt32Sprite(command, sprite);
+                if (!decision.supported)
+                {
+                    t.Fail(
+                        "the standard-clamp edge corpus must satisfy the linear predicate");
+                    return;
+                }
+
+                t.Equals(
+                    gsVulkanTextureWrapMode(sprite.textureWrapU),
+                    clampCase.wrapU,
+                    "the clamp corpus should retain its U mode");
+                t.Equals(
+                    gsVulkanTextureWrapMode(sprite.textureWrapV),
+                    clampCase.wrapV,
+                    "the clamp corpus should retain its V mode");
+
+                std::vector<uint8_t> actual = makeVramPattern(
+                    0x434C4D50u + static_cast<uint32_t>(index));
+                std::vector<uint8_t> expected = actual;
+                applyLinearCt32SpriteCpu(expected, sprite);
+
+                GS gs;
+                gs.init(
+                    actual.data(),
+                    static_cast<uint32_t>(actual.size()),
+                    nullptr);
+                gs.setDebugHistoryPaused(true);
+                drawNearestCt32SpriteCommand(gs, command);
+                gs.flushRenderBatch();
+
+                if (actual != expected)
+                {
+                    std::ostringstream message;
+                    message
+                        << "linear CT32 clamp record diverged from software case "
                         << index;
                     t.Fail(message.str());
                     return;
@@ -3172,6 +3356,26 @@ void register_ps2_gs_vulkan_tests()
                         "an exact linear executor should create Verify");
             if (!backend)
                 return;
+
+            const GsDrawCommand clampedCommand =
+                makeLinearCt32SpriteCommand(
+                    99u, 0u, 8u, 3584u, 8u, 10u, 10u,
+                    {0u, 511u, 0u, 447u},
+                    {28672u, 29184u},
+                    {28664u, 29176u},
+                    {29176u, 36344u},
+                    {0u, 512u},
+                    {0u, 6656u},
+                    1u, 1u);
+            GsVulkanLinearCt32Sprite clampedPrepared{};
+            t.IsTrue(
+                prepareGsVulkanLinearCt32Sprite(
+                    clampedCommand, clampedPrepared).supported,
+                "standard clamp should be valid at the prepared-record seam");
+            t.Equals(
+                backend->classify(clampedCommand).reason,
+                GsFallbackReason::UnsupportedTextureWrap,
+                "renderer routing should remain repeat-only until shader qualification");
 
             t.IsTrue(backend->classify(command).supported,
                      "Verify should expose capability-gated linear repeat sprites");

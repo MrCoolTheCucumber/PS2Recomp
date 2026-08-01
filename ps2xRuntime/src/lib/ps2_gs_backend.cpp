@@ -772,7 +772,7 @@ namespace
     {
         Disabled,
         NearestCt32,
-        LinearCt32Repeat,
+        LinearCt32,
     };
 
     bool hasOneToOneIntegerTextureAxis(
@@ -945,9 +945,8 @@ namespace
                 (context.clamp >> 24u) & 0x3FFu);
             const uint16_t regionMaxV = static_cast<uint16_t>(
                 (context.clamp >> 34u) & 0x3FFu);
-            if (textureRequirement ==
-                    TextureRequirement::LinearCt32Repeat &&
-                (wrapModeU != 0u || wrapModeV != 0u))
+            if (textureRequirement == TextureRequirement::LinearCt32 &&
+                (wrapModeU > 1u || wrapModeV > 1u))
             {
                 return {
                     false,
@@ -1001,12 +1000,12 @@ GsBackendDecision classifyGsNearestCt32TexturedSprite(
         TextureRequirement::NearestCt32);
 }
 
-GsBackendDecision classifyGsLinearCt32RepeatSprite(
+GsBackendDecision classifyGsLinearCt32TexturedSprite(
     const GsDrawCommand &command) noexcept
 {
     return classifyFlatCt32NoDepth(
         command, GS_PRIM_SPRITE, 2u,
-        TextureRequirement::LinearCt32Repeat);
+        TextureRequirement::LinearCt32);
 }
 
 GsBackendDecision classifyGsFlatCt32Triangle(

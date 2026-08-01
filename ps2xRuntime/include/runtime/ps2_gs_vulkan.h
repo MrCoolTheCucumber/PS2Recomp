@@ -403,7 +403,8 @@ static_assert(offsetof(GsVulkanNearestCt32Sprite, textureWrapV) == 60u);
 // slice. U retains the software GS eight-lane setup verbatim. V retains the
 // binary32 seed and step used by its sequential scanline recurrence; the bit
 // representation keeps the executor ABI independent of host float layout
-// spelling. The initial classifier admits REPEAT on both axes only.
+// spelling. The preparation contract admits REPEAT or standard CLAMP on each
+// axis; execution capabilities may qualify those modes incrementally.
 struct alignas(16) GsVulkanLinearCt32Sprite
 {
     uint32_t framebufferBaseBlock = 0u;
@@ -448,7 +449,7 @@ static_assert(offsetof(GsVulkanLinearCt32Sprite, fixedStepVBits) == 84u);
 static_assert(offsetof(GsVulkanLinearCt32Sprite, textureWrapU) == 88u);
 static_assert(offsetof(GsVulkanLinearCt32Sprite, textureWrapV) == 92u);
 
-// Publishes only a fully validated repeat/repeat linear CT32 record. Rejected
+// Publishes only a fully validated repeat/clamp linear CT32 record. Rejected
 // commands leave the caller's record untouched.
 [[nodiscard]] GsBackendDecision prepareGsVulkanLinearCt32Sprite(
     const GsDrawCommand &command,

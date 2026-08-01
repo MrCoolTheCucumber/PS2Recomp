@@ -267,17 +267,17 @@ namespace
             sprite.textureMaskV + 1u);
     }
 
-    const char *linearCt32SpriteValidationError(
+    const char *linearCt32SpriteRecordValidationError(
         const GsVulkanLinearCt32Sprite &sprite) noexcept
     {
         if ((sprite.textureWrapU &
              ~GS_VULKAN_TEXTURE_WRAP_DESCRIPTOR_MASK) != 0u ||
             (sprite.textureWrapV &
              ~GS_VULKAN_TEXTURE_WRAP_DESCRIPTOR_MASK) != 0u ||
-            gsVulkanTextureWrapMode(sprite.textureWrapU) != 0u ||
-            gsVulkanTextureWrapMode(sprite.textureWrapV) != 0u)
+            gsVulkanTextureWrapMode(sprite.textureWrapU) > 1u ||
+            gsVulkanTextureWrapMode(sprite.textureWrapV) > 1u)
         {
-            return "Vulkan linear CT32 sprite requires repeat wrap";
+            return "Vulkan linear CT32 sprite requires repeat or clamp wrap";
         }
         if (sprite.framebufferBaseBlock > 0x3FFFu ||
             sprite.textureBaseBlock > 0x3FFFu)
@@ -338,6 +338,22 @@ namespace
             sprite.boundsY1 - sprite.boundsY0);
         if (texturePages.intersects(framebufferPages))
             return "Vulkan linear CT32 sprite source aliases destination";
+        return nullptr;
+    }
+
+    const char *linearCt32SpriteValidationError(
+        const GsVulkanLinearCt32Sprite &sprite) noexcept
+    {
+        if (const char *recordError =
+                linearCt32SpriteRecordValidationError(sprite))
+        {
+            return recordError;
+        }
+        if (gsVulkanTextureWrapMode(sprite.textureWrapU) != 0u ||
+            gsVulkanTextureWrapMode(sprite.textureWrapV) != 0u)
+        {
+            return "Vulkan linear CT32 sprite execution requires repeat wrap";
+        }
         return nullptr;
     }
 
@@ -719,7 +735,7 @@ GsBackendDecision prepareGsVulkanLinearCt32Sprite(
     GsVulkanLinearCt32Sprite &sprite) noexcept
 {
     const GsBackendDecision decision =
-        classifyGsLinearCt32RepeatSprite(command);
+        classifyGsLinearCt32TexturedSprite(command);
     if (!decision.supported)
         return decision;
 
@@ -816,7 +832,7 @@ GsBackendDecision prepareGsVulkanLinearCt32Sprite(
         static_cast<uint8_t>((context.clamp >> 2u) & 0x3u),
         static_cast<uint16_t>((context.clamp >> 24u) & 0x3FFu),
         static_cast<uint16_t>((context.clamp >> 34u) & 0x3FFu));
-    if (linearCt32SpriteValidationError(prepared))
+    if (linearCt32SpriteRecordValidationError(prepared))
         return {false, GsFallbackReason::UnknownMemoryLayout};
 
     sprite = prepared;
