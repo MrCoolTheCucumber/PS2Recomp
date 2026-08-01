@@ -3310,7 +3310,7 @@ void register_ps2_gs_vulkan_tests()
                      "strict texture failure must not invoke software fallback");
         });
 
-        tc.Run("Vulkan raster backend verifies linear CT32 repeat sprites behind capability", [](TestCase &t)
+        tc.Run("Vulkan raster backend verifies linear CT32 repeat and clamp behind capability", [](TestCase &t)
         {
             GSMem::InitLookupTables();
             const GsDrawCommand command =
@@ -3372,10 +3372,13 @@ void register_ps2_gs_vulkan_tests()
                 prepareGsVulkanLinearCt32Sprite(
                     clampedCommand, clampedPrepared).supported,
                 "standard clamp should be valid at the prepared-record seam");
-            t.Equals(
-                backend->classify(clampedCommand).reason,
-                GsFallbackReason::UnsupportedTextureWrap,
-                "renderer routing should remain repeat-only until shader qualification");
+            const GsBackendDecision clampedRoute =
+                backend->classify(clampedCommand);
+            t.IsTrue(
+                clampedRoute.supported,
+                "Verify should expose qualified linear standard clamp");
+            if (!clampedRoute.supported)
+                return;
 
             t.IsTrue(backend->classify(command).supported,
                      "Verify should expose capability-gated linear repeat sprites");
@@ -3404,6 +3407,45 @@ void register_ps2_gs_vulkan_tests()
             t.Equals(serviceStatistics.nearestCt32SpriteDrawsCompleted,
                      0ull,
                      "linear Verify must not alias the nearest request");
+
+            std::vector<uint8_t> clampedExpected = expected;
+            applyLinearCt32SpriteCpu(
+                clampedExpected, clampedPrepared);
+            backend->submit(
+                std::span<const GsDrawCommand>(&clampedCommand, 1u));
+            t.IsTrue(
+                vram == clampedExpected,
+                "linear clamp Verify should retain the agreed software image");
+            t.Equals(
+                softwareCalls,
+                2ull,
+                "linear clamp Verify should run its independent oracle once");
+            const GsVulkanRasterBackendStatistics clampedStatistics =
+                backend->backendStatistics();
+            t.Equals(clampedStatistics.commandsAttempted, 2ull,
+                     "repeat and clamp should each reach Verify");
+            t.Equals(clampedStatistics.commandsCompleted, 2ull,
+                     "repeat and clamp should each complete once");
+            t.Equals(clampedStatistics.verifiedCommands, 2ull,
+                     "repeat and clamp should each compare independently");
+            t.Equals(
+                clampedStatistics.bytesCompared,
+                2ull * GS_VULKAN_VRAM_SIZE,
+                "two linear draws should compare two complete VRAM images");
+            t.Equals(
+                backend->serviceStatistics()
+                    .linearCt32SpriteDrawsCompleted,
+                2ull,
+                "the executor should receive repeat and clamp requests");
+
+            t.IsTrue(backend->setMode(GsRendererMode::GpuStrict),
+                     "the Verify fixture should enter strict mode cleanly");
+            t.Equals(
+                backend->classify(clampedCommand).reason,
+                GsFallbackReason::UnsupportedTextureWrap,
+                "strict clamp should remain closed until resident routing qualification");
+            t.IsTrue(backend->setMode(GsRendererMode::Verify),
+                     "the fixture should restore Verify after its strict gate");
 
             std::vector<uint8_t> unavailableVram = initial;
             std::unique_ptr<GsVulkanRasterBackend> unavailable =

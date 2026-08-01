@@ -935,8 +935,11 @@ GsBackendDecision GsVulkanRasterBackend::classify(
             prepareGsVulkanLinearCt32Sprite(command, linearSprite);
         if (!linearDecision.supported)
             return linearDecision;
-        if (gsVulkanTextureWrapMode(linearSprite.textureWrapU) != 0u ||
-            gsVulkanTextureWrapMode(linearSprite.textureWrapV) != 0u)
+        const bool usesStandardClamp =
+            gsVulkanTextureWrapMode(linearSprite.textureWrapU) != 0u ||
+            gsVulkanTextureWrapMode(linearSprite.textureWrapV) != 0u;
+        if (usesStandardClamp &&
+            m_impl->config.mode != GsRendererMode::Verify)
         {
             return {false, GsFallbackReason::UnsupportedTextureWrap};
         }
