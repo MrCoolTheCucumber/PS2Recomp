@@ -1,11 +1,18 @@
 #include "MiniTest.h"
 #include "runtime/ps2_gs_memory.h"
 #include "runtime/ps2_gs_vulkan.h"
+#include "runtime/ps2_gs_vulkan_backend.h"
 
 #include <array>
+#include <atomic>
+#include <chrono>
 #include <cstdint>
 #include <cstring>
+#include <filesystem>
+#include <fstream>
+#include <iterator>
 #include <sstream>
+#include <stdexcept>
 #include <string>
 #include <thread>
 #include <vector>
@@ -303,6 +310,110 @@ namespace
             }
         }
     }
+
+    class FakeCt32Executor final : public IGsVulkanDrawExecutor
+    {
+    public:
+        enum class Behavior
+        {
+            Exact,
+            Noop,
+            Fail,
+            InvalidOutput,
+        };
+
+        explicit FakeCt32Executor(Behavior behavior_)
+            : behavior(behavior_)
+        {
+            report.compiled = true;
+            report.status = GsVulkanProbeStatus::Ready;
+            report.selectedDeviceIndex = 0;
+            report.devices.push_back({});
+            report.devices[0].name = "deterministic fake executor";
+            report.devices[0].suitable = true;
+        }
+
+        bool executeCt32Sprite(
+            std::span<const uint8_t> input,
+            const GsVulkanCt32Sprite &sprite,
+            std::vector<uint8_t> &output,
+            std::string *error) override
+        {
+            if (!isHealthy || behavior == Behavior::Fail)
+            {
+                ++serviceStatistics.spriteDrawsFailed;
+                if (error)
+                    *error = "injected CT32 executor failure";
+                return false;
+            }
+
+            output.assign(input.begin(), input.end());
+            if (behavior == Behavior::Exact)
+                applyCt32SpriteCpu(output, sprite);
+            else if (behavior == Behavior::InvalidOutput)
+                output.resize(1u);
+            ++serviceStatistics.spriteDrawsCompleted;
+            if (error)
+                error->clear();
+            return true;
+        }
+
+        void shutdown() noexcept override
+        {
+            isHealthy = false;
+        }
+
+        GsVulkanCapabilityReport capabilities() const override
+        {
+            return report;
+        }
+
+        GsVulkanServiceStatistics statistics() const override
+        {
+            return serviceStatistics;
+        }
+
+        bool healthy() const override
+        {
+            return isHealthy;
+        }
+
+    private:
+        Behavior behavior;
+        GsVulkanCapabilityReport report;
+        GsVulkanServiceStatistics serviceStatistics;
+        bool isHealthy = true;
+    };
+
+    class ScopedArtifactDirectory final
+    {
+    public:
+        ScopedArtifactDirectory()
+        {
+            static std::atomic<uint64_t> sequence{0u};
+            const uint64_t unique =
+                static_cast<uint64_t>(
+                    std::chrono::steady_clock::now()
+                        .time_since_epoch().count()) ^
+                sequence.fetch_add(1u, std::memory_order_relaxed);
+            path = std::filesystem::temp_directory_path() /
+                   ("ps2-gs-vulkan-verify-" +
+                    std::to_string(unique));
+            std::filesystem::create_directories(path);
+        }
+
+        ~ScopedArtifactDirectory()
+        {
+            std::error_code error;
+            std::filesystem::remove_all(path, error);
+        }
+
+        ScopedArtifactDirectory(const ScopedArtifactDirectory &) = delete;
+        ScopedArtifactDirectory &operator=(
+            const ScopedArtifactDirectory &) = delete;
+
+        std::filesystem::path path;
+    };
 }
 
 void register_ps2_gs_vulkan_tests()
@@ -395,6 +506,309 @@ void register_ps2_gs_vulkan_tests()
                      "degenerate endpoints should fail before any GPU submission");
             t.IsTrue(sprite == sentinel,
                      "degenerate preparation must preserve the caller's record");
+        });
+
+        tc.Run("Vulkan raster backend verifies commits and fails before mutation", [](TestCase &t)
+        {
+            GSMem::InitLookupTables();
+            const GsDrawCommand command = makeCt32SpriteCommand(
+                41u, 9u, 2u,
+                {0u, 63u, 0u, 63u}, {0u, 0u},
+                3u * 16u, 5u * 16u,
+                19u * 16u, 14u * 16u,
+                0xA1B2C3D4u);
+            const auto commands =
+                std::span<const GsDrawCommand>(&command, 1u);
+
+            std::vector<uint8_t> vram = makeVramPattern(0xBACC3EEDu);
+            const std::vector<uint8_t> initial = vram;
+            std::vector<uint8_t> expected = initial;
+            GsVulkanCt32Sprite prepared{};
+            t.IsTrue(prepareGsVulkanCt32Sprite(command, prepared).supported,
+                     "the backend fixture should satisfy the canonical predicate");
+            applyCt32SpriteCpu(expected, prepared);
+
+            uint64_t softwareCalls = 0u;
+            uint64_t commitCalls = 0u;
+            const auto softwareOracle =
+                [&](const GsDrawCommand &draw)
+            {
+                ++softwareCalls;
+                GsVulkanCt32Sprite sprite{};
+                if (prepareGsVulkanCt32Sprite(draw, sprite).supported)
+                    applyCt32SpriteCpu(vram, sprite);
+            };
+            const auto acceleratedCommit =
+                [&](const GsDrawCommand &)
+            {
+                ++commitCalls;
+            };
+
+            GsVulkanRasterBackendConfig config{};
+            config.mode = GsRendererMode::Verify;
+            std::string creationError;
+            std::unique_ptr<GsVulkanRasterBackend> backend =
+                GsVulkanRasterBackend::createWithExecutor(
+                    std::make_unique<FakeCt32Executor>(
+                        FakeCt32Executor::Behavior::Exact),
+                    config, vram, softwareOracle,
+                    acceleratedCommit, &creationError);
+            t.IsNotNull(backend.get(),
+                        "a healthy injected executor should create the backend");
+            t.IsTrue(creationError.empty(),
+                     "successful injected creation should clear its diagnostic");
+            if (!backend)
+                return;
+
+            backend->submit(commands);
+            t.IsTrue(vram == expected,
+                     "verify mode should retain the agreed software image");
+            t.Equals(softwareCalls, 1ull,
+                     "verify mode should execute the software oracle once");
+            t.Equals(commitCalls, 0ull,
+                     "verify mode must not publish the duplicate GPU image");
+            GsVulkanRasterBackendStatistics statistics =
+                backend->backendStatistics();
+            t.Equals(statistics.commandsAttempted, 1ull,
+                     "verify should record one attempted command");
+            t.Equals(statistics.commandsCompleted, 1ull,
+                     "an agreeing command should complete");
+            t.Equals(statistics.verifiedCommands, 1ull,
+                     "the independent comparison should be counted");
+            t.Equals(statistics.bytesCompared,
+                     static_cast<uint64_t>(GS_VULKAN_VRAM_SIZE),
+                     "verification should compare all 4 MiB");
+
+            t.IsTrue(backend->setMode(GsRendererMode::GpuStrict),
+                     "the synchronized backend should accept strict mode");
+            t.IsFalse(backend->setMode(GsRendererMode::Software),
+                      "the accelerated backend should reject software mode");
+            std::copy(initial.begin(), initial.end(), vram.begin());
+            backend->submit(commands);
+            t.IsTrue(vram == expected,
+                     "strict mode should publish the exact GPU result");
+            t.Equals(softwareCalls, 1ull,
+                     "strict execution must not invoke the software oracle");
+            t.Equals(commitCalls, 1ull,
+                     "strict execution should publish one commit callback");
+            statistics = backend->backendStatistics();
+            t.Equals(statistics.committedGpuCommands, 1ull,
+                     "strict publication should be counted exactly once");
+
+            GSPrimReg textured = command.primitive();
+            textured.tme = true;
+            const GsDrawCommand unsupported = buildGsDrawCommand(
+                42u, textured, command.context(),
+                std::span<const GSVertex>(
+                    command.vertices().data(), command.vertexCount()),
+                command.globalState());
+            t.Equals(backend->classify(unsupported).reason,
+                     GsFallbackReason::Textured,
+                     "the backend should reuse the canonical reason");
+            const std::vector<uint8_t> unsupportedSentinel = vram;
+            bool unsupportedThrew = false;
+            try
+            {
+                backend->submit(
+                    std::span<const GsDrawCommand>(&unsupported, 1u));
+            }
+            catch (const std::logic_error &)
+            {
+                unsupportedThrew = true;
+            }
+            t.IsTrue(unsupportedThrew,
+                     "direct unsupported submission should fail as a router bug");
+            t.IsTrue(vram == unsupportedSentinel,
+                     "unsupported direct submission must not mutate VRAM");
+
+            std::copy(initial.begin(), initial.end(), vram.begin());
+            const std::array<GsDrawCommand, 2> mixedBatch{
+                command, unsupported};
+            bool batchThrew = false;
+            try
+            {
+                backend->submit(mixedBatch);
+            }
+            catch (const std::logic_error &)
+            {
+                batchThrew = true;
+            }
+            t.IsTrue(batchThrew,
+                     "an unsupported batch member should reject the whole span");
+            t.IsTrue(vram == initial,
+                     "batch preclassification must precede every mutation");
+            t.Equals(backend->backendStatistics().commandsAttempted, 2ull,
+                     "rejected spans should not count partial attempts");
+
+            std::vector<uint8_t> failureVram = initial;
+            uint64_t failedSoftwareCalls = 0u;
+            std::unique_ptr<GsVulkanRasterBackend> failingBackend =
+                GsVulkanRasterBackend::createWithExecutor(
+                    std::make_unique<FakeCt32Executor>(
+                        FakeCt32Executor::Behavior::Fail),
+                    GsVulkanRasterBackendConfig{
+                        GsRendererMode::GpuStrict, {}},
+                    failureVram,
+                    [&](const GsDrawCommand &)
+                    {
+                        ++failedSoftwareCalls;
+                    },
+                    {}, nullptr);
+            t.IsNotNull(failingBackend.get(),
+                        "an initially healthy failing executor should construct");
+            bool executionThrew = false;
+            if (failingBackend)
+            {
+                try
+                {
+                    failingBackend->submit(commands);
+                }
+                catch (const std::runtime_error &error)
+                {
+                    executionThrew =
+                        std::string(error.what()).find(
+                            "before canonical VRAM mutation") !=
+                        std::string::npos;
+                }
+                t.Equals(
+                    failingBackend->backendStatistics().gpuRequestsFailed,
+                    1ull,
+                    "executor failure should be counted once");
+            }
+            t.IsTrue(executionThrew,
+                     "executor failure should report the synchronized boundary");
+            t.IsTrue(failureVram == initial,
+                     "executor failure must retain pre-draw canonical VRAM");
+            t.Equals(failedSoftwareCalls, 0ull,
+                     "GPU failure should occur before the oracle mutates VRAM");
+
+            backend->flush(GsFlushReason::Shutdown);
+            t.IsFalse(backend->healthy(),
+                      "shutdown should close the injected executor once");
+            t.Equals(backend->classify(command).reason,
+                     GsFallbackReason::BackendUnavailable,
+                     "post-shutdown classification should fail closed");
+            t.Equals(backend->pendingCommandCount(), static_cast<size_t>(0u),
+                     "Phase 3 requests should remain synchronous");
+        });
+
+        tc.Run("Vulkan verify mismatch writes a complete bounded reproducer", [](TestCase &t)
+        {
+            GSMem::InitLookupTables();
+            ScopedArtifactDirectory artifacts;
+            const std::filesystem::path collidingBundle =
+                artifacts.path / "draw-00000000000000000091";
+            std::filesystem::create_directory(collidingBundle);
+            const GsDrawCommand command = makeCt32SpriteCommand(
+                91u, 5u, 1u,
+                {0u, 31u, 0u, 31u}, {0u, 0u},
+                4u * 16u, 6u * 16u,
+                11u * 16u, 13u * 16u,
+                0x44332211u);
+            std::vector<uint8_t> vram(GS_VULKAN_VRAM_SIZE, 0u);
+            const std::vector<uint8_t> initial = vram;
+
+            GsVulkanRasterBackendConfig config{};
+            config.mode = GsRendererMode::Verify;
+            config.verificationArtifactDirectory =
+                artifacts.path.string();
+            std::unique_ptr<GsVulkanRasterBackend> backend =
+                GsVulkanRasterBackend::createWithExecutor(
+                    std::make_unique<FakeCt32Executor>(
+                        FakeCt32Executor::Behavior::Noop),
+                    config, vram,
+                    [&](const GsDrawCommand &draw)
+                    {
+                        GsVulkanCt32Sprite sprite{};
+                        if (prepareGsVulkanCt32Sprite(
+                                draw, sprite).supported)
+                        {
+                            applyCt32SpriteCpu(vram, sprite);
+                        }
+                    },
+                    {}, nullptr);
+            t.IsNotNull(backend.get(),
+                        "the mismatch fixture backend should construct");
+            if (!backend)
+                return;
+
+            std::string mismatchText;
+            try
+            {
+                backend->submit(
+                    std::span<const GsDrawCommand>(&command, 1u));
+            }
+            catch (const std::runtime_error &error)
+            {
+                mismatchText = error.what();
+            }
+            t.IsFalse(mismatchText.empty(),
+                      "an injected no-op GPU result should disagree");
+            t.IsTrue(mismatchText.find("draw 91") != std::string::npos,
+                     "the failure should identify the exact sequence");
+            t.IsTrue(mismatchText.find("artifact=") != std::string::npos,
+                     "the failure should publish its reproducer path");
+
+            const GsVulkanRasterBackendStatistics statistics =
+                backend->backendStatistics();
+            t.Equals(statistics.commandsAttempted, 1ull,
+                     "the mismatching command should be attempted once");
+            t.Equals(statistics.commandsCompleted, 0ull,
+                     "a mismatch must not be reported as completed");
+            t.Equals(statistics.verificationMismatches, 1ull,
+                     "the first disagreement should stop verification");
+            t.Equals(statistics.bytesCompared,
+                     static_cast<uint64_t>(GS_VULKAN_VRAM_SIZE),
+                     "the mismatch search should cover canonical VRAM");
+
+            const std::filesystem::path bundle =
+                statistics.lastVerificationArtifact;
+            t.IsTrue(std::filesystem::is_directory(bundle),
+                     "the reproducer should be atomically published as a directory");
+            t.IsTrue(bundle.filename() ==
+                         "draw-00000000000000000091-1",
+                     "an existing sequence bundle should select a stable suffix");
+            const auto expectFullVram = [&](const char *name)
+            {
+                std::error_code error;
+                const uintmax_t size = std::filesystem::file_size(
+                    bundle / name, error);
+                t.IsFalse(static_cast<bool>(error),
+                          std::string(name) + " should be readable");
+                t.Equals(size,
+                         static_cast<uintmax_t>(GS_VULKAN_VRAM_SIZE),
+                         std::string(name) + " should retain all 4 MiB");
+            };
+            expectFullVram("initial-vram.bin");
+            expectFullVram("software-vram.bin");
+            expectFullVram("gpu-vram.bin");
+
+            std::ifstream manifest(bundle / "command.json");
+            const std::string manifestText{
+                std::istreambuf_iterator<char>(manifest),
+                std::istreambuf_iterator<char>()};
+            t.IsTrue(manifest.good() || manifest.eof(),
+                     "the command manifest should be readable");
+            t.IsTrue(manifestText.find(
+                         "ps2-gs-vulkan-verification-mismatch") !=
+                         std::string::npos,
+                     "the manifest should identify its stable schema kind");
+            t.IsTrue(manifestText.find("\"sequence\": 91") !=
+                         std::string::npos,
+                     "the manifest should retain the command identity");
+            t.IsTrue(manifestText.find("\"vertices\"") !=
+                         std::string::npos,
+                     "the manifest should retain raw vertex state");
+            t.IsTrue(manifestText.find("\"write_pages\"") !=
+                         std::string::npos,
+                     "the manifest should retain conservative resource pages");
+
+            std::vector<uint8_t> expected = initial;
+            GsVulkanCt32Sprite sprite{};
+            (void)prepareGsVulkanCt32Sprite(command, sprite);
+            applyCt32SpriteCpu(expected, sprite);
+            t.IsTrue(vram == expected,
+                     "the software oracle should remain canonical on mismatch");
         });
 
         tc.Run("Compact PSM addresses match the CPU memory oracle", [](TestCase &t)

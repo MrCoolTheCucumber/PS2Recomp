@@ -255,10 +255,30 @@ static_assert(offsetof(GsVulkanCt32Sprite, reserved) == 28u);
     const GsDrawCommand &command,
     GsVulkanCt32Sprite &sprite) noexcept;
 
+// Narrow injectable execution seam used by the Phase 3 verification backend.
+// Production requests still enter through the single-owner service below.
+class IGsVulkanDrawExecutor
+{
+public:
+    virtual ~IGsVulkanDrawExecutor() = default;
+
+    [[nodiscard]] virtual bool executeCt32Sprite(
+        std::span<const uint8_t> input,
+        const GsVulkanCt32Sprite &sprite,
+        std::vector<uint8_t> &output,
+        std::string *error = nullptr) = 0;
+    virtual void shutdown() noexcept = 0;
+    [[nodiscard]] virtual GsVulkanCapabilityReport
+    capabilities() const = 0;
+    [[nodiscard]] virtual GsVulkanServiceStatistics
+    statistics() const = 0;
+    [[nodiscard]] virtual bool healthy() const = 0;
+};
+
 // Owns all Vulkan API objects on one worker thread. Callers synchronously post
 // fixed-size jobs through a single bounded slot; no Vulkan object escapes to
 // an EE, replay, or presentation thread.
-class GsVulkanService final
+class GsVulkanService final : public IGsVulkanDrawExecutor
 {
 public:
     [[nodiscard]] static std::unique_ptr<GsVulkanService> create(
@@ -266,7 +286,7 @@ public:
         GsVulkanCapabilityReport *report = nullptr,
         std::string *error = nullptr);
 
-    ~GsVulkanService();
+    ~GsVulkanService() override;
 
     GsVulkanService(const GsVulkanService &) = delete;
     GsVulkanService &operator=(const GsVulkanService &) = delete;
@@ -294,16 +314,16 @@ public:
         std::span<const uint8_t> input,
         const GsVulkanCt32Sprite &sprite,
         std::vector<uint8_t> &output,
-        std::string *error = nullptr);
+        std::string *error = nullptr) override;
 
     // Idempotently drains accepted work and destroys every Vulkan object on
     // the owning worker before returning. The diagnostic snapshots remain
     // readable after shutdown.
-    void shutdown() noexcept;
+    void shutdown() noexcept override;
 
-    [[nodiscard]] GsVulkanCapabilityReport capabilities() const;
-    [[nodiscard]] GsVulkanServiceStatistics statistics() const;
-    [[nodiscard]] bool healthy() const;
+    [[nodiscard]] GsVulkanCapabilityReport capabilities() const override;
+    [[nodiscard]] GsVulkanServiceStatistics statistics() const override;
+    [[nodiscard]] bool healthy() const override;
 
 private:
     struct Impl;
