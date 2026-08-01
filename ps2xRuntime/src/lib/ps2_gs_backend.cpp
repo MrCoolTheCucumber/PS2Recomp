@@ -584,6 +584,82 @@ GsVramPageMask::words() const noexcept
     return m_words;
 }
 
+GsVramPageMask gsVramPagesForSurfaceRect(
+    uint32_t bp,
+    uint32_t bw,
+    uint8_t psm,
+    uint32_t x,
+    uint32_t y,
+    uint32_t width,
+    uint32_t height) noexcept
+{
+    GsVramPageMask pages;
+    if (width == 0u || height == 0u)
+        return pages;
+
+    PageGeometry geometry{};
+    if (!pageGeometry(psm, geometry))
+    {
+        pages.setAll();
+        return pages;
+    }
+
+    const uint64_t lastX =
+        static_cast<uint64_t>(x) + width - 1u;
+    const uint64_t lastY =
+        static_cast<uint64_t>(y) + height - 1u;
+    if (lastX > std::numeric_limits<uint32_t>::max() ||
+        lastY > std::numeric_limits<uint32_t>::max())
+    {
+        pages.setAll();
+        return pages;
+    }
+
+    const uint64_t firstPageX = x / geometry.width;
+    const uint64_t lastPageX = lastX / geometry.width;
+    const uint64_t firstPageY = y / geometry.height;
+    const uint64_t lastPageY = lastY / geometry.height;
+    const uint64_t pageColumns = lastPageX - firstPageX + 1u;
+    const uint64_t pageRows = lastPageY - firstPageY + 1u;
+    if (pageColumns > GS_VRAM_PAGE_COUNT ||
+        pageRows > GS_VRAM_PAGE_COUNT ||
+        pageColumns * pageRows > GS_VRAM_PAGE_COUNT)
+    {
+        pages.setAll();
+        return pages;
+    }
+
+    bp %= kGsBlockCount;
+    const uint64_t basePage = bp / 32u;
+    const uint64_t baseBlockPhase = bp % 32u;
+    const uint64_t rowStridePages =
+        (static_cast<uint64_t>(bw) * 64u) / geometry.width;
+    for (uint64_t pageY = firstPageY;
+         pageY <= lastPageY; ++pageY)
+    {
+        for (uint64_t pageX = firstPageX;
+             pageX <= lastPageX; ++pageX)
+        {
+            const size_t physicalPage = static_cast<size_t>(
+                (basePage +
+                 (pageY % GS_VRAM_PAGE_COUNT) *
+                     (rowStridePages % GS_VRAM_PAGE_COUNT) +
+                 pageX) % GS_VRAM_PAGE_COUNT);
+            pages.set(physicalPage);
+            // The GS base pointer may begin part-way through a page. A block
+            // selected late in the swizzle then carries into the next physical
+            // page; include it without depending on format-specific block
+            // permutation tables.
+            if (baseBlockPhase != 0u)
+            {
+                pages.set(
+                    (physicalPage + 1u) % GS_VRAM_PAGE_COUNT);
+            }
+        }
+    }
+    return pages;
+}
+
 GsDrawCommand::GsDrawCommand(
     uint64_t sequence,
     GSPrimReg primitive,

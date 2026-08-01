@@ -590,6 +590,117 @@ void register_ps2_gs_tests()
                       "opaque CT32 draw with disabled depth should not claim a read dependency");
         });
 
+        tc.Run("GS surface rectangle masks contain every canonical PSM address", [](TestCase &t)
+        {
+            struct SurfaceSpec
+            {
+                uint8_t psm;
+                uint32_t pageWidth;
+                uint32_t pageHeight;
+            };
+            constexpr std::array<SurfaceSpec, 13> specs{{
+                {GS_PSM_CT32, 64u, 32u},
+                {GS_PSM_CT24, 64u, 32u},
+                {GS_PSM_CT16, 64u, 64u},
+                {GS_PSM_CT16S, 64u, 64u},
+                {GS_PSM_T8, 128u, 64u},
+                {GS_PSM_T4, 128u, 128u},
+                {GS_PSM_T8H, 64u, 32u},
+                {GS_PSM_T4HL, 64u, 32u},
+                {GS_PSM_T4HH, 64u, 32u},
+                {GS_PSM_Z32, 64u, 32u},
+                {GS_PSM_Z24, 64u, 32u},
+                {GS_PSM_Z16, 64u, 64u},
+                {GS_PSM_Z16S, 64u, 64u},
+            }};
+            constexpr std::array<uint32_t, 4> widths{{0u, 1u, 2u, 63u}};
+
+            uint64_t resolvedPixels = 0u;
+            for (const SurfaceSpec &spec : specs)
+            {
+                const uint32_t x = spec.pageWidth - 3u;
+                const uint32_t y = spec.pageHeight - 2u;
+                const uint32_t rectangleWidth = spec.pageWidth + 7u;
+                const uint32_t rectangleHeight = spec.pageHeight + 5u;
+                for (uint32_t basePhase = 0u;
+                     basePhase < 32u; ++basePhase)
+                {
+                    const uint32_t bp =
+                        (basePhase & 1u) != 0u
+                            ? 37u * 32u + basePhase
+                            : 0x3FE0u + basePhase;
+                    for (uint32_t bw : widths)
+                    {
+                        const GsVramPageMask pages =
+                            gsVramPagesForSurfaceRect(
+                                bp, bw, spec.psm,
+                                x, y,
+                                rectangleWidth, rectangleHeight);
+                        t.IsFalse(pages.all(),
+                                  "a bounded valid rectangle should retain a partial mask");
+                        for (uint32_t py = y;
+                             py < y + rectangleHeight; ++py)
+                        {
+                            for (uint32_t px = x;
+                                 px < x + rectangleWidth; ++px)
+                            {
+                                GSMem::PixelAddress address{};
+                                if (!GSMem::ResolvePixelAddress(
+                                        static_cast<GSMem::PixelStorageMode>(
+                                            spec.psm),
+                                        bp, bw, px, py, address))
+                                {
+                                    t.Fail("canonical resolver rejected a supported surface PSM");
+                                    return;
+                                }
+                                const size_t physicalPage =
+                                    (static_cast<size_t>(address.word_index) *
+                                     sizeof(uint32_t)) /
+                                    GS_VRAM_PAGE_SIZE;
+                                if (!pages.test(physicalPage))
+                                {
+                                    t.Fail("surface mask omitted a canonical physical page");
+                                    return;
+                                }
+                                ++resolvedPixels;
+                            }
+                        }
+                    }
+                }
+            }
+            t.IsTrue(resolvedPixels > 5'000'000ull,
+                     "the containment corpus should cover millions of packed addresses");
+
+            const GsVramPageMask wrap =
+                gsVramPagesForSurfaceRect(
+                    511u * 32u, 1u, GS_PSM_CT32,
+                    0u, 0u, 64u, 64u);
+            t.Equals(wrap.count(), static_cast<size_t>(2u),
+                     "an aligned two-page CT32 rectangle should stay exact");
+            t.IsTrue(wrap.test(511u) && wrap.test(0u),
+                     "the exact rectangle should wrap across the 4 MiB ring");
+
+            const GsVramPageMask phased =
+                gsVramPagesForSurfaceRect(
+                    31u, 1u, GS_PSM_T4HH,
+                    0u, 0u, 1u, 1u);
+            t.IsTrue(phased.test(0u) && phased.test(1u),
+                     "a non-page-aligned high-plane surface should include a possible carry page");
+
+            t.IsTrue(gsVramPagesForSurfaceRect(
+                         0u, 1u, 0x3Fu,
+                         0u, 0u, 1u, 1u).all(),
+                     "an unknown layout should fail closed to all pages");
+            t.IsFalse(gsVramPagesForSurfaceRect(
+                          0u, 1u, 0x3Fu,
+                          0u, 0u, 0u, 1u).any(),
+                      "an empty rectangle should remain empty even with unknown state");
+            t.IsTrue(gsVramPagesForSurfaceRect(
+                         0u, 1u, GS_PSM_CT32,
+                         UINT32_MAX, 0u, 2u, 1u).all(),
+                     "coordinate overflow should fail closed to all pages");
+        });
+
         tc.Run("GS draw resource masks fail closed for unknown memory layouts", [](TestCase &t)
         {
             GSContext context{};

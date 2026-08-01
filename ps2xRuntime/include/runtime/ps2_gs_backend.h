@@ -327,6 +327,20 @@ private:
     std::span<const GSVertex> vertices,
     const GsDrawGlobalState &globalState);
 
+// Returns a bounded conservative mask for one GS surface rectangle. bp is in
+// 256-byte blocks and bw is the GS buffer-width field in 64-pixel units. The
+// physical 4 MiB ring, non-page-aligned bases, packed/high-plane formats, and
+// zero row strides are all handled. Unknown formats conservatively touch all
+// pages; an empty rectangle touches none.
+[[nodiscard]] GsVramPageMask gsVramPagesForSurfaceRect(
+    uint32_t bp,
+    uint32_t bw,
+    uint8_t psm,
+    uint32_t x,
+    uint32_t y,
+    uint32_t width,
+    uint32_t height) noexcept;
+
 // Phase 3's deliberately narrow first GPU predicate. Keeping it as a pure
 // classifier makes the Phase 0 census and future backend use the same reason.
 [[nodiscard]] GsBackendDecision classifyGsInitialCt32Sprite(
