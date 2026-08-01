@@ -383,6 +383,12 @@ namespace
                << statistics.residentSpriteBatchesFailed
                << ",\"largest_resident_sprite_batch\":"
                << statistics.largestResidentSpriteBatch
+               << ",\"resident_triangle_batches_completed\":"
+               << statistics.residentTriangleBatchesCompleted
+               << ",\"resident_triangle_batches_failed\":"
+               << statistics.residentTriangleBatchesFailed
+               << ",\"largest_resident_triangle_batch\":"
+               << statistics.largestResidentTriangleBatch
                << ",\"page_upload_operations_completed\":"
                << statistics.pageUploadOperationsCompleted
                << ",\"page_upload_operations_failed\":"

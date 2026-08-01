@@ -24,6 +24,8 @@ inline constexpr uint32_t GS_VULKAN_NOOP_GROUP_COUNT =
         GS_VULKAN_NOOP_LOCAL_SIZE);
 inline constexpr uint32_t GS_VULKAN_MAX_MEMORY_CASES = 65536u;
 inline constexpr size_t GS_VULKAN_MAX_RESIDENT_SPRITE_BATCH = 64u;
+inline constexpr size_t GS_VULKAN_MAX_RESIDENT_TRIANGLE_BATCH =
+    GS_VRAM_PAGE_COUNT;
 
 enum class GsVulkanProbeStatus : uint8_t
 {
@@ -179,6 +181,9 @@ struct GsVulkanServiceStatistics
     uint64_t residentSpriteBatchesCompleted = 0u;
     uint64_t residentSpriteBatchesFailed = 0u;
     uint64_t largestResidentSpriteBatch = 0u;
+    uint64_t residentTriangleBatchesCompleted = 0u;
+    uint64_t residentTriangleBatchesFailed = 0u;
+    uint64_t largestResidentTriangleBatch = 0u;
     uint64_t pageUploadOperationsCompleted = 0u;
     uint64_t pageUploadOperationsFailed = 0u;
     uint64_t pageDownloadOperationsCompleted = 0u;
@@ -365,6 +370,12 @@ public:
     [[nodiscard]] virtual bool executeResidentCt32Sprites(
         std::span<const GsVulkanCt32Sprite> sprites,
         std::string *error = nullptr) = 0;
+    [[nodiscard]] virtual bool executeResidentCt32Triangle(
+        const GsVulkanCt32Triangle &triangle,
+        std::string *error = nullptr) = 0;
+    [[nodiscard]] virtual bool executeResidentCt32Triangles(
+        std::span<const GsVulkanCt32Triangle> triangles,
+        std::string *error = nullptr) = 0;
     virtual void shutdown() noexcept = 0;
     [[nodiscard]] virtual GsVulkanCapabilityReport
     capabilities() const = 0;
@@ -449,6 +460,16 @@ public:
     // overlapping batches before they enter the worker slot.
     [[nodiscard]] bool executeResidentCt32Sprites(
         std::span<const GsVulkanCt32Sprite> sprites,
+        std::string *error = nullptr) override;
+
+    // Uses the exact 64-bit triangle pipeline against already-resident VRAM.
+    // As with sprite batches, records must have pairwise-disjoint conservative
+    // physical write-page masks so no inter-dispatch ordering is assumed.
+    [[nodiscard]] bool executeResidentCt32Triangle(
+        const GsVulkanCt32Triangle &triangle,
+        std::string *error = nullptr) override;
+    [[nodiscard]] bool executeResidentCt32Triangles(
+        std::span<const GsVulkanCt32Triangle> triangles,
         std::string *error = nullptr) override;
 
     // Idempotently drains accepted work and destroys every Vulkan object on

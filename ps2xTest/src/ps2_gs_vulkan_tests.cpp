@@ -855,6 +855,58 @@ namespace
             return true;
         }
 
+        bool executeResidentCt32Triangle(
+            const GsVulkanCt32Triangle &triangle,
+            std::string *error) override
+        {
+            return executeResidentCt32Triangles(
+                std::span<const GsVulkanCt32Triangle>(&triangle, 1u),
+                error);
+        }
+
+        bool executeResidentCt32Triangles(
+            std::span<const GsVulkanCt32Triangle> triangles,
+            std::string *error) override
+        {
+            if (!isHealthy || behavior == Behavior::Fail ||
+                behavior == Behavior::InvalidOutput ||
+                triangles.empty() ||
+                triangles.size() >
+                    GS_VULKAN_MAX_RESIDENT_TRIANGLE_BATCH ||
+                !report.devices[0].exactCt32Triangle)
+            {
+                serviceStatistics.triangleDrawsFailed += triangles.size();
+                ++serviceStatistics.residentTriangleBatchesFailed;
+                if (error)
+                    *error = "injected resident CT32 triangle executor failure";
+                return false;
+            }
+            for (const GsVulkanCt32Triangle &triangle : triangles)
+            {
+                if (behavior == Behavior::Exact)
+                    applyCt32TriangleCpu(residentVram, triangle);
+                serviceStatistics.triangleCandidatePixelsExecuted +=
+                    static_cast<uint64_t>(
+                        triangle.boundsX1 - triangle.boundsX0) *
+                    static_cast<uint64_t>(
+                        triangle.boundsY1 - triangle.boundsY0);
+            }
+            serviceStatistics.triangleDrawsCompleted += triangles.size();
+            ++serviceStatistics.residentTriangleBatchesCompleted;
+            serviceStatistics.largestResidentTriangleBatch = std::max(
+                serviceStatistics.largestResidentTriangleBatch,
+                static_cast<uint64_t>(triangles.size()));
+            ++serviceStatistics.queueSubmissions;
+            serviceStatistics.shaderDispatches += triangles.size();
+            serviceStatistics.pipelineBarriers += 2u;
+            ++serviceStatistics.pipelineBinds;
+            ++serviceStatistics.pipelineCacheHits;
+            ++serviceStatistics.fenceWaits;
+            if (error)
+                error->clear();
+            return true;
+        }
+
         void shutdown() noexcept override
         {
             isHealthy = false;
@@ -940,6 +992,9 @@ void register_ps2_gs_vulkan_tests()
                      "memory conformance batches should have a fixed host bound");
             t.Equals(GS_VULKAN_MAX_RESIDENT_SPRITE_BATCH, size_t{64u},
                      "resident sprite batches should have a fixed host bound");
+            t.Equals(GS_VULKAN_MAX_RESIDENT_TRIANGLE_BATCH,
+                     GS_VRAM_PAGE_COUNT,
+                     "disjoint triangle batches cannot exceed physical pages");
         });
 
         tc.Run("CT32 sprite preparation applies exact GS bounds and eligibility", [](TestCase &t)
@@ -5092,6 +5147,224 @@ void register_ps2_gs_vulkan_tests()
                      "resident batching should emit no validation warnings");
             t.IsTrue(service->healthy(),
                      "accepted and caller-rejected batches should leave the service healthy");
+            service->shutdown();
+        });
+
+        tc.Run("Vulkan resident triangle batches require disjoint pages", [](TestCase &t)
+        {
+            GSMem::InitLookupTables();
+            GsVulkanCapabilityReport preflight{};
+            const GsVulkanServiceConfig config =
+                makeRendererServiceConfig(preflight);
+            GsVulkanCapabilityReport creationReport{};
+            std::string creationError;
+            std::unique_ptr<GsVulkanService> service =
+                GsVulkanService::create(
+                    config, &creationReport, &creationError);
+            if (!preflight.ready())
+            {
+                t.IsNull(service.get(),
+                         "an unavailable host should skip triangle batching cleanly");
+                t.IsFalse(creationReport.ready(),
+                          "a skipped triangle batch service should retain its capability result");
+                return;
+            }
+            t.IsNotNull(service.get(),
+                        "a generally suitable device should create the triangle batch service");
+            t.IsTrue(creationError.empty(),
+                     "successful triangle batch service creation should clear its diagnostic");
+            if (!service)
+                return;
+
+            constexpr std::array<uint32_t, 4> physicalPages{{
+                5u, 41u, 197u, 509u,
+            }};
+            std::vector<GsVulkanCt32Triangle> triangles;
+            for (size_t index = 0u; index < physicalPages.size(); ++index)
+            {
+                const uint16_t phase = static_cast<uint16_t>(index * 3u + 1u);
+                const GsDrawCommand command = makeCt32TriangleCommand(
+                    30'000u + index, physicalPages[index], 1u,
+                    {0u, 31u, 0u, 31u}, {0u, 0u},
+                    {
+                        static_cast<uint16_t>(2u * 16u + phase),
+                        static_cast<uint16_t>(22u * 16u + phase),
+                        static_cast<uint16_t>(6u * 16u + phase),
+                    },
+                    {
+                        static_cast<uint16_t>(3u * 16u + phase),
+                        static_cast<uint16_t>(8u * 16u + phase),
+                        static_cast<uint16_t>(25u * 16u + phase),
+                    },
+                    0x80402010u + static_cast<uint32_t>(index));
+                GsVulkanCt32Triangle triangle{};
+                const GsBackendDecision decision =
+                    prepareGsVulkanCt32Triangle(command, triangle);
+                if (!decision.supported)
+                {
+                    t.Fail(
+                        "disjoint triangle fixture was rejected as " +
+                        std::string(gsFallbackReasonName(decision.reason)));
+                    return;
+                }
+                const GsVramPageMask writePages =
+                    gsVramPagesForSurfaceRect(
+                        triangle.framebufferBaseBlock,
+                        triangle.framebufferWidth,
+                        static_cast<uint8_t>(GSMem::C32),
+                        triangle.boundsX0,
+                        triangle.boundsY0,
+                        triangle.boundsX1 - triangle.boundsX0,
+                        triangle.boundsY1 - triangle.boundsY0);
+                t.Equals(writePages.count(), size_t{1u},
+                         "each triangle fixture should own exactly one physical page");
+                t.IsTrue(writePages.test(physicalPages[index]),
+                         "each triangle fixture should map to its selected page");
+                triangles.push_back(triangle);
+            }
+
+            const GsVulkanServiceStatistics beforeRejections =
+                service->statistics();
+            std::string operationError;
+            const auto expectRejected =
+                [&](std::span<const GsVulkanCt32Triangle> rejected,
+                    const std::string &label)
+            {
+                operationError.clear();
+                t.IsFalse(service->executeResidentCt32Triangles(
+                              rejected, &operationError),
+                          label + " should fail before worker submission");
+                t.IsFalse(operationError.empty(),
+                          label + " should retain a diagnostic");
+            };
+            expectRejected({}, "empty resident triangle batch");
+            std::vector<GsVulkanCt32Triangle> oversized(
+                GS_VULKAN_MAX_RESIDENT_TRIANGLE_BATCH + 1u,
+                triangles.front());
+            expectRejected(oversized, "oversized resident triangle batch");
+            std::vector<GsVulkanCt32Triangle> invalid = triangles;
+            invalid[2].reserved0 = 1u;
+            expectRejected(invalid, "invalid resident triangle batch member");
+            const std::array<GsVulkanCt32Triangle, 2> overlapping{{
+                triangles.front(), triangles.front(),
+            }};
+            expectRejected(overlapping,
+                           "physical-page-overlapping triangle batch");
+
+            const GsVulkanServiceStatistics afterRejections =
+                service->statistics();
+            t.Equals(afterRejections.queueSubmissions,
+                     beforeRejections.queueSubmissions,
+                     "caller-rejected triangle batches must not submit GPU work");
+            t.Equals(afterRejections.triangleDrawsFailed,
+                     beforeRejections.triangleDrawsFailed,
+                     "caller-rejected triangle batches must not count worker failures");
+            t.Equals(afterRejections.residentTriangleBatchesFailed,
+                     beforeRejections.residentTriangleBatchesFailed,
+                     "caller-rejected triangle batches must not count failed worker batches");
+
+            const GsVulkanDeviceReport *selected =
+                creationReport.selectedDevice();
+            t.IsNotNull(selected,
+                        "the triangle batch service should retain its selected device");
+            if (!selected)
+                return;
+            if (!selected->exactCt32Triangle)
+            {
+                expectRejected(triangles,
+                               "capability-gated resident triangle batch");
+                t.Equals(service->statistics().triangleDrawsFailed, 0ull,
+                         "capability rejection must not enter the worker");
+                t.IsTrue(service->healthy(),
+                         "unsupported triangle batching must not poison the base service");
+                service->shutdown();
+                return;
+            }
+
+            const std::vector<uint8_t> initial =
+                makeVramPattern(0x54524231u);
+            std::vector<uint8_t> expected = initial;
+            uint64_t expectedCandidatePixels = 0u;
+            for (const GsVulkanCt32Triangle &triangle : triangles)
+            {
+                applyCt32TriangleCpu(expected, triangle);
+                expectedCandidatePixels +=
+                    static_cast<uint64_t>(
+                        triangle.boundsX1 - triangle.boundsX0) *
+                    static_cast<uint64_t>(
+                        triangle.boundsY1 - triangle.boundsY0);
+            }
+            GsVramPageMask allPages;
+            allPages.setAll();
+            t.IsTrue(service->uploadVramPages(
+                         initial, allPages, &operationError),
+                     "the triangle batch fixture should establish resident VRAM");
+            if (!operationError.empty())
+                t.Fail("resident triangle batch upload failed: " + operationError);
+
+            const GsVulkanServiceStatistics beforeBatch =
+                service->statistics();
+            operationError.clear();
+            t.IsTrue(service->executeResidentCt32Triangles(
+                         triangles, &operationError),
+                     "four disjoint resident triangles should execute as one batch");
+            t.IsTrue(operationError.empty(),
+                     "successful resident triangle batching should clear its diagnostic");
+            const GsVulkanServiceStatistics afterBatch =
+                service->statistics();
+            t.Equals(afterBatch.queueSubmissions -
+                         beforeBatch.queueSubmissions,
+                     1ull,
+                     "one triangle batch should use one Vulkan queue submission");
+            t.Equals(afterBatch.shaderDispatches -
+                         beforeBatch.shaderDispatches,
+                     static_cast<uint64_t>(triangles.size()),
+                     "each triangle batch member should retain one compute dispatch");
+            t.Equals(afterBatch.pipelineBarriers -
+                         beforeBatch.pipelineBarriers,
+                     2ull,
+                     "one triangle batch should use one prepare and one completion barrier");
+            t.Equals(afterBatch.pipelineBinds - beforeBatch.pipelineBinds,
+                     1ull,
+                     "one triangle batch should bind the exact pipeline once");
+            t.Equals(afterBatch.pipelineCacheHits -
+                         beforeBatch.pipelineCacheHits,
+                     1ull,
+                     "one triangle batch should reuse its prebuilt pipeline once");
+            t.Equals(afterBatch.fenceWaits - beforeBatch.fenceWaits,
+                     1ull,
+                     "one triangle batch should wait on one submitted fence");
+            t.Equals(afterBatch.triangleDrawsCompleted -
+                         beforeBatch.triangleDrawsCompleted,
+                     static_cast<uint64_t>(triangles.size()),
+                     "batch statistics should count every completed triangle");
+            t.Equals(afterBatch.triangleCandidatePixelsExecuted -
+                         beforeBatch.triangleCandidatePixelsExecuted,
+                     expectedCandidatePixels,
+                     "batch statistics should count every conservative candidate pixel");
+            t.Equals(afterBatch.residentTriangleBatchesCompleted -
+                         beforeBatch.residentTriangleBatchesCompleted,
+                     1ull,
+                     "the worker should complete one resident triangle batch");
+            t.Equals(afterBatch.largestResidentTriangleBatch,
+                     static_cast<uint64_t>(triangles.size()),
+                     "the service should retain its largest triangle batch");
+
+            std::vector<uint8_t> actual(
+                GS_VULKAN_VRAM_SIZE, 0xA5u);
+            t.IsTrue(service->downloadVramPages(
+                         actual, allPages, &operationError),
+                     "the completed resident triangle batch should be observable");
+            t.IsTrue(actual == expected,
+                     "one triangle batch must match sequential CPU draws exactly");
+            const GsVulkanServiceStatistics finalStatistics =
+                service->statistics();
+            t.Equals(finalStatistics.validationErrors, 0u,
+                     "resident triangle batching must remain validation-clean");
+            t.Equals(finalStatistics.validationWarnings, 0u,
+                     "resident triangle batching should emit no validation warnings");
+            t.IsTrue(service->healthy(),
+                     "accepted and rejected triangle batches should leave the service healthy");
             service->shutdown();
         });
 
