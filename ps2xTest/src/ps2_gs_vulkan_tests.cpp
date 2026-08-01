@@ -8901,6 +8901,422 @@ void register_ps2_gs_vulkan_tests()
                      "strict texture routing should emit no validation warnings");
         });
 
+        tc.Run("GS Vulkan strict depth CT32 survives ownership and frame checkpoints", [](TestCase &t)
+        {
+            GSMem::InitLookupTables();
+            const std::array<GsDrawCommand, 6> commands =
+                makeOrderedDepthCt32SpriteCommands(40'000u);
+            std::array<GsVulkanDepthCt32Sprite, 6> prepared{};
+            for (size_t index = 0u; index < commands.size(); ++index)
+            {
+                t.IsTrue(
+                    prepareGsVulkanDepthCt32Sprite(
+                        commands[index], prepared[index]).supported,
+                    "every strict depth checkpoint should satisfy the narrow predicate");
+            }
+            const GsDrawCommand flat = makeCt32SpriteCommand(
+                40'010u, 43u, 1u,
+                {0u, 31u, 0u, 31u}, {0u, 0u},
+                17u, 17u, 257u, 257u, 0x0D15EA5Eu);
+            GsVulkanCt32Sprite flatPrepared{};
+            t.IsTrue(prepareGsVulkanCt32Sprite(
+                         flat, flatPrepared).supported,
+                     "the strict depth checkpoint should retain one flat pipeline draw");
+
+            const std::vector<uint8_t> initial =
+                makeVramPattern(0x44504331u);
+            std::vector<uint8_t> softwareVram = initial;
+            std::vector<uint8_t> strictVram = initial;
+            GSRegisters softwareRegisters{};
+            GSRegisters strictRegisters{};
+            configureCt32Display(softwareRegisters, 40u, 64u, 32u);
+            configureCt32Display(strictRegisters, 40u, 64u, 32u);
+            GS software;
+            GS strict;
+            software.init(
+                softwareVram.data(),
+                static_cast<uint32_t>(softwareVram.size()),
+                &softwareRegisters);
+            strict.init(
+                strictVram.data(),
+                static_cast<uint32_t>(strictVram.size()),
+                &strictRegisters);
+
+            GsVulkanCapabilityReport preflight{};
+            const GsVulkanServiceConfig config =
+                makeRendererServiceConfig(preflight);
+            t.IsTrue(strict.configureVulkanRenderer(config),
+                     "the strict depth checkpoint fixture should accept Vulkan configuration");
+            if (!preflight.ready())
+            {
+                t.IsFalse(strict.setRendererMode(
+                              GsRendererMode::GpuStrict),
+                          "an unavailable host should decline strict depth checkpoints cleanly");
+                return;
+            }
+            const GsVulkanDeviceReport *selected =
+                preflight.selectedDevice();
+            t.IsNotNull(selected,
+                        "a ready strict depth preflight should select one device");
+            if (!selected)
+                return;
+            t.IsTrue(selected->exactDepthCt32Sprite,
+                     "the strict checkpoint device should expose the depth kernel");
+            if (!selected->exactDepthCt32Sprite)
+                return;
+
+            t.IsTrue(strict.setRendererMode(
+                         GsRendererMode::GpuStrict),
+                     "the qualified host should enter strict depth mode");
+            if (strict.rendererMode() != GsRendererMode::GpuStrict)
+                return;
+            strict.setBackendCountersEnabled(true);
+            strict.resetBackendCounters();
+
+            const auto drawPair = [&](const GsDrawCommand &command)
+            {
+                drawNearestCt32SpriteCommand(software, command);
+                drawNearestCt32SpriteCommand(strict, command);
+            };
+            const auto compareFullVram = [&](const char *boundary)
+            {
+                const auto difference = std::mismatch(
+                    softwareVram.begin(), softwareVram.end(),
+                    strictVram.begin(), strictVram.end());
+                if (difference.first == softwareVram.end())
+                    return true;
+                const size_t byteOffset = static_cast<size_t>(
+                    difference.first - softwareVram.begin());
+                t.IsTrue(
+                    false,
+                    std::string("strict depth VRAM mismatch after ") +
+                        boundary + " at byte " +
+                        std::to_string(byteOffset) + ", page " +
+                        std::to_string(
+                            byteOffset / GS_VRAM_PAGE_SIZE));
+                return false;
+            };
+
+            drawPair(commands[0]);
+            drawPair(commands[1]);
+            t.IsTrue(strictVram == initial,
+                     "overlapping strict depth draws should remain resident before observation");
+            (void)software.getDebugSnapshot();
+            (void)strict.getDebugSnapshot();
+            if (!compareFullVram("overlapping Z24 debugger checkpoint"))
+                return;
+
+            drawPair(commands[2]);
+            drawPair(commands[3]);
+            software.writeRegister(GS_REG_FINISH, 0u);
+            strict.writeRegister(GS_REG_FINISH, 0u);
+            if (!compareFullVram("overlapping Z32 FINISH checkpoint"))
+                return;
+
+            drawPair(commands[0]);
+            constexpr std::array<uint32_t, 4> uploadedPixels{{
+                0xA0010203u,
+                0xA1040506u,
+                0xA2070809u,
+                0xA30A0B0Cu,
+            }};
+            uploadCt32Pixels(
+                software, prepared[0].framebufferBaseBlock,
+                prepared[0].framebufferWidth,
+                static_cast<uint16_t>(prepared[0].boundsX0),
+                static_cast<uint16_t>(prepared[0].boundsY0),
+                uploadedPixels);
+            uploadCt32Pixels(
+                strict, prepared[0].framebufferBaseBlock,
+                prepared[0].framebufferWidth,
+                static_cast<uint16_t>(prepared[0].boundsX0),
+                static_cast<uint16_t>(prepared[0].boundsY0),
+                uploadedPixels);
+            drawPair(commands[1]);
+            const std::vector<uint8_t> softwareReadback =
+                readCt32Pixels(
+                    software, prepared[1].framebufferBaseBlock,
+                    prepared[1].framebufferWidth,
+                    static_cast<uint16_t>(prepared[1].boundsX0),
+                    static_cast<uint16_t>(prepared[1].boundsY0),
+                    4u, 1u);
+            const std::vector<uint8_t> strictReadback =
+                readCt32Pixels(
+                    strict, prepared[1].framebufferBaseBlock,
+                    prepared[1].framebufferWidth,
+                    static_cast<uint16_t>(prepared[1].boundsX0),
+                    static_cast<uint16_t>(prepared[1].boundsY0),
+                    4u, 1u);
+            t.IsTrue(strictReadback == softwareReadback,
+                     "strict depth should upload CPU-newer color and publish scoped readback");
+            (void)software.getDebugSnapshot();
+            (void)strict.getDebugSnapshot();
+            if (!compareFullVram("transfer and scoped readback checkpoint"))
+                return;
+
+            drawPair(commands[0]);
+            software.latchHostPresentationFrame();
+            strict.latchHostPresentationFrame();
+            std::vector<uint8_t> softwareFrame;
+            std::vector<uint8_t> strictFrame;
+            uint32_t softwareWidth = 0u;
+            uint32_t softwareHeight = 0u;
+            uint32_t strictWidth = 0u;
+            uint32_t strictHeight = 0u;
+            t.IsTrue(
+                software.copyLatchedHostPresentationFrame(
+                    softwareFrame, softwareWidth, softwareHeight),
+                "the software depth checkpoint should publish one frame");
+            t.IsTrue(
+                strict.copyLatchedHostPresentationFrame(
+                    strictFrame, strictWidth, strictHeight),
+                "strict depth should publish one frame");
+            t.Equals(strictWidth, softwareWidth,
+                     "strict depth presentation should preserve frame width");
+            t.Equals(strictHeight, softwareHeight,
+                     "strict depth presentation should preserve frame height");
+            t.IsTrue(strictFrame == softwareFrame,
+                     "strict depth presentation bytes should match software");
+            if (!compareFullVram("presentation checkpoint"))
+                return;
+
+            drawPair(commands[2]);
+            configureNearestCt32SpriteCommand(software, flat);
+            configureNearestCt32SpriteCommand(strict, flat);
+            for (const GSVertex &vertex : flat.vertices())
+            {
+                writeNearestCt32SpriteVertex(software, vertex);
+                writeNearestCt32SpriteVertex(strict, vertex);
+            }
+            drawPair(commands[3]);
+            (void)software.getDebugSnapshot();
+            (void)strict.getDebugSnapshot();
+            if (!compareFullVram("depth-flat-depth pipeline checkpoint"))
+                return;
+
+            configureNearestCt32SpriteCommand(software, commands[0]);
+            configureNearestCt32SpriteCommand(strict, commands[0]);
+            writeNearestCt32SpriteVertex(
+                software, commands[0].vertices()[0]);
+            writeNearestCt32SpriteVertex(
+                strict, commands[0].vertices()[0]);
+            const GsReplayState softwareState =
+                software.captureReplayState();
+            const GsReplayState strictState =
+                strict.captureReplayState();
+            t.Equals(softwareState.vertexCount, 1,
+                     "the software depth checkpoint should retain one vertex");
+            t.Equals(strictState.vertexCount, 1,
+                     "the strict depth checkpoint should retain one vertex");
+            std::vector<uint8_t> softwareEncoded;
+            std::vector<uint8_t> strictEncoded;
+            std::string stateError;
+            t.IsTrue(
+                encodeGsReplayState(
+                    softwareState, softwareEncoded, &stateError),
+                "the software depth checkpoint should encode");
+            t.IsTrue(
+                encodeGsReplayState(
+                    strictState, strictEncoded, &stateError),
+                "the strict depth checkpoint should encode");
+            t.IsTrue(strictEncoded == softwareEncoded,
+                     "strict depth save-state should preserve frontend state");
+            software.writeRegister(
+                GS_REG_PRIM, static_cast<uint64_t>(GS_PRIM_POINT));
+            strict.writeRegister(
+                GS_REG_PRIM, static_cast<uint64_t>(GS_PRIM_POINT));
+            t.IsTrue(software.restoreReplayState(softwareState),
+                     "the software depth checkpoint should restore");
+            t.IsTrue(strict.restoreReplayState(strictState),
+                     "the strict depth checkpoint should restore");
+            writeNearestCt32SpriteVertex(
+                software, commands[0].vertices()[1]);
+            writeNearestCt32SpriteVertex(
+                strict, commands[0].vertices()[1]);
+            (void)software.getDebugSnapshot();
+            (void)strict.getDebugSnapshot();
+            if (!compareFullVram("save-state restore checkpoint"))
+                return;
+
+            drawPair(commands[1]);
+            software.reset();
+            strict.reset();
+            t.Equals(strict.rendererMode(), GsRendererMode::GpuStrict,
+                     "reset should preserve strict depth mode and service");
+            if (!compareFullVram("reset checkpoint"))
+                return;
+            drawPair(commands[0]);
+            (void)software.getDebugSnapshot();
+            (void)strict.getDebugSnapshot();
+            if (!compareFullVram("post-reset depth draw"))
+                return;
+
+            drawPair(commands[2]);
+            t.IsTrue(strict.setRendererMode(GsRendererMode::Software),
+                     "the depth checkpoint should enter explicit software mode");
+            if (!compareFullVram("strict-to-software switch"))
+                return;
+            drawPair(commands[3]);
+            if (!compareFullVram("explicit software depth draw"))
+                return;
+            configureFlatCt32Draws(software, 44u, 1u);
+            configureFlatCt32Draws(strict, 44u, 1u);
+            const uint64_t feedbackTex0 =
+                static_cast<uint64_t>(44u * 32u) |
+                (1ull << 14u) |
+                (static_cast<uint64_t>(GS_PSM_CT32) << 20u) |
+                (5ull << 26u) |
+                (5ull << 30u) |
+                (1ull << 34u) |
+                (1ull << 35u);
+            software.writeRegister(GS_REG_TEX0_1, feedbackTex0);
+            strict.writeRegister(GS_REG_TEX0_1, feedbackTex0);
+            software.beginRenderBatch();
+            strict.beginRenderBatch();
+            drawRecursiveCt32Sprite(
+                software, 2u * 16u, 3u * 16u,
+                10u * 16u, 11u * 16u, 0x80808080u);
+            drawRecursiveCt32Sprite(
+                strict, 2u * 16u, 3u * 16u,
+                10u * 16u, 11u * 16u, 0x80808080u);
+            software.endRenderBatch();
+            strict.endRenderBatch();
+            if (!compareFullVram("software feedback snapshot interval"))
+                return;
+            t.IsTrue(strict.setRendererMode(GsRendererMode::GpuStrict),
+                     "the depth checkpoint should restore strict mode");
+            drawPair(commands[0]);
+            (void)software.getDebugSnapshot();
+            (void)strict.getDebugSnapshot();
+            if (!compareFullVram("software-to-strict switch"))
+                return;
+
+            drawPair(commands[0]);
+            software.flushRenderBatch();
+            strict.flushRenderBatch();
+            if (!compareFullVram("explicit flush checkpoint"))
+                return;
+
+            drawPair(commands[0]);
+            const uint64_t indexedTex0 =
+                (1ull << 14u) |
+                (static_cast<uint64_t>(GS_PSM_T8) << 20u) |
+                (5ull << 26u) |
+                (5ull << 30u) |
+                (1ull << 34u) |
+                (static_cast<uint64_t>(
+                     prepared[0].depthBaseBlock) << 37u) |
+                (static_cast<uint64_t>(GS_PSM_CT32) << 51u) |
+                (1ull << 61u);
+            software.writeRegister(GS_REG_TEX0_1, indexedTex0);
+            strict.writeRegister(GS_REG_TEX0_1, indexedTex0);
+            if (!compareFullVram("CLUT hazard checkpoint"))
+                return;
+            t.IsTrue(
+                strict.vulkanRendererBackendStatistics()
+                        .pageOwnership.gpuNewerPages > 0u,
+                "the scoped CLUT read should leave unrelated color writes resident");
+            (void)software.getDebugSnapshot();
+            (void)strict.getDebugSnapshot();
+            if (!compareFullVram("final debugger checkpoint"))
+                return;
+
+            const GsBackendCounters counters = strict.backendCounters();
+            t.Equals(counters.commands, 19ull,
+                     "the strict depth checkpoint should assemble its exact draw count");
+            t.Equals(counters.acceleratedCommands, 17ull,
+                     "every strict-mode depth or flat draw should reach Vulkan");
+            t.Equals(counters.softwareCommands, 2ull,
+                     "only the explicit software interval should use the CPU");
+            t.Equals(counters.fallbackCommands, 0ull,
+                     "strict depth checkpoints should have no implicit fallback");
+            t.Equals(counters.strictFailures, 0ull,
+                     "every strict depth checkpoint should remain supported");
+            t.IsTrue(
+                counters.flushReasons[static_cast<size_t>(
+                    GsFlushReason::Explicit)] >= 1ull,
+                "explicit flush should retain its named boundary");
+            t.IsTrue(
+                counters.flushReasons[static_cast<size_t>(
+                    GsFlushReason::Transfer)] >= 1ull,
+                "the host upload should retain its transfer boundary");
+            t.IsTrue(
+                counters.flushReasons[static_cast<size_t>(
+                    GsFlushReason::CpuReadback)] >= 1ull,
+                "the scoped readback should retain its named boundary");
+            t.IsTrue(
+                counters.flushReasons[static_cast<size_t>(
+                    GsFlushReason::ClutHazard)] >= 1ull,
+                "the depth-written CLUT page should retain its hazard boundary");
+            t.IsTrue(
+                counters.flushReasons[static_cast<size_t>(
+                    GsFlushReason::FeedbackSnapshot)] >= 1ull,
+                "the software interval should retain its feedback snapshot boundary");
+            t.IsTrue(
+                counters.flushReasons[static_cast<size_t>(
+                    GsFlushReason::Finish)] >= 1ull,
+                "FINISH should remain an explicit checkpoint");
+            t.IsTrue(
+                counters.flushReasons[static_cast<size_t>(
+                    GsFlushReason::PresentationLatch)] >= 1ull,
+                "presentation should remain an explicit checkpoint");
+            t.IsTrue(
+                counters.flushReasons[static_cast<size_t>(
+                    GsFlushReason::DebuggerObservation)] >= 1ull,
+                "debugger snapshots should retain their observation boundary");
+            t.IsTrue(
+                counters.flushReasons[static_cast<size_t>(
+                    GsFlushReason::SaveLoad)] >= 2ull,
+                "capture and restore should each cross the save-state boundary");
+            t.IsTrue(
+                counters.flushReasons[static_cast<size_t>(
+                    GsFlushReason::Reset)] >= 1ull,
+                "reset should retain its named boundary");
+            t.IsTrue(
+                counters.flushReasons[static_cast<size_t>(
+                    GsFlushReason::BackendSwitch)] >= 2ull,
+                "the explicit software interval should cross both backend boundaries");
+
+            const GsVulkanRasterBackendStatistics backend =
+                strict.vulkanRendererBackendStatistics();
+            t.Equals(backend.commandsCompleted, 17ull,
+                     "every strict depth checkpoint draw should complete once");
+            t.Equals(backend.committedGpuCommands, 17ull,
+                     "every strict depth checkpoint should publish once");
+            t.Equals(backend.residentCommands, 17ull,
+                     "every accelerated checkpoint should remain resident");
+            t.Equals(backend.pipelineChangeDrains, 2ull,
+                     "depth-flat-depth should retain two pipeline drains");
+            t.Equals(backend.coherency.rejectedTransitions, 0ull,
+                     "strict depth checkpoints should preserve page ownership");
+            t.Equals(backend.pageOwnership.gpuNewerPages, size_t{0u},
+                     "the final debugger observation should publish all GPU writers");
+
+            const GsVulkanServiceStatistics service =
+                strict.vulkanRendererServiceStatistics();
+            t.Equals(service.depthCt32SpriteDrawsCompleted, 16ull,
+                     "the service should execute every strict depth draw");
+            t.Equals(service.depthCt32SpriteDrawsFailed, 0ull,
+                     "strict depth checkpoints should not fail service work");
+            t.Equals(service.residentDepthCt32SpriteBatchesCompleted,
+                     14ull,
+                     "only the two overlapping pairs should share depth batches");
+            t.Equals(service.largestResidentDepthCt32SpriteBatch, 2ull,
+                     "overlapping Z24 and Z32 pairs should establish batch size two");
+            t.Equals(service.spriteDrawsCompleted, 1ull,
+                     "the pipeline transition should execute one flat sprite");
+            t.IsTrue(service.pageUploadOperationsCompleted >= 2ull,
+                     "strict depth should upload initial and CPU-newer pages");
+            t.IsTrue(service.pageDownloadOperationsCompleted >= 1ull,
+                     "strict observations should publish GPU-newer pages");
+            t.Equals(service.fenceTimeouts, 0ull,
+                     "bounded strict depth checkpoints should not time out");
+            t.Equals(service.validationErrors, 0u,
+                     "strict depth checkpoints should remain validation-clean");
+            t.Equals(service.validationWarnings, 0u,
+                     "strict depth checkpoints should emit no validation warnings");
+        });
+
         tc.Run("GS Vulkan strict linear CT32 survives frame and reset checkpoints", [](TestCase &t)
         {
             GSMem::InitLookupTables();
