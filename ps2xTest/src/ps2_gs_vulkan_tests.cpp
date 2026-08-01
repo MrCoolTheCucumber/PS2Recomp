@@ -1635,7 +1635,8 @@ namespace
             bool exactCt32Triangle_ = true,
             bool exactNearestCt32Sprite_ = true,
             bool exactLinearCt32Sprite_ = true,
-            bool exactDepthCt32Sprite_ = true)
+            bool exactDepthCt32Sprite_ = true,
+            bool exactFeedbackLinearDepthCt32Sprite_ = true)
             : behavior(behavior_)
         {
             report.compiled = true;
@@ -1653,7 +1654,8 @@ namespace
             report.devices[0].exactDepthCt32Sprite =
                 exactDepthCt32Sprite_;
             report.devices[0].exactFeedbackLinearDepthCt32Sprite =
-                exactLinearCt32Sprite_ && exactDepthCt32Sprite_;
+                exactLinearCt32Sprite_ && exactDepthCt32Sprite_ &&
+                exactFeedbackLinearDepthCt32Sprite_;
         }
 
         bool executeCt32Sprite(
@@ -5423,6 +5425,312 @@ void register_ps2_gs_vulkan_tests()
                      "the injected no-op depth result should stop Verify");
             t.IsTrue(mismatchVram == mismatchExpected,
                      "the software depth oracle should remain canonical on mismatch");
+        });
+
+        tc.Run("Vulkan raster backend recognizes feedback linear depth sprites in Verify", [](TestCase &t)
+        {
+            GSMem::InitLookupTables();
+            const std::array<GsDrawCommand, 2> commands{{
+                makeFeedbackLinearDepthCt32SpriteCommand(
+                    30'300u, 4u, 1u, 200u, GS_PSM_Z24, false, 1u,
+                    6u, 5u,
+                    {0u, 63u, 0u, 31u}, {0u, 0u},
+                    {0u, 128u}, {0u, 128u},
+                    {128u, 256u}, {0u, 128u},
+                    0x00123456u),
+                makeFeedbackLinearDepthCt32SpriteCommand(
+                    30'301u, 4u, 1u, 200u, GS_PSM_Z24, false, 1u,
+                    6u, 5u,
+                    {0u, 63u, 0u, 31u}, {0u, 0u},
+                    {128u, 256u}, {0u, 128u},
+                    {0u, 128u}, {0u, 128u},
+                    0x00654321u),
+            }};
+            std::array<GsVulkanFeedbackLinearDepthCt32Sprite, 2>
+                prepared{};
+            for (size_t index = 0u; index < commands.size(); ++index)
+            {
+                t.IsTrue(
+                    prepareGsVulkanFeedbackLinearDepthCt32Sprite(
+                        commands[index], prepared[index]).supported,
+                    "the Verify fixture should satisfy the feedback contract");
+            }
+
+            const std::vector<uint8_t> initial =
+                makeVramPattern(0x56464231u);
+            const std::vector<uint8_t> feedbackSnapshot = initial;
+            std::vector<uint8_t> expected = initial;
+            for (const auto &sprite : prepared)
+            {
+                applyFeedbackLinearDepthCt32SpriteCpu(
+                    expected, feedbackSnapshot, sprite);
+            }
+            std::vector<uint8_t> perDrawSnapshot = initial;
+            applyFeedbackLinearDepthCt32SpriteCpu(
+                perDrawSnapshot, initial, prepared.front());
+            const std::vector<uint8_t> laterSnapshot = perDrawSnapshot;
+            applyFeedbackLinearDepthCt32SpriteCpu(
+                perDrawSnapshot, laterSnapshot, prepared.back());
+            t.IsFalse(
+                perDrawSnapshot == expected,
+                "the fixture should distinguish one run snapshot from per-draw recurrence");
+
+            std::vector<uint8_t> vram = initial;
+            uint64_t softwareCalls = 0u;
+            uint64_t snapshotRequests = 0u;
+            GsVulkanRasterBackendConfig config{};
+            config.mode = GsRendererMode::Verify;
+            std::unique_ptr<GsVulkanRasterBackend> backend =
+                GsVulkanRasterBackend::createWithExecutor(
+                    std::make_unique<FakeCt32Executor>(
+                        FakeCt32Executor::Behavior::Exact),
+                    config, vram,
+                    [&](const GsDrawCommand &draw)
+                    {
+                        ++softwareCalls;
+                        GsVulkanFeedbackLinearDepthCt32Sprite sprite{};
+                        if (prepareGsVulkanFeedbackLinearDepthCt32Sprite(
+                                draw, sprite).supported)
+                        {
+                            applyFeedbackLinearDepthCt32SpriteCpu(
+                                vram, feedbackSnapshot, sprite);
+                        }
+                    },
+                    {}, nullptr,
+                    [&]() -> std::span<const uint8_t>
+                    {
+                        ++snapshotRequests;
+                        return feedbackSnapshot;
+                    });
+            t.IsNotNull(
+                backend.get(),
+                "an exact feedback executor should create Verify");
+            if (!backend)
+                return;
+
+            for (const GsDrawCommand &command : commands)
+            {
+                t.IsTrue(
+                    backend->classify(command).supported,
+                    "Verify should expose capability-gated feedback sprites");
+            }
+            backend->submit(commands);
+            t.IsTrue(
+                vram == expected,
+                "feedback Verify should retain the agreed software image");
+            t.Equals(
+                softwareCalls, 2ull,
+                "feedback Verify should run each independent oracle once");
+            t.Equals(
+                snapshotRequests, 2ull,
+                "each feedback request should acquire the prepared run snapshot once");
+            const GsVulkanRasterBackendStatistics statistics =
+                backend->backendStatistics();
+            t.Equals(statistics.commandsAttempted, 2ull,
+                     "feedback Verify should attempt both commands");
+            t.Equals(statistics.commandsCompleted, 2ull,
+                     "both agreeing feedback commands should complete");
+            t.Equals(statistics.verifiedCommands, 2ull,
+                     "both full feedback comparisons should be counted");
+            t.Equals(
+                statistics.bytesCompared,
+                2ull * GS_VULKAN_VRAM_SIZE,
+                "feedback Verify should compare two complete VRAM images");
+            const GsVulkanServiceStatistics serviceStatistics =
+                backend->serviceStatistics();
+            t.Equals(
+                serviceStatistics
+                    .feedbackLinearDepthCt32SpriteDrawsCompleted,
+                2ull,
+                "the executor should receive both feedback requests");
+            t.Equals(serviceStatistics.linearCt32SpriteDrawsCompleted,
+                     0ull,
+                     "feedback Verify must not alias ordinary linear work");
+            t.Equals(serviceStatistics.depthCt32SpriteDrawsCompleted,
+                     0ull,
+                     "feedback Verify must not alias flat depth work");
+            t.Equals(statistics.pageOwnership.gpuNewerPages, size_t{0u},
+                     "Verify should not leave feedback pages GPU-owned");
+            t.Equals(statistics.residentCommands, 0ull,
+                     "Verify should not enqueue resident feedback work");
+
+            t.IsTrue(backend->setMode(GsRendererMode::GpuStrict),
+                     "the Verify fixture should enter strict mode");
+            t.IsFalse(
+                backend->classify(commands.front()).supported,
+                "strict should stay closed until resident snapshot ordering exists");
+            t.IsTrue(backend->setMode(GsRendererMode::Hybrid),
+                     "the fixture should enter Hybrid mode");
+            t.IsFalse(
+                backend->classify(commands.front()).supported,
+                "Hybrid should stay closed until strict feedback is proven");
+
+            std::vector<uint8_t> unavailableVram = initial;
+            std::unique_ptr<GsVulkanRasterBackend> missingProvider =
+                GsVulkanRasterBackend::createWithExecutor(
+                    std::make_unique<FakeCt32Executor>(
+                        FakeCt32Executor::Behavior::Exact),
+                    config, unavailableVram,
+                    [](const GsDrawCommand &) {}, {}, nullptr);
+            t.IsNotNull(
+                missingProvider.get(),
+                "a backend without a snapshot provider should still construct");
+            if (missingProvider)
+            {
+                t.Equals(
+                    missingProvider->classify(commands.front()).reason,
+                    GsFallbackReason::BackendUnavailable,
+                    "feedback should fail closed without a frontend snapshot provider");
+            }
+
+            std::unique_ptr<GsVulkanRasterBackend> missingCapability =
+                GsVulkanRasterBackend::createWithExecutor(
+                    std::make_unique<FakeCt32Executor>(
+                        FakeCt32Executor::Behavior::Exact,
+                        true, true, true, true, false),
+                    config, unavailableVram,
+                    [](const GsDrawCommand &) {}, {}, nullptr,
+                    [&]() -> std::span<const uint8_t>
+                    {
+                        return feedbackSnapshot;
+                    });
+            t.IsNotNull(
+                missingCapability.get(),
+                "a base-capable executor should retain feedback fallback");
+            if (missingCapability)
+            {
+                t.Equals(
+                    missingCapability->classify(commands.front()).reason,
+                    GsFallbackReason::BackendUnavailable,
+                    "missing exact feedback capability should fail closed");
+            }
+
+            const std::vector<uint8_t> shortSnapshot(
+                GS_VULKAN_VRAM_SIZE - 1u, 0u);
+            std::vector<uint8_t> malformedVram = initial;
+            uint64_t malformedSoftwareCalls = 0u;
+            std::unique_ptr<GsVulkanRasterBackend> malformed =
+                GsVulkanRasterBackend::createWithExecutor(
+                    std::make_unique<FakeCt32Executor>(
+                        FakeCt32Executor::Behavior::Exact),
+                    config, malformedVram,
+                    [&](const GsDrawCommand &)
+                    {
+                        ++malformedSoftwareCalls;
+                    },
+                    {}, nullptr,
+                    [&]() -> std::span<const uint8_t>
+                    {
+                        return shortSnapshot;
+                    });
+            t.IsNotNull(malformed.get(),
+                        "a malformed-provider fixture should construct");
+            bool malformedThrew = false;
+            if (malformed)
+            {
+                t.IsTrue(
+                    malformed->classify(commands.front()).supported,
+                    "classification should require a provider but not invoke it");
+                try
+                {
+                    malformed->submit(std::span<const GsDrawCommand>(
+                        &commands.front(), 1u));
+                }
+                catch (const std::runtime_error &error)
+                {
+                    malformedThrew =
+                        std::string(error.what()).find("exact 4 MiB") !=
+                        std::string::npos;
+                }
+                t.Equals(
+                    malformed->backendStatistics().gpuRequestsFailed,
+                    1ull,
+                    "an invalid prepared snapshot should fail one request");
+                t.Equals(
+                    malformed->serviceStatistics()
+                        .feedbackLinearDepthCt32SpriteDrawsCompleted,
+                    0ull,
+                    "an invalid snapshot must not reach the executor");
+            }
+            t.IsTrue(
+                malformedThrew,
+                "an invalid prepared snapshot should retain an exact-size diagnostic");
+            t.IsTrue(malformedVram == initial,
+                     "snapshot validation must preserve canonical VRAM");
+            t.Equals(malformedSoftwareCalls, 0ull,
+                     "snapshot validation must precede the software oracle");
+
+            ScopedArtifactDirectory artifacts;
+            std::vector<uint8_t> mismatchVram = initial;
+            GsVulkanRasterBackendConfig mismatchConfig = config;
+            mismatchConfig.verificationArtifactDirectory =
+                artifacts.path.string();
+            std::unique_ptr<GsVulkanRasterBackend> mismatch =
+                GsVulkanRasterBackend::createWithExecutor(
+                    std::make_unique<FakeCt32Executor>(
+                        FakeCt32Executor::Behavior::Noop),
+                    mismatchConfig, mismatchVram,
+                    [&](const GsDrawCommand &draw)
+                    {
+                        GsVulkanFeedbackLinearDepthCt32Sprite sprite{};
+                        if (prepareGsVulkanFeedbackLinearDepthCt32Sprite(
+                                draw, sprite).supported)
+                        {
+                            applyFeedbackLinearDepthCt32SpriteCpu(
+                                mismatchVram, feedbackSnapshot, sprite);
+                        }
+                    },
+                    {}, nullptr,
+                    [&]() -> std::span<const uint8_t>
+                    {
+                        return feedbackSnapshot;
+                    });
+            t.IsNotNull(mismatch.get(),
+                        "the feedback mismatch fixture should construct");
+            bool mismatchThrew = false;
+            if (mismatch)
+            {
+                try
+                {
+                    mismatch->submit(std::span<const GsDrawCommand>(
+                        &commands.front(), 1u));
+                }
+                catch (const std::runtime_error &)
+                {
+                    mismatchThrew = true;
+                }
+                const std::filesystem::path bundle =
+                    mismatch->backendStatistics().lastVerificationArtifact;
+                t.IsTrue(std::filesystem::is_directory(bundle),
+                         "the feedback reproducer should publish atomically");
+                std::ifstream snapshotFile(
+                    bundle / "feedback-snapshot-vram.bin",
+                    std::ios::in | std::ios::binary);
+                const std::vector<uint8_t> dumpedSnapshot{
+                    std::istreambuf_iterator<char>(snapshotFile),
+                    std::istreambuf_iterator<char>()};
+                t.IsTrue(
+                    dumpedSnapshot == feedbackSnapshot,
+                    "the reproducer should preserve the independent snapshot exactly");
+                std::ifstream manifest(bundle / "command.json");
+                const std::string manifestText{
+                    std::istreambuf_iterator<char>(manifest),
+                    std::istreambuf_iterator<char>()};
+                t.IsTrue(
+                    manifestText.find(
+                        "\"feedback_linear_depth_ct32_sprite\"") !=
+                        std::string::npos,
+                    "the manifest should identify the feedback record");
+                t.IsTrue(
+                    manifestText.find("\"texture_source\":1") !=
+                            std::string::npos &&
+                        manifestText.find(
+                            "\"feedback_snapshot_fnv1a64\"") !=
+                            std::string::npos,
+                    "the manifest should bind the record to its snapshot");
+            }
+            t.IsTrue(mismatchThrew,
+                     "the injected no-op feedback result should stop Verify");
         });
 
         tc.Run("Vulkan strict backend keeps ordered depth CT32 sprites resident", [](TestCase &t)
@@ -9603,6 +9911,155 @@ void register_ps2_gs_vulkan_tests()
                      "integrated linear Verify should remain validation-clean");
             t.Equals(service.validationWarnings, 0u,
                      "integrated linear Verify should emit no validation warnings");
+        });
+
+        tc.Run("GS Vulkan verifies feedback linear depth with one run snapshot", [](TestCase &t)
+        {
+            GSMem::InitLookupTables();
+            const std::array<GsDrawCommand, 2> commands{{
+                makeFeedbackLinearDepthCt32SpriteCommand(
+                    30'400u, 4u, 1u, 200u, GS_PSM_Z24, false, 1u,
+                    6u, 5u,
+                    {0u, 63u, 0u, 31u}, {0u, 0u},
+                    {0u, 128u}, {0u, 128u},
+                    {128u, 256u}, {0u, 128u},
+                    0x00123456u),
+                makeFeedbackLinearDepthCt32SpriteCommand(
+                    30'401u, 4u, 1u, 200u, GS_PSM_Z24, false, 1u,
+                    6u, 5u,
+                    {0u, 63u, 0u, 31u}, {0u, 0u},
+                    {128u, 256u}, {0u, 128u},
+                    {0u, 128u}, {0u, 128u},
+                    0x00654321u),
+            }};
+            std::array<GsVulkanFeedbackLinearDepthCt32Sprite, 2>
+                prepared{};
+            uint64_t expectedPixels = 0u;
+            for (size_t index = 0u; index < commands.size(); ++index)
+            {
+                t.IsTrue(
+                    prepareGsVulkanFeedbackLinearDepthCt32Sprite(
+                        commands[index], prepared[index]).supported,
+                    "the integrated feedback fixture should be eligible");
+                expectedPixels +=
+                    static_cast<uint64_t>(
+                        prepared[index].boundsX1 -
+                        prepared[index].boundsX0) *
+                    static_cast<uint64_t>(
+                        prepared[index].boundsY1 -
+                        prepared[index].boundsY0);
+            }
+
+            std::vector<uint8_t> softwareVram =
+                makeVramPattern(0x46425631u);
+            std::vector<uint8_t> acceleratedVram = softwareVram;
+            GS software;
+            GS accelerated;
+            software.init(
+                softwareVram.data(),
+                static_cast<uint32_t>(softwareVram.size()), nullptr);
+            accelerated.init(
+                acceleratedVram.data(),
+                static_cast<uint32_t>(acceleratedVram.size()), nullptr);
+
+            GsVulkanCapabilityReport preflight{};
+            const GsVulkanServiceConfig config =
+                makeRendererServiceConfig(preflight);
+            ScopedArtifactDirectory artifacts;
+            t.IsTrue(
+                accelerated.configureVulkanRenderer(
+                    config, artifacts.path.string()),
+                "the feedback fixture should accept Vulkan configuration");
+            if (!preflight.ready())
+            {
+                t.IsFalse(
+                    accelerated.setRendererMode(GsRendererMode::Verify),
+                    "an unavailable host should decline feedback Verify cleanly");
+                return;
+            }
+
+            const GsVulkanDeviceReport *selected =
+                preflight.selectedDevice();
+            t.IsNotNull(
+                selected,
+                "a ready feedback preflight should select one device");
+            if (!selected)
+                return;
+            t.IsTrue(
+                selected->exactFeedbackLinearDepthCt32Sprite,
+                "the selected device should expose immutable feedback execution");
+            if (!selected->exactFeedbackLinearDepthCt32Sprite)
+                return;
+
+            t.IsTrue(
+                accelerated.setRendererMode(GsRendererMode::Verify),
+                "the capable host should create feedback Verify");
+            if (accelerated.rendererMode() != GsRendererMode::Verify)
+                return;
+            accelerated.setBackendCountersEnabled(true);
+            accelerated.resetBackendCounters();
+
+            for (const GsDrawCommand &command : commands)
+            {
+                drawNearestCt32SpriteCommand(software, command);
+                drawNearestCt32SpriteCommand(accelerated, command);
+            }
+            (void)software.getDebugSnapshot();
+            (void)accelerated.getDebugSnapshot();
+            t.IsTrue(
+                acceleratedVram == softwareVram,
+                "real feedback Verify should match the frontend snapshot oracle");
+
+            const GsBackendCounters counters =
+                accelerated.backendCounters();
+            t.Equals(counters.commands, 2ull,
+                     "the feedback fixture should assemble both draws");
+            t.Equals(counters.acceleratedCommands, 2ull,
+                     "both feedback draws should use Vulkan Verify");
+            t.Equals(counters.verifiedCommands, 2ull,
+                     "both feedback draws should record verification");
+            t.Equals(counters.softwareCommands, 0ull,
+                     "feedback Verify should not use router fallback");
+            t.Equals(counters.fallbackCommands, 0ull,
+                     "eligible feedback should have no fallback decision");
+
+            const GsVulkanRasterBackendStatistics backend =
+                accelerated.vulkanRendererBackendStatistics();
+            t.Equals(backend.commandsAttempted, 2ull,
+                     "the integrated backend should attempt both feedback draws");
+            t.Equals(backend.commandsCompleted, 2ull,
+                     "both matching feedback draws should complete");
+            t.Equals(backend.verifiedCommands, 2ull,
+                     "the backend should compare both feedback results");
+            t.Equals(
+                backend.bytesCompared,
+                2ull * GS_VULKAN_VRAM_SIZE,
+                "feedback Verify should compare two complete VRAM images");
+            t.Equals(backend.verificationMismatches, 0ull,
+                     "the real feedback kernel should have no mismatch");
+
+            const GsVulkanServiceStatistics service =
+                accelerated.vulkanRendererServiceStatistics();
+            t.Equals(
+                service.feedbackLinearDepthCt32SpriteDrawsCompleted,
+                2ull,
+                "the service should execute both feedback draws");
+            t.Equals(
+                service.feedbackLinearDepthCt32SpriteDrawsFailed,
+                0ull,
+                "real feedback Verify should not fail");
+            t.Equals(
+                service.feedbackLinearDepthCt32SpritePixelsExecuted,
+                expectedPixels,
+                "the service should retain exact feedback pixel accounting");
+            t.Equals(service.linearCt32SpriteDrawsCompleted, 0ull,
+                     "feedback routing must not alias ordinary linear work");
+            t.Equals(service.depthCt32SpriteDrawsCompleted, 0ull,
+                     "feedback routing must not alias flat depth work");
+            t.Equals(service.validationErrors, 0u,
+                     "integrated feedback Verify should remain validation-clean");
+            t.Equals(service.validationWarnings, 0u,
+                     "integrated feedback Verify should emit no validation warnings");
         });
 
         tc.Run("GS Vulkan Hybrid qualifies nearest CT32 textures at 8192 samples", [](TestCase &t)

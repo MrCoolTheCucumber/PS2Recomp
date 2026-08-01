@@ -228,6 +228,51 @@ namespace
             << "\"texture_wrap_v\":" << sprite.textureWrapV << '}';
     }
 
+    void writePreparedRecord(
+        std::ostream &output,
+        const GsVulkanFeedbackLinearDepthCt32Sprite &sprite)
+    {
+        output
+            << "  \"feedback_linear_depth_ct32_sprite\": {"
+            << "\"framebuffer_base_block\":"
+            << sprite.framebufferBaseBlock << ','
+            << "\"framebuffer_width\":"
+            << sprite.framebufferWidth << ','
+            << "\"bounds_x0\":" << sprite.boundsX0 << ','
+            << "\"bounds_y0\":" << sprite.boundsY0 << ','
+            << "\"bounds_x1\":" << sprite.boundsX1 << ','
+            << "\"bounds_y1\":" << sprite.boundsY1 << ','
+            << "\"texture_base_block\":"
+            << sprite.textureBaseBlock << ','
+            << "\"texture_width\":" << sprite.textureWidth << ','
+            << "\"texture_mask_u\":" << sprite.textureMaskU << ','
+            << "\"texture_mask_v\":" << sprite.textureMaskV << ','
+            << "\"fixed_base_u\":" << sprite.fixedBaseU << ','
+            << "\"fixed_block_step_u\":"
+            << sprite.fixedBlockStepU << ','
+            << "\"fixed_lane_u\":[";
+        for (size_t lane = 0u; lane < sprite.fixedLaneU.size(); ++lane)
+        {
+            if (lane != 0u)
+                output << ',';
+            output << sprite.fixedLaneU[lane];
+        }
+        output
+            << "],\"fixed_scan_v_bits\":"
+            << sprite.fixedScanVBits << ','
+            << "\"fixed_step_v_bits\":"
+            << sprite.fixedStepVBits << ','
+            << "\"texture_wrap_u\":" << sprite.textureWrapU << ','
+            << "\"texture_wrap_v\":" << sprite.textureWrapV << ','
+            << "\"depth_base_block\":" << sprite.depthBaseBlock << ','
+            << "\"depth_psm\":" << sprite.depthPsm << ','
+            << "\"depth\":" << sprite.depth << ','
+            << "\"depth_test_method\":"
+            << sprite.depthTestMethod << ','
+            << "\"depth_write\":" << sprite.depthWrite << ','
+            << "\"texture_source\":" << sprite.textureSource << '}';
+    }
+
     template <typename PreparedRecord>
     bool writeCommandManifest(
         const fs::path &path,
@@ -239,6 +284,7 @@ namespace
         std::span<const uint8_t> initial,
         std::span<const uint8_t> software,
         std::span<const uint8_t> gpu,
+        std::span<const uint8_t> feedbackSnapshot,
         std::string &error)
     {
         std::ofstream output(path, std::ios::out | std::ios::trunc);
@@ -279,10 +325,25 @@ namespace
             << "\",\n"
             << "  \"gpu_fnv1a64\": \"0x"
             << std::setw(16) << std::setfill('0') << fnv1a64(gpu)
-            << std::dec << "\",\n"
-            << "  \"files\": {\"initial\": \"initial-vram.bin\", "
+            << std::dec << '"';
+        if (!feedbackSnapshot.empty())
+        {
+            output
+                << ",\n  \"feedback_snapshot_fnv1a64\": \"0x"
+                << std::hex << std::setw(16) << std::setfill('0')
+                << fnv1a64(feedbackSnapshot) << std::dec << '"';
+        }
+        output
+            << ",\n  \"files\": {\"initial\": \"initial-vram.bin\", "
                "\"software\": \"software-vram.bin\", "
-               "\"gpu\": \"gpu-vram.bin\"},\n";
+               "\"gpu\": \"gpu-vram.bin\"";
+        if (!feedbackSnapshot.empty())
+        {
+            output
+                << ", \"feedback_snapshot\": "
+                   "\"feedback-snapshot-vram.bin\"";
+        }
+        output << "},\n";
         writePreparedRecord(output, record);
         output
             << ",\n  \"bounds\": {"
@@ -493,7 +554,8 @@ namespace
         std::span<const uint8_t> software,
         std::span<const uint8_t> gpu,
         std::string &artifactPath,
-        std::string &error)
+        std::string &error,
+        std::span<const uint8_t> feedbackSnapshot = {})
     {
         fs::path partial;
         fs::path completed;
@@ -508,10 +570,15 @@ namespace
         if (!writeBytes(partial / "initial-vram.bin", initial, error) ||
             !writeBytes(partial / "software-vram.bin", software, error) ||
             !writeBytes(partial / "gpu-vram.bin", gpu, error) ||
+            (!feedbackSnapshot.empty() &&
+             !writeBytes(
+                 partial / "feedback-snapshot-vram.bin",
+                 feedbackSnapshot, error)) ||
             !writeCommandManifest(
                 partial / "command.json", command, record,
                 firstDifference, software[firstDifference],
-                gpu[firstDifference], initial, software, gpu, error))
+                gpu[firstDifference], initial, software, gpu,
+                feedbackSnapshot, error))
         {
             return false;
         }
@@ -566,6 +633,7 @@ struct GsVulkanRasterBackend::Impl final
     std::span<uint8_t> canonicalVram;
     DrawCallback softwareOracle;
     DrawCallback acceleratedCommit;
+    FeedbackSnapshotCallback feedbackSnapshot;
     GsVulkanRasterBackendStatistics statistics;
     GsVramCoherency coherency;
     std::vector<PendingResidentCommand> pendingResidentCommands;
@@ -575,6 +643,7 @@ struct GsVulkanRasterBackend::Impl final
     bool exactDepthCt32Sprite = false;
     bool exactNearestCt32Sprite = false;
     bool exactLinearCt32Sprite = false;
+    bool exactFeedbackLinearDepthCt32Sprite = false;
     bool failed = false;
     bool shutDown = false;
 
@@ -820,7 +889,8 @@ GsVulkanRasterBackend::create(
     DrawCallback softwareOracle,
     DrawCallback acceleratedCommit,
     GsVulkanCapabilityReport *report,
-    std::string *error)
+    std::string *error,
+    FeedbackSnapshotCallback feedbackSnapshot)
 {
     std::unique_ptr<GsVulkanService> service =
         GsVulkanService::create(serviceConfig, report, error);
@@ -828,7 +898,8 @@ GsVulkanRasterBackend::create(
         return nullptr;
     return createWithExecutor(
         std::move(service), backendConfig, canonicalVram,
-        std::move(softwareOracle), std::move(acceleratedCommit), error);
+        std::move(softwareOracle), std::move(acceleratedCommit), error,
+        std::move(feedbackSnapshot));
 }
 
 std::unique_ptr<GsVulkanRasterBackend>
@@ -838,7 +909,8 @@ GsVulkanRasterBackend::createWithExecutor(
     std::span<uint8_t> canonicalVram,
     DrawCallback softwareOracle,
     DrawCallback acceleratedCommit,
-    std::string *error)
+    std::string *error,
+    FeedbackSnapshotCallback feedbackSnapshot)
 {
     const auto reject = [&](std::string message)
     {
@@ -882,10 +954,14 @@ GsVulkanRasterBackend::createWithExecutor(
         selectedDevice && selectedDevice->exactNearestCt32Sprite;
     impl->exactLinearCt32Sprite =
         selectedDevice && selectedDevice->exactLinearCt32Sprite;
+    impl->exactFeedbackLinearDepthCt32Sprite =
+        selectedDevice &&
+        selectedDevice->exactFeedbackLinearDepthCt32Sprite;
     impl->config = backendConfig;
     impl->canonicalVram = canonicalVram;
     impl->softwareOracle = std::move(softwareOracle);
     impl->acceleratedCommit = std::move(acceleratedCommit);
+    impl->feedbackSnapshot = std::move(feedbackSnapshot);
     impl->pendingResidentCommands.reserve(
         backendConfig.maximumResidentBatchCommands);
     GsVramPageMask allPages;
@@ -1016,6 +1092,24 @@ GsBackendDecision GsVulkanRasterBackend::classify(
         if (!requestsExactLinearFilter)
             return textureDecision;
 
+        const GsDrawResources resources = command.resources();
+        if (m_impl->config.mode == GsRendererMode::Verify &&
+            resources.framebufferTextureAlias)
+        {
+            GsVulkanFeedbackLinearDepthCt32Sprite feedbackSprite{};
+            const GsBackendDecision feedbackDecision =
+                prepareGsVulkanFeedbackLinearDepthCt32Sprite(
+                    command, feedbackSprite);
+            if (!feedbackDecision.supported)
+                return feedbackDecision;
+            if (!m_impl->exactFeedbackLinearDepthCt32Sprite ||
+                !m_impl->feedbackSnapshot)
+            {
+                return {false, GsFallbackReason::BackendUnavailable};
+            }
+            return feedbackDecision;
+        }
+
         GsVulkanLinearCt32Sprite linearSprite{};
         const GsBackendDecision linearDecision =
             prepareGsVulkanLinearCt32Sprite(command, linearSprite);
@@ -1099,7 +1193,10 @@ void GsVulkanRasterBackend::submit(
         GsVulkanDepthCt32Sprite depthSprite{};
         GsVulkanNearestCt32Sprite texturedSprite{};
         GsVulkanLinearCt32Sprite linearTexturedSprite{};
+        GsVulkanFeedbackLinearDepthCt32Sprite
+            feedbackLinearDepthSprite{};
         GsVulkanCt32Triangle triangle{};
+        const GsDrawResources resources = command.resources();
         const bool isTriangle =
             command.primitive().type == GS_PRIM_TRIANGLE;
         const bool isTexturedSprite =
@@ -1107,6 +1204,7 @@ void GsVulkanRasterBackend::submit(
             command.primitive().tme;
         bool isDepthSprite = false;
         bool isLinearTexturedSprite = false;
+        bool isFeedbackLinearDepthSprite = false;
         if (isTriangle)
             (void)prepareGsVulkanCt32Triangle(command, triangle);
         else if (isTexturedSprite)
@@ -1116,9 +1214,21 @@ void GsVulkanRasterBackend::submit(
                     command, texturedSprite);
             if (!textureDecision.supported)
             {
-                (void)prepareGsVulkanLinearCt32Sprite(
-                    command, linearTexturedSprite);
-                isLinearTexturedSprite = true;
+                if (m_impl->config.mode == GsRendererMode::Verify &&
+                    resources.framebufferTextureAlias)
+                {
+                    const GsBackendDecision feedbackDecision =
+                        prepareGsVulkanFeedbackLinearDepthCt32Sprite(
+                            command, feedbackLinearDepthSprite);
+                    isFeedbackLinearDepthSprite =
+                        feedbackDecision.supported;
+                }
+                if (!isFeedbackLinearDepthSprite)
+                {
+                    (void)prepareGsVulkanLinearCt32Sprite(
+                        command, linearTexturedSprite);
+                    isLinearTexturedSprite = true;
+                }
             }
         }
         else
@@ -1141,11 +1251,21 @@ void GsVulkanRasterBackend::submit(
                 isDepthSprite = depthDecision.supported;
             }
         }
-        const GsDrawResources resources = command.resources();
-
         ++m_impl->statistics.commandsAttempted;
         if (m_impl->config.mode == GsRendererMode::Verify)
         {
+            std::span<const uint8_t> feedbackSnapshot;
+            if (isFeedbackLinearDepthSprite)
+            {
+                feedbackSnapshot = m_impl->feedbackSnapshot();
+                if (feedbackSnapshot.size() != GS_VULKAN_VRAM_SIZE)
+                {
+                    m_impl->failRequest(
+                        "feedback snapshot for verification draw " +
+                            std::to_string(command.sequence()),
+                        "frontend did not provide an exact 4 MiB snapshot");
+                }
+            }
             GsVramPageMask allPages;
             allPages.setAll();
             prepareCpuVramAccess(
@@ -1160,6 +1280,14 @@ void GsVulkanRasterBackend::submit(
             {
                 executed = m_impl->executor->executeCt32Triangle(
                     initial, triangle, gpuOutput, &executionError);
+            }
+            else if (isFeedbackLinearDepthSprite)
+            {
+                executed = m_impl->executor
+                    ->executeFeedbackLinearDepthCt32Sprite(
+                        initial, feedbackSnapshot,
+                        feedbackLinearDepthSprite, gpuOutput,
+                        &executionError);
             }
             else if (isDepthSprite)
             {
@@ -1230,6 +1358,16 @@ void GsVulkanRasterBackend::submit(
                         command, triangle, firstDifference,
                         initial, m_impl->canonicalVram, gpuOutput,
                         artifactPath, artifactError);
+                }
+                else if (isFeedbackLinearDepthSprite)
+                {
+                    artifactWritten = writeVerificationArtifact(
+                        m_impl->config.verificationArtifactDirectory,
+                        command, feedbackLinearDepthSprite,
+                        firstDifference, initial,
+                        m_impl->canonicalVram, gpuOutput,
+                        artifactPath, artifactError,
+                        feedbackSnapshot);
                 }
                 else if (isDepthSprite)
                 {

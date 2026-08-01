@@ -2736,7 +2736,19 @@ bool GSRasterizer::setRendererMode(GsRendererMode mode)
                     recordAcceleratedCommit(m_owner, command);
                 },
                 &state.capabilityReport,
-                &state.diagnostic);
+                &state.diagnostic,
+                [this]() -> std::span<const uint8_t>
+                {
+                    if (!m_feedbackSnapshotValid ||
+                        m_textureSnapshot.size() !=
+                            GS_VULKAN_VRAM_SIZE)
+                    {
+                        return {};
+                    }
+                    return std::span<const uint8_t>(
+                        m_textureSnapshot.data(),
+                        m_textureSnapshot.size());
+                });
         if (!accelerated)
             return false;
         state.accelerated = std::move(accelerated);

@@ -72,6 +72,10 @@ class GsVulkanRasterBackend final : public IGsRasterBackend
 {
 public:
     using DrawCallback = std::function<void(const GsDrawCommand &)>;
+    // Verify invokes this synchronously once per admitted feedback draw. The
+    // caller owns the returned bytes and must keep them stable for the call.
+    using FeedbackSnapshotCallback =
+        std::function<std::span<const uint8_t>()>;
 
     [[nodiscard]] static std::unique_ptr<GsVulkanRasterBackend> create(
         const GsVulkanServiceConfig &serviceConfig,
@@ -80,7 +84,8 @@ public:
         DrawCallback softwareOracle,
         DrawCallback acceleratedCommit,
         GsVulkanCapabilityReport *report = nullptr,
-        std::string *error = nullptr);
+        std::string *error = nullptr,
+        FeedbackSnapshotCallback feedbackSnapshot = {});
 
     // Dependency-injected construction keeps mismatch, execution-failure, and
     // lifecycle tests deterministic even on compiled-out or GPU-less hosts.
@@ -91,7 +96,8 @@ public:
         std::span<uint8_t> canonicalVram,
         DrawCallback softwareOracle,
         DrawCallback acceleratedCommit,
-        std::string *error = nullptr);
+        std::string *error = nullptr,
+        FeedbackSnapshotCallback feedbackSnapshot = {});
 
     ~GsVulkanRasterBackend() override;
 
