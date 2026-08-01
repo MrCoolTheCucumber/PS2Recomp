@@ -4,6 +4,7 @@
 #include "runtime/ps2_gs_coherency.h"
 #include "runtime/ps2_gs_vulkan.h"
 
+#include <cstddef>
 #include <cstdint>
 #include <functional>
 #include <memory>
@@ -16,6 +17,8 @@ struct GsVulkanRasterBackendConfig
     // Empty selects PS2X_GS_VERIFY_DUMP_DIR, then the bounded default
     // "gs-vulkan-verify-failures" below the process working directory.
     std::string verificationArtifactDirectory;
+    size_t maximumResidentBatchCommands =
+        GS_VULKAN_MAX_RESIDENT_SPRITE_BATCH;
 };
 
 struct GsVulkanRasterBackendStatistics
@@ -29,6 +32,10 @@ struct GsVulkanRasterBackendStatistics
     uint64_t bytesCompared = 0u;
     uint64_t flushes = 0u;
     uint64_t residentCommands = 0u;
+    uint64_t residentBatchesCompleted = 0u;
+    uint64_t largestResidentBatch = 0u;
+    uint64_t resourceHazardDrains = 0u;
+    uint64_t queueBackpressureDrains = 0u;
     uint64_t cpuAccessPreparations = 0u;
     GsVramCoherencySummary pageOwnership{};
     GsVramCoherencyStatistics coherency{};

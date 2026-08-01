@@ -854,10 +854,12 @@ void register_ps2_gs_vulkan_tests()
                      "strict mode should leave resident GPU-newer pages off the CPU hot path");
             const GsVramPageMask writtenPages =
                 command.resources().writePages;
-            t.IsTrue(
-                backend->backendStatistics().pageOwnership.gpuNewerPages ==
-                    writtenPages.count(),
-                "strict mode should transfer ownership of every conservative write page");
+            t.Equals(backend->pendingCommandCount(), static_cast<size_t>(1u),
+                     "strict submission should remain in the bounded resident queue");
+            t.Equals(
+                backend->backendStatistics().pageOwnership.gpuNewerPages,
+                static_cast<size_t>(0u),
+                "queued work should not publish ownership before execution");
             backend->prepareCpuVramAccess(
                 writtenPages, GsFlushReason::CpuReadback);
             t.IsTrue(vram == expected,
@@ -935,9 +937,13 @@ void register_ps2_gs_vulkan_tests()
             bool executionThrew = false;
             if (failingBackend)
             {
+                failingBackend->submit(commands);
+                t.Equals(failingBackend->pendingCommandCount(),
+                         static_cast<size_t>(1u),
+                         "a deferred failing request should first enter the queue");
                 try
                 {
-                    failingBackend->submit(commands);
+                    failingBackend->flush(GsFlushReason::Explicit);
                 }
                 catch (const std::runtime_error &error)
                 {
@@ -952,7 +958,7 @@ void register_ps2_gs_vulkan_tests()
                     "executor failure should be counted once");
             }
             t.IsTrue(executionThrew,
-                     "executor failure should report the synchronized boundary");
+                     "executor failure should report the draining boundary");
             t.IsTrue(failureVram == initial,
                      "executor failure must retain pre-draw canonical VRAM");
             t.Equals(failedSoftwareCalls, 0ull,
@@ -965,7 +971,7 @@ void register_ps2_gs_vulkan_tests()
                      GsFallbackReason::BackendUnavailable,
                      "post-shutdown classification should fail closed");
             t.Equals(backend->pendingCommandCount(), static_cast<size_t>(0u),
-                     "Phase 3 requests should remain synchronous");
+                     "shutdown should leave no accepted resident work");
         });
 
         tc.Run("Vulkan hybrid backend keeps disjoint pages resident until scoped CPU access", [](TestCase &t)
@@ -1046,23 +1052,33 @@ void register_ps2_gs_vulkan_tests()
                      "three resident draws should avoid every implicit CPU publication");
             t.Equals(softwareCalls, 0ull,
                      "hybrid resident execution must not invoke the oracle");
-            t.Equals(commitCalls, 3ull,
-                     "each resident draw should still publish its metadata commit");
+            t.Equals(commitCalls, 2ull,
+                     "the disjoint prefix should publish when the repeated page forces a drain");
+            t.Equals(backend->pendingCommandCount(), static_cast<size_t>(1u),
+                     "the post-hazard command should remain pending");
 
             GsVulkanServiceStatistics service = backend->serviceStatistics();
-            t.Equals(service.pageUploadOperationsCompleted, 2ull,
-                     "only the first touch of each disjoint page should upload");
+            t.Equals(service.pageUploadOperationsCompleted, 1ull,
+                     "the disjoint prefix should upload both pages in one operation");
             t.Equals(service.pagesUploaded, 2ull,
                      "resident setup should transfer exactly two 8 KiB pages");
             t.Equals(service.pageDownloadOperationsCompleted, 0ull,
                      "no CPU observer means no resident page download");
-            t.Equals(service.spriteDrawsCompleted, 3ull,
-                     "all three commands should execute against resident VRAM");
+            t.Equals(service.spriteDrawsCompleted, 2ull,
+                     "only the drained disjoint prefix should have executed");
+            t.Equals(service.residentSpriteBatchesCompleted, 1ull,
+                     "the disjoint prefix should be one service batch");
+            t.Equals(service.largestResidentSpriteBatch, 2ull,
+                     "the first resident batch should contain both disjoint draws");
 
             GsVulkanRasterBackendStatistics statistics =
                 backend->backendStatistics();
-            t.Equals(statistics.residentCommands, 3ull,
-                     "backend counters should distinguish resident commands");
+            t.Equals(statistics.residentCommands, 2ull,
+                     "backend counters should count only executed resident commands");
+            t.Equals(statistics.resourceHazardDrains, 1ull,
+                     "the repeated physical page should force one conservative drain");
+            t.Equals(statistics.largestResidentBatch, 2ull,
+                     "backend diagnostics should retain the disjoint prefix size");
             t.Equals(statistics.pageOwnership.gpuNewerPages,
                      static_cast<size_t>(2u),
                      "both touched pages should remain GPU-newer");
@@ -1072,6 +1088,10 @@ void register_ps2_gs_vulkan_tests()
 
             backend->prepareCpuVramAccess(
                 firstPages, GsFlushReason::CpuReadback);
+            t.Equals(commitCalls, 3ull,
+                     "the CPU boundary should publish the remaining metadata commit");
+            t.Equals(backend->pendingCommandCount(), static_cast<size_t>(0u),
+                     "CPU access should drain all accepted resident work");
             const size_t firstOffset = 5u * GS_VRAM_PAGE_SIZE;
             const size_t secondOffset = 511u * GS_VRAM_PAGE_SIZE;
             t.IsTrue(std::equal(
@@ -1097,6 +1117,10 @@ void register_ps2_gs_vulkan_tests()
                      "two differently scoped observers should issue two downloads");
             t.Equals(service.pagesDownloaded, 2ull,
                      "each GPU-newer page should download exactly once");
+            t.Equals(service.spriteDrawsCompleted, 3ull,
+                     "the CPU boundary should execute the final queued draw");
+            t.Equals(service.residentSpriteBatchesCompleted, 2ull,
+                     "the hazard prefix and remaining draw should form two batches");
             statistics = backend->backendStatistics();
             t.Equals(statistics.coherency.gpuWriteOperations, 3ull,
                      "every resident command should advance GPU ownership");
@@ -1107,6 +1131,127 @@ void register_ps2_gs_vulkan_tests()
             t.Equals(statistics.pageOwnership.gpuNewerPages,
                      static_cast<size_t>(0u),
                      "the final observation should leave no hidden GPU writer");
+        });
+
+        tc.Run("Vulkan resident queue drains at its configured bound", [](TestCase &t)
+        {
+            GSMem::InitLookupTables();
+            const std::array<GsDrawCommand, 3> commands{
+                makeCt32SpriteCommand(
+                    201u, 3u, 1u,
+                    {0u, 31u, 0u, 31u}, {0u, 0u},
+                    1u * 16u, 2u * 16u,
+                    9u * 16u, 8u * 16u, 0x44332211u),
+                makeCt32SpriteCommand(
+                    202u, 7u, 1u,
+                    {0u, 31u, 0u, 31u}, {0u, 0u},
+                    3u * 16u, 4u * 16u,
+                    12u * 16u, 11u * 16u, 0x88776655u),
+                makeCt32SpriteCommand(
+                    203u, 11u, 1u,
+                    {0u, 31u, 0u, 31u}, {0u, 0u},
+                    5u * 16u, 6u * 16u,
+                    15u * 16u, 13u * 16u, 0xCCBBAA99u),
+            };
+
+            std::vector<uint8_t> vram = makeVramPattern(0x424F554Eu);
+            const std::vector<uint8_t> initial = vram;
+            std::vector<uint8_t> expected = initial;
+            for (const GsDrawCommand &command : commands)
+            {
+                GsVulkanCt32Sprite sprite{};
+                t.IsTrue(prepareGsVulkanCt32Sprite(
+                             command, sprite).supported,
+                         "each bounded-queue fixture should be GPU eligible");
+                applyCt32SpriteCpu(expected, sprite);
+            }
+
+            uint64_t commitCalls = 0u;
+            GsVulkanRasterBackendConfig config{};
+            config.mode = GsRendererMode::Hybrid;
+            config.maximumResidentBatchCommands = 2u;
+            std::unique_ptr<GsVulkanRasterBackend> backend =
+                GsVulkanRasterBackend::createWithExecutor(
+                    std::make_unique<FakeCt32Executor>(
+                        FakeCt32Executor::Behavior::Exact),
+                    config, vram,
+                    [](const GsDrawCommand &) {},
+                    [&](const GsDrawCommand &) { ++commitCalls; },
+                    nullptr);
+            t.IsNotNull(backend.get(),
+                        "a two-command resident queue should construct");
+            if (!backend)
+                return;
+
+            for (const GsDrawCommand &command : commands)
+            {
+                backend->submit(
+                    std::span<const GsDrawCommand>(&command, 1u));
+            }
+            t.Equals(commitCalls, 2ull,
+                     "the third command should drain the full two-command prefix");
+            t.Equals(backend->pendingCommandCount(), static_cast<size_t>(1u),
+                     "the third command should occupy the newly empty queue");
+            t.IsTrue(vram == initial,
+                     "backpressure execution should not imply CPU publication");
+
+            GsVulkanRasterBackendStatistics backendStatistics =
+                backend->backendStatistics();
+            t.Equals(backendStatistics.commandsAttempted, 3ull,
+                     "all three commands should be accepted once");
+            t.Equals(backendStatistics.commandsCompleted, 2ull,
+                     "only the backpressure-drained prefix should be complete");
+            t.Equals(backendStatistics.queueBackpressureDrains, 1ull,
+                     "the configured bound should force one named drain");
+            t.Equals(backendStatistics.residentBatchesCompleted, 1ull,
+                     "the full prefix should use one resident batch");
+            t.Equals(backendStatistics.largestResidentBatch, 2ull,
+                     "the backend should retain its configured peak batch size");
+
+            GsVulkanServiceStatistics service =
+                backend->serviceStatistics();
+            t.Equals(service.pageUploadOperationsCompleted, 1ull,
+                     "the full prefix should upload its pages together");
+            t.Equals(service.pagesUploaded, 2ull,
+                     "the first batch should upload two distinct pages");
+            t.Equals(service.spriteDrawsCompleted, 2ull,
+                     "the service should execute the full prefix only");
+            t.Equals(service.residentSpriteBatchesCompleted, 1ull,
+                     "the service should observe one full prefix batch");
+
+            backend->flush(GsFlushReason::Explicit);
+            t.Equals(commitCalls, 3ull,
+                     "an explicit drain should publish the remaining commit");
+            t.Equals(backend->pendingCommandCount(), static_cast<size_t>(0u),
+                     "the explicit drain should empty the bounded queue");
+            t.IsTrue(vram == initial,
+                     "an executor drain should keep GPU-newer bytes resident");
+
+            GsVramPageMask allPages;
+            allPages.setAll();
+            backend->prepareCpuVramAccess(
+                allPages, GsFlushReason::DebuggerObservation);
+            t.IsTrue(vram == expected,
+                     "the bounded queue should match sequential CPU execution exactly");
+            backendStatistics = backend->backendStatistics();
+            t.Equals(backendStatistics.commandsCompleted, 3ull,
+                     "all accepted commands should complete after the drain");
+            t.Equals(backendStatistics.residentBatchesCompleted, 2ull,
+                     "the full prefix and tail should form two batches");
+
+            GsVulkanRasterBackendConfig invalidConfig = config;
+            invalidConfig.maximumResidentBatchCommands = 0u;
+            std::string invalidError;
+            std::unique_ptr<GsVulkanRasterBackend> invalidBackend =
+                GsVulkanRasterBackend::createWithExecutor(
+                    std::make_unique<FakeCt32Executor>(
+                        FakeCt32Executor::Behavior::Exact),
+                    invalidConfig, vram,
+                    [](const GsDrawCommand &) {}, {}, &invalidError);
+            t.IsNull(invalidBackend.get(),
+                     "a zero-sized resident queue should fail closed");
+            t.IsFalse(invalidError.empty(),
+                      "an invalid queue bound should retain a diagnostic");
         });
 
         tc.Run("Vulkan verify mismatch writes a complete bounded reproducer", [](TestCase &t)
@@ -1451,12 +1596,23 @@ void register_ps2_gs_vulkan_tests()
 
             GsVulkanServiceStatistics service =
                 accelerated.vulkanRendererServiceStatistics();
-            t.Equals(service.pageUploadOperationsCompleted, 2ull,
-                     "two first-use draw pages should issue two uploads");
-            t.Equals(service.pagesUploaded, 2ull,
-                     "the two draws should upload exactly two 8 KiB pages");
+            t.Equals(service.pageUploadOperationsCompleted, 0ull,
+                     "compatible draws should defer their upload until a boundary");
+            t.Equals(service.pagesUploaded, 0ull,
+                     "pending draws should not transfer pages early");
             t.Equals(service.pageDownloadOperationsCompleted, 0ull,
                      "resident draws should not publish either page to CPU");
+            GsVulkanRasterBackendStatistics backend =
+                accelerated.vulkanRendererBackendStatistics();
+            t.Equals(backend.commandsAttempted, 2ull,
+                     "both compatible draws should be accepted immediately");
+            t.Equals(backend.commandsCompleted, 0ull,
+                     "accepted draws should remain incomplete before a boundary");
+            GsBackendCounters counters = accelerated.backendCounters();
+            t.Equals(counters.queueDepth, 2ull,
+                     "the router should expose both pending compatible draws");
+            t.Equals(counters.queueHighWatermark, 2ull,
+                     "the router should retain the compatible-run high watermark");
 
             constexpr std::array<uint32_t, 3> uploadPixels{
                 0xC0010203u, 0xD0040506u, 0xE0070809u};
@@ -1468,12 +1624,27 @@ void register_ps2_gs_vulkan_tests()
                 uploadPixels);
 
             service = accelerated.vulkanRendererServiceStatistics();
+            t.Equals(service.pageUploadOperationsCompleted, 1ull,
+                     "the transfer boundary should upload both draw pages together");
+            t.Equals(service.pagesUploaded, 2ull,
+                     "the batched upload should contain exactly two 8 KiB pages");
+            t.Equals(service.residentSpriteBatchesCompleted, 1ull,
+                     "the transfer boundary should execute one resident draw batch");
+            t.Equals(service.largestResidentSpriteBatch, 2ull,
+                     "the resident service should observe both compatible draws");
+            t.Equals(service.queueSubmissions, 3ull,
+                     "one upload one draw batch and one download should require three submissions");
+            t.Equals(service.shaderDispatches, 2ull,
+                     "both batched sprites should retain exact dispatch accounting");
             t.Equals(service.pageDownloadOperationsCompleted, 1ull,
                      "a partial host upload should preserve one overlapping GPU page");
             t.Equals(service.pagesDownloaded, 1ull,
                      "the upload must not publish an unrelated resident page");
-            GsVulkanRasterBackendStatistics backend =
-                accelerated.vulkanRendererBackendStatistics();
+            backend = accelerated.vulkanRendererBackendStatistics();
+            t.Equals(backend.commandsCompleted, 2ull,
+                     "the transfer boundary should complete both accepted draws");
+            t.Equals(backend.residentBatchesCompleted, 1ull,
+                     "the backend should submit one compatible resident batch");
             t.Equals(backend.pageOwnership.gpuNewerPages,
                      static_cast<size_t>(1u),
                      "the disjoint draw page should remain GPU-newer after the upload");
@@ -1519,8 +1690,11 @@ void register_ps2_gs_vulkan_tests()
             t.Equals(backend.coherency.gpuToCpuPages, 2ull,
                      "coherency accounting should match the exact observed pages");
 
-            const GsBackendCounters counters =
-                accelerated.backendCounters();
+            counters = accelerated.backendCounters();
+            t.Equals(counters.queueDepth, 0ull,
+                     "the scoped CPU boundaries should leave no pending draw");
+            t.Equals(counters.queueHighWatermark, 2ull,
+                     "queue drainage should retain the observed high watermark");
             t.Equals(
                 counters.flushReasons[static_cast<size_t>(
                     GsFlushReason::Transfer)],

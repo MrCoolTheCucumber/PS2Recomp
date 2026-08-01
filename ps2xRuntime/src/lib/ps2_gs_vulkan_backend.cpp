@@ -401,6 +401,13 @@ namespace
 
 struct GsVulkanRasterBackend::Impl final
 {
+    struct PendingResidentCommand
+    {
+        GsDrawCommand command;
+        GsVulkanCt32Sprite sprite;
+        GsDrawResources resources;
+    };
+
     std::unique_ptr<IGsVulkanDrawExecutor> executor;
     GsVulkanRasterBackendConfig config;
     std::span<uint8_t> canonicalVram;
@@ -408,6 +415,8 @@ struct GsVulkanRasterBackend::Impl final
     DrawCallback acceleratedCommit;
     GsVulkanRasterBackendStatistics statistics;
     GsVramCoherency coherency;
+    std::vector<PendingResidentCommand> pendingResidentCommands;
+    GsVramPageMask pendingResidentAccessPages;
     bool failed = false;
     bool shutDown = false;
 
@@ -466,6 +475,86 @@ struct GsVulkanRasterBackend::Impl final
                 std::move(executionError));
         }
         coherency.completeGpuToCpu(pages);
+    }
+
+    void clearPendingResidentCommands() noexcept
+    {
+        pendingResidentCommands.clear();
+        pendingResidentAccessPages.clear();
+    }
+
+    void drainPendingResidentCommands(GsFlushReason reason)
+    {
+        if (pendingResidentCommands.empty())
+            return;
+
+        const size_t commandCount = pendingResidentCommands.size();
+        if (reason == GsFlushReason::ResourceHazard)
+            ++statistics.resourceHazardDrains;
+        else if (reason == GsFlushReason::QueueBackpressure)
+            ++statistics.queueBackpressureDrains;
+
+        std::vector<GsVulkanCt32Sprite> sprites;
+        sprites.reserve(commandCount);
+        for (const PendingResidentCommand &pending :
+             pendingResidentCommands)
+        {
+            sprites.push_back(pending.sprite);
+        }
+
+        try
+        {
+            uploadCpuNewer(
+                pendingResidentAccessPages,
+                "page upload for resident CT32 batch at " +
+                    std::string(gsFlushReasonName(reason)));
+        }
+        catch (...)
+        {
+            clearPendingResidentCommands();
+            throw;
+        }
+
+        std::string executionError;
+        if (!executor->executeResidentCt32Sprites(
+                sprites, &executionError))
+        {
+            clearPendingResidentCommands();
+            failRequest(
+                "resident CT32 batch at " +
+                    std::string(gsFlushReasonName(reason)),
+                std::move(executionError));
+        }
+
+        for (const PendingResidentCommand &pending :
+             pendingResidentCommands)
+        {
+            coherency.noteGpuWrite(pending.resources.writePages);
+        }
+        statistics.committedGpuCommands += commandCount;
+        statistics.residentCommands += commandCount;
+        statistics.commandsCompleted += commandCount;
+        ++statistics.residentBatchesCompleted;
+        statistics.largestResidentBatch = std::max(
+            statistics.largestResidentBatch,
+            static_cast<uint64_t>(commandCount));
+        try
+        {
+            if (acceleratedCommit)
+            {
+                for (const PendingResidentCommand &pending :
+                     pendingResidentCommands)
+                {
+                    acceleratedCommit(pending.command);
+                }
+            }
+        }
+        catch (...)
+        {
+            clearPendingResidentCommands();
+            throw;
+        }
+        clearPendingResidentCommands();
     }
 };
 
@@ -538,6 +627,14 @@ GsVulkanRasterBackend::createWithExecutor(
         return reject("Vulkan raster backend requires a software oracle");
     if (!isAcceleratedMode(backendConfig.mode))
         return reject("Vulkan raster backend requires an accelerated mode");
+    if (backendConfig.maximumResidentBatchCommands == 0u ||
+        backendConfig.maximumResidentBatchCommands >
+            GS_VULKAN_MAX_RESIDENT_SPRITE_BATCH)
+    {
+        return reject(
+            "Vulkan raster backend resident batch bound must be between 1 and " +
+            std::to_string(GS_VULKAN_MAX_RESIDENT_SPRITE_BATCH));
+    }
 
     auto impl = std::make_unique<Impl>();
     impl->executor = std::move(executor);
@@ -545,6 +642,8 @@ GsVulkanRasterBackend::createWithExecutor(
     impl->canonicalVram = canonicalVram;
     impl->softwareOracle = std::move(softwareOracle);
     impl->acceleratedCommit = std::move(acceleratedCommit);
+    impl->pendingResidentCommands.reserve(
+        backendConfig.maximumResidentBatchCommands);
     GsVramPageMask allPages;
     allPages.setAll();
     // The canonical image predates the device allocation. Start with explicit
@@ -686,27 +785,25 @@ void GsVulkanRasterBackend::submit(
         {
             GsVramPageMask accessPages = resources.readPages;
             accessPages.unionWith(resources.writePages);
-            m_impl->uploadCpuNewer(
-                accessPages,
-                "page upload for CT32 draw " +
-                    std::to_string(command.sequence()));
-
-            std::string executionError;
-            if (!m_impl->executor->executeResidentCt32Sprite(
-                    sprite, &executionError))
+            if (m_impl->pendingResidentAccessPages.intersects(
+                    accessPages))
             {
-                m_impl->failRequest(
-                    "resident CT32 draw " +
-                        std::to_string(command.sequence()),
-                    std::move(executionError));
+                m_impl->drainPendingResidentCommands(
+                    GsFlushReason::ResourceHazard);
             }
-            m_impl->coherency.noteGpuWrite(resources.writePages);
-            if (m_impl->acceleratedCommit)
-                m_impl->acceleratedCommit(command);
-            ++m_impl->statistics.committedGpuCommands;
-            ++m_impl->statistics.residentCommands;
+            if (m_impl->pendingResidentCommands.size() >=
+                m_impl->config.maximumResidentBatchCommands)
+            {
+                m_impl->drainPendingResidentCommands(
+                    GsFlushReason::QueueBackpressure);
+            }
+
+            m_impl->pendingResidentCommands.push_back(
+                {command, sprite, resources});
+            m_impl->pendingResidentAccessPages.unionWith(accessPages);
         }
-        ++m_impl->statistics.commandsCompleted;
+        if (m_impl->config.mode == GsRendererMode::Verify)
+            ++m_impl->statistics.commandsCompleted;
     }
 }
 
@@ -730,11 +827,15 @@ void GsVulkanRasterBackend::flush(GsFlushReason reason)
         m_impl->executor->shutdown();
         m_impl->shutDown = true;
     }
+    else
+    {
+        m_impl->drainPendingResidentCommands(reason);
+    }
 }
 
 size_t GsVulkanRasterBackend::pendingCommandCount() const noexcept
 {
-    return 0u;
+    return m_impl->pendingResidentCommands.size();
 }
 
 void GsVulkanRasterBackend::prepareCpuVramAccess(
@@ -743,6 +844,7 @@ void GsVulkanRasterBackend::prepareCpuVramAccess(
 {
     if (!pages.any())
         return;
+    m_impl->drainPendingResidentCommands(reason);
     ++m_impl->statistics.cpuAccessPreparations;
     m_impl->downloadGpuNewer(pages, reason);
 }
