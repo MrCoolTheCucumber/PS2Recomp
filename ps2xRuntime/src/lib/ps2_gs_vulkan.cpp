@@ -5,7 +5,9 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <bit>
 #include <chrono>
+#include <cmath>
 #include <condition_variable>
 #include <cstring>
 #include <exception>
@@ -241,6 +243,101 @@ namespace
             sprite.boundsY1 - sprite.boundsY0);
         if (texturePages.intersects(framebufferPages))
             return "Vulkan nearest CT32 sprite source aliases destination";
+        return nullptr;
+    }
+
+    bool linearDdaFloatFitsInt32(float value) noexcept
+    {
+        constexpr float kInt32Minimum = -2147483648.0f;
+        constexpr float kInt32Limit = 2147483648.0f;
+        return std::isfinite(value) &&
+               value >= kInt32Minimum && value < kInt32Limit;
+    }
+
+    GsVramPageMask linearCt32TexturePages(
+        const GsVulkanLinearCt32Sprite &sprite) noexcept
+    {
+        return gsVramPagesForSurfaceRect(
+            sprite.textureBaseBlock,
+            sprite.textureWidth,
+            static_cast<uint8_t>(GSMem::C32),
+            0u,
+            0u,
+            sprite.textureMaskU + 1u,
+            sprite.textureMaskV + 1u);
+    }
+
+    const char *linearCt32SpriteValidationError(
+        const GsVulkanLinearCt32Sprite &sprite) noexcept
+    {
+        if ((sprite.textureWrapU &
+             ~GS_VULKAN_TEXTURE_WRAP_DESCRIPTOR_MASK) != 0u ||
+            (sprite.textureWrapV &
+             ~GS_VULKAN_TEXTURE_WRAP_DESCRIPTOR_MASK) != 0u ||
+            gsVulkanTextureWrapMode(sprite.textureWrapU) != 0u ||
+            gsVulkanTextureWrapMode(sprite.textureWrapV) != 0u)
+        {
+            return "Vulkan linear CT32 sprite requires repeat wrap";
+        }
+        if (sprite.framebufferBaseBlock > 0x3FFFu ||
+            sprite.textureBaseBlock > 0x3FFFu)
+        {
+            return "Vulkan linear CT32 sprite base is outside GS VRAM";
+        }
+        if (sprite.framebufferWidth == 0u ||
+            sprite.framebufferWidth > 0x3Fu ||
+            sprite.textureWidth == 0u || sprite.textureWidth > 0x3Fu)
+        {
+            return "Vulkan linear CT32 sprite width is outside GS register range";
+        }
+        if (sprite.boundsX0 >= sprite.boundsX1 ||
+            sprite.boundsY0 >= sprite.boundsY1)
+        {
+            return "Vulkan linear CT32 sprite bounds are empty";
+        }
+        if (sprite.boundsX1 > 2048u || sprite.boundsY1 > 2048u)
+            return "Vulkan linear CT32 sprite bounds are outside GS scissor range";
+        if (!ct32RectangleHasUniqueWords(
+                sprite.boundsX0,
+                sprite.boundsY0,
+                sprite.boundsX1,
+                sprite.boundsY1,
+                sprite.framebufferWidth))
+        {
+            return "Vulkan linear CT32 sprite destination aliases itself";
+        }
+        if (!isPowerOfTwoMask(sprite.textureMaskU) ||
+            !isPowerOfTwoMask(sprite.textureMaskV))
+        {
+            return "Vulkan linear CT32 sprite texture mask is invalid";
+        }
+
+        float fixedScanV = std::bit_cast<float>(sprite.fixedScanVBits);
+        const float fixedStepV =
+            std::bit_cast<float>(sprite.fixedStepVBits);
+        if (!std::isfinite(fixedStepV))
+            return "Vulkan linear CT32 sprite V step is not finite";
+        for (uint32_t y = sprite.boundsY0; y < sprite.boundsY1; ++y)
+        {
+            if (!linearDdaFloatFitsInt32(fixedScanV))
+            {
+                return "Vulkan linear CT32 sprite V coordinate is outside signed fixed range";
+            }
+            fixedScanV += fixedStepV;
+        }
+
+        const GsVramPageMask texturePages =
+            linearCt32TexturePages(sprite);
+        const GsVramPageMask framebufferPages = gsVramPagesForSurfaceRect(
+            sprite.framebufferBaseBlock,
+            sprite.framebufferWidth,
+            static_cast<uint8_t>(GSMem::C32),
+            sprite.boundsX0,
+            sprite.boundsY0,
+            sprite.boundsX1 - sprite.boundsX0,
+            sprite.boundsY1 - sprite.boundsY0);
+        if (texturePages.intersects(framebufferPages))
+            return "Vulkan linear CT32 sprite source aliases destination";
         return nullptr;
     }
 
@@ -581,6 +678,115 @@ GsBackendDecision prepareGsVulkanNearestCt32Sprite(
         static_cast<uint16_t>((context.clamp >> 24u) & 0x3FFu),
         static_cast<uint16_t>((context.clamp >> 34u) & 0x3FFu));
     if (nearestCt32SpriteValidationError(prepared))
+        return {false, GsFallbackReason::UnknownMemoryLayout};
+
+    sprite = prepared;
+    return decision;
+}
+
+GsBackendDecision prepareGsVulkanLinearCt32Sprite(
+    const GsDrawCommand &command,
+    GsVulkanLinearCt32Sprite &sprite) noexcept
+{
+    const GsBackendDecision decision =
+        classifyGsLinearCt32RepeatSprite(command);
+    if (!decision.supported)
+        return decision;
+
+    const GSContext &context = command.context();
+    const GsDrawBounds &bounds = command.bounds();
+    int32_t fixedX0 = command.fixedX()[0];
+    int32_t fixedX1 = command.fixedX()[1];
+    int32_t fixedY0 = command.fixedY()[0];
+    int32_t fixedY1 = command.fixedY()[1];
+    float textureU0 =
+        static_cast<float>(command.vertices()[0].u) / 16.0f;
+    float textureU1 =
+        static_cast<float>(command.vertices()[1].u) / 16.0f;
+    float textureV0 =
+        static_cast<float>(command.vertices()[0].v) / 16.0f;
+    float textureV1 =
+        static_cast<float>(command.vertices()[1].v) / 16.0f;
+    if (fixedX0 > fixedX1)
+    {
+        std::swap(fixedX0, fixedX1);
+        std::swap(textureU0, textureU1);
+    }
+    if (fixedY0 > fixedY1)
+    {
+        std::swap(fixedY0, fixedY1);
+        std::swap(textureV0, textureV1);
+    }
+
+    constexpr float kLinearBias = 32768.0f;
+    const float windowX0 = static_cast<float>(fixedX0) / 16.0f;
+    const float windowY0 = static_cast<float>(fixedY0) / 16.0f;
+    const float spriteWidth =
+        static_cast<float>(fixedX1 - fixedX0) / 16.0f;
+    const float spriteHeight =
+        static_cast<float>(fixedY1 - fixedY0) / 16.0f;
+    const float fixedU0 = textureU0 * 65536.0f - kLinearBias;
+    const float fixedV0 = textureV0 * 65536.0f - kLinearBias;
+    const float fixedU1 = textureU1 * 65536.0f - kLinearBias;
+    const float fixedV1 = textureV1 * 65536.0f - kLinearBias;
+    const float fixedStepU = (fixedU1 - fixedU0) / spriteWidth;
+    const float fixedStepV = (fixedV1 - fixedV0) / spriteHeight;
+    const float fixedPrestepX =
+        static_cast<float>(bounds.x0) - windowX0;
+    const float fixedPrestepY =
+        static_cast<float>(bounds.y0) - windowY0;
+    const float fixedScanU = fixedU0 + fixedStepU * fixedPrestepX;
+    const float fixedScanV = fixedV0 + fixedStepV * fixedPrestepY;
+    constexpr int kPixelsPerLaneGroup = 8;
+    const int laneSkip = bounds.x0 & (kPixelsPerLaneGroup - 1);
+    const float fixedBlockStepU =
+        fixedStepU * static_cast<float>(kPixelsPerLaneGroup);
+    if (!linearDdaFloatFitsInt32(fixedScanU) ||
+        !linearDdaFloatFitsInt32(fixedBlockStepU) ||
+        !std::isfinite(fixedStepV))
+    {
+        return {false, GsFallbackReason::UnsupportedTextureCoordinates};
+    }
+
+    GsVulkanLinearCt32Sprite prepared{};
+    prepared.framebufferBaseBlock = context.frame.fbp << 5u;
+    prepared.framebufferWidth =
+        std::max<uint32_t>(context.frame.fbw, 1u);
+    prepared.boundsX0 = static_cast<uint32_t>(bounds.x0);
+    prepared.boundsY0 = static_cast<uint32_t>(bounds.y0);
+    prepared.boundsX1 = static_cast<uint32_t>(bounds.x1);
+    prepared.boundsY1 = static_cast<uint32_t>(bounds.y1);
+    prepared.textureBaseBlock = context.tex0.tbp0;
+    prepared.textureWidth = context.tex0.tbw;
+    prepared.textureMaskU = (1u << context.tex0.tw) - 1u;
+    prepared.textureMaskV = (1u << context.tex0.th) - 1u;
+    prepared.fixedBaseU = static_cast<int32_t>(fixedScanU);
+    prepared.fixedBlockStepU =
+        static_cast<int32_t>(fixedBlockStepU);
+    for (int lane = 0; lane < kPixelsPerLaneGroup; ++lane)
+    {
+        const float fixedLaneU = fixedStepU *
+            static_cast<float>(lane - laneSkip);
+        if (!linearDdaFloatFitsInt32(fixedLaneU))
+        {
+            return {
+                false,
+                GsFallbackReason::UnsupportedTextureCoordinates};
+        }
+        prepared.fixedLaneU[static_cast<size_t>(lane)] =
+            static_cast<int32_t>(fixedLaneU);
+    }
+    prepared.fixedScanVBits = std::bit_cast<uint32_t>(fixedScanV);
+    prepared.fixedStepVBits = std::bit_cast<uint32_t>(fixedStepV);
+    prepared.textureWrapU = packGsVulkanTextureWrap(
+        static_cast<uint8_t>(context.clamp & 0x3u),
+        static_cast<uint16_t>((context.clamp >> 4u) & 0x3FFu),
+        static_cast<uint16_t>((context.clamp >> 14u) & 0x3FFu));
+    prepared.textureWrapV = packGsVulkanTextureWrap(
+        static_cast<uint8_t>((context.clamp >> 2u) & 0x3u),
+        static_cast<uint16_t>((context.clamp >> 24u) & 0x3FFu),
+        static_cast<uint16_t>((context.clamp >> 34u) & 0x3FFu));
+    if (linearCt32SpriteValidationError(prepared))
         return {false, GsFallbackReason::UnknownMemoryLayout};
 
     sprite = prepared;

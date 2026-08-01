@@ -371,6 +371,12 @@ private:
 [[nodiscard]] GsBackendDecision classifyGsNearestCt32TexturedSprite(
     const GsDrawCommand &command) noexcept;
 
+// First exact linear-filtered texture predicate. It retains the software FST
+// sprite DDA and admits only direct CT32 DECAL RGBA with the explicit
+// MXL=0/MMAG=1/MMIN=1 filter state and REPEAT on both axes.
+[[nodiscard]] GsBackendDecision classifyGsLinearCt32RepeatSprite(
+    const GsDrawCommand &command) noexcept;
+
 // Phase 5's first triangle predicate deliberately admits only flat,
 // untextured CT32 triangles with no destination or depth dependency. It shares
 // the ordered state checks above with the sprite slice but remains a separate

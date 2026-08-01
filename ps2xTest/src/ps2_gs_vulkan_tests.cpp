@@ -8,6 +8,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <bit>
 #include <chrono>
 #include <cstdint>
 #include <cstring>
@@ -370,6 +371,47 @@ namespace
             GsDrawGlobalState{});
     }
 
+    GsDrawCommand makeLinearCt32RepeatSpriteCommand(
+        uint64_t sequence,
+        uint32_t framebufferPage,
+        uint8_t framebufferWidth,
+        uint32_t textureBaseBlock,
+        uint8_t textureWidth,
+        uint8_t textureWidthLog2,
+        uint8_t textureHeightLog2,
+        GSScissorReg scissor,
+        GSXYOffsetReg xyoffset,
+        const std::array<uint16_t, 2> &rawX,
+        const std::array<uint16_t, 2> &rawY,
+        const std::array<uint16_t, 2> &rawU,
+        const std::array<uint16_t, 2> &rawV)
+    {
+        const GsDrawCommand nearest = makeNearestCt32SpriteCommand(
+            sequence,
+            framebufferPage,
+            framebufferWidth,
+            textureBaseBlock,
+            textureWidth,
+            textureWidthLog2,
+            textureHeightLog2,
+            scissor,
+            xyoffset,
+            rawX,
+            rawY,
+            rawU,
+            rawV);
+        GSContext context = nearest.context();
+        context.tex1 &=
+            ~((0x7ull << 2u) | (1ull << 5u) | (0x7ull << 6u));
+        context.tex1 |= (1ull << 5u) | (1ull << 6u);
+        return buildGsDrawCommand(
+            sequence,
+            nearest.primitive(),
+            context,
+            std::span<const GSVertex>(nearest.vertices()).first(2u),
+            nearest.globalState());
+    }
+
     GsDrawCommand makeCt32TriangleCommand(
         uint64_t sequence,
         uint32_t framebufferPage,
@@ -497,6 +539,168 @@ namespace
                     sprite.framebufferWidth,
                     x, y, texel);
             }
+        }
+    }
+
+    int floorLinearFixed16_16(int32_t value)
+    {
+        int quotient = value / 65536;
+        if (value < 0 && (value % 65536) != 0)
+            --quotient;
+        return quotient;
+    }
+
+    int linearShiftRight4(int value)
+    {
+        return value >= 0 ? value / 16 : -((-value + 15) / 16);
+    }
+
+    uint32_t linearColor4ForRecord(
+        uint32_t from,
+        uint32_t to,
+        uint8_t weight)
+    {
+        uint32_t result = 0u;
+        for (uint32_t shift = 0u; shift < 32u; shift += 8u)
+        {
+            const int fromChannel =
+                static_cast<int>((from >> shift) & 0xFFu);
+            const int toChannel =
+                static_cast<int>((to >> shift) & 0xFFu);
+            const int channel = std::clamp(
+                fromChannel + linearShiftRight4(
+                    (toChannel - fromChannel) * weight),
+                0,
+                255);
+            result |= static_cast<uint32_t>(channel) << shift;
+        }
+        return result;
+    }
+
+    uint32_t bilinearColor4ForRecord(
+        uint32_t c00,
+        uint32_t c10,
+        uint32_t c01,
+        uint32_t c11,
+        uint8_t weightU,
+        uint8_t weightV)
+    {
+        return linearColor4ForRecord(
+            linearColor4ForRecord(c00, c10, weightU),
+            linearColor4ForRecord(c01, c11, weightU),
+            weightV);
+    }
+
+    void applyLinearCt32SpriteCpu(
+        std::vector<uint8_t> &vram,
+        const GsVulkanLinearCt32Sprite &sprite)
+    {
+        const int alignedDrawX =
+            static_cast<int>(sprite.boundsX0) & ~7;
+        float fixedScanV =
+            std::bit_cast<float>(sprite.fixedScanVBits);
+        const float fixedStepV =
+            std::bit_cast<float>(sprite.fixedStepVBits);
+        for (uint32_t y = sprite.boundsY0;
+             y < sprite.boundsY1;
+             ++y)
+        {
+            const int32_t fixedV = static_cast<int32_t>(fixedScanV);
+            const uint8_t weightV = static_cast<uint8_t>(
+                (static_cast<uint32_t>(fixedV) >> 12u) & 0xFu);
+            const uint32_t v0 =
+                static_cast<uint32_t>(floorLinearFixed16_16(fixedV)) &
+                sprite.textureMaskV;
+            const uint32_t v1 =
+                weightV == 0u ? v0 : (v0 + 1u) & sprite.textureMaskV;
+
+            for (uint32_t x = sprite.boundsX0;
+                 x < sprite.boundsX1;
+                 ++x)
+            {
+                const int block =
+                    (static_cast<int>(x) - alignedDrawX) / 8;
+                const int32_t fixedU = static_cast<int32_t>(
+                    static_cast<uint32_t>(sprite.fixedBaseU) +
+                    static_cast<uint32_t>(sprite.fixedLaneU[x & 7u]) +
+                    static_cast<uint32_t>(sprite.fixedBlockStepU) *
+                        static_cast<uint32_t>(block));
+                const uint8_t weightU = static_cast<uint8_t>(
+                    (static_cast<uint32_t>(fixedU) >> 12u) & 0xFu);
+                const uint32_t u0 =
+                    static_cast<uint32_t>(floorLinearFixed16_16(fixedU)) &
+                    sprite.textureMaskU;
+                const uint32_t u1 =
+                    weightU == 0u ? u0 : (u0 + 1u) & sprite.textureMaskU;
+
+                const uint32_t c00 = GSMem::ReadCT32(
+                    vram.data(),
+                    sprite.textureBaseBlock,
+                    sprite.textureWidth,
+                    u0,
+                    v0);
+                uint32_t color = c00;
+                if (weightU == 0u)
+                {
+                    if (weightV != 0u)
+                    {
+                        color = linearColor4ForRecord(
+                            c00,
+                            GSMem::ReadCT32(
+                                vram.data(),
+                                sprite.textureBaseBlock,
+                                sprite.textureWidth,
+                                u0,
+                                v1),
+                            weightV);
+                    }
+                }
+                else if (weightV == 0u)
+                {
+                    color = linearColor4ForRecord(
+                        c00,
+                        GSMem::ReadCT32(
+                            vram.data(),
+                            sprite.textureBaseBlock,
+                            sprite.textureWidth,
+                            u1,
+                            v0),
+                        weightU);
+                }
+                else
+                {
+                    color = bilinearColor4ForRecord(
+                        c00,
+                        GSMem::ReadCT32(
+                            vram.data(),
+                            sprite.textureBaseBlock,
+                            sprite.textureWidth,
+                            u1,
+                            v0),
+                        GSMem::ReadCT32(
+                            vram.data(),
+                            sprite.textureBaseBlock,
+                            sprite.textureWidth,
+                            u0,
+                            v1),
+                        GSMem::ReadCT32(
+                            vram.data(),
+                            sprite.textureBaseBlock,
+                            sprite.textureWidth,
+                            u1,
+                            v1),
+                        weightU,
+                        weightV);
+                }
+                GSMem::WriteCT32(
+                    vram.data(),
+                    sprite.framebufferBaseBlock,
+                    sprite.framebufferWidth,
+                    x,
+                    y,
+                    color);
+            }
+            fixedScanV += fixedStepV;
         }
     }
 
@@ -1883,6 +2087,247 @@ void register_ps2_gs_vulkan_tests()
                     std::ostringstream message;
                     message << "nearest CT32 record diverged from software case "
                             << index;
+                    t.Fail(message.str());
+                    return;
+                }
+            }
+        });
+
+        tc.Run("Linear CT32 repeat preparation retains the exact software DDA", [](TestCase &t)
+        {
+            const GsDrawCommand command =
+                makeLinearCt32RepeatSpriteCommand(
+                    140u,
+                    0u,
+                    8u,
+                    3584u,
+                    8u,
+                    10u,
+                    10u,
+                    {0u, 511u, 0u, 447u},
+                    {28672u, 29184u},
+                    {28664u, 29176u},
+                    {29176u, 36344u},
+                    {0u, 512u},
+                    {0u, 6656u});
+
+            GsVulkanLinearCt32Sprite sprite{};
+            sprite.framebufferBaseBlock = 0xDEADu;
+            const GsVulkanLinearCt32Sprite sentinel = sprite;
+            const GsBackendDecision decision =
+                prepareGsVulkanLinearCt32Sprite(command, sprite);
+            t.IsTrue(
+                decision.supported,
+                "the retained 32x448 / 32x416 linear repeat sprite should be eligible");
+            if (!decision.supported)
+                return;
+
+            t.Equals(decision.reason, GsFallbackReason::Supported,
+                     "eligible linear preparation should retain the canonical reason");
+            t.Equals(sprite.framebufferBaseBlock, 0u,
+                     "FRAME page zero should become raw block zero");
+            t.Equals(sprite.framebufferWidth, 8u,
+                     "the title framebuffer stride should remain exact");
+            t.Equals(sprite.boundsX0, 0u,
+                     "the half-pixel left edge should ceil to zero");
+            t.Equals(sprite.boundsY0, 0u,
+                     "the half-pixel top edge should ceil to zero");
+            t.Equals(sprite.boundsX1, 32u,
+                     "the retained title width should be exact");
+            t.Equals(sprite.boundsY1, 448u,
+                     "the retained title height should be exact");
+            t.Equals(sprite.textureBaseBlock, 3584u,
+                     "the title texture block should remain native");
+            t.Equals(sprite.textureWidth, 8u,
+                     "the title texture stride should remain native");
+            t.Equals(sprite.textureMaskU, 1023u,
+                     "TW=10 should publish its exact repeat mask");
+            t.Equals(sprite.textureMaskV, 1023u,
+                     "TH=10 should publish its exact repeat mask");
+            t.Equals(sprite.fixedBaseU, 0,
+                     "half-texel bias and half-pixel prestep should center the first U sample");
+            t.Equals(sprite.fixedBlockStepU, 8 * 65536,
+                     "one-to-one U should retain the eight-pixel GS block step");
+            for (size_t lane = 0u; lane < sprite.fixedLaneU.size(); ++lane)
+            {
+                t.Equals(
+                    sprite.fixedLaneU[lane],
+                    static_cast<int32_t>(lane * 65536u),
+                    "the prepared record should retain every truncated GS U lane");
+            }
+            t.Equals(sprite.fixedScanVBits, 0xC5124928u,
+                     "the clipped first V scanline must retain its exact binary32 seed");
+            t.Equals(sprite.fixedStepVBits, 0x476DB6DBu,
+                     "the 416/448 V scale must retain its exact binary32 step");
+            t.Equals(gsVulkanTextureWrapMode(sprite.textureWrapU), 0u,
+                     "the initial linear record should be repeat-only on U");
+            t.Equals(gsVulkanTextureWrapMode(sprite.textureWrapV), 0u,
+                     "the initial linear record should be repeat-only on V");
+
+            const auto rebuild = [&command](
+                uint64_t sequence,
+                const GSPrimReg &primitive,
+                const GSContext &context)
+            {
+                return buildGsDrawCommand(
+                    sequence,
+                    primitive,
+                    context,
+                    std::span<const GSVertex>(command.vertices()).first(2u),
+                    command.globalState());
+            };
+            const auto expectRejected = [&t, &sprite, &rebuild](
+                const GsDrawCommand &rejected,
+                GsFallbackReason expectedReason,
+                const char *message)
+            {
+                const GsVulkanLinearCt32Sprite prior = sprite;
+                const GsBackendDecision rejectedDecision =
+                    prepareGsVulkanLinearCt32Sprite(rejected, sprite);
+                t.IsFalse(rejectedDecision.supported, message);
+                t.Equals(rejectedDecision.reason, expectedReason, message);
+                t.IsTrue(sprite == prior,
+                         "linear rejection must preserve the caller's record");
+            };
+
+            GSContext point = command.context();
+            point.tex1 &= ~((1ull << 5u) | (0x7ull << 6u));
+            expectRejected(
+                rebuild(141u, command.primitive(), point),
+                GsFallbackReason::UnsupportedTextureFilter,
+                "point filtering must remain on the nearest pipeline");
+
+            GSContext clamp = command.context();
+            clamp.clamp = (clamp.clamp & ~0xFull) | 0x5u;
+            expectRejected(
+                rebuild(142u, command.primitive(), clamp),
+                GsFallbackReason::UnsupportedTextureWrap,
+                "linear clamp should remain a later independent slice");
+
+            GSPrimReg stq = command.primitive();
+            stq.fst = false;
+            expectRejected(
+                rebuild(143u, stq, command.context()),
+                GsFallbackReason::UnsupportedTextureCoordinates,
+                "linear STQ should remain outside the prepared FST DDA");
+
+            GSContext aliased = command.context();
+            aliased.tex0.tbp0 = command.context().frame.fbp << 5u;
+            expectRejected(
+                rebuild(144u, command.primitive(), aliased),
+                GsFallbackReason::ResourceAlias,
+                "linear raw texture reads must remain disjoint from writes");
+
+            t.IsFalse(sprite == sentinel,
+                      "successful preparation should replace the initial sentinel");
+        });
+
+        tc.Run("Linear CT32 repeat records match software bilinear sampling", [](TestCase &t)
+        {
+            GSMem::InitLookupTables();
+            struct LinearCase
+            {
+                uint32_t framebufferPage;
+                uint8_t framebufferWidth;
+                uint32_t textureBaseBlock;
+                uint8_t textureWidth;
+                uint8_t tw;
+                uint8_t th;
+                GSScissorReg scissor;
+                GSXYOffsetReg xyoffset;
+                std::array<uint16_t, 2> x;
+                std::array<uint16_t, 2> y;
+                std::array<uint16_t, 2> u;
+                std::array<uint16_t, 2> v;
+            };
+            const std::array<LinearCase, 4> cases{{
+                {
+                    0u, 8u, 3584u, 8u, 10u, 10u,
+                    {0u, 511u, 0u, 447u},
+                    {28672u, 29184u},
+                    {28664u, 29176u},
+                    {29176u, 36344u},
+                    {0u, 512u},
+                    {0u, 6656u},
+                },
+                {
+                    0u, 2u, 512u, 2u, 6u, 5u,
+                    {3u, 12u, 2u, 13u},
+                    {128u, 96u},
+                    {120u, 376u},
+                    {88u, 344u},
+                    {0u, 249u},
+                    {0u, 137u},
+                },
+                {
+                    0u, 2u, 512u, 2u, 6u, 5u,
+                    {4u, 14u, 3u, 12u},
+                    {128u, 96u},
+                    {400u, 144u},
+                    {352u, 96u},
+                    {9u, 521u},
+                    {17u, 273u},
+                },
+                {
+                    0u, 1u, 512u, 1u, 3u, 3u,
+                    {0u, 7u, 0u, 7u},
+                    {128u, 96u},
+                    {120u, 248u},
+                    {88u, 216u},
+                    {0u, 128u},
+                    {0u, 128u},
+                },
+            }};
+
+            uint64_t sequence = 150u;
+            for (size_t index = 0u; index < cases.size(); ++index)
+            {
+                const LinearCase &linearCase = cases[index];
+                const GsDrawCommand command =
+                    makeLinearCt32RepeatSpriteCommand(
+                        sequence++,
+                        linearCase.framebufferPage,
+                        linearCase.framebufferWidth,
+                        linearCase.textureBaseBlock,
+                        linearCase.textureWidth,
+                        linearCase.tw,
+                        linearCase.th,
+                        linearCase.scissor,
+                        linearCase.xyoffset,
+                        linearCase.x,
+                        linearCase.y,
+                        linearCase.u,
+                        linearCase.v);
+                GsVulkanLinearCt32Sprite sprite{};
+                const GsBackendDecision decision =
+                    prepareGsVulkanLinearCt32Sprite(command, sprite);
+                if (!decision.supported)
+                {
+                    t.Fail(
+                        "the linear software-equivalence corpus must satisfy the narrow predicate");
+                    return;
+                }
+
+                std::vector<uint8_t> actual = makeVramPattern(
+                    0x4C494E30u + static_cast<uint32_t>(index));
+                std::vector<uint8_t> expected = actual;
+                applyLinearCt32SpriteCpu(expected, sprite);
+
+                GS gs;
+                gs.init(
+                    actual.data(),
+                    static_cast<uint32_t>(actual.size()),
+                    nullptr);
+                gs.setDebugHistoryPaused(true);
+                drawNearestCt32SpriteCommand(gs, command);
+                gs.flushRenderBatch();
+
+                if (actual != expected)
+                {
+                    std::ostringstream message;
+                    message
+                        << "linear CT32 record diverged from software case "
+                        << index;
                     t.Fail(message.str());
                     return;
                 }

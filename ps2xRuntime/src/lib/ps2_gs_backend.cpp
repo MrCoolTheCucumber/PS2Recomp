@@ -772,6 +772,7 @@ namespace
     {
         Disabled,
         NearestCt32,
+        LinearCt32Repeat,
     };
 
     bool hasOneToOneIntegerTextureAxis(
@@ -845,7 +846,7 @@ namespace
         {
             return {false, GsFallbackReason::Textured};
         }
-        if (textureRequirement == TextureRequirement::NearestCt32 &&
+        if (textureRequirement != TextureRequirement::Disabled &&
             !primitive.tme)
         {
             return {false, GsFallbackReason::UnsupportedTextureState};
@@ -873,7 +874,7 @@ namespace
         if (global.scanMask != 0u)
             return {false, GsFallbackReason::ScanMask};
 
-        if (textureRequirement == TextureRequirement::NearestCt32)
+        if (textureRequirement != TextureRequirement::Disabled)
         {
             if (context.tex0.psm != GS_PSM_CT32)
             {
@@ -887,13 +888,19 @@ namespace
                     false,
                     GsFallbackReason::UnsupportedTextureFunction};
             }
-            if (!primitive.fst ||
-                !hasOneToOneIntegerTextureAxis(
-                    command.fixedX()[0], command.fixedX()[1],
-                    command.vertices()[0].u, command.vertices()[1].u) ||
-                !hasOneToOneIntegerTextureAxis(
-                    command.fixedY()[0], command.fixedY()[1],
-                    command.vertices()[0].v, command.vertices()[1].v))
+            if (!primitive.fst)
+            {
+                return {
+                    false,
+                    GsFallbackReason::UnsupportedTextureCoordinates};
+            }
+            if (textureRequirement == TextureRequirement::NearestCt32 &&
+                (!hasOneToOneIntegerTextureAxis(
+                     command.fixedX()[0], command.fixedX()[1],
+                     command.vertices()[0].u, command.vertices()[1].u) ||
+                 !hasOneToOneIntegerTextureAxis(
+                     command.fixedY()[0], command.fixedY()[1],
+                     command.vertices()[0].v, command.vertices()[1].v)))
             {
                 return {
                     false,
@@ -912,9 +919,15 @@ namespace
                 static_cast<uint8_t>((context.tex1 >> 5u) & 0x1u);
             const uint8_t minificationFilter =
                 static_cast<uint8_t>((context.tex1 >> 6u) & 0x7u);
-            if (maximumMipLevel != 0u ||
-                magnificationFilter != 0u ||
-                minificationFilter != 0u)
+            const bool supportedFilter =
+                textureRequirement == TextureRequirement::NearestCt32
+                    ? maximumMipLevel == 0u &&
+                          magnificationFilter == 0u &&
+                          minificationFilter == 0u
+                    : maximumMipLevel == 0u &&
+                          magnificationFilter == 1u &&
+                          minificationFilter == 1u;
+            if (!supportedFilter)
             {
                 return {
                     false,
@@ -932,6 +945,14 @@ namespace
                 (context.clamp >> 24u) & 0x3FFu);
             const uint16_t regionMaxV = static_cast<uint16_t>(
                 (context.clamp >> 34u) & 0x3FFu);
+            if (textureRequirement ==
+                    TextureRequirement::LinearCt32Repeat &&
+                (wrapModeU != 0u || wrapModeV != 0u))
+            {
+                return {
+                    false,
+                    GsFallbackReason::UnsupportedTextureWrap};
+            }
             if ((wrapModeU == 2u && regionMinU > regionMaxU) ||
                 (wrapModeV == 2u && regionMinV > regionMaxV))
             {
@@ -978,6 +999,14 @@ GsBackendDecision classifyGsNearestCt32TexturedSprite(
     return classifyFlatCt32NoDepth(
         command, GS_PRIM_SPRITE, 2u,
         TextureRequirement::NearestCt32);
+}
+
+GsBackendDecision classifyGsLinearCt32RepeatSprite(
+    const GsDrawCommand &command) noexcept
+{
+    return classifyFlatCt32NoDepth(
+        command, GS_PRIM_SPRITE, 2u,
+        TextureRequirement::LinearCt32Repeat);
 }
 
 GsBackendDecision classifyGsFlatCt32Triangle(

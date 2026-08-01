@@ -2,6 +2,7 @@
 
 #include "runtime/ps2_gs_backend.h"
 
+#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <limits>
@@ -385,6 +386,61 @@ static_assert(offsetof(GsVulkanNearestCt32Sprite, textureWrapV) == 60u);
 [[nodiscard]] GsBackendDecision prepareGsVulkanNearestCt32Sprite(
     const GsDrawCommand &command,
     GsVulkanNearestCt32Sprite &sprite) noexcept;
+
+// Fixed prepared-DDA record for the first exact linear-filtered texture
+// slice. U retains the software GS eight-lane setup verbatim. V retains the
+// binary32 seed and step used by its sequential scanline recurrence; the bit
+// representation keeps the executor ABI independent of host float layout
+// spelling. The initial classifier admits REPEAT on both axes only.
+struct alignas(16) GsVulkanLinearCt32Sprite
+{
+    uint32_t framebufferBaseBlock = 0u;
+    uint32_t framebufferWidth = 0u;
+    uint32_t boundsX0 = 0u;
+    uint32_t boundsY0 = 0u;
+    uint32_t boundsX1 = 0u;
+    uint32_t boundsY1 = 0u;
+    uint32_t textureBaseBlock = 0u;
+    uint32_t textureWidth = 0u;
+    uint32_t textureMaskU = 0u;
+    uint32_t textureMaskV = 0u;
+    int32_t fixedBaseU = 0;
+    int32_t fixedBlockStepU = 0;
+    std::array<int32_t, 8> fixedLaneU{};
+    uint32_t fixedScanVBits = 0u;
+    uint32_t fixedStepVBits = 0u;
+    uint32_t textureWrapU = 0u;
+    uint32_t textureWrapV = 0u;
+
+    bool operator==(const GsVulkanLinearCt32Sprite &) const = default;
+};
+
+static_assert(sizeof(GsVulkanLinearCt32Sprite) == 96u);
+static_assert(std::is_standard_layout_v<GsVulkanLinearCt32Sprite>);
+static_assert(std::is_trivially_copyable_v<GsVulkanLinearCt32Sprite>);
+static_assert(offsetof(GsVulkanLinearCt32Sprite, framebufferBaseBlock) == 0u);
+static_assert(offsetof(GsVulkanLinearCt32Sprite, framebufferWidth) == 4u);
+static_assert(offsetof(GsVulkanLinearCt32Sprite, boundsX0) == 8u);
+static_assert(offsetof(GsVulkanLinearCt32Sprite, boundsY0) == 12u);
+static_assert(offsetof(GsVulkanLinearCt32Sprite, boundsX1) == 16u);
+static_assert(offsetof(GsVulkanLinearCt32Sprite, boundsY1) == 20u);
+static_assert(offsetof(GsVulkanLinearCt32Sprite, textureBaseBlock) == 24u);
+static_assert(offsetof(GsVulkanLinearCt32Sprite, textureWidth) == 28u);
+static_assert(offsetof(GsVulkanLinearCt32Sprite, textureMaskU) == 32u);
+static_assert(offsetof(GsVulkanLinearCt32Sprite, textureMaskV) == 36u);
+static_assert(offsetof(GsVulkanLinearCt32Sprite, fixedBaseU) == 40u);
+static_assert(offsetof(GsVulkanLinearCt32Sprite, fixedBlockStepU) == 44u);
+static_assert(offsetof(GsVulkanLinearCt32Sprite, fixedLaneU) == 48u);
+static_assert(offsetof(GsVulkanLinearCt32Sprite, fixedScanVBits) == 80u);
+static_assert(offsetof(GsVulkanLinearCt32Sprite, fixedStepVBits) == 84u);
+static_assert(offsetof(GsVulkanLinearCt32Sprite, textureWrapU) == 88u);
+static_assert(offsetof(GsVulkanLinearCt32Sprite, textureWrapV) == 92u);
+
+// Publishes only a fully validated repeat/repeat linear CT32 record. Rejected
+// commands leave the caller's record untouched.
+[[nodiscard]] GsBackendDecision prepareGsVulkanLinearCt32Sprite(
+    const GsDrawCommand &command,
+    GsVulkanLinearCt32Sprite &sprite) noexcept;
 
 // Phase 5's first exact triangle record. Vertex coordinates retain the signed
 // 12.4 window-space values after XYOFFSET. Preparation normalizes the winding
