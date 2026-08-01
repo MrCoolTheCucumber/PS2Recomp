@@ -298,6 +298,68 @@ namespace
             GsDrawGlobalState{});
     }
 
+    GsDrawCommand makeNearestCt32SpriteCommand(
+        uint64_t sequence,
+        uint32_t framebufferPage,
+        uint8_t framebufferWidth,
+        uint32_t textureBaseBlock,
+        uint8_t textureWidth,
+        uint8_t textureWidthLog2,
+        uint8_t textureHeightLog2,
+        GSScissorReg scissor,
+        GSXYOffsetReg xyoffset,
+        const std::array<uint16_t, 2> &rawX,
+        const std::array<uint16_t, 2> &rawY,
+        const std::array<uint16_t, 2> &rawU,
+        const std::array<uint16_t, 2> &rawV)
+    {
+        GSContext context{};
+        context.frame = {
+            framebufferPage, framebufferWidth,
+            GS_PSM_CT32, 0u};
+        context.scissor = scissor;
+        context.xyoffset = xyoffset;
+        context.zbuf = {0u, GS_PSM_Z32, true};
+        context.test = 0x30000u; // ZTE=1, ZTST=ALWAYS, ZMSK=1.
+        context.tex0.tbp0 = textureBaseBlock;
+        context.tex0.tbw = textureWidth;
+        context.tex0.psm = GS_PSM_CT32;
+        context.tex0.tw = textureWidthLog2;
+        context.tex0.th = textureHeightLog2;
+        context.tex0.tcc = 1u;
+        context.tex0.tfx = 1u;
+        // LCM, MTBA, L, and K are semantically irrelevant when MXL, MMAG,
+        // and MMIN are zero. Keep them non-zero to make that contract visible.
+        context.tex1 = 1ull | (1ull << 9u) |
+                       (3ull << 19u) | (0x321ull << 32u);
+        context.miptbp1 = 0x0123456789ABCDEFull;
+        context.miptbp2 = 0x0FEDCBA987654321ull;
+        context.clamp =
+            (0x155ull << 4u) | (0x2AAull << 14u) |
+            (0x133ull << 24u) | (0x266ull << 34u);
+
+        GSPrimReg primitive{};
+        primitive.type = GS_PRIM_SPRITE;
+        primitive.tme = true;
+        primitive.fst = true;
+        std::array<GSVertex, 2> vertices{};
+        for (size_t index = 0u; index < vertices.size(); ++index)
+        {
+            vertices[index].x12_4 = rawX[index];
+            vertices[index].y12_4 = rawY[index];
+            vertices[index].u = rawU[index];
+            vertices[index].v = rawV[index];
+            vertices[index].r = static_cast<uint8_t>(0x10u + index);
+            vertices[index].g = static_cast<uint8_t>(0x20u + index);
+            vertices[index].b = static_cast<uint8_t>(0x30u + index);
+            vertices[index].a = static_cast<uint8_t>(0x40u + index);
+        }
+        return buildGsDrawCommand(
+            sequence, primitive, context,
+            std::span<const GSVertex>(vertices),
+            GsDrawGlobalState{});
+    }
+
     GsDrawCommand makeCt32TriangleCommand(
         uint64_t sequence,
         uint32_t framebufferPage,
@@ -356,6 +418,41 @@ namespace
                     sprite.framebufferBaseBlock,
                     sprite.framebufferWidth,
                     x, y, sprite.rgba);
+            }
+        }
+    }
+
+    void applyNearestCt32SpriteCpu(
+        std::vector<uint8_t> &vram,
+        const GsVulkanNearestCt32Sprite &sprite)
+    {
+        for (uint32_t y = sprite.boundsY0;
+             y < sprite.boundsY1; ++y)
+        {
+            const int32_t textureV =
+                sprite.textureOriginV +
+                static_cast<int32_t>(y - sprite.boundsY0) *
+                    sprite.textureStepV;
+            for (uint32_t x = sprite.boundsX0;
+                 x < sprite.boundsX1; ++x)
+            {
+                const int32_t textureU =
+                    sprite.textureOriginU +
+                    static_cast<int32_t>(x - sprite.boundsX0) *
+                        sprite.textureStepU;
+                const uint32_t texel = GSMem::ReadCT32(
+                    vram.data(),
+                    sprite.textureBaseBlock,
+                    sprite.textureWidth,
+                    static_cast<uint32_t>(textureU) &
+                        sprite.textureMaskU,
+                    static_cast<uint32_t>(textureV) &
+                        sprite.textureMaskV);
+                GSMem::WriteCT32(
+                    vram.data(),
+                    sprite.framebufferBaseBlock,
+                    sprite.framebufferWidth,
+                    x, y, texel);
             }
         }
     }
@@ -535,6 +632,89 @@ namespace
             rawY[index] = command.vertices()[index].y12_4;
         }
         drawFlatCt32Triangle(gs, rawX, rawY, rgba);
+    }
+
+    void drawNearestCt32SpriteCommand(
+        GS &gs,
+        const GsDrawCommand &command)
+    {
+        const GSContext &context = command.context();
+        const GsDrawGlobalState &global = command.globalState();
+        const GSTex0Reg &texture = context.tex0;
+        const uint64_t frame =
+            static_cast<uint64_t>(context.frame.fbp) |
+            (static_cast<uint64_t>(context.frame.fbw) << 16u) |
+            (static_cast<uint64_t>(context.frame.psm) << 24u) |
+            (static_cast<uint64_t>(context.frame.fbmsk) << 32u);
+        const uint64_t zbuf =
+            static_cast<uint64_t>(context.zbuf.zbp) |
+            (static_cast<uint64_t>(context.zbuf.psm) << 24u) |
+            (static_cast<uint64_t>(context.zbuf.zmask) << 32u);
+        const uint64_t scissor =
+            static_cast<uint64_t>(context.scissor.x0) |
+            (static_cast<uint64_t>(context.scissor.x1) << 16u) |
+            (static_cast<uint64_t>(context.scissor.y0) << 32u) |
+            (static_cast<uint64_t>(context.scissor.y1) << 48u);
+        const uint64_t xyoffset =
+            static_cast<uint64_t>(context.xyoffset.ofx) |
+            (static_cast<uint64_t>(context.xyoffset.ofy) << 32u);
+        const uint64_t tex0 =
+            static_cast<uint64_t>(texture.tbp0) |
+            (static_cast<uint64_t>(texture.tbw) << 14u) |
+            (static_cast<uint64_t>(texture.psm) << 20u) |
+            (static_cast<uint64_t>(texture.tw) << 26u) |
+            (static_cast<uint64_t>(texture.th) << 30u) |
+            (static_cast<uint64_t>(texture.tcc) << 34u) |
+            (static_cast<uint64_t>(texture.tfx) << 35u) |
+            (static_cast<uint64_t>(texture.cbp) << 37u) |
+            (static_cast<uint64_t>(texture.cpsm) << 51u) |
+            (static_cast<uint64_t>(texture.csm) << 55u) |
+            (static_cast<uint64_t>(texture.csa) << 56u) |
+            (static_cast<uint64_t>(texture.cld) << 61u);
+        const GSPrimReg &primitive = command.primitive();
+        const uint64_t prim =
+            static_cast<uint64_t>(primitive.type) |
+            (static_cast<uint64_t>(primitive.iip) << 3u) |
+            (static_cast<uint64_t>(primitive.tme) << 4u) |
+            (static_cast<uint64_t>(primitive.fge) << 5u) |
+            (static_cast<uint64_t>(primitive.abe) << 6u) |
+            (static_cast<uint64_t>(primitive.aa1) << 7u) |
+            (static_cast<uint64_t>(primitive.fst) << 8u) |
+            (static_cast<uint64_t>(primitive.ctxt) << 9u) |
+            (static_cast<uint64_t>(primitive.fix) << 10u);
+
+        gs.writeRegister(GS_REG_FRAME_1, frame);
+        gs.writeRegister(GS_REG_ZBUF_1, zbuf);
+        gs.writeRegister(GS_REG_SCISSOR_1, scissor);
+        gs.writeRegister(GS_REG_XYOFFSET_1, xyoffset);
+        gs.writeRegister(GS_REG_TEST_1, context.test);
+        gs.writeRegister(GS_REG_FBA_1, context.fba);
+        gs.writeRegister(GS_REG_SCANMSK, global.scanMask);
+        gs.writeRegister(GS_REG_DTHE, global.dither ? 1u : 0u);
+        gs.writeRegister(GS_REG_TEX0_1, tex0);
+        gs.writeRegister(GS_REG_TEX1_1, context.tex1);
+        gs.writeRegister(GS_REG_MIPTBP1_1, context.miptbp1);
+        gs.writeRegister(GS_REG_MIPTBP2_1, context.miptbp2);
+        gs.writeRegister(GS_REG_CLAMP_1, context.clamp);
+        gs.writeRegister(GS_REG_PRIM, prim);
+        for (size_t index = 0u; index < command.vertexCount(); ++index)
+        {
+            const GSVertex &vertex = command.vertices()[index];
+            const uint32_t rgba =
+                static_cast<uint32_t>(vertex.r) |
+                (static_cast<uint32_t>(vertex.g) << 8u) |
+                (static_cast<uint32_t>(vertex.b) << 16u) |
+                (static_cast<uint32_t>(vertex.a) << 24u);
+            const uint64_t uv =
+                static_cast<uint64_t>(vertex.u) |
+                (static_cast<uint64_t>(vertex.v) << 16u);
+            gs.writeRegister(GS_REG_RGBAQ, rgba);
+            gs.writeRegister(GS_REG_UV, uv);
+            gs.writeRegister(
+                GS_REG_XYZ2,
+                packXyz2(vertex.x12_4, vertex.y12_4,
+                         vertex.zInteger));
+        }
     }
 
     void drawFlatCt32Point(
@@ -1109,6 +1289,279 @@ void register_ps2_gs_vulkan_tests()
                      "degenerate endpoints should fail before any GPU submission");
             t.IsTrue(sprite == sentinel,
                      "degenerate preparation must preserve the caller's record");
+        });
+
+        tc.Run("Nearest CT32 texture preparation publishes exact integer sampling", [](TestCase &t)
+        {
+            const GsDrawCommand command = makeNearestCt32SpriteCommand(
+                21u,
+                40u,
+                0u,
+                64u,
+                2u,
+                6u,
+                5u,
+                {6u, 15u, 5u, 12u},
+                {32u, 16u},
+                {352u, 96u},
+                {48u, 304u},
+                {480u, 224u},
+                {64u, 320u});
+
+            GsVulkanNearestCt32Sprite sprite{
+                1u, 2u, 3u, 4u, 5u, 6u, 7u, 8u,
+                9u, 10u, 11, 12, 13, 14, 15u, 16u};
+            const GsBackendDecision decision =
+                prepareGsVulkanNearestCt32Sprite(command, sprite);
+            t.IsTrue(decision.supported,
+                     "one-to-one point-sampled CT32 sprites should be eligible");
+            t.Equals(decision.reason, GsFallbackReason::Supported,
+                     "eligible texture preparation should retain the canonical reason");
+            t.Equals(sprite.framebufferBaseBlock, 1280u,
+                     "FRAME pages should become raw-VRAM block units");
+            t.Equals(sprite.framebufferWidth, 1u,
+                     "FRAME width zero should retain the software normalization");
+            t.Equals(sprite.boundsX0, 6u,
+                     "the texture record should start at the clipped X bound");
+            t.Equals(sprite.boundsY0, 5u,
+                     "the texture record should start at the clipped Y bound");
+            t.Equals(sprite.boundsX1, 16u,
+                     "the texture record should retain exclusive X bounds");
+            t.Equals(sprite.boundsY1, 13u,
+                     "the texture record should retain exclusive Y bounds");
+            t.Equals(sprite.textureBaseBlock, 64u,
+                     "TEX0 block units should remain native raw-VRAM units");
+            t.Equals(sprite.textureWidth, 2u,
+                     "the shader record should retain the exact texture stride");
+            t.Equals(sprite.textureMaskU, 63u,
+                     "TW should become the repeat mask used by point sampling");
+            t.Equals(sprite.textureMaskV, 31u,
+                     "TH should become the repeat mask used by point sampling");
+            t.Equals(sprite.textureOriginU, 16,
+                     "reversed screen endpoints and scissor clipping should advance U");
+            t.Equals(sprite.textureOriginV, 7,
+                     "scissor clipping should advance V from the geometric origin");
+            t.Equals(sprite.textureStepU, 1,
+                     "normalization should preserve positive U progression");
+            t.Equals(sprite.textureStepV, 1,
+                     "normalization should preserve positive V progression");
+            t.Equals(sprite.reserved0, 0u,
+                     "prepared texture records should clear reserved data");
+            t.Equals(sprite.reserved1, 0u,
+                     "all texture ABI padding should be deterministic");
+
+            const GsVulkanNearestCt32Sprite sentinel = sprite;
+            auto expectRejected =
+                [&](const GsDrawCommand &rejected,
+                    GsFallbackReason reason,
+                    const char *message)
+            {
+                const GsBackendDecision rejectedDecision =
+                    prepareGsVulkanNearestCt32Sprite(rejected, sprite);
+                t.IsFalse(rejectedDecision.supported, message);
+                t.Equals(rejectedDecision.reason, reason, message);
+                t.IsTrue(sprite == sentinel,
+                         "rejected texture preparation must preserve the caller's record");
+            };
+            auto rebuild =
+                [&](uint64_t sequence,
+                    const GSPrimReg &primitive,
+                    const GSContext &context,
+                    std::span<const GSVertex> vertices)
+            {
+                return buildGsDrawCommand(
+                    sequence, primitive, context, vertices,
+                    command.globalState());
+            };
+
+            GSPrimReg untextured = command.primitive();
+            untextured.tme = false;
+            expectRejected(
+                rebuild(22u, untextured, command.context(),
+                        std::span<const GSVertex>(command.vertices()).first(2u)),
+                GsFallbackReason::UnsupportedTextureState,
+                "the texture capability should require TME");
+
+            GSContext format = command.context();
+            format.tex0.psm = GS_PSM_T8;
+            expectRejected(
+                rebuild(23u, command.primitive(), format,
+                        std::span<const GSVertex>(command.vertices()).first(2u)),
+                GsFallbackReason::UnsupportedTextureFormat,
+                "the first raw texture slice should reject indexed sources");
+
+            GSContext function = command.context();
+            function.tex0.tfx = 0u;
+            expectRejected(
+                rebuild(24u, command.primitive(), function,
+                        std::span<const GSVertex>(command.vertices()).first(2u)),
+                GsFallbackReason::UnsupportedTextureFunction,
+                "the first texture slice should require direct DECAL RGBA");
+
+            GSPrimReg stq = command.primitive();
+            stq.fst = false;
+            expectRejected(
+                rebuild(25u, stq, command.context(),
+                        std::span<const GSVertex>(command.vertices()).first(2u)),
+                GsFallbackReason::UnsupportedTextureCoordinates,
+                "STQ interpolation should remain outside the integer FST slice");
+
+            std::array<GSVertex, 3> fractional = command.vertices();
+            ++fractional[0].u;
+            expectRejected(
+                rebuild(26u, command.primitive(), command.context(),
+                        std::span<const GSVertex>(fractional).first(2u)),
+                GsFallbackReason::UnsupportedTextureCoordinates,
+                "fractional UV endpoints should not publish an integer record");
+
+            std::array<GSVertex, 3> scaled = command.vertices();
+            scaled[0].u = static_cast<uint16_t>(scaled[0].u + 16u);
+            expectRejected(
+                rebuild(27u, command.primitive(), command.context(),
+                        std::span<const GSVertex>(scaled).first(2u)),
+                GsFallbackReason::UnsupportedTextureCoordinates,
+                "integer UV scaling should remain outside the one-to-one slice");
+
+            GSContext filtered = command.context();
+            filtered.tex1 |= 1ull << 5u;
+            expectRejected(
+                rebuild(28u, command.primitive(), filtered,
+                        std::span<const GSVertex>(command.vertices()).first(2u)),
+                GsFallbackReason::UnsupportedTextureFilter,
+                "linear magnification should remain outside the point slice");
+
+            GSContext mipmapped = command.context();
+            mipmapped.tex1 |= 1ull << 2u;
+            expectRejected(
+                rebuild(29u, command.primitive(), mipmapped,
+                        std::span<const GSVertex>(command.vertices()).first(2u)),
+                GsFallbackReason::UnsupportedTextureFilter,
+                "non-zero maximum mip level should remain outside the point slice");
+
+            GSContext clamped = command.context();
+            clamped.clamp |= 1u;
+            expectRejected(
+                rebuild(30u, command.primitive(), clamped,
+                        std::span<const GSVertex>(command.vertices()).first(2u)),
+                GsFallbackReason::UnsupportedTextureWrap,
+                "the first texture slice should require repeat on both axes");
+
+            GSContext zeroStride = command.context();
+            zeroStride.tex0.tbw = 0u;
+            expectRejected(
+                rebuild(31u, command.primitive(), zeroStride,
+                        std::span<const GSVertex>(command.vertices()).first(2u)),
+                GsFallbackReason::UnsupportedTextureState,
+                "zero texture stride should remain an explicit later capability");
+
+            GSContext oversized = command.context();
+            oversized.tex0.tw = 11u;
+            expectRejected(
+                rebuild(32u, command.primitive(), oversized,
+                        std::span<const GSVertex>(command.vertices()).first(2u)),
+                GsFallbackReason::UnsupportedTextureState,
+                "texture exponents above the GS UV range should fail closed");
+
+            GSContext aliased = command.context();
+            aliased.tex0.tbp0 = command.context().frame.fbp << 5u;
+            expectRejected(
+                rebuild(33u, command.primitive(), aliased,
+                        std::span<const GSVertex>(command.vertices()).first(2u)),
+                GsFallbackReason::ResourceAlias,
+                "raw texture reads must not overlap framebuffer writes");
+
+            t.Equals(
+                gsFallbackReasonName(
+                    GsFallbackReason::UnsupportedTextureCoordinates),
+                std::string_view("unsupported-texture-coordinates"),
+                "texture fallbacks should have stable diagnostic names");
+        });
+
+        tc.Run("Nearest CT32 texture records match software point sampling", [](TestCase &t)
+        {
+            GSMem::InitLookupTables();
+            struct TextureCase
+            {
+                GSScissorReg scissor;
+                GSXYOffsetReg xyoffset;
+                std::array<uint16_t, 2> x;
+                std::array<uint16_t, 2> y;
+                std::array<uint16_t, 2> u;
+                std::array<uint16_t, 2> v;
+                uint8_t tw;
+                uint8_t th;
+            };
+            const std::array<TextureCase, 5> cases{{
+                {
+                    {6u, 15u, 5u, 12u}, {32u, 16u},
+                    {352u, 96u}, {48u, 304u},
+                    {480u, 224u}, {64u, 320u}, 6u, 5u,
+                },
+                {
+                    {3u, 14u, 2u, 6u}, {0u, 0u},
+                    {0u, 256u}, {0u, 128u},
+                    {992u, 1248u}, {480u, 608u}, 6u, 5u,
+                },
+                {
+                    {10u, 20u, 7u, 17u}, {16u, 32u},
+                    {400u, 144u}, {352u, 96u},
+                    {80u, 336u}, {32u, 288u}, 5u, 5u,
+                },
+                {
+                    {5u, 10u, 6u, 10u}, {48u, 16u},
+                    {112u, 240u}, {208u, 80u},
+                    {320u, 192u}, {320u, 192u}, 5u, 4u,
+                },
+                {
+                    {1u, 3u, 1u, 3u}, {0u, 0u},
+                    {0u, 64u}, {0u, 64u},
+                    {160u, 224u}, {320u, 384u}, 0u, 0u,
+                },
+            }};
+
+            uint64_t sequence = 100u;
+            for (size_t index = 0u; index < cases.size(); ++index)
+            {
+                const TextureCase &textureCase = cases[index];
+                const GsDrawCommand command = makeNearestCt32SpriteCommand(
+                    sequence++, 40u, 2u, 64u, 2u,
+                    textureCase.tw, textureCase.th,
+                    textureCase.scissor, textureCase.xyoffset,
+                    textureCase.x, textureCase.y,
+                    textureCase.u, textureCase.v);
+                GsVulkanNearestCt32Sprite sprite{};
+                const GsBackendDecision decision =
+                    prepareGsVulkanNearestCt32Sprite(command, sprite);
+                if (!decision.supported)
+                {
+                    t.Fail(
+                        "the software-equivalence corpus must satisfy the narrow texture predicate");
+                    return;
+                }
+
+                std::vector<uint8_t> actual = makeVramPattern(
+                    0x54455830u + static_cast<uint32_t>(index));
+                std::vector<uint8_t> expected = actual;
+                applyNearestCt32SpriteCpu(expected, sprite);
+
+                GS gs;
+                gs.init(
+                    actual.data(),
+                    static_cast<uint32_t>(actual.size()),
+                    nullptr);
+                gs.setDebugHistoryPaused(true);
+                drawNearestCt32SpriteCommand(gs, command);
+                gs.flushRenderBatch();
+
+                if (actual != expected)
+                {
+                    std::ostringstream message;
+                    message << "nearest CT32 record diverged from software case "
+                            << index;
+                    t.Fail(message.str());
+                    return;
+                }
+            }
         });
 
         tc.Run("CT32 triangle preparation normalizes exact fixed-point edges", [](TestCase &t)

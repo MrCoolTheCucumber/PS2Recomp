@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <bit>
+#include <cstdlib>
 #include <limits>
 #include <type_traits>
 
@@ -749,15 +750,41 @@ GsDrawCommand buildGsDrawCommand(
 
 namespace
 {
+    enum class TextureRequirement : uint8_t
+    {
+        Disabled,
+        NearestCt32,
+    };
+
+    bool hasOneToOneIntegerTextureAxis(
+        int32_t fixed0,
+        int32_t fixed1,
+        uint16_t texture0,
+        uint16_t texture1) noexcept
+    {
+        if ((fixed0 % 16) != 0 || (fixed1 % 16) != 0 ||
+            (texture0 % 16u) != 0u || (texture1 % 16u) != 0u)
+        {
+            return false;
+        }
+
+        const int32_t screenDelta = fixed1 - fixed0;
+        const int32_t textureDelta =
+            static_cast<int32_t>(texture1) -
+            static_cast<int32_t>(texture0);
+        return screenDelta != 0 &&
+               std::abs(textureDelta) == std::abs(screenDelta);
+    }
+
     GsBackendDecision classifyFlatCt32NoDepth(
         const GsDrawCommand &command,
         GSPrimType expectedPrimitive,
-        uint8_t expectedVertices) noexcept
+        uint8_t expectedVertices,
+        TextureRequirement textureRequirement) noexcept
     {
         const GSPrimReg &primitive = command.primitive();
         const GSContext &context = command.context();
         const GsDrawGlobalState &global = command.globalState();
-        const GsDrawResources resources = command.resources();
 
         if (command.bounds().empty())
             return {false, GsFallbackReason::EmptyBounds};
@@ -772,8 +799,16 @@ namespace
         }
         if (context.frame.psm != GS_PSM_CT32)
             return {false, GsFallbackReason::UnsupportedFramebufferFormat};
-        if (primitive.tme)
+        if (textureRequirement == TextureRequirement::Disabled &&
+            primitive.tme)
+        {
             return {false, GsFallbackReason::Textured};
+        }
+        if (textureRequirement == TextureRequirement::NearestCt32 &&
+            !primitive.tme)
+        {
+            return {false, GsFallbackReason::UnsupportedTextureState};
+        }
         if (primitive.iip)
             return {false, GsFallbackReason::GouraudShading};
         if (primitive.fge)
@@ -796,6 +831,63 @@ namespace
             return {false, GsFallbackReason::Dither};
         if (global.scanMask != 0u)
             return {false, GsFallbackReason::ScanMask};
+
+        if (textureRequirement == TextureRequirement::NearestCt32)
+        {
+            if (context.tex0.psm != GS_PSM_CT32)
+            {
+                return {
+                    false,
+                    GsFallbackReason::UnsupportedTextureFormat};
+            }
+            if (context.tex0.tcc != 1u || context.tex0.tfx != 1u)
+            {
+                return {
+                    false,
+                    GsFallbackReason::UnsupportedTextureFunction};
+            }
+            if (!primitive.fst ||
+                !hasOneToOneIntegerTextureAxis(
+                    command.fixedX()[0], command.fixedX()[1],
+                    command.vertices()[0].u, command.vertices()[1].u) ||
+                !hasOneToOneIntegerTextureAxis(
+                    command.fixedY()[0], command.fixedY()[1],
+                    command.vertices()[0].v, command.vertices()[1].v))
+            {
+                return {
+                    false,
+                    GsFallbackReason::UnsupportedTextureCoordinates};
+            }
+            if (context.tex0.tbw == 0u || context.tex0.tbw > 0x3Fu ||
+                context.tex0.tw > 10u || context.tex0.th > 10u)
+            {
+                return {
+                    false,
+                    GsFallbackReason::UnsupportedTextureState};
+            }
+            const uint8_t maximumMipLevel =
+                static_cast<uint8_t>((context.tex1 >> 2u) & 0x7u);
+            const uint8_t magnificationFilter =
+                static_cast<uint8_t>((context.tex1 >> 5u) & 0x1u);
+            const uint8_t minificationFilter =
+                static_cast<uint8_t>((context.tex1 >> 6u) & 0x7u);
+            if (maximumMipLevel != 0u ||
+                magnificationFilter != 0u ||
+                minificationFilter != 0u)
+            {
+                return {
+                    false,
+                    GsFallbackReason::UnsupportedTextureFilter};
+            }
+            if ((context.clamp & 0xFu) != 0u)
+            {
+                return {
+                    false,
+                    GsFallbackReason::UnsupportedTextureWrap};
+            }
+        }
+
+        const GsDrawResources resources = command.resources();
         if (resources.unknownMemoryLayout)
             return {false, GsFallbackReason::UnknownMemoryLayout};
         if (resources.depthReadPages.any())
@@ -814,14 +906,24 @@ GsBackendDecision classifyGsInitialCt32Sprite(
     const GsDrawCommand &command) noexcept
 {
     return classifyFlatCt32NoDepth(
-        command, GS_PRIM_SPRITE, 2u);
+        command, GS_PRIM_SPRITE, 2u,
+        TextureRequirement::Disabled);
+}
+
+GsBackendDecision classifyGsNearestCt32TexturedSprite(
+    const GsDrawCommand &command) noexcept
+{
+    return classifyFlatCt32NoDepth(
+        command, GS_PRIM_SPRITE, 2u,
+        TextureRequirement::NearestCt32);
 }
 
 GsBackendDecision classifyGsFlatCt32Triangle(
     const GsDrawCommand &command) noexcept
 {
     return classifyFlatCt32NoDepth(
-        command, GS_PRIM_TRIANGLE, 3u);
+        command, GS_PRIM_TRIANGLE, 3u,
+        TextureRequirement::Disabled);
 }
 
 GsBackendRouter::GsBackendRouter(
@@ -1148,6 +1250,12 @@ std::string_view gsFallbackReasonName(GsFallbackReason reason) noexcept
     case GsFallbackReason::UnsupportedPrimitiveState: return "unsupported-primitive-state";
     case GsFallbackReason::UnsupportedFramebufferFormat: return "unsupported-framebuffer-format";
     case GsFallbackReason::Textured: return "textured";
+    case GsFallbackReason::UnsupportedTextureState: return "unsupported-texture-state";
+    case GsFallbackReason::UnsupportedTextureFormat: return "unsupported-texture-format";
+    case GsFallbackReason::UnsupportedTextureFunction: return "unsupported-texture-function";
+    case GsFallbackReason::UnsupportedTextureCoordinates: return "unsupported-texture-coordinates";
+    case GsFallbackReason::UnsupportedTextureFilter: return "unsupported-texture-filter";
+    case GsFallbackReason::UnsupportedTextureWrap: return "unsupported-texture-wrap";
     case GsFallbackReason::GouraudShading: return "gouraud-shading";
     case GsFallbackReason::Fog: return "fog";
     case GsFallbackReason::AlphaBlend: return "alpha-blend";

@@ -114,6 +114,52 @@ namespace
         return nullptr;
     }
 
+    bool isPowerOfTwoMask(uint32_t mask) noexcept
+    {
+        return mask <= 1023u && (mask & (mask + 1u)) == 0u;
+    }
+
+    const char *nearestCt32SpriteValidationError(
+        const GsVulkanNearestCt32Sprite &sprite) noexcept
+    {
+        if (sprite.reserved0 != 0u || sprite.reserved1 != 0u)
+            return "Vulkan nearest CT32 sprite has non-zero reserved data";
+        if (sprite.framebufferBaseBlock > 0x3FFFu ||
+            sprite.textureBaseBlock > 0x3FFFu)
+        {
+            return "Vulkan nearest CT32 sprite base is outside GS VRAM";
+        }
+        if (sprite.framebufferWidth == 0u ||
+            sprite.framebufferWidth > 0x3Fu ||
+            sprite.textureWidth == 0u || sprite.textureWidth > 0x3Fu)
+        {
+            return "Vulkan nearest CT32 sprite width is outside GS register range";
+        }
+        if (sprite.boundsX0 >= sprite.boundsX1 ||
+            sprite.boundsY0 >= sprite.boundsY1)
+        {
+            return "Vulkan nearest CT32 sprite bounds are empty";
+        }
+        if (sprite.boundsX1 > 2048u || sprite.boundsY1 > 2048u)
+            return "Vulkan nearest CT32 sprite bounds are outside GS scissor range";
+        if (!isPowerOfTwoMask(sprite.textureMaskU) ||
+            !isPowerOfTwoMask(sprite.textureMaskV))
+        {
+            return "Vulkan nearest CT32 sprite texture mask is invalid";
+        }
+        if (sprite.textureOriginU < 0 || sprite.textureOriginU > 1023 ||
+            sprite.textureOriginV < 0 || sprite.textureOriginV > 1023)
+        {
+            return "Vulkan nearest CT32 sprite texture origin is outside UV range";
+        }
+        if ((sprite.textureStepU != -1 && sprite.textureStepU != 1) ||
+            (sprite.textureStepV != -1 && sprite.textureStepV != 1))
+        {
+            return "Vulkan nearest CT32 sprite texture step is not unit length";
+        }
+        return nullptr;
+    }
+
     struct FixedTriangleVertex
     {
         int32_t x;
@@ -327,6 +373,68 @@ GsBackendDecision prepareGsVulkanCt32Sprite(
     {
         return {false, GsFallbackReason::UnknownMemoryLayout};
     }
+
+    sprite = prepared;
+    return decision;
+}
+
+GsBackendDecision prepareGsVulkanNearestCt32Sprite(
+    const GsDrawCommand &command,
+    GsVulkanNearestCt32Sprite &sprite) noexcept
+{
+    const GsBackendDecision decision =
+        classifyGsNearestCt32TexturedSprite(command);
+    if (!decision.supported)
+        return decision;
+
+    const GSContext &context = command.context();
+    const GsDrawBounds &bounds = command.bounds();
+    int32_t fixedX0 = command.fixedX()[0];
+    int32_t fixedX1 = command.fixedX()[1];
+    int32_t fixedY0 = command.fixedY()[0];
+    int32_t fixedY1 = command.fixedY()[1];
+    int32_t textureU0 = command.vertices()[0].u;
+    int32_t textureU1 = command.vertices()[1].u;
+    int32_t textureV0 = command.vertices()[0].v;
+    int32_t textureV1 = command.vertices()[1].v;
+    if (fixedX0 > fixedX1)
+    {
+        std::swap(fixedX0, fixedX1);
+        std::swap(textureU0, textureU1);
+    }
+    if (fixedY0 > fixedY1)
+    {
+        std::swap(fixedY0, fixedY1);
+        std::swap(textureV0, textureV1);
+    }
+
+    const int32_t textureStepU = textureU1 > textureU0 ? 1 : -1;
+    const int32_t textureStepV = textureV1 > textureV0 ? 1 : -1;
+    const int32_t unclippedX0 = fixedX0 / 16;
+    const int32_t unclippedY0 = fixedY0 / 16;
+
+    GsVulkanNearestCt32Sprite prepared{};
+    prepared.framebufferBaseBlock = context.frame.fbp << 5u;
+    prepared.framebufferWidth =
+        std::max<uint32_t>(context.frame.fbw, 1u);
+    prepared.boundsX0 = static_cast<uint32_t>(bounds.x0);
+    prepared.boundsY0 = static_cast<uint32_t>(bounds.y0);
+    prepared.boundsX1 = static_cast<uint32_t>(bounds.x1);
+    prepared.boundsY1 = static_cast<uint32_t>(bounds.y1);
+    prepared.textureBaseBlock = context.tex0.tbp0;
+    prepared.textureWidth = context.tex0.tbw;
+    prepared.textureMaskU = (1u << context.tex0.tw) - 1u;
+    prepared.textureMaskV = (1u << context.tex0.th) - 1u;
+    prepared.textureOriginU =
+        textureU0 / 16 +
+        textureStepU * (bounds.x0 - unclippedX0);
+    prepared.textureOriginV =
+        textureV0 / 16 +
+        textureStepV * (bounds.y0 - unclippedY0);
+    prepared.textureStepU = textureStepU;
+    prepared.textureStepV = textureStepV;
+    if (nearestCt32SpriteValidationError(prepared))
+        return {false, GsFallbackReason::UnknownMemoryLayout};
 
     sprite = prepared;
     return decision;

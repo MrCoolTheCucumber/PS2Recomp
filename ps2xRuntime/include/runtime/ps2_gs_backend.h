@@ -182,6 +182,12 @@ enum class GsFallbackReason : uint8_t
     UnsupportedPrimitiveState,
     UnsupportedFramebufferFormat,
     Textured,
+    UnsupportedTextureState,
+    UnsupportedTextureFormat,
+    UnsupportedTextureFunction,
+    UnsupportedTextureCoordinates,
+    UnsupportedTextureFilter,
+    UnsupportedTextureWrap,
     GouraudShading,
     Fog,
     AlphaBlend,
@@ -356,6 +362,13 @@ private:
 // Phase 3's deliberately narrow first GPU predicate. Keeping it as a pure
 // classifier makes the Phase 0 census and future backend use the same reason.
 [[nodiscard]] GsBackendDecision classifyGsInitialCt32Sprite(
+    const GsDrawCommand &command) noexcept;
+
+// Phase 6's first texture predicate deliberately covers only direct CT32
+// point sampling whose integer FST coordinates advance exactly one texel per
+// framebuffer pixel. Repeat wrap and disjoint source/destination pages keep
+// the eventual raw-VRAM executor free of filtering and feedback hazards.
+[[nodiscard]] GsBackendDecision classifyGsNearestCt32TexturedSprite(
     const GsDrawCommand &command) noexcept;
 
 // Phase 5's first triangle predicate deliberately admits only flat,

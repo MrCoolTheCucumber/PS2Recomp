@@ -285,6 +285,60 @@ static_assert(offsetof(GsVulkanCt32Sprite, reserved) == 28u);
     const GsDrawCommand &command,
     GsVulkanCt32Sprite &sprite) noexcept;
 
+// Fixed record for Phase 6's first textured-sprite semantic slice. Texture
+// coordinates name the texel sampled at boundsX0/boundsY0 and advance by one
+// signed texel per output pixel. Power-of-two masks implement GS REPEAT before
+// raw CT32 local-memory addressing. Source and destination are guaranteed
+// disjoint by the backend-neutral classifier.
+struct alignas(16) GsVulkanNearestCt32Sprite
+{
+    uint32_t framebufferBaseBlock = 0u;
+    uint32_t framebufferWidth = 0u;
+    uint32_t boundsX0 = 0u;
+    uint32_t boundsY0 = 0u;
+    uint32_t boundsX1 = 0u;
+    uint32_t boundsY1 = 0u;
+    uint32_t textureBaseBlock = 0u;
+    uint32_t textureWidth = 0u;
+    uint32_t textureMaskU = 0u;
+    uint32_t textureMaskV = 0u;
+    int32_t textureOriginU = 0;
+    int32_t textureOriginV = 0;
+    int32_t textureStepU = 0;
+    int32_t textureStepV = 0;
+    uint32_t reserved0 = 0u;
+    uint32_t reserved1 = 0u;
+
+    bool operator==(const GsVulkanNearestCt32Sprite &) const = default;
+};
+
+static_assert(sizeof(GsVulkanNearestCt32Sprite) == 64u);
+static_assert(std::is_standard_layout_v<GsVulkanNearestCt32Sprite>);
+static_assert(std::is_trivially_copyable_v<GsVulkanNearestCt32Sprite>);
+static_assert(offsetof(GsVulkanNearestCt32Sprite, framebufferBaseBlock) == 0u);
+static_assert(offsetof(GsVulkanNearestCt32Sprite, framebufferWidth) == 4u);
+static_assert(offsetof(GsVulkanNearestCt32Sprite, boundsX0) == 8u);
+static_assert(offsetof(GsVulkanNearestCt32Sprite, boundsY0) == 12u);
+static_assert(offsetof(GsVulkanNearestCt32Sprite, boundsX1) == 16u);
+static_assert(offsetof(GsVulkanNearestCt32Sprite, boundsY1) == 20u);
+static_assert(offsetof(GsVulkanNearestCt32Sprite, textureBaseBlock) == 24u);
+static_assert(offsetof(GsVulkanNearestCt32Sprite, textureWidth) == 28u);
+static_assert(offsetof(GsVulkanNearestCt32Sprite, textureMaskU) == 32u);
+static_assert(offsetof(GsVulkanNearestCt32Sprite, textureMaskV) == 36u);
+static_assert(offsetof(GsVulkanNearestCt32Sprite, textureOriginU) == 40u);
+static_assert(offsetof(GsVulkanNearestCt32Sprite, textureOriginV) == 44u);
+static_assert(offsetof(GsVulkanNearestCt32Sprite, textureStepU) == 48u);
+static_assert(offsetof(GsVulkanNearestCt32Sprite, textureStepV) == 52u);
+static_assert(offsetof(GsVulkanNearestCt32Sprite, reserved0) == 56u);
+static_assert(offsetof(GsVulkanNearestCt32Sprite, reserved1) == 60u);
+
+// Publishes only fully validated records. Rejection leaves the caller's
+// record untouched, matching the established sprite/triangle preparation
+// contract.
+[[nodiscard]] GsBackendDecision prepareGsVulkanNearestCt32Sprite(
+    const GsDrawCommand &command,
+    GsVulkanNearestCt32Sprite &sprite) noexcept;
+
 // Phase 5's first exact triangle record. Vertex coordinates retain the signed
 // 12.4 window-space values after XYOFFSET. Preparation normalizes the winding
 // to positive area; topLeftEdgeMask bits 0..2 describe the edges opposite
