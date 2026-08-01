@@ -413,6 +413,11 @@ public:
         const GsVulkanCt32Sprite &sprite,
         std::vector<uint8_t> &output,
         std::string *error = nullptr) = 0;
+    [[nodiscard]] virtual bool executeNearestCt32Sprite(
+        std::span<const uint8_t> input,
+        const GsVulkanNearestCt32Sprite &sprite,
+        std::vector<uint8_t> &output,
+        std::string *error = nullptr) = 0;
     [[nodiscard]] virtual bool executeCt32Triangle(
         std::span<const uint8_t> input,
         const GsVulkanCt32Triangle &triangle,
@@ -489,12 +494,12 @@ public:
 
     // Uploads canonical VRAM, executes one prepared nearest CT32 texture
     // sprite through raw GS-local-memory reads, and publishes the synchronized
-    // 4 MiB result. This qualification seam is not yet used by live routing.
+    // 4 MiB result.
     [[nodiscard]] bool executeNearestCt32Sprite(
         std::span<const uint8_t> input,
         const GsVulkanNearestCt32Sprite &sprite,
         std::vector<uint8_t> &output,
-        std::string *error = nullptr);
+        std::string *error = nullptr) override;
 
     // Uploads canonical 4 MiB CPU VRAM, executes one prepared exact flat
     // CT32 triangle, and publishes the complete synchronized image. Devices

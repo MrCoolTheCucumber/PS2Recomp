@@ -882,7 +882,8 @@ namespace
 
         explicit FakeCt32Executor(
             Behavior behavior_,
-            bool exactCt32Triangle_ = true)
+            bool exactCt32Triangle_ = true,
+            bool exactNearestCt32Sprite_ = true)
             : behavior(behavior_)
         {
             report.compiled = true;
@@ -893,6 +894,8 @@ namespace
             report.devices[0].suitable = true;
             report.devices[0].shaderInt64 = exactCt32Triangle_;
             report.devices[0].exactCt32Triangle = exactCt32Triangle_;
+            report.devices[0].exactNearestCt32Sprite =
+                exactNearestCt32Sprite_;
         }
 
         bool executeCt32Sprite(
@@ -953,6 +956,44 @@ namespace
                     triangle.boundsX1 - triangle.boundsX0) *
                 static_cast<uint64_t>(
                     triangle.boundsY1 - triangle.boundsY0);
+            ++serviceStatistics.queueSubmissions;
+            ++serviceStatistics.shaderDispatches;
+            serviceStatistics.pipelineBarriers += 4u;
+            ++serviceStatistics.pipelineBinds;
+            ++serviceStatistics.pipelineCacheHits;
+            ++serviceStatistics.fenceWaits;
+            if (error)
+                error->clear();
+            return true;
+        }
+
+        bool executeNearestCt32Sprite(
+            std::span<const uint8_t> input,
+            const GsVulkanNearestCt32Sprite &sprite,
+            std::vector<uint8_t> &output,
+            std::string *error) override
+        {
+            if (!isHealthy || behavior == Behavior::Fail ||
+                !report.devices[0].exactNearestCt32Sprite)
+            {
+                ++serviceStatistics.nearestCt32SpriteDrawsFailed;
+                if (error)
+                    *error = "injected nearest CT32 executor failure";
+                return false;
+            }
+
+            residentVram.assign(input.begin(), input.end());
+            if (behavior == Behavior::Exact)
+                applyNearestCt32SpriteCpu(residentVram, sprite);
+            output = residentVram;
+            if (behavior == Behavior::InvalidOutput)
+                output.resize(1u);
+            ++serviceStatistics.nearestCt32SpriteDrawsCompleted;
+            serviceStatistics.nearestCt32SpritePixelsExecuted +=
+                static_cast<uint64_t>(
+                    sprite.boundsX1 - sprite.boundsX0) *
+                static_cast<uint64_t>(
+                    sprite.boundsY1 - sprite.boundsY0);
             ++serviceStatistics.queueSubmissions;
             ++serviceStatistics.shaderDispatches;
             serviceStatistics.pipelineBarriers += 4u;
@@ -2040,6 +2081,110 @@ void register_ps2_gs_vulkan_tests()
                      "post-shutdown classification should fail closed");
             t.Equals(backend->pendingCommandCount(), static_cast<size_t>(0u),
                      "shutdown should leave no accepted resident work");
+        });
+
+        tc.Run("Vulkan raster backend verifies nearest CT32 textures behind capability", [](TestCase &t)
+        {
+            GSMem::InitLookupTables();
+            const GsDrawCommand command = makeNearestCt32SpriteCommand(
+                43u, 40u, 2u, 64u, 2u, 6u, 5u,
+                {6u, 15u, 5u, 12u}, {32u, 16u},
+                {352u, 96u}, {48u, 304u},
+                {480u, 224u}, {64u, 320u});
+            GsVulkanNearestCt32Sprite prepared{};
+            t.IsTrue(
+                prepareGsVulkanNearestCt32Sprite(
+                    command, prepared).supported,
+                "the verification fixture should satisfy the nearest texture predicate");
+
+            std::vector<uint8_t> vram = makeVramPattern(0x54585631u);
+            const std::vector<uint8_t> initial = vram;
+            std::vector<uint8_t> expected = initial;
+            applyNearestCt32SpriteCpu(expected, prepared);
+            uint64_t softwareCalls = 0u;
+            GsVulkanRasterBackendConfig config{};
+            config.mode = GsRendererMode::Verify;
+            std::unique_ptr<GsVulkanRasterBackend> backend =
+                GsVulkanRasterBackend::createWithExecutor(
+                    std::make_unique<FakeCt32Executor>(
+                        FakeCt32Executor::Behavior::Exact),
+                    config, vram,
+                    [&](const GsDrawCommand &draw)
+                    {
+                        ++softwareCalls;
+                        GsVulkanNearestCt32Sprite sprite{};
+                        if (prepareGsVulkanNearestCt32Sprite(
+                                draw, sprite).supported)
+                        {
+                            applyNearestCt32SpriteCpu(vram, sprite);
+                        }
+                    },
+                    {}, nullptr);
+            t.IsNotNull(backend.get(),
+                        "an exact texture executor should create Verify");
+            if (!backend)
+                return;
+
+            t.IsTrue(backend->classify(command).supported,
+                     "Verify should expose the capability-gated nearest texture class");
+            backend->submit(
+                std::span<const GsDrawCommand>(&command, 1u));
+            t.IsTrue(vram == expected,
+                     "Verify should retain the agreed textured software image");
+            t.Equals(softwareCalls, 1ull,
+                     "texture Verify should run the software oracle once");
+            const GsVulkanRasterBackendStatistics statistics =
+                backend->backendStatistics();
+            t.Equals(statistics.commandsAttempted, 1ull,
+                     "texture Verify should attempt one command");
+            t.Equals(statistics.commandsCompleted, 1ull,
+                     "an agreeing texture draw should complete once");
+            t.Equals(statistics.verifiedCommands, 1ull,
+                     "the full textured comparison should be counted");
+            t.Equals(statistics.bytesCompared,
+                     static_cast<uint64_t>(GS_VULKAN_VRAM_SIZE),
+                     "texture Verify should compare all 4 MiB");
+            const GsVulkanServiceStatistics serviceStatistics =
+                backend->serviceStatistics();
+            t.Equals(
+                serviceStatistics.nearestCt32SpriteDrawsCompleted,
+                1ull,
+                "the executor should receive one nearest texture request");
+            t.Equals(serviceStatistics.spriteDrawsCompleted, 0ull,
+                     "texture Verify must not use the flat sprite kernel");
+
+            t.IsTrue(backend->setMode(GsRendererMode::GpuStrict),
+                     "the synchronized backend should accept strict mode");
+            t.Equals(backend->classify(command).reason,
+                     GsFallbackReason::Textured,
+                     "strict routing should remain closed around the new texture class");
+            t.IsTrue(backend->setMode(GsRendererMode::Hybrid),
+                     "the synchronized backend should accept Hybrid mode");
+            t.Equals(backend->classify(command).reason,
+                     GsFallbackReason::Textured,
+                     "Hybrid should remain closed until resident texture qualification");
+
+            std::vector<uint8_t> unavailableVram = initial;
+            std::unique_ptr<GsVulkanRasterBackend> unavailable =
+                GsVulkanRasterBackend::createWithExecutor(
+                    std::make_unique<FakeCt32Executor>(
+                        FakeCt32Executor::Behavior::Exact,
+                        true, false),
+                    config, unavailableVram,
+                    [](const GsDrawCommand &) {}, {}, nullptr);
+            t.IsNotNull(unavailable.get(),
+                        "a base-capable executor should retain texture fallback");
+            if (unavailable)
+            {
+                t.Equals(unavailable->classify(command).reason,
+                         GsFallbackReason::BackendUnavailable,
+                         "missing exact texture capability should fail before submission");
+                t.Equals(
+                    unavailable->serviceStatistics()
+                        .nearestCt32SpriteDrawsFailed,
+                    0ull,
+                    "capability fallback must not post texture work");
+            }
         });
 
         tc.Run("Vulkan raster backend routes exact triangles behind capability", [](TestCase &t)
@@ -4243,6 +4388,204 @@ void register_ps2_gs_vulkan_tests()
             t.IsTrue(manifestText.find("\"top_left_edge_mask\"") !=
                          std::string::npos,
                      "the manifest should retain exact edge ownership");
+        });
+
+        tc.Run("Vulkan texture mismatch artifact retains exact sampling record", [](TestCase &t)
+        {
+            GSMem::InitLookupTables();
+            ScopedArtifactDirectory artifacts;
+            const GsDrawCommand command = makeNearestCt32SpriteCommand(
+                93u, 40u, 2u, 64u, 2u, 6u, 5u,
+                {6u, 15u, 5u, 12u}, {32u, 16u},
+                {352u, 96u}, {48u, 304u},
+                {480u, 224u}, {64u, 320u});
+            std::vector<uint8_t> vram = makeVramPattern(0x54584D31u);
+
+            GsVulkanRasterBackendConfig config{};
+            config.mode = GsRendererMode::Verify;
+            config.verificationArtifactDirectory =
+                artifacts.path.string();
+            std::unique_ptr<GsVulkanRasterBackend> backend =
+                GsVulkanRasterBackend::createWithExecutor(
+                    std::make_unique<FakeCt32Executor>(
+                        FakeCt32Executor::Behavior::Noop),
+                    config, vram,
+                    [&](const GsDrawCommand &draw)
+                    {
+                        GsVulkanNearestCt32Sprite sprite{};
+                        if (prepareGsVulkanNearestCt32Sprite(
+                                draw, sprite).supported)
+                        {
+                            applyNearestCt32SpriteCpu(vram, sprite);
+                        }
+                    },
+                    {}, nullptr);
+            t.IsNotNull(backend.get(),
+                        "the texture mismatch backend should construct");
+            if (!backend)
+                return;
+
+            bool mismatch = false;
+            try
+            {
+                backend->submit(
+                    std::span<const GsDrawCommand>(&command, 1u));
+            }
+            catch (const std::runtime_error &)
+            {
+                mismatch = true;
+            }
+            t.IsTrue(mismatch,
+                     "the injected no-op texture result should disagree with software");
+            const GsVulkanRasterBackendStatistics statistics =
+                backend->backendStatistics();
+            t.Equals(statistics.verificationMismatches, 1ull,
+                     "the texture mismatch should stop at its first draw");
+            const std::filesystem::path bundle =
+                statistics.lastVerificationArtifact;
+            t.IsTrue(std::filesystem::is_directory(bundle),
+                     "the texture reproducer should be published atomically");
+            std::ifstream manifest(bundle / "command.json");
+            const std::string manifestText{
+                std::istreambuf_iterator<char>(manifest),
+                std::istreambuf_iterator<char>()};
+            t.IsTrue(manifestText.find("\"nearest_ct32_sprite\"") !=
+                         std::string::npos,
+                     "the manifest should identify the texture record");
+            t.IsTrue(manifestText.find("\"texture_base_block\":64") !=
+                         std::string::npos,
+                     "the manifest should retain the raw texture base");
+            t.IsTrue(manifestText.find("\"texture_mask_u\":63") !=
+                         std::string::npos,
+                     "the manifest should retain the exact repeat mask");
+            t.IsTrue(manifestText.find("\"texture_origin_u\":16") !=
+                         std::string::npos,
+                     "the manifest should retain the clipped texture origin");
+            t.IsTrue(manifestText.find("\"texture_step_u\":1") !=
+                         std::string::npos,
+                     "the manifest should retain signed sampling direction");
+        });
+
+        tc.Run("GS Vulkan verifies nearest CT32 texture sprites end to end", [](TestCase &t)
+        {
+            GSMem::InitLookupTables();
+            const GsDrawCommand command = makeNearestCt32SpriteCommand(
+                94u, 40u, 2u, 64u, 2u, 6u, 5u,
+                {6u, 15u, 5u, 12u}, {32u, 16u},
+                {352u, 96u}, {48u, 304u},
+                {480u, 224u}, {64u, 320u});
+            GsVulkanNearestCt32Sprite prepared{};
+            t.IsTrue(
+                prepareGsVulkanNearestCt32Sprite(
+                    command, prepared).supported,
+                "the integrated fixture should satisfy the nearest texture predicate");
+
+            std::vector<uint8_t> softwareVram =
+                makeVramPattern(0x54585632u);
+            std::vector<uint8_t> acceleratedVram = softwareVram;
+            GS software;
+            GS accelerated;
+            software.init(
+                softwareVram.data(),
+                static_cast<uint32_t>(softwareVram.size()), nullptr);
+            accelerated.init(
+                acceleratedVram.data(),
+                static_cast<uint32_t>(acceleratedVram.size()), nullptr);
+
+            GsVulkanCapabilityReport preflight{};
+            const GsVulkanServiceConfig config =
+                makeRendererServiceConfig(preflight);
+            ScopedArtifactDirectory artifacts;
+            t.IsTrue(accelerated.configureVulkanRenderer(
+                         config, artifacts.path.string()),
+                     "the texture fixture should accept Vulkan configuration");
+            if (!preflight.ready())
+            {
+                t.IsFalse(accelerated.setRendererMode(
+                              GsRendererMode::Verify),
+                          "an unavailable host should decline texture Verify cleanly");
+                return;
+            }
+
+            const GsVulkanDeviceReport *selected =
+                preflight.selectedDevice();
+            t.IsNotNull(selected,
+                        "a ready texture preflight should select one device");
+            if (!selected)
+                return;
+            t.IsTrue(selected->exactNearestCt32Sprite,
+                     "the selected raw-VRAM device should expose the exact texture kernel");
+            if (!selected->exactNearestCt32Sprite)
+                return;
+
+            t.IsTrue(accelerated.setRendererMode(
+                         GsRendererMode::Verify),
+                     "the capable host should create texture Verify");
+            if (accelerated.rendererMode() != GsRendererMode::Verify)
+                return;
+            accelerated.setBackendCountersEnabled(true);
+            accelerated.resetBackendCounters();
+
+            drawNearestCt32SpriteCommand(software, command);
+            drawNearestCt32SpriteCommand(accelerated, command);
+            (void)software.getDebugSnapshot();
+            (void)accelerated.getDebugSnapshot();
+            t.IsTrue(acceleratedVram == softwareVram,
+                     "real Vulkan texture Verify should match all canonical VRAM");
+
+            const GsBackendCounters counters =
+                accelerated.backendCounters();
+            t.Equals(counters.commands, 1ull,
+                     "the texture fixture should assemble one draw");
+            t.Equals(counters.acceleratedCommands, 1ull,
+                     "the exact texture draw should use Vulkan Verify");
+            t.Equals(counters.verifiedCommands, 1ull,
+                     "the texture draw should record one verification");
+            t.Equals(counters.softwareCommands, 0ull,
+                     "the routed texture draw should not use fallback");
+            t.Equals(counters.fallbackCommands, 0ull,
+                     "the exact texture draw should have no fallback decision");
+            t.Equals(
+                counters.decisions[static_cast<size_t>(
+                    GsFallbackReason::Supported)],
+                1ull,
+                "the router should retain the supported texture decision");
+
+            const GsVulkanRasterBackendStatistics backend =
+                accelerated.vulkanRendererBackendStatistics();
+            t.Equals(backend.commandsAttempted, 1ull,
+                     "the integrated backend should attempt one texture draw");
+            t.Equals(backend.commandsCompleted, 1ull,
+                     "the matching texture draw should complete once");
+            t.Equals(backend.verifiedCommands, 1ull,
+                     "the backend should compare one texture result");
+            t.Equals(backend.bytesCompared,
+                     static_cast<uint64_t>(GS_VULKAN_VRAM_SIZE),
+                     "texture Verify should compare the complete 4 MiB image");
+            t.Equals(backend.verificationMismatches, 0ull,
+                     "the real texture kernel should have no byte mismatch");
+
+            const GsVulkanServiceStatistics service =
+                accelerated.vulkanRendererServiceStatistics();
+            t.Equals(service.nearestCt32SpriteDrawsCompleted, 1ull,
+                     "the service should execute one nearest texture request");
+            t.Equals(service.nearestCt32SpriteDrawsFailed, 0ull,
+                     "the real texture request should not fail");
+            t.Equals(
+                service.nearestCt32SpritePixelsExecuted,
+                static_cast<uint64_t>(
+                    prepared.boundsX1 - prepared.boundsX0) *
+                    static_cast<uint64_t>(
+                        prepared.boundsY1 - prepared.boundsY0),
+                "the service should retain exact texture pixel accounting");
+            t.Equals(service.spriteDrawsCompleted, 0ull,
+                     "texture routing must not alias the flat sprite request");
+            t.Equals(service.triangleDrawsCompleted, 0ull,
+                     "texture routing must not alias the triangle request");
+            t.Equals(service.validationErrors, 0u,
+                     "integrated texture Verify should remain validation-clean");
+            t.Equals(service.validationWarnings, 0u,
+                     "integrated texture Verify should emit no validation warnings");
         });
 
         tc.Run("GS Vulkan verify and hybrid preserve fallback transfer ordering", [](TestCase &t)

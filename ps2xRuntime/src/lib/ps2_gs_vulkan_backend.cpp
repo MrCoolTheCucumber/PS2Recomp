@@ -125,6 +125,31 @@ namespace
             << triangle.topLeftEdgeMask << '}';
     }
 
+    void writePreparedRecord(
+        std::ostream &output,
+        const GsVulkanNearestCt32Sprite &sprite)
+    {
+        output
+            << "  \"nearest_ct32_sprite\": {"
+            << "\"framebuffer_base_block\":"
+            << sprite.framebufferBaseBlock << ','
+            << "\"framebuffer_width\":"
+            << sprite.framebufferWidth << ','
+            << "\"bounds_x0\":" << sprite.boundsX0 << ','
+            << "\"bounds_y0\":" << sprite.boundsY0 << ','
+            << "\"bounds_x1\":" << sprite.boundsX1 << ','
+            << "\"bounds_y1\":" << sprite.boundsY1 << ','
+            << "\"texture_base_block\":"
+            << sprite.textureBaseBlock << ','
+            << "\"texture_width\":" << sprite.textureWidth << ','
+            << "\"texture_mask_u\":" << sprite.textureMaskU << ','
+            << "\"texture_mask_v\":" << sprite.textureMaskV << ','
+            << "\"texture_origin_u\":" << sprite.textureOriginU << ','
+            << "\"texture_origin_v\":" << sprite.textureOriginV << ','
+            << "\"texture_step_u\":" << sprite.textureStepU << ','
+            << "\"texture_step_v\":" << sprite.textureStepV << '}';
+    }
+
     template <typename PreparedRecord>
     bool writeCommandManifest(
         const fs::path &path,
@@ -456,6 +481,7 @@ struct GsVulkanRasterBackend::Impl final
     std::vector<PendingResidentCommand> pendingResidentCommands;
     GsVramPageMask pendingResidentAccessPages;
     bool exactCt32Triangle = false;
+    bool exactNearestCt32Sprite = false;
     bool failed = false;
     bool shutDown = false;
 
@@ -705,6 +731,8 @@ GsVulkanRasterBackend::createWithExecutor(
         executorCapabilities.selectedDevice();
     impl->exactCt32Triangle =
         selectedDevice && selectedDevice->exactCt32Triangle;
+    impl->exactNearestCt32Sprite =
+        selectedDevice && selectedDevice->exactNearestCt32Sprite;
     impl->config = backendConfig;
     impl->canonicalVram = canonicalVram;
     impl->softwareOracle = std::move(softwareOracle);
@@ -758,6 +786,21 @@ GsBackendDecision GsVulkanRasterBackend::classify(
         return decision;
     }
 
+    if (command.primitive().type == GS_PRIM_SPRITE &&
+        command.primitive().tme &&
+        m_impl->config.mode == GsRendererMode::Verify)
+    {
+        GsVulkanNearestCt32Sprite texturedSprite{};
+        const GsBackendDecision textureDecision =
+            prepareGsVulkanNearestCt32Sprite(
+                command, texturedSprite);
+        if (!textureDecision.supported)
+            return textureDecision;
+        if (!m_impl->exactNearestCt32Sprite)
+            return {false, GsFallbackReason::BackendUnavailable};
+        return textureDecision;
+    }
+
     if (command.primitive().type != GS_PRIM_TRIANGLE ||
         (m_impl->config.mode != GsRendererMode::Hybrid &&
          m_impl->config.mode != GsRendererMode::Verify &&
@@ -809,11 +852,20 @@ void GsVulkanRasterBackend::submit(
     for (const GsDrawCommand &command : commands)
     {
         GsVulkanCt32Sprite sprite{};
+        GsVulkanNearestCt32Sprite texturedSprite{};
         GsVulkanCt32Triangle triangle{};
         const bool isTriangle =
             command.primitive().type == GS_PRIM_TRIANGLE;
+        const bool isTexturedSprite =
+            command.primitive().type == GS_PRIM_SPRITE &&
+            command.primitive().tme;
         if (isTriangle)
             (void)prepareGsVulkanCt32Triangle(command, triangle);
+        else if (isTexturedSprite)
+        {
+            (void)prepareGsVulkanNearestCt32Sprite(
+                command, texturedSprite);
+        }
         else
             (void)prepareGsVulkanCt32Sprite(command, sprite);
         const GsDrawResources resources = command.resources();
@@ -830,11 +882,24 @@ void GsVulkanRasterBackend::submit(
                 m_impl->canonicalVram.end());
             std::vector<uint8_t> gpuOutput;
             std::string executionError;
-            const bool executed = isTriangle
-                ? m_impl->executor->executeCt32Triangle(
-                      initial, triangle, gpuOutput, &executionError)
-                : m_impl->executor->executeCt32Sprite(
-                      initial, sprite, gpuOutput, &executionError);
+            bool executed = false;
+            if (isTriangle)
+            {
+                executed = m_impl->executor->executeCt32Triangle(
+                    initial, triangle, gpuOutput, &executionError);
+            }
+            else if (isTexturedSprite)
+            {
+                executed =
+                    m_impl->executor->executeNearestCt32Sprite(
+                        initial, texturedSprite, gpuOutput,
+                        &executionError);
+            }
+            else
+            {
+                executed = m_impl->executor->executeCt32Sprite(
+                    initial, sprite, gpuOutput, &executionError);
+            }
             if (!executed ||
                 gpuOutput.size() != GS_VULKAN_VRAM_SIZE)
             {
@@ -872,17 +937,31 @@ void GsVulkanRasterBackend::submit(
                 m_impl->failed = true;
                 std::string artifactPath;
                 std::string artifactError;
-                const bool artifactWritten = isTriangle
-                    ? writeVerificationArtifact(
-                          m_impl->config.verificationArtifactDirectory,
-                          command, triangle, firstDifference,
-                          initial, m_impl->canonicalVram, gpuOutput,
-                          artifactPath, artifactError)
-                    : writeVerificationArtifact(
-                          m_impl->config.verificationArtifactDirectory,
-                          command, sprite, firstDifference,
-                          initial, m_impl->canonicalVram, gpuOutput,
-                          artifactPath, artifactError);
+                bool artifactWritten = false;
+                if (isTriangle)
+                {
+                    artifactWritten = writeVerificationArtifact(
+                        m_impl->config.verificationArtifactDirectory,
+                        command, triangle, firstDifference,
+                        initial, m_impl->canonicalVram, gpuOutput,
+                        artifactPath, artifactError);
+                }
+                else if (isTexturedSprite)
+                {
+                    artifactWritten = writeVerificationArtifact(
+                        m_impl->config.verificationArtifactDirectory,
+                        command, texturedSprite, firstDifference,
+                        initial, m_impl->canonicalVram, gpuOutput,
+                        artifactPath, artifactError);
+                }
+                else
+                {
+                    artifactWritten = writeVerificationArtifact(
+                        m_impl->config.verificationArtifactDirectory,
+                        command, sprite, firstDifference,
+                        initial, m_impl->canonicalVram, gpuOutput,
+                        artifactPath, artifactError);
+                }
                 m_impl->statistics.lastVerificationArtifact = artifactPath;
                 std::ostringstream message;
                 message
