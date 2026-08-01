@@ -6799,7 +6799,7 @@ void register_ps2_gs_vulkan_tests()
                      "integrated texture Verify should emit no validation warnings");
         });
 
-        tc.Run("GS Vulkan verifies linear CT32 repeat sprites end to end", [](TestCase &t)
+        tc.Run("GS Vulkan verifies linear CT32 repeat and clamp end to end", [](TestCase &t)
         {
             GSMem::InitLookupTables();
             const GsDrawCommand command =
@@ -6811,11 +6811,26 @@ void register_ps2_gs_vulkan_tests()
                     {29176u, 36344u},
                     {0u, 512u},
                     {0u, 6656u});
+            const GsDrawCommand clampedCommand =
+                makeLinearCt32SpriteCommand(
+                    100u, 0u, 8u, 3584u, 8u, 10u, 10u,
+                    {0u, 511u, 0u, 447u},
+                    {28672u, 29184u},
+                    {28664u, 29176u},
+                    {29176u, 36344u},
+                    {0u, 512u},
+                    {0u, 6656u},
+                    1u, 1u);
             GsVulkanLinearCt32Sprite prepared{};
+            GsVulkanLinearCt32Sprite clampedPrepared{};
             t.IsTrue(
                 prepareGsVulkanLinearCt32Sprite(
                     command, prepared).supported,
                 "the integrated title fixture should satisfy the linear predicate");
+            t.IsTrue(
+                prepareGsVulkanLinearCt32Sprite(
+                    clampedCommand, clampedPrepared).supported,
+                "the integrated clamp title fixture should satisfy the linear predicate");
 
             std::vector<uint8_t> softwareVram =
                 makeVramPattern(0x4C565247u);
@@ -6865,6 +6880,8 @@ void register_ps2_gs_vulkan_tests()
 
             drawNearestCt32SpriteCommand(software, command);
             drawNearestCt32SpriteCommand(accelerated, command);
+            drawNearestCt32SpriteCommand(software, clampedCommand);
+            drawNearestCt32SpriteCommand(accelerated, clampedCommand);
             (void)software.getDebugSnapshot();
             (void)accelerated.getDebugSnapshot();
             t.IsTrue(acceleratedVram == softwareVram,
@@ -6872,12 +6889,12 @@ void register_ps2_gs_vulkan_tests()
 
             const GsBackendCounters counters =
                 accelerated.backendCounters();
-            t.Equals(counters.commands, 1ull,
-                     "the linear title fixture should assemble one draw");
-            t.Equals(counters.acceleratedCommands, 1ull,
-                     "the exact linear draw should use Vulkan Verify");
-            t.Equals(counters.verifiedCommands, 1ull,
-                     "the routed linear draw should record verification");
+            t.Equals(counters.commands, 2ull,
+                     "the linear title fixture should assemble two draws");
+            t.Equals(counters.acceleratedCommands, 2ull,
+                     "both exact linear draws should use Vulkan Verify");
+            t.Equals(counters.verifiedCommands, 2ull,
+                     "both routed linear draws should record verification");
             t.Equals(counters.softwareCommands, 0ull,
                      "the routed linear draw should not use fallback");
             t.Equals(counters.fallbackCommands, 0ull,
@@ -6885,27 +6902,27 @@ void register_ps2_gs_vulkan_tests()
             t.Equals(
                 counters.decisions[static_cast<size_t>(
                     GsFallbackReason::Supported)],
-                1ull,
-                "the router should retain the supported linear decision");
+                2ull,
+                "the router should retain both supported linear decisions");
 
             const GsVulkanRasterBackendStatistics backend =
                 accelerated.vulkanRendererBackendStatistics();
-            t.Equals(backend.commandsAttempted, 1ull,
-                     "the integrated backend should attempt the linear draw");
-            t.Equals(backend.commandsCompleted, 1ull,
-                     "the matching linear draw should complete once");
-            t.Equals(backend.verifiedCommands, 1ull,
-                     "the backend should compare the linear result");
+            t.Equals(backend.commandsAttempted, 2ull,
+                     "the integrated backend should attempt both linear draws");
+            t.Equals(backend.commandsCompleted, 2ull,
+                     "both matching linear draws should complete once");
+            t.Equals(backend.verifiedCommands, 2ull,
+                     "the backend should compare both linear results");
             t.Equals(backend.bytesCompared,
-                     static_cast<uint64_t>(GS_VULKAN_VRAM_SIZE),
-                     "linear Verify should compare the complete 4 MiB image");
+                     2ull * GS_VULKAN_VRAM_SIZE,
+                     "linear Verify should compare two complete VRAM images");
             t.Equals(backend.verificationMismatches, 0ull,
                      "the real linear kernel should have no byte mismatch");
 
             const GsVulkanServiceStatistics service =
                 accelerated.vulkanRendererServiceStatistics();
-            t.Equals(service.linearCt32SpriteDrawsCompleted, 1ull,
-                     "the service should execute the routed linear draw");
+            t.Equals(service.linearCt32SpriteDrawsCompleted, 2ull,
+                     "the service should execute repeat and clamp draws");
             t.Equals(service.linearCt32SpriteDrawsFailed, 0ull,
                      "the real linear request should not fail");
             t.Equals(
@@ -6913,7 +6930,13 @@ void register_ps2_gs_vulkan_tests()
                 static_cast<uint64_t>(
                     prepared.boundsX1 - prepared.boundsX0) *
                     static_cast<uint64_t>(
-                        prepared.boundsY1 - prepared.boundsY0),
+                        prepared.boundsY1 - prepared.boundsY0) +
+                    static_cast<uint64_t>(
+                        clampedPrepared.boundsX1 -
+                        clampedPrepared.boundsX0) *
+                    static_cast<uint64_t>(
+                        clampedPrepared.boundsY1 -
+                        clampedPrepared.boundsY0),
                 "the service should retain exact linear pixel accounting");
             t.Equals(service.nearestCt32SpriteDrawsCompleted, 0ull,
                      "linear routing must not alias the nearest request");
@@ -7476,21 +7499,33 @@ void register_ps2_gs_vulkan_tests()
                     {29176u, 36344u},
                     {0u, 512u},
                     {0u, 6656u});
+            const GsDrawCommand retainedClamp =
+                makeLinearCt32SpriteCommand(
+                    104u, 0u, 8u, 3584u, 8u, 10u, 10u,
+                    {0u, 511u, 0u, 447u},
+                    {28672u, 29184u},
+                    {28664u, 29176u},
+                    {29176u, 36344u},
+                    {0u, 512u},
+                    {0u, 6656u},
+                    1u, 1u);
             const auto makeSmall = [](uint64_t sequence,
-                                      uint32_t framebufferPage)
+                                      uint32_t framebufferPage,
+                                      uint8_t wrapU = 0u,
+                                      uint8_t wrapV = 0u)
             {
-                return makeLinearCt32RepeatSpriteCommand(
+                return makeLinearCt32SpriteCommand(
                     sequence, framebufferPage, 2u,
                     512u, 2u, 6u, 5u,
                     {3u, 12u, 2u, 13u}, {128u, 96u},
                     {120u, 376u}, {88u, 344u},
-                    {0u, 249u}, {0u, 137u});
+                    {0u, 249u}, {0u, 137u}, wrapU, wrapV);
             };
-            const GsDrawCommand smallA = makeSmall(104u, 40u);
-            const GsDrawCommand smallB = makeSmall(105u, 41u);
+            const GsDrawCommand smallA = makeSmall(105u, 40u);
+            const GsDrawCommand smallB = makeSmall(106u, 41u, 1u, 1u);
             for (const GsDrawCommand *command :
-                 std::array<const GsDrawCommand *, 3>{{
-                     &retained, &smallA, &smallB,
+                 std::array<const GsDrawCommand *, 4>{{
+                     &retained, &retainedClamp, &smallA, &smallB,
                  }})
             {
                 GsVulkanLinearCt32Sprite prepared{};
@@ -7579,8 +7614,8 @@ void register_ps2_gs_vulkan_tests()
                 return;
 
             const std::vector<uint8_t> beforeRetained = strictVram;
-            drawNearestCt32SpriteCommand(software, retained);
-            drawNearestCt32SpriteCommand(strict, retained);
+            drawNearestCt32SpriteCommand(software, retainedClamp);
+            drawNearestCt32SpriteCommand(strict, retainedClamp);
             t.IsTrue(strictVram == beforeRetained,
                      "the retained title draw should stay resident before presentation");
             software.latchHostPresentationFrame();
@@ -7667,7 +7702,7 @@ void register_ps2_gs_vulkan_tests()
             drawNearestCt32SpriteCommand(strict, retained);
             (void)software.getDebugSnapshot();
             (void)strict.getDebugSnapshot();
-            if (!compareFullVram("post-reset title draw"))
+            if (!compareFullVram("post-reset repeat title draw"))
                 return;
 
             const GsBackendCounters counters = strict.backendCounters();
