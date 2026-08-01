@@ -311,6 +311,54 @@ static_assert(offsetof(GsVulkanCt32Sprite, reserved) == 28u);
     const GsDrawCommand &command,
     GsVulkanCt32Sprite &sprite) noexcept;
 
+// Fixed record for exact flat CT32 color plus Z32/Z24 depth execution. The
+// depth method uses GS ZTST values (ALWAYS=1, GEQUAL=2, GREATER=3); depthWrite
+// is normalized from ZMASK. Z24 writes preserve the unrelated high byte.
+struct alignas(16) GsVulkanDepthCt32Sprite
+{
+    uint32_t framebufferBaseBlock = 0u;
+    uint32_t framebufferWidth = 0u;
+    uint32_t depthBaseBlock = 0u;
+    uint32_t depthPsm = 0u;
+    uint32_t boundsX0 = 0u;
+    uint32_t boundsY0 = 0u;
+    uint32_t boundsX1 = 0u;
+    uint32_t boundsY1 = 0u;
+    uint32_t rgba = 0u;
+    uint32_t depth = 0u;
+    uint32_t depthTestMethod = 0u;
+    uint32_t depthWrite = 0u;
+    uint32_t reserved0 = 0u;
+    uint32_t reserved1 = 0u;
+    uint32_t reserved2 = 0u;
+    uint32_t reserved3 = 0u;
+
+    bool operator==(const GsVulkanDepthCt32Sprite &) const = default;
+};
+
+static_assert(sizeof(GsVulkanDepthCt32Sprite) == 64u);
+static_assert(std::is_standard_layout_v<GsVulkanDepthCt32Sprite>);
+static_assert(std::is_trivially_copyable_v<GsVulkanDepthCt32Sprite>);
+static_assert(offsetof(GsVulkanDepthCt32Sprite, framebufferBaseBlock) == 0u);
+static_assert(offsetof(GsVulkanDepthCt32Sprite, framebufferWidth) == 4u);
+static_assert(offsetof(GsVulkanDepthCt32Sprite, depthBaseBlock) == 8u);
+static_assert(offsetof(GsVulkanDepthCt32Sprite, depthPsm) == 12u);
+static_assert(offsetof(GsVulkanDepthCt32Sprite, boundsX0) == 16u);
+static_assert(offsetof(GsVulkanDepthCt32Sprite, boundsY0) == 20u);
+static_assert(offsetof(GsVulkanDepthCt32Sprite, boundsX1) == 24u);
+static_assert(offsetof(GsVulkanDepthCt32Sprite, boundsY1) == 28u);
+static_assert(offsetof(GsVulkanDepthCt32Sprite, rgba) == 32u);
+static_assert(offsetof(GsVulkanDepthCt32Sprite, depth) == 36u);
+static_assert(offsetof(GsVulkanDepthCt32Sprite, depthTestMethod) == 40u);
+static_assert(offsetof(GsVulkanDepthCt32Sprite, depthWrite) == 44u);
+static_assert(offsetof(GsVulkanDepthCt32Sprite, reserved0) == 48u);
+static_assert(offsetof(GsVulkanDepthCt32Sprite, reserved3) == 60u);
+
+// Rejection leaves the caller's record untouched.
+[[nodiscard]] GsBackendDecision prepareGsVulkanDepthCt32Sprite(
+    const GsDrawCommand &command,
+    GsVulkanDepthCt32Sprite &sprite) noexcept;
+
 // Fixed record for Phase 6's first textured-sprite semantic slice. Texture
 // coordinates name the texel sampled at boundsX0/boundsY0 and advance by one
 // signed texel per output pixel. Power-of-two masks and packed per-axis wrap

@@ -775,6 +775,12 @@ namespace
         LinearCt32,
     };
 
+    enum class DepthRequirement : uint8_t
+    {
+        None,
+        Z32OrZ24,
+    };
+
     bool hasOneToOneIntegerTextureAxis(
         int32_t fixed0,
         int32_t fixed1,
@@ -818,11 +824,12 @@ namespace
         return logicalPageSpan < GS_VRAM_PAGE_COUNT;
     }
 
-    GsBackendDecision classifyFlatCt32NoDepth(
+    GsBackendDecision classifyFlatCt32State(
         const GsDrawCommand &command,
         GSPrimType expectedPrimitive,
         uint8_t expectedVertices,
-        TextureRequirement textureRequirement) noexcept
+        TextureRequirement textureRequirement,
+        DepthRequirement depthRequirement = DepthRequirement::None) noexcept
     {
         const GSPrimReg &primitive = command.primitive();
         const GSContext &context = command.context();
@@ -972,10 +979,36 @@ namespace
         const GsDrawResources resources = command.resources();
         if (resources.unknownMemoryLayout)
             return {false, GsFallbackReason::UnknownMemoryLayout};
-        if (resources.depthReadPages.any())
-            return {false, GsFallbackReason::DepthRead};
-        if (resources.depthWritePages.any())
-            return {false, GsFallbackReason::DepthWrite};
+        if (depthRequirement == DepthRequirement::None)
+        {
+            if (resources.depthReadPages.any())
+                return {false, GsFallbackReason::DepthRead};
+            if (resources.depthWritePages.any())
+                return {false, GsFallbackReason::DepthWrite};
+        }
+        else
+        {
+            if (context.zbuf.psm != GS_PSM_Z32 &&
+                context.zbuf.psm != GS_PSM_Z24)
+            {
+                return {false, GsFallbackReason::UnsupportedDepthFormat};
+            }
+            const bool depthTestEnabled =
+                ((context.test >> 16u) & 1u) != 0u;
+            const uint8_t depthTestMethod =
+                static_cast<uint8_t>((context.test >> 17u) & 0x3u);
+            if (!depthTestEnabled || depthTestMethod == 0u ||
+                (depthTestMethod == 1u && context.zbuf.zmask))
+            {
+                return {false, GsFallbackReason::UnsupportedDepthFunction};
+            }
+            if (!ct32RectangleHasUniqueWords(
+                    command.bounds(),
+                    std::max<uint32_t>(context.frame.fbw, 1u)))
+            {
+                return {false, GsFallbackReason::UnknownMemoryLayout};
+            }
+        }
         if (resources.readsDestination)
             return {false, GsFallbackReason::DestinationRead};
         if (resources.aliasesAnotherView())
@@ -987,15 +1020,24 @@ namespace
 GsBackendDecision classifyGsInitialCt32Sprite(
     const GsDrawCommand &command) noexcept
 {
-    return classifyFlatCt32NoDepth(
+    return classifyFlatCt32State(
         command, GS_PRIM_SPRITE, 2u,
         TextureRequirement::Disabled);
+}
+
+GsBackendDecision classifyGsDepthCt32Sprite(
+    const GsDrawCommand &command) noexcept
+{
+    return classifyFlatCt32State(
+        command, GS_PRIM_SPRITE, 2u,
+        TextureRequirement::Disabled,
+        DepthRequirement::Z32OrZ24);
 }
 
 GsBackendDecision classifyGsNearestCt32TexturedSprite(
     const GsDrawCommand &command) noexcept
 {
-    return classifyFlatCt32NoDepth(
+    return classifyFlatCt32State(
         command, GS_PRIM_SPRITE, 2u,
         TextureRequirement::NearestCt32);
 }
@@ -1003,7 +1045,7 @@ GsBackendDecision classifyGsNearestCt32TexturedSprite(
 GsBackendDecision classifyGsLinearCt32TexturedSprite(
     const GsDrawCommand &command) noexcept
 {
-    return classifyFlatCt32NoDepth(
+    return classifyFlatCt32State(
         command, GS_PRIM_SPRITE, 2u,
         TextureRequirement::LinearCt32);
 }
@@ -1011,7 +1053,7 @@ GsBackendDecision classifyGsLinearCt32TexturedSprite(
 GsBackendDecision classifyGsFlatCt32Triangle(
     const GsDrawCommand &command) noexcept
 {
-    return classifyFlatCt32NoDepth(
+    return classifyFlatCt32State(
         command, GS_PRIM_TRIANGLE, 3u,
         TextureRequirement::Disabled);
 }
@@ -1355,6 +1397,8 @@ std::string_view gsFallbackReasonName(GsFallbackReason reason) noexcept
     case GsFallbackReason::FramebufferAlphaCorrection: return "framebuffer-alpha-correction";
     case GsFallbackReason::Dither: return "dither";
     case GsFallbackReason::ScanMask: return "scan-mask";
+    case GsFallbackReason::UnsupportedDepthFormat: return "unsupported-depth-format";
+    case GsFallbackReason::UnsupportedDepthFunction: return "unsupported-depth-function";
     case GsFallbackReason::DepthRead: return "depth-read";
     case GsFallbackReason::DepthWrite: return "depth-write";
     case GsFallbackReason::DestinationRead: return "destination-read";

@@ -197,6 +197,8 @@ enum class GsFallbackReason : uint8_t
     FramebufferAlphaCorrection,
     Dither,
     ScanMask,
+    UnsupportedDepthFormat,
+    UnsupportedDepthFunction,
     DepthRead,
     DepthWrite,
     DestinationRead,
@@ -362,6 +364,12 @@ private:
 // Phase 3's deliberately narrow first GPU predicate. Keeping it as a pure
 // classifier makes the Phase 0 census and future backend use the same reason.
 [[nodiscard]] GsBackendDecision classifyGsInitialCt32Sprite(
+    const GsDrawCommand &command) noexcept;
+
+// Exact flat CT32 sprite subset with an enabled Z32/Z24 depth test. It keeps
+// packed Z24 read-modify-write dependencies explicit and rejects framebuffer /
+// depth aliases before a device record can be published.
+[[nodiscard]] GsBackendDecision classifyGsDepthCt32Sprite(
     const GsDrawCommand &command) noexcept;
 
 // Phase 6's first texture predicate deliberately covers only direct CT32

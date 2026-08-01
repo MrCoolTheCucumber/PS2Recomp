@@ -299,6 +299,50 @@ namespace
             GsDrawGlobalState{});
     }
 
+    GsDrawCommand makeDepthCt32SpriteCommand(
+        uint64_t sequence,
+        uint32_t framebufferPage,
+        uint8_t framebufferWidth,
+        uint32_t depthPage,
+        uint8_t depthPsm,
+        bool depthMask,
+        uint8_t depthTestMethod,
+        GSScissorReg scissor,
+        GSXYOffsetReg xyoffset,
+        uint16_t rawX0,
+        uint16_t rawY0,
+        uint16_t rawX1,
+        uint16_t rawY1,
+        uint32_t rgba,
+        uint32_t depth)
+    {
+        const GsDrawCommand flat = makeCt32SpriteCommand(
+            sequence,
+            framebufferPage,
+            framebufferWidth,
+            scissor,
+            xyoffset,
+            rawX0,
+            rawY0,
+            rawX1,
+            rawY1,
+            rgba);
+        GSContext context = flat.context();
+        context.zbuf = {depthPage, depthPsm, depthMask};
+        context.test =
+            (1ull << 16u) |
+            (static_cast<uint64_t>(depthTestMethod & 0x3u) << 17u);
+        std::array<GSVertex, 3> vertices = flat.vertices();
+        vertices[1].z = static_cast<double>(depth);
+        vertices[1].zInteger = depth;
+        return buildGsDrawCommand(
+            sequence,
+            flat.primitive(),
+            context,
+            std::span<const GSVertex>(vertices).first(2u),
+            flat.globalState());
+    }
+
     GsDrawCommand makeNearestCt32SpriteCommand(
         uint64_t sequence,
         uint32_t framebufferPage,
@@ -507,6 +551,61 @@ namespace
                     sprite.framebufferBaseBlock,
                     sprite.framebufferWidth,
                     x, y, sprite.rgba);
+            }
+        }
+    }
+
+    void applyDepthCt32SpriteCpu(
+        std::vector<uint8_t> &vram,
+        const GsVulkanDepthCt32Sprite &sprite)
+    {
+        const auto readDepth = [&](uint32_t x, uint32_t y)
+        {
+            return sprite.depthPsm == GS_PSM_Z24
+                ? GSMem::ReadZ24(
+                      vram.data(), sprite.depthBaseBlock,
+                      sprite.framebufferWidth, x, y)
+                : GSMem::ReadZ32(
+                      vram.data(), sprite.depthBaseBlock,
+                      sprite.framebufferWidth, x, y);
+        };
+        const auto writeDepth = [&](uint32_t x, uint32_t y)
+        {
+            if (sprite.depthPsm == GS_PSM_Z24)
+            {
+                GSMem::WriteZ24(
+                    vram.data(), sprite.depthBaseBlock,
+                    sprite.framebufferWidth, x, y, sprite.depth);
+            }
+            else
+            {
+                GSMem::WriteZ32(
+                    vram.data(), sprite.depthBaseBlock,
+                    sprite.framebufferWidth, x, y, sprite.depth);
+            }
+        };
+
+        for (uint32_t y = sprite.boundsY0; y < sprite.boundsY1; ++y)
+        {
+            for (uint32_t x = sprite.boundsX0; x < sprite.boundsX1; ++x)
+            {
+                const uint32_t currentDepth =
+                    sprite.depthTestMethod >= 2u ? readDepth(x, y) : 0u;
+                const bool passes =
+                    sprite.depthTestMethod == 1u ||
+                    (sprite.depthTestMethod == 2u &&
+                     sprite.depth >= currentDepth) ||
+                    (sprite.depthTestMethod == 3u &&
+                     sprite.depth > currentDepth);
+                if (!passes)
+                    continue;
+                GSMem::WriteCT32(
+                    vram.data(),
+                    sprite.framebufferBaseBlock,
+                    sprite.framebufferWidth,
+                    x, y, sprite.rgba);
+                if (sprite.depthWrite != 0u)
+                    writeDepth(x, y);
             }
         }
     }
@@ -1848,6 +1947,334 @@ void register_ps2_gs_vulkan_tests()
                      "degenerate endpoints should fail before any GPU submission");
             t.IsTrue(sprite == sentinel,
                      "degenerate preparation must preserve the caller's record");
+        });
+
+        tc.Run("depth CT32 sprite preparation publishes exact Z32 and Z24 state", [](TestCase &t)
+        {
+            const GsDrawCommand command = makeDepthCt32SpriteCommand(
+                20u,
+                511u,
+                0u,
+                200u,
+                GS_PSM_Z24,
+                false,
+                1u,
+                {4u, 15u, 3u, 12u},
+                {32u, 16u},
+                289u, 209u,
+                65u, 33u,
+                0xD4C3B2A1u,
+                0xFEDCBA98u);
+
+            GsVulkanDepthCt32Sprite sprite{
+                1u, 2u, 3u, 4u, 5u, 6u, 7u, 8u,
+                9u, 10u, 11u, 12u, 13u, 14u, 15u, 16u};
+            const GsBackendDecision decision =
+                prepareGsVulkanDepthCt32Sprite(command, sprite);
+            t.IsTrue(decision.supported,
+                     "an opaque CT32 sprite with an ALWAYS Z24 write should be eligible");
+            t.Equals(decision.reason, GsFallbackReason::Supported,
+                     "eligible depth preparation should retain the canonical reason");
+            t.Equals(sprite.framebufferBaseBlock, 0x3FE0u,
+                     "depth records should retain converted FRAME block units");
+            t.Equals(sprite.framebufferWidth, 1u,
+                     "zero FRAME width should use the software one-unit normalization");
+            t.Equals(sprite.depthBaseBlock, 6400u,
+                     "ZBUF page units should become 256-byte block units");
+            t.Equals(sprite.depthPsm, static_cast<uint32_t>(GS_PSM_Z24),
+                     "the record should retain packed Z24 format explicitly");
+            t.Equals(sprite.boundsX0, 4u,
+                     "depth records should retain the clipped inclusive X minimum");
+            t.Equals(sprite.boundsY0, 3u,
+                     "depth records should retain the clipped inclusive Y minimum");
+            t.Equals(sprite.boundsX1, 16u,
+                     "depth records should retain the exclusive X maximum");
+            t.Equals(sprite.boundsY1, 13u,
+                     "depth records should retain the exclusive Y maximum");
+            t.Equals(sprite.rgba, 0xD4C3B2A1u,
+                     "depth records should use the sprite provoking color");
+            t.Equals(sprite.depth, 0xFEDCBA98u,
+                     "depth records must use the exact integer XYZ payload");
+            t.Equals(sprite.depthTestMethod, 1u,
+                     "the GS ALWAYS method should remain explicit");
+            t.Equals(sprite.depthWrite, 1u,
+                     "an unmasked depth surface should remain writable");
+            t.Equals(sprite.reserved0 | sprite.reserved1 |
+                         sprite.reserved2 | sprite.reserved3,
+                     0u,
+                     "all reserved depth ABI words should be deterministic");
+            t.IsTrue(command.resources().depthReadPages.any(),
+                     "a packed Z24 write should retain its preservation read dependency");
+            t.IsTrue(command.resources().depthWritePages.any(),
+                     "an unmasked Z24 write should name its write pages");
+
+            const GsDrawCommand gequalReadOnly = makeDepthCt32SpriteCommand(
+                21u, 40u, 2u, 200u, GS_PSM_Z32, true, 2u,
+                {0u, 31u, 0u, 31u}, {0u, 0u},
+                16u, 16u, 272u, 272u,
+                0x88776655u, 0x80000000u);
+            t.IsTrue(
+                prepareGsVulkanDepthCt32Sprite(gequalReadOnly, sprite).supported,
+                "masked Z32 GEQUAL should remain a useful comparison-only class");
+            t.Equals(sprite.depthPsm, static_cast<uint32_t>(GS_PSM_Z32),
+                     "Z32 and Z24 should share one explicit prepared contract");
+            t.Equals(sprite.depthTestMethod, 2u,
+                     "GEQUAL should remain distinct from ALWAYS");
+            t.Equals(sprite.depthWrite, 0u,
+                     "ZMASK should suppress only the prepared depth write");
+
+            const GsVulkanDepthCt32Sprite sentinel = sprite;
+            const auto expectRejected = [&](const GsDrawCommand &rejected,
+                                            GsFallbackReason reason,
+                                            const char *message)
+            {
+                const GsBackendDecision rejectedDecision =
+                    prepareGsVulkanDepthCt32Sprite(rejected, sprite);
+                t.IsFalse(rejectedDecision.supported, message);
+                t.Equals(rejectedDecision.reason, reason,
+                         "depth rejection should retain its ordered reason");
+                t.IsTrue(sprite == sentinel,
+                         "rejected depth preparation must preserve the caller record");
+            };
+
+            expectRejected(
+                makeDepthCt32SpriteCommand(
+                    22u, 40u, 2u, 200u, GS_PSM_Z16, false, 1u,
+                    {0u, 31u, 0u, 31u}, {0u, 0u},
+                    16u, 16u, 272u, 272u,
+                    0x01020304u, 7u),
+                GsFallbackReason::UnsupportedDepthFormat,
+                "Z16 should remain outside the first depth record");
+            expectRejected(
+                makeDepthCt32SpriteCommand(
+                    23u, 40u, 2u, 200u, GS_PSM_Z32, false, 0u,
+                    {0u, 31u, 0u, 31u}, {0u, 0u},
+                    16u, 16u, 272u, 272u,
+                    0x01020304u, 7u),
+                GsFallbackReason::UnsupportedDepthFunction,
+                "ZTST NEVER should not publish a record that can write nothing");
+            GSContext disabledContext = gequalReadOnly.context();
+            disabledContext.test = 0u;
+            const GsDrawCommand disabled = buildGsDrawCommand(
+                24u,
+                gequalReadOnly.primitive(),
+                disabledContext,
+                std::span<const GSVertex>(gequalReadOnly.vertices()).first(2u),
+                gequalReadOnly.globalState());
+            expectRejected(
+                disabled,
+                GsFallbackReason::UnsupportedDepthFunction,
+                "disabled depth testing belongs to the established no-depth path");
+            expectRejected(
+                makeDepthCt32SpriteCommand(
+                    25u, 40u, 2u, 200u, GS_PSM_Z32, true, 1u,
+                    {0u, 31u, 0u, 31u}, {0u, 0u},
+                    16u, 16u, 272u, 272u,
+                    0x01020304u, 7u),
+                GsFallbackReason::UnsupportedDepthFunction,
+                "ALWAYS plus ZMASK belongs to the established no-depth class");
+            expectRejected(
+                makeDepthCt32SpriteCommand(
+                    26u, 40u, 2u, 40u, GS_PSM_Z32, false, 3u,
+                    {0u, 31u, 0u, 31u}, {0u, 0u},
+                    16u, 16u, 272u, 272u,
+                    0x01020304u, 7u),
+                GsFallbackReason::ResourceAlias,
+                "framebuffer/depth aliases should remain outside the independent kernel");
+        });
+
+        tc.Run("depth CT32 prepared record matches the production software GS", [](TestCase &t)
+        {
+            GSMem::InitLookupTables();
+            const std::array<GsDrawCommand, 4> commands{{
+                makeDepthCt32SpriteCommand(
+                    26u, 40u, 2u, 200u, GS_PSM_Z24, false, 1u,
+                    {3u, 30u, 2u, 25u}, {16u, 32u},
+                    49u, 65u, 449u, 353u,
+                    0x88776655u, 0xFEDCBA98u),
+                makeDepthCt32SpriteCommand(
+                    27u, 40u, 2u, 200u, GS_PSM_Z32, false, 1u,
+                    {3u, 30u, 2u, 25u}, {16u, 32u},
+                    449u, 353u, 49u, 65u,
+                    0x10203040u, 0x12345678u),
+                makeDepthCt32SpriteCommand(
+                    28u, 40u, 2u, 200u, GS_PSM_Z24, true, 2u,
+                    {3u, 30u, 2u, 25u}, {16u, 32u},
+                    49u, 65u, 449u, 353u,
+                    0xA1B2C3D4u, 0x007FFFFFu),
+                makeDepthCt32SpriteCommand(
+                    29u, 40u, 2u, 200u, GS_PSM_Z32, false, 3u,
+                    {3u, 30u, 2u, 25u}, {16u, 32u},
+                    49u, 65u, 449u, 353u,
+                    0x0A0B0C0Du, 0x80000000u),
+            }};
+
+            for (size_t index = 0u; index < commands.size(); ++index)
+            {
+                GsVulkanDepthCt32Sprite sprite{};
+                if (!prepareGsVulkanDepthCt32Sprite(
+                        commands[index], sprite).supported)
+                {
+                    t.Fail("the depth software-equivalence corpus should prepare");
+                    return;
+                }
+
+                std::vector<uint8_t> actual = makeVramPattern(
+                    0x5A170000u + static_cast<uint32_t>(index));
+                std::vector<uint8_t> expected = actual;
+                applyDepthCt32SpriteCpu(expected, sprite);
+
+                GS gs;
+                gs.init(
+                    actual.data(),
+                    static_cast<uint32_t>(actual.size()),
+                    nullptr);
+                gs.setDebugHistoryPaused(true);
+                drawNearestCt32SpriteCommand(gs, commands[index]);
+                gs.flushRenderBatch();
+
+                if (actual != expected)
+                {
+                    std::ostringstream message;
+                    message << "depth prepared record diverged from software case "
+                            << index;
+                    t.Fail(message.str());
+                    return;
+                }
+            }
+        });
+
+        tc.Run("depth CT32 record survives fixed-seed edge and transition corpus", [](TestCase &t)
+        {
+            GSMem::InitLookupTables();
+            std::vector<uint8_t> actual = makeVramPattern(0xD37A5EEDu);
+            std::vector<uint8_t> expected = actual;
+            GS gs;
+            gs.init(
+                actual.data(),
+                static_cast<uint32_t>(actual.size()),
+                nullptr);
+            gs.setDebugHistoryPaused(true);
+
+            uint32_t random = 0x5A24C732u;
+            constexpr size_t kCases = 4096u;
+            uint64_t candidatePixels = 0u;
+            size_t z24Cases = 0u;
+            size_t z32Cases = 0u;
+            std::array<size_t, 4> methods{};
+            size_t maskedComparisons = 0u;
+            for (size_t index = 0u; index < kCases; ++index)
+            {
+                const uint32_t bits = nextRandom(random);
+                const uint8_t depthPsm =
+                    (bits & 1u) != 0u ? GS_PSM_Z24 : GS_PSM_Z32;
+                const uint8_t method = static_cast<uint8_t>(1u +
+                    ((bits >> 1u) % 3u));
+                const bool depthMask =
+                    method >= 2u && ((bits >> 3u) & 1u) != 0u;
+                const uint8_t framebufferWidth = static_cast<uint8_t>(
+                    1u + ((bits >> 4u) % 4u));
+                const uint32_t framebufferPage =
+                    index % 97u == 0u ? 511u : (bits >> 7u) % 96u;
+                const uint32_t depthPage =
+                    index % 89u == 0u ? 255u : 256u + ((bits >> 14u) % 96u);
+
+                const uint32_t width = 1u + (nextRandom(random) % 17u);
+                const uint32_t height = 1u + (nextRandom(random) % 13u);
+                const uint32_t rawOriginX = (bits >> 21u) % 96u;
+                const uint32_t x0 = framebufferWidth == 1u
+                    ? rawOriginX % (64u - width)
+                    : rawOriginX;
+                const uint32_t y0 = (nextRandom(random) >> 23u) % 48u;
+                const uint32_t phaseX = nextRandom(random) & 0xFu;
+                const uint32_t phaseY = nextRandom(random) & 0xFu;
+                const uint32_t offsetX = nextRandom(random) & 0x3Fu;
+                const uint32_t offsetY = nextRandom(random) & 0x3Fu;
+                uint16_t rawX0 = static_cast<uint16_t>(
+                    x0 * 16u + phaseX + offsetX);
+                uint16_t rawY0 = static_cast<uint16_t>(
+                    y0 * 16u + phaseY + offsetY);
+                uint16_t rawX1 = static_cast<uint16_t>(
+                    (x0 + width) * 16u + phaseX + offsetX);
+                uint16_t rawY1 = static_cast<uint16_t>(
+                    (y0 + height) * 16u + phaseY + offsetY);
+                if ((nextRandom(random) & 1u) != 0u)
+                    std::swap(rawX0, rawX1);
+                if ((nextRandom(random) & 1u) != 0u)
+                    std::swap(rawY0, rawY1);
+
+                const uint32_t roundedX0 =
+                    x0 + (phaseX != 0u ? 1u : 0u);
+                const uint32_t roundedY0 =
+                    y0 + (phaseY != 0u ? 1u : 0u);
+                const uint32_t scissorInsetX = std::min(
+                    nextRandom(random) % 3u, width - 1u);
+                const uint32_t scissorInsetY = std::min(
+                    nextRandom(random) % 3u, height - 1u);
+                const GSScissorReg scissor{
+                    static_cast<uint16_t>(roundedX0 + scissorInsetX),
+                    static_cast<uint16_t>(roundedX0 + width - 1u),
+                    static_cast<uint16_t>(roundedY0 + scissorInsetY),
+                    static_cast<uint16_t>(roundedY0 + height - 1u),
+                };
+                const GsDrawCommand command = makeDepthCt32SpriteCommand(
+                    1000u + index,
+                    framebufferPage,
+                    framebufferWidth,
+                    depthPage,
+                    depthPsm,
+                    depthMask,
+                    method,
+                    scissor,
+                    {static_cast<uint16_t>(offsetX),
+                     static_cast<uint16_t>(offsetY)},
+                    rawX0,
+                    rawY0,
+                    rawX1,
+                    rawY1,
+                    nextRandom(random),
+                    nextRandom(random));
+                GsVulkanDepthCt32Sprite sprite{};
+                const GsBackendDecision decision =
+                    prepareGsVulkanDepthCt32Sprite(command, sprite);
+                if (!decision.supported)
+                {
+                    std::ostringstream message;
+                    message << "fixed-seed depth case " << index
+                            << " rejected as "
+                            << gsFallbackReasonName(decision.reason);
+                    t.Fail(message.str());
+                    return;
+                }
+
+                applyDepthCt32SpriteCpu(expected, sprite);
+                drawNearestCt32SpriteCommand(gs, command);
+                candidatePixels +=
+                    static_cast<uint64_t>(sprite.boundsX1 - sprite.boundsX0) *
+                    (sprite.boundsY1 - sprite.boundsY0);
+                ++methods[method];
+                if (depthMask)
+                    ++maskedComparisons;
+                if (depthPsm == GS_PSM_Z24)
+                    ++z24Cases;
+                else
+                    ++z32Cases;
+            }
+            gs.flushRenderBatch();
+
+            t.IsTrue(actual == expected,
+                     "all fixed-seed Z32/Z24 transitions should match the independent record oracle");
+            t.Equals(z24Cases + z32Cases, kCases,
+                     "the corpus should account every accepted depth format");
+            t.IsTrue(z24Cases > 1000u && z32Cases > 1000u,
+                     "both packed and full-word depth formats should have broad coverage");
+            t.IsTrue(methods[1] > 1000u && methods[2] > 1000u &&
+                         methods[3] > 1000u,
+                     "ALWAYS, GEQUAL, and GREATER should each have broad coverage");
+            t.IsTrue(maskedComparisons > 1000u,
+                     "comparison-only masked depth draws should be common in the corpus");
+            t.IsTrue(candidatePixels > 100'000u,
+                     "the edge corpus should execute substantial exact pixel work");
         });
 
         tc.Run("Nearest CT32 texture preparation publishes exact integer sampling", [](TestCase &t)
