@@ -941,6 +941,195 @@ void register_ps2_gs_tests()
                 "native packet decoding should not execute the packet suffix");
         });
 
+        tc.Run("GS replay state preserves partial primitive assembly", [](TestCase &t)
+        {
+            std::vector<uint8_t> originalVram(PS2_GS_VRAM_SIZE, 0u);
+            GS original;
+            original.init(
+                originalVram.data(),
+                static_cast<uint32_t>(originalVram.size()),
+                nullptr);
+            original.writeRegister(GS_REG_FRAME_1, 1ull << 16u);
+            original.writeRegister(GS_REG_ZBUF_1, 1ull << 32u);
+            original.writeRegister(
+                GS_REG_SCISSOR_1,
+                (15ull << 16u) | (15ull << 48u));
+            original.writeRegister(GS_REG_TEST_1, 0x30000ull);
+            original.writeRegister(
+                GS_REG_PRIM,
+                static_cast<uint64_t>(GS_PRIM_TRISTRIP));
+            original.writeRegister(GS_REG_RGBAQ, 0x80443322ull);
+            original.writeRegister(
+                GS_REG_XYZ2,
+                16ull | (16ull << 16u));
+            original.writeRegister(
+                GS_REG_XYZ2,
+                192ull | (16ull << 16u));
+
+            const GsReplayState captured =
+                original.captureReplayState();
+            t.Equals(captured.vertexCount, 2,
+                     "two strip vertices should remain pending at the boundary");
+
+            std::vector<uint8_t> encoded;
+            std::string stateError;
+            t.IsTrue(
+                encodeGsReplayState(captured, encoded, &stateError),
+                "the synchronized frontend state should encode");
+            GsReplayState decoded{};
+            t.IsTrue(
+                decodeGsReplayState(encoded, decoded, &stateError),
+                "the encoded frontend state should decode");
+            std::vector<uint8_t> canonical;
+            t.IsTrue(
+                encodeGsReplayState(decoded, canonical, &stateError),
+                "decoded frontend state should re-encode");
+            t.IsTrue(encoded == canonical,
+                     "GS replay state encoding should be canonical");
+            if (!encoded.empty())
+            {
+                std::vector<uint8_t> truncated = encoded;
+                truncated.pop_back();
+                GsReplayState rejected{};
+                t.IsFalse(
+                    decodeGsReplayState(
+                        truncated, rejected, &stateError),
+                    "truncated GS replay state should fail closed");
+            }
+
+            std::vector<uint8_t> packet;
+            appendU64(packet, makeGifTag(1u, GIF_FMT_PACKED, 1u));
+            appendU64(packet, 0x0Eull);
+            appendGifAd(
+                packet,
+                16ull | (192ull << 16u),
+                GS_REG_XYZ2);
+
+            const std::vector<uint8_t> initialVram = originalVram;
+            original.processGIFPacket(
+                packet.data(),
+                static_cast<uint32_t>(packet.size()));
+            t.Equals(original.submittedDrawCommandCount(), 1ull,
+                     "the third strip vertex should complete one command");
+            t.IsFalse(originalVram == initialVram,
+                      "the completed strip should mutate the framebuffer");
+
+            std::vector<uint8_t> replayVram = initialVram;
+            GS replay;
+            replay.init(
+                replayVram.data(),
+                static_cast<uint32_t>(replayVram.size()),
+                nullptr);
+            t.IsTrue(replay.restoreReplayState(decoded),
+                     "the decoded frontend state should restore");
+            replay.processGIFPacket(
+                packet.data(),
+                static_cast<uint32_t>(packet.size()));
+            t.Equals(replay.submittedDrawCommandCount(), 1ull,
+                     "restored strip assembly should complete one command");
+            t.IsTrue(replayVram == originalVram,
+                     "restored partial assembly should reproduce all VRAM bytes");
+
+            GsReplayState invalidFeedback = captured;
+            invalidFeedback.rasterizer.feedbackSnapshotValid = true;
+            invalidFeedback.rasterizer.feedbackVram.assign(1u, 0u);
+            t.IsFalse(
+                encodeGsReplayState(
+                    invalidFeedback, canonical, &stateError),
+                "partial feedback snapshots should fail closed");
+            t.IsTrue(canonical.empty(),
+                     "a failed state encoding should not leave stale bytes");
+            invalidFeedback.rasterizer.feedbackSnapshotValid = false;
+            t.IsFalse(
+                encodeGsReplayState(
+                    invalidFeedback, canonical, &stateError),
+                "inactive feedback snapshots should not carry stale VRAM");
+
+            GsReplayState invalidFrontend = captured;
+            invalidFrontend.vertexCount =
+                static_cast<int32_t>(
+                    GS_REPLAY_VERTEX_QUEUE_CAPACITY + 1u);
+            t.IsFalse(
+                encodeGsReplayState(
+                    invalidFrontend, canonical, &stateError),
+                "oversized primitive assembly should fail closed");
+            invalidFrontend = captured;
+            invalidFrontend.prim.type =
+                static_cast<GSPrimType>(0xFFu);
+            t.IsFalse(
+                encodeGsReplayState(
+                    invalidFrontend, canonical, &stateError),
+                "invalid primitive types should fail closed");
+        });
+
+        tc.Run("GS replay state resumes partial host-to-local transfers", [](TestCase &t)
+        {
+            std::vector<uint8_t> originalVram(PS2_GS_VRAM_SIZE, 0u);
+            GS original;
+            original.init(
+                originalVram.data(),
+                static_cast<uint32_t>(originalVram.size()),
+                nullptr);
+
+            original.writeRegister(
+                GS_REG_BITBLTBUF,
+                1ull << 48u); // DBW=1, DPSM=CT32.
+            original.writeRegister(GS_REG_TRXPOS, 0ull);
+            original.writeRegister(
+                GS_REG_TRXREG,
+                4ull | (1ull << 32u));
+            original.writeRegister(GS_REG_TRXDIR, 0ull);
+
+            constexpr uint32_t kPixel0 = 0x80112233u;
+            constexpr uint32_t kPixel1 = 0x80445566u;
+            constexpr uint32_t kPixel2 = 0x80778899u;
+            constexpr uint32_t kPixel3 = 0x80AABBCCu;
+            original.writeRegister(
+                GS_REG_HWREG,
+                static_cast<uint64_t>(kPixel0) |
+                    (static_cast<uint64_t>(kPixel1) << 32u));
+
+            const GsReplayState captured =
+                original.captureReplayState();
+            t.Equals(captured.transfer.copiedPixels, 2u,
+                     "the capture should retain transfer progress");
+            const std::vector<uint8_t> initialVram = originalVram;
+
+            std::vector<uint8_t> packet;
+            appendU64(packet, makeGifTag(1u, GIF_FMT_PACKED, 1u));
+            appendU64(packet, 0x0Eull);
+            appendGifAd(
+                packet,
+                static_cast<uint64_t>(kPixel2) |
+                    (static_cast<uint64_t>(kPixel3) << 32u),
+                GS_REG_HWREG);
+            original.processGIFPacket(
+                packet.data(),
+                static_cast<uint32_t>(packet.size()));
+
+            std::vector<uint8_t> replayVram = initialVram;
+            GS replay;
+            replay.init(
+                replayVram.data(),
+                static_cast<uint32_t>(replayVram.size()),
+                nullptr);
+            t.IsTrue(replay.restoreReplayState(captured),
+                     "the partial transfer state should restore");
+            replay.processGIFPacket(
+                packet.data(),
+                static_cast<uint32_t>(packet.size()));
+            t.IsTrue(replayVram == originalVram,
+                     "restored transfer progress should reproduce all VRAM bytes");
+            t.Equals(
+                replay.ReadVram(GS_PSM_CT32, 0u, 1u, 2u, 0u),
+                kPixel2,
+                "the resumed transfer should continue at the third pixel");
+            t.Equals(
+                replay.ReadVram(GS_PSM_CT32, 0u, 1u, 3u, 0u),
+                kPixel3,
+                "the resumed transfer should complete at the fourth pixel");
+        });
+
         tc.Run("GS CSR/IMR support coherent 64-bit and 32-bit access", [](TestCase &t)
         {
             PS2Memory mem;
@@ -4503,6 +4692,26 @@ void register_ps2_gs_tests()
             gs.writeRegister(GS_REG_UV, 16ull);
             gs.writeRegister(GS_REG_XYZ2, 32ull | (16ull << 16));
 
+            const GsReplayState captured = gs.captureReplayState();
+            t.IsTrue(captured.rasterizer.feedbackSnapshotValid,
+                     "the first recursive draw should retain its source snapshot");
+            t.Equals(
+                captured.rasterizer.feedbackVram.size(),
+                PS2_GS_VRAM_SIZE,
+                "a recursive replay boundary should retain all feedback VRAM");
+            const std::vector<uint8_t> replayInitialVram = vram;
+            std::vector<uint8_t> encodedState;
+            std::string stateError;
+            t.IsTrue(
+                encodeGsReplayState(
+                    captured, encodedState, &stateError),
+                "recursive feedback state should encode");
+            GsReplayState decodedState{};
+            t.IsTrue(
+                decodeGsReplayState(
+                    encodedState, decodedState, &stateError),
+                "recursive feedback state should decode");
+
             // Then copy original texel 1 to texel 2. Recursive drawing reads
             // through the texture cache, so this must not observe the first
             // draw's framebuffer write.
@@ -4511,12 +4720,31 @@ void register_ps2_gs_tests()
             gs.writeRegister(GS_REG_UV, 32ull);
             gs.writeRegister(GS_REG_XYZ2, 48ull | (16ull << 16));
 
+            std::vector<uint8_t> replayVram = replayInitialVram;
+            GS replay;
+            replay.init(
+                replayVram.data(),
+                static_cast<uint32_t>(replayVram.size()),
+                nullptr);
+            t.IsTrue(
+                replay.restoreReplayState(decodedState),
+                "recursive feedback state should restore");
+            replay.writeRegister(GS_REG_UV, 16ull);
+            replay.writeRegister(GS_REG_XYZ2, 32ull);
+            replay.writeRegister(GS_REG_UV, 32ull);
+            replay.writeRegister(
+                GS_REG_XYZ2,
+                48ull | (16ull << 16));
+
             t.Equals(gs.ReadVram(GS_PSM_CT32, 0u, 1u, 1u, 0u),
                      kOriginal0,
                      "the first recursive sprite should update its destination");
             t.Equals(gs.ReadVram(GS_PSM_CT32, 0u, 1u, 2u, 0u),
                      kOriginal1,
                      "a consecutive recursive sprite should sample the cached pre-draw surface");
+            t.IsTrue(
+                replayVram == vram,
+                "restored feedback state should reproduce every GS VRAM byte");
         });
 
         tc.Run("GS render batches match sequential overlapping triangle draws", [](TestCase &t)

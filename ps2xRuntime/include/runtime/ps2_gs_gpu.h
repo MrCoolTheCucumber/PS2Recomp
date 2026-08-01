@@ -13,6 +13,7 @@
 
 #include "ps2_gs_types.h"
 #include "ps2_gs_rasterizer.h"
+#include "ps2_gs_replay.h"
 #include "ps2_gs_memory.h"
 
 struct GSDebugSnapshot
@@ -154,7 +155,10 @@ public:
                               std::vector<uint8_t> &outStream,
                               std::vector<uint32_t> &outSizes,
                               std::vector<uint8_t> &outInitialVram,
-                              GSDebugSnapshot *outInitialState) const;
+                              GsReplayState *outInitialState) const;
+    [[nodiscard]] GsReplayState captureReplayState() const;
+    [[nodiscard]] bool restoreReplayState(
+        const GsReplayState &state);
     void clearDebugHistory();
     bool isDebugHistoryPaused() const;
     void setDebugHistoryPaused(bool paused);
@@ -212,6 +216,7 @@ private:
     void recordPresentDebugEventUnlocked(uint32_t displayFbp, uint32_t sourceFbp, uint32_t width, uint32_t height, bool usedPreferred);
 
     void processImageData(const uint8_t *data, uint32_t sizeBytes);
+    [[nodiscard]] GsReplayState captureReplayStateUnlocked() const;
     bool tryProcessNativeImageUploadPacket(const uint8_t *data, uint32_t sizeBytes);
     void performLocalToLocalTransfer();
     void performLocalToHostToBuffer();
@@ -271,6 +276,8 @@ private:
     } m_transferState;
 
     static constexpr int kMaxVerts = 6;
+    static_assert(
+        kMaxVerts == static_cast<int>(GS_REPLAY_VERTEX_QUEUE_CAPACITY));
     GSVertex m_vtxQueue[kMaxVerts];
     int m_vtxCount = 0;
     int m_vtxIndex = 0;
@@ -310,7 +317,7 @@ private:
     std::deque<std::vector<uint8_t>> m_debugGifPackets;
     size_t m_debugGifPacketBytes = 0;
     std::vector<uint8_t> m_debugGifInitialVram;
-    GSDebugSnapshot m_debugGifInitialState{};
+    GsReplayState m_debugGifInitialState{};
     size_t m_debugHistoryWrite = 0;
     size_t m_debugHistoryCount = 0;
     uint64_t m_debugNextSeq = 1;

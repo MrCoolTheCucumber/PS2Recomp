@@ -2,6 +2,7 @@
 #define PS2_GS_RASTERIZER_H
 
 #include "runtime/ps2_gs_backend.h"
+#include "runtime/ps2_gs_replay.h"
 
 #include <array>
 #include <cstddef>
@@ -31,6 +32,10 @@ public:
     void setBackendCountersEnabled(bool enabled) noexcept;
     [[nodiscard]] GsBackendCounters backendCounters() const noexcept;
     void resetBackendCounters() noexcept;
+    [[nodiscard]] GsReplayRasterizerState captureReplayState() const;
+    [[nodiscard]] bool restoreReplayState(
+        const GsReplayRasterizerState &state,
+        uint32_t vramSize);
     void writePixel(GS *gs,
                     int x,
                     int y,

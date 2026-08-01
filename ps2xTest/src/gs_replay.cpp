@@ -5,11 +5,13 @@
 #include <cstdlib>
 #include <cstring>
 #include <cstdint>
+#include <filesystem>
 #include <fstream>
 #include <iomanip>
 #include <iostream>
 #include <limits>
 #include <string>
+#include <string_view>
 #include <utility>
 #include <vector>
 
@@ -52,6 +54,7 @@ namespace
         std::cerr
             << "usage: gs_replay [--vram-in FILE] [--vram-out FILE] "
                "[--register ADDRESS=VALUE] [--register-file FILE] "
+               "[--state-in FILE] "
                "[--packet-sizes FILE] [--hash-trace FILE] "
                "[--renderer software|hybrid|verify|gpu-strict] "
                "[--backend-stats] [--stop-after-command COUNT] "
@@ -244,7 +247,8 @@ namespace
 
     bool readRegisterFile(
         const std::string &path,
-        std::vector<std::pair<uint8_t, uint64_t>> &assignments)
+        std::vector<std::pair<uint8_t, uint64_t>> &assignments,
+        std::string &statePath)
     {
         std::ifstream input(path);
         if (!input)
@@ -263,11 +267,29 @@ namespace
             if (first == std::string::npos)
                 continue;
             const size_t last = line.find_last_not_of(" \t\r");
+            const std::string content =
+                line.substr(first, last - first + 1u);
+
+            constexpr std::string_view statePrefix = "@state-file=";
+            if (content.starts_with(statePrefix))
+            {
+                const std::string value =
+                    content.substr(statePrefix.size());
+                if (value.empty() || !statePath.empty())
+                    return false;
+                std::filesystem::path resolved(value);
+                if (resolved.is_relative())
+                {
+                    resolved =
+                        std::filesystem::path(path).parent_path() /
+                        resolved;
+                }
+                statePath = resolved.lexically_normal().string();
+                continue;
+            }
 
             std::pair<uint8_t, uint64_t> assignment{};
-            if (!parseRegisterAssignment(
-                    line.substr(first, last - first + 1u),
-                    assignment))
+            if (!parseRegisterAssignment(content, assignment))
             {
                 return false;
             }
@@ -284,6 +306,8 @@ int main(int argc, char **argv)
     std::string packetSizesPath;
     std::string hashTracePath;
     std::string compareVramPath;
+    std::string explicitStatePath;
+    std::string registerStatePath;
     bool batchStream = false;
     bool backendStats = false;
     bool commandLimitSet = false;
@@ -291,7 +315,8 @@ int main(int argc, char **argv)
     uint64_t commandLimit = 0u;
     uint64_t packetLimit = 0u;
     GsRendererMode rendererMode = GsRendererMode::Software;
-    std::vector<std::pair<uint8_t, uint64_t>> initialRegisters;
+    std::vector<std::pair<uint8_t, uint64_t>> fileRegisters;
+    std::vector<std::pair<uint8_t, uint64_t>> overrideRegisters;
     std::vector<std::string> packetPaths;
     for (int index = 1; index < argc; ++index)
     {
@@ -308,6 +333,7 @@ int main(int argc, char **argv)
             argument == "--vram-out" ||
             argument == "--register" ||
             argument == "--register-file" ||
+            argument == "--state-in" ||
             argument == "--packet-sizes" ||
             argument == "--hash-trace" ||
             argument == "--renderer" ||
@@ -329,6 +355,8 @@ int main(int argc, char **argv)
                 packetSizesPath = argv[index];
             else if (argument == "--hash-trace")
                 hashTracePath = argv[index];
+            else if (argument == "--state-in")
+                explicitStatePath = argv[index];
             else if (argument == "--compare-vram")
                 compareVramPath = argv[index];
             else if (argument == "--renderer")
@@ -362,7 +390,10 @@ int main(int argc, char **argv)
             }
             else if (argument == "--register-file")
             {
-                if (!readRegisterFile(argv[index], initialRegisters))
+                if (!readRegisterFile(
+                        argv[index],
+                        fileRegisters,
+                        registerStatePath))
                 {
                     std::cerr << "failed to read register file: "
                               << argv[index] << '\n';
@@ -378,7 +409,7 @@ int main(int argc, char **argv)
                               << argv[index] << '\n';
                     return 2;
                 }
-                initialRegisters.push_back(assignment);
+                overrideRegisters.push_back(assignment);
             }
         }
         else if (argument == "--help" || argument == "-h")
@@ -421,6 +452,31 @@ int main(int argc, char **argv)
         }
     }
 
+    const std::string statePath = explicitStatePath.empty()
+        ? registerStatePath
+        : explicitStatePath;
+    GsReplayState replayState{};
+    bool replayStateLoaded = false;
+    if (!statePath.empty())
+    {
+        std::vector<uint8_t> encodedState;
+        if (!readFile(statePath, encodedState))
+        {
+            std::cerr << "failed to read initial GS replay state: "
+                      << statePath << '\n';
+            return 2;
+        }
+        std::string stateError;
+        if (!decodeGsReplayState(
+                encodedState, replayState, &stateError))
+        {
+            std::cerr << "failed to decode initial GS replay state: "
+                      << stateError << '\n';
+            return 2;
+        }
+        replayStateLoaded = true;
+    }
+
     PS2Memory memory;
     if (!memory.initialize())
     {
@@ -459,7 +515,21 @@ int main(int argc, char **argv)
                     initialVram.size());
     }
 
-    for (const auto &[address, value] : initialRegisters)
+    if (replayStateLoaded)
+    {
+        if (!gs.restoreReplayState(replayState))
+        {
+            std::cerr << "initial GS replay state is incompatible "
+                         "with this runtime\n";
+            return 2;
+        }
+    }
+    else
+    {
+        for (const auto &[address, value] : fileRegisters)
+            gs.writeRegister(address, value);
+    }
+    for (const auto &[address, value] : overrideRegisters)
         gs.writeRegister(address, value);
 
     if (backendStats)
@@ -623,6 +693,8 @@ int main(int argc, char **argv)
               << "\",\"packets\":" << packetIndex
               << ",\"bytes\":" << totalBytes
               << ",\"commands\":" << gs.submittedDrawCommandCount()
+              << ",\"state_restored\":"
+              << (replayStateLoaded ? "true" : "false")
               << ",\"stopped\":" << (stopped ? "true" : "false")
               << ",\"stop_reason\":\"" << stopReason << '\"'
               << ",\"stopped_within_packet\":"

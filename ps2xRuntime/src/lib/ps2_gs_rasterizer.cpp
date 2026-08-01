@@ -2590,6 +2590,73 @@ void GSRasterizer::resetBackendCounters() noexcept
     m_backendState->router.resetCounters();
 }
 
+GsReplayRasterizerState GSRasterizer::captureReplayState() const
+{
+    GsReplayRasterizerState state{};
+    state.feedbackTextureBase = m_feedbackTextureBase;
+    state.feedbackFrameBase = m_feedbackFrameBase;
+    state.feedbackTexturePsm = m_feedbackTexturePsm;
+    state.feedbackFramePsm = m_feedbackFramePsm;
+    state.feedbackTextureWidth = m_feedbackTextureWidth;
+    state.feedbackFrameWidth = m_feedbackFrameWidth;
+    state.feedbackSnapshotValid = m_feedbackSnapshotValid;
+    if (m_feedbackSnapshotValid)
+        state.feedbackVram = m_textureSnapshot;
+    state.decodedClut = m_decodedClut;
+    state.decodedClutGeneration = m_decodedClutGeneration;
+    state.decodedClutTexa = m_decodedClutTexa;
+    state.decodedClutSourcePsm = m_decodedClutSourcePsm;
+    state.decodedClutCsm = m_decodedClutCsm;
+    state.decodedClutCsa = m_decodedClutCsa;
+    state.decodedClutActive = m_decodedClutActive;
+    return state;
+}
+
+bool GSRasterizer::restoreReplayState(
+    const GsReplayRasterizerState &state,
+    uint32_t vramSize)
+{
+    if (state.feedbackSnapshotValid &&
+        state.feedbackVram.size() != vramSize)
+    {
+        return false;
+    }
+    if (!state.feedbackSnapshotValid && !state.feedbackVram.empty())
+        return false;
+
+    m_textureSnapshot = state.feedbackVram;
+    m_textureReadVram = nullptr;
+    m_feedbackTextureBase = state.feedbackTextureBase;
+    m_feedbackFrameBase = state.feedbackFrameBase;
+    m_feedbackTexturePsm = state.feedbackTexturePsm;
+    m_feedbackFramePsm = state.feedbackFramePsm;
+    m_feedbackTextureWidth = state.feedbackTextureWidth;
+    m_feedbackFrameWidth = state.feedbackFrameWidth;
+    m_feedbackSnapshotValid = state.feedbackSnapshotValid;
+    m_decodedClut = state.decodedClut;
+    m_decodedClutGeneration = state.decodedClutGeneration;
+    m_decodedClutTexa = state.decodedClutTexa;
+    m_decodedClutSourcePsm = state.decodedClutSourcePsm;
+    m_decodedClutCsm = state.decodedClutCsm;
+    m_decodedClutCsa = state.decodedClutCsa;
+    m_decodedClutActive = state.decodedClutActive;
+    m_queuedPaletteSerial = UINT64_MAX;
+    m_queuedFixedVerticesValid = false;
+
+    if (m_parallelState)
+    {
+        m_parallelState->commands.clear();
+        m_parallelState->palettes.clear();
+        for (auto &commands : m_parallelState->workerCommands)
+            commands.clear();
+        m_parallelState->batchActive = false;
+        m_parallelState->primaryGs = nullptr;
+        m_parallelState->eligibilityCacheValid = false;
+        m_parallelState->outputGroupValid = false;
+    }
+    return true;
+}
+
 void GSRasterizer::renderSoftwarePrimitive(
     GS *gs,
     const GsDrawCommand &command)

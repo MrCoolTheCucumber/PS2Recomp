@@ -526,6 +526,12 @@ void register_ps2_debug_control_tests()
                     static_cast<uint32_t>(PS2_GS_VRAM_SIZE),
                     &memory.gs());
             gs.setDebugHistoryPaused(false);
+            gs.writeRegister(
+                GS_REG_PRIM,
+                static_cast<uint64_t>(GS_PRIM_TRISTRIP));
+            gs.writeRegister(GS_REG_RGBAQ, 0x80776655ull);
+            gs.writeRegister(GS_REG_XYZ2, 16ull | (16ull << 16u));
+            gs.writeRegister(GS_REG_XYZ2, 32ull | (16ull << 16u));
 
             std::array<uint8_t, 16> packet{};
             packet[1] = 0x80u; // GIF EOP with NLOOP=0.
@@ -535,7 +541,7 @@ void register_ps2_debug_control_tests()
             std::vector<uint8_t> stream;
             std::vector<uint32_t> sizes;
             std::vector<uint8_t> initialVram;
-            GSDebugSnapshot initialState{};
+            GsReplayState initialState{};
             gs.copyRecentGifPackets(
                 8u, stream, sizes, initialVram, &initialState);
             t.Equals(sizes.size(), static_cast<size_t>(1u),
@@ -550,6 +556,25 @@ void register_ps2_debug_control_tests()
             t.IsTrue(stream == std::vector<uint8_t>(
                                    packet.begin(), packet.end()),
                      "the replay stream should preserve packet bytes");
+            t.Equals(initialVram.size(), PS2_GS_VRAM_SIZE,
+                     "the packet boundary should retain all initial GS VRAM");
+            t.Equals(initialState.vertexCount, 2,
+                     "the packet boundary should retain partial primitive assembly");
+            t.Equals(initialState.currentR, static_cast<uint8_t>(0x55u),
+                     "the packet boundary should retain current vertex attributes");
+            std::vector<uint8_t> encodedState;
+            std::string stateError;
+            t.IsTrue(
+                encodeGsReplayState(
+                    initialState, encodedState, &stateError),
+                "the debugger's retained state should be serializable");
+            GsReplayState decodedState{};
+            t.IsTrue(
+                decodeGsReplayState(
+                    encodedState, decodedState, &stateError),
+                "the debugger's retained state should be self-contained");
+            t.Equals(decodedState.vertexCount, 2,
+                     "serialized debugger state should retain pending vertices");
 
             gs.clearDebugHistory();
             gs.copyRecentGifPackets(

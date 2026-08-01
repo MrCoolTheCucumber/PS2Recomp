@@ -782,6 +782,169 @@ GSDebugSnapshot GS::getDebugSnapshot() const
     return snapshot;
 }
 
+GsReplayState GS::captureReplayStateUnlocked() const
+{
+    GsReplayState state{};
+    state.ctx[0] = m_ctx[0];
+    state.ctx[1] = m_ctx[1];
+    state.prim = m_prim;
+    state.currentR = m_curR;
+    state.currentG = m_curG;
+    state.currentB = m_curB;
+    state.currentA = m_curA;
+    state.currentQ = m_curQ;
+    state.currentS = m_curS;
+    state.currentT = m_curT;
+    state.currentU = m_curU;
+    state.currentV = m_curV;
+    state.currentFog = m_curFog;
+    state.fogColor = m_fogColor;
+    state.prmodecont = m_prmodecont;
+    state.pabe = m_pabe;
+    state.scanMask = m_scanMask;
+    state.dimx = m_dimx;
+    state.dither = m_dither;
+    state.colorClamp = m_colorClamp;
+    state.texa = m_texa;
+    state.texclut = m_texclut;
+    std::copy_n(
+        m_clutCache,
+        state.clutCache.size(),
+        state.clutCache.begin());
+    std::copy_n(
+        m_clutCacheFormat,
+        state.clutCacheFormat.size(),
+        state.clutCacheFormat.begin());
+    for (size_t index = 0u;
+         index < state.clutCacheValid.size();
+         ++index)
+    {
+        state.clutCacheValid[index] =
+            m_clutCacheValid[index] ? 1u : 0u;
+    }
+    std::copy_n(m_clutCbp, state.clutCbp.size(), state.clutCbp.begin());
+    state.clutCacheGeneration = m_clutCacheGeneration;
+    state.bitbltbuf = m_bitbltbuf;
+    state.trxpos = m_trxpos;
+    state.trxreg = m_trxreg;
+    state.trxdir = m_trxdir;
+    state.transfer = {
+        m_transferState.x,
+        m_transferState.y,
+        m_transferState.total_pixels,
+        m_transferState.copied_pixels,
+    };
+    std::copy_n(
+        m_vtxQueue,
+        state.vertexQueue.size(),
+        state.vertexQueue.begin());
+    state.vertexCount = m_vtxCount;
+    state.rasterizer = m_rasterizer.captureReplayState();
+    return state;
+}
+
+GsReplayState GS::captureReplayState() const
+{
+    std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
+    flushForObservation(GsFlushReason::SaveLoad);
+    return captureReplayStateUnlocked();
+}
+
+bool GS::restoreReplayState(const GsReplayState &state)
+{
+    std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
+    if (static_cast<uint32_t>(state.prim.type) >
+            static_cast<uint32_t>(GS_PRIM_SPRITE) ||
+        state.vertexCount < 0 ||
+        state.vertexCount >
+            static_cast<int32_t>(GS_REPLAY_VERTEX_QUEUE_CAPACITY) ||
+        state.trxdir > 3u || state.scanMask > 3u)
+    {
+        return false;
+    }
+    for (uint8_t valid : state.clutCacheValid)
+    {
+        if (valid > 1u)
+            return false;
+    }
+    if (state.rasterizer.feedbackSnapshotValid &&
+        state.rasterizer.feedbackVram.size() != m_vramSize)
+    {
+        return false;
+    }
+    if (!state.rasterizer.feedbackSnapshotValid &&
+        !state.rasterizer.feedbackVram.empty())
+    {
+        return false;
+    }
+
+    m_rasterizer.flushDrawBatch(this, GsFlushReason::SaveLoad);
+    m_ctx[0] = state.ctx[0];
+    m_ctx[1] = state.ctx[1];
+    m_prim = state.prim;
+    m_curR = state.currentR;
+    m_curG = state.currentG;
+    m_curB = state.currentB;
+    m_curA = state.currentA;
+    m_curQ = state.currentQ;
+    m_curS = state.currentS;
+    m_curT = state.currentT;
+    m_curU = state.currentU;
+    m_curV = state.currentV;
+    m_curFog = state.currentFog;
+    m_fogColor = state.fogColor;
+    m_prmodecont = state.prmodecont;
+    m_pabe = state.pabe;
+    m_scanMask = state.scanMask;
+    m_dimx = state.dimx;
+    m_dither = state.dither;
+    m_colorClamp = state.colorClamp;
+    m_texa = state.texa;
+    m_texclut = state.texclut;
+    std::copy(
+        state.clutCache.begin(),
+        state.clutCache.end(),
+        m_clutCache);
+    std::copy(
+        state.clutCacheFormat.begin(),
+        state.clutCacheFormat.end(),
+        m_clutCacheFormat);
+    for (size_t index = 0u;
+         index < state.clutCacheValid.size();
+         ++index)
+    {
+        m_clutCacheValid[index] =
+            state.clutCacheValid[index] != 0u;
+    }
+    std::copy(state.clutCbp.begin(), state.clutCbp.end(), m_clutCbp);
+    m_clutCacheGeneration = state.clutCacheGeneration;
+    m_bitbltbuf = state.bitbltbuf;
+    m_trxpos = state.trxpos;
+    m_trxreg = state.trxreg;
+    m_trxdir = state.trxdir;
+    m_transferState = {
+        state.transfer.x,
+        state.transfer.y,
+        state.transfer.totalPixels,
+        state.transfer.copiedPixels,
+    };
+    std::copy(
+        state.vertexQueue.begin(),
+        state.vertexQueue.end(),
+        m_vtxQueue);
+    m_vtxCount = state.vertexCount;
+    // This counter is diagnostic-only; restart it rather than serializing
+    // state which cannot influence subsequent GS output.
+    m_vtxIndex = 0;
+    m_nextDrawSequence = 1u;
+    m_drawCommandLimit = UINT64_MAX;
+    m_drawCommandLimitReached = false;
+    m_localToHostBuffer.clear();
+    m_localToHostReadPos = 0u;
+    return m_rasterizer.restoreReplayState(
+        state.rasterizer, m_vramSize);
+}
+
 GSProgressSnapshot GS::getProgressSnapshot() const
 {
     GSProgressSnapshot snapshot{};
@@ -827,7 +990,7 @@ void GS::copyRecentGifPackets(size_t limit,
                               std::vector<uint8_t> &outStream,
                               std::vector<uint32_t> &outSizes,
                               std::vector<uint8_t> &outInitialVram,
-                              GSDebugSnapshot *outInitialState) const
+                              GsReplayState *outInitialState) const
 {
     std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
     flushForObservation(GsFlushReason::DebuggerObservation);
@@ -1604,8 +1767,12 @@ void GS::processGIFPacket(const uint8_t *data, uint32_t sizeBytes)
         {
             m_debugGifPackets.clear();
             m_debugGifPacketBytes = 0u;
+            // Make the state and VRAM one atomic synchronized boundary. The
+            // runtime may have an outer GIF-drain batch active here.
+            m_rasterizer.flushDrawBatch(
+                this, GsFlushReason::DebuggerObservation);
             m_debugGifInitialVram.assign(m_vram, m_vram + m_vramSize);
-            m_debugGifInitialState = getDebugSnapshot();
+            m_debugGifInitialState = captureReplayStateUnlocked();
         }
         m_debugGifPackets.emplace_back(data, data + sizeBytes);
         m_debugGifPacketBytes += sizeBytes;

@@ -16,6 +16,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <bit>
 #include <chrono>
 #include <cctype>
 #include <cerrno>
@@ -3457,9 +3458,13 @@ struct PS2DebugServer::Impl
         addArtifact(artifacts, path, "events", allocator);
     }
 
-    std::string gsReplayRegisterFile(const GSDebugSnapshot &snapshot)
+    std::string gsReplayRegisterFile(
+        const GsReplayState &snapshot,
+        std::string_view stateFile)
     {
         std::ostringstream output;
+        if (!stateFile.empty())
+            output << "@state-file=" << stateFile << '\n';
         const auto append = [&output](uint8_t address, uint64_t value)
         {
             output << "0x" << std::hex << std::setw(2)
@@ -3532,6 +3537,10 @@ struct PS2DebugServer::Impl
                 (static_cast<uint64_t>(snapshot.texa.ta1) << 32u));
         append(GS_REG_FOGCOL, snapshot.fogColor);
         append(GS_REG_PABE, snapshot.pabe ? 1u : 0u);
+        append(GS_REG_SCANMSK, snapshot.scanMask);
+        append(GS_REG_DIMX, snapshot.dimx);
+        append(GS_REG_DTHE, snapshot.dither ? 1u : 0u);
+        append(GS_REG_COLCLAMP, snapshot.colorClamp ? 1u : 0u);
         for (uint32_t index = 0u; index < 2u; ++index)
         {
             const GSContext &context = snapshot.ctx[index];
@@ -3593,6 +3602,29 @@ struct PS2DebugServer::Impl
                 (static_cast<uint64_t>(snapshot.trxreg.rrh) << 32u));
         append(GS_REG_TRXDIR, snapshot.trxdir);
         append(GS_REG_PRIM, packPrim(snapshot.prim));
+        append(
+            GS_REG_RGBAQ,
+            static_cast<uint64_t>(snapshot.currentR) |
+                (static_cast<uint64_t>(snapshot.currentG) << 8u) |
+                (static_cast<uint64_t>(snapshot.currentB) << 16u) |
+                (static_cast<uint64_t>(snapshot.currentA) << 24u) |
+                (static_cast<uint64_t>(
+                     std::bit_cast<uint32_t>(snapshot.currentQ))
+                 << 32u));
+        append(
+            GS_REG_ST,
+            static_cast<uint64_t>(
+                std::bit_cast<uint32_t>(snapshot.currentS)) |
+                (static_cast<uint64_t>(
+                     std::bit_cast<uint32_t>(snapshot.currentT))
+                 << 32u));
+        append(
+            GS_REG_UV,
+            static_cast<uint64_t>(snapshot.currentU) |
+                (static_cast<uint64_t>(snapshot.currentV) << 16u));
+        append(
+            GS_REG_FOG,
+            static_cast<uint64_t>(snapshot.currentFog) << 56u);
         return output.str();
     }
 
@@ -3604,7 +3636,7 @@ struct PS2DebugServer::Impl
         std::vector<uint8_t> stream;
         std::vector<uint32_t> sizes;
         std::vector<uint8_t> initialVram;
-        GSDebugSnapshot initialState{};
+        GsReplayState initialState{};
         runtime.gs().copyRecentGifPackets(
             static_cast<size_t>(std::min<uint64_t>(
                 historyLimit, std::numeric_limits<size_t>::max())),
@@ -3634,8 +3666,28 @@ struct PS2DebugServer::Impl
             writeBytes(vramPath, initialVram.data(), initialVram.size());
             addArtifact(artifacts, vramPath, "initial-vram", allocator);
 
+            std::vector<uint8_t> stateBytes;
+            std::string stateError;
+            if (!encodeGsReplayState(
+                    initialState, stateBytes, &stateError))
+            {
+                throw std::runtime_error(
+                    "failed to encode initial GS replay state: " +
+                    stateError);
+            }
+            const auto statePath = root / "initial-gs-state.bin";
+            writeBytes(
+                statePath, stateBytes.data(), stateBytes.size());
+            addArtifact(
+                artifacts,
+                statePath,
+                "initial-gs-state",
+                allocator);
+
             const std::string registers =
-                gsReplayRegisterFile(initialState);
+                gsReplayRegisterFile(
+                    initialState,
+                    statePath.filename().string());
             const auto registersPath =
                 root / "initial-gs-registers.txt";
             writeBytes(
