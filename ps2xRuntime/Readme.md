@@ -10,6 +10,17 @@ The runtime library provides the execution environment for recompiled code, incl
 
 Take your decompiled code and place the cpp files on ps2xRuntime/src/runner and header files on ps2xRuntime/include and compile/be happy.
 
+The desktop runner accepts an optional GS renderer mode before or after the
+guest paths:
+
+```sh
+ps2EntryRunner --renderer hybrid GAME.ELF DISC.iso
+```
+
+Available modes are `software`, `hybrid`, `verify`, and `gpu-strict`.
+Accelerated modes fail at startup with a capability diagnostic when the
+optional Vulkan backend is unavailable.
+
 ## Vita Build Notes
 
 The Vita runtime uses `Quenom/raylib-5.5-vita` for vita build. I recommend build runtime only.

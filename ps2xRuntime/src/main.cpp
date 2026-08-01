@@ -14,6 +14,8 @@
 #include <exception>
 #include <algorithm>
 #include <cstdlib>
+#include <stdexcept>
+#include <vector>
 
 #if defined(__ANDROID__)
 #include <android/log.h>
@@ -109,12 +111,85 @@ namespace
         return result;
     }
 
-    std::filesystem::path getExecutablePath(int argc, char *argv[])
+    bool parseRendererMode(
+        const std::string &text,
+        GsRendererMode &mode)
     {
-        if (argc >= 2 && argv[1] && argv[1][0] != '\0')
+        if (text == "software")
+            mode = GsRendererMode::Software;
+        else if (text == "hybrid")
+            mode = GsRendererMode::Hybrid;
+        else if (text == "verify")
+            mode = GsRendererMode::Verify;
+        else if (text == "gpu-strict")
+            mode = GsRendererMode::GpuStrict;
+        else
+            return false;
+        return true;
+    }
+
+    void printUsage(const char *program)
+    {
+        std::cout
+            << "Usage: " << program
+            << " [--renderer software|hybrid|verify|gpu-strict]"
+               " [ELF [CD_IMAGE]]\n";
+    }
+
+    struct RunnerOptions
+    {
+        bool showHelp = false;
+        GsRendererMode rendererMode = GsRendererMode::Software;
+        std::vector<std::filesystem::path> positionalPaths;
+    };
+
+    RunnerOptions parseRunnerOptions(int argc, char *argv[])
+    {
+        RunnerOptions options{};
+        bool optionsEnded = false;
+        for (int i = 1; i < argc; ++i)
+        {
+            const std::string argument = argv[i] ? argv[i] : "";
+            if (!optionsEnded && (argument == "--help" || argument == "-h"))
+            {
+                options.showHelp = true;
+                continue;
+            }
+            if (!optionsEnded && argument == "--")
+            {
+                optionsEnded = true;
+                continue;
+            }
+            if (!optionsEnded && argument == "--renderer")
+            {
+                if (++i >= argc || !argv[i] ||
+                    !parseRendererMode(argv[i], options.rendererMode))
+                {
+                    throw std::invalid_argument(
+                        "--renderer requires software, hybrid, verify, or gpu-strict");
+                }
+                continue;
+            }
+            if (!optionsEnded && !argument.empty() && argument[0] == '-')
+            {
+                throw std::invalid_argument("unknown option: " + argument);
+            }
+            options.positionalPaths.emplace_back(argument);
+        }
+        if (options.positionalPaths.size() > 2u)
+        {
+            throw std::invalid_argument(
+                "expected at most an ELF and optional CD image path");
+        }
+        return options;
+    }
+
+    std::filesystem::path getExecutablePath(const RunnerOptions &options)
+    {
+        if (!options.positionalPaths.empty())
         {
             std::cout << "Using argv boot path" << std::endl;
-            return std::filesystem::path(argv[1]);
+            return options.positionalPaths[0];
         }
 #if defined(PS2X_DEFAULT_BOOT_ELF)
         std::cout << "Using default boot file" << std::endl;
@@ -134,16 +209,15 @@ namespace
 
     void configureOptionalCdImage(
         PS2Runtime &runtime,
-        int argc,
-        char *argv[])
+        const RunnerOptions &options)
     {
-        if (argc < 3 || !argv[2] || argv[2][0] == '\0')
+        if (options.positionalPaths.size() < 2u)
         {
             return;
         }
 
         PS2Runtime::IoPaths ioPaths = runtime.ioPaths();
-        ioPaths.cdImage = std::filesystem::path(argv[2]);
+        ioPaths.cdImage = options.positionalPaths[1];
         runtime.configureIoPaths(ioPaths);
         std::cout << "Using argv CD image path: "
                   << runtime.ioPaths().cdImage << std::endl;
@@ -159,7 +233,14 @@ int main(int argc, char *argv[])
 
     try
     {
-        std::filesystem::path pathObj = getExecutablePath(argc, argv);
+        const RunnerOptions options = parseRunnerOptions(argc, argv);
+        if (options.showHelp)
+        {
+            printUsage(argc > 0 && argv[0] ? argv[0] : "ps2EntryRunner");
+            return 0;
+        }
+
+        std::filesystem::path pathObj = getExecutablePath(options);
 
         std::string filePathStr = pathObj.string();
         std::string elfName = pathObj.filename().string();
@@ -180,7 +261,7 @@ int main(int argc, char *argv[])
         }
 
         PS2Runtime runtime;
-        configureOptionalCdImage(runtime, argc, argv);
+        configureOptionalCdImage(runtime, options);
 #if defined(PS2X_ENABLE_DEBUG_UI) && !defined(PLATFORM_VITA)
         // This hook is to prevent leak rlimgui deps to recompiler etc
         PS2DebugPanel debugPanel;
@@ -206,6 +287,18 @@ int main(int argc, char *argv[])
             std::cerr << "Failed to initialize PS2 runtime" << std::endl;
             return 1;
         }
+        if (!runtime.gs().setRendererMode(options.rendererMode))
+        {
+            std::cerr
+                << "Failed to select GS renderer '"
+                << gsRendererModeName(options.rendererMode) << "': "
+                << runtime.gs().rendererDiagnostic() << std::endl;
+            return 1;
+        }
+        std::cout
+            << "GS renderer: "
+            << gsRendererModeName(runtime.gs().rendererMode())
+            << std::endl;
 
         if (!runtime.loadELF(filePathStr))
         {
