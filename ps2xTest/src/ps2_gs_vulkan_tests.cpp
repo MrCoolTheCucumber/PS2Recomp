@@ -891,6 +891,7 @@ namespace
             Exact,
             Noop,
             Fail,
+            FailResidentDraw,
             InvalidOutput,
         };
 
@@ -1103,6 +1104,7 @@ namespace
             std::string *error) override
         {
             if (!isHealthy || behavior == Behavior::Fail ||
+                behavior == Behavior::FailResidentDraw ||
                 behavior == Behavior::InvalidOutput ||
                 sprites.empty() ||
                 sprites.size() > GS_VULKAN_MAX_RESIDENT_SPRITE_BATCH)
@@ -1152,6 +1154,7 @@ namespace
             std::string *error) override
         {
             if (!isHealthy || behavior == Behavior::Fail ||
+                behavior == Behavior::FailResidentDraw ||
                 behavior == Behavior::InvalidOutput ||
                 sprites.empty() ||
                 sprites.size() >
@@ -1213,6 +1216,7 @@ namespace
             std::string *error) override
         {
             if (!isHealthy || behavior == Behavior::Fail ||
+                behavior == Behavior::FailResidentDraw ||
                 behavior == Behavior::InvalidOutput ||
                 triangles.empty() ||
                 triangles.size() >
@@ -1336,6 +1340,9 @@ void register_ps2_gs_vulkan_tests()
                      "memory conformance batches should have a fixed host bound");
             t.Equals(GS_VULKAN_MAX_RESIDENT_SPRITE_BATCH, size_t{64u},
                      "resident sprite batches should have a fixed host bound");
+            t.Equals(GS_VULKAN_MAX_RESIDENT_NEAREST_CT32_BATCH,
+                     GS_VULKAN_MAX_RESIDENT_SPRITE_BATCH,
+                     "resident texture batches should share the bounded sprite limit");
             t.Equals(GS_VULKAN_MAX_RESIDENT_TRIANGLE_BATCH,
                      GS_VRAM_PAGE_COUNT,
                      "disjoint triangle batches cannot exceed physical pages");
@@ -2241,14 +2248,25 @@ void register_ps2_gs_vulkan_tests()
             backend->noteCpuVramWrite(allPages);
             backend->submit(
                 std::span<const GsDrawCommand>(&command, 1u));
-            t.IsTrue(vram == expected,
-                     "strict should publish the complete exact GPU image");
+            t.IsTrue(vram == initial,
+                     "strict texture queueing should leave canonical VRAM untouched");
             t.Equals(softwareCalls, 1ull,
                      "strict texture execution must not call the software oracle");
+            t.Equals(commitCalls, 0ull,
+                     "queued strict textures should not publish commit metadata early");
+            t.Equals(backend->pendingCommandCount(), size_t{1u},
+                     "strict textures should enter the bounded resident queue");
+            const GsDrawResources resources = command.resources();
+            GsVramPageMask strictAccessPages = resources.readPages;
+            strictAccessPages.unionWith(resources.writePages);
+            backend->prepareCpuVramAccess(
+                resources.writePages, GsFlushReason::CpuReadback);
+            t.IsTrue(vram == expected,
+                     "an overlapping CPU observation should publish the exact texture result");
             t.Equals(commitCalls, 1ull,
-                     "strict texture execution should publish one commit callback");
+                     "drained strict texture execution should publish one commit callback");
             t.Equals(backend->pendingCommandCount(), size_t{0u},
-                     "strict textures should remain synchronous until resident qualification");
+                     "the observation boundary should drain resident texture work");
             const GsVulkanRasterBackendStatistics strictStatistics =
                 backend->backendStatistics();
             t.Equals(strictStatistics.commandsAttempted, 2ull,
@@ -2259,19 +2277,30 @@ void register_ps2_gs_vulkan_tests()
                      "strict should not increment verification accounting");
             t.Equals(strictStatistics.committedGpuCommands, 1ull,
                      "strict should commit the GPU result exactly once");
-            t.Equals(strictStatistics.residentCommands, 0ull,
-                     "strict should not claim resident texture execution");
+            t.Equals(strictStatistics.residentCommands, 1ull,
+                     "strict should count the drained resident texture once");
             t.Equals(strictStatistics.pageOwnership.cpuNewerPages,
-                     size_t{0u},
-                     "the complete strict upload should consume CPU-newer pages");
+                     GS_VRAM_PAGE_COUNT - strictAccessPages.count(),
+                     "resident strict should upload only conservative texture access pages");
             t.Equals(strictStatistics.pageOwnership.gpuNewerPages,
                      size_t{0u},
-                     "synchronous strict publication should leave no stale CPU page");
+                     "the scoped observation should publish the texture destination");
+            const GsVulkanServiceStatistics strictServiceStatistics =
+                backend->serviceStatistics();
+            t.Equals(
+                strictServiceStatistics.nearestCt32SpriteDrawsCompleted,
+                2ull,
+                "Verify and resident strict should each execute one texture draw");
+            t.Equals(
+                strictServiceStatistics
+                    .residentNearestCt32SpriteBatchesCompleted,
+                1ull,
+                "strict should execute one resident texture batch");
             t.IsTrue(backend->setMode(GsRendererMode::Hybrid),
                      "the synchronized backend should accept Hybrid mode");
             t.Equals(backend->classify(command).reason,
                      GsFallbackReason::Textured,
-                     "Hybrid should remain closed until resident texture qualification");
+                     "Hybrid should remain closed until texture cost qualification");
 
             std::vector<uint8_t> unavailableVram = initial;
             std::unique_ptr<GsVulkanRasterBackend> unavailable =
@@ -2305,7 +2334,7 @@ void register_ps2_gs_vulkan_tests()
             std::unique_ptr<GsVulkanRasterBackend> failing =
                 GsVulkanRasterBackend::createWithExecutor(
                     std::make_unique<FakeCt32Executor>(
-                        FakeCt32Executor::Behavior::Fail),
+                        FakeCt32Executor::Behavior::FailResidentDraw),
                     GsVulkanRasterBackendConfig{
                         GsRendererMode::GpuStrict, {}},
                     failureVram,
@@ -2319,10 +2348,13 @@ void register_ps2_gs_vulkan_tests()
             bool executionThrew = false;
             if (failing)
             {
+                failing->submit(
+                    std::span<const GsDrawCommand>(&command, 1u));
+                t.Equals(failing->pendingCommandCount(), size_t{1u},
+                         "a failing resident texture should first enter the queue");
                 try
                 {
-                    failing->submit(
-                        std::span<const GsDrawCommand>(&command, 1u));
+                    failing->flush(GsFlushReason::Explicit);
                 }
                 catch (const std::runtime_error &error)
                 {
@@ -2335,6 +2367,11 @@ void register_ps2_gs_vulkan_tests()
                     failing->backendStatistics().gpuRequestsFailed,
                     1ull,
                     "strict texture execution failure should be counted once");
+                t.Equals(
+                    failing->serviceStatistics()
+                        .residentNearestCt32SpriteBatchesFailed,
+                    1ull,
+                    "the deferred texture failure should count one resident batch");
             }
             t.IsTrue(executionThrew,
                      "strict texture failure should identify its atomic boundary");
@@ -2342,6 +2379,171 @@ void register_ps2_gs_vulkan_tests()
                      "strict texture failure must preserve canonical VRAM");
             t.Equals(failedSoftwareCalls, 0ull,
                      "strict texture failure must not invoke software fallback");
+        });
+
+        tc.Run("Vulkan strict texture queue shares reads and splits dependencies", [](TestCase &t)
+        {
+            GSMem::InitLookupTables();
+            const auto makeTexture =
+                [](uint64_t sequence,
+                   uint32_t framebufferPage,
+                   uint32_t texturePage)
+            {
+                return makeNearestCt32SpriteCommand(
+                    sequence, framebufferPage, 2u,
+                    texturePage * 32u, 2u, 6u, 5u,
+                    {0u, 31u, 0u, 31u}, {0u, 0u},
+                    {0u, 8u * 16u}, {0u, 8u * 16u},
+                    {0u, 8u * 16u}, {0u, 8u * 16u});
+            };
+            const std::array<GsDrawCommand, 5> commands{{
+                makeTexture(44u, 40u, 2u),
+                makeTexture(45u, 41u, 2u),
+                makeTexture(46u, 42u, 40u),
+                makeTexture(47u, 40u, 60u),
+                makeTexture(48u, 40u, 61u),
+            }};
+
+            std::vector<uint8_t> vram = makeVramPattern(0x54515231u);
+            const std::vector<uint8_t> initial = vram;
+            std::vector<uint8_t> expected = initial;
+            for (size_t index = 0u; index < commands.size(); ++index)
+            {
+                GsVulkanNearestCt32Sprite prepared{};
+                const GsBackendDecision decision =
+                    prepareGsVulkanNearestCt32Sprite(
+                        commands[index], prepared);
+                if (!decision.supported)
+                {
+                    t.Fail(
+                        "strict texture dependency fixture " +
+                        std::to_string(index) + " was rejected as " +
+                        std::string(gsFallbackReasonName(decision.reason)));
+                    return;
+                }
+                const GsDrawResources resources =
+                    commands[index].resources();
+                t.Equals(resources.readPages.count(), size_t{1u},
+                         "each dependency fixture should read one physical page");
+                t.Equals(resources.writePages.count(), size_t{1u},
+                         "each dependency fixture should write one physical page");
+                t.IsFalse(
+                    resources.readPages.intersects(resources.writePages),
+                    "each dependency fixture must be individually non-aliasing");
+                applyNearestCt32SpriteCpu(expected, prepared);
+            }
+
+            uint64_t softwareCalls = 0u;
+            uint64_t commitCalls = 0u;
+            GsVulkanRasterBackendConfig config{};
+            config.mode = GsRendererMode::GpuStrict;
+            std::unique_ptr<GsVulkanRasterBackend> backend =
+                GsVulkanRasterBackend::createWithExecutor(
+                    std::make_unique<FakeCt32Executor>(
+                        FakeCt32Executor::Behavior::Exact),
+                    config, vram,
+                    [&](const GsDrawCommand &) { ++softwareCalls; },
+                    [&](const GsDrawCommand &) { ++commitCalls; },
+                    nullptr);
+            t.IsNotNull(backend.get(),
+                        "an exact executor should create strict texture residency");
+            if (!backend)
+                return;
+
+            backend->submit(
+                std::span<const GsDrawCommand>(&commands[0], 1u));
+            backend->submit(
+                std::span<const GsDrawCommand>(&commands[1], 1u));
+            t.Equals(backend->pendingCommandCount(), size_t{2u},
+                     "two shared-source reads should remain in one resident batch");
+            t.Equals(commitCalls, 0ull,
+                     "shared-read queueing should not execute the batch early");
+
+            backend->submit(
+                std::span<const GsDrawCommand>(&commands[2], 1u));
+            t.Equals(commitCalls, 2ull,
+                     "a write-then-read dependency should drain the shared prefix");
+            t.Equals(backend->pendingCommandCount(), size_t{1u},
+                     "the dependent reader should begin a new batch");
+
+            backend->submit(
+                std::span<const GsDrawCommand>(&commands[3], 1u));
+            t.Equals(commitCalls, 3ull,
+                     "a read-then-write dependency should drain its reader");
+            t.Equals(backend->pendingCommandCount(), size_t{1u},
+                     "the dependent writer should begin a new batch");
+
+            backend->submit(
+                std::span<const GsDrawCommand>(&commands[4], 1u));
+            t.Equals(commitCalls, 4ull,
+                     "a write/write dependency should drain the earlier writer");
+            t.Equals(backend->pendingCommandCount(), size_t{1u},
+                     "the final writer should remain pending");
+            t.IsTrue(vram == initial,
+                     "dependency drains should retain every result on resident VRAM");
+            t.Equals(softwareCalls, 0ull,
+                     "strict texture dependencies must not invoke software fallback");
+
+            GsVulkanRasterBackendStatistics statistics =
+                backend->backendStatistics();
+            t.Equals(statistics.resourceHazardDrains, 3ull,
+                     "all three unordered dependency directions should drain once");
+            t.Equals(statistics.pipelineChangeDrains, 0ull,
+                     "homogeneous texture dependencies are not pipeline changes");
+            t.Equals(statistics.residentBatchesCompleted, 3ull,
+                     "three dependency drains should complete three prefixes");
+            t.Equals(statistics.largestResidentBatch, 2ull,
+                     "the shared-read prefix should establish the peak batch size");
+
+            backend->flush(GsFlushReason::Explicit);
+            t.Equals(commitCalls, 5ull,
+                     "the explicit boundary should execute the final writer");
+            t.Equals(backend->pendingCommandCount(), size_t{0u},
+                     "the explicit boundary should empty the texture queue");
+            GsVramPageMask allPages;
+            allPages.setAll();
+            backend->prepareCpuVramAccess(
+                allPages, GsFlushReason::DebuggerObservation);
+            t.IsTrue(vram == expected,
+                     "hazard-split resident textures should match sequential CPU execution");
+
+            statistics = backend->backendStatistics();
+            t.Equals(statistics.commandsAttempted, 5ull,
+                     "every texture dependency fixture should be attempted once");
+            t.Equals(statistics.commandsCompleted, 5ull,
+                     "every texture dependency fixture should complete once");
+            t.Equals(statistics.committedGpuCommands, 5ull,
+                     "every drained texture should publish one commit");
+            t.Equals(statistics.residentCommands, 5ull,
+                     "all dependency fixtures should use resident execution");
+            t.Equals(statistics.residentBatchesCompleted, 4ull,
+                     "the three hazard prefixes and final tail should form four batches");
+            t.Equals(statistics.pageOwnership.gpuNewerPages, size_t{0u},
+                     "the final observation should publish every texture writer");
+            t.Equals(statistics.coherency.rejectedTransitions, 0ull,
+                     "hazard splitting should preserve single-writer ownership");
+
+            const GsVulkanServiceStatistics service =
+                backend->serviceStatistics();
+            t.Equals(service.nearestCt32SpriteDrawsCompleted, 5ull,
+                     "the service should execute every resident texture once");
+            t.Equals(service.residentNearestCt32SpriteBatchesCompleted,
+                     4ull,
+                     "the service should receive each hazard-split texture batch");
+            t.Equals(service.largestResidentNearestCt32SpriteBatch, 2ull,
+                     "the service should retain the shared-read prefix size");
+            t.Equals(service.pageUploadOperationsCompleted, 4ull,
+                     "each resident texture batch should upload its CPU-newer inputs");
+            t.Equals(service.pagesUploaded, 6ull,
+                     "texture residency should upload only first-use source and destination pages");
+            t.Equals(service.pageDownloadOperationsCompleted, 1ull,
+                     "one final observation should download resident texture outputs");
+            t.Equals(service.pagesDownloaded, 3ull,
+                     "only the three distinct texture destinations should download");
+            t.Equals(service.spriteDrawsCompleted, 0ull,
+                     "resident textures must not alias flat-sprite accounting");
+            t.Equals(service.triangleDrawsCompleted, 0ull,
+                     "resident textures must not alias triangle accounting");
         });
 
         tc.Run("Vulkan raster backend routes exact triangles behind capability", [](TestCase &t)
@@ -4363,8 +4565,8 @@ void register_ps2_gs_vulkan_tests()
                      "every strict GPU command should complete once");
             t.Equals(backend.committedGpuCommands, 48ull,
                      "every strict geometry and texture draw should commit once");
-            t.Equals(backend.residentCommands, 40ull,
-                     "only the established geometry classes should claim residency");
+            t.Equals(backend.residentCommands, 48ull,
+                     "every qualified strict class should use resident execution");
             t.Equals(backend.pageOwnership.gpuNewerPages,
                      static_cast<size_t>(0u),
                      "the final observation should publish every strict writer");
@@ -4392,6 +4594,13 @@ void register_ps2_gs_vulkan_tests()
                 "the randomized stream should retain exact texture pixel accounting");
             t.IsTrue(service.residentTriangleBatchesCompleted > 0ull,
                      "strict triangles should use the resident triangle service");
+            t.Equals(
+                service.residentNearestCt32SpriteBatchesCompleted,
+                8ull,
+                "every shuffled strict texture should use a resident batch");
+            t.Equals(service.largestResidentNearestCt32SpriteBatch,
+                     1ull,
+                     "repeated texture destinations should remain dependency-split");
             t.IsTrue(service.largestResidentTriangleBatch >= 2ull,
                      "the explicit triangle pairs should share a resident batch");
             t.IsTrue(service.pageUploadOperationsCompleted > 0ull,
@@ -4798,16 +5007,27 @@ void register_ps2_gs_vulkan_tests()
                 {6u, 15u, 5u, 12u}, {32u, 16u},
                 {352u, 96u}, {48u, 304u},
                 {480u, 224u}, {64u, 320u});
+            const GsDrawCommand secondCommand =
+                makeNearestCt32SpriteCommand(
+                    96u, 41u, 2u, 64u, 2u, 6u, 5u,
+                    {6u, 15u, 5u, 12u}, {32u, 16u},
+                    {352u, 96u}, {48u, 304u},
+                    {480u, 224u}, {64u, 320u});
             GsVulkanNearestCt32Sprite prepared{};
+            GsVulkanNearestCt32Sprite secondPrepared{};
             t.IsTrue(
                 prepareGsVulkanNearestCt32Sprite(
                     command, prepared).supported,
                 "the strict frontend fixture should satisfy the texture predicate");
+            t.IsTrue(
+                prepareGsVulkanNearestCt32Sprite(
+                    secondCommand, secondPrepared).supported,
+                "the shared-source strict fixture should satisfy the texture predicate");
 
             GSContext filteredContext = command.context();
             filteredContext.tex1 |= 1ull << 5u;
             const GsDrawCommand filtered = buildGsDrawCommand(
-                96u, command.primitive(), filteredContext,
+                97u, command.primitive(), filteredContext,
                 std::span<const GSVertex>(
                     command.vertices().data(), command.vertexCount()),
                 command.globalState());
@@ -4863,10 +5083,12 @@ void register_ps2_gs_vulkan_tests()
 
             drawNearestCt32SpriteCommand(software, command);
             drawNearestCt32SpriteCommand(strict, command);
+            drawNearestCt32SpriteCommand(software, secondCommand);
+            drawNearestCt32SpriteCommand(strict, secondCommand);
             (void)software.getDebugSnapshot();
             (void)strict.getDebugSnapshot();
             t.IsTrue(strictVram == softwareVram,
-                     "strict texture routing should match complete software VRAM");
+                     "shared-read strict texture batching should match complete software VRAM");
 
             const std::vector<uint8_t> rejectionSentinel = strictVram;
             std::string rejection;
@@ -4885,10 +5107,10 @@ void register_ps2_gs_vulkan_tests()
                      "strict texture rejection must precede canonical mutation");
 
             const GsBackendCounters counters = strict.backendCounters();
-            t.Equals(counters.commands, 2ull,
-                     "strict should classify one accepted and one rejected texture draw");
-            t.Equals(counters.acceleratedCommands, 1ull,
-                     "the qualified strict texture should reach Vulkan");
+            t.Equals(counters.commands, 3ull,
+                     "strict should classify two accepted and one rejected texture draw");
+            t.Equals(counters.acceleratedCommands, 2ull,
+                     "both qualified strict textures should reach Vulkan");
             t.Equals(counters.softwareCommands, 0ull,
                      "strict texture routing must never use software fallback");
             t.Equals(counters.fallbackCommands, 0ull,
@@ -4902,35 +5124,45 @@ void register_ps2_gs_vulkan_tests()
 
             const GsVulkanRasterBackendStatistics backend =
                 strict.vulkanRendererBackendStatistics();
-            t.Equals(backend.commandsAttempted, 1ull,
-                     "only the supported strict texture should be submitted");
-            t.Equals(backend.commandsCompleted, 1ull,
-                     "the strict texture should complete exactly once");
-            t.Equals(backend.committedGpuCommands, 1ull,
-                     "the strict texture should publish one GPU result");
+            t.Equals(backend.commandsAttempted, 2ull,
+                     "only the supported strict textures should be submitted");
+            t.Equals(backend.commandsCompleted, 2ull,
+                     "both strict textures should complete exactly once");
+            t.Equals(backend.committedGpuCommands, 2ull,
+                     "both strict textures should publish one GPU result");
             t.Equals(backend.verifiedCommands, 0ull,
                      "strict texture routing should not run the Verify oracle");
             t.Equals(backend.bytesCompared, 0ull,
                      "strict texture routing should not claim a comparison");
-            t.Equals(backend.residentCommands, 0ull,
-                     "strict texture routing should stay outside residency for now");
+            t.Equals(backend.residentCommands, 2ull,
+                     "strict texture routing should batch resident execution");
             t.Equals(backend.pageOwnership.gpuNewerPages, size_t{0u},
-                     "synchronous strict texture publication should update CPU VRAM");
+                     "debug observation should publish resident texture VRAM");
             t.Equals(backend.coherency.rejectedTransitions, 0ull,
                      "strict texture publication should preserve page ownership");
 
             const GsVulkanServiceStatistics service =
                 strict.vulkanRendererServiceStatistics();
-            t.Equals(service.nearestCt32SpriteDrawsCompleted, 1ull,
-                     "the service should execute one strict texture request");
+            t.Equals(service.nearestCt32SpriteDrawsCompleted, 2ull,
+                     "the service should execute both strict textures");
             t.Equals(service.nearestCt32SpriteDrawsFailed, 0ull,
                      "classification rejection must not post service work");
+            t.Equals(service.residentNearestCt32SpriteBatchesCompleted,
+                     1ull,
+                     "strict texture routing should complete one resident batch");
+            t.Equals(service.largestResidentNearestCt32SpriteBatch,
+                     2ull,
+                     "shared texture reads should remain in one service batch");
             t.Equals(
                 service.nearestCt32SpritePixelsExecuted,
                 static_cast<uint64_t>(
                     prepared.boundsX1 - prepared.boundsX0) *
                     static_cast<uint64_t>(
-                        prepared.boundsY1 - prepared.boundsY0),
+                        prepared.boundsY1 - prepared.boundsY0) +
+                    static_cast<uint64_t>(
+                        secondPrepared.boundsX1 - secondPrepared.boundsX0) *
+                    static_cast<uint64_t>(
+                        secondPrepared.boundsY1 - secondPrepared.boundsY0),
                 "the service should retain strict texture pixel accounting");
             t.Equals(service.spriteDrawsCompleted, 0ull,
                      "strict texture routing must not alias the flat sprite request");
@@ -6167,6 +6399,8 @@ void register_ps2_gs_vulkan_tests()
                      "only accepted strict draws should execute");
             t.Equals(backendStatistics.committedGpuCommands, 4ull,
                      "all accepted strict draws should publish GPU VRAM");
+            t.Equals(backendStatistics.residentCommands, 4ull,
+                     "all accepted strict draws should use resident execution");
             const GsVulkanServiceStatistics serviceStatistics =
                 strict.vulkanRendererServiceStatistics();
             t.Equals(serviceStatistics.spriteDrawsCompleted,
@@ -6178,6 +6412,11 @@ void register_ps2_gs_vulkan_tests()
             t.Equals(serviceStatistics.nearestCt32SpriteDrawsCompleted,
                      2ull,
                      "strict reset should preserve texture execution on both sides");
+            t.Equals(
+                serviceStatistics
+                    .residentNearestCt32SpriteBatchesCompleted,
+                2ull,
+                "strict reset should preserve resident texture execution on both sides");
             t.Equals(
                 serviceStatistics.nearestCt32SpritePixelsExecuted,
                 2ull * static_cast<uint64_t>(

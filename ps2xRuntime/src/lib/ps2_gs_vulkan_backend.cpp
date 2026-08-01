@@ -462,13 +462,21 @@ namespace
 
 struct GsVulkanRasterBackend::Impl final
 {
+    enum class ResidentPipeline : uint8_t
+    {
+        Ct32Sprite,
+        NearestCt32Sprite,
+        Ct32Triangle,
+    };
+
     struct PendingResidentCommand
     {
         GsDrawCommand command;
         GsVulkanCt32Sprite sprite;
+        GsVulkanNearestCt32Sprite nearestCt32Sprite;
         GsVulkanCt32Triangle triangle;
         GsDrawResources resources;
-        bool isTriangle = false;
+        ResidentPipeline pipeline = ResidentPipeline::Ct32Sprite;
     };
 
     std::unique_ptr<IGsVulkanDrawExecutor> executor;
@@ -479,7 +487,8 @@ struct GsVulkanRasterBackend::Impl final
     GsVulkanRasterBackendStatistics statistics;
     GsVramCoherency coherency;
     std::vector<PendingResidentCommand> pendingResidentCommands;
-    GsVramPageMask pendingResidentAccessPages;
+    GsVramPageMask pendingResidentReadPages;
+    GsVramPageMask pendingResidentWritePages;
     bool exactCt32Triangle = false;
     bool exactNearestCt32Sprite = false;
     bool failed = false;
@@ -545,7 +554,8 @@ struct GsVulkanRasterBackend::Impl final
     void clearPendingResidentCommands() noexcept
     {
         pendingResidentCommands.clear();
-        pendingResidentAccessPages.clear();
+        pendingResidentReadPages.clear();
+        pendingResidentWritePages.clear();
     }
 
     void drainPendingResidentCommands(GsFlushReason reason)
@@ -561,35 +571,49 @@ struct GsVulkanRasterBackend::Impl final
         else if (reason == GsFlushReason::PipelineChange)
             ++statistics.pipelineChangeDrains;
 
-        const bool triangleBatch =
-            pendingResidentCommands.front().isTriangle;
+        const ResidentPipeline pipeline =
+            pendingResidentCommands.front().pipeline;
         std::vector<GsVulkanCt32Sprite> sprites;
+        std::vector<GsVulkanNearestCt32Sprite> nearestCt32Sprites;
         std::vector<GsVulkanCt32Triangle> triangles;
-        if (triangleBatch)
+        if (pipeline == ResidentPipeline::Ct32Triangle)
             triangles.reserve(commandCount);
+        else if (pipeline == ResidentPipeline::NearestCt32Sprite)
+            nearestCt32Sprites.reserve(commandCount);
         else
             sprites.reserve(commandCount);
         for (const PendingResidentCommand &pending :
              pendingResidentCommands)
         {
-            if (pending.isTriangle != triangleBatch)
+            if (pending.pipeline != pipeline)
             {
                 clearPendingResidentCommands();
                 failRequest(
                     "resident CT32 batch assembly",
                     "mixed pipelines reached a homogeneous service batch");
             }
-            if (triangleBatch)
+            if (pipeline == ResidentPipeline::Ct32Triangle)
                 triangles.push_back(pending.triangle);
+            else if (pipeline == ResidentPipeline::NearestCt32Sprite)
+                nearestCt32Sprites.push_back(
+                    pending.nearestCt32Sprite);
             else
                 sprites.push_back(pending.sprite);
         }
 
+        const char *batchName = "resident CT32 sprite batch";
+        if (pipeline == ResidentPipeline::NearestCt32Sprite)
+            batchName = "resident nearest CT32 sprite batch";
+        else if (pipeline == ResidentPipeline::Ct32Triangle)
+            batchName = "resident CT32 triangle batch";
+        GsVramPageMask accessPages = pendingResidentReadPages;
+        accessPages.unionWith(pendingResidentWritePages);
+
         try
         {
             uploadCpuNewer(
-                pendingResidentAccessPages,
-                "page upload for resident CT32 batch at " +
+                accessPages,
+                "page upload for " + std::string(batchName) + " at " +
                     std::string(gsFlushReasonName(reason)));
         }
         catch (...)
@@ -599,16 +623,27 @@ struct GsVulkanRasterBackend::Impl final
         }
 
         std::string executionError;
-        const bool executed = triangleBatch
-            ? executor->executeResidentCt32Triangles(
-                  triangles, &executionError)
-            : executor->executeResidentCt32Sprites(
-                  sprites, &executionError);
+        bool executed = false;
+        if (pipeline == ResidentPipeline::Ct32Triangle)
+        {
+            executed = executor->executeResidentCt32Triangles(
+                triangles, &executionError);
+        }
+        else if (pipeline == ResidentPipeline::NearestCt32Sprite)
+        {
+            executed = executor->executeResidentNearestCt32Sprites(
+                nearestCt32Sprites, &executionError);
+        }
+        else
+        {
+            executed = executor->executeResidentCt32Sprites(
+                sprites, &executionError);
+        }
         if (!executed)
         {
             clearPendingResidentCommands();
             failRequest(
-                "resident CT32 batch at " +
+                std::string(batchName) + " at " +
                     std::string(gsFlushReasonName(reason)),
                 std::move(executionError));
         }
@@ -987,67 +1022,29 @@ void GsVulkanRasterBackend::submit(
             m_impl->coherency.completeCpuToGpu(resources.writePages);
             ++m_impl->statistics.verifiedCommands;
         }
-        else if (isTexturedSprite)
-        {
-            // The first strict texture slice deliberately retains the
-            // independently qualified whole-image service transaction. It
-            // publishes only after the executor has returned one complete
-            // image; resident texture submission is a separate gate.
-            GsVramPageMask allPages;
-            allPages.setAll();
-            prepareCpuVramAccess(
-                allPages, GsFlushReason::BackendSwitch);
-            std::vector<uint8_t> initial(
-                m_impl->canonicalVram.begin(),
-                m_impl->canonicalVram.end());
-            std::vector<uint8_t> gpuOutput;
-            std::string executionError;
-            if (!m_impl->executor->executeNearestCt32Sprite(
-                    initial, texturedSprite, gpuOutput,
-                    &executionError) ||
-                gpuOutput.size() != GS_VULKAN_VRAM_SIZE)
-            {
-                if (executionError.empty())
-                {
-                    executionError =
-                        "executor returned an invalid VRAM image";
-                }
-                m_impl->failRequest(
-                    "nearest CT32 strict draw " +
-                        std::to_string(command.sequence()),
-                    std::move(executionError));
-            }
-
-            // The request uploads the complete canonical input, writes the
-            // qualified destination pages, and returns the complete resulting
-            // device image. Publish it as one synchronous transaction so no
-            // observer can see a partial strict draw.
-            const GsVramPageMask initiallyCpuNewer =
-                m_impl->coherency.cpuNewerPages(allPages);
-            m_impl->coherency.completeCpuToGpu(initiallyCpuNewer);
-            m_impl->coherency.noteGpuWrite(resources.writePages);
-            std::copy(
-                gpuOutput.begin(), gpuOutput.end(),
-                m_impl->canonicalVram.begin());
-            m_impl->coherency.completeGpuToCpu(resources.writePages);
-            ++m_impl->statistics.committedGpuCommands;
-            ++m_impl->statistics.commandsCompleted;
-            if (m_impl->acceleratedCommit)
-                m_impl->acceleratedCommit(command);
-        }
         else
         {
-            GsVramPageMask accessPages = resources.readPages;
-            accessPages.unionWith(resources.writePages);
+            Impl::ResidentPipeline pipeline =
+                Impl::ResidentPipeline::Ct32Sprite;
+            if (isTriangle)
+                pipeline = Impl::ResidentPipeline::Ct32Triangle;
+            else if (isTexturedSprite)
+                pipeline = Impl::ResidentPipeline::NearestCt32Sprite;
             if (!m_impl->pendingResidentCommands.empty() &&
-                m_impl->pendingResidentCommands.front().isTriangle !=
-                    isTriangle)
+                m_impl->pendingResidentCommands.front().pipeline !=
+                    pipeline)
             {
                 m_impl->drainPendingResidentCommands(
                     GsFlushReason::PipelineChange);
             }
-            if (m_impl->pendingResidentAccessPages.intersects(
-                    accessPages))
+            const bool hasDependency =
+                m_impl->pendingResidentWritePages.intersects(
+                    resources.readPages) ||
+                m_impl->pendingResidentWritePages.intersects(
+                    resources.writePages) ||
+                m_impl->pendingResidentReadPages.intersects(
+                    resources.writePages);
+            if (hasDependency)
             {
                 m_impl->drainPendingResidentCommands(
                     GsFlushReason::ResourceHazard);
@@ -1060,8 +1057,12 @@ void GsVulkanRasterBackend::submit(
             }
 
             m_impl->pendingResidentCommands.push_back(
-                {command, sprite, triangle, resources, isTriangle});
-            m_impl->pendingResidentAccessPages.unionWith(accessPages);
+                {command, sprite, texturedSprite, triangle,
+                 resources, pipeline});
+            m_impl->pendingResidentReadPages.unionWith(
+                resources.readPages);
+            m_impl->pendingResidentWritePages.unionWith(
+                resources.writePages);
         }
         if (m_impl->config.mode == GsRendererMode::Verify)
             ++m_impl->statistics.commandsCompleted;
