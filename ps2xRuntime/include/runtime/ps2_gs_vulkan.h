@@ -31,6 +31,9 @@ inline constexpr size_t GS_VULKAN_MAX_RESIDENT_NEAREST_CT32_BATCH =
     GS_VULKAN_MAX_RESIDENT_SPRITE_BATCH;
 inline constexpr size_t GS_VULKAN_MAX_RESIDENT_LINEAR_CT32_BATCH =
     GS_VULKAN_MAX_RESIDENT_SPRITE_BATCH;
+inline constexpr size_t
+    GS_VULKAN_MAX_RESIDENT_FEEDBACK_LINEAR_DEPTH_CT32_BATCH =
+        GS_VULKAN_MAX_RESIDENT_SPRITE_BATCH;
 inline constexpr size_t GS_VULKAN_MAX_RESIDENT_TRIANGLE_BATCH =
     GS_VRAM_PAGE_COUNT;
 
@@ -214,6 +217,10 @@ struct GsVulkanServiceStatistics
     uint64_t feedbackLinearDepthCt32SpriteDrawsCompleted = 0u;
     uint64_t feedbackLinearDepthCt32SpriteDrawsFailed = 0u;
     uint64_t feedbackLinearDepthCt32SpritePixelsExecuted = 0u;
+    uint64_t
+        residentFeedbackLinearDepthCt32SpriteBatchesCompleted = 0u;
+    uint64_t residentFeedbackLinearDepthCt32SpriteBatchesFailed = 0u;
+    uint64_t largestResidentFeedbackLinearDepthCt32SpriteBatch = 0u;
     uint64_t residentLinearCt32SpriteBatchesCompleted = 0u;
     uint64_t residentLinearCt32SpriteBatchesFailed = 0u;
     uint64_t largestResidentLinearCt32SpriteBatch = 0u;
@@ -775,6 +782,16 @@ public:
     [[nodiscard]] virtual bool executeResidentDepthCt32Sprites(
         std::span<const GsVulkanDepthCt32Sprite> sprites,
         std::string *error = nullptr) = 0;
+    [[nodiscard]] virtual bool
+    executeResidentFeedbackLinearDepthCt32Sprite(
+        std::span<const uint8_t> feedbackSnapshot,
+        const GsVulkanFeedbackLinearDepthCt32Sprite &sprite,
+        std::string *error = nullptr) = 0;
+    [[nodiscard]] virtual bool
+    executeResidentFeedbackLinearDepthCt32Sprites(
+        std::span<const uint8_t> feedbackSnapshot,
+        std::span<const GsVulkanFeedbackLinearDepthCt32Sprite> sprites,
+        std::string *error = nullptr) = 0;
     [[nodiscard]] virtual bool executeResidentNearestCt32Sprite(
         const GsVulkanNearestCt32Sprite &sprite,
         std::string *error = nullptr) = 0;
@@ -920,6 +937,18 @@ public:
         std::string *error = nullptr) override;
     [[nodiscard]] bool executeResidentDepthCt32Sprites(
         std::span<const GsVulkanDepthCt32Sprite> sprites,
+        std::string *error = nullptr) override;
+
+    // Uploads one immutable texture snapshot and records a bounded recursive
+    // linear/depth batch against already-resident canonical VRAM. Records run
+    // in guest order; canonical page ownership remains the caller's concern.
+    [[nodiscard]] bool executeResidentFeedbackLinearDepthCt32Sprite(
+        std::span<const uint8_t> feedbackSnapshot,
+        const GsVulkanFeedbackLinearDepthCt32Sprite &sprite,
+        std::string *error = nullptr) override;
+    [[nodiscard]] bool executeResidentFeedbackLinearDepthCt32Sprites(
+        std::span<const uint8_t> feedbackSnapshot,
+        std::span<const GsVulkanFeedbackLinearDepthCt32Sprite> sprites,
         std::string *error = nullptr) override;
 
     // Records a bounded nearest-texture batch against resident raw VRAM.

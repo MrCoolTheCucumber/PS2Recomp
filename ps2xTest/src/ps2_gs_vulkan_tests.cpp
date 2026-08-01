@@ -2134,6 +2134,83 @@ namespace
             return true;
         }
 
+        bool executeResidentFeedbackLinearDepthCt32Sprite(
+            std::span<const uint8_t> feedbackSnapshot,
+            const GsVulkanFeedbackLinearDepthCt32Sprite &sprite,
+            std::string *error) override
+        {
+            return executeResidentFeedbackLinearDepthCt32Sprites(
+                feedbackSnapshot,
+                std::span<const GsVulkanFeedbackLinearDepthCt32Sprite>(
+                    &sprite, 1u),
+                error);
+        }
+
+        bool executeResidentFeedbackLinearDepthCt32Sprites(
+            std::span<const uint8_t> feedbackSnapshot,
+            std::span<const GsVulkanFeedbackLinearDepthCt32Sprite> sprites,
+            std::string *error) override
+        {
+            if (!isHealthy || behavior == Behavior::Fail ||
+                behavior == Behavior::FailResidentDraw ||
+                behavior == Behavior::InvalidOutput ||
+                feedbackSnapshot.size() != GS_VULKAN_VRAM_SIZE ||
+                sprites.empty() ||
+                sprites.size() >
+                    GS_VULKAN_MAX_RESIDENT_FEEDBACK_LINEAR_DEPTH_CT32_BATCH ||
+                !report.devices[0]
+                     .exactFeedbackLinearDepthCt32Sprite)
+            {
+                serviceStatistics
+                    .feedbackLinearDepthCt32SpriteDrawsFailed +=
+                    sprites.size();
+                ++serviceStatistics
+                      .residentFeedbackLinearDepthCt32SpriteBatchesFailed;
+                if (error)
+                {
+                    *error =
+                        "injected resident feedback linear depth executor failure";
+                }
+                return false;
+            }
+            for (const GsVulkanFeedbackLinearDepthCt32Sprite &sprite :
+                 sprites)
+            {
+                if (behavior == Behavior::Exact)
+                {
+                    applyFeedbackLinearDepthCt32SpriteCpu(
+                        residentVram, feedbackSnapshot, sprite);
+                }
+                serviceStatistics
+                    .feedbackLinearDepthCt32SpritePixelsExecuted +=
+                    static_cast<uint64_t>(
+                        sprite.boundsX1 - sprite.boundsX0) *
+                    static_cast<uint64_t>(
+                        sprite.boundsY1 - sprite.boundsY0);
+            }
+            serviceStatistics
+                .feedbackLinearDepthCt32SpriteDrawsCompleted +=
+                sprites.size();
+            ++serviceStatistics
+                  .residentFeedbackLinearDepthCt32SpriteBatchesCompleted;
+            serviceStatistics
+                .largestResidentFeedbackLinearDepthCt32SpriteBatch =
+                std::max(
+                    serviceStatistics
+                        .largestResidentFeedbackLinearDepthCt32SpriteBatch,
+                    static_cast<uint64_t>(sprites.size()));
+            ++serviceStatistics.queueSubmissions;
+            serviceStatistics.shaderDispatches += sprites.size();
+            serviceStatistics.pipelineBarriers += sprites.size() + 3u;
+            ++serviceStatistics.pipelineBinds;
+            ++serviceStatistics.pipelineCacheHits;
+            ++serviceStatistics.fenceWaits;
+            serviceStatistics.bytesUploaded += GS_VULKAN_VRAM_SIZE;
+            if (error)
+                error->clear();
+            return true;
+        }
+
         bool executeResidentLinearCt32Sprite(
             const GsVulkanLinearCt32Sprite &sprite,
             std::string *error) override
@@ -2341,6 +2418,10 @@ void register_ps2_gs_vulkan_tests()
             t.Equals(GS_VULKAN_MAX_RESIDENT_LINEAR_CT32_BATCH,
                      GS_VULKAN_MAX_RESIDENT_SPRITE_BATCH,
                      "resident linear batches should share the bounded sprite limit");
+            t.Equals(
+                GS_VULKAN_MAX_RESIDENT_FEEDBACK_LINEAR_DEPTH_CT32_BATCH,
+                GS_VULKAN_MAX_RESIDENT_SPRITE_BATCH,
+                "resident feedback batches should share the bounded sprite limit");
             t.Equals(GS_VULKAN_MAX_RESIDENT_TRIANGLE_BATCH,
                      GS_VRAM_PAGE_COUNT,
                      "disjoint triangle batches cannot exceed physical pages");
@@ -14775,6 +14856,294 @@ void register_ps2_gs_vulkan_tests()
             t.IsTrue(
                 shutdownOutput == shutdownSentinel,
                 "post-shutdown feedback rejection must preserve output");
+        });
+
+        tc.Run("Vulkan resident feedback batches preserve one immutable snapshot", [](TestCase &t)
+        {
+            GSMem::InitLookupTables();
+            const std::array<GsDrawCommand, 2> commands{{
+                makeFeedbackLinearDepthCt32SpriteCommand(
+                    30'300u, 4u, 1u, 200u, GS_PSM_Z24, false, 1u,
+                    6u, 5u,
+                    {0u, 63u, 0u, 31u}, {0u, 0u},
+                    {0u, 128u}, {0u, 128u},
+                    {128u, 256u}, {0u, 128u},
+                    0x00123456u),
+                makeFeedbackLinearDepthCt32SpriteCommand(
+                    30'301u, 4u, 1u, 200u, GS_PSM_Z24, false, 1u,
+                    6u, 5u,
+                    {0u, 63u, 0u, 31u}, {0u, 0u},
+                    {128u, 256u}, {0u, 128u},
+                    {0u, 128u}, {0u, 128u},
+                    0x00654321u),
+            }};
+            std::array<GsVulkanFeedbackLinearDepthCt32Sprite, 2> sprites{};
+            for (size_t index = 0u; index < commands.size(); ++index)
+            {
+                const GsBackendDecision decision =
+                    prepareGsVulkanFeedbackLinearDepthCt32Sprite(
+                        commands[index], sprites[index]);
+                if (!decision.supported)
+                {
+                    t.Fail(
+                        "resident feedback fixture was rejected as " +
+                        std::string(gsFallbackReasonName(decision.reason)));
+                    return;
+                }
+            }
+
+            GsVulkanCapabilityReport preflight{};
+            const GsVulkanServiceConfig config =
+                makeRendererServiceConfig(preflight);
+            GsVulkanCapabilityReport creationReport{};
+            std::string creationError;
+            std::unique_ptr<GsVulkanService> service =
+                GsVulkanService::create(
+                    config, &creationReport, &creationError);
+            if (!preflight.ready())
+            {
+                t.IsNull(
+                    service.get(),
+                    "an unavailable host should skip resident feedback batching cleanly");
+                return;
+            }
+            t.IsNotNull(
+                service.get(),
+                "a suitable device should create the resident feedback service");
+            if (!service)
+                return;
+            const GsVulkanDeviceReport *selected =
+                creationReport.selectedDevice();
+            t.IsNotNull(
+                selected,
+                "the resident feedback service should retain its selected device");
+            if (!selected)
+                return;
+            if (!selected->exactFeedbackLinearDepthCt32Sprite)
+            {
+                std::string capabilityError;
+                t.IsFalse(
+                    service->executeResidentFeedbackLinearDepthCt32Sprites(
+                        makeVramPattern(0x46425350u), sprites,
+                        &capabilityError),
+                    "resident feedback execution should remain capability-gated");
+                t.IsFalse(
+                    capabilityError.empty(),
+                    "resident feedback capability rejection should retain a diagnostic");
+                service->shutdown();
+                return;
+            }
+
+            const std::vector<uint8_t> initial =
+                makeVramPattern(0x52465354u);
+            const std::vector<uint8_t> feedbackSnapshot =
+                makeVramPattern(0x46425350u);
+            std::vector<uint8_t> expected = initial;
+            uint64_t expectedPixels = 0u;
+            for (const GsVulkanFeedbackLinearDepthCt32Sprite &sprite :
+                 sprites)
+            {
+                applyFeedbackLinearDepthCt32SpriteCpu(
+                    expected, feedbackSnapshot, sprite);
+                expectedPixels +=
+                    static_cast<uint64_t>(
+                        sprite.boundsX1 - sprite.boundsX0) *
+                    static_cast<uint64_t>(
+                        sprite.boundsY1 - sprite.boundsY0);
+            }
+            std::vector<uint8_t> resampled = initial;
+            for (const GsVulkanFeedbackLinearDepthCt32Sprite &sprite :
+                 sprites)
+            {
+                const std::vector<uint8_t> drawSnapshot = resampled;
+                applyFeedbackLinearDepthCt32SpriteCpu(
+                    resampled, drawSnapshot, sprite);
+            }
+            t.IsFalse(
+                expected == resampled,
+                "the fixture should distinguish one run snapshot from per-draw resampling");
+
+            GsVramPageMask allPages;
+            allPages.setAll();
+            std::string operationError;
+            t.IsTrue(
+                service->uploadVramPages(
+                    initial, allPages, &operationError),
+                "the resident feedback fixture should establish canonical VRAM");
+            if (!operationError.empty())
+                t.Fail("resident feedback upload failed: " + operationError);
+
+            const GsVulkanServiceStatistics beforeRejections =
+                service->statistics();
+            const auto expectRejected =
+                [&](std::span<const uint8_t> rejectedSnapshot,
+                    std::span<const GsVulkanFeedbackLinearDepthCt32Sprite>
+                        rejectedSprites,
+                    const std::string &label)
+            {
+                operationError.clear();
+                t.IsFalse(
+                    service->executeResidentFeedbackLinearDepthCt32Sprites(
+                        rejectedSnapshot, rejectedSprites,
+                        &operationError),
+                    label + " should fail before worker submission");
+                t.IsFalse(
+                    operationError.empty(),
+                    label + " should retain a diagnostic");
+            };
+            expectRejected(feedbackSnapshot, {},
+                           "empty resident feedback batch");
+            std::vector<GsVulkanFeedbackLinearDepthCt32Sprite> oversized(
+                GS_VULKAN_MAX_RESIDENT_FEEDBACK_LINEAR_DEPTH_CT32_BATCH +
+                    1u,
+                sprites.front());
+            expectRejected(feedbackSnapshot, oversized,
+                           "oversized resident feedback batch");
+            const std::vector<uint8_t> shortSnapshot(
+                GS_VULKAN_VRAM_SIZE - 1u, 0u);
+            expectRejected(shortSnapshot, sprites,
+                           "short resident feedback snapshot");
+            std::array<GsVulkanFeedbackLinearDepthCt32Sprite, 2> invalid =
+                sprites;
+            invalid[1].reserved1 = 1u;
+            expectRejected(feedbackSnapshot, invalid,
+                           "invalid resident feedback member");
+            const GsVulkanServiceStatistics afterRejections =
+                service->statistics();
+            t.Equals(
+                afterRejections.queueSubmissions,
+                beforeRejections.queueSubmissions,
+                "caller-rejected resident feedback batches must not submit");
+            t.Equals(
+                afterRejections
+                    .feedbackLinearDepthCt32SpriteDrawsFailed,
+                beforeRejections
+                    .feedbackLinearDepthCt32SpriteDrawsFailed,
+                "caller rejection must not count resident feedback worker failures");
+            t.Equals(
+                afterRejections
+                    .residentFeedbackLinearDepthCt32SpriteBatchesFailed,
+                beforeRejections
+                    .residentFeedbackLinearDepthCt32SpriteBatchesFailed,
+                "caller rejection must not count failed resident feedback batches");
+
+            const GsVulkanServiceStatistics beforeBatch =
+                service->statistics();
+            operationError.clear();
+            if (!service->executeResidentFeedbackLinearDepthCt32Sprites(
+                    feedbackSnapshot, sprites, &operationError))
+            {
+                t.Fail(
+                    "resident feedback batch failed: " + operationError);
+                service->shutdown();
+                return;
+            }
+            const GsVulkanServiceStatistics afterBatch =
+                service->statistics();
+            t.IsTrue(
+                operationError.empty(),
+                "successful resident feedback batching should clear its diagnostic");
+            t.Equals(
+                afterBatch.queueSubmissions -
+                    beforeBatch.queueSubmissions,
+                1ull,
+                "one resident feedback batch should submit once");
+            t.Equals(
+                afterBatch.shaderDispatches -
+                    beforeBatch.shaderDispatches,
+                static_cast<uint64_t>(sprites.size()),
+                "each resident feedback member should dispatch once");
+            t.Equals(
+                afterBatch.pipelineBarriers -
+                    beforeBatch.pipelineBarriers,
+                static_cast<uint64_t>(sprites.size()) + 3u,
+                "resident feedback should synchronize one snapshot and every ordered dependency");
+            t.Equals(
+                afterBatch.pipelineBinds - beforeBatch.pipelineBinds,
+                1ull,
+                "one resident feedback batch should bind one pipeline");
+            t.Equals(
+                afterBatch.fenceWaits - beforeBatch.fenceWaits,
+                1ull,
+                "one resident feedback batch should wait once");
+            t.Equals(
+                afterBatch.bytesUploaded - beforeBatch.bytesUploaded,
+                static_cast<uint64_t>(GS_VULKAN_VRAM_SIZE),
+                "resident feedback should upload only its immutable snapshot");
+            t.Equals(
+                afterBatch.bytesDownloaded - beforeBatch.bytesDownloaded,
+                0ull,
+                "resident feedback should leave canonical VRAM on-device");
+            t.Equals(
+                afterBatch
+                        .feedbackLinearDepthCt32SpriteDrawsCompleted -
+                    beforeBatch
+                        .feedbackLinearDepthCt32SpriteDrawsCompleted,
+                static_cast<uint64_t>(sprites.size()),
+                "resident feedback counters should include every member");
+            t.Equals(
+                afterBatch
+                        .feedbackLinearDepthCt32SpritePixelsExecuted -
+                    beforeBatch
+                        .feedbackLinearDepthCt32SpritePixelsExecuted,
+                expectedPixels,
+                "resident feedback counters should include exact candidate pixels");
+            t.Equals(
+                afterBatch
+                        .residentFeedbackLinearDepthCt32SpriteBatchesCompleted -
+                    beforeBatch
+                        .residentFeedbackLinearDepthCt32SpriteBatchesCompleted,
+                1ull,
+                "the worker should complete one resident feedback batch");
+            t.Equals(
+                afterBatch
+                    .largestResidentFeedbackLinearDepthCt32SpriteBatch,
+                static_cast<uint64_t>(sprites.size()),
+                "the service should retain its largest resident feedback batch");
+
+            std::vector<uint8_t> actual(
+                GS_VULKAN_VRAM_SIZE, 0xA5u);
+            t.IsTrue(
+                service->downloadVramPages(
+                    actual, allPages, &operationError),
+                "the completed resident feedback batch should be observable");
+            t.IsTrue(
+                actual == expected,
+                "resident feedback draws must use the one supplied snapshot in guest order");
+
+            std::vector<uint8_t> singletonExpected = expected;
+            applyFeedbackLinearDepthCt32SpriteCpu(
+                singletonExpected, feedbackSnapshot, sprites.front());
+            operationError.clear();
+            t.IsTrue(
+                service->executeResidentFeedbackLinearDepthCt32Sprite(
+                    feedbackSnapshot, sprites.front(), &operationError),
+                "the resident feedback singleton wrapper should execute");
+            std::fill(actual.begin(), actual.end(), 0xA5u);
+            t.IsTrue(
+                service->downloadVramPages(
+                    actual, allPages, &operationError),
+                "the resident feedback singleton should be observable");
+            t.IsTrue(
+                actual == singletonExpected,
+                "the resident feedback singleton should preserve snapshot semantics");
+            t.Equals(
+                service->statistics().validationErrors,
+                0u,
+                "resident feedback batching must remain validation-clean");
+            t.IsTrue(
+                service->healthy(),
+                "accepted and rejected resident feedback work should leave the service healthy");
+
+            service->shutdown();
+            operationError.clear();
+            t.IsFalse(
+                service->executeResidentFeedbackLinearDepthCt32Sprites(
+                    feedbackSnapshot, sprites, &operationError),
+                "a stopped service must reject resident feedback batches");
+            t.IsFalse(
+                operationError.empty(),
+                "post-shutdown resident feedback rejection should retain a diagnostic");
         });
 
         tc.Run("Vulkan linear CT32 repeat and clamp sprites match the prepared DDA", [](TestCase &t)
