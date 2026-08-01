@@ -4699,7 +4699,16 @@ void register_ps2_gs_vulkan_tests()
                     {3u, 30u, 2u, 25u}, {16u, 32u},
                     49u, 65u, 449u, 353u,
                     0x88776655u, 0xFEDCBA98u);
-            const std::array<GsDrawCommand, 2> commands{{
+            const GsDrawCommand sourceOverZ24 =
+                makeDepthCt32SpriteCommand(
+                    30'102u, 112u, 8u, 216u, GS_PSM_Z24, false, 1u,
+                    {0u, 511u, 0u, 415u},
+                    {1792u * 16u, 1840u * 16u},
+                    1792u * 16u - 8u, 1840u * 16u - 8u,
+                    (1792u + 32u) * 16u - 8u,
+                    (1840u + 416u) * 16u - 8u,
+                    0x78000000u, 0u);
+            const std::array<GsDrawCommand, 3> commands{{
                 makeAlphaBlendCommand(
                     opaqueZ24, 30'100u, 0u),
                 makeDepthCt32SpriteCommand(
@@ -4707,12 +4716,29 @@ void register_ps2_gs_vulkan_tests()
                     {4u, 27u, 3u, 22u}, {0u, 0u},
                     65u, 49u, 433u, 337u,
                     0x10203040u, 0x7FFFFF00u),
+                makeAlphaBlendCommand(
+                    sourceOverZ24, 30'102u,
+                    0x0000008000000044ull, false, true),
             }};
-            std::array<GsVulkanDepthCt32Sprite, 2> prepared{};
+            const auto prepareDepth = [](
+                const GsDrawCommand &command,
+                GsVulkanDepthCt32Sprite &sprite)
+            {
+                GsBackendDecision decision =
+                    prepareGsVulkanDepthCt32Sprite(command, sprite);
+                if (!decision.supported &&
+                    decision.reason == GsFallbackReason::AlphaBlend)
+                {
+                    decision = prepareGsVulkanSourceOverDepthCt32Sprite(
+                        command, sprite);
+                }
+                return decision;
+            };
+            std::array<GsVulkanDepthCt32Sprite, 3> prepared{};
             for (size_t index = 0u; index < commands.size(); ++index)
             {
                 t.IsTrue(
-                    prepareGsVulkanDepthCt32Sprite(
+                    prepareDepth(
                         commands[index], prepared[index]).supported,
                     "the Verify depth fixture should satisfy its narrow predicate");
             }
@@ -4720,6 +4746,12 @@ void register_ps2_gs_vulkan_tests()
                      "the first Verify depth command should exercise source-copy alpha");
             t.IsFalse(commands.front().resources().framebufferReadPages.any(),
                       "source-copy Verify should not invent a color dependency");
+            t.IsTrue(commands.back().resources().framebufferReadPages.any(),
+                     "source-over Verify should retain its color dependency");
+            t.Equals(
+                prepared.back().colorBlendMode,
+                GS_VULKAN_DEPTH_CT32_COLOR_SOURCE_OVER,
+                "the Verify fixture should retain its source-over operation");
 
             std::vector<uint8_t> initial =
                 makeVramPattern(0x44565246u);
@@ -4757,8 +4789,7 @@ void register_ps2_gs_vulkan_tests()
                     {
                         ++softwareCalls;
                         GsVulkanDepthCt32Sprite sprite{};
-                        if (prepareGsVulkanDepthCt32Sprite(
-                                draw, sprite).supported)
+                        if (prepareDepth(draw, sprite).supported)
                         {
                             applyDepthCt32SpriteCpu(vram, sprite);
                         }
@@ -4780,24 +4811,32 @@ void register_ps2_gs_vulkan_tests()
             backend->submit(commands);
             t.IsTrue(vram == expected,
                      "depth Verify should retain the agreed software image");
-            t.Equals(softwareCalls, 2ull,
+            t.Equals(softwareCalls,
+                     static_cast<uint64_t>(commands.size()),
                      "depth Verify should run each independent oracle once");
             const GsVulkanRasterBackendStatistics statistics =
                 backend->backendStatistics();
-            t.Equals(statistics.commandsAttempted, 2ull,
-                     "depth Verify should attempt both commands");
-            t.Equals(statistics.commandsCompleted, 2ull,
-                     "agreeing depth commands should complete once each");
-            t.Equals(statistics.verifiedCommands, 2ull,
-                     "both full depth comparisons should be counted");
+            t.Equals(
+                statistics.commandsAttempted,
+                static_cast<uint64_t>(commands.size()),
+                "depth Verify should attempt every command");
+            t.Equals(
+                statistics.commandsCompleted,
+                static_cast<uint64_t>(commands.size()),
+                "agreeing depth commands should complete once each");
+            t.Equals(
+                statistics.verifiedCommands,
+                static_cast<uint64_t>(commands.size()),
+                "every full depth comparison should be counted");
             t.Equals(statistics.bytesCompared,
-                     2ull * GS_VULKAN_VRAM_SIZE,
-                     "depth Verify should compare two complete VRAM images");
+                     static_cast<uint64_t>(commands.size()) *
+                         GS_VULKAN_VRAM_SIZE,
+                     "depth Verify should compare complete VRAM images");
             const GsVulkanServiceStatistics serviceStatistics =
                 backend->serviceStatistics();
             t.Equals(serviceStatistics.depthCt32SpriteDrawsCompleted,
-                     2ull,
-                     "the executor should receive two depth requests");
+                     static_cast<uint64_t>(commands.size()),
+                     "the executor should receive every depth request");
             t.Equals(serviceStatistics.spriteDrawsCompleted, 0ull,
                      "depth Verify must not alias the no-depth request");
 
@@ -4805,6 +4844,9 @@ void register_ps2_gs_vulkan_tests()
                      "the synchronized Verify fixture should enter strict mode");
             t.IsTrue(backend->classify(commands.front()).supported,
                      "strict should expose the resident-qualified depth class");
+            t.IsFalse(
+                backend->classify(commands.back()).supported,
+                "strict source-over routing should remain closed in the Verify slice");
             t.IsTrue(backend->setMode(GsRendererMode::Hybrid),
                      "the fixture should also enter Hybrid cleanly");
             t.IsFalse(backend->classify(commands.front()).supported,
@@ -4882,7 +4924,7 @@ void register_ps2_gs_vulkan_tests()
             ScopedArtifactDirectory artifacts;
             std::vector<uint8_t> mismatchVram = initial;
             std::vector<uint8_t> mismatchExpected = initial;
-            applyDepthCt32SpriteCpu(mismatchExpected, prepared.front());
+            applyDepthCt32SpriteCpu(mismatchExpected, prepared.back());
             GsVulkanRasterBackendConfig mismatchConfig = config;
             mismatchConfig.verificationArtifactDirectory =
                 artifacts.path.string();
@@ -4894,8 +4936,7 @@ void register_ps2_gs_vulkan_tests()
                     [&](const GsDrawCommand &draw)
                     {
                         GsVulkanDepthCt32Sprite sprite{};
-                        if (prepareGsVulkanDepthCt32Sprite(
-                                draw, sprite).supported)
+                        if (prepareDepth(draw, sprite).supported)
                         {
                             applyDepthCt32SpriteCpu(
                                 mismatchVram, sprite);
@@ -4910,7 +4951,7 @@ void register_ps2_gs_vulkan_tests()
                 try
                 {
                     mismatchBackend->submit(std::span<const GsDrawCommand>(
-                        &commands.front(), 1u));
+                        &commands.back(), 1u));
                 }
                 catch (const std::runtime_error &)
                 {
@@ -4936,13 +4977,13 @@ void register_ps2_gs_vulkan_tests()
                 t.IsTrue(
                     manifestText.find(
                         "\"depth_psm\":" +
-                        std::to_string(prepared.front().depthPsm)) !=
+                        std::to_string(prepared.back().depthPsm)) !=
                         std::string::npos,
                     "the manifest should retain the exact depth format");
                 t.IsTrue(
                     manifestText.find(
                         "\"depth\":" +
-                        std::to_string(prepared.front().depth)) !=
+                        std::to_string(prepared.back().depth)) !=
                         std::string::npos,
                     "the manifest should retain the integer Z payload");
                 t.IsTrue(
@@ -4951,6 +4992,10 @@ void register_ps2_gs_vulkan_tests()
                     manifestText.find("\"depth_write\":1") !=
                         std::string::npos,
                     "the manifest should retain ALWAYS plus write state");
+                t.IsTrue(
+                    manifestText.find("\"color_blend_mode\":1") !=
+                        std::string::npos,
+                    "the manifest should retain the source-over operation");
             }
             t.IsTrue(mismatchThrew,
                      "the injected no-op depth result should stop Verify");

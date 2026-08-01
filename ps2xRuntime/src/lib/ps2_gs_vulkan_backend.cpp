@@ -121,7 +121,9 @@ namespace
             << "\"depth\":" << sprite.depth << ','
             << "\"depth_test_method\":"
             << sprite.depthTestMethod << ','
-            << "\"depth_write\":" << sprite.depthWrite << '}';
+            << "\"depth_write\":" << sprite.depthWrite << ','
+            << "\"color_blend_mode\":"
+            << sprite.colorBlendMode << '}';
     }
 
     void writePreparedRecord(
@@ -946,8 +948,16 @@ GsBackendDecision GsVulkanRasterBackend::classify(
          m_impl->config.mode == GsRendererMode::GpuStrict))
     {
         GsVulkanDepthCt32Sprite depthSprite{};
-        const GsBackendDecision depthDecision =
+        GsBackendDecision depthDecision =
             prepareGsVulkanDepthCt32Sprite(command, depthSprite);
+        if (!depthDecision.supported &&
+            depthDecision.reason == GsFallbackReason::AlphaBlend &&
+            m_impl->config.mode == GsRendererMode::Verify)
+        {
+            depthDecision =
+                prepareGsVulkanSourceOverDepthCt32Sprite(
+                    command, depthSprite);
+        }
         if (!depthDecision.supported)
             return depthDecision;
         if (!m_impl->exactDepthCt32Sprite)
@@ -1118,9 +1128,18 @@ void GsVulkanRasterBackend::submit(
                 prepareGsVulkanCt32Sprite(command, sprite);
             if (!spriteDecision.supported)
             {
-                (void)prepareGsVulkanDepthCt32Sprite(
-                    command, depthSprite);
-                isDepthSprite = true;
+                GsBackendDecision depthDecision =
+                    prepareGsVulkanDepthCt32Sprite(
+                        command, depthSprite);
+                if (!depthDecision.supported &&
+                    depthDecision.reason ==
+                        GsFallbackReason::AlphaBlend)
+                {
+                    depthDecision =
+                        prepareGsVulkanSourceOverDepthCt32Sprite(
+                            command, depthSprite);
+                }
+                isDepthSprite = depthDecision.supported;
             }
         }
         const GsDrawResources resources = command.resources();
