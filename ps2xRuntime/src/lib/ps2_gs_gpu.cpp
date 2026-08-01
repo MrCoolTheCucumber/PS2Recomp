@@ -3518,6 +3518,15 @@ bool GS::configureVulkanRenderer(
         config, std::move(verificationArtifactDirectory));
 }
 
+bool GS::configureVulkanRenderer(
+    const GsVulkanServiceConfig &config,
+    GsVulkanRasterBackendConfig backendConfig)
+{
+    std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
+    return m_rasterizer.configureVulkanRenderer(
+        config, std::move(backendConfig));
+}
+
 bool GS::setRendererMode(GsRendererMode mode)
 {
     std::lock_guard<std::recursive_mutex> lock(m_stateMutex);

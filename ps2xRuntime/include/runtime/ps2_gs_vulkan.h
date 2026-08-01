@@ -154,9 +154,15 @@ struct GsVulkanServiceStatistics
     uint64_t roundTripsFailed = 0u;
     uint64_t queueSubmissions = 0u;
     uint64_t shaderDispatches = 0u;
+    uint64_t pipelineBarriers = 0u;
+    uint64_t pipelineBinds = 0u;
+    uint64_t pipelineCacheHits = 0u;
+    uint64_t pipelineCacheMisses = 0u;
     uint64_t bytesUploaded = 0u;
     uint64_t bytesDownloaded = 0u;
+    uint64_t fenceWaits = 0u;
     uint64_t fenceWaitNanoseconds = 0u;
+    uint64_t fenceTimeouts = 0u;
     uint64_t memoryBatchesCompleted = 0u;
     uint64_t memoryBatchesFailed = 0u;
     uint64_t memoryCasesExecuted = 0u;

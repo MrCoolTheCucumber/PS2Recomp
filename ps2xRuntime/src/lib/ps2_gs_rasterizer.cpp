@@ -1998,8 +1998,8 @@ struct GSRasterizer::BackendState
     std::unique_ptr<GsVulkanRasterBackend> accelerated;
     GsBackendRouter router;
     GsVulkanServiceConfig serviceConfig{};
+    GsVulkanRasterBackendConfig vulkanBackendConfig{};
     GsVulkanCapabilityReport capabilityReport{};
-    std::string verificationArtifactDirectory;
     std::string diagnostic;
 };
 
@@ -2627,6 +2627,16 @@ bool GSRasterizer::configureVulkanRenderer(
     const GsVulkanServiceConfig &config,
     std::string verificationArtifactDirectory)
 {
+    GsVulkanRasterBackendConfig backendConfig{};
+    backendConfig.verificationArtifactDirectory =
+        std::move(verificationArtifactDirectory);
+    return configureVulkanRenderer(config, std::move(backendConfig));
+}
+
+bool GSRasterizer::configureVulkanRenderer(
+    const GsVulkanServiceConfig &config,
+    GsVulkanRasterBackendConfig backendConfig)
+{
     BackendState &state = *m_backendState;
     if (state.router.mode() != GsRendererMode::Software ||
         state.accelerated)
@@ -2637,8 +2647,7 @@ bool GSRasterizer::configureVulkanRenderer(
     }
 
     state.serviceConfig = config;
-    state.verificationArtifactDirectory =
-        std::move(verificationArtifactDirectory);
+    state.vulkanBackendConfig = std::move(backendConfig);
     state.capabilityReport = {};
     state.diagnostic.clear();
     return true;
@@ -2672,10 +2681,9 @@ bool GSRasterizer::setRendererMode(GsRendererMode mode)
             return false;
         }
 
-        GsVulkanRasterBackendConfig backendConfig{};
+        GsVulkanRasterBackendConfig backendConfig =
+            state.vulkanBackendConfig;
         backendConfig.mode = mode;
-        backendConfig.verificationArtifactDirectory =
-            state.verificationArtifactDirectory;
         std::unique_ptr<GsVulkanRasterBackend> accelerated =
             GsVulkanRasterBackend::create(
                 state.serviceConfig, backendConfig,

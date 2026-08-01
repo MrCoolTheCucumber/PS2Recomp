@@ -177,6 +177,9 @@ public:
     [[nodiscard]] bool configureVulkanRenderer(
         const GsVulkanServiceConfig &config,
         std::string verificationArtifactDirectory = {});
+    [[nodiscard]] bool configureVulkanRenderer(
+        const GsVulkanServiceConfig &config,
+        GsVulkanRasterBackendConfig backendConfig);
     [[nodiscard]] bool setRendererMode(GsRendererMode mode);
     [[nodiscard]] GsRendererMode rendererMode() const;
     [[nodiscard]] std::string rendererDiagnostic() const;

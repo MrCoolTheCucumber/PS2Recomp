@@ -19,6 +19,9 @@ struct GsVulkanRasterBackendConfig
     std::string verificationArtifactDirectory;
     size_t maximumResidentBatchCommands =
         GS_VULKAN_MAX_RESIDENT_SPRITE_BATCH;
+    // Hybrid keeps smaller draws on the CPU. Zero disables this policy.
+    // Verify and strict modes always exercise every semantically eligible draw.
+    uint64_t minimumHybridSpritePixels = 64u;
 };
 
 struct GsVulkanRasterBackendStatistics

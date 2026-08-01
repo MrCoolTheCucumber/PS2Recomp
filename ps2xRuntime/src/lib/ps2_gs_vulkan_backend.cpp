@@ -676,7 +676,20 @@ GsBackendDecision GsVulkanRasterBackend::classify(
         !m_impl->executor->healthy())
         return {false, GsFallbackReason::BackendUnavailable};
     GsVulkanCt32Sprite sprite{};
-    return prepareGsVulkanCt32Sprite(command, sprite);
+    const GsBackendDecision decision =
+        prepareGsVulkanCt32Sprite(command, sprite);
+    if (!decision.supported ||
+        m_impl->config.mode != GsRendererMode::Hybrid)
+    {
+        return decision;
+    }
+
+    const uint64_t pixels =
+        static_cast<uint64_t>(sprite.x1 - sprite.x0) *
+        static_cast<uint64_t>(sprite.y1 - sprite.y0);
+    if (pixels < m_impl->config.minimumHybridSpritePixels)
+        return {false, GsFallbackReason::CostModel};
+    return decision;
 }
 
 void GsVulkanRasterBackend::submit(

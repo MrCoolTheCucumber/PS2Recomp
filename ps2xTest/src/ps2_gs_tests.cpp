@@ -863,6 +863,10 @@ void register_ps2_gs_tests()
                      "software adapter should receive the command once");
             t.Equals(router.counters().queueHighWatermark, 1ull,
                      "router should expose backend queue high-water state");
+            t.Equals(router.counters().drawPixels, 256ull,
+                     "router counters should measure exact command bounds");
+            t.Equals(router.counters().softwarePixels, 256ull,
+                     "software routing should account its covered pixels");
 
             router.setAcceleratedBackend(&accelerated);
             t.IsTrue(router.setMode(GsRendererMode::Hybrid),
@@ -879,6 +883,8 @@ void register_ps2_gs_tests()
                      "unsupported command must not partially reach the accelerated backend");
             t.Equals(router.counters().fallbackCommands, 1ull,
                      "fallback should be represented in structured counters");
+            t.Equals(router.counters().fallbackPixels, 256ull,
+                     "fallback counters should retain covered-pixel cost");
             t.Equals(
                 router.counters().decisions[
                     static_cast<size_t>(GsFallbackReason::Textured)],
@@ -942,6 +948,16 @@ void register_ps2_gs_tests()
                      "verification backend should receive supported work");
             t.Equals(router.counters().verifiedCommands, 1ull,
                      "verify submissions should be counted separately");
+            t.Equals(router.counters().drawPixels, 1280ull,
+                     "all five routing decisions should contribute pixel work");
+            t.Equals(router.counters().softwarePixels, 512ull,
+                     "direct software and fallback pixels should be separated");
+            t.Equals(router.counters().acceleratedPixels, 512ull,
+                     "hybrid and verify submissions should count accelerated pixels");
+            t.Equals(router.counters().verifiedPixels, 256ull,
+                     "verify pixels should be a named accelerated subset");
+            t.Equals(router.counters().strictFailurePixels, 256ull,
+                     "strict rejection should retain its avoided pixel work");
 
             accelerated.cpuAccessPages.clear();
             accelerated.cpuAccessReasons.clear();

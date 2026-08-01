@@ -503,6 +503,12 @@ namespace
             else if (behavior == Behavior::InvalidOutput)
                 output.resize(1u);
             ++serviceStatistics.spriteDrawsCompleted;
+            ++serviceStatistics.queueSubmissions;
+            ++serviceStatistics.shaderDispatches;
+            serviceStatistics.pipelineBarriers += 4u;
+            ++serviceStatistics.pipelineBinds;
+            ++serviceStatistics.pipelineCacheHits;
+            ++serviceStatistics.fenceWaits;
             if (error)
                 error->clear();
             return true;
@@ -532,6 +538,9 @@ namespace
                     GS_VRAM_PAGE_SIZE);
             }
             ++serviceStatistics.pageUploadOperationsCompleted;
+            ++serviceStatistics.queueSubmissions;
+            serviceStatistics.pipelineBarriers += 3u;
+            ++serviceStatistics.fenceWaits;
             serviceStatistics.pagesUploaded += pages.count();
             serviceStatistics.bytesUploaded +=
                 pages.count() * GS_VRAM_PAGE_SIZE;
@@ -564,6 +573,9 @@ namespace
                     GS_VRAM_PAGE_SIZE);
             }
             ++serviceStatistics.pageDownloadOperationsCompleted;
+            ++serviceStatistics.queueSubmissions;
+            serviceStatistics.pipelineBarriers += 3u;
+            ++serviceStatistics.fenceWaits;
             serviceStatistics.pagesDownloaded += pages.count();
             serviceStatistics.bytesDownloaded +=
                 pages.count() * GS_VRAM_PAGE_SIZE;
@@ -611,6 +623,10 @@ namespace
                 static_cast<uint64_t>(sprites.size()));
             ++serviceStatistics.queueSubmissions;
             serviceStatistics.shaderDispatches += sprites.size();
+            serviceStatistics.pipelineBarriers += 2u;
+            ++serviceStatistics.pipelineBinds;
+            ++serviceStatistics.pipelineCacheHits;
+            ++serviceStatistics.fenceWaits;
             if (error)
                 error->clear();
             return true;
@@ -1170,6 +1186,7 @@ void register_ps2_gs_vulkan_tests()
             GsVulkanRasterBackendConfig config{};
             config.mode = GsRendererMode::Hybrid;
             config.maximumResidentBatchCommands = 2u;
+            config.minimumHybridSpritePixels = 0u;
             std::unique_ptr<GsVulkanRasterBackend> backend =
                 GsVulkanRasterBackend::createWithExecutor(
                     std::make_unique<FakeCt32Executor>(
@@ -1252,6 +1269,167 @@ void register_ps2_gs_vulkan_tests()
                      "a zero-sized resident queue should fail closed");
             t.IsFalse(invalidError.empty(),
                       "an invalid queue bound should retain a diagnostic");
+        });
+
+        tc.Run("Vulkan hybrid cost policy keeps tiny sprites in software", [](TestCase &t)
+        {
+            class ImmediateSoftwareBackend final : public IGsRasterBackend
+            {
+            public:
+                explicit ImmediateSoftwareBackend(
+                    std::vector<uint8_t> &vram_) noexcept
+                    : vram(vram_)
+                {
+                }
+
+                GsBackendDecision classify(
+                    const GsDrawCommand &) const override
+                {
+                    return {true, GsFallbackReason::Supported};
+                }
+
+                void submit(
+                    std::span<const GsDrawCommand> commands) override
+                {
+                    for (const GsDrawCommand &command : commands)
+                    {
+                        GsVulkanCt32Sprite sprite{};
+                        if (prepareGsVulkanCt32Sprite(
+                                command, sprite).supported)
+                        {
+                            applyCt32SpriteCpu(vram, sprite);
+                        }
+                    }
+                }
+
+                void flush(GsFlushReason) override {}
+
+                size_t pendingCommandCount() const noexcept override
+                {
+                    return 0u;
+                }
+
+            private:
+                std::vector<uint8_t> &vram;
+            };
+
+            GSMem::InitLookupTables();
+            const GsDrawCommand tiny = makeCt32SpriteCommand(
+                301u, 2u, 1u,
+                {0u, 31u, 0u, 31u}, {0u, 0u},
+                1u * 16u, 1u * 16u,
+                5u * 16u, 5u * 16u, 0x44332211u);
+            const GsDrawCommand threshold = makeCt32SpriteCommand(
+                302u, 6u, 1u,
+                {0u, 31u, 0u, 31u}, {0u, 0u},
+                2u * 16u, 2u * 16u,
+                10u * 16u, 10u * 16u, 0x88776655u);
+
+            std::vector<uint8_t> vram = makeVramPattern(0x434F5354u);
+            std::vector<uint8_t> expected = vram;
+            for (const GsDrawCommand *command :
+                 std::array<const GsDrawCommand *, 2>{&tiny, &threshold})
+            {
+                GsVulkanCt32Sprite sprite{};
+                t.IsTrue(prepareGsVulkanCt32Sprite(
+                             *command, sprite).supported,
+                         "cost fixtures should satisfy the semantic predicate");
+                applyCt32SpriteCpu(expected, sprite);
+            }
+
+            GsVulkanRasterBackendConfig config{};
+            config.mode = GsRendererMode::Hybrid;
+            config.minimumHybridSpritePixels = 64u;
+            uint64_t commitCalls = 0u;
+            std::unique_ptr<GsVulkanRasterBackend> accelerated =
+                GsVulkanRasterBackend::createWithExecutor(
+                    std::make_unique<FakeCt32Executor>(
+                        FakeCt32Executor::Behavior::Exact),
+                    config, vram,
+                    [](const GsDrawCommand &) {},
+                    [&](const GsDrawCommand &) { ++commitCalls; }, nullptr);
+            t.IsNotNull(accelerated.get(),
+                        "the cost-policy fake backend should construct");
+            if (!accelerated)
+                return;
+
+            t.Equals(accelerated->classify(tiny).reason,
+                     GsFallbackReason::CostModel,
+                     "a 16-pixel hybrid draw should fall below the threshold");
+            t.IsTrue(accelerated->classify(threshold).supported,
+                     "a draw exactly at the threshold should stay eligible");
+            t.IsTrue(accelerated->setMode(GsRendererMode::GpuStrict),
+                     "the fixture should switch to strict mode");
+            t.IsTrue(accelerated->classify(tiny).supported,
+                     "strict mode should ignore the hybrid performance policy");
+            t.IsTrue(accelerated->setMode(GsRendererMode::Verify),
+                     "the fixture should switch to verify mode");
+            t.IsTrue(accelerated->classify(tiny).supported,
+                     "verify mode should exercise every semantic candidate");
+            t.IsTrue(accelerated->setMode(GsRendererMode::Hybrid),
+                     "the fixture should restore hybrid policy routing");
+
+            ImmediateSoftwareBackend software(vram);
+            GsBackendRouter router(software);
+            router.setAcceleratedBackend(accelerated.get());
+            t.IsTrue(router.setMode(GsRendererMode::Hybrid),
+                     "the cost-policy backend should attach to the router");
+            router.setCountersEnabled(true);
+            const GsSubmissionResult tinyResult = router.submit(tiny);
+            const GsSubmissionResult thresholdResult =
+                router.submit(threshold);
+            t.IsTrue(tinyResult.usedSoftware &&
+                         tinyResult.decision.reason ==
+                             GsFallbackReason::CostModel,
+                     "hybrid should route the tiny draw through software");
+            t.IsTrue(thresholdResult.usedAccelerated,
+                     "hybrid should queue the threshold-sized draw on the GPU");
+            t.Equals(accelerated->pendingCommandCount(), static_cast<size_t>(1u),
+                     "the threshold-sized draw should remain pending until observation");
+
+            router.flush(GsFlushReason::DebuggerObservation);
+            t.IsTrue(vram == expected,
+                     "mixed cost fallback and GPU execution should remain byte-exact");
+            t.Equals(commitCalls, 1ull,
+                     "only the accelerated threshold draw should publish a commit");
+
+            const GsBackendCounters &counters = router.counters();
+            t.Equals(counters.commands, 2ull,
+                     "the cost sequence should contain two commands");
+            t.Equals(counters.softwareCommands, 1ull,
+                     "the tiny command should use software once");
+            t.Equals(counters.fallbackCommands, 1ull,
+                     "the tiny command should be one explicit fallback");
+            t.Equals(counters.acceleratedCommands, 1ull,
+                     "the threshold command should be accelerated once");
+            t.Equals(counters.drawPixels, 80ull,
+                     "pixel counters should include both 4x4 and 8x8 draws");
+            t.Equals(counters.softwarePixels, 16ull,
+                     "software cost should retain the tiny draw's 16 pixels");
+            t.Equals(counters.fallbackPixels, 16ull,
+                     "cost fallback should retain its exact pixel count");
+            t.Equals(counters.acceleratedPixels, 64ull,
+                     "accelerated cost should retain the threshold draw's pixels");
+            t.Equals(
+                counters.decisions[static_cast<size_t>(
+                    GsFallbackReason::CostModel)],
+                1ull,
+                "the named cost-model decision should be counted once");
+            t.Equals(counters.queueHighWatermark, 1ull,
+                     "the cost sequence should expose one queued GPU draw");
+
+            const GsVulkanServiceStatistics service =
+                accelerated->serviceStatistics();
+            t.Equals(service.spriteDrawsCompleted, 1ull,
+                     "cost fallback should not become a GPU request");
+            t.Equals(service.pipelineBarriers, 8ull,
+                     "one upload draw and download should expose eight barriers");
+            t.Equals(service.pipelineBinds, 1ull,
+                     "the one accelerated draw should bind one fixed pipeline");
+            t.Equals(service.pipelineCacheHits, 1ull,
+                     "the accelerated draw should reuse one fixed pipeline");
+            t.Equals(service.fenceWaits, 3ull,
+                     "upload draw and observation should each wait once");
         });
 
         tc.Run("Vulkan verify mismatch writes a complete bounded reproducer", [](TestCase &t)
@@ -1636,6 +1814,14 @@ void register_ps2_gs_vulkan_tests()
                      "one upload one draw batch and one download should require three submissions");
             t.Equals(service.shaderDispatches, 2ull,
                      "both batched sprites should retain exact dispatch accounting");
+            t.Equals(service.pipelineBarriers, 8ull,
+                     "upload batch and download should expose all submitted barriers");
+            t.Equals(service.pipelineBinds, 1ull,
+                     "the two compatible draws should bind their fixed pipeline once");
+            t.Equals(service.pipelineCacheHits, 1ull,
+                     "the compatible batch should reuse the fixed sprite pipeline");
+            t.Equals(service.fenceWaits, 3ull,
+                     "upload batch and download should each wait on one fence");
             t.Equals(service.pageDownloadOperationsCompleted, 1ull,
                      "a partial host upload should preserve one overlapping GPU page");
             t.Equals(service.pagesDownloaded, 1ull,
@@ -2993,6 +3179,21 @@ void register_ps2_gs_vulkan_tests()
                          beforeBatch.shaderDispatches,
                      static_cast<uint64_t>(sprites.size()),
                      "each resident batch member should retain one compute dispatch");
+            t.Equals(afterBatch.pipelineBarriers -
+                         beforeBatch.pipelineBarriers,
+                     2ull,
+                     "one resident batch should use one prepare and one completion barrier");
+            t.Equals(afterBatch.pipelineBinds -
+                         beforeBatch.pipelineBinds,
+                     1ull,
+                     "one resident batch should bind the fixed CT32 pipeline once");
+            t.Equals(afterBatch.pipelineCacheHits -
+                         beforeBatch.pipelineCacheHits,
+                     1ull,
+                     "one resident batch should reuse its prebuilt pipeline once");
+            t.Equals(afterBatch.fenceWaits - beforeBatch.fenceWaits,
+                     1ull,
+                     "one resident batch should wait on one submitted fence");
             t.Equals(afterBatch.spriteDrawsCompleted -
                          beforeBatch.spriteDrawsCompleted,
                      static_cast<uint64_t>(sprites.size()),

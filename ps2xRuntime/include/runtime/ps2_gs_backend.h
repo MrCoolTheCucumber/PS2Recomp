@@ -195,6 +195,7 @@ enum class GsFallbackReason : uint8_t
     DestinationRead,
     ResourceAlias,
     UnknownMemoryLayout,
+    CostModel,
     Count,
 };
 
@@ -229,6 +230,12 @@ struct GsBackendCounters
     uint64_t backendSwitches = 0;
     uint64_t queueDepth = 0;
     uint64_t queueHighWatermark = 0;
+    uint64_t drawPixels = 0;
+    uint64_t softwarePixels = 0;
+    uint64_t acceleratedPixels = 0;
+    uint64_t verifiedPixels = 0;
+    uint64_t fallbackPixels = 0;
+    uint64_t strictFailurePixels = 0;
     std::array<uint64_t, GS_FALLBACK_REASON_COUNT> decisions{};
     std::array<uint64_t, GS_FLUSH_REASON_COUNT> flushReasons{};
 };

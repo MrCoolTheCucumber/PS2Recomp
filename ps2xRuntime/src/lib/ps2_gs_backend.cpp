@@ -515,6 +515,18 @@ namespace
         }
         return true;
     }
+
+    uint64_t drawPixelCount(const GsDrawCommand &command) noexcept
+    {
+        const GsDrawBounds &bounds = command.bounds();
+        if (bounds.empty())
+            return 0u;
+        const uint64_t width = static_cast<uint64_t>(
+            static_cast<int64_t>(bounds.x1) - bounds.x0);
+        const uint64_t height = static_cast<uint64_t>(
+            static_cast<int64_t>(bounds.y1) - bounds.y0);
+        return width * height;
+    }
 }
 
 void GsVramPageMask::clear() noexcept
@@ -837,8 +849,13 @@ bool GsBackendRouter::hasAcceleratedBackend() const noexcept
 GsSubmissionResult GsBackendRouter::submit(
     const GsDrawCommand &command)
 {
+    uint64_t pixels = 0u;
     if (m_countersEnabled)
+    {
         ++m_counters.commands;
+        pixels = drawPixelCount(command);
+        m_counters.drawPixels += pixels;
+    }
 
     if (m_mode == GsRendererMode::Software)
     {
@@ -856,6 +873,7 @@ GsSubmissionResult GsBackendRouter::submit(
         if (m_countersEnabled)
         {
             ++m_counters.softwareCommands;
+            m_counters.softwarePixels += pixels;
             recordDecision(GsFallbackReason::Supported);
             updateQueueDepth(*m_softwareBackend);
         }
@@ -883,8 +901,12 @@ GsSubmissionResult GsBackendRouter::submit(
         if (m_countersEnabled)
         {
             ++m_counters.acceleratedCommands;
+            m_counters.acceleratedPixels += pixels;
             if (m_mode == GsRendererMode::Verify)
+            {
                 ++m_counters.verifiedCommands;
+                m_counters.verifiedPixels += pixels;
+            }
             updateQueueDepth(*m_acceleratedBackend);
         }
         return {true, false, true, decision};
@@ -893,7 +915,10 @@ GsSubmissionResult GsBackendRouter::submit(
     if (m_mode == GsRendererMode::GpuStrict)
     {
         if (m_countersEnabled)
+        {
             ++m_counters.strictFailures;
+            m_counters.strictFailurePixels += pixels;
+        }
         return {false, false, false, decision};
     }
 
@@ -912,6 +937,8 @@ GsSubmissionResult GsBackendRouter::submit(
     {
         ++m_counters.softwareCommands;
         ++m_counters.fallbackCommands;
+        m_counters.softwarePixels += pixels;
+        m_counters.fallbackPixels += pixels;
         updateQueueDepth(*m_softwareBackend);
     }
     return {true, true, false, decision};
@@ -1108,6 +1135,7 @@ std::string_view gsFallbackReasonName(GsFallbackReason reason) noexcept
     case GsFallbackReason::DestinationRead: return "destination-read";
     case GsFallbackReason::ResourceAlias: return "resource-alias";
     case GsFallbackReason::UnknownMemoryLayout: return "unknown-memory-layout";
+    case GsFallbackReason::CostModel: return "cost-model";
     case GsFallbackReason::Count: break;
     }
     return "unknown";

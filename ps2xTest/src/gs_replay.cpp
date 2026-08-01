@@ -67,6 +67,8 @@ namespace
                "[--packet-sizes FILE] [--hash-trace FILE] "
                "[--renderer software|hybrid|verify|gpu-strict] "
                "[--verify-dump-dir DIRECTORY] "
+               "[--vulkan-max-resident-batch COUNT] "
+               "[--vulkan-min-hybrid-pixels COUNT] "
                "[--vulkan-validation] [--vulkan-loader FILE] "
                "[--vulkan-vendor ID] [--vulkan-device ID] "
                "[--backend-stats] [--stop-after-command COUNT] "
@@ -153,6 +155,13 @@ namespace
                << ",\"queue_depth\":" << counters.queueDepth
                << ",\"queue_high_watermark\":"
                << counters.queueHighWatermark
+               << ",\"draw_pixels\":" << counters.drawPixels
+               << ",\"software_pixels\":" << counters.softwarePixels
+               << ",\"accelerated_pixels\":" << counters.acceleratedPixels
+               << ",\"verified_pixels\":" << counters.verifiedPixels
+               << ",\"fallback_pixels\":" << counters.fallbackPixels
+               << ",\"strict_failure_pixels\":"
+               << counters.strictFailurePixels
                << ",\"decisions\":{";
 
         for (size_t index = 0u;
@@ -328,12 +337,24 @@ namespace
                << statistics.queueSubmissions
                << ",\"shader_dispatches\":"
                << statistics.shaderDispatches
+               << ",\"pipeline_barriers\":"
+               << statistics.pipelineBarriers
+               << ",\"pipeline_binds\":"
+               << statistics.pipelineBinds
+               << ",\"pipeline_cache_hits\":"
+               << statistics.pipelineCacheHits
+               << ",\"pipeline_cache_misses\":"
+               << statistics.pipelineCacheMisses
                << ",\"bytes_uploaded\":"
                << statistics.bytesUploaded
                << ",\"bytes_downloaded\":"
                << statistics.bytesDownloaded
+               << ",\"fence_waits\":"
+               << statistics.fenceWaits
                << ",\"fence_wait_nanoseconds\":"
                << statistics.fenceWaitNanoseconds
+               << ",\"fence_timeouts\":"
+               << statistics.fenceTimeouts
                << ",\"memory_batches_completed\":"
                << statistics.memoryBatchesCompleted
                << ",\"memory_batches_failed\":"
@@ -346,6 +367,28 @@ namespace
                << statistics.spriteDrawsFailed
                << ",\"sprite_pixels_executed\":"
                << statistics.spritePixelsExecuted
+               << ",\"resident_sprite_batches_completed\":"
+               << statistics.residentSpriteBatchesCompleted
+               << ",\"resident_sprite_batches_failed\":"
+               << statistics.residentSpriteBatchesFailed
+               << ",\"largest_resident_sprite_batch\":"
+               << statistics.largestResidentSpriteBatch
+               << ",\"page_upload_operations_completed\":"
+               << statistics.pageUploadOperationsCompleted
+               << ",\"page_upload_operations_failed\":"
+               << statistics.pageUploadOperationsFailed
+               << ",\"page_download_operations_completed\":"
+               << statistics.pageDownloadOperationsCompleted
+               << ",\"page_download_operations_failed\":"
+               << statistics.pageDownloadOperationsFailed
+               << ",\"pages_uploaded\":"
+               << statistics.pagesUploaded
+               << ",\"pages_downloaded\":"
+               << statistics.pagesDownloaded
+               << ",\"page_upload_regions\":"
+               << statistics.pageUploadRegions
+               << ",\"page_download_regions\":"
+               << statistics.pageDownloadRegions
                << ",\"validation_warnings\":"
                << statistics.validationWarnings
                << ",\"validation_errors\":"
@@ -374,6 +417,42 @@ namespace
                << ",\"bytes_compared\":"
                << statistics.bytesCompared
                << ",\"flushes\":" << statistics.flushes
+               << ",\"resident_commands\":"
+               << statistics.residentCommands
+               << ",\"resident_batches_completed\":"
+               << statistics.residentBatchesCompleted
+               << ",\"largest_resident_batch\":"
+               << statistics.largestResidentBatch
+               << ",\"resource_hazard_drains\":"
+               << statistics.resourceHazardDrains
+               << ",\"queue_backpressure_drains\":"
+               << statistics.queueBackpressureDrains
+               << ",\"cpu_access_preparations\":"
+               << statistics.cpuAccessPreparations
+               << ",\"page_ownership\":{\"synchronized_pages\":"
+               << statistics.pageOwnership.synchronizedPages
+               << ",\"cpu_newer_pages\":"
+               << statistics.pageOwnership.cpuNewerPages
+               << ",\"gpu_newer_pages\":"
+               << statistics.pageOwnership.gpuNewerPages
+               << "},\"coherency\":{\"cpu_write_operations\":"
+               << statistics.coherency.cpuWriteOperations
+               << ",\"cpu_write_pages\":"
+               << statistics.coherency.cpuWritePages
+               << ",\"gpu_write_operations\":"
+               << statistics.coherency.gpuWriteOperations
+               << ",\"gpu_write_pages\":"
+               << statistics.coherency.gpuWritePages
+               << ",\"cpu_to_gpu_operations\":"
+               << statistics.coherency.cpuToGpuOperations
+               << ",\"cpu_to_gpu_pages\":"
+               << statistics.coherency.cpuToGpuPages
+               << ",\"gpu_to_cpu_operations\":"
+               << statistics.coherency.gpuToCpuOperations
+               << ",\"gpu_to_cpu_pages\":"
+               << statistics.coherency.gpuToCpuPages
+               << ",\"rejected_transitions\":"
+               << statistics.coherency.rejectedTransitions << '}'
                << ",\"last_verification_artifact\":";
         writeJsonString(
             output, statistics.lastVerificationArtifact);
@@ -611,6 +690,7 @@ int main(int argc, char **argv)
     bool vulkanOptionUsed = false;
     uint64_t vulkanRoundTripCount = 0u;
     GsVulkanProbeConfig vulkanConfig{};
+    GsVulkanRasterBackendConfig vulkanBackendConfig{};
     bool commandLimitSet = false;
     bool packetLimitSet = false;
     uint64_t commandLimit = 0u;
@@ -673,6 +753,8 @@ int main(int argc, char **argv)
             argument == "--stop-after-packet" ||
             argument == "--compare-vram" ||
             argument == "--verify-dump-dir" ||
+            argument == "--vulkan-max-resident-batch" ||
+            argument == "--vulkan-min-hybrid-pixels" ||
             argument == "--vulkan-loader" ||
             argument == "--vulkan-vendor" ||
             argument == "--vulkan-device")
@@ -715,6 +797,40 @@ int main(int argc, char **argv)
             else if (argument == "--verify-dump-dir")
             {
                 verificationArtifactDirectory = argv[index];
+                replayOptionUsed = true;
+                gifReplayOptionUsed = true;
+            }
+            else if (argument == "--vulkan-max-resident-batch")
+            {
+                uint64_t maximum = 0u;
+                if (!parseCount(argv[index], maximum) || maximum == 0u ||
+                    maximum > GS_VULKAN_MAX_RESIDENT_SPRITE_BATCH)
+                {
+                    std::cerr
+                        << "Vulkan resident batch bound must be between 1 and "
+                        << GS_VULKAN_MAX_RESIDENT_SPRITE_BATCH << '\n';
+                    return 2;
+                }
+                vulkanBackendConfig.maximumResidentBatchCommands =
+                    static_cast<size_t>(maximum);
+                vulkanOptionUsed = true;
+                replayOptionUsed = true;
+                gifReplayOptionUsed = true;
+            }
+            else if (argument == "--vulkan-min-hybrid-pixels")
+            {
+                uint64_t minimum = 0u;
+                constexpr uint64_t maximumPixels = 2048ull * 2048ull;
+                if (!parseCount(argv[index], minimum) ||
+                    minimum > maximumPixels)
+                {
+                    std::cerr
+                        << "Vulkan hybrid pixel threshold must be between 0 and "
+                        << maximumPixels << '\n';
+                    return 2;
+                }
+                vulkanBackendConfig.minimumHybridSpritePixels = minimum;
+                vulkanOptionUsed = true;
                 replayOptionUsed = true;
                 gifReplayOptionUsed = true;
             }
@@ -1030,8 +1146,10 @@ int main(int argc, char **argv)
     {
         GsVulkanServiceConfig serviceConfig{};
         serviceConfig.probe = vulkanConfig;
+        vulkanBackendConfig.verificationArtifactDirectory =
+            verificationArtifactDirectory;
         if (!gs.configureVulkanRenderer(
-                serviceConfig, verificationArtifactDirectory))
+                serviceConfig, vulkanBackendConfig))
         {
             std::cerr << "failed to configure Vulkan renderer: "
                       << gs.rendererDiagnostic() << '\n';

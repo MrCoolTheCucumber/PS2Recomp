@@ -1316,6 +1316,8 @@ namespace
         bool submitCommands(
             std::string_view operationName,
             uint64_t shaderDispatchCount,
+            uint64_t pipelineBarrierCount,
+            uint64_t pipelineBindCount,
             GsVulkanCapabilityReport &report,
             GsVulkanServiceStatistics &statistics,
             std::string &error);
@@ -1366,6 +1368,7 @@ namespace
         VkCommandBuffer m_commandBuffer = VK_NULL_HANDLE;
         VkFence m_fence = VK_NULL_HANDLE;
         uint64_t m_fenceTimeoutNanoseconds = 0u;
+        uint64_t m_pipelineCacheMisses = 0u;
         bool m_healthy = false;
     };
 
@@ -1962,6 +1965,10 @@ namespace
                 VkShaderModule &shaderModule, VkPipeline &pipeline,
                 std::string_view label)
         {
+            // The service eagerly populates its fixed, bounded pipeline set.
+            // Each creation attempt is the only possible cache miss; submitted
+            // operations reuse one of these handles and account cache hits.
+            ++m_pipelineCacheMisses;
             VkShaderModuleCreateInfo shaderInfo{};
             shaderInfo.sType =
                 VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;
@@ -2173,6 +2180,7 @@ namespace
             m_validation.errors.load(std::memory_order_relaxed);
         statistics.validationWarnings = report.validationWarnings;
         statistics.validationErrors = report.validationErrors;
+        statistics.pipelineCacheMisses = m_pipelineCacheMisses;
         statistics.deviceLost =
             report.status == GsVulkanProbeStatus::DeviceLost;
     }
@@ -2380,6 +2388,8 @@ namespace
     bool VulkanExecutionContext::submitCommands(
         std::string_view operationName,
         uint64_t shaderDispatchCount,
+        uint64_t pipelineBarrierCount,
+        uint64_t pipelineBindCount,
         GsVulkanCapabilityReport &report,
         GsVulkanServiceStatistics &statistics,
         std::string &error)
@@ -2406,8 +2416,12 @@ namespace
         }
         ++statistics.queueSubmissions;
         statistics.shaderDispatches += shaderDispatchCount;
+        statistics.pipelineBarriers += pipelineBarrierCount;
+        statistics.pipelineBinds += pipelineBindCount;
+        statistics.pipelineCacheHits += pipelineBindCount;
 
         const auto waitStart = std::chrono::steady_clock::now();
+        ++statistics.fenceWaits;
         result = m_functions.waitForFences(
             m_device, 1u, &m_fence, VK_TRUE,
             m_fenceTimeoutNanoseconds);
@@ -2419,6 +2433,7 @@ namespace
                     .count());
         if (result == VK_TIMEOUT)
         {
+            ++statistics.fenceTimeouts;
             error = "Vulkan GS " + std::string(operationName) +
                     " fence timed out";
             report.status = GsVulkanProbeStatus::ExecutionTimeout;
@@ -2538,7 +2553,7 @@ namespace
             0u, 0u, nullptr, 1u, &vramCompleteBarrier, 0u, nullptr);
 
         if (!submitCommands(
-                "VRAM page upload", 0u,
+                "VRAM page upload", 0u, 3u, 0u,
                 report, statistics, error) ||
             !finishOperation(
                 "VRAM page upload", validationErrorsBefore,
@@ -2633,7 +2648,7 @@ namespace
             0u, nullptr);
 
         if (!submitCommands(
-                "VRAM page download", 0u,
+                "VRAM page download", 0u, 3u, 0u,
                 report, statistics, error) ||
             !invalidateMappedAllocation(
                 m_staging, "VRAM page download", report, error) ||
@@ -2728,7 +2743,7 @@ namespace
             0u, 0u, nullptr, 1u, &completeBarrier, 0u, nullptr);
 
         if (!submitCommands(
-                "resident CT32 sprite batch", sprites.size(),
+                "resident CT32 sprite batch", sprites.size(), 2u, 1u,
                 report, statistics, error) ||
             !finishOperation(
                 "resident CT32 sprite batch", validationErrorsBefore,
@@ -2940,7 +2955,9 @@ namespace
             0u, nullptr);
 
         if (!submitCommands(
-                operationName, 1u, report, statistics, error) ||
+                operationName, 1u,
+                memoryOperation ? 6u : 4u, 1u,
+                report, statistics, error) ||
             !invalidateMappedAllocation(
                 m_staging, "VRAM", report, error) ||
             (memoryOperation &&
@@ -3210,11 +3227,9 @@ struct GsVulkanService::Impl final
             context.initialize(config, localCapabilities, localError);
 
         if (!initializedSuccessfully)
-        {
             context.shutdown();
-            context.refreshDiagnostics(
-                localCapabilities, localStatistics);
-        }
+        context.refreshDiagnostics(
+            localCapabilities, localStatistics);
 
         {
             std::lock_guard lock(stateMutex);
