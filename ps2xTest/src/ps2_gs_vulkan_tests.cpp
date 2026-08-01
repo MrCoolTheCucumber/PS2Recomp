@@ -10384,6 +10384,386 @@ void register_ps2_gs_vulkan_tests()
                      "integrated feedback Verify should emit no validation warnings");
         });
 
+        tc.Run("GS Vulkan strict feedback survives ownership and lifecycle checkpoints", [](TestCase &t)
+        {
+            GSMem::InitLookupTables();
+            const std::array<GsDrawCommand, 2> commands{{
+                makeFeedbackLinearDepthCt32SpriteCommand(
+                    30'500u, 4u, 1u, 200u, GS_PSM_Z24, false, 1u,
+                    6u, 5u,
+                    {0u, 63u, 0u, 31u}, {0u, 0u},
+                    {0u, 128u}, {0u, 128u},
+                    {128u, 256u}, {0u, 128u},
+                    0x00123456u),
+                makeFeedbackLinearDepthCt32SpriteCommand(
+                    30'501u, 4u, 1u, 200u, GS_PSM_Z24, false, 1u,
+                    6u, 5u,
+                    {0u, 63u, 0u, 31u}, {0u, 0u},
+                    {128u, 256u}, {0u, 128u},
+                    {0u, 128u}, {0u, 128u},
+                    0x00654321u),
+            }};
+            const std::array<GsDrawCommand, 2> shutdownCommands{{
+                makeFeedbackLinearDepthCt32SpriteCommand(
+                    30'502u, 4u, 1u, 200u, GS_PSM_Z24, false, 1u,
+                    6u, 5u,
+                    {0u, 63u, 0u, 31u}, {0u, 0u},
+                    {256u, 384u}, {256u, 384u},
+                    {384u, 512u}, {256u, 384u},
+                    0x002468ACu),
+                makeFeedbackLinearDepthCt32SpriteCommand(
+                    30'503u, 4u, 1u, 200u, GS_PSM_Z24, false, 1u,
+                    6u, 5u,
+                    {0u, 63u, 0u, 31u}, {0u, 0u},
+                    {384u, 512u}, {256u, 384u},
+                    {256u, 384u}, {256u, 384u},
+                    0x0013579Bu),
+            }};
+            std::array<GsVulkanFeedbackLinearDepthCt32Sprite, 2>
+                prepared{};
+            for (size_t index = 0u; index < commands.size(); ++index)
+            {
+                t.IsTrue(
+                    prepareGsVulkanFeedbackLinearDepthCt32Sprite(
+                        commands[index], prepared[index]).supported,
+                    "every strict feedback checkpoint should satisfy the exact predicate");
+            }
+            for (const GsDrawCommand &command : shutdownCommands)
+            {
+                GsVulkanFeedbackLinearDepthCt32Sprite shutdownPrepared{};
+                t.IsTrue(
+                    prepareGsVulkanFeedbackLinearDepthCt32Sprite(
+                        command, shutdownPrepared).supported,
+                    "the shutdown feedback fixture should satisfy the exact predicate");
+            }
+
+            const std::vector<uint8_t> initial =
+                makeVramPattern(0x46425331u);
+            std::vector<uint8_t> softwareVram = initial;
+            std::vector<uint8_t> strictVram = initial;
+            GSRegisters softwareRegisters{};
+            GSRegisters strictRegisters{};
+            configureCt32Display(softwareRegisters, 4u);
+            configureCt32Display(strictRegisters, 4u);
+
+            {
+                GS software;
+                GS strict;
+                software.init(
+                    softwareVram.data(),
+                    static_cast<uint32_t>(softwareVram.size()),
+                    &softwareRegisters);
+                strict.init(
+                    strictVram.data(),
+                    static_cast<uint32_t>(strictVram.size()),
+                    &strictRegisters);
+
+                GsVulkanCapabilityReport preflight{};
+                const GsVulkanServiceConfig config =
+                    makeRendererServiceConfig(preflight);
+                t.IsTrue(
+                    strict.configureVulkanRenderer(config),
+                    "the strict feedback checkpoint fixture should accept Vulkan configuration");
+                if (!preflight.ready())
+                {
+                    t.IsFalse(
+                        strict.setRendererMode(GsRendererMode::GpuStrict),
+                        "an unavailable host should decline strict feedback checkpoints cleanly");
+                    return;
+                }
+                const GsVulkanDeviceReport *selected =
+                    preflight.selectedDevice();
+                t.IsNotNull(
+                    selected,
+                    "a ready strict feedback preflight should select one device");
+                if (!selected)
+                    return;
+                t.IsTrue(
+                    selected->exactFeedbackLinearDepthCt32Sprite,
+                    "the strict feedback checkpoint device should expose the exact kernel");
+                if (!selected->exactFeedbackLinearDepthCt32Sprite)
+                    return;
+
+                t.IsTrue(
+                    strict.setRendererMode(GsRendererMode::GpuStrict),
+                    "the qualified host should enter strict feedback mode");
+                if (strict.rendererMode() != GsRendererMode::GpuStrict)
+                    return;
+                strict.setBackendCountersEnabled(true);
+                strict.resetBackendCounters();
+
+                const auto drawRun = [&software, &strict](
+                    const std::array<GsDrawCommand, 2> &run)
+                {
+                    for (const GsDrawCommand &command : run)
+                    {
+                        drawNearestCt32SpriteCommand(software, command);
+                        drawNearestCt32SpriteCommand(strict, command);
+                    }
+                };
+                const auto compareFullVram = [&](const char *boundary)
+                {
+                    const auto difference = std::mismatch(
+                        softwareVram.begin(), softwareVram.end(),
+                        strictVram.begin(), strictVram.end());
+                    if (difference.first == softwareVram.end())
+                        return true;
+                    const size_t byteOffset = static_cast<size_t>(
+                        difference.first - softwareVram.begin());
+                    t.IsTrue(
+                        false,
+                        std::string("strict feedback VRAM mismatch after ") +
+                            boundary + " at byte " +
+                            std::to_string(byteOffset) + ", page " +
+                            std::to_string(
+                                byteOffset / GS_VRAM_PAGE_SIZE));
+                    return false;
+                };
+
+                drawRun(commands);
+                t.IsTrue(
+                    strictVram == initial,
+                    "strict feedback should remain resident before debugger observation");
+                t.IsFalse(
+                    softwareVram == initial,
+                    "the software feedback oracle should establish a visible result");
+                (void)software.getDebugSnapshot();
+                (void)strict.getDebugSnapshot();
+                if (!compareFullVram("debugger checkpoint"))
+                    return;
+
+                drawRun(commands);
+                software.writeRegister(GS_REG_FINISH, 0u);
+                strict.writeRegister(GS_REG_FINISH, 0u);
+                if (!compareFullVram("FINISH checkpoint"))
+                    return;
+
+                drawRun(commands);
+                constexpr std::array<uint32_t, 3> uploadPixels{{
+                    0xC0010203u,
+                    0xD0040506u,
+                    0xE0070809u,
+                }};
+                uploadCt32Pixels(
+                    software, prepared[0].framebufferBaseBlock,
+                    prepared[0].framebufferWidth,
+                    40u, 20u, uploadPixels);
+                uploadCt32Pixels(
+                    strict, prepared[0].framebufferBaseBlock,
+                    prepared[0].framebufferWidth,
+                    40u, 20u, uploadPixels);
+                drawRun(commands);
+                const std::vector<uint8_t> softwareReadback =
+                    readCt32Pixels(
+                        software, prepared[1].framebufferBaseBlock,
+                        prepared[1].framebufferWidth,
+                        static_cast<uint16_t>(prepared[1].boundsX0),
+                        static_cast<uint16_t>(prepared[1].boundsY0),
+                        4u, 1u);
+                const std::vector<uint8_t> strictReadback =
+                    readCt32Pixels(
+                        strict, prepared[1].framebufferBaseBlock,
+                        prepared[1].framebufferWidth,
+                        static_cast<uint16_t>(prepared[1].boundsX0),
+                        static_cast<uint16_t>(prepared[1].boundsY0),
+                        4u, 1u);
+                t.IsTrue(
+                    strictReadback == softwareReadback,
+                    "strict feedback should preserve transfer ordering and scoped readback");
+                (void)software.getDebugSnapshot();
+                (void)strict.getDebugSnapshot();
+                if (!compareFullVram("transfer and readback checkpoint"))
+                    return;
+
+                drawRun(commands);
+                software.latchHostPresentationFrame();
+                strict.latchHostPresentationFrame();
+                std::vector<uint8_t> softwareFrame;
+                std::vector<uint8_t> strictFrame;
+                uint32_t softwareWidth = 0u;
+                uint32_t softwareHeight = 0u;
+                uint32_t strictWidth = 0u;
+                uint32_t strictHeight = 0u;
+                t.IsTrue(
+                    software.copyLatchedHostPresentationFrame(
+                        softwareFrame, softwareWidth, softwareHeight),
+                    "the software feedback checkpoint should publish one frame");
+                t.IsTrue(
+                    strict.copyLatchedHostPresentationFrame(
+                        strictFrame, strictWidth, strictHeight),
+                    "strict feedback should publish one frame");
+                t.Equals(
+                    strictWidth, softwareWidth,
+                    "strict feedback presentation should preserve frame width");
+                t.Equals(
+                    strictHeight, softwareHeight,
+                    "strict feedback presentation should preserve frame height");
+                t.IsTrue(
+                    strictFrame == softwareFrame,
+                    "strict feedback presentation bytes should match software");
+                if (!compareFullVram("presentation checkpoint"))
+                    return;
+
+                drawRun(commands);
+                const GsReplayState softwareState =
+                    software.captureReplayState();
+                const GsReplayState strictState =
+                    strict.captureReplayState();
+                std::vector<uint8_t> softwareEncoded;
+                std::vector<uint8_t> strictEncoded;
+                std::string stateError;
+                t.IsTrue(
+                    encodeGsReplayState(
+                        softwareState, softwareEncoded, &stateError),
+                    "the software feedback checkpoint should encode");
+                t.IsTrue(
+                    encodeGsReplayState(
+                        strictState, strictEncoded, &stateError),
+                    "the strict feedback checkpoint should encode");
+                t.IsTrue(
+                    strictEncoded == softwareEncoded,
+                    "strict feedback save-state should retain the immutable snapshot");
+                software.writeRegister(
+                    GS_REG_PRIM, static_cast<uint64_t>(GS_PRIM_POINT));
+                strict.writeRegister(
+                    GS_REG_PRIM, static_cast<uint64_t>(GS_PRIM_POINT));
+                t.IsTrue(
+                    software.restoreReplayState(softwareState),
+                    "the software feedback checkpoint should restore");
+                t.IsTrue(
+                    strict.restoreReplayState(strictState),
+                    "the strict feedback checkpoint should restore");
+                if (!compareFullVram("save-state restore checkpoint"))
+                    return;
+
+                drawRun(commands);
+                software.reset();
+                strict.reset();
+                t.Equals(
+                    strict.rendererMode(), GsRendererMode::GpuStrict,
+                    "reset should preserve strict feedback mode and service");
+                if (!compareFullVram("reset checkpoint"))
+                    return;
+
+                drawRun(commands);
+                t.IsTrue(
+                    strict.setRendererMode(GsRendererMode::Software),
+                    "the feedback checkpoint should enter explicit software mode");
+                if (!compareFullVram("strict-to-software switch"))
+                    return;
+                drawRun(commands);
+                if (!compareFullVram("explicit software feedback run"))
+                    return;
+                t.IsTrue(
+                    strict.setRendererMode(GsRendererMode::GpuStrict),
+                    "the feedback checkpoint should restore strict mode");
+                drawRun(commands);
+                (void)software.getDebugSnapshot();
+                (void)strict.getDebugSnapshot();
+                if (!compareFullVram("software-to-strict switch"))
+                    return;
+
+                const GsBackendCounters counters =
+                    strict.backendCounters();
+                t.Equals(counters.commands, 20ull,
+                         "the feedback checkpoint should assemble its exact draw count");
+                t.Equals(counters.acceleratedCommands, 18ull,
+                         "every strict-mode feedback draw should reach Vulkan");
+                t.Equals(counters.softwareCommands, 2ull,
+                         "only the explicit software interval should use the CPU");
+                t.Equals(counters.fallbackCommands, 0ull,
+                         "strict feedback checkpoints should have no implicit fallback");
+                t.Equals(counters.strictFailures, 0ull,
+                         "every strict feedback checkpoint should remain supported");
+                t.IsTrue(
+                    counters.flushReasons[static_cast<size_t>(
+                        GsFlushReason::Finish)] >= 1ull,
+                    "FINISH should retain its named feedback checkpoint");
+                t.IsTrue(
+                    counters.flushReasons[static_cast<size_t>(
+                        GsFlushReason::Transfer)] >= 1ull,
+                    "the upload should retain its transfer checkpoint");
+                t.IsTrue(
+                    counters.flushReasons[static_cast<size_t>(
+                        GsFlushReason::CpuReadback)] >= 1ull,
+                    "local-to-host should retain its feedback readback checkpoint");
+                t.IsTrue(
+                    counters.flushReasons[static_cast<size_t>(
+                        GsFlushReason::PresentationLatch)] >= 1ull,
+                    "presentation should retain its feedback checkpoint");
+                t.IsTrue(
+                    counters.flushReasons[static_cast<size_t>(
+                        GsFlushReason::DebuggerObservation)] >= 1ull,
+                    "debugger snapshots should retain their feedback checkpoint");
+                t.IsTrue(
+                    counters.flushReasons[static_cast<size_t>(
+                        GsFlushReason::SaveLoad)] >= 2ull,
+                    "capture and restore should cross both save-state boundaries");
+                t.IsTrue(
+                    counters.flushReasons[static_cast<size_t>(
+                        GsFlushReason::Reset)] >= 1ull,
+                    "reset should retain its feedback checkpoint");
+                t.IsTrue(
+                    counters.flushReasons[static_cast<size_t>(
+                        GsFlushReason::BackendSwitch)] >= 2ull,
+                    "the explicit software interval should cross both backend boundaries");
+
+                const GsVulkanRasterBackendStatistics backend =
+                    strict.vulkanRendererBackendStatistics();
+                t.Equals(backend.commandsCompleted, 18ull,
+                         "every observed strict feedback draw should complete once");
+                t.Equals(backend.committedGpuCommands, 18ull,
+                         "every observed strict feedback draw should publish once");
+                t.Equals(backend.residentCommands, 18ull,
+                         "every accelerated feedback checkpoint should stay resident");
+                t.Equals(backend.residentBatchesCompleted, 9ull,
+                         "each lifecycle boundary should drain one two-draw feedback run");
+                t.Equals(backend.coherency.rejectedTransitions, 0ull,
+                         "strict feedback checkpoints should preserve page ownership");
+                t.Equals(backend.pageOwnership.gpuNewerPages, size_t{0u},
+                         "the final debugger observation should publish every writer");
+
+                const GsVulkanServiceStatistics service =
+                    strict.vulkanRendererServiceStatistics();
+                t.Equals(
+                    service.feedbackLinearDepthCt32SpriteDrawsCompleted,
+                    18ull,
+                    "the service should execute every observed strict feedback draw");
+                t.Equals(
+                    service.feedbackLinearDepthCt32SpriteDrawsFailed,
+                    0ull,
+                    "strict feedback checkpoints should not fail service work");
+                t.Equals(
+                    service.residentFeedbackLinearDepthCt32SpriteBatchesCompleted,
+                    9ull,
+                    "the service should execute one resident batch per checkpoint run");
+                t.Equals(
+                    service.largestResidentFeedbackLinearDepthCt32SpriteBatch,
+                    2ull,
+                    "strict feedback checkpoints should retain two-draw batching");
+                t.Equals(service.validationErrors, 0u,
+                         "strict feedback checkpoints should remain validation-clean");
+                t.Equals(service.validationWarnings, 0u,
+                         "strict feedback checkpoints should emit no validation warnings");
+
+                drawRun(shutdownCommands);
+                (void)software.getDebugSnapshot();
+                const GsVulkanRasterBackendStatistics pendingBackend =
+                    strict.vulkanRendererBackendStatistics();
+                t.Equals(pendingBackend.commandsAttempted, 20ull,
+                         "shutdown should receive two final accepted feedback draws");
+                t.Equals(pendingBackend.commandsCompleted, 18ull,
+                         "the final feedback run should remain pending until shutdown");
+                t.IsFalse(
+                    strictVram == softwareVram,
+                    "the final feedback run should not publish before shutdown");
+            }
+
+            t.IsTrue(
+                strictVram == softwareVram,
+                "shutdown should publish the final resident feedback run");
+        });
+
         tc.Run("GS Vulkan Hybrid qualifies nearest CT32 textures at 8192 samples", [](TestCase &t)
         {
             GSMem::InitLookupTables();
