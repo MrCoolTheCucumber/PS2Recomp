@@ -1,4 +1,5 @@
 #include "runtime/ps2_gs_vulkan.h"
+#include "runtime/ps2_gs_common.h"
 #include "runtime/ps2_gs_memory.h"
 
 #include <algorithm>
@@ -141,13 +142,55 @@ namespace
         return logicalPageSpan < GS_VRAM_PAGE_COUNT;
     }
 
+    uint32_t maximumNearestCt32TextureCoordinate(
+        uint32_t textureMask,
+        uint32_t wrap) noexcept
+    {
+        return GSInternal::maximumWrappedTextureCoordinate(
+            textureMask + 1u,
+            gsVulkanTextureWrapMode(wrap),
+            gsVulkanTextureRegionMin(wrap),
+            gsVulkanTextureRegionMax(wrap));
+    }
+
+    GsVramPageMask nearestCt32TexturePages(
+        const GsVulkanNearestCt32Sprite &sprite) noexcept
+    {
+        return gsVramPagesForSurfaceRect(
+            sprite.textureBaseBlock,
+            sprite.textureWidth,
+            static_cast<uint8_t>(GSMem::C32),
+            0u,
+            0u,
+            maximumNearestCt32TextureCoordinate(
+                sprite.textureMaskU, sprite.textureWrapU) + 1u,
+            maximumNearestCt32TextureCoordinate(
+                sprite.textureMaskV, sprite.textureWrapV) + 1u);
+    }
+
     const char *nearestCt32SpriteValidationError(
         const GsVulkanNearestCt32Sprite &sprite) noexcept
     {
-        if (sprite.textureWrapModeU > 1u ||
-            sprite.textureWrapModeV > 1u)
+        if ((sprite.textureWrapU &
+             ~GS_VULKAN_TEXTURE_WRAP_DESCRIPTOR_MASK) != 0u ||
+            (sprite.textureWrapV &
+             ~GS_VULKAN_TEXTURE_WRAP_DESCRIPTOR_MASK) != 0u)
+        {
+            return "Vulkan nearest CT32 sprite wrap descriptor is invalid";
+        }
+        if (gsVulkanTextureWrapMode(sprite.textureWrapU) > 2u ||
+            gsVulkanTextureWrapMode(sprite.textureWrapV) > 2u)
         {
             return "Vulkan nearest CT32 sprite wrap mode is unsupported";
+        }
+        if ((gsVulkanTextureWrapMode(sprite.textureWrapU) == 2u &&
+             gsVulkanTextureRegionMin(sprite.textureWrapU) >
+                 gsVulkanTextureRegionMax(sprite.textureWrapU)) ||
+            (gsVulkanTextureWrapMode(sprite.textureWrapV) == 2u &&
+             gsVulkanTextureRegionMin(sprite.textureWrapV) >
+                 gsVulkanTextureRegionMax(sprite.textureWrapV)))
+        {
+            return "Vulkan nearest CT32 sprite region clamp is reversed";
         }
         if (sprite.framebufferBaseBlock > 0x3FFFu ||
             sprite.textureBaseBlock > 0x3FFFu)
@@ -191,14 +234,8 @@ namespace
         {
             return "Vulkan nearest CT32 sprite texture step is not unit length";
         }
-        const GsVramPageMask texturePages = gsVramPagesForSurfaceRect(
-            sprite.textureBaseBlock,
-            sprite.textureWidth,
-            static_cast<uint8_t>(GSMem::C32),
-            0u,
-            0u,
-            sprite.textureMaskU + 1u,
-            sprite.textureMaskV + 1u);
+        const GsVramPageMask texturePages =
+            nearestCt32TexturePages(sprite);
         const GsVramPageMask framebufferPages = gsVramPagesForSurfaceRect(
             sprite.framebufferBaseBlock,
             sprite.framebufferWidth,
@@ -368,14 +405,7 @@ namespace
             }
 
             const GsVramPageMask readPages =
-                gsVramPagesForSurfaceRect(
-                    sprite.textureBaseBlock,
-                    sprite.textureWidth,
-                    static_cast<uint8_t>(GSMem::C32),
-                    0u,
-                    0u,
-                    sprite.textureMaskU + 1u,
-                    sprite.textureMaskV + 1u);
+                nearestCt32TexturePages(sprite);
             const GsVramPageMask writePages =
                 gsVramPagesForSurfaceRect(
                     sprite.framebufferBaseBlock,
@@ -547,10 +577,14 @@ GsBackendDecision prepareGsVulkanNearestCt32Sprite(
         textureStepV * (bounds.y0 - unclippedY0);
     prepared.textureStepU = textureStepU;
     prepared.textureStepV = textureStepV;
-    prepared.textureWrapModeU =
-        static_cast<uint32_t>(context.clamp & 0x3u);
-    prepared.textureWrapModeV =
-        static_cast<uint32_t>((context.clamp >> 2u) & 0x3u);
+    prepared.textureWrapU = packGsVulkanTextureWrap(
+        static_cast<uint8_t>(context.clamp & 0x3u),
+        static_cast<uint16_t>((context.clamp >> 4u) & 0x3FFu),
+        static_cast<uint16_t>((context.clamp >> 14u) & 0x3FFu));
+    prepared.textureWrapV = packGsVulkanTextureWrap(
+        static_cast<uint8_t>((context.clamp >> 2u) & 0x3u),
+        static_cast<uint16_t>((context.clamp >> 24u) & 0x3FFu),
+        static_cast<uint16_t>((context.clamp >> 34u) & 0x3FFu));
     if (nearestCt32SpriteValidationError(prepared))
         return {false, GsFallbackReason::UnknownMemoryLayout};
 
@@ -1383,7 +1417,7 @@ namespace
     static_assert(kGsCt32TriangleShaderSpv[0] == 0x07230203u);
     static_assert(sizeof(kGsMemoryCasesShaderSpv) == 10988u);
     static_assert(kGsMemoryCasesShaderSpv[0] == 0x07230203u);
-    static_assert(sizeof(kGsNearestCt32SpriteShaderSpv) == 12872u);
+    static_assert(sizeof(kGsNearestCt32SpriteShaderSpv) == 13656u);
     static_assert(kGsNearestCt32SpriteShaderSpv[0] == 0x07230203u);
     static_assert(sizeof(kGsVramNoopShaderSpv) == 1112u);
     static_assert(kGsVramNoopShaderSpv[0] == 0x07230203u);

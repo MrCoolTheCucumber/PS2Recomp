@@ -300,10 +300,44 @@ static_assert(offsetof(GsVulkanCt32Sprite, reserved) == 28u);
 
 // Fixed record for Phase 6's first textured-sprite semantic slice. Texture
 // coordinates name the texel sampled at boundsX0/boundsY0 and advance by one
-// signed texel per output pixel. Power-of-two masks and the per-axis wrap modes
-// implement GS REPEAT or standard CLAMP before raw CT32 local-memory
-// addressing. Region modes remain a separate semantic slice. Source and
-// destination are guaranteed disjoint by the backend-neutral classifier.
+// signed texel per output pixel. Power-of-two masks and packed per-axis wrap
+// descriptors implement GS REPEAT, standard CLAMP, or raw-bound REGION_CLAMP
+// before raw CT32 local-memory addressing. Each descriptor stores the two-bit
+// mode followed by ten-bit MIN and MAX values. REGION_REPEAT remains a separate
+// semantic slice. Source and destination are guaranteed disjoint by the
+// backend-neutral classifier.
+inline constexpr uint32_t GS_VULKAN_TEXTURE_WRAP_DESCRIPTOR_MASK =
+    0x003FFFFFu;
+
+inline constexpr uint32_t packGsVulkanTextureWrap(
+    uint8_t mode,
+    uint16_t regionMin,
+    uint16_t regionMax) noexcept
+{
+    return
+        (static_cast<uint32_t>(mode) & 0x3u) |
+        ((static_cast<uint32_t>(regionMin) & 0x3FFu) << 2u) |
+        ((static_cast<uint32_t>(regionMax) & 0x3FFu) << 12u);
+}
+
+inline constexpr uint8_t gsVulkanTextureWrapMode(
+    uint32_t descriptor) noexcept
+{
+    return static_cast<uint8_t>(descriptor & 0x3u);
+}
+
+inline constexpr uint16_t gsVulkanTextureRegionMin(
+    uint32_t descriptor) noexcept
+{
+    return static_cast<uint16_t>((descriptor >> 2u) & 0x3FFu);
+}
+
+inline constexpr uint16_t gsVulkanTextureRegionMax(
+    uint32_t descriptor) noexcept
+{
+    return static_cast<uint16_t>((descriptor >> 12u) & 0x3FFu);
+}
+
 struct alignas(16) GsVulkanNearestCt32Sprite
 {
     uint32_t framebufferBaseBlock = 0u;
@@ -320,8 +354,8 @@ struct alignas(16) GsVulkanNearestCt32Sprite
     int32_t textureOriginV = 0;
     int32_t textureStepU = 0;
     int32_t textureStepV = 0;
-    uint32_t textureWrapModeU = 0u;
-    uint32_t textureWrapModeV = 0u;
+    uint32_t textureWrapU = 0u;
+    uint32_t textureWrapV = 0u;
 
     bool operator==(const GsVulkanNearestCt32Sprite &) const = default;
 };
@@ -343,8 +377,8 @@ static_assert(offsetof(GsVulkanNearestCt32Sprite, textureOriginU) == 40u);
 static_assert(offsetof(GsVulkanNearestCt32Sprite, textureOriginV) == 44u);
 static_assert(offsetof(GsVulkanNearestCt32Sprite, textureStepU) == 48u);
 static_assert(offsetof(GsVulkanNearestCt32Sprite, textureStepV) == 52u);
-static_assert(offsetof(GsVulkanNearestCt32Sprite, textureWrapModeU) == 56u);
-static_assert(offsetof(GsVulkanNearestCt32Sprite, textureWrapModeV) == 60u);
+static_assert(offsetof(GsVulkanNearestCt32Sprite, textureWrapU) == 56u);
+static_assert(offsetof(GsVulkanNearestCt32Sprite, textureWrapV) == 60u);
 
 // Publishes only fully validated records. Rejection leaves the caller's
 // record untouched, matching the established sprite/triangle preparation

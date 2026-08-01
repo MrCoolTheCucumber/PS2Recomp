@@ -924,7 +924,22 @@ namespace
                 static_cast<uint8_t>(context.clamp & 0x3u);
             const uint8_t wrapModeV =
                 static_cast<uint8_t>((context.clamp >> 2u) & 0x3u);
-            if (wrapModeU > 1u || wrapModeV > 1u)
+            if (wrapModeU > 2u || wrapModeV > 2u)
+            {
+                return {
+                    false,
+                    GsFallbackReason::UnsupportedTextureWrap};
+            }
+            const uint16_t regionMinU = static_cast<uint16_t>(
+                (context.clamp >> 4u) & 0x3FFu);
+            const uint16_t regionMaxU = static_cast<uint16_t>(
+                (context.clamp >> 14u) & 0x3FFu);
+            const uint16_t regionMinV = static_cast<uint16_t>(
+                (context.clamp >> 24u) & 0x3FFu);
+            const uint16_t regionMaxV = static_cast<uint16_t>(
+                (context.clamp >> 34u) & 0x3FFu);
+            if ((wrapModeU == 2u && regionMinU > regionMaxU) ||
+                (wrapModeV == 2u && regionMinV > regionMaxV))
             {
                 return {
                     false,

@@ -149,9 +149,19 @@ namespace
             << "\"texture_step_u\":" << sprite.textureStepU << ','
             << "\"texture_step_v\":" << sprite.textureStepV << ','
             << "\"texture_wrap_mode_u\":"
-            << sprite.textureWrapModeU << ','
+            << static_cast<uint32_t>(
+                   gsVulkanTextureWrapMode(sprite.textureWrapU)) << ','
             << "\"texture_wrap_mode_v\":"
-            << sprite.textureWrapModeV << '}';
+            << static_cast<uint32_t>(
+                   gsVulkanTextureWrapMode(sprite.textureWrapV)) << ','
+            << "\"texture_region_min_u\":"
+            << gsVulkanTextureRegionMin(sprite.textureWrapU) << ','
+            << "\"texture_region_max_u\":"
+            << gsVulkanTextureRegionMax(sprite.textureWrapU) << ','
+            << "\"texture_region_min_v\":"
+            << gsVulkanTextureRegionMin(sprite.textureWrapV) << ','
+            << "\"texture_region_max_v\":"
+            << gsVulkanTextureRegionMax(sprite.textureWrapV) << '}';
     }
 
     template <typename PreparedRecord>

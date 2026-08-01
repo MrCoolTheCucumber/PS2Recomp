@@ -26,15 +26,25 @@ layout(push_constant) uniform TextureSpriteParameters
     int texture_origin_v;
     int texture_step_u;
     int texture_step_v;
-    uint texture_wrap_mode_u;
-    uint texture_wrap_mode_v;
+    uint texture_wrap_u;
+    uint texture_wrap_v;
 } sprite;
 
-uint wrap_texture_coordinate(int coordinate, uint mask, uint mode)
+uint wrap_texture_coordinate(int coordinate, uint mask, uint wrap)
 {
+    uint mode = wrap & 0x3u;
     if (mode == 0u)
         return uint(coordinate) & mask;
-    return uint(clamp(coordinate, 0, int(mask)));
+    if (mode == 1u)
+        return uint(clamp(coordinate, 0, int(mask)));
+
+    int region_minimum = int((wrap >> 2u) & 0x3FFu);
+    int region_maximum = int((wrap >> 12u) & 0x3FFu);
+    if (coordinate < region_minimum)
+        return uint(region_minimum);
+    if (coordinate > region_maximum)
+        return uint(region_maximum);
+    return uint(coordinate);
 }
 
 void main()
@@ -51,9 +61,9 @@ void main()
     int texture_v = sprite.texture_origin_v +
                     int(offset_y) * sprite.texture_step_v;
     uint wrapped_u = wrap_texture_coordinate(
-        texture_u, sprite.texture_mask_u, sprite.texture_wrap_mode_u);
+        texture_u, sprite.texture_mask_u, sprite.texture_wrap_u);
     uint wrapped_v = wrap_texture_coordinate(
-        texture_v, sprite.texture_mask_v, sprite.texture_wrap_mode_v);
+        texture_v, sprite.texture_mask_v, sprite.texture_wrap_v);
     uint texture_bit_address = gs_pixel_bit_address(
         0x00u,
         sprite.texture_base_block,
