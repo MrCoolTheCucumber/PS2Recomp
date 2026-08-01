@@ -395,6 +395,15 @@ private:
 [[nodiscard]] GsBackendDecision classifyGsLinearCt32TexturedSprite(
     const GsDrawCommand &command) noexcept;
 
+// Exact recursive-feedback slice for direct CT32 DECAL RGBA with the linear
+// FST DDA, standard CLAMP/REPEAT, and Z32/Z24 depth. The texture base must name
+// the same complete surface as FRAME. Execution must sample one immutable
+// snapshot shared by the consecutive same-surface feedback run; canonical
+// color/depth writes are never a texture source for later draws in that run.
+[[nodiscard]] GsBackendDecision
+classifyGsFeedbackLinearDepthCt32Sprite(
+    const GsDrawCommand &command) noexcept;
+
 // Phase 5's first triangle predicate deliberately admits only flat,
 // untextured CT32 triangles with no destination or depth dependency. It shares
 // the ordered state checks above with the sprite slice but remains a separate

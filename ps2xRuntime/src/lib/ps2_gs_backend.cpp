@@ -824,6 +824,12 @@ namespace
         SourceOver,
     };
 
+    enum class AliasRequirement : uint8_t
+    {
+        Disallowed,
+        ExactFramebufferTextureFeedback,
+    };
+
     bool hasOneToOneIntegerTextureAxis(
         int32_t fixed0,
         int32_t fixed1,
@@ -874,7 +880,9 @@ namespace
         TextureRequirement textureRequirement,
         DepthRequirement depthRequirement = DepthRequirement::None,
         AlphaRequirement alphaRequirement =
-            AlphaRequirement::Disabled) noexcept
+            AlphaRequirement::Disabled,
+        AliasRequirement aliasRequirement =
+            AliasRequirement::Disallowed) noexcept
     {
         const GSPrimReg &primitive = command.primitive();
         const GSContext &context = command.context();
@@ -1064,8 +1072,24 @@ namespace
         if (resources.readsDestination &&
             alphaRequirement != AlphaRequirement::SourceOver)
             return {false, GsFallbackReason::DestinationRead};
-        if (resources.aliasesAnotherView())
+        if (aliasRequirement ==
+            AliasRequirement::ExactFramebufferTextureFeedback)
+        {
+            const bool exactFeedbackSurface =
+                resources.framebufferTextureAlias &&
+                !resources.framebufferDepthAlias &&
+                !resources.framebufferClutAlias &&
+                context.tex0.tbp0 == (context.frame.fbp << 5u) &&
+                context.tex0.psm == context.frame.psm &&
+                context.tex0.tbw ==
+                    std::max<uint32_t>(context.frame.fbw, 1u);
+            if (!exactFeedbackSurface)
+                return {false, GsFallbackReason::ResourceAlias};
+        }
+        else if (resources.aliasesAnotherView())
+        {
             return {false, GsFallbackReason::ResourceAlias};
+        }
         return {true, GsFallbackReason::Supported};
     }
 }
@@ -1114,6 +1138,17 @@ GsBackendDecision classifyGsLinearCt32TexturedSprite(
     return classifyFlatCt32State(
         command, GS_PRIM_SPRITE, 2u,
         TextureRequirement::LinearCt32);
+}
+
+GsBackendDecision classifyGsFeedbackLinearDepthCt32Sprite(
+    const GsDrawCommand &command) noexcept
+{
+    return classifyFlatCt32State(
+        command, GS_PRIM_SPRITE, 2u,
+        TextureRequirement::LinearCt32,
+        DepthRequirement::Z32OrZ24,
+        AlphaRequirement::Disabled,
+        AliasRequirement::ExactFramebufferTextureFeedback);
 }
 
 GsBackendDecision classifyGsFlatCt32Triangle(

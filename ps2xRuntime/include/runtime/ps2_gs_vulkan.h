@@ -527,6 +527,135 @@ static_assert(offsetof(GsVulkanLinearCt32Sprite, textureWrapV) == 92u);
     const GsDrawCommand &command,
     GsVulkanLinearCt32Sprite &sprite) noexcept;
 
+// Fixed record for the first recursive framebuffer-feedback contract. Its
+// leading 96 bytes retain the exact linear CT32 DDA ABI. The remaining words
+// describe the independent Z32/Z24 operation and require texture reads from a
+// separately supplied immutable 4 MiB feedback snapshot. Snapshot creation,
+// same-surface reuse, and invalidation are ordered by the raster frontend;
+// this record never permits in-place texture reads from writable resident VRAM.
+inline constexpr uint32_t GS_VULKAN_TEXTURE_SOURCE_FEEDBACK_SNAPSHOT = 1u;
+
+struct alignas(16) GsVulkanFeedbackLinearDepthCt32Sprite
+{
+    uint32_t framebufferBaseBlock = 0u;
+    uint32_t framebufferWidth = 0u;
+    uint32_t boundsX0 = 0u;
+    uint32_t boundsY0 = 0u;
+    uint32_t boundsX1 = 0u;
+    uint32_t boundsY1 = 0u;
+    uint32_t textureBaseBlock = 0u;
+    uint32_t textureWidth = 0u;
+    uint32_t textureMaskU = 0u;
+    uint32_t textureMaskV = 0u;
+    int32_t fixedBaseU = 0;
+    int32_t fixedBlockStepU = 0;
+    std::array<int32_t, 8> fixedLaneU{};
+    uint32_t fixedScanVBits = 0u;
+    uint32_t fixedStepVBits = 0u;
+    uint32_t textureWrapU = 0u;
+    uint32_t textureWrapV = 0u;
+    uint32_t depthBaseBlock = 0u;
+    uint32_t depthPsm = 0u;
+    uint32_t depth = 0u;
+    uint32_t depthTestMethod = 0u;
+    uint32_t depthWrite = 0u;
+    uint32_t textureSource =
+        GS_VULKAN_TEXTURE_SOURCE_FEEDBACK_SNAPSHOT;
+    uint32_t reserved0 = 0u;
+    uint32_t reserved1 = 0u;
+
+    bool operator==(
+        const GsVulkanFeedbackLinearDepthCt32Sprite &) const = default;
+};
+
+static_assert(sizeof(GsVulkanFeedbackLinearDepthCt32Sprite) == 128u);
+static_assert(std::is_standard_layout_v<
+              GsVulkanFeedbackLinearDepthCt32Sprite>);
+static_assert(std::is_trivially_copyable_v<
+              GsVulkanFeedbackLinearDepthCt32Sprite>);
+static_assert(offsetof(
+    GsVulkanFeedbackLinearDepthCt32Sprite,
+    framebufferBaseBlock) == 0u);
+static_assert(offsetof(
+    GsVulkanFeedbackLinearDepthCt32Sprite,
+    framebufferWidth) == 4u);
+static_assert(offsetof(
+    GsVulkanFeedbackLinearDepthCt32Sprite,
+    boundsX0) == 8u);
+static_assert(offsetof(
+    GsVulkanFeedbackLinearDepthCt32Sprite,
+    boundsY0) == 12u);
+static_assert(offsetof(
+    GsVulkanFeedbackLinearDepthCt32Sprite,
+    boundsX1) == 16u);
+static_assert(offsetof(
+    GsVulkanFeedbackLinearDepthCt32Sprite,
+    boundsY1) == 20u);
+static_assert(offsetof(
+    GsVulkanFeedbackLinearDepthCt32Sprite,
+    textureBaseBlock) == 24u);
+static_assert(offsetof(
+    GsVulkanFeedbackLinearDepthCt32Sprite,
+    textureWidth) == 28u);
+static_assert(offsetof(
+    GsVulkanFeedbackLinearDepthCt32Sprite,
+    textureMaskU) == 32u);
+static_assert(offsetof(
+    GsVulkanFeedbackLinearDepthCt32Sprite,
+    textureMaskV) == 36u);
+static_assert(offsetof(
+    GsVulkanFeedbackLinearDepthCt32Sprite,
+    fixedBaseU) == 40u);
+static_assert(offsetof(
+    GsVulkanFeedbackLinearDepthCt32Sprite,
+    fixedBlockStepU) == 44u);
+static_assert(offsetof(
+    GsVulkanFeedbackLinearDepthCt32Sprite,
+    fixedLaneU) == 48u);
+static_assert(offsetof(
+    GsVulkanFeedbackLinearDepthCt32Sprite,
+    fixedScanVBits) == 80u);
+static_assert(offsetof(
+    GsVulkanFeedbackLinearDepthCt32Sprite,
+    fixedStepVBits) == 84u);
+static_assert(offsetof(
+    GsVulkanFeedbackLinearDepthCt32Sprite,
+    textureWrapU) == 88u);
+static_assert(offsetof(
+    GsVulkanFeedbackLinearDepthCt32Sprite,
+    textureWrapV) == 92u);
+static_assert(offsetof(
+    GsVulkanFeedbackLinearDepthCt32Sprite,
+    depthBaseBlock) == 96u);
+static_assert(offsetof(
+    GsVulkanFeedbackLinearDepthCt32Sprite,
+    depthPsm) == 100u);
+static_assert(offsetof(
+    GsVulkanFeedbackLinearDepthCt32Sprite,
+    depth) == 104u);
+static_assert(offsetof(
+    GsVulkanFeedbackLinearDepthCt32Sprite,
+    depthTestMethod) == 108u);
+static_assert(offsetof(
+    GsVulkanFeedbackLinearDepthCt32Sprite,
+    depthWrite) == 112u);
+static_assert(offsetof(
+    GsVulkanFeedbackLinearDepthCt32Sprite,
+    textureSource) == 116u);
+static_assert(offsetof(
+    GsVulkanFeedbackLinearDepthCt32Sprite,
+    reserved0) == 120u);
+static_assert(offsetof(
+    GsVulkanFeedbackLinearDepthCt32Sprite,
+    reserved1) == 124u);
+
+// Rejection leaves the caller's record untouched. A successful record still
+// requires the matching immutable feedback snapshot at execution time.
+[[nodiscard]] GsBackendDecision
+prepareGsVulkanFeedbackLinearDepthCt32Sprite(
+    const GsDrawCommand &command,
+    GsVulkanFeedbackLinearDepthCt32Sprite &sprite) noexcept;
+
 // Phase 5's first exact triangle record. Vertex coordinates retain the signed
 // 12.4 window-space values after XYOFFSET. Preparation normalizes the winding
 // to positive area; topLeftEdgeMask bits 0..2 describe the edges opposite

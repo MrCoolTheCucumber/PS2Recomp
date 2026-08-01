@@ -598,6 +598,57 @@ namespace
             0u);
     }
 
+    GsDrawCommand makeFeedbackLinearDepthCt32SpriteCommand(
+        uint64_t sequence,
+        uint32_t framebufferPage,
+        uint8_t framebufferWidth,
+        uint32_t depthPage,
+        uint8_t depthPsm,
+        bool depthMask,
+        uint8_t depthTestMethod,
+        uint8_t textureWidthLog2,
+        uint8_t textureHeightLog2,
+        GSScissorReg scissor,
+        GSXYOffsetReg xyoffset,
+        const std::array<uint16_t, 2> &rawX,
+        const std::array<uint16_t, 2> &rawY,
+        const std::array<uint16_t, 2> &rawU,
+        const std::array<uint16_t, 2> &rawV,
+        uint32_t depth)
+    {
+        const uint32_t framebufferBaseBlock = framebufferPage << 5u;
+        const GsDrawCommand linear = makeLinearCt32SpriteCommand(
+            sequence,
+            framebufferPage,
+            framebufferWidth,
+            framebufferBaseBlock,
+            framebufferWidth,
+            textureWidthLog2,
+            textureHeightLog2,
+            scissor,
+            xyoffset,
+            rawX,
+            rawY,
+            rawU,
+            rawV,
+            1u,
+            1u);
+        GSContext context = linear.context();
+        context.zbuf = {depthPage, depthPsm, depthMask};
+        context.test =
+            (1ull << 16u) |
+            (static_cast<uint64_t>(depthTestMethod & 0x3u) << 17u);
+        std::array<GSVertex, 3> vertices = linear.vertices();
+        vertices[1].z = static_cast<double>(depth);
+        vertices[1].zInteger = depth;
+        return buildGsDrawCommand(
+            sequence,
+            linear.primitive(),
+            context,
+            std::span<const GSVertex>(vertices).first(2u),
+            linear.globalState());
+    }
+
     GsDrawCommand makeCt32TriangleCommand(
         uint64_t sequence,
         uint32_t framebufferPage,
@@ -880,10 +931,13 @@ namespace
             weightV);
     }
 
-    void applyLinearCt32SpriteCpu(
+    void applyLinearCt32SpriteCpuFromSource(
         std::vector<uint8_t> &vram,
+        std::span<const uint8_t> textureSource,
         const GsVulkanLinearCt32Sprite &sprite)
     {
+        uint8_t *const textureVram =
+            const_cast<uint8_t *>(textureSource.data());
         const auto wrapCoordinate = [](
             int32_t coordinate,
             uint32_t mask,
@@ -967,7 +1021,7 @@ namespace
                           sprite.textureWrapU);
 
                 const uint32_t c00 = GSMem::ReadCT32(
-                    vram.data(),
+                    textureVram,
                     sprite.textureBaseBlock,
                     sprite.textureWidth,
                     u0,
@@ -980,7 +1034,7 @@ namespace
                         color = linearColor4ForRecord(
                             c00,
                             GSMem::ReadCT32(
-                                vram.data(),
+                                textureVram,
                                 sprite.textureBaseBlock,
                                 sprite.textureWidth,
                                 u0,
@@ -993,7 +1047,7 @@ namespace
                     color = linearColor4ForRecord(
                         c00,
                         GSMem::ReadCT32(
-                            vram.data(),
+                            textureVram,
                             sprite.textureBaseBlock,
                             sprite.textureWidth,
                             u1,
@@ -1005,19 +1059,19 @@ namespace
                     color = bilinearColor4ForRecord(
                         c00,
                         GSMem::ReadCT32(
-                            vram.data(),
+                            textureVram,
                             sprite.textureBaseBlock,
                             sprite.textureWidth,
                             u1,
                             v0),
                         GSMem::ReadCT32(
-                            vram.data(),
+                            textureVram,
                             sprite.textureBaseBlock,
                             sprite.textureWidth,
                             u0,
                             v1),
                         GSMem::ReadCT32(
-                            vram.data(),
+                            textureVram,
                             sprite.textureBaseBlock,
                             sprite.textureWidth,
                             u1,
@@ -1034,6 +1088,103 @@ namespace
                     color);
             }
             fixedScanV += fixedStepV;
+        }
+    }
+
+    void applyLinearCt32SpriteCpu(
+        std::vector<uint8_t> &vram,
+        const GsVulkanLinearCt32Sprite &sprite)
+    {
+        applyLinearCt32SpriteCpuFromSource(
+            vram, std::span<const uint8_t>(vram), sprite);
+    }
+
+    void applyFeedbackLinearDepthCt32SpriteCpu(
+        std::vector<uint8_t> &vram,
+        std::span<const uint8_t> feedbackSnapshot,
+        const GsVulkanFeedbackLinearDepthCt32Sprite &sprite)
+    {
+        const GsVulkanLinearCt32Sprite linear{
+            sprite.framebufferBaseBlock,
+            sprite.framebufferWidth,
+            sprite.boundsX0,
+            sprite.boundsY0,
+            sprite.boundsX1,
+            sprite.boundsY1,
+            sprite.textureBaseBlock,
+            sprite.textureWidth,
+            sprite.textureMaskU,
+            sprite.textureMaskV,
+            sprite.fixedBaseU,
+            sprite.fixedBlockStepU,
+            sprite.fixedLaneU,
+            sprite.fixedScanVBits,
+            sprite.fixedStepVBits,
+            sprite.textureWrapU,
+            sprite.textureWrapV,
+        };
+        std::vector<uint8_t> sampled = vram;
+        applyLinearCt32SpriteCpuFromSource(
+            sampled, feedbackSnapshot, linear);
+
+        const auto readDepth = [&](uint32_t x, uint32_t y)
+        {
+            return sprite.depthPsm == GS_PSM_Z24
+                ? GSMem::ReadZ24(
+                      vram.data(), sprite.depthBaseBlock,
+                      sprite.framebufferWidth, x, y)
+                : GSMem::ReadZ32(
+                      vram.data(), sprite.depthBaseBlock,
+                      sprite.framebufferWidth, x, y);
+        };
+        const auto writeDepth = [&](uint32_t x, uint32_t y)
+        {
+            if (sprite.depthPsm == GS_PSM_Z24)
+            {
+                GSMem::WriteZ24(
+                    vram.data(), sprite.depthBaseBlock,
+                    sprite.framebufferWidth, x, y, sprite.depth);
+            }
+            else
+            {
+                GSMem::WriteZ32(
+                    vram.data(), sprite.depthBaseBlock,
+                    sprite.framebufferWidth, x, y, sprite.depth);
+            }
+        };
+
+        for (uint32_t y = sprite.boundsY0; y < sprite.boundsY1; ++y)
+        {
+            for (uint32_t x = sprite.boundsX0; x < sprite.boundsX1; ++x)
+            {
+                const uint32_t currentDepth =
+                    sprite.depthTestMethod >= 2u
+                        ? readDepth(x, y)
+                        : 0u;
+                const bool passes =
+                    sprite.depthTestMethod == 1u ||
+                    (sprite.depthTestMethod == 2u &&
+                     sprite.depth >= currentDepth) ||
+                    (sprite.depthTestMethod == 3u &&
+                     sprite.depth > currentDepth);
+                if (!passes)
+                    continue;
+                const uint32_t color = GSMem::ReadCT32(
+                    sampled.data(),
+                    sprite.framebufferBaseBlock,
+                    sprite.framebufferWidth,
+                    x,
+                    y);
+                GSMem::WriteCT32(
+                    vram.data(),
+                    sprite.framebufferBaseBlock,
+                    sprite.framebufferWidth,
+                    x,
+                    y,
+                    color);
+                if (sprite.depthWrite != 0u)
+                    writeDepth(x, y);
+            }
         }
     }
 
@@ -3545,6 +3696,224 @@ void register_ps2_gs_vulkan_tests()
 
             t.IsFalse(sprite == sentinel,
                       "successful preparation should replace the initial sentinel");
+        });
+
+        tc.Run("feedback linear CT32 depth has an immutable run snapshot contract", [](TestCase &t)
+        {
+            GSMem::InitLookupTables();
+            const GsDrawCommand title =
+                makeFeedbackLinearDepthCt32SpriteCommand(
+                    150u,
+                    112u,
+                    8u,
+                    216u,
+                    GS_PSM_Z24,
+                    false,
+                    1u,
+                    10u,
+                    10u,
+                    {0u, 511u, 0u, 415u},
+                    {28672u, 29440u},
+                    {28672u, 29184u},
+                    {29440u, 36080u},
+                    {0u, 512u},
+                    {0u, 6656u},
+                    0u);
+            const GsDrawResources titleResources = title.resources();
+            t.IsTrue(
+                titleResources.framebufferTextureAlias,
+                "the retained title state must expose its true feedback alias");
+            t.IsTrue(
+                titleResources.texturePages.intersects(
+                    titleResources.framebufferWritePages),
+                "the feedback texture must overlap canonical color writes");
+            t.IsTrue(
+                titleResources.depthReadPages.any() &&
+                    titleResources.depthWritePages.any(),
+                "packed Z24 writes must retain both preservation reads and writes");
+
+            GsVulkanLinearCt32Sprite ordinary{};
+            t.IsFalse(
+                prepareGsVulkanLinearCt32Sprite(title, ordinary).supported,
+                "the disjoint linear contract must stay closed for feedback/depth");
+
+            GsVulkanFeedbackLinearDepthCt32Sprite prepared{};
+            prepared.framebufferBaseBlock = 0xDEADu;
+            const GsVulkanFeedbackLinearDepthCt32Sprite sentinel = prepared;
+            const GsBackendDecision decision =
+                prepareGsVulkanFeedbackLinearDepthCt32Sprite(
+                    title, prepared);
+            t.IsTrue(
+                decision.supported,
+                "the exact retained feedback/linear/Z24 state should prepare");
+            if (!decision.supported)
+                return;
+            t.Equals(
+                decision.reason,
+                GsFallbackReason::Supported,
+                "feedback preparation should retain the canonical reason");
+            t.Equals(
+                prepared.framebufferBaseBlock,
+                3584u,
+                "FRAME page 112 must remain raw block 3584");
+            t.Equals(
+                prepared.textureBaseBlock,
+                prepared.framebufferBaseBlock,
+                "the record must name the exact recursive source surface");
+            t.Equals(
+                prepared.textureWidth,
+                prepared.framebufferWidth,
+                "the narrow feedback contract requires one complete surface stride");
+            t.Equals(prepared.boundsX0, 0u,
+                     "the retained first horizontal slice should begin at zero");
+            t.Equals(prepared.boundsX1, 32u,
+                     "the retained first horizontal slice should span 32 pixels");
+            t.Equals(prepared.boundsY0, 0u,
+                     "the retained feedback slice should begin at the top row");
+            t.Equals(prepared.boundsY1, 415u,
+                     "the retained feedback slice should preserve its 415-row clip");
+            t.Equals(prepared.textureMaskU, 1023u,
+                     "TW=10 should retain its exact texture mask");
+            t.Equals(prepared.textureMaskV, 1023u,
+                     "TH=10 should retain its exact texture mask");
+            t.Equals(gsVulkanTextureWrapMode(prepared.textureWrapU), 1u,
+                     "the retained U axis should use standard CLAMP");
+            t.Equals(gsVulkanTextureWrapMode(prepared.textureWrapV), 1u,
+                     "the retained V axis should use standard CLAMP");
+            t.Equals(prepared.depthBaseBlock, 6912u,
+                     "ZBUF page 216 must remain raw block 6912");
+            t.Equals(prepared.depthPsm,
+                     static_cast<uint32_t>(GS_PSM_Z24),
+                     "the record should retain packed Z24 explicitly");
+            t.Equals(prepared.depthTestMethod, 1u,
+                     "the retained draw should preserve ZTST ALWAYS");
+            t.Equals(prepared.depthWrite, 1u,
+                     "the retained Z24 surface should remain writable");
+            t.Equals(
+                prepared.textureSource,
+                GS_VULKAN_TEXTURE_SOURCE_FEEDBACK_SNAPSHOT,
+                "the shader ABI must forbid in-place resident texture reads");
+            t.Equals(prepared.reserved0 | prepared.reserved1, 0u,
+                     "feedback record reserved words should be deterministic");
+            t.IsFalse(
+                prepared == sentinel,
+                "successful feedback preparation should replace the sentinel");
+
+            const std::array<GsDrawCommand, 2> commands{{
+                makeFeedbackLinearDepthCt32SpriteCommand(
+                    151u, 4u, 1u, 200u, GS_PSM_Z24, false, 1u,
+                    6u, 5u,
+                    {0u, 63u, 0u, 31u}, {0u, 0u},
+                    {0u, 128u}, {0u, 128u},
+                    {128u, 256u}, {0u, 128u},
+                    0x00123456u),
+                makeFeedbackLinearDepthCt32SpriteCommand(
+                    152u, 4u, 1u, 200u, GS_PSM_Z24, false, 1u,
+                    6u, 5u,
+                    {0u, 63u, 0u, 31u}, {0u, 0u},
+                    {128u, 256u}, {0u, 128u},
+                    {0u, 128u}, {0u, 128u},
+                    0x00654321u),
+            }};
+            std::array<GsVulkanFeedbackLinearDepthCt32Sprite, 2> records{};
+            for (size_t index = 0u; index < commands.size(); ++index)
+            {
+                if (!prepareGsVulkanFeedbackLinearDepthCt32Sprite(
+                        commands[index], records[index]).supported)
+                {
+                    t.Fail("the overlapping snapshot fixture should prepare");
+                    return;
+                }
+            }
+
+            const std::vector<uint8_t> initial =
+                makeVramPattern(0x46424431u);
+            const std::vector<uint8_t> feedbackSnapshot = initial;
+            std::vector<uint8_t> expected = initial;
+            for (const auto &record : records)
+            {
+                applyFeedbackLinearDepthCt32SpriteCpu(
+                    expected, feedbackSnapshot, record);
+            }
+
+            std::vector<uint8_t> perDrawSnapshot = initial;
+            for (const auto &record : records)
+            {
+                const std::vector<uint8_t> snapshot = perDrawSnapshot;
+                applyFeedbackLinearDepthCt32SpriteCpu(
+                    perDrawSnapshot, snapshot, record);
+            }
+            t.IsFalse(
+                perDrawSnapshot == expected,
+                "the fixture must distinguish one run snapshot from per-draw recurrence");
+
+            std::vector<uint8_t> actual = initial;
+            GS gs;
+            gs.init(
+                actual.data(),
+                static_cast<uint32_t>(actual.size()),
+                nullptr);
+            gs.setDebugHistoryPaused(true);
+            for (const GsDrawCommand &command : commands)
+                drawNearestCt32SpriteCommand(gs, command);
+            gs.flushRenderBatch();
+            t.IsTrue(
+                actual == expected,
+                "the independent immutable-snapshot/depth oracle must match production software over all VRAM");
+
+            const auto rebuild = [&title](
+                uint64_t sequence,
+                const GSContext &context)
+            {
+                return buildGsDrawCommand(
+                    sequence,
+                    title.primitive(),
+                    context,
+                    std::span<const GSVertex>(title.vertices()).first(2u),
+                    title.globalState());
+            };
+            const auto expectRejected = [
+                &t, &prepared, &rebuild](
+                    const GSContext &context,
+                    GsFallbackReason reason,
+                    const char *message)
+            {
+                const GsVulkanFeedbackLinearDepthCt32Sprite prior = prepared;
+                const GsBackendDecision rejected =
+                    prepareGsVulkanFeedbackLinearDepthCt32Sprite(
+                        rebuild(153u, context), prepared);
+                t.IsFalse(rejected.supported, message);
+                t.Equals(rejected.reason, reason, message);
+                t.IsTrue(
+                    prepared == prior,
+                    "rejected feedback preparation must preserve caller output");
+            };
+
+            GSContext disjoint = title.context();
+            disjoint.tex0.tbp0 = 512u;
+            expectRejected(
+                disjoint,
+                GsFallbackReason::ResourceAlias,
+                "a disjoint texture belongs to the established linear/depth-independent contracts");
+            GSContext partialAlias = title.context();
+            ++partialAlias.tex0.tbp0;
+            expectRejected(
+                partialAlias,
+                GsFallbackReason::ResourceAlias,
+                "a partially overlapping texture is not an exact recursive surface");
+            GSContext aliasedDepth = title.context();
+            aliasedDepth.zbuf.zbp = title.context().frame.fbp;
+            expectRejected(
+                aliasedDepth,
+                GsFallbackReason::ResourceAlias,
+                "feedback color and depth surfaces must remain independent");
+            GSContext noDepth = title.context();
+            noDepth.test = 0u;
+            noDepth.zbuf.zmask = true;
+            expectRejected(
+                noDepth,
+                GsFallbackReason::UnsupportedDepthFunction,
+                "the first feedback record requires explicit depth semantics");
         });
 
         tc.Run("Linear CT32 repeat records match software bilinear sampling", [](TestCase &t)
