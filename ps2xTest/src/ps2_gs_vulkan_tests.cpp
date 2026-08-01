@@ -3835,7 +3835,7 @@ void register_ps2_gs_vulkan_tests()
                      "randomized transitions should emit no validation warnings");
         });
 
-        tc.Run("GS Vulkan strict triangle transitions match software at every observation", [](TestCase &t)
+        tc.Run("GS Vulkan strict geometry and texture transitions match every observation", [](TestCase &t)
         {
             GSMem::InitLookupTables();
             std::vector<uint8_t> softwareVram =
@@ -3844,6 +3844,17 @@ void register_ps2_gs_vulkan_tests()
 
             constexpr std::array<uint32_t, 8> pages{
                 1u, 5u, 9u, 13u, 17u, 21u, 25u, 29u};
+            const GsDrawCommand textureCommand =
+                makeNearestCt32SpriteCommand(
+                    80u, 40u, 2u, 64u, 2u, 6u, 5u,
+                    {6u, 15u, 5u, 12u}, {32u, 16u},
+                    {352u, 96u}, {48u, 304u},
+                    {480u, 224u}, {64u, 320u});
+            GsVulkanNearestCt32Sprite preparedTexture{};
+            t.IsTrue(
+                prepareGsVulkanNearestCt32Sprite(
+                    textureCommand, preparedTexture).supported,
+                "the randomized strict texture fixture should be eligible");
             GSRegisters softwareRegisters{};
             GSRegisters acceleratedRegisters{};
             configureCt32Display(softwareRegisters, pages[0]);
@@ -3877,7 +3888,16 @@ void register_ps2_gs_vulkan_tests()
             }
             const GsVulkanDeviceReport *selected =
                 preflight.selectedDevice();
-            if (!selected || !selected->exactCt32Triangle)
+            t.IsNotNull(selected,
+                        "a ready strict transition probe should select one device");
+            if (!selected)
+                return;
+            t.IsTrue(selected->exactCt32Triangle,
+                     "the strict transition device should support exact triangles");
+            t.IsTrue(selected->exactNearestCt32Sprite,
+                     "the strict transition device should support exact textures");
+            if (!selected->exactCt32Triangle ||
+                !selected->exactNearestCt32Sprite)
                 return;
 
             t.IsTrue(accelerated.setRendererMode(
@@ -3965,6 +3985,13 @@ void register_ps2_gs_vulkan_tests()
                     static_cast<uint16_t>((x0 + width) * 16u),
                     static_cast<uint16_t>((y0 + height) * 16u),
                     color);
+            };
+            const auto drawTexturePair = [&]()
+            {
+                drawNearestCt32SpriteCommand(
+                    software, textureCommand);
+                drawNearestCt32SpriteCommand(
+                    accelerated, textureCommand);
             };
 
             uint64_t forcedObservations = 0u;
@@ -4060,6 +4087,7 @@ void register_ps2_gs_vulkan_tests()
                 CpuReadback,
                 LocalCopy,
                 SoftwareModeTriangle,
+                TextureDraw,
                 Observation,
                 Count,
             };
@@ -4078,6 +4106,7 @@ void register_ps2_gs_vulkan_tests()
                     StrictTransitionAction::CpuReadback,
                     StrictTransitionAction::LocalCopy,
                     StrictTransitionAction::SoftwareModeTriangle,
+                    StrictTransitionAction::TextureDraw,
                     StrictTransitionAction::Observation,
                 };
                 for (size_t index = order.size() - 1u;
@@ -4208,6 +4237,9 @@ void register_ps2_gs_vulkan_tests()
                             return;
                         }
                         break;
+                    case StrictTransitionAction::TextureDraw:
+                        drawTexturePair();
+                        break;
                     case StrictTransitionAction::Observation:
                         if (!forceObservation(
                                 static_cast<uint32_t>(cycle % 4u),
@@ -4245,9 +4277,9 @@ void register_ps2_gs_vulkan_tests()
 
             const GsBackendCounters counters =
                 accelerated.backendCounters();
-            t.Equals(counters.commands, 48ull,
+            t.Equals(counters.commands, 56ull,
                      "the strict stream should assemble its exact draw count");
-            t.Equals(counters.acceleratedCommands, 40ull,
+            t.Equals(counters.acceleratedCommands, 48ull,
                      "every strict-mode draw should reach Vulkan");
             t.Equals(counters.softwareCommands, 8ull,
                      "only explicit software-mode triangles should use the CPU");
@@ -4265,8 +4297,12 @@ void register_ps2_gs_vulkan_tests()
 
             const GsVulkanRasterBackendStatistics backend =
                 accelerated.vulkanRendererBackendStatistics();
-            t.Equals(backend.commandsCompleted, 40ull,
+            t.Equals(backend.commandsCompleted, 48ull,
                      "every strict GPU command should complete once");
+            t.Equals(backend.committedGpuCommands, 48ull,
+                     "every strict geometry and texture draw should commit once");
+            t.Equals(backend.residentCommands, 40ull,
+                     "only the established geometry classes should claim residency");
             t.Equals(backend.pageOwnership.gpuNewerPages,
                      static_cast<size_t>(0u),
                      "the final observation should publish every strict writer");
@@ -4283,6 +4319,15 @@ void register_ps2_gs_vulkan_tests()
                      "the service should execute every strict triangle once");
             t.Equals(service.spriteDrawsCompleted, 8ull,
                      "the service should execute every pipeline-change sprite once");
+            t.Equals(service.nearestCt32SpriteDrawsCompleted, 8ull,
+                     "the service should execute every shuffled strict texture once");
+            t.Equals(
+                service.nearestCt32SpritePixelsExecuted,
+                8ull * static_cast<uint64_t>(
+                    preparedTexture.boundsX1 - preparedTexture.boundsX0) *
+                    static_cast<uint64_t>(
+                        preparedTexture.boundsY1 - preparedTexture.boundsY0),
+                "the randomized stream should retain exact texture pixel accounting");
             t.IsTrue(service.residentTriangleBatchesCompleted > 0ull,
                      "strict triangles should use the resident triangle service");
             t.IsTrue(service.largestResidentTriangleBatch >= 2ull,
@@ -5873,6 +5918,17 @@ void register_ps2_gs_vulkan_tests()
         tc.Run("GS Vulkan strict rejects before mutation and survives reset", [](TestCase &t)
         {
             GSMem::InitLookupTables();
+            const GsDrawCommand textureCommand =
+                makeNearestCt32SpriteCommand(
+                    101u, 40u, 2u, 64u, 2u, 6u, 5u,
+                    {6u, 15u, 5u, 12u}, {32u, 16u},
+                    {352u, 96u}, {48u, 304u},
+                    {480u, 224u}, {64u, 320u});
+            GsVulkanNearestCt32Sprite preparedTexture{};
+            t.IsTrue(
+                prepareGsVulkanNearestCt32Sprite(
+                    textureCommand, preparedTexture).supported,
+                "the strict reset texture fixture should be eligible");
             std::vector<uint8_t> softwareVram =
                 makeVramPattern(0x53545231u);
             std::vector<uint8_t> strictVram = softwareVram;
@@ -5905,6 +5961,12 @@ void register_ps2_gs_vulkan_tests()
                 preflight.selectedDevice();
             const bool exactTriangle =
                 selected && selected->exactCt32Triangle;
+            const bool exactTexture =
+                selected && selected->exactNearestCt32Sprite;
+            t.IsTrue(exactTexture,
+                     "the strict reset device should expose the texture kernel");
+            if (!exactTexture)
+                return;
 
             t.IsTrue(strict.setRendererMode(
                          GsRendererMode::GpuStrict),
@@ -5923,6 +5985,14 @@ void register_ps2_gs_vulkan_tests()
             (void)strict.getDebugSnapshot();
             t.IsTrue(strictVram == softwareVram,
                      "strict GPU publication should match the software oracle");
+
+            drawNearestCt32SpriteCommand(
+                software, textureCommand);
+            drawNearestCt32SpriteCommand(
+                strict, textureCommand);
+            (void)strict.getDebugSnapshot();
+            t.IsTrue(strictVram == softwareVram,
+                     "strict texture execution before reset should remain exact");
 
             const std::vector<uint8_t> rejectionSentinel = strictVram;
             std::string pointFailure;
@@ -5995,16 +6065,20 @@ void register_ps2_gs_vulkan_tests()
                     strict, 19u * 16u, 20u * 16u,
                     39u * 16u, 31u * 16u, 0xF0AABBCCu);
             }
+            drawNearestCt32SpriteCommand(
+                software, textureCommand);
+            drawNearestCt32SpriteCommand(
+                strict, textureCommand);
             strict.writeRegister(GS_REG_FINISH, 0u);
             (void)strict.getDebugSnapshot();
             t.IsTrue(strictVram == softwareVram,
                      "strict execution after reset and forced drain should remain exact");
 
             const GsBackendCounters counters = strict.backendCounters();
-            t.Equals(counters.commands, 4ull,
-                     "strict should classify two accepted and two rejected commands");
-            t.Equals(counters.acceleratedCommands, 2ull,
-                     "both eligible strict draws should reach Vulkan");
+            t.Equals(counters.commands, 6ull,
+                     "strict should classify four accepted and two rejected commands");
+            t.Equals(counters.acceleratedCommands, 4ull,
+                     "all eligible strict draws should reach Vulkan");
             t.Equals(counters.softwareCommands, 0ull,
                      "strict must never hide rejection behind software");
             t.Equals(counters.strictFailures, 2ull,
@@ -6027,10 +6101,10 @@ void register_ps2_gs_vulkan_tests()
 
             const GsVulkanRasterBackendStatistics backendStatistics =
                 strict.vulkanRendererBackendStatistics();
-            t.Equals(backendStatistics.commandsCompleted, 2ull,
+            t.Equals(backendStatistics.commandsCompleted, 4ull,
                      "only accepted strict draws should execute");
-            t.Equals(backendStatistics.committedGpuCommands, 2ull,
-                     "both accepted strict draws should publish GPU VRAM");
+            t.Equals(backendStatistics.committedGpuCommands, 4ull,
+                     "all accepted strict draws should publish GPU VRAM");
             const GsVulkanServiceStatistics serviceStatistics =
                 strict.vulkanRendererServiceStatistics();
             t.Equals(serviceStatistics.spriteDrawsCompleted,
@@ -6039,6 +6113,16 @@ void register_ps2_gs_vulkan_tests()
             t.Equals(serviceStatistics.triangleDrawsCompleted,
                      exactTriangle ? 1ull : 0ull,
                      "a qualified host should execute the post-reset triangle");
+            t.Equals(serviceStatistics.nearestCt32SpriteDrawsCompleted,
+                     2ull,
+                     "strict reset should preserve texture execution on both sides");
+            t.Equals(
+                serviceStatistics.nearestCt32SpritePixelsExecuted,
+                2ull * static_cast<uint64_t>(
+                    preparedTexture.boundsX1 - preparedTexture.boundsX0) *
+                    static_cast<uint64_t>(
+                        preparedTexture.boundsY1 - preparedTexture.boundsY0),
+                "strict reset should preserve texture pixel accounting");
             t.Equals(serviceStatistics.residentTriangleBatchesCompleted,
                      exactTriangle ? 1ull : 0ull,
                      "the qualified post-reset triangle should use resident execution");
