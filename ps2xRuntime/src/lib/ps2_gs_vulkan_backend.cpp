@@ -758,9 +758,10 @@ GsBackendDecision GsVulkanRasterBackend::classify(
         return decision;
     }
 
-    if ((m_impl->config.mode != GsRendererMode::Verify &&
-         m_impl->config.mode != GsRendererMode::GpuStrict) ||
-        command.primitive().type != GS_PRIM_TRIANGLE)
+    if (command.primitive().type != GS_PRIM_TRIANGLE ||
+        (m_impl->config.mode != GsRendererMode::Hybrid &&
+         m_impl->config.mode != GsRendererMode::Verify &&
+         m_impl->config.mode != GsRendererMode::GpuStrict))
     {
         return decision;
     }
@@ -768,8 +769,22 @@ GsBackendDecision GsVulkanRasterBackend::classify(
     GsVulkanCt32Triangle triangle{};
     const GsBackendDecision triangleDecision =
         prepareGsVulkanCt32Triangle(command, triangle);
-    if (triangleDecision.supported && !m_impl->exactCt32Triangle)
+    if (!triangleDecision.supported)
+        return triangleDecision;
+    if (!m_impl->exactCt32Triangle)
         return {false, GsFallbackReason::BackendUnavailable};
+
+    if (m_impl->config.mode == GsRendererMode::Hybrid)
+    {
+        const uint64_t candidatePixels =
+            static_cast<uint64_t>(triangle.boundsX1 - triangle.boundsX0) *
+            static_cast<uint64_t>(triangle.boundsY1 - triangle.boundsY0);
+        if (candidatePixels <
+            m_impl->config.minimumHybridTriangleCandidatePixels)
+        {
+            return {false, GsFallbackReason::CostModel};
+        }
+    }
     return triangleDecision;
 }
 

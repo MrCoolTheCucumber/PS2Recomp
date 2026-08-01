@@ -445,15 +445,17 @@ namespace
     void configureFlatCt32Draws(
         GS &gs,
         uint32_t framebufferPage = 3u,
-        uint32_t framebufferWidth = 2u)
+        uint32_t framebufferWidth = 2u,
+        uint32_t scissorX1 = 127u,
+        uint32_t scissorY1 = 63u)
     {
         const uint64_t frame =
             static_cast<uint64_t>(framebufferPage) |
             (static_cast<uint64_t>(framebufferWidth) << 16u) |
             (static_cast<uint64_t>(GS_PSM_CT32) << 24u);
         const uint64_t scissor =
-            (127ull << 16u) |
-            (63ull << 48u);
+            (static_cast<uint64_t>(scissorX1) << 16u) |
+            (static_cast<uint64_t>(scissorY1) << 48u);
         gs.writeRegister(GS_REG_FRAME_1, frame);
         gs.writeRegister(GS_REG_ZBUF_1, 1ull << 32u);
         gs.writeRegister(GS_REG_SCISSOR_1, scissor);
@@ -1647,8 +1649,8 @@ void register_ps2_gs_vulkan_tests()
             t.IsTrue(backend->setMode(GsRendererMode::Hybrid),
                      "the synchronized backend should accept Hybrid mode");
             t.Equals(backend->classify(command).reason,
-                     GsFallbackReason::UnsupportedPrimitive,
-                     "Hybrid must not expose the unqualified triangle class");
+                     GsFallbackReason::CostModel,
+                     "Hybrid should retain a small qualified triangle on the CPU");
             t.IsTrue(backend->setMode(GsRendererMode::GpuStrict),
                      "the synchronized backend should accept strict mode");
             t.IsTrue(backend->classify(command).supported,
@@ -1691,6 +1693,11 @@ void register_ps2_gs_vulkan_tests()
                         "a base-capable executor should remain generally usable");
             if (unavailable)
             {
+                t.IsTrue(unavailable->setMode(GsRendererMode::Hybrid),
+                         "the base service should still enter Hybrid mode");
+                t.Equals(unavailable->classify(command).reason,
+                         GsFallbackReason::BackendUnavailable,
+                         "Hybrid should name capability failure before cost");
                 t.IsTrue(unavailable->setMode(GsRendererMode::GpuStrict),
                          "the base service should still enter strict mode");
                 t.Equals(unavailable->classify(command).reason,
@@ -2249,6 +2256,125 @@ void register_ps2_gs_vulkan_tests()
                      "the accelerated draw should reuse one fixed pipeline");
             t.Equals(service.fenceWaits, 3ull,
                      "upload draw and observation should each wait once");
+        });
+
+        tc.Run("Vulkan hybrid triangle cost policy uses candidate bounds", [](TestCase &t)
+        {
+            GSMem::InitLookupTables();
+            constexpr uint64_t thresholdPixels = 32'768u;
+            const GsDrawCommand belowThreshold = makeCt32TriangleCommand(
+                303u, 27u, 4u,
+                {0u, 255u, 0u, 127u}, {0u, 0u},
+                {0u, 255u * 16u, 0u},
+                {0u, 0u, 128u * 16u},
+                0x44332211u);
+            const GsDrawCommand atThreshold = makeCt32TriangleCommand(
+                304u, 59u, 4u,
+                {0u, 255u, 0u, 127u}, {0u, 0u},
+                {0u, 256u * 16u, 0u},
+                {0u, 0u, 128u * 16u},
+                0x88776655u);
+
+            GsVulkanCt32Triangle belowPrepared{};
+            GsVulkanCt32Triangle thresholdPrepared{};
+            t.IsTrue(prepareGsVulkanCt32Triangle(
+                         belowThreshold, belowPrepared).supported,
+                     "the below-threshold triangle should be semantically eligible");
+            t.IsTrue(prepareGsVulkanCt32Triangle(
+                         atThreshold, thresholdPrepared).supported,
+                     "the threshold triangle should be semantically eligible");
+            const auto candidatePixels = [](const GsVulkanCt32Triangle &triangle)
+            {
+                return
+                    static_cast<uint64_t>(
+                        triangle.boundsX1 - triangle.boundsX0) *
+                    static_cast<uint64_t>(
+                        triangle.boundsY1 - triangle.boundsY0);
+            };
+            t.Equals(candidatePixels(belowPrepared), 32'640ull,
+                     "the smaller conservative box should be 128 pixels short");
+            t.Equals(candidatePixels(thresholdPrepared), thresholdPixels,
+                     "the larger conservative box should meet the policy exactly");
+
+            std::vector<uint8_t> vram = makeVramPattern(0x5452434Fu);
+            std::vector<uint8_t> expected = vram;
+            applyCt32TriangleCpu(expected, thresholdPrepared);
+            uint64_t softwareCalls = 0u;
+            uint64_t commitCalls = 0u;
+            GsVulkanRasterBackendConfig config{};
+            config.mode = GsRendererMode::Hybrid;
+            t.Equals(config.minimumHybridTriangleCandidatePixels,
+                     thresholdPixels,
+                     "the measured conservative threshold should be the default");
+            std::unique_ptr<GsVulkanRasterBackend> backend =
+                GsVulkanRasterBackend::createWithExecutor(
+                    std::make_unique<FakeCt32Executor>(
+                        FakeCt32Executor::Behavior::Exact),
+                    config, vram,
+                    [&](const GsDrawCommand &) { ++softwareCalls; },
+                    [&](const GsDrawCommand &) { ++commitCalls; }, nullptr);
+            t.IsNotNull(backend.get(),
+                        "an exact executor should create Hybrid triangle policy");
+            if (!backend)
+                return;
+
+            t.Equals(backend->classify(belowThreshold).reason,
+                     GsFallbackReason::CostModel,
+                     "a triangle below the measured box should remain on the CPU");
+            t.IsTrue(backend->classify(atThreshold).supported,
+                     "a triangle exactly at the measured box should use the GPU");
+            t.IsTrue(backend->setMode(GsRendererMode::GpuStrict),
+                     "the fixture should switch to strict mode");
+            t.IsTrue(backend->classify(belowThreshold).supported,
+                     "strict mode should ignore the triangle cost policy");
+            t.IsTrue(backend->setMode(GsRendererMode::Verify),
+                     "the fixture should switch to Verify mode");
+            t.IsTrue(backend->classify(belowThreshold).supported,
+                     "Verify should exercise every semantic triangle candidate");
+            t.IsTrue(backend->setMode(GsRendererMode::Hybrid),
+                     "the fixture should restore Hybrid policy routing");
+
+            backend->submit(
+                std::span<const GsDrawCommand>(&atThreshold, 1u));
+            t.Equals(backend->pendingCommandCount(), size_t{1u},
+                     "the threshold triangle should remain resident until observation");
+            backend->flush(GsFlushReason::Explicit);
+            backend->prepareCpuVramAccess(
+                atThreshold.resources().writePages,
+                GsFlushReason::CpuReadback);
+            t.IsTrue(vram == expected,
+                     "the accepted threshold triangle should remain byte-exact");
+            t.Equals(softwareCalls, 0ull,
+                     "an accepted Hybrid triangle must not call the oracle");
+            t.Equals(commitCalls, 1ull,
+                     "the accepted Hybrid triangle should publish one commit");
+            const GsVulkanServiceStatistics service =
+                backend->serviceStatistics();
+            t.Equals(service.triangleDrawsCompleted, 1ull,
+                     "the accepted Hybrid triangle should reach the executor once");
+            t.Equals(service.residentTriangleBatchesCompleted, 1ull,
+                     "the accepted Hybrid triangle should use one resident batch");
+
+            std::vector<uint8_t> unavailableVram =
+                makeVramPattern(0x54524355u);
+            std::unique_ptr<GsVulkanRasterBackend> unavailable =
+                GsVulkanRasterBackend::createWithExecutor(
+                    std::make_unique<FakeCt32Executor>(
+                        FakeCt32Executor::Behavior::Exact, false),
+                    config, unavailableVram,
+                    [](const GsDrawCommand &) {}, {}, nullptr);
+            t.IsNotNull(unavailable.get(),
+                        "a base-capable executor should retain Hybrid fallback");
+            if (unavailable)
+            {
+                t.Equals(unavailable->classify(atThreshold).reason,
+                         GsFallbackReason::BackendUnavailable,
+                         "missing exact coverage should take priority over cost");
+                t.Equals(
+                    unavailable->serviceStatistics().triangleDrawsFailed,
+                    0ull,
+                    "capability fallback must not post triangle work");
+            }
         });
 
         tc.Run("GS Vulkan presentation latch publishes a complete CPU frame checkpoint", [](TestCase &t)
@@ -3833,8 +3959,8 @@ void register_ps2_gs_vulkan_tests()
             accelerated.init(
                 acceleratedVram.data(),
                 static_cast<uint32_t>(acceleratedVram.size()), nullptr);
-            configureFlatCt32Draws(software);
-            configureFlatCt32Draws(accelerated);
+            configureFlatCt32Draws(software, 80u, 4u, 255u, 127u);
+            configureFlatCt32Draws(accelerated, 80u, 4u, 255u, 127u);
 
             GsVulkanCapabilityReport preflight{};
             const GsVulkanServiceConfig config =
@@ -3938,16 +4064,18 @@ void register_ps2_gs_vulkan_tests()
             const GsBackendCounters hybridCounters =
                 accelerated.backendCounters();
             t.Equals(hybridCounters.acceleratedCommands, 0ull,
-                     "Hybrid must not accelerate the unqualified triangle class");
+                     "Hybrid should not accelerate a triangle below its cost threshold");
             t.Equals(hybridCounters.softwareCommands, 1ull,
                      "Hybrid should execute the triangle once in software");
             t.Equals(hybridCounters.fallbackCommands, 1ull,
                      "Hybrid triangle fallback should remain explicit");
             t.Equals(
                 hybridCounters.decisions[static_cast<size_t>(
-                    GsFallbackReason::UnsupportedPrimitive)],
+                    exactTriangle
+                        ? GsFallbackReason::CostModel
+                        : GsFallbackReason::BackendUnavailable)],
                 1ull,
-                "Hybrid should retain the existing primitive rejection");
+                "Hybrid should record the capability or measured cost gate");
             const GsVulkanServiceStatistics finalService =
                 accelerated.vulkanRendererServiceStatistics();
             t.Equals(finalService.triangleDrawsCompleted,
@@ -3960,6 +4088,46 @@ void register_ps2_gs_vulkan_tests()
 
             if (exactTriangle)
             {
+                accelerated.resetBackendCounters();
+                constexpr std::array<uint16_t, 3> hybridX{{
+                    0u,
+                    256u * 16u,
+                    0u,
+                }};
+                constexpr std::array<uint16_t, 3> hybridY{{
+                    0u,
+                    0u,
+                    128u * 16u,
+                }};
+                drawFlatCt32Triangle(
+                    software, hybridX, hybridY, 0x6C5B4A39u);
+                drawFlatCt32Triangle(
+                    accelerated, hybridX, hybridY, 0x6C5B4A39u);
+                (void)software.getDebugSnapshot();
+                (void)accelerated.getDebugSnapshot();
+                t.IsTrue(acceleratedVram == softwareVram,
+                         "a threshold-sized Hybrid triangle should match software VRAM");
+                const GsBackendCounters eligibleHybridCounters =
+                    accelerated.backendCounters();
+                t.Equals(eligibleHybridCounters.acceleratedCommands, 1ull,
+                         "Hybrid should accelerate the measured triangle envelope");
+                t.Equals(eligibleHybridCounters.softwareCommands, 0ull,
+                         "an eligible Hybrid triangle should not execute in software");
+                t.Equals(eligibleHybridCounters.fallbackCommands, 0ull,
+                         "an eligible Hybrid triangle should not record fallback");
+                const GsVulkanRasterBackendStatistics hybridBackend =
+                    accelerated.vulkanRendererBackendStatistics();
+                t.Equals(hybridBackend.committedGpuCommands, 1ull,
+                         "Hybrid should commit one resident triangle");
+                t.Equals(hybridBackend.residentBatchesCompleted, 1ull,
+                         "the Hybrid checkpoint should drain one triangle batch");
+                const GsVulkanServiceStatistics hybridService =
+                    accelerated.vulkanRendererServiceStatistics();
+                t.Equals(hybridService.triangleDrawsCompleted, 2ull,
+                         "Verify and Hybrid should each complete one triangle");
+                t.Equals(hybridService.residentTriangleBatchesCompleted, 1ull,
+                         "Hybrid should reach the resident triangle request");
+
                 t.IsTrue(accelerated.setRendererMode(
                              GsRendererMode::GpuStrict),
                          "the qualified host should enter strict triangle mode");
@@ -3992,16 +4160,16 @@ void register_ps2_gs_vulkan_tests()
                          "the qualified strict triangle should not fail routing");
                 const GsVulkanRasterBackendStatistics strictBackend =
                     accelerated.vulkanRendererBackendStatistics();
-                t.Equals(strictBackend.committedGpuCommands, 1ull,
-                         "strict should commit one resident triangle");
-                t.Equals(strictBackend.residentBatchesCompleted, 1ull,
-                         "the strict checkpoint should drain one triangle batch");
+                t.Equals(strictBackend.committedGpuCommands, 2ull,
+                         "Hybrid and strict should each commit a resident triangle");
+                t.Equals(strictBackend.residentBatchesCompleted, 2ull,
+                         "Hybrid and strict checkpoints should each drain a triangle batch");
                 const GsVulkanServiceStatistics strictService =
                     accelerated.vulkanRendererServiceStatistics();
-                t.Equals(strictService.triangleDrawsCompleted, 2ull,
-                         "Verify and strict should each complete one triangle");
-                t.Equals(strictService.residentTriangleBatchesCompleted, 1ull,
-                         "strict should reach the resident triangle request");
+                t.Equals(strictService.triangleDrawsCompleted, 3ull,
+                         "Verify, Hybrid, and strict should each complete one triangle");
+                t.Equals(strictService.residentTriangleBatchesCompleted, 2ull,
+                         "Hybrid and strict should use resident triangle requests");
                 t.Equals(strictService.validationErrors, 0u,
                          "strict triangle routing should remain validation-clean");
                 t.Equals(strictService.validationWarnings, 0u,

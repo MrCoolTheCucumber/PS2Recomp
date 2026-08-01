@@ -69,6 +69,7 @@ namespace
                "[--verify-dump-dir DIRECTORY] "
                "[--vulkan-max-resident-batch COUNT] "
                "[--vulkan-min-hybrid-pixels COUNT] "
+               "[--vulkan-min-hybrid-triangle-pixels COUNT] "
                "[--vulkan-validation] [--vulkan-loader FILE] "
                "[--vulkan-vendor ID] [--vulkan-device ID] "
                "[--backend-stats] [--stop-after-command COUNT] "
@@ -773,6 +774,7 @@ int main(int argc, char **argv)
             argument == "--verify-dump-dir" ||
             argument == "--vulkan-max-resident-batch" ||
             argument == "--vulkan-min-hybrid-pixels" ||
+            argument == "--vulkan-min-hybrid-triangle-pixels" ||
             argument == "--vulkan-loader" ||
             argument == "--vulkan-vendor" ||
             argument == "--vulkan-device")
@@ -848,6 +850,26 @@ int main(int argc, char **argv)
                     return 2;
                 }
                 vulkanBackendConfig.minimumHybridSpritePixels = minimum;
+                vulkanOptionUsed = true;
+                replayOptionUsed = true;
+                gifReplayOptionUsed = true;
+            }
+            else if (argument ==
+                     "--vulkan-min-hybrid-triangle-pixels")
+            {
+                uint64_t minimum = 0u;
+                constexpr uint64_t maximumPixels = 2048ull * 2048ull;
+                if (!parseCount(argv[index], minimum) ||
+                    minimum > maximumPixels)
+                {
+                    std::cerr
+                        << "Vulkan hybrid triangle candidate-pixel threshold "
+                           "must be between 0 and "
+                        << maximumPixels << '\n';
+                    return 2;
+                }
+                vulkanBackendConfig.minimumHybridTriangleCandidatePixels =
+                    minimum;
                 vulkanOptionUsed = true;
                 replayOptionUsed = true;
                 gifReplayOptionUsed = true;
