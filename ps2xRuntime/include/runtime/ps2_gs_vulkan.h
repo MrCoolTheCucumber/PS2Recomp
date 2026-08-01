@@ -301,10 +301,9 @@ static_assert(offsetof(GsVulkanCt32Sprite, reserved) == 28u);
 // Fixed record for Phase 6's first textured-sprite semantic slice. Texture
 // coordinates name the texel sampled at boundsX0/boundsY0 and advance by one
 // signed texel per output pixel. Power-of-two masks and packed per-axis wrap
-// descriptors implement GS REPEAT, standard CLAMP, or raw-bound REGION_CLAMP
-// before raw CT32 local-memory addressing. Each descriptor stores the two-bit
-// mode followed by ten-bit MIN and MAX values. REGION_REPEAT remains a separate
-// semantic slice. Source and destination are guaranteed disjoint by the
+// descriptors implement all four GS wrap modes before raw CT32 local-memory
+// addressing. Each descriptor stores the two-bit mode followed by ten-bit MIN
+// and MAX values. Source and destination are guaranteed disjoint by the
 // backend-neutral classifier.
 inline constexpr uint32_t GS_VULKAN_TEXTURE_WRAP_DESCRIPTOR_MASK =
     0x003FFFFFu;

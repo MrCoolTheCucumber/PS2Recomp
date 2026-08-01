@@ -449,6 +449,14 @@ namespace
                 return static_cast<uint32_t>(std::clamp(
                     coordinate, 0, static_cast<int32_t>(mask)));
             }
+            if (mode == 3u)
+            {
+                const uint32_t regionMask =
+                    gsVulkanTextureRegionMin(wrap) & mask;
+                return
+                    (static_cast<uint32_t>(coordinate) & regionMask) |
+                    gsVulkanTextureRegionMax(wrap);
+            }
             const int32_t minimum =
                 gsVulkanTextureRegionMin(wrap);
             const int32_t maximum =
@@ -1662,12 +1670,32 @@ void register_ps2_gs_vulkan_tests()
 
             GSContext regionRepeated = command.context();
             regionRepeated.clamp =
-                (regionRepeated.clamp & ~0xFull) | (0x3u << 2u);
-            expectRejected(
-                rebuild(36u, command.primitive(), regionRepeated,
+                3ull | (3ull << 2u) |
+                (127ull << 4u) | (128ull << 14u) |
+                (63ull << 24u) | (64ull << 34u);
+            GsVulkanNearestCt32Sprite regionRepeatedSprite{};
+            const GsBackendDecision regionRepeatedDecision =
+                prepareGsVulkanNearestCt32Sprite(
+                    rebuild(
+                        36u, command.primitive(), regionRepeated,
                         std::span<const GSVertex>(command.vertices()).first(2u)),
-                GsFallbackReason::UnsupportedTextureWrap,
-                "region repeat should remain outside the standard clamp slice");
+                    regionRepeatedSprite);
+            t.IsTrue(regionRepeatedDecision.supported,
+                     "REGION_REPEAT should be independently eligible");
+            t.Equals(
+                gsVulkanTextureWrapMode(regionRepeatedSprite.textureWrapU), 3u,
+                "REGION_REPEAT U should reach the shader record");
+            t.Equals(
+                gsVulkanTextureRegionMin(regionRepeatedSprite.textureWrapU),
+                127u,
+                "REGION_REPEAT U should retain raw MINU before nominal masking");
+            t.Equals(
+                gsVulkanTextureRegionMax(regionRepeatedSprite.textureWrapU),
+                128u,
+                "REGION_REPEAT U should retain its raw MAXU offset");
+            t.Equals(
+                gsVulkanTextureWrapMode(regionRepeatedSprite.textureWrapV), 3u,
+                "REGION_REPEAT V should remain independent");
 
             GSContext zeroStride = command.context();
             zeroStride.tex0.tbw = 0u;
@@ -1731,7 +1759,7 @@ void register_ps2_gs_vulkan_tests()
                 uint16_t regionMinV = 0x133u;
                 uint16_t regionMaxV = 0x266u;
             };
-            const std::array<TextureCase, 11> cases{{
+            const std::array<TextureCase, 14> cases{{
                 {
                     {6u, 15u, 5u, 12u}, {32u, 16u},
                     {352u, 96u}, {48u, 304u},
@@ -1789,6 +1817,24 @@ void register_ps2_gs_vulkan_tests()
                     {0u, 256u}, {0u, 128u},
                     {0u, 256u}, {0u, 128u}, 3u, 2u, 2u, 2u,
                     10u, 12u, 6u, 9u,
+                },
+                {
+                    {0u, 15u, 0u, 7u}, {0u, 0u},
+                    {0u, 256u}, {0u, 128u},
+                    {0u, 256u}, {0u, 128u}, 3u, 2u, 3u, 0u,
+                    15u, 16u, 0u, 0u,
+                },
+                {
+                    {0u, 15u, 0u, 7u}, {0u, 0u},
+                    {0u, 256u}, {0u, 128u},
+                    {0u, 256u}, {0u, 128u}, 3u, 2u, 0u, 3u,
+                    0u, 0u, 15u, 16u,
+                },
+                {
+                    {0u, 15u, 0u, 7u}, {0u, 0u},
+                    {0u, 256u}, {0u, 128u},
+                    {0u, 256u}, {0u, 128u}, 3u, 2u, 3u, 3u,
+                    15u, 32u, 15u, 24u,
                 },
             }};
 
@@ -2317,13 +2363,13 @@ void register_ps2_gs_vulkan_tests()
                 43u, 40u, 2u, 64u, 2u, 6u, 5u,
                 {6u, 15u, 5u, 12u}, {32u, 16u},
                 {352u, 96u}, {48u, 304u},
-                {480u, 224u}, {64u, 320u}, 2u, 2u,
-                70u, 72u, 40u, 42u);
+                {480u, 224u}, {64u, 320u}, 3u, 3u,
+                15u, 128u, 15u, 64u);
             GsVulkanNearestCt32Sprite prepared{};
             t.IsTrue(
                 prepareGsVulkanNearestCt32Sprite(
                     command, prepared).supported,
-                "the REGION_CLAMP verification fixture should satisfy the nearest texture predicate");
+                "the REGION_REPEAT verification fixture should satisfy the nearest texture predicate");
 
             std::vector<uint8_t> vram = makeVramPattern(0x54585631u);
             const std::vector<uint8_t> initial = vram;
@@ -3389,7 +3435,7 @@ void register_ps2_gs_vulkan_tests()
                     {0u, 127u, 0u, 63u}, {0u, 0u},
                     {0u, 128u * 16u}, {0u, 64u * 16u},
                     {0u, 128u * 16u}, {0u, 64u * 16u},
-                    2u, 2u, 70u, 72u, 40u, 42u);
+                    3u, 3u, 15u, 16u, 15u, 16u);
 
             GsVulkanNearestCt32Sprite belowPrepared{};
             GsVulkanNearestCt32Sprite thresholdPrepared{};
@@ -3413,11 +3459,11 @@ void register_ps2_gs_vulkan_tests()
             t.Equals(samplePixels(thresholdPrepared), thresholdPixels,
                      "the larger texture should meet the policy exactly");
             t.Equals(gsVulkanTextureWrapMode(
-                         thresholdPrepared.textureWrapU), 2u,
-                     "Hybrid cost routing should preserve REGION_CLAMP U");
+                         thresholdPrepared.textureWrapU), 3u,
+                     "Hybrid cost routing should preserve REGION_REPEAT U");
             t.Equals(gsVulkanTextureWrapMode(
-                         thresholdPrepared.textureWrapV), 2u,
-                     "Hybrid cost routing should preserve REGION_CLAMP V");
+                         thresholdPrepared.textureWrapV), 3u,
+                     "Hybrid cost routing should preserve REGION_REPEAT V");
 
             std::vector<uint8_t> vram = makeVramPattern(0x5458434Fu);
             std::vector<uint8_t> expected = vram;
@@ -4411,13 +4457,13 @@ void register_ps2_gs_vulkan_tests()
                     80u, 40u, 2u, 64u, 2u, 6u, 5u,
                     {6u, 15u, 5u, 12u}, {32u, 16u},
                     {352u, 96u}, {48u, 304u},
-                    {480u, 224u}, {64u, 320u}, 2u, 2u,
-                    70u, 72u, 40u, 42u);
+                    {480u, 224u}, {64u, 320u}, 3u, 3u,
+                    15u, 128u, 15u, 64u);
             GsVulkanNearestCt32Sprite preparedTexture{};
             t.IsTrue(
                 prepareGsVulkanNearestCt32Sprite(
                     textureCommand, preparedTexture).supported,
-                "the randomized strict REGION_CLAMP texture fixture should be eligible");
+                "the randomized strict REGION_REPEAT texture fixture should be eligible");
             GSRegisters softwareRegisters{};
             GSRegisters acceleratedRegisters{};
             configureCt32Display(softwareRegisters, pages[0]);
@@ -5108,8 +5154,8 @@ void register_ps2_gs_vulkan_tests()
                 93u, 40u, 2u, 64u, 2u, 6u, 5u,
                 {6u, 15u, 5u, 12u}, {32u, 16u},
                 {352u, 96u}, {48u, 304u},
-                {480u, 224u}, {64u, 320u}, 2u, 1u,
-                70u, 72u, 40u, 42u);
+                {480u, 224u}, {64u, 320u}, 3u, 1u,
+                15u, 128u, 40u, 42u);
             std::vector<uint8_t> vram = makeVramPattern(0x54584D31u);
 
             GsVulkanRasterBackendConfig config{};
@@ -5175,18 +5221,18 @@ void register_ps2_gs_vulkan_tests()
             t.IsTrue(manifestText.find("\"texture_step_u\":1") !=
                          std::string::npos,
                      "the manifest should retain signed sampling direction");
-            t.IsTrue(manifestText.find("\"texture_wrap_mode_u\":2") !=
+            t.IsTrue(manifestText.find("\"texture_wrap_mode_u\":3") !=
                          std::string::npos,
-                     "the manifest should retain REGION_CLAMP U");
+                     "the manifest should retain REGION_REPEAT U");
             t.IsTrue(manifestText.find("\"texture_wrap_mode_v\":1") !=
                          std::string::npos,
                      "the manifest should retain standard V clamp independently");
-            t.IsTrue(manifestText.find("\"texture_region_min_u\":70") !=
+            t.IsTrue(manifestText.find("\"texture_region_min_u\":15") !=
                          std::string::npos,
-                     "the manifest should retain raw MINU beyond nominal width");
-            t.IsTrue(manifestText.find("\"texture_region_max_u\":72") !=
+                     "the manifest should retain raw MINU before nominal masking");
+            t.IsTrue(manifestText.find("\"texture_region_max_u\":128") !=
                          std::string::npos,
-                     "the manifest should retain raw MAXU beyond nominal width");
+                     "the manifest should retain the raw MAXU offset");
             t.IsTrue(manifestText.find("\"texture_region_min_v\":40") !=
                          std::string::npos,
                      "the manifest should retain raw MINV independently");
@@ -5216,9 +5262,17 @@ void register_ps2_gs_vulkan_tests()
                     {0u, 256u}, {0u, 128u},
                     {0u, 256u}, {0u, 128u}, 2u, 2u,
                     70u, 72u, 40u, 42u);
+            const GsDrawCommand regionRepeatedCommand =
+                makeNearestCt32SpriteCommand(
+                    97u, 43u, 2u, 64u, 2u, 3u, 2u,
+                    {0u, 15u, 0u, 7u}, {0u, 0u},
+                    {0u, 256u}, {0u, 128u},
+                    {0u, 256u}, {0u, 128u}, 3u, 3u,
+                    15u, 128u, 15u, 64u);
             GsVulkanNearestCt32Sprite prepared{};
             GsVulkanNearestCt32Sprite clampedPrepared{};
             GsVulkanNearestCt32Sprite regionClampedPrepared{};
+            GsVulkanNearestCt32Sprite regionRepeatedPrepared{};
             t.IsTrue(
                 prepareGsVulkanNearestCt32Sprite(
                     command, prepared).supported,
@@ -5232,6 +5286,11 @@ void register_ps2_gs_vulkan_tests()
                     regionClampedCommand,
                     regionClampedPrepared).supported,
                 "the integrated REGION_CLAMP fixture should be eligible");
+            t.IsTrue(
+                prepareGsVulkanNearestCt32Sprite(
+                    regionRepeatedCommand,
+                    regionRepeatedPrepared).supported,
+                "the integrated REGION_REPEAT fixture should be eligible");
 
             std::vector<uint8_t> softwareVram =
                 makeVramPattern(0x54585632u);
@@ -5285,6 +5344,8 @@ void register_ps2_gs_vulkan_tests()
             drawNearestCt32SpriteCommand(accelerated, clampedCommand);
             drawNearestCt32SpriteCommand(software, regionClampedCommand);
             drawNearestCt32SpriteCommand(accelerated, regionClampedCommand);
+            drawNearestCt32SpriteCommand(software, regionRepeatedCommand);
+            drawNearestCt32SpriteCommand(accelerated, regionRepeatedCommand);
             (void)software.getDebugSnapshot();
             (void)accelerated.getDebugSnapshot();
             t.IsTrue(acceleratedVram == softwareVram,
@@ -5292,11 +5353,11 @@ void register_ps2_gs_vulkan_tests()
 
             const GsBackendCounters counters =
                 accelerated.backendCounters();
-            t.Equals(counters.commands, 3ull,
-                     "the texture fixture should assemble repeat and both clamp classes");
-            t.Equals(counters.acceleratedCommands, 3ull,
+            t.Equals(counters.commands, 4ull,
+                     "the texture fixture should assemble all four wrap classes");
+            t.Equals(counters.acceleratedCommands, 4ull,
                      "all exact texture draws should use Vulkan Verify");
-            t.Equals(counters.verifiedCommands, 3ull,
+            t.Equals(counters.verifiedCommands, 4ull,
                      "all texture draws should record verification");
             t.Equals(counters.softwareCommands, 0ull,
                      "the routed texture draw should not use fallback");
@@ -5305,27 +5366,27 @@ void register_ps2_gs_vulkan_tests()
             t.Equals(
                 counters.decisions[static_cast<size_t>(
                     GsFallbackReason::Supported)],
-                3ull,
+                4ull,
                 "the router should retain every supported texture decision");
 
             const GsVulkanRasterBackendStatistics backend =
                 accelerated.vulkanRendererBackendStatistics();
-            t.Equals(backend.commandsAttempted, 3ull,
+            t.Equals(backend.commandsAttempted, 4ull,
                      "the integrated backend should attempt all texture draws");
-            t.Equals(backend.commandsCompleted, 3ull,
+            t.Equals(backend.commandsCompleted, 4ull,
                      "all matching texture draws should complete once");
-            t.Equals(backend.verifiedCommands, 3ull,
-                     "the backend should compare repeat and both clamp results");
+            t.Equals(backend.verifiedCommands, 4ull,
+                     "the backend should compare all four wrap results");
             t.Equals(backend.bytesCompared,
-                     3ull * GS_VULKAN_VRAM_SIZE,
+                     4ull * GS_VULKAN_VRAM_SIZE,
                      "each texture Verify should compare the complete 4 MiB image");
             t.Equals(backend.verificationMismatches, 0ull,
                      "the real texture kernel should have no byte mismatch");
 
             const GsVulkanServiceStatistics service =
                 accelerated.vulkanRendererServiceStatistics();
-            t.Equals(service.nearestCt32SpriteDrawsCompleted, 3ull,
-                     "the service should execute repeat and both clamp requests");
+            t.Equals(service.nearestCt32SpriteDrawsCompleted, 4ull,
+                     "the service should execute all four wrap classes");
             t.Equals(service.nearestCt32SpriteDrawsFailed, 0ull,
                      "the real texture request should not fail");
             t.Equals(
@@ -5345,7 +5406,13 @@ void register_ps2_gs_vulkan_tests()
                         regionClampedPrepared.boundsX0) *
                     static_cast<uint64_t>(
                         regionClampedPrepared.boundsY1 -
-                        regionClampedPrepared.boundsY0),
+                        regionClampedPrepared.boundsY0) +
+                    static_cast<uint64_t>(
+                        regionRepeatedPrepared.boundsX1 -
+                        regionRepeatedPrepared.boundsX0) *
+                    static_cast<uint64_t>(
+                        regionRepeatedPrepared.boundsY1 -
+                        regionRepeatedPrepared.boundsY0),
                 "the service should retain exact texture pixel accounting");
             t.Equals(service.spriteDrawsCompleted, 0ull,
                      "texture routing must not alias the flat sprite request");
@@ -5373,7 +5440,7 @@ void register_ps2_gs_vulkan_tests()
                     {0u, 127u, 0u, 63u}, {0u, 0u},
                     {0u, 128u * 16u}, {0u, 64u * 16u},
                     {0u, 128u * 16u}, {0u, 64u * 16u},
-                    2u, 2u, 70u, 72u, 40u, 42u);
+                    3u, 3u, 15u, 16u, 15u, 16u);
             GsVulkanNearestCt32Sprite belowPrepared{};
             GsVulkanNearestCt32Sprite thresholdPrepared{};
             t.IsTrue(prepareGsVulkanNearestCt32Sprite(
@@ -5383,17 +5450,17 @@ void register_ps2_gs_vulkan_tests()
                          atThreshold, thresholdPrepared).supported,
                      "the real threshold fixture should be eligible");
             t.Equals(gsVulkanTextureWrapMode(
-                         thresholdPrepared.textureWrapU), 2u,
-                     "real Hybrid should retain REGION_CLAMP U");
+                         thresholdPrepared.textureWrapU), 3u,
+                     "real Hybrid should retain REGION_REPEAT U");
             t.Equals(gsVulkanTextureWrapMode(
-                         thresholdPrepared.textureWrapV), 2u,
-                     "real Hybrid should retain REGION_CLAMP V");
+                         thresholdPrepared.textureWrapV), 3u,
+                     "real Hybrid should retain REGION_REPEAT V");
             t.Equals(gsVulkanTextureRegionMax(
-                         thresholdPrepared.textureWrapU), 72u,
-                     "real Hybrid should retain raw MAXU beyond nominal width");
+                         thresholdPrepared.textureWrapU), 16u,
+                     "real Hybrid should retain the REGION_REPEAT U offset");
             t.Equals(gsVulkanTextureRegionMax(
-                         thresholdPrepared.textureWrapV), 42u,
-                     "real Hybrid should retain raw MAXV beyond nominal height");
+                         thresholdPrepared.textureWrapV), 16u,
+                     "real Hybrid should retain the REGION_REPEAT V offset");
 
             std::vector<uint8_t> softwareVram =
                 makeVramPattern(0x54584859u);
@@ -5533,7 +5600,8 @@ void register_ps2_gs_vulkan_tests()
                     96u, 41u, 2u, 64u, 2u, 6u, 5u,
                     {6u, 15u, 5u, 12u}, {32u, 16u},
                     {352u, 96u}, {48u, 304u},
-                    {480u, 224u}, {64u, 320u});
+                    {480u, 224u}, {64u, 320u}, 3u, 3u,
+                    15u, 16u, 15u, 16u);
             const GsDrawCommand clampedCommand =
                 makeNearestCt32SpriteCommand(
                     97u, 42u, 2u, 64u, 2u, 3u, 2u,
@@ -5558,7 +5626,7 @@ void register_ps2_gs_vulkan_tests()
             t.IsTrue(
                 prepareGsVulkanNearestCt32Sprite(
                     secondCommand, secondPrepared).supported,
-                "the shared-source strict fixture should satisfy the texture predicate");
+                "the shared-source strict REGION_REPEAT fixture should satisfy the texture predicate");
             t.IsTrue(
                 prepareGsVulkanNearestCt32Sprite(
                     clampedCommand, clampedPrepared).supported,
@@ -5747,13 +5815,13 @@ void register_ps2_gs_vulkan_tests()
                 textureBlock, bufferWidth, 6u, 5u,
                 {6u, 15u, 5u, 12u}, {32u, 16u},
                 {352u, 96u}, {48u, 304u},
-                {480u, 224u}, {64u, 320u}, 2u, 2u,
-                70u, 72u, 40u, 42u);
+                {480u, 224u}, {64u, 320u}, 3u, 3u,
+                15u, 70u, 8u, 40u);
             GsVulkanNearestCt32Sprite prepared{};
             t.IsTrue(
                 prepareGsVulkanNearestCt32Sprite(
                     command, prepared).supported,
-                "the REGION_CLAMP transition fixture should satisfy the nearest texture predicate");
+                "the REGION_REPEAT transition fixture should satisfy the nearest texture predicate");
 
             std::vector<uint8_t> softwareVram =
                 makeVramPattern(0x54584350u);
@@ -6779,13 +6847,13 @@ void register_ps2_gs_vulkan_tests()
                     101u, 40u, 2u, 64u, 2u, 6u, 5u,
                     {6u, 15u, 5u, 12u}, {32u, 16u},
                     {352u, 96u}, {48u, 304u},
-                    {480u, 224u}, {64u, 320u}, 2u, 2u,
-                    70u, 72u, 40u, 42u);
+                    {480u, 224u}, {64u, 320u}, 3u, 3u,
+                    15u, 128u, 15u, 64u);
             GsVulkanNearestCt32Sprite preparedTexture{};
             t.IsTrue(
                 prepareGsVulkanNearestCt32Sprite(
                     textureCommand, preparedTexture).supported,
-                "the strict reset REGION_CLAMP texture fixture should be eligible");
+                "the strict reset REGION_REPEAT texture fixture should be eligible");
             std::vector<uint8_t> softwareVram =
                 makeVramPattern(0x53545231u);
             std::vector<uint8_t> strictVram = softwareVram;
@@ -7734,12 +7802,30 @@ void register_ps2_gs_vulkan_tests()
                     {0u, 15u, 0u, 7u}, {0u, 0u},
                     {0u, 256u}, {0u, 128u},
                     {0u, 256u}, {0u, 128u}, 2u, 2u,
-                    70u, 72u, 40u, 42u)))
+                    70u, 72u, 40u, 42u)) ||
+                !addSprite(makeNearestCt32SpriteCommand(
+                    30'013u, 107u, 2u, 64u, 2u, 3u, 2u,
+                    {0u, 15u, 0u, 7u}, {0u, 0u},
+                    {0u, 256u}, {0u, 128u},
+                    {0u, 256u}, {0u, 128u}, 3u, 0u,
+                    15u, 16u, 0u, 0u)) ||
+                !addSprite(makeNearestCt32SpriteCommand(
+                    30'014u, 108u, 2u, 64u, 2u, 3u, 2u,
+                    {0u, 15u, 0u, 7u}, {0u, 0u},
+                    {0u, 256u}, {0u, 128u},
+                    {0u, 256u}, {0u, 128u}, 0u, 3u,
+                    0u, 0u, 15u, 16u)) ||
+                !addSprite(makeNearestCt32SpriteCommand(
+                    30'015u, 109u, 2u, 64u, 2u, 3u, 2u,
+                    {0u, 15u, 0u, 7u}, {0u, 0u},
+                    {0u, 256u}, {0u, 128u},
+                    {0u, 256u}, {0u, 128u}, 3u, 3u,
+                    15u, 128u, 15u, 64u)))
             {
                 return;
             }
 
-            t.Equals(sprites.size(), static_cast<size_t>(13u),
+            t.Equals(sprites.size(), static_cast<size_t>(16u),
                      "the GPU texture corpus should retain every semantic fixture");
             t.Equals(sprites[4].textureBaseBlock, 0x3FFFu,
                      "the source-wrap fixture should begin at the last GS block");
@@ -7775,6 +7861,18 @@ void register_ps2_gs_vulkan_tests()
                      "the GPU corpus should combine U and V REGION_CLAMP");
             t.Equals(gsVulkanTextureWrapMode(sprites[12].textureWrapV), 2u,
                      "the GPU corpus should combine V and U REGION_CLAMP");
+            t.Equals(gsVulkanTextureWrapMode(sprites[13].textureWrapU), 3u,
+                     "the GPU corpus should retain REGION_REPEAT U");
+            t.Equals(gsVulkanTextureRegionMin(sprites[13].textureWrapU), 15u,
+                     "REGION_REPEAT U should retain raw MINU before masking");
+            t.Equals(gsVulkanTextureRegionMax(sprites[13].textureWrapU), 16u,
+                     "REGION_REPEAT U should retain its raw MAXU offset");
+            t.Equals(gsVulkanTextureWrapMode(sprites[14].textureWrapV), 3u,
+                     "the GPU corpus should retain REGION_REPEAT V");
+            t.Equals(gsVulkanTextureWrapMode(sprites[15].textureWrapU), 3u,
+                     "the GPU corpus should combine U and V REGION_REPEAT");
+            t.Equals(gsVulkanTextureWrapMode(sprites[15].textureWrapV), 3u,
+                     "the GPU corpus should combine V and U REGION_REPEAT");
 
             GsVulkanServiceConfig config{};
             config.probe.enableValidation = true;
@@ -7894,11 +7992,6 @@ void register_ps2_gs_vulkan_tests()
             expectRejected(shortInput, sprites.front(),
                            "short texture VRAM input");
             GsVulkanNearestCt32Sprite invalid = sprites.front();
-            invalid.textureWrapU =
-                packGsVulkanTextureWrap(3u, 7u, 16u);
-            expectRejected(validInput, invalid,
-                           "unsupported texture region-repeat mode");
-            invalid = sprites.front();
             invalid.textureWrapU |= 1u << 31u;
             expectRejected(validInput, invalid,
                            "texture wrap descriptor reserved bits");
@@ -7940,6 +8033,20 @@ void register_ps2_gs_vulkan_tests()
             invalid.framebufferBaseBlock = regionPage * 32u;
             expectRejected(validInput, invalid,
                            "region-expanded texture source and destination alias");
+            GSMem::PixelAddress repeatAddress{};
+            t.IsTrue(GSMem::ResolvePixelAddress(
+                         GSMem::PixelStorageMode::C32,
+                         sprites[15].textureBaseBlock,
+                         sprites[15].textureWidth,
+                         135u, 67u, repeatAddress),
+                     "the canonical resolver should accept the expanded repeat maximum");
+            const uint32_t repeatPage = static_cast<uint32_t>(
+                (static_cast<uint64_t>(repeatAddress.word_index) *
+                 sizeof(uint32_t)) / GS_VRAM_PAGE_SIZE);
+            invalid = sprites[15];
+            invalid.framebufferBaseBlock = repeatPage * 32u;
+            expectRejected(validInput, invalid,
+                           "region-repeat-expanded source and destination alias");
 
             const GsVulkanServiceStatistics statistics =
                 service->statistics();
@@ -8728,8 +8835,8 @@ void register_ps2_gs_vulkan_tests()
             if (!service)
                 return;
 
-            constexpr std::array<uint32_t, 6> framebufferPages{{
-                40u, 41u, 197u, 509u, 200u, 201u,
+            constexpr std::array<uint32_t, 8> framebufferPages{{
+                40u, 41u, 197u, 509u, 200u, 201u, 202u, 203u,
             }};
             std::vector<GsVulkanNearestCt32Sprite> sprites;
             for (size_t index = 0u; index < framebufferPages.size(); ++index)
@@ -8742,14 +8849,18 @@ void register_ps2_gs_vulkan_tests()
                     {480u, 224u}, {64u, 320u},
                     index == 4u
                         ? 2u
-                        : static_cast<uint8_t>(index & 1u),
+                        : (index == 6u
+                            ? 3u
+                            : static_cast<uint8_t>(index & 1u)),
                     index == 5u
                         ? 2u
-                        : static_cast<uint8_t>((index >> 1u) & 1u),
-                    index == 4u ? 70u : 0u,
-                    index == 4u ? 72u : 0u,
-                    index == 5u ? 40u : 0u,
-                    index == 5u ? 42u : 0u);
+                        : (index == 7u
+                            ? 3u
+                            : static_cast<uint8_t>((index >> 1u) & 1u)),
+                    index == 4u ? 70u : (index == 6u ? 15u : 0u),
+                    index == 4u ? 72u : (index == 6u ? 16u : 0u),
+                    index == 5u ? 40u : (index == 7u ? 15u : 0u),
+                    index == 5u ? 42u : (index == 7u ? 16u : 0u));
                 GsVulkanNearestCt32Sprite sprite{};
                 const GsBackendDecision decision =
                     prepareGsVulkanNearestCt32Sprite(command, sprite);
@@ -8770,6 +8881,14 @@ void register_ps2_gs_vulkan_tests()
                      "resident batching should retain REGION_CLAMP V");
             t.Equals(gsVulkanTextureRegionMax(sprites[5].textureWrapV), 42u,
                      "resident batching should retain raw MAXV beyond nominal height");
+            t.Equals(gsVulkanTextureWrapMode(sprites[6].textureWrapU), 3u,
+                     "resident batching should retain REGION_REPEAT U");
+            t.Equals(gsVulkanTextureRegionMax(sprites[6].textureWrapU), 16u,
+                     "resident batching should retain REGION_REPEAT U offset");
+            t.Equals(gsVulkanTextureWrapMode(sprites[7].textureWrapV), 3u,
+                     "resident batching should retain REGION_REPEAT V");
+            t.Equals(gsVulkanTextureRegionMax(sprites[7].textureWrapV), 16u,
+                     "resident batching should retain REGION_REPEAT V offset");
 
             const GsVramPageMask sharedReadPages =
                 gsVramPagesForSurfaceRect(
@@ -8814,8 +8933,7 @@ void register_ps2_gs_vulkan_tests()
                 sprites.front());
             expectRejected(oversized, "oversized resident texture batch");
             std::vector<GsVulkanNearestCt32Sprite> invalid = sprites;
-            invalid[2].textureWrapU =
-                packGsVulkanTextureWrap(3u, 7u, 16u);
+            invalid[2].textureWrapU |= 1u << 31u;
             expectRejected(invalid, "invalid resident texture batch member");
 
             const std::array<GsVulkanNearestCt32Sprite, 2> writeWrite{{

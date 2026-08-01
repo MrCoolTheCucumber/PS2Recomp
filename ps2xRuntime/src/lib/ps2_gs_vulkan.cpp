@@ -178,11 +178,6 @@ namespace
         {
             return "Vulkan nearest CT32 sprite wrap descriptor is invalid";
         }
-        if (gsVulkanTextureWrapMode(sprite.textureWrapU) > 2u ||
-            gsVulkanTextureWrapMode(sprite.textureWrapV) > 2u)
-        {
-            return "Vulkan nearest CT32 sprite wrap mode is unsupported";
-        }
         if ((gsVulkanTextureWrapMode(sprite.textureWrapU) == 2u &&
              gsVulkanTextureRegionMin(sprite.textureWrapU) >
                  gsVulkanTextureRegionMax(sprite.textureWrapU)) ||
@@ -1417,7 +1412,7 @@ namespace
     static_assert(kGsCt32TriangleShaderSpv[0] == 0x07230203u);
     static_assert(sizeof(kGsMemoryCasesShaderSpv) == 10988u);
     static_assert(kGsMemoryCasesShaderSpv[0] == 0x07230203u);
-    static_assert(sizeof(kGsNearestCt32SpriteShaderSpv) == 13656u);
+    static_assert(sizeof(kGsNearestCt32SpriteShaderSpv) == 14128u);
     static_assert(kGsNearestCt32SpriteShaderSpv[0] == 0x07230203u);
     static_assert(sizeof(kGsVramNoopShaderSpv) == 1112u);
     static_assert(kGsVramNoopShaderSpv[0] == 0x07230203u);

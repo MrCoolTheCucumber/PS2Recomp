@@ -37,6 +37,12 @@ uint wrap_texture_coordinate(int coordinate, uint mask, uint wrap)
         return uint(coordinate) & mask;
     if (mode == 1u)
         return uint(clamp(coordinate, 0, int(mask)));
+    if (mode == 3u)
+    {
+        uint region_mask = ((wrap >> 2u) & 0x3FFu) & mask;
+        uint region_offset = (wrap >> 12u) & 0x3FFu;
+        return (uint(coordinate) & region_mask) | region_offset;
+    }
 
     int region_minimum = int((wrap >> 2u) & 0x3FFu);
     int region_maximum = int((wrap >> 12u) & 0x3FFu);
