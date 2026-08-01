@@ -492,6 +492,49 @@ namespace
             gs.writeRegister(GS_REG_XYZ2, packXyz2(x[index], y[index]));
     }
 
+    void drawFlatCt32TriangleCommand(
+        GS &gs,
+        const GsDrawCommand &command,
+        uint32_t rgba)
+    {
+        const GSContext &context = command.context();
+        const GsDrawGlobalState &global = command.globalState();
+        const uint64_t frame =
+            static_cast<uint64_t>(context.frame.fbp) |
+            (static_cast<uint64_t>(context.frame.fbw) << 16u) |
+            (static_cast<uint64_t>(context.frame.psm) << 24u) |
+            (static_cast<uint64_t>(context.frame.fbmsk) << 32u);
+        const uint64_t zbuf =
+            static_cast<uint64_t>(context.zbuf.zbp) |
+            (static_cast<uint64_t>(context.zbuf.psm) << 24u) |
+            (static_cast<uint64_t>(context.zbuf.zmask) << 32u);
+        const uint64_t scissor =
+            static_cast<uint64_t>(context.scissor.x0) |
+            (static_cast<uint64_t>(context.scissor.x1) << 16u) |
+            (static_cast<uint64_t>(context.scissor.y0) << 32u) |
+            (static_cast<uint64_t>(context.scissor.y1) << 48u);
+        const uint64_t xyoffset =
+            static_cast<uint64_t>(context.xyoffset.ofx) |
+            (static_cast<uint64_t>(context.xyoffset.ofy) << 32u);
+        gs.writeRegister(GS_REG_FRAME_1, frame);
+        gs.writeRegister(GS_REG_ZBUF_1, zbuf);
+        gs.writeRegister(GS_REG_SCISSOR_1, scissor);
+        gs.writeRegister(GS_REG_XYOFFSET_1, xyoffset);
+        gs.writeRegister(GS_REG_TEST_1, context.test);
+        gs.writeRegister(GS_REG_FBA_1, context.fba);
+        gs.writeRegister(GS_REG_SCANMSK, global.scanMask);
+        gs.writeRegister(GS_REG_DTHE, global.dither ? 1u : 0u);
+
+        std::array<uint16_t, 3> rawX{};
+        std::array<uint16_t, 3> rawY{};
+        for (size_t index = 0u; index < rawX.size(); ++index)
+        {
+            rawX[index] = command.vertices()[index].x12_4;
+            rawY[index] = command.vertices()[index].y12_4;
+        }
+        drawFlatCt32Triangle(gs, rawX, rawY, rgba);
+    }
+
     void drawFlatCt32Point(
         GS &gs, uint16_t x, uint16_t y, uint32_t rgba)
     {
@@ -5365,6 +5408,440 @@ void register_ps2_gs_vulkan_tests()
                      "resident triangle batching should emit no validation warnings");
             t.IsTrue(service->healthy(),
                      "accepted and rejected triangle batches should leave the service healthy");
+            service->shutdown();
+        });
+
+        tc.Run("Vulkan CT32 triangles match exhaustive and random software batches", [](TestCase &t)
+        {
+            GSMem::InitLookupTables();
+            using FixedVertex = std::array<int32_t, 2>;
+            using FixedTriangle = std::array<FixedVertex, 3>;
+            constexpr std::array<std::array<uint8_t, 3>, 6>
+                permutations{{
+                    {{0u, 1u, 2u}},
+                    {{0u, 2u, 1u}},
+                    {{1u, 0u, 2u}},
+                    {{1u, 2u, 0u}},
+                    {{2u, 0u, 1u}},
+                    {{2u, 1u, 0u}},
+                }};
+            constexpr std::array<GSScissorReg, 4> scissors{{
+                {0u, 31u, 0u, 31u},
+                {4u, 13u, 3u, 14u},
+                {0u, 7u, 6u, 20u},
+                {8u, 8u, 0u, 31u},
+            }};
+            constexpr GSXYOffsetReg edgeXyoffset{128u, 128u};
+
+            // Degenerate geometry never reaches a GPU record. Cover repeated,
+            // horizontal, vertical, and diagonal collinearity across every
+            // fractional phase, scissor, and vertex order.
+            constexpr std::array<FixedTriangle, 4> degenerateShapes{{
+                {{{32, 32}, {32, 32}, {32, 32}}},
+                {{{32, 48}, {256, 48}, {144, 48}}},
+                {{{64, 16}, {64, 256}, {64, 128}}},
+                {{{16, 16}, {256, 256}, {128, 128}}},
+            }};
+            uint64_t sequence = 40'000u;
+            uint64_t degenerateCases = 0u;
+            for (const FixedTriangle &shape : degenerateShapes)
+            {
+                for (const GSScissorReg &scissor : scissors)
+                {
+                    for (uint32_t phaseY = 0u; phaseY < 16u; ++phaseY)
+                    {
+                        for (uint32_t phaseX = 0u; phaseX < 16u; ++phaseX)
+                        {
+                            for (const auto &permutation : permutations)
+                            {
+                                std::array<uint16_t, 3> rawX{};
+                                std::array<uint16_t, 3> rawY{};
+                                for (size_t vertex = 0u;
+                                     vertex < rawX.size(); ++vertex)
+                                {
+                                    const FixedVertex &source =
+                                        shape[permutation[vertex]];
+                                    rawX[vertex] = static_cast<uint16_t>(
+                                        source[0] + phaseX +
+                                        edgeXyoffset.ofx);
+                                    rawY[vertex] = static_cast<uint16_t>(
+                                        source[1] + phaseY +
+                                        edgeXyoffset.ofy);
+                                }
+                                const GsDrawCommand command =
+                                    makeCt32TriangleCommand(
+                                        sequence++, 0u, 1u,
+                                        scissor, edgeXyoffset,
+                                        rawX, rawY, 0xD06E0000u);
+                                GsVulkanCt32Triangle record{
+                                    1u, 2u, 3u, 4u, 5u, 6u,
+                                    7, 8, 9, 10, 11, 12,
+                                    13u, 14u, 15u, 16u};
+                                const GsVulkanCt32Triangle sentinel = record;
+                                const GsBackendDecision decision =
+                                    prepareGsVulkanCt32Triangle(
+                                        command, record);
+                                if (decision.supported ||
+                                    decision.reason !=
+                                        GsFallbackReason::EmptyBounds ||
+                                    !(record == sentinel))
+                                {
+                                    t.Fail(
+                                        "degenerate triangle corpus did not fail as an empty bound");
+                                    return;
+                                }
+                                ++degenerateCases;
+                            }
+                        }
+                    }
+                }
+            }
+            t.Equals(degenerateCases, 24'576ull,
+                     "the exhaustive degenerate corpus should retain every case");
+
+            GsVulkanCapabilityReport preflight{};
+            const GsVulkanServiceConfig config =
+                makeRendererServiceConfig(preflight);
+            GsVulkanCapabilityReport creationReport{};
+            std::string creationError;
+            std::unique_ptr<GsVulkanService> service =
+                GsVulkanService::create(
+                    config, &creationReport, &creationError);
+            if (!preflight.ready())
+            {
+                t.IsNull(service.get(),
+                         "an unavailable host should skip the GPU triangle corpus cleanly");
+                t.IsFalse(creationReport.ready(),
+                          "a skipped corpus service should retain its capability result");
+                return;
+            }
+            t.IsNotNull(service.get(),
+                        "a generally suitable device should create the triangle corpus service");
+            t.IsTrue(creationError.empty(),
+                     "successful corpus service creation should clear its diagnostic");
+            if (!service)
+                return;
+            const GsVulkanDeviceReport *selected =
+                creationReport.selectedDevice();
+            t.IsNotNull(selected,
+                        "the triangle corpus service should retain its selected device");
+            if (!selected)
+                return;
+            if (!selected->exactCt32Triangle)
+            {
+                service->shutdown();
+                return;
+            }
+
+            std::vector<uint8_t> softwareVram(
+                GS_VULKAN_VRAM_SIZE, 0u);
+            GS software;
+            software.init(
+                softwareVram.data(),
+                static_cast<uint32_t>(softwareVram.size()), nullptr);
+            software.setDebugHistoryPaused(true);
+
+            GsVramPageMask allPages;
+            allPages.setAll();
+            std::vector<GsVulkanCt32Triangle> batch;
+            batch.reserve(GS_VULKAN_MAX_RESIDENT_TRIANGLE_BATCH);
+            std::vector<uint8_t> initial;
+            uint64_t acceptedCases = 0u;
+            uint64_t candidatePixels = 0u;
+            uint64_t completedBatches = 0u;
+            std::string operationError;
+
+            const auto beginBatch = [&]()
+            {
+                initial = makeVramPattern(
+                    0x54514331u ^
+                    static_cast<uint32_t>(completedBatches *
+                                          0x9E3779B9u));
+                std::copy(
+                    initial.begin(), initial.end(), softwareVram.begin());
+            };
+            const auto flushBatch = [&]()
+            {
+                if (batch.empty())
+                    return true;
+                if (batch.size() !=
+                    GS_VULKAN_MAX_RESIDENT_TRIANGLE_BATCH)
+                {
+                    t.Fail("triangle qualification produced a partial batch");
+                    return false;
+                }
+
+                software.flushRenderBatch();
+                operationError.clear();
+                if (!service->uploadVramPages(
+                        initial, allPages, &operationError))
+                {
+                    t.Fail(
+                        "triangle qualification upload failed: " +
+                        operationError);
+                    return false;
+                }
+                operationError.clear();
+                if (!service->executeResidentCt32Triangles(
+                        batch, &operationError))
+                {
+                    t.Fail(
+                        "triangle qualification batch failed: " +
+                        operationError);
+                    return false;
+                }
+
+                std::vector<uint8_t> actual(
+                    GS_VULKAN_VRAM_SIZE, 0xA5u);
+                operationError.clear();
+                if (!service->downloadVramPages(
+                        actual, allPages, &operationError))
+                {
+                    t.Fail(
+                        "triangle qualification download failed: " +
+                        operationError);
+                    return false;
+                }
+                if (actual != softwareVram)
+                {
+                    const auto mismatch = std::mismatch(
+                        actual.begin(), actual.end(),
+                        softwareVram.begin());
+                    const size_t byte = static_cast<size_t>(
+                        mismatch.first - actual.begin());
+                    const size_t page = byte / GS_VRAM_PAGE_SIZE;
+                    const uint64_t firstCase =
+                        acceptedCases - batch.size();
+                    std::ostringstream message;
+                    message
+                        << "triangle qualification batch "
+                        << completedBatches
+                        << " first disagreed at byte " << byte
+                        << " physical page " << page
+                        << " corpus case " << (firstCase + page);
+                    t.Fail(message.str());
+                    return false;
+                }
+                ++completedBatches;
+                batch.clear();
+                return true;
+            };
+            const auto appendCase =
+                [&](const GsDrawCommand &command,
+                    const GsVulkanCt32Triangle &triangle)
+            {
+                if (batch.empty())
+                    beginBatch();
+                const size_t physicalPage = batch.size();
+                const GsVramPageMask writePages =
+                    gsVramPagesForSurfaceRect(
+                        triangle.framebufferBaseBlock,
+                        triangle.framebufferWidth,
+                        static_cast<uint8_t>(GSMem::C32),
+                        triangle.boundsX0,
+                        triangle.boundsY0,
+                        triangle.boundsX1 - triangle.boundsX0,
+                        triangle.boundsY1 - triangle.boundsY0);
+                if (writePages.count() != 1u ||
+                    !writePages.test(physicalPage))
+                {
+                    t.Fail(
+                        "triangle qualification record escaped its assigned page");
+                    return false;
+                }
+                drawFlatCt32TriangleCommand(
+                    software, command, triangle.rgba);
+                batch.push_back(triangle);
+                ++acceptedCases;
+                candidatePixels +=
+                    static_cast<uint64_t>(
+                        triangle.boundsX1 - triangle.boundsX0) *
+                    static_cast<uint64_t>(
+                        triangle.boundsY1 - triangle.boundsY0);
+                return batch.size() !=
+                           GS_VULKAN_MAX_RESIDENT_TRIANGLE_BATCH ||
+                       flushBatch();
+            };
+
+            constexpr std::array<FixedTriangle, 3> edgeShapes{{
+                {{{-64, 17}, {239, 49}, {33, 255}}},
+                {{{32, 32}, {256, 32}, {32, 256}}},
+                {{{65, 65}, {81, 241}, {257, 97}}},
+            }};
+            uint64_t exhaustiveCases = 0u;
+            uint32_t colorState = 0xE6A1C4D3u;
+            for (const FixedTriangle &shape : edgeShapes)
+            {
+                for (const GSScissorReg &scissor : scissors)
+                {
+                    for (uint32_t phaseY = 0u; phaseY < 16u; ++phaseY)
+                    {
+                        for (uint32_t phaseX = 0u; phaseX < 16u; ++phaseX)
+                        {
+                            for (const auto &permutation : permutations)
+                            {
+                                std::array<uint16_t, 3> rawX{};
+                                std::array<uint16_t, 3> rawY{};
+                                for (size_t vertex = 0u;
+                                     vertex < rawX.size(); ++vertex)
+                                {
+                                    const FixedVertex &source =
+                                        shape[permutation[vertex]];
+                                    rawX[vertex] = static_cast<uint16_t>(
+                                        source[0] + phaseX +
+                                        edgeXyoffset.ofx);
+                                    rawY[vertex] = static_cast<uint16_t>(
+                                        source[1] + phaseY +
+                                        edgeXyoffset.ofy);
+                                }
+                                const uint32_t physicalPage =
+                                    static_cast<uint32_t>(batch.size());
+                                const GsDrawCommand command =
+                                    makeCt32TriangleCommand(
+                                        sequence++, physicalPage, 1u,
+                                        scissor, edgeXyoffset,
+                                        rawX, rawY,
+                                        nextRandom(colorState));
+                                GsVulkanCt32Triangle triangle{};
+                                const GsBackendDecision decision =
+                                    prepareGsVulkanCt32Triangle(
+                                        command, triangle);
+                                if (!decision.supported)
+                                {
+                                    t.Fail(
+                                        "exhaustive GPU edge case was rejected as " +
+                                        std::string(gsFallbackReasonName(
+                                            decision.reason)));
+                                    return;
+                                }
+                                if (!appendCase(command, triangle))
+                                    return;
+                                ++exhaustiveCases;
+                            }
+                        }
+                    }
+                }
+            }
+            t.Equals(exhaustiveCases, 18'432ull,
+                     "the GPU edge corpus should retain every exhaustive case");
+            t.Equals(completedBatches, 36ull,
+                     "the exhaustive corpus should use 36 full-page batches");
+
+            constexpr uint64_t randomTarget = 4'096u;
+            constexpr uint32_t randomSeed = 0xC001D00Du;
+            uint32_t randomState = randomSeed;
+            uint64_t randomAttempts = 0u;
+            uint64_t randomCases = 0u;
+            uint64_t randomEmpty = 0u;
+            while (randomCases < randomTarget &&
+                   randomAttempts < 100'000u)
+            {
+                ++randomAttempts;
+                const GSXYOffsetReg xyoffset{
+                    static_cast<uint16_t>(
+                        0x4000u + (nextRandom(randomState) & 0x0FFFu)),
+                    static_cast<uint16_t>(
+                        0x4000u + (nextRandom(randomState) & 0x0FFFu)),
+                };
+                std::array<uint16_t, 3> rawX{};
+                std::array<uint16_t, 3> rawY{};
+                for (size_t vertex = 0u;
+                     vertex < rawX.size(); ++vertex)
+                {
+                    const int32_t fixedX =
+                        static_cast<int32_t>(
+                            nextRandom(randomState) % (80u * 16u)) -
+                        8 * 16;
+                    const int32_t fixedY =
+                        static_cast<int32_t>(
+                            nextRandom(randomState) % (48u * 16u)) -
+                        8 * 16;
+                    rawX[vertex] = static_cast<uint16_t>(
+                        fixedX + xyoffset.ofx);
+                    rawY[vertex] = static_cast<uint16_t>(
+                        fixedY + xyoffset.ofy);
+                }
+                const GSScissorReg scissor{
+                    static_cast<uint16_t>(nextRandom(randomState) % 16u),
+                    static_cast<uint16_t>(
+                        48u + nextRandom(randomState) % 16u),
+                    static_cast<uint16_t>(nextRandom(randomState) % 8u),
+                    static_cast<uint16_t>(
+                        24u + nextRandom(randomState) % 8u),
+                };
+                const uint32_t physicalPage =
+                    static_cast<uint32_t>(batch.size());
+                const GsDrawCommand command = makeCt32TriangleCommand(
+                    sequence++, physicalPage, 1u,
+                    scissor, xyoffset, rawX, rawY,
+                    nextRandom(randomState));
+                GsVulkanCt32Triangle triangle{};
+                const GsBackendDecision decision =
+                    prepareGsVulkanCt32Triangle(command, triangle);
+                if (!decision.supported)
+                {
+                    if (decision.reason != GsFallbackReason::EmptyBounds)
+                    {
+                        t.Fail(
+                            "seeded random triangle was rejected as " +
+                            std::string(gsFallbackReasonName(
+                                decision.reason)));
+                        return;
+                    }
+                    ++randomEmpty;
+                    continue;
+                }
+                if (!appendCase(command, triangle))
+                    return;
+                ++randomCases;
+            }
+            t.Equals(randomCases, randomTarget,
+                     "the fixed seed should produce every requested random draw");
+            t.IsTrue(randomEmpty != 0u,
+                     "the fixed seed should exercise clipped or degenerate fallback");
+            t.Equals(batch.size(), size_t{0u},
+                     "the complete qualification corpus should end on a full batch");
+            t.Equals(completedBatches, 44ull,
+                     "exhaustive and random cases should use 44 full batches");
+            t.Equals(acceptedCases,
+                     exhaustiveCases + randomCases,
+                     "every accepted record should be assigned to one batch");
+
+            const GsVulkanServiceStatistics statistics =
+                service->statistics();
+            t.Equals(statistics.triangleDrawsCompleted, acceptedCases,
+                     "the GPU should complete every qualification record");
+            t.Equals(statistics.triangleDrawsFailed, 0ull,
+                     "the qualification corpus should have no worker failures");
+            t.Equals(statistics.triangleCandidatePixelsExecuted,
+                     candidatePixels,
+                     "qualification statistics should retain all candidate pixels");
+            t.Equals(statistics.residentTriangleBatchesCompleted,
+                     completedBatches,
+                     "the worker should complete every qualification batch");
+            t.Equals(statistics.residentTriangleBatchesFailed, 0ull,
+                     "no qualification batch should fail");
+            t.Equals(statistics.largestResidentTriangleBatch,
+                     static_cast<uint64_t>(
+                         GS_VULKAN_MAX_RESIDENT_TRIANGLE_BATCH),
+                     "qualification should exercise the maximum safe batch");
+            t.Equals(statistics.queueSubmissions,
+                     completedBatches * 3u,
+                     "each corpus batch should use upload draw and download submissions");
+            t.Equals(statistics.shaderDispatches, acceptedCases,
+                     "every accepted record should use one production dispatch");
+            t.Equals(statistics.pagesUploaded,
+                     completedBatches * GS_VRAM_PAGE_COUNT,
+                     "each corpus batch should reset every independent page");
+            t.Equals(statistics.pagesDownloaded,
+                     completedBatches * GS_VRAM_PAGE_COUNT,
+                     "each corpus batch should compare every independent page");
+            t.Equals(statistics.validationErrors, 0u,
+                     "the full triangle corpus must remain validation-clean");
+            t.Equals(statistics.validationWarnings, 0u,
+                     "the full triangle corpus should emit no validation warnings");
+            t.IsTrue(service->healthy(),
+                     "the exhaustive and random corpus should leave the service healthy");
             service->shutdown();
         });
 
