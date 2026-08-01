@@ -778,6 +778,167 @@ void register_ps2_gs_tests()
                      "initial subset should name depth comparisons precisely");
         });
 
+        tc.Run("flat CT32 triangle classifier fails closed with ordered reasons", [](TestCase &t)
+        {
+            GSContext context{};
+            context.frame = {0u, 1u, GS_PSM_CT32, 0u};
+            context.scissor = {0u, 15u, 0u, 15u};
+            context.zbuf = {32u, GS_PSM_Z32, true};
+            context.test = 0x30000u; // ZTE=1, ZTST=ALWAYS.
+
+            GSPrimReg primitive{};
+            primitive.type = GS_PRIM_TRIANGLE;
+            std::array<GSVertex, 3> vertices{};
+            vertices[1].x12_4 = 10u * 16u;
+            vertices[2].y12_4 = 10u * 16u;
+            GsDrawGlobalState global{};
+
+            const auto classify = [&](const GSPrimReg &drawPrimitive,
+                                      const GSContext &drawContext,
+                                      const GsDrawGlobalState &drawGlobal)
+            {
+                return classifyGsFlatCt32Triangle(buildGsDrawCommand(
+                    1u,
+                    drawPrimitive,
+                    drawContext,
+                    std::span<const GSVertex>(vertices),
+                    drawGlobal));
+            };
+            const auto expect = [&](GsFallbackReason expected,
+                                    const GSPrimReg &drawPrimitive,
+                                    const GSContext &drawContext,
+                                    const GsDrawGlobalState &drawGlobal,
+                                    const char *message)
+            {
+                t.Equals(
+                    classify(drawPrimitive, drawContext, drawGlobal).reason,
+                    expected,
+                    message);
+            };
+
+            expect(
+                GsFallbackReason::Supported,
+                primitive, context, global,
+                "the exact flat no-depth triangle should be supported");
+
+            GSPrimReg changedPrimitive = primitive;
+            changedPrimitive.type = GS_PRIM_TRISTRIP;
+            expect(
+                GsFallbackReason::UnsupportedPrimitive,
+                changedPrimitive, context, global,
+                "triangle strips should remain a distinct future capability");
+            changedPrimitive = primitive;
+            changedPrimitive.aa1 = true;
+            expect(
+                GsFallbackReason::UnsupportedPrimitiveState,
+                changedPrimitive, context, global,
+                "AA1 should fail before pixel-state classification");
+            changedPrimitive = primitive;
+            changedPrimitive.fix = true;
+            expect(
+                GsFallbackReason::UnsupportedPrimitiveState,
+                changedPrimitive, context, global,
+                "FIX should remain outside the first triangle slice");
+
+            GSContext changedContext = context;
+            changedContext.frame.psm = GS_PSM_CT24;
+            expect(
+                GsFallbackReason::UnsupportedFramebufferFormat,
+                primitive, changedContext, global,
+                "CT24 should not enter a CT32-only shader record");
+            changedPrimitive = primitive;
+            changedPrimitive.tme = true;
+            expect(
+                GsFallbackReason::Textured,
+                changedPrimitive, context, global,
+                "texturing should retain its named fallback");
+            changedPrimitive = primitive;
+            changedPrimitive.iip = true;
+            expect(
+                GsFallbackReason::GouraudShading,
+                changedPrimitive, context, global,
+                "Gouraud interpolation should remain software-only");
+            changedPrimitive = primitive;
+            changedPrimitive.fge = true;
+            expect(
+                GsFallbackReason::Fog,
+                changedPrimitive, context, global,
+                "fog should remain software-only");
+            changedPrimitive = primitive;
+            changedPrimitive.abe = true;
+            expect(
+                GsFallbackReason::AlphaBlend,
+                changedPrimitive, context, global,
+                "destination-dependent blending should remain software-only");
+
+            changedContext = context;
+            changedContext.test |= 1u;
+            expect(
+                GsFallbackReason::AlphaTest,
+                primitive, changedContext, global,
+                "alpha testing should fail before resource dependencies");
+            changedContext = context;
+            changedContext.test |= 1ull << 14u;
+            expect(
+                GsFallbackReason::DestinationAlphaTest,
+                primitive, changedContext, global,
+                "destination alpha testing should remain software-only");
+            changedContext = context;
+            changedContext.frame.fbmsk = 1u;
+            expect(
+                GsFallbackReason::FramebufferMask,
+                primitive, changedContext, global,
+                "masked framebuffer writes should remain software-only");
+            changedContext = context;
+            changedContext.fba = 1u;
+            expect(
+                GsFallbackReason::FramebufferAlphaCorrection,
+                primitive, changedContext, global,
+                "FBA should remain outside the first triangle slice");
+
+            GsDrawGlobalState changedGlobal = global;
+            changedGlobal.dither = true;
+            expect(
+                GsFallbackReason::Dither,
+                primitive, context, changedGlobal,
+                "dithering should remain software-only");
+            changedGlobal = global;
+            changedGlobal.scanMask = 1u;
+            expect(
+                GsFallbackReason::ScanMask,
+                primitive, context, changedGlobal,
+                "scan masking should remain software-only");
+
+            changedContext = context;
+            changedContext.zbuf.zmask = false;
+            expect(
+                GsFallbackReason::DepthWrite,
+                primitive, changedContext, global,
+                "unmasked ZTST ALWAYS should name the depth write");
+            changedContext = context;
+            changedContext.test = 0x50000u; // ZTE=1, ZTST=GEQUAL.
+            expect(
+                GsFallbackReason::DepthRead,
+                primitive, changedContext, global,
+                "GEQUAL should name its depth read even when writes are masked");
+
+            std::array<GSVertex, 3> degenerateVertices = vertices;
+            degenerateVertices[1].x12_4 = 16u;
+            degenerateVertices[1].y12_4 = 16u;
+            degenerateVertices[2].x12_4 = 32u;
+            degenerateVertices[2].y12_4 = 32u;
+            const GsDrawCommand degenerate = buildGsDrawCommand(
+                2u,
+                primitive,
+                context,
+                std::span<const GSVertex>(degenerateVertices),
+                global);
+            t.Equals(
+                classifyGsFlatCt32Triangle(degenerate).reason,
+                GsFallbackReason::EmptyBounds,
+                "degenerate geometry should be rejected before state checks");
+        });
+
         tc.Run("GS backend router classifies before mutation and records synchronized fallback", [](TestCase &t)
         {
             class RecordingBackend final : public IGsRasterBackend

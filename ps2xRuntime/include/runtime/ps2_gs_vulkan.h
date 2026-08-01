@@ -273,6 +273,60 @@ static_assert(offsetof(GsVulkanCt32Sprite, reserved) == 28u);
     const GsDrawCommand &command,
     GsVulkanCt32Sprite &sprite) noexcept;
 
+// Phase 5's first exact triangle record. Vertex coordinates retain the signed
+// 12.4 window-space values after XYOFFSET. Preparation normalizes the winding
+// to positive area; topLeftEdgeMask bits 0..2 describe the edges opposite
+// vertices 0..2 respectively. Bounds are inclusive minimum / exclusive
+// maximum after scissor clipping.
+struct alignas(16) GsVulkanCt32Triangle
+{
+    uint32_t framebufferBaseBlock = 0u;
+    uint32_t framebufferWidth = 0u;
+    uint32_t boundsX0 = 0u;
+    uint32_t boundsY0 = 0u;
+    uint32_t boundsX1 = 0u;
+    uint32_t boundsY1 = 0u;
+    int32_t vertex0X12_4 = 0;
+    int32_t vertex0Y12_4 = 0;
+    int32_t vertex1X12_4 = 0;
+    int32_t vertex1Y12_4 = 0;
+    int32_t vertex2X12_4 = 0;
+    int32_t vertex2Y12_4 = 0;
+    uint32_t rgba = 0u;
+    uint32_t topLeftEdgeMask = 0u;
+    uint32_t reserved0 = 0u;
+    uint32_t reserved1 = 0u;
+
+    bool operator==(const GsVulkanCt32Triangle &) const = default;
+};
+
+static_assert(sizeof(GsVulkanCt32Triangle) == 64u);
+static_assert(std::is_standard_layout_v<GsVulkanCt32Triangle>);
+static_assert(std::is_trivially_copyable_v<GsVulkanCt32Triangle>);
+static_assert(offsetof(GsVulkanCt32Triangle, framebufferBaseBlock) == 0u);
+static_assert(offsetof(GsVulkanCt32Triangle, framebufferWidth) == 4u);
+static_assert(offsetof(GsVulkanCt32Triangle, boundsX0) == 8u);
+static_assert(offsetof(GsVulkanCt32Triangle, boundsY0) == 12u);
+static_assert(offsetof(GsVulkanCt32Triangle, boundsX1) == 16u);
+static_assert(offsetof(GsVulkanCt32Triangle, boundsY1) == 20u);
+static_assert(offsetof(GsVulkanCt32Triangle, vertex0X12_4) == 24u);
+static_assert(offsetof(GsVulkanCt32Triangle, vertex0Y12_4) == 28u);
+static_assert(offsetof(GsVulkanCt32Triangle, vertex1X12_4) == 32u);
+static_assert(offsetof(GsVulkanCt32Triangle, vertex1Y12_4) == 36u);
+static_assert(offsetof(GsVulkanCt32Triangle, vertex2X12_4) == 40u);
+static_assert(offsetof(GsVulkanCt32Triangle, vertex2Y12_4) == 44u);
+static_assert(offsetof(GsVulkanCt32Triangle, rgba) == 48u);
+static_assert(offsetof(GsVulkanCt32Triangle, topLeftEdgeMask) == 52u);
+static_assert(offsetof(GsVulkanCt32Triangle, reserved0) == 56u);
+static_assert(offsetof(GsVulkanCt32Triangle, reserved1) == 60u);
+
+// Applies the triangle predicate and publishes a normalized shader record
+// only after every invariant has been validated. Rejection leaves the caller's
+// record untouched.
+[[nodiscard]] GsBackendDecision prepareGsVulkanCt32Triangle(
+    const GsDrawCommand &command,
+    GsVulkanCt32Triangle &triangle) noexcept;
+
 // Narrow injectable execution seam used by the Phase 3 verification backend.
 // Production requests still enter through the single-owner service below.
 class IGsVulkanDrawExecutor

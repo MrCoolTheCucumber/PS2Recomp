@@ -114,6 +114,86 @@ namespace
         return nullptr;
     }
 
+    struct FixedTriangleVertex
+    {
+        int32_t x;
+        int32_t y;
+    };
+
+    int64_t triangleEdge(
+        const FixedTriangleVertex &a,
+        const FixedTriangleVertex &b,
+        const FixedTriangleVertex &sample) noexcept
+    {
+        return
+            (static_cast<int64_t>(b.x) - a.x) *
+                (static_cast<int64_t>(sample.y) - a.y) -
+            (static_cast<int64_t>(b.y) - a.y) *
+                (static_cast<int64_t>(sample.x) - a.x);
+    }
+
+    bool isTopLeftEdge(
+        const FixedTriangleVertex &a,
+        const FixedTriangleVertex &b) noexcept
+    {
+        const int64_t dx =
+            static_cast<int64_t>(b.x) - a.x;
+        const int64_t dy =
+            static_cast<int64_t>(b.y) - a.y;
+        return dy < 0 || (dy == 0 && dx > 0);
+    }
+
+    const char *ct32TriangleValidationError(
+        const GsVulkanCt32Triangle &triangle) noexcept
+    {
+        if (triangle.reserved0 != 0u || triangle.reserved1 != 0u)
+            return "Vulkan CT32 triangle has non-zero reserved data";
+        if (triangle.framebufferBaseBlock > 0x3FFFu)
+            return "Vulkan CT32 triangle framebuffer base is outside GS VRAM";
+        if (triangle.framebufferWidth == 0u ||
+            triangle.framebufferWidth > 0x3Fu)
+        {
+            return "Vulkan CT32 triangle framebuffer width is outside FRAME range";
+        }
+        if (triangle.boundsX0 >= triangle.boundsX1 ||
+            triangle.boundsY0 >= triangle.boundsY1)
+        {
+            return "Vulkan CT32 triangle bounds are empty";
+        }
+        if (triangle.boundsX1 > 2048u || triangle.boundsY1 > 2048u)
+            return "Vulkan CT32 triangle bounds are outside GS scissor range";
+        if ((triangle.topLeftEdgeMask & ~0x7u) != 0u)
+            return "Vulkan CT32 triangle edge mask has reserved bits";
+
+        constexpr int32_t kMinimumWindowFixed = -65535;
+        constexpr int32_t kMaximumWindowFixed = 65535;
+        const std::array<FixedTriangleVertex, 3> vertices{{
+            {triangle.vertex0X12_4, triangle.vertex0Y12_4},
+            {triangle.vertex1X12_4, triangle.vertex1Y12_4},
+            {triangle.vertex2X12_4, triangle.vertex2Y12_4},
+        }};
+        for (const FixedTriangleVertex &vertex : vertices)
+        {
+            if (vertex.x < kMinimumWindowFixed ||
+                vertex.x > kMaximumWindowFixed ||
+                vertex.y < kMinimumWindowFixed ||
+                vertex.y > kMaximumWindowFixed)
+            {
+                return "Vulkan CT32 triangle vertex is outside GS window range";
+            }
+        }
+
+        if (triangleEdge(vertices[0], vertices[1], vertices[2]) <= 0)
+            return "Vulkan CT32 triangle winding is not normalized";
+        const uint32_t expectedTopLeftMask =
+            (isTopLeftEdge(vertices[1], vertices[2]) ? 1u : 0u) |
+            (isTopLeftEdge(vertices[2], vertices[0]) ? 2u : 0u) |
+            (isTopLeftEdge(vertices[0], vertices[1]) ? 4u : 0u);
+        if (triangle.topLeftEdgeMask != expectedTopLeftMask)
+            return "Vulkan CT32 triangle edge mask is inconsistent";
+        return nullptr;
+    }
+
     bool validateResidentCt32SpriteBatch(
         std::span<const GsVulkanCt32Sprite> sprites,
         std::string &error)
@@ -201,6 +281,56 @@ GsBackendDecision prepareGsVulkanCt32Sprite(
     }
 
     sprite = prepared;
+    return decision;
+}
+
+GsBackendDecision prepareGsVulkanCt32Triangle(
+    const GsDrawCommand &command,
+    GsVulkanCt32Triangle &triangle) noexcept
+{
+    const GsBackendDecision decision =
+        classifyGsFlatCt32Triangle(command);
+    if (!decision.supported)
+        return decision;
+
+    const GSContext &context = command.context();
+    const GsDrawBounds &bounds = command.bounds();
+    const GSVertex &color = command.vertices()[2];
+    std::array<FixedTriangleVertex, 3> vertices{{
+        {command.fixedX()[0], command.fixedY()[0]},
+        {command.fixedX()[1], command.fixedY()[1]},
+        {command.fixedX()[2], command.fixedY()[2]},
+    }};
+    if (triangleEdge(vertices[0], vertices[1], vertices[2]) < 0)
+        std::swap(vertices[1], vertices[2]);
+
+    GsVulkanCt32Triangle prepared{};
+    prepared.framebufferBaseBlock = context.frame.fbp << 5u;
+    prepared.framebufferWidth =
+        std::max<uint32_t>(context.frame.fbw, 1u);
+    prepared.boundsX0 = static_cast<uint32_t>(bounds.x0);
+    prepared.boundsY0 = static_cast<uint32_t>(bounds.y0);
+    prepared.boundsX1 = static_cast<uint32_t>(bounds.x1);
+    prepared.boundsY1 = static_cast<uint32_t>(bounds.y1);
+    prepared.vertex0X12_4 = vertices[0].x;
+    prepared.vertex0Y12_4 = vertices[0].y;
+    prepared.vertex1X12_4 = vertices[1].x;
+    prepared.vertex1Y12_4 = vertices[1].y;
+    prepared.vertex2X12_4 = vertices[2].x;
+    prepared.vertex2Y12_4 = vertices[2].y;
+    prepared.rgba =
+        static_cast<uint32_t>(color.r) |
+        (static_cast<uint32_t>(color.g) << 8u) |
+        (static_cast<uint32_t>(color.b) << 16u) |
+        (static_cast<uint32_t>(color.a) << 24u);
+    prepared.topLeftEdgeMask =
+        (isTopLeftEdge(vertices[1], vertices[2]) ? 1u : 0u) |
+        (isTopLeftEdge(vertices[2], vertices[0]) ? 2u : 0u) |
+        (isTopLeftEdge(vertices[0], vertices[1]) ? 4u : 0u);
+    if (ct32TriangleValidationError(prepared))
+        return {false, GsFallbackReason::UnknownMemoryLayout};
+
+    triangle = prepared;
     return decision;
 }
 

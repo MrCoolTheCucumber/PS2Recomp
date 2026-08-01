@@ -297,6 +297,51 @@ namespace
             GsDrawGlobalState{});
     }
 
+    GsDrawCommand makeCt32TriangleCommand(
+        uint64_t sequence,
+        uint32_t framebufferPage,
+        uint8_t framebufferWidth,
+        GSScissorReg scissor,
+        GSXYOffsetReg xyoffset,
+        const std::array<uint16_t, 3> &rawX,
+        const std::array<uint16_t, 3> &rawY,
+        uint32_t rgba)
+    {
+        GSContext context{};
+        context.frame = {
+            framebufferPage, framebufferWidth,
+            GS_PSM_CT32, 0u};
+        context.scissor = scissor;
+        context.xyoffset = xyoffset;
+        context.zbuf = {0u, GS_PSM_Z32, true};
+        context.test = 0x30000u; // ZTE=1, ZTST=ALWAYS, ZMSK=1.
+
+        GSPrimReg primitive{};
+        primitive.type = GS_PRIM_TRIANGLE;
+        std::array<GSVertex, 3> vertices{};
+        for (size_t index = 0u; index < vertices.size(); ++index)
+        {
+            vertices[index].x12_4 = rawX[index];
+            vertices[index].y12_4 = rawY[index];
+            vertices[index].r = static_cast<uint8_t>(
+                0x10u + index);
+            vertices[index].g = static_cast<uint8_t>(
+                0x20u + index);
+            vertices[index].b = static_cast<uint8_t>(
+                0x30u + index);
+            vertices[index].a = static_cast<uint8_t>(
+                0x40u + index);
+        }
+        vertices[2].r = static_cast<uint8_t>(rgba);
+        vertices[2].g = static_cast<uint8_t>(rgba >> 8u);
+        vertices[2].b = static_cast<uint8_t>(rgba >> 16u);
+        vertices[2].a = static_cast<uint8_t>(rgba >> 24u);
+        return buildGsDrawCommand(
+            sequence, primitive, context,
+            std::span<const GSVertex>(vertices),
+            GsDrawGlobalState{});
+    }
+
     void applyCt32SpriteCpu(
         std::vector<uint8_t> &vram,
         const GsVulkanCt32Sprite &sprite)
@@ -310,6 +355,80 @@ namespace
                     sprite.framebufferBaseBlock,
                     sprite.framebufferWidth,
                     x, y, sprite.rgba);
+            }
+        }
+    }
+
+    int64_t ct32TriangleEdge(
+        int32_t ax,
+        int32_t ay,
+        int32_t bx,
+        int32_t by,
+        int32_t sampleX,
+        int32_t sampleY)
+    {
+        return
+            (static_cast<int64_t>(bx) - ax) *
+                (static_cast<int64_t>(sampleY) - ay) -
+            (static_cast<int64_t>(by) - ay) *
+                (static_cast<int64_t>(sampleX) - ax);
+    }
+
+    void applyCt32TriangleCpu(
+        std::vector<uint8_t> &vram,
+        const GsVulkanCt32Triangle &triangle)
+    {
+        for (uint32_t y = triangle.boundsY0;
+             y < triangle.boundsY1; ++y)
+        {
+            for (uint32_t x = triangle.boundsX0;
+                 x < triangle.boundsX1; ++x)
+            {
+                const int32_t sampleX = static_cast<int32_t>(x * 16u);
+                const int32_t sampleY = static_cast<int32_t>(y * 16u);
+                const std::array<int64_t, 3> edges{{
+                    ct32TriangleEdge(
+                        triangle.vertex1X12_4,
+                        triangle.vertex1Y12_4,
+                        triangle.vertex2X12_4,
+                        triangle.vertex2Y12_4,
+                        sampleX,
+                        sampleY),
+                    ct32TriangleEdge(
+                        triangle.vertex2X12_4,
+                        triangle.vertex2Y12_4,
+                        triangle.vertex0X12_4,
+                        triangle.vertex0Y12_4,
+                        sampleX,
+                        sampleY),
+                    ct32TriangleEdge(
+                        triangle.vertex0X12_4,
+                        triangle.vertex0Y12_4,
+                        triangle.vertex1X12_4,
+                        triangle.vertex1Y12_4,
+                        sampleX,
+                        sampleY),
+                }};
+                bool covered = true;
+                for (uint32_t edge = 0u; edge < edges.size(); ++edge)
+                {
+                    if (edges[edge] < 0 ||
+                        (edges[edge] == 0 &&
+                         (triangle.topLeftEdgeMask & (1u << edge)) == 0u))
+                    {
+                        covered = false;
+                        break;
+                    }
+                }
+                if (!covered)
+                    continue;
+                GSMem::WriteCT32(
+                    vram.data(),
+                    triangle.framebufferBaseBlock,
+                    triangle.framebufferWidth,
+                    x,
+                    y,
+                    triangle.rgba);
             }
         }
     }
@@ -834,6 +953,269 @@ void register_ps2_gs_vulkan_tests()
                      "degenerate endpoints should fail before any GPU submission");
             t.IsTrue(sprite == sentinel,
                      "degenerate preparation must preserve the caller's record");
+        });
+
+        tc.Run("CT32 triangle preparation normalizes exact fixed-point edges", [](TestCase &t)
+        {
+            const GsDrawCommand command = makeCt32TriangleCommand(
+                27u,
+                511u,
+                0u,
+                {4u, 15u, 3u, 12u},
+                {32u, 16u},
+                {289u, 209u, 65u},
+                {33u, 65u, 209u},
+                0xD4C3B2A1u);
+
+            GsVulkanCt32Triangle triangle{
+                1u, 2u, 3u, 4u, 5u, 6u,
+                7, 8, 9, 10, 11, 12,
+                13u, 14u, 15u, 16u};
+            const GsBackendDecision decision =
+                prepareGsVulkanCt32Triangle(command, triangle);
+            t.IsTrue(decision.supported,
+                     "the flat opaque CT32 triangle should be eligible");
+            t.Equals(decision.reason, GsFallbackReason::Supported,
+                     "eligible triangle preparation should retain the canonical reason");
+            t.Equals(triangle.framebufferBaseBlock, 0x3FE0u,
+                     "triangle FRAME page units should become 256-byte blocks");
+            t.Equals(triangle.framebufferWidth, 1u,
+                     "triangle FRAME width zero should use one-unit normalization");
+            t.Equals(triangle.boundsX0, 4u,
+                     "triangle minimum X should be ceil-rounded then scissor clipped");
+            t.Equals(triangle.boundsY0, 3u,
+                     "triangle minimum Y should be ceil-rounded then scissor clipped");
+            t.Equals(triangle.boundsX1, 16u,
+                     "triangle maximum X should remain exclusive after clipping");
+            t.Equals(triangle.boundsY1, 13u,
+                     "triangle maximum Y should remain exclusive after clipping");
+            t.Equals(triangle.vertex0X12_4, 257,
+                     "triangle preparation should retain signed 12.4 X after XYOFFSET");
+            t.Equals(triangle.vertex0Y12_4, 17,
+                     "triangle preparation should retain signed 12.4 Y after XYOFFSET");
+            t.Equals(triangle.vertex1X12_4, 33,
+                     "negative winding should swap the second geometric vertex");
+            t.Equals(triangle.vertex1Y12_4, 193,
+                     "winding normalization should preserve the swapped Y coordinate");
+            t.Equals(triangle.vertex2X12_4, 177,
+                     "negative winding should swap the third geometric vertex");
+            t.Equals(triangle.vertex2Y12_4, 49,
+                     "winding normalization should preserve every fractional coordinate");
+            t.Equals(triangle.rgba, 0xD4C3B2A1u,
+                     "flat color should come from the original third GS vertex");
+            t.Equals(triangle.topLeftEdgeMask, 3u,
+                     "prepared edges should name the two inclusive top-left sides");
+            t.Equals(triangle.reserved0, 0u,
+                     "prepared triangle records should clear reserved data");
+            t.Equals(triangle.reserved1, 0u,
+                     "all prepared triangle padding should be deterministic");
+
+            GSPrimReg textured = command.primitive();
+            textured.tme = true;
+            const GsDrawCommand rejected = buildGsDrawCommand(
+                28u, textured, command.context(),
+                std::span<const GSVertex>(command.vertices()),
+                command.globalState());
+            const GsVulkanCt32Triangle sentinel = triangle;
+            const GsBackendDecision rejectedDecision =
+                prepareGsVulkanCt32Triangle(rejected, triangle);
+            t.Equals(rejectedDecision.reason, GsFallbackReason::Textured,
+                     "triangle preparation should preserve ordered fallback reasons");
+            t.IsTrue(triangle == sentinel,
+                     "rejected triangle preparation must leave the record untouched");
+
+            std::array<GSVertex, 3> degenerateVertices = command.vertices();
+            degenerateVertices[0].x12_4 = 64u;
+            degenerateVertices[0].y12_4 = 64u;
+            degenerateVertices[1].x12_4 = 128u;
+            degenerateVertices[1].y12_4 = 128u;
+            degenerateVertices[2].x12_4 = 192u;
+            degenerateVertices[2].y12_4 = 192u;
+            const GsDrawCommand degenerate = buildGsDrawCommand(
+                29u, command.primitive(), command.context(),
+                std::span<const GSVertex>(degenerateVertices),
+                command.globalState());
+            t.Equals(
+                prepareGsVulkanCt32Triangle(degenerate, triangle).reason,
+                GsFallbackReason::EmptyBounds,
+                "collinear triangles should fail before record publication");
+            t.IsTrue(triangle == sentinel,
+                     "degenerate triangle rejection must preserve the prior record");
+
+            std::array<GSVertex, 2> incompleteVertices{{
+                command.vertices()[0], command.vertices()[1]}};
+            incompleteVertices[0].x12_4 = 64u;
+            incompleteVertices[0].y12_4 = 64u;
+            incompleteVertices[1].x12_4 = 192u;
+            incompleteVertices[1].y12_4 = 80u;
+            const GsDrawCommand incomplete = buildGsDrawCommand(
+                30u, command.primitive(), command.context(),
+                std::span<const GSVertex>(incompleteVertices),
+                command.globalState());
+            t.Equals(classifyGsFlatCt32Triangle(incomplete).reason,
+                     GsFallbackReason::UnsupportedPrimitiveState,
+                     "a nondegenerate partial command must not synthesize a third vertex");
+        });
+
+        tc.Run("CT32 triangle preparation matches exhaustive software edge coverage", [](TestCase &t)
+        {
+            GSMem::InitLookupTables();
+            std::vector<uint8_t> actual(GS_VULKAN_VRAM_SIZE, 0u);
+            std::vector<uint8_t> expected(GS_VULKAN_VRAM_SIZE, 0u);
+            GS gs;
+            gs.init(
+                actual.data(),
+                static_cast<uint32_t>(actual.size()),
+                nullptr);
+            gs.setDebugHistoryPaused(true);
+
+            using FixedVertex = std::array<int32_t, 2>;
+            using FixedTriangle = std::array<FixedVertex, 3>;
+            const std::array<FixedTriangle, 3> shapes{{
+                {{{-64, 17}, {239, 49}, {33, 255}}},
+                {{{32, 32}, {256, 32}, {32, 256}}},
+                {{{65, 65}, {81, 241}, {257, 97}}},
+            }};
+            constexpr std::array<std::array<uint8_t, 3>, 6>
+                permutations{{
+                    {{0u, 1u, 2u}},
+                    {{0u, 2u, 1u}},
+                    {{1u, 0u, 2u}},
+                    {{1u, 2u, 0u}},
+                    {{2u, 0u, 1u}},
+                    {{2u, 1u, 0u}},
+                }};
+            constexpr std::array<GSScissorReg, 4> scissors{{
+                {0u, 31u, 0u, 31u},
+                {4u, 13u, 3u, 14u},
+                {0u, 7u, 6u, 20u},
+                {8u, 8u, 0u, 31u},
+            }};
+            constexpr GSXYOffsetReg xyoffset{128u, 128u};
+            constexpr uint32_t rgba = 0xA4B3C2D1u;
+            constexpr uint8_t initialByte = 0x5Au;
+            uint64_t sequence = 1000u;
+            uint64_t preparedCases = 0u;
+            uint64_t emptyCases = 0u;
+
+            for (const FixedTriangle &shape : shapes)
+            {
+                for (const GSScissorReg &scissor : scissors)
+                {
+                    for (uint32_t phaseY = 0u; phaseY < 16u; ++phaseY)
+                    {
+                        for (uint32_t phaseX = 0u; phaseX < 16u; ++phaseX)
+                        {
+                            for (const auto &permutation : permutations)
+                            {
+                                std::array<uint16_t, 3> rawX{};
+                                std::array<uint16_t, 3> rawY{};
+                                for (size_t vertex = 0u;
+                                     vertex < rawX.size(); ++vertex)
+                                {
+                                    const FixedVertex &source =
+                                        shape[permutation[vertex]];
+                                    rawX[vertex] = static_cast<uint16_t>(
+                                        source[0] + phaseX + xyoffset.ofx);
+                                    rawY[vertex] = static_cast<uint16_t>(
+                                        source[1] + phaseY + xyoffset.ofy);
+                                }
+
+                                const GsDrawCommand command =
+                                    makeCt32TriangleCommand(
+                                        sequence++, 0u, 1u,
+                                        scissor, xyoffset,
+                                        rawX, rawY, rgba);
+                                GsVulkanCt32Triangle triangle{};
+                                const GsBackendDecision decision =
+                                    prepareGsVulkanCt32Triangle(
+                                        command, triangle);
+                                if (decision.supported)
+                                {
+                                    ++preparedCases;
+                                }
+                                else if (decision.reason ==
+                                         GsFallbackReason::EmptyBounds)
+                                {
+                                    ++emptyCases;
+                                }
+                                else
+                                {
+                                    t.Fail(
+                                        "eligible edge corpus produced an unexpected triangle fallback");
+                                    return;
+                                }
+
+                                std::fill_n(
+                                    actual.begin(),
+                                    GS_VRAM_PAGE_SIZE,
+                                    initialByte);
+                                std::fill_n(
+                                    expected.begin(),
+                                    GS_VRAM_PAGE_SIZE,
+                                    initialByte);
+                                if (decision.supported)
+                                    applyCt32TriangleCpu(expected, triangle);
+
+                                const uint64_t frame =
+                                    (1ull << 16u) |
+                                    (static_cast<uint64_t>(GS_PSM_CT32) << 24u);
+                                const uint64_t scissorValue =
+                                    static_cast<uint64_t>(scissor.x0) |
+                                    (static_cast<uint64_t>(scissor.x1) << 16u) |
+                                    (static_cast<uint64_t>(scissor.y0) << 32u) |
+                                    (static_cast<uint64_t>(scissor.y1) << 48u);
+                                const uint64_t xyoffsetValue =
+                                    static_cast<uint64_t>(xyoffset.ofx) |
+                                    (static_cast<uint64_t>(xyoffset.ofy) << 32u);
+                                gs.writeRegister(GS_REG_FRAME_1, frame);
+                                gs.writeRegister(GS_REG_ZBUF_1, 1ull << 32u);
+                                gs.writeRegister(GS_REG_SCISSOR_1, scissorValue);
+                                gs.writeRegister(GS_REG_XYOFFSET_1, xyoffsetValue);
+                                gs.writeRegister(GS_REG_TEST_1, 0x30000u);
+                                gs.writeRegister(GS_REG_FBA_1, 0u);
+                                gs.writeRegister(GS_REG_SCANMSK, 0u);
+                                gs.writeRegister(GS_REG_DTHE, 0u);
+                                gs.writeRegister(
+                                    GS_REG_PRIM,
+                                    static_cast<uint64_t>(GS_PRIM_TRIANGLE));
+                                for (size_t vertex = 0u;
+                                     vertex < rawX.size(); ++vertex)
+                                {
+                                    gs.writeRegister(GS_REG_RGBAQ, rgba);
+                                    gs.writeRegister(
+                                        GS_REG_XYZ2,
+                                        packXyz2(rawX[vertex], rawY[vertex]));
+                                }
+                                gs.flushRenderBatch();
+
+                                if (!std::equal(
+                                        actual.begin(),
+                                        actual.begin() + GS_VRAM_PAGE_SIZE,
+                                        expected.begin()))
+                                {
+                                    std::ostringstream message;
+                                    message
+                                        << "triangle edge mismatch at sequence "
+                                        << command.sequence()
+                                        << " phase=(" << phaseX << ','
+                                        << phaseY << ") scissor=("
+                                        << scissor.x0 << ',' << scissor.y0
+                                        << ")-(" << scissor.x1 << ','
+                                        << scissor.y1 << ')';
+                                    t.Fail(message.str());
+                                    return;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            t.Equals(preparedCases, 18'432ull,
+                     "all winding, fractional-phase, and scissor cases should remain drawable");
+            t.Equals(emptyCases, 0ull,
+                     "the bounded edge corpus should not accidentally become fully clipped");
         });
 
         tc.Run("Vulkan raster backend verifies commits and fails before mutation", [](TestCase &t)

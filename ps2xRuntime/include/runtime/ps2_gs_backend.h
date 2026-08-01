@@ -357,6 +357,13 @@ private:
 [[nodiscard]] GsBackendDecision classifyGsInitialCt32Sprite(
     const GsDrawCommand &command) noexcept;
 
+// Phase 5's first triangle predicate deliberately admits only flat,
+// untextured CT32 triangles with no destination or depth dependency. It shares
+// the ordered state checks above with the sprite slice but remains a separate
+// capability until an exact triangle executor is installed.
+[[nodiscard]] GsBackendDecision classifyGsFlatCt32Triangle(
+    const GsDrawCommand &command) noexcept;
+
 [[nodiscard]] std::string_view gsFallbackReasonName(
     GsFallbackReason reason) noexcept;
 

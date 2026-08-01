@@ -746,55 +746,81 @@ GsDrawCommand buildGsDrawCommand(
         globalState);
 }
 
+namespace
+{
+    GsBackendDecision classifyFlatCt32NoDepth(
+        const GsDrawCommand &command,
+        GSPrimType expectedPrimitive,
+        uint8_t expectedVertices) noexcept
+    {
+        const GSPrimReg &primitive = command.primitive();
+        const GSContext &context = command.context();
+        const GsDrawGlobalState &global = command.globalState();
+        const GsDrawResources resources = command.resources();
+
+        if (command.bounds().empty())
+            return {false, GsFallbackReason::EmptyBounds};
+        if (!command.bounds().exact)
+            return {false, GsFallbackReason::InexactBounds};
+        if (primitive.type != expectedPrimitive)
+            return {false, GsFallbackReason::UnsupportedPrimitive};
+        if (command.vertexCount() != expectedVertices ||
+            primitive.aa1 || primitive.fix)
+        {
+            return {false, GsFallbackReason::UnsupportedPrimitiveState};
+        }
+        if (context.frame.psm != GS_PSM_CT32)
+            return {false, GsFallbackReason::UnsupportedFramebufferFormat};
+        if (primitive.tme)
+            return {false, GsFallbackReason::Textured};
+        if (primitive.iip)
+            return {false, GsFallbackReason::GouraudShading};
+        if (primitive.fge)
+            return {false, GsFallbackReason::Fog};
+        if (primitive.abe)
+            return {false, GsFallbackReason::AlphaBlend};
+        if ((context.test & 1u) != 0u)
+            return {false, GsFallbackReason::AlphaTest};
+        if (((context.test >> 14u) & 1u) != 0u)
+            return {false, GsFallbackReason::DestinationAlphaTest};
+        if (context.frame.fbmsk != 0u)
+            return {false, GsFallbackReason::FramebufferMask};
+        if ((context.fba & 1u) != 0u)
+        {
+            return {
+                false,
+                GsFallbackReason::FramebufferAlphaCorrection};
+        }
+        if (global.dither)
+            return {false, GsFallbackReason::Dither};
+        if (global.scanMask != 0u)
+            return {false, GsFallbackReason::ScanMask};
+        if (resources.unknownMemoryLayout)
+            return {false, GsFallbackReason::UnknownMemoryLayout};
+        if (resources.depthReadPages.any())
+            return {false, GsFallbackReason::DepthRead};
+        if (resources.depthWritePages.any())
+            return {false, GsFallbackReason::DepthWrite};
+        if (resources.readsDestination)
+            return {false, GsFallbackReason::DestinationRead};
+        if (resources.aliasesAnotherView())
+            return {false, GsFallbackReason::ResourceAlias};
+        return {true, GsFallbackReason::Supported};
+    }
+}
+
 GsBackendDecision classifyGsInitialCt32Sprite(
     const GsDrawCommand &command) noexcept
 {
-    const GSPrimReg &primitive = command.primitive();
-    const GSContext &context = command.context();
-    const GsDrawGlobalState &global = command.globalState();
-    const GsDrawResources resources = command.resources();
+    return classifyFlatCt32NoDepth(
+        command, GS_PRIM_SPRITE, 2u);
+}
 
-    if (command.bounds().empty())
-        return {false, GsFallbackReason::EmptyBounds};
-    if (!command.bounds().exact)
-        return {false, GsFallbackReason::InexactBounds};
-    if (primitive.type != GS_PRIM_SPRITE)
-        return {false, GsFallbackReason::UnsupportedPrimitive};
-    if (primitive.aa1 || primitive.fix)
-        return {false, GsFallbackReason::UnsupportedPrimitiveState};
-    if (context.frame.psm != GS_PSM_CT32)
-        return {false, GsFallbackReason::UnsupportedFramebufferFormat};
-    if (primitive.tme)
-        return {false, GsFallbackReason::Textured};
-    if (primitive.iip)
-        return {false, GsFallbackReason::GouraudShading};
-    if (primitive.fge)
-        return {false, GsFallbackReason::Fog};
-    if (primitive.abe)
-        return {false, GsFallbackReason::AlphaBlend};
-    if ((context.test & 1u) != 0u)
-        return {false, GsFallbackReason::AlphaTest};
-    if (((context.test >> 14u) & 1u) != 0u)
-        return {false, GsFallbackReason::DestinationAlphaTest};
-    if (context.frame.fbmsk != 0u)
-        return {false, GsFallbackReason::FramebufferMask};
-    if ((context.fba & 1u) != 0u)
-        return {false, GsFallbackReason::FramebufferAlphaCorrection};
-    if (global.dither)
-        return {false, GsFallbackReason::Dither};
-    if (global.scanMask != 0u)
-        return {false, GsFallbackReason::ScanMask};
-    if (resources.unknownMemoryLayout)
-        return {false, GsFallbackReason::UnknownMemoryLayout};
-    if (resources.depthReadPages.any())
-        return {false, GsFallbackReason::DepthRead};
-    if (resources.depthWritePages.any())
-        return {false, GsFallbackReason::DepthWrite};
-    if (resources.readsDestination)
-        return {false, GsFallbackReason::DestinationRead};
-    if (resources.aliasesAnotherView())
-        return {false, GsFallbackReason::ResourceAlias};
-    return {true, GsFallbackReason::Supported};
+GsBackendDecision classifyGsFlatCt32Triangle(
+    const GsDrawCommand &command) noexcept
+{
+    return classifyFlatCt32NoDepth(
+        command, GS_PRIM_TRIANGLE, 3u);
 }
 
 GsBackendRouter::GsBackendRouter(
