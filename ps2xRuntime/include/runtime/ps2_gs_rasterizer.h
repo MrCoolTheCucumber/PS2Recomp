@@ -91,6 +91,9 @@ private:
     };
 
     bool tryQueuePrimitive(GS *gs, const GsDrawCommand &command);
+    void prepareFeedbackSnapshot(
+        GS *gs,
+        const GsDrawCommand &command);
     void submitSoftwareCommand(GS *gs, const GsDrawCommand &command);
     void recordAcceleratedCommit(
         GS *gs,

@@ -2330,49 +2330,8 @@ bool GSRasterizer::tryQueuePrimitive(
     const int minimumY = bounds.y0;
     const int maximumY = bounds.y1;
 
-    m_textureReadVram = nullptr;
     const bool recursiveTextureDraw =
         state->cachedRecursiveFeedback;
-    if (recursiveTextureDraw)
-    {
-        const uint32_t frameBase =
-            GSInternal::framePageBaseToBlock(ctx.frame.fbp);
-        const bool sameFeedbackSurface =
-            m_feedbackSnapshotValid &&
-            m_feedbackTextureBase == ctx.tex0.tbp0 &&
-            m_feedbackFrameBase == frameBase &&
-            m_feedbackTexturePsm == ctx.tex0.psm &&
-            m_feedbackFramePsm == ctx.frame.psm &&
-            m_feedbackTextureWidth == ctx.tex0.tbw &&
-            m_feedbackFrameWidth == ctx.frame.fbw;
-        if (!sameFeedbackSurface)
-        {
-            const GsDrawResources resources = command.resources();
-            beginCpuVramAccess(
-                gs,
-                resources.readPages,
-                {},
-                GsFlushReason::FeedbackSnapshot);
-            m_textureSnapshot.resize(gs->m_vramSize);
-            std::memcpy(
-                m_textureSnapshot.data(),
-                gs->m_vram,
-                gs->m_vramSize);
-            m_feedbackTextureBase = ctx.tex0.tbp0;
-            m_feedbackFrameBase = frameBase;
-            m_feedbackTexturePsm = ctx.tex0.psm;
-            m_feedbackFramePsm = ctx.frame.psm;
-            m_feedbackTextureWidth = ctx.tex0.tbw;
-            m_feedbackFrameWidth = ctx.frame.fbw;
-            m_feedbackSnapshotValid = true;
-        }
-    }
-    else
-    {
-        if (m_feedbackSnapshotValid)
-            flushDrawBatch(gs, GsFlushReason::FeedbackSnapshot);
-        m_feedbackSnapshotValid = false;
-    }
     if (gs->m_hasPreferredDisplaySource &&
         ctx.frame.fbp == gs->m_preferredDisplayDestFbp)
     {
@@ -2570,6 +2529,7 @@ void GSRasterizer::drawPrimitive(GS *gs)
         gs->activeContext(),
         std::span<const GSVertex>(gs->m_vtxQueue, 3u),
         globalState);
+    prepareFeedbackSnapshot(gs, command);
     const GsSubmissionResult result =
         m_backendState->router.submit(command);
     if (!result.submitted)
@@ -2578,6 +2538,57 @@ void GSRasterizer::drawPrimitive(GS *gs)
             std::string("GS gpu-strict rejected draw: ") +
             std::string(gsFallbackReasonName(result.decision.reason)));
     }
+}
+
+void GSRasterizer::prepareFeedbackSnapshot(
+    GS *gs,
+    const GsDrawCommand &command)
+{
+    m_textureReadVram = nullptr;
+    const GSContext &context = command.context();
+    const uint32_t frameBase =
+        GSInternal::framePageBaseToBlock(context.frame.fbp);
+    const bool recursiveTextureDraw =
+        command.primitive().tme &&
+        context.tex0.tbp0 == frameBase &&
+        gs && gs->m_vram && gs->m_vramSize != 0u;
+    if (!recursiveTextureDraw)
+    {
+        if (m_feedbackSnapshotValid)
+            flushDrawBatch(gs, GsFlushReason::FeedbackSnapshot);
+        m_feedbackSnapshotValid = false;
+        return;
+    }
+
+    const bool sameFeedbackSurface =
+        m_feedbackSnapshotValid &&
+        m_feedbackTextureBase == context.tex0.tbp0 &&
+        m_feedbackFrameBase == frameBase &&
+        m_feedbackTexturePsm == context.tex0.psm &&
+        m_feedbackFramePsm == context.frame.psm &&
+        m_feedbackTextureWidth == context.tex0.tbw &&
+        m_feedbackFrameWidth == context.frame.fbw;
+    if (sameFeedbackSurface)
+        return;
+
+    const GsDrawResources resources = command.resources();
+    beginCpuVramAccess(
+        gs,
+        resources.readPages,
+        {},
+        GsFlushReason::FeedbackSnapshot);
+    m_textureSnapshot.resize(gs->m_vramSize);
+    std::memcpy(
+        m_textureSnapshot.data(),
+        gs->m_vram,
+        gs->m_vramSize);
+    m_feedbackTextureBase = context.tex0.tbp0;
+    m_feedbackFrameBase = frameBase;
+    m_feedbackTexturePsm = context.tex0.psm;
+    m_feedbackFramePsm = context.frame.psm;
+    m_feedbackTextureWidth = context.tex0.tbw;
+    m_feedbackFrameWidth = context.frame.fbw;
+    m_feedbackSnapshotValid = true;
 }
 
 void GSRasterizer::submitSoftwareCommand(
@@ -2603,11 +2614,10 @@ void GSRasterizer::recordAcceleratedCommit(
             static_cast<uint64_t>(bounds.y1 - bounds.y0);
     }
 
-    // A strict/hybrid GPU write invalidates software-only snapshots derived
-    // from the prior image. Canonical CPU VRAM may remain stale until a later
-    // overlapping access; the narrow predicate rules out CLUT/texture aliases.
+    // Snapshot lifetime follows frontend command order rather than completion
+    // callbacks: a recursive feedback run must keep sampling the image captured
+    // before its first draw even while strict/hybrid writes become GPU-newer.
     m_textureReadVram = nullptr;
-    m_feedbackSnapshotValid = false;
     if (gs->m_hasPreferredDisplaySource &&
         command.context().frame.fbp ==
             gs->m_preferredDisplayDestFbp)
@@ -2891,32 +2901,13 @@ void GSRasterizer::renderSoftwarePrimitive(
         gs->m_vramSize != 0u;
     if (recursiveTextureDraw)
     {
-        const bool sameFeedbackSurface =
-            m_feedbackSnapshotValid &&
-            m_feedbackTextureBase == ctx.tex0.tbp0 &&
-            m_feedbackFrameBase == frameBase &&
-            m_feedbackTexturePsm == ctx.tex0.psm &&
-            m_feedbackFramePsm == ctx.frame.psm &&
-            m_feedbackTextureWidth == ctx.tex0.tbw &&
-            m_feedbackFrameWidth == ctx.frame.fbw;
-        if (!sameFeedbackSurface)
+        if (!m_feedbackSnapshotValid ||
+            m_textureSnapshot.size() != gs->m_vramSize)
         {
-            m_textureSnapshot.resize(gs->m_vramSize);
-            std::memcpy(
-                m_textureSnapshot.data(), gs->m_vram, gs->m_vramSize);
-            m_feedbackTextureBase = ctx.tex0.tbp0;
-            m_feedbackFrameBase = frameBase;
-            m_feedbackTexturePsm = ctx.tex0.psm;
-            m_feedbackFramePsm = ctx.frame.psm;
-            m_feedbackTextureWidth = ctx.tex0.tbw;
-            m_feedbackFrameWidth = ctx.frame.fbw;
-            m_feedbackSnapshotValid = true;
+            throw std::logic_error(
+                "GS recursive feedback draw has no prepared snapshot");
         }
         m_textureReadVram = m_textureSnapshot.data();
-    }
-    else
-    {
-        m_feedbackSnapshotValid = false;
     }
     feedbackTrace().record(
         primitive, ctx, command.vertices().data());
