@@ -72,8 +72,9 @@ class GsVulkanRasterBackend final : public IGsRasterBackend
 {
 public:
     using DrawCallback = std::function<void(const GsDrawCommand &)>;
-    // Verify invokes this synchronously once per admitted feedback draw. The
-    // caller owns the returned bytes and must keep them stable for the call.
+    // Verify invokes this synchronously once per admitted feedback draw;
+    // strict copies it once when opening a resident feedback batch. The caller
+    // owns the returned bytes and must keep them stable only for the callback.
     using FeedbackSnapshotCallback =
         std::function<std::span<const uint8_t>()>;
 

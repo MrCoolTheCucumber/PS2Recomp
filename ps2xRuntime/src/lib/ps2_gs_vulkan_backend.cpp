@@ -613,6 +613,7 @@ struct GsVulkanRasterBackend::Impl final
         DepthCt32Sprite,
         NearestCt32Sprite,
         LinearCt32Sprite,
+        FeedbackLinearDepthCt32Sprite,
         Ct32Triangle,
     };
 
@@ -623,6 +624,8 @@ struct GsVulkanRasterBackend::Impl final
         GsVulkanDepthCt32Sprite depthCt32Sprite;
         GsVulkanNearestCt32Sprite nearestCt32Sprite;
         GsVulkanLinearCt32Sprite linearCt32Sprite;
+        GsVulkanFeedbackLinearDepthCt32Sprite
+            feedbackLinearDepthCt32Sprite;
         GsVulkanCt32Triangle triangle;
         GsDrawResources resources;
         ResidentPipeline pipeline = ResidentPipeline::Ct32Sprite;
@@ -639,6 +642,7 @@ struct GsVulkanRasterBackend::Impl final
     std::vector<PendingResidentCommand> pendingResidentCommands;
     GsVramPageMask pendingResidentReadPages;
     GsVramPageMask pendingResidentWritePages;
+    std::vector<uint8_t> pendingFeedbackSnapshot;
     bool exactCt32Triangle = false;
     bool exactDepthCt32Sprite = false;
     bool exactNearestCt32Sprite = false;
@@ -709,6 +713,7 @@ struct GsVulkanRasterBackend::Impl final
         pendingResidentCommands.clear();
         pendingResidentReadPages.clear();
         pendingResidentWritePages.clear();
+        pendingFeedbackSnapshot.clear();
     }
 
     void drainPendingResidentCommands(GsFlushReason reason)
@@ -730,6 +735,8 @@ struct GsVulkanRasterBackend::Impl final
         std::vector<GsVulkanDepthCt32Sprite> depthCt32Sprites;
         std::vector<GsVulkanNearestCt32Sprite> nearestCt32Sprites;
         std::vector<GsVulkanLinearCt32Sprite> linearCt32Sprites;
+        std::vector<GsVulkanFeedbackLinearDepthCt32Sprite>
+            feedbackLinearDepthCt32Sprites;
         std::vector<GsVulkanCt32Triangle> triangles;
         if (pipeline == ResidentPipeline::Ct32Triangle)
             triangles.reserve(commandCount);
@@ -737,6 +744,11 @@ struct GsVulkanRasterBackend::Impl final
             depthCt32Sprites.reserve(commandCount);
         else if (pipeline == ResidentPipeline::LinearCt32Sprite)
             linearCt32Sprites.reserve(commandCount);
+        else if (pipeline ==
+                 ResidentPipeline::FeedbackLinearDepthCt32Sprite)
+        {
+            feedbackLinearDepthCt32Sprites.reserve(commandCount);
+        }
         else if (pipeline == ResidentPipeline::NearestCt32Sprite)
             nearestCt32Sprites.reserve(commandCount);
         else
@@ -759,6 +771,12 @@ struct GsVulkanRasterBackend::Impl final
             else if (pipeline == ResidentPipeline::LinearCt32Sprite)
                 linearCt32Sprites.push_back(
                     pending.linearCt32Sprite);
+            else if (pipeline ==
+                     ResidentPipeline::FeedbackLinearDepthCt32Sprite)
+            {
+                feedbackLinearDepthCt32Sprites.push_back(
+                    pending.feedbackLinearDepthCt32Sprite);
+            }
             else if (pipeline == ResidentPipeline::NearestCt32Sprite)
                 nearestCt32Sprites.push_back(
                     pending.nearestCt32Sprite);
@@ -773,6 +791,12 @@ struct GsVulkanRasterBackend::Impl final
             batchName = "resident nearest CT32 sprite batch";
         else if (pipeline == ResidentPipeline::LinearCt32Sprite)
             batchName = "resident linear CT32 sprite batch";
+        else if (pipeline ==
+                 ResidentPipeline::FeedbackLinearDepthCt32Sprite)
+        {
+            batchName =
+                "resident feedback linear depth CT32 sprite batch";
+        }
         else if (pipeline == ResidentPipeline::Ct32Triangle)
             batchName = "resident CT32 triangle batch";
         GsVramPageMask accessPages = pendingResidentReadPages;
@@ -812,6 +836,24 @@ struct GsVulkanRasterBackend::Impl final
         {
             executed = executor->executeResidentLinearCt32Sprites(
                 linearCt32Sprites, &executionError);
+        }
+        else if (pipeline ==
+                 ResidentPipeline::FeedbackLinearDepthCt32Sprite)
+        {
+            if (pendingFeedbackSnapshot.size() !=
+                GS_VULKAN_VRAM_SIZE)
+            {
+                clearPendingResidentCommands();
+                failRequest(
+                    std::string(batchName) + " at " +
+                        std::string(gsFlushReasonName(reason)),
+                    "resident batch lost its exact 4 MiB snapshot");
+            }
+            executed = executor
+                ->executeResidentFeedbackLinearDepthCt32Sprites(
+                    pendingFeedbackSnapshot,
+                    feedbackLinearDepthCt32Sprites,
+                    &executionError);
         }
         else
         {
@@ -1093,7 +1135,8 @@ GsBackendDecision GsVulkanRasterBackend::classify(
             return textureDecision;
 
         const GsDrawResources resources = command.resources();
-        if (m_impl->config.mode == GsRendererMode::Verify &&
+        if ((m_impl->config.mode == GsRendererMode::Verify ||
+             m_impl->config.mode == GsRendererMode::GpuStrict) &&
             resources.framebufferTextureAlias)
         {
             GsVulkanFeedbackLinearDepthCt32Sprite feedbackSprite{};
@@ -1214,7 +1257,8 @@ void GsVulkanRasterBackend::submit(
                     command, texturedSprite);
             if (!textureDecision.supported)
             {
-                if (m_impl->config.mode == GsRendererMode::Verify &&
+                if ((m_impl->config.mode == GsRendererMode::Verify ||
+                     m_impl->config.mode == GsRendererMode::GpuStrict) &&
                     resources.framebufferTextureAlias)
                 {
                     const GsBackendDecision feedbackDecision =
@@ -1433,10 +1477,57 @@ void GsVulkanRasterBackend::submit(
                 pipeline = Impl::ResidentPipeline::Ct32Triangle;
             else if (isDepthSprite)
                 pipeline = Impl::ResidentPipeline::DepthCt32Sprite;
+            else if (isFeedbackLinearDepthSprite)
+            {
+                pipeline = Impl::ResidentPipeline::
+                    FeedbackLinearDepthCt32Sprite;
+            }
             else if (isLinearTexturedSprite)
                 pipeline = Impl::ResidentPipeline::LinearCt32Sprite;
             else if (isTexturedSprite)
                 pipeline = Impl::ResidentPipeline::NearestCt32Sprite;
+
+            GsDrawResources residentResources = resources;
+            if (isFeedbackLinearDepthSprite)
+            {
+                // Texture, mip, and CLUT reads consume the independently
+                // copied snapshot rather than canonical resident VRAM.
+                residentResources.readPages =
+                    resources.framebufferReadPages;
+                residentResources.readPages.unionWith(
+                    resources.depthReadPages);
+            }
+
+            std::vector<uint8_t> nextFeedbackSnapshot;
+            const bool opensFeedbackBatch =
+                isFeedbackLinearDepthSprite &&
+                (m_impl->pendingResidentCommands.empty() ||
+                 m_impl->pendingResidentCommands.front().pipeline !=
+                     pipeline ||
+                 m_impl->pendingResidentCommands.size() >=
+                     m_impl->config.maximumResidentBatchCommands);
+            if (opensFeedbackBatch)
+            {
+                const std::span<const uint8_t> snapshot =
+                    m_impl->feedbackSnapshot();
+                if (snapshot.size() != GS_VULKAN_VRAM_SIZE)
+                {
+                    m_impl->failRequest(
+                        "feedback snapshot for strict draw " +
+                            std::to_string(command.sequence()),
+                        "frontend did not provide an exact 4 MiB snapshot");
+                }
+                if (m_impl->pendingResidentCommands.empty())
+                {
+                    m_impl->pendingFeedbackSnapshot.assign(
+                        snapshot.begin(), snapshot.end());
+                }
+                else
+                {
+                    nextFeedbackSnapshot.assign(
+                        snapshot.begin(), snapshot.end());
+                }
+            }
             if (!m_impl->pendingResidentCommands.empty() &&
                 m_impl->pendingResidentCommands.front().pipeline !=
                     pipeline)
@@ -1446,14 +1537,16 @@ void GsVulkanRasterBackend::submit(
             }
             const bool hasDependency =
                 m_impl->pendingResidentWritePages.intersects(
-                    resources.readPages) ||
+                    residentResources.readPages) ||
                 m_impl->pendingResidentWritePages.intersects(
-                    resources.writePages) ||
+                    residentResources.writePages) ||
                 m_impl->pendingResidentReadPages.intersects(
-                    resources.writePages);
+                    residentResources.writePages);
             const bool ordersDependenciesInBatch =
                 pipeline == Impl::ResidentPipeline::LinearCt32Sprite ||
-                pipeline == Impl::ResidentPipeline::DepthCt32Sprite;
+                pipeline == Impl::ResidentPipeline::DepthCt32Sprite ||
+                pipeline == Impl::ResidentPipeline::
+                    FeedbackLinearDepthCt32Sprite;
             if (hasDependency && !ordersDependenciesInBatch)
             {
                 m_impl->drainPendingResidentCommands(
@@ -1466,14 +1559,31 @@ void GsVulkanRasterBackend::submit(
                     GsFlushReason::QueueBackpressure);
             }
 
+            if (isFeedbackLinearDepthSprite &&
+                m_impl->pendingFeedbackSnapshot.size() !=
+                    GS_VULKAN_VRAM_SIZE)
+            {
+                if (nextFeedbackSnapshot.size() == GS_VULKAN_VRAM_SIZE)
+                {
+                    m_impl->pendingFeedbackSnapshot =
+                        std::move(nextFeedbackSnapshot);
+                }
+                else
+                {
+                    m_impl->failRequest(
+                        "resident feedback batch assembly",
+                        "pending batch has no exact 4 MiB snapshot");
+                }
+            }
+
             m_impl->pendingResidentCommands.push_back(
                 {command, sprite, depthSprite, texturedSprite,
-                 linearTexturedSprite, triangle,
-                 resources, pipeline});
+                 linearTexturedSprite, feedbackLinearDepthSprite,
+                 triangle, residentResources, pipeline});
             m_impl->pendingResidentReadPages.unionWith(
-                resources.readPages);
+                residentResources.readPages);
             m_impl->pendingResidentWritePages.unionWith(
-                resources.writePages);
+                residentResources.writePages);
         }
         if (m_impl->config.mode == GsRendererMode::Verify)
             ++m_impl->statistics.commandsCompleted;

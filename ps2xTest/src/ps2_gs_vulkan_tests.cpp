@@ -5637,9 +5637,9 @@ void register_ps2_gs_vulkan_tests()
 
             t.IsTrue(backend->setMode(GsRendererMode::GpuStrict),
                      "the Verify fixture should enter strict mode");
-            t.IsFalse(
+            t.IsTrue(
                 backend->classify(commands.front()).supported,
-                "strict should stay closed until resident snapshot ordering exists");
+                "strict should expose proven resident feedback ordering");
             t.IsTrue(backend->setMode(GsRendererMode::Hybrid),
                      "the fixture should enter Hybrid mode");
             t.IsFalse(
@@ -5812,6 +5812,247 @@ void register_ps2_gs_vulkan_tests()
             }
             t.IsTrue(mismatchThrew,
                      "the injected no-op feedback result should stop Verify");
+        });
+
+        tc.Run("Vulkan strict backend owns one resident feedback snapshot", [](TestCase &t)
+        {
+            GSMem::InitLookupTables();
+            const std::array<GsDrawCommand, 2> commands{{
+                makeFeedbackLinearDepthCt32SpriteCommand(
+                    30'310u, 4u, 1u, 200u, GS_PSM_Z24, false, 1u,
+                    6u, 5u,
+                    {0u, 63u, 0u, 31u}, {0u, 0u},
+                    {0u, 128u}, {0u, 128u},
+                    {128u, 256u}, {0u, 128u},
+                    0x00123456u),
+                makeFeedbackLinearDepthCt32SpriteCommand(
+                    30'311u, 4u, 1u, 200u, GS_PSM_Z24, false, 1u,
+                    6u, 5u,
+                    {0u, 63u, 0u, 31u}, {0u, 0u},
+                    {128u, 256u}, {0u, 128u},
+                    {0u, 128u}, {0u, 128u},
+                    0x00654321u),
+            }};
+            std::array<GsVulkanFeedbackLinearDepthCt32Sprite, 2>
+                prepared{};
+            uint64_t expectedPixels = 0u;
+            for (size_t index = 0u; index < commands.size(); ++index)
+            {
+                t.IsTrue(
+                    prepareGsVulkanFeedbackLinearDepthCt32Sprite(
+                        commands[index], prepared[index]).supported,
+                    "the strict feedback fixture should satisfy its exact predicate");
+                expectedPixels +=
+                    static_cast<uint64_t>(
+                        prepared[index].boundsX1 -
+                        prepared[index].boundsX0) *
+                    static_cast<uint64_t>(
+                        prepared[index].boundsY1 -
+                        prepared[index].boundsY0);
+            }
+
+            const std::vector<uint8_t> initial =
+                makeVramPattern(0x53544631u);
+            std::vector<uint8_t> providerBytes =
+                makeVramPattern(0x53544632u);
+            const std::vector<uint8_t> submittedSnapshot = providerBytes;
+            std::vector<uint8_t> expected = initial;
+            for (const auto &sprite : prepared)
+            {
+                applyFeedbackLinearDepthCt32SpriteCpu(
+                    expected, submittedSnapshot, sprite);
+            }
+            std::vector<uint8_t> resampled = initial;
+            for (const auto &sprite : prepared)
+            {
+                const std::vector<uint8_t> drawSnapshot = resampled;
+                applyFeedbackLinearDepthCt32SpriteCpu(
+                    resampled, drawSnapshot, sprite);
+            }
+            t.IsFalse(
+                expected == resampled,
+                "the strict fixture should distinguish one run snapshot from recurrence");
+
+            std::vector<uint8_t> vram = initial;
+            uint64_t softwareCalls = 0u;
+            uint64_t commitCalls = 0u;
+            uint64_t snapshotRequests = 0u;
+            GsVulkanRasterBackendConfig config{};
+            config.mode = GsRendererMode::GpuStrict;
+            std::unique_ptr<GsVulkanRasterBackend> backend =
+                GsVulkanRasterBackend::createWithExecutor(
+                    std::make_unique<FakeCt32Executor>(
+                        FakeCt32Executor::Behavior::Exact),
+                    config, vram,
+                    [&](const GsDrawCommand &)
+                    {
+                        ++softwareCalls;
+                    },
+                    [&](const GsDrawCommand &)
+                    {
+                        ++commitCalls;
+                    },
+                    nullptr,
+                    [&]() -> std::span<const uint8_t>
+                    {
+                        ++snapshotRequests;
+                        return providerBytes;
+                    });
+            t.IsNotNull(
+                backend.get(),
+                "an exact feedback executor should create strict mode");
+            if (!backend)
+                return;
+            for (const GsDrawCommand &command : commands)
+            {
+                t.IsTrue(
+                    backend->classify(command).supported,
+                    "strict should expose every exact feedback draw");
+            }
+
+            backend->submit(commands);
+            t.Equals(
+                snapshotRequests, 1ull,
+                "one resident feedback batch should acquire one snapshot");
+            t.Equals(
+                backend->pendingCommandCount(), commands.size(),
+                "ordered feedback draws should remain in one resident queue");
+            t.IsTrue(
+                vram == initial,
+                "queued strict feedback work should leave canonical VRAM untouched");
+            t.Equals(softwareCalls, 0ull,
+                     "strict feedback must not invoke the software oracle");
+            t.Equals(commitCalls, 0ull,
+                     "pending strict feedback must not publish commits");
+
+            std::fill(providerBytes.begin(), providerBytes.end(), 0u);
+            GsVramPageMask allPages;
+            allPages.setAll();
+            backend->prepareCpuVramAccess(
+                allPages, GsFlushReason::CpuReadback);
+            t.IsTrue(
+                vram == expected,
+                "resident feedback must consume the snapshot copied at submission");
+            t.Equals(
+                backend->pendingCommandCount(), size_t{0u},
+                "CPU readback should drain the resident feedback batch");
+            t.Equals(commitCalls, 2ull,
+                     "draining feedback should publish each command once");
+            t.Equals(softwareCalls, 0ull,
+                     "strict feedback publication must remain GPU-only");
+
+            const GsVulkanRasterBackendStatistics statistics =
+                backend->backendStatistics();
+            t.Equals(statistics.commandsAttempted, 2ull,
+                     "strict should attempt both feedback commands");
+            t.Equals(statistics.commandsCompleted, 2ull,
+                     "strict should complete both feedback commands");
+            t.Equals(statistics.committedGpuCommands, 2ull,
+                     "strict should commit both resident feedback commands");
+            t.Equals(statistics.residentCommands, 2ull,
+                     "both feedback commands should remain resident");
+            t.Equals(statistics.residentBatchesCompleted, 1ull,
+                     "both feedback commands should share one backend batch");
+            t.Equals(statistics.resourceHazardDrains, 0ull,
+                     "the ordered feedback service should absorb dependencies");
+            t.Equals(statistics.largestResidentBatch, 2ull,
+                     "the backend should retain feedback batch size two");
+            t.Equals(statistics.pageOwnership.gpuNewerPages, size_t{0u},
+                     "CPU readback should publish every feedback writer");
+            t.Equals(statistics.coherency.rejectedTransitions, 0ull,
+                     "strict feedback should preserve page ownership");
+
+            const GsVulkanServiceStatistics service =
+                backend->serviceStatistics();
+            t.Equals(
+                service.feedbackLinearDepthCt32SpriteDrawsCompleted,
+                2ull,
+                "the resident executor should complete both feedback draws");
+            t.Equals(
+                service.feedbackLinearDepthCt32SpritePixelsExecuted,
+                expectedPixels,
+                "the resident executor should retain exact feedback pixels");
+            t.Equals(
+                service
+                    .residentFeedbackLinearDepthCt32SpriteBatchesCompleted,
+                1ull,
+                "strict should execute one resident feedback service batch");
+            t.Equals(
+                service
+                    .largestResidentFeedbackLinearDepthCt32SpriteBatch,
+                2ull,
+                "the service should retain the strict feedback batch size");
+            t.Equals(service.linearCt32SpriteDrawsCompleted, 0ull,
+                     "strict feedback must not alias ordinary linear work");
+            t.Equals(service.depthCt32SpriteDrawsCompleted, 0ull,
+                     "strict feedback must not alias flat depth work");
+
+            t.IsTrue(backend->setMode(GsRendererMode::Hybrid),
+                     "the synchronized feedback backend should enter Hybrid");
+            t.IsFalse(
+                backend->classify(commands.front()).supported,
+                "Hybrid should remain closed pending fixed-work measurement");
+
+            const std::vector<uint8_t> shortSnapshot(
+                GS_VULKAN_VRAM_SIZE - 1u, 0u);
+            std::vector<uint8_t> malformedVram = initial;
+            uint64_t malformedSoftwareCalls = 0u;
+            std::unique_ptr<GsVulkanRasterBackend> malformed =
+                GsVulkanRasterBackend::createWithExecutor(
+                    std::make_unique<FakeCt32Executor>(
+                        FakeCt32Executor::Behavior::Exact),
+                    config, malformedVram,
+                    [&](const GsDrawCommand &)
+                    {
+                        ++malformedSoftwareCalls;
+                    },
+                    {}, nullptr,
+                    [&]() -> std::span<const uint8_t>
+                    {
+                        return shortSnapshot;
+                    });
+            t.IsNotNull(
+                malformed.get(),
+                "a malformed strict snapshot fixture should construct");
+            bool malformedThrew = false;
+            if (malformed)
+            {
+                t.IsTrue(
+                    malformed->classify(commands.front()).supported,
+                    "strict classification should not borrow snapshot bytes");
+                try
+                {
+                    malformed->submit(std::span<const GsDrawCommand>(
+                        &commands.front(), 1u));
+                }
+                catch (const std::runtime_error &error)
+                {
+                    malformedThrew =
+                        std::string(error.what()).find("exact 4 MiB") !=
+                        std::string::npos;
+                }
+                t.Equals(
+                    malformed->pendingCommandCount(), size_t{0u},
+                    "invalid strict snapshots must not leave queued work");
+                t.Equals(
+                    malformed->backendStatistics().gpuRequestsFailed,
+                    1ull,
+                    "an invalid strict snapshot should fail one request");
+                t.Equals(
+                    malformed->serviceStatistics()
+                        .residentFeedbackLinearDepthCt32SpriteBatchesCompleted,
+                    0ull,
+                    "an invalid strict snapshot must not reach the resident service");
+            }
+            t.IsTrue(
+                malformedThrew,
+                "an invalid strict snapshot should retain an exact-size diagnostic");
+            t.IsTrue(
+                malformedVram == initial,
+                "strict snapshot validation must preserve canonical VRAM");
+            t.Equals(
+                malformedSoftwareCalls, 0ull,
+                "strict snapshot validation must precede any software mutation");
         });
 
         tc.Run("Vulkan strict backend keeps ordered depth CT32 sprites resident", [](TestCase &t)
