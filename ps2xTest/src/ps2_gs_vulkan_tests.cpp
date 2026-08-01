@@ -3,6 +3,7 @@
 #include "runtime/ps2_gs_memory.h"
 #include "runtime/ps2_gs_vulkan.h"
 #include "runtime/ps2_gs_vulkan_backend.h"
+#include "runtime/ps2_memory.h"
 
 #include <algorithm>
 #include <array>
@@ -1430,6 +1431,231 @@ void register_ps2_gs_vulkan_tests()
                      "the accelerated draw should reuse one fixed pipeline");
             t.Equals(service.fenceWaits, 3ull,
                      "upload draw and observation should each wait once");
+        });
+
+        tc.Run("GS Vulkan presentation latch publishes a complete CPU frame checkpoint", [](TestCase &t)
+        {
+            GSMem::InitLookupTables();
+            std::vector<uint8_t> softwareVram =
+                makeVramPattern(0x4652414Du);
+            std::vector<uint8_t> acceleratedVram = softwareVram;
+            const std::vector<uint8_t> initial = softwareVram;
+
+            constexpr uint32_t displayPage = 5u;
+            constexpr uint32_t offscreenPage = 20u;
+            const auto configureRegisters = [](GSRegisters &registers)
+            {
+                registers.pmode = 1ull;
+                registers.dispfb1 =
+                    displayPage |
+                    (1ull << 9u) |
+                    (static_cast<uint64_t>(GS_PSM_CT32) << 15u);
+                registers.display1 =
+                    (63ull << 32u) |
+                    (63ull << 44u);
+            };
+            GSRegisters softwareRegisters{};
+            GSRegisters acceleratedRegisters{};
+            configureRegisters(softwareRegisters);
+            configureRegisters(acceleratedRegisters);
+
+            GS software;
+            GS accelerated;
+            software.init(
+                softwareVram.data(),
+                static_cast<uint32_t>(softwareVram.size()),
+                &softwareRegisters);
+            accelerated.init(
+                acceleratedVram.data(),
+                static_cast<uint32_t>(acceleratedVram.size()),
+                &acceleratedRegisters);
+
+            GsVulkanCapabilityReport preflight{};
+            const GsVulkanServiceConfig config =
+                makeRendererServiceConfig(preflight);
+            t.IsTrue(accelerated.configureVulkanRenderer(config),
+                     "the frame checkpoint fixture should accept Vulkan configuration");
+            if (!preflight.ready())
+            {
+                t.IsFalse(accelerated.setRendererMode(
+                              GsRendererMode::Hybrid),
+                          "an unavailable host should skip the frame checkpoint cleanly");
+                return;
+            }
+
+            t.IsTrue(accelerated.setRendererMode(
+                         GsRendererMode::Hybrid),
+                     "a capable host should create the hybrid frame fixture");
+            if (accelerated.rendererMode() != GsRendererMode::Hybrid)
+                return;
+            accelerated.setBackendCountersEnabled(true);
+            accelerated.resetBackendCounters();
+
+            configureFlatCt32Draws(software, displayPage, 1u);
+            configureFlatCt32Draws(accelerated, displayPage, 1u);
+            drawFlatCt32Sprite(
+                software, 2u * 16u, 3u * 16u,
+                18u * 16u, 19u * 16u, 0xA043210Fu);
+            drawFlatCt32Sprite(
+                accelerated, 2u * 16u, 3u * 16u,
+                18u * 16u, 19u * 16u, 0xA043210Fu);
+
+            configureFlatCt32Draws(software, offscreenPage, 1u);
+            configureFlatCt32Draws(accelerated, offscreenPage, 1u);
+            drawFlatCt32Sprite(
+                software, 7u * 16u, 9u * 16u,
+                23u * 16u, 25u * 16u, 0xB0876543u);
+            drawFlatCt32Sprite(
+                accelerated, 7u * 16u, 9u * 16u,
+                23u * 16u, 25u * 16u, 0xB0876543u);
+
+            GsBackendCounters counters = accelerated.backendCounters();
+            t.Equals(counters.queueDepth, 2ull,
+                     "both disjoint frame draws should remain queued before the latch");
+            t.Equals(counters.queueHighWatermark, 2ull,
+                     "the frame fixture should expose its compatible-run depth");
+            GsVulkanRasterBackendStatistics backend =
+                accelerated.vulkanRendererBackendStatistics();
+            t.Equals(backend.commandsCompleted, 0ull,
+                     "the frame boundary should own execution of both pending draws");
+            const uint64_t cpuPreparationsBeforeFrame =
+                backend.cpuAccessPreparations;
+            t.IsTrue(std::equal(
+                         acceleratedVram.begin() +
+                             offscreenPage * GS_VRAM_PAGE_SIZE,
+                         acceleratedVram.begin() +
+                             (offscreenPage + 1u) * GS_VRAM_PAGE_SIZE,
+                         initial.begin() +
+                             offscreenPage * GS_VRAM_PAGE_SIZE),
+                     "canonical CPU VRAM should still hide the off-display pending draw");
+
+            software.latchHostPresentationFrame();
+            accelerated.latchHostPresentationFrame();
+            t.IsTrue(acceleratedVram == softwareVram,
+                     "the frame checkpoint should publish every GPU-newer page");
+
+            std::vector<uint8_t> softwareFrame;
+            std::vector<uint8_t> acceleratedFrame;
+            uint32_t softwareWidth = 0u;
+            uint32_t softwareHeight = 0u;
+            uint32_t acceleratedWidth = 0u;
+            uint32_t acceleratedHeight = 0u;
+            uint32_t displayFbp = 0u;
+            uint32_t sourceFbp = 0u;
+            bool usedPreferred = true;
+            t.IsTrue(software.copyLatchedHostPresentationFrame(
+                         softwareFrame, softwareWidth, softwareHeight),
+                     "the software oracle should produce a latched frame");
+            t.IsTrue(accelerated.copyLatchedHostPresentationFrame(
+                         acceleratedFrame,
+                         acceleratedWidth, acceleratedHeight,
+                         &displayFbp, &sourceFbp, &usedPreferred),
+                     "the synchronized hybrid image should produce a latched frame");
+            t.IsTrue(acceleratedFrame == softwareFrame,
+                     "hybrid presentation bytes should equal the software frame");
+            t.Equals(acceleratedWidth, 64u,
+                     "the frame fixture should retain its bounded display width");
+            t.Equals(acceleratedHeight, 64u,
+                     "the frame fixture should retain its bounded display height");
+            t.Equals(acceleratedWidth, softwareWidth,
+                     "hybrid and software widths should agree");
+            t.Equals(acceleratedHeight, softwareHeight,
+                     "hybrid and software heights should agree");
+            t.Equals(displayFbp, displayPage,
+                     "the latch should retain the configured display page");
+            t.Equals(sourceFbp, displayPage,
+                     "direct presentation should read the configured display source");
+            t.IsFalse(usedPreferred,
+                      "the direct frame checkpoint should not require a copy shortcut");
+            const size_t drawnPixel =
+                (3u * acceleratedWidth + 2u) * 4u;
+            t.Equals(static_cast<uint32_t>(
+                         acceleratedFrame[drawnPixel + 0u]),
+                     0x0Fu,
+                     "the latched frame should expose the GPU draw's red byte");
+            t.Equals(static_cast<uint32_t>(
+                         acceleratedFrame[drawnPixel + 1u]),
+                     0x21u,
+                     "the latched frame should expose the GPU draw's green byte");
+            t.Equals(static_cast<uint32_t>(
+                         acceleratedFrame[drawnPixel + 2u]),
+                     0x43u,
+                     "the latched frame should expose the GPU draw's blue byte");
+
+            const GsVulkanServiceStatistics service =
+                accelerated.vulkanRendererServiceStatistics();
+            t.Equals(service.pageUploadOperationsCompleted, 1ull,
+                     "the frame checkpoint should upload both CPU-newer pages once");
+            t.Equals(service.pagesUploaded, 2ull,
+                     "the frame upload should contain only the two draw pages");
+            t.Equals(service.residentSpriteBatchesCompleted, 1ull,
+                     "the frame checkpoint should submit one compatible batch");
+            t.Equals(service.largestResidentSpriteBatch, 2ull,
+                     "the frame batch should retain both disjoint draws");
+            t.Equals(service.pageDownloadOperationsCompleted, 1ull,
+                     "the frame checkpoint should publish GPU-newer pages once");
+            t.Equals(service.pagesDownloaded, 2ull,
+                     "presentation should publish display and off-display GPU pages");
+            t.Equals(service.queueSubmissions, 3ull,
+                     "one upload batch and download should use three submissions");
+            t.Equals(service.shaderDispatches, 2ull,
+                     "the frame batch should execute both draw dispatches");
+            t.Equals(service.pipelineBarriers, 8ull,
+                     "the frame checkpoint should expose upload draw and download barriers");
+            t.Equals(service.pipelineCacheHits, 1ull,
+                     "the frame batch should reuse the fixed sprite pipeline once");
+            t.Equals(service.fenceWaits, 3ull,
+                     "each submitted frame operation should wait on one fence");
+
+            backend = accelerated.vulkanRendererBackendStatistics();
+            t.Equals(backend.commandsCompleted, 2ull,
+                     "the frame checkpoint should complete both accepted draws");
+            t.Equals(backend.residentBatchesCompleted, 1ull,
+                     "the backend should expose one frame-boundary batch");
+            t.Equals(backend.cpuAccessPreparations -
+                         cpuPreparationsBeforeFrame,
+                     1ull,
+                     "the first frame should request one full CPU publication");
+            t.Equals(backend.pageOwnership.gpuNewerPages,
+                     static_cast<size_t>(0u),
+                     "no hidden GPU writer may survive a frame checkpoint");
+            t.Equals(backend.coherency.cpuToGpuPages, 2ull,
+                     "coherency should record the two uploaded draw pages");
+            t.Equals(backend.coherency.gpuToCpuPages, 2ull,
+                     "coherency should record display and off-display publication");
+            counters = accelerated.backendCounters();
+            t.Equals(counters.queueDepth, 0ull,
+                     "the presentation boundary should leave no pending draw");
+            t.Equals(
+                counters.flushReasons[static_cast<size_t>(
+                    GsFlushReason::PresentationLatch)],
+                1ull,
+                "the first frame should retain one named presentation latch");
+
+            accelerated.latchHostPresentationFrame();
+            const GsVulkanServiceStatistics repeatedService =
+                accelerated.vulkanRendererServiceStatistics();
+            t.Equals(repeatedService.queueSubmissions,
+                     service.queueSubmissions,
+                     "an unchanged second frame should submit no Vulkan work");
+            t.Equals(repeatedService.pagesDownloaded,
+                     service.pagesDownloaded,
+                     "an unchanged second frame should download no page twice");
+            backend = accelerated.vulkanRendererBackendStatistics();
+            t.Equals(backend.cpuAccessPreparations -
+                         cpuPreparationsBeforeFrame,
+                     2ull,
+                     "each conservative frame should still prepare CPU visibility");
+            counters = accelerated.backendCounters();
+            t.Equals(
+                counters.flushReasons[static_cast<size_t>(
+                    GsFlushReason::PresentationLatch)],
+                2ull,
+                "both frame boundaries should remain observable");
+            t.Equals(repeatedService.validationErrors, 0u,
+                     "frame synchronization should remain validation-clean");
+            t.Equals(repeatedService.validationWarnings, 0u,
+                     "frame synchronization should emit no validation warnings");
         });
 
         tc.Run("Vulkan verify mismatch writes a complete bounded reproducer", [](TestCase &t)

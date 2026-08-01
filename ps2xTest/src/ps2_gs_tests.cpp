@@ -984,6 +984,37 @@ void register_ps2_gs_tests()
                      "external CPU transaction should publish its writer mask once");
             t.IsTrue(accelerated.cpuWritePages[0] == cpuWrites,
                      "external CPU publication should not dirty read-only pages");
+
+            accelerated.cpuAccessPages.clear();
+            accelerated.cpuAccessReasons.clear();
+            accelerated.flushReasons.clear();
+            const GsSubmissionResult frameDraw = router.submit(command);
+            t.IsTrue(frameDraw.submitted && frameDraw.usedAccelerated,
+                     "the frame checkpoint fixture should begin with pending GPU work");
+            t.Equals(router.counters().queueDepth, 1ull,
+                     "the frame checkpoint should observe pending accelerated work");
+            router.flush(GsFlushReason::PresentationLatch);
+            t.Equals(accelerated.cpuAccessPages.size(),
+                     static_cast<size_t>(1u),
+                     "a presentation latch should request one CPU publication");
+            t.IsTrue(accelerated.cpuAccessPages[0].all(),
+                     "a conservative frame checkpoint should publish all 512 pages");
+            t.Equals(accelerated.cpuAccessReasons[0],
+                     GsFlushReason::PresentationLatch,
+                     "frame publication should retain its named boundary");
+            t.Equals(accelerated.flushReasons.size(),
+                     static_cast<size_t>(1u),
+                     "the active accelerated backend should drain once at the latch");
+            t.Equals(accelerated.flushReasons[0],
+                     GsFlushReason::PresentationLatch,
+                     "accelerated drainage should retain the frame reason");
+            t.Equals(router.counters().queueDepth, 0ull,
+                     "the frame checkpoint should leave no queued command");
+            t.Equals(
+                router.counters().flushReasons[static_cast<size_t>(
+                    GsFlushReason::PresentationLatch)],
+                1ull,
+                "the router should count the conservative frame checkpoint");
         });
 
         tc.Run("GS frontend routes draws and visibility boundaries through the software backend", [](TestCase &t)
