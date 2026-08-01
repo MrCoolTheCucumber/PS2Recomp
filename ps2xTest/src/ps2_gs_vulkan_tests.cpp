@@ -9847,7 +9847,7 @@ void register_ps2_gs_vulkan_tests()
                      "strict texture routing should emit no validation warnings");
         });
 
-        tc.Run("GS Vulkan strict source-copy depth survives ownership and frame checkpoints", [](TestCase &t)
+        tc.Run("GS Vulkan strict blended depth survives ownership and frame checkpoints", [](TestCase &t)
         {
             GSMem::InitLookupTables();
             std::array<GsDrawCommand, 6> commands =
@@ -9855,11 +9855,14 @@ void register_ps2_gs_vulkan_tests()
             const GsDrawCommand opaqueFirst = commands[0];
             commands[0] = makeAlphaBlendCommand(
                 opaqueFirst, 40'000u, 0u);
+            commands[1] = makeAlphaBlendCommand(
+                commands[1], 40'001u,
+                0x0000008000000044ull, false, true);
             std::array<GsVulkanDepthCt32Sprite, 6> prepared{};
             for (size_t index = 0u; index < commands.size(); ++index)
             {
                 t.IsTrue(
-                    prepareGsVulkanDepthCt32Sprite(
+                    prepareAnyDepthCt32Sprite(
                         commands[index], prepared[index]).supported,
                     "every strict depth checkpoint should satisfy the narrow predicate");
             }
@@ -9874,6 +9877,13 @@ void register_ps2_gs_vulkan_tests()
             t.IsFalse(
                 commands[0].resources().framebufferReadPages.any(),
                 "source-copy checkpoints should not claim a color read");
+            t.Equals(
+                prepared[1].colorBlendMode,
+                GS_VULKAN_DEPTH_CT32_COLOR_SOURCE_OVER,
+                "the checkpoint fixture should retain source-over depth");
+            t.IsTrue(
+                commands[1].resources().framebufferReadPages.any(),
+                "source-over checkpoints should retain their color read");
             const GsDrawCommand flat = makeCt32SpriteCommand(
                 40'010u, 43u, 1u,
                 {0u, 31u, 0u, 31u}, {0u, 0u},
