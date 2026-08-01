@@ -3005,6 +3005,470 @@ void register_ps2_gs_vulkan_tests()
                      "randomized transitions should emit no validation warnings");
         });
 
+        tc.Run("GS Vulkan strict triangle transitions match software at every observation", [](TestCase &t)
+        {
+            GSMem::InitLookupTables();
+            std::vector<uint8_t> softwareVram =
+                makeVramPattern(0x54525331u);
+            std::vector<uint8_t> acceleratedVram = softwareVram;
+
+            constexpr std::array<uint32_t, 8> pages{
+                1u, 5u, 9u, 13u, 17u, 21u, 25u, 29u};
+            GSRegisters softwareRegisters{};
+            GSRegisters acceleratedRegisters{};
+            configureCt32Display(softwareRegisters, pages[0]);
+            configureCt32Display(acceleratedRegisters, pages[0]);
+
+            GS software;
+            GS accelerated;
+            software.init(
+                softwareVram.data(),
+                static_cast<uint32_t>(softwareVram.size()),
+                &softwareRegisters);
+            accelerated.init(
+                acceleratedVram.data(),
+                static_cast<uint32_t>(acceleratedVram.size()),
+                &acceleratedRegisters);
+
+            GsVulkanCapabilityReport preflight{};
+            const GsVulkanServiceConfig serviceConfig =
+                makeRendererServiceConfig(preflight);
+            GsVulkanRasterBackendConfig backendConfig{};
+            backendConfig.maximumResidentBatchCommands = 8u;
+            t.IsTrue(accelerated.configureVulkanRenderer(
+                         serviceConfig, backendConfig),
+                     "the strict transition fixture should accept Vulkan configuration");
+            if (!preflight.ready())
+            {
+                t.IsFalse(accelerated.setRendererMode(
+                              GsRendererMode::GpuStrict),
+                          "an unavailable host should skip strict transitions cleanly");
+                return;
+            }
+            const GsVulkanDeviceReport *selected =
+                preflight.selectedDevice();
+            if (!selected || !selected->exactCt32Triangle)
+                return;
+
+            t.IsTrue(accelerated.setRendererMode(
+                         GsRendererMode::GpuStrict),
+                     "a qualified host should create the strict transition fixture");
+            if (accelerated.rendererMode() !=
+                GsRendererMode::GpuStrict)
+            {
+                return;
+            }
+            accelerated.setBackendCountersEnabled(true);
+            accelerated.resetBackendCounters();
+
+            uint32_t randomState = 0x13D4A7C9u;
+            const auto randomBelow = [&](uint32_t bound)
+            {
+                return nextRandom(randomState) % bound;
+            };
+            const auto randomPageIndex = [&]()
+            {
+                return static_cast<size_t>(
+                    randomBelow(static_cast<uint32_t>(pages.size())));
+            };
+            const auto distinctPageIndex = [&](size_t first)
+            {
+                return (first + 1u +
+                        randomBelow(static_cast<uint32_t>(
+                            pages.size() - 1u))) %
+                       pages.size();
+            };
+            const auto drawTrianglePair = [&](uint32_t page)
+            {
+                const uint16_t baseX = static_cast<uint16_t>(
+                    randomBelow(20u));
+                const uint16_t baseY = static_cast<uint16_t>(
+                    randomBelow(7u));
+                const std::array<uint16_t, 3> x{{
+                    static_cast<uint16_t>(
+                        (baseX + 1u) * 16u + randomBelow(16u)),
+                    static_cast<uint16_t>(
+                        (baseX + 25u) * 16u + randomBelow(16u)),
+                    static_cast<uint16_t>(
+                        (baseX + 6u) * 16u + randomBelow(16u)),
+                }};
+                const std::array<uint16_t, 3> y{{
+                    static_cast<uint16_t>(
+                        (baseY + 1u) * 16u + randomBelow(16u)),
+                    static_cast<uint16_t>(
+                        (baseY + 6u) * 16u + randomBelow(16u)),
+                    static_cast<uint16_t>(
+                        (baseY + 23u) * 16u + randomBelow(16u)),
+                }};
+                const uint32_t color =
+                    0x80000000u | nextRandom(randomState);
+                configureFlatCt32Draws(software, page, 1u);
+                configureFlatCt32Draws(accelerated, page, 1u);
+                drawFlatCt32Triangle(software, x, y, color);
+                drawFlatCt32Triangle(accelerated, x, y, color);
+            };
+            const auto drawSpritePair = [&](uint32_t page)
+            {
+                const uint16_t x0 = static_cast<uint16_t>(
+                    randomBelow(32u));
+                const uint16_t y0 = static_cast<uint16_t>(
+                    randomBelow(16u));
+                const uint16_t width = static_cast<uint16_t>(
+                    8u + randomBelow(9u));
+                const uint16_t height = static_cast<uint16_t>(
+                    8u + randomBelow(5u));
+                const uint32_t color =
+                    0x80000000u | nextRandom(randomState);
+                configureFlatCt32Draws(software, page, 1u);
+                configureFlatCt32Draws(accelerated, page, 1u);
+                drawFlatCt32Sprite(
+                    software,
+                    static_cast<uint16_t>(x0 * 16u),
+                    static_cast<uint16_t>(y0 * 16u),
+                    static_cast<uint16_t>((x0 + width) * 16u),
+                    static_cast<uint16_t>((y0 + height) * 16u),
+                    color);
+                drawFlatCt32Sprite(
+                    accelerated,
+                    static_cast<uint16_t>(x0 * 16u),
+                    static_cast<uint16_t>(y0 * 16u),
+                    static_cast<uint16_t>((x0 + width) * 16u),
+                    static_cast<uint16_t>((y0 + height) * 16u),
+                    color);
+            };
+
+            uint64_t forcedObservations = 0u;
+            uint64_t frameObservations = 0u;
+            const auto compareFullVram = [&](
+                const char *boundary,
+                size_t operationIndex) -> bool
+            {
+                ++forcedObservations;
+                const auto difference = std::mismatch(
+                    softwareVram.begin(), softwareVram.end(),
+                    acceleratedVram.begin(), acceleratedVram.end());
+                if (difference.first == softwareVram.end())
+                    return true;
+                const size_t byteOffset = static_cast<size_t>(
+                    difference.first - softwareVram.begin());
+                t.IsTrue(
+                    false,
+                    std::string("strict transition VRAM mismatch after ") +
+                        boundary + " at operation " +
+                        std::to_string(operationIndex) + ", byte " +
+                        std::to_string(byteOffset) + ", page " +
+                        std::to_string(
+                            byteOffset / GS_VRAM_PAGE_SIZE));
+                return false;
+            };
+            const auto forceObservation = [&](
+                uint32_t kind,
+                size_t operationIndex) -> bool
+            {
+                const char *name = nullptr;
+                switch (kind)
+                {
+                case 0u:
+                    (void)software.getDebugSnapshot();
+                    (void)accelerated.getDebugSnapshot();
+                    name = "debugger observation";
+                    break;
+                case 1u:
+                {
+                    software.latchHostPresentationFrame();
+                    accelerated.latchHostPresentationFrame();
+                    std::vector<uint8_t> softwareFrame;
+                    std::vector<uint8_t> acceleratedFrame;
+                    uint32_t softwareWidth = 0u;
+                    uint32_t softwareHeight = 0u;
+                    uint32_t acceleratedWidth = 0u;
+                    uint32_t acceleratedHeight = 0u;
+                    const bool softwareFrameReady =
+                        software.copyLatchedHostPresentationFrame(
+                            softwareFrame,
+                            softwareWidth, softwareHeight);
+                    const bool acceleratedFrameReady =
+                        accelerated.copyLatchedHostPresentationFrame(
+                            acceleratedFrame,
+                            acceleratedWidth, acceleratedHeight);
+                    if (!softwareFrameReady ||
+                        acceleratedFrameReady != softwareFrameReady ||
+                        acceleratedWidth != softwareWidth ||
+                        acceleratedHeight != softwareHeight ||
+                        acceleratedFrame != softwareFrame)
+                    {
+                        t.IsTrue(
+                            false,
+                            "strict transition frame diverged at operation " +
+                                std::to_string(operationIndex));
+                        return false;
+                    }
+                    ++frameObservations;
+                    name = "presentation latch";
+                    break;
+                }
+                case 2u:
+                    software.writeRegister(GS_REG_FINISH, 0u);
+                    accelerated.writeRegister(GS_REG_FINISH, 0u);
+                    name = "FINISH";
+                    break;
+                default:
+                    (void)software.captureReplayState();
+                    (void)accelerated.captureReplayState();
+                    name = "save-state observation";
+                    break;
+                }
+                return compareFullVram(name, operationIndex);
+            };
+
+            enum class StrictTransitionAction : uint8_t
+            {
+                TriangleDraw,
+                TriangleBatch,
+                PipelineChange,
+                HostUpload,
+                CpuReadback,
+                LocalCopy,
+                SoftwareModeTriangle,
+                Observation,
+                Count,
+            };
+            constexpr size_t actionCount =
+                static_cast<size_t>(StrictTransitionAction::Count);
+            std::array<uint64_t, actionCount> actionCounts{};
+            constexpr size_t cycleCount = 8u;
+            size_t operationIndex = 0u;
+            for (size_t cycle = 0u; cycle < cycleCount; ++cycle)
+            {
+                std::array<StrictTransitionAction, actionCount> order{
+                    StrictTransitionAction::TriangleDraw,
+                    StrictTransitionAction::TriangleBatch,
+                    StrictTransitionAction::PipelineChange,
+                    StrictTransitionAction::HostUpload,
+                    StrictTransitionAction::CpuReadback,
+                    StrictTransitionAction::LocalCopy,
+                    StrictTransitionAction::SoftwareModeTriangle,
+                    StrictTransitionAction::Observation,
+                };
+                for (size_t index = order.size() - 1u;
+                     index > 0u; --index)
+                {
+                    const size_t other = randomBelow(
+                        static_cast<uint32_t>(index + 1u));
+                    std::swap(order[index], order[other]);
+                }
+
+                for (StrictTransitionAction action : order)
+                {
+                    ++operationIndex;
+                    ++actionCounts[static_cast<size_t>(action)];
+                    const size_t firstPageIndex = randomPageIndex();
+                    const size_t secondPageIndex =
+                        distinctPageIndex(firstPageIndex);
+                    const uint32_t page = pages[firstPageIndex];
+                    switch (action)
+                    {
+                    case StrictTransitionAction::TriangleDraw:
+                        drawTrianglePair(page);
+                        break;
+                    case StrictTransitionAction::TriangleBatch:
+                        drawTrianglePair(page);
+                        drawTrianglePair(pages[secondPageIndex]);
+                        break;
+                    case StrictTransitionAction::PipelineChange:
+                        drawTrianglePair(page);
+                        drawSpritePair(pages[secondPageIndex]);
+                        break;
+                    case StrictTransitionAction::HostUpload:
+                    {
+                        std::array<uint32_t, 4> pixels{};
+                        for (uint32_t &pixel : pixels)
+                            pixel = nextRandom(randomState);
+                        const size_t pixelCount =
+                            1u + randomBelow(static_cast<uint32_t>(
+                                     pixels.size()));
+                        const uint16_t x = static_cast<uint16_t>(
+                            randomBelow(61u));
+                        const uint16_t y = static_cast<uint16_t>(
+                            randomBelow(32u));
+                        const std::span<const uint32_t> payload(
+                            pixels.data(), pixelCount);
+                        uploadCt32Pixels(
+                            software, page * 32u, 1u,
+                            x, y, payload);
+                        uploadCt32Pixels(
+                            accelerated, page * 32u, 1u,
+                            x, y, payload);
+                        break;
+                    }
+                    case StrictTransitionAction::CpuReadback:
+                    {
+                        const uint16_t x = static_cast<uint16_t>(
+                            randomBelow(61u));
+                        const uint16_t y = static_cast<uint16_t>(
+                            randomBelow(29u));
+                        const std::vector<uint8_t> softwareBytes =
+                            readCt32Pixels(
+                                software, page * 32u, 1u,
+                                x, y, 3u, 3u);
+                        const std::vector<uint8_t> acceleratedBytes =
+                            readCt32Pixels(
+                                accelerated, page * 32u, 1u,
+                                x, y, 3u, 3u);
+                        if (acceleratedBytes != softwareBytes)
+                        {
+                            t.IsTrue(
+                                false,
+                                "strict scoped readback diverged at operation " +
+                                    std::to_string(operationIndex));
+                            return;
+                        }
+                        break;
+                    }
+                    case StrictTransitionAction::LocalCopy:
+                    {
+                        const uint16_t sourceX =
+                            static_cast<uint16_t>(randomBelow(57u));
+                        const uint16_t sourceY =
+                            static_cast<uint16_t>(randomBelow(25u));
+                        const uint16_t destinationX =
+                            static_cast<uint16_t>(randomBelow(57u));
+                        const uint16_t destinationY =
+                            static_cast<uint16_t>(randomBelow(25u));
+                        copyCt32Pixels(
+                            software,
+                            page * 32u,
+                            pages[secondPageIndex] * 32u,
+                            1u,
+                            sourceX, sourceY,
+                            destinationX, destinationY,
+                            8u, 8u);
+                        copyCt32Pixels(
+                            accelerated,
+                            page * 32u,
+                            pages[secondPageIndex] * 32u,
+                            1u,
+                            sourceX, sourceY,
+                            destinationX, destinationY,
+                            8u, 8u);
+                        break;
+                    }
+                    case StrictTransitionAction::SoftwareModeTriangle:
+                        if (!accelerated.setRendererMode(
+                                GsRendererMode::Software))
+                        {
+                            t.IsTrue(
+                                false,
+                                "strict transition stream failed to enter software mode");
+                            return;
+                        }
+                        drawTrianglePair(page);
+                        if (!accelerated.setRendererMode(
+                                GsRendererMode::GpuStrict))
+                        {
+                            t.IsTrue(
+                                false,
+                                "strict transition stream failed to restore strict mode");
+                            return;
+                        }
+                        if (!compareFullVram(
+                                "software-to-strict mode switch",
+                                operationIndex))
+                        {
+                            return;
+                        }
+                        break;
+                    case StrictTransitionAction::Observation:
+                        if (!forceObservation(
+                                static_cast<uint32_t>(cycle % 4u),
+                                operationIndex))
+                        {
+                            return;
+                        }
+                        break;
+                    case StrictTransitionAction::Count:
+                        break;
+                    }
+                }
+            }
+
+            (void)software.getDebugSnapshot();
+            (void)accelerated.getDebugSnapshot();
+            if (!compareFullVram(
+                    "final debugger observation", operationIndex))
+            {
+                return;
+            }
+
+            for (size_t index = 0u; index < actionCounts.size(); ++index)
+            {
+                t.Equals(actionCounts[index],
+                         static_cast<uint64_t>(cycleCount),
+                         "every strict transition action should run once per cycle");
+            }
+            t.Equals(operationIndex, cycleCount * actionCount,
+                     "the strict transition stream should remain bounded");
+            t.Equals(forcedObservations, 17ull,
+                     "mode switches scheduled observations and final state should compare VRAM");
+            t.Equals(frameObservations, 2ull,
+                     "both scheduled frame observations should compare host pixels");
+
+            const GsBackendCounters counters =
+                accelerated.backendCounters();
+            t.Equals(counters.commands, 48ull,
+                     "the strict stream should assemble its exact draw count");
+            t.Equals(counters.acceleratedCommands, 40ull,
+                     "every strict-mode draw should reach Vulkan");
+            t.Equals(counters.softwareCommands, 8ull,
+                     "only explicit software-mode triangles should use the CPU");
+            t.Equals(counters.fallbackCommands, 0ull,
+                     "strict transitions should contain no implicit fallback");
+            t.Equals(counters.strictFailures, 0ull,
+                     "every strict draw should satisfy the qualified envelope");
+            t.IsTrue(counters.queueHighWatermark >= 2ull,
+                     "each explicit triangle pair should expose resident queueing");
+            t.Equals(
+                counters.flushReasons[static_cast<size_t>(
+                    GsFlushReason::BackendSwitch)],
+                16ull,
+                "each explicit software interval should cross two backend boundaries");
+
+            const GsVulkanRasterBackendStatistics backend =
+                accelerated.vulkanRendererBackendStatistics();
+            t.Equals(backend.commandsCompleted, 40ull,
+                     "every strict GPU command should complete once");
+            t.Equals(backend.pageOwnership.gpuNewerPages,
+                     static_cast<size_t>(0u),
+                     "the final observation should publish every strict writer");
+            t.Equals(backend.coherency.rejectedTransitions, 0ull,
+                     "the strict stream should never create competing writers");
+            t.IsTrue(backend.residentBatchesCompleted > 0ull,
+                     "strict transitions should exercise resident batches");
+            t.IsTrue(backend.pipelineChangeDrains >= 8ull,
+                     "each triangle-to-sprite pair should retain a pipeline drain");
+
+            const GsVulkanServiceStatistics service =
+                accelerated.vulkanRendererServiceStatistics();
+            t.Equals(service.triangleDrawsCompleted, 32ull,
+                     "the service should execute every strict triangle once");
+            t.Equals(service.spriteDrawsCompleted, 8ull,
+                     "the service should execute every pipeline-change sprite once");
+            t.IsTrue(service.residentTriangleBatchesCompleted > 0ull,
+                     "strict triangles should use the resident triangle service");
+            t.IsTrue(service.largestResidentTriangleBatch >= 2ull,
+                     "the explicit triangle pairs should share a resident batch");
+            t.IsTrue(service.pageUploadOperationsCompleted > 0ull,
+                     "strict transitions should upload CPU-newer pages");
+            t.IsTrue(service.pageDownloadOperationsCompleted > 0ull,
+                     "strict observations should publish GPU-newer pages");
+            t.Equals(service.fenceTimeouts, 0ull,
+                     "the bounded strict transition stream should not time out");
+            t.Equals(service.validationErrors, 0u,
+                     "strict triangle transitions should remain validation-clean");
+            t.Equals(service.validationWarnings, 0u,
+                     "strict triangle transitions should emit no validation warnings");
+        });
+
         tc.Run("Vulkan verify mismatch writes a complete bounded reproducer", [](TestCase &t)
         {
             GSMem::InitLookupTables();
