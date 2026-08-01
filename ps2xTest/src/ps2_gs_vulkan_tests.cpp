@@ -343,6 +343,49 @@ namespace
             flat.globalState());
     }
 
+    std::array<GsDrawCommand, 6> makeOrderedDepthCt32SpriteCommands(
+        uint64_t sequenceBase)
+    {
+        return {{
+            makeDepthCt32SpriteCommand(
+                sequenceBase, 40u, 1u, 200u,
+                GS_PSM_Z24, false, 1u,
+                {0u, 31u, 0u, 31u}, {0u, 0u},
+                17u, 17u, 257u, 257u,
+                0x10203040u, 0x00ABCDEFu),
+            makeDepthCt32SpriteCommand(
+                sequenceBase + 1u, 40u, 1u, 200u,
+                GS_PSM_Z24, false, 2u,
+                {0u, 31u, 0u, 31u}, {0u, 0u},
+                17u, 17u, 257u, 257u,
+                0x50607080u, 0x00BCDEF0u),
+            makeDepthCt32SpriteCommand(
+                sequenceBase + 2u, 41u, 1u, 201u,
+                GS_PSM_Z32, false, 1u,
+                {0u, 31u, 0u, 31u}, {0u, 0u},
+                17u, 17u, 257u, 257u,
+                0x90A0B0C0u, 0x7FFFF000u),
+            makeDepthCt32SpriteCommand(
+                sequenceBase + 3u, 41u, 1u, 201u,
+                GS_PSM_Z32, false, 3u,
+                {0u, 31u, 0u, 31u}, {0u, 0u},
+                17u, 17u, 257u, 257u,
+                0xD0E0F001u, 0x80000000u),
+            makeDepthCt32SpriteCommand(
+                sequenceBase + 4u, 201u, 1u, 202u,
+                GS_PSM_Z24, false, 1u,
+                {0u, 31u, 0u, 31u}, {0u, 0u},
+                17u, 17u, 257u, 257u,
+                0x12345678u, 0x00555555u),
+            makeDepthCt32SpriteCommand(
+                sequenceBase + 5u, 42u, 1u, 202u,
+                GS_PSM_Z24, true, 2u,
+                {0u, 31u, 0u, 31u}, {0u, 0u},
+                17u, 17u, 257u, 257u,
+                0x89ABCDEFu, 0x00555555u),
+        }};
+    }
+
     GsDrawCommand makeNearestCt32SpriteCommand(
         uint64_t sequence,
         uint32_t framebufferPage,
@@ -4226,8 +4269,8 @@ void register_ps2_gs_vulkan_tests()
 
             t.IsTrue(backend->setMode(GsRendererMode::GpuStrict),
                      "the synchronized Verify fixture should enter strict mode");
-            t.IsFalse(backend->classify(commands.front()).supported,
-                      "strict routing should remain closed in the Verify slice");
+            t.IsTrue(backend->classify(commands.front()).supported,
+                     "strict should expose the resident-qualified depth class");
             t.IsTrue(backend->setMode(GsRendererMode::Hybrid),
                      "the fixture should also enter Hybrid cleanly");
             t.IsFalse(backend->classify(commands.front()).supported,
@@ -4379,6 +4422,269 @@ void register_ps2_gs_vulkan_tests()
                      "the injected no-op depth result should stop Verify");
             t.IsTrue(mismatchVram == mismatchExpected,
                      "the software depth oracle should remain canonical on mismatch");
+        });
+
+        tc.Run("Vulkan strict backend keeps ordered depth CT32 sprites resident", [](TestCase &t)
+        {
+            GSMem::InitLookupTables();
+            const std::array<GsDrawCommand, 6> commands =
+                makeOrderedDepthCt32SpriteCommands(39'000u);
+            std::array<GsVulkanDepthCt32Sprite, 6> prepared{};
+            for (size_t index = 0u; index < commands.size(); ++index)
+            {
+                t.IsTrue(
+                    prepareGsVulkanDepthCt32Sprite(
+                        commands[index], prepared[index]).supported,
+                    "the strict depth fixture should satisfy its narrow predicate");
+            }
+
+            const std::vector<uint8_t> initial =
+                makeVramPattern(0x44535431u);
+            std::vector<uint8_t> expected = initial;
+            uint64_t expectedPixels = 0u;
+            for (const GsVulkanDepthCt32Sprite &sprite : prepared)
+            {
+                applyDepthCt32SpriteCpu(expected, sprite);
+                expectedPixels +=
+                    static_cast<uint64_t>(
+                        sprite.boundsX1 - sprite.boundsX0) *
+                    static_cast<uint64_t>(
+                        sprite.boundsY1 - sprite.boundsY0);
+            }
+
+            std::vector<uint8_t> vram = initial;
+            uint64_t softwareCalls = 0u;
+            uint64_t commitCalls = 0u;
+            GsVulkanRasterBackendConfig config{};
+            config.mode = GsRendererMode::GpuStrict;
+            std::unique_ptr<GsVulkanRasterBackend> backend =
+                GsVulkanRasterBackend::createWithExecutor(
+                    std::make_unique<FakeCt32Executor>(
+                        FakeCt32Executor::Behavior::Exact),
+                    config, vram,
+                    [&](const GsDrawCommand &)
+                    {
+                        ++softwareCalls;
+                    },
+                    [&](const GsDrawCommand &)
+                    {
+                        ++commitCalls;
+                    },
+                    nullptr);
+            t.IsNotNull(backend.get(),
+                        "an exact depth executor should create strict mode");
+            if (!backend)
+                return;
+
+            const GsBackendDecision firstDecision =
+                backend->classify(commands.front());
+            t.IsTrue(firstDecision.supported,
+                     "strict should expose the capability-gated depth class");
+            if (!firstDecision.supported)
+                return;
+            for (const GsDrawCommand &command :
+                 std::span<const GsDrawCommand>(commands).subspan(1u))
+            {
+                t.IsTrue(backend->classify(command).supported,
+                         "strict should accept every ordered depth record");
+            }
+
+            backend->submit(commands);
+            t.IsTrue(vram == initial,
+                     "queued strict depth draws should not mutate canonical VRAM");
+            t.Equals(softwareCalls, 0ull,
+                     "strict depth execution must not call the software oracle");
+            t.Equals(commitCalls, 0ull,
+                     "pending strict depth draws must not publish commit metadata");
+            t.Equals(backend->pendingCommandCount(), commands.size(),
+                     "dependent and disjoint depth draws should share one ordered queue");
+
+            GsVramPageMask allPages;
+            allPages.setAll();
+            backend->prepareCpuVramAccess(
+                allPages, GsFlushReason::CpuReadback);
+            t.IsTrue(vram == expected,
+                     "strict depth observation should publish the exact resident result");
+            t.Equals(softwareCalls, 0ull,
+                     "strict depth publication must not invoke software fallback");
+            t.Equals(
+                commitCalls,
+                static_cast<uint64_t>(commands.size()),
+                "draining strict depth work should publish every commit");
+            t.Equals(backend->pendingCommandCount(), size_t{0u},
+                     "the observation boundary should drain resident depth work");
+
+            const GsVulkanRasterBackendStatistics firstStatistics =
+                backend->backendStatistics();
+            t.Equals(
+                firstStatistics.commandsCompleted,
+                static_cast<uint64_t>(commands.size()),
+                "strict should complete every ordered depth draw");
+            t.Equals(
+                firstStatistics.committedGpuCommands,
+                static_cast<uint64_t>(commands.size()),
+                "strict should commit every ordered depth result");
+            t.Equals(
+                firstStatistics.residentCommands,
+                static_cast<uint64_t>(commands.size()),
+                "strict should count every resident depth draw");
+            t.Equals(firstStatistics.residentBatchesCompleted, 1ull,
+                     "overlapping depth draws should share one backend batch");
+            t.Equals(firstStatistics.resourceHazardDrains, 0ull,
+                     "the ordered depth service should absorb resource dependencies");
+            t.Equals(
+                firstStatistics.largestResidentBatch,
+                static_cast<uint64_t>(commands.size()),
+                "the backend should retain the ordered depth batch size");
+            const GsVulkanServiceStatistics firstServiceStatistics =
+                backend->serviceStatistics();
+            t.Equals(
+                firstServiceStatistics.depthCt32SpriteDrawsCompleted,
+                static_cast<uint64_t>(commands.size()),
+                "the resident executor should complete every depth draw");
+            t.Equals(
+                firstServiceStatistics.depthCt32SpritePixelsExecuted,
+                expectedPixels,
+                "the resident executor should retain depth pixel accounting");
+            t.Equals(
+                firstServiceStatistics
+                    .residentDepthCt32SpriteBatchesCompleted,
+                1ull,
+                "strict should execute one resident depth service batch");
+            t.Equals(
+                firstServiceStatistics
+                    .largestResidentDepthCt32SpriteBatch,
+                static_cast<uint64_t>(commands.size()),
+                "the service should retain the ordered depth batch size");
+
+            const GsDrawCommand flat = makeCt32SpriteCommand(
+                39'010u, 43u, 1u,
+                {0u, 31u, 0u, 31u}, {0u, 0u},
+                17u, 17u, 257u, 257u, 0x0BADF00Du);
+            GsVulkanCt32Sprite flatPrepared{};
+            t.IsTrue(prepareGsVulkanCt32Sprite(
+                         flat, flatPrepared).supported,
+                     "the mixed-pipeline fixture should retain one flat draw");
+            std::vector<uint8_t> mixedExpected = expected;
+            applyDepthCt32SpriteCpu(mixedExpected, prepared[0]);
+            applyCt32SpriteCpu(mixedExpected, flatPrepared);
+            applyDepthCt32SpriteCpu(mixedExpected, prepared[2]);
+
+            backend->submit(std::span<const GsDrawCommand>(
+                &commands[0], 1u));
+            backend->submit(std::span<const GsDrawCommand>(&flat, 1u));
+            backend->submit(std::span<const GsDrawCommand>(
+                &commands[2], 1u));
+            t.Equals(backend->pendingCommandCount(), size_t{1u},
+                     "depth-flat-depth transitions should leave the final draw pending");
+            backend->prepareCpuVramAccess(
+                allPages, GsFlushReason::DebuggerObservation);
+            t.IsTrue(vram == mixedExpected,
+                     "mixed strict pipeline transitions should preserve guest order");
+            t.Equals(commitCalls, 9ull,
+                     "mixed pipeline drains should publish each commit once");
+
+            const GsVulkanRasterBackendStatistics mixedStatistics =
+                backend->backendStatistics();
+            t.Equals(mixedStatistics.commandsCompleted, 9ull,
+                     "the strict backend should complete both depth groups and flat draw");
+            t.Equals(mixedStatistics.residentBatchesCompleted, 4ull,
+                     "the initial depth batch and three mixed groups should complete");
+            t.Equals(mixedStatistics.pipelineChangeDrains, 2ull,
+                     "depth-flat-depth should cross two pipeline boundaries");
+            t.Equals(mixedStatistics.coherency.rejectedTransitions, 0ull,
+                     "strict depth routing should preserve page ownership");
+            t.Equals(mixedStatistics.pageOwnership.gpuNewerPages, size_t{0u},
+                     "debug observation should publish every resident depth writer");
+            const GsVulkanServiceStatistics mixedServiceStatistics =
+                backend->serviceStatistics();
+            t.Equals(mixedServiceStatistics.depthCt32SpriteDrawsCompleted,
+                     8ull,
+                     "the service should execute both follow-up depth draws");
+            t.Equals(
+                mixedServiceStatistics
+                    .residentDepthCt32SpriteBatchesCompleted,
+                3ull,
+                "the service should retain three resident depth batches");
+            t.Equals(mixedServiceStatistics.spriteDrawsCompleted, 1ull,
+                     "the mixed transition should execute one flat sprite");
+
+            t.IsTrue(backend->setMode(GsRendererMode::Hybrid),
+                     "a synchronized strict depth backend should enter Hybrid");
+            t.IsFalse(backend->classify(commands.front()).supported,
+                      "Hybrid should remain closed before depth measurement");
+
+            std::vector<uint8_t> unavailableVram = initial;
+            std::unique_ptr<GsVulkanRasterBackend> unavailable =
+                GsVulkanRasterBackend::createWithExecutor(
+                    std::make_unique<FakeCt32Executor>(
+                        FakeCt32Executor::Behavior::Exact,
+                        true, true, true, false),
+                    config, unavailableVram,
+                    [](const GsDrawCommand &) {}, {}, nullptr);
+            t.IsNotNull(unavailable.get(),
+                        "a base-capable executor should retain strict depth fallback");
+            if (unavailable)
+            {
+                t.Equals(unavailable->classify(commands.front()).reason,
+                         GsFallbackReason::BackendUnavailable,
+                         "missing depth capability should reject before queueing");
+                t.Equals(unavailable->pendingCommandCount(), size_t{0u},
+                         "capability fallback must not retain depth work");
+                t.Equals(
+                    unavailable->serviceStatistics()
+                        .residentDepthCt32SpriteBatchesFailed,
+                    0ull,
+                    "capability fallback must not post a resident depth batch");
+            }
+
+            std::vector<uint8_t> failureVram = initial;
+            uint64_t failedSoftwareCalls = 0u;
+            std::unique_ptr<GsVulkanRasterBackend> failing =
+                GsVulkanRasterBackend::createWithExecutor(
+                    std::make_unique<FakeCt32Executor>(
+                        FakeCt32Executor::Behavior::FailResidentDraw),
+                    config, failureVram,
+                    [&](const GsDrawCommand &)
+                    {
+                        ++failedSoftwareCalls;
+                    },
+                    {}, nullptr);
+            t.IsNotNull(failing.get(),
+                        "an initially healthy failing depth executor should construct");
+            bool executionThrew = false;
+            if (failing)
+            {
+                failing->submit(std::span<const GsDrawCommand>(
+                    &commands.front(), 1u));
+                t.Equals(failing->pendingCommandCount(), size_t{1u},
+                         "a failing strict depth draw should first enter the queue");
+                try
+                {
+                    failing->flush(GsFlushReason::Explicit);
+                }
+                catch (const std::runtime_error &error)
+                {
+                    executionThrew =
+                        std::string(error.what()).find(
+                            "before canonical VRAM mutation") !=
+                        std::string::npos;
+                }
+                t.Equals(failing->backendStatistics().gpuRequestsFailed,
+                         1ull,
+                         "resident depth execution failure should be counted once");
+                t.Equals(
+                    failing->serviceStatistics()
+                        .residentDepthCt32SpriteBatchesFailed,
+                    1ull,
+                    "the deferred depth failure should count one resident batch");
+            }
+            t.IsTrue(executionThrew,
+                     "strict depth failure should identify its atomic boundary");
+            t.IsTrue(failureVram == initial,
+                     "strict depth failure must preserve canonical VRAM");
+            t.Equals(failedSoftwareCalls, 0ull,
+                     "strict depth failure must not invoke software fallback");
         });
 
         tc.Run("Vulkan strict backend keeps linear CT32 textures resident", [](TestCase &t)
@@ -12343,38 +12649,8 @@ void register_ps2_gs_vulkan_tests()
             if (!service)
                 return;
 
-            const std::array<GsDrawCommand, 6> commands{{
-                makeDepthCt32SpriteCommand(
-                    38'000u, 40u, 1u, 200u, GS_PSM_Z24, false, 1u,
-                    {0u, 31u, 0u, 31u}, {0u, 0u},
-                    17u, 17u, 257u, 257u,
-                    0x10203040u, 0x00ABCDEFu),
-                makeDepthCt32SpriteCommand(
-                    38'001u, 40u, 1u, 200u, GS_PSM_Z24, false, 2u,
-                    {0u, 31u, 0u, 31u}, {0u, 0u},
-                    17u, 17u, 257u, 257u,
-                    0x50607080u, 0x00BCDEF0u),
-                makeDepthCt32SpriteCommand(
-                    38'002u, 41u, 1u, 201u, GS_PSM_Z32, false, 1u,
-                    {0u, 31u, 0u, 31u}, {0u, 0u},
-                    17u, 17u, 257u, 257u,
-                    0x90A0B0C0u, 0x7FFFF000u),
-                makeDepthCt32SpriteCommand(
-                    38'003u, 41u, 1u, 201u, GS_PSM_Z32, false, 3u,
-                    {0u, 31u, 0u, 31u}, {0u, 0u},
-                    17u, 17u, 257u, 257u,
-                    0xD0E0F001u, 0x80000000u),
-                makeDepthCt32SpriteCommand(
-                    38'004u, 201u, 1u, 202u, GS_PSM_Z24, false, 1u,
-                    {0u, 31u, 0u, 31u}, {0u, 0u},
-                    17u, 17u, 257u, 257u,
-                    0x12345678u, 0x00555555u),
-                makeDepthCt32SpriteCommand(
-                    38'005u, 42u, 1u, 202u, GS_PSM_Z24, true, 2u,
-                    {0u, 31u, 0u, 31u}, {0u, 0u},
-                    17u, 17u, 257u, 257u,
-                    0x89ABCDEFu, 0x00555555u),
-            }};
+            const std::array<GsDrawCommand, 6> commands =
+                makeOrderedDepthCt32SpriteCommands(38'000u);
             std::vector<GsVulkanDepthCt32Sprite> sprites;
             for (const GsDrawCommand &command : commands)
             {

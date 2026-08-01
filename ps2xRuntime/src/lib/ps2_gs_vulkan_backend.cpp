@@ -541,6 +541,7 @@ struct GsVulkanRasterBackend::Impl final
     enum class ResidentPipeline : uint8_t
     {
         Ct32Sprite,
+        DepthCt32Sprite,
         NearestCt32Sprite,
         LinearCt32Sprite,
         Ct32Triangle,
@@ -550,6 +551,7 @@ struct GsVulkanRasterBackend::Impl final
     {
         GsDrawCommand command;
         GsVulkanCt32Sprite sprite;
+        GsVulkanDepthCt32Sprite depthCt32Sprite;
         GsVulkanNearestCt32Sprite nearestCt32Sprite;
         GsVulkanLinearCt32Sprite linearCt32Sprite;
         GsVulkanCt32Triangle triangle;
@@ -654,11 +656,14 @@ struct GsVulkanRasterBackend::Impl final
         const ResidentPipeline pipeline =
             pendingResidentCommands.front().pipeline;
         std::vector<GsVulkanCt32Sprite> sprites;
+        std::vector<GsVulkanDepthCt32Sprite> depthCt32Sprites;
         std::vector<GsVulkanNearestCt32Sprite> nearestCt32Sprites;
         std::vector<GsVulkanLinearCt32Sprite> linearCt32Sprites;
         std::vector<GsVulkanCt32Triangle> triangles;
         if (pipeline == ResidentPipeline::Ct32Triangle)
             triangles.reserve(commandCount);
+        else if (pipeline == ResidentPipeline::DepthCt32Sprite)
+            depthCt32Sprites.reserve(commandCount);
         else if (pipeline == ResidentPipeline::LinearCt32Sprite)
             linearCt32Sprites.reserve(commandCount);
         else if (pipeline == ResidentPipeline::NearestCt32Sprite)
@@ -677,6 +682,9 @@ struct GsVulkanRasterBackend::Impl final
             }
             if (pipeline == ResidentPipeline::Ct32Triangle)
                 triangles.push_back(pending.triangle);
+            else if (pipeline == ResidentPipeline::DepthCt32Sprite)
+                depthCt32Sprites.push_back(
+                    pending.depthCt32Sprite);
             else if (pipeline == ResidentPipeline::LinearCt32Sprite)
                 linearCt32Sprites.push_back(
                     pending.linearCt32Sprite);
@@ -688,7 +696,9 @@ struct GsVulkanRasterBackend::Impl final
         }
 
         const char *batchName = "resident CT32 sprite batch";
-        if (pipeline == ResidentPipeline::NearestCt32Sprite)
+        if (pipeline == ResidentPipeline::DepthCt32Sprite)
+            batchName = "resident depth CT32 sprite batch";
+        else if (pipeline == ResidentPipeline::NearestCt32Sprite)
             batchName = "resident nearest CT32 sprite batch";
         else if (pipeline == ResidentPipeline::LinearCt32Sprite)
             batchName = "resident linear CT32 sprite batch";
@@ -716,6 +726,11 @@ struct GsVulkanRasterBackend::Impl final
         {
             executed = executor->executeResidentCt32Triangles(
                 triangles, &executionError);
+        }
+        else if (pipeline == ResidentPipeline::DepthCt32Sprite)
+        {
+            executed = executor->executeResidentDepthCt32Sprites(
+                depthCt32Sprites, &executionError);
         }
         else if (pipeline == ResidentPipeline::NearestCt32Sprite)
         {
@@ -918,11 +933,12 @@ GsBackendDecision GsVulkanRasterBackend::classify(
         return decision;
     }
 
-    // Qualify depth through full-image Verify before opening any resident or
-    // cost-selected production path.
+    // Depth is exact through full-image Verify and ordered resident execution.
+    // Keep Hybrid closed until its production cost is measured independently.
     if (command.primitive().type == GS_PRIM_SPRITE &&
         !command.primitive().tme &&
-        m_impl->config.mode == GsRendererMode::Verify)
+        (m_impl->config.mode == GsRendererMode::Verify ||
+         m_impl->config.mode == GsRendererMode::GpuStrict))
     {
         GsVulkanDepthCt32Sprite depthSprite{};
         const GsBackendDecision depthDecision =
@@ -1241,6 +1257,8 @@ void GsVulkanRasterBackend::submit(
                 Impl::ResidentPipeline::Ct32Sprite;
             if (isTriangle)
                 pipeline = Impl::ResidentPipeline::Ct32Triangle;
+            else if (isDepthSprite)
+                pipeline = Impl::ResidentPipeline::DepthCt32Sprite;
             else if (isLinearTexturedSprite)
                 pipeline = Impl::ResidentPipeline::LinearCt32Sprite;
             else if (isTexturedSprite)
@@ -1260,7 +1278,8 @@ void GsVulkanRasterBackend::submit(
                 m_impl->pendingResidentReadPages.intersects(
                     resources.writePages);
             const bool ordersDependenciesInBatch =
-                pipeline == Impl::ResidentPipeline::LinearCt32Sprite;
+                pipeline == Impl::ResidentPipeline::LinearCt32Sprite ||
+                pipeline == Impl::ResidentPipeline::DepthCt32Sprite;
             if (hasDependency && !ordersDependenciesInBatch)
             {
                 m_impl->drainPendingResidentCommands(
@@ -1274,8 +1293,8 @@ void GsVulkanRasterBackend::submit(
             }
 
             m_impl->pendingResidentCommands.push_back(
-                {command, sprite, texturedSprite, linearTexturedSprite,
-                 triangle,
+                {command, sprite, depthSprite, texturedSprite,
+                 linearTexturedSprite, triangle,
                  resources, pipeline});
             m_impl->pendingResidentReadPages.unionWith(
                 resources.readPages);
