@@ -119,7 +119,7 @@ class GS
 
 public:
     GS();
-    ~GS() = default;
+    ~GS();
 
     void init(uint8_t *vram, uint32_t vramSize, struct GSRegisters *privRegs = nullptr);
     void reset();
@@ -170,6 +170,11 @@ public:
     bool clearActiveFramebuffer(uint32_t rgba);
     uint64_t nativeImageUploadCount() const { return m_nativeImageUploadCount; }
     uint64_t nativePackedGIFPacketCount() const { return m_nativePackedGIFPacketCount; }
+    [[nodiscard]] bool setRendererMode(GsRendererMode mode);
+    [[nodiscard]] GsRendererMode rendererMode() const;
+    void setBackendCountersEnabled(bool enabled);
+    [[nodiscard]] GsBackendCounters backendCounters() const;
+    void resetBackendCounters();
 
     uint32_t consumeLocalToHostBytes(uint8_t *dst, uint32_t maxBytes);
 
@@ -190,6 +195,7 @@ private:
     void vertexKick(bool drawing);
     void latchHostPresentationFrameUnlocked();
     uint64_t currentVSyncTickUnlocked() const;
+    void flushForObservation(GsFlushReason reason) const;
 
     void recordDebugEventUnlocked(GSDebugHistoryEntry entry);
     GSDebugHistoryEntry makeDebugEventUnlocked(GSDebugEventKind kind) const;

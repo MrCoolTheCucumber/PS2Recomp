@@ -667,6 +667,187 @@ void register_ps2_gs_tests()
                      "initial subset should name depth comparisons precisely");
         });
 
+        tc.Run("GS backend router classifies before mutation and records synchronized fallback", [](TestCase &t)
+        {
+            class RecordingBackend final : public IGsRasterBackend
+            {
+            public:
+                GsBackendDecision decision{
+                    true, GsFallbackReason::Supported};
+                std::vector<uint64_t> sequences;
+                std::vector<GsFlushReason> flushReasons;
+                size_t pending = 0u;
+
+                [[nodiscard]] GsBackendDecision classify(
+                    const GsDrawCommand &) const override
+                {
+                    return decision;
+                }
+
+                void submit(
+                    std::span<const GsDrawCommand> commands) override
+                {
+                    for (const GsDrawCommand &command : commands)
+                        sequences.push_back(command.sequence());
+                    pending += commands.size();
+                }
+
+                void flush(GsFlushReason reason) override
+                {
+                    flushReasons.push_back(reason);
+                    pending = 0u;
+                }
+
+                [[nodiscard]] size_t pendingCommandCount()
+                    const noexcept override
+                {
+                    return pending;
+                }
+            } software, accelerated;
+
+            GSContext context{};
+            context.frame.fbw = 1u;
+            context.frame.psm = GS_PSM_CT32;
+            context.scissor = {0u, 15u, 0u, 15u};
+            GSPrimReg primitive{};
+            primitive.type = GS_PRIM_SPRITE;
+            std::array<GSVertex, 2> vertices{};
+            vertices[1].x12_4 = 16u * 16u;
+            vertices[1].y12_4 = 16u * 16u;
+            const GsDrawCommand command = buildGsDrawCommand(
+                7u,
+                primitive,
+                context,
+                std::span<const GSVertex>(vertices),
+                GsDrawGlobalState{});
+
+            GsBackendRouter router(software);
+            t.IsFalse(router.setMode(GsRendererMode::Hybrid),
+                      "accelerated modes should not be selectable without a backend");
+            t.Equals(router.mode(), GsRendererMode::Software,
+                     "failed selection should retain the synchronized software mode");
+
+            router.setCountersEnabled(true);
+            const GsSubmissionResult direct = router.submit(command);
+            t.IsTrue(direct.submitted && direct.usedSoftware,
+                     "software mode should submit through the permanent adapter");
+            t.Equals(software.sequences.size(), static_cast<size_t>(1u),
+                     "software adapter should receive the command once");
+            t.Equals(router.counters().queueHighWatermark, 1ull,
+                     "router should expose backend queue high-water state");
+
+            router.setAcceleratedBackend(&accelerated);
+            t.IsTrue(router.setMode(GsRendererMode::Hybrid),
+                     "hybrid mode should become selectable after backend attachment");
+            accelerated.decision = {
+                false, GsFallbackReason::Textured};
+            const GsSubmissionResult fallback = router.submit(command);
+            t.IsTrue(fallback.submitted && fallback.usedSoftware,
+                     "hybrid rejection should fall back before accelerated submission");
+            t.Equals(accelerated.sequences.size(), static_cast<size_t>(0u),
+                     "unsupported command must not partially reach the accelerated backend");
+            t.Equals(router.counters().fallbackCommands, 1ull,
+                     "fallback should be represented in structured counters");
+            t.Equals(
+                router.counters().decisions[
+                    static_cast<size_t>(GsFallbackReason::Textured)],
+                1ull,
+                "the classifier's single reason should be counted");
+
+            accelerated.decision = {
+                true, GsFallbackReason::Supported};
+            const GsSubmissionResult acceleratedResult =
+                router.submit(command);
+            t.IsTrue(
+                acceleratedResult.submitted &&
+                    acceleratedResult.usedAccelerated,
+                "supported hybrid command should route to the accelerated backend");
+            t.Equals(accelerated.sequences.size(), static_cast<size_t>(1u),
+                     "accelerated backend should receive a supported command once");
+            t.IsTrue(!software.flushReasons.empty() &&
+                         software.flushReasons.back() ==
+                             GsFlushReason::BackendSwitch,
+                     "switching away from queued software work should synchronize it first");
+
+            t.IsTrue(router.setMode(GsRendererMode::GpuStrict),
+                     "strict mode should be selectable with an accelerated backend");
+            accelerated.decision = {
+                false, GsFallbackReason::AlphaBlend};
+            const size_t softwareBefore = software.sequences.size();
+            const size_t acceleratedBefore = accelerated.sequences.size();
+            const GsSubmissionResult strict = router.submit(command);
+            t.IsFalse(strict.submitted,
+                      "strict mode should fail the first unsupported command");
+            t.Equals(software.sequences.size(), softwareBefore,
+                     "strict rejection must not silently fall back to software");
+            t.Equals(accelerated.sequences.size(), acceleratedBefore,
+                     "strict rejection must occur before accelerated mutation");
+            t.Equals(router.counters().strictFailures, 1ull,
+                     "strict failures should be explicit in counters");
+
+            t.IsTrue(router.setMode(GsRendererMode::Verify),
+                     "verify mode should share the synchronized accelerated slot");
+            accelerated.decision = {
+                true, GsFallbackReason::Supported};
+            const GsSubmissionResult verified = router.submit(command);
+            t.IsTrue(verified.submitted && verified.usedAccelerated,
+                     "verification backend should receive supported work");
+            t.Equals(router.counters().verifiedCommands, 1ull,
+                     "verify submissions should be counted separately");
+        });
+
+        tc.Run("GS frontend routes draws and visibility boundaries through the software backend", [](TestCase &t)
+        {
+            std::vector<uint8_t> vram(PS2_GS_VRAM_SIZE, 0u);
+            GS gs;
+            gs.init(
+                vram.data(),
+                static_cast<uint32_t>(vram.size()),
+                nullptr);
+
+            t.Equals(gs.rendererMode(), GsRendererMode::Software,
+                     "software should remain the permanent default mode");
+            t.IsFalse(gs.setRendererMode(GsRendererMode::Hybrid),
+                      "missing accelerated backend should fail selection cleanly");
+
+            gs.setBackendCountersEnabled(true);
+            gs.writeRegister(GS_REG_FRAME_1, 1ull << 16u);
+            gs.writeRegister(GS_REG_ZBUF_1, 1ull << 32u);
+            gs.writeRegister(GS_REG_SCISSOR_1, 0ull);
+            gs.writeRegister(GS_REG_TEST_1, 0x30000ull);
+            gs.writeRegister(
+                GS_REG_PRIM,
+                static_cast<uint64_t>(GS_PRIM_POINT));
+            gs.writeRegister(GS_REG_RGBAQ, 0x80112233ull);
+            gs.writeRegister(GS_REG_XYZ2, 0ull);
+
+            const GsBackendCounters drawCounters =
+                gs.backendCounters();
+            t.Equals(drawCounters.commands, 1ull,
+                     "frontend should submit each assembled draw to the router");
+            t.Equals(drawCounters.softwareCommands, 1ull,
+                     "default routing should reach the software adapter once");
+
+            gs.writeRegister(GS_REG_FINISH, 0ull);
+            const GsBackendCounters finishCounters =
+                gs.backendCounters();
+            t.Equals(
+                finishCounters.flushReasons[
+                    static_cast<size_t>(GsFlushReason::Finish)],
+                1ull,
+                "FINISH visibility should carry a structured flush reason");
+
+            (void)gs.getDebugSnapshot();
+            const GsBackendCounters debugCounters =
+                gs.backendCounters();
+            t.Equals(
+                debugCounters.flushReasons[
+                    static_cast<size_t>(
+                        GsFlushReason::DebuggerObservation)],
+                1ull,
+                "debugger state observation should be an explicit synchronization boundary");
+        });
+
         tc.Run("GS CSR/IMR support coherent 64-bit and 32-bit access", [](TestCase &t)
         {
             PS2Memory mem;

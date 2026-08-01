@@ -1,6 +1,8 @@
 #ifndef PS2_GS_RASTERIZER_H
 #define PS2_GS_RASTERIZER_H
 
+#include "runtime/ps2_gs_backend.h"
+
 #include <array>
 #include <cstddef>
 #include <cstdint>
@@ -8,21 +10,27 @@
 #include <vector>
 
 class GS;
-class GsDrawCommand;
 
 class GSRasterizer
 {
 public:
-    GSRasterizer();
+    explicit GSRasterizer(GS *owner = nullptr);
     ~GSRasterizer();
 
     GSRasterizer(const GSRasterizer &) = delete;
     GSRasterizer &operator=(const GSRasterizer &) = delete;
 
     bool beginDrawBatch(GS *gs);
-    void flushDrawBatch(GS *gs);
+    void flushDrawBatch(
+        GS *gs,
+        GsFlushReason reason = GsFlushReason::Explicit);
     void endDrawBatch(GS *gs);
     void drawPrimitive(GS *gs);
+    [[nodiscard]] bool setRendererMode(GsRendererMode mode);
+    [[nodiscard]] GsRendererMode rendererMode() const noexcept;
+    void setBackendCountersEnabled(bool enabled) noexcept;
+    [[nodiscard]] GsBackendCounters backendCounters() const noexcept;
+    void resetBackendCounters() noexcept;
     void writePixel(GS *gs,
                     int x,
                     int y,
@@ -39,6 +47,7 @@ public:
 
 private:
     struct ParallelState;
+    struct BackendState;
     class DebugProgressScope
     {
     public:
@@ -53,6 +62,9 @@ private:
     };
 
     bool tryQueuePrimitive(GS *gs, const GsDrawCommand &command);
+    void submitSoftwareCommand(GS *gs, const GsDrawCommand &command);
+    void flushSoftwareDrawBatch(GS *gs);
+    [[nodiscard]] size_t softwarePendingCommandCount() const noexcept;
     void renderSoftwarePrimitive(GS *gs, const GsDrawCommand &command);
     void beginDebugProgress(GS *owner);
     void endDebugProgress();
@@ -96,7 +108,9 @@ private:
     int32_t m_queuedFixedX[3]{};
     int32_t m_queuedFixedY[3]{};
     bool m_queuedFixedVerticesValid = false;
+    GS *m_owner = nullptr;
     std::unique_ptr<ParallelState> m_parallelState;
+    std::unique_ptr<BackendState> m_backendState;
     uint32_t m_scanlineWorkerIndex = 0u;
     uint32_t m_scanlineWorkerCount = 1u;
     GS *m_debugProgressOwner = nullptr;

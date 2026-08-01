@@ -684,11 +684,215 @@ GsBackendDecision classifyGsInitialCt32Sprite(
     return {true, GsFallbackReason::Supported};
 }
 
+GsBackendRouter::GsBackendRouter(
+    IGsRasterBackend &softwareBackend) noexcept
+    : m_softwareBackend(&softwareBackend)
+{
+}
+
+void GsBackendRouter::setAcceleratedBackend(
+    IGsRasterBackend *backend)
+{
+    if (m_acceleratedBackend == backend)
+        return;
+
+    flush(GsFlushReason::BackendSwitch);
+    m_acceleratedBackend = backend;
+    if (!m_acceleratedBackend && m_mode != GsRendererMode::Software)
+        m_mode = GsRendererMode::Software;
+}
+
+bool GsBackendRouter::setMode(GsRendererMode mode)
+{
+    if (m_mode == mode)
+        return true;
+    if (mode != GsRendererMode::Software && !m_acceleratedBackend)
+        return false;
+
+    flush(GsFlushReason::BackendSwitch);
+    m_mode = mode;
+    return true;
+}
+
+GsRendererMode GsBackendRouter::mode() const noexcept
+{
+    return m_mode;
+}
+
+bool GsBackendRouter::hasAcceleratedBackend() const noexcept
+{
+    return m_acceleratedBackend != nullptr;
+}
+
+GsSubmissionResult GsBackendRouter::submit(
+    const GsDrawCommand &command)
+{
+    if (m_countersEnabled)
+        ++m_counters.commands;
+
+    if (m_mode == GsRendererMode::Software)
+    {
+        transitionTo(ActiveBackend::Software);
+        m_softwareBackend->submit(
+            std::span<const GsDrawCommand>(&command, 1u));
+        m_activeBackend = ActiveBackend::Software;
+        if (m_countersEnabled)
+        {
+            ++m_counters.softwareCommands;
+            recordDecision(GsFallbackReason::Supported);
+            updateQueueDepth(*m_softwareBackend);
+        }
+        return {
+            true,
+            true,
+            false,
+            {true, GsFallbackReason::Supported}};
+    }
+
+    const GsBackendDecision decision =
+        m_acceleratedBackend
+            ? m_acceleratedBackend->classify(command)
+            : GsBackendDecision{
+                  false, GsFallbackReason::BackendUnavailable};
+    if (m_countersEnabled)
+        recordDecision(decision.reason);
+
+    if (decision.supported)
+    {
+        transitionTo(ActiveBackend::Accelerated);
+        m_acceleratedBackend->submit(
+            std::span<const GsDrawCommand>(&command, 1u));
+        m_activeBackend = ActiveBackend::Accelerated;
+        if (m_countersEnabled)
+        {
+            ++m_counters.acceleratedCommands;
+            if (m_mode == GsRendererMode::Verify)
+                ++m_counters.verifiedCommands;
+            updateQueueDepth(*m_acceleratedBackend);
+        }
+        return {true, false, true, decision};
+    }
+
+    if (m_mode == GsRendererMode::GpuStrict)
+    {
+        if (m_countersEnabled)
+            ++m_counters.strictFailures;
+        return {false, false, false, decision};
+    }
+
+    transitionTo(ActiveBackend::Software);
+    m_softwareBackend->submit(
+        std::span<const GsDrawCommand>(&command, 1u));
+    m_activeBackend = ActiveBackend::Software;
+    if (m_countersEnabled)
+    {
+        ++m_counters.softwareCommands;
+        ++m_counters.fallbackCommands;
+        updateQueueDepth(*m_softwareBackend);
+    }
+    return {true, true, false, decision};
+}
+
+void GsBackendRouter::flush(GsFlushReason reason)
+{
+    switch (m_activeBackend)
+    {
+    case ActiveBackend::Software:
+        m_softwareBackend->flush(reason);
+        break;
+    case ActiveBackend::Accelerated:
+        if (m_acceleratedBackend)
+            m_acceleratedBackend->flush(reason);
+        break;
+    case ActiveBackend::None:
+        break;
+    }
+
+    m_activeBackend = ActiveBackend::None;
+    if (m_countersEnabled)
+    {
+        m_counters.queueDepth = 0u;
+        recordFlush(reason);
+    }
+}
+
+void GsBackendRouter::setCountersEnabled(bool enabled) noexcept
+{
+    m_countersEnabled = enabled;
+}
+
+bool GsBackendRouter::countersEnabled() const noexcept
+{
+    return m_countersEnabled;
+}
+
+const GsBackendCounters &GsBackendRouter::counters() const noexcept
+{
+    return m_counters;
+}
+
+void GsBackendRouter::resetCounters() noexcept
+{
+    m_counters = {};
+}
+
+void GsBackendRouter::transitionTo(ActiveBackend backend)
+{
+    if (m_activeBackend == ActiveBackend::None ||
+        m_activeBackend == backend)
+    {
+        m_activeBackend = backend;
+        return;
+    }
+
+    if (m_activeBackend == ActiveBackend::Software)
+    {
+        m_softwareBackend->flush(GsFlushReason::BackendSwitch);
+    }
+    else if (m_acceleratedBackend)
+    {
+        m_acceleratedBackend->flush(GsFlushReason::BackendSwitch);
+    }
+    m_activeBackend = backend;
+    if (m_countersEnabled)
+    {
+        ++m_counters.backendSwitches;
+        m_counters.queueDepth = 0u;
+        recordFlush(GsFlushReason::BackendSwitch);
+    }
+}
+
+void GsBackendRouter::recordDecision(
+    GsFallbackReason reason) noexcept
+{
+    const size_t index = static_cast<size_t>(reason);
+    if (index < m_counters.decisions.size())
+        ++m_counters.decisions[index];
+}
+
+void GsBackendRouter::recordFlush(GsFlushReason reason) noexcept
+{
+    ++m_counters.flushes;
+    const size_t index = static_cast<size_t>(reason);
+    if (index < m_counters.flushReasons.size())
+        ++m_counters.flushReasons[index];
+}
+
+void GsBackendRouter::updateQueueDepth(
+    const IGsRasterBackend &backend) noexcept
+{
+    m_counters.queueDepth = backend.pendingCommandCount();
+    m_counters.queueHighWatermark = std::max(
+        m_counters.queueHighWatermark,
+        m_counters.queueDepth);
+}
+
 std::string_view gsFallbackReasonName(GsFallbackReason reason) noexcept
 {
     switch (reason)
     {
     case GsFallbackReason::Supported: return "supported";
+    case GsFallbackReason::BackendUnavailable: return "backend-unavailable";
     case GsFallbackReason::EmptyBounds: return "empty-bounds";
     case GsFallbackReason::InexactBounds: return "inexact-bounds";
     case GsFallbackReason::UnsupportedPrimitive: return "unsupported-primitive";
@@ -709,6 +913,42 @@ std::string_view gsFallbackReasonName(GsFallbackReason reason) noexcept
     case GsFallbackReason::DestinationRead: return "destination-read";
     case GsFallbackReason::ResourceAlias: return "resource-alias";
     case GsFallbackReason::UnknownMemoryLayout: return "unknown-memory-layout";
+    case GsFallbackReason::Count: break;
+    }
+    return "unknown";
+}
+
+std::string_view gsFlushReasonName(GsFlushReason reason) noexcept
+{
+    switch (reason)
+    {
+    case GsFlushReason::Explicit: return "explicit";
+    case GsFlushReason::Transfer: return "transfer";
+    case GsFlushReason::CpuReadback: return "cpu-readback";
+    case GsFlushReason::FeedbackSnapshot: return "feedback-snapshot";
+    case GsFlushReason::ClutHazard: return "clut-hazard";
+    case GsFlushReason::Finish: return "finish";
+    case GsFlushReason::PresentationLatch: return "presentation-latch";
+    case GsFlushReason::DebuggerObservation: return "debugger-observation";
+    case GsFlushReason::BackendSwitch: return "backend-switch";
+    case GsFlushReason::Reset: return "reset";
+    case GsFlushReason::SaveLoad: return "save-load";
+    case GsFlushReason::Shutdown: return "shutdown";
+    case GsFlushReason::QueueBackpressure: return "queue-backpressure";
+    case GsFlushReason::ResourceHazard: return "resource-hazard";
+    case GsFlushReason::Count: break;
+    }
+    return "unknown";
+}
+
+std::string_view gsRendererModeName(GsRendererMode mode) noexcept
+{
+    switch (mode)
+    {
+    case GsRendererMode::Software: return "software";
+    case GsRendererMode::Hybrid: return "hybrid";
+    case GsRendererMode::Verify: return "verify";
+    case GsRendererMode::GpuStrict: return "gpu-strict";
     }
     return "unknown";
 }

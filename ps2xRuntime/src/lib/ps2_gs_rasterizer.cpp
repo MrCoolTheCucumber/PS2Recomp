@@ -27,6 +27,7 @@
 #include <memory>
 #include <mutex>
 #include <sstream>
+#include <stdexcept>
 #include <string>
 #include <thread>
 #include <vector>
@@ -1950,7 +1951,57 @@ struct GSRasterizer::ParallelState
     size_t maximumBatchDraws = 0u;
 };
 
-GSRasterizer::GSRasterizer() = default;
+struct GSRasterizer::BackendState
+{
+    class SoftwareBackend final : public IGsRasterBackend
+    {
+    public:
+        SoftwareBackend(GSRasterizer &rasterizer_, GS *owner_) noexcept
+            : rasterizer(rasterizer_), owner(owner_)
+        {
+        }
+
+        [[nodiscard]] GsBackendDecision classify(
+            const GsDrawCommand &) const override
+        {
+            return {true, GsFallbackReason::Supported};
+        }
+
+        void submit(std::span<const GsDrawCommand> commands) override
+        {
+            for (const GsDrawCommand &command : commands)
+                rasterizer.submitSoftwareCommand(owner, command);
+        }
+
+        void flush(GsFlushReason) override
+        {
+            rasterizer.flushSoftwareDrawBatch(owner);
+        }
+
+        [[nodiscard]] size_t pendingCommandCount() const noexcept override
+        {
+            return rasterizer.softwarePendingCommandCount();
+        }
+
+    private:
+        GSRasterizer &rasterizer;
+        GS *owner = nullptr;
+    };
+
+    BackendState(GSRasterizer &rasterizer, GS *owner) noexcept
+        : software(rasterizer, owner), router(software)
+    {
+    }
+
+    SoftwareBackend software;
+    GsBackendRouter router;
+};
+
+GSRasterizer::GSRasterizer(GS *owner)
+    : m_owner(owner),
+      m_backendState(std::make_unique<BackendState>(*this, owner))
+{
+}
 GSRasterizer::~GSRasterizer() = default;
 
 GSRasterizer::DebugProgressScope::DebugProgressScope(
@@ -2026,7 +2077,7 @@ bool GSRasterizer::beginDrawBatch(GS *gs)
     return true;
 }
 
-void GSRasterizer::flushDrawBatch(GS *gs)
+void GSRasterizer::flushSoftwareDrawBatch(GS *gs)
 {
     ParallelState *state = m_parallelState.get();
     if (!state || state->commands.empty())
@@ -2117,7 +2168,7 @@ void GSRasterizer::flushDrawBatch(GS *gs)
 
 void GSRasterizer::endDrawBatch(GS *gs)
 {
-    flushDrawBatch(gs);
+    flushDrawBatch(gs, GsFlushReason::Explicit);
     if (m_parallelState)
     {
         m_parallelState->batchActive = false;
@@ -2276,7 +2327,7 @@ bool GSRasterizer::tryQueuePrimitive(
             m_feedbackFrameWidth == ctx.frame.fbw;
         if (!sameFeedbackSurface)
         {
-            flushDrawBatch(gs);
+            flushDrawBatch(gs, GsFlushReason::FeedbackSnapshot);
             m_textureSnapshot.resize(gs->m_vramSize);
             std::memcpy(
                 m_textureSnapshot.data(),
@@ -2294,7 +2345,7 @@ bool GSRasterizer::tryQueuePrimitive(
     else
     {
         if (m_feedbackSnapshotValid)
-            flushDrawBatch(gs);
+            flushDrawBatch(gs, GsFlushReason::FeedbackSnapshot);
         m_feedbackSnapshotValid = false;
     }
     if (gs->m_hasPreferredDisplaySource &&
@@ -2315,7 +2366,7 @@ bool GSRasterizer::tryQueuePrimitive(
         state->groupDepth.zbp == ctx.zbuf.zbp &&
         state->groupDepth.psm == ctx.zbuf.psm;
     if (state->outputGroupValid && !sameOutputGroup)
-        flushDrawBatch(gs);
+        flushDrawBatch(gs, GsFlushReason::ResourceHazard);
     if (!state->outputGroupValid)
     {
         state->groupFrame = ctx.frame;
@@ -2480,10 +2531,63 @@ void GSRasterizer::drawPrimitive(GS *gs)
         gs->activeContext(),
         std::span<const GSVertex>(gs->m_vtxQueue, 3u),
         globalState);
+    const GsSubmissionResult result =
+        m_backendState->router.submit(command);
+    if (!result.submitted)
+    {
+        throw std::runtime_error(
+            std::string("GS gpu-strict rejected draw: ") +
+            std::string(gsFallbackReasonName(result.decision.reason)));
+    }
+}
+
+void GSRasterizer::submitSoftwareCommand(
+    GS *gs,
+    const GsDrawCommand &command)
+{
     if (tryQueuePrimitive(gs, command))
         return;
-    flushDrawBatch(gs);
+    flushSoftwareDrawBatch(gs);
     renderSoftwarePrimitive(gs, command);
+}
+
+void GSRasterizer::flushDrawBatch(
+    GS *gs,
+    GsFlushReason reason)
+{
+    if (gs && gs != m_owner)
+        return;
+    m_backendState->router.flush(reason);
+}
+
+size_t GSRasterizer::softwarePendingCommandCount() const noexcept
+{
+    return m_parallelState ? m_parallelState->commands.size() : 0u;
+}
+
+bool GSRasterizer::setRendererMode(GsRendererMode mode)
+{
+    return m_backendState->router.setMode(mode);
+}
+
+GsRendererMode GSRasterizer::rendererMode() const noexcept
+{
+    return m_backendState->router.mode();
+}
+
+void GSRasterizer::setBackendCountersEnabled(bool enabled) noexcept
+{
+    m_backendState->router.setCountersEnabled(enabled);
+}
+
+GsBackendCounters GSRasterizer::backendCounters() const noexcept
+{
+    return m_backendState->router.counters();
+}
+
+void GSRasterizer::resetBackendCounters() noexcept
+{
+    m_backendState->router.resetCounters();
 }
 
 void GSRasterizer::renderSoftwarePrimitive(
@@ -3322,7 +3426,7 @@ void GSRasterizer::updateClutCache(GS *gs, int contextIndex)
          blockRangesOverlap(
              clutRange, state->groupDepthRange)))
     {
-        flushDrawBatch(gs);
+        flushDrawBatch(gs, GsFlushReason::ClutHazard);
     }
 
     GSClutTraceState &trace = clutTrace();

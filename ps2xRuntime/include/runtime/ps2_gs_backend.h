@@ -167,11 +167,14 @@ enum class GsFlushReason : uint8_t
     SaveLoad,
     Shutdown,
     QueueBackpressure,
+    ResourceHazard,
+    Count,
 };
 
 enum class GsFallbackReason : uint8_t
 {
     Supported,
+    BackendUnavailable,
     EmptyBounds,
     InexactBounds,
     UnsupportedPrimitive,
@@ -192,12 +195,42 @@ enum class GsFallbackReason : uint8_t
     DestinationRead,
     ResourceAlias,
     UnknownMemoryLayout,
+    Count,
 };
+
+inline constexpr size_t GS_FLUSH_REASON_COUNT =
+    static_cast<size_t>(GsFlushReason::Count);
+inline constexpr size_t GS_FALLBACK_REASON_COUNT =
+    static_cast<size_t>(GsFallbackReason::Count);
 
 struct GsBackendDecision
 {
     bool supported = false;
     GsFallbackReason reason = GsFallbackReason::UnsupportedPrimitive;
+};
+
+struct GsSubmissionResult
+{
+    bool submitted = false;
+    bool usedSoftware = false;
+    bool usedAccelerated = false;
+    GsBackendDecision decision{};
+};
+
+struct GsBackendCounters
+{
+    uint64_t commands = 0;
+    uint64_t softwareCommands = 0;
+    uint64_t acceleratedCommands = 0;
+    uint64_t verifiedCommands = 0;
+    uint64_t fallbackCommands = 0;
+    uint64_t strictFailures = 0;
+    uint64_t flushes = 0;
+    uint64_t backendSwitches = 0;
+    uint64_t queueDepth = 0;
+    uint64_t queueHighWatermark = 0;
+    std::array<uint64_t, GS_FALLBACK_REASON_COUNT> decisions{};
+    std::array<uint64_t, GS_FLUSH_REASON_COUNT> flushReasons{};
 };
 
 class IGsRasterBackend
@@ -209,6 +242,51 @@ public:
     classify(const GsDrawCommand &command) const = 0;
     virtual void submit(std::span<const GsDrawCommand> commands) = 0;
     virtual void flush(GsFlushReason reason) = 0;
+    [[nodiscard]] virtual size_t pendingCommandCount() const noexcept = 0;
+};
+
+// Selects a backend before submission, so unsupported commands cannot
+// partially execute. The accelerated slot may later be a GPU or verification
+// service; in Verify mode that service owns the independent software/GPU
+// images and comparison. The permanent software backend is always present.
+class GsBackendRouter final
+{
+public:
+    explicit GsBackendRouter(IGsRasterBackend &softwareBackend) noexcept;
+
+    void setAcceleratedBackend(IGsRasterBackend *backend);
+    [[nodiscard]] bool setMode(GsRendererMode mode);
+    [[nodiscard]] GsRendererMode mode() const noexcept;
+    [[nodiscard]] bool hasAcceleratedBackend() const noexcept;
+
+    [[nodiscard]] GsSubmissionResult submit(
+        const GsDrawCommand &command);
+    void flush(GsFlushReason reason);
+
+    void setCountersEnabled(bool enabled) noexcept;
+    [[nodiscard]] bool countersEnabled() const noexcept;
+    [[nodiscard]] const GsBackendCounters &counters() const noexcept;
+    void resetCounters() noexcept;
+
+private:
+    enum class ActiveBackend : uint8_t
+    {
+        None,
+        Software,
+        Accelerated,
+    };
+
+    void transitionTo(ActiveBackend backend);
+    void recordDecision(GsFallbackReason reason) noexcept;
+    void recordFlush(GsFlushReason reason) noexcept;
+    void updateQueueDepth(const IGsRasterBackend &backend) noexcept;
+
+    IGsRasterBackend *m_softwareBackend = nullptr;
+    IGsRasterBackend *m_acceleratedBackend = nullptr;
+    GsRendererMode m_mode = GsRendererMode::Software;
+    ActiveBackend m_activeBackend = ActiveBackend::None;
+    bool m_countersEnabled = false;
+    GsBackendCounters m_counters{};
 };
 
 [[nodiscard]] GsDrawCommand buildGsDrawCommand(
@@ -225,3 +303,9 @@ public:
 
 [[nodiscard]] std::string_view gsFallbackReasonName(
     GsFallbackReason reason) noexcept;
+
+[[nodiscard]] std::string_view gsFlushReasonName(
+    GsFlushReason reason) noexcept;
+
+[[nodiscard]] std::string_view gsRendererModeName(
+    GsRendererMode mode) noexcept;
