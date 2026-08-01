@@ -164,6 +164,44 @@ namespace
             << gsVulkanTextureRegionMax(sprite.textureWrapV) << '}';
     }
 
+    void writePreparedRecord(
+        std::ostream &output,
+        const GsVulkanLinearCt32Sprite &sprite)
+    {
+        output
+            << "  \"linear_ct32_sprite\": {"
+            << "\"framebuffer_base_block\":"
+            << sprite.framebufferBaseBlock << ','
+            << "\"framebuffer_width\":"
+            << sprite.framebufferWidth << ','
+            << "\"bounds_x0\":" << sprite.boundsX0 << ','
+            << "\"bounds_y0\":" << sprite.boundsY0 << ','
+            << "\"bounds_x1\":" << sprite.boundsX1 << ','
+            << "\"bounds_y1\":" << sprite.boundsY1 << ','
+            << "\"texture_base_block\":"
+            << sprite.textureBaseBlock << ','
+            << "\"texture_width\":" << sprite.textureWidth << ','
+            << "\"texture_mask_u\":" << sprite.textureMaskU << ','
+            << "\"texture_mask_v\":" << sprite.textureMaskV << ','
+            << "\"fixed_base_u\":" << sprite.fixedBaseU << ','
+            << "\"fixed_block_step_u\":"
+            << sprite.fixedBlockStepU << ','
+            << "\"fixed_lane_u\":[";
+        for (size_t lane = 0u; lane < sprite.fixedLaneU.size(); ++lane)
+        {
+            if (lane != 0u)
+                output << ',';
+            output << sprite.fixedLaneU[lane];
+        }
+        output
+            << "],\"fixed_scan_v_bits\":"
+            << sprite.fixedScanVBits << ','
+            << "\"fixed_step_v_bits\":"
+            << sprite.fixedStepVBits << ','
+            << "\"texture_wrap_u\":" << sprite.textureWrapU << ','
+            << "\"texture_wrap_v\":" << sprite.textureWrapV << '}';
+    }
+
     template <typename PreparedRecord>
     bool writeCommandManifest(
         const fs::path &path,
@@ -505,6 +543,7 @@ struct GsVulkanRasterBackend::Impl final
     GsVramPageMask pendingResidentWritePages;
     bool exactCt32Triangle = false;
     bool exactNearestCt32Sprite = false;
+    bool exactLinearCt32Sprite = false;
     bool failed = false;
     bool shutDown = false;
 
@@ -782,6 +821,8 @@ GsVulkanRasterBackend::createWithExecutor(
         selectedDevice && selectedDevice->exactCt32Triangle;
     impl->exactNearestCt32Sprite =
         selectedDevice && selectedDevice->exactNearestCt32Sprite;
+    impl->exactLinearCt32Sprite =
+        selectedDevice && selectedDevice->exactLinearCt32Sprite;
     impl->config = backendConfig;
     impl->canonicalVram = canonicalVram;
     impl->softwareOracle = std::move(softwareOracle);
@@ -845,25 +886,40 @@ GsBackendDecision GsVulkanRasterBackend::classify(
         const GsBackendDecision textureDecision =
             prepareGsVulkanNearestCt32Sprite(
                 command, texturedSprite);
-        if (!textureDecision.supported)
-            return textureDecision;
-        if (!m_impl->exactNearestCt32Sprite)
-            return {false, GsFallbackReason::BackendUnavailable};
-
-        if (m_impl->config.mode == GsRendererMode::Hybrid)
+        if (textureDecision.supported)
         {
-            const uint64_t pixels =
-                static_cast<uint64_t>(
-                    texturedSprite.boundsX1 - texturedSprite.boundsX0) *
-                static_cast<uint64_t>(
-                    texturedSprite.boundsY1 - texturedSprite.boundsY0);
-            if (pixels <
-                m_impl->config.minimumHybridNearestCt32SpritePixels)
+            if (!m_impl->exactNearestCt32Sprite)
+                return {false, GsFallbackReason::BackendUnavailable};
+
+            if (m_impl->config.mode == GsRendererMode::Hybrid)
             {
-                return {false, GsFallbackReason::CostModel};
+                const uint64_t pixels =
+                    static_cast<uint64_t>(
+                        texturedSprite.boundsX1 - texturedSprite.boundsX0) *
+                    static_cast<uint64_t>(
+                        texturedSprite.boundsY1 - texturedSprite.boundsY0);
+                if (pixels <
+                    m_impl->config.minimumHybridNearestCt32SpritePixels)
+                {
+                    return {false, GsFallbackReason::CostModel};
+                }
             }
+            return textureDecision;
         }
-        return textureDecision;
+
+        // First qualify the independent kernel through full-image Verify.
+        // Strict and Hybrid remain closed until resident linear execution is
+        // available, preserving their atomic ownership contract.
+        if (m_impl->config.mode != GsRendererMode::Verify)
+            return textureDecision;
+        GsVulkanLinearCt32Sprite linearSprite{};
+        const GsBackendDecision linearDecision =
+            prepareGsVulkanLinearCt32Sprite(command, linearSprite);
+        if (!linearDecision.supported)
+            return linearDecision;
+        if (!m_impl->exactLinearCt32Sprite)
+            return {false, GsFallbackReason::BackendUnavailable};
+        return linearDecision;
     }
 
     if (command.primitive().type != GS_PRIM_TRIANGLE ||
@@ -918,18 +974,27 @@ void GsVulkanRasterBackend::submit(
     {
         GsVulkanCt32Sprite sprite{};
         GsVulkanNearestCt32Sprite texturedSprite{};
+        GsVulkanLinearCt32Sprite linearTexturedSprite{};
         GsVulkanCt32Triangle triangle{};
         const bool isTriangle =
             command.primitive().type == GS_PRIM_TRIANGLE;
         const bool isTexturedSprite =
             command.primitive().type == GS_PRIM_SPRITE &&
             command.primitive().tme;
+        bool isLinearTexturedSprite = false;
         if (isTriangle)
             (void)prepareGsVulkanCt32Triangle(command, triangle);
         else if (isTexturedSprite)
         {
-            (void)prepareGsVulkanNearestCt32Sprite(
-                command, texturedSprite);
+            const GsBackendDecision textureDecision =
+                prepareGsVulkanNearestCt32Sprite(
+                    command, texturedSprite);
+            if (!textureDecision.supported)
+            {
+                (void)prepareGsVulkanLinearCt32Sprite(
+                    command, linearTexturedSprite);
+                isLinearTexturedSprite = true;
+            }
         }
         else
             (void)prepareGsVulkanCt32Sprite(command, sprite);
@@ -952,6 +1017,13 @@ void GsVulkanRasterBackend::submit(
             {
                 executed = m_impl->executor->executeCt32Triangle(
                     initial, triangle, gpuOutput, &executionError);
+            }
+            else if (isLinearTexturedSprite)
+            {
+                executed =
+                    m_impl->executor->executeLinearCt32Sprite(
+                        initial, linearTexturedSprite, gpuOutput,
+                        &executionError);
             }
             else if (isTexturedSprite)
             {
@@ -1008,6 +1080,14 @@ void GsVulkanRasterBackend::submit(
                     artifactWritten = writeVerificationArtifact(
                         m_impl->config.verificationArtifactDirectory,
                         command, triangle, firstDifference,
+                        initial, m_impl->canonicalVram, gpuOutput,
+                        artifactPath, artifactError);
+                }
+                else if (isLinearTexturedSprite)
+                {
+                    artifactWritten = writeVerificationArtifact(
+                        m_impl->config.verificationArtifactDirectory,
+                        command, linearTexturedSprite, firstDifference,
                         initial, m_impl->canonicalVram, gpuOutput,
                         artifactPath, artifactError);
                 }

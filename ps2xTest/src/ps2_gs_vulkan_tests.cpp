@@ -1145,7 +1145,8 @@ namespace
         explicit FakeCt32Executor(
             Behavior behavior_,
             bool exactCt32Triangle_ = true,
-            bool exactNearestCt32Sprite_ = true)
+            bool exactNearestCt32Sprite_ = true,
+            bool exactLinearCt32Sprite_ = true)
             : behavior(behavior_)
         {
             report.compiled = true;
@@ -1158,6 +1159,8 @@ namespace
             report.devices[0].exactCt32Triangle = exactCt32Triangle_;
             report.devices[0].exactNearestCt32Sprite =
                 exactNearestCt32Sprite_;
+            report.devices[0].exactLinearCt32Sprite =
+                exactLinearCt32Sprite_;
         }
 
         bool executeCt32Sprite(
@@ -1252,6 +1255,44 @@ namespace
                 output.resize(1u);
             ++serviceStatistics.nearestCt32SpriteDrawsCompleted;
             serviceStatistics.nearestCt32SpritePixelsExecuted +=
+                static_cast<uint64_t>(
+                    sprite.boundsX1 - sprite.boundsX0) *
+                static_cast<uint64_t>(
+                    sprite.boundsY1 - sprite.boundsY0);
+            ++serviceStatistics.queueSubmissions;
+            ++serviceStatistics.shaderDispatches;
+            serviceStatistics.pipelineBarriers += 4u;
+            ++serviceStatistics.pipelineBinds;
+            ++serviceStatistics.pipelineCacheHits;
+            ++serviceStatistics.fenceWaits;
+            if (error)
+                error->clear();
+            return true;
+        }
+
+        bool executeLinearCt32Sprite(
+            std::span<const uint8_t> input,
+            const GsVulkanLinearCt32Sprite &sprite,
+            std::vector<uint8_t> &output,
+            std::string *error) override
+        {
+            if (!isHealthy || behavior == Behavior::Fail ||
+                !report.devices[0].exactLinearCt32Sprite)
+            {
+                ++serviceStatistics.linearCt32SpriteDrawsFailed;
+                if (error)
+                    *error = "injected linear CT32 executor failure";
+                return false;
+            }
+
+            residentVram.assign(input.begin(), input.end());
+            if (behavior == Behavior::Exact)
+                applyLinearCt32SpriteCpu(residentVram, sprite);
+            output = residentVram;
+            if (behavior == Behavior::InvalidOutput)
+                output.resize(1u);
+            ++serviceStatistics.linearCt32SpriteDrawsCompleted;
+            serviceStatistics.linearCt32SpritePixelsExecuted +=
                 static_cast<uint64_t>(
                     sprite.boundsX1 - sprite.boundsX0) *
                 static_cast<uint64_t>(
@@ -3017,6 +3058,224 @@ void register_ps2_gs_vulkan_tests()
                      "strict texture failure must preserve canonical VRAM");
             t.Equals(failedSoftwareCalls, 0ull,
                      "strict texture failure must not invoke software fallback");
+        });
+
+        tc.Run("Vulkan raster backend verifies linear CT32 repeat sprites behind capability", [](TestCase &t)
+        {
+            GSMem::InitLookupTables();
+            const GsDrawCommand command =
+                makeLinearCt32RepeatSpriteCommand(
+                    98u, 0u, 8u, 3584u, 8u, 10u, 10u,
+                    {0u, 511u, 0u, 447u},
+                    {28672u, 29184u},
+                    {28664u, 29176u},
+                    {29176u, 36344u},
+                    {0u, 512u},
+                    {0u, 6656u});
+            GsVulkanLinearCt32Sprite prepared{};
+            t.IsTrue(
+                prepareGsVulkanLinearCt32Sprite(
+                    command, prepared).supported,
+                "the retained title linear sprite should satisfy its prepared-DDA predicate");
+
+            const std::vector<uint8_t> initial =
+                makeVramPattern(0x4C565246u);
+            std::vector<uint8_t> expected = initial;
+            applyLinearCt32SpriteCpu(expected, prepared);
+            std::vector<uint8_t> vram = initial;
+            uint64_t softwareCalls = 0u;
+            GsVulkanRasterBackendConfig config{};
+            config.mode = GsRendererMode::Verify;
+            std::unique_ptr<GsVulkanRasterBackend> backend =
+                GsVulkanRasterBackend::createWithExecutor(
+                    std::make_unique<FakeCt32Executor>(
+                        FakeCt32Executor::Behavior::Exact),
+                    config, vram,
+                    [&](const GsDrawCommand &draw)
+                    {
+                        ++softwareCalls;
+                        GsVulkanLinearCt32Sprite sprite{};
+                        if (prepareGsVulkanLinearCt32Sprite(
+                                draw, sprite).supported)
+                        {
+                            applyLinearCt32SpriteCpu(vram, sprite);
+                        }
+                    },
+                    {}, nullptr);
+            t.IsNotNull(backend.get(),
+                        "an exact linear executor should create Verify");
+            if (!backend)
+                return;
+
+            t.IsTrue(backend->classify(command).supported,
+                     "Verify should expose capability-gated linear repeat sprites");
+            backend->submit(
+                std::span<const GsDrawCommand>(&command, 1u));
+            t.IsTrue(vram == expected,
+                     "linear Verify should retain the agreed software image");
+            t.Equals(softwareCalls, 1ull,
+                     "linear Verify should run its independent oracle once");
+            const GsVulkanRasterBackendStatistics statistics =
+                backend->backendStatistics();
+            t.Equals(statistics.commandsAttempted, 1ull,
+                     "linear Verify should attempt one command");
+            t.Equals(statistics.commandsCompleted, 1ull,
+                     "an agreeing linear command should complete once");
+            t.Equals(statistics.verifiedCommands, 1ull,
+                     "the full linear comparison should be counted");
+            t.Equals(statistics.bytesCompared,
+                     static_cast<uint64_t>(GS_VULKAN_VRAM_SIZE),
+                     "linear Verify should compare all 4 MiB");
+            const GsVulkanServiceStatistics serviceStatistics =
+                backend->serviceStatistics();
+            t.Equals(serviceStatistics.linearCt32SpriteDrawsCompleted,
+                     1ull,
+                     "the executor should receive one linear request");
+            t.Equals(serviceStatistics.nearestCt32SpriteDrawsCompleted,
+                     0ull,
+                     "linear Verify must not alias the nearest request");
+
+            std::vector<uint8_t> unavailableVram = initial;
+            std::unique_ptr<GsVulkanRasterBackend> unavailable =
+                GsVulkanRasterBackend::createWithExecutor(
+                    std::make_unique<FakeCt32Executor>(
+                        FakeCt32Executor::Behavior::Exact,
+                        true, true, false),
+                    config, unavailableVram,
+                    [](const GsDrawCommand &) {}, {}, nullptr);
+            t.IsNotNull(unavailable.get(),
+                        "a base-capable executor should retain linear fallback");
+            if (unavailable)
+            {
+                t.Equals(unavailable->classify(command).reason,
+                         GsFallbackReason::BackendUnavailable,
+                         "a missing exact linear capability should fail closed");
+                t.Equals(
+                    unavailable->serviceStatistics()
+                        .linearCt32SpriteDrawsFailed,
+                    0ull,
+                    "capability fallback must not post linear work");
+            }
+
+            std::vector<uint8_t> failureVram = initial;
+            uint64_t failedSoftwareCalls = 0u;
+            std::unique_ptr<GsVulkanRasterBackend> failing =
+                GsVulkanRasterBackend::createWithExecutor(
+                    std::make_unique<FakeCt32Executor>(
+                        FakeCt32Executor::Behavior::Fail),
+                    config, failureVram,
+                    [&](const GsDrawCommand &)
+                    {
+                        ++failedSoftwareCalls;
+                    },
+                    {}, nullptr);
+            t.IsNotNull(failing.get(),
+                        "an initially healthy failing linear executor should construct");
+            bool executionThrew = false;
+            if (failing)
+            {
+                try
+                {
+                    failing->submit(
+                        std::span<const GsDrawCommand>(&command, 1u));
+                }
+                catch (const std::runtime_error &error)
+                {
+                    executionThrew =
+                        std::string(error.what()).find(
+                            "before canonical VRAM mutation") !=
+                        std::string::npos;
+                }
+                t.Equals(failing->backendStatistics().gpuRequestsFailed,
+                         1ull,
+                         "linear executor failure should be counted once");
+                t.Equals(
+                    failing->serviceStatistics()
+                        .linearCt32SpriteDrawsFailed,
+                    1ull,
+                    "the failed linear request should retain its class counter");
+            }
+            t.IsTrue(executionThrew,
+                     "linear executor failure should identify its atomic boundary");
+            t.IsTrue(failureVram == initial,
+                     "linear executor failure must preserve canonical VRAM");
+            t.Equals(failedSoftwareCalls, 0ull,
+                     "linear executor failure must precede the software oracle");
+
+            ScopedArtifactDirectory artifacts;
+            std::vector<uint8_t> mismatchVram = initial;
+            GsVulkanRasterBackendConfig mismatchConfig = config;
+            mismatchConfig.verificationArtifactDirectory =
+                artifacts.path.string();
+            std::unique_ptr<GsVulkanRasterBackend> mismatchBackend =
+                GsVulkanRasterBackend::createWithExecutor(
+                    std::make_unique<FakeCt32Executor>(
+                        FakeCt32Executor::Behavior::Noop),
+                    mismatchConfig, mismatchVram,
+                    [&](const GsDrawCommand &draw)
+                    {
+                        GsVulkanLinearCt32Sprite sprite{};
+                        if (prepareGsVulkanLinearCt32Sprite(
+                                draw, sprite).supported)
+                        {
+                            applyLinearCt32SpriteCpu(
+                                mismatchVram, sprite);
+                        }
+                    },
+                    {}, nullptr);
+            t.IsNotNull(mismatchBackend.get(),
+                        "the linear mismatch backend should construct");
+            bool mismatchThrew = false;
+            if (mismatchBackend)
+            {
+                try
+                {
+                    mismatchBackend->submit(
+                        std::span<const GsDrawCommand>(&command, 1u));
+                }
+                catch (const std::runtime_error &)
+                {
+                    mismatchThrew = true;
+                }
+                const GsVulkanRasterBackendStatistics mismatchStatistics =
+                    mismatchBackend->backendStatistics();
+                t.Equals(mismatchStatistics.verificationMismatches,
+                         1ull,
+                         "the injected no-op linear result should disagree once");
+                const std::filesystem::path bundle =
+                    mismatchStatistics.lastVerificationArtifact;
+                t.IsTrue(std::filesystem::is_directory(bundle),
+                         "the linear reproducer should be published atomically");
+                std::ifstream manifest(bundle / "command.json");
+                const std::string manifestText{
+                    std::istreambuf_iterator<char>(manifest),
+                    std::istreambuf_iterator<char>()};
+                t.IsTrue(
+                    manifestText.find("\"linear_ct32_sprite\"") !=
+                        std::string::npos,
+                    "the manifest should identify the linear record");
+                t.IsTrue(
+                    manifestText.find(
+                        "\"fixed_lane_u\":[0,65536,131072,196608,262144,327680,393216,458752]") !=
+                        std::string::npos,
+                    "the manifest should retain all eight prepared U lanes");
+                t.IsTrue(
+                    manifestText.find(
+                        "\"fixed_scan_v_bits\":" +
+                        std::to_string(prepared.fixedScanVBits)) !=
+                        std::string::npos,
+                    "the manifest should retain the exact binary32 V seed");
+                t.IsTrue(
+                    manifestText.find(
+                        "\"fixed_step_v_bits\":" +
+                        std::to_string(prepared.fixedStepVBits)) !=
+                        std::string::npos,
+                    "the manifest should retain the exact binary32 V step");
+            }
+            t.IsTrue(mismatchThrew,
+                     "the injected no-op linear result should stop Verify");
+            t.IsTrue(mismatchVram == expected,
+                     "the software oracle should remain canonical on mismatch");
         });
 
         tc.Run("Vulkan strict texture queue shares reads and splits dependencies", [](TestCase &t)
@@ -5867,6 +6126,130 @@ void register_ps2_gs_vulkan_tests()
                      "integrated texture Verify should remain validation-clean");
             t.Equals(service.validationWarnings, 0u,
                      "integrated texture Verify should emit no validation warnings");
+        });
+
+        tc.Run("GS Vulkan verifies linear CT32 repeat sprites end to end", [](TestCase &t)
+        {
+            GSMem::InitLookupTables();
+            const GsDrawCommand command =
+                makeLinearCt32RepeatSpriteCommand(
+                    99u, 0u, 8u, 3584u, 8u, 10u, 10u,
+                    {0u, 511u, 0u, 447u},
+                    {28672u, 29184u},
+                    {28664u, 29176u},
+                    {29176u, 36344u},
+                    {0u, 512u},
+                    {0u, 6656u});
+            GsVulkanLinearCt32Sprite prepared{};
+            t.IsTrue(
+                prepareGsVulkanLinearCt32Sprite(
+                    command, prepared).supported,
+                "the integrated title fixture should satisfy the linear predicate");
+
+            std::vector<uint8_t> softwareVram =
+                makeVramPattern(0x4C565247u);
+            std::vector<uint8_t> acceleratedVram = softwareVram;
+            GS software;
+            GS accelerated;
+            software.init(
+                softwareVram.data(),
+                static_cast<uint32_t>(softwareVram.size()), nullptr);
+            accelerated.init(
+                acceleratedVram.data(),
+                static_cast<uint32_t>(acceleratedVram.size()), nullptr);
+
+            GsVulkanCapabilityReport preflight{};
+            const GsVulkanServiceConfig config =
+                makeRendererServiceConfig(preflight);
+            ScopedArtifactDirectory artifacts;
+            t.IsTrue(accelerated.configureVulkanRenderer(
+                         config, artifacts.path.string()),
+                     "the linear fixture should accept Vulkan configuration");
+            if (!preflight.ready())
+            {
+                t.IsFalse(accelerated.setRendererMode(
+                              GsRendererMode::Verify),
+                          "an unavailable host should decline linear Verify cleanly");
+                return;
+            }
+
+            const GsVulkanDeviceReport *selected =
+                preflight.selectedDevice();
+            t.IsNotNull(selected,
+                        "a ready linear preflight should select one device");
+            if (!selected)
+                return;
+            t.IsTrue(selected->exactLinearCt32Sprite,
+                     "the selected raw-VRAM device should expose the exact linear kernel");
+            if (!selected->exactLinearCt32Sprite)
+                return;
+
+            t.IsTrue(accelerated.setRendererMode(
+                         GsRendererMode::Verify),
+                     "the capable host should create linear Verify");
+            if (accelerated.rendererMode() != GsRendererMode::Verify)
+                return;
+            accelerated.setBackendCountersEnabled(true);
+            accelerated.resetBackendCounters();
+
+            drawNearestCt32SpriteCommand(software, command);
+            drawNearestCt32SpriteCommand(accelerated, command);
+            (void)software.getDebugSnapshot();
+            (void)accelerated.getDebugSnapshot();
+            t.IsTrue(acceleratedVram == softwareVram,
+                     "real Vulkan linear Verify should match canonical VRAM");
+
+            const GsBackendCounters counters =
+                accelerated.backendCounters();
+            t.Equals(counters.commands, 1ull,
+                     "the linear title fixture should assemble one draw");
+            t.Equals(counters.acceleratedCommands, 1ull,
+                     "the exact linear draw should use Vulkan Verify");
+            t.Equals(counters.verifiedCommands, 1ull,
+                     "the routed linear draw should record verification");
+            t.Equals(counters.softwareCommands, 0ull,
+                     "the routed linear draw should not use fallback");
+            t.Equals(counters.fallbackCommands, 0ull,
+                     "the exact linear draw should have no fallback decision");
+            t.Equals(
+                counters.decisions[static_cast<size_t>(
+                    GsFallbackReason::Supported)],
+                1ull,
+                "the router should retain the supported linear decision");
+
+            const GsVulkanRasterBackendStatistics backend =
+                accelerated.vulkanRendererBackendStatistics();
+            t.Equals(backend.commandsAttempted, 1ull,
+                     "the integrated backend should attempt the linear draw");
+            t.Equals(backend.commandsCompleted, 1ull,
+                     "the matching linear draw should complete once");
+            t.Equals(backend.verifiedCommands, 1ull,
+                     "the backend should compare the linear result");
+            t.Equals(backend.bytesCompared,
+                     static_cast<uint64_t>(GS_VULKAN_VRAM_SIZE),
+                     "linear Verify should compare the complete 4 MiB image");
+            t.Equals(backend.verificationMismatches, 0ull,
+                     "the real linear kernel should have no byte mismatch");
+
+            const GsVulkanServiceStatistics service =
+                accelerated.vulkanRendererServiceStatistics();
+            t.Equals(service.linearCt32SpriteDrawsCompleted, 1ull,
+                     "the service should execute the routed linear draw");
+            t.Equals(service.linearCt32SpriteDrawsFailed, 0ull,
+                     "the real linear request should not fail");
+            t.Equals(
+                service.linearCt32SpritePixelsExecuted,
+                static_cast<uint64_t>(
+                    prepared.boundsX1 - prepared.boundsX0) *
+                    static_cast<uint64_t>(
+                        prepared.boundsY1 - prepared.boundsY0),
+                "the service should retain exact linear pixel accounting");
+            t.Equals(service.nearestCt32SpriteDrawsCompleted, 0ull,
+                     "linear routing must not alias the nearest request");
+            t.Equals(service.validationErrors, 0u,
+                     "integrated linear Verify should remain validation-clean");
+            t.Equals(service.validationWarnings, 0u,
+                     "integrated linear Verify should emit no validation warnings");
         });
 
         tc.Run("GS Vulkan Hybrid qualifies nearest CT32 textures at 8192 samples", [](TestCase &t)

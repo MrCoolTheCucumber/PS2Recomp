@@ -520,6 +520,11 @@ public:
         const GsVulkanNearestCt32Sprite &sprite,
         std::vector<uint8_t> &output,
         std::string *error = nullptr) = 0;
+    [[nodiscard]] virtual bool executeLinearCt32Sprite(
+        std::span<const uint8_t> input,
+        const GsVulkanLinearCt32Sprite &sprite,
+        std::vector<uint8_t> &output,
+        std::string *error = nullptr) = 0;
     [[nodiscard]] virtual bool executeCt32Triangle(
         std::span<const uint8_t> input,
         const GsVulkanCt32Triangle &triangle,
@@ -610,13 +615,12 @@ public:
         std::string *error = nullptr) override;
 
     // Uploads canonical VRAM and executes one exact prepared-DDA linear CT32
-    // repeat sprite. This remains a direct service seam until the independent
-    // compute pipeline is qualified for renderer routing.
+    // repeat sprite.
     [[nodiscard]] bool executeLinearCt32Sprite(
         std::span<const uint8_t> input,
         const GsVulkanLinearCt32Sprite &sprite,
         std::vector<uint8_t> &output,
-        std::string *error = nullptr);
+        std::string *error = nullptr) override;
 
     // Uploads canonical 4 MiB CPU VRAM, executes one prepared exact flat
     // CT32 triangle, and publishes the complete synchronized image. Devices
