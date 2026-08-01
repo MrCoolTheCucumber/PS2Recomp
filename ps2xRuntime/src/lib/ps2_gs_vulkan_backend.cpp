@@ -83,10 +83,53 @@ namespace
         output << ']';
     }
 
+    void writePreparedRecord(
+        std::ostream &output,
+        const GsVulkanCt32Sprite &sprite)
+    {
+        output
+            << "  \"sprite\": {"
+            << "\"framebuffer_base_block\":"
+            << sprite.framebufferBaseBlock << ','
+            << "\"framebuffer_width\":"
+            << sprite.framebufferWidth << ','
+            << "\"x0\":" << sprite.x0 << ','
+            << "\"y0\":" << sprite.y0 << ','
+            << "\"x1\":" << sprite.x1 << ','
+            << "\"y1\":" << sprite.y1 << ','
+            << "\"rgba\":" << sprite.rgba << '}';
+    }
+
+    void writePreparedRecord(
+        std::ostream &output,
+        const GsVulkanCt32Triangle &triangle)
+    {
+        output
+            << "  \"triangle\": {"
+            << "\"framebuffer_base_block\":"
+            << triangle.framebufferBaseBlock << ','
+            << "\"framebuffer_width\":"
+            << triangle.framebufferWidth << ','
+            << "\"bounds_x0\":" << triangle.boundsX0 << ','
+            << "\"bounds_y0\":" << triangle.boundsY0 << ','
+            << "\"bounds_x1\":" << triangle.boundsX1 << ','
+            << "\"bounds_y1\":" << triangle.boundsY1 << ','
+            << "\"vertex0_x_12_4\":" << triangle.vertex0X12_4 << ','
+            << "\"vertex0_y_12_4\":" << triangle.vertex0Y12_4 << ','
+            << "\"vertex1_x_12_4\":" << triangle.vertex1X12_4 << ','
+            << "\"vertex1_y_12_4\":" << triangle.vertex1Y12_4 << ','
+            << "\"vertex2_x_12_4\":" << triangle.vertex2X12_4 << ','
+            << "\"vertex2_y_12_4\":" << triangle.vertex2Y12_4 << ','
+            << "\"rgba\":" << triangle.rgba << ','
+            << "\"top_left_edge_mask\":"
+            << triangle.topLeftEdgeMask << '}';
+    }
+
+    template <typename PreparedRecord>
     bool writeCommandManifest(
         const fs::path &path,
         const GsDrawCommand &command,
-        const GsVulkanCt32Sprite &sprite,
+        const PreparedRecord &record,
         size_t firstDifference,
         uint8_t softwareByte,
         uint8_t gpuByte,
@@ -136,18 +179,10 @@ namespace
             << std::dec << "\",\n"
             << "  \"files\": {\"initial\": \"initial-vram.bin\", "
                "\"software\": \"software-vram.bin\", "
-               "\"gpu\": \"gpu-vram.bin\"},\n"
-            << "  \"sprite\": {"
-            << "\"framebuffer_base_block\":"
-            << sprite.framebufferBaseBlock << ','
-            << "\"framebuffer_width\":"
-            << sprite.framebufferWidth << ','
-            << "\"x0\":" << sprite.x0 << ','
-            << "\"y0\":" << sprite.y0 << ','
-            << "\"x1\":" << sprite.x1 << ','
-            << "\"y1\":" << sprite.y1 << ','
-            << "\"rgba\":" << sprite.rgba << "},\n"
-            << "  \"bounds\": {"
+               "\"gpu\": \"gpu-vram.bin\"},\n";
+        writePreparedRecord(output, record);
+        output
+            << ",\n  \"bounds\": {"
             << "\"x0\":" << bounds.x0 << ','
             << "\"y0\":" << bounds.y0 << ','
             << "\"x1\":" << bounds.x1 << ','
@@ -345,10 +380,11 @@ namespace
         return false;
     }
 
+    template <typename PreparedRecord>
     bool writeVerificationArtifact(
         const std::string &configuredDirectory,
         const GsDrawCommand &command,
-        const GsVulkanCt32Sprite &sprite,
+        const PreparedRecord &record,
         size_t firstDifference,
         std::span<const uint8_t> initial,
         std::span<const uint8_t> software,
@@ -370,7 +406,7 @@ namespace
             !writeBytes(partial / "software-vram.bin", software, error) ||
             !writeBytes(partial / "gpu-vram.bin", gpu, error) ||
             !writeCommandManifest(
-                partial / "command.json", command, sprite,
+                partial / "command.json", command, record,
                 firstDifference, software[firstDifference],
                 gpu[firstDifference], initial, software, gpu, error))
         {
@@ -417,6 +453,7 @@ struct GsVulkanRasterBackend::Impl final
     GsVramCoherency coherency;
     std::vector<PendingResidentCommand> pendingResidentCommands;
     GsVramPageMask pendingResidentAccessPages;
+    bool exactCt32Triangle = false;
     bool failed = false;
     bool shutDown = false;
 
@@ -638,6 +675,12 @@ GsVulkanRasterBackend::createWithExecutor(
 
     auto impl = std::make_unique<Impl>();
     impl->executor = std::move(executor);
+    const GsVulkanCapabilityReport executorCapabilities =
+        impl->executor->capabilities();
+    const GsVulkanDeviceReport *selectedDevice =
+        executorCapabilities.selectedDevice();
+    impl->exactCt32Triangle =
+        selectedDevice && selectedDevice->exactCt32Triangle;
     impl->config = backendConfig;
     impl->canonicalVram = canonicalVram;
     impl->softwareOracle = std::move(softwareOracle);
@@ -678,18 +721,31 @@ GsBackendDecision GsVulkanRasterBackend::classify(
     GsVulkanCt32Sprite sprite{};
     const GsBackendDecision decision =
         prepareGsVulkanCt32Sprite(command, sprite);
-    if (!decision.supported ||
-        m_impl->config.mode != GsRendererMode::Hybrid)
+    if (decision.supported)
+    {
+        if (m_impl->config.mode != GsRendererMode::Hybrid)
+            return decision;
+
+        const uint64_t pixels =
+            static_cast<uint64_t>(sprite.x1 - sprite.x0) *
+            static_cast<uint64_t>(sprite.y1 - sprite.y0);
+        if (pixels < m_impl->config.minimumHybridSpritePixels)
+            return {false, GsFallbackReason::CostModel};
+        return decision;
+    }
+
+    if (m_impl->config.mode != GsRendererMode::Verify ||
+        command.primitive().type != GS_PRIM_TRIANGLE)
     {
         return decision;
     }
 
-    const uint64_t pixels =
-        static_cast<uint64_t>(sprite.x1 - sprite.x0) *
-        static_cast<uint64_t>(sprite.y1 - sprite.y0);
-    if (pixels < m_impl->config.minimumHybridSpritePixels)
-        return {false, GsFallbackReason::CostModel};
-    return decision;
+    GsVulkanCt32Triangle triangle{};
+    const GsBackendDecision triangleDecision =
+        prepareGsVulkanCt32Triangle(command, triangle);
+    if (triangleDecision.supported && !m_impl->exactCt32Triangle)
+        return {false, GsFallbackReason::BackendUnavailable};
+    return triangleDecision;
 }
 
 void GsVulkanRasterBackend::submit(
@@ -713,7 +769,14 @@ void GsVulkanRasterBackend::submit(
     for (const GsDrawCommand &command : commands)
     {
         GsVulkanCt32Sprite sprite{};
-        (void)prepareGsVulkanCt32Sprite(command, sprite);
+        GsVulkanCt32Triangle triangle{};
+        const bool isTriangle =
+            m_impl->config.mode == GsRendererMode::Verify &&
+            command.primitive().type == GS_PRIM_TRIANGLE;
+        if (isTriangle)
+            (void)prepareGsVulkanCt32Triangle(command, triangle);
+        else
+            (void)prepareGsVulkanCt32Sprite(command, sprite);
         const GsDrawResources resources = command.resources();
 
         ++m_impl->statistics.commandsAttempted;
@@ -728,8 +791,12 @@ void GsVulkanRasterBackend::submit(
                 m_impl->canonicalVram.end());
             std::vector<uint8_t> gpuOutput;
             std::string executionError;
-            if (!m_impl->executor->executeCt32Sprite(
-                    initial, sprite, gpuOutput, &executionError) ||
+            const bool executed = isTriangle
+                ? m_impl->executor->executeCt32Triangle(
+                      initial, triangle, gpuOutput, &executionError)
+                : m_impl->executor->executeCt32Sprite(
+                      initial, sprite, gpuOutput, &executionError);
+            if (!executed ||
                 gpuOutput.size() != GS_VULKAN_VRAM_SIZE)
             {
                 if (executionError.empty())
@@ -743,8 +810,9 @@ void GsVulkanRasterBackend::submit(
                     std::move(executionError));
             }
 
-            // executeCt32Sprite uploaded the entire initial image. Record that
-            // fact before the independent CPU oracle creates its newer result.
+            // The verification request uploaded the entire initial image.
+            // Record that fact before the independent CPU oracle creates its
+            // newer result.
             const GsVramPageMask initiallyCpuNewer =
                 m_impl->coherency.cpuNewerPages(allPages);
             m_impl->coherency.completeCpuToGpu(initiallyCpuNewer);
@@ -765,11 +833,17 @@ void GsVulkanRasterBackend::submit(
                 m_impl->failed = true;
                 std::string artifactPath;
                 std::string artifactError;
-                const bool artifactWritten = writeVerificationArtifact(
-                    m_impl->config.verificationArtifactDirectory,
-                    command, sprite, firstDifference,
-                    initial, m_impl->canonicalVram, gpuOutput,
-                    artifactPath, artifactError);
+                const bool artifactWritten = isTriangle
+                    ? writeVerificationArtifact(
+                          m_impl->config.verificationArtifactDirectory,
+                          command, triangle, firstDifference,
+                          initial, m_impl->canonicalVram, gpuOutput,
+                          artifactPath, artifactError)
+                    : writeVerificationArtifact(
+                          m_impl->config.verificationArtifactDirectory,
+                          command, sprite, firstDifference,
+                          initial, m_impl->canonicalVram, gpuOutput,
+                          artifactPath, artifactError);
                 m_impl->statistics.lastVerificationArtifact = artifactPath;
                 std::ostringstream message;
                 message

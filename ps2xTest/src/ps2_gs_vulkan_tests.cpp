@@ -479,6 +479,19 @@ namespace
         gs.writeRegister(GS_REG_XYZ2, packXyz2(x1, y1));
     }
 
+    void drawFlatCt32Triangle(
+        GS &gs,
+        const std::array<uint16_t, 3> &x,
+        const std::array<uint16_t, 3> &y,
+        uint32_t rgba)
+    {
+        gs.writeRegister(
+            GS_REG_PRIM, static_cast<uint64_t>(GS_PRIM_TRIANGLE));
+        gs.writeRegister(GS_REG_RGBAQ, rgba);
+        for (size_t index = 0u; index < x.size(); ++index)
+            gs.writeRegister(GS_REG_XYZ2, packXyz2(x[index], y[index]));
+    }
+
     void drawFlatCt32Point(
         GS &gs, uint16_t x, uint16_t y, uint32_t rgba)
     {
@@ -642,7 +655,9 @@ namespace
             InvalidOutput,
         };
 
-        explicit FakeCt32Executor(Behavior behavior_)
+        explicit FakeCt32Executor(
+            Behavior behavior_,
+            bool exactCt32Triangle_ = true)
             : behavior(behavior_)
         {
             report.compiled = true;
@@ -651,8 +666,8 @@ namespace
             report.devices.push_back({});
             report.devices[0].name = "deterministic fake executor";
             report.devices[0].suitable = true;
-            report.devices[0].shaderInt64 = true;
-            report.devices[0].exactCt32Triangle = true;
+            report.devices[0].shaderInt64 = exactCt32Triangle_;
+            report.devices[0].exactCt32Triangle = exactCt32Triangle_;
         }
 
         bool executeCt32Sprite(
@@ -1459,6 +1474,108 @@ void register_ps2_gs_vulkan_tests()
                      "post-shutdown classification should fail closed");
             t.Equals(backend->pendingCommandCount(), static_cast<size_t>(0u),
                      "shutdown should leave no accepted resident work");
+        });
+
+        tc.Run("Vulkan raster backend verifies exact triangles only behind capability", [](TestCase &t)
+        {
+            GSMem::InitLookupTables();
+            const GsDrawCommand command = makeCt32TriangleCommand(
+                43u, 9u, 2u,
+                {0u, 63u, 0u, 63u}, {0u, 0u},
+                {49u, 335u, 103u},
+                {83u, 139u, 309u},
+                0xD4C3B2A1u);
+            GsVulkanCt32Triangle prepared{};
+            t.IsTrue(
+                prepareGsVulkanCt32Triangle(command, prepared).supported,
+                "the verification fixture should satisfy the triangle predicate");
+
+            std::vector<uint8_t> vram = makeVramPattern(0x54525631u);
+            const std::vector<uint8_t> initial = vram;
+            std::vector<uint8_t> expected = initial;
+            applyCt32TriangleCpu(expected, prepared);
+            uint64_t softwareCalls = 0u;
+            GsVulkanRasterBackendConfig config{};
+            config.mode = GsRendererMode::Verify;
+            std::unique_ptr<GsVulkanRasterBackend> backend =
+                GsVulkanRasterBackend::createWithExecutor(
+                    std::make_unique<FakeCt32Executor>(
+                        FakeCt32Executor::Behavior::Exact),
+                    config, vram,
+                    [&](const GsDrawCommand &draw)
+                    {
+                        ++softwareCalls;
+                        GsVulkanCt32Triangle triangle{};
+                        if (prepareGsVulkanCt32Triangle(
+                                draw, triangle).supported)
+                        {
+                            applyCt32TriangleCpu(vram, triangle);
+                        }
+                    },
+                    {}, nullptr);
+            t.IsNotNull(backend.get(),
+                        "an exact triangle executor should create Verify");
+            if (!backend)
+                return;
+
+            t.IsTrue(backend->classify(command).supported,
+                     "Verify should expose the capability-gated triangle class");
+            backend->submit(
+                std::span<const GsDrawCommand>(&command, 1u));
+            t.IsTrue(vram == expected,
+                     "Verify should retain the agreed independent CPU image");
+            t.Equals(softwareCalls, 1ull,
+                     "triangle Verify should run the software oracle once");
+            const GsVulkanRasterBackendStatistics statistics =
+                backend->backendStatistics();
+            t.Equals(statistics.commandsAttempted, 1ull,
+                     "triangle Verify should attempt one command");
+            t.Equals(statistics.commandsCompleted, 1ull,
+                     "an agreeing triangle should complete once");
+            t.Equals(statistics.verifiedCommands, 1ull,
+                     "the full triangle comparison should be counted");
+            t.Equals(statistics.bytesCompared,
+                     static_cast<uint64_t>(GS_VULKAN_VRAM_SIZE),
+                     "triangle Verify should compare all 4 MiB");
+            const GsVulkanServiceStatistics serviceStatistics =
+                backend->serviceStatistics();
+            t.Equals(serviceStatistics.triangleDrawsCompleted, 1ull,
+                     "the executor should receive one triangle request");
+            t.Equals(serviceStatistics.spriteDrawsCompleted, 0ull,
+                     "triangle Verify must not use the sprite kernel");
+
+            t.IsTrue(backend->setMode(GsRendererMode::Hybrid),
+                     "the synchronized backend should accept Hybrid mode");
+            t.Equals(backend->classify(command).reason,
+                     GsFallbackReason::UnsupportedPrimitive,
+                     "Hybrid must not expose the unqualified triangle class");
+            t.IsTrue(backend->setMode(GsRendererMode::GpuStrict),
+                     "the synchronized backend should accept strict mode");
+            t.Equals(backend->classify(command).reason,
+                     GsFallbackReason::UnsupportedPrimitive,
+                     "strict mode must retain the existing triangle rejection");
+
+            std::vector<uint8_t> unavailableVram = initial;
+            std::unique_ptr<GsVulkanRasterBackend> unavailable =
+                GsVulkanRasterBackend::createWithExecutor(
+                    std::make_unique<FakeCt32Executor>(
+                        FakeCt32Executor::Behavior::Exact, false),
+                    config, unavailableVram,
+                    [](const GsDrawCommand &) {}, {}, nullptr);
+            t.IsNotNull(unavailable.get(),
+                        "a base-capable executor should remain generally usable");
+            if (unavailable)
+            {
+                t.Equals(unavailable->classify(command).reason,
+                         GsFallbackReason::BackendUnavailable,
+                         "missing shaderInt64 should produce a named fallback");
+                t.IsTrue(unavailableVram == initial,
+                         "capability classification must not mutate VRAM");
+                t.Equals(
+                    unavailable->serviceStatistics().triangleDrawsFailed,
+                    0ull,
+                    "capability fallback must not post triangle work");
+            }
         });
 
         tc.Run("Vulkan hybrid backend keeps disjoint pages resident until scoped CPU access", [](TestCase &t)
@@ -2776,6 +2893,73 @@ void register_ps2_gs_vulkan_tests()
                      "the software oracle should remain canonical on mismatch");
         });
 
+        tc.Run("Vulkan triangle mismatch artifact retains exact shader record", [](TestCase &t)
+        {
+            GSMem::InitLookupTables();
+            ScopedArtifactDirectory artifacts;
+            const GsDrawCommand command = makeCt32TriangleCommand(
+                92u, 5u, 1u,
+                {0u, 31u, 0u, 31u}, {0u, 0u},
+                {65u, 337u, 113u},
+                {81u, 145u, 321u},
+                0x88776655u);
+            std::vector<uint8_t> vram(GS_VULKAN_VRAM_SIZE, 0u);
+
+            GsVulkanRasterBackendConfig config{};
+            config.mode = GsRendererMode::Verify;
+            config.verificationArtifactDirectory =
+                artifacts.path.string();
+            std::unique_ptr<GsVulkanRasterBackend> backend =
+                GsVulkanRasterBackend::createWithExecutor(
+                    std::make_unique<FakeCt32Executor>(
+                        FakeCt32Executor::Behavior::Noop),
+                    config, vram,
+                    [&](const GsDrawCommand &draw)
+                    {
+                        GsVulkanCt32Triangle triangle{};
+                        if (prepareGsVulkanCt32Triangle(
+                                draw, triangle).supported)
+                        {
+                            applyCt32TriangleCpu(vram, triangle);
+                        }
+                    },
+                    {}, nullptr);
+            t.IsNotNull(backend.get(),
+                        "the triangle mismatch backend should construct");
+            if (!backend)
+                return;
+
+            bool mismatch = false;
+            try
+            {
+                backend->submit(
+                    std::span<const GsDrawCommand>(&command, 1u));
+            }
+            catch (const std::runtime_error &)
+            {
+                mismatch = true;
+            }
+            t.IsTrue(mismatch,
+                     "the injected no-op triangle should disagree with software");
+            const std::filesystem::path bundle =
+                backend->backendStatistics().lastVerificationArtifact;
+            t.IsTrue(std::filesystem::is_directory(bundle),
+                     "the triangle reproducer should be published atomically");
+            std::ifstream manifest(bundle / "command.json");
+            const std::string manifestText{
+                std::istreambuf_iterator<char>(manifest),
+                std::istreambuf_iterator<char>()};
+            t.IsTrue(manifestText.find("\"triangle\"") !=
+                         std::string::npos,
+                     "the manifest should identify the triangle record");
+            t.IsTrue(manifestText.find("\"vertex0_x_12_4\"") !=
+                         std::string::npos,
+                     "the manifest should retain signed fixed-point vertices");
+            t.IsTrue(manifestText.find("\"top_left_edge_mask\"") !=
+                         std::string::npos,
+                     "the manifest should retain exact edge ownership");
+        });
+
         tc.Run("GS Vulkan verify and hybrid preserve fallback transfer ordering", [](TestCase &t)
         {
             GSMem::InitLookupTables();
@@ -2938,6 +3122,146 @@ void register_ps2_gs_vulkan_tests()
                      "integrated transitions should remain validation-clean");
             t.Equals(serviceStatistics.validationWarnings, 0u,
                      "integrated transitions should emit no validation warnings");
+        });
+
+        tc.Run("GS Vulkan routes flat CT32 triangles through Verify only", [](TestCase &t)
+        {
+            GSMem::InitLookupTables();
+            std::vector<uint8_t> softwareVram =
+                makeVramPattern(0x54524956u);
+            std::vector<uint8_t> acceleratedVram = softwareVram;
+            GS software;
+            GS accelerated;
+            software.init(
+                softwareVram.data(),
+                static_cast<uint32_t>(softwareVram.size()), nullptr);
+            accelerated.init(
+                acceleratedVram.data(),
+                static_cast<uint32_t>(acceleratedVram.size()), nullptr);
+            configureFlatCt32Draws(software);
+            configureFlatCt32Draws(accelerated);
+
+            GsVulkanCapabilityReport preflight{};
+            const GsVulkanServiceConfig config =
+                makeRendererServiceConfig(preflight);
+            t.IsTrue(accelerated.configureVulkanRenderer(config),
+                     "a software-mode GS should accept triangle renderer configuration");
+            if (!preflight.ready())
+            {
+                t.IsFalse(accelerated.setRendererMode(
+                              GsRendererMode::Verify),
+                          "an unavailable host should decline triangle Verify cleanly");
+                return;
+            }
+
+            t.IsTrue(accelerated.setRendererMode(
+                         GsRendererMode::Verify),
+                     "a generally capable host should create Verify");
+            if (accelerated.rendererMode() != GsRendererMode::Verify)
+                return;
+            accelerated.setBackendCountersEnabled(true);
+            accelerated.resetBackendCounters();
+
+            constexpr std::array<uint16_t, 3> firstX{{
+                3u * 16u + 1u,
+                27u * 16u + 15u,
+                8u * 16u + 7u,
+            }};
+            constexpr std::array<uint16_t, 3> firstY{{
+                5u * 16u + 3u,
+                9u * 16u + 11u,
+                24u * 16u + 5u,
+            }};
+            drawFlatCt32Triangle(
+                software, firstX, firstY, 0xD4C3B2A1u);
+            drawFlatCt32Triangle(
+                accelerated, firstX, firstY, 0xD4C3B2A1u);
+            (void)software.getDebugSnapshot();
+            (void)accelerated.getDebugSnapshot();
+            t.IsTrue(acceleratedVram == softwareVram,
+                     "Verify triangle routing should retain the complete software image");
+
+            const GsVulkanDeviceReport *selected =
+                preflight.selectedDevice();
+            const bool exactTriangle =
+                selected && selected->exactCt32Triangle;
+            const GsBackendCounters verifyCounters =
+                accelerated.backendCounters();
+            t.Equals(verifyCounters.commands, 1ull,
+                     "the Verify fixture should assemble one triangle");
+            t.Equals(verifyCounters.acceleratedCommands,
+                     exactTriangle ? 1ull : 0ull,
+                     "only the explicit triangle capability should select GPU Verify");
+            t.Equals(verifyCounters.verifiedCommands,
+                     exactTriangle ? 1ull : 0ull,
+                     "only a GPU-routed triangle should count as verified");
+            t.Equals(verifyCounters.softwareCommands,
+                     exactTriangle ? 0ull : 1ull,
+                     "missing triangle capability should retain software fallback");
+            t.Equals(
+                verifyCounters.decisions[static_cast<size_t>(
+                    exactTriangle
+                        ? GsFallbackReason::Supported
+                        : GsFallbackReason::BackendUnavailable)],
+                1ull,
+                "Verify should record the exact capability decision");
+            const GsVulkanRasterBackendStatistics verifyBackend =
+                accelerated.vulkanRendererBackendStatistics();
+            t.Equals(verifyBackend.verifiedCommands,
+                     exactTriangle ? 1ull : 0ull,
+                     "the backend should compare only a capable triangle");
+            const GsVulkanServiceStatistics verifyService =
+                accelerated.vulkanRendererServiceStatistics();
+            t.Equals(verifyService.triangleDrawsCompleted,
+                     exactTriangle ? 1ull : 0ull,
+                     "the service should receive only capability-approved triangles");
+            t.Equals(verifyService.spriteDrawsCompleted, 0ull,
+                     "triangle routing must not alias the sprite request");
+
+            t.IsTrue(accelerated.setRendererMode(
+                         GsRendererMode::Hybrid),
+                     "the synchronized Verify backend should enter Hybrid");
+            accelerated.resetBackendCounters();
+            constexpr std::array<uint16_t, 3> secondX{{
+                35u * 16u,
+                55u * 16u,
+                39u * 16u,
+            }};
+            constexpr std::array<uint16_t, 3> secondY{{
+                7u * 16u,
+                12u * 16u,
+                29u * 16u,
+            }};
+            drawFlatCt32Triangle(
+                software, secondX, secondY, 0x88776655u);
+            drawFlatCt32Triangle(
+                accelerated, secondX, secondY, 0x88776655u);
+            (void)software.getDebugSnapshot();
+            (void)accelerated.getDebugSnapshot();
+            t.IsTrue(acceleratedVram == softwareVram,
+                     "Hybrid should retain exact software triangle fallback");
+            const GsBackendCounters hybridCounters =
+                accelerated.backendCounters();
+            t.Equals(hybridCounters.acceleratedCommands, 0ull,
+                     "Hybrid must not accelerate the unqualified triangle class");
+            t.Equals(hybridCounters.softwareCommands, 1ull,
+                     "Hybrid should execute the triangle once in software");
+            t.Equals(hybridCounters.fallbackCommands, 1ull,
+                     "Hybrid triangle fallback should remain explicit");
+            t.Equals(
+                hybridCounters.decisions[static_cast<size_t>(
+                    GsFallbackReason::UnsupportedPrimitive)],
+                1ull,
+                "Hybrid should retain the existing primitive rejection");
+            const GsVulkanServiceStatistics finalService =
+                accelerated.vulkanRendererServiceStatistics();
+            t.Equals(finalService.triangleDrawsCompleted,
+                     exactTriangle ? 1ull : 0ull,
+                     "Hybrid fallback must not add a triangle dispatch");
+            t.Equals(finalService.validationErrors, 0u,
+                     "integrated triangle routing should remain validation-clean");
+            t.Equals(finalService.validationWarnings, 0u,
+                     "integrated triangle routing should emit no validation warnings");
         });
 
         tc.Run("GS Vulkan hybrid scopes host transfers and readbacks to overlapping pages", [](TestCase &t)
