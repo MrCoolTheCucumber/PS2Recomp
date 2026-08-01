@@ -2299,8 +2299,8 @@ void register_ps2_gs_vulkan_tests()
             t.IsTrue(backend->setMode(GsRendererMode::Hybrid),
                      "the synchronized backend should accept Hybrid mode");
             t.Equals(backend->classify(command).reason,
-                     GsFallbackReason::Textured,
-                     "Hybrid should remain closed until texture cost qualification");
+                     GsFallbackReason::CostModel,
+                     "Hybrid should keep the small qualified texture on the CPU");
 
             std::vector<uint8_t> unavailableVram = initial;
             std::unique_ptr<GsVulkanRasterBackend> unavailable =
@@ -2314,9 +2314,11 @@ void register_ps2_gs_vulkan_tests()
                         "a base-capable executor should retain texture fallback");
             if (unavailable)
             {
+                t.IsTrue(unavailable->setMode(GsRendererMode::Hybrid),
+                         "the unavailable fixture should exercise Hybrid ordering");
                 t.Equals(unavailable->classify(command).reason,
                          GsFallbackReason::BackendUnavailable,
-                         "missing exact texture capability should fail before submission");
+                         "missing exact texture capability should precede cost fallback");
                 t.IsTrue(unavailable->setMode(GsRendererMode::GpuStrict),
                          "the base-capable executor should still enter strict mode");
                 t.Equals(unavailable->classify(command).reason,
@@ -3226,6 +3228,145 @@ void register_ps2_gs_vulkan_tests()
                      "upload draw and observation should each wait once");
         });
 
+        tc.Run("Vulkan hybrid nearest CT32 cost policy uses sample bounds", [](TestCase &t)
+        {
+            GSMem::InitLookupTables();
+            constexpr uint64_t thresholdPixels = 8'192u;
+            const GsDrawCommand belowThreshold =
+                makeNearestCt32SpriteCommand(
+                    303u, 100u, 2u, 64u, 1u, 6u, 5u,
+                    {0u, 127u, 0u, 63u}, {0u, 0u},
+                    {0u, 127u * 16u}, {0u, 64u * 16u},
+                    {0u, 127u * 16u}, {0u, 64u * 16u});
+            const GsDrawCommand atThreshold =
+                makeNearestCt32SpriteCommand(
+                    304u, 110u, 2u, 64u, 1u, 6u, 5u,
+                    {0u, 127u, 0u, 63u}, {0u, 0u},
+                    {0u, 128u * 16u}, {0u, 64u * 16u},
+                    {0u, 128u * 16u}, {0u, 64u * 16u});
+
+            GsVulkanNearestCt32Sprite belowPrepared{};
+            GsVulkanNearestCt32Sprite thresholdPrepared{};
+            t.IsTrue(prepareGsVulkanNearestCt32Sprite(
+                         belowThreshold, belowPrepared).supported,
+                     "the below-threshold texture should be semantically eligible");
+            t.IsTrue(prepareGsVulkanNearestCt32Sprite(
+                         atThreshold, thresholdPrepared).supported,
+                     "the threshold texture should be semantically eligible");
+            const auto samplePixels = [](
+                const GsVulkanNearestCt32Sprite &sprite)
+            {
+                return
+                    static_cast<uint64_t>(
+                        sprite.boundsX1 - sprite.boundsX0) *
+                    static_cast<uint64_t>(
+                        sprite.boundsY1 - sprite.boundsY0);
+            };
+            t.Equals(samplePixels(belowPrepared), 8'128ull,
+                     "the smaller texture should be 64 samples short");
+            t.Equals(samplePixels(thresholdPrepared), thresholdPixels,
+                     "the larger texture should meet the policy exactly");
+
+            std::vector<uint8_t> vram = makeVramPattern(0x5458434Fu);
+            std::vector<uint8_t> expected = vram;
+            applyNearestCt32SpriteCpu(expected, thresholdPrepared);
+            uint64_t softwareCalls = 0u;
+            uint64_t commitCalls = 0u;
+            GsVulkanRasterBackendConfig config{};
+            config.mode = GsRendererMode::Hybrid;
+            t.Equals(config.minimumHybridNearestCt32SpritePixels,
+                     thresholdPixels,
+                     "the measured nearest-texture threshold should be the default");
+            std::unique_ptr<GsVulkanRasterBackend> backend =
+                GsVulkanRasterBackend::createWithExecutor(
+                    std::make_unique<FakeCt32Executor>(
+                        FakeCt32Executor::Behavior::Exact),
+                    config, vram,
+                    [&](const GsDrawCommand &) { ++softwareCalls; },
+                    [&](const GsDrawCommand &) { ++commitCalls; }, nullptr);
+            t.IsNotNull(backend.get(),
+                        "an exact executor should create Hybrid texture policy");
+            if (!backend)
+                return;
+
+            t.Equals(backend->classify(belowThreshold).reason,
+                     GsFallbackReason::CostModel,
+                     "a texture below the measured sample count should stay on the CPU");
+            t.IsTrue(backend->classify(atThreshold).supported,
+                     "a texture exactly at the measured sample count should use the GPU");
+            t.IsTrue(backend->setMode(GsRendererMode::GpuStrict),
+                     "the fixture should switch to strict mode");
+            t.IsTrue(backend->classify(belowThreshold).supported,
+                     "strict mode should ignore the texture cost policy");
+            t.IsTrue(backend->setMode(GsRendererMode::Verify),
+                     "the fixture should switch to Verify mode");
+            t.IsTrue(backend->classify(belowThreshold).supported,
+                     "Verify should exercise every semantic texture candidate");
+            t.IsTrue(backend->setMode(GsRendererMode::Hybrid),
+                     "the fixture should restore Hybrid policy routing");
+
+            backend->submit(
+                std::span<const GsDrawCommand>(&atThreshold, 1u));
+            t.Equals(backend->pendingCommandCount(), size_t{1u},
+                     "the threshold texture should remain resident until observation");
+            backend->flush(GsFlushReason::Explicit);
+            backend->prepareCpuVramAccess(
+                atThreshold.resources().writePages,
+                GsFlushReason::CpuReadback);
+            t.IsTrue(vram == expected,
+                     "the accepted threshold texture should remain byte-exact");
+            t.Equals(softwareCalls, 0ull,
+                     "an accepted Hybrid texture must not call the oracle");
+            t.Equals(commitCalls, 1ull,
+                     "the accepted Hybrid texture should publish one commit");
+            const GsVulkanServiceStatistics service =
+                backend->serviceStatistics();
+            t.Equals(service.nearestCt32SpriteDrawsCompleted, 1ull,
+                     "the accepted Hybrid texture should reach the executor once");
+            t.Equals(service.residentNearestCt32SpriteBatchesCompleted, 1ull,
+                     "the accepted Hybrid texture should use one resident batch");
+
+            std::vector<uint8_t> unavailableVram =
+                makeVramPattern(0x54584355u);
+            std::unique_ptr<GsVulkanRasterBackend> unavailable =
+                GsVulkanRasterBackend::createWithExecutor(
+                    std::make_unique<FakeCt32Executor>(
+                        FakeCt32Executor::Behavior::Exact, true, false),
+                    config, unavailableVram,
+                    [](const GsDrawCommand &) {}, {}, nullptr);
+            t.IsNotNull(unavailable.get(),
+                        "a base-capable executor should retain Hybrid texture fallback");
+            if (unavailable)
+            {
+                t.Equals(unavailable->classify(belowThreshold).reason,
+                         GsFallbackReason::BackendUnavailable,
+                         "missing exact texture coverage should take priority over cost");
+                t.Equals(
+                    unavailable->serviceStatistics()
+                        .nearestCt32SpriteDrawsFailed,
+                    0ull,
+                    "capability fallback must not post texture work");
+            }
+
+            GsVulkanRasterBackendConfig disabledConfig = config;
+            disabledConfig.minimumHybridNearestCt32SpritePixels = 0u;
+            std::vector<uint8_t> disabledVram =
+                makeVramPattern(0x5458435Au);
+            std::unique_ptr<GsVulkanRasterBackend> disabled =
+                GsVulkanRasterBackend::createWithExecutor(
+                    std::make_unique<FakeCt32Executor>(
+                        FakeCt32Executor::Behavior::Exact),
+                    disabledConfig, disabledVram,
+                    [](const GsDrawCommand &) {}, {}, nullptr);
+            t.IsNotNull(disabled.get(),
+                        "a zero-threshold Hybrid texture backend should construct");
+            if (disabled)
+            {
+                t.IsTrue(disabled->classify(belowThreshold).supported,
+                         "zero should disable the Hybrid texture cost policy");
+            }
+        });
+
         tc.Run("Vulkan hybrid triangle cost policy uses candidate bounds", [](TestCase &t)
         {
             GSMem::InitLookupTables();
@@ -4051,8 +4192,13 @@ void register_ps2_gs_vulkan_tests()
             t.Equals(
                 counters.decisions[static_cast<size_t>(
                     GsFallbackReason::Textured)],
+                0ull,
+                "qualified nearest feedback should no longer use generic texture fallback");
+            t.Equals(
+                counters.decisions[static_cast<size_t>(
+                    GsFallbackReason::ResourceAlias)],
                 8ull,
-                "each shuffled cycle should contain one feedback fallback");
+                "each shuffled feedback draw should name its source-destination alias");
             t.IsTrue(counters.queueHighWatermark >= 2ull,
                      "local-copy setup should expose compatible GPU queueing");
             t.IsTrue(
@@ -4997,6 +5143,156 @@ void register_ps2_gs_vulkan_tests()
                      "integrated texture Verify should remain validation-clean");
             t.Equals(service.validationWarnings, 0u,
                      "integrated texture Verify should emit no validation warnings");
+        });
+
+        tc.Run("GS Vulkan Hybrid qualifies nearest CT32 textures at 8192 samples", [](TestCase &t)
+        {
+            GSMem::InitLookupTables();
+            constexpr uint64_t thresholdPixels = 8'192u;
+            const GsDrawCommand belowThreshold =
+                makeNearestCt32SpriteCommand(
+                    95u, 100u, 2u, 64u, 1u, 6u, 5u,
+                    {0u, 127u, 0u, 63u}, {0u, 0u},
+                    {0u, 127u * 16u}, {0u, 64u * 16u},
+                    {0u, 127u * 16u}, {0u, 64u * 16u});
+            const GsDrawCommand atThreshold =
+                makeNearestCt32SpriteCommand(
+                    96u, 110u, 2u, 64u, 1u, 6u, 5u,
+                    {0u, 127u, 0u, 63u}, {0u, 0u},
+                    {0u, 128u * 16u}, {0u, 64u * 16u},
+                    {0u, 128u * 16u}, {0u, 64u * 16u});
+            GsVulkanNearestCt32Sprite belowPrepared{};
+            GsVulkanNearestCt32Sprite thresholdPrepared{};
+            t.IsTrue(prepareGsVulkanNearestCt32Sprite(
+                         belowThreshold, belowPrepared).supported,
+                     "the real below-threshold fixture should be eligible");
+            t.IsTrue(prepareGsVulkanNearestCt32Sprite(
+                         atThreshold, thresholdPrepared).supported,
+                     "the real threshold fixture should be eligible");
+
+            std::vector<uint8_t> softwareVram =
+                makeVramPattern(0x54584859u);
+            std::vector<uint8_t> acceleratedVram = softwareVram;
+            GS software;
+            GS accelerated;
+            software.init(
+                softwareVram.data(),
+                static_cast<uint32_t>(softwareVram.size()), nullptr);
+            accelerated.init(
+                acceleratedVram.data(),
+                static_cast<uint32_t>(acceleratedVram.size()), nullptr);
+
+            GsVulkanCapabilityReport preflight{};
+            const GsVulkanServiceConfig serviceConfig =
+                makeRendererServiceConfig(preflight);
+            GsVulkanRasterBackendConfig backendConfig{};
+            t.Equals(backendConfig.minimumHybridNearestCt32SpritePixels,
+                     thresholdPixels,
+                     "the integrated fixture should use the measured default");
+            t.IsTrue(accelerated.configureVulkanRenderer(
+                         serviceConfig, backendConfig),
+                     "the Hybrid texture fixture should accept Vulkan configuration");
+            if (!preflight.ready())
+            {
+                t.IsFalse(accelerated.setRendererMode(
+                              GsRendererMode::Hybrid),
+                          "an unavailable host should decline texture Hybrid cleanly");
+                return;
+            }
+
+            const GsVulkanDeviceReport *selected =
+                preflight.selectedDevice();
+            t.IsNotNull(selected,
+                        "a ready Hybrid texture preflight should select one device");
+            if (!selected)
+                return;
+            t.IsTrue(selected->exactNearestCt32Sprite,
+                     "the selected device should expose exact nearest textures");
+            if (!selected->exactNearestCt32Sprite)
+                return;
+
+            t.IsTrue(accelerated.setRendererMode(
+                         GsRendererMode::Hybrid),
+                     "the qualified host should enter texture Hybrid mode");
+            if (accelerated.rendererMode() != GsRendererMode::Hybrid)
+                return;
+            accelerated.setBackendCountersEnabled(true);
+            accelerated.resetBackendCounters();
+
+            drawNearestCt32SpriteCommand(software, belowThreshold);
+            drawNearestCt32SpriteCommand(accelerated, belowThreshold);
+            drawNearestCt32SpriteCommand(software, atThreshold);
+            drawNearestCt32SpriteCommand(accelerated, atThreshold);
+
+            GsBackendCounters counters = accelerated.backendCounters();
+            t.Equals(counters.queueDepth, 1ull,
+                     "only the threshold texture should remain GPU-resident");
+            t.Equals(counters.softwareCommands, 1ull,
+                     "the smaller texture should execute once in software");
+            t.Equals(counters.acceleratedCommands, 1ull,
+                     "the threshold texture should route to Vulkan once");
+
+            (void)software.getDebugSnapshot();
+            (void)accelerated.getDebugSnapshot();
+            t.IsTrue(acceleratedVram == softwareVram,
+                     "mixed Hybrid texture routing should match complete software VRAM");
+
+            counters = accelerated.backendCounters();
+            t.Equals(counters.commands, 2ull,
+                     "Hybrid should classify both texture fixtures");
+            t.Equals(counters.softwareCommands, 1ull,
+                     "only the below-threshold texture should use software");
+            t.Equals(counters.fallbackCommands, 1ull,
+                     "the smaller texture should record one fallback");
+            t.Equals(counters.acceleratedCommands, 1ull,
+                     "only the threshold texture should use Vulkan");
+            t.Equals(counters.drawPixels, 16'320ull,
+                     "draw accounting should include both exact sample rectangles");
+            t.Equals(counters.softwarePixels, 8'128ull,
+                     "software accounting should retain the smaller rectangle");
+            t.Equals(counters.fallbackPixels, 8'128ull,
+                     "fallback accounting should retain the smaller rectangle");
+            t.Equals(counters.acceleratedPixels, thresholdPixels,
+                     "accelerated accounting should retain the threshold rectangle");
+            t.Equals(counters.decisions[static_cast<size_t>(
+                         GsFallbackReason::CostModel)],
+                     1ull,
+                     "Hybrid should retain one named texture cost decision");
+            t.Equals(counters.decisions[static_cast<size_t>(
+                         GsFallbackReason::Supported)],
+                     1ull,
+                     "Hybrid should retain one supported texture decision");
+
+            const GsVulkanRasterBackendStatistics backend =
+                accelerated.vulkanRendererBackendStatistics();
+            t.Equals(backend.commandsAttempted, 1ull,
+                     "cost fallback must not become a backend attempt");
+            t.Equals(backend.commandsCompleted, 1ull,
+                     "the threshold texture should complete once");
+            t.Equals(backend.committedGpuCommands, 1ull,
+                     "the threshold texture should publish one GPU result");
+            t.Equals(backend.residentCommands, 1ull,
+                     "the accepted Hybrid texture should remain resident");
+            t.Equals(backend.pageOwnership.gpuNewerPages, size_t{0u},
+                     "debug observation should publish the texture destination");
+
+            const GsVulkanServiceStatistics service =
+                accelerated.vulkanRendererServiceStatistics();
+            t.Equals(service.nearestCt32SpriteDrawsCompleted, 1ull,
+                     "the real service should execute only the threshold texture");
+            t.Equals(service.nearestCt32SpriteDrawsFailed, 0ull,
+                     "real Hybrid texture execution should not fail");
+            t.Equals(service.nearestCt32SpritePixelsExecuted,
+                     thresholdPixels,
+                     "the service should retain the threshold sample count");
+            t.Equals(service.residentNearestCt32SpriteBatchesCompleted, 1ull,
+                     "the accepted texture should use one resident service batch");
+            t.Equals(service.largestResidentNearestCt32SpriteBatch, 1ull,
+                     "the real cost fixture should expose a one-draw batch");
+            t.Equals(service.validationErrors, 0u,
+                     "real Hybrid texture routing should remain validation-clean");
+            t.Equals(service.validationWarnings, 0u,
+                     "real Hybrid texture routing should emit no validation warnings");
         });
 
         tc.Run("GS Vulkan routes nearest CT32 texture sprites in strict mode", [](TestCase &t)

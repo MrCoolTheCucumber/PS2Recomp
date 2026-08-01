@@ -823,7 +823,8 @@ GsBackendDecision GsVulkanRasterBackend::classify(
 
     if (command.primitive().type == GS_PRIM_SPRITE &&
         command.primitive().tme &&
-        (m_impl->config.mode == GsRendererMode::Verify ||
+        (m_impl->config.mode == GsRendererMode::Hybrid ||
+         m_impl->config.mode == GsRendererMode::Verify ||
          m_impl->config.mode == GsRendererMode::GpuStrict))
     {
         GsVulkanNearestCt32Sprite texturedSprite{};
@@ -834,6 +835,20 @@ GsBackendDecision GsVulkanRasterBackend::classify(
             return textureDecision;
         if (!m_impl->exactNearestCt32Sprite)
             return {false, GsFallbackReason::BackendUnavailable};
+
+        if (m_impl->config.mode == GsRendererMode::Hybrid)
+        {
+            const uint64_t pixels =
+                static_cast<uint64_t>(
+                    texturedSprite.boundsX1 - texturedSprite.boundsX0) *
+                static_cast<uint64_t>(
+                    texturedSprite.boundsY1 - texturedSprite.boundsY0);
+            if (pixels <
+                m_impl->config.minimumHybridNearestCt32SpritePixels)
+            {
+                return {false, GsFallbackReason::CostModel};
+            }
+        }
         return textureDecision;
     }
 

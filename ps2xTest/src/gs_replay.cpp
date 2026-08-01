@@ -69,6 +69,7 @@ namespace
                "[--verify-dump-dir DIRECTORY] "
                "[--vulkan-max-resident-batch COUNT] "
                "[--vulkan-min-hybrid-pixels COUNT] "
+               "[--vulkan-min-hybrid-nearest-ct32-pixels COUNT] "
                "[--vulkan-min-hybrid-triangle-pixels COUNT] "
                "[--vulkan-validation] [--vulkan-loader FILE] "
                "[--vulkan-vendor ID] [--vulkan-device ID] "
@@ -310,6 +311,8 @@ namespace
                    << (device.exactVramStorage ? "true" : "false")
                    << ",\"exact_ct32_triangle\":"
                    << (device.exactCt32Triangle ? "true" : "false")
+                   << ",\"exact_nearest_ct32_sprite\":"
+                   << (device.exactNearestCt32Sprite ? "true" : "false")
                    << ",\"suitable\":"
                    << (device.suitable ? "true" : "false")
                    << ",\"rejection_reason\":";
@@ -372,6 +375,18 @@ namespace
                << statistics.spriteDrawsFailed
                << ",\"sprite_pixels_executed\":"
                << statistics.spritePixelsExecuted
+               << ",\"nearest_ct32_sprite_draws_completed\":"
+               << statistics.nearestCt32SpriteDrawsCompleted
+               << ",\"nearest_ct32_sprite_draws_failed\":"
+               << statistics.nearestCt32SpriteDrawsFailed
+               << ",\"nearest_ct32_sprite_pixels_executed\":"
+               << statistics.nearestCt32SpritePixelsExecuted
+               << ",\"resident_nearest_ct32_sprite_batches_completed\":"
+               << statistics.residentNearestCt32SpriteBatchesCompleted
+               << ",\"resident_nearest_ct32_sprite_batches_failed\":"
+               << statistics.residentNearestCt32SpriteBatchesFailed
+               << ",\"largest_resident_nearest_ct32_sprite_batch\":"
+               << statistics.largestResidentNearestCt32SpriteBatch
                << ",\"triangle_draws_completed\":"
                << statistics.triangleDrawsCompleted
                << ",\"triangle_draws_failed\":"
@@ -774,6 +789,7 @@ int main(int argc, char **argv)
             argument == "--verify-dump-dir" ||
             argument == "--vulkan-max-resident-batch" ||
             argument == "--vulkan-min-hybrid-pixels" ||
+            argument == "--vulkan-min-hybrid-nearest-ct32-pixels" ||
             argument == "--vulkan-min-hybrid-triangle-pixels" ||
             argument == "--vulkan-loader" ||
             argument == "--vulkan-vendor" ||
@@ -850,6 +866,26 @@ int main(int argc, char **argv)
                     return 2;
                 }
                 vulkanBackendConfig.minimumHybridSpritePixels = minimum;
+                vulkanOptionUsed = true;
+                replayOptionUsed = true;
+                gifReplayOptionUsed = true;
+            }
+            else if (argument ==
+                     "--vulkan-min-hybrid-nearest-ct32-pixels")
+            {
+                uint64_t minimum = 0u;
+                constexpr uint64_t maximumPixels = 2048ull * 2048ull;
+                if (!parseCount(argv[index], minimum) ||
+                    minimum > maximumPixels)
+                {
+                    std::cerr
+                        << "Vulkan hybrid nearest CT32 pixel threshold "
+                           "must be between 0 and "
+                        << maximumPixels << '\n';
+                    return 2;
+                }
+                vulkanBackendConfig.minimumHybridNearestCt32SpritePixels =
+                    minimum;
                 vulkanOptionUsed = true;
                 replayOptionUsed = true;
                 gifReplayOptionUsed = true;
