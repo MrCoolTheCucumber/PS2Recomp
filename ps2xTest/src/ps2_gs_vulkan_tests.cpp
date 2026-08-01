@@ -3729,8 +3729,8 @@ void register_ps2_gs_vulkan_tests()
                       "Hybrid should keep the small repeat fixture on software");
             t.Equals(
                 backend->classify(commands.back()).reason,
-                GsFallbackReason::UnsupportedTextureWrap,
-                "Hybrid clamp should remain closed until cost qualification");
+                GsFallbackReason::CostModel,
+                "Hybrid should keep the small clamp fixture on software");
 
             std::vector<uint8_t> unavailableVram = initial;
             std::unique_ptr<GsVulkanRasterBackend> unavailable =
@@ -4937,6 +4937,154 @@ void register_ps2_gs_vulkan_tests()
             {
                 t.IsTrue(disabled->classify(belowThreshold).supported,
                          "zero should disable the Hybrid linear cost policy");
+            }
+        });
+
+        tc.Run("Vulkan hybrid linear CT32 clamp uses its measured work", [](TestCase &t)
+        {
+            GSMem::InitLookupTables();
+            constexpr uint64_t thresholdPixels = 8'192u;
+            constexpr uint32_t width = 32u;
+            const auto makeCommand = [](
+                uint64_t sequence, uint32_t height,
+                uint8_t wrapU, uint8_t wrapV)
+            {
+                return makeLinearCt32SpriteCommand(
+                    sequence, 0u, 1u, 400u * 32u, 1u, 6u, 5u,
+                    {0u, static_cast<uint16_t>(width - 1u),
+                     0u, static_cast<uint16_t>(height - 1u)},
+                    {0u, 0u},
+                    {0u, static_cast<uint16_t>(width * 16u)},
+                    {0u, static_cast<uint16_t>(height * 16u)},
+                    {3u, static_cast<uint16_t>(width * 16u + 3u)},
+                    {5u, static_cast<uint16_t>(height * 16u + 5u)},
+                    wrapU, wrapV);
+            };
+            const GsDrawCommand belowThreshold =
+                makeCommand(307u, 255u, 1u, 1u);
+            const GsDrawCommand admitted =
+                makeCommand(308u, 256u, 1u, 1u);
+            const GsDrawCommand repeatAtClampThreshold =
+                makeCommand(309u, 256u, 0u, 0u);
+
+            std::array<GsVulkanLinearCt32Sprite, 2> prepared{};
+            const std::array<const GsDrawCommand *, 2> clampCommands{{
+                &belowThreshold, &admitted,
+            }};
+            for (size_t index = 0u; index < clampCommands.size(); ++index)
+            {
+                t.IsTrue(
+                    prepareGsVulkanLinearCt32Sprite(
+                        *clampCommands[index], prepared[index]).supported,
+                    "every clamp cost fixture should be semantically eligible");
+            }
+            const auto pixels = [](const GsVulkanLinearCt32Sprite &sprite)
+            {
+                return static_cast<uint64_t>(
+                           sprite.boundsX1 - sprite.boundsX0) *
+                       static_cast<uint64_t>(
+                           sprite.boundsY1 - sprite.boundsY0);
+            };
+            t.Equals(pixels(prepared[0]), 8'160ull,
+                     "the smaller clamp fixture should be one row below policy");
+            t.Equals(pixels(prepared[1]), thresholdPixels,
+                     "the admitted clamp fixture should land on policy");
+
+            std::vector<uint8_t> vram = makeVramPattern(0x4C48434Cu);
+            std::vector<uint8_t> expected = vram;
+            applyLinearCt32SpriteCpu(expected, prepared[1]);
+            uint64_t softwareCalls = 0u;
+            uint64_t commitCalls = 0u;
+            GsVulkanRasterBackendConfig config{};
+            config.mode = GsRendererMode::Hybrid;
+            t.Equals(config.minimumHybridLinearCt32ClampSpritePixels,
+                     thresholdPixels,
+                     "standard clamp should retain its measured default");
+            std::unique_ptr<GsVulkanRasterBackend> backend =
+                GsVulkanRasterBackend::createWithExecutor(
+                    std::make_unique<FakeCt32Executor>(
+                        FakeCt32Executor::Behavior::Exact),
+                    config, vram,
+                    [&](const GsDrawCommand &) { ++softwareCalls; },
+                    [&](const GsDrawCommand &) { ++commitCalls; }, nullptr);
+            t.IsNotNull(backend.get(),
+                        "an exact executor should create Hybrid clamp policy");
+            if (!backend)
+                return;
+
+            t.Equals(backend->classify(belowThreshold).reason,
+                     GsFallbackReason::CostModel,
+                     "insufficient clamp work should stay on the CPU");
+            t.IsTrue(backend->classify(admitted).supported,
+                     "the measured clamp envelope should use the GPU");
+            t.Equals(backend->classify(repeatAtClampThreshold).reason,
+                     GsFallbackReason::CostModel,
+                     "clamp policy must not lower the REPEAT threshold");
+            t.IsTrue(backend->setMode(GsRendererMode::GpuStrict),
+                     "the clamp fixture should switch to strict mode");
+            t.IsTrue(backend->classify(belowThreshold).supported,
+                     "strict mode should ignore clamp cost policy");
+            t.IsTrue(backend->setMode(GsRendererMode::Verify),
+                     "the clamp fixture should switch to Verify mode");
+            t.IsTrue(backend->classify(belowThreshold).supported,
+                     "Verify should exercise every semantic clamp candidate");
+            t.IsTrue(backend->setMode(GsRendererMode::Hybrid),
+                     "the clamp fixture should restore Hybrid routing");
+
+            backend->submit(std::span<const GsDrawCommand>(&admitted, 1u));
+            t.Equals(backend->pendingCommandCount(), size_t{1u},
+                     "the admitted clamp draw should remain resident");
+            backend->flush(GsFlushReason::Explicit);
+            backend->prepareCpuVramAccess(
+                admitted.resources().writePages,
+                GsFlushReason::CpuReadback);
+            t.IsTrue(vram == expected,
+                     "the admitted Hybrid clamp draw should remain byte-exact");
+            t.Equals(softwareCalls, 0ull,
+                     "an admitted Hybrid clamp draw must not call the oracle");
+            t.Equals(commitCalls, 1ull,
+                     "the admitted Hybrid clamp draw should commit once");
+            const GsVulkanServiceStatistics service =
+                backend->serviceStatistics();
+            t.Equals(service.linearCt32SpriteDrawsCompleted, 1ull,
+                     "the admitted clamp draw should reach the linear executor");
+            t.Equals(service.residentLinearCt32SpriteBatchesCompleted, 1ull,
+                     "the admitted clamp draw should use one resident batch");
+
+            std::vector<uint8_t> unavailableVram =
+                makeVramPattern(0x4C484343u);
+            std::unique_ptr<GsVulkanRasterBackend> unavailable =
+                GsVulkanRasterBackend::createWithExecutor(
+                    std::make_unique<FakeCt32Executor>(
+                        FakeCt32Executor::Behavior::Exact,
+                        true, true, false),
+                    config, unavailableVram,
+                    [](const GsDrawCommand &) {}, {}, nullptr);
+            t.IsNotNull(unavailable.get(),
+                        "a base-capable executor should retain clamp fallback");
+            if (unavailable)
+            {
+                t.Equals(unavailable->classify(admitted).reason,
+                         GsFallbackReason::BackendUnavailable,
+                         "missing linear capability should precede clamp cost");
+            }
+
+            GsVulkanRasterBackendConfig disabledConfig = config;
+            disabledConfig.minimumHybridLinearCt32ClampSpritePixels = 0u;
+            std::vector<uint8_t> disabledVram =
+                makeVramPattern(0x4C48435Cu);
+            std::unique_ptr<GsVulkanRasterBackend> disabled =
+                GsVulkanRasterBackend::createWithExecutor(
+                    std::make_unique<FakeCt32Executor>(
+                        FakeCt32Executor::Behavior::Exact),
+                    disabledConfig, disabledVram,
+                    [](const GsDrawCommand &) {}, {}, nullptr);
+            t.IsNotNull(disabled.get(),
+                        "a zero-threshold Hybrid clamp backend should construct");
+            if (disabled)
+            {
+                t.IsTrue(disabled->classify(belowThreshold).supported,
+                         "zero should disable only the clamp cost policy");
             }
         });
 
@@ -7269,6 +7417,174 @@ void register_ps2_gs_vulkan_tests()
                      "real Hybrid linear routing should remain validation-clean");
             t.Equals(service.validationWarnings, 0u,
                      "real Hybrid linear routing should emit no warnings");
+        });
+
+        tc.Run("GS Vulkan Hybrid qualifies linear CT32 clamp at measured work", [](TestCase &t)
+        {
+            GSMem::InitLookupTables();
+            constexpr uint64_t thresholdPixels = 8'192u;
+            constexpr uint32_t width = 32u;
+            const auto makeCommand = [](
+                uint64_t sequence, uint32_t framebufferPage,
+                uint32_t height, uint16_t uFraction)
+            {
+                return makeLinearCt32SpriteCommand(
+                    sequence, framebufferPage, 1u,
+                    400u * 32u, 1u, 6u, 5u,
+                    {0u, static_cast<uint16_t>(width - 1u),
+                     0u, static_cast<uint16_t>(height - 1u)},
+                    {0u, 0u},
+                    {0u, static_cast<uint16_t>(width * 16u)},
+                    {0u, static_cast<uint16_t>(height * 16u)},
+                    {uFraction,
+                     static_cast<uint16_t>(width * 16u + uFraction)},
+                    {5u, static_cast<uint16_t>(height * 16u + 5u)},
+                    1u, 1u);
+            };
+            const GsDrawCommand belowThreshold =
+                makeCommand(100u, 0u, 255u, 3u);
+            const GsDrawCommand admittedA =
+                makeCommand(101u, 8u, 256u, 3u);
+            const GsDrawCommand admittedB =
+                makeCommand(102u, 16u, 256u, 11u);
+            GsVulkanLinearCt32Sprite belowPrepared{};
+            GsVulkanLinearCt32Sprite admittedPrepared{};
+            t.IsTrue(
+                prepareGsVulkanLinearCt32Sprite(
+                    belowThreshold, belowPrepared).supported,
+                "the real below-threshold clamp fixture should be eligible");
+            t.IsTrue(
+                prepareGsVulkanLinearCt32Sprite(
+                    admittedA, admittedPrepared).supported,
+                "the real admitted clamp fixture should be eligible");
+            const auto pixels = [](const GsVulkanLinearCt32Sprite &sprite)
+            {
+                return static_cast<uint64_t>(
+                           sprite.boundsX1 - sprite.boundsX0) *
+                       static_cast<uint64_t>(
+                           sprite.boundsY1 - sprite.boundsY0);
+            };
+            t.Equals(pixels(belowPrepared), 8'160ull,
+                     "the real clamp fallback should remain below policy");
+            t.Equals(pixels(admittedPrepared), thresholdPixels,
+                     "the first admitted clamp row should land on policy");
+
+            std::vector<uint8_t> softwareVram =
+                makeVramPattern(0x4C48434Du);
+            std::vector<uint8_t> acceleratedVram = softwareVram;
+            GS software;
+            GS accelerated;
+            software.init(
+                softwareVram.data(),
+                static_cast<uint32_t>(softwareVram.size()), nullptr);
+            accelerated.init(
+                acceleratedVram.data(),
+                static_cast<uint32_t>(acceleratedVram.size()), nullptr);
+
+            GsVulkanCapabilityReport preflight{};
+            const GsVulkanServiceConfig serviceConfig =
+                makeRendererServiceConfig(preflight);
+            GsVulkanRasterBackendConfig backendConfig{};
+            t.Equals(
+                backendConfig.minimumHybridLinearCt32ClampSpritePixels,
+                thresholdPixels,
+                "the integrated clamp fixture should use measured work");
+            t.IsTrue(accelerated.configureVulkanRenderer(
+                         serviceConfig, backendConfig),
+                     "the Hybrid clamp fixture should accept Vulkan configuration");
+            if (!preflight.ready())
+            {
+                t.IsFalse(accelerated.setRendererMode(
+                              GsRendererMode::Hybrid),
+                          "an unavailable host should decline clamp Hybrid cleanly");
+                return;
+            }
+
+            const GsVulkanDeviceReport *selected =
+                preflight.selectedDevice();
+            t.IsNotNull(selected,
+                        "a ready Hybrid clamp preflight should select one device");
+            if (!selected)
+                return;
+            t.IsTrue(selected->exactLinearCt32Sprite,
+                     "the selected device should expose exact linear clamp");
+            if (!selected->exactLinearCt32Sprite)
+                return;
+
+            t.IsTrue(accelerated.setRendererMode(GsRendererMode::Hybrid),
+                     "the qualified host should enter clamp Hybrid mode");
+            if (accelerated.rendererMode() != GsRendererMode::Hybrid)
+                return;
+            accelerated.setBackendCountersEnabled(true);
+            accelerated.resetBackendCounters();
+
+            drawNearestCt32SpriteCommand(software, belowThreshold);
+            drawNearestCt32SpriteCommand(accelerated, belowThreshold);
+            drawNearestCt32SpriteCommand(software, admittedA);
+            drawNearestCt32SpriteCommand(accelerated, admittedA);
+            drawNearestCt32SpriteCommand(software, admittedB);
+            drawNearestCt32SpriteCommand(accelerated, admittedB);
+
+            GsBackendCounters counters = accelerated.backendCounters();
+            t.Equals(counters.queueDepth, 2ull,
+                     "admitted clamp draws should remain resident together");
+            t.Equals(counters.softwareCommands, 1ull,
+                     "the smaller clamp draw should execute in software");
+            t.Equals(counters.acceleratedCommands, 2ull,
+                     "both measured clamp draws should route to Vulkan");
+
+            (void)software.getDebugSnapshot();
+            (void)accelerated.getDebugSnapshot();
+            t.IsTrue(acceleratedVram == softwareVram,
+                     "mixed Hybrid clamp routing should match all 4 MiB");
+
+            counters = accelerated.backendCounters();
+            t.Equals(counters.commands, 3ull,
+                     "Hybrid should classify all three clamp fixtures");
+            t.Equals(counters.fallbackCommands, 1ull,
+                     "the smaller clamp draw should record one fallback");
+            t.Equals(counters.softwarePixels, 8'160ull,
+                     "software accounting should retain sub-threshold clamp work");
+            t.Equals(counters.acceleratedPixels, 16'384ull,
+                     "accelerated accounting should retain admitted clamp work");
+            t.Equals(counters.decisions[static_cast<size_t>(
+                         GsFallbackReason::CostModel)],
+                     1ull,
+                     "Hybrid should retain one named clamp cost decision");
+            t.Equals(counters.decisions[static_cast<size_t>(
+                         GsFallbackReason::Supported)],
+                     2ull,
+                     "Hybrid should retain two supported clamp decisions");
+
+            const GsVulkanRasterBackendStatistics backend =
+                accelerated.vulkanRendererBackendStatistics();
+            t.Equals(backend.commandsAttempted, 2ull,
+                     "clamp cost fallback must not reach the backend");
+            t.Equals(backend.committedGpuCommands, 2ull,
+                     "both admitted clamp draws should publish once");
+            t.Equals(backend.residentCommands, 2ull,
+                     "both admitted clamp draws should remain resident");
+            t.Equals(backend.resourceHazardDrains, 0ull,
+                     "disjoint clamp writes should not force a queue drain");
+            t.Equals(backend.coherency.rejectedTransitions, 0ull,
+                     "mixed clamp routing should preserve page ownership");
+
+            const GsVulkanServiceStatistics service =
+                accelerated.vulkanRendererServiceStatistics();
+            t.Equals(service.linearCt32SpriteDrawsCompleted, 2ull,
+                     "the service should execute both admitted clamp draws");
+            t.Equals(service.linearCt32SpritePixelsExecuted, 16'384ull,
+                     "the service should retain admitted clamp pixel counts");
+            t.Equals(service.residentLinearCt32SpriteBatchesCompleted, 1ull,
+                     "disjoint clamp writes should use one service batch");
+            t.Equals(service.largestResidentLinearCt32SpriteBatch, 2ull,
+                     "the real clamp cost fixture should expose batch size two");
+            t.Equals(service.nearestCt32SpriteDrawsCompleted, 0ull,
+                     "linear clamp Hybrid must not alias nearest execution");
+            t.Equals(service.validationErrors, 0u,
+                     "real Hybrid clamp routing should remain validation-clean");
+            t.Equals(service.validationWarnings, 0u,
+                     "real Hybrid clamp routing should emit no warnings");
         });
 
         tc.Run("GS Vulkan routes nearest CT32 texture sprites in strict mode", [](TestCase &t)

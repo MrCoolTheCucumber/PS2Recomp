@@ -938,11 +938,6 @@ GsBackendDecision GsVulkanRasterBackend::classify(
         const bool usesStandardClamp =
             gsVulkanTextureWrapMode(linearSprite.textureWrapU) != 0u ||
             gsVulkanTextureWrapMode(linearSprite.textureWrapV) != 0u;
-        if (usesStandardClamp &&
-            m_impl->config.mode == GsRendererMode::Hybrid)
-        {
-            return {false, GsFallbackReason::UnsupportedTextureWrap};
-        }
         if (!m_impl->exactLinearCt32Sprite)
             return {false, GsFallbackReason::BackendUnavailable};
         if (m_impl->config.mode == GsRendererMode::Hybrid)
@@ -953,9 +948,10 @@ GsBackendDecision GsVulkanRasterBackend::classify(
                 static_cast<uint64_t>(columns) *
                 static_cast<uint64_t>(
                     linearSprite.boundsY1 - linearSprite.boundsY0);
-            if (m_impl->config.minimumHybridLinearCt32SpritePixels != 0u &&
-                pixels <
-                    m_impl->config.minimumHybridLinearCt32SpritePixels)
+            const uint64_t minimumPixels = usesStandardClamp
+                ? m_impl->config.minimumHybridLinearCt32ClampSpritePixels
+                : m_impl->config.minimumHybridLinearCt32SpritePixels;
+            if (minimumPixels != 0u && pixels < minimumPixels)
             {
                 return {false, GsFallbackReason::CostModel};
             }
