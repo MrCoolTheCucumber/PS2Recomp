@@ -1137,6 +1137,68 @@ namespace
             return true;
         }
 
+        bool executeResidentNearestCt32Sprite(
+            const GsVulkanNearestCt32Sprite &sprite,
+            std::string *error) override
+        {
+            return executeResidentNearestCt32Sprites(
+                std::span<const GsVulkanNearestCt32Sprite>(
+                    &sprite, 1u),
+                error);
+        }
+
+        bool executeResidentNearestCt32Sprites(
+            std::span<const GsVulkanNearestCt32Sprite> sprites,
+            std::string *error) override
+        {
+            if (!isHealthy || behavior == Behavior::Fail ||
+                behavior == Behavior::InvalidOutput ||
+                sprites.empty() ||
+                sprites.size() >
+                    GS_VULKAN_MAX_RESIDENT_NEAREST_CT32_BATCH ||
+                !report.devices[0].exactNearestCt32Sprite)
+            {
+                serviceStatistics.nearestCt32SpriteDrawsFailed +=
+                    sprites.size();
+                ++serviceStatistics
+                      .residentNearestCt32SpriteBatchesFailed;
+                if (error)
+                {
+                    *error =
+                        "injected resident nearest CT32 executor failure";
+                }
+                return false;
+            }
+            for (const GsVulkanNearestCt32Sprite &sprite : sprites)
+            {
+                if (behavior == Behavior::Exact)
+                    applyNearestCt32SpriteCpu(residentVram, sprite);
+                serviceStatistics.nearestCt32SpritePixelsExecuted +=
+                    static_cast<uint64_t>(
+                        sprite.boundsX1 - sprite.boundsX0) *
+                    static_cast<uint64_t>(
+                        sprite.boundsY1 - sprite.boundsY0);
+            }
+            serviceStatistics.nearestCt32SpriteDrawsCompleted +=
+                sprites.size();
+            ++serviceStatistics
+                  .residentNearestCt32SpriteBatchesCompleted;
+            serviceStatistics.largestResidentNearestCt32SpriteBatch =
+                std::max(
+                    serviceStatistics
+                        .largestResidentNearestCt32SpriteBatch,
+                    static_cast<uint64_t>(sprites.size()));
+            ++serviceStatistics.queueSubmissions;
+            serviceStatistics.shaderDispatches += sprites.size();
+            serviceStatistics.pipelineBarriers += 2u;
+            ++serviceStatistics.pipelineBinds;
+            ++serviceStatistics.pipelineCacheHits;
+            ++serviceStatistics.fenceWaits;
+            if (error)
+                error->clear();
+            return true;
+        }
+
         bool executeResidentCt32Triangle(
             const GsVulkanCt32Triangle &triangle,
             std::string *error) override
@@ -7749,6 +7811,254 @@ void register_ps2_gs_vulkan_tests()
             t.IsTrue(service->healthy(),
                      "accepted and caller-rejected batches should leave the service healthy");
             service->shutdown();
+        });
+
+        tc.Run("Vulkan resident nearest CT32 batches preserve texture dependencies", [](TestCase &t)
+        {
+            GSMem::InitLookupTables();
+            GsVulkanCapabilityReport preflight{};
+            const GsVulkanServiceConfig config =
+                makeRendererServiceConfig(preflight);
+            GsVulkanCapabilityReport creationReport{};
+            std::string creationError;
+            std::unique_ptr<GsVulkanService> service =
+                GsVulkanService::create(
+                    config, &creationReport, &creationError);
+            if (!preflight.ready())
+            {
+                t.IsNull(service.get(),
+                         "an unavailable host should skip resident texture batching cleanly");
+                t.IsFalse(creationReport.ready(),
+                          "a skipped texture batch service should retain its capability result");
+                return;
+            }
+            t.IsNotNull(service.get(),
+                        "a suitable device should create the resident texture batch service");
+            t.IsTrue(creationError.empty(),
+                     "successful texture batch service creation should clear its diagnostic");
+            if (!service)
+                return;
+
+            constexpr std::array<uint32_t, 4> framebufferPages{{
+                40u, 41u, 197u, 509u,
+            }};
+            std::vector<GsVulkanNearestCt32Sprite> sprites;
+            for (size_t index = 0u; index < framebufferPages.size(); ++index)
+            {
+                const GsDrawCommand command = makeNearestCt32SpriteCommand(
+                    35'000u + index, framebufferPages[index], 2u,
+                    64u, 2u, 6u, 5u,
+                    {6u, 15u, 5u, 12u}, {32u, 16u},
+                    {352u, 96u}, {48u, 304u},
+                    {480u, 224u}, {64u, 320u});
+                GsVulkanNearestCt32Sprite sprite{};
+                const GsBackendDecision decision =
+                    prepareGsVulkanNearestCt32Sprite(command, sprite);
+                if (!decision.supported)
+                {
+                    t.Fail(
+                        "resident nearest CT32 fixture was rejected as " +
+                        std::string(gsFallbackReasonName(decision.reason)));
+                    return;
+                }
+                sprites.push_back(sprite);
+            }
+
+            const GsVramPageMask sharedReadPages =
+                gsVramPagesForSurfaceRect(
+                    sprites.front().textureBaseBlock,
+                    sprites.front().textureWidth,
+                    static_cast<uint8_t>(GSMem::C32),
+                    0u, 0u,
+                    sprites.front().textureMaskU + 1u,
+                    sprites.front().textureMaskV + 1u);
+            t.Equals(sharedReadPages.count(), size_t{1u},
+                     "the shared texture fixture should conservatively read one page");
+            t.IsTrue(sharedReadPages.test(2u),
+                     "the shared texture fixture should read its selected physical page");
+
+            std::string operationError;
+            const GsVulkanServiceStatistics beforeRejections =
+                service->statistics();
+            const auto expectRejected =
+                [&](std::span<const GsVulkanNearestCt32Sprite> rejected,
+                    const std::string &label)
+            {
+                operationError.clear();
+                t.IsFalse(service->executeResidentNearestCt32Sprites(
+                              rejected, &operationError),
+                          label + " should fail before worker submission");
+                t.IsFalse(operationError.empty(),
+                          label + " should retain a diagnostic");
+            };
+            const auto expectDependencyRejected =
+                [&](std::span<const GsVulkanNearestCt32Sprite> rejected,
+                    const std::string &label)
+            {
+                expectRejected(rejected, label);
+                t.IsTrue(
+                    operationError.find("memory dependency") !=
+                        std::string::npos,
+                    label + " should identify an inter-draw dependency");
+            };
+            expectRejected({}, "empty resident texture batch");
+            std::vector<GsVulkanNearestCt32Sprite> oversized(
+                GS_VULKAN_MAX_RESIDENT_NEAREST_CT32_BATCH + 1u,
+                sprites.front());
+            expectRejected(oversized, "oversized resident texture batch");
+            std::vector<GsVulkanNearestCt32Sprite> invalid = sprites;
+            invalid[2].reserved0 = 1u;
+            expectRejected(invalid, "invalid resident texture batch member");
+
+            const std::array<GsVulkanNearestCt32Sprite, 2> writeWrite{{
+                sprites.front(), sprites.front(),
+            }};
+            expectDependencyRejected(
+                writeWrite, "write/write-dependent texture batch");
+
+            GsVulkanNearestCt32Sprite writeThenRead = sprites[1];
+            writeThenRead.textureBaseBlock =
+                sprites.front().framebufferBaseBlock;
+            const std::array<GsVulkanNearestCt32Sprite, 2>
+                writeRead{{sprites.front(), writeThenRead}};
+            expectDependencyRejected(
+                writeRead, "write/read-dependent texture batch");
+
+            GsVulkanNearestCt32Sprite readThenWrite = sprites[1];
+            readThenWrite.framebufferBaseBlock =
+                sprites.front().textureBaseBlock;
+            readThenWrite.textureBaseBlock = 60u * 32u;
+            const std::array<GsVulkanNearestCt32Sprite, 2>
+                readWrite{{sprites.front(), readThenWrite}};
+            expectDependencyRejected(
+                readWrite, "read/write-dependent texture batch");
+
+            const GsVulkanServiceStatistics afterRejections =
+                service->statistics();
+            t.Equals(afterRejections.queueSubmissions,
+                     beforeRejections.queueSubmissions,
+                     "caller-rejected texture batches must not submit GPU work");
+            t.Equals(afterRejections.nearestCt32SpriteDrawsFailed,
+                     beforeRejections.nearestCt32SpriteDrawsFailed,
+                     "caller-rejected texture batches must not count worker failures");
+            t.Equals(
+                afterRejections.residentNearestCt32SpriteBatchesFailed,
+                beforeRejections.residentNearestCt32SpriteBatchesFailed,
+                "caller-rejected texture batches must not count failed worker batches");
+
+            const GsVulkanDeviceReport *selected =
+                creationReport.selectedDevice();
+            t.IsNotNull(selected,
+                        "the texture batch service should retain its selected device");
+            if (!selected)
+                return;
+            if (!selected->exactNearestCt32Sprite)
+            {
+                expectRejected(sprites,
+                               "capability-gated resident texture batch");
+                t.Equals(
+                    service->statistics().nearestCt32SpriteDrawsFailed,
+                    0ull,
+                    "capability rejection must not enter the worker");
+                t.IsTrue(service->healthy(),
+                         "unsupported texture batching must not poison the base service");
+                service->shutdown();
+                return;
+            }
+
+            const std::vector<uint8_t> initial =
+                makeVramPattern(0x52545831u);
+            std::vector<uint8_t> expected = initial;
+            uint64_t expectedPixels = 0u;
+            for (const GsVulkanNearestCt32Sprite &sprite : sprites)
+            {
+                applyNearestCt32SpriteCpu(expected, sprite);
+                expectedPixels +=
+                    static_cast<uint64_t>(
+                        sprite.boundsX1 - sprite.boundsX0) *
+                    static_cast<uint64_t>(
+                        sprite.boundsY1 - sprite.boundsY0);
+            }
+            GsVramPageMask allPages;
+            allPages.setAll();
+            t.IsTrue(service->uploadVramPages(
+                         initial, allPages, &operationError),
+                     "the texture batch fixture should establish resident VRAM");
+            if (!operationError.empty())
+                t.Fail("resident texture batch upload failed: " + operationError);
+
+            const GsVulkanServiceStatistics beforeBatch =
+                service->statistics();
+            operationError.clear();
+            t.IsTrue(service->executeResidentNearestCt32Sprites(
+                         sprites, &operationError),
+                     "shared-read resident textures should execute as one batch");
+            t.IsTrue(operationError.empty(),
+                     "successful resident texture batching should clear its diagnostic");
+            const GsVulkanServiceStatistics afterBatch =
+                service->statistics();
+            t.Equals(afterBatch.queueSubmissions -
+                         beforeBatch.queueSubmissions,
+                     1ull,
+                     "one texture batch should use one Vulkan queue submission");
+            t.Equals(afterBatch.shaderDispatches -
+                         beforeBatch.shaderDispatches,
+                     static_cast<uint64_t>(sprites.size()),
+                     "each texture batch member should retain one compute dispatch");
+            t.Equals(afterBatch.pipelineBarriers -
+                         beforeBatch.pipelineBarriers,
+                     2ull,
+                     "one texture batch should use one prepare and one completion barrier");
+            t.Equals(afterBatch.pipelineBinds - beforeBatch.pipelineBinds,
+                     1ull,
+                     "one texture batch should bind the exact pipeline once");
+            t.Equals(afterBatch.pipelineCacheHits -
+                         beforeBatch.pipelineCacheHits,
+                     1ull,
+                     "one texture batch should reuse its prebuilt pipeline once");
+            t.Equals(afterBatch.fenceWaits - beforeBatch.fenceWaits,
+                     1ull,
+                     "one texture batch should wait on one submitted fence");
+            t.Equals(afterBatch.nearestCt32SpriteDrawsCompleted -
+                         beforeBatch.nearestCt32SpriteDrawsCompleted,
+                     static_cast<uint64_t>(sprites.size()),
+                     "texture batch statistics should count every completed sprite");
+            t.Equals(afterBatch.nearestCt32SpritePixelsExecuted -
+                         beforeBatch.nearestCt32SpritePixelsExecuted,
+                     expectedPixels,
+                     "texture batch statistics should count every covered pixel");
+            t.Equals(
+                afterBatch.residentNearestCt32SpriteBatchesCompleted -
+                    beforeBatch.residentNearestCt32SpriteBatchesCompleted,
+                1ull,
+                "the worker should complete one resident texture batch");
+            t.Equals(afterBatch.largestResidentNearestCt32SpriteBatch,
+                     static_cast<uint64_t>(sprites.size()),
+                     "the service should retain its largest texture batch");
+
+            std::vector<uint8_t> actual(
+                GS_VULKAN_VRAM_SIZE, 0xA5u);
+            t.IsTrue(service->downloadVramPages(
+                         actual, allPages, &operationError),
+                     "the completed resident texture batch should be observable");
+            t.IsTrue(actual == expected,
+                     "one resident texture batch must match sequential CPU draws exactly");
+            const GsVulkanServiceStatistics finalStatistics =
+                service->statistics();
+            t.Equals(finalStatistics.validationErrors, 0u,
+                     "resident texture batching must remain validation-clean");
+            t.Equals(finalStatistics.validationWarnings, 0u,
+                     "resident texture batching should emit no validation warnings");
+            t.IsTrue(service->healthy(),
+                     "accepted and rejected texture batches should leave the service healthy");
+
+            service->shutdown();
+            operationError.clear();
+            t.IsFalse(service->executeResidentNearestCt32Sprites(
+                          sprites, &operationError),
+                      "a stopped service must reject resident texture batches");
+            t.IsFalse(operationError.empty(),
+                      "post-shutdown texture rejection should retain a diagnostic");
         });
 
         tc.Run("Vulkan resident triangle batches require disjoint pages", [](TestCase &t)

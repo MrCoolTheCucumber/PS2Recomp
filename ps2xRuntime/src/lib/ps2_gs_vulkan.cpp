@@ -336,6 +336,68 @@ namespace
         return true;
     }
 
+    bool validateResidentNearestCt32SpriteBatch(
+        std::span<const GsVulkanNearestCt32Sprite> sprites,
+        std::string &error)
+    {
+        if (sprites.empty() ||
+            sprites.size() > GS_VULKAN_MAX_RESIDENT_NEAREST_CT32_BATCH)
+        {
+            error =
+                "Vulkan resident nearest CT32 sprite batches require between 1 and " +
+                std::to_string(
+                    GS_VULKAN_MAX_RESIDENT_NEAREST_CT32_BATCH) +
+                " records";
+            return false;
+        }
+
+        GsVramPageMask priorReadPages;
+        GsVramPageMask priorWritePages;
+        for (size_t index = 0u; index < sprites.size(); ++index)
+        {
+            const GsVulkanNearestCt32Sprite &sprite = sprites[index];
+            if (const char *validationError =
+                    nearestCt32SpriteValidationError(sprite))
+            {
+                error = "Vulkan resident nearest CT32 sprite " +
+                        std::to_string(index) + ": " + validationError;
+                return false;
+            }
+
+            const GsVramPageMask readPages =
+                gsVramPagesForSurfaceRect(
+                    sprite.textureBaseBlock,
+                    sprite.textureWidth,
+                    static_cast<uint8_t>(GSMem::C32),
+                    0u,
+                    0u,
+                    sprite.textureMaskU + 1u,
+                    sprite.textureMaskV + 1u);
+            const GsVramPageMask writePages =
+                gsVramPagesForSurfaceRect(
+                    sprite.framebufferBaseBlock,
+                    sprite.framebufferWidth,
+                    static_cast<uint8_t>(GSMem::C32),
+                    sprite.boundsX0,
+                    sprite.boundsY0,
+                    sprite.boundsX1 - sprite.boundsX0,
+                    sprite.boundsY1 - sprite.boundsY0);
+            if (priorWritePages.intersects(readPages) ||
+                priorWritePages.intersects(writePages) ||
+                priorReadPages.intersects(writePages))
+            {
+                error = "Vulkan resident nearest CT32 sprite " +
+                        std::to_string(index) +
+                        " has a memory dependency on an earlier batch member";
+                return false;
+            }
+            priorReadPages.unionWith(readPages);
+            priorWritePages.unionWith(writePages);
+        }
+        error.clear();
+        return true;
+    }
+
     bool validateResidentCt32TriangleBatch(
         std::span<const GsVulkanCt32Triangle> triangles,
         std::string &error)
@@ -1617,6 +1679,11 @@ namespace
             std::string &error);
         bool executeResidentCt32Sprites(
             std::span<const GsVulkanCt32Sprite> sprites,
+            GsVulkanCapabilityReport &report,
+            GsVulkanServiceStatistics &statistics,
+            std::string &error);
+        bool executeResidentNearestCt32Sprites(
+            std::span<const GsVulkanNearestCt32Sprite> sprites,
             GsVulkanCapabilityReport &report,
             GsVulkanServiceStatistics &statistics,
             std::string &error);
@@ -3235,6 +3302,102 @@ namespace
         return true;
     }
 
+    bool VulkanExecutionContext::executeResidentNearestCt32Sprites(
+        std::span<const GsVulkanNearestCt32Sprite> sprites,
+        GsVulkanCapabilityReport &report,
+        GsVulkanServiceStatistics &statistics,
+        std::string &error)
+    {
+        if (!m_healthy)
+        {
+            error = "Vulkan GS service is not healthy";
+            return false;
+        }
+        if (m_nearestCt32SpritePipeline == VK_NULL_HANDLE)
+        {
+            error =
+                "Vulkan device does not support exact nearest CT32 sprites";
+            return false;
+        }
+        if (!validateResidentNearestCt32SpriteBatch(sprites, error))
+            return false;
+
+        constexpr uint32_t localSize = 8u;
+        const uint32_t validationErrorsBefore =
+            m_validation.errors.load(std::memory_order_relaxed);
+        if (!beginCommands(report, error))
+            return false;
+
+        VkBufferMemoryBarrier prepareBarrier{};
+        prepareBarrier.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
+        prepareBarrier.srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT;
+        prepareBarrier.dstAccessMask =
+            VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+        prepareBarrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        prepareBarrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        prepareBarrier.buffer = m_vram.buffer;
+        prepareBarrier.offset = 0u;
+        prepareBarrier.size = GS_VULKAN_VRAM_SIZE;
+        m_functions.cmdPipelineBarrier(
+            m_commandBuffer,
+            VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+            0u, 0u, nullptr, 1u, &prepareBarrier, 0u, nullptr);
+
+        m_functions.cmdBindPipeline(
+            m_commandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE,
+            m_nearestCt32SpritePipeline);
+        m_functions.cmdBindDescriptorSets(
+            m_commandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE,
+            m_pipelineLayout, 0u, 1u, &m_descriptorSet,
+            0u, nullptr);
+        for (const GsVulkanNearestCt32Sprite &sprite : sprites)
+        {
+            const uint32_t groupCountX =
+                (sprite.boundsX1 - sprite.boundsX0 +
+                 localSize - 1u) / localSize;
+            const uint32_t groupCountY =
+                (sprite.boundsY1 - sprite.boundsY0 +
+                 localSize - 1u) / localSize;
+            m_functions.cmdPushConstants(
+                m_commandBuffer, m_pipelineLayout,
+                VK_SHADER_STAGE_COMPUTE_BIT, 0u,
+                sizeof(sprite), &sprite);
+            m_functions.cmdDispatch(
+                m_commandBuffer, groupCountX, groupCountY, 1u);
+        }
+
+        VkBufferMemoryBarrier completeBarrier{};
+        completeBarrier.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
+        completeBarrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+        completeBarrier.dstAccessMask =
+            VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
+        completeBarrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        completeBarrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        completeBarrier.buffer = m_vram.buffer;
+        completeBarrier.offset = 0u;
+        completeBarrier.size = GS_VULKAN_VRAM_SIZE;
+        m_functions.cmdPipelineBarrier(
+            m_commandBuffer,
+            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+            VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+            0u, 0u, nullptr, 1u, &completeBarrier, 0u, nullptr);
+
+        if (!submitCommands(
+                "resident nearest CT32 sprite batch",
+                sprites.size(), 2u, 1u,
+                report, statistics, error) ||
+            !finishOperation(
+                "resident nearest CT32 sprite batch",
+                validationErrorsBefore,
+                report, statistics, error))
+        {
+            return false;
+        }
+        error.clear();
+        return true;
+    }
+
     bool VulkanExecutionContext::executeResidentCt32Triangles(
         std::span<const GsVulkanCt32Triangle> triangles,
         GsVulkanCapabilityReport &report,
@@ -3732,6 +3895,7 @@ enum class GsVulkanRequestKind : uint8_t
     UploadPages,
     DownloadPages,
     ResidentCt32Sprites,
+    ResidentNearestCt32Sprites,
     ResidentCt32Triangles,
 };
 
@@ -3802,6 +3966,13 @@ struct GsVulkanService::Impl final
                     statistics.spriteDrawsFailed +=
                         activeRequestSpriteCount;
                     ++statistics.residentSpriteBatchesFailed;
+                }
+                else if (activeRequestKind ==
+                         GsVulkanRequestKind::ResidentNearestCt32Sprites)
+                {
+                    statistics.nearestCt32SpriteDrawsFailed +=
+                        activeRequestNearestCt32SpriteCount;
+                    ++statistics.residentNearestCt32SpriteBatchesFailed;
                 }
                 else if (activeRequestKind ==
                          GsVulkanRequestKind::ResidentCt32Triangles)
@@ -3895,6 +4066,8 @@ struct GsVulkanService::Impl final
                 kind = requestKind;
                 activeRequestKind = kind;
                 activeRequestSpriteCount = sprites.size();
+                activeRequestNearestCt32SpriteCount =
+                    nearestCt32Sprites.size();
                 activeRequestTriangleCount = triangles.size();
                 requestPending = false;
                 requestInFlight = true;
@@ -3949,6 +4122,13 @@ struct GsVulkanService::Impl final
                 succeeded = context.executeResidentCt32Sprites(
                     sprites, localCapabilities, localStatistics,
                     operationError);
+            }
+            else if (kind ==
+                     GsVulkanRequestKind::ResidentNearestCt32Sprites)
+            {
+                succeeded = context.executeResidentNearestCt32Sprites(
+                    nearestCt32Sprites, localCapabilities,
+                    localStatistics, operationError);
             }
             else if (kind == GsVulkanRequestKind::ResidentCt32Triangles)
             {
@@ -4046,6 +4226,39 @@ struct GsVulkanService::Impl final
                 {
                     localStatistics.spriteDrawsFailed += sprites.size();
                     ++localStatistics.residentSpriteBatchesFailed;
+                }
+            }
+            else if (kind ==
+                     GsVulkanRequestKind::ResidentNearestCt32Sprites)
+            {
+                if (succeeded)
+                {
+                    localStatistics.nearestCt32SpriteDrawsCompleted +=
+                        nearestCt32Sprites.size();
+                    for (const GsVulkanNearestCt32Sprite &sprite :
+                         nearestCt32Sprites)
+                    {
+                        localStatistics.nearestCt32SpritePixelsExecuted +=
+                            static_cast<uint64_t>(
+                                sprite.boundsX1 - sprite.boundsX0) *
+                            static_cast<uint64_t>(
+                                sprite.boundsY1 - sprite.boundsY0);
+                    }
+                    ++localStatistics
+                          .residentNearestCt32SpriteBatchesCompleted;
+                    localStatistics.largestResidentNearestCt32SpriteBatch =
+                        std::max(
+                            localStatistics
+                                .largestResidentNearestCt32SpriteBatch,
+                            static_cast<uint64_t>(
+                                nearestCt32Sprites.size()));
+                }
+                else
+                {
+                    localStatistics.nearestCt32SpriteDrawsFailed +=
+                        nearestCt32Sprites.size();
+                    ++localStatistics
+                          .residentNearestCt32SpriteBatchesFailed;
                 }
             }
             else if (kind == GsVulkanRequestKind::ResidentCt32Triangles)
@@ -4249,6 +4462,7 @@ struct GsVulkanService::Impl final
     GsVulkanRequestKind activeRequestKind =
         GsVulkanRequestKind::RoundTrip;
     size_t activeRequestSpriteCount = 0u;
+    size_t activeRequestNearestCt32SpriteCount = 0u;
     size_t activeRequestTriangleCount = 0u;
     bool initialized = false;
     bool healthy = false;
@@ -4735,6 +4949,58 @@ bool GsVulkanService::executeResidentCt32Sprites(
         std::vector<GsVulkanCt32Sprite>(
             sprites.begin(), sprites.end()),
         {}, {}, {}, unusedOutput, nullptr, error);
+#endif
+}
+
+bool GsVulkanService::executeResidentNearestCt32Sprite(
+    const GsVulkanNearestCt32Sprite &sprite,
+    std::string *error)
+{
+    return executeResidentNearestCt32Sprites(
+        std::span<const GsVulkanNearestCt32Sprite>(&sprite, 1u),
+        error);
+}
+
+bool GsVulkanService::executeResidentNearestCt32Sprites(
+    std::span<const GsVulkanNearestCt32Sprite> sprites,
+    std::string *error)
+{
+#if !PS2X_HAS_GS_VULKAN
+    (void)sprites;
+    if (error)
+        *error = "Vulkan GS support was compiled out";
+    return false;
+#else
+    std::string validationError;
+    if (!validateResidentNearestCt32SpriteBatch(
+            sprites, validationError))
+    {
+        if (error)
+            *error = std::move(validationError);
+        return false;
+    }
+    {
+        std::lock_guard lock(m_impl->stateMutex);
+        const GsVulkanDeviceReport *selected =
+            m_impl->capabilities.selectedDevice();
+        if (!selected || !selected->exactNearestCt32Sprite)
+        {
+            if (error)
+            {
+                *error =
+                    "Vulkan device does not support exact nearest CT32 sprites";
+            }
+            return false;
+        }
+    }
+
+    std::vector<uint8_t> unusedOutput;
+    return m_impl->executeRequest(
+        GsVulkanRequestKind::ResidentNearestCt32Sprites,
+        {}, {}, {},
+        std::vector<GsVulkanNearestCt32Sprite>(
+            sprites.begin(), sprites.end()),
+        {}, {}, unusedOutput, nullptr, error);
 #endif
 }
 

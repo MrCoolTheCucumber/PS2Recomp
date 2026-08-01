@@ -24,6 +24,8 @@ inline constexpr uint32_t GS_VULKAN_NOOP_GROUP_COUNT =
         GS_VULKAN_NOOP_LOCAL_SIZE);
 inline constexpr uint32_t GS_VULKAN_MAX_MEMORY_CASES = 65536u;
 inline constexpr size_t GS_VULKAN_MAX_RESIDENT_SPRITE_BATCH = 64u;
+inline constexpr size_t GS_VULKAN_MAX_RESIDENT_NEAREST_CT32_BATCH =
+    GS_VULKAN_MAX_RESIDENT_SPRITE_BATCH;
 inline constexpr size_t GS_VULKAN_MAX_RESIDENT_TRIANGLE_BATCH =
     GS_VRAM_PAGE_COUNT;
 
@@ -183,6 +185,9 @@ struct GsVulkanServiceStatistics
     uint64_t nearestCt32SpriteDrawsCompleted = 0u;
     uint64_t nearestCt32SpriteDrawsFailed = 0u;
     uint64_t nearestCt32SpritePixelsExecuted = 0u;
+    uint64_t residentNearestCt32SpriteBatchesCompleted = 0u;
+    uint64_t residentNearestCt32SpriteBatchesFailed = 0u;
+    uint64_t largestResidentNearestCt32SpriteBatch = 0u;
     uint64_t triangleDrawsCompleted = 0u;
     uint64_t triangleDrawsFailed = 0u;
     uint64_t triangleCandidatePixelsExecuted = 0u;
@@ -437,6 +442,12 @@ public:
     [[nodiscard]] virtual bool executeResidentCt32Sprites(
         std::span<const GsVulkanCt32Sprite> sprites,
         std::string *error = nullptr) = 0;
+    [[nodiscard]] virtual bool executeResidentNearestCt32Sprite(
+        const GsVulkanNearestCt32Sprite &sprite,
+        std::string *error = nullptr) = 0;
+    [[nodiscard]] virtual bool executeResidentNearestCt32Sprites(
+        std::span<const GsVulkanNearestCt32Sprite> sprites,
+        std::string *error = nullptr) = 0;
     [[nodiscard]] virtual bool executeResidentCt32Triangle(
         const GsVulkanCt32Triangle &triangle,
         std::string *error = nullptr) = 0;
@@ -536,6 +547,16 @@ public:
     // overlapping batches before they enter the worker slot.
     [[nodiscard]] bool executeResidentCt32Sprites(
         std::span<const GsVulkanCt32Sprite> sprites,
+        std::string *error = nullptr) override;
+
+    // Records a bounded nearest-texture batch against resident raw VRAM.
+    // Shared read-only texture pages are allowed; any pairwise read/write or
+    // write/write dependency is rejected before the worker slot.
+    [[nodiscard]] bool executeResidentNearestCt32Sprite(
+        const GsVulkanNearestCt32Sprite &sprite,
+        std::string *error = nullptr) override;
+    [[nodiscard]] bool executeResidentNearestCt32Sprites(
+        std::span<const GsVulkanNearestCt32Sprite> sprites,
         std::string *error = nullptr) override;
 
     // Uses the exact 64-bit triangle pipeline against already-resident VRAM.
