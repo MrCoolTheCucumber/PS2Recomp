@@ -641,6 +641,10 @@ void GS::reset()
     m_fogColor = 0;
     m_prmodecont = true;
     m_pabe = false;
+    m_scanMask = 0u;
+    m_dimx = 0u;
+    m_dither = false;
+    m_colorClamp = false;
     m_texa = {0u, false, 0u};
     m_texclut = {0u, 0u, 0u};
     std::memset(m_clutCache, 0, sizeof(m_clutCache));
@@ -654,6 +658,7 @@ void GS::reset()
     m_trxdir = 3;
     m_vtxCount = 0;
     m_vtxIndex = 0;
+    m_nextDrawSequence = 1u;
     m_localToHostBuffer.clear();
     m_localToHostReadPos = 0;
     m_preferredDisplaySourceFrame = {};
@@ -1878,6 +1883,9 @@ void GS::writeRegisterPacked(uint8_t regDesc, uint64_t lo, uint64_t hi)
             }
         });
         GSVertex &vtx = m_vtxQueue[m_vtxCount % kMaxVerts];
+        vtx.x12_4 = x;
+        vtx.y12_4 = y;
+        vtx.zInteger = z;
         vtx.x = static_cast<float>(x) / 16.0f;
         vtx.y = static_cast<float>(y) / 16.0f;
         vtx.z = static_cast<float>(z);
@@ -1915,6 +1923,9 @@ void GS::writeRegisterPacked(uint8_t regDesc, uint64_t lo, uint64_t hi)
             }
         });
         GSVertex &vtx = m_vtxQueue[m_vtxCount % kMaxVerts];
+        vtx.x12_4 = x;
+        vtx.y12_4 = y;
+        vtx.zInteger = z;
         vtx.x = static_cast<float>(x) / 16.0f;
         vtx.y = static_cast<float>(y) / 16.0f;
         vtx.z = static_cast<float>(z);
@@ -1949,6 +1960,9 @@ void GS::writeRegisterPacked(uint8_t regDesc, uint64_t lo, uint64_t hi)
             }
         });
         GSVertex &vtx = m_vtxQueue[m_vtxCount % kMaxVerts];
+        vtx.x12_4 = static_cast<uint16_t>(lo & 0xFFFFu);
+        vtx.y12_4 = static_cast<uint16_t>((lo >> 32u) & 0xFFFFu);
+        vtx.zInteger = static_cast<uint32_t>((hi >> 4u) & 0xFFFFFFu);
         vtx.x = static_cast<float>(lo & 0xFFFF) / 16.0f;
         vtx.y = static_cast<float>((lo >> 32) & 0xFFFF) / 16.0f;
         vtx.z = static_cast<float>((hi >> 4) & 0xFFFFFF);
@@ -1980,6 +1994,9 @@ void GS::writeRegisterPacked(uint8_t regDesc, uint64_t lo, uint64_t hi)
             }
         });
         GSVertex &vtx = m_vtxQueue[m_vtxCount % kMaxVerts];
+        vtx.x12_4 = static_cast<uint16_t>(lo & 0xFFFFu);
+        vtx.y12_4 = static_cast<uint16_t>((lo >> 32u) & 0xFFFFu);
+        vtx.zInteger = static_cast<uint32_t>(hi & 0xFFFFFFFFu);
         vtx.x = static_cast<float>(lo & 0xFFFF) / 16.0f;
         vtx.y = static_cast<float>((lo >> 32) & 0xFFFF) / 16.0f;
         vtx.z = static_cast<float>(hi & 0xFFFFFFFF);
@@ -2130,6 +2147,9 @@ void GS::writeRegister(uint8_t regAddr, uint64_t value)
     case GS_REG_XYZF3:
     {
         GSVertex &vtx = m_vtxQueue[m_vtxCount % kMaxVerts];
+        vtx.x12_4 = static_cast<uint16_t>(value & 0xFFFFu);
+        vtx.y12_4 = static_cast<uint16_t>((value >> 16u) & 0xFFFFu);
+        vtx.zInteger = static_cast<uint32_t>((value >> 32u) & 0xFFFFFFu);
         vtx.x = static_cast<float>(value & 0xFFFF) / 16.0f;
         vtx.y = static_cast<float>((value >> 16) & 0xFFFF) / 16.0f;
         vtx.z = static_cast<double>((value >> 32) & 0xFFFFFF);
@@ -2150,6 +2170,9 @@ void GS::writeRegister(uint8_t regAddr, uint64_t value)
     case GS_REG_XYZ3:
     {
         GSVertex &vtx = m_vtxQueue[m_vtxCount % kMaxVerts];
+        vtx.x12_4 = static_cast<uint16_t>(value & 0xFFFFu);
+        vtx.y12_4 = static_cast<uint16_t>((value >> 16u) & 0xFFFFu);
+        vtx.zInteger = static_cast<uint32_t>((value >> 32u) & 0xFFFFFFFFu);
         vtx.x = static_cast<float>(value & 0xFFFF) / 16.0f;
         vtx.y = static_cast<float>((value >> 16) & 0xFFFF) / 16.0f;
         vtx.z = static_cast<double>((value >> 32) & 0xFFFFFFFF);
@@ -2383,10 +2406,18 @@ void GS::writeRegister(uint8_t regAddr, uint64_t value)
         m_fogColor = static_cast<uint32_t>(value & 0x00FFFFFFu);
         break;
     case GS_REG_TEXFLUSH:
+        break;
     case GS_REG_SCANMSK:
+        m_scanMask = static_cast<uint8_t>(value & 0x3u);
+        break;
     case GS_REG_DIMX:
+        m_dimx = value;
+        break;
     case GS_REG_DTHE:
+        m_dither = (value & 1u) != 0u;
+        break;
     case GS_REG_COLCLAMP:
+        m_colorClamp = (value & 1u) != 0u;
         break;
     case GS_REG_TEXA:
     {

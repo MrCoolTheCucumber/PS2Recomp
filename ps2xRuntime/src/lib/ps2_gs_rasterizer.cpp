@@ -1,4 +1,5 @@
 #include "runtime/ps2_gs_rasterizer.h"
+#include "runtime/ps2_gs_backend.h"
 #include "runtime/ps2_gs_gpu.h"
 #include "runtime/ps2_gs_common.h"
 #include "runtime/ps2_gs_psmct16.h"
@@ -512,6 +513,22 @@ namespace
         return output.str();
     }
 
+    std::string debugPageList(const GsVramPageMask &pages)
+    {
+        std::ostringstream output;
+        bool first = true;
+        for (size_t page = 0u; page < GS_VRAM_PAGE_COUNT; ++page)
+        {
+            if (!pages.test(page))
+                continue;
+            if (!first)
+                output << ';';
+            first = false;
+            output << page;
+        }
+        return output.str();
+    }
+
     struct GSDrawTraceState
     {
         std::ofstream output;
@@ -550,8 +567,9 @@ namespace
         bool initialized = false;
         bool capturing = false;
 
-        void begin(const GSContext &ctx)
+        void begin(const GsDrawCommand &command)
         {
+            const GSContext &ctx = command.context();
             if (!initialized)
             {
                 initialized = true;
@@ -601,7 +619,14 @@ namespace
                                   "texture_samples,min_texture_index,max_texture_index,"
                                   "min_texture_alpha,max_texture_alpha,"
                                   "framebuffer_pages,depth_pages,texture_pages,"
-                                  "feedback,vram_fnv1a64\n";
+                                  "feedback,vram_fnv1a64,"
+                                  "sequence,state_signature,draw_x0,draw_y0,draw_x1,draw_y1,bounds_exact,"
+                                  "raw_x0,raw_y0,integer_z0,raw_x1,raw_y1,integer_z1,raw_x2,raw_y2,integer_z2,"
+                                  "aa1,fix,pabe,texa_ta0,texa_aem,texa_ta1,scanmsk,dimx,dthe,colclamp,fba,"
+                                  "framebuffer_read_pages,framebuffer_write_pages,"
+                                  "depth_read_pages,depth_write_pages,texture_read_pages,mip_read_pages,clut_read_pages,"
+                                  "reads_destination,framebuffer_depth_alias,framebuffer_texture_alias,framebuffer_clut_alias,"
+                                  "fallback_reason\n";
                     }
                 }
             }
@@ -1767,14 +1792,12 @@ struct GSRasterizer::ParallelState
 
     struct Command
     {
-        GSContext context{};
-        GSPrimReg prim{};
-        GSVertex vertices[3]{};
-        int32_t fixedX[3]{};
-        int32_t fixedY[3]{};
-        GSTexaReg texa{};
-        uint32_t fogColor = 0u;
-        bool pabe = false;
+        explicit Command(const GsDrawCommand &draw_)
+            : draw(draw_)
+        {
+        }
+
+        GsDrawCommand draw;
         bool feedbackSnapshot = false;
         size_t paletteIndex = SIZE_MAX;
         uint32_t workerMask = 0u;
@@ -2102,13 +2125,16 @@ void GSRasterizer::endDrawBatch(GS *gs)
     }
 }
 
-bool GSRasterizer::tryQueuePrimitive(GS *gs)
+bool GSRasterizer::tryQueuePrimitive(
+    GS *gs,
+    const GsDrawCommand &command)
 {
     ParallelState *state = m_parallelState.get();
     if (!state || !state->batchActive || state->primaryGs != gs)
         return false;
 
-    switch (gs->m_prim.type)
+    const GSPrimReg &primitive = command.primitive();
+    switch (primitive.type)
     {
     case GS_PRIM_TRIANGLE:
     case GS_PRIM_TRISTRIP:
@@ -2119,7 +2145,7 @@ bool GSRasterizer::tryQueuePrimitive(GS *gs)
         return false;
     }
 
-    const GSContext &ctx = gs->activeContext();
+    const GSContext &ctx = command.context();
     auto sameEligibilityState =
         [&](const GSContext &cached,
             const GSPrimReg &cachedPrim)
@@ -2146,8 +2172,8 @@ bool GSRasterizer::tryQueuePrimitive(GS *gs)
             cached.miptbp2 == ctx.miptbp2 &&
             cached.test == ctx.test &&
             cached.alpha == ctx.alpha &&
-            cachedPrim.tme == gs->m_prim.tme &&
-            cachedPrim.abe == gs->m_prim.abe;
+            cachedPrim.tme == primitive.tme &&
+            cachedPrim.abe == primitive.abe;
     };
     if (!state->eligibilityCacheValid ||
         !sameEligibilityState(
@@ -2156,7 +2182,7 @@ bool GSRasterizer::tryQueuePrimitive(GS *gs)
     {
         state->eligibilityCacheValid = true;
         state->eligibilityContext = ctx;
-        state->eligibilityPrim = gs->m_prim;
+        state->eligibilityPrim = primitive;
 
         bool eligible =
             ctx.frame.psm == GS_PSM_CT32 &&
@@ -2165,9 +2191,9 @@ bool GSRasterizer::tryQueuePrimitive(GS *gs)
                 ctx.test, GS_PSM_CT32) &&
             (ctx.zbuf.psm == GS_PSM_Z24 ||
              ctx.zbuf.psm == GS_PSM_Z32) &&
-            (!gs->m_prim.abe ||
+            (!primitive.abe ||
              (ctx.alpha & 0xFFu) == 0x44u) &&
-            (!gs->m_prim.tme ||
+            (!primitive.tme ||
              ctx.tex0.psm == GS_PSM_T8 ||
              ctx.tex0.psm == GS_PSM_CT32);
 
@@ -2183,11 +2209,11 @@ bool GSRasterizer::tryQueuePrimitive(GS *gs)
         const GSBlockRange depth =
             depthSurfaceUsed ? depthRange(ctx) : GSBlockRange{};
         const bool recursiveFeedback =
-            gs->m_prim.tme &&
+            primitive.tme &&
             ctx.tex0.tbp0 == frame.start;
         eligible =
             eligible && !blockRangesOverlap(frame, depth);
-        if (eligible && gs->m_prim.tme)
+        if (eligible && primitive.tme)
         {
             uint8_t maximumLevel = 0u;
             const uint8_t minificationFilter =
@@ -2227,61 +2253,11 @@ bool GSRasterizer::tryQueuePrimitive(GS *gs)
     const GSBlockRange frame = state->eligibleFrameRange;
     const GSBlockRange depth = state->eligibleDepthRange;
 
-    const GSVertex &v0 = gs->m_vtxQueue[0];
-    const GSVertex &v1 = gs->m_vtxQueue[1];
-    const GSVertex &v2 = gs->m_vtxQueue[2];
-    const bool sprite = gs->m_prim.type == GS_PRIM_SPRITE;
-    const FixedPointVertex p0{
-        static_cast<int32_t>(std::lround(v0.x * 16.0f)) -
-            static_cast<int32_t>(ctx.xyoffset.ofx),
-        static_cast<int32_t>(std::lround(v0.y * 16.0f)) -
-            static_cast<int32_t>(ctx.xyoffset.ofy),
-    };
-    const FixedPointVertex p1{
-        static_cast<int32_t>(std::lround(v1.x * 16.0f)) -
-            static_cast<int32_t>(ctx.xyoffset.ofx),
-        static_cast<int32_t>(std::lround(v1.y * 16.0f)) -
-            static_cast<int32_t>(ctx.xyoffset.ofy),
-    };
-    const FixedPointVertex p2{
-        sprite
-            ? p1.x
-            : static_cast<int32_t>(
-                  std::lround(v2.x * 16.0f)) -
-                  static_cast<int32_t>(ctx.xyoffset.ofx),
-        sprite
-            ? p1.y
-            : static_cast<int32_t>(
-                  std::lround(v2.y * 16.0f)) -
-                  static_cast<int32_t>(ctx.xyoffset.ofy),
-    };
-    int minimumX =
-        ceilFixed12_4(
-            sprite
-                ? std::min(p0.x, p1.x)
-                : std::min({p0.x, p1.x, p2.x}));
-    int maximumX =
-        ceilFixed12_4(
-            sprite
-                ? std::max(p0.x, p1.x)
-                : std::max({p0.x, p1.x, p2.x}));
-    int minimumY =
-        ceilFixed12_4(
-            sprite
-                ? std::min(p0.y, p1.y)
-                : std::min({p0.y, p1.y, p2.y}));
-    int maximumY =
-        ceilFixed12_4(
-            sprite
-                ? std::max(p0.y, p1.y)
-                : std::max({p0.y, p1.y, p2.y}));
-    minimumX = std::max(
-        minimumX, static_cast<int>(ctx.scissor.x0));
-    maximumX = std::min(
-        maximumX, static_cast<int>(ctx.scissor.x1) + 1);
-    minimumY = std::max(minimumY, static_cast<int>(ctx.scissor.y0));
-    maximumY = std::min(
-        maximumY, static_cast<int>(ctx.scissor.y1) + 1);
+    const GsDrawBounds &bounds = command.bounds();
+    const int minimumX = bounds.x0;
+    const int maximumX = bounds.x1;
+    const int minimumY = bounds.y0;
+    const int maximumY = bounds.y1;
 
     m_textureReadVram = nullptr;
     const bool recursiveTextureDraw =
@@ -2326,9 +2302,7 @@ bool GSRasterizer::tryQueuePrimitive(GS *gs)
     {
         gs->m_hasPreferredDisplaySource = false;
     }
-    if ((!sprite && triangleEdge(p0, p1, p2) == 0) ||
-        minimumX >= maximumX ||
-        minimumY >= maximumY)
+    if (bounds.empty())
     {
         return true;
     }
@@ -2364,24 +2338,9 @@ bool GSRasterizer::tryQueuePrimitive(GS *gs)
             1u << (stripe % state->workerCount);
     }
 
-    ParallelState::Command command;
-    command.context = ctx;
-    command.prim = gs->m_prim;
-    std::copy_n(
-        gs->m_vtxQueue,
-        sprite ? 2u : 3u,
-        command.vertices);
-    command.fixedX[0] = p0.x;
-    command.fixedX[1] = p1.x;
-    command.fixedX[2] = p2.x;
-    command.fixedY[0] = p0.y;
-    command.fixedY[1] = p1.y;
-    command.fixedY[2] = p2.y;
-    command.texa = gs->m_texa;
-    command.fogColor = gs->m_fogColor;
-    command.pabe = gs->m_pabe;
-    command.feedbackSnapshot = recursiveTextureDraw;
-    if (gs->m_prim.tme && ctx.tex0.psm == GS_PSM_T8)
+    ParallelState::Command queuedCommand(command);
+    queuedCommand.feedbackSnapshot = recursiveTextureDraw;
+    if (primitive.tme && ctx.tex0.psm == GS_PSM_T8)
     {
         prepareDecodedClut(gs);
         size_t paletteIndex = SIZE_MAX;
@@ -2411,12 +2370,12 @@ bool GSRasterizer::tryQueuePrimitive(GS *gs)
             paletteIndex = state->palettes.size();
             state->palettes.emplace_back(std::move(palette));
         }
-        command.paletteIndex = paletteIndex;
+        queuedCommand.paletteIndex = paletteIndex;
     }
-    command.workerMask = workerMask;
+    queuedCommand.workerMask = workerMask;
 
     const size_t commandIndex = state->commands.size();
-    state->commands.emplace_back(std::move(command));
+    state->commands.emplace_back(std::move(queuedCommand));
     for (uint32_t worker = 0u;
          worker < state->workerCount;
          ++worker)
@@ -2434,24 +2393,33 @@ void GSRasterizer::renderQueuedPrimitive(GS *renderGs,
 {
     const ParallelState::Command &command =
         m_parallelState->commands[commandIndex];
+    const GsDrawCommand &draw = command.draw;
+    const GSPrimReg &primitive = draw.primitive();
+    const GSContext &context = draw.context();
+    const GsDrawGlobalState &global = draw.globalState();
     renderGs->m_vram = m_parallelState->primaryGs->m_vram;
     renderGs->m_vramSize = m_parallelState->primaryGs->m_vramSize;
-    renderGs->m_ctx[command.prim.ctxt ? 1 : 0] =
-        command.context;
-    renderGs->m_prim = command.prim;
-    std::copy_n(command.vertices, 3u, renderGs->m_vtxQueue);
-    renderGs->m_vtxCount = 3;
-    renderGs->m_texa = command.texa;
-    renderGs->m_fogColor = command.fogColor;
-    renderGs->m_pabe = command.pabe;
+    renderGs->m_ctx[primitive.ctxt ? 1 : 0] = context;
+    renderGs->m_prim = primitive;
+    std::copy_n(draw.vertices().data(), 3u, renderGs->m_vtxQueue);
+    renderGs->m_vtxCount = draw.vertexCount();
+    renderGs->m_texa = global.texa;
+    renderGs->m_texclut = global.texclut;
+    renderGs->m_fogColor = global.fogColor;
+    renderGs->m_prmodecont = global.prmodecont;
+    renderGs->m_pabe = global.pabe;
+    renderGs->m_scanMask = global.scanMask;
+    renderGs->m_dimx = global.dimx;
+    renderGs->m_dither = global.dither;
+    renderGs->m_colorClamp = global.colorClamp;
 
     GSRasterizer &rasterizer = renderGs->m_rasterizer;
     DebugProgressScope progress(
         rasterizer, m_parallelState->primaryGs);
     rasterizer.m_scanlineWorkerIndex = workerIndex;
     rasterizer.m_scanlineWorkerCount = workerCount;
-    std::copy_n(command.fixedX, 3u, rasterizer.m_queuedFixedX);
-    std::copy_n(command.fixedY, 3u, rasterizer.m_queuedFixedY);
+    std::copy_n(draw.fixedX().data(), 3u, rasterizer.m_queuedFixedX);
+    std::copy_n(draw.fixedY().data(), 3u, rasterizer.m_queuedFixedY);
     rasterizer.m_queuedFixedVerticesValid = true;
     rasterizer.m_textureReadVram =
         command.feedbackSnapshot
@@ -2478,7 +2446,7 @@ void GSRasterizer::renderQueuedPrimitive(GS *renderGs,
     {
         rasterizer.m_decodedClutActive = false;
     }
-    if (command.prim.type == GS_PRIM_SPRITE)
+    if (primitive.type == GS_PRIM_SPRITE)
         rasterizer.drawSprite(renderGs);
     else
         rasterizer.drawTriangle(renderGs);
@@ -2495,18 +2463,43 @@ bool GSRasterizer::ownsScanline(int y) const
 
 void GSRasterizer::drawPrimitive(GS *gs)
 {
-    if (tryQueuePrimitive(gs))
+    const GsDrawGlobalState globalState{
+        .texa = gs->m_texa,
+        .texclut = gs->m_texclut,
+        .fogColor = gs->m_fogColor,
+        .dimx = gs->m_dimx,
+        .scanMask = gs->m_scanMask,
+        .prmodecont = gs->m_prmodecont,
+        .pabe = gs->m_pabe,
+        .dither = gs->m_dither,
+        .colorClamp = gs->m_colorClamp,
+    };
+    const GsDrawCommand command = buildGsDrawCommand(
+        gs->m_nextDrawSequence++,
+        gs->m_prim,
+        gs->activeContext(),
+        std::span<const GSVertex>(gs->m_vtxQueue, 3u),
+        globalState);
+    if (tryQueuePrimitive(gs, command))
         return;
     flushDrawBatch(gs);
+    renderSoftwarePrimitive(gs, command);
+}
+
+void GSRasterizer::renderSoftwarePrimitive(
+    GS *gs,
+    const GsDrawCommand &command)
+{
     DebugProgressScope progress(*this, gs);
 
-    const auto &ctx = gs->activeContext();
+    const GSContext &ctx = command.context();
+    const GSPrimReg &primitive = command.primitive();
     prepareDecodedClut(gs);
     m_textureReadVram = nullptr;
     const uint32_t frameBase =
         GSInternal::framePageBaseToBlock(ctx.frame.fbp);
     const bool recursiveTextureDraw =
-        gs->m_prim.tme &&
+        primitive.tme &&
         ctx.tex0.tbp0 == frameBase &&
         gs->m_vram &&
         gs->m_vramSize != 0u;
@@ -2539,9 +2532,10 @@ void GSRasterizer::drawPrimitive(GS *gs)
     {
         m_feedbackSnapshotValid = false;
     }
-    feedbackTrace().record(gs->m_prim, ctx, gs->m_vtxQueue);
+    feedbackTrace().record(
+        primitive, ctx, command.vertices().data());
     GSDrawTraceState &trace = drawTrace();
-    trace.begin(ctx);
+    trace.begin(command);
     trace.feedback = recursiveTextureDraw;
     dumpDrawFramebuffer(gs, ctx, trace.index, "before");
     GSDrawDumpState &dump = drawDump();
@@ -2672,7 +2666,10 @@ void GSRasterizer::drawPrimitive(GS *gs)
         gs->m_hasPreferredDisplaySource = false;
     }
 
-    switch (gs->m_prim.type)
+    std::copy_n(command.fixedX().data(), 3u, m_queuedFixedX);
+    std::copy_n(command.fixedY().data(), 3u, m_queuedFixedY);
+    m_queuedFixedVerticesValid = true;
+    switch (primitive.type)
     {
     case GS_PRIM_SPRITE:
         drawSprite(gs);
@@ -2688,40 +2685,45 @@ void GSRasterizer::drawPrimitive(GS *gs)
         break;
     case GS_PRIM_POINT:
     {
-        const GSVertex &v = gs->m_vtxQueue[0];
-        const auto &ctx = gs->activeContext();
+        const GSVertex &v = command.vertices()[0];
         int px = static_cast<int>(v.x) - (ctx.xyoffset.ofx >> 4);
         int py = static_cast<int>(v.y) - (ctx.xyoffset.ofy >> 4);
         uint8_t r = v.r;
         uint8_t g = v.g;
         uint8_t b = v.b;
-        if (gs->m_prim.fge)
-            applyFog(gs->m_fogColor, v.fog, r, g, b);
+        if (primitive.fge)
+            applyFog(command.globalState().fogColor, v.fog, r, g, b);
         writePixel(gs, px, py, static_cast<u32>(v.z), r, g, b, v.a);
         break;
     }
     default:
         break;
     }
+    m_queuedFixedVerticesValid = false;
     m_textureReadVram = nullptr;
 
     dumpDrawFramebuffer(gs, ctx, trace.index, "after");
 
     if (trace.capturing)
     {
-        const GSVertex &v0 = gs->m_vtxQueue[0];
-        const GSVertex &v1 = gs->m_vtxQueue[1];
-        const GSVertex &v2 = gs->m_vtxQueue[2];
+        const GSVertex &v0 = command.vertices()[0];
+        const GSVertex &v1 = command.vertices()[1];
+        const GSVertex &v2 = command.vertices()[2];
+        const GsDrawGlobalState &global = command.globalState();
+        const GsDrawBounds &bounds = command.bounds();
+        const GsDrawResources resources = command.resources();
+        const GsBackendDecision decision =
+            classifyGsInitialCt32Sprite(command);
         trace.output
             << trace.index << ','
-            << static_cast<uint32_t>(gs->m_prim.type) << ','
-            << static_cast<uint32_t>(gs->m_prim.iip) << ','
-            << static_cast<uint32_t>(gs->m_prim.tme) << ','
-            << static_cast<uint32_t>(gs->m_prim.fge) << ','
-            << static_cast<uint32_t>(gs->m_prim.abe) << ','
-            << static_cast<uint32_t>(gs->m_prim.fst) << ','
-            << static_cast<uint32_t>(gs->m_prim.ctxt) << ','
-            << gs->m_fogColor << ','
+            << static_cast<uint32_t>(primitive.type) << ','
+            << static_cast<uint32_t>(primitive.iip) << ','
+            << static_cast<uint32_t>(primitive.tme) << ','
+            << static_cast<uint32_t>(primitive.fge) << ','
+            << static_cast<uint32_t>(primitive.abe) << ','
+            << static_cast<uint32_t>(primitive.fst) << ','
+            << static_cast<uint32_t>(primitive.ctxt) << ','
+            << global.fogColor << ','
             << ctx.frame.fbp << ','
             << ctx.frame.fbw << ','
             << static_cast<uint32_t>(ctx.frame.psm) << ','
@@ -2747,9 +2749,9 @@ void GSRasterizer::drawPrimitive(GS *gs)
             << ctx.miptbp1 << ','
             << ctx.miptbp2 << ','
             << ctx.clamp << ','
-            << static_cast<uint32_t>(gs->m_texclut.cbw) << ','
-            << static_cast<uint32_t>(gs->m_texclut.cou) << ','
-            << gs->m_texclut.cov << ','
+            << static_cast<uint32_t>(global.texclut.cbw) << ','
+            << static_cast<uint32_t>(global.texclut.cou) << ','
+            << global.texclut.cov << ','
             << (ctx.xyoffset.ofx >> 4) << ','
             << (ctx.xyoffset.ofy >> 4) << ','
             << ctx.scissor.x0 << ','
@@ -2813,6 +2815,46 @@ void GSRasterizer::drawPrimitive(GS *gs)
                 << debugFnv1a64(gs->m_vram, gs->m_vramSize)
                 << std::dec;
         }
+        trace.output
+            << ',' << command.sequence()
+            << ',' << command.stateSignature()
+            << ',' << bounds.x0
+            << ',' << bounds.y0
+            << ',' << bounds.x1
+            << ',' << bounds.y1
+            << ',' << static_cast<uint32_t>(bounds.exact)
+            << ',' << v0.x12_4
+            << ',' << v0.y12_4
+            << ',' << v0.zInteger
+            << ',' << v1.x12_4
+            << ',' << v1.y12_4
+            << ',' << v1.zInteger
+            << ',' << v2.x12_4
+            << ',' << v2.y12_4
+            << ',' << v2.zInteger
+            << ',' << static_cast<uint32_t>(primitive.aa1)
+            << ',' << static_cast<uint32_t>(primitive.fix)
+            << ',' << static_cast<uint32_t>(global.pabe)
+            << ',' << static_cast<uint32_t>(global.texa.ta0)
+            << ',' << static_cast<uint32_t>(global.texa.aem)
+            << ',' << static_cast<uint32_t>(global.texa.ta1)
+            << ',' << static_cast<uint32_t>(global.scanMask)
+            << ',' << global.dimx
+            << ',' << static_cast<uint32_t>(global.dither)
+            << ',' << static_cast<uint32_t>(global.colorClamp)
+            << ',' << ctx.fba
+            << ',' << debugPageList(resources.framebufferReadPages)
+            << ',' << debugPageList(resources.framebufferWritePages)
+            << ',' << debugPageList(resources.depthReadPages)
+            << ',' << debugPageList(resources.depthWritePages)
+            << ',' << debugPageList(resources.texturePages)
+            << ',' << debugPageList(resources.mipPages)
+            << ',' << debugPageList(resources.clutPages)
+            << ',' << static_cast<uint32_t>(resources.readsDestination)
+            << ',' << static_cast<uint32_t>(resources.framebufferDepthAlias)
+            << ',' << static_cast<uint32_t>(resources.framebufferTextureAlias)
+            << ',' << static_cast<uint32_t>(resources.framebufferClutAlias)
+            << ',' << gsFallbackReasonName(decision.reason);
         trace.output << '\n';
         ++trace.written;
     }

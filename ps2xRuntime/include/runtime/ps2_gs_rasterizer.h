@@ -8,6 +8,7 @@
 #include <vector>
 
 class GS;
+class GsDrawCommand;
 
 class GSRasterizer
 {
@@ -51,7 +52,8 @@ private:
         GSRasterizer &m_rasterizer;
     };
 
-    bool tryQueuePrimitive(GS *gs);
+    bool tryQueuePrimitive(GS *gs, const GsDrawCommand &command);
+    void renderSoftwarePrimitive(GS *gs, const GsDrawCommand &command);
     void beginDebugProgress(GS *owner);
     void endDebugProgress();
     void renderQueuedPrimitive(GS *renderGs,

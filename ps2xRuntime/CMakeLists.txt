@@ -585,6 +585,7 @@ add_library(ps2_runtime STATIC
     src/lib/ps2_gif_arbiter.cpp
     src/lib/ps2_audio.cpp
     src/lib/ps2_audio_vag.cpp
+    src/lib/ps2_gs_backend.cpp
     src/lib/ps2_gs_gpu.cpp
     src/lib/ps2_gs_memory.cpp
     src/lib/ps2_gs_rasterizer.cpp

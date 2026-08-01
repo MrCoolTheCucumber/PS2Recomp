@@ -4,6 +4,7 @@
 #include "ps2_stubs.h"
 #include "ps2_syscalls.h"
 #include "runtime/ps2_gs_gpu.h"
+#include "runtime/ps2_gs_backend.h"
 #include "runtime/ps2_gs_memory.h"
 #include "runtime/ps2_gs_rasterizer.h"
 #include "ps2_gs_rasterizer_detail.h"
@@ -13,6 +14,7 @@
 #include "Stubs/Helpers/Support.h"
 #include "Stubs/GS.h"
 
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <cstdint>
@@ -483,6 +485,188 @@ void register_ps2_gs_tests()
 {
     MiniTest::Case("PS2GS", [](TestCase &tc)
     {
+        tc.Run("GS draw commands preserve raw vertices and stable state signatures", [](TestCase &t)
+        {
+            GSContext context{};
+            context.frame.fbp = 7u;
+            context.frame.fbw = 2u;
+            context.frame.psm = GS_PSM_CT32;
+            context.scissor = {0u, 127u, 0u, 63u};
+            context.xyoffset = {16u, 32u};
+            context.zbuf = {20u, GS_PSM_Z32, true};
+            context.test = 0x30000u;
+
+            GSPrimReg primitive{};
+            primitive.type = GS_PRIM_SPRITE;
+
+            std::array<GSVertex, 2> vertices{};
+            vertices[0].x = 999.0f;
+            vertices[0].y = 999.0f;
+            vertices[0].x12_4 = 32u;
+            vertices[0].y12_4 = 48u;
+            vertices[0].zInteger = 0xFEDCBA98u;
+            vertices[1].x12_4 = 160u;
+            vertices[1].y12_4 = 176u;
+
+            const GsDrawGlobalState global{};
+            const GsDrawCommand first = buildGsDrawCommand(
+                41u,
+                primitive,
+                context,
+                std::span<const GSVertex>(vertices),
+                global);
+
+            t.Equals(first.sequence(), 41ull,
+                     "draw sequence should be retained verbatim");
+            t.Equals(first.vertexCount(), static_cast<uint8_t>(2u),
+                     "sprite command should own two submitted vertices");
+            t.Equals(first.vertices()[0].zInteger, 0xFEDCBA98u,
+                     "integer Z should survive without a floating-point round trip");
+            t.Equals(first.fixedX()[0], 16,
+                     "fixed X should come from raw 12.4 payload minus XYOFFSET");
+            t.Equals(first.fixedY()[0], 16,
+                     "fixed Y should come from raw 12.4 payload minus XYOFFSET");
+            t.Equals(first.bounds().x0, 1,
+                     "decoded bounds should use raw fixed-point coordinates");
+            t.Equals(first.bounds().y0, 1,
+                     "decoded bounds should include the raw XYOFFSET subtraction");
+
+            vertices[0].x12_4 = 48u;
+            t.Equals(first.vertices()[0].x12_4,
+                     static_cast<uint16_t>(32u),
+                     "command vertices should not observe later assembly mutations");
+            const GsDrawCommand sameState = buildGsDrawCommand(
+                42u,
+                primitive,
+                context,
+                std::span<const GSVertex>(vertices),
+                global);
+            t.Equals(first.stateSignature(), sameState.stateSignature(),
+                     "state signature should group compatible draws independently of geometry and sequence");
+
+            GSContext changedContext = context;
+            changedContext.frame.fbp = 8u;
+            const GsDrawCommand changedState = buildGsDrawCommand(
+                43u,
+                primitive,
+                changedContext,
+                std::span<const GSVertex>(vertices),
+                global);
+            t.IsTrue(first.stateSignature() != changedState.stateSignature(),
+                     "state signature should change when a resource-defining register changes");
+        });
+
+        tc.Run("GS draw resource masks conservatively wrap the 4 MiB page ring", [](TestCase &t)
+        {
+            GSContext context{};
+            context.frame.fbp = 511u;
+            context.frame.fbw = 1u;
+            context.frame.psm = GS_PSM_CT32;
+            context.scissor = {0u, 63u, 0u, 63u};
+            context.zbuf = {100u, GS_PSM_Z32, true};
+
+            GSPrimReg primitive{};
+            primitive.type = GS_PRIM_SPRITE;
+            std::array<GSVertex, 2> vertices{};
+            vertices[1].x12_4 = 64u * 16u;
+            vertices[1].y12_4 = 64u * 16u;
+
+            const GsDrawCommand command = buildGsDrawCommand(
+                1u,
+                primitive,
+                context,
+                std::span<const GSVertex>(vertices),
+                GsDrawGlobalState{});
+            const GsDrawResources resources = command.resources();
+            const GsVramPageMask &writes =
+                resources.framebufferWritePages;
+            t.Equals(writes.count(), static_cast<size_t>(2u),
+                     "64x64 CT32 bounds should conservatively span two 8 KiB pages");
+            t.IsTrue(writes.test(511u),
+                     "resource mask should retain the final physical GS page");
+            t.IsTrue(writes.test(0u),
+                     "resource mask should wrap past the end of 4 MiB VRAM");
+            t.IsFalse(resources.readPages.any(),
+                      "opaque CT32 draw with disabled depth should not claim a read dependency");
+        });
+
+        tc.Run("GS draw resource masks fail closed for unknown memory layouts", [](TestCase &t)
+        {
+            GSContext context{};
+            context.frame.fbw = 1u;
+            context.frame.psm = 0x3Fu;
+            context.scissor = {0u, 15u, 0u, 15u};
+
+            GSPrimReg primitive{};
+            primitive.type = GS_PRIM_SPRITE;
+            std::array<GSVertex, 2> vertices{};
+            vertices[1].x12_4 = 16u * 16u;
+            vertices[1].y12_4 = 16u * 16u;
+
+            const GsDrawCommand command = buildGsDrawCommand(
+                1u,
+                primitive,
+                context,
+                std::span<const GSVertex>(vertices),
+                GsDrawGlobalState{});
+            t.IsTrue(command.resources().unknownMemoryLayout,
+                     "unknown PSM should be explicit in the resource description");
+            t.IsTrue(command.resources().framebufferWritePages.all(),
+                     "unknown framebuffer layout should conservatively touch all 512 pages");
+        });
+
+        tc.Run("initial CT32 sprite classifier distinguishes depth access from ZTST ALWAYS", [](TestCase &t)
+        {
+            GSContext context{};
+            context.frame.fbw = 1u;
+            context.frame.psm = GS_PSM_CT32;
+            context.scissor = {0u, 15u, 0u, 15u};
+            context.zbuf = {32u, GS_PSM_Z32, true};
+            context.test = 0x30000u; // ZTE=1, ZTST=ALWAYS.
+
+            GSPrimReg primitive{};
+            primitive.type = GS_PRIM_SPRITE;
+            std::array<GSVertex, 2> vertices{};
+            vertices[1].x12_4 = 16u * 16u;
+            vertices[1].y12_4 = 16u * 16u;
+
+            const auto makeCommand = [&](const GSContext &drawContext)
+            {
+                return buildGsDrawCommand(
+                    1u,
+                    primitive,
+                    drawContext,
+                    std::span<const GSVertex>(vertices),
+                    GsDrawGlobalState{});
+            };
+
+            const GsDrawCommand alwaysMasked = makeCommand(context);
+            t.IsFalse(alwaysMasked.resources().depthReadPages.any(),
+                      "ZTST ALWAYS should not read the depth surface");
+            t.IsFalse(alwaysMasked.resources().depthWritePages.any(),
+                      "ZMSK should suppress the depth write dependency");
+            t.Equals(classifyGsInitialCt32Sprite(alwaysMasked).reason,
+                     GsFallbackReason::Supported,
+                     "depth-always with masked writes belongs in the no-depth initial subset");
+
+            context.zbuf.zmask = false;
+            const GsDrawCommand depthWrite = makeCommand(context);
+            t.IsTrue(depthWrite.resources().depthWritePages.any(),
+                     "unmasked depth should create a write dependency");
+            t.Equals(classifyGsInitialCt32Sprite(depthWrite).reason,
+                     GsFallbackReason::DepthWrite,
+                     "initial subset should name depth writes precisely");
+
+            context.zbuf.zmask = true;
+            context.test = 0x50000u; // ZTE=1, ZTST=GEQUAL.
+            const GsDrawCommand depthRead = makeCommand(context);
+            t.IsTrue(depthRead.resources().depthReadPages.any(),
+                     "GEQUAL should create a depth read dependency even with writes masked");
+            t.Equals(classifyGsInitialCt32Sprite(depthRead).reason,
+                     GsFallbackReason::DepthRead,
+                     "initial subset should name depth comparisons precisely");
+        });
+
         tc.Run("GS CSR/IMR support coherent 64-bit and 32-bit access", [](TestCase &t)
         {
             PS2Memory mem;
