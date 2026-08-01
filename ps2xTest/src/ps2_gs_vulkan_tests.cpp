@@ -13390,6 +13390,145 @@ void register_ps2_gs_vulkan_tests()
                      "post-shutdown depth rejection must preserve output");
         });
 
+        tc.Run("Vulkan source-over depth CT32 sprites match clamped GS blending", [](TestCase &t)
+        {
+            GSMem::InitLookupTables();
+            const std::array<GsDrawCommand, 3> opaque{{
+                makeDepthCt32SpriteCommand(
+                    30'100u, 112u, 8u, 216u, GS_PSM_Z24, false, 1u,
+                    {0u, 511u, 0u, 415u},
+                    {1792u * 16u, 1840u * 16u},
+                    1792u * 16u - 8u, 1840u * 16u - 8u,
+                    (1792u + 32u) * 16u - 8u,
+                    (1840u + 416u) * 16u - 8u,
+                    0x78000000u, 0u),
+                makeDepthCt32SpriteCommand(
+                    30'101u, 40u, 2u, 200u, GS_PSM_Z32, true, 2u,
+                    {3u, 30u, 2u, 25u}, {16u, 32u},
+                    49u, 65u, 449u, 353u,
+                    0x80F02010u, 0x80000000u),
+                makeDepthCt32SpriteCommand(
+                    30'102u, 41u, 3u, 201u, GS_PSM_Z24, false, 3u,
+                    {4u, 29u, 3u, 26u}, {0u, 0u},
+                    65u, 49u, 465u, 369u,
+                    0xFF10E0F0u, 0x00700000u),
+            }};
+            const std::array<uint64_t, 3> alphaRegisters{{
+                0x0000000000000044ull,
+                0x0000008000000044ull,
+                0x000000FF00000044ull,
+            }};
+            std::array<GsVulkanDepthCt32Sprite, 3> sprites{};
+            for (size_t index = 0u; index < sprites.size(); ++index)
+            {
+                const GsDrawCommand command = makeAlphaBlendCommand(
+                    opaque[index], 30'110u + index,
+                    alphaRegisters[index], false, true);
+                const GsBackendDecision decision =
+                    prepareGsVulkanSourceOverDepthCt32Sprite(
+                        command, sprites[index]);
+                if (!decision.supported)
+                {
+                    t.Fail(
+                        "synthetic source-over depth sprite was rejected as " +
+                        std::string(gsFallbackReasonName(decision.reason)));
+                    return;
+                }
+            }
+
+            GsVulkanCapabilityReport preflight{};
+            const GsVulkanServiceConfig config =
+                makeRendererServiceConfig(preflight);
+            GsVulkanCapabilityReport creationReport{};
+            std::string creationError;
+            std::unique_ptr<GsVulkanService> service =
+                GsVulkanService::create(
+                    config, &creationReport, &creationError);
+            if (!preflight.ready())
+            {
+                t.IsNull(
+                    service.get(),
+                    "an unavailable host should skip source-over depth cleanly");
+                return;
+            }
+            t.IsNotNull(
+                service.get(),
+                "a suitable device should create the source-over depth service");
+            if (!service)
+                return;
+            const GsVulkanDeviceReport *selected =
+                creationReport.selectedDevice();
+            t.IsNotNull(
+                selected,
+                "the source-over depth service should retain its device");
+            if (!selected)
+                return;
+            t.IsTrue(
+                selected->exactDepthCt32Sprite,
+                "the selected device should publish exact depth execution");
+            if (!selected->exactDepthCt32Sprite)
+            {
+                service->shutdown();
+                return;
+            }
+
+            std::vector<uint8_t> gpu = makeVramPattern(0x50A0D601u);
+            for (size_t index = 0u; index < sprites.size(); ++index)
+            {
+                std::vector<uint8_t> expected = gpu;
+                applyDepthCt32SpriteCpu(expected, sprites[index]);
+                std::vector<uint8_t> actual;
+                std::string operationError;
+                if (!service->executeDepthCt32Sprite(
+                        gpu, sprites[index], actual, &operationError))
+                {
+                    t.Fail(
+                        "GPU source-over depth sprite " +
+                        std::to_string(index) + " failed: " +
+                        operationError);
+                    service->shutdown();
+                    return;
+                }
+                t.IsTrue(
+                    actual == expected,
+                    "source-over depth GPU output must match complete CPU VRAM");
+                gpu = std::move(actual);
+            }
+
+            GsVulkanDepthCt32Sprite invalid = sprites.front();
+            invalid.colorBlendMode = 2u;
+            std::vector<uint8_t> rejectedOutput = {0x12u, 0x34u};
+            const std::vector<uint8_t> outputSentinel = rejectedOutput;
+            std::string rejectionError;
+            t.IsFalse(
+                service->executeDepthCt32Sprite(
+                    gpu, invalid, rejectedOutput, &rejectionError),
+                "unknown depth color operations must fail closed");
+            t.IsTrue(
+                rejectedOutput == outputSentinel,
+                "caller-side color-operation rejection must preserve output");
+            t.IsFalse(
+                rejectionError.empty(),
+                "color-operation rejection should retain a diagnostic");
+
+            const GsVulkanServiceStatistics statistics =
+                service->statistics();
+            t.Equals(
+                statistics.depthCt32SpriteDrawsCompleted,
+                static_cast<uint64_t>(sprites.size()),
+                "every source-over depth sprite should complete exactly once");
+            t.Equals(
+                statistics.depthCt32SpriteDrawsFailed, 0ull,
+                "caller rejection must not count as a GPU failure");
+            t.Equals(
+                statistics.validationErrors, 0u,
+                "source-over depth execution must remain validation-clean");
+            t.Equals(
+                statistics.validationWarnings, 0u,
+                "source-over depth execution should emit no validation warnings");
+            service->shutdown();
+        });
+
         tc.Run("Vulkan linear CT32 repeat and clamp sprites match the prepared DDA", [](TestCase &t)
         {
             GSMem::InitLookupTables();

@@ -24,7 +24,7 @@ layout(push_constant) uniform DepthSpriteParameters
     uint depth;
     uint depth_test_method;
     uint depth_write;
-    uint reserved0;
+    uint color_blend_mode;
     uint reserved1;
     uint reserved2;
     uint reserved3;
@@ -50,6 +50,26 @@ void write_z24(uint word_index, uint initial_word)
             return;
         expected = observed;
     }
+}
+
+uint blend_source_over_rgb(uint source, uint destination)
+{
+    uint result = source & 0xff000000u;
+    int alpha = int(source >> 24u);
+    for (uint shift = 0u; shift < 24u; shift += 8u)
+    {
+        int source_channel = int((source >> shift) & 0xffu);
+        int destination_channel = int((destination >> shift) & 0xffu);
+        int product =
+            (source_channel - destination_channel) * alpha;
+        int scaled = product >= 0
+            ? product / 128
+            : -((-product + 127) / 128);
+        int blended = clamp(
+            destination_channel + scaled, 0, 255);
+        result |= uint(blended) << shift;
+    }
+    return result;
 }
 
 void main()
@@ -82,7 +102,14 @@ void main()
 
     uint framebuffer_word_index = gs_word_index(
         0x00u, sprite.framebuffer_base_block, x, y);
-    atomicExchange(gs_vram.words[framebuffer_word_index], sprite.rgba);
+    uint color = sprite.rgba;
+    if (sprite.color_blend_mode == 1u)
+    {
+        uint destination = atomicAdd(
+            gs_vram.words[framebuffer_word_index], 0u);
+        color = blend_source_over_rgb(sprite.rgba, destination);
+    }
+    atomicExchange(gs_vram.words[framebuffer_word_index], color);
     if (sprite.depth_write == 0u)
         return;
 

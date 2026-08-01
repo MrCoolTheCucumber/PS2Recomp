@@ -199,11 +199,8 @@ namespace
         {
             return "Vulkan depth CT32 sprite has non-zero reserved data";
         }
-        // The source-over record is CPU-contract-only until its matching
-        // shader lands; do not let the existing source-copy pipeline silently
-        // consume a mode it does not implement.
-        if (sprite.colorBlendMode !=
-            GS_VULKAN_DEPTH_CT32_COLOR_SOURCE_COPY)
+        if (sprite.colorBlendMode >
+            GS_VULKAN_DEPTH_CT32_COLOR_SOURCE_OVER)
         {
             return "Vulkan depth CT32 sprite has unsupported color operation";
         }
@@ -222,14 +219,21 @@ namespace
         const uint32_t width = sprite.boundsX1 - sprite.boundsX0;
         const uint32_t height = sprite.boundsY1 - sprite.boundsY0;
         DepthCt32SpriteAccessPages access{};
-        access.writePages = gsVramPagesForSurfaceRect(
-            sprite.framebufferBaseBlock,
-            sprite.framebufferWidth,
-            static_cast<uint8_t>(GSMem::C32),
-            sprite.boundsX0,
-            sprite.boundsY0,
-            width,
-            height);
+        const GsVramPageMask framebufferPages =
+            gsVramPagesForSurfaceRect(
+                sprite.framebufferBaseBlock,
+                sprite.framebufferWidth,
+                static_cast<uint8_t>(GSMem::C32),
+                sprite.boundsX0,
+                sprite.boundsY0,
+                width,
+                height);
+        access.writePages = framebufferPages;
+        if (sprite.colorBlendMode ==
+            GS_VULKAN_DEPTH_CT32_COLOR_SOURCE_OVER)
+        {
+            access.readPages.unionWith(framebufferPages);
+        }
         const GsVramPageMask depthPages =
             gsVramPagesForSurfaceRect(
                 sprite.depthBaseBlock,
@@ -1892,7 +1896,7 @@ namespace
 
     static_assert(sizeof(kGsCt32SpriteShaderSpv) == 7536u);
     static_assert(kGsCt32SpriteShaderSpv[0] == 0x07230203u);
-    static_assert(sizeof(kGsDepthCt32SpriteShaderSpv) == 14852u);
+    static_assert(sizeof(kGsDepthCt32SpriteShaderSpv) == 15820u);
     static_assert(kGsDepthCt32SpriteShaderSpv[0] == 0x07230203u);
     static_assert(sizeof(kGsCt32TriangleShaderSpv) == 10200u);
     static_assert(kGsCt32TriangleShaderSpv[0] == 0x07230203u);
