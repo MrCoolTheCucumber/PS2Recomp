@@ -1118,6 +1118,50 @@ namespace
         bool coherent = false;
     };
 
+    struct PageCopyPlan
+    {
+        std::array<VkBufferCopy, GS_VRAM_PAGE_COUNT> regions{};
+        uint32_t regionCount = 0u;
+        size_t pageCount = 0u;
+        VkDeviceSize byteCount = 0u;
+    };
+
+    PageCopyPlan buildPageCopyPlan(
+        const GsVramPageMask &pages,
+        bool upload) noexcept
+    {
+        PageCopyPlan plan{};
+        VkDeviceSize packedOffset = 0u;
+        size_t page = 0u;
+        while (page < GS_VRAM_PAGE_COUNT)
+        {
+            if (!pages.test(page))
+            {
+                ++page;
+                continue;
+            }
+
+            const size_t firstPage = page;
+            do
+            {
+                ++page;
+            } while (page < GS_VRAM_PAGE_COUNT && pages.test(page));
+
+            const VkDeviceSize vramOffset =
+                firstPage * GS_VRAM_PAGE_SIZE;
+            const VkDeviceSize byteCount =
+                (page - firstPage) * GS_VRAM_PAGE_SIZE;
+            VkBufferCopy &region = plan.regions[plan.regionCount++];
+            region.srcOffset = upload ? packedOffset : vramOffset;
+            region.dstOffset = upload ? vramOffset : packedOffset;
+            region.size = byteCount;
+            packedOffset += byteCount;
+        }
+        plan.pageCount = pages.count();
+        plan.byteCount = packedOffset;
+        return plan;
+    }
+
     class VulkanExecutionContext final
     {
     public:
@@ -1151,6 +1195,23 @@ namespace
             std::span<const uint8_t> input,
             const GsVulkanCt32Sprite &sprite,
             std::vector<uint8_t> &output,
+            GsVulkanCapabilityReport &report,
+            GsVulkanServiceStatistics &statistics,
+            std::string &error);
+        bool uploadVramPages(
+            std::span<const uint8_t> packedInput,
+            const GsVramPageMask &pages,
+            GsVulkanCapabilityReport &report,
+            GsVulkanServiceStatistics &statistics,
+            std::string &error);
+        bool downloadVramPages(
+            const GsVramPageMask &pages,
+            std::vector<uint8_t> &packedOutput,
+            GsVulkanCapabilityReport &report,
+            GsVulkanServiceStatistics &statistics,
+            std::string &error);
+        bool executeResidentCt32Sprite(
+            const GsVulkanCt32Sprite &sprite,
             GsVulkanCapabilityReport &report,
             GsVulkanServiceStatistics &statistics,
             std::string &error);
@@ -1189,6 +1250,31 @@ namespace
             std::vector<uint8_t> &output,
             std::vector<GsVulkanMemoryResult> *results,
             std::string_view operationName,
+            GsVulkanCapabilityReport &report,
+            GsVulkanServiceStatistics &statistics,
+            std::string &error);
+        bool flushMappedAllocation(
+            const BufferAllocation &allocation,
+            std::string_view label,
+            GsVulkanCapabilityReport &report,
+            std::string &error);
+        bool invalidateMappedAllocation(
+            const BufferAllocation &allocation,
+            std::string_view label,
+            GsVulkanCapabilityReport &report,
+            std::string &error);
+        bool beginCommands(
+            GsVulkanCapabilityReport &report,
+            std::string &error);
+        bool submitCommands(
+            std::string_view operationName,
+            bool shaderDispatch,
+            GsVulkanCapabilityReport &report,
+            GsVulkanServiceStatistics &statistics,
+            std::string &error);
+        bool finishOperation(
+            std::string_view operationName,
+            uint32_t validationErrorsBefore,
             GsVulkanCapabilityReport &report,
             GsVulkanServiceStatistics &statistics,
             std::string &error);
@@ -2155,6 +2241,460 @@ namespace
             "CT32 sprite", report, statistics, error);
     }
 
+    bool VulkanExecutionContext::flushMappedAllocation(
+        const BufferAllocation &allocation,
+        std::string_view label,
+        GsVulkanCapabilityReport &report,
+        std::string &error)
+    {
+        if (allocation.coherent)
+            return true;
+        VkMappedMemoryRange mappedRange{};
+        mappedRange.sType = VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE;
+        mappedRange.memory = allocation.memory;
+        mappedRange.offset = 0u;
+        mappedRange.size = VK_WHOLE_SIZE;
+        const VkResult result = m_functions.flushMappedMemoryRanges(
+            m_device, 1u, &mappedRange);
+        const std::string operation =
+            "vkFlushMappedMemoryRanges(" + std::string(label) + ')';
+        if (checkResult(
+                result, operation, report, error,
+                GsVulkanProbeStatus::ResourceCreationFailed))
+        {
+            return true;
+        }
+        m_healthy = false;
+        return false;
+    }
+
+    bool VulkanExecutionContext::invalidateMappedAllocation(
+        const BufferAllocation &allocation,
+        std::string_view label,
+        GsVulkanCapabilityReport &report,
+        std::string &error)
+    {
+        if (allocation.coherent)
+            return true;
+        VkMappedMemoryRange mappedRange{};
+        mappedRange.sType = VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE;
+        mappedRange.memory = allocation.memory;
+        mappedRange.offset = 0u;
+        mappedRange.size = VK_WHOLE_SIZE;
+        const VkResult result = m_functions.invalidateMappedMemoryRanges(
+            m_device, 1u, &mappedRange);
+        const std::string operation =
+            "vkInvalidateMappedMemoryRanges(" +
+            std::string(label) + ')';
+        if (checkResult(
+                result, operation, report, error,
+                GsVulkanProbeStatus::ResourceCreationFailed))
+        {
+            return true;
+        }
+        m_healthy = false;
+        return false;
+    }
+
+    bool VulkanExecutionContext::beginCommands(
+        GsVulkanCapabilityReport &report,
+        std::string &error)
+    {
+        VkResult result = m_functions.resetFences(
+            m_device, 1u, &m_fence);
+        if (!checkResult(result, "vkResetFences", report, error,
+                         GsVulkanProbeStatus::ResourceCreationFailed))
+        {
+            m_healthy = false;
+            return false;
+        }
+        result = m_functions.resetCommandBuffer(m_commandBuffer, 0u);
+        if (!checkResult(result, "vkResetCommandBuffer", report, error,
+                         GsVulkanProbeStatus::ResourceCreationFailed))
+        {
+            m_healthy = false;
+            return false;
+        }
+
+        VkCommandBufferBeginInfo beginInfo{};
+        beginInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+        beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+        result = m_functions.beginCommandBuffer(
+            m_commandBuffer, &beginInfo);
+        if (!checkResult(result, "vkBeginCommandBuffer", report, error,
+                         GsVulkanProbeStatus::ResourceCreationFailed))
+        {
+            m_healthy = false;
+            return false;
+        }
+        return true;
+    }
+
+    bool VulkanExecutionContext::submitCommands(
+        std::string_view operationName,
+        bool shaderDispatch,
+        GsVulkanCapabilityReport &report,
+        GsVulkanServiceStatistics &statistics,
+        std::string &error)
+    {
+        VkResult result = m_functions.endCommandBuffer(m_commandBuffer);
+        if (!checkResult(result, "vkEndCommandBuffer", report, error,
+                         GsVulkanProbeStatus::ResourceCreationFailed))
+        {
+            m_healthy = false;
+            return false;
+        }
+
+        VkSubmitInfo submitInfo{};
+        submitInfo.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+        submitInfo.commandBufferCount = 1u;
+        submitInfo.pCommandBuffers = &m_commandBuffer;
+        result = m_functions.queueSubmit(
+            m_queue, 1u, &submitInfo, m_fence);
+        if (!checkResult(result, "vkQueueSubmit", report, error,
+                         GsVulkanProbeStatus::ResourceCreationFailed))
+        {
+            m_healthy = false;
+            return false;
+        }
+        ++statistics.queueSubmissions;
+        if (shaderDispatch)
+            ++statistics.shaderDispatches;
+
+        const auto waitStart = std::chrono::steady_clock::now();
+        result = m_functions.waitForFences(
+            m_device, 1u, &m_fence, VK_TRUE,
+            m_fenceTimeoutNanoseconds);
+        const auto waitEnd = std::chrono::steady_clock::now();
+        statistics.fenceWaitNanoseconds +=
+            static_cast<uint64_t>(
+                std::chrono::duration_cast<std::chrono::nanoseconds>(
+                    waitEnd - waitStart)
+                    .count());
+        if (result == VK_TIMEOUT)
+        {
+            error = "Vulkan GS " + std::string(operationName) +
+                    " fence timed out";
+            report.status = GsVulkanProbeStatus::ExecutionTimeout;
+            report.detail = error;
+            m_healthy = false;
+            return false;
+        }
+        if (!checkResult(result, "vkWaitForFences", report, error,
+                         GsVulkanProbeStatus::ResourceCreationFailed))
+        {
+            m_healthy = false;
+            return false;
+        }
+        return true;
+    }
+
+    bool VulkanExecutionContext::finishOperation(
+        std::string_view operationName,
+        uint32_t validationErrorsBefore,
+        GsVulkanCapabilityReport &report,
+        GsVulkanServiceStatistics &statistics,
+        std::string &error)
+    {
+        refreshDiagnostics(report, statistics);
+        if (report.validationErrors == validationErrorsBefore)
+            return true;
+        error = "Vulkan validation reported an error during the " +
+                std::string(operationName);
+        report.status = GsVulkanProbeStatus::ValidationError;
+        report.detail = error;
+        m_healthy = false;
+        return false;
+    }
+
+    bool VulkanExecutionContext::uploadVramPages(
+        std::span<const uint8_t> packedInput,
+        const GsVramPageMask &pages,
+        GsVulkanCapabilityReport &report,
+        GsVulkanServiceStatistics &statistics,
+        std::string &error)
+    {
+        const PageCopyPlan plan = buildPageCopyPlan(pages, true);
+        if (!m_healthy)
+        {
+            error = "Vulkan GS service is not healthy";
+            return false;
+        }
+        if (plan.pageCount == 0u ||
+            packedInput.size() != plan.byteCount)
+        {
+            error = "invalid Vulkan GS page upload request";
+            return false;
+        }
+
+        const uint32_t validationErrorsBefore =
+            m_validation.errors.load(std::memory_order_relaxed);
+        std::memcpy(
+            m_stagingMap, packedInput.data(), packedInput.size());
+        if (!flushMappedAllocation(
+                m_staging, "VRAM page upload", report, error) ||
+            !beginCommands(report, error))
+        {
+            return false;
+        }
+
+        VkBufferMemoryBarrier stagingBarrier{};
+        stagingBarrier.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
+        stagingBarrier.srcAccessMask = VK_ACCESS_HOST_WRITE_BIT;
+        stagingBarrier.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+        stagingBarrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        stagingBarrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        stagingBarrier.buffer = m_staging.buffer;
+        stagingBarrier.offset = 0u;
+        stagingBarrier.size = plan.byteCount;
+        m_functions.cmdPipelineBarrier(
+            m_commandBuffer,
+            VK_PIPELINE_STAGE_HOST_BIT,
+            VK_PIPELINE_STAGE_TRANSFER_BIT,
+            0u, 0u, nullptr, 1u, &stagingBarrier, 0u, nullptr);
+
+        VkBufferMemoryBarrier vramPrepareBarrier{};
+        vramPrepareBarrier.sType =
+            VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
+        vramPrepareBarrier.srcAccessMask =
+            VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
+        vramPrepareBarrier.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+        vramPrepareBarrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        vramPrepareBarrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        vramPrepareBarrier.buffer = m_vram.buffer;
+        vramPrepareBarrier.offset = 0u;
+        vramPrepareBarrier.size = GS_VULKAN_VRAM_SIZE;
+        m_functions.cmdPipelineBarrier(
+            m_commandBuffer,
+            VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+            VK_PIPELINE_STAGE_TRANSFER_BIT,
+            0u, 0u, nullptr, 1u, &vramPrepareBarrier, 0u, nullptr);
+
+        m_functions.cmdCopyBuffer(
+            m_commandBuffer, m_staging.buffer, m_vram.buffer,
+            plan.regionCount, plan.regions.data());
+
+        VkBufferMemoryBarrier vramCompleteBarrier{};
+        vramCompleteBarrier.sType =
+            VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
+        vramCompleteBarrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+        vramCompleteBarrier.dstAccessMask =
+            VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
+        vramCompleteBarrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        vramCompleteBarrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        vramCompleteBarrier.buffer = m_vram.buffer;
+        vramCompleteBarrier.offset = 0u;
+        vramCompleteBarrier.size = GS_VULKAN_VRAM_SIZE;
+        m_functions.cmdPipelineBarrier(
+            m_commandBuffer,
+            VK_PIPELINE_STAGE_TRANSFER_BIT,
+            VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+            0u, 0u, nullptr, 1u, &vramCompleteBarrier, 0u, nullptr);
+
+        if (!submitCommands(
+                "VRAM page upload", false,
+                report, statistics, error) ||
+            !finishOperation(
+                "VRAM page upload", validationErrorsBefore,
+                report, statistics, error))
+        {
+            return false;
+        }
+
+        statistics.bytesUploaded += plan.byteCount;
+        statistics.pagesUploaded += plan.pageCount;
+        statistics.pageUploadRegions += plan.regionCount;
+        error.clear();
+        return true;
+    }
+
+    bool VulkanExecutionContext::downloadVramPages(
+        const GsVramPageMask &pages,
+        std::vector<uint8_t> &packedOutput,
+        GsVulkanCapabilityReport &report,
+        GsVulkanServiceStatistics &statistics,
+        std::string &error)
+    {
+        const PageCopyPlan plan = buildPageCopyPlan(pages, false);
+        if (!m_healthy)
+        {
+            error = "Vulkan GS service is not healthy";
+            return false;
+        }
+        if (plan.pageCount == 0u)
+        {
+            error = "invalid Vulkan GS page download request";
+            return false;
+        }
+
+        const uint32_t validationErrorsBefore =
+            m_validation.errors.load(std::memory_order_relaxed);
+        if (!beginCommands(report, error))
+            return false;
+
+        VkBufferMemoryBarrier vramBarrier{};
+        vramBarrier.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
+        vramBarrier.srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT;
+        vramBarrier.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+        vramBarrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        vramBarrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        vramBarrier.buffer = m_vram.buffer;
+        vramBarrier.offset = 0u;
+        vramBarrier.size = GS_VULKAN_VRAM_SIZE;
+        m_functions.cmdPipelineBarrier(
+            m_commandBuffer,
+            VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+            VK_PIPELINE_STAGE_TRANSFER_BIT,
+            0u, 0u, nullptr, 1u, &vramBarrier, 0u, nullptr);
+
+        VkBufferMemoryBarrier stagingPrepareBarrier{};
+        stagingPrepareBarrier.sType =
+            VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
+        stagingPrepareBarrier.srcAccessMask =
+            VK_ACCESS_HOST_READ_BIT | VK_ACCESS_HOST_WRITE_BIT;
+        stagingPrepareBarrier.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+        stagingPrepareBarrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        stagingPrepareBarrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        stagingPrepareBarrier.buffer = m_staging.buffer;
+        stagingPrepareBarrier.offset = 0u;
+        stagingPrepareBarrier.size = plan.byteCount;
+        m_functions.cmdPipelineBarrier(
+            m_commandBuffer,
+            VK_PIPELINE_STAGE_HOST_BIT,
+            VK_PIPELINE_STAGE_TRANSFER_BIT,
+            0u, 0u, nullptr, 1u, &stagingPrepareBarrier,
+            0u, nullptr);
+
+        m_functions.cmdCopyBuffer(
+            m_commandBuffer, m_vram.buffer, m_staging.buffer,
+            plan.regionCount, plan.regions.data());
+
+        VkBufferMemoryBarrier stagingCompleteBarrier{};
+        stagingCompleteBarrier.sType =
+            VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
+        stagingCompleteBarrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+        stagingCompleteBarrier.dstAccessMask = VK_ACCESS_HOST_READ_BIT;
+        stagingCompleteBarrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        stagingCompleteBarrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        stagingCompleteBarrier.buffer = m_staging.buffer;
+        stagingCompleteBarrier.offset = 0u;
+        stagingCompleteBarrier.size = plan.byteCount;
+        m_functions.cmdPipelineBarrier(
+            m_commandBuffer,
+            VK_PIPELINE_STAGE_TRANSFER_BIT,
+            VK_PIPELINE_STAGE_HOST_BIT,
+            0u, 0u, nullptr, 1u, &stagingCompleteBarrier,
+            0u, nullptr);
+
+        if (!submitCommands(
+                "VRAM page download", false,
+                report, statistics, error) ||
+            !invalidateMappedAllocation(
+                m_staging, "VRAM page download", report, error) ||
+            !finishOperation(
+                "VRAM page download", validationErrorsBefore,
+                report, statistics, error))
+        {
+            return false;
+        }
+
+        std::vector<uint8_t> completed(plan.byteCount);
+        std::memcpy(completed.data(), m_stagingMap, completed.size());
+        packedOutput = std::move(completed);
+        statistics.bytesDownloaded += plan.byteCount;
+        statistics.pagesDownloaded += plan.pageCount;
+        statistics.pageDownloadRegions += plan.regionCount;
+        error.clear();
+        return true;
+    }
+
+    bool VulkanExecutionContext::executeResidentCt32Sprite(
+        const GsVulkanCt32Sprite &sprite,
+        GsVulkanCapabilityReport &report,
+        GsVulkanServiceStatistics &statistics,
+        std::string &error)
+    {
+        if (!m_healthy)
+        {
+            error = "Vulkan GS service is not healthy";
+            return false;
+        }
+        if (const char *validationError =
+                ct32SpriteValidationError(sprite))
+        {
+            error = validationError;
+            return false;
+        }
+
+        constexpr uint32_t localSize = 8u;
+        const uint32_t groupCountX =
+            (sprite.x1 - sprite.x0 + localSize - 1u) / localSize;
+        const uint32_t groupCountY =
+            (sprite.y1 - sprite.y0 + localSize - 1u) / localSize;
+        const uint32_t validationErrorsBefore =
+            m_validation.errors.load(std::memory_order_relaxed);
+        if (!beginCommands(report, error))
+            return false;
+
+        VkBufferMemoryBarrier prepareBarrier{};
+        prepareBarrier.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
+        prepareBarrier.srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT;
+        prepareBarrier.dstAccessMask =
+            VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+        prepareBarrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        prepareBarrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        prepareBarrier.buffer = m_vram.buffer;
+        prepareBarrier.offset = 0u;
+        prepareBarrier.size = GS_VULKAN_VRAM_SIZE;
+        m_functions.cmdPipelineBarrier(
+            m_commandBuffer,
+            VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+            0u, 0u, nullptr, 1u, &prepareBarrier, 0u, nullptr);
+
+        m_functions.cmdBindPipeline(
+            m_commandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE,
+            m_spritePipeline);
+        m_functions.cmdBindDescriptorSets(
+            m_commandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE,
+            m_pipelineLayout, 0u, 1u, &m_descriptorSet,
+            0u, nullptr);
+        m_functions.cmdPushConstants(
+            m_commandBuffer, m_pipelineLayout,
+            VK_SHADER_STAGE_COMPUTE_BIT, 0u,
+            sizeof(sprite), &sprite);
+        m_functions.cmdDispatch(
+            m_commandBuffer, groupCountX, groupCountY, 1u);
+
+        VkBufferMemoryBarrier completeBarrier{};
+        completeBarrier.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
+        completeBarrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+        completeBarrier.dstAccessMask =
+            VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
+        completeBarrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        completeBarrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        completeBarrier.buffer = m_vram.buffer;
+        completeBarrier.offset = 0u;
+        completeBarrier.size = GS_VULKAN_VRAM_SIZE;
+        m_functions.cmdPipelineBarrier(
+            m_commandBuffer,
+            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+            VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+            0u, 0u, nullptr, 1u, &completeBarrier, 0u, nullptr);
+
+        if (!submitCommands(
+                "resident CT32 sprite", true,
+                report, statistics, error) ||
+            !finishOperation(
+                "resident CT32 sprite", validationErrorsBefore,
+                report, statistics, error))
+        {
+            return false;
+        }
+        error.clear();
+        return true;
+    }
+
     bool VulkanExecutionContext::executeKernel(
         std::span<const uint8_t> input,
         std::span<const GsVulkanMemoryCase> cases,
@@ -2196,61 +2736,13 @@ namespace
                 static_cast<size_t>(caseBytes));
         }
 
-        const auto flushMappedAllocation =
-            [&](const BufferAllocation &allocation,
-                std::string_view label)
-        {
-            if (allocation.coherent)
-                return true;
-            VkMappedMemoryRange mappedRange{};
-            mappedRange.sType =
-                VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE;
-            mappedRange.memory = allocation.memory;
-            mappedRange.offset = 0u;
-            mappedRange.size = VK_WHOLE_SIZE;
-            const VkResult flushResult =
-                m_functions.flushMappedMemoryRanges(
-                    m_device, 1u, &mappedRange);
-            const std::string operation =
-                "vkFlushMappedMemoryRanges(" +
-                std::string(label) + ')';
-            return checkResult(
-                flushResult, operation, report, error,
-                GsVulkanProbeStatus::ResourceCreationFailed);
-        };
-        if (!flushMappedAllocation(m_staging, "VRAM") ||
+        if (!flushMappedAllocation(
+                m_staging, "VRAM", report, error) ||
             (memoryOperation &&
-             !flushMappedAllocation(m_memoryCases, "memory cases")))
+             !flushMappedAllocation(
+                 m_memoryCases, "memory cases", report, error)) ||
+            !beginCommands(report, error))
         {
-            m_healthy = false;
-            return false;
-        }
-
-        VkResult result = m_functions.resetFences(
-            m_device, 1u, &m_fence);
-        if (!checkResult(result, "vkResetFences", report, error,
-                         GsVulkanProbeStatus::ResourceCreationFailed))
-        {
-            m_healthy = false;
-            return false;
-        }
-        result = m_functions.resetCommandBuffer(m_commandBuffer, 0u);
-        if (!checkResult(result, "vkResetCommandBuffer", report, error,
-                         GsVulkanProbeStatus::ResourceCreationFailed))
-        {
-            m_healthy = false;
-            return false;
-        }
-
-        VkCommandBufferBeginInfo beginInfo{};
-        beginInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
-        beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-        result = m_functions.beginCommandBuffer(
-            m_commandBuffer, &beginInfo);
-        if (!checkResult(result, "vkBeginCommandBuffer", report, error,
-                         GsVulkanProbeStatus::ResourceCreationFailed))
-        {
-            m_healthy = false;
             return false;
         }
 
@@ -2402,95 +2894,17 @@ namespace
             0u, 0u, nullptr, 1u, &stagingDownloadBarrier,
             0u, nullptr);
 
-        result = m_functions.endCommandBuffer(m_commandBuffer);
-        if (!checkResult(result, "vkEndCommandBuffer", report, error,
-                         GsVulkanProbeStatus::ResourceCreationFailed))
-        {
-            m_healthy = false;
-            return false;
-        }
-
-        VkSubmitInfo submitInfo{};
-        submitInfo.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
-        submitInfo.commandBufferCount = 1u;
-        submitInfo.pCommandBuffers = &m_commandBuffer;
-        result = m_functions.queueSubmit(
-            m_queue, 1u, &submitInfo, m_fence);
-        if (!checkResult(result, "vkQueueSubmit", report, error,
-                         GsVulkanProbeStatus::ResourceCreationFailed))
-        {
-            m_healthy = false;
-            return false;
-        }
-        ++statistics.queueSubmissions;
-        ++statistics.shaderDispatches;
-
-        const auto waitStart = std::chrono::steady_clock::now();
-        result = m_functions.waitForFences(
-            m_device, 1u, &m_fence, VK_TRUE,
-            m_fenceTimeoutNanoseconds);
-        const auto waitEnd = std::chrono::steady_clock::now();
-        statistics.fenceWaitNanoseconds +=
-            static_cast<uint64_t>(
-                std::chrono::duration_cast<std::chrono::nanoseconds>(
-                    waitEnd - waitStart)
-                    .count());
-        if (result == VK_TIMEOUT)
-        {
-            error = "Vulkan GS " + std::string(operationName) +
-                    " fence timed out";
-            report.status = GsVulkanProbeStatus::ExecutionTimeout;
-            report.detail = error;
-            m_healthy = false;
-            return false;
-        }
-        if (!checkResult(result, "vkWaitForFences", report, error,
-                         GsVulkanProbeStatus::ResourceCreationFailed))
-        {
-            m_healthy = false;
-            return false;
-        }
-
-        const auto invalidateMappedAllocation =
-            [&](const BufferAllocation &allocation,
-                std::string_view label)
-        {
-            if (allocation.coherent)
-                return true;
-            VkMappedMemoryRange mappedRange{};
-            mappedRange.sType =
-                VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE;
-            mappedRange.memory = allocation.memory;
-            mappedRange.offset = 0u;
-            mappedRange.size = VK_WHOLE_SIZE;
-            const VkResult invalidateResult =
-                m_functions.invalidateMappedMemoryRanges(
-                    m_device, 1u, &mappedRange);
-            const std::string operation =
-                "vkInvalidateMappedMemoryRanges(" +
-                std::string(label) + ')';
-            return checkResult(
-                invalidateResult, operation, report, error,
-                GsVulkanProbeStatus::ResourceCreationFailed);
-        };
-        if (!invalidateMappedAllocation(m_staging, "VRAM") ||
+        if (!submitCommands(
+                operationName, true, report, statistics, error) ||
+            !invalidateMappedAllocation(
+                m_staging, "VRAM", report, error) ||
             (memoryOperation &&
              !invalidateMappedAllocation(
-                 m_memoryResults, "memory results")))
+                 m_memoryResults, "memory results", report, error)) ||
+            !finishOperation(
+                operationName, validationErrorsBefore,
+                report, statistics, error))
         {
-            m_healthy = false;
-            return false;
-        }
-
-        refreshDiagnostics(report, statistics);
-        if (report.validationErrors != validationErrorsBefore)
-        {
-            error =
-                "Vulkan validation reported an error during the " +
-                std::string(operationName);
-            report.status = GsVulkanProbeStatus::ValidationError;
-            report.detail = error;
-            m_healthy = false;
             return false;
         }
 
@@ -2649,6 +3063,9 @@ enum class GsVulkanRequestKind : uint8_t
     RoundTrip,
     MemoryCases,
     Ct32Sprite,
+    UploadPages,
+    DownloadPages,
+    ResidentCt32Sprite,
 };
 
 struct GsVulkanService::Impl final
@@ -2698,9 +3115,21 @@ struct GsVulkanService::Impl final
                     ++statistics.memoryBatchesFailed;
                 }
                 else if (activeRequestKind ==
-                         GsVulkanRequestKind::Ct32Sprite)
+                             GsVulkanRequestKind::Ct32Sprite ||
+                         activeRequestKind ==
+                             GsVulkanRequestKind::ResidentCt32Sprite)
                 {
                     ++statistics.spriteDrawsFailed;
+                }
+                else if (activeRequestKind ==
+                         GsVulkanRequestKind::UploadPages)
+                {
+                    ++statistics.pageUploadOperationsFailed;
+                }
+                else if (activeRequestKind ==
+                         GsVulkanRequestKind::DownloadPages)
+                {
+                    ++statistics.pageDownloadOperationsFailed;
                 }
                 else
                 {
@@ -2756,6 +3185,7 @@ struct GsVulkanService::Impl final
             std::vector<uint8_t> input;
             std::vector<GsVulkanMemoryCase> memoryCases;
             GsVulkanCt32Sprite sprite{};
+            GsVramPageMask pages;
             GsVulkanRequestKind kind =
                 GsVulkanRequestKind::RoundTrip;
             {
@@ -2769,6 +3199,7 @@ struct GsVulkanService::Impl final
                 input = std::move(requestInput);
                 memoryCases = std::move(requestMemoryCases);
                 sprite = requestSprite;
+                pages = requestPages;
                 kind = requestKind;
                 activeRequestKind = kind;
                 requestPending = false;
@@ -2793,6 +3224,24 @@ struct GsVulkanService::Impl final
                     localCapabilities, localStatistics,
                     operationError);
             }
+            else if (kind == GsVulkanRequestKind::UploadPages)
+            {
+                succeeded = context.uploadVramPages(
+                    input, pages, localCapabilities,
+                    localStatistics, operationError);
+            }
+            else if (kind == GsVulkanRequestKind::DownloadPages)
+            {
+                succeeded = context.downloadVramPages(
+                    pages, output, localCapabilities,
+                    localStatistics, operationError);
+            }
+            else if (kind == GsVulkanRequestKind::ResidentCt32Sprite)
+            {
+                succeeded = context.executeResidentCt32Sprite(
+                    sprite, localCapabilities, localStatistics,
+                    operationError);
+            }
             else
             {
                 succeeded = context.roundTrip(
@@ -2812,7 +3261,8 @@ struct GsVulkanService::Impl final
                     ++localStatistics.memoryBatchesFailed;
                 }
             }
-            else if (kind == GsVulkanRequestKind::Ct32Sprite)
+            else if (kind == GsVulkanRequestKind::Ct32Sprite ||
+                     kind == GsVulkanRequestKind::ResidentCt32Sprite)
             {
                 if (succeeded)
                 {
@@ -2825,6 +3275,20 @@ struct GsVulkanService::Impl final
                 {
                     ++localStatistics.spriteDrawsFailed;
                 }
+            }
+            else if (kind == GsVulkanRequestKind::UploadPages)
+            {
+                if (succeeded)
+                    ++localStatistics.pageUploadOperationsCompleted;
+                else
+                    ++localStatistics.pageUploadOperationsFailed;
+            }
+            else if (kind == GsVulkanRequestKind::DownloadPages)
+            {
+                if (succeeded)
+                    ++localStatistics.pageDownloadOperationsCompleted;
+                else
+                    ++localStatistics.pageDownloadOperationsFailed;
             }
             else if (succeeded)
             {
@@ -2878,6 +3342,7 @@ struct GsVulkanService::Impl final
         std::vector<uint8_t> input,
         std::vector<GsVulkanMemoryCase> memoryCases,
         GsVulkanCt32Sprite sprite,
+        GsVramPageMask pages,
         std::vector<uint8_t> &output,
         std::vector<GsVulkanMemoryResult> *memoryResults,
         std::string *error)
@@ -2904,6 +3369,7 @@ struct GsVulkanService::Impl final
         requestInput = std::move(input);
         requestMemoryCases = std::move(memoryCases);
         requestSprite = sprite;
+        requestPages = pages;
         responseOutput.clear();
         responseResults.clear();
         responseError.clear();
@@ -2972,6 +3438,7 @@ struct GsVulkanService::Impl final
     std::vector<uint8_t> requestInput;
     std::vector<GsVulkanMemoryCase> requestMemoryCases;
     GsVulkanCt32Sprite requestSprite{};
+    GsVramPageMask requestPages;
     std::vector<uint8_t> responseOutput;
     std::vector<GsVulkanMemoryResult> responseResults;
     std::string responseError;
@@ -3096,7 +3563,7 @@ bool GsVulkanService::roundTripVram(
     return m_impl->executeRequest(
         GsVulkanRequestKind::RoundTrip,
         std::vector<uint8_t>(input.begin(), input.end()), {},
-        {}, output, nullptr, error);
+        {}, {}, output, nullptr, error);
 #endif
 }
 
@@ -3180,7 +3647,7 @@ bool GsVulkanService::executeMemoryCases(
         std::vector<uint8_t>(input.begin(), input.end()),
         std::vector<GsVulkanMemoryCase>(
             cases.begin(), cases.end()),
-        {}, output, &results, error);
+        {}, {}, output, &results, error);
 #endif
 }
 
@@ -3216,7 +3683,136 @@ bool GsVulkanService::executeCt32Sprite(
     return m_impl->executeRequest(
         GsVulkanRequestKind::Ct32Sprite,
         std::vector<uint8_t>(input.begin(), input.end()), {},
-        sprite, output, nullptr, error);
+        sprite, {}, output, nullptr, error);
+#endif
+}
+
+bool GsVulkanService::uploadVramPages(
+    std::span<const uint8_t> source,
+    const GsVramPageMask &pages,
+    std::string *error)
+{
+#if !PS2X_HAS_GS_VULKAN
+    (void)source;
+    (void)pages;
+    if (error)
+        *error = "Vulkan GS support was compiled out";
+    return false;
+#else
+    if (source.size() != GS_VULKAN_VRAM_SIZE)
+    {
+        if (error)
+            *error = "Vulkan page upload requires exactly 4 MiB of VRAM";
+        return false;
+    }
+    if (!pages.any())
+    {
+        if (error)
+            *error = "Vulkan page upload requires at least one page";
+        return false;
+    }
+
+    std::vector<uint8_t> packed(
+        pages.count() * GS_VRAM_PAGE_SIZE);
+    size_t packedOffset = 0u;
+    for (size_t page = 0u; page < GS_VRAM_PAGE_COUNT; ++page)
+    {
+        if (!pages.test(page))
+            continue;
+        std::memcpy(
+            packed.data() + packedOffset,
+            source.data() + page * GS_VRAM_PAGE_SIZE,
+            GS_VRAM_PAGE_SIZE);
+        packedOffset += GS_VRAM_PAGE_SIZE;
+    }
+
+    std::vector<uint8_t> unusedOutput;
+    return m_impl->executeRequest(
+        GsVulkanRequestKind::UploadPages,
+        std::move(packed), {}, {}, pages,
+        unusedOutput, nullptr, error);
+#endif
+}
+
+bool GsVulkanService::downloadVramPages(
+    std::span<uint8_t> destination,
+    const GsVramPageMask &pages,
+    std::string *error)
+{
+#if !PS2X_HAS_GS_VULKAN
+    (void)destination;
+    (void)pages;
+    if (error)
+        *error = "Vulkan GS support was compiled out";
+    return false;
+#else
+    if (destination.size() != GS_VULKAN_VRAM_SIZE)
+    {
+        if (error)
+            *error = "Vulkan page download requires exactly 4 MiB of VRAM";
+        return false;
+    }
+    if (!pages.any())
+    {
+        if (error)
+            *error = "Vulkan page download requires at least one page";
+        return false;
+    }
+
+    std::vector<uint8_t> packed;
+    if (!m_impl->executeRequest(
+            GsVulkanRequestKind::DownloadPages,
+            {}, {}, {}, pages, packed, nullptr, error))
+    {
+        return false;
+    }
+    const size_t expectedBytes = pages.count() * GS_VRAM_PAGE_SIZE;
+    if (packed.size() != expectedBytes)
+    {
+        if (error)
+            *error = "Vulkan page download returned an invalid payload";
+        return false;
+    }
+
+    size_t packedOffset = 0u;
+    for (size_t page = 0u; page < GS_VRAM_PAGE_COUNT; ++page)
+    {
+        if (!pages.test(page))
+            continue;
+        std::memcpy(
+            destination.data() + page * GS_VRAM_PAGE_SIZE,
+            packed.data() + packedOffset,
+            GS_VRAM_PAGE_SIZE);
+        packedOffset += GS_VRAM_PAGE_SIZE;
+    }
+    if (error)
+        error->clear();
+    return true;
+#endif
+}
+
+bool GsVulkanService::executeResidentCt32Sprite(
+    const GsVulkanCt32Sprite &sprite,
+    std::string *error)
+{
+#if !PS2X_HAS_GS_VULKAN
+    (void)sprite;
+    if (error)
+        *error = "Vulkan GS support was compiled out";
+    return false;
+#else
+    if (const char *validationError =
+            ct32SpriteValidationError(sprite))
+    {
+        if (error)
+            *error = validationError;
+        return false;
+    }
+
+    std::vector<uint8_t> unusedOutput;
+    return m_impl->executeRequest(
+        GsVulkanRequestKind::ResidentCt32Sprite,
+        {}, {}, sprite, {}, unusedOutput, nullptr, error);
 #endif
 }
 

@@ -162,6 +162,14 @@ struct GsVulkanServiceStatistics
     uint64_t spriteDrawsCompleted = 0u;
     uint64_t spriteDrawsFailed = 0u;
     uint64_t spritePixelsExecuted = 0u;
+    uint64_t pageUploadOperationsCompleted = 0u;
+    uint64_t pageUploadOperationsFailed = 0u;
+    uint64_t pageDownloadOperationsCompleted = 0u;
+    uint64_t pageDownloadOperationsFailed = 0u;
+    uint64_t pagesUploaded = 0u;
+    uint64_t pagesDownloaded = 0u;
+    uint64_t pageUploadRegions = 0u;
+    uint64_t pageDownloadRegions = 0u;
     uint32_t validationWarnings = 0u;
     uint32_t validationErrors = 0u;
     bool deviceLost = false;
@@ -267,6 +275,17 @@ public:
         const GsVulkanCt32Sprite &sprite,
         std::vector<uint8_t> &output,
         std::string *error = nullptr) = 0;
+    [[nodiscard]] virtual bool uploadVramPages(
+        std::span<const uint8_t> source,
+        const GsVramPageMask &pages,
+        std::string *error = nullptr) = 0;
+    [[nodiscard]] virtual bool downloadVramPages(
+        std::span<uint8_t> destination,
+        const GsVramPageMask &pages,
+        std::string *error = nullptr) = 0;
+    [[nodiscard]] virtual bool executeResidentCt32Sprite(
+        const GsVulkanCt32Sprite &sprite,
+        std::string *error = nullptr) = 0;
     virtual void shutdown() noexcept = 0;
     [[nodiscard]] virtual GsVulkanCapabilityReport
     capabilities() const = 0;
@@ -314,6 +333,26 @@ public:
         std::span<const uint8_t> input,
         const GsVulkanCt32Sprite &sprite,
         std::vector<uint8_t> &output,
+        std::string *error = nullptr) override;
+
+    // Copies only the selected 8 KiB physical pages between canonical CPU
+    // storage and the persistent device-local VRAM allocation. The source and
+    // destination still describe the exact 4 MiB GS address space; page data
+    // is compacted through the bounded worker slot. A successful download
+    // leaves every unselected destination byte untouched.
+    [[nodiscard]] bool uploadVramPages(
+        std::span<const uint8_t> source,
+        const GsVramPageMask &pages,
+        std::string *error = nullptr) override;
+    [[nodiscard]] bool downloadVramPages(
+        std::span<uint8_t> destination,
+        const GsVramPageMask &pages,
+        std::string *error = nullptr) override;
+
+    // Executes against already-resident device VRAM without an implicit
+    // upload or download. Page ownership remains the caller's responsibility.
+    [[nodiscard]] bool executeResidentCt32Sprite(
+        const GsVulkanCt32Sprite &sprite,
         std::string *error = nullptr) override;
 
     // Idempotently drains accepted work and destroys every Vulkan object on

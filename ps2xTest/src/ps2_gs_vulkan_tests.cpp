@@ -452,6 +452,93 @@ namespace
             return true;
         }
 
+        bool uploadVramPages(
+            std::span<const uint8_t> source,
+            const GsVramPageMask &pages,
+            std::string *error) override
+        {
+            if (!isHealthy || behavior == Behavior::Fail ||
+                source.size() != GS_VULKAN_VRAM_SIZE || !pages.any())
+            {
+                ++serviceStatistics.pageUploadOperationsFailed;
+                if (error)
+                    *error = "injected page upload failure";
+                return false;
+            }
+            for (size_t page = 0u; page < GS_VRAM_PAGE_COUNT; ++page)
+            {
+                if (!pages.test(page))
+                    continue;
+                const size_t offset = page * GS_VRAM_PAGE_SIZE;
+                std::memcpy(
+                    residentVram.data() + offset,
+                    source.data() + offset,
+                    GS_VRAM_PAGE_SIZE);
+            }
+            ++serviceStatistics.pageUploadOperationsCompleted;
+            serviceStatistics.pagesUploaded += pages.count();
+            serviceStatistics.bytesUploaded +=
+                pages.count() * GS_VRAM_PAGE_SIZE;
+            if (error)
+                error->clear();
+            return true;
+        }
+
+        bool downloadVramPages(
+            std::span<uint8_t> destination,
+            const GsVramPageMask &pages,
+            std::string *error) override
+        {
+            if (!isHealthy || behavior == Behavior::Fail ||
+                destination.size() != GS_VULKAN_VRAM_SIZE || !pages.any())
+            {
+                ++serviceStatistics.pageDownloadOperationsFailed;
+                if (error)
+                    *error = "injected page download failure";
+                return false;
+            }
+            for (size_t page = 0u; page < GS_VRAM_PAGE_COUNT; ++page)
+            {
+                if (!pages.test(page))
+                    continue;
+                const size_t offset = page * GS_VRAM_PAGE_SIZE;
+                std::memcpy(
+                    destination.data() + offset,
+                    residentVram.data() + offset,
+                    GS_VRAM_PAGE_SIZE);
+            }
+            ++serviceStatistics.pageDownloadOperationsCompleted;
+            serviceStatistics.pagesDownloaded += pages.count();
+            serviceStatistics.bytesDownloaded +=
+                pages.count() * GS_VRAM_PAGE_SIZE;
+            if (error)
+                error->clear();
+            return true;
+        }
+
+        bool executeResidentCt32Sprite(
+            const GsVulkanCt32Sprite &sprite,
+            std::string *error) override
+        {
+            if (!isHealthy || behavior == Behavior::Fail ||
+                behavior == Behavior::InvalidOutput)
+            {
+                ++serviceStatistics.spriteDrawsFailed;
+                if (error)
+                    *error = "injected resident CT32 executor failure";
+                return false;
+            }
+            if (behavior == Behavior::Exact)
+                applyCt32SpriteCpu(residentVram, sprite);
+            ++serviceStatistics.spriteDrawsCompleted;
+            serviceStatistics.spritePixelsExecuted +=
+                static_cast<uint64_t>(sprite.x1 - sprite.x0) *
+                static_cast<uint64_t>(sprite.y1 - sprite.y0);
+            if (error)
+                error->clear();
+            return true;
+        }
+
         void shutdown() noexcept override
         {
             isHealthy = false;
@@ -476,6 +563,8 @@ namespace
         Behavior behavior;
         GsVulkanCapabilityReport report;
         GsVulkanServiceStatistics serviceStatistics;
+        std::vector<uint8_t> residentVram =
+            std::vector<uint8_t>(GS_VULKAN_VRAM_SIZE);
         bool isHealthy = true;
     };
 
@@ -1856,6 +1945,240 @@ void register_ps2_gs_vulkan_tests()
                       "a stopped service must reject sprite work");
             t.IsTrue(shutdownOutput == shutdownSentinel,
                      "post-shutdown sprite rejection must preserve output");
+        });
+
+        tc.Run("Vulkan resident page operations preserve unselected bytes", [](TestCase &t)
+        {
+            GSMem::InitLookupTables();
+            GsVulkanCapabilityReport preflight{};
+            const GsVulkanServiceConfig config =
+                makeRendererServiceConfig(preflight);
+            GsVulkanCapabilityReport creationReport{};
+            std::string creationError;
+            std::unique_ptr<GsVulkanService> service =
+                GsVulkanService::create(
+                    config, &creationReport, &creationError);
+            if (!preflight.ready())
+            {
+                t.IsNull(service.get(),
+                         "an unavailable host should skip resident page execution cleanly");
+                t.IsFalse(creationReport.ready(),
+                          "a skipped resident service should retain its capability result");
+                return;
+            }
+            t.IsNotNull(service.get(),
+                        "a suitable device should create the resident page service");
+            t.IsTrue(creationError.empty(),
+                     "successful resident page service creation should clear its diagnostic");
+            if (!service)
+                return;
+
+            GsVramPageMask allPages;
+            allPages.setAll();
+            GsVramPageMask sparsePages;
+            for (const size_t page : {0u, 1u, 7u, 255u, 256u, 511u})
+                sparsePages.set(page);
+            const auto countRuns = [](const GsVramPageMask &pages)
+            {
+                uint64_t runs = 0u;
+                bool insideRun = false;
+                for (size_t page = 0u; page < GS_VRAM_PAGE_COUNT; ++page)
+                {
+                    const bool selected = pages.test(page);
+                    if (selected && !insideRun)
+                        ++runs;
+                    insideRun = selected;
+                }
+                return runs;
+            };
+            const auto copyPages = [](
+                std::vector<uint8_t> &destination,
+                const std::vector<uint8_t> &source,
+                const GsVramPageMask &pages)
+            {
+                for (size_t page = 0u; page < GS_VRAM_PAGE_COUNT; ++page)
+                {
+                    if (!pages.test(page))
+                        continue;
+                    const size_t offset = page * GS_VRAM_PAGE_SIZE;
+                    std::memcpy(
+                        destination.data() + offset,
+                        source.data() + offset,
+                        GS_VRAM_PAGE_SIZE);
+                }
+            };
+
+            const std::vector<uint8_t> initial =
+                makeVramPattern(0x50414731u);
+            const std::vector<uint8_t> replacement =
+                makeVramPattern(0x50414732u);
+            std::vector<uint8_t> expected = initial;
+            copyPages(expected, replacement, sparsePages);
+            std::string operationError;
+            t.IsTrue(service->uploadVramPages(
+                         initial, allPages, &operationError),
+                     "the initial full-page upload should establish resident VRAM");
+            t.IsTrue(operationError.empty(),
+                     "the initial upload should clear its diagnostic");
+            t.IsTrue(service->uploadVramPages(
+                         replacement, sparsePages, &operationError),
+                     "a sparse upload should accept first last and adjacent pages");
+            t.IsTrue(operationError.empty(),
+                     "the sparse upload should clear its diagnostic");
+
+            std::vector<uint8_t> sparseDownload(
+                GS_VULKAN_VRAM_SIZE, 0xA5u);
+            std::vector<uint8_t> expectedSparse = sparseDownload;
+            copyPages(expectedSparse, expected, sparsePages);
+            t.IsTrue(service->downloadVramPages(
+                         sparseDownload, sparsePages, &operationError),
+                     "a sparse download should complete");
+            t.IsTrue(sparseDownload == expectedSparse,
+                     "a sparse download must leave every unselected byte untouched");
+
+            std::vector<uint8_t> residentBefore(
+                GS_VULKAN_VRAM_SIZE, 0u);
+            t.IsTrue(service->downloadVramPages(
+                         residentBefore, allPages, &operationError),
+                     "a full observation should reconstruct resident VRAM");
+            t.IsTrue(residentBefore == expected,
+                     "sparse upload ranges must preserve every other resident page");
+
+            const GsDrawCommand command = makeCt32SpriteCommand(
+                91u, 511u, 1u,
+                {0u, 127u, 0u, 63u}, {0u, 0u},
+                60u * 16u, 28u * 16u,
+                68u * 16u, 36u * 16u,
+                0xD1C2B3A4u);
+            GsVulkanCt32Sprite sprite{};
+            const GsBackendDecision decision =
+                prepareGsVulkanCt32Sprite(command, sprite);
+            t.IsTrue(decision.supported,
+                     "the resident wrap fixture should satisfy the exact predicate");
+            if (!decision.supported)
+                return;
+            std::vector<uint8_t> expectedAfter = expected;
+            applyCt32SpriteCpu(expectedAfter, sprite);
+            t.IsTrue(service->executeResidentCt32Sprite(
+                         sprite, &operationError),
+                     "a resident sprite should execute without implicit transfers");
+            t.IsTrue(operationError.empty(),
+                     "resident sprite execution should clear its diagnostic");
+
+            const GsVramPageMask writePages =
+                command.resources().writePages;
+            t.IsTrue(writePages.any(),
+                     "the resident sprite should expose conservative write pages");
+            std::vector<uint8_t> writePageObservation = expected;
+            t.IsTrue(service->downloadVramPages(
+                         writePageObservation, writePages,
+                         &operationError),
+                     "downloading only sprite write pages should complete");
+            t.IsTrue(writePageObservation == expectedAfter,
+                     "the command write mask must cover every resident sprite byte");
+
+            std::vector<uint8_t> residentAfter(
+                GS_VULKAN_VRAM_SIZE, 0x5Au);
+            t.IsTrue(service->downloadVramPages(
+                         residentAfter, allPages, &operationError),
+                     "a full post-draw observation should complete");
+            t.IsTrue(residentAfter == expectedAfter,
+                     "resident upload draw and download must match the CPU oracle exactly");
+
+            const std::vector<uint8_t> shortSource(
+                GS_VULKAN_VRAM_SIZE - 1u, 0u);
+            GsVramPageMask emptyPages;
+            t.IsFalse(service->uploadVramPages(
+                          shortSource, sparsePages, &operationError),
+                      "a short page-upload source should fail closed");
+            t.IsFalse(service->uploadVramPages(
+                          initial, emptyPages, &operationError),
+                      "an empty page upload should fail closed");
+            std::vector<uint8_t> shortDestination(
+                GS_VULKAN_VRAM_SIZE - 1u, 0x33u);
+            const std::vector<uint8_t> shortSentinel = shortDestination;
+            t.IsFalse(service->downloadVramPages(
+                          shortDestination, sparsePages,
+                          &operationError),
+                      "a short page-download destination should fail closed");
+            t.IsTrue(shortDestination == shortSentinel,
+                     "a rejected page download must preserve its destination");
+            std::vector<uint8_t> emptyDestination(
+                GS_VULKAN_VRAM_SIZE, 0x44u);
+            const std::vector<uint8_t> emptySentinel = emptyDestination;
+            t.IsFalse(service->downloadVramPages(
+                          emptyDestination, emptyPages,
+                          &operationError),
+                      "an empty page download should fail closed");
+            t.IsTrue(emptyDestination == emptySentinel,
+                     "an empty page download must preserve its destination");
+            GsVulkanCt32Sprite invalidSprite = sprite;
+            invalidSprite.reserved = 1u;
+            t.IsFalse(service->executeResidentCt32Sprite(
+                          invalidSprite, &operationError),
+                      "an invalid resident sprite should fail before submission");
+
+            const GsVulkanServiceStatistics statistics =
+                service->statistics();
+            const uint64_t writePageCount = writePages.count();
+            t.Equals(statistics.pageUploadOperationsCompleted, 2ull,
+                     "both accepted page uploads should complete once");
+            t.Equals(statistics.pageUploadOperationsFailed, 0ull,
+                     "caller-side upload rejection should not count as worker failure");
+            t.Equals(statistics.pageDownloadOperationsCompleted, 4ull,
+                     "all accepted page downloads should complete once");
+            t.Equals(statistics.pageDownloadOperationsFailed, 0ull,
+                     "caller-side download rejection should not count as worker failure");
+            t.Equals(statistics.pagesUploaded,
+                     512ull + sparsePages.count(),
+                     "page upload statistics should count selected physical pages");
+            t.Equals(statistics.pagesDownloaded,
+                     512ull + sparsePages.count() +
+                         writePageCount + 512ull,
+                     "page download statistics should count selected physical pages");
+            t.Equals(statistics.pageUploadRegions,
+                     1ull + countRuns(sparsePages),
+                     "adjacent upload pages should coalesce into copy regions");
+            t.Equals(statistics.pageDownloadRegions,
+                     countRuns(sparsePages) + 1ull +
+                         countRuns(writePages) + 1ull,
+                     "adjacent download pages should coalesce into copy regions");
+            t.Equals(statistics.bytesUploaded,
+                     (512ull + sparsePages.count()) *
+                         GS_VRAM_PAGE_SIZE,
+                     "page uploads should account only selected bytes");
+            t.Equals(statistics.bytesDownloaded,
+                     (512ull + sparsePages.count() +
+                          writePageCount + 512ull) *
+                         GS_VRAM_PAGE_SIZE,
+                     "page downloads should account only selected bytes");
+            t.Equals(statistics.spriteDrawsCompleted, 1ull,
+                     "the resident sprite should complete exactly once");
+            t.Equals(statistics.spriteDrawsFailed, 0ull,
+                     "caller-side resident rejection should not count as worker failure");
+            t.Equals(statistics.queueSubmissions, 7ull,
+                     "each accepted transfer or draw should use one bounded submission");
+            t.Equals(statistics.shaderDispatches, 1ull,
+                     "page transfers should not execute a compute shader");
+            t.Equals(statistics.validationErrors, 0u,
+                     "resident page operations must remain validation-clean");
+            t.Equals(statistics.validationWarnings, 0u,
+                     "resident page operations should emit no validation warnings");
+            t.IsTrue(service->healthy(),
+                     "successful and caller-rejected page work should leave the service healthy");
+
+            service->shutdown();
+            service->shutdown();
+            std::vector<uint8_t> shutdownDestination(
+                GS_VULKAN_VRAM_SIZE, 0x6Bu);
+            const std::vector<uint8_t> shutdownSentinel =
+                shutdownDestination;
+            t.IsFalse(service->downloadVramPages(
+                          shutdownDestination, sparsePages,
+                          &operationError),
+                      "a stopped service must reject page downloads");
+            t.IsTrue(shutdownDestination == shutdownSentinel,
+                     "post-shutdown page rejection must preserve output");
         });
 
         tc.Run("Vulkan PSM helpers match CPU addresses reads and writes", [](TestCase &t)
