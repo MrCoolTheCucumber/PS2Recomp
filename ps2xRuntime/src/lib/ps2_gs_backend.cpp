@@ -12,6 +12,25 @@ namespace
     constexpr uint32_t kGsBlockCount =
         static_cast<uint32_t>(GS_VRAM_PAGE_COUNT * 32u);
 
+    bool isSourceCopyAlphaBlend(const GSPrimReg &primitive,
+                                const GSContext &context) noexcept
+    {
+        if (!primitive.abe)
+            return false;
+
+        const uint8_t a = static_cast<uint8_t>(context.alpha & 0x3u);
+        const uint8_t b = static_cast<uint8_t>(
+            (context.alpha >> 2u) & 0x3u);
+        const uint8_t d = static_cast<uint8_t>(
+            (context.alpha >> 6u) & 0x3u);
+        // GS ALPHA computes (A-B)*C/128+D for RGB. Equal defined A/B
+        // selectors cancel exactly, and D=Cs makes the result a plain source
+        // copy. Alpha itself is never blended. Keep selector 3 closed because
+        // it is reserved rather than relying on the software fallback's zero
+        // interpretation.
+        return a <= 2u && a == b && d == 0u;
+    }
+
     struct PageGeometry
     {
         uint32_t width;
@@ -283,9 +302,13 @@ namespace
         const bool destinationAlphaTest =
             ((context.test >> 14u) & 1u) != 0u &&
             context.frame.psm != GS_PSM_CT24;
+        const bool alphaBlendReadsDestination =
+            primitive.abe &&
+            !isSourceCopyAlphaBlend(primitive, context);
         const bool framebufferReadModifyWrite =
             context.frame.psm == GS_PSM_CT24 ||
-            context.frame.fbmsk != 0u || primitive.abe || primitive.aa1 ||
+            context.frame.fbmsk != 0u || alphaBlendReadsDestination ||
+            primitive.aa1 ||
             destinationAlphaTest || preserveDestinationAlpha;
         if (framebufferReadModifyWrite)
             resources.framebufferReadPages = framebufferSurface;
@@ -829,7 +852,8 @@ namespace
         GSPrimType expectedPrimitive,
         uint8_t expectedVertices,
         TextureRequirement textureRequirement,
-        DepthRequirement depthRequirement = DepthRequirement::None) noexcept
+        DepthRequirement depthRequirement = DepthRequirement::None,
+        bool allowSourceCopyAlphaBlend = false) noexcept
     {
         const GSPrimReg &primitive = command.primitive();
         const GSContext &context = command.context();
@@ -862,7 +886,9 @@ namespace
             return {false, GsFallbackReason::GouraudShading};
         if (primitive.fge)
             return {false, GsFallbackReason::Fog};
-        if (primitive.abe)
+        if (primitive.abe &&
+            !(allowSourceCopyAlphaBlend &&
+              isSourceCopyAlphaBlend(primitive, context)))
             return {false, GsFallbackReason::AlphaBlend};
         if ((context.test & 1u) != 0u)
             return {false, GsFallbackReason::AlphaTest};
@@ -1022,7 +1048,9 @@ GsBackendDecision classifyGsInitialCt32Sprite(
 {
     return classifyFlatCt32State(
         command, GS_PRIM_SPRITE, 2u,
-        TextureRequirement::Disabled);
+        TextureRequirement::Disabled,
+        DepthRequirement::None,
+        true);
 }
 
 GsBackendDecision classifyGsDepthCt32Sprite(

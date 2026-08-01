@@ -299,6 +299,45 @@ namespace
             GsDrawGlobalState{});
     }
 
+    GsDrawCommand makeSourceCopyAlphaCt32SpriteCommand(
+        uint64_t sequence,
+        uint32_t framebufferPage,
+        uint8_t framebufferWidth,
+        GSScissorReg scissor,
+        GSXYOffsetReg xyoffset,
+        uint16_t rawX0,
+        uint16_t rawY0,
+        uint16_t rawX1,
+        uint16_t rawY1,
+        uint32_t rgba,
+        uint64_t alpha = 0u,
+        bool pabe = false)
+    {
+        const GsDrawCommand opaque = makeCt32SpriteCommand(
+            sequence,
+            framebufferPage,
+            framebufferWidth,
+            scissor,
+            xyoffset,
+            rawX0,
+            rawY0,
+            rawX1,
+            rawY1,
+            rgba);
+        GSPrimReg primitive = opaque.primitive();
+        primitive.abe = true;
+        GSContext context = opaque.context();
+        context.alpha = alpha;
+        GsDrawGlobalState global = opaque.globalState();
+        global.pabe = pabe;
+        return buildGsDrawCommand(
+            sequence,
+            primitive,
+            context,
+            std::span<const GSVertex>(opaque.vertices()).first(2u),
+            global);
+    }
+
     GsDrawCommand makeDepthCt32SpriteCommand(
         uint64_t sequence,
         uint32_t framebufferPage,
@@ -2094,6 +2133,122 @@ void register_ps2_gs_vulkan_tests()
                      "degenerate endpoints should fail before any GPU submission");
             t.IsTrue(sprite == sentinel,
                      "degenerate preparation must preserve the caller's record");
+        });
+
+        tc.Run("source-copy alpha CT32 sprites reuse the opaque record exactly", [](TestCase &t)
+        {
+            GSMem::InitLookupTables();
+            const GsDrawCommand opaque = makeCt32SpriteCommand(
+                20u,
+                0u,
+                8u,
+                {0u, 511u, 0u, 511u},
+                {0u, 0u},
+                7u * 16u,
+                9u * 16u,
+                35u * 16u,
+                521u * 16u,
+                0x2B000000u);
+
+            const auto withAlpha = [&opaque](
+                                       uint64_t sequence,
+                                       uint64_t alpha,
+                                       bool pabe = false)
+            {
+                GSPrimReg primitive = opaque.primitive();
+                primitive.abe = true;
+                GSContext context = opaque.context();
+                context.alpha = alpha;
+                GsDrawGlobalState global = opaque.globalState();
+                global.pabe = pabe;
+                return buildGsDrawCommand(
+                    sequence,
+                    primitive,
+                    context,
+                    std::span<const GSVertex>(opaque.vertices()).first(2u),
+                    global);
+            };
+
+            const std::array<GsDrawCommand, 3> sourceCopies{{
+                withAlpha(21u, 0u),
+                // A=Cd, B=Cd, C=Ad, D=Cs. FIX is deliberately nonzero.
+                withAlpha(22u, 0xA500000015ull),
+                // A=0, B=0, C=FIX, D=Cs. PABE cannot change the result.
+                withAlpha(23u, 0x7F0000002Aull, true),
+            }};
+
+            GsVulkanCt32Sprite opaqueRecord{};
+            t.IsTrue(
+                prepareGsVulkanCt32Sprite(opaque, opaqueRecord).supported,
+                "the comparison record should prepare");
+            for (const GsDrawCommand &command : sourceCopies)
+            {
+                const GsDrawResources resources = command.resources();
+                t.IsFalse(
+                    resources.framebufferReadPages.any(),
+                    "a cancelling blend equation must not claim a framebuffer read");
+                t.IsFalse(
+                    resources.readsDestination,
+                    "a source-copy blend has no effective destination dependency");
+
+                GsVulkanCt32Sprite record{};
+                const GsBackendDecision decision =
+                    prepareGsVulkanCt32Sprite(command, record);
+                t.IsTrue(
+                    decision.supported,
+                    "A=B and D=Cs should reuse the exact flat CT32 path");
+                t.Equals(
+                    decision.reason,
+                    GsFallbackReason::Supported,
+                    "a source-copy blend should retain the supported reason");
+                t.IsTrue(
+                    record == opaqueRecord,
+                    "blend cancellation should publish the identical shader record");
+            }
+
+            const std::array<uint64_t, 3> rejectedAlpha{{
+                0x44u, // (Cs-Cd)*As/128+Cd: genuine source-over.
+                0x40u, // A=B but D=Cd: destination copy.
+                0x0Fu, // Reserved A/B selectors are not an exact contract.
+            }};
+            for (uint64_t alpha : rejectedAlpha)
+            {
+                const GsDrawCommand rejected = withAlpha(24u, alpha);
+                t.IsTrue(
+                    rejected.resources().framebufferReadPages.any(),
+                    "non-source-copy blending should retain its conservative read");
+                GsVulkanCt32Sprite sentinel{
+                    1u, 2u, 3u, 4u, 5u, 6u, 7u, 8u};
+                const GsBackendDecision decision =
+                    prepareGsVulkanCt32Sprite(rejected, sentinel);
+                t.IsFalse(
+                    decision.supported,
+                    "destination-dependent or reserved equations must stay closed");
+                t.Equals(
+                    decision.reason,
+                    GsFallbackReason::AlphaBlend,
+                    "rejected equations should retain the alpha-blend reason");
+                t.IsTrue(
+                    sentinel == GsVulkanCt32Sprite{
+                        1u, 2u, 3u, 4u, 5u, 6u, 7u, 8u},
+                    "rejected alpha preparation must preserve caller output");
+            }
+
+            std::vector<uint8_t> actual = makeVramPattern(0xA17A0000u);
+            std::vector<uint8_t> expected = actual;
+            applyCt32SpriteCpu(expected, opaqueRecord);
+
+            GS gs;
+            gs.init(
+                actual.data(),
+                static_cast<uint32_t>(actual.size()),
+                nullptr);
+            gs.setDebugHistoryPaused(true);
+            drawNearestCt32SpriteCommand(gs, sourceCopies.front());
+            gs.flushRenderBatch();
+            t.IsTrue(
+                actual == expected,
+                "the retained ALPHA=0 software draw must equal the opaque record over all VRAM");
         });
 
         tc.Run("depth CT32 sprite preparation publishes exact Z32 and Z24 state", [](TestCase &t)
@@ -5940,6 +6095,108 @@ void register_ps2_gs_vulkan_tests()
                      "upload draw and observation should each wait once");
         });
 
+        tc.Run("Vulkan hybrid source-copy alpha policy uses measured work", [](TestCase &t)
+        {
+            const auto sourceCopy = [](const GsDrawCommand &opaque,
+                                       uint64_t sequence,
+                                       uint64_t alpha = 0u)
+            {
+                GSPrimReg primitive = opaque.primitive();
+                primitive.abe = true;
+                GSContext context = opaque.context();
+                context.alpha = alpha;
+                return buildGsDrawCommand(
+                    sequence,
+                    primitive,
+                    context,
+                    std::span<const GSVertex>(opaque.vertices()).first(2u),
+                    opaque.globalState());
+            };
+            const GsDrawCommand below = sourceCopy(
+                makeCt32SpriteCommand(
+                    350u, 4u, 1u,
+                    {0u, 63u, 0u, 63u}, {0u, 0u},
+                    0u, 0u, 64u * 16u, 64u * 16u,
+                    0x20000000u),
+                351u);
+            const GsDrawCommand threshold = sourceCopy(
+                makeCt32SpriteCommand(
+                    352u, 8u, 2u,
+                    {0u, 127u, 0u, 63u}, {0u, 0u},
+                    0u, 0u, 128u * 16u, 64u * 16u,
+                    0x40000000u),
+                353u);
+            const GsDrawCommand sourceOver = sourceCopy(
+                threshold, 354u, 0x44u);
+
+            std::vector<uint8_t> vram = makeVramPattern(0x53434150u);
+            GsVulkanRasterBackendConfig config{};
+            config.mode = GsRendererMode::Hybrid;
+            t.Equals(
+                config.minimumHybridSourceCopyAlphaSpritePixels,
+                8'192ull,
+                "source-copy alpha should retain the measured default floor");
+            std::unique_ptr<GsVulkanRasterBackend> backend =
+                GsVulkanRasterBackend::createWithExecutor(
+                    std::make_unique<FakeCt32Executor>(
+                        FakeCt32Executor::Behavior::Exact),
+                    config,
+                    vram,
+                    [](const GsDrawCommand &) {},
+                    {},
+                    nullptr);
+            t.IsNotNull(
+                backend.get(),
+                "the source-copy policy fixture should construct");
+            if (!backend)
+                return;
+
+            t.Equals(
+                backend->classify(below).reason,
+                GsFallbackReason::CostModel,
+                "4,096 source-copy pixels should remain below the crossover");
+            t.IsTrue(
+                backend->classify(threshold).supported,
+                "8,192 source-copy pixels should meet the crossover exactly");
+            t.Equals(
+                backend->classify(sourceOver).reason,
+                GsFallbackReason::AlphaBlend,
+                "the policy must not turn source-over into a semantic candidate");
+
+            t.IsTrue(
+                backend->setMode(GsRendererMode::GpuStrict),
+                "the source-copy fixture should enter strict mode");
+            t.IsTrue(
+                backend->classify(below).supported,
+                "strict mode should ignore the source-copy cost gate");
+            t.IsTrue(
+                backend->setMode(GsRendererMode::Verify),
+                "the source-copy fixture should enter Verify mode");
+            t.IsTrue(
+                backend->classify(below).supported,
+                "Verify should exercise every source-copy candidate");
+
+            config.minimumHybridSourceCopyAlphaSpritePixels = 0u;
+            std::unique_ptr<GsVulkanRasterBackend> disabled =
+                GsVulkanRasterBackend::createWithExecutor(
+                    std::make_unique<FakeCt32Executor>(
+                        FakeCt32Executor::Behavior::Exact),
+                    config,
+                    vram,
+                    [](const GsDrawCommand &) {},
+                    {},
+                    nullptr);
+            t.IsNotNull(
+                disabled.get(),
+                "a disabled source-copy cost gate should construct");
+            if (disabled)
+            {
+                t.IsTrue(
+                    disabled->classify(below).supported,
+                    "zero should disable the source-copy Hybrid floor");
+            }
+        });
+
         tc.Run("Vulkan hybrid nearest CT32 cost policy uses sample bounds", [](TestCase &t)
         {
             GSMem::InitLookupTables();
@@ -9506,6 +9763,164 @@ void register_ps2_gs_vulkan_tests()
                      "strict depth checkpoints should remain validation-clean");
             t.Equals(service.validationWarnings, 0u,
                      "strict depth checkpoints should emit no validation warnings");
+        });
+
+        tc.Run("GS Vulkan source-copy alpha survives Verify strict and Hybrid", [](TestCase &t)
+        {
+            GSMem::InitLookupTables();
+            const GsDrawCommand below =
+                makeSourceCopyAlphaCt32SpriteCommand(
+                    40'900u, 20u, 1u,
+                    {0u, 63u, 0u, 63u}, {0u, 0u},
+                    0u, 0u, 64u * 16u, 64u * 16u,
+                    0x20000000u);
+            const GsDrawCommand threshold =
+                makeSourceCopyAlphaCt32SpriteCommand(
+                    40'901u, 100u, 2u,
+                    {0u, 127u, 0u, 63u}, {0u, 0u},
+                    0u, 0u, 128u * 16u, 64u * 16u,
+                    0x40000000u);
+            const GsDrawCommand retained =
+                makeSourceCopyAlphaCt32SpriteCommand(
+                    40'902u, 300u, 8u,
+                    {0u, 511u, 0u, 447u},
+                    {1792u * 16u, 1824u * 16u},
+                    1792u * 16u - 8u,
+                    1824u * 16u - 8u,
+                    (1792u + 32u) * 16u - 8u,
+                    (1824u + 448u) * 16u - 8u,
+                    0x08000000u);
+            const auto pixels = [](const GsDrawCommand &command)
+            {
+                return static_cast<uint64_t>(
+                           command.bounds().x1 - command.bounds().x0) *
+                       static_cast<uint64_t>(
+                           command.bounds().y1 - command.bounds().y0);
+            };
+            t.Equals(pixels(below), 4'096ull,
+                     "the small source-copy fixture should stay below policy");
+            t.Equals(pixels(threshold), 8'192ull,
+                     "the threshold fixture should meet policy exactly");
+            t.Equals(pixels(retained), 14'336ull,
+                     "the retained fixture should reproduce one RAC1 strip");
+
+            const std::vector<uint8_t> initial =
+                makeVramPattern(0x53434152u);
+            std::vector<uint8_t> softwareVram = initial;
+            std::vector<uint8_t> acceleratedVram = initial;
+            GS software;
+            GS accelerated;
+            software.init(
+                softwareVram.data(),
+                static_cast<uint32_t>(softwareVram.size()), nullptr);
+            accelerated.init(
+                acceleratedVram.data(),
+                static_cast<uint32_t>(acceleratedVram.size()), nullptr);
+
+            GsVulkanCapabilityReport preflight{};
+            const GsVulkanServiceConfig serviceConfig =
+                makeRendererServiceConfig(preflight);
+            GsVulkanRasterBackendConfig config{};
+            t.Equals(config.minimumHybridSourceCopyAlphaSpritePixels,
+                     8'192ull,
+                     "the integrated fixture should use measured policy");
+            t.IsTrue(accelerated.configureVulkanRenderer(
+                         serviceConfig, config),
+                     "source-copy integration should accept configuration");
+            if (!preflight.ready())
+            {
+                t.IsFalse(accelerated.setRendererMode(
+                              GsRendererMode::Verify),
+                          "an unavailable host should decline Verify");
+                return;
+            }
+            const GsVulkanDeviceReport *selected =
+                preflight.selectedDevice();
+            t.IsNotNull(selected,
+                        "a ready source-copy preflight should select a device");
+            if (!selected)
+                return;
+            t.IsTrue(selected->exactVramStorage,
+                     "the selected device should expose exact raw VRAM");
+            if (!selected->exactVramStorage)
+                return;
+
+            t.IsTrue(accelerated.setRendererMode(GsRendererMode::Verify),
+                     "the qualified host should enter Verify");
+            drawNearestCt32SpriteCommand(software, below);
+            drawNearestCt32SpriteCommand(accelerated, below);
+            (void)software.getDebugSnapshot();
+            (void)accelerated.getDebugSnapshot();
+            t.IsTrue(acceleratedVram == softwareVram,
+                     "source-copy Verify should match all software VRAM");
+
+            t.IsTrue(accelerated.setRendererMode(GsRendererMode::GpuStrict),
+                     "the qualified host should enter strict mode");
+            drawNearestCt32SpriteCommand(software, threshold);
+            drawNearestCt32SpriteCommand(accelerated, threshold);
+            (void)software.getDebugSnapshot();
+            (void)accelerated.getDebugSnapshot();
+            t.IsTrue(acceleratedVram == softwareVram,
+                     "resident strict source-copy should publish exact VRAM");
+
+            t.IsTrue(accelerated.setRendererMode(GsRendererMode::Hybrid),
+                     "the qualified host should enter Hybrid");
+            accelerated.setBackendCountersEnabled(true);
+            accelerated.resetBackendCounters();
+            for (const GsDrawCommand *command :
+                 std::array<const GsDrawCommand *, 3>{
+                     &below, &threshold, &retained})
+            {
+                drawNearestCt32SpriteCommand(software, *command);
+                drawNearestCt32SpriteCommand(accelerated, *command);
+            }
+            (void)software.getDebugSnapshot();
+            (void)accelerated.getDebugSnapshot();
+            t.IsTrue(acceleratedVram == softwareVram,
+                     "mixed source-copy Hybrid routing should remain exact");
+
+            const GsBackendCounters counters =
+                accelerated.backendCounters();
+            t.Equals(counters.commands, 3ull,
+                     "Hybrid should classify the complete source-copy stream");
+            t.Equals(counters.softwareCommands, 1ull,
+                     "only below-threshold source-copy work should use CPU");
+            t.Equals(counters.fallbackCommands, 1ull,
+                     "the small draw should retain one cost fallback");
+            t.Equals(counters.acceleratedCommands, 2ull,
+                     "threshold and retained source-copy work should use GPU");
+            t.Equals(counters.decisions[static_cast<size_t>(
+                         GsFallbackReason::CostModel)],
+                     1ull,
+                     "the mixed stream should expose one cost decision");
+
+            const GsVulkanRasterBackendStatistics backend =
+                accelerated.vulkanRendererBackendStatistics();
+            t.Equals(backend.commandsCompleted, 4ull,
+                     "Verify strict and two Hybrid GPU draws should complete");
+            t.Equals(backend.verifiedCommands, 1ull,
+                     "the first source-copy draw should be verified once");
+            t.Equals(backend.residentCommands, 3ull,
+                     "strict and Hybrid source-copy work should stay resident");
+            t.Equals(backend.coherency.rejectedTransitions, 0ull,
+                     "source-copy routing should preserve page ownership");
+            t.Equals(backend.pageOwnership.gpuNewerPages, size_t{0u},
+                     "the final observation should publish every GPU page");
+
+            const GsVulkanServiceStatistics service =
+                accelerated.vulkanRendererServiceStatistics();
+            t.Equals(service.spriteDrawsCompleted, 4ull,
+                     "the flat service should execute every accelerated copy");
+            t.Equals(service.spriteDrawsFailed, 0ull,
+                     "source-copy service work should not fail");
+            t.Equals(service.residentSpriteBatchesCompleted, 2ull,
+                     "strict and two-draw Hybrid work should form two batches");
+            t.Equals(service.largestResidentSpriteBatch, 2ull,
+                     "disjoint threshold and retained work should batch together");
+            t.Equals(service.validationErrors, 0u,
+                     "source-copy integration should remain validation-clean");
+            t.Equals(service.validationWarnings, 0u,
+                     "source-copy integration should emit no warnings");
         });
 
         tc.Run("GS Vulkan Hybrid keeps retained depth on CPU and orders admitted work", [](TestCase &t)

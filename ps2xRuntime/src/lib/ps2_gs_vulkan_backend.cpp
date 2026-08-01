@@ -928,7 +928,10 @@ GsBackendDecision GsVulkanRasterBackend::classify(
         const uint64_t pixels =
             static_cast<uint64_t>(sprite.x1 - sprite.x0) *
             static_cast<uint64_t>(sprite.y1 - sprite.y0);
-        if (pixels < m_impl->config.minimumHybridSpritePixels)
+        const uint64_t minimumPixels = command.primitive().abe
+            ? m_impl->config.minimumHybridSourceCopyAlphaSpritePixels
+            : m_impl->config.minimumHybridSpritePixels;
+        if (minimumPixels != 0u && pixels < minimumPixels)
             return {false, GsFallbackReason::CostModel};
         return decision;
     }

@@ -22,6 +22,9 @@ struct GsVulkanRasterBackendConfig
     // Hybrid keeps smaller draws on the CPU. Zero disables these policies.
     // Verify and strict modes always exercise every semantically eligible draw.
     uint64_t minimumHybridSpritePixels = 64u;
+    // Source-copy alpha equations reuse the flat sprite kernel but retain a
+    // separate crossover because the software blend path is more expensive.
+    uint64_t minimumHybridSourceCopyAlphaSpritePixels = 8'192u;
     // Depth work includes one CT32 write plus an exact Z32/Z24 test/write. The
     // default is the conservative isolated-draw crossover across both formats.
     uint64_t minimumHybridDepthCt32SpritePixels = 262'144u;

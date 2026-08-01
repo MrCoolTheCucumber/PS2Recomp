@@ -361,8 +361,10 @@ private:
     uint32_t width,
     uint32_t height) noexcept;
 
-// Phase 3's deliberately narrow first GPU predicate. Keeping it as a pure
-// classifier makes the Phase 0 census and future backend use the same reason.
+// Exact flat, untextured CT32 sprite predicate. In addition to opaque writes,
+// it admits alpha equations whose defined equal A/B selectors cancel and whose
+// D selector copies the source; those equations publish the same raster record.
+// Keeping this as a pure classifier gives census and every backend one reason.
 [[nodiscard]] GsBackendDecision classifyGsInitialCt32Sprite(
     const GsDrawCommand &command) noexcept;
 

@@ -69,6 +69,7 @@ namespace
                "[--verify-dump-dir DIRECTORY] "
                "[--vulkan-max-resident-batch COUNT] "
                "[--vulkan-min-hybrid-pixels COUNT] "
+               "[--vulkan-min-hybrid-source-copy-alpha-pixels COUNT] "
                "[--vulkan-min-hybrid-depth-ct32-pixels COUNT] "
                "[--vulkan-min-hybrid-nearest-ct32-pixels COUNT] "
                "[--vulkan-min-hybrid-linear-ct32-pixels COUNT] "
@@ -820,6 +821,8 @@ int main(int argc, char **argv)
             argument == "--verify-dump-dir" ||
             argument == "--vulkan-max-resident-batch" ||
             argument == "--vulkan-min-hybrid-pixels" ||
+            argument ==
+                "--vulkan-min-hybrid-source-copy-alpha-pixels" ||
             argument == "--vulkan-min-hybrid-depth-ct32-pixels" ||
             argument == "--vulkan-min-hybrid-nearest-ct32-pixels" ||
             argument == "--vulkan-min-hybrid-linear-ct32-pixels" ||
@@ -900,6 +903,26 @@ int main(int argc, char **argv)
                     return 2;
                 }
                 vulkanBackendConfig.minimumHybridSpritePixels = minimum;
+                vulkanOptionUsed = true;
+                replayOptionUsed = true;
+                gifReplayOptionUsed = true;
+            }
+            else if (argument ==
+                     "--vulkan-min-hybrid-source-copy-alpha-pixels")
+            {
+                uint64_t minimum = 0u;
+                constexpr uint64_t maximumPixels = 2048ull * 2048ull;
+                if (!parseCount(argv[index], minimum) ||
+                    minimum > maximumPixels)
+                {
+                    std::cerr
+                        << "Vulkan hybrid source-copy alpha pixel threshold "
+                           "must be between 0 and "
+                        << maximumPixels << '\n';
+                    return 2;
+                }
+                vulkanBackendConfig
+                    .minimumHybridSourceCopyAlphaSpritePixels = minimum;
                 vulkanOptionUsed = true;
                 replayOptionUsed = true;
                 gifReplayOptionUsed = true;
