@@ -94,6 +94,10 @@ struct GsVulkanDeviceReport
     // access. This flag also requires the queue, limits, and memory classes
     // needed by the fixed 4 MiB raw-GS-buffer design.
     bool exactVramStorage = false;
+
+    // The initial exact triangle kernel additionally requires native signed
+    // 64-bit shader arithmetic for full-range GS 12.4 edge equations.
+    bool exactCt32Triangle = false;
     bool suitable = false;
     std::string rejectionReason;
 };
@@ -169,6 +173,9 @@ struct GsVulkanServiceStatistics
     uint64_t spriteDrawsCompleted = 0u;
     uint64_t spriteDrawsFailed = 0u;
     uint64_t spritePixelsExecuted = 0u;
+    uint64_t triangleDrawsCompleted = 0u;
+    uint64_t triangleDrawsFailed = 0u;
+    uint64_t triangleCandidatePixelsExecuted = 0u;
     uint64_t residentSpriteBatchesCompleted = 0u;
     uint64_t residentSpriteBatchesFailed = 0u;
     uint64_t largestResidentSpriteBatch = 0u;
@@ -339,6 +346,11 @@ public:
         const GsVulkanCt32Sprite &sprite,
         std::vector<uint8_t> &output,
         std::string *error = nullptr) = 0;
+    [[nodiscard]] virtual bool executeCt32Triangle(
+        std::span<const uint8_t> input,
+        const GsVulkanCt32Triangle &triangle,
+        std::vector<uint8_t> &output,
+        std::string *error = nullptr) = 0;
     [[nodiscard]] virtual bool uploadVramPages(
         std::span<const uint8_t> source,
         const GsVramPageMask &pages,
@@ -399,6 +411,15 @@ public:
     [[nodiscard]] bool executeCt32Sprite(
         std::span<const uint8_t> input,
         const GsVulkanCt32Sprite &sprite,
+        std::vector<uint8_t> &output,
+        std::string *error = nullptr) override;
+
+    // Uploads canonical 4 MiB CPU VRAM, executes one prepared exact flat
+    // CT32 triangle, and publishes the complete synchronized image. Devices
+    // without the explicit 64-bit triangle capability reject before posting.
+    [[nodiscard]] bool executeCt32Triangle(
+        std::span<const uint8_t> input,
+        const GsVulkanCt32Triangle &triangle,
         std::vector<uint8_t> &output,
         std::string *error = nullptr) override;
 

@@ -1052,6 +1052,8 @@ GsVulkanCapabilityReport probeGsVulkanCapabilities(
         device.suitable =
             device.exactVramStorage &&
             device.kind != GsVulkanDeviceKind::Cpu;
+        device.exactCt32Triangle =
+            device.suitable && device.shaderInt64;
 
         if (device.kind == GsVulkanDeviceKind::Cpu)
             device.rejectionReason = "CPU Vulkan implementations are not hardware-GS targets";
@@ -1095,11 +1097,14 @@ GsVulkanCapabilityReport probeGsVulkanCapabilities(
 namespace
 {
 #include "shaders/ps2_gs_ct32_sprite_spv.inc"
+#include "shaders/ps2_gs_ct32_triangle_spv.inc"
 #include "shaders/ps2_gs_memory_cases_spv.inc"
 #include "shaders/ps2_gs_vram_noop_spv.inc"
 
     static_assert(sizeof(kGsCt32SpriteShaderSpv) == 7536u);
     static_assert(kGsCt32SpriteShaderSpv[0] == 0x07230203u);
+    static_assert(sizeof(kGsCt32TriangleShaderSpv) == 10200u);
+    static_assert(kGsCt32TriangleShaderSpv[0] == 0x07230203u);
     static_assert(sizeof(kGsMemoryCasesShaderSpv) == 10988u);
     static_assert(kGsMemoryCasesShaderSpv[0] == 0x07230203u);
     static_assert(sizeof(kGsVramNoopShaderSpv) == 1112u);
@@ -1375,6 +1380,13 @@ namespace
             GsVulkanCapabilityReport &report,
             GsVulkanServiceStatistics &statistics,
             std::string &error);
+        bool executeCt32Triangle(
+            std::span<const uint8_t> input,
+            const GsVulkanCt32Triangle &triangle,
+            std::vector<uint8_t> &output,
+            GsVulkanCapabilityReport &report,
+            GsVulkanServiceStatistics &statistics,
+            std::string &error);
         bool uploadVramPages(
             std::span<const uint8_t> packedInput,
             const GsVramPageMask &pages,
@@ -1492,6 +1504,8 @@ namespace
         VkPipeline m_memoryPipeline = VK_NULL_HANDLE;
         VkShaderModule m_spriteShaderModule = VK_NULL_HANDLE;
         VkPipeline m_spritePipeline = VK_NULL_HANDLE;
+        VkShaderModule m_triangleShaderModule = VK_NULL_HANDLE;
+        VkPipeline m_trianglePipeline = VK_NULL_HANDLE;
         VkDescriptorPool m_descriptorPool = VK_NULL_HANDLE;
         VkDescriptorSet m_descriptorSet = VK_NULL_HANDLE;
         VkCommandPool m_commandPool = VK_NULL_HANDLE;
@@ -1499,6 +1513,7 @@ namespace
         VkFence m_fence = VK_NULL_HANDLE;
         uint64_t m_fenceTimeoutNanoseconds = 0u;
         uint64_t m_pipelineCacheMisses = 0u;
+        bool m_exactCt32Triangle = false;
         bool m_healthy = false;
     };
 
@@ -1840,6 +1855,9 @@ namespace
         queueInfo.pQueuePriorities = &priority;
 
         VkPhysicalDeviceFeatures enabledFeatures{};
+        enabledFeatures.shaderInt64 =
+            selected.exactCt32Triangle ? VK_TRUE : VK_FALSE;
+        m_exactCt32Triangle = selected.exactCt32Triangle;
         VkDeviceCreateInfo deviceInfo{};
         deviceInfo.sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO;
         deviceInfo.queueCreateInfoCount = 1u;
@@ -2073,7 +2091,7 @@ namespace
         VkPushConstantRange pushConstantRange{};
         pushConstantRange.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
         pushConstantRange.offset = 0u;
-        pushConstantRange.size = sizeof(GsVulkanCt32Sprite);
+        pushConstantRange.size = sizeof(GsVulkanCt32Triangle);
         VkPipelineLayoutCreateInfo pipelineLayoutInfo{};
         pipelineLayoutInfo.sType =
             VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
@@ -2151,6 +2169,15 @@ namespace
                 sizeof(kGsCt32SpriteShaderSpv),
                 m_spriteShaderModule, m_spritePipeline,
                 "CT32 sprite"))
+        {
+            return false;
+        }
+        if (m_exactCt32Triangle &&
+            !createComputePipeline(
+                kGsCt32TriangleShaderSpv,
+                sizeof(kGsCt32TriangleShaderSpv),
+                m_triangleShaderModule, m_trianglePipeline,
+                "CT32 triangle"))
         {
             return false;
         }
@@ -2424,6 +2451,53 @@ namespace
             groupCountX, groupCountY,
             &sprite, sizeof(sprite), output, nullptr,
             "CT32 sprite", report, statistics, error);
+    }
+
+    bool VulkanExecutionContext::executeCt32Triangle(
+        std::span<const uint8_t> input,
+        const GsVulkanCt32Triangle &triangle,
+        std::vector<uint8_t> &output,
+        GsVulkanCapabilityReport &report,
+        GsVulkanServiceStatistics &statistics,
+        std::string &error)
+    {
+        if (!m_healthy)
+        {
+            error = "Vulkan GS service is not healthy";
+            return false;
+        }
+        if (!m_exactCt32Triangle ||
+            m_trianglePipeline == VK_NULL_HANDLE)
+        {
+            error = "Vulkan device does not support exact CT32 triangles";
+            return false;
+        }
+        if (input.size() != GS_VULKAN_VRAM_SIZE)
+        {
+            error = "Vulkan CT32 triangle requires exactly 4 MiB of VRAM";
+            return false;
+        }
+        if (const char *validationError =
+                ct32TriangleValidationError(triangle))
+        {
+            error = validationError;
+            return false;
+        }
+
+        constexpr uint32_t localSize = 8u;
+        const uint32_t width =
+            triangle.boundsX1 - triangle.boundsX0;
+        const uint32_t height =
+            triangle.boundsY1 - triangle.boundsY0;
+        const uint32_t groupCountX =
+            (width + localSize - 1u) / localSize;
+        const uint32_t groupCountY =
+            (height + localSize - 1u) / localSize;
+        return executeKernel(
+            input, {}, m_trianglePipeline,
+            groupCountX, groupCountY,
+            &triangle, sizeof(triangle), output, nullptr,
+            "CT32 triangle", report, statistics, error);
     }
 
     bool VulkanExecutionContext::flushMappedAllocation(
@@ -2904,7 +2978,7 @@ namespace
         if (pipeline == VK_NULL_HANDLE ||
             groupCountX == 0u || groupCountY == 0u ||
             !pushConstants || pushConstantSize == 0u ||
-            pushConstantSize > sizeof(GsVulkanCt32Sprite) ||
+            pushConstantSize > sizeof(GsVulkanCt32Triangle) ||
             (pushConstantSize & 3u) != 0u ||
             memoryOperation != !cases.empty())
         {
@@ -3157,6 +3231,20 @@ namespace
         }
         m_descriptorPool = VK_NULL_HANDLE;
         m_descriptorSet = VK_NULL_HANDLE;
+        if (m_trianglePipeline != VK_NULL_HANDLE &&
+            m_functions.destroyPipeline)
+        {
+            m_functions.destroyPipeline(
+                m_device, m_trianglePipeline, nullptr);
+        }
+        m_trianglePipeline = VK_NULL_HANDLE;
+        if (m_triangleShaderModule != VK_NULL_HANDLE &&
+            m_functions.destroyShaderModule)
+        {
+            m_functions.destroyShaderModule(
+                m_device, m_triangleShaderModule, nullptr);
+        }
+        m_triangleShaderModule = VK_NULL_HANDLE;
         if (m_spritePipeline != VK_NULL_HANDLE &&
             m_functions.destroyPipeline)
         {
@@ -3255,6 +3343,7 @@ enum class GsVulkanRequestKind : uint8_t
     RoundTrip,
     MemoryCases,
     Ct32Sprite,
+    Ct32Triangle,
     UploadPages,
     DownloadPages,
     ResidentCt32Sprites,
@@ -3310,6 +3399,11 @@ struct GsVulkanService::Impl final
                          GsVulkanRequestKind::Ct32Sprite)
                 {
                     ++statistics.spriteDrawsFailed;
+                }
+                else if (activeRequestKind ==
+                         GsVulkanRequestKind::Ct32Triangle)
+                {
+                    ++statistics.triangleDrawsFailed;
                 }
                 else if (activeRequestKind ==
                          GsVulkanRequestKind::ResidentCt32Sprites)
@@ -3380,6 +3474,7 @@ struct GsVulkanService::Impl final
             std::vector<uint8_t> input;
             std::vector<GsVulkanMemoryCase> memoryCases;
             std::vector<GsVulkanCt32Sprite> sprites;
+            GsVulkanCt32Triangle triangle{};
             GsVramPageMask pages;
             GsVulkanRequestKind kind =
                 GsVulkanRequestKind::RoundTrip;
@@ -3394,6 +3489,7 @@ struct GsVulkanService::Impl final
                 input = std::move(requestInput);
                 memoryCases = std::move(requestMemoryCases);
                 sprites = std::move(requestSprites);
+                triangle = requestTriangle;
                 pages = requestPages;
                 kind = requestKind;
                 activeRequestKind = kind;
@@ -3417,6 +3513,13 @@ struct GsVulkanService::Impl final
             {
                 succeeded = context.executeCt32Sprite(
                     input, sprites.front(), output,
+                    localCapabilities, localStatistics,
+                    operationError);
+            }
+            else if (kind == GsVulkanRequestKind::Ct32Triangle)
+            {
+                succeeded = context.executeCt32Triangle(
+                    input, triangle, output,
                     localCapabilities, localStatistics,
                     operationError);
             }
@@ -3471,6 +3574,22 @@ struct GsVulkanService::Impl final
                 else
                 {
                     ++localStatistics.spriteDrawsFailed;
+                }
+            }
+            else if (kind == GsVulkanRequestKind::Ct32Triangle)
+            {
+                if (succeeded)
+                {
+                    ++localStatistics.triangleDrawsCompleted;
+                    localStatistics.triangleCandidatePixelsExecuted +=
+                        static_cast<uint64_t>(
+                            triangle.boundsX1 - triangle.boundsX0) *
+                        static_cast<uint64_t>(
+                            triangle.boundsY1 - triangle.boundsY0);
+                }
+                else
+                {
+                    ++localStatistics.triangleDrawsFailed;
                 }
             }
             else if (kind == GsVulkanRequestKind::ResidentCt32Sprites)
@@ -3561,6 +3680,7 @@ struct GsVulkanService::Impl final
         std::vector<uint8_t> input,
         std::vector<GsVulkanMemoryCase> memoryCases,
         std::vector<GsVulkanCt32Sprite> sprites,
+        GsVulkanCt32Triangle triangle,
         GsVramPageMask pages,
         std::vector<uint8_t> &output,
         std::vector<GsVulkanMemoryResult> *memoryResults,
@@ -3588,6 +3708,7 @@ struct GsVulkanService::Impl final
         requestInput = std::move(input);
         requestMemoryCases = std::move(memoryCases);
         requestSprites = std::move(sprites);
+        requestTriangle = triangle;
         requestPages = pages;
         responseOutput.clear();
         responseResults.clear();
@@ -3657,6 +3778,7 @@ struct GsVulkanService::Impl final
     std::vector<uint8_t> requestInput;
     std::vector<GsVulkanMemoryCase> requestMemoryCases;
     std::vector<GsVulkanCt32Sprite> requestSprites;
+    GsVulkanCt32Triangle requestTriangle{};
     GsVramPageMask requestPages;
     std::vector<uint8_t> responseOutput;
     std::vector<GsVulkanMemoryResult> responseResults;
@@ -3783,7 +3905,7 @@ bool GsVulkanService::roundTripVram(
     return m_impl->executeRequest(
         GsVulkanRequestKind::RoundTrip,
         std::vector<uint8_t>(input.begin(), input.end()), {},
-        {}, {}, output, nullptr, error);
+        {}, {}, {}, output, nullptr, error);
 #endif
 }
 
@@ -3867,7 +3989,7 @@ bool GsVulkanService::executeMemoryCases(
         std::vector<uint8_t>(input.begin(), input.end()),
         std::vector<GsVulkanMemoryCase>(
             cases.begin(), cases.end()),
-        {}, {}, output, &results, error);
+        {}, {}, {}, output, &results, error);
 #endif
 }
 
@@ -3903,8 +4025,60 @@ bool GsVulkanService::executeCt32Sprite(
     return m_impl->executeRequest(
         GsVulkanRequestKind::Ct32Sprite,
         std::vector<uint8_t>(input.begin(), input.end()), {},
-        std::vector<GsVulkanCt32Sprite>{sprite}, {},
+        std::vector<GsVulkanCt32Sprite>{sprite}, {}, {},
         output, nullptr, error);
+#endif
+}
+
+bool GsVulkanService::executeCt32Triangle(
+    std::span<const uint8_t> input,
+    const GsVulkanCt32Triangle &triangle,
+    std::vector<uint8_t> &output,
+    std::string *error)
+{
+#if !PS2X_HAS_GS_VULKAN
+    (void)input;
+    (void)triangle;
+    (void)output;
+    if (error)
+        *error = "Vulkan GS support was compiled out";
+    return false;
+#else
+    if (input.size() != GS_VULKAN_VRAM_SIZE)
+    {
+        if (error)
+        {
+            *error =
+                "Vulkan CT32 triangle requires exactly 4 MiB of VRAM";
+        }
+        return false;
+    }
+    if (const char *validationError =
+            ct32TriangleValidationError(triangle))
+    {
+        if (error)
+            *error = validationError;
+        return false;
+    }
+    {
+        std::lock_guard lock(m_impl->stateMutex);
+        const GsVulkanDeviceReport *selected =
+            m_impl->capabilities.selectedDevice();
+        if (!selected || !selected->exactCt32Triangle)
+        {
+            if (error)
+            {
+                *error =
+                    "Vulkan device does not support exact CT32 triangles";
+            }
+            return false;
+        }
+    }
+
+    return m_impl->executeRequest(
+        GsVulkanRequestKind::Ct32Triangle,
+        std::vector<uint8_t>(input.begin(), input.end()),
+        {}, {}, triangle, {}, output, nullptr, error);
 #endif
 }
 
@@ -3950,7 +4124,7 @@ bool GsVulkanService::uploadVramPages(
     std::vector<uint8_t> unusedOutput;
     return m_impl->executeRequest(
         GsVulkanRequestKind::UploadPages,
-        std::move(packed), {}, {}, pages,
+        std::move(packed), {}, {}, {}, pages,
         unusedOutput, nullptr, error);
 #endif
 }
@@ -3983,7 +4157,7 @@ bool GsVulkanService::downloadVramPages(
     std::vector<uint8_t> packed;
     if (!m_impl->executeRequest(
             GsVulkanRequestKind::DownloadPages,
-            {}, {}, {}, pages, packed, nullptr, error))
+            {}, {}, {}, {}, pages, packed, nullptr, error))
     {
         return false;
     }
@@ -4044,7 +4218,7 @@ bool GsVulkanService::executeResidentCt32Sprites(
         {}, {},
         std::vector<GsVulkanCt32Sprite>(
             sprites.begin(), sprites.end()),
-        {}, unusedOutput, nullptr, error);
+        {}, {}, unusedOutput, nullptr, error);
 #endif
 }
 

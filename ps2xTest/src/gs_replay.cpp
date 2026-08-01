@@ -307,6 +307,8 @@ namespace
                    << (device.shaderInt64 ? "true" : "false")
                    << ",\"exact_vram_storage\":"
                    << (device.exactVramStorage ? "true" : "false")
+                   << ",\"exact_ct32_triangle\":"
+                   << (device.exactCt32Triangle ? "true" : "false")
                    << ",\"suitable\":"
                    << (device.suitable ? "true" : "false")
                    << ",\"rejection_reason\":";
@@ -369,6 +371,12 @@ namespace
                << statistics.spriteDrawsFailed
                << ",\"sprite_pixels_executed\":"
                << statistics.spritePixelsExecuted
+               << ",\"triangle_draws_completed\":"
+               << statistics.triangleDrawsCompleted
+               << ",\"triangle_draws_failed\":"
+               << statistics.triangleDrawsFailed
+               << ",\"triangle_candidate_pixels_executed\":"
+               << statistics.triangleCandidatePixelsExecuted
                << ",\"resident_sprite_batches_completed\":"
                << statistics.residentSpriteBatchesCompleted
                << ",\"resident_sprite_batches_failed\":"

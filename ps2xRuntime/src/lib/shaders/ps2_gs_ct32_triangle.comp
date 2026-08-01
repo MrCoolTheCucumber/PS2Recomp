@@ -1,0 +1,106 @@
+#version 450
+#extension GL_GOOGLE_include_directive : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+
+#include "ps2_gs_memory.glsl"
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+layout(set = 0, binding = 0, std430) buffer GsVram
+{
+    uint words[];
+} gs_vram;
+
+layout(push_constant) uniform TriangleParameters
+{
+    uint framebuffer_base_block;
+    uint framebuffer_width;
+    uint bounds_x0;
+    uint bounds_y0;
+    uint bounds_x1;
+    uint bounds_y1;
+    int vertex0_x_12_4;
+    int vertex0_y_12_4;
+    int vertex1_x_12_4;
+    int vertex1_y_12_4;
+    int vertex2_x_12_4;
+    int vertex2_y_12_4;
+    uint rgba;
+    uint top_left_edge_mask;
+    uint reserved0;
+    uint reserved1;
+} triangle;
+
+int64_t edge_value(
+    int ax,
+    int ay,
+    int bx,
+    int by,
+    int sample_x,
+    int sample_y)
+{
+    return
+        (int64_t(bx) - int64_t(ax)) *
+            (int64_t(sample_y) - int64_t(ay)) -
+        (int64_t(by) - int64_t(ay)) *
+            (int64_t(sample_x) - int64_t(ax));
+}
+
+bool edge_covers(int64_t value, uint mask_bit)
+{
+    return value > int64_t(0) ||
+           (value == int64_t(0) &&
+            (triangle.top_left_edge_mask & mask_bit) != 0u);
+}
+
+void main()
+{
+    uint x = triangle.bounds_x0 + gl_GlobalInvocationID.x;
+    uint y = triangle.bounds_y0 + gl_GlobalInvocationID.y;
+    if (x >= triangle.bounds_x1 || y >= triangle.bounds_y1)
+        return;
+
+    int sample_x = int(x << 4u);
+    int sample_y = int(y << 4u);
+    int64_t edge0 = edge_value(
+        triangle.vertex1_x_12_4,
+        triangle.vertex1_y_12_4,
+        triangle.vertex2_x_12_4,
+        triangle.vertex2_y_12_4,
+        sample_x,
+        sample_y);
+    int64_t edge1 = edge_value(
+        triangle.vertex2_x_12_4,
+        triangle.vertex2_y_12_4,
+        triangle.vertex0_x_12_4,
+        triangle.vertex0_y_12_4,
+        sample_x,
+        sample_y);
+    int64_t edge2 = edge_value(
+        triangle.vertex0_x_12_4,
+        triangle.vertex0_y_12_4,
+        triangle.vertex1_x_12_4,
+        triangle.vertex1_y_12_4,
+        sample_x,
+        sample_y);
+    if (!edge_covers(edge0, 1u) ||
+        !edge_covers(edge1, 2u) ||
+        !edge_covers(edge2, 4u))
+    {
+        return;
+    }
+
+    uint bit_address = gs_pixel_bit_address(
+        0x00u,
+        triangle.framebuffer_base_block,
+        triangle.framebuffer_width,
+        x,
+        y);
+    uint word_index =
+        (bit_address >> 5u) & (GS_MEMORY_WORD_COUNT - 1u);
+
+    // Aliased GS coordinates can race on one physical word. All covered
+    // invocations write the same flat color, so an atomic exchange defines
+    // the result without changing the byte-exact value.
+    atomicExchange(gs_vram.words[word_index], triangle.rgba);
+}

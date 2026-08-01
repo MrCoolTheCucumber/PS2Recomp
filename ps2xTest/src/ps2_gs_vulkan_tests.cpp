@@ -14,6 +14,7 @@
 #include <filesystem>
 #include <fstream>
 #include <iterator>
+#include <limits>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -650,6 +651,8 @@ namespace
             report.devices.push_back({});
             report.devices[0].name = "deterministic fake executor";
             report.devices[0].suitable = true;
+            report.devices[0].shaderInt64 = true;
+            report.devices[0].exactCt32Triangle = true;
         }
 
         bool executeCt32Sprite(
@@ -672,6 +675,42 @@ namespace
             else if (behavior == Behavior::InvalidOutput)
                 output.resize(1u);
             ++serviceStatistics.spriteDrawsCompleted;
+            ++serviceStatistics.queueSubmissions;
+            ++serviceStatistics.shaderDispatches;
+            serviceStatistics.pipelineBarriers += 4u;
+            ++serviceStatistics.pipelineBinds;
+            ++serviceStatistics.pipelineCacheHits;
+            ++serviceStatistics.fenceWaits;
+            if (error)
+                error->clear();
+            return true;
+        }
+
+        bool executeCt32Triangle(
+            std::span<const uint8_t> input,
+            const GsVulkanCt32Triangle &triangle,
+            std::vector<uint8_t> &output,
+            std::string *error) override
+        {
+            if (!isHealthy || behavior == Behavior::Fail)
+            {
+                ++serviceStatistics.triangleDrawsFailed;
+                if (error)
+                    *error = "injected CT32 triangle executor failure";
+                return false;
+            }
+
+            output.assign(input.begin(), input.end());
+            if (behavior == Behavior::Exact)
+                applyCt32TriangleCpu(output, triangle);
+            else if (behavior == Behavior::InvalidOutput)
+                output.resize(1u);
+            ++serviceStatistics.triangleDrawsCompleted;
+            serviceStatistics.triangleCandidatePixelsExecuted +=
+                static_cast<uint64_t>(
+                    triangle.boundsX1 - triangle.boundsX0) *
+                static_cast<uint64_t>(
+                    triangle.boundsY1 - triangle.boundsY0);
             ++serviceStatistics.queueSubmissions;
             ++serviceStatistics.shaderDispatches;
             serviceStatistics.pipelineBarriers += 4u;
@@ -3569,6 +3608,10 @@ void register_ps2_gs_vulkan_tests()
 
             for (const GsVulkanDeviceReport &device : report.devices)
             {
+                t.Equals(
+                    device.exactCt32Triangle,
+                    device.suitable && device.shaderInt64,
+                    "the exact triangle capability should expose its complete hard gate");
                 if (!device.suitable)
                     continue;
                 t.IsTrue(device.exactVramStorage && device.computeQueue &&
@@ -4017,6 +4060,320 @@ void register_ps2_gs_vulkan_tests()
                       "a stopped service must reject sprite work");
             t.IsTrue(shutdownOutput == shutdownSentinel,
                      "post-shutdown sprite rejection must preserve output");
+        });
+
+        tc.Run("Vulkan CT32 triangles match CPU fixed-point edges and wrap", [](TestCase &t)
+        {
+            GSMem::InitLookupTables();
+            std::vector<GsVulkanCt32Triangle> triangles;
+            const auto addTriangle = [&](const GsDrawCommand &command)
+            {
+                GsVulkanCt32Triangle triangle{};
+                const GsBackendDecision decision =
+                    prepareGsVulkanCt32Triangle(command, triangle);
+                if (!decision.supported)
+                {
+                    t.Fail(
+                        "synthetic CT32 triangle was rejected as " +
+                        std::string(gsFallbackReasonName(
+                            decision.reason)));
+                    return false;
+                }
+                triangles.push_back(triangle);
+                return true;
+            };
+
+            using FixedVertex = std::array<int32_t, 2>;
+            using FixedTriangle = std::array<FixedVertex, 3>;
+            constexpr std::array<FixedTriangle, 3> shapes{{
+                {{{-64, 17}, {239, 49}, {33, 255}}},
+                {{{32, 32}, {256, 32}, {32, 256}}},
+                {{{65, 65}, {81, 241}, {257, 97}}},
+            }};
+            constexpr std::array<std::array<uint8_t, 3>, 6>
+                permutations{{
+                    {{0u, 1u, 2u}},
+                    {{0u, 2u, 1u}},
+                    {{1u, 0u, 2u}},
+                    {{1u, 2u, 0u}},
+                    {{2u, 0u, 1u}},
+                    {{2u, 1u, 0u}},
+                }};
+            constexpr std::array<GSScissorReg, 3> scissors{{
+                {0u, 31u, 0u, 31u},
+                {4u, 13u, 3u, 14u},
+                {0u, 7u, 6u, 20u},
+            }};
+            constexpr std::array<uint32_t, 6> phases{{
+                0u, 1u, 7u, 8u, 14u, 15u,
+            }};
+            constexpr GSXYOffsetReg xyoffset{128u, 128u};
+            uint64_t sequence = 20'000u;
+            for (size_t shapeIndex = 0u;
+                 shapeIndex < shapes.size(); ++shapeIndex)
+            {
+                for (size_t permutationIndex = 0u;
+                     permutationIndex < permutations.size();
+                     ++permutationIndex)
+                {
+                    std::array<uint16_t, 3> rawX{};
+                    std::array<uint16_t, 3> rawY{};
+                    for (size_t vertex = 0u;
+                         vertex < rawX.size(); ++vertex)
+                    {
+                        const FixedVertex &source = shapes[shapeIndex]
+                            [permutations[permutationIndex][vertex]];
+                        rawX[vertex] = static_cast<uint16_t>(
+                            source[0] + phases[permutationIndex] +
+                            xyoffset.ofx);
+                        rawY[vertex] = static_cast<uint16_t>(
+                            source[1] +
+                            phases[permutations.size() - 1u -
+                                   permutationIndex] +
+                            xyoffset.ofy);
+                    }
+                    if (!addTriangle(makeCt32TriangleCommand(
+                            sequence++,
+                            static_cast<uint32_t>(3u + shapeIndex),
+                            static_cast<uint8_t>(1u + shapeIndex),
+                            scissors[permutationIndex % scissors.size()],
+                            xyoffset, rawX, rawY,
+                            0x80000000u |
+                                static_cast<uint32_t>(
+                                    shapeIndex * permutations.size() +
+                                    permutationIndex + 1u))))
+                    {
+                        return;
+                    }
+                }
+            }
+
+            if (!addTriangle(makeCt32TriangleCommand(
+                    sequence++, 511u, 1u,
+                    {0u, 127u, 0u, 63u}, {0u, 0u},
+                    {60u * 16u, 68u * 16u, 60u * 16u},
+                    {28u * 16u, 28u * 16u, 36u * 16u},
+                    0xC0778899u)) ||
+                !addTriangle(makeCt32TriangleCommand(
+                    sequence++, 7u, 2u,
+                    {0u, 15u, 0u, 15u}, {32768u, 32768u},
+                    {0u, 65535u, 0u},
+                    {0u, 0u, 65535u},
+                    0xE0AABBCCu)))
+            {
+                return;
+            }
+
+            t.Equals(triangles.size(), static_cast<size_t>(20u),
+                     "the GPU corpus should retain every prepared triangle");
+            t.Equals(triangles[18].framebufferBaseBlock, 0x3FE0u,
+                     "the triangle wrap fixture should begin in the last GS page");
+            t.IsTrue(
+                ct32TriangleEdge(
+                    triangles[19].vertex2X12_4,
+                    triangles[19].vertex2Y12_4,
+                    triangles[19].vertex0X12_4,
+                    triangles[19].vertex0Y12_4,
+                    15 * 16, 15 * 16) >
+                    std::numeric_limits<int32_t>::max(),
+                "the extreme fixture should require signed 64-bit edge arithmetic");
+
+            GsVulkanCapabilityReport preflight{};
+            const GsVulkanServiceConfig config =
+                makeRendererServiceConfig(preflight);
+
+            GsVulkanCapabilityReport creationReport{};
+            std::string creationError;
+            std::unique_ptr<GsVulkanService> service =
+                GsVulkanService::create(
+                    config, &creationReport, &creationError);
+            if (!preflight.ready())
+            {
+                t.IsNull(service.get(),
+                         "an unavailable host should skip triangle execution cleanly");
+                t.IsFalse(creationReport.ready(),
+                          "a skipped triangle service must retain its capability result");
+                return;
+            }
+
+            t.IsNotNull(service.get(),
+                        "a generally suitable device should create the GS service");
+            t.IsTrue(creationError.empty(),
+                     "successful triangle service creation should clear its diagnostic");
+            if (!service)
+                return;
+            const GsVulkanDeviceReport *selected =
+                creationReport.selectedDevice();
+            t.IsNotNull(selected,
+                        "the triangle service should retain its selected device");
+            if (!selected)
+                return;
+
+            const std::vector<uint8_t> initial =
+                makeVramPattern(0x54524931u);
+            if (!selected->exactCt32Triangle)
+            {
+                std::vector<uint8_t> output = {0xA5u, 0x5Au};
+                const std::vector<uint8_t> sentinel = output;
+                std::string error;
+                t.IsFalse(service->executeCt32Triangle(
+                              initial, triangles.front(), output, &error),
+                          "a device without shaderInt64 must reject exact triangles");
+                t.IsTrue(output == sentinel,
+                         "capability rejection must preserve caller output");
+                t.IsFalse(error.empty(),
+                          "capability rejection should retain a diagnostic");
+                t.Equals(service->statistics().triangleDrawsFailed, 0ull,
+                         "capability rejection must not enter the worker");
+                t.IsTrue(service->healthy(),
+                         "an unsupported triangle must not poison the base service");
+                service->shutdown();
+                return;
+            }
+            t.IsTrue(selected->shaderInt64 && selected->suitable,
+                     "an exact triangle device must expose every prerequisite");
+
+            std::vector<uint8_t> gpu = initial;
+            uint64_t expectedCandidatePixels = 0u;
+            for (size_t index = 0u; index < triangles.size(); ++index)
+            {
+                const GsVulkanCt32Triangle &triangle = triangles[index];
+                std::vector<uint8_t> expected = gpu;
+                applyCt32TriangleCpu(expected, triangle);
+                std::vector<uint8_t> actual = {0xA5u};
+                std::string error;
+                if (!service->executeCt32Triangle(
+                        gpu, triangle, actual, &error))
+                {
+                    t.Fail(
+                        "GPU CT32 triangle " +
+                        std::to_string(index) + " failed: " + error);
+                    return;
+                }
+                if (actual != expected)
+                {
+                    const auto mismatch = std::mismatch(
+                        actual.begin(), actual.end(), expected.begin());
+                    t.Fail(
+                        "GPU CT32 triangle " +
+                        std::to_string(index) +
+                        " first disagreed with CPU VRAM at byte " +
+                        std::to_string(static_cast<size_t>(
+                            mismatch.first - actual.begin())));
+                    return;
+                }
+                gpu = std::move(actual);
+                expectedCandidatePixels +=
+                    static_cast<uint64_t>(
+                        triangle.boundsX1 - triangle.boundsX0) *
+                    static_cast<uint64_t>(
+                        triangle.boundsY1 - triangle.boundsY0);
+            }
+
+            const auto expectRejected =
+                [&](std::span<const uint8_t> rejectedInput,
+                    GsVulkanCt32Triangle rejectedTriangle,
+                    const std::string &label)
+            {
+                std::vector<uint8_t> output = {0x12u, 0x34u};
+                const std::vector<uint8_t> sentinel = output;
+                std::string error;
+                t.IsFalse(service->executeCt32Triangle(
+                              rejectedInput, rejectedTriangle,
+                              output, &error),
+                          label + " should fail closed");
+                t.IsTrue(output == sentinel,
+                         label + " must preserve caller output");
+                t.IsFalse(error.empty(),
+                          label + " should retain a diagnostic");
+            };
+
+            const std::vector<uint8_t> shortInput(
+                GS_VULKAN_VRAM_SIZE - 1u, 0u);
+            expectRejected(shortInput, triangles.front(),
+                           "short triangle VRAM input");
+            GsVulkanCt32Triangle invalid = triangles.front();
+            invalid.framebufferBaseBlock = 0x4000u;
+            expectRejected(initial, invalid,
+                           "out-of-range triangle framebuffer base");
+            invalid = triangles.front();
+            invalid.framebufferWidth = 0u;
+            expectRejected(initial, invalid,
+                           "zero triangle framebuffer width");
+            invalid = triangles.front();
+            invalid.boundsX1 = invalid.boundsX0;
+            expectRejected(initial, invalid, "empty triangle bounds");
+            invalid = triangles.front();
+            invalid.boundsX1 = 2049u;
+            expectRejected(initial, invalid,
+                           "out-of-range triangle bounds");
+            invalid = triangles.front();
+            invalid.vertex0X12_4 = 65536;
+            expectRejected(initial, invalid,
+                           "out-of-range triangle vertex");
+            invalid = triangles.front();
+            std::swap(invalid.vertex1X12_4, invalid.vertex2X12_4);
+            std::swap(invalid.vertex1Y12_4, invalid.vertex2Y12_4);
+            expectRejected(initial, invalid,
+                           "negative triangle winding");
+            invalid = triangles.front();
+            invalid.topLeftEdgeMask ^= 1u;
+            expectRejected(initial, invalid,
+                           "inconsistent triangle edge mask");
+            invalid = triangles.front();
+            invalid.topLeftEdgeMask |= 8u;
+            expectRejected(initial, invalid,
+                           "reserved triangle edge mask bit");
+            invalid = triangles.front();
+            invalid.reserved1 = 1u;
+            expectRejected(initial, invalid,
+                           "non-zero triangle reserved data");
+
+            const GsVulkanServiceStatistics statistics =
+                service->statistics();
+            const uint64_t acceptedDraws = triangles.size();
+            t.Equals(statistics.triangleDrawsCompleted, acceptedDraws,
+                     "every accepted triangle should complete exactly once");
+            t.Equals(statistics.triangleDrawsFailed, 0ull,
+                     "caller-side triangle rejection should not count as failed GPU work");
+            t.Equals(statistics.triangleCandidatePixelsExecuted,
+                     expectedCandidatePixels,
+                     "triangle statistics should count conservative dispatch pixels");
+            t.Equals(statistics.queueSubmissions, acceptedDraws,
+                     "each independent triangle should use one queue submission");
+            t.Equals(statistics.shaderDispatches, acceptedDraws,
+                     "each independent triangle should use one compute dispatch");
+            t.Equals(statistics.bytesUploaded,
+                     acceptedDraws * GS_VULKAN_VRAM_SIZE,
+                     "each triangle should upload canonical CPU VRAM");
+            t.Equals(statistics.bytesDownloaded,
+                     acceptedDraws * GS_VULKAN_VRAM_SIZE,
+                     "each triangle should download canonical CPU VRAM");
+            t.Equals(statistics.validationErrors, 0u,
+                     "CT32 triangle execution must remain validation-clean");
+            t.Equals(statistics.validationWarnings, 0u,
+                     "CT32 triangle execution should emit no validation warnings");
+            t.IsTrue(service->healthy(),
+                     "successful and rejected triangles should leave the service healthy");
+
+            service->shutdown();
+            service->shutdown();
+            const GsVulkanServiceStatistics shutdownStatistics =
+                service->statistics();
+            t.Equals(shutdownStatistics.validationErrors, 0u,
+                     "triangle pipeline destruction must remain validation-clean");
+            t.Equals(shutdownStatistics.validationWarnings, 0u,
+                     "triangle pipeline destruction should emit no validation warnings");
+
+            std::vector<uint8_t> shutdownOutput = {0xABu};
+            const std::vector<uint8_t> shutdownSentinel = shutdownOutput;
+            std::string shutdownError;
+            t.IsFalse(service->executeCt32Triangle(
+                          initial, triangles.front(), shutdownOutput,
+                          &shutdownError),
+                      "a stopped service must reject triangle work");
+            t.IsTrue(shutdownOutput == shutdownSentinel,
+                     "post-shutdown triangle rejection must preserve output");
         });
 
         tc.Run("Vulkan resident page operations preserve unselected bytes", [](TestCase &t)
