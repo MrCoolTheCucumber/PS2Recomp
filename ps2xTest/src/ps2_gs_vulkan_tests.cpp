@@ -244,6 +244,65 @@ namespace
                 << " y=0x" << memoryCase.y;
         return message.str();
     }
+
+    GsDrawCommand makeCt32SpriteCommand(
+        uint64_t sequence,
+        uint32_t framebufferPage,
+        uint8_t framebufferWidth,
+        GSScissorReg scissor,
+        GSXYOffsetReg xyoffset,
+        uint16_t rawX0,
+        uint16_t rawY0,
+        uint16_t rawX1,
+        uint16_t rawY1,
+        uint32_t rgba)
+    {
+        GSContext context{};
+        context.frame = {
+            framebufferPage, framebufferWidth,
+            GS_PSM_CT32, 0u};
+        context.scissor = scissor;
+        context.xyoffset = xyoffset;
+        context.zbuf = {0u, GS_PSM_Z32, true};
+        context.test = 0x30000u; // ZTE=1, ZTST=ALWAYS, ZMSK=1.
+
+        GSPrimReg primitive{};
+        primitive.type = GS_PRIM_SPRITE;
+        std::array<GSVertex, 2> vertices{};
+        vertices[0].x12_4 = rawX0;
+        vertices[0].y12_4 = rawY0;
+        vertices[0].r = 0x11u;
+        vertices[0].g = 0x22u;
+        vertices[0].b = 0x33u;
+        vertices[0].a = 0x44u;
+        vertices[1].x12_4 = rawX1;
+        vertices[1].y12_4 = rawY1;
+        vertices[1].r = static_cast<uint8_t>(rgba);
+        vertices[1].g = static_cast<uint8_t>(rgba >> 8u);
+        vertices[1].b = static_cast<uint8_t>(rgba >> 16u);
+        vertices[1].a = static_cast<uint8_t>(rgba >> 24u);
+        return buildGsDrawCommand(
+            sequence, primitive, context,
+            std::span<const GSVertex>(vertices),
+            GsDrawGlobalState{});
+    }
+
+    void applyCt32SpriteCpu(
+        std::vector<uint8_t> &vram,
+        const GsVulkanCt32Sprite &sprite)
+    {
+        for (uint32_t y = sprite.y0; y < sprite.y1; ++y)
+        {
+            for (uint32_t x = sprite.x0; x < sprite.x1; ++x)
+            {
+                GSMem::WriteCT32(
+                    vram.data(),
+                    sprite.framebufferBaseBlock,
+                    sprite.framebufferWidth,
+                    x, y, sprite.rgba);
+            }
+        }
+    }
 }
 
 void register_ps2_gs_vulkan_tests()
@@ -269,6 +328,73 @@ void register_ps2_gs_vulkan_tests()
                      "the fixed 64-thread kernel should cover every 4 MiB word");
             t.Equals(GS_VULKAN_MAX_MEMORY_CASES, 65536u,
                      "memory conformance batches should have a fixed host bound");
+        });
+
+        tc.Run("CT32 sprite preparation applies exact GS bounds and eligibility", [](TestCase &t)
+        {
+            const GsDrawCommand command = makeCt32SpriteCommand(
+                17u,
+                511u,
+                0u,
+                {4u, 15u, 3u, 12u},
+                {32u, 16u},
+                289u, 209u,
+                65u, 33u,
+                0xD4C3B2A1u);
+
+            GsVulkanCt32Sprite sprite{
+                1u, 2u, 3u, 4u, 5u, 6u, 7u, 8u};
+            const GsBackendDecision decision =
+                prepareGsVulkanCt32Sprite(command, sprite);
+            t.IsTrue(decision.supported,
+                     "the narrow opaque CT32 command should be eligible");
+            t.Equals(decision.reason, GsFallbackReason::Supported,
+                     "eligible preparation should retain the canonical reason");
+            t.Equals(sprite.framebufferBaseBlock, 0x3FE0u,
+                     "FRAME page units should become 256-byte block units");
+            t.Equals(sprite.framebufferWidth, 1u,
+                     "FRAME width zero should use the software oracle's one-unit normalization");
+            t.Equals(sprite.x0, 4u,
+                     "reversed fractional X endpoints should ceil then clip at scissor minimum");
+            t.Equals(sprite.y0, 3u,
+                     "XYOFFSET-adjusted Y should clip at scissor minimum");
+            t.Equals(sprite.x1, 16u,
+                     "sprite X maximum should remain exclusive after scissor clipping");
+            t.Equals(sprite.y1, 13u,
+                     "sprite Y maximum should remain exclusive after scissor clipping");
+            t.Equals(sprite.rgba, 0xD4C3B2A1u,
+                     "flat sprite color should come from the second GS vertex in RGBA byte order");
+            t.Equals(sprite.reserved, 0u,
+                     "prepared shader ABI records should clear reserved data");
+
+            GSPrimReg textured = command.primitive();
+            textured.tme = true;
+            const GsDrawCommand rejected = buildGsDrawCommand(
+                18u, textured, command.context(),
+                std::span<const GSVertex>(
+                    command.vertices().data(), command.vertexCount()),
+                command.globalState());
+            const GsVulkanCt32Sprite sentinel = sprite;
+            const GsBackendDecision rejectedDecision =
+                prepareGsVulkanCt32Sprite(rejected, sprite);
+            t.IsFalse(rejectedDecision.supported,
+                      "texturing should be rejected before a shader record is published");
+            t.Equals(rejectedDecision.reason, GsFallbackReason::Textured,
+                     "preparation should expose the canonical first fallback reason");
+            t.IsTrue(sprite == sentinel,
+                     "rejected preparation must preserve the caller's record");
+
+            const GsDrawCommand empty = makeCt32SpriteCommand(
+                19u, 0u, 1u,
+                {0u, 31u, 0u, 31u}, {0u, 0u},
+                123u, 456u, 123u, 456u,
+                0x01020304u);
+            const GsBackendDecision emptyDecision =
+                prepareGsVulkanCt32Sprite(empty, sprite);
+            t.Equals(emptyDecision.reason, GsFallbackReason::EmptyBounds,
+                     "degenerate endpoints should fail before any GPU submission");
+            t.IsTrue(sprite == sentinel,
+                     "degenerate preparation must preserve the caller's record");
         });
 
         tc.Run("Compact PSM addresses match the CPU memory oracle", [](TestCase &t)
@@ -678,6 +804,239 @@ void register_ps2_gs_vulkan_tests()
                       "a stopped service must reject later work");
             t.IsTrue(shutdownOutput == shutdownSentinel,
                      "post-shutdown rejection must preserve caller output");
+        });
+
+        tc.Run("Vulkan CT32 sprites match CPU bounds overlap and wrap", [](TestCase &t)
+        {
+            GSMem::InitLookupTables();
+            std::vector<GsVulkanCt32Sprite> sprites;
+            const auto addSprite = [&](GsDrawCommand command)
+            {
+                GsVulkanCt32Sprite sprite{};
+                const GsBackendDecision decision =
+                    prepareGsVulkanCt32Sprite(command, sprite);
+                if (!decision.supported)
+                {
+                    t.Fail(
+                        "synthetic CT32 sprite was rejected as " +
+                        std::string(gsFallbackReasonName(
+                            decision.reason)));
+                    return false;
+                }
+                sprites.push_back(sprite);
+                return true;
+            };
+
+            if (!addSprite(makeCt32SpriteCommand(
+                    1u, 0u, 1u,
+                    {0u, 63u, 0u, 63u}, {0u, 0u},
+                    7u * 16u, 9u * 16u,
+                    8u * 16u, 10u * 16u,
+                    0x80112233u)) ||
+                !addSprite(makeCt32SpriteCommand(
+                    2u, 3u, 2u,
+                    {4u, 31u, 3u, 23u}, {32u, 16u},
+                    35u, 18u,
+                    497u, 402u,
+                    0xA0445566u)) ||
+                !addSprite(makeCt32SpriteCommand(
+                    3u, 511u, 1u,
+                    {0u, 127u, 0u, 63u}, {0u, 0u},
+                    60u * 16u, 28u * 16u,
+                    68u * 16u, 36u * 16u,
+                    0xC0778899u)) ||
+                !addSprite(makeCt32SpriteCommand(
+                    4u, 7u, 2u,
+                    {0u, 63u, 0u, 63u}, {0u, 0u},
+                    7u * 16u, 11u * 16u,
+                    29u * 16u, 27u * 16u,
+                    0xE0AABBCCu)) ||
+                !addSprite(makeCt32SpriteCommand(
+                    5u, 7u, 2u,
+                    {0u, 63u, 0u, 63u}, {0u, 0u},
+                    15u * 16u, 19u * 16u,
+                    36u * 16u, 35u * 16u,
+                    0xF0DDEEFFu)))
+            {
+                return;
+            }
+
+            t.Equals(sprites.size(), static_cast<size_t>(5u),
+                     "the synthetic corpus should retain every prepared sprite");
+            t.Equals(sprites[1].x0, 4u,
+                     "fractional XYOFFSET geometry should clip to X scissor minimum");
+            t.Equals(sprites[1].y0, 3u,
+                     "fractional XYOFFSET geometry should clip to Y scissor minimum");
+            t.Equals(sprites[2].framebufferBaseBlock, 0x3FE0u,
+                     "the wrap fixture should begin in the last GS page");
+
+            GsVulkanServiceConfig config{};
+            config.probe.enableValidation = true;
+            GsVulkanCapabilityReport preflight =
+                probeGsVulkanCapabilities(config.probe);
+            if (preflight.status ==
+                GsVulkanProbeStatus::ValidationUnavailable)
+            {
+                config.probe.enableValidation = false;
+                preflight = probeGsVulkanCapabilities(config.probe);
+            }
+
+            GsVulkanCapabilityReport creationReport{};
+            std::string creationError;
+            std::unique_ptr<GsVulkanService> service =
+                GsVulkanService::create(
+                    config, &creationReport, &creationError);
+            if (!preflight.ready())
+            {
+                t.IsNull(service.get(),
+                         "an unavailable host should skip CT32 shader execution cleanly");
+                t.IsFalse(creationReport.ready(),
+                          "the skipped sprite service must retain its capability result");
+                return;
+            }
+
+            t.IsNotNull(service.get(),
+                        "a suitable device should create the CT32 sprite service");
+            t.IsTrue(creationError.empty(),
+                     "successful sprite service creation should clear its diagnostic");
+            if (!service)
+                return;
+
+            const std::vector<uint8_t> initial =
+                makeVramPattern(0x53505231u);
+            std::vector<uint8_t> gpu = initial;
+            uint64_t expectedPixels = 0u;
+            for (size_t index = 0u; index < sprites.size(); ++index)
+            {
+                const GsVulkanCt32Sprite &sprite = sprites[index];
+                std::vector<uint8_t> expected = gpu;
+                applyCt32SpriteCpu(expected, sprite);
+                std::vector<uint8_t> actual = {0xA5u};
+                std::string error;
+                if (!service->executeCt32Sprite(
+                        gpu, sprite, actual, &error))
+                {
+                    t.Fail(
+                        "GPU CT32 sprite " +
+                        std::to_string(index) + " failed: " + error);
+                    return;
+                }
+                if (actual != expected)
+                {
+                    t.Fail(
+                        "GPU CT32 sprite " +
+                        std::to_string(index) +
+                        " disagreed with the complete CPU VRAM image");
+                    return;
+                }
+                gpu = std::move(actual);
+                expectedPixels +=
+                    static_cast<uint64_t>(sprite.x1 - sprite.x0) *
+                    static_cast<uint64_t>(sprite.y1 - sprite.y0);
+            }
+
+            // Repeat the wrapping dispatch from the same input to prove that
+            // physical-address overlap is deterministic under atomic writes.
+            std::vector<uint8_t> repeatedExpected = initial;
+            applyCt32SpriteCpu(repeatedExpected, sprites[2]);
+            std::vector<uint8_t> repeatedOutput = {0x5Au};
+            std::string repeatedError;
+            t.IsTrue(service->executeCt32Sprite(
+                         initial, sprites[2], repeatedOutput,
+                         &repeatedError),
+                     "the repeated wrap dispatch should complete");
+            t.IsTrue(repeatedOutput == repeatedExpected,
+                     "the repeated wrap dispatch should remain byte-exact");
+            expectedPixels +=
+                static_cast<uint64_t>(sprites[2].x1 - sprites[2].x0) *
+                static_cast<uint64_t>(sprites[2].y1 - sprites[2].y0);
+
+            const auto expectRejected =
+                [&](std::span<const uint8_t> rejectedInput,
+                    GsVulkanCt32Sprite rejectedSprite,
+                    const std::string &label)
+            {
+                std::vector<uint8_t> output = {0x12u, 0x34u};
+                const std::vector<uint8_t> sentinel = output;
+                std::string error;
+                t.IsFalse(service->executeCt32Sprite(
+                              rejectedInput, rejectedSprite,
+                              output, &error),
+                          label + " should fail closed");
+                t.IsTrue(output == sentinel,
+                         label + " must preserve caller output");
+                t.IsFalse(error.empty(),
+                          label + " should retain a diagnostic");
+            };
+
+            const std::vector<uint8_t> shortInput(
+                GS_VULKAN_VRAM_SIZE - 1u, 0u);
+            expectRejected(shortInput, sprites.front(),
+                           "short sprite VRAM input");
+            GsVulkanCt32Sprite invalid = sprites.front();
+            invalid.framebufferBaseBlock = 0x4000u;
+            expectRejected(initial, invalid,
+                           "out-of-range sprite framebuffer base");
+            invalid = sprites.front();
+            invalid.framebufferWidth = 0u;
+            expectRejected(initial, invalid,
+                           "zero sprite framebuffer width");
+            invalid = sprites.front();
+            invalid.x1 = invalid.x0;
+            expectRejected(initial, invalid, "empty sprite bounds");
+            invalid = sprites.front();
+            invalid.x1 = 2049u;
+            expectRejected(initial, invalid,
+                           "out-of-range sprite bounds");
+            invalid = sprites.front();
+            invalid.reserved = 1u;
+            expectRejected(initial, invalid,
+                           "non-zero sprite reserved data");
+
+            const GsVulkanServiceStatistics statistics =
+                service->statistics();
+            constexpr uint64_t acceptedDraws = 6u;
+            t.Equals(statistics.spriteDrawsCompleted, acceptedDraws,
+                     "every accepted sprite should complete exactly once");
+            t.Equals(statistics.spriteDrawsFailed, 0ull,
+                     "caller-side sprite rejection should not count as failed GPU work");
+            t.Equals(statistics.spritePixelsExecuted, expectedPixels,
+                     "sprite statistics should count exact covered pixels");
+            t.Equals(statistics.queueSubmissions, acceptedDraws,
+                     "each Phase 3 sprite should use one queue submission");
+            t.Equals(statistics.shaderDispatches, acceptedDraws,
+                     "each Phase 3 sprite should use one compute dispatch");
+            t.Equals(statistics.bytesUploaded,
+                     acceptedDraws * GS_VULKAN_VRAM_SIZE,
+                     "each sprite should upload canonical CPU VRAM");
+            t.Equals(statistics.bytesDownloaded,
+                     acceptedDraws * GS_VULKAN_VRAM_SIZE,
+                     "each sprite should download canonical CPU VRAM");
+            t.Equals(statistics.validationErrors, 0u,
+                     "CT32 sprite execution must remain validation-clean");
+            t.Equals(statistics.validationWarnings, 0u,
+                     "CT32 sprite execution should emit no validation warnings");
+            t.IsTrue(service->healthy(),
+                     "successful and rejected sprites should leave the service healthy");
+
+            service->shutdown();
+            service->shutdown();
+            const GsVulkanServiceStatistics shutdownStatistics =
+                service->statistics();
+            t.Equals(shutdownStatistics.validationErrors, 0u,
+                     "sprite pipeline destruction must remain validation-clean");
+            t.Equals(shutdownStatistics.validationWarnings, 0u,
+                     "sprite pipeline destruction should emit no validation warnings");
+
+            std::vector<uint8_t> shutdownOutput = {0xABu};
+            const std::vector<uint8_t> shutdownSentinel = shutdownOutput;
+            std::string shutdownError;
+            t.IsFalse(service->executeCt32Sprite(
+                          initial, sprites.front(), shutdownOutput,
+                          &shutdownError),
+                      "a stopped service must reject sprite work");
+            t.IsTrue(shutdownOutput == shutdownSentinel,
+                     "post-shutdown sprite rejection must preserve output");
         });
 
         tc.Run("Vulkan PSM helpers match CPU addresses reads and writes", [](TestCase &t)

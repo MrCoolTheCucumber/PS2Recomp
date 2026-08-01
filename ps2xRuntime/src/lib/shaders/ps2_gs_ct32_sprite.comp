@@ -1,0 +1,45 @@
+#version 450
+#extension GL_GOOGLE_include_directive : require
+
+#include "ps2_gs_memory.glsl"
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+layout(set = 0, binding = 0, std430) buffer GsVram
+{
+    uint words[];
+} gs_vram;
+
+layout(push_constant) uniform SpriteParameters
+{
+    uint framebuffer_base_block;
+    uint framebuffer_width;
+    uint x0;
+    uint y0;
+    uint x1;
+    uint y1;
+    uint rgba;
+    uint reserved;
+} sprite;
+
+void main()
+{
+    uint x = sprite.x0 + gl_GlobalInvocationID.x;
+    uint y = sprite.y0 + gl_GlobalInvocationID.y;
+    if (x >= sprite.x1 || y >= sprite.y1)
+        return;
+
+    uint bit_address = gs_pixel_bit_address(
+        0x00u,
+        sprite.framebuffer_base_block,
+        sprite.framebuffer_width,
+        x,
+        y);
+    uint word_index =
+        (bit_address >> 5u) & (GS_MEMORY_WORD_COUNT - 1u);
+
+    // Wrapped or unusually wide GS surfaces can map multiple covered pixels
+    // to the same physical word. Every invocation writes the same flat color,
+    // and the atomic makes that overlap defined rather than a shader data race.
+    atomicExchange(gs_vram.words[word_index], sprite.rgba);
+}

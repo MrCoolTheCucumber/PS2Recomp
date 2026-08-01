@@ -1,5 +1,7 @@
 #pragma once
 
+#include "runtime/ps2_gs_backend.h"
+
 #include <cstddef>
 #include <cstdint>
 #include <limits>
@@ -157,6 +159,9 @@ struct GsVulkanServiceStatistics
     uint64_t memoryBatchesCompleted = 0u;
     uint64_t memoryBatchesFailed = 0u;
     uint64_t memoryCasesExecuted = 0u;
+    uint64_t spriteDrawsCompleted = 0u;
+    uint64_t spriteDrawsFailed = 0u;
+    uint64_t spritePixelsExecuted = 0u;
     uint32_t validationWarnings = 0u;
     uint32_t validationErrors = 0u;
     bool deviceLost = false;
@@ -214,6 +219,42 @@ static_assert(offsetof(GsVulkanMemoryResult, bitShift) == 4u);
 static_assert(offsetof(GsVulkanMemoryResult, valueBefore) == 8u);
 static_assert(offsetof(GsVulkanMemoryResult, valueAfter) == 12u);
 
+// Fixed push-constant ABI for Phase 3's first exact draw kernel. Bounds are
+// inclusive minimum and exclusive maximum framebuffer coordinates after the
+// backend-neutral command builder has applied XYOFFSET, endpoint, and scissor
+// rules. The FRAME base is expressed in 256-byte GS blocks.
+struct alignas(16) GsVulkanCt32Sprite
+{
+    uint32_t framebufferBaseBlock = 0u;
+    uint32_t framebufferWidth = 0u;
+    uint32_t x0 = 0u;
+    uint32_t y0 = 0u;
+    uint32_t x1 = 0u;
+    uint32_t y1 = 0u;
+    uint32_t rgba = 0u;
+    uint32_t reserved = 0u;
+
+    bool operator==(const GsVulkanCt32Sprite &) const = default;
+};
+
+static_assert(sizeof(GsVulkanCt32Sprite) == 32u);
+static_assert(std::is_standard_layout_v<GsVulkanCt32Sprite>);
+static_assert(std::is_trivially_copyable_v<GsVulkanCt32Sprite>);
+static_assert(offsetof(GsVulkanCt32Sprite, framebufferBaseBlock) == 0u);
+static_assert(offsetof(GsVulkanCt32Sprite, framebufferWidth) == 4u);
+static_assert(offsetof(GsVulkanCt32Sprite, x0) == 8u);
+static_assert(offsetof(GsVulkanCt32Sprite, y0) == 12u);
+static_assert(offsetof(GsVulkanCt32Sprite, x1) == 16u);
+static_assert(offsetof(GsVulkanCt32Sprite, y1) == 20u);
+static_assert(offsetof(GsVulkanCt32Sprite, rgba) == 24u);
+static_assert(offsetof(GsVulkanCt32Sprite, reserved) == 28u);
+
+// Applies the canonical eligibility predicate before publishing a shader ABI
+// record. Rejected commands leave the caller's record untouched.
+[[nodiscard]] GsBackendDecision prepareGsVulkanCt32Sprite(
+    const GsDrawCommand &command,
+    GsVulkanCt32Sprite &sprite) noexcept;
+
 // Owns all Vulkan API objects on one worker thread. Callers synchronously post
 // fixed-size jobs through a single bounded slot; no Vulkan object escapes to
 // an EE, replay, or presentation thread.
@@ -245,6 +286,14 @@ public:
         std::span<const GsVulkanMemoryCase> cases,
         std::vector<uint8_t> &output,
         std::vector<GsVulkanMemoryResult> &results,
+        std::string *error = nullptr);
+
+    // Uploads canonical 4 MiB CPU VRAM, executes one already-classified flat
+    // CT32 sprite, and publishes the complete synchronized image on success.
+    [[nodiscard]] bool executeCt32Sprite(
+        std::span<const uint8_t> input,
+        const GsVulkanCt32Sprite &sprite,
+        std::vector<uint8_t> &output,
         std::string *error = nullptr);
 
     // Idempotently drains accepted work and destroys every Vulkan object on
