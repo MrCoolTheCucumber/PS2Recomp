@@ -6892,6 +6892,265 @@ void register_ps2_gs_vulkan_tests()
                      "strict texture routing should emit no validation warnings");
         });
 
+        tc.Run("GS Vulkan strict linear CT32 survives frame and reset checkpoints", [](TestCase &t)
+        {
+            GSMem::InitLookupTables();
+            const GsDrawCommand retained =
+                makeLinearCt32RepeatSpriteCommand(
+                    103u, 0u, 8u, 3584u, 8u, 10u, 10u,
+                    {0u, 511u, 0u, 447u},
+                    {28672u, 29184u},
+                    {28664u, 29176u},
+                    {29176u, 36344u},
+                    {0u, 512u},
+                    {0u, 6656u});
+            const auto makeSmall = [](uint64_t sequence,
+                                      uint32_t framebufferPage)
+            {
+                return makeLinearCt32RepeatSpriteCommand(
+                    sequence, framebufferPage, 2u,
+                    512u, 2u, 6u, 5u,
+                    {3u, 12u, 2u, 13u}, {128u, 96u},
+                    {120u, 376u}, {88u, 344u},
+                    {0u, 249u}, {0u, 137u});
+            };
+            const GsDrawCommand smallA = makeSmall(104u, 40u);
+            const GsDrawCommand smallB = makeSmall(105u, 41u);
+            for (const GsDrawCommand *command :
+                 std::array<const GsDrawCommand *, 3>{{
+                     &retained, &smallA, &smallB,
+                 }})
+            {
+                GsVulkanLinearCt32Sprite prepared{};
+                t.IsTrue(
+                    prepareGsVulkanLinearCt32Sprite(
+                        *command, prepared).supported,
+                    "every strict checkpoint command should satisfy the linear predicate");
+            }
+
+            const std::vector<uint8_t> initial =
+                makeVramPattern(0x4C535432u);
+            std::vector<uint8_t> softwareVram = initial;
+            std::vector<uint8_t> strictVram = initial;
+            GSRegisters softwareRegisters{};
+            GSRegisters strictRegisters{};
+            configureCt32Display(softwareRegisters, 0u);
+            configureCt32Display(strictRegisters, 0u);
+            GS software;
+            GS strict;
+            software.init(
+                softwareVram.data(),
+                static_cast<uint32_t>(softwareVram.size()),
+                &softwareRegisters);
+            strict.init(
+                strictVram.data(),
+                static_cast<uint32_t>(strictVram.size()),
+                &strictRegisters);
+
+            GsVulkanCapabilityReport preflight{};
+            const GsVulkanServiceConfig config =
+                makeRendererServiceConfig(preflight);
+            t.IsTrue(strict.configureVulkanRenderer(config),
+                     "the strict linear checkpoint fixture should accept Vulkan configuration");
+            if (!preflight.ready())
+            {
+                t.IsFalse(strict.setRendererMode(
+                              GsRendererMode::GpuStrict),
+                          "an unavailable host should decline strict linear checkpoints cleanly");
+                return;
+            }
+            const GsVulkanDeviceReport *selected =
+                preflight.selectedDevice();
+            t.IsNotNull(selected,
+                        "a ready strict linear preflight should select one device");
+            if (!selected)
+                return;
+            t.IsTrue(selected->exactLinearCt32Sprite,
+                     "the strict checkpoint device should expose the linear kernel");
+            if (!selected->exactLinearCt32Sprite)
+                return;
+
+            t.IsTrue(strict.setRendererMode(
+                         GsRendererMode::GpuStrict),
+                     "the qualified host should enter strict linear mode");
+            if (strict.rendererMode() != GsRendererMode::GpuStrict)
+                return;
+            strict.setBackendCountersEnabled(true);
+            strict.resetBackendCounters();
+
+            const auto compareFullVram = [&](const char *boundary)
+            {
+                const auto difference = std::mismatch(
+                    softwareVram.begin(), softwareVram.end(),
+                    strictVram.begin(), strictVram.end());
+                if (difference.first == softwareVram.end())
+                    return true;
+                const size_t byteOffset = static_cast<size_t>(
+                    difference.first - softwareVram.begin());
+                t.IsTrue(
+                    false,
+                    std::string("strict linear VRAM mismatch after ") +
+                        boundary + " at byte " +
+                        std::to_string(byteOffset));
+                return false;
+            };
+
+            drawNearestCt32SpriteCommand(software, smallA);
+            drawNearestCt32SpriteCommand(strict, smallA);
+            drawNearestCt32SpriteCommand(software, smallB);
+            drawNearestCt32SpriteCommand(strict, smallB);
+            t.IsTrue(strictVram == initial,
+                     "two pending strict linear draws should not publish CPU VRAM");
+            (void)software.getDebugSnapshot();
+            (void)strict.getDebugSnapshot();
+            if (!compareFullVram("shared-read debugger checkpoint"))
+                return;
+
+            const std::vector<uint8_t> beforeRetained = strictVram;
+            drawNearestCt32SpriteCommand(software, retained);
+            drawNearestCt32SpriteCommand(strict, retained);
+            t.IsTrue(strictVram == beforeRetained,
+                     "the retained title draw should stay resident before presentation");
+            software.latchHostPresentationFrame();
+            strict.latchHostPresentationFrame();
+            std::vector<uint8_t> softwareFrame;
+            std::vector<uint8_t> strictFrame;
+            uint32_t softwareWidth = 0u;
+            uint32_t softwareHeight = 0u;
+            uint32_t strictWidth = 0u;
+            uint32_t strictHeight = 0u;
+            t.IsTrue(
+                software.copyLatchedHostPresentationFrame(
+                    softwareFrame, softwareWidth, softwareHeight),
+                "the software linear checkpoint should publish one frame");
+            t.IsTrue(
+                strict.copyLatchedHostPresentationFrame(
+                    strictFrame, strictWidth, strictHeight),
+                "strict linear presentation should publish one frame");
+            t.Equals(strictWidth, softwareWidth,
+                     "strict linear presentation should preserve frame width");
+            t.Equals(strictHeight, softwareHeight,
+                     "strict linear presentation should preserve frame height");
+            t.IsTrue(strictFrame == softwareFrame,
+                     "strict linear presentation bytes should match software");
+            if (!compareFullVram("presentation checkpoint"))
+                return;
+
+            drawNearestCt32SpriteCommand(software, smallA);
+            drawNearestCt32SpriteCommand(strict, smallA);
+            software.writeRegister(GS_REG_FINISH, 0u);
+            strict.writeRegister(GS_REG_FINISH, 0u);
+            if (!compareFullVram("FINISH checkpoint"))
+                return;
+
+            drawNearestCt32SpriteCommand(software, smallA);
+            drawNearestCt32SpriteCommand(strict, smallA);
+            configureFlatCt32Draws(software, 42u, 1u);
+            configureFlatCt32Draws(strict, 42u, 1u);
+            drawFlatCt32Sprite(
+                software, 3u * 16u, 2u * 16u,
+                15u * 16u, 11u * 16u, 0xD0112233u);
+            drawFlatCt32Sprite(
+                strict, 3u * 16u, 2u * 16u,
+                15u * 16u, 11u * 16u, 0xD0112233u);
+            drawNearestCt32SpriteCommand(software, smallB);
+            drawNearestCt32SpriteCommand(strict, smallB);
+            (void)software.getDebugSnapshot();
+            (void)strict.getDebugSnapshot();
+            if (!compareFullVram("pipeline-change checkpoint"))
+                return;
+
+            drawNearestCt32SpriteCommand(software, smallA);
+            drawNearestCt32SpriteCommand(strict, smallA);
+            const GsReplayState softwareState =
+                software.captureReplayState();
+            const GsReplayState strictState =
+                strict.captureReplayState();
+            std::vector<uint8_t> softwareEncoded;
+            std::vector<uint8_t> strictEncoded;
+            std::string stateError;
+            t.IsTrue(
+                encodeGsReplayState(
+                    softwareState, softwareEncoded, &stateError),
+                "the software linear checkpoint should encode");
+            t.IsTrue(
+                encodeGsReplayState(
+                    strictState, strictEncoded, &stateError),
+                "the strict linear checkpoint should encode");
+            t.IsTrue(strictEncoded == softwareEncoded,
+                     "strict linear save-state should preserve frontend state");
+            if (!compareFullVram("save-state checkpoint"))
+                return;
+
+            drawNearestCt32SpriteCommand(software, smallB);
+            drawNearestCt32SpriteCommand(strict, smallB);
+            software.reset();
+            strict.reset();
+            t.Equals(strict.rendererMode(), GsRendererMode::GpuStrict,
+                     "reset should preserve strict linear mode and service");
+            if (!compareFullVram("reset checkpoint"))
+                return;
+
+            drawNearestCt32SpriteCommand(software, retained);
+            drawNearestCt32SpriteCommand(strict, retained);
+            (void)software.getDebugSnapshot();
+            (void)strict.getDebugSnapshot();
+            if (!compareFullVram("post-reset title draw"))
+                return;
+
+            const GsBackendCounters counters = strict.backendCounters();
+            t.Equals(counters.commands, 10ull,
+                     "the checkpoint stream should assemble nine linear and one flat draw");
+            t.Equals(counters.acceleratedCommands, 10ull,
+                     "every checkpoint draw should reach strict Vulkan");
+            t.Equals(counters.softwareCommands, 0ull,
+                     "strict linear checkpoints must not use software fallback");
+            t.Equals(counters.fallbackCommands, 0ull,
+                     "strict linear checkpoints should have no fallback decision");
+            t.Equals(counters.strictFailures, 0ull,
+                     "every checkpoint command should remain supported");
+            t.Equals(
+                counters.flushReasons[static_cast<size_t>(
+                    GsFlushReason::Reset)],
+                1ull,
+                "reset should drain pending strict linear work once");
+
+            const GsVulkanRasterBackendStatistics backend =
+                strict.vulkanRendererBackendStatistics();
+            t.Equals(backend.commandsCompleted, 10ull,
+                     "every strict checkpoint draw should complete once");
+            t.Equals(backend.committedGpuCommands, 10ull,
+                     "every strict checkpoint draw should publish once");
+            t.Equals(backend.residentCommands, 10ull,
+                     "all checkpoint draws should use resident execution");
+            t.Equals(backend.pipelineChangeDrains, 2ull,
+                     "linear/flat/linear transitions should drain twice");
+            t.Equals(backend.coherency.rejectedTransitions, 0ull,
+                     "strict linear checkpoints should preserve page ownership");
+            t.Equals(backend.pageOwnership.gpuNewerPages, size_t{0u},
+                     "the final debugger checkpoint should publish all GPU writers");
+
+            const GsVulkanServiceStatistics service =
+                strict.vulkanRendererServiceStatistics();
+            t.Equals(service.linearCt32SpriteDrawsCompleted, 9ull,
+                     "the service should execute every strict linear draw");
+            t.Equals(service.linearCt32SpriteDrawsFailed, 0ull,
+                     "strict checkpoint routing should not fail linear work");
+            t.Equals(service.residentLinearCt32SpriteBatchesCompleted,
+                     8ull,
+                     "only the initial shared-read pair should share a linear batch");
+            t.Equals(service.largestResidentLinearCt32SpriteBatch, 2ull,
+                     "the initial disjoint pair should establish batch size two");
+            t.Equals(service.spriteDrawsCompleted, 1ull,
+                     "the pipeline transition should execute one flat sprite");
+            t.Equals(service.nearestCt32SpriteDrawsCompleted, 0ull,
+                     "strict linear checkpoints must not alias nearest textures");
+            t.Equals(service.validationErrors, 0u,
+                     "strict linear checkpoints should remain validation-clean");
+            t.Equals(service.validationWarnings, 0u,
+                     "strict linear checkpoints should emit no validation warnings");
+        });
+
         tc.Run("GS Vulkan nearest CT32 Verify survives every frame checkpoint", [](TestCase &t)
         {
             GSMem::InitLookupTables();
