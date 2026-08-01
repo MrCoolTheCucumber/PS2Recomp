@@ -23,6 +23,7 @@ inline constexpr uint32_t GS_VULKAN_NOOP_GROUP_COUNT =
         GS_VULKAN_VRAM_SIZE / sizeof(uint32_t) /
         GS_VULKAN_NOOP_LOCAL_SIZE);
 inline constexpr uint32_t GS_VULKAN_MAX_MEMORY_CASES = 65536u;
+inline constexpr size_t GS_VULKAN_MAX_RESIDENT_SPRITE_BATCH = 64u;
 
 enum class GsVulkanProbeStatus : uint8_t
 {
@@ -162,6 +163,9 @@ struct GsVulkanServiceStatistics
     uint64_t spriteDrawsCompleted = 0u;
     uint64_t spriteDrawsFailed = 0u;
     uint64_t spritePixelsExecuted = 0u;
+    uint64_t residentSpriteBatchesCompleted = 0u;
+    uint64_t residentSpriteBatchesFailed = 0u;
+    uint64_t largestResidentSpriteBatch = 0u;
     uint64_t pageUploadOperationsCompleted = 0u;
     uint64_t pageUploadOperationsFailed = 0u;
     uint64_t pageDownloadOperationsCompleted = 0u;
@@ -286,6 +290,9 @@ public:
     [[nodiscard]] virtual bool executeResidentCt32Sprite(
         const GsVulkanCt32Sprite &sprite,
         std::string *error = nullptr) = 0;
+    [[nodiscard]] virtual bool executeResidentCt32Sprites(
+        std::span<const GsVulkanCt32Sprite> sprites,
+        std::string *error = nullptr) = 0;
     virtual void shutdown() noexcept = 0;
     [[nodiscard]] virtual GsVulkanCapabilityReport
     capabilities() const = 0;
@@ -353,6 +360,14 @@ public:
     // upload or download. Page ownership remains the caller's responsibility.
     [[nodiscard]] bool executeResidentCt32Sprite(
         const GsVulkanCt32Sprite &sprite,
+        std::string *error = nullptr) override;
+
+    // Records a bounded set of non-overlapping resident draws into one command
+    // buffer and submits it once. The caller remains responsible for page
+    // ownership; the service rejects empty, oversized, invalid, or physically
+    // overlapping batches before they enter the worker slot.
+    [[nodiscard]] bool executeResidentCt32Sprites(
+        std::span<const GsVulkanCt32Sprite> sprites,
         std::string *error = nullptr) override;
 
     // Idempotently drains accepted work and destroys every Vulkan object on

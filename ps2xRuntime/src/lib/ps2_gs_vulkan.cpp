@@ -114,6 +114,53 @@ namespace
         return nullptr;
     }
 
+    bool validateResidentCt32SpriteBatch(
+        std::span<const GsVulkanCt32Sprite> sprites,
+        std::string &error)
+    {
+        if (sprites.empty() ||
+            sprites.size() > GS_VULKAN_MAX_RESIDENT_SPRITE_BATCH)
+        {
+            error = "Vulkan resident CT32 sprite batches require between 1 and " +
+                    std::to_string(GS_VULKAN_MAX_RESIDENT_SPRITE_BATCH) +
+                    " records";
+            return false;
+        }
+
+        GsVramPageMask priorWritePages;
+        for (size_t index = 0u; index < sprites.size(); ++index)
+        {
+            const GsVulkanCt32Sprite &sprite = sprites[index];
+            if (const char *validationError =
+                    ct32SpriteValidationError(sprite))
+            {
+                error = "Vulkan resident CT32 sprite " +
+                        std::to_string(index) + ": " + validationError;
+                return false;
+            }
+
+            const GsVramPageMask writePages =
+                gsVramPagesForSurfaceRect(
+                    sprite.framebufferBaseBlock,
+                    sprite.framebufferWidth,
+                    static_cast<uint8_t>(GSMem::C32),
+                    sprite.x0,
+                    sprite.y0,
+                    sprite.x1 - sprite.x0,
+                    sprite.y1 - sprite.y0);
+            if (priorWritePages.intersects(writePages))
+            {
+                error = "Vulkan resident CT32 sprite " +
+                        std::to_string(index) +
+                        " overlaps an earlier batch member";
+                return false;
+            }
+            priorWritePages.unionWith(writePages);
+        }
+        error.clear();
+        return true;
+    }
+
     struct GsVulkanElementParameters
     {
         uint32_t elementCount;
@@ -1210,8 +1257,8 @@ namespace
             GsVulkanCapabilityReport &report,
             GsVulkanServiceStatistics &statistics,
             std::string &error);
-        bool executeResidentCt32Sprite(
-            const GsVulkanCt32Sprite &sprite,
+        bool executeResidentCt32Sprites(
+            std::span<const GsVulkanCt32Sprite> sprites,
             GsVulkanCapabilityReport &report,
             GsVulkanServiceStatistics &statistics,
             std::string &error);
@@ -1268,7 +1315,7 @@ namespace
             std::string &error);
         bool submitCommands(
             std::string_view operationName,
-            bool shaderDispatch,
+            uint64_t shaderDispatchCount,
             GsVulkanCapabilityReport &report,
             GsVulkanServiceStatistics &statistics,
             std::string &error);
@@ -2332,7 +2379,7 @@ namespace
 
     bool VulkanExecutionContext::submitCommands(
         std::string_view operationName,
-        bool shaderDispatch,
+        uint64_t shaderDispatchCount,
         GsVulkanCapabilityReport &report,
         GsVulkanServiceStatistics &statistics,
         std::string &error)
@@ -2358,8 +2405,7 @@ namespace
             return false;
         }
         ++statistics.queueSubmissions;
-        if (shaderDispatch)
-            ++statistics.shaderDispatches;
+        statistics.shaderDispatches += shaderDispatchCount;
 
         const auto waitStart = std::chrono::steady_clock::now();
         result = m_functions.waitForFences(
@@ -2492,7 +2538,7 @@ namespace
             0u, 0u, nullptr, 1u, &vramCompleteBarrier, 0u, nullptr);
 
         if (!submitCommands(
-                "VRAM page upload", false,
+                "VRAM page upload", 0u,
                 report, statistics, error) ||
             !finishOperation(
                 "VRAM page upload", validationErrorsBefore,
@@ -2587,7 +2633,7 @@ namespace
             0u, nullptr);
 
         if (!submitCommands(
-                "VRAM page download", false,
+                "VRAM page download", 0u,
                 report, statistics, error) ||
             !invalidateMappedAllocation(
                 m_staging, "VRAM page download", report, error) ||
@@ -2608,8 +2654,8 @@ namespace
         return true;
     }
 
-    bool VulkanExecutionContext::executeResidentCt32Sprite(
-        const GsVulkanCt32Sprite &sprite,
+    bool VulkanExecutionContext::executeResidentCt32Sprites(
+        std::span<const GsVulkanCt32Sprite> sprites,
         GsVulkanCapabilityReport &report,
         GsVulkanServiceStatistics &statistics,
         std::string &error)
@@ -2619,18 +2665,10 @@ namespace
             error = "Vulkan GS service is not healthy";
             return false;
         }
-        if (const char *validationError =
-                ct32SpriteValidationError(sprite))
-        {
-            error = validationError;
+        if (!validateResidentCt32SpriteBatch(sprites, error))
             return false;
-        }
 
         constexpr uint32_t localSize = 8u;
-        const uint32_t groupCountX =
-            (sprite.x1 - sprite.x0 + localSize - 1u) / localSize;
-        const uint32_t groupCountY =
-            (sprite.y1 - sprite.y0 + localSize - 1u) / localSize;
         const uint32_t validationErrorsBefore =
             m_validation.errors.load(std::memory_order_relaxed);
         if (!beginCommands(report, error))
@@ -2659,12 +2697,19 @@ namespace
             m_commandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE,
             m_pipelineLayout, 0u, 1u, &m_descriptorSet,
             0u, nullptr);
-        m_functions.cmdPushConstants(
-            m_commandBuffer, m_pipelineLayout,
-            VK_SHADER_STAGE_COMPUTE_BIT, 0u,
-            sizeof(sprite), &sprite);
-        m_functions.cmdDispatch(
-            m_commandBuffer, groupCountX, groupCountY, 1u);
+        for (const GsVulkanCt32Sprite &sprite : sprites)
+        {
+            const uint32_t groupCountX =
+                (sprite.x1 - sprite.x0 + localSize - 1u) / localSize;
+            const uint32_t groupCountY =
+                (sprite.y1 - sprite.y0 + localSize - 1u) / localSize;
+            m_functions.cmdPushConstants(
+                m_commandBuffer, m_pipelineLayout,
+                VK_SHADER_STAGE_COMPUTE_BIT, 0u,
+                sizeof(sprite), &sprite);
+            m_functions.cmdDispatch(
+                m_commandBuffer, groupCountX, groupCountY, 1u);
+        }
 
         VkBufferMemoryBarrier completeBarrier{};
         completeBarrier.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
@@ -2683,10 +2728,10 @@ namespace
             0u, 0u, nullptr, 1u, &completeBarrier, 0u, nullptr);
 
         if (!submitCommands(
-                "resident CT32 sprite", true,
+                "resident CT32 sprite batch", sprites.size(),
                 report, statistics, error) ||
             !finishOperation(
-                "resident CT32 sprite", validationErrorsBefore,
+                "resident CT32 sprite batch", validationErrorsBefore,
                 report, statistics, error))
         {
             return false;
@@ -2895,7 +2940,7 @@ namespace
             0u, nullptr);
 
         if (!submitCommands(
-                operationName, true, report, statistics, error) ||
+                operationName, 1u, report, statistics, error) ||
             !invalidateMappedAllocation(
                 m_staging, "VRAM", report, error) ||
             (memoryOperation &&
@@ -3065,7 +3110,7 @@ enum class GsVulkanRequestKind : uint8_t
     Ct32Sprite,
     UploadPages,
     DownloadPages,
-    ResidentCt32Sprite,
+    ResidentCt32Sprites,
 };
 
 struct GsVulkanService::Impl final
@@ -3115,11 +3160,16 @@ struct GsVulkanService::Impl final
                     ++statistics.memoryBatchesFailed;
                 }
                 else if (activeRequestKind ==
-                             GsVulkanRequestKind::Ct32Sprite ||
-                         activeRequestKind ==
-                             GsVulkanRequestKind::ResidentCt32Sprite)
+                         GsVulkanRequestKind::Ct32Sprite)
                 {
                     ++statistics.spriteDrawsFailed;
+                }
+                else if (activeRequestKind ==
+                         GsVulkanRequestKind::ResidentCt32Sprites)
+                {
+                    statistics.spriteDrawsFailed +=
+                        activeRequestSpriteCount;
+                    ++statistics.residentSpriteBatchesFailed;
                 }
                 else if (activeRequestKind ==
                          GsVulkanRequestKind::UploadPages)
@@ -3184,7 +3234,7 @@ struct GsVulkanService::Impl final
         {
             std::vector<uint8_t> input;
             std::vector<GsVulkanMemoryCase> memoryCases;
-            GsVulkanCt32Sprite sprite{};
+            std::vector<GsVulkanCt32Sprite> sprites;
             GsVramPageMask pages;
             GsVulkanRequestKind kind =
                 GsVulkanRequestKind::RoundTrip;
@@ -3198,10 +3248,11 @@ struct GsVulkanService::Impl final
                     break;
                 input = std::move(requestInput);
                 memoryCases = std::move(requestMemoryCases);
-                sprite = requestSprite;
+                sprites = std::move(requestSprites);
                 pages = requestPages;
                 kind = requestKind;
                 activeRequestKind = kind;
+                activeRequestSpriteCount = sprites.size();
                 requestPending = false;
                 requestInFlight = true;
             }
@@ -3220,7 +3271,7 @@ struct GsVulkanService::Impl final
             else if (kind == GsVulkanRequestKind::Ct32Sprite)
             {
                 succeeded = context.executeCt32Sprite(
-                    input, sprite, output,
+                    input, sprites.front(), output,
                     localCapabilities, localStatistics,
                     operationError);
             }
@@ -3236,10 +3287,10 @@ struct GsVulkanService::Impl final
                     pages, output, localCapabilities,
                     localStatistics, operationError);
             }
-            else if (kind == GsVulkanRequestKind::ResidentCt32Sprite)
+            else if (kind == GsVulkanRequestKind::ResidentCt32Sprites)
             {
-                succeeded = context.executeResidentCt32Sprite(
-                    sprite, localCapabilities, localStatistics,
+                succeeded = context.executeResidentCt32Sprites(
+                    sprites, localCapabilities, localStatistics,
                     operationError);
             }
             else
@@ -3261,19 +3312,42 @@ struct GsVulkanService::Impl final
                     ++localStatistics.memoryBatchesFailed;
                 }
             }
-            else if (kind == GsVulkanRequestKind::Ct32Sprite ||
-                     kind == GsVulkanRequestKind::ResidentCt32Sprite)
+            else if (kind == GsVulkanRequestKind::Ct32Sprite)
             {
                 if (succeeded)
                 {
                     ++localStatistics.spriteDrawsCompleted;
                     localStatistics.spritePixelsExecuted +=
-                        static_cast<uint64_t>(sprite.x1 - sprite.x0) *
-                        static_cast<uint64_t>(sprite.y1 - sprite.y0);
+                        static_cast<uint64_t>(
+                            sprites.front().x1 - sprites.front().x0) *
+                        static_cast<uint64_t>(
+                            sprites.front().y1 - sprites.front().y0);
                 }
                 else
                 {
                     ++localStatistics.spriteDrawsFailed;
+                }
+            }
+            else if (kind == GsVulkanRequestKind::ResidentCt32Sprites)
+            {
+                if (succeeded)
+                {
+                    localStatistics.spriteDrawsCompleted += sprites.size();
+                    for (const GsVulkanCt32Sprite &sprite : sprites)
+                    {
+                        localStatistics.spritePixelsExecuted +=
+                            static_cast<uint64_t>(sprite.x1 - sprite.x0) *
+                            static_cast<uint64_t>(sprite.y1 - sprite.y0);
+                    }
+                    ++localStatistics.residentSpriteBatchesCompleted;
+                    localStatistics.largestResidentSpriteBatch = std::max(
+                        localStatistics.largestResidentSpriteBatch,
+                        static_cast<uint64_t>(sprites.size()));
+                }
+                else
+                {
+                    localStatistics.spriteDrawsFailed += sprites.size();
+                    ++localStatistics.residentSpriteBatchesFailed;
                 }
             }
             else if (kind == GsVulkanRequestKind::UploadPages)
@@ -3341,7 +3415,7 @@ struct GsVulkanService::Impl final
         GsVulkanRequestKind kind,
         std::vector<uint8_t> input,
         std::vector<GsVulkanMemoryCase> memoryCases,
-        GsVulkanCt32Sprite sprite,
+        std::vector<GsVulkanCt32Sprite> sprites,
         GsVramPageMask pages,
         std::vector<uint8_t> &output,
         std::vector<GsVulkanMemoryResult> *memoryResults,
@@ -3368,7 +3442,7 @@ struct GsVulkanService::Impl final
         requestKind = kind;
         requestInput = std::move(input);
         requestMemoryCases = std::move(memoryCases);
-        requestSprite = sprite;
+        requestSprites = std::move(sprites);
         requestPages = pages;
         responseOutput.clear();
         responseResults.clear();
@@ -3437,7 +3511,7 @@ struct GsVulkanService::Impl final
     std::string initializationError;
     std::vector<uint8_t> requestInput;
     std::vector<GsVulkanMemoryCase> requestMemoryCases;
-    GsVulkanCt32Sprite requestSprite{};
+    std::vector<GsVulkanCt32Sprite> requestSprites;
     GsVramPageMask requestPages;
     std::vector<uint8_t> responseOutput;
     std::vector<GsVulkanMemoryResult> responseResults;
@@ -3446,6 +3520,7 @@ struct GsVulkanService::Impl final
         GsVulkanRequestKind::RoundTrip;
     GsVulkanRequestKind activeRequestKind =
         GsVulkanRequestKind::RoundTrip;
+    size_t activeRequestSpriteCount = 0u;
     bool initialized = false;
     bool healthy = false;
     bool stopping = false;
@@ -3683,7 +3758,8 @@ bool GsVulkanService::executeCt32Sprite(
     return m_impl->executeRequest(
         GsVulkanRequestKind::Ct32Sprite,
         std::vector<uint8_t>(input.begin(), input.end()), {},
-        sprite, {}, output, nullptr, error);
+        std::vector<GsVulkanCt32Sprite>{sprite}, {},
+        output, nullptr, error);
 #endif
 }
 
@@ -3795,24 +3871,35 @@ bool GsVulkanService::executeResidentCt32Sprite(
     const GsVulkanCt32Sprite &sprite,
     std::string *error)
 {
+    return executeResidentCt32Sprites(
+        std::span<const GsVulkanCt32Sprite>(&sprite, 1u), error);
+}
+
+bool GsVulkanService::executeResidentCt32Sprites(
+    std::span<const GsVulkanCt32Sprite> sprites,
+    std::string *error)
+{
 #if !PS2X_HAS_GS_VULKAN
-    (void)sprite;
+    (void)sprites;
     if (error)
         *error = "Vulkan GS support was compiled out";
     return false;
 #else
-    if (const char *validationError =
-            ct32SpriteValidationError(sprite))
+    std::string validationError;
+    if (!validateResidentCt32SpriteBatch(sprites, validationError))
     {
         if (error)
-            *error = validationError;
+            *error = std::move(validationError);
         return false;
     }
 
     std::vector<uint8_t> unusedOutput;
     return m_impl->executeRequest(
-        GsVulkanRequestKind::ResidentCt32Sprite,
-        {}, {}, sprite, {}, unusedOutput, nullptr, error);
+        GsVulkanRequestKind::ResidentCt32Sprites,
+        {}, {},
+        std::vector<GsVulkanCt32Sprite>(
+            sprites.begin(), sprites.end()),
+        {}, unusedOutput, nullptr, error);
 #endif
 }
 

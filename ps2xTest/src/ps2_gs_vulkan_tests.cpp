@@ -576,20 +576,41 @@ namespace
             const GsVulkanCt32Sprite &sprite,
             std::string *error) override
         {
+            return executeResidentCt32Sprites(
+                std::span<const GsVulkanCt32Sprite>(&sprite, 1u),
+                error);
+        }
+
+        bool executeResidentCt32Sprites(
+            std::span<const GsVulkanCt32Sprite> sprites,
+            std::string *error) override
+        {
             if (!isHealthy || behavior == Behavior::Fail ||
-                behavior == Behavior::InvalidOutput)
+                behavior == Behavior::InvalidOutput ||
+                sprites.empty() ||
+                sprites.size() > GS_VULKAN_MAX_RESIDENT_SPRITE_BATCH)
             {
-                ++serviceStatistics.spriteDrawsFailed;
+                serviceStatistics.spriteDrawsFailed += sprites.size();
+                ++serviceStatistics.residentSpriteBatchesFailed;
                 if (error)
                     *error = "injected resident CT32 executor failure";
                 return false;
             }
-            if (behavior == Behavior::Exact)
-                applyCt32SpriteCpu(residentVram, sprite);
-            ++serviceStatistics.spriteDrawsCompleted;
-            serviceStatistics.spritePixelsExecuted +=
-                static_cast<uint64_t>(sprite.x1 - sprite.x0) *
-                static_cast<uint64_t>(sprite.y1 - sprite.y0);
+            for (const GsVulkanCt32Sprite &sprite : sprites)
+            {
+                if (behavior == Behavior::Exact)
+                    applyCt32SpriteCpu(residentVram, sprite);
+                serviceStatistics.spritePixelsExecuted +=
+                    static_cast<uint64_t>(sprite.x1 - sprite.x0) *
+                    static_cast<uint64_t>(sprite.y1 - sprite.y0);
+            }
+            serviceStatistics.spriteDrawsCompleted += sprites.size();
+            ++serviceStatistics.residentSpriteBatchesCompleted;
+            serviceStatistics.largestResidentSpriteBatch = std::max(
+                serviceStatistics.largestResidentSpriteBatch,
+                static_cast<uint64_t>(sprites.size()));
+            ++serviceStatistics.queueSubmissions;
+            serviceStatistics.shaderDispatches += sprites.size();
             if (error)
                 error->clear();
             return true;
@@ -678,6 +699,8 @@ void register_ps2_gs_vulkan_tests()
                      "the fixed 64-thread kernel should cover every 4 MiB word");
             t.Equals(GS_VULKAN_MAX_MEMORY_CASES, 65536u,
                      "memory conformance batches should have a fixed host bound");
+            t.Equals(GS_VULKAN_MAX_RESIDENT_SPRITE_BATCH, size_t{64u},
+                     "resident sprite batches should have a fixed host bound");
         });
 
         tc.Run("CT32 sprite preparation applies exact GS bounds and eligibility", [](TestCase &t)
@@ -2682,6 +2705,152 @@ void register_ps2_gs_vulkan_tests()
                       "a stopped service must reject page downloads");
             t.IsTrue(shutdownDestination == shutdownSentinel,
                      "post-shutdown page rejection must preserve output");
+        });
+
+        tc.Run("Vulkan resident sprite batches use one exact submission", [](TestCase &t)
+        {
+            GSMem::InitLookupTables();
+            GsVulkanCapabilityReport preflight{};
+            const GsVulkanServiceConfig config =
+                makeRendererServiceConfig(preflight);
+            GsVulkanCapabilityReport creationReport{};
+            std::string creationError;
+            std::unique_ptr<GsVulkanService> service =
+                GsVulkanService::create(
+                    config, &creationReport, &creationError);
+            if (!preflight.ready())
+            {
+                t.IsNull(service.get(),
+                         "an unavailable host should skip resident batching cleanly");
+                t.IsFalse(creationReport.ready(),
+                          "a skipped batch service should retain its capability result");
+                return;
+            }
+            t.IsNotNull(service.get(),
+                        "a suitable device should create the resident batch service");
+            t.IsTrue(creationError.empty(),
+                     "successful batch service creation should clear its diagnostic");
+            if (!service)
+                return;
+
+            const std::vector<uint8_t> initial =
+                makeVramPattern(0x42415431u);
+            GsVramPageMask allPages;
+            allPages.setAll();
+            std::string operationError;
+            t.IsTrue(service->uploadVramPages(
+                         initial, allPages, &operationError),
+                     "the batch fixture should establish resident VRAM");
+            if (!operationError.empty())
+                t.Fail("resident batch upload failed: " + operationError);
+
+            const std::array<GsVulkanCt32Sprite, 4> sprites{{
+                {5u * 32u, 1u, 1u, 2u, 9u, 8u, 0x10203040u, 0u},
+                {41u * 32u, 1u, 3u, 4u, 14u, 13u, 0x50607080u, 0u},
+                {197u * 32u, 1u, 8u, 1u, 21u, 12u, 0x90A0B0C0u, 0u},
+                {509u * 32u, 1u, 17u, 15u, 31u, 27u, 0xD0E0F001u, 0u},
+            }};
+
+            const GsVulkanServiceStatistics beforeRejections =
+                service->statistics();
+            const auto expectRejected =
+                [&](std::span<const GsVulkanCt32Sprite> rejected,
+                    const std::string &label)
+            {
+                operationError.clear();
+                t.IsFalse(service->executeResidentCt32Sprites(
+                              rejected, &operationError),
+                          label + " should fail before worker submission");
+                t.IsFalse(operationError.empty(),
+                          label + " should retain a diagnostic");
+            };
+            expectRejected({}, "empty resident batch");
+            std::vector<GsVulkanCt32Sprite> oversized(
+                GS_VULKAN_MAX_RESIDENT_SPRITE_BATCH + 1u,
+                sprites.front());
+            expectRejected(oversized, "oversized resident batch");
+            std::vector<GsVulkanCt32Sprite> invalid(
+                sprites.begin(), sprites.end());
+            invalid[2].reserved = 1u;
+            expectRejected(invalid, "invalid resident batch member");
+            const std::array<GsVulkanCt32Sprite, 2> overlapping{{
+                sprites.front(),
+                {5u * 32u, 1u, 32u, 1u, 40u, 7u,
+                 0x55667788u, 0u},
+            }};
+            expectRejected(overlapping, "physical-page-overlapping batch");
+
+            const GsVulkanServiceStatistics afterRejections =
+                service->statistics();
+            t.Equals(afterRejections.queueSubmissions,
+                     beforeRejections.queueSubmissions,
+                     "caller-rejected batches must not submit GPU work");
+            t.Equals(afterRejections.spriteDrawsFailed,
+                     beforeRejections.spriteDrawsFailed,
+                     "caller-rejected batches must not count worker failures");
+            t.Equals(afterRejections.residentSpriteBatchesFailed,
+                     beforeRejections.residentSpriteBatchesFailed,
+                     "caller-rejected batches must not count failed worker batches");
+
+            std::vector<uint8_t> expected = initial;
+            uint64_t expectedPixels = 0u;
+            for (const GsVulkanCt32Sprite &sprite : sprites)
+            {
+                applyCt32SpriteCpu(expected, sprite);
+                expectedPixels +=
+                    static_cast<uint64_t>(sprite.x1 - sprite.x0) *
+                    static_cast<uint64_t>(sprite.y1 - sprite.y0);
+            }
+            const GsVulkanServiceStatistics beforeBatch =
+                service->statistics();
+            operationError.clear();
+            t.IsTrue(service->executeResidentCt32Sprites(
+                         sprites, &operationError),
+                     "four disjoint resident sprites should execute as one batch");
+            t.IsTrue(operationError.empty(),
+                     "successful resident batching should clear its diagnostic");
+            const GsVulkanServiceStatistics afterBatch =
+                service->statistics();
+            t.Equals(afterBatch.queueSubmissions -
+                         beforeBatch.queueSubmissions,
+                     1ull,
+                     "one resident batch should use one Vulkan queue submission");
+            t.Equals(afterBatch.shaderDispatches -
+                         beforeBatch.shaderDispatches,
+                     static_cast<uint64_t>(sprites.size()),
+                     "each resident batch member should retain one compute dispatch");
+            t.Equals(afterBatch.spriteDrawsCompleted -
+                         beforeBatch.spriteDrawsCompleted,
+                     static_cast<uint64_t>(sprites.size()),
+                     "batch statistics should count every completed sprite");
+            t.Equals(afterBatch.spritePixelsExecuted -
+                         beforeBatch.spritePixelsExecuted,
+                     expectedPixels,
+                     "batch statistics should count every exact covered pixel");
+            t.Equals(afterBatch.residentSpriteBatchesCompleted -
+                         beforeBatch.residentSpriteBatchesCompleted,
+                     1ull,
+                     "the worker should complete one resident batch");
+            t.Equals(afterBatch.largestResidentSpriteBatch,
+                     static_cast<uint64_t>(sprites.size()),
+                     "the service should retain its largest accepted batch");
+
+            std::vector<uint8_t> actual(
+                GS_VULKAN_VRAM_SIZE, 0xA5u);
+            t.IsTrue(service->downloadVramPages(
+                         actual, allPages, &operationError),
+                     "the completed resident batch should be observable");
+            t.IsTrue(actual == expected,
+                     "one submitted resident batch must match sequential CPU draws exactly");
+            const GsVulkanServiceStatistics finalStatistics =
+                service->statistics();
+            t.Equals(finalStatistics.validationErrors, 0u,
+                     "resident batching must remain validation-clean");
+            t.Equals(finalStatistics.validationWarnings, 0u,
+                     "resident batching should emit no validation warnings");
+            t.IsTrue(service->healthy(),
+                     "accepted and caller-rejected batches should leave the service healthy");
+            service->shutdown();
         });
 
         tc.Run("Vulkan PSM helpers match CPU addresses reads and writes", [](TestCase &t)
