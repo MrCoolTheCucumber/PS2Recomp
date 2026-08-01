@@ -415,6 +415,39 @@ namespace
             static_cast<uint32_t>(pixels.size_bytes()));
     }
 
+    void copyCt32Pixels(
+        GS &gs,
+        uint32_t sourceBlock,
+        uint32_t destinationBlock,
+        uint32_t bufferWidth,
+        uint16_t sourceX,
+        uint16_t sourceY,
+        uint16_t destinationX,
+        uint16_t destinationY,
+        uint16_t width,
+        uint16_t height)
+    {
+        const uint64_t bitbltbuf =
+            static_cast<uint64_t>(sourceBlock) |
+            (static_cast<uint64_t>(bufferWidth) << 16u) |
+            (static_cast<uint64_t>(GS_PSM_CT32) << 24u) |
+            (static_cast<uint64_t>(destinationBlock) << 32u) |
+            (static_cast<uint64_t>(bufferWidth) << 48u) |
+            (static_cast<uint64_t>(GS_PSM_CT32) << 56u);
+        const uint64_t trxpos =
+            static_cast<uint64_t>(sourceX) |
+            (static_cast<uint64_t>(sourceY) << 16u) |
+            (static_cast<uint64_t>(destinationX) << 32u) |
+            (static_cast<uint64_t>(destinationY) << 48u);
+        const uint64_t trxreg =
+            static_cast<uint64_t>(width) |
+            (static_cast<uint64_t>(height) << 32u);
+        gs.writeRegister(GS_REG_BITBLTBUF, bitbltbuf);
+        gs.writeRegister(GS_REG_TRXPOS, trxpos);
+        gs.writeRegister(GS_REG_TRXREG, trxreg);
+        gs.writeRegister(GS_REG_TRXDIR, 2u);
+    }
+
     std::vector<uint8_t> readCt32Pixels(
         GS &gs,
         uint32_t sourceBlock,
@@ -460,6 +493,22 @@ namespace
             preflight = probeGsVulkanCapabilities(config.probe);
         }
         return config;
+    }
+
+    void configureCt32Display(
+        GSRegisters &registers,
+        uint32_t framebufferPage,
+        uint32_t width = 64u,
+        uint32_t height = 64u)
+    {
+        registers.pmode = 1ull;
+        registers.dispfb1 =
+            framebufferPage |
+            (1ull << 9u) |
+            (static_cast<uint64_t>(GS_PSM_CT32) << 15u);
+        registers.display1 =
+            (static_cast<uint64_t>(width - 1u) << 32u) |
+            (static_cast<uint64_t>(height - 1u) << 44u);
     }
 
     class FakeCt32Executor final : public IGsVulkanDrawExecutor
@@ -1443,21 +1492,10 @@ void register_ps2_gs_vulkan_tests()
 
             constexpr uint32_t displayPage = 5u;
             constexpr uint32_t offscreenPage = 20u;
-            const auto configureRegisters = [](GSRegisters &registers)
-            {
-                registers.pmode = 1ull;
-                registers.dispfb1 =
-                    displayPage |
-                    (1ull << 9u) |
-                    (static_cast<uint64_t>(GS_PSM_CT32) << 15u);
-                registers.display1 =
-                    (63ull << 32u) |
-                    (63ull << 44u);
-            };
             GSRegisters softwareRegisters{};
             GSRegisters acceleratedRegisters{};
-            configureRegisters(softwareRegisters);
-            configureRegisters(acceleratedRegisters);
+            configureCt32Display(softwareRegisters, displayPage);
+            configureCt32Display(acceleratedRegisters, displayPage);
 
             GS software;
             GS accelerated;
@@ -1656,6 +1694,546 @@ void register_ps2_gs_vulkan_tests()
                      "frame synchronization should remain validation-clean");
             t.Equals(repeatedService.validationWarnings, 0u,
                      "frame synchronization should emit no validation warnings");
+        });
+
+        tc.Run("GS Vulkan fixed-seed transition streams match software at every observation", [](TestCase &t)
+        {
+            GSMem::InitLookupTables();
+            std::vector<uint8_t> softwareVram =
+                makeVramPattern(0x5452414Eu);
+            std::vector<uint8_t> acceleratedVram = softwareVram;
+
+            constexpr std::array<uint32_t, 8> pages{
+                1u, 5u, 9u, 13u, 17u, 21u, 25u, 29u};
+            GSRegisters softwareRegisters{};
+            GSRegisters acceleratedRegisters{};
+            configureCt32Display(softwareRegisters, pages[0]);
+            configureCt32Display(acceleratedRegisters, pages[0]);
+
+            GS software;
+            GS accelerated;
+            software.init(
+                softwareVram.data(),
+                static_cast<uint32_t>(softwareVram.size()),
+                &softwareRegisters);
+            accelerated.init(
+                acceleratedVram.data(),
+                static_cast<uint32_t>(acceleratedVram.size()),
+                &acceleratedRegisters);
+
+            GsVulkanCapabilityReport preflight{};
+            const GsVulkanServiceConfig serviceConfig =
+                makeRendererServiceConfig(preflight);
+            GsVulkanRasterBackendConfig backendConfig{};
+            backendConfig.maximumResidentBatchCommands = 8u;
+            backendConfig.minimumHybridSpritePixels = 64u;
+            t.IsTrue(accelerated.configureVulkanRenderer(
+                         serviceConfig, backendConfig),
+                     "the randomized transition fixture should accept Vulkan configuration");
+            if (!preflight.ready())
+            {
+                t.IsFalse(accelerated.setRendererMode(
+                              GsRendererMode::Hybrid),
+                          "an unavailable host should skip randomized GPU transitions cleanly");
+                return;
+            }
+
+            t.IsTrue(accelerated.setRendererMode(
+                         GsRendererMode::Hybrid),
+                     "a capable host should create the randomized hybrid fixture");
+            if (accelerated.rendererMode() != GsRendererMode::Hybrid)
+                return;
+            accelerated.setBackendCountersEnabled(true);
+            accelerated.resetBackendCounters();
+
+            uint32_t randomState = 0x6D2B79F5u;
+            const auto randomBelow = [&](uint32_t bound)
+            {
+                return nextRandom(randomState) % bound;
+            };
+            const auto randomPage = [&]()
+            {
+                return pages[randomBelow(
+                    static_cast<uint32_t>(pages.size()))];
+            };
+            const auto drawEligiblePair = [&](uint32_t page)
+            {
+                const uint16_t x0 = static_cast<uint16_t>(
+                    randomBelow(40u));
+                const uint16_t y0 = static_cast<uint16_t>(
+                    randomBelow(16u));
+                const uint16_t width = static_cast<uint16_t>(
+                    8u + randomBelow(9u));
+                const uint16_t height = static_cast<uint16_t>(
+                    8u + randomBelow(5u));
+                const uint32_t color =
+                    0x80000000u | nextRandom(randomState);
+                configureFlatCt32Draws(software, page, 1u);
+                configureFlatCt32Draws(accelerated, page, 1u);
+                drawFlatCt32Sprite(
+                    software,
+                    static_cast<uint16_t>(x0 * 16u),
+                    static_cast<uint16_t>(y0 * 16u),
+                    static_cast<uint16_t>((x0 + width) * 16u),
+                    static_cast<uint16_t>((y0 + height) * 16u),
+                    color);
+                drawFlatCt32Sprite(
+                    accelerated,
+                    static_cast<uint16_t>(x0 * 16u),
+                    static_cast<uint16_t>(y0 * 16u),
+                    static_cast<uint16_t>((x0 + width) * 16u),
+                    static_cast<uint16_t>((y0 + height) * 16u),
+                    color);
+            };
+
+            uint64_t forcedObservations = 0u;
+            uint64_t frameObservations = 0u;
+            const auto compareFullVram = [&](
+                const char *boundary,
+                size_t operationIndex) -> bool
+            {
+                ++forcedObservations;
+                const auto difference = std::mismatch(
+                    softwareVram.begin(), softwareVram.end(),
+                    acceleratedVram.begin(), acceleratedVram.end());
+                if (difference.first == softwareVram.end())
+                    return true;
+                const size_t byteOffset = static_cast<size_t>(
+                    difference.first - softwareVram.begin());
+                t.IsTrue(
+                    false,
+                    std::string("fixed-seed VRAM mismatch after ") +
+                        boundary + " at operation " +
+                        std::to_string(operationIndex) +
+                        ", byte " + std::to_string(byteOffset) +
+                        ", page " + std::to_string(
+                            byteOffset / GS_VRAM_PAGE_SIZE));
+                return false;
+            };
+            const auto forceObservation = [&](
+                uint32_t kind,
+                size_t operationIndex) -> bool
+            {
+                const char *name = nullptr;
+                switch (kind)
+                {
+                case 0u:
+                    (void)software.getDebugSnapshot();
+                    (void)accelerated.getDebugSnapshot();
+                    name = "debugger observation";
+                    break;
+                case 1u:
+                {
+                    software.latchHostPresentationFrame();
+                    accelerated.latchHostPresentationFrame();
+                    std::vector<uint8_t> softwareFrame;
+                    std::vector<uint8_t> acceleratedFrame;
+                    uint32_t softwareWidth = 0u;
+                    uint32_t softwareHeight = 0u;
+                    uint32_t acceleratedWidth = 0u;
+                    uint32_t acceleratedHeight = 0u;
+                    const bool softwareFrameReady =
+                        software.copyLatchedHostPresentationFrame(
+                            softwareFrame,
+                            softwareWidth, softwareHeight);
+                    const bool acceleratedFrameReady =
+                        accelerated.copyLatchedHostPresentationFrame(
+                            acceleratedFrame,
+                            acceleratedWidth, acceleratedHeight);
+                    if (!softwareFrameReady ||
+                        acceleratedFrameReady != softwareFrameReady ||
+                        acceleratedWidth != softwareWidth ||
+                        acceleratedHeight != softwareHeight ||
+                        acceleratedFrame != softwareFrame)
+                    {
+                        t.IsTrue(
+                            false,
+                            "fixed-seed frame bytes diverged at operation " +
+                                std::to_string(operationIndex));
+                        return false;
+                    }
+                    ++frameObservations;
+                    name = "presentation latch";
+                    break;
+                }
+                case 2u:
+                    software.writeRegister(GS_REG_FINISH, 0u);
+                    accelerated.writeRegister(GS_REG_FINISH, 0u);
+                    name = "FINISH";
+                    break;
+                default:
+                    (void)software.captureReplayState();
+                    (void)accelerated.captureReplayState();
+                    name = "save-state observation";
+                    break;
+                }
+                return compareFullVram(name, operationIndex);
+            };
+
+            enum class TransitionAction : uint8_t
+            {
+                GpuDraw,
+                PointFallback,
+                HostUpload,
+                CpuReadback,
+                CostFallback,
+                ClutLoad,
+                Feedback,
+                LocalCopy,
+                CpuClear,
+                Count,
+            };
+            constexpr size_t actionCount =
+                static_cast<size_t>(TransitionAction::Count);
+            std::array<uint64_t, actionCount> actionCounts{};
+            constexpr size_t cycleCount = 8u;
+            size_t operationIndex = 0u;
+            for (size_t cycle = 0u; cycle < cycleCount; ++cycle)
+            {
+                std::array<TransitionAction, actionCount> order{
+                    TransitionAction::GpuDraw,
+                    TransitionAction::PointFallback,
+                    TransitionAction::HostUpload,
+                    TransitionAction::CpuReadback,
+                    TransitionAction::CostFallback,
+                    TransitionAction::ClutLoad,
+                    TransitionAction::Feedback,
+                    TransitionAction::LocalCopy,
+                    TransitionAction::CpuClear,
+                };
+                for (size_t index = order.size() - 1u;
+                     index > 0u; --index)
+                {
+                    const size_t other = randomBelow(
+                        static_cast<uint32_t>(index + 1u));
+                    std::swap(order[index], order[other]);
+                }
+
+                for (TransitionAction action : order)
+                {
+                    ++operationIndex;
+                    ++actionCounts[static_cast<size_t>(action)];
+                    const uint32_t page = randomPage();
+                    switch (action)
+                    {
+                    case TransitionAction::GpuDraw:
+                        drawEligiblePair(page);
+                        break;
+                    case TransitionAction::PointFallback:
+                    {
+                        configureFlatCt32Draws(software, page, 1u);
+                        configureFlatCt32Draws(accelerated, page, 1u);
+                        const uint16_t x = static_cast<uint16_t>(
+                            randomBelow(64u) * 16u);
+                        const uint16_t y = static_cast<uint16_t>(
+                            randomBelow(32u) * 16u);
+                        const uint32_t color =
+                            0x80000000u | nextRandom(randomState);
+                        drawFlatCt32Point(software, x, y, color);
+                        drawFlatCt32Point(accelerated, x, y, color);
+                        break;
+                    }
+                    case TransitionAction::HostUpload:
+                    {
+                        std::array<uint32_t, 4> pixels{};
+                        for (uint32_t &pixel : pixels)
+                            pixel = nextRandom(randomState);
+                        const size_t pixelCount =
+                            1u + randomBelow(
+                                static_cast<uint32_t>(pixels.size()));
+                        const uint16_t x = static_cast<uint16_t>(
+                            randomBelow(60u));
+                        const uint16_t y = static_cast<uint16_t>(
+                            randomBelow(32u));
+                        const std::span<const uint32_t> payload(
+                            pixels.data(), pixelCount);
+                        uploadCt32Pixels(
+                            software, page * 32u, 1u,
+                            x, y, payload);
+                        uploadCt32Pixels(
+                            accelerated, page * 32u, 1u,
+                            x, y, payload);
+                        break;
+                    }
+                    case TransitionAction::CpuReadback:
+                    {
+                        const uint16_t x = static_cast<uint16_t>(
+                            randomBelow(61u));
+                        const uint16_t y = static_cast<uint16_t>(
+                            randomBelow(29u));
+                        const std::vector<uint8_t> softwareBytes =
+                            readCt32Pixels(
+                                software, page * 32u, 1u,
+                                x, y, 3u, 3u);
+                        const std::vector<uint8_t> acceleratedBytes =
+                            readCt32Pixels(
+                                accelerated, page * 32u, 1u,
+                                x, y, 3u, 3u);
+                        if (acceleratedBytes != softwareBytes)
+                        {
+                            t.IsTrue(
+                                false,
+                                "fixed-seed scoped readback diverged at operation " +
+                                    std::to_string(operationIndex));
+                            return;
+                        }
+                        break;
+                    }
+                    case TransitionAction::CostFallback:
+                    {
+                        configureFlatCt32Draws(software, page, 1u);
+                        configureFlatCt32Draws(accelerated, page, 1u);
+                        const uint16_t x0 = static_cast<uint16_t>(
+                            randomBelow(60u));
+                        const uint16_t y0 = static_cast<uint16_t>(
+                            randomBelow(28u));
+                        const uint32_t color =
+                            0x80000000u | nextRandom(randomState);
+                        drawFlatCt32Sprite(
+                            software,
+                            static_cast<uint16_t>(x0 * 16u),
+                            static_cast<uint16_t>(y0 * 16u),
+                            static_cast<uint16_t>((x0 + 4u) * 16u),
+                            static_cast<uint16_t>((y0 + 4u) * 16u),
+                            color);
+                        drawFlatCt32Sprite(
+                            accelerated,
+                            static_cast<uint16_t>(x0 * 16u),
+                            static_cast<uint16_t>(y0 * 16u),
+                            static_cast<uint16_t>((x0 + 4u) * 16u),
+                            static_cast<uint16_t>((y0 + 4u) * 16u),
+                            color);
+                        break;
+                    }
+                    case TransitionAction::ClutLoad:
+                    {
+                        drawEligiblePair(page);
+                        const uint64_t indexedTex0 =
+                            (1ull << 14u) |
+                            (static_cast<uint64_t>(GS_PSM_T8) << 20u) |
+                            (5ull << 26u) |
+                            (5ull << 30u) |
+                            (1ull << 34u) |
+                            (static_cast<uint64_t>(page * 32u) << 37u) |
+                            (static_cast<uint64_t>(GS_PSM_CT32) << 51u) |
+                            (1ull << 61u);
+                        software.writeRegister(GS_REG_TEX0_1, indexedTex0);
+                        accelerated.writeRegister(
+                            GS_REG_TEX0_1, indexedTex0);
+                        break;
+                    }
+                    case TransitionAction::Feedback:
+                    {
+                        drawEligiblePair(page);
+                        const uint64_t feedbackTex0 =
+                            static_cast<uint64_t>(page * 32u) |
+                            (1ull << 14u) |
+                            (static_cast<uint64_t>(GS_PSM_CT32) << 20u) |
+                            (5ull << 26u) |
+                            (5ull << 30u) |
+                            (1ull << 34u) |
+                            (1ull << 35u);
+                        software.writeRegister(GS_REG_TEX0_1, feedbackTex0);
+                        accelerated.writeRegister(
+                            GS_REG_TEX0_1, feedbackTex0);
+                        software.beginRenderBatch();
+                        accelerated.beginRenderBatch();
+                        const uint16_t x0 = static_cast<uint16_t>(
+                            randomBelow(48u));
+                        const uint16_t y0 = static_cast<uint16_t>(
+                            randomBelow(16u));
+                        drawRecursiveCt32Sprite(
+                            software,
+                            static_cast<uint16_t>(x0 * 16u),
+                            static_cast<uint16_t>(y0 * 16u),
+                            static_cast<uint16_t>((x0 + 8u) * 16u),
+                            static_cast<uint16_t>((y0 + 8u) * 16u),
+                            0x80808080u);
+                        drawRecursiveCt32Sprite(
+                            accelerated,
+                            static_cast<uint16_t>(x0 * 16u),
+                            static_cast<uint16_t>(y0 * 16u),
+                            static_cast<uint16_t>((x0 + 8u) * 16u),
+                            static_cast<uint16_t>((y0 + 8u) * 16u),
+                            0x80808080u);
+                        software.endRenderBatch();
+                        accelerated.endRenderBatch();
+                        if (!compareFullVram(
+                                "feedback explicit boundary",
+                                operationIndex))
+                        {
+                            return;
+                        }
+                        break;
+                    }
+                    case TransitionAction::LocalCopy:
+                    {
+                        const size_t sourceIndex = randomBelow(
+                            static_cast<uint32_t>(pages.size()));
+                        const size_t destinationIndex =
+                            (sourceIndex + 1u + randomBelow(
+                                static_cast<uint32_t>(pages.size() - 1u))) %
+                            pages.size();
+                        const uint32_t sourcePage = pages[sourceIndex];
+                        const uint32_t destinationPage =
+                            pages[destinationIndex];
+                        drawEligiblePair(sourcePage);
+                        drawEligiblePair(destinationPage);
+                        const uint16_t sourceX = static_cast<uint16_t>(
+                            randomBelow(57u));
+                        const uint16_t sourceY = static_cast<uint16_t>(
+                            randomBelow(29u));
+                        const uint16_t destinationX =
+                            static_cast<uint16_t>(randomBelow(57u));
+                        const uint16_t destinationY =
+                            static_cast<uint16_t>(randomBelow(29u));
+                        copyCt32Pixels(
+                            software,
+                            sourcePage * 32u,
+                            destinationPage * 32u,
+                            1u,
+                            sourceX, sourceY,
+                            destinationX, destinationY,
+                            4u, 3u);
+                        copyCt32Pixels(
+                            accelerated,
+                            sourcePage * 32u,
+                            destinationPage * 32u,
+                            1u,
+                            sourceX, sourceY,
+                            destinationX, destinationY,
+                            4u, 3u);
+                        break;
+                    }
+                    case TransitionAction::CpuClear:
+                    {
+                        configureFlatCt32Draws(software, page, 1u);
+                        configureFlatCt32Draws(accelerated, page, 1u);
+                        const uint32_t color =
+                            0x80000000u | nextRandom(randomState);
+                        const bool softwareCleared =
+                            software.clearFramebufferContext(0u, color);
+                        const bool acceleratedCleared =
+                            accelerated.clearFramebufferContext(0u, color);
+                        if (!softwareCleared ||
+                            acceleratedCleared != softwareCleared)
+                        {
+                            t.IsTrue(
+                                false,
+                                "fixed-seed CPU clear failed at operation " +
+                                    std::to_string(operationIndex));
+                            return;
+                        }
+                        break;
+                    }
+                    case TransitionAction::Count:
+                        break;
+                    }
+
+                    if ((operationIndex & 3u) == 0u)
+                    {
+                        const uint32_t observationKind =
+                            static_cast<uint32_t>(
+                                (operationIndex / 4u - 1u) % 4u);
+                        if (!forceObservation(
+                                observationKind, operationIndex))
+                        {
+                            return;
+                        }
+                    }
+                }
+            }
+
+            (void)software.getDebugSnapshot();
+            (void)accelerated.getDebugSnapshot();
+            if (!compareFullVram(
+                    "final debugger observation", operationIndex))
+            {
+                return;
+            }
+
+            for (size_t index = 0u; index < actionCounts.size(); ++index)
+            {
+                t.Equals(actionCounts[index],
+                         static_cast<uint64_t>(cycleCount),
+                         "every transition action should execute once per shuffled cycle");
+            }
+            t.Equals(operationIndex, cycleCount * actionCount,
+                     "the randomized transition stream should remain bounded");
+            t.Equals(forcedObservations, 27ull,
+                     "scheduled feedback and final boundaries should all compare VRAM");
+            t.Equals(frameObservations, 5ull,
+                     "five scheduled frame observations should compare host pixels");
+
+            const GsBackendCounters counters =
+                accelerated.backendCounters();
+            t.Equals(counters.commands, 64ull,
+                     "the shuffled stream should submit its exact draw count");
+            t.Equals(counters.acceleratedCommands, 40ull,
+                     "all semantically eligible non-tiny sprites should accelerate");
+            t.Equals(counters.softwareCommands, 24ull,
+                     "point cost and feedback commands should use software");
+            t.Equals(counters.fallbackCommands, 24ull,
+                     "every software command should retain an explicit fallback");
+            t.Equals(
+                counters.decisions[static_cast<size_t>(
+                    GsFallbackReason::UnsupportedPrimitive)],
+                8ull,
+                "each shuffled cycle should contain one point fallback");
+            t.Equals(
+                counters.decisions[static_cast<size_t>(
+                    GsFallbackReason::CostModel)],
+                8ull,
+                "each shuffled cycle should contain one tiny cost fallback");
+            t.Equals(
+                counters.decisions[static_cast<size_t>(
+                    GsFallbackReason::Textured)],
+                8ull,
+                "each shuffled cycle should contain one feedback fallback");
+            t.IsTrue(counters.queueHighWatermark >= 2ull,
+                     "local-copy setup should expose compatible GPU queueing");
+            t.IsTrue(
+                counters.flushReasons[static_cast<size_t>(
+                    GsFlushReason::Transfer)] >= 24ull,
+                "uploads local copies and clears should cross transfer boundaries");
+            t.IsTrue(
+                counters.flushReasons[static_cast<size_t>(
+                    GsFlushReason::CpuReadback)] >= 8ull,
+                "every readback action should retain its scoped boundary");
+            t.IsTrue(
+                counters.flushReasons[static_cast<size_t>(
+                    GsFlushReason::ClutHazard)] >= 8ull,
+                "every CLUT action should retain its sampled-page boundary");
+            t.IsTrue(
+                counters.flushReasons[static_cast<size_t>(
+                    GsFlushReason::FeedbackSnapshot)] >= 8ull,
+                "every recursive draw should retain its feedback boundary");
+
+            const GsVulkanRasterBackendStatistics backend =
+                accelerated.vulkanRendererBackendStatistics();
+            t.Equals(backend.commandsCompleted, 40ull,
+                     "every accelerated transition command should complete");
+            t.Equals(backend.pageOwnership.gpuNewerPages,
+                     static_cast<size_t>(0u),
+                     "the final observation should publish every GPU writer");
+            t.Equals(backend.coherency.rejectedTransitions, 0ull,
+                     "the randomized stream should never create competing writers");
+            t.IsTrue(backend.residentBatchesCompleted > 0ull,
+                     "the randomized stream should exercise resident batches");
+            const GsVulkanServiceStatistics service =
+                accelerated.vulkanRendererServiceStatistics();
+            t.Equals(service.spriteDrawsCompleted, 40ull,
+                     "the service should execute every accepted sprite once");
+            t.IsTrue(service.pageUploadOperationsCompleted > 0ull,
+                     "the randomized stream should upload CPU-newer pages");
+            t.IsTrue(service.pageDownloadOperationsCompleted > 0ull,
+                     "forced observations should publish GPU-newer pages");
+            t.Equals(service.fenceTimeouts, 0ull,
+                     "the bounded transition stream should not time out");
+            t.Equals(service.validationErrors, 0u,
+                     "randomized transitions should remain validation-clean");
+            t.Equals(service.validationWarnings, 0u,
+                     "randomized transitions should emit no validation warnings");
         });
 
         tc.Run("Vulkan verify mismatch writes a complete bounded reproducer", [](TestCase &t)
