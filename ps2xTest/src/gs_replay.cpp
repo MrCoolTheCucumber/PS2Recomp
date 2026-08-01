@@ -313,6 +313,8 @@ namespace
                    << (device.exactCt32Triangle ? "true" : "false")
                    << ",\"exact_nearest_ct32_sprite\":"
                    << (device.exactNearestCt32Sprite ? "true" : "false")
+                   << ",\"exact_linear_ct32_sprite\":"
+                   << (device.exactLinearCt32Sprite ? "true" : "false")
                    << ",\"suitable\":"
                    << (device.suitable ? "true" : "false")
                    << ",\"rejection_reason\":";

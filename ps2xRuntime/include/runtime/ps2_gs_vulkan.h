@@ -108,6 +108,10 @@ struct GsVulkanDeviceReport
     // storage contract; the separate bit lets routing fail closed if that
     // semantic pipeline is unavailable on a future platform.
     bool exactNearestCt32Sprite = false;
+
+    // The first exact linear pipeline uses the same raw-VRAM contract and a
+    // 96-byte push-constant record, below Vulkan 1.0's required minimum.
+    bool exactLinearCt32Sprite = false;
     bool suitable = false;
     std::string rejectionReason;
 };
@@ -186,6 +190,9 @@ struct GsVulkanServiceStatistics
     uint64_t nearestCt32SpriteDrawsCompleted = 0u;
     uint64_t nearestCt32SpriteDrawsFailed = 0u;
     uint64_t nearestCt32SpritePixelsExecuted = 0u;
+    uint64_t linearCt32SpriteDrawsCompleted = 0u;
+    uint64_t linearCt32SpriteDrawsFailed = 0u;
+    uint64_t linearCt32SpritePixelsExecuted = 0u;
     uint64_t residentNearestCt32SpriteBatchesCompleted = 0u;
     uint64_t residentNearestCt32SpriteBatchesFailed = 0u;
     uint64_t largestResidentNearestCt32SpriteBatch = 0u;
@@ -601,6 +608,15 @@ public:
         const GsVulkanNearestCt32Sprite &sprite,
         std::vector<uint8_t> &output,
         std::string *error = nullptr) override;
+
+    // Uploads canonical VRAM and executes one exact prepared-DDA linear CT32
+    // repeat sprite. This remains a direct service seam until the independent
+    // compute pipeline is qualified for renderer routing.
+    [[nodiscard]] bool executeLinearCt32Sprite(
+        std::span<const uint8_t> input,
+        const GsVulkanLinearCt32Sprite &sprite,
+        std::vector<uint8_t> &output,
+        std::string *error = nullptr);
 
     // Uploads canonical 4 MiB CPU VRAM, executes one prepared exact flat
     // CT32 triangle, and publishes the complete synchronized image. Devices

@@ -7709,6 +7709,10 @@ void register_ps2_gs_vulkan_tests()
                     device.exactNearestCt32Sprite,
                     device.suitable,
                     "the nearest CT32 capability should expose its raw-VRAM hard gate");
+                t.Equals(
+                    device.exactLinearCt32Sprite,
+                    device.suitable,
+                    "the linear CT32 capability should expose its raw-VRAM hard gate");
                 if (!device.suitable)
                     continue;
                 t.IsTrue(device.exactVramStorage && device.computeQueue &&
@@ -8543,6 +8547,180 @@ void register_ps2_gs_vulkan_tests()
                       "a stopped service must reject nearest CT32 work");
             t.IsTrue(shutdownOutput == shutdownSentinel,
                      "post-shutdown texture rejection must preserve output");
+        });
+
+        tc.Run("Vulkan linear CT32 repeat sprites match the prepared DDA", [](TestCase &t)
+        {
+            GSMem::InitLookupTables();
+            const std::array<GsDrawCommand, 4> commands{{
+                makeLinearCt32RepeatSpriteCommand(
+                    31'000u, 0u, 8u, 3584u, 8u, 10u, 10u,
+                    {0u, 511u, 0u, 447u}, {28672u, 29184u},
+                    {28664u, 29176u}, {29176u, 36344u},
+                    {0u, 512u}, {0u, 6656u}),
+                makeLinearCt32RepeatSpriteCommand(
+                    31'001u, 40u, 2u, 512u, 2u, 6u, 5u,
+                    {3u, 12u, 2u, 13u}, {128u, 96u},
+                    {120u, 376u}, {88u, 344u},
+                    {0u, 249u}, {0u, 137u}),
+                makeLinearCt32RepeatSpriteCommand(
+                    31'002u, 41u, 2u, 512u, 2u, 6u, 5u,
+                    {4u, 14u, 3u, 12u}, {128u, 96u},
+                    {400u, 144u}, {352u, 96u},
+                    {9u, 521u}, {17u, 273u}),
+                makeLinearCt32RepeatSpriteCommand(
+                    31'003u, 42u, 1u, 512u, 1u, 3u, 3u,
+                    {0u, 7u, 0u, 7u}, {128u, 96u},
+                    {120u, 248u}, {88u, 216u},
+                    {0u, 128u}, {0u, 128u}),
+            }};
+            std::vector<GsVulkanLinearCt32Sprite> sprites;
+            for (const GsDrawCommand &command : commands)
+            {
+                GsVulkanLinearCt32Sprite sprite{};
+                const GsBackendDecision decision =
+                    prepareGsVulkanLinearCt32Sprite(command, sprite);
+                if (!decision.supported)
+                {
+                    t.Fail(
+                        "synthetic linear CT32 sprite was rejected as " +
+                        std::string(gsFallbackReasonName(decision.reason)));
+                    return;
+                }
+                sprites.push_back(sprite);
+            }
+
+            GsVulkanServiceConfig config{};
+            config.probe.enableValidation = true;
+            GsVulkanCapabilityReport preflight =
+                probeGsVulkanCapabilities(config.probe);
+            if (preflight.status ==
+                GsVulkanProbeStatus::ValidationUnavailable)
+            {
+                config.probe.enableValidation = false;
+                preflight = probeGsVulkanCapabilities(config.probe);
+            }
+
+            GsVulkanCapabilityReport creationReport{};
+            std::string creationError;
+            std::unique_ptr<GsVulkanService> service =
+                GsVulkanService::create(
+                    config, &creationReport, &creationError);
+            if (!preflight.ready())
+            {
+                t.IsNull(service.get(),
+                         "an unavailable host should skip the linear shader cleanly");
+                return;
+            }
+            t.IsNotNull(service.get(),
+                        "a suitable device should create the linear sprite service");
+            if (!service)
+                return;
+            const GsVulkanDeviceReport *selected =
+                creationReport.selectedDevice();
+            t.IsNotNull(selected,
+                        "the linear service should retain its selected device");
+            if (!selected)
+                return;
+            t.IsTrue(selected->exactLinearCt32Sprite,
+                     "the selected device should publish exact linear sampling");
+
+            std::vector<uint8_t> gpu = makeVramPattern(0x4C494E47u);
+            uint64_t expectedPixels = 0u;
+            for (size_t index = 0u; index < sprites.size(); ++index)
+            {
+                const GsVulkanLinearCt32Sprite &sprite = sprites[index];
+                std::vector<uint8_t> expected = gpu;
+                applyLinearCt32SpriteCpu(expected, sprite);
+                std::vector<uint8_t> actual = {0xA5u};
+                std::string error;
+                if (!service->executeLinearCt32Sprite(
+                        gpu, sprite, actual, &error))
+                {
+                    t.Fail(
+                        "GPU linear CT32 sprite " +
+                        std::to_string(index) + " failed: " + error);
+                    return;
+                }
+                if (actual != expected)
+                {
+                    t.Fail(
+                        "GPU linear CT32 sprite " +
+                        std::to_string(index) +
+                        " disagreed with the complete CPU VRAM image");
+                    return;
+                }
+                gpu = std::move(actual);
+                expectedPixels +=
+                    static_cast<uint64_t>(
+                        sprite.boundsX1 - sprite.boundsX0) *
+                    static_cast<uint64_t>(
+                        sprite.boundsY1 - sprite.boundsY0);
+            }
+
+            const auto expectRejected = [&t, &service](
+                std::span<const uint8_t> input,
+                const GsVulkanLinearCt32Sprite &sprite,
+                const std::string &label)
+            {
+                std::vector<uint8_t> output = {0x12u, 0x34u};
+                const std::vector<uint8_t> sentinel = output;
+                std::string error;
+                t.IsFalse(
+                    service->executeLinearCt32Sprite(
+                        input, sprite, output, &error),
+                    label + " should fail closed");
+                t.IsTrue(output == sentinel,
+                         label + " must preserve caller output");
+                t.IsFalse(error.empty(),
+                          label + " should retain a diagnostic");
+            };
+            const std::vector<uint8_t> shortInput(
+                GS_VULKAN_VRAM_SIZE - 1u, 0u);
+            expectRejected(shortInput, sprites.front(),
+                           "short linear sprite VRAM input");
+            GsVulkanLinearCt32Sprite invalid = sprites.front();
+            invalid.textureWrapU = packGsVulkanTextureWrap(1u, 0u, 0u);
+            expectRejected(gpu, invalid,
+                           "non-repeat linear sprite wrap");
+            invalid = sprites.front();
+            invalid.textureMaskU = 6u;
+            expectRejected(gpu, invalid,
+                           "non-power-of-two linear sprite mask");
+            invalid = sprites.front();
+            invalid.fixedStepVBits = 0x7FC00000u;
+            expectRejected(gpu, invalid,
+                           "non-finite linear sprite V step");
+            invalid = sprites.front();
+            invalid.textureBaseBlock = invalid.framebufferBaseBlock;
+            expectRejected(gpu, invalid,
+                           "aliased linear sprite source");
+
+            const GsVulkanServiceStatistics statistics =
+                service->statistics();
+            t.Equals(statistics.linearCt32SpriteDrawsCompleted, 4ull,
+                     "every linear sprite should complete exactly once");
+            t.Equals(statistics.linearCt32SpriteDrawsFailed, 0ull,
+                     "caller-side linear rejection should not count as GPU failure");
+            t.Equals(statistics.linearCt32SpritePixelsExecuted,
+                     expectedPixels,
+                     "linear statistics should count exact output pixels");
+            t.Equals(statistics.validationErrors, 0u,
+                     "linear shader execution must remain validation-clean");
+            t.Equals(statistics.validationWarnings, 0u,
+                     "linear shader execution should emit no validation warnings");
+
+            service->shutdown();
+            service->shutdown();
+            std::vector<uint8_t> shutdownOutput = {0xABu};
+            const std::vector<uint8_t> shutdownSentinel = shutdownOutput;
+            std::string shutdownError;
+            t.IsFalse(
+                service->executeLinearCt32Sprite(
+                    gpu, sprites.front(), shutdownOutput, &shutdownError),
+                "a stopped service must reject linear sprite work");
+            t.IsTrue(shutdownOutput == shutdownSentinel,
+                     "post-shutdown linear rejection must preserve output");
         });
 
         tc.Run("Vulkan CT32 triangles match CPU fixed-point edges and wrap", [](TestCase &t)
