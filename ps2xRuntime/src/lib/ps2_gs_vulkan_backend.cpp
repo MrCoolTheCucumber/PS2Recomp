@@ -518,6 +518,7 @@ struct GsVulkanRasterBackend::Impl final
     {
         Ct32Sprite,
         NearestCt32Sprite,
+        LinearCt32Sprite,
         Ct32Triangle,
     };
 
@@ -526,6 +527,7 @@ struct GsVulkanRasterBackend::Impl final
         GsDrawCommand command;
         GsVulkanCt32Sprite sprite;
         GsVulkanNearestCt32Sprite nearestCt32Sprite;
+        GsVulkanLinearCt32Sprite linearCt32Sprite;
         GsVulkanCt32Triangle triangle;
         GsDrawResources resources;
         ResidentPipeline pipeline = ResidentPipeline::Ct32Sprite;
@@ -628,9 +630,12 @@ struct GsVulkanRasterBackend::Impl final
             pendingResidentCommands.front().pipeline;
         std::vector<GsVulkanCt32Sprite> sprites;
         std::vector<GsVulkanNearestCt32Sprite> nearestCt32Sprites;
+        std::vector<GsVulkanLinearCt32Sprite> linearCt32Sprites;
         std::vector<GsVulkanCt32Triangle> triangles;
         if (pipeline == ResidentPipeline::Ct32Triangle)
             triangles.reserve(commandCount);
+        else if (pipeline == ResidentPipeline::LinearCt32Sprite)
+            linearCt32Sprites.reserve(commandCount);
         else if (pipeline == ResidentPipeline::NearestCt32Sprite)
             nearestCt32Sprites.reserve(commandCount);
         else
@@ -647,6 +652,9 @@ struct GsVulkanRasterBackend::Impl final
             }
             if (pipeline == ResidentPipeline::Ct32Triangle)
                 triangles.push_back(pending.triangle);
+            else if (pipeline == ResidentPipeline::LinearCt32Sprite)
+                linearCt32Sprites.push_back(
+                    pending.linearCt32Sprite);
             else if (pipeline == ResidentPipeline::NearestCt32Sprite)
                 nearestCt32Sprites.push_back(
                     pending.nearestCt32Sprite);
@@ -657,6 +665,8 @@ struct GsVulkanRasterBackend::Impl final
         const char *batchName = "resident CT32 sprite batch";
         if (pipeline == ResidentPipeline::NearestCt32Sprite)
             batchName = "resident nearest CT32 sprite batch";
+        else if (pipeline == ResidentPipeline::LinearCt32Sprite)
+            batchName = "resident linear CT32 sprite batch";
         else if (pipeline == ResidentPipeline::Ct32Triangle)
             batchName = "resident CT32 triangle batch";
         GsVramPageMask accessPages = pendingResidentReadPages;
@@ -686,6 +696,11 @@ struct GsVulkanRasterBackend::Impl final
         {
             executed = executor->executeResidentNearestCt32Sprites(
                 nearestCt32Sprites, &executionError);
+        }
+        else if (pipeline == ResidentPipeline::LinearCt32Sprite)
+        {
+            executed = executor->executeResidentLinearCt32Sprites(
+                linearCt32Sprites, &executionError);
         }
         else
         {
@@ -907,10 +922,9 @@ GsBackendDecision GsVulkanRasterBackend::classify(
             return textureDecision;
         }
 
-        // First qualify the independent kernel through full-image Verify.
-        // Strict and Hybrid remain closed until resident linear execution is
-        // available, preserving their atomic ownership contract.
-        if (m_impl->config.mode != GsRendererMode::Verify)
+        // Hybrid remains closed until the resident linear path has an
+        // independently measured cost threshold.
+        if (m_impl->config.mode == GsRendererMode::Hybrid)
             return textureDecision;
         GsVulkanLinearCt32Sprite linearSprite{};
         const GsBackendDecision linearDecision =
@@ -1137,6 +1151,8 @@ void GsVulkanRasterBackend::submit(
                 Impl::ResidentPipeline::Ct32Sprite;
             if (isTriangle)
                 pipeline = Impl::ResidentPipeline::Ct32Triangle;
+            else if (isLinearTexturedSprite)
+                pipeline = Impl::ResidentPipeline::LinearCt32Sprite;
             else if (isTexturedSprite)
                 pipeline = Impl::ResidentPipeline::NearestCt32Sprite;
             if (!m_impl->pendingResidentCommands.empty() &&
@@ -1166,7 +1182,8 @@ void GsVulkanRasterBackend::submit(
             }
 
             m_impl->pendingResidentCommands.push_back(
-                {command, sprite, texturedSprite, triangle,
+                {command, sprite, texturedSprite, linearTexturedSprite,
+                 triangle,
                  resources, pipeline});
             m_impl->pendingResidentReadPages.unionWith(
                 resources.readPages);

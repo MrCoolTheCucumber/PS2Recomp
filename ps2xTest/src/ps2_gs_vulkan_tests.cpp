@@ -3344,6 +3344,201 @@ void register_ps2_gs_vulkan_tests()
                      "the software oracle should remain canonical on mismatch");
         });
 
+        tc.Run("Vulkan strict backend keeps linear CT32 textures resident", [](TestCase &t)
+        {
+            GSMem::InitLookupTables();
+            const auto makeLinear = [](uint64_t sequence,
+                                       uint32_t framebufferPage)
+            {
+                return makeLinearCt32RepeatSpriteCommand(
+                    sequence, framebufferPage, 2u,
+                    512u, 2u, 6u, 5u,
+                    {3u, 12u, 2u, 13u}, {128u, 96u},
+                    {120u, 376u}, {88u, 344u},
+                    {0u, 249u}, {0u, 137u});
+            };
+            const std::array<GsDrawCommand, 2> commands{{
+                makeLinear(101u, 40u),
+                makeLinear(102u, 41u),
+            }};
+            std::array<GsVulkanLinearCt32Sprite, 2> prepared{};
+            for (size_t index = 0u; index < commands.size(); ++index)
+            {
+                t.IsTrue(
+                    prepareGsVulkanLinearCt32Sprite(
+                        commands[index], prepared[index]).supported,
+                    "the strict linear fixture should satisfy its narrow predicate");
+            }
+
+            const std::vector<uint8_t> initial =
+                makeVramPattern(0x4C535431u);
+            std::vector<uint8_t> expected = initial;
+            for (const GsVulkanLinearCt32Sprite &sprite : prepared)
+                applyLinearCt32SpriteCpu(expected, sprite);
+
+            std::vector<uint8_t> vram = initial;
+            uint64_t softwareCalls = 0u;
+            uint64_t commitCalls = 0u;
+            GsVulkanRasterBackendConfig config{};
+            config.mode = GsRendererMode::GpuStrict;
+            std::unique_ptr<GsVulkanRasterBackend> backend =
+                GsVulkanRasterBackend::createWithExecutor(
+                    std::make_unique<FakeCt32Executor>(
+                        FakeCt32Executor::Behavior::Exact),
+                    config, vram,
+                    [&](const GsDrawCommand &)
+                    {
+                        ++softwareCalls;
+                    },
+                    [&](const GsDrawCommand &)
+                    {
+                        ++commitCalls;
+                    },
+                    nullptr);
+            t.IsNotNull(backend.get(),
+                        "an exact linear executor should create strict mode");
+            if (!backend)
+                return;
+
+            for (const GsDrawCommand &command : commands)
+            {
+                t.IsTrue(backend->classify(command).supported,
+                         "strict should expose the capability-gated linear class");
+            }
+            backend->submit(commands);
+            t.IsTrue(vram == initial,
+                     "queued strict linear draws should not mutate canonical VRAM");
+            t.Equals(softwareCalls, 0ull,
+                     "strict linear execution must not call the software oracle");
+            t.Equals(commitCalls, 0ull,
+                     "pending strict linear draws must not publish commit metadata");
+            t.Equals(backend->pendingCommandCount(), commands.size(),
+                     "shared-read disjoint linear draws should remain in one queue");
+
+            GsVramPageMask allPages;
+            allPages.setAll();
+            backend->prepareCpuVramAccess(
+                allPages, GsFlushReason::CpuReadback);
+            t.IsTrue(vram == expected,
+                     "strict linear observation should publish the exact resident result");
+            t.Equals(softwareCalls, 0ull,
+                     "strict linear publication must not invoke software fallback");
+            t.Equals(commitCalls, 2ull,
+                     "draining strict linear work should publish both commits");
+            t.Equals(backend->pendingCommandCount(), size_t{0u},
+                     "the observation boundary should drain resident linear work");
+
+            const GsVulkanRasterBackendStatistics statistics =
+                backend->backendStatistics();
+            t.Equals(statistics.commandsAttempted, 2ull,
+                     "strict should attempt both linear draws");
+            t.Equals(statistics.commandsCompleted, 2ull,
+                     "strict should complete both linear draws");
+            t.Equals(statistics.committedGpuCommands, 2ull,
+                     "strict should commit both GPU results");
+            t.Equals(statistics.residentCommands, 2ull,
+                     "strict should count both resident linear draws");
+            t.Equals(statistics.residentBatchesCompleted, 1ull,
+                     "the two linear draws should share one backend batch");
+            t.Equals(statistics.largestResidentBatch, 2ull,
+                     "the backend should retain the two-draw linear batch size");
+            t.Equals(statistics.gpuRequestsFailed, 0ull,
+                     "the exact strict linear batch should not fail");
+            const GsVulkanServiceStatistics serviceStatistics =
+                backend->serviceStatistics();
+            t.Equals(serviceStatistics.linearCt32SpriteDrawsCompleted,
+                     2ull,
+                     "the resident executor should complete both linear draws");
+            t.Equals(
+                serviceStatistics.residentLinearCt32SpriteBatchesCompleted,
+                1ull,
+                "strict should execute one resident linear service batch");
+            t.Equals(serviceStatistics.largestResidentLinearCt32SpriteBatch,
+                     2ull,
+                     "the service should retain the two-draw linear batch size");
+            t.Equals(serviceStatistics.nearestCt32SpriteDrawsCompleted,
+                     0ull,
+                     "strict linear routing must not alias nearest textures");
+
+            t.IsTrue(backend->setMode(GsRendererMode::Hybrid),
+                     "a synchronized strict backend should enter Hybrid");
+            t.IsFalse(backend->classify(commands.front()).supported,
+                      "Hybrid should remain closed until linear cost qualification");
+
+            std::vector<uint8_t> unavailableVram = initial;
+            std::unique_ptr<GsVulkanRasterBackend> unavailable =
+                GsVulkanRasterBackend::createWithExecutor(
+                    std::make_unique<FakeCt32Executor>(
+                        FakeCt32Executor::Behavior::Exact,
+                        true, true, false),
+                    config, unavailableVram,
+                    [](const GsDrawCommand &) {}, {}, nullptr);
+            t.IsNotNull(unavailable.get(),
+                        "a base-capable executor should retain strict linear fallback");
+            if (unavailable)
+            {
+                t.Equals(unavailable->classify(commands.front()).reason,
+                         GsFallbackReason::BackendUnavailable,
+                         "missing linear capability should reject before queueing");
+                t.Equals(unavailable->pendingCommandCount(), size_t{0u},
+                         "capability fallback must not retain linear work");
+                t.Equals(
+                    unavailable->serviceStatistics()
+                        .residentLinearCt32SpriteBatchesFailed,
+                    0ull,
+                    "capability fallback must not post a resident batch");
+            }
+
+            std::vector<uint8_t> failureVram = initial;
+            uint64_t failedSoftwareCalls = 0u;
+            std::unique_ptr<GsVulkanRasterBackend> failing =
+                GsVulkanRasterBackend::createWithExecutor(
+                    std::make_unique<FakeCt32Executor>(
+                        FakeCt32Executor::Behavior::FailResidentDraw),
+                    config, failureVram,
+                    [&](const GsDrawCommand &)
+                    {
+                        ++failedSoftwareCalls;
+                    },
+                    {}, nullptr);
+            t.IsNotNull(failing.get(),
+                        "an initially healthy failing linear executor should construct");
+            bool executionThrew = false;
+            if (failing)
+            {
+                failing->submit(
+                    std::span<const GsDrawCommand>(
+                        &commands.front(), 1u));
+                t.Equals(failing->pendingCommandCount(), size_t{1u},
+                         "a failing strict linear draw should first enter the queue");
+                try
+                {
+                    failing->flush(GsFlushReason::Explicit);
+                }
+                catch (const std::runtime_error &error)
+                {
+                    executionThrew =
+                        std::string(error.what()).find(
+                            "before canonical VRAM mutation") !=
+                        std::string::npos;
+                }
+                t.Equals(failing->backendStatistics().gpuRequestsFailed,
+                         1ull,
+                         "resident linear execution failure should be counted once");
+                t.Equals(
+                    failing->serviceStatistics()
+                        .residentLinearCt32SpriteBatchesFailed,
+                    1ull,
+                    "the deferred linear failure should count one resident batch");
+            }
+            t.IsTrue(executionThrew,
+                     "strict linear failure should identify its atomic boundary");
+            t.IsTrue(failureVram == initial,
+                     "strict linear failure must preserve canonical VRAM");
+            t.Equals(failedSoftwareCalls, 0ull,
+                     "strict linear failure must not invoke software fallback");
+        });
+
         tc.Run("Vulkan strict texture queue shares reads and splits dependencies", [](TestCase &t)
         {
             GSMem::InitLookupTables();
