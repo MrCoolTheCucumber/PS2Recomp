@@ -939,7 +939,7 @@ GsBackendDecision GsVulkanRasterBackend::classify(
             gsVulkanTextureWrapMode(linearSprite.textureWrapU) != 0u ||
             gsVulkanTextureWrapMode(linearSprite.textureWrapV) != 0u;
         if (usesStandardClamp &&
-            m_impl->config.mode != GsRendererMode::Verify)
+            m_impl->config.mode == GsRendererMode::Hybrid)
         {
             return {false, GsFallbackReason::UnsupportedTextureWrap};
         }

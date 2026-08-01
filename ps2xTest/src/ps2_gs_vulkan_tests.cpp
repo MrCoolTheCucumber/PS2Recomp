@@ -3440,10 +3440,9 @@ void register_ps2_gs_vulkan_tests()
 
             t.IsTrue(backend->setMode(GsRendererMode::GpuStrict),
                      "the Verify fixture should enter strict mode cleanly");
-            t.Equals(
-                backend->classify(clampedCommand).reason,
-                GsFallbackReason::UnsupportedTextureWrap,
-                "strict clamp should remain closed until resident routing qualification");
+            t.IsTrue(
+                backend->classify(clampedCommand).supported,
+                "strict should expose resident-qualified linear clamp");
             t.IsTrue(backend->setMode(GsRendererMode::Verify),
                      "the fixture should restore Verify after its strict gate");
 
@@ -3594,20 +3593,24 @@ void register_ps2_gs_vulkan_tests()
         {
             GSMem::InitLookupTables();
             const auto makeLinear = [](uint64_t sequence,
-                                       uint32_t framebufferPage)
+                                       uint32_t framebufferPage,
+                                       uint8_t wrapU = 0u,
+                                       uint8_t wrapV = 0u)
             {
-                return makeLinearCt32RepeatSpriteCommand(
+                return makeLinearCt32SpriteCommand(
                     sequence, framebufferPage, 2u,
                     512u, 2u, 6u, 5u,
                     {3u, 12u, 2u, 13u}, {128u, 96u},
                     {120u, 376u}, {88u, 344u},
-                    {0u, 249u}, {0u, 137u});
+                    {0u, 249u}, {0u, 137u}, wrapU, wrapV);
             };
-            const std::array<GsDrawCommand, 2> commands{{
+            const std::array<GsDrawCommand, 4> commands{{
                 makeLinear(101u, 40u),
                 makeLinear(102u, 41u),
+                makeLinear(103u, 42u, 1u, 0u),
+                makeLinear(104u, 43u, 1u, 1u),
             }};
-            std::array<GsVulkanLinearCt32Sprite, 2> prepared{};
+            std::array<GsVulkanLinearCt32Sprite, 4> prepared{};
             for (size_t index = 0u; index < commands.size(); ++index)
             {
                 t.IsTrue(
@@ -3669,39 +3672,53 @@ void register_ps2_gs_vulkan_tests()
                      "strict linear observation should publish the exact resident result");
             t.Equals(softwareCalls, 0ull,
                      "strict linear publication must not invoke software fallback");
-            t.Equals(commitCalls, 2ull,
-                     "draining strict linear work should publish both commits");
+            t.Equals(
+                commitCalls,
+                static_cast<uint64_t>(commands.size()),
+                "draining strict linear work should publish every commit");
             t.Equals(backend->pendingCommandCount(), size_t{0u},
                      "the observation boundary should drain resident linear work");
 
             const GsVulkanRasterBackendStatistics statistics =
                 backend->backendStatistics();
-            t.Equals(statistics.commandsAttempted, 2ull,
-                     "strict should attempt both linear draws");
-            t.Equals(statistics.commandsCompleted, 2ull,
-                     "strict should complete both linear draws");
-            t.Equals(statistics.committedGpuCommands, 2ull,
-                     "strict should commit both GPU results");
-            t.Equals(statistics.residentCommands, 2ull,
-                     "strict should count both resident linear draws");
+            t.Equals(
+                statistics.commandsAttempted,
+                static_cast<uint64_t>(commands.size()),
+                "strict should attempt every linear draw");
+            t.Equals(
+                statistics.commandsCompleted,
+                static_cast<uint64_t>(commands.size()),
+                "strict should complete every linear draw");
+            t.Equals(
+                statistics.committedGpuCommands,
+                static_cast<uint64_t>(commands.size()),
+                "strict should commit every GPU result");
+            t.Equals(
+                statistics.residentCommands,
+                static_cast<uint64_t>(commands.size()),
+                "strict should count every resident linear draw");
             t.Equals(statistics.residentBatchesCompleted, 1ull,
-                     "the two linear draws should share one backend batch");
-            t.Equals(statistics.largestResidentBatch, 2ull,
-                     "the backend should retain the two-draw linear batch size");
+                     "the mixed-wrap linear draws should share one backend batch");
+            t.Equals(
+                statistics.largestResidentBatch,
+                static_cast<uint64_t>(commands.size()),
+                "the backend should retain the mixed-wrap linear batch size");
             t.Equals(statistics.gpuRequestsFailed, 0ull,
                      "the exact strict linear batch should not fail");
             const GsVulkanServiceStatistics serviceStatistics =
                 backend->serviceStatistics();
-            t.Equals(serviceStatistics.linearCt32SpriteDrawsCompleted,
-                     2ull,
-                     "the resident executor should complete both linear draws");
+            t.Equals(
+                serviceStatistics.linearCt32SpriteDrawsCompleted,
+                static_cast<uint64_t>(commands.size()),
+                "the resident executor should complete every linear draw");
             t.Equals(
                 serviceStatistics.residentLinearCt32SpriteBatchesCompleted,
                 1ull,
                 "strict should execute one resident linear service batch");
-            t.Equals(serviceStatistics.largestResidentLinearCt32SpriteBatch,
-                     2ull,
-                     "the service should retain the two-draw linear batch size");
+            t.Equals(
+                serviceStatistics.largestResidentLinearCt32SpriteBatch,
+                static_cast<uint64_t>(commands.size()),
+                "the service should retain the mixed-wrap linear batch size");
             t.Equals(serviceStatistics.nearestCt32SpriteDrawsCompleted,
                      0ull,
                      "strict linear routing must not alias nearest textures");
@@ -3709,7 +3726,11 @@ void register_ps2_gs_vulkan_tests()
             t.IsTrue(backend->setMode(GsRendererMode::Hybrid),
                      "a synchronized strict backend should enter Hybrid");
             t.IsFalse(backend->classify(commands.front()).supported,
-                      "Hybrid should remain closed until linear cost qualification");
+                      "Hybrid should keep the small repeat fixture on software");
+            t.Equals(
+                backend->classify(commands.back()).reason,
+                GsFallbackReason::UnsupportedTextureWrap,
+                "Hybrid clamp should remain closed until cost qualification");
 
             std::vector<uint8_t> unavailableVram = initial;
             std::unique_ptr<GsVulkanRasterBackend> unavailable =
