@@ -634,7 +634,7 @@ namespace
         drawFlatCt32Triangle(gs, rawX, rawY, rgba);
     }
 
-    void drawNearestCt32SpriteCommand(
+    void configureNearestCt32SpriteCommand(
         GS &gs,
         const GsDrawCommand &command)
     {
@@ -697,23 +697,37 @@ namespace
         gs.writeRegister(GS_REG_MIPTBP2_1, context.miptbp2);
         gs.writeRegister(GS_REG_CLAMP_1, context.clamp);
         gs.writeRegister(GS_REG_PRIM, prim);
+    }
+
+    void writeNearestCt32SpriteVertex(
+        GS &gs,
+        const GSVertex &vertex)
+    {
+        const uint32_t rgba =
+            static_cast<uint32_t>(vertex.r) |
+            (static_cast<uint32_t>(vertex.g) << 8u) |
+            (static_cast<uint32_t>(vertex.b) << 16u) |
+            (static_cast<uint32_t>(vertex.a) << 24u);
+        const uint64_t uv =
+            static_cast<uint64_t>(vertex.u) |
+            (static_cast<uint64_t>(vertex.v) << 16u);
+        gs.writeRegister(GS_REG_RGBAQ, rgba);
+        gs.writeRegister(GS_REG_UV, uv);
+        gs.writeRegister(
+            GS_REG_XYZ2,
+            packXyz2(vertex.x12_4, vertex.y12_4,
+                     vertex.zInteger));
+    }
+
+    void drawNearestCt32SpriteCommand(
+        GS &gs,
+        const GsDrawCommand &command)
+    {
+        configureNearestCt32SpriteCommand(gs, command);
         for (size_t index = 0u; index < command.vertexCount(); ++index)
         {
-            const GSVertex &vertex = command.vertices()[index];
-            const uint32_t rgba =
-                static_cast<uint32_t>(vertex.r) |
-                (static_cast<uint32_t>(vertex.g) << 8u) |
-                (static_cast<uint32_t>(vertex.b) << 16u) |
-                (static_cast<uint32_t>(vertex.a) << 24u);
-            const uint64_t uv =
-                static_cast<uint64_t>(vertex.u) |
-                (static_cast<uint64_t>(vertex.v) << 16u);
-            gs.writeRegister(GS_REG_RGBAQ, rgba);
-            gs.writeRegister(GS_REG_UV, uv);
-            gs.writeRegister(
-                GS_REG_XYZ2,
-                packXyz2(vertex.x12_4, vertex.y12_4,
-                         vertex.zInteger));
+            writeNearestCt32SpriteVertex(
+                gs, command.vertices()[index]);
         }
     }
 
@@ -4586,6 +4600,316 @@ void register_ps2_gs_vulkan_tests()
                      "integrated texture Verify should remain validation-clean");
             t.Equals(service.validationWarnings, 0u,
                      "integrated texture Verify should emit no validation warnings");
+        });
+
+        tc.Run("GS Vulkan nearest CT32 Verify survives every frame checkpoint", [](TestCase &t)
+        {
+            GSMem::InitLookupTables();
+            constexpr uint32_t framebufferPage = 40u;
+            constexpr uint32_t framebufferBlock = framebufferPage * 32u;
+            constexpr uint32_t textureBlock = 64u;
+            constexpr uint32_t bufferWidth = 2u;
+            const GsDrawCommand command = makeNearestCt32SpriteCommand(
+                95u, framebufferPage, bufferWidth,
+                textureBlock, bufferWidth, 6u, 5u,
+                {6u, 15u, 5u, 12u}, {32u, 16u},
+                {352u, 96u}, {48u, 304u},
+                {480u, 224u}, {64u, 320u});
+            GsVulkanNearestCt32Sprite prepared{};
+            t.IsTrue(
+                prepareGsVulkanNearestCt32Sprite(
+                    command, prepared).supported,
+                "the transition fixture should satisfy the nearest texture predicate");
+
+            std::vector<uint8_t> softwareVram =
+                makeVramPattern(0x54584350u);
+            std::vector<uint8_t> acceleratedVram = softwareVram;
+            GSRegisters softwareRegisters{};
+            GSRegisters acceleratedRegisters{};
+            configureCt32Display(
+                softwareRegisters, framebufferPage, 64u, 32u);
+            configureCt32Display(
+                acceleratedRegisters, framebufferPage, 64u, 32u);
+            GS software;
+            GS accelerated;
+            software.init(
+                softwareVram.data(),
+                static_cast<uint32_t>(softwareVram.size()),
+                &softwareRegisters);
+            accelerated.init(
+                acceleratedVram.data(),
+                static_cast<uint32_t>(acceleratedVram.size()),
+                &acceleratedRegisters);
+
+            GsVulkanCapabilityReport preflight{};
+            const GsVulkanServiceConfig config =
+                makeRendererServiceConfig(preflight);
+            ScopedArtifactDirectory artifacts;
+            t.IsTrue(accelerated.configureVulkanRenderer(
+                         config, artifacts.path.string()),
+                     "the transition fixture should accept Vulkan configuration");
+            if (!preflight.ready())
+            {
+                t.IsFalse(accelerated.setRendererMode(
+                              GsRendererMode::Verify),
+                          "an unavailable host should skip texture checkpoints cleanly");
+                return;
+            }
+            const GsVulkanDeviceReport *selected =
+                preflight.selectedDevice();
+            t.IsNotNull(selected,
+                        "a ready checkpoint preflight should select one device");
+            if (!selected)
+                return;
+            t.IsTrue(selected->exactNearestCt32Sprite,
+                     "the checkpoint device should expose the exact texture kernel");
+            if (!selected->exactNearestCt32Sprite)
+                return;
+
+            t.IsTrue(accelerated.setRendererMode(
+                         GsRendererMode::Verify),
+                     "the qualified host should create texture Verify checkpoints");
+            if (accelerated.rendererMode() != GsRendererMode::Verify)
+                return;
+            accelerated.setBackendCountersEnabled(true);
+            accelerated.resetBackendCounters();
+
+            const auto compareFullVram = [&](const char *boundary) -> bool
+            {
+                const auto difference = std::mismatch(
+                    softwareVram.begin(), softwareVram.end(),
+                    acceleratedVram.begin(), acceleratedVram.end());
+                if (difference.first == softwareVram.end())
+                    return true;
+                const size_t byteOffset = static_cast<size_t>(
+                    difference.first - softwareVram.begin());
+                t.IsTrue(
+                    false,
+                    std::string("texture Verify VRAM mismatch after ") +
+                        boundary + ", byte " +
+                        std::to_string(byteOffset) + ", page " +
+                        std::to_string(
+                            byteOffset / GS_VRAM_PAGE_SIZE));
+                return false;
+            };
+
+            drawNearestCt32SpriteCommand(software, command);
+            drawNearestCt32SpriteCommand(accelerated, command);
+            if (!compareFullVram("initial eligible draw"))
+                return;
+
+            drawFlatCt32Point(
+                software, 10u * 16u + 32u,
+                8u * 16u + 16u, 0xC0112233u);
+            drawFlatCt32Point(
+                accelerated, 10u * 16u + 32u,
+                8u * 16u + 16u, 0xC0112233u);
+            if (!compareFullVram("eligible to fallback adjacency"))
+                return;
+            drawNearestCt32SpriteCommand(software, command);
+            drawNearestCt32SpriteCommand(accelerated, command);
+            if (!compareFullVram("eligible fallback eligible adjacency"))
+                return;
+
+            constexpr std::array<uint32_t, 4> sourcePixels{{
+                0xD0010203u,
+                0xD1040506u,
+                0xD2070809u,
+                0xD30A0B0Cu,
+            }};
+            uploadCt32Pixels(
+                software, textureBlock, bufferWidth,
+                16u, 7u, sourcePixels);
+            uploadCt32Pixels(
+                accelerated, textureBlock, bufferWidth,
+                16u, 7u, sourcePixels);
+            drawNearestCt32SpriteCommand(software, command);
+            drawNearestCt32SpriteCommand(accelerated, command);
+
+            const std::vector<uint8_t> softwareReadback =
+                readCt32Pixels(
+                    software, framebufferBlock, bufferWidth,
+                    prepared.boundsX0, prepared.boundsY0, 3u, 2u);
+            const std::vector<uint8_t> acceleratedReadback =
+                readCt32Pixels(
+                    accelerated, framebufferBlock, bufferWidth,
+                    prepared.boundsX0, prepared.boundsY0, 3u, 2u);
+            t.IsTrue(acceleratedReadback == softwareReadback,
+                     "the destination readback should match after the source upload");
+            t.Equals(
+                GSMem::ReadCT32(
+                    acceleratedVram.data(), framebufferBlock,
+                    bufferWidth, prepared.boundsX0,
+                    prepared.boundsY0),
+                sourcePixels[0],
+                "the verified draw should consume the newly uploaded source texel");
+            if (!compareFullVram("source upload and destination readback"))
+                return;
+
+            drawNearestCt32SpriteCommand(software, command);
+            drawNearestCt32SpriteCommand(accelerated, command);
+            software.writeRegister(GS_REG_FINISH, 0u);
+            accelerated.writeRegister(GS_REG_FINISH, 0u);
+            if (!compareFullVram("FINISH"))
+                return;
+
+            software.latchHostPresentationFrame();
+            accelerated.latchHostPresentationFrame();
+            std::vector<uint8_t> softwareFrame;
+            std::vector<uint8_t> acceleratedFrame;
+            uint32_t softwareWidth = 0u;
+            uint32_t softwareHeight = 0u;
+            uint32_t acceleratedWidth = 0u;
+            uint32_t acceleratedHeight = 0u;
+            t.IsTrue(
+                software.copyLatchedHostPresentationFrame(
+                    softwareFrame, softwareWidth, softwareHeight),
+                "the software checkpoint should publish one host frame");
+            t.IsTrue(
+                accelerated.copyLatchedHostPresentationFrame(
+                    acceleratedFrame,
+                    acceleratedWidth, acceleratedHeight),
+                "texture Verify should publish one host frame");
+            t.Equals(acceleratedWidth, softwareWidth,
+                     "texture Verify should preserve the frame width");
+            t.Equals(acceleratedHeight, softwareHeight,
+                     "texture Verify should preserve the frame height");
+            t.IsTrue(acceleratedFrame == softwareFrame,
+                     "texture Verify presentation bytes should match software");
+            if (!compareFullVram("presentation latch"))
+                return;
+
+            configureNearestCt32SpriteCommand(software, command);
+            configureNearestCt32SpriteCommand(accelerated, command);
+            writeNearestCt32SpriteVertex(
+                software, command.vertices()[0]);
+            writeNearestCt32SpriteVertex(
+                accelerated, command.vertices()[0]);
+            const GsReplayState softwareState =
+                software.captureReplayState();
+            const GsReplayState acceleratedState =
+                accelerated.captureReplayState();
+            t.Equals(softwareState.vertexCount, 1,
+                     "the software checkpoint should retain one sprite vertex");
+            t.Equals(acceleratedState.vertexCount, 1,
+                     "the Vulkan checkpoint should retain one sprite vertex");
+            std::vector<uint8_t> softwareEncoded;
+            std::vector<uint8_t> acceleratedEncoded;
+            std::string stateError;
+            t.IsTrue(
+                encodeGsReplayState(
+                    softwareState, softwareEncoded, &stateError),
+                "the software texture checkpoint should encode");
+            t.IsTrue(
+                encodeGsReplayState(
+                    acceleratedState, acceleratedEncoded, &stateError),
+                "the Vulkan texture checkpoint should encode");
+            t.IsTrue(acceleratedEncoded == softwareEncoded,
+                     "Verify should preserve the exact canonical frontend state");
+
+            software.writeRegister(
+                GS_REG_PRIM,
+                static_cast<uint64_t>(GS_PRIM_POINT));
+            accelerated.writeRegister(
+                GS_REG_PRIM,
+                static_cast<uint64_t>(GS_PRIM_POINT));
+            t.IsTrue(software.restoreReplayState(softwareState),
+                     "the software texture checkpoint should restore");
+            t.IsTrue(accelerated.restoreReplayState(acceleratedState),
+                     "the Vulkan texture checkpoint should restore");
+            writeNearestCt32SpriteVertex(
+                software, command.vertices()[1]);
+            writeNearestCt32SpriteVertex(
+                accelerated, command.vertices()[1]);
+            (void)software.getDebugSnapshot();
+            (void)accelerated.getDebugSnapshot();
+            if (!compareFullVram("exact-state restore"))
+                return;
+
+            software.reset();
+            accelerated.reset();
+            t.Equals(accelerated.rendererMode(), GsRendererMode::Verify,
+                     "reset should preserve the texture Verify service and mode");
+            drawNearestCt32SpriteCommand(software, command);
+            drawNearestCt32SpriteCommand(accelerated, command);
+            (void)software.getDebugSnapshot();
+            (void)accelerated.getDebugSnapshot();
+            if (!compareFullVram("post-reset draw"))
+                return;
+
+            const GsBackendCounters counters =
+                accelerated.backendCounters();
+            t.Equals(counters.commands, 7ull,
+                     "the checkpoint stream should assemble six textures and one point");
+            t.Equals(counters.acceleratedCommands, 6ull,
+                     "every eligible texture should reach Verify");
+            t.Equals(counters.verifiedCommands, 6ull,
+                     "every accelerated texture should compare completely");
+            t.Equals(counters.softwareCommands, 1ull,
+                     "only the unsupported point should use software");
+            t.Equals(counters.fallbackCommands, 1ull,
+                     "the unsupported point should remain explicit fallback");
+            t.Equals(counters.backendSwitches, 2ull,
+                     "the eligible fallback eligible run should cross both backends");
+            t.Equals(
+                counters.decisions[static_cast<size_t>(
+                    GsFallbackReason::UnsupportedPrimitive)],
+                1ull,
+                "the fallback should retain the point reason");
+            t.IsTrue(
+                counters.flushReasons[static_cast<size_t>(
+                    GsFlushReason::Transfer)] >= 1ull,
+                "the source upload should retain a transfer boundary");
+            t.IsTrue(
+                counters.flushReasons[static_cast<size_t>(
+                    GsFlushReason::CpuReadback)] >= 1ull,
+                "the destination readback should retain its named boundary");
+            t.IsTrue(
+                counters.flushReasons[static_cast<size_t>(
+                    GsFlushReason::Finish)] >= 1ull,
+                "FINISH should remain an explicit checkpoint");
+            t.IsTrue(
+                counters.flushReasons[static_cast<size_t>(
+                    GsFlushReason::PresentationLatch)] >= 1ull,
+                "presentation should remain an explicit checkpoint");
+            t.IsTrue(
+                counters.flushReasons[static_cast<size_t>(
+                    GsFlushReason::SaveLoad)] >= 2ull,
+                "capture and restore should each cross the save-state boundary");
+            t.IsTrue(
+                counters.flushReasons[static_cast<size_t>(
+                    GsFlushReason::Reset)] >= 1ull,
+                "reset should retain its named boundary");
+
+            const GsVulkanRasterBackendStatistics backend =
+                accelerated.vulkanRendererBackendStatistics();
+            t.Equals(backend.commandsCompleted, 6ull,
+                     "all six texture checkpoints should complete once");
+            t.Equals(backend.verifiedCommands, 6ull,
+                     "all six texture checkpoints should remain verified");
+            t.Equals(
+                backend.bytesCompared,
+                6ull * static_cast<uint64_t>(GS_VULKAN_VRAM_SIZE),
+                "each texture checkpoint should compare all 4 MiB");
+            t.Equals(backend.verificationMismatches, 0ull,
+                     "no texture checkpoint should disagree");
+            const GsVulkanServiceStatistics service =
+                accelerated.vulkanRendererServiceStatistics();
+            t.Equals(service.nearestCt32SpriteDrawsCompleted, 6ull,
+                     "the service should execute every eligible texture once");
+            t.Equals(service.nearestCt32SpriteDrawsFailed, 0ull,
+                     "no texture checkpoint should fail execution");
+            t.Equals(
+                service.nearestCt32SpritePixelsExecuted,
+                6ull * static_cast<uint64_t>(
+                    prepared.boundsX1 - prepared.boundsX0) *
+                    static_cast<uint64_t>(
+                        prepared.boundsY1 - prepared.boundsY0),
+                "the checkpoint stream should retain exact pixel accounting");
+            t.Equals(service.validationErrors, 0u,
+                     "texture checkpoints should remain validation-clean");
+            t.Equals(service.validationWarnings, 0u,
+                     "texture checkpoints should emit no validation warnings");
         });
 
         tc.Run("GS Vulkan verify and hybrid preserve fallback transfer ordering", [](TestCase &t)
