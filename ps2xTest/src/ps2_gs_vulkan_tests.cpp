@@ -727,10 +727,11 @@ namespace
                 return false;
             }
 
-            output.assign(input.begin(), input.end());
+            residentVram.assign(input.begin(), input.end());
             if (behavior == Behavior::Exact)
-                applyCt32SpriteCpu(output, sprite);
-            else if (behavior == Behavior::InvalidOutput)
+                applyCt32SpriteCpu(residentVram, sprite);
+            output = residentVram;
+            if (behavior == Behavior::InvalidOutput)
                 output.resize(1u);
             ++serviceStatistics.spriteDrawsCompleted;
             ++serviceStatistics.queueSubmissions;
@@ -758,10 +759,11 @@ namespace
                 return false;
             }
 
-            output.assign(input.begin(), input.end());
+            residentVram.assign(input.begin(), input.end());
             if (behavior == Behavior::Exact)
-                applyCt32TriangleCpu(output, triangle);
-            else if (behavior == Behavior::InvalidOutput)
+                applyCt32TriangleCpu(residentVram, triangle);
+            output = residentVram;
+            if (behavior == Behavior::InvalidOutput)
                 output.resize(1u);
             ++serviceStatistics.triangleDrawsCompleted;
             serviceStatistics.triangleCandidatePixelsExecuted +=
@@ -1574,7 +1576,7 @@ void register_ps2_gs_vulkan_tests()
                      "shutdown should leave no accepted resident work");
         });
 
-        tc.Run("Vulkan raster backend verifies exact triangles only behind capability", [](TestCase &t)
+        tc.Run("Vulkan raster backend routes exact triangles behind capability", [](TestCase &t)
         {
             GSMem::InitLookupTables();
             const GsDrawCommand command = makeCt32TriangleCommand(
@@ -1649,9 +1651,34 @@ void register_ps2_gs_vulkan_tests()
                      "Hybrid must not expose the unqualified triangle class");
             t.IsTrue(backend->setMode(GsRendererMode::GpuStrict),
                      "the synchronized backend should accept strict mode");
-            t.Equals(backend->classify(command).reason,
-                     GsFallbackReason::UnsupportedPrimitive,
-                     "strict mode must retain the existing triangle rejection");
+            t.IsTrue(backend->classify(command).supported,
+                     "strict mode should expose the exhaustively qualified class");
+            backend->submit(
+                std::span<const GsDrawCommand>(&command, 1u));
+            t.Equals(backend->pendingCommandCount(), size_t{1u},
+                     "strict triangles should enter the resident queue");
+            backend->flush(GsFlushReason::Explicit);
+            t.Equals(backend->pendingCommandCount(), size_t{0u},
+                     "an explicit checkpoint should drain the triangle queue");
+            backend->prepareCpuVramAccess(
+                command.resources().writePages,
+                GsFlushReason::CpuReadback);
+            t.IsTrue(vram == expected,
+                     "strict resident execution should preserve exact VRAM");
+            t.Equals(softwareCalls, 1ull,
+                     "strict triangle execution must not call the software oracle");
+            const GsVulkanRasterBackendStatistics strictStatistics =
+                backend->backendStatistics();
+            t.Equals(strictStatistics.committedGpuCommands, 1ull,
+                     "the strict triangle should commit one resident command");
+            t.Equals(strictStatistics.residentBatchesCompleted, 1ull,
+                     "the strict triangle should complete one resident batch");
+            const GsVulkanServiceStatistics strictService =
+                backend->serviceStatistics();
+            t.Equals(strictService.triangleDrawsCompleted, 2ull,
+                     "Verify and strict should use the triangle pipeline once each");
+            t.Equals(strictService.residentTriangleBatchesCompleted, 1ull,
+                     "strict should use the resident triangle request");
 
             std::vector<uint8_t> unavailableVram = initial;
             std::unique_ptr<GsVulkanRasterBackend> unavailable =
@@ -1664,9 +1691,11 @@ void register_ps2_gs_vulkan_tests()
                         "a base-capable executor should remain generally usable");
             if (unavailable)
             {
+                t.IsTrue(unavailable->setMode(GsRendererMode::GpuStrict),
+                         "the base service should still enter strict mode");
                 t.Equals(unavailable->classify(command).reason,
                          GsFallbackReason::BackendUnavailable,
-                         "missing shaderInt64 should produce a named fallback");
+                         "strict should name the missing triangle capability");
                 t.IsTrue(unavailableVram == initial,
                          "capability classification must not mutate VRAM");
                 t.Equals(
@@ -1674,6 +1703,110 @@ void register_ps2_gs_vulkan_tests()
                     0ull,
                     "capability fallback must not post triangle work");
             }
+        });
+
+        tc.Run("Vulkan strict backend splits resident pipeline classes", [](TestCase &t)
+        {
+            GSMem::InitLookupTables();
+            const GsDrawCommand sprite = makeCt32SpriteCommand(
+                51u, 5u, 1u,
+                {0u, 31u, 0u, 31u}, {0u, 0u},
+                2u * 16u, 3u * 16u,
+                12u * 16u, 14u * 16u,
+                0x44332211u);
+            const GsDrawCommand firstTriangle = makeCt32TriangleCommand(
+                52u, 41u, 1u,
+                {0u, 31u, 0u, 31u}, {0u, 0u},
+                {3u * 16u + 1u, 24u * 16u + 7u, 7u * 16u + 3u},
+                {4u * 16u + 5u, 9u * 16u + 1u, 26u * 16u + 9u},
+                0x88776655u);
+            const GsDrawCommand secondTriangle = makeCt32TriangleCommand(
+                53u, 197u, 1u,
+                {0u, 31u, 0u, 31u}, {0u, 0u},
+                {5u * 16u + 2u, 27u * 16u + 6u, 11u * 16u + 14u},
+                {2u * 16u + 3u, 12u * 16u + 11u, 28u * 16u + 4u},
+                0xCCBBAA99u);
+
+            GsVulkanCt32Sprite preparedSprite{};
+            GsVulkanCt32Triangle preparedFirst{};
+            GsVulkanCt32Triangle preparedSecond{};
+            t.IsTrue(prepareGsVulkanCt32Sprite(
+                         sprite, preparedSprite).supported,
+                     "the strict sprite fixture should be eligible");
+            t.IsTrue(prepareGsVulkanCt32Triangle(
+                         firstTriangle, preparedFirst).supported,
+                     "the first strict triangle fixture should be eligible");
+            t.IsTrue(prepareGsVulkanCt32Triangle(
+                         secondTriangle, preparedSecond).supported,
+                     "the second strict triangle fixture should be eligible");
+
+            std::vector<uint8_t> vram = makeVramPattern(0x53545231u);
+            std::vector<uint8_t> expected = vram;
+            applyCt32SpriteCpu(expected, preparedSprite);
+            applyCt32TriangleCpu(expected, preparedFirst);
+            applyCt32TriangleCpu(expected, preparedSecond);
+            uint64_t softwareCalls = 0u;
+            uint64_t committedCalls = 0u;
+            GsVulkanRasterBackendConfig config{};
+            config.mode = GsRendererMode::GpuStrict;
+            std::unique_ptr<GsVulkanRasterBackend> backend =
+                GsVulkanRasterBackend::createWithExecutor(
+                    std::make_unique<FakeCt32Executor>(
+                        FakeCt32Executor::Behavior::Exact),
+                    config, vram,
+                    [&](const GsDrawCommand &) { ++softwareCalls; },
+                    [&](const GsDrawCommand &) { ++committedCalls; },
+                    nullptr);
+            t.IsNotNull(backend.get(),
+                        "an exact executor should create strict mixed routing");
+            if (!backend)
+                return;
+
+            backend->submit(
+                std::span<const GsDrawCommand>(&sprite, 1u));
+            t.Equals(backend->pendingCommandCount(), size_t{1u},
+                     "the sprite should begin one homogeneous batch");
+            backend->submit(
+                std::span<const GsDrawCommand>(&firstTriangle, 1u));
+            t.Equals(backend->pendingCommandCount(), size_t{1u},
+                     "a pipeline change should drain then queue the triangle");
+            backend->submit(
+                std::span<const GsDrawCommand>(&secondTriangle, 1u));
+            t.Equals(backend->pendingCommandCount(), size_t{2u},
+                     "same-pipeline disjoint triangles should batch together");
+            backend->flush(GsFlushReason::Explicit);
+            GsVramPageMask affected = sprite.resources().writePages;
+            affected.unionWith(firstTriangle.resources().writePages);
+            affected.unionWith(secondTriangle.resources().writePages);
+            backend->prepareCpuVramAccess(
+                affected, GsFlushReason::CpuReadback);
+
+            t.IsTrue(vram == expected,
+                     "split strict batches should match sequential CPU records");
+            t.Equals(softwareCalls, 0ull,
+                     "strict mixed routing must not call the software oracle");
+            t.Equals(committedCalls, 3ull,
+                     "every completed resident draw should publish its commit callback");
+            const GsVulkanRasterBackendStatistics statistics =
+                backend->backendStatistics();
+            t.Equals(statistics.pipelineChangeDrains, 1ull,
+                     "sprite-to-triangle should retain its explicit drain reason");
+            t.Equals(statistics.resourceHazardDrains, 0ull,
+                     "disjoint class changes should not be mislabeled as hazards");
+            t.Equals(statistics.residentBatchesCompleted, 2ull,
+                     "the two homogeneous classes should use two backend batches");
+            t.Equals(statistics.largestResidentBatch, 2ull,
+                     "the triangle suffix should establish the peak batch size");
+            const GsVulkanServiceStatistics service =
+                backend->serviceStatistics();
+            t.Equals(service.residentSpriteBatchesCompleted, 1ull,
+                     "the sprite prefix should use one sprite service batch");
+            t.Equals(service.residentTriangleBatchesCompleted, 1ull,
+                     "the triangle suffix should use one triangle service batch");
+            t.Equals(service.spriteDrawsCompleted, 1ull,
+                     "the sprite pipeline should execute one draw");
+            t.Equals(service.triangleDrawsCompleted, 2ull,
+                     "the triangle pipeline should execute two draws");
         });
 
         tc.Run("Vulkan hybrid backend keeps disjoint pages resident until scoped CPU access", [](TestCase &t)
@@ -3222,7 +3355,7 @@ void register_ps2_gs_vulkan_tests()
                      "integrated transitions should emit no validation warnings");
         });
 
-        tc.Run("GS Vulkan routes flat CT32 triangles through Verify only", [](TestCase &t)
+        tc.Run("GS Vulkan routes qualified flat CT32 triangles by mode", [](TestCase &t)
         {
             GSMem::InitLookupTables();
             std::vector<uint8_t> softwareVram =
@@ -3360,6 +3493,56 @@ void register_ps2_gs_vulkan_tests()
                      "integrated triangle routing should remain validation-clean");
             t.Equals(finalService.validationWarnings, 0u,
                      "integrated triangle routing should emit no validation warnings");
+
+            if (exactTriangle)
+            {
+                t.IsTrue(accelerated.setRendererMode(
+                             GsRendererMode::GpuStrict),
+                         "the qualified host should enter strict triangle mode");
+                accelerated.resetBackendCounters();
+                constexpr std::array<uint16_t, 3> thirdX{{
+                    61u * 16u + 1u,
+                    83u * 16u + 13u,
+                    67u * 16u + 9u,
+                }};
+                constexpr std::array<uint16_t, 3> thirdY{{
+                    31u * 16u + 5u,
+                    37u * 16u + 3u,
+                    55u * 16u + 15u,
+                }};
+                drawFlatCt32Triangle(
+                    software, thirdX, thirdY, 0xC4B3A291u);
+                drawFlatCt32Triangle(
+                    accelerated, thirdX, thirdY, 0xC4B3A291u);
+                (void)software.getDebugSnapshot();
+                (void)accelerated.getDebugSnapshot();
+                t.IsTrue(acceleratedVram == softwareVram,
+                         "strict triangle routing should match complete software VRAM");
+                const GsBackendCounters strictCounters =
+                    accelerated.backendCounters();
+                t.Equals(strictCounters.acceleratedCommands, 1ull,
+                         "strict should accelerate the qualified triangle");
+                t.Equals(strictCounters.softwareCommands, 0ull,
+                         "strict should not execute the qualified triangle in software");
+                t.Equals(strictCounters.strictFailures, 0ull,
+                         "the qualified strict triangle should not fail routing");
+                const GsVulkanRasterBackendStatistics strictBackend =
+                    accelerated.vulkanRendererBackendStatistics();
+                t.Equals(strictBackend.committedGpuCommands, 1ull,
+                         "strict should commit one resident triangle");
+                t.Equals(strictBackend.residentBatchesCompleted, 1ull,
+                         "the strict checkpoint should drain one triangle batch");
+                const GsVulkanServiceStatistics strictService =
+                    accelerated.vulkanRendererServiceStatistics();
+                t.Equals(strictService.triangleDrawsCompleted, 2ull,
+                         "Verify and strict should each complete one triangle");
+                t.Equals(strictService.residentTriangleBatchesCompleted, 1ull,
+                         "strict should reach the resident triangle request");
+                t.Equals(strictService.validationErrors, 0u,
+                         "strict triangle routing should remain validation-clean");
+                t.Equals(strictService.validationWarnings, 0u,
+                         "strict triangle routing should emit no validation warnings");
+            }
         });
 
         tc.Run("GS Vulkan hybrid scopes host transfers and readbacks to overlapping pages", [](TestCase &t)

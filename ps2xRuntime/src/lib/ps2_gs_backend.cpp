@@ -506,6 +506,7 @@ namespace
         case GsFlushReason::BackendSwitch:
         case GsFlushReason::QueueBackpressure:
         case GsFlushReason::ResourceHazard:
+        case GsFlushReason::PipelineChange:
         case GsFlushReason::Transfer:
         case GsFlushReason::CpuReadback:
         case GsFlushReason::FeedbackSnapshot:
@@ -1185,6 +1186,7 @@ std::string_view gsFlushReasonName(GsFlushReason reason) noexcept
     case GsFlushReason::Shutdown: return "shutdown";
     case GsFlushReason::QueueBackpressure: return "queue-backpressure";
     case GsFlushReason::ResourceHazard: return "resource-hazard";
+    case GsFlushReason::PipelineChange: return "pipeline-change";
     case GsFlushReason::Count: break;
     }
     return "unknown";

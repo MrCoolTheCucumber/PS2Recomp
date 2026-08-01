@@ -168,6 +168,7 @@ enum class GsFlushReason : uint8_t
     Shutdown,
     QueueBackpressure,
     ResourceHazard,
+    PipelineChange,
     Count,
 };
 

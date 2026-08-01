@@ -39,6 +39,7 @@ struct GsVulkanRasterBackendStatistics
     uint64_t largestResidentBatch = 0u;
     uint64_t resourceHazardDrains = 0u;
     uint64_t queueBackpressureDrains = 0u;
+    uint64_t pipelineChangeDrains = 0u;
     uint64_t cpuAccessPreparations = 0u;
     GsVramCoherencySummary pageOwnership{};
     GsVramCoherencyStatistics coherency{};

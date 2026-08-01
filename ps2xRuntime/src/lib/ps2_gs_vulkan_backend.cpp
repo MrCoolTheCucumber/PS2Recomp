@@ -441,7 +441,9 @@ struct GsVulkanRasterBackend::Impl final
     {
         GsDrawCommand command;
         GsVulkanCt32Sprite sprite;
+        GsVulkanCt32Triangle triangle;
         GsDrawResources resources;
+        bool isTriangle = false;
     };
 
     std::unique_ptr<IGsVulkanDrawExecutor> executor;
@@ -530,13 +532,31 @@ struct GsVulkanRasterBackend::Impl final
             ++statistics.resourceHazardDrains;
         else if (reason == GsFlushReason::QueueBackpressure)
             ++statistics.queueBackpressureDrains;
+        else if (reason == GsFlushReason::PipelineChange)
+            ++statistics.pipelineChangeDrains;
 
+        const bool triangleBatch =
+            pendingResidentCommands.front().isTriangle;
         std::vector<GsVulkanCt32Sprite> sprites;
-        sprites.reserve(commandCount);
+        std::vector<GsVulkanCt32Triangle> triangles;
+        if (triangleBatch)
+            triangles.reserve(commandCount);
+        else
+            sprites.reserve(commandCount);
         for (const PendingResidentCommand &pending :
              pendingResidentCommands)
         {
-            sprites.push_back(pending.sprite);
+            if (pending.isTriangle != triangleBatch)
+            {
+                clearPendingResidentCommands();
+                failRequest(
+                    "resident CT32 batch assembly",
+                    "mixed pipelines reached a homogeneous service batch");
+            }
+            if (triangleBatch)
+                triangles.push_back(pending.triangle);
+            else
+                sprites.push_back(pending.sprite);
         }
 
         try
@@ -553,8 +573,12 @@ struct GsVulkanRasterBackend::Impl final
         }
 
         std::string executionError;
-        if (!executor->executeResidentCt32Sprites(
-                sprites, &executionError))
+        const bool executed = triangleBatch
+            ? executor->executeResidentCt32Triangles(
+                  triangles, &executionError)
+            : executor->executeResidentCt32Sprites(
+                  sprites, &executionError);
+        if (!executed)
         {
             clearPendingResidentCommands();
             failRequest(
@@ -734,7 +758,8 @@ GsBackendDecision GsVulkanRasterBackend::classify(
         return decision;
     }
 
-    if (m_impl->config.mode != GsRendererMode::Verify ||
+    if ((m_impl->config.mode != GsRendererMode::Verify &&
+         m_impl->config.mode != GsRendererMode::GpuStrict) ||
         command.primitive().type != GS_PRIM_TRIANGLE)
     {
         return decision;
@@ -771,7 +796,6 @@ void GsVulkanRasterBackend::submit(
         GsVulkanCt32Sprite sprite{};
         GsVulkanCt32Triangle triangle{};
         const bool isTriangle =
-            m_impl->config.mode == GsRendererMode::Verify &&
             command.primitive().type == GS_PRIM_TRIANGLE;
         if (isTriangle)
             (void)prepareGsVulkanCt32Triangle(command, triangle);
@@ -872,6 +896,13 @@ void GsVulkanRasterBackend::submit(
         {
             GsVramPageMask accessPages = resources.readPages;
             accessPages.unionWith(resources.writePages);
+            if (!m_impl->pendingResidentCommands.empty() &&
+                m_impl->pendingResidentCommands.front().isTriangle !=
+                    isTriangle)
+            {
+                m_impl->drainPendingResidentCommands(
+                    GsFlushReason::PipelineChange);
+            }
             if (m_impl->pendingResidentAccessPages.intersects(
                     accessPages))
             {
@@ -886,7 +917,7 @@ void GsVulkanRasterBackend::submit(
             }
 
             m_impl->pendingResidentCommands.push_back(
-                {command, sprite, resources});
+                {command, sprite, triangle, resources, isTriangle});
             m_impl->pendingResidentAccessPages.unionWith(accessPages);
         }
         if (m_impl->config.mode == GsRendererMode::Verify)

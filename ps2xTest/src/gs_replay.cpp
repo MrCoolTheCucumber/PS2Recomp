@@ -443,6 +443,8 @@ namespace
                << statistics.resourceHazardDrains
                << ",\"queue_backpressure_drains\":"
                << statistics.queueBackpressureDrains
+               << ",\"pipeline_change_drains\":"
+               << statistics.pipelineChangeDrains
                << ",\"cpu_access_preparations\":"
                << statistics.cpuAccessPreparations
                << ",\"page_ownership\":{\"synchronized_pages\":"
