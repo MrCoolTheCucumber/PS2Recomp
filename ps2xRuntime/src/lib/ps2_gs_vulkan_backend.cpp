@@ -1135,7 +1135,8 @@ GsBackendDecision GsVulkanRasterBackend::classify(
             return textureDecision;
 
         const GsDrawResources resources = command.resources();
-        if ((m_impl->config.mode == GsRendererMode::Verify ||
+        if ((m_impl->config.mode == GsRendererMode::Hybrid ||
+             m_impl->config.mode == GsRendererMode::Verify ||
              m_impl->config.mode == GsRendererMode::GpuStrict) &&
             resources.framebufferTextureAlias)
         {
@@ -1212,6 +1213,61 @@ GsBackendDecision GsVulkanRasterBackend::classify(
     return triangleDecision;
 }
 
+GsHybridBatchPolicy GsVulkanRasterBackend::hybridBatchPolicy(
+    const GsDrawCommand &command) const noexcept
+{
+    if (m_impl->config.mode != GsRendererMode::Hybrid ||
+        m_impl->config.minimumHybridFeedbackLinearDepthCt32RunPixels == 0u ||
+        m_impl->shutDown || m_impl->failed ||
+        !m_impl->exactFeedbackLinearDepthCt32Sprite ||
+        !m_impl->feedbackSnapshot)
+    {
+        return {};
+    }
+
+    GsVulkanFeedbackLinearDepthCt32Sprite feedbackSprite{};
+    if (!prepareGsVulkanFeedbackLinearDepthCt32Sprite(
+             command, feedbackSprite).supported)
+    {
+        return {};
+    }
+    return {
+        m_impl->config.minimumHybridFeedbackLinearDepthCt32RunPixels,
+        m_impl->config.maximumResidentBatchCommands};
+}
+
+bool GsVulkanRasterBackend::hybridBatchCompatible(
+    const GsDrawCommand &first,
+    const GsDrawCommand &next) const noexcept
+{
+    if (m_impl->config.mode != GsRendererMode::Hybrid ||
+        m_impl->shutDown || m_impl->failed ||
+        !m_impl->exactFeedbackLinearDepthCt32Sprite ||
+        !m_impl->feedbackSnapshot)
+    {
+        return false;
+    }
+
+    GsVulkanFeedbackLinearDepthCt32Sprite firstSprite{};
+    GsVulkanFeedbackLinearDepthCt32Sprite nextSprite{};
+    if (!prepareGsVulkanFeedbackLinearDepthCt32Sprite(
+             first, firstSprite).supported ||
+        !prepareGsVulkanFeedbackLinearDepthCt32Sprite(
+             next, nextSprite).supported)
+    {
+        return false;
+    }
+
+    // These are exactly the surface fields used by the raster frontend to
+    // retain or invalidate its immutable feedback snapshot. Depth state,
+    // coordinates, and sampling DDA may vary within the same snapshot run.
+    return firstSprite.framebufferBaseBlock ==
+               nextSprite.framebufferBaseBlock &&
+           firstSprite.framebufferWidth == nextSprite.framebufferWidth &&
+           firstSprite.textureBaseBlock == nextSprite.textureBaseBlock &&
+           firstSprite.textureWidth == nextSprite.textureWidth;
+}
+
 void GsVulkanRasterBackend::submit(
     std::span<const GsDrawCommand> commands)
 {
@@ -1257,7 +1313,8 @@ void GsVulkanRasterBackend::submit(
                     command, texturedSprite);
             if (!textureDecision.supported)
             {
-                if ((m_impl->config.mode == GsRendererMode::Verify ||
+                if ((m_impl->config.mode == GsRendererMode::Hybrid ||
+                     m_impl->config.mode == GsRendererMode::Verify ||
                      m_impl->config.mode == GsRendererMode::GpuStrict) &&
                     resources.framebufferTextureAlias)
                 {

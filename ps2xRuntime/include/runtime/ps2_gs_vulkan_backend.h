@@ -36,6 +36,11 @@ struct GsVulkanRasterBackendConfig
     // Standard CLAMP is materially more expensive in the software oracle, so
     // it has a separately measured Hybrid crossover. Zero disables the policy.
     uint64_t minimumHybridLinearCt32ClampSpritePixels = 8'192u;
+    // Recursive feedback pays for one immutable 4 MiB snapshot per compatible
+    // frontend run. The default is the measured 16-draw title-shaped crossover,
+    // so admission is deferred and based on aggregate run pixels. Zero admits
+    // every semantically exact feedback draw immediately.
+    uint64_t minimumHybridFeedbackLinearDepthCt32RunPixels = 212'480u;
     // Triangle work is the conservative clipped bounding box dispatched by the
     // compute kernel, including samples rejected by its exact edge tests.
     uint64_t minimumHybridTriangleCandidatePixels = 32'768u;
@@ -73,8 +78,9 @@ class GsVulkanRasterBackend final : public IGsRasterBackend
 public:
     using DrawCallback = std::function<void(const GsDrawCommand &)>;
     // Verify invokes this synchronously once per admitted feedback draw;
-    // strict copies it once when opening a resident feedback batch. The caller
-    // owns the returned bytes and must keep them stable only for the callback.
+    // resident modes copy it once when opening an admitted feedback batch. The
+    // caller owns the returned bytes and must keep them stable only for the
+    // callback.
     using FeedbackSnapshotCallback =
         std::function<std::span<const uint8_t>()>;
 
@@ -111,6 +117,11 @@ public:
 
     [[nodiscard]] GsBackendDecision classify(
         const GsDrawCommand &command) const override;
+    [[nodiscard]] GsHybridBatchPolicy hybridBatchPolicy(
+        const GsDrawCommand &command) const noexcept override;
+    [[nodiscard]] bool hybridBatchCompatible(
+        const GsDrawCommand &first,
+        const GsDrawCommand &next) const noexcept override;
     void submit(std::span<const GsDrawCommand> commands) override;
     void flush(GsFlushReason reason) override;
     [[nodiscard]] size_t pendingCommandCount() const noexcept override;

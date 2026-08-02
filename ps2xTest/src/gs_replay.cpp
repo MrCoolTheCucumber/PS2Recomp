@@ -74,6 +74,7 @@ namespace
                "[--vulkan-min-hybrid-nearest-ct32-pixels COUNT] "
                "[--vulkan-min-hybrid-linear-ct32-pixels COUNT] "
                "[--vulkan-min-hybrid-linear-ct32-clamp-pixels COUNT] "
+               "[--vulkan-min-hybrid-feedback-ct32-run-pixels COUNT] "
                "[--vulkan-min-hybrid-triangle-pixels COUNT] "
                "[--vulkan-validation] [--vulkan-loader FILE] "
                "[--vulkan-vendor ID] [--vulkan-device ID] "
@@ -846,6 +847,8 @@ int main(int argc, char **argv)
             argument == "--vulkan-min-hybrid-nearest-ct32-pixels" ||
             argument == "--vulkan-min-hybrid-linear-ct32-pixels" ||
             argument == "--vulkan-min-hybrid-linear-ct32-clamp-pixels" ||
+            argument ==
+                "--vulkan-min-hybrid-feedback-ct32-run-pixels" ||
             argument == "--vulkan-min-hybrid-triangle-pixels" ||
             argument == "--vulkan-loader" ||
             argument == "--vulkan-vendor" ||
@@ -1022,6 +1025,29 @@ int main(int argc, char **argv)
                 }
                 vulkanBackendConfig
                     .minimumHybridLinearCt32ClampSpritePixels = minimum;
+                vulkanOptionUsed = true;
+                replayOptionUsed = true;
+                gifReplayOptionUsed = true;
+            }
+            else if (argument ==
+                     "--vulkan-min-hybrid-feedback-ct32-run-pixels")
+            {
+                uint64_t minimum = 0u;
+                constexpr uint64_t maximumPixels =
+                    2048ull * 2048ull *
+                    GS_VULKAN_MAX_RESIDENT_SPRITE_BATCH;
+                if (!parseCount(argv[index], minimum) ||
+                    minimum > maximumPixels)
+                {
+                    std::cerr
+                        << "Vulkan hybrid feedback CT32 run-pixel threshold "
+                           "must be between 0 and "
+                        << maximumPixels << '\n';
+                    return 2;
+                }
+                vulkanBackendConfig
+                    .minimumHybridFeedbackLinearDepthCt32RunPixels =
+                    minimum;
                 vulkanOptionUsed = true;
                 replayOptionUsed = true;
                 gifReplayOptionUsed = true;

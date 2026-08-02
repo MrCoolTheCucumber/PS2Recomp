@@ -5642,9 +5642,9 @@ void register_ps2_gs_vulkan_tests()
                 "strict should expose proven resident feedback ordering");
             t.IsTrue(backend->setMode(GsRendererMode::Hybrid),
                      "the fixture should enter Hybrid mode");
-            t.IsFalse(
+            t.IsTrue(
                 backend->classify(commands.front()).supported,
-                "Hybrid should stay closed until strict feedback is proven");
+                "Hybrid should expose feedback after fixed-work qualification");
 
             std::vector<uint8_t> unavailableVram = initial;
             std::unique_ptr<GsVulkanRasterBackend> missingProvider =
@@ -5989,9 +5989,9 @@ void register_ps2_gs_vulkan_tests()
 
             t.IsTrue(backend->setMode(GsRendererMode::Hybrid),
                      "the synchronized feedback backend should enter Hybrid");
-            t.IsFalse(
+            t.IsTrue(
                 backend->classify(commands.front()).supported,
-                "Hybrid should remain closed pending fixed-work measurement");
+                "Hybrid should expose measured feedback run candidates");
 
             const std::vector<uint8_t> shortSnapshot(
                 GS_VULKAN_VRAM_SIZE - 1u, 0u);
@@ -6053,6 +6053,125 @@ void register_ps2_gs_vulkan_tests()
             t.Equals(
                 malformedSoftwareCalls, 0ull,
                 "strict snapshot validation must precede any software mutation");
+        });
+
+        tc.Run("Vulkan Hybrid defers compatible feedback runs until measured work", [](TestCase &t)
+        {
+            GSMem::InitLookupTables();
+            const std::array<GsDrawCommand, 3> commands{{
+                makeFeedbackLinearDepthCt32SpriteCommand(
+                    30'320u, 4u, 1u, 200u, GS_PSM_Z24, false, 1u,
+                    6u, 5u,
+                    {0u, 63u, 0u, 31u}, {0u, 0u},
+                    {0u, 128u}, {0u, 128u},
+                    {128u, 256u}, {0u, 128u},
+                    0x00123456u),
+                makeFeedbackLinearDepthCt32SpriteCommand(
+                    30'321u, 4u, 1u, 201u, GS_PSM_Z32, false, 2u,
+                    6u, 5u,
+                    {0u, 63u, 0u, 31u}, {0u, 0u},
+                    {128u, 256u}, {0u, 128u},
+                    {0u, 128u}, {0u, 128u},
+                    0x00654321u),
+                makeFeedbackLinearDepthCt32SpriteCommand(
+                    30'322u, 5u, 1u, 202u, GS_PSM_Z24, false, 1u,
+                    6u, 5u,
+                    {0u, 63u, 0u, 31u}, {0u, 0u},
+                    {0u, 128u}, {0u, 128u},
+                    {128u, 256u}, {0u, 128u},
+                    0x00010203u),
+            }};
+            for (const GsDrawCommand &command : commands)
+            {
+                GsVulkanFeedbackLinearDepthCt32Sprite prepared{};
+                t.IsTrue(
+                    prepareGsVulkanFeedbackLinearDepthCt32Sprite(
+                        command, prepared).supported,
+                    "every Hybrid policy fixture should satisfy the exact contract");
+            }
+
+            const std::vector<uint8_t> snapshot =
+                makeVramPattern(0x48594246u);
+            std::vector<uint8_t> vram = snapshot;
+            GsVulkanRasterBackendConfig config{};
+            config.mode = GsRendererMode::Hybrid;
+            t.Equals(
+                config.minimumHybridFeedbackLinearDepthCt32RunPixels,
+                212'480ull,
+                "feedback Hybrid should retain the measured run crossover");
+            std::unique_ptr<GsVulkanRasterBackend> backend =
+                GsVulkanRasterBackend::createWithExecutor(
+                    std::make_unique<FakeCt32Executor>(
+                        FakeCt32Executor::Behavior::Exact),
+                    config, vram, [](const GsDrawCommand &) {}, {},
+                    nullptr,
+                    [&]() -> std::span<const uint8_t>
+                    {
+                        return snapshot;
+                    });
+            t.IsNotNull(
+                backend.get(),
+                "an exact feedback executor should create Hybrid mode");
+            if (!backend)
+                return;
+
+            t.IsTrue(
+                backend->classify(commands.front()).supported,
+                "Hybrid classification should expose semantic feedback support");
+            const GsHybridBatchPolicy policy =
+                backend->hybridBatchPolicy(commands.front());
+            t.IsTrue(policy.deferred(),
+                     "the measured feedback policy should defer admission");
+            t.Equals(policy.minimumPixels, 212'480ull,
+                     "the policy should expose the measured run work floor");
+            t.Equals(
+                policy.maximumCommands,
+                config.maximumResidentBatchCommands,
+                "the undecided run should share the resident service bound");
+            t.IsTrue(
+                backend->hybridBatchCompatible(commands[0], commands[1]),
+                "depth state may vary while one frontend snapshot remains valid");
+            t.IsFalse(
+                backend->hybridBatchCompatible(commands[1], commands[2]),
+                "a different recursive surface should end the deferred run");
+
+            t.IsTrue(backend->setMode(GsRendererMode::GpuStrict),
+                     "the policy fixture should enter strict mode");
+            t.IsFalse(
+                backend->hybridBatchPolicy(commands.front()).deferred(),
+                "strict admission should not borrow the Hybrid work floor");
+            t.IsTrue(backend->setMode(GsRendererMode::Verify),
+                     "the policy fixture should enter Verify mode");
+            t.IsFalse(
+                backend->hybridBatchPolicy(commands.front()).deferred(),
+                "Verify admission should not borrow the Hybrid work floor");
+
+            GsVulkanRasterBackendConfig disabledConfig = config;
+            disabledConfig.minimumHybridFeedbackLinearDepthCt32RunPixels =
+                0u;
+            std::vector<uint8_t> disabledVram = snapshot;
+            std::unique_ptr<GsVulkanRasterBackend> disabled =
+                GsVulkanRasterBackend::createWithExecutor(
+                    std::make_unique<FakeCt32Executor>(
+                        FakeCt32Executor::Behavior::Exact),
+                    disabledConfig, disabledVram,
+                    [](const GsDrawCommand &) {}, {}, nullptr,
+                    [&]() -> std::span<const uint8_t>
+                    {
+                        return snapshot;
+                    });
+            t.IsNotNull(
+                disabled.get(),
+                "a zero-threshold feedback Hybrid should construct");
+            if (disabled)
+            {
+                t.IsTrue(
+                    disabled->classify(commands.front()).supported,
+                    "zero should disable only the feedback cost policy");
+                t.IsFalse(
+                    disabled->hybridBatchPolicy(commands.front()).deferred(),
+                    "zero should admit an exact feedback draw immediately");
+            }
         });
 
         tc.Run("Vulkan strict backend keeps ordered depth CT32 sprites resident", [](TestCase &t)
@@ -10382,6 +10501,173 @@ void register_ps2_gs_vulkan_tests()
                      "integrated feedback Verify should remain validation-clean");
             t.Equals(service.validationWarnings, 0u,
                      "integrated feedback Verify should emit no validation warnings");
+        });
+
+        tc.Run("GS Vulkan Hybrid admits one measured feedback run", [](TestCase &t)
+        {
+            GSMem::InitLookupTables();
+            constexpr size_t drawCount = 16u;
+            constexpr uint32_t width = 32u;
+            constexpr uint32_t height = 415u;
+            constexpr uint16_t offsetX = 1'792u * 16u;
+            constexpr uint16_t offsetY = 1'840u * 16u;
+            std::vector<GsDrawCommand> commands;
+            commands.reserve(drawCount);
+            uint64_t expectedPixels = 0u;
+            for (size_t index = 0u; index < drawCount; ++index)
+            {
+                const uint16_t rawX0 = static_cast<uint16_t>(
+                    offsetX + index * width * 16u);
+                const uint16_t rawX1 = static_cast<uint16_t>(
+                    rawX0 + width * 16u);
+                const uint16_t rawU0 = static_cast<uint16_t>(
+                    index * width * 16u);
+                const uint16_t rawU1 = static_cast<uint16_t>(
+                    rawU0 + width * 16u);
+                commands.push_back(
+                    makeFeedbackLinearDepthCt32SpriteCommand(
+                        30'450u + index,
+                        112u, 8u, 216u, GS_PSM_Z24, false, 3u,
+                        10u, 10u,
+                        {0u, 511u, 0u, height},
+                        {offsetX, offsetY},
+                        {rawX0, rawX1},
+                        {offsetY,
+                         static_cast<uint16_t>(offsetY + height * 16u)},
+                        {rawU0, rawU1}, {0u, 6'656u},
+                        989'743u));
+                GsVulkanFeedbackLinearDepthCt32Sprite prepared{};
+                t.IsTrue(
+                    prepareGsVulkanFeedbackLinearDepthCt32Sprite(
+                        commands.back(), prepared).supported,
+                    "every title-shaped Hybrid draw should be exact");
+                expectedPixels +=
+                    static_cast<uint64_t>(
+                        prepared.boundsX1 - prepared.boundsX0) *
+                    static_cast<uint64_t>(
+                        prepared.boundsY1 - prepared.boundsY0);
+            }
+            t.Equals(expectedPixels, 212'480ull,
+                     "the integrated run should meet the measured floor exactly");
+
+            const std::vector<uint8_t> initial =
+                makeVramPattern(0x46424859u);
+            std::vector<uint8_t> softwareVram = initial;
+            std::vector<uint8_t> hybridVram = initial;
+            GS software;
+            GS hybrid;
+            software.init(
+                softwareVram.data(),
+                static_cast<uint32_t>(softwareVram.size()), nullptr);
+            hybrid.init(
+                hybridVram.data(),
+                static_cast<uint32_t>(hybridVram.size()), nullptr);
+
+            GsVulkanCapabilityReport preflight{};
+            const GsVulkanServiceConfig serviceConfig =
+                makeRendererServiceConfig(preflight);
+            GsVulkanRasterBackendConfig backendConfig{};
+            t.Equals(
+                backendConfig
+                    .minimumHybridFeedbackLinearDepthCt32RunPixels,
+                expectedPixels,
+                "the production frontend should use the measured run policy");
+            t.IsTrue(
+                hybrid.configureVulkanRenderer(
+                    serviceConfig, backendConfig),
+                "the feedback Hybrid fixture should accept configuration");
+            if (!preflight.ready())
+            {
+                t.IsFalse(
+                    hybrid.setRendererMode(GsRendererMode::Hybrid),
+                    "an unavailable host should decline feedback Hybrid cleanly");
+                return;
+            }
+            const GsVulkanDeviceReport *selected =
+                preflight.selectedDevice();
+            t.IsNotNull(
+                selected,
+                "a ready feedback Hybrid preflight should select one device");
+            if (!selected)
+                return;
+            t.IsTrue(
+                selected->exactFeedbackLinearDepthCt32Sprite,
+                "the Hybrid device should expose exact feedback execution");
+            if (!selected->exactFeedbackLinearDepthCt32Sprite)
+                return;
+
+            t.IsTrue(
+                hybrid.setRendererMode(GsRendererMode::Hybrid),
+                "the qualified host should enter feedback Hybrid");
+            if (hybrid.rendererMode() != GsRendererMode::Hybrid)
+                return;
+            hybrid.setBackendCountersEnabled(true);
+            hybrid.resetBackendCounters();
+
+            for (const GsDrawCommand &command : commands)
+            {
+                drawNearestCt32SpriteCommand(software, command);
+                drawNearestCt32SpriteCommand(hybrid, command);
+            }
+            t.IsFalse(
+                softwareVram == initial,
+                "the software oracle should publish the measured run");
+            t.IsTrue(
+                hybridVram == initial,
+                "the admitted Hybrid run should remain resident before observation");
+            (void)software.getDebugSnapshot();
+            (void)hybrid.getDebugSnapshot();
+            t.IsTrue(
+                hybridVram == softwareVram,
+                "the production Hybrid snapshot path should match software exactly");
+
+            const GsBackendCounters counters = hybrid.backendCounters();
+            t.Equals(counters.commands, 16ull,
+                     "the Hybrid frontend should assemble all run members");
+            t.Equals(counters.acceleratedCommands, 16ull,
+                     "the measured run should accelerate in full");
+            t.Equals(counters.softwareCommands, 0ull,
+                     "the admitted run should not split back to software");
+            t.Equals(counters.fallbackCommands, 0ull,
+                     "the measured run should have no cost fallback");
+            t.Equals(counters.queueHighWatermark, 16ull,
+                     "the deferred queue should peak at the measured run length");
+
+            const GsVulkanRasterBackendStatistics backend =
+                hybrid.vulkanRendererBackendStatistics();
+            t.Equals(backend.commandsAttempted, 16ull,
+                     "the backend should attempt every admitted draw");
+            t.Equals(backend.commandsCompleted, 16ull,
+                     "the backend should complete every admitted draw");
+            t.Equals(backend.residentBatchesCompleted, 1ull,
+                     "the frontend run should remain one resident batch");
+            t.Equals(backend.largestResidentBatch, 16ull,
+                     "the backend should retain the full measured run");
+
+            const GsVulkanServiceStatistics service =
+                hybrid.vulkanRendererServiceStatistics();
+            t.Equals(
+                service.feedbackLinearDepthCt32SpriteDrawsCompleted,
+                16ull,
+                "the service should execute every feedback draw");
+            t.Equals(
+                service.feedbackLinearDepthCt32SpritePixelsExecuted,
+                expectedPixels,
+                "the service should retain exact measured work");
+            t.Equals(
+                service
+                    .residentFeedbackLinearDepthCt32SpriteBatchesCompleted,
+                1ull,
+                "the service should upload one immutable run snapshot");
+            t.Equals(
+                service
+                    .largestResidentFeedbackLinearDepthCt32SpriteBatch,
+                16ull,
+                "the service should retain the title-shaped batch size");
+            t.Equals(service.validationErrors, 0u,
+                     "feedback Hybrid should remain validation-clean");
+            t.Equals(service.validationWarnings, 0u,
+                     "feedback Hybrid should emit no validation warnings");
         });
 
         tc.Run("GS Vulkan strict feedback survives ownership and lifecycle checkpoints", [](TestCase &t)
