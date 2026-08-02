@@ -24,6 +24,10 @@ namespace
     static constexpr uint32_t kDefaultDisplayHeight = 448u;
     static constexpr uint32_t kMaxPresentationWidth = 2048u;
     static constexpr uint32_t kMaxPresentationHeight = 2048u;
+    // GIF packets are already bounded by kDebugGifCaptureBytes. Keep their
+    // count independent of the much smaller human-readable event ring: a
+    // single frame can legitimately contain several thousand small packets.
+    static constexpr size_t kDebugGifCapturePacketCount = 16384u;
 
     uint16_t encodeFramePixelPSMCT16(uint8_t r, uint8_t g, uint8_t b, uint8_t a)
     {
@@ -1798,7 +1802,7 @@ void GS::processGIFPacket(const uint8_t *data, uint32_t sizeBytes)
         const bool restart =
             m_debugGifPackets.empty() ||
             m_debugGifPacketBytes + sizeBytes > kDebugGifCaptureBytes ||
-            m_debugGifPackets.size() >= kDebugHistoryCapacity;
+            m_debugGifPackets.size() >= kDebugGifCapturePacketCount;
         if (restart)
         {
             m_debugGifPackets.clear();
