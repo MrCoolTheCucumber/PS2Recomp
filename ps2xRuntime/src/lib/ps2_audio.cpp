@@ -1,4 +1,5 @@
 #include "runtime/ps2_audio.h"
+#include "ps2_989snd.h"
 #include "runtime/ps2_memory.h"
 #include "ps2_host_backend.h"
 #include <algorithm>
@@ -117,11 +118,22 @@ struct PS2AudioBackend::Impl
         bool playing = false;
     };
 
+    struct Sony989sndStream
+    {
+        mutable std::mutex mutex;
+        ps2_989snd::Engine engine;
+        AudioStream hostStream{};
+        bool hostStreamLoaded = false;
+        bool playing = false;
+    };
+
     std::vector<TrackedSound> activeSounds;
     SpuAdpcmStream spuAdpcmStream;
+    Sony989sndStream sony989sndStream;
     std::atomic<bool> debuggerPaused{false};
 
     inline static std::atomic<SpuAdpcmStream *> activeCallbackStream{nullptr};
+    inline static std::atomic<Sony989sndStream *> activeSony989sndCallbackStream{nullptr};
 
     static void flushChannelPcm(SpuAdpcmStream &stream)
     {
@@ -206,6 +218,15 @@ struct PS2AudioBackend::Impl
         std::lock_guard<std::mutex> lock(stream->mutex);
         renderStreamFramesLocked(*stream, bufferData, frameCount);
     }
+
+    static void sony989sndCallback(void *bufferData, unsigned int frameCount)
+    {
+        Sony989sndStream *const stream =
+            activeSony989sndCallbackStream.load(std::memory_order_acquire);
+        if (!stream || !bufferData)
+            return;
+        stream->engine.render(static_cast<int16_t *>(bufferData), frameCount);
+    }
 };
 
 PS2AudioBackend::PS2AudioBackend() : m_impl(std::make_unique<Impl>())
@@ -271,7 +292,12 @@ namespace
 {
     constexpr uint32_t LIBSD_CMD_SET_VOICE = 0x8010u;
     constexpr uint32_t SONY_989SND_SID = 0x00123456u;
+    constexpr uint32_t SONY_989SND_UNLOAD_BANK = 0x06u;
+    constexpr uint32_t SONY_989SND_SET_MASTER_VOLUME = 0x09u;
+    constexpr uint32_t SONY_989SND_PLAY_SOUND = 0x11u;
+    constexpr uint32_t SONY_989SND_STOP_SOUND = 0x15u;
     constexpr uint32_t SONY_989SND_STOP_ALL_SOUNDS = 0x18u;
+    constexpr uint32_t SONY_989SND_SET_SOUND_PARAMS = 0x21u;
     constexpr uint32_t SONY_989SND_STOP_ALL_STREAMS = 0x34u;
     constexpr uint32_t SONY_989SND_OPEN_STREAM = 0x3Bu;
     constexpr uint32_t SONY_989SND_CLOSE_STREAM = 0x3Cu;
@@ -340,16 +366,19 @@ void PS2AudioBackend::onSoundBankLoaded(uint32_t sid,
                                         const uint8_t *container,
                                         size_t containerSize)
 {
-    (void)sid;
-    (void)bankHandle;
-    (void)container;
-    (void)containerSize;
+    if (sid != SONY_989SND_SID || !m_impl)
+        return;
+    (void)m_impl->sony989sndStream.engine.loadBank(
+        bankHandle,
+        container,
+        containerSize);
 }
 
 void PS2AudioBackend::onSoundBankUnloaded(uint32_t sid, uint32_t bankHandle)
 {
-    (void)sid;
-    (void)bankHandle;
+    if (sid != SONY_989SND_SID || !m_impl)
+        return;
+    m_impl->sony989sndStream.engine.unloadBank(bankHandle);
 }
 
 void PS2AudioBackend::destroySpuAdpcmHostStream()
@@ -405,6 +434,70 @@ void PS2AudioBackend::closeSpuAdpcmStream()
     stream.opened = false;
 }
 
+void PS2AudioBackend::ensureSony989sndHostStream()
+{
+#if defined(PLATFORM_VITA)
+    return;
+#else
+    if (!m_audioReady || !IsAudioDeviceReady() || !m_impl)
+        return;
+
+    Impl::Sony989sndStream &stream = m_impl->sony989sndStream;
+    std::lock_guard<std::mutex> lock(stream.mutex);
+    if (stream.hostStreamLoaded)
+    {
+        if (!stream.playing)
+        {
+            stream.playing = true;
+            PlayAudioStream(stream.hostStream);
+        }
+        return;
+    }
+
+    AudioStream hostStream = LoadAudioStream(48'000u, 16u, 2u);
+    if (!IsAudioStreamValid(hostStream))
+        return;
+    stream.hostStream = hostStream;
+    stream.hostStreamLoaded = true;
+    stream.playing = true;
+    Impl::activeSony989sndCallbackStream.store(&stream, std::memory_order_release);
+    SetAudioStreamCallback(hostStream, &Impl::sony989sndCallback);
+    PlayAudioStream(hostStream);
+#endif
+}
+
+void PS2AudioBackend::destroySony989sndHostStream()
+{
+    if (!m_impl)
+        return;
+    Impl::Sony989sndStream &stream = m_impl->sony989sndStream;
+    AudioStream hostStream{};
+    bool loaded = false;
+    {
+        std::lock_guard<std::mutex> lock(stream.mutex);
+        hostStream = stream.hostStream;
+        loaded = stream.hostStreamLoaded;
+        stream.hostStream = {};
+        stream.hostStreamLoaded = false;
+        stream.playing = false;
+    }
+    Impl::Sony989sndStream *expected = &stream;
+    (void)Impl::activeSony989sndCallbackStream.compare_exchange_strong(
+        expected, nullptr, std::memory_order_acq_rel);
+
+#if !defined(PLATFORM_VITA)
+    if (loaded && IsAudioDeviceReady())
+    {
+        SetAudioStreamCallback(hostStream, nullptr);
+        StopAudioStream(hostStream);
+        UnloadAudioStream(hostStream);
+    }
+#else
+    (void)hostStream;
+    (void)loaded;
+#endif
+}
+
 void PS2AudioBackend::handleSony989sndCommand(uint32_t rpcNum,
                                                const uint8_t *sendBuf,
                                                uint32_t sendSize,
@@ -413,9 +506,86 @@ void PS2AudioBackend::handleSony989sndCommand(uint32_t rpcNum,
 {
     Impl::SpuAdpcmStream &stream = m_impl->spuAdpcmStream;
 
+    if (rpcNum == SONY_989SND_UNLOAD_BANK)
+    {
+        uint32_t bankHandle = 0u;
+        if (sendBuf && sendSize >= sizeof(bankHandle))
+        {
+            std::memcpy(&bankHandle, sendBuf, sizeof(bankHandle));
+            m_impl->sony989sndStream.engine.unloadBank(bankHandle);
+        }
+        return;
+    }
+
+    if (rpcNum == SONY_989SND_SET_MASTER_VOLUME)
+    {
+        std::array<uint32_t, 2u> parameters{};
+        if (sendBuf && sendSize >= sizeof(parameters))
+        {
+            std::memcpy(parameters.data(), sendBuf, sizeof(parameters));
+            m_impl->sony989sndStream.engine.setMasterVolume(
+                parameters[0u],
+                static_cast<int32_t>(parameters[1u]));
+        }
+        return;
+    }
+
+    if (rpcNum == SONY_989SND_PLAY_SOUND)
+    {
+        std::array<uint32_t, 6u> parameters{};
+        uint32_t soundHandle = 0u;
+        if (sendBuf && sendSize >= sizeof(parameters) &&
+            streamData && streamDataSize >= sizeof(soundHandle))
+        {
+            std::memcpy(parameters.data(), sendBuf, sizeof(parameters));
+            std::memcpy(&soundHandle, streamData, sizeof(soundHandle));
+            if (m_impl->sony989sndStream.engine.playSound(
+                    parameters[0u],
+                    parameters[1u],
+                    soundHandle,
+                    static_cast<int32_t>(parameters[2u]),
+                    static_cast<int32_t>(parameters[3u]),
+                    static_cast<int32_t>(parameters[4u]),
+                    static_cast<int32_t>(parameters[5u])))
+            {
+                ensureSony989sndHostStream();
+            }
+        }
+        return;
+    }
+
+    if (rpcNum == SONY_989SND_STOP_SOUND)
+    {
+        uint32_t soundHandle = 0u;
+        if (sendBuf && sendSize >= sizeof(soundHandle))
+        {
+            std::memcpy(&soundHandle, sendBuf, sizeof(soundHandle));
+            m_impl->sony989sndStream.engine.stopSound(soundHandle);
+        }
+        return;
+    }
+
+    if (rpcNum == SONY_989SND_SET_SOUND_PARAMS)
+    {
+        std::array<uint32_t, 6u> parameters{};
+        if (sendBuf && sendSize >= sizeof(parameters))
+        {
+            std::memcpy(parameters.data(), sendBuf, sizeof(parameters));
+            m_impl->sony989sndStream.engine.setSoundParameters(
+                parameters[0u],
+                parameters[1u],
+                static_cast<int32_t>(parameters[2u]),
+                static_cast<int32_t>(parameters[3u]),
+                static_cast<int32_t>(parameters[4u]),
+                static_cast<int32_t>(parameters[5u]));
+        }
+        return;
+    }
+
     if (rpcNum == SONY_989SND_STOP_ALL_SOUNDS)
     {
         stopAllSounds();
+        m_impl->sony989sndStream.engine.stopAllSounds();
         return;
     }
 
@@ -683,6 +853,9 @@ void PS2AudioBackend::stop(uint32_t voiceId)
 void PS2AudioBackend::stopAll()
 {
     closeSpuAdpcmStream();
+    if (m_impl)
+        m_impl->sony989sndStream.engine.stopAllSounds();
+    destroySony989sndHostStream();
     stopAllSounds();
 }
 
@@ -729,6 +902,22 @@ void PS2AudioBackend::setDebuggerPaused(bool paused)
             ResumeAudioStream(hostStream);
     }
 
+    AudioStream sfxHostStream{};
+    bool resumeSfxStream = false;
+    {
+        Impl::Sony989sndStream &sfxStream = m_impl->sony989sndStream;
+        std::lock_guard<std::mutex> lock(sfxStream.mutex);
+        sfxHostStream = sfxStream.hostStream;
+        resumeSfxStream = sfxStream.hostStreamLoaded && sfxStream.playing;
+    }
+    if (resumeSfxStream && IsAudioDeviceReady())
+    {
+        if (paused)
+            PauseAudioStream(sfxHostStream);
+        else
+            ResumeAudioStream(sfxHostStream);
+    }
+
     std::lock_guard<std::mutex> lock(m_mutex);
     for (auto &tracked : m_impl->activeSounds)
     {
@@ -751,6 +940,16 @@ void PS2AudioBackend::renderSpuAdpcmFramesForTesting(
     std::lock_guard<std::mutex> lock(stream.mutex);
     Impl::renderStreamFramesLocked(
         stream, bufferData, frameCount);
+}
+
+void PS2AudioBackend::renderSony989sndFramesForTesting(
+    void *bufferData,
+    unsigned int frameCount)
+{
+    if (!m_impl || !bufferData)
+        return;
+    m_impl->sony989sndStream.engine.render(
+        static_cast<int16_t *>(bufferData), frameCount);
 }
 
 PS2AudioStreamDebugSnapshot PS2AudioBackend::streamDebugSnapshot() const
@@ -777,5 +976,23 @@ PS2AudioStreamDebugSnapshot PS2AudioBackend::streamDebugSnapshot() const
     snapshot.queuedSamples = stream.interleavedPcm.size();
     for (const auto &channel : stream.channelPcm)
         snapshot.queuedSamples += channel.size();
+
+    const Impl::Sony989sndStream &sfxStream = m_impl->sony989sndStream;
+    {
+        std::lock_guard<std::mutex> sfxLock(sfxStream.mutex);
+        snapshot.sfxOpened = sfxStream.hostStreamLoaded;
+        snapshot.sfxPlaying = sfxStream.playing;
+    }
+    const ps2_989snd::DebugSnapshot sfx = sfxStream.engine.debugSnapshot();
+    snapshot.sfxBankCount = sfx.bankCount;
+    snapshot.sfxSoundCount = sfx.soundCount;
+    snapshot.sfxDecodedSampleCount = sfx.decodedSampleCount;
+    snapshot.sfxActiveHandlerCount = sfx.activeHandlerCount;
+    snapshot.sfxActiveVoiceCount = sfx.activeVoiceCount;
+    snapshot.sfxRenderedFrames = sfx.renderedFrames;
+    snapshot.sfxNonzeroFrames = sfx.nonzeroFrames;
+    snapshot.sfxRejectedBanks = sfx.rejectedBanks;
+    snapshot.sfxRejectedCommands = sfx.rejectedCommands;
+    snapshot.sfxUnsupportedGrains = sfx.unsupportedGrains;
     return snapshot;
 }

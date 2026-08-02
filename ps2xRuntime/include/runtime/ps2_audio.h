@@ -40,6 +40,18 @@ struct PS2AudioStreamDebugSnapshot
     uint64_t consumedFrames = 0;
     uint64_t zeroFilledFrames = 0;
     size_t queuedSamples = 0;
+    bool sfxOpened = false;
+    bool sfxPlaying = false;
+    size_t sfxBankCount = 0u;
+    size_t sfxSoundCount = 0u;
+    size_t sfxDecodedSampleCount = 0u;
+    size_t sfxActiveHandlerCount = 0u;
+    size_t sfxActiveVoiceCount = 0u;
+    uint64_t sfxRenderedFrames = 0u;
+    uint64_t sfxNonzeroFrames = 0u;
+    uint64_t sfxRejectedBanks = 0u;
+    uint64_t sfxRejectedCommands = 0u;
+    uint64_t sfxUnsupportedGrains = 0u;
 };
 
 struct PS2AudioBackendTestAccess;
@@ -96,9 +108,14 @@ private:
     void renderSpuAdpcmFramesForTesting(
         void *bufferData,
         unsigned int frameCount);
+    void renderSony989sndFramesForTesting(
+        void *bufferData,
+        unsigned int frameCount);
     void stopAllSounds();
     void destroySpuAdpcmHostStream();
     void closeSpuAdpcmStream();
+    void ensureSony989sndHostStream();
+    void destroySony989sndHostStream();
 
     friend struct PS2AudioBackendTestAccess;
 };

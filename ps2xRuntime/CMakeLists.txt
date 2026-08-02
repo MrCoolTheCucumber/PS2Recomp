@@ -607,6 +607,7 @@ add_library(ps2_runtime STATIC
     src/lib/ee_thread_scheduler.cpp
     src/lib/game_overrides.cpp
     src/lib/ps2_gif_arbiter.cpp
+    src/lib/ps2_989snd.cpp
     src/lib/ps2_audio.cpp
     src/lib/ps2_audio_vag.cpp
     src/lib/ps2_gs_backend.cpp

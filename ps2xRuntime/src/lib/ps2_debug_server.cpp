@@ -2050,6 +2050,33 @@ struct PS2DebugServer::Impl
             "zero_filled_frames", audio.zeroFilledFrames, allocator);
         audioValue.AddMember(
             "queued_samples", static_cast<uint64_t>(audio.queuedSamples), allocator);
+        Value sfxValue(rapidjson::kObjectType);
+        sfxValue.AddMember("opened", audio.sfxOpened, allocator);
+        sfxValue.AddMember("playing", audio.sfxPlaying, allocator);
+        sfxValue.AddMember(
+            "banks", static_cast<uint64_t>(audio.sfxBankCount), allocator);
+        sfxValue.AddMember(
+            "sounds", static_cast<uint64_t>(audio.sfxSoundCount), allocator);
+        sfxValue.AddMember(
+            "decoded_samples",
+            static_cast<uint64_t>(audio.sfxDecodedSampleCount),
+            allocator);
+        sfxValue.AddMember(
+            "active_handlers",
+            static_cast<uint64_t>(audio.sfxActiveHandlerCount),
+            allocator);
+        sfxValue.AddMember(
+            "active_voices",
+            static_cast<uint64_t>(audio.sfxActiveVoiceCount),
+            allocator);
+        sfxValue.AddMember("rendered_frames", audio.sfxRenderedFrames, allocator);
+        sfxValue.AddMember("nonzero_frames", audio.sfxNonzeroFrames, allocator);
+        sfxValue.AddMember("rejected_banks", audio.sfxRejectedBanks, allocator);
+        sfxValue.AddMember(
+            "rejected_commands", audio.sfxRejectedCommands, allocator);
+        sfxValue.AddMember(
+            "unsupported_grains", audio.sfxUnsupportedGrains, allocator);
+        audioValue.AddMember("sfx", sfxValue, allocator);
         result.AddMember("audio", audioValue, allocator);
         return result;
     }
