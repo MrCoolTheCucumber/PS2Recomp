@@ -335,6 +335,23 @@ void PS2AudioBackend::onSoundCommand(uint32_t sid, uint32_t rpcNum,
     }
 }
 
+void PS2AudioBackend::onSoundBankLoaded(uint32_t sid,
+                                        uint32_t bankHandle,
+                                        const uint8_t *container,
+                                        size_t containerSize)
+{
+    (void)sid;
+    (void)bankHandle;
+    (void)container;
+    (void)containerSize;
+}
+
+void PS2AudioBackend::onSoundBankUnloaded(uint32_t sid, uint32_t bankHandle)
+{
+    (void)sid;
+    (void)bankHandle;
+}
+
 void PS2AudioBackend::destroySpuAdpcmHostStream()
 {
     Impl::SpuAdpcmStream &stream = m_impl->spuAdpcmStream;

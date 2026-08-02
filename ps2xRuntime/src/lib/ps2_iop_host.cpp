@@ -279,6 +279,23 @@ void PS2IopHostAdapter::audioCommand(uint32_t sid,
                                             receive.size);
 }
 
+void PS2IopHostAdapter::audioBankLoaded(uint32_t sid,
+                                        uint32_t bankHandle,
+                                        const void *container,
+                                        size_t containerSize)
+{
+    m_runtime.audioBackend().onSoundBankLoaded(
+        sid,
+        bankHandle,
+        static_cast<const uint8_t *>(container),
+        containerSize);
+}
+
+void PS2IopHostAdapter::audioBankUnloaded(uint32_t sid, uint32_t bankHandle)
+{
+    m_runtime.audioBackend().onSoundBankUnloaded(sid, bankHandle);
+}
+
 uint64_t PS2IopHostAdapter::virtualTimeNanoseconds() const
 {
     constexpr uint64_t kTicksPerSecond = 60u;

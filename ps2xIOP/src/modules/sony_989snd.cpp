@@ -68,6 +68,7 @@ namespace ps2x::iop::detail
         constexpr uint32_t kMaximumSoundBankChunkCount = 3u;
         constexpr uint32_t kSoundBankFileType1 = 1u;
         constexpr uint32_t kSoundBankFileType3 = 3u;
+        constexpr uint64_t kMaximumSoundBankContainerSize = 16u * 1024u * 1024u;
         constexpr uint32_t kSfxBlockDataId = 0x6B6C4253u; // "SBlk"
         constexpr uint32_t kMusicBankDataId = 0x32764253u; // "SBv2"
         constexpr uint32_t kEeRamSize = 32u * 1024u * 1024u;
@@ -139,6 +140,10 @@ namespace ps2x::iop::detail
                                         kRpcCloseVagStreaming,
                                         {},
                                         {});
+                }
+                for (const LoadedSoundBank &bank : m_loadedSoundBanks)
+                {
+                    m_host.audioBankUnloaded(kSony989sndSid, bank.handle);
                 }
                 releaseStreamingResource();
                 m_loadedSoundBanks.clear();
@@ -505,6 +510,15 @@ namespace ps2x::iop::detail
                         {
                             warnCommandBatch("cannot read unload-bank payload");
                             return result;
+                        }
+                        const auto loadedBank = std::find_if(
+                            m_loadedSoundBanks.begin(),
+                            m_loadedSoundBanks.end(),
+                            [bankHandle](const LoadedSoundBank &bank)
+                            { return bank.handle == bankHandle; });
+                        if (loadedBank != m_loadedSoundBanks.end())
+                        {
+                            m_host.audioBankUnloaded(kSony989sndSid, bankHandle);
                         }
                         m_loadedSoundBanks.erase(
                             std::remove_if(m_loadedSoundBanks.begin(),
@@ -888,6 +902,18 @@ namespace ps2x::iop::detail
                     return fail("unsupported sound-bank data block");
                 }
 
+                if (containerSize > kMaximumSoundBankContainerSize ||
+                    containerSize > std::numeric_limits<size_t>::max())
+                {
+                    return fail("sound-bank container is too large");
+                }
+
+                std::vector<uint8_t> container(static_cast<size_t>(containerSize));
+                if (!readExact(sourceOffset, container.data(), container.size()))
+                {
+                    return fail("failed to read sound-bank container");
+                }
+
                 const uint32_t bankHandle =
                     m_host.allocateIopHandle(IopHandleKind::ServiceResource);
                 if (bankHandle == 0u)
@@ -905,6 +931,10 @@ namespace ps2x::iop::detail
                     false,
                     std::move(chunks),
                 });
+                m_host.audioBankLoaded(kSony989sndSid,
+                                       bankHandle,
+                                       container.data(),
+                                       container.size());
                 return bankHandle;
             }
 

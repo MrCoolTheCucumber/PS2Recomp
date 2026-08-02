@@ -255,6 +255,16 @@ extern "C"
                                          uint32_t a3,
                                          uint32_t *result_address);
         void (*log)(void *userdata, uint32_t level, ps2x_iop_string_view_v1 message);
+
+        /* Appended host callbacks preserve the offsets used by earlier v1 plugins. */
+        int32_t (*audio_bank_loaded)(void *userdata,
+                                     uint32_t sid,
+                                     uint32_t bank_handle,
+                                     const void *container,
+                                     size_t container_size);
+        int32_t (*audio_bank_unloaded)(void *userdata,
+                                       uint32_t sid,
+                                       uint32_t bank_handle);
     } ps2x_iop_host_api_v1;
 
     typedef void *(*ps2x_iop_profile_create_v1)(const ps2x_iop_host_api_v1 *host,

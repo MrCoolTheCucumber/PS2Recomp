@@ -56,6 +56,11 @@ public:
                       uint32_t function,
                       ps2x::iop::GuestBuffer send,
                       ps2x::iop::GuestBuffer receive) override;
+    void audioBankLoaded(uint32_t sid,
+                         uint32_t bankHandle,
+                         const void *container,
+                         size_t containerSize) override;
+    void audioBankUnloaded(uint32_t sid, uint32_t bankHandle) override;
     uint64_t virtualTimeNanoseconds() const override;
 
     std::string hostPath(ps2x::iop::HostPathKind kind) const override;

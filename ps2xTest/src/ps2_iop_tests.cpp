@@ -149,6 +149,29 @@ namespace
             ++audioCalls;
         }
 
+        void audioBankLoaded(uint32_t sid,
+                             uint32_t bankHandle,
+                             const void *container,
+                             size_t containerSize) override
+        {
+            lastAudioBankSid = sid;
+            lastLoadedAudioBankHandle = bankHandle;
+            lastAudioBankContainer.clear();
+            if (container && containerSize != 0u)
+            {
+                const auto *bytes = static_cast<const uint8_t *>(container);
+                lastAudioBankContainer.assign(bytes, bytes + containerSize);
+            }
+            ++audioBankLoads;
+        }
+
+        void audioBankUnloaded(uint32_t sid, uint32_t bankHandle) override
+        {
+            lastAudioBankSid = sid;
+            lastUnloadedAudioBankHandle = bankHandle;
+            ++audioBankUnloads;
+        }
+
         uint64_t virtualTimeNanoseconds() const override
         {
             return virtualTime;
@@ -312,6 +335,12 @@ namespace
         GuestBuffer lastAudioSend{};
         GuestBuffer lastAudioReceive{};
         std::vector<uint8_t> lastAudioPayload;
+        uint32_t audioBankLoads = 0u;
+        uint32_t audioBankUnloads = 0u;
+        uint32_t lastAudioBankSid = 0u;
+        uint32_t lastLoadedAudioBankHandle = 0u;
+        uint32_t lastUnloadedAudioBankHandle = 0u;
+        std::vector<uint8_t> lastAudioBankContainer;
         uint64_t virtualTime = 0u;
         uint32_t memoryCardCalls = 0u;
         MemoryCardRequest lastMemoryCardRequest{};
@@ -467,6 +496,9 @@ void register_ps2_iop_tests()
             writeImageWord(kBankOffset + 0x10u, 0x58u);
             writeImageWord(kBankOffset + 0x14u, 0x80u);
             writeImageWord(kBankOffset + 0x18u, 0x6B6C4253u); // "SBlk"
+            const std::vector<uint8_t> expectedContainer(
+                image.begin() + kBankOffset,
+                image.begin() + kBankOffset + 0xD8u);
             host.hostFileContents.emplace("fake/disc.iso", std::move(image));
 
             const std::array<uint32_t, 2> source{kSector, kByteOffset};
@@ -490,6 +522,19 @@ void register_ps2_iop_tests()
                      "the four-byte loading response must not overwrite adjacent memory");
             t.Equals(host.closedHostFileHandles.size(), size_t{1},
                      "the sound-bank loader should close the CD image after validation");
+            t.Equals(host.audioBankLoads, 1u,
+                     "a validated sound bank should be delivered to the audio backend once");
+            t.Equals(host.lastAudioBankSid, kMainSid,
+                     "the bank notification should identify the owning audio service");
+            t.Equals(host.lastLoadedAudioBankHandle, 0x8000u,
+                     "the audio backend should receive the published bank handle");
+            t.Equals(host.lastAudioBankContainer.size(), expectedContainer.size(),
+                     "the backend should receive the complete bounded bank container");
+            t.Equals(std::memcmp(host.lastAudioBankContainer.data(),
+                                 expectedContainer.data(),
+                                 expectedContainer.size()),
+                     0,
+                     "the delivered bank container should match the validated CD bytes");
 
             constexpr uint32_t kWait = 1u;
             (void)host.writeGuest(kSendAddress, &kWait, sizeof(kWait));
@@ -537,6 +582,10 @@ void register_ps2_iop_tests()
                      "the backend should receive the bank-handle payload address");
             t.Equals(host.lastAudioSend.size, sizeof(uint32_t),
                      "the backend should receive exactly one bank handle");
+            t.Equals(host.audioBankUnloads, 1u,
+                     "an unloaded bank should retire its backend copy once");
+            t.Equals(host.lastUnloadedAudioBankHandle, 0x8000u,
+                     "the unload notification should identify the released bank");
 
             constexpr std::array<uint32_t, 4> kMalformedUnload{
                 1u,

@@ -131,6 +131,8 @@ namespace ps2x::iop::detail
                 api.has_guest_function = &hasGuestFunction;
                 api.invoke_guest_function = &invokeGuestFunction;
                 api.log = &log;
+                api.audio_bank_loaded = &audioBankLoaded;
+                api.audio_bank_unloaded = &audioBankUnloaded;
             }
 
             ps2x_iop_host_api_v1 api{};
@@ -276,6 +278,44 @@ namespace ps2x::iop::detail
                                                                            {send.address, send.size},
                                                                            {receive.address, receive.size});
                                          return PS2X_IOP_STATUS_OK_V1; });
+            }
+
+            static int32_t audioBankLoaded(void *userdata,
+                                           uint32_t sid,
+                                           uint32_t bankHandle,
+                                           const void *container,
+                                           size_t containerSize)
+            {
+                if (!userdata || (!container && containerSize != 0u))
+                {
+                    return PS2X_IOP_STATUS_INVALID_ARGUMENT_V1;
+                }
+                return guardedStatus([&]()
+                                     {
+                                         self(userdata)->host.audioBankLoaded(
+                                             sid,
+                                             bankHandle,
+                                             container,
+                                             containerSize);
+                                         return PS2X_IOP_STATUS_OK_V1;
+                                     });
+            }
+
+            static int32_t audioBankUnloaded(void *userdata,
+                                             uint32_t sid,
+                                             uint32_t bankHandle)
+            {
+                if (!userdata)
+                {
+                    return PS2X_IOP_STATUS_INVALID_ARGUMENT_V1;
+                }
+                return guardedStatus([&]()
+                                     {
+                                         self(userdata)->host.audioBankUnloaded(
+                                             sid,
+                                             bankHandle);
+                                         return PS2X_IOP_STATUS_OK_V1;
+                                     });
             }
 
             static int32_t getHostPath(void *userdata,
