@@ -1482,7 +1482,7 @@ int main(int argc, char **argv)
             return false;
         }
         totalBytes += size;
-        if (hashTrace)
+        if (hashTrace.is_open())
         {
             gs.flushRenderBatch();
             hashTrace << packetIndex << ',' << size << ','
