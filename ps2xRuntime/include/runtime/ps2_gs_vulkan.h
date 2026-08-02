@@ -724,6 +724,122 @@ static_assert(offsetof(GsVulkanCt32Triangle, reserved1) == 60u);
     const GsDrawCommand &command,
     GsVulkanCt32Triangle &triangle) noexcept;
 
+// Exact Phase 5 Gouraud/depth triangle record. Unlike the flat record, vertex
+// order and attributes remain paired exactly as submitted; positiveArea tells
+// the executor how to normalize edge signs without perturbing equal-Y DDA
+// ordering. The first contract has constant Z and alpha 128 at every vertex,
+// but retains independently varying RGB for exact color interpolation.
+struct alignas(16) GsVulkanGouraudDepthCt32Triangle
+{
+    uint32_t framebufferBaseBlock = 0u;
+    uint32_t framebufferWidth = 0u;
+    uint32_t boundsX0 = 0u;
+    uint32_t boundsY0 = 0u;
+    uint32_t boundsX1 = 0u;
+    uint32_t boundsY1 = 0u;
+    uint32_t depthBaseBlock = 0u;
+    uint32_t depthPsm = 0u;
+    uint32_t depth = 0u;
+    uint32_t positiveArea = 0u;
+    int32_t vertex0X12_4 = 0;
+    int32_t vertex0Y12_4 = 0;
+    int32_t vertex1X12_4 = 0;
+    int32_t vertex1Y12_4 = 0;
+    int32_t vertex2X12_4 = 0;
+    int32_t vertex2Y12_4 = 0;
+    uint32_t rgba0 = 0u;
+    uint32_t rgba1 = 0u;
+    uint32_t rgba2 = 0u;
+    uint32_t topLeftEdgeMask = 0u;
+    uint32_t reserved0 = 0u;
+    uint32_t reserved1 = 0u;
+    uint32_t reserved2 = 0u;
+    uint32_t reserved3 = 0u;
+
+    bool operator==(
+        const GsVulkanGouraudDepthCt32Triangle &) const = default;
+};
+
+static_assert(sizeof(GsVulkanGouraudDepthCt32Triangle) == 96u);
+static_assert(std::is_standard_layout_v<
+              GsVulkanGouraudDepthCt32Triangle>);
+static_assert(std::is_trivially_copyable_v<
+              GsVulkanGouraudDepthCt32Triangle>);
+static_assert(offsetof(
+    GsVulkanGouraudDepthCt32Triangle,
+    framebufferBaseBlock) == 0u);
+static_assert(offsetof(
+    GsVulkanGouraudDepthCt32Triangle,
+    framebufferWidth) == 4u);
+static_assert(offsetof(
+    GsVulkanGouraudDepthCt32Triangle,
+    boundsX0) == 8u);
+static_assert(offsetof(
+    GsVulkanGouraudDepthCt32Triangle,
+    boundsY0) == 12u);
+static_assert(offsetof(
+    GsVulkanGouraudDepthCt32Triangle,
+    boundsX1) == 16u);
+static_assert(offsetof(
+    GsVulkanGouraudDepthCt32Triangle,
+    boundsY1) == 20u);
+static_assert(offsetof(
+    GsVulkanGouraudDepthCt32Triangle,
+    depthBaseBlock) == 24u);
+static_assert(offsetof(
+    GsVulkanGouraudDepthCt32Triangle,
+    depthPsm) == 28u);
+static_assert(offsetof(
+    GsVulkanGouraudDepthCt32Triangle,
+    depth) == 32u);
+static_assert(offsetof(
+    GsVulkanGouraudDepthCt32Triangle,
+    positiveArea) == 36u);
+static_assert(offsetof(
+    GsVulkanGouraudDepthCt32Triangle,
+    vertex0X12_4) == 40u);
+static_assert(offsetof(
+    GsVulkanGouraudDepthCt32Triangle,
+    vertex0Y12_4) == 44u);
+static_assert(offsetof(
+    GsVulkanGouraudDepthCt32Triangle,
+    vertex1X12_4) == 48u);
+static_assert(offsetof(
+    GsVulkanGouraudDepthCt32Triangle,
+    vertex1Y12_4) == 52u);
+static_assert(offsetof(
+    GsVulkanGouraudDepthCt32Triangle,
+    vertex2X12_4) == 56u);
+static_assert(offsetof(
+    GsVulkanGouraudDepthCt32Triangle,
+    vertex2Y12_4) == 60u);
+static_assert(offsetof(
+    GsVulkanGouraudDepthCt32Triangle,
+    rgba0) == 64u);
+static_assert(offsetof(
+    GsVulkanGouraudDepthCt32Triangle,
+    rgba1) == 68u);
+static_assert(offsetof(
+    GsVulkanGouraudDepthCt32Triangle,
+    rgba2) == 72u);
+static_assert(offsetof(
+    GsVulkanGouraudDepthCt32Triangle,
+    topLeftEdgeMask) == 76u);
+static_assert(offsetof(
+    GsVulkanGouraudDepthCt32Triangle,
+    reserved0) == 80u);
+static_assert(offsetof(
+    GsVulkanGouraudDepthCt32Triangle,
+    reserved3) == 92u);
+
+// Applies the complete semantic predicate and publishes the raw ordered
+// vertices/attributes only after every invariant has been validated.
+// Rejection leaves the caller's record untouched.
+[[nodiscard]] GsBackendDecision
+prepareGsVulkanGouraudSourceOverDepthCt32Triangle(
+    const GsDrawCommand &command,
+    GsVulkanGouraudDepthCt32Triangle &triangle) noexcept;
+
 // Narrow injectable execution seam used by the Phase 3 verification backend.
 // Production requests still enter through the single-owner service below.
 class IGsVulkanDrawExecutor

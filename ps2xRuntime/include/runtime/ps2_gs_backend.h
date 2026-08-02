@@ -450,6 +450,15 @@ classifyGsFeedbackLinearDepthCt32Sprite(
 [[nodiscard]] GsBackendDecision classifyGsFlatCt32Triangle(
     const GsDrawCommand &command) noexcept;
 
+// Exact untextured Gouraud CT32 triangle slice selected by the title census.
+// It accepts the standard source-over equation only when all three source
+// alpha values are 128, which reduces RGB exactly to a source copy while
+// preserving the source alpha byte. Z32/Z24 must be a constant, unmasked
+// ALWAYS write; varying color remains part of the contract.
+[[nodiscard]] GsBackendDecision
+classifyGsGouraudSourceOverDepthCt32Triangle(
+    const GsDrawCommand &command) noexcept;
+
 [[nodiscard]] std::string_view gsFallbackReasonName(
     GsFallbackReason reason) noexcept;
 

@@ -823,6 +823,13 @@ namespace
         Disabled,
         DisabledOrSourceCopy,
         SourceOver,
+        SourceOverConstant128,
+    };
+
+    enum class ShadingRequirement : uint8_t
+    {
+        Flat,
+        Gouraud,
     };
 
     enum class AliasRequirement : uint8_t
@@ -883,7 +890,9 @@ namespace
         AlphaRequirement alphaRequirement =
             AlphaRequirement::Disabled,
         AliasRequirement aliasRequirement =
-            AliasRequirement::Disallowed) noexcept
+            AliasRequirement::Disallowed,
+        ShadingRequirement shadingRequirement =
+            ShadingRequirement::Flat) noexcept
     {
         const GSPrimReg &primitive = command.primitive();
         const GSContext &context = command.context();
@@ -912,17 +921,42 @@ namespace
         {
             return {false, GsFallbackReason::UnsupportedTextureState};
         }
-        if (primitive.iip)
+        if ((shadingRequirement == ShadingRequirement::Flat &&
+             primitive.iip) ||
+            (shadingRequirement == ShadingRequirement::Gouraud &&
+             !primitive.iip))
+        {
             return {false, GsFallbackReason::GouraudShading};
+        }
         if (primitive.fge)
             return {false, GsFallbackReason::Fog};
-        const bool acceptedAlpha =
-            alphaRequirement == AlphaRequirement::SourceOver
-                ? isSourceOverAlphaBlend(primitive, context, global)
-                : !primitive.abe ||
-                      (alphaRequirement ==
-                           AlphaRequirement::DisabledOrSourceCopy &&
-                       isSourceCopyAlphaBlend(primitive, context));
+        bool acceptedAlpha = false;
+        switch (alphaRequirement)
+        {
+        case AlphaRequirement::Disabled:
+            acceptedAlpha = !primitive.abe;
+            break;
+        case AlphaRequirement::DisabledOrSourceCopy:
+            acceptedAlpha =
+                !primitive.abe ||
+                isSourceCopyAlphaBlend(primitive, context);
+            break;
+        case AlphaRequirement::SourceOver:
+            acceptedAlpha =
+                isSourceOverAlphaBlend(primitive, context, global);
+            break;
+        case AlphaRequirement::SourceOverConstant128:
+            acceptedAlpha =
+                isSourceOverAlphaBlend(primitive, context, global);
+            for (uint8_t index = 0u;
+                 acceptedAlpha && index < expectedVertices;
+                 ++index)
+            {
+                acceptedAlpha =
+                    command.vertices()[index].a == 128u;
+            }
+            break;
+        }
         if (!acceptedAlpha)
             return {false, GsFallbackReason::AlphaBlend};
         if ((context.test & 1u) != 0u)
@@ -1070,8 +1104,11 @@ namespace
                 return {false, GsFallbackReason::UnknownMemoryLayout};
             }
         }
-        if (resources.readsDestination &&
-            alphaRequirement != AlphaRequirement::SourceOver)
+        const bool allowsDestinationRead =
+            alphaRequirement == AlphaRequirement::SourceOver ||
+            alphaRequirement ==
+                AlphaRequirement::SourceOverConstant128;
+        if (resources.readsDestination && !allowsDestinationRead)
             return {false, GsFallbackReason::DestinationRead};
         if (aliasRequirement ==
             AliasRequirement::ExactFramebufferTextureFeedback)
@@ -1158,6 +1195,42 @@ GsBackendDecision classifyGsFlatCt32Triangle(
     return classifyFlatCt32State(
         command, GS_PRIM_TRIANGLE, 3u,
         TextureRequirement::Disabled);
+}
+
+GsBackendDecision classifyGsGouraudSourceOverDepthCt32Triangle(
+    const GsDrawCommand &command) noexcept
+{
+    const GsBackendDecision decision = classifyFlatCt32State(
+        command,
+        GS_PRIM_TRIANGLE,
+        3u,
+        TextureRequirement::Disabled,
+        DepthRequirement::Z32OrZ24,
+        AlphaRequirement::SourceOverConstant128,
+        AliasRequirement::Disallowed,
+        ShadingRequirement::Gouraud);
+    if (!decision.supported)
+        return decision;
+
+    const GSContext &context = command.context();
+    const uint8_t depthTestMethod =
+        static_cast<uint8_t>((context.test >> 17u) & 0x3u);
+    if (depthTestMethod != 1u || context.zbuf.zmask)
+    {
+        return {
+            false,
+            GsFallbackReason::UnsupportedDepthFunction};
+    }
+
+    const auto &vertices = command.vertices();
+    if (vertices[0].zInteger != vertices[1].zInteger ||
+        vertices[1].zInteger != vertices[2].zInteger)
+    {
+        return {
+            false,
+            GsFallbackReason::UnsupportedDepthFunction};
+    }
+    return decision;
 }
 
 GsBackendRouter::GsBackendRouter(

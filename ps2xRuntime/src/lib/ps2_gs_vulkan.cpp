@@ -570,6 +570,133 @@ namespace
         return nullptr;
     }
 
+    const char *gouraudDepthCt32TriangleValidationError(
+        const GsVulkanGouraudDepthCt32Triangle &triangle) noexcept
+    {
+        if ((triangle.reserved0 | triangle.reserved1 |
+             triangle.reserved2 | triangle.reserved3) != 0u)
+        {
+            return "Vulkan Gouraud depth CT32 triangle has non-zero reserved data";
+        }
+        if (triangle.framebufferBaseBlock > 0x3FFFu ||
+            triangle.depthBaseBlock > 0x3FFFu)
+        {
+            return "Vulkan Gouraud depth CT32 triangle base is outside GS VRAM";
+        }
+        if (triangle.framebufferWidth == 0u ||
+            triangle.framebufferWidth > 0x3Fu)
+        {
+            return "Vulkan Gouraud depth CT32 triangle width is outside FRAME range";
+        }
+        if (triangle.boundsX0 >= triangle.boundsX1 ||
+            triangle.boundsY0 >= triangle.boundsY1)
+        {
+            return "Vulkan Gouraud depth CT32 triangle bounds are empty";
+        }
+        if (triangle.boundsX1 > 2048u || triangle.boundsY1 > 2048u)
+        {
+            return "Vulkan Gouraud depth CT32 triangle bounds are outside GS scissor range";
+        }
+        if (triangle.depthPsm != GS_PSM_Z32 &&
+            triangle.depthPsm != GS_PSM_Z24)
+        {
+            return "Vulkan Gouraud depth CT32 triangle has unsupported depth format";
+        }
+        if (triangle.positiveArea > 1u)
+        {
+            return "Vulkan Gouraud depth CT32 triangle has invalid winding data";
+        }
+        if ((triangle.topLeftEdgeMask & ~0x7u) != 0u)
+        {
+            return "Vulkan Gouraud depth CT32 triangle edge mask has reserved bits";
+        }
+        if ((triangle.rgba0 >> 24u) != 128u ||
+            (triangle.rgba1 >> 24u) != 128u ||
+            (triangle.rgba2 >> 24u) != 128u)
+        {
+            return "Vulkan Gouraud depth CT32 triangle alpha is not normalized";
+        }
+        if (!ct32RectangleHasUniqueWords(
+                triangle.boundsX0,
+                triangle.boundsY0,
+                triangle.boundsX1,
+                triangle.boundsY1,
+                triangle.framebufferWidth))
+        {
+            return "Vulkan Gouraud depth CT32 triangle surface aliases itself";
+        }
+
+        constexpr int32_t kMinimumWindowFixed = -65535;
+        constexpr int32_t kMaximumWindowFixed = 65535;
+        const std::array<FixedTriangleVertex, 3> vertices{{
+            {triangle.vertex0X12_4, triangle.vertex0Y12_4},
+            {triangle.vertex1X12_4, triangle.vertex1Y12_4},
+            {triangle.vertex2X12_4, triangle.vertex2Y12_4},
+        }};
+        for (const FixedTriangleVertex &vertex : vertices)
+        {
+            if (vertex.x < kMinimumWindowFixed ||
+                vertex.x > kMaximumWindowFixed ||
+                vertex.y < kMinimumWindowFixed ||
+                vertex.y > kMaximumWindowFixed)
+            {
+                return "Vulkan Gouraud depth CT32 triangle vertex is outside GS window range";
+            }
+        }
+
+        const int64_t signedArea =
+            triangleEdge(vertices[0], vertices[1], vertices[2]);
+        if (signedArea == 0 ||
+            (signedArea > 0) != (triangle.positiveArea != 0u))
+        {
+            return "Vulkan Gouraud depth CT32 triangle winding is inconsistent";
+        }
+        const bool positiveArea = signedArea > 0;
+        const auto orientedTopLeft =
+            [positiveArea](
+                const FixedTriangleVertex &a,
+                const FixedTriangleVertex &b)
+        {
+            return positiveArea
+                ? isTopLeftEdge(a, b)
+                : isTopLeftEdge(b, a);
+        };
+        const uint32_t expectedTopLeftMask =
+            (orientedTopLeft(vertices[1], vertices[2]) ? 1u : 0u) |
+            (orientedTopLeft(vertices[2], vertices[0]) ? 2u : 0u) |
+            (orientedTopLeft(vertices[0], vertices[1]) ? 4u : 0u);
+        if (triangle.topLeftEdgeMask != expectedTopLeftMask)
+        {
+            return "Vulkan Gouraud depth CT32 triangle edge mask is inconsistent";
+        }
+
+        const uint32_t width = triangle.boundsX1 - triangle.boundsX0;
+        const uint32_t height = triangle.boundsY1 - triangle.boundsY0;
+        const GsVramPageMask framebufferPages =
+            gsVramPagesForSurfaceRect(
+                triangle.framebufferBaseBlock,
+                triangle.framebufferWidth,
+                static_cast<uint8_t>(GSMem::C32),
+                triangle.boundsX0,
+                triangle.boundsY0,
+                width,
+                height);
+        const GsVramPageMask depthPages =
+            gsVramPagesForSurfaceRect(
+                triangle.depthBaseBlock,
+                triangle.framebufferWidth,
+                static_cast<uint8_t>(triangle.depthPsm),
+                triangle.boundsX0,
+                triangle.boundsY0,
+                width,
+                height);
+        if (framebufferPages.intersects(depthPages))
+        {
+            return "Vulkan Gouraud depth CT32 triangle framebuffer aliases depth";
+        }
+        return nullptr;
+    }
+
     bool validateResidentCt32SpriteBatch(
         std::span<const GsVulkanCt32Sprite> sprites,
         std::string &error)
@@ -1311,6 +1438,75 @@ GsBackendDecision prepareGsVulkanCt32Triangle(
         (isTopLeftEdge(vertices[2], vertices[0]) ? 2u : 0u) |
         (isTopLeftEdge(vertices[0], vertices[1]) ? 4u : 0u);
     if (ct32TriangleValidationError(prepared))
+        return {false, GsFallbackReason::UnknownMemoryLayout};
+
+    triangle = prepared;
+    return decision;
+}
+
+GsBackendDecision prepareGsVulkanGouraudSourceOverDepthCt32Triangle(
+    const GsDrawCommand &command,
+    GsVulkanGouraudDepthCt32Triangle &triangle) noexcept
+{
+    const GsBackendDecision decision =
+        classifyGsGouraudSourceOverDepthCt32Triangle(command);
+    if (!decision.supported)
+        return decision;
+
+    const GSContext &context = command.context();
+    const GsDrawBounds &bounds = command.bounds();
+    const auto &vertices = command.vertices();
+    const std::array<FixedTriangleVertex, 3> fixedVertices{{
+        {command.fixedX()[0], command.fixedY()[0]},
+        {command.fixedX()[1], command.fixedY()[1]},
+        {command.fixedX()[2], command.fixedY()[2]},
+    }};
+    const int64_t signedArea = triangleEdge(
+        fixedVertices[0], fixedVertices[1], fixedVertices[2]);
+    const bool positiveArea = signedArea > 0;
+    const auto orientedTopLeft =
+        [positiveArea](
+            const FixedTriangleVertex &a,
+            const FixedTriangleVertex &b)
+    {
+        return positiveArea
+            ? isTopLeftEdge(a, b)
+            : isTopLeftEdge(b, a);
+    };
+    const auto packRgba = [](const GSVertex &vertex)
+    {
+        return static_cast<uint32_t>(vertex.r) |
+               (static_cast<uint32_t>(vertex.g) << 8u) |
+               (static_cast<uint32_t>(vertex.b) << 16u) |
+               (static_cast<uint32_t>(vertex.a) << 24u);
+    };
+
+    GsVulkanGouraudDepthCt32Triangle prepared{};
+    prepared.framebufferBaseBlock = context.frame.fbp << 5u;
+    prepared.framebufferWidth =
+        std::max<uint32_t>(context.frame.fbw, 1u);
+    prepared.boundsX0 = static_cast<uint32_t>(bounds.x0);
+    prepared.boundsY0 = static_cast<uint32_t>(bounds.y0);
+    prepared.boundsX1 = static_cast<uint32_t>(bounds.x1);
+    prepared.boundsY1 = static_cast<uint32_t>(bounds.y1);
+    prepared.depthBaseBlock = context.zbuf.zbp << 5u;
+    prepared.depthPsm = context.zbuf.psm;
+    prepared.depth = vertices[0].zInteger;
+    prepared.positiveArea = positiveArea ? 1u : 0u;
+    prepared.vertex0X12_4 = fixedVertices[0].x;
+    prepared.vertex0Y12_4 = fixedVertices[0].y;
+    prepared.vertex1X12_4 = fixedVertices[1].x;
+    prepared.vertex1Y12_4 = fixedVertices[1].y;
+    prepared.vertex2X12_4 = fixedVertices[2].x;
+    prepared.vertex2Y12_4 = fixedVertices[2].y;
+    prepared.rgba0 = packRgba(vertices[0]);
+    prepared.rgba1 = packRgba(vertices[1]);
+    prepared.rgba2 = packRgba(vertices[2]);
+    prepared.topLeftEdgeMask =
+        (orientedTopLeft(fixedVertices[1], fixedVertices[2]) ? 1u : 0u) |
+        (orientedTopLeft(fixedVertices[2], fixedVertices[0]) ? 2u : 0u) |
+        (orientedTopLeft(fixedVertices[0], fixedVertices[1]) ? 4u : 0u);
+    if (gouraudDepthCt32TriangleValidationError(prepared))
         return {false, GsFallbackReason::UnknownMemoryLayout};
 
     triangle = prepared;

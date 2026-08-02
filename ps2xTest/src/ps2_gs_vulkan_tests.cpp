@@ -694,6 +694,55 @@ namespace
             GsDrawGlobalState{});
     }
 
+    GsDrawCommand makeGouraudSourceOverDepthCt32TriangleCommand(
+        uint64_t sequence,
+        uint32_t framebufferPage,
+        uint8_t framebufferWidth,
+        uint32_t depthPage,
+        uint8_t depthPsm,
+        GSScissorReg scissor,
+        GSXYOffsetReg xyoffset,
+        const std::array<uint16_t, 3> &rawX,
+        const std::array<uint16_t, 3> &rawY,
+        const std::array<uint32_t, 3> &rgba,
+        uint32_t depth)
+    {
+        const GsDrawCommand flat = makeCt32TriangleCommand(
+            sequence,
+            framebufferPage,
+            framebufferWidth,
+            scissor,
+            xyoffset,
+            rawX,
+            rawY,
+            rgba[2]);
+        GSPrimReg primitive = flat.primitive();
+        primitive.iip = true;
+        primitive.abe = true;
+        GSContext context = flat.context();
+        context.alpha = 0x8000000044ull;
+        context.zbuf = {depthPage, depthPsm, false};
+        context.test = 0x30000u;
+        GsDrawGlobalState global = flat.globalState();
+        global.colorClamp = true;
+        std::array<GSVertex, 3> vertices = flat.vertices();
+        for (size_t index = 0u; index < vertices.size(); ++index)
+        {
+            vertices[index].r = static_cast<uint8_t>(rgba[index]);
+            vertices[index].g = static_cast<uint8_t>(rgba[index] >> 8u);
+            vertices[index].b = static_cast<uint8_t>(rgba[index] >> 16u);
+            vertices[index].a = static_cast<uint8_t>(rgba[index] >> 24u);
+            vertices[index].z = static_cast<double>(depth);
+            vertices[index].zInteger = depth;
+        }
+        return buildGsDrawCommand(
+            sequence,
+            primitive,
+            context,
+            std::span<const GSVertex>(vertices),
+            global);
+    }
+
     void applyCt32SpriteCpu(
         std::vector<uint8_t> &vram,
         const GsVulkanCt32Sprite &sprite)
@@ -4343,6 +4392,121 @@ void register_ps2_gs_vulkan_tests()
             t.Equals(classifyGsFlatCt32Triangle(incomplete).reason,
                      GsFallbackReason::UnsupportedPrimitiveState,
                      "a nondegenerate partial command must not synthesize a third vertex");
+        });
+
+        tc.Run("Gouraud source-over depth triangle preparation retains ordered attributes", [](TestCase &t)
+        {
+            const std::array<uint32_t, 3> colors{{
+                0x80000000u,
+                0x800A0000u,
+                0x800F0000u,
+            }};
+            const GsDrawCommand command =
+                makeGouraudSourceOverDepthCt32TriangleCommand(
+                    31u,
+                    112u,
+                    8u,
+                    220u,
+                    GS_PSM_Z24,
+                    {4u, 15u, 3u, 12u},
+                    {32u, 16u},
+                    {289u, 209u, 65u},
+                    {33u, 65u, 209u},
+                    colors,
+                    0x12345678u);
+
+            GsVulkanGouraudDepthCt32Triangle triangle{
+                1u, 2u, 3u, 4u, 5u, 6u, 7u, 8u,
+                9u, 1u, 10, 11, 12, 13, 14, 15,
+                16u, 17u, 18u, 19u, 20u, 21u, 22u, 23u};
+            const GsBackendDecision decision =
+                prepareGsVulkanGouraudSourceOverDepthCt32Triangle(
+                    command, triangle);
+            t.IsTrue(decision.supported,
+                     "the measured Gouraud source-over Z24 triangle should be eligible");
+            t.Equals(decision.reason, GsFallbackReason::Supported,
+                     "eligible Gouraud preparation should retain the canonical reason");
+            t.Equals(triangle.framebufferBaseBlock, 3584u,
+                     "Gouraud FRAME page units should become 256-byte blocks");
+            t.Equals(triangle.framebufferWidth, 8u,
+                     "Gouraud preparation should retain framebuffer width");
+            t.Equals(triangle.depthBaseBlock, 7040u,
+                     "Gouraud ZBUF page units should become 256-byte blocks");
+            t.Equals(triangle.depthPsm, static_cast<uint32_t>(GS_PSM_Z24),
+                     "Gouraud preparation should retain the exact depth format");
+            t.Equals(triangle.depth, 0x12345678u,
+                     "constant integer depth should survive record preparation");
+            t.Equals(triangle.boundsX0, 4u,
+                     "Gouraud minimum X should be clipped exactly");
+            t.Equals(triangle.boundsY0, 3u,
+                     "Gouraud minimum Y should be clipped exactly");
+            t.Equals(triangle.boundsX1, 16u,
+                     "Gouraud maximum X should remain exclusive");
+            t.Equals(triangle.boundsY1, 13u,
+                     "Gouraud maximum Y should remain exclusive");
+            t.Equals(triangle.positiveArea, 0u,
+                     "the record should retain negative submitted winding");
+            t.Equals(triangle.vertex0X12_4, 257,
+                     "the first ordered vertex should retain signed 12.4 X");
+            t.Equals(triangle.vertex0Y12_4, 17,
+                     "the first ordered vertex should retain signed 12.4 Y");
+            t.Equals(triangle.vertex1X12_4, 177,
+                     "Gouraud preparation must not swap the second attribute owner");
+            t.Equals(triangle.vertex1Y12_4, 49,
+                     "the second ordered Y should remain paired with its color");
+            t.Equals(triangle.vertex2X12_4, 33,
+                     "Gouraud preparation must not swap the third attribute owner");
+            t.Equals(triangle.vertex2Y12_4, 193,
+                     "the third ordered Y should remain paired with its color");
+            t.Equals(triangle.rgba0, colors[0],
+                     "the first interpolated color should remain ordered");
+            t.Equals(triangle.rgba1, colors[1],
+                     "the second interpolated color should remain ordered");
+            t.Equals(triangle.rgba2, colors[2],
+                     "the third interpolated color should remain ordered");
+            t.Equals(triangle.topLeftEdgeMask, 5u,
+                     "negative winding should reverse the inclusive edge directions");
+            t.Equals(triangle.reserved0, 0u,
+                     "Gouraud record padding should be deterministic");
+            t.Equals(triangle.reserved1, 0u,
+                     "Gouraud record padding should remain clear");
+            t.Equals(triangle.reserved2, 0u,
+                     "Gouraud record padding should remain clear");
+            t.Equals(triangle.reserved3, 0u,
+                     "Gouraud record padding should remain clear");
+
+            std::array<GSVertex, 3> varyingDepth = command.vertices();
+            varyingDepth[1].zInteger += 1u;
+            varyingDepth[1].z += 1.0;
+            const GsDrawCommand rejected = buildGsDrawCommand(
+                32u,
+                command.primitive(),
+                command.context(),
+                std::span<const GSVertex>(varyingDepth),
+                command.globalState());
+            const GsVulkanGouraudDepthCt32Triangle sentinel = triangle;
+            const GsBackendDecision rejectedDecision =
+                prepareGsVulkanGouraudSourceOverDepthCt32Triangle(
+                    rejected, triangle);
+            t.Equals(rejectedDecision.reason,
+                     GsFallbackReason::UnsupportedDepthFunction,
+                     "varying Z should remain closed until depth interpolation is exact");
+            t.IsTrue(triangle == sentinel,
+                     "rejected Gouraud preparation must leave the record untouched");
+
+            std::array<GSVertex, 3> wrongAlpha = command.vertices();
+            wrongAlpha[2].a = 127u;
+            const GsDrawCommand nonNormalizable = buildGsDrawCommand(
+                33u,
+                command.primitive(),
+                command.context(),
+                std::span<const GSVertex>(wrongAlpha),
+                command.globalState());
+            t.Equals(
+                classifyGsGouraudSourceOverDepthCt32Triangle(
+                    nonNormalizable).reason,
+                GsFallbackReason::AlphaBlend,
+                "source-over must stay destination-dependent away from alpha 128");
         });
 
         tc.Run("CT32 triangle preparation matches exhaustive software edge coverage", [](TestCase &t)
