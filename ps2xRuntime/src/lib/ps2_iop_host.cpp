@@ -241,16 +241,9 @@ uint32_t PS2IopHostAdapter::allocateIopHandle(ps2x::iop::IopHandleKind kind)
         return handle;
     }
 
-    uint8_t *const rdram = m_activeRdram
-                               ? m_activeRdram
-                               : m_runtime.memory().getRDRAM();
-    if (!rdram)
-    {
-        return 0;
-    }
     return kind == ps2x::iop::IopHandleKind::RpcPacket
-               ? rpcAllocPacketAddr(rdram, &m_runtime)
-               : rpcAllocServerAddr(rdram, &m_runtime);
+               ? rpcAllocPacketHandle(&m_runtime)
+               : rpcAllocServerHandle(&m_runtime);
 }
 
 uint32_t PS2IopHostAdapter::allocateGuest(uint32_t size, uint32_t alignment)

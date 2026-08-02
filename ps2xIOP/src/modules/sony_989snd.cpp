@@ -16,7 +16,10 @@ namespace ps2x::iop::detail
         constexpr uint32_t kSony989sndSid = 0x00123456u;
         constexpr uint32_t kSony989sndLoadingSid = 0x00123457u;
         constexpr uint32_t kRpcStartSoundSystem = 0u;
+        constexpr uint32_t kRpcResolveBankReferences = 0x08u;
+        constexpr uint32_t kRpcStopAllSounds = 0x18u;
         constexpr uint32_t kRpcConfigureSoundSystem = 0x2Au;
+        constexpr uint32_t kRpcStopAllStreams = 0x34u;
         constexpr uint32_t kRpcWaitForLoads = 0x36u;
         constexpr uint32_t kRpcOpenVagStreaming = 0x3Bu;
         constexpr uint32_t kRpcCloseVagStreaming = 0x3Cu;
@@ -38,6 +41,7 @@ namespace ps2x::iop::detail
         constexpr uint32_t kMaximumCommandBatchCount = 1024u;
         constexpr uint32_t kCommandIdMask = 0xFFFFu;
         constexpr uint32_t kCommandPayloadSizeShift = 16u;
+        constexpr uint32_t kCommandIdUnloadBank = 0x06u;
         constexpr uint32_t kCommandId08 = 0x08u;
         constexpr uint32_t kCommandId09 = 0x09u;
         constexpr uint32_t kCommandId0B = 0x0Bu;
@@ -46,9 +50,15 @@ namespace ps2x::iop::detail
         constexpr uint32_t kCommandIdStopSound = 0x15u;
         constexpr uint32_t kCommandIdSoundIsStillPlaying = 0x19u;
         constexpr uint32_t kCommandIdSetSoundParams = 0x21u;
+        constexpr uint32_t kCommandIdPlayVagStreamByLocation = 0x2Cu;
+        constexpr uint32_t kCommandIdPauseVagStream = 0x2Du;
+        constexpr uint32_t kCommandIdContinueVagStream = 0x2Eu;
+        constexpr uint32_t kCommandIdGetVagStreamTimeRemaining = 0x32u;
         constexpr uint32_t kCommandIdDataReadCancel = 0x37u;
         constexpr uint32_t kCommandIdDataRead = 0x38u;
         constexpr uint32_t kCommandId4E = 0x4Eu;
+        constexpr uint32_t kCommandIdIsVagStreamBuffered = 0x4Fu;
+        constexpr uint32_t kCommandId50 = 0x50u;
         constexpr uint32_t kCommandId51 = 0x51u;
         constexpr uint32_t kCdSectorSize = 2048u;
         constexpr uint32_t kSoundBankLoadRequestSize = 2u * sizeof(uint32_t);
@@ -182,6 +192,34 @@ namespace ps2x::iop::detail
                     supported = true;
                     responseResult = 1u;
                 }
+                if (request.function == kRpcResolveBankReferences &&
+                    request.send.size == 0u)
+                {
+                    for (LoadedSoundBank &bank : m_loadedSoundBanks)
+                    {
+                        bank.ready = true;
+                    }
+                    supported = true;
+                    notifyAudioBackend = true;
+                    // The retail handler resolves each loaded bank's cross-bank
+                    // references but does not write the shared result word.
+                }
+                if (request.function == kRpcStopAllSounds &&
+                    request.send.size == 0u)
+                {
+                    m_activeSoundHandles.clear();
+                    supported = true;
+                    notifyAudioBackend = true;
+                    // The original RPC leaves the shared result word untouched.
+                }
+                if (request.function == kRpcStopAllStreams &&
+                    request.send.size == 0u)
+                {
+                    stopVagStreaming();
+                    supported = true;
+                    notifyAudioBackend = true;
+                    // The original RPC leaves the shared result word untouched.
+                }
                 if (request.function == kRpcWaitForLoads &&
                     request.send.size == kWaitForLoadsRequestSize)
                 {
@@ -301,7 +339,10 @@ namespace ps2x::iop::detail
                     return result;
                 }
 
-                if (request.function != kRpcCloseVagStreaming &&
+                if (request.function != kRpcResolveBankReferences &&
+                    request.function != kRpcStopAllSounds &&
+                    request.function != kRpcStopAllStreams &&
+                    request.function != kRpcCloseVagStreaming &&
                     request.function != kRpcStopVagStreaming &&
                     request.function != kRpcStartVagStreaming &&
                     request.function != kRpcSubmitVagStreaming)
@@ -455,6 +496,27 @@ namespace ps2x::iop::detail
                 for (uint32_t index = 0u; index < commands.size(); ++index)
                 {
                     const ParsedSoundCommand &command = commands[index];
+                    if (command.id == kCommandIdUnloadBank)
+                    {
+                        uint32_t bankHandle = 0u;
+                        if (!m_host.readGuest(command.payloadAddress,
+                                              &bankHandle,
+                                              sizeof(bankHandle)))
+                        {
+                            warnCommandBatch("cannot read unload-bank payload");
+                            return result;
+                        }
+                        m_loadedSoundBanks.erase(
+                            std::remove_if(m_loadedSoundBanks.begin(),
+                                           m_loadedSoundBanks.end(),
+                                           [bankHandle](const LoadedSoundBank &bank)
+                                           { return bank.handle == bankHandle; }),
+                            m_loadedSoundBanks.end());
+
+                        // The retail command wrapper explicitly clears its
+                        // shared result after attempting the bank release.
+                        response[index + 1u] = 0u;
+                    }
                     if (command.id == kCommandId08)
                     {
                         for (LoadedSoundBank &bank : m_loadedSoundBanks)
@@ -487,7 +549,8 @@ namespace ps2x::iop::detail
                             return result;
                         }
                     }
-                    if (command.id == kCommandIdPlaySound)
+                    if (command.id == kCommandIdPlaySound ||
+                        command.id == kCommandIdPlayVagStreamByLocation)
                     {
                         const uint32_t soundHandle =
                             m_host.allocateIopHandle(IopHandleKind::ServiceResource);
@@ -498,6 +561,37 @@ namespace ps2x::iop::detail
                         }
                         response[index + 1u] = soundHandle;
                         m_activeSoundHandles.push_back(soundHandle);
+                    }
+                    if (command.id == kCommandIdPauseVagStream ||
+                        command.id == kCommandIdContinueVagStream)
+                    {
+                        uint32_t soundHandle = 0u;
+                        if (!m_host.readGuest(command.payloadAddress,
+                                              &soundHandle,
+                                              sizeof(soundHandle)))
+                        {
+                            warnCommandBatch("cannot read VAG stream control payload");
+                            return result;
+                        }
+                        // Paused VAG streams remain active and queryable. The
+                        // host audio backend receives pause and continue below
+                        // and owns the presentation-side state.
+                    }
+                    if (command.id == kCommandIdGetVagStreamTimeRemaining)
+                    {
+                        uint32_t soundHandle = 0u;
+                        if (!m_host.readGuest(command.payloadAddress,
+                                              &soundHandle,
+                                              sizeof(soundHandle)))
+                        {
+                            warnCommandBatch("cannot read VAG time-remaining payload");
+                            return result;
+                        }
+                        // Retail returns zero for an invalid or non-finite
+                        // stream. Host-backed VAG streams currently expose no
+                        // finite-duration metadata, matching the live looping
+                        // RAC1 stream observed through this command.
+                        response[index + 1u] = 0u;
                     }
                     if (command.id == kCommandIdStopSound)
                     {
@@ -540,6 +634,26 @@ namespace ps2x::iop::detail
                         response[index + 1u] =
                             activeSoundHandle(parameters[0]);
                     }
+                    if (command.id == kCommandIdIsVagStreamBuffered)
+                    {
+                        uint32_t soundHandle = 0u;
+                        if (!m_host.readGuest(command.payloadAddress,
+                                              &soundHandle,
+                                              sizeof(soundHandle)))
+                        {
+                            warnCommandBatch("cannot read stream-buffered payload");
+                            return result;
+                        }
+                        response[index + 1u] =
+                            isVagStreamBuffered(soundHandle);
+                    }
+                    if (command.id == kCommandId50)
+                    {
+                        // Unlike commands which retain the queue's success
+                        // word, the 989snd server explicitly completes this
+                        // five-word configuration command with zero.
+                        response[index + 1u] = 0u;
+                    }
                 }
 
                 if (!m_host.writeGuest(request.receive.address,
@@ -570,7 +684,9 @@ namespace ps2x::iop::detail
             [[nodiscard]] static bool isSupportedCommand(uint32_t commandId,
                                                           uint32_t payloadSize)
             {
-                return (commandId == kCommandId08 && payloadSize == 0u) ||
+                return (commandId == kCommandIdUnloadBank &&
+                        payloadSize == sizeof(uint32_t)) ||
+                       (commandId == kCommandId08 && payloadSize == 0u) ||
                        (commandId == kCommandId09 &&
                         payloadSize == 2u * sizeof(uint32_t)) ||
                        (commandId == kCommandId0B &&
@@ -579,6 +695,14 @@ namespace ps2x::iop::detail
                         payloadSize == 2u * sizeof(uint32_t)) ||
                        (commandId == kCommandIdPlaySound &&
                         payloadSize == 6u * sizeof(uint32_t)) ||
+                       (commandId == kCommandIdPlayVagStreamByLocation &&
+                        payloadSize == 7u * sizeof(uint32_t)) ||
+                       (commandId == kCommandIdPauseVagStream &&
+                        payloadSize == sizeof(uint32_t)) ||
+                       (commandId == kCommandIdContinueVagStream &&
+                        payloadSize == sizeof(uint32_t)) ||
+                       (commandId == kCommandIdGetVagStreamTimeRemaining &&
+                        payloadSize == sizeof(uint32_t)) ||
                        (commandId == kCommandIdStopSound &&
                         payloadSize == sizeof(uint32_t)) ||
                        (commandId == kCommandIdSoundIsStillPlaying &&
@@ -591,6 +715,10 @@ namespace ps2x::iop::detail
                         payloadSize == 3u * sizeof(uint32_t)) ||
                        (commandId == kCommandId4E &&
                         payloadSize == 3u * sizeof(uint32_t)) ||
+                       (commandId == kCommandIdIsVagStreamBuffered &&
+                        payloadSize == sizeof(uint32_t)) ||
+                       (commandId == kCommandId50 &&
+                        payloadSize == 5u * sizeof(uint32_t)) ||
                        (commandId == kCommandId51 &&
                         payloadSize == 2u * sizeof(uint32_t));
             }
@@ -650,6 +778,14 @@ namespace ps2x::iop::detail
                                  soundHandle) != m_activeSoundHandles.end()
                            ? soundHandle
                            : 0u;
+            }
+
+            [[nodiscard]] uint32_t isVagStreamBuffered(uint32_t soundHandle) const
+            {
+                // Retail returns -1 for an invalid handle and otherwise the
+                // stream handler's buffered bit. HLE-created VAG streams are
+                // ready as soon as their opaque handle is published.
+                return activeSoundHandle(soundHandle) != 0u ? 1u : 0xFFFFFFFFu;
             }
 
             [[nodiscard]] uint32_t loadSoundBankFromCd(uint32_t sector,

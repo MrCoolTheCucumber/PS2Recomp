@@ -271,6 +271,8 @@ namespace
 {
     constexpr uint32_t LIBSD_CMD_SET_VOICE = 0x8010u;
     constexpr uint32_t SONY_989SND_SID = 0x00123456u;
+    constexpr uint32_t SONY_989SND_STOP_ALL_SOUNDS = 0x18u;
+    constexpr uint32_t SONY_989SND_STOP_ALL_STREAMS = 0x34u;
     constexpr uint32_t SONY_989SND_OPEN_STREAM = 0x3Bu;
     constexpr uint32_t SONY_989SND_CLOSE_STREAM = 0x3Cu;
     constexpr uint32_t SONY_989SND_STOP_STREAM = 0x3Du;
@@ -394,6 +396,12 @@ void PS2AudioBackend::handleSony989sndCommand(uint32_t rpcNum,
 {
     Impl::SpuAdpcmStream &stream = m_impl->spuAdpcmStream;
 
+    if (rpcNum == SONY_989SND_STOP_ALL_SOUNDS)
+    {
+        stopAllSounds();
+        return;
+    }
+
     if (rpcNum == SONY_989SND_OPEN_STREAM)
     {
         closeSpuAdpcmStream();
@@ -420,7 +428,8 @@ void PS2AudioBackend::handleSony989sndCommand(uint32_t rpcNum,
         return;
     }
 
-    if (rpcNum == SONY_989SND_STOP_STREAM)
+    if (rpcNum == SONY_989SND_STOP_ALL_STREAMS ||
+        rpcNum == SONY_989SND_STOP_STREAM)
     {
         AudioStream hostStream{};
         bool loaded = false;
@@ -657,7 +666,11 @@ void PS2AudioBackend::stop(uint32_t voiceId)
 void PS2AudioBackend::stopAll()
 {
     closeSpuAdpcmStream();
+    stopAllSounds();
+}
 
+void PS2AudioBackend::stopAllSounds()
+{
     std::lock_guard<std::mutex> lock(m_mutex);
 #if defined(PLATFORM_VITA)
     return;

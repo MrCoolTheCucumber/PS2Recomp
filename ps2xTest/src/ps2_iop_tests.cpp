@@ -442,7 +442,7 @@ void register_ps2_iop_tests()
                         "Fatal Frame profile should expose SDRDRV");
         });
 
-        tc.Run("Sony 989snd loads a validated CD sound bank and reports idle", [](TestCase &t)
+        tc.Run("Sony 989snd loads and unloads a validated CD sound bank", [](TestCase &t)
         {
             FakeIopHost host;
             ps2x::iop::IopSubsystem subsystem(host);
@@ -506,6 +506,52 @@ void register_ps2_iop_tests()
                      "a completed synchronous bank load should report idle");
             t.Equals(host.readWord(kReceiveAddress + 8u), 0xFFFFFFFFu,
                      "the main response should retain its trailing sentinel");
+
+            constexpr std::array<uint32_t, 3> kUnloadBank{
+                1u,
+                (sizeof(uint32_t) << 16u) | 0x06u,
+                0x8000u,
+            };
+            (void)host.writeGuest(kSendAddress,
+                                  kUnloadBank.data(),
+                                  sizeof(kUnloadBank));
+            ps2x::iop::RpcRequest unload{};
+            unload.sid = kMainSid;
+            unload.function = 0x4Du;
+            unload.send = {kSendAddress, sizeof(kUnloadBank)};
+            unload.receive = {kReceiveAddress, 12u};
+            const ps2x::iop::RpcResult unloadResult = subsystem.handleRpc(unload);
+            t.IsTrue(unloadResult.handled,
+                     "989snd command 0x06 should unload a sound bank");
+            t.Equals(host.readWord(kReceiveAddress), 0xFFFFFFFFu,
+                     "the unload response should retain its leading sentinel");
+            t.Equals(host.readWord(kReceiveAddress + 4u), 0u,
+                     "the unload command should return zero");
+            t.Equals(host.readWord(kReceiveAddress + 8u), 0xFFFFFFFFu,
+                     "the unload response should retain its trailing sentinel");
+            t.Equals(host.audioCalls, 1u,
+                     "the audio backend should observe the bank unload");
+            t.Equals(host.lastAudioFunction, 0x06u,
+                     "the backend notification should identify command 0x06");
+            t.Equals(host.lastAudioSend.address, kSendAddress + 8u,
+                     "the backend should receive the bank-handle payload address");
+            t.Equals(host.lastAudioSend.size, sizeof(uint32_t),
+                     "the backend should receive exactly one bank handle");
+
+            constexpr std::array<uint32_t, 4> kMalformedUnload{
+                1u,
+                (2u * sizeof(uint32_t) << 16u) | 0x06u,
+                0x8000u,
+                0u,
+            };
+            (void)host.writeGuest(kSendAddress,
+                                  kMalformedUnload.data(),
+                                  sizeof(kMalformedUnload));
+            unload.send.size = sizeof(kMalformedUnload);
+            t.IsFalse(subsystem.handleRpc(unload).handled,
+                      "989snd command 0x06 should reject a two-word payload");
+            t.Equals(host.audioCalls, 1u,
+                     "a malformed unload must not reach the audio backend");
 
             load.send.size = sizeof(uint32_t);
             t.IsFalse(subsystem.handleRpc(load).handled,
@@ -796,6 +842,307 @@ void register_ps2_iop_tests()
                      "reset should clear every tracked sound handle");
         });
 
+        tc.Run("Sony 989snd VAG stream play returns a tracked handle", [](TestCase &t)
+        {
+            FakeIopHost host;
+            ps2x::iop::IopSubsystem subsystem(host);
+
+            constexpr uint32_t kSid = 0x00123456u;
+            constexpr uint32_t kSendAddress = 0x1000u;
+            constexpr uint32_t kReceiveAddress = 0x1100u;
+            std::array<uint32_t, 9> playBatch{
+                1u,
+                (28u << 16u) | 0x2Cu,
+                0x001790C6u,
+                0u,
+                0x00040000u,
+                0x01000000u,
+                0u,
+                0x20000000u,
+                0u,
+            };
+            (void)host.writeGuest(kSendAddress,
+                                  playBatch.data(),
+                                  sizeof(playBatch));
+
+            ps2x::iop::RpcRequest request{};
+            request.sid = kSid;
+            request.function = 0x4Du;
+            request.send = {kSendAddress, sizeof(playBatch)};
+            request.receive = {kReceiveAddress, 12u};
+            const ps2x::iop::RpcResult result = subsystem.handleRpc(request);
+
+            const uint32_t soundHandle = host.readWord(kReceiveAddress + 4u);
+            t.IsTrue(result.handled,
+                     "a 28-byte VAG stream-by-location command should be handled");
+            t.Equals(host.readWord(kReceiveAddress), 0xFFFFFFFFu,
+                     "a VAG stream response should begin with a sentinel");
+            t.IsTrue(soundHandle != 0u,
+                     "VAG stream play should return an opaque sound handle");
+            t.Equals(host.readWord(kReceiveAddress + 8u), 0xFFFFFFFFu,
+                     "a VAG stream response should end with a sentinel");
+            t.Equals(host.audioCalls, 1u,
+                     "the native audio backend should observe VAG stream play");
+            t.Equals(host.lastAudioFunction, 0x2Cu,
+                     "the backend notification should preserve the VAG stream command ID");
+            t.Equals(host.lastAudioSend.address, kSendAddress + 8u,
+                     "the backend should receive the VAG stream payload");
+            t.Equals(host.lastAudioSend.size, 28u,
+                     "the backend should receive the complete VAG stream payload");
+            t.Equals(host.lastAudioReceive.address, kReceiveAddress + 4u,
+                     "the backend should receive the matching stream-handle slot");
+
+            const std::array<uint32_t, 3> pauseBatch{
+                1u,
+                (4u << 16u) | 0x2Du,
+                soundHandle,
+            };
+            (void)host.writeGuest(kSendAddress,
+                                  pauseBatch.data(),
+                                  sizeof(pauseBatch));
+            request.send.size = sizeof(pauseBatch);
+            t.IsTrue(subsystem.handleRpc(request).handled,
+                     "a VAG stream pause command should be handled");
+            t.Equals(host.readWord(kReceiveAddress), 0xFFFFFFFFu,
+                     "a VAG pause response should begin with a sentinel");
+            t.Equals(host.readWord(kReceiveAddress + 4u), 1u,
+                     "VAG pause should retain the command success word");
+            t.Equals(host.readWord(kReceiveAddress + 8u), 0xFFFFFFFFu,
+                     "a VAG pause response should end with a sentinel");
+            t.Equals(host.lastAudioFunction, 0x2Du,
+                     "the backend should observe the VAG pause command");
+
+            const std::array<uint32_t, 3> continueBatch{
+                1u,
+                (4u << 16u) | 0x2Eu,
+                soundHandle,
+            };
+            (void)host.writeGuest(kSendAddress,
+                                  continueBatch.data(),
+                                  sizeof(continueBatch));
+            request.send.size = sizeof(continueBatch);
+            t.IsTrue(subsystem.handleRpc(request).handled,
+                     "a VAG stream continue command should be handled");
+            t.Equals(host.readWord(kReceiveAddress), 0xFFFFFFFFu,
+                     "a VAG continue response should begin with a sentinel");
+            t.Equals(host.readWord(kReceiveAddress + 4u), 1u,
+                     "VAG continue should retain the command success word");
+            t.Equals(host.readWord(kReceiveAddress + 8u), 0xFFFFFFFFu,
+                     "a VAG continue response should end with a sentinel");
+            t.Equals(host.lastAudioFunction, 0x2Eu,
+                     "the backend should observe the VAG continue command");
+
+            std::array<uint32_t, 3> timeRemainingBatch{
+                1u,
+                (4u << 16u) | 0x32u,
+                soundHandle,
+            };
+            (void)host.writeGuest(kSendAddress,
+                                  timeRemainingBatch.data(),
+                                  sizeof(timeRemainingBatch));
+            request.send.size = sizeof(timeRemainingBatch);
+            t.IsTrue(subsystem.handleRpc(request).handled,
+                     "a VAG time-remaining query should be handled");
+            t.Equals(host.readWord(kReceiveAddress), 0xFFFFFFFFu,
+                     "a VAG time response should begin with a sentinel");
+            t.Equals(host.readWord(kReceiveAddress + 4u), 0u,
+                     "a host-backed VAG stream without finite duration should return zero");
+            t.Equals(host.readWord(kReceiveAddress + 8u), 0xFFFFFFFFu,
+                     "a VAG time response should end with a sentinel");
+            t.Equals(host.lastAudioFunction, 0x32u,
+                     "the backend should observe the VAG time query");
+
+            timeRemainingBatch[2] = 0xDEADBEEFu;
+            (void)host.writeGuest(kSendAddress,
+                                  timeRemainingBatch.data(),
+                                  sizeof(timeRemainingBatch));
+            t.IsTrue(subsystem.handleRpc(request).handled,
+                     "a VAG time query for an invalid handle should complete");
+            t.Equals(host.readWord(kReceiveAddress + 4u), 0u,
+                     "an invalid VAG handle should reproduce the retail zero result");
+
+            std::array<uint32_t, 3> statusBatch{
+                1u,
+                (4u << 16u) | 0x19u,
+                soundHandle,
+            };
+            (void)host.writeGuest(kSendAddress,
+                                  statusBatch.data(),
+                                  sizeof(statusBatch));
+            request.send.size = sizeof(statusBatch);
+            t.IsTrue(subsystem.handleRpc(request).handled,
+                     "a VAG stream handle should be queryable");
+            t.Equals(host.readWord(kReceiveAddress + 4u), soundHandle,
+                     "a VAG stream handle should remain active");
+
+            std::array<uint32_t, 21> bufferedBatch{
+                7u,
+                (8u << 16u) | 0x09u,
+                1u,
+                0u,
+                (8u << 16u) | 0x09u,
+                0u,
+                0x199u,
+                (8u << 16u) | 0x09u,
+                3u,
+                0x166u,
+                (8u << 16u) | 0x09u,
+                2u,
+                0x333u,
+                (8u << 16u) | 0x09u,
+                4u,
+                0x2CCu,
+                (8u << 16u) | 0x09u,
+                5u,
+                0x400u,
+                (4u << 16u) | 0x4Fu,
+                soundHandle,
+            };
+            (void)host.writeGuest(kSendAddress,
+                                  bufferedBatch.data(),
+                                  sizeof(bufferedBatch));
+            request.send.size = sizeof(bufferedBatch);
+            request.receive.size = 9u * sizeof(uint32_t);
+            t.IsTrue(subsystem.handleRpc(request).handled,
+                     "the live seven-command stream-buffer query should be handled");
+            t.Equals(host.readWord(kReceiveAddress), 0xFFFFFFFFu,
+                     "a stream-buffer query response should begin with a sentinel");
+            for (uint32_t index = 0u; index < 6u; ++index)
+            {
+                t.Equals(host.readWord(kReceiveAddress +
+                                       (index + 1u) * sizeof(uint32_t)),
+                         1u,
+                         "the preceding parameter commands should retain success");
+            }
+            t.Equals(host.readWord(kReceiveAddress + 7u * sizeof(uint32_t)),
+                     1u,
+                     "an active HLE sound should report buffered");
+            t.Equals(host.readWord(kReceiveAddress + 8u * sizeof(uint32_t)),
+                     0xFFFFFFFFu,
+                     "a stream-buffer query response should end with a sentinel");
+            t.Equals(host.lastAudioFunction, 0x4Fu,
+                     "the backend should observe the stream-buffer query");
+
+            std::array<uint32_t, 3> unknownBufferedBatch{
+                1u,
+                (4u << 16u) | 0x4Fu,
+                0xDEADBEEFu,
+            };
+            (void)host.writeGuest(kSendAddress,
+                                  unknownBufferedBatch.data(),
+                                  sizeof(unknownBufferedBatch));
+            request.send.size = sizeof(unknownBufferedBatch);
+            request.receive.size = 3u * sizeof(uint32_t);
+            t.IsTrue(subsystem.handleRpc(request).handled,
+                     "a stream-buffer query for an invalid handle should complete");
+            t.Equals(host.readWord(kReceiveAddress + sizeof(uint32_t)),
+                     0xFFFFFFFFu,
+                     "an invalid stream handle should reproduce the retail -1 result");
+
+            playBatch[1] = (24u << 16u) | 0x2Cu;
+            (void)host.writeGuest(kSendAddress,
+                                  playBatch.data(),
+                                  8u * sizeof(uint32_t));
+            request.send.size = 8u * sizeof(uint32_t);
+            t.IsFalse(subsystem.handleRpc(request).handled,
+                      "VAG stream-by-location should reject a truncated payload");
+            t.Equals(host.audioCalls, 14u,
+                     "a malformed VAG stream command must not reach the audio backend");
+        });
+
+        tc.Run("Sony 989snd stop-all RPC retires sounds and preserves the shared result", [](TestCase &t)
+        {
+            FakeIopHost host;
+            ps2x::iop::IopSubsystem subsystem(host);
+
+            constexpr uint32_t kSid = 0x00123456u;
+            constexpr uint32_t kSendAddress = 0x1000u;
+            constexpr uint32_t kReceiveAddress = 0x1100u;
+            constexpr std::array<uint32_t, 8> kPlayBatch{
+                1u,
+                (24u << 16u) | 0x11u,
+                0x100000u,
+                3u,
+                0x400u,
+                0u,
+                0u,
+                0u,
+            };
+            (void)host.writeGuest(kSendAddress,
+                                  kPlayBatch.data(),
+                                  sizeof(kPlayBatch));
+
+            ps2x::iop::RpcRequest request{};
+            request.sid = kSid;
+            request.function = 0x4Du;
+            request.send = {kSendAddress, sizeof(kPlayBatch)};
+            request.receive = {kReceiveAddress, 12u};
+            t.IsTrue(subsystem.handleRpc(request).handled,
+                     "a play command should establish an active sound");
+            const uint32_t soundHandle = host.readWord(kReceiveAddress + 4u);
+            t.IsTrue(soundHandle != 0u,
+                     "a play command should return a sound handle");
+
+            constexpr std::array<uint32_t, 6> kOpenStream{
+                0x400u,
+                0x1000u,
+                0x400u,
+                0u,
+                5u,
+                3u,
+            };
+            (void)host.writeGuest(kSendAddress,
+                                  kOpenStream.data(),
+                                  sizeof(kOpenStream));
+            request.function = 0x3Bu;
+            request.send.size = sizeof(kOpenStream);
+            t.IsTrue(subsystem.handleRpc(request).handled,
+                     "streaming open should seed a non-default shared result");
+            const uint32_t previousResult = host.readWord(kReceiveAddress + 4u);
+            t.IsTrue(previousResult != 0u && previousResult != 1u,
+                     "streaming open should return a distinct resource handle");
+
+            request.function = 0x18u;
+            request.send = {};
+            const ps2x::iop::RpcResult stopAllResult = subsystem.handleRpc(request);
+            t.IsTrue(stopAllResult.handled,
+                     "the stop-all-sounds RPC should be handled");
+            t.Equals(stopAllResult.resultAddress, kReceiveAddress,
+                     "the stop-all-sounds RPC should return its completion record");
+            t.Equals(host.readWord(kReceiveAddress), 0xFFFFFFFFu,
+                     "the stop-all-sounds response should begin with a sentinel");
+            t.Equals(host.readWord(kReceiveAddress + 4u), previousResult,
+                     "the stop-all-sounds RPC should preserve the shared result word");
+            t.Equals(host.readWord(kReceiveAddress + 8u), 0xFFFFFFFFu,
+                     "the stop-all-sounds response should end with a sentinel");
+            t.Equals(host.lastAudioSid, kSid,
+                     "the backend should receive the 989snd server ID");
+            t.Equals(host.lastAudioFunction, 0x18u,
+                     "the backend should observe the stop-all-sounds RPC");
+            t.Equals(host.lastAudioSend.size, 0u,
+                     "the backend stop-all notification should have no payload");
+
+            const std::array<uint32_t, 3> statusBatch{
+                1u,
+                (4u << 16u) | 0x19u,
+                soundHandle,
+            };
+            (void)host.writeGuest(kSendAddress,
+                                  statusBatch.data(),
+                                  sizeof(statusBatch));
+            request.function = 0x4Du;
+            request.send = {kSendAddress, sizeof(statusBatch)};
+            t.IsTrue(subsystem.handleRpc(request).handled,
+                     "a stopped sound should remain queryable");
+            t.Equals(host.readWord(kReceiveAddress + 4u), 0u,
+                     "stop all should retire every active sound handle");
+
+            request.function = 0x18u;
+            request.send = {kSendAddress, sizeof(uint32_t)};
+            t.IsFalse(subsystem.handleRpc(request).handled,
+                      "the stop-all-sounds RPC should reject a payload");
+        });
+
         tc.Run("Sony 989snd streaming position follows virtual SPU time", [](TestCase &t)
         {
             FakeIopHost host;
@@ -1006,6 +1353,76 @@ void register_ps2_iop_tests()
 
             t.IsFalse(call(0x3Du, sizeof(uint32_t)).handled,
                       "streaming stop should reject an unexpected request body");
+        });
+
+        tc.Run("Sony 989snd stop-all-streams freezes playback and preserves the shared result", [](TestCase &t)
+        {
+            FakeIopHost host;
+            ps2x::iop::IopSubsystem subsystem(host);
+
+            constexpr uint32_t kSid = 0x00123456u;
+            constexpr uint32_t kSendAddress = 0x1000u;
+            constexpr uint32_t kReceiveAddress = 0x1100u;
+            auto call = [&](uint32_t function, uint32_t sendSize) {
+                ps2x::iop::RpcRequest request{};
+                request.sid = kSid;
+                request.function = function;
+                request.send = {sendSize == 0u ? 0u : kSendAddress, sendSize};
+                request.receive = {kReceiveAddress, 12u};
+                return subsystem.handleRpc(request);
+            };
+
+            constexpr std::array<uint32_t, 6> kOpen{
+                0x400u, 0x1000u, 0x400u, 0u, 5u, 3u,
+            };
+            (void)host.writeGuest(kSendAddress, kOpen.data(), sizeof(kOpen));
+            t.IsTrue(call(0x3Bu, sizeof(kOpen)).handled,
+                     "streaming-open RPC should be handled");
+            const uint32_t workArea = host.readWord(kReceiveAddress + 4u);
+            t.IsTrue(workArea != 0u,
+                     "streaming-open RPC should allocate a work area");
+
+            constexpr std::array<uint32_t, 2> kTransfer{0x400u, 0u};
+            (void)host.writeGuest(kSendAddress, kTransfer.data(), sizeof(kTransfer));
+            t.IsTrue(call(0x5Au, sizeof(kTransfer)).handled,
+                     "streaming transfer should prime playback");
+
+            const std::array<uint32_t, 5> playback{
+                workArea, 0x400u, 0u, 44100u, 2u,
+            };
+            (void)host.writeGuest(kSendAddress, playback.data(), sizeof(playback));
+            t.IsTrue(call(0x3Eu, sizeof(playback)).handled,
+                     "streaming playback should start");
+
+            host.virtualTime = 16'666'667u;
+            t.IsTrue(call(0x5Bu, 0u).handled,
+                     "streaming position should expose a non-default shared result");
+            constexpr uint32_t kFrozenPosition = 0x1A4u;
+            t.Equals(host.readWord(kReceiveAddress + 4u), kFrozenPosition,
+                     "one video tick should advance the streaming cursor");
+
+            const ps2x::iop::RpcResult stopAllResult = call(0x34u, 0u);
+            t.IsTrue(stopAllResult.handled,
+                     "the stop-all-streams RPC should be handled");
+            t.Equals(stopAllResult.resultAddress, kReceiveAddress,
+                     "stop all streams should return its completion record");
+            t.Equals(host.readWord(kReceiveAddress), 0xFFFFFFFFu,
+                     "the stop-all-streams response should begin with a sentinel");
+            t.Equals(host.readWord(kReceiveAddress + 4u), kFrozenPosition,
+                     "stop all streams should preserve the shared result word");
+            t.Equals(host.readWord(kReceiveAddress + 8u), 0xFFFFFFFFu,
+                     "the stop-all-streams response should end with a sentinel");
+            t.Equals(host.lastAudioFunction, 0x34u,
+                     "the backend should observe the stop-all-streams RPC");
+
+            host.virtualTime = 1'000'000'000u;
+            t.IsTrue(call(0x5Bu, 0u).handled,
+                     "a stopped stream should remain open");
+            t.Equals(host.readWord(kReceiveAddress + 4u), kFrozenPosition,
+                     "stop all streams should freeze the encoded-byte cursor");
+
+            t.IsFalse(call(0x34u, sizeof(uint32_t)).handled,
+                      "stop all streams should reject an unexpected request body");
         });
 
         tc.Run("two subsystem instances isolate profile state and reset deterministically", [](TestCase &t)

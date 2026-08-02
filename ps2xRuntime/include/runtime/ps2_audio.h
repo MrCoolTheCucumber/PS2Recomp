@@ -91,6 +91,7 @@ private:
     void renderSpuAdpcmFramesForTesting(
         void *bufferData,
         unsigned int frameCount);
+    void stopAllSounds();
     void destroySpuAdpcmHostStream();
     void closeSpuAdpcmStream();
 
