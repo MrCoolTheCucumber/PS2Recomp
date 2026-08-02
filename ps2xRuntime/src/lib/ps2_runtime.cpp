@@ -5486,6 +5486,12 @@ void PS2Runtime::configureIoPathsFromElf(const std::string &elfPath)
 
 namespace
 {
+    constexpr size_t kMaxRecompiledModules = 32u;
+    std::array<
+        std::atomic<const PS2RecompiledModuleDescriptor *>,
+        kMaxRecompiledModules>
+        g_recompiledModules{};
+
     uint32_t normalizeGuestFunctionAddress(uint32_t address)
     {
         uint32_t offset = 0u;
@@ -5530,6 +5536,114 @@ namespace
         return g_ps2RecompiledFunctionTable[slot];
     }
 
+    bool recompiledModuleMatches(
+        const PS2RecompiledModuleDescriptor &module,
+        const uint8_t *rdram)
+    {
+        if (rdram == nullptr)
+        {
+            return false;
+        }
+
+        uint32_t offset = 0u;
+        if (!ps2ResolveDirectRdramOffset(module.matchAddress, offset) ||
+            offset > PS2_RAM_SIZE ||
+            module.matchSize > PS2_RAM_SIZE - offset)
+        {
+            return false;
+        }
+        return std::memcmp(
+                   rdram + offset,
+                   module.matchBytes,
+                   module.matchSize) == 0;
+    }
+
+    PS2Runtime::RecompiledFunction recompiledModuleFunction(
+        const PS2RecompiledModuleDescriptor &module,
+        uint32_t address)
+    {
+        uint32_t first = 0u;
+        uint32_t last = module.functionCount;
+        while (first < last)
+        {
+            const uint32_t middle = first + ((last - first) / 2u);
+            if (module.functions[middle].address < address)
+            {
+                first = middle + 1u;
+            }
+            else
+            {
+                last = middle;
+            }
+        }
+        if (first < module.functionCount &&
+            module.functions[first].address == address)
+        {
+            return module.functions[first].function;
+        }
+        return nullptr;
+    }
+
+    PS2Runtime::RecompiledFunction activeRecompiledModuleFunction(
+        uint32_t address,
+        const uint8_t *rdram)
+    {
+        for (const auto &slot : g_recompiledModules)
+        {
+            const PS2RecompiledModuleDescriptor *module =
+                slot.load(std::memory_order_acquire);
+            if (module == nullptr)
+            {
+                continue;
+            }
+
+            PS2Runtime::RecompiledFunction function =
+                recompiledModuleFunction(*module, address);
+            if (function != nullptr &&
+                recompiledModuleMatches(*module, rdram))
+            {
+                return function;
+            }
+        }
+        return nullptr;
+    }
+
+    PS2Runtime::RecompiledFunction activeRecompiledFunction(
+        uint32_t address,
+        const uint8_t *rdram)
+    {
+        PS2Runtime::RecompiledFunction moduleFunction =
+            activeRecompiledModuleFunction(address, rdram);
+        return moduleFunction != nullptr
+                   ? moduleFunction
+                   : generatedFunctionAtNormalizedAddress(address);
+    }
+
+    bool activeRecompiledModuleCodeAddress(
+        uint32_t address,
+        const uint8_t *rdram)
+    {
+        for (const auto &slot : g_recompiledModules)
+        {
+            const PS2RecompiledModuleDescriptor *module =
+                slot.load(std::memory_order_acquire);
+            if (module == nullptr ||
+                !recompiledModuleMatches(*module, rdram))
+            {
+                continue;
+            }
+            for (uint32_t index = 0u; index < module->symbolCount; ++index)
+            {
+                const PS2GuestFunctionSymbol &symbol = module->symbols[index];
+                if (address >= symbol.start && address < symbol.end)
+                {
+                    return true;
+                }
+            }
+        }
+        return false;
+    }
+
     const PS2GuestFunctionSymbol *findGuestFunctionSymbol(uint32_t address)
     {
         address = normalizeGuestFunctionAddress(address);
@@ -5560,6 +5674,80 @@ namespace
         }
         return nullptr;
     }
+}
+
+bool ps2RegisterRecompiledModule(
+    const PS2RecompiledModuleDescriptor *descriptor) noexcept
+{
+    if (descriptor == nullptr || descriptor->name == nullptr ||
+        descriptor->name[0] == '\0' || descriptor->matchBytes == nullptr ||
+        descriptor->matchSize < 4u || descriptor->matchSize > 4096u ||
+        descriptor->functions == nullptr || descriptor->functionCount == 0u ||
+        (descriptor->symbolCount != 0u && descriptor->symbols == nullptr))
+    {
+        return false;
+    }
+
+    uint32_t matchOffset = 0u;
+    if (!ps2ResolveDirectRdramOffset(descriptor->matchAddress, matchOffset) ||
+        matchOffset > PS2_RAM_SIZE ||
+        descriptor->matchSize > PS2_RAM_SIZE - matchOffset)
+    {
+        return false;
+    }
+
+    uint32_t previousAddress = 0u;
+    for (uint32_t index = 0u; index < descriptor->functionCount; ++index)
+    {
+        const PS2RecompiledModuleFunction &entry = descriptor->functions[index];
+        if (entry.function == nullptr || (entry.address & 3u) != 0u ||
+            entry.address >= PS2_RAM_SIZE ||
+            (index != 0u && entry.address <= previousAddress))
+        {
+            return false;
+        }
+        previousAddress = entry.address;
+    }
+
+    for (uint32_t index = 0u; index < descriptor->symbolCount; ++index)
+    {
+        const PS2GuestFunctionSymbol &symbol = descriptor->symbols[index];
+        if (symbol.end <= symbol.start || symbol.end > PS2_RAM_SIZE ||
+            (index != 0u &&
+             symbol.start <= descriptor->symbols[index - 1u].start))
+        {
+            return false;
+        }
+    }
+
+    for (auto &slot : g_recompiledModules)
+    {
+        const PS2RecompiledModuleDescriptor *existing =
+            slot.load(std::memory_order_acquire);
+        if (existing == descriptor)
+        {
+            return true;
+        }
+        if (existing != nullptr &&
+            std::strcmp(existing->name, descriptor->name) == 0)
+        {
+            return false;
+        }
+    }
+
+    for (auto &slot : g_recompiledModules)
+    {
+        const PS2RecompiledModuleDescriptor *expected = nullptr;
+        if (slot.compare_exchange_strong(
+                expected,
+                descriptor,
+                std::memory_order_release,
+                std::memory_order_relaxed))
+        {
+            return true;
+        }
+    }
+    return false;
 }
 
 std::string PS2Runtime::formatGuestPc(uint32_t address)
@@ -5606,8 +5794,9 @@ bool PS2Runtime::registerFunction(uint32_t address, RecompiledFunction func)
 
 bool PS2Runtime::hasFunction(uint32_t address) const
 {
-    return generatedFunctionAtNormalizedAddress(
-               normalizeGuestFunctionAddress(address)) != nullptr;
+    return activeRecompiledFunction(
+               normalizeGuestFunctionAddress(address),
+               m_memory.getRDRAM()) != nullptr;
 }
 
 const char *describeGuestBranchKind(PS2Runtime::GuestBranchKind kind)
@@ -5640,7 +5829,7 @@ PS2Runtime::RecompiledFunction PS2Runtime::lookupFunction(uint32_t address)
     }
 
     RecompiledFunction fn =
-        generatedFunctionAtNormalizedAddress(normalizedAddress);
+        activeRecompiledFunction(normalizedAddress, m_memory.getRDRAM());
     if (fn != nullptr)
     {
         if (normalizedAddress != address)
@@ -5740,7 +5929,11 @@ void PS2Runtime::reportMissingFunction(uint8_t *rdram,
         fault.a1 = a1;
         fault.v0 = v0;
         fault.v1 = v1;
-        fault.codeRegion = m_memory.isCodeAddress(targetPc);
+        fault.codeRegion =
+            m_memory.isCodeAddress(targetPc) ||
+            activeRecompiledModuleCodeAddress(
+                normalizeGuestFunctionAddress(targetPc),
+                m_memory.getRDRAM());
         fault.policy = policy;
         debugRecordFault(fault);
         fault = debugFaultSnapshot();
@@ -5801,7 +5994,7 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
     ctx->pc = targetPc;
     const bool isCall = (kind == GuestBranchKind::DirectCall || kind == GuestBranchKind::IndirectCall);
     RecompiledFunction targetFn =
-        generatedFunctionAtNormalizedAddress(targetPc);
+        activeRecompiledFunction(targetPc, rdram);
 
     if (kind == GuestBranchKind::Return)
     {

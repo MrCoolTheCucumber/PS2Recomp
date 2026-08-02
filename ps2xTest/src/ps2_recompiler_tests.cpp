@@ -869,6 +869,9 @@ void register_ps2_recompiler_tests()
             configFile << "input = \"dummy.elf\"\n";
             configFile << "output = \"out\"\n\n";
             configFile << "recover_leaf_functions = true\n\n";
+            configFile << "module_name = \"veldin-test\"\n";
+            configFile << "module_match_address = \"0x245c28\"\n";
+            configFile << "module_match_size = 96\n\n";
             configFile << "[functions]\n";
             configFile << "[[functions.boundary]]\n";
             configFile << "address = \"0x1700\"\n";
@@ -889,6 +892,12 @@ void register_ps2_recompiler_tests()
 
             t.IsTrue(config.recoverLeafFunctions,
                      "leaf-function recovery option should parse");
+            t.Equals(config.moduleName, std::string("veldin-test"),
+                     "fixed-address module name should parse");
+            t.Equals(config.moduleMatchAddress, 0x245c28u,
+                     "module match address should parse from a hex string");
+            t.Equals(config.moduleMatchSize, 96u,
+                     "module match size should parse");
             t.Equals(config.functionBoundaries.size(), static_cast<size_t>(1),
                      "one configured function boundary should be loaded");
             if (!config.functionBoundaries.empty())

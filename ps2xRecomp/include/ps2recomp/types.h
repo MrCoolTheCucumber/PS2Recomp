@@ -194,6 +194,12 @@ namespace ps2recomp
         bool patchCop0 = true;
         bool patchCache = true;
         bool recoverLeafFunctions = false;
+        // Optional fixed-address AOT module. A module is registered alongside
+        // the primary ELF and becomes dispatchable only while its signature
+        // bytes are present in guest memory.
+        std::string moduleName;
+        uint32_t moduleMatchAddress = 0;
+        uint32_t moduleMatchSize = 64;
         std::vector<std::string> skipFunctions;
         std::unordered_map<uint32_t, std::string> patches;
         std::vector<std::string> stubImplementations;

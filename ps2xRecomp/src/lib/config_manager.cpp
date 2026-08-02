@@ -96,6 +96,22 @@ namespace ps2recomp
             config.patchCache = toml::find_or<bool>(general, "patch_cache", config.patchCache);
             config.recoverLeafFunctions = toml::find_or<bool>(
                 general, "recover_leaf_functions", config.recoverLeafFunctions);
+            config.moduleName = toml::find_or<std::string>(
+                general, "module_name", config.moduleName);
+            if (general.contains("module_match_address") &&
+                !parseAddress(general.at("module_match_address"),
+                              config.moduleMatchAddress))
+            {
+                throw std::runtime_error(
+                    "general.module_match_address must be a 32-bit address.");
+            }
+            if (general.contains("module_match_size") &&
+                !parseAddress(general.at("module_match_size"),
+                              config.moduleMatchSize))
+            {
+                throw std::runtime_error(
+                    "general.module_match_size must be a 32-bit size.");
+            }
 
             if (general.contains("stubs") && general.at("stubs").is_array())
             {
@@ -354,6 +370,14 @@ namespace ps2recomp
         general["patch_cop0"] = config.patchCop0;
         general["patch_cache"] = config.patchCache;
         general["recover_leaf_functions"] = config.recoverLeafFunctions;
+        if (!config.moduleName.empty())
+        {
+            general["module_name"] = config.moduleName;
+            general["module_match_address"] =
+                static_cast<int64_t>(config.moduleMatchAddress);
+            general["module_match_size"] =
+                static_cast<int64_t>(config.moduleMatchSize);
+        }
         general["skip"] = config.skipFunctions;
         general["stubs"] = config.stubImplementations;
         data["general"] = general;

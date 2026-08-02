@@ -244,6 +244,91 @@ namespace ps2recomp
                                 GuestFunctionSymbolRecord{function.end, function.name});
         }
 
+        if (cg.m_moduleInfo.valid)
+        {
+            if (entries.empty())
+            {
+                throw std::runtime_error(
+                    "A recompiled module must contain at least one function entry.");
+            }
+            if (cg.m_moduleInfo.name.empty() ||
+                cg.m_moduleInfo.signature.empty())
+            {
+                throw std::runtime_error(
+                    "A recompiled module requires a name and match signature.");
+            }
+
+            std::stringstream ss;
+            ss << "#include <cstdlib>\n";
+            ss << "#include \"ps2_runtime.h\"\n";
+            ss << "#include \"ps2_recompiled_functions.h\"\n";
+            ss << "#include \"ps2_stubs.h\"\n";
+            ss << "#include \"ps2_recompiled_stubs.h\"\n";
+            ss << "#include \"ps2_syscalls.h\"\n\n";
+
+            ss << "namespace {\n";
+            ss << "static const uint8_t g_moduleSignature[] = {";
+            for (size_t index = 0; index < cg.m_moduleInfo.signature.size(); ++index)
+            {
+                if (index != 0u)
+                {
+                    ss << ", ";
+                }
+                ss << "0x" << std::hex
+                   << static_cast<uint32_t>(cg.m_moduleInfo.signature[index])
+                   << "u";
+            }
+            ss << "};\n";
+
+            ss << "static const PS2RecompiledModuleFunction g_moduleFunctions[] = {\n";
+            for (const auto &[address, name] : entries)
+            {
+                ss << "    {0x" << std::hex << address << "u, " << name << "},\n";
+            }
+            ss << "};\n";
+
+            if (!symbols.empty())
+            {
+                ss << "static const PS2GuestFunctionSymbol g_moduleSymbols[] = {\n";
+                for (const auto &[start, symbol] : symbols)
+                {
+                    ss << "    {0x" << std::hex << start << "u, 0x"
+                       << symbol.end << "u, \""
+                       << escapeCStringLiteral(symbol.name) << "\"},\n";
+                }
+                ss << "};\n";
+            }
+
+            ss << "static const PS2RecompiledModuleDescriptor g_moduleDescriptor = {\n";
+            ss << "    \"" << escapeCStringLiteral(cg.m_moduleInfo.name) << "\",\n";
+            ss << "    0x" << std::hex << cg.m_moduleInfo.matchAddress << "u,\n";
+            ss << "    g_moduleSignature,\n";
+            ss << "    " << std::dec << cg.m_moduleInfo.signature.size() << "u,\n";
+            ss << "    g_moduleFunctions,\n";
+            ss << "    " << std::dec << entries.size() << "u,\n";
+            if (symbols.empty())
+            {
+                ss << "    nullptr,\n";
+            }
+            else
+            {
+                ss << "    g_moduleSymbols,\n";
+            }
+            ss << "    " << std::dec << symbols.size() << "u,\n";
+            ss << "};\n\n";
+
+            ss << "struct GeneratedModuleInitializer {\n";
+            ss << "    GeneratedModuleInitializer() {\n";
+            ss << "        if (!ps2RegisterRecompiledModule(&g_moduleDescriptor)) {\n";
+            ss << "            std::abort();\n";
+            ss << "        }\n";
+            ss << "    }\n";
+            ss << "};\n";
+            ss << "static const GeneratedModuleInitializer g_generatedModuleInitializer;\n";
+            ss << "}\n";
+            return ss.str();
+        }
+
         uint32_t tableBase = 0u;
         uint32_t tableEnd = 0u;
         uint32_t slotCount = 0u;

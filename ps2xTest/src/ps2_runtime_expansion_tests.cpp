@@ -53,6 +53,18 @@ namespace
 
     constexpr int KE_OK = 0;
 
+    void testPrimaryModuleFunction(
+        uint8_t *, R5900Context *ctx, PS2Runtime *)
+    {
+        SET_GPR_U32(ctx, 2, 0x11111111u);
+    }
+
+    void testOverlayModuleFunction(
+        uint8_t *, R5900Context *ctx, PS2Runtime *)
+    {
+        SET_GPR_U32(ctx, 2, 0x22222222u);
+    }
+
     void setRegU32(R5900Context &ctx, int reg, uint32_t value)
     {
         ctx.r[reg] = _mm_set_epi64x(0, static_cast<int64_t>(value));
@@ -708,6 +720,89 @@ void register_ps2_runtime_expansion_tests()
             t.Equals(PS2Runtime::formatGuestPc(0x00000180u),
                      std::string("0x180"),
                      "an unknown PC should remain an unambiguous raw address");
+        });
+
+        tc.Run("fixed-address AOT modules activate from guest-memory signatures", [](TestCase &t)
+        {
+            constexpr uint32_t kMatchAddress = 0x00301000u;
+            constexpr uint32_t kOverlapEntry = 0x00302000u;
+            constexpr uint32_t kModuleOnlyEntry = 0x00302100u;
+            static constexpr uint8_t kMatchBytes[] = {
+                0x70u, 0xFFu, 0xBDu, 0x27u,
+                0x16u, 0x00u, 0x02u, 0x3Cu,
+            };
+            static const PS2RecompiledModuleFunction kFunctions[] = {
+                {kOverlapEntry, &testOverlayModuleFunction},
+                {kModuleOnlyEntry, &testOverlayModuleFunction},
+            };
+            static const PS2GuestFunctionSymbol kSymbols[] = {
+                {kOverlapEntry, kOverlapEntry + 0x20u, "overlay_overlap"},
+                {kModuleOnlyEntry, kModuleOnlyEntry + 0x20u, "overlay_only"},
+            };
+            static const PS2RecompiledModuleDescriptor kModule = {
+                "runtime-test-overlay",
+                kMatchAddress,
+                kMatchBytes,
+                sizeof(kMatchBytes),
+                kFunctions,
+                std::size(kFunctions),
+                kSymbols,
+                std::size(kSymbols),
+            };
+
+            t.IsTrue(
+                ps2RegisterRecompiledModule(&kModule),
+                "a valid generated module descriptor should register");
+
+            PS2Runtime runtime;
+            t.IsTrue(
+                runtime.memory().initialize(),
+                "runtime memory initialize should succeed");
+            t.IsTrue(
+                runtime.registerFunction(
+                    kOverlapEntry, &testPrimaryModuleFunction),
+                "the primary overlapping function should register");
+
+            t.IsFalse(
+                runtime.hasFunction(kModuleOnlyEntry),
+                "module-only code should remain unavailable before its bytes load");
+            R5900Context ctx{};
+            ctx.pc = kOverlapEntry;
+            runtime.lookupFunction(kOverlapEntry)(
+                runtime.memory().getRDRAM(), &ctx, &runtime);
+            t.Equals(
+                ::getRegU32(&ctx, 2), 0x11111111u,
+                "the primary implementation should win while the module is inactive");
+
+            std::memcpy(
+                runtime.memory().getRDRAM() + kMatchAddress,
+                kMatchBytes,
+                sizeof(kMatchBytes));
+            t.IsTrue(
+                runtime.hasFunction(kModuleOnlyEntry),
+                "module-only code should become available after the exact signature loads");
+            t.IsTrue(
+                runtime.hasFunction(0x80000000u | kModuleOnlyEntry),
+                "module dispatch should normalize a direct-mapped EE alias");
+            std::memset(&ctx, 0, sizeof(ctx));
+            ctx.pc = kOverlapEntry;
+            runtime.lookupFunction(kOverlapEntry)(
+                runtime.memory().getRDRAM(), &ctx, &runtime);
+            t.Equals(
+                ::getRegU32(&ctx, 2), 0x22222222u,
+                "the active overlay implementation should replace an overlapping primary entry");
+
+            runtime.memory().getRDRAM()[kMatchAddress] ^= 0x01u;
+            t.IsFalse(
+                runtime.hasFunction(kModuleOnlyEntry),
+                "a changed signature should deactivate the stale module immediately");
+            std::memset(&ctx, 0, sizeof(ctx));
+            ctx.pc = kOverlapEntry;
+            runtime.lookupFunction(kOverlapEntry)(
+                runtime.memory().getRDRAM(), &ctx, &runtime);
+            t.Equals(
+                ::getRegU32(&ctx, 2), 0x11111111u,
+                "dispatch should fall back to the primary implementation after replacement");
         });
 
         tc.Run("scalar overflow helpers use defined wrapping arithmetic", [](TestCase &t)

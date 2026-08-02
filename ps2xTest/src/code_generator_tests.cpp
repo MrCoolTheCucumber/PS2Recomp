@@ -1121,6 +1121,49 @@ void register_code_generator_tests()
                  "registration should retain map names and ranges as escaped string metadata");
     });
 
+    tc.Run("module registration emits signature-activated descriptors", [](TestCase &t) {
+        Function mapped;
+        mapped.name = "overlay_entry";
+        mapped.start = 0x9000u;
+        mapped.end = 0x9040u;
+        mapped.isRecompiled = true;
+
+        CodeGenerator gen({}, {});
+        gen.setRenamedFunctions(
+            {{mapped.start, "ps2_module_test_overlay_entry_0x9000"}});
+        CodeGenerator::ModuleInfo module{};
+        module.valid = true;
+        module.name = "test-overlay";
+        module.matchAddress = mapped.start;
+        module.signature = {0x70u, 0xFFu, 0xBDu, 0x27u};
+        gen.setModuleInfo(module);
+
+        std::string registration =
+            gen.generateFunctionRegistration({mapped}, {});
+        printGeneratedCode(
+            "module registration emits signature-activated descriptors",
+            registration);
+
+        t.IsTrue(
+            registration.find(
+                "{0x9000u, ps2_module_test_overlay_entry_0x9000}") !=
+                std::string::npos,
+            "module registration should retain the prefixed native entry");
+        t.IsTrue(
+            registration.find("\"test-overlay\"") != std::string::npos &&
+                registration.find("0x9000u") != std::string::npos &&
+                registration.find("g_moduleSignature") != std::string::npos,
+            "module registration should embed its name, match address, and bytes");
+        t.IsTrue(
+            registration.find("ps2RegisterRecompiledModule") !=
+                std::string::npos,
+            "module registration should publish its descriptor at startup");
+        t.IsTrue(
+            registration.find("g_ps2RecompiledFunctionTableBase") ==
+                std::string::npos,
+            "a secondary module must not define the primary dense table");
+    });
+
     tc.Run("external mid-function entry can register to the owner wrapper", [](TestCase &t) {
         Function caller;
         caller.name = "caller";

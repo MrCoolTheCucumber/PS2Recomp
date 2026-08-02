@@ -941,6 +941,78 @@ namespace ps2recomp
             }
             m_codeGenerator->setRelocationCallNames(relocationCallNames);
             m_codeGenerator->setBootstrapInfo(m_bootstrapInfo);
+            if (!m_config.moduleName.empty())
+            {
+                if (m_config.moduleMatchSize < 4u ||
+                    m_config.moduleMatchSize > 4096u)
+                {
+                    m_reporter.error(
+                        "config",
+                        "general.module_match_size must be between 4 and 4096 bytes.");
+                    return false;
+                }
+
+                const uint32_t matchAddress =
+                    m_config.moduleMatchAddress != 0u
+                        ? m_config.moduleMatchAddress
+                        : m_bootstrapInfo.entry;
+                if (matchAddress == 0u)
+                {
+                    m_reporter.error(
+                        "config",
+                        "A recompiled module requires an ELF entry point or "
+                        "general.module_match_address.");
+                    return false;
+                }
+
+                CodeGenerator::ModuleInfo moduleInfo{};
+                moduleInfo.valid = true;
+                moduleInfo.name = m_config.moduleName;
+                moduleInfo.matchAddress = matchAddress;
+
+                for (const Section &section : m_sections)
+                {
+                    if (!section.isCode || section.data == nullptr ||
+                        matchAddress < section.address)
+                    {
+                        continue;
+                    }
+                    const uint64_t offset =
+                        static_cast<uint64_t>(matchAddress) - section.address;
+                    const uint64_t end =
+                        offset + m_config.moduleMatchSize;
+                    if (end > section.size)
+                    {
+                        continue;
+                    }
+
+                    moduleInfo.signature.assign(
+                        section.data + offset,
+                        section.data + end);
+                    break;
+                }
+
+                if (moduleInfo.signature.empty())
+                {
+                    std::ostringstream msg;
+                    msg << "Module match range [0x" << std::hex
+                        << matchAddress << ", 0x"
+                        << (static_cast<uint64_t>(matchAddress) +
+                            m_config.moduleMatchSize)
+                        << ") is not contained in an executable ELF section.";
+                    m_reporter.error("config", msg.str());
+                    return false;
+                }
+
+                m_codeGenerator->setModuleInfo(moduleInfo);
+                std::ostringstream msg;
+                msg << "Configured fixed-address AOT module '"
+                    << m_config.moduleName << "' with " << std::dec
+                    << moduleInfo.signature.size()
+                    << " signature bytes at 0x" << std::hex
+                    << moduleInfo.matchAddress << ".";
+                m_reporter.info("module", msg.str());
+            }
             m_codeGenerator->setConfiguredJumpTables(m_config.jumpTables);
             m_codeGenerator->setEmitInstructionComments(true);
 
@@ -1037,6 +1109,14 @@ namespace ps2recomp
         {
             m_functionRenames.clear();
 
+            std::string modulePrefix;
+            if (!m_config.moduleName.empty())
+            {
+                modulePrefix =
+                    "ps2_module_" +
+                    sanitizeFunctionName(m_config.moduleName) + "_";
+            }
+
             auto makeName = [&](const Function &function) -> std::string
             {
                 std::string sanitized = sanitizeFunctionName(function.name);
@@ -1053,12 +1133,13 @@ namespace ps2recomp
                     {
                         std::stringstream entryName;
                         entryName << sanitized << "_0x" << std::hex << function.end;
-                        return entryName.str();
+                        return modulePrefix + entryName.str();
                     }
                 }
 
                 std::stringstream ss;
-                ss << sanitized << "_0x" << std::hex << function.start;
+                ss << modulePrefix << sanitized << "_0x" << std::hex
+                   << function.start;
                 return ss.str();
             };
 
@@ -1089,7 +1170,8 @@ namespace ps2recomp
                     }
                     else
                     {
-                        m_bootstrapInfo.entryName = sanitizeFunctionName(entryIt->name);
+                        m_bootstrapInfo.entryName =
+                            modulePrefix + sanitizeFunctionName(entryIt->name);
                     }
                 }
 

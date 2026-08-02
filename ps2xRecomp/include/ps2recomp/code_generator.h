@@ -38,6 +38,14 @@ namespace ps2recomp
             std::string entryName;
         };
 
+        struct ModuleInfo
+        {
+            bool valid = false;
+            std::string name;
+            uint32_t matchAddress = 0;
+            std::vector<uint8_t> signature;
+        };
+
         using AnalysisResult = ControlFlowAnalysisResult;
 
         std::string generateFunction(const Function &function, const std::vector<Instruction> &instructions, const bool &useHeaders);
@@ -50,6 +58,7 @@ namespace ps2recomp
 
         void setRenamedFunctions(const std::unordered_map<uint32_t, std::string> &renames);
         void setBootstrapInfo(const BootstrapInfo &info);
+        void setModuleInfo(const ModuleInfo &info);
         void setRelocationCallNames(const std::unordered_map<uint32_t, std::string> &callNames);
         void setConfiguredJumpTables(const std::vector<JumpTable> &jumpTables);
         void setResumeEntryTargets(const std::unordered_map<uint32_t, std::vector<uint32_t>> &resumeTargetsByOwner);
@@ -68,6 +77,7 @@ namespace ps2recomp
         std::unordered_map<uint32_t, std::vector<uint32_t>> m_resumeEntryTargetsByOwner;
         const std::vector<Section>& m_sections;
         BootstrapInfo m_bootstrapInfo;
+        ModuleInfo m_moduleInfo;
         bool m_emitInstructionComments = true;
         RecompilerReporter *m_reporter = nullptr;
         std::string m_currentFunctionName;

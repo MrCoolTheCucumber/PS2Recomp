@@ -9,6 +9,8 @@ option(PS2X_ENABLE_RUNNER_UNITY_BUILD "Build ps2EntryRunner with CMake unity bui
 set(PS2X_RUNNER_UNITY_BUILD_BATCH_SIZE 32 CACHE STRING "Unity build batch size for ps2EntryRunner")
 set(PS2X_RUNNER_SOURCE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/src/runner" CACHE PATH
     "Directory containing generated ps2EntryRunner C++ sources")
+set(PS2X_RUNNER_MODULE_SOURCE_DIRS "" CACHE STRING
+    "Semicolon-separated generated fixed-address AOT module source directories")
 option(PS2X_ENABLE_RUNNER_PCH "Precompile the heavy runtime headers for ps2EntryRunner" ON)
 option(PS2X_ENABLE_SCCACHE "Use sccache as compiler launcher when available" ON)
 
@@ -864,6 +866,34 @@ file(GLOB RUNNER_SRC_FILES CONFIGURE_DEPENDS
     "${PS2X_RUNNER_SOURCE_DIR}/*.cpp"
 )
 
+set(PS2X_RUNNER_MODULE_INCLUDE_DIRS)
+set(PS2X_RUNNER_MODULE_SRC_FILES)
+set(PS2X_RUNNER_MODULE_REGISTRATION_SOURCES)
+foreach(PS2X_RUNNER_MODULE_SOURCE_DIR IN LISTS PS2X_RUNNER_MODULE_SOURCE_DIRS)
+    get_filename_component(PS2X_RUNNER_MODULE_SOURCE_DIR
+        "${PS2X_RUNNER_MODULE_SOURCE_DIR}" ABSOLUTE
+        BASE_DIR "${CMAKE_CURRENT_SOURCE_DIR}")
+    if(NOT IS_DIRECTORY "${PS2X_RUNNER_MODULE_SOURCE_DIR}")
+        message(FATAL_ERROR
+            "PS2X_RUNNER_MODULE_SOURCE_DIR does not exist: ${PS2X_RUNNER_MODULE_SOURCE_DIR}")
+    endif()
+    file(GLOB PS2X_RUNNER_MODULE_SOURCES CONFIGURE_DEPENDS
+        "${PS2X_RUNNER_MODULE_SOURCE_DIR}/*.cpp")
+    if(NOT PS2X_RUNNER_MODULE_SOURCES)
+        message(FATAL_ERROR
+            "PS2X_RUNNER_MODULE_SOURCE_DIR contains no C++ sources: ${PS2X_RUNNER_MODULE_SOURCE_DIR}")
+    endif()
+    list(APPEND PS2X_RUNNER_MODULE_INCLUDE_DIRS
+        "${PS2X_RUNNER_MODULE_SOURCE_DIR}")
+    list(APPEND PS2X_RUNNER_MODULE_SRC_FILES
+        ${PS2X_RUNNER_MODULE_SOURCES})
+    if(EXISTS "${PS2X_RUNNER_MODULE_SOURCE_DIR}/register_functions.cpp")
+        list(APPEND PS2X_RUNNER_MODULE_REGISTRATION_SOURCES
+            "${PS2X_RUNNER_MODULE_SOURCE_DIR}/register_functions.cpp")
+    endif()
+endforeach()
+list(APPEND RUNNER_SRC_FILES ${PS2X_RUNNER_MODULE_SRC_FILES})
+
 set(RUNNER_MAIN_CPP "${PS2X_RUNNER_SOURCE_DIR}/main.cpp")
 set(ROOT_MAIN_CPP "${CMAKE_CURRENT_SOURCE_DIR}/src/main.cpp")
 
@@ -887,7 +917,16 @@ endif()
 
 target_include_directories(ps2EntryRunner PRIVATE
     "${PS2X_RUNNER_SOURCE_DIR}"
+    ${PS2X_RUNNER_MODULE_INCLUDE_DIRS}
 )
+
+# Module function symbols carry a module-specific prefix and can safely use
+# unity batches. Registration files contain same-named anonymous-namespace
+# objects, so compile each of those as its own translation unit.
+if(PS2X_RUNNER_MODULE_REGISTRATION_SOURCES)
+    set_source_files_properties(${PS2X_RUNNER_MODULE_REGISTRATION_SOURCES}
+        PROPERTIES SKIP_UNITY_BUILD_INCLUSION ON)
+endif()
 
 if(PS2X_ENABLE_RUNNER_UNITY_BUILD)
     set_target_properties(ps2EntryRunner PROPERTIES

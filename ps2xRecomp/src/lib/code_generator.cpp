@@ -115,6 +115,11 @@ namespace ps2recomp
         m_bootstrapInfo = info;
     }
 
+    void CodeGenerator::setModuleInfo(const ModuleInfo &info)
+    {
+        m_moduleInfo = info;
+    }
+
     void CodeGenerator::setRelocationCallNames(const std::unordered_map<uint32_t, std::string> &callNames)
     {
         m_relocationCallNames = callNames;
