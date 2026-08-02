@@ -277,6 +277,20 @@ void register_code_generator_tests()
                  "DADDI should not compute a potentially overflowing signed sum");
     });
 
+    tc.Run("LWU zero-extends bit 31 into the low scalar lane", [](TestCase &t) {
+        CodeGenerator gen({}, {});
+
+        const Instruction lwu = makeIType(0x1000, OPCODE_LWU, 5, 6, 0x20u);
+        const std::string generated = gen.translateInstruction(lwu);
+
+        t.IsTrue(
+            generated.find("SET_GPR_U64(ctx, 6, (uint64_t)(uint32_t)READ32(") != std::string::npos,
+            "LWU should zero-extend the loaded word to 64 bits");
+        t.IsTrue(
+            generated.find("SET_GPR_U32(ctx, 6") == std::string::npos,
+            "LWU must not use the sign-extending 32-bit setter");
+    });
+
     tc.Run("VU FTOI uses saturating conversion", [](TestCase &t) {
         CodeGenerator gen({}, {});
         Instruction ftoi{};
