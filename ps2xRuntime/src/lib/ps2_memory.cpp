@@ -490,6 +490,7 @@ struct Ps2GsDmaTraceState
     std::FILE *output = nullptr;
     uint64_t sequence = 0u;
     uint64_t activeSequence = 0u;
+    uint64_t start = 0u;
     uint64_t limit = std::numeric_limits<uint64_t>::max();
     uint32_t chcr = 0u;
     uint32_t madr = 0u;
@@ -515,6 +516,7 @@ struct Ps2GsDmaTraceState
     Digest vu1CurrentPath1{};
     uint64_t vu1StepSequence = std::numeric_limits<uint64_t>::max();
     uint64_t vu1StepOrdinal = std::numeric_limits<uint64_t>::max();
+    uint64_t vu1DumpCount = 1u;
     uint64_t vu1StepEvents = 0u;
     std::array<int32_t, 16u> vu1CurrentInitialVi{};
     std::array<uint8_t, 256u> vu1CurrentTopData{};
@@ -666,6 +668,28 @@ struct Ps2GsDmaTraceState
             limit = static_cast<uint64_t>(parsed);
         }
 
+        const char *startText = std::getenv("PS2X_GS_DMA_TRACE_START");
+        if (startText && *startText)
+        {
+            errno = 0;
+            char *end = nullptr;
+            const unsigned long long parsed = std::strtoull(startText, &end, 0);
+            if (errno != 0 || end == startText || *end != '\0')
+            {
+                std::fprintf(stderr,
+                             "PS2 GS DMA trace: invalid PS2X_GS_DMA_TRACE_START '%s'\n",
+                             startText);
+                return;
+            }
+            start = static_cast<uint64_t>(parsed);
+        }
+        if (start >= limit)
+        {
+            std::fprintf(stderr,
+                         "PS2 GS DMA trace: start must be below limit\n");
+            return;
+        }
+
         output = std::fopen(path, "wb");
         if (!output)
         {
@@ -693,7 +717,9 @@ struct Ps2GsDmaTraceState
             return true;
         };
         if (!parseOptionalIndex("PS2X_VU1_STEP_SEQUENCE", vu1StepSequence) ||
-            !parseOptionalIndex("PS2X_VU1_STEP_ORDINAL", vu1StepOrdinal))
+            !parseOptionalIndex("PS2X_VU1_STEP_ORDINAL", vu1StepOrdinal) ||
+            !parseOptionalIndex("PS2X_VU1_DUMP_COUNT", vu1DumpCount) ||
+            vu1DumpCount == 0u)
         {
             return;
         }
@@ -739,10 +765,11 @@ struct Ps2GsDmaTraceState
         }
         std::fprintf(output,
                      "{\"schema_version\":1,\"event\":\"configuration\","
-                     "\"producer\":\"PS2Recomp\",\"limit\":%" PRIu64 ","
+                     "\"producer\":\"PS2Recomp\",\"start\":%" PRIu64 ","
+                     "\"limit\":%" PRIu64 ","
                      "\"ee_write_ranges\":\"%s\","
                      "\"watch_addresses\":\"%s\"}\n",
-                     limit, writeRangesText ? writeRangesText : "",
+                     start, limit, writeRangesText ? writeRangesText : "",
                      watchAddressesText ? watchAddressesText : "");
         std::fflush(output);
     }
@@ -1918,7 +1945,15 @@ void PS2Memory::beginVif1DmaTrace(uint32_t chcr,
     trace.configure();
     trace.finish();
     trace.flushEeWrites(trace.sequence);
-    if (!trace.enabled || trace.sequence >= trace.limit)
+    if (!trace.enabled)
+    {
+        if (g_ps2GsDmaTraceState == &trace)
+            g_ps2GsDmaWriteTraceEnabled.store(false, std::memory_order_relaxed);
+        return;
+    }
+
+    const uint64_t sequence = trace.sequence++;
+    if (sequence < trace.start || sequence >= trace.limit)
     {
         if (g_ps2GsDmaTraceState == &trace)
             g_ps2GsDmaWriteTraceEnabled.store(false, std::memory_order_relaxed);
@@ -1926,7 +1961,7 @@ void PS2Memory::beginVif1DmaTrace(uint32_t chcr,
     }
 
     trace.active = true;
-    trace.activeSequence = trace.sequence++;
+    trace.activeSequence = sequence;
     trace.chcr = chcr;
     trace.madr = madr;
     trace.qwc = qwc;
@@ -2113,9 +2148,12 @@ void PS2Memory::traceVu1Invocation(uint32_t startPc, uint32_t top, uint32_t itop
         }
     }
 
-    if (!resume &&
+    const bool selectedDumpRun =
         m_gsDmaTrace->activeSequence == m_gsDmaTrace->vu1StepSequence &&
-        ordinal == m_gsDmaTrace->vu1StepOrdinal &&
+        ordinal >= m_gsDmaTrace->vu1StepOrdinal &&
+        ordinal - m_gsDmaTrace->vu1StepOrdinal <
+            m_gsDmaTrace->vu1DumpCount;
+    if (!resume && selectedDumpRun &&
         !m_gsDmaTrace->vu1DumpDirectory.empty() &&
         m_vu1Data && m_vu1Code)
     {
@@ -2165,9 +2203,10 @@ void PS2Memory::traceVu1Invocation(uint32_t startPc, uint32_t top, uint32_t itop
     ++m_gsDmaTrace->vu1RunStarts[(startPc & 0x3FFFu) / 8u];
     if (m_gsDmaTrace->vu1StartPcs.size() < 64u)
         m_gsDmaTrace->vu1StartPcs.push_back(startPc & 0x3FFFu);
-    const bool selectedRun =
-        m_gsDmaTrace->activeSequence == m_gsDmaTrace->vu1StepSequence &&
-        ordinal == m_gsDmaTrace->vu1StepOrdinal;
+    // Retain the same bounded run window as the fixture dumps. This keeps the
+    // command/state prefix for each adjacent setup invocation available in a
+    // single deterministic capture instead of retaining only the first one.
+    const bool selectedRun = selectedDumpRun;
     if (m_gsDmaTrace->vu1RunPrefix.size() < 8u ||
         (selectedRun && ordinal >= 8u))
     {
