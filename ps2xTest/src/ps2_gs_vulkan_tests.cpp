@@ -10,6 +10,7 @@
 #include <atomic>
 #include <bit>
 #include <chrono>
+#include <cmath>
 #include <cstdint>
 #include <cstring>
 #include <filesystem>
@@ -1311,6 +1312,308 @@ namespace
         }
     }
 
+    std::array<int64_t, 3> gouraudDepthTriangleEdges(
+        const GsVulkanGouraudDepthCt32Triangle &triangle,
+        int32_t sampleX,
+        int32_t sampleY)
+    {
+        std::array<int64_t, 3> edges{{
+            ct32TriangleEdge(
+                triangle.vertex1X12_4,
+                triangle.vertex1Y12_4,
+                triangle.vertex2X12_4,
+                triangle.vertex2Y12_4,
+                sampleX,
+                sampleY),
+            ct32TriangleEdge(
+                triangle.vertex2X12_4,
+                triangle.vertex2Y12_4,
+                triangle.vertex0X12_4,
+                triangle.vertex0Y12_4,
+                sampleX,
+                sampleY),
+            ct32TriangleEdge(
+                triangle.vertex0X12_4,
+                triangle.vertex0Y12_4,
+                triangle.vertex1X12_4,
+                triangle.vertex1Y12_4,
+                sampleX,
+                sampleY),
+        }};
+        if (triangle.positiveArea == 0u)
+        {
+            for (int64_t &edge : edges)
+                edge = -edge;
+        }
+        return edges;
+    }
+
+    bool gouraudDepthTriangleCovered(
+        const GsVulkanGouraudDepthCt32Triangle &triangle,
+        int32_t sampleX,
+        int32_t sampleY)
+    {
+        const std::array<int64_t, 3> edges =
+            gouraudDepthTriangleEdges(triangle, sampleX, sampleY);
+        for (uint32_t edge = 0u; edge < edges.size(); ++edge)
+        {
+            if (edges[edge] < 0 ||
+                (edges[edge] == 0 &&
+                 (triangle.topLeftEdgeMask & (1u << edge)) == 0u))
+            {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    // Independent record-level oracle for the software triangle rasterizer's
+    // single-precision setup and eight-pixel color DDA. The selected contract
+    // reduces source-over at alpha 128 to an exact source color write and uses
+    // constant ALWAYS-write depth, leaving interpolation as the only
+    // floating-point behavior under test.
+    void applyGouraudDepthCt32TriangleCpu(
+        std::vector<uint8_t> &vram,
+        const GsVulkanGouraudDepthCt32Triangle &triangle)
+    {
+        struct Vertex
+        {
+            float x = 0.0f;
+            float y = 0.0f;
+            uint32_t rgba = 0u;
+        };
+        std::array<Vertex, 3> original{{
+            {static_cast<float>(triangle.vertex0X12_4) / 16.0f,
+             static_cast<float>(triangle.vertex0Y12_4) / 16.0f,
+             triangle.rgba0},
+            {static_cast<float>(triangle.vertex1X12_4) / 16.0f,
+             static_cast<float>(triangle.vertex1Y12_4) / 16.0f,
+             triangle.rgba1},
+            {static_cast<float>(triangle.vertex2X12_4) / 16.0f,
+             static_cast<float>(triangle.vertex2Y12_4) / 16.0f,
+             triangle.rgba2},
+        }};
+        std::array<Vertex, 3> sorted = original;
+        if (sorted[1].y < sorted[0].y)
+            std::swap(sorted[0], sorted[1]);
+        if (sorted[2].y < sorted[1].y)
+            std::swap(sorted[1], sorted[2]);
+        if (sorted[1].y < sorted[0].y)
+            std::swap(sorted[0], sorted[1]);
+
+        const float gradientDx01 = sorted[1].x - sorted[0].x;
+        const float gradientDy01 = sorted[1].y - sorted[0].y;
+        const float gradientDx02 = sorted[2].x - sorted[0].x;
+        const float gradientDy02 = sorted[2].y - sorted[0].y;
+        const float gradientCross = std::fma(
+            gradientDy01,
+            gradientDx02,
+            -(gradientDx01 * gradientDy02));
+        const bool gradientValid = gradientCross != 0.0f;
+        const float gradientX01OverCross =
+            gradientValid ? gradientDx01 / gradientCross : 0.0f;
+        const float gradientY01OverCross =
+            gradientValid ? gradientDy01 / gradientCross : 0.0f;
+        const float gradientX02OverCross =
+            gradientValid ? gradientDx02 / gradientCross : 0.0f;
+        const float gradientY02OverCross =
+            gradientValid ? gradientDy02 / gradientCross : 0.0f;
+
+        std::array<float, 4> colorDx{};
+        std::array<float, 4> colorDy{};
+        const auto channel = [](uint32_t rgba, size_t index)
+        {
+            return static_cast<float>(
+                       (rgba >> (index * 8u)) & 0xFFu) *
+                   128.0f;
+        };
+        if (gradientValid)
+        {
+            for (size_t index = 0u; index < colorDx.size(); ++index)
+            {
+                const float top = channel(sorted[0].rgba, index);
+                const float delta01 =
+                    channel(sorted[1].rgba, index) - top;
+                const float delta02 =
+                    channel(sorted[2].rgba, index) - top;
+                colorDx[index] = std::fma(
+                    delta02,
+                    gradientY01OverCross,
+                    -(delta01 * gradientY02OverCross));
+                colorDy[index] = std::fma(
+                    delta01,
+                    gradientX02OverCross,
+                    -(delta02 * gradientX01OverCross));
+            }
+        }
+
+        const int64_t signedArea = ct32TriangleEdge(
+            triangle.vertex0X12_4,
+            triangle.vertex0Y12_4,
+            triangle.vertex1X12_4,
+            triangle.vertex1Y12_4,
+            triangle.vertex2X12_4,
+            triangle.vertex2Y12_4);
+        const float inverseArea =
+            1.0f / static_cast<float>(
+                signedArea > 0 ? signedArea : -signedArea);
+        for (uint32_t y = triangle.boundsY0;
+             y < triangle.boundsY1; ++y)
+        {
+            uint32_t scanlineLeft = triangle.boundsX1;
+            for (uint32_t x = triangle.boundsX0;
+                 x < triangle.boundsX1; ++x)
+            {
+                if (gouraudDepthTriangleCovered(
+                        triangle,
+                        static_cast<int32_t>(x * 16u),
+                        static_cast<int32_t>(y * 16u)))
+                {
+                    scanlineLeft = x;
+                    break;
+                }
+            }
+            if (scanlineLeft == triangle.boundsX1)
+                continue;
+
+            std::array<int32_t, 4> scanlineColor{};
+            if (gradientValid)
+            {
+                const Vertex *base = &sorted[0];
+                if (sorted[0].y == sorted[1].y)
+                {
+                    const bool negativeCross =
+                        (sorted[1].y - sorted[0].y) *
+                                (sorted[2].x - sorted[0].x) -
+                            (sorted[1].x - sorted[0].x) *
+                                (sorted[2].y - sorted[0].y) <
+                        0.0f;
+                    if (!negativeCross)
+                        base = &sorted[1];
+                }
+                else if (static_cast<int32_t>(y) >=
+                         static_cast<int32_t>(std::ceil(sorted[1].y)))
+                {
+                    base = &sorted[1];
+                }
+                const float deltaY = static_cast<float>(y) - base->y;
+                const float prestep =
+                    static_cast<float>(scanlineLeft) - base->x;
+                for (size_t index = 0u;
+                     index < scanlineColor.size(); ++index)
+                {
+                    const float edgeValue = std::fma(
+                        colorDy[index],
+                        deltaY,
+                        channel(base->rgba, index));
+                    scanlineColor[index] = static_cast<int32_t>(std::fma(
+                        colorDx[index], prestep, edgeValue));
+                }
+            }
+
+            const int32_t scanlineSkip =
+                static_cast<int32_t>(scanlineLeft & 7u);
+            const int32_t alignedLeft =
+                static_cast<int32_t>(scanlineLeft & ~7u);
+            for (uint32_t x = scanlineLeft;
+                 x < triangle.boundsX1; ++x)
+            {
+                const std::array<int64_t, 3> edges =
+                    gouraudDepthTriangleEdges(
+                        triangle,
+                        static_cast<int32_t>(x * 16u),
+                        static_cast<int32_t>(y * 16u));
+                bool covered = true;
+                for (uint32_t edge = 0u; edge < edges.size(); ++edge)
+                {
+                    if (edges[edge] < 0 ||
+                        (edges[edge] == 0 &&
+                         (triangle.topLeftEdgeMask &
+                          (1u << edge)) == 0u))
+                    {
+                        covered = false;
+                        break;
+                    }
+                }
+                if (!covered)
+                    continue;
+
+                std::array<uint8_t, 4> color{};
+                if (gradientValid)
+                {
+                    const int32_t block =
+                        (static_cast<int32_t>(x) - alignedLeft) / 8;
+                    const int32_t laneOffset =
+                        static_cast<int32_t>(x & 7u) - scanlineSkip;
+                    for (size_t index = 0u;
+                         index < color.size(); ++index)
+                    {
+                        const int32_t laneDelta =
+                            static_cast<int32_t>(
+                                colorDx[index] *
+                                static_cast<float>(laneOffset));
+                        const int32_t blockDelta =
+                            static_cast<int32_t>(
+                                colorDx[index] * 8.0f);
+                        const int32_t fixed =
+                            scanlineColor[index] + laneDelta +
+                            block * blockDelta;
+                        color[index] = static_cast<uint8_t>(
+                            std::clamp(fixed >> 7, 0, 255));
+                    }
+                }
+                else
+                {
+                    const float w1 =
+                        static_cast<float>(edges[1]) * inverseArea;
+                    const float w2 =
+                        static_cast<float>(edges[2]) * inverseArea;
+                    for (size_t index = 0u;
+                         index < color.size(); ++index)
+                    {
+                        const float a =
+                            channel(original[0].rgba, index) / 128.0f;
+                        const float b =
+                            channel(original[1].rgba, index) / 128.0f;
+                        const float c =
+                            channel(original[2].rgba, index) / 128.0f;
+                        color[index] = static_cast<uint8_t>(std::clamp(
+                            static_cast<int32_t>(
+                                a + (b - a) * w1 + (c - a) * w2),
+                            0, 255));
+                    }
+                }
+
+                const uint32_t rgba =
+                    static_cast<uint32_t>(color[0]) |
+                    (static_cast<uint32_t>(color[1]) << 8u) |
+                    (static_cast<uint32_t>(color[2]) << 16u) |
+                    (static_cast<uint32_t>(color[3]) << 24u);
+                GSMem::WriteCT32(
+                    vram.data(),
+                    triangle.framebufferBaseBlock,
+                    triangle.framebufferWidth,
+                    x, y, rgba);
+                if (triangle.depthPsm == GS_PSM_Z24)
+                {
+                    GSMem::WriteZ24(
+                        vram.data(),
+                        triangle.depthBaseBlock,
+                        triangle.framebufferWidth,
+                        x, y, triangle.depth);
+                }
+                else
+                {
+                    GSMem::WriteZ32(
+                        vram.data(),
+                        triangle.depthBaseBlock,
+                        triangle.framebufferWidth,
+                        x, y, triangle.depth);
+                }
+            }
+        }
+    }
+
     uint64_t packXyz2(
         uint16_t x12_4, uint16_t y12_4, uint32_t z = 0u)
     {
@@ -1515,6 +1818,29 @@ namespace
         }
     }
 
+    void drawGouraudDepthCt32TriangleCommand(
+        GS &gs,
+        const GsDrawCommand &command)
+    {
+        configureNearestCt32SpriteCommand(gs, command);
+        for (size_t index = 0u; index < command.vertexCount(); ++index)
+        {
+            const GSVertex &vertex = command.vertices()[index];
+            const uint32_t rgba =
+                static_cast<uint32_t>(vertex.r) |
+                (static_cast<uint32_t>(vertex.g) << 8u) |
+                (static_cast<uint32_t>(vertex.b) << 16u) |
+                (static_cast<uint32_t>(vertex.a) << 24u);
+            gs.writeRegister(GS_REG_RGBAQ, rgba);
+            gs.writeRegister(
+                GS_REG_XYZ2,
+                packXyz2(
+                    vertex.x12_4,
+                    vertex.y12_4,
+                    vertex.zInteger));
+        }
+    }
+
     void drawFlatCt32Point(
         GS &gs, uint16_t x, uint16_t y, uint32_t rgba)
     {
@@ -1696,6 +2022,8 @@ namespace
             report.devices[0].suitable = true;
             report.devices[0].shaderInt64 = exactCt32Triangle_;
             report.devices[0].exactCt32Triangle = exactCt32Triangle_;
+            report.devices[0].exactGouraudDepthCt32Triangle =
+                exactCt32Triangle_;
             report.devices[0].exactNearestCt32Sprite =
                 exactNearestCt32Sprite_;
             report.devices[0].exactLinearCt32Sprite =
@@ -1761,6 +2089,53 @@ namespace
                 output.resize(1u);
             ++serviceStatistics.triangleDrawsCompleted;
             serviceStatistics.triangleCandidatePixelsExecuted +=
+                static_cast<uint64_t>(
+                    triangle.boundsX1 - triangle.boundsX0) *
+                static_cast<uint64_t>(
+                    triangle.boundsY1 - triangle.boundsY0);
+            ++serviceStatistics.queueSubmissions;
+            ++serviceStatistics.shaderDispatches;
+            serviceStatistics.pipelineBarriers += 4u;
+            ++serviceStatistics.pipelineBinds;
+            ++serviceStatistics.pipelineCacheHits;
+            ++serviceStatistics.fenceWaits;
+            if (error)
+                error->clear();
+            return true;
+        }
+
+        bool executeGouraudDepthCt32Triangle(
+            std::span<const uint8_t> input,
+            const GsVulkanGouraudDepthCt32Triangle &triangle,
+            std::vector<uint8_t> &output,
+            std::string *error) override
+        {
+            if (!isHealthy || behavior == Behavior::Fail ||
+                !report.devices[0].exactGouraudDepthCt32Triangle)
+            {
+                ++serviceStatistics
+                      .gouraudDepthCt32TriangleDrawsFailed;
+                if (error)
+                {
+                    *error =
+                        "injected Gouraud depth CT32 triangle executor failure";
+                }
+                return false;
+            }
+
+            residentVram.assign(input.begin(), input.end());
+            if (behavior == Behavior::Exact)
+            {
+                applyGouraudDepthCt32TriangleCpu(
+                    residentVram, triangle);
+            }
+            output = residentVram;
+            if (behavior == Behavior::InvalidOutput)
+                output.resize(1u);
+            ++serviceStatistics
+                  .gouraudDepthCt32TriangleDrawsCompleted;
+            serviceStatistics
+                .gouraudDepthCt32TriangleCandidatePixelsExecuted +=
                 static_cast<uint64_t>(
                     triangle.boundsX1 - triangle.boundsX0) *
                 static_cast<uint64_t>(
@@ -4415,10 +4790,10 @@ void register_ps2_gs_vulkan_tests()
                     colors,
                     0x12345678u);
 
-            GsVulkanGouraudDepthCt32Triangle triangle{
-                1u, 2u, 3u, 4u, 5u, 6u, 7u, 8u,
-                9u, 1u, 10, 11, 12, 13, 14, 15,
-                16u, 17u, 18u, 19u, 20u, 21u, 22u, 23u};
+            GsVulkanGouraudDepthCt32Triangle triangle{};
+            triangle.framebufferBaseBlock = 1u;
+            triangle.colorDxBits.fill(0xDEADBEEFu);
+            triangle.colorDyBits.fill(0xA5A5A5A5u);
             const GsBackendDecision decision =
                 prepareGsVulkanGouraudSourceOverDepthCt32Triangle(
                     command, triangle);
@@ -4466,14 +4841,16 @@ void register_ps2_gs_vulkan_tests()
                      "the third interpolated color should remain ordered");
             t.Equals(triangle.topLeftEdgeMask, 5u,
                      "negative winding should reverse the inclusive edge directions");
-            t.Equals(triangle.reserved0, 0u,
-                     "Gouraud record padding should be deterministic");
-            t.Equals(triangle.reserved1, 0u,
-                     "Gouraud record padding should remain clear");
-            t.Equals(triangle.reserved2, 0u,
-                     "Gouraud record padding should remain clear");
-            t.Equals(triangle.reserved3, 0u,
-                     "Gouraud record padding should remain clear");
+            t.Equals(triangle.colorDxBits[0], 0u,
+                     "constant red should have zero horizontal DDA step");
+            t.Equals(triangle.colorDxBits[1], 0u,
+                     "constant green should have zero horizontal DDA step");
+            t.IsTrue(triangle.colorDxBits[2] != 0u,
+                     "varying blue should retain an exact horizontal DDA step");
+            t.Equals(triangle.colorDxBits[3], 0u,
+                     "constant alpha should have zero horizontal DDA step");
+            t.Equals(triangle.colorDyBits[3], 0u,
+                     "constant alpha should have zero vertical DDA step");
 
             std::array<GSVertex, 3> varyingDepth = command.vertices();
             varyingDepth[1].zInteger += 1u;
@@ -4507,6 +4884,76 @@ void register_ps2_gs_vulkan_tests()
                     nonNormalizable).reason,
                 GsFallbackReason::AlphaBlend,
                 "source-over must stay destination-dependent away from alpha 128");
+        });
+
+        tc.Run("Gouraud depth triangle record oracle matches software rasterization", [](TestCase &t)
+        {
+            GSMem::InitLookupTables();
+            std::vector<GsDrawCommand> commands;
+            commands.push_back(
+                makeGouraudSourceOverDepthCt32TriangleCommand(
+                    40u, 17u, 8u, 240u, GS_PSM_Z24,
+                    {4u, 31u, 3u, 27u}, {32u, 16u},
+                    {289u, 209u, 65u},
+                    {33u, 65u, 401u},
+                    {0x80000000u, 0x800A8040u, 0x80F01070u},
+                    0x12345678u));
+            commands.push_back(
+                makeGouraudSourceOverDepthCt32TriangleCommand(
+                    41u, 31u, 4u, 300u, GS_PSM_Z32,
+                    {0u, 31u, 0u, 31u}, {0u, 0u},
+                    {32u, 384u, 32u},
+                    {32u, 32u, 384u},
+                    {0x801020F0u, 0x80E04020u, 0x8050D080u},
+                    0xFEDCBA98u));
+            commands.push_back(
+                makeGouraudSourceOverDepthCt32TriangleCommand(
+                    42u, 45u, 3u, 360u, GS_PSM_Z24,
+                    {2u, 25u, 5u, 22u}, {128u, 144u},
+                    {161u, 513u, 225u},
+                    {497u, 177u, 177u},
+                    {0x808000FFu, 0x8000FF10u, 0x80FF0020u},
+                    0x00ABCDEFu));
+
+            std::vector<uint8_t> actual =
+                makeVramPattern(0x44444131u);
+            std::vector<uint8_t> expected = actual;
+            GS gs;
+            gs.init(
+                actual.data(),
+                static_cast<uint32_t>(actual.size()),
+                nullptr);
+            gs.setDebugHistoryPaused(true);
+            for (size_t index = 0u; index < commands.size(); ++index)
+            {
+                GsVulkanGouraudDepthCt32Triangle triangle{};
+                const GsBackendDecision decision =
+                    prepareGsVulkanGouraudSourceOverDepthCt32Triangle(
+                        commands[index], triangle);
+                if (!decision.supported)
+                {
+                    t.Fail(
+                        "software-oracle Gouraud fixture was rejected as " +
+                        std::string(gsFallbackReasonName(
+                            decision.reason)));
+                    return;
+                }
+                applyGouraudDepthCt32TriangleCpu(expected, triangle);
+                drawGouraudDepthCt32TriangleCommand(
+                    gs, commands[index]);
+                gs.flushRenderBatch();
+                if (actual != expected)
+                {
+                    const auto mismatch = std::mismatch(
+                        actual.begin(), actual.end(), expected.begin());
+                    t.Fail(
+                        "Gouraud record oracle disagreed with software draw " +
+                        std::to_string(index) + " at byte " +
+                        std::to_string(static_cast<size_t>(
+                            mismatch.first - actual.begin())));
+                    return;
+                }
+            }
         });
 
         tc.Run("CT32 triangle preparation matches exhaustive software edge coverage", [](TestCase &t)
@@ -14464,6 +14911,10 @@ void register_ps2_gs_vulkan_tests()
                     device.suitable && device.shaderInt64,
                     "the exact triangle capability should expose its complete hard gate");
                 t.Equals(
+                    device.exactGouraudDepthCt32Triangle,
+                    device.exactCt32Triangle,
+                    "the Gouraud depth capability should retain the exact edge prerequisite");
+                t.Equals(
                     device.exactDepthCt32Sprite,
                     device.suitable,
                     "the depth CT32 capability should expose its raw-VRAM hard gate");
@@ -16725,6 +17176,273 @@ void register_ps2_gs_vulkan_tests()
                       "a stopped service must reject triangle work");
             t.IsTrue(shutdownOutput == shutdownSentinel,
                      "post-shutdown triangle rejection must preserve output");
+        });
+
+        tc.Run("Vulkan Gouraud depth CT32 triangles match the software DDA oracle", [](TestCase &t)
+        {
+            GSMem::InitLookupTables();
+            std::vector<GsVulkanGouraudDepthCt32Triangle> triangles;
+            const auto addTriangle = [&](const GsDrawCommand &command)
+            {
+                GsVulkanGouraudDepthCt32Triangle triangle{};
+                const GsBackendDecision decision =
+                    prepareGsVulkanGouraudSourceOverDepthCt32Triangle(
+                        command, triangle);
+                if (!decision.supported)
+                {
+                    t.Fail(
+                        "synthetic Gouraud depth triangle was rejected as " +
+                        std::string(gsFallbackReasonName(
+                            decision.reason)));
+                    return false;
+                }
+                triangles.push_back(triangle);
+                return true;
+            };
+
+            uint64_t sequence = 30'000u;
+            if (!addTriangle(
+                    makeGouraudSourceOverDepthCt32TriangleCommand(
+                        sequence++, 17u, 8u, 240u, GS_PSM_Z24,
+                        {4u, 31u, 3u, 27u}, {32u, 16u},
+                        {289u, 209u, 65u},
+                        {33u, 65u, 401u},
+                        {0x80000000u, 0x800A8040u, 0x80F01070u},
+                        0x12345678u)) ||
+                !addTriangle(
+                    makeGouraudSourceOverDepthCt32TriangleCommand(
+                        sequence++, 31u, 4u, 300u, GS_PSM_Z32,
+                        {0u, 31u, 0u, 31u}, {0u, 0u},
+                        {32u, 384u, 32u},
+                        {32u, 32u, 384u},
+                        {0x801020F0u, 0x80E04020u, 0x8050D080u},
+                        0xFEDCBA98u)) ||
+                !addTriangle(
+                    makeGouraudSourceOverDepthCt32TriangleCommand(
+                        sequence++, 45u, 3u, 360u, GS_PSM_Z24,
+                        {2u, 25u, 5u, 22u}, {128u, 144u},
+                        {161u, 513u, 225u},
+                        {497u, 177u, 177u},
+                        {0x808000FFu, 0x8000FF10u, 0x80FF0020u},
+                        0x00ABCDEFu)) ||
+                !addTriangle(
+                    makeGouraudSourceOverDepthCt32TriangleCommand(
+                        sequence++, 73u, 6u, 420u, GS_PSM_Z32,
+                        {9u, 18u, 7u, 15u}, {512u, 496u},
+                        {433u, 817u, 641u},
+                        {385u, 609u, 753u},
+                        {0x80010203u, 0x807F40E0u, 0x80FEA010u},
+                        0x01020304u)))
+            {
+                return;
+            }
+
+            t.Equals(triangles.size(), static_cast<size_t>(4u),
+                     "the Gouraud corpus should retain every prepared triangle");
+            t.Equals(triangles[0].positiveArea, 0u,
+                     "the corpus should cover negative submitted winding");
+            t.Equals(triangles[1].positiveArea, 1u,
+                     "the corpus should cover positive submitted winding");
+            t.Equals(triangles[1].vertex0Y12_4,
+                     triangles[1].vertex1Y12_4,
+                     "the corpus should cover stable flat-top setup");
+            t.Equals(triangles[2].vertex1Y12_4,
+                     triangles[2].vertex2Y12_4,
+                     "the corpus should cover stable flat-bottom setup");
+
+            GsVulkanCapabilityReport preflight{};
+            const GsVulkanServiceConfig config =
+                makeRendererServiceConfig(preflight);
+            GsVulkanCapabilityReport creationReport{};
+            std::string creationError;
+            std::unique_ptr<GsVulkanService> service =
+                GsVulkanService::create(
+                    config, &creationReport, &creationError);
+            if (!preflight.ready())
+            {
+                t.IsNull(service.get(),
+                         "an unavailable host should skip Gouraud execution cleanly");
+                return;
+            }
+            t.IsNotNull(service.get(),
+                        "a suitable device should create the Gouraud service");
+            t.IsTrue(creationError.empty(),
+                     "successful Gouraud service creation should clear its diagnostic");
+            if (!service)
+                return;
+
+            const GsVulkanDeviceReport *selected =
+                creationReport.selectedDevice();
+            t.IsNotNull(selected,
+                        "the Gouraud service should retain its selected device");
+            if (!selected)
+                return;
+            if (!selected->exactGouraudDepthCt32Triangle)
+            {
+                std::vector<uint8_t> output = {0xA5u};
+                const std::vector<uint8_t> sentinel = output;
+                std::string error;
+                const std::vector<uint8_t> initial =
+                    makeVramPattern(0x474F5552u);
+                t.IsFalse(service->executeGouraudDepthCt32Triangle(
+                              initial, triangles.front(), output, &error),
+                          "a device without the exact Gouraud capability must reject");
+                t.IsTrue(output == sentinel,
+                         "Gouraud capability rejection must preserve output");
+                t.IsFalse(error.empty(),
+                          "Gouraud capability rejection should retain a diagnostic");
+                service->shutdown();
+                return;
+            }
+            t.IsTrue(selected->shaderInt64 && selected->exactCt32Triangle,
+                     "the Gouraud capability should retain its integer coverage prerequisites");
+
+            std::vector<uint8_t> gpu = makeVramPattern(0x474F5552u);
+            uint64_t expectedCandidatePixels = 0u;
+            for (size_t index = 0u; index < triangles.size(); ++index)
+            {
+                const GsVulkanGouraudDepthCt32Triangle &triangle =
+                    triangles[index];
+                std::vector<uint8_t> expected = gpu;
+                applyGouraudDepthCt32TriangleCpu(expected, triangle);
+                std::vector<uint8_t> actual = {0xA5u};
+                std::string error;
+                if (!service->executeGouraudDepthCt32Triangle(
+                        gpu, triangle, actual, &error))
+                {
+                    t.Fail(
+                        "GPU Gouraud depth triangle " +
+                        std::to_string(index) + " failed: " + error);
+                    return;
+                }
+                if (actual != expected)
+                {
+                    const auto mismatch = std::mismatch(
+                        actual.begin(), actual.end(), expected.begin());
+                    std::ostringstream message;
+                    message
+                        << "GPU Gouraud depth triangle " << index
+                        << " first disagreed with the DDA oracle at byte "
+                        << static_cast<size_t>(
+                               mismatch.first - actual.begin())
+                        << " actual=0x" << std::hex
+                        << static_cast<uint32_t>(*mismatch.first)
+                        << " expected=0x"
+                        << static_cast<uint32_t>(*mismatch.second);
+                    for (uint32_t y = triangle.boundsY0;
+                         y < triangle.boundsY1; ++y)
+                    {
+                        bool found = false;
+                        for (uint32_t x = triangle.boundsX0;
+                             x < triangle.boundsX1; ++x)
+                        {
+                            const uint32_t actualColor = GSMem::ReadCT32(
+                                actual.data(),
+                                triangle.framebufferBaseBlock,
+                                triangle.framebufferWidth,
+                                x, y);
+                            const uint32_t expectedColor = GSMem::ReadCT32(
+                                expected.data(),
+                                triangle.framebufferBaseBlock,
+                                triangle.framebufferWidth,
+                                x, y);
+                            if (actualColor != expectedColor)
+                            {
+                                message << std::dec << " xy=(" << x
+                                        << ',' << y << ") actual_color=0x"
+                                        << std::hex << actualColor
+                                        << " expected_color=0x"
+                                        << expectedColor;
+                                found = true;
+                                break;
+                            }
+                        }
+                        if (found)
+                            break;
+                    }
+                    t.Fail(message.str());
+                    return;
+                }
+                gpu = std::move(actual);
+                expectedCandidatePixels +=
+                    static_cast<uint64_t>(
+                        triangle.boundsX1 - triangle.boundsX0) *
+                    static_cast<uint64_t>(
+                        triangle.boundsY1 - triangle.boundsY0);
+            }
+
+            const auto expectRejected =
+                [&](std::span<const uint8_t> input,
+                    GsVulkanGouraudDepthCt32Triangle triangle,
+                    const std::string &label)
+            {
+                std::vector<uint8_t> output = {0x12u, 0x34u};
+                const std::vector<uint8_t> sentinel = output;
+                std::string error;
+                t.IsFalse(service->executeGouraudDepthCt32Triangle(
+                              input, triangle, output, &error),
+                          label + " should fail closed");
+                t.IsTrue(output == sentinel,
+                         label + " must preserve caller output");
+                t.IsFalse(error.empty(),
+                          label + " should retain a diagnostic");
+            };
+            const std::vector<uint8_t> shortInput(
+                GS_VULKAN_VRAM_SIZE - 1u, 0u);
+            expectRejected(shortInput, triangles.front(),
+                           "short Gouraud triangle VRAM input");
+            GsVulkanGouraudDepthCt32Triangle invalid = triangles.front();
+            invalid.colorDxBits[2] ^= 1u;
+            expectRejected(gpu, invalid,
+                           "inconsistent Gouraud triangle color DDA");
+            invalid = triangles.front();
+            invalid.rgba1 ^= 1u << 24u;
+            expectRejected(gpu, invalid,
+                           "non-normalized Gouraud triangle alpha");
+            invalid = triangles.front();
+            invalid.depthPsm = GS_PSM_Z16;
+            expectRejected(gpu, invalid,
+                           "unsupported Gouraud triangle depth format");
+            invalid = triangles.front();
+            invalid.depthBaseBlock = invalid.framebufferBaseBlock;
+            expectRejected(gpu, invalid,
+                           "aliased Gouraud triangle color and depth");
+            invalid = triangles.front();
+            invalid.positiveArea ^= 1u;
+            expectRejected(gpu, invalid,
+                           "inconsistent Gouraud triangle winding");
+
+            const GsVulkanServiceStatistics statistics =
+                service->statistics();
+            t.Equals(
+                statistics.gouraudDepthCt32TriangleDrawsCompleted,
+                static_cast<uint64_t>(triangles.size()),
+                "every accepted Gouraud triangle should complete once");
+            t.Equals(
+                statistics.gouraudDepthCt32TriangleDrawsFailed,
+                0ull,
+                "caller-side Gouraud rejection should not count worker failures");
+            t.Equals(
+                statistics
+                    .gouraudDepthCt32TriangleCandidatePixelsExecuted,
+                expectedCandidatePixels,
+                "Gouraud statistics should count conservative dispatch pixels");
+            t.Equals(statistics.validationErrors, 0u,
+                     "Gouraud execution must remain validation-clean");
+            t.Equals(statistics.validationWarnings, 0u,
+                     "Gouraud execution should emit no validation warnings");
+
+            service->shutdown();
+            service->shutdown();
+            std::vector<uint8_t> shutdownOutput = {0xABu};
+            const std::vector<uint8_t> shutdownSentinel = shutdownOutput;
+            std::string shutdownError;
+            t.IsFalse(service->executeGouraudDepthCt32Triangle(
+                          gpu, triangles.front(), shutdownOutput,
+                          &shutdownError),
+                      "a stopped service must reject Gouraud work");
+            t.IsTrue(shutdownOutput == shutdownSentinel,
+                     "post-shutdown Gouraud rejection must preserve output");
         });
 
         tc.Run("Vulkan resident page operations preserve unselected bytes", [](TestCase &t)

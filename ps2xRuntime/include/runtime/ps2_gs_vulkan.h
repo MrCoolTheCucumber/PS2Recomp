@@ -111,6 +111,11 @@ struct GsVulkanDeviceReport
     // 64-bit shader arithmetic for full-range GS 12.4 edge equations.
     bool exactCt32Triangle = false;
 
+    // Gouraud CT32 plus constant Z32/Z24 depth retains the same signed
+    // 64-bit coverage requirement and additionally reproduces the software
+    // rasterizer's single-precision eight-pixel color DDA.
+    bool exactGouraudDepthCt32Triangle = false;
+
     // Exact flat CT32 plus Z32/Z24 depth uses only the permanent raw-VRAM
     // contract and 32-bit storage-buffer atomics.
     bool exactDepthCt32Sprite = false;
@@ -230,6 +235,9 @@ struct GsVulkanServiceStatistics
     uint64_t triangleDrawsCompleted = 0u;
     uint64_t triangleDrawsFailed = 0u;
     uint64_t triangleCandidatePixelsExecuted = 0u;
+    uint64_t gouraudDepthCt32TriangleDrawsCompleted = 0u;
+    uint64_t gouraudDepthCt32TriangleDrawsFailed = 0u;
+    uint64_t gouraudDepthCt32TriangleCandidatePixelsExecuted = 0u;
     uint64_t residentSpriteBatchesCompleted = 0u;
     uint64_t residentSpriteBatchesFailed = 0u;
     uint64_t largestResidentSpriteBatch = 0u;
@@ -751,16 +759,17 @@ struct alignas(16) GsVulkanGouraudDepthCt32Triangle
     uint32_t rgba1 = 0u;
     uint32_t rgba2 = 0u;
     uint32_t topLeftEdgeMask = 0u;
-    uint32_t reserved0 = 0u;
-    uint32_t reserved1 = 0u;
-    uint32_t reserved2 = 0u;
-    uint32_t reserved3 = 0u;
+    // Exact host float bit patterns from the software rasterizer's setup.
+    // Shipping setup results avoids relying on device-specific division and
+    // setup contraction while retaining per-pixel fused scanline evaluation.
+    std::array<uint32_t, 4> colorDxBits{};
+    std::array<uint32_t, 4> colorDyBits{};
 
     bool operator==(
         const GsVulkanGouraudDepthCt32Triangle &) const = default;
 };
 
-static_assert(sizeof(GsVulkanGouraudDepthCt32Triangle) == 96u);
+static_assert(sizeof(GsVulkanGouraudDepthCt32Triangle) == 112u);
 static_assert(std::is_standard_layout_v<
               GsVulkanGouraudDepthCt32Triangle>);
 static_assert(std::is_trivially_copyable_v<
@@ -827,10 +836,10 @@ static_assert(offsetof(
     topLeftEdgeMask) == 76u);
 static_assert(offsetof(
     GsVulkanGouraudDepthCt32Triangle,
-    reserved0) == 80u);
+    colorDxBits) == 80u);
 static_assert(offsetof(
     GsVulkanGouraudDepthCt32Triangle,
-    reserved3) == 92u);
+    colorDyBits) == 96u);
 
 // Applies the complete semantic predicate and publishes the raw ordered
 // vertices/attributes only after every invariant has been validated.
@@ -876,6 +885,11 @@ public:
     [[nodiscard]] virtual bool executeCt32Triangle(
         std::span<const uint8_t> input,
         const GsVulkanCt32Triangle &triangle,
+        std::vector<uint8_t> &output,
+        std::string *error = nullptr) = 0;
+    [[nodiscard]] virtual bool executeGouraudDepthCt32Triangle(
+        std::span<const uint8_t> input,
+        const GsVulkanGouraudDepthCt32Triangle &triangle,
         std::vector<uint8_t> &output,
         std::string *error = nullptr) = 0;
     [[nodiscard]] virtual bool uploadVramPages(
@@ -1015,6 +1029,15 @@ public:
     [[nodiscard]] bool executeCt32Triangle(
         std::span<const uint8_t> input,
         const GsVulkanCt32Triangle &triangle,
+        std::vector<uint8_t> &output,
+        std::string *error = nullptr) override;
+
+    // Uploads canonical 4 MiB CPU VRAM, executes one prepared Gouraud CT32
+    // triangle with constant ALWAYS-write Z32/Z24 depth, and publishes the
+    // complete synchronized image.
+    [[nodiscard]] bool executeGouraudDepthCt32Triangle(
+        std::span<const uint8_t> input,
+        const GsVulkanGouraudDepthCt32Triangle &triangle,
         std::vector<uint8_t> &output,
         std::string *error = nullptr) override;
 

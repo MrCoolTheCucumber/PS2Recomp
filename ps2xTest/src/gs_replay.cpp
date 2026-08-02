@@ -316,6 +316,10 @@ namespace
                    << (device.exactVramStorage ? "true" : "false")
                    << ",\"exact_ct32_triangle\":"
                    << (device.exactCt32Triangle ? "true" : "false")
+                   << ",\"exact_gouraud_depth_ct32_triangle\":"
+                   << (device.exactGouraudDepthCt32Triangle
+                           ? "true"
+                           : "false")
                    << ",\"exact_depth_ct32_sprite\":"
                    << (device.exactDepthCt32Sprite ? "true" : "false")
                    << ",\"exact_nearest_ct32_sprite\":"
@@ -445,6 +449,13 @@ namespace
                << statistics.triangleDrawsFailed
                << ",\"triangle_candidate_pixels_executed\":"
                << statistics.triangleCandidatePixelsExecuted
+               << ",\"gouraud_depth_ct32_triangle_draws_completed\":"
+               << statistics.gouraudDepthCt32TriangleDrawsCompleted
+               << ",\"gouraud_depth_ct32_triangle_draws_failed\":"
+               << statistics.gouraudDepthCt32TriangleDrawsFailed
+               << ",\"gouraud_depth_ct32_triangle_candidate_pixels_executed\":"
+               << statistics
+                      .gouraudDepthCt32TriangleCandidatePixelsExecuted
                << ",\"resident_sprite_batches_completed\":"
                << statistics.residentSpriteBatchesCompleted
                << ",\"resident_sprite_batches_failed\":"

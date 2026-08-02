@@ -1,0 +1,428 @@
+#version 450
+#extension GL_GOOGLE_include_directive : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+
+#include "ps2_gs_memory.glsl"
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+layout(set = 0, binding = 0, std430) buffer GsVram
+{
+    uint words[];
+} gs_vram;
+
+layout(push_constant) uniform GouraudDepthTriangleParameters
+{
+    uint framebuffer_base_block;
+    uint framebuffer_width;
+    uint bounds_x0;
+    uint bounds_y0;
+    uint bounds_x1;
+    uint bounds_y1;
+    uint depth_base_block;
+    uint depth_psm;
+    uint depth;
+    uint positive_area;
+    int vertex0_x_12_4;
+    int vertex0_y_12_4;
+    int vertex1_x_12_4;
+    int vertex1_y_12_4;
+    int vertex2_x_12_4;
+    int vertex2_y_12_4;
+    uint rgba0;
+    uint rgba1;
+    uint rgba2;
+    uint top_left_edge_mask;
+    uvec4 color_dx_bits;
+    uvec4 color_dy_bits;
+} triangle;
+
+struct TriangleVertex
+{
+    int x_12_4;
+    int y_12_4;
+    uint rgba;
+};
+
+int64_t edge_value(
+    int ax,
+    int ay,
+    int bx,
+    int by,
+    int sample_x,
+    int sample_y)
+{
+    return
+        (int64_t(bx) - int64_t(ax)) *
+            (int64_t(sample_y) - int64_t(ay)) -
+        (int64_t(by) - int64_t(ay)) *
+            (int64_t(sample_x) - int64_t(ax));
+}
+
+int64_t oriented_edge_value(
+    int ax,
+    int ay,
+    int bx,
+    int by,
+    int sample_x,
+    int sample_y)
+{
+    int64_t value = edge_value(
+        ax, ay, bx, by, sample_x, sample_y);
+    return triangle.positive_area != 0u ? value : -value;
+}
+
+bool edge_covers(int64_t value, uint mask_bit)
+{
+    return value > int64_t(0) ||
+           (value == int64_t(0) &&
+            (triangle.top_left_edge_mask & mask_bit) != 0u);
+}
+
+bool sample_covered(int sample_x, int sample_y)
+{
+    int64_t edge0 = oriented_edge_value(
+        triangle.vertex1_x_12_4,
+        triangle.vertex1_y_12_4,
+        triangle.vertex2_x_12_4,
+        triangle.vertex2_y_12_4,
+        sample_x,
+        sample_y);
+    int64_t edge1 = oriented_edge_value(
+        triangle.vertex2_x_12_4,
+        triangle.vertex2_y_12_4,
+        triangle.vertex0_x_12_4,
+        triangle.vertex0_y_12_4,
+        sample_x,
+        sample_y);
+    int64_t edge2 = oriented_edge_value(
+        triangle.vertex0_x_12_4,
+        triangle.vertex0_y_12_4,
+        triangle.vertex1_x_12_4,
+        triangle.vertex1_y_12_4,
+        sample_x,
+        sample_y);
+    return edge_covers(edge0, 1u) &&
+           edge_covers(edge1, 2u) &&
+           edge_covers(edge2, 4u);
+}
+
+void clip_span_to_edge(
+    int64_t edge,
+    int64_t step,
+    bool top_left,
+    inout int span_start,
+    inout int span_end)
+{
+    int64_t threshold = top_left ? int64_t(0) : int64_t(1);
+    if (step > int64_t(0))
+    {
+        if (edge < threshold)
+        {
+            int64_t delta = threshold - edge;
+            int64_t first =
+                (delta + step - int64_t(1)) / step;
+            if (first >= int64_t(span_end))
+                span_start = span_end;
+            else
+                span_start = max(span_start, int(first));
+        }
+    }
+    else if (step < int64_t(0))
+    {
+        if (edge < threshold)
+        {
+            span_end = 0;
+        }
+        else
+        {
+            int64_t last =
+                (edge - threshold) / -step;
+            if (last < int64_t(span_end - 1))
+                span_end = int(last + int64_t(1));
+        }
+    }
+    else if (edge < threshold)
+    {
+        span_end = 0;
+    }
+}
+
+int scanline_left(uint y)
+{
+    int sample_x = int(triangle.bounds_x0 << 4u);
+    int sample_y = int(y << 4u);
+    int64_t edge0 = oriented_edge_value(
+        triangle.vertex1_x_12_4,
+        triangle.vertex1_y_12_4,
+        triangle.vertex2_x_12_4,
+        triangle.vertex2_y_12_4,
+        sample_x,
+        sample_y);
+    int64_t edge1 = oriented_edge_value(
+        triangle.vertex2_x_12_4,
+        triangle.vertex2_y_12_4,
+        triangle.vertex0_x_12_4,
+        triangle.vertex0_y_12_4,
+        sample_x,
+        sample_y);
+    int64_t edge2 = oriented_edge_value(
+        triangle.vertex0_x_12_4,
+        triangle.vertex0_y_12_4,
+        triangle.vertex1_x_12_4,
+        triangle.vertex1_y_12_4,
+        sample_x,
+        sample_y);
+    int64_t step0 =
+        -int64_t(triangle.vertex2_y_12_4 -
+                 triangle.vertex1_y_12_4) * int64_t(16);
+    int64_t step1 =
+        -int64_t(triangle.vertex0_y_12_4 -
+                 triangle.vertex2_y_12_4) * int64_t(16);
+    int64_t step2 =
+        -int64_t(triangle.vertex1_y_12_4 -
+                 triangle.vertex0_y_12_4) * int64_t(16);
+    if (triangle.positive_area == 0u)
+    {
+        step0 = -step0;
+        step1 = -step1;
+        step2 = -step2;
+    }
+
+    int span_start = 0;
+    int span_end = int(triangle.bounds_x1 - triangle.bounds_x0);
+    clip_span_to_edge(
+        edge0, step0,
+        (triangle.top_left_edge_mask & 1u) != 0u,
+        span_start, span_end);
+    clip_span_to_edge(
+        edge1, step1,
+        (triangle.top_left_edge_mask & 2u) != 0u,
+        span_start, span_end);
+    clip_span_to_edge(
+        edge2, step2,
+        (triangle.top_left_edge_mask & 4u) != 0u,
+        span_start, span_end);
+    return span_start < span_end
+        ? int(triangle.bounds_x0) + span_start
+        : int(triangle.bounds_x1);
+}
+
+void swap_vertices(inout TriangleVertex a, inout TriangleVertex b)
+{
+    TriangleVertex temporary = a;
+    a = b;
+    b = temporary;
+}
+
+precise vec4 fixed_color(uint rgba)
+{
+    return vec4(
+        float(rgba & 0xffu),
+        float((rgba >> 8u) & 0xffu),
+        float((rgba >> 16u) & 0xffu),
+        float(rgba >> 24u)) * 128.0f;
+}
+
+uint interpolated_color(
+    uint x,
+    uint y,
+    int left,
+    int64_t edge1,
+    int64_t edge2)
+{
+    TriangleVertex original0 = TriangleVertex(
+        triangle.vertex0_x_12_4,
+        triangle.vertex0_y_12_4,
+        triangle.rgba0);
+    TriangleVertex original1 = TriangleVertex(
+        triangle.vertex1_x_12_4,
+        triangle.vertex1_y_12_4,
+        triangle.rgba1);
+    TriangleVertex original2 = TriangleVertex(
+        triangle.vertex2_x_12_4,
+        triangle.vertex2_y_12_4,
+        triangle.rgba2);
+    TriangleVertex top = original0;
+    TriangleVertex middle = original1;
+    TriangleVertex bottom = original2;
+    if (middle.y_12_4 < top.y_12_4)
+        swap_vertices(top, middle);
+    if (bottom.y_12_4 < middle.y_12_4)
+        swap_vertices(middle, bottom);
+    if (middle.y_12_4 < top.y_12_4)
+        swap_vertices(top, middle);
+
+    precise float top_x = float(top.x_12_4) / 16.0f;
+    precise float top_y = float(top.y_12_4) / 16.0f;
+    precise float middle_x = float(middle.x_12_4) / 16.0f;
+    precise float middle_y = float(middle.y_12_4) / 16.0f;
+    precise float bottom_x = float(bottom.x_12_4) / 16.0f;
+    precise float bottom_y = float(bottom.y_12_4) / 16.0f;
+    precise float gradient_dx01 = middle_x - top_x;
+    precise float gradient_dy01 = middle_y - top_y;
+    precise float gradient_dx02 = bottom_x - top_x;
+    precise float gradient_dy02 = bottom_y - top_y;
+    precise float gradient_cross = fma(
+        gradient_dy01,
+        gradient_dx02,
+        -(gradient_dx01 * gradient_dy02));
+    if (gradient_cross == 0.0f)
+    {
+        int64_t signed_area = edge_value(
+            triangle.vertex0_x_12_4,
+            triangle.vertex0_y_12_4,
+            triangle.vertex1_x_12_4,
+            triangle.vertex1_y_12_4,
+            triangle.vertex2_x_12_4,
+            triangle.vertex2_y_12_4);
+        int64_t area = signed_area > int64_t(0)
+            ? signed_area
+            : -signed_area;
+        precise float inverse_area = 1.0f / float(area);
+        precise float weight1 = float(edge1) * inverse_area;
+        precise float weight2 = float(edge2) * inverse_area;
+        precise vec4 color0 = fixed_color(original0.rgba) / 128.0f;
+        precise vec4 color1 = fixed_color(original1.rgba) / 128.0f;
+        precise vec4 color2 = fixed_color(original2.rgba) / 128.0f;
+        precise vec4 interpolated =
+            color0 + (color1 - color0) * weight1 +
+            (color2 - color0) * weight2;
+        ivec4 channels = clamp(ivec4(interpolated), ivec4(0), ivec4(255));
+        return uint(channels.r) |
+               (uint(channels.g) << 8u) |
+               (uint(channels.b) << 16u) |
+               (uint(channels.a) << 24u);
+    }
+
+    precise vec4 color_dx = uintBitsToFloat(triangle.color_dx_bits);
+    precise vec4 color_dy = uintBitsToFloat(triangle.color_dy_bits);
+
+    TriangleVertex base = top;
+    precise float base_x = top_x;
+    precise float base_y = top_y;
+    if (top_y == middle_y)
+    {
+        precise float flat_cross =
+            (middle_y - top_y) * (bottom_x - top_x) -
+            (middle_x - top_x) * (bottom_y - top_y);
+        if (!(flat_cross < 0.0f))
+        {
+            base = middle;
+            base_x = middle_x;
+            base_y = middle_y;
+        }
+    }
+    else if (float(y) >= ceil(middle_y))
+    {
+        base = middle;
+        base_x = middle_x;
+        base_y = middle_y;
+    }
+
+    precise float delta_y = float(y) - base_y;
+    precise float prestep = float(left) - base_x;
+    precise vec4 edge_color = fma(
+        color_dy,
+        vec4(delta_y),
+        fixed_color(base.rgba));
+    precise vec4 scanline_color_raw = fma(
+        color_dx,
+        vec4(prestep),
+        edge_color);
+    ivec4 scanline_color = ivec4(scanline_color_raw);
+
+    int scanline_skip = left & 7;
+    int aligned_left = left & ~7;
+    int block = (int(x) - aligned_left) / 8;
+    int lane_offset = (int(x) & 7) - scanline_skip;
+    ivec4 lane_delta = ivec4(color_dx * float(lane_offset));
+    ivec4 block_delta = ivec4(color_dx * 8.0f);
+    ivec4 fixed_value =
+        scanline_color + lane_delta + block * block_delta;
+    ivec4 channels = clamp(
+        fixed_value >> 7, ivec4(0), ivec4(255));
+    return uint(channels.r) |
+           (uint(channels.g) << 8u) |
+           (uint(channels.b) << 16u) |
+           (uint(channels.a) << 24u);
+}
+
+uint gs_word_index(
+    uint psm,
+    uint base_block,
+    uint x,
+    uint y)
+{
+    uint bit_address = gs_pixel_bit_address(
+        psm,
+        base_block,
+        triangle.framebuffer_width,
+        x,
+        y);
+    return (bit_address >> 5u) & (GS_MEMORY_WORD_COUNT - 1u);
+}
+
+void write_z24(uint word_index, uint initial_word)
+{
+    uint expected = initial_word;
+    for (;;)
+    {
+        uint replacement =
+            (expected & 0xff000000u) |
+            (triangle.depth & 0x00ffffffu);
+        uint observed = atomicCompSwap(
+            gs_vram.words[word_index], expected, replacement);
+        if (observed == expected)
+            return;
+        expected = observed;
+    }
+}
+
+void main()
+{
+    uint x = triangle.bounds_x0 + gl_GlobalInvocationID.x;
+    uint y = triangle.bounds_y0 + gl_GlobalInvocationID.y;
+    if (x >= triangle.bounds_x1 || y >= triangle.bounds_y1)
+        return;
+
+    int sample_x = int(x << 4u);
+    int sample_y = int(y << 4u);
+    int64_t edge1 = oriented_edge_value(
+        triangle.vertex2_x_12_4,
+        triangle.vertex2_y_12_4,
+        triangle.vertex0_x_12_4,
+        triangle.vertex0_y_12_4,
+        sample_x,
+        sample_y);
+    int64_t edge2 = oriented_edge_value(
+        triangle.vertex0_x_12_4,
+        triangle.vertex0_y_12_4,
+        triangle.vertex1_x_12_4,
+        triangle.vertex1_y_12_4,
+        sample_x,
+        sample_y);
+    if (!sample_covered(sample_x, sample_y))
+        return;
+
+    int left = scanline_left(y);
+    if (left >= int(triangle.bounds_x1))
+        return;
+    uint color = interpolated_color(x, y, left, edge1, edge2);
+    uint framebuffer_word_index = gs_word_index(
+        0x00u, triangle.framebuffer_base_block, x, y);
+    atomicExchange(gs_vram.words[framebuffer_word_index], color);
+
+    uint depth_word_index = gs_word_index(
+        triangle.depth_psm, triangle.depth_base_block, x, y);
+    if (triangle.depth_psm == 0x31u)
+    {
+        uint initial_word = atomicAdd(
+            gs_vram.words[depth_word_index], 0u);
+        write_z24(depth_word_index, initial_word);
+    }
+    else
+    {
+        atomicExchange(gs_vram.words[depth_word_index], triangle.depth);
+    }
+}

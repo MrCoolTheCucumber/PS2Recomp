@@ -519,6 +519,87 @@ namespace
         return dy < 0 || (dy == 0 && dx > 0);
     }
 
+    struct GouraudColorDdaBits
+    {
+        std::array<uint32_t, 4> dx{};
+        std::array<uint32_t, 4> dy{};
+    };
+
+    GouraudColorDdaBits prepareGouraudColorDdaBits(
+        const std::array<FixedTriangleVertex, 3> &fixedVertices,
+        const std::array<uint32_t, 3> &rgba) noexcept
+    {
+        struct Vertex
+        {
+            float x;
+            float y;
+            uint32_t rgba;
+        };
+        std::array<Vertex, 3> sorted{{
+            {static_cast<float>(fixedVertices[0].x) / 16.0f,
+             static_cast<float>(fixedVertices[0].y) / 16.0f,
+             rgba[0]},
+            {static_cast<float>(fixedVertices[1].x) / 16.0f,
+             static_cast<float>(fixedVertices[1].y) / 16.0f,
+             rgba[1]},
+            {static_cast<float>(fixedVertices[2].x) / 16.0f,
+             static_cast<float>(fixedVertices[2].y) / 16.0f,
+             rgba[2]},
+        }};
+        if (sorted[1].y < sorted[0].y)
+            std::swap(sorted[0], sorted[1]);
+        if (sorted[2].y < sorted[1].y)
+            std::swap(sorted[1], sorted[2]);
+        if (sorted[1].y < sorted[0].y)
+            std::swap(sorted[0], sorted[1]);
+
+        const float gradientDx01 = sorted[1].x - sorted[0].x;
+        const float gradientDy01 = sorted[1].y - sorted[0].y;
+        const float gradientDx02 = sorted[2].x - sorted[0].x;
+        const float gradientDy02 = sorted[2].y - sorted[0].y;
+        const float gradientCross = std::fma(
+            gradientDy01,
+            gradientDx02,
+            -(gradientDx01 * gradientDy02));
+        GouraudColorDdaBits result{};
+        if (gradientCross == 0.0f)
+            return result;
+
+        const float gradientX01OverCross =
+            gradientDx01 / gradientCross;
+        const float gradientY01OverCross =
+            gradientDy01 / gradientCross;
+        const float gradientX02OverCross =
+            gradientDx02 / gradientCross;
+        const float gradientY02OverCross =
+            gradientDy02 / gradientCross;
+        const auto channel = [](uint32_t color, size_t index)
+        {
+            return static_cast<float>(
+                       (color >> (index * 8u)) & 0xFFu) *
+                   128.0f;
+        };
+        for (size_t index = 0u; index < result.dx.size(); ++index)
+        {
+            const float top = channel(sorted[0].rgba, index);
+            const float delta01 =
+                channel(sorted[1].rgba, index) - top;
+            const float delta02 =
+                channel(sorted[2].rgba, index) - top;
+            const float dx = std::fma(
+                delta02,
+                gradientY01OverCross,
+                -(delta01 * gradientY02OverCross));
+            const float dy = std::fma(
+                delta01,
+                gradientX02OverCross,
+                -(delta02 * gradientX01OverCross));
+            result.dx[index] = std::bit_cast<uint32_t>(dx);
+            result.dy[index] = std::bit_cast<uint32_t>(dy);
+        }
+        return result;
+    }
+
     const char *ct32TriangleValidationError(
         const GsVulkanCt32Triangle &triangle) noexcept
     {
@@ -573,11 +654,6 @@ namespace
     const char *gouraudDepthCt32TriangleValidationError(
         const GsVulkanGouraudDepthCt32Triangle &triangle) noexcept
     {
-        if ((triangle.reserved0 | triangle.reserved1 |
-             triangle.reserved2 | triangle.reserved3) != 0u)
-        {
-            return "Vulkan Gouraud depth CT32 triangle has non-zero reserved data";
-        }
         if (triangle.framebufferBaseBlock > 0x3FFFu ||
             triangle.depthBaseBlock > 0x3FFFu)
         {
@@ -668,6 +744,15 @@ namespace
         if (triangle.topLeftEdgeMask != expectedTopLeftMask)
         {
             return "Vulkan Gouraud depth CT32 triangle edge mask is inconsistent";
+        }
+        const GouraudColorDdaBits expectedColorDda =
+            prepareGouraudColorDdaBits(
+                vertices,
+                {triangle.rgba0, triangle.rgba1, triangle.rgba2});
+        if (triangle.colorDxBits != expectedColorDda.dx ||
+            triangle.colorDyBits != expectedColorDda.dy)
+        {
+            return "Vulkan Gouraud depth CT32 triangle color DDA is inconsistent";
         }
 
         const uint32_t width = triangle.boundsX1 - triangle.boundsX0;
@@ -1506,6 +1591,12 @@ GsBackendDecision prepareGsVulkanGouraudSourceOverDepthCt32Triangle(
         (orientedTopLeft(fixedVertices[1], fixedVertices[2]) ? 1u : 0u) |
         (orientedTopLeft(fixedVertices[2], fixedVertices[0]) ? 2u : 0u) |
         (orientedTopLeft(fixedVertices[0], fixedVertices[1]) ? 4u : 0u);
+    const GouraudColorDdaBits colorDda =
+        prepareGouraudColorDdaBits(
+            fixedVertices,
+            {prepared.rgba0, prepared.rgba1, prepared.rgba2});
+    prepared.colorDxBits = colorDda.dx;
+    prepared.colorDyBits = colorDda.dy;
     if (gouraudDepthCt32TriangleValidationError(prepared))
         return {false, GsFallbackReason::UnknownMemoryLayout};
 
@@ -2233,6 +2324,8 @@ GsVulkanCapabilityReport probeGsVulkanCapabilities(
             device.kind != GsVulkanDeviceKind::Cpu;
         device.exactCt32Triangle =
             device.suitable && device.shaderInt64;
+        device.exactGouraudDepthCt32Triangle =
+            device.exactCt32Triangle;
         device.exactDepthCt32Sprite = device.suitable;
         device.exactNearestCt32Sprite = device.suitable;
         device.exactLinearCt32Sprite = device.suitable;
@@ -2282,6 +2375,7 @@ namespace
 #include "shaders/ps2_gs_ct32_sprite_spv.inc"
 #include "shaders/ps2_gs_depth_ct32_sprite_spv.inc"
 #include "shaders/ps2_gs_feedback_linear_depth_ct32_sprite_spv.inc"
+#include "shaders/ps2_gs_gouraud_depth_ct32_triangle_spv.inc"
 #include "shaders/ps2_gs_ct32_triangle_spv.inc"
 #include "shaders/ps2_gs_linear_ct32_sprite_spv.inc"
 #include "shaders/ps2_gs_memory_cases_spv.inc"
@@ -2296,6 +2390,10 @@ namespace
         sizeof(kGsFeedbackLinearDepthCt32SpriteShaderSpv) == 46420u);
     static_assert(
         kGsFeedbackLinearDepthCt32SpriteShaderSpv[0] == 0x07230203u);
+    static_assert(
+        sizeof(kGsGouraudDepthCt32TriangleShaderSpv) == 26356u);
+    static_assert(
+        kGsGouraudDepthCt32TriangleShaderSpv[0] == 0x07230203u);
     static_assert(sizeof(kGsCt32TriangleShaderSpv) == 10200u);
     static_assert(kGsCt32TriangleShaderSpv[0] == 0x07230203u);
     static_assert(sizeof(kGsLinearCt32SpriteShaderSpv) == 38900u);
@@ -2613,6 +2711,13 @@ namespace
             GsVulkanCapabilityReport &report,
             GsVulkanServiceStatistics &statistics,
             std::string &error);
+        bool executeGouraudDepthCt32Triangle(
+            std::span<const uint8_t> input,
+            const GsVulkanGouraudDepthCt32Triangle &triangle,
+            std::vector<uint8_t> &output,
+            GsVulkanCapabilityReport &report,
+            GsVulkanServiceStatistics &statistics,
+            std::string &error);
         bool uploadVramPages(
             std::span<const uint8_t> packedInput,
             const GsVramPageMask &pages,
@@ -2772,6 +2877,10 @@ namespace
             VK_NULL_HANDLE;
         VkShaderModule m_triangleShaderModule = VK_NULL_HANDLE;
         VkPipeline m_trianglePipeline = VK_NULL_HANDLE;
+        VkShaderModule m_gouraudDepthCt32TriangleShaderModule =
+            VK_NULL_HANDLE;
+        VkPipeline m_gouraudDepthCt32TrianglePipeline =
+            VK_NULL_HANDLE;
         VkDescriptorPool m_descriptorPool = VK_NULL_HANDLE;
         VkDescriptorSet m_descriptorSet = VK_NULL_HANDLE;
         VkCommandPool m_commandPool = VK_NULL_HANDLE;
@@ -2780,6 +2889,7 @@ namespace
         uint64_t m_fenceTimeoutNanoseconds = 0u;
         uint64_t m_pipelineCacheMisses = 0u;
         bool m_exactCt32Triangle = false;
+        bool m_exactGouraudDepthCt32Triangle = false;
         bool m_healthy = false;
     };
 
@@ -3122,8 +3232,13 @@ namespace
 
         VkPhysicalDeviceFeatures enabledFeatures{};
         enabledFeatures.shaderInt64 =
-            selected.exactCt32Triangle ? VK_TRUE : VK_FALSE;
+            (selected.exactCt32Triangle ||
+             selected.exactGouraudDepthCt32Triangle)
+                ? VK_TRUE
+                : VK_FALSE;
         m_exactCt32Triangle = selected.exactCt32Triangle;
+        m_exactGouraudDepthCt32Triangle =
+            selected.exactGouraudDepthCt32Triangle;
         VkDeviceCreateInfo deviceInfo{};
         deviceInfo.sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO;
         deviceInfo.queueCreateInfoCount = 1u;
@@ -3494,6 +3609,16 @@ namespace
                 sizeof(kGsCt32TriangleShaderSpv),
                 m_triangleShaderModule, m_trianglePipeline,
                 "CT32 triangle"))
+        {
+            return false;
+        }
+        if (m_exactGouraudDepthCt32Triangle &&
+            !createComputePipeline(
+                kGsGouraudDepthCt32TriangleShaderSpv,
+                sizeof(kGsGouraudDepthCt32TriangleShaderSpv),
+                m_gouraudDepthCt32TriangleShaderModule,
+                m_gouraudDepthCt32TrianglePipeline,
+                "Gouraud depth CT32 triangle"))
         {
             return false;
         }
@@ -4011,6 +4136,56 @@ namespace
             groupCountX, groupCountY,
             &triangle, sizeof(triangle), output, nullptr,
             "CT32 triangle", report, statistics, error);
+    }
+
+    bool VulkanExecutionContext::executeGouraudDepthCt32Triangle(
+        std::span<const uint8_t> input,
+        const GsVulkanGouraudDepthCt32Triangle &triangle,
+        std::vector<uint8_t> &output,
+        GsVulkanCapabilityReport &report,
+        GsVulkanServiceStatistics &statistics,
+        std::string &error)
+    {
+        if (!m_healthy)
+        {
+            error = "Vulkan GS service is not healthy";
+            return false;
+        }
+        if (!m_exactGouraudDepthCt32Triangle ||
+            m_gouraudDepthCt32TrianglePipeline == VK_NULL_HANDLE)
+        {
+            error =
+                "Vulkan device does not support exact Gouraud depth CT32 triangles";
+            return false;
+        }
+        if (input.size() != GS_VULKAN_VRAM_SIZE)
+        {
+            error =
+                "Vulkan Gouraud depth CT32 triangle requires exactly 4 MiB of VRAM";
+            return false;
+        }
+        if (const char *validationError =
+                gouraudDepthCt32TriangleValidationError(triangle))
+        {
+            error = validationError;
+            return false;
+        }
+
+        constexpr uint32_t localSize = 8u;
+        const uint32_t width =
+            triangle.boundsX1 - triangle.boundsX0;
+        const uint32_t height =
+            triangle.boundsY1 - triangle.boundsY0;
+        const uint32_t groupCountX =
+            (width + localSize - 1u) / localSize;
+        const uint32_t groupCountY =
+            (height + localSize - 1u) / localSize;
+        return executeKernel(
+            input, {}, {}, m_gouraudDepthCt32TrianglePipeline,
+            groupCountX, groupCountY,
+            &triangle, sizeof(triangle), output, nullptr,
+            "Gouraud depth CT32 triangle",
+            report, statistics, error);
     }
 
     bool VulkanExecutionContext::flushMappedAllocation(
@@ -5510,6 +5685,25 @@ namespace
         }
         m_descriptorPool = VK_NULL_HANDLE;
         m_descriptorSet = VK_NULL_HANDLE;
+        if (m_gouraudDepthCt32TrianglePipeline != VK_NULL_HANDLE &&
+            m_functions.destroyPipeline)
+        {
+            m_functions.destroyPipeline(
+                m_device,
+                m_gouraudDepthCt32TrianglePipeline,
+                nullptr);
+        }
+        m_gouraudDepthCt32TrianglePipeline = VK_NULL_HANDLE;
+        if (m_gouraudDepthCt32TriangleShaderModule !=
+                VK_NULL_HANDLE &&
+            m_functions.destroyShaderModule)
+        {
+            m_functions.destroyShaderModule(
+                m_device,
+                m_gouraudDepthCt32TriangleShaderModule,
+                nullptr);
+        }
+        m_gouraudDepthCt32TriangleShaderModule = VK_NULL_HANDLE;
         if (m_trianglePipeline != VK_NULL_HANDLE &&
             m_functions.destroyPipeline)
         {
@@ -5690,6 +5884,7 @@ enum class GsVulkanRequestKind : uint8_t
     LinearCt32Sprite,
     FeedbackLinearDepthCt32Sprite,
     Ct32Triangle,
+    GouraudDepthCt32Triangle,
     UploadPages,
     DownloadPages,
     ResidentCt32Sprites,
@@ -5776,6 +5971,12 @@ struct GsVulkanService::Impl final
                          GsVulkanRequestKind::Ct32Triangle)
                 {
                     ++statistics.triangleDrawsFailed;
+                }
+                else if (activeRequestKind ==
+                         GsVulkanRequestKind::GouraudDepthCt32Triangle)
+                {
+                    ++statistics
+                          .gouraudDepthCt32TriangleDrawsFailed;
                 }
                 else if (activeRequestKind ==
                          GsVulkanRequestKind::ResidentCt32Sprites)
@@ -5891,6 +6092,8 @@ struct GsVulkanService::Impl final
             std::vector<GsVulkanFeedbackLinearDepthCt32Sprite>
                 feedbackLinearDepthCt32Sprites;
             std::vector<GsVulkanCt32Triangle> triangles;
+            std::vector<GsVulkanGouraudDepthCt32Triangle>
+                gouraudDepthCt32Triangles;
             GsVramPageMask pages;
             GsVulkanRequestKind kind =
                 GsVulkanRequestKind::RoundTrip;
@@ -5917,6 +6120,8 @@ struct GsVulkanService::Impl final
                     std::move(
                         requestFeedbackLinearDepthCt32Sprites);
                 triangles = std::move(requestTriangles);
+                gouraudDepthCt32Triangles =
+                    std::move(requestGouraudDepthCt32Triangles);
                 pages = requestPages;
                 kind = requestKind;
                 activeRequestKind = kind;
@@ -5990,6 +6195,14 @@ struct GsVulkanService::Impl final
             {
                 succeeded = context.executeCt32Triangle(
                     input, triangles.front(), output,
+                    localCapabilities, localStatistics,
+                    operationError);
+            }
+            else if (kind ==
+                     GsVulkanRequestKind::GouraudDepthCt32Triangle)
+            {
+                succeeded = context.executeGouraudDepthCt32Triangle(
+                    input, gouraudDepthCt32Triangles.front(), output,
                     localCapabilities, localStatistics,
                     operationError);
             }
@@ -6176,6 +6389,28 @@ struct GsVulkanService::Impl final
                 else
                 {
                     ++localStatistics.triangleDrawsFailed;
+                }
+            }
+            else if (kind ==
+                     GsVulkanRequestKind::GouraudDepthCt32Triangle)
+            {
+                if (succeeded)
+                {
+                    const GsVulkanGouraudDepthCt32Triangle &triangle =
+                        gouraudDepthCt32Triangles.front();
+                    ++localStatistics
+                          .gouraudDepthCt32TriangleDrawsCompleted;
+                    localStatistics
+                        .gouraudDepthCt32TriangleCandidatePixelsExecuted +=
+                        static_cast<uint64_t>(
+                            triangle.boundsX1 - triangle.boundsX0) *
+                        static_cast<uint64_t>(
+                            triangle.boundsY1 - triangle.boundsY0);
+                }
+                else
+                {
+                    ++localStatistics
+                          .gouraudDepthCt32TriangleDrawsFailed;
                 }
             }
             else if (kind == GsVulkanRequestKind::ResidentCt32Sprites)
@@ -6439,6 +6674,43 @@ struct GsVulkanService::Impl final
         std::vector<GsVulkanMemoryResult> *memoryResults,
         std::string *error)
     {
+        return executeRequest(
+            kind,
+            std::move(input),
+            std::move(feedbackSnapshot),
+            std::move(memoryCases),
+            std::move(sprites),
+            std::move(depthCt32Sprites),
+            std::move(nearestCt32Sprites),
+            std::move(linearCt32Sprites),
+            std::move(feedbackLinearDepthCt32Sprites),
+            std::move(triangles),
+            {},
+            pages,
+            output,
+            memoryResults,
+            error);
+    }
+
+    bool executeRequest(
+        GsVulkanRequestKind kind,
+        std::vector<uint8_t> input,
+        std::vector<uint8_t> feedbackSnapshot,
+        std::vector<GsVulkanMemoryCase> memoryCases,
+        std::vector<GsVulkanCt32Sprite> sprites,
+        std::vector<GsVulkanDepthCt32Sprite> depthCt32Sprites,
+        std::vector<GsVulkanNearestCt32Sprite> nearestCt32Sprites,
+        std::vector<GsVulkanLinearCt32Sprite> linearCt32Sprites,
+        std::vector<GsVulkanFeedbackLinearDepthCt32Sprite>
+            feedbackLinearDepthCt32Sprites,
+        std::vector<GsVulkanCt32Triangle> triangles,
+        std::vector<GsVulkanGouraudDepthCt32Triangle>
+            gouraudDepthCt32Triangles,
+        GsVramPageMask pages,
+        std::vector<uint8_t> &output,
+        std::vector<GsVulkanMemoryResult> *memoryResults,
+        std::string *error)
+    {
         std::lock_guard callLock(callMutex);
         std::unique_lock stateLock(stateMutex);
         if (!healthy || stopping || workerFinished)
@@ -6468,6 +6740,8 @@ struct GsVulkanService::Impl final
         requestFeedbackLinearDepthCt32Sprites =
             std::move(feedbackLinearDepthCt32Sprites);
         requestTriangles = std::move(triangles);
+        requestGouraudDepthCt32Triangles =
+            std::move(gouraudDepthCt32Triangles);
         requestPages = pages;
         responseOutput.clear();
         responseResults.clear();
@@ -6544,6 +6818,8 @@ struct GsVulkanService::Impl final
     std::vector<GsVulkanFeedbackLinearDepthCt32Sprite>
         requestFeedbackLinearDepthCt32Sprites;
     std::vector<GsVulkanCt32Triangle> requestTriangles;
+    std::vector<GsVulkanGouraudDepthCt32Triangle>
+        requestGouraudDepthCt32Triangles;
     GsVramPageMask requestPages;
     std::vector<uint8_t> responseOutput;
     std::vector<GsVulkanMemoryResult> responseResults;
@@ -7088,6 +7364,61 @@ bool GsVulkanService::executeCt32Triangle(
         {}, {}, {}, {}, {}, {}, {},
         std::vector<GsVulkanCt32Triangle>{triangle}, {},
         output, nullptr, error);
+#endif
+}
+
+bool GsVulkanService::executeGouraudDepthCt32Triangle(
+    std::span<const uint8_t> input,
+    const GsVulkanGouraudDepthCt32Triangle &triangle,
+    std::vector<uint8_t> &output,
+    std::string *error)
+{
+#if !PS2X_HAS_GS_VULKAN
+    (void)input;
+    (void)triangle;
+    (void)output;
+    if (error)
+        *error = "Vulkan GS support was compiled out";
+    return false;
+#else
+    if (input.size() != GS_VULKAN_VRAM_SIZE)
+    {
+        if (error)
+        {
+            *error =
+                "Vulkan Gouraud depth CT32 triangle requires exactly 4 MiB of VRAM";
+        }
+        return false;
+    }
+    if (const char *validationError =
+            gouraudDepthCt32TriangleValidationError(triangle))
+    {
+        if (error)
+            *error = validationError;
+        return false;
+    }
+    {
+        std::lock_guard lock(m_impl->stateMutex);
+        const GsVulkanDeviceReport *selected =
+            m_impl->capabilities.selectedDevice();
+        if (!selected ||
+            !selected->exactGouraudDepthCt32Triangle)
+        {
+            if (error)
+            {
+                *error =
+                    "Vulkan device does not support exact Gouraud depth CT32 triangles";
+            }
+            return false;
+        }
+    }
+
+    return m_impl->executeRequest(
+        GsVulkanRequestKind::GouraudDepthCt32Triangle,
+        std::vector<uint8_t>(input.begin(), input.end()),
+        {}, {}, {}, {}, {}, {}, {}, {},
+        std::vector<GsVulkanGouraudDepthCt32Triangle>{triangle},
+        {}, output, nullptr, error);
 #endif
 }
 
