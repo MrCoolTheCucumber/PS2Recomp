@@ -153,6 +153,55 @@ namespace
 
     void writePreparedRecord(
         std::ostream &output,
+        const GsVulkanGouraudDepthCt32Triangle &triangle)
+    {
+        output
+            << "  \"gouraud_depth_ct32_triangle\": {"
+            << "\"framebuffer_base_block\":"
+            << triangle.framebufferBaseBlock << ','
+            << "\"framebuffer_width\":"
+            << triangle.framebufferWidth << ','
+            << "\"bounds_x0\":" << triangle.boundsX0 << ','
+            << "\"bounds_y0\":" << triangle.boundsY0 << ','
+            << "\"bounds_x1\":" << triangle.boundsX1 << ','
+            << "\"bounds_y1\":" << triangle.boundsY1 << ','
+            << "\"depth_base_block\":"
+            << triangle.depthBaseBlock << ','
+            << "\"depth_psm\":" << triangle.depthPsm << ','
+            << "\"depth\":" << triangle.depth << ','
+            << "\"positive_area\":" << triangle.positiveArea << ','
+            << "\"vertex0_x_12_4\":" << triangle.vertex0X12_4 << ','
+            << "\"vertex0_y_12_4\":" << triangle.vertex0Y12_4 << ','
+            << "\"vertex1_x_12_4\":" << triangle.vertex1X12_4 << ','
+            << "\"vertex1_y_12_4\":" << triangle.vertex1Y12_4 << ','
+            << "\"vertex2_x_12_4\":" << triangle.vertex2X12_4 << ','
+            << "\"vertex2_y_12_4\":" << triangle.vertex2Y12_4 << ','
+            << "\"rgba0\":" << triangle.rgba0 << ','
+            << "\"rgba1\":" << triangle.rgba1 << ','
+            << "\"rgba2\":" << triangle.rgba2 << ','
+            << "\"top_left_edge_mask\":"
+            << triangle.topLeftEdgeMask
+            << ",\"color_dx_bits\":[";
+        for (size_t index = 0u;
+             index < triangle.colorDxBits.size(); ++index)
+        {
+            if (index != 0u)
+                output << ',';
+            output << triangle.colorDxBits[index];
+        }
+        output << "],\"color_dy_bits\":[";
+        for (size_t index = 0u;
+             index < triangle.colorDyBits.size(); ++index)
+        {
+            if (index != 0u)
+                output << ',';
+            output << triangle.colorDyBits[index];
+        }
+        output << "]}";
+    }
+
+    void writePreparedRecord(
+        std::ostream &output,
         const GsVulkanNearestCt32Sprite &sprite)
     {
         output
@@ -644,6 +693,7 @@ struct GsVulkanRasterBackend::Impl final
     GsVramPageMask pendingResidentWritePages;
     std::vector<uint8_t> pendingFeedbackSnapshot;
     bool exactCt32Triangle = false;
+    bool exactGouraudDepthCt32Triangle = false;
     bool exactDepthCt32Sprite = false;
     bool exactNearestCt32Sprite = false;
     bool exactLinearCt32Sprite = false;
@@ -990,6 +1040,9 @@ GsVulkanRasterBackend::createWithExecutor(
         executorCapabilities.selectedDevice();
     impl->exactCt32Triangle =
         selectedDevice && selectedDevice->exactCt32Triangle;
+    impl->exactGouraudDepthCt32Triangle =
+        selectedDevice &&
+        selectedDevice->exactGouraudDepthCt32Triangle;
     impl->exactDepthCt32Sprite =
         selectedDevice && selectedDevice->exactDepthCt32Sprite;
     impl->exactNearestCt32Sprite =
@@ -1194,23 +1247,45 @@ GsBackendDecision GsVulkanRasterBackend::classify(
     GsVulkanCt32Triangle triangle{};
     const GsBackendDecision triangleDecision =
         prepareGsVulkanCt32Triangle(command, triangle);
-    if (!triangleDecision.supported)
-        return triangleDecision;
-    if (!m_impl->exactCt32Triangle)
-        return {false, GsFallbackReason::BackendUnavailable};
-
-    if (m_impl->config.mode == GsRendererMode::Hybrid)
+    if (triangleDecision.supported)
     {
-        const uint64_t candidatePixels =
-            static_cast<uint64_t>(triangle.boundsX1 - triangle.boundsX0) *
-            static_cast<uint64_t>(triangle.boundsY1 - triangle.boundsY0);
-        if (candidatePixels <
-            m_impl->config.minimumHybridTriangleCandidatePixels)
+        if (!m_impl->exactCt32Triangle)
+            return {false, GsFallbackReason::BackendUnavailable};
+
+        if (m_impl->config.mode == GsRendererMode::Hybrid)
         {
-            return {false, GsFallbackReason::CostModel};
+            const uint64_t candidatePixels =
+                static_cast<uint64_t>(
+                    triangle.boundsX1 - triangle.boundsX0) *
+                static_cast<uint64_t>(
+                    triangle.boundsY1 - triangle.boundsY0);
+            if (candidatePixels <
+                m_impl->config.minimumHybridTriangleCandidatePixels)
+            {
+                return {false, GsFallbackReason::CostModel};
+            }
         }
+        return triangleDecision;
     }
-    return triangleDecision;
+
+    // Preserve every established triangle fallback outside Verify. The new
+    // class remains closed in strict/Hybrid until resident execution and a
+    // crossover are independently qualified.
+    if (m_impl->config.mode != GsRendererMode::Verify ||
+        triangleDecision.reason != GsFallbackReason::GouraudShading)
+    {
+        return triangleDecision;
+    }
+
+    GsVulkanGouraudDepthCt32Triangle gouraudDepthTriangle{};
+    const GsBackendDecision gouraudDepthDecision =
+        prepareGsVulkanGouraudSourceOverDepthCt32Triangle(
+            command, gouraudDepthTriangle);
+    if (!gouraudDepthDecision.supported)
+        return triangleDecision;
+    if (!m_impl->exactGouraudDepthCt32Triangle)
+        return {false, GsFallbackReason::BackendUnavailable};
+    return gouraudDepthDecision;
 }
 
 GsHybridBatchPolicy GsVulkanRasterBackend::hybridBatchPolicy(
@@ -1295,6 +1370,8 @@ void GsVulkanRasterBackend::submit(
         GsVulkanFeedbackLinearDepthCt32Sprite
             feedbackLinearDepthSprite{};
         GsVulkanCt32Triangle triangle{};
+        GsVulkanGouraudDepthCt32Triangle
+            gouraudDepthTriangle{};
         const GsDrawResources resources = command.resources();
         const bool isTriangle =
             command.primitive().type == GS_PRIM_TRIANGLE;
@@ -1304,8 +1381,19 @@ void GsVulkanRasterBackend::submit(
         bool isDepthSprite = false;
         bool isLinearTexturedSprite = false;
         bool isFeedbackLinearDepthSprite = false;
+        bool isGouraudDepthTriangle = false;
         if (isTriangle)
-            (void)prepareGsVulkanCt32Triangle(command, triangle);
+        {
+            const GsBackendDecision triangleDecision =
+                prepareGsVulkanCt32Triangle(command, triangle);
+            if (!triangleDecision.supported &&
+                m_impl->config.mode == GsRendererMode::Verify)
+            {
+                isGouraudDepthTriangle =
+                    prepareGsVulkanGouraudSourceOverDepthCt32Triangle(
+                        command, gouraudDepthTriangle).supported;
+            }
+        }
         else if (isTexturedSprite)
         {
             const GsBackendDecision textureDecision =
@@ -1377,7 +1465,14 @@ void GsVulkanRasterBackend::submit(
             std::vector<uint8_t> gpuOutput;
             std::string executionError;
             bool executed = false;
-            if (isTriangle)
+            if (isGouraudDepthTriangle)
+            {
+                executed = m_impl->executor
+                    ->executeGouraudDepthCt32Triangle(
+                        initial, gouraudDepthTriangle,
+                        gpuOutput, &executionError);
+            }
+            else if (isTriangle)
             {
                 executed = m_impl->executor->executeCt32Triangle(
                     initial, triangle, gpuOutput, &executionError);
@@ -1452,7 +1547,16 @@ void GsVulkanRasterBackend::submit(
                 std::string artifactPath;
                 std::string artifactError;
                 bool artifactWritten = false;
-                if (isTriangle)
+                if (isGouraudDepthTriangle)
+                {
+                    artifactWritten = writeVerificationArtifact(
+                        m_impl->config.verificationArtifactDirectory,
+                        command, gouraudDepthTriangle,
+                        firstDifference, initial,
+                        m_impl->canonicalVram, gpuOutput,
+                        artifactPath, artifactError);
+                }
+                else if (isTriangle)
                 {
                     artifactWritten = writeVerificationArtifact(
                         m_impl->config.verificationArtifactDirectory,

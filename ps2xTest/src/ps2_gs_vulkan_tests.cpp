@@ -2035,6 +2035,11 @@ namespace
                 exactFeedbackLinearDepthCt32Sprite_;
         }
 
+        void setExactGouraudDepthCt32Triangle(bool exact) noexcept
+        {
+            report.devices[0].exactGouraudDepthCt32Triangle = exact;
+        }
+
         bool executeCt32Sprite(
             std::span<const uint8_t> input,
             const GsVulkanCt32Sprite &sprite,
@@ -7874,6 +7879,188 @@ void register_ps2_gs_vulkan_tests()
             }
         });
 
+        tc.Run("Vulkan raster backend verifies Gouraud depth triangles only behind capability", [](TestCase &t)
+        {
+            GSMem::InitLookupTables();
+            const GsDrawCommand command =
+                makeGouraudSourceOverDepthCt32TriangleCommand(
+                    44u, 17u, 8u, 240u, GS_PSM_Z24,
+                    {4u, 31u, 3u, 27u}, {32u, 16u},
+                    {289u, 209u, 65u},
+                    {33u, 65u, 401u},
+                    {0x80000000u, 0x800A8040u, 0x80F01070u},
+                    0x12345678u);
+            GsVulkanGouraudDepthCt32Triangle prepared{};
+            t.IsTrue(
+                prepareGsVulkanGouraudSourceOverDepthCt32Triangle(
+                    command, prepared).supported,
+                "the Verify fixture should satisfy the Gouraud depth contract");
+
+            const std::vector<uint8_t> initial =
+                makeVramPattern(0x47445631u);
+            std::vector<uint8_t> expected = initial;
+            applyGouraudDepthCt32TriangleCpu(expected, prepared);
+            std::vector<uint8_t> vram = initial;
+            uint64_t softwareCalls = 0u;
+            GsVulkanRasterBackendConfig config{};
+            config.mode = GsRendererMode::Verify;
+            std::unique_ptr<GsVulkanRasterBackend> backend =
+                GsVulkanRasterBackend::createWithExecutor(
+                    std::make_unique<FakeCt32Executor>(
+                        FakeCt32Executor::Behavior::Exact),
+                    config, vram,
+                    [&](const GsDrawCommand &draw)
+                    {
+                        ++softwareCalls;
+                        GsVulkanGouraudDepthCt32Triangle triangle{};
+                        if (prepareGsVulkanGouraudSourceOverDepthCt32Triangle(
+                                draw, triangle).supported)
+                        {
+                            applyGouraudDepthCt32TriangleCpu(
+                                vram, triangle);
+                        }
+                    },
+                    {}, nullptr);
+            t.IsNotNull(
+                backend.get(),
+                "an exact Gouraud executor should create Verify");
+            if (!backend)
+                return;
+
+            const GsBackendDecision verifyDecision =
+                backend->classify(command);
+            t.IsTrue(
+                verifyDecision.supported,
+                "Verify should expose the capability-gated Gouraud depth class");
+            if (!verifyDecision.supported)
+                return;
+
+            backend->submit(
+                std::span<const GsDrawCommand>(&command, 1u));
+            t.IsTrue(
+                vram == expected,
+                "Verify should retain the agreed independent Gouraud software image");
+            t.Equals(
+                softwareCalls, 1ull,
+                "Gouraud Verify should run the software oracle once");
+            const GsVulkanRasterBackendStatistics statistics =
+                backend->backendStatistics();
+            t.Equals(statistics.commandsAttempted, 1ull,
+                     "Gouraud Verify should attempt one command");
+            t.Equals(statistics.commandsCompleted, 1ull,
+                     "an agreeing Gouraud command should complete once");
+            t.Equals(statistics.verifiedCommands, 1ull,
+                     "the full Gouraud comparison should be counted");
+            t.Equals(
+                statistics.bytesCompared,
+                static_cast<uint64_t>(GS_VULKAN_VRAM_SIZE),
+                "Gouraud Verify should compare all 4 MiB");
+            const GsVulkanServiceStatistics service =
+                backend->serviceStatistics();
+            t.Equals(
+                service.gouraudDepthCt32TriangleDrawsCompleted,
+                1ull,
+                "the executor should receive one Gouraud triangle request");
+            t.Equals(service.triangleDrawsCompleted, 0ull,
+                     "Gouraud Verify must not use the flat triangle kernel");
+            t.Equals(service.depthCt32SpriteDrawsCompleted, 0ull,
+                     "Gouraud Verify must not alias depth sprite execution");
+
+            t.IsTrue(backend->setMode(GsRendererMode::GpuStrict),
+                     "the synchronized backend should accept strict mode");
+            t.Equals(
+                backend->classify(command).reason,
+                GsFallbackReason::GouraudShading,
+                "strict must keep the new Gouraud class closed");
+            t.IsTrue(backend->setMode(GsRendererMode::Hybrid),
+                     "the synchronized backend should accept Hybrid mode");
+            t.Equals(
+                backend->classify(command).reason,
+                GsFallbackReason::GouraudShading,
+                "Hybrid must keep the unmeasured Gouraud class closed");
+
+            std::vector<uint8_t> unavailableVram = initial;
+            auto unavailableExecutor =
+                std::make_unique<FakeCt32Executor>(
+                    FakeCt32Executor::Behavior::Exact);
+            unavailableExecutor->setExactGouraudDepthCt32Triangle(false);
+            std::unique_ptr<GsVulkanRasterBackend> unavailable =
+                GsVulkanRasterBackend::createWithExecutor(
+                    std::move(unavailableExecutor), config,
+                    unavailableVram,
+                    [](const GsDrawCommand &) {}, {}, nullptr);
+            t.IsNotNull(
+                unavailable.get(),
+                "a backend without the Gouraud capability should still construct");
+            if (unavailable)
+            {
+                t.IsTrue(unavailable->setMode(GsRendererMode::Verify),
+                         "the base backend should still enter Verify");
+                t.Equals(
+                    unavailable->classify(command).reason,
+                    GsFallbackReason::BackendUnavailable,
+                    "missing Gouraud capability should produce a named fallback");
+                t.IsTrue(
+                    unavailableVram == initial,
+                    "Gouraud capability fallback must not mutate VRAM");
+                t.Equals(
+                    unavailable->serviceStatistics()
+                        .gouraudDepthCt32TriangleDrawsFailed,
+                    0ull,
+                    "capability fallback must not post Gouraud work");
+            }
+
+            std::vector<uint8_t> failureVram = initial;
+            uint64_t failedSoftwareCalls = 0u;
+            std::unique_ptr<GsVulkanRasterBackend> failing =
+                GsVulkanRasterBackend::createWithExecutor(
+                    std::make_unique<FakeCt32Executor>(
+                        FakeCt32Executor::Behavior::Fail),
+                    config, failureVram,
+                    [&](const GsDrawCommand &)
+                    {
+                        ++failedSoftwareCalls;
+                    },
+                    {}, nullptr);
+            t.IsNotNull(
+                failing.get(),
+                "an initially healthy failing Gouraud executor should construct");
+            if (failing)
+            {
+                bool executionThrew = false;
+                try
+                {
+                    failing->submit(
+                        std::span<const GsDrawCommand>(&command, 1u));
+                }
+                catch (const std::runtime_error &error)
+                {
+                    executionThrew =
+                        std::string(error.what()).find(
+                            "before canonical VRAM mutation") !=
+                        std::string::npos;
+                }
+                t.IsTrue(
+                    executionThrew,
+                    "Gouraud executor failure should identify atomic rejection");
+                t.IsTrue(
+                    failureVram == initial,
+                    "failed Gouraud execution must preserve canonical VRAM");
+                t.Equals(
+                    failedSoftwareCalls, 0ull,
+                    "failed Gouraud execution must precede the software oracle");
+                t.Equals(
+                    failing->backendStatistics().gpuRequestsFailed,
+                    1ull,
+                    "failed Gouraud execution should be counted once");
+                t.Equals(
+                    failing->serviceStatistics()
+                        .gouraudDepthCt32TriangleDrawsFailed,
+                    1ull,
+                    "the fake should receive exactly one failed Gouraud request");
+            }
+        });
+
         tc.Run("Vulkan strict backend splits resident pipeline classes", [](TestCase &t)
         {
             GSMem::InitLookupTables();
@@ -10538,6 +10725,136 @@ void register_ps2_gs_vulkan_tests()
             t.IsTrue(manifestText.find("\"top_left_edge_mask\"") !=
                          std::string::npos,
                      "the manifest should retain exact edge ownership");
+        });
+
+        tc.Run("Vulkan Gouraud triangle mismatch artifact retains the complete prepared record", [](TestCase &t)
+        {
+            GSMem::InitLookupTables();
+            ScopedArtifactDirectory artifacts;
+            const GsDrawCommand command =
+                makeGouraudSourceOverDepthCt32TriangleCommand(
+                    93u, 31u, 4u, 300u, GS_PSM_Z32,
+                    {0u, 31u, 0u, 31u}, {0u, 0u},
+                    {32u, 384u, 32u},
+                    {32u, 32u, 384u},
+                    {0x801020F0u, 0x80E04020u, 0x8050D080u},
+                    0xFEDCBA98u);
+            GsVulkanGouraudDepthCt32Triangle prepared{};
+            t.IsTrue(
+                prepareGsVulkanGouraudSourceOverDepthCt32Triangle(
+                    command, prepared).supported,
+                "the mismatch fixture should satisfy the Gouraud contract");
+            const std::vector<uint8_t> initial =
+                makeVramPattern(0x474D4931u);
+            std::vector<uint8_t> vram = initial;
+
+            GsVulkanRasterBackendConfig config{};
+            config.mode = GsRendererMode::Verify;
+            config.verificationArtifactDirectory =
+                artifacts.path.string();
+            std::unique_ptr<GsVulkanRasterBackend> backend =
+                GsVulkanRasterBackend::createWithExecutor(
+                    std::make_unique<FakeCt32Executor>(
+                        FakeCt32Executor::Behavior::Noop),
+                    config, vram,
+                    [&](const GsDrawCommand &draw)
+                    {
+                        GsVulkanGouraudDepthCt32Triangle triangle{};
+                        if (prepareGsVulkanGouraudSourceOverDepthCt32Triangle(
+                                draw, triangle).supported)
+                        {
+                            applyGouraudDepthCt32TriangleCpu(
+                                vram, triangle);
+                        }
+                    },
+                    {}, nullptr);
+            t.IsNotNull(
+                backend.get(),
+                "the Gouraud mismatch backend should construct");
+            if (!backend)
+                return;
+            const GsBackendDecision decision = backend->classify(command);
+            t.IsTrue(
+                decision.supported,
+                "Verify should expose the Gouraud mismatch fixture");
+            if (!decision.supported)
+                return;
+
+            bool mismatch = false;
+            try
+            {
+                backend->submit(
+                    std::span<const GsDrawCommand>(&command, 1u));
+            }
+            catch (const std::runtime_error &)
+            {
+                mismatch = true;
+            }
+            t.IsTrue(
+                mismatch,
+                "the injected no-op Gouraud result should disagree with software");
+            const std::filesystem::path bundle =
+                backend->backendStatistics().lastVerificationArtifact;
+            t.IsTrue(
+                std::filesystem::is_directory(bundle),
+                "the Gouraud reproducer should be atomically published");
+            if (!std::filesystem::is_directory(bundle))
+                return;
+
+            std::ifstream manifest(bundle / "command.json");
+            const std::string manifestText{
+                std::istreambuf_iterator<char>(manifest),
+                std::istreambuf_iterator<char>()};
+            const auto arrayText = [](const char *name,
+                                      const std::array<uint32_t, 4> &values)
+            {
+                std::ostringstream output;
+                output << '\"' << name << "\":[";
+                for (size_t index = 0u; index < values.size(); ++index)
+                {
+                    if (index != 0u)
+                        output << ',';
+                    output << values[index];
+                }
+                output << ']';
+                return output.str();
+            };
+            t.IsTrue(
+                manifestText.find(
+                    "\"gouraud_depth_ct32_triangle\"") !=
+                    std::string::npos,
+                "the manifest should identify the Gouraud record");
+            for (const char *field : {
+                     "framebuffer_base_block", "framebuffer_width",
+                     "bounds_x0", "bounds_y0", "bounds_x1", "bounds_y1",
+                     "depth_base_block", "depth_psm", "depth",
+                     "positive_area", "vertex0_x_12_4", "vertex0_y_12_4",
+                     "vertex1_x_12_4", "vertex1_y_12_4",
+                     "vertex2_x_12_4", "vertex2_y_12_4", "rgba0",
+                     "rgba1", "rgba2", "top_left_edge_mask"})
+            {
+                t.IsTrue(
+                    manifestText.find(
+                        std::string("\"") + field + "\"") !=
+                        std::string::npos,
+                    std::string("the manifest should retain ") + field);
+            }
+            t.IsTrue(
+                manifestText.find(arrayText(
+                    "color_dx_bits", prepared.colorDxBits)) !=
+                    std::string::npos,
+                "the manifest should retain all four exact horizontal DDA words");
+            t.IsTrue(
+                manifestText.find(arrayText(
+                    "color_dy_bits", prepared.colorDyBits)) !=
+                    std::string::npos,
+                "the manifest should retain all four exact vertical DDA words");
+
+            std::vector<uint8_t> expected = initial;
+            applyGouraudDepthCt32TriangleCpu(expected, prepared);
+            t.IsTrue(
+                vram == expected,
+                "the Gouraud software oracle should remain canonical on mismatch");
         });
 
         tc.Run("Vulkan texture mismatch artifact retains exact sampling record", [](TestCase &t)
@@ -14158,6 +14475,161 @@ void register_ps2_gs_vulkan_tests()
                 t.Equals(strictService.validationWarnings, 0u,
                          "strict triangle routing should emit no validation warnings");
             }
+        });
+
+        tc.Run("GS Vulkan verifies Gouraud source-over depth triangles end to end", [](TestCase &t)
+        {
+            GSMem::InitLookupTables();
+            const std::array<GsDrawCommand, 2> commands{{
+                makeGouraudSourceOverDepthCt32TriangleCommand(
+                    30'500u, 17u, 8u, 240u, GS_PSM_Z24,
+                    {4u, 31u, 3u, 27u}, {32u, 16u},
+                    {289u, 209u, 65u},
+                    {33u, 65u, 401u},
+                    {0x80000000u, 0x800A8040u, 0x80F01070u},
+                    0x12345678u),
+                makeGouraudSourceOverDepthCt32TriangleCommand(
+                    30'501u, 31u, 4u, 300u, GS_PSM_Z32,
+                    {0u, 31u, 0u, 31u}, {0u, 0u},
+                    {32u, 384u, 32u},
+                    {32u, 32u, 384u},
+                    {0x801020F0u, 0x80E04020u, 0x8050D080u},
+                    0xFEDCBA98u),
+            }};
+            std::array<GsVulkanGouraudDepthCt32Triangle, 2> prepared{};
+            uint64_t expectedCandidatePixels = 0u;
+            for (size_t index = 0u; index < commands.size(); ++index)
+            {
+                t.IsTrue(
+                    prepareGsVulkanGouraudSourceOverDepthCt32Triangle(
+                        commands[index], prepared[index]).supported,
+                    "the integrated Gouraud fixture should be eligible");
+                expectedCandidatePixels +=
+                    static_cast<uint64_t>(
+                        prepared[index].boundsX1 -
+                        prepared[index].boundsX0) *
+                    static_cast<uint64_t>(
+                        prepared[index].boundsY1 -
+                        prepared[index].boundsY0);
+            }
+
+            std::vector<uint8_t> softwareVram =
+                makeVramPattern(0x47565231u);
+            std::vector<uint8_t> acceleratedVram = softwareVram;
+            GS software;
+            GS accelerated;
+            software.init(
+                softwareVram.data(),
+                static_cast<uint32_t>(softwareVram.size()), nullptr);
+            accelerated.init(
+                acceleratedVram.data(),
+                static_cast<uint32_t>(acceleratedVram.size()), nullptr);
+
+            GsVulkanCapabilityReport preflight{};
+            const GsVulkanServiceConfig config =
+                makeRendererServiceConfig(preflight);
+            ScopedArtifactDirectory artifacts;
+            t.IsTrue(
+                accelerated.configureVulkanRenderer(
+                    config, artifacts.path.string()),
+                "the Gouraud fixture should accept Vulkan configuration");
+            if (!preflight.ready())
+            {
+                t.IsFalse(
+                    accelerated.setRendererMode(GsRendererMode::Verify),
+                    "an unavailable host should decline Gouraud Verify cleanly");
+                return;
+            }
+
+            const GsVulkanDeviceReport *selected =
+                preflight.selectedDevice();
+            t.IsNotNull(
+                selected,
+                "a ready Gouraud preflight should select one device");
+            if (!selected)
+                return;
+            t.IsTrue(
+                selected->exactGouraudDepthCt32Triangle,
+                "the selected device should expose exact Gouraud depth execution");
+            if (!selected->exactGouraudDepthCt32Triangle)
+                return;
+
+            t.IsTrue(
+                accelerated.setRendererMode(GsRendererMode::Verify),
+                "the capable host should create Gouraud Verify");
+            if (accelerated.rendererMode() != GsRendererMode::Verify)
+                return;
+            accelerated.setBackendCountersEnabled(true);
+            accelerated.resetBackendCounters();
+
+            for (const GsDrawCommand &command : commands)
+            {
+                drawGouraudDepthCt32TriangleCommand(software, command);
+                drawGouraudDepthCt32TriangleCommand(accelerated, command);
+            }
+            (void)software.getDebugSnapshot();
+            (void)accelerated.getDebugSnapshot();
+            t.IsTrue(
+                acceleratedVram == softwareVram,
+                "real Gouraud Verify should match production software VRAM");
+
+            const GsBackendCounters counters =
+                accelerated.backendCounters();
+            t.Equals(counters.commands, 2ull,
+                     "the Gouraud fixture should assemble both triangles");
+            t.Equals(counters.acceleratedCommands, 2ull,
+                     "both Gouraud triangles should use Vulkan Verify");
+            t.Equals(counters.verifiedCommands, 2ull,
+                     "both Gouraud triangles should record verification");
+            t.Equals(counters.softwareCommands, 0ull,
+                     "Gouraud Verify should not use router fallback");
+            t.Equals(counters.fallbackCommands, 0ull,
+                     "eligible Gouraud triangles should have no fallback");
+            t.Equals(
+                counters.decisions[static_cast<size_t>(
+                    GsFallbackReason::Supported)],
+                2ull,
+                "the router should retain both supported Gouraud decisions");
+
+            const GsVulkanRasterBackendStatistics backend =
+                accelerated.vulkanRendererBackendStatistics();
+            t.Equals(backend.commandsAttempted, 2ull,
+                     "the integrated backend should attempt both Gouraud draws");
+            t.Equals(backend.commandsCompleted, 2ull,
+                     "both matching Gouraud draws should complete");
+            t.Equals(backend.verifiedCommands, 2ull,
+                     "the backend should compare both Gouraud results");
+            t.Equals(
+                backend.bytesCompared,
+                2ull * GS_VULKAN_VRAM_SIZE,
+                "Gouraud Verify should compare two complete VRAM images");
+            t.Equals(backend.verificationMismatches, 0ull,
+                     "the real Gouraud kernel should have no mismatch");
+            t.Equals(backend.pageOwnership.gpuNewerPages, size_t{0u},
+                     "Verify should leave no Gouraud pages GPU-owned");
+
+            const GsVulkanServiceStatistics service =
+                accelerated.vulkanRendererServiceStatistics();
+            t.Equals(
+                service.gouraudDepthCt32TriangleDrawsCompleted,
+                2ull,
+                "the service should execute both Gouraud triangles");
+            t.Equals(
+                service.gouraudDepthCt32TriangleDrawsFailed,
+                0ull,
+                "real Gouraud Verify should not fail");
+            t.Equals(
+                service.gouraudDepthCt32TriangleCandidatePixelsExecuted,
+                expectedCandidatePixels,
+                "the service should retain exact Gouraud candidate accounting");
+            t.Equals(service.triangleDrawsCompleted, 0ull,
+                     "Gouraud routing must not alias flat triangle work");
+            t.Equals(service.depthCt32SpriteDrawsCompleted, 0ull,
+                     "Gouraud routing must not alias depth sprite work");
+            t.Equals(service.validationErrors, 0u,
+                     "integrated Gouraud Verify should remain validation-clean");
+            t.Equals(service.validationWarnings, 0u,
+                     "integrated Gouraud Verify should emit no validation warnings");
         });
 
         tc.Run("GS Vulkan hybrid scopes host transfers and readbacks to overlapping pages", [](TestCase &t)
