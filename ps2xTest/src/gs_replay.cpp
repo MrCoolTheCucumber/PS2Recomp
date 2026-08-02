@@ -321,6 +321,10 @@ namespace
                    << (device.exactNearestCt32Sprite ? "true" : "false")
                    << ",\"exact_linear_ct32_sprite\":"
                    << (device.exactLinearCt32Sprite ? "true" : "false")
+                   << ",\"exact_feedback_linear_depth_ct32_sprite\":"
+                   << (device.exactFeedbackLinearDepthCt32Sprite
+                           ? "true"
+                           : "false")
                    << ",\"suitable\":"
                    << (device.suitable ? "true" : "false")
                    << ",\"rejection_reason\":";
@@ -413,6 +417,21 @@ namespace
                << statistics.linearCt32SpriteDrawsFailed
                << ",\"linear_ct32_sprite_pixels_executed\":"
                << statistics.linearCt32SpritePixelsExecuted
+               << ",\"feedback_linear_depth_ct32_sprite_draws_completed\":"
+               << statistics.feedbackLinearDepthCt32SpriteDrawsCompleted
+               << ",\"feedback_linear_depth_ct32_sprite_draws_failed\":"
+               << statistics.feedbackLinearDepthCt32SpriteDrawsFailed
+               << ",\"feedback_linear_depth_ct32_sprite_pixels_executed\":"
+               << statistics.feedbackLinearDepthCt32SpritePixelsExecuted
+               << ",\"resident_feedback_linear_depth_ct32_sprite_batches_completed\":"
+               << statistics
+                      .residentFeedbackLinearDepthCt32SpriteBatchesCompleted
+               << ",\"resident_feedback_linear_depth_ct32_sprite_batches_failed\":"
+               << statistics
+                      .residentFeedbackLinearDepthCt32SpriteBatchesFailed
+               << ",\"largest_resident_feedback_linear_depth_ct32_sprite_batch\":"
+               << statistics
+                      .largestResidentFeedbackLinearDepthCt32SpriteBatch
                << ",\"resident_linear_ct32_sprite_batches_completed\":"
                << statistics.residentLinearCt32SpriteBatchesCompleted
                << ",\"resident_linear_ct32_sprite_batches_failed\":"
