@@ -5,6 +5,7 @@
 #include <bit>
 #include <cstdlib>
 #include <limits>
+#include <stdexcept>
 #include <type_traits>
 
 namespace
@@ -1214,8 +1215,8 @@ GsSubmissionResult GsBackendRouter::submit(
     uint64_t pixels = 0u;
     if (m_countersEnabled)
     {
-        ++m_counters.commands;
         pixels = drawPixelCount(command);
+        ++m_counters.commands;
         m_counters.drawPixels += pixels;
     }
 
@@ -1251,11 +1252,104 @@ GsSubmissionResult GsBackendRouter::submit(
             ? m_acceleratedBackend->classify(command)
             : GsBackendDecision{
                   false, GsFallbackReason::BackendUnavailable};
-    if (m_countersEnabled)
-        recordDecision(decision.reason);
+
+    GsHybridBatchPolicy hybridPolicy{};
+    if (m_mode == GsRendererMode::Hybrid && decision.supported &&
+        m_acceleratedBackend)
+    {
+        hybridPolicy =
+            m_acceleratedBackend->hybridBatchPolicy(command);
+    }
+
+    if (m_admittedHybridTail)
+    {
+        const bool compatible =
+            hybridPolicy.deferred() &&
+            hybridPolicy.minimumPixels ==
+                m_admittedHybridPolicy.minimumPixels &&
+            hybridPolicy.maximumCommands ==
+                m_admittedHybridPolicy.maximumCommands &&
+            m_acceleratedBackend &&
+            m_acceleratedBackend->hybridBatchCompatible(
+                *m_admittedHybridTail, command);
+        if (compatible)
+        {
+            if (m_countersEnabled)
+                recordDecision(decision.reason);
+            transitionTo(ActiveBackend::Accelerated);
+            m_acceleratedBackend->submit(
+                std::span<const GsDrawCommand>(&command, 1u));
+            m_activeBackend = ActiveBackend::Accelerated;
+            m_admittedHybridTail = command;
+            if (m_countersEnabled)
+            {
+                ++m_counters.acceleratedCommands;
+                m_counters.acceleratedPixels += pixels;
+                updateQueueDepth(*m_acceleratedBackend);
+            }
+            return {true, false, true, decision};
+        }
+        m_admittedHybridTail.reset();
+        m_admittedHybridPolicy = {};
+    }
+
+    if (!m_pendingHybridCommands.empty())
+    {
+        const bool compatible =
+            hybridPolicy.deferred() &&
+            hybridPolicy.minimumPixels ==
+                m_pendingHybridPolicy.minimumPixels &&
+            hybridPolicy.maximumCommands ==
+                m_pendingHybridPolicy.maximumCommands &&
+            m_acceleratedBackend &&
+            m_acceleratedBackend->hybridBatchCompatible(
+                m_pendingHybridCommands.back(), command);
+        if (!compatible)
+            resolvePendingHybrid(false);
+    }
+
+    if (hybridPolicy.deferred())
+    {
+        if (!m_countersEnabled)
+            pixels = drawPixelCount(command);
+        if (m_pendingHybridCommands.empty())
+        {
+            m_pendingHybridPolicy = hybridPolicy;
+            m_pendingHybridPixels = 0u;
+        }
+        m_pendingHybridCommands.push_back(command);
+        if (pixels <=
+            std::numeric_limits<uint64_t>::max() -
+                m_pendingHybridPixels)
+            m_pendingHybridPixels += pixels;
+        else
+            m_pendingHybridPixels =
+                std::numeric_limits<uint64_t>::max();
+        updateDeferredQueueDepth();
+
+        if (m_pendingHybridPixels >=
+            m_pendingHybridPolicy.minimumPixels)
+        {
+            resolvePendingHybrid(true);
+            return {true, false, true, decision};
+        }
+        if (m_pendingHybridCommands.size() >=
+            m_pendingHybridPolicy.maximumCommands)
+        {
+            resolvePendingHybrid(false);
+            return {
+                true,
+                true,
+                false,
+                {false, GsFallbackReason::CostModel}};
+        }
+        return {true, false, false, decision};
+    }
 
     if (decision.supported)
     {
+        if (m_countersEnabled)
+            recordDecision(decision.reason);
         transitionTo(ActiveBackend::Accelerated);
         m_acceleratedBackend->submit(
             std::span<const GsDrawCommand>(&command, 1u));
@@ -1278,6 +1372,7 @@ GsSubmissionResult GsBackendRouter::submit(
     {
         if (m_countersEnabled)
         {
+            recordDecision(decision.reason);
             ++m_counters.strictFailures;
             m_counters.strictFailurePixels += pixels;
         }
@@ -1297,6 +1392,7 @@ GsSubmissionResult GsBackendRouter::submit(
     m_activeBackend = ActiveBackend::Software;
     if (m_countersEnabled)
     {
+        recordDecision(decision.reason);
         ++m_counters.softwareCommands;
         ++m_counters.fallbackCommands;
         m_counters.softwarePixels += pixels;
@@ -1308,6 +1404,10 @@ GsSubmissionResult GsBackendRouter::submit(
 
 void GsBackendRouter::flush(GsFlushReason reason)
 {
+    resolvePendingHybrid(false);
+    m_admittedHybridTail.reset();
+    m_admittedHybridPolicy = {};
+
     if (reason == GsFlushReason::Shutdown)
     {
         if (m_activeBackend == ActiveBackend::Software)
@@ -1362,6 +1462,9 @@ void GsBackendRouter::beginCpuVramAccess(
     const GsVramPageMask &writePages,
     GsFlushReason reason)
 {
+    resolvePendingHybrid(false);
+    m_admittedHybridTail.reset();
+    m_admittedHybridPolicy = {};
     drainActive(reason);
     m_activeBackend = ActiveBackend::None;
 
@@ -1444,6 +1547,97 @@ void GsBackendRouter::synchronizeCpuVram(
 {
     if (m_acceleratedBackend && pages.any())
         m_acceleratedBackend->prepareCpuVramAccess(pages, reason);
+}
+
+void GsBackendRouter::resolvePendingHybrid(bool accelerate)
+{
+    if (m_pendingHybridCommands.empty())
+        return;
+
+    const size_t commandCount = m_pendingHybridCommands.size();
+    const uint64_t pixels = m_pendingHybridPixels;
+    const std::span<const GsDrawCommand> commands(
+        m_pendingHybridCommands.data(),
+        m_pendingHybridCommands.size());
+
+    if (accelerate)
+    {
+        if (!m_acceleratedBackend)
+            throw std::logic_error(
+                "deferred Hybrid run lost its accelerated backend");
+        transitionTo(ActiveBackend::Accelerated);
+        m_acceleratedBackend->submit(commands);
+        m_activeBackend = ActiveBackend::Accelerated;
+        m_admittedHybridTail = commands.back();
+        m_admittedHybridPolicy = m_pendingHybridPolicy;
+    }
+    else
+    {
+        transitionTo(ActiveBackend::Software);
+        GsVramPageMask accessPages;
+        GsVramPageMask writePages;
+        for (const GsDrawCommand &command : commands)
+        {
+            const GsDrawResources resources = command.resources();
+            accessPages.unionWith(resources.readPages);
+            accessPages.unionWith(resources.writePages);
+            writePages.unionWith(resources.writePages);
+        }
+        synchronizeCpuVram(
+            accessPages, GsFlushReason::BackendSwitch);
+        m_softwareBackend->submit(commands);
+        if (m_acceleratedBackend)
+            m_acceleratedBackend->noteCpuVramWrite(writePages);
+        m_activeBackend = ActiveBackend::Software;
+        m_admittedHybridTail.reset();
+        m_admittedHybridPolicy = {};
+    }
+
+    m_pendingHybridCommands.clear();
+    m_pendingHybridPixels = 0u;
+    m_pendingHybridPolicy = {};
+
+    if (!m_countersEnabled)
+        return;
+    for (size_t index = 0u; index < commandCount; ++index)
+    {
+        recordDecision(
+            accelerate
+                ? GsFallbackReason::Supported
+                : GsFallbackReason::CostModel);
+    }
+    if (accelerate)
+    {
+        m_counters.acceleratedCommands += commandCount;
+        m_counters.acceleratedPixels += pixels;
+        updateQueueDepth(*m_acceleratedBackend);
+    }
+    else
+    {
+        m_counters.softwareCommands += commandCount;
+        m_counters.fallbackCommands += commandCount;
+        m_counters.softwarePixels += pixels;
+        m_counters.fallbackPixels += pixels;
+        updateQueueDepth(*m_softwareBackend);
+    }
+}
+
+void GsBackendRouter::updateDeferredQueueDepth() noexcept
+{
+    if (!m_countersEnabled)
+        return;
+    uint64_t pending = m_pendingHybridCommands.size();
+    if (m_activeBackend == ActiveBackend::Software)
+        pending += m_softwareBackend->pendingCommandCount();
+    else if (m_activeBackend == ActiveBackend::Accelerated &&
+             m_acceleratedBackend)
+    {
+        pending += m_acceleratedBackend->pendingCommandCount();
+    }
+    m_counters.queueDepth = pending;
+    m_counters.queueHighWatermark = std::max(
+        m_counters.queueHighWatermark,
+        m_counters.queueDepth);
 }
 
 void GsBackendRouter::recordDecision(

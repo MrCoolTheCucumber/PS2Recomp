@@ -1298,6 +1298,186 @@ void register_ps2_gs_tests()
                 "the router should count the conservative frame checkpoint");
         });
 
+        tc.Run("GS backend router defers Hybrid runs until measured work", [](TestCase &t)
+        {
+            class RecordingBackend final : public IGsRasterBackend
+            {
+            public:
+                bool deferredPolicy = false;
+                std::vector<uint64_t> sequences;
+                std::vector<size_t> submissionSizes;
+                size_t pending = 0u;
+
+                [[nodiscard]] GsBackendDecision classify(
+                    const GsDrawCommand &) const override
+                {
+                    return {true, GsFallbackReason::Supported};
+                }
+
+                [[nodiscard]] GsHybridBatchPolicy hybridBatchPolicy(
+                    const GsDrawCommand &) const noexcept override
+                {
+                    return deferredPolicy
+                        ? GsHybridBatchPolicy{128u, 4u}
+                        : GsHybridBatchPolicy{};
+                }
+
+                [[nodiscard]] bool hybridBatchCompatible(
+                    const GsDrawCommand &first,
+                    const GsDrawCommand &next) const noexcept override
+                {
+                    return first.context().frame.fbp ==
+                           next.context().frame.fbp;
+                }
+
+                void submit(
+                    std::span<const GsDrawCommand> commands) override
+                {
+                    submissionSizes.push_back(commands.size());
+                    for (const GsDrawCommand &command : commands)
+                        sequences.push_back(command.sequence());
+                    pending += commands.size();
+                }
+
+                void flush(GsFlushReason) override
+                {
+                    pending = 0u;
+                }
+
+                [[nodiscard]] size_t pendingCommandCount()
+                    const noexcept override
+                {
+                    return pending;
+                }
+            } software, accelerated;
+
+            const auto makeCommand = [](
+                uint64_t sequence,
+                uint32_t framebufferPage)
+            {
+                GSContext context{};
+                context.frame.fbp = framebufferPage;
+                context.frame.fbw = 1u;
+                context.frame.psm = GS_PSM_CT32;
+                context.scissor = {0u, 7u, 0u, 7u};
+                GSPrimReg primitive{};
+                primitive.type = GS_PRIM_SPRITE;
+                std::array<GSVertex, 2> vertices{};
+                vertices[1].x12_4 = 8u * 16u;
+                vertices[1].y12_4 = 8u * 16u;
+                return buildGsDrawCommand(
+                    sequence,
+                    primitive,
+                    context,
+                    std::span<const GSVertex>(vertices),
+                    GsDrawGlobalState{});
+            };
+            const std::array<GsDrawCommand, 6> commands{{
+                makeCommand(40u, 1u),
+                makeCommand(41u, 1u),
+                makeCommand(42u, 1u),
+                makeCommand(43u, 1u),
+                makeCommand(44u, 2u),
+                makeCommand(45u, 3u),
+            }};
+
+            accelerated.deferredPolicy = true;
+            GsBackendRouter router(software);
+            router.setAcceleratedBackend(&accelerated);
+            t.IsTrue(router.setMode(GsRendererMode::Hybrid),
+                     "the deferred policy fixture should select Hybrid");
+            router.setCountersEnabled(true);
+
+            const GsSubmissionResult shortResult =
+                router.submit(commands[0]);
+            t.IsTrue(shortResult.submitted &&
+                         !shortResult.usedSoftware &&
+                         !shortResult.usedAccelerated,
+                     "an undecided short run should remain backend-neutral");
+            t.IsTrue(software.sequences.empty() &&
+                         accelerated.sequences.empty(),
+                     "deferred admission must not mutate either backend early");
+            t.Equals(router.counters().queueDepth, 1ull,
+                     "the router should expose one deferred command");
+
+            router.flush(GsFlushReason::Explicit);
+            t.Equals(software.sequences,
+                     std::vector<uint64_t>{40u},
+                     "a short run should fall back as one software batch");
+            t.IsTrue(accelerated.sequences.empty(),
+                     "a short run must not reach acceleration");
+
+            const GsSubmissionResult thresholdPrefix =
+                router.submit(commands[1]);
+            const GsSubmissionResult thresholdResult =
+                router.submit(commands[2]);
+            t.IsTrue(thresholdPrefix.submitted &&
+                         !thresholdPrefix.usedSoftware &&
+                         !thresholdPrefix.usedAccelerated,
+                     "the first threshold member should remain deferred");
+            t.IsTrue(thresholdResult.submitted &&
+                         thresholdResult.usedAccelerated,
+                     "crossing the measured work floor should publish the run");
+            t.Equals(accelerated.submissionSizes,
+                     std::vector<size_t>{2u},
+                     "threshold crossing should submit one compatible batch");
+            t.Equals(accelerated.sequences,
+                     std::vector<uint64_t>({41u, 42u}),
+                     "the accelerated batch should retain guest order");
+
+            const GsSubmissionResult admittedTail =
+                router.submit(commands[3]);
+            t.IsTrue(admittedTail.submitted &&
+                         admittedTail.usedAccelerated,
+                     "the compatible tail should retain run admission");
+            t.Equals(accelerated.submissionSizes,
+                     std::vector<size_t>({2u, 1u}),
+                     "the admitted tail should submit without another work floor");
+            t.Equals(accelerated.sequences,
+                     std::vector<uint64_t>({41u, 42u, 43u}),
+                     "the admitted run should retain its compatible tail");
+
+            const GsSubmissionResult incompatible =
+                router.submit(commands[4]);
+            t.IsTrue(incompatible.submitted &&
+                         !incompatible.usedSoftware &&
+                     !incompatible.usedAccelerated,
+                     "an incompatible successor should start a new deferred run");
+            (void)router.submit(commands[5]);
+            router.flush(GsFlushReason::Explicit);
+            t.Equals(software.sequences,
+                     std::vector<uint64_t>({40u, 44u, 45u}),
+                     "incompatible under-threshold runs should fall back separately");
+
+            const GsBackendCounters &counters = router.counters();
+            t.Equals(counters.commands, 6ull,
+                     "all deferred decisions should count once");
+            t.Equals(counters.softwareCommands, 3ull,
+                     "three short-run commands should use software");
+            t.Equals(counters.fallbackCommands, 3ull,
+                     "short-run software work should remain named fallback");
+            t.Equals(counters.acceleratedCommands, 3ull,
+                     "the threshold members and admitted tail should accelerate");
+            t.Equals(counters.drawPixels, 384ull,
+                     "deferred counters should preserve total pixel work");
+            t.Equals(counters.softwarePixels, 192ull,
+                     "short-run fallback should retain exact pixel work");
+            t.Equals(counters.acceleratedPixels, 192ull,
+                     "threshold acceleration should retain exact pixel work");
+            t.Equals(counters.queueHighWatermark, 4ull,
+                     "the router should expose resident plus deferred work");
+            t.Equals(
+                counters.decisions[static_cast<size_t>(
+                    GsFallbackReason::CostModel)],
+                3ull,
+                "every short-run command should name the cost policy");
+            t.Equals(
+                counters.decisions[static_cast<size_t>(
+                    GsFallbackReason::Supported)],
+                3ull,
+                "every admitted run member should be supported once");
+        });
+
         tc.Run("GS frontend routes draws and visibility boundaries through the software backend", [](TestCase &t)
         {
             std::vector<uint8_t> vram(PS2_GS_VRAM_SIZE, 0u);

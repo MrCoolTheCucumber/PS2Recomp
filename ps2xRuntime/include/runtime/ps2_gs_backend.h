@@ -5,8 +5,10 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <optional>
 #include <span>
 #include <string_view>
+#include <vector>
 
 inline constexpr size_t GS_VRAM_PAGE_SIZE = 8u * 1024u;
 inline constexpr size_t GS_VRAM_PAGE_COUNT = 512u;
@@ -227,6 +229,21 @@ struct GsSubmissionResult
     GsBackendDecision decision{};
 };
 
+// Some exact GPU classes only cross over after several compatible commands
+// share one synchronization boundary. A non-zero policy lets Hybrid defer the
+// backend choice until the run reaches minimumPixels. maximumCommands keeps
+// the undecided queue bounded; a shorter full queue falls back to software.
+struct GsHybridBatchPolicy
+{
+    uint64_t minimumPixels = 0u;
+    size_t maximumCommands = 0u;
+
+    [[nodiscard]] bool deferred() const noexcept
+    {
+        return minimumPixels != 0u && maximumCommands != 0u;
+    }
+};
+
 struct GsBackendCounters
 {
     uint64_t commands = 0;
@@ -263,6 +280,21 @@ public:
     virtual void submit(std::span<const GsDrawCommand> commands) = 0;
     virtual void flush(GsFlushReason reason) = 0;
     [[nodiscard]] virtual size_t pendingCommandCount() const noexcept = 0;
+
+    // The default preserves immediate per-command routing. Backends opting
+    // into deferred Hybrid admission must also prove compatibility between
+    // every adjacent command retained in one candidate run.
+    [[nodiscard]] virtual GsHybridBatchPolicy hybridBatchPolicy(
+        const GsDrawCommand &) const noexcept
+    {
+        return {};
+    }
+    [[nodiscard]] virtual bool hybridBatchCompatible(
+        const GsDrawCommand &,
+        const GsDrawCommand &) const noexcept
+    {
+        return false;
+    }
 
     // Device-backed implementations use these hooks to keep their private GS
     // memory image coherent with the canonical CPU image. The default no-op
@@ -328,6 +360,8 @@ private:
     void synchronizeCpuVram(
         const GsVramPageMask &pages,
         GsFlushReason reason);
+    void resolvePendingHybrid(bool accelerate);
+    void updateDeferredQueueDepth() noexcept;
     void recordDecision(GsFallbackReason reason) noexcept;
     void recordFlush(GsFlushReason reason) noexcept;
     void updateQueueDepth(const IGsRasterBackend &backend) noexcept;
@@ -336,6 +370,11 @@ private:
     IGsRasterBackend *m_acceleratedBackend = nullptr;
     GsRendererMode m_mode = GsRendererMode::Software;
     ActiveBackend m_activeBackend = ActiveBackend::None;
+    std::vector<GsDrawCommand> m_pendingHybridCommands;
+    uint64_t m_pendingHybridPixels = 0u;
+    GsHybridBatchPolicy m_pendingHybridPolicy{};
+    std::optional<GsDrawCommand> m_admittedHybridTail;
+    GsHybridBatchPolicy m_admittedHybridPolicy{};
     bool m_countersEnabled = false;
     GsBackendCounters m_counters{};
 };
