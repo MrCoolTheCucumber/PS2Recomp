@@ -201,6 +201,11 @@ namespace
     constexpr uint32_t kGuestHeapDefaultAlignment = 16u;
     constexpr uint32_t kGuestHeapSafetyPad = 0x1000u;
     constexpr uint32_t kGuestHeapHardLimit = 0x01F00000u;
+    // RAC1's BIOS VSync entry captured in PCSX2 uses this handler stack.
+    // The idle PC is the BIOS EENULL continuation used when no guest thread
+    // owns the interrupted boundary.
+    constexpr uint32_t kEeBiosInterruptHandlerStack = 0x01FFFC20u;
+    constexpr uint32_t kEeBiosIdleThreadPc = 0x00081FC0u;
     constexpr uint32_t kElfSectionAlloc = 0x2u;
     constexpr uint32_t kElfSectionExecInstr = 0x4u;
     constexpr uint32_t kVu0SyncThresholdCycles = 4u;
@@ -811,7 +816,9 @@ namespace
 }
 
 PS2Runtime::GuestExecutionScope::GuestExecutionScope(
-    PS2Runtime *runtime, R5900Context *context) noexcept
+    PS2Runtime *runtime,
+    R5900Context *context,
+    int selectionHint) noexcept
     : m_runtime(runtime),
       m_context(context)
 {
@@ -819,7 +826,48 @@ PS2Runtime::GuestExecutionScope::GuestExecutionScope(
     {
         m_previousContext =
             m_runtime->enterGuestExecution(
-                m_context, &m_previousThreadId);
+                m_context,
+                &m_previousThreadId,
+                selectionHint);
+    }
+}
+
+PS2Runtime::AsyncCallbackInvocationScope::
+    AsyncCallbackInvocationScope(
+        PS2Runtime *runtime,
+        R5900Context *callbackContext)
+    : AsyncCallbackInvocationScope(
+          runtime,
+          callbackContext,
+          nullptr,
+          -1)
+{
+}
+
+PS2Runtime::AsyncCallbackInvocationScope::
+    AsyncCallbackInvocationScope(
+        PS2Runtime *runtime,
+        R5900Context *callbackContext,
+        R5900Context *continuationContext,
+        int continuationThreadId)
+    : m_runtime(runtime),
+      m_guestExecution(runtime, callbackContext)
+{
+    if (m_runtime)
+    {
+        m_runtime->beginAsyncCallbackInvocation(
+            *this,
+            continuationContext,
+            continuationThreadId);
+    }
+}
+
+PS2Runtime::AsyncCallbackInvocationScope::
+    ~AsyncCallbackInvocationScope()
+{
+    if (m_runtime)
+    {
+        m_runtime->endAsyncCallbackInvocation(*this);
     }
 }
 
@@ -1395,8 +1443,6 @@ PS2Runtime::PS2Runtime(PS2RuntimeConfiguration configuration)
     m_guestHeapLimit = std::min(kGuestHeapHardLimit, PS2_RAM_SIZE);
     m_guestHeapSuggestedBase = kGuestHeapDefaultBase;
     m_guestHeapConfigured = false;
-    m_asyncCallbackStackFloor = std::min(kGuestHeapHardLimit, PS2_RAM_SIZE);
-    m_asyncCallbackStackTop = PS2_RAM_SIZE;
 }
 
 void PS2Runtime::setDebugUiCallbacks(DebugUiCallback initCallback,
@@ -1814,14 +1860,189 @@ void PS2Runtime::yieldEeExecutorCurrent(
     }
 }
 
+PS2Runtime::EeInterruptedContinuationFrame
+PS2Runtime::makeEeInterruptedContinuation(
+    R5900Context *context,
+    int threadId,
+    bool retainDormantContext)
+{
+    EeInterruptedContinuationFrame frame{};
+    std::shared_ptr<ThreadInfo> owner;
+
+    if (threadId <= 0 && context)
+    {
+        threadId = threadIdForEeContext(context);
+    }
+    if (threadId > 0)
+    {
+        EeThreadRuntimeState &state =
+            *m_eeThreadRuntimeState;
+        std::lock_guard<std::mutex> lock(
+            state.threadMapMutex);
+        const auto entry = state.threads.find(threadId);
+        if (entry != state.threads.end())
+        {
+            owner = entry->second;
+            if (!context)
+            {
+                context = owner->boundContext;
+            }
+        }
+    }
+
+    bool dormant = false;
+    uint32_t generation = 0u;
+    if (owner)
+    {
+        std::lock_guard<std::mutex> lock(owner->m);
+        dormant = owner->guestState.isDormant();
+        generation = owner->generation;
+    }
+
+    const bool hasContinuation =
+        context &&
+        ((threadId > 0 &&
+          (!dormant || retainDormantContext)) ||
+         (retainDormantContext && threadId == 0));
+    if (hasContinuation)
+    {
+        frame.context = *context;
+        frame.continuationContext = context;
+        frame.continuationOwner = std::move(owner);
+        frame.generation = generation;
+        frame.threadId = threadId;
+        frame.idle = threadId == 0;
+        return frame;
+    }
+
+    frame.context = {};
+    frame.context.pc = kEeBiosIdleThreadPc;
+    SET_GPR_U32(
+        &frame.context,
+        29,
+        kEeBiosInterruptHandlerStack);
+    frame.threadId = 0;
+    frame.idle = true;
+    return frame;
+}
+
+void PS2Runtime::captureEeInterruptContinuation(
+    R5900Context *context,
+    int threadId)
+{
+    m_eeInterruptedContinuation =
+        makeEeInterruptedContinuation(
+            context, threadId);
+}
+
+void PS2Runtime::captureEeInterruptContinuation(
+    std::optional<int> threadId)
+{
+    m_eeInterruptedContinuation =
+        makeEeInterruptedContinuation(
+            nullptr,
+            threadId.value_or(0));
+}
+
+void PS2Runtime::clearEeInterruptContinuation() noexcept
+{
+    m_eeInterruptedContinuation.reset();
+}
+
+void PS2Runtime::beginAsyncCallbackInvocation(
+    AsyncCallbackInvocationScope &scope,
+    R5900Context *continuationContext,
+    int continuationThreadId)
+{
+    EeInterruptedContinuationFrame interrupted{};
+    const bool nested =
+        m_asyncCallbackInvocationDepth != 0u;
+    const bool explicitContinuation =
+        continuationContext != nullptr;
+    if (explicitContinuation)
+    {
+        // Synchronous guest callbacks can intentionally release the guest
+        // execution binding around their host-side dispatcher. Preserve the
+        // caller supplied at that release boundary instead of mistaking the
+        // temporarily unbound runtime for the BIOS idle thread.
+        interrupted = makeEeInterruptedContinuation(
+            continuationContext,
+            continuationThreadId,
+            nested);
+    }
+    else if (scope.m_guestExecution.m_previousContext)
+    {
+        interrupted = makeEeInterruptedContinuation(
+            scope.m_guestExecution.m_previousContext,
+            scope.m_guestExecution.m_previousThreadId,
+            nested);
+    }
+    else if (m_eeInterruptedContinuation)
+    {
+        interrupted = *m_eeInterruptedContinuation;
+    }
+    else
+    {
+        interrupted = makeEeInterruptedContinuation(
+            nullptr, 0);
+    }
+
+    scope.m_interruptedContext = interrupted.context;
+    scope.m_continuationContext =
+        interrupted.continuationContext;
+    scope.m_continuationOwner =
+        std::move(interrupted.continuationOwner);
+    scope.m_continuationGeneration =
+        interrupted.generation;
+    scope.m_ownerThreadId = interrupted.threadId;
+    scope.m_idle = interrupted.idle;
+    scope.m_depth = m_asyncCallbackInvocationDepth++;
+    scope.m_active = true;
+
+    scope.m_stackTop = kEeBiosInterruptHandlerStack;
+    const uint32_t interruptedSp =
+        static_cast<uint32_t>(
+            _mm_cvtsi128_si32(
+                scope.m_interruptedContext.r[29]));
+    const uint32_t alignedSp =
+        interruptedSp & ~0xFu;
+    if (!scope.m_idle &&
+        alignedSp >= 0x10u &&
+        alignedSp <= PS2_RAM_SIZE)
+    {
+        scope.m_stackTop = alignedSp;
+    }
+
+    // The callback's temporary register context is untracked by the thread
+    // map. Bind it explicitly to the interrupted continuation (or thread 0
+    // for the BIOS idle frame); never infer ownership from handler
+    // registration state.
+    selectEeThread(scope.m_ownerThreadId);
+}
+
+void PS2Runtime::endAsyncCallbackInvocation(
+    AsyncCallbackInvocationScope &scope) noexcept
+{
+    if (!scope.m_active)
+    {
+        return;
+    }
+    if (m_asyncCallbackInvocationDepth != 0u)
+    {
+        --m_asyncCallbackInvocationDepth;
+    }
+    scope.m_active = false;
+}
+
 void PS2Runtime::commitPriorContext(
-    std::optional<int>,
+    std::optional<int> priorThreadId,
     ps2x::timing::EeTickDelta,
     ps2x::timing::EeTick)
 {
     // Generated code and runtime helpers already advance the canonical EE
     // timeline. The executor's relative tick is a consistency/accounting
     // view and must not advance that timeline a second time.
+    captureEeInterruptContinuation(priorThreadId);
     m_eeExecutorInterruptPassComplete = false;
 }
 
@@ -1923,12 +2144,14 @@ PS2Runtime::applyNextConsequence(
     catch (...)
     {
         consequence = {};
+        clearEeInterruptContinuation();
         throw;
     }
     const ps2x::ee::EeSchedulerReschedulePolicy
         reschedulePolicy =
             consequence.reschedulePolicy;
     consequence = {};
+    clearEeInterruptContinuation();
     m_guestExecutionPreemptionRequested.store(
         false, std::memory_order_release);
     return reschedulePolicy;
@@ -5385,13 +5608,6 @@ bool PS2Runtime::loadELF(const std::string &elfPath)
             m_guestHeapLimit = hardLimit;
         }
     }
-    {
-        std::lock_guard<std::mutex> lock(m_asyncCallbackStackMutex);
-        const uint32_t hardLimit = std::min(kGuestHeapHardLimit, PS2_RAM_SIZE);
-        m_asyncCallbackStackFloor = std::min(std::max(hardLimit, suggestedHeapBase), PS2_RAM_SIZE);
-        m_asyncCallbackStackTop = PS2_RAM_SIZE;
-    }
-
     LoadedModule module;
     module.name = elfPath.substr(elfPath.find_last_of("/\\") + 1);
     module.baseAddress = (moduleBase == std::numeric_limits<uint32_t>::max()) ? 0x00100000u : moduleBase;
@@ -7137,25 +7353,10 @@ void PS2Runtime::drainPendingAlarmCallbacks()
 
         try
         {
-            constexpr uint32_t kAlarmCallbackStackSize =
-                0x4000u;
-            if (state.callbackStackTop == 0u)
-            {
-                state.callbackStackTop =
-                    reserveAsyncCallbackStack(
-                        kAlarmCallbackStackSize, 16u);
-            }
-
             R5900Context &callbackCtx =
                 state.callbackContext;
             callbackCtx = {};
             SET_GPR_U32(&callbackCtx, 28, alarm->gp);
-            SET_GPR_U32(
-                &callbackCtx,
-                29,
-                state.callbackStackTop != 0u
-                    ? state.callbackStackTop
-                    : (PS2_RAM_SIZE - 0x10u));
             SET_GPR_U32(&callbackCtx, 31, 0u);
             SET_GPR_U32(
                 &callbackCtx,
@@ -7172,8 +7373,12 @@ void PS2Runtime::drainPendingAlarmCallbacks()
 
             RecompiledFunction function =
                 lookupFunction(alarm->handler);
-            GuestExecutionScope guestExecution(
+            AsyncCallbackInvocationScope callbackExecution(
                 this, &callbackCtx);
+            SET_GPR_U32(
+                &callbackCtx,
+                29,
+                callbackExecution.stackTop());
             executeGuestStep(
                 alarm->rdram,
                 &callbackCtx,
@@ -7806,44 +8011,6 @@ uint32_t PS2Runtime::guestHeapLimit() const
     return m_guestHeapConfigured ? m_guestHeapLimit : m_guestHeapSuggestedBase;
 }
 
-uint32_t PS2Runtime::reserveAsyncCallbackStack(uint32_t size, uint32_t alignment)
-{
-    if (size == 0u)
-    {
-        return 0u;
-    }
-
-    const uint32_t normalizedAlignment = normalizeGuestHeapAlignment(alignment);
-    const uint32_t allocSize = alignGuestHeapValue(size, kGuestHeapDefaultAlignment);
-    if (allocSize == 0u)
-    {
-        return 0u;
-    }
-
-    std::lock_guard<std::mutex> lock(m_asyncCallbackStackMutex);
-    uint32_t top = m_asyncCallbackStackTop;
-    if (top > PS2_RAM_SIZE)
-    {
-        top = PS2_RAM_SIZE;
-    }
-    top &= ~(kGuestHeapDefaultAlignment - 1u);
-
-    if (top <= allocSize)
-    {
-        return 0u;
-    }
-
-    uint32_t base = top - allocSize;
-    base &= ~(normalizedAlignment - 1u);
-    if (base < m_asyncCallbackStackFloor || base >= top)
-    {
-        return 0u;
-    }
-
-    m_asyncCallbackStackTop = base;
-    return top - 0x10u;
-}
-
 void PS2Runtime::executeGuestStep(uint8_t *rdram,
                                   R5900Context *ctx,
                                   RecompiledFunction function)
@@ -7973,15 +8140,15 @@ void PS2Runtime::dispatchLoop(uint8_t *rdram, R5900Context *ctx)
             const uint32_t ra = static_cast<uint32_t>(_mm_extract_epi32(ctx->r[31], 0));
             const uint32_t sp = static_cast<uint32_t>(_mm_extract_epi32(ctx->r[29], 0));
             const uint32_t gp = static_cast<uint32_t>(_mm_extract_epi32(ctx->r[28], 0));
-            PS2_IF_AGRESSIVE_LOGS({
-                std::cerr << "[dispatch:pc-zero] from=" << formatGuestPc(dispatchedPc)
-                          << " fromRa=" << formatGuestPc(dispatchedRa)
-                          << " ra=" << formatGuestPc(ra)
-                          << " sp=0x" << std::hex << sp
-                          << " gp=0x" << gp
-                          << " trace=" << formatDispatchHistory()
-                          << std::dec << std::endl;
-            });
+            RUNTIME_LOG(
+                "[dispatch:pc-zero] from="
+                << formatGuestPc(dispatchedPc)
+                << " fromRa=" << formatGuestPc(dispatchedRa)
+                << " ra=" << formatGuestPc(ra)
+                << " sp=0x" << std::hex << sp
+                << " gp=0x" << gp
+                << " trace=" << formatDispatchHistory()
+                << std::dec << std::endl);
 
             // PC=0 means this guest thread returned (usually via jr $ra with RA=0).
             // Do not request a global runtime stop here: other guest threads may still run.
@@ -8010,7 +8177,7 @@ int PS2Runtime::threadIdForEeContext(
 
 void PS2Runtime::selectEeThread(int threadId) noexcept
 {
-    if (threadId <= 0)
+    if (threadId < 0)
     {
         threadId = 1;
     }
@@ -8036,7 +8203,7 @@ void PS2Runtime::switchGuestExecutionContext(
         threadIdForEeContext(context);
     if (selectedThreadId <= 0)
     {
-        if (selectionHint > 0)
+        if (selectionHint >= 0)
         {
             selectedThreadId = selectionHint;
         }
@@ -8335,6 +8502,27 @@ void PS2Runtime::leaveGuestExecution(
         return;
     }
 
+    const bool legacyBoundary =
+        it->second == 1u && !m_eeRuntimeExecutor;
+    const bool hasPublishedCallback =
+        legacyBoundary &&
+        (m_eeAlarmRuntimeState
+                 ->pendingCallbackPublished.load(
+                     std::memory_order_acquire) ||
+         m_pendingVSyncDeliveryCount != 0u ||
+         m_pendingEeCounterInterrupts != 0u ||
+         m_dmacInterruptDeliveryDirty.load(
+             std::memory_order_acquire));
+    if (hasPublishedCallback)
+    {
+        captureEeInterruptContinuation(
+            context, m_boundEeThreadId);
+    }
+    else if (legacyBoundary)
+    {
+        clearEeInterruptContinuation();
+    }
+
     restoreGuestExecutionContext(
         context,
         previousContext,
@@ -8344,14 +8532,24 @@ void PS2Runtime::leaveGuestExecution(
     // the outermost recompiled invocation returns. The dedicated executor
     // drains the same work from applyNextConsequence instead because a
     // suspended fiber can retain this scope across scheduler boundaries.
-    if (it->second == 1u && !m_eeRuntimeExecutor)
+    if (hasPublishedCallback)
     {
-        drainPendingAlarmCallbacks();
-        drainPendingVSyncHandlers(
-            m_memory.getRDRAM());
-        drainPendingEeCounterHandlers(
-            m_memory.getRDRAM());
-        drainCompletedDmacHandlers(m_memory.getRDRAM());
+        try
+        {
+            drainPendingAlarmCallbacks();
+            drainPendingVSyncHandlers(
+                m_memory.getRDRAM());
+            drainPendingEeCounterHandlers(
+                m_memory.getRDRAM());
+            drainCompletedDmacHandlers(
+                m_memory.getRDRAM());
+        }
+        catch (...)
+        {
+            clearEeInterruptContinuation();
+            throw;
+        }
+        clearEeInterruptContinuation();
         m_guestExecutionPreemptionRequested.store(
             false, std::memory_order_release);
         it = g_guestExecutionDepths.find(this);

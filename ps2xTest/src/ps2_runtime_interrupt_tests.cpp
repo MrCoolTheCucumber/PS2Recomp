@@ -5,6 +5,7 @@
 #include "Stubs/GS.h"
 #include "runtime/ps2_gs_gpu.h"
 
+#include <algorithm>
 #include <array>
 #include <atomic>
 #include <chrono>
@@ -28,10 +29,23 @@ namespace
     constexpr uint32_t kInterruptIsolationHitAddr = 0x1180u;
     constexpr uint32_t kInterruptIsolationSpAddr = 0x1184u;
     constexpr uint32_t kInterruptIsolationPcAddr = 0x1188u;
+    constexpr uint32_t kInterruptIsolationOwnerAddr = 0x118Cu;
     constexpr uint32_t
         kExecutorBoundaryThreadParamAddr = 0x1200u;
     constexpr uint32_t
         kExecutorBoundaryResumeAddress = 0x00ABC3C0u;
+    constexpr uint32_t
+        kExecutorBoundaryMainStack = 0x00300000u;
+    constexpr uint32_t
+        kExecutorBoundaryMainRa = 0x00FEDCBAu;
+    constexpr uint32_t
+        kExecutorBoundaryMainS4 = 0x13579BDFu;
+    constexpr uint32_t
+        kEeKernelInterruptHandlerStack = 0x01FFFC20u;
+    constexpr uint32_t
+        kLegacyCallbackPoolSentinel = 0x01FFFFE0u;
+    constexpr uint32_t
+        kCallbackStackWriteMarker = 0xC011BACCu;
 
     enum class ExecutorBoundaryInterruptKind
     {
@@ -80,6 +94,10 @@ namespace
     std::atomic<uint32_t> g_eeCounterIntcAtHandler{0u};
     std::atomic<uint32_t>
         g_executorBoundaryCallbackHits{0u};
+    std::atomic<uint32_t>
+        g_executorBoundaryCallbackStack{0u};
+    std::atomic<int>
+        g_executorBoundaryCallbackOwner{0};
     std::atomic<ExecutorBoundaryInterruptKind>
         g_executorBoundaryInterruptKind{
             ExecutorBoundaryInterruptKind::VSync};
@@ -105,6 +123,9 @@ namespace
             false};
     std::atomic<bool>
         g_executorBoundaryMainResumedBeforeChild{
+            false};
+    std::atomic<bool>
+        g_executorBoundaryContinuationPreserved{
             false};
     std::atomic<bool>
         g_interruptIsolationBlockNext{false};
@@ -273,7 +294,6 @@ namespace
         R5900Context *ctx,
         PS2Runtime *runtime)
     {
-        (void)runtime;
         if (g_interruptIsolationBlockNext.exchange(
                 false, std::memory_order_acq_rel))
         {
@@ -305,6 +325,13 @@ namespace
             rdram,
             kInterruptIsolationPcAddr,
             ctx->pc);
+        writeGuestU32(
+            rdram,
+            kInterruptIsolationOwnerAddr,
+            static_cast<uint32_t>(
+                runtime
+                    ? runtime->currentEeThreadId()
+                    : -1));
         ctx->pc = 0u;
     }
 
@@ -418,6 +445,21 @@ namespace
     {
         g_executorBoundaryCallbackHits.fetch_add(
             1u, std::memory_order_acq_rel);
+        const uint32_t callbackStack =
+            getRegU32(ctx, 29);
+        g_executorBoundaryCallbackStack.store(
+            callbackStack,
+            std::memory_order_release);
+        g_executorBoundaryCallbackOwner.store(
+            runtime ? runtime->currentEeThreadId() : 0,
+            std::memory_order_release);
+        if (rdram && callbackStack >= 16u)
+        {
+            writeGuestU32(
+                rdram,
+                (callbackStack - 16u) & PS2_RAM_MASK,
+                kCallbackStackWriteMarker);
+        }
         if (g_executorBoundaryMainWaiting.load(
                 std::memory_order_acquire))
         {
@@ -428,6 +470,8 @@ namespace
         }
         g_executorBoundaryCallbackActive.store(
             true, std::memory_order_release);
+        setRegU32(*ctx, 4, 1u);
+        iRotateThreadReadyQueue(rdram, ctx, runtime);
         setRegU32(
             *ctx,
             4,
@@ -465,6 +509,15 @@ namespace
         R5900Context *ctx,
         PS2Runtime *)
     {
+        g_executorBoundaryContinuationPreserved.store(
+            ctx->pc == kExecutorBoundaryResumeAddress &&
+                getRegU32(ctx, 29) ==
+                    kExecutorBoundaryMainStack &&
+                getRegU32(ctx, 31) ==
+                    kExecutorBoundaryMainRa &&
+                getRegU32(ctx, 20) ==
+                    kExecutorBoundaryMainS4,
+            std::memory_order_release);
         g_executorBoundaryMainWaiting.store(
             false, std::memory_order_release);
         g_executorBoundaryMainResumedBeforeChild.store(
@@ -567,6 +620,9 @@ namespace
 
         g_executorBoundaryMainWaiting.store(
             true, std::memory_order_release);
+        setRegU32(*ctx, 29, kExecutorBoundaryMainStack);
+        setRegU32(*ctx, 31, kExecutorBoundaryMainRa);
+        setRegU32(*ctx, 20, kExecutorBoundaryMainS4);
         ctx->cop0_config |= 1u << 18u;
         ctx->advanceEeCycleTicks(
             static_cast<uint32_t>(elapsed));
@@ -890,12 +946,16 @@ void register_ps2_runtime_interrupt_tests()
                     bool completed = false;
                     std::string backendName;
                     uint32_t callbackHits = 0u;
+                    uint32_t callbackStack = 0u;
+                    int callbackOwner = 0;
                     bool callbackRanWhileWaiting = false;
                     int childThreadId = 0;
                     int wakeResult = -1;
                     bool childWaiting = false;
                     bool childRanInsideCallback = false;
                     bool mainResumedBeforeChild = false;
+                    bool continuationPreserved = false;
+                    bool callbackPoolSentinelPreserved = false;
                     bool executionQuiescent = false;
                     bool memoryCaptured = false;
                     std::vector<
@@ -941,6 +1001,11 @@ void register_ps2_runtime_interrupt_tests()
                         }
                         uint8_t *const rdram =
                             runtime.memory().getRDRAM();
+                        std::memset(
+                            rdram +
+                                kLegacyCallbackPoolSentinel,
+                            0xA5,
+                            16u);
 
                         runtime.registerFunction(
                             kMainAddress,
@@ -1053,6 +1118,10 @@ void register_ps2_runtime_interrupt_tests()
                             std::memory_order_release);
                         g_executorBoundaryCallbackHits.store(
                             0u, std::memory_order_release);
+                        g_executorBoundaryCallbackStack.store(
+                            0u, std::memory_order_release);
+                        g_executorBoundaryCallbackOwner.store(
+                            0, std::memory_order_release);
                         g_executorBoundaryMainWaiting.store(
                             false, std::memory_order_release);
                         g_executorBoundaryCallbackRanWhileWaiting
@@ -1079,10 +1148,14 @@ void register_ps2_runtime_interrupt_tests()
                             .store(
                                 false,
                                 std::memory_order_release);
+                        g_executorBoundaryContinuationPreserved
+                            .store(
+                                false,
+                                std::memory_order_release);
                         runtime.cpu().pc = kMainAddress;
                         setRegU32(
                             runtime.cpu(), 29,
-                            0x00300000u);
+                            kExecutorBoundaryMainStack);
                         runtime.debugStartEeEventTrace(
                             8u);
 
@@ -1136,6 +1209,12 @@ void register_ps2_runtime_interrupt_tests()
                         result.callbackHits =
                             g_executorBoundaryCallbackHits.load(
                                 std::memory_order_acquire);
+                        result.callbackStack =
+                            g_executorBoundaryCallbackStack.load(
+                                std::memory_order_acquire);
+                        result.callbackOwner =
+                            g_executorBoundaryCallbackOwner.load(
+                                std::memory_order_acquire);
                         result.callbackRanWhileWaiting =
                             g_executorBoundaryCallbackRanWhileWaiting
                                 .load(
@@ -1157,6 +1236,21 @@ void register_ps2_runtime_interrupt_tests()
                             g_executorBoundaryMainResumedBeforeChild
                                 .load(
                                     std::memory_order_acquire);
+                        result.continuationPreserved =
+                            g_executorBoundaryContinuationPreserved
+                                .load(
+                                    std::memory_order_acquire);
+                        result.callbackPoolSentinelPreserved =
+                            std::all_of(
+                                result.memory.begin() +
+                                    kLegacyCallbackPoolSentinel,
+                                result.memory.begin() +
+                                    kLegacyCallbackPoolSentinel +
+                                    16u,
+                                [](uint8_t value)
+                                {
+                                    return value == 0xA5u;
+                                });
                         result.managedAfterStop =
                             runtime
                                 .managedEeExecutionThreadCountForTesting();
@@ -1184,6 +1278,12 @@ void register_ps2_runtime_interrupt_tests()
                                ",hits=" +
                                std::to_string(
                                    result.callbackHits) +
+                               ",callback_sp=" +
+                               std::to_string(
+                                   result.callbackStack) +
+                               ",callback_owner=" +
+                               std::to_string(
+                                   result.callbackOwner) +
                                ",callback_wait=" +
                                std::to_string(
                                    result.callbackRanWhileWaiting) +
@@ -1199,6 +1299,12 @@ void register_ps2_runtime_interrupt_tests()
                                ",main_first=" +
                                std::to_string(
                                    result.mainResumedBeforeChild) +
+                               ",context=" +
+                               std::to_string(
+                                   result.continuationPreserved) +
+                               ",sentinel=" +
+                               std::to_string(
+                                   result.callbackPoolSentinelPreserved) +
                                ",child_in_callback=" +
                                std::to_string(
                                    result.childRanInsideCallback) +
@@ -1324,6 +1430,24 @@ void register_ps2_runtime_interrupt_tests()
                             " raw wake should make the "
                             "child READY without recursive "
                             "dispatch");
+                    t.IsTrue(
+                        host.callbackStack ==
+                                kExecutorBoundaryMainStack &&
+                            fiber.callbackStack ==
+                                host.callbackStack &&
+                            host.callbackOwner == 1 &&
+                            fiber.callbackOwner ==
+                                host.callbackOwner &&
+                            host.continuationPreserved &&
+                            fiber.continuationPreserved &&
+                            host.callbackPoolSentinelPreserved &&
+                            fiber.callbackPoolSentinelPreserved,
+                        prefix +
+                            " should descend from the owned "
+                            "interrupted stack while retaining "
+                            "the interrupted thread's complete "
+                            "continuation and ownership: " +
+                            differentialSummary);
                     t.IsTrue(
                         host.eventSources ==
                                 std::vector<
@@ -2283,14 +2407,10 @@ void register_ps2_runtime_interrupt_tests()
                 readGuestU32(
                     second.rdram.data(),
                     kInterruptIsolationSpAddr);
-            const uint32_t secondNextStack =
-                second.runtime.reserveAsyncCallbackStack(
-                    0x4000u, 16u);
-            t.IsTrue(
-                secondCallbackStack != 0u &&
-                    secondNextStack !=
-                        secondCallbackStack,
-                "the second callback stack should be reserved by the second runtime");
+            t.Equals(
+                secondCallbackStack,
+                kEeKernelInterruptHandlerStack,
+                "direct GS delivery should use the BIOS interrupt frame rather than the registration-time stack");
 
             auto resetGsVideo =
                 [](TestEnv &env, uint32_t interlace)
@@ -2367,7 +2487,7 @@ void register_ps2_runtime_interrupt_tests()
                 &first.runtime);
         });
 
-        tc.Run("interrupt callback stack belongs to the runtime rather than the host thread", [](TestCase &t)
+        tc.Run("interrupt callback owns a BIOS idle frame rather than host or registration state", [](TestCase &t)
         {
             notifyRuntimeStop();
             TestEnv env;
@@ -2385,6 +2505,7 @@ void register_ps2_runtime_interrupt_tests()
             R5900Context add{};
             setRegU32(add, 4, kCause);
             setRegU32(add, 5, kHandlerAddr);
+            setRegU32(add, 29, 0x00123450u);
             AddIntcHandler(
                 env.rdram.data(),
                 &add,
@@ -2415,14 +2536,20 @@ void register_ps2_runtime_interrupt_tests()
                     env.rdram.data(),
                     kInterruptIsolationSpAddr);
 
-            t.IsTrue(
-                firstStack != 0u &&
-                    (firstStack & 0xFu) == 0u,
-                "interrupt callback stack should be nonzero and 16-byte aligned");
+            t.Equals(
+                firstStack,
+                kEeKernelInterruptHandlerStack,
+                "idle delivery should use the PCSX2-observed BIOS interrupt stack, not the registration SP");
             t.Equals(
                 secondStack,
                 firstStack,
-                "changing host threads must reuse the runtime-owned callback stack");
+                "changing host threads must preserve the runtime-owned BIOS frame");
+            t.Equals(
+                readGuestU32(
+                    env.rdram.data(),
+                    kInterruptIsolationOwnerAddr),
+                0u,
+                "delivery without an interrupted guest continuation should belong to explicit BIOS idle thread 0");
 
             const uint32_t beforeConcurrent =
                 readGuestU32(

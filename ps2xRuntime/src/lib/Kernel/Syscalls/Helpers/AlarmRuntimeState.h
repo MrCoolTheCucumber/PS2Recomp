@@ -69,7 +69,6 @@ struct EeAlarmRuntimeState
     bool workerRunning = false;
 
     R5900Context callbackContext{};
-    uint32_t callbackStackTop = 0u;
     uint32_t exceptionLogCount = 0u;
     uint32_t setLogCount = 0u;
 };

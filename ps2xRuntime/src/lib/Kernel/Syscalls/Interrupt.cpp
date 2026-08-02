@@ -133,12 +133,10 @@ namespace ps2_syscalls
             try
             {
                 EeAsyncCallbackContextLease callback(
-                    state, *runtime);
+                    state);
                 R5900Context &irqCtx =
                     callback.context();
                 SET_GPR_U32(&irqCtx, 28, info.gp);
-                SET_GPR_U32(
-                    &irqCtx, 29, callback.stackTop());
                 SET_GPR_U32(&irqCtx, 31, 0u);
                 SET_GPR_U32(&irqCtx, 4, cause);
                 SET_GPR_U32(&irqCtx, 5, info.arg);
@@ -150,8 +148,13 @@ namespace ps2_syscalls
                 uint64_t handoffBaseline = 0u;
                 uint32_t stepCount = 0u;
                 {
-                    PS2Runtime::GuestExecutionScope guestExecution(
+                    PS2Runtime::AsyncCallbackInvocationScope
+                        callbackExecution(
                         runtime, &irqCtx);
+                    SET_GPR_U32(
+                        &irqCtx,
+                        29,
+                        callbackExecution.stackTop());
                     PS2Runtime::DeferredGuestYieldScope deferYield(reschedulePending);
 
                     while (irqCtx.pc != 0u && runtime && !runtime->isStopRequested() && stepCount < kMaxIrqHandlerSteps)
@@ -266,12 +269,10 @@ namespace ps2_syscalls
             try
             {
                 EeAsyncCallbackContextLease callback(
-                    state, *runtime);
+                    state);
                 R5900Context &irqCtx =
                     callback.context();
                 SET_GPR_U32(&irqCtx, 28, info.gp);
-                SET_GPR_U32(
-                    &irqCtx, 29, callback.stackTop());
                 SET_GPR_U32(&irqCtx, 31, 0u);
                 SET_GPR_U32(&irqCtx, 4, cause);
                 SET_GPR_U32(&irqCtx, 5, info.arg);
@@ -283,8 +284,13 @@ namespace ps2_syscalls
                 uint64_t handoffBaseline = 0u;
                 uint32_t steps = 0u;
                 {
-                    PS2Runtime::GuestExecutionScope guestExecution(
+                    PS2Runtime::AsyncCallbackInvocationScope
+                        callbackExecution(
                         runtime, &irqCtx);
+                    SET_GPR_U32(
+                        &irqCtx,
+                        29,
+                        callbackExecution.stackTop());
                     PS2Runtime::DeferredGuestYieldScope deferYield(reschedulePending);
 
                     while (irqCtx.pc != 0u && runtime && !runtime->isStopRequested() &&

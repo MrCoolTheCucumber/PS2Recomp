@@ -675,6 +675,11 @@ namespace ps2_syscalls
                 getCurrentThreadId(runtime);
             const uint32_t generation =
                 info->generation;
+            const uint32_t callerPc = ctx->pc;
+            const uint32_t callerSp =
+                getRegU32(ctx, 29);
+            const uint32_t callerRa =
+                getRegU32(ctx, 31);
             const auto transition =
                 std::make_shared<WaitTransition>();
             const bool published =
@@ -684,6 +689,9 @@ namespace ps2_syscalls
                      sid,
                      threadId,
                      generation,
+                     callerPc,
+                     callerSp,
+                     callerRa,
                      transition](
                         ps2x::ee::EeThreadScheduler
                             &scheduler)
@@ -695,9 +703,26 @@ namespace ps2_syscalls
                             handle->generation !=
                                 generation)
                         {
+                            const int schedulerThreadId =
+                                scheduler.currentThreadId()
+                                    .value_or(0);
                             throw std::logic_error(
                                 "WaitSema lost its EE "
-                                "scheduler record");
+                                "scheduler record: tid=" +
+                                std::to_string(threadId) +
+                                " generation=" +
+                                std::to_string(generation) +
+                                " scheduler_tid=" +
+                                std::to_string(
+                                    schedulerThreadId) +
+                                " sid=" +
+                                std::to_string(sid) +
+                                " pc=" +
+                                std::to_string(callerPc) +
+                                " sp=" +
+                                std::to_string(callerSp) +
+                                " ra=" +
+                                std::to_string(callerRa));
                         }
 
                         std::lock_guard<std::mutex> lock(

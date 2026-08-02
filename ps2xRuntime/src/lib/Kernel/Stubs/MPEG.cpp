@@ -772,9 +772,29 @@ namespace ps2_stubs
         constexpr uint32_t kStubMovieWidth = 320u;
         constexpr uint32_t kStubMovieHeight = 240u;
         constexpr uint32_t kMpegStrM2V = 0u;
-        constexpr uint32_t kMpegStrPCM = 1u;
-        constexpr uint32_t kMpegStrADPCM = 2u;
-        constexpr uint32_t kMpegStrData = 3u;
+        struct MpegStreamSelectorSpec
+        {
+            uint64_t base = 0u;
+            uint64_t mask = 0u;
+            uint32_t streamIdShift = 0u;
+        };
+
+        // Sony libmpeg identifies a registered stream by a five-byte value:
+        // the PES stream id followed by the first four payload bytes. These
+        // are the selector bases and masks used by its _type2id table.
+        constexpr std::array<MpegStreamSelectorSpec, 10u>
+            kMpegStreamSelectorSpecs{{
+                {0x000000E000000000ull, 0x000000FF00000000ull, 32u},
+                {0x000000BDFFC00000ull, 0x000000FFFFFFFFFFull, 0u},
+                {0x000000BDFFA00000ull, 0x000000FFFFFFFFFFull, 0u},
+                {0x000000BDFFA10000ull, 0x000000FFFFFFFFFFull, 0u},
+                {0x000000BDFF900000ull, 0x000000FFFFFFFFFFull, 0u},
+                {0x000000C000000000ull, 0x000000FF00000000ull, 32u},
+                {0x000000BD80000000ull, 0x000000FFFF000000ull, 24u},
+                {0x000000BDA0000000ull, 0x000000FFFF000000ull, 24u},
+                {0x000000BD88000000ull, 0x000000FFFF000000ull, 24u},
+                {0x000000BD90000000ull, 0x000000FFFF000000ull, 24u},
+            }};
         constexpr uint8_t kMpegPackHeader = 0xBAu;
         constexpr uint8_t kMpegSystemHeader = 0xBBu;
         constexpr uint8_t kMpegProgramEnd = 0xB9u;
@@ -1412,11 +1432,45 @@ namespace ps2_stubs
             playback.pssInputOffsets.clear();
         }
 
+        uint64_t makeMpegPacketSelector(uint8_t pesStreamId,
+                                        const uint8_t *payload,
+                                        size_t payloadSize)
+        {
+            uint64_t selector = static_cast<uint64_t>(pesStreamId) << 32u;
+            const size_t selectorPayloadBytes =
+                std::min<size_t>(payloadSize, 4u);
+            for (size_t index = 0u; index < selectorPayloadBytes; ++index)
+            {
+                selector |= static_cast<uint64_t>(payload[index])
+                            << (24u - static_cast<uint32_t>(index) * 8u);
+            }
+            return selector;
+        }
+
+        bool streamCallbackMatchesSelector(
+            const MpegRegisteredCallback &callback,
+            uint64_t packetSelector)
+        {
+            if (callback.type >= kMpegStreamSelectorSpecs.size())
+            {
+                return false;
+            }
+
+            const MpegStreamSelectorSpec &spec =
+                kMpegStreamSelectorSpecs[callback.type];
+            const uint64_t registeredSelector =
+                spec.base |
+                (static_cast<uint64_t>(callback.streamId)
+                 << spec.streamIdShift);
+            return (packetSelector & spec.mask) == registeredSelector;
+        }
+
         std::vector<MpegRegisteredCallback>
         matchingStreamCallbacks(
             MpegRuntimeState::Impl &runtimeState,
             uint32_t mpegAddr,
-            uint32_t streamType)
+            uint32_t streamType,
+            uint64_t packetSelector)
         {
             std::vector<MpegRegisteredCallback> out;
             auto it =
@@ -1430,7 +1484,9 @@ namespace ps2_stubs
 
             for (const MpegRegisteredCallback &callback : it->second)
             {
-                if (callback.stream && callback.type == streamType)
+                if (callback.stream && callback.type == streamType &&
+                    streamCallbackMatchesSelector(
+                        callback, packetSelector))
                 {
                     out.push_back(callback);
                 }
@@ -1447,6 +1503,7 @@ namespace ps2_stubs
                                       const uint8_t *payload,
                                       bool sourceContiguous,
                                       bool hostConsumesPayload,
+                                      uint64_t packetSelector,
                                       size_t inputOffset,
                                       size_t inputEndOffset,
                                       std::vector<MpegStreamCallbackEvent> &callbackEvents)
@@ -1459,7 +1516,10 @@ namespace ps2_stubs
             event.inputOffset = inputOffset;
             event.inputEndOffset = inputEndOffset;
             event.callbacks = matchingStreamCallbacks(
-                runtimeState, mpegAddr, streamType);
+                runtimeState,
+                mpegAddr,
+                streamType,
+                packetSelector);
             event.hostConsumesPayload = hostConsumesPayload;
             if (!event.callbacks.empty())
             {
@@ -1664,87 +1724,54 @@ namespace ps2_stubs
                 }
                 const size_t callbacksBeforePacket = callbackEvents.size();
 
-                if (isVideoStreamId(streamId))
+                const bool videoPacket = isVideoStreamId(streamId);
+                const bool audioPacket = isAudioStreamId(streamId);
+                if (videoPacket || audioPacket)
                 {
                     const size_t payloadStart = parsePesPayloadOffset(buffer.data(), packetEnd);
-                    if (payloadStart < packetEnd)
-                    {
-                        if (payloadStart < playback.pssGuestAddrs.size())
-                        {
-                            const uint32_t payloadSize =
-                                static_cast<uint32_t>(packetEnd - payloadStart);
-                            queueStreamCallbackEvent(
-                                runtimeState,
-                                mpegAddr,
-                                kMpegStrM2V,
-                                playback.pssGuestAddrs[payloadStart],
-                                payloadSize,
-                                buffer.data() + payloadStart,
-                                isContiguousGuestPayload(
-                                    playback.pssGuestAddrs,
-                                    payloadStart,
-                                    payloadSize),
-                                PS2X_HAS_FFMPEG != 0,
-                                packetInputOffset,
-                                packetInputEndOffset,
-                                callbackEvents);
-                        }
-                        feedElementaryStream(
-                            runtimeState,
-                            playback,
-                            buffer.data() + payloadStart,
-                            packetEnd - payloadStart);
-                    }
-                }
-                else if (isAudioStreamId(streamId))
-                {
-                    const size_t payloadStart = parsePesPayloadOffset(buffer.data(), packetEnd);
-                    if (payloadStart < packetEnd && payloadStart < playback.pssGuestAddrs.size())
+                    if (payloadStart < packetEnd &&
+                        payloadStart < playback.pssGuestAddrs.size())
                     {
                         const uint32_t payloadSize =
                             static_cast<uint32_t>(packetEnd - payloadStart);
-                        const bool sourceContiguous = isContiguousGuestPayload(
-                            playback.pssGuestAddrs,
-                            payloadStart,
-                            payloadSize);
-                        queueStreamCallbackEvent(
-                            runtimeState,
-                            mpegAddr,
-                            kMpegStrPCM,
-                            playback.pssGuestAddrs[payloadStart],
-                            payloadSize,
-                            buffer.data() + payloadStart,
-                            sourceContiguous,
-                            false,
-                            packetInputOffset,
-                            packetInputEndOffset,
-                            callbackEvents);
-                        queueStreamCallbackEvent(
-                            runtimeState,
-                            mpegAddr,
-                            kMpegStrADPCM,
-                            playback.pssGuestAddrs[payloadStart],
-                            payloadSize,
-                            buffer.data() + payloadStart,
-                            sourceContiguous,
-                            false,
-                            packetInputOffset,
-                            packetInputEndOffset,
-                            callbackEvents);
-                        if (streamId == kMpegPrivateStream1)
+                        const bool sourceContiguous =
+                            isContiguousGuestPayload(
+                                playback.pssGuestAddrs,
+                                payloadStart,
+                                payloadSize);
+                        const uint64_t packetSelector =
+                            makeMpegPacketSelector(
+                                streamId,
+                                buffer.data() + payloadStart,
+                                payloadSize);
+                        for (uint32_t streamType = 0u;
+                             streamType < kMpegStreamSelectorSpecs.size();
+                             ++streamType)
                         {
                             queueStreamCallbackEvent(
                                 runtimeState,
                                 mpegAddr,
-                                kMpegStrData,
+                                streamType,
                                 playback.pssGuestAddrs[payloadStart],
                                 payloadSize,
                                 buffer.data() + payloadStart,
                                 sourceContiguous,
-                                false,
+                                videoPacket &&
+                                    streamType == kMpegStrM2V &&
+                                    PS2X_HAS_FFMPEG != 0,
+                                packetSelector,
                                 packetInputOffset,
                                 packetInputEndOffset,
                                 callbackEvents);
+                        }
+
+                        if (videoPacket)
+                        {
+                            feedElementaryStream(
+                                runtimeState,
+                                playback,
+                                buffer.data() + payloadStart,
+                                packetEnd - payloadStart);
                         }
                     }
                 }
@@ -2018,6 +2045,7 @@ namespace ps2_stubs
             uint8_t *rdram,
             R5900Context *callerCtx,
             PS2Runtime *runtime,
+            int continuationThreadId,
             const MpegStreamCallbackEvent &event,
             const MpegRegisteredCallback &callback)
         {
@@ -2034,25 +2062,28 @@ namespace ps2_stubs
             }
 
             EeAsyncCallbackContextLease callbackLease(
-                runtime->eeInterruptRuntimeState(),
-                *runtime);
+                runtime->eeInterruptRuntimeState());
             R5900Context &callbackCtx =
                 callbackLease.context();
             callbackCtx = *callerCtx;
-            const uint32_t reservedTop =
-                callbackLease.stackTop();
-            if (reservedTop < kMpegCallbackDataSize)
-            {
-                return MpegCallbackDisposition::Failed;
-            }
-            const uint32_t cbDataAddr =
-                reservedTop - kMpegCallbackDataSize;
             uint32_t steps = 0u;
             bool reschedulePending = false;
             uint64_t handoffBaseline = 0u;
             {
-                PS2Runtime::GuestExecutionScope guestExecution(
-                    runtime, &callbackCtx);
+                PS2Runtime::AsyncCallbackInvocationScope
+                    callbackExecution(
+                        runtime,
+                        &callbackCtx,
+                        callerCtx,
+                        continuationThreadId);
+                const uint32_t reservedTop =
+                    callbackExecution.stackTop();
+                if (reservedTop < kMpegCallbackDataSize)
+                {
+                    return MpegCallbackDisposition::Failed;
+                }
+                const uint32_t cbDataAddr =
+                    reservedTop - kMpegCallbackDataSize;
                 // Stream callbacks receive the original guest address. Ring-aware
                 // callbacks rely on that address to handle source wrapping, so an
                 // arbitrary linear staging address is not protocol-compatible.
@@ -2159,6 +2190,7 @@ namespace ps2_stubs
         bool dispatchStreamCallbacks(uint8_t *rdram,
                                      R5900Context *ctx,
                                      PS2Runtime *runtime,
+                                     int continuationThreadId,
                                      std::vector<MpegStreamCallbackEvent> &events)
         {
             if (events.empty())
@@ -2175,7 +2207,13 @@ namespace ps2_stubs
                     const MpegRegisteredCallback &callback =
                         event.callbacks[event.nextCallbackIndex];
                     const MpegCallbackDisposition disposition =
-                        dispatchGuestStreamCallback(rdram, ctx, runtime, event, callback);
+                        dispatchGuestStreamCallback(
+                            rdram,
+                            ctx,
+                            runtime,
+                            continuationThreadId,
+                            event,
+                            callback);
                     if (disposition == MpegCallbackDisposition::Backpressured &&
                         event.hostConsumesPayload)
                     {
@@ -2217,8 +2255,17 @@ namespace ps2_stubs
                 return true;
             }
 
+            const int continuationThreadId =
+                runtime
+                    ? runtime->currentEeThreadId()
+                    : 0;
             PS2Runtime::GuestExecutionReleaseScope releaseGuestExecution(runtime);
-            return dispatchStreamCallbacks(rdram, ctx, runtime, events);
+            return dispatchStreamCallbacks(
+                rdram,
+                ctx,
+                runtime,
+                continuationThreadId,
+                events);
         }
 
         bool drainPssCallbacksIncrementally(

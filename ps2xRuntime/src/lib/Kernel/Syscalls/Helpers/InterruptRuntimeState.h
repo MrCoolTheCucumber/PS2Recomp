@@ -24,7 +24,6 @@ struct IrqHandlerInfo
 struct EeInterruptCallbackContext
 {
     R5900Context context{};
-    uint32_t stackTop = 0u;
     bool active = false;
 };
 
@@ -45,14 +44,12 @@ struct EeGsVideoParameters
 // Guest interrupt registration, masks, and callback continuations belong to
 // one runtime. Handler metadata is copied while handlerMutex is held, then
 // guest code runs without the registry lock. Callback slots are pooled so
-// concurrent or nested delivery never shares an R5900 context or guest stack.
+// concurrent or nested delivery never shares an R5900 context. The runtime's
+// owned interrupt frame supplies continuation identity and handler stack.
 struct EeInterruptRuntimeState
 {
-    EeInterruptCallbackContext *acquireCallbackContext(
-        PS2Runtime &runtime)
+    EeInterruptCallbackContext *acquireCallbackContext()
     {
-        constexpr uint32_t kCallbackStackSize = 0x4000u;
-
         std::lock_guard<std::mutex> lock(
             callbackContextMutex);
         EeInterruptCallbackContext *slot = nullptr;
@@ -73,12 +70,6 @@ struct EeInterruptRuntimeState
         }
 
         slot->context = {};
-        if (slot->stackTop == 0u)
-        {
-            slot->stackTop =
-                runtime.reserveAsyncCallbackStack(
-                    kCallbackStackSize, 16u);
-        }
         slot->active = true;
         return slot;
     }
@@ -133,10 +124,9 @@ class EeAsyncCallbackContextLease
 {
 public:
     EeAsyncCallbackContextLease(
-        EeInterruptRuntimeState &state,
-        PS2Runtime &runtime)
+        EeInterruptRuntimeState &state)
         : m_state(state),
-          m_slot(state.acquireCallbackContext(runtime))
+          m_slot(state.acquireCallbackContext())
     {
     }
 
@@ -148,13 +138,6 @@ public:
     R5900Context &context()
     {
         return m_slot->context;
-    }
-
-    uint32_t stackTop() const
-    {
-        return m_slot->stackTop != 0u
-                   ? m_slot->stackTop
-                   : (PS2_RAM_SIZE - 0x10u);
     }
 
     EeAsyncCallbackContextLease(

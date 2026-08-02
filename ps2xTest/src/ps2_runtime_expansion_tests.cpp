@@ -486,15 +486,24 @@ namespace
     std::atomic<uint32_t> gAsyncCallbackObservedSp{0u};
     std::atomic<uint32_t> gAsyncCallbackObservedGp{0u};
 
-    void testRecordAsyncCallbackStack(uint8_t *, R5900Context *ctx, PS2Runtime *)
+    void testRecordAsyncCallbackStack(uint8_t *rdram, R5900Context *ctx, PS2Runtime *)
     {
         if (!ctx)
         {
             return;
         }
 
-        gAsyncCallbackObservedSp.store(::getRegU32(ctx, 29), std::memory_order_release);
+        const uint32_t sp = ::getRegU32(ctx, 29);
+        gAsyncCallbackObservedSp.store(sp, std::memory_order_release);
         gAsyncCallbackObservedGp.store(::getRegU32(ctx, 28), std::memory_order_release);
+        if (rdram && sp >= 16u)
+        {
+            constexpr uint32_t kStackMarker = 0xC011BACCu;
+            std::memcpy(
+                rdram + ((sp - 16u) & PS2_RAM_MASK),
+                &kStackMarker,
+                sizeof(kStackMarker));
+        }
         ctx->pc = 0u;
     }
 
@@ -506,6 +515,9 @@ namespace
     std::atomic<uint32_t> gMpegStreamCallbackUserData{0u};
     std::atomic<uint32_t> gMpegStreamCallbackSp{0u};
     std::atomic<uint32_t> gMpegStreamCallbackReturn{1u};
+    std::atomic<int> gMpegStreamCallbackOwner{0};
+    std::atomic<int32_t> gMpegStreamCallbackWaitResult{-1};
+    std::atomic<int32_t> gMpegStreamCallbackSemaphore{-1};
     std::mutex gMpegStreamCallbackPayloadMutex;
     std::vector<uint8_t> gMpegStreamCallbackPayload;
 
@@ -548,6 +560,36 @@ namespace
         gMpegStreamCallbackSp.store(::getRegU32(ctx, 29), std::memory_order_release);
         gMpegStreamCallbackCount.fetch_add(1u, std::memory_order_acq_rel);
         setRegU32(*ctx, 2, gMpegStreamCallbackReturn.load(std::memory_order_acquire));
+        ctx->pc = 0u;
+    }
+
+    void testMpegStreamCallbackWaitSema(
+        uint8_t *rdram,
+        R5900Context *ctx,
+        PS2Runtime *runtime)
+    {
+        if (!rdram || !ctx || !runtime)
+        {
+            return;
+        }
+
+        gMpegStreamCallbackOwner.store(
+            runtime->currentEeThreadId(),
+            std::memory_order_release);
+        gMpegStreamCallbackSp.store(
+            ::getRegU32(ctx, 29),
+            std::memory_order_release);
+        setRegU32(
+            *ctx,
+            4,
+            static_cast<uint32_t>(
+                gMpegStreamCallbackSemaphore.load(
+                    std::memory_order_acquire)));
+        WaitSema(rdram, ctx, runtime);
+        gMpegStreamCallbackWaitResult.store(
+            getRegS32(*ctx, 2),
+            std::memory_order_release);
+        setRegU32(*ctx, 2, 1u);
         ctx->pc = 0u;
     }
 
@@ -2004,6 +2046,7 @@ void register_ps2_runtime_expansion_tests()
                 &first);
 
             const std::vector<uint8_t> payload = {
+                0xFFu, 0xA1u, 0x00u, 0x00u,
                 0x11u, 0x22u, 0x33u, 0x44u};
             const uint16_t packetLength =
                 static_cast<uint16_t>(
@@ -2079,6 +2122,154 @@ void register_ps2_runtime_expansion_tests()
             first.requestStop();
             second.requestStop();
         });
+
+        tc.Run(
+            "MPEG stream callbacks retain the releasing guest continuation",
+            [](TestCase &t)
+            {
+                PS2Runtime runtime;
+                std::vector<uint8_t> rdram(
+                    PS2_RAM_SIZE, 0u);
+                ps2_stubs::resetMpegStubState(&runtime);
+
+                constexpr uint32_t kMpegAddr =
+                    0x00123000u;
+                constexpr uint32_t kCallbackEntry =
+                    0x00124000u;
+                constexpr uint32_t kPacketAddr =
+                    0x00129000u;
+                constexpr uint32_t kSemaParamAddr =
+                    0x00002000u;
+                constexpr uint32_t kParentSp =
+                    0x00300000u;
+                constexpr uint32_t kCallbackDataSize =
+                    0x20u;
+
+                const uint32_t semaParam[6] = {
+                    0u,
+                    1u,
+                    1u,
+                    0u,
+                    0u,
+                    0u,
+                };
+                std::memcpy(
+                    rdram.data() + kSemaParamAddr,
+                    semaParam,
+                    sizeof(semaParam));
+                R5900Context createSemaCtx{};
+                setRegU32(
+                    createSemaCtx, 4,
+                    kSemaParamAddr);
+                CreateSema(
+                    rdram.data(),
+                    &createSemaCtx,
+                    &runtime);
+                const int32_t sid =
+                    getRegS32(createSemaCtx, 2);
+                t.IsTrue(
+                    sid >= 0,
+                    "the callback fixture should create a semaphore");
+
+                runtime.registerFunction(
+                    kCallbackEntry,
+                    &testMpegStreamCallbackWaitSema);
+                R5900Context addCtx{};
+                setRegU32(addCtx, 4, kMpegAddr);
+                setRegU32(addCtx, 5, 3u);
+                setRegU32(addCtx, 6, 0u);
+                setRegU32(
+                    addCtx, 7, kCallbackEntry);
+                setRegU32(addCtx, 8, 0u);
+                ps2_stubs::sceMpegAddStrCallback(
+                    rdram.data(), &addCtx, &runtime);
+
+                const std::vector<uint8_t> payload = {
+                    0xFFu, 0xA1u, 0x00u, 0x00u,
+                    0x21u, 0x43u, 0x65u, 0x87u};
+                const uint16_t packetLen =
+                    static_cast<uint16_t>(
+                        payload.size() + 3u);
+                std::vector<uint8_t> packet = {
+                    0x00u, 0x00u, 0x01u, 0xBDu,
+                    static_cast<uint8_t>(
+                        packetLen >> 8u),
+                    static_cast<uint8_t>(
+                        packetLen & 0xFFu),
+                    0x80u, 0x00u, 0x00u};
+                packet.insert(
+                    packet.end(),
+                    payload.begin(),
+                    payload.end());
+                std::memcpy(
+                    rdram.data() + kPacketAddr,
+                    packet.data(),
+                    packet.size());
+
+                gMpegStreamCallbackOwner.store(
+                    -1, std::memory_order_release);
+                gMpegStreamCallbackSp.store(
+                    0u, std::memory_order_release);
+                gMpegStreamCallbackWaitResult.store(
+                    -1, std::memory_order_release);
+                gMpegStreamCallbackSemaphore.store(
+                    sid, std::memory_order_release);
+
+                R5900Context demuxCtx{};
+                demuxCtx.pc = 0x00101000u;
+                setRegU32(demuxCtx, 29, kParentSp);
+                setRegU32(demuxCtx, 4, kMpegAddr);
+                setRegU32(
+                    demuxCtx, 5, kPacketAddr);
+                setRegU32(
+                    demuxCtx,
+                    6,
+                    static_cast<uint32_t>(
+                        packet.size()));
+                setRegU32(
+                    demuxCtx, 7, kPacketAddr);
+                setRegU32(
+                    demuxCtx,
+                    8,
+                    static_cast<uint32_t>(
+                        packet.size()));
+                {
+                    PS2Runtime::GuestExecutionScope
+                        guestExecution(
+                            &runtime,
+                            &demuxCtx,
+                            1);
+                    ps2_stubs::sceMpegDemuxPssRing(
+                        rdram.data(),
+                        &demuxCtx,
+                        &runtime);
+                }
+
+                t.Equals(
+                    gMpegStreamCallbackOwner.load(
+                        std::memory_order_acquire),
+                    1,
+                    "a synchronous MPEG callback should retain the releasing thread owner");
+                t.Equals(
+                    gMpegStreamCallbackSp.load(
+                        std::memory_order_acquire),
+                    kParentSp - kCallbackDataSize,
+                    "a synchronous MPEG callback should use the releasing continuation stack");
+                t.Equals(
+                    gMpegStreamCallbackWaitResult.load(
+                        std::memory_order_acquire),
+                    0,
+                    "the callback should execute a scheduler syscall as its parent thread");
+                t.Equals(
+                    getRegS32(demuxCtx, 2),
+                    static_cast<int32_t>(
+                        packet.size()),
+                    "the callback should acknowledge the complete private-stream packet");
+
+                ps2_stubs::resetMpegStubState(
+                    &runtime);
+                runtime.requestStop();
+            });
 
         tc.Run("sceMpegDemuxPssRing dispatches registered video and audio stream callbacks", [](TestCase &t)
         {
@@ -2163,7 +2354,9 @@ void register_ps2_runtime_expansion_tests()
             t.Equals(gMpegStreamCallbackUserData.load(std::memory_order_acquire), kVideoUserData,
                      "video callback should receive registered user data");
 
-            const std::vector<uint8_t> audioPayload = {0x80u, 0x01u, 0x02u, 0x03u, 0x04u, 0x05u};
+            const std::vector<uint8_t> audioPayload = {
+                0xFFu, 0xA0u, 0x00u, 0x00u,
+                0x01u, 0x02u, 0x03u, 0x04u, 0x05u};
             const uint32_t audioPacketSize = writePesPacket(kAudioPacketAddr, 0xBDu, audioPayload);
 
             gMpegStreamCallbackCount.store(0u, std::memory_order_release);
@@ -2259,6 +2452,110 @@ void register_ps2_runtime_expansion_tests()
 
             t.Equals(gMpegStreamCallbackCount.load(std::memory_order_acquire), 1u,
                      "new MPEG create should allow callbacks for the next stream");
+
+            runtime.requestStop();
+        });
+
+        tc.Run("sceMpegDemuxPssRing filters private callbacks by registered stream ID", [](TestCase &t)
+        {
+            PS2Runtime runtime;
+            std::vector<uint8_t> rdram(PS2_RAM_SIZE, 0u);
+            ps2_stubs::resetMpegStubState(&runtime);
+
+            constexpr uint32_t kMpegAddr = 0x00123000u;
+            constexpr uint32_t kCallbackEntry = 0x00124000u;
+            constexpr uint32_t kPacketAddr = 0x00129000u;
+            constexpr uint32_t kDataStreamType = 3u;
+            constexpr uint32_t kSelectedStreamId = 0u;
+            constexpr uint32_t kCallbackUserData = 0x55667788u;
+
+            runtime.registerFunction(
+                kCallbackEntry, &testRecordMpegStreamCallback);
+
+            R5900Context addCtx{};
+            setRegU32(addCtx, 4, kMpegAddr);
+            setRegU32(addCtx, 5, kDataStreamType);
+            setRegU32(addCtx, 6, kSelectedStreamId);
+            setRegU32(addCtx, 7, kCallbackEntry);
+            setRegU32(addCtx, 8, kCallbackUserData);
+            ps2_stubs::sceMpegAddStrCallback(
+                rdram.data(), &addCtx, &runtime);
+
+            const auto makePrivatePacket = [](uint8_t streamId, uint8_t marker)
+            {
+                const std::vector<uint8_t> payload = {
+                    0xFFu, 0xA1u, 0x00u, streamId,
+                    marker, 0x21u, 0x43u, 0x65u};
+                const uint16_t packetLen =
+                    static_cast<uint16_t>(payload.size() + 3u);
+                std::vector<uint8_t> packet = {
+                    0x00u, 0x00u, 0x01u, 0xBDu,
+                    static_cast<uint8_t>(packetLen >> 8u),
+                    static_cast<uint8_t>(packetLen & 0xFFu),
+                    0x80u, 0x00u, 0x00u};
+                packet.insert(
+                    packet.end(), payload.begin(), payload.end());
+                return packet;
+            };
+
+            const std::vector<uint8_t> unselectedPacket =
+                makePrivatePacket(2u, 0x22u);
+            const std::vector<uint8_t> selectedPacket =
+                makePrivatePacket(0u, 0x00u);
+            std::vector<uint8_t> input = unselectedPacket;
+            input.insert(
+                input.end(), selectedPacket.begin(), selectedPacket.end());
+            std::memcpy(
+                rdram.data() + kPacketAddr, input.data(), input.size());
+
+            {
+                std::lock_guard<std::mutex> lock(
+                    gMpegStreamCallbackPayloadMutex);
+                gMpegStreamCallbackPayload.clear();
+            }
+            gMpegStreamCallbackCount.store(
+                0u, std::memory_order_release);
+            gMpegStreamCallbackReturn.store(
+                1u, std::memory_order_release);
+
+            R5900Context demuxCtx{};
+            setRegU32(demuxCtx, 4, kMpegAddr);
+            setRegU32(demuxCtx, 5, kPacketAddr);
+            setRegU32(
+                demuxCtx, 6, static_cast<uint32_t>(input.size()));
+            setRegU32(demuxCtx, 7, kPacketAddr);
+            setRegU32(
+                demuxCtx, 8, static_cast<uint32_t>(input.size()));
+            ps2_stubs::sceMpegDemuxPssRing(
+                rdram.data(), &demuxCtx, &runtime);
+
+            std::vector<uint8_t> observedPayload;
+            {
+                std::lock_guard<std::mutex> lock(
+                    gMpegStreamCallbackPayloadMutex);
+                observedPayload = gMpegStreamCallbackPayload;
+            }
+            const std::vector<uint8_t> expectedPayload(
+                selectedPacket.begin() + 9,
+                selectedPacket.end());
+
+            t.Equals(
+                getRegS32(demuxCtx, 2),
+                static_cast<int32_t>(input.size()),
+                "demux should consume selected and unselected stream packets");
+            t.Equals(
+                gMpegStreamCallbackCount.load(
+                    std::memory_order_acquire),
+                1u,
+                "only the registered private stream ID should dispatch a callback");
+            t.Equals(
+                gMpegStreamCallbackUserData.load(
+                    std::memory_order_acquire),
+                kCallbackUserData,
+                "the selected stream callback should receive its user data");
+            t.IsTrue(
+                observedPayload == expectedPayload,
+                "the callback should receive the selected stream payload");
 
             runtime.requestStop();
         });
@@ -2388,6 +2685,7 @@ void register_ps2_runtime_expansion_tests()
             constexpr uint32_t kPacketAddr = 0x00129000u;
             constexpr uint32_t kDataStreamType = 3u;
             const std::vector<uint8_t> payload = {
+                0xFFu, 0xA1u, 0x00u, 0x00u,
                 0x21u, 0x43u, 0x65u, 0x87u, 0xA9u, 0xCBu};
 
             runtime.configureGuestHeap(0x01F00000u, 0x01F00000u);
@@ -2453,6 +2751,7 @@ void register_ps2_runtime_expansion_tests()
             constexpr uint32_t kPacketOffset = 0x30u;
             constexpr uint32_t kDataStreamType = 3u;
             const std::vector<uint8_t> payload = {
+                0xFFu, 0xA1u, 0x00u, 0x00u,
                 0x10u, 0x21u, 0x32u, 0x43u, 0x54u, 0x65u, 0x76u, 0x87u,
                 0x98u, 0xA9u, 0xBAu, 0xCBu, 0xDCu, 0xEDu, 0xFEu, 0x0Fu};
 
@@ -2521,6 +2820,7 @@ void register_ps2_runtime_expansion_tests()
             constexpr uint32_t kPacketAddr = 0x00129000u;
             constexpr uint32_t kDataStreamType = 3u;
             const std::vector<uint8_t> payload = {
+                0xFFu, 0xA1u, 0x00u, 0x00u,
                 0x12u, 0x34u, 0x56u, 0x78u, 0x9Au, 0xBCu, 0xDEu, 0xF0u};
 
             runtime.registerFunction(kCallbackEntry, &testRecordMpegStreamCallback);
@@ -2617,10 +2917,13 @@ void register_ps2_runtime_expansion_tests()
             constexpr uint32_t kInputOffset = 0x28u;
             constexpr uint32_t kDataStreamType = 3u;
             const std::vector<uint8_t> firstPayload = {
+                0xFFu, 0xA1u, 0x00u, 0x00u,
                 0x10u, 0x21u, 0x32u, 0x43u, 0x54u, 0x65u, 0x76u, 0x87u};
             const std::vector<uint8_t> secondPayload = {
+                0xFFu, 0xA1u, 0x00u, 0x00u,
                 0x98u, 0xA9u, 0xBAu, 0xCBu, 0xDCu, 0xEDu, 0xFEu, 0x0Fu};
             const std::vector<uint8_t> thirdPayload = {
+                0xFFu, 0xA1u, 0x00u, 0x00u,
                 0x01u, 0x23u, 0x45u, 0x67u, 0x89u, 0xABu, 0xCDu, 0xEFu};
             const auto makePrivatePacket = [](const std::vector<uint8_t> &payload)
             {

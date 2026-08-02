@@ -999,22 +999,78 @@ public:
         std::vector<DebugVu0InstructionEntry> entries;
     };
 
+    class AsyncCallbackInvocationScope;
+
     class GuestExecutionScope
     {
     public:
         explicit GuestExecutionScope(
             PS2Runtime *runtime,
-            R5900Context *context = nullptr) noexcept;
+            R5900Context *context = nullptr,
+            int selectionHint = -1) noexcept;
         ~GuestExecutionScope();
 
         GuestExecutionScope(const GuestExecutionScope &) = delete;
         GuestExecutionScope &operator=(const GuestExecutionScope &) = delete;
 
     private:
+        friend class PS2Runtime;
+        friend class AsyncCallbackInvocationScope;
+
         PS2Runtime *m_runtime = nullptr;
         R5900Context *m_context = nullptr;
         R5900Context *m_previousContext = nullptr;
         int m_previousThreadId = 1;
+    };
+
+    // An asynchronous EE callback executes from a separate register context,
+    // but it still belongs to the continuation interrupted at the current
+    // boundary. This scope owns a complete snapshot and the continuation's
+    // identity for the duration of the callback. Active and explicit
+    // synchronous callbacks descend from their owned interrupted/caller
+    // stack, while a truly idle delivery uses the BIOS interrupt stack.
+    class AsyncCallbackInvocationScope
+    {
+    public:
+        AsyncCallbackInvocationScope(
+            PS2Runtime *runtime,
+            R5900Context *callbackContext);
+        AsyncCallbackInvocationScope(
+            PS2Runtime *runtime,
+            R5900Context *callbackContext,
+            R5900Context *continuationContext,
+            int continuationThreadId);
+        ~AsyncCallbackInvocationScope();
+
+        [[nodiscard]] uint32_t stackTop() const noexcept
+        {
+            return m_stackTop;
+        }
+
+        [[nodiscard]] int ownerThreadId() const noexcept
+        {
+            return m_ownerThreadId;
+        }
+
+        AsyncCallbackInvocationScope(
+            const AsyncCallbackInvocationScope &) = delete;
+        AsyncCallbackInvocationScope &operator=(
+            const AsyncCallbackInvocationScope &) = delete;
+
+    private:
+        friend class PS2Runtime;
+
+        PS2Runtime *m_runtime = nullptr;
+        GuestExecutionScope m_guestExecution;
+        R5900Context m_interruptedContext{};
+        R5900Context *m_continuationContext = nullptr;
+        std::shared_ptr<ThreadInfo> m_continuationOwner;
+        uint32_t m_continuationGeneration = 0u;
+        uint32_t m_stackTop = 0u;
+        uint32_t m_depth = 0u;
+        int m_ownerThreadId = 0;
+        bool m_idle = true;
+        bool m_active = false;
     };
 
     class GuestExecutionReleaseScope
@@ -1179,8 +1235,6 @@ public:
     uint32_t guestHeapBase() const;
     uint32_t guestHeapEnd() const;
     uint32_t guestHeapLimit() const;
-    uint32_t reserveAsyncCallbackStack(uint32_t size, uint32_t alignment = 16u);
-
     void executeGuestStep(uint8_t *rdram, R5900Context *ctx, RecompiledFunction function);
     void dispatchLoop(uint8_t *rdram, R5900Context *ctx);
 
@@ -1480,6 +1534,16 @@ private:
     enum class EeVSyncVideoModeClass : uint8_t;
     struct PendingVSyncDelivery;
 
+    struct EeInterruptedContinuationFrame
+    {
+        R5900Context context{};
+        R5900Context *continuationContext = nullptr;
+        std::shared_ptr<ThreadInfo> continuationOwner;
+        uint32_t generation = 0u;
+        int threadId = 0;
+        bool idle = true;
+    };
+
     struct GuestHeapBlock
     {
         uint32_t addr = 0;
@@ -1498,16 +1562,33 @@ private:
     uint32_t allocateGuestBlockLocked(uint32_t size, uint32_t alignment);
     void freeGuestBlockLocked(uint32_t guestAddr);
     void coalesceGuestHeapLocked();
+    [[nodiscard]] EeInterruptedContinuationFrame
+    makeEeInterruptedContinuation(
+        R5900Context *context,
+        int threadId,
+        bool retainDormantContext = false);
+    void captureEeInterruptContinuation(
+        R5900Context *context,
+        int threadId);
+    void captureEeInterruptContinuation(
+        std::optional<int> threadId);
+    void clearEeInterruptContinuation() noexcept;
+    void beginAsyncCallbackInvocation(
+        AsyncCallbackInvocationScope &scope,
+        R5900Context *continuationContext = nullptr,
+        int continuationThreadId = -1);
+    void endAsyncCallbackInvocation(
+        AsyncCallbackInvocationScope &scope) noexcept;
     R5900Context *enterGuestExecution(
         R5900Context *context,
         int *previousThreadId = nullptr,
-        int selectionHint = 0);
+        int selectionHint = -1);
     bool tryEnterGuestExecution(
         R5900Context *context,
         std::chrono::milliseconds timeout,
         R5900Context *&previousContext,
         int &previousThreadId,
-        int selectionHint = 0);
+        int selectionHint = -1);
     void lockGuestExecutionMutex(bool mayContend);
     void recordOuterGuestExecutionAcquisition(
         R5900Context *context) noexcept;
@@ -1747,7 +1828,7 @@ private:
     void selectEeThread(int threadId) noexcept;
     void switchGuestExecutionContext(
         R5900Context *context,
-        int selectionHint = 0) noexcept;
+        int selectionHint = -1) noexcept;
     void restoreGuestExecutionContext(
         R5900Context *context,
         R5900Context *previousContext,
@@ -1938,6 +2019,9 @@ private:
         m_eeExecutorDispatchStartTick{};
     R5900Context *m_boundEeContext = nullptr;
     int m_boundEeThreadId = 1;
+    std::optional<EeInterruptedContinuationFrame>
+        m_eeInterruptedContinuation;
+    uint32_t m_asyncCallbackInvocationDepth = 0u;
     mutable std::recursive_timed_mutex m_guestExecutionMutex;
     mutable std::atomic<uint32_t> m_guestExecutionWaiters{0u};
     mutable std::mutex m_legacyDeferredEeWakeMutex;
@@ -1997,15 +2081,12 @@ private:
     std::atomic<uint64_t> m_dmacInterruptDrainPasses{0u};
     std::vector<DmacPendingInterrupt> m_pendingDmacInterrupts;
     mutable std::mutex m_guestHeapMutex;
-    mutable std::mutex m_asyncCallbackStackMutex;
     std::vector<GuestHeapBlock> m_guestHeapBlocks;
     uint32_t m_guestHeapBase = 0x00100000u;
     uint32_t m_guestHeapEnd = 0x00100000u;
     uint32_t m_guestHeapLimit = PS2_RAM_SIZE;
     uint32_t m_guestHeapSuggestedBase = 0x00100000u;
     bool m_guestHeapConfigured = false;
-    uint32_t m_asyncCallbackStackFloor = 0x01F00000u;
-    uint32_t m_asyncCallbackStackTop = PS2_RAM_SIZE;
 
     std::atomic<uint32_t> m_missingFunctionPolicy{static_cast<uint32_t>(MissingFunctionPolicy::ContinueToTarget)};
     std::atomic<bool> m_missingFunctionReported{false};

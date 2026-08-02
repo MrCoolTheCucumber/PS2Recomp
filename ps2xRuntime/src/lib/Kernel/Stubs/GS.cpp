@@ -756,14 +756,10 @@ namespace ps2_stubs
         try
         {
             EeAsyncCallbackContextLease callbackLease(
-                state, *runtime);
+                state);
             R5900Context &callbackCtx =
                 callbackLease.context();
             SET_GPR_U32(&callbackCtx, 28, gp);
-            SET_GPR_U32(
-                &callbackCtx,
-                29,
-                callbackLease.stackTop());
             SET_GPR_U32(&callbackCtx, 31, 0u);
             SET_GPR_U32(&callbackCtx, 4, static_cast<uint32_t>(callbackTick));
             callbackCtx.pc = callback;
@@ -775,23 +771,28 @@ namespace ps2_stubs
                         std::memory_order_relaxed);
             const bool shouldLogDispatch =
                 dispatchLogIndex < 64u;
-            if (shouldLogDispatch)
-            {
-                PS2_IF_AGRESSIVE_LOGS({
-                    RUNTIME_LOG("[sceGsSyncVCallback:dispatch] cb=0x" << std::hex << callback
-                                                                      << " gp=0x" << gp
-                                                                      << " sp=0x" << getRegU32(&callbackCtx, 29)
-                                                                      << " tick=0x" << callbackTick
-                                                                      << std::dec << std::endl);
-                });
-            }
 
             uint32_t steps = 0u;
             bool reschedulePending = false;
             uint64_t handoffBaseline = 0u;
             {
-                PS2Runtime::GuestExecutionScope guestExecution(
+                PS2Runtime::AsyncCallbackInvocationScope
+                    callbackExecution(
                     runtime, &callbackCtx);
+                SET_GPR_U32(
+                    &callbackCtx,
+                    29,
+                    callbackExecution.stackTop());
+                if (shouldLogDispatch)
+                {
+                    PS2_IF_AGRESSIVE_LOGS({
+                        RUNTIME_LOG("[sceGsSyncVCallback:dispatch] cb=0x" << std::hex << callback
+                                                                          << " gp=0x" << gp
+                                                                          << " sp=0x" << getRegU32(&callbackCtx, 29)
+                                                                          << " tick=0x" << callbackTick
+                                                                          << std::dec << std::endl);
+                    });
+                }
                 PS2Runtime::DeferredGuestYieldScope deferYield(reschedulePending);
 
                 while (callbackCtx.pc != 0u && !runtime->isStopRequested() && steps < 1024u)

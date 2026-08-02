@@ -564,7 +564,7 @@ static bool rpcInvokeFunction(uint8_t *rdram, R5900Context *ctx, PS2Runtime *run
     constexpr uint32_t kRpcInvokeMaxSteps = 0x8000u;
 
     EeAsyncCallbackContextLease callbackContext(
-        runtime->eeInterruptRuntimeState(), *runtime);
+        runtime->eeInterruptRuntimeState());
     R5900Context &tmp = callbackContext.context();
     tmp = *ctx;
     setRegU32(&tmp, 4, a0);
@@ -572,43 +572,51 @@ static bool rpcInvokeFunction(uint8_t *rdram, R5900Context *ctx, PS2Runtime *run
     setRegU32(&tmp, 6, a2);
     setRegU32(&tmp, 7, a3);
 
-    setRegU32(&tmp, 29, callbackContext.stackTop());
-
-    setRegU32(&tmp, 31, kRpcInvokeReturnSentinel);
-    tmp.pc = funcAddr;
-
     uint32_t steps = 0u;
     uint32_t lastPc = 0xFFFFFFFFu;
     uint32_t samePcCount = 0u;
     RpcInvokeExitReason exitReason = RpcInvokeExitReason::MissingFunction;
-    while (tmp.pc != 0u &&
-           tmp.pc != kRpcInvokeReturnSentinel &&
-           runtime->hasFunction(tmp.pc) &&
-           steps < kRpcInvokeMaxSteps)
+    const int continuationThreadId =
+        runtime->currentEeThreadId();
     {
-        const uint32_t pc = tmp.pc;
-        if (pc == lastPc)
-        {
-            ++samePcCount;
-            if (samePcCount > 0x2000u)
-            {
-                exitReason = RpcInvokeExitReason::SamePcLimit;
-                break;
-            }
-        }
-        else
-        {
-            lastPc = pc;
-            samePcCount = 0u;
-        }
+        PS2Runtime::AsyncCallbackInvocationScope
+            callbackExecution(
+                runtime,
+                &tmp,
+                ctx,
+                continuationThreadId);
+        setRegU32(
+            &tmp, 29,
+            callbackExecution.stackTop());
+        setRegU32(&tmp, 31, kRpcInvokeReturnSentinel);
+        tmp.pc = funcAddr;
 
-        PS2Runtime::RecompiledFunction func = runtime->lookupFunction(pc);
+        while (tmp.pc != 0u &&
+               tmp.pc != kRpcInvokeReturnSentinel &&
+               runtime->hasFunction(tmp.pc) &&
+               steps < kRpcInvokeMaxSteps)
         {
-            PS2Runtime::GuestExecutionScope guestExecution(
-                runtime, &tmp);
+            const uint32_t pc = tmp.pc;
+            if (pc == lastPc)
+            {
+                ++samePcCount;
+                if (samePcCount > 0x2000u)
+                {
+                    exitReason = RpcInvokeExitReason::SamePcLimit;
+                    break;
+                }
+            }
+            else
+            {
+                lastPc = pc;
+                samePcCount = 0u;
+            }
+
+            PS2Runtime::RecompiledFunction func =
+                runtime->lookupFunction(pc);
             runtime->executeGuestStep(rdram, &tmp, func);
+            ++steps;
         }
-        ++steps;
     }
 
     if (outV0)
