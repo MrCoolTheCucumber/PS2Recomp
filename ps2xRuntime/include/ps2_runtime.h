@@ -1288,6 +1288,8 @@ public:
         std::chrono::milliseconds timeout =
             std::chrono::seconds(30));
     DebugStopInfo debugRunUntilPc(uint32_t pc, std::chrono::milliseconds timeout);
+    DebugStopInfo debugRunForVSyncFields(
+        uint64_t count, std::chrono::milliseconds timeout);
     DebugStopInfo debugStepDispatches(uint64_t count, std::chrono::milliseconds timeout);
     R5900Context debugCpuSnapshot();
     DebugEeTiming debugEeTimingSnapshot();
@@ -2151,6 +2153,8 @@ private:
     DebugStopInfo m_debugLastStop{};
     bool m_debugRunUntilActive = false;
     uint32_t m_debugRunUntilPc = 0u;
+    bool m_debugRunForVSyncFieldsActive = false;
+    uint64_t m_debugRunForVSyncFieldsTarget = 0u;
     bool m_debugStepActive = false;
     uint64_t m_debugStepRemaining = 0u;
     bool m_debugSkipBreakpoint = false;

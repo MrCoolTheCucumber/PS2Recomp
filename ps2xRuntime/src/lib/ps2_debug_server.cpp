@@ -3188,6 +3188,45 @@ struct PS2DebugServer::Impl
         return result;
     }
 
+    Value runForVSyncFields(const Value *params, Allocator &allocator)
+    {
+        const uint64_t count = requiredUnsigned(params, "fields");
+        if (count == 0u || count > 1000000u)
+        {
+            throw RequestError(
+                -32602, "fields must be between 1 and 1000000");
+        }
+        const uint64_t timeout = timeoutMs(params);
+        const PS2Runtime::DebugStopInfo stop =
+            runtime.debugRunForVSyncFields(
+                count, std::chrono::milliseconds(timeout));
+        if (!stop.completed)
+        {
+            throw RequestError(-32002, "run-for-vsync-fields " + stop.reason);
+        }
+        Value result(rapidjson::kObjectType);
+        addString(result, "reason", stop.reason, allocator);
+        addString(result, "cpu", "ee", allocator);
+        addString(result, "pc", addressString(stop.pc), allocator);
+        result.AddMember("fields", count, allocator);
+        result.AddMember("sequence", stop.sequence, allocator);
+        result.AddMember("timeout_ms", timeout, allocator);
+        return result;
+    }
+
+    Value clearGsHistory(Allocator &allocator)
+    {
+        if (!runtime.debugIsPaused())
+        {
+            throw RequestError(
+                -32001, "GS history can only be cleared while paused");
+        }
+        runtime.gs().clearDebugHistory();
+        Value result(rapidjson::kObjectType);
+        result.AddMember("cleared", true, allocator);
+        return result;
+    }
+
     void addArtifact(Value &artifacts,
                      const std::filesystem::path &path,
                      std::string_view kind,
@@ -4271,9 +4310,17 @@ struct PS2DebugServer::Impl
         {
             return runUntil(params, allocator);
         }
+        if (method == "execution.runForVSyncFields")
+        {
+            return runForVSyncFields(params, allocator);
+        }
         if (method == "execution.step")
         {
             return step(params, allocator);
+        }
+        if (method == "gs.history.clear")
+        {
+            return clearGsHistory(allocator);
         }
         if (method == "capture.create")
         {

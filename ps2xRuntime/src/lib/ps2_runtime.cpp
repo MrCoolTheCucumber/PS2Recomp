@@ -8829,6 +8829,7 @@ void PS2Runtime::debugRefreshControlActiveLocked()
     const bool active =
         m_debugPauseRequested.load(std::memory_order_relaxed) ||
         m_debugRunUntilActive ||
+        m_debugRunForVSyncFieldsActive ||
         m_debugStepActive ||
         !m_debugBreakpoints.empty() ||
         !m_debugWatchpoints.empty();
@@ -9139,6 +9140,7 @@ void PS2Runtime::debugBlockGuestAtBoundary(R5900Context *ctx, const char *reason
         std::lock_guard<std::mutex> lock(m_debugControlMutex);
         m_debugPauseRequested.store(true, std::memory_order_release);
         m_debugRunUntilActive = false;
+        m_debugRunForVSyncFieldsActive = false;
         m_debugStepActive = false;
         m_debugStepRemaining = 0u;
         debugRecordStopLocked(reason, pc);
@@ -9221,6 +9223,12 @@ void PS2Runtime::debugBeforeGuestStep(R5900Context *ctx)
         {
             stopReason = "predicate";
         }
+        else if (m_debugRunForVSyncFieldsActive &&
+                 m_debugVSyncFields.load(std::memory_order_relaxed) >=
+                     m_debugRunForVSyncFieldsTarget)
+        {
+            stopReason = "vsync-fields";
+        }
         else
         {
             const bool hasBreakpoint =
@@ -9301,6 +9309,7 @@ bool PS2Runtime::debugPause(std::chrono::milliseconds timeout)
             newlyRequested = true;
             m_debugPauseRequested.store(true, std::memory_order_release);
             m_debugRunUntilActive = false;
+            m_debugRunForVSyncFieldsActive = false;
             m_debugStepActive = false;
             m_debugStepRemaining = 0u;
             debugRecordStopLocked("pause", m_debugPc.load(std::memory_order_relaxed));
@@ -9374,6 +9383,7 @@ void PS2Runtime::debugResume()
             m_debugSkipBreakpointPc = m_debugLastStop.pc;
         }
         m_debugRunUntilActive = false;
+        m_debugRunForVSyncFieldsActive = false;
         m_debugStepActive = false;
         m_debugStepRemaining = 0u;
         m_debugPauseRequested.store(false, std::memory_order_release);
@@ -9528,6 +9538,7 @@ PS2Runtime::DebugStopInfo PS2Runtime::debugRunUntilPc(
         baseline = m_debugStopSequence;
         m_debugRunUntilActive = true;
         m_debugRunUntilPc = pc;
+        m_debugRunForVSyncFieldsActive = false;
         m_debugStepActive = false;
         m_debugPauseRequested.store(false, std::memory_order_release);
         debugRefreshControlActiveLocked();
@@ -9576,6 +9587,74 @@ PS2Runtime::DebugStopInfo PS2Runtime::debugRunUntilPc(
             m_debugStopSequence};
 }
 
+PS2Runtime::DebugStopInfo PS2Runtime::debugRunForVSyncFields(
+    uint64_t count, std::chrono::milliseconds timeout)
+{
+    m_debugControlActive.store(true, std::memory_order_release);
+    if (count == 0u)
+    {
+        return {false, "invalid-count", m_debugPc.load(std::memory_order_relaxed), 0u};
+    }
+    if (!debugPause(timeout))
+    {
+        return {false, "pause-timeout", m_debugPc.load(std::memory_order_relaxed), 0u};
+    }
+
+    const uint64_t current =
+        m_debugVSyncFields.load(std::memory_order_relaxed);
+    if (count > std::numeric_limits<uint64_t>::max() - current)
+    {
+        return {false, "count-overflow", m_debugPc.load(std::memory_order_relaxed), 0u};
+    }
+
+    uint64_t baseline = 0u;
+    {
+        std::lock_guard<std::mutex> lock(m_debugControlMutex);
+        baseline = m_debugStopSequence;
+        m_debugRunUntilActive = false;
+        m_debugRunForVSyncFieldsActive = true;
+        m_debugRunForVSyncFieldsTarget = current + count;
+        m_debugStepActive = false;
+        m_debugStepRemaining = 0u;
+        m_debugPauseRequested.store(false, std::memory_order_release);
+        debugRefreshControlActiveLocked();
+    }
+    if (m_eeRuntimeExecutor)
+    {
+        m_eeRuntimeExecutor->debugResume();
+    }
+    m_debugControlCv.notify_all();
+    m_audioBackend.setDebuggerPaused(false);
+
+    {
+        std::unique_lock<std::mutex> lock(m_debugControlMutex);
+        if (m_debugControlCv.wait_for(lock, timeout, [this, baseline]()
+                                      { return (m_debugStopSequence > baseline &&
+                                                m_debugPauseRequested.load(std::memory_order_acquire)) ||
+                                               isStopRequested(); }))
+        {
+            if (m_debugStopSequence > baseline)
+            {
+                const DebugStopInfo stop = m_debugLastStop;
+                lock.unlock();
+                if (m_eeRuntimeExecutor &&
+                    !m_eeRuntimeExecutor->debugWaitUntilPaused(timeout))
+                {
+                    return {false, "pause-timeout", stop.pc, stop.sequence};
+                }
+                return stop;
+            }
+            return {false, "stopped", m_debugPc.load(std::memory_order_relaxed),
+                    m_debugStopSequence};
+        }
+        m_debugRunForVSyncFieldsActive = false;
+    }
+
+    (void)debugPause(timeout);
+    return {false, "timeout", m_debugPc.load(std::memory_order_relaxed),
+            m_debugStopSequence};
+}
+
 PS2Runtime::DebugStopInfo PS2Runtime::debugStepDispatches(
     uint64_t count, std::chrono::milliseconds timeout)
 {
@@ -9594,6 +9673,7 @@ PS2Runtime::DebugStopInfo PS2Runtime::debugStepDispatches(
         std::lock_guard<std::mutex> lock(m_debugControlMutex);
         baseline = m_debugStopSequence;
         m_debugRunUntilActive = false;
+        m_debugRunForVSyncFieldsActive = false;
         m_debugStepActive = true;
         m_debugStepRemaining = count;
         m_debugPauseRequested.store(false, std::memory_order_release);
@@ -11163,6 +11243,7 @@ void PS2Runtime::requestStop()
     {
         std::lock_guard<std::mutex> lock(m_debugControlMutex);
         m_debugRunUntilActive = false;
+        m_debugRunForVSyncFieldsActive = false;
         m_debugStepActive = false;
         m_debugStepRemaining = 0u;
         m_debugPauseRequested.store(false, std::memory_order_release);
