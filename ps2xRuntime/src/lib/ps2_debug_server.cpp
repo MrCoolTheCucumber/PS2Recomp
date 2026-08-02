@@ -2,6 +2,7 @@
 
 #include "ThreadNaming.h"
 #include "Kernel/Stubs/Pad.h"
+#include "Kernel/Syscalls/Helpers/State.h"
 #include "ps2_runtime.h"
 #include "ps2_syscalls.h"
 #include "runtime/ps2_vu_program_cache.h"
@@ -1900,6 +1901,77 @@ struct PS2DebugServer::Impl
             branchValues.PushBack(entry, allocator);
         }
         result.AddMember("branches", branchValues, allocator);
+
+        Value rpcValue(rapidjson::kObjectType);
+        Value rpcEvents(rapidjson::kArrayType);
+        std::vector<SifRpcDebugEvent> rpcHistory;
+        uint64_t nextRpcSequence = 0u;
+        {
+            EeRpcRuntimeState &rpcState =
+                runtime.eeRpcRuntimeState();
+            std::lock_guard<std::mutex> lock(rpcState.rpcMutex);
+            nextRpcSequence = rpcState.nextDebugSequence;
+            rpcHistory.reserve(kSifRpcDebugHistoryCount);
+            for (const SifRpcDebugEvent &event : rpcState.debugHistory)
+            {
+                if (event.seq != 0u)
+                {
+                    rpcHistory.push_back(event);
+                }
+            }
+        }
+        std::sort(
+            rpcHistory.begin(), rpcHistory.end(),
+            [](const SifRpcDebugEvent &left,
+               const SifRpcDebugEvent &right)
+            {
+                return left.seq < right.seq;
+            });
+        for (const SifRpcDebugEvent &event : rpcHistory)
+        {
+            Value entry(rapidjson::kObjectType);
+            entry.AddMember("sequence", event.seq, allocator);
+            addString(entry, "operation",
+                      event.op ? event.op : "", allocator);
+            addString(entry, "pc", addressString(event.pc), allocator);
+            addString(entry, "ra", addressString(event.ra), allocator);
+            entry.AddMember("thread_id", event.threadId, allocator);
+            entry.AddMember("sid", event.sid, allocator);
+            entry.AddMember("rpc", event.rpcNum, allocator);
+            addString(entry, "client",
+                      addressString(event.clientPtr), allocator);
+            addString(entry, "server",
+                      addressString(event.serverPtr), allocator);
+            addString(entry, "send_buffer",
+                      addressString(event.sendBuf), allocator);
+            entry.AddMember("send_size", event.sendSize, allocator);
+            addString(entry, "receive_buffer",
+                      addressString(event.recvBuf), allocator);
+            entry.AddMember("receive_size", event.recvSize, allocator);
+            addString(entry, "result_pointer",
+                      addressString(event.resultPtr), allocator);
+            entry.AddMember("mode", event.mode, allocator);
+            addString(entry, "end_function",
+                      addressString(event.endFunc), allocator);
+            addString(entry, "end_parameter",
+                      addressString(event.endParam), allocator);
+            entry.AddMember("semaphore_id", event.semaId, allocator);
+            entry.AddMember("flags", event.flags, allocator);
+            entry.AddMember("result", event.result, allocator);
+            addString(
+                entry, "send_preview",
+                hexBytes(event.sendPreview, event.sendPreviewSize),
+                allocator);
+            addString(
+                entry, "receive_preview",
+                hexBytes(event.recvPreview, event.recvPreviewSize),
+                allocator);
+            rpcEvents.PushBack(entry, allocator);
+        }
+        rpcValue.AddMember(
+            "next_sequence", nextRpcSequence, allocator);
+        rpcValue.AddMember("events", rpcEvents, allocator);
+        result.AddMember("sif_rpc", rpcValue, allocator);
 
         bool hasMainThread = false;
         Value threadValues(rapidjson::kArrayType);

@@ -11,7 +11,8 @@
 struct RpcServerState
 {
     uint32_t sid = 0;
-    uint32_t sd_ptr = 0; // PS2 address
+    uint32_t sd_ptr = 0; // Opaque IOP handle or EE address.
+    bool guestBacked = false;
 };
 
 struct RpcClientState
@@ -69,11 +70,10 @@ struct SifModuleRecord
     bool loaded = false;
 };
 
-// SIF RPC registries, guest-visible allocation cursors, diagnostic history,
-// and IOP module bookkeeping belong to one emulated machine. Keeping the
-// call mutex in the same state also permits independent runtimes to execute
-// RPC callbacks concurrently while retaining recursive calls within one
-// runtime.
+// SIF RPC registries, opaque IOP-handle cursors, diagnostic history, and IOP
+// module bookkeeping belong to one emulated machine. Keeping the call mutex
+// in the same state also permits independent runtimes to execute RPC callbacks
+// concurrently while retaining recursive calls within one runtime.
 struct EeRpcRuntimeState
 {
     std::mutex rpcMutex;

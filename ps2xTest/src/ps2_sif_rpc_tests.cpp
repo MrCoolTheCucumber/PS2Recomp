@@ -277,7 +277,7 @@ void register_ps2_sif_rpc_tests()
 {
     MiniTest::Case("PS2SifRpc", [](TestCase &tc)
     {
-        tc.Run("RPC registries allocators and callback stacks are isolated per runtime", [](TestCase &t)
+        tc.Run("RPC registries opaque handles and callback stacks are isolated per runtime", [](TestCase &t)
         {
             TestEnv first;
             TestEnv second;
@@ -296,6 +296,22 @@ void register_ps2_sif_rpc_tests()
             constexpr uint32_t kSecondClientAddr =
                 0x00021100u;
             constexpr uint32_t kSid = 0x2F00ABCDu;
+            constexpr uint32_t kFirstServerHandle =
+                0x01F10000u;
+            std::array<uint8_t, 0x80> serverSentinel{};
+            for (size_t i = 0; i < serverSentinel.size(); ++i)
+            {
+                serverSentinel[i] =
+                    static_cast<uint8_t>(0x40u + i);
+            }
+            std::memcpy(
+                first.rdram.data() + kFirstServerHandle,
+                serverSentinel.data(),
+                serverSentinel.size());
+            std::memcpy(
+                second.rdram.data() + kFirstServerHandle,
+                serverSentinel.data(),
+                serverSentinel.size());
 
             auto bind =
                 [&](TestEnv &env, uint32_t clientAddr)
@@ -323,23 +339,23 @@ void register_ps2_sif_rpc_tests()
             t.Equals(
                 secondClient.server,
                 firstClient.server,
-                "each runtime should independently allocate the same first placeholder server address");
+                "each runtime should independently allocate the same first opaque server handle");
             t.Equals(
-                static_cast<uint32_t>(
-                    readGuestStruct<SifRpcServerData>(
-                        first.rdram.data(),
-                        firstClient.server)
-                        .sid),
-                kSid,
-                "the first runtime should populate its placeholder server");
-            t.Equals(
-                static_cast<uint32_t>(
-                    readGuestStruct<SifRpcServerData>(
-                        second.rdram.data(),
-                        secondClient.server)
-                        .sid),
-                kSid,
-                "the second runtime should populate its own placeholder server");
+                firstClient.server,
+                kFirstServerHandle,
+                "the first opaque server handle should remain stable");
+            t.IsTrue(
+                std::memcmp(
+                    first.rdram.data() + kFirstServerHandle,
+                    serverSentinel.data(),
+                    serverSentinel.size()) == 0,
+                "allocating the first runtime's IOP handle must preserve numerically corresponding EE memory");
+            t.IsTrue(
+                std::memcmp(
+                    second.rdram.data() + kFirstServerHandle,
+                    serverSentinel.data(),
+                    serverSentinel.size()) == 0,
+                "allocating the second runtime's IOP handle must preserve numerically corresponding EE memory");
 
             constexpr uint32_t kFirstPathAddr =
                 0x00021200u;
@@ -829,6 +845,56 @@ void register_ps2_sif_rpc_tests()
                      "989snd configure RPC should set the trailing sentinel");
         });
 
+        tc.Run("Sony 989snd bank-reference RPC preserves the shared result", [](TestCase &t)
+        {
+            TestEnv env;
+
+            constexpr uint32_t kSendAddr = 0x00035B00u;
+            constexpr uint32_t kRecvAddr = 0x00035B20u;
+            constexpr std::array<uint32_t, 6> kOpenRequest{
+                0x400u,
+                0x1000u,
+                0x400u,
+                0u,
+                5u,
+                3u,
+            };
+            writeGuestStruct(env.rdram.data(), kSendAddr, kOpenRequest);
+
+            const ps2x::iop::RpcResult openResult =
+                callIop(env, IOP_SID_SONY_989SND, 0x3Bu,
+                        kSendAddr, sizeof(kOpenRequest), kRecvAddr, 12u);
+            const uint32_t previousResult =
+                readGuestStruct<uint32_t>(env.rdram.data(), kRecvAddr + 4u);
+            t.IsTrue(openResult.handled && previousResult > 1u,
+                     "989snd streaming open should seed a distinct shared result");
+
+            std::memset(env.rdram.data() + kRecvAddr, 0, 12u);
+            const ps2x::iop::RpcResult result =
+                callIop(env, IOP_SID_SONY_989SND, 0x08u,
+                        0u, 0u, kRecvAddr, 12u);
+
+            t.IsTrue(result.handled,
+                     "989snd bank-reference RPC should be handled");
+            t.Equals(result.resultAddress, kRecvAddr,
+                     "989snd bank-reference RPC should return the receive buffer");
+            t.Equals(readGuestStruct<uint32_t>(env.rdram.data(), kRecvAddr + 0u),
+                     0xFFFFFFFFu,
+                     "989snd bank-reference response should begin with a sentinel");
+            t.Equals(readGuestStruct<uint32_t>(env.rdram.data(), kRecvAddr + 4u),
+                     previousResult,
+                     "989snd bank-reference RPC should preserve the shared result word");
+            t.Equals(readGuestStruct<uint32_t>(env.rdram.data(), kRecvAddr + 8u),
+                     0xFFFFFFFFu,
+                     "989snd bank-reference response should end with a sentinel");
+
+            const ps2x::iop::RpcResult malformedResult =
+                callIop(env, IOP_SID_SONY_989SND, 0x08u,
+                        kSendAddr, sizeof(uint32_t), kRecvAddr, 12u);
+            t.IsFalse(malformedResult.handled,
+                      "989snd bank-reference RPC should reject a payload");
+        });
+
         tc.Run("Sony 989snd streaming open returns an allocated work area", [](TestCase &t)
         {
             TestEnv env;
@@ -1174,6 +1240,70 @@ void register_ps2_sif_rpc_tests()
             t.Equals(readGuestStruct<uint32_t>(env.rdram.data(), kRecvAddr + 8u),
                      0xFFFFFFFFu,
                      "989snd command 0x51 should set the trailing sentinel");
+        });
+
+        tc.Run("Sony 989snd command 0x50 returns its zero completion result", [](TestCase &t)
+        {
+            TestEnv env;
+
+            constexpr uint32_t kSendAddr = 0x00035B80u;
+            constexpr uint32_t kRecvAddr = 0x00035BA0u;
+            constexpr std::array<uint32_t, 7> kCommand{
+                1u,
+                (5u * sizeof(uint32_t) << 16u) | 0x50u,
+                2u,
+                1u,
+                1u,
+                1u,
+                1u,
+            };
+            writeGuestStruct(env.rdram.data(), kSendAddr, kCommand);
+            std::memset(env.rdram.data() + kRecvAddr, 0xCC, 12u);
+
+            const ps2x::iop::RpcResult result =
+                callIop(env, IOP_SID_SONY_989SND, 0x4Du,
+                        kSendAddr, sizeof(kCommand), kRecvAddr, 12u);
+
+            t.IsTrue(result.handled, "989snd command 0x50 should be handled");
+            t.Equals(readGuestStruct<uint32_t>(env.rdram.data(), kRecvAddr + 0u),
+                     0xFFFFFFFFu,
+                     "989snd command 0x50 should set the leading sentinel");
+            t.Equals(readGuestStruct<uint32_t>(env.rdram.data(), kRecvAddr + 4u),
+                     0u,
+                     "989snd command 0x50 should return zero");
+            t.Equals(readGuestStruct<uint32_t>(env.rdram.data(), kRecvAddr + 8u),
+                     0xFFFFFFFFu,
+                     "989snd command 0x50 should set the trailing sentinel");
+        });
+
+        tc.Run("Sony 989snd command 0x06 returns its bank-release result", [](TestCase &t)
+        {
+            TestEnv env;
+
+            constexpr uint32_t kSendAddr = 0x00035B80u;
+            constexpr uint32_t kRecvAddr = 0x00035BA0u;
+            constexpr std::array<uint32_t, 3> kCommand{
+                1u,
+                (sizeof(uint32_t) << 16u) | 0x06u,
+                0x00100010u,
+            };
+            writeGuestStruct(env.rdram.data(), kSendAddr, kCommand);
+            std::memset(env.rdram.data() + kRecvAddr, 0xCC, 12u);
+
+            const ps2x::iop::RpcResult result =
+                callIop(env, IOP_SID_SONY_989SND, 0x4Du,
+                        kSendAddr, sizeof(kCommand), kRecvAddr, 12u);
+
+            t.IsTrue(result.handled, "989snd command 0x06 should be handled");
+            t.Equals(readGuestStruct<uint32_t>(env.rdram.data(), kRecvAddr + 0u),
+                     0xFFFFFFFFu,
+                     "989snd command 0x06 should set the leading sentinel");
+            t.Equals(readGuestStruct<uint32_t>(env.rdram.data(), kRecvAddr + 4u),
+                     0u,
+                     "989snd command 0x06 should return zero");
+            t.Equals(readGuestStruct<uint32_t>(env.rdram.data(), kRecvAddr + 8u),
+                     0xFFFFFFFFu,
+                     "989snd command 0x06 should set the trailing sentinel");
         });
 
         tc.Run("Sony 989snd command 0x4e completes a twelve-byte batch", [](TestCase &t)
@@ -1603,7 +1733,76 @@ void register_ps2_sif_rpc_tests()
             t.Equals(getRegS32(env.ctx, 2), 0, "RECVX snddrv client should no longer be RPC-busy");
         });
 
-        tc.Run("bind before register creates placeholder then remaps", [](TestCase &t)
+        tc.Run("opaque IOP server handles never write EE RDRAM", [](TestCase &t)
+        {
+            TestEnv env;
+
+            constexpr uint32_t kClientAddr = 0x00023000u;
+            // Zero is a valid RPC service ID (for example, SNDDRV's command
+            // service), so it must not be confused with an unbound client.
+            constexpr uint32_t kSid = 0u;
+            constexpr uint32_t kFirstServerHandle = 0x01F10000u;
+            std::array<uint8_t, 0x80> reusedGuestBytes{};
+            for (size_t i = 0; i < reusedGuestBytes.size(); ++i)
+            {
+                reusedGuestBytes[i] =
+                    static_cast<uint8_t>(0xA0u ^ i);
+            }
+
+            SifInitRpc(env.rdram.data(), &env.ctx, &env.runtime);
+            std::memcpy(
+                env.rdram.data() + kFirstServerHandle,
+                reusedGuestBytes.data(),
+                reusedGuestBytes.size());
+
+            setRegU32(env.ctx, 4, kClientAddr);
+            setRegU32(env.ctx, 5, kSid);
+            setRegU32(env.ctx, 6, 0u);
+            SifBindRpc(env.rdram.data(), &env.ctx, &env.runtime);
+            t.Equals(
+                getRegS32(env.ctx, 2),
+                KE_OK,
+                "binding an HLE IOP service should succeed");
+
+            const SifRpcClientData client =
+                readGuestStruct<SifRpcClientData>(
+                    env.rdram.data(), kClientAddr);
+            t.Equals(
+                client.server,
+                kFirstServerHandle,
+                "binding should expose a stable nonzero opaque handle");
+            t.IsTrue(
+                std::memcmp(
+                    env.rdram.data() + kFirstServerHandle,
+                    reusedGuestBytes.data(),
+                    reusedGuestBytes.size()) == 0,
+                "binding must not allocate its opaque IOP handle in EE memory");
+
+            setRegU32(env.ctx, 4, kClientAddr);
+            setRegU32(env.ctx, 5, 0x55u);
+            setRegU32(env.ctx, 6, 0u);
+            setRegU32(env.ctx, 7, 0u);
+            setRegU32(env.ctx, 8, 0u);
+            setRegU32(env.ctx, 9, 0u);
+            setRegU32(env.ctx, 10, 0u);
+            setRegU32(env.ctx, 11, 0u);
+            setRegU32(env.ctx, 29, K_STACK_ADDR);
+            writeGuestU32(
+                env.rdram.data(), K_STACK_ADDR, 0u);
+            SifCallRpc(env.rdram.data(), &env.ctx, &env.runtime);
+            t.Equals(
+                getRegS32(env.ctx, 2),
+                KE_OK,
+                "calling through an opaque IOP handle should complete");
+            t.IsTrue(
+                std::memcmp(
+                    env.rdram.data() + kFirstServerHandle,
+                    reusedGuestBytes.data(),
+                    reusedGuestBytes.size()) == 0,
+                "SifCallRpc must not dereference an opaque IOP handle as EE memory");
+        });
+
+        tc.Run("bind before register creates opaque placeholder then remaps", [](TestCase &t)
         {
             TestEnv env;
 
@@ -1625,7 +1824,7 @@ void register_ps2_sif_rpc_tests()
             const SifRpcClientData clientBeforeRegister = readGuestStruct<SifRpcClientData>(env.rdram.data(), kClientAddr);
             t.IsTrue(clientBeforeRegister.server != 0u, "bind should allocate placeholder server when sid is missing");
             t.IsTrue(clientBeforeRegister.server >= 0x01F10000u && clientBeforeRegister.server < 0x01F20000u,
-                     "placeholder server should come from rpc server pool");
+                     "placeholder server should use the opaque IOP handle range");
             t.Equals(clientBeforeRegister.buf, 0u, "placeholder server starts with empty buf");
             t.Equals(clientBeforeRegister.cbuf, 0u, "placeholder server starts with empty cbuf");
 

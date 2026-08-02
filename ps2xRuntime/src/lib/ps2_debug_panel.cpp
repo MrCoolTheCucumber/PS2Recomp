@@ -994,6 +994,7 @@ namespace
         {
             uint32_t sid = 0;
             uint32_t sdPtr = 0;
+            bool guestBacked = false;
             bool readable = false;
             t_SifRpcServerData sd{};
         };
@@ -1030,7 +1031,9 @@ namespace
                 RpcServerRow row{};
                 row.sid = sid;
                 row.sdPtr = state.sd_ptr;
-                row.readable = readGuestObjectNoThrow(rdram, state.sd_ptr, row.sd);
+                row.guestBacked = state.guestBacked;
+                row.readable = state.guestBacked &&
+                               readGuestObjectNoThrow(rdram, state.sd_ptr, row.sd);
                 servers.push_back(row);
             }
 

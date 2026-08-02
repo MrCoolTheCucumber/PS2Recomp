@@ -187,13 +187,16 @@ static constexpr uint32_t kGuestSyscallMirrorLimit = 0x00080000u;
 static constexpr uint32_t kGuestSyscallTableProbeBase = 0x000002F0u;
 
 static constexpr uint32_t kRpcPacketSize = 64;
-static constexpr uint32_t kRpcPacketPoolBase = 0x01F00000;
-static constexpr uint32_t kRpcPacketPoolBytes = 0x00010000;
-static constexpr uint32_t kRpcPacketPoolCount = kRpcPacketPoolBytes / kRpcPacketSize;
-static constexpr uint32_t kRpcServerPoolBase = 0x01F10000;
-static constexpr uint32_t kRpcServerPoolBytes = 0x00010000;
+// IOP-side RPC pointers are opaque to EE software. These ranges provide
+// stable nonzero handle values only; they must never reserve or modify the
+// numerically corresponding EE RDRAM.
+static constexpr uint32_t kRpcPacketHandleBase = 0x01F00000;
+static constexpr uint32_t kRpcPacketHandleBytes = 0x00010000;
+static constexpr uint32_t kRpcPacketHandleCount = kRpcPacketHandleBytes / kRpcPacketSize;
+static constexpr uint32_t kRpcServerHandleBase = 0x01F10000;
+static constexpr uint32_t kRpcServerHandleBytes = 0x00010000;
 static constexpr uint32_t kRpcServerStride = 0x80;
-static constexpr uint32_t kRpcServerPoolCount = kRpcServerPoolBytes / kRpcServerStride;
+static constexpr uint32_t kRpcServerHandleCount = kRpcServerHandleBytes / kRpcServerStride;
 
 static constexpr uint32_t kTlsPoolBase = 0x01F20000;
 static constexpr uint32_t kTlsPoolBytes = 0x00010000;

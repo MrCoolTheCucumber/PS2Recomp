@@ -654,38 +654,30 @@ static bool rpcInvokeFunction(uint8_t *rdram, R5900Context *ctx, PS2Runtime *run
     return false;
 }
 
-static uint32_t rpcAllocPacketAddr(
-    uint8_t *rdram,
-    PS2Runtime *runtime)
+static uint32_t rpcAllocPacketHandle(PS2Runtime *runtime)
 {
-    if (!runtime || kRpcPacketPoolCount == 0)
+    if (!runtime || kRpcPacketHandleCount == 0)
         return 0;
 
     EeRpcRuntimeState &state =
         runtime->eeRpcRuntimeState();
     std::lock_guard<std::mutex> lock(state.rpcMutex);
     uint32_t slot =
-        state.packetIndex++ % kRpcPacketPoolCount;
-    uint32_t addr = kRpcPacketPoolBase + (slot * kRpcPacketSize);
-    rpcZeroRdram(rdram, addr, kRpcPacketSize);
-    return addr;
+        state.packetIndex++ % kRpcPacketHandleCount;
+    return kRpcPacketHandleBase + (slot * kRpcPacketSize);
 }
 
-static uint32_t rpcAllocServerAddr(
-    uint8_t *rdram,
-    PS2Runtime *runtime)
+static uint32_t rpcAllocServerHandle(PS2Runtime *runtime)
 {
-    if (!runtime || kRpcServerPoolCount == 0)
+    if (!runtime || kRpcServerHandleCount == 0)
         return 0;
 
     EeRpcRuntimeState &state =
         runtime->eeRpcRuntimeState();
     std::lock_guard<std::mutex> lock(state.rpcMutex);
     uint32_t slot =
-        state.serverIndex++ % kRpcServerPoolCount;
-    uint32_t addr = kRpcServerPoolBase + (slot * kRpcServerStride);
-    rpcZeroRdram(rdram, addr, kRpcServerStride);
-    return addr;
+        state.serverIndex++ % kRpcServerHandleCount;
+    return kRpcServerHandleBase + (slot * kRpcServerStride);
 }
 
 inline std::string translatePs2Path(

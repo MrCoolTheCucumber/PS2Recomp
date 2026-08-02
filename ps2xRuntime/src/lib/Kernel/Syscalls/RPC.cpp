@@ -395,7 +395,7 @@ namespace ps2_syscalls
         client->hdr.sema_id = -1;
         client->hdr.mode = mode;
 
-        uint32_t serverPtr = 0;
+        RpcServerState serverState{};
         {
             std::lock_guard<std::mutex> lock(
                 rpcState.rpcMutex);
@@ -404,35 +404,35 @@ namespace ps2_syscalls
             auto it = rpcState.servers.find(rpcId);
             if (it != rpcState.servers.end())
             {
-                serverPtr = it->second.sd_ptr;
+                serverState = it->second;
             }
             rpcState.clients[clientPtr] = {};
             rpcState.clients[clientPtr].sid = rpcId;
         }
 
-        if (!serverPtr)
+        if (!serverState.sd_ptr)
         {
-            // Allocate a dummy server so bind loops can proceed.
-            serverPtr =
-                rpcAllocServerAddr(rdram, runtime);
-            if (serverPtr)
+            // The server pointer returned by the IOP is opaque to EE code.
+            // Keep the placeholder entirely in host state so it cannot
+            // reserve or overwrite an arbitrary range of guest RDRAM.
+            serverState = {
+                rpcId,
+                rpcAllocServerHandle(runtime),
+                false};
+            if (serverState.sd_ptr)
             {
-                t_SifRpcServerData *dummy = reinterpret_cast<t_SifRpcServerData *>(getMemPtr(rdram, serverPtr));
-                if (dummy)
-                {
-                    std::memset(dummy, 0, sizeof(*dummy));
-                    dummy->sid = static_cast<int>(rpcId);
-                }
                 std::lock_guard<std::mutex> lock(
                     rpcState.rpcMutex);
-                rpcState.servers[rpcId] = {
-                    rpcId, serverPtr};
+                rpcState.servers[rpcId] = serverState;
             }
         }
 
+        const uint32_t serverPtr = serverState.sd_ptr;
         if (serverPtr)
         {
-            t_SifRpcServerData *sd = reinterpret_cast<t_SifRpcServerData *>(getMemPtr(rdram, serverPtr));
+            t_SifRpcServerData *sd = serverState.guestBacked
+                                         ? reinterpret_cast<t_SifRpcServerData *>(getMemPtr(rdram, serverPtr))
+                                         : nullptr;
             client->server = serverPtr;
             client->buf = sd ? sd->buf : 0;
             client->cbuf = sd ? sd->cbuf : 0;
@@ -612,28 +612,45 @@ namespace ps2_syscalls
         client->hdr.mode = mode;
 
         uint32_t sid = 0u;
+        RpcServerState serverState{};
+        bool hasServerState = false;
         {
             std::lock_guard<std::mutex> lock(
                 rpcState.rpcMutex);
-            auto &clientState =
-                rpcState.clients[clientPtr];
+            auto clientIt =
+                rpcState.clients.find(clientPtr);
+            const bool hasClientState =
+                clientIt != rpcState.clients.end();
+            if (!hasClientState)
+            {
+                clientIt = rpcState.clients.emplace(
+                    clientPtr, RpcClientState{}).first;
+            }
+            auto &clientState = clientIt->second;
             clientState.busy = true;
             clientState.last_rpc = rpcNum;
             sid = clientState.sid;
-            if (sid != 0u)
+            if (hasClientState)
             {
                 const auto serverIt =
                     rpcState.servers.find(sid);
                 if (serverIt != rpcState.servers.end() &&
                     serverIt->second.sd_ptr != 0u)
                 {
-                    client->server = serverIt->second.sd_ptr;
+                    serverState = serverIt->second;
+                    hasServerState = true;
+                    client->server = serverState.sd_ptr;
                 }
             }
         }
 
-        const uint32_t serverPtr = client->server;
-        auto *server = serverPtr
+        const uint32_t serverPtr = hasServerState
+                                       ? serverState.sd_ptr
+                                       : client->server;
+        const bool serverGuestBacked = hasServerState
+                                           ? serverState.guestBacked
+                                           : serverPtr != 0u;
+        auto *server = serverPtr && serverGuestBacked
                            ? reinterpret_cast<t_SifRpcServerData *>(getMemPtr(rdram, serverPtr))
                            : nullptr;
         if (server)
@@ -960,7 +977,7 @@ namespace ps2_syscalls
                 }
             }
 
-            rpcState.servers[sid] = {sid, sdPtr};
+            rpcState.servers[sid] = {sid, sdPtr, true};
             for (auto &entry : rpcState.clients)
             {
                 if (entry.second.sid == sid)
