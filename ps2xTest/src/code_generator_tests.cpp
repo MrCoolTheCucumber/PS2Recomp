@@ -2005,7 +2005,7 @@ void register_code_generator_tests()
                      "QFSRV should map to PS2_QFSRV with rs/rt ordering");
         });
 
-        tc.Run("PCPYLD and PEXEW use runtime helper macros", [](TestCase &t) {
+        tc.Run("PCPYLD translation uses runtime helper macro", [](TestCase &t) {
             CodeGenerator gen({}, {});
 
             Instruction pcpyld{};
@@ -2020,18 +2020,38 @@ void register_code_generator_tests()
             std::string pcpyldOut = gen.translateInstruction(pcpyld);
             t.IsTrue(pcpyldOut.find("PS2_PCPYLD(GPR_VEC(ctx, 7), GPR_VEC(ctx, 8))") != std::string::npos,
                      "PCPYLD should use PS2_PCPYLD helper");
+        });
 
-            Instruction pexew{};
-            pexew.isMMI = true;
-            pexew.opcode = OPCODE_MMI;
-            pexew.function = MMI_MMI2;
-            pexew.sa = MMI2_PEXEW;
-            pexew.rd = 9;
-            pexew.rs = 10;
+        tc.Run("unary MMI shuffles read rt and use runtime lane helpers", [](TestCase &t) {
+            CodeGenerator gen({}, {});
 
-            std::string pexewOut = gen.translateInstruction(pexew);
-            t.IsTrue(pexewOut.find("PS2_PEXEW(GPR_VEC(ctx, 10))") != std::string::npos,
-                     "PEXEW should use PS2_PEXEW helper");
+            const auto verify = [&](uint32_t group, uint32_t subfunction,
+                                    const std::string &name) {
+                Instruction inst{};
+                inst.isMMI = true;
+                inst.opcode = OPCODE_MMI;
+                inst.function = group;
+                inst.sa = subfunction;
+                inst.rd = 9;
+                inst.rs = 0;
+                inst.rt = 10;
+
+                const std::string out = gen.translateInstruction(inst);
+                const std::string expected =
+                    "PS2_" + name + "(GPR_VEC(ctx, 10))";
+                t.IsTrue(out.find(expected) != std::string::npos,
+                         name + " should read rt and use its runtime helper");
+                t.IsTrue(out.find("GPR_VEC(ctx, 0)") == std::string::npos,
+                         name + " must not read the unused rs field");
+            };
+
+            verify(MMI_MMI2, MMI2_PEXEH, "PEXEH");
+            verify(MMI_MMI2, MMI2_PREVH, "PREVH");
+            verify(MMI_MMI2, MMI2_PEXEW, "PEXEW");
+            verify(MMI_MMI2, MMI2_PROT3W, "PROT3W");
+            verify(MMI_MMI3, MMI3_PEXCH, "PEXCH");
+            verify(MMI_MMI3, MMI3_PCPYH, "PCPYH");
+            verify(MMI_MMI3, MMI3_PEXCW, "PEXCW");
         });
 
         tc.Run("VU0 macro mappings cover all S1/S2 enums", [](TestCase &t) {

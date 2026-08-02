@@ -1051,6 +1051,52 @@ void register_ps2_runtime_expansion_tests()
             t.Equals(ctx.hi1, 0x02468ACE13579BDFull, "PMTHI high lane mismatch");
         });
 
+        tc.Run("unary MMI shuffle helpers preserve architectural lane order", [](TestCase &t)
+        {
+            const auto verifyHalfwords = [&](const std::string &name,
+                                             __m128i value,
+                                             const std::array<uint16_t, 8> &expected)
+            {
+                uint16_t actual[8]{};
+                std::memcpy(actual, &value, sizeof(actual));
+                for (size_t lane = 0; lane < expected.size(); ++lane)
+                {
+                    t.Equals(actual[lane], expected[lane],
+                             name + " halfword lane " + std::to_string(lane) +
+                                 " mismatch");
+                }
+            };
+            const auto verifyWords = [&](const std::string &name,
+                                         __m128i value,
+                                         const std::array<uint32_t, 4> &expected)
+            {
+                uint32_t actual[4]{};
+                std::memcpy(actual, &value, sizeof(actual));
+                for (size_t lane = 0; lane < expected.size(); ++lane)
+                {
+                    t.Equals(actual[lane], expected[lane],
+                             name + " word lane " + std::to_string(lane) +
+                                 " mismatch");
+                }
+            };
+
+            const __m128i halfwords =
+                Ps2MakeU16Vector(0u, 1u, 2u, 3u, 4u, 5u, 6u, 7u);
+            verifyHalfwords(
+                "PEXEH", PS2_PEXEH(halfwords), {2u, 1u, 0u, 3u, 6u, 5u, 4u, 7u});
+            verifyHalfwords(
+                "PREVH", PS2_PREVH(halfwords), {3u, 2u, 1u, 0u, 7u, 6u, 5u, 4u});
+            verifyHalfwords(
+                "PEXCH", PS2_PEXCH(halfwords), {0u, 2u, 1u, 3u, 4u, 6u, 5u, 7u});
+            verifyHalfwords(
+                "PCPYH", PS2_PCPYH(halfwords), {0u, 0u, 0u, 0u, 4u, 4u, 4u, 4u});
+
+            const __m128i words = Ps2MakeU32Vector(0u, 1u, 2u, 3u);
+            verifyWords("PEXEW", PS2_PEXEW(words), {2u, 1u, 0u, 3u});
+            verifyWords("PROT3W", PS2_PROT3W(words), {1u, 2u, 0u, 3u});
+            verifyWords("PEXCW", PS2_PEXCW(words), {0u, 2u, 1u, 3u});
+        });
+
         tc.Run("PMULTH writes eight independent signed products", [](TestCase &t)
         {
             R5900Context ctx{};
