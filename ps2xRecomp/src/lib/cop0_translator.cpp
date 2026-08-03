@@ -117,7 +117,7 @@ namespace ps2recomp
                     "runtime->writeCop0Status(rdram, ctx, GPR_U32(ctx, {}));",
                     rt);
             case COP0_REG_CAUSE:
-                return fmt::format("ctx->cop0_cause = (ctx->cop0_cause & ~0x00000300) | (GPR_U32(ctx, {}) & 0x00000300);", rt);
+                return "// MTC0 to CAUSE register ignored (read-only)";
             case COP0_REG_EPC:
                 return fmt::format("ctx->cop0_epc = GPR_U32(ctx, {});", rt);
             case COP0_REG_PRID:
