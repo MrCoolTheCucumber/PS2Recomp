@@ -186,7 +186,8 @@ namespace ps2recomp
         m_ss << indent
              << eeInstructionIssueCall(m_delaySlot)
              << "\n";
-        m_ss << fmt::format("{}++ctx->insn_count;\n", indent);
+        m_ss << fmt::format(
+            "{}ctx->beginEeInstruction();\n", indent);
         m_ss << fmt::format(
             "{}ctx->advanceEeCycleTicks({}u);\n",
             indent,

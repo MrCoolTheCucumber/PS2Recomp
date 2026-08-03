@@ -157,10 +157,11 @@ void register_ee_bus_error_tests()
                 CodeGenerator({}, {}).generateFunction(
                     function, instructions, false);
             const size_t loadRetirement = generated.find(
-                "++ctx->insn_count;");
+                "ctx->beginEeInstruction();");
             const size_t load = generated.find("READ32(", loadRetirement);
             const size_t storeRetirement = generated.find(
-                "++ctx->insn_count;", loadRetirement + 1u);
+                "ctx->beginEeInstruction();",
+                loadRetirement + 1u);
             const size_t store = generated.find("WRITE32(", storeRetirement);
 
             t.IsTrue(

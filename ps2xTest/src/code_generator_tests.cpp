@@ -1974,7 +1974,9 @@ void register_code_generator_tests()
                 false);
 
             t.Equals(
-                countOccurrences(generated, "++ctx->insn_count;"),
+                countOccurrences(
+                    generated,
+                    "ctx->beginEeInstruction();"),
                 static_cast<size_t>(3u),
                 "each emitted non-branch EE instruction should retire");
             t.Equals(
@@ -2043,7 +2045,9 @@ void register_code_generator_tests()
                     std::string::npos,
                 "executed load delay slot should use the load weight");
             t.Equals(
-                countOccurrences(generated, "++ctx->insn_count;"),
+                countOccurrences(
+                    generated,
+                    "ctx->beginEeInstruction();"),
                 static_cast<size_t>(2u),
                 "branch and delay slot should retire independently");
             t.Equals(

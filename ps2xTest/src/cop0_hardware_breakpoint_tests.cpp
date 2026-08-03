@@ -183,7 +183,9 @@ void register_cop0_hardware_breakpoint_tests()
                     "runtime->CheckEeInstructionBreakpoint(ctx, ctx->pc);",
                     ordinaryPc);
             const std::size_t ordinaryRetire =
-                generated.find("++ctx->insn_count;", ordinaryPc);
+                generated.find(
+                    "ctx->beginEeInstruction();",
+                    ordinaryPc);
             t.IsTrue(
                 ordinaryPc != std::string::npos &&
                     ordinaryCheck != std::string::npos &&

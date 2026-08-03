@@ -152,6 +152,7 @@ struct alignas(16) R5900Context
     uint64_t insn_count; // Retired instruction counter
     uint32_t ee_block_cycle_ticks;
     bool ee_block_cycle_active;
+    bool cop0_random_instruction_pending;
     bool ee_performance_issue_pending;
     ps2x::performance::EeInstructionIssueProfile
         ee_performance_pending_issue;
@@ -245,6 +246,32 @@ struct alignas(16) R5900Context
         vi[0] = 0;
     }
 
+    void finishEeInstruction() noexcept
+    {
+        if (!cop0_random_instruction_pending)
+        {
+            return;
+        }
+
+        constexpr uint32_t upperBound = 47u;
+        const uint32_t lowerBound =
+            std::min(cop0_wired & 0x3fu, upperBound);
+        const uint32_t random =
+            cop0_random & 0x3fu;
+        cop0_random =
+            random > upperBound || random <= lowerBound
+                ? upperBound
+                : random - 1u;
+        cop0_random_instruction_pending = false;
+    }
+
+    void beginEeInstruction() noexcept
+    {
+        finishEeInstruction();
+        ++insn_count;
+        cop0_random_instruction_pending = true;
+    }
+
     void advanceEeCycleTicks(uint32_t dualIssueTicks)
     {
         const uint32_t issueScale = 2u - ((cop0_config >> 18u) & 1u);
@@ -294,6 +321,7 @@ struct alignas(16) R5900Context
     {
         ee_block_cycle_ticks = 0u;
         ee_block_cycle_active = false;
+        cop0_random_instruction_pending = false;
         ee_performance_issue_pending = false;
         ee_performance_pending_issue = {};
     }

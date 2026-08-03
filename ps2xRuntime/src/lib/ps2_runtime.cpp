@@ -4006,6 +4006,7 @@ ps2x::timing::EeTick PS2Runtime::commitEeContextProgress(
     {
         return currentEeTick();
     }
+    context->finishEeInstruction();
     return publishEeElapsed(context->commitEeBlockCycles());
 }
 
@@ -4016,6 +4017,7 @@ ps2x::timing::EeTick PS2Runtime::finishEeContextBlock(
     {
         return currentEeTick();
     }
+    context->finishEeInstruction();
     flushEeInstructionIssue(context);
     return publishEeElapsed(context->finishEeBasicBlock());
 }
@@ -8242,7 +8244,8 @@ void PS2Runtime::handleTLBWR(uint8_t *rdram, R5900Context *ctx)
 
     // Keep COP0 bookkeeping in sync with the selected slot.
     ctx->cop0_index = (ctx->cop0_index & ~0x3Fu) | (random & 0x3Fu);
-    ctx->cop0_random = (random <= wired) ? (entryCount - 1) : (random - 1);
+    // Automatic Random retirement occurs after this instruction consumes
+    // the selected slot, at the shared EE instruction boundary.
 }
 
 void PS2Runtime::handleTLBP(uint8_t *rdram, R5900Context *ctx)

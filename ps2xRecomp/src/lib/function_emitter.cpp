@@ -188,7 +188,7 @@ namespace ps2recomp
                     ss << "    "
                        << eeInstructionIssueCall(inst)
                        << "\n";
-                    ss << "    ++ctx->insn_count;\n";
+                    ss << "    ctx->beginEeInstruction();\n";
                     ss << "    ctx->advanceEeCycleTicks("
                        << eeInstructionCycleTicks(inst) << "u);\n";
                     const bool hasDecodedDelaySlot =
@@ -253,7 +253,7 @@ namespace ps2recomp
                     ss << "    "
                        << eeInstructionIssueCall(inst)
                        << "\n";
-                    ss << "    ++ctx->insn_count;\n";
+                    ss << "    ctx->beginEeInstruction();\n";
                     ss << "    ctx->advanceEeCycleTicks("
                        << eeInstructionCycleTicks(inst) << "u);\n";
                     if (!gifDmaKickPlan.valid)
