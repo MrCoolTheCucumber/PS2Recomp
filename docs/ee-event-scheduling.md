@@ -19,6 +19,12 @@ basic-block exit:
    deadline.
 4. Only a due boundary enters event dispatch.
 
+Per-instruction weights are deterministic scheduling estimates, not a
+cycle-accurate pipeline simulation. The model intentionally keeps
+unconditional jumps at 9 fixed-point ticks and conditional branches at 11;
+each supported jump and branch encoding is classified explicitly so an opcode
+cannot silently inherit a switch default.
+
 Context switches flush local elapsed time before changing the bound guest
 context. Runtime timing reset invalidates every source generation, resets the
 canonical timeline, and re-arms sources whose architectural configuration

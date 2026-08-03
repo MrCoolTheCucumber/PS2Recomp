@@ -7,6 +7,7 @@ void register_boost_ee_fiber_tests();
 void register_cop0_timing_tests();
 void register_ee_addi_zero_tests();
 void register_ee_bus_error_tests();
+void register_ee_cycle_model_tests();
 void register_ee_cache_tests();
 void register_ee_counter_tests();
 void register_ee_execution_backend_tests();
@@ -50,6 +51,7 @@ int main()
     register_cop0_timing_tests();
     register_ee_addi_zero_tests();
     register_ee_bus_error_tests();
+    register_ee_cycle_model_tests();
     register_ee_cache_tests();
     register_ee_counter_tests();
     register_ee_execution_backend_tests();

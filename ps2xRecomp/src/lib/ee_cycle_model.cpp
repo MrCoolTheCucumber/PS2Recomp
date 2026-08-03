@@ -8,6 +8,9 @@ namespace ps2recomp
     namespace
     {
         constexpr uint32_t kDefaultTicks = 9u;
+        // The reference timing model intentionally keeps unconditional jumps
+        // in a distinct class even though they currently match the default.
+        constexpr uint32_t kUnconditionalJumpTicks = 9u;
         constexpr uint32_t kBranchTicks = 11u;
         constexpr uint32_t kCoprocessorTicks = 7u;
         constexpr uint32_t kLoadStoreTicks = 14u;
@@ -63,6 +66,9 @@ namespace ps2recomp
         {
             switch (inst.function)
             {
+            case SPECIAL_JR:
+            case SPECIAL_JALR:
+                return kUnconditionalJumpTicks;
             case SPECIAL_MULT:
             case SPECIAL_MULTU:
                 return kMultiplyTicks;
@@ -207,6 +213,9 @@ namespace ps2recomp
             return specialCycleTicks(inst);
         case OPCODE_REGIMM:
             return regimmCycleTicks(inst);
+        case OPCODE_J:
+        case OPCODE_JAL:
+            return kUnconditionalJumpTicks;
         case OPCODE_BEQ:
         case OPCODE_BNE:
         case OPCODE_BLEZ:
@@ -220,6 +229,8 @@ namespace ps2recomp
             return inst.rs == COP0_BC ? kBranchTicks : kCoprocessorTicks;
         case OPCODE_COP1:
             return cop1CycleTicks(inst);
+        case OPCODE_COP2:
+            return inst.rs == COP2_BC ? kBranchTicks : kDefaultTicks;
         case OPCODE_MMI:
             return mmiCycleTicks(inst);
         default:
