@@ -95,7 +95,7 @@ namespace ps2recomp
             case COP0_REG_ENTRYLO1:
                 return fmt::format("ctx->cop0_entrylo1 = GPR_U32(ctx, {}) & 0x3FFFFFFF;", rt);
             case COP0_REG_CONTEXT:
-                return fmt::format("ctx->cop0_context = (ctx->cop0_context & 0xFF800000) | (GPR_U32(ctx, {}) & 0x7FFFFF);", rt);
+                return fmt::format("ctx->cop0_context = (ctx->cop0_context & 0x007FFFF0) | (GPR_U32(ctx, {}) & 0xFF800000);", rt);
             case COP0_REG_PAGEMASK:
                 return fmt::format("ctx->cop0_pagemask = GPR_U32(ctx, {}) & 0x01FFE000;", rt);
             case COP0_REG_WIRED:

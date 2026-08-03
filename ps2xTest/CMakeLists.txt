@@ -45,6 +45,7 @@ target_include_directories(ps2_test_function_table PRIVATE
 add_library(ps2_test_lib STATIC
     src/boost_ee_fiber_tests.cpp
     src/code_generator_tests.cpp
+    src/cop0_context_tests.cpp
     src/cop0_timing_tests.cpp
     src/ee_addi_zero_tests.cpp
     src/ee_address_mode_tests.cpp

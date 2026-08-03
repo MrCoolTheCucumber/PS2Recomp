@@ -6532,7 +6532,7 @@ void PS2Runtime::RequireCoprocessorUsable(
         exception == EXCEPTION_TLB_REFILL_LOAD ||
         exception == EXCEPTION_TLB_REFILL_STORE)
     {
-        ctx->cop0_context = (ctx->cop0_context & 0xFF80000Fu) |
+        ctx->cop0_context = (ctx->cop0_context & 0xFF800000u) |
                             ((badVAddr >> 9u) & 0x007FFFF0u);
         ctx->cop0_entryhi = (badVAddr & 0xFFFFE000u) |
                             (ctx->cop0_entryhi & 0x00001FFFu);
