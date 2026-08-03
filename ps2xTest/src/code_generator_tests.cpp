@@ -2500,6 +2500,10 @@ void register_code_generator_tests()
 
         tc.Run("VU0 macro mappings cover all S1/S2 enums", [](TestCase &t) {
             const std::vector<std::string> candidates = {
+                (std::filesystem::path(__FILE__).parent_path() /
+                 "../../ps2xRecomp/include/ps2recomp/instructions.h")
+                    .lexically_normal()
+                    .string(),
                 "ps2xRecomp/include/ps2recomp/instructions.h",
                 "../ps2xRecomp/include/ps2recomp/instructions.h",
                 "../../ps2xRecomp/include/ps2recomp/instructions.h"
