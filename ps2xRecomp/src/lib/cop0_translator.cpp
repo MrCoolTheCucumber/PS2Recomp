@@ -165,7 +165,7 @@ namespace ps2recomp
             case COP0_REG_CONFIG:
                 return fmt::format("ctx->cop0_config = (ctx->cop0_config & 0x70000FC0u) | (GPR_U32(ctx, {}) & 0x00073007u);", rt);
             case COP0_REG_BADPADDR:
-                return "// MTC0 to BADPADDR register ignored (read-only)";
+                return fmt::format("ctx->cop0_badpaddr = GPR_U32(ctx, {}) & 0xFFFFFFF0u;", rt);
             case COP0_REG_DEBUG:
             {
                 const uint32_t selector =
