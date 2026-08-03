@@ -11249,6 +11249,130 @@ void PS2Runtime::Store64(uint8_t *rdram, R5900Context *ctx, uint32_t vaddr, uint
     }
 }
 
+void PS2Runtime::StoreMasked32(
+    uint8_t *rdram,
+    R5900Context *ctx,
+    uint32_t vaddr,
+    uint32_t value,
+    uint8_t byteEnable)
+{
+    const Ps2ByteEnableSpan span =
+        Ps2DecodeByteEnableSpan(byteEnable, 4u);
+    if (span.valid && span.size != 0u)
+    {
+        const uint32_t selectedAddress =
+            vaddr + span.offset;
+        const uint32_t selectedValue =
+            value >> (span.offset * 8u);
+        synchronizeEeCounterMmio(
+            ctx, selectedAddress, span.size);
+        debugObserveMemoryAccess(
+            selectedAddress,
+            span.size,
+            DebugMemoryAccess::Write,
+            ctx);
+        ps2TraceGuestWrite(
+            rdram,
+            selectedAddress,
+            span.size,
+            selectedValue,
+            0u,
+            "WRITE_MASKED32",
+            ctx);
+        traceVif0MmioWrite(
+            m_memory,
+            ctx,
+            selectedAddress,
+            span.size,
+            selectedValue,
+            0u);
+    }
+    try
+    {
+        m_memory.writeMasked32(
+            vaddr,
+            value,
+            byteEnable,
+            ctx ? ctx->pc : 0u);
+    }
+    catch (const PS2TlbMissException &fault)
+    {
+        SignalMemoryException(
+            ctx,
+            EXCEPTION_TLB_REFILL_STORE,
+            fault.virtualAddress());
+    }
+    catch (const std::exception &)
+    {
+        SignalMemoryException(
+            ctx,
+            EXCEPTION_ADDRESS_ERROR_STORE,
+            vaddr);
+    }
+}
+
+void PS2Runtime::StoreMasked64(
+    uint8_t *rdram,
+    R5900Context *ctx,
+    uint32_t vaddr,
+    uint64_t value,
+    uint8_t byteEnable)
+{
+    const Ps2ByteEnableSpan span =
+        Ps2DecodeByteEnableSpan(byteEnable, 8u);
+    if (span.valid && span.size != 0u)
+    {
+        const uint32_t selectedAddress =
+            vaddr + span.offset;
+        const uint64_t selectedValue =
+            value >> (span.offset * 8u);
+        synchronizeEeCounterMmio(
+            ctx, selectedAddress, span.size);
+        debugObserveMemoryAccess(
+            selectedAddress,
+            span.size,
+            DebugMemoryAccess::Write,
+            ctx);
+        ps2TraceGuestWrite(
+            rdram,
+            selectedAddress,
+            span.size,
+            selectedValue,
+            0u,
+            "WRITE_MASKED64",
+            ctx);
+        traceVif0MmioWrite(
+            m_memory,
+            ctx,
+            selectedAddress,
+            span.size,
+            selectedValue,
+            0u);
+    }
+    try
+    {
+        m_memory.writeMasked64(
+            vaddr,
+            value,
+            byteEnable,
+            ctx ? ctx->pc : 0u);
+    }
+    catch (const PS2TlbMissException &fault)
+    {
+        SignalMemoryException(
+            ctx,
+            EXCEPTION_TLB_REFILL_STORE,
+            fault.virtualAddress());
+    }
+    catch (const std::exception &)
+    {
+        SignalMemoryException(
+            ctx,
+            EXCEPTION_ADDRESS_ERROR_STORE,
+            vaddr);
+    }
+}
+
 void PS2Runtime::Store128(uint8_t *rdram, R5900Context *ctx, uint32_t vaddr, __m128i value)
 {
     synchronizeEeCounterMmio(ctx, vaddr, 16u);

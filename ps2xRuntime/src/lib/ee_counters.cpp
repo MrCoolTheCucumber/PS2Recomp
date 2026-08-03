@@ -727,7 +727,8 @@ namespace ps2x::timing
         uint32_t address,
         uint32_t value,
         uint64_t currentCycle,
-        EeCounterAdvanceResult *advance) noexcept
+        EeCounterAdvanceResult *advance,
+        uint32_t writeMask) noexcept
     {
         const std::optional<DecodedRegister> decoded =
             decodeRegister(address);
@@ -740,10 +741,24 @@ namespace ps2x::timing
             advanceTo(currentCycle);
         Counter &counter =
             m_counters[decoded->counter];
+        const uint16_t selectedMask =
+            static_cast<uint16_t>(writeMask);
+        const uint16_t selectedValue =
+            static_cast<uint16_t>(value) & selectedMask;
+        if (selectedMask == 0u)
+        {
+            if (advance)
+            {
+                *advance = result;
+            }
+            return true;
+        }
         switch (decoded->reg)
         {
         case EeCounterRegister::Count:
-            counter.count = value & 0xffffu;
+            counter.count =
+                (counter.count & ~selectedMask) |
+                selectedValue;
             counter.targetAfterOverflow =
                 counter.count >= counter.target;
             break;
@@ -754,11 +769,16 @@ namespace ps2x::timing
             const uint16_t clearedStatus =
                 oldStatus &
                 ~static_cast<uint16_t>(
-                    value & kModeStatusMask);
+                    selectedValue & kModeStatusMask);
+            const uint16_t controlMask =
+                selectedMask & kModeWritableControlMask;
+            const uint16_t mergedControl =
+                (counter.mode & kModeWritableControlMask &
+                 ~controlMask) |
+                (selectedValue & kModeWritableControlMask);
             counter.mode =
                 clearedStatus |
-                static_cast<uint16_t>(
-                    value & kModeWritableControlMask);
+                mergedControl;
             switch (clockSource(counter))
             {
             case 0u:
@@ -783,13 +803,15 @@ namespace ps2x::timing
         }
         case EeCounterRegister::Target:
             counter.target =
-                static_cast<uint16_t>(value);
+                (counter.target & ~selectedMask) |
+                selectedValue;
             counter.targetAfterOverflow =
                 counter.target <= counter.count;
             break;
         case EeCounterRegister::Hold:
             counter.hold =
-                static_cast<uint16_t>(value);
+                (counter.hold & ~selectedMask) |
+                selectedValue;
             break;
         }
 

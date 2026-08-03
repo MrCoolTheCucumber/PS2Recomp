@@ -375,48 +375,40 @@ namespace ps2recomp
                                "uint32_t aligned_addr = addr & ~3u; "
                                "uint32_t offset = addr & 3u; "
                                "uint32_t shift = (3u - offset) << 3; "
-                               "uint32_t mask = 0xFFFFFFFFu >> shift; "
-                               "uint32_t old_data = {}; "
-                               "uint32_t val = GPR_U32(ctx, {}); "
-                               "uint32_t new_data = (old_data & ~mask) | ((val >> shift) & mask); "
-                               "{}; }}",
-                               inst.rs, inst.simmediate, genRead(32, "aligned_addr"), inst.rt, genWrite(32, "aligned_addr", "new_data"));
+                               "uint8_t byte_enable = (uint8_t)((1u << (offset + 1u)) - 1u); "
+                               "uint32_t value = GPR_U32(ctx, {}) >> shift; "
+                               "WRITE_MASKED32(aligned_addr, value, byte_enable); }}",
+                               inst.rs, inst.simmediate, inst.rt);
 
         case OPCODE_SWR:
             return fmt::format("{{ uint32_t addr = ADD32(GPR_U32(ctx, {}), {}); "
                                "uint32_t aligned_addr = addr & ~3u; "
                                "uint32_t offset = addr & 3u; "
                                "uint32_t shift = offset << 3; "
-                               "uint32_t mask = 0xFFFFFFFFu << shift; "
-                               "uint32_t old_data = {}; "
-                               "uint32_t val = GPR_U32(ctx, {}); "
-                               "uint32_t new_data = (old_data & ~mask) | ((val << shift) & mask); "
-                               "{}; }}",
-                               inst.rs, inst.simmediate, genRead(32, "aligned_addr"), inst.rt, genWrite(32, "aligned_addr", "new_data"));
+                               "uint8_t byte_enable = (uint8_t)((0xFu << offset) & 0xFu); "
+                               "uint32_t value = GPR_U32(ctx, {}) << shift; "
+                               "WRITE_MASKED32(aligned_addr, value, byte_enable); }}",
+                               inst.rs, inst.simmediate, inst.rt);
 
         case OPCODE_SDL:
             return fmt::format("{{ uint32_t addr = ADD32(GPR_U32(ctx, {}), {}); "
                                "uint32_t aligned_addr = addr & ~7u; "
                                "uint32_t offset = addr & 7u; "
                                "uint32_t shift = (7u - offset) << 3; "
-                               "uint64_t mask = 0xFFFFFFFFFFFFFFFFull >> shift; "
-                               "uint64_t old_data = {}; "
-                               "uint64_t val = GPR_U64(ctx, {}); "
-                               "uint64_t new_data = (old_data & ~mask) | ((val >> shift) & mask); "
-                               "{}; }}",
-                               inst.rs, inst.simmediate, genRead(64, "aligned_addr"), inst.rt, genWrite(64, "aligned_addr", "new_data"));
+                               "uint8_t byte_enable = (uint8_t)((1u << (offset + 1u)) - 1u); "
+                               "uint64_t value = GPR_U64(ctx, {}) >> shift; "
+                               "WRITE_MASKED64(aligned_addr, value, byte_enable); }}",
+                               inst.rs, inst.simmediate, inst.rt);
 
         case OPCODE_SDR:
             return fmt::format("{{ uint32_t addr = ADD32(GPR_U32(ctx, {}), {}); "
                                "uint32_t aligned_addr = addr & ~7u; "
                                "uint32_t offset = addr & 7u; "
                                "uint32_t shift = offset << 3; "
-                               "uint64_t mask = 0xFFFFFFFFFFFFFFFFull << shift; "
-                               "uint64_t old_data = {}; "
-                               "uint64_t val = GPR_U64(ctx, {}); "
-                               "uint64_t new_data = (old_data & ~mask) | ((val << shift) & mask); "
-                               "{}; }}",
-                               inst.rs, inst.simmediate, genRead(64, "aligned_addr"), inst.rt, genWrite(64, "aligned_addr", "new_data"));
+                               "uint8_t byte_enable = (uint8_t)((0xFFu << offset) & 0xFFu); "
+                               "uint64_t value = GPR_U64(ctx, {}) << shift; "
+                               "WRITE_MASKED64(aligned_addr, value, byte_enable); }}",
+                               inst.rs, inst.simmediate, inst.rt);
         case OPCODE_CACHE:
             return fmt::format(
                 "runtime->handleEeCacheOperation(rdram, ctx, 0x{:02X}u, "

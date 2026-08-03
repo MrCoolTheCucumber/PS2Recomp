@@ -347,12 +347,23 @@ void register_ps2_memory_tests()
                     (newlyRaised & (1u << 9u)) != 0u,
                 "interrupt callback should observe state after device publication");
 
+            mem.write8(kTimer0Mode, 0u);
+            t.IsTrue(
+                (mem.readIORegister(kTimer0Mode) &
+                 0x400u) != 0u,
+                "an unselected timer W1C status bit must survive SB");
+
             (void)mem.writeIORegister(
                 kIntcMask, 1u << 9u);
             t.IsTrue(
                 (mem.readIORegister(kIntcMask) &
                  (1u << 9u)) != 0u,
                 "INTC mask writes should toggle selected bits");
+            mem.write8(kIntcMask, 0u);
+            t.IsTrue(
+                (mem.readIORegister(kIntcMask) &
+                 (1u << 9u)) != 0u,
+                "an unselected INTC mask bit must not be replayed by SB");
             (void)mem.writeIORegister(
                 kIntcStat, 1u << 9u);
             t.IsTrue(
@@ -534,6 +545,22 @@ void register_ps2_memory_tests()
             t.IsTrue(storeRaised, "misaligned fast-path store should raise an EE exception");
             t.Equals(storeContext.cop0_badvaddr, 0x00000002u,
                      "misaligned store should retain the original virtual address");
+
+            const uint32_t maskedBase = 0xA1B2C3D4u;
+            std::memcpy(rdram + 0x20u, &maskedBase, sizeof(maskedBase));
+            WRITE_MASKED32(0x20u, 0x00EEDD00u, 0x6u);
+            uint32_t maskedResult = 0u;
+            std::memcpy(&maskedResult, rdram + 0x20u, sizeof(maskedResult));
+            t.Equals(maskedResult, 0xA1EEDDD4u,
+                     "fast masked word writes should preserve disabled byte lanes");
+
+            const uint64_t maskedDoubleBase = 0x8877665544332211ull;
+            std::memcpy(rdram + 0x28u, &maskedDoubleBase, sizeof(maskedDoubleBase));
+            WRITE_MASKED64(0x28u, 0x0000DDEECCBB0000ull, 0x3Cu);
+            uint64_t maskedDoubleResult = 0u;
+            std::memcpy(&maskedDoubleResult, rdram + 0x28u, sizeof(maskedDoubleResult));
+            t.Equals(maskedDoubleResult, 0x8877DDEECCBB2211ull,
+                     "fast masked doubleword writes should preserve disabled byte lanes");
         });
 
         tc.Run("VIF MPG num zero uploads 256 instructions", [](TestCase &t)
@@ -3752,6 +3779,71 @@ void register_ps2_memory_tests()
             const uint32_t dstatCleared = mem.readIORegister(kDStat);
             t.IsTrue((dstatCleared & kGifStatusBit) == 0u, "write-one should clear GIF channel status bit");
             t.IsTrue((dstatCleared & kSummaryBit) == 0u, "summary bit should clear after status clear");
+        });
+
+        tc.Run("partial D_STAT stores do not replay untouched toggle bits", [](TestCase &t)
+        {
+            PS2Memory mem;
+            t.IsTrue(mem.initialize(), "PS2Memory initialize should succeed");
+
+            constexpr uint32_t kDStat = 0x1000E010u;
+            constexpr uint32_t kByteSentinel = 1u << 24u;
+            constexpr uint32_t kHalfSentinel = 1u << 25u;
+
+            t.IsTrue(mem.writeIORegister(kDStat, kByteSentinel),
+                     "D_STAT byte sentinel should enable");
+            mem.write8(kDStat, 0u);
+            t.IsTrue((mem.readIORegister(kDStat) & kByteSentinel) != 0u,
+                     "SB must not replay and toggle an unselected D_STAT mask bit");
+
+            t.IsTrue(mem.writeIORegister(kDStat, kByteSentinel | kHalfSentinel),
+                     "D_STAT sentinels should switch for the halfword check");
+            mem.write16(kDStat, 0u);
+            t.IsTrue((mem.readIORegister(kDStat) & kHalfSentinel) != 0u,
+                     "SH must not replay and toggle an unselected D_STAT mask bit");
+        });
+
+        tc.Run("masked stores preserve disabled RAM and MMIO byte lanes", [](TestCase &t)
+        {
+            PS2Memory mem;
+            t.IsTrue(mem.initialize(), "PS2Memory initialize should succeed");
+
+            constexpr uint32_t kWordAddress = 0x00012000u;
+            mem.write32(kWordAddress, 0x44332211u);
+            mem.writeMasked32(kWordAddress, 0x00BBAA00u, 0x6u);
+            t.Equals(mem.read32(kWordAddress), 0x44BBAA11u,
+                     "masked word store should replace only enabled RAM lanes");
+
+            constexpr uint32_t kDoubleAddress = 0x00012008u;
+            mem.write64(kDoubleAddress, 0x8877665544332211ull);
+            mem.writeMasked64(
+                kDoubleAddress,
+                0x0000DDEECCBB0000ull,
+                0x3Cu);
+            t.Equals(mem.read64(kDoubleAddress), 0x8877DDEECCBB2211ull,
+                     "masked doubleword store should replace only enabled RAM lanes");
+
+            constexpr uint32_t kGifMadr = 0x1000A010u;
+            t.IsTrue(mem.writeIORegister(kGifMadr, 0x44332211u),
+                     "GIF MADR setup should succeed");
+            mem.write8(kGifMadr + 1u, 0xAAu);
+            mem.write16(kGifMadr + 2u, 0xBBCCu);
+            t.Equals(mem.readIORegister(kGifMadr), 0xBBCCAA11u,
+                     "ordinary MMIO fields should merge only selected lanes without a guest read");
+
+            constexpr uint32_t kDStat = 0x1000E010u;
+            constexpr uint32_t kMaskSentinels =
+                (1u << 16u) | (1u << 24u);
+            t.IsTrue(mem.writeIORegister(kDStat, kMaskSentinels),
+                     "D_STAT masked-store sentinels should enable");
+            mem.writeMasked32(kDStat, 0u, 0x1u);
+            mem.writeMasked32(kDStat, 0u, 0x8u);
+            mem.writeMasked64(kDStat, 0u, 0x01u);
+            mem.writeMasked64(kDStat, 0u, 0x80u);
+            t.Equals(
+                mem.readIORegister(kDStat) & kMaskSentinels,
+                kMaskSentinels,
+                "SWL/SWR/SDL/SDR-style byte enables must not replay D_STAT sentinels");
         });
 
         tc.Run("DMAC D_CTRL DMAE gates GIF DMA start", [](TestCase &t)

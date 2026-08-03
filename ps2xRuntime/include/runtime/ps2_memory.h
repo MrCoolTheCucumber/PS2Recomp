@@ -85,6 +85,73 @@ constexpr uint32_t PS2_GS_PRIV_REG_BASE = PS2_GS_BASE; // GS Privileged Register
 constexpr uint32_t PS2_GS_PRIV_REG_SIZE = 0x2000;
 constexpr size_t PS2_GS_VRAM_SIZE = 4u * 1024u * 1024u; // 4MB GS VRAM
 
+// EE left/right stores select one contiguous span of little-endian byte lanes.
+// A zero byte enable is a valid no-op; non-contiguous enables are rejected.
+struct Ps2ByteEnableSpan
+{
+    bool valid = false;
+    uint32_t offset = 0u;
+    uint32_t size = 0u;
+};
+
+inline constexpr Ps2ByteEnableSpan Ps2DecodeByteEnableSpan(
+    uint8_t byteEnable,
+    uint32_t widthBytes) noexcept
+{
+    if (widthBytes == 0u || widthBytes > 8u)
+    {
+        return {};
+    }
+
+    const uint32_t allowed = (1u << widthBytes) - 1u;
+    if ((static_cast<uint32_t>(byteEnable) & ~allowed) != 0u)
+    {
+        return {};
+    }
+    if (byteEnable == 0u)
+    {
+        return {true, 0u, 0u};
+    }
+
+    uint32_t first = 0u;
+    while ((byteEnable & (1u << first)) == 0u)
+    {
+        ++first;
+    }
+    uint32_t last = widthBytes - 1u;
+    while ((byteEnable & (1u << last)) == 0u)
+    {
+        --last;
+    }
+    const uint32_t contiguous =
+        ((1u << (last - first + 1u)) - 1u) << first;
+    if (static_cast<uint32_t>(byteEnable) != contiguous)
+    {
+        return {};
+    }
+    return {true, first, last - first + 1u};
+}
+
+inline constexpr uint64_t Ps2ExpandByteEnableMask(
+    uint8_t byteEnable,
+    uint32_t widthBytes) noexcept
+{
+    if (widthBytes > 8u)
+    {
+        return 0u;
+    }
+
+    uint64_t mask = 0u;
+    for (uint32_t index = 0u; index < widthBytes; ++index)
+    {
+        if ((byteEnable & (1u << index)) != 0u)
+        {
+            mask |= 0xFFull << (index * 8u);
+        }
+    }
+    return mask;
+}
+
 inline constexpr uint32_t PS2_FIO_O_RDONLY = 0x0001;
 inline constexpr uint32_t PS2_FIO_O_WRONLY = 0x0002;
 inline constexpr uint32_t PS2_FIO_O_RDWR = 0x0003;
@@ -774,6 +841,16 @@ public:
     void write32(uint32_t address, uint32_t value, uint32_t writerPc = 0);
     void write64(uint32_t address, uint64_t value, uint32_t writerPc = 0);
     void write128(uint32_t address, __m128i value, uint32_t writerPc = 0);
+    void writeMasked32(
+        uint32_t address,
+        uint32_t value,
+        uint8_t byteEnable,
+        uint32_t writerPc = 0);
+    void writeMasked64(
+        uint32_t address,
+        uint64_t value,
+        uint8_t byteEnable,
+        uint32_t writerPc = 0);
 
     // TLB handling
     uint32_t translateAddress(uint32_t virtualAddress);
@@ -784,6 +861,7 @@ public:
 
     // Hardware register interface
     bool writeIORegister(uint32_t address, uint32_t value);
+    bool writeIORegisterMasked(uint32_t address, uint32_t value, uint8_t byteEnable);
     uint32_t readIORegister(uint32_t address);
 
     using EeCounterCycleCallback = std::function<uint64_t()>;

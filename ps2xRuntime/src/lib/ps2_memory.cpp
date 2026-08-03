@@ -159,7 +159,11 @@ namespace
     // so the whole read-modify-write is a single atomic step -- this register is
     // also touched by the vsync worker (FIELD bit) and the GIF (SIGNAL/FINISH) on
     // other threads, so a load-then-store here would race with them.
-    inline void writeCsrHalf(std::atomic<uint64_t> &csr, uint32_t off, uint32_t value)
+    inline void writeCsrHalf(
+        std::atomic<uint64_t> &csr,
+        uint32_t off,
+        uint32_t value,
+        uint32_t writeMask = 0xFFFFFFFFu)
     {
         constexpr uint32_t kW1cMask = 0x3u;
         uint64_t expected = csr.load();
@@ -169,29 +173,41 @@ namespace
             if (off == 0u)
             {
                 uint32_t oldLow = static_cast<uint32_t>(expected & 0xFFFFFFFFull);
-                uint32_t mergedLow = (oldLow & kW1cMask) | (value & ~kW1cMask);
+                const uint32_t ordinaryMask = writeMask & ~kW1cMask;
+                uint32_t mergedLow =
+                    (oldLow & ~ordinaryMask) |
+                    (value & ordinaryMask);
                 desired = (expected & 0xFFFFFFFF00000000ull) | static_cast<uint64_t>(mergedLow);
-                desired &= ~static_cast<uint64_t>(value & kW1cMask);
+                desired &= ~static_cast<uint64_t>(value & writeMask & kW1cMask);
             }
             else
             {
-                uint64_t mask = 0xFFFFFFFFull << (off * 8u);
-                desired = (expected & ~mask) | (static_cast<uint64_t>(value) << (off * 8u));
+                const uint64_t mask =
+                    static_cast<uint64_t>(writeMask) << (off * 8u);
+                desired =
+                    (expected & ~mask) |
+                    ((static_cast<uint64_t>(value) << (off * 8u)) & mask);
             }
         } while (!csr.compare_exchange_weak(expected, desired));
     }
 
     // Same as writeCsrHalf but for a full 64-bit CSR write (bits 0..1 are still
     // write-one-to-clear against the current value).
-    inline void writeCsrFull(std::atomic<uint64_t> &csr, uint64_t value)
+    inline void writeCsrFull(
+        std::atomic<uint64_t> &csr,
+        uint64_t value,
+        uint64_t writeMask = 0xFFFFFFFFFFFFFFFFull)
     {
         constexpr uint64_t kW1cMask = 0x3ull;
         uint64_t expected = csr.load();
         uint64_t desired;
         do
         {
-            desired = (expected & kW1cMask) | (value & ~kW1cMask);
-            desired &= ~(value & kW1cMask);
+            const uint64_t ordinaryMask = writeMask & ~kW1cMask;
+            desired =
+                (expected & ~ordinaryMask) |
+                (value & ordinaryMask);
+            desired &= ~(value & writeMask & kW1cMask);
         } while (!csr.compare_exchange_weak(expected, desired));
     }
 
@@ -200,6 +216,55 @@ namespace
     constexpr uint32_t kEeCounterIntcMask =
         (1u << 9u) | (1u << 10u) |
         (1u << 11u) | (1u << 12u);
+
+    std::optional<uint32_t> vifRegisterValue(
+        const VIFRegisters &regs,
+        uint32_t offset)
+    {
+        switch (offset)
+        {
+        case 0x00u:
+            return regs.stat;
+        case 0x20u:
+            return regs.err;
+        case 0x30u:
+            return regs.mark;
+        case 0x40u:
+            return regs.cycle;
+        case 0x50u:
+            return regs.mode;
+        case 0x60u:
+            return regs.num;
+        case 0x70u:
+            return regs.mask;
+        case 0x80u:
+            return regs.code;
+        case 0x90u:
+            return regs.itops;
+        case 0xA0u:
+            return regs.base;
+        case 0xB0u:
+            return regs.ofst;
+        case 0xC0u:
+            return regs.tops;
+        case 0xD0u:
+            return regs.itop;
+        case 0xE0u:
+            return regs.top;
+        case 0x100u:
+        case 0x110u:
+        case 0x120u:
+        case 0x130u:
+            return regs.row[(offset - 0x100u) / 0x10u];
+        case 0x140u:
+        case 0x150u:
+        case 0x160u:
+        case 0x170u:
+            return regs.col[(offset - 0x140u) / 0x10u];
+        default:
+            return std::nullopt;
+        }
+    }
 
     struct DmaTagView
     {
@@ -3066,6 +3131,17 @@ void PS2Memory::write8(uint32_t address, uint8_t value, uint32_t writerPc)
     const bool scratch = isScratchpad(address);
     uint32_t physAddr = translateAddress(address);
 
+    if (isGsPrivReg(physAddr))
+    {
+        const uint32_t shift = (physAddr & 3u) * 8u;
+        writeMasked32(
+            physAddr & ~3u,
+            static_cast<uint32_t>(value) << shift,
+            static_cast<uint8_t>(1u << (physAddr & 3u)),
+            writerPc);
+        return;
+    }
+
     if (scratch)
     {
         m_scratchpad[physAddr] = value;
@@ -3089,14 +3165,12 @@ void PS2Memory::write8(uint32_t address, uint8_t value, uint32_t writerPc)
     }
     if (isIoRegister(physAddr))
     {
-        // IO registers - handle byte writes by modifying the appropriate byte in the word
-        uint32_t regAddr = physAddr & ~0x3;
-        uint32_t shift = (physAddr & 3) * 8;
-        uint32_t mask = ~(0xFF << shift);
-        uint32_t newValue =
-            (readIORegister(regAddr) & mask) |
-            (static_cast<uint32_t>(value) << shift);
-        writeIORegister(regAddr, newValue);
+        const uint32_t regAddr = physAddr & ~3u;
+        const uint32_t lane = physAddr & 3u;
+        writeIORegisterMasked(
+            regAddr,
+            static_cast<uint32_t>(value) << (lane * 8u),
+            static_cast<uint8_t>(1u << lane));
     }
 }
 
@@ -3109,6 +3183,17 @@ void PS2Memory::write16(uint32_t address, uint16_t value, uint32_t writerPc)
 
     const bool scratch = isScratchpad(address);
     uint32_t physAddr = translateAddress(address);
+
+    if (isGsPrivReg(physAddr))
+    {
+        const uint32_t lane = physAddr & 2u;
+        writeMasked32(
+            physAddr & ~3u,
+            static_cast<uint32_t>(value) << (lane * 8u),
+            static_cast<uint8_t>(0x3u << lane),
+            writerPc);
+        return;
+    }
 
     if (scratch)
     {
@@ -3132,13 +3217,12 @@ void PS2Memory::write16(uint32_t address, uint16_t value, uint32_t writerPc)
     }
     if (isIoRegister(physAddr))
     {
-        uint32_t regAddr = physAddr & ~0x3;
-        uint32_t shift = (physAddr & 2) * 8;
-        uint32_t mask = ~(0xFFFF << shift);
-        uint32_t newValue =
-            (readIORegister(regAddr) & mask) |
-            (static_cast<uint32_t>(value) << shift);
-        writeIORegister(regAddr, newValue);
+        const uint32_t regAddr = physAddr & ~3u;
+        const uint32_t lane = physAddr & 2u;
+        writeIORegisterMasked(
+            regAddr,
+            static_cast<uint32_t>(value) << (lane * 8u),
+            static_cast<uint8_t>(0x3u << lane));
     }
 }
 
@@ -3252,6 +3336,211 @@ void PS2Memory::write64(uint32_t address, uint64_t value, uint32_t writerPc)
     }
 }
 
+void PS2Memory::writeMasked32(
+    uint32_t address,
+    uint32_t value,
+    uint8_t byteEnable,
+    uint32_t writerPc)
+{
+    if (address & 3u)
+    {
+        throw std::runtime_error(
+            "Unaligned masked 32-bit write at address: 0x" +
+            std::to_string(address));
+    }
+    const Ps2ByteEnableSpan span =
+        Ps2DecodeByteEnableSpan(byteEnable, 4u);
+    if (!span.valid)
+    {
+        throw std::runtime_error("Invalid masked 32-bit byte enables");
+    }
+    if (span.size == 0u)
+    {
+        return;
+    }
+
+    const uint32_t writeMask = static_cast<uint32_t>(
+        Ps2ExpandByteEnableMask(byteEnable, 4u));
+    if (isGsPrivReg(address))
+    {
+        const uint32_t off = address & 7u;
+        const uint32_t regOff =
+            (address - PS2_GS_PRIV_REG_BASE) & ~7u;
+        if (regOff == kGsCsrRegOffset)
+        {
+            writeCsrHalf(gs_regs.csr, off, value, writeMask);
+        }
+        else if (uint64_t *reg = gsRegPtr(gs_regs, address))
+        {
+            const uint64_t shiftedMask =
+                static_cast<uint64_t>(writeMask) << (off * 8u);
+            const uint64_t shiftedValue =
+                static_cast<uint64_t>(value) << (off * 8u);
+            *reg = (*reg & ~shiftedMask) |
+                   (shiftedValue & shiftedMask);
+        }
+        m_gsWriteCount.fetch_add(1, std::memory_order_relaxed);
+        return;
+    }
+
+    const bool scratch = isScratchpad(address);
+    const uint32_t physAddr = translateAddress(address);
+    auto writeBytes = [&](uint8_t *destination)
+    {
+        for (uint32_t index = span.offset;
+             index < span.offset + span.size;
+             ++index)
+        {
+            destination[index] = static_cast<uint8_t>(
+                value >> (index * 8u));
+        }
+    };
+
+    if (scratch)
+    {
+        inRange(
+            physAddr, sizeof(value), PS2_SCRATCHPAD_SIZE,
+            "writeMasked32 scratchpad", address);
+        writeBytes(m_scratchpad + physAddr);
+        return;
+    }
+    if (physAddr < PS2_RAM_SIZE)
+    {
+        inRange(
+            physAddr, sizeof(value), PS2_RAM_SIZE,
+            "writeMasked32 rdram", address);
+        markModified(
+            physAddr + span.offset, span.size, writerPc);
+        writeBytes(m_rdram + physAddr);
+        return;
+    }
+
+    uint32_t vuOffset = 0u;
+    uint32_t vuLimit = 0u;
+    if (uint8_t *vuMem =
+            mapVuMemory(physAddr, sizeof(value), vuOffset, vuLimit))
+    {
+        inRange(
+            vuOffset, sizeof(value), vuLimit,
+            "writeMasked32 vu", address);
+        writeBytes(vuMem + vuOffset);
+        markVUCodeModified(vuMem);
+        return;
+    }
+    if (isIoRegister(physAddr))
+    {
+        writeIORegisterMasked(physAddr, value, byteEnable);
+    }
+}
+
+void PS2Memory::writeMasked64(
+    uint32_t address,
+    uint64_t value,
+    uint8_t byteEnable,
+    uint32_t writerPc)
+{
+    if (address & 7u)
+    {
+        throw std::runtime_error(
+            "Unaligned masked 64-bit write at address: 0x" +
+            std::to_string(address));
+    }
+    const Ps2ByteEnableSpan span =
+        Ps2DecodeByteEnableSpan(byteEnable, 8u);
+    if (!span.valid)
+    {
+        throw std::runtime_error("Invalid masked 64-bit byte enables");
+    }
+    if (span.size == 0u)
+    {
+        return;
+    }
+
+    const uint64_t writeMask =
+        Ps2ExpandByteEnableMask(byteEnable, 8u);
+    if (isGsPrivReg(address))
+    {
+        const uint32_t regOff =
+            (address - PS2_GS_PRIV_REG_BASE) & ~7u;
+        if (regOff == kGsCsrRegOffset)
+        {
+            writeCsrFull(gs_regs.csr, value, writeMask);
+        }
+        else if (uint64_t *reg = gsRegPtr(gs_regs, address))
+        {
+            *reg = (*reg & ~writeMask) |
+                   (value & writeMask);
+        }
+        m_gsWriteCount.fetch_add(1, std::memory_order_relaxed);
+        return;
+    }
+
+    const bool scratch = isScratchpad(address);
+    const uint32_t physAddr = translateAddress(address);
+    auto writeBytes = [&](uint8_t *destination)
+    {
+        for (uint32_t index = span.offset;
+             index < span.offset + span.size;
+             ++index)
+        {
+            destination[index] = static_cast<uint8_t>(
+                value >> (index * 8u));
+        }
+    };
+
+    if (scratch)
+    {
+        inRange(
+            physAddr, sizeof(value), PS2_SCRATCHPAD_SIZE,
+            "writeMasked64 scratchpad", address);
+        writeBytes(m_scratchpad + physAddr);
+        return;
+    }
+    if (physAddr < PS2_RAM_SIZE)
+    {
+        inRange(
+            physAddr, sizeof(value), PS2_RAM_SIZE,
+            "writeMasked64 rdram", address);
+        markModified(
+            physAddr + span.offset, span.size, writerPc);
+        writeBytes(m_rdram + physAddr);
+        return;
+    }
+
+    uint32_t vuOffset = 0u;
+    uint32_t vuLimit = 0u;
+    if (uint8_t *vuMem =
+            mapVuMemory(physAddr, sizeof(value), vuOffset, vuLimit))
+    {
+        inRange(
+            vuOffset, sizeof(value), vuLimit,
+            "writeMasked64 vu", address);
+        writeBytes(vuMem + vuOffset);
+        markVUCodeModified(vuMem);
+        return;
+    }
+    if (isIoRegister(physAddr))
+    {
+        const uint8_t lowEnable = byteEnable & 0xFu;
+        const uint8_t highEnable =
+            static_cast<uint8_t>((byteEnable >> 4u) & 0xFu);
+        if (lowEnable != 0u)
+        {
+            writeIORegisterMasked(
+                physAddr,
+                static_cast<uint32_t>(value),
+                lowEnable);
+        }
+        if (highEnable != 0u)
+        {
+            writeIORegisterMasked(
+                physAddr + 4u,
+                static_cast<uint32_t>(value >> 32u),
+                highEnable);
+        }
+    }
+}
+
 void PS2Memory::write128(uint32_t address, __m128i value, uint32_t writerPc)
 {
     if (address & 15)
@@ -3308,12 +3597,63 @@ void PS2Memory::write128(uint32_t address, __m128i value, uint32_t writerPc)
 
 bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
 {
+    return writeIORegisterMasked(address, value, 0xFu);
+}
+
+bool PS2Memory::writeIORegisterMasked(
+    uint32_t address,
+    uint32_t value,
+    uint8_t byteEnable)
+{
+    const Ps2ByteEnableSpan span =
+        Ps2DecodeByteEnableSpan(byteEnable, 4u);
+    if (!span.valid)
+    {
+        return false;
+    }
+    if (span.size == 0u)
+    {
+        return true;
+    }
+
+    const uint32_t writeMask = static_cast<uint32_t>(
+        Ps2ExpandByteEnableMask(byteEnable, 4u));
+    const uint32_t writeValue = value & writeMask;
+    const auto currentIt = m_ioRegisters.find(address);
+    uint32_t currentValue =
+        currentIt != m_ioRegisters.end()
+            ? currentIt->second
+            : 0u;
+    if ((address >= 0x10003800u &&
+         address < 0x10003A00u) ||
+        (address >= 0x10003C00u &&
+         address < 0x10003E00u))
+    {
+        const uint32_t base =
+            address < 0x10003C00u
+                ? 0x10003800u
+                : 0x10003C00u;
+        const VIFRegisters &regs =
+            base == 0x10003800u
+                ? vif0_regs
+                : vif1_regs;
+        if (const std::optional<uint32_t> vifValue =
+                vifRegisterValue(regs, address - base);
+            vifValue.has_value())
+        {
+            currentValue = *vifValue;
+        }
+    }
+    const uint32_t mergedValue =
+        (currentValue & ~writeMask) | writeValue;
+
     ps2x::timing::EeCounterAdvanceResult counterAdvance{};
     if (m_eeCounters.writeRegister(
             address,
             value,
             currentEeCounterCycle(),
-            &counterAdvance))
+            &counterAdvance,
+            writeMask))
     {
         publishEeCounterAdvance(counterAdvance);
         return true;
@@ -3322,7 +3662,7 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
     if (address == kIntcStat)
     {
         m_ioRegisters[kIntcStat] =
-            intcStatus() & ~value;
+            intcStatus() & ~writeValue;
         publishEeCounterAdvance({}, true);
         return true;
     }
@@ -3330,7 +3670,7 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
     {
         // EE INTC_MASK bits toggle when written as one.
         m_ioRegisters[kIntcMask] =
-            intcMask() ^ value;
+            intcMask() ^ writeValue;
         publishEeCounterAdvance({}, true);
         return true;
     }
@@ -3340,17 +3680,21 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
         // NB: unreachable from write8/16/32/64 today since those all funnel IO
         // register writes through addresses in PS2_IO_BASE's range, which is
         // disjoint from PS2_GS_PRIV_REG_BASE; kept correct for direct callers.
-        m_ioRegisters[address] = value;
+        m_ioRegisters[address] = mergedValue;
         const uint32_t off = address & 7u;
         const uint32_t regOff = (address - PS2_GS_PRIV_REG_BASE) & ~0x7u;
         if (regOff == kGsCsrRegOffset)
         {
-            writeCsrHalf(gs_regs.csr, off, value);
+            writeCsrHalf(
+                gs_regs.csr, off, value, writeMask);
         }
         else if (uint64_t *reg = gsRegPtr(gs_regs, address))
         {
-            const uint64_t mask = 0xFFFFFFFFull << (off * 8u);
-            *reg = (*reg & ~mask) | (static_cast<uint64_t>(value) << (off * 8u));
+            const uint64_t mask =
+                static_cast<uint64_t>(writeMask) << (off * 8u);
+            *reg =
+                (*reg & ~mask) |
+                ((static_cast<uint64_t>(value) << (off * 8u)) & mask);
         }
         m_gsWriteCount.fetch_add(1, std::memory_order_relaxed);
         return true;
@@ -3360,8 +3704,9 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
     {
         if (address == 0x10002010)
         {
-            m_ioRegisters[address] = value & ~(1u << 31);
-            if (value & (1u << 30))
+            m_ioRegisters[address] =
+                mergedValue & ~(1u << 31);
+            if (writeValue & (1u << 30))
             {
                 clearIpuOutputFifo();
                 clearIpuInputFifo();
@@ -3386,7 +3731,7 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
         }
         else
         {
-            m_ioRegisters[address] = value;
+            m_ioRegisters[address] = mergedValue;
         }
         return true;
     }
@@ -3400,8 +3745,9 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
         if (address == kGifCtrl)
         {
             const bool wasPaused = isGifPaused();
-            m_ioRegisters[kGifCtrl] = value & 0x9u;
-            if ((value & 0x1u) != 0u)
+            m_ioRegisters[kGifCtrl] =
+                mergedValue & 0x9u;
+            if ((writeValue & 0x1u) != 0u)
             {
                 if (m_gifArbiter)
                     m_gifArbiter->reset();
@@ -3423,9 +3769,9 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
             const bool wasM3r =
                 m_gifModePath3Masked;
             m_ioRegisters[kGifMode] =
-                value & 0x5u;
+                mergedValue & 0x5u;
             m_gifModePath3Masked =
-                (value & 0x1u) != 0u;
+                (mergedValue & 0x1u) != 0u;
             updateGifStat();
             if (wasM3r &&
                 !m_gifModePath3Masked &&
@@ -3451,8 +3797,8 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
         uint32_t mask = (current >> 16) & 0x3FFu;
 
         // D_STAT low bits are W1C status, high bits [16..25] toggle masks on write-one.
-        status &= ~(value & 0x3FFu);
-        mask ^= ((value >> 16) & 0x3FFu);
+        status &= ~(writeValue & 0x3FFu);
+        mask ^= ((writeValue >> 16) & 0x3FFu);
 
         uint32_t next = (current & ~((0x3FFu) | (0x3FFu << 16) | (1u << 31)));
         next |= status | (mask << 16);
@@ -3469,7 +3815,7 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
     if (address == 0x1000E000u) // D_CTRL
     {
         const bool wasEnabled = isDmacEnabled();
-        m_ioRegisters[address] = value;
+        m_ioRegisters[address] = mergedValue;
         const bool enabled = isDmacEnabled();
         if (m_vif0Dma.active && wasEnabled != enabled)
         {
@@ -3566,7 +3912,7 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
         return true;
     }
 
-    m_ioRegisters[address] = value;
+    m_ioRegisters[address] = mergedValue;
 
     if (address >= 0x10003C00u && address < 0x10003E00u)
     {
@@ -3575,7 +3921,7 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
         switch (address)
         {
         case 0x10003C10u:     // VIF1_FBRST
-            if (value & 0x1u) // RST
+            if (writeValue & 0x1u) // RST
             {
                 std::memset(&vif1_regs, 0, sizeof(vif1_regs));
                 m_vif1PendingPath2DirectQwc = 0u;
@@ -3598,7 +3944,7 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
                     m_vif1ResetCallback();
                 break;
             }
-            if (value & 0x2u) // FBK
+            if (writeValue & 0x2u) // FBK
             {
                 vif1_regs.stat |= (1u << 9u); // VFS
                 vif1_regs.stat &= ~0x3u;       // VPS idle
@@ -3611,7 +3957,7 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
                     m_vif1DmaCancelCallback();
                 }
             }
-            if (value & 0x4u) // STP
+            if (writeValue & 0x4u) // STP
             {
                 vif1_regs.stat |= (1u << 8u); // VSS
                 vif1_regs.stat &= ~0x3u;       // VPS idle
@@ -3624,7 +3970,7 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
                     m_vif1DmaCancelCallback();
                 }
             }
-            if (value & 0x8u) // STC
+            if (writeValue & 0x8u) // STC
             {
                 vif1_regs.stat &= ~((1u << 8) | (1u << 9) | (1u << 10) | (1u << 11) | (1u << 12) | (1u << 13));
                 if (m_vif1Dma.active)
@@ -3634,41 +3980,41 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
             }
             break;
         case 0x10003C30u:
-            vif1_regs.mark = value & 0xFFFFu;
+            vif1_regs.mark = mergedValue & 0xFFFFu;
             vif1_regs.stat &= ~(1u << 6); // clear MRK flag on CPU write
             break;
         case 0x10003C40u:
-            vif1_regs.cycle = value & 0xFFFFu;
+            vif1_regs.cycle = mergedValue & 0xFFFFu;
             break;
         case 0x10003C50u:
-            vif1_regs.mode = value & 0x3u;
+            vif1_regs.mode = mergedValue & 0x3u;
             break;
         case 0x10003C60u:
-            vif1_regs.num = value & 0xFFu;
+            vif1_regs.num = mergedValue & 0xFFu;
             break;
         case 0x10003C70u:
-            vif1_regs.mask = value;
+            vif1_regs.mask = mergedValue;
             break;
         case 0x10003C80u:
-            vif1_regs.code = value;
+            vif1_regs.code = mergedValue;
             break;
         case 0x10003C90u:
-            vif1_regs.itops = value & 0x3FFu;
+            vif1_regs.itops = mergedValue & 0x3FFu;
             break;
         case 0x10003CA0u:
-            vif1_regs.base = value & 0x3FFu;
+            vif1_regs.base = mergedValue & 0x3FFu;
             break;
         case 0x10003CB0u:
-            vif1_regs.ofst = value & 0x3FFu;
+            vif1_regs.ofst = mergedValue & 0x3FFu;
             break;
         case 0x10003CC0u:
-            vif1_regs.tops = value & 0x3FFu;
+            vif1_regs.tops = mergedValue & 0x3FFu;
             break;
         case 0x10003CD0u:
-            vif1_regs.itop = value & 0x3FFu;
+            vif1_regs.itop = mergedValue & 0x3FFu;
             break;
         case 0x10003CE0u:
-            vif1_regs.top = value & 0x3FFu;
+            vif1_regs.top = mergedValue & 0x3FFu;
             break;
         default:
             break;
@@ -3684,7 +4030,7 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
         switch (address)
         {
         case 0x10003810u:     // VIF0_FBRST
-            if (value & 0x1u) // RST
+            if (writeValue & 0x1u) // RST
             {
                 std::memset(&vif0_regs, 0, sizeof(vif0_regs));
                 m_vif0WaitingForVu = false;
@@ -3694,7 +4040,7 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
                     m_vif0ResetCallback();
                 break;
             }
-            if (value & 0x2u) // FBK
+            if (writeValue & 0x2u) // FBK
             {
                 vif0_regs.stat |= (1u << 9u); // VFS
                 vif0_regs.stat &= ~0x3u;       // VPS idle
@@ -3707,7 +4053,7 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
                     m_vif0DmaCancelCallback();
                 }
             }
-            if (value & 0x4u) // STP
+            if (writeValue & 0x4u) // STP
             {
                 vif0_regs.stat |= (1u << 8u); // VSS
                 vif0_regs.stat &= ~0x3u;       // VPS idle
@@ -3720,7 +4066,7 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
                     m_vif0DmaCancelCallback();
                 }
             }
-            if (value & 0x8u) // STC
+            if (writeValue & 0x8u) // STC
             {
                 vif0_regs.stat &=
                     ~((1u << 8u) | (1u << 9u) |
@@ -3733,29 +4079,29 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
             }
             break;
         case 0x10003830u:
-            vif0_regs.mark = value & 0xFFFFu;
+            vif0_regs.mark = mergedValue & 0xFFFFu;
             vif0_regs.stat &= ~(1u << 6); // clear MRK
             break;
         case 0x10003840u:
-            vif0_regs.cycle = value & 0xFFFFu;
+            vif0_regs.cycle = mergedValue & 0xFFFFu;
             break;
         case 0x10003850u:
-            vif0_regs.mode = value & 0x3u;
+            vif0_regs.mode = mergedValue & 0x3u;
             break;
         case 0x10003860u:
-            vif0_regs.num = value & 0xFFu;
+            vif0_regs.num = mergedValue & 0xFFu;
             break;
         case 0x10003870u:
-            vif0_regs.mask = value;
+            vif0_regs.mask = mergedValue;
             break;
         case 0x10003880u:
-            vif0_regs.code = value;
+            vif0_regs.code = mergedValue;
             break;
         case 0x10003890u:
-            vif0_regs.itops = value & 0xFFu;
+            vif0_regs.itops = mergedValue & 0xFFu;
             break;
         case 0x100038D0u:
-            vif0_regs.itop = value & 0xFFu;
+            vif0_regs.itop = mergedValue & 0xFFu;
             break;
         default:
             break;
@@ -3769,9 +4115,12 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
             address & 0xFFFFFF00u;
         const std::optional<DmacChannel> channel =
             dmacChannelFromBase(channelBase);
+        const bool writesStr =
+            (writeMask & 0x100u) != 0u;
         if ((address & 0xFFu) == 0x00u &&
             channel.has_value() &&
-            (value & 0x100u) == 0u)
+            writesStr &&
+            (mergedValue & 0x100u) == 0u)
         {
             (void)cancelDmacTransfer(*channel);
             return true;
@@ -3779,7 +4128,8 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
 
         if ((address & 0xFFu) == 0x00u &&
             channel.has_value() &&
-            (value & 0x100u) != 0u)
+            writesStr &&
+            (mergedValue & 0x100u) != 0u)
         {
             const auto dctrlIt = m_ioRegisters.find(0x1000E000u);
             const bool dmacEnabled = (dctrlIt == m_ioRegisters.end()) || ((dctrlIt->second & 0x1u) != 0u);
@@ -3799,7 +4149,7 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
 
             if (channelBase == 0x1000B000u)
             {
-                (void)startFromIpuDma(transfer, value);
+                (void)startFromIpuDma(transfer, mergedValue);
                 const FromIpuDmaAdvanceResult initial =
                     advanceFromIpuDma();
                 if (initial.active &&
@@ -3816,7 +4166,7 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
 
             if (channelBase == 0x1000B400u)
             {
-                (void)startToIpuDma(transfer, value);
+                (void)startToIpuDma(transfer, mergedValue);
                 const ToIpuDmaAdvanceResult initial =
                     advanceToIpuDma();
                 if (initial.active &&
@@ -3833,7 +4183,7 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
 
             if (channelBase == 0x1000D000u || channelBase == 0x1000D400u)
             {
-                (void)startScratchpadDma(transfer, value);
+                (void)startScratchpadDma(transfer, mergedValue);
                 ScratchpadDmaSnapshot submitted =
                     scratchpadDmaSnapshot(*channel);
                 uint32_t initialDelayEeCycles = 0u;
@@ -3869,12 +4219,12 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
             {
                 m_ioRegisters[channelBase + 0x20u] = qwc;
                 beginVif1DmaTrace(
-                    value, madr, qwc,
+                    mergedValue, madr, qwc,
                     m_ioRegisters[channelBase + 0x30u],
                     m_ioRegisters[channelBase + 0x40u],
                     m_ioRegisters[channelBase + 0x50u],
                     m_ioRegisters[channelBase + 0x80u]);
-                (void)startVif1Dma(transfer, value);
+                (void)startVif1Dma(transfer, mergedValue);
                 if (!scheduleVif1Dma(4u))
                     drainVif1DmaCompatibility();
                 return true;
@@ -3883,7 +4233,7 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
             if (channelBase == 0x10008000u)
             {
                 m_ioRegisters[channelBase + 0x20u] = qwc;
-                (void)startVif0Dma(transfer, value);
+                (void)startVif0Dma(transfer, mergedValue);
                 if (!scheduleVif0Dma(4u))
                     drainVif0DmaCompatibility();
                 return true;
@@ -3891,7 +4241,7 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
 
             if (channelBase == 0x1000A000u && m_gsVRAM)
             {
-                (void)startGifDma(transfer, value);
+                (void)startGifDma(transfer, mergedValue);
                 const bool hasGifSink =
                     static_cast<bool>(m_gifPacketCallback) ||
                     m_gifArbiter != nullptr;
@@ -8458,48 +8808,11 @@ uint32_t PS2Memory::readIORegister(uint32_t address)
                 ? vif0_regs
                 : vif1_regs;
         const uint32_t offset = address - base;
-        switch (offset)
+        if (const std::optional<uint32_t> value =
+                vifRegisterValue(regs, offset);
+            value.has_value())
         {
-        case 0x00u:
-            return regs.stat;
-        case 0x20u:
-            return regs.err;
-        case 0x30u:
-            return regs.mark;
-        case 0x40u:
-            return regs.cycle;
-        case 0x50u:
-            return regs.mode;
-        case 0x60u:
-            return regs.num;
-        case 0x70u:
-            return regs.mask;
-        case 0x80u:
-            return regs.code;
-        case 0x90u:
-            return regs.itops;
-        case 0xA0u:
-            return regs.base;
-        case 0xB0u:
-            return regs.ofst;
-        case 0xC0u:
-            return regs.tops;
-        case 0xD0u:
-            return regs.itop;
-        case 0xE0u:
-            return regs.top;
-        case 0x100u:
-        case 0x110u:
-        case 0x120u:
-        case 0x130u:
-            return regs.row[(offset - 0x100u) / 0x10u];
-        case 0x140u:
-        case 0x150u:
-        case 0x160u:
-        case 0x170u:
-            return regs.col[(offset - 0x140u) / 0x10u];
-        default:
-            break;
+            return *value;
         }
     }
 

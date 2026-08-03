@@ -1479,6 +1479,8 @@ public:
     void Store16(uint8_t *rdram, R5900Context *ctx, uint32_t vaddr, uint16_t value);
     void Store32(uint8_t *rdram, R5900Context *ctx, uint32_t vaddr, uint32_t value);
     void Store64(uint8_t *rdram, R5900Context *ctx, uint32_t vaddr, uint64_t value);
+    void StoreMasked32(uint8_t *rdram, R5900Context *ctx, uint32_t vaddr, uint32_t value, uint8_t byteEnable);
+    void StoreMasked64(uint8_t *rdram, R5900Context *ctx, uint32_t vaddr, uint64_t value, uint8_t byteEnable);
     void Store128(uint8_t *rdram, R5900Context *ctx, uint32_t vaddr, __m128i value);
     void kickGifDmaChainFromMMIO(uint8_t *rdram,
                                  R5900Context *ctx,

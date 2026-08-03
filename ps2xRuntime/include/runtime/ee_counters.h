@@ -88,7 +88,8 @@ namespace ps2x::timing
             uint32_t address,
             uint32_t value,
             uint64_t currentCycle,
-            EeCounterAdvanceResult *advance = nullptr) noexcept;
+            EeCounterAdvanceResult *advance = nullptr,
+            uint32_t writeMask = 0xFFFFFFFFu) noexcept;
 
         [[nodiscard]] std::optional<uint64_t>
         nextEventCycle() const noexcept;

@@ -579,6 +579,54 @@ void register_code_generator_tests()
                  "silently aligned SQ should not be treated as an address error");
     });
 
+    tc.Run("EE partial stores preserve byte enables without memory loads", [](TestCase &t) {
+        CodeGenerator gen({}, {});
+        const Instruction swl = makeIType(0x2900, OPCODE_SWL, 1, 2, 3);
+        const Instruction swr = makeIType(0x2904, OPCODE_SWR, 3, 4, 5);
+        const Instruction sdl = makeIType(0x2908, OPCODE_SDL, 5, 6, 7);
+        const Instruction sdr = makeIType(0x290C, OPCODE_SDR, 7, 8, 9);
+
+        const std::string swlCode = gen.translateInstruction(swl);
+        const std::string swrCode = gen.translateInstruction(swr);
+        const std::string sdlCode = gen.translateInstruction(sdl);
+        const std::string sdrCode = gen.translateInstruction(sdr);
+
+        t.IsTrue(swlCode.find("WRITE_MASKED32(aligned_addr") != std::string::npos,
+                 "SWL should issue one masked 32-bit store");
+        t.IsTrue(swrCode.find("WRITE_MASKED32(aligned_addr") != std::string::npos,
+                 "SWR should issue one masked 32-bit store");
+        t.IsTrue(sdlCode.find("WRITE_MASKED64(aligned_addr") != std::string::npos,
+                 "SDL should issue one masked 64-bit store");
+        t.IsTrue(sdrCode.find("WRITE_MASKED64(aligned_addr") != std::string::npos,
+                 "SDR should issue one masked 64-bit store");
+        t.IsTrue(
+            swlCode.find("byte_enable = (uint8_t)((1u << (offset + 1u)) - 1u)") !=
+                    std::string::npos &&
+                swlCode.find("GPR_U32(ctx, 2) >> shift") != std::string::npos,
+            "SWL should enable low lanes through the effective byte and shift the source right");
+        t.IsTrue(
+            swrCode.find("byte_enable = (uint8_t)((0xFu << offset) & 0xFu)") !=
+                    std::string::npos &&
+                swrCode.find("GPR_U32(ctx, 4) << shift") != std::string::npos,
+            "SWR should enable lanes from the effective byte upward and shift the source left");
+        t.IsTrue(
+            sdlCode.find("byte_enable = (uint8_t)((1u << (offset + 1u)) - 1u)") !=
+                    std::string::npos &&
+                sdlCode.find("GPR_U64(ctx, 6) >> shift") != std::string::npos,
+            "SDL should enable low lanes through the effective byte and shift the source right");
+        t.IsTrue(
+            sdrCode.find("byte_enable = (uint8_t)((0xFFu << offset) & 0xFFu)") !=
+                    std::string::npos &&
+                sdrCode.find("GPR_U64(ctx, 8) << shift") != std::string::npos,
+            "SDR should enable lanes from the effective byte upward and shift the source left");
+        t.IsTrue(swlCode.find("READ32(") == std::string::npos &&
+                     swrCode.find("READ32(") == std::string::npos,
+                 "SWL and SWR must not issue an architectural memory read");
+        t.IsTrue(sdlCode.find("READ64(") == std::string::npos &&
+                     sdrCode.find("READ64(") == std::string::npos,
+                 "SDL and SDR must not issue an architectural memory read");
+    });
+
     tc.Run("known GIF DMA MMIO sequence emits native kick helper", [](TestCase &t) {
         Function func;
         func.name = "gif_dma_kick";

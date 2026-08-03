@@ -567,6 +567,40 @@ static inline void Ps2FastWrite64(uint8_t *rdram, uint32_t addr, uint64_t value)
     std::memcpy(rdram + offset, &value, sizeof(value));
 }
 
+static inline void Ps2FastWriteMasked32(
+    uint8_t *rdram,
+    uint32_t addr,
+    uint32_t value,
+    uint8_t byteEnable)
+{
+    const uint32_t offset = addr & PS2_RAM_MASK;
+    for (uint32_t index = 0u; index < 4u; ++index)
+    {
+        if ((byteEnable & (1u << index)) != 0u)
+        {
+            rdram[offset + index] = static_cast<uint8_t>(
+                value >> (index * 8u));
+        }
+    }
+}
+
+static inline void Ps2FastWriteMasked64(
+    uint8_t *rdram,
+    uint32_t addr,
+    uint64_t value,
+    uint8_t byteEnable)
+{
+    const uint32_t offset = addr & PS2_RAM_MASK;
+    for (uint32_t index = 0u; index < 8u; ++index)
+    {
+        if ((byteEnable & (1u << index)) != 0u)
+        {
+            rdram[offset + index] = static_cast<uint8_t>(
+                value >> (index * 8u));
+        }
+    }
+}
+
 static inline void Ps2FastWrite128(uint8_t *rdram, uint32_t addr, __m128i value)
 {
     const uint32_t offset = addr & PS2_RAM_MASK;
@@ -721,6 +755,60 @@ static inline void Ps2FastWrite128(uint8_t *rdram, uint32_t addr, __m128i value)
             ps2TraceGuestWrite(rdram, _addr, 8u, (uint64_t)(val), 0u, "WRITE64", ctx); \
             FAST_WRITE64(_addr, (val));                                                \
         }                                                                              \
+    } while (0)
+
+#define WRITE_MASKED32(addr, val, byteEnable)                                      \
+    do                                                                              \
+    {                                                                               \
+        const uint32_t _addr = (uint32_t)(addr);                                    \
+        const uint32_t _value = (uint32_t)(val);                                    \
+        const uint8_t _byte_enable = (uint8_t)(byteEnable);                         \
+        const Ps2ByteEnableSpan _span =                                             \
+            Ps2DecodeByteEnableSpan(_byte_enable, 4u);                              \
+        if (!_span.valid || !Ps2CanUseFastRdramAccess(_addr, 4u))                   \
+            runtime->StoreMasked32(                                                 \
+                rdram, ctx, _addr, _value, _byte_enable);                           \
+        else if (_span.size != 0u)                                                  \
+        {                                                                           \
+            const uint32_t _selected_addr = _addr + _span.offset;                   \
+            const uint32_t _selected_value =                                        \
+                _value >> (_span.offset * 8u);                                      \
+            runtime->debugObserveMemoryAccess(                                      \
+                _selected_addr, _span.size,                                         \
+                PS2Runtime::DebugMemoryAccess::Write, ctx);                         \
+            ps2TraceGuestWrite(                                                     \
+                rdram, _selected_addr, _span.size, _selected_value, 0u,             \
+                "WRITE_MASKED32", ctx);                                             \
+            Ps2FastWriteMasked32(                                                   \
+                rdram, _addr, _value, _byte_enable);                                \
+        }                                                                           \
+    } while (0)
+
+#define WRITE_MASKED64(addr, val, byteEnable)                                      \
+    do                                                                              \
+    {                                                                               \
+        const uint32_t _addr = (uint32_t)(addr);                                    \
+        const uint64_t _value = (uint64_t)(val);                                    \
+        const uint8_t _byte_enable = (uint8_t)(byteEnable);                         \
+        const Ps2ByteEnableSpan _span =                                             \
+            Ps2DecodeByteEnableSpan(_byte_enable, 8u);                              \
+        if (!_span.valid || !Ps2CanUseFastRdramAccess(_addr, 8u))                   \
+            runtime->StoreMasked64(                                                 \
+                rdram, ctx, _addr, _value, _byte_enable);                           \
+        else if (_span.size != 0u)                                                  \
+        {                                                                           \
+            const uint32_t _selected_addr = _addr + _span.offset;                   \
+            const uint64_t _selected_value =                                        \
+                _value >> (_span.offset * 8u);                                      \
+            runtime->debugObserveMemoryAccess(                                      \
+                _selected_addr, _span.size,                                         \
+                PS2Runtime::DebugMemoryAccess::Write, ctx);                         \
+            ps2TraceGuestWrite(                                                     \
+                rdram, _selected_addr, _span.size, _selected_value, 0u,             \
+                "WRITE_MASKED64", ctx);                                             \
+            Ps2FastWriteMasked64(                                                   \
+                rdram, _addr, _value, _byte_enable);                                \
+        }                                                                           \
     } while (0)
 
 #define WRITE128(addr, val)                                                          \
