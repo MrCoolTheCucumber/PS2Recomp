@@ -1391,6 +1391,89 @@ void register_ps2_runtime_expansion_tests()
                 {0x80000003u, 0xffffffffu, 0xff000000u, 0xffffffffu});
         });
 
+        tc.Run("PINTH and PINTEH select architectural halfword lanes", [](TestCase &t)
+        {
+            constexpr uint8_t sourceRegister = 11u;
+            constexpr uint8_t targetRegister = 12u;
+            constexpr uint8_t destinationRegister = 13u;
+
+            const struct
+            {
+                const char *name;
+                uint32_t raw;
+                const char *helper;
+            } translations[] = {
+                {"PINTH", 0x716c6a89u, "PS2_PINTH"},
+                {"PINTEH", 0x716c6aa9u, "PS2_PINTEH"},
+            };
+
+            for (const auto &test : translations)
+            {
+                const Instruction instruction =
+                    R5900Decoder{}.decodeInstruction(
+                        0x00100000u, test.raw);
+                const std::string generated =
+                    CodeGenerator({}, {}).translateInstruction(
+                        instruction);
+                const std::string expected =
+                    std::string(test.helper) +
+                    "(GPR_VEC(ctx, 11), GPR_VEC(ctx, 12))";
+
+                t.Equals(
+                    instruction.rs,
+                    sourceRegister,
+                    std::string(test.name) +
+                        " should decode its first source from rs");
+                t.Equals(
+                    instruction.rt,
+                    targetRegister,
+                    std::string(test.name) +
+                        " should decode its second source from rt");
+                t.Equals(
+                    instruction.rd,
+                    destinationRegister,
+                    std::string(test.name) +
+                        " should decode the destination from rd");
+                t.IsTrue(
+                    generated.find(expected) != std::string::npos,
+                    std::string(test.name) +
+                        " translation should preserve rs/rt helper order");
+            }
+
+            const __m128i rs = Ps2MakeU16Vector(
+                0x1000u, 0x1001u, 0x1002u, 0x1003u,
+                0x1004u, 0x1005u, 0x1006u, 0x1007u);
+            const __m128i rt = Ps2MakeU16Vector(
+                0x2000u, 0x2001u, 0x2002u, 0x2003u,
+                0x2004u, 0x2005u, 0x2006u, 0x2007u);
+            const auto verifyHalfwords =
+                [&](const std::string &name,
+                    __m128i value,
+                    const std::array<uint16_t, 8u> &expected)
+            {
+                std::array<uint16_t, 8u> actual{};
+                std::memcpy(actual.data(), &value, sizeof(value));
+                for (size_t lane = 0u; lane < actual.size(); ++lane)
+                {
+                    t.Equals(
+                        actual[lane],
+                        expected[lane],
+                        name + " halfword lane " + std::to_string(lane));
+                }
+            };
+
+            verifyHalfwords(
+                "PINTH",
+                PS2_PINTH(rs, rt),
+                {0x2000u, 0x1004u, 0x2001u, 0x1005u,
+                 0x2002u, 0x1006u, 0x2003u, 0x1007u});
+            verifyHalfwords(
+                "PINTEH",
+                PS2_PINTEH(rs, rt),
+                {0x2000u, 0x1000u, 0x2002u, 0x1002u,
+                 0x2004u, 0x1004u, 0x2006u, 0x1006u});
+        });
+
         tc.Run("PMULTH writes eight independent signed products", [](TestCase &t)
         {
             R5900Context ctx{};
