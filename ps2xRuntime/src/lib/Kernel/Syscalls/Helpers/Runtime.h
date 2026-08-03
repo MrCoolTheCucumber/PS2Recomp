@@ -535,6 +535,12 @@ enum class RpcInvokeExitReason
     SamePcLimit
 };
 
+enum class RpcInvokeMode
+{
+    InheritCaller,
+    SyscallHandler,
+};
+
 static const char *rpcInvokeExitReasonName(RpcInvokeExitReason reason)
 {
     switch (reason)
@@ -555,7 +561,8 @@ static const char *rpcInvokeExitReasonName(RpcInvokeExitReason reason)
 }
 
 static bool rpcInvokeFunction(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime,
-                              uint32_t funcAddr, uint32_t a0, uint32_t a1, uint32_t a2, uint32_t a3, uint32_t *outV0)
+                              uint32_t funcAddr, uint32_t a0, uint32_t a1, uint32_t a2, uint32_t a3, uint32_t *outV0,
+                              RpcInvokeMode mode = RpcInvokeMode::InheritCaller)
 {
     if (!runtime || !ctx || !funcAddr || !runtime->hasFunction(funcAddr))
         return false;
@@ -567,6 +574,16 @@ static bool rpcInvokeFunction(uint8_t *rdram, R5900Context *ctx, PS2Runtime *run
         runtime->eeInterruptRuntimeState());
     R5900Context &tmp = callbackContext.context();
     tmp = *ctx;
+    if (mode == RpcInvokeMode::SyscallHandler)
+    {
+        // The EE kernel runs SetSyscall-installed handlers with interrupts
+        // disabled and KSU forced to kernel, then returns to the unchanged
+        // caller Status. The temporary callback context naturally provides
+        // that save/restore boundary.
+        constexpr uint32_t kStatusIe = 0x00000001u;
+        constexpr uint32_t kStatusKsuMask = 0x00000018u;
+        tmp.cop0_status &= ~(kStatusIe | kStatusKsuMask);
+    }
     setRegU32(&tmp, 4, a0);
     setRegU32(&tmp, 5, a1);
     setRegU32(&tmp, 6, a2);

@@ -242,6 +242,15 @@ namespace
     constexpr uint32_t EXCEPTION_VECTOR_COMMON_OFFSET = 0x180u;
     constexpr uint32_t EXCEPTION_VECTOR_INTERRUPT_OFFSET = 0x200u;
 
+    EeAddressTranslationContext guestAddressTranslation(
+        const R5900Context *ctx) noexcept
+    {
+        return ctx
+                   ? EeAddressTranslationContext::fromCop0Status(
+                         ctx->cop0_status)
+                   : EeAddressTranslationContext::unchecked();
+    }
+
     struct DispatchHistory
     {
         std::array<uint32_t, 64> pcs{};
@@ -3898,12 +3907,20 @@ void PS2Runtime::handleEeCacheOperation(
                 virtualAddress,
                 ctx->cop0_taglo,
                 ctx->cop0_taghi,
-                ctx->pc))
+                ctx->pc,
+                guestAddressTranslation(ctx)))
         {
             SignalException(
                 ctx,
                 EXCEPTION_RESERVED_INSTRUCTION);
         }
+    }
+    catch (const PS2AddressErrorException &fault)
+    {
+        SignalMemoryException(
+            ctx,
+            EXCEPTION_ADDRESS_ERROR_LOAD,
+            fault.virtualAddress());
     }
     catch (const PS2TlbMissException &fault)
     {
@@ -6266,6 +6283,8 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
                                      GuestBranchKind kind,
                                      const char *debugName)
 {
+    ctx->pc = targetPc;
+    ValidateInstructionFetch(ctx, targetPc);
     targetPc = normalizeGuestFunctionAddress(targetPc);
     ctx->pc = targetPc;
     const bool isCall = (kind == GuestBranchKind::DirectCall || kind == GuestBranchKind::IndirectCall);
@@ -6520,6 +6539,48 @@ void PS2Runtime::RequireCoprocessorUsable(
     }
 
     SignalException(ctx, exception);
+}
+
+void PS2Runtime::ValidateInstructionFetch(
+    R5900Context *ctx,
+    uint32_t virtualAddress)
+{
+    if (!ctx)
+    {
+        throw PS2GuestException{};
+    }
+
+    if ((virtualAddress & 3u) != 0u)
+    {
+        ctx->pc = virtualAddress;
+        SignalMemoryException(
+            ctx,
+            EXCEPTION_ADDRESS_ERROR_LOAD,
+            virtualAddress);
+    }
+
+    try
+    {
+        (void)m_memory.translateAddress(
+            virtualAddress,
+            guestAddressTranslation(ctx));
+    }
+    catch (const PS2AddressErrorException &fault)
+    {
+        ctx->pc = fault.virtualAddress();
+        SignalMemoryException(
+            ctx,
+            EXCEPTION_ADDRESS_ERROR_LOAD,
+            fault.virtualAddress());
+    }
+    catch (const PS2TlbMissException &fault)
+    {
+        ctx->pc = fault.virtualAddress();
+        SignalMemoryException(
+            ctx,
+            EXCEPTION_TLB_REFILL_LOAD,
+            fault.virtualAddress());
+    }
 }
 
 void PS2Runtime::SignalBusError(R5900Context *ctx,
@@ -8153,6 +8214,10 @@ void PS2Runtime::executeGuestStep(uint8_t *rdram,
 
     try
     {
+        if (ctx)
+        {
+            ValidateInstructionFetch(ctx, ctx->pc);
+        }
         function(rdram, ctx, this);
     }
     catch (const PS2GuestException &)
@@ -8174,6 +8239,14 @@ void PS2Runtime::dispatchLoop(uint8_t *rdram, R5900Context *ctx)
 
     while (!isStopRequested())
     {
+        try
+        {
+            ValidateInstructionFetch(ctx, ctx->pc);
+        }
+        catch (const PS2GuestException &)
+        {
+            continue;
+        }
         const uint32_t pc = normalizeGuestFunctionAddress(ctx->pc);
         ctx->pc = pc;
 
@@ -11144,7 +11217,15 @@ uint8_t PS2Runtime::Load8(uint8_t *rdram, R5900Context *ctx, uint32_t vaddr)
     debugObserveMemoryAccess(vaddr, 1u, DebugMemoryAccess::Read, ctx);
     try
     {
-        return m_memory.read8(vaddr);
+        return m_memory.read8(
+            vaddr, guestAddressTranslation(ctx));
+    }
+    catch (const PS2AddressErrorException &fault)
+    {
+        SignalMemoryException(
+            ctx,
+            EXCEPTION_ADDRESS_ERROR_LOAD,
+            fault.virtualAddress());
     }
     catch (const PS2TlbMissException &fault)
     {
@@ -11167,7 +11248,15 @@ uint16_t PS2Runtime::Load16(uint8_t *rdram, R5900Context *ctx, uint32_t vaddr)
     debugObserveMemoryAccess(vaddr, 2u, DebugMemoryAccess::Read, ctx);
     try
     {
-        return m_memory.read16(vaddr);
+        return m_memory.read16(
+            vaddr, guestAddressTranslation(ctx));
+    }
+    catch (const PS2AddressErrorException &fault)
+    {
+        SignalMemoryException(
+            ctx,
+            EXCEPTION_ADDRESS_ERROR_LOAD,
+            fault.virtualAddress());
     }
     catch (const PS2TlbMissException &fault)
     {
@@ -11190,7 +11279,15 @@ uint32_t PS2Runtime::Load32(uint8_t *rdram, R5900Context *ctx, uint32_t vaddr)
     debugObserveMemoryAccess(vaddr, 4u, DebugMemoryAccess::Read, ctx);
     try
     {
-        return m_memory.read32(vaddr);
+        return m_memory.read32(
+            vaddr, guestAddressTranslation(ctx));
+    }
+    catch (const PS2AddressErrorException &fault)
+    {
+        SignalMemoryException(
+            ctx,
+            EXCEPTION_ADDRESS_ERROR_LOAD,
+            fault.virtualAddress());
     }
     catch (const PS2TlbMissException &fault)
     {
@@ -11213,7 +11310,15 @@ uint64_t PS2Runtime::Load64(uint8_t *rdram, R5900Context *ctx, uint32_t vaddr)
     debugObserveMemoryAccess(vaddr, 8u, DebugMemoryAccess::Read, ctx);
     try
     {
-        return m_memory.read64(vaddr);
+        return m_memory.read64(
+            vaddr, guestAddressTranslation(ctx));
+    }
+    catch (const PS2AddressErrorException &fault)
+    {
+        SignalMemoryException(
+            ctx,
+            EXCEPTION_ADDRESS_ERROR_LOAD,
+            fault.virtualAddress());
     }
     catch (const PS2TlbMissException &fault)
     {
@@ -11236,7 +11341,15 @@ __m128i PS2Runtime::Load128(uint8_t *rdram, R5900Context *ctx, uint32_t vaddr)
     debugObserveMemoryAccess(vaddr, 16u, DebugMemoryAccess::Read, ctx);
     try
     {
-        return m_memory.read128(vaddr);
+        return m_memory.read128(
+            vaddr, guestAddressTranslation(ctx));
+    }
+    catch (const PS2AddressErrorException &fault)
+    {
+        SignalMemoryException(
+            ctx,
+            EXCEPTION_ADDRESS_ERROR_LOAD,
+            fault.virtualAddress());
     }
     catch (const PS2TlbMissException &fault)
     {
@@ -11261,7 +11374,18 @@ void PS2Runtime::Store8(uint8_t *rdram, R5900Context *ctx, uint32_t vaddr, uint8
     traceVif0MmioWrite(m_memory, ctx, vaddr, 1u, value, 0u);
     try
     {
-        m_memory.write8(vaddr, value, ctx ? ctx->pc : 0u);
+        m_memory.write8(
+            vaddr,
+            value,
+            ctx ? ctx->pc : 0u,
+            guestAddressTranslation(ctx));
+    }
+    catch (const PS2AddressErrorException &fault)
+    {
+        SignalMemoryException(
+            ctx,
+            EXCEPTION_ADDRESS_ERROR_STORE,
+            fault.virtualAddress());
     }
     catch (const PS2TlbMissException &fault)
     {
@@ -11286,7 +11410,18 @@ void PS2Runtime::Store16(uint8_t *rdram, R5900Context *ctx, uint32_t vaddr, uint
     traceVif0MmioWrite(m_memory, ctx, vaddr, 2u, value, 0u);
     try
     {
-        m_memory.write16(vaddr, value, ctx ? ctx->pc : 0u);
+        m_memory.write16(
+            vaddr,
+            value,
+            ctx ? ctx->pc : 0u,
+            guestAddressTranslation(ctx));
+    }
+    catch (const PS2AddressErrorException &fault)
+    {
+        SignalMemoryException(
+            ctx,
+            EXCEPTION_ADDRESS_ERROR_STORE,
+            fault.virtualAddress());
     }
     catch (const PS2TlbMissException &fault)
     {
@@ -11311,7 +11446,18 @@ void PS2Runtime::Store32(uint8_t *rdram, R5900Context *ctx, uint32_t vaddr, uint
     traceVif0MmioWrite(m_memory, ctx, vaddr, 4u, value, 0u);
     try
     {
-        m_memory.write32(vaddr, value, ctx ? ctx->pc : 0u);
+        m_memory.write32(
+            vaddr,
+            value,
+            ctx ? ctx->pc : 0u,
+            guestAddressTranslation(ctx));
+    }
+    catch (const PS2AddressErrorException &fault)
+    {
+        SignalMemoryException(
+            ctx,
+            EXCEPTION_ADDRESS_ERROR_STORE,
+            fault.virtualAddress());
     }
     catch (const PS2TlbMissException &fault)
     {
@@ -11336,7 +11482,18 @@ void PS2Runtime::Store64(uint8_t *rdram, R5900Context *ctx, uint32_t vaddr, uint
     traceVif0MmioWrite(m_memory, ctx, vaddr, 8u, value, 0u);
     try
     {
-        m_memory.write64(vaddr, value, ctx ? ctx->pc : 0u);
+        m_memory.write64(
+            vaddr,
+            value,
+            ctx ? ctx->pc : 0u,
+            guestAddressTranslation(ctx));
+    }
+    catch (const PS2AddressErrorException &fault)
+    {
+        SignalMemoryException(
+            ctx,
+            EXCEPTION_ADDRESS_ERROR_STORE,
+            fault.virtualAddress());
     }
     catch (const PS2TlbMissException &fault)
     {
@@ -11397,7 +11554,15 @@ void PS2Runtime::StoreMasked32(
             vaddr,
             value,
             byteEnable,
-            ctx ? ctx->pc : 0u);
+            ctx ? ctx->pc : 0u,
+            guestAddressTranslation(ctx));
+    }
+    catch (const PS2AddressErrorException &fault)
+    {
+        SignalMemoryException(
+            ctx,
+            EXCEPTION_ADDRESS_ERROR_STORE,
+            fault.virtualAddress());
     }
     catch (const PS2TlbMissException &fault)
     {
@@ -11467,7 +11632,15 @@ void PS2Runtime::StoreMasked64(
             vaddr,
             value,
             byteEnable,
-            ctx ? ctx->pc : 0u);
+            ctx ? ctx->pc : 0u,
+            guestAddressTranslation(ctx));
+    }
+    catch (const PS2AddressErrorException &fault)
+    {
+        SignalMemoryException(
+            ctx,
+            EXCEPTION_ADDRESS_ERROR_STORE,
+            fault.virtualAddress());
     }
     catch (const PS2TlbMissException &fault)
     {
@@ -11503,7 +11676,18 @@ void PS2Runtime::Store128(uint8_t *rdram, R5900Context *ctx, uint32_t vaddr, __m
     traceVif0MmioWrite(m_memory, ctx, vaddr, 16u, _parts[0], _parts[1]);
     try
     {
-        m_memory.write128(vaddr, value, ctx ? ctx->pc : 0u);
+        m_memory.write128(
+            vaddr,
+            value,
+            ctx ? ctx->pc : 0u,
+            guestAddressTranslation(ctx));
+    }
+    catch (const PS2AddressErrorException &fault)
+    {
+        SignalMemoryException(
+            ctx,
+            EXCEPTION_ADDRESS_ERROR_STORE,
+            fault.virtualAddress());
     }
     catch (const PS2TlbMissException &fault)
     {

@@ -507,14 +507,39 @@ void register_code_generator_tests()
         std::string generated = gen.generateFunction(func, instructions, false);
         printGeneratedCode("constant RDRAM load and store emit fast memory access", generated);
 
-        t.IsTrue(generated.find("SET_GPR_S32(ctx, 3, (int32_t)DEBUG_FAST_READ32(0x123460u));") != std::string::npos,
-                 "constant RDRAM LW should emit a watchpoint-aware fast read");
-        t.IsTrue(generated.find("DEBUG_FAST_WRITE32(0x123464u, _value);") != std::string::npos,
-                 "constant RDRAM SW should emit a watchpoint-aware fast write");
+        t.IsTrue(generated.find("SET_GPR_S32(ctx, 3, (int32_t)READ32(0x123460u));") != std::string::npos,
+                 "constant RDRAM LW should retain guest-mode-aware fast-path selection");
+        t.IsTrue(generated.find("WRITE32(0x123464u, GPR_U32(ctx, 4));") != std::string::npos,
+                 "constant RDRAM SW should retain guest-mode-aware fast-path selection");
         t.IsTrue(generated.find("READ32(ADD32(GPR_U32(ctx, 1)") == std::string::npos,
                  "constant RDRAM LW should not go through READ32 address classification");
         t.IsTrue(generated.find("WRITE32(ADD32(GPR_U32(ctx, 1)") == std::string::npos,
                  "constant RDRAM SW should not go through WRITE32 address classification");
+    });
+
+    tc.Run("constant privileged RDRAM aliases retain the guest permission gate", [](TestCase &t) {
+        CodeGenerator gen({}, {});
+        const Instruction load = makeLw(0x2380u, 3u, 1u, 0u);
+        const Instruction store = makeSw(0x2384u, 4u, 1u, 0u);
+
+        const std::string generatedLoad = gen.translateInstruction(
+            load, MemoryAccessHint{true, 0x80001000u});
+        const std::string generatedStore = gen.translateInstruction(
+            store, MemoryAccessHint{true, 0xA0001000u});
+
+        t.IsTrue(
+            generatedLoad.find("READ32(0x80001000u)") != std::string::npos,
+            "a resolved KSEG0 load should retain runtime mode selection");
+        t.IsTrue(
+            generatedStore.find("WRITE32(0xA0001000u, GPR_U32(ctx, 4))") !=
+                std::string::npos,
+            "a resolved KSEG1 store should retain runtime mode selection");
+        t.IsTrue(
+            generatedLoad.find("DEBUG_FAST_READ32") == std::string::npos,
+            "a resolved privileged load must not bypass guest permissions");
+        t.IsTrue(
+            generatedStore.find("DEBUG_FAST_WRITE32") == std::string::npos,
+            "a resolved privileged store must not bypass guest permissions");
     });
 
     tc.Run("constant invalid and misaligned memory accesses use checked runtime", [](TestCase &t) {
@@ -569,9 +594,9 @@ void register_code_generator_tests()
         const std::string constantLq = gen.translateInstruction(lq, unalignedHint);
         const std::string constantSq = gen.translateInstruction(sq, unalignedHint);
 
-        t.IsTrue(constantLq.find("DEBUG_FAST_READ128(0x123450u)") != std::string::npos,
+        t.IsTrue(constantLq.find("READ128(0x123450u)") != std::string::npos,
                  "constant LQ hint should be aligned before selecting the fast path");
-        t.IsTrue(constantSq.find("DEBUG_FAST_WRITE128(0x123450u, _value)") != std::string::npos,
+        t.IsTrue(constantSq.find("WRITE128(0x123450u, GPR_VEC(ctx, 4))") != std::string::npos,
                  "constant SQ hint should be aligned before selecting the fast path");
         t.IsTrue(constantLq.find("runtime->Load128") == std::string::npos,
                  "silently aligned LQ should not be treated as an address error");
@@ -1577,6 +1602,51 @@ void register_code_generator_tests()
                 "MTC0 register 25 should preserve the PCR selector bits");
         });
 
+        tc.Run("MTC0 Status validates the next sequential instruction fetch", [](TestCase &t) {
+            Function function;
+            function.name = "status_mode_transition";
+            function.start = 0x80001000u;
+            function.end = 0x80001008u;
+            function.isRecompiled = true;
+
+            Instruction mtc0{};
+            mtc0.address = 0x80001000u;
+            mtc0.opcode = OPCODE_COP0;
+            mtc0.rs = COP0_MT;
+            mtc0.rt = 7u;
+            mtc0.rd = COP0_REG_STATUS;
+            mtc0.raw =
+                (OPCODE_COP0 << 26u) |
+                (COP0_MT << 21u) |
+                (7u << 16u) |
+                (COP0_REG_STATUS << 11u);
+
+            const std::string generated =
+                CodeGenerator({}, {}).generateFunction(
+                    function,
+                    {mtc0, makeAddiu(0x80001004u, 2u, 2u, 1u)},
+                    false);
+            const size_t statusWrite = generated.find(
+                "runtime->writeCop0Status");
+            const size_t nextPc = generated.find(
+                "ctx->pc = 0x80001004u;", statusWrite);
+            const size_t validation = generated.find(
+                "runtime->ValidateInstructionFetch(ctx, ctx->pc);",
+                nextPc);
+            const size_t nextEffect = generated.find(
+                "SET_GPR_S32(ctx, 2", validation);
+
+            t.IsTrue(
+                statusWrite != std::string::npos &&
+                    nextPc != std::string::npos &&
+                    validation != std::string::npos &&
+                    nextEffect != std::string::npos &&
+                    statusWrite < nextPc &&
+                    nextPc < validation &&
+                    validation < nextEffect,
+                "a Status mode change should gate the following fetch before its effect");
+        });
+
         tc.Run("CACHE dispatches its operation and effective address", [](TestCase &t) {
             constexpr uint32_t raw =
                 (OPCODE_CACHE << 26u) |
@@ -1985,9 +2055,11 @@ void register_code_generator_tests()
                 "each mutually exclusive branch path should commit time and service events");
         });
 
-        tc.Run("post-delay event boundaries publish the resolved branch PC", [](TestCase &t) {
+        tc.Run("post-delay boundaries validate the resolved branch PC", [](TestCase &t) {
             constexpr std::string_view boundary =
                 "runtime->serviceEeEventsAtBlockBoundary(rdram, ctx);";
+            constexpr std::string_view validation =
+                "runtime->ValidateInstructionFetch(ctx, ctx->pc);";
 
             Function staticJumpFunction;
             staticJumpFunction.name = "post_delay_static_jump";
@@ -2001,17 +2073,21 @@ void register_code_generator_tests()
                 false);
             const size_t staticTarget = staticJump.find(
                 "ctx->pc = 0x3000u;");
+            const size_t staticValidation = staticJump.find(
+                validation, staticTarget);
             const size_t staticBoundary = staticJump.find(
                 boundary, staticTarget);
             const size_t staticDispatch = staticJump.find(
                 "dispatchGuestBranch", staticTarget);
             t.IsTrue(
                 staticTarget != std::string::npos &&
+                    staticValidation != std::string::npos &&
                     staticBoundary != std::string::npos &&
                     staticDispatch != std::string::npos &&
-                    staticTarget < staticBoundary &&
+                    staticTarget < staticValidation &&
+                    staticValidation < staticBoundary &&
                     staticBoundary < staticDispatch,
-                "a taken jump with a NOP slot should publish its target before servicing events");
+                "a taken jump with a NOP slot should validate its target before servicing events");
 
             Function conditionalFunction;
             conditionalFunction.name = "post_delay_conditional";
@@ -2029,26 +2105,38 @@ void register_code_generator_tests()
                 false);
             const size_t conditionalTarget = conditional.find(
                 "ctx->pc = 0x2310u;");
+            const size_t conditionalTargetValidation = conditional.find(
+                validation, conditionalTarget);
             const size_t conditionalTargetBoundary = conditional.find(
                 boundary, conditionalTarget);
             const size_t conditionalFallthrough = conditional.find(
                 "ctx->pc = 0x2308u;", conditionalTarget);
+            const size_t conditionalFallthroughValidation = conditional.find(
+                validation, conditionalFallthrough);
             const size_t conditionalFallthroughBoundary = conditional.find(
                 boundary, conditionalFallthrough);
             t.Equals(
                 countOccurrences(conditional, std::string(boundary)),
                 static_cast<size_t>(2u),
                 "taken and not-taken paths should each service exactly one resolved boundary");
+            t.Equals(
+                countOccurrences(conditional, std::string(validation)),
+                static_cast<size_t>(2u),
+                "taken and not-taken paths should each validate the resolved fetch address");
             t.IsTrue(
                 conditionalTarget != std::string::npos &&
+                    conditionalTargetValidation != std::string::npos &&
                     conditionalTargetBoundary != std::string::npos &&
-                    conditionalTarget < conditionalTargetBoundary,
-                "a taken conditional with a real slot should publish its target before servicing events");
+                    conditionalTarget < conditionalTargetValidation &&
+                    conditionalTargetValidation < conditionalTargetBoundary,
+                "a taken conditional with a real slot should validate its target before servicing events");
             t.IsTrue(
                 conditionalFallthrough != std::string::npos &&
+                    conditionalFallthroughValidation != std::string::npos &&
                     conditionalFallthroughBoundary != std::string::npos &&
-                    conditionalFallthrough < conditionalFallthroughBoundary,
-                "a not-taken conditional should publish its post-slot fallthrough before servicing events");
+                    conditionalFallthrough < conditionalFallthroughValidation &&
+                    conditionalFallthroughValidation < conditionalFallthroughBoundary,
+                "a not-taken conditional should validate its post-slot fallthrough before servicing events");
 
             Function likelyFunction;
             likelyFunction.name = "post_delay_likely";
@@ -2089,22 +2177,30 @@ void register_code_generator_tests()
                     : likelyCode.substr(likelyNotTakenStart);
             const size_t likelyTarget = likelyTakenPath.find(
                 "ctx->pc = 0x2410u;");
+            const size_t likelyTargetValidation = likelyTakenPath.find(
+                validation, likelyTarget);
             const size_t likelyTargetBoundary = likelyTakenPath.find(
                 boundary, likelyTarget);
             const size_t likelyFallthrough = likelyNotTakenPath.find(
                 "ctx->pc = 0x2408u;");
+            const size_t likelyFallthroughValidation = likelyNotTakenPath.find(
+                validation, likelyFallthrough);
             const size_t likelyFallthroughBoundary = likelyNotTakenPath.find(
                 boundary, likelyFallthrough);
             t.IsTrue(
                 likelyTarget != std::string::npos &&
+                    likelyTargetValidation != std::string::npos &&
                     likelyTargetBoundary != std::string::npos &&
-                    likelyTarget < likelyTargetBoundary,
-                "a taken likely branch should publish its target after executing the slot");
+                    likelyTarget < likelyTargetValidation &&
+                    likelyTargetValidation < likelyTargetBoundary,
+                "a taken likely branch should validate its target after executing the slot");
             t.IsTrue(
                 likelyFallthrough != std::string::npos &&
+                    likelyFallthroughValidation != std::string::npos &&
                     likelyFallthroughBoundary != std::string::npos &&
-                    likelyFallthrough < likelyFallthroughBoundary,
-                "an annulled likely branch should publish its fallthrough before servicing events");
+                    likelyFallthrough < likelyFallthroughValidation &&
+                    likelyFallthroughValidation < likelyFallthroughBoundary,
+                "an annulled likely branch should validate its fallthrough before servicing events");
 
             Function registerJumpFunction;
             registerJumpFunction.name = "post_delay_register_jump";
@@ -2122,13 +2218,17 @@ void register_code_generator_tests()
                 false);
             const size_t dynamicTarget = registerJump.find(
                 "ctx->pc = jumpTarget;");
+            const size_t dynamicValidation = registerJump.find(
+                validation, dynamicTarget);
             const size_t dynamicBoundary = registerJump.find(
                 boundary, dynamicTarget);
             t.IsTrue(
                 dynamicTarget != std::string::npos &&
+                    dynamicValidation != std::string::npos &&
                     dynamicBoundary != std::string::npos &&
-                    dynamicTarget < dynamicBoundary,
-                "a register jump should publish its captured target before servicing events");
+                    dynamicTarget < dynamicValidation &&
+                    dynamicValidation < dynamicBoundary,
+                "a register jump should validate its captured target before servicing events");
         });
 
         tc.Run("VU0 macro writes preserve the hardwired zero registers", [](TestCase &t) {

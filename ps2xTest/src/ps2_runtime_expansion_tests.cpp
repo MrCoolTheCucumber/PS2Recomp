@@ -8229,6 +8229,10 @@ void register_ps2_runtime_expansion_tests()
                 "scratchpad counter-alias fixture memory should initialize");
 
             R5900Context &ctx = runtime.cpu();
+            // This timing fixture intentionally exercises privileged
+            // scratchpad and KSEG aliases, so run it in kernel mode rather
+            // than inheriting the runtime's post-BIOS user-mode handoff.
+            ctx.cop0_status = 0u;
             uint8_t *const rdram =
                 runtime.memory().getRDRAM();
             const __m128i value =

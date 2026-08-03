@@ -561,7 +561,8 @@ namespace ps2_syscalls
                                                getRegU32(ctx, 5),
                                                getRegU32(ctx, 6),
                                                getRegU32(ctx, 7),
-                                               &retV0);
+                                               &retV0,
+                                               RpcInvokeMode::SyscallHandler);
 
         if (syscallNumber == 0x83u)
         {

@@ -2812,8 +2812,15 @@ const uint8_t *PS2Memory::mapVuMemory(uint32_t physAddr, uint32_t size, uint32_t
     return mapRange(PS2_VU1_DATA_BASE, PS2_VU1_DATA_SIZE, m_vu1Data);
 }
 
-uint32_t PS2Memory::translateAddress(uint32_t virtualAddress)
+uint32_t PS2Memory::translateAddress(
+    uint32_t virtualAddress,
+    EeAddressTranslationContext translation)
 {
+    if (!translation.permits(virtualAddress))
+    {
+        throw PS2AddressErrorException(virtualAddress);
+    }
+
     if (isScratchpad(virtualAddress))
     {
         return ps2ScratchpadOffset(virtualAddress);
@@ -2827,6 +2834,14 @@ uint32_t PS2Memory::translateAddress(uint32_t virtualAddress)
     if (Ps2IsAcceleratedRamMirrorAddress(virtualAddress))
     {
         return virtualAddress & PS2_RAM_MASK;
+    }
+
+    // Status.ERL makes ordinary kuseg uncached and unmapped. Keep this
+    // architectural path explicit so normal kuseg translation can move to
+    // the TLB independently of the runtime's compatibility aliases above.
+    if (translation.errorLevel && virtualAddress < 0x80000000u)
+    {
+        return virtualAddress;
     }
 
     // KSEG0/KSEG1 direct-mapped window.
@@ -2918,10 +2933,12 @@ int32_t PS2Memory::tlbProbe(uint32_t vpn) const
     return -1;
 }
 
-uint8_t PS2Memory::read8(uint32_t address)
+uint8_t PS2Memory::read8(
+    uint32_t address,
+    EeAddressTranslationContext translation)
 {
     const bool scratch = isScratchpad(address);
-    uint32_t physAddr = translateAddress(address);
+    uint32_t physAddr = translateAddress(address, translation);
     checkEePhysicalBusError(physAddr);
 
     if (scratch)
@@ -2950,7 +2967,9 @@ uint8_t PS2Memory::read8(uint32_t address)
     return 0;
 }
 
-uint16_t PS2Memory::read16(uint32_t address)
+uint16_t PS2Memory::read16(
+    uint32_t address,
+    EeAddressTranslationContext translation)
 {
     if (address & 1)
     {
@@ -2958,7 +2977,7 @@ uint16_t PS2Memory::read16(uint32_t address)
     }
 
     const bool scratch = isScratchpad(address);
-    uint32_t physAddr = translateAddress(address);
+    uint32_t physAddr = translateAddress(address, translation);
     checkEePhysicalBusError(physAddr);
 
     if (scratch)
@@ -2986,7 +3005,9 @@ uint16_t PS2Memory::read16(uint32_t address)
     return 0;
 }
 
-uint32_t PS2Memory::read32(uint32_t address)
+uint32_t PS2Memory::read32(
+    uint32_t address,
+    EeAddressTranslationContext translation)
 {
     if (address & 3)
     {
@@ -3010,7 +3031,7 @@ uint32_t PS2Memory::read32(uint32_t address)
     }
 
     const bool scratch = isScratchpad(address);
-    uint32_t physAddr = translateAddress(address);
+    uint32_t physAddr = translateAddress(address, translation);
     checkEePhysicalBusError(physAddr);
 
     if (scratch)
@@ -3035,7 +3056,9 @@ uint32_t PS2Memory::read32(uint32_t address)
     return 0;
 }
 
-uint64_t PS2Memory::read64(uint32_t address)
+uint64_t PS2Memory::read64(
+    uint32_t address,
+    EeAddressTranslationContext translation)
 {
     if (address & 7)
     {
@@ -3054,7 +3077,7 @@ uint64_t PS2Memory::read64(uint32_t address)
     }
 
     const bool scratch = isScratchpad(address);
-    uint32_t physAddr = translateAddress(address);
+    uint32_t physAddr = translateAddress(address, translation);
     checkEePhysicalBusError(physAddr);
 
     if (scratch)
@@ -3093,10 +3116,13 @@ uint64_t PS2Memory::read64(uint32_t address)
                                  : 0u);
         return static_cast<uint64_t>(lo) | (static_cast<uint64_t>(hi) << 32);
     }
-    return (uint64_t)read32(address) | ((uint64_t)read32(address + 4) << 32);
+    return (uint64_t)read32(address, translation) |
+           ((uint64_t)read32(address + 4, translation) << 32);
 }
 
-__m128i PS2Memory::read128(uint32_t address)
+__m128i PS2Memory::read128(
+    uint32_t address,
+    EeAddressTranslationContext translation)
 {
     if (address & 15)
     {
@@ -3104,7 +3130,7 @@ __m128i PS2Memory::read128(uint32_t address)
     }
 
     const bool scratch = isScratchpad(address);
-    uint32_t physAddr = translateAddress(address);
+    uint32_t physAddr = translateAddress(address, translation);
     checkEePhysicalBusError(physAddr);
 
     if (physAddr == 0x10007000u)
@@ -3139,10 +3165,14 @@ __m128i PS2Memory::read128(uint32_t address)
     return _mm_setzero_si128();
 }
 
-void PS2Memory::write8(uint32_t address, uint8_t value, uint32_t writerPc)
+void PS2Memory::write8(
+    uint32_t address,
+    uint8_t value,
+    uint32_t writerPc,
+    EeAddressTranslationContext translation)
 {
     const bool scratch = isScratchpad(address);
-    uint32_t physAddr = translateAddress(address);
+    uint32_t physAddr = translateAddress(address, translation);
     checkEePhysicalBusError(physAddr);
 
     if (isGsPrivReg(physAddr))
@@ -3188,7 +3218,11 @@ void PS2Memory::write8(uint32_t address, uint8_t value, uint32_t writerPc)
     }
 }
 
-void PS2Memory::write16(uint32_t address, uint16_t value, uint32_t writerPc)
+void PS2Memory::write16(
+    uint32_t address,
+    uint16_t value,
+    uint32_t writerPc,
+    EeAddressTranslationContext translation)
 {
     if (address & 1)
     {
@@ -3196,7 +3230,7 @@ void PS2Memory::write16(uint32_t address, uint16_t value, uint32_t writerPc)
     }
 
     const bool scratch = isScratchpad(address);
-    uint32_t physAddr = translateAddress(address);
+    uint32_t physAddr = translateAddress(address, translation);
     checkEePhysicalBusError(physAddr);
 
     if (isGsPrivReg(physAddr))
@@ -3241,7 +3275,11 @@ void PS2Memory::write16(uint32_t address, uint16_t value, uint32_t writerPc)
     }
 }
 
-void PS2Memory::write32(uint32_t address, uint32_t value, uint32_t writerPc)
+void PS2Memory::write32(
+    uint32_t address,
+    uint32_t value,
+    uint32_t writerPc,
+    EeAddressTranslationContext translation)
 {
     if (address & 3)
     {
@@ -3268,7 +3306,7 @@ void PS2Memory::write32(uint32_t address, uint32_t value, uint32_t writerPc)
     }
 
     const bool scratch = isScratchpad(address);
-    uint32_t physAddr = translateAddress(address);
+    uint32_t physAddr = translateAddress(address, translation);
     checkEePhysicalBusError(physAddr);
 
     if (scratch)
@@ -3299,7 +3337,11 @@ void PS2Memory::write32(uint32_t address, uint32_t value, uint32_t writerPc)
     }
 }
 
-void PS2Memory::write64(uint32_t address, uint64_t value, uint32_t writerPc)
+void PS2Memory::write64(
+    uint32_t address,
+    uint64_t value,
+    uint32_t writerPc,
+    EeAddressTranslationContext translation)
 {
     if (address & 7)
     {
@@ -3323,7 +3365,7 @@ void PS2Memory::write64(uint32_t address, uint64_t value, uint32_t writerPc)
     }
 
     const bool scratch = isScratchpad(address);
-    uint32_t physAddr = translateAddress(address);
+    uint32_t physAddr = translateAddress(address, translation);
     checkEePhysicalBusError(physAddr);
 
     if (scratch)
@@ -3348,8 +3390,12 @@ void PS2Memory::write64(uint32_t address, uint64_t value, uint32_t writerPc)
     }
     if (isIoRegister(physAddr))
     {
-        write32(address, (uint32_t)value, writerPc);
-        write32(address + 4, (uint32_t)(value >> 32), writerPc);
+        write32(address, (uint32_t)value, writerPc, translation);
+        write32(
+            address + 4,
+            (uint32_t)(value >> 32),
+            writerPc,
+            translation);
     }
 }
 
@@ -3357,7 +3403,8 @@ void PS2Memory::writeMasked32(
     uint32_t address,
     uint32_t value,
     uint8_t byteEnable,
-    uint32_t writerPc)
+    uint32_t writerPc,
+    EeAddressTranslationContext translation)
 {
     if (address & 3u)
     {
@@ -3401,7 +3448,7 @@ void PS2Memory::writeMasked32(
     }
 
     const bool scratch = isScratchpad(address);
-    const uint32_t physAddr = translateAddress(address);
+    const uint32_t physAddr = translateAddress(address, translation);
     checkEePhysicalBusError(physAddr);
     auto writeBytes = [&](uint8_t *destination)
     {
@@ -3455,7 +3502,8 @@ void PS2Memory::writeMasked64(
     uint32_t address,
     uint64_t value,
     uint8_t byteEnable,
-    uint32_t writerPc)
+    uint32_t writerPc,
+    EeAddressTranslationContext translation)
 {
     if (address & 7u)
     {
@@ -3494,7 +3542,7 @@ void PS2Memory::writeMasked64(
     }
 
     const bool scratch = isScratchpad(address);
-    const uint32_t physAddr = translateAddress(address);
+    const uint32_t physAddr = translateAddress(address, translation);
     checkEePhysicalBusError(physAddr);
     auto writeBytes = [&](uint8_t *destination)
     {
@@ -3560,7 +3608,11 @@ void PS2Memory::writeMasked64(
     }
 }
 
-void PS2Memory::write128(uint32_t address, __m128i value, uint32_t writerPc)
+void PS2Memory::write128(
+    uint32_t address,
+    __m128i value,
+    uint32_t writerPc,
+    EeAddressTranslationContext translation)
 {
     if (address & 15)
     {
@@ -3568,7 +3620,7 @@ void PS2Memory::write128(uint32_t address, __m128i value, uint32_t writerPc)
     }
 
     const bool scratch = isScratchpad(address);
-    uint32_t physAddr = translateAddress(address);
+    uint32_t physAddr = translateAddress(address, translation);
     checkEePhysicalBusError(physAddr);
 
     if (physAddr == 0x10007010u)
@@ -3610,8 +3662,8 @@ void PS2Memory::write128(uint32_t address, __m128i value, uint32_t writerPc)
         uint64_t lo = _mm_extract_epi64(value, 0);
         uint64_t hi = _mm_extract_epi64(value, 1);
 
-        write64(address, lo, writerPc);
-        write64(address + 8, hi, writerPc);
+        write64(address, lo, writerPc, translation);
+        write64(address + 8, hi, writerPc, translation);
     }
 }
 

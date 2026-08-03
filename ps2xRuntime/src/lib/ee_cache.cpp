@@ -155,6 +155,25 @@ bool EeCache::execute(
     uint32_t &tagHi,
     uint32_t writerPc)
 {
+    return execute(
+        memory,
+        operation,
+        virtualAddress,
+        tagLo,
+        tagHi,
+        writerPc,
+        EeAddressTranslationContext::unchecked());
+}
+
+bool EeCache::execute(
+    PS2Memory &memory,
+    uint32_t operation,
+    uint32_t virtualAddress,
+    uint32_t &tagLo,
+    uint32_t &tagHi,
+    uint32_t writerPc,
+    const EeAddressTranslationContext &translation)
+{
     const uint32_t cacheOperation = operation & 0x1Fu;
     const uint32_t way = virtualAddress & 1u;
     const uint32_t wordOffset = virtualAddress & 0x3Cu;
@@ -247,7 +266,8 @@ bool EeCache::execute(
     case kIhin:
     {
         const uint32_t physicalAddress =
-            memory.translateAddress(virtualAddress);
+            memory.translateAddress(
+                virtualAddress, translation);
         const uint32_t index =
             (virtualAddress >> 6u) &
             (kInstructionSetCount - 1u);
@@ -268,7 +288,8 @@ bool EeCache::execute(
     case kIfl:
     {
         const uint32_t physicalAddress =
-            memory.translateAddress(virtualAddress);
+            memory.translateAddress(
+                virtualAddress, translation);
         const uint32_t physicalBase =
             physicalAddress & ~(kLineSize - 1u);
         std::array<uint8_t, kLineSize> refill{};
@@ -358,7 +379,8 @@ bool EeCache::execute(
     case kDhwoin:
     {
         const uint32_t physicalAddress =
-            memory.translateAddress(virtualAddress);
+            memory.translateAddress(
+                virtualAddress, translation);
         const uint32_t index =
             (virtualAddress >> 6u) &
             (kDataSetCount - 1u);

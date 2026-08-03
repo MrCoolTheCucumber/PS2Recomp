@@ -6,6 +6,7 @@
 #include <cstdint>
 
 class PS2Memory;
+struct EeAddressTranslationContext;
 
 // Architectural state touched explicitly by the R5900 CACHE instruction.
 // Ordinary host memory accesses remain coherent and do not pay the cost of a
@@ -30,6 +31,13 @@ public:
                  uint32_t &tagLo,
                  uint32_t &tagHi,
                  uint32_t writerPc = 0u);
+    bool execute(PS2Memory &memory,
+                 uint32_t operation,
+                 uint32_t virtualAddress,
+                 uint32_t &tagLo,
+                 uint32_t &tagHi,
+                 uint32_t writerPc,
+                 const EeAddressTranslationContext &translation);
 
 private:
     struct DataLine

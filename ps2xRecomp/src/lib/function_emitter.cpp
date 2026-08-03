@@ -26,6 +26,13 @@ namespace ps2recomp
             inst.function = SPECIAL_SLL;
             return inst;
         }
+
+        bool changesEeAddressMode(const Instruction &instruction)
+        {
+            return instruction.opcode == OPCODE_COP0 &&
+                   instruction.rs == COP0_MT &&
+                   instruction.rd == COP0_REG_STATUS;
+        }
     }
 
     FunctionEmitter::FunctionEmitter(CodeGenerator &codeGenerator)
@@ -136,6 +143,7 @@ namespace ps2recomp
         ss << "\n";
 
         bool lastInstructionWasControlFlow = false;
+        bool validateSequentialFetch = false;
 
         for (size_t i = 0; i < scheduledInstructions.size(); ++i)
         {
@@ -161,6 +169,15 @@ namespace ps2recomp
 
             try
             {
+                if (validateSequentialFetch)
+                {
+                    ss << "    ctx->pc = 0x" << std::hex
+                       << inst.address << "u;\n"
+                       << std::dec;
+                    ss << "    runtime->ValidateInstructionFetch(ctx, ctx->pc);\n";
+                    validateSequentialFetch = false;
+                }
+
                 if (inst.hasDelaySlot)
                 {
                     ss << "    ++ctx->insn_count;\n";
@@ -249,6 +266,8 @@ namespace ps2recomp
                     ss << "\n";
 
                     updateConstantRegisters(inst, constantRegisters);
+                    validateSequentialFetch =
+                        changesEeAddressMode(inst);
                 }
             }
             catch (const std::exception &e)

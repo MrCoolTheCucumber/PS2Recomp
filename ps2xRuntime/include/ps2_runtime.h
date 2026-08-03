@@ -1197,6 +1197,9 @@ public:
     [[noreturn]] void SignalMemoryException(R5900Context *ctx,
                                             PS2Exception exception,
                                             uint32_t badVAddr);
+    void ValidateInstructionFetch(
+        R5900Context *ctx,
+        uint32_t virtualAddress);
     void SignalBusError(R5900Context *ctx,
                         PS2BusErrorAccess access,
                         uint32_t physicalAddress);

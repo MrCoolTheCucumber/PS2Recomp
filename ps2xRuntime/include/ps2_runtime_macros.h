@@ -667,33 +667,48 @@ static inline void Ps2FastWrite128(uint8_t *rdram, uint32_t addr, __m128i value)
         FAST_WRITE128(_debug_addr, _debug_value);                                   \
     } while (0)
 
+static inline bool Ps2CanUseFastGuestRdramAccess(
+    const R5900Context *ctx,
+    uint32_t address,
+    uint32_t bytes)
+{
+    if (!Ps2CanUseFastRdramAccess(address, bytes))
+    {
+        return false;
+    }
+    return ctx == nullptr ||
+           EeAddressTranslationContext::fromCop0Status(
+               ctx->cop0_status)
+               .permits(address);
+}
+
 #define READ8(addr) ([&]() -> uint8_t {                       \
     uint32_t _addr = (uint32_t)(addr);                        \
-    return Ps2CanUseFastRdramAccess(_addr, 1u)                 \
+    return Ps2CanUseFastGuestRdramAccess(ctx, _addr, 1u)       \
         ? DEBUG_FAST_READ8(_addr)                             \
         : runtime->Load8(rdram, ctx, _addr); }())
 
 #define READ16(addr) ([&]() -> uint16_t {                     \
     uint32_t _addr = (uint32_t)(addr);                        \
-    return Ps2CanUseFastRdramAccess(_addr, 2u)                 \
+    return Ps2CanUseFastGuestRdramAccess(ctx, _addr, 2u)       \
         ? DEBUG_FAST_READ16(_addr)                            \
         : runtime->Load16(rdram, ctx, _addr); }())
 
 #define READ32(addr) ([&]() -> uint32_t {                     \
     uint32_t _addr = (uint32_t)(addr);                        \
-    return Ps2CanUseFastRdramAccess(_addr, 4u)                 \
+    return Ps2CanUseFastGuestRdramAccess(ctx, _addr, 4u)       \
         ? DEBUG_FAST_READ32(_addr)                            \
         : runtime->Load32(rdram, ctx, _addr); }())
 
 #define READ64(addr) ([&]() -> uint64_t {                     \
     uint32_t _addr = (uint32_t)(addr);                        \
-    return Ps2CanUseFastRdramAccess(_addr, 8u)                 \
+    return Ps2CanUseFastGuestRdramAccess(ctx, _addr, 8u)       \
         ? DEBUG_FAST_READ64(_addr)                            \
         : runtime->Load64(rdram, ctx, _addr); }())
 
 #define READ128(addr) ([&]() -> __m128i {                     \
     uint32_t _addr = (uint32_t)(addr);                        \
-    return Ps2CanUseFastRdramAccess(_addr, 16u)                \
+    return Ps2CanUseFastGuestRdramAccess(ctx, _addr, 16u)      \
         ? DEBUG_FAST_READ128(_addr)                           \
         : runtime->Load128(rdram, ctx, _addr); }())
 
@@ -701,7 +716,7 @@ static inline void Ps2FastWrite128(uint8_t *rdram, uint32_t addr, __m128i value)
     do                                                                               \
     {                                                                                \
         uint32_t _addr = (addr);                                                     \
-        if (!Ps2CanUseFastRdramAccess(_addr, 1u))                                    \
+        if (!Ps2CanUseFastGuestRdramAccess(ctx, _addr, 1u))                          \
             runtime->Store8(rdram, ctx, _addr, (val));                               \
         else                                                                         \
         {                                                                            \
@@ -716,7 +731,7 @@ static inline void Ps2FastWrite128(uint8_t *rdram, uint32_t addr, __m128i value)
     do                                                                                 \
     {                                                                                  \
         uint32_t _addr = (addr);                                                       \
-        if (!Ps2CanUseFastRdramAccess(_addr, 2u))                                      \
+        if (!Ps2CanUseFastGuestRdramAccess(ctx, _addr, 2u))                            \
             runtime->Store16(rdram, ctx, _addr, (val));                                \
         else                                                                           \
         {                                                                              \
@@ -731,7 +746,7 @@ static inline void Ps2FastWrite128(uint8_t *rdram, uint32_t addr, __m128i value)
     do                                                                                 \
     {                                                                                  \
         uint32_t _addr = (addr);                                                       \
-        if (!Ps2CanUseFastRdramAccess(_addr, 4u))                                      \
+        if (!Ps2CanUseFastGuestRdramAccess(ctx, _addr, 4u))                            \
             runtime->Store32(rdram, ctx, _addr, (val));                                \
         else                                                                           \
         {                                                                              \
@@ -746,7 +761,7 @@ static inline void Ps2FastWrite128(uint8_t *rdram, uint32_t addr, __m128i value)
     do                                                                                 \
     {                                                                                  \
         uint32_t _addr = (addr);                                                       \
-        if (!Ps2CanUseFastRdramAccess(_addr, 8u))                                      \
+        if (!Ps2CanUseFastGuestRdramAccess(ctx, _addr, 8u))                            \
             runtime->Store64(rdram, ctx, _addr, (val));                                \
         else                                                                           \
         {                                                                              \
@@ -765,7 +780,7 @@ static inline void Ps2FastWrite128(uint8_t *rdram, uint32_t addr, __m128i value)
         const uint8_t _byte_enable = (uint8_t)(byteEnable);                         \
         const Ps2ByteEnableSpan _span =                                             \
             Ps2DecodeByteEnableSpan(_byte_enable, 4u);                              \
-        if (!_span.valid || !Ps2CanUseFastRdramAccess(_addr, 4u))                   \
+        if (!_span.valid || !Ps2CanUseFastGuestRdramAccess(ctx, _addr, 4u))         \
             runtime->StoreMasked32(                                                 \
                 rdram, ctx, _addr, _value, _byte_enable);                           \
         else if (_span.size != 0u)                                                  \
@@ -792,7 +807,7 @@ static inline void Ps2FastWrite128(uint8_t *rdram, uint32_t addr, __m128i value)
         const uint8_t _byte_enable = (uint8_t)(byteEnable);                         \
         const Ps2ByteEnableSpan _span =                                             \
             Ps2DecodeByteEnableSpan(_byte_enable, 8u);                              \
-        if (!_span.valid || !Ps2CanUseFastRdramAccess(_addr, 8u))                   \
+        if (!_span.valid || !Ps2CanUseFastGuestRdramAccess(ctx, _addr, 8u))         \
             runtime->StoreMasked64(                                                 \
                 rdram, ctx, _addr, _value, _byte_enable);                           \
         else if (_span.size != 0u)                                                  \
@@ -816,7 +831,7 @@ static inline void Ps2FastWrite128(uint8_t *rdram, uint32_t addr, __m128i value)
     {                                                                                \
         uint32_t _addr = (addr);                                                     \
         __m128i _value = (val);                                                      \
-        if (!Ps2CanUseFastRdramAccess(_addr, 16u))                                   \
+        if (!Ps2CanUseFastGuestRdramAccess(ctx, _addr, 16u))                         \
             runtime->Store128(rdram, ctx, _addr, _value);                            \
         else                                                                         \
         {                                                                            \

@@ -156,6 +156,9 @@ namespace ps2recomp
     {
         m_ss << fmt::format(
             "{}ctx->pc = {};\n", indent, nextPcExpression);
+        m_ss << fmt::format(
+            "{}runtime->ValidateInstructionFetch(ctx, ctx->pc);\n",
+            indent);
         emitBasicBlockBoundary(indent);
     }
 

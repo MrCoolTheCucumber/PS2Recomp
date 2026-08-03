@@ -31,6 +31,98 @@ struct Ps2GsDmaTraceState;
 struct Ps2Vu1WorkloadProfileState;
 struct VuExecutionState;
 
+enum class EeAddressSpaceMode : uint8_t
+{
+    Kernel,
+    Supervisor,
+    User,
+    Reserved,
+};
+
+struct EeAddressTranslationContext
+{
+    EeAddressSpaceMode mode = EeAddressSpaceMode::Kernel;
+    bool enforceOperatingMode = false;
+    bool errorLevel = false;
+
+    static constexpr EeAddressTranslationContext unchecked() noexcept
+    {
+        return {};
+    }
+
+    static constexpr EeAddressTranslationContext fromCop0Status(
+        uint32_t status) noexcept
+    {
+        constexpr uint32_t kStatusExl = 0x00000002u;
+        constexpr uint32_t kStatusErl = 0x00000004u;
+        constexpr uint32_t kStatusKsuMask = 0x00000018u;
+        constexpr uint32_t kStatusKsuSupervisor = 0x00000008u;
+        constexpr uint32_t kStatusKsuUser = 0x00000010u;
+
+        const bool errorLevelActive =
+            (status & kStatusErl) != 0u;
+        if ((status & (kStatusExl | kStatusErl)) != 0u)
+        {
+            return {
+                EeAddressSpaceMode::Kernel,
+                true,
+                errorLevelActive,
+            };
+        }
+
+        switch (status & kStatusKsuMask)
+        {
+        case 0u:
+            return {EeAddressSpaceMode::Kernel, true, false};
+        case kStatusKsuSupervisor:
+            return {EeAddressSpaceMode::Supervisor, true, false};
+        case kStatusKsuUser:
+            return {EeAddressSpaceMode::User, true, false};
+        default:
+            return {EeAddressSpaceMode::Reserved, true, false};
+        }
+    }
+
+    constexpr bool permits(uint32_t virtualAddress) const noexcept
+    {
+        if (!enforceOperatingMode ||
+            mode == EeAddressSpaceMode::Kernel)
+        {
+            return true;
+        }
+        if (virtualAddress < 0x80000000u)
+        {
+            return true;
+        }
+        return mode == EeAddressSpaceMode::Supervisor &&
+               virtualAddress >= 0xC0000000u &&
+               virtualAddress < 0xE0000000u;
+    }
+};
+
+class PS2AddressErrorException final : public std::exception
+{
+public:
+    explicit PS2AddressErrorException(
+        uint32_t virtualAddress) noexcept
+        : m_virtualAddress(virtualAddress)
+    {
+    }
+
+    const char *what() const noexcept override
+    {
+        return "EE address error";
+    }
+
+    uint32_t virtualAddress() const noexcept
+    {
+        return m_virtualAddress;
+    }
+
+private:
+    uint32_t m_virtualAddress;
+};
+
 class PS2TlbMissException final : public std::exception
 {
 public:
@@ -867,30 +959,77 @@ public:
     void resetVu1WorkloadProfileEpoch();
 
     // Read/write memory
-    uint8_t read8(uint32_t address);
-    uint16_t read16(uint32_t address);
-    uint32_t read32(uint32_t address);
-    uint64_t read64(uint32_t address);
-    __m128i read128(uint32_t address);
+    uint8_t read8(
+        uint32_t address,
+        EeAddressTranslationContext translation =
+            EeAddressTranslationContext::unchecked());
+    uint16_t read16(
+        uint32_t address,
+        EeAddressTranslationContext translation =
+            EeAddressTranslationContext::unchecked());
+    uint32_t read32(
+        uint32_t address,
+        EeAddressTranslationContext translation =
+            EeAddressTranslationContext::unchecked());
+    uint64_t read64(
+        uint32_t address,
+        EeAddressTranslationContext translation =
+            EeAddressTranslationContext::unchecked());
+    __m128i read128(
+        uint32_t address,
+        EeAddressTranslationContext translation =
+            EeAddressTranslationContext::unchecked());
 
-    void write8(uint32_t address, uint8_t value, uint32_t writerPc = 0);
-    void write16(uint32_t address, uint16_t value, uint32_t writerPc = 0);
-    void write32(uint32_t address, uint32_t value, uint32_t writerPc = 0);
-    void write64(uint32_t address, uint64_t value, uint32_t writerPc = 0);
-    void write128(uint32_t address, __m128i value, uint32_t writerPc = 0);
+    void write8(
+        uint32_t address,
+        uint8_t value,
+        uint32_t writerPc = 0,
+        EeAddressTranslationContext translation =
+            EeAddressTranslationContext::unchecked());
+    void write16(
+        uint32_t address,
+        uint16_t value,
+        uint32_t writerPc = 0,
+        EeAddressTranslationContext translation =
+            EeAddressTranslationContext::unchecked());
+    void write32(
+        uint32_t address,
+        uint32_t value,
+        uint32_t writerPc = 0,
+        EeAddressTranslationContext translation =
+            EeAddressTranslationContext::unchecked());
+    void write64(
+        uint32_t address,
+        uint64_t value,
+        uint32_t writerPc = 0,
+        EeAddressTranslationContext translation =
+            EeAddressTranslationContext::unchecked());
+    void write128(
+        uint32_t address,
+        __m128i value,
+        uint32_t writerPc = 0,
+        EeAddressTranslationContext translation =
+            EeAddressTranslationContext::unchecked());
     void writeMasked32(
         uint32_t address,
         uint32_t value,
         uint8_t byteEnable,
-        uint32_t writerPc = 0);
+        uint32_t writerPc = 0,
+        EeAddressTranslationContext translation =
+            EeAddressTranslationContext::unchecked());
     void writeMasked64(
         uint32_t address,
         uint64_t value,
         uint8_t byteEnable,
-        uint32_t writerPc = 0);
+        uint32_t writerPc = 0,
+        EeAddressTranslationContext translation =
+            EeAddressTranslationContext::unchecked());
 
     // TLB handling
-    uint32_t translateAddress(uint32_t virtualAddress);
+    uint32_t translateAddress(
+        uint32_t virtualAddress,
+        EeAddressTranslationContext translation =
+            EeAddressTranslationContext::unchecked());
     bool tlbRead(uint32_t index, uint32_t &vpn, uint32_t &pfn, uint32_t &mask, bool &valid) const;
     bool tlbWrite(uint32_t index, uint32_t vpn, uint32_t pfn, uint32_t mask, bool valid);
     int32_t tlbProbe(uint32_t vpn) const;

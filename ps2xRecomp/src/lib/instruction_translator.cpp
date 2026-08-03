@@ -21,45 +21,6 @@ namespace ps2recomp
         {
             return static_cast<uint32_t>(width / 8);
         }
-
-        std::string memoryValueType(int width)
-        {
-            switch (width)
-            {
-            case 8:
-                return "uint8_t";
-            case 16:
-                return "uint16_t";
-            case 32:
-                return "uint32_t";
-            case 64:
-                return "uint64_t";
-            default:
-                return "";
-            }
-        }
-
-        std::string genFastWrite(int width, uint32_t address, const std::string &val)
-        {
-            const std::string addr = addressLiteral(address);
-            if (width == 128)
-            {
-                return fmt::format(
-                    "do {{ __m128i _value = ({}); "
-                    "const uint64_t _lo = static_cast<uint64_t>(PS2_EXTRACT_EPI64_0(_value)); "
-                    "const uint64_t _hi = static_cast<uint64_t>(PS2_EXTRACT_EPI64_1(_value)); "
-                    "ps2TraceGuestWrite(rdram, {}, 16u, _lo, _hi, \"WRITE128\", ctx); "
-                    "DEBUG_FAST_WRITE128({}, _value); }} while (0)",
-                    val, addr, addr);
-            }
-
-            const std::string valueType = memoryValueType(width);
-            return fmt::format(
-                "do {{ {} _value = static_cast<{}>({}); "
-                "ps2TraceGuestWrite(rdram, {}, {}u, _value, 0u, \"WRITE{}\", ctx); "
-                "DEBUG_FAST_WRITE{}({}, _value); }} while (0)",
-                valueType, valueType, val, addr, memoryAccessSize(width), width, width, addr);
-        }
     }
 
     InstructionTranslator::InstructionTranslator(CodeGenerator &codeGenerator)
@@ -93,7 +54,7 @@ namespace ps2recomp
             {
                 return fmt::format("runtime->Load{}(rdram, ctx, {})", width, resolvedAddressExpr);
             }
-            return fmt::format("DEBUG_FAST_READ{}({})", width, resolvedAddressExpr);
+            return fmt::format("READ{}({})", width, resolvedAddressExpr);
         }
 
         if (inst.isMmio)
@@ -118,7 +79,11 @@ namespace ps2recomp
             {
                 return fmt::format("runtime->Store{}(rdram, ctx, {}, {})", width, resolvedAddressExpr, value);
             }
-            return genFastWrite(width, resolvedAddress, value);
+            return fmt::format(
+                "WRITE{}({}, {})",
+                width,
+                resolvedAddressExpr,
+                value);
         }
 
         if (inst.isMmio)

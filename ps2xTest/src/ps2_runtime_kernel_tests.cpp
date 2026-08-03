@@ -832,6 +832,20 @@ namespace
         return dispatchNumericSyscall(syscallNumber, rdram, ctx, runtime);
     }
 
+    uint32_t g_syscallOverrideObservedStatus = 0u;
+    bool g_syscallOverridePermitsKseg = false;
+
+    void overrideKernelContextHandler(uint8_t *, R5900Context *ctx, PS2Runtime *)
+    {
+        g_syscallOverrideObservedStatus = ctx->cop0_status;
+        g_syscallOverridePermitsKseg =
+            EeAddressTranslationContext::fromCop0Status(
+                ctx->cop0_status)
+                .permits(0x80000000u);
+        setReturnU32(ctx, g_syscallOverridePermitsKseg ? 1u : 0u);
+        ctx->pc = ::getRegU32(ctx, 31);
+    }
+
     void overrideReturnHandler(uint8_t *, R5900Context *ctx, PS2Runtime *)
     {
         setReturnU32(ctx, ::getRegU32(ctx, 4) + ::getRegU32(ctx, 5));
@@ -17364,6 +17378,41 @@ void register_ps2_runtime_kernel_tests()
             t.Equals(static_cast<uint32_t>(getRegS32(env.ctx, 2)),
                      12u,
                      "Successful override dispatch should propagate guest handler return value");
+
+            notifyRuntimeStop();
+        });
+
+        tc.Run("SetSyscall overrides execute in a temporary kernel context", [](TestCase &t)
+        {
+            notifyRuntimeStop();
+            TestEnv env;
+            constexpr uint32_t kSyscallIndex = 0x94u;
+            constexpr uint32_t kHandler = 0x00200050u;
+            constexpr uint32_t kCallerStatus = 0x70020C11u;
+            constexpr uint32_t kExpectedKernelStatus = 0x70020C00u;
+
+            env.runtime.registerFunction(
+                kHandler,
+                overrideKernelContextHandler);
+            setRegU32(env.ctx, 4, kSyscallIndex);
+            setRegU32(env.ctx, 5, kHandler);
+            t.IsTrue(callSyscall(0x74u, env.rdram.data(), &env.ctx, &env.runtime),
+                     "SetSyscall syscall should dispatch");
+
+            env.ctx.cop0_status = kCallerStatus;
+            g_syscallOverrideObservedStatus = 0xFFFFFFFFu;
+            g_syscallOverridePermitsKseg = false;
+
+            t.IsTrue(callSyscall(kSyscallIndex, env.rdram.data(), &env.ctx, &env.runtime),
+                     "the guest override should complete in its temporary context");
+            t.Equals(g_syscallOverrideObservedStatus,
+                     kExpectedKernelStatus,
+                     "the syscall trampoline should clear IE and KSU while the override runs");
+            t.IsTrue(g_syscallOverridePermitsKseg,
+                     "the temporary kernel context should permit KSEG0 translation");
+            t.Equals(env.ctx.cop0_status,
+                     kCallerStatus,
+                     "returning from the override should preserve the caller's Status");
 
             notifyRuntimeStop();
         });
