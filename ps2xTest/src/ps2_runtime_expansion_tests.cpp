@@ -1474,6 +1474,89 @@ void register_ps2_runtime_expansion_tests()
                  0x2004u, 0x1004u, 0x2006u, 0x1006u});
         });
 
+        tc.Run("PADDUH and PSUBUH use unsigned halfword saturation", [](TestCase &t)
+        {
+            constexpr uint8_t sourceRegister = 11u;
+            constexpr uint8_t targetRegister = 12u;
+            constexpr uint8_t destinationRegister = 13u;
+
+            const struct
+            {
+                const char *name;
+                uint32_t raw;
+                const char *operation;
+            } translations[] = {
+                {"PADDUH", 0x716c6d28u, "_mm_adds_epu16"},
+                {"PSUBUH", 0x716c6d68u, "_mm_subs_epu16"},
+            };
+
+            for (const auto &test : translations)
+            {
+                const Instruction instruction =
+                    R5900Decoder{}.decodeInstruction(
+                        0x00100000u, test.raw);
+                const std::string generated =
+                    CodeGenerator({}, {}).translateInstruction(
+                        instruction);
+                const std::string expected =
+                    std::string(test.operation) +
+                    "(GPR_VEC(ctx, 11), GPR_VEC(ctx, 12))";
+
+                t.Equals(
+                    instruction.rs,
+                    sourceRegister,
+                    std::string(test.name) +
+                        " should decode its minuend/addend from rs");
+                t.Equals(
+                    instruction.rt,
+                    targetRegister,
+                    std::string(test.name) +
+                        " should decode its subtrahend/addend from rt");
+                t.Equals(
+                    instruction.rd,
+                    destinationRegister,
+                    std::string(test.name) +
+                        " should decode the destination from rd");
+                t.IsTrue(
+                    generated.find(expected) != std::string::npos,
+                    std::string(test.name) +
+                        " translation should use unsigned saturation");
+            }
+
+            const __m128i rs = Ps2MakeU16Vector(
+                0xffffu, 0x0000u, 0xfffeu, 0x8000u,
+                0x1234u, 0x4321u, 0xf000u, 0x0001u);
+            const __m128i rt = Ps2MakeU16Vector(
+                0x0001u, 0x0001u, 0x0001u, 0x8000u,
+                0x4321u, 0x1234u, 0x1000u, 0xffffu);
+            const auto verifyHalfwords =
+                [&](const std::string &name,
+                    __m128i value,
+                    const std::array<uint16_t, 8u> &expected)
+            {
+                std::array<uint16_t, 8u> actual{};
+                std::memcpy(actual.data(), &value, sizeof(value));
+                for (size_t lane = 0u; lane < actual.size(); ++lane)
+                {
+                    t.Equals(
+                        actual[lane],
+                        expected[lane],
+                        name + " halfword lane " + std::to_string(lane));
+                }
+            };
+
+            verifyHalfwords(
+                "PADDUH",
+                _mm_adds_epu16(rs, rt),
+                {0xffffu, 0x0001u, 0xffffu, 0xffffu,
+                 0x5555u, 0x5555u, 0xffffu, 0xffffu});
+            verifyHalfwords(
+                "PSUBUH",
+                _mm_subs_epu16(rs, rt),
+                {0xfffeu, 0x0000u, 0xfffdu, 0x0000u,
+                 0x0000u, 0x30edu, 0xe000u, 0x0000u});
+        });
+
         tc.Run("PMULTH writes eight independent signed products", [](TestCase &t)
         {
             R5900Context ctx{};
