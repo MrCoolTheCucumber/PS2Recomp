@@ -3,6 +3,7 @@
 #include "ps2_runtime.h"
 #include "runtime/cop0_timing.h"
 
+#include <array>
 #include <cstdint>
 
 using namespace ps2x::timing;
@@ -374,6 +375,146 @@ void register_cop0_timing_tests()
             t.Equals(
                 exl.pcr[0], 20u,
                 "without EXL0, the kernel mode bit should still enable PCR0");
+        });
+
+        tc.Run("occurrence events do not advance with elapsed processor cycles", [](TestCase &t)
+        {
+            constexpr std::array<uint32_t, 6u> occurrenceEvents{
+                2u, 3u, 12u, 13u, 14u, 15u};
+            for (size_t counter = 0u; counter < 2u; ++counter)
+            {
+                const uint32_t eventShift =
+                    counter == 0u ? 5u : 15u;
+                const uint32_t kernelEnable =
+                    1u << (counter == 0u ? 2u : 12u);
+                for (const uint32_t event : occurrenceEvents)
+                {
+                    Cop0Timing timing;
+                    timing.reset(
+                        0u, 0u, 0u,
+                        kPccrCte |
+                            kernelEnable |
+                            (event << eventShift));
+
+                    (void)timing.synchronizePerformance(
+                        64u, 0u);
+                    t.Equals(
+                        timing.snapshot().pcr[counter],
+                        0u,
+                        "a non-cycle EVENT selection must not alias elapsed cycle counting");
+                }
+            }
+        });
+
+        tc.Run("occurrence events have no speculative cycle overflow deadline", [](TestCase &t)
+        {
+            Cop0Timing timing;
+            timing.reset(
+                50u, 0u, 0u,
+                kPccrCte |
+                    kPccrK0 |
+                    (12u << 5u),
+                0x7fffffffu, 0u);
+
+            t.IsFalse(
+                timing.nextPerformanceEventCycle(
+                    50u, 0u)
+                    .has_value(),
+                "instruction completion cannot be scheduled from elapsed cycles alone");
+        });
+
+        tc.Run("counter-specific occurrence events select their documented sources", [](TestCase &t)
+        {
+            Cop0PerformanceEvents events{};
+            events.lowOrderBranchIssued = 2u;
+            events.singleInstructionIssued = 3u;
+            events.dualInstructionIssued = 5u;
+            events.branchIssued = 7u;
+            events.branchMispredicted = 11u;
+            events.instructionCompleted = 13u;
+            events.nonBdsInstructionCompleted = 17u;
+            events.cop2InstructionCompleted = 19u;
+            events.cop1InstructionCompleted = 23u;
+            events.loadCompleted = 29u;
+            events.storeCompleted = 31u;
+
+            const auto count =
+                [&events](size_t counter, uint32_t event)
+                {
+                    const uint32_t eventShift =
+                        counter == 0u ? 5u : 15u;
+                    const uint32_t kernelEnable =
+                        1u << (counter == 0u ? 2u : 12u);
+                    Cop0Timing timing;
+                    timing.reset(
+                        0u, 0u, 0u,
+                        kPccrCte |
+                            kernelEnable |
+                            (event << eventShift));
+                    (void)timing.recordPerformanceEvents(
+                        0u, events);
+                    return timing.snapshot().pcr[counter];
+                };
+
+            t.Equals(count(1u, 0u), 2u,
+                     "PCR1 EVENT 0 should count low-order predicted branches");
+            t.Equals(count(0u, 0u), 0u,
+                     "PCR0 EVENT 0 is reserved");
+            t.Equals(count(0u, 2u), 3u,
+                     "PCR0 EVENT 2 should count single issue slots");
+            t.Equals(count(1u, 2u), 5u,
+                     "PCR1 EVENT 2 should count dual issue slots");
+            t.Equals(count(0u, 3u), 7u,
+                     "PCR0 EVENT 3 should count issued predictive branches");
+            t.Equals(count(1u, 3u), 11u,
+                     "PCR1 EVENT 3 should count conditional mispredictions");
+            t.Equals(count(0u, 12u), 13u,
+                     "PCR0 EVENT 12 should count completed instructions");
+            t.Equals(count(1u, 12u), 13u,
+                     "PCR1 EVENT 12 should share completed instructions");
+            t.Equals(count(0u, 13u), 17u,
+                     "PCR0 EVENT 13 should count completed non-BDS instructions");
+            t.Equals(count(1u, 13u), 17u,
+                     "PCR1 EVENT 13 should share completed non-BDS instructions");
+            t.Equals(count(0u, 14u), 19u,
+                     "PCR0 EVENT 14 should count completed COP2 instructions");
+            t.Equals(count(1u, 14u), 23u,
+                     "PCR1 EVENT 14 should count completed COP1 instructions");
+            t.Equals(count(0u, 15u), 29u,
+                     "PCR0 EVENT 15 should count completed loads");
+            t.Equals(count(1u, 15u), 31u,
+                     "PCR1 EVENT 15 should count completed stores");
+        });
+
+        tc.Run("occurrence overflow is raised by the event rather than time", [](TestCase &t)
+        {
+            Cop0Timing timing;
+            timing.reset(
+                10u, 0u, 0u,
+                kPccrCte |
+                    kPccrK0 |
+                    (12u << 5u),
+                0x7fffffffu, 0u);
+            (void)timing.synchronizePerformance(
+                100u, 0u);
+            t.Equals(
+                timing.snapshot().pcr[0],
+                0x7fffffffu,
+                "elapsed cycles must not overflow a completion counter");
+
+            Cop0PerformanceEvents events{};
+            events.instructionCompleted = 1u;
+            const Cop0TimingAdvanceResult result =
+                timing.recordPerformanceEvents(
+                    0u, events);
+            t.Equals(
+                result.performanceOverflowMask,
+                static_cast<uint8_t>(1u),
+                "the completing instruction should report the first overflow");
+            t.Equals(
+                timing.snapshot().pcr[0],
+                0x80000000u,
+                "occurrence overflow should wrap VALUE and latch OVFL");
         });
 
         tc.Run("performance overflow has an exact scheduled boundary", [](TestCase &t)

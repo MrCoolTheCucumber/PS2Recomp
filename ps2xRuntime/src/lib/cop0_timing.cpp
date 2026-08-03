@@ -126,8 +126,7 @@ namespace ps2x::timing
                 (m_pccr & kPccrCounterEnable) != 0u &&
                 performanceCounterEnabled(
                     m_pccr, counter, status) &&
-                supportedPerformanceEvent(
-                    performanceEvent(m_pccr, counter));
+                performanceEvent(m_pccr, counter) == 1u;
             if (canCount)
             {
                 if (minimumIncrement && elapsed == 0u)
@@ -136,34 +135,49 @@ namespace ps2x::timing
                 }
                 if (elapsed != 0u)
                 {
-                    const bool alreadyOverflowed =
-                        (m_pcr[counter] &
-                         kPcrOverflow) != 0u;
-                    const uint64_t value =
-                        static_cast<uint64_t>(
-                            m_pcr[counter] &
-                            ~kPcrOverflow) +
-                        elapsed;
-                    const bool overflowed =
-                        value >=
-                        kPerformanceCounterModulus;
-                    m_pcr[counter] =
-                        static_cast<uint32_t>(
-                            value %
-                            kPerformanceCounterModulus) |
-                        ((alreadyOverflowed || overflowed)
-                             ? kPcrOverflow
-                             : 0u);
-                    if (!alreadyOverflowed && overflowed)
-                    {
-                        result.performanceOverflowMask |=
-                            static_cast<uint8_t>(
-                                1u << counter);
-                    }
+                    result.merge(
+                        incrementPerformanceCounter(
+                            counter, elapsed));
                 }
             }
             m_lastPerformanceCycle[counter] =
                 currentCycle;
+        }
+        return result;
+    }
+
+    Cop0TimingAdvanceResult
+    Cop0Timing::recordPerformanceEvents(
+        uint32_t status,
+        const Cop0PerformanceEvents &events) noexcept
+    {
+        Cop0TimingAdvanceResult result{};
+        if ((status & kStatusErl) != 0u ||
+            (m_pccr & kPccrCounterEnable) == 0u)
+        {
+            return result;
+        }
+
+        for (size_t counter = 0u;
+             counter < m_pcr.size();
+             ++counter)
+        {
+            if (!performanceCounterEnabled(
+                    m_pccr, counter, status))
+            {
+                continue;
+            }
+            const uint32_t event =
+                performanceEvent(m_pccr, counter);
+            const uint32_t occurrences =
+                performanceEventOccurrences(
+                    counter, event, events);
+            if (occurrences != 0u)
+            {
+                result.merge(
+                    incrementPerformanceCounter(
+                        counter, occurrences));
+            }
         }
         return result;
     }
@@ -268,9 +282,8 @@ namespace ps2x::timing
         {
             if (!performanceCounterEnabled(
                     m_pccr, counter, status) ||
-                !supportedPerformanceEvent(
-                    performanceEvent(
-                        m_pccr, counter)))
+                performanceEvent(
+                    m_pccr, counter) != 1u)
             {
                 continue;
             }
@@ -335,8 +348,13 @@ namespace ps2x::timing
     }
 
     bool Cop0Timing::supportedPerformanceEvent(
+        size_t counter,
         uint32_t event) noexcept
     {
+        if (event == 0u)
+        {
+            return counter == 1u;
+        }
         switch (event)
         {
         case 1u:
@@ -352,6 +370,45 @@ namespace ps2x::timing
         }
     }
 
+    uint32_t Cop0Timing::performanceEventOccurrences(
+        size_t counter,
+        uint32_t event,
+        const Cop0PerformanceEvents &events) noexcept
+    {
+        if (!supportedPerformanceEvent(counter, event) ||
+            event == 1u)
+        {
+            return 0u;
+        }
+        switch (event)
+        {
+        case 0u:
+            return events.lowOrderBranchIssued;
+        case 2u:
+            return counter == 0u
+                       ? events.singleInstructionIssued
+                       : events.dualInstructionIssued;
+        case 3u:
+            return counter == 0u
+                       ? events.branchIssued
+                       : events.branchMispredicted;
+        case 12u:
+            return events.instructionCompleted;
+        case 13u:
+            return events.nonBdsInstructionCompleted;
+        case 14u:
+            return counter == 0u
+                       ? events.cop2InstructionCompleted
+                       : events.cop1InstructionCompleted;
+        case 15u:
+            return counter == 0u
+                       ? events.loadCompleted
+                       : events.storeCompleted;
+        default:
+            return 0u;
+        }
+    }
+
     uint32_t Cop0Timing::performanceEvent(
         uint32_t pccr,
         size_t counter) noexcept
@@ -359,6 +416,39 @@ namespace ps2x::timing
         const uint32_t shift =
             counter == 0u ? 5u : 15u;
         return (pccr >> shift) & 0x1fu;
+    }
+
+    Cop0TimingAdvanceResult
+    Cop0Timing::incrementPerformanceCounter(
+        size_t counter,
+        uint64_t increment) noexcept
+    {
+        Cop0TimingAdvanceResult result{};
+        if (counter >= m_pcr.size() || increment == 0u)
+        {
+            return result;
+        }
+
+        const bool alreadyOverflowed =
+            (m_pcr[counter] & kPcrOverflow) != 0u;
+        const uint64_t value =
+            static_cast<uint64_t>(
+                m_pcr[counter] & ~kPcrOverflow) +
+            increment;
+        const bool overflowed =
+            value >= kPerformanceCounterModulus;
+        m_pcr[counter] =
+            static_cast<uint32_t>(
+                value % kPerformanceCounterModulus) |
+            ((alreadyOverflowed || overflowed)
+                 ? kPcrOverflow
+                 : 0u);
+        if (!alreadyOverflowed && overflowed)
+        {
+            result.performanceOverflowMask |=
+                static_cast<uint8_t>(1u << counter);
+        }
+        return result;
     }
 
     uint64_t Cop0Timing::saturatingAdd(

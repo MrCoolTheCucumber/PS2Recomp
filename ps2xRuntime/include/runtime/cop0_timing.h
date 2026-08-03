@@ -32,6 +32,24 @@ namespace ps2x::timing
         bool timerPending = false;
     };
 
+    // Occurrences observed at the EE issue or completion boundary.  Event
+    // numbers are counter-specific, so keep the semantic identities here and
+    // let Cop0Timing select the field for PCR0/PCR1.
+    struct Cop0PerformanceEvents
+    {
+        uint32_t lowOrderBranchIssued = 0u;
+        uint32_t singleInstructionIssued = 0u;
+        uint32_t dualInstructionIssued = 0u;
+        uint32_t branchIssued = 0u;
+        uint32_t branchMispredicted = 0u;
+        uint32_t instructionCompleted = 0u;
+        uint32_t nonBdsInstructionCompleted = 0u;
+        uint32_t cop2InstructionCompleted = 0u;
+        uint32_t cop1InstructionCompleted = 0u;
+        uint32_t loadCompleted = 0u;
+        uint32_t storeCompleted = 0u;
+    };
+
     // Runtime-owned timing state for the R5900 Count/Compare timer and the
     // two performance counters selected through COP0 register 25.
     class Cop0Timing
@@ -62,6 +80,9 @@ namespace ps2x::timing
             uint64_t currentCycle,
             uint32_t status,
             bool minimumIncrement = false) noexcept;
+        Cop0TimingAdvanceResult recordPerformanceEvents(
+            uint32_t status,
+            const Cop0PerformanceEvents &events) noexcept;
         [[nodiscard]] uint32_t readPerformance(
             uint32_t selector,
             uint64_t currentCycle,
@@ -90,10 +111,18 @@ namespace ps2x::timing
             size_t counter,
             uint32_t status) noexcept;
         [[nodiscard]] static bool supportedPerformanceEvent(
+            size_t counter,
             uint32_t event) noexcept;
+        [[nodiscard]] static uint32_t performanceEventOccurrences(
+            size_t counter,
+            uint32_t event,
+            const Cop0PerformanceEvents &events) noexcept;
         [[nodiscard]] static uint32_t performanceEvent(
             uint32_t pccr,
             size_t counter) noexcept;
+        Cop0TimingAdvanceResult incrementPerformanceCounter(
+            size_t counter,
+            uint64_t increment) noexcept;
         [[nodiscard]] static uint64_t saturatingAdd(
             uint64_t lhs,
             uint64_t rhs) noexcept;
