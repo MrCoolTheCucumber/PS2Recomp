@@ -66,6 +66,8 @@ namespace ps2recomp
                 (m_branchInst.opcode == OPCODE_REGIMM &&
                  (m_branchInst.rt == REGIMM_BLTZL || m_branchInst.rt == REGIMM_BGEZL ||
                   m_branchInst.rt == REGIMM_BLTZALL || m_branchInst.rt == REGIMM_BGEZALL)) ||
+                (m_branchInst.opcode == OPCODE_COP0 && m_branchInst.rs == COP0_BC &&
+                 (m_branchInst.rt == COP0_BC_BCFL || m_branchInst.rt == COP0_BC_BCTL)) ||
                 (m_branchInst.opcode == OPCODE_COP1 && m_branchInst.rs == COP1_BC &&
                  (m_branchInst.rt == COP1_BC_BCFL || m_branchInst.rt == COP1_BC_BCTL)) ||
                 (m_branchInst.opcode == OPCODE_COP2 && m_branchInst.rs == COP2_BC &&
@@ -439,6 +441,22 @@ namespace ps2recomp
             default:
                 return "false";
             }
+        case OPCODE_COP0:
+            if (m_branchInst.rs == COP0_BC)
+            {
+                switch (m_branchInst.rt)
+                {
+                case COP0_BC_BCF:
+                case COP0_BC_BCFL:
+                    return "!runtime->readCop0Condition0()";
+                case COP0_BC_BCT:
+                case COP0_BC_BCTL:
+                    return "runtime->readCop0Condition0()";
+                default:
+                    return "false";
+                }
+            }
+            break;
         case OPCODE_COP1:
             if (m_branchInst.rs == COP1_BC)
             {

@@ -58,6 +58,68 @@ void register_cop0_timing_tests()
                 "a repeated same-cycle Count read should increment again");
         });
 
+        tc.Run("CPCOND0 follows the documented DMAC completion truth table", [](TestCase &t)
+        {
+            constexpr uint32_t kDStat = 0x1000E010u;
+            constexpr uint32_t kDPcr = 0x1000E020u;
+            constexpr uint32_t kAllChannels = 0x3FFu;
+            PS2Runtime runtime;
+            PS2Memory &memory = runtime.memory();
+
+            t.IsTrue(
+                memory.writeIORegister(kDPcr, 0u),
+                "D_PCR write should succeed");
+            t.IsTrue(
+                runtime.readCop0Condition0(),
+                "CPCOND0 should be true when no channel participates");
+
+            t.IsTrue(
+                memory.writeIORegister(kDPcr, kAllChannels),
+                "D_PCR should select every channel");
+            t.IsFalse(
+                runtime.readCop0Condition0(),
+                "CPCOND0 should be false while selected channels are incomplete");
+
+            for (size_t index = 0u;
+                 index < PS2_DMAC_CHANNEL_COUNT;
+                 ++index)
+            {
+                const DmacChannel channel =
+                    static_cast<DmacChannel>(index);
+                const DmacTransferToken transfer =
+                    memory.beginDmacTransfer(channel);
+                t.IsTrue(
+                    memory.requestDmacCompletion(transfer),
+                    "the selected DMAC channel should complete");
+                t.Equals(
+                    memory.publishReadyDmacCompletions(index + 1u),
+                    static_cast<size_t>(1u),
+                    "one completion should publish its D_STAT bit");
+            }
+            t.Equals(
+                memory.readIORegister(kDStat) & kAllChannels,
+                kAllChannels,
+                "the fixture should latch every channel completion");
+            t.IsTrue(
+                runtime.readCop0Condition0(),
+                "CPCOND0 should become true when every selected channel completes");
+
+            constexpr uint32_t kGifChannel = 1u << 2u;
+            t.IsTrue(
+                memory.writeIORegister(kDStat, kGifChannel),
+                "D_STAT write-one should clear the GIF completion");
+            t.IsFalse(
+                runtime.readCop0Condition0(),
+                "clearing one selected completion should lower CPCOND0");
+            t.IsTrue(
+                memory.writeIORegister(
+                    kDPcr, kAllChannels & ~kGifChannel),
+                "D_PCR should be able to exclude the incomplete channel");
+            t.IsTrue(
+                runtime.readCop0Condition0(),
+                "an incomplete unselected channel should not lower CPCOND0");
+        });
+
         tc.Run("Compare detects modular equality and clears only on write", [](TestCase &t)
         {
             Cop0Timing timing;

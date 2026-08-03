@@ -3661,6 +3661,19 @@ void PS2Runtime::deliverPendingCop0Exceptions(
     }
 }
 
+bool PS2Runtime::readCop0Condition0()
+{
+    constexpr uint32_t kDStat = 0x1000E010u;
+    constexpr uint32_t kDPcr = 0x1000E020u;
+    constexpr uint32_t kChannelMask = 0x3FFu;
+    const uint32_t channelStatus =
+        m_memory.readIORegister(kDStat);
+    const uint32_t selectedChannels =
+        m_memory.readIORegister(kDPcr);
+    return ((channelStatus | ~selectedChannels) &
+            kChannelMask) == kChannelMask;
+}
+
 uint32_t PS2Runtime::readCop0Count(
     uint8_t *rdram,
     R5900Context *ctx)

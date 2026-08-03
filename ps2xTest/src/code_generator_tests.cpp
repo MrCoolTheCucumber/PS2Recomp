@@ -3,6 +3,7 @@
 #include "ps2recomp/ee_cycle_model.h"
 #include "ps2recomp/instructions.h"
 #include "ps2recomp/ps2_recompiler.h"
+#include "ps2recomp/r5900_decoder.h"
 #include "ps2recomp/recompiler_reporter.h"
 #include "ps2recomp/types.h"
 #include <filesystem>
@@ -24,6 +25,19 @@ static Instruction makeBranch(uint32_t address, uint32_t targetOffsetWords)
     inst.isBranch = true;
     inst.hasDelaySlot = true;
     return inst;
+}
+
+static Instruction makeCop0Branch(
+    uint32_t address,
+    uint8_t condition,
+    int16_t targetOffsetWords)
+{
+    const uint32_t raw =
+        (OPCODE_COP0 << 26) |
+        (COP0_BC << 21) |
+        (static_cast<uint32_t>(condition) << 16) |
+        static_cast<uint16_t>(targetOffsetWords);
+    return R5900Decoder{}.decodeInstruction(address, raw, false);
 }
 
 static Instruction makeNop(uint32_t address)
@@ -2499,6 +2513,73 @@ void register_code_generator_tests()
  
             t.IsTrue(generated.find("SET_GPR_S32(ctx, 7,") != std::string::npos, "delay slot should be translated");
             t.IsTrue(generated.find("if (branch_taken_0x1200)") != std::string::npos, "should generate branch_taken variable and if for likely branch");
+        });
+
+        tc.Run("BC0 branches use CPCOND0 and annul likely delay slots", [](TestCase &t) {
+            struct BranchCase
+            {
+                uint8_t condition;
+                bool branchOnTrue;
+                bool likely;
+            };
+            const BranchCase cases[] = {
+                {COP0_BC_BCF, false, false},
+                {COP0_BC_BCT, true, false},
+                {COP0_BC_BCFL, false, true},
+                {COP0_BC_BCTL, true, true},
+            };
+
+            for (const BranchCase &branchCase : cases)
+            {
+                Function function;
+                function.name = "bc0_condition";
+                function.start = 0x1240u;
+                function.end = 0x124Cu;
+                function.isRecompiled = true;
+
+                const Instruction branch = makeCop0Branch(
+                    0x1240u, branchCase.condition, 3);
+                const Instruction delay = makeAddiu(
+                    0x1244u, 7u, 0u, 123u);
+                const Instruction fallthrough = makeAddiu(
+                    0x1248u, 8u, 0u, 77u);
+
+                CodeGenerator generator({}, {});
+                const std::string generated = generator.generateFunction(
+                    function, {branch, delay, fallthrough}, false);
+                const std::string expectedCondition =
+                    branchCase.branchOnTrue
+                        ? "const bool branch_taken_0x1240 = (runtime->readCop0Condition0());"
+                        : "const bool branch_taken_0x1240 = (!runtime->readCop0Condition0());";
+                t.IsTrue(
+                    generated.find(expectedCondition) != std::string::npos,
+                    "BC0 polarity should be derived from the live CPCOND0 signal");
+                t.IsTrue(
+                    generated.find("ctx->pc = 0x1250u;") !=
+                        std::string::npos,
+                    "a taken BC0 should dispatch to its external target");
+                t.IsTrue(
+                    generated.find("SET_GPR_S32(ctx, 8,") !=
+                        std::string::npos,
+                    "a not-taken BC0 should retain its decoded fallthrough");
+
+                const size_t branchBody = generated.find(
+                    "if (branch_taken_0x1240)");
+                const size_t delaySlot = generated.find(
+                    "SET_GPR_S32(ctx, 7,");
+                t.IsTrue(
+                    branchBody != std::string::npos &&
+                        delaySlot != std::string::npos,
+                    "BC0 fixture should contain a branch body and translated delay slot");
+                if (branchBody != std::string::npos &&
+                    delaySlot != std::string::npos)
+                {
+                    t.Equals(
+                        branchBody < delaySlot,
+                        branchCase.likely,
+                        "only BC0 likely forms should place the delay slot inside the taken path");
+                }
+            }
         });
 
         tc.Run("JR $31 returns through dynamic target without broad local switch", [](TestCase &t) {

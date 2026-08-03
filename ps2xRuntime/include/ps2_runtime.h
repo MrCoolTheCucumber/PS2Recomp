@@ -1191,6 +1191,7 @@ public:
     void handleTLBWI(uint8_t *rdram, R5900Context *ctx);
     void handleTLBWR(uint8_t *rdram, R5900Context *ctx);
     void handleTLBP(uint8_t *rdram, R5900Context *ctx);
+    [[nodiscard]] bool readCop0Condition0();
     [[nodiscard]] uint32_t readCop0Count(
         uint8_t *rdram,
         R5900Context *ctx);
