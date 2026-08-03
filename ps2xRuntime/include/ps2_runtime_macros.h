@@ -1150,9 +1150,11 @@ static inline void Ps2SetGprLow64(R5900Context *ctx, int reg, __m128i new_low)
 #define SET_GPR_U32(ctx_ptr, reg_idx, val)                                \
     do                                                                    \
     {                                                                     \
+        auto _evaluatedVal = (val);                                       \
         if ((reg_idx) != 0)                                               \
         {                                                                 \
-            __m128i _newVal = _mm_cvtsi64_si128((int64_t)(int32_t)(val)); \
+            __m128i _newVal =                                             \
+                _mm_cvtsi64_si128((int64_t)(int32_t)_evaluatedVal);        \
                                                                           \
             Ps2SetGprLow64(ctx_ptr, reg_idx, _newVal);                    \
         }                                                                 \
@@ -1161,30 +1163,34 @@ static inline void Ps2SetGprLow64(R5900Context *ctx, int reg, __m128i new_low)
 #define SET_GPR_S32(ctx_ptr, reg_idx, val)                                \
     do                                                                    \
     {                                                                     \
+        auto _evaluatedVal = (val);                                       \
         if ((reg_idx) != 0)                                               \
         {                                                                 \
-            __m128i _newVal = _mm_cvtsi64_si128((int64_t)(int32_t)(val)); \
+            __m128i _newVal =                                             \
+                _mm_cvtsi64_si128((int64_t)(int32_t)_evaluatedVal);        \
             Ps2SetGprLow64(ctx_ptr, reg_idx, _newVal);                    \
         }                                                                 \
     } while (0)
 
-#define SET_GPR_U64(ctx_ptr, reg_idx, val)                       \
-    do                                                           \
-    {                                                            \
-        if ((reg_idx) != 0)                                      \
-        {                                                        \
-            __m128i _newVal = _mm_cvtsi64_si128((int64_t)(val)); \
-            Ps2SetGprLow64(ctx_ptr, reg_idx, _newVal);           \
-        }                                                        \
+#define SET_GPR_U64(ctx_ptr, reg_idx, val)                                \
+    do                                                                    \
+    {                                                                     \
+        auto _evaluatedVal = (val);                                       \
+        if ((reg_idx) != 0)                                               \
+        {                                                                 \
+            __m128i _newVal = _mm_cvtsi64_si128((int64_t)_evaluatedVal);  \
+            Ps2SetGprLow64(ctx_ptr, reg_idx, _newVal);                    \
+        }                                                                 \
     } while (0)
 
 #define SET_GPR_S64(ctx_ptr, reg_idx, val) SET_GPR_U64(ctx_ptr, reg_idx, val)
 
-#define SET_GPR_VEC(ctx_ptr, reg_idx, val) \
-    do                                     \
-    {                                      \
-        if (reg_idx != 0)                  \
-            ctx_ptr->r[reg_idx] = (val);   \
+#define SET_GPR_VEC(ctx_ptr, reg_idx, val)     \
+    do                                         \
+    {                                          \
+        __m128i _evaluatedVal = (val);         \
+        if ((reg_idx) != 0)                    \
+            ctx_ptr->r[reg_idx] = _evaluatedVal; \
     } while (0)
 
 #endif // PS2_RUNTIME_MACROS_H

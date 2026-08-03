@@ -50,6 +50,7 @@ add_library(ps2_test_lib STATIC
     src/ee_counter_tests.cpp
     src/ee_execution_backend_tests.cpp
     src/ee_event_scheduler_tests.cpp
+    src/ee_load_zero_tests.cpp
     src/ee_runtime_executor_tests.cpp
     src/ee_reserved_instruction_tests.cpp
     src/ee_thread_scheduler_tests.cpp
