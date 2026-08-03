@@ -311,7 +311,8 @@ void register_code_generator_tests()
         const std::string generated = gen.translateInstruction(lwu);
 
         t.IsTrue(
-            generated.find("SET_GPR_U64(ctx, 6, (uint64_t)(uint32_t)READ32(") != std::string::npos,
+            generated.find("SET_GPR_U64(ctx, 6, (uint64_t)(uint32_t)([&]()") != std::string::npos &&
+                generated.find("READ32(eeBreakpointAddress)") != std::string::npos,
             "LWU should zero-extend the loaded word to 64 bits");
         t.IsTrue(
             generated.find("SET_GPR_U32(ctx, 6") == std::string::npos,
@@ -484,7 +485,7 @@ void register_code_generator_tests()
         std::string generated = gen.generateFunction(func, instructions, false);
         printGeneratedCode("constant MMIO store emits direct runtime store", generated);
 
-        t.IsTrue(generated.find("runtime->Store32(rdram, ctx, 0x1000E020u, GPR_U32(ctx, 2));") != std::string::npos,
+        t.IsTrue(generated.find("runtime->Store32(rdram, ctx, 0x1000E020u, eeBreakpointStoreValue);") != std::string::npos,
                  "constant MMIO SW should emit a direct runtime Store32");
         t.IsTrue(generated.find("WRITE32(ADD32(GPR_U32(ctx, 1)") == std::string::npos,
                  "constant MMIO SW should not go through WRITE32 address classification");
@@ -507,9 +508,9 @@ void register_code_generator_tests()
         std::string generated = gen.generateFunction(func, instructions, false);
         printGeneratedCode("constant RDRAM load and store emit fast memory access", generated);
 
-        t.IsTrue(generated.find("SET_GPR_S32(ctx, 3, (int32_t)READ32(0x123460u));") != std::string::npos,
+        t.IsTrue(generated.find("READ32(0x123460u)") != std::string::npos,
                  "constant RDRAM LW should retain guest-mode-aware fast-path selection");
-        t.IsTrue(generated.find("WRITE32(0x123464u, GPR_U32(ctx, 4));") != std::string::npos,
+        t.IsTrue(generated.find("WRITE32(0x123464u, eeBreakpointStoreValue);") != std::string::npos,
                  "constant RDRAM SW should retain guest-mode-aware fast-path selection");
         t.IsTrue(generated.find("READ32(ADD32(GPR_U32(ctx, 1)") == std::string::npos,
                  "constant RDRAM LW should not go through READ32 address classification");
@@ -531,7 +532,7 @@ void register_code_generator_tests()
             generatedLoad.find("READ32(0x80001000u)") != std::string::npos,
             "a resolved KSEG0 load should retain runtime mode selection");
         t.IsTrue(
-            generatedStore.find("WRITE32(0xA0001000u, GPR_U32(ctx, 4))") !=
+            generatedStore.find("WRITE32(0xA0001000u, eeBreakpointStoreValue)") !=
                 std::string::npos,
             "a resolved KSEG1 store should retain runtime mode selection");
         t.IsTrue(
@@ -565,7 +566,7 @@ void register_code_generator_tests()
                  "constant address beyond RDRAM aliases should use the checked load");
         t.IsTrue(generated.find("runtime->Load32(rdram, ctx, 0x123451u)") != std::string::npos,
                  "constant misaligned LW should use the checked load");
-        t.IsTrue(generated.find("runtime->Store32(rdram, ctx, 0x123452u, GPR_U32(ctx, 5))") != std::string::npos,
+        t.IsTrue(generated.find("runtime->Store32(rdram, ctx, 0x123452u, eeBreakpointStoreValue)") != std::string::npos,
                  "constant misaligned SW should use the checked store");
         t.IsTrue(generated.find("FAST_READ32(0x22000000u)") == std::string::npos,
                  "invalid constant load must not wrap through the fast helper");
@@ -585,9 +586,9 @@ void register_code_generator_tests()
         printGeneratedCode("EE LQ silently aligns dynamic address", dynamicLq);
         printGeneratedCode("EE SQ silently aligns dynamic address", dynamicSq);
 
-        t.IsTrue(dynamicLq.find("READ128((ADD32(GPR_U32(ctx, 1), 8) & ~0xFu))") != std::string::npos,
+        t.IsTrue(dynamicLq.find("READ128((eeBreakpointAddress & ~0xFu))") != std::string::npos,
                  "LQ should clear the low four effective-address bits");
-        t.IsTrue(dynamicSq.find("WRITE128((ADD32(GPR_U32(ctx, 3), 8) & ~0xFu), GPR_VEC(ctx, 4))") != std::string::npos,
+        t.IsTrue(dynamicSq.find("WRITE128((eeBreakpointAddress & ~0xFu), eeBreakpointStoreValue)") != std::string::npos,
                  "SQ should clear the low four effective-address bits");
 
         const MemoryAccessHint unalignedHint{true, 0x00123458u};
@@ -596,7 +597,7 @@ void register_code_generator_tests()
 
         t.IsTrue(constantLq.find("READ128(0x123450u)") != std::string::npos,
                  "constant LQ hint should be aligned before selecting the fast path");
-        t.IsTrue(constantSq.find("WRITE128(0x123450u, GPR_VEC(ctx, 4))") != std::string::npos,
+        t.IsTrue(constantSq.find("WRITE128(0x123450u, eeBreakpointStoreValue)") != std::string::npos,
                  "constant SQ hint should be aligned before selecting the fast path");
         t.IsTrue(constantLq.find("runtime->Load128") == std::string::npos,
                  "silently aligned LQ should not be treated as an address error");
@@ -682,10 +683,12 @@ void register_code_generator_tests()
                  "dynamic GIF TADR source should be captured when the store is coalesced");
         t.IsTrue(generated.find("runtime->kickGifDmaChainFromMMIO(rdram, ctx, 0x4u, 0x4u, gifDmaKickValue_3024_2, 0x105u);") != std::string::npos,
                  "known GIF DMA MMIO stores should coalesce into the native kick helper");
-        t.IsTrue(generated.find("runtime->Store32(rdram, ctx, 0x1000E020u") == std::string::npos,
-                 "coalesced D_PCR store should not remain as an individual Store32");
-        t.IsTrue(generated.find("runtime->Store32(rdram, ctx, 0x1000A000u") == std::string::npos,
-                 "coalesced GIF CHCR store should not remain as an individual Store32");
+        t.IsTrue(generated.find("runtime->EeDataBreakpointEnabled(ctx, true)") != std::string::npos,
+                 "coalescing should retain a guarded architectural-breakpoint fallback");
+        t.IsTrue(generated.find("runtime->Store32(rdram, ctx, 0x1000E020u") != std::string::npos,
+                 "the breakpoint fallback should preserve the individual D_PCR store");
+        t.IsTrue(generated.find("runtime->Store32(rdram, ctx, 0x1000A000u") != std::string::npos,
+                 "the breakpoint fallback should preserve the individual GIF CHCR store");
     });
 
     tc.Run("GIF DMA kick coalesces when CHCR store is a return delay slot", [](TestCase &t) {
@@ -723,8 +726,9 @@ void register_code_generator_tests()
                  "coalesced helper should still run as the return delay slot");
         t.IsTrue(generated.find("runtime->kickGifDmaChainFromMMIO(rdram, ctx, 0x4u, 0x4u, gifDmaKickValue_2e7cb4_2, 0x105u);") != std::string::npos,
                  "loadImage-like GIF DMA stores should coalesce into the native kick helper");
-        t.IsTrue(generated.find("WRITE32(ADD32(GPR_U32(ctx, 3), 0), GPR_U32(ctx, 4));") == std::string::npos,
-                 "coalesced delay-slot CHCR store should not remain as an individual WRITE32");
+        t.IsTrue(generated.find("runtime->EeDataBreakpointEnabled(ctx, true)") != std::string::npos &&
+                     generated.find("CheckEeDataAddressBreakpoint") != std::string::npos,
+                 "the coalesced delay-slot store should retain a guarded breakpoint fallback");
     });
 
         tc.Run("emits labels and gotos for internal branches", [](TestCase &t) {

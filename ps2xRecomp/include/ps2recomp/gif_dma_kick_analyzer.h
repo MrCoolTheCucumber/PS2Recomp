@@ -56,7 +56,11 @@ namespace ps2recomp
 
     std::string gifDmaKickCall(const GifDmaKickPlan &plan);
     void emitGifDmaCapture(std::ostream &out, const GifDmaKickPlan &plan, size_t slot, std::string_view indent);
-    std::string gifDmaDelaySlotOverride(const Instruction &delaySlot, const GifDmaKickPlan &plan, bool emitComments);
+    std::string gifDmaDelaySlotOverride(
+        const Instruction &delaySlot,
+        const GifDmaKickPlan &plan,
+        bool emitComments,
+        std::string slowPathCode);
 }
 
 #endif // PS2RECOMP_GIF_DMA_KICK_ANALYZER_H

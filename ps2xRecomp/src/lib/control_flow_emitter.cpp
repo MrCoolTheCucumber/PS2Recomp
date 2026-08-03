@@ -166,23 +166,9 @@ namespace ps2recomp
         std::string_view indent,
         bool branchDelayExecution)
     {
-        m_ss << fmt::format("{}++ctx->insn_count;\n", indent);
-        m_ss << fmt::format(
-            "{}ctx->advanceEeCycleTicks({}u);\n",
-            indent,
-            eeInstructionCycleTicks(m_delaySlot));
-
         if (!branchDelayExecution)
         {
             m_ss << fmt::format("{}ctx->in_delay_slot = false;\n", indent);
-        }
-
-        const bool hasInstruction = branchDelayExecution
-                                        ? hasRealDelaySlot()
-                                        : !isGuestNop(m_delaySlot);
-        if (!hasInstruction)
-        {
-            return;
         }
 
         m_ss << fmt::format("{}ctx->pc = 0x{:X}u;\n", indent, delayPc());
@@ -190,6 +176,28 @@ namespace ps2recomp
         {
             m_ss << fmt::format("{}ctx->in_delay_slot = true;\n", indent);
             m_ss << fmt::format("{}ctx->branch_pc = 0x{:X}u;\n", indent, branchPc());
+        }
+        m_ss << fmt::format(
+            "{}runtime->CheckEeInstructionBreakpoint(ctx, ctx->pc);\n",
+            indent);
+        m_ss << fmt::format("{}++ctx->insn_count;\n", indent);
+        m_ss << fmt::format(
+            "{}ctx->advanceEeCycleTicks({}u);\n",
+            indent,
+            eeInstructionCycleTicks(m_delaySlot));
+
+        const bool hasInstruction = branchDelayExecution
+                                        ? hasRealDelaySlot()
+                                        : !isGuestNop(m_delaySlot);
+        if (!hasInstruction)
+        {
+            if (branchDelayExecution)
+            {
+                m_ss << fmt::format(
+                    "{}ctx->in_delay_slot = false;\n",
+                    indent);
+            }
+            return;
         }
 
         const std::string code = delaySlotCode(branchDelayExecution);

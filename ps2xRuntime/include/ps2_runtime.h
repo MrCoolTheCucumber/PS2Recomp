@@ -1206,6 +1206,21 @@ public:
     void ValidateInstructionFetch(
         R5900Context *ctx,
         uint32_t virtualAddress);
+    void CheckEeInstructionBreakpoint(
+        R5900Context *ctx,
+        uint32_t virtualAddress);
+    [[nodiscard]] bool EeDataBreakpointEnabled(
+        const R5900Context *ctx,
+        bool write) const noexcept;
+    [[nodiscard]] bool CheckEeDataAddressBreakpoint(
+        R5900Context *ctx,
+        uint32_t virtualAddress,
+        bool write);
+    void CheckEeDataValueBreakpoint(
+        R5900Context *ctx,
+        uint32_t virtualAddress,
+        uint32_t value,
+        bool write);
     void SignalBusError(R5900Context *ctx,
                         PS2BusErrorAccess access,
                         uint32_t physicalAddress);
@@ -1873,6 +1888,9 @@ private:
         bool commitContextProgress = true);
     [[noreturn]] void raiseCop0PerformanceException(
         R5900Context *ctx);
+    [[noreturn]] void raiseCop0DebugException(
+        R5900Context *ctx,
+        bool dataBreakpoint);
     [[nodiscard]] ps2x::timing::EeTick publishEeElapsed(
         ps2x::timing::EeTickDelta elapsed) noexcept;
     [[nodiscard]] ps2x::timing::EeTick commitEeContextProgress(

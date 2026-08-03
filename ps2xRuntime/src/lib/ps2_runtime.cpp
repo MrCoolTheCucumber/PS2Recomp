@@ -224,6 +224,7 @@ namespace
     constexpr uint32_t COP0_CAUSE_IP7 = 0x00008000u;
     constexpr uint32_t COP0_CAUSE_EXC2_MASK = 0x00070000u;
     constexpr uint32_t COP0_CAUSE_EXC2_PERFORMANCE = 0x00020000u;
+    constexpr uint32_t COP0_CAUSE_EXC2_DEBUG = 0x00030000u;
     constexpr uint32_t COP0_CAUSE_BD2 = 0x40000000u;
     constexpr uint32_t COP0_CAUSE_BD = 0x80000000u;
     constexpr uint32_t COP0_CAUSE_CE_MASK = 0x30000000u;
@@ -241,6 +242,65 @@ namespace
     constexpr uint32_t EXCEPTION_VECTOR_BOOT_BASE = 0xBFC00200u;
     constexpr uint32_t EXCEPTION_VECTOR_COMMON_OFFSET = 0x180u;
     constexpr uint32_t EXCEPTION_VECTOR_INTERRUPT_OFFSET = 0x200u;
+    constexpr uint32_t COP0_BPC_IAE = 1u << 31u;
+    constexpr uint32_t COP0_BPC_DRE = 1u << 30u;
+    constexpr uint32_t COP0_BPC_DWE = 1u << 29u;
+    constexpr uint32_t COP0_BPC_DVE = 1u << 28u;
+    constexpr uint32_t COP0_BPC_IUE = 1u << 26u;
+    constexpr uint32_t COP0_BPC_ISE = 1u << 25u;
+    constexpr uint32_t COP0_BPC_IKE = 1u << 24u;
+    constexpr uint32_t COP0_BPC_IXE = 1u << 23u;
+    constexpr uint32_t COP0_BPC_DUE = 1u << 21u;
+    constexpr uint32_t COP0_BPC_DSE = 1u << 20u;
+    constexpr uint32_t COP0_BPC_DKE = 1u << 19u;
+    constexpr uint32_t COP0_BPC_DXE = 1u << 18u;
+    constexpr uint32_t COP0_BPC_BED = 1u << 15u;
+    constexpr uint32_t COP0_BPC_DWB = 1u << 2u;
+    constexpr uint32_t COP0_BPC_DRB = 1u << 1u;
+    constexpr uint32_t COP0_BPC_IAB = 1u << 0u;
+
+    bool eeBreakpointModeEnabled(
+        uint32_t status,
+        uint32_t bpc,
+        bool instruction) noexcept
+    {
+        if ((status & COP0_STATUS_ERL) != 0u)
+        {
+            return false;
+        }
+
+        uint32_t enable = 0u;
+        if ((status & COP0_STATUS_EXL) != 0u)
+        {
+            enable = instruction
+                         ? COP0_BPC_IXE
+                         : COP0_BPC_DXE;
+        }
+        else
+        {
+            switch (status & COP0_STATUS_KSU_MASK)
+            {
+            case 0u:
+                enable = instruction
+                             ? COP0_BPC_IKE
+                             : COP0_BPC_DKE;
+                break;
+            case 1u << 3u:
+                enable = instruction
+                             ? COP0_BPC_ISE
+                             : COP0_BPC_DSE;
+                break;
+            case 2u << 3u:
+                enable = instruction
+                             ? COP0_BPC_IUE
+                             : COP0_BPC_DUE;
+                break;
+            default:
+                return false;
+            }
+        }
+        return (bpc & enable) != 0u;
+    }
 
     EeAddressTranslationContext guestAddressTranslation(
         const R5900Context *ctx) noexcept
@@ -6476,6 +6536,68 @@ PS2Runtime::raiseCop0PerformanceException(
     throw PS2GuestException{};
 }
 
+[[noreturn]] void
+PS2Runtime::raiseCop0DebugException(
+    R5900Context *ctx,
+    bool dataBreakpoint)
+{
+    if (!ctx)
+    {
+        throw PS2GuestException{};
+    }
+
+    const ps2x::timing::EeTick now =
+        commitEeContextProgress(ctx);
+    const uint64_t cycle =
+        ps2x::timing::eeTickToCyclesFloor(now);
+    synchronizeCop0Timing(ctx, cycle);
+
+    // Performance overflow precedes both debug classes. Enabled interrupts
+    // precede data breakpoints but follow instruction breakpoints.
+    if (m_cop0Timing.performanceExceptionPending(
+            ctx->cop0_status))
+    {
+        raiseCop0PerformanceException(ctx);
+    }
+    if (dataBreakpoint &&
+        cop0TimerInterruptEnabled(ctx))
+    {
+        raiseCop0Level1Exception(
+            ctx, EXCEPTION_INTERRUPT, false);
+    }
+
+    if (ctx->in_delay_slot)
+    {
+        ctx->cop0_errorepc =
+            ctx->branch_pc;
+        ctx->cop0_cause =
+            (ctx->cop0_cause &
+             ~(COP0_CAUSE_EXC2_MASK |
+               COP0_CAUSE_BD2)) |
+            COP0_CAUSE_EXC2_DEBUG |
+            COP0_CAUSE_BD2;
+    }
+    else
+    {
+        ctx->cop0_errorepc = ctx->pc;
+        ctx->cop0_cause =
+            (ctx->cop0_cause &
+             ~(COP0_CAUSE_EXC2_MASK |
+               COP0_CAUSE_BD2)) |
+            COP0_CAUSE_EXC2_DEBUG;
+    }
+
+    ctx->cop0_status |= COP0_STATUS_ERL;
+    ctx->pc =
+        (ctx->cop0_status &
+         COP0_STATUS_DEV) != 0u
+            ? 0xBFC00300u
+            : 0x80000100u;
+    ctx->in_delay_slot = false;
+    refreshCop0EventSchedules(ctx, cycle);
+    throw PS2GuestException{};
+}
+
 [[noreturn]] void PS2Runtime::SignalException(R5900Context *ctx, PS2Exception exception)
 {
     if (exception == EXCEPTION_INTEGER_OVERFLOW)
@@ -6545,6 +6667,9 @@ void PS2Runtime::ValidateInstructionFetch(
     R5900Context *ctx,
     uint32_t virtualAddress)
 {
+    CheckEeInstructionBreakpoint(
+        ctx, virtualAddress);
+
     if (!ctx)
     {
         throw PS2GuestException{};
@@ -6580,6 +6705,104 @@ void PS2Runtime::ValidateInstructionFetch(
             ctx,
             EXCEPTION_TLB_REFILL_LOAD,
             fault.virtualAddress());
+    }
+}
+
+void PS2Runtime::CheckEeInstructionBreakpoint(
+    R5900Context *ctx,
+    uint32_t virtualAddress)
+{
+    if (!ctx)
+    {
+        throw PS2GuestException{};
+    }
+
+    const uint32_t bpc = ctx->cop0_bpc;
+    if ((bpc & COP0_BPC_IAE) == 0u ||
+        !eeBreakpointModeEnabled(
+            ctx->cop0_status, bpc, true) ||
+        (virtualAddress & ctx->cop0_iabm) !=
+            (ctx->cop0_iab & ctx->cop0_iabm))
+    {
+        return;
+    }
+
+    ctx->cop0_bpc |= COP0_BPC_IAB;
+    if ((bpc & COP0_BPC_BED) != 0u)
+    {
+        return;
+    }
+
+    ctx->pc = virtualAddress;
+    raiseCop0DebugException(ctx, false);
+}
+
+bool PS2Runtime::EeDataBreakpointEnabled(
+    const R5900Context *ctx,
+    bool write) const noexcept
+{
+    if (!ctx)
+    {
+        return false;
+    }
+    const uint32_t bpc = ctx->cop0_bpc;
+    const uint32_t directionEnable =
+        write ? COP0_BPC_DWE
+              : COP0_BPC_DRE;
+    return (bpc & directionEnable) != 0u &&
+           eeBreakpointModeEnabled(
+               ctx->cop0_status, bpc, false);
+}
+
+bool PS2Runtime::CheckEeDataAddressBreakpoint(
+    R5900Context *ctx,
+    uint32_t virtualAddress,
+    bool write)
+{
+    if (!EeDataBreakpointEnabled(ctx, write) ||
+        (virtualAddress & ctx->cop0_dabm) !=
+            (ctx->cop0_dab & ctx->cop0_dabm))
+    {
+        return false;
+    }
+
+    if ((ctx->cop0_bpc & COP0_BPC_DVE) != 0u)
+    {
+        return true;
+    }
+
+    ctx->cop0_bpc |=
+        write ? COP0_BPC_DWB
+              : COP0_BPC_DRB;
+    if ((ctx->cop0_bpc & COP0_BPC_BED) == 0u)
+    {
+        raiseCop0DebugException(ctx, true);
+    }
+    return false;
+}
+
+void PS2Runtime::CheckEeDataValueBreakpoint(
+    R5900Context *ctx,
+    uint32_t virtualAddress,
+    uint32_t value,
+    bool write)
+{
+    if (!EeDataBreakpointEnabled(ctx, write) ||
+        (ctx->cop0_bpc & COP0_BPC_DVE) == 0u ||
+        (virtualAddress & ctx->cop0_dabm) !=
+            (ctx->cop0_dab & ctx->cop0_dabm) ||
+        (value & ctx->cop0_dvbm) !=
+            (ctx->cop0_dvb & ctx->cop0_dvbm))
+    {
+        return;
+    }
+
+    ctx->cop0_bpc |=
+        write ? COP0_BPC_DWB
+              : COP0_BPC_DRB;
+    if ((ctx->cop0_bpc & COP0_BPC_BED) == 0u)
+    {
+        raiseCop0DebugException(ctx, true);
     }
 }
 

@@ -270,7 +270,11 @@ namespace ps2recomp
         out << indent << "uint32_t " << plan.values[slot] << " = " << plan.captureExpressions[slot] << ";\n";
     }
 
-    std::string gifDmaDelaySlotOverride(const Instruction &delaySlot, const GifDmaKickPlan &plan, bool emitComments)
+    std::string gifDmaDelaySlotOverride(
+        const Instruction &delaySlot,
+        const GifDmaKickPlan &plan,
+        bool emitComments,
+        std::string slowPathCode)
     {
         std::ostringstream code;
         const size_t slot = plan.slotFor(plan.endIndex);
@@ -285,7 +289,11 @@ namespace ps2recomp
 
         if (slot < plan.captures.size() && plan.captures[slot])
             code << "uint32_t " << plan.values[slot] << " = " << plan.captureExpressions[slot] << ";\n";
-        code << gifDmaKickCall(plan);
+        code << "if (runtime->EeDataBreakpointEnabled(ctx, true)) {\n";
+        code << "    " << slowPathCode << "\n";
+        code << "} else {\n";
+        code << "    " << gifDmaKickCall(plan) << "\n";
+        code << "}";
         return code.str();
     }
 

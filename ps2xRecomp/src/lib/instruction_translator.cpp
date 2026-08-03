@@ -153,6 +153,77 @@ namespace ps2recomp
             return translateMemoryWrite(inst, alignedHint, 128, fmt::format("({} & ~0xFu)", addr), val);
         };
 
+        auto genCheckedRead = [&](
+                                  int width,
+                                  const std::string &addr,
+                                  const std::string &breakpointValue)
+        {
+            return fmt::format(
+                "([&]() {{ const uint32_t eeBreakpointAddress = {}; "
+                "const bool eeBreakpointCheckValue = "
+                "runtime->CheckEeDataAddressBreakpoint(ctx, eeBreakpointAddress, false); "
+                "auto eeBreakpointValue = {}; "
+                "if (eeBreakpointCheckValue) "
+                "runtime->CheckEeDataValueBreakpoint(ctx, eeBreakpointAddress, {}, false); "
+                "return eeBreakpointValue; }}())",
+                addr,
+                genRead(width, "eeBreakpointAddress"),
+                breakpointValue);
+        };
+
+        auto genCheckedAlignedQuadwordRead = [&](
+                                                  const std::string &addr,
+                                                  const std::string &breakpointValue)
+        {
+            return fmt::format(
+                "([&]() {{ const uint32_t eeBreakpointAddress = {}; "
+                "const bool eeBreakpointCheckValue = "
+                "runtime->CheckEeDataAddressBreakpoint(ctx, eeBreakpointAddress, false); "
+                "auto eeBreakpointValue = {}; "
+                "if (eeBreakpointCheckValue) "
+                "runtime->CheckEeDataValueBreakpoint(ctx, eeBreakpointAddress, {}, false); "
+                "return eeBreakpointValue; }}())",
+                addr,
+                genAlignedQuadwordRead("eeBreakpointAddress"),
+                breakpointValue);
+        };
+
+        auto genCheckedWrite = [&](int width,
+                                   const std::string &addr,
+                                   const std::string &value,
+                                   const std::string &breakpointValue)
+        {
+            return fmt::format(
+                "{{ const uint32_t eeBreakpointAddress = {}; "
+                "auto eeBreakpointStoreValue = {}; "
+                "if (runtime->CheckEeDataAddressBreakpoint(ctx, eeBreakpointAddress, true)) "
+                "runtime->CheckEeDataValueBreakpoint(ctx, eeBreakpointAddress, {}, true); "
+                "{}; }}",
+                addr,
+                value,
+                breakpointValue,
+                genWrite(width, "eeBreakpointAddress", "eeBreakpointStoreValue"));
+        };
+
+        auto genCheckedAlignedQuadwordWrite = [&](
+                                                   const std::string &addr,
+                                                   const std::string &value,
+                                                   const std::string &breakpointValue)
+        {
+            return fmt::format(
+                "{{ const uint32_t eeBreakpointAddress = {}; "
+                "auto eeBreakpointStoreValue = {}; "
+                "if (runtime->CheckEeDataAddressBreakpoint(ctx, eeBreakpointAddress, true)) "
+                "runtime->CheckEeDataValueBreakpoint(ctx, eeBreakpointAddress, {}, true); "
+                "{}; }}",
+                addr,
+                value,
+                breakpointValue,
+                genAlignedQuadwordWrite(
+                    "eeBreakpointAddress",
+                    "eeBreakpointStoreValue"));
+        };
+
         switch (inst.opcode)
         {
         case OPCODE_SPECIAL:
@@ -216,38 +287,38 @@ namespace ps2recomp
         case OPCODE_LUI:
             return fmt::format("SET_GPR_S32(ctx, {}, (int32_t)((uint32_t){} << 16));", inst.rt, inst.immediate);
         case OPCODE_LB:
-            return fmt::format("SET_GPR_S32(ctx, {}, (int8_t){});", inst.rt, genRead(8, fmt::format("ADD32(GPR_U32(ctx, {}), {})", inst.rs, inst.simmediate)));
+            return fmt::format("SET_GPR_S32(ctx, {}, (int8_t){});", inst.rt, genCheckedRead(8, fmt::format("ADD32(GPR_U32(ctx, {}), {})", inst.rs, inst.simmediate), "(uint32_t)(int32_t)(int8_t)eeBreakpointValue"));
         case OPCODE_LH:
-            return fmt::format("SET_GPR_S32(ctx, {}, (int16_t){});", inst.rt, genRead(16, fmt::format("ADD32(GPR_U32(ctx, {}), {})", inst.rs, inst.simmediate)));
+            return fmt::format("SET_GPR_S32(ctx, {}, (int16_t){});", inst.rt, genCheckedRead(16, fmt::format("ADD32(GPR_U32(ctx, {}), {})", inst.rs, inst.simmediate), "(uint32_t)(int32_t)(int16_t)eeBreakpointValue"));
         case OPCODE_LW:
-            return fmt::format("SET_GPR_S32(ctx, {}, (int32_t){});", inst.rt, genRead(32, fmt::format("ADD32(GPR_U32(ctx, {}), {})", inst.rs, inst.simmediate)));
+            return fmt::format("SET_GPR_S32(ctx, {}, (int32_t){});", inst.rt, genCheckedRead(32, fmt::format("ADD32(GPR_U32(ctx, {}), {})", inst.rs, inst.simmediate), "(uint32_t)eeBreakpointValue"));
         case OPCODE_LBU:
-            return fmt::format("SET_GPR_U32(ctx, {}, (uint8_t){});", inst.rt, genRead(8, fmt::format("ADD32(GPR_U32(ctx, {}), {})", inst.rs, inst.simmediate)));
+            return fmt::format("SET_GPR_U32(ctx, {}, (uint8_t){});", inst.rt, genCheckedRead(8, fmt::format("ADD32(GPR_U32(ctx, {}), {})", inst.rs, inst.simmediate), "(uint32_t)eeBreakpointValue"));
         case OPCODE_LHU:
-            return fmt::format("SET_GPR_U32(ctx, {}, (uint16_t){});", inst.rt, genRead(16, fmt::format("ADD32(GPR_U32(ctx, {}), {})", inst.rs, inst.simmediate)));
+            return fmt::format("SET_GPR_U32(ctx, {}, (uint16_t){});", inst.rt, genCheckedRead(16, fmt::format("ADD32(GPR_U32(ctx, {}), {})", inst.rs, inst.simmediate), "(uint32_t)eeBreakpointValue"));
         case OPCODE_LWU:
-            return fmt::format("SET_GPR_U64(ctx, {}, (uint64_t)(uint32_t){});", inst.rt, genRead(32, fmt::format("ADD32(GPR_U32(ctx, {}), {})", inst.rs, inst.simmediate)));
+            return fmt::format("SET_GPR_U64(ctx, {}, (uint64_t)(uint32_t){});", inst.rt, genCheckedRead(32, fmt::format("ADD32(GPR_U32(ctx, {}), {})", inst.rs, inst.simmediate), "(uint32_t)eeBreakpointValue"));
         case OPCODE_SB:
-            return genWrite(8, fmt::format("ADD32(GPR_U32(ctx, {}), {})", inst.rs, inst.simmediate), fmt::format("(uint8_t)GPR_U32(ctx, {})", inst.rt)) + ";";
+            return genCheckedWrite(8, fmt::format("ADD32(GPR_U32(ctx, {}), {})", inst.rs, inst.simmediate), fmt::format("(uint8_t)GPR_U32(ctx, {})", inst.rt), fmt::format("GPR_U32(ctx, {})", inst.rt));
         case OPCODE_SH:
-            return genWrite(16, fmt::format("ADD32(GPR_U32(ctx, {}), {})", inst.rs, inst.simmediate), fmt::format("(uint16_t)GPR_U32(ctx, {})", inst.rt)) + ";";
+            return genCheckedWrite(16, fmt::format("ADD32(GPR_U32(ctx, {}), {})", inst.rs, inst.simmediate), fmt::format("(uint16_t)GPR_U32(ctx, {})", inst.rt), fmt::format("GPR_U32(ctx, {})", inst.rt));
         case OPCODE_SW:
-            return genWrite(32, fmt::format("ADD32(GPR_U32(ctx, {}), {})", inst.rs, inst.simmediate), fmt::format("GPR_U32(ctx, {})", inst.rt)) + ";";
+            return genCheckedWrite(32, fmt::format("ADD32(GPR_U32(ctx, {}), {})", inst.rs, inst.simmediate), fmt::format("GPR_U32(ctx, {})", inst.rt), fmt::format("GPR_U32(ctx, {})", inst.rt));
         case OPCODE_LQ:
-            return fmt::format("SET_GPR_VEC(ctx, {}, {});", inst.rt, genAlignedQuadwordRead(fmt::format("ADD32(GPR_U32(ctx, {}), {})", inst.rs, inst.simmediate)));
+            return fmt::format("SET_GPR_VEC(ctx, {}, {});", inst.rt, genCheckedAlignedQuadwordRead(fmt::format("ADD32(GPR_U32(ctx, {}), {})", inst.rs, inst.simmediate), "(uint32_t)Ps2ExtractEpi32(eeBreakpointValue, 0)"));
         case OPCODE_SQ:
-            return genAlignedQuadwordWrite(fmt::format("ADD32(GPR_U32(ctx, {}), {})", inst.rs, inst.simmediate), fmt::format("GPR_VEC(ctx, {})", inst.rt)) + ";";
+            return genCheckedAlignedQuadwordWrite(fmt::format("ADD32(GPR_U32(ctx, {}), {})", inst.rs, inst.simmediate), fmt::format("GPR_VEC(ctx, {})", inst.rt), fmt::format("GPR_U32(ctx, {})", inst.rt));
         case OPCODE_LD:
-            return fmt::format("SET_GPR_U64(ctx, {}, {});", inst.rt, genRead(64, fmt::format("ADD32(GPR_U32(ctx, {}), {})", inst.rs, inst.simmediate)));
+            return fmt::format("SET_GPR_U64(ctx, {}, {});", inst.rt, genCheckedRead(64, fmt::format("ADD32(GPR_U32(ctx, {}), {})", inst.rs, inst.simmediate), "(uint32_t)eeBreakpointValue"));
         case OPCODE_SD:
-            return genWrite(64, fmt::format("ADD32(GPR_U32(ctx, {}), {})", inst.rs, inst.simmediate), fmt::format("GPR_U64(ctx, {})", inst.rt)) + ";";
+            return genCheckedWrite(64, fmt::format("ADD32(GPR_U32(ctx, {}), {})", inst.rs, inst.simmediate), fmt::format("GPR_U64(ctx, {})", inst.rt), fmt::format("GPR_U32(ctx, {})", inst.rt));
         case OPCODE_LWC1:
-            return fmt::format("{{ uint32_t bits = {}; float f; std::memcpy(&f, &bits, sizeof(f)); ctx->f[{}] = f; }}", genRead(32, fmt::format("ADD32(GPR_U32(ctx, {}), {})", inst.rs, inst.simmediate)), inst.rt);
+            return fmt::format("{{ uint32_t bits = {}; float f; std::memcpy(&f, &bits, sizeof(f)); ctx->f[{}] = f; }}", genCheckedRead(32, fmt::format("ADD32(GPR_U32(ctx, {}), {})", inst.rs, inst.simmediate), "(uint32_t)eeBreakpointValue"), inst.rt);
         case OPCODE_SWC1:
             return fmt::format(
                 "{{ float f = ctx->f[{}]; uint32_t bits; std::memcpy(&bits, &f, sizeof(bits)); {}; }}",
                 inst.rt,
-                genWrite(32, fmt::format("ADD32(GPR_U32(ctx, {}), {})", inst.rs, inst.simmediate), "bits"));
+                genCheckedWrite(32, fmt::format("ADD32(GPR_U32(ctx, {}), {})", inst.rs, inst.simmediate), "bits", "bits"));
         case OPCODE_LDC2:
             if (inst.vu0SyncMode == Vu0SyncMode::Skip)
             {
@@ -255,7 +326,7 @@ namespace ps2recomp
                     "{{ ctx->vu0_vf[{}] = _mm_castsi128_ps({}); "
                     "ctx->enforceVu0RegisterInvariants(); }}",
                     inst.rt,
-                    genRead(128, fmt::format("ADD32(GPR_U32(ctx, {}), {})", inst.rs, inst.simmediate)));
+                    genCheckedRead(128, fmt::format("ADD32(GPR_U32(ctx, {}), {})", inst.rs, inst.simmediate), "(uint32_t)Ps2ExtractEpi32(eeBreakpointValue, 0)"));
             }
             return fmt::format(
                 "{{ runtime->synchronizeVU0Microprogram(rdram, ctx, {}); "
@@ -265,25 +336,26 @@ namespace ps2recomp
                     ? "true"
                     : "false",
                 inst.rt,
-                genRead(128, fmt::format("ADD32(GPR_U32(ctx, {}), {})", inst.rs, inst.simmediate)));
+                genCheckedRead(128, fmt::format("ADD32(GPR_U32(ctx, {}), {})", inst.rs, inst.simmediate), "(uint32_t)Ps2ExtractEpi32(eeBreakpointValue, 0)"));
         case OPCODE_SDC2:
             if (inst.vu0SyncMode == Vu0SyncMode::Skip)
             {
-                return genWrite(
+                return genCheckedWrite(
                            128,
                            fmt::format("ADD32(GPR_U32(ctx, {}), {})", inst.rs, inst.simmediate),
-                           fmt::format("_mm_castps_si128(ctx->vu0_vf[{}])", inst.rt)) +
-                       ";";
+                           fmt::format("_mm_castps_si128(ctx->vu0_vf[{}])", inst.rt),
+                           fmt::format("(uint32_t)Ps2ExtractEpi32(_mm_castps_si128(ctx->vu0_vf[{}]), 0)", inst.rt));
             }
             return fmt::format(
                 "{{ runtime->synchronizeVU0Microprogram(rdram, ctx, {}); {}; }}",
                 inst.vu0SyncMode == Vu0SyncMode::Finish
                     ? "true"
                     : "false",
-                genWrite(
+                genCheckedWrite(
                     128,
                     fmt::format("ADD32(GPR_U32(ctx, {}), {})", inst.rs, inst.simmediate),
-                    fmt::format("_mm_castps_si128(ctx->vu0_vf[{}])", inst.rt)));
+                    fmt::format("_mm_castps_si128(ctx->vu0_vf[{}])", inst.rt),
+                    fmt::format("(uint32_t)Ps2ExtractEpi32(_mm_castps_si128(ctx->vu0_vf[{}]), 0)", inst.rt)));
         case OPCODE_DADDI:
             return fmt::format(
                 "{{ uint64_t result; bool overflow; "
@@ -311,37 +383,46 @@ namespace ps2recomp
 
         case OPCODE_LDL:
             return fmt::format("{{ uint32_t addr = ADD32(GPR_U32(ctx, {}), {}); "
+                               "bool eeBreakpointCheckValue = runtime->CheckEeDataAddressBreakpoint(ctx, addr, false); "
                                "uint32_t aligned_addr = addr & ~7u; "
                                "uint32_t offset = addr & 7u; "
                                "uint64_t mem = {}; "
                                "uint32_t shift = (7u - offset) << 3; "
                                "uint64_t keepMask = (shift == 0) ? 0ull : ((1ull << shift) - 1ull); "
-                               "SET_GPR_U64(ctx, {}, (GPR_U64(ctx, {}) & keepMask) | (mem << shift)); }}",
+                               "uint64_t merged = (GPR_U64(ctx, {}) & keepMask) | (mem << shift); "
+                               "if (eeBreakpointCheckValue) runtime->CheckEeDataValueBreakpoint(ctx, addr, (uint32_t)merged, false); "
+                               "SET_GPR_U64(ctx, {}, merged); }}",
                                inst.rs, inst.simmediate, genRead(64, "aligned_addr"), inst.rt, inst.rt);
 
         case OPCODE_LDR:
             return fmt::format("{{ uint32_t addr = ADD32(GPR_U32(ctx, {}), {}); "
+                               "bool eeBreakpointCheckValue = runtime->CheckEeDataAddressBreakpoint(ctx, addr, false); "
                                "uint32_t aligned_addr = addr & ~7u; "
                                "uint32_t offset = addr & 7u; "
                                "uint64_t mem = {}; "
                                "uint32_t shift = offset << 3; "
                                "uint64_t keepMask = (offset == 0) ? 0ull : (0xFFFFFFFFFFFFFFFFull << ((8u - offset) << 3)); "
-                               "SET_GPR_U64(ctx, {}, (GPR_U64(ctx, {}) & keepMask) | (mem >> shift)); }}",
+                               "uint64_t merged = (GPR_U64(ctx, {}) & keepMask) | (mem >> shift); "
+                               "if (eeBreakpointCheckValue) runtime->CheckEeDataValueBreakpoint(ctx, addr, (uint32_t)merged, false); "
+                               "SET_GPR_U64(ctx, {}, merged); }}",
                                inst.rs, inst.simmediate, genRead(64, "aligned_addr"), inst.rt, inst.rt);
 
         case OPCODE_LWL:
             return fmt::format("{{ uint32_t addr = ADD32(GPR_U32(ctx, {}), {}); "
+                               "bool eeBreakpointCheckValue = runtime->CheckEeDataAddressBreakpoint(ctx, addr, false); "
                                "uint32_t aligned_addr = addr & ~3u; "
                                "uint32_t offset = addr & 3u; "
                                "uint32_t mem = {}; "
                                "uint32_t shift = (3u - offset) << 3; "
                                "uint32_t keepMask = (shift == 0) ? 0u : ((1u << shift) - 1u); "
                                "uint32_t merged = (GPR_U32(ctx, {}) & keepMask) | (mem << shift); "
+                               "if (eeBreakpointCheckValue) runtime->CheckEeDataValueBreakpoint(ctx, addr, merged, false); "
                                "SET_GPR_S32(ctx, {}, (int32_t)merged); }}",
                                inst.rs, inst.simmediate, genRead(32, "aligned_addr"), inst.rt, inst.rt);
 
         case OPCODE_LWR:
             return fmt::format("{{ uint32_t addr = ADD32(GPR_U32(ctx, {}), {}); "
+                               "bool eeBreakpointCheckValue = runtime->CheckEeDataAddressBreakpoint(ctx, addr, false); "
                                "uint32_t aligned_addr = addr & ~3u; "
                                "uint32_t offset = addr & 3u; "
                                "uint32_t mem = {}; "
@@ -350,49 +431,54 @@ namespace ps2recomp
                                "uint32_t merged32 = (GPR_U32(ctx, {}) & keepMask) | (mem >> shift); "
                                "uint64_t merged64 = (GPR_U64(ctx, {}) & 0xFFFFFFFF00000000ull) | (uint64_t)merged32; "
                                "if (offset == 0) merged64 = (uint64_t)(int64_t)(int32_t)merged32; "
+                               "if (eeBreakpointCheckValue) runtime->CheckEeDataValueBreakpoint(ctx, addr, merged32, false); "
                                "SET_GPR_U64(ctx, {}, merged64); }}",
                                inst.rs, inst.simmediate, genRead(32, "aligned_addr"),
                                inst.rt, inst.rt, inst.rt);
 
         case OPCODE_SWL:
             return fmt::format("{{ uint32_t addr = ADD32(GPR_U32(ctx, {}), {}); "
+                               "if (runtime->CheckEeDataAddressBreakpoint(ctx, addr, true)) runtime->CheckEeDataValueBreakpoint(ctx, addr, GPR_U32(ctx, {}), true); "
                                "uint32_t aligned_addr = addr & ~3u; "
                                "uint32_t offset = addr & 3u; "
                                "uint32_t shift = (3u - offset) << 3; "
                                "uint8_t byte_enable = (uint8_t)((1u << (offset + 1u)) - 1u); "
                                "uint32_t value = GPR_U32(ctx, {}) >> shift; "
                                "WRITE_MASKED32(aligned_addr, value, byte_enable); }}",
-                               inst.rs, inst.simmediate, inst.rt);
+                               inst.rs, inst.simmediate, inst.rt, inst.rt);
 
         case OPCODE_SWR:
             return fmt::format("{{ uint32_t addr = ADD32(GPR_U32(ctx, {}), {}); "
+                               "if (runtime->CheckEeDataAddressBreakpoint(ctx, addr, true)) runtime->CheckEeDataValueBreakpoint(ctx, addr, GPR_U32(ctx, {}), true); "
                                "uint32_t aligned_addr = addr & ~3u; "
                                "uint32_t offset = addr & 3u; "
                                "uint32_t shift = offset << 3; "
                                "uint8_t byte_enable = (uint8_t)((0xFu << offset) & 0xFu); "
                                "uint32_t value = GPR_U32(ctx, {}) << shift; "
                                "WRITE_MASKED32(aligned_addr, value, byte_enable); }}",
-                               inst.rs, inst.simmediate, inst.rt);
+                               inst.rs, inst.simmediate, inst.rt, inst.rt);
 
         case OPCODE_SDL:
             return fmt::format("{{ uint32_t addr = ADD32(GPR_U32(ctx, {}), {}); "
+                               "if (runtime->CheckEeDataAddressBreakpoint(ctx, addr, true)) runtime->CheckEeDataValueBreakpoint(ctx, addr, GPR_U32(ctx, {}), true); "
                                "uint32_t aligned_addr = addr & ~7u; "
                                "uint32_t offset = addr & 7u; "
                                "uint32_t shift = (7u - offset) << 3; "
                                "uint8_t byte_enable = (uint8_t)((1u << (offset + 1u)) - 1u); "
                                "uint64_t value = GPR_U64(ctx, {}) >> shift; "
                                "WRITE_MASKED64(aligned_addr, value, byte_enable); }}",
-                               inst.rs, inst.simmediate, inst.rt);
+                               inst.rs, inst.simmediate, inst.rt, inst.rt);
 
         case OPCODE_SDR:
             return fmt::format("{{ uint32_t addr = ADD32(GPR_U32(ctx, {}), {}); "
+                               "if (runtime->CheckEeDataAddressBreakpoint(ctx, addr, true)) runtime->CheckEeDataValueBreakpoint(ctx, addr, GPR_U32(ctx, {}), true); "
                                "uint32_t aligned_addr = addr & ~7u; "
                                "uint32_t offset = addr & 7u; "
                                "uint32_t shift = offset << 3; "
                                "uint8_t byte_enable = (uint8_t)((0xFFu << offset) & 0xFFu); "
                                "uint64_t value = GPR_U64(ctx, {}) << shift; "
                                "WRITE_MASKED64(aligned_addr, value, byte_enable); }}",
-                               inst.rs, inst.simmediate, inst.rt);
+                               inst.rs, inst.simmediate, inst.rt, inst.rt);
         case OPCODE_CACHE:
             return fmt::format(
                 "runtime->handleEeCacheOperation(rdram, ctx, 0x{:02X}u, "

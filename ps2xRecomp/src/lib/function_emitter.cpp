@@ -169,13 +169,17 @@ namespace ps2recomp
 
             try
             {
+                ss << "    ctx->pc = 0x" << std::hex
+                   << inst.address << "u;\n"
+                   << std::dec;
                 if (validateSequentialFetch)
                 {
-                    ss << "    ctx->pc = 0x" << std::hex
-                       << inst.address << "u;\n"
-                       << std::dec;
                     ss << "    runtime->ValidateInstructionFetch(ctx, ctx->pc);\n";
                     validateSequentialFetch = false;
+                }
+                else
+                {
+                    ss << "    runtime->CheckEeInstructionBreakpoint(ctx, ctx->pc);\n";
                 }
 
                 if (inst.hasDelaySlot)
@@ -209,12 +213,21 @@ namespace ps2recomp
                         gifDmaKickPlan.branchIndex == i &&
                         hasDecodedDelaySlot)
                     {
+                        const MemoryAccessHint delayMemoryHint =
+                            resolveMemoryAccessHint(
+                                *delaySlot, constantRegisters);
                         ss << cg.handleBranchDelaySlots(
                             inst,
                             *delaySlot,
                             function,
                             analysisResult,
-                            gifDmaDelaySlotOverride(*delaySlot, gifDmaKickPlan, cg.m_emitInstructionComments));
+                            gifDmaDelaySlotOverride(
+                                *delaySlot,
+                                gifDmaKickPlan,
+                                cg.m_emitInstructionComments,
+                                cg.translateInstruction(
+                                    *delaySlot,
+                                    delayMemoryHint)));
                         gifDmaKickPlan = {};
                     }
                     else
@@ -243,13 +256,21 @@ namespace ps2recomp
                         const size_t slot = gifDmaKickPlan.slotFor(i);
                         emitGifDmaCapture(ss, gifDmaKickPlan, slot, "    ");
 
+                        const MemoryAccessHint memoryHint =
+                            resolveMemoryAccessHint(
+                                inst, constantRegisters);
+                        ss << "    if (runtime->EeDataBreakpointEnabled(ctx, true)) {\n";
+                        ss << "        "
+                           << cg.translateInstruction(inst, memoryHint)
+                           << "\n";
+
                         if (gifDmaKickPlan.completesAt(i))
                         {
-                            ss << "    ctx->pc = 0x" << std::hex << inst.address << "u;\n"
-                               << std::dec;
-                            ss << "    " << gifDmaKickCall(gifDmaKickPlan) << "\n";
+                            ss << "    } else {\n";
+                            ss << "        " << gifDmaKickCall(gifDmaKickPlan) << "\n";
                             gifDmaKickPlan = {};
                         }
+                        ss << "    }\n";
 
                         updateConstantRegisters(inst, constantRegisters);
                         continue;
