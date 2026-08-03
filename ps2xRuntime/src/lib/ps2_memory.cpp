@@ -2618,8 +2618,17 @@ bool PS2Memory::initialize(size_t ramSize)
         std::memset(m_scratchpad, 0, PS2_SCRATCHPAD_SIZE);
         ps2SetScratchpadHostPtr(m_scratchpad);
 
-        // Initialize EE TLB entries (R5900 has 48 entries).
-        m_tlbEntries.assign(48, EeTlbEntry{});
+        // Initialize EE TLB entries (R5900 has 48 entries). PS2Runtime
+        // configures a post-BIOS profile that survives host memory resets;
+        // standalone PS2Memory instances retain an empty architectural TLB.
+        if (m_postBiosTlbStateConfigured)
+        {
+            installPostBiosTlbState();
+        }
+        else
+        {
+            m_tlbEntries.assign(48, EeTlbEntry{});
+        }
 
         // Allocate IOP RAM
         iop_ram = new uint8_t[PS2_IOP_RAM_SIZE];
@@ -2842,6 +2851,15 @@ PS2Memory::translateAddressImpl(
         };
     }
 
+    // The runtime accepts the EE's numerically addressed physical device
+    // windows as compatibility aliases. Keep that explicit exception
+    // separate from ordinary kuseg translation.
+    if (virtualAddress < 0x80000000u &&
+        Ps2IsPhysicalSpecialAddress(virtualAddress))
+    {
+        return {virtualAddress, false};
+    }
+
     // EE TLB aliases of main RAM installed by the kernel.
     if (Ps2IsUncachedRamMirrorAddress(virtualAddress))
     {
@@ -2869,14 +2887,10 @@ PS2Memory::translateAddressImpl(
         };
     }
 
-    // In this runtime, low segments are treated as physical-style addresses already.
-    if (virtualAddress < 0x80000000)
-    {
-        return {virtualAddress, false};
-    }
-
-    // KSEG2/KSEG3 are TLB mapped.
-    if (Ps2IsKseg23Address(virtualAddress))
+    // Ordinary kuseg/useg/suseg and KSEG2/KSEG3 are TLB mapped. Unchecked
+    // runtime-internal low addresses remain physical-style and fall through.
+    if (translation.mapsKusegThroughTlb(virtualAddress) ||
+        Ps2IsKseg23Address(virtualAddress))
     {
         for (const auto &entry : m_tlbEntries)
         {
@@ -2975,6 +2989,67 @@ bool PS2Memory::tlbRead(
 
     entry = m_tlbEntries[index];
     return true;
+}
+
+void PS2Memory::installPostBiosTlbState()
+{
+    // SCPH-39001 BIOS ELF-loader handoff captured through TLBR in strict
+    // interpreter mode. These are architectural guest mappings, not host
+    // address shortcuts; ordinary kuseg still faults after the guest clears
+    // or replaces them.
+    static constexpr std::array<EeTlbEntry, 48u> entries{{
+        {0x00000000u, 0x70000000u, 0x0000001fu, 0x0000001fu},
+        {0x00006000u, 0xffff8000u, 0x00001e1fu, 0x00001f1fu},
+        {0x00000000u, 0x10000000u, 0x00400017u, 0x00400053u},
+        {0x00000000u, 0x10002000u, 0x00400097u, 0x004000d7u},
+        {0x00000000u, 0x10004000u, 0x00400117u, 0x00400157u},
+        {0x00000000u, 0x10006000u, 0x00400197u, 0x004001d7u},
+        {0x00000000u, 0x10008000u, 0x00400217u, 0x00400257u},
+        {0x00000000u, 0x1000a000u, 0x00400297u, 0x004002d7u},
+        {0x00000000u, 0x1000c000u, 0x00400313u, 0x00400357u},
+        {0x00000000u, 0x1000e000u, 0x00400397u, 0x004003d7u},
+        {0x0001e000u, 0x11000000u, 0x00440017u, 0x00440415u},
+        {0x0001e000u, 0x12000000u, 0x00480017u, 0x00480415u},
+        {0x01ffe000u, 0x1e000000u, 0x00780017u, 0x007c0017u},
+        {0x0007e000u, 0x00080000u, 0x0000201fu, 0x0000301fu},
+        {0x0007e000u, 0x00100000u, 0x0000401fu, 0x0000501fu},
+        {0x0007e000u, 0x00180000u, 0x0000601fu, 0x0000701fu},
+        {0x001fe000u, 0x00200000u, 0x0000801fu, 0x0000c01fu},
+        {0x001fe000u, 0x00400000u, 0x0001001fu, 0x0001401fu},
+        {0x001fe000u, 0x00600000u, 0x0001801fu, 0x0001c01fu},
+        {0x007fe000u, 0x00800000u, 0x0002001fu, 0x0003001fu},
+        {0x007fe000u, 0x01000000u, 0x0004001fu, 0x0005001fu},
+        {0x007fe000u, 0x01800000u, 0x0006001fu, 0x0007001fu},
+        {0x0007e000u, 0x20080000u, 0x00002017u, 0x00003017u},
+        {0x0007e000u, 0x20100000u, 0x00004017u, 0x00005017u},
+        {0x0007e000u, 0x20180000u, 0x00006017u, 0x00007017u},
+        {0x001fe000u, 0x20200000u, 0x00008017u, 0x0000c017u},
+        {0x001fe000u, 0x20400000u, 0x00010017u, 0x00014017u},
+        {0x001fe000u, 0x20600000u, 0x00018017u, 0x0001c017u},
+        {0x007fe000u, 0x20800000u, 0x00020017u, 0x00030017u},
+        {0x007fe000u, 0x21000000u, 0x00040017u, 0x00050017u},
+        {0x007fe000u, 0x21800000u, 0x00060017u, 0x00070017u},
+        {0x0007e000u, 0x30100000u, 0x0000403fu, 0x0000503fu},
+        {0x0007e000u, 0x30180000u, 0x0000603fu, 0x0000703fu},
+        {0x001fe000u, 0x30200000u, 0x0000803fu, 0x0000c03fu},
+        {0x001fe000u, 0x30400000u, 0x0001003fu, 0x0001403fu},
+        {0x001fe000u, 0x30600000u, 0x0001803fu, 0x0001c03fu},
+        {0x007fe000u, 0x30800000u, 0x0002003fu, 0x0003003fu},
+        {0x007fe000u, 0x31000000u, 0x0004003fu, 0x0005003fu},
+        {0x007fe000u, 0x31800000u, 0x0006003fu, 0x0007003fu},
+        {0x00000000u, 0xe004c000u, 0x00000010u, 0x00000010u},
+        {0x00000000u, 0xe004e000u, 0x00000010u, 0x00000010u},
+        {0x00000000u, 0xe0050000u, 0x00000010u, 0x00000010u},
+        {0x00000000u, 0xe0052000u, 0x00000010u, 0x00000010u},
+        {0x00000000u, 0xe0054000u, 0x00000010u, 0x00000010u},
+        {0x00000000u, 0xe0056000u, 0x00000010u, 0x00000010u},
+        {0x00000000u, 0xe0058000u, 0x00000010u, 0x00000010u},
+        {0x00000000u, 0xe005a000u, 0x00000010u, 0x00000010u},
+        {0x00000000u, 0xe005c000u, 0x00000010u, 0x00000010u},
+    }};
+
+    m_postBiosTlbStateConfigured = true;
+    m_tlbEntries.assign(entries.begin(), entries.end());
 }
 
 bool PS2Memory::tlbWrite(

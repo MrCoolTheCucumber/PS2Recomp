@@ -165,6 +165,8 @@ void register_ps2_debug_control_tests()
 
             R5900Context context{};
             context.pc = 0x00001000u;
+            // This synthetic function table uses a direct low PC.
+            context.cop0_status = 0x00000004u;
             std::atomic<bool> vuExecuted{false};
             std::thread worker([&]()
             {
@@ -364,6 +366,8 @@ void register_ps2_debug_control_tests()
 
             R5900Context context{};
             context.pc = 0x00001000u;
+            // This synthetic function table uses direct low PCs.
+            context.cop0_status = 0x00000004u;
             std::atomic<bool> finished{false};
 
             t.IsTrue(runtime.debugPause(std::chrono::milliseconds(50)),

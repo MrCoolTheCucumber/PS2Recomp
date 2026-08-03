@@ -27,6 +27,25 @@ namespace
                (global ? 0x1u : 0u);
     }
 
+    bool initializeEmptyTlb(PS2Runtime &runtime)
+    {
+        if (!runtime.memory().initialize())
+        {
+            return false;
+        }
+        for (uint32_t index = 0u;
+             index < runtime.memory().tlbEntryCount();
+             ++index)
+        {
+            if (!runtime.memory().tlbWrite(
+                    index, EeTlbEntry{}))
+            {
+                return false;
+            }
+        }
+        return true;
+    }
+
     void writeIndexedEntry(
         PS2Runtime &runtime,
         R5900Context &ctx,
@@ -74,7 +93,7 @@ void register_cop0_tlb_tests()
 
             PS2Runtime runtime;
             t.IsTrue(
-                runtime.memory().initialize(),
+                initializeEmptyTlb(runtime),
                 "PS2Memory initialize should succeed");
             uint8_t *const rdram = runtime.memory().getRDRAM();
 
@@ -121,7 +140,7 @@ void register_cop0_tlb_tests()
 
             PS2Runtime runtime;
             t.IsTrue(
-                runtime.memory().initialize(),
+                initializeEmptyTlb(runtime),
                 "PS2Memory initialize should succeed");
             R5900Context ctx{};
             writeIndexedEntry(
@@ -172,7 +191,7 @@ void register_cop0_tlb_tests()
 
             PS2Runtime runtime;
             t.IsTrue(
-                runtime.memory().initialize(),
+                initializeEmptyTlb(runtime),
                 "PS2Memory initialize should succeed");
             R5900Context ctx{};
             writeIndexedEntry(
@@ -231,7 +250,7 @@ void register_cop0_tlb_tests()
 
             PS2Runtime runtime;
             t.IsTrue(
-                runtime.memory().initialize(),
+                initializeEmptyTlb(runtime),
                 "PS2Memory initialize should succeed");
             R5900Context ctx{};
 
@@ -290,7 +309,7 @@ void register_cop0_tlb_tests()
 
             PS2Runtime runtime;
             t.IsTrue(
-                runtime.memory().initialize(),
+                initializeEmptyTlb(runtime),
                 "PS2Memory initialize should succeed");
             R5900Context ctx{};
             writeIndexedEntry(
@@ -340,7 +359,7 @@ void register_cop0_tlb_tests()
         {
             PS2Runtime runtime;
             t.IsTrue(
-                runtime.memory().initialize(),
+                initializeEmptyTlb(runtime),
                 "PS2Memory initialize should succeed");
             R5900Context ctx{};
 
@@ -421,7 +440,7 @@ void register_cop0_tlb_tests()
 
             PS2Runtime runtime;
             t.IsTrue(
-                runtime.memory().initialize(),
+                initializeEmptyTlb(runtime),
                 "PS2Memory initialize should succeed");
             R5900Context ctx{};
             writeIndexedEntry(
@@ -489,7 +508,7 @@ void register_cop0_tlb_tests()
 
             PS2Runtime runtime;
             t.IsTrue(
-                runtime.memory().initialize(),
+                initializeEmptyTlb(runtime),
                 "PS2Memory initialize should succeed");
             R5900Context ctx{};
             ctx.cop0_random = random;
@@ -529,7 +548,7 @@ void register_cop0_tlb_tests()
         {
             PS2Runtime runtime;
             t.IsTrue(
-                runtime.memory().initialize(),
+                initializeEmptyTlb(runtime),
                 "PS2Memory initialize should succeed");
 
             R5900Context invalidCtx{};
@@ -636,7 +655,7 @@ void register_cop0_tlb_tests()
 
             PS2Runtime runtime;
             t.IsTrue(
-                runtime.memory().initialize(),
+                initializeEmptyTlb(runtime),
                 "PS2Memory initialize should succeed");
             R5900Context ctx{};
             writeIndexedEntry(

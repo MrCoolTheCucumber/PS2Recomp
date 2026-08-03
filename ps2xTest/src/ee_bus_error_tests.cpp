@@ -20,6 +20,8 @@ namespace
     constexpr uint32_t kStatusErl = 0x00000004u;
     constexpr uint32_t kStatusBem = 0x00001000u;
     constexpr uint32_t kGeneralExceptionVector = 0x80000180u;
+    constexpr uint32_t kUnmappedKseg1Base = 0xB1010000u;
+    constexpr uint32_t kUnmappedPhysicalBase = 0x11010000u;
 
     bool raisesGuestException(const auto &operation)
     {
@@ -197,7 +199,7 @@ void register_ee_bus_error_tests()
                     runtime.memory().getRDRAM(),
                     &ctx,
                     0x0Eu,
-                    0x22000000u);
+                    kUnmappedKseg1Base);
             });
 
             t.IsTrue(raised, "an instruction-cache fill bus fault should unwind guest execution");
@@ -205,7 +207,7 @@ void register_ee_bus_error_tests()
                 t,
                 ctx,
                 EXCEPTION_BUS_ERROR_DATA,
-                0x22000000u,
+                kUnmappedPhysicalBase,
                 0x0BADCAFEu,
                 "CACHE fill: ");
         });
@@ -226,7 +228,7 @@ void register_ee_bus_error_tests()
                 (void)runtime.Load32(
                     runtime.memory().getRDRAM(),
                     &ctx,
-                    0x22001234u);
+                    kUnmappedKseg1Base + 0x1234u);
             });
 
             t.IsTrue(raised, "physical-bus load failure should unwind guest execution");
@@ -241,7 +243,7 @@ void register_ee_bus_error_tests()
                 t,
                 ctx,
                 EXCEPTION_BUS_ERROR_DATA,
-                0x22001230u,
+                kUnmappedPhysicalBase + 0x1230u,
                 0xA5A5A5A5u,
                 "data load: ");
         });
@@ -264,7 +266,7 @@ void register_ee_bus_error_tests()
                 runtime.Store32(
                     runtime.memory().getRDRAM(),
                     &ctx,
-                    0x22005678u,
+                    kUnmappedKseg1Base + 0x5678u,
                     0x11223344u);
             });
 
@@ -280,7 +282,7 @@ void register_ee_bus_error_tests()
                 t,
                 ctx,
                 EXCEPTION_BUS_ERROR_DATA,
-                0x22005670u,
+                kUnmappedPhysicalBase + 0x5670u,
                 0x5A5A5A5Au,
                 "data store: ");
         });
@@ -310,11 +312,11 @@ void register_ee_bus_error_tests()
                 loaded = runtime.Load32(
                     runtime.memory().getRDRAM(),
                     &ctx,
-                    0x22002000u);
+                    kUnmappedKseg1Base + 0x2000u);
                 runtime.Store32(
                     runtime.memory().getRDRAM(),
                     &ctx,
-                    0x22003000u,
+                    kUnmappedKseg1Base + 0x3000u,
                     0xDEADBEEFu);
             }
             catch (const PS2GuestException &)
@@ -357,7 +359,7 @@ void register_ee_bus_error_tests()
                     (void)runtime.Load32(
                         runtime.memory().getRDRAM(),
                         &ctx,
-                        0x22005000u);
+                        kUnmappedKseg1Base + 0x5000u);
                 }
                 catch (const PS2GuestException &)
                 {

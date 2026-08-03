@@ -45,6 +45,7 @@ namespace
     constexpr uint32_t COP0_CAUSE_BD = 0x80000000u;
     constexpr uint32_t COP0_CAUSE_EXCCODE_MASK = 0x0000007Cu;
     constexpr uint32_t COP0_STATUS_EXL = 0x00000002u;
+    constexpr uint32_t COP0_STATUS_ERL = 0x00000004u;
     constexpr uint32_t COP0_STATUS_BEV = 0x00400000u;
     constexpr uint32_t EXCEPTION_VECTOR_GENERAL = 0x80000180u;
     constexpr uint32_t EXCEPTION_VECTOR_BOOT = 0xBFC00380u;
@@ -1848,6 +1849,7 @@ void register_ps2_runtime_expansion_tests()
 
             R5900Context ctx{};
             ctx.pc = 0x2000u;
+            ctx.cop0_status = COP0_STATUS_ERL;
 
             const bool returnedToFallthrough = runtime.dispatchGuestBranch(
                 nullptr,
@@ -1873,6 +1875,7 @@ void register_ps2_runtime_expansion_tests()
 
             R5900Context ctx{};
             ctx.pc = 0x2000u;
+            ctx.cop0_status = COP0_STATUS_ERL;
 
             const bool returnedToFallthrough = runtime.dispatchGuestBranch(
                 nullptr,
@@ -1896,6 +1899,7 @@ void register_ps2_runtime_expansion_tests()
 
             R5900Context ctx{};
             ctx.pc = 0x2000u;
+            ctx.cop0_status = COP0_STATUS_ERL;
 
             runtime.requestGuestPreemption();
             const bool returnedToFallthrough = runtime.dispatchGuestBranch(
@@ -1923,6 +1927,7 @@ void register_ps2_runtime_expansion_tests()
 
             R5900Context ctx{};
             ctx.pc = 0x2000u;
+            ctx.cop0_status = COP0_STATUS_ERL;
 
             const bool returnedToFallthrough = runtime.dispatchGuestBranch(
                 nullptr,
@@ -3859,6 +3864,7 @@ void register_ps2_runtime_expansion_tests()
             PS2Runtime runtime;
             std::vector<uint8_t> rdram(PS2_RAM_SIZE, 0u);
             R5900Context ctx{};
+            ctx.cop0_status = COP0_STATUS_ERL;
 
             t.IsTrue(runtime.registerFunction(kExceptionUnwindEntry,
                                               &testExceptionUnwindEntryFunction),

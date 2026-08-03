@@ -326,6 +326,16 @@ struct alignas(16) R5900Context
         ee_performance_pending_issue = {};
     }
 
+    void resetPostBiosTlbRegisters() noexcept
+    {
+        cop0_index = 38u;
+        cop0_entrylo0 = 0x0006003fu;
+        cop0_entrylo1 = 0x0007003fu;
+        cop0_pagemask = 0x007fe000u;
+        cop0_wired = 31u;
+        cop0_entryhi = 0x31800000u;
+    }
+
     R5900Context()
         : R5900Context(InitializationProfile::Deterministic)
     {
@@ -357,6 +367,10 @@ struct alignas(16) R5900Context
             profile == InitializationProfile::PostBiosElf ?
                 kPostBiosElfStatus :
                 0u;
+        if (profile == InitializationProfile::PostBiosElf)
+        {
+            resetPostBiosTlbRegisters();
+        }
         cop0_prid = 0x00002e20; // CPU ID for R5900
         cop0_config = 0x00073443; // Normal post-BIOS EE configuration
 

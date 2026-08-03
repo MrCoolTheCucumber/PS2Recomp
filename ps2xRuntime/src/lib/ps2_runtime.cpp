@@ -1157,6 +1157,7 @@ PS2Runtime::PS2Runtime(PS2RuntimeConfiguration configuration)
       m_cpuContext(
           R5900Context::InitializationProfile::PostBiosElf)
 {
+    m_memory.installPostBiosTlbState();
     m_hostPresentationUploadState =
         std::make_unique<
             HostPresentationUploadState>();
@@ -5465,6 +5466,8 @@ bool PS2Runtime::initialize(const char *title)
             std::cerr << "Failed to initialize PS2 memory" << std::endl;
             return false;
         }
+        m_memory.installPostBiosTlbState();
+        m_cpuContext.resetPostBiosTlbRegisters();
 
         if (!syncCoreSubsystems())
         {
@@ -5577,6 +5580,9 @@ bool PS2Runtime::loadELF(const std::string &elfPath)
         std::cerr << "ELF program-header table is out of range." << std::endl;
         return false;
     }
+
+    m_memory.installPostBiosTlbState();
+    m_cpuContext.resetPostBiosTlbRegisters();
 
     m_cpuContext.pc = header.entry;
     m_debugPc.store(m_cpuContext.pc, std::memory_order_relaxed);

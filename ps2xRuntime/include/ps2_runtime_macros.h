@@ -676,10 +676,22 @@ static inline bool Ps2CanUseFastGuestRdramAccess(
     {
         return false;
     }
-    return ctx == nullptr ||
-           EeAddressTranslationContext::fromCop0Status(
-               ctx->cop0_status)
-               .permits(address);
+    if (ctx == nullptr)
+    {
+        return true;
+    }
+
+    const EeAddressTranslationContext translation =
+        EeAddressTranslationContext::fromCop0Status(
+            ctx->cop0_status);
+    if (!translation.permits(address))
+    {
+        return false;
+    }
+
+    return !translation.mapsKusegThroughTlb(address) ||
+           Ps2IsUncachedRamMirrorAddress(address) ||
+           Ps2IsAcceleratedRamMirrorAddress(address);
 }
 
 #define READ8(addr) ([&]() -> uint8_t {                       \

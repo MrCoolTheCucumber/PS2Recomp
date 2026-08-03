@@ -101,6 +101,14 @@ struct EeAddressTranslationContext
                virtualAddress >= 0xC0000000u &&
                virtualAddress < 0xE0000000u;
     }
+
+    constexpr bool mapsKusegThroughTlb(
+        uint32_t virtualAddress) const noexcept
+    {
+        return enforceOperatingMode &&
+               !errorLevel &&
+               virtualAddress < 0x80000000u;
+    }
 };
 
 class PS2AddressErrorException final : public std::exception
@@ -1102,6 +1110,7 @@ public:
     bool tlbRead(uint32_t index, EeTlbEntry &entry) const;
     bool tlbWrite(uint32_t index, const EeTlbEntry &entry);
     int32_t tlbProbe(uint32_t entryHi) const;
+    void installPostBiosTlbState();
     size_t tlbEntryCount() const { return m_tlbEntries.size(); }
 
     // Hardware register interface
@@ -1424,6 +1433,7 @@ public:
         bool writeAccess);
 
     std::vector<EeTlbEntry> m_tlbEntries;
+    bool m_postBiosTlbStateConfigured = false;
 
     GifPacketCallback m_gifPacketCallback;
     GifArbiter *m_gifArbiter = nullptr;

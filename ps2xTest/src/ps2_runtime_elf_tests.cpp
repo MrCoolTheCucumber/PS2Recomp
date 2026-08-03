@@ -113,6 +113,110 @@ void register_ps2_runtime_elf_tests()
 {
     MiniTest::Case("PS2RuntimeELF", [](TestCase &tc)
     {
+        tc.Run("direct ELF load recreates the BIOS TLB handoff", [](TestCase &t)
+        {
+            ScopedElfFile elf("post-bios-tlb");
+            const bool wroteElf =
+                writeMixedReadWriteExecuteElf(elf.path);
+            t.IsTrue(
+                wroteElf,
+                "synthetic direct ELF should be generated");
+            if (!wroteElf)
+            {
+                return;
+            }
+
+            PS2Runtime runtime;
+            const bool initialized =
+                initializeHeadlessRuntime(runtime);
+            t.IsTrue(
+                initialized,
+                "headless runtime should initialize");
+            if (!initialized)
+            {
+                return;
+            }
+
+            const bool loaded =
+                runtime.loadELF(elf.path.string());
+            t.IsTrue(
+                loaded,
+                "synthetic direct ELF should load");
+            if (!loaded)
+            {
+                return;
+            }
+            t.Equals(
+                runtime.cpu().cop0_wired,
+                31u,
+                "the direct ELF profile should retain the BIOS Wired boundary");
+            t.Equals(
+                runtime.cpu().cop0_index,
+                38u,
+                "the direct ELF profile should retain the current BIOS TLB index");
+            t.Equals(
+                runtime.cpu().cop0_pagemask,
+                0x007fe000u,
+                "the direct ELF profile should retain the current PageMask");
+            t.Equals(
+                runtime.cpu().cop0_entryhi,
+                0x31800000u,
+                "the direct ELF profile should retain the current EntryHi");
+            t.Equals(
+                runtime.cpu().cop0_entrylo0,
+                0x0006003fu,
+                "the direct ELF profile should retain the current EntryLo0");
+            t.Equals(
+                runtime.cpu().cop0_entrylo1,
+                0x0007003fu,
+                "the direct ELF profile should retain the current EntryLo1");
+
+            EeTlbEntry entry{};
+            t.IsTrue(
+                runtime.memory().tlbRead(14u, entry),
+                "the BIOS main-RAM entry should be readable");
+            t.Equals(
+                entry.pageMask,
+                0x0007e000u,
+                "the 1 MiB identity pair should retain its page size");
+            t.Equals(
+                entry.entryHi,
+                0x00100000u,
+                "the identity pair should retain its virtual base");
+            t.Equals(
+                entry.entryLo0,
+                0x0000401fu,
+                "the identity pair should retain its even PFN and attributes");
+            t.Equals(
+                entry.entryLo1,
+                0x0000501fu,
+                "the identity pair should retain its odd PFN and attributes");
+
+            bool translated = false;
+            uint32_t physicalAddress = 0u;
+            try
+            {
+                physicalAddress =
+                    runtime.memory().translateAddress(
+                        0x00123456u,
+                        EeAddressTranslationContext::fromCop0Status(
+                            runtime.cpu().cop0_status,
+                            static_cast<uint8_t>(
+                                runtime.cpu().cop0_entryhi)));
+                translated = true;
+            }
+            catch (const PS2TlbFaultException &)
+            {
+            }
+            t.IsTrue(
+                translated,
+                "the BIOS handoff should map the direct ELF useg entry");
+            t.Equals(
+                physicalAddress,
+                0x00123456u,
+                "the BIOS handoff should identity-map ordinary main RAM");
+        });
+
         tc.Run("mixed RWE segments track only executable sections", [](TestCase &t)
         {
             ScopedElfFile elf("mixed-rwe-sections");

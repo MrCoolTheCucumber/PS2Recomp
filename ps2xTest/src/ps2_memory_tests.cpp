@@ -495,7 +495,9 @@ void register_ps2_memory_tests()
             PS2Runtime *runtime = &runtimeStorage;
             uint8_t *rdram = runtime->memory().getRDRAM();
             R5900Context loadContext{};
-            loadContext.cop0_status = 0x00001000u; // Status.BEM
+            // ERL makes this fixture's physical-style low probes direct;
+            // BEM retains the original masked bus-error behavior.
+            loadContext.cop0_status = 0x00001004u;
             R5900Context *ctx = &loadContext;
 
             const uint32_t baseValue = 0x11223344u;
@@ -532,6 +534,7 @@ void register_ps2_memory_tests()
                      "misaligned load should retain the original virtual address");
 
             R5900Context storeContext{};
+            storeContext.cop0_status = 0x00000004u;
             ctx = &storeContext;
             storeContext.pc = 0x2000u;
             bool storeRaised = false;

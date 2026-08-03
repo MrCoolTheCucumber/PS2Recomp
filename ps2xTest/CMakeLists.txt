@@ -53,6 +53,7 @@ add_library(ps2_test_lib STATIC
     src/cop0_context_tests.cpp
     src/cop0_entryhi_tests.cpp
     src/cop0_entrylo_tests.cpp
+    src/cop0_kuseg_tests.cpp
     src/cop0_random_tests.cpp
     src/cop0_tlb_tests.cpp
     src/cop0_timing_tests.cpp

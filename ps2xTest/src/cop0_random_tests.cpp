@@ -80,6 +80,15 @@ void register_cop0_random_tests()
             t.IsTrue(
                 runtime.memory().initialize(),
                 "PS2Memory initialize should succeed");
+            for (uint32_t index = 0u;
+                 index < runtime.memory().tlbEntryCount();
+                 ++index)
+            {
+                t.IsTrue(
+                    runtime.memory().tlbWrite(
+                        index, EeTlbEntry{}),
+                    "the TLBWR fixture should clear every TLB entry");
+            }
             uint8_t *const rdram =
                 runtime.memory().getRDRAM();
 
