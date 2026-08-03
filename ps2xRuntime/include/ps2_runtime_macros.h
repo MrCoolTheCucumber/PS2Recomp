@@ -921,8 +921,26 @@ inline __m128i ps2_psubsw(__m128i a, __m128i b)
 #define PS2_PCEQB(a, b) _mm_cmpeq_epi8((__m128i)(a), (__m128i)(b))
 
 // Packed Absolute (PABS)
-#define PS2_PABSW(a) _mm_abs_epi32((__m128i)(a))
-#define PS2_PABSH(a) _mm_abs_epi16((__m128i)(a))
+// x86 PABS retains the minimum signed value. A matching all-ones mask
+// decrements only that bit pattern to the EE's saturated maximum.
+inline __m128i ps2_pabsw(__m128i value)
+{
+    const __m128i absolute = _mm_abs_epi32(value);
+    const __m128i minimum = _mm_cmpeq_epi32(
+        absolute, _mm_set1_epi32(INT32_MIN));
+    return _mm_add_epi32(absolute, minimum);
+}
+
+inline __m128i ps2_pabsh(__m128i value)
+{
+    const __m128i absolute = _mm_abs_epi16(value);
+    const __m128i minimum = _mm_cmpeq_epi16(
+        absolute, _mm_set1_epi16(INT16_MIN));
+    return _mm_add_epi16(absolute, minimum);
+}
+
+#define PS2_PABSW(a) ps2_pabsw((__m128i)(a))
+#define PS2_PABSH(a) ps2_pabsh((__m128i)(a))
 #define PS2_PABSB(a) _mm_abs_epi8((__m128i)(a))
 
 // Packed Pack (PPAC) - Packs larger elements into smaller ones

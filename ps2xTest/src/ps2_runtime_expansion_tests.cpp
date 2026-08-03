@@ -1222,6 +1222,85 @@ void register_ps2_runtime_expansion_tests()
             }
         });
 
+        tc.Run("PABSH and PABSW saturate minimum negative lanes", [](TestCase &t)
+        {
+            const auto verifyHalfwords =
+                [&](const std::string &name,
+                    __m128i value,
+                    const std::array<uint16_t, 8u> &expected)
+            {
+                std::array<uint16_t, 8u> actual{};
+                std::memcpy(actual.data(), &value, sizeof(value));
+                for (size_t lane = 0u; lane < actual.size(); ++lane)
+                {
+                    t.Equals(
+                        actual[lane],
+                        expected[lane],
+                        name + " halfword lane " +
+                            std::to_string(lane));
+                }
+            };
+            const auto verifyWords =
+                [&](const std::string &name,
+                    __m128i value,
+                    const std::array<uint32_t, 4u> &expected)
+            {
+                std::array<uint32_t, 4u> actual{};
+                std::memcpy(actual.data(), &value, sizeof(value));
+                for (size_t lane = 0u; lane < actual.size(); ++lane)
+                {
+                    t.Equals(
+                        actual[lane],
+                        expected[lane],
+                        name + " word lane " +
+                            std::to_string(lane));
+                }
+            };
+
+            const __m128i minimumHalfwords = Ps2MakeU16Vector(
+                0x8000u, 0x8000u, 0x8000u, 0x8000u,
+                0x8000u, 0x8000u, 0x8000u, 0x8000u);
+            const __m128i mixedHalfwords = Ps2MakeU16Vector(
+                0x8000u,
+                0xffffu,
+                0u,
+                0x7fffu,
+                0x8000u,
+                0xfffeu,
+                1u,
+                0x1234u);
+            verifyHalfwords(
+                "minimum",
+                PS2_PABSH(minimumHalfwords),
+                {0x7fffu, 0x7fffu, 0x7fffu, 0x7fffu,
+                 0x7fffu, 0x7fffu, 0x7fffu, 0x7fffu});
+            verifyHalfwords(
+                "mixed",
+                PS2_PABSH(mixedHalfwords),
+                {0x7fffu, 1u, 0u, 0x7fffu,
+                 0x7fffu, 2u, 1u, 0x1234u});
+
+            const __m128i minimumWords = Ps2MakeU32Vector(
+                0x80000000u,
+                0x80000000u,
+                0x80000000u,
+                0x80000000u);
+            const __m128i mixedWords = Ps2MakeU32Vector(
+                0x80000000u,
+                0xffffffffu,
+                0u,
+                0x7fffffffu);
+            verifyWords(
+                "minimum",
+                PS2_PABSW(minimumWords),
+                {0x7fffffffu, 0x7fffffffu,
+                 0x7fffffffu, 0x7fffffffu});
+            verifyWords(
+                "mixed",
+                PS2_PABSW(mixedWords),
+                {0x7fffffffu, 1u, 0u, 0x7fffffffu});
+        });
+
         tc.Run("PMULTH writes eight independent signed products", [](TestCase &t)
         {
             R5900Context ctx{};
