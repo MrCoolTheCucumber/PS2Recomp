@@ -997,52 +997,65 @@ inline __m128i ps2_ppacb(__m128i rs, __m128i rt)
 #define PS2_PMADDW(a, b) _mm_add_epi32(_mm_mullo_epi32(_mm_shuffle_epi32((__m128i)(a), _MM_SHUFFLE(1, 0, 3, 2)), _mm_shuffle_epi32((__m128i)(b), _MM_SHUFFLE(1, 0, 3, 2))), _mm_mullo_epi32(_mm_shuffle_epi32((__m128i)(a), _MM_SHUFFLE(3, 2, 1, 0)), _mm_shuffle_epi32((__m128i)(b), _MM_SHUFFLE(3, 2, 1, 0))))
 
 // Packed Variable Shifts
-#define PS2_PSLLVW(a, b) _mm_custom_sllv_epi32((__m128i)(a), (__m128i)(b))
-#define PS2_PSRLVW(a, b) _mm_custom_srlv_epi32((__m128i)(a), (__m128i)(b))
-#define PS2_PSRAVW(a, b) _mm_custom_srav_epi32((__m128i)(a), (__m128i)(b))
-
-inline __m128i _mm_custom_sllv_epi32(__m128i a, __m128i count)
+enum class Ps2VariableWordShiftOperation
 {
-    alignas(16) int32_t a_arr[4];
-    alignas(16) int32_t count_arr[4];
-    alignas(16) int32_t result[4];
+    LogicalLeft,
+    LogicalRight,
+    ArithmeticRight,
+};
 
-    std::memcpy(a_arr, &a, sizeof(a));
-    std::memcpy(count_arr, &count, sizeof(count));
-
-    for (int i = 0; i < 4; i++)
+inline uint32_t Ps2ArithmeticShiftRight32(uint32_t value, uint32_t amount)
+{
+    if (amount == 0u)
     {
-        result[i] = a_arr[i] << (count_arr[i] & 0x1F);
+        return value;
     }
 
-    __m128i out;
-    std::memcpy(&out, result, sizeof(out));
-    return out;
+    const uint32_t sign = 0u - (value >> 31u);
+    return (value >> amount) | (sign << (32u - amount));
 }
 
-inline __m128i _mm_custom_srlv_epi32(__m128i a, __m128i count)
+inline __m128i Ps2VariableWordShift(
+    __m128i values,
+    __m128i counts,
+    Ps2VariableWordShiftOperation operation)
 {
-    int32_t a_arr[4], count_arr[4], result[4];
-    _mm_storeu_si128((__m128i *)a_arr, a);
-    _mm_storeu_si128((__m128i *)count_arr, count);
-    for (int i = 0; i < 4; i++)
+    uint32_t valueWords[4];
+    uint32_t countWords[4];
+    uint32_t resultWords[4];
+    std::memcpy(valueWords, &values, sizeof(values));
+    std::memcpy(countWords, &counts, sizeof(counts));
+
+    for (uint32_t sourceWord = 0u; sourceWord < 4u; sourceWord += 2u)
     {
-        result[i] = (uint32_t)a_arr[i] >> (count_arr[i] & 0x1F);
+        const uint32_t amount = countWords[sourceWord] & 0x1fu;
+        uint32_t result = 0u;
+        switch (operation)
+        {
+        case Ps2VariableWordShiftOperation::LogicalLeft:
+            result = valueWords[sourceWord] << amount;
+            break;
+        case Ps2VariableWordShiftOperation::LogicalRight:
+            result = valueWords[sourceWord] >> amount;
+            break;
+        case Ps2VariableWordShiftOperation::ArithmeticRight:
+            result = Ps2ArithmeticShiftRight32(
+                valueWords[sourceWord], amount);
+            break;
+        }
+
+        resultWords[sourceWord] = result;
+        resultWords[sourceWord + 1u] = 0u - (result >> 31u);
     }
-    return _mm_loadu_si128((__m128i *)result);
+
+    __m128i output;
+    std::memcpy(&output, resultWords, sizeof(output));
+    return output;
 }
 
-inline __m128i _mm_custom_srav_epi32(__m128i a, __m128i count)
-{
-    int32_t a_arr[4], count_arr[4], result[4];
-    _mm_storeu_si128((__m128i *)a_arr, a);
-    _mm_storeu_si128((__m128i *)count_arr, count);
-    for (int i = 0; i < 4; i++)
-    {
-        result[i] = a_arr[i] >> (count_arr[i] & 0x1F);
-    }
-    return _mm_loadu_si128((__m128i *)result);
-}
+#define PS2_PSLLVW(values, counts) Ps2VariableWordShift((__m128i)(values), (__m128i)(counts), Ps2VariableWordShiftOperation::LogicalLeft)
+#define PS2_PSRLVW(values, counts) Ps2VariableWordShift((__m128i)(values), (__m128i)(counts), Ps2VariableWordShiftOperation::LogicalRight)
+#define PS2_PSRAVW(values, counts) Ps2VariableWordShift((__m128i)(values), (__m128i)(counts), Ps2VariableWordShiftOperation::ArithmeticRight)
 
 // FPU (COP1) operations
 #define FPU_SET_ACC(ctx, res) (ctx->f_acc = res)

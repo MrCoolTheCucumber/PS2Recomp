@@ -1301,6 +1301,96 @@ void register_ps2_runtime_expansion_tests()
                 {0x7fffffffu, 1u, 0u, 0x7fffffffu});
         });
 
+        tc.Run("variable word shifts use rt values and sign-extended doubleword results", [](TestCase &t)
+        {
+            constexpr uint8_t countRegister = 11u;
+            constexpr uint8_t valueRegister = 12u;
+            constexpr uint8_t destinationRegister = 13u;
+
+            const struct
+            {
+                const char *name;
+                uint32_t raw;
+                const char *helper;
+            } translations[] = {
+                {"PSLLVW", 0x716c6889u, "PS2_PSLLVW"},
+                {"PSRLVW", 0x716c68c9u, "PS2_PSRLVW"},
+                {"PSRAVW", 0x716c68e9u, "PS2_PSRAVW"},
+            };
+
+            for (const auto &test : translations)
+            {
+                const Instruction instruction =
+                    R5900Decoder{}.decodeInstruction(
+                        0x00100000u, test.raw);
+                const std::string generated =
+                    CodeGenerator({}, {}).translateInstruction(
+                        instruction);
+                const std::string expected =
+                    std::string(test.helper) +
+                    "(GPR_VEC(ctx, 12), GPR_VEC(ctx, 11))";
+
+                t.Equals(
+                    instruction.rs,
+                    countRegister,
+                    std::string(test.name) +
+                        " should decode counts from rs");
+                t.Equals(
+                    instruction.rt,
+                    valueRegister,
+                    std::string(test.name) +
+                        " should decode values from rt");
+                t.Equals(
+                    instruction.rd,
+                    destinationRegister,
+                    std::string(test.name) +
+                        " should decode the destination from rd");
+                t.IsTrue(
+                    generated.find(expected) != std::string::npos,
+                    std::string(test.name) +
+                        " translation should pass rt values before rs counts");
+            }
+
+            const __m128i counts = Ps2MakeU32Vector(
+                0x00000020u,
+                0x00000007u,
+                0x00000024u,
+                0x0000001fu);
+            const __m128i values = Ps2MakeU32Vector(
+                0x80000003u,
+                0x11111111u,
+                0xf0000001u,
+                0x22222222u);
+            const auto verifyWords =
+                [&](const std::string &name,
+                    __m128i value,
+                    const std::array<uint32_t, 4u> &expected)
+            {
+                std::array<uint32_t, 4u> actual{};
+                std::memcpy(actual.data(), &value, sizeof(value));
+                for (size_t lane = 0u; lane < actual.size(); ++lane)
+                {
+                    t.Equals(
+                        actual[lane],
+                        expected[lane],
+                        name + " word lane " + std::to_string(lane));
+                }
+            };
+
+            verifyWords(
+                "PSLLVW",
+                PS2_PSLLVW(values, counts),
+                {0x80000003u, 0xffffffffu, 0x00000010u, 0u});
+            verifyWords(
+                "PSRLVW",
+                PS2_PSRLVW(values, counts),
+                {0x80000003u, 0xffffffffu, 0x0f000000u, 0u});
+            verifyWords(
+                "PSRAVW",
+                PS2_PSRAVW(values, counts),
+                {0x80000003u, 0xffffffffu, 0xff000000u, 0xffffffffu});
+        });
+
         tc.Run("PMULTH writes eight independent signed products", [](TestCase &t)
         {
             R5900Context ctx{};
