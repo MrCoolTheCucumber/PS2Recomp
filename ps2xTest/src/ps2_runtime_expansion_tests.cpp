@@ -1124,6 +1124,104 @@ void register_ps2_runtime_expansion_tests()
             verifyWords("PEXCW", PS2_PEXCW(words), {0u, 2u, 1u, 3u});
         });
 
+        tc.Run("PABSH and PABSW read rt across every lane", [](TestCase &t)
+        {
+            constexpr uint32_t sourceRegister = 10u;
+            constexpr uint32_t destinationRegister = 9u;
+
+            const auto verifyTranslation =
+                [&](uint32_t subfunction, const std::string &helper)
+            {
+                const uint32_t raw =
+                    (OPCODE_MMI << 26u) |
+                    (sourceRegister << 16u) |
+                    (destinationRegister << 11u) |
+                    (subfunction << 6u) |
+                    MMI_MMI1;
+                const Instruction instruction =
+                    R5900Decoder{}.decodeInstruction(
+                        0x00100000u, raw);
+                const std::string generated =
+                    CodeGenerator({}, {}).translateInstruction(
+                        instruction);
+
+                t.Equals(
+                    instruction.rs,
+                    static_cast<uint8_t>(0u),
+                    helper + " canonical encoding should fix rs to zero");
+                t.Equals(
+                    instruction.rt,
+                    static_cast<uint8_t>(sourceRegister),
+                    helper + " should decode its only source from rt");
+                t.IsTrue(
+                    generated.find(
+                        helper + "(GPR_VEC(ctx, 10))") !=
+                        std::string::npos,
+                    helper + " translation should read rt");
+                t.IsTrue(
+                    generated.find("GPR_VEC(ctx, 0)") ==
+                        std::string::npos,
+                    helper + " translation must not read unused rs");
+            };
+
+            verifyTranslation(MMI1_PABSH, "PS2_PABSH");
+            verifyTranslation(MMI1_PABSW, "PS2_PABSW");
+
+            const __m128i halfwords = Ps2MakeU16Vector(
+                static_cast<uint16_t>(-1),
+                2u,
+                static_cast<uint16_t>(-3),
+                4u,
+                static_cast<uint16_t>(-5),
+                6u,
+                static_cast<uint16_t>(-7),
+                0x7ffeu);
+            const __m128i words = Ps2MakeU32Vector(
+                static_cast<uint32_t>(-1),
+                2u,
+                static_cast<uint32_t>(-3),
+                0x7ffffffeu);
+            const std::array<uint16_t, 8u> expectedHalfwords{
+                1u, 2u, 3u, 4u, 5u, 6u, 7u, 0x7ffeu};
+            const std::array<uint32_t, 4u> expectedWords{
+                1u, 2u, 3u, 0x7ffffffeu};
+            std::array<uint16_t, 8u> actualHalfwords{};
+            std::array<uint32_t, 4u> actualWords{};
+            const __m128i halfwordResult =
+                PS2_PABSH(halfwords);
+            const __m128i wordResult =
+                PS2_PABSW(words);
+            std::memcpy(
+                actualHalfwords.data(),
+                &halfwordResult,
+                sizeof(halfwordResult));
+            std::memcpy(
+                actualWords.data(),
+                &wordResult,
+                sizeof(wordResult));
+
+            for (size_t lane = 0u;
+                 lane < expectedHalfwords.size();
+                 ++lane)
+            {
+                t.Equals(
+                    actualHalfwords[lane],
+                    expectedHalfwords[lane],
+                    "PABSH lane " + std::to_string(lane) +
+                        " should take the absolute value from rt");
+            }
+            for (size_t lane = 0u;
+                 lane < expectedWords.size();
+                 ++lane)
+            {
+                t.Equals(
+                    actualWords[lane],
+                    expectedWords[lane],
+                    "PABSW lane " + std::to_string(lane) +
+                        " should take the absolute value from rt");
+            }
+        });
+
         tc.Run("PMULTH writes eight independent signed products", [](TestCase &t)
         {
             R5900Context ctx{};
