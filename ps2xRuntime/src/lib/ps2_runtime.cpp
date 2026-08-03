@@ -2060,6 +2060,16 @@ void PS2Runtime::beginAsyncCallbackInvocation(
     }
 
     scope.m_interruptedContext = interrupted.context;
+    if (scope.m_guestExecution.m_context)
+    {
+        // Host-invoked guest callbacks use a private register context so
+        // their writes cannot leak into the interrupted continuation. Begin
+        // that context from the complete owned snapshot; callback executors
+        // install their entry PC and ABI argument registers after the scope
+        // has been constructed.
+        *scope.m_guestExecution.m_context =
+            scope.m_interruptedContext;
+    }
     scope.m_continuationContext =
         interrupted.continuationContext;
     scope.m_continuationOwner =
@@ -6350,6 +6360,31 @@ void PS2Runtime::reportMissingFunction(uint8_t *rdram,
     }
 }
 
+bool PS2Runtime::ValidateGuestBranchTarget(
+    R5900Context *ctx,
+    uint32_t targetPc,
+    GuestBranchKind kind)
+{
+    // Host-invoked asynchronous callbacks use a zero return address as the
+    // boundary back into the runtime. It is not a guest instruction fetch,
+    // so consume it before architectural address translation. Keep the
+    // exception narrowly scoped to the callback context that is currently
+    // bound; an ordinary guest return to zero must still fault normally.
+    if (ctx &&
+        kind == GuestBranchKind::Return &&
+        targetPc == 0u &&
+        m_asyncCallbackInvocationDepth != 0u &&
+        m_boundEeContext == ctx)
+    {
+        ctx->pc = 0u;
+        return false;
+    }
+
+    ctx->pc = targetPc;
+    ValidateInstructionFetch(ctx, targetPc);
+    return true;
+}
+
 bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
                                      R5900Context *ctx,
                                      uint32_t targetPc,
@@ -6358,8 +6393,10 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
                                      GuestBranchKind kind,
                                      const char *debugName)
 {
-    ctx->pc = targetPc;
-    ValidateInstructionFetch(ctx, targetPc);
+    if (!ValidateGuestBranchTarget(ctx, targetPc, kind))
+    {
+        return false;
+    }
     targetPc = normalizeGuestFunctionAddress(targetPc);
     ctx->pc = targetPc;
     const bool isCall = (kind == GuestBranchKind::DirectCall || kind == GuestBranchKind::IndirectCall);
@@ -8038,7 +8075,11 @@ void PS2Runtime::drainPendingAlarmCallbacks()
         {
             R5900Context &callbackCtx =
                 state.callbackContext;
-            callbackCtx = {};
+
+            RecompiledFunction function =
+                lookupFunction(alarm->handler);
+            AsyncCallbackInvocationScope callbackExecution(
+                this, &callbackCtx);
             SET_GPR_U32(&callbackCtx, 28, alarm->gp);
             SET_GPR_U32(&callbackCtx, 31, 0u);
             SET_GPR_U32(
@@ -8052,16 +8093,11 @@ void PS2Runtime::drainPendingAlarmCallbacks()
             SET_GPR_U32(
                 &callbackCtx, 6, alarm->commonArg);
             SET_GPR_U32(&callbackCtx, 7, 0u);
-            callbackCtx.pc = alarm->handler;
-
-            RecompiledFunction function =
-                lookupFunction(alarm->handler);
-            AsyncCallbackInvocationScope callbackExecution(
-                this, &callbackCtx);
             SET_GPR_U32(
                 &callbackCtx,
                 29,
                 callbackExecution.stackTop());
+            callbackCtx.pc = alarm->handler;
             executeGuestStep(
                 alarm->rdram,
                 &callbackCtx,

@@ -133,6 +133,20 @@ namespace
         g_interruptIsolationBlockEntered{false};
     std::atomic<bool>
         g_interruptIsolationBlockRelease{false};
+    std::atomic<uint32_t>
+        g_interruptContextStatus{0u};
+    std::atomic<uint32_t>
+        g_interruptContextVpuStat{0u};
+    std::atomic<uint32_t>
+        g_interruptContextS4{0u};
+    std::atomic<uint32_t>
+        g_interruptContextCauseArg{0u};
+    std::atomic<uint32_t>
+        g_interruptContextUserArg{0u};
+    std::atomic<uint32_t>
+        g_interruptContextGp{0u};
+    std::atomic<bool>
+        g_interruptContextCop2Usable{false};
 
     void setRegU32(R5900Context &ctx, int reg, uint32_t value)
     {
@@ -332,6 +346,45 @@ namespace
                 runtime
                     ? runtime->currentEeThreadId()
                     : -1));
+        ctx->pc = 0u;
+    }
+
+    void testInterruptContextHandler(
+        uint8_t *,
+        R5900Context *ctx,
+        PS2Runtime *runtime)
+    {
+        g_interruptContextStatus.store(
+            ctx->cop0_status,
+            std::memory_order_relaxed);
+        g_interruptContextVpuStat.store(
+            ctx->vu0_vpu_stat,
+            std::memory_order_relaxed);
+        g_interruptContextS4.store(
+            getRegU32(ctx, 20),
+            std::memory_order_relaxed);
+        g_interruptContextCauseArg.store(
+            getRegU32(ctx, 4),
+            std::memory_order_relaxed);
+        g_interruptContextUserArg.store(
+            getRegU32(ctx, 5),
+            std::memory_order_relaxed);
+        g_interruptContextGp.store(
+            getRegU32(ctx, 28),
+            std::memory_order_relaxed);
+
+        bool usable = false;
+        try
+        {
+            runtime->RequireCoprocessorUsable(ctx, 2u);
+            usable = true;
+        }
+        catch (const PS2GuestException &)
+        {
+        }
+        g_interruptContextCop2Usable.store(
+            usable,
+            std::memory_order_relaxed);
         ctx->pc = 0u;
     }
 
@@ -2485,6 +2538,129 @@ void register_ps2_runtime_interrupt_tests()
             cleanupRuntime(first);
             ps2_stubs::resetGsSyncVCallbackState(
                 &first.runtime);
+        });
+
+        tc.Run("INTC callback inherits interrupted coprocessor state", [](TestCase &t)
+        {
+            notifyRuntimeStop();
+            TestEnv env;
+            t.IsTrue(
+                env.runtime.memory().initialize(),
+                "runtime memory initialize should succeed");
+
+            constexpr uint32_t kCause = 7u;
+            constexpr uint32_t kHandlerAddr =
+                0x00ABC100u;
+            constexpr uint32_t kHandlerArg =
+                0x00C0FFEEu;
+            constexpr uint32_t kHandlerGp =
+                0x00166C00u;
+            constexpr uint32_t kInterruptedS4 =
+                0x13579BDFu;
+            constexpr uint32_t kInterruptedVpuStat =
+                0x00000100u;
+            constexpr uint32_t kCoprocessorMask =
+                0x70000000u;
+
+            env.runtime.registerFunction(
+                kHandlerAddr,
+                &testInterruptContextHandler);
+            g_interruptContextStatus.store(
+                0u, std::memory_order_relaxed);
+            g_interruptContextVpuStat.store(
+                0u, std::memory_order_relaxed);
+            g_interruptContextS4.store(
+                0u, std::memory_order_relaxed);
+            g_interruptContextCauseArg.store(
+                0u, std::memory_order_relaxed);
+            g_interruptContextUserArg.store(
+                0u, std::memory_order_relaxed);
+            g_interruptContextGp.store(
+                0u, std::memory_order_relaxed);
+            g_interruptContextCop2Usable.store(
+                false, std::memory_order_relaxed);
+
+            R5900Context add{};
+            setRegU32(add, 4, kCause);
+            setRegU32(add, 5, kHandlerAddr);
+            setRegU32(add, 6, 0u);
+            setRegU32(add, 7, kHandlerArg);
+            setRegU32(add, 28, kHandlerGp);
+            AddIntcHandler(
+                env.rdram.data(),
+                &add,
+                &env.runtime);
+            t.Equals(
+                getRegS32(add, 2),
+                1,
+                "fixture should allocate INTC handler ID 1");
+
+            R5900Context interrupted{};
+            interrupted.pc = 0x001188C4u;
+            interrupted.cop0_status =
+                R5900Context::kPostBiosElfStatus;
+            interrupted.vu0_vpu_stat =
+                kInterruptedVpuStat;
+            setRegU32(
+                interrupted, 20, kInterruptedS4);
+            setRegU32(
+                interrupted, 29, 0x00300008u);
+
+            {
+                PS2Runtime::GuestExecutionScope guestExecution(
+                    &env.runtime, &interrupted);
+                dispatchIntcHandlersForCause(
+                    env.rdram.data(),
+                    &env.runtime,
+                    kCause);
+            }
+
+            const uint32_t observedStatus =
+                g_interruptContextStatus.load(
+                    std::memory_order_relaxed);
+            t.Equals(
+                observedStatus & kCoprocessorMask,
+                interrupted.cop0_status & kCoprocessorMask,
+                "the registered handler should inherit the interrupted CU bits");
+            t.IsTrue(
+                g_interruptContextCop2Usable.load(
+                    std::memory_order_relaxed),
+                "an enabled COP2 operation in the handler must not raise CpU");
+            t.Equals(
+                g_interruptContextVpuStat.load(
+                    std::memory_order_relaxed),
+                kInterruptedVpuStat,
+                "the handler should inherit VU0 control state");
+            t.Equals(
+                g_interruptContextS4.load(
+                    std::memory_order_relaxed),
+                kInterruptedS4,
+                "the handler should inherit callee-saved GPR state");
+            t.Equals(
+                g_interruptContextCauseArg.load(
+                    std::memory_order_relaxed),
+                kCause,
+                "the INTC ABI should replace a0 with the interrupt cause");
+            t.Equals(
+                g_interruptContextUserArg.load(
+                    std::memory_order_relaxed),
+                kHandlerArg,
+                "the INTC ABI should replace a1 with the registered argument");
+            t.Equals(
+                g_interruptContextGp.load(
+                    std::memory_order_relaxed),
+                kHandlerGp,
+                "the INTC ABI should replace gp with the registered value");
+            t.Equals(
+                interrupted.cop0_status,
+                R5900Context::kPostBiosElfStatus,
+                "callback exception state must not leak into the interrupted continuation");
+            t.Equals(
+                getRegU32(&interrupted, 20),
+                kInterruptedS4,
+                "callback GPR writes must not leak into the interrupted continuation");
+
+            cleanupRuntime(env);
         });
 
         tc.Run("interrupt callback owns a BIOS idle frame rather than host or registration state", [](TestCase &t)

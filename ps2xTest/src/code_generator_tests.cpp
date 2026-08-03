@@ -3110,6 +3110,22 @@ void register_code_generator_tests()
                       "JR $31 should not emit a broad local switch over internal labels");
             t.IsTrue(generated.find("label_1308:") != std::string::npos,
                      "internal JAL return address should still be emitted as a label");
+            const size_t targetValidation = generated.find(
+                "runtime->ValidateGuestBranchTarget(ctx, jumpTarget, "
+                "PS2Runtime::GuestBranchKind::Return)");
+            const size_t callbackBoundary = generated.find(
+                "runtime->serviceEeEventsAtBlockBoundary(rdram, ctx);",
+                targetValidation);
+            const size_t callbackUnwind = generated.find(
+                "if (!continueGuestExecution) { return; }",
+                callbackBoundary);
+            t.IsTrue(
+                targetValidation != std::string::npos &&
+                    callbackBoundary != std::string::npos &&
+                    callbackUnwind != std::string::npos &&
+                    targetValidation < callbackBoundary &&
+                    callbackBoundary < callbackUnwind,
+                "JR $31 should recognize the host callback boundary before fetch validation while still servicing retired work");
             t.IsTrue(generated.find("        return;") != std::string::npos,
                      "JR $31 should return to the dispatcher/runtime after setting ctx->pc");
             t.IsTrue(generated.find("PS2Runtime::GuestBranchKind::Return") != std::string::npos,

@@ -573,21 +573,6 @@ static bool rpcInvokeFunction(uint8_t *rdram, R5900Context *ctx, PS2Runtime *run
     EeAsyncCallbackContextLease callbackContext(
         runtime->eeInterruptRuntimeState());
     R5900Context &tmp = callbackContext.context();
-    tmp = *ctx;
-    if (mode == RpcInvokeMode::SyscallHandler)
-    {
-        // The EE kernel runs SetSyscall-installed handlers with interrupts
-        // disabled and KSU forced to kernel, then returns to the unchanged
-        // caller Status. The temporary callback context naturally provides
-        // that save/restore boundary.
-        constexpr uint32_t kStatusIe = 0x00000001u;
-        constexpr uint32_t kStatusKsuMask = 0x00000018u;
-        tmp.cop0_status &= ~(kStatusIe | kStatusKsuMask);
-    }
-    setRegU32(&tmp, 4, a0);
-    setRegU32(&tmp, 5, a1);
-    setRegU32(&tmp, 6, a2);
-    setRegU32(&tmp, 7, a3);
 
     uint32_t steps = 0u;
     uint32_t lastPc = 0xFFFFFFFFu;
@@ -602,6 +587,21 @@ static bool rpcInvokeFunction(uint8_t *rdram, R5900Context *ctx, PS2Runtime *run
                 &tmp,
                 ctx,
                 continuationThreadId);
+        if (mode == RpcInvokeMode::SyscallHandler)
+        {
+            // The EE kernel runs SetSyscall-installed handlers with
+            // interrupts disabled and KSU forced to kernel, then returns to
+            // the unchanged caller Status. The temporary callback context
+            // naturally provides that save/restore boundary.
+            constexpr uint32_t kStatusIe = 0x00000001u;
+            constexpr uint32_t kStatusKsuMask = 0x00000018u;
+            tmp.cop0_status &=
+                ~(kStatusIe | kStatusKsuMask);
+        }
+        setRegU32(&tmp, 4, a0);
+        setRegU32(&tmp, 5, a1);
+        setRegU32(&tmp, 6, a2);
+        setRegU32(&tmp, 7, a3);
         setRegU32(
             &tmp, 29,
             callbackExecution.stackTop());

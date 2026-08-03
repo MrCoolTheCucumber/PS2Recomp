@@ -1111,10 +1111,13 @@ public:
 
     // An asynchronous EE callback executes from a separate register context,
     // but it still belongs to the continuation interrupted at the current
-    // boundary. This scope owns a complete snapshot and the continuation's
-    // identity for the duration of the callback. Active and explicit
-    // synchronous callbacks descend from their owned interrupted/caller
-    // stack, while a truly idle delivery uses the BIOS interrupt stack.
+    // boundary. This scope initializes the private callback context from a
+    // complete owned snapshot and retains the continuation's identity for the
+    // duration of the callback. The callback executor installs its entry PC
+    // and ABI argument registers after constructing the scope. Active and
+    // explicit synchronous callbacks descend from their owned
+    // interrupted/caller stack, while a truly idle delivery uses the BIOS
+    // interrupt stack.
     class AsyncCallbackInvocationScope
     {
     public:
@@ -1232,6 +1235,10 @@ public:
                              uint32_t fallthroughPc,
                              GuestBranchKind kind,
                              const char *debugName);
+    [[nodiscard]] bool ValidateGuestBranchTarget(
+        R5900Context *ctx,
+        uint32_t targetPc,
+        GuestBranchKind kind);
     void reportMissingFunction(uint8_t *rdram,
                                R5900Context *ctx,
                                uint32_t targetPc,

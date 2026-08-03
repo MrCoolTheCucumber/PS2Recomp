@@ -2473,6 +2473,137 @@ void register_ps2_runtime_expansion_tests()
                      "missing target should remain visible in ctx->pc for diagnostics");
         });
 
+        tc.Run("async callback return sentinel exits before guest fetch validation", [](TestCase &t)
+        {
+            PS2Runtime runtime;
+            R5900Context callbackCtx{};
+            callbackCtx.pc = 0x180000u;
+
+            bool returnedToFallthrough = true;
+            bool raised = false;
+            {
+                PS2Runtime::AsyncCallbackInvocationScope callback(
+                    &runtime, &callbackCtx);
+                raised = raisesGuestException([&]
+                {
+                    returnedToFallthrough = runtime.ValidateGuestBranchTarget(
+                        &callbackCtx,
+                        0u,
+                        PS2Runtime::GuestBranchKind::Return);
+                });
+            }
+
+            t.IsFalse(
+                raised,
+                "the host callback return sentinel must not become an architectural fetch");
+            t.IsFalse(
+                returnedToFallthrough,
+                "returning to the host callback boundary must unwind generated dispatch");
+            t.Equals(
+                callbackCtx.pc,
+                0u,
+                "the callback executor must observe its zero return sentinel unchanged");
+            t.IsFalse(
+                (callbackCtx.cop0_status & COP0_STATUS_EXL) != 0u,
+                "the callback return boundary must not raise a TLB-refill exception");
+        });
+
+        tc.Run("async callback context inherits the interrupted EE snapshot", [](TestCase &t)
+        {
+            PS2Runtime runtime;
+            R5900Context interruptedCtx{};
+            interruptedCtx.pc = 0x00123450u;
+            interruptedCtx.cop0_status =
+                R5900Context::kPostBiosElfStatus;
+            interruptedCtx.cop0_entryhi = 0x00556042u;
+            interruptedCtx.vu0_vpu_stat = 0x00000100u;
+            interruptedCtx.fcr31 = 0x01000001u;
+            setRegU32(interruptedCtx, 20, 0x13579BDFu);
+            setRegU32(interruptedCtx, 29, 0x00300008u);
+
+            R5900Context callbackCtx{};
+            callbackCtx.pc = 0x00ABC000u;
+            callbackCtx.cop0_status = 0u;
+            callbackCtx.cop0_entryhi = 0u;
+            callbackCtx.vu0_vpu_stat = 0u;
+            callbackCtx.fcr31 = 0u;
+            setRegU32(callbackCtx, 20, 0u);
+
+            {
+                PS2Runtime::GuestExecutionScope interruptedExecution(
+                    &runtime, &interruptedCtx);
+                PS2Runtime::AsyncCallbackInvocationScope callbackExecution(
+                    &runtime, &callbackCtx);
+
+                t.Equals(
+                    callbackCtx.pc,
+                    interruptedCtx.pc,
+                    "the callback should begin from the interrupted guest PC before installing its entry");
+                t.Equals(
+                    callbackCtx.cop0_status,
+                    interruptedCtx.cop0_status,
+                    "the callback should inherit COP0 privilege and usability state");
+                t.Equals(
+                    callbackCtx.cop0_entryhi,
+                    interruptedCtx.cop0_entryhi,
+                    "the callback should inherit the interrupted TLB identity");
+                t.Equals(
+                    callbackCtx.vu0_vpu_stat,
+                    interruptedCtx.vu0_vpu_stat,
+                    "the callback should inherit VU0 control state");
+                t.Equals(
+                    callbackCtx.fcr31,
+                    interruptedCtx.fcr31,
+                    "the callback should inherit COP1 control state");
+                t.Equals(
+                    ::getRegU32(&callbackCtx, 20),
+                    0x13579BDFu,
+                    "the callback should inherit callee-saved GPR state");
+                t.Equals(
+                    callbackExecution.stackTop(),
+                    0x00300000u,
+                    "the callback stack should descend from the same owned snapshot");
+
+                callbackCtx.cop0_status = 0u;
+                setRegU32(callbackCtx, 20, 0u);
+            }
+
+            t.Equals(
+                interruptedCtx.cop0_status,
+                R5900Context::kPostBiosElfStatus,
+                "callback COP0 writes must not leak into the interrupted continuation");
+            t.Equals(
+                ::getRegU32(&interruptedCtx, 20),
+                0x13579BDFu,
+                "callback GPR writes must not leak into the interrupted continuation");
+        });
+
+        tc.Run("ordinary guest return to zero still validates instruction fetch", [](TestCase &t)
+        {
+            PS2Runtime runtime;
+            R5900Context ctx{};
+            ctx.pc = 0x180000u;
+
+            const bool raised = raisesGuestException([&]
+            {
+                (void)runtime.ValidateGuestBranchTarget(
+                    &ctx,
+                    0u,
+                    PS2Runtime::GuestBranchKind::Return);
+            });
+
+            t.IsTrue(
+                raised,
+                "zero is only a host boundary inside the active callback context");
+            t.Equals(
+                ctx.pc,
+                EXCEPTION_VECTOR_TLB_REFILL,
+                "an ordinary guest return to unmapped kuseg must enter the refill vector");
+            t.IsTrue(
+                (ctx.cop0_status & COP0_STATUS_EXL) != 0u,
+                "the ordinary guest fetch fault must enter exception level");
+        });
+
 
         tc.Run("GS async callbacks keep a dedicated stack when guest heap is exhausted", [](TestCase &t)
         {

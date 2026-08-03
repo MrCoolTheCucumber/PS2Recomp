@@ -136,13 +136,6 @@ namespace ps2_syscalls
                     state);
                 R5900Context &irqCtx =
                     callback.context();
-                SET_GPR_U32(&irqCtx, 28, info.gp);
-                SET_GPR_U32(&irqCtx, 31, 0u);
-                SET_GPR_U32(&irqCtx, 4, cause);
-                SET_GPR_U32(&irqCtx, 5, info.arg);
-                SET_GPR_U32(&irqCtx, 6, 0u);
-                SET_GPR_U32(&irqCtx, 7, 0u);
-                irqCtx.pc = info.handler;
 
                 bool reschedulePending = false;
                 uint64_t handoffBaseline = 0u;
@@ -151,10 +144,17 @@ namespace ps2_syscalls
                     PS2Runtime::AsyncCallbackInvocationScope
                         callbackExecution(
                         runtime, &irqCtx);
+                    SET_GPR_U32(&irqCtx, 28, info.gp);
+                    SET_GPR_U32(&irqCtx, 31, 0u);
+                    SET_GPR_U32(&irqCtx, 4, cause);
+                    SET_GPR_U32(&irqCtx, 5, info.arg);
+                    SET_GPR_U32(&irqCtx, 6, 0u);
+                    SET_GPR_U32(&irqCtx, 7, 0u);
                     SET_GPR_U32(
                         &irqCtx,
                         29,
                         callbackExecution.stackTop());
+                    irqCtx.pc = info.handler;
                     PS2Runtime::DeferredGuestYieldScope deferYield(reschedulePending);
 
                     while (irqCtx.pc != 0u && runtime && !runtime->isStopRequested() && stepCount < kMaxIrqHandlerSteps)
@@ -272,13 +272,6 @@ namespace ps2_syscalls
                     state);
                 R5900Context &irqCtx =
                     callback.context();
-                SET_GPR_U32(&irqCtx, 28, info.gp);
-                SET_GPR_U32(&irqCtx, 31, 0u);
-                SET_GPR_U32(&irqCtx, 4, cause);
-                SET_GPR_U32(&irqCtx, 5, info.arg);
-                SET_GPR_U32(&irqCtx, 6, 0u);
-                SET_GPR_U32(&irqCtx, 7, 0u);
-                irqCtx.pc = info.handler;
 
                 bool reschedulePending = false;
                 uint64_t handoffBaseline = 0u;
@@ -287,10 +280,17 @@ namespace ps2_syscalls
                     PS2Runtime::AsyncCallbackInvocationScope
                         callbackExecution(
                         runtime, &irqCtx);
+                    SET_GPR_U32(&irqCtx, 28, info.gp);
+                    SET_GPR_U32(&irqCtx, 31, 0u);
+                    SET_GPR_U32(&irqCtx, 4, cause);
+                    SET_GPR_U32(&irqCtx, 5, info.arg);
+                    SET_GPR_U32(&irqCtx, 6, 0u);
+                    SET_GPR_U32(&irqCtx, 7, 0u);
                     SET_GPR_U32(
                         &irqCtx,
                         29,
                         callbackExecution.stackTop());
+                    irqCtx.pc = info.handler;
                     PS2Runtime::DeferredGuestYieldScope deferYield(reschedulePending);
 
                     while (irqCtx.pc != 0u && runtime && !runtime->isStopRequested() &&

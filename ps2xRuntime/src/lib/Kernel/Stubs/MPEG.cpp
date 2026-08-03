@@ -2065,7 +2065,6 @@ namespace ps2_stubs
                 runtime->eeInterruptRuntimeState());
             R5900Context &callbackCtx =
                 callbackLease.context();
-            callbackCtx = *callerCtx;
             uint32_t steps = 0u;
             bool reschedulePending = false;
             uint64_t handoffBaseline = 0u;

@@ -759,10 +759,6 @@ namespace ps2_stubs
                 state);
             R5900Context &callbackCtx =
                 callbackLease.context();
-            SET_GPR_U32(&callbackCtx, 28, gp);
-            SET_GPR_U32(&callbackCtx, 31, 0u);
-            SET_GPR_U32(&callbackCtx, 4, static_cast<uint32_t>(callbackTick));
-            callbackCtx.pc = callback;
 
             const uint32_t dispatchLogIndex =
                 state.gsSyncVCallbackDispatchLogCount
@@ -779,10 +775,17 @@ namespace ps2_stubs
                 PS2Runtime::AsyncCallbackInvocationScope
                     callbackExecution(
                     runtime, &callbackCtx);
+                SET_GPR_U32(&callbackCtx, 28, gp);
+                SET_GPR_U32(&callbackCtx, 31, 0u);
+                SET_GPR_U32(
+                    &callbackCtx,
+                    4,
+                    static_cast<uint32_t>(callbackTick));
                 SET_GPR_U32(
                     &callbackCtx,
                     29,
                     callbackExecution.stackTop());
+                callbackCtx.pc = callback;
                 if (shouldLogDispatch)
                 {
                     PS2_IF_AGRESSIVE_LOGS({

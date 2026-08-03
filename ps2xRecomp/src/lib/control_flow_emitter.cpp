@@ -455,6 +455,8 @@ namespace ps2recomp
     {
         const uint8_t rsReg = static_cast<uint8_t>(m_branchInst.rs);
         const uint8_t rdReg = static_cast<uint8_t>(m_branchInst.rd);
+        const bool isReturn =
+            kind == RegisterBranchKind::Jump && rsReg == 31u;
         const std::vector<uint32_t> sortedInternalTargets = resolvedLocalIndirectTargets();
 
         m_ss << "    {\n";
@@ -469,7 +471,18 @@ namespace ps2recomp
         }
 
         emitDelaySlot("        ");
-        emitResolvedBasicBlockBoundary("jumpTarget", "        ");
+        if (isReturn)
+        {
+            m_ss << "        const bool continueGuestExecution = "
+                    "runtime->ValidateGuestBranchTarget(ctx, jumpTarget, "
+                    "PS2Runtime::GuestBranchKind::Return);\n";
+            emitBasicBlockBoundary("        ");
+            m_ss << "        if (!continueGuestExecution) { return; }\n";
+        }
+        else
+        {
+            emitResolvedBasicBlockBoundary("jumpTarget", "        ");
+        }
 
         if (!sortedInternalTargets.empty())
         {
