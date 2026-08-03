@@ -1747,8 +1747,8 @@ void register_code_generator_tests()
                 countOccurrences(
                     generated,
                     "serviceEeEventsAtBlockBoundary(rdram, ctx)"),
-                static_cast<size_t>(1u),
-                "the completed EE block should service shared timing events");
+                static_cast<size_t>(2u),
+                "taken and not-taken paths should each service the completed EE block");
             t.Equals(
                 countOccurrences(
                     generated,
@@ -1908,8 +1908,154 @@ void register_code_generator_tests()
                 countOccurrences(
                     generated,
                     "runtime->serviceEeEventsAtBlockBoundary(rdram, ctx);"),
-                static_cast<size_t>(1u),
-                "one runtime boundary helper should commit time and service events");
+                static_cast<size_t>(2u),
+                "each mutually exclusive branch path should commit time and service events");
+        });
+
+        tc.Run("post-delay event boundaries publish the resolved branch PC", [](TestCase &t) {
+            constexpr std::string_view boundary =
+                "runtime->serviceEeEventsAtBlockBoundary(rdram, ctx);";
+
+            Function staticJumpFunction;
+            staticJumpFunction.name = "post_delay_static_jump";
+            staticJumpFunction.start = 0x2200u;
+            staticJumpFunction.end = 0x2208u;
+            staticJumpFunction.isRecompiled = true;
+
+            const std::string staticJump = CodeGenerator({}, {}).generateFunction(
+                staticJumpFunction,
+                {makeJal(0x2200u, 0x3000u), makeNop(0x2204u)},
+                false);
+            const size_t staticTarget = staticJump.find(
+                "ctx->pc = 0x3000u;");
+            const size_t staticBoundary = staticJump.find(
+                boundary, staticTarget);
+            const size_t staticDispatch = staticJump.find(
+                "dispatchGuestBranch", staticTarget);
+            t.IsTrue(
+                staticTarget != std::string::npos &&
+                    staticBoundary != std::string::npos &&
+                    staticDispatch != std::string::npos &&
+                    staticTarget < staticBoundary &&
+                    staticBoundary < staticDispatch,
+                "a taken jump with a NOP slot should publish its target before servicing events");
+
+            Function conditionalFunction;
+            conditionalFunction.name = "post_delay_conditional";
+            conditionalFunction.start = 0x2300u;
+            conditionalFunction.end = 0x230Cu;
+            conditionalFunction.isRecompiled = true;
+
+            const std::string conditional = CodeGenerator({}, {}).generateFunction(
+                conditionalFunction,
+                {
+                    makeBranch(0x2300u, 3u),
+                    makeAddiu(0x2304u, 7u, 7u, 1u),
+                    makeNop(0x2308u),
+                },
+                false);
+            const size_t conditionalTarget = conditional.find(
+                "ctx->pc = 0x2310u;");
+            const size_t conditionalTargetBoundary = conditional.find(
+                boundary, conditionalTarget);
+            const size_t conditionalFallthrough = conditional.find(
+                "ctx->pc = 0x2308u;", conditionalTarget);
+            const size_t conditionalFallthroughBoundary = conditional.find(
+                boundary, conditionalFallthrough);
+            t.Equals(
+                countOccurrences(conditional, std::string(boundary)),
+                static_cast<size_t>(2u),
+                "taken and not-taken paths should each service exactly one resolved boundary");
+            t.IsTrue(
+                conditionalTarget != std::string::npos &&
+                    conditionalTargetBoundary != std::string::npos &&
+                    conditionalTarget < conditionalTargetBoundary,
+                "a taken conditional with a real slot should publish its target before servicing events");
+            t.IsTrue(
+                conditionalFallthrough != std::string::npos &&
+                    conditionalFallthroughBoundary != std::string::npos &&
+                    conditionalFallthrough < conditionalFallthroughBoundary,
+                "a not-taken conditional should publish its post-slot fallthrough before servicing events");
+
+            Function likelyFunction;
+            likelyFunction.name = "post_delay_likely";
+            likelyFunction.start = 0x2400u;
+            likelyFunction.end = 0x240Cu;
+            likelyFunction.isRecompiled = true;
+
+            Instruction likely{};
+            likely.address = 0x2400u;
+            likely.opcode = OPCODE_BEQL;
+            likely.rs = 1u;
+            likely.rt = 2u;
+            likely.simmediate = 3u;
+            likely.isBranch = true;
+            likely.hasDelaySlot = true;
+            const std::string likelyCode = CodeGenerator({}, {}).generateFunction(
+                likelyFunction,
+                {
+                    likely,
+                    makeAddiu(0x2404u, 8u, 8u, 1u),
+                    makeNop(0x2408u),
+                },
+                false);
+            const size_t likelyTakenStart = likelyCode.find(
+                "if (branch_taken_0x2400)");
+            const size_t likelyNotTakenStart = likelyCode.find(
+                "if (!branch_taken_0x2400)", likelyTakenStart);
+            const std::string likelyTakenPath =
+                likelyTakenStart == std::string::npos ||
+                        likelyNotTakenStart == std::string::npos
+                    ? std::string{}
+                    : likelyCode.substr(
+                          likelyTakenStart,
+                          likelyNotTakenStart - likelyTakenStart);
+            const std::string likelyNotTakenPath =
+                likelyNotTakenStart == std::string::npos
+                    ? std::string{}
+                    : likelyCode.substr(likelyNotTakenStart);
+            const size_t likelyTarget = likelyTakenPath.find(
+                "ctx->pc = 0x2410u;");
+            const size_t likelyTargetBoundary = likelyTakenPath.find(
+                boundary, likelyTarget);
+            const size_t likelyFallthrough = likelyNotTakenPath.find(
+                "ctx->pc = 0x2408u;");
+            const size_t likelyFallthroughBoundary = likelyNotTakenPath.find(
+                boundary, likelyFallthrough);
+            t.IsTrue(
+                likelyTarget != std::string::npos &&
+                    likelyTargetBoundary != std::string::npos &&
+                    likelyTarget < likelyTargetBoundary,
+                "a taken likely branch should publish its target after executing the slot");
+            t.IsTrue(
+                likelyFallthrough != std::string::npos &&
+                    likelyFallthroughBoundary != std::string::npos &&
+                    likelyFallthrough < likelyFallthroughBoundary,
+                "an annulled likely branch should publish its fallthrough before servicing events");
+
+            Function registerJumpFunction;
+            registerJumpFunction.name = "post_delay_register_jump";
+            registerJumpFunction.start = 0x2500u;
+            registerJumpFunction.end = 0x250Cu;
+            registerJumpFunction.isRecompiled = true;
+
+            const std::string registerJump = CodeGenerator({}, {}).generateFunction(
+                registerJumpFunction,
+                {
+                    makeJr(0x2500u, 16u),
+                    makeNop(0x2504u),
+                    makeNop(0x2508u),
+                },
+                false);
+            const size_t dynamicTarget = registerJump.find(
+                "ctx->pc = jumpTarget;");
+            const size_t dynamicBoundary = registerJump.find(
+                boundary, dynamicTarget);
+            t.IsTrue(
+                dynamicTarget != std::string::npos &&
+                    dynamicBoundary != std::string::npos &&
+                    dynamicTarget < dynamicBoundary,
+                "a register jump should publish its captured target before servicing events");
         });
 
         tc.Run("VU0 macro writes preserve the hardwired zero registers", [](TestCase &t) {

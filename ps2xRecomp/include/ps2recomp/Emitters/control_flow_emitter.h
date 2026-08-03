@@ -56,6 +56,11 @@ namespace ps2recomp
 
         std::string delaySlotCode(bool branchDelayExecution) const;
         void emitBasicBlockBoundary(std::string_view indent);
+        void emitResolvedBasicBlockBoundary(uint32_t nextPc,
+                                            std::string_view indent);
+        void emitResolvedBasicBlockBoundary(
+            std::string_view nextPcExpression,
+            std::string_view indent);
         void emitInstructionAtDelayPc(std::string_view indent,
                                       bool branchDelayExecution);
         void emitDelaySlot(std::string_view indent);

@@ -142,6 +142,23 @@ namespace ps2recomp
             indent);
     }
 
+    void ControlFlowEmitter::emitResolvedBasicBlockBoundary(
+        uint32_t nextPc,
+        std::string_view indent)
+    {
+        emitResolvedBasicBlockBoundary(
+            fmt::format("0x{:X}u", nextPc), indent);
+    }
+
+    void ControlFlowEmitter::emitResolvedBasicBlockBoundary(
+        std::string_view nextPcExpression,
+        std::string_view indent)
+    {
+        m_ss << fmt::format(
+            "{}ctx->pc = {};\n", indent, nextPcExpression);
+        emitBasicBlockBoundary(indent);
+    }
+
     void ControlFlowEmitter::emitInstructionAtDelayPc(
         std::string_view indent,
         bool branchDelayExecution)
@@ -162,7 +179,6 @@ namespace ps2recomp
                                         : !isGuestNop(m_delaySlot);
         if (!hasInstruction)
         {
-            emitBasicBlockBoundary(indent);
             return;
         }
 
@@ -188,7 +204,6 @@ namespace ps2recomp
         {
             m_ss << fmt::format("{}ctx->in_delay_slot = false;\n", indent);
         }
-        emitBasicBlockBoundary(indent);
     }
 
     void ControlFlowEmitter::emitDelaySlot(std::string_view indent)
@@ -205,7 +220,7 @@ namespace ps2recomp
 
         m_ss << fmt::format("    if (ctx->pc == 0x{:X}u) {{\n", delayPc());
         emitInstructionAtDelayPc("        ", false);
-        m_ss << fmt::format("        ctx->pc = 0x{:X}u;\n", fallthroughPc());
+        emitResolvedBasicBlockBoundary(fallthroughPc(), "        ");
 
         if (isInternalTarget(fallthroughPc()))
         {
@@ -221,7 +236,7 @@ namespace ps2recomp
 
     void ControlFlowEmitter::emitInternalTarget(uint32_t target, uint32_t sourcePc, std::string_view indent)
     {
-        m_ss << fmt::format("{}ctx->pc = 0x{:X}u;\n", indent, target);
+        emitResolvedBasicBlockBoundary(target, indent);
         if (target <= sourcePc && !isCallLikeEdge())
         {
             m_ss << fmt::format(
@@ -380,7 +395,7 @@ namespace ps2recomp
             return;
         }
 
-        m_ss << fmt::format("    ctx->pc = 0x{:X}u;\n", target);
+        emitResolvedBasicBlockBoundary(target, "    ");
 
         if (kind == StaticBranchKind::Call && emitRelocationCallIfAvailable(kind, "    "))
         {
@@ -410,7 +425,7 @@ namespace ps2recomp
         }
 
         emitDelaySlot("        ");
-        m_ss << "        ctx->pc = jumpTarget;\n";
+        emitResolvedBasicBlockBoundary("jumpTarget", "        ");
 
         if (!sortedInternalTargets.empty())
         {
@@ -568,12 +583,13 @@ namespace ps2recomp
             }
             else
             {
-                m_ss << fmt::format("            ctx->pc = 0x{:X}u;\n", target);
+                emitResolvedBasicBlockBoundary(target, "            ");
                 m_ss << "            return;\n";
             }
             m_ss << "        }\n";
             m_ss << "        if (!" << branchTakenVar << ") {\n";
-            emitBasicBlockBoundary("            ");
+            emitResolvedBasicBlockBoundary(
+                fallthroughPc(), "            ");
             m_ss << "        }\n";
         }
         else
@@ -592,9 +608,13 @@ namespace ps2recomp
             }
             else
             {
-                m_ss << fmt::format("            ctx->pc = 0x{:X}u;\n", target);
+                emitResolvedBasicBlockBoundary(target, "            ");
                 m_ss << "            return;\n";
             }
+            m_ss << "        }\n";
+            m_ss << "        if (!" << branchTakenVar << ") {\n";
+            emitResolvedBasicBlockBoundary(
+                fallthroughPc(), "            ");
             m_ss << "        }\n";
         }
 
@@ -605,6 +625,7 @@ namespace ps2recomp
     {
         m_ss << "    " << m_gen.translateInstruction(m_branchInst) << "\n";
         emitDelaySlot("    ");
+        emitResolvedBasicBlockBoundary(fallthroughPc(), "    ");
     }
 
     void ControlFlowEmitter::emitFallthroughLabelIfNeeded()
