@@ -23,6 +23,7 @@ void register_ee_counter_tests();
 void register_ee_execution_backend_tests();
 void register_ee_event_scheduler_tests();
 void register_ee_load_zero_tests();
+void register_ee_performance_event_tests();
 void register_ee_runtime_reset_tests();
 void register_ee_runtime_executor_tests();
 void register_ee_reserved_instruction_tests();
@@ -78,6 +79,7 @@ int main()
     register_ee_execution_backend_tests();
     register_ee_event_scheduler_tests();
     register_ee_load_zero_tests();
+    register_ee_performance_event_tests();
     register_ee_runtime_reset_tests();
     register_ee_runtime_executor_tests();
     register_ee_reserved_instruction_tests();

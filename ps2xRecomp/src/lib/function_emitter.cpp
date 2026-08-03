@@ -1,6 +1,7 @@
 #include "ps2recomp/Emitters/function_emitter.h"
 #include "ps2recomp/code_generator.h"
 #include "ps2recomp/ee_cycle_model.h"
+#include "ps2recomp/ee_performance_model.h"
 #include "ps2recomp/gif_dma_kick_analyzer.h"
 #include "ps2recomp/instructions.h"
 #include "ps2recomp/r5900_decoder.h"
@@ -184,6 +185,9 @@ namespace ps2recomp
 
                 if (inst.hasDelaySlot)
                 {
+                    ss << "    "
+                       << eeInstructionIssueCall(inst)
+                       << "\n";
                     ss << "    ++ctx->insn_count;\n";
                     ss << "    ctx->advanceEeCycleTicks("
                        << eeInstructionCycleTicks(inst) << "u);\n";
@@ -243,6 +247,12 @@ namespace ps2recomp
                 }
                 else
                 {
+                    const EeInstructionPerformanceInfo
+                        performanceInfo =
+                            eeInstructionPerformanceInfo(inst);
+                    ss << "    "
+                       << eeInstructionIssueCall(inst)
+                       << "\n";
                     ss << "    ++ctx->insn_count;\n";
                     ss << "    ctx->advanceEeCycleTicks("
                        << eeInstructionCycleTicks(inst) << "u);\n";
@@ -253,6 +263,13 @@ namespace ps2recomp
 
                     if (gifDmaKickPlan.suppresses(i))
                     {
+                        if (performanceInfo
+                                .completionBeforeEffect)
+                        {
+                            ss << "    "
+                               << eeInstructionCompletionCall(inst)
+                               << "\n";
+                        }
                         const size_t slot = gifDmaKickPlan.slotFor(i);
                         emitGifDmaCapture(ss, gifDmaKickPlan, slot, "    ");
 
@@ -272,6 +289,14 @@ namespace ps2recomp
                         }
                         ss << "    }\n";
 
+                        if (!performanceInfo
+                                 .completionBeforeEffect)
+                        {
+                            ss << "    "
+                               << eeInstructionCompletionCall(inst)
+                               << "\n";
+                        }
+
                         updateConstantRegisters(inst, constantRegisters);
                         continue;
                     }
@@ -279,12 +304,26 @@ namespace ps2recomp
                     ss << "    ctx->pc = 0x" << std::hex << inst.address << "u;\n"
                        << std::dec;
                     const MemoryAccessHint memoryHint = resolveMemoryAccessHint(inst, constantRegisters);
+                    if (performanceInfo
+                            .completionBeforeEffect)
+                    {
+                        ss << "    "
+                           << eeInstructionCompletionCall(inst)
+                           << "\n";
+                    }
                     ss << "    " << cg.translateInstruction(inst, memoryHint);
                     if (inst.isMmio)
                     {
                         ss << " // MMIO: 0x" << std::hex << inst.mmioAddress << std::dec;
                     }
                     ss << "\n";
+                    if (!performanceInfo
+                             .completionBeforeEffect)
+                    {
+                        ss << "    "
+                           << eeInstructionCompletionCall(inst)
+                           << "\n";
+                    }
 
                     updateConstantRegisters(inst, constantRegisters);
                     validateSequentialFetch =

@@ -30,6 +30,7 @@
 #include "ps2_log.h"
 #include "runtime/cop0_timing.h"
 #include "runtime/ee_cache.h"
+#include "runtime/ee_performance.h"
 #include "runtime/ee_execution_backend.h"
 #include "runtime/ee_event_scheduler.h"
 #include "runtime/ee_runtime_executor.h"
@@ -151,6 +152,9 @@ struct alignas(16) R5900Context
     uint64_t insn_count; // Retired instruction counter
     uint32_t ee_block_cycle_ticks;
     bool ee_block_cycle_active;
+    bool ee_performance_issue_pending;
+    ps2x::performance::EeInstructionIssueProfile
+        ee_performance_pending_issue;
     uint64_t hi, lo;     // Lower 64-bit lanes of the 128-bit HI/LO registers
     uint64_t hi1, lo1;   // Upper lanes, also used by scalar MULT1/DIV1 operations
     uint32_t sa;         // Shift amount register
@@ -290,6 +294,8 @@ struct alignas(16) R5900Context
     {
         ee_block_cycle_ticks = 0u;
         ee_block_cycle_active = false;
+        ee_performance_issue_pending = false;
+        ee_performance_pending_issue = {};
     }
 
     R5900Context()
@@ -1224,6 +1230,19 @@ public:
     void SignalBusError(R5900Context *ctx,
                         PS2BusErrorAccess access,
                         uint32_t physicalAddress);
+    void recordEeInstructionIssue(
+        R5900Context *ctx,
+        ps2x::performance::EeInstructionIssueProfile profile);
+    void recordEeInstructionCompletion(
+        R5900Context *ctx,
+        uint32_t completionEvents);
+    void recordEePredictedBranch(
+        R5900Context *ctx,
+        uint32_t branchPc);
+    void recordEeConditionalBranch(
+        R5900Context *ctx,
+        uint32_t branchPc,
+        bool taken);
 
     void executeVU0Microprogram(uint8_t *rdram, R5900Context *ctx, uint32_t address);
     void vu0StartMicroProgram(uint8_t *rdram, R5900Context *ctx, uint32_t address);
@@ -1880,6 +1899,11 @@ private:
         uint64_t currentCycle) noexcept;
     void deliverPendingCop0Exceptions(
         R5900Context *ctx);
+    void recordEePerformanceEvents(
+        R5900Context *ctx,
+        const ps2x::timing::Cop0PerformanceEvents &events) noexcept;
+    void flushEeInstructionIssue(
+        R5900Context *ctx) noexcept;
     [[nodiscard]] bool cop0TimerInterruptEnabled(
         const R5900Context *ctx) const noexcept;
     [[noreturn]] void raiseCop0Level1Exception(
@@ -1924,6 +1948,11 @@ private:
     VuUnit m_vu0;
     VuUnit m_vu1;
     ps2x::timing::Cop0Timing m_cop0Timing;
+    static constexpr size_t kEeBranchHistoryEntries = 4096u;
+    std::array<uint32_t, kEeBranchHistoryEntries>
+        m_eeBranchHistoryTags{};
+    std::array<uint8_t, kEeBranchHistoryEntries>
+        m_eeBranchHistoryStates{};
     ps2x::timing::EeTimeline m_eeTimeline;
     ps2x::timing::EeEventScheduler m_eeEventScheduler;
     struct Vu1ExecutionTiming

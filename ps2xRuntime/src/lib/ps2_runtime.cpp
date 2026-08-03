@@ -3677,6 +3677,7 @@ ps2x::timing::EeTick PS2Runtime::prepareCop0Access(
     uint8_t *rdram,
     R5900Context *ctx)
 {
+    flushEeInstructionIssue(ctx);
     const ps2x::timing::EeTick now =
         commitEeContextProgress(ctx);
     if (m_eeEventScheduler.deadlineDue(now))
@@ -4015,6 +4016,7 @@ ps2x::timing::EeTick PS2Runtime::finishEeContextBlock(
     {
         return currentEeTick();
     }
+    flushEeInstructionIssue(context);
     return publishEeElapsed(context->finishEeBasicBlock());
 }
 
@@ -4079,6 +4081,10 @@ void PS2Runtime::resetEeTimingUnlocked(
     }
     m_eeTimeline.reset();
     m_eeEventScheduler.reset();
+    m_eeBranchHistoryTags = {};
+    m_eeBranchHistoryStates = {};
+    cop0Context->ee_performance_issue_pending = false;
+    cop0Context->ee_performance_pending_issue = {};
     resetEeVSyncPacingUnlocked();
     m_cop0Timing.reset(
         0u,
@@ -6437,6 +6443,8 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
         throw PS2GuestException{};
     }
 
+    flushEeInstructionIssue(ctx);
+
     const ps2x::timing::EeTick now =
         commitContextProgress
             ? commitEeContextProgress(ctx)
@@ -6444,6 +6452,15 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
     const uint64_t cycle =
         ps2x::timing::eeTickToCyclesFloor(now);
     synchronizeCop0Timing(ctx, cycle);
+
+    // Performance counter exceptions outrank every level-1 exception. An
+    // occurrence counter can overflow between scheduler boundaries, so honor
+    // the sticky state before publishing the lower-priority exception.
+    if (m_cop0Timing.performanceExceptionPending(
+            ctx->cop0_status))
+    {
+        raiseCop0PerformanceException(ctx);
+    }
 
     const bool alreadyInException =
         (ctx->cop0_status &
@@ -6498,6 +6515,8 @@ PS2Runtime::raiseCop0PerformanceException(
         throw PS2GuestException{};
     }
 
+    flushEeInstructionIssue(ctx);
+
     const ps2x::timing::EeTick now =
         currentEeTick();
     const uint64_t cycle =
@@ -6545,6 +6564,8 @@ PS2Runtime::raiseCop0DebugException(
     {
         throw PS2GuestException{};
     }
+
+    flushEeInstructionIssue(ctx);
 
     const ps2x::timing::EeTick now =
         commitEeContextProgress(ctx);
@@ -6806,6 +6827,213 @@ void PS2Runtime::CheckEeDataValueBreakpoint(
     }
 }
 
+void PS2Runtime::recordEeInstructionIssue(
+    R5900Context *ctx,
+    ps2x::performance::EeInstructionIssueProfile profile)
+{
+    if (!ctx)
+    {
+        return;
+    }
+
+    if ((ctx->cop0_perf & (1u << 31u)) == 0u ||
+        (ctx->cop0_status & COP0_STATUS_ERL) != 0u)
+    {
+        ctx->ee_performance_issue_pending = false;
+        ctx->ee_performance_pending_issue = {};
+        return;
+    }
+
+    using namespace ps2x::performance;
+    const auto recordIssue =
+        [this, ctx](bool dual)
+        {
+            ps2x::timing::Cop0PerformanceEvents events{};
+            if (dual)
+            {
+                events.dualInstructionIssued = 1u;
+            }
+            else
+            {
+                events.singleInstructionIssued = 1u;
+            }
+            recordEePerformanceEvents(ctx, events);
+        };
+
+    const bool dualIssueEnabled =
+        (ctx->cop0_config & (1u << 18u)) != 0u;
+    if (!dualIssueEnabled)
+    {
+        flushEeInstructionIssue(ctx);
+        recordIssue(false);
+        return;
+    }
+
+    if (!ctx->ee_performance_issue_pending)
+    {
+        ctx->ee_performance_pending_issue = profile;
+        ctx->ee_performance_issue_pending = true;
+        return;
+    }
+
+    const auto &previous =
+        ctx->ee_performance_pending_issue;
+    const bool distinctPipes =
+        ((previous.pipeMask & kIssuePipe0) != 0u &&
+         (profile.pipeMask & kIssuePipe1) != 0u) ||
+        ((previous.pipeMask & kIssuePipe1) != 0u &&
+         (profile.pipeMask & kIssuePipe0) != 0u);
+    const bool forbiddenControlPair =
+        ((previous.flags & kIssueBranch) != 0u &&
+         (profile.flags &
+          (kIssueBranch | kIssueEret)) != 0u);
+    const bool conservativeBarrier =
+        ((previous.flags | profile.flags) &
+         kIssueConservativeBarrier) != 0u;
+    const bool registerHazard =
+        (previous.gprWriteMask &
+         (profile.gprReadMask |
+          profile.gprWriteMask)) != 0u;
+
+    if (distinctPipes &&
+        !forbiddenControlPair &&
+        !conservativeBarrier &&
+        !registerHazard)
+    {
+        recordIssue(true);
+        ctx->ee_performance_issue_pending = false;
+        ctx->ee_performance_pending_issue = {};
+        return;
+    }
+
+    recordIssue(false);
+    ctx->ee_performance_pending_issue = profile;
+}
+
+void PS2Runtime::flushEeInstructionIssue(
+    R5900Context *ctx) noexcept
+{
+    if (!ctx || !ctx->ee_performance_issue_pending)
+    {
+        return;
+    }
+
+    ps2x::timing::Cop0PerformanceEvents events{};
+    events.singleInstructionIssued = 1u;
+    recordEePerformanceEvents(ctx, events);
+    ctx->ee_performance_issue_pending = false;
+    ctx->ee_performance_pending_issue = {};
+}
+
+void PS2Runtime::recordEePerformanceEvents(
+    R5900Context *ctx,
+    const ps2x::timing::Cop0PerformanceEvents &events) noexcept
+{
+    if (!ctx)
+    {
+        return;
+    }
+
+    const ps2x::timing::Cop0TimingAdvanceResult result =
+        m_cop0Timing.recordPerformanceEvents(
+            ctx->cop0_status, events);
+    publishCop0TimingMirrors(ctx);
+    if (result.performanceOverflowMask != 0u)
+    {
+        refreshCop0EventSchedules(
+            ctx,
+            ps2x::timing::eeTickToCyclesFloor(
+                currentEeTick()));
+    }
+}
+
+void PS2Runtime::recordEeInstructionCompletion(
+    R5900Context *ctx,
+    uint32_t completionEvents)
+{
+    if (!ctx || completionEvents == 0u)
+    {
+        return;
+    }
+
+    using namespace ps2x::performance;
+    ps2x::timing::Cop0PerformanceEvents events{};
+    events.instructionCompleted =
+        (completionEvents & kInstructionCompleted) != 0u;
+    events.nonBdsInstructionCompleted =
+        (completionEvents &
+         kNonBdsInstructionCompleted) != 0u;
+    events.cop2InstructionCompleted =
+        (completionEvents & kCop2InstructionCompleted) != 0u;
+    events.cop1InstructionCompleted =
+        (completionEvents & kCop1InstructionCompleted) != 0u;
+    events.loadCompleted =
+        (completionEvents & kLoadCompleted) != 0u;
+    events.storeCompleted =
+        (completionEvents & kStoreCompleted) != 0u;
+    recordEePerformanceEvents(ctx, events);
+}
+
+void PS2Runtime::recordEePredictedBranch(
+    R5900Context *ctx,
+    uint32_t branchPc)
+{
+    if (!ctx)
+    {
+        return;
+    }
+
+    ps2x::timing::Cop0PerformanceEvents events{};
+    events.branchIssued = 1u;
+    events.lowOrderBranchIssued =
+        (branchPc & 4u) == 0u ? 1u : 0u;
+    recordEePerformanceEvents(ctx, events);
+}
+
+void PS2Runtime::recordEeConditionalBranch(
+    R5900Context *ctx,
+    uint32_t branchPc,
+    bool taken)
+{
+    if (!ctx)
+    {
+        return;
+    }
+
+    constexpr uint32_t kConfigBranchPredictionEnable =
+        1u << 12u;
+    const size_t index =
+        (branchPc >> 2u) &
+        (kEeBranchHistoryEntries - 1u);
+    if (m_eeBranchHistoryTags[index] != branchPc)
+    {
+        m_eeBranchHistoryTags[index] = branchPc;
+        m_eeBranchHistoryStates[index] = 0u;
+    }
+    uint8_t &history = m_eeBranchHistoryStates[index];
+    const bool predictedTaken = history >= 2u;
+    const bool mispredicted =
+        (ctx->cop0_config &
+         kConfigBranchPredictionEnable) != 0u &&
+        predictedTaken != taken;
+    if (taken)
+    {
+        history = std::min<uint8_t>(history + 1u, 3u);
+    }
+    else if (history != 0u)
+    {
+        --history;
+    }
+
+    ps2x::timing::Cop0PerformanceEvents events{};
+    events.branchIssued = 1u;
+    events.branchMispredicted =
+        mispredicted ? 1u : 0u;
+    events.lowOrderBranchIssued =
+        (branchPc & 4u) == 0u ? 1u : 0u;
+    recordEePerformanceEvents(ctx, events);
+}
+
 void PS2Runtime::SignalBusError(R5900Context *ctx,
                                 PS2BusErrorAccess access,
                                 uint32_t physicalAddress)
@@ -6823,6 +7051,17 @@ void PS2Runtime::SignalBusError(R5900Context *ctx,
           COP0_STATUS_ERL)) != 0u)
     {
         return;
+    }
+
+    if (access == PS2BusErrorAccess::DataLoad)
+    {
+        recordEeInstructionCompletion(
+            ctx, ps2x::performance::kLoadCompleted);
+    }
+    else if (access == PS2BusErrorAccess::DataStore)
+    {
+        recordEeInstructionCompletion(
+            ctx, ps2x::performance::kStoreCompleted);
     }
 
     ctx->cop0_badpaddr = physicalAddress & ~0xFu;

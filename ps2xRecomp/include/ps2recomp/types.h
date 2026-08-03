@@ -43,6 +43,11 @@ namespace ps2recomp
         bool isStore;      // Is store instruction
         bool isLoad;       // Is load instruction
 
+        // Register hazards used by the EE issue-pair model. Register zero is
+        // omitted because reads are constant and writes are discarded.
+        uint32_t gprReadMask;
+        uint32_t gprWriteMask;
+
         // Additional PS2-specific fields
         uint8_t mmiType;        // 0=MMI0, 1=MMI1, 2=MMI2, 3=MMI3
         uint8_t mmiFunction;    // Function within MMI type
@@ -82,6 +87,7 @@ namespace ps2recomp
                         immediate(0), simmediate(0), target(0), raw(0),
                         isMMI(false), isVU(false), isBranch(false), isJump(false), isCall(false),
                         isReturn(false), hasDelaySlot(false), isMultimedia(false), isStore(false), isLoad(false),
+                        gprReadMask(0), gprWriteMask(0),
                         mmiType(0), mmiFunction(0), pmfhlVariation(0), vuFunction(0), isMmio(false), mmioAddress(0)
         {
             vectorInfo = {};

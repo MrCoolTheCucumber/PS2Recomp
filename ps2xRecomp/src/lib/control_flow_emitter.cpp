@@ -2,6 +2,7 @@
 
 #include "ps2recomp/control_flow_utils.h"
 #include "ps2recomp/ee_cycle_model.h"
+#include "ps2recomp/ee_performance_model.h"
 #include "ps2recomp/instructions.h"
 #include "ps2recomp/r5900_decoder.h"
 #include "ps2_runtime_calls.h"
@@ -180,6 +181,11 @@ namespace ps2recomp
         m_ss << fmt::format(
             "{}runtime->CheckEeInstructionBreakpoint(ctx, ctx->pc);\n",
             indent);
+        const EeInstructionPerformanceInfo performanceInfo =
+            eeInstructionPerformanceInfo(m_delaySlot);
+        m_ss << indent
+             << eeInstructionIssueCall(m_delaySlot)
+             << "\n";
         m_ss << fmt::format("{}++ctx->insn_count;\n", indent);
         m_ss << fmt::format(
             "{}ctx->advanceEeCycleTicks({}u);\n",
@@ -191,6 +197,9 @@ namespace ps2recomp
                                         : !isGuestNop(m_delaySlot);
         if (!hasInstruction)
         {
+            m_ss << indent
+                 << eeInstructionCompletionCall(m_delaySlot)
+                 << "\n";
             if (branchDelayExecution)
             {
                 m_ss << fmt::format(
@@ -200,6 +209,12 @@ namespace ps2recomp
             return;
         }
 
+        if (performanceInfo.completionBeforeEffect)
+        {
+            m_ss << indent
+                 << eeInstructionCompletionCall(m_delaySlot)
+                 << "\n";
+        }
         const std::string code = delaySlotCode(branchDelayExecution);
         std::istringstream lines(code);
         std::string line;
@@ -209,6 +224,13 @@ namespace ps2recomp
             {
                 m_ss << indent << line << "\n";
             }
+        }
+
+        if (!performanceInfo.completionBeforeEffect)
+        {
+            m_ss << indent
+                 << eeInstructionCompletionCall(m_delaySlot)
+                 << "\n";
         }
 
         if (branchDelayExecution)
@@ -392,6 +414,13 @@ namespace ps2recomp
 
     void ControlFlowEmitter::emitStaticJump(StaticBranchKind kind)
     {
+        m_ss << fmt::format(
+            "    if ((ctx->cop0_perf & 0x80000000u) != 0u) {{ "
+            "runtime->recordEePredictedBranch(ctx, 0x{:X}u); }}\n",
+            branchPc());
+        m_ss << "    "
+             << eeInstructionCompletionCall(m_branchInst)
+             << "\n";
         if (kind == StaticBranchKind::Call)
         {
             m_ss << fmt::format("    SET_GPR_U32(ctx, 31, 0x{:X}u);\n", fallthroughPc());
@@ -429,6 +458,9 @@ namespace ps2recomp
 
         m_ss << "    {\n";
         m_ss << "        const uint32_t jumpTarget = GPR_U32(ctx, " << static_cast<int>(rsReg) << ");\n";
+        m_ss << "        "
+             << eeInstructionCompletionCall(m_branchInst)
+             << "\n";
 
         if (kind == RegisterBranchKind::Call && rdReg != 0u)
         {
@@ -573,6 +605,13 @@ namespace ps2recomp
 
         m_ss << "    {\n";
         m_ss << "        const bool " << branchTakenVar << " = (" << conditionalBranchExpression() << ");\n";
+        m_ss << fmt::format(
+            "        if ((ctx->cop0_perf & 0x80000000u) != 0u) {{ "
+            "runtime->recordEeConditionalBranch(ctx, 0x{:X}u, {}); }}\n",
+            branchPc(), branchTakenVar);
+        m_ss << "        "
+             << eeInstructionCompletionCall(m_branchInst)
+             << "\n";
 
         if (!unconditionalLinkCode.empty())
         {
@@ -599,6 +638,12 @@ namespace ps2recomp
             }
             m_ss << "        }\n";
             m_ss << "        if (!" << branchTakenVar << ") {\n";
+            m_ss << "            "
+                 << eeInstructionIssueCall(m_delaySlot)
+                 << "\n";
+            m_ss << "            "
+                 << eeInstructionCompletionCall(m_delaySlot)
+                 << "\n";
             emitResolvedBasicBlockBoundary(
                 fallthroughPc(), "            ");
             m_ss << "        }\n";
@@ -635,6 +680,9 @@ namespace ps2recomp
     void ControlFlowEmitter::emitFallbackInstruction()
     {
         m_ss << "    " << m_gen.translateInstruction(m_branchInst) << "\n";
+        m_ss << "    "
+             << eeInstructionCompletionCall(m_branchInst)
+             << "\n";
         emitDelaySlot("    ");
         emitResolvedBasicBlockBoundary(fallthroughPc(), "    ");
     }

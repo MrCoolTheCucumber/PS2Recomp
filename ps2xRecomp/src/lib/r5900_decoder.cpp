@@ -114,6 +114,41 @@ namespace ps2recomp
         inst.isLoad = RabbitizerInstrDescriptor_doesLoad(desc);
         inst.isStore = RabbitizerInstrDescriptor_doesStore(desc);
 
+        const auto registerBit =
+            [](uint32_t index)
+            {
+                return index == 0u ? 0u : (1u << index);
+            };
+        if (RabbitizerInstrDescriptor_readsRs(desc))
+        {
+            inst.gprReadMask |= registerBit(inst.rs);
+        }
+        if (RabbitizerInstrDescriptor_readsRt(desc))
+        {
+            inst.gprReadMask |= registerBit(inst.rt);
+        }
+        if (RabbitizerInstrDescriptor_readsRd(desc))
+        {
+            inst.gprReadMask |= registerBit(inst.rd);
+        }
+        if (RabbitizerInstrDescriptor_modifiesRs(desc))
+        {
+            inst.gprWriteMask |= registerBit(inst.rs);
+        }
+        if (RabbitizerInstrDescriptor_modifiesRt(desc))
+        {
+            inst.gprWriteMask |= registerBit(inst.rt);
+        }
+        if (RabbitizerInstrDescriptor_modifiesRd(desc))
+        {
+            inst.gprWriteMask |= registerBit(inst.rd);
+        }
+        if (RabbitizerInstrDescriptor_doesLink(desc) &&
+            inst.gprWriteMask == 0u)
+        {
+            inst.gprWriteMask |= registerBit(31u);
+        }
+
         inst.isMMI = inst.opcode == OPCODE_MMI;
         inst.isVU = inst.opcode == OPCODE_COP2 ||
                     inst.opcode == OPCODE_LWC2 ||
