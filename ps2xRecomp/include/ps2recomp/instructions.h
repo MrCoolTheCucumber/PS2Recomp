@@ -410,13 +410,27 @@ namespace ps2recomp
         COP0_REG_CONFIG = 16,  // Configuration register
 
         COP0_REG_BADPADDR = 23, // Bad physical address
-        COP0_REG_DEBUG = 24,    // Debug register
+        COP0_REG_DEBUG = 24,    // Breakpoint register bank
         COP0_REG_PERF = 25,     // Performance counter
 
         COP0_REG_TAGLO = 28,   // Cache TagLo (I-Cache & D-Cache)
         COP0_REG_TAGHI = 29,   // High bits of cache tag ( Cache TagHi )
         COP0_REG_ERROREPC = 30 // Error exception program counter
     };
+
+    // Low 11-bit selector for the seven register-24 breakpoint moves.
+    enum Cop0BreakpointSelector
+    {
+        COP0_BREAKPOINT_BPC = 0x000,
+        COP0_BREAKPOINT_IAB = 0x002,
+        COP0_BREAKPOINT_IABM = 0x003,
+        COP0_BREAKPOINT_DAB = 0x004,
+        COP0_BREAKPOINT_DABM = 0x005,
+        COP0_BREAKPOINT_DVB = 0x006,
+        COP0_BREAKPOINT_DVBM = 0x007,
+    };
+
+    constexpr uint32_t COP0_BREAKPOINT_SELECTOR_MASK = 0x7ffu;
 
     // COP1 (FPU) Format Field ('fmt' or 'rs' field, bits 25-21) for OPCODE_COP1
     enum Cop1Format

@@ -8,6 +8,31 @@
 #include <sstream>
 #include <cmath>
 
+namespace
+{
+    const char *breakpointRegisterMember(uint32_t selector)
+    {
+        switch (selector)
+        {
+        case ps2recomp::COP0_BREAKPOINT_BPC:
+            return "cop0_bpc";
+        case ps2recomp::COP0_BREAKPOINT_IAB:
+            return "cop0_iab";
+        case ps2recomp::COP0_BREAKPOINT_IABM:
+            return "cop0_iabm";
+        case ps2recomp::COP0_BREAKPOINT_DAB:
+            return "cop0_dab";
+        case ps2recomp::COP0_BREAKPOINT_DABM:
+            return "cop0_dabm";
+        case ps2recomp::COP0_BREAKPOINT_DVB:
+            return "cop0_dvb";
+        case ps2recomp::COP0_BREAKPOINT_DVBM:
+            return "cop0_dvbm";
+        default:
+            return nullptr;
+        }
+    }
+}
 
 namespace ps2recomp
 {
@@ -67,7 +92,22 @@ namespace ps2recomp
             case COP0_REG_BADPADDR:
                 return fmt::format("SET_GPR_S32(ctx, {}, (int32_t)ctx->cop0_badpaddr);", rt);
             case COP0_REG_DEBUG:
-                return fmt::format("SET_GPR_S32(ctx, {}, (int32_t)ctx->cop0_debug);", rt);
+            {
+                const uint32_t selector =
+                    inst.raw & COP0_BREAKPOINT_SELECTOR_MASK;
+                const char *const member = breakpointRegisterMember(selector);
+                if (member == nullptr)
+                {
+                    return fmt::format(
+                        "SET_GPR_S32(ctx, {}, 0);  // Unimplemented COP0 breakpoint selector {}",
+                        rt,
+                        selector);
+                }
+                return fmt::format(
+                    "SET_GPR_S32(ctx, {}, (int32_t)ctx->{});",
+                    rt,
+                    member);
+            }
             case COP0_REG_PERF:
                 return fmt::format(
                     "SET_GPR_S32(ctx, {}, (int32_t)runtime->readCop0Performance("
@@ -127,7 +167,21 @@ namespace ps2recomp
             case COP0_REG_BADPADDR:
                 return "// MTC0 to BADPADDR register ignored (read-only)";
             case COP0_REG_DEBUG:
-                return fmt::format("ctx->cop0_debug = GPR_U32(ctx, {});", rt);
+            {
+                const uint32_t selector =
+                    inst.raw & COP0_BREAKPOINT_SELECTOR_MASK;
+                const char *const member = breakpointRegisterMember(selector);
+                if (member == nullptr)
+                {
+                    return fmt::format(
+                        "// Unimplemented MTC0 breakpoint selector {}",
+                        selector);
+                }
+                return fmt::format(
+                    "ctx->{} = GPR_U32(ctx, {});",
+                    member,
+                    rt);
+            }
             case COP0_REG_PERF:
                 return fmt::format(
                     "runtime->writeCop0Performance(rdram, ctx, {}u, GPR_U32(ctx, {}));",

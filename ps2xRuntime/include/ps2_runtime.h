@@ -207,7 +207,13 @@ struct alignas(16) R5900Context
     uint32_t cop0_prid;
     uint32_t cop0_config;
     uint32_t cop0_badpaddr;
-    uint32_t cop0_debug;
+    uint32_t cop0_bpc;
+    uint32_t cop0_iab;
+    uint32_t cop0_iabm;
+    uint32_t cop0_dab;
+    uint32_t cop0_dabm;
+    uint32_t cop0_dvb;
+    uint32_t cop0_dvbm;
     uint32_t cop0_perf;
     uint32_t cop0_pcr0;
     uint32_t cop0_pcr1;
