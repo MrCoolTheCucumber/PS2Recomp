@@ -99,14 +99,18 @@ namespace ps2recomp
         return targets;
     }
 
-    std::string ControlFlowEmitter::delaySlotCode() const
+    std::string ControlFlowEmitter::delaySlotCode(
+        bool branchDelayExecution) const
     {
-        if (!hasRealDelaySlot())
+        const bool hasInstruction = branchDelayExecution
+                                        ? hasRealDelaySlot()
+                                        : !isGuestNop(m_delaySlot);
+        if (!hasInstruction)
         {
             return {};
         }
 
-        if (!m_delaySlotOverride.empty())
+        if (branchDelayExecution && !m_delaySlotOverride.empty())
         {
             return m_delaySlotOverride;
         }
@@ -120,7 +124,11 @@ namespace ps2recomp
             {
                 code += "  " + disassembly;
             }
-            code += " (Delay Slot)\n";
+            if (branchDelayExecution)
+            {
+                code += " (Delay Slot)";
+            }
+            code += "\n";
         }
 
         code += m_gen.translateInstruction(m_delaySlot);
@@ -134,7 +142,9 @@ namespace ps2recomp
             indent);
     }
 
-    void ControlFlowEmitter::emitDelaySlot(std::string_view indent)
+    void ControlFlowEmitter::emitInstructionAtDelayPc(
+        std::string_view indent,
+        bool branchDelayExecution)
     {
         m_ss << fmt::format("{}++ctx->insn_count;\n", indent);
         m_ss << fmt::format(
@@ -142,17 +152,28 @@ namespace ps2recomp
             indent,
             eeInstructionCycleTicks(m_delaySlot));
 
-        if (!hasRealDelaySlot())
+        if (!branchDelayExecution)
+        {
+            m_ss << fmt::format("{}ctx->in_delay_slot = false;\n", indent);
+        }
+
+        const bool hasInstruction = branchDelayExecution
+                                        ? hasRealDelaySlot()
+                                        : !isGuestNop(m_delaySlot);
+        if (!hasInstruction)
         {
             emitBasicBlockBoundary(indent);
             return;
         }
 
         m_ss << fmt::format("{}ctx->pc = 0x{:X}u;\n", indent, delayPc());
-        m_ss << fmt::format("{}ctx->in_delay_slot = true;\n", indent);
-        m_ss << fmt::format("{}ctx->branch_pc = 0x{:X}u;\n", indent, branchPc());
+        if (branchDelayExecution)
+        {
+            m_ss << fmt::format("{}ctx->in_delay_slot = true;\n", indent);
+            m_ss << fmt::format("{}ctx->branch_pc = 0x{:X}u;\n", indent, branchPc());
+        }
 
-        const std::string code = delaySlotCode();
+        const std::string code = delaySlotCode(branchDelayExecution);
         std::istringstream lines(code);
         std::string line;
         while (std::getline(lines, line))
@@ -163,8 +184,16 @@ namespace ps2recomp
             }
         }
 
-        m_ss << fmt::format("{}ctx->in_delay_slot = false;\n", indent);
+        if (branchDelayExecution)
+        {
+            m_ss << fmt::format("{}ctx->in_delay_slot = false;\n", indent);
+        }
         emitBasicBlockBoundary(indent);
+    }
+
+    void ControlFlowEmitter::emitDelaySlot(std::string_view indent)
+    {
+        emitInstructionAtDelayPc(indent, true);
     }
 
     void ControlFlowEmitter::emitResumeFromDelaySlotEntry()
@@ -175,7 +204,7 @@ namespace ps2recomp
         }
 
         m_ss << fmt::format("    if (ctx->pc == 0x{:X}u) {{\n", delayPc());
-        emitDelaySlot("        ");
+        emitInstructionAtDelayPc("        ", false);
         m_ss << fmt::format("        ctx->pc = 0x{:X}u;\n", fallthroughPc());
 
         if (isInternalTarget(fallthroughPc()))

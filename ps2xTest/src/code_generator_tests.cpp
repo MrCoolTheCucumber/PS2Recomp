@@ -706,6 +706,84 @@ void register_code_generator_tests()
         t.IsTrue(generated.find("goto label_2004;") != std::string::npos, "branch to delay slot should use goto");
     });
 
+    tc.Run("direct entry at a delay-slot address is not branch-delay execution", [](TestCase &t) {
+        Function func;
+        func.name = "direct_delay_slot_entry";
+        func.start = 0x3000u;
+        func.end = 0x3018u;
+        func.isRecompiled = true;
+
+        // The first branch enters 0x300c directly. The second branch owns the
+        // same instruction as its delay slot, so codegen must emit distinct
+        // ordinary-entry and branch-delay paths for the trapping load.
+        const std::vector<Instruction> instructions = {
+            makeBranch(0x3000u, 2u),
+            makeNop(0x3004u),
+            makeBranch(0x3008u, 2u),
+            makeLw(0x300Cu, 2u, 0u, 1u),
+            makeNop(0x3010u),
+            makeNop(0x3014u),
+        };
+
+        CodeGenerator gen({}, {});
+        const std::string generated =
+            gen.generateFunction(func, instructions, false);
+
+        const size_t directStart = generated.find(
+            "if (ctx->pc == 0x300Cu) {");
+        const size_t owningBranchStart = generated.find(
+            "ctx->pc = 0x3008u;", directStart);
+        t.IsTrue(
+            directStart != std::string::npos &&
+                owningBranchStart != std::string::npos,
+            "fixture should contain separate direct and owning-branch paths");
+        if (directStart == std::string::npos ||
+            owningBranchStart == std::string::npos)
+        {
+            return;
+        }
+
+        const std::string directPath = generated.substr(
+            directStart, owningBranchStart - directStart);
+        const size_t directState = directPath.find(
+            "ctx->in_delay_slot = false;");
+        const size_t directTrap = directPath.find("READ32(");
+        t.IsTrue(
+            directState != std::string::npos &&
+                directTrap != std::string::npos &&
+                directState < directTrap,
+            "direct entry should establish ordinary state before the trapping load");
+        t.IsFalse(
+            directPath.find("ctx->in_delay_slot = true;") !=
+                std::string::npos,
+            "direct entry must leave CAUSE.BD clear on an exception");
+        t.IsFalse(
+            directPath.find("ctx->branch_pc = 0x3008u;") !=
+                std::string::npos,
+            "direct entry must preserve the target instruction as EPC");
+
+        const std::string owningBranchPath = generated.substr(
+            owningBranchStart);
+        const size_t owningState = owningBranchPath.find(
+            "ctx->in_delay_slot = true;");
+        const size_t owningBranchPc = owningBranchPath.find(
+            "ctx->branch_pc = 0x3008u;");
+        const size_t owningTrap = owningBranchPath.find("READ32(");
+        t.IsTrue(
+            owningState != std::string::npos &&
+                owningBranchPc != std::string::npos &&
+                owningTrap != std::string::npos &&
+                owningState < owningTrap &&
+                owningBranchPc < owningTrap,
+            "the owning branch should establish delay state before the same trapping load");
+        t.IsTrue(
+            owningState != std::string::npos,
+            "genuine delay-slot execution must retain CAUSE.BD behavior");
+        t.IsTrue(
+            owningBranchPc != std::string::npos,
+            "genuine delay-slot execution must retain the branch EPC");
+    });
+
     tc.Run("control-flow analysis keeps same-function JAL target internal and promotes only the return pc", [](TestCase &t) {
         Function func;
         func.name = "same_function_call";

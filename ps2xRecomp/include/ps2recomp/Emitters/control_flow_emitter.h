@@ -54,8 +54,10 @@ namespace ps2recomp
         bool isInternalTarget(uint32_t target) const;
         std::vector<uint32_t> resolvedLocalIndirectTargets() const;
 
-        std::string delaySlotCode() const;
+        std::string delaySlotCode(bool branchDelayExecution) const;
         void emitBasicBlockBoundary(std::string_view indent);
+        void emitInstructionAtDelayPc(std::string_view indent,
+                                      bool branchDelayExecution);
         void emitDelaySlot(std::string_view indent);
         void emitResumeFromDelaySlotEntry();
         void emitInternalTarget(uint32_t target, uint32_t sourcePc, std::string_view indent);
