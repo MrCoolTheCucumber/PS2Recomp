@@ -7350,8 +7350,7 @@ void PS2Runtime::handleSyscall(uint8_t *rdram, R5900Context *ctx, uint32_t encod
 {
     if (ctx->in_delay_slot)
     {
-        throw std::runtime_error("Attempted to execute a syscall inside a branch delay slot! "
-                                 "This breaks the atomic basic block model and is structurally unsupported by the emulator.");
+        raiseCop0Level1Exception(ctx, EXCEPTION_SYSCALL);
     }
 
     const uint32_t syscallId = (encodedSyscallId != 0u)

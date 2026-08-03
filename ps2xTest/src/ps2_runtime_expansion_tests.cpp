@@ -3892,26 +3892,6 @@ void register_ps2_runtime_expansion_tests()
                      "fault should retain the address-error cause at the handler");
         });
 
-        tc.Run("handleSyscall rejects invocation in delay slot", [](TestCase &t)
-        {
-            PS2Runtime runtime;
-            std::vector<uint8_t> rdram(PS2_RAM_SIZE, 0u);
-            R5900Context ctx{};
-            ctx.in_delay_slot = true;
-
-            bool threw = false;
-            try
-            {
-                runtime.handleSyscall(rdram.data(), &ctx, 0x3Cu);
-            }
-            catch (const std::runtime_error &)
-            {
-                threw = true;
-            }
-
-            t.IsTrue(threw, "syscall from delay slot should throw to preserve block atomicity");
-        });
-
         tc.Run("VIF MSCAL and MSCNT toggle DBF and keep TOPS/ITOPS coherent", [](TestCase &t)
         {
             PS2Memory mem;
