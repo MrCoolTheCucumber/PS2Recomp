@@ -43,17 +43,13 @@ namespace ps2recomp
             case OPCODE_SDL:
             case OPCODE_SDR:
             case OPCODE_SWR:
-            case OPCODE_LL:
             case OPCODE_LWC1:
             case OPCODE_LWC2:
-            case OPCODE_LLD:
             case OPCODE_LDC1:
             case OPCODE_LDC2:
             case OPCODE_LD:
-            case OPCODE_SC:
             case OPCODE_SWC1:
             case OPCODE_SWC2:
-            case OPCODE_SCD:
             case OPCODE_SDC1:
             case OPCODE_SDC2:
             case OPCODE_SD:

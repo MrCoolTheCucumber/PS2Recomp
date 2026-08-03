@@ -197,10 +197,6 @@ struct alignas(16) R5900Context
     uint32_t cop0_taghi;
     uint32_t cop0_errorepc;
 
-    // LL/SC reservation state (not part of COP0 Status bits).
-    uint32_t llbit;
-    uint32_t lladdr;
-
     // Delay slot state tracking
     bool in_delay_slot;
     uint32_t branch_pc;
@@ -1235,7 +1231,6 @@ public:
         R5900Context *ctx,
         uint32_t operation,
         uint32_t virtualAddress);
-    void clearLLBit(R5900Context *ctx);
     void configureGuestHeap(uint32_t guestBase, uint32_t guestLimit = PS2_RAM_SIZE);
     uint32_t guestMalloc(uint32_t size, uint32_t alignment = 16u);
     uint32_t guestCalloc(uint32_t count, uint32_t size, uint32_t alignment = 16u);

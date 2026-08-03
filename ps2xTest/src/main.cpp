@@ -10,6 +10,7 @@ void register_ee_counter_tests();
 void register_ee_execution_backend_tests();
 void register_ee_event_scheduler_tests();
 void register_ee_runtime_executor_tests();
+void register_ee_reserved_instruction_tests();
 void register_ee_thread_scheduler_tests();
 void register_r5900_decoder_tests();
 void register_elf_analyzer_tests();
@@ -48,6 +49,7 @@ int main()
     register_ee_execution_backend_tests();
     register_ee_event_scheduler_tests();
     register_ee_runtime_executor_tests();
+    register_ee_reserved_instruction_tests();
     register_ee_thread_scheduler_tests();
     register_r5900_decoder_tests();
     register_elf_analyzer_tests();

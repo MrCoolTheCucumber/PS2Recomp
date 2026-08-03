@@ -190,20 +190,30 @@ void register_r5900_decoder_tests()
         t.Equals(decoder.getBranchTarget(inst), expectedTarget, "bgezal target should be computed");
     });
 
-    tc.Run("LL/SC modify control and set load/store flags", [](TestCase &t) {
-        uint32_t address = 0x9000;
-        uint32_t llRaw = (OPCODE_LL << 26) | (2 << 21) | (3 << 16) | 0x10;
-        uint32_t scRaw = (OPCODE_SC << 26) | (4 << 21) | (5 << 16) | 0x20;
-
+    tc.Run("LL/SC encodings are control-only reserved instructions", [](TestCase &t) {
+        constexpr uint32_t opcodes[] = {
+            OPCODE_LL, OPCODE_LLD, OPCODE_SC, OPCODE_SCD};
         R5900Decoder decoder;
-        Instruction ll = decoder.decodeInstruction(address, llRaw);
-        Instruction sc = decoder.decodeInstruction(address + 4, scRaw);
 
-        t.IsTrue(ll.isLoad, "ll should be load");
-        t.IsTrue(ll.modificationInfo.modifiesControl, "ll should modify control (LL bit)");
-        t.IsTrue(sc.isStore, "sc should be store");
-        t.IsTrue(sc.modificationInfo.modifiesControl, "sc should modify control (LL bit)");
-        t.IsTrue(sc.modificationInfo.modifiesGPR, "sc writes success flag to rt");
+        for (size_t index = 0; index < std::size(opcodes); ++index)
+        {
+            const uint32_t raw =
+                (opcodes[index] << 26) |
+                (2u << 21) |
+                (3u << 16) |
+                0x10u;
+            const Instruction inst = decoder.decodeInstruction(
+                0x9000u + static_cast<uint32_t>(index * 4u), raw);
+
+            t.IsFalse(inst.isLoad, "reserved encoding should not be a load");
+            t.IsFalse(inst.isStore, "reserved encoding should not be a store");
+            t.IsFalse(inst.modificationInfo.modifiesGPR,
+                      "reserved encoding should not write rt");
+            t.IsFalse(inst.modificationInfo.modifiesMemory,
+                      "reserved encoding should not write memory");
+            t.IsTrue(inst.modificationInfo.modifiesControl,
+                     "reserved encoding should enter exception control flow");
+        }
     });
 
     tc.Run("CACHE exposes memory and control side effects", [](TestCase &t) {

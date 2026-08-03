@@ -220,11 +220,7 @@ namespace ps2recomp
         case OPCODE_LDL:
         case OPCODE_LDR:
         case OPCODE_LQ:
-        case OPCODE_LL:
         case OPCODE_LD:
-            constants.invalidate(inst.rt);
-            return;
-        case OPCODE_SC:
             constants.invalidate(inst.rt);
             return;
         case OPCODE_SPECIAL:

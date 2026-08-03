@@ -158,24 +158,16 @@ namespace ps2recomp
             inst.modificationInfo.modifiesControl = true;
         }
 
-        if (inst.opcode == OPCODE_LL || inst.opcode == OPCODE_LLD)
+        if (inst.opcode == OPCODE_LL || inst.opcode == OPCODE_LLD ||
+            inst.opcode == OPCODE_SC || inst.opcode == OPCODE_SCD)
         {
-            inst.isLoad = true;
+            // Rabbitizer describes the shared MIPS III encodings. The R5900
+            // instead takes RI before any data access or rt write.
+            inst.isLoad = false;
+            inst.isStore = false;
+            inst.modificationInfo.modifiesGPR = false;
+            inst.modificationInfo.modifiesMemory = false;
             inst.modificationInfo.modifiesControl = true;
-            if (inst.rt != 0)
-            {
-                inst.modificationInfo.modifiesGPR = true;
-            }
-        }
-
-        if (inst.opcode == OPCODE_SC || inst.opcode == OPCODE_SCD)
-        {
-            inst.isStore = true;
-            inst.modificationInfo.modifiesControl = true;
-            if (inst.rt != 0)
-            {
-                inst.modificationInfo.modifiesGPR = true; // success flag to rt
-            }
         }
 
         if (inst.opcode == OPCODE_CACHE)

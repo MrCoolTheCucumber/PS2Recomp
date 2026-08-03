@@ -2296,22 +2296,6 @@ void register_code_generator_tests()
                      "MOVN must not overwrite the destination upper 64 bits");
         });
 
-        tc.Run("SC requires matching LL reservation address", [](TestCase &t) {
-            CodeGenerator gen({}, {});
-
-            Instruction sc{};
-            sc.opcode = OPCODE_SC;
-            sc.rs = 9;
-            sc.rt = 10;
-            sc.simmediate = static_cast<uint32_t>(static_cast<int16_t>(4));
-
-            std::string out = gen.translateInstruction(sc);
-            t.IsTrue(out.find("ctx->llbit && ctx->lladdr == addr") != std::string::npos,
-                     "SC must require both llbit and matching lladdr");
-            t.IsTrue(out.find("ctx->llbit = 0; ctx->lladdr = 0;") != std::string::npos,
-                     "SC must clear reservation state after attempting the store");
-        });
-
         tc.Run("QFSRV translation uses runtime helper macro", [](TestCase &t) {
             CodeGenerator gen({}, {});
 

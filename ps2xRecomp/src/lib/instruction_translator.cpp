@@ -419,19 +419,12 @@ namespace ps2recomp
         case OPCODE_PREF:
             return "// PREF instruction (ignored)";
         case OPCODE_LL:
-            return fmt::format(
-                "{{ uint32_t addr = ADD32(GPR_U32(ctx, {}), {}); "
-                "SET_GPR_S32(ctx, {}, (int32_t)READ32(addr)); "
-                "ctx->llbit = 1; ctx->lladdr = addr; }}",
-                inst.rs, inst.simmediate, inst.rt);
+        case OPCODE_LLD:
         case OPCODE_SC:
-            return fmt::format(
-                "{{ uint32_t addr = ADD32(GPR_U32(ctx, {}), {}); "
-                "if (ctx->llbit && ctx->lladdr == addr) {{ WRITE32(addr, GPR_U32(ctx, {})); "
-                "SET_GPR_S32(ctx, {}, 1); }} "
-                "else {{ SET_GPR_S32(ctx, {}, 0); }} "
-                "ctx->llbit = 0; ctx->lladdr = 0; }}",
-                inst.rs, inst.simmediate, inst.rt, inst.rt, inst.rt);
+        case OPCODE_SCD:
+            // The EE Core omits the MIPS III load-linked/store-conditional
+            // instructions. All four primary encodings are precise RI faults.
+            return "runtime->SignalException(ctx, EXCEPTION_RESERVED_INSTRUCTION);";
         default:
             return m_codeGenerator.emitUnhandledInstruction(inst, fmt::format("Unhandled opcode: 0x{:X}", inst.opcode));
         }

@@ -63,19 +63,19 @@ namespace ps2recomp
         OPCODE_SWR = 0x2E,   // Store Word Right
         OPCODE_CACHE = 0x2F, // Cache Operation
 
-        OPCODE_LL = 0x30,   // LL - Load Linked Word, maybe omitted/unused
+        OPCODE_LL = 0x30,   // Unsupported LL encoding; raises RI on EE
         OPCODE_LWC1 = 0x31, // Load Word to Coprocessor 1 (FPU)
         OPCODE_LWC2 = 0x32, // Load Word to Coprocessor 2, maybe omitted/unused
         OPCODE_PREF = 0x33, // Prefetch
-        OPCODE_LLD = 0x34,  // Load Linked Doubleword, maybe omitted/unused
+        OPCODE_LLD = 0x34,  // Unsupported LLD encoding; raises RI on EE
         OPCODE_LDC1 = 0x35, // Load Doubleword to Coprocessor 1, FPU is single-precision
         OPCODE_LDC2 = 0x36, // Load Quadword to Coprocessor 2 (VU0) - Overrides standard MIPS LDC2
         OPCODE_LD = 0x37,   // Load Doubleword
 
-        OPCODE_SC = 0x38,   // Store Conditional Word, maybe omitted/unused?
+        OPCODE_SC = 0x38,   // Unsupported SC encoding; raises RI on EE
         OPCODE_SWC1 = 0x39, // Store Word from Coprocessor 1 (FPU)
         OPCODE_SWC2 = 0x3A, // SWC2 - Store Word from Coprocessor 2, maybe omitted/unused
-        OPCODE_SCD = 0x3C,  // SCD - Store Conditional Doubleword, maybe omitted/unused?
+        OPCODE_SCD = 0x3C,  // Unsupported SCD encoding; raises RI on EE
         OPCODE_SDC1 = 0x3D, // SDC1 - Store Doubleword from Coprocessor 1, FPU is single-precision
         OPCODE_SDC2 = 0x3E, // PS2 specific Store Quadword from Coprocessor 2 (VU0) - Overrides standard MIPS SDC2
         OPCODE_SD = 0x3F,   // Store Doubleword

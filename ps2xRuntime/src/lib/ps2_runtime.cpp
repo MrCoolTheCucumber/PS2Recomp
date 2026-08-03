@@ -3825,7 +3825,6 @@ void PS2Runtime::handleCop0Eret(
         ctx->pc = ctx->cop0_epc;
         ctx->cop0_status &= ~COP0_STATUS_EXL;
     }
-    clearLLBit(ctx);
     refreshCop0EventSchedules(ctx, cycle);
     deliverPendingCop0Exceptions(ctx);
 }
@@ -7669,13 +7668,6 @@ void PS2Runtime::handleTLBP(uint8_t *rdram, R5900Context *ctx)
         // MIPS sets probe failure bit (P) in Index[31].
         ctx->cop0_index |= 0x80000000u;
     }
-}
-
-void PS2Runtime::clearLLBit(R5900Context *ctx)
-{
-    // LL/SC reservation is tracked separately from COP0 Status.
-    ctx->llbit = 0;
-    ctx->lladdr = 0;
 }
 
 uint32_t PS2Runtime::alignGuestHeapValue(uint32_t value, uint32_t alignment)
