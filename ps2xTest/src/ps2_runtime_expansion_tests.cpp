@@ -1557,6 +1557,100 @@ void register_ps2_runtime_expansion_tests()
                  0x0000u, 0x30edu, 0xe000u, 0x0000u});
         });
 
+        tc.Run("PMADDW preserves packed multiplier accumulator quirks", [](TestCase &t)
+        {
+            struct PmaddwCase
+            {
+                uint64_t initialHi;
+                uint64_t initialLo;
+                uint64_t initialHi1;
+                uint64_t initialLo1;
+                std::array<uint32_t, 4u> lhs;
+                std::array<uint32_t, 4u> rhs;
+                std::array<uint32_t, 4u> expectedResult;
+                uint64_t expectedHi;
+                uint64_t expectedLo;
+                uint64_t expectedHi1;
+                uint64_t expectedLo1;
+            };
+
+            const std::array<PmaddwCase, 3u> cases{{
+                {
+                    0x5555555500000001ull,
+                    0x13579bdffffffff0ull,
+                    0xaaaaaaaa00000000ull,
+                    0x2468ace000000010ull,
+                    {0xfffffffau, 0xffffffffu, 0xfffffffcu, 0xffffffffu},
+                    {0xfffffff8u, 0xffffffffu, 0x00000008u, 0x00000000u},
+                    {0x00000020u, 0x00000001u, 0xfffffff0u, 0x00000000u},
+                    0x0000000000000001ull,
+                    0x0000000000000020ull,
+                    0x0000000000000000ull,
+                    0xfffffffffffffff0ull,
+                },
+                {
+                    0x1111111100000000ull,
+                    0x3333333300000000ull,
+                    0x2222222200000005ull,
+                    0x4444444400000010ull,
+                    {0x00010001u, 0x00000000u, 0x00010001u, 0x00000000u},
+                    {0x0000ffffu, 0x00000000u, 0x0000ffffu, 0x00000000u},
+                    {0xffffffffu, 0x00000001u, 0x0000000fu, 0x00000006u},
+                    0x0000000000000001ull,
+                    0xffffffffffffffffull,
+                    0x0000000000000006ull,
+                    0x000000000000000full,
+                },
+                {
+                    0x5555555500000000ull,
+                    0x13579bdf00000000ull,
+                    0xaaaaaaaa00000000ull,
+                    0x2468ace000000000ull,
+                    {0x00000002u, 0x00000000u, 0x00000002u, 0x00000000u},
+                    {0x80000000u, 0xffffffffu, 0x80000000u, 0xffffffffu},
+                    {0x00000000u, 0x00000000u, 0x00000000u, 0xffffffffu},
+                    0x0000000000000000ull,
+                    0x0000000000000000ull,
+                    0xffffffffffffffffull,
+                    0x0000000000000000ull,
+                },
+            }};
+
+            for (size_t caseIndex = 0u; caseIndex < cases.size(); ++caseIndex)
+            {
+                const PmaddwCase &test = cases[caseIndex];
+                R5900Context ctx{};
+                ctx.hi = test.initialHi;
+                ctx.lo = test.initialLo;
+                ctx.hi1 = test.initialHi1;
+                ctx.lo1 = test.initialLo1;
+                const __m128i lhs = Ps2MakeU32Vector(
+                    test.lhs[0], test.lhs[1], test.lhs[2], test.lhs[3]);
+                const __m128i rhs = Ps2MakeU32Vector(
+                    test.rhs[0], test.rhs[1], test.rhs[2], test.rhs[3]);
+
+                const __m128i result = Ps2Pmaddw(&ctx, lhs, rhs);
+                std::array<uint32_t, 4u> resultWords{};
+                std::memcpy(resultWords.data(), &result, sizeof(result));
+                for (size_t lane = 0u; lane < resultWords.size(); ++lane)
+                {
+                    t.Equals(
+                        resultWords[lane],
+                        test.expectedResult[lane],
+                        "PMADDW oracle case " + std::to_string(caseIndex) +
+                            " result word " + std::to_string(lane));
+                }
+                t.Equals(ctx.hi, test.expectedHi,
+                         "PMADDW oracle HI mismatch");
+                t.Equals(ctx.lo, test.expectedLo,
+                         "PMADDW oracle LO mismatch");
+                t.Equals(ctx.hi1, test.expectedHi1,
+                         "PMADDW oracle HI1 mismatch");
+                t.Equals(ctx.lo1, test.expectedLo1,
+                         "PMADDW oracle LO1 mismatch");
+            }
+        });
+
         tc.Run("PMULTH writes eight independent signed products", [](TestCase &t)
         {
             R5900Context ctx{};

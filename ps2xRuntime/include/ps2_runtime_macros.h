@@ -296,6 +296,67 @@ static inline __m128i Ps2Pmultw(R5900Context *ctx, __m128i lhs, __m128i rhs)
     return Ps2MakeU64Vector(product0, product1);
 }
 
+static inline uint64_t Ps2PmaddwLane(uint32_t initialHi,
+                                     uint32_t initialLo,
+                                     int32_t lhs,
+                                     int32_t rhs,
+                                     bool applyLowerLaneCorrection)
+{
+    const int64_t signedProduct =
+        static_cast<int64_t>(lhs) * static_cast<int64_t>(rhs);
+    const uint64_t product = std::bit_cast<uint64_t>(signedProduct);
+
+    // The EE multiplier does not carry the low-word addition into HI.
+    // Its HI path also divides by 0xffffffff rather than shifting by 32,
+    // with one additional correction that exists only on packed lane zero.
+    uint64_t highNumerator =
+        product + (static_cast<uint64_t>(initialHi) << 32u);
+    const uint32_t rhsBits = std::bit_cast<uint32_t>(rhs);
+    if (applyLowerLaneCorrection &&
+        ((rhsBits & 0x7fffffffu) == 0u ||
+         (rhsBits & 0x7fffffffu) == 0x7fffffffu) &&
+        lhs != rhs)
+    {
+        highNumerator += 0x70000000u;
+    }
+
+    constexpr int64_t highDivisor = 0xffffffffll;
+    const int64_t signedNumerator =
+        std::bit_cast<int64_t>(highNumerator);
+    const uint32_t highResult = static_cast<uint32_t>(
+        signedNumerator / highDivisor);
+    const uint32_t lowResult =
+        initialLo + Ps2LowWord(product);
+    return (static_cast<uint64_t>(highResult) << 32u) | lowResult;
+}
+
+static inline __m128i Ps2Pmaddw(R5900Context *ctx, __m128i lhs, __m128i rhs)
+{
+    int32_t lhsWords[4];
+    int32_t rhsWords[4];
+    std::memcpy(lhsWords, &lhs, sizeof(lhs));
+    std::memcpy(rhsWords, &rhs, sizeof(rhs));
+
+    const uint64_t result0 = Ps2PmaddwLane(
+        Ps2LowWord(ctx->hi),
+        Ps2LowWord(ctx->lo),
+        lhsWords[0],
+        rhsWords[0],
+        true);
+    const uint64_t result1 = Ps2PmaddwLane(
+        Ps2LowWord(ctx->hi1),
+        Ps2LowWord(ctx->lo1),
+        lhsWords[2],
+        rhsWords[2],
+        false);
+
+    ctx->lo = Ps2SignExt32ToU64(Ps2LowWord(result0));
+    ctx->hi = Ps2SignExt32ToU64(Ps2HighWord(result0));
+    ctx->lo1 = Ps2SignExt32ToU64(Ps2LowWord(result1));
+    ctx->hi1 = Ps2SignExt32ToU64(Ps2HighWord(result1));
+    return Ps2MakeU64Vector(result0, result1);
+}
+
 // PLZCW: Count leading bits that match the sign bit, minus 1.
 // For positive values: count leading zeros minus 1 (excludes sign bit).
 // For negative values: count leading ones minus 1 (excludes sign bit).

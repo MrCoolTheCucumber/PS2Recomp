@@ -469,6 +469,34 @@ void register_code_generator_tests()
                  "PMULTW must not use unsigned multiplication or collapse product lanes");
     });
 
+    tc.Run("PMADDW emits a packed signed accumulator operation", [](TestCase &t) {
+        constexpr uint32_t rawPmaddw = 0x71f08809u;
+        const Instruction pmaddw = R5900Decoder{}.decodeInstruction(
+            0x00100000u, rawPmaddw);
+        const std::string generated =
+            CodeGenerator({}, {}).translateInstruction(pmaddw);
+
+        t.Equals(pmaddw.rs, static_cast<uint8_t>(15u),
+                 "PMADDW should decode rs from the literal encoding");
+        t.Equals(pmaddw.rt, static_cast<uint8_t>(16u),
+                 "PMADDW should decode rt from the literal encoding");
+        t.Equals(pmaddw.rd, static_cast<uint8_t>(17u),
+                 "PMADDW should decode rd from the literal encoding");
+        t.IsTrue(
+            generated.find(
+                "__m128i result = Ps2Pmaddw(ctx, GPR_VEC(ctx, 15), GPR_VEC(ctx, 16));") !=
+                std::string::npos,
+            "PMADDW should use the packed signed-accumulator helper");
+        t.IsTrue(
+            generated.find("SET_GPR_VEC(ctx, 17, result);") !=
+                std::string::npos,
+            "PMADDW should return both packed accumulator results");
+        t.IsTrue(
+            generated.find("_mm_mul_epu32") == std::string::npos &&
+                generated.find("Ps2HiLoToU64") == std::string::npos,
+            "PMADDW must not use unsigned products or collapse packed HI/LO state");
+    });
+
     tc.Run("constant MMIO store emits direct runtime store", [](TestCase &t) {
         Function func;
         func.name = "mmio_store";
