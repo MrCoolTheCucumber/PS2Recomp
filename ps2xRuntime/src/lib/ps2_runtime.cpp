@@ -1080,7 +1080,9 @@ PS2Runtime::PS2Runtime()
 
 PS2Runtime::PS2Runtime(PS2RuntimeConfiguration configuration)
     : m_vu0(VuUnitId::Vu0),
-      m_vu1(VuUnitId::Vu1)
+      m_vu1(VuUnitId::Vu1),
+      m_cpuContext(
+          R5900Context::InitializationProfile::PostBiosElf)
 {
     m_hostPresentationUploadState =
         std::make_unique<
@@ -1427,13 +1429,6 @@ PS2Runtime::PS2Runtime(PS2RuntimeConfiguration configuration)
     }
 #endif
 
-    std::memset(&m_cpuContext, 0, sizeof(m_cpuContext));
-
-    // R0 is always zero in MIPS
-    m_cpuContext.r[0] = _mm_set1_epi32(0);
-    // Recompiled ELFs enter after the console BIOS has enabled normal
-    // dual-issue, cache, non-blocking-load, and branch-prediction modes.
-    m_cpuContext.cop0_config = 0x00073443u;
     m_cop0Timing.reset();
     publishCop0TimingMirrors(&m_cpuContext);
 

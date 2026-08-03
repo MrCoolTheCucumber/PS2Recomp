@@ -135,6 +135,14 @@ struct PS2GuestFunctionSymbol
 // PS2 CPU context (R5900)
 struct alignas(16) R5900Context
 {
+    enum class InitializationProfile : uint8_t
+    {
+        Deterministic,
+        PostBiosElf,
+    };
+
+    static constexpr uint32_t kPostBiosElfStatus = 0x70020C11u;
+
     // General Purpose Registers (128-bit)
     __m128i r[32]; // Main registers
 
@@ -279,19 +287,36 @@ struct alignas(16) R5900Context
     }
 
     R5900Context()
+        : R5900Context(InitializationProfile::Deterministic)
+    {
+    }
+
+    explicit R5900Context(InitializationProfile profile)
     {
         std::memset(this, 0, sizeof(*this));
 
-        // Initialize VU0 registers
-        vu0_q = 1.0f; // Q register usually initialized to 1.0
+        // Q is architecturally indeterminate. Preserve the established
+        // deterministic synthetic-context value, while direct ELF launch
+        // uses the zero observed after the standard BIOS loader handoff.
+        vu0_q =
+            profile == InitializationProfile::Deterministic ?
+                1.0f :
+                0.0f;
         enforceVu0RegisterInvariants();
 
-        // Reset COP0 registers
-        cop0_random = 47; // Start at maximum value
-        // cop0_status = 0x400000; // BEV set, ERL clear, kernel mode
-        // 0x00400000 = BEV (Boot Exception Vectors).
-        // 0x00000000 = Normal mode (after BIOS handoff).
-        cop0_status = 0x00000000;
+        // Standalone contexts use the architectural Random reset value. The
+        // BIOS loader has already populated its wired TLB entries by direct
+        // ELF entry, where the standard handoff exposes Random as zero.
+        cop0_random =
+            profile == InitializationProfile::Deterministic ? 47u : 0u;
+        // Direct ELF execution starts after EELOAD has enabled COP0, COP1,
+        // and COP2, selected user mode, and enabled the ordinary INTC/DMAC
+        // interrupt masks. Synthetic contexts retain the legacy neutral
+        // Status value so focused instruction tests can select their mode.
+        cop0_status =
+            profile == InitializationProfile::PostBiosElf ?
+                kPostBiosElfStatus :
+                0u;
         cop0_prid = 0x00002e20; // CPU ID for R5900
         cop0_config = 0x00073443; // Normal post-BIOS EE configuration
 
