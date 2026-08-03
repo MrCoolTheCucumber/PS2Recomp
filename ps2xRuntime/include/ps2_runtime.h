@@ -29,6 +29,7 @@
 
 #include "ps2_log.h"
 #include "runtime/cop0_timing.h"
+#include "runtime/ee_cache.h"
 #include "runtime/ee_execution_backend.h"
 #include "runtime/ee_event_scheduler.h"
 #include "runtime/ee_runtime_executor.h"
@@ -1229,6 +1230,11 @@ public:
     void handleCop0Di(
         uint8_t *rdram,
         R5900Context *ctx);
+    void handleEeCacheOperation(
+        uint8_t *rdram,
+        R5900Context *ctx,
+        uint32_t operation,
+        uint32_t virtualAddress);
     void clearLLBit(R5900Context *ctx);
     void configureGuestHeap(uint32_t guestBase, uint32_t guestLimit = PS2_RAM_SIZE);
     uint32_t guestMalloc(uint32_t size, uint32_t alignment = 16u);
@@ -1841,6 +1847,7 @@ private:
     void resetEeTimingUnlocked(R5900Context *context) noexcept;
 
     PS2Memory m_memory;
+    EeCache m_eeCache;
     GifArbiter m_gifArbiter;
     GS m_gs;
     std::unique_ptr<HostPresentationUploadState>

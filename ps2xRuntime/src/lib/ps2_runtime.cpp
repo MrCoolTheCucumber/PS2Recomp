@@ -3882,6 +3882,41 @@ void PS2Runtime::handleCop0Di(
     deliverPendingCop0Exceptions(ctx);
 }
 
+void PS2Runtime::handleEeCacheOperation(
+    uint8_t *rdram,
+    R5900Context *ctx,
+    uint32_t operation,
+    uint32_t virtualAddress)
+{
+    (void)rdram;
+    if (!ctx)
+    {
+        return;
+    }
+    try
+    {
+        if (!m_eeCache.execute(
+                m_memory,
+                operation,
+                virtualAddress,
+                ctx->cop0_taglo,
+                ctx->cop0_taghi,
+                ctx->pc))
+        {
+            SignalException(
+                ctx,
+                EXCEPTION_RESERVED_INSTRUCTION);
+        }
+    }
+    catch (const PS2TlbMissException &fault)
+    {
+        SignalMemoryException(
+            ctx,
+            EXCEPTION_TLB_REFILL_LOAD,
+            fault.virtualAddress());
+    }
+}
+
 ps2x::timing::EeTick PS2Runtime::commitEeContextProgress(
     R5900Context *context) noexcept
 {
@@ -5334,6 +5369,7 @@ bool PS2Runtime::initialize(const char *title)
 {
     try
     {
+        m_eeCache.reset();
         if (!m_memory.initialize())
         {
             std::cerr << "Failed to initialize PS2 memory" << std::endl;

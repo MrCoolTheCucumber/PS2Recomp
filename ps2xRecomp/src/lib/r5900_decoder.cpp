@@ -178,6 +178,14 @@ namespace ps2recomp
             }
         }
 
+        if (inst.opcode == OPCODE_CACHE)
+        {
+            // CACHE can update diagnostic COP0 state, cache-backed data, or
+            // synchronously raise an exception for a reserved operation.
+            inst.modificationInfo.modifiesMemory = true;
+            inst.modificationInfo.modifiesControl = true;
+        }
+
         if (inst.opcode == OPCODE_COP2)
         {
             decodeCOP2(inst);

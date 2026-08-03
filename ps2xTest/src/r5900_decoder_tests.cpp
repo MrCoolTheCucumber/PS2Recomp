@@ -206,6 +206,24 @@ void register_r5900_decoder_tests()
         t.IsTrue(sc.modificationInfo.modifiesGPR, "sc writes success flag to rt");
     });
 
+    tc.Run("CACHE exposes memory and control side effects", [](TestCase &t) {
+        constexpr uint32_t raw =
+            (OPCODE_CACHE << 26u) |
+            (4u << 21u) |
+            (0x12u << 16u) |
+            0x0040u;
+
+        const Instruction inst =
+            R5900Decoder{}.decodeInstruction(0x9800u, raw);
+
+        t.IsTrue(
+            inst.modificationInfo.modifiesMemory,
+            "CACHE operations can write back diagnostic cache data");
+        t.IsTrue(
+            inst.modificationInfo.modifiesControl,
+            "CACHE operations can update COP0 tags or raise an exception");
+    });
+
     tc.Run("COP0 ERET is marked as return without delay slot", [](TestCase &t) {
         uint32_t address = 0xA000;
         uint32_t raw = (OPCODE_COP0 << 26) | (COP0_CO << 21) | COP0_CO_ERET;

@@ -46,6 +46,7 @@ add_library(ps2_test_lib STATIC
     src/boost_ee_fiber_tests.cpp
     src/code_generator_tests.cpp
     src/cop0_timing_tests.cpp
+    src/ee_cache_tests.cpp
     src/ee_counter_tests.cpp
     src/ee_execution_backend_tests.cpp
     src/ee_event_scheduler_tests.cpp

@@ -599,6 +599,7 @@ endfunction()
 add_library(ps2_runtime STATIC
     src/lib/boost_ee_fiber.cpp
     src/lib/cop0_timing.cpp
+    src/lib/ee_cache.cpp
     src/lib/ee_counters.cpp
     src/lib/ee_execution_backend.cpp
     src/lib/ee_event_scheduler.cpp

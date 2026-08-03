@@ -418,7 +418,12 @@ namespace ps2recomp
                                "{}; }}",
                                inst.rs, inst.simmediate, genRead(64, "aligned_addr"), inst.rt, genWrite(64, "aligned_addr", "new_data"));
         case OPCODE_CACHE:
-            return "// CACHE instruction (ignored)";
+            return fmt::format(
+                "runtime->handleEeCacheOperation(rdram, ctx, 0x{:02X}u, "
+                "ADD32(GPR_U32(ctx, {}), 0x{:08X}u));",
+                inst.rt,
+                inst.rs,
+                inst.simmediate);
         case OPCODE_PREF:
             return "// PREF instruction (ignored)";
         case OPCODE_LL:

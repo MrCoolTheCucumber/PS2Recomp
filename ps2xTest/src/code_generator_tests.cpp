@@ -1529,6 +1529,31 @@ void register_code_generator_tests()
                 "MTC0 register 25 should preserve the PCR selector bits");
         });
 
+        tc.Run("CACHE dispatches its operation and effective address", [](TestCase &t) {
+            constexpr uint32_t raw =
+                (OPCODE_CACHE << 26u) |
+                (5u << 21u) |
+                (0x12u << 16u) |
+                0xFFFCu;
+            const Instruction cache =
+                R5900Decoder{}.decodeInstruction(0x1000u, raw, false);
+            const std::string code =
+                CodeGenerator({}, {}).translateInstruction(cache);
+
+            printGeneratedCode(
+                "CACHE dispatches its operation and effective address",
+                code);
+            t.IsTrue(
+                code.find(
+                    "runtime->handleEeCacheOperation(rdram, ctx, 0x12u, "
+                    "ADD32(GPR_U32(ctx, 5), 0xFFFFFFFCu))") !=
+                    std::string::npos,
+                "CACHE should preserve op and use a wrapping base-plus-offset address");
+            t.IsFalse(
+                code.find("ignored") != std::string::npos,
+                "architecturally visible CACHE operations must not be discarded");
+        });
+
         tc.Run("FCR access uses CFC1/CTC1", [](TestCase &t) {
             CodeGenerator gen({}, {});
 
