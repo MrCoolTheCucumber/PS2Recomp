@@ -5,6 +5,7 @@
 void register_code_generator_tests();
 void register_boost_ee_fiber_tests();
 void register_cop0_context_tests();
+void register_cop0_entryhi_tests();
 void register_cop0_timing_tests();
 void register_ee_addi_zero_tests();
 void register_ee_address_mode_tests();
@@ -53,6 +54,7 @@ int main()
     register_code_generator_tests();
     register_boost_ee_fiber_tests();
     register_cop0_context_tests();
+    register_cop0_entryhi_tests();
     register_cop0_timing_tests();
     register_ee_addi_zero_tests();
     register_ee_address_mode_tests();

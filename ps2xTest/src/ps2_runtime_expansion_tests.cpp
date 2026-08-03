@@ -3827,7 +3827,7 @@ void register_ps2_runtime_expansion_tests()
                      (0xAB80000Fu & 0xFF800000u) | ((loadMissAddress >> 9u) & 0x007FFFF0u),
                      "TLB load refill should update Context.BadVPN2 and clear bits 3:0");
             t.Equals(loadMissCtx.cop0_entryhi,
-                     (loadMissAddress & 0xFFFFE000u) | (0x000005A5u & 0x00001FFFu),
+                     (loadMissAddress & 0xFFFFE000u) | (0x000005A5u & 0x000000FFu),
                      "TLB load refill should update EntryHi.VPN2 and preserve ASID");
             t.Equals(loadMissCtx.cop0_cause & COP0_CAUSE_EXCCODE_MASK,
                      (static_cast<uint32_t>(EXCEPTION_TLB_REFILL_LOAD) << 2) & COP0_CAUSE_EXCCODE_MASK,

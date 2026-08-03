@@ -107,7 +107,7 @@ namespace ps2recomp
                     "runtime->writeCop0Count(rdram, ctx, GPR_U32(ctx, {}));",
                     rt);
             case COP0_REG_ENTRYHI:
-                return fmt::format("ctx->cop0_entryhi = GPR_U32(ctx, {}) & 0xC00000FF;", rt);
+                return fmt::format("ctx->cop0_entryhi = GPR_U32(ctx, {}) & 0xFFFFE0FF;", rt);
             case COP0_REG_COMPARE:
                 return fmt::format(
                     "runtime->writeCop0Compare(rdram, ctx, GPR_U32(ctx, {}));",

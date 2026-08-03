@@ -6535,7 +6535,7 @@ void PS2Runtime::RequireCoprocessorUsable(
         ctx->cop0_context = (ctx->cop0_context & 0xFF800000u) |
                             ((badVAddr >> 9u) & 0x007FFFF0u);
         ctx->cop0_entryhi = (badVAddr & 0xFFFFE000u) |
-                            (ctx->cop0_entryhi & 0x00001FFFu);
+                            (ctx->cop0_entryhi & 0x000000FFu);
     }
 
     SignalException(ctx, exception);
