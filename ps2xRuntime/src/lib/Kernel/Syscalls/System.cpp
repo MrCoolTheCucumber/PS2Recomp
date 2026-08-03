@@ -895,7 +895,7 @@ namespace ps2_syscalls
         const uint32_t entryCount = static_cast<uint32_t>(memory.tlbEntryCount());
         for (uint32_t entryIndex = 0; entryIndex < entryCount; ++entryIndex)
         {
-            memory.tlbWrite(entryIndex, 0u, 0u, 0u, false);
+            memory.tlbWrite(entryIndex, EeTlbEntry{});
         }
 
         // Reset basic COP0 TLB bookkeeping to sane post-init values.

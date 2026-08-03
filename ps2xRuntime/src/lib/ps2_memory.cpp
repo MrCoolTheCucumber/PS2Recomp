@@ -2619,7 +2619,7 @@ bool PS2Memory::initialize(size_t ramSize)
         ps2SetScratchpadHostPtr(m_scratchpad);
 
         // Initialize EE TLB entries (R5900 has 48 entries).
-        m_tlbEntries.assign(48, TLBEntry{0, 0, 0, false});
+        m_tlbEntries.assign(48, EeTlbEntry{});
 
         // Allocate IOP RAM
         iop_ram = new uint8_t[PS2_IOP_RAM_SIZE];
@@ -2816,6 +2816,19 @@ uint32_t PS2Memory::translateAddress(
     uint32_t virtualAddress,
     EeAddressTranslationContext translation)
 {
+    return translateAddressImpl(
+               virtualAddress,
+               translation,
+               false)
+        .physicalAddress;
+}
+
+PS2Memory::EeTranslatedAddress
+PS2Memory::translateAddressImpl(
+    uint32_t virtualAddress,
+    EeAddressTranslationContext translation,
+    bool writeAccess)
+{
     if (!translation.permits(virtualAddress))
     {
         throw PS2AddressErrorException(virtualAddress);
@@ -2823,17 +2836,20 @@ uint32_t PS2Memory::translateAddress(
 
     if (isScratchpad(virtualAddress))
     {
-        return ps2ScratchpadOffset(virtualAddress);
+        return {
+            ps2ScratchpadOffset(virtualAddress),
+            true,
+        };
     }
 
     // EE TLB aliases of main RAM installed by the kernel.
     if (Ps2IsUncachedRamMirrorAddress(virtualAddress))
     {
-        return virtualAddress & PS2_RAM_MASK;
+        return {virtualAddress & PS2_RAM_MASK, false};
     }
     if (Ps2IsAcceleratedRamMirrorAddress(virtualAddress))
     {
-        return virtualAddress & PS2_RAM_MASK;
+        return {virtualAddress & PS2_RAM_MASK, false};
     }
 
     // Status.ERL makes ordinary kuseg uncached and unmapped. Keep this
@@ -2841,19 +2857,22 @@ uint32_t PS2Memory::translateAddress(
     // the TLB independently of the runtime's compatibility aliases above.
     if (translation.errorLevel && virtualAddress < 0x80000000u)
     {
-        return virtualAddress;
+        return {virtualAddress, false};
     }
 
     // KSEG0/KSEG1 direct-mapped window.
     if (Ps2IsKseg01Address(virtualAddress))
     {
-        return Ps2DirectMappedPhysicalAddress(virtualAddress);
+        return {
+            Ps2DirectMappedPhysicalAddress(virtualAddress),
+            false,
+        };
     }
 
     // In this runtime, low segments are treated as physical-style addresses already.
     if (virtualAddress < 0x80000000)
     {
-        return virtualAddress;
+        return {virtualAddress, false};
     }
 
     // KSEG2/KSEG3 are TLB mapped.
@@ -2861,70 +2880,184 @@ uint32_t PS2Memory::translateAddress(
     {
         for (const auto &entry : m_tlbEntries)
         {
-            if (entry.valid)
+            constexpr uint32_t entryHiVpnMask =
+                0xffffe000u;
+            constexpr uint32_t entryHiAsidMask =
+                0x000000ffu;
+            constexpr uint32_t entryLoScratchpad =
+                0x80000000u;
+            constexpr uint32_t entryLoPfnMask =
+                0x03ffffc0u;
+            constexpr uint32_t entryLoDirty = 0x4u;
+            constexpr uint32_t entryLoValid = 0x2u;
+            constexpr uint32_t entryLoGlobal = 0x1u;
+
+            const uint32_t pageMask =
+                entry.pageMask & 0x01ffe000u;
+            const bool scratchpad =
+                (entry.entryLo0 & entryLoScratchpad) != 0u;
+            const uint32_t pairOffsetMask =
+                scratchpad
+                    ? 0x00003fffu
+                    : pageMask | 0x00001fffu;
+            const uint32_t compareMask =
+                ~pairOffsetMask;
+            if ((virtualAddress & compareMask) !=
+                (entry.entryHi & entryHiVpnMask &
+                 compareMask))
             {
-                // PageMask uses bits [24:13]. Build an address-level mask (plus 4KB base page bits).
-                const uint32_t mask = entry.mask & 0x01FFE000u;
-                const uint32_t compareMask = ~(mask | 0xFFFu);
-                if ((virtualAddress & compareMask) == (entry.vpn & compareMask))
-                {
-                    // TLB hit
-                    const uint32_t pageOffsetMask = mask | 0xFFFu;
-                    const uint32_t physBase = entry.pfn << 12;
-                    return physBase | (virtualAddress & pageOffsetMask);
-                }
+                continue;
             }
+
+            const bool global =
+                (entry.entryLo0 & entryLoGlobal) != 0u;
+            if (!global &&
+                (entry.entryHi & entryHiAsidMask) !=
+                    translation.asid)
+            {
+                continue;
+            }
+
+            const uint32_t pageSize =
+                ((pageMask >> 13u) + 1u) << 12u;
+            const uint32_t entryLo =
+                scratchpad ||
+                        (virtualAddress & pageSize) == 0u
+                    ? entry.entryLo0
+                    : entry.entryLo1;
+            if ((entryLo & entryLoValid) == 0u)
+            {
+                throw PS2TlbInvalidException(
+                    virtualAddress);
+            }
+            if (writeAccess &&
+                (entryLo & entryLoDirty) == 0u)
+            {
+                throw PS2TlbModifiedException(
+                    virtualAddress);
+            }
+
+            if (scratchpad)
+            {
+                return {
+                    virtualAddress & 0x00003fffu,
+                    true,
+                };
+            }
+
+            const uint32_t pageOffsetMask =
+                pageSize - 1u;
+            const uint32_t pfnMask =
+                pageMask >> 13u;
+            const uint32_t pfn =
+                ((entryLo & entryLoPfnMask) >> 6u) &
+                ~pfnMask;
+            return {
+                (pfn << 12u) |
+                    (virtualAddress & pageOffsetMask),
+                false,
+            };
         }
         throw PS2TlbMissException(virtualAddress);
     }
 
-    return virtualAddress;
+    return {virtualAddress, false};
 }
 
-bool PS2Memory::tlbRead(uint32_t index, uint32_t &vpn, uint32_t &pfn, uint32_t &mask, bool &valid) const
+bool PS2Memory::tlbRead(
+    uint32_t index,
+    EeTlbEntry &entry) const
 {
     if (index >= m_tlbEntries.size())
     {
         return false;
     }
 
-    const TLBEntry &entry = m_tlbEntries[index];
-    vpn = entry.vpn;
-    pfn = entry.pfn;
-    mask = entry.mask;
-    valid = entry.valid;
+    entry = m_tlbEntries[index];
     return true;
 }
 
-bool PS2Memory::tlbWrite(uint32_t index, uint32_t vpn, uint32_t pfn, uint32_t mask, bool valid)
+bool PS2Memory::tlbWrite(
+    uint32_t index,
+    const EeTlbEntry &entry)
 {
     if (index >= m_tlbEntries.size())
     {
         return false;
     }
 
-    TLBEntry &entry = m_tlbEntries[index];
-    entry.vpn = vpn & 0xFFFFF000u;
-    entry.pfn = pfn & 0x000FFFFFu;
-    entry.mask = mask & 0x01FFE000u;
-    entry.valid = valid;
+    constexpr uint32_t pageMaskMask = 0x01ffe000u;
+    constexpr uint32_t entryHiMask = 0xffffe0ffu;
+    constexpr uint32_t entryLo0Mask = 0x83ffffffu;
+    constexpr uint32_t entryLo1Mask = 0x03ffffffu;
+    constexpr uint32_t entryLoCacheMask = 0x38u;
+    constexpr uint32_t entryLoUncached = 2u << 3u;
+    constexpr uint32_t entryLoGlobal = 0x1u;
+    constexpr uint32_t entryLoScratchpad = 0x80000000u;
+
+    EeTlbEntry normalized{};
+    normalized.pageMask =
+        entry.pageMask & pageMaskMask;
+    normalized.entryLo0 =
+        entry.entryLo0 & entryLo0Mask;
+    normalized.entryLo1 =
+        entry.entryLo1 & entryLo1Mask;
+
+    const bool global =
+        (normalized.entryLo0 &
+         normalized.entryLo1 &
+         entryLoGlobal) != 0u;
+    normalized.entryLo0 =
+        (normalized.entryLo0 & ~entryLoGlobal) |
+        (global ? entryLoGlobal : 0u);
+    normalized.entryLo1 =
+        (normalized.entryLo1 & ~entryLoGlobal) |
+        (global ? entryLoGlobal : 0u);
+
+    if ((normalized.entryLo0 &
+         entryLoScratchpad) != 0u)
+    {
+        normalized.pageMask = 0u;
+        normalized.entryLo0 =
+            (normalized.entryLo0 &
+             ~entryLoCacheMask) |
+            entryLoUncached;
+        normalized.entryLo1 =
+            (normalized.entryLo1 &
+             ~entryLoCacheMask) |
+            entryLoUncached;
+    }
+
+    normalized.entryHi =
+        (entry.entryHi & entryHiMask) &
+        ~normalized.pageMask;
+    m_tlbEntries[index] = normalized;
     return true;
 }
 
-int32_t PS2Memory::tlbProbe(uint32_t vpn) const
+int32_t PS2Memory::tlbProbe(uint32_t entryHi) const
 {
-    const uint32_t normalizedVpn = vpn & 0xFFFFF000u;
+    constexpr uint32_t entryHiVpnMask = 0xffffe000u;
+    constexpr uint32_t entryHiAsidMask = 0x000000ffu;
+    constexpr uint32_t entryLoGlobal = 0x1u;
+    const uint32_t probeVpn =
+        entryHi & entryHiVpnMask;
+    const uint32_t probeAsid =
+        entryHi & entryHiAsidMask;
     for (uint32_t i = 0; i < static_cast<uint32_t>(m_tlbEntries.size()); ++i)
     {
-        const TLBEntry &entry = m_tlbEntries[i];
-        if (!entry.valid)
-        {
-            continue;
-        }
-
-        const uint32_t mask = entry.mask & 0x01FFE000u;
-        const uint32_t compareMask = ~(mask | 0xFFFu);
-        if ((normalizedVpn & compareMask) == (entry.vpn & compareMask))
+        const EeTlbEntry &entry = m_tlbEntries[i];
+        const uint32_t pageMask =
+            entry.pageMask & 0x01ffe000u;
+        const uint32_t normalizedProbeVpn =
+            probeVpn & ~pageMask;
+        const bool global =
+            (entry.entryLo0 & entryLoGlobal) != 0u;
+        if (normalizedProbeVpn ==
+                (entry.entryHi & entryHiVpnMask) &&
+            (global ||
+             probeAsid ==
+                 (entry.entryHi & entryHiAsidMask)))
         {
             return static_cast<int32_t>(i);
         }
@@ -2937,8 +3070,10 @@ uint8_t PS2Memory::read8(
     uint32_t address,
     EeAddressTranslationContext translation)
 {
-    const bool scratch = isScratchpad(address);
-    uint32_t physAddr = translateAddress(address, translation);
+    const EeTranslatedAddress translated =
+        translateAddressImpl(address, translation, false);
+    const bool scratch = translated.scratchpad;
+    const uint32_t physAddr = translated.physicalAddress;
     checkEePhysicalBusError(physAddr);
 
     if (scratch)
@@ -2976,8 +3111,10 @@ uint16_t PS2Memory::read16(
         throw std::runtime_error("Unaligned 16-bit read at address: 0x" + std::to_string(address));
     }
 
-    const bool scratch = isScratchpad(address);
-    uint32_t physAddr = translateAddress(address, translation);
+    const EeTranslatedAddress translated =
+        translateAddressImpl(address, translation, false);
+    const bool scratch = translated.scratchpad;
+    const uint32_t physAddr = translated.physicalAddress;
     checkEePhysicalBusError(physAddr);
 
     if (scratch)
@@ -3030,8 +3167,10 @@ uint32_t PS2Memory::read32(
         return (uint32_t)(val >> (off * 8));
     }
 
-    const bool scratch = isScratchpad(address);
-    uint32_t physAddr = translateAddress(address, translation);
+    const EeTranslatedAddress translated =
+        translateAddressImpl(address, translation, false);
+    const bool scratch = translated.scratchpad;
+    const uint32_t physAddr = translated.physicalAddress;
     checkEePhysicalBusError(physAddr);
 
     if (scratch)
@@ -3076,8 +3215,10 @@ uint64_t PS2Memory::read64(
         return reg ? *reg : 0;
     }
 
-    const bool scratch = isScratchpad(address);
-    uint32_t physAddr = translateAddress(address, translation);
+    const EeTranslatedAddress translated =
+        translateAddressImpl(address, translation, false);
+    const bool scratch = translated.scratchpad;
+    const uint32_t physAddr = translated.physicalAddress;
     checkEePhysicalBusError(physAddr);
 
     if (scratch)
@@ -3129,8 +3270,10 @@ __m128i PS2Memory::read128(
         throw std::runtime_error("Unaligned 128-bit read at address: 0x" + std::to_string(address));
     }
 
-    const bool scratch = isScratchpad(address);
-    uint32_t physAddr = translateAddress(address, translation);
+    const EeTranslatedAddress translated =
+        translateAddressImpl(address, translation, false);
+    const bool scratch = translated.scratchpad;
+    const uint32_t physAddr = translated.physicalAddress;
     checkEePhysicalBusError(physAddr);
 
     if (physAddr == 0x10007000u)
@@ -3171,8 +3314,10 @@ void PS2Memory::write8(
     uint32_t writerPc,
     EeAddressTranslationContext translation)
 {
-    const bool scratch = isScratchpad(address);
-    uint32_t physAddr = translateAddress(address, translation);
+    const EeTranslatedAddress translated =
+        translateAddressImpl(address, translation, true);
+    const bool scratch = translated.scratchpad;
+    const uint32_t physAddr = translated.physicalAddress;
     checkEePhysicalBusError(physAddr);
 
     if (isGsPrivReg(physAddr))
@@ -3229,8 +3374,10 @@ void PS2Memory::write16(
         throw std::runtime_error("Unaligned 16-bit write at address: 0x" + std::to_string(address));
     }
 
-    const bool scratch = isScratchpad(address);
-    uint32_t physAddr = translateAddress(address, translation);
+    const EeTranslatedAddress translated =
+        translateAddressImpl(address, translation, true);
+    const bool scratch = translated.scratchpad;
+    const uint32_t physAddr = translated.physicalAddress;
     checkEePhysicalBusError(physAddr);
 
     if (isGsPrivReg(physAddr))
@@ -3305,8 +3452,10 @@ void PS2Memory::write32(
         return;
     }
 
-    const bool scratch = isScratchpad(address);
-    uint32_t physAddr = translateAddress(address, translation);
+    const EeTranslatedAddress translated =
+        translateAddressImpl(address, translation, true);
+    const bool scratch = translated.scratchpad;
+    const uint32_t physAddr = translated.physicalAddress;
     checkEePhysicalBusError(physAddr);
 
     if (scratch)
@@ -3364,8 +3513,10 @@ void PS2Memory::write64(
         return;
     }
 
-    const bool scratch = isScratchpad(address);
-    uint32_t physAddr = translateAddress(address, translation);
+    const EeTranslatedAddress translated =
+        translateAddressImpl(address, translation, true);
+    const bool scratch = translated.scratchpad;
+    const uint32_t physAddr = translated.physicalAddress;
     checkEePhysicalBusError(physAddr);
 
     if (scratch)
@@ -3447,8 +3598,10 @@ void PS2Memory::writeMasked32(
         return;
     }
 
-    const bool scratch = isScratchpad(address);
-    const uint32_t physAddr = translateAddress(address, translation);
+    const EeTranslatedAddress translated =
+        translateAddressImpl(address, translation, true);
+    const bool scratch = translated.scratchpad;
+    const uint32_t physAddr = translated.physicalAddress;
     checkEePhysicalBusError(physAddr);
     auto writeBytes = [&](uint8_t *destination)
     {
@@ -3541,8 +3694,10 @@ void PS2Memory::writeMasked64(
         return;
     }
 
-    const bool scratch = isScratchpad(address);
-    const uint32_t physAddr = translateAddress(address, translation);
+    const EeTranslatedAddress translated =
+        translateAddressImpl(address, translation, true);
+    const bool scratch = translated.scratchpad;
+    const uint32_t physAddr = translated.physicalAddress;
     checkEePhysicalBusError(physAddr);
     auto writeBytes = [&](uint8_t *destination)
     {
@@ -3619,8 +3774,10 @@ void PS2Memory::write128(
         throw std::runtime_error("Unaligned 128-bit write at address: 0x" + std::to_string(address));
     }
 
-    const bool scratch = isScratchpad(address);
-    uint32_t physAddr = translateAddress(address, translation);
+    const EeTranslatedAddress translated =
+        translateAddressImpl(address, translation, true);
+    const bool scratch = translated.scratchpad;
+    const uint32_t physAddr = translated.physicalAddress;
     checkEePhysicalBusError(physAddr);
 
     if (physAddr == 0x10007010u)

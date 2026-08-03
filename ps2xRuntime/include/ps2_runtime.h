@@ -1937,7 +1937,12 @@ private:
     [[noreturn]] void raiseCop0Level1Exception(
         R5900Context *ctx,
         uint32_t exceptionCode,
-        bool commitContextProgress = true);
+        bool commitContextProgress = true,
+        bool useTlbRefillVector = true);
+    [[noreturn]] void raiseTlbFault(
+        R5900Context *ctx,
+        const PS2TlbFaultException &fault,
+        bool storeAccess);
     [[noreturn]] void raiseCop0PerformanceException(
         R5900Context *ctx);
     [[noreturn]] void raiseCop0DebugException(

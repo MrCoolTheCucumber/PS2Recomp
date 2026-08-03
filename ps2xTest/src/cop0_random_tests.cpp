@@ -96,24 +96,22 @@ void register_cop0_random_tests()
                 (0x23456u << 6u) | 0x2u;
             runtime.handleTLBWR(rdram, &ctx);
 
-            uint32_t vpn = 0u;
-            uint32_t pfn = 0u;
-            uint32_t mask = 0u;
-            bool valid = false;
+            EeTlbEntry entry{};
             t.IsTrue(
                 runtime.memory().tlbRead(
-                    19u, vpn, pfn, mask, valid),
+                    19u, entry),
                 "the current Random slot should be readable");
             t.Equals(
-                vpn,
+                entry.entryHi & 0xffffe000u,
                 0x23456000u,
                 "repeated TLBWR effects should consume the same current Random value");
             t.Equals(
-                pfn,
+                (entry.entryLo0 >> 6u) &
+                    0x000fffffu,
                 0x23456u,
                 "TLBWR should write the payload to the current Random slot");
             t.IsTrue(
-                valid,
+                (entry.entryLo0 & 0x2u) != 0u,
                 "TLBWR should preserve the entry validity payload");
             t.Equals(
                 ctx.cop0_random,

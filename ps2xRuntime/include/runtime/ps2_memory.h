@@ -44,6 +44,7 @@ struct EeAddressTranslationContext
     EeAddressSpaceMode mode = EeAddressSpaceMode::Kernel;
     bool enforceOperatingMode = false;
     bool errorLevel = false;
+    uint8_t asid = 0u;
 
     static constexpr EeAddressTranslationContext unchecked() noexcept
     {
@@ -51,7 +52,8 @@ struct EeAddressTranslationContext
     }
 
     static constexpr EeAddressTranslationContext fromCop0Status(
-        uint32_t status) noexcept
+        uint32_t status,
+        uint8_t asid = 0u) noexcept
     {
         constexpr uint32_t kStatusExl = 0x00000002u;
         constexpr uint32_t kStatusErl = 0x00000004u;
@@ -67,19 +69,20 @@ struct EeAddressTranslationContext
                 EeAddressSpaceMode::Kernel,
                 true,
                 errorLevelActive,
+                asid,
             };
         }
 
         switch (status & kStatusKsuMask)
         {
         case 0u:
-            return {EeAddressSpaceMode::Kernel, true, false};
+            return {EeAddressSpaceMode::Kernel, true, false, asid};
         case kStatusKsuSupervisor:
-            return {EeAddressSpaceMode::Supervisor, true, false};
+            return {EeAddressSpaceMode::Supervisor, true, false, asid};
         case kStatusKsuUser:
-            return {EeAddressSpaceMode::User, true, false};
+            return {EeAddressSpaceMode::User, true, false, asid};
         default:
-            return {EeAddressSpaceMode::Reserved, true, false};
+            return {EeAddressSpaceMode::Reserved, true, false, asid};
         }
     }
 
@@ -123,17 +126,36 @@ private:
     uint32_t m_virtualAddress;
 };
 
-class PS2TlbMissException final : public std::exception
+enum class PS2TlbFaultKind : uint8_t
+{
+    Refill,
+    Invalid,
+    Modified,
+};
+
+class PS2TlbFaultException : public std::exception
 {
 public:
-    explicit PS2TlbMissException(uint32_t virtualAddress) noexcept
-        : m_virtualAddress(virtualAddress)
+    PS2TlbFaultException(
+        uint32_t virtualAddress,
+        PS2TlbFaultKind kind) noexcept
+        : m_virtualAddress(virtualAddress),
+          m_kind(kind)
     {
     }
 
     const char *what() const noexcept override
     {
-        return "EE TLB miss";
+        switch (m_kind)
+        {
+        case PS2TlbFaultKind::Refill:
+            return "EE TLB refill";
+        case PS2TlbFaultKind::Invalid:
+            return "EE TLB invalid";
+        case PS2TlbFaultKind::Modified:
+            return "EE TLB modified";
+        }
+        return "EE TLB fault";
     }
 
     uint32_t virtualAddress() const noexcept
@@ -141,8 +163,55 @@ public:
         return m_virtualAddress;
     }
 
+    PS2TlbFaultKind kind() const noexcept
+    {
+        return m_kind;
+    }
+
 private:
     uint32_t m_virtualAddress;
+    PS2TlbFaultKind m_kind;
+};
+
+class PS2TlbMissException final : public PS2TlbFaultException
+{
+public:
+    explicit PS2TlbMissException(uint32_t virtualAddress) noexcept
+        : PS2TlbFaultException(
+              virtualAddress,
+              PS2TlbFaultKind::Refill)
+    {
+    }
+};
+
+class PS2TlbInvalidException final : public PS2TlbFaultException
+{
+public:
+    explicit PS2TlbInvalidException(uint32_t virtualAddress) noexcept
+        : PS2TlbFaultException(
+              virtualAddress,
+              PS2TlbFaultKind::Invalid)
+    {
+    }
+};
+
+class PS2TlbModifiedException final : public PS2TlbFaultException
+{
+public:
+    explicit PS2TlbModifiedException(uint32_t virtualAddress) noexcept
+        : PS2TlbFaultException(
+              virtualAddress,
+              PS2TlbFaultKind::Modified)
+    {
+    }
+};
+
+struct EeTlbEntry
+{
+    uint32_t pageMask = 0u;
+    uint32_t entryHi = 0u;
+    uint32_t entryLo0 = 0u;
+    uint32_t entryLo1 = 0u;
 };
 
 class PS2BusErrorException final : public std::exception
@@ -1030,9 +1099,9 @@ public:
         uint32_t virtualAddress,
         EeAddressTranslationContext translation =
             EeAddressTranslationContext::unchecked());
-    bool tlbRead(uint32_t index, uint32_t &vpn, uint32_t &pfn, uint32_t &mask, bool &valid) const;
-    bool tlbWrite(uint32_t index, uint32_t vpn, uint32_t pfn, uint32_t mask, bool valid);
-    int32_t tlbProbe(uint32_t vpn) const;
+    bool tlbRead(uint32_t index, EeTlbEntry &entry) const;
+    bool tlbWrite(uint32_t index, const EeTlbEntry &entry);
+    int32_t tlbProbe(uint32_t entryHi) const;
     size_t tlbEntryCount() const { return m_tlbEntries.size(); }
 
     // Hardware register interface
@@ -1343,16 +1412,18 @@ public:
     VIFRegisters vif1_regs;
     DMARegisters dma_regs[10]; // 10 DMA channels
 
-    // TLB entries
-    struct TLBEntry
+    struct EeTranslatedAddress
     {
-        uint32_t vpn;
-        uint32_t pfn;
-        uint32_t mask;
-        bool valid;
+        uint32_t physicalAddress = 0u;
+        bool scratchpad = false;
     };
 
-    std::vector<TLBEntry> m_tlbEntries;
+    EeTranslatedAddress translateAddressImpl(
+        uint32_t virtualAddress,
+        EeAddressTranslationContext translation,
+        bool writeAccess);
+
+    std::vector<EeTlbEntry> m_tlbEntries;
 
     GifPacketCallback m_gifPacketCallback;
     GifArbiter *m_gifArbiter = nullptr;

@@ -307,7 +307,9 @@ namespace
     {
         return ctx
                    ? EeAddressTranslationContext::fromCop0Status(
-                         ctx->cop0_status)
+                         ctx->cop0_status,
+                         static_cast<uint8_t>(
+                             ctx->cop0_entryhi))
                    : EeAddressTranslationContext::unchecked();
     }
 
@@ -714,13 +716,15 @@ namespace
 
     uint32_t selectExceptionVector(const R5900Context *ctx,
                                    uint32_t exceptionCode,
-                                   bool alreadyInException)
+                                   bool alreadyInException,
+                                   bool useTlbRefillVector)
     {
         uint32_t offset = EXCEPTION_VECTOR_COMMON_OFFSET;
         if (!alreadyInException)
         {
-            if (exceptionCode == EXCEPTION_TLB_REFILL_LOAD ||
-                exceptionCode == EXCEPTION_TLB_REFILL_STORE)
+            if (useTlbRefillVector &&
+                (exceptionCode == EXCEPTION_TLB_REFILL_LOAD ||
+                 exceptionCode == EXCEPTION_TLB_REFILL_STORE))
             {
                 offset = 0u;
             }
@@ -3983,12 +3987,9 @@ void PS2Runtime::handleEeCacheOperation(
             EXCEPTION_ADDRESS_ERROR_LOAD,
             fault.virtualAddress());
     }
-    catch (const PS2TlbMissException &fault)
+    catch (const PS2TlbFaultException &fault)
     {
-        SignalMemoryException(
-            ctx,
-            EXCEPTION_TLB_REFILL_LOAD,
-            fault.virtualAddress());
+        raiseTlbFault(ctx, fault, false);
     }
     catch (const PS2BusErrorException &fault)
     {
@@ -6438,7 +6439,8 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
 [[noreturn]] void PS2Runtime::raiseCop0Level1Exception(
     R5900Context *ctx,
     uint32_t exceptionCode,
-    bool commitContextProgress)
+    bool commitContextProgress,
+    bool useTlbRefillVector)
 {
     if (!ctx)
     {
@@ -6502,7 +6504,8 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
     ctx->cop0_status |= COP0_STATUS_EXL;
     ctx->pc = selectExceptionVector(
         ctx, exceptionCode,
-        alreadyInException);
+        alreadyInException,
+        useTlbRefillVector);
     ctx->in_delay_slot = false;
     refreshCop0EventSchedules(ctx, cycle);
     throw PS2GuestException{};
@@ -6686,6 +6689,36 @@ void PS2Runtime::RequireCoprocessorUsable(
     SignalException(ctx, exception);
 }
 
+[[noreturn]] void PS2Runtime::raiseTlbFault(
+    R5900Context *ctx,
+    const PS2TlbFaultException &fault,
+    bool storeAccess)
+{
+    const uint32_t badVAddr = fault.virtualAddress();
+    ctx->cop0_badvaddr = badVAddr;
+    ctx->cop0_context =
+        (ctx->cop0_context & 0xff800000u) |
+        ((badVAddr >> 9u) & 0x007ffff0u);
+    ctx->cop0_entryhi =
+        (badVAddr & 0xffffe000u) |
+        (ctx->cop0_entryhi & 0x000000ffu);
+
+    uint32_t exceptionCode =
+        storeAccess
+            ? EXCEPTION_TLB_REFILL_STORE
+            : EXCEPTION_TLB_REFILL_LOAD;
+    if (fault.kind() == PS2TlbFaultKind::Modified)
+    {
+        exceptionCode = EXCEPTION_TLB_MODIFIED;
+    }
+
+    raiseCop0Level1Exception(
+        ctx,
+        exceptionCode,
+        true,
+        fault.kind() == PS2TlbFaultKind::Refill);
+}
+
 void PS2Runtime::ValidateInstructionFetch(
     R5900Context *ctx,
     uint32_t virtualAddress)
@@ -6721,13 +6754,10 @@ void PS2Runtime::ValidateInstructionFetch(
             EXCEPTION_ADDRESS_ERROR_LOAD,
             fault.virtualAddress());
     }
-    catch (const PS2TlbMissException &fault)
+    catch (const PS2TlbFaultException &fault)
     {
         ctx->pc = fault.virtualAddress();
-        SignalMemoryException(
-            ctx,
-            EXCEPTION_TLB_REFILL_LOAD,
-            fault.virtualAddress());
+        raiseTlbFault(ctx, fault, false);
     }
 }
 
@@ -8177,36 +8207,33 @@ void PS2Runtime::handleTrap(uint8_t *rdram, R5900Context *ctx)
 
 void PS2Runtime::handleTLBR(uint8_t *rdram, R5900Context *ctx)
 {
-    uint32_t vpn = 0;
-    uint32_t pfn = 0;
-    uint32_t mask = 0;
-    bool valid = false;
+    EeTlbEntry entry{};
 
     const uint32_t index = ctx->cop0_index & 0x3Fu;
-    if (!m_memory.tlbRead(index, vpn, pfn, mask, valid))
+    if (!m_memory.tlbRead(index, entry))
     {
         raiseCop0Level1Exception(
             ctx, EXCEPTION_RESERVED_INSTRUCTION);
         return;
     }
 
-    // Preserve low ASID bits in EntryHi.
-    ctx->cop0_entryhi = (ctx->cop0_entryhi & 0x00000FFFu) | (vpn & 0xFFFFF000u);
-    ctx->cop0_entrylo0 = (ctx->cop0_entrylo0 & ~0x03FFFFC2u) |
-                         ((pfn & 0x000FFFFFu) << 6) |
-                         (valid ? 0x2u : 0u);
-    ctx->cop0_pagemask = mask & 0x01FFE000u;
+    ctx->cop0_pagemask = entry.pageMask;
+    ctx->cop0_entryhi = entry.entryHi;
+    ctx->cop0_entrylo0 = entry.entryLo0;
+    ctx->cop0_entrylo1 = entry.entryLo1;
 }
 
 void PS2Runtime::handleTLBWI(uint8_t *rdram, R5900Context *ctx)
 {
     const uint32_t index = ctx->cop0_index & 0x3Fu;
-    const uint32_t vpn = ctx->cop0_entryhi & 0xFFFFF000u;
-    const uint32_t pfn = (ctx->cop0_entrylo0 >> 6) & 0x000FFFFFu;
-    const uint32_t mask = ctx->cop0_pagemask & 0x01FFE000u;
-    const bool valid = (ctx->cop0_entrylo0 & 0x2u) != 0u;
+    const EeTlbEntry entry{
+        ctx->cop0_pagemask,
+        ctx->cop0_entryhi,
+        ctx->cop0_entrylo0,
+        ctx->cop0_entrylo1,
+    };
 
-    if (!m_memory.tlbWrite(index, vpn, pfn, mask, valid))
+    if (!m_memory.tlbWrite(index, entry))
     {
         raiseCop0Level1Exception(
             ctx, EXCEPTION_RESERVED_INSTRUCTION);
@@ -8230,12 +8257,14 @@ void PS2Runtime::handleTLBWR(uint8_t *rdram, R5900Context *ctx)
         random = wired;
     }
 
-    const uint32_t vpn = ctx->cop0_entryhi & 0xFFFFF000u;
-    const uint32_t pfn = (ctx->cop0_entrylo0 >> 6) & 0x000FFFFFu;
-    const uint32_t mask = ctx->cop0_pagemask & 0x01FFE000u;
-    const bool valid = (ctx->cop0_entrylo0 & 0x2u) != 0u;
+    const EeTlbEntry entry{
+        ctx->cop0_pagemask,
+        ctx->cop0_entryhi,
+        ctx->cop0_entrylo0,
+        ctx->cop0_entrylo1,
+    };
 
-    if (!m_memory.tlbWrite(random, vpn, pfn, mask, valid))
+    if (!m_memory.tlbWrite(random, entry))
     {
         raiseCop0Level1Exception(
             ctx, EXCEPTION_RESERVED_INSTRUCTION);
@@ -8250,7 +8279,8 @@ void PS2Runtime::handleTLBWR(uint8_t *rdram, R5900Context *ctx)
 
 void PS2Runtime::handleTLBP(uint8_t *rdram, R5900Context *ctx)
 {
-    const int32_t index = m_memory.tlbProbe(ctx->cop0_entryhi & 0xFFFFF000u);
+    const int32_t index =
+        m_memory.tlbProbe(ctx->cop0_entryhi);
     if (index >= 0)
     {
         ctx->cop0_index = (ctx->cop0_index & ~0x8000003Fu) |
@@ -11692,9 +11722,9 @@ uint8_t PS2Runtime::Load8(uint8_t *rdram, R5900Context *ctx, uint32_t vaddr)
             EXCEPTION_ADDRESS_ERROR_LOAD,
             fault.virtualAddress());
     }
-    catch (const PS2TlbMissException &fault)
+    catch (const PS2TlbFaultException &fault)
     {
-        SignalMemoryException(ctx, EXCEPTION_TLB_REFILL_LOAD, fault.virtualAddress());
+        raiseTlbFault(ctx, fault, false);
     }
     catch (const PS2BusErrorException &fault)
     {
@@ -11723,9 +11753,9 @@ uint16_t PS2Runtime::Load16(uint8_t *rdram, R5900Context *ctx, uint32_t vaddr)
             EXCEPTION_ADDRESS_ERROR_LOAD,
             fault.virtualAddress());
     }
-    catch (const PS2TlbMissException &fault)
+    catch (const PS2TlbFaultException &fault)
     {
-        SignalMemoryException(ctx, EXCEPTION_TLB_REFILL_LOAD, fault.virtualAddress());
+        raiseTlbFault(ctx, fault, false);
     }
     catch (const PS2BusErrorException &fault)
     {
@@ -11754,9 +11784,9 @@ uint32_t PS2Runtime::Load32(uint8_t *rdram, R5900Context *ctx, uint32_t vaddr)
             EXCEPTION_ADDRESS_ERROR_LOAD,
             fault.virtualAddress());
     }
-    catch (const PS2TlbMissException &fault)
+    catch (const PS2TlbFaultException &fault)
     {
-        SignalMemoryException(ctx, EXCEPTION_TLB_REFILL_LOAD, fault.virtualAddress());
+        raiseTlbFault(ctx, fault, false);
     }
     catch (const PS2BusErrorException &fault)
     {
@@ -11785,9 +11815,9 @@ uint64_t PS2Runtime::Load64(uint8_t *rdram, R5900Context *ctx, uint32_t vaddr)
             EXCEPTION_ADDRESS_ERROR_LOAD,
             fault.virtualAddress());
     }
-    catch (const PS2TlbMissException &fault)
+    catch (const PS2TlbFaultException &fault)
     {
-        SignalMemoryException(ctx, EXCEPTION_TLB_REFILL_LOAD, fault.virtualAddress());
+        raiseTlbFault(ctx, fault, false);
     }
     catch (const PS2BusErrorException &fault)
     {
@@ -11816,9 +11846,9 @@ __m128i PS2Runtime::Load128(uint8_t *rdram, R5900Context *ctx, uint32_t vaddr)
             EXCEPTION_ADDRESS_ERROR_LOAD,
             fault.virtualAddress());
     }
-    catch (const PS2TlbMissException &fault)
+    catch (const PS2TlbFaultException &fault)
     {
-        SignalMemoryException(ctx, EXCEPTION_TLB_REFILL_LOAD, fault.virtualAddress());
+        raiseTlbFault(ctx, fault, false);
     }
     catch (const PS2BusErrorException &fault)
     {
@@ -11852,9 +11882,9 @@ void PS2Runtime::Store8(uint8_t *rdram, R5900Context *ctx, uint32_t vaddr, uint8
             EXCEPTION_ADDRESS_ERROR_STORE,
             fault.virtualAddress());
     }
-    catch (const PS2TlbMissException &fault)
+    catch (const PS2TlbFaultException &fault)
     {
-        SignalMemoryException(ctx, EXCEPTION_TLB_REFILL_STORE, fault.virtualAddress());
+        raiseTlbFault(ctx, fault, true);
     }
     catch (const PS2BusErrorException &fault)
     {
@@ -11888,9 +11918,9 @@ void PS2Runtime::Store16(uint8_t *rdram, R5900Context *ctx, uint32_t vaddr, uint
             EXCEPTION_ADDRESS_ERROR_STORE,
             fault.virtualAddress());
     }
-    catch (const PS2TlbMissException &fault)
+    catch (const PS2TlbFaultException &fault)
     {
-        SignalMemoryException(ctx, EXCEPTION_TLB_REFILL_STORE, fault.virtualAddress());
+        raiseTlbFault(ctx, fault, true);
     }
     catch (const PS2BusErrorException &fault)
     {
@@ -11924,9 +11954,9 @@ void PS2Runtime::Store32(uint8_t *rdram, R5900Context *ctx, uint32_t vaddr, uint
             EXCEPTION_ADDRESS_ERROR_STORE,
             fault.virtualAddress());
     }
-    catch (const PS2TlbMissException &fault)
+    catch (const PS2TlbFaultException &fault)
     {
-        SignalMemoryException(ctx, EXCEPTION_TLB_REFILL_STORE, fault.virtualAddress());
+        raiseTlbFault(ctx, fault, true);
     }
     catch (const PS2BusErrorException &fault)
     {
@@ -11960,9 +11990,9 @@ void PS2Runtime::Store64(uint8_t *rdram, R5900Context *ctx, uint32_t vaddr, uint
             EXCEPTION_ADDRESS_ERROR_STORE,
             fault.virtualAddress());
     }
-    catch (const PS2TlbMissException &fault)
+    catch (const PS2TlbFaultException &fault)
     {
-        SignalMemoryException(ctx, EXCEPTION_TLB_REFILL_STORE, fault.virtualAddress());
+        raiseTlbFault(ctx, fault, true);
     }
     catch (const PS2BusErrorException &fault)
     {
@@ -12029,12 +12059,9 @@ void PS2Runtime::StoreMasked32(
             EXCEPTION_ADDRESS_ERROR_STORE,
             fault.virtualAddress());
     }
-    catch (const PS2TlbMissException &fault)
+    catch (const PS2TlbFaultException &fault)
     {
-        SignalMemoryException(
-            ctx,
-            EXCEPTION_TLB_REFILL_STORE,
-            fault.virtualAddress());
+        raiseTlbFault(ctx, fault, true);
     }
     catch (const PS2BusErrorException &fault)
     {
@@ -12107,12 +12134,9 @@ void PS2Runtime::StoreMasked64(
             EXCEPTION_ADDRESS_ERROR_STORE,
             fault.virtualAddress());
     }
-    catch (const PS2TlbMissException &fault)
+    catch (const PS2TlbFaultException &fault)
     {
-        SignalMemoryException(
-            ctx,
-            EXCEPTION_TLB_REFILL_STORE,
-            fault.virtualAddress());
+        raiseTlbFault(ctx, fault, true);
     }
     catch (const PS2BusErrorException &fault)
     {
@@ -12154,9 +12178,9 @@ void PS2Runtime::Store128(uint8_t *rdram, R5900Context *ctx, uint32_t vaddr, __m
             EXCEPTION_ADDRESS_ERROR_STORE,
             fault.virtualAddress());
     }
-    catch (const PS2TlbMissException &fault)
+    catch (const PS2TlbFaultException &fault)
     {
-        SignalMemoryException(ctx, EXCEPTION_TLB_REFILL_STORE, fault.virtualAddress());
+        raiseTlbFault(ctx, fault, true);
     }
     catch (const PS2BusErrorException &fault)
     {
