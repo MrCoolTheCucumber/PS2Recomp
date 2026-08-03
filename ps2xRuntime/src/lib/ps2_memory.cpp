@@ -100,6 +100,14 @@ namespace
         return Ps2AddressInRange(addr, PS2_IO_BASE, PS2_IO_SIZE);
     }
 
+    inline void checkEePhysicalBusError(uint32_t physicalAddress)
+    {
+        if (Ps2IsEeBusErrorPhysicalAddress(physicalAddress))
+        {
+            throw PS2BusErrorException(physicalAddress);
+        }
+    }
+
     inline uint64_t *gsRegPtr(GSRegisters &gs, uint32_t addr)
     {
         // Support both 64-bit base offsets and +4 dword aliases.
@@ -2914,6 +2922,7 @@ uint8_t PS2Memory::read8(uint32_t address)
 {
     const bool scratch = isScratchpad(address);
     uint32_t physAddr = translateAddress(address);
+    checkEePhysicalBusError(physAddr);
 
     if (scratch)
     {
@@ -2950,6 +2959,7 @@ uint16_t PS2Memory::read16(uint32_t address)
 
     const bool scratch = isScratchpad(address);
     uint32_t physAddr = translateAddress(address);
+    checkEePhysicalBusError(physAddr);
 
     if (scratch)
     {
@@ -3001,6 +3011,7 @@ uint32_t PS2Memory::read32(uint32_t address)
 
     const bool scratch = isScratchpad(address);
     uint32_t physAddr = translateAddress(address);
+    checkEePhysicalBusError(physAddr);
 
     if (scratch)
     {
@@ -3044,6 +3055,7 @@ uint64_t PS2Memory::read64(uint32_t address)
 
     const bool scratch = isScratchpad(address);
     uint32_t physAddr = translateAddress(address);
+    checkEePhysicalBusError(physAddr);
 
     if (scratch)
     {
@@ -3093,6 +3105,7 @@ __m128i PS2Memory::read128(uint32_t address)
 
     const bool scratch = isScratchpad(address);
     uint32_t physAddr = translateAddress(address);
+    checkEePhysicalBusError(physAddr);
 
     if (physAddr == 0x10007000u)
     {
@@ -3130,6 +3143,7 @@ void PS2Memory::write8(uint32_t address, uint8_t value, uint32_t writerPc)
 {
     const bool scratch = isScratchpad(address);
     uint32_t physAddr = translateAddress(address);
+    checkEePhysicalBusError(physAddr);
 
     if (isGsPrivReg(physAddr))
     {
@@ -3183,6 +3197,7 @@ void PS2Memory::write16(uint32_t address, uint16_t value, uint32_t writerPc)
 
     const bool scratch = isScratchpad(address);
     uint32_t physAddr = translateAddress(address);
+    checkEePhysicalBusError(physAddr);
 
     if (isGsPrivReg(physAddr))
     {
@@ -3254,6 +3269,7 @@ void PS2Memory::write32(uint32_t address, uint32_t value, uint32_t writerPc)
 
     const bool scratch = isScratchpad(address);
     uint32_t physAddr = translateAddress(address);
+    checkEePhysicalBusError(physAddr);
 
     if (scratch)
     {
@@ -3308,6 +3324,7 @@ void PS2Memory::write64(uint32_t address, uint64_t value, uint32_t writerPc)
 
     const bool scratch = isScratchpad(address);
     uint32_t physAddr = translateAddress(address);
+    checkEePhysicalBusError(physAddr);
 
     if (scratch)
     {
@@ -3385,6 +3402,7 @@ void PS2Memory::writeMasked32(
 
     const bool scratch = isScratchpad(address);
     const uint32_t physAddr = translateAddress(address);
+    checkEePhysicalBusError(physAddr);
     auto writeBytes = [&](uint8_t *destination)
     {
         for (uint32_t index = span.offset;
@@ -3477,6 +3495,7 @@ void PS2Memory::writeMasked64(
 
     const bool scratch = isScratchpad(address);
     const uint32_t physAddr = translateAddress(address);
+    checkEePhysicalBusError(physAddr);
     auto writeBytes = [&](uint8_t *destination)
     {
         for (uint32_t index = span.offset;
@@ -3550,6 +3569,7 @@ void PS2Memory::write128(uint32_t address, __m128i value, uint32_t writerPc)
 
     const bool scratch = isScratchpad(address);
     uint32_t physAddr = translateAddress(address);
+    checkEePhysicalBusError(physAddr);
 
     if (physAddr == 0x10007010u)
     {

@@ -53,6 +53,28 @@ private:
     uint32_t m_virtualAddress;
 };
 
+class PS2BusErrorException final : public std::exception
+{
+public:
+    explicit PS2BusErrorException(uint32_t physicalAddress) noexcept
+        : m_physicalAddress(physicalAddress)
+    {
+    }
+
+    const char *what() const noexcept override
+    {
+        return "EE physical bus error";
+    }
+
+    uint32_t physicalAddress() const noexcept
+    {
+        return m_physicalAddress;
+    }
+
+private:
+    uint32_t m_physicalAddress;
+};
+
 constexpr uint32_t PS2_RAM_SIZE = 32u * 1024u * 1024u; // 32MB
 constexpr uint32_t PS2_RAM_MASK = PS2_RAM_SIZE - 1u;   // Mask for 32MB alignment
 constexpr uint32_t PS2_RAM_BASE = 0x00000000;          // Physical base of RDRAM
@@ -84,6 +106,21 @@ constexpr uint32_t PS2_GS_BASE = 0x12000000;
 constexpr uint32_t PS2_GS_PRIV_REG_BASE = PS2_GS_BASE; // GS Privileged Registers
 constexpr uint32_t PS2_GS_PRIV_REG_SIZE = 0x2000;
 constexpr size_t PS2_GS_VRAM_SIZE = 4u * 1024u * 1024u; // 4MB GS VRAM
+
+// These regions are explicitly marked as BUSERR by the EE memory map. Callers
+// must resolve virtual aliases first: PS2Recomp's configured RDRAM mirrors
+// overlap the nominal 0x20000000 physical range but translate back to RDRAM.
+inline constexpr bool Ps2IsEeBusErrorPhysicalAddress(
+    uint32_t physicalAddress) noexcept
+{
+    return (physicalAddress >= 0x11010000u &&
+            physicalAddress < 0x12000000u) ||
+           (physicalAddress >= 0x12010000u &&
+            physicalAddress < 0x14000000u) ||
+           (physicalAddress >= 0x20000000u &&
+            physicalAddress < 0x40000000u) ||
+           physicalAddress >= 0x80000000u;
+}
 
 // EE left/right stores select one contiguous span of little-endian byte lanes.
 // A zero byte enable is a valid no-op; non-contiguous enables are rejected.

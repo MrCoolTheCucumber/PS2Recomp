@@ -495,15 +495,16 @@ void register_ps2_memory_tests()
             PS2Runtime *runtime = &runtimeStorage;
             uint8_t *rdram = runtime->memory().getRDRAM();
             R5900Context loadContext{};
+            loadContext.cop0_status = 0x00001000u; // Status.BEM
             R5900Context *ctx = &loadContext;
 
             const uint32_t baseValue = 0x11223344u;
             std::memcpy(rdram, &baseValue, sizeof(baseValue));
 
             t.Equals(READ32(0x22000000u), 0u,
-                     "address beyond the uncached mirror should use the checked path");
+                     "masked bus-error address should use the checked path");
             t.Equals(READ32(0x30000000u), 0u,
-                     "unmapped accelerated address should not wrap to RDRAM");
+                     "masked accelerated bus-error address should not wrap to RDRAM");
             WRITE32(0x22000000u, 0xAABBCCDDu);
 
             uint32_t unchangedValue = 0u;

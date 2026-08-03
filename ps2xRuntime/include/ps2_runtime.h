@@ -96,11 +96,20 @@ enum PS2Exception
     EXCEPTION_TLB_REFILL_STORE = 0x03,
     EXCEPTION_ADDRESS_ERROR_LOAD = 0x04,  // Address error on load
     EXCEPTION_ADDRESS_ERROR_STORE = 0x05, // Address error on store
+    EXCEPTION_BUS_ERROR_INSTRUCTION = 0x06,
+    EXCEPTION_BUS_ERROR_DATA = 0x07,
     EXCEPTION_SYSCALL = 0x08,             // SYSCALL instruction
     EXCEPTION_BREAKPOINT = 0x09,          // BREAK instruction
     EXCEPTION_RESERVED_INSTRUCTION = 0x0A,
     EXCEPTION_INTEGER_OVERFLOW = 0x0C, // From MIPS spec
     EXCEPTION_TRAP = 0x0D,             // Trap instruction condition met
+};
+
+enum class PS2BusErrorAccess : uint8_t
+{
+    InstructionFetch,
+    DataLoad,
+    DataStore,
 };
 
 // Internal control-flow signal used to leave generated guest code immediately
@@ -1161,6 +1170,9 @@ public:
     [[noreturn]] void SignalMemoryException(R5900Context *ctx,
                                             PS2Exception exception,
                                             uint32_t badVAddr);
+    void SignalBusError(R5900Context *ctx,
+                        PS2BusErrorAccess access,
+                        uint32_t physicalAddress);
 
     void executeVU0Microprogram(uint8_t *rdram, R5900Context *ctx, uint32_t address);
     void vu0StartMicroProgram(uint8_t *rdram, R5900Context *ctx, uint32_t address);

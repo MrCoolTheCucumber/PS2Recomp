@@ -229,6 +229,7 @@ namespace
     constexpr uint32_t COP0_STATUS_IE = 0x00000001u;
     constexpr uint32_t COP0_STATUS_EXL = 0x00000002u;
     constexpr uint32_t COP0_STATUS_ERL = 0x00000004u;
+    constexpr uint32_t COP0_STATUS_BEM = 0x00001000u;
     constexpr uint32_t COP0_STATUS_IM7 = 0x00008000u;
     constexpr uint32_t COP0_STATUS_EIE = 0x00010000u;
     constexpr uint32_t COP0_STATUS_BEV = 0x00400000u;
@@ -3914,6 +3915,13 @@ void PS2Runtime::handleEeCacheOperation(
             EXCEPTION_TLB_REFILL_LOAD,
             fault.virtualAddress());
     }
+    catch (const PS2BusErrorException &fault)
+    {
+        SignalBusError(
+            ctx,
+            PS2BusErrorAccess::DataLoad,
+            fault.physicalAddress());
+    }
 }
 
 ps2x::timing::EeTick PS2Runtime::commitEeContextProgress(
@@ -6480,6 +6488,34 @@ PS2Runtime::raiseCop0PerformanceException(
     }
 
     SignalException(ctx, exception);
+}
+
+void PS2Runtime::SignalBusError(R5900Context *ctx,
+                                PS2BusErrorAccess access,
+                                uint32_t physicalAddress)
+{
+    if (!ctx)
+    {
+        throw PS2GuestException{};
+    }
+
+    // Bus errors cannot recursively enter either exception level. BEM also
+    // suppresses both BadPAddr capture and delivery until software clears it.
+    if ((ctx->cop0_status &
+         (COP0_STATUS_BEM |
+          COP0_STATUS_EXL |
+          COP0_STATUS_ERL)) != 0u)
+    {
+        return;
+    }
+
+    ctx->cop0_badpaddr = physicalAddress & ~0xFu;
+    ctx->cop0_status |= COP0_STATUS_BEM;
+    raiseCop0Level1Exception(
+        ctx,
+        access == PS2BusErrorAccess::InstructionFetch
+            ? EXCEPTION_BUS_ERROR_INSTRUCTION
+            : EXCEPTION_BUS_ERROR_DATA);
 }
 
 void PS2Runtime::debugArmVu0Traces(const R5900Context *ctx)
@@ -11082,6 +11118,11 @@ uint8_t PS2Runtime::Load8(uint8_t *rdram, R5900Context *ctx, uint32_t vaddr)
     {
         SignalMemoryException(ctx, EXCEPTION_TLB_REFILL_LOAD, fault.virtualAddress());
     }
+    catch (const PS2BusErrorException &fault)
+    {
+        SignalBusError(ctx, PS2BusErrorAccess::DataLoad, fault.physicalAddress());
+        return 0u;
+    }
     catch (const std::exception &)
     {
         SignalMemoryException(ctx, EXCEPTION_ADDRESS_ERROR_LOAD, vaddr);
@@ -11099,6 +11140,11 @@ uint16_t PS2Runtime::Load16(uint8_t *rdram, R5900Context *ctx, uint32_t vaddr)
     catch (const PS2TlbMissException &fault)
     {
         SignalMemoryException(ctx, EXCEPTION_TLB_REFILL_LOAD, fault.virtualAddress());
+    }
+    catch (const PS2BusErrorException &fault)
+    {
+        SignalBusError(ctx, PS2BusErrorAccess::DataLoad, fault.physicalAddress());
+        return 0u;
     }
     catch (const std::exception &)
     {
@@ -11118,6 +11164,11 @@ uint32_t PS2Runtime::Load32(uint8_t *rdram, R5900Context *ctx, uint32_t vaddr)
     {
         SignalMemoryException(ctx, EXCEPTION_TLB_REFILL_LOAD, fault.virtualAddress());
     }
+    catch (const PS2BusErrorException &fault)
+    {
+        SignalBusError(ctx, PS2BusErrorAccess::DataLoad, fault.physicalAddress());
+        return 0u;
+    }
     catch (const std::exception &)
     {
         SignalMemoryException(ctx, EXCEPTION_ADDRESS_ERROR_LOAD, vaddr);
@@ -11136,6 +11187,11 @@ uint64_t PS2Runtime::Load64(uint8_t *rdram, R5900Context *ctx, uint32_t vaddr)
     {
         SignalMemoryException(ctx, EXCEPTION_TLB_REFILL_LOAD, fault.virtualAddress());
     }
+    catch (const PS2BusErrorException &fault)
+    {
+        SignalBusError(ctx, PS2BusErrorAccess::DataLoad, fault.physicalAddress());
+        return 0u;
+    }
     catch (const std::exception &)
     {
         SignalMemoryException(ctx, EXCEPTION_ADDRESS_ERROR_LOAD, vaddr);
@@ -11153,6 +11209,11 @@ __m128i PS2Runtime::Load128(uint8_t *rdram, R5900Context *ctx, uint32_t vaddr)
     catch (const PS2TlbMissException &fault)
     {
         SignalMemoryException(ctx, EXCEPTION_TLB_REFILL_LOAD, fault.virtualAddress());
+    }
+    catch (const PS2BusErrorException &fault)
+    {
+        SignalBusError(ctx, PS2BusErrorAccess::DataLoad, fault.physicalAddress());
+        return _mm_setzero_si128();
     }
     catch (const std::exception &)
     {
@@ -11174,6 +11235,11 @@ void PS2Runtime::Store8(uint8_t *rdram, R5900Context *ctx, uint32_t vaddr, uint8
     {
         SignalMemoryException(ctx, EXCEPTION_TLB_REFILL_STORE, fault.virtualAddress());
     }
+    catch (const PS2BusErrorException &fault)
+    {
+        SignalBusError(ctx, PS2BusErrorAccess::DataStore, fault.physicalAddress());
+        return;
+    }
     catch (const std::exception &)
     {
         SignalMemoryException(ctx, EXCEPTION_ADDRESS_ERROR_STORE, vaddr);
@@ -11193,6 +11259,11 @@ void PS2Runtime::Store16(uint8_t *rdram, R5900Context *ctx, uint32_t vaddr, uint
     catch (const PS2TlbMissException &fault)
     {
         SignalMemoryException(ctx, EXCEPTION_TLB_REFILL_STORE, fault.virtualAddress());
+    }
+    catch (const PS2BusErrorException &fault)
+    {
+        SignalBusError(ctx, PS2BusErrorAccess::DataStore, fault.physicalAddress());
+        return;
     }
     catch (const std::exception &)
     {
@@ -11214,6 +11285,11 @@ void PS2Runtime::Store32(uint8_t *rdram, R5900Context *ctx, uint32_t vaddr, uint
     {
         SignalMemoryException(ctx, EXCEPTION_TLB_REFILL_STORE, fault.virtualAddress());
     }
+    catch (const PS2BusErrorException &fault)
+    {
+        SignalBusError(ctx, PS2BusErrorAccess::DataStore, fault.physicalAddress());
+        return;
+    }
     catch (const std::exception &)
     {
         SignalMemoryException(ctx, EXCEPTION_ADDRESS_ERROR_STORE, vaddr);
@@ -11233,6 +11309,11 @@ void PS2Runtime::Store64(uint8_t *rdram, R5900Context *ctx, uint32_t vaddr, uint
     catch (const PS2TlbMissException &fault)
     {
         SignalMemoryException(ctx, EXCEPTION_TLB_REFILL_STORE, fault.virtualAddress());
+    }
+    catch (const PS2BusErrorException &fault)
+    {
+        SignalBusError(ctx, PS2BusErrorAccess::DataStore, fault.physicalAddress());
+        return;
     }
     catch (const std::exception &)
     {
@@ -11292,6 +11373,14 @@ void PS2Runtime::StoreMasked32(
             ctx,
             EXCEPTION_TLB_REFILL_STORE,
             fault.virtualAddress());
+    }
+    catch (const PS2BusErrorException &fault)
+    {
+        SignalBusError(
+            ctx,
+            PS2BusErrorAccess::DataStore,
+            fault.physicalAddress());
+        return;
     }
     catch (const std::exception &)
     {
@@ -11355,6 +11444,14 @@ void PS2Runtime::StoreMasked64(
             EXCEPTION_TLB_REFILL_STORE,
             fault.virtualAddress());
     }
+    catch (const PS2BusErrorException &fault)
+    {
+        SignalBusError(
+            ctx,
+            PS2BusErrorAccess::DataStore,
+            fault.physicalAddress());
+        return;
+    }
     catch (const std::exception &)
     {
         SignalMemoryException(
@@ -11379,6 +11476,11 @@ void PS2Runtime::Store128(uint8_t *rdram, R5900Context *ctx, uint32_t vaddr, __m
     catch (const PS2TlbMissException &fault)
     {
         SignalMemoryException(ctx, EXCEPTION_TLB_REFILL_STORE, fault.virtualAddress());
+    }
+    catch (const PS2BusErrorException &fault)
+    {
+        SignalBusError(ctx, PS2BusErrorAccess::DataStore, fault.physicalAddress());
+        return;
     }
     catch (const std::exception &)
     {

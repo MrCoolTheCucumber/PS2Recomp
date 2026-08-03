@@ -47,6 +47,7 @@ add_library(ps2_test_lib STATIC
     src/code_generator_tests.cpp
     src/cop0_timing_tests.cpp
     src/ee_addi_zero_tests.cpp
+    src/ee_bus_error_tests.cpp
     src/ee_cache_tests.cpp
     src/ee_counter_tests.cpp
     src/ee_execution_backend_tests.cpp
