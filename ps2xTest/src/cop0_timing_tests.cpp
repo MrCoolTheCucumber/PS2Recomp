@@ -373,8 +373,65 @@ void register_cop0_timing_tests()
             Cop0TimingSnapshot exl =
                 timing.snapshot();
             t.Equals(
-                exl.pcr[0], 20u,
-                "without EXL0, the kernel mode bit should still enable PCR0");
+                exl.pcr[0], 10u,
+                "without EXL0, the kernel mode bit should not enable PCR0 in a level-one handler");
+        });
+
+        tc.Run("EXL selects only the level-one performance enables", [](TestCase &t)
+        {
+            constexpr std::array<uint32_t, 3u> ksuModes{
+                0u, 1u << 3u, 2u << 3u};
+            for (size_t counter = 0u; counter < 2u; ++counter)
+            {
+                const uint32_t base =
+                    counter == 0u ? 0u : 10u;
+                const uint32_t cycleEvent =
+                    counter == 0u
+                        ? kPccrEvent0Cycles
+                        : kPccrEvent1Cycles;
+                const uint32_t exlEnable =
+                    1u << (base + 1u);
+                for (const uint32_t ksu : ksuModes)
+                {
+                    const uint32_t ordinaryEnable =
+                        1u <<
+                        (base + 2u +
+                         ((ksu >> 3u) & 3u));
+
+                    Cop0Timing ordinaryOnly;
+                    ordinaryOnly.reset(
+                        0u, 0u, 0u,
+                        kPccrCte |
+                            cycleEvent |
+                            ordinaryEnable);
+                    (void)ordinaryOnly.synchronizePerformance(
+                        7u, kStatusExl | ksu);
+                    t.Equals(
+                        ordinaryOnly.snapshot().pcr[counter],
+                        0u,
+                        "a KSU enable must not count in a level-one exception handler");
+
+                    Cop0Timing exlOnly;
+                    exlOnly.reset(
+                        0u, 0u, 0u,
+                        kPccrCte |
+                            cycleEvent |
+                            exlEnable);
+                    (void)exlOnly.synchronizePerformance(
+                        7u, kStatusExl | ksu);
+                    t.Equals(
+                        exlOnly.snapshot().pcr[counter],
+                        7u,
+                        "the EXL enable must count independently of latent KSU");
+                    (void)exlOnly.synchronizePerformance(
+                        14u,
+                        kStatusErl | kStatusExl | ksu);
+                    t.Equals(
+                        exlOnly.snapshot().pcr[counter],
+                        7u,
+                        "ERL must inhibit a counter enabled for level one");
+                }
+            }
         });
 
         tc.Run("occurrence events do not advance with elapsed processor cycles", [](TestCase &t)

@@ -336,15 +336,11 @@ namespace ps2x::timing
     {
         const uint32_t base =
             counter == 0u ? 0u : 10u;
-        const uint32_t ksu =
-            (status >> 3u) & 3u;
-        uint32_t modeMask =
-            1u << (base + 2u + ksu);
-        if ((status & kStatusExl) != 0u)
-        {
-            modeMask |= 1u << (base + 1u);
-        }
-        return (pccr & modeMask) != 0u;
+        const uint32_t mode =
+            (status & kStatusExl) != 0u
+                ? 1u
+                : 2u + ((status >> 3u) & 3u);
+        return (pccr & (1u << (base + mode))) != 0u;
     }
 
     bool Cop0Timing::supportedPerformanceEvent(
