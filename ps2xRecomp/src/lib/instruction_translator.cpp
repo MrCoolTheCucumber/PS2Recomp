@@ -206,8 +206,6 @@ namespace ps2recomp
                 operation);
         }
         case OPCODE_ADDI:
-            if (inst.rt == 0)
-                return "// NOP (addi to $zero)";
             return fmt::format(
                 "{{ uint32_t tmp; bool ov; "
                 "ADD32_OV(GPR_U32(ctx, {}), (int32_t){}, tmp, ov); "
