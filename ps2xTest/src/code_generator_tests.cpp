@@ -1564,11 +1564,11 @@ void register_code_generator_tests()
             mtc0.rd = COP0_REG_CONFIG;
             mtc0Code = gen.translateInstruction(mtc0);
             t.IsTrue(
-                mtc0Code.find("GPR_U32(ctx, 7) & ~0xFC0u") != std::string::npos,
-                "MTC0 CONFIG should allow writable issue/cache-enable bits");
+                mtc0Code.find("ctx->cop0_config & 0x70000FC0u") != std::string::npos,
+                "MTC0 CONFIG should preserve hardware configuration fields");
             t.IsTrue(
-                mtc0Code.find("| 0x440u") != std::string::npos,
-                "MTC0 CONFIG should preserve hardware cache-size fields");
+                mtc0Code.find("GPR_U32(ctx, 7) & 0x00073007u") != std::string::npos,
+                "MTC0 CONFIG should accept only software-owned fields");
 
             mfc0.rt = 0;
             mfc0.rd = COP0_REG_COUNT;
