@@ -128,7 +128,28 @@ namespace ps2recomp
         return fmt::format("WRITE{}({}, {})", width, addr, value);
     }
 
-    std::string InstructionTranslator::translate(const Instruction &inst, const MemoryAccessHint &memoryHint)
+    std::string InstructionTranslator::translate(
+        const Instruction &inst,
+        const MemoryAccessHint &memoryHint)
+    {
+        const std::string operation =
+            translateUnchecked(inst, memoryHint);
+        const int coprocessor =
+            eeCoprocessorForOpcode(inst.opcode);
+        if (coprocessor < 0)
+        {
+            return operation;
+        }
+
+        return fmt::format(
+            "{{ runtime->RequireCoprocessorUsable(ctx, {}u);\n{}\n}}",
+            coprocessor,
+            operation);
+    }
+
+    std::string InstructionTranslator::translateUnchecked(
+        const Instruction &inst,
+        const MemoryAccessHint &memoryHint)
     {
         if (inst.isMMI)
         {

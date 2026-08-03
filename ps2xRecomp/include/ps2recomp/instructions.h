@@ -84,6 +84,30 @@ namespace ps2recomp
         OPCODE_SQC2 = OPCODE_SDC2
     };
 
+    // Returns the architectural coprocessor named by a valid EE primary
+    // opcode, or -1 when the instruction does not require a CU bit. The EE
+    // reserves the generic LWC2/SWC2 and LDC1/SDC1 encodings; its supported
+    // memory forms are LWC1/SWC1 and LQC2/SQC2.
+    constexpr int eeCoprocessorForOpcode(uint8_t opcode)
+    {
+        switch (opcode)
+        {
+        case OPCODE_COP0:
+        case OPCODE_CACHE:
+            return 0;
+        case OPCODE_COP1:
+        case OPCODE_LWC1:
+        case OPCODE_SWC1:
+            return 1;
+        case OPCODE_COP2:
+        case OPCODE_LQC2:
+        case OPCODE_SQC2:
+            return 2;
+        default:
+            return -1;
+        }
+    }
+
     // SPECIAL Function (bits 5-0) for OPCODE_SPECIAL
     enum SpecialFunctions
     {

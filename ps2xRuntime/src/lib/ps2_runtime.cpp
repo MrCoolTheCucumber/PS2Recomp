@@ -226,9 +226,11 @@ namespace
     constexpr uint32_t COP0_CAUSE_EXC2_PERFORMANCE = 0x00020000u;
     constexpr uint32_t COP0_CAUSE_BD2 = 0x40000000u;
     constexpr uint32_t COP0_CAUSE_BD = 0x80000000u;
+    constexpr uint32_t COP0_CAUSE_CE_MASK = 0x30000000u;
     constexpr uint32_t COP0_STATUS_IE = 0x00000001u;
     constexpr uint32_t COP0_STATUS_EXL = 0x00000002u;
     constexpr uint32_t COP0_STATUS_ERL = 0x00000004u;
+    constexpr uint32_t COP0_STATUS_KSU_MASK = 0x00000018u;
     constexpr uint32_t COP0_STATUS_BEM = 0x00001000u;
     constexpr uint32_t COP0_STATUS_IM7 = 0x00008000u;
     constexpr uint32_t COP0_STATUS_EIE = 0x00010000u;
@@ -6469,6 +6471,41 @@ PS2Runtime::raiseCop0PerformanceException(
 
     raiseCop0Level1Exception(
         ctx, static_cast<uint32_t>(exception));
+}
+
+void PS2Runtime::RequireCoprocessorUsable(
+    R5900Context *ctx,
+    uint32_t coprocessor)
+{
+    if (!ctx)
+    {
+        throw PS2GuestException{};
+    }
+    if (coprocessor > 3u)
+    {
+        throw std::out_of_range("EE coprocessor number must fit Cause.CE");
+    }
+
+    const bool kernelMode =
+        (ctx->cop0_status &
+         (COP0_STATUS_EXL |
+          COP0_STATUS_ERL)) != 0u ||
+        (ctx->cop0_status & COP0_STATUS_KSU_MASK) == 0u;
+    const bool enabled =
+        (coprocessor == 0u && kernelMode) ||
+        (ctx->cop0_status &
+         (1u << (28u + coprocessor))) != 0u;
+    if (enabled)
+    {
+        return;
+    }
+
+    ctx->cop0_cause =
+        (ctx->cop0_cause & ~COP0_CAUSE_CE_MASK) |
+        ((coprocessor << 28u) & COP0_CAUSE_CE_MASK);
+    SignalException(
+        ctx,
+        EXCEPTION_COPROCESSOR_UNUSABLE);
 }
 
 [[noreturn]] void PS2Runtime::SignalMemoryException(R5900Context *ctx,

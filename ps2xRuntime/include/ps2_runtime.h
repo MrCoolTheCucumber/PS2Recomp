@@ -101,6 +101,7 @@ enum PS2Exception
     EXCEPTION_SYSCALL = 0x08,             // SYSCALL instruction
     EXCEPTION_BREAKPOINT = 0x09,          // BREAK instruction
     EXCEPTION_RESERVED_INSTRUCTION = 0x0A,
+    EXCEPTION_COPROCESSOR_UNUSABLE = 0x0B,
     EXCEPTION_INTEGER_OVERFLOW = 0x0C, // From MIPS spec
     EXCEPTION_TRAP = 0x0D,             // Trap instruction condition met
 };
@@ -1167,6 +1168,7 @@ public:
     void configureIoPathsFromElf(const std::string &elfPath);
 
     [[noreturn]] void SignalException(R5900Context *ctx, PS2Exception exception);
+    void RequireCoprocessorUsable(R5900Context *ctx, uint32_t coprocessor);
     [[noreturn]] void SignalMemoryException(R5900Context *ctx,
                                             PS2Exception exception,
                                             uint32_t badVAddr);

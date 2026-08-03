@@ -646,6 +646,14 @@ namespace ps2recomp
         (void)m_function;
         emitResumeFromDelaySlotEntry();
         m_ss << fmt::format("    ctx->pc = 0x{:X}u;\n", branchPc());
+        const int coprocessor =
+            eeCoprocessorForOpcode(m_branchInst.opcode);
+        if (coprocessor >= 0)
+        {
+            m_ss << fmt::format(
+                "    runtime->RequireCoprocessorUsable(ctx, {}u);\n",
+                coprocessor);
+        }
 
         if (m_branchInst.opcode == OPCODE_J || m_branchInst.opcode == OPCODE_JAL)
         {
