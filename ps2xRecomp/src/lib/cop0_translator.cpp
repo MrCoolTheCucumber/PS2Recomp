@@ -91,9 +91,9 @@ namespace ps2recomp
             case COP0_REG_RANDOM:
                 return "// MTC0 to RANDOM register ignored (read-only)";
             case COP0_REG_ENTRYLO0:
-                return fmt::format("ctx->cop0_entrylo0 = GPR_U32(ctx, {}) & 0x3FFFFFFF;", rt);
+                return fmt::format("ctx->cop0_entrylo0 = GPR_U32(ctx, {}) & 0x83FFFFFF;", rt);
             case COP0_REG_ENTRYLO1:
-                return fmt::format("ctx->cop0_entrylo1 = GPR_U32(ctx, {}) & 0x3FFFFFFF;", rt);
+                return fmt::format("ctx->cop0_entrylo1 = GPR_U32(ctx, {}) & 0x03FFFFFF;", rt);
             case COP0_REG_CONTEXT:
                 return fmt::format("ctx->cop0_context = (ctx->cop0_context & 0x007FFFF0) | (GPR_U32(ctx, {}) & 0xFF800000);", rt);
             case COP0_REG_PAGEMASK:
