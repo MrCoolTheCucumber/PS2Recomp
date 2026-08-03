@@ -1977,6 +1977,10 @@ private:
         R5900Context *context) noexcept;
     int threadIdForEeContext(
         const R5900Context *context) noexcept;
+    void publishEeProcessorGlobalState(
+        R5900Context *context) noexcept;
+    void restoreEeProcessorGlobalState(
+        R5900Context *context) noexcept;
     void selectEeThread(int threadId) noexcept;
     void switchGuestExecutionContext(
         R5900Context *context,

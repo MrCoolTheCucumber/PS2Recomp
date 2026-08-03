@@ -1449,6 +1449,9 @@ namespace ps2_syscalls
                 ThreadNaming::SetCurrentThreadName(name);
             }
             R5900Context *threadCtx = &info->context;
+            // The retail kernel creates a clean saved thread frame (GPRs,
+            // HI/LO, SA, and COP1). COP0 and VU0 are processor-global and
+            // are restored from the live EE state when this context binds.
             *threadCtx = R5900Context{};
 
             {

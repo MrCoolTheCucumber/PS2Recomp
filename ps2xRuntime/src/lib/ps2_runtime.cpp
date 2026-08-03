@@ -8900,6 +8900,115 @@ int PS2Runtime::threadIdForEeContext(
                : 0;
 }
 
+static void copyEeProcessorGlobalState(
+    R5900Context &destination,
+    const R5900Context &source) noexcept
+{
+    std::copy_n(
+        source.vu0_vf,
+        std::size(source.vu0_vf),
+        destination.vu0_vf);
+    std::copy_n(
+        source.vi,
+        std::size(source.vi),
+        destination.vi);
+    destination.vu0_q = source.vu0_q;
+    destination.vu0_p = source.vu0_p;
+    destination.vu0_i = source.vu0_i;
+    destination.vu0_r = source.vu0_r;
+    destination.vu0_acc = source.vu0_acc;
+    destination.vu0_status = source.vu0_status;
+    destination.vu0_mac_flags = source.vu0_mac_flags;
+    destination.vu0_clip_flags = source.vu0_clip_flags;
+    destination.vu0_clip_flags2 = source.vu0_clip_flags2;
+    destination.vu0_cmsar0 = source.vu0_cmsar0;
+    destination.vu0_cmsar1 = source.vu0_cmsar1;
+    destination.vu0_cmsar2 = source.vu0_cmsar2;
+    destination.vu0_cmsar3 = source.vu0_cmsar3;
+    destination.vu0_vpu_stat = source.vu0_vpu_stat;
+    destination.vu0_vpu_stat2 = source.vu0_vpu_stat2;
+    destination.vu0_vpu_stat3 = source.vu0_vpu_stat3;
+    destination.vu0_vpu_stat4 = source.vu0_vpu_stat4;
+    destination.vu0_tpc = source.vu0_tpc;
+    destination.vu0_tpc2 = source.vu0_tpc2;
+    destination.vu0_fbrst = source.vu0_fbrst;
+    destination.vu0_fbrst2 = source.vu0_fbrst2;
+    destination.vu0_fbrst3 = source.vu0_fbrst3;
+    destination.vu0_fbrst4 = source.vu0_fbrst4;
+    destination.vu0_itop = source.vu0_itop;
+    destination.vu0_top = source.vu0_top;
+    destination.vu0_info = source.vu0_info;
+    destination.vu0_xitop = source.vu0_xitop;
+    destination.vu0_pc = source.vu0_pc;
+    std::copy_n(
+        source.vu0_cf,
+        std::size(source.vu0_cf),
+        destination.vu0_cf);
+
+    destination.cop0_index = source.cop0_index;
+    destination.cop0_random = source.cop0_random;
+    destination.cop0_entrylo0 = source.cop0_entrylo0;
+    destination.cop0_entrylo1 = source.cop0_entrylo1;
+    destination.cop0_context = source.cop0_context;
+    destination.cop0_pagemask = source.cop0_pagemask;
+    destination.cop0_wired = source.cop0_wired;
+    destination.cop0_badvaddr = source.cop0_badvaddr;
+    destination.cop0_count = source.cop0_count;
+    destination.cop0_entryhi = source.cop0_entryhi;
+    destination.cop0_compare = source.cop0_compare;
+    destination.cop0_status = source.cop0_status;
+    destination.cop0_cause = source.cop0_cause;
+    destination.cop0_epc = source.cop0_epc;
+    destination.cop0_prid = source.cop0_prid;
+    destination.cop0_config = source.cop0_config;
+    destination.cop0_badpaddr = source.cop0_badpaddr;
+    destination.cop0_bpc = source.cop0_bpc;
+    destination.cop0_iab = source.cop0_iab;
+    destination.cop0_iabm = source.cop0_iabm;
+    destination.cop0_dab = source.cop0_dab;
+    destination.cop0_dabm = source.cop0_dabm;
+    destination.cop0_dvb = source.cop0_dvb;
+    destination.cop0_dvbm = source.cop0_dvbm;
+    destination.cop0_perf = source.cop0_perf;
+    destination.cop0_pcr0 = source.cop0_pcr0;
+    destination.cop0_pcr1 = source.cop0_pcr1;
+    destination.cop0_taglo = source.cop0_taglo;
+    destination.cop0_taghi = source.cop0_taghi;
+    destination.cop0_errorepc = source.cop0_errorepc;
+
+    std::copy_n(
+        source.cop2_ccr,
+        std::size(source.cop2_ccr),
+        destination.cop2_ccr);
+    destination.enforceVu0RegisterInvariants();
+}
+
+void PS2Runtime::publishEeProcessorGlobalState(
+    R5900Context *context) noexcept
+{
+    if (!context ||
+        context == &m_cpuContext ||
+        threadIdForEeContext(context) <= 0)
+    {
+        return;
+    }
+    copyEeProcessorGlobalState(
+        m_cpuContext, *context);
+}
+
+void PS2Runtime::restoreEeProcessorGlobalState(
+    R5900Context *context) noexcept
+{
+    if (!context ||
+        context == &m_cpuContext ||
+        threadIdForEeContext(context) <= 0)
+    {
+        return;
+    }
+    copyEeProcessorGlobalState(
+        *context, m_cpuContext);
+}
+
 void PS2Runtime::selectEeThread(int threadId) noexcept
 {
     if (threadId < 0)
@@ -8948,6 +9057,8 @@ void PS2Runtime::switchGuestExecutionContext(
         previous,
         ps2x::timing::eeTickToCyclesFloor(
             now));
+    publishEeProcessorGlobalState(previous);
+    restoreEeProcessorGlobalState(context);
     context->resetEeBlockTiming();
     m_boundEeContext = context;
     selectEeThread(selectedThreadId);
@@ -8976,6 +9087,8 @@ void PS2Runtime::restoreGuestExecutionContext(
         context,
         ps2x::timing::eeTickToCyclesFloor(
             now));
+    publishEeProcessorGlobalState(context);
+    restoreEeProcessorGlobalState(previousContext);
     m_boundEeContext = previousContext;
     selectEeThread(previousThreadId);
     publishCop0TimingMirrors(previousContext);
@@ -9322,7 +9435,14 @@ uint32_t PS2Runtime::releaseGuestExecution(
 
     context = m_boundEeContext;
     threadId = m_boundEeThreadId;
-    (void)finishEeContextBlock(m_boundEeContext);
+    const ps2x::timing::EeTick now =
+        finishEeContextBlock(m_boundEeContext);
+    synchronizeCop0Timing(
+        m_boundEeContext,
+        ps2x::timing::eeTickToCyclesFloor(
+            now));
+    publishEeProcessorGlobalState(
+        m_boundEeContext);
     m_boundEeContext = nullptr;
     m_boundEeThreadId = 1;
     m_eeThreadRuntimeState->currentThreadId.store(

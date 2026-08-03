@@ -212,6 +212,9 @@ namespace
         K_BACKEND_WAKE_RACE_CHILD_ENTRY =
             0x25c200u;
     constexpr uint32_t
+        K_PROCESSOR_GLOBAL_STATE_WORKER_ENTRY =
+            0x25c300u;
+    constexpr uint32_t
         K_BACKEND_WAKE_RACE_RESULT_ADDR =
             0x1a00u;
     constexpr size_t
@@ -398,6 +401,14 @@ namespace
         g_setupThreadRootStartResult{KE_ERROR};
     std::atomic<bool>
         g_setupThreadRootMainReturned{false};
+    std::atomic<uint32_t>
+        g_processorGlobalObservedStatus{0u};
+    std::atomic<uint32_t>
+        g_processorGlobalObservedEntryHi{0u};
+    std::atomic<uint32_t>
+        g_processorGlobalObservedCop2Control{0u};
+    std::atomic<uint32_t>
+        g_processorGlobalObservedSavedGpr{0u};
     int g_executorChildThreadId = 0;
     std::array<int, 3u> g_executorWakeCountResults{
         KE_ERROR,
@@ -1096,6 +1107,29 @@ namespace
             rdram,
             K_CURRENT_THREAD_ID_ADDR,
             static_cast<uint32_t>(getRegS32(*ctx, 2)));
+        ctx->pc = 0u;
+    }
+
+    void processorGlobalStateWorkerHandler(
+        uint8_t *,
+        R5900Context *ctx,
+        PS2Runtime *)
+    {
+        g_processorGlobalObservedStatus.store(
+            ctx->cop0_status,
+            std::memory_order_release);
+        g_processorGlobalObservedEntryHi.store(
+            ctx->cop0_entryhi,
+            std::memory_order_release);
+        g_processorGlobalObservedCop2Control.store(
+            ctx->cop2_ccr[29],
+            std::memory_order_release);
+        g_processorGlobalObservedSavedGpr.store(
+            ::getRegU32(ctx, 20),
+            std::memory_order_release);
+
+        ctx->cop0_entryhi = 0x55667788u;
+        ctx->cop2_ccr[29] = 0x99aabbccu;
         ctx->pc = 0u;
     }
 
@@ -11739,6 +11773,151 @@ void register_ps2_runtime_kernel_tests()
                 env.runtime.eeThreadLegacyAdapterMismatchCount() >= 1u,
                 "the runtime should detect TLS adapter divergence");
         });
+
+        tc.Run(
+            "EE threads share processor-global COP0 and COP2 state",
+            [](TestCase &t)
+            {
+                TestEnv env;
+                env.runtime.registerFunction(
+                    K_PROCESSOR_GLOBAL_STATE_WORKER_ENTRY,
+                    &processorGlobalStateWorkerHandler);
+
+                constexpr uint32_t kLiveStatus =
+                    0x70030c11u;
+                constexpr uint32_t kLiveEntryHi =
+                    0x123450abu;
+                constexpr uint32_t kLiveCop2Control =
+                    0x11223344u;
+                env.runtime.cpu().cop0_status =
+                    kLiveStatus;
+                env.runtime.cpu().cop0_entryhi =
+                    kLiveEntryHi;
+                env.runtime.cpu().cop2_ccr[29] =
+                    kLiveCop2Control;
+                setRegU32(
+                    env.runtime.cpu(),
+                    20,
+                    0xdeadbeefu);
+
+                g_processorGlobalObservedStatus.store(
+                    0u,
+                    std::memory_order_release);
+                g_processorGlobalObservedEntryHi.store(
+                    0u,
+                    std::memory_order_release);
+                g_processorGlobalObservedCop2Control.store(
+                    0u,
+                    std::memory_order_release);
+                g_processorGlobalObservedSavedGpr.store(
+                    0xffffffffu,
+                    std::memory_order_release);
+
+                const uint32_t threadParam[9] = {
+                    0u,
+                    K_PROCESSOR_GLOBAL_STATE_WORKER_ENTRY,
+                    0x00308000u,
+                    0x00000800u,
+                    0u,
+                    40u,
+                    0u,
+                    0u,
+                    0u,
+                };
+                writeGuestWords(
+                    env.rdram.data(),
+                    K_PARAM_ADDR,
+                    threadParam,
+                    std::size(threadParam));
+                setRegU32(env.ctx, 4, K_PARAM_ADDR);
+                CreateThread(
+                    env.rdram.data(),
+                    &env.ctx,
+                    &env.runtime);
+                const int32_t tid =
+                    getRegS32(env.ctx, 2);
+                t.IsTrue(
+                    tid >= 2,
+                    "the processor-state worker should be created");
+
+                setRegU32(
+                    env.ctx,
+                    4,
+                    static_cast<uint32_t>(tid));
+                setRegU32(env.ctx, 5, 0u);
+                StartThread(
+                    env.rdram.data(),
+                    &env.ctx,
+                    &env.runtime);
+                t.Equals(
+                    getRegS32(env.ctx, 2),
+                    tid,
+                    "the processor-state worker should start");
+
+                const bool dormant = waitUntil([&]()
+                {
+                    R5900Context statusCtx{};
+                    setRegU32(
+                        statusCtx,
+                        4,
+                        static_cast<uint32_t>(tid));
+                    setRegU32(
+                        statusCtx,
+                        5,
+                        K_STATUS_ADDR);
+                    ReferThreadStatus(
+                        env.rdram.data(),
+                        &statusCtx,
+                        &env.runtime);
+                    return getRegS32(statusCtx, 2) ==
+                           THS_DORMANT;
+                }, std::chrono::milliseconds(500));
+                t.IsTrue(
+                    dormant,
+                    "the processor-state worker should finish");
+
+                t.Equals(
+                    g_processorGlobalObservedStatus.load(
+                        std::memory_order_acquire),
+                    kLiveStatus,
+                    "a new thread should inherit the live COP0 status");
+                t.Equals(
+                    g_processorGlobalObservedEntryHi.load(
+                        std::memory_order_acquire),
+                    kLiveEntryHi,
+                    "a new thread should inherit the live COP0 register file");
+                t.Equals(
+                    g_processorGlobalObservedCop2Control.load(
+                        std::memory_order_acquire),
+                    kLiveCop2Control,
+                    "a new thread should inherit the live COP2 control state");
+                t.Equals(
+                    g_processorGlobalObservedSavedGpr.load(
+                        std::memory_order_acquire),
+                    0u,
+                    "a new thread should still receive a clean saved GPR frame");
+
+                setRegU32(
+                    env.ctx,
+                    4,
+                    static_cast<uint32_t>(tid));
+                DeleteThread(
+                    env.rdram.data(),
+                    &env.ctx,
+                    &env.runtime);
+                t.Equals(
+                    getRegS32(env.ctx, 2),
+                    tid,
+                    "the processor-state worker should be deletable");
+                t.Equals(
+                    env.runtime.cpu().cop0_entryhi,
+                    0x55667788u,
+                    "worker COP0 writes should remain visible after a thread switch");
+                t.Equals(
+                    env.runtime.cpu().cop2_ccr[29],
+                    0x99aabbccu,
+                    "worker COP2 writes should remain visible after a thread switch");
+            });
 
         tc.Run("start thread validates target and entry registration", [](TestCase &t)
         {
