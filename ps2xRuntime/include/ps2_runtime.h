@@ -1170,6 +1170,8 @@ public:
     void synchronizeVU0Microprogram(uint8_t *rdram,
                                     R5900Context *ctx,
                                     bool interlocked);
+    [[nodiscard]] bool readCop2Condition(
+        const R5900Context *ctx) const noexcept;
     void serviceEeEventsAtBlockBoundary(uint8_t *rdram,
                                         R5900Context *ctx);
     void configureEeVSyncVideoMode(

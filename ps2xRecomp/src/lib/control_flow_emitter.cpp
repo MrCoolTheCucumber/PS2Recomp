@@ -469,10 +469,17 @@ namespace ps2recomp
         case OPCODE_COP2:
             if (m_branchInst.rs == COP2_BC)
             {
-                const uint8_t bcCond = static_cast<uint8_t>(m_branchInst.rt);
-                return (bcCond == COP2_BC_BCF || bcCond == COP2_BC_BCFL)
-                           ? "!(ctx->vu0_status & 0x1)"
-                           : "(ctx->vu0_status & 0x1)";
+                switch (m_branchInst.rt)
+                {
+                case COP2_BC_BCF:
+                case COP2_BC_BCFL:
+                    return "!runtime->readCop2Condition(ctx)";
+                case COP2_BC_BCT:
+                case COP2_BC_BCTL:
+                    return "runtime->readCop2Condition(ctx)";
+                default:
+                    return "false";
+                }
             }
             break;
         default:

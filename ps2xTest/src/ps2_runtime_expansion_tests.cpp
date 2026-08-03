@@ -922,6 +922,32 @@ void register_ps2_runtime_expansion_tests()
             t.Equals(ctx.vi[0], static_cast<uint16_t>(0), "VI0 writes should be discarded");
         });
 
+        tc.Run("COP2 condition follows only VPU_STAT VU1 running state", [](TestCase &t)
+        {
+            PS2Runtime runtime;
+            R5900Context ctx{};
+
+            for (uint32_t statusZ = 0u; statusZ <= 1u; ++statusZ)
+            {
+                for (uint32_t vu1Running = 0u;
+                     vu1Running <= 1u;
+                     ++vu1Running)
+                {
+                    ctx.vu0_status =
+                        static_cast<uint16_t>(statusZ);
+                    ctx.vu0_vpu_stat = vu1Running << 8u;
+                    t.Equals(
+                        runtime.readCop2Condition(&ctx),
+                        vu1Running != 0u,
+                        "CPCOND2 should ignore STATUS.Z and follow VPU_STAT.VBS1");
+                }
+            }
+
+            t.IsFalse(
+                runtime.readCop2Condition(nullptr),
+                "a missing EE context cannot report a running VU1");
+        });
+
         tc.Run("VU FTOI saturates unrepresentable values", [](TestCase &t)
         {
             uint32_t words[4]{};

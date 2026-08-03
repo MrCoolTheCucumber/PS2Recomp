@@ -40,6 +40,19 @@ static Instruction makeCop0Branch(
     return R5900Decoder{}.decodeInstruction(address, raw, false);
 }
 
+static Instruction makeCop2Branch(
+    uint32_t address,
+    uint8_t condition,
+    int16_t targetOffsetWords)
+{
+    const uint32_t raw =
+        (OPCODE_COP2 << 26) |
+        (COP2_BC << 21) |
+        (static_cast<uint32_t>(condition) << 16) |
+        static_cast<uint16_t>(targetOffsetWords);
+    return R5900Decoder{}.decodeInstruction(address, raw, false);
+}
+
 static Instruction makeNop(uint32_t address)
 {
     Instruction inst;
@@ -2578,6 +2591,76 @@ void register_code_generator_tests()
                         branchBody < delaySlot,
                         branchCase.likely,
                         "only BC0 likely forms should place the delay slot inside the taken path");
+                }
+            }
+        });
+
+        tc.Run("BC2 branches use VU1 running state instead of VU0 flags", [](TestCase &t) {
+            struct BranchCase
+            {
+                uint8_t condition;
+                bool branchOnTrue;
+                bool likely;
+            };
+            const BranchCase cases[] = {
+                {COP2_BC_BCF, false, false},
+                {COP2_BC_BCT, true, false},
+                {COP2_BC_BCFL, false, true},
+                {COP2_BC_BCTL, true, true},
+            };
+
+            for (const BranchCase &branchCase : cases)
+            {
+                Function function;
+                function.name = "bc2_condition";
+                function.start = 0x1280u;
+                function.end = 0x128Cu;
+                function.isRecompiled = true;
+
+                const Instruction branch = makeCop2Branch(
+                    0x1280u, branchCase.condition, 3);
+                const Instruction delay = makeAddiu(
+                    0x1284u, 9u, 0u, 123u);
+                const Instruction fallthrough = makeAddiu(
+                    0x1288u, 10u, 0u, 77u);
+
+                CodeGenerator generator({}, {});
+                const std::string generated = generator.generateFunction(
+                    function, {branch, delay, fallthrough}, false);
+                const std::string expectedCondition =
+                    branchCase.branchOnTrue
+                        ? "const bool branch_taken_0x1280 = (runtime->readCop2Condition(ctx));"
+                        : "const bool branch_taken_0x1280 = (!runtime->readCop2Condition(ctx));";
+                t.IsTrue(
+                    generated.find(expectedCondition) != std::string::npos,
+                    "BC2 polarity should be derived from VU1 running state");
+                t.IsFalse(
+                    generated.find("vu0_status") != std::string::npos,
+                    "BC2 must not depend on VU0 arithmetic flags");
+                t.IsTrue(
+                    generated.find("ctx->pc = 0x1290u;") !=
+                        std::string::npos,
+                    "a taken BC2 should dispatch to its external target");
+                t.IsTrue(
+                    generated.find("SET_GPR_S32(ctx, 10,") !=
+                        std::string::npos,
+                    "a not-taken BC2 should retain its decoded fallthrough");
+
+                const size_t branchBody = generated.find(
+                    "if (branch_taken_0x1280)");
+                const size_t delaySlot = generated.find(
+                    "SET_GPR_S32(ctx, 9,");
+                t.IsTrue(
+                    branchBody != std::string::npos &&
+                        delaySlot != std::string::npos,
+                    "BC2 fixture should contain a branch body and translated delay slot");
+                if (branchBody != std::string::npos &&
+                    delaySlot != std::string::npos)
+                {
+                    t.Equals(
+                        branchBody < delaySlot,
+                        branchCase.likely,
+                        "only BC2 likely forms should place the delay slot inside the taken path");
                 }
             }
         });

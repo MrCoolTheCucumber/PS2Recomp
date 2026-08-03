@@ -4224,6 +4224,13 @@ void PS2Runtime::setVU1BusyFlag(
     }
 }
 
+bool PS2Runtime::readCop2Condition(
+    const R5900Context *ctx) const noexcept
+{
+    return ctx != nullptr &&
+           (ctx->vu0_vpu_stat & kVu1BusyMask) != 0u;
+}
+
 void PS2Runtime::startVU0FromVif(
     uint32_t startPC, uint32_t itop)
 {
