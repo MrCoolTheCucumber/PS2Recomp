@@ -17,6 +17,7 @@ namespace
     constexpr uint32_t kPccrEvent1Cycles = 1u << 15u;
     constexpr uint32_t kPccrK0 = 1u << 2u;
     constexpr uint32_t kPccrU1 = 1u << 14u;
+    constexpr uint32_t kPccrWritableMask = 0x800ffbfeu;
 
     bool serviceAfterCycles(
         PS2Runtime &runtime,
@@ -238,7 +239,7 @@ void register_cop0_timing_tests()
             timing.reset();
             t.IsTrue(
                 timing.writePerformance(
-                    0u, 0x87654321u, 0u, 0u),
+                    0u, 0x80054320u, 0u, 0u),
                 "selector zero should write PCCR");
             t.IsFalse(
                 timing.writePerformance(
@@ -256,7 +257,7 @@ void register_cop0_timing_tests()
             t.Equals(
                 timing.readPerformance(
                     2u, 0u, 0u),
-                0x87654321u,
+                0x80054320u,
                 "every even read selector should return PCCR");
             t.Equals(
                 timing.readPerformance(
@@ -268,6 +269,57 @@ void register_cop0_timing_tests()
                     3u, 0u, kStatusErl),
                 0x33333333u,
                 "odd selector three should return PCR1");
+        });
+
+        tc.Run("PCCR software writes clear every fixed zero bit", [](TestCase &t)
+        {
+            Cop0Timing timing;
+            timing.reset();
+
+            t.IsTrue(
+                timing.writePerformance(
+                    0u, 0xffffffffu, 0u, 0u),
+                "selector zero should accept an MTPS write");
+            t.Equals(
+                timing.readPerformance(
+                    0u, 0u, 0u),
+                kPccrWritableMask,
+                "all-ones MTPS should retain only documented PCCR fields");
+
+            for (uint32_t bit = 0u; bit < 32u; ++bit)
+            {
+                const uint32_t input = 1u << bit;
+                (void)timing.writePerformance(
+                    0u, input, 0u, 0u);
+                t.Equals(
+                    timing.snapshot().pccr,
+                    input & kPccrWritableMask,
+                    "single-bit MTPS writes should follow the complete PCCR field mask");
+            }
+        });
+
+        tc.Run("PCCR restored state clears every fixed zero bit", [](TestCase &t)
+        {
+            Cop0Timing timing;
+            timing.reset(
+                12u, 0x11111111u, 0x22222222u,
+                0xffffffffu, 0x33333333u,
+                0x44444444u);
+            t.Equals(
+                timing.snapshot().pccr,
+                kPccrWritableMask,
+                "restoring all-one PCCR state should normalize reserved bits");
+
+            for (uint32_t bit = 0u; bit < 32u; ++bit)
+            {
+                const uint32_t input = 1u << bit;
+                timing.reset(
+                    12u, 0u, 0u, input);
+                t.Equals(
+                    timing.snapshot().pccr,
+                    input & kPccrWritableMask,
+                    "single-bit restored state should follow the complete PCCR field mask");
+            }
         });
 
         tc.Run("performance mode and ERL gates are independent per counter", [](TestCase &t)

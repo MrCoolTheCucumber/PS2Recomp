@@ -10,6 +10,7 @@ namespace ps2x::timing
         constexpr uint32_t kStatusExl = 1u << 1u;
         constexpr uint32_t kStatusErl = 1u << 2u;
         constexpr uint32_t kPccrCounterEnable = 1u << 31u;
+        constexpr uint32_t kPccrWritableMask = 0x800ffbfeu;
         constexpr uint32_t kPcrOverflow = 1u << 31u;
         constexpr uint64_t kCounterModulus = uint64_t{1u} << 32u;
         constexpr uint64_t kPerformanceCounterModulus =
@@ -26,7 +27,7 @@ namespace ps2x::timing
     {
         m_count = count;
         m_compare = compare;
-        m_pccr = pccr;
+        m_pccr = pccr & kPccrWritableMask;
         m_pcr = {pcr0, pcr1};
         m_lastCountCycle = currentCycle;
         m_lastPerformanceCycle = {
@@ -214,7 +215,7 @@ namespace ps2x::timing
             {
                 advance->merge(result);
             }
-            m_pccr = value;
+            m_pccr = value & kPccrWritableMask;
             return true;
         }
 
