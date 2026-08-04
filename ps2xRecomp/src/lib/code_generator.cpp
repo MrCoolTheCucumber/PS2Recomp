@@ -161,6 +161,64 @@ namespace ps2recomp
         }
     }
 
+    void CodeGenerator::setConfiguredFunctionTableRanges(
+        const std::vector<FunctionTableRange> &ranges)
+    {
+        std::vector<FunctionTableRange> configuredRanges = ranges;
+        std::sort(
+            configuredRanges.begin(),
+            configuredRanges.end(),
+            [](const FunctionTableRange &lhs, const FunctionTableRange &rhs)
+            {
+                return lhs.address < rhs.address;
+            });
+
+        uint64_t previousEnd = 0u;
+        bool havePrevious = false;
+        for (const FunctionTableRange &range : configuredRanges)
+        {
+            const uint64_t rangeEnd =
+                static_cast<uint64_t>(range.address) + range.size;
+            if (range.size == 0u ||
+                (range.address & 3u) != 0u ||
+                (range.size & 3u) != 0u ||
+                rangeEnd >
+                    static_cast<uint64_t>(UINT32_MAX) + 1u)
+            {
+                throw std::runtime_error(
+                    "Configured function table range is empty, unaligned, or overflows the guest address space.");
+            }
+            if (havePrevious && range.address < previousEnd)
+            {
+                throw std::runtime_error(
+                    "Configured function table ranges must not overlap.");
+            }
+
+            bool backedByData = false;
+            for (const Section &section : m_sections)
+            {
+                const uint64_t sectionEnd =
+                    static_cast<uint64_t>(section.address) + section.size;
+                if (section.data && section.isData && !section.isBSS &&
+                    range.address >= section.address && rangeEnd <= sectionEnd)
+                {
+                    backedByData = true;
+                    break;
+                }
+            }
+            if (!backedByData)
+            {
+                throw std::runtime_error(
+                    "Configured function table range is not fully backed by an ELF data section.");
+            }
+
+            previousEnd = rangeEnd;
+            havePrevious = true;
+        }
+
+        m_configFunctionTableRanges = std::move(configuredRanges);
+    }
+
     void CodeGenerator::setResumeEntryTargets(const std::unordered_map<uint32_t, std::vector<uint32_t>> &resumeTargetsByOwner)
     {
         m_resumeEntryTargetsByOwner = resumeTargetsByOwner;
@@ -320,6 +378,7 @@ namespace ps2recomp
             m_sections,
             m_configJumpTableTargetsByAddress,
             m_configIndirectBranchTargetsByInstructionAddress,
+            m_configFunctionTableRanges,
             reportDiagnostics ? m_reporter : nullptr);
         return analyzer.analyze(function, instructions, allFunctions);
     }

@@ -360,6 +360,52 @@ namespace ps2recomp
                 }
             }
 
+            if (data.contains("analysis") && data.at("analysis").is_table())
+            {
+                const auto &analysisNode = data.at("analysis");
+                if (analysisNode.contains("function_table_range"))
+                {
+                    const auto &rangesNode =
+                        analysisNode.at("function_table_range");
+                    if (!rangesNode.is_array())
+                    {
+                        throw std::runtime_error(
+                            "Configured analysis.function_table_range must be an array of tables.");
+                    }
+
+                    const auto &ranges = rangesNode.as_array();
+                    for (size_t index = 0u; index < ranges.size(); ++index)
+                    {
+                        const auto &rangeNode = ranges[index];
+                        if (!rangeNode.is_table() ||
+                            !rangeNode.contains("address") ||
+                            !rangeNode.contains("size"))
+                        {
+                            throw std::runtime_error(
+                                "Configured function table range " +
+                                std::to_string(index) +
+                                " must contain address and size fields.");
+                        }
+
+                        FunctionTableRange range{};
+                        if (!parseAddress(rangeNode.at("address"), range.address) ||
+                            !parseAddress(rangeNode.at("size"), range.size) ||
+                            range.size == 0u ||
+                            (range.address & 3u) != 0u ||
+                            (range.size & 3u) != 0u ||
+                            static_cast<uint64_t>(range.address) + range.size >
+                                (static_cast<uint64_t>(UINT32_MAX) + 1u))
+                        {
+                            throw std::runtime_error(
+                                "Configured function table range " +
+                                std::to_string(index) +
+                                " has an invalid, unaligned, or overflowing range.");
+                        }
+                        config.functionTableRanges.push_back(range);
+                    }
+                }
+            }
+
             if (data.contains("functions") && data.at("functions").is_table())
             {
                 const auto &functionsNode = data.at("functions");
@@ -507,6 +553,25 @@ namespace ps2recomp
                 branches[address.str()] = targets;
             }
             data["indirect_branches"] = branches;
+        }
+
+        if (!config.functionTableRanges.empty())
+        {
+            toml::table analysis;
+            toml::array ranges;
+            for (const FunctionTableRange &range : config.functionTableRanges)
+            {
+                toml::table node;
+                std::ostringstream address;
+                address << "0x" << std::hex << range.address;
+                std::ostringstream size;
+                size << "0x" << std::hex << range.size;
+                node["address"] = address.str();
+                node["size"] = size.str();
+                ranges.push_back(node);
+            }
+            analysis["function_table_range"] = ranges;
+            data["analysis"] = analysis;
         }
 
         if (!config.functionBoundaries.empty())

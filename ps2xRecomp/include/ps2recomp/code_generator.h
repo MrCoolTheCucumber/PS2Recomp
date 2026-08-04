@@ -14,6 +14,7 @@ namespace ps2recomp
 {
 	struct JumpTableEntry;
     struct JumpTable;
+	struct FunctionTableRange;
 	struct Instruction;
     struct MemoryAccessHint;
 	struct Function;
@@ -64,6 +65,8 @@ namespace ps2recomp
         void setConfiguredJumpTables(const std::vector<JumpTable> &jumpTables);
         void setConfiguredIndirectBranchTargets(
             const std::unordered_map<uint32_t, std::vector<uint32_t>> &targetsByInstructionAddress);
+        void setConfiguredFunctionTableRanges(
+            const std::vector<FunctionTableRange> &ranges);
         void setResumeEntryTargets(const std::unordered_map<uint32_t, std::vector<uint32_t>> &resumeTargetsByOwner);
         void setEmitInstructionComments(bool emitInstructionComments);
         void setReporter(RecompilerReporter *reporter);
@@ -85,6 +88,7 @@ namespace ps2recomp
         std::unordered_map<uint32_t, std::vector<uint32_t>> m_configJumpTableTargetsByAddress;
         std::unordered_map<uint32_t, std::vector<uint32_t>>
             m_configIndirectBranchTargetsByInstructionAddress;
+        std::vector<FunctionTableRange> m_configFunctionTableRanges;
         std::unordered_map<uint32_t, std::vector<uint32_t>> m_resumeEntryTargetsByOwner;
         const std::vector<Section>& m_sections;
         BootstrapInfo m_bootstrapInfo;

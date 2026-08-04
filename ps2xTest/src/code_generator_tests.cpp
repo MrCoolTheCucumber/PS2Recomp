@@ -1654,6 +1654,76 @@ void register_code_generator_tests()
         t.IsFalse(analysis.indirectFallbackEntryPoints.empty(),
                   "a writable function table must retain conservative fallback entries");
 
+        writableGen.setConfiguredFunctionTableRanges({
+            FunctionTableRange{
+                tableAddress,
+                static_cast<uint32_t>(tableData.size())}});
+        analysis = writableGen.collectInternalBranchTargets(
+            caller, instructions, &functions);
+        t.IsTrue(analysis.indirectFallbackEntryPoints.empty(),
+                 "an exact configured function-table range should permit validation inside writable ELF data");
+        t.IsTrue(analysis.externalEntryPoints.contains(0x6004u),
+                 "configured writable-section tables should promote validated mid-function targets");
+
+        bool rejectedUnbackedRange = false;
+        try
+        {
+            writableGen.setConfiguredFunctionTableRanges({
+                FunctionTableRange{0x00300000u, 0x20u}});
+        }
+        catch (const std::runtime_error &)
+        {
+            rejectedUnbackedRange = true;
+        }
+        t.IsTrue(rejectedUnbackedRange,
+                 "configured function-table ranges must be fully backed by ELF data");
+
+        Function longBaseCaller;
+        longBaseCaller.name = "long_lived_function_table_base_caller";
+        longBaseCaller.start = 0x5200u;
+        longBaseCaller.end = 0x529Cu;
+        longBaseCaller.isRecompiled = true;
+
+        std::vector<Instruction> longBaseInstructions{
+            decodeI(0x5200u, OPCODE_LUI, 0u, 22u, 0x0020u),
+            decodeI(0x5204u, OPCODE_ADDIU, 22u, 22u, 0u),
+            decodeI(0x5208u, OPCODE_BEQ, 4u, 0u, 3u),
+            makeNop(0x520Cu),
+            makeNop(0x5210u),
+            makeNop(0x5214u),
+        };
+        for (uint32_t address = 0x5218u; address <= 0x5280u;
+             address += 4u)
+        {
+            longBaseInstructions.push_back(makeNop(address));
+        }
+        longBaseInstructions.push_back(
+            decodeI(0x5284u, OPCODE_ADDIU, 0u, 4u, recordStride));
+        longBaseInstructions.push_back(
+            decodeR(0x5288u, 5u, 4u, 8u, 0u, SPECIAL_MULT));
+        longBaseInstructions.push_back(
+            decodeR(0x528Cu, 8u, 22u, 9u, 0u, SPECIAL_ADDU));
+        longBaseInstructions.push_back(
+            decodeI(0x5290u, OPCODE_LW, 9u, 10u, callableFieldOffset));
+        longBaseInstructions.push_back(makeJalr(0x5294u, 10u, 31u));
+        longBaseInstructions.push_back(makeNop(0x5298u));
+
+        const std::vector<Function> longBaseFunctions{
+            longBaseCaller, targetA, targetB};
+        analysis = writableGen.collectInternalBranchTargets(
+            longBaseCaller, longBaseInstructions, &longBaseFunctions);
+        t.IsTrue(analysis.indirectFallbackEntryPoints.empty(),
+                 "a path-invariant table base should survive beyond the old backward-scan window");
+
+        std::vector<Instruction> pathClobberInstructions =
+            longBaseInstructions;
+        pathClobberInstructions[5] =
+            decodeI(0x5214u, OPCODE_ADDIU, 0u, 22u, 0u);
+        analysis = writableGen.collectInternalBranchTargets(
+            longBaseCaller, pathClobberInstructions, &longBaseFunctions);
+        t.IsFalse(analysis.indirectFallbackEntryPoints.empty(),
+                  "a path-dependent table-base assignment must merge to unknown");
+
         writeTableWord(recordStride + callableFieldOffset, 0x12345678u);
         analysis = gen.collectInternalBranchTargets(
             caller, instructions, &functions);

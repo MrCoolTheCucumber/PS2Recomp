@@ -166,6 +166,16 @@ namespace ps2recomp
         std::vector<JumpTableEntry> entries;
     };
 
+    // Exact extent of a strided function table known by external analysis to
+    // remain immutable, even when the ELF places it in a writable section.
+    // This is an analysis assertion only; it does not change guest memory
+    // permissions. The analyzer still validates every non-null target.
+    struct FunctionTableRange
+    {
+        uint32_t address = 0;
+        uint32_t size = 0;
+    };
+
     // Control flow graph
     struct CFGNode
     {
@@ -213,6 +223,7 @@ namespace ps2recomp
         std::vector<JumpTable> jumpTables;
         std::unordered_map<uint32_t, std::vector<uint32_t>>
             indirectBranchTargetsByInstructionAddress;
+        std::vector<FunctionTableRange> functionTableRanges;
         std::vector<Function> functionBoundaries;
     };
 

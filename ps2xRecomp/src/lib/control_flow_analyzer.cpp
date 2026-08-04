@@ -8,6 +8,7 @@
 
 #include <algorithm>
 #include <cstring>
+#include <deque>
 
 namespace ps2recomp
 {
@@ -15,11 +16,13 @@ namespace ps2recomp
         const std::vector<Section> &sections,
         const std::unordered_map<uint32_t, std::vector<uint32_t>> &configuredJumpTableTargetsByAddress,
         const std::unordered_map<uint32_t, std::vector<uint32_t>> &configuredIndirectBranchTargetsByInstructionAddress,
+        const std::vector<FunctionTableRange> &configuredFunctionTableRanges,
         RecompilerReporter *reporter)
         : m_sections(sections),
           m_configJumpTableTargetsByAddress(configuredJumpTableTargetsByAddress),
           m_configIndirectBranchTargetsByInstructionAddress(
               configuredIndirectBranchTargetsByInstructionAddress),
+          m_configFunctionTableRanges(configuredFunctionTableRanges),
           m_reporter(reporter)
     {
     }
@@ -35,6 +38,8 @@ namespace ps2recomp
         std::unordered_map<uint32_t, const Instruction *>
             instructionsByAddress;
         instructionsByAddress.reserve(instructions.size());
+        std::unordered_map<uint32_t, size_t> instructionIndicesByAddress;
+        instructionIndicesByAddress.reserve(instructions.size());
         bool hasIndirectRegisterJump = false;
         std::vector<const Instruction *> indirectJumps;
 
@@ -203,16 +208,224 @@ namespace ps2recomp
                    (inst.rs == 0u && inst.rt == 31u);
         };
 
-        for (const auto &inst : instructions)
+        for (size_t index = 0u; index < instructions.size(); ++index)
         {
+            const auto &inst = instructions[index];
             instructionAddresses.insert(inst.address);
             instructionsByAddress.emplace(inst.address, &inst);
+            instructionIndicesByAddress.emplace(inst.address, index);
             if (inst.opcode == OPCODE_SPECIAL &&
                 ((inst.function == SPECIAL_JR && inst.rs != 31) ||
                  inst.function == SPECIAL_JALR))
             {
                 hasIndirectRegisterJump = true;
                 indirectJumps.push_back(&inst);
+            }
+        }
+
+        // Compute constants at each instruction with a conservative
+        // instruction-level CFG. Unlike a fixed backward scan, this keeps a
+        // once-initialized table base through long blocks and loops, while a
+        // path-dependent assignment merges it back to unknown. Delay-slot
+        // shortcuts over-approximate branch-likely behavior, so they can only
+        // discard a constant rather than manufacture one.
+        std::vector<ConstantRegisterState> constantsBefore(instructions.size());
+        std::vector<bool> reachable(instructions.size(), false);
+        std::vector<std::vector<size_t>> successors(instructions.size());
+        const auto addSuccessor = [&](size_t source, uint32_t targetAddress)
+        {
+            const auto target = instructionIndicesByAddress.find(targetAddress);
+            if (source >= successors.size() ||
+                target == instructionIndicesByAddress.end())
+            {
+                return;
+            }
+            auto &targets = successors[source];
+            if (std::find(targets.begin(), targets.end(), target->second) ==
+                targets.end())
+            {
+                targets.push_back(target->second);
+            }
+        };
+
+        for (size_t index = 0u; index < instructions.size(); ++index)
+        {
+            if (index + 1u < instructions.size())
+            {
+                successors[index].push_back(index + 1u);
+            }
+        }
+
+        for (size_t index = 0u; index < instructions.size(); ++index)
+        {
+            const Instruction &inst = instructions[index];
+            const bool staticJump =
+                inst.opcode == OPCODE_J || inst.opcode == OPCODE_JAL;
+            const bool conditionalBranch =
+                inst.isBranch && !staticJump;
+            const bool indirectJump =
+                inst.opcode == OPCODE_SPECIAL &&
+                (inst.function == SPECIAL_JR ||
+                 inst.function == SPECIAL_JALR);
+            if (!staticJump && !conditionalBranch && !indirectJump)
+            {
+                continue;
+            }
+
+            successors[index].clear();
+            if (index + 1u < instructions.size())
+            {
+                successors[index].push_back(index + 1u);
+            }
+
+            const size_t delayIndex = index + 1u;
+            if (delayIndex >= instructions.size())
+            {
+                continue;
+            }
+            successors[delayIndex].clear();
+
+            if (conditionalBranch)
+            {
+                const int32_t offsetBytes =
+                    static_cast<int32_t>(
+                        static_cast<int16_t>(inst.simmediate)) * 4;
+                const uint32_t target = static_cast<uint32_t>(
+                    static_cast<int64_t>(inst.address + 4u) +
+                    static_cast<int64_t>(offsetBytes));
+                addSuccessor(delayIndex, target);
+                addSuccessor(delayIndex, inst.address + 8u);
+
+                // A likely branch skips its delay slot when not taken. Treat
+                // every conditional branch this way conservatively; the
+                // extra path merely weakens constant propagation.
+                addSuccessor(index, inst.address + 8u);
+            }
+            else if (staticJump)
+            {
+                if (inst.opcode == OPCODE_JAL)
+                {
+                    addSuccessor(delayIndex, inst.address + 8u);
+                }
+                else
+                {
+                    addSuccessor(
+                        delayIndex,
+                        buildAbsoluteJumpTarget(inst.address, inst.target));
+                }
+            }
+            else if (inst.function == SPECIAL_JALR)
+            {
+                addSuccessor(delayIndex, inst.address + 8u);
+            }
+        }
+
+        const auto transferConstants = [](const Instruction &inst,
+                                          ConstantRegisterState &constants)
+        {
+            const ConstantRegisterState incoming = constants;
+            for (uint32_t reg = 1u; reg < 32u; ++reg)
+            {
+                if ((inst.gprWriteMask & (1u << reg)) != 0u)
+                {
+                    constants.invalidate(reg);
+                }
+            }
+
+            // Calls may overwrite the MIPS caller-saved registers. Preserve
+            // $s0-$s7, $gp, $sp, and $fp as required by the ABI.
+            if (inst.isCall)
+            {
+                for (uint32_t reg = 1u; reg <= 15u; ++reg)
+                {
+                    constants.invalidate(reg);
+                }
+                constants.invalidate(24u);
+                constants.invalidate(25u);
+                constants.invalidate(31u);
+            }
+
+            uint32_t lhs = 0u;
+            uint32_t rhs = 0u;
+            switch (inst.opcode)
+            {
+            case OPCODE_LUI:
+                constants.write(inst.rt, inst.immediate << 16u);
+                break;
+            case OPCODE_ADDI:
+            case OPCODE_ADDIU:
+            case OPCODE_DADDI:
+            case OPCODE_DADDIU:
+                if (incoming.read(inst.rs, lhs))
+                {
+                    constants.write(inst.rt, lhs + inst.simmediate);
+                }
+                break;
+            case OPCODE_ORI:
+                if (incoming.read(inst.rs, lhs))
+                {
+                    constants.write(inst.rt, lhs | inst.immediate);
+                }
+                break;
+            case OPCODE_SPECIAL:
+                if (incoming.read(inst.rs, lhs) &&
+                    incoming.read(inst.rt, rhs))
+                {
+                    if (inst.function == SPECIAL_ADDU ||
+                        inst.function == SPECIAL_DADDU)
+                    {
+                        constants.write(inst.rd, lhs + rhs);
+                    }
+                    else if (inst.function == SPECIAL_OR)
+                    {
+                        constants.write(inst.rd, lhs | rhs);
+                    }
+                }
+                break;
+            default:
+                break;
+            }
+        };
+
+        if (!instructions.empty())
+        {
+            reachable[0] = true;
+            std::deque<size_t> worklist{0u};
+            while (!worklist.empty())
+            {
+                const size_t index = worklist.front();
+                worklist.pop_front();
+
+                ConstantRegisterState outgoing = constantsBefore[index];
+                transferConstants(instructions[index], outgoing);
+                for (size_t successor : successors[index])
+                {
+                    bool changed = false;
+                    if (!reachable[successor])
+                    {
+                        constantsBefore[successor] = outgoing;
+                        reachable[successor] = true;
+                        changed = true;
+                    }
+                    else
+                    {
+                        auto &merged = constantsBefore[successor];
+                        for (uint32_t reg = 1u; reg < 32u; ++reg)
+                        {
+                            if (merged.known[reg] &&
+                                (!outgoing.known[reg] ||
+                                 merged.values[reg] != outgoing.values[reg]))
+                            {
+                                merged.invalidate(reg);
+                                changed = true;
+                            }
+                        }
+                    }
+                    if (changed)
+                    {
+                        worklist.push_back(successor);
+                    }
+                }
             }
         }
 
@@ -543,37 +756,67 @@ namespace ps2recomp
                         uint32_t tableAddress = 0;
                         bool foundTableAddress = false;
 
-                        if (adduIndex != -1)
+                        if (adduIndex != -1 &&
+                            static_cast<size_t>(adduIndex) <
+                                constantsBefore.size() &&
+                            reachable[adduIndex])
                         {
-                            for (int i = adduIndex - 1; i >= 0 && i >= adduIndex - 20; --i)
+                            uint32_t lhs = 0u;
+                            uint32_t rhs = 0u;
+                            const bool lhsIsConstant =
+                                constantsBefore[adduIndex].read(
+                                    tableBaseReg, lhs);
+                            const bool rhsIsConstant =
+                                constantsBefore[adduIndex].read(
+                                    indexReg, rhs);
+                            if (lhsIsConstant != rhsIsConstant)
+                            {
+                                tableAddress = lhsIsConstant ? lhs : rhs;
+                                foundTableAddress = true;
+                            }
+                        }
+
+                        // Some function maps contain disconnected blocks
+                        // reached only through the very indirect jump being
+                        // analyzed. Preserve the existing local materialized-
+                        // address matcher for those blocks; the CFG state
+                        // above is what permits a proven base to live beyond
+                        // this deliberately small window.
+                        if (!foundTableAddress && adduIndex != -1)
+                        {
+                            for (int i = adduIndex - 1;
+                                 i >= 0 && i >= adduIndex - 20; --i)
                             {
                                 const auto &inst = instructions[i];
-                                if (inst.opcode == OPCODE_LUI)
+                                if (inst.opcode != OPCODE_LUI ||
+                                    (inst.rt != tableBaseReg &&
+                                     inst.rt != indexReg))
                                 {
-                                    if (inst.rt == tableBaseReg || inst.rt == indexReg)
+                                    continue;
+                                }
+
+                                const uint32_t high = inst.immediate << 16u;
+                                uint32_t low = 0u;
+                                for (int j = i + 1; j < adduIndex; ++j)
+                                {
+                                    const auto &lowInst = instructions[j];
+                                    if (lowInst.rs != inst.rt ||
+                                        lowInst.rt != inst.rt)
                                     {
-                                        uint32_t high = inst.immediate << 16;
-                                        uint32_t low = 0;
-                                        for (int j = i + 1; j < adduIndex; ++j)
-                                        {
-                                            const auto &lowInst = instructions[j];
-                                            if (lowInst.rs == inst.rt && lowInst.rt == inst.rt)
-                                            {
-                                                if (lowInst.opcode == OPCODE_ADDIU)
-                                                {
-                                                    low = (uint32_t)lowInst.simmediate;
-                                                }
-                                                else if (lowInst.opcode == OPCODE_ORI)
-                                                {
-                                                    low = lowInst.immediate;
-                                                }
-                                            }
-                                        }
-                                        tableAddress = high + low;
-                                        foundTableAddress = true;
-                                        break;
+                                        continue;
+                                    }
+                                    if (lowInst.opcode == OPCODE_ADDIU)
+                                    {
+                                        low = lowInst.simmediate;
+                                    }
+                                    else if (lowInst.opcode == OPCODE_ORI)
+                                    {
+                                        low = lowInst.immediate;
                                     }
                                 }
+                                tableAddress = high + low;
+                                foundTableAddress = true;
+                                break;
                             }
                         }
 
@@ -877,25 +1120,72 @@ namespace ps2recomp
                                 }
                             }
 
-                            // Read-only sections frequently encode vtables as
-                            // fixed-size records rather than dense switch
-                            // tables. When a JALR loads one field from each
-                            // record, the section boundary supplies the table
-                            // extent. Accept the inference only when every
-                            // non-null field is a known executable target.
+                            // Read-only sections and verified function-table
+                            // ranges frequently encode vtables as fixed-size
+                            // records rather than dense switch tables. The
+                            // immutable boundary supplies the exact extent;
+                            // every non-null field must still be a known
+                            // executable target.
                             if (!foundTable &&
                                 jrInst->function == SPECIAL_JALR &&
                                 scaledIndex.instructionIndex >= 0)
                             {
                                 const Section *tableSection = nullptr;
-                                for (const auto &sec : m_sections)
+                                uint32_t tableRangeAddress = 0u;
+                                uint32_t tableRangeSize = 0u;
+
+                                // Explicit immutable subranges take priority
+                                // over coarse ELF section flags and also
+                                // provide the exact record-table extent.
+                                for (const FunctionTableRange &range :
+                                     m_configFunctionTableRanges)
                                 {
-                                    if (sec.isReadOnly && sec.data &&
-                                        tableAddress >= sec.address &&
-                                        tableAddress < sec.address + sec.size)
+                                    const uint64_t rangeEnd =
+                                        static_cast<uint64_t>(range.address) +
+                                        range.size;
+                                    if (tableAddress < range.address ||
+                                        tableAddress >= rangeEnd)
                                     {
-                                        tableSection = &sec;
+                                        continue;
+                                    }
+                                    for (const Section &sec : m_sections)
+                                    {
+                                        const uint64_t sectionEnd =
+                                            static_cast<uint64_t>(sec.address) +
+                                            sec.size;
+                                        if (sec.data && sec.isData &&
+                                            !sec.isBSS &&
+                                            range.address >= sec.address &&
+                                            rangeEnd <= sectionEnd)
+                                        {
+                                            tableSection = &sec;
+                                            tableRangeAddress = range.address;
+                                            tableRangeSize = range.size;
+                                            break;
+                                        }
+                                    }
+                                    if (tableSection)
+                                    {
                                         break;
+                                    }
+                                }
+
+                                if (!tableSection)
+                                {
+                                    for (const auto &sec : m_sections)
+                                    {
+                                        const uint64_t sectionEnd =
+                                            static_cast<uint64_t>(sec.address) +
+                                            sec.size;
+                                        if (sec.isReadOnly && sec.data &&
+                                            tableAddress >= sec.address &&
+                                            tableAddress < sectionEnd)
+                                        {
+                                            tableSection = &sec;
+                                            tableRangeAddress = sec.address;
+                                            tableRangeSize = sec.size;
+                                            break;
+                                        }
                                     }
                                 }
 
@@ -903,10 +1193,10 @@ namespace ps2recomp
                                     scaledIndex.strideBytes >= sizeof(uint32_t))
                                 {
                                     const uint32_t fieldOffset =
-                                        tableAddress - tableSection->address;
+                                        tableAddress - tableRangeAddress;
                                     const uint64_t sectionEnd =
-                                        static_cast<uint64_t>(tableSection->address) +
-                                        tableSection->size;
+                                        static_cast<uint64_t>(tableRangeAddress) +
+                                        tableRangeSize;
                                     const bool firstFieldFits =
                                         static_cast<uint64_t>(tableAddress) +
                                             sizeof(uint32_t) <=

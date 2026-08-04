@@ -10,6 +10,7 @@ namespace ps2recomp
 {
     struct Function;
     struct Instruction;
+    struct FunctionTableRange;
     struct Section;
     class RecompilerReporter;
 
@@ -30,6 +31,7 @@ namespace ps2recomp
         ControlFlowAnalyzer(const std::vector<Section> &sections,
                             const std::unordered_map<uint32_t, std::vector<uint32_t>> &configuredJumpTableTargetsByAddress,
                             const std::unordered_map<uint32_t, std::vector<uint32_t>> &configuredIndirectBranchTargetsByInstructionAddress,
+                            const std::vector<FunctionTableRange> &configuredFunctionTableRanges,
                             RecompilerReporter *reporter);
 
         ControlFlowAnalysisResult analyze(const Function &function,
@@ -41,6 +43,7 @@ namespace ps2recomp
         const std::unordered_map<uint32_t, std::vector<uint32_t>> &m_configJumpTableTargetsByAddress;
         const std::unordered_map<uint32_t, std::vector<uint32_t>> &
             m_configIndirectBranchTargetsByInstructionAddress;
+        const std::vector<FunctionTableRange> &m_configFunctionTableRanges;
         RecompilerReporter *m_reporter = nullptr;
     };
 }

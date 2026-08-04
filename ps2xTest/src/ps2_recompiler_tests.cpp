@@ -872,6 +872,10 @@ void register_ps2_recompiler_tests()
             configFile << "module_name = \"veldin-test\"\n";
             configFile << "module_match_address = \"0x245c28\"\n";
             configFile << "module_match_size = 96\n\n";
+            configFile << "[analysis]\n";
+            configFile << "[[analysis.function_table_range]]\n";
+            configFile << "address = \"0x183f90\"\n";
+            configFile << "size = \"0x260\"\n\n";
             configFile << "[functions]\n";
             configFile << "[[functions.boundary]]\n";
             configFile << "address = \"0x1700\"\n";
@@ -900,6 +904,15 @@ void register_ps2_recompiler_tests()
                      "module match address should parse from a hex string");
             t.Equals(config.moduleMatchSize, 96u,
                      "module match size should parse");
+            t.Equals(config.functionTableRanges.size(), static_cast<size_t>(1),
+                     "one configured function-table range should be loaded");
+            if (!config.functionTableRanges.empty())
+            {
+                t.Equals(config.functionTableRanges.front().address, 0x183f90u,
+                         "function-table address should parse from a hex string");
+                t.Equals(config.functionTableRanges.front().size, 0x260u,
+                         "function-table size should parse from a hex string");
+            }
             t.Equals(config.functionBoundaries.size(), static_cast<size_t>(1),
                      "one configured function boundary should be loaded");
             if (!config.functionBoundaries.empty())
@@ -953,6 +966,21 @@ void register_ps2_recompiler_tests()
                     t.Equals(indirectBranch->second[1], 0x1630u,
                              "second indirect target should parse");
                 }
+            }
+
+            manager.saveConfig(config);
+            const RecompilerConfig roundTripped = manager.loadConfig();
+            t.Equals(roundTripped.functionTableRanges.size(),
+                     static_cast<size_t>(1),
+                     "function-table ranges should survive config save and reload");
+            if (!roundTripped.functionTableRanges.empty())
+            {
+                t.Equals(roundTripped.functionTableRanges.front().address,
+                         0x183f90u,
+                         "round-tripped function-table address should match");
+                t.Equals(roundTripped.functionTableRanges.front().size,
+                         0x260u,
+                         "round-tripped function-table size should match");
             }
 
             std::error_code removeError;
