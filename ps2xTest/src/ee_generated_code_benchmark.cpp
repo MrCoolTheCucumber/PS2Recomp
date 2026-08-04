@@ -20,12 +20,14 @@ namespace
 {
     using namespace ps2x::performance;
 
-    constexpr uint32_t kOutputSchemaVersion = 2u;
+    constexpr uint32_t kOutputSchemaVersion = 3u;
     constexpr uint32_t kInstructionsPerBlock = 10u;
     constexpr uint32_t kLoadsPerBlock = 1u;
     constexpr uint32_t kStoresPerBlock = 1u;
     constexpr uint32_t kCycleTicksPerInstruction = 8u;
     constexpr uint32_t kCodeBase = 0x00180004u;
+    constexpr uint32_t kCodeRegionBase = kCodeBase & ~0xfffu;
+    constexpr uint32_t kCodeRegionSize = 0x1000u;
     constexpr uint32_t kVirtualBase = 0x00400000u;
     constexpr uint32_t kIdentityPhysicalBase = kVirtualBase;
     constexpr uint32_t kMappedPhysicalBase = 0x00800000u;
@@ -632,6 +634,13 @@ namespace
                 throw std::runtime_error(
                     "failed to initialize PS2 memory");
             }
+            // Production generated code registers executable RDRAM regions.
+            // Keep one inert page away from both benchmark working sets so
+            // every store measures the ordinary non-code invalidation probe
+            // without changing its memory result.
+            runtime.memory().registerCodeRegion(
+                kCodeRegionBase,
+                kCodeRegionBase + kCodeRegionSize);
             for (uint32_t index = 0u;
                  index < runtime.memory().tlbEntryCount();
                  ++index)
@@ -1241,6 +1250,8 @@ int main(int argc, char **argv)
             << ",\"virtual_base\":" << kVirtualBase
             << ",\"mapped_physical_base\":" << kMappedPhysicalBase
             << ",\"direct_kseg_base\":" << kDirectBase
+            << ",\"inert_code_region_base\":" << kCodeRegionBase
+            << ",\"inert_code_region_size\":" << kCodeRegionSize
             << ",\"non_identity_mapping\":"
             << (kVirtualBase != kMappedPhysicalBase
                     ? "true" : "false")

@@ -1145,6 +1145,48 @@ public:
         observeRdramWriteSlow(
             physicalAddress, size, writerPc);
     }
+
+    // Reject the common non-code case inline for generated fixed-width
+    // stores. Accesses of at most 16 bytes can touch no more than two RDRAM
+    // pages, while the slow path retains the exact region intersection and
+    // invalidation aggregation behavior for pages that may contain code.
+    template <uint32_t AccessSize>
+    inline void observeRdramWriteFixed(
+        uint32_t physicalAddress,
+        uint32_t writerPc)
+    {
+        static_assert(
+            AccessSize != 0u && AccessSize <= 16u,
+            "fixed RDRAM writes must be between 1 and 16 bytes");
+
+        if (!m_hasCodeRegions ||
+            physicalAddress > PS2_RAM_SIZE - AccessSize)
+        {
+            return;
+        }
+
+        const uint32_t firstPage =
+            physicalAddress >> kCodeRegionPageShift;
+        const uint32_t lastPage =
+            (physicalAddress + AccessSize - 1u) >>
+            kCodeRegionPageShift;
+        const auto pageMayContainCode = [this](uint32_t page)
+        {
+            const uint64_t pageBit =
+                uint64_t{1u} << (page & 63u);
+            return (m_codeRegionPages[page >> 6u] & pageBit) != 0u;
+        };
+
+        if (!pageMayContainCode(firstPage) &&
+            (lastPage == firstPage ||
+             !pageMayContainCode(lastPage)))
+        {
+            return;
+        }
+
+        observeRdramWriteSlow(
+            physicalAddress, AccessSize, writerPc);
+    }
     void observeRdramWriteSlow(
         uint32_t physicalAddress,
         uint32_t size,

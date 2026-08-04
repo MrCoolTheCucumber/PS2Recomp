@@ -709,8 +709,8 @@ static inline void Ps2FastWrite128(uint8_t *rdram, uint32_t addr, __m128i value)
             (uint32_t)(physicalOffset);                                             \
         runtime->debugObserveMemoryAccess(                                          \
             _debug_addr, (width) / 8u, PS2Runtime::DebugMemoryAccess::Write, ctx);  \
-        runtime->memory().observeRdramWrite(                                        \
-            _debug_physical_offset, (width) / 8u, ctx ? ctx->pc : 0u);             \
+        runtime->memory().observeRdramWriteFixed<(width) / 8u>(                     \
+            _debug_physical_offset, ctx ? ctx->pc : 0u);                           \
         FAST_WRITE##width(_debug_physical_offset, (type)(val));                     \
     } while (0)
 
@@ -742,8 +742,8 @@ static inline void Ps2FastWrite128(uint8_t *rdram, uint32_t addr, __m128i value)
         const __m128i _debug_value = (val);                                         \
         runtime->debugObserveMemoryAccess(                                          \
             _debug_addr, 16u, PS2Runtime::DebugMemoryAccess::Write, ctx);           \
-        runtime->memory().observeRdramWrite(                                        \
-            _debug_physical_offset, 16u, ctx ? ctx->pc : 0u);                      \
+        runtime->memory().observeRdramWriteFixed<16u>(                              \
+            _debug_physical_offset, ctx ? ctx->pc : 0u);                           \
         FAST_WRITE128(_debug_physical_offset, _debug_value);                        \
     } while (0)
 
@@ -853,8 +853,8 @@ Ps2ResolveFastGuestRdramAccessFixed(
             runtime->debugObserveMemoryAccess(                                       \
                 _addr, 1u, PS2Runtime::DebugMemoryAccess::Write, ctx);               \
             ps2TraceGuestWrite(rdram, _addr, 1u, _value, 0u, "WRITE8", ctx);        \
-            runtime->memory().observeRdramWrite(                                     \
-                _physical_offset, 1u, ctx ? ctx->pc : 0u);                          \
+            runtime->memory().observeRdramWriteFixed<1u>(                            \
+                _physical_offset, ctx ? ctx->pc : 0u);                              \
             FAST_WRITE8(_physical_offset, _value);                                   \
         }                                                                            \
     } while (0)
@@ -876,8 +876,8 @@ Ps2ResolveFastGuestRdramAccessFixed(
             runtime->debugObserveMemoryAccess(                                         \
                 _addr, 2u, PS2Runtime::DebugMemoryAccess::Write, ctx);                 \
             ps2TraceGuestWrite(rdram, _addr, 2u, _value, 0u, "WRITE16", ctx);         \
-            runtime->memory().observeRdramWrite(                                       \
-                _physical_offset, 2u, ctx ? ctx->pc : 0u);                            \
+            runtime->memory().observeRdramWriteFixed<2u>(                              \
+                _physical_offset, ctx ? ctx->pc : 0u);                                \
             FAST_WRITE16(_physical_offset, _value);                                    \
         }                                                                              \
     } while (0)
@@ -899,8 +899,8 @@ Ps2ResolveFastGuestRdramAccessFixed(
             runtime->debugObserveMemoryAccess(                                         \
                 _addr, 4u, PS2Runtime::DebugMemoryAccess::Write, ctx);                 \
             ps2TraceGuestWrite(rdram, _addr, 4u, _value, 0u, "WRITE32", ctx);         \
-            runtime->memory().observeRdramWrite(                                       \
-                _physical_offset, 4u, ctx ? ctx->pc : 0u);                            \
+            runtime->memory().observeRdramWriteFixed<4u>(                              \
+                _physical_offset, ctx ? ctx->pc : 0u);                                \
             FAST_WRITE32(_physical_offset, _value);                                    \
         }                                                                              \
     } while (0)
@@ -922,8 +922,8 @@ Ps2ResolveFastGuestRdramAccessFixed(
             runtime->debugObserveMemoryAccess(                                         \
                 _addr, 8u, PS2Runtime::DebugMemoryAccess::Write, ctx);                 \
             ps2TraceGuestWrite(rdram, _addr, 8u, _value, 0u, "WRITE64", ctx);         \
-            runtime->memory().observeRdramWrite(                                       \
-                _physical_offset, 8u, ctx ? ctx->pc : 0u);                            \
+            runtime->memory().observeRdramWriteFixed<8u>(                              \
+                _physical_offset, ctx ? ctx->pc : 0u);                                \
             FAST_WRITE64(_physical_offset, _value);                                    \
         }                                                                              \
     } while (0)
@@ -1017,8 +1017,8 @@ Ps2ResolveFastGuestRdramAccessFixed(
             const uint64_t _lo = static_cast<uint64_t>(PS2_EXTRACT_EPI64_0(_value)); \
             const uint64_t _hi = static_cast<uint64_t>(PS2_EXTRACT_EPI64_1(_value)); \
             ps2TraceGuestWrite(rdram, _addr, 16u, _lo, _hi, "WRITE128", ctx);        \
-            runtime->memory().observeRdramWrite(                                     \
-                _physical_offset, 16u, ctx ? ctx->pc : 0u);                         \
+            runtime->memory().observeRdramWriteFixed<16u>(                           \
+                _physical_offset, ctx ? ctx->pc : 0u);                              \
             FAST_WRITE128(_physical_offset, _value);                                 \
         }                                                                            \
     } while (0)

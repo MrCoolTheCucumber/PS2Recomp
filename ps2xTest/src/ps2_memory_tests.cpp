@@ -6299,5 +6299,44 @@ void register_ps2_memory_tests()
             t.IsTrue(mem.isCodeModified(0x1000u, 0x24u),
                      "all invalidated code words should remain marked modified");
         });
+
+        tc.Run("fixed RDRAM write observation rejects non-code pages and checks page crossings", [](TestCase &t)
+        {
+            PS2Memory mem;
+            t.IsTrue(mem.initialize(), "PS2Memory initialize should succeed");
+            mem.registerCodeRegion(0x2000u, 0x2010u);
+
+            constexpr uint32_t writerPc = 0x00123450u;
+            mem.observeRdramWriteFixed<4u>(0x4000u, writerPc);
+            t.IsTrue(
+                mem.takeCodeInvalidationEvents().empty(),
+                "a fixed write on a non-code page should not invalidate code");
+
+            mem.observeRdramWriteFixed<16u>(0x1ff8u, writerPc);
+            const auto events = mem.takeCodeInvalidationEvents();
+            t.Equals(
+                events.size(),
+                static_cast<size_t>(1u),
+                "a fixed write crossing into a code page should invalidate code");
+            if (events.size() == 1u)
+            {
+                t.Equals(
+                    events[0].start,
+                    0x2000u,
+                    "the crossing invalidation should begin at the code region");
+                t.Equals(
+                    events[0].end,
+                    0x2008u,
+                    "the crossing invalidation should cover the overlapping words");
+                t.Equals(
+                    events[0].words,
+                    2u,
+                    "the crossing invalidation should count both overlapping words");
+                t.Equals(
+                    events[0].writerPc,
+                    writerPc,
+                    "the crossing invalidation should retain its writer PC");
+            }
+        });
     });
 }
