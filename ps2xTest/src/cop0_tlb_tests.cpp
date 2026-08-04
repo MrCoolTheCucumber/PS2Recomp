@@ -1,6 +1,7 @@
 #include "MiniTest.h"
 
 #include "ps2_runtime.h"
+#include "ps2_runtime_macros.h"
 
 #include <array>
 #include <cstring>
@@ -76,6 +77,15 @@ namespace
         }
         return false;
     }
+
+    uint32_t generatedMappedLoad32(
+        uint8_t *rdram,
+        R5900Context *ctx,
+        PS2Runtime *runtime,
+        uint32_t virtualAddress)
+    {
+        return READ32(virtualAddress);
+    }
 }
 
 void register_cop0_tlb_tests()
@@ -128,6 +138,125 @@ void register_cop0_tlb_tests()
                 ctx.cop0_pagemask,
                 0u,
                 "TLBR should restore PageMask");
+        });
+
+        tc.Run("TLBWI and TLBWR invalidate generated mapped cache hits", [](TestCase &t)
+        {
+            constexpr uint32_t virtualBase = 0x04400000u;
+            constexpr uint32_t virtualAddress =
+                virtualBase + 0x180u;
+            constexpr uint32_t unrelatedBase = 0x04600000u;
+            constexpr uint32_t asid = 0x5au;
+            constexpr uint32_t firstPfn = 0x00100u;
+            constexpr uint32_t secondPfn = 0x00200u;
+            constexpr uint32_t thirdPfn = 0x00300u;
+            constexpr uint32_t firstValue = 0x11223344u;
+            constexpr uint32_t secondValue = 0x55667788u;
+            constexpr uint32_t thirdValue = 0x99aabbccu;
+
+            PS2Runtime runtime;
+            t.IsTrue(
+                initializeEmptyTlb(runtime),
+                "the mutation fixture should initialize an empty TLB");
+            R5900Context ctx{};
+            ctx.cop0_status = 0x00000010u;
+            writeIndexedEntry(
+                runtime,
+                ctx,
+                7u,
+                virtualBase | asid,
+                makeEntryLo(
+                    firstPfn, 2u, true, true, false),
+                makeEntryLo(
+                    firstPfn + 1u, 2u, true, true, false));
+            ctx.cop0_entryhi = asid;
+            std::memcpy(
+                runtime.memory().getRDRAM() +
+                    (firstPfn << 12u) + 0x180u,
+                &firstValue,
+                sizeof(firstValue));
+            std::memcpy(
+                runtime.memory().getRDRAM() +
+                    (secondPfn << 12u) + 0x180u,
+                &secondValue,
+                sizeof(secondValue));
+            std::memcpy(
+                runtime.memory().getRDRAM() +
+                    (thirdPfn << 12u) + 0x180u,
+                &thirdValue,
+                sizeof(thirdValue));
+
+            uint8_t *const rdram =
+                runtime.memory().getRDRAM();
+            t.Equals(
+                generatedMappedLoad32(
+                    rdram, &ctx, &runtime, virtualAddress),
+                firstValue,
+                "the first generated load should fill from TLBWI");
+            runtime.memory().setTlbTranslationCacheDiagnosticsEnabled(
+                true);
+            runtime.memory().resetTlbTranslationCacheStats();
+            t.Equals(
+                generatedMappedLoad32(
+                    rdram, &ctx, &runtime, virtualAddress),
+                firstValue,
+                "the repeated generated load should hit the initial mapping");
+            t.Equals(
+                runtime.memory().tlbTranslationCacheStats().hits,
+                1ull,
+                "the initial generated mapping should be warm");
+
+            writeIndexedEntry(
+                runtime,
+                ctx,
+                8u,
+                unrelatedBase | asid,
+                makeEntryLo(
+                    0x00400u, 2u, true, true, false),
+                makeEntryLo(
+                    0x00401u, 2u, true, true, false));
+            ctx.cop0_entryhi = asid;
+            runtime.memory().resetTlbTranslationCacheStats();
+            t.Equals(
+                generatedMappedLoad32(
+                    rdram, &ctx, &runtime, virtualAddress),
+                firstValue,
+                "an unrelated TLBWI should refill the unchanged mapping");
+            t.IsTrue(
+                runtime.memory().tlbTranslationCacheStats().generationMisses !=
+                    0u,
+                "an unrelated TLBWI should reject the stale cache generation");
+
+            writeIndexedEntry(
+                runtime,
+                ctx,
+                7u,
+                virtualBase | asid,
+                makeEntryLo(
+                    secondPfn, 2u, true, true, false),
+                makeEntryLo(
+                    secondPfn + 1u, 2u, true, true, false));
+            ctx.cop0_entryhi = asid;
+            t.Equals(
+                generatedMappedLoad32(
+                    rdram, &ctx, &runtime, virtualAddress),
+                secondValue,
+                "an exact TLBWI replacement should select its new PFN");
+
+            ctx.cop0_random = 7u;
+            ctx.cop0_entryhi = virtualBase | asid;
+            ctx.cop0_entrylo0 = makeEntryLo(
+                thirdPfn, 2u, true, true, false);
+            ctx.cop0_entrylo1 = makeEntryLo(
+                thirdPfn + 1u, 2u, true, true, false);
+            ctx.cop0_pagemask = 0u;
+            runtime.handleTLBWR(rdram, &ctx);
+            ctx.cop0_entryhi = asid;
+            t.Equals(
+                generatedMappedLoad32(
+                    rdram, &ctx, &runtime, virtualAddress),
+                thirdValue,
+                "TLBWR should invalidate the hit and select its replacement PFN");
         });
 
         tc.Run("even and odd virtual pages select distinct PFNs", [](TestCase &t)

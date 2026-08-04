@@ -101,6 +101,93 @@ defaultPs2RuntimeConfiguration() noexcept
     return configuration;
 }
 
+#if defined(_MSC_VER)
+__declspec(noinline)
+#elif defined(__GNUC__) || defined(__clang__)
+__attribute__((noinline))
+#endif
+bool Ps2ResolveFastGuestRdramAccess(
+    PS2Runtime *runtime,
+    const R5900Context *ctx,
+    uint32_t address,
+    uint32_t bytes,
+    bool writeAccess,
+    uint32_t &physicalOffset)
+{
+    if (runtime == nullptr)
+    {
+        return false;
+    }
+    const EeAddressTranslationContext translation =
+        ctx != nullptr
+            ? EeAddressTranslationContext::fromCop0Status(
+                  ctx->cop0_status,
+                  static_cast<uint8_t>(ctx->cop0_entryhi))
+            : EeAddressTranslationContext::unchecked();
+    return Ps2ResolveFastGuestRdramOffset(
+        runtime->memory(),
+        translation,
+        address,
+        bytes,
+        writeAccess,
+        physicalOffset);
+}
+
+static void emitEeTlbTranslationCacheDiagnostics(
+    PS2Memory &memory,
+    bool &pending)
+{
+    if (!pending)
+    {
+        return;
+    }
+    pending = false;
+
+    const EeTlbTranslationCacheStats stats =
+        memory.tlbTranslationCacheStats();
+    std::cerr
+        << "{\"schema_version\":1,"
+           "\"event\":\"ee-tlb-cache-stats\","
+           "\"sets\":"
+        << PS2Memory::kTlbTranslationCacheSetCount
+        << ",\"ways\":"
+        << PS2Memory::kTlbTranslationCacheWayCount
+        << ",\"fast_sets\":"
+        << PS2Memory::kTlbFastCacheSetCount
+        << ",\"page_size\":"
+        << PS2Memory::kTlbTranslationCachePageSize
+        << ",\"generation\":"
+        << memory.tlbMappingGeneration()
+        << ",\"hits\":" << stats.hits
+        << ",\"misses\":" << stats.misses
+        << ",\"permission_misses\":"
+        << stats.permissionMisses
+        << ",\"generation_misses\":"
+        << stats.generationMisses
+        << ",\"interval_crossings\":"
+        << stats.intervalCrossings
+        << ",\"slow_path_faults\":"
+        << stats.slowPathFaults
+        << ",\"fills\":" << stats.fills
+        << ",\"replacements\":"
+        << stats.replacements
+        << ",\"mapping_changes\":"
+        << stats.mappingChanges
+        << ",\"fast_hits\":"
+        << stats.fastHits
+        << ",\"fast_misses\":"
+        << stats.fastMisses
+        << ",\"backing_hits\":"
+        << stats.backingHits
+        << ",\"backing_misses\":"
+        << stats.backingMisses
+        << ",\"fast_fills\":"
+        << stats.fastFills
+        << ",\"fast_replacements\":"
+        << stats.fastReplacements
+        << "}" << std::endl;
+}
+
 struct HostPresentationUploadState
 {
     uint64_t lastPresentationTick =
@@ -1348,6 +1435,39 @@ PS2Runtime::PS2Runtime(PS2RuntimeConfiguration configuration)
         }
     }
 
+    bool tlbTranslationCacheDiagnostics =
+        configuration.eeTlbTranslationCacheDiagnostics;
+    if (configuration
+            .useEeTlbTranslationCacheDiagnosticsEnvironment)
+    {
+        if (const char *const value =
+                std::getenv(
+                    "PS2X_EE_TLB_CACHE_DIAGNOSTICS"))
+        {
+            const std::string_view text(value);
+            if (text == "1" || text == "true" ||
+                text == "on")
+            {
+                tlbTranslationCacheDiagnostics = true;
+            }
+            else if (text == "0" || text == "false" ||
+                     text == "off")
+            {
+                tlbTranslationCacheDiagnostics = false;
+            }
+            else
+            {
+                throw std::invalid_argument(
+                    "PS2X_EE_TLB_CACHE_DIAGNOSTICS must be "
+                    "0, 1, false, true, off, or on");
+            }
+        }
+    }
+    m_memory.setTlbTranslationCacheDiagnosticsEnabled(
+        tlbTranslationCacheDiagnostics);
+    m_emitTlbTranslationCacheDiagnosticsOnDestruction =
+        tlbTranslationCacheDiagnostics;
+
     m_memory.setEeCounterCycleCallback(
         [this]()
         {
@@ -1562,6 +1682,9 @@ PS2Runtime::~PS2Runtime()
         {
             m_eeRuntimeExecutor->join();
         }
+        emitEeTlbTranslationCacheDiagnostics(
+            m_memory,
+            m_emitTlbTranslationCacheDiagnosticsOnDestruction);
 #if defined(PS2X_ENABLE_DEBUG_SERVER) && PS2X_ENABLE_DEBUG_SERVER
         if (m_debugServer)
         {
@@ -6989,6 +7112,18 @@ void PS2Runtime::ValidateInstructionFetchWithoutObservation(
             ctx,
             EXCEPTION_ADDRESS_ERROR_LOAD,
             virtualAddress);
+    }
+
+    uint32_t physicalOffset = 0u;
+    if (Ps2ResolveFastGuestRdramOffset(
+            m_memory,
+            guestAddressTranslation(ctx),
+            virtualAddress,
+            sizeof(uint32_t),
+            false,
+            physicalOffset))
+    {
+        return;
     }
 
     try
@@ -13388,6 +13523,9 @@ void PS2Runtime::run()
         std::cerr << "[run] warning: " << remainingThreads
                   << " guest worker thread(s) still active during shutdown." << std::endl;
     }
+    emitEeTlbTranslationCacheDiagnostics(
+        m_memory,
+        m_emitTlbTranslationCacheDiagnosticsOnDestruction);
 }
 
 #undef PS2X_EE_OBSERVATION_COLD

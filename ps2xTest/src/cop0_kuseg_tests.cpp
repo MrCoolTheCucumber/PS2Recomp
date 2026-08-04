@@ -178,6 +178,9 @@ void register_cop0_kuseg_tests()
             R5900Context ctx{};
             ctx.cop0_status = kStatusUser;
             ctx.cop0_entryhi = asid;
+            runtime.memory().setTlbTranslationCacheDiagnosticsEnabled(
+                true);
+            runtime.memory().resetTlbTranslationCacheStats();
             const bool mappedFault = raisesGuestException([&]()
             {
                 generatedKusegPairAccess(
@@ -207,6 +210,54 @@ void register_cop0_kuseg_tests()
                 0xa5b6c7d8u,
                 "the mapped kuseg store should target the odd PFN");
 
+            uint32_t cachedPhysicalOffset = 0u;
+            t.IsTrue(
+                Ps2ResolveFastGuestRdramAccess(
+                    &runtime,
+                    &ctx,
+                    virtualBase + 0x1044u,
+                    sizeof(uint32_t),
+                    true,
+                    cachedPhysicalOffset),
+                "a successful mapped access should expose its cached RDRAM offset");
+            t.Equals(
+                cachedPhysicalOffset,
+                (oddPfn << 12u) + 0x44u,
+                "the mapped fast resolver must return the non-identity odd PFN");
+
+            runtime.memory().resetTlbTranslationCacheStats();
+            runtime.validateEeInstructionFetchPolicy<
+                EeArchitecturalObservationMode::Fast>(
+                &ctx, virtualBase + 0x40u);
+            const EeTlbTranslationCacheStats fetchStats =
+                runtime.memory().tlbTranslationCacheStats();
+            t.Equals(
+                fetchStats.hits,
+                1ull,
+                "fast instruction-fetch validation should use the mapped cache");
+            t.Equals(
+                fetchStats.misses,
+                0ull,
+                "a warm mapped instruction fetch should avoid the translator");
+
+            R5900Context sharedContext{};
+            sharedContext.cop0_status = kStatusUser;
+            sharedContext.cop0_entryhi = asid;
+            uint32_t sharedPhysicalOffset = 0u;
+            t.IsTrue(
+                Ps2ResolveFastGuestRdramAccess(
+                    &runtime,
+                    &sharedContext,
+                    virtualBase + 0x40u,
+                    sizeof(uint32_t),
+                    false,
+                    sharedPhysicalOffset),
+                "a second guest context should share the processor TLB cache");
+            t.Equals(
+                sharedPhysicalOffset,
+                (evenPfn << 12u) + 0x40u,
+                "shared contexts should resolve the same processor-global PFN");
+
             R5900Context wrongAsid{};
             wrongAsid.pc = 0x00150040u;
             wrongAsid.cop0_status = kStatusUser;
@@ -225,6 +276,116 @@ void register_cop0_kuseg_tests()
                 wrongAsid.pc,
                 0x80000000u,
                 "an ASID mismatch should use the refill vector");
+        });
+
+        tc.Run("mapped fetch cache preserves page-end and stale-fault boundaries", [](TestCase &t)
+        {
+            constexpr uint32_t virtualBase = 0x01200000u;
+            constexpr uint32_t physicalPfn = 0x00500u;
+            constexpr uint32_t asid = 0x2au;
+            constexpr uint32_t pageEndFetch =
+                virtualBase + 0x0ffcu;
+            constexpr uint32_t crossingFetch =
+                virtualBase + 0x0ffeu;
+
+            PS2Runtime runtime;
+            t.IsTrue(
+                runtime.memory().initialize(),
+                "the fetch-boundary fixture should allocate RDRAM");
+            clearTlb(
+                t,
+                runtime,
+                "the fetch-boundary fixture should clear every TLB entry");
+            t.IsTrue(
+                runtime.memory().tlbWrite(
+                    14u,
+                    EeTlbEntry{
+                        0u,
+                        virtualBase | asid,
+                        makeEntryLo(
+                            physicalPfn, true, true, false),
+                        makeEntryLo(
+                            physicalPfn + 1u, true, true, false),
+                    }),
+                "the fetch-boundary fixture should install its mapping");
+
+            R5900Context ctx{};
+            ctx.cop0_status = kStatusUser;
+            ctx.cop0_entryhi = asid;
+            (void)runtime.Load32(
+                runtime.memory().getRDRAM(),
+                &ctx,
+                pageEndFetch);
+            runtime.memory().setTlbTranslationCacheDiagnosticsEnabled(
+                true);
+            runtime.memory().resetTlbTranslationCacheStats();
+            runtime.validateEeInstructionFetchPolicy<
+                EeArchitecturalObservationMode::Fast>(
+                &ctx, pageEndFetch);
+            t.Equals(
+                runtime.memory().tlbTranslationCacheStats().hits,
+                1ull,
+                "an aligned fetch ending at the cached page boundary should hit");
+
+            R5900Context crossingCtx{};
+            crossingCtx.cop0_status = kStatusUser;
+            crossingCtx.cop0_entryhi = asid;
+            const bool crossingRaised = raisesGuestException([&]()
+            {
+                runtime.validateEeInstructionFetchPolicy<
+                    EeArchitecturalObservationMode::Fast>(
+                    &crossingCtx, crossingFetch);
+            });
+            t.IsTrue(
+                crossingRaised,
+                "a page-crossing unaligned fetch should retain its address fault");
+            t.Equals(
+                crossingCtx.cop0_badvaddr,
+                crossingFetch,
+                "the fetch address fault should retain the original virtual address");
+            t.Equals(
+                crossingCtx.cop0_cause & kCauseExcCodeMask,
+                (static_cast<uint32_t>(
+                     EXCEPTION_ADDRESS_ERROR_LOAD)
+                 << 2u) &
+                    kCauseExcCodeMask,
+                "the crossing fetch should publish AdEL rather than use a partial hit");
+
+            t.IsTrue(
+                runtime.memory().tlbWrite(
+                    14u,
+                    EeTlbEntry{
+                        0u,
+                        virtualBase | asid,
+                        makeEntryLo(
+                            physicalPfn, true, false, false),
+                        makeEntryLo(
+                            physicalPfn + 1u, true, true, false),
+                    }),
+                "the fetch-boundary fixture should replace the cached page with invalid");
+            R5900Context invalidCtx{};
+            invalidCtx.cop0_status = kStatusUser;
+            invalidCtx.cop0_entryhi = asid;
+            const bool invalidRaised = raisesGuestException([&]()
+            {
+                runtime.validateEeInstructionFetchPolicy<
+                    EeArchitecturalObservationMode::Fast>(
+                    &invalidCtx, pageEndFetch);
+            });
+            t.IsTrue(
+                invalidRaised,
+                "an invalid replacement should fault after a prior fetch hit");
+            t.Equals(
+                invalidCtx.cop0_badvaddr,
+                pageEndFetch,
+                "the stale fetch fault should retain the original virtual address");
+            t.Equals(
+                invalidCtx.cop0_cause & kCauseExcCodeMask,
+                (static_cast<uint32_t>(
+                     EXCEPTION_TLB_REFILL_LOAD)
+                 << 2u) &
+                    kCauseExcCodeMask,
+                "the invalid fetch should publish the architectural TLBL code");
         });
 
         tc.Run("ERL and explicit compatibility aliases remain direct", [](TestCase &t)
@@ -304,22 +465,55 @@ void register_cop0_kuseg_tests()
                 deviceAddress,
                 "the explicit physical device alias should remain direct");
 
+            uint32_t physicalOffset = 0u;
             t.IsFalse(
-                Ps2CanUseFastGuestRdramAccess(
-                    &normalCtx, erlAddress, 4u),
+                Ps2ResolveFastGuestRdramAccess(
+                    &runtime,
+                    &normalCtx,
+                    erlAddress,
+                    4u,
+                    false,
+                    physicalOffset),
                 "normal kuseg must not use the generated RDRAM fast path");
             t.IsTrue(
-                Ps2CanUseFastGuestRdramAccess(
-                    &erlCtx, erlAddress, 4u),
+                Ps2ResolveFastGuestRdramAccess(
+                    &runtime,
+                    &erlCtx,
+                    erlAddress,
+                    4u,
+                    false,
+                    physicalOffset),
                 "ERL kuseg may use the direct RDRAM fast path");
+            t.Equals(
+                physicalOffset,
+                erlAddress,
+                "the ERL direct path should return its physical RDRAM offset");
             t.IsTrue(
-                Ps2CanUseFastGuestRdramAccess(
-                    &normalCtx, uncachedAddress, 4u),
+                Ps2ResolveFastGuestRdramAccess(
+                    &runtime,
+                    &normalCtx,
+                    uncachedAddress,
+                    4u,
+                    false,
+                    physicalOffset),
                 "the explicit uncached mirror may retain its fast path");
+            t.Equals(
+                physicalOffset,
+                0x2000u,
+                "the uncached mirror should return a physical RDRAM offset");
             t.IsTrue(
-                Ps2CanUseFastGuestRdramAccess(
-                    &normalCtx, acceleratedAddress, 4u),
+                Ps2ResolveFastGuestRdramAccess(
+                    &runtime,
+                    &normalCtx,
+                    acceleratedAddress,
+                    4u,
+                    false,
+                    physicalOffset),
                 "the explicit accelerated mirror may retain its fast path");
+            t.Equals(
+                physicalOffset,
+                0x00103000u,
+                "the accelerated mirror should return a physical RDRAM offset");
         });
     });
 }

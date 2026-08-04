@@ -1,5 +1,6 @@
 #include "MiniTest.h"
 #include "ps2_runtime.h"
+#include "ps2_runtime_macros.h"
 
 #include <elfio/elfio.hpp>
 
@@ -258,6 +259,74 @@ void register_ps2_runtime_elf_tests()
             runtime.memory().write32(kTextAddress, 0u);
             t.IsTrue(runtime.memory().isCodeModified(kTextAddress, sizeof(uint32_t)),
                      "writes to an executable section should still mark code modified");
+
+            // Generated stores receive virtual addresses, but executable
+            // invalidation is keyed by the translated physical ELF range.
+            // Exercise a non-identity warm-cache hit so this cannot pass via
+            // either the direct-address shortcut or the authoritative miss
+            // path.
+            constexpr uint32_t mappedVirtualBase = 0x04000000u;
+            constexpr uint32_t writerPc = 0x0015a040u;
+            const auto makeEntryLo = [](uint32_t pfn)
+            {
+                return (pfn << 6u) | (2u << 3u) | 0x7u;
+            };
+            t.IsTrue(
+                runtime.memory().tlbWrite(
+                    5u,
+                    EeTlbEntry{
+                        0u,
+                        mappedVirtualBase,
+                        makeEntryLo(kTextAddress >> 12u),
+                        makeEntryLo((kTextAddress >> 12u) + 1u),
+                    }),
+                "the translated executable mapping should install");
+
+            runtime.memory().clearModifiedFlag(
+                kTextAddress, sizeof(uint32_t));
+            (void)runtime.memory().takeCodeInvalidationEvents();
+            R5900Context context{};
+            context.pc = writerPc;
+            context.cop0_status = 0x00000010u;
+            R5900Context *ctx = &context;
+            uint8_t *rdram = runtime.memory().getRDRAM();
+            (void)runtime.Load32(rdram, ctx, mappedVirtualBase);
+            runtime.memory().setTlbTranslationCacheDiagnosticsEnabled(true);
+            runtime.memory().resetTlbTranslationCacheStats();
+            const auto generatedStore = [](
+                PS2Runtime *runtime,
+                uint8_t *rdram,
+                R5900Context *ctx)
+            {
+                WRITE32(mappedVirtualBase, 0x8badf00du);
+            };
+            generatedStore(&runtime, rdram, ctx);
+
+            t.Equals(
+                runtime.memory().tlbTranslationCacheStats().hits,
+                1ull,
+                "the generated store should use the warm mapped translation");
+            t.IsTrue(
+                runtime.memory().isCodeModified(
+                    kTextAddress, sizeof(uint32_t)),
+                "a translated generated store should invalidate physical ELF code");
+            const auto invalidations =
+                runtime.memory().takeCodeInvalidationEvents();
+            t.Equals(
+                invalidations.size(),
+                static_cast<size_t>(1u),
+                "the translated generated store should publish one invalidation");
+            if (invalidations.size() == 1u)
+            {
+                t.Equals(
+                    invalidations[0].start,
+                    kTextAddress,
+                    "the invalidation should identify the physical ELF address");
+                t.Equals(
+                    invalidations[0].writerPc,
+                    writerPc,
+                    "the invalidation should retain the generated writer PC");
+            }
         });
 
         tc.Run("sectionless ELFs fall back to executable segments", [](TestCase &t)

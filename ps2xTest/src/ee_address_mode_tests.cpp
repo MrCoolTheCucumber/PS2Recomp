@@ -5,6 +5,7 @@
 
 #include <array>
 #include <cstdint>
+#include <cstring>
 #include <string>
 
 namespace
@@ -16,6 +17,19 @@ namespace
     constexpr uint32_t kCauseExcCodeMask = 0x0000007Cu;
     constexpr uint32_t kCauseBd = 0x80000000u;
     constexpr uint32_t kCommonVector = 0x80000180u;
+
+    constexpr uint32_t makeEntryLo(
+        uint32_t pfn,
+        bool dirty,
+        bool valid,
+        bool global)
+    {
+        return (pfn << 6u) |
+               (2u << 3u) |
+               (dirty ? 0x4u : 0u) |
+               (valid ? 0x2u : 0u) |
+               (global ? 0x1u : 0u);
+    }
 
     bool raisesGuestException(const auto &operation)
     {
@@ -80,6 +94,15 @@ namespace
         PS2Runtime *runtime)
     {
         WRITE32(0xA0001000u, 0xA5A55A5Au);
+    }
+
+    uint32_t generatedModeMappedLoad(
+        uint8_t *rdram,
+        R5900Context *ctx,
+        PS2Runtime *runtime,
+        uint32_t address)
+    {
+        return READ32(address);
     }
 
     void privilegedDispatchTarget(
@@ -352,6 +375,107 @@ void register_ee_address_mode_tests()
                     0x89ABCDEFu,
                     "active exception levels should retain direct KSEG0 translation");
             }
+        });
+
+        tc.Run("mapped fast hits are keyed by KSU EXL and ERL", [](TestCase &t)
+        {
+            constexpr uint32_t virtualBase = 0x01000000u;
+            constexpr uint32_t virtualAddress =
+                virtualBase + 0x100u;
+            constexpr uint32_t mappedPfn = 0x00400u;
+            constexpr uint32_t asid = 0x42u;
+            constexpr uint32_t mappedValue = 0x13579bdfu;
+            constexpr uint32_t erlDirectValue = 0x2468ace0u;
+
+            PS2Runtime runtime;
+            t.IsTrue(
+                runtime.memory().initialize(),
+                "the mapped mode fixture should allocate RDRAM");
+            for (uint32_t index = 0u;
+                 index < runtime.memory().tlbEntryCount();
+                 ++index)
+            {
+                t.IsTrue(
+                    runtime.memory().tlbWrite(
+                        index, EeTlbEntry{}),
+                    "the mapped mode fixture should clear the TLB");
+            }
+            t.IsTrue(
+                runtime.memory().tlbWrite(
+                    9u,
+                    EeTlbEntry{
+                        0u,
+                        virtualBase | asid,
+                        makeEntryLo(
+                            mappedPfn, true, true, false),
+                        makeEntryLo(
+                            mappedPfn + 1u, true, true, false),
+                    }),
+                "the mapped mode fixture should install a non-identity entry");
+            std::memcpy(
+                runtime.memory().getRDRAM() +
+                    (mappedPfn << 12u) + 0x100u,
+                &mappedValue,
+                sizeof(mappedValue));
+            std::memcpy(
+                runtime.memory().getRDRAM() + virtualAddress,
+                &erlDirectValue,
+                sizeof(erlDirectValue));
+
+            R5900Context ctx{};
+            ctx.cop0_status = kStatusUser;
+            ctx.cop0_entryhi = asid;
+            uint8_t *const rdram =
+                runtime.memory().getRDRAM();
+            t.Equals(
+                generatedModeMappedLoad(
+                    rdram, &ctx, &runtime, virtualAddress),
+                mappedValue,
+                "user mode should fill the mapped PFN");
+            t.Equals(
+                generatedModeMappedLoad(
+                    rdram, &ctx, &runtime, virtualAddress),
+                mappedValue,
+                "user mode should reuse its mapped cache entry");
+
+            ctx.cop0_status = kStatusSupervisor;
+            t.Equals(
+                generatedModeMappedLoad(
+                    rdram, &ctx, &runtime, virtualAddress),
+                mappedValue,
+                "supervisor mode should refill under its distinct cache key");
+
+            ctx.cop0_status = kStatusUser | kStatusExl;
+            t.Equals(
+                generatedModeMappedLoad(
+                    rdram, &ctx, &runtime, virtualAddress),
+                mappedValue,
+                "EXL should use the kernel-mode TLB key for ordinary kuseg");
+
+            runtime.memory().setTlbTranslationCacheDiagnosticsEnabled(
+                true);
+            runtime.memory().resetTlbTranslationCacheStats();
+            ctx.cop0_status = kStatusUser | kStatusErl;
+            t.Equals(
+                generatedModeMappedLoad(
+                    rdram, &ctx, &runtime, virtualAddress),
+                erlDirectValue,
+                "ERL should bypass the stale mapped hit and use direct kuseg");
+            t.Equals(
+                runtime.memory().tlbTranslationCacheStats().hits,
+                0ull,
+                "ERL direct kuseg should not probe the mapped cache");
+
+            ctx.cop0_status = kStatusUser;
+            t.Equals(
+                generatedModeMappedLoad(
+                    rdram, &ctx, &runtime, virtualAddress),
+                mappedValue,
+                "leaving ERL should restore the original user mapping");
+            t.Equals(
+                runtime.memory().tlbTranslationCacheStats().hits,
+                1ull,
+                "the unchanged user-mode entry should remain safely reusable");
         });
 
         tc.Run("generated fast RDRAM paths cannot bypass protection", [](TestCase &t)

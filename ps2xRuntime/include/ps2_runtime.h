@@ -87,6 +87,8 @@ struct PS2RuntimeConfiguration
     bool useVuBackendEnvironment = true;
     bool eeThreadDiagnostics = false;
     bool useEeThreadDiagnosticsEnvironment = true;
+    bool eeTlbTranslationCacheDiagnostics = false;
+    bool useEeTlbTranslationCacheDiagnosticsEnvironment = true;
 };
 
 enum PS2Exception
@@ -151,21 +153,26 @@ static_assert(sizeof(EeObservationInstructionDescriptor) == 24u);
 
 #if defined(_MSC_VER)
 #define PS2X_EE_OBSERVATION_POLICY_INLINE __forceinline
+#define PS2X_EE_MEMORY_POLICY_NOINLINE __declspec(noinline)
 #define PS2X_EE_OBSERVATION_PRECISE_BODY __declspec(noinline)
 #elif defined(__GNUC__) && !defined(__clang__)
 #define PS2X_EE_OBSERVATION_POLICY_INLINE                              \
     inline __attribute__((always_inline))
+#define PS2X_EE_MEMORY_POLICY_NOINLINE                                 \
+    __attribute__((noinline, noipa))
 #define PS2X_EE_OBSERVATION_PRECISE_BODY                               \
     __attribute__((noinline, noipa, cold, optimize("Oz"),             \
                    section(".text.unlikely.ee_observation")))
 #elif defined(__clang__)
 #define PS2X_EE_OBSERVATION_POLICY_INLINE                              \
     inline __attribute__((always_inline))
+#define PS2X_EE_MEMORY_POLICY_NOINLINE __attribute__((noinline))
 #define PS2X_EE_OBSERVATION_PRECISE_BODY                               \
     __attribute__((noinline, cold, minsize,                            \
                    section(".text.unlikely.ee_observation")))
 #else
 #define PS2X_EE_OBSERVATION_POLICY_INLINE inline
+#define PS2X_EE_MEMORY_POLICY_NOINLINE
 #define PS2X_EE_OBSERVATION_PRECISE_BODY
 #endif
 
@@ -2563,6 +2570,7 @@ private:
         m_guestExecutionDispatcherExitEpoch{0u};
     std::atomic<bool> m_guestExecutionPreemptionRequested{false};
     bool m_eeThreadDiagnosticsEnabled = false;
+    bool m_emitTlbTranslationCacheDiagnosticsOnDestruction = false;
     bool m_eeThreadDiagnosticsHasLastOuterContext = false;
     R5900Context *m_eeThreadDiagnosticsLastOuterContext = nullptr;
     std::atomic<uint64_t> m_eeThreadDiagnosticGuestLockRequests{0u};

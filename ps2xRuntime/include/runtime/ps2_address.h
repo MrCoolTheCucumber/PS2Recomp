@@ -44,6 +44,56 @@ static inline constexpr bool Ps2CanUseFastRdramAccess(uint32_t addr, uint32_t by
            offset <= (PS2_RAM_SIZE - bytes);
 }
 
+// Resolve a complete guest access to the physical RDRAM offset consumed by
+// the inline host helpers. Direct aliases are classified locally; ordinary
+// mapped addresses succeed only after the authoritative translator has
+// populated a matching cache entry.
+static inline bool Ps2ResolveFastGuestRdramOffset(
+    PS2Memory &memory,
+    EeAddressTranslationContext translation,
+    uint32_t address,
+    uint32_t bytes,
+    bool writeAccess,
+    uint32_t &physicalOffset)
+{
+    if (!translation.permits(address))
+    {
+        return false;
+    }
+
+    const bool directAddress =
+        !translation.mapsKusegThroughTlb(address) ||
+        Ps2IsUncachedRamMirrorAddress(address) ||
+        Ps2IsAcceleratedRamMirrorAddress(address);
+    if (directAddress &&
+        Ps2CanUseFastRdramAccess(address, bytes))
+    {
+        return ps2ResolveDirectRdramOffset(
+            address, physicalOffset);
+    }
+
+    // KSEG2/KSEG3 and non-identity kuseg mappings are not direct RDRAM
+    // aliases. Only an already-authoritative mapped cache entry may make
+    // them eligible for the inline host access.
+    const bool supportedAccessSize =
+        bytes != 0u &&
+        bytes <= sizeof(__m128i) &&
+        (bytes & (bytes - 1u)) == 0u;
+    if (!supportedAccessSize ||
+        (address & (bytes - 1u)) != 0u ||
+        (!translation.mapsKusegThroughTlb(address) &&
+         address < PS2_KSEG2_BASE))
+    {
+        return false;
+    }
+    return memory.tryResolveCachedTlbRdramOffset(
+        address,
+        translation,
+        writeAccess,
+        bytes,
+        physicalOffset);
+}
+
 static inline constexpr bool Ps2IsKseg01Address(uint32_t addr)
 {
     return Ps2AddressInRange(addr, PS2_KSEG0_BASE, PS2_KSEG0_KSEG1_SIZE);

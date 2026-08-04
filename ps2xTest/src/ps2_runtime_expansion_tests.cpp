@@ -1160,10 +1160,59 @@ void register_ps2_runtime_expansion_tests()
                 ::getRegU32(&ctx, 2), 0x22222222u,
                 "module redispatch should select the fast entry after BPC disable");
 
-            runtime.memory().getRDRAM()[kMatchAddress] ^= 0x01u;
+            constexpr uint32_t kMappedMatchAddress =
+                0x04000000u;
+            constexpr uint32_t kMatchPfn =
+                kMatchAddress >> 12u;
+            const auto entryLo = [](uint32_t pfn)
+            {
+                return (pfn << 6u) |
+                       (2u << 3u) |
+                       0x7u;
+            };
+            t.IsTrue(
+                runtime.memory().tlbWrite(
+                    5u,
+                    EeTlbEntry{
+                        0u,
+                        kMappedMatchAddress,
+                        entryLo(kMatchPfn),
+                        entryLo(kMatchPfn + 1u),
+                    }),
+                "the module mutation fixture should install a writable mapping");
+            R5900Context mappedStoreContext{};
+            mappedStoreContext.pc = 0x0017a100u;
+            mappedStoreContext.cop0_status = 0x00000010u;
+            t.Equals(
+                runtime.Load8(
+                    runtime.memory().getRDRAM(),
+                    &mappedStoreContext,
+                    kMappedMatchAddress),
+                kMatchBytes[0],
+                "the module signature mapping should resolve before mutation");
+            runtime.memory().setTlbTranslationCacheDiagnosticsEnabled(
+                true);
+            runtime.memory().resetTlbTranslationCacheStats();
+            const auto mappedSignatureStore = [](
+                uint8_t *rdram,
+                R5900Context *ctx,
+                PS2Runtime *runtime)
+            {
+                WRITE8(
+                    kMappedMatchAddress,
+                    kMatchBytes[0] ^ 0x01u);
+            };
+            mappedSignatureStore(
+                runtime.memory().getRDRAM(),
+                &mappedStoreContext,
+                &runtime);
+            t.Equals(
+                runtime.memory().tlbTranslationCacheStats().hits,
+                1ull,
+                "the translated signature store should use the warm cache");
             t.IsFalse(
                 runtime.hasFunction(kModuleOnlyEntry),
-                "a changed signature should deactivate the stale module immediately");
+                "a translated signature write should deactivate the stale module immediately");
             std::memset(&ctx, 0, sizeof(ctx));
             ctx.pc = kOverlapEntry;
             runtime.lookupFunction(kOverlapEntry, &ctx)(

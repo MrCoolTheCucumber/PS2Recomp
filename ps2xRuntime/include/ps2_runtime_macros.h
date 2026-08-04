@@ -690,158 +690,188 @@ static inline void Ps2FastWrite128(uint8_t *rdram, uint32_t addr, __m128i value)
 #define FAST_WRITE64(addr, val) Ps2FastWrite64(rdram, (uint32_t)(addr), (uint64_t)(val))
 #define FAST_WRITE128(addr, val) Ps2FastWrite128(rdram, (uint32_t)(addr), (val))
 
-#define DEBUG_FAST_READ(width, type, addr)                                          \
+#define DEBUG_FAST_READ(width, type, virtualAddr, physicalOffset)                   \
     ([&]() -> type                                                                  \
      {                                                                              \
-         const uint32_t _debug_addr = (uint32_t)(addr);                             \
+         const uint32_t _debug_addr = (uint32_t)(virtualAddr);                      \
+         const uint32_t _debug_physical_offset =                                   \
+             (uint32_t)(physicalOffset);                                            \
          runtime->debugObserveMemoryAccess(                                         \
              _debug_addr, (width) / 8u, PS2Runtime::DebugMemoryAccess::Read, ctx);  \
-         return FAST_READ##width(_debug_addr);                                       \
+         return FAST_READ##width(_debug_physical_offset);                            \
      }())
 
-#define DEBUG_FAST_WRITE(width, type, addr, val)                                    \
+#define DEBUG_FAST_WRITE(width, type, virtualAddr, physicalOffset, val)             \
     do                                                                              \
     {                                                                               \
-        const uint32_t _debug_addr = (uint32_t)(addr);                              \
+        const uint32_t _debug_addr = (uint32_t)(virtualAddr);                       \
+        const uint32_t _debug_physical_offset =                                    \
+            (uint32_t)(physicalOffset);                                             \
         runtime->debugObserveMemoryAccess(                                          \
             _debug_addr, (width) / 8u, PS2Runtime::DebugMemoryAccess::Write, ctx);  \
-        FAST_WRITE##width(_debug_addr, (type)(val));                                \
+        runtime->memory().observeRdramWrite(                                        \
+            _debug_physical_offset, (width) / 8u, ctx ? ctx->pc : 0u);             \
+        FAST_WRITE##width(_debug_physical_offset, (type)(val));                     \
     } while (0)
 
-#define DEBUG_FAST_READ8(addr) DEBUG_FAST_READ(8, uint8_t, addr)
-#define DEBUG_FAST_READ16(addr) DEBUG_FAST_READ(16, uint16_t, addr)
-#define DEBUG_FAST_READ32(addr) DEBUG_FAST_READ(32, uint32_t, addr)
-#define DEBUG_FAST_READ64(addr) DEBUG_FAST_READ(64, uint64_t, addr)
-#define DEBUG_FAST_READ128(addr) DEBUG_FAST_READ(128, __m128i, addr)
+#define DEBUG_FAST_READ8(virtualAddr, physicalOffset)                               \
+    DEBUG_FAST_READ(8, uint8_t, virtualAddr, physicalOffset)
+#define DEBUG_FAST_READ16(virtualAddr, physicalOffset)                              \
+    DEBUG_FAST_READ(16, uint16_t, virtualAddr, physicalOffset)
+#define DEBUG_FAST_READ32(virtualAddr, physicalOffset)                              \
+    DEBUG_FAST_READ(32, uint32_t, virtualAddr, physicalOffset)
+#define DEBUG_FAST_READ64(virtualAddr, physicalOffset)                              \
+    DEBUG_FAST_READ(64, uint64_t, virtualAddr, physicalOffset)
+#define DEBUG_FAST_READ128(virtualAddr, physicalOffset)                             \
+    DEBUG_FAST_READ(128, __m128i, virtualAddr, physicalOffset)
 
-#define DEBUG_FAST_WRITE8(addr, val) DEBUG_FAST_WRITE(8, uint8_t, addr, val)
-#define DEBUG_FAST_WRITE16(addr, val) DEBUG_FAST_WRITE(16, uint16_t, addr, val)
-#define DEBUG_FAST_WRITE32(addr, val) DEBUG_FAST_WRITE(32, uint32_t, addr, val)
-#define DEBUG_FAST_WRITE64(addr, val) DEBUG_FAST_WRITE(64, uint64_t, addr, val)
-#define DEBUG_FAST_WRITE128(addr, val)                                              \
+#define DEBUG_FAST_WRITE8(virtualAddr, physicalOffset, val)                         \
+    DEBUG_FAST_WRITE(8, uint8_t, virtualAddr, physicalOffset, val)
+#define DEBUG_FAST_WRITE16(virtualAddr, physicalOffset, val)                        \
+    DEBUG_FAST_WRITE(16, uint16_t, virtualAddr, physicalOffset, val)
+#define DEBUG_FAST_WRITE32(virtualAddr, physicalOffset, val)                        \
+    DEBUG_FAST_WRITE(32, uint32_t, virtualAddr, physicalOffset, val)
+#define DEBUG_FAST_WRITE64(virtualAddr, physicalOffset, val)                        \
+    DEBUG_FAST_WRITE(64, uint64_t, virtualAddr, physicalOffset, val)
+#define DEBUG_FAST_WRITE128(virtualAddr, physicalOffset, val)                       \
     do                                                                              \
     {                                                                               \
-        const uint32_t _debug_addr = (uint32_t)(addr);                              \
+        const uint32_t _debug_addr = (uint32_t)(virtualAddr);                       \
+        const uint32_t _debug_physical_offset =                                    \
+            (uint32_t)(physicalOffset);                                             \
         const __m128i _debug_value = (val);                                         \
         runtime->debugObserveMemoryAccess(                                          \
             _debug_addr, 16u, PS2Runtime::DebugMemoryAccess::Write, ctx);           \
-        FAST_WRITE128(_debug_addr, _debug_value);                                   \
+        runtime->memory().observeRdramWrite(                                        \
+            _debug_physical_offset, 16u, ctx ? ctx->pc : 0u);                      \
+        FAST_WRITE128(_debug_physical_offset, _debug_value);                        \
     } while (0)
 
-static inline bool Ps2CanUseFastGuestRdramAccess(
+bool Ps2ResolveFastGuestRdramAccess(
+    PS2Runtime *runtime,
     const R5900Context *ctx,
     uint32_t address,
-    uint32_t bytes)
-{
-    if (!Ps2CanUseFastRdramAccess(address, bytes))
-    {
-        return false;
-    }
-    if (ctx == nullptr)
-    {
-        return true;
-    }
+    uint32_t bytes,
+    bool writeAccess,
+    uint32_t &physicalOffset);
 
-    const EeAddressTranslationContext translation =
-        EeAddressTranslationContext::fromCop0Status(
-            ctx->cop0_status);
-    if (!translation.permits(address))
-    {
-        return false;
-    }
-
-    return !translation.mapsKusegThroughTlb(address) ||
-           Ps2IsUncachedRamMirrorAddress(address) ||
-           Ps2IsAcceleratedRamMirrorAddress(address);
-}
-
-#define READ8(addr) ([&]() -> uint8_t {                       \
-    uint32_t _addr = (uint32_t)(addr);                        \
-    return Ps2CanUseFastGuestRdramAccess(ctx, _addr, 1u)       \
-        ? DEBUG_FAST_READ8(_addr)                             \
+#define READ8(addr) ([&]() -> uint8_t {                              \
+    const uint32_t _addr = (uint32_t)(addr);                         \
+    uint32_t _physical_offset = 0u;                                  \
+    return Ps2ResolveFastGuestRdramAccess(                            \
+               runtime, ctx, _addr, 1u, false, _physical_offset)     \
+        ? DEBUG_FAST_READ8(_addr, _physical_offset)                  \
         : runtime->Load8(rdram, ctx, _addr); }())
 
-#define READ16(addr) ([&]() -> uint16_t {                     \
-    uint32_t _addr = (uint32_t)(addr);                        \
-    return Ps2CanUseFastGuestRdramAccess(ctx, _addr, 2u)       \
-        ? DEBUG_FAST_READ16(_addr)                            \
+#define READ16(addr) ([&]() -> uint16_t {                            \
+    const uint32_t _addr = (uint32_t)(addr);                         \
+    uint32_t _physical_offset = 0u;                                  \
+    return Ps2ResolveFastGuestRdramAccess(                            \
+               runtime, ctx, _addr, 2u, false, _physical_offset)     \
+        ? DEBUG_FAST_READ16(_addr, _physical_offset)                 \
         : runtime->Load16(rdram, ctx, _addr); }())
 
-#define READ32(addr) ([&]() -> uint32_t {                     \
-    uint32_t _addr = (uint32_t)(addr);                        \
-    return Ps2CanUseFastGuestRdramAccess(ctx, _addr, 4u)       \
-        ? DEBUG_FAST_READ32(_addr)                            \
+#define READ32(addr) ([&]() -> uint32_t {                            \
+    const uint32_t _addr = (uint32_t)(addr);                         \
+    uint32_t _physical_offset = 0u;                                  \
+    return Ps2ResolveFastGuestRdramAccess(                            \
+               runtime, ctx, _addr, 4u, false, _physical_offset)     \
+        ? DEBUG_FAST_READ32(_addr, _physical_offset)                 \
         : runtime->Load32(rdram, ctx, _addr); }())
 
-#define READ64(addr) ([&]() -> uint64_t {                     \
-    uint32_t _addr = (uint32_t)(addr);                        \
-    return Ps2CanUseFastGuestRdramAccess(ctx, _addr, 8u)       \
-        ? DEBUG_FAST_READ64(_addr)                            \
+#define READ64(addr) ([&]() -> uint64_t {                            \
+    const uint32_t _addr = (uint32_t)(addr);                         \
+    uint32_t _physical_offset = 0u;                                  \
+    return Ps2ResolveFastGuestRdramAccess(                            \
+               runtime, ctx, _addr, 8u, false, _physical_offset)     \
+        ? DEBUG_FAST_READ64(_addr, _physical_offset)                 \
         : runtime->Load64(rdram, ctx, _addr); }())
 
-#define READ128(addr) ([&]() -> __m128i {                     \
-    uint32_t _addr = (uint32_t)(addr);                        \
-    return Ps2CanUseFastGuestRdramAccess(ctx, _addr, 16u)      \
-        ? DEBUG_FAST_READ128(_addr)                           \
+#define READ128(addr) ([&]() -> __m128i {                            \
+    const uint32_t _addr = (uint32_t)(addr);                         \
+    uint32_t _physical_offset = 0u;                                  \
+    return Ps2ResolveFastGuestRdramAccess(                            \
+               runtime, ctx, _addr, 16u, false, _physical_offset)    \
+        ? DEBUG_FAST_READ128(_addr, _physical_offset)                \
         : runtime->Load128(rdram, ctx, _addr); }())
 
 #define WRITE8(addr, val)                                                            \
     do                                                                               \
     {                                                                                \
-        uint32_t _addr = (addr);                                                     \
-        if (!Ps2CanUseFastGuestRdramAccess(ctx, _addr, 1u))                          \
-            runtime->Store8(rdram, ctx, _addr, (val));                               \
+        const uint32_t _addr = (uint32_t)(addr);                                     \
+        const uint8_t _value = (uint8_t)(val);                                       \
+        uint32_t _physical_offset = 0u;                                              \
+        if (!Ps2ResolveFastGuestRdramAccess(                                         \
+                runtime, ctx, _addr, 1u, true, _physical_offset))                    \
+            runtime->Store8(rdram, ctx, _addr, _value);                              \
         else                                                                         \
         {                                                                            \
             runtime->debugObserveMemoryAccess(                                       \
                 _addr, 1u, PS2Runtime::DebugMemoryAccess::Write, ctx);               \
-            ps2TraceGuestWrite(rdram, _addr, 1u, (uint8_t)(val), 0u, "WRITE8", ctx); \
-            FAST_WRITE8(_addr, (val));                                               \
+            ps2TraceGuestWrite(rdram, _addr, 1u, _value, 0u, "WRITE8", ctx);        \
+            runtime->memory().observeRdramWrite(                                     \
+                _physical_offset, 1u, ctx ? ctx->pc : 0u);                          \
+            FAST_WRITE8(_physical_offset, _value);                                   \
         }                                                                            \
     } while (0)
 
 #define WRITE16(addr, val)                                                             \
     do                                                                                 \
     {                                                                                  \
-        uint32_t _addr = (addr);                                                       \
-        if (!Ps2CanUseFastGuestRdramAccess(ctx, _addr, 2u))                            \
-            runtime->Store16(rdram, ctx, _addr, (val));                                \
+        const uint32_t _addr = (uint32_t)(addr);                                       \
+        const uint16_t _value = (uint16_t)(val);                                       \
+        uint32_t _physical_offset = 0u;                                                \
+        if (!Ps2ResolveFastGuestRdramAccess(                                           \
+                runtime, ctx, _addr, 2u, true, _physical_offset))                      \
+            runtime->Store16(rdram, ctx, _addr, _value);                               \
         else                                                                           \
         {                                                                              \
             runtime->debugObserveMemoryAccess(                                         \
                 _addr, 2u, PS2Runtime::DebugMemoryAccess::Write, ctx);                 \
-            ps2TraceGuestWrite(rdram, _addr, 2u, (uint16_t)(val), 0u, "WRITE16", ctx); \
-            FAST_WRITE16(_addr, (val));                                                \
+            ps2TraceGuestWrite(rdram, _addr, 2u, _value, 0u, "WRITE16", ctx);         \
+            runtime->memory().observeRdramWrite(                                       \
+                _physical_offset, 2u, ctx ? ctx->pc : 0u);                            \
+            FAST_WRITE16(_physical_offset, _value);                                    \
         }                                                                              \
     } while (0)
 
 #define WRITE32(addr, val)                                                             \
     do                                                                                 \
     {                                                                                  \
-        uint32_t _addr = (addr);                                                       \
-        if (!Ps2CanUseFastGuestRdramAccess(ctx, _addr, 4u))                            \
-            runtime->Store32(rdram, ctx, _addr, (val));                                \
+        const uint32_t _addr = (uint32_t)(addr);                                       \
+        const uint32_t _value = (uint32_t)(val);                                       \
+        uint32_t _physical_offset = 0u;                                                \
+        if (!Ps2ResolveFastGuestRdramAccess(                                           \
+                runtime, ctx, _addr, 4u, true, _physical_offset))                      \
+            runtime->Store32(rdram, ctx, _addr, _value);                               \
         else                                                                           \
         {                                                                              \
             runtime->debugObserveMemoryAccess(                                         \
                 _addr, 4u, PS2Runtime::DebugMemoryAccess::Write, ctx);                 \
-            ps2TraceGuestWrite(rdram, _addr, 4u, (uint32_t)(val), 0u, "WRITE32", ctx); \
-            FAST_WRITE32(_addr, (val));                                                \
+            ps2TraceGuestWrite(rdram, _addr, 4u, _value, 0u, "WRITE32", ctx);         \
+            runtime->memory().observeRdramWrite(                                       \
+                _physical_offset, 4u, ctx ? ctx->pc : 0u);                            \
+            FAST_WRITE32(_physical_offset, _value);                                    \
         }                                                                              \
     } while (0)
 
 #define WRITE64(addr, val)                                                             \
     do                                                                                 \
     {                                                                                  \
-        uint32_t _addr = (addr);                                                       \
-        if (!Ps2CanUseFastGuestRdramAccess(ctx, _addr, 8u))                            \
-            runtime->Store64(rdram, ctx, _addr, (val));                                \
+        const uint32_t _addr = (uint32_t)(addr);                                       \
+        const uint64_t _value = (uint64_t)(val);                                       \
+        uint32_t _physical_offset = 0u;                                                \
+        if (!Ps2ResolveFastGuestRdramAccess(                                           \
+                runtime, ctx, _addr, 8u, true, _physical_offset))                      \
+            runtime->Store64(rdram, ctx, _addr, _value);                               \
         else                                                                           \
         {                                                                              \
             runtime->debugObserveMemoryAccess(                                         \
                 _addr, 8u, PS2Runtime::DebugMemoryAccess::Write, ctx);                 \
-            ps2TraceGuestWrite(rdram, _addr, 8u, (uint64_t)(val), 0u, "WRITE64", ctx); \
-            FAST_WRITE64(_addr, (val));                                                \
+            ps2TraceGuestWrite(rdram, _addr, 8u, _value, 0u, "WRITE64", ctx);         \
+            runtime->memory().observeRdramWrite(                                       \
+                _physical_offset, 8u, ctx ? ctx->pc : 0u);                            \
+            FAST_WRITE64(_physical_offset, _value);                                    \
         }                                                                              \
     } while (0)
 
@@ -853,7 +883,9 @@ static inline bool Ps2CanUseFastGuestRdramAccess(
         const uint8_t _byte_enable = (uint8_t)(byteEnable);                         \
         const Ps2ByteEnableSpan _span =                                             \
             Ps2DecodeByteEnableSpan(_byte_enable, 4u);                              \
-        if (!_span.valid || !Ps2CanUseFastGuestRdramAccess(ctx, _addr, 4u))         \
+        uint32_t _physical_offset = 0u;                                              \
+        if (!_span.valid || !Ps2ResolveFastGuestRdramAccess(                        \
+                runtime, ctx, _addr, 4u, true, _physical_offset))                   \
             runtime->StoreMasked32(                                                 \
                 rdram, ctx, _addr, _value, _byte_enable);                           \
         else if (_span.size != 0u)                                                  \
@@ -867,8 +899,11 @@ static inline bool Ps2CanUseFastGuestRdramAccess(
             ps2TraceGuestWrite(                                                     \
                 rdram, _selected_addr, _span.size, _selected_value, 0u,             \
                 "WRITE_MASKED32", ctx);                                             \
+            runtime->memory().observeRdramWrite(                                    \
+                _physical_offset + _span.offset,                                    \
+                _span.size, ctx ? ctx->pc : 0u);                                   \
             Ps2FastWriteMasked32(                                                   \
-                rdram, _addr, _value, _byte_enable);                                \
+                rdram, _physical_offset, _value, _byte_enable);                     \
         }                                                                           \
     } while (0)
 
@@ -880,7 +915,9 @@ static inline bool Ps2CanUseFastGuestRdramAccess(
         const uint8_t _byte_enable = (uint8_t)(byteEnable);                         \
         const Ps2ByteEnableSpan _span =                                             \
             Ps2DecodeByteEnableSpan(_byte_enable, 8u);                              \
-        if (!_span.valid || !Ps2CanUseFastGuestRdramAccess(ctx, _addr, 8u))         \
+        uint32_t _physical_offset = 0u;                                              \
+        if (!_span.valid || !Ps2ResolveFastGuestRdramAccess(                        \
+                runtime, ctx, _addr, 8u, true, _physical_offset))                   \
             runtime->StoreMasked64(                                                 \
                 rdram, ctx, _addr, _value, _byte_enable);                           \
         else if (_span.size != 0u)                                                  \
@@ -894,17 +931,22 @@ static inline bool Ps2CanUseFastGuestRdramAccess(
             ps2TraceGuestWrite(                                                     \
                 rdram, _selected_addr, _span.size, _selected_value, 0u,             \
                 "WRITE_MASKED64", ctx);                                             \
+            runtime->memory().observeRdramWrite(                                    \
+                _physical_offset + _span.offset,                                    \
+                _span.size, ctx ? ctx->pc : 0u);                                   \
             Ps2FastWriteMasked64(                                                   \
-                rdram, _addr, _value, _byte_enable);                                \
+                rdram, _physical_offset, _value, _byte_enable);                     \
         }                                                                           \
     } while (0)
 
 #define WRITE128(addr, val)                                                          \
     do                                                                               \
     {                                                                                \
-        uint32_t _addr = (addr);                                                     \
-        __m128i _value = (val);                                                      \
-        if (!Ps2CanUseFastGuestRdramAccess(ctx, _addr, 16u))                         \
+        const uint32_t _addr = (uint32_t)(addr);                                     \
+        const __m128i _value = (val);                                                \
+        uint32_t _physical_offset = 0u;                                              \
+        if (!Ps2ResolveFastGuestRdramAccess(                                         \
+                runtime, ctx, _addr, 16u, true, _physical_offset))                   \
             runtime->Store128(rdram, ctx, _addr, _value);                            \
         else                                                                         \
         {                                                                            \
@@ -913,93 +955,95 @@ static inline bool Ps2CanUseFastGuestRdramAccess(
             const uint64_t _lo = static_cast<uint64_t>(PS2_EXTRACT_EPI64_0(_value)); \
             const uint64_t _hi = static_cast<uint64_t>(PS2_EXTRACT_EPI64_1(_value)); \
             ps2TraceGuestWrite(rdram, _addr, 16u, _lo, _hi, "WRITE128", ctx);        \
-            FAST_WRITE128(_addr, _value);                                            \
+            runtime->memory().observeRdramWrite(                                     \
+                _physical_offset, 16u, ctx ? ctx->pc : 0u);                         \
+            FAST_WRITE128(_physical_offset, _value);                                 \
         }                                                                            \
     } while (0)
 
-// Generated EE fast bodies retain the inline RDRAM classification above.
-// Precise bodies are cold and favor a compact call to the authoritative
-// runtime access path, which also preserves address translation, exceptions,
-// debugger observation, tracing, and MMIO behavior.
+// Keep the complete fast memory operation in one shared body per access
+// width. This avoids repeating translation, fallback, observation, and code
+// invalidation branches in every generated function. Precise bodies remain
+// inline wrappers around the authoritative runtime access path.
 template <EeArchitecturalObservationMode Mode>
 struct Ps2EeMemoryAccessPolicy;
 
 template <>
 struct Ps2EeMemoryAccessPolicy<EeArchitecturalObservationMode::Fast>
 {
-    static PS2X_EE_OBSERVATION_POLICY_INLINE uint8_t read8(
+    static PS2X_EE_MEMORY_POLICY_NOINLINE uint8_t read8(
         uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime, uint32_t address)
     {
         return READ8(address);
     }
 
-    static PS2X_EE_OBSERVATION_POLICY_INLINE uint16_t read16(
+    static PS2X_EE_MEMORY_POLICY_NOINLINE uint16_t read16(
         uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime, uint32_t address)
     {
         return READ16(address);
     }
 
-    static PS2X_EE_OBSERVATION_POLICY_INLINE uint32_t read32(
+    static PS2X_EE_MEMORY_POLICY_NOINLINE uint32_t read32(
         uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime, uint32_t address)
     {
         return READ32(address);
     }
 
-    static PS2X_EE_OBSERVATION_POLICY_INLINE uint64_t read64(
+    static PS2X_EE_MEMORY_POLICY_NOINLINE uint64_t read64(
         uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime, uint32_t address)
     {
         return READ64(address);
     }
 
-    static PS2X_EE_OBSERVATION_POLICY_INLINE __m128i read128(
+    static PS2X_EE_MEMORY_POLICY_NOINLINE __m128i read128(
         uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime, uint32_t address)
     {
         return READ128(address);
     }
 
-    static PS2X_EE_OBSERVATION_POLICY_INLINE void write8(
+    static PS2X_EE_MEMORY_POLICY_NOINLINE void write8(
         uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime,
         uint32_t address, uint8_t value)
     {
         WRITE8(address, value);
     }
 
-    static PS2X_EE_OBSERVATION_POLICY_INLINE void write16(
+    static PS2X_EE_MEMORY_POLICY_NOINLINE void write16(
         uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime,
         uint32_t address, uint16_t value)
     {
         WRITE16(address, value);
     }
 
-    static PS2X_EE_OBSERVATION_POLICY_INLINE void write32(
+    static PS2X_EE_MEMORY_POLICY_NOINLINE void write32(
         uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime,
         uint32_t address, uint32_t value)
     {
         WRITE32(address, value);
     }
 
-    static PS2X_EE_OBSERVATION_POLICY_INLINE void write64(
+    static PS2X_EE_MEMORY_POLICY_NOINLINE void write64(
         uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime,
         uint32_t address, uint64_t value)
     {
         WRITE64(address, value);
     }
 
-    static PS2X_EE_OBSERVATION_POLICY_INLINE void write128(
+    static PS2X_EE_MEMORY_POLICY_NOINLINE void write128(
         uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime,
         uint32_t address, __m128i value)
     {
         WRITE128(address, value);
     }
 
-    static PS2X_EE_OBSERVATION_POLICY_INLINE void writeMasked32(
+    static PS2X_EE_MEMORY_POLICY_NOINLINE void writeMasked32(
         uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime,
         uint32_t address, uint32_t value, uint8_t byteEnable)
     {
         WRITE_MASKED32(address, value, byteEnable);
     }
 
-    static PS2X_EE_OBSERVATION_POLICY_INLINE void writeMasked64(
+    static PS2X_EE_MEMORY_POLICY_NOINLINE void writeMasked64(
         uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime,
         uint32_t address, uint64_t value, uint8_t byteEnable)
     {

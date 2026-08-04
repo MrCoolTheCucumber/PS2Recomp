@@ -413,6 +413,10 @@ void register_ps2_memory_tests()
                 stats.hits,
                 1u,
                 "the repeated lookup should hit once");
+            t.Equals(
+                stats.fills,
+                1u,
+                "the initial authoritative lookup should fill one line");
 
             const uint64_t beforeReplacement =
                 mem.tlbMappingGeneration();
@@ -449,6 +453,10 @@ void register_ps2_memory_tests()
                 stats.hits,
                 2u,
                 "the replacement should hit after one refill");
+            t.Equals(
+                stats.mappingChanges,
+                1u,
+                "the accepted replacement should be counted while diagnostics are enabled");
 
             t.IsTrue(
                 mem.tlbWrite(
@@ -527,6 +535,75 @@ void register_ps2_memory_tests()
                 stats.hits + stats.misses,
                 0u,
                 "forced-uncached translation should not report cache probes");
+        });
+
+        tc.Run("mapped cache diagnostics identify set collision replacement", [](TestCase &t)
+        {
+            constexpr uint32_t virtualBase = 0x04000000u;
+            constexpr uint32_t setStride =
+                static_cast<uint32_t>(
+                    PS2Memory::kTlbTranslationCacheSetCount)
+                * PS2Memory::kTlbTranslationCachePageSize;
+            constexpr uint32_t mappingCount =
+                static_cast<uint32_t>(
+                    PS2Memory::kTlbTranslationCacheWayCount) +
+                1u;
+            const EeAddressTranslationContext translation =
+                EeAddressTranslationContext::fromCop0Status(
+                    0x10u, 0u);
+
+            PS2Memory mem;
+            t.IsTrue(
+                mem.initialize(),
+                "PS2Memory initialize should succeed");
+            for (uint32_t mapping = 0u;
+                 mapping < mappingCount;
+                 ++mapping)
+            {
+                const uint32_t pageBase =
+                    virtualBase + mapping * setStride;
+                const uint32_t physicalPfn =
+                    0x00100u + mapping * 2u;
+                t.IsTrue(
+                    mem.tlbWrite(
+                        mapping,
+                        EeTlbEntry{
+                            0u,
+                            pageBase,
+                            makeEeTlbEntryLo(
+                                physicalPfn,
+                                true,
+                                true,
+                                true),
+                            makeEeTlbEntryLo(
+                                physicalPfn + 1u,
+                                true,
+                                true,
+                                true),
+                        }),
+                    "the colliding mapping should install");
+            }
+
+            mem.setTlbTranslationCacheDiagnosticsEnabled(true);
+            mem.resetTlbTranslationCacheStats();
+            for (uint32_t mapping = 0u;
+                 mapping < mappingCount;
+                 ++mapping)
+            {
+                (void)mem.translateAddress(
+                    virtualBase + mapping * setStride,
+                    translation);
+            }
+            const EeTlbTranslationCacheStats stats =
+                mem.tlbTranslationCacheStats();
+            t.Equals(
+                stats.fills,
+                static_cast<uint64_t>(mappingCount),
+                "each cold colliding page should fill one line");
+            t.Equals(
+                stats.replacements,
+                1ull,
+                "the first access beyond associativity should replace one live line");
         });
 
         tc.Run("mapped cache preserves ASID Global and write permissions", [](TestCase &t)
@@ -1791,6 +1868,122 @@ void register_ps2_memory_tests()
                 EeArchitecturalObservationMode::Precise>(
                 0x200u,
                 "precise EE policy should preserve RDRAM operations");
+        });
+
+        tc.Run("fast direct and mapped stores share physical code invalidation", [](TestCase &t)
+        {
+            constexpr uint32_t virtualBase = 0x04000000u;
+            constexpr uint32_t physicalBase = 0x00120000u;
+            constexpr uint32_t writerPc = 0x0015a040u;
+
+            PS2Runtime runtimeStorage;
+            t.IsTrue(
+                runtimeStorage.memory().initialize(),
+                "the invalidation fixture should allocate RDRAM");
+            PS2Runtime *runtime = &runtimeStorage;
+            uint8_t *rdram = runtime->memory().getRDRAM();
+            for (uint32_t index = 0u;
+                 index < runtime->memory().tlbEntryCount();
+                 ++index)
+            {
+                t.IsTrue(
+                    runtime->memory().tlbWrite(
+                        index, EeTlbEntry{}),
+                    "the invalidation fixture should clear the TLB");
+            }
+            t.IsTrue(
+                runtime->memory().tlbWrite(
+                    7u,
+                    EeTlbEntry{
+                        0u,
+                        virtualBase,
+                        makeEeTlbEntryLo(
+                            physicalBase >> 12u,
+                            true,
+                            true,
+                            true),
+                        makeEeTlbEntryLo(
+                            (physicalBase >> 12u) + 1u,
+                            true,
+                            true,
+                            true),
+                    }),
+                "the invalidation fixture should install a writable mapping");
+
+            runtime->memory().registerCodeRegion(
+                physicalBase + 0x100u,
+                physicalBase + 0x120u);
+            R5900Context context{};
+            context.pc = writerPc;
+            context.cop0_status = 0x00000010u;
+            R5900Context *ctx = &context;
+
+            // Fill the authoritative translation cache, then require the
+            // generated store to use the mapped physical destination.
+            (void)runtime->Load32(
+                rdram, ctx, virtualBase + 0x104u);
+            runtime->memory().setTlbTranslationCacheDiagnosticsEnabled(
+                true);
+            runtime->memory().resetTlbTranslationCacheStats();
+            WRITE32(
+                virtualBase + 0x104u,
+                0x11223344u);
+            t.Equals(
+                runtime->memory().tlbTranslationCacheStats().hits,
+                1ull,
+                "the mapped code store should use the warm translation cache");
+
+            // The direct KSEG path must publish the same invalidation side
+            // effect rather than writing around PS2Memory.
+            context.cop0_status = 0u;
+            WRITE32(
+                0x80000000u | physicalBase | 0x108u,
+                0x55667788u);
+
+            uint32_t mappedValue = 0u;
+            uint32_t directValue = 0u;
+            std::memcpy(
+                &mappedValue,
+                rdram + physicalBase + 0x104u,
+                sizeof(mappedValue));
+            std::memcpy(
+                &directValue,
+                rdram + physicalBase + 0x108u,
+                sizeof(directValue));
+            t.Equals(
+                mappedValue,
+                0x11223344u,
+                "the mapped fast store should write the translated PFN");
+            t.Equals(
+                directValue,
+                0x55667788u,
+                "the direct fast store should retain its physical target");
+
+            const auto events =
+                runtime->memory().takeCodeInvalidationEvents();
+            t.Equals(
+                events.size(),
+                static_cast<size_t>(1u),
+                "adjacent fast stores should publish one merged invalidation");
+            if (events.size() == 1u)
+            {
+                t.Equals(
+                    events[0].start,
+                    physicalBase + 0x104u,
+                    "fast invalidation should use the physical code address");
+                t.Equals(
+                    events[0].end,
+                    physicalBase + 0x10cu,
+                    "fast invalidation should cover both written words");
+                t.Equals(
+                    events[0].words,
+                    2u,
+                    "fast invalidation should count each code word once");
+                t.Equals(
+                    events[0].writerPc,
+                    writerPc,
+                    "fast invalidation should retain the guest writer PC");
+            }
         });
 
         tc.Run("VIF MPG num zero uploads 256 instructions", [](TestCase &t)

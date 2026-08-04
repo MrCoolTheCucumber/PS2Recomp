@@ -230,6 +230,15 @@ struct EeTlbTranslationCacheStats
     uint64_t generationMisses = 0u;
     uint64_t intervalCrossings = 0u;
     uint64_t slowPathFaults = 0u;
+    uint64_t fills = 0u;
+    uint64_t replacements = 0u;
+    uint64_t mappingChanges = 0u;
+    uint64_t fastHits = 0u;
+    uint64_t fastMisses = 0u;
+    uint64_t backingHits = 0u;
+    uint64_t backingMisses = 0u;
+    uint64_t fastFills = 0u;
+    uint64_t fastReplacements = 0u;
 };
 
 class PS2BusErrorException final : public std::exception
@@ -1121,6 +1130,26 @@ public:
         EeAddressTranslationContext translation =
             EeAddressTranslationContext::unchecked());
 
+    // Publish the non-memory side effects of a write whose destination has
+    // already been proven to be a physical RDRAM interval. Generated direct
+    // and cached-mapping stores share this with the authoritative store path.
+    inline void observeRdramWrite(
+        uint32_t physicalAddress,
+        uint32_t size,
+        uint32_t writerPc)
+    {
+        if (!m_hasCodeRegions)
+        {
+            return;
+        }
+        observeRdramWriteSlow(
+            physicalAddress, size, writerPc);
+    }
+    void observeRdramWriteSlow(
+        uint32_t physicalAddress,
+        uint32_t size,
+        uint32_t writerPc);
+
     // TLB handling
     uint32_t translateAddress(
         uint32_t virtualAddress,
@@ -1168,6 +1197,10 @@ public:
     {
         m_tlbTranslationCacheDiagnosticsEnabled = enabled;
     }
+    bool tlbTranslationCacheDiagnosticsEnabled() const noexcept
+    {
+        return m_tlbTranslationCacheDiagnosticsEnabled;
+    }
     void resetTlbTranslationCacheStats() noexcept
     {
         m_tlbTranslationCacheStats = {};
@@ -1177,6 +1210,16 @@ public:
     {
         return m_tlbTranslationCacheStats;
     }
+
+    // Cache-only lookup for generated accesses. A false result deliberately
+    // says nothing about the architectural outcome: callers must use the
+    // authoritative runtime path to fill the cache or raise the exact fault.
+    bool tryResolveCachedTlbRdramOffset(
+        uint32_t virtualAddress,
+        EeAddressTranslationContext translation,
+        bool writeAccess,
+        uint32_t accessSize,
+        uint32_t &physicalOffset) noexcept;
 
     // Hardware register interface
     bool writeIORegister(uint32_t address, uint32_t value);
@@ -1488,6 +1531,7 @@ public:
 
     static constexpr size_t kTlbTranslationCacheSetCount = 32u;
     static constexpr size_t kTlbTranslationCacheWayCount = 4u;
+    static constexpr size_t kTlbFastCacheSetCount = 64u;
     static constexpr uint32_t kTlbTranslationCachePageSize = 0x1000u;
     static_assert(
         (kTlbTranslationCacheSetCount &
@@ -1509,6 +1553,33 @@ public:
         bool scratchpad = false;
     };
 
+    struct EeTlbFastCacheEntry
+    {
+        uint64_t generation = 0u;
+        uint64_t key = 0u;
+        uint64_t matchMask = 0u;
+        uint32_t physicalPageBase = 0u;
+    };
+
+    static uint64_t makeTlbFastCacheKey(
+        uint32_t virtualAddress,
+        EeAddressTranslationContext translation,
+        bool writeAccess) noexcept
+    {
+        return
+            static_cast<uint64_t>(
+                virtualAddress &
+                ~(kTlbTranslationCachePageSize - 1u)) |
+            static_cast<uint64_t>(translation.asid) |
+            (static_cast<uint64_t>(translation.mode) << 8u) |
+            (static_cast<uint64_t>(
+                 translation.enforceOperatingMode)
+             << 10u) |
+            (static_cast<uint64_t>(translation.errorLevel)
+             << 11u) |
+            (static_cast<uint64_t>(writeAccess) << 32u);
+    }
+
     EeTranslatedAddress translateAddressImpl(
         uint32_t virtualAddress,
         EeAddressTranslationContext translation,
@@ -1528,6 +1599,12 @@ public:
         uint32_t tlbPageSize,
         bool global,
         bool writable);
+    void fillTlbFastCache(
+        uint32_t virtualPageBase,
+        uint32_t physicalPageBase,
+        EeAddressTranslationContext translation,
+        bool global,
+        bool writable) noexcept;
     void advanceTlbMappingGeneration() noexcept;
     void clearTlbTranslationCache() noexcept;
     void recordTlbTranslationSlowPathFault() noexcept;
@@ -1546,6 +1623,8 @@ public:
         m_tlbTranslationCache{};
     std::array<uint8_t, kTlbTranslationCacheSetCount>
         m_tlbTranslationCacheNextWay{};
+    std::array<EeTlbFastCacheEntry, kTlbFastCacheSetCount>
+        m_tlbFastCache{};
 
     GifPacketCallback m_gifPacketCallback;
     GifArbiter *m_gifArbiter = nullptr;
@@ -1830,7 +1909,15 @@ public:
         uint32_t end;
         std::vector<bool> modified; // Bitmap of modified 4-byte blocks
     };
+    static constexpr uint32_t kCodeRegionPageShift = 12u;
+    static constexpr size_t kCodeRegionPageCount =
+        PS2_RAM_SIZE >> kCodeRegionPageShift;
+    static constexpr size_t kCodeRegionPageWordCount =
+        (kCodeRegionPageCount + 63u) / 64u;
     std::vector<CodeRegion> m_codeRegions;
+    bool m_hasCodeRegions = false;
+    std::array<uint64_t, kCodeRegionPageWordCount>
+        m_codeRegionPages{};
     std::mutex m_codeInvalidationMutex;
     std::vector<CodeInvalidationEvent> m_pendingCodeInvalidations;
 

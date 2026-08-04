@@ -2596,6 +2596,8 @@ bool PS2Memory::initialize(size_t ramSize)
     m_ipuInputFifoQwc = 0u;
     m_scratchpadDma = {};
     m_codeRegions.clear();
+    m_hasCodeRegions = false;
+    m_codeRegionPages = {};
     m_path3Masked = false;
     m_gifModePath3Masked = false;
     m_path3MaskedFifo.clear();
@@ -2883,10 +2885,15 @@ void PS2Memory::clearTlbTranslationCache() noexcept
 {
     m_tlbTranslationCache = {};
     m_tlbTranslationCacheNextWay = {};
+    m_tlbFastCache = {};
 }
 
 void PS2Memory::advanceTlbMappingGeneration() noexcept
 {
+    if (m_tlbTranslationCacheDiagnosticsEnabled)
+    {
+        ++m_tlbTranslationCacheStats.mappingChanges;
+    }
     if (m_tlbMappingGeneration ==
         std::numeric_limits<uint64_t>::max())
     {
@@ -2905,6 +2912,108 @@ void PS2Memory::recordTlbTranslationSlowPathFault() noexcept
     {
         ++m_tlbTranslationCacheStats.slowPathFaults;
     }
+}
+
+bool PS2Memory::tryResolveCachedTlbRdramOffset(
+    uint32_t virtualAddress,
+    EeAddressTranslationContext translation,
+    bool writeAccess,
+    uint32_t accessSize,
+    uint32_t &physicalOffset) noexcept
+{
+    if (!m_tlbTranslationCacheEnabled)
+    {
+        return false;
+    }
+
+    constexpr uint32_t pageMask =
+        kTlbTranslationCachePageSize - 1u;
+    const uint32_t pageOffset = virtualAddress & pageMask;
+    const bool supportedAccessSize =
+        accessSize != 0u &&
+        accessSize <= sizeof(__m128i) &&
+        (accessSize & (accessSize - 1u)) == 0u;
+    if (!supportedAccessSize ||
+        !translation.permits(virtualAddress))
+    {
+        if (m_tlbTranslationCacheDiagnosticsEnabled)
+        {
+            ++m_tlbTranslationCacheStats.misses;
+        }
+        return false;
+    }
+    if (accessSize >
+        kTlbTranslationCachePageSize - pageOffset)
+    {
+        if (m_tlbTranslationCacheDiagnosticsEnabled)
+        {
+            ++m_tlbTranslationCacheStats.intervalCrossings;
+            ++m_tlbTranslationCacheStats.misses;
+        }
+        return false;
+    }
+    if ((virtualAddress & (accessSize - 1u)) != 0u)
+    {
+        if (m_tlbTranslationCacheDiagnosticsEnabled)
+        {
+            ++m_tlbTranslationCacheStats.misses;
+        }
+        return false;
+    }
+
+    const size_t setIndex =
+        (virtualAddress >> 12u) &
+        (kTlbFastCacheSetCount - 1u);
+    const EeTlbFastCacheEntry &entry =
+        m_tlbFastCache[setIndex];
+    const uint64_t requestKey =
+        makeTlbFastCacheKey(
+            virtualAddress,
+            translation,
+            writeAccess);
+    const bool generationMatches =
+        entry.generation == m_tlbMappingGeneration;
+    const bool keyMatches =
+        ((requestKey ^ entry.key) & entry.matchMask) == 0u;
+    const uint32_t resolved =
+        entry.physicalPageBase + pageOffset;
+    if (generationMatches &&
+        keyMatches &&
+        resolved <= PS2_RAM_SIZE - accessSize)
+    {
+        if (m_tlbTranslationCacheDiagnosticsEnabled)
+        {
+            ++m_tlbTranslationCacheStats.hits;
+            ++m_tlbTranslationCacheStats.fastHits;
+        }
+        physicalOffset = resolved;
+        return true;
+    }
+
+    if (m_tlbTranslationCacheDiagnosticsEnabled)
+    {
+        ++m_tlbTranslationCacheStats.misses;
+        ++m_tlbTranslationCacheStats.fastMisses;
+        if (!generationMatches &&
+            entry.generation != 0u &&
+            keyMatches)
+        {
+            ++m_tlbTranslationCacheStats.generationMisses;
+        }
+        if (generationMatches &&
+            writeAccess &&
+            !keyMatches &&
+            ((makeTlbFastCacheKey(
+                   virtualAddress,
+                   translation,
+                   false) ^
+               entry.key) &
+              entry.matchMask) == 0u)
+        {
+            ++m_tlbTranslationCacheStats.permissionMisses;
+        }
+    }
+    return false;
 }
 
 std::optional<PS2Memory::EeTranslatedAddress>
@@ -2926,11 +3035,13 @@ PS2Memory::lookupTlbTranslationCache(
         accessSize != 0u &&
         accessSize <= sizeof(__m128i) &&
         (accessSize & (accessSize - 1u)) == 0u;
-    if (!supportedAccessSize)
+    if (!supportedAccessSize ||
+        !translation.permits(virtualAddress))
     {
         if (m_tlbTranslationCacheDiagnosticsEnabled)
         {
             ++m_tlbTranslationCacheStats.misses;
+            ++m_tlbTranslationCacheStats.backingMisses;
         }
         return std::nullopt;
     }
@@ -2941,6 +3052,7 @@ PS2Memory::lookupTlbTranslationCache(
         {
             ++m_tlbTranslationCacheStats.intervalCrossings;
             ++m_tlbTranslationCacheStats.misses;
+            ++m_tlbTranslationCacheStats.backingMisses;
         }
         return std::nullopt;
     }
@@ -2949,6 +3061,7 @@ PS2Memory::lookupTlbTranslationCache(
         if (m_tlbTranslationCacheDiagnosticsEnabled)
         {
             ++m_tlbTranslationCacheStats.misses;
+            ++m_tlbTranslationCacheStats.backingMisses;
         }
         return std::nullopt;
     }
@@ -2963,7 +3076,7 @@ PS2Memory::lookupTlbTranslationCache(
     for (const EeTlbTranslationCacheEntry &entry :
          m_tlbTranslationCache[setIndex])
     {
-        if (!entry.valid ||
+        if (!entry.valid || entry.scratchpad ||
             entry.virtualPageBase != virtualPageBase ||
             entry.mode != translation.mode ||
             entry.enforceOperatingMode !=
@@ -2984,19 +3097,30 @@ PS2Memory::lookupTlbTranslationCache(
             continue;
         }
 
+        const uint32_t resolved =
+            entry.physicalPageBase + pageOffset;
+        if (resolved > PS2_RAM_SIZE - accessSize)
+        {
+            continue;
+        }
+        fillTlbFastCache(
+            entry.virtualPageBase,
+            entry.physicalPageBase,
+            translation,
+            entry.global,
+            entry.writable);
         if (m_tlbTranslationCacheDiagnosticsEnabled)
         {
             ++m_tlbTranslationCacheStats.hits;
+            ++m_tlbTranslationCacheStats.backingHits;
         }
-        return EeTranslatedAddress{
-            entry.physicalPageBase + pageOffset,
-            entry.scratchpad,
-        };
+        return EeTranslatedAddress{resolved, false};
     }
 
     if (m_tlbTranslationCacheDiagnosticsEnabled)
     {
         ++m_tlbTranslationCacheStats.misses;
+        ++m_tlbTranslationCacheStats.backingMisses;
         if (generationMiss)
         {
             ++m_tlbTranslationCacheStats.generationMisses;
@@ -3007,6 +3131,57 @@ PS2Memory::lookupTlbTranslationCache(
         }
     }
     return std::nullopt;
+}
+
+void PS2Memory::fillTlbFastCache(
+    uint32_t virtualPageBase,
+    uint32_t physicalPageBase,
+    EeAddressTranslationContext translation,
+    bool global,
+    bool writable) noexcept
+{
+    const size_t setIndex =
+        (virtualPageBase >> 12u) &
+        (kTlbFastCacheSetCount - 1u);
+    EeTlbFastCacheEntry &entry =
+        m_tlbFastCache[setIndex];
+    const uint64_t key =
+        makeTlbFastCacheKey(
+            virtualPageBase,
+            translation,
+            false);
+    uint64_t matchMask = ~uint64_t{0u};
+    if (global)
+    {
+        matchMask &= ~uint64_t{0xffu};
+    }
+    if (writable)
+    {
+        matchMask &= ~(uint64_t{1u} << 32u);
+    }
+    const bool sameLine =
+        entry.generation == m_tlbMappingGeneration &&
+        entry.key == key &&
+        entry.matchMask == matchMask &&
+        entry.physicalPageBase == physicalPageBase;
+    if (!sameLine)
+    {
+        if (m_tlbTranslationCacheDiagnosticsEnabled &&
+            entry.generation == m_tlbMappingGeneration)
+        {
+            ++m_tlbTranslationCacheStats.fastReplacements;
+        }
+        entry = {
+            m_tlbMappingGeneration,
+            key,
+            matchMask,
+            physicalPageBase,
+        };
+        if (m_tlbTranslationCacheDiagnosticsEnabled)
+        {
+            ++m_tlbTranslationCacheStats.fastFills;
+        }
+    }
 }
 
 void PS2Memory::fillTlbTranslationCache(
@@ -3085,6 +3260,10 @@ void PS2Memory::fillTlbTranslationCache(
             static_cast<uint8_t>(
                 (selectedWay + 1u) %
                 kTlbTranslationCacheWayCount);
+        if (m_tlbTranslationCacheDiagnosticsEnabled)
+        {
+            ++m_tlbTranslationCacheStats.replacements;
+        }
     }
 
     set[selectedWay] = {
@@ -3101,6 +3280,16 @@ void PS2Memory::fillTlbTranslationCache(
         writable,
         translated.scratchpad,
     };
+    fillTlbFastCache(
+        virtualPageBase,
+        physicalPageBase,
+        translation,
+        global,
+        writable);
+    if (m_tlbTranslationCacheDiagnosticsEnabled)
+    {
+        ++m_tlbTranslationCacheStats.fills;
+    }
 }
 
 PS2Memory::EeTranslatedAddress
@@ -3739,7 +3928,7 @@ void PS2Memory::write8(
     }
     else if (physAddr < PS2_RAM_SIZE)
     {
-        markModified(physAddr, sizeof(value), writerPc);
+        observeRdramWrite(physAddr, sizeof(value), writerPc);
         m_rdram[physAddr] = value;
     }
     else
@@ -3800,7 +3989,7 @@ void PS2Memory::write16(
     }
     else if (physAddr < PS2_RAM_SIZE)
     {
-        markModified(physAddr, sizeof(value), writerPc);
+        observeRdramWrite(physAddr, sizeof(value), writerPc);
         storeScalar<uint16_t>(m_rdram, physAddr, PS2_RAM_SIZE, value, "write16 rdram", address);
     }
     else
@@ -3869,7 +4058,7 @@ void PS2Memory::write32(
     else if (physAddr < PS2_RAM_SIZE)
     {
         // Check if this might be code modification
-        markModified(physAddr, sizeof(value), writerPc);
+        observeRdramWrite(physAddr, sizeof(value), writerPc);
 
         storeScalar<uint32_t>(m_rdram, physAddr, PS2_RAM_SIZE, value, "write32 rdram", address);
     }
@@ -3930,7 +4119,7 @@ void PS2Memory::write64(
     }
     else if (physAddr < PS2_RAM_SIZE)
     {
-        markModified(physAddr, sizeof(value), writerPc);
+        observeRdramWrite(physAddr, sizeof(value), writerPc);
         storeScalar<uint64_t>(m_rdram, physAddr, PS2_RAM_SIZE, value, "write64 rdram", address);
     }
     else
@@ -4033,7 +4222,7 @@ void PS2Memory::writeMasked32(
         inRange(
             physAddr, sizeof(value), PS2_RAM_SIZE,
             "writeMasked32 rdram", address);
-        markModified(
+        observeRdramWrite(
             physAddr + span.offset, span.size, writerPc);
         writeBytes(m_rdram + physAddr);
         return;
@@ -4130,7 +4319,7 @@ void PS2Memory::writeMasked64(
         inRange(
             physAddr, sizeof(value), PS2_RAM_SIZE,
             "writeMasked64 rdram", address);
-        markModified(
+        observeRdramWrite(
             physAddr + span.offset, span.size, writerPc);
         writeBytes(m_rdram + physAddr);
         return;
@@ -4205,7 +4394,7 @@ void PS2Memory::write128(
     }
     else if (physAddr < PS2_RAM_SIZE)
     {
-        markModified(physAddr, sizeof(__m128i), writerPc);
+        observeRdramWrite(physAddr, sizeof(__m128i), writerPc);
         inRange(physAddr, sizeof(__m128i), PS2_RAM_SIZE, "write128 rdram", address);
         _mm_storeu_si128(reinterpret_cast<__m128i *>(&m_rdram[physAddr]), value);
     }
@@ -6457,7 +6646,7 @@ bool PS2Memory::copyFromIpuDmaPayload(
         }
         else if (physicalAddress < PS2_RAM_SIZE)
         {
-            markModified(
+            observeRdramWrite(
                 physicalAddress, 16u, 0u);
             std::memcpy(
                 m_rdram + physicalAddress,
@@ -9553,6 +9742,23 @@ void PS2Memory::registerCodeRegion(uint32_t start, uint32_t end)
     region.modified.resize(sizeInWords, false);
 
     m_codeRegions.push_back(region);
+    m_hasCodeRegions = true;
+    if (start < PS2_RAM_SIZE)
+    {
+        const uint32_t boundedEnd =
+            std::min(end, PS2_RAM_SIZE);
+        const uint32_t firstPage =
+            start >> kCodeRegionPageShift;
+        const uint32_t lastPage =
+            (boundedEnd - 1u) >> kCodeRegionPageShift;
+        for (uint32_t page = firstPage;
+             page <= lastPage;
+             ++page)
+        {
+            m_codeRegionPages[page >> 6u] |=
+                uint64_t{1u} << (page & 63u);
+        }
+    }
     RUNTIME_LOG("Registered code region: " << std::hex << start << " - " << end
                                             << std::dec << std::endl);
 }
@@ -9572,6 +9778,37 @@ bool PS2Memory::isCodeAddress(uint32_t address) const
         }
     }
     return false;
+}
+
+void PS2Memory::observeRdramWriteSlow(
+    uint32_t physicalAddress,
+    uint32_t size,
+    uint32_t writerPc)
+{
+    if (size == 0u ||
+        physicalAddress >= PS2_RAM_SIZE ||
+        size > PS2_RAM_SIZE - physicalAddress)
+    {
+        return;
+    }
+
+    const uint32_t firstPage =
+        physicalAddress >> kCodeRegionPageShift;
+    const uint32_t lastPage =
+        (physicalAddress + size - 1u) >>
+        kCodeRegionPageShift;
+    for (uint32_t page = firstPage;
+         page <= lastPage;
+         ++page)
+    {
+        const uint64_t pageBit =
+            uint64_t{1u} << (page & 63u);
+        if ((m_codeRegionPages[page >> 6u] & pageBit) != 0u)
+        {
+            markModified(physicalAddress, size, writerPc);
+            return;
+        }
+    }
 }
 
 void PS2Memory::markModified(uint32_t address, uint32_t size, uint32_t writerPc)
