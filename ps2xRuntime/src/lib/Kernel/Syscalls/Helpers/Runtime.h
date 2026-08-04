@@ -630,7 +630,7 @@ static bool rpcInvokeFunction(uint8_t *rdram, R5900Context *ctx, PS2Runtime *run
             }
 
             PS2Runtime::RecompiledFunction func =
-                runtime->lookupFunction(pc);
+                runtime->lookupFunction(pc, &tmp);
             runtime->executeGuestStep(rdram, &tmp, func);
             ++steps;
         }

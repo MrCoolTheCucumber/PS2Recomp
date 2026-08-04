@@ -60,10 +60,28 @@ namespace
         SET_GPR_U32(ctx, 2, 0x11111111u);
     }
 
-    void testOverlayModuleFunction(
+    void testOverlayModuleFastFunction(
         uint8_t *, R5900Context *ctx, PS2Runtime *)
     {
         SET_GPR_U32(ctx, 2, 0x22222222u);
+    }
+
+    void testOverlayModulePreciseFunction(
+        uint8_t *, R5900Context *ctx, PS2Runtime *)
+    {
+        SET_GPR_U32(ctx, 2, 0x33333333u);
+    }
+
+    void testFastObservationFunction(
+        uint8_t *, R5900Context *ctx, PS2Runtime *)
+    {
+        SET_GPR_U32(ctx, 2, 0xFA57FA57u);
+    }
+
+    void testPreciseObservationFunction(
+        uint8_t *, R5900Context *ctx, PS2Runtime *)
+    {
+        SET_GPR_U32(ctx, 2, 0xEC1AEC1Au);
     }
 
     void setRegU32(R5900Context &ctx, int reg, uint32_t value)
@@ -486,6 +504,7 @@ namespace
 
     std::atomic<uint32_t> gAsyncCallbackObservedSp{0u};
     std::atomic<uint32_t> gAsyncCallbackObservedGp{0u};
+    std::atomic<uint32_t> gAsyncCallbackObservationEntry{0u};
 
     void testRecordAsyncCallbackStack(uint8_t *rdram, R5900Context *ctx, PS2Runtime *)
     {
@@ -506,6 +525,26 @@ namespace
                 sizeof(kStackMarker));
         }
         ctx->pc = 0u;
+    }
+
+    void testRecordFastAsyncCallbackStack(
+        uint8_t *rdram,
+        R5900Context *ctx,
+        PS2Runtime *runtime)
+    {
+        gAsyncCallbackObservationEntry.store(
+            1u, std::memory_order_release);
+        testRecordAsyncCallbackStack(rdram, ctx, runtime);
+    }
+
+    void testRecordPreciseAsyncCallbackStack(
+        uint8_t *rdram,
+        R5900Context *ctx,
+        PS2Runtime *runtime)
+    {
+        gAsyncCallbackObservationEntry.store(
+            2u, std::memory_order_release);
+        testRecordAsyncCallbackStack(rdram, ctx, runtime);
     }
 
     std::atomic<uint32_t> gMpegStreamCallbackCount{0u};
@@ -765,6 +804,139 @@ void register_ps2_runtime_expansion_tests()
                      "an unknown PC should remain an unambiguous raw address");
         });
 
+        tc.Run("function pairs select one architectural observation mode per lookup", [](TestCase &t)
+        {
+            constexpr uint32_t kEntry = 0x00003000u;
+            constexpr uint32_t kBreakpointInstructionEnable = 1u << 31u;
+            constexpr uint32_t kBreakpointReadEnable = 1u << 30u;
+            constexpr uint32_t kBreakpointWriteEnable = 1u << 29u;
+            constexpr uint32_t kPerformanceCounterEnable = 1u << 31u;
+
+            PS2Runtime runtime;
+            t.IsTrue(
+                runtime.replaceFunction(
+                    kEntry,
+                    {&testFastObservationFunction,
+                     &testPreciseObservationFunction}),
+                "a complete fast/precise pair should install in the dense table");
+
+            const auto invoke =
+                [&runtime, kEntry](R5900Context &ctx,
+                                   bool contextAware)
+                {
+                    ctx.pc = kEntry;
+                    SET_GPR_U32(&ctx, 2, 0u);
+                    PS2Runtime::RecompiledFunction function =
+                        contextAware
+                            ? runtime.lookupFunction(kEntry, &ctx)
+                            : runtime.lookupFunction(kEntry);
+                    function(
+                        runtime.memory().getRDRAM(),
+                        &ctx,
+                        &runtime);
+                    return ::getRegU32(&ctx, 2);
+                };
+
+            R5900Context ctx{};
+            t.Equals(
+                PS2Runtime::architecturalObservationMode(&ctx),
+                EeArchitecturalObservationMode::Fast,
+                "an inactive BPC/PCCR context should select fast mode");
+            t.Equals(
+                invoke(ctx, true), 0xFA57FA57u,
+                "context-aware dense lookup should select the fast entry");
+            t.Equals(
+                invoke(ctx, false), 0xEC1AEC1Au,
+                "context-free compatibility lookup should conservatively select precise mode");
+
+            for (const uint32_t enable : {
+                     kBreakpointInstructionEnable,
+                     kBreakpointReadEnable,
+                     kBreakpointWriteEnable})
+            {
+                ctx = {};
+                ctx.cop0_bpc = enable;
+                t.Equals(
+                    invoke(ctx, true), 0xEC1AEC1Au,
+                    "each global hardware-breakpoint enable should select precise mode");
+            }
+
+            ctx = {};
+            ctx.cop0_bpc = 1u;
+            t.Equals(
+                invoke(ctx, true), 0xFA57FA57u,
+                "breakpoint cause/status bits alone should not select precise mode");
+
+            ctx = {};
+            ctx.cop0_perf = kPerformanceCounterEnable;
+            t.Equals(
+                invoke(ctx, true), 0xEC1AEC1Au,
+                "PCCR.CTE should select precise mode");
+
+            ctx = {};
+            ctx.pc = 0x00002000u;
+            ctx.cop0_status = COP0_STATUS_ERL;
+            t.IsTrue(
+                runtime.dispatchGuestBranch(
+                    nullptr,
+                    &ctx,
+                    kEntry,
+                    0x00002000u,
+                    0x00002008u,
+                    PS2Runtime::GuestBranchKind::DirectCall,
+                    "fast pair test"),
+                "mode-aware branch dispatch should preserve call-return behavior");
+            t.Equals(
+                ::getRegU32(&ctx, 2), 0xFA57FA57u,
+                "branch dispatch should select the fast entry when observation is inactive");
+
+            ctx = {};
+            ctx.pc = 0x00002000u;
+            ctx.cop0_status = COP0_STATUS_ERL;
+            ctx.cop0_bpc = kBreakpointInstructionEnable;
+            t.IsTrue(
+                runtime.dispatchGuestBranch(
+                    nullptr,
+                    &ctx,
+                    kEntry,
+                    0x00002000u,
+                    0x00002008u,
+                    PS2Runtime::GuestBranchKind::IndirectCall,
+                    "precise pair test"),
+                "precise branch dispatch should preserve call-return behavior");
+            t.Equals(
+                ::getRegU32(&ctx, 2), 0xEC1AEC1Au,
+                "branch dispatch should select the precise entry when observation is enabled");
+
+            ctx = {};
+            ctx.pc = 0x80000000u | kEntry;
+            PS2Runtime::RecompiledFunction alias =
+                runtime.lookupFunction(ctx.pc, &ctx);
+            alias(runtime.memory().getRDRAM(), &ctx, &runtime);
+            t.Equals(
+                ::getRegU32(&ctx, 2), 0xFA57FA57u,
+                "direct-mapped aliases should retain context-aware mode selection");
+
+            t.IsFalse(
+                runtime.replaceFunction(
+                    kEntry,
+                    {&testFastObservationFunction, nullptr}),
+                "an incomplete function pair should be rejected");
+            ctx = {};
+            t.Equals(
+                invoke(ctx, true), 0xFA57FA57u,
+                "a rejected replacement should preserve the existing pair");
+
+            t.IsTrue(
+                runtime.replaceFunction(
+                    kEntry, &testPreciseObservationFunction),
+                "a legacy single-function replacement should remain supported");
+            ctx = {};
+            t.Equals(
+                invoke(ctx, true), 0xEC1AEC1Au,
+                "a single-function replacement should populate both pair entries");
+        });
+
         tc.Run("fixed-address AOT modules activate from guest-memory signatures", [](TestCase &t)
         {
             constexpr uint32_t kMatchAddress = 0x00301000u;
@@ -775,14 +947,19 @@ void register_ps2_runtime_expansion_tests()
                 0x16u, 0x00u, 0x02u, 0x3Cu,
             };
             static const PS2RecompiledModuleFunction kFunctions[] = {
-                {kOverlapEntry, &testOverlayModuleFunction},
-                {kModuleOnlyEntry, &testOverlayModuleFunction},
+                {kOverlapEntry,
+                 {&testOverlayModuleFastFunction,
+                  &testOverlayModulePreciseFunction}},
+                {kModuleOnlyEntry,
+                 {&testOverlayModuleFastFunction,
+                  &testOverlayModulePreciseFunction}},
             };
             static const PS2GuestFunctionSymbol kSymbols[] = {
                 {kOverlapEntry, kOverlapEntry + 0x20u, "overlay_overlap"},
                 {kModuleOnlyEntry, kModuleOnlyEntry + 0x20u, "overlay_only"},
             };
             static const PS2RecompiledModuleDescriptor kModule = {
+                PS2_RECOMPILED_FUNCTION_PAIR_ABI_VERSION,
                 "runtime-test-overlay",
                 kMatchAddress,
                 kMatchBytes,
@@ -793,6 +970,12 @@ void register_ps2_runtime_expansion_tests()
                 std::size(kSymbols),
             };
 
+            PS2RecompiledModuleDescriptor staleModule = kModule;
+            staleModule.abiVersion =
+                PS2_RECOMPILED_FUNCTION_PAIR_ABI_VERSION - 1u;
+            t.IsFalse(
+                ps2RegisterRecompiledModule(&staleModule),
+                "a stale generated module ABI should be rejected before registration");
             t.IsTrue(
                 ps2RegisterRecompiledModule(&kModule),
                 "a valid generated module descriptor should register");
@@ -811,7 +994,7 @@ void register_ps2_runtime_expansion_tests()
                 "module-only code should remain unavailable before its bytes load");
             R5900Context ctx{};
             ctx.pc = kOverlapEntry;
-            runtime.lookupFunction(kOverlapEntry)(
+            runtime.lookupFunction(kOverlapEntry, &ctx)(
                 runtime.memory().getRDRAM(), &ctx, &runtime);
             t.Equals(
                 ::getRegU32(&ctx, 2), 0x11111111u,
@@ -829,11 +1012,20 @@ void register_ps2_runtime_expansion_tests()
                 "module dispatch should normalize a direct-mapped EE alias");
             std::memset(&ctx, 0, sizeof(ctx));
             ctx.pc = kOverlapEntry;
-            runtime.lookupFunction(kOverlapEntry)(
+            runtime.lookupFunction(kOverlapEntry, &ctx)(
                 runtime.memory().getRDRAM(), &ctx, &runtime);
             t.Equals(
                 ::getRegU32(&ctx, 2), 0x22222222u,
                 "the active overlay implementation should replace an overlapping primary entry");
+
+            std::memset(&ctx, 0, sizeof(ctx));
+            ctx.pc = kOverlapEntry;
+            ctx.cop0_bpc = 1u << 31u;
+            runtime.lookupFunction(kOverlapEntry, &ctx)(
+                runtime.memory().getRDRAM(), &ctx, &runtime);
+            t.Equals(
+                ::getRegU32(&ctx, 2), 0x33333333u,
+                "active module lookup should select its precise entry when observation is enabled");
 
             runtime.memory().getRDRAM()[kMatchAddress] ^= 0x01u;
             t.IsFalse(
@@ -841,7 +1033,7 @@ void register_ps2_runtime_expansion_tests()
                 "a changed signature should deactivate the stale module immediately");
             std::memset(&ctx, 0, sizeof(ctx));
             ctx.pc = kOverlapEntry;
-            runtime.lookupFunction(kOverlapEntry)(
+            runtime.lookupFunction(kOverlapEntry, &ctx)(
                 runtime.memory().getRDRAM(), &ctx, &runtime);
             t.Equals(
                 ::getRegU32(&ctx, 2), 0x11111111u,
@@ -2617,11 +2809,16 @@ void register_ps2_runtime_expansion_tests()
             constexpr uint32_t kAsyncStackFloor = 0x01F00000u;
 
             runtime.configureGuestHeap(kAsyncStackFloor, kAsyncStackFloor);
-            runtime.registerFunction(kCallbackEntry, &testRecordAsyncCallbackStack);
+            runtime.registerFunction(
+                kCallbackEntry,
+                {&testRecordFastAsyncCallbackStack,
+                 &testRecordPreciseAsyncCallbackStack});
             ps2_stubs::resetGsSyncVCallbackState(
                 &runtime);
             gAsyncCallbackObservedSp.store(0u, std::memory_order_release);
             gAsyncCallbackObservedGp.store(0u, std::memory_order_release);
+            gAsyncCallbackObservationEntry.store(
+                0u, std::memory_order_release);
 
             R5900Context registerCtx{};
             registerCtx.pc = 0x00101900u;
@@ -2640,6 +2837,28 @@ void register_ps2_runtime_expansion_tests()
             t.IsTrue(observedSp != kCallerSp, "callback should not reuse the registering thread stack");
             t.IsTrue(observedSp >= kAsyncStackFloor,
                      "callback should switch to the reserved async stack pool");
+            t.Equals(
+                gAsyncCallbackObservationEntry.load(
+                    std::memory_order_acquire),
+                1u,
+                "an idle callback should select the fast entry when observation is inactive");
+
+            R5900Context interruptedCtx{};
+            interruptedCtx.pc = 0x00102000u;
+            interruptedCtx.cop0_bpc = 1u << 31u;
+            gAsyncCallbackObservationEntry.store(
+                0u, std::memory_order_release);
+            {
+                PS2Runtime::GuestExecutionScope interruptedExecution(
+                    &runtime, &interruptedCtx);
+                ps2_stubs::dispatchGsSyncVCallback(
+                    rdram.data(), &runtime, 2u);
+            }
+            t.Equals(
+                gAsyncCallbackObservationEntry.load(
+                    std::memory_order_acquire),
+                2u,
+                "a callback should inherit processor observation state and select precise mode");
 
             runtime.requestStop();
             notifyRuntimeStop();

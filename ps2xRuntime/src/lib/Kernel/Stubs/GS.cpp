@@ -819,7 +819,8 @@ namespace ps2_stubs
                         break;
                     }
 
-                    auto step = runtime->lookupFunction(callbackCtx.pc);
+                    auto step = runtime->lookupFunction(
+                        callbackCtx.pc, &callbackCtx);
                     if (!step)
                     {
                         break;

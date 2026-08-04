@@ -1303,9 +1303,19 @@ void register_code_generator_tests()
         std::string registration = gen.generateFunctionRegistration({func}, {});
         printGeneratedCode("resume entry targets register to the owner wrapper", registration);
 
-        t.IsTrue(registration.find("g_ps2RecompiledFunctionTable[2] = resume_owner_0x7000; // 0x7008") != std::string::npos,
+        t.IsTrue(
+            registration.find(
+                "g_ps2RecompiledFunctionPairAbiVersion = PS2_RECOMPILED_FUNCTION_PAIR_ABI_VERSION") !=
+                std::string::npos,
+            "primary registration should publish the function-pair ABI version");
+        t.IsTrue(
+            registration.find(
+                "PS2Runtime::RecompiledFunctionPair g_ps2RecompiledFunctionTable") !=
+                std::string::npos,
+            "the dense table should retain O(1) slots containing function pairs");
+        t.IsTrue(registration.find("g_ps2RecompiledFunctionTable[2] = {resume_owner_0x7000, resume_owner_0x7000}; // 0x7008") != std::string::npos,
                  "resume entry pc should register to the owner wrapper");
-        t.IsTrue(registration.find("g_ps2RecompiledFunctionTable[3] = resume_owner_0x7000; // 0x700c") != std::string::npos,
+        t.IsTrue(registration.find("g_ps2RecompiledFunctionTable[3] = {resume_owner_0x7000, resume_owner_0x7000}; // 0x700c") != std::string::npos,
                  "multiple resume pcs should register to the same owner wrapper");
         const RecompilerReporter::Counters counters = reporter.counters();
         t.Equals(counters.resumeEntryTargetsAudited, size_t{3},
@@ -1356,9 +1366,14 @@ void register_code_generator_tests()
 
         t.IsTrue(
             registration.find(
-                "{0x9000u, ps2_module_test_overlay_entry_0x9000}") !=
+                "{0x9000u, {ps2_module_test_overlay_entry_0x9000, ps2_module_test_overlay_entry_0x9000}}") !=
                 std::string::npos,
             "module registration should retain the prefixed native entry");
+        t.IsTrue(
+            registration.find(
+                "PS2_RECOMPILED_FUNCTION_PAIR_ABI_VERSION") !=
+                std::string::npos,
+            "module registration should declare its function-pair ABI version");
         t.IsTrue(
             registration.find("\"test-overlay\"") != std::string::npos &&
                 registration.find("0x9000u") != std::string::npos &&
@@ -1415,7 +1430,7 @@ void register_code_generator_tests()
         std::string registration = gen.generateFunctionRegistration({owner}, {});
         printGeneratedCode("external mid-function entry can register to the owner wrapper", registration);
 
-        t.IsTrue(registration.find("g_ps2RecompiledFunctionTable[1] = owner_0x5000; // 0x5004") != std::string::npos,
+        t.IsTrue(registration.find("g_ps2RecompiledFunctionTable[1] = {owner_0x5000, owner_0x5000}; // 0x5004") != std::string::npos,
                  "mid-function external entry should register back to the owner wrapper");
     });
 

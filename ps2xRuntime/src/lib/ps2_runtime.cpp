@@ -1157,6 +1157,13 @@ PS2Runtime::PS2Runtime(PS2RuntimeConfiguration configuration)
       m_cpuContext(
           R5900Context::InitializationProfile::PostBiosElf)
 {
+    if (g_ps2RecompiledFunctionPairAbiVersion !=
+        PS2_RECOMPILED_FUNCTION_PAIR_ABI_VERSION)
+    {
+        throw std::runtime_error(
+            "generated EE function table uses an incompatible fast/precise ABI");
+    }
+
     m_memory.installPostBiosTlbState();
     m_hostPresentationUploadState =
         std::make_unique<
@@ -5903,13 +5910,13 @@ namespace
             normalizeGuestFunctionAddress(address), slot);
     }
 
-    PS2Runtime::RecompiledFunction generatedFunctionAtNormalizedAddress(
+    PS2Runtime::RecompiledFunctionPair generatedFunctionAtNormalizedAddress(
         uint32_t address)
     {
         uint32_t slot = 0u;
         if (!generatedFunctionTableSlotNormalized(address, slot))
         {
-            return nullptr;
+            return {};
         }
         return g_ps2RecompiledFunctionTable[slot];
     }
@@ -5936,7 +5943,7 @@ namespace
                    module.matchSize) == 0;
     }
 
-    PS2Runtime::RecompiledFunction recompiledModuleFunction(
+    PS2Runtime::RecompiledFunctionPair recompiledModuleFunction(
         const PS2RecompiledModuleDescriptor &module,
         uint32_t address)
     {
@@ -5957,12 +5964,12 @@ namespace
         if (first < module.functionCount &&
             module.functions[first].address == address)
         {
-            return module.functions[first].function;
+            return module.functions[first].functions;
         }
-        return nullptr;
+        return {};
     }
 
-    PS2Runtime::RecompiledFunction activeRecompiledModuleFunction(
+    PS2Runtime::RecompiledFunctionPair activeRecompiledModuleFunction(
         uint32_t address,
         const uint8_t *rdram)
     {
@@ -5975,25 +5982,25 @@ namespace
                 continue;
             }
 
-            PS2Runtime::RecompiledFunction function =
+            PS2Runtime::RecompiledFunctionPair functions =
                 recompiledModuleFunction(*module, address);
-            if (function != nullptr &&
+            if (!functions.empty() &&
                 recompiledModuleMatches(*module, rdram))
             {
-                return function;
+                return functions;
             }
         }
-        return nullptr;
+        return {};
     }
 
-    PS2Runtime::RecompiledFunction activeRecompiledFunction(
+    PS2Runtime::RecompiledFunctionPair activeRecompiledFunction(
         uint32_t address,
         const uint8_t *rdram)
     {
-        PS2Runtime::RecompiledFunction moduleFunction =
+        PS2Runtime::RecompiledFunctionPair moduleFunctions =
             activeRecompiledModuleFunction(address, rdram);
-        return moduleFunction != nullptr
-                   ? moduleFunction
+        return !moduleFunctions.empty()
+                   ? moduleFunctions
                    : generatedFunctionAtNormalizedAddress(address);
     }
 
@@ -6057,7 +6064,10 @@ namespace
 bool ps2RegisterRecompiledModule(
     const PS2RecompiledModuleDescriptor *descriptor) noexcept
 {
-    if (descriptor == nullptr || descriptor->name == nullptr ||
+    if (descriptor == nullptr ||
+        descriptor->abiVersion !=
+            PS2_RECOMPILED_FUNCTION_PAIR_ABI_VERSION ||
+        descriptor->name == nullptr ||
         descriptor->name[0] == '\0' || descriptor->matchBytes == nullptr ||
         descriptor->matchSize < 4u || descriptor->matchSize > 4096u ||
         descriptor->functions == nullptr || descriptor->functionCount == 0u ||
@@ -6078,7 +6088,7 @@ bool ps2RegisterRecompiledModule(
     for (uint32_t index = 0u; index < descriptor->functionCount; ++index)
     {
         const PS2RecompiledModuleFunction &entry = descriptor->functions[index];
-        if (entry.function == nullptr || (entry.address & 3u) != 0u ||
+        if (!entry.functions.complete() || (entry.address & 3u) != 0u ||
             entry.address >= PS2_RAM_SIZE ||
             (index != 0u && entry.address <= previousAddress))
         {
@@ -6149,8 +6159,18 @@ std::string PS2Runtime::formatGuestPc(uint32_t address)
     return oss.str();
 }
 
-bool PS2Runtime::replaceFunction(uint32_t address, RecompiledFunction func)
+bool PS2Runtime::replaceFunction(
+    uint32_t address,
+    RecompiledFunctionPair functions)
 {
+    if (!functions.empty() && !functions.complete())
+    {
+        std::cerr
+            << "[function-table] cannot install an incomplete fast/precise pair at guest PC 0x"
+            << std::hex << address << std::dec << std::endl;
+        return false;
+    }
+
     uint32_t slot = 0u;
     if (!generatedFunctionTableSlot(address, slot))
     {
@@ -6161,8 +6181,24 @@ bool PS2Runtime::replaceFunction(uint32_t address, RecompiledFunction func)
         return false;
     }
 
-    g_ps2RecompiledFunctionTable[slot] = func;
+    g_ps2RecompiledFunctionTable[slot] = functions;
     return true;
+}
+
+bool PS2Runtime::replaceFunction(
+    uint32_t address,
+    RecompiledFunction func)
+{
+    return replaceFunction(
+        address,
+        RecompiledFunctionPair::identical(func));
+}
+
+bool PS2Runtime::registerFunction(
+    uint32_t address,
+    RecompiledFunctionPair functions)
+{
+    return replaceFunction(address, functions);
 }
 
 bool PS2Runtime::registerFunction(uint32_t address, RecompiledFunction func)
@@ -6172,9 +6208,10 @@ bool PS2Runtime::registerFunction(uint32_t address, RecompiledFunction func)
 
 bool PS2Runtime::hasFunction(uint32_t address) const
 {
-    return activeRecompiledFunction(
-               normalizeGuestFunctionAddress(address),
-               m_memory.getRDRAM()) != nullptr;
+    return !activeRecompiledFunction(
+                normalizeGuestFunctionAddress(address),
+                m_memory.getRDRAM())
+                .empty();
 }
 
 const char *describeGuestBranchKind(PS2Runtime::GuestBranchKind kind)
@@ -6196,7 +6233,31 @@ const char *describeGuestBranchKind(PS2Runtime::GuestBranchKind kind)
     }
 }
 
-PS2Runtime::RecompiledFunction PS2Runtime::lookupFunction(uint32_t address)
+EeArchitecturalObservationMode
+PS2Runtime::architecturalObservationMode(
+    const R5900Context *ctx) noexcept
+{
+    constexpr uint32_t kBreakpointEnableMask =
+        COP0_BPC_IAE | COP0_BPC_DRE | COP0_BPC_DWE;
+    constexpr uint32_t kPerformanceCounterEnable = 1u << 31u;
+    if (ctx != nullptr &&
+        (ctx->cop0_bpc & kBreakpointEnableMask) == 0u &&
+        (ctx->cop0_perf & kPerformanceCounterEnable) == 0u)
+    {
+        return EeArchitecturalObservationMode::Fast;
+    }
+    return EeArchitecturalObservationMode::Precise;
+}
+
+PS2Runtime::RecompiledFunction PS2Runtime::lookupFunction(
+    uint32_t address)
+{
+    return lookupFunction(address, nullptr);
+}
+
+PS2Runtime::RecompiledFunction PS2Runtime::lookupFunction(
+    uint32_t address,
+    const R5900Context *ctx)
 {
     pushDispatchPc(address);
 
@@ -6206,8 +6267,11 @@ PS2Runtime::RecompiledFunction PS2Runtime::lookupFunction(uint32_t address)
         debugRecordBranch(normalizedAddress);
     }
 
+    const EeArchitecturalObservationMode mode =
+        architecturalObservationMode(ctx);
     RecompiledFunction fn =
-        activeRecompiledFunction(normalizedAddress, m_memory.getRDRAM());
+        activeRecompiledFunction(normalizedAddress, m_memory.getRDRAM())
+            .select(mode);
     if (fn != nullptr)
     {
         if (normalizedAddress != address)
@@ -6221,7 +6285,8 @@ PS2Runtime::RecompiledFunction PS2Runtime::lookupFunction(uint32_t address)
                 }
 
                 ctx->pc = normalizeGuestFunctionAddress(ctx->pc);
-                RecompiledFunction target = runtime->lookupFunction(ctx->pc);
+                RecompiledFunction target =
+                    runtime->lookupFunction(ctx->pc, ctx);
                 target(rdram, ctx, runtime);
             };
             return directMappedAlias;
@@ -6401,7 +6466,8 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
     ctx->pc = targetPc;
     const bool isCall = (kind == GuestBranchKind::DirectCall || kind == GuestBranchKind::IndirectCall);
     RecompiledFunction targetFn =
-        activeRecompiledFunction(targetPc, rdram);
+        activeRecompiledFunction(targetPc, rdram)
+            .select(architecturalObservationMode(ctx));
 
     if (kind == GuestBranchKind::Return)
     {
@@ -8076,8 +8142,6 @@ void PS2Runtime::drainPendingAlarmCallbacks()
             R5900Context &callbackCtx =
                 state.callbackContext;
 
-            RecompiledFunction function =
-                lookupFunction(alarm->handler);
             AsyncCallbackInvocationScope callbackExecution(
                 this, &callbackCtx);
             SET_GPR_U32(&callbackCtx, 28, alarm->gp);
@@ -8098,6 +8162,8 @@ void PS2Runtime::drainPendingAlarmCallbacks()
                 29,
                 callbackExecution.stackTop());
             callbackCtx.pc = alarm->handler;
+            RecompiledFunction function =
+                lookupFunction(alarm->handler, &callbackCtx);
             executeGuestStep(
                 alarm->rdram,
                 &callbackCtx,
@@ -8809,7 +8875,7 @@ void PS2Runtime::dispatchLoop(uint8_t *rdram, R5900Context *ctx)
         m_debugSp.store(static_cast<uint32_t>(_mm_extract_epi32(ctx->r[29], 0)), std::memory_order_relaxed);
         m_debugGp.store(static_cast<uint32_t>(_mm_extract_epi32(ctx->r[28], 0)), std::memory_order_relaxed);
 
-        RecompiledFunction fn = lookupFunction(pc);
+        RecompiledFunction fn = lookupFunction(pc, ctx);
         const uint32_t dispatchedPc = pc;
         const uint32_t dispatchedRa = static_cast<uint32_t>(_mm_extract_epi32(ctx->r[31], 0));
 

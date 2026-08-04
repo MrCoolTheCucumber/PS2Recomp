@@ -283,7 +283,8 @@ namespace ps2recomp
             ss << "static const PS2RecompiledModuleFunction g_moduleFunctions[] = {\n";
             for (const auto &[address, name] : entries)
             {
-                ss << "    {0x" << std::hex << address << "u, " << name << "},\n";
+                ss << "    {0x" << std::hex << address << "u, {" << name
+                   << ", " << name << "}},\n";
             }
             ss << "};\n";
 
@@ -300,6 +301,7 @@ namespace ps2recomp
             }
 
             ss << "static const PS2RecompiledModuleDescriptor g_moduleDescriptor = {\n";
+            ss << "    PS2_RECOMPILED_FUNCTION_PAIR_ABI_VERSION,\n";
             ss << "    \"" << escapeCStringLiteral(cg.m_moduleInfo.name) << "\",\n";
             ss << "    0x" << std::hex << cg.m_moduleInfo.matchAddress << "u,\n";
             ss << "    g_moduleSignature,\n";
@@ -346,10 +348,11 @@ namespace ps2recomp
         ss << "#include \"ps2_recompiled_stubs.h\"//this will give duplicated erros because runtime maybe has it define already, just delete the TODOS ones\n";
         ss << "#include \"ps2_syscalls.h\"\n\n";
 
+        ss << "extern const uint32_t g_ps2RecompiledFunctionPairAbiVersion = PS2_RECOMPILED_FUNCTION_PAIR_ABI_VERSION;\n";
         ss << "extern const uint32_t g_ps2RecompiledFunctionTableBase = 0x" << std::hex << tableBase << "u;\n";
         ss << "extern const uint32_t g_ps2RecompiledFunctionTableEnd = 0x" << std::hex << tableEnd << "u;\n";
         ss << "extern const uint32_t g_ps2RecompiledFunctionTableSlotCount = " << std::dec << slotCount << "u;\n";
-        ss << "PS2Runtime::RecompiledFunction g_ps2RecompiledFunctionTable[" << std::dec << (slotCount == 0u ? 1u : slotCount) << "u] = {};\n\n";
+        ss << "PS2Runtime::RecompiledFunctionPair g_ps2RecompiledFunctionTable[" << std::dec << (slotCount == 0u ? 1u : slotCount) << "u] = {};\n\n";
 
         ss << "extern const uint32_t g_ps2GuestFunctionSymbolCount = " << std::dec << symbols.size() << "u;\n";
         ss << "extern const PS2GuestFunctionSymbol g_ps2GuestFunctionSymbols["
@@ -374,8 +377,9 @@ namespace ps2recomp
         for (const auto &[address, name] : entries)
         {
             const uint32_t slot = (address - tableBase) >> 2;
-            ss << "        g_ps2RecompiledFunctionTable[" << std::dec << slot << "] = " << name
-               << "; // 0x" << std::hex << address << std::dec << "\n";
+            ss << "        g_ps2RecompiledFunctionTable[" << std::dec << slot << "] = {"
+               << name << ", " << name << "}; // 0x" << std::hex << address
+               << std::dec << "\n";
         }
         ss << "    }\n";
         ss << "};\n";

@@ -159,7 +159,8 @@ namespace ps2_syscalls
 
                     while (irqCtx.pc != 0u && runtime && !runtime->isStopRequested() && stepCount < kMaxIrqHandlerSteps)
                     {
-                        PS2Runtime::RecompiledFunction step = runtime->lookupFunction(irqCtx.pc);
+                        PS2Runtime::RecompiledFunction step =
+                            runtime->lookupFunction(irqCtx.pc, &irqCtx);
                         if (!step)
                         {
                             break;
@@ -296,7 +297,8 @@ namespace ps2_syscalls
                     while (irqCtx.pc != 0u && runtime && !runtime->isStopRequested() &&
                            steps < kMaxIrqHandlerSteps)
                     {
-                        PS2Runtime::RecompiledFunction step = runtime->lookupFunction(irqCtx.pc);
+                        PS2Runtime::RecompiledFunction step =
+                            runtime->lookupFunction(irqCtx.pc, &irqCtx);
                         if (!step)
                         {
                             break;

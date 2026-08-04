@@ -1590,7 +1590,7 @@ struct PS2DebugServer::Impl
              slot < g_ps2RecompiledFunctionTableSlotCount;
              ++slot)
         {
-            canonical << (g_ps2RecompiledFunctionTable[slot] ? '1' : '0');
+            canonical << (!g_ps2RecompiledFunctionTable[slot].empty() ? '1' : '0');
         }
         canonical << '\n';
         for (uint32_t index = 0u;

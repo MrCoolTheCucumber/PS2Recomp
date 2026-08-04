@@ -2122,7 +2122,9 @@ namespace ps2_stubs
                         break;
                     }
 
-                    PS2Runtime::RecompiledFunction step = runtime->lookupFunction(callbackCtx.pc);
+                    PS2Runtime::RecompiledFunction step =
+                        runtime->lookupFunction(
+                            callbackCtx.pc, &callbackCtx);
                     if (!step)
                     {
                         break;

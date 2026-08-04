@@ -1555,13 +1555,6 @@ namespace ps2_syscalls
                         lastPc = pc;
                     }
 
-                    PS2Runtime::RecompiledFunction step = runtime->lookupFunction(pc);
-                    if (!step)
-                    {
-                        std::cerr << "[StartThread] id=" << tid << " missing function for pc=0x"
-                                  << std::hex << pc << std::dec << std::endl;
-                        throw ThreadExitException();
-                    }
                     uint64_t handoffBaseline = 0u;
                     bool suspendedAtBoundary = false;
                     bool admissionDeferred = false;
@@ -1586,6 +1579,18 @@ namespace ps2_syscalls
                             !publishRunningAtGuestBoundary(info);
                         if (!suspendedAtBoundary)
                         {
+                            PS2Runtime::RecompiledFunction step =
+                                runtime->lookupFunction(
+                                    pc, threadCtx);
+                            if (!step)
+                            {
+                                std::cerr
+                                    << "[StartThread] id=" << tid
+                                    << " missing function for pc=0x"
+                                    << std::hex << pc << std::dec
+                                    << std::endl;
+                                throw ThreadExitException();
+                            }
                             runtime->executeGuestStep(
                                 rdram, threadCtx, step);
                             returnedAtBoundary =
