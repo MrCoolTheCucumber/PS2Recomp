@@ -327,28 +327,12 @@ struct alignas(16) R5900Context
         }
         if (retirementCount != 0u)
         {
-            uint64_t decrement = retirementCount;
-            if (decrement >= interval)
-            {
-                decrement -= interval;
-                if (decrement >= interval)
-                {
-                    decrement %= interval;
-                }
-            }
-
-            uint32_t offset = random - lowerBound;
-            const uint32_t boundedDecrement =
-                static_cast<uint32_t>(decrement);
-            if (boundedDecrement <= offset)
-            {
-                offset -= boundedDecrement;
-            }
-            else
-            {
-                offset += interval - boundedDecrement;
-            }
-            random = lowerBound + offset;
+            const uint32_t offset = random - lowerBound;
+            const uint32_t decrement =
+                static_cast<uint32_t>(
+                    retirementCount % interval);
+            random = lowerBound +
+                     ((offset + interval - decrement) % interval);
         }
         cop0_random = random;
     }
