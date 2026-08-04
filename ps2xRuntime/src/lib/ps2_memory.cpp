@@ -33,6 +33,21 @@
 #define PS2X_VU_OBSERVER_NOINLINE
 #endif
 
+// TLB-cache diagnostics are opt-in and disabled in production. Keep their
+// accounting out of the cache-hit body so the common resolver remains a
+// small leaf even when LTO can see both paths.
+#if defined(_MSC_VER)
+#define PS2X_TLB_DIAGNOSTICS_COLD __declspec(noinline)
+#elif defined(__GNUC__) && !defined(__clang__)
+#define PS2X_TLB_DIAGNOSTICS_COLD \
+    __attribute__((noinline, noipa, cold))
+#elif defined(__clang__)
+#define PS2X_TLB_DIAGNOSTICS_COLD \
+    __attribute__((noinline, cold))
+#else
+#define PS2X_TLB_DIAGNOSTICS_COLD
+#endif
+
 namespace
 {
     struct DmaChainState
@@ -2914,6 +2929,55 @@ void PS2Memory::recordTlbTranslationSlowPathFault() noexcept
     }
 }
 
+PS2X_TLB_DIAGNOSTICS_COLD
+void PS2Memory::recordTlbFastCacheRejectedAccess(
+    bool intervalCrossing) noexcept
+{
+    if (intervalCrossing)
+    {
+        ++m_tlbTranslationCacheStats.intervalCrossings;
+    }
+    ++m_tlbTranslationCacheStats.misses;
+}
+
+PS2X_TLB_DIAGNOSTICS_COLD
+void PS2Memory::recordTlbFastCacheHit() noexcept
+{
+    ++m_tlbTranslationCacheStats.hits;
+    ++m_tlbTranslationCacheStats.fastHits;
+}
+
+PS2X_TLB_DIAGNOSTICS_COLD
+void PS2Memory::recordTlbFastCacheMiss(
+    const EeTlbFastCacheEntry &entry,
+    uint64_t requestKey,
+    bool writeAccess) noexcept
+{
+    ++m_tlbTranslationCacheStats.misses;
+    ++m_tlbTranslationCacheStats.fastMisses;
+
+    const bool generationMatches =
+        entry.generation == m_tlbMappingGeneration;
+    const bool keyMatches =
+        ((requestKey ^ entry.key) & entry.matchMask) == 0u;
+    if (!generationMatches &&
+        entry.generation != 0u &&
+        keyMatches)
+    {
+        ++m_tlbTranslationCacheStats.generationMisses;
+    }
+
+    constexpr uint64_t kWriteAccessKeyBit = 1ull << 32u;
+    if (generationMatches &&
+        writeAccess &&
+        !keyMatches &&
+        (((requestKey & ~kWriteAccessKeyBit) ^ entry.key) &
+         entry.matchMask) == 0u)
+    {
+        ++m_tlbTranslationCacheStats.permissionMisses;
+    }
+}
+
 bool PS2Memory::tryResolveCachedTlbRdramOffset(
     uint32_t virtualAddress,
     EeAddressTranslationContext translation,
@@ -2938,7 +3002,8 @@ bool PS2Memory::tryResolveCachedTlbRdramOffset(
     {
         if (m_tlbTranslationCacheDiagnosticsEnabled)
         {
-            ++m_tlbTranslationCacheStats.misses;
+            recordTlbFastCacheRejectedAccess(
+                false);
         }
         return false;
     }
@@ -2947,8 +3012,8 @@ bool PS2Memory::tryResolveCachedTlbRdramOffset(
     {
         if (m_tlbTranslationCacheDiagnosticsEnabled)
         {
-            ++m_tlbTranslationCacheStats.intervalCrossings;
-            ++m_tlbTranslationCacheStats.misses;
+            recordTlbFastCacheRejectedAccess(
+                true);
         }
         return false;
     }
@@ -2956,7 +3021,8 @@ bool PS2Memory::tryResolveCachedTlbRdramOffset(
     {
         if (m_tlbTranslationCacheDiagnosticsEnabled)
         {
-            ++m_tlbTranslationCacheStats.misses;
+            recordTlbFastCacheRejectedAccess(
+                false);
         }
         return false;
     }
@@ -2983,8 +3049,7 @@ bool PS2Memory::tryResolveCachedTlbRdramOffset(
     {
         if (m_tlbTranslationCacheDiagnosticsEnabled)
         {
-            ++m_tlbTranslationCacheStats.hits;
-            ++m_tlbTranslationCacheStats.fastHits;
+            recordTlbFastCacheHit();
         }
         physicalOffset = resolved;
         return true;
@@ -2992,26 +3057,10 @@ bool PS2Memory::tryResolveCachedTlbRdramOffset(
 
     if (m_tlbTranslationCacheDiagnosticsEnabled)
     {
-        ++m_tlbTranslationCacheStats.misses;
-        ++m_tlbTranslationCacheStats.fastMisses;
-        if (!generationMatches &&
-            entry.generation != 0u &&
-            keyMatches)
-        {
-            ++m_tlbTranslationCacheStats.generationMisses;
-        }
-        if (generationMatches &&
-            writeAccess &&
-            !keyMatches &&
-            ((makeTlbFastCacheKey(
-                   virtualAddress,
-                   translation,
-                   false) ^
-               entry.key) &
-              entry.matchMask) == 0u)
-        {
-            ++m_tlbTranslationCacheStats.permissionMisses;
-        }
+        recordTlbFastCacheMiss(
+            entry,
+            requestKey,
+            writeAccess);
     }
     return false;
 }

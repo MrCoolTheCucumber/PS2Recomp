@@ -1605,6 +1605,13 @@ public:
         EeAddressTranslationContext translation,
         bool global,
         bool writable) noexcept;
+    void recordTlbFastCacheRejectedAccess(
+        bool intervalCrossing) noexcept;
+    void recordTlbFastCacheHit() noexcept;
+    void recordTlbFastCacheMiss(
+        const EeTlbFastCacheEntry &entry,
+        uint64_t requestKey,
+        bool writeAccess) noexcept;
     void advanceTlbMappingGeneration() noexcept;
     void clearTlbTranslationCache() noexcept;
     void recordTlbTranslationSlowPathFault() noexcept;
