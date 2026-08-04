@@ -132,6 +132,15 @@ enum class EeArchitecturalObservationMode : uint8_t
     Precise,
 };
 
+struct EeObservationInstructionDescriptor
+{
+    uint32_t pc = 0u;
+    ps2x::performance::EeInstructionIssueProfile issue{};
+    uint32_t completionEvents = 0u;
+};
+
+static_assert(sizeof(EeObservationInstructionDescriptor) == 24u);
+
 inline constexpr uint32_t PS2_RECOMPILED_FUNCTION_PAIR_ABI_VERSION = 2u;
 
 struct PS2GuestFunctionSymbol
@@ -1308,6 +1317,10 @@ public:
         R5900Context *ctx,
         uint32_t targetPc,
         GuestBranchKind kind);
+    [[nodiscard]] bool ValidateGuestBranchTargetWithoutObservation(
+        R5900Context *ctx,
+        uint32_t targetPc,
+        GuestBranchKind kind);
     void reportMissingFunction(uint8_t *rdram,
                                R5900Context *ctx,
                                uint32_t targetPc,
@@ -1328,6 +1341,9 @@ public:
                                             PS2Exception exception,
                                             uint32_t badVAddr);
     void ValidateInstructionFetch(
+        R5900Context *ctx,
+        uint32_t virtualAddress);
+    void ValidateInstructionFetchWithoutObservation(
         R5900Context *ctx,
         uint32_t virtualAddress);
     void CheckEeInstructionBreakpoint(
@@ -1360,6 +1376,32 @@ public:
     void recordEeConditionalBranch(
         R5900Context *ctx,
         uint32_t branchPc,
+        bool taken);
+    // Cold precise-mode entry points used by generated policy templates. The
+    // fast instantiation does not reference these functions or its descriptor
+    // data at all.
+    void observeEeInstructionBeginPrecise(
+        R5900Context *ctx,
+        const EeObservationInstructionDescriptor *instruction,
+        bool breakpointAlreadyChecked);
+    void observeEeInstructionCompletePrecise(
+        R5900Context *ctx,
+        const EeObservationInstructionDescriptor *instruction);
+    [[nodiscard]] bool observeEeDataAddressPrecise(
+        R5900Context *ctx,
+        uint32_t virtualAddress,
+        bool write);
+    void observeEeDataValuePrecise(
+        R5900Context *ctx,
+        uint32_t virtualAddress,
+        uint32_t value,
+        bool write);
+    void observeEePredictedBranchPrecise(
+        R5900Context *ctx,
+        const EeObservationInstructionDescriptor *instruction);
+    void observeEeConditionalBranchPrecise(
+        R5900Context *ctx,
+        const EeObservationInstructionDescriptor *instruction,
         bool taken);
 
     void executeVU0Microprogram(uint8_t *rdram, R5900Context *ctx, uint32_t address);

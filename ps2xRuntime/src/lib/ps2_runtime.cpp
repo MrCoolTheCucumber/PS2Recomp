@@ -78,6 +78,18 @@ static std::atomic<uint64_t> g_nextEeThreadRuntimeGeneration{1u};
 #define PS2X_DEFAULT_EE_EXECUTION_BACKEND_CPP_FIBER 0
 #endif
 
+#if defined(_MSC_VER)
+#define PS2X_EE_OBSERVATION_COLD __declspec(noinline)
+#elif defined(__GNUC__) && !defined(__clang__)
+#define PS2X_EE_OBSERVATION_COLD                                      \
+    __attribute__((noinline, noipa, cold,                             \
+                   section(".text.unlikely.ee_observation")))
+#else
+#define PS2X_EE_OBSERVATION_COLD                                      \
+    __attribute__((noinline, cold,                                    \
+                   section(".text.unlikely.ee_observation")))
+#endif
+
 static PS2RuntimeConfiguration
 defaultPs2RuntimeConfiguration() noexcept
 {
@@ -6529,6 +6541,26 @@ bool PS2Runtime::ValidateGuestBranchTarget(
     return true;
 }
 
+bool PS2Runtime::ValidateGuestBranchTargetWithoutObservation(
+    R5900Context *ctx,
+    uint32_t targetPc,
+    GuestBranchKind kind)
+{
+    if (ctx &&
+        kind == GuestBranchKind::Return &&
+        targetPc == 0u &&
+        m_asyncCallbackInvocationDepth != 0u &&
+        m_boundEeContext == ctx)
+    {
+        ctx->pc = 0u;
+        return false;
+    }
+
+    ctx->pc = targetPc;
+    ValidateInstructionFetchWithoutObservation(ctx, targetPc);
+    return true;
+}
+
 bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
                                      R5900Context *ctx,
                                      uint32_t targetPc,
@@ -6914,6 +6946,15 @@ void PS2Runtime::ValidateInstructionFetch(
     CheckEeInstructionBreakpoint(
         ctx, virtualAddress);
 
+    ValidateInstructionFetchWithoutObservation(
+        ctx, virtualAddress);
+}
+
+void PS2Runtime::ValidateInstructionFetchWithoutObservation(
+    R5900Context *ctx,
+    uint32_t virtualAddress)
+{
+
     if (!ctx)
     {
         throw PS2GuestException{};
@@ -7252,6 +7293,86 @@ void PS2Runtime::recordEeConditionalBranch(
     events.lowOrderBranchIssued =
         (branchPc & 4u) == 0u ? 1u : 0u;
     recordEePerformanceEvents(ctx, events);
+}
+
+PS2X_EE_OBSERVATION_COLD
+void PS2Runtime::observeEeInstructionBeginPrecise(
+    R5900Context *ctx,
+    const EeObservationInstructionDescriptor *instruction,
+    bool breakpointAlreadyChecked)
+{
+    if (!instruction)
+    {
+        return;
+    }
+    if (!breakpointAlreadyChecked)
+    {
+        CheckEeInstructionBreakpoint(ctx, instruction->pc);
+    }
+    if (ctx && (ctx->cop0_perf & 0x80000000u) != 0u)
+    {
+        recordEeInstructionIssue(ctx, instruction->issue);
+    }
+}
+
+PS2X_EE_OBSERVATION_COLD
+void PS2Runtime::observeEeInstructionCompletePrecise(
+    R5900Context *ctx,
+    const EeObservationInstructionDescriptor *instruction)
+{
+    if (ctx && instruction &&
+        (ctx->cop0_perf & 0x80000000u) != 0u)
+    {
+        recordEeInstructionCompletion(
+            ctx, instruction->completionEvents);
+    }
+}
+
+PS2X_EE_OBSERVATION_COLD
+bool PS2Runtime::observeEeDataAddressPrecise(
+    R5900Context *ctx,
+    uint32_t virtualAddress,
+    bool write)
+{
+    return CheckEeDataAddressBreakpoint(
+        ctx, virtualAddress, write);
+}
+
+PS2X_EE_OBSERVATION_COLD
+void PS2Runtime::observeEeDataValuePrecise(
+    R5900Context *ctx,
+    uint32_t virtualAddress,
+    uint32_t value,
+    bool write)
+{
+    CheckEeDataValueBreakpoint(
+        ctx, virtualAddress, value, write);
+}
+
+PS2X_EE_OBSERVATION_COLD
+void PS2Runtime::observeEePredictedBranchPrecise(
+    R5900Context *ctx,
+    const EeObservationInstructionDescriptor *instruction)
+{
+    if (ctx && instruction &&
+        (ctx->cop0_perf & 0x80000000u) != 0u)
+    {
+        recordEePredictedBranch(ctx, instruction->pc);
+    }
+}
+
+PS2X_EE_OBSERVATION_COLD
+void PS2Runtime::observeEeConditionalBranchPrecise(
+    R5900Context *ctx,
+    const EeObservationInstructionDescriptor *instruction,
+    bool taken)
+{
+    if (ctx && instruction &&
+        (ctx->cop0_perf & 0x80000000u) != 0u)
+    {
+        recordEeConditionalBranch(
+            ctx, instruction->pc, taken);
+    }
 }
 
 void PS2Runtime::SignalBusError(R5900Context *ctx,
@@ -13229,3 +13350,5 @@ void PS2Runtime::run()
                   << " guest worker thread(s) still active during shutdown." << std::endl;
     }
 }
+
+#undef PS2X_EE_OBSERVATION_COLD

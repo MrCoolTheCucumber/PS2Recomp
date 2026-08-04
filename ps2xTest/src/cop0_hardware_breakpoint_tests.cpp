@@ -5,6 +5,7 @@
 #include "ps2recomp/instructions.h"
 #include "ps2recomp/r5900_decoder.h"
 #include "ps2recomp/types.h"
+#include "runtime/ee_performance.h"
 
 #include <concepts>
 #include <cstddef>
@@ -163,6 +164,79 @@ void register_cop0_hardware_breakpoint_tests()
 {
     MiniTest::Case("COP0 hardware breakpoints", [](TestCase &tc)
     {
+        tc.Run("cold precise observation helpers preserve breakpoint and PCCR behavior", [](TestCase &t)
+        {
+            using namespace ps2x::performance;
+
+            constexpr uint32_t kPc = 0x80004000u;
+            constexpr uint32_t kPccrCte = 1u << 31u;
+            constexpr uint32_t kPccrK0 = 1u << 2u;
+            constexpr uint32_t kCompletionEvent = 12u;
+            const EeObservationInstructionDescriptor instruction{
+                kPc,
+                {kIssuePipe0, 1u << 2u, 1u << 3u, 0u},
+                kInstructionCompleted |
+                    kNonBdsInstructionCompleted};
+
+            PS2Runtime runtime;
+            R5900Context ctx{};
+            ctx.cop0_bpc =
+                kBpcIae | kBpcIke | kBpcBed;
+            ctx.cop0_iab = kPc;
+            ctx.cop0_iabm = 0xffffffffu;
+            runtime.observeEeInstructionBeginPrecise(
+                &ctx, &instruction, false);
+            t.IsTrue(
+                (ctx.cop0_bpc & kBpcIab) != 0u,
+                "the cold begin helper should preserve instruction-breakpoint matching");
+
+            ctx.cop0_bpc &= ~kBpcIab;
+            runtime.observeEeInstructionBeginPrecise(
+                &ctx, &instruction, true);
+            t.IsFalse(
+                (ctx.cop0_bpc & kBpcIab) != 0u,
+                "a boundary-validated fetch should not be checked twice by the begin helper");
+
+            runtime.writeCop0Performance(
+                nullptr, &ctx, 1u, 0u);
+            runtime.writeCop0Performance(
+                nullptr, &ctx, 0u,
+                kPccrCte | kPccrK0 |
+                    (kCompletionEvent << 5u));
+            runtime.observeEeInstructionCompletePrecise(
+                &ctx, &instruction);
+            t.Equals(
+                ctx.cop0_pcr0, 1u,
+                "the cold completion helper should preserve the selected completion event");
+
+            ctx.cop0_bpc =
+                kBpcDre | kBpcDve |
+                kBpcDke | kBpcBed;
+            ctx.cop0_dab = 0x80005000u;
+            ctx.cop0_dabm = 0xffffffffu;
+            ctx.cop0_dvb = 0x12345678u;
+            ctx.cop0_dvbm = 0xffffffffu;
+            t.IsTrue(
+                runtime.observeEeDataAddressPrecise(
+                    &ctx, 0x80005000u, false),
+                "the cold data-address helper should request a matching value phase");
+            runtime.observeEeDataValuePrecise(
+                &ctx, 0x80005000u, 0x12345678u, false);
+            t.IsTrue(
+                (ctx.cop0_bpc & kBpcDrb) != 0u,
+                "the cold data-value helper should preserve the read-breakpoint cause bit");
+
+            ctx.cop0_bpc =
+                kBpcIae | kBpcIke | kBpcBed;
+            ctx.cop0_iab = kPc;
+            ctx.cop0_iabm = 0xffffffffu;
+            runtime.ValidateInstructionFetchWithoutObservation(
+                &ctx, kPc);
+            t.IsFalse(
+                (ctx.cop0_bpc & kBpcIab) != 0u,
+                "fast fetch validation should retain translation without observing BPC");
+        });
+
         tc.Run("generated instructions check before execution including delay NOPs", [](TestCase &t)
         {
             const Instruction ordinary = decode(0x1000u, 0u);
