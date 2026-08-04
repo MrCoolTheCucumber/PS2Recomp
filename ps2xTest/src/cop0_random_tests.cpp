@@ -577,6 +577,34 @@ void register_cop0_random_tests()
                 checkpointCtx.cop0_random_pending_retirements,
                 0u,
                 "a real checkpoint should publish no pending retirements");
+            t.IsFalse(
+                runtime.guestPreemptionRequestedForTesting(),
+                "a checkpoint should consume its explicit request");
+
+            runtime.requestGuestPreemption();
+            runtime.requestGuestPreemption();
+            t.IsTrue(
+                runtime.guestPreemptionRequestedForTesting(),
+                "multiple producers should coalesce into pending work");
+            t.Equals(
+                runtime.checkpointGuestExecution(nullptr),
+                PS2GuestCheckpointResult::ExitToDispatcher,
+                "one checkpoint should consume coalesced requests");
+            t.IsFalse(
+                runtime.guestPreemptionRequestedForTesting(),
+                "coalesced requests should be fully consumed");
+
+            runtime.requestGuestPreemption();
+            t.IsTrue(
+                runtime.guestPreemptionRequestedForTesting(),
+                "a later request should remain independently visible");
+            t.Equals(
+                runtime.checkpointGuestExecution(nullptr),
+                PS2GuestCheckpointResult::ExitToDispatcher,
+                "a later request should trigger another checkpoint");
+            t.IsFalse(
+                runtime.guestPreemptionRequestedForTesting(),
+                "the later request should be consumed exactly once");
 
             R5900Context continueCtx{};
             continueCtx.cop0_wired = 10u;

@@ -1952,8 +1952,12 @@ public:
     uint64_t eeThreadLegacyAdapterMismatchCount() const noexcept;
     bool guestPreemptionRequestedForTesting() const
     {
-        return m_guestExecutionPreemptionRequested.load(
-            std::memory_order_acquire);
+        const uint64_t requestedGeneration =
+            m_guestExecutionPreemptionGeneration.load(
+                std::memory_order_acquire);
+        return requestedGeneration !=
+               m_guestExecutionConsumedPreemptionGeneration.load(
+                   std::memory_order_acquire);
     }
     uint64_t dmacInterruptDrainPassesForTesting() const
     {
@@ -2017,6 +2021,8 @@ public:
     inline const PSPadBackend &padBackend() const { return m_padBackend; }
 
 private:
+    void acknowledgeGuestPreemptionRequests() noexcept;
+    [[nodiscard]] bool consumeGuestPreemptionRequest() noexcept;
     void startDedicatedEeExecution();
     void joinDedicatedEeExecution();
     void runMainEeContinuation();
@@ -2571,7 +2577,9 @@ private:
     std::atomic<uint64_t> m_guestExecutionHandoffTimeouts{0u};
     std::atomic<uint64_t>
         m_guestExecutionDispatcherExitEpoch{0u};
-    std::atomic<bool> m_guestExecutionPreemptionRequested{false};
+    std::atomic<uint64_t> m_guestExecutionPreemptionGeneration{0u};
+    std::atomic<uint64_t>
+        m_guestExecutionConsumedPreemptionGeneration{0u};
     bool m_eeThreadDiagnosticsEnabled = false;
     bool m_emitTlbTranslationCacheDiagnosticsOnDestruction = false;
     bool m_eeThreadDiagnosticsHasLastOuterContext = false;

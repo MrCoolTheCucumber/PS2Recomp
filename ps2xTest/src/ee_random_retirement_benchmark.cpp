@@ -47,6 +47,7 @@ namespace
         DeferredGeneratedBlocks,
         RuntimePublishedBlocks,
         RuntimeDeferredBlocks,
+        RuntimeCheckpointBlocks,
         DirectBlockTotal,
     };
 
@@ -156,6 +157,13 @@ namespace
             ctx->advanceEeCycleTicks(8u);
             runtime.serviceEeEventsAtGeneratedBlockBoundary(
                 nullptr, ctx);
+        }
+        else if constexpr (Strategy ==
+                           RetirementStrategy::RuntimeCheckpointBlocks)
+        {
+            static PS2Runtime runtime;
+            ctx->retireEeInstructions(kInstructionsPerBlock);
+            (void)runtime.checkpointGuestExecution(ctx);
         }
         else if constexpr (Strategy ==
                            RetirementStrategy::DirectBlockTotal)
@@ -285,6 +293,15 @@ namespace
     }
 
     extern "C" PS2_RANDOM_BENCHMARK_NOINLINE
+    void EeRandomRetirementRuntimeCheckpointBlocks(
+        R5900Context *ctx,
+        uint64_t blocks)
+    {
+        runArithmeticBlocks<
+            RetirementStrategy::RuntimeCheckpointBlocks>(ctx, blocks);
+    }
+
+    extern "C" PS2_RANDOM_BENCHMARK_NOINLINE
     void EeRandomRetirementDirectBlockTotal(
         R5900Context *ctx,
         uint64_t blocks)
@@ -293,7 +310,7 @@ namespace
             RetirementStrategy::DirectBlockTotal>(ctx, blocks);
     }
 
-    constexpr std::array<BenchmarkCase, 6u> kCases{{
+    constexpr std::array<BenchmarkCase, 7u> kCases{{
         {"scalar_reference",
          RetirementStrategy::ScalarReference,
          EeRandomRetirementScalarReference},
@@ -309,6 +326,9 @@ namespace
         {"runtime_deferred_blocks",
          RetirementStrategy::RuntimeDeferredBlocks,
          EeRandomRetirementRuntimeDeferredBlocks},
+        {"runtime_checkpoint_blocks",
+         RetirementStrategy::RuntimeCheckpointBlocks,
+         EeRandomRetirementRuntimeCheckpointBlocks},
         {"direct_block_total",
          RetirementStrategy::DirectBlockTotal,
          EeRandomRetirementDirectBlockTotal},
@@ -398,6 +418,8 @@ namespace
             return "runtime_published_blocks";
         case RetirementStrategy::RuntimeDeferredBlocks:
             return "runtime_deferred_blocks";
+        case RetirementStrategy::RuntimeCheckpointBlocks:
+            return "runtime_checkpoint_blocks";
         case RetirementStrategy::DirectBlockTotal:
             return "benchmark_direct_total";
         }

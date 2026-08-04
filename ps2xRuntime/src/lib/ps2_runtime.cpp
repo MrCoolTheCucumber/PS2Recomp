@@ -2376,8 +2376,7 @@ PS2Runtime::applyNextConsequence(
             consequence.reschedulePolicy;
     consequence = {};
     clearEeInterruptContinuation();
-    m_guestExecutionPreemptionRequested.store(
-        false, std::memory_order_release);
+    acknowledgeGuestPreemptionRequests();
     return reschedulePolicy;
 }
 
@@ -4296,8 +4295,7 @@ void PS2Runtime::resetEeTimingUnlocked(
     resetEeVSyncStateUnlocked();
     cancelVU1Execution(true);
     m_vu0CycleTick = {};
-    m_guestExecutionPreemptionRequested.store(
-        false, std::memory_order_release);
+    acknowledgeGuestPreemptionRequests();
     if (m_dmacCompletionReady.load(
             std::memory_order_acquire))
     {
@@ -9971,8 +9969,7 @@ void PS2Runtime::leaveGuestExecution(
             throw;
         }
         clearEeInterruptContinuation();
-        m_guestExecutionPreemptionRequested.store(
-            false, std::memory_order_release);
+        acknowledgeGuestPreemptionRequests();
         it = g_guestExecutionDepths.find(this);
         if (it == g_guestExecutionDepths.end() || it->second == 0u)
         {
@@ -12531,8 +12528,8 @@ void PS2Runtime::yieldGuestExecutionAfterWake()
 
 void PS2Runtime::requestGuestPreemption()
 {
-    m_guestExecutionPreemptionRequested.store(
-        true, std::memory_order_release);
+    m_guestExecutionPreemptionGeneration.fetch_add(
+        1u, std::memory_order_release);
     if (m_eeRuntimeExecutor)
     {
         // External alarm/device publishers may be the only runnable source
@@ -12542,14 +12539,43 @@ void PS2Runtime::requestGuestPreemption()
     }
 }
 
+void PS2Runtime::acknowledgeGuestPreemptionRequests() noexcept
+{
+    const uint64_t requestedGeneration =
+        m_guestExecutionPreemptionGeneration.load(
+            std::memory_order_acquire);
+    m_guestExecutionConsumedPreemptionGeneration.store(
+        requestedGeneration, std::memory_order_release);
+}
+
+bool PS2Runtime::consumeGuestPreemptionRequest() noexcept
+{
+    // Guest execution ownership serializes consumers. If a producer advances
+    // the requested generation after this load, that newer request remains
+    // visible to the next checkpoint instead of being cleared accidentally.
+    const uint64_t requestedGeneration =
+        m_guestExecutionPreemptionGeneration.load(
+            std::memory_order_acquire);
+    const uint64_t consumedGeneration =
+        m_guestExecutionConsumedPreemptionGeneration.load(
+            std::memory_order_relaxed);
+    if (requestedGeneration == consumedGeneration)
+    {
+        return false;
+    }
+
+    m_guestExecutionConsumedPreemptionGeneration.store(
+        requestedGeneration, std::memory_order_release);
+    return true;
+}
+
 PS2GuestCheckpointResult
 PS2Runtime::checkpointGuestExecution(
     R5900Context *ctx)
 {
     static_cast<void>(ctx);
     const bool explicitlyRequested =
-        m_guestExecutionPreemptionRequested.exchange(
-            false, std::memory_order_acq_rel);
+        consumeGuestPreemptionRequest();
 
     thread_local uint32_t s_backEdgeYieldCounter = 0u;
     const uint32_t waiterCount =
