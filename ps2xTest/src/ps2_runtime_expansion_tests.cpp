@@ -1212,6 +1212,20 @@ void register_ps2_runtime_expansion_tests()
                 ::getRegU32(&ctx, 2), 0x33333333u,
                 "module redispatch should select the precise entry after BPC enable");
 
+            runtime.memory().getRDRAM()[kMatchAddress + 4u] ^=
+                0x01u;
+            t.IsFalse(
+                runtime.hasFunction(kModuleOnlyEntry),
+                "a signature suffix mismatch should deactivate a module even when its prefix matches");
+            t.IsTrue(
+                runtime.hasFunction(kSecondModuleOnlyEntry),
+                "a suffix mismatch should leave a disjoint module active");
+            runtime.memory().getRDRAM()[kMatchAddress + 4u] =
+                kMatchBytes[4u];
+            t.IsTrue(
+                runtime.hasFunction(kModuleOnlyEntry),
+                "restoring the exact signature should reactivate the module immediately");
+
             runtime.writeCop0Breakpoint(&ctx, 0u, 0u);
             ctx.pc = 0x80000000u | kModuleOnlyEntry;
             t.IsTrue(

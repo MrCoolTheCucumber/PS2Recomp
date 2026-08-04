@@ -6152,13 +6152,13 @@ namespace
         return g_ps2RecompiledFunctionTable[slot];
     }
 
-    bool recompiledModuleMatches(
+    const uint8_t *recompiledModuleMatchData(
         const PS2RecompiledModuleDescriptor &module,
         const uint8_t *rdram)
     {
         if (rdram == nullptr)
         {
-            return false;
+            return nullptr;
         }
 
         uint32_t offset = 0u;
@@ -6166,10 +6166,23 @@ namespace
             offset > PS2_RAM_SIZE ||
             module.matchSize > PS2_RAM_SIZE - offset)
         {
+            return nullptr;
+        }
+        return rdram + offset;
+    }
+
+    bool recompiledModuleMatches(
+        const PS2RecompiledModuleDescriptor &module,
+        const uint8_t *rdram)
+    {
+        const uint8_t *matchData =
+            recompiledModuleMatchData(module, rdram);
+        if (matchData == nullptr)
+        {
             return false;
         }
         return std::memcmp(
-                   rdram + offset,
+                   matchData,
                    module.matchBytes,
                    module.matchSize) == 0;
     }
@@ -6235,10 +6248,26 @@ namespace
                 continue;
             }
 
+            constexpr size_t kMatchPrefixSize = sizeof(uint32_t);
+            const uint8_t *matchData =
+                recompiledModuleMatchData(*module, rdram);
+            if (matchData == nullptr ||
+                std::memcmp(
+                    matchData,
+                    module->matchBytes,
+                    kMatchPrefixSize) != 0)
+            {
+                continue;
+            }
+
             PS2Runtime::RecompiledFunctionPair functions =
                 recompiledModuleFunction(*module, address);
             if (!functions.empty() &&
-                recompiledModuleMatches(*module, rdram))
+                (module->matchSize == kMatchPrefixSize ||
+                 std::memcmp(
+                     matchData + kMatchPrefixSize,
+                     module->matchBytes + kMatchPrefixSize,
+                     module->matchSize - kMatchPrefixSize) == 0))
             {
                 return functions;
             }
