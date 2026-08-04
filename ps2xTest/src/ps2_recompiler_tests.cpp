@@ -885,6 +885,8 @@ void register_ps2_recompiler_tests()
             configFile << "  { index = 0, target = \"0x1620\" },\n";
             configFile << "  { index = 1, target = \"0x1630\" },\n";
             configFile << "]\n";
+            configFile << "\n[indirect_branches]\n";
+            configFile << "\"0x1640\" = [\"0x1620\", \"0x1630\", \"0x1620\"]\n";
             configFile.close();
 
             ConfigManager manager(configPath.string());
@@ -924,6 +926,32 @@ void register_ps2_recompiler_tests()
                     t.Equals(table.entries[0].target, 0x1620u, "first entry target should parse");
                     t.Equals(table.entries[1].index, 1u, "second entry index should parse");
                     t.Equals(table.entries[1].target, 0x1630u, "second entry target should parse");
+                }
+            }
+
+            t.Equals(
+                config.indirectBranchTargetsByInstructionAddress.size(),
+                static_cast<size_t>(1),
+                "one configured indirect branch should be loaded");
+            const auto indirectBranch =
+                config.indirectBranchTargetsByInstructionAddress.find(
+                    0x1640u);
+            t.IsTrue(
+                indirectBranch !=
+                    config.indirectBranchTargetsByInstructionAddress.end(),
+                "indirect branch instruction address should parse from a hex key");
+            if (indirectBranch !=
+                config.indirectBranchTargetsByInstructionAddress.end())
+            {
+                t.Equals(indirectBranch->second.size(),
+                         static_cast<size_t>(2),
+                         "configured indirect targets should be sorted and deduplicated");
+                if (indirectBranch->second.size() >= 2u)
+                {
+                    t.Equals(indirectBranch->second[0], 0x1620u,
+                             "first indirect target should parse");
+                    t.Equals(indirectBranch->second[1], 0x1630u,
+                             "second indirect target should parse");
                 }
             }
 

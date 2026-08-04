@@ -29,6 +29,7 @@ namespace ps2recomp
     public:
         ControlFlowAnalyzer(const std::vector<Section> &sections,
                             const std::unordered_map<uint32_t, std::vector<uint32_t>> &configuredJumpTableTargetsByAddress,
+                            const std::unordered_map<uint32_t, std::vector<uint32_t>> &configuredIndirectBranchTargetsByInstructionAddress,
                             RecompilerReporter *reporter);
 
         ControlFlowAnalysisResult analyze(const Function &function,
@@ -38,6 +39,8 @@ namespace ps2recomp
     private:
         const std::vector<Section> &m_sections;
         const std::unordered_map<uint32_t, std::vector<uint32_t>> &m_configJumpTableTargetsByAddress;
+        const std::unordered_map<uint32_t, std::vector<uint32_t>> &
+            m_configIndirectBranchTargetsByInstructionAddress;
         RecompilerReporter *m_reporter = nullptr;
     };
 }

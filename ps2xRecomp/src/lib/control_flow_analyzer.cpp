@@ -14,9 +14,12 @@ namespace ps2recomp
     ControlFlowAnalyzer::ControlFlowAnalyzer(
         const std::vector<Section> &sections,
         const std::unordered_map<uint32_t, std::vector<uint32_t>> &configuredJumpTableTargetsByAddress,
+        const std::unordered_map<uint32_t, std::vector<uint32_t>> &configuredIndirectBranchTargetsByInstructionAddress,
         RecompilerReporter *reporter)
         : m_sections(sections),
           m_configJumpTableTargetsByAddress(configuredJumpTableTargetsByAddress),
+          m_configIndirectBranchTargetsByInstructionAddress(
+              configuredIndirectBranchTargetsByInstructionAddress),
           m_reporter(reporter)
     {
     }
@@ -382,6 +385,66 @@ namespace ps2recomp
 
                 bool foundTable = false;
 
+                const auto configuredBranchIt =
+                    m_configIndirectBranchTargetsByInstructionAddress.find(
+                        jrInst->address);
+                if (configuredBranchIt !=
+                    m_configIndirectBranchTargetsByInstructionAddress.end())
+                {
+                    bool validTargets = !configuredBranchIt->second.empty();
+                    std::vector<uint32_t> localTargets;
+                    std::vector<uint32_t> externalTargets;
+                    for (uint32_t target : configuredBranchIt->second)
+                    {
+                        if ((target & 3u) != 0u ||
+                            !isExecutableAddress(target))
+                        {
+                            validTargets = false;
+                            break;
+                        }
+
+                        const bool isLocalTarget =
+                            target >= function.start &&
+                            target < function.end;
+                        if (isLocalTarget)
+                        {
+                            if (!instructionAddresses.contains(target))
+                            {
+                                validTargets = false;
+                                break;
+                            }
+                            localTargets.push_back(target);
+                        }
+                        else
+                        {
+                            externalTargets.push_back(target);
+                        }
+                    }
+
+                    if (validTargets)
+                    {
+                        for (uint32_t target : externalTargets)
+                        {
+                            queueExternalEntryTarget(target);
+                        }
+                        if (!localTargets.empty())
+                        {
+                            result.jumpTableTargets[jrInst->address] =
+                                localTargets;
+                            for (uint32_t target : localTargets)
+                            {
+                                result.entryPoints.insert(target);
+                                if (hasObservationModeChangingDelaySlot(
+                                        *jrInst))
+                                {
+                                    queueResumeEntryTarget(target);
+                                }
+                            }
+                        }
+                        foundTable = true;
+                    }
+                }
+
                 uint32_t jrReg = jrInst->rs;
 
                 int lwIndex = -1;
@@ -399,7 +462,8 @@ namespace ps2recomp
                     // nested calls, then returns with JR through that alias.
                     // Accept only an exact copy in the straight-line entry
                     // prologue which is never overwritten locally.
-                    if (jrInst->function == SPECIAL_JR &&
+                    if (!foundTable &&
+                        jrInst->function == SPECIAL_JR &&
                         jrReg != 0u && jrReg != 31u)
                     {
                         constexpr int kMaxReturnAliasPrologueInstructions = 4;

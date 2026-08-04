@@ -296,6 +296,70 @@ namespace ps2recomp
                 }
             }
 
+            if (data.contains("indirect_branches") &&
+                data.at("indirect_branches").is_table())
+            {
+                const auto &branches =
+                    data.at("indirect_branches").as_table();
+                for (const auto &[addressText, targetsNode] : branches)
+                {
+                    uint32_t instructionAddress = 0u;
+                    try
+                    {
+                        const unsigned long parsed =
+                            std::stoul(addressText, nullptr, 0);
+                        if (parsed > std::numeric_limits<uint32_t>::max())
+                        {
+                            throw std::out_of_range("address");
+                        }
+                        instructionAddress = static_cast<uint32_t>(parsed);
+                    }
+                    catch (const std::exception &)
+                    {
+                        throw std::runtime_error(
+                            "Configured indirect branch key '" +
+                            addressText + "' is not a valid address.");
+                    }
+
+                    if (instructionAddress == 0u ||
+                        (instructionAddress & 3u) != 0u ||
+                        !targetsNode.is_array())
+                    {
+                        throw std::runtime_error(
+                            "Configured indirect branch '" +
+                            addressText +
+                            "' must be aligned and contain a target array.");
+                    }
+
+                    auto &targets = config
+                        .indirectBranchTargetsByInstructionAddress[
+                            instructionAddress];
+                    for (const auto &targetNode : targetsNode.as_array())
+                    {
+                        uint32_t target = 0u;
+                        if (!parseAddress(targetNode, target) ||
+                            target == 0u || (target & 3u) != 0u)
+                        {
+                            throw std::runtime_error(
+                                "Configured indirect branch target for '" +
+                                addressText +
+                                "' is not an aligned address.");
+                        }
+                        targets.push_back(target);
+                    }
+                    if (targets.empty())
+                    {
+                        throw std::runtime_error(
+                            "Configured indirect branch '" +
+                            addressText + "' has no targets.");
+                    }
+                    std::sort(targets.begin(), targets.end());
+                    targets.erase(
+                        std::unique(targets.begin(), targets.end()),
+                        targets.end());
+                }
+            }
+
             if (data.contains("functions") && data.at("functions").is_table())
             {
                 const auto &functionsNode = data.at("functions");
@@ -423,6 +487,26 @@ namespace ps2recomp
             }
             jumpTables["table"] = tableArray;
             data["jump_tables"] = jumpTables;
+        }
+
+        if (!config.indirectBranchTargetsByInstructionAddress.empty())
+        {
+            toml::table branches;
+            for (const auto &[instructionAddress, configuredTargets] :
+                 config.indirectBranchTargetsByInstructionAddress)
+            {
+                std::ostringstream address;
+                address << "0x" << std::hex << instructionAddress;
+                toml::array targets;
+                for (uint32_t configuredTarget : configuredTargets)
+                {
+                    std::ostringstream target;
+                    target << "0x" << std::hex << configuredTarget;
+                    targets.push_back(target.str());
+                }
+                branches[address.str()] = targets;
+            }
+            data["indirect_branches"] = branches;
         }
 
         if (!config.functionBoundaries.empty())

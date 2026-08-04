@@ -211,6 +211,8 @@ namespace ps2recomp
         std::vector<std::string> stubImplementations;
         std::unordered_map<uint32_t, uint32_t> mmioByInstructionAddress;
         std::vector<JumpTable> jumpTables;
+        std::unordered_map<uint32_t, std::vector<uint32_t>>
+            indirectBranchTargetsByInstructionAddress;
         std::vector<Function> functionBoundaries;
     };
 

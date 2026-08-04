@@ -145,6 +145,22 @@ namespace ps2recomp
         }
     }
 
+    void CodeGenerator::setConfiguredIndirectBranchTargets(
+        const std::unordered_map<uint32_t, std::vector<uint32_t>> &targetsByInstructionAddress)
+    {
+        m_configIndirectBranchTargetsByInstructionAddress =
+            targetsByInstructionAddress;
+        for (auto &[address, targets] :
+             m_configIndirectBranchTargetsByInstructionAddress)
+        {
+            (void)address;
+            std::sort(targets.begin(), targets.end());
+            targets.erase(
+                std::unique(targets.begin(), targets.end()),
+                targets.end());
+        }
+    }
+
     void CodeGenerator::setResumeEntryTargets(const std::unordered_map<uint32_t, std::vector<uint32_t>> &resumeTargetsByOwner)
     {
         m_resumeEntryTargetsByOwner = resumeTargetsByOwner;
@@ -303,6 +319,7 @@ namespace ps2recomp
         ControlFlowAnalyzer analyzer(
             m_sections,
             m_configJumpTableTargetsByAddress,
+            m_configIndirectBranchTargetsByInstructionAddress,
             reportDiagnostics ? m_reporter : nullptr);
         return analyzer.analyze(function, instructions, allFunctions);
     }

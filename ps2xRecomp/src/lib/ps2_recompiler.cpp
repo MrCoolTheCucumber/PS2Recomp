@@ -1015,6 +1015,8 @@ namespace ps2recomp
                 m_reporter.info("module", msg.str());
             }
             m_codeGenerator->setConfiguredJumpTables(m_config.jumpTables);
+            m_codeGenerator->setConfiguredIndirectBranchTargets(
+                m_config.indirectBranchTargetsByInstructionAddress);
             m_codeGenerator->setEmitInstructionComments(true);
 
             fs::create_directories(m_config.outputPath);

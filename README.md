@@ -102,6 +102,26 @@ Main fields in `config.toml`:
 * `general.stubs`: names to force as stubs. Also accepts `handler@0xADDRESS` to bind a stripped function address directly to a runtime syscall/stub handler. Includes generic handlers `ret0`, `ret1`, `reta0`.
 * `general.skip`: names to force as skipped wrappers.
 * `patches.instructions`: raw instruction replacements by address.
+* `indirect_branches`: complete, statically verified target sets for indirect
+  `JR`/`JALR` instructions that automatic control-flow analysis cannot resolve.
+
+Indirect branch targets:
+
+* Map the address of an indirect branch instruction to every address that the
+  branch can reach.
+* Use this only when reverse engineering has proven the target set is complete.
+  An incomplete set can omit required generated entry points.
+* Instruction and target addresses must be nonzero and four-byte aligned;
+  malformed configuration is rejected. If a target is not a decoded local
+  instruction or executable ELF address, analysis ignores the set and retains
+  conservative runtime dispatch.
+
+Example:
+
+```toml
+[indirect_branches]
+"0x001FD9CC" = ["0x001FD9E0", "0x001FD9E4", "0x001FD9E8"]
+```
 
 Address binding for stripped ELFs:
 

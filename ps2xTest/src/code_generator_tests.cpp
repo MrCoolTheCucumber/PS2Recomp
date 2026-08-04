@@ -3774,6 +3774,67 @@ void register_code_generator_tests()
                      "configured table should avoid broad JR fallback labels");
         });
 
+        tc.Run("configured indirect branch sites drive validated JR targets", [](TestCase &t) {
+            Function func;
+            func.name = "jr_configured_targets";
+            func.start = 0x1680u;
+            func.end = 0x16A0u;
+            func.isRecompiled = true;
+            func.isStub = false;
+
+            const std::vector<Instruction> instructions{
+                makeJr(0x1680u, 8u),
+                makeNop(0x1684u),
+                makeNop(0x1690u),
+                makeNop(0x1694u),
+            };
+            const std::vector<Section> sections{
+                {".text", 0x1680u, 0x20u, 0u, true, false, false, true, nullptr},
+            };
+
+            CodeGenerator gen({}, sections);
+            gen.setConfiguredIndirectBranchTargets({
+                {0x1680u, {0x1694u, 0x1690u, 0x1694u}},
+            });
+            const CodeGenerator::AnalysisResult analysis =
+                gen.collectInternalBranchTargets(func, instructions);
+
+            const auto targets = analysis.jumpTableTargets.find(0x1680u);
+            t.IsTrue(targets != analysis.jumpTableTargets.end(),
+                     "configured JR site should have resolved local targets");
+            if (targets != analysis.jumpTableTargets.end())
+            {
+                t.Equals(targets->second.size(), static_cast<size_t>(2),
+                         "configured JR targets should be deduplicated");
+                t.Equals(targets->second[0], 0x1690u,
+                         "configured JR targets should be sorted");
+                t.Equals(targets->second[1], 0x1694u,
+                         "configured JR should retain every validated target");
+            }
+            t.IsTrue(analysis.indirectFallbackEntryPoints.empty(),
+                     "validated configured targets should avoid broad fallback promotion");
+
+            const std::string generated =
+                gen.generateFunction(func, instructions, false);
+            t.IsTrue(generated.find(
+                         "case 0x1690u: goto label_1690;") !=
+                         std::string::npos,
+                     "first configured target should appear in the emitted switch");
+            t.IsTrue(generated.find(
+                         "case 0x1694u: goto label_1694;") !=
+                         std::string::npos,
+                     "second configured target should appear in the emitted switch");
+
+            gen.setConfiguredIndirectBranchTargets({
+                {0x1680u, {0x3000u}},
+            });
+            const CodeGenerator::AnalysisResult invalidAnalysis =
+                gen.collectInternalBranchTargets(func, instructions);
+            t.IsTrue(invalidAnalysis.indirectFallbackEntryPoints.contains(
+                         0x1680u),
+                     "a configured non-executable target should retain conservative fallback coverage");
+        });
+
         tc.Run("unresolved JALR uses runtime dispatch without broad local switch", [](TestCase &t) {
             Function func;
             func.name = "jalr_runtime_fallback";
