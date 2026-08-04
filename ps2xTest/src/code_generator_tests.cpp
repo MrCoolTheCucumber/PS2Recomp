@@ -185,6 +185,11 @@ static Instruction makeJr(uint32_t address, uint8_t rs)
     return inst;
 }
 
+static Instruction decodeRawInstruction(uint32_t address, uint32_t raw)
+{
+    return R5900Decoder{}.decodeInstruction(address, raw, false);
+}
+
 static void printGeneratedCode(const std::string& name, const std::string& code)
 {
 #ifdef PRINT_GENERATED_CODE
@@ -1144,6 +1149,95 @@ void register_code_generator_tests()
                  "unresolved JR fallback targets should still emit labels in the owner");
         t.IsFalse(analysis.jumpTableTargets.contains(0x3104u),
                   "unresolved JR should not pretend it has a resolved local jump table");
+    });
+
+    tc.Run("JR through an entry-prologue return-address alias is classified as a return", [](TestCase &t) {
+        struct AliasCase
+        {
+            uint32_t start;
+            uint8_t aliasReg;
+            uint32_t copyRaw;
+            bool hasLeadingNop;
+        };
+
+        const AliasCase cases[] = {
+            {
+                0x3140u,
+                15u,
+                (OPCODE_ADDI << 26) | (31u << 21) | (15u << 16),
+                false,
+            },
+            {
+                0x3180u,
+                25u,
+                (31u << 21) | (25u << 11) | SPECIAL_DADDU,
+                true,
+            },
+        };
+
+        for (const AliasCase &aliasCase : cases)
+        {
+            Function func;
+            func.name = "saved_ra_return";
+            func.start = aliasCase.start;
+            func.end = aliasCase.start + 0x14u;
+            func.isRecompiled = true;
+            func.isStub = false;
+
+            std::vector<Instruction> instructions;
+            if (aliasCase.hasLeadingNop)
+            {
+                instructions.push_back(makeNop(aliasCase.start));
+            }
+            const uint32_t copyAddress = aliasCase.start +
+                (aliasCase.hasLeadingNop ? 4u : 0u);
+            const uint32_t jrAddress = copyAddress + 8u;
+            instructions.push_back(decodeRawInstruction(
+                copyAddress, aliasCase.copyRaw));
+            instructions.push_back(makeNop(copyAddress + 4u));
+            instructions.push_back(makeJr(jrAddress, aliasCase.aliasReg));
+            instructions.push_back(makeNop(jrAddress + 4u));
+
+            CodeGenerator gen({}, {});
+            const CodeGenerator::AnalysisResult analysis =
+                gen.collectInternalBranchTargets(func, instructions);
+
+            t.IsTrue(analysis.returnAddressAliasJumps.contains(jrAddress),
+                     "an exact entry-prologue copy of $ra should classify its JR as a return");
+            t.IsTrue(analysis.indirectFallbackEntryPoints.empty(),
+                     "a proven saved-$ra return should not promote broad fallback entries");
+        }
+    });
+
+    tc.Run("overwriting a saved return-address alias keeps JR conservative", [](TestCase &t) {
+        Function func;
+        func.name = "clobbered_saved_ra";
+        func.start = 0x31C0u;
+        func.end = 0x31D0u;
+        func.isRecompiled = true;
+        func.isStub = false;
+
+        const Instruction saveRa = decodeRawInstruction(
+            0x31C0u,
+            (OPCODE_ADDIU << 26) | (31u << 21) | (15u << 16));
+        const Instruction overwriteAlias = decodeRawInstruction(
+            0x31C4u,
+            (OPCODE_ADDIU << 26) | (15u << 16) | 1u);
+        const std::vector<Instruction> instructions{
+            saveRa,
+            overwriteAlias,
+            makeJr(0x31C8u, 15u),
+            makeNop(0x31CCu),
+        };
+
+        CodeGenerator gen({}, {});
+        const CodeGenerator::AnalysisResult analysis =
+            gen.collectInternalBranchTargets(func, instructions);
+
+        t.IsFalse(analysis.returnAddressAliasJumps.contains(0x31C8u),
+                  "a locally overwritten alias must not be classified as the incoming return address");
+        t.IsTrue(analysis.indirectFallbackEntryPoints.contains(0x31C0u),
+                 "a clobbered alias should retain conservative indirect fallback coverage");
     });
 
     tc.Run("unresolved JALR marks internal labels as indirect fallback resume entries", [](TestCase &t) {
@@ -3512,6 +3606,46 @@ void register_code_generator_tests()
                      "truncated trailing JR must not degrade to comment-only output");
             t.IsTrue(generated.find("PS2Runtime::GuestBranchKind::Return") != std::string::npos,
                      "truncated JR $31 should still use return diagnostics");
+        });
+
+        tc.Run("JR through a saved return-address alias emits return flow", [](TestCase &t) {
+            Function func;
+            func.name = "jr_saved_ra_return";
+            func.start = 0x1580u;
+            func.end = 0x15A0u;
+            func.isRecompiled = true;
+            func.isStub = false;
+
+            const Instruction saveRa = decodeRawInstruction(
+                0x1580u,
+                (OPCODE_ADDI << 26) | (31u << 21) | (15u << 16));
+            const Instruction jal = makeJal(0x1584u, 0x2000u);
+            const Instruction jalDelay = makeNop(0x1588u);
+            const Instruction jr = makeJr(0x158Cu, 15u);
+            const Instruction jrDelay = makeNop(0x1590u);
+
+            CodeGenerator gen({}, {});
+            const std::string generated = gen.generateFunction(
+                func, {saveRa, jal, jalDelay, jr, jrDelay}, false);
+            printGeneratedCode(
+                "JR through a saved return-address alias emits return flow",
+                generated);
+
+            t.IsTrue(generated.find(
+                         "const uint32_t jumpTarget = GPR_U32(ctx, 15);") !=
+                         std::string::npos,
+                     "saved-$ra return should read the actual alias register");
+            t.IsTrue(generated.find(
+                         "PS2Runtime::GuestBranchKind::Return") !=
+                         std::string::npos,
+                     "saved-$ra JR should use return validation and dispatch semantics");
+            t.IsFalse(generated.find(
+                          "PS2Runtime::GuestBranchKind::IndirectJump") !=
+                          std::string::npos,
+                      "saved-$ra JR should not be emitted as an arbitrary computed jump");
+            t.IsTrue(generated.find("\"JR saved $ra\"") !=
+                         std::string::npos,
+                     "saved-$ra returns should retain a precise diagnostic name");
         });
 
         tc.Run("unresolved JR non-RA uses dispatcher resume entries without broad local switch", [](TestCase &t) {

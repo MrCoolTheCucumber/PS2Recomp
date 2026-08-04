@@ -168,6 +168,38 @@ namespace ps2recomp
                    inst.rt == REGIMM_BLTZALL || inst.rt == REGIMM_BGEZALL;
         };
 
+        const auto writesRegister = [](const Instruction &inst, uint32_t reg)
+        {
+            return reg != 0u &&
+                   (inst.gprWriteMask & (1u << reg)) != 0u;
+        };
+
+        const auto isExactReturnAddressCopy = [](const Instruction &inst,
+                                                 uint32_t destinationReg)
+        {
+            if (inst.rt == destinationReg && inst.rs == 31u &&
+                inst.simmediate == 0u &&
+                (inst.opcode == OPCODE_ADDI ||
+                 inst.opcode == OPCODE_ADDIU ||
+                 inst.opcode == OPCODE_DADDI ||
+                 inst.opcode == OPCODE_DADDIU))
+            {
+                return true;
+            }
+
+            if (inst.opcode != OPCODE_SPECIAL ||
+                inst.rd != destinationReg ||
+                (inst.function != SPECIAL_OR &&
+                 inst.function != SPECIAL_ADDU &&
+                 inst.function != SPECIAL_DADDU))
+            {
+                return false;
+            }
+
+            return (inst.rs == 31u && inst.rt == 0u) ||
+                   (inst.rs == 0u && inst.rt == 31u);
+        };
+
         for (const auto &inst : instructions)
         {
             instructionAddresses.insert(inst.address);
@@ -361,6 +393,61 @@ namespace ps2recomp
                 if (it != instructions.end())
                 {
                     int jrIndex = std::distance(instructions.begin(), it);
+
+                    // Hand-written EE code sometimes preserves the incoming
+                    // return address in a temporary register before making
+                    // nested calls, then returns with JR through that alias.
+                    // Accept only an exact copy in the straight-line entry
+                    // prologue which is never overwritten locally.
+                    if (jrInst->function == SPECIAL_JR &&
+                        jrReg != 0u && jrReg != 31u)
+                    {
+                        constexpr int kMaxReturnAliasPrologueInstructions = 4;
+                        int aliasDefinitionIndex = -1;
+                        const int prologueEnd = std::min(
+                            jrIndex,
+                            kMaxReturnAliasPrologueInstructions);
+                        for (int i = 0; i < prologueEnd; ++i)
+                        {
+                            const auto &inst = instructions[i];
+                            if (inst.hasDelaySlot || inst.isBranch ||
+                                inst.isJump || inst.isCall || inst.isReturn)
+                            {
+                                break;
+                            }
+                            if (isExactReturnAddressCopy(inst, jrReg))
+                            {
+                                aliasDefinitionIndex = i;
+                                break;
+                            }
+                        }
+
+                        if (aliasDefinitionIndex >= 0)
+                        {
+                            bool aliasWasOverwritten = false;
+                            for (int i = aliasDefinitionIndex + 1;
+                                 i < jrIndex; ++i)
+                            {
+                                if (writesRegister(instructions[i], jrReg))
+                                {
+                                    aliasWasOverwritten = true;
+                                    break;
+                                }
+                            }
+                            if (!aliasWasOverwritten)
+                            {
+                                result.returnAddressAliasJumps.insert(
+                                    jrInst->address);
+                                foundTable = true;
+                            }
+                        }
+                    }
+
+                    if (foundTable)
+                    {
+                        continue;
+                    }
+
                     for (int i = jrIndex - 1; i >= 0 && i >= jrIndex - 20; --i)
                     {
                         const auto &inst = instructions[i];
@@ -477,11 +564,6 @@ namespace ps2recomp
 
                             constexpr int kMaxJumpTableDataFlowInstructions = 64;
                             constexpr uint32_t kMaxInferredTableEntries = 1000u;
-                            const auto writesRegister = [](const Instruction &inst, uint32_t reg)
-                            {
-                                return reg != 0u &&
-                                       (inst.gprWriteMask & (1u << reg)) != 0u;
-                            };
                             struct RegisterConstant
                             {
                                 bool found = false;

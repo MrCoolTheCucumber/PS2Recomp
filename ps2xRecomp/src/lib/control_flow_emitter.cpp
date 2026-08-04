@@ -430,18 +430,18 @@ namespace ps2recomp
     }
 
     void ControlFlowEmitter::emitExternalRegisterJumpDispatch(std::string_view jumpTargetExpression,
-                                                              RegisterBranchKind kind,
+                                                              bool isReturn,
                                                               uint8_t rsReg,
                                                               std::string_view indent)
     {
-        const bool isReturn = kind == RegisterBranchKind::Jump && rsReg == 31u;
-
         if (isReturn)
         {
             m_ss << indent << "#if defined(PS2X_STRICT_RETURN_DIAGNOSTICS) && PS2X_STRICT_RETURN_DIAGNOSTICS\n";
             m_ss << indent << "(void)runtime->dispatchValidatedGuestBranchPolicy<Mode>(rdram, ctx, " << jumpTargetExpression
                  << ", 0x" << fmt::format("{:X}", branchPc())
-                 << "u, 0u, PS2Runtime::GuestBranchKind::Return, \"JR $ra\");\n";
+                 << "u, 0u, PS2Runtime::GuestBranchKind::Return, \""
+                 << (rsReg == 31u ? "JR $ra" : "JR saved $ra")
+                 << "\");\n";
             m_ss << indent << "return;\n";
             m_ss << indent << "#else\n";
             m_ss << indent << "ctx->pc = " << jumpTargetExpression << ";\n";
@@ -551,7 +551,10 @@ namespace ps2recomp
         const uint8_t rsReg = static_cast<uint8_t>(m_branchInst.rs);
         const uint8_t rdReg = static_cast<uint8_t>(m_branchInst.rd);
         const bool isReturn =
-            kind == RegisterBranchKind::Jump && rsReg == 31u;
+            kind == RegisterBranchKind::Jump &&
+            (rsReg == 31u ||
+             m_analysisResult.returnAddressAliasJumps.contains(
+                 m_branchInst.address));
         const std::vector<uint32_t> sortedInternalTargets = resolvedLocalIndirectTargets();
 
         m_ss << "    {\n";
@@ -601,7 +604,7 @@ namespace ps2recomp
 
         if (kind == RegisterBranchKind::Jump)
         {
-            emitExternalRegisterJumpDispatch("jumpTarget", kind, rsReg, "        ");
+            emitExternalRegisterJumpDispatch("jumpTarget", isReturn, rsReg, "        ");
         }
         else
         {
