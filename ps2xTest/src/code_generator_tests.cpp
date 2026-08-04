@@ -1151,13 +1151,13 @@ void register_code_generator_tests()
                   "unresolved JR should not pretend it has a resolved local jump table");
     });
 
-    tc.Run("JR through an entry-prologue return-address alias is classified as a return", [](TestCase &t) {
+    tc.Run("JR through an entry-block return-address alias is classified as a return", [](TestCase &t) {
         struct AliasCase
         {
             uint32_t start;
             uint8_t aliasReg;
             uint32_t copyRaw;
-            bool hasLeadingNop;
+            uint32_t leadingNops;
         };
 
         const AliasCase cases[] = {
@@ -1165,13 +1165,19 @@ void register_code_generator_tests()
                 0x3140u,
                 15u,
                 (OPCODE_ADDI << 26) | (31u << 21) | (15u << 16),
-                false,
+                0u,
             },
             {
                 0x3180u,
                 25u,
                 (31u << 21) | (25u << 11) | SPECIAL_DADDU,
-                true,
+                1u,
+            },
+            {
+                0x31A0u,
+                14u,
+                (OPCODE_ADDIU << 26) | (31u << 21) | (14u << 16),
+                12u,
             },
         };
 
@@ -1180,18 +1186,19 @@ void register_code_generator_tests()
             Function func;
             func.name = "saved_ra_return";
             func.start = aliasCase.start;
-            func.end = aliasCase.start + 0x14u;
+            const uint32_t copyAddress = aliasCase.start +
+                aliasCase.leadingNops * sizeof(uint32_t);
+            const uint32_t jrAddress = copyAddress + 8u;
+            func.end = jrAddress + 8u;
             func.isRecompiled = true;
             func.isStub = false;
 
             std::vector<Instruction> instructions;
-            if (aliasCase.hasLeadingNop)
+            for (uint32_t i = 0u; i < aliasCase.leadingNops; ++i)
             {
-                instructions.push_back(makeNop(aliasCase.start));
+                instructions.push_back(makeNop(
+                    aliasCase.start + i * sizeof(uint32_t)));
             }
-            const uint32_t copyAddress = aliasCase.start +
-                (aliasCase.hasLeadingNop ? 4u : 0u);
-            const uint32_t jrAddress = copyAddress + 8u;
             instructions.push_back(decodeRawInstruction(
                 copyAddress, aliasCase.copyRaw));
             instructions.push_back(makeNop(copyAddress + 4u));
@@ -1203,10 +1210,70 @@ void register_code_generator_tests()
                 gen.collectInternalBranchTargets(func, instructions);
 
             t.IsTrue(analysis.returnAddressAliasJumps.contains(jrAddress),
-                     "an exact entry-prologue copy of $ra should classify its JR as a return");
+                     "an exact entry-block copy of $ra should classify its JR as a return");
             t.IsTrue(analysis.indirectFallbackEntryPoints.empty(),
                      "a proven saved-$ra return should not promote broad fallback entries");
         }
+    });
+
+    tc.Run("copying $ra after a call does not prove an incoming return alias", [](TestCase &t) {
+        Function func;
+        func.name = "post_call_ra_copy";
+        func.start = 0x3200u;
+        func.end = 0x3214u;
+        func.isRecompiled = true;
+        func.isStub = false;
+
+        const Instruction saveChangedRa = decodeRawInstruction(
+            0x3208u,
+            (OPCODE_ADDIU << 26) | (31u << 21) | (14u << 16));
+        const std::vector<Instruction> instructions{
+            makeJal(0x3200u, 0x4000u),
+            makeNop(0x3204u),
+            saveChangedRa,
+            makeJr(0x320Cu, 14u),
+            makeNop(0x3210u),
+        };
+
+        CodeGenerator gen({}, {});
+        const CodeGenerator::AnalysisResult analysis =
+            gen.collectInternalBranchTargets(func, instructions);
+
+        t.IsFalse(analysis.returnAddressAliasJumps.contains(0x320Cu),
+                  "$ra copied after a call is not the incoming return address");
+        t.IsTrue(analysis.indirectFallbackEntryPoints.contains(0x3200u),
+                 "a post-call $ra copy should retain conservative fallback coverage");
+    });
+
+    tc.Run("copying an overwritten $ra does not prove an incoming return alias", [](TestCase &t) {
+        Function func;
+        func.name = "overwritten_ra_copy";
+        func.start = 0x3240u;
+        func.end = 0x3250u;
+        func.isRecompiled = true;
+        func.isStub = false;
+
+        const Instruction overwriteRa = decodeRawInstruction(
+            0x3240u,
+            (OPCODE_ADDIU << 26) | (31u << 16) | 0x1234u);
+        const Instruction saveChangedRa = decodeRawInstruction(
+            0x3244u,
+            (OPCODE_ADDIU << 26) | (31u << 21) | (14u << 16));
+        const std::vector<Instruction> instructions{
+            overwriteRa,
+            saveChangedRa,
+            makeJr(0x3248u, 14u),
+            makeNop(0x324Cu),
+        };
+
+        CodeGenerator gen({}, {});
+        const CodeGenerator::AnalysisResult analysis =
+            gen.collectInternalBranchTargets(func, instructions);
+
+        t.IsFalse(analysis.returnAddressAliasJumps.contains(0x3248u),
+                  "a copied locally-written $ra is not the incoming return address");
+        t.IsTrue(analysis.indirectFallbackEntryPoints.contains(0x3240u),
+                 "an overwritten-$ra copy should retain conservative fallback coverage");
     });
 
     tc.Run("overwriting a saved return-address alias keeps JR conservative", [](TestCase &t) {

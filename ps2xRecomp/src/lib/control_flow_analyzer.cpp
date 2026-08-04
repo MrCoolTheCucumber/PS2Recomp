@@ -461,21 +461,20 @@ namespace ps2recomp
                     // return address in a temporary register before making
                     // nested calls, then returns with JR through that alias.
                     // Accept only an exact copy in the straight-line entry
-                    // prologue which is never overwritten locally.
+                    // block, before any instruction which could change $ra
+                    // or make the copy path-dependent, which is never
+                    // overwritten locally.
                     if (!foundTable &&
                         jrInst->function == SPECIAL_JR &&
                         jrReg != 0u && jrReg != 31u)
                     {
-                        constexpr int kMaxReturnAliasPrologueInstructions = 4;
                         int aliasDefinitionIndex = -1;
-                        const int prologueEnd = std::min(
-                            jrIndex,
-                            kMaxReturnAliasPrologueInstructions);
-                        for (int i = 0; i < prologueEnd; ++i)
+                        for (int i = 0; i < jrIndex; ++i)
                         {
                             const auto &inst = instructions[i];
                             if (inst.hasDelaySlot || inst.isBranch ||
-                                inst.isJump || inst.isCall || inst.isReturn)
+                                inst.isJump || inst.isCall || inst.isReturn ||
+                                writesRegister(inst, 31u))
                             {
                                 break;
                             }
