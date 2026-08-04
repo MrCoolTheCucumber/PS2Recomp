@@ -1986,6 +1986,209 @@ void register_ps2_memory_tests()
             }
         });
 
+        tc.Run("fixed fast resolvers match generic access semantics", [](TestCase &t)
+        {
+            constexpr uint32_t virtualBase = 0x04000000u;
+            constexpr uint32_t physicalBase = 0x00120000u;
+            constexpr uint32_t offset = 0x100u;
+            constexpr uint8_t asid = 0x2au;
+
+            PS2Runtime runtime;
+            t.IsTrue(
+                runtime.memory().initialize(),
+                "the fixed-resolver fixture should allocate RDRAM");
+            for (uint32_t index = 0u;
+                 index < runtime.memory().tlbEntryCount();
+                 ++index)
+            {
+                t.IsTrue(
+                    runtime.memory().tlbWrite(index, EeTlbEntry{}),
+                    "the fixed-resolver fixture should clear the TLB");
+            }
+
+            const auto installMapping = [&](bool dirty)
+            {
+                return runtime.memory().tlbWrite(
+                    7u,
+                    EeTlbEntry{
+                        0u,
+                        virtualBase | asid,
+                        makeEeTlbEntryLo(
+                            physicalBase >> 12u,
+                            dirty,
+                            true,
+                            false),
+                        makeEeTlbEntryLo(
+                            (physicalBase >> 12u) + 1u,
+                            dirty,
+                            true,
+                            false),
+                    });
+            };
+            t.IsTrue(
+                installMapping(true),
+                "the fixed-resolver fixture should install a writable mapping");
+
+            R5900Context mappedContext{};
+            mappedContext.cop0_status = 0x00000010u;
+            mappedContext.cop0_entryhi = asid;
+            R5900Context directContext{};
+
+            const auto expectSuccess =
+                [&]<uint32_t Bytes, bool WriteAccess>(
+                    R5900Context &context,
+                    uint32_t address,
+                    bool warmMappedCache,
+                    const std::string &label)
+            {
+                const EeAddressTranslationContext translation =
+                    EeAddressTranslationContext::fromCop0Status(
+                        context.cop0_status,
+                        static_cast<uint8_t>(context.cop0_entryhi));
+                if (warmMappedCache)
+                {
+                    (void)runtime.memory().translateAddress(
+                        address,
+                        translation,
+                        WriteAccess,
+                        Bytes);
+                }
+
+                uint32_t genericOffset = 0xdeadc0deu;
+                uint32_t fixedOffset = 0xc001c0deu;
+                const bool genericResult =
+                    Ps2ResolveFastGuestRdramAccess(
+                        &runtime,
+                        &context,
+                        address,
+                        Bytes,
+                        WriteAccess,
+                        genericOffset);
+                const bool fixedResult =
+                    Ps2ResolveFastGuestRdramAccessFixed<
+                        Bytes,
+                        WriteAccess>(
+                        &runtime,
+                        &context,
+                        address,
+                        fixedOffset);
+
+                t.IsTrue(genericResult, label + ": generic resolver should accept");
+                t.Equals(
+                    fixedResult,
+                    genericResult,
+                    label + ": fixed and generic acceptance should match");
+                t.Equals(
+                    fixedOffset,
+                    genericOffset,
+                    label + ": fixed and generic offsets should match");
+                t.Equals(
+                    fixedOffset,
+                    physicalBase + offset,
+                    label + ": resolver should return the mapped RDRAM offset");
+            };
+
+            const uint32_t mappedAddress = virtualBase + offset;
+            const uint32_t directAddress =
+                0x80000000u | physicalBase | offset;
+#define EXPECT_FIXED_SUCCESS(bytes, write_access)                    \
+            expectSuccess.template operator()<bytes, write_access>( \
+                mappedContext,                                      \
+                mappedAddress,                                      \
+                true,                                               \
+                "mapped " #bytes "-byte " #write_access);          \
+            expectSuccess.template operator()<bytes, write_access>( \
+                directContext,                                      \
+                directAddress,                                      \
+                false,                                              \
+                "direct " #bytes "-byte " #write_access)
+            EXPECT_FIXED_SUCCESS(1u, false);
+            EXPECT_FIXED_SUCCESS(1u, true);
+            EXPECT_FIXED_SUCCESS(2u, false);
+            EXPECT_FIXED_SUCCESS(2u, true);
+            EXPECT_FIXED_SUCCESS(4u, false);
+            EXPECT_FIXED_SUCCESS(4u, true);
+            EXPECT_FIXED_SUCCESS(8u, false);
+            EXPECT_FIXED_SUCCESS(8u, true);
+            EXPECT_FIXED_SUCCESS(16u, false);
+            EXPECT_FIXED_SUCCESS(16u, true);
+#undef EXPECT_FIXED_SUCCESS
+
+            const auto expectRejected =
+                [&]<uint32_t Bytes, bool WriteAccess>(
+                    R5900Context &context,
+                    uint32_t address,
+                    const std::string &label)
+            {
+                uint32_t genericOffset = 0xdeadc0deu;
+                uint32_t fixedOffset = 0xc001c0deu;
+                const bool genericResult =
+                    Ps2ResolveFastGuestRdramAccess(
+                        &runtime,
+                        &context,
+                        address,
+                        Bytes,
+                        WriteAccess,
+                        genericOffset);
+                const bool fixedResult =
+                    Ps2ResolveFastGuestRdramAccessFixed<
+                        Bytes,
+                        WriteAccess>(
+                        &runtime,
+                        &context,
+                        address,
+                        fixedOffset);
+                t.IsFalse(
+                    genericResult,
+                    label + ": generic resolver should reject");
+                t.Equals(
+                    fixedResult,
+                    genericResult,
+                    label + ": fixed and generic rejection should match");
+                t.Equals(
+                    fixedOffset,
+                    0xc001c0deu,
+                    label + ": rejection should not publish a fixed offset");
+            };
+
+            expectRejected.template operator()<4u, false>(
+                mappedContext,
+                mappedAddress + 2u,
+                "misaligned mapped read");
+
+            R5900Context wrongAsidContext = mappedContext;
+            wrongAsidContext.cop0_entryhi = asid ^ 1u;
+            expectRejected.template operator()<4u, true>(
+                wrongAsidContext,
+                mappedAddress,
+                "wrong-ASID mapped write");
+
+            t.IsTrue(
+                installMapping(false),
+                "the fixed-resolver fixture should install a read-only mapping");
+            const EeAddressTranslationContext mappedTranslation =
+                EeAddressTranslationContext::fromCop0Status(
+                    mappedContext.cop0_status,
+                    static_cast<uint8_t>(mappedContext.cop0_entryhi));
+            (void)runtime.memory().translateAddress(
+                mappedAddress,
+                mappedTranslation,
+                false,
+                4u);
+            expectRejected.template operator()<4u, true>(
+                mappedContext,
+                mappedAddress,
+                "read-only mapped write");
+
+            t.IsTrue(
+                installMapping(true),
+                "rewriting the mapping should invalidate its cached generation");
+            expectRejected.template operator()<4u, false>(
+                mappedContext,
+                mappedAddress,
+                "stale-generation mapped read");
+        });
+
         tc.Run("VIF MPG num zero uploads 256 instructions", [](TestCase &t)
         {
             PS2Memory mem;

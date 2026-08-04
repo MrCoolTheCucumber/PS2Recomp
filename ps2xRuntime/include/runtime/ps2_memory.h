@@ -1221,6 +1221,88 @@ public:
         uint32_t accessSize,
         uint32_t &physicalOffset) noexcept;
 
+    template <uint32_t AccessSize, bool WriteAccess>
+    bool tryResolveCachedTlbRdramOffsetFixed(
+        uint32_t virtualAddress,
+        EeAddressTranslationContext translation,
+        uint32_t &physicalOffset) noexcept
+    {
+        static_assert(
+            AccessSize != 0u &&
+            AccessSize <= sizeof(__m128i) &&
+            (AccessSize & (AccessSize - 1u)) == 0u);
+
+        if (!m_tlbTranslationCacheEnabled)
+        {
+            return false;
+        }
+
+        constexpr uint32_t pageMask =
+            kTlbTranslationCachePageSize - 1u;
+        const uint32_t pageOffset = virtualAddress & pageMask;
+        if (!translation.permits(virtualAddress))
+        {
+            if (m_tlbTranslationCacheDiagnosticsEnabled)
+            {
+                recordTlbFastCacheRejectedAccess(false);
+            }
+            return false;
+        }
+        if (pageOffset >
+            kTlbTranslationCachePageSize - AccessSize)
+        {
+            if (m_tlbTranslationCacheDiagnosticsEnabled)
+            {
+                recordTlbFastCacheRejectedAccess(true);
+            }
+            return false;
+        }
+        if ((virtualAddress & (AccessSize - 1u)) != 0u)
+        {
+            if (m_tlbTranslationCacheDiagnosticsEnabled)
+            {
+                recordTlbFastCacheRejectedAccess(false);
+            }
+            return false;
+        }
+
+        const size_t setIndex =
+            (virtualAddress >> 12u) &
+            (kTlbFastCacheSetCount - 1u);
+        const EeTlbFastCacheEntry &entry =
+            m_tlbFastCache[setIndex];
+        const uint64_t requestKey = makeTlbFastCacheKey(
+            virtualAddress,
+            translation,
+            WriteAccess);
+        const bool generationMatches =
+            entry.generation == m_tlbMappingGeneration;
+        const bool keyMatches =
+            ((requestKey ^ entry.key) & entry.matchMask) == 0u;
+        const uint32_t resolved =
+            entry.physicalPageBase + pageOffset;
+        if (generationMatches &&
+            keyMatches &&
+            resolved <= PS2_RAM_SIZE - AccessSize)
+        {
+            if (m_tlbTranslationCacheDiagnosticsEnabled)
+            {
+                recordTlbFastCacheHit();
+            }
+            physicalOffset = resolved;
+            return true;
+        }
+
+        if (m_tlbTranslationCacheDiagnosticsEnabled)
+        {
+            recordTlbFastCacheMiss(
+                entry,
+                requestKey,
+                WriteAccess);
+        }
+        return false;
+    }
+
     // Hardware register interface
     bool writeIORegister(uint32_t address, uint32_t value);
     bool writeIORegisterMasked(uint32_t address, uint32_t value, uint8_t byteEnable);

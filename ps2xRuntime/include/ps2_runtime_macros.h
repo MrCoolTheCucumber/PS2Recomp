@@ -755,43 +755,70 @@ bool Ps2ResolveFastGuestRdramAccess(
     bool writeAccess,
     uint32_t &physicalOffset);
 
+template <uint32_t Bytes, bool WriteAccess>
+PS2X_EE_OBSERVATION_POLICY_INLINE bool
+Ps2ResolveFastGuestRdramAccessFixed(
+    PS2Runtime *runtime,
+    const R5900Context *ctx,
+    uint32_t address,
+    uint32_t &physicalOffset)
+{
+    if (runtime == nullptr)
+    {
+        return false;
+    }
+    const EeAddressTranslationContext translation =
+        ctx != nullptr
+            ? EeAddressTranslationContext::fromCop0Status(
+                  ctx->cop0_status,
+                  static_cast<uint8_t>(ctx->cop0_entryhi))
+            : EeAddressTranslationContext::unchecked();
+    return Ps2ResolveFastGuestRdramOffsetFixed<
+        Bytes,
+        WriteAccess>(
+        runtime->memory(),
+        translation,
+        address,
+        physicalOffset);
+}
+
 #define READ8(addr) ([&]() -> uint8_t {                              \
     const uint32_t _addr = (uint32_t)(addr);                         \
     uint32_t _physical_offset = 0u;                                  \
-    return Ps2ResolveFastGuestRdramAccess(                            \
-               runtime, ctx, _addr, 1u, false, _physical_offset)     \
+    return Ps2ResolveFastGuestRdramAccessFixed<1u, false>(            \
+               runtime, ctx, _addr, _physical_offset)                \
         ? DEBUG_FAST_READ8(_addr, _physical_offset)                  \
         : runtime->Load8(rdram, ctx, _addr); }())
 
 #define READ16(addr) ([&]() -> uint16_t {                            \
     const uint32_t _addr = (uint32_t)(addr);                         \
     uint32_t _physical_offset = 0u;                                  \
-    return Ps2ResolveFastGuestRdramAccess(                            \
-               runtime, ctx, _addr, 2u, false, _physical_offset)     \
+    return Ps2ResolveFastGuestRdramAccessFixed<2u, false>(            \
+               runtime, ctx, _addr, _physical_offset)                \
         ? DEBUG_FAST_READ16(_addr, _physical_offset)                 \
         : runtime->Load16(rdram, ctx, _addr); }())
 
 #define READ32(addr) ([&]() -> uint32_t {                            \
     const uint32_t _addr = (uint32_t)(addr);                         \
     uint32_t _physical_offset = 0u;                                  \
-    return Ps2ResolveFastGuestRdramAccess(                            \
-               runtime, ctx, _addr, 4u, false, _physical_offset)     \
+    return Ps2ResolveFastGuestRdramAccessFixed<4u, false>(            \
+               runtime, ctx, _addr, _physical_offset)                \
         ? DEBUG_FAST_READ32(_addr, _physical_offset)                 \
         : runtime->Load32(rdram, ctx, _addr); }())
 
 #define READ64(addr) ([&]() -> uint64_t {                            \
     const uint32_t _addr = (uint32_t)(addr);                         \
     uint32_t _physical_offset = 0u;                                  \
-    return Ps2ResolveFastGuestRdramAccess(                            \
-               runtime, ctx, _addr, 8u, false, _physical_offset)     \
+    return Ps2ResolveFastGuestRdramAccessFixed<8u, false>(            \
+               runtime, ctx, _addr, _physical_offset)                \
         ? DEBUG_FAST_READ64(_addr, _physical_offset)                 \
         : runtime->Load64(rdram, ctx, _addr); }())
 
 #define READ128(addr) ([&]() -> __m128i {                            \
     const uint32_t _addr = (uint32_t)(addr);                         \
     uint32_t _physical_offset = 0u;                                  \
-    return Ps2ResolveFastGuestRdramAccess(                            \
-               runtime, ctx, _addr, 16u, false, _physical_offset)    \
+    return Ps2ResolveFastGuestRdramAccessFixed<16u, false>(           \
+               runtime, ctx, _addr, _physical_offset)                \
         ? DEBUG_FAST_READ128(_addr, _physical_offset)                \
         : runtime->Load128(rdram, ctx, _addr); }())
 
@@ -801,8 +828,8 @@ bool Ps2ResolveFastGuestRdramAccess(
         const uint32_t _addr = (uint32_t)(addr);                                     \
         const uint8_t _value = (uint8_t)(val);                                       \
         uint32_t _physical_offset = 0u;                                              \
-        if (!Ps2ResolveFastGuestRdramAccess(                                         \
-                runtime, ctx, _addr, 1u, true, _physical_offset))                    \
+        if (!Ps2ResolveFastGuestRdramAccessFixed<1u, true>(                          \
+                runtime, ctx, _addr, _physical_offset))                              \
             runtime->Store8(rdram, ctx, _addr, _value);                              \
         else                                                                         \
         {                                                                            \
@@ -821,8 +848,8 @@ bool Ps2ResolveFastGuestRdramAccess(
         const uint32_t _addr = (uint32_t)(addr);                                       \
         const uint16_t _value = (uint16_t)(val);                                       \
         uint32_t _physical_offset = 0u;                                                \
-        if (!Ps2ResolveFastGuestRdramAccess(                                           \
-                runtime, ctx, _addr, 2u, true, _physical_offset))                      \
+        if (!Ps2ResolveFastGuestRdramAccessFixed<2u, true>(                            \
+                runtime, ctx, _addr, _physical_offset))                                \
             runtime->Store16(rdram, ctx, _addr, _value);                               \
         else                                                                           \
         {                                                                              \
@@ -841,8 +868,8 @@ bool Ps2ResolveFastGuestRdramAccess(
         const uint32_t _addr = (uint32_t)(addr);                                       \
         const uint32_t _value = (uint32_t)(val);                                       \
         uint32_t _physical_offset = 0u;                                                \
-        if (!Ps2ResolveFastGuestRdramAccess(                                           \
-                runtime, ctx, _addr, 4u, true, _physical_offset))                      \
+        if (!Ps2ResolveFastGuestRdramAccessFixed<4u, true>(                            \
+                runtime, ctx, _addr, _physical_offset))                                \
             runtime->Store32(rdram, ctx, _addr, _value);                               \
         else                                                                           \
         {                                                                              \
@@ -861,8 +888,8 @@ bool Ps2ResolveFastGuestRdramAccess(
         const uint32_t _addr = (uint32_t)(addr);                                       \
         const uint64_t _value = (uint64_t)(val);                                       \
         uint32_t _physical_offset = 0u;                                                \
-        if (!Ps2ResolveFastGuestRdramAccess(                                           \
-                runtime, ctx, _addr, 8u, true, _physical_offset))                      \
+        if (!Ps2ResolveFastGuestRdramAccessFixed<8u, true>(                            \
+                runtime, ctx, _addr, _physical_offset))                                \
             runtime->Store64(rdram, ctx, _addr, _value);                               \
         else                                                                           \
         {                                                                              \
@@ -884,8 +911,8 @@ bool Ps2ResolveFastGuestRdramAccess(
         const Ps2ByteEnableSpan _span =                                             \
             Ps2DecodeByteEnableSpan(_byte_enable, 4u);                              \
         uint32_t _physical_offset = 0u;                                              \
-        if (!_span.valid || !Ps2ResolveFastGuestRdramAccess(                        \
-                runtime, ctx, _addr, 4u, true, _physical_offset))                   \
+        if (!_span.valid || !Ps2ResolveFastGuestRdramAccessFixed<4u, true>(          \
+                runtime, ctx, _addr, _physical_offset))                             \
             runtime->StoreMasked32(                                                 \
                 rdram, ctx, _addr, _value, _byte_enable);                           \
         else if (_span.size != 0u)                                                  \
@@ -916,8 +943,8 @@ bool Ps2ResolveFastGuestRdramAccess(
         const Ps2ByteEnableSpan _span =                                             \
             Ps2DecodeByteEnableSpan(_byte_enable, 8u);                              \
         uint32_t _physical_offset = 0u;                                              \
-        if (!_span.valid || !Ps2ResolveFastGuestRdramAccess(                        \
-                runtime, ctx, _addr, 8u, true, _physical_offset))                   \
+        if (!_span.valid || !Ps2ResolveFastGuestRdramAccessFixed<8u, true>(          \
+                runtime, ctx, _addr, _physical_offset))                             \
             runtime->StoreMasked64(                                                 \
                 rdram, ctx, _addr, _value, _byte_enable);                           \
         else if (_span.size != 0u)                                                  \
@@ -945,8 +972,8 @@ bool Ps2ResolveFastGuestRdramAccess(
         const uint32_t _addr = (uint32_t)(addr);                                     \
         const __m128i _value = (val);                                                \
         uint32_t _physical_offset = 0u;                                              \
-        if (!Ps2ResolveFastGuestRdramAccess(                                         \
-                runtime, ctx, _addr, 16u, true, _physical_offset))                   \
+        if (!Ps2ResolveFastGuestRdramAccessFixed<16u, true>(                         \
+                runtime, ctx, _addr, _physical_offset))                             \
             runtime->Store128(rdram, ctx, _addr, _value);                            \
         else                                                                         \
         {                                                                            \
