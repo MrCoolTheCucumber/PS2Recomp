@@ -6052,6 +6052,61 @@ namespace
         std::atomic<const PS2RecompiledModuleDescriptor *>,
         kMaxRecompiledModules>
         g_recompiledModules{};
+    std::atomic<uint32_t> g_recompiledModuleHighWatermark{0u};
+    constexpr uint64_t kEmptyRecompiledModuleAddressEnvelope =
+        static_cast<uint64_t>(std::numeric_limits<uint32_t>::max()) << 32u;
+    std::atomic<uint64_t> g_recompiledModuleAddressEnvelope{
+        kEmptyRecompiledModuleAddressEnvelope};
+
+    uint64_t recompiledModuleAddressEnvelope(
+        uint32_t firstAddress,
+        uint32_t lastAddress) noexcept
+    {
+        return (static_cast<uint64_t>(firstAddress) << 32u) |
+               lastAddress;
+    }
+
+    void publishRecompiledModuleBounds(
+        uint32_t slotCount,
+        uint32_t firstAddress,
+        uint32_t lastAddress) noexcept
+    {
+        uint32_t observedCount =
+            g_recompiledModuleHighWatermark.load(
+                std::memory_order_relaxed);
+        while (observedCount < slotCount &&
+               !g_recompiledModuleHighWatermark.compare_exchange_weak(
+                   observedCount,
+                   slotCount,
+                   std::memory_order_release,
+                   std::memory_order_relaxed))
+        {
+        }
+
+        uint64_t observedEnvelope =
+            g_recompiledModuleAddressEnvelope.load(
+                std::memory_order_relaxed);
+        while (true)
+        {
+            const uint32_t observedFirst =
+                static_cast<uint32_t>(observedEnvelope >> 32u);
+            const uint32_t observedLast =
+                static_cast<uint32_t>(observedEnvelope);
+            const uint64_t expandedEnvelope =
+                recompiledModuleAddressEnvelope(
+                    std::min(observedFirst, firstAddress),
+                    std::max(observedLast, lastAddress));
+            if (expandedEnvelope == observedEnvelope ||
+                g_recompiledModuleAddressEnvelope.compare_exchange_weak(
+                    observedEnvelope,
+                    expandedEnvelope,
+                    std::memory_order_release,
+                    std::memory_order_relaxed))
+            {
+                return;
+            }
+        }
+    }
 
     uint32_t normalizeGuestFunctionAddress(uint32_t address)
     {
@@ -6123,6 +6178,12 @@ namespace
         const PS2RecompiledModuleDescriptor &module,
         uint32_t address)
     {
+        if (address < module.functions[0].address ||
+            address > module.functions[module.functionCount - 1u].address)
+        {
+            return {};
+        }
+
         uint32_t first = 0u;
         uint32_t last = module.functionCount;
         while (first < last)
@@ -6149,10 +6210,26 @@ namespace
         uint32_t address,
         const uint8_t *rdram)
     {
-        for (const auto &slot : g_recompiledModules)
+        const uint64_t envelope =
+            g_recompiledModuleAddressEnvelope.load(
+                std::memory_order_acquire);
+        const uint32_t firstAddress =
+            static_cast<uint32_t>(envelope >> 32u);
+        const uint32_t lastAddress =
+            static_cast<uint32_t>(envelope);
+        if (address < firstAddress || address > lastAddress)
+        {
+            return {};
+        }
+
+        const uint32_t moduleCount =
+            g_recompiledModuleHighWatermark.load(
+                std::memory_order_acquire);
+        for (uint32_t index = 0u; index < moduleCount; ++index)
         {
             const PS2RecompiledModuleDescriptor *module =
-                slot.load(std::memory_order_acquire);
+                g_recompiledModules[index].load(
+                    std::memory_order_acquire);
             if (module == nullptr)
             {
                 continue;
@@ -6184,10 +6261,14 @@ namespace
         uint32_t address,
         const uint8_t *rdram)
     {
-        for (const auto &slot : g_recompiledModules)
+        const uint32_t moduleCount =
+            g_recompiledModuleHighWatermark.load(
+                std::memory_order_acquire);
+        for (uint32_t index = 0u; index < moduleCount; ++index)
         {
             const PS2RecompiledModuleDescriptor *module =
-                slot.load(std::memory_order_acquire);
+                g_recompiledModules[index].load(
+                    std::memory_order_acquire);
             if (module == nullptr ||
                 !recompiledModuleMatches(*module, rdram))
             {
@@ -6299,15 +6380,22 @@ bool ps2RegisterRecompiledModule(
         }
     }
 
-    for (auto &slot : g_recompiledModules)
+    for (uint32_t index = 0u;
+         index < g_recompiledModules.size();
+         ++index)
     {
         const PS2RecompiledModuleDescriptor *expected = nullptr;
-        if (slot.compare_exchange_strong(
+        if (g_recompiledModules[index].compare_exchange_strong(
                 expected,
                 descriptor,
                 std::memory_order_release,
                 std::memory_order_relaxed))
         {
+            publishRecompiledModuleBounds(
+                index + 1u,
+                descriptor->functions[0].address,
+                descriptor->functions[
+                    descriptor->functionCount - 1u].address);
             return true;
         }
     }

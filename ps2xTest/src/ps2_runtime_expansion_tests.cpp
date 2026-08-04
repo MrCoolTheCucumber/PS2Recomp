@@ -1043,11 +1043,20 @@ void register_ps2_runtime_expansion_tests()
         tc.Run("fixed-address AOT modules activate from guest-memory signatures", [](TestCase &t)
         {
             constexpr uint32_t kMatchAddress = 0x00301000u;
+            constexpr uint32_t kSecondMatchAddress = 0x00301200u;
+            constexpr uint32_t kBelowModuleEntry = 0x00301F00u;
             constexpr uint32_t kOverlapEntry = 0x00302000u;
+            constexpr uint32_t kModuleGapEntry = 0x00302080u;
             constexpr uint32_t kModuleOnlyEntry = 0x00302100u;
+            constexpr uint32_t kAboveModuleEntry = 0x00302200u;
+            constexpr uint32_t kSecondModuleOnlyEntry = 0x00304000u;
             static constexpr uint8_t kMatchBytes[] = {
                 0x70u, 0xFFu, 0xBDu, 0x27u,
                 0x16u, 0x00u, 0x02u, 0x3Cu,
+            };
+            static constexpr uint8_t kSecondMatchBytes[] = {
+                0x40u, 0x00u, 0x02u, 0x3Cu,
+                0x21u, 0x10u, 0x42u, 0x24u,
             };
             static const PS2RecompiledModuleFunction kFunctions[] = {
                 {kOverlapEntry,
@@ -1072,6 +1081,27 @@ void register_ps2_runtime_expansion_tests()
                 kSymbols,
                 std::size(kSymbols),
             };
+            static const PS2RecompiledModuleFunction kSecondFunctions[] = {
+                {kSecondModuleOnlyEntry,
+                 {&testOverlayModuleFastFunction,
+                  &testOverlayModulePreciseFunction}},
+            };
+            static const PS2GuestFunctionSymbol kSecondSymbols[] = {
+                {kSecondModuleOnlyEntry,
+                 kSecondModuleOnlyEntry + 0x20u,
+                 "overlay_second"},
+            };
+            static const PS2RecompiledModuleDescriptor kSecondModule = {
+                PS2_RECOMPILED_FUNCTION_PAIR_ABI_VERSION,
+                "runtime-test-overlay-second",
+                kSecondMatchAddress,
+                kSecondMatchBytes,
+                sizeof(kSecondMatchBytes),
+                kSecondFunctions,
+                std::size(kSecondFunctions),
+                kSecondSymbols,
+                std::size(kSecondSymbols),
+            };
 
             PS2RecompiledModuleDescriptor staleModule = kModule;
             staleModule.abiVersion =
@@ -1082,6 +1112,9 @@ void register_ps2_runtime_expansion_tests()
             t.IsTrue(
                 ps2RegisterRecompiledModule(&kModule),
                 "a valid generated module descriptor should register");
+            t.IsTrue(
+                ps2RegisterRecompiledModule(&kSecondModule),
+                "a second disjoint module descriptor should register after the first");
 
             PS2Runtime runtime;
             t.IsTrue(
@@ -1091,10 +1124,23 @@ void register_ps2_runtime_expansion_tests()
                 runtime.registerFunction(
                     kOverlapEntry, &testPrimaryModuleFunction),
                 "the primary overlapping function should register");
+            for (const uint32_t address :
+                 {kBelowModuleEntry,
+                  kModuleGapEntry,
+                  kAboveModuleEntry})
+            {
+                t.IsTrue(
+                    runtime.registerFunction(
+                        address, &testPrimaryModuleFunction),
+                    "primary functions around a module range should register");
+            }
 
             t.IsFalse(
                 runtime.hasFunction(kModuleOnlyEntry),
                 "module-only code should remain unavailable before its bytes load");
+            t.IsFalse(
+                runtime.hasFunction(kSecondModuleOnlyEntry),
+                "a later registered module should remain inactive before its bytes load");
             R5900Context ctx{};
             ctx.pc = kOverlapEntry;
             runtime.lookupFunction(kOverlapEntry, &ctx)(
@@ -1107,12 +1153,32 @@ void register_ps2_runtime_expansion_tests()
                 runtime.memory().getRDRAM() + kMatchAddress,
                 kMatchBytes,
                 sizeof(kMatchBytes));
+            std::memcpy(
+                runtime.memory().getRDRAM() + kSecondMatchAddress,
+                kSecondMatchBytes,
+                sizeof(kSecondMatchBytes));
             t.IsTrue(
                 runtime.hasFunction(kModuleOnlyEntry),
                 "module-only code should become available after the exact signature loads");
             t.IsTrue(
                 runtime.hasFunction(0x80000000u | kModuleOnlyEntry),
                 "module dispatch should normalize a direct-mapped EE alias");
+            t.IsTrue(
+                runtime.hasFunction(kSecondModuleOnlyEntry),
+                "bounded module iteration should retain a later registered descriptor");
+            for (const uint32_t address :
+                 {kBelowModuleEntry,
+                  kModuleGapEntry,
+                  kAboveModuleEntry})
+            {
+                std::memset(&ctx, 0, sizeof(ctx));
+                ctx.pc = address;
+                runtime.lookupFunction(address, &ctx)(
+                    runtime.memory().getRDRAM(), &ctx, &runtime);
+                t.Equals(
+                    ::getRegU32(&ctx, 2), 0x11111111u,
+                    "module range rejection should preserve primary lookup outside exact entries");
+            }
             std::memset(&ctx, 0, sizeof(ctx));
             ctx.pc = kOverlapEntry;
             runtime.lookupFunction(kOverlapEntry, &ctx)(
@@ -1213,6 +1279,9 @@ void register_ps2_runtime_expansion_tests()
             t.IsFalse(
                 runtime.hasFunction(kModuleOnlyEntry),
                 "a translated signature write should deactivate the stale module immediately");
+            t.IsTrue(
+                runtime.hasFunction(kSecondModuleOnlyEntry),
+                "mutating one module signature should not deactivate another registered range");
             std::memset(&ctx, 0, sizeof(ctx));
             ctx.pc = kOverlapEntry;
             runtime.lookupFunction(kOverlapEntry, &ctx)(
