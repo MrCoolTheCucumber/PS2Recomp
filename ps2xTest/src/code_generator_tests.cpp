@@ -1940,7 +1940,7 @@ void register_code_generator_tests()
             t.Equals(
                 countOccurrences(
                     generated,
-                    "serviceEeEventsAtBlockBoundary(rdram, ctx)"),
+                    "serviceEeEventsAtGeneratedBlockBoundary(rdram, ctx)"),
                 static_cast<size_t>(2u),
                 "taken and not-taken paths should each service the completed EE block");
             t.Equals(
@@ -2105,14 +2105,14 @@ void register_code_generator_tests()
             t.Equals(
                 countOccurrences(
                     generated,
-                    "runtime->serviceEeEventsAtBlockBoundary(rdram, ctx);"),
+                    "runtime->serviceEeEventsAtGeneratedBlockBoundary(rdram, ctx);"),
                 static_cast<size_t>(2u),
                 "each mutually exclusive branch path should commit time and service events");
         });
 
         tc.Run("post-delay boundaries validate the resolved branch PC", [](TestCase &t) {
             constexpr std::string_view boundary =
-                "runtime->serviceEeEventsAtBlockBoundary(rdram, ctx);";
+                "runtime->serviceEeEventsAtGeneratedBlockBoundary(rdram, ctx);";
             constexpr std::string_view validation =
                 "runtime->validateEeInstructionFetchPolicy<Mode>(ctx, ctx->pc);";
 
@@ -3137,7 +3137,7 @@ void register_code_generator_tests()
                 "runtime->validateEeGuestBranchTargetPolicy<Mode>("
                 "ctx, jumpTarget, PS2Runtime::GuestBranchKind::Return)");
             const size_t callbackBoundary = generated.find(
-                "runtime->serviceEeEventsAtBlockBoundary(rdram, ctx);",
+                "runtime->serviceEeEventsAtGeneratedBlockBoundary(rdram, ctx);",
                 targetValidation);
             const size_t callbackUnwind = generated.find(
                 "if (!continueGuestExecution) { return; }",

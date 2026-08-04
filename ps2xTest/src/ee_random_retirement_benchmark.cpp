@@ -44,6 +44,9 @@ namespace
     {
         ScalarReference,
         GeneratedBatch,
+        DeferredGeneratedBlocks,
+        RuntimePublishedBlocks,
+        RuntimeDeferredBlocks,
         DirectBlockTotal,
     };
 
@@ -128,6 +131,31 @@ namespace
             // publication boundary materializes the counted Random update.
             ctx->retireEeInstructions(kInstructionsPerBlock);
             ctx->finishEeInstruction();
+        }
+        else if constexpr (Strategy ==
+                           RetirementStrategy::DeferredGeneratedBlocks)
+        {
+            // Generated no-event boundaries publish timing without making
+            // Random observable. The outer benchmark publication drains the
+            // complete accumulated run once.
+            ctx->retireEeInstructions(kInstructionsPerBlock);
+        }
+        else if constexpr (Strategy ==
+                           RetirementStrategy::RuntimePublishedBlocks)
+        {
+            static PS2Runtime runtime;
+            ctx->retireEeInstructions(kInstructionsPerBlock);
+            ctx->advanceEeCycleTicks(8u);
+            runtime.serviceEeEventsAtBlockBoundary(nullptr, ctx);
+        }
+        else if constexpr (Strategy ==
+                           RetirementStrategy::RuntimeDeferredBlocks)
+        {
+            static PS2Runtime runtime;
+            ctx->retireEeInstructions(kInstructionsPerBlock);
+            ctx->advanceEeCycleTicks(8u);
+            runtime.serviceEeEventsAtGeneratedBlockBoundary(
+                nullptr, ctx);
         }
         else if constexpr (Strategy ==
                            RetirementStrategy::DirectBlockTotal)
@@ -230,6 +258,33 @@ namespace
     }
 
     extern "C" PS2_RANDOM_BENCHMARK_NOINLINE
+    void EeRandomRetirementDeferredGeneratedBlocks(
+        R5900Context *ctx,
+        uint64_t blocks)
+    {
+        runArithmeticBlocks<
+            RetirementStrategy::DeferredGeneratedBlocks>(ctx, blocks);
+    }
+
+    extern "C" PS2_RANDOM_BENCHMARK_NOINLINE
+    void EeRandomRetirementRuntimePublishedBlocks(
+        R5900Context *ctx,
+        uint64_t blocks)
+    {
+        runArithmeticBlocks<
+            RetirementStrategy::RuntimePublishedBlocks>(ctx, blocks);
+    }
+
+    extern "C" PS2_RANDOM_BENCHMARK_NOINLINE
+    void EeRandomRetirementRuntimeDeferredBlocks(
+        R5900Context *ctx,
+        uint64_t blocks)
+    {
+        runArithmeticBlocks<
+            RetirementStrategy::RuntimeDeferredBlocks>(ctx, blocks);
+    }
+
+    extern "C" PS2_RANDOM_BENCHMARK_NOINLINE
     void EeRandomRetirementDirectBlockTotal(
         R5900Context *ctx,
         uint64_t blocks)
@@ -238,13 +293,22 @@ namespace
             RetirementStrategy::DirectBlockTotal>(ctx, blocks);
     }
 
-    constexpr std::array<BenchmarkCase, 3u> kCases{{
+    constexpr std::array<BenchmarkCase, 6u> kCases{{
         {"scalar_reference",
          RetirementStrategy::ScalarReference,
          EeRandomRetirementScalarReference},
         {"generated_batch",
          RetirementStrategy::GeneratedBatch,
          EeRandomRetirementGeneratedBatch},
+        {"deferred_generated_blocks",
+         RetirementStrategy::DeferredGeneratedBlocks,
+         EeRandomRetirementDeferredGeneratedBlocks},
+        {"runtime_published_blocks",
+         RetirementStrategy::RuntimePublishedBlocks,
+         EeRandomRetirementRuntimePublishedBlocks},
+        {"runtime_deferred_blocks",
+         RetirementStrategy::RuntimeDeferredBlocks,
+         EeRandomRetirementRuntimeDeferredBlocks},
         {"direct_block_total",
          RetirementStrategy::DirectBlockTotal,
          EeRandomRetirementDirectBlockTotal},
@@ -328,6 +392,12 @@ namespace
             return "scalar_reference";
         case RetirementStrategy::GeneratedBatch:
             return "production_counted_batch";
+        case RetirementStrategy::DeferredGeneratedBlocks:
+            return "deferred_generated_blocks";
+        case RetirementStrategy::RuntimePublishedBlocks:
+            return "runtime_published_blocks";
+        case RetirementStrategy::RuntimeDeferredBlocks:
+            return "runtime_deferred_blocks";
         case RetirementStrategy::DirectBlockTotal:
             return "benchmark_direct_total";
         }

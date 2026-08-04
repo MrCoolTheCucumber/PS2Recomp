@@ -155,7 +155,7 @@ namespace ps2recomp
     void ControlFlowEmitter::emitBasicBlockBoundary(std::string_view indent)
     {
         m_ss << fmt::format(
-            "{}runtime->serviceEeEventsAtBlockBoundary(rdram, ctx);\n",
+            "{}runtime->serviceEeEventsAtGeneratedBlockBoundary(rdram, ctx);\n",
             indent);
     }
 

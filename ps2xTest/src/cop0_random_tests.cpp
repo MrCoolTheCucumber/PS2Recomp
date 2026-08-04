@@ -525,6 +525,89 @@ void register_cop0_random_tests()
                 11u,
                 "an EE block boundary should retire its pending instruction");
 
+            R5900Context generatedCtx{};
+            generatedCtx.cop0_wired = 10u;
+            generatedCtx.cop0_random = 12u;
+            generatedCtx.beginEeInstruction();
+            runtime.serviceEeEventsAtGeneratedBlockBoundary(
+                nullptr, &generatedCtx);
+            t.Equals(
+                generatedCtx.cop0_random,
+                12u,
+                "a generated no-event boundary should defer Random materialization");
+            t.Equals(
+                generatedCtx.cop0_random_pending_retirements,
+                1u,
+                "a generated no-event boundary should retain counted retirement work");
+
+            runtime.writeCop0Count(
+                nullptr, &generatedCtx, 10u);
+            runtime.writeCop0Compare(
+                nullptr, &generatedCtx, 13u);
+            generatedCtx.retireEeInstructions(3u);
+            generatedCtx.advanceEeCycleTicks(3u * 8u);
+            runtime.serviceEeEventsAtGeneratedBlockBoundary(
+                nullptr, &generatedCtx);
+            t.Equals(
+                generatedCtx.cop0_random,
+                46u,
+                "a due generated event should materialize all pending retirements first");
+            t.Equals(
+                generatedCtx.cop0_random_pending_retirements,
+                0u,
+                "a due generated event should publish no stale Random work");
+            t.IsTrue(
+                (generatedCtx.cop0_cause & 0x00008000u) != 0u,
+                "the generated boundary should still service the due COP0 timer");
+
+            R5900Context checkpointCtx{};
+            checkpointCtx.cop0_wired = 10u;
+            checkpointCtx.cop0_random = 12u;
+            checkpointCtx.retireEeInstructions(3u);
+            runtime.requestGuestPreemption();
+            t.Equals(
+                runtime.checkpointGuestExecution(&checkpointCtx),
+                PS2GuestCheckpointResult::ExitToDispatcher,
+                "an explicit checkpoint should unwind generated execution");
+            t.Equals(
+                checkpointCtx.cop0_random,
+                47u,
+                "a real checkpoint should materialize pending Random work");
+            t.Equals(
+                checkpointCtx.cop0_random_pending_retirements,
+                0u,
+                "a real checkpoint should publish no pending retirements");
+
+            R5900Context continueCtx{};
+            continueCtx.cop0_wired = 10u;
+            continueCtx.cop0_random = 12u;
+            bool observedContinue = false;
+            for (uint32_t attempt = 0u;
+                 attempt < 2u && !observedContinue;
+                 ++attempt)
+            {
+                continueCtx.retireEeInstructions(1u);
+                const uint32_t randomBefore =
+                    continueCtx.cop0_random;
+                if (runtime.checkpointGuestExecution(
+                        &continueCtx) ==
+                    PS2GuestCheckpointResult::Continue)
+                {
+                    observedContinue = true;
+                    t.Equals(
+                        continueCtx.cop0_random,
+                        randomBefore,
+                        "an ordinary checkpoint probe should not materialize Random");
+                    t.Equals(
+                        continueCtx.cop0_random_pending_retirements,
+                        1u,
+                        "an ordinary checkpoint probe should retain pending work");
+                }
+            }
+            t.IsTrue(
+                observedContinue,
+                "a bounded checkpoint probe should observe the common continue path");
+
             R5900Context faultCtx{};
             faultCtx.pc = 0x00140000u;
             faultCtx.cop0_wired = 10u;

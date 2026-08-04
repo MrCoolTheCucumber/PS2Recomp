@@ -7890,6 +7890,32 @@ void PS2Runtime::serviceEeEventsAtBlockBoundary(
     serviceEeEventsAtTick(rdram, ctx, eeCycleTick);
 }
 
+void PS2Runtime::serviceEeEventsAtGeneratedBlockBoundary(
+    uint8_t *rdram, R5900Context *ctx)
+{
+    debugArmVu0Traces(ctx);
+    if (!ctx)
+    {
+        return;
+    }
+
+    // Generated Fast-mode code may carry a counted Random retirement run
+    // across an internal control-flow edge. Block timing and issue state are
+    // still published at every edge; Random becomes observable only when a
+    // due event can enter callbacks/exceptions or another explicit
+    // publication barrier is reached.
+    flushEeInstructionIssue(ctx);
+    const ps2x::timing::EeTick eeCycleTick =
+        publishEeElapsed(ctx->finishEeBasicBlock());
+    if (!m_eeEventScheduler.deadlineDue(eeCycleTick))
+    {
+        return;
+    }
+
+    ctx->finishEeInstruction();
+    serviceEeEventsAtTick(rdram, ctx, eeCycleTick);
+}
+
 void PS2Runtime::serviceEeVSyncAtEvent(
     uint8_t *rdram,
     const ps2x::timing::EeEventService &service)
@@ -12538,6 +12564,14 @@ PS2Runtime::checkpointGuestExecution(
         !periodicCheckpoint)
     {
         return PS2GuestCheckpointResult::Continue;
+    }
+
+    // The common generated back-edge check is not an architectural
+    // publication point. A real checkpoint is: it can release ownership,
+    // suspend the continuation, or unwind to the outer dispatcher.
+    if (ctx)
+    {
+        ctx->finishEeInstruction();
     }
 
     if (periodicCheckpoint)

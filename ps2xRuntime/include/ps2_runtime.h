@@ -1666,6 +1666,9 @@ public:
         const R5900Context *ctx) const noexcept;
     void serviceEeEventsAtBlockBoundary(uint8_t *rdram,
                                         R5900Context *ctx);
+    void serviceEeEventsAtGeneratedBlockBoundary(
+        uint8_t *rdram,
+        R5900Context *ctx);
     void configureEeVSyncVideoMode(
         uint32_t videoMode,
         bool interlaced);
