@@ -2572,6 +2572,7 @@ bool PS2Memory::initialize(size_t ramSize)
     m_gifCopyCount.store(0, std::memory_order_relaxed);
     m_gsWriteCount.store(0, std::memory_order_relaxed);
     m_vifWriteCount.store(0, std::memory_order_relaxed);
+    resetTlbTranslationCacheStats();
     {
         std::lock_guard<std::mutex> lock(m_dmacMutex);
         m_dmacChannels = {};
@@ -2628,6 +2629,7 @@ bool PS2Memory::initialize(size_t ramSize)
         else
         {
             m_tlbEntries.assign(48, EeTlbEntry{});
+            advanceTlbMappingGeneration();
         }
 
         // Allocate IOP RAM
@@ -2823,20 +2825,291 @@ const uint8_t *PS2Memory::mapVuMemory(uint32_t physAddr, uint32_t size, uint32_t
 
 uint32_t PS2Memory::translateAddress(
     uint32_t virtualAddress,
-    EeAddressTranslationContext translation)
+    EeAddressTranslationContext translation,
+    bool writeAccess,
+    uint32_t accessSize)
 {
-    return translateAddressImpl(
+    return resolveAddress(
                virtualAddress,
                translation,
-               false)
+               writeAccess,
+               accessSize)
         .physicalAddress;
+}
+
+PS2Memory::EeTranslatedAddress PS2Memory::resolveAddress(
+    uint32_t virtualAddress,
+    EeAddressTranslationContext translation,
+    bool writeAccess,
+    uint32_t accessSize)
+{
+    return translateAddressImpl(
+        virtualAddress,
+        translation,
+        writeAccess,
+        accessSize);
+}
+
+uint32_t PS2Memory::translateAddressUncached(
+    uint32_t virtualAddress,
+    EeAddressTranslationContext translation,
+    bool writeAccess,
+    uint32_t accessSize)
+{
+    return resolveAddressUncached(
+               virtualAddress,
+               translation,
+               writeAccess,
+               accessSize)
+        .physicalAddress;
+}
+
+PS2Memory::EeTranslatedAddress
+PS2Memory::resolveAddressUncached(
+    uint32_t virtualAddress,
+    EeAddressTranslationContext translation,
+    bool writeAccess,
+    uint32_t accessSize)
+{
+    return translateAddressImpl(
+        virtualAddress,
+        translation,
+        writeAccess,
+        accessSize,
+        false);
+}
+
+void PS2Memory::clearTlbTranslationCache() noexcept
+{
+    m_tlbTranslationCache = {};
+    m_tlbTranslationCacheNextWay = {};
+}
+
+void PS2Memory::advanceTlbMappingGeneration() noexcept
+{
+    if (m_tlbMappingGeneration ==
+        std::numeric_limits<uint64_t>::max())
+    {
+        // No stale entry may become current after generation wrap.
+        clearTlbTranslationCache();
+        m_tlbMappingGeneration = 1u;
+        return;
+    }
+    ++m_tlbMappingGeneration;
+}
+
+void PS2Memory::recordTlbTranslationSlowPathFault() noexcept
+{
+    if (m_tlbTranslationCacheEnabled &&
+        m_tlbTranslationCacheDiagnosticsEnabled)
+    {
+        ++m_tlbTranslationCacheStats.slowPathFaults;
+    }
+}
+
+std::optional<PS2Memory::EeTranslatedAddress>
+PS2Memory::lookupTlbTranslationCache(
+    uint32_t virtualAddress,
+    EeAddressTranslationContext translation,
+    bool writeAccess,
+    uint32_t accessSize)
+{
+    if (!m_tlbTranslationCacheEnabled)
+    {
+        return std::nullopt;
+    }
+
+    constexpr uint32_t pageMask =
+        kTlbTranslationCachePageSize - 1u;
+    const uint32_t pageOffset = virtualAddress & pageMask;
+    const bool supportedAccessSize =
+        accessSize != 0u &&
+        accessSize <= sizeof(__m128i) &&
+        (accessSize & (accessSize - 1u)) == 0u;
+    if (!supportedAccessSize)
+    {
+        if (m_tlbTranslationCacheDiagnosticsEnabled)
+        {
+            ++m_tlbTranslationCacheStats.misses;
+        }
+        return std::nullopt;
+    }
+    if (accessSize >
+        kTlbTranslationCachePageSize - pageOffset)
+    {
+        if (m_tlbTranslationCacheDiagnosticsEnabled)
+        {
+            ++m_tlbTranslationCacheStats.intervalCrossings;
+            ++m_tlbTranslationCacheStats.misses;
+        }
+        return std::nullopt;
+    }
+    if ((virtualAddress & (accessSize - 1u)) != 0u)
+    {
+        if (m_tlbTranslationCacheDiagnosticsEnabled)
+        {
+            ++m_tlbTranslationCacheStats.misses;
+        }
+        return std::nullopt;
+    }
+
+    const uint32_t virtualPageBase =
+        virtualAddress & ~pageMask;
+    const size_t setIndex =
+        (virtualAddress >> 12u) &
+        (kTlbTranslationCacheSetCount - 1u);
+    bool generationMiss = false;
+    bool permissionMiss = false;
+    for (const EeTlbTranslationCacheEntry &entry :
+         m_tlbTranslationCache[setIndex])
+    {
+        if (!entry.valid ||
+            entry.virtualPageBase != virtualPageBase ||
+            entry.mode != translation.mode ||
+            entry.enforceOperatingMode !=
+                translation.enforceOperatingMode ||
+            entry.errorLevel != translation.errorLevel ||
+            (!entry.global && entry.asid != translation.asid))
+        {
+            continue;
+        }
+        if (entry.generation != m_tlbMappingGeneration)
+        {
+            generationMiss = true;
+            continue;
+        }
+        if (writeAccess && !entry.writable)
+        {
+            permissionMiss = true;
+            continue;
+        }
+
+        if (m_tlbTranslationCacheDiagnosticsEnabled)
+        {
+            ++m_tlbTranslationCacheStats.hits;
+        }
+        return EeTranslatedAddress{
+            entry.physicalPageBase + pageOffset,
+            entry.scratchpad,
+        };
+    }
+
+    if (m_tlbTranslationCacheDiagnosticsEnabled)
+    {
+        ++m_tlbTranslationCacheStats.misses;
+        if (generationMiss)
+        {
+            ++m_tlbTranslationCacheStats.generationMisses;
+        }
+        if (permissionMiss)
+        {
+            ++m_tlbTranslationCacheStats.permissionMisses;
+        }
+    }
+    return std::nullopt;
+}
+
+void PS2Memory::fillTlbTranslationCache(
+    uint32_t virtualAddress,
+    const EeTranslatedAddress &translated,
+    EeAddressTranslationContext translation,
+    uint32_t tlbPageSize,
+    bool global,
+    bool writable)
+{
+    if (!m_tlbTranslationCacheEnabled)
+    {
+        return;
+    }
+
+    // The mapped fast path is deliberately RDRAM-only. Scratchpad mappings
+    // retain the authoritative translator and local-memory distinction.
+    if (translated.scratchpad)
+    {
+        return;
+    }
+
+    constexpr uint32_t pageMask =
+        kTlbTranslationCachePageSize - 1u;
+    const uint32_t pageOffset = virtualAddress & pageMask;
+    if ((translated.physicalAddress & pageMask) != pageOffset)
+    {
+        return;
+    }
+    const uint32_t physicalPageBase =
+        translated.physicalAddress - pageOffset;
+    if (physicalPageBase >
+        PS2_RAM_SIZE - kTlbTranslationCachePageSize)
+    {
+        // Device and bus-error translations retain the authoritative path.
+        return;
+    }
+
+    const uint32_t virtualPageBase =
+        virtualAddress & ~pageMask;
+    const size_t setIndex =
+        (virtualAddress >> 12u) &
+        (kTlbTranslationCacheSetCount - 1u);
+    auto &set = m_tlbTranslationCache[setIndex];
+    size_t selectedWay = kTlbTranslationCacheWayCount;
+    for (size_t way = 0u;
+         way < kTlbTranslationCacheWayCount;
+         ++way)
+    {
+        EeTlbTranslationCacheEntry &entry = set[way];
+        const bool sameAddressSpace =
+            entry.valid &&
+            entry.generation == m_tlbMappingGeneration &&
+            entry.virtualPageBase == virtualPageBase &&
+            entry.mode == translation.mode &&
+            entry.enforceOperatingMode ==
+                translation.enforceOperatingMode &&
+            entry.errorLevel == translation.errorLevel &&
+            entry.global == global &&
+            (global || entry.asid == translation.asid);
+        if (sameAddressSpace)
+        {
+            selectedWay = way;
+            break;
+        }
+        if (selectedWay == kTlbTranslationCacheWayCount &&
+            entry.generation != m_tlbMappingGeneration)
+        {
+            selectedWay = way;
+        }
+    }
+    if (selectedWay == kTlbTranslationCacheWayCount)
+    {
+        selectedWay = m_tlbTranslationCacheNextWay[setIndex];
+        m_tlbTranslationCacheNextWay[setIndex] =
+            static_cast<uint8_t>(
+                (selectedWay + 1u) %
+                kTlbTranslationCacheWayCount);
+    }
+
+    set[selectedWay] = {
+        m_tlbMappingGeneration,
+        virtualPageBase,
+        physicalPageBase,
+        tlbPageSize,
+        translation.asid,
+        translation.mode,
+        translation.enforceOperatingMode,
+        translation.errorLevel,
+        true,
+        global,
+        writable,
+        translated.scratchpad,
+    };
 }
 
 PS2Memory::EeTranslatedAddress
 PS2Memory::translateAddressImpl(
     uint32_t virtualAddress,
     EeAddressTranslationContext translation,
-    bool writeAccess)
+    bool writeAccess,
+    uint32_t accessSize,
+    bool allowTlbCache)
 {
     if (!translation.permits(virtualAddress))
     {
@@ -2892,6 +3165,18 @@ PS2Memory::translateAddressImpl(
     if (translation.mapsKusegThroughTlb(virtualAddress) ||
         Ps2IsKseg23Address(virtualAddress))
     {
+        if (allowTlbCache)
+        {
+            if (const auto cached =
+                    lookupTlbTranslationCache(
+                        virtualAddress,
+                        translation,
+                        writeAccess,
+                        accessSize))
+            {
+                return *cached;
+            }
+        }
         for (const auto &entry : m_tlbEntries)
         {
             constexpr uint32_t entryHiVpnMask =
@@ -2941,22 +3226,41 @@ PS2Memory::translateAddressImpl(
                     : entry.entryLo1;
             if ((entryLo & entryLoValid) == 0u)
             {
+                if (allowTlbCache)
+                {
+                    recordTlbTranslationSlowPathFault();
+                }
                 throw PS2TlbInvalidException(
                     virtualAddress);
             }
             if (writeAccess &&
                 (entryLo & entryLoDirty) == 0u)
             {
+                if (allowTlbCache)
+                {
+                    recordTlbTranslationSlowPathFault();
+                }
                 throw PS2TlbModifiedException(
                     virtualAddress);
             }
 
             if (scratchpad)
             {
-                return {
+                const EeTranslatedAddress translated{
                     virtualAddress & 0x00003fffu,
                     true,
                 };
+                if (allowTlbCache)
+                {
+                    fillTlbTranslationCache(
+                        virtualAddress,
+                        translated,
+                        translation,
+                        0x00004000u,
+                        global,
+                        (entryLo & entryLoDirty) != 0u);
+                }
+                return translated;
             }
 
             const uint32_t pageOffsetMask =
@@ -2966,11 +3270,26 @@ PS2Memory::translateAddressImpl(
             const uint32_t pfn =
                 ((entryLo & entryLoPfnMask) >> 6u) &
                 ~pfnMask;
-            return {
+            const EeTranslatedAddress translated{
                 (pfn << 12u) |
                     (virtualAddress & pageOffsetMask),
                 false,
             };
+            if (allowTlbCache)
+            {
+                fillTlbTranslationCache(
+                    virtualAddress,
+                    translated,
+                    translation,
+                    pageSize,
+                    global,
+                    (entryLo & entryLoDirty) != 0u);
+            }
+            return translated;
+        }
+        if (allowTlbCache)
+        {
+            recordTlbTranslationSlowPathFault();
         }
         throw PS2TlbMissException(virtualAddress);
     }
@@ -3050,6 +3369,7 @@ void PS2Memory::installPostBiosTlbState()
 
     m_postBiosTlbStateConfigured = true;
     m_tlbEntries.assign(entries.begin(), entries.end());
+    advanceTlbMappingGeneration();
 }
 
 bool PS2Memory::tlbWrite(
@@ -3107,6 +3427,7 @@ bool PS2Memory::tlbWrite(
         (entry.entryHi & entryHiMask) &
         ~normalized.pageMask;
     m_tlbEntries[index] = normalized;
+    advanceTlbMappingGeneration();
     return true;
 }
 
@@ -3146,7 +3467,8 @@ uint8_t PS2Memory::read8(
     EeAddressTranslationContext translation)
 {
     const EeTranslatedAddress translated =
-        translateAddressImpl(address, translation, false);
+        translateAddressImpl(
+            address, translation, false, sizeof(uint8_t));
     const bool scratch = translated.scratchpad;
     const uint32_t physAddr = translated.physicalAddress;
     checkEePhysicalBusError(physAddr);
@@ -3187,7 +3509,8 @@ uint16_t PS2Memory::read16(
     }
 
     const EeTranslatedAddress translated =
-        translateAddressImpl(address, translation, false);
+        translateAddressImpl(
+            address, translation, false, sizeof(uint16_t));
     const bool scratch = translated.scratchpad;
     const uint32_t physAddr = translated.physicalAddress;
     checkEePhysicalBusError(physAddr);
@@ -3243,7 +3566,8 @@ uint32_t PS2Memory::read32(
     }
 
     const EeTranslatedAddress translated =
-        translateAddressImpl(address, translation, false);
+        translateAddressImpl(
+            address, translation, false, sizeof(uint32_t));
     const bool scratch = translated.scratchpad;
     const uint32_t physAddr = translated.physicalAddress;
     checkEePhysicalBusError(physAddr);
@@ -3291,7 +3615,8 @@ uint64_t PS2Memory::read64(
     }
 
     const EeTranslatedAddress translated =
-        translateAddressImpl(address, translation, false);
+        translateAddressImpl(
+            address, translation, false, sizeof(uint64_t));
     const bool scratch = translated.scratchpad;
     const uint32_t physAddr = translated.physicalAddress;
     checkEePhysicalBusError(physAddr);
@@ -3346,7 +3671,8 @@ __m128i PS2Memory::read128(
     }
 
     const EeTranslatedAddress translated =
-        translateAddressImpl(address, translation, false);
+        translateAddressImpl(
+            address, translation, false, sizeof(__m128i));
     const bool scratch = translated.scratchpad;
     const uint32_t physAddr = translated.physicalAddress;
     checkEePhysicalBusError(physAddr);
@@ -3390,7 +3716,8 @@ void PS2Memory::write8(
     EeAddressTranslationContext translation)
 {
     const EeTranslatedAddress translated =
-        translateAddressImpl(address, translation, true);
+        translateAddressImpl(
+            address, translation, true, sizeof(uint8_t));
     const bool scratch = translated.scratchpad;
     const uint32_t physAddr = translated.physicalAddress;
     checkEePhysicalBusError(physAddr);
@@ -3450,7 +3777,8 @@ void PS2Memory::write16(
     }
 
     const EeTranslatedAddress translated =
-        translateAddressImpl(address, translation, true);
+        translateAddressImpl(
+            address, translation, true, sizeof(uint16_t));
     const bool scratch = translated.scratchpad;
     const uint32_t physAddr = translated.physicalAddress;
     checkEePhysicalBusError(physAddr);
@@ -3528,7 +3856,8 @@ void PS2Memory::write32(
     }
 
     const EeTranslatedAddress translated =
-        translateAddressImpl(address, translation, true);
+        translateAddressImpl(
+            address, translation, true, sizeof(uint32_t));
     const bool scratch = translated.scratchpad;
     const uint32_t physAddr = translated.physicalAddress;
     checkEePhysicalBusError(physAddr);
@@ -3589,7 +3918,8 @@ void PS2Memory::write64(
     }
 
     const EeTranslatedAddress translated =
-        translateAddressImpl(address, translation, true);
+        translateAddressImpl(
+            address, translation, true, sizeof(uint64_t));
     const bool scratch = translated.scratchpad;
     const uint32_t physAddr = translated.physicalAddress;
     checkEePhysicalBusError(physAddr);
@@ -3674,7 +4004,8 @@ void PS2Memory::writeMasked32(
     }
 
     const EeTranslatedAddress translated =
-        translateAddressImpl(address, translation, true);
+        translateAddressImpl(
+            address, translation, true, sizeof(uint32_t));
     const bool scratch = translated.scratchpad;
     const uint32_t physAddr = translated.physicalAddress;
     checkEePhysicalBusError(physAddr);
@@ -3770,7 +4101,8 @@ void PS2Memory::writeMasked64(
     }
 
     const EeTranslatedAddress translated =
-        translateAddressImpl(address, translation, true);
+        translateAddressImpl(
+            address, translation, true, sizeof(uint64_t));
     const bool scratch = translated.scratchpad;
     const uint32_t physAddr = translated.physicalAddress;
     checkEePhysicalBusError(physAddr);
@@ -3850,7 +4182,8 @@ void PS2Memory::write128(
     }
 
     const EeTranslatedAddress translated =
-        translateAddressImpl(address, translation, true);
+        translateAddressImpl(
+            address, translation, true, sizeof(__m128i));
     const bool scratch = translated.scratchpad;
     const uint32_t physAddr = translated.physicalAddress;
     checkEePhysicalBusError(physAddr);

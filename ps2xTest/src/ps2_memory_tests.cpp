@@ -9,14 +9,112 @@
 #include "Stubs/GS.h"
 
 #include <algorithm>
+#include <array>
 #include <chrono>
 #include <cstdint>
 #include <cstring>
+#include <limits>
+#include <string>
 #include <thread>
 #include <vector>
 
 namespace
 {
+    constexpr uint32_t makeEeTlbEntryLo(
+        uint32_t pfn,
+        bool dirty,
+        bool valid,
+        bool global,
+        bool scratchpad = false)
+    {
+        return (scratchpad ? 0x80000000u : 0u) |
+               ((pfn & 0x000fffffu) << 6u) |
+               (2u << 3u) |
+               (dirty ? 0x4u : 0u) |
+               (valid ? 0x2u : 0u) |
+               (global ? 0x1u : 0u);
+    }
+
+    enum class TranslationOutcomeKind : uint8_t
+    {
+        Success,
+        AddressError,
+        TlbRefill,
+        TlbInvalid,
+        TlbModified,
+    };
+
+    struct TranslationOutcome
+    {
+        TranslationOutcomeKind kind =
+            TranslationOutcomeKind::Success;
+        PS2Memory::EeTranslatedAddress translated{};
+        uint32_t faultAddress = 0u;
+
+        bool operator==(
+            const TranslationOutcome &) const = default;
+    };
+
+    TranslationOutcome captureTranslation(
+        const std::function<PS2Memory::EeTranslatedAddress()> &operation)
+    {
+        try
+        {
+            return {
+                TranslationOutcomeKind::Success,
+                operation(),
+                0u,
+            };
+        }
+        catch (const PS2AddressErrorException &error)
+        {
+            return {
+                TranslationOutcomeKind::AddressError,
+                {},
+                error.virtualAddress(),
+            };
+        }
+        catch (const PS2TlbFaultException &error)
+        {
+            TranslationOutcomeKind kind =
+                TranslationOutcomeKind::TlbRefill;
+            switch (error.kind())
+            {
+            case PS2TlbFaultKind::Refill:
+                kind = TranslationOutcomeKind::TlbRefill;
+                break;
+            case PS2TlbFaultKind::Invalid:
+                kind = TranslationOutcomeKind::TlbInvalid;
+                break;
+            case PS2TlbFaultKind::Modified:
+                kind = TranslationOutcomeKind::TlbModified;
+                break;
+            }
+            return {kind, {}, error.virtualAddress()};
+        }
+    }
+
+    class DeterministicTranslationRng
+    {
+    public:
+        explicit DeterministicTranslationRng(uint64_t seed)
+            : m_state(seed)
+        {
+        }
+
+        uint32_t next()
+        {
+            m_state ^= m_state >> 12u;
+            m_state ^= m_state << 25u;
+            m_state ^= m_state >> 27u;
+            return static_cast<uint32_t>(
+                (m_state * 0x2545f4914f6cdd1dull) >> 32u);
+        }
+
+    private:
+        uint64_t m_state;
+    };
+
     uint32_t makeVifCmd(uint8_t opcode, uint8_t num, uint16_t imm)
     {
         return (static_cast<uint32_t>(opcode) << 24) |
@@ -201,6 +299,1049 @@ void register_ps2_memory_tests()
             t.Equals(mem.translateAddress(0x30105678u), 0x00105678u, "0x3010 accelerated alias should map to RAM");
             t.Equals(mem.translateAddress(PS2_SCRATCHPAD_BASE + 0x123u), 0x123u, "scratchpad base should translate to local offset");
             t.Equals(mem.translateAddress(PS2_SCRATCHPAD_ALIAS_BASE + 0x123u), 0x123u, "0xF000 scratchpad alias should translate to local offset");
+        });
+
+        tc.Run("TLB mapping generation advances on every accepted mutation", [](TestCase &t)
+        {
+            PS2Memory mem;
+            const uint64_t constructedGeneration =
+                mem.tlbMappingGeneration();
+            t.IsTrue(
+                mem.initialize(),
+                "PS2Memory initialize should succeed");
+            const uint64_t initializedGeneration =
+                mem.tlbMappingGeneration();
+            t.Equals(
+                initializedGeneration,
+                constructedGeneration + 1u,
+                "initial TLB reset should advance the mapping generation");
+
+            const bool rejected = mem.tlbWrite(
+                static_cast<uint32_t>(mem.tlbEntryCount()),
+                EeTlbEntry{});
+            t.IsFalse(
+                rejected,
+                "an out-of-range TLB write should be rejected");
+            t.Equals(
+                mem.tlbMappingGeneration(),
+                initializedGeneration,
+                "a rejected TLB write must not change the generation");
+
+            t.IsTrue(
+                mem.tlbWrite(3u, EeTlbEntry{}),
+                "an in-range TLB write should succeed");
+            t.Equals(
+                mem.tlbMappingGeneration(),
+                initializedGeneration + 1u,
+                "an accepted TLB write should advance the generation");
+
+            const uint64_t beforeBulkInstall =
+                mem.tlbMappingGeneration();
+            mem.installPostBiosTlbState();
+            t.Equals(
+                mem.tlbMappingGeneration(),
+                beforeBulkInstall + 1u,
+                "a post-BIOS bulk install should advance the generation once");
+
+            const uint64_t beforeReset =
+                mem.tlbMappingGeneration();
+            t.IsTrue(
+                mem.initialize(),
+                "PS2Memory reinitialize should succeed");
+            t.Equals(
+                mem.tlbMappingGeneration(),
+                beforeReset + 1u,
+                "a configured memory reset should reinstall and invalidate the TLB once");
+        });
+
+        tc.Run("mapped RDRAM cache hits and TLB writes invalidate stale translations", [](TestCase &t)
+        {
+            constexpr uint32_t virtualBase = 0x00400000u;
+            constexpr uint32_t virtualAddress =
+                virtualBase + 0x234u;
+            constexpr uint8_t asid = 0x31u;
+            const EeAddressTranslationContext translation =
+                EeAddressTranslationContext::fromCop0Status(
+                    0x10u, asid);
+
+            PS2Memory mem;
+            t.IsTrue(
+                mem.initialize(),
+                "PS2Memory initialize should succeed");
+            t.IsTrue(
+                mem.tlbWrite(
+                    7u,
+                    EeTlbEntry{
+                        0u,
+                        virtualBase | asid,
+                        makeEeTlbEntryLo(
+                            0x00100u, true, true, false),
+                        makeEeTlbEntryLo(
+                            0x00101u, true, true, false),
+                    }),
+                "the first non-identity mapping should install");
+
+            t.Equals(
+                mem.tlbTranslationCacheStats().hits,
+                0u,
+                "cache diagnostics should be off by default");
+            mem.setTlbTranslationCacheDiagnosticsEnabled(true);
+            mem.resetTlbTranslationCacheStats();
+
+            const uint32_t first = mem.translateAddress(
+                virtualAddress, translation);
+            const uint32_t reference =
+                mem.translateAddressUncached(
+                    virtualAddress, translation);
+            const uint32_t second = mem.translateAddress(
+                virtualAddress, translation);
+            t.Equals(
+                first,
+                0x00100234u,
+                "the initial slow lookup should preserve a non-identity PFN");
+            t.Equals(
+                second,
+                reference,
+                "a cache hit should equal the authoritative uncached result");
+            EeTlbTranslationCacheStats stats =
+                mem.tlbTranslationCacheStats();
+            t.Equals(
+                stats.misses,
+                1u,
+                "the first lookup should miss once");
+            t.Equals(
+                stats.hits,
+                1u,
+                "the repeated lookup should hit once");
+
+            const uint64_t beforeReplacement =
+                mem.tlbMappingGeneration();
+            t.IsTrue(
+                mem.tlbWrite(
+                    7u,
+                    EeTlbEntry{
+                        0u,
+                        virtualBase | asid,
+                        makeEeTlbEntryLo(
+                            0x00200u, true, true, false),
+                        makeEeTlbEntryLo(
+                            0x00201u, true, true, false),
+                    }),
+                "the replacement mapping should install");
+            t.Equals(
+                mem.tlbMappingGeneration(),
+                beforeReplacement + 1u,
+                "TLB replacement should publish a new generation");
+            t.Equals(
+                mem.translateAddress(virtualAddress, translation),
+                0x00200234u,
+                "a stale cache entry must not survive replacement");
+            t.Equals(
+                mem.translateAddress(virtualAddress, translation),
+                0x00200234u,
+                "the replacement mapping should become cacheable");
+            stats = mem.tlbTranslationCacheStats();
+            t.Equals(
+                stats.generationMisses,
+                1u,
+                "the replaced mapping should be rejected by generation");
+            t.Equals(
+                stats.hits,
+                2u,
+                "the replacement should hit after one refill");
+
+            t.IsTrue(
+                mem.tlbWrite(
+                    8u,
+                    EeTlbEntry{
+                        0u,
+                        0x00600000u | asid,
+                        makeEeTlbEntryLo(
+                            0x00300u, true, true, false),
+                        makeEeTlbEntryLo(
+                            0x00301u, true, true, false),
+                    }),
+                "an unrelated mapping should install");
+            t.Equals(
+                mem.translateAddress(virtualAddress, translation),
+                0x00200234u,
+                "global generation invalidation should retain the authoritative mapping");
+            stats = mem.tlbTranslationCacheStats();
+            t.Equals(
+                stats.generationMisses,
+                2u,
+                "an unrelated TLB write should invalidate prior cache generations");
+
+            t.IsTrue(
+                mem.tlbWrite(
+                    7u,
+                    EeTlbEntry{
+                        0u,
+                        virtualBase | asid,
+                        makeEeTlbEntryLo(
+                            0x00200u, true, false, false),
+                        makeEeTlbEntryLo(
+                            0x00201u, true, false, false),
+                    }),
+                "an invalid replacement should install");
+            bool invalidRaised = false;
+            try
+            {
+                (void)mem.translateAddress(
+                    virtualAddress, translation);
+            }
+            catch (const PS2TlbInvalidException &error)
+            {
+                invalidRaised =
+                    error.virtualAddress() == virtualAddress;
+            }
+            t.IsTrue(
+                invalidRaised,
+                "an invalid replacement must fault instead of returning stale RDRAM");
+            stats = mem.tlbTranslationCacheStats();
+            t.Equals(
+                stats.slowPathFaults,
+                1u,
+                "the invalid replacement should be counted as one slow-path fault");
+
+            mem.setTlbTranslationCacheEnabled(false);
+            mem.resetTlbTranslationCacheStats();
+            t.IsTrue(
+                mem.tlbWrite(
+                    7u,
+                    EeTlbEntry{
+                        0u,
+                        virtualBase | asid,
+                        makeEeTlbEntryLo(
+                            0x00400u, true, true, false),
+                        makeEeTlbEntryLo(
+                            0x00401u, true, true, false),
+                    }),
+                "the forced-uncached mapping should install");
+            t.Equals(
+                mem.translateAddress(virtualAddress, translation),
+                0x00400234u,
+                "disabling the cache should retain authoritative translation");
+            stats = mem.tlbTranslationCacheStats();
+            t.Equals(
+                stats.hits + stats.misses,
+                0u,
+                "forced-uncached translation should not report cache probes");
+        });
+
+        tc.Run("mapped cache preserves ASID Global and write permissions", [](TestCase &t)
+        {
+            constexpr uint32_t virtualBase = 0x00800000u;
+            constexpr uint32_t virtualAddress =
+                virtualBase + 0x180u;
+            constexpr uint8_t firstAsid = 0x11u;
+            constexpr uint8_t secondAsid = 0x22u;
+            const auto firstTranslation =
+                EeAddressTranslationContext::fromCop0Status(
+                    0x10u, firstAsid);
+            const auto secondTranslation =
+                EeAddressTranslationContext::fromCop0Status(
+                    0x10u, secondAsid);
+
+            PS2Memory mem;
+            t.IsTrue(
+                mem.initialize(),
+                "PS2Memory initialize should succeed");
+            t.IsTrue(
+                mem.tlbWrite(
+                    10u,
+                    EeTlbEntry{
+                        0u,
+                        virtualBase | firstAsid,
+                        makeEeTlbEntryLo(
+                            0x00500u, false, true, false),
+                        makeEeTlbEntryLo(
+                            0x00501u, false, true, false),
+                    }),
+                "the read-only ASID mapping should install");
+            t.IsTrue(
+                mem.tlbWrite(
+                    11u,
+                    EeTlbEntry{
+                        0u,
+                        virtualBase | secondAsid,
+                        makeEeTlbEntryLo(
+                            0x00600u, true, true, false),
+                        makeEeTlbEntryLo(
+                            0x00601u, true, true, false),
+                    }),
+                "the writable ASID mapping should install");
+            mem.setTlbTranslationCacheDiagnosticsEnabled(true);
+            mem.resetTlbTranslationCacheStats();
+
+            t.Equals(
+                mem.translateAddress(
+                    virtualAddress, firstTranslation),
+                0x00500180u,
+                "the first ASID should select its own PFN");
+            t.Equals(
+                mem.translateAddress(
+                    virtualAddress, secondTranslation),
+                0x00600180u,
+                "the second ASID should not reuse the first cache entry");
+            t.Equals(
+                mem.translateAddress(
+                    virtualAddress, firstTranslation),
+                0x00500180u,
+                "both conflicting ASIDs should remain independently cacheable");
+
+            bool modifiedRaised = false;
+            try
+            {
+                mem.write32(
+                    virtualAddress,
+                    0x12345678u,
+                    0u,
+                    firstTranslation);
+            }
+            catch (const PS2TlbModifiedException &error)
+            {
+                modifiedRaised =
+                    error.virtualAddress() == virtualAddress;
+            }
+            t.IsTrue(
+                modifiedRaised,
+                "a cached read-only mapping must retain the Modified fault");
+            EeTlbTranslationCacheStats stats =
+                mem.tlbTranslationCacheStats();
+            t.Equals(
+                stats.permissionMisses,
+                1u,
+                "a cached clean mapping should reject write permission once");
+            t.Equals(
+                stats.slowPathFaults,
+                1u,
+                "the authoritative Modified fault should remain on the slow path");
+
+            t.IsTrue(
+                mem.tlbWrite(
+                    10u,
+                    EeTlbEntry{
+                        0u,
+                        virtualBase | firstAsid,
+                        makeEeTlbEntryLo(
+                            0x00700u, true, true, true),
+                        makeEeTlbEntryLo(
+                            0x00701u, true, true, true),
+                    }),
+                "the global writable replacement should install");
+            t.Equals(
+                mem.translateAddress(
+                    virtualAddress, firstTranslation),
+                0x00700180u,
+                "the global mapping should refill for its original ASID");
+            t.Equals(
+                mem.translateAddress(
+                    virtualAddress, secondTranslation),
+                0x00700180u,
+                "a global cache entry should ignore the live ASID");
+
+            const auto userKseg2 =
+                EeAddressTranslationContext::fromCop0Status(
+                    0x10u, firstAsid);
+            bool addressErrorRaised = false;
+            try
+            {
+                (void)mem.translateAddress(
+                    0xC0000180u, userKseg2);
+            }
+            catch (const PS2AddressErrorException &error)
+            {
+                addressErrorRaised =
+                    error.virtualAddress() == 0xC0000180u;
+            }
+            t.IsTrue(
+                addressErrorRaised,
+                "operating-mode checks must run before any cache lookup");
+        });
+
+        tc.Run("mapped cache preserves every PageMask and access interval", [](TestCase &t)
+        {
+            constexpr std::array<uint32_t, 7u> maskFields{
+                0x000u,
+                0x003u,
+                0x00fu,
+                0x03fu,
+                0x0ffu,
+                0x3ffu,
+                0xfffu,
+            };
+            constexpr uint32_t virtualBase = 0x04000000u;
+            constexpr uint8_t asid = 0x5au;
+            const auto translation =
+                EeAddressTranslationContext::fromCop0Status(
+                    0x10u, asid);
+
+            PS2Memory mem;
+            t.IsTrue(
+                mem.initialize(),
+                "PS2Memory initialize should succeed");
+            mem.setTlbTranslationCacheDiagnosticsEnabled(true);
+
+            for (const uint32_t maskField : maskFields)
+            {
+                const uint32_t pageMask =
+                    maskField << 13u;
+                const uint32_t pageSize =
+                    (maskField + 1u) << 12u;
+                const uint32_t subpageOffset =
+                    pageSize - 0x1000u + 0x120u;
+                t.IsTrue(
+                    mem.tlbWrite(
+                        14u,
+                        EeTlbEntry{
+                            pageMask,
+                            virtualBase | asid,
+                            makeEeTlbEntryLo(
+                                0x00000u, true, true, false),
+                            makeEeTlbEntryLo(
+                                0x01000u, true, true, false),
+                        }),
+                    "the PageMask mapping should install");
+
+                const uint32_t evenAddress =
+                    virtualBase + subpageOffset;
+                const uint32_t oddAddress =
+                    virtualBase + pageSize + subpageOffset;
+                const auto evenReference =
+                    mem.resolveAddressUncached(
+                        evenAddress, translation, false, 16u);
+                const auto oddReference =
+                    mem.resolveAddressUncached(
+                        oddAddress, translation, false, 16u);
+                const std::string suffix =
+                    " for PageMask field " +
+                    std::to_string(maskField);
+
+                t.Equals(
+                    mem.resolveAddress(
+                        evenAddress, translation, false, 16u),
+                    evenReference,
+                    "the even page should fill from the authoritative mapping" +
+                        suffix);
+                t.Equals(
+                    mem.resolveAddress(
+                        evenAddress, translation, false, 16u),
+                    evenReference,
+                    "the even page should preserve its cached PFN and offset" +
+                        suffix);
+                t.Equals(
+                    mem.resolveAddress(
+                        oddAddress, translation, false, 16u),
+                    oddReference,
+                    "the odd page should fill from the authoritative mapping" +
+                        suffix);
+                t.Equals(
+                    mem.resolveAddress(
+                        oddAddress, translation, false, 16u),
+                    oddReference,
+                    "the odd page should preserve its cached PFN and offset" +
+                        suffix);
+            }
+
+            constexpr uint32_t boundaryAddress =
+                virtualBase + 0x0ff0u;
+            t.IsTrue(
+                mem.tlbWrite(
+                    14u,
+                    EeTlbEntry{
+                        0u,
+                        virtualBase | asid,
+                        makeEeTlbEntryLo(
+                            0x00100u, true, true, false),
+                        makeEeTlbEntryLo(
+                            0x00101u, true, true, false),
+                    }),
+                "the boundary mapping should install");
+            mem.resetTlbTranslationCacheStats();
+
+            const auto boundaryReference =
+                mem.resolveAddressUncached(
+                    boundaryAddress, translation, false, 16u);
+            t.Equals(
+                mem.resolveAddress(
+                    boundaryAddress, translation, false, 16u),
+                boundaryReference,
+                "a 128-bit access ending at the subpage boundary should fill");
+            t.Equals(
+                mem.resolveAddress(
+                    boundaryAddress, translation, false, 16u),
+                boundaryReference,
+                "a 128-bit access ending at the subpage boundary should hit");
+
+            constexpr uint32_t crossingAddress =
+                virtualBase + 0x0ff8u;
+            t.Equals(
+                mem.resolveAddress(
+                    crossingAddress, translation, false, 16u),
+                mem.resolveAddressUncached(
+                    crossingAddress, translation, false, 16u),
+                "a cross-boundary access should fall back without changing translation");
+            constexpr uint32_t unalignedAddress =
+                virtualBase + 0x0101u;
+            t.Equals(
+                mem.resolveAddress(
+                    unalignedAddress, translation, false, 4u),
+                mem.resolveAddressUncached(
+                    unalignedAddress, translation, false, 4u),
+                "an unaligned access should fall back without changing translation");
+
+            const EeTlbTranslationCacheStats stats =
+                mem.tlbTranslationCacheStats();
+            t.Equals(
+                stats.hits,
+                1u,
+                "only the repeated complete boundary access should hit");
+            t.Equals(
+                stats.misses,
+                3u,
+                "the fill boundary crossing and unaligned access should miss");
+            t.Equals(
+                stats.intervalCrossings,
+                1u,
+                "only the access spanning two 4 KiB intervals should cross");
+        });
+
+        tc.Run("mapped cache keeps scratchpad and fault paths authoritative", [](TestCase &t)
+        {
+            constexpr uint8_t asid = 0x2du;
+            constexpr uint32_t scratchVirtualBase = 0x00600000u;
+            constexpr uint32_t scratchAddress =
+                scratchVirtualBase + 0x0240u;
+            constexpr uint32_t faultVirtualBase = 0x00800000u;
+            constexpr uint32_t faultAddress =
+                faultVirtualBase + 0x0180u;
+            const auto translation =
+                EeAddressTranslationContext::fromCop0Status(
+                    0x10u, asid);
+
+            PS2Memory mem;
+            t.IsTrue(
+                mem.initialize(),
+                "PS2Memory initialize should succeed");
+            t.IsTrue(
+                mem.tlbWrite(
+                    16u,
+                    EeTlbEntry{
+                        0u,
+                        scratchVirtualBase | asid,
+                        makeEeTlbEntryLo(
+                            0u, true, true, false, true),
+                        makeEeTlbEntryLo(
+                            0u, true, true, false),
+                    }),
+                "the mapped scratchpad entry should install");
+            mem.setTlbTranslationCacheDiagnosticsEnabled(true);
+            mem.resetTlbTranslationCacheStats();
+
+            const auto scratchReference =
+                mem.resolveAddressUncached(
+                    scratchAddress, translation, true, 4u);
+            t.Equals(
+                mem.resolveAddress(
+                    scratchAddress, translation, true, 4u),
+                scratchReference,
+                "mapped scratchpad translation should equal the forced slow path");
+            t.Equals(
+                mem.resolveAddress(
+                    scratchAddress, translation, true, 4u),
+                scratchReference,
+                "mapped scratchpad translation should remain authoritative");
+            t.IsTrue(
+                scratchReference.scratchpad,
+                "the detailed result should preserve scratchpad storage");
+            t.Equals(
+                mem.tlbTranslationCacheStats().hits,
+                0u,
+                "mapped scratchpad must not become an RDRAM cache hit");
+            t.Equals(
+                mem.tlbTranslationCacheStats().misses,
+                2u,
+                "each mapped scratchpad lookup should use the slow translator");
+
+            mem.write32(
+                scratchAddress,
+                0x89abcdefu,
+                0u,
+                translation);
+            uint32_t scratchValue = 0u;
+            std::memcpy(
+                &scratchValue,
+                mem.getScratchpad() + 0x0240u,
+                sizeof(scratchValue));
+            t.Equals(
+                scratchValue,
+                0x89abcdefu,
+                "mapped scratchpad stores should retain local-memory routing");
+
+            t.IsTrue(
+                mem.tlbWrite(
+                    17u,
+                    EeTlbEntry{
+                        0u,
+                        faultVirtualBase | asid,
+                        makeEeTlbEntryLo(
+                            0x00100u, true, true, false),
+                        makeEeTlbEntryLo(
+                            0x00101u, true, true, false),
+                    }),
+                "the initial RDRAM mapping should install");
+            t.Equals(
+                mem.translateAddress(faultAddress, translation),
+                0x00100180u,
+                "the initial RDRAM mapping should fill");
+            t.Equals(
+                mem.translateAddress(faultAddress, translation),
+                0x00100180u,
+                "the initial RDRAM mapping should hit");
+
+            t.IsTrue(
+                mem.tlbWrite(
+                    17u,
+                    EeTlbEntry{
+                        0u,
+                        faultVirtualBase | asid,
+                        makeEeTlbEntryLo(
+                            0x30000u, true, true, false),
+                        makeEeTlbEntryLo(
+                            0x30001u, true, true, false),
+                    }),
+                "the BUSERR replacement should install");
+            bool busErrorRaised = false;
+            try
+            {
+                (void)mem.read32(faultAddress, translation);
+            }
+            catch (const PS2BusErrorException &error)
+            {
+                busErrorRaised =
+                    error.physicalAddress() == 0x30000180u;
+            }
+            t.IsTrue(
+                busErrorRaised,
+                "a BUSERR replacement must fault instead of using cached RDRAM");
+
+            t.IsTrue(
+                mem.tlbWrite(17u, EeTlbEntry{}),
+                "the refill replacement should clear the cached mapping");
+            const TranslationOutcome refill = captureTranslation(
+                [&]()
+                {
+                    return mem.resolveAddress(
+                        faultAddress, translation);
+                });
+            t.Equals(
+                refill.kind,
+                TranslationOutcomeKind::TlbRefill,
+                "an empty replacement should restore the TLB refill fault");
+            t.Equals(
+                refill.faultAddress,
+                faultAddress,
+                "the refill should retain the original virtual address");
+        });
+
+        tc.Run("mapped cache reset and generation wrap cannot revive stale entries", [](TestCase &t)
+        {
+            constexpr uint32_t virtualBase = 0x04000000u;
+            constexpr uint32_t virtualAddress =
+                virtualBase + 0x0340u;
+            constexpr uint8_t asid = 0x63u;
+            const auto translation =
+                EeAddressTranslationContext::fromCop0Status(
+                    0x10u, asid);
+
+            PS2Memory mem;
+            t.IsTrue(
+                mem.initialize(),
+                "PS2Memory initialize should succeed");
+            t.IsTrue(
+                mem.tlbWrite(
+                    18u,
+                    EeTlbEntry{
+                        0u,
+                        virtualBase | asid,
+                        makeEeTlbEntryLo(
+                            0x00100u, true, true, false),
+                        makeEeTlbEntryLo(
+                            0x00101u, true, true, false),
+                    }),
+                "the pre-wrap mapping should install");
+
+            // Seed the cache at generation one so an implementation which
+            // merely wraps the counter would accept this entry as current.
+            mem.m_tlbMappingGeneration = 1u;
+            t.Equals(
+                mem.translateAddress(virtualAddress, translation),
+                0x00100340u,
+                "the generation-one cache entry should fill");
+            t.Equals(
+                mem.translateAddress(virtualAddress, translation),
+                0x00100340u,
+                "the generation-one cache entry should hit");
+
+            mem.m_tlbMappingGeneration =
+                std::numeric_limits<uint64_t>::max();
+            t.IsTrue(
+                mem.tlbWrite(
+                    18u,
+                    EeTlbEntry{
+                        0u,
+                        virtualBase | asid,
+                        makeEeTlbEntryLo(
+                            0x00200u, true, true, false),
+                        makeEeTlbEntryLo(
+                            0x00201u, true, true, false),
+                    }),
+                "the wrap replacement should install");
+            t.Equals(
+                mem.tlbMappingGeneration(),
+                1u,
+                "generation wrap should restart at one after flushing");
+            t.Equals(
+                mem.translateAddress(virtualAddress, translation),
+                0x00200340u,
+                "generation wrap must not revive the old generation-one PFN");
+
+            const uint64_t beforePostBios =
+                mem.tlbMappingGeneration();
+            mem.installPostBiosTlbState();
+            t.Equals(
+                mem.tlbMappingGeneration(),
+                beforePostBios + 1u,
+                "post-BIOS replacement should advance generation after wrap");
+            const TranslationOutcome postBios = captureTranslation(
+                [&]()
+                {
+                    return mem.resolveAddress(
+                        virtualAddress, translation);
+                });
+            t.Equals(
+                postBios.kind,
+                TranslationOutcomeKind::TlbRefill,
+                "post-BIOS installation should remove the custom mapping");
+
+            const uint64_t beforeReset =
+                mem.tlbMappingGeneration();
+            t.IsTrue(
+                mem.initialize(),
+                "PS2Memory reset should succeed");
+            t.Equals(
+                mem.tlbMappingGeneration(),
+                beforeReset + 1u,
+                "reset should reinstall the configured profile exactly once");
+            const TranslationOutcome afterReset = captureTranslation(
+                [&]()
+                {
+                    return mem.resolveAddress(
+                        virtualAddress, translation);
+                });
+            t.Equals(
+                afterReset.kind,
+                TranslationOutcomeKind::TlbRefill,
+                "reset must not revive the pre-profile cached mapping");
+        });
+
+        tc.Run("mapped cache matches deterministic forced-uncached translation", [](TestCase &t)
+        {
+            constexpr std::array<uint32_t, 7u> maskFields{
+                0x000u,
+                0x003u,
+                0x00fu,
+                0x03fu,
+                0x0ffu,
+                0x3ffu,
+                0xfffu,
+            };
+            constexpr std::array<uint32_t, 7u> statusValues{
+                0x00000000u,
+                0x00000008u,
+                0x00000010u,
+                0x00000018u,
+                0x00000002u,
+                0x00000004u,
+                0x00000006u,
+            };
+            constexpr std::array<uint32_t, 5u> accessSizes{
+                1u, 2u, 4u, 8u, 16u,
+            };
+
+            PS2Memory mem;
+            t.IsTrue(
+                mem.initialize(),
+                "PS2Memory initialize should succeed");
+            DeterministicTranslationRng rng(
+                0x8bb84b93962eacc9ull);
+            std::array<EeTlbEntry, 48u> entries{};
+
+            auto makeRandomEntry =
+                [&](uint32_t index)
+                {
+                    const uint32_t maskField =
+                        maskFields[rng.next() % maskFields.size()];
+                    const uint32_t pageMask =
+                        maskField << 13u;
+                    uint32_t virtualBits = rng.next();
+                    if ((index & 1u) == 0u)
+                    {
+                        virtualBits &= 0x7fffffffu;
+                    }
+                    else
+                    {
+                        virtualBits =
+                            0xc0000000u |
+                            (virtualBits & 0x3fffffffu);
+                    }
+                    const uint8_t asid =
+                        static_cast<uint8_t>(rng.next());
+                    const bool global =
+                        (rng.next() & 7u) == 0u;
+                    const bool scratchpad =
+                        (rng.next() & 31u) == 0u;
+                    const bool valid0 =
+                        (rng.next() & 3u) != 0u;
+                    const bool valid1 =
+                        (rng.next() & 3u) != 0u;
+                    const bool dirty0 =
+                        (rng.next() & 1u) != 0u;
+                    const bool dirty1 =
+                        (rng.next() & 1u) != 0u;
+                    const uint32_t pfn0 =
+                        (rng.next() & 7u) == 0u
+                            ? 0x20000u +
+                                  (rng.next() & 0x1ffffu)
+                            : rng.next() & 0x01fffu;
+                    const uint32_t pfn1 =
+                        (rng.next() & 7u) == 0u
+                            ? 0x20000u +
+                                  (rng.next() & 0x1ffffu)
+                            : rng.next() & 0x01fffu;
+                    return EeTlbEntry{
+                        pageMask,
+                        (virtualBits & 0xffffe000u & ~pageMask) |
+                            asid,
+                        makeEeTlbEntryLo(
+                            pfn0,
+                            dirty0,
+                            valid0,
+                            global,
+                            scratchpad),
+                        makeEeTlbEntryLo(
+                            pfn1,
+                            dirty1,
+                            valid1,
+                            global),
+                    };
+                };
+
+            for (uint32_t index = 0u;
+                 index < entries.size();
+                 ++index)
+            {
+                entries[index] = makeRandomEntry(index);
+                t.IsTrue(
+                    mem.tlbWrite(index, entries[index]),
+                    "the randomized TLB entry should install");
+                t.IsTrue(
+                    mem.tlbRead(index, entries[index]),
+                    "the normalized randomized TLB entry should read back");
+            }
+
+            // Deterministic adversarial anchors guarantee collisions, ASIDs,
+            // Global, scratchpad, invalid, clean, and BUSERR targets occur in
+            // the otherwise randomized corpus.
+            constexpr uint32_t anchorVirtualBase = 0x06000000u;
+            const std::array<EeTlbEntry, 7u> anchors{
+                EeTlbEntry{0u, anchorVirtualBase | 0x11u,
+                    makeEeTlbEntryLo(0x00100u, true, true, false),
+                    makeEeTlbEntryLo(0x00101u, true, true, false)},
+                EeTlbEntry{0u, anchorVirtualBase | 0x22u,
+                    makeEeTlbEntryLo(0x00200u, true, true, false),
+                    makeEeTlbEntryLo(0x00201u, true, true, false)},
+                EeTlbEntry{0u, anchorVirtualBase | 0x33u,
+                    makeEeTlbEntryLo(0x00300u, true, true, true),
+                    makeEeTlbEntryLo(0x00301u, true, true, true)},
+                EeTlbEntry{0u, 0x06200044u,
+                    makeEeTlbEntryLo(0u, true, true, false, true),
+                    makeEeTlbEntryLo(0u, true, true, false)},
+                EeTlbEntry{0u, 0x06400055u,
+                    makeEeTlbEntryLo(0x00400u, true, false, false),
+                    makeEeTlbEntryLo(0x00401u, true, false, false)},
+                EeTlbEntry{0u, 0x06600066u,
+                    makeEeTlbEntryLo(0x00500u, false, true, false),
+                    makeEeTlbEntryLo(0x00501u, false, true, false)},
+                EeTlbEntry{0u, 0x06800077u,
+                    makeEeTlbEntryLo(0x30000u, true, true, false),
+                    makeEeTlbEntryLo(0x30001u, true, true, false)},
+            };
+            for (uint32_t index = 0u;
+                 index < anchors.size();
+                 ++index)
+            {
+                entries[index] = anchors[index];
+                t.IsTrue(
+                    mem.tlbWrite(index, entries[index]),
+                    "the adversarial anchor should install");
+                t.IsTrue(
+                    mem.tlbRead(index, entries[index]),
+                    "the normalized adversarial anchor should read back");
+            }
+
+            mem.setTlbTranslationCacheDiagnosticsEnabled(true);
+            mem.resetTlbTranslationCacheStats();
+            uint32_t successful = 0u;
+            uint32_t scratchpad = 0u;
+            uint32_t addressFaults = 0u;
+            uint32_t refillFaults = 0u;
+            uint32_t invalidFaults = 0u;
+            uint32_t modifiedFaults = 0u;
+
+            for (uint32_t iteration = 0u;
+                 iteration < 4096u;
+                 ++iteration)
+            {
+                if (iteration != 0u &&
+                    iteration % 113u == 0u)
+                {
+                    const uint32_t index =
+                        rng.next() % entries.size();
+                    entries[index] = makeRandomEntry(index);
+                    t.IsTrue(
+                        mem.tlbWrite(index, entries[index]),
+                        "the randomized replacement should install");
+                    t.IsTrue(
+                        mem.tlbRead(index, entries[index]),
+                        "the normalized replacement should read back");
+                }
+
+                const EeTlbEntry &entry =
+                    entries[rng.next() % entries.size()];
+                const uint32_t pageMask =
+                    entry.pageMask & 0x01ffe000u;
+                const uint32_t pairOffsetMask =
+                    (entry.entryLo0 & 0x80000000u) != 0u
+                        ? 0x00003fffu
+                        : pageMask | 0x00001fffu;
+                uint32_t virtualAddress =
+                    (entry.entryHi & 0xffffe000u &
+                     ~pairOffsetMask) |
+                    (rng.next() & pairOffsetMask);
+                const uint32_t accessSize =
+                    accessSizes[rng.next() % accessSizes.size()];
+                if ((rng.next() & 15u) == 0u)
+                {
+                    virtualAddress =
+                        (virtualAddress & ~0x0fffu) |
+                        (0x1000u - accessSize / 2u);
+                }
+                else if ((rng.next() & 15u) == 0u)
+                {
+                    virtualAddress |= 1u;
+                }
+
+                const uint8_t entryAsid =
+                    static_cast<uint8_t>(entry.entryHi);
+                const uint8_t liveAsid =
+                    (rng.next() & 3u) != 0u
+                        ? entryAsid
+                        : static_cast<uint8_t>(rng.next());
+                const uint32_t status =
+                    statusValues[rng.next() % statusValues.size()];
+                const auto translation =
+                    EeAddressTranslationContext::fromCop0Status(
+                        status, liveAsid);
+                const bool writeAccess =
+                    (rng.next() & 1u) != 0u;
+
+                const TranslationOutcome first = captureTranslation(
+                    [&]()
+                    {
+                        return mem.resolveAddress(
+                            virtualAddress,
+                            translation,
+                            writeAccess,
+                            accessSize);
+                    });
+                const TranslationOutcome reference = captureTranslation(
+                    [&]()
+                    {
+                        return mem.resolveAddressUncached(
+                            virtualAddress,
+                            translation,
+                            writeAccess,
+                            accessSize);
+                    });
+                const TranslationOutcome second = captureTranslation(
+                    [&]()
+                    {
+                        return mem.resolveAddress(
+                            virtualAddress,
+                            translation,
+                            writeAccess,
+                            accessSize);
+                    });
+                const std::string suffix =
+                    " at deterministic iteration " +
+                    std::to_string(iteration);
+                t.Equals(
+                    first,
+                    reference,
+                    "the first cached result should equal the forced-uncached result" +
+                        suffix);
+                t.Equals(
+                    second,
+                    reference,
+                    "the repeated cached result should equal the forced-uncached result" +
+                        suffix);
+
+                switch (reference.kind)
+                {
+                case TranslationOutcomeKind::Success:
+                    ++successful;
+                    if (reference.translated.scratchpad)
+                    {
+                        ++scratchpad;
+                    }
+                    break;
+                case TranslationOutcomeKind::AddressError:
+                    ++addressFaults;
+                    break;
+                case TranslationOutcomeKind::TlbRefill:
+                    ++refillFaults;
+                    break;
+                case TranslationOutcomeKind::TlbInvalid:
+                    ++invalidFaults;
+                    break;
+                case TranslationOutcomeKind::TlbModified:
+                    ++modifiedFaults;
+                    break;
+                }
+            }
+
+            const EeTlbTranslationCacheStats stats =
+                mem.tlbTranslationCacheStats();
+            t.IsTrue(
+                successful != 0u && stats.hits != 0u,
+                "the corpus should exercise successful cached translations");
+            t.IsTrue(
+                scratchpad != 0u,
+                "the corpus should compare scratchpad result distinctions");
+            t.IsTrue(
+                addressFaults != 0u &&
+                    refillFaults != 0u &&
+                    invalidFaults != 0u &&
+                    modifiedFaults != 0u,
+                "the corpus should compare every architectural translation fault kind");
+            t.IsTrue(
+                stats.generationMisses != 0u,
+                "randomized replacements should reject stale generations");
+            t.IsTrue(
+                stats.intervalCrossings != 0u,
+                "the corpus should exercise cache interval crossings");
         });
 
         tc.Run("guest pointers reject non-RDRAM address spaces", [](TestCase &t)

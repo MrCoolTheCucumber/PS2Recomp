@@ -222,6 +222,16 @@ struct EeTlbEntry
     uint32_t entryLo1 = 0u;
 };
 
+struct EeTlbTranslationCacheStats
+{
+    uint64_t hits = 0u;
+    uint64_t misses = 0u;
+    uint64_t permissionMisses = 0u;
+    uint64_t generationMisses = 0u;
+    uint64_t intervalCrossings = 0u;
+    uint64_t slowPathFaults = 0u;
+};
+
 class PS2BusErrorException final : public std::exception
 {
 public:
@@ -989,6 +999,15 @@ struct Vu1WorkloadProfileSnapshot
 class PS2Memory
 {
 public:
+    struct EeTranslatedAddress
+    {
+        uint32_t physicalAddress = 0u;
+        bool scratchpad = false;
+
+        constexpr bool operator==(
+            const EeTranslatedAddress &) const noexcept = default;
+    };
+
     struct CodeInvalidationEvent
     {
         uint32_t start = 0;
@@ -1106,12 +1125,58 @@ public:
     uint32_t translateAddress(
         uint32_t virtualAddress,
         EeAddressTranslationContext translation =
-            EeAddressTranslationContext::unchecked());
+            EeAddressTranslationContext::unchecked(),
+        bool writeAccess = false,
+        uint32_t accessSize = 1u);
+    EeTranslatedAddress resolveAddress(
+        uint32_t virtualAddress,
+        EeAddressTranslationContext translation =
+            EeAddressTranslationContext::unchecked(),
+        bool writeAccess = false,
+        uint32_t accessSize = 1u);
+    uint32_t translateAddressUncached(
+        uint32_t virtualAddress,
+        EeAddressTranslationContext translation =
+            EeAddressTranslationContext::unchecked(),
+        bool writeAccess = false,
+        uint32_t accessSize = 1u);
+    EeTranslatedAddress resolveAddressUncached(
+        uint32_t virtualAddress,
+        EeAddressTranslationContext translation =
+            EeAddressTranslationContext::unchecked(),
+        bool writeAccess = false,
+        uint32_t accessSize = 1u);
     bool tlbRead(uint32_t index, EeTlbEntry &entry) const;
     bool tlbWrite(uint32_t index, const EeTlbEntry &entry);
     int32_t tlbProbe(uint32_t entryHi) const;
     void installPostBiosTlbState();
     size_t tlbEntryCount() const { return m_tlbEntries.size(); }
+    uint64_t tlbMappingGeneration() const noexcept
+    {
+        return m_tlbMappingGeneration;
+    }
+    void setTlbTranslationCacheEnabled(bool enabled) noexcept
+    {
+        m_tlbTranslationCacheEnabled = enabled;
+    }
+    bool tlbTranslationCacheEnabled() const noexcept
+    {
+        return m_tlbTranslationCacheEnabled;
+    }
+    void setTlbTranslationCacheDiagnosticsEnabled(
+        bool enabled) noexcept
+    {
+        m_tlbTranslationCacheDiagnosticsEnabled = enabled;
+    }
+    void resetTlbTranslationCacheStats() noexcept
+    {
+        m_tlbTranslationCacheStats = {};
+    }
+    EeTlbTranslationCacheStats
+    tlbTranslationCacheStats() const noexcept
+    {
+        return m_tlbTranslationCacheStats;
+    }
 
     // Hardware register interface
     bool writeIORegister(uint32_t address, uint32_t value);
@@ -1421,19 +1486,66 @@ public:
     VIFRegisters vif1_regs;
     DMARegisters dma_regs[10]; // 10 DMA channels
 
-    struct EeTranslatedAddress
+    static constexpr size_t kTlbTranslationCacheSetCount = 32u;
+    static constexpr size_t kTlbTranslationCacheWayCount = 4u;
+    static constexpr uint32_t kTlbTranslationCachePageSize = 0x1000u;
+    static_assert(
+        (kTlbTranslationCacheSetCount &
+         (kTlbTranslationCacheSetCount - 1u)) == 0u);
+
+    struct EeTlbTranslationCacheEntry
     {
-        uint32_t physicalAddress = 0u;
+        uint64_t generation = 0u;
+        uint32_t virtualPageBase = 0u;
+        uint32_t physicalPageBase = 0u;
+        uint32_t tlbPageSize = 0u;
+        uint8_t asid = 0u;
+        EeAddressSpaceMode mode = EeAddressSpaceMode::Kernel;
+        bool enforceOperatingMode = false;
+        bool errorLevel = false;
+        bool valid = false;
+        bool global = false;
+        bool writable = false;
         bool scratchpad = false;
     };
 
     EeTranslatedAddress translateAddressImpl(
         uint32_t virtualAddress,
         EeAddressTranslationContext translation,
-        bool writeAccess);
+        bool writeAccess,
+        uint32_t accessSize = 1u,
+        bool allowTlbCache = true);
+    std::optional<EeTranslatedAddress>
+    lookupTlbTranslationCache(
+        uint32_t virtualAddress,
+        EeAddressTranslationContext translation,
+        bool writeAccess,
+        uint32_t accessSize);
+    void fillTlbTranslationCache(
+        uint32_t virtualAddress,
+        const EeTranslatedAddress &translated,
+        EeAddressTranslationContext translation,
+        uint32_t tlbPageSize,
+        bool global,
+        bool writable);
+    void advanceTlbMappingGeneration() noexcept;
+    void clearTlbTranslationCache() noexcept;
+    void recordTlbTranslationSlowPathFault() noexcept;
 
     std::vector<EeTlbEntry> m_tlbEntries;
     bool m_postBiosTlbStateConfigured = false;
+    uint64_t m_tlbMappingGeneration = 1u;
+    bool m_tlbTranslationCacheEnabled = true;
+    bool m_tlbTranslationCacheDiagnosticsEnabled = false;
+    EeTlbTranslationCacheStats m_tlbTranslationCacheStats{};
+    std::array<
+        std::array<
+            EeTlbTranslationCacheEntry,
+            kTlbTranslationCacheWayCount>,
+        kTlbTranslationCacheSetCount>
+        m_tlbTranslationCache{};
+    std::array<uint8_t, kTlbTranslationCacheSetCount>
+        m_tlbTranslationCacheNextWay{};
 
     GifPacketCallback m_gifPacketCallback;
     GifArbiter *m_gifArbiter = nullptr;

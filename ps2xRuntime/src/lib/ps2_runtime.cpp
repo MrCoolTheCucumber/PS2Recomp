@@ -6995,7 +6995,9 @@ void PS2Runtime::ValidateInstructionFetchWithoutObservation(
     {
         (void)m_memory.translateAddress(
             virtualAddress,
-            guestAddressTranslation(ctx));
+            guestAddressTranslation(ctx),
+            false,
+            sizeof(uint32_t));
     }
     catch (const PS2AddressErrorException &fault)
     {
