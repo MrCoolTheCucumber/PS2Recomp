@@ -208,6 +208,32 @@ namespace ps2recomp
                    (inst.rs == 0u && inst.rt == 31u);
         };
 
+        const auto getExactRegisterCopySource = [](const Instruction &inst,
+                                                   uint32_t destinationReg,
+                                                   uint32_t &sourceReg)
+        {
+            if (inst.opcode != OPCODE_SPECIAL ||
+                inst.rd != destinationReg ||
+                (inst.function != SPECIAL_OR &&
+                 inst.function != SPECIAL_ADDU &&
+                 inst.function != SPECIAL_DADDU))
+            {
+                return false;
+            }
+
+            if (inst.rs == 0u && inst.rt != 0u)
+            {
+                sourceReg = inst.rt;
+                return true;
+            }
+            if (inst.rt == 0u && inst.rs != 0u)
+            {
+                sourceReg = inst.rs;
+                return true;
+            }
+            return false;
+        };
+
         for (size_t index = 0u; index < instructions.size(); ++index)
         {
             const auto &inst = instructions[index];
@@ -993,6 +1019,35 @@ namespace ps2recomp
                                     findScaledIndexDefinition(indexReg);
                             }
 
+                            uint32_t copiedIndexSourceRegister = 0u;
+                            int copiedIndexDefinition = -1;
+                            if (scaledIndex.instructionIndex >= 0)
+                            {
+                                for (int i = scaledIndex.instructionIndex - 1;
+                                     i >= 0 &&
+                                     i >= scaledIndex.instructionIndex -
+                                              kMaxJumpTableDataFlowInstructions;
+                                     --i)
+                                {
+                                    const auto &inst = instructions[i];
+                                    if (!writesRegister(
+                                            inst,
+                                            scaledIndex.sourceRegister))
+                                    {
+                                        continue;
+                                    }
+
+                                    if (getExactRegisterCopySource(
+                                            inst,
+                                            scaledIndex.sourceRegister,
+                                            copiedIndexSourceRegister))
+                                    {
+                                        copiedIndexDefinition = i;
+                                    }
+                                    break;
+                                }
+                            }
+
                             uint32_t numCases = 0;
                             if (scaledIndex.instructionIndex >= 0)
                             {
@@ -1004,9 +1059,88 @@ namespace ps2recomp
                                     const auto &inst = instructions[i];
                                     if ((inst.opcode != OPCODE_SLTIU &&
                                          inst.opcode != OPCODE_SLTI) ||
-                                        inst.rs != scaledIndex.sourceRegister)
+                                        (inst.rs != scaledIndex.sourceRegister &&
+                                         (copiedIndexDefinition < 0 ||
+                                          inst.rs !=
+                                              copiedIndexSourceRegister)))
                                     {
                                         continue;
+                                    }
+
+                                    const bool guardsCopiedSource =
+                                        copiedIndexDefinition >= 0 &&
+                                        inst.rs == copiedIndexSourceRegister;
+
+                                    if (guardsCopiedSource)
+                                    {
+                                        bool copyWasInvalidated = false;
+
+                                        // The scaled register must still hold
+                                        // the value installed by the exact
+                                        // copy when the SLL observes it.
+                                        for (int j = copiedIndexDefinition + 1;
+                                             j < scaledIndex.instructionIndex;
+                                             ++j)
+                                        {
+                                            if (writesRegister(
+                                                    instructions[j],
+                                                    scaledIndex.sourceRegister))
+                                            {
+                                                copyWasInvalidated = true;
+                                                break;
+                                            }
+                                        }
+
+                                        // The guard and copy must observe the
+                                        // same source value. The common
+                                        // compiler pattern copies the index,
+                                        // then overwrites its original
+                                        // register with the SLTIU predicate;
+                                        // that guard write is intentionally
+                                        // outside this interval.
+                                        if (!copyWasInvalidated &&
+                                            i > copiedIndexDefinition)
+                                        {
+                                            for (int j =
+                                                     copiedIndexDefinition + 1;
+                                                 j < i; ++j)
+                                            {
+                                                if (writesRegister(
+                                                        instructions[j],
+                                                        copiedIndexSourceRegister))
+                                                {
+                                                    copyWasInvalidated = true;
+                                                    break;
+                                                }
+                                            }
+                                        }
+                                        else if (!copyWasInvalidated &&
+                                                 i < copiedIndexDefinition)
+                                        {
+                                            if (writesRegister(
+                                                    inst,
+                                                    copiedIndexSourceRegister))
+                                            {
+                                                copyWasInvalidated = true;
+                                            }
+                                            for (int j = i + 1;
+                                                 !copyWasInvalidated &&
+                                                 j < copiedIndexDefinition;
+                                                 ++j)
+                                            {
+                                                if (writesRegister(
+                                                        instructions[j],
+                                                        copiedIndexSourceRegister))
+                                                {
+                                                    copyWasInvalidated = true;
+                                                }
+                                            }
+                                        }
+
+                                        if (copyWasInvalidated)
+                                        {
+                                            continue;
+                                        }
                                     }
 
                                     if (i > scaledIndex.instructionIndex &&

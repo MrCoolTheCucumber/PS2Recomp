@@ -1534,6 +1534,37 @@ void register_code_generator_tests()
         t.IsFalse(analysis.jumpTableTargets.contains(0x401Cu),
                   "a source overwrite between the guard and shift must reject the stale bound");
 
+        writeTableTarget(0u, 0x4030u);
+        writeTableTarget(4u, 0x4034u);
+        std::vector<Instruction> copiedIndexInstructions{
+            decodeI(0x4000u, OPCODE_LW, 16u, 2u, 0x50u),
+            decodeR(0x4004u, 2u, 0u, 5u, 0u, SPECIAL_DADDU),
+            makeNop(0x4008u),
+            decodeI(0x400Cu, OPCODE_SLTIU, 2u, 2u, 2u),
+            decodeI(0x4010u, OPCODE_BEQ, 2u, 0u, 8u),
+            decodeI(0x4014u, OPCODE_LUI, 0u, 2u, 0x0020u),
+            decodeR(0x4018u, 0u, 5u, 8u, 2u, SPECIAL_SLL),
+            decodeI(0x401Cu, OPCODE_ADDIU, 2u, 2u, 0u),
+            decodeR(0x4020u, 8u, 2u, 9u, 0u, SPECIAL_ADDU),
+            decodeI(0x4024u, OPCODE_LW, 9u, 10u, 0u),
+            makeJr(0x4028u, 10u),
+            makeNop(0x402Cu),
+            makeNop(0x4030u),
+            makeNop(0x4034u),
+            makeNop(0x4038u),
+        };
+        analysis = gen.collectInternalBranchTargets(
+            func, copiedIndexInstructions);
+        t.IsTrue(analysis.jumpTableTargets.contains(0x4028u),
+                 "a bound on the source of an exact index copy should resolve the table");
+
+        copiedIndexInstructions[2] =
+            decodeI(0x4008u, OPCODE_ADDIU, 0u, 2u, 0u);
+        analysis = gen.collectInternalBranchTargets(
+            func, copiedIndexInstructions);
+        t.IsFalse(analysis.jumpTableTargets.contains(0x4028u),
+                  "a copied-index source overwrite before the guard must reject the stale bound");
+
         instructions[15] =
             decodeI(instructions[15].address, OPCODE_ADDIU, 0u, 8u, 0u);
         analysis = gen.collectInternalBranchTargets(func, instructions);
