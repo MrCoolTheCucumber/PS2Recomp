@@ -14,6 +14,35 @@ namespace ps2x::ee
 {
     namespace
     {
+        thread_local const void *g_currentRuntimeExecutor =
+            nullptr;
+
+        class CurrentRuntimeExecutorScope final
+        {
+        public:
+            explicit CurrentRuntimeExecutorScope(
+                const void *executor) noexcept
+                : m_previous(g_currentRuntimeExecutor)
+            {
+                g_currentRuntimeExecutor = executor;
+            }
+
+            ~CurrentRuntimeExecutorScope() noexcept
+            {
+                g_currentRuntimeExecutor = m_previous;
+            }
+
+            CurrentRuntimeExecutorScope(
+                const CurrentRuntimeExecutorScope &) =
+                delete;
+            CurrentRuntimeExecutorScope &operator=(
+                const CurrentRuntimeExecutorScope &) =
+                delete;
+
+        private:
+            const void *m_previous = nullptr;
+        };
+
         class NullEeSchedulerExecutorHooks final
             : public IEeSchedulerExecutorHooks
         {
@@ -439,11 +468,7 @@ namespace ps2x::ee
         [[nodiscard]] bool
         ownsCurrentThread() const noexcept
         {
-            std::lock_guard<std::mutex> lock(m_mutex);
-            return m_executorThreadId !=
-                       std::thread::id{} &&
-                   m_executorThreadId ==
-                       std::this_thread::get_id();
+            return g_currentRuntimeExecutor == this;
         }
 
         [[nodiscard]] EeRuntimeExecutorStatistics
@@ -739,6 +764,8 @@ namespace ps2x::ee
 
         void run(Command setup) noexcept
         {
+            const CurrentRuntimeExecutorScope ownerScope(
+                this);
             {
                 std::lock_guard<std::mutex> lock(m_mutex);
                 m_executorThreadId =
