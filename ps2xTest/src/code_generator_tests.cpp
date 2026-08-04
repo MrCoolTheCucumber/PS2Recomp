@@ -1251,6 +1251,139 @@ void register_code_generator_tests()
                  "the reporter should contain one control-flow fallback event");
     });
 
+    tc.Run("jump-table inference reuses a bounded scaled index until it is overwritten", [](TestCase &t) {
+        Function func;
+        func.name = "reused_jump_table_index";
+        func.start = 0x4000u;
+        func.end = 0x40A4u;
+        func.isRecompiled = true;
+        func.isStub = false;
+
+        constexpr uint32_t tableAddress = 0x00200000u;
+        std::vector<uint8_t> tableData(24u, 0u);
+        const auto writeTableTarget = [&](size_t offset, uint32_t target)
+        {
+            tableData[offset] = static_cast<uint8_t>(target);
+            tableData[offset + 1u] = static_cast<uint8_t>(target >> 8u);
+            tableData[offset + 2u] = static_cast<uint8_t>(target >> 16u);
+            tableData[offset + 3u] = static_cast<uint8_t>(target >> 24u);
+        };
+        writeTableTarget(0u, 0x4024u);
+        writeTableTarget(4u, 0x4028u);
+        writeTableTarget(16u, 0x409Cu);
+        writeTableTarget(20u, 0x40A0u);
+
+        Section tableSection{};
+        tableSection.name = ".rodata";
+        tableSection.address = tableAddress;
+        tableSection.size = static_cast<uint32_t>(tableData.size());
+        tableSection.isData = true;
+        tableSection.isReadOnly = true;
+        tableSection.data = tableData.data();
+
+        const R5900Decoder decoder;
+        const auto decodeI = [&](uint32_t address, uint32_t opcode,
+                                 uint8_t rs, uint8_t rt, uint16_t immediate)
+        {
+            const uint32_t raw =
+                (opcode << 26u) |
+                (static_cast<uint32_t>(rs) << 21u) |
+                (static_cast<uint32_t>(rt) << 16u) |
+                immediate;
+            return decoder.decodeInstruction(address, raw, false);
+        };
+        const auto decodeR = [&](uint32_t address, uint8_t rs, uint8_t rt,
+                                 uint8_t rd, uint8_t sa, uint8_t function)
+        {
+            const uint32_t raw =
+                (static_cast<uint32_t>(rs) << 21u) |
+                (static_cast<uint32_t>(rt) << 16u) |
+                (static_cast<uint32_t>(rd) << 11u) |
+                (static_cast<uint32_t>(sa) << 6u) |
+                function;
+            return decoder.decodeInstruction(address, raw, false);
+        };
+
+        std::vector<Instruction> instructions{
+            decodeI(0x4000u, OPCODE_SLTIU, 4u, 2u, 2u),
+            makeNop(0x4004u),
+            decodeR(0x4008u, 0u, 4u, 8u, 2u, SPECIAL_SLL),
+            decodeI(0x400Cu, OPCODE_LUI, 0u, 9u, 0x0020u),
+            decodeI(0x4010u, OPCODE_ADDIU, 9u, 9u, 0u),
+            decodeR(0x4014u, 8u, 9u, 9u, 0u, SPECIAL_ADDU),
+            decodeI(0x4018u, OPCODE_LW, 9u, 10u, 0u),
+            makeJr(0x401Cu, 10u),
+            makeNop(0x4020u),
+            makeNop(0x4024u),
+            makeNop(0x4028u),
+        };
+        for (uint32_t address = 0x402Cu; address <= 0x4080u; address += 4u)
+        {
+            instructions.push_back(makeNop(address));
+        }
+        instructions.push_back(
+            decodeI(0x4084u, OPCODE_LUI, 0u, 9u, 0x0020u));
+        instructions.push_back(
+            decodeI(0x4088u, OPCODE_ADDIU, 9u, 9u, 0x0010u));
+        instructions.push_back(
+            decodeR(0x408Cu, 8u, 9u, 9u, 0u, SPECIAL_ADDU));
+        instructions.push_back(
+            decodeI(0x4090u, OPCODE_LW, 9u, 10u, 0u));
+        instructions.push_back(makeJr(0x4094u, 10u));
+        instructions.push_back(makeNop(0x4098u));
+        instructions.push_back(makeNop(0x409Cu));
+        instructions.push_back(makeNop(0x40A0u));
+
+        const std::vector<Symbol> symbols;
+        const std::vector<Section> sections{tableSection};
+        CodeGenerator gen(symbols, sections);
+        CodeGenerator::AnalysisResult analysis =
+            gen.collectInternalBranchTargets(func, instructions);
+        t.IsTrue(analysis.jumpTableTargets.contains(0x401Cu),
+                 "the nearby first use of the scaled index should resolve");
+        t.IsTrue(analysis.jumpTableTargets.contains(0x4094u),
+                 "the bounded unmodified scaled index should resolve after more than ten instructions");
+        t.IsTrue(analysis.indirectFallbackEntryPoints.empty(),
+                 "resolved reused-index tables should not request broad fallback entries");
+
+        std::vector<Instruction> inPlaceInstructions = instructions;
+        inPlaceInstructions[0] =
+            decodeI(0x4000u, OPCODE_SLTIU, 8u, 2u, 2u);
+        inPlaceInstructions[2] =
+            decodeR(0x4008u, 0u, 8u, 8u, 2u, SPECIAL_SLL);
+        analysis = gen.collectInternalBranchTargets(func, inPlaceInstructions);
+        t.IsTrue(analysis.jumpTableTargets.contains(0x4094u),
+                 "an in-place scaled index guarded before the shift should remain reusable");
+
+        std::vector<Instruction> postShiftInPlaceInstructions =
+            inPlaceInstructions;
+        postShiftInPlaceInstructions[0] = makeNop(0x4000u);
+        postShiftInPlaceInstructions[11] =
+            decodeI(0x402Cu, OPCODE_SLTIU, 8u, 2u, 2u);
+        analysis = gen.collectInternalBranchTargets(
+            func, postShiftInPlaceInstructions);
+        t.IsFalse(analysis.jumpTableTargets.contains(0x4094u),
+                  "a guard after an in-place shift must not bound the original index");
+
+        std::vector<Instruction> sourceClobberInstructions = instructions;
+        sourceClobberInstructions[1] =
+            decodeI(0x4004u, OPCODE_ADDIU, 0u, 4u, 0u);
+        analysis = gen.collectInternalBranchTargets(
+            func, sourceClobberInstructions);
+        t.IsFalse(analysis.jumpTableTargets.contains(0x401Cu),
+                  "a source overwrite between the guard and shift must reject the stale bound");
+
+        instructions[15] =
+            decodeI(instructions[15].address, OPCODE_ADDIU, 0u, 8u, 0u);
+        analysis = gen.collectInternalBranchTargets(func, instructions);
+        t.IsTrue(analysis.jumpTableTargets.contains(0x401Cu),
+                 "an overwrite after the first dispatch must not invalidate the first table");
+        t.IsFalse(analysis.jumpTableTargets.contains(0x4094u),
+                  "an intervening scaled-index overwrite must prevent stale table inference");
+        t.IsFalse(analysis.indirectFallbackEntryPoints.empty(),
+                  "the rejected stale index should retain conservative fallback entries");
+    });
+
     tc.Run("resume entry targets emit a top-level pc switch in the owner wrapper", [](TestCase &t) {
         Function func;
         func.name = "resume_owner";

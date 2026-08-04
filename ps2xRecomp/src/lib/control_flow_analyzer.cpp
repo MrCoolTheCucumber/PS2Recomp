@@ -436,24 +436,112 @@ namespace ps2recomp
                                 }
                             }
 
-                            uint32_t unshiftedIndexReg = 0;
-                            for (int i = adduIndex - 1; i >= 0 && i >= adduIndex - 10; --i)
+                            struct ShiftedIndexDefinition
                             {
-                                const auto &inst = instructions[i];
-                                if (inst.opcode == OPCODE_SPECIAL && inst.function == SPECIAL_SLL && (inst.rd == tableBaseReg || inst.rd == indexReg))
+                                uint32_t destinationRegister = 0;
+                                uint32_t sourceRegister = 0;
+                                int instructionIndex = -1;
+                            };
+
+                            constexpr int kMaxJumpTableDataFlowInstructions = 64;
+                            const auto writesRegister = [](const Instruction &inst, uint32_t reg)
+                            {
+                                return reg != 0u &&
+                                       (inst.gprWriteMask & (1u << reg)) != 0u;
+                            };
+                            const auto findShiftedIndexDefinition =
+                                [&](uint32_t shiftedRegister)
                                 {
-                                    unshiftedIndexReg = inst.rt;
-                                    break;
-                                }
+                                    ShiftedIndexDefinition definition;
+                                    if (shiftedRegister == 0u)
+                                    {
+                                        return definition;
+                                    }
+
+                                    for (int i = adduIndex - 1;
+                                         i >= 0 &&
+                                         i >= adduIndex - kMaxJumpTableDataFlowInstructions;
+                                         --i)
+                                    {
+                                        const auto &inst = instructions[i];
+                                        if (!writesRegister(inst, shiftedRegister))
+                                        {
+                                            continue;
+                                        }
+
+                                        if (inst.opcode == OPCODE_SPECIAL &&
+                                            inst.function == SPECIAL_SLL &&
+                                            inst.rd == shiftedRegister &&
+                                            inst.rt != 0u &&
+                                            inst.sa == 2u)
+                                        {
+                                            definition.destinationRegister =
+                                                shiftedRegister;
+                                            definition.sourceRegister = inst.rt;
+                                            definition.instructionIndex = i;
+                                        }
+                                        return definition;
+                                    }
+                                    return definition;
+                                };
+
+                            ShiftedIndexDefinition shiftedIndex =
+                                findShiftedIndexDefinition(tableBaseReg);
+                            if (shiftedIndex.instructionIndex < 0)
+                            {
+                                shiftedIndex =
+                                    findShiftedIndexDefinition(indexReg);
                             }
 
                             uint32_t numCases = 0;
-                            if (unshiftedIndexReg != 0)
+                            if (shiftedIndex.instructionIndex >= 0)
                             {
-                                for (int i = adduIndex - 1; i >= 0 && i >= adduIndex - 30; --i)
+                                for (int i = adduIndex - 1;
+                                     i >= 0 &&
+                                     i >= adduIndex - kMaxJumpTableDataFlowInstructions;
+                                     --i)
                                 {
                                     const auto &inst = instructions[i];
-                                    if ((inst.opcode == OPCODE_SLTIU || inst.opcode == OPCODE_SLTI) && inst.rs == unshiftedIndexReg)
+                                    if ((inst.opcode != OPCODE_SLTIU &&
+                                         inst.opcode != OPCODE_SLTI) ||
+                                        inst.rs != shiftedIndex.sourceRegister)
+                                    {
+                                        continue;
+                                    }
+
+                                    if (i > shiftedIndex.instructionIndex &&
+                                        shiftedIndex.sourceRegister ==
+                                            shiftedIndex.destinationRegister)
+                                    {
+                                        continue;
+                                    }
+
+                                    // The bound and SLL must observe the same
+                                    // source value. A guard may follow the SLL
+                                    // (as long as the source was not changed),
+                                    // but a guard which overwrites the source
+                                    // before the SLL cannot bound that index.
+                                    bool sourceWasClobbered = false;
+                                    const int firstCheckedIndex =
+                                        i < shiftedIndex.instructionIndex
+                                            ? i
+                                            : shiftedIndex.instructionIndex + 1;
+                                    const int lastCheckedIndex =
+                                        i < shiftedIndex.instructionIndex
+                                            ? shiftedIndex.instructionIndex
+                                            : i;
+                                    for (int j = firstCheckedIndex;
+                                         j < lastCheckedIndex; ++j)
+                                    {
+                                        if (writesRegister(
+                                                instructions[j],
+                                                shiftedIndex.sourceRegister))
+                                        {
+                                            sourceWasClobbered = true;
+                                            break;
+                                        }
+                                    }
+                                    if (!sourceWasClobbered)
                                     {
                                         numCases = inst.immediate;
                                         break;
