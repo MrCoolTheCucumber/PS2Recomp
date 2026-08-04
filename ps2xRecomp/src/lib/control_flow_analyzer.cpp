@@ -85,6 +85,37 @@ namespace ps2recomp
             return best;
         };
 
+        auto findContainingCallableFunction = [&](uint32_t address) -> const Function *
+        {
+            if (!allFunctions || !isExecutableAddress(address))
+            {
+                return nullptr;
+            }
+
+            const Function *best = nullptr;
+            for (const auto &candidateFn : *allFunctions)
+            {
+                if (candidateFn.isSkipped ||
+                    (!candidateFn.isRecompiled && !candidateFn.isStub))
+                {
+                    continue;
+                }
+                if (candidateFn.isStub && address != candidateFn.start)
+                {
+                    continue;
+                }
+                if (address < candidateFn.start || address >= candidateFn.end)
+                {
+                    continue;
+                }
+                if (!best || candidateFn.start > best->start)
+                {
+                    best = &candidateFn;
+                }
+            }
+            return best;
+        };
+
         auto queueExternalEntryTarget = [&](uint32_t target)
         {
             const Function *containingFn = findContainingExternalFunction(target);
@@ -436,23 +467,76 @@ namespace ps2recomp
                                 }
                             }
 
-                            struct ShiftedIndexDefinition
+                            struct ScaledIndexDefinition
                             {
                                 uint32_t destinationRegister = 0;
                                 uint32_t sourceRegister = 0;
+                                uint32_t strideBytes = 0;
                                 int instructionIndex = -1;
                             };
 
                             constexpr int kMaxJumpTableDataFlowInstructions = 64;
+                            constexpr uint32_t kMaxInferredTableEntries = 1000u;
                             const auto writesRegister = [](const Instruction &inst, uint32_t reg)
                             {
                                 return reg != 0u &&
                                        (inst.gprWriteMask & (1u << reg)) != 0u;
                             };
-                            const auto findShiftedIndexDefinition =
+                            struct RegisterConstant
+                            {
+                                bool found = false;
+                                uint32_t value = 0;
+                            };
+                            const auto findRegisterConstantBefore =
+                                [&](uint32_t reg, int beforeIndex)
+                                {
+                                    RegisterConstant constant;
+                                    if (reg == 0u)
+                                    {
+                                        constant.found = true;
+                                        return constant;
+                                    }
+
+                                    for (int i = beforeIndex - 1;
+                                         i >= 0 &&
+                                         i >= beforeIndex - kMaxJumpTableDataFlowInstructions;
+                                         --i)
+                                    {
+                                        const auto &inst = instructions[i];
+                                        if (!writesRegister(inst, reg))
+                                        {
+                                            continue;
+                                        }
+
+                                        if (inst.rt == reg && inst.rs == 0u)
+                                        {
+                                            if (inst.opcode == OPCODE_ADDIU ||
+                                                inst.opcode == OPCODE_DADDIU)
+                                            {
+                                                constant.found = true;
+                                                constant.value = inst.simmediate;
+                                            }
+                                            else if (inst.opcode == OPCODE_ORI)
+                                            {
+                                                constant.found = true;
+                                                constant.value = inst.immediate;
+                                            }
+                                        }
+                                        return constant;
+                                    }
+                                    return constant;
+                                };
+                            const auto isUsableTableStride = [](RegisterConstant constant)
+                            {
+                                return constant.found &&
+                                       constant.value >= sizeof(uint32_t) &&
+                                       constant.value <= 0x10000u &&
+                                       (constant.value & 3u) == 0u;
+                            };
+                            const auto findScaledIndexDefinition =
                                 [&](uint32_t shiftedRegister)
                                 {
-                                    ShiftedIndexDefinition definition;
+                                    ScaledIndexDefinition definition;
                                     if (shiftedRegister == 0u)
                                     {
                                         return definition;
@@ -473,28 +557,56 @@ namespace ps2recomp
                                             inst.function == SPECIAL_SLL &&
                                             inst.rd == shiftedRegister &&
                                             inst.rt != 0u &&
-                                            inst.sa == 2u)
+                                            inst.sa >= 2u &&
+                                            inst.sa < 31u)
                                         {
                                             definition.destinationRegister =
                                                 shiftedRegister;
                                             definition.sourceRegister = inst.rt;
+                                            definition.strideBytes = 1u << inst.sa;
                                             definition.instructionIndex = i;
+                                        }
+                                        else if (inst.opcode == OPCODE_SPECIAL &&
+                                                 (inst.function == SPECIAL_MULT ||
+                                                  inst.function == SPECIAL_MULTU) &&
+                                                 inst.rd == shiftedRegister)
+                                        {
+                                            const RegisterConstant rsConstant =
+                                                findRegisterConstantBefore(inst.rs, i);
+                                            const RegisterConstant rtConstant =
+                                                findRegisterConstantBefore(inst.rt, i);
+                                            const bool rsIsStride =
+                                                isUsableTableStride(rsConstant);
+                                            const bool rtIsStride =
+                                                isUsableTableStride(rtConstant);
+                                            if (rsIsStride != rtIsStride)
+                                            {
+                                                definition.destinationRegister =
+                                                    shiftedRegister;
+                                                definition.sourceRegister =
+                                                    rsIsStride ? inst.rt : inst.rs;
+                                                definition.strideBytes =
+                                                    rsIsStride
+                                                        ? rsConstant.value
+                                                        : rtConstant.value;
+                                                definition.instructionIndex = i;
+                                            }
                                         }
                                         return definition;
                                     }
                                     return definition;
                                 };
 
-                            ShiftedIndexDefinition shiftedIndex =
-                                findShiftedIndexDefinition(tableBaseReg);
-                            if (shiftedIndex.instructionIndex < 0)
+                            ScaledIndexDefinition scaledIndex =
+                                findScaledIndexDefinition(tableBaseReg);
+                            if (scaledIndex.instructionIndex < 0)
                             {
-                                shiftedIndex =
-                                    findShiftedIndexDefinition(indexReg);
+                                scaledIndex =
+                                    findScaledIndexDefinition(indexReg);
                             }
 
                             uint32_t numCases = 0;
-                            if (shiftedIndex.instructionIndex >= 0)
+                            if (scaledIndex.instructionIndex >= 0)
                             {
                                 for (int i = adduIndex - 1;
                                      i >= 0 &&
@@ -504,14 +616,14 @@ namespace ps2recomp
                                     const auto &inst = instructions[i];
                                     if ((inst.opcode != OPCODE_SLTIU &&
                                          inst.opcode != OPCODE_SLTI) ||
-                                        inst.rs != shiftedIndex.sourceRegister)
+                                        inst.rs != scaledIndex.sourceRegister)
                                     {
                                         continue;
                                     }
 
-                                    if (i > shiftedIndex.instructionIndex &&
-                                        shiftedIndex.sourceRegister ==
-                                            shiftedIndex.destinationRegister)
+                                    if (i > scaledIndex.instructionIndex &&
+                                        scaledIndex.sourceRegister ==
+                                            scaledIndex.destinationRegister)
                                     {
                                         continue;
                                     }
@@ -523,19 +635,19 @@ namespace ps2recomp
                                     // before the SLL cannot bound that index.
                                     bool sourceWasClobbered = false;
                                     const int firstCheckedIndex =
-                                        i < shiftedIndex.instructionIndex
+                                        i < scaledIndex.instructionIndex
                                             ? i
-                                            : shiftedIndex.instructionIndex + 1;
+                                            : scaledIndex.instructionIndex + 1;
                                     const int lastCheckedIndex =
-                                        i < shiftedIndex.instructionIndex
-                                            ? shiftedIndex.instructionIndex
+                                        i < scaledIndex.instructionIndex
+                                            ? scaledIndex.instructionIndex
                                             : i;
                                     for (int j = firstCheckedIndex;
                                          j < lastCheckedIndex; ++j)
                                     {
                                         if (writesRegister(
                                                 instructions[j],
-                                                shiftedIndex.sourceRegister))
+                                                scaledIndex.sourceRegister))
                                         {
                                             sourceWasClobbered = true;
                                             break;
@@ -549,7 +661,8 @@ namespace ps2recomp
                                 }
                             }
 
-                            if (!foundTable && numCases > 0 && numCases <= 1000)
+                            if (!foundTable && numCases > 0 &&
+                                numCases <= kMaxInferredTableEntries)
                             {
                                 const Section *rodata = nullptr;
                                 for (const auto &sec : m_sections)
@@ -568,7 +681,17 @@ namespace ps2recomp
                                     std::unordered_set<uint32_t> uniqueTargets;
                                     for (uint32_t i = 0; i < numCases; ++i)
                                     {
-                                        uint32_t addr = tableAddress + i * 4;
+                                        const uint64_t wideAddress =
+                                            static_cast<uint64_t>(tableAddress) +
+                                            static_cast<uint64_t>(i) *
+                                                scaledIndex.strideBytes;
+                                        if (wideAddress > UINT32_MAX)
+                                        {
+                                            validJumpTable = false;
+                                            break;
+                                        }
+                                        const uint32_t addr =
+                                            static_cast<uint32_t>(wideAddress);
                                         if (addr >= rodata->address && addr + 4 <= rodata->address + rodata->size)
                                         {
                                             uint32_t target = 0;
@@ -605,6 +728,142 @@ namespace ps2recomp
                                             }
                                         }
                                         foundTable = true;
+                                    }
+                                }
+                            }
+
+                            // Read-only sections frequently encode vtables as
+                            // fixed-size records rather than dense switch
+                            // tables. When a JALR loads one field from each
+                            // record, the section boundary supplies the table
+                            // extent. Accept the inference only when every
+                            // non-null field is a known executable target.
+                            if (!foundTable &&
+                                jrInst->function == SPECIAL_JALR &&
+                                scaledIndex.instructionIndex >= 0)
+                            {
+                                const Section *tableSection = nullptr;
+                                for (const auto &sec : m_sections)
+                                {
+                                    if (sec.isReadOnly && sec.data &&
+                                        tableAddress >= sec.address &&
+                                        tableAddress < sec.address + sec.size)
+                                    {
+                                        tableSection = &sec;
+                                        break;
+                                    }
+                                }
+
+                                if (tableSection &&
+                                    scaledIndex.strideBytes >= sizeof(uint32_t))
+                                {
+                                    const uint32_t fieldOffset =
+                                        tableAddress - tableSection->address;
+                                    const uint64_t sectionEnd =
+                                        static_cast<uint64_t>(tableSection->address) +
+                                        tableSection->size;
+                                    const bool firstFieldFits =
+                                        static_cast<uint64_t>(tableAddress) +
+                                            sizeof(uint32_t) <=
+                                        sectionEnd;
+                                    const uint32_t recordCount =
+                                        firstFieldFits
+                                            ? 1u + static_cast<uint32_t>(
+                                                       (sectionEnd - tableAddress -
+                                                        sizeof(uint32_t)) /
+                                                       scaledIndex.strideBytes)
+                                            : 0u;
+                                    if (fieldOffset < scaledIndex.strideBytes &&
+                                        recordCount > 0u &&
+                                        recordCount <= kMaxInferredTableEntries)
+                                    {
+                                        bool validFunctionTable = true;
+                                        bool foundCallableTarget = false;
+                                        std::vector<uint32_t> localTargets;
+                                        std::unordered_set<uint32_t> uniqueTargets;
+                                        for (uint32_t i = 0; i < recordCount; ++i)
+                                        {
+                                            const uint64_t wideAddress =
+                                                static_cast<uint64_t>(tableAddress) +
+                                                static_cast<uint64_t>(i) *
+                                                    scaledIndex.strideBytes;
+                                            if (wideAddress + sizeof(uint32_t) >
+                                                sectionEnd)
+                                            {
+                                                validFunctionTable = false;
+                                                break;
+                                            }
+                                            const uint32_t addr =
+                                                static_cast<uint32_t>(wideAddress);
+                                            uint32_t target = 0;
+                                            std::memcpy(
+                                                &target,
+                                                tableSection->data +
+                                                    (addr - tableSection->address),
+                                                sizeof(target));
+                                            if (target == 0u)
+                                            {
+                                                continue;
+                                            }
+                                            if ((target & 3u) != 0u ||
+                                                !isExecutableAddress(target))
+                                            {
+                                                validFunctionTable = false;
+                                                break;
+                                            }
+
+                                            const Function *targetOwner =
+                                                findContainingCallableFunction(target);
+                                            if (allFunctions && !targetOwner)
+                                            {
+                                                validFunctionTable = false;
+                                                break;
+                                            }
+
+                                            foundCallableTarget = true;
+                                            const bool isLocalTarget =
+                                                target >= function.start &&
+                                                target < function.end &&
+                                                instructionAddresses.contains(target);
+                                            if (targetOwner &&
+                                                targetOwner->start == function.start &&
+                                                !isLocalTarget)
+                                            {
+                                                validFunctionTable = false;
+                                                break;
+                                            }
+                                            if (isLocalTarget)
+                                            {
+                                                if (uniqueTargets.insert(target).second)
+                                                {
+                                                    localTargets.push_back(target);
+                                                }
+                                            }
+                                            else
+                                            {
+                                                queueExternalEntryTarget(target);
+                                            }
+                                        }
+
+                                        if (validFunctionTable &&
+                                            foundCallableTarget)
+                                        {
+                                            if (!localTargets.empty())
+                                            {
+                                                result.jumpTableTargets[
+                                                    jrInst->address] = localTargets;
+                                                for (uint32_t target : localTargets)
+                                                {
+                                                    result.entryPoints.insert(target);
+                                                    if (hasObservationModeChangingDelaySlot(
+                                                            *jrInst))
+                                                    {
+                                                        queueResumeEntryTarget(target);
+                                                    }
+                                                }
+                                            }
+                                            foundTable = true;
+                                        }
                                     }
                                 }
                             }

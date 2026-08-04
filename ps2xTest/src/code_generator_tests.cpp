@@ -1384,6 +1384,122 @@ void register_code_generator_tests()
                   "the rejected stale index should retain conservative fallback entries");
     });
 
+    tc.Run("JALR inference validates read-only strided function tables", [](TestCase &t) {
+        Function caller;
+        caller.name = "strided_function_table_caller";
+        caller.start = 0x5000u;
+        caller.end = 0x5030u;
+        caller.isRecompiled = true;
+
+        Function targetA;
+        targetA.name = "strided_target_a";
+        targetA.start = 0x6000u;
+        targetA.end = 0x6010u;
+        targetA.isRecompiled = true;
+
+        Function targetB;
+        targetB.name = "strided_target_b";
+        targetB.start = 0x6100u;
+        targetB.end = 0x6110u;
+        targetB.isRecompiled = true;
+
+        constexpr uint32_t tableAddress = 0x00200000u;
+        constexpr uint32_t recordStride = 12u;
+        constexpr uint32_t callableFieldOffset = 4u;
+        std::vector<uint8_t> tableData(recordStride * 3u, 0u);
+        const auto writeTableWord = [&](size_t offset, uint32_t value)
+        {
+            tableData[offset] = static_cast<uint8_t>(value);
+            tableData[offset + 1u] = static_cast<uint8_t>(value >> 8u);
+            tableData[offset + 2u] = static_cast<uint8_t>(value >> 16u);
+            tableData[offset + 3u] = static_cast<uint8_t>(value >> 24u);
+        };
+        writeTableWord(callableFieldOffset, 0x6004u);
+        writeTableWord(recordStride + callableFieldOffset, 0x6100u);
+
+        Section tableSection{};
+        tableSection.name = ".vtable";
+        tableSection.address = tableAddress;
+        tableSection.size = static_cast<uint32_t>(tableData.size());
+        tableSection.isData = true;
+        tableSection.isReadOnly = true;
+        tableSection.data = tableData.data();
+
+        Section codeSection{};
+        codeSection.name = ".text";
+        codeSection.address = 0x5000u;
+        codeSection.size = 0x1200u;
+        codeSection.isCode = true;
+        codeSection.isReadOnly = true;
+
+        const R5900Decoder decoder;
+        const auto decodeI = [&](uint32_t address, uint32_t opcode,
+                                 uint8_t rs, uint8_t rt, uint16_t immediate)
+        {
+            const uint32_t raw =
+                (opcode << 26u) |
+                (static_cast<uint32_t>(rs) << 21u) |
+                (static_cast<uint32_t>(rt) << 16u) |
+                immediate;
+            return decoder.decodeInstruction(address, raw, false);
+        };
+        const auto decodeR = [&](uint32_t address, uint8_t rs, uint8_t rt,
+                                 uint8_t rd, uint8_t sa, uint8_t function)
+        {
+            const uint32_t raw =
+                (static_cast<uint32_t>(rs) << 21u) |
+                (static_cast<uint32_t>(rt) << 16u) |
+                (static_cast<uint32_t>(rd) << 11u) |
+                (static_cast<uint32_t>(sa) << 6u) |
+                function;
+            return decoder.decodeInstruction(address, raw, false);
+        };
+
+        const std::vector<Instruction> instructions{
+            decodeI(0x5000u, OPCODE_ADDIU, 0u, 4u, recordStride),
+            decodeR(0x5004u, 5u, 4u, 8u, 0u, SPECIAL_MULT),
+            decodeI(0x5008u, OPCODE_LUI, 0u, 9u, 0x0020u),
+            decodeI(0x500Cu, OPCODE_ADDIU, 9u, 9u, 0u),
+            decodeR(0x5010u, 8u, 9u, 9u, 0u, SPECIAL_ADDU),
+            decodeI(0x5014u, OPCODE_LW, 9u, 10u, callableFieldOffset),
+            makeJalr(0x5018u, 10u, 31u),
+            makeNop(0x501Cu),
+            makeNop(0x5020u),
+        };
+        const std::vector<Function> functions{caller, targetA, targetB};
+        const std::vector<Symbol> symbols;
+        const std::vector<Section> sections{tableSection, codeSection};
+        CodeGenerator gen(symbols, sections);
+
+        CodeGenerator::AnalysisResult analysis =
+            gen.collectInternalBranchTargets(
+                caller, instructions, &functions);
+        t.IsTrue(analysis.indirectFallbackEntryPoints.empty(),
+                 "a fully validated read-only function table should not request fallback entries");
+        t.IsTrue(analysis.externalEntryPoints.contains(0x6004u),
+                 "a validated mid-function table target should be promoted in its owner");
+        t.IsFalse(analysis.jumpTableTargets.contains(0x5018u),
+                  "external callable targets should continue through runtime JALR dispatch");
+
+        analysis = gen.collectInternalBranchTargets(caller, instructions);
+        t.IsTrue(analysis.indirectFallbackEntryPoints.empty(),
+                 "emission analysis should validate executable table targets without function metadata");
+
+        std::vector<Section> writableSections{tableSection, codeSection};
+        writableSections[0].isReadOnly = false;
+        CodeGenerator writableGen(symbols, writableSections);
+        analysis = writableGen.collectInternalBranchTargets(
+            caller, instructions, &functions);
+        t.IsFalse(analysis.indirectFallbackEntryPoints.empty(),
+                  "a writable function table must retain conservative fallback entries");
+
+        writeTableWord(recordStride + callableFieldOffset, 0x12345678u);
+        analysis = gen.collectInternalBranchTargets(
+            caller, instructions, &functions);
+        t.IsFalse(analysis.indirectFallbackEntryPoints.empty(),
+                  "a non-executable non-null table field must reject the whole inference");
+    });
+
     tc.Run("resume entry targets emit a top-level pc switch in the owner wrapper", [](TestCase &t) {
         Function func;
         func.name = "resume_owner";
