@@ -126,6 +126,12 @@ enum class PS2GuestCheckpointResult : uint8_t
     ExitToDispatcher,
 };
 
+enum class EeArchitecturalObservationMode : uint8_t
+{
+    Fast,
+    Precise,
+};
+
 struct PS2GuestFunctionSymbol
 {
     uint32_t start;

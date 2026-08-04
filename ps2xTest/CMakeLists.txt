@@ -224,6 +224,15 @@ add_executable(ee_generated_code_benchmark
     $<TARGET_OBJECTS:ps2_test_function_table>
 )
 
+add_executable(ee_observation_policy_prototype
+    src/ee_observation_policy_prototype.cpp
+    src/ee_observation_policy_template.cpp
+    src/ee_observation_policy_explicit.cpp
+    src/ee_observation_policy_compact.cpp
+    src/ee_observation_policy_outlined.cpp
+    $<TARGET_OBJECTS:ps2_test_function_table>
+)
+
 add_executable(ee_thread_scheduler_benchmark
     src/ee_thread_scheduler_benchmark.cpp
     $<TARGET_OBJECTS:ps2_test_function_table>
@@ -301,6 +310,14 @@ target_link_libraries(ee_generated_code_benchmark PRIVATE
     ps2_runtime
 )
 
+target_include_directories(ee_observation_policy_prototype PRIVATE
+    ${CMAKE_SOURCE_DIR}/ps2xRuntime/include
+)
+
+target_link_libraries(ee_observation_policy_prototype PRIVATE
+    ps2_runtime
+)
+
 target_include_directories(ee_thread_scheduler_benchmark PRIVATE
     ${CMAKE_SOURCE_DIR}/ps2xRuntime/include
 )
@@ -329,6 +346,7 @@ if(CMAKE_BUILD_TYPE STREQUAL "Release" OR CMAKE_BUILD_TYPE STREQUAL "RelWithDebI
     EnableFastReleaseMode(ee_runtime_executor_tests)
     EnableFastReleaseMode(ee_timing_benchmark)
     EnableFastReleaseMode(ee_generated_code_benchmark)
+    EnableFastReleaseMode(ee_observation_policy_prototype)
     EnableFastReleaseMode(ee_thread_scheduler_benchmark)
     EnableFastReleaseMode(vu_backend_benchmark)
     if(TARGET vu_native_emitter_spike)
