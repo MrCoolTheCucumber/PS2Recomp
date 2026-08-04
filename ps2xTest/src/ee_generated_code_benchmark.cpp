@@ -822,7 +822,7 @@ namespace
             hash.add(context.cop0_status);
             hash.add(context.cop0_cause);
             hash.add(context.cop0_errorepc);
-            hash.add(context.cop0_random_instruction_pending);
+            hash.add(context.cop0_random_pending_retirements);
             hash.add(context.ee_performance_issue_pending);
             return hash.value();
         }

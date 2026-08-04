@@ -9031,6 +9031,13 @@ void PS2Runtime::executeGuestStep(uint8_t *rdram,
         }
     } flush{m_memory};
 
+    // Outer dispatch is an architectural publication boundary. Generated
+    // fast code may return with a completed straight-line retirement run, so
+    // materialize Random before either debugger hook can snapshot the context.
+    if (ctx)
+    {
+        ctx->finishEeInstruction();
+    }
     debugBeforeGuestStep(ctx);
     if (isStopRequested())
     {
@@ -9050,8 +9057,16 @@ void PS2Runtime::executeGuestStep(uint8_t *rdram,
     }
     catch (...)
     {
+        if (ctx)
+        {
+            ctx->finishEeInstruction();
+        }
         debugAfterGuestStep(ctx);
         throw;
+    }
+    if (ctx)
+    {
+        ctx->finishEeInstruction();
     }
     debugAfterGuestStep(ctx);
 }

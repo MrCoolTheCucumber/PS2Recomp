@@ -24,6 +24,7 @@
 #include <filesystem>
 #include <iostream>
 #include <iomanip>
+#include <limits>
 #include <memory>
 #include <optional>
 
@@ -196,7 +197,11 @@ struct alignas(16) R5900Context
     uint64_t insn_count; // Retired instruction counter
     uint32_t ee_block_cycle_ticks;
     bool ee_block_cycle_active;
-    bool cop0_random_instruction_pending;
+    // Instructions whose architectural retirement is already reflected in
+    // insn_count, but whose identical COP0 Random decrements have not yet
+    // been materialized. Generated straight-line runs may accumulate here;
+    // every architectural observation boundary drains the count first.
+    uint64_t cop0_random_pending_retirements;
     bool ee_performance_issue_pending;
     ps2x::performance::EeInstructionIssueProfile
         ee_performance_pending_issue;
@@ -290,9 +295,9 @@ struct alignas(16) R5900Context
         vi[0] = 0;
     }
 
-    void finishEeInstruction() noexcept
+    void advanceCop0Random(uint64_t retirementCount) noexcept
     {
-        if (!cop0_random_instruction_pending)
+        if (retirementCount == 0u)
         {
             return;
         }
@@ -300,20 +305,58 @@ struct alignas(16) R5900Context
         constexpr uint32_t upperBound = 47u;
         const uint32_t lowerBound =
             std::min(cop0_wired & 0x3fu, upperBound);
-        const uint32_t random =
+        const uint32_t interval =
+            upperBound - lowerBound + 1u;
+        uint32_t random =
             cop0_random & 0x3fu;
-        cop0_random =
-            random > upperBound || random <= lowerBound
-                ? upperBound
-                : random - 1u;
-        cop0_random_instruction_pending = false;
+
+        // Out-of-range state follows the scalar EE rule: the first
+        // retirement selects entry 47. Thereafter Random is a cyclic
+        // decrement over the closed [Wired, 47] interval.
+        if (random < lowerBound || random > upperBound)
+        {
+            random = upperBound;
+            --retirementCount;
+        }
+        if (retirementCount != 0u)
+        {
+            const uint32_t offset = random - lowerBound;
+            const uint32_t decrement =
+                static_cast<uint32_t>(
+                    retirementCount % interval);
+            random = lowerBound +
+                     ((offset + interval - decrement) % interval);
+        }
+        cop0_random = random;
+    }
+
+    void finishEeInstruction() noexcept
+    {
+        advanceCop0Random(
+            cop0_random_pending_retirements);
+        cop0_random_pending_retirements = 0u;
+    }
+
+    void retireEeInstructions(uint64_t retirementCount) noexcept
+    {
+        if (retirementCount == 0u)
+        {
+            return;
+        }
+        if (cop0_random_pending_retirements >
+            std::numeric_limits<uint64_t>::max() - retirementCount)
+        {
+            finishEeInstruction();
+        }
+        insn_count += retirementCount;
+        cop0_random_pending_retirements += retirementCount;
     }
 
     void beginEeInstruction() noexcept
     {
         finishEeInstruction();
         ++insn_count;
-        cop0_random_instruction_pending = true;
+        cop0_random_pending_retirements = 1u;
     }
 
     void advanceEeCycleTicks(uint32_t dualIssueTicks)
@@ -363,9 +406,12 @@ struct alignas(16) R5900Context
 
     void resetEeBlockTiming()
     {
+        // Reset and state-copy paths are architectural publication
+        // boundaries. Never discard completed Random retirements merely
+        // because the local block timing accumulator is being cleared.
+        finishEeInstruction();
         ee_block_cycle_ticks = 0u;
         ee_block_cycle_active = false;
-        cop0_random_instruction_pending = false;
         ee_performance_issue_pending = false;
         ee_performance_pending_issue = {};
     }

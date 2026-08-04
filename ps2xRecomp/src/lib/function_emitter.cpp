@@ -3,6 +3,7 @@
 #include "ps2recomp/ee_cycle_model.h"
 #include "ps2recomp/ee_observation_mode.h"
 #include "ps2recomp/ee_performance_model.h"
+#include "ps2recomp/ee_retirement_model.h"
 #include "ps2recomp/gif_dma_kick_analyzer.h"
 #include "ps2recomp/instructions.h"
 #include "ps2recomp/r5900_decoder.h"
@@ -200,16 +201,37 @@ namespace ps2recomp
 
         bool lastInstructionWasControlFlow = false;
         bool validateSequentialFetch = false;
+        uint32_t fastRetirementRun = 0u;
+        const auto emitFastRetirementRun = [&]()
+        {
+            if (fastRetirementRun == 0u)
+            {
+                return;
+            }
+            ss << "    if constexpr (Mode == "
+                  "EeArchitecturalObservationMode::Fast) { "
+                  "ctx->retireEeInstructions("
+               << fastRetirementRun << "u); }\n";
+            fastRetirementRun = 0u;
+        };
 
         for (size_t i = 0; i < scheduledInstructions.size(); ++i)
         {
             const Instruction &inst = scheduledInstructions[i];
             lastInstructionWasControlFlow = inst.hasDelaySlot;
+            const bool batchRetirement =
+                eeInstructionCanBatchRetirement(inst);
 
             if (internalTargets.contains(inst.address))
             {
+                emitFastRetirementRun();
                 constantRegisters.clear();
                 ss << "label_" << std::hex << inst.address << std::dec << ":\n";
+            }
+
+            if (!batchRetirement)
+            {
+                emitFastRetirementRun();
             }
 
             if (cg.m_emitInstructionComments)
@@ -313,7 +335,16 @@ namespace ps2recomp
                     const EeInstructionPerformanceInfo
                         performanceInfo =
                             eeInstructionPerformanceInfo(inst);
-                    ss << "    ctx->beginEeInstruction();\n";
+                    if (batchRetirement)
+                    {
+                        ss << "    if constexpr (Mode == "
+                              "EeArchitecturalObservationMode::Precise) { "
+                              "ctx->beginEeInstruction(); }\n";
+                    }
+                    else
+                    {
+                        ss << "    ctx->beginEeInstruction();\n";
+                    }
                     ss << "    ctx->advanceEeCycleTicks("
                        << eeInstructionCycleTicks(inst) << "u);\n";
                     if (!gifDmaKickPlan.valid)
@@ -410,6 +441,10 @@ namespace ps2recomp
                     }
 
                     updateConstantRegisters(inst, constantRegisters);
+                    if (batchRetirement)
+                    {
+                        ++fastRetirementRun;
+                    }
                     validateSequentialFetch =
                         changesEeAddressMode(inst);
                 }
@@ -426,6 +461,8 @@ namespace ps2recomp
                 throw;
             }
         }
+
+        emitFastRetirementRun();
 
         // Fallthrough with no terminating branch: advance ctx->pc past the function so dispatchLoop doesn't re-call it forever.
         if (!instructions.empty() && !lastInstructionWasControlFlow)
