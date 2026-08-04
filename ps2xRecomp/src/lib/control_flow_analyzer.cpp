@@ -1,4 +1,5 @@
 #include "ps2recomp/control_flow_analyzer.h"
+#include "ps2recomp/ee_observation_mode.h"
 #include "ps2recomp/gif_dma_kick_analyzer.h"
 #include "ps2recomp/types.h"
 #include "ps2recomp/instructions.h"
@@ -28,6 +29,9 @@ namespace ps2recomp
         ControlFlowAnalysisResult result;
         std::unordered_set<uint32_t> instructionAddresses;
         instructionAddresses.reserve(instructions.size());
+        std::unordered_map<uint32_t, const Instruction *>
+            instructionsByAddress;
+        instructionsByAddress.reserve(instructions.size());
         bool hasIndirectRegisterJump = false;
         std::vector<const Instruction *> indirectJumps;
 
@@ -136,6 +140,7 @@ namespace ps2recomp
         for (const auto &inst : instructions)
         {
             instructionAddresses.insert(inst.address);
+            instructionsByAddress.emplace(inst.address, &inst);
             if (inst.opcode == OPCODE_SPECIAL &&
                 ((inst.function == SPECIAL_JR && inst.rs != 31) ||
                  inst.function == SPECIAL_JALR))
@@ -145,11 +150,39 @@ namespace ps2recomp
             }
         }
 
+        auto hasObservationModeChangingDelaySlot =
+            [&](const Instruction &inst)
+        {
+            if (!inst.hasDelaySlot)
+            {
+                return false;
+            }
+            const auto delay =
+                instructionsByAddress.find(inst.address + 4u);
+            return delay != instructionsByAddress.end() &&
+                   mayChangeEeArchitecturalObservationMode(
+                       *delay->second);
+        };
+
+        // A specialization transition after an ordinary MTC0 resumes at the
+        // following instruction. Delay-slot writes also use this fallthrough
+        // for the not-taken path of likely branches; resolved taken targets
+        // are added with their owning control-flow instruction below.
+        for (const Instruction &inst : instructions)
+        {
+            if (mayChangeEeArchitecturalObservationMode(inst))
+            {
+                queueResumeEntryTarget(inst.address + 4u);
+            }
+        }
+
         for (const auto &inst : instructions)
         {
             bool isStaticJump = (inst.opcode == OPCODE_J || inst.opcode == OPCODE_JAL);
             if (inst.isBranch && inst.opcode != OPCODE_J && inst.opcode != OPCODE_JAL)
             {
+                const bool transitionDelay =
+                    hasObservationModeChangingDelaySlot(inst);
                 const int32_t offsetBytes = (static_cast<int32_t>(static_cast<int16_t>(inst.simmediate)) << 2);
                 const uint32_t target = static_cast<uint32_t>(
                     static_cast<int64_t>(inst.address + 4u) + static_cast<int64_t>(offsetBytes));
@@ -159,6 +192,10 @@ namespace ps2recomp
                 {
                     result.entryPoints.insert(target);
                     queueLoopResumeEntryTarget(target, inst.address);
+                    if (transitionDelay)
+                    {
+                        queueResumeEntryTarget(target);
+                    }
                 }
                 else
                 {
@@ -169,15 +206,25 @@ namespace ps2recomp
                 {
                     queueResumeEntryTarget(inst.address + 8u);
                 }
+                else if (transitionDelay)
+                {
+                    queueResumeEntryTarget(inst.address + 8u);
+                }
             }
             else if (isStaticJump)
             {
+                const bool transitionDelay =
+                    hasObservationModeChangingDelaySlot(inst);
                 uint32_t target = buildAbsoluteJumpTarget(inst.address, inst.target);
                 if (target >= function.start && target < function.end &&
                     instructionAddresses.contains(target))
                 {
                     result.entryPoints.insert(target);
                     queueLoopResumeEntryTarget(target, inst.address);
+                    if (transitionDelay)
+                    {
+                        queueResumeEntryTarget(target);
+                    }
 
                     if (inst.opcode == OPCODE_JAL)
                     {
@@ -378,6 +425,11 @@ namespace ps2recomp
                                     for (uint32_t target : jrTargets)
                                     {
                                         result.entryPoints.insert(target);
+                                        if (hasObservationModeChangingDelaySlot(
+                                                *jrInst))
+                                        {
+                                            queueResumeEntryTarget(target);
+                                        }
                                     }
                                     foundTable = true;
                                 }
@@ -457,6 +509,11 @@ namespace ps2recomp
                                         for (uint32_t t : jrTargets)
                                         {
                                             result.entryPoints.insert(t);
+                                            if (hasObservationModeChangingDelaySlot(
+                                                    *jrInst))
+                                            {
+                                                queueResumeEntryTarget(t);
+                                            }
                                         }
                                         foundTable = true;
                                     }

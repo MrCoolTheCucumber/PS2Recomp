@@ -421,6 +421,109 @@ namespace
         }
     }
 
+    constexpr uint32_t kObservationTransitionMiddle = 0x00007000u;
+    constexpr uint32_t kObservationTransitionLeaf = 0x00007100u;
+    constexpr uint32_t kObservationTransitionResume = 0x80007200u;
+    constexpr uint32_t kObservationTransitionMiddleAlias =
+        0x80000000u | kObservationTransitionMiddle;
+    constexpr uint32_t kObservationTransitionLeafAlias =
+        0x80000000u | kObservationTransitionLeaf;
+
+    enum class ObservationTransitionWrite : uint8_t
+    {
+        Breakpoint,
+        Performance,
+    };
+
+    struct ObservationTransitionFixture
+    {
+        ObservationTransitionWrite write =
+            ObservationTransitionWrite::Breakpoint;
+        uint32_t selector = 0u;
+        uint32_t value = 0u;
+        EeArchitecturalObservationMode previousMode =
+            EeArchitecturalObservationMode::Fast;
+        PS2Runtime::GuestBranchKind nestedKind =
+            PS2Runtime::GuestBranchKind::DirectCall;
+        bool boundaryChanged = false;
+        uint32_t leafContinuationCount = 0u;
+        uint32_t middleContinuationCount = 0u;
+    };
+
+    ObservationTransitionFixture gObservationTransitionFixture{};
+
+    void testObservationTransitionLeaf(
+        uint8_t *rdram,
+        R5900Context *ctx,
+        PS2Runtime *runtime)
+    {
+        if (!ctx || !runtime)
+        {
+            return;
+        }
+
+        if (gObservationTransitionFixture.write ==
+            ObservationTransitionWrite::Breakpoint)
+        {
+            runtime->writeCop0Breakpoint(
+                ctx,
+                gObservationTransitionFixture.selector,
+                gObservationTransitionFixture.value);
+        }
+        else
+        {
+            runtime->writeCop0Performance(
+                rdram,
+                ctx,
+                gObservationTransitionFixture.selector,
+                gObservationTransitionFixture.value);
+        }
+
+        // This is the shape emitted after the changing instruction has
+        // completed: publish its exact continuation, finish the boundary,
+        // and return immediately if the specialization no longer matches.
+        ctx->pc = kObservationTransitionResume;
+        gObservationTransitionFixture.boundaryChanged =
+            runtime->completeEeObservationModeTransition(
+                rdram,
+                ctx,
+                gObservationTransitionFixture.previousMode);
+        if (gObservationTransitionFixture.boundaryChanged)
+        {
+            return;
+        }
+
+        ++gObservationTransitionFixture.leafContinuationCount;
+        ctx->pc = kObservationTransitionLeaf;
+    }
+
+    void testObservationTransitionMiddle(
+        uint8_t *rdram,
+        R5900Context *ctx,
+        PS2Runtime *runtime)
+    {
+        if (!ctx || !runtime)
+        {
+            return;
+        }
+
+        const bool returned = runtime->dispatchGuestBranch(
+            rdram,
+            ctx,
+            kObservationTransitionLeafAlias,
+            kObservationTransitionMiddleAlias,
+            kObservationTransitionMiddle + 8u,
+            gObservationTransitionFixture.nestedKind,
+            "observation-transition-leaf");
+        if (!returned)
+        {
+            return;
+        }
+
+        ++gObservationTransitionFixture.middleContinuationCount;
+        ctx->pc = kObservationTransitionMiddle;
+    }
+
     constexpr uint32_t kExceptionUnwindEntry = 0x160000u;
     constexpr uint32_t kExceptionUnwindNested = 0x160100u;
     constexpr uint32_t kExceptionUnwindVector = 0x00000180u;
@@ -1026,6 +1129,36 @@ void register_ps2_runtime_expansion_tests()
             t.Equals(
                 ::getRegU32(&ctx, 2), 0x33333333u,
                 "active module lookup should select its precise entry when observation is enabled");
+
+            std::memset(&ctx, 0, sizeof(ctx));
+            runtime.writeCop0Breakpoint(
+                &ctx, 0u, 1u << 31u);
+            ctx.pc = 0x80000000u | kModuleOnlyEntry;
+            t.IsTrue(
+                runtime.completeEeObservationModeTransition(
+                    runtime.memory().getRDRAM(),
+                    &ctx,
+                    EeArchitecturalObservationMode::Fast),
+                "a fast-to-precise boundary should redispatch into an active fixed-address module");
+            runtime.lookupFunction(ctx.pc, &ctx)(
+                runtime.memory().getRDRAM(), &ctx, &runtime);
+            t.Equals(
+                ::getRegU32(&ctx, 2), 0x33333333u,
+                "module redispatch should select the precise entry after BPC enable");
+
+            runtime.writeCop0Breakpoint(&ctx, 0u, 0u);
+            ctx.pc = 0x80000000u | kModuleOnlyEntry;
+            t.IsTrue(
+                runtime.completeEeObservationModeTransition(
+                    runtime.memory().getRDRAM(),
+                    &ctx,
+                    EeArchitecturalObservationMode::Precise),
+                "a precise-to-fast boundary should redispatch within an active fixed-address module");
+            runtime.lookupFunction(ctx.pc, &ctx)(
+                runtime.memory().getRDRAM(), &ctx, &runtime);
+            t.Equals(
+                ::getRegU32(&ctx, 2), 0x22222222u,
+                "module redispatch should select the fast entry after BPC disable");
 
             runtime.memory().getRDRAM()[kMatchAddress] ^= 0x01u;
             t.IsFalse(
@@ -2638,6 +2771,256 @@ void register_ps2_runtime_expansion_tests()
                      "the callee should have observed a cooperative preemption request");
         });
 
+        tc.Run("observation mode transitions unwind nested calls at the resolved boundary", [](TestCase &t)
+        {
+            constexpr uint32_t kBpcIae = 1u << 31u;
+            constexpr uint32_t kBpcIke = 1u << 24u;
+            constexpr uint32_t kPccrCte = 1u << 31u;
+
+            struct Outcome
+            {
+                bool returned = false;
+                bool raised = false;
+                bool boundaryChanged = false;
+                uint32_t leafContinuations = 0u;
+                uint32_t middleContinuations = 0u;
+                uint32_t selectedMarker = 0u;
+                uint32_t pc = 0u;
+                uint32_t errorEpc = 0u;
+                EeArchitecturalObservationMode mode =
+                    EeArchitecturalObservationMode::Fast;
+            };
+
+            const auto run =
+                [](uint32_t initialBpc,
+                   uint32_t initialPccr,
+                   ObservationTransitionWrite write,
+                   uint32_t selector,
+                   uint32_t value,
+                   EeArchitecturalObservationMode previousMode,
+                   PS2Runtime::GuestBranchKind outerKind,
+                   PS2Runtime::GuestBranchKind nestedKind,
+                   bool matchResumeBreakpoint = false)
+                {
+                    PS2Runtime runtime;
+                    uint8_t *const rdram =
+                        runtime.memory().getRDRAM();
+                    runtime.registerFunction(
+                        kObservationTransitionMiddle,
+                        {&testObservationTransitionMiddle,
+                         &testObservationTransitionMiddle});
+                    runtime.registerFunction(
+                        kObservationTransitionLeaf,
+                        {&testObservationTransitionLeaf,
+                         &testObservationTransitionLeaf});
+                    runtime.registerFunction(
+                        kObservationTransitionResume,
+                        {&testFastObservationFunction,
+                         &testPreciseObservationFunction});
+
+                    R5900Context ctx{};
+                    ctx.pc = 0x80006000u;
+                    ctx.cop0_bpc = initialBpc;
+                    if (matchResumeBreakpoint)
+                    {
+                        ctx.cop0_iab =
+                            kObservationTransitionResume;
+                        ctx.cop0_iabm = 0xffffffffu;
+                    }
+                    if (initialPccr != 0u)
+                    {
+                        runtime.writeCop0Performance(
+                            rdram, &ctx, 0u, initialPccr);
+                    }
+
+                    gObservationTransitionFixture = {};
+                    gObservationTransitionFixture.write = write;
+                    gObservationTransitionFixture.selector = selector;
+                    gObservationTransitionFixture.value = value;
+                    gObservationTransitionFixture.previousMode =
+                        previousMode;
+                    gObservationTransitionFixture.nestedKind =
+                        nestedKind;
+
+                    Outcome outcome{};
+                    try
+                    {
+                        outcome.returned =
+                            runtime.dispatchGuestBranch(
+                                rdram,
+                                &ctx,
+                                kObservationTransitionMiddleAlias,
+                                0x80006000u,
+                                0x80006008u,
+                                outerKind,
+                                "observation-transition-middle");
+                    }
+                    catch (const PS2GuestException &)
+                    {
+                        outcome.raised = true;
+                    }
+
+                    outcome.boundaryChanged =
+                        gObservationTransitionFixture.boundaryChanged;
+                    outcome.leafContinuations =
+                        gObservationTransitionFixture
+                            .leafContinuationCount;
+                    outcome.middleContinuations =
+                        gObservationTransitionFixture
+                            .middleContinuationCount;
+                    outcome.pc = ctx.pc;
+                    outcome.errorEpc = ctx.cop0_errorepc;
+                    outcome.mode =
+                        PS2Runtime::architecturalObservationMode(
+                            &ctx);
+
+                    if (!outcome.raised &&
+                        ctx.pc == kObservationTransitionResume)
+                    {
+                        PS2Runtime::RecompiledFunction continuation =
+                            runtime.lookupFunction(ctx.pc, &ctx);
+                        continuation(rdram, &ctx, &runtime);
+                        outcome.selectedMarker =
+                            ::getRegU32(&ctx, 2);
+                    }
+                    return outcome;
+                };
+
+            const Outcome breakpointEnable = run(
+                0u, 0u,
+                ObservationTransitionWrite::Breakpoint,
+                0u, kBpcIae,
+                EeArchitecturalObservationMode::Fast,
+                PS2Runtime::GuestBranchKind::DirectCall,
+                PS2Runtime::GuestBranchKind::DirectCall);
+            t.IsFalse(
+                breakpointEnable.returned,
+                "enabling BPC observation should unwind both direct callers");
+            t.IsTrue(
+                breakpointEnable.boundaryChanged,
+                "the fast leaf should recognize its transition to precise mode");
+            t.Equals(
+                breakpointEnable.leafContinuations +
+                    breakpointEnable.middleContinuations,
+                0u,
+                "no old-mode continuation should run after enabling BPC");
+            t.Equals(
+                breakpointEnable.pc,
+                kObservationTransitionResume,
+                "the dispatcher should receive the first eligible following instruction");
+            t.Equals(
+                breakpointEnable.selectedMarker,
+                0xEC1AEC1Au,
+                "redispatch should select the precise continuation");
+
+            const Outcome breakpointDisable = run(
+                kBpcIae, 0u,
+                ObservationTransitionWrite::Breakpoint,
+                0u, 0u,
+                EeArchitecturalObservationMode::Precise,
+                PS2Runtime::GuestBranchKind::IndirectCall,
+                PS2Runtime::GuestBranchKind::DirectCall);
+            t.IsFalse(
+                breakpointDisable.returned,
+                "disabling BPC observation should unwind an indirect outer caller");
+            t.Equals(
+                breakpointDisable.selectedMarker,
+                0xFA57FA57u,
+                "BPC disable should redispatch to the fast continuation");
+
+            const Outcome addressWhileEnabled = run(
+                kBpcIae, 0u,
+                ObservationTransitionWrite::Breakpoint,
+                2u, 0x80001234u,
+                EeArchitecturalObservationMode::Precise,
+                PS2Runtime::GuestBranchKind::DirectCall,
+                PS2Runtime::GuestBranchKind::IndirectCall);
+            t.IsTrue(
+                addressWhileEnabled.returned,
+                "an address write while BPC remains enabled should return normally");
+            t.IsFalse(
+                addressWhileEnabled.boundaryChanged,
+                "address and mask changes in precise mode should not force redispatch");
+            t.Equals(
+                addressWhileEnabled.leafContinuations, 1u,
+                "the precise leaf should continue after a non-transitioning address write");
+            t.Equals(
+                addressWhileEnabled.middleContinuations, 1u,
+                "no unwind epoch should leak into the nested caller");
+
+            const Outcome maskWhileEnabled = run(
+                kBpcIae, 0u,
+                ObservationTransitionWrite::Breakpoint,
+                3u, 0xfffffffcu,
+                EeArchitecturalObservationMode::Precise,
+                PS2Runtime::GuestBranchKind::IndirectCall,
+                PS2Runtime::GuestBranchKind::DirectCall);
+            t.IsTrue(
+                maskWhileEnabled.returned &&
+                    !maskWhileEnabled.boundaryChanged,
+                "a mask write while BPC remains enabled should not force redispatch");
+            t.Equals(
+                maskWhileEnabled.leafContinuations +
+                    maskWhileEnabled.middleContinuations,
+                2u,
+                "address-mask writes should preserve both precise continuations");
+
+            const Outcome pccrEnable = run(
+                0u, 0u,
+                ObservationTransitionWrite::Performance,
+                0u, kPccrCte,
+                EeArchitecturalObservationMode::Fast,
+                PS2Runtime::GuestBranchKind::IndirectCall,
+                PS2Runtime::GuestBranchKind::IndirectCall);
+            t.IsTrue(
+                pccrEnable.boundaryChanged,
+                "PCCR.CTE enable should use the same fast-to-precise boundary");
+            t.Equals(
+                pccrEnable.selectedMarker,
+                0xEC1AEC1Au,
+                "PCCR.CTE enable should select the precise continuation");
+
+            const Outcome pccrDisable = run(
+                0u, kPccrCte,
+                ObservationTransitionWrite::Performance,
+                0u, 0u,
+                EeArchitecturalObservationMode::Precise,
+                PS2Runtime::GuestBranchKind::DirectCall,
+                PS2Runtime::GuestBranchKind::DirectCall);
+            t.IsTrue(
+                pccrDisable.boundaryChanged,
+                "PCCR.CTE disable should use the precise-to-fast boundary");
+            t.Equals(
+                pccrDisable.selectedMarker,
+                0xFA57FA57u,
+                "PCCR.CTE disable should select the fast continuation");
+
+            const Outcome breakpointException = run(
+                0u, 0u,
+                ObservationTransitionWrite::Breakpoint,
+                0u, kBpcIae | kBpcIke,
+                EeArchitecturalObservationMode::Fast,
+                PS2Runtime::GuestBranchKind::DirectCall,
+                PS2Runtime::GuestBranchKind::DirectCall,
+                true);
+            t.IsTrue(
+                breakpointException.raised,
+                "newly enabled instruction observation should validate the following fetch in precise mode");
+            t.Equals(
+                breakpointException.errorEpc,
+                kObservationTransitionResume,
+                "a transition-boundary breakpoint should restart at the following instruction");
+            t.Equals(
+                breakpointException.pc,
+                0x80000100u,
+                "the first precise fetch should enter the level-two debug vector");
+            t.Equals(
+                breakpointException.leafContinuations +
+                    breakpointException.middleContinuations,
+                0u,
+                "an exception at the transition boundary should unwind every old-mode caller");
+        });
+
         tc.Run("dispatchGuestBranch rejects missing exact targets", [](TestCase &t)
         {
             PS2Runtime runtime;
@@ -2698,6 +3081,51 @@ void register_ps2_runtime_expansion_tests()
             t.IsFalse(
                 (callbackCtx.cop0_status & COP0_STATUS_EXL) != 0u,
                 "the callback return boundary must not raise a TLB-refill exception");
+        });
+
+        tc.Run("callback return mode transitions preserve the host sentinel boundary", [](TestCase &t)
+        {
+            constexpr uint32_t kBpcIae = 1u << 31u;
+            PS2Runtime runtime;
+            R5900Context callbackCtx{};
+            callbackCtx.pc = 0x00180000u;
+            callbackCtx.cop0_bpc = kBpcIae;
+
+            bool changed = false;
+            bool raised = false;
+            {
+                PS2Runtime::AsyncCallbackInvocationScope callback(
+                    &runtime, &callbackCtx);
+                runtime.writeCop0Breakpoint(
+                    &callbackCtx, 0u, kBpcIae);
+                runtime.writeCop0Breakpoint(
+                    &callbackCtx, 0u, 0u);
+                callbackCtx.pc = 0u;
+                raised = raisesGuestException([&]
+                {
+                    changed =
+                        runtime.completeEeObservationModeTransitionAtGuestBranch(
+                            runtime.memory().getRDRAM(),
+                            &callbackCtx,
+                            EeArchitecturalObservationMode::Precise,
+                            PS2Runtime::GuestBranchKind::Return);
+                });
+            }
+
+            t.IsFalse(
+                raised,
+                "a precise-to-fast return transition should consume the active callback sentinel before fetch validation");
+            t.IsTrue(
+                changed,
+                "disabling observation in a callback return delay slot should request redispatch/unwind");
+            t.Equals(
+                callbackCtx.pc, 0u,
+                "the transition boundary should preserve the host callback return sentinel");
+            t.Equals(
+                PS2Runtime::architecturalObservationMode(
+                    &callbackCtx),
+                EeArchitecturalObservationMode::Fast,
+                "the callback context should expose its new mode before returning to the host");
         });
 
         tc.Run("async callback context inherits the interrupted EE snapshot", [](TestCase &t)

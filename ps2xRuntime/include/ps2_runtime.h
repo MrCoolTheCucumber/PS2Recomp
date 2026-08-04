@@ -1275,6 +1275,20 @@ public:
     [[nodiscard]] static EeArchitecturalObservationMode
     architecturalObservationMode(
         const R5900Context *ctx) noexcept;
+    // Generated code captures the derived mode immediately before a
+    // statically known BPC/PCCR write, then calls this only after the changing
+    // instruction has completed. On a real mode change, finish the resolved
+    // boundary and advance the same epoch used by stackless checkpoints so
+    // nested generated calls unwind.
+    [[nodiscard]] bool completeEeObservationModeTransition(
+        uint8_t *rdram,
+        R5900Context *ctx,
+        EeArchitecturalObservationMode previousMode);
+    [[nodiscard]] bool completeEeObservationModeTransitionAtGuestBranch(
+        uint8_t *rdram,
+        R5900Context *ctx,
+        EeArchitecturalObservationMode previousMode,
+        GuestBranchKind kind);
     // Compatibility lookup is deliberately precise. Runtime-owned execution
     // paths pass their context and select the pair once at the transfer.
     RecompiledFunction lookupFunction(uint32_t address);
@@ -1394,6 +1408,10 @@ public:
         uint8_t *rdram,
         R5900Context *ctx,
         uint32_t selector);
+    void writeCop0Breakpoint(
+        R5900Context *ctx,
+        uint32_t selector,
+        uint32_t value);
     void writeCop0Performance(
         uint8_t *rdram,
         R5900Context *ctx,

@@ -209,6 +209,222 @@ void register_cop0_hardware_breakpoint_tests()
                 "an elided NOP delay slot should still check its virtual instruction address");
         });
 
+        tc.Run("generated mode writes exit only after a resumable instruction boundary", [](TestCase &t)
+        {
+            const auto mtc0 =
+                [](uint32_t address,
+                   uint32_t rd,
+                   uint32_t selector)
+                {
+                    return decode(
+                        address,
+                        (OPCODE_COP0 << 26u) |
+                            (COP0_MT << 21u) |
+                            (8u << 16u) |
+                            (rd << 11u) |
+                            selector);
+                };
+
+            CodeGenerator generator({}, {});
+            const Instruction bpcWrite =
+                mtc0(0x4000u, COP0_REG_DEBUG,
+                     COP0_BREAKPOINT_BPC);
+            const std::string ordinary =
+                generator.generateFunction(
+                    makeFunction(
+                        "observation_transition",
+                        0x4000u, 0x4008u),
+                    {bpcWrite, decode(0x4004u, 0u)},
+                    false);
+
+            const std::size_t modeBefore = ordinary.find(
+                "eeObservationModeBefore_4000 = "
+                "PS2Runtime::architecturalObservationMode(ctx);");
+            const std::size_t write = ordinary.find(
+                "runtime->writeCop0Breakpoint(ctx, 0u");
+            const std::size_t completion = ordinary.find(
+                "runtime->recordEeInstructionCompletion",
+                write);
+            const std::size_t nextPc = ordinary.find(
+                "ctx->pc = 0x4004u;", completion);
+            const std::size_t transition = ordinary.find(
+                "completeEeObservationModeTransition(",
+                nextPc);
+            t.IsTrue(
+                modeBefore != std::string::npos &&
+                    write != std::string::npos &&
+                    completion != std::string::npos &&
+                    modeBefore < write &&
+                    write < completion &&
+                    completion < nextPc &&
+                    nextPc < transition,
+                "a BPC write should compare its pre-write mode only after completing and resolving the following instruction boundary");
+            t.IsTrue(
+                ordinary.find(
+                    "rdram, ctx, eeObservationModeBefore_4000))") !=
+                    std::string::npos,
+                "the transition detector should not assume which shared specialization entry invoked the generated body");
+            t.IsTrue(
+                ordinary.find(
+                    "case 0x4004u: goto label_4004;") !=
+                    std::string::npos,
+                "the following instruction should be a registered owner resume label");
+
+            const Instruction pccrWrite =
+                mtc0(0x4100u, COP0_REG_PERF, 0u);
+            const std::string performance =
+                generator.generateFunction(
+                    makeFunction(
+                        "performance_transition",
+                        0x4100u, 0x4108u),
+                    {pccrWrite, decode(0x4104u, 0u)},
+                    false);
+            t.IsTrue(
+                performance.find(
+                    "runtime->writeCop0Performance(rdram, ctx, 0u") !=
+                        std::string::npos &&
+                    performance.find(
+                        "completeEeObservationModeTransition(") !=
+                        std::string::npos,
+                "PCCR writes should share the same post-completion transition boundary");
+            const std::size_t performanceWrite = performance.find(
+                "runtime->writeCop0Performance(rdram, ctx, 0u");
+            const std::size_t performanceCompletion = performance.find(
+                "runtime->recordEeInstructionCompletion",
+                performanceWrite);
+            const std::size_t performanceTransition = performance.find(
+                "completeEeObservationModeTransition(",
+                performanceCompletion);
+            t.IsTrue(
+                performanceWrite < performanceCompletion &&
+                    performanceCompletion < performanceTransition,
+                "PCCR transition detection should occur only after the MTC0 completion event has been counted");
+
+            const Instruction branch = decodeIType(
+                0x5000u, OPCODE_BEQ, 1u, 1u, 2u);
+            const Instruction delayWrite =
+                mtc0(0x5004u, COP0_REG_DEBUG,
+                     COP0_BREAKPOINT_BPC);
+            const std::string delayed =
+                generator.generateFunction(
+                    makeFunction(
+                        "delay_transition",
+                        0x5000u, 0x5010u),
+                    {branch, delayWrite,
+                     decode(0x5008u, 0u),
+                     decode(0x500Cu, 0u)},
+                    false);
+            const std::size_t delayCleared = delayed.find(
+                "ctx->in_delay_slot = false;");
+            const std::size_t delayedTransition = delayed.find(
+                "completeEeObservationModeTransition(",
+                delayCleared);
+            t.IsTrue(
+                delayCleared != std::string::npos &&
+                    delayedTransition != std::string::npos &&
+                    delayCleared < delayedTransition,
+                "a delay-slot mode write should not exit until branch-delay ownership is cleared");
+            t.IsTrue(
+                delayed.find(
+                    "case 0x5008u: goto label_5008;") !=
+                        std::string::npos &&
+                    delayed.find(
+                        "case 0x500cu: goto label_500c;") !=
+                        std::string::npos,
+                "both resolved conditional continuations should be resumable after a delay-slot transition");
+
+            const Instruction likelyBranch = decodeIType(
+                0x5100u, OPCODE_BEQL, 1u, 1u, 2u);
+            const std::string likely =
+                generator.generateFunction(
+                    makeFunction(
+                        "likely_delay_transition",
+                        0x5100u, 0x5110u),
+                    {likelyBranch,
+                     mtc0(0x5104u, COP0_REG_DEBUG,
+                          COP0_BREAKPOINT_BPC),
+                     decode(0x5108u, 0u),
+                     decode(0x510Cu, 0u)},
+                    false);
+            t.Equals(
+                countOccurrences(
+                    likely,
+                    "runtime->writeCop0Breakpoint(ctx, 0u"),
+                static_cast<std::size_t>(1u),
+                "a likely branch should emit the mode-changing delay effect only on its taken path");
+            t.Equals(
+                countOccurrences(
+                    likely,
+                    "completeEeObservationModeTransition("),
+                static_cast<std::size_t>(1u),
+                "an annulled likely delay slot should not test a transition that never occurred");
+            t.IsTrue(
+                likely.find(
+                    "case 0x5108u: goto label_5108;") !=
+                        std::string::npos &&
+                    likely.find(
+                        "case 0x510cu: goto label_510c;") !=
+                        std::string::npos,
+                "likely annulment and taken execution should retain distinct resumable continuations");
+
+            const Instruction returnBranch = decode(
+                0x6000u,
+                (OPCODE_SPECIAL << 26u) |
+                    (31u << 21u) |
+                    SPECIAL_JR);
+            const std::string returning =
+                generator.generateFunction(
+                    makeFunction(
+                        "return_transition",
+                        0x6000u, 0x6008u),
+                    {returnBranch,
+                     mtc0(0x6004u, COP0_REG_DEBUG,
+                          COP0_BREAKPOINT_BPC)},
+                    false);
+            const std::size_t returnTransition = returning.find(
+                "completeEeObservationModeTransitionAtGuestBranch(");
+            const std::size_t returnValidation = returning.find(
+                "ValidateGuestBranchTarget(");
+            t.IsTrue(
+                returnTransition != std::string::npos &&
+                    returnValidation != std::string::npos &&
+                    returnTransition < returnValidation,
+                "return transitions should preserve callback-sentinel validation inside the transition boundary");
+
+            CodeGenerator relocatedGenerator({}, {});
+            relocatedGenerator.setRelocationCallNames(
+                {{0x6100u, "ReleaseAlarm"}});
+            const uint32_t relocatedTarget = 0x7000u;
+            const std::string relocated =
+                relocatedGenerator.generateFunction(
+                    makeFunction(
+                        "relocated_transition",
+                        0x6100u, 0x6108u),
+                    {decode(
+                         0x6100u,
+                         (OPCODE_JAL << 26u) |
+                             ((relocatedTarget >> 2u) &
+                              0x03ffffffu)),
+                     mtc0(0x6104u, COP0_REG_DEBUG,
+                          COP0_BREAKPOINT_BPC)},
+                    false);
+            const std::size_t deferredTransition = relocated.find(
+                "const bool eeObservationModeChangedAfter_6104 = "
+                "runtime->completeEeObservationModeTransition(");
+            const std::size_t replacement = relocated.find(
+                "ps2_syscalls::ReleaseAlarm(rdram, ctx, runtime);");
+            const std::size_t deferredExit = relocated.find(
+                "if (eeObservationModeChangedAfter_6104) { return; }",
+                replacement);
+            t.IsTrue(
+                deferredTransition != std::string::npos &&
+                    replacement != std::string::npos &&
+                    deferredExit != std::string::npos &&
+                    deferredTransition < replacement &&
+                    replacement < deferredExit,
+                "a relocated call should finish its replacement handler before unwinding the old specialization");
+        });
+
         tc.Run("instruction match enters the normal level two debug vector", [](TestCase &t)
         {
             PS2Runtime runtime;

@@ -2,6 +2,7 @@
 
 #include "ps2recomp/control_flow_utils.h"
 #include "ps2recomp/ee_cycle_model.h"
+#include "ps2recomp/ee_observation_mode.h"
 #include "ps2recomp/ee_performance_model.h"
 #include "ps2recomp/instructions.h"
 #include "ps2recomp/r5900_decoder.h"
@@ -145,18 +146,52 @@ namespace ps2recomp
 
     void ControlFlowEmitter::emitResolvedBasicBlockBoundary(
         uint32_t nextPc,
-        std::string_view indent)
+        std::string_view indent,
+        ObservationModeTransitionExit transitionExit)
     {
         emitResolvedBasicBlockBoundary(
-            fmt::format("0x{:X}u", nextPc), indent);
+            fmt::format("0x{:X}u", nextPc), indent,
+            transitionExit);
     }
 
     void ControlFlowEmitter::emitResolvedBasicBlockBoundary(
         std::string_view nextPcExpression,
-        std::string_view indent)
+        std::string_view indent,
+        ObservationModeTransitionExit transitionExit)
     {
         m_ss << fmt::format(
             "{}ctx->pc = {};\n", indent, nextPcExpression);
+        const bool completedModeWrite =
+            transitionExit !=
+                ObservationModeTransitionExit::DelaySlotNotExecuted &&
+            mayChangeEeArchitecturalObservationMode(m_delaySlot);
+        if (completedModeWrite)
+        {
+            const std::string modeBefore = fmt::format(
+                "eeObservationModeBefore_{:x}", delayPc());
+            if (transitionExit ==
+                ObservationModeTransitionExit::Deferred)
+            {
+                const std::string modeChanged = fmt::format(
+                    "eeObservationModeChangedAfter_{:x}", delayPc());
+                m_ss << fmt::format(
+                    "{}const bool {} = runtime->completeEeObservationModeTransition("
+                    "rdram, ctx, {});\n",
+                    indent, modeChanged, modeBefore);
+                m_ss << fmt::format("{}if (!{}) {{\n", indent, modeChanged);
+                m_ss << fmt::format(
+                    "{}    runtime->ValidateInstructionFetch(ctx, ctx->pc);\n",
+                    indent);
+                emitBasicBlockBoundary(fmt::format("{}    ", indent));
+                m_ss << fmt::format("{}}}\n", indent);
+                return;
+            }
+
+            m_ss << fmt::format(
+                "{}if (runtime->completeEeObservationModeTransition("
+                "rdram, ctx, {})) {{ return; }}\n",
+                indent, modeBefore);
+        }
         m_ss << fmt::format(
             "{}runtime->ValidateInstructionFetch(ctx, ctx->pc);\n",
             indent);
@@ -215,6 +250,14 @@ namespace ps2recomp
             m_ss << indent
                  << eeInstructionCompletionCall(m_delaySlot)
                  << "\n";
+        }
+        if (mayChangeEeArchitecturalObservationMode(m_delaySlot))
+        {
+            m_ss << fmt::format(
+                "{}const EeArchitecturalObservationMode "
+                "eeObservationModeBefore_{:x} = "
+                "PS2Runtime::architecturalObservationMode(ctx);\n",
+                indent, delayPc());
         }
         const std::string code = delaySlotCode(branchDelayExecution);
         std::istringstream lines(code);
@@ -323,6 +366,24 @@ namespace ps2recomp
         return true;
     }
 
+    bool ControlFlowEmitter::hasRelocationCall() const
+    {
+        const auto relocIt =
+            m_gen.m_relocationCallNames.find(m_branchInst.address);
+        if (relocIt == m_gen.m_relocationCallNames.end() ||
+            relocIt->second.empty())
+        {
+            return false;
+        }
+
+        return !ps2_runtime_calls::resolveSyscallName(
+                    relocIt->second)
+                    .empty() ||
+               !ps2_runtime_calls::resolveStubName(
+                    relocIt->second)
+                    .empty();
+    }
+
     void ControlFlowEmitter::emitExternalJumpDispatch(uint32_t target, StaticBranchKind kind, std::string_view indent)
     {
         const bool isCall = kind == StaticBranchKind::Call;
@@ -401,6 +462,13 @@ namespace ps2recomp
         m_ss << indent << "    if (ctx->pc == __entryPc) { ctx->pc = getRegU32(ctx, 31); }\n";
         m_ss << indent << "}\n";
 
+        if (mayChangeEeArchitecturalObservationMode(m_delaySlot))
+        {
+            m_ss << fmt::format(
+                "{}if (eeObservationModeChangedAfter_{:x}) {{ return; }}\n",
+                indent, delayPc());
+        }
+
         if (kind == StaticBranchKind::Jump)
         {
             m_ss << indent << "return;\n";
@@ -436,7 +504,12 @@ namespace ps2recomp
             return;
         }
 
-        emitResolvedBasicBlockBoundary(target, "    ");
+        emitResolvedBasicBlockBoundary(
+            target,
+            "    ",
+            kind == StaticBranchKind::Call && hasRelocationCall()
+                ? ObservationModeTransitionExit::Deferred
+                : ObservationModeTransitionExit::Immediate);
 
         if (kind == StaticBranchKind::Call && emitRelocationCallIfAvailable(kind, "    "))
         {
@@ -473,6 +546,14 @@ namespace ps2recomp
         emitDelaySlot("        ");
         if (isReturn)
         {
+            if (mayChangeEeArchitecturalObservationMode(m_delaySlot))
+            {
+                m_ss << "        ctx->pc = jumpTarget;\n";
+                m_ss << "        if (runtime->completeEeObservationModeTransitionAtGuestBranch("
+                        "rdram, ctx, eeObservationModeBefore_"
+                     << std::hex << delayPc() << std::dec
+                     << ", PS2Runtime::GuestBranchKind::Return)) { return; }\n";
+            }
             m_ss << "        const bool continueGuestExecution = "
                     "runtime->ValidateGuestBranchTarget(ctx, jumpTarget, "
                     "PS2Runtime::GuestBranchKind::Return);\n";
@@ -659,7 +740,8 @@ namespace ps2recomp
                  << eeInstructionCompletionCall(m_delaySlot)
                  << "\n";
             emitResolvedBasicBlockBoundary(
-                fallthroughPc(), "            ");
+                fallthroughPc(), "            ",
+                ObservationModeTransitionExit::DelaySlotNotExecuted);
             m_ss << "        }\n";
         }
         else

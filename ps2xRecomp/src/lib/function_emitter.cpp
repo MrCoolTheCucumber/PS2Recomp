@@ -1,6 +1,7 @@
 #include "ps2recomp/Emitters/function_emitter.h"
 #include "ps2recomp/code_generator.h"
 #include "ps2recomp/ee_cycle_model.h"
+#include "ps2recomp/ee_observation_mode.h"
 #include "ps2recomp/ee_performance_model.h"
 #include "ps2recomp/gif_dma_kick_analyzer.h"
 #include "ps2recomp/instructions.h"
@@ -311,6 +312,14 @@ namespace ps2recomp
                            << eeInstructionCompletionCall(inst)
                            << "\n";
                     }
+                    if (mayChangeEeArchitecturalObservationMode(inst))
+                    {
+                        ss << "    const EeArchitecturalObservationMode "
+                              "eeObservationModeBefore_"
+                           << std::hex << inst.address
+                           << " = PS2Runtime::architecturalObservationMode(ctx);\n"
+                           << std::dec;
+                    }
                     ss << "    " << cg.translateInstruction(inst, memoryHint);
                     if (inst.isMmio)
                     {
@@ -323,6 +332,18 @@ namespace ps2recomp
                         ss << "    "
                            << eeInstructionCompletionCall(inst)
                            << "\n";
+                    }
+
+                    if (mayChangeEeArchitecturalObservationMode(inst))
+                    {
+                        ss << "    ctx->pc = 0x" << std::hex
+                           << (inst.address + 4u) << "u;\n"
+                           << std::dec;
+                        ss << "    if (runtime->completeEeObservationModeTransition("
+                              "rdram, ctx, eeObservationModeBefore_"
+                           << std::hex << inst.address
+                           << ")) { return; }\n"
+                           << std::dec;
                     }
 
                     updateConstantRegisters(inst, constantRegisters);

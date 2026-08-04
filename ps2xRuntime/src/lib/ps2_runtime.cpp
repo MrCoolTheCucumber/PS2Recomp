@@ -3843,6 +3843,47 @@ uint32_t PS2Runtime::readCop0Performance(
     return value;
 }
 
+void PS2Runtime::writeCop0Breakpoint(
+    R5900Context *ctx,
+    uint32_t selector,
+    uint32_t value)
+{
+    if (!ctx)
+    {
+        return;
+    }
+
+    // The EE encodes the seven register-24 breakpoint registers in the low
+    // eleven instruction bits. Unknown selectors retain the previous no-op
+    // behavior while all supported writes now pass one runtime seam.
+    switch (selector & 0x7ffu)
+    {
+    case 0x000u:
+        ctx->cop0_bpc = value;
+        break;
+    case 0x002u:
+        ctx->cop0_iab = value;
+        break;
+    case 0x003u:
+        ctx->cop0_iabm = value;
+        break;
+    case 0x004u:
+        ctx->cop0_dab = value;
+        break;
+    case 0x005u:
+        ctx->cop0_dabm = value;
+        break;
+    case 0x006u:
+        ctx->cop0_dvb = value;
+        break;
+    case 0x007u:
+        ctx->cop0_dvbm = value;
+        break;
+    default:
+        break;
+    }
+}
+
 void PS2Runtime::writeCop0Performance(
     uint8_t *rdram,
     R5900Context *ctx,
@@ -6247,6 +6288,44 @@ PS2Runtime::architecturalObservationMode(
         return EeArchitecturalObservationMode::Fast;
     }
     return EeArchitecturalObservationMode::Precise;
+}
+
+bool PS2Runtime::completeEeObservationModeTransition(
+    uint8_t *rdram,
+    R5900Context *ctx,
+    EeArchitecturalObservationMode previousMode)
+{
+    if (architecturalObservationMode(ctx) == previousMode)
+    {
+        return false;
+    }
+
+    // Publish the unwind before fetch validation or event service. Either can
+    // enter an exception or callback; in both cases no older specialization
+    // may resume after that nested work completes.
+    m_guestExecutionDispatcherExitEpoch.fetch_add(
+        1u, std::memory_order_release);
+    ValidateInstructionFetch(ctx, ctx->pc);
+    serviceEeEventsAtBlockBoundary(rdram, ctx);
+    return true;
+}
+
+bool PS2Runtime::completeEeObservationModeTransitionAtGuestBranch(
+    uint8_t *rdram,
+    R5900Context *ctx,
+    EeArchitecturalObservationMode previousMode,
+    GuestBranchKind kind)
+{
+    if (architecturalObservationMode(ctx) == previousMode)
+    {
+        return false;
+    }
+
+    m_guestExecutionDispatcherExitEpoch.fetch_add(
+        1u, std::memory_order_release);
+    (void)ValidateGuestBranchTarget(ctx, ctx->pc, kind);
+    serviceEeEventsAtBlockBoundary(rdram, ctx);
+    return true;
 }
 
 PS2Runtime::RecompiledFunction PS2Runtime::lookupFunction(

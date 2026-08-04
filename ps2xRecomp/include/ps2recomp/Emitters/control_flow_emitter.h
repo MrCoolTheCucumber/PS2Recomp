@@ -37,6 +37,13 @@ namespace ps2recomp
             Call,
         };
 
+        enum class ObservationModeTransitionExit
+        {
+            Immediate,
+            Deferred,
+            DelaySlotNotExecuted,
+        };
+
         CodeGenerator &m_gen;
         const Instruction &m_branchInst;
         const Instruction &m_delaySlot;
@@ -57,10 +64,14 @@ namespace ps2recomp
         std::string delaySlotCode(bool branchDelayExecution) const;
         void emitBasicBlockBoundary(std::string_view indent);
         void emitResolvedBasicBlockBoundary(uint32_t nextPc,
-                                            std::string_view indent);
+                                            std::string_view indent,
+                                            ObservationModeTransitionExit transitionExit =
+                                                ObservationModeTransitionExit::Immediate);
         void emitResolvedBasicBlockBoundary(
             std::string_view nextPcExpression,
-            std::string_view indent);
+            std::string_view indent,
+            ObservationModeTransitionExit transitionExit =
+                ObservationModeTransitionExit::Immediate);
         void emitInstructionAtDelayPc(std::string_view indent,
                                       bool branchDelayExecution);
         void emitDelaySlot(std::string_view indent);
@@ -75,6 +86,7 @@ namespace ps2recomp
         void emitFallbackInstruction();
 
         bool emitDirectFunctionJumpIfAvailable(uint32_t target, StaticBranchKind kind, std::string_view indent);
+        bool hasRelocationCall() const;
         void emitExternalJumpDispatch(uint32_t target, StaticBranchKind kind, std::string_view indent);
         void emitExternalRegisterCallDispatch(std::string_view jumpTargetExpression, std::string_view indent);
         void emitExternalRegisterJumpDispatch(std::string_view jumpTargetExpression, RegisterBranchKind kind, uint8_t rsReg, std::string_view indent);

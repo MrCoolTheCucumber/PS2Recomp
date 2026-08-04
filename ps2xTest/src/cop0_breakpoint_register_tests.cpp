@@ -1,4 +1,5 @@
 #include "MiniTest.h"
+#include "ps2_runtime.h"
 #include "ps2recomp/code_generator.h"
 #include "ps2recomp/instructions.h"
 #include "ps2recomp/r5900_decoder.h"
@@ -9,7 +10,6 @@
 #include <cstdint>
 #include <optional>
 #include <string>
-#include <unordered_map>
 
 using namespace ps2recomp;
 
@@ -84,6 +84,31 @@ namespace
         }
         return generated.substr(start, end - start);
     }
+
+    uint32_t breakpointRegisterValue(
+        const R5900Context &context,
+        uint16_t selector)
+    {
+        switch (selector)
+        {
+        case 0u:
+            return context.cop0_bpc;
+        case 2u:
+            return context.cop0_iab;
+        case 3u:
+            return context.cop0_iabm;
+        case 4u:
+            return context.cop0_dab;
+        case 5u:
+            return context.cop0_dabm;
+        case 6u:
+            return context.cop0_dvb;
+        case 7u:
+            return context.cop0_dvbm;
+        default:
+            return 0u;
+        }
+    }
 }
 
 void register_cop0_breakpoint_register_tests()
@@ -93,7 +118,8 @@ void register_cop0_breakpoint_register_tests()
         tc.Run("raw move selectors round-trip seven independent registers", [](TestCase &t)
         {
             CodeGenerator generator({}, {});
-            std::unordered_map<std::string, uint32_t> translatedState;
+            PS2Runtime runtime;
+            R5900Context context{};
 
             for (std::size_t index = 0u;
                  index < kBreakpointRegisters.size();
@@ -118,21 +144,23 @@ void register_cop0_breakpoint_register_tests()
 
                 const std::string generated =
                     generator.translateInstruction(moveTo);
-                const std::optional<std::string> member =
-                    emittedContextMember(generated);
                 t.IsTrue(
-                    member.has_value(),
-                    "each move-to variant should target context state");
-                if (!member.has_value())
-                {
-                    continue;
-                }
-
+                    generated.find(
+                        "runtime->writeCop0Breakpoint(ctx, " +
+                        std::to_string(registerCase.selector) +
+                        "u, GPR_U32(ctx, " +
+                        std::to_string(gpr) + "));") !=
+                        std::string::npos,
+                    "each move-to selector should pass through the runtime breakpoint-write seam");
+                runtime.writeCop0Breakpoint(
+                    &context,
+                    registerCase.selector,
+                    registerCase.value);
                 t.Equals(
-                    *member,
-                    std::string(registerCase.contextMember),
-                    "each move-to selector should target its named breakpoint register");
-                translatedState[*member] = registerCase.value;
+                    breakpointRegisterValue(
+                        context, registerCase.selector),
+                    registerCase.value,
+                    "the runtime helper should update the selected architectural register");
             }
 
             for (std::size_t index = 0u;
@@ -163,10 +191,19 @@ void register_cop0_breakpoint_register_tests()
                     std::string(registerCase.contextMember),
                     "each move-from selector should target its named breakpoint register");
                 t.Equals(
-                    translatedState[*member],
+                    breakpointRegisterValue(
+                        context, registerCase.selector),
                     registerCase.value,
                     "seven distinct writes should round-trip through their matching selectors");
             }
+
+            const uint32_t originalBpc = context.cop0_bpc;
+            runtime.writeCop0Breakpoint(
+                &context, 0x7ffu, 0xffffffffu);
+            t.Equals(
+                context.cop0_bpc,
+                originalBpc,
+                "unknown register-24 selectors should retain their previous no-op behavior");
         });
     });
 }

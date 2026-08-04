@@ -170,16 +170,9 @@ namespace ps2recomp
             {
                 const uint32_t selector =
                     inst.raw & COP0_BREAKPOINT_SELECTOR_MASK;
-                const char *const member = breakpointRegisterMember(selector);
-                if (member == nullptr)
-                {
-                    return fmt::format(
-                        "// Unimplemented MTC0 breakpoint selector {}",
-                        selector);
-                }
                 return fmt::format(
-                    "ctx->{} = GPR_U32(ctx, {});",
-                    member,
+                    "runtime->writeCop0Breakpoint(ctx, {}u, GPR_U32(ctx, {}));",
+                    selector,
                     rt);
             }
             case COP0_REG_PERF:
