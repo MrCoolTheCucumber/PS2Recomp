@@ -3893,7 +3893,7 @@ namespace ps2_stubs
 
         if (haveFrame)
         {
-            runtime->recordMpegPictureServed(repeatedFrame);
+            runtime->recordMpegPictureServed(ctx, repeatedFrame);
         }
         mpegGuestWrite32(rdram, mpegAddr + 0x00u, width);
         mpegGuestWrite32(rdram, mpegAddr + 0x04u, height);

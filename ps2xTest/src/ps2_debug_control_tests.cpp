@@ -18,6 +18,8 @@
 
 namespace
 {
+    std::atomic<uint32_t> g_moviePictures{0u};
+
     void firstDispatch(uint8_t *, R5900Context *ctx, PS2Runtime *)
     {
         ctx->pc = 0x00002000u;
@@ -31,6 +33,14 @@ namespace
     void loopDispatch(uint8_t *, R5900Context *ctx, PS2Runtime *)
     {
         ctx->pc = 0x00001000u;
+    }
+
+    void movieDispatch(uint8_t *, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        runtime->recordMpegPictureServed(ctx, false);
+        const uint32_t pictures =
+            g_moviePictures.fetch_add(1u, std::memory_order_relaxed) + 1u;
+        ctx->pc = pictures >= 5u ? 0u : 0x00001000u;
     }
 }
 
@@ -402,6 +412,73 @@ void register_ps2_debug_control_tests()
             worker.join();
             t.IsTrue(finished.load(std::memory_order_acquire),
                      "the guest worker should exit after its zero return PC");
+        });
+
+        tc.Run("run-until stops at an exact unique MPEG picture boundary", [](TestCase &t)
+        {
+            PS2Runtime runtime;
+            runtime.registerFunction(0x00001000u, movieDispatch);
+            g_moviePictures.store(0u, std::memory_order_relaxed);
+
+            R5900Context context{};
+            context.pc = 0x00001000u;
+            context.cop0_status = 0x00000004u;
+
+            t.IsTrue(runtime.debugPause(std::chrono::milliseconds(50)),
+                     "the movie fixture should begin paused");
+            std::thread worker([&]()
+                               { runtime.dispatchLoop(nullptr, &context); });
+
+            const PS2Runtime::DebugStopInfo target =
+                runtime.debugRunUntilMpegUniquePictures(
+                    4u, std::chrono::seconds(1));
+            t.IsTrue(target.completed,
+                     "the unique-picture target should be reached");
+            t.Equals(target.reason, std::string("mpeg-unique-pictures"),
+                     "the stop should identify the progress counter");
+            t.Equals(
+                runtime.debugRuntimeProgress().mpegUniquePicturesServed,
+                static_cast<uint64_t>(4u),
+                "the next movie dispatch must not pass the target");
+            t.IsTrue(runtime.debugIsPaused(),
+                     "the unique-picture boundary should remain paused");
+
+            const PS2Runtime::DebugStopInfo beforeNext =
+                runtime.debugRunUntilBeforeNextMpegUniquePicture(
+                    4u, std::chrono::seconds(1));
+            t.IsTrue(beforeNext.completed,
+                     "the next unique picture should reach a pre-increment stop");
+            t.Equals(
+                beforeNext.reason,
+                std::string("before-mpeg-unique-picture"),
+                "the stop should identify the pre-increment boundary");
+            t.Equals(
+                runtime.debugRuntimeProgress().mpegUniquePicturesServed,
+                static_cast<uint64_t>(4u),
+                "the pre-increment stop must retain the current picture count");
+            t.Equals(g_moviePictures.load(std::memory_order_relaxed), 4u,
+                     "the stopped movie dispatch must not finish");
+
+            const PS2Runtime::DebugStopInfo passed =
+                runtime.debugRunUntilMpegUniquePictures(
+                    3u, std::chrono::milliseconds(50));
+            t.IsFalse(passed.completed,
+                      "an already-passed exact target must be rejected");
+            t.Equals(passed.reason, std::string("target-already-passed"),
+                     "the rejection should explain the stale target");
+
+            const PS2Runtime::DebugStopInfo staleBeforeNext =
+                runtime.debugRunUntilBeforeNextMpegUniquePicture(
+                    3u, std::chrono::milliseconds(50));
+            t.IsFalse(staleBeforeNext.completed,
+                      "a stale pre-increment target must be rejected");
+            t.Equals(staleBeforeNext.reason, std::string("target-not-current"),
+                     "the rejection should require the exact current count");
+
+            runtime.debugResume();
+            worker.join();
+            t.Equals(g_moviePictures.load(std::memory_order_relaxed), 5u,
+                     "resuming should execute the final dispatch");
         });
 
         tc.Run("branch history and missing-target faults are bounded and structured", [](TestCase &t)

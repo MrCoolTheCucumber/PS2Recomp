@@ -1562,6 +1562,8 @@ struct PS2DebugServer::Impl
         for (const char *capability : {
                  "system.status", "execution.pause", "execution.resume",
                  "execution.shutdown", "execution.runUntil:ee.pc",
+                 "execution.runUntil:progress.mpeg_unique_pictures_served",
+                 "execution.runUntilBeforeNextMpegUniquePicture",
                  "execution.step:dispatch", "state.registers:ee",
                  "state.registers:iop", "state.registers:vu0",
                  "state.registers:vu1", "memory.read", "memory.hash",
@@ -3135,23 +3137,55 @@ struct PS2DebugServer::Impl
             trim(std::string_view(predicate).substr(0u, equals));
         const std::string_view value =
             trim(std::string_view(predicate).substr(equals + 2u));
-        if (field != "ee.pc")
-        {
-            throw RequestError(-32001,
-                               "PS2Recomp v1 supports only ee.pc predicates");
-        }
-        const uint32_t target = parseAddress(value);
         const uint64_t timeout = timeoutMs(params);
-        const PS2Runtime::DebugStopInfo stop = runtime.debugRunUntilPc(
-            target, std::chrono::milliseconds(timeout));
+        PS2Runtime::DebugStopInfo stop{};
+        Value result(rapidjson::kObjectType);
+        if (field == "ee.pc")
+        {
+            const uint32_t target = parseAddress(value);
+            stop = runtime.debugRunUntilPc(
+                target, std::chrono::milliseconds(timeout));
+            addString(result, "cpu", "ee", allocator);
+            addString(result, "pc", addressString(stop.pc), allocator);
+        }
+        else if (field == "progress.mpeg_unique_pictures_served")
+        {
+            if (value.empty() || value.front() == '-')
+            {
+                throw RequestError(-32602, "invalid unsigned counter " +
+                                               std::string(value));
+            }
+            std::string counterText(value);
+            char *end = nullptr;
+            errno = 0;
+            const unsigned long long parsed =
+                std::strtoull(counterText.c_str(), &end, 0);
+            if (errno != 0 || end != counterText.c_str() + counterText.size())
+            {
+                throw RequestError(-32602, "invalid unsigned counter " +
+                                               counterText);
+            }
+            const uint64_t target = static_cast<uint64_t>(parsed);
+            stop = runtime.debugRunUntilMpegUniquePictures(
+                target, std::chrono::milliseconds(timeout));
+            result.AddMember("target", target, allocator);
+            result.AddMember(
+                "observed",
+                runtime.debugRuntimeProgress().mpegUniquePicturesServed,
+                allocator);
+        }
+        else
+        {
+            throw RequestError(
+                -32001,
+                "PS2Recomp v1 supports ee.pc and "
+                "progress.mpeg_unique_pictures_served predicates");
+        }
         if (!stop.completed)
         {
             throw RequestError(-32002, "run-until " + stop.reason);
         }
-        Value result(rapidjson::kObjectType);
         addString(result, "reason", stop.reason, allocator);
-        addString(result, "cpu", "ee", allocator);
-        addString(result, "pc", addressString(stop.pc), allocator);
         result.AddMember("sequence", stop.sequence, allocator);
         result.AddMember("timeout_ms", timeout, allocator);
         return result;
@@ -3209,6 +3243,33 @@ struct PS2DebugServer::Impl
         addString(result, "cpu", "ee", allocator);
         addString(result, "pc", addressString(stop.pc), allocator);
         result.AddMember("fields", count, allocator);
+        result.AddMember("sequence", stop.sequence, allocator);
+        result.AddMember("timeout_ms", timeout, allocator);
+        return result;
+    }
+
+    Value runUntilBeforeNextMpegUniquePicture(
+        const Value *params, Allocator &allocator)
+    {
+        const uint64_t current = requiredUnsigned(params, "current");
+        const uint64_t timeout = timeoutMs(params);
+        const PS2Runtime::DebugStopInfo stop =
+            runtime.debugRunUntilBeforeNextMpegUniquePicture(
+                current, std::chrono::milliseconds(timeout));
+        if (!stop.completed)
+        {
+            throw RequestError(
+                -32002,
+                "run-until-before-next-mpeg-unique-picture " + stop.reason);
+        }
+        Value result(rapidjson::kObjectType);
+        addString(result, "reason", stop.reason, allocator);
+        result.AddMember("current", current, allocator);
+        result.AddMember(
+            "observed",
+            runtime.debugRuntimeProgress().mpegUniquePicturesServed,
+            allocator);
+        addString(result, "pc", addressString(stop.pc), allocator);
         result.AddMember("sequence", stop.sequence, allocator);
         result.AddMember("timeout_ms", timeout, allocator);
         return result;
@@ -4313,6 +4374,10 @@ struct PS2DebugServer::Impl
         if (method == "execution.runForVSyncFields")
         {
             return runForVSyncFields(params, allocator);
+        }
+        if (method == "execution.runUntilBeforeNextMpegUniquePicture")
+        {
+            return runUntilBeforeNextMpegUniquePicture(params, allocator);
         }
         if (method == "execution.step")
         {

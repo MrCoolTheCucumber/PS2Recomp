@@ -1407,7 +1407,7 @@ public:
         int requestedPriority,
         int effectivePriority,
         bool accepted) noexcept;
-    void recordMpegPictureServed(bool repeated) noexcept;
+    void recordMpegPictureServed(R5900Context *ctx, bool repeated);
 
     void requestStop();
     bool isStopRequested() const;
@@ -1423,6 +1423,10 @@ public:
         std::chrono::milliseconds timeout =
             std::chrono::seconds(30));
     DebugStopInfo debugRunUntilPc(uint32_t pc, std::chrono::milliseconds timeout);
+    DebugStopInfo debugRunUntilMpegUniquePictures(
+        uint64_t target, std::chrono::milliseconds timeout);
+    DebugStopInfo debugRunUntilBeforeNextMpegUniquePicture(
+        uint64_t current, std::chrono::milliseconds timeout);
     DebugStopInfo debugRunForVSyncFields(
         uint64_t count, std::chrono::milliseconds timeout);
     DebugStopInfo debugStepDispatches(uint64_t count, std::chrono::milliseconds timeout);
@@ -2313,6 +2317,10 @@ private:
     DebugStopInfo m_debugLastStop{};
     bool m_debugRunUntilActive = false;
     uint32_t m_debugRunUntilPc = 0u;
+    bool m_debugRunUntilMpegUniquePicturesActive = false;
+    uint64_t m_debugRunUntilMpegUniquePicturesTarget = 0u;
+    bool m_debugRunBeforeNextMpegUniquePictureActive = false;
+    uint64_t m_debugRunBeforeNextMpegUniquePictureCurrent = 0u;
     bool m_debugRunForVSyncFieldsActive = false;
     uint64_t m_debugRunForVSyncFieldsTarget = 0u;
     bool m_debugStepActive = false;

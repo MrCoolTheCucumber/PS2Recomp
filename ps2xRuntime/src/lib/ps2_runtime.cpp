@@ -9674,6 +9674,8 @@ void PS2Runtime::debugRefreshControlActiveLocked()
     const bool active =
         m_debugPauseRequested.load(std::memory_order_relaxed) ||
         m_debugRunUntilActive ||
+        m_debugRunUntilMpegUniquePicturesActive ||
+        m_debugRunBeforeNextMpegUniquePictureActive ||
         m_debugRunForVSyncFieldsActive ||
         m_debugStepActive ||
         !m_debugBreakpoints.empty() ||
@@ -9985,6 +9987,8 @@ void PS2Runtime::debugBlockGuestAtBoundary(R5900Context *ctx, const char *reason
         std::lock_guard<std::mutex> lock(m_debugControlMutex);
         m_debugPauseRequested.store(true, std::memory_order_release);
         m_debugRunUntilActive = false;
+        m_debugRunUntilMpegUniquePicturesActive = false;
+        m_debugRunBeforeNextMpegUniquePictureActive = false;
         m_debugRunForVSyncFieldsActive = false;
         m_debugStepActive = false;
         m_debugStepRemaining = 0u;
@@ -10067,6 +10071,13 @@ void PS2Runtime::debugBeforeGuestStep(R5900Context *ctx)
         else if (m_debugRunUntilActive && pc == m_debugRunUntilPc)
         {
             stopReason = "predicate";
+        }
+        else if (m_debugRunUntilMpegUniquePicturesActive &&
+                 m_debugMpegUniquePicturesServed.load(
+                     std::memory_order_relaxed) >=
+                     m_debugRunUntilMpegUniquePicturesTarget)
+        {
+            stopReason = "mpeg-unique-pictures";
         }
         else if (m_debugRunForVSyncFieldsActive &&
                  m_debugVSyncFields.load(std::memory_order_relaxed) >=
@@ -10154,6 +10165,8 @@ bool PS2Runtime::debugPause(std::chrono::milliseconds timeout)
             newlyRequested = true;
             m_debugPauseRequested.store(true, std::memory_order_release);
             m_debugRunUntilActive = false;
+            m_debugRunUntilMpegUniquePicturesActive = false;
+            m_debugRunBeforeNextMpegUniquePictureActive = false;
             m_debugRunForVSyncFieldsActive = false;
             m_debugStepActive = false;
             m_debugStepRemaining = 0u;
@@ -10228,6 +10241,8 @@ void PS2Runtime::debugResume()
             m_debugSkipBreakpointPc = m_debugLastStop.pc;
         }
         m_debugRunUntilActive = false;
+        m_debugRunUntilMpegUniquePicturesActive = false;
+        m_debugRunBeforeNextMpegUniquePictureActive = false;
         m_debugRunForVSyncFieldsActive = false;
         m_debugStepActive = false;
         m_debugStepRemaining = 0u;
@@ -10383,6 +10398,8 @@ PS2Runtime::DebugStopInfo PS2Runtime::debugRunUntilPc(
         baseline = m_debugStopSequence;
         m_debugRunUntilActive = true;
         m_debugRunUntilPc = pc;
+        m_debugRunUntilMpegUniquePicturesActive = false;
+        m_debugRunBeforeNextMpegUniquePictureActive = false;
         m_debugRunForVSyncFieldsActive = false;
         m_debugStepActive = false;
         m_debugPauseRequested.store(false, std::memory_order_release);
@@ -10432,6 +10449,146 @@ PS2Runtime::DebugStopInfo PS2Runtime::debugRunUntilPc(
             m_debugStopSequence};
 }
 
+PS2Runtime::DebugStopInfo PS2Runtime::debugRunUntilMpegUniquePictures(
+    uint64_t target, std::chrono::milliseconds timeout)
+{
+    m_debugControlActive.store(true, std::memory_order_release);
+    if (!debugPause(timeout))
+    {
+        return {false, "pause-timeout", m_debugPc.load(std::memory_order_relaxed), 0u};
+    }
+
+    const uint64_t current =
+        m_debugMpegUniquePicturesServed.load(std::memory_order_relaxed);
+    if (current > target)
+    {
+        return {false, "target-already-passed",
+                m_debugPc.load(std::memory_order_relaxed), 0u};
+    }
+    if (current == target)
+    {
+        std::lock_guard<std::mutex> lock(m_debugControlMutex);
+        debugRecordStopLocked(
+            "already-matched", m_debugPc.load(std::memory_order_relaxed));
+        return m_debugLastStop;
+    }
+
+    uint64_t baseline = 0u;
+    {
+        std::lock_guard<std::mutex> lock(m_debugControlMutex);
+        baseline = m_debugStopSequence;
+        m_debugRunUntilActive = false;
+        m_debugRunUntilMpegUniquePicturesActive = true;
+        m_debugRunUntilMpegUniquePicturesTarget = target;
+        m_debugRunBeforeNextMpegUniquePictureActive = false;
+        m_debugRunForVSyncFieldsActive = false;
+        m_debugStepActive = false;
+        m_debugStepRemaining = 0u;
+        m_debugPauseRequested.store(false, std::memory_order_release);
+        debugRefreshControlActiveLocked();
+    }
+    if (m_eeRuntimeExecutor)
+    {
+        m_eeRuntimeExecutor->debugResume();
+    }
+    m_debugControlCv.notify_all();
+    m_audioBackend.setDebuggerPaused(false);
+
+    {
+        std::unique_lock<std::mutex> lock(m_debugControlMutex);
+        if (m_debugControlCv.wait_for(lock, timeout, [this, baseline]()
+                                      { return (m_debugStopSequence > baseline &&
+                                                m_debugPauseRequested.load(std::memory_order_acquire)) ||
+                                               isStopRequested(); }))
+        {
+            if (m_debugStopSequence > baseline)
+            {
+                const DebugStopInfo stop = m_debugLastStop;
+                lock.unlock();
+                if (m_eeRuntimeExecutor &&
+                    !m_eeRuntimeExecutor->debugWaitUntilPaused(timeout))
+                {
+                    return {false, "pause-timeout", stop.pc, stop.sequence};
+                }
+                return stop;
+            }
+            return {false, "stopped", m_debugPc.load(std::memory_order_relaxed),
+                    m_debugStopSequence};
+        }
+        m_debugRunUntilMpegUniquePicturesActive = false;
+    }
+
+    (void)debugPause(timeout);
+    return {false, "timeout", m_debugPc.load(std::memory_order_relaxed),
+            m_debugStopSequence};
+}
+
+PS2Runtime::DebugStopInfo
+PS2Runtime::debugRunUntilBeforeNextMpegUniquePicture(
+    uint64_t current, std::chrono::milliseconds timeout)
+{
+    m_debugControlActive.store(true, std::memory_order_release);
+    if (!debugPause(timeout))
+    {
+        return {false, "pause-timeout", m_debugPc.load(std::memory_order_relaxed), 0u};
+    }
+
+    if (m_debugMpegUniquePicturesServed.load(std::memory_order_relaxed) != current)
+    {
+        return {false, "target-not-current",
+                m_debugPc.load(std::memory_order_relaxed), 0u};
+    }
+
+    uint64_t baseline = 0u;
+    {
+        std::lock_guard<std::mutex> lock(m_debugControlMutex);
+        baseline = m_debugStopSequence;
+        m_debugRunUntilActive = false;
+        m_debugRunUntilMpegUniquePicturesActive = false;
+        m_debugRunBeforeNextMpegUniquePictureActive = true;
+        m_debugRunBeforeNextMpegUniquePictureCurrent = current;
+        m_debugRunForVSyncFieldsActive = false;
+        m_debugStepActive = false;
+        m_debugStepRemaining = 0u;
+        m_debugPauseRequested.store(false, std::memory_order_release);
+        debugRefreshControlActiveLocked();
+    }
+    if (m_eeRuntimeExecutor)
+    {
+        m_eeRuntimeExecutor->debugResume();
+    }
+    m_debugControlCv.notify_all();
+    m_audioBackend.setDebuggerPaused(false);
+
+    {
+        std::unique_lock<std::mutex> lock(m_debugControlMutex);
+        if (m_debugControlCv.wait_for(lock, timeout, [this, baseline]()
+                                      { return (m_debugStopSequence > baseline &&
+                                                m_debugPauseRequested.load(std::memory_order_acquire)) ||
+                                               isStopRequested(); }))
+        {
+            if (m_debugStopSequence > baseline)
+            {
+                const DebugStopInfo stop = m_debugLastStop;
+                lock.unlock();
+                if (m_eeRuntimeExecutor &&
+                    !m_eeRuntimeExecutor->debugWaitUntilPaused(timeout))
+                {
+                    return {false, "pause-timeout", stop.pc, stop.sequence};
+                }
+                return stop;
+            }
+            return {false, "stopped", m_debugPc.load(std::memory_order_relaxed),
+                    m_debugStopSequence};
+        }
+        m_debugRunBeforeNextMpegUniquePictureActive = false;
+    }
+
+    (void)debugPause(timeout);
+    return {false, "timeout", m_debugPc.load(std::memory_order_relaxed),
+            m_debugStopSequence};
+}
+
 PS2Runtime::DebugStopInfo PS2Runtime::debugRunForVSyncFields(
     uint64_t count, std::chrono::milliseconds timeout)
 {
@@ -10457,6 +10614,8 @@ PS2Runtime::DebugStopInfo PS2Runtime::debugRunForVSyncFields(
         std::lock_guard<std::mutex> lock(m_debugControlMutex);
         baseline = m_debugStopSequence;
         m_debugRunUntilActive = false;
+        m_debugRunUntilMpegUniquePicturesActive = false;
+        m_debugRunBeforeNextMpegUniquePictureActive = false;
         m_debugRunForVSyncFieldsActive = true;
         m_debugRunForVSyncFieldsTarget = current + count;
         m_debugStepActive = false;
@@ -10518,6 +10677,8 @@ PS2Runtime::DebugStopInfo PS2Runtime::debugStepDispatches(
         std::lock_guard<std::mutex> lock(m_debugControlMutex);
         baseline = m_debugStopSequence;
         m_debugRunUntilActive = false;
+        m_debugRunUntilMpegUniquePicturesActive = false;
+        m_debugRunBeforeNextMpegUniquePictureActive = false;
         m_debugRunForVSyncFieldsActive = false;
         m_debugStepActive = true;
         m_debugStepRemaining = count;
@@ -10888,8 +11049,23 @@ void PS2Runtime::recordEeThreadQueueRotation(
     }
 }
 
-void PS2Runtime::recordMpegPictureServed(bool repeated) noexcept
+void PS2Runtime::recordMpegPictureServed(
+    R5900Context *ctx, bool repeated)
 {
+    bool stopBeforeUniquePicture = false;
+    if (!repeated && m_debugControlActive.load(std::memory_order_acquire))
+    {
+        std::lock_guard<std::mutex> lock(m_debugControlMutex);
+        stopBeforeUniquePicture =
+            m_debugRunBeforeNextMpegUniquePictureActive &&
+            m_debugMpegUniquePicturesServed.load(std::memory_order_relaxed) ==
+                m_debugRunBeforeNextMpegUniquePictureCurrent;
+    }
+    if (stopBeforeUniquePicture)
+    {
+        debugBlockGuestAtBoundary(ctx, "before-mpeg-unique-picture");
+    }
+
     m_debugMpegPicturesServed.fetch_add(
         1u, std::memory_order_relaxed);
     if (repeated)
@@ -12383,6 +12559,8 @@ void PS2Runtime::requestStop()
     {
         std::lock_guard<std::mutex> lock(m_debugControlMutex);
         m_debugRunUntilActive = false;
+        m_debugRunUntilMpegUniquePicturesActive = false;
+        m_debugRunBeforeNextMpegUniquePictureActive = false;
         m_debugRunForVSyncFieldsActive = false;
         m_debugStepActive = false;
         m_debugStepRemaining = 0u;

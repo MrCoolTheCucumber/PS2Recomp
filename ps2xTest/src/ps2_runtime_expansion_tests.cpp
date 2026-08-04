@@ -1931,8 +1931,8 @@ void register_ps2_runtime_expansion_tests()
                 uint64_t{2u},
                 "thread buckets should include both accepted requests");
 
-            runtime.recordMpegPictureServed(false);
-            runtime.recordMpegPictureServed(true);
+            runtime.recordMpegPictureServed(nullptr, false);
+            runtime.recordMpegPictureServed(nullptr, true);
             const auto progress = runtime.debugRuntimeProgress();
             t.Equals(
                 progress.mpegPicturesServed,
