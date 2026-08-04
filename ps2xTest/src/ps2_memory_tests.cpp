@@ -567,6 +567,91 @@ void register_ps2_memory_tests()
                      "fast masked doubleword writes should preserve disabled byte lanes");
         });
 
+        tc.Run("EE memory policies preserve access semantics and single evaluation", [](TestCase &t)
+        {
+            PS2Runtime runtimeStorage;
+            t.IsTrue(
+                runtimeStorage.memory().initialize(),
+                "the policy fixture should allocate RDRAM");
+            PS2Runtime *runtime = &runtimeStorage;
+            uint8_t *rdram = runtime->memory().getRDRAM();
+            R5900Context context{};
+            context.cop0_status = 0x00000004u;
+            R5900Context *ctx = &context;
+
+            auto exercise = [&]<EeArchitecturalObservationMode Mode>(
+                                uint32_t base,
+                                const char *modeName)
+            {
+                const uint32_t initial = 0x11223344u;
+                std::memcpy(rdram + base, &initial, sizeof(initial));
+
+                uint32_t readAddressEvaluations = 0u;
+                const auto readAddress = [&]()
+                {
+                    ++readAddressEvaluations;
+                    return base;
+                };
+                t.Equals(
+                    PS2X_EE_READ32(Mode, readAddress()),
+                    initial,
+                    modeName);
+                t.Equals(
+                    readAddressEvaluations,
+                    1u,
+                    "a policy read should evaluate its address exactly once");
+
+                uint32_t writeAddressEvaluations = 0u;
+                uint32_t writeValueEvaluations = 0u;
+                const auto writeAddress = [&]()
+                {
+                    ++writeAddressEvaluations;
+                    return base + 4u;
+                };
+                const auto writeValue = [&]()
+                {
+                    ++writeValueEvaluations;
+                    return 0xAABBCCDDu;
+                };
+                PS2X_EE_WRITE32(Mode, writeAddress(), writeValue());
+
+                uint32_t stored = 0u;
+                std::memcpy(&stored, rdram + base + 4u, sizeof(stored));
+                t.Equals(stored, 0xAABBCCDDu, modeName);
+                t.Equals(
+                    writeAddressEvaluations,
+                    1u,
+                    "a policy write should evaluate its address exactly once");
+                t.Equals(
+                    writeValueEvaluations,
+                    1u,
+                    "a policy write should evaluate its value exactly once");
+
+                const uint32_t maskedInitial = 0xA1B2C3D4u;
+                std::memcpy(
+                    rdram + base + 8u,
+                    &maskedInitial,
+                    sizeof(maskedInitial));
+                PS2X_EE_WRITE_MASKED32(
+                    Mode,
+                    base + 8u,
+                    0x00EEDD00u,
+                    0x6u);
+                uint32_t masked = 0u;
+                std::memcpy(&masked, rdram + base + 8u, sizeof(masked));
+                t.Equals(masked, 0xA1EEDDD4u, modeName);
+            };
+
+            exercise.template operator()<
+                EeArchitecturalObservationMode::Fast>(
+                0x100u,
+                "fast EE policy should preserve RDRAM operations");
+            exercise.template operator()<
+                EeArchitecturalObservationMode::Precise>(
+                0x200u,
+                "precise EE policy should preserve RDRAM operations");
+        });
+
         tc.Run("VIF MPG num zero uploads 256 instructions", [](TestCase &t)
         {
             PS2Memory mem;

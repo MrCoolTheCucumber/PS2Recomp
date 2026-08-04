@@ -1,5 +1,6 @@
 #include "ps2recomp/Emitters/function_table_emitter.h"
 #include "ps2recomp/code_generator.h"
+#include "ps2recomp/ee_observation_mode.h"
 #include "ps2recomp/ps2_recompiler.h"
 #include "ps2recomp/recompiler_reporter.h"
 #include "ps2recomp/types.h"
@@ -283,8 +284,9 @@ namespace ps2recomp
             ss << "static const PS2RecompiledModuleFunction g_moduleFunctions[] = {\n";
             for (const auto &[address, name] : entries)
             {
-                ss << "    {0x" << std::hex << address << "u, {" << name
-                   << ", " << name << "}},\n";
+                ss << "    {0x" << std::hex << address << "u, {"
+                   << eeFastFunctionName(name) << ", "
+                   << eePreciseFunctionName(name) << "}},\n";
             }
             ss << "};\n";
 
@@ -378,7 +380,8 @@ namespace ps2recomp
         {
             const uint32_t slot = (address - tableBase) >> 2;
             ss << "        g_ps2RecompiledFunctionTable[" << std::dec << slot << "] = {"
-               << name << ", " << name << "}; // 0x" << std::hex << address
+               << eeFastFunctionName(name) << ", "
+               << eePreciseFunctionName(name) << "}; // 0x" << std::hex << address
                << std::dec << "\n";
         }
         ss << "    }\n";

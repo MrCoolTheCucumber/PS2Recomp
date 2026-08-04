@@ -38,6 +38,8 @@ The direct reference performs the same work through the KSEG0 alias
 The executable runs these cases in an interleaved, rotating order:
 
 - compiled-out fast entry, mapped and direct memory;
+- production policy selection with inactive BPC/PCCR, mapped and direct
+  memory;
 - precise entry with BPC and PCCR inactive, mapped and direct memory;
 - matching instruction, data-address, and data-value breakpoints with BED
   suppression;
@@ -77,9 +79,11 @@ taskset -c 6 \
   --blocks 1000000 --warmup-blocks 20000 --samples 5
 ```
 
-`--blocks`, `--warmup-blocks`, and `--samples` are optional. Output consists
-of one configuration record, one record per case and sample, and a median/min/
-max summary for each case.
+`--blocks`, `--warmup-blocks`, and `--samples` are optional. `--case NAME`
+restricts a run to one named case so external performance-counter tools can
+attribute process-wide events to one entry. Output consists of one
+configuration record, one record per case and sample, and a median/min/max
+summary for each case.
 
 The two exported entry symbols make the compiled-out property auditable in
 the final executable:

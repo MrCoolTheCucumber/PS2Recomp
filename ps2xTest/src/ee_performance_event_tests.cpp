@@ -518,11 +518,11 @@ void register_ee_performance_event_tests()
             const std::string ordinary =
                 generateFunction({addiuRaw});
             const size_t issue = ordinary.find(
-                "recordEeInstructionIssue");
+                "observeEeInstructionBeginPolicy<Mode>");
             const size_t effect = ordinary.find(
                 "SET_GPR_S32(ctx, 3");
             const size_t completion = ordinary.find(
-                "recordEeInstructionCompletion(ctx, 3u)");
+                "observeEeInstructionCompletePolicy<Mode>");
             t.IsTrue(
                 issue < effect && effect < completion,
                 "an ordinary instruction should issue before its effect and complete afterward");
@@ -531,7 +531,7 @@ void register_ee_performance_event_tests()
                 generateFunction({SPECIAL_SYSCALL});
             t.IsTrue(
                 syscall.find(
-                    "recordEeInstructionCompletion(ctx, 3u)") <
+                    "observeEeInstructionCompletePolicy<Mode>") <
                     syscall.find("runtime->handleSyscall"),
                 "SYSCALL's architecturally owned exception should retain its completion event");
 
@@ -543,7 +543,7 @@ void register_ee_performance_event_tests()
                 generateFunction({eretRaw});
             t.IsTrue(
                 eret.find(
-                    "recordEeInstructionCompletion(ctx, 3u)") <
+                    "observeEeInstructionCompletePolicy<Mode>") <
                     eret.find("runtime->handleCop0Eret"),
                 "ERET should complete before its generated return transfers control");
 
@@ -555,7 +555,7 @@ void register_ee_performance_event_tests()
             t.IsTrue(
                 load.find("READ32(") <
                     load.find(
-                        "recordEeInstructionCompletion(ctx, 19u)"),
+                        "observeEeInstructionCompletePolicy<Mode>"),
                 "a load should complete only after a faulting memory access returns");
         });
 
@@ -572,7 +572,7 @@ void register_ee_performance_event_tests()
                     {conditionalRaw, delayLoadRaw, 0u, 0u});
             t.IsTrue(
                 conditional.find(
-                    "recordEeConditionalBranch") !=
+                    "observeEeConditionalBranchPolicy<Mode>") !=
                     std::string::npos,
                 "conditional branches should publish their resolved outcome");
             const size_t annulled = conditional.find(
@@ -580,10 +580,10 @@ void register_ee_performance_event_tests()
             t.IsTrue(
                 annulled != std::string::npos &&
                     conditional.find(
-                        "recordEeInstructionIssue",
+                        "observeEeInstructionBeginPolicy<Mode>",
                         annulled) != std::string::npos &&
                     conditional.find(
-                        "recordEeInstructionCompletion(ctx, 19u)",
+                        "observeEeInstructionCompletePolicy<Mode>",
                         annulled) != std::string::npos,
                 "a nullified likely delay load should still publish issue and completion categories");
 
@@ -594,7 +594,7 @@ void register_ee_performance_event_tests()
             const std::string jump =
                 generateFunction({jumpRaw, 0u});
             t.IsTrue(
-                jump.find("recordEePredictedBranch") !=
+                jump.find("observeEePredictedBranchPolicy<Mode>") !=
                     std::string::npos,
                 "J should count as a predictive branch");
 
@@ -603,7 +603,7 @@ void register_ee_performance_event_tests()
             const std::string jr =
                 generateFunction({jrRaw, 0u});
             t.IsFalse(
-                jr.find("recordEePredictedBranch") !=
+                jr.find("observeEePredictedBranchPolicy<Mode>") !=
                     std::string::npos,
                 "JR should remain excluded from predictive branch events");
         });

@@ -917,6 +917,208 @@ static inline bool Ps2CanUseFastGuestRdramAccess(
         }                                                                            \
     } while (0)
 
+// Generated EE fast bodies retain the inline RDRAM classification above.
+// Precise bodies are cold and favor a compact call to the authoritative
+// runtime access path, which also preserves address translation, exceptions,
+// debugger observation, tracing, and MMIO behavior.
+template <EeArchitecturalObservationMode Mode>
+struct Ps2EeMemoryAccessPolicy;
+
+template <>
+struct Ps2EeMemoryAccessPolicy<EeArchitecturalObservationMode::Fast>
+{
+    static PS2X_EE_OBSERVATION_POLICY_INLINE uint8_t read8(
+        uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime, uint32_t address)
+    {
+        return READ8(address);
+    }
+
+    static PS2X_EE_OBSERVATION_POLICY_INLINE uint16_t read16(
+        uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime, uint32_t address)
+    {
+        return READ16(address);
+    }
+
+    static PS2X_EE_OBSERVATION_POLICY_INLINE uint32_t read32(
+        uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime, uint32_t address)
+    {
+        return READ32(address);
+    }
+
+    static PS2X_EE_OBSERVATION_POLICY_INLINE uint64_t read64(
+        uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime, uint32_t address)
+    {
+        return READ64(address);
+    }
+
+    static PS2X_EE_OBSERVATION_POLICY_INLINE __m128i read128(
+        uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime, uint32_t address)
+    {
+        return READ128(address);
+    }
+
+    static PS2X_EE_OBSERVATION_POLICY_INLINE void write8(
+        uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime,
+        uint32_t address, uint8_t value)
+    {
+        WRITE8(address, value);
+    }
+
+    static PS2X_EE_OBSERVATION_POLICY_INLINE void write16(
+        uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime,
+        uint32_t address, uint16_t value)
+    {
+        WRITE16(address, value);
+    }
+
+    static PS2X_EE_OBSERVATION_POLICY_INLINE void write32(
+        uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime,
+        uint32_t address, uint32_t value)
+    {
+        WRITE32(address, value);
+    }
+
+    static PS2X_EE_OBSERVATION_POLICY_INLINE void write64(
+        uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime,
+        uint32_t address, uint64_t value)
+    {
+        WRITE64(address, value);
+    }
+
+    static PS2X_EE_OBSERVATION_POLICY_INLINE void write128(
+        uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime,
+        uint32_t address, __m128i value)
+    {
+        WRITE128(address, value);
+    }
+
+    static PS2X_EE_OBSERVATION_POLICY_INLINE void writeMasked32(
+        uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime,
+        uint32_t address, uint32_t value, uint8_t byteEnable)
+    {
+        WRITE_MASKED32(address, value, byteEnable);
+    }
+
+    static PS2X_EE_OBSERVATION_POLICY_INLINE void writeMasked64(
+        uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime,
+        uint32_t address, uint64_t value, uint8_t byteEnable)
+    {
+        WRITE_MASKED64(address, value, byteEnable);
+    }
+};
+
+template <>
+struct Ps2EeMemoryAccessPolicy<EeArchitecturalObservationMode::Precise>
+{
+    static PS2X_EE_OBSERVATION_POLICY_INLINE uint8_t read8(
+        uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime, uint32_t address)
+    {
+        return runtime->Load8(rdram, ctx, address);
+    }
+
+    static PS2X_EE_OBSERVATION_POLICY_INLINE uint16_t read16(
+        uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime, uint32_t address)
+    {
+        return runtime->Load16(rdram, ctx, address);
+    }
+
+    static PS2X_EE_OBSERVATION_POLICY_INLINE uint32_t read32(
+        uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime, uint32_t address)
+    {
+        return runtime->Load32(rdram, ctx, address);
+    }
+
+    static PS2X_EE_OBSERVATION_POLICY_INLINE uint64_t read64(
+        uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime, uint32_t address)
+    {
+        return runtime->Load64(rdram, ctx, address);
+    }
+
+    static PS2X_EE_OBSERVATION_POLICY_INLINE __m128i read128(
+        uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime, uint32_t address)
+    {
+        return runtime->Load128(rdram, ctx, address);
+    }
+
+    static PS2X_EE_OBSERVATION_POLICY_INLINE void write8(
+        uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime,
+        uint32_t address, uint8_t value)
+    {
+        runtime->Store8(rdram, ctx, address, value);
+    }
+
+    static PS2X_EE_OBSERVATION_POLICY_INLINE void write16(
+        uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime,
+        uint32_t address, uint16_t value)
+    {
+        runtime->Store16(rdram, ctx, address, value);
+    }
+
+    static PS2X_EE_OBSERVATION_POLICY_INLINE void write32(
+        uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime,
+        uint32_t address, uint32_t value)
+    {
+        runtime->Store32(rdram, ctx, address, value);
+    }
+
+    static PS2X_EE_OBSERVATION_POLICY_INLINE void write64(
+        uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime,
+        uint32_t address, uint64_t value)
+    {
+        runtime->Store64(rdram, ctx, address, value);
+    }
+
+    static PS2X_EE_OBSERVATION_POLICY_INLINE void write128(
+        uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime,
+        uint32_t address, __m128i value)
+    {
+        runtime->Store128(rdram, ctx, address, value);
+    }
+
+    static PS2X_EE_OBSERVATION_POLICY_INLINE void writeMasked32(
+        uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime,
+        uint32_t address, uint32_t value, uint8_t byteEnable)
+    {
+        runtime->StoreMasked32(rdram, ctx, address, value, byteEnable);
+    }
+
+    static PS2X_EE_OBSERVATION_POLICY_INLINE void writeMasked64(
+        uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime,
+        uint32_t address, uint64_t value, uint8_t byteEnable)
+    {
+        runtime->StoreMasked64(rdram, ctx, address, value, byteEnable);
+    }
+};
+
+#define PS2X_EE_READ8(mode, addr)                                      \
+    Ps2EeMemoryAccessPolicy<mode>::read8(rdram, ctx, runtime, (addr))
+#define PS2X_EE_READ16(mode, addr)                                     \
+    Ps2EeMemoryAccessPolicy<mode>::read16(rdram, ctx, runtime, (addr))
+#define PS2X_EE_READ32(mode, addr)                                     \
+    Ps2EeMemoryAccessPolicy<mode>::read32(rdram, ctx, runtime, (addr))
+#define PS2X_EE_READ64(mode, addr)                                     \
+    Ps2EeMemoryAccessPolicy<mode>::read64(rdram, ctx, runtime, (addr))
+#define PS2X_EE_READ128(mode, addr)                                    \
+    Ps2EeMemoryAccessPolicy<mode>::read128(rdram, ctx, runtime, (addr))
+
+#define PS2X_EE_WRITE8(mode, addr, val)                                \
+    Ps2EeMemoryAccessPolicy<mode>::write8(rdram, ctx, runtime, (addr), (val))
+#define PS2X_EE_WRITE16(mode, addr, val)                               \
+    Ps2EeMemoryAccessPolicy<mode>::write16(rdram, ctx, runtime, (addr), (val))
+#define PS2X_EE_WRITE32(mode, addr, val)                               \
+    Ps2EeMemoryAccessPolicy<mode>::write32(rdram, ctx, runtime, (addr), (val))
+#define PS2X_EE_WRITE64(mode, addr, val)                               \
+    Ps2EeMemoryAccessPolicy<mode>::write64(rdram, ctx, runtime, (addr), (val))
+#define PS2X_EE_WRITE128(mode, addr, val)                              \
+    Ps2EeMemoryAccessPolicy<mode>::write128(rdram, ctx, runtime, (addr), (val))
+
+#define PS2X_EE_WRITE_MASKED32(mode, addr, val, byteEnable)            \
+    Ps2EeMemoryAccessPolicy<mode>::writeMasked32(                      \
+        rdram, ctx, runtime, (addr), (val), (byteEnable))
+#define PS2X_EE_WRITE_MASKED64(mode, addr, val, byteEnable)            \
+    Ps2EeMemoryAccessPolicy<mode>::writeMasked64(                      \
+        rdram, ctx, runtime, (addr), (val), (byteEnable))
+
 // Packed Compare Greater Than (PCGT)
 #define PS2_PCGTW(a, b) _mm_cmpgt_epi32((__m128i)(a), (__m128i)(b))
 #define PS2_PCGTH(a, b) _mm_cmpgt_epi16((__m128i)(a), (__m128i)(b))

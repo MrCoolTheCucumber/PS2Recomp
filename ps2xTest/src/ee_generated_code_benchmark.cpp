@@ -20,7 +20,7 @@ namespace
 {
     using namespace ps2x::performance;
 
-    constexpr uint32_t kOutputSchemaVersion = 1u;
+    constexpr uint32_t kOutputSchemaVersion = 2u;
     constexpr uint32_t kInstructionsPerBlock = 10u;
     constexpr uint32_t kLoadsPerBlock = 1u;
     constexpr uint32_t kStoresPerBlock = 1u;
@@ -74,6 +74,7 @@ namespace
     enum class ObservationEntry : uint8_t
     {
         FastCompiledOut,
+        PolicySelected,
         Precise,
     };
 
@@ -107,10 +108,14 @@ namespace
         Feature feature = Feature::Inactive;
     };
 
-    constexpr std::array<BenchmarkCase, 15u> kCases{{
+    constexpr std::array<BenchmarkCase, 17u> kCases{{
         {"fast_control_mapped", ObservationEntry::FastCompiledOut,
          MemoryPath::MappedKuseg, Feature::Inactive},
         {"fast_control_direct", ObservationEntry::FastCompiledOut,
+         MemoryPath::DirectKseg, Feature::Inactive},
+        {"policy_inactive_mapped", ObservationEntry::PolicySelected,
+         MemoryPath::MappedKuseg, Feature::Inactive},
+        {"policy_inactive_direct", ObservationEntry::PolicySelected,
          MemoryPath::DirectKseg, Feature::Inactive},
         {"precise_inactive_mapped", ObservationEntry::Precise,
          MemoryPath::MappedKuseg, Feature::Inactive},
@@ -146,6 +151,7 @@ namespace
         uint64_t blocks = 1'000'000u;
         uint64_t warmupBlocks = 20'000u;
         uint32_t samples = 5u;
+        std::string_view caseFilter;
     };
 
     struct Measurement
@@ -252,6 +258,11 @@ namespace
             if (index + 1 >= argc)
                 return false;
             const std::string_view option = argv[index];
+            if (option == "--case")
+            {
+                configuration.caseFilter = argv[index + 1];
+                continue;
+            }
             uint64_t value = 0u;
             if (!parseUnsigned(argv[index + 1], value))
                 return false;
@@ -294,9 +305,16 @@ namespace
 
     std::string_view entryName(ObservationEntry entry)
     {
-        return entry == ObservationEntry::FastCompiledOut
-                   ? "fast_compiled_out"
-                   : "precise";
+        switch (entry)
+        {
+        case ObservationEntry::FastCompiledOut:
+            return "fast_compiled_out";
+        case ObservationEntry::PolicySelected:
+            return "policy_selected";
+        case ObservationEntry::Precise:
+            return "precise";
+        }
+        return "unknown";
     }
 
     std::string_view memoryPathName(MemoryPath memory)
@@ -579,6 +597,27 @@ namespace
             rdram, ctx, runtime, addressBase, blocks);
     }
 
+    extern "C" PS2_BENCHMARK_NOINLINE
+    void EeGeneratedBenchmarkPolicyEntry(
+        uint8_t *rdram,
+        R5900Context *ctx,
+        PS2Runtime *runtime,
+        uint32_t addressBase,
+        uint64_t blocks)
+    {
+        if (PS2Runtime::architecturalObservationMode(ctx) ==
+            EeArchitecturalObservationMode::Fast)
+        {
+            EeGeneratedBenchmarkFastEntry(
+                rdram, ctx, runtime, addressBase, blocks);
+        }
+        else
+        {
+            EeGeneratedBenchmarkPreciseEntry(
+                rdram, ctx, runtime, addressBase, blocks);
+        }
+    }
+
     class Fixture
     {
     public:
@@ -645,6 +684,12 @@ namespace
             if (m_case.entry == ObservationEntry::FastCompiledOut)
             {
                 EeGeneratedBenchmarkFastEntry(
+                    rdram, &context, &runtime,
+                    addressBase, m_blocks);
+            }
+            else if (m_case.entry == ObservationEntry::PolicySelected)
+            {
+                EeGeneratedBenchmarkPolicyEntry(
                     rdram, &context, &runtime,
                     addressBase, m_blocks);
             }
@@ -1174,7 +1219,8 @@ int main(int argc, char **argv)
     {
         std::cerr
             << "usage: ee_generated_code_benchmark "
-               "[--blocks N] [--warmup-blocks N] [--samples N]\n";
+               "[--blocks N] [--warmup-blocks N] [--samples N] "
+               "[--case NAME]\n";
         return 2;
     }
 
@@ -1186,6 +1232,8 @@ int main(int argc, char **argv)
             << ",\"blocks\":" << configuration.blocks
             << ",\"warmup_blocks\":" << configuration.warmupBlocks
             << ",\"samples\":" << configuration.samples
+            << ",\"case_filter\":\""
+            << configuration.caseFilter << "\""
             << ",\"instructions_per_block\":"
             << kInstructionsPerBlock
             << ",\"loads_per_block\":" << kLoadsPerBlock
@@ -1202,11 +1250,25 @@ int main(int argc, char **argv)
         std::array<uint64_t, kCases.size()> workHashes{};
         std::array<uint64_t, kCases.size()> counterHashes{};
         uint64_t commonWorkHash = 0u;
+        std::vector<size_t> selectedCases;
 
-        for (const BenchmarkCase &benchmarkCase : kCases)
+        for (size_t index = 0u; index < kCases.size(); ++index)
+        {
+            if (configuration.caseFilter.empty() ||
+                kCases[index].name == configuration.caseFilter)
+            {
+                selectedCases.push_back(index);
+            }
+        }
+        if (selectedCases.empty())
+        {
+            throw std::runtime_error("unknown benchmark case");
+        }
+
+        for (size_t index : selectedCases)
         {
             runWarmup(
-                benchmarkCase,
+                kCases[index],
                 configuration.warmupBlocks);
         }
 
@@ -1218,11 +1280,12 @@ int main(int argc, char **argv)
             // favor the same entry while retaining deterministic JSON order
             // within each sample.
             for (size_t offset = 0u;
-                 offset < kCases.size();
+                 offset < selectedCases.size();
                  ++offset)
             {
                 const size_t index =
-                    (offset + sample) % kCases.size();
+                    selectedCases[
+                        (offset + sample) % selectedCases.size()];
                 const Measurement measurement = runMeasurement(
                     kCases[index], configuration.blocks, sample);
                 printMeasurement(measurement);
@@ -1253,7 +1316,7 @@ int main(int argc, char **argv)
             }
         }
 
-        for (size_t index = 0u; index < kCases.size(); ++index)
+        for (size_t index : selectedCases)
         {
             printSummary(
                 kCases[index], configuration.blocks,

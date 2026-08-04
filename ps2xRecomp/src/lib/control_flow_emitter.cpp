@@ -11,6 +11,7 @@
 #include <algorithm>
 #include <fmt/format.h>
 #include <sstream>
+#include <stdexcept>
 #include <utility>
 
 namespace ps2recomp
@@ -101,6 +102,20 @@ namespace ps2recomp
         return targets;
     }
 
+    std::string ControlFlowEmitter::observationDescriptor(
+        const Instruction &instruction) const
+    {
+        const std::string expression =
+            m_gen.eeObservationDescriptorExpression(
+                instruction.address);
+        if (expression.empty())
+        {
+            throw std::runtime_error(
+                "Missing EE control-flow observation descriptor");
+        }
+        return expression;
+    }
+
     std::string ControlFlowEmitter::delaySlotCode(
         bool branchDelayExecution) const
     {
@@ -180,7 +195,7 @@ namespace ps2recomp
                     indent, modeChanged, modeBefore);
                 m_ss << fmt::format("{}if (!{}) {{\n", indent, modeChanged);
                 m_ss << fmt::format(
-                    "{}    runtime->ValidateInstructionFetch(ctx, ctx->pc);\n",
+                    "{}    runtime->validateEeInstructionFetchPolicy<Mode>(ctx, ctx->pc);\n",
                     indent);
                 emitBasicBlockBoundary(fmt::format("{}    ", indent));
                 m_ss << fmt::format("{}}}\n", indent);
@@ -193,7 +208,7 @@ namespace ps2recomp
                 indent, modeBefore);
         }
         m_ss << fmt::format(
-            "{}runtime->ValidateInstructionFetch(ctx, ctx->pc);\n",
+            "{}runtime->validateEeInstructionFetchPolicy<Mode>(ctx, ctx->pc);\n",
             indent);
         emitBasicBlockBoundary(indent);
     }
@@ -213,13 +228,12 @@ namespace ps2recomp
             m_ss << fmt::format("{}ctx->in_delay_slot = true;\n", indent);
             m_ss << fmt::format("{}ctx->branch_pc = 0x{:X}u;\n", indent, branchPc());
         }
-        m_ss << fmt::format(
-            "{}runtime->CheckEeInstructionBreakpoint(ctx, ctx->pc);\n",
-            indent);
+        const std::string descriptor =
+            observationDescriptor(m_delaySlot);
         const EeInstructionPerformanceInfo performanceInfo =
             eeInstructionPerformanceInfo(m_delaySlot);
         m_ss << indent
-             << eeInstructionIssueCall(m_delaySlot)
+             << eeObservationBeginCall(descriptor, false)
              << "\n";
         m_ss << fmt::format(
             "{}ctx->beginEeInstruction();\n", indent);
@@ -234,7 +248,7 @@ namespace ps2recomp
         if (!hasInstruction)
         {
             m_ss << indent
-                 << eeInstructionCompletionCall(m_delaySlot)
+                 << eeObservationCompletionCall(descriptor)
                  << "\n";
             if (branchDelayExecution)
             {
@@ -248,7 +262,7 @@ namespace ps2recomp
         if (performanceInfo.completionBeforeEffect)
         {
             m_ss << indent
-                 << eeInstructionCompletionCall(m_delaySlot)
+                 << eeObservationCompletionCall(descriptor)
                  << "\n";
         }
         if (mayChangeEeArchitecturalObservationMode(m_delaySlot))
@@ -273,7 +287,7 @@ namespace ps2recomp
         if (!performanceInfo.completionBeforeEffect)
         {
             m_ss << indent
-                 << eeInstructionCompletionCall(m_delaySlot)
+                 << eeObservationCompletionCall(descriptor)
                  << "\n";
         }
 
@@ -335,7 +349,7 @@ namespace ps2recomp
                                                        bool returnOnTransfer)
     {
         m_ss << fmt::format(
-            "{}if (!runtime->dispatchGuestBranch(rdram, ctx, {}, 0x{:X}u, 0x{:X}u, PS2Runtime::GuestBranchKind::{}, \"{}\")) {{\n",
+            "{}if (!runtime->dispatchValidatedGuestBranchPolicy<Mode>(rdram, ctx, {}, 0x{:X}u, 0x{:X}u, PS2Runtime::GuestBranchKind::{}, \"{}\")) {{\n",
             indent,
             targetExpression,
             sourcePc,
@@ -362,7 +376,15 @@ namespace ps2recomp
             return false;
         }
 
-        m_ss << indent << functionName << "(rdram, ctx, runtime); return;\n";
+        m_ss << indent << "if constexpr (Mode == "
+             << "EeArchitecturalObservationMode::Fast) {\n";
+        m_ss << indent << "    " << eeFastFunctionName(functionName)
+             << "(rdram, ctx, runtime);\n";
+        m_ss << indent << "} else {\n";
+        m_ss << indent << "    " << eePreciseFunctionName(functionName)
+             << "(rdram, ctx, runtime);\n";
+        m_ss << indent << "}\n";
+        m_ss << indent << "return;\n";
         return true;
     }
 
@@ -417,7 +439,7 @@ namespace ps2recomp
         if (isReturn)
         {
             m_ss << indent << "#if defined(PS2X_STRICT_RETURN_DIAGNOSTICS) && PS2X_STRICT_RETURN_DIAGNOSTICS\n";
-            m_ss << indent << "(void)runtime->dispatchGuestBranch(rdram, ctx, " << jumpTargetExpression
+            m_ss << indent << "(void)runtime->dispatchValidatedGuestBranchPolicy<Mode>(rdram, ctx, " << jumpTargetExpression
                  << ", 0x" << fmt::format("{:X}", branchPc())
                  << "u, 0u, PS2Runtime::GuestBranchKind::Return, \"JR $ra\");\n";
             m_ss << indent << "return;\n";
@@ -483,12 +505,12 @@ namespace ps2recomp
 
     void ControlFlowEmitter::emitStaticJump(StaticBranchKind kind)
     {
-        m_ss << fmt::format(
-            "    if ((ctx->cop0_perf & 0x80000000u) != 0u) {{ "
-            "runtime->recordEePredictedBranch(ctx, 0x{:X}u); }}\n",
-            branchPc());
+        const std::string branchDescriptor =
+            observationDescriptor(m_branchInst);
+        m_ss << "    runtime->observeEePredictedBranchPolicy<Mode>(ctx, "
+             << branchDescriptor << ");\n";
         m_ss << "    "
-             << eeInstructionCompletionCall(m_branchInst)
+             << eeObservationCompletionCall(branchDescriptor)
              << "\n";
         if (kind == StaticBranchKind::Call)
         {
@@ -535,7 +557,8 @@ namespace ps2recomp
         m_ss << "    {\n";
         m_ss << "        const uint32_t jumpTarget = GPR_U32(ctx, " << static_cast<int>(rsReg) << ");\n";
         m_ss << "        "
-             << eeInstructionCompletionCall(m_branchInst)
+             << eeObservationCompletionCall(
+                    observationDescriptor(m_branchInst))
              << "\n";
 
         if (kind == RegisterBranchKind::Call && rdReg != 0u)
@@ -555,8 +578,8 @@ namespace ps2recomp
                      << ", PS2Runtime::GuestBranchKind::Return)) { return; }\n";
             }
             m_ss << "        const bool continueGuestExecution = "
-                    "runtime->ValidateGuestBranchTarget(ctx, jumpTarget, "
-                    "PS2Runtime::GuestBranchKind::Return);\n";
+                    "runtime->validateEeGuestBranchTargetPolicy<Mode>("
+                    "ctx, jumpTarget, PS2Runtime::GuestBranchKind::Return);\n";
             emitBasicBlockBoundary("        ");
             m_ss << "        if (!continueGuestExecution) { return; }\n";
         }
@@ -700,12 +723,12 @@ namespace ps2recomp
 
         m_ss << "    {\n";
         m_ss << "        const bool " << branchTakenVar << " = (" << conditionalBranchExpression() << ");\n";
-        m_ss << fmt::format(
-            "        if ((ctx->cop0_perf & 0x80000000u) != 0u) {{ "
-            "runtime->recordEeConditionalBranch(ctx, 0x{:X}u, {}); }}\n",
-            branchPc(), branchTakenVar);
+        const std::string branchDescriptor =
+            observationDescriptor(m_branchInst);
+        m_ss << "        runtime->observeEeConditionalBranchPolicy<Mode>(ctx, "
+             << branchDescriptor << ", " << branchTakenVar << ");\n";
         m_ss << "        "
-             << eeInstructionCompletionCall(m_branchInst)
+             << eeObservationCompletionCall(branchDescriptor)
              << "\n";
 
         if (!unconditionalLinkCode.empty())
@@ -734,10 +757,12 @@ namespace ps2recomp
             m_ss << "        }\n";
             m_ss << "        if (!" << branchTakenVar << ") {\n";
             m_ss << "            "
-                 << eeInstructionIssueCall(m_delaySlot)
+                 << eeObservationBeginCall(
+                        observationDescriptor(m_delaySlot), true)
                  << "\n";
             m_ss << "            "
-                 << eeInstructionCompletionCall(m_delaySlot)
+                 << eeObservationCompletionCall(
+                        observationDescriptor(m_delaySlot))
                  << "\n";
             emitResolvedBasicBlockBoundary(
                 fallthroughPc(), "            ",
@@ -777,7 +802,8 @@ namespace ps2recomp
     {
         m_ss << "    " << m_gen.translateInstruction(m_branchInst) << "\n";
         m_ss << "    "
-             << eeInstructionCompletionCall(m_branchInst)
+             << eeObservationCompletionCall(
+                    observationDescriptor(m_branchInst))
              << "\n";
         emitDelaySlot("    ");
         emitResolvedBasicBlockBoundary(fallthroughPc(), "    ");

@@ -2,6 +2,7 @@
 #include "ps2recomp/instructions.h"
 #include "ps2recomp/types.h"
 #include "ps2recomp/elf_parser.h"
+#include "ps2recomp/ee_observation_mode.h"
 #include "ps2recomp/r5900_decoder.h"
 #include "ps2_runtime_calls.h"
 #include <iostream>
@@ -1184,8 +1185,10 @@ namespace ps2recomp
                 if (function.isStub || function.isSkipped)
                 {
                     std::string generatedName = m_codeGenerator->getFunctionName(function.start);
+                    const std::string sharedStubName =
+                        generatedName + "__ee_stub";
                     std::stringstream stub;
-                    stub << "void " << generatedName
+                    stub << "static void " << sharedStubName
                          << "(uint8_t* rdram, R5900Context* ctx, PS2Runtime *runtime) {\n";
                     stub << "#ifdef _DEBUG\n";
                     stub << "    PS_LOG_ENTRY(\"" << generatedName << "\");\n";
@@ -1232,6 +1235,16 @@ namespace ps2recomp
                          << "    {\n"
                          << "        ctx->pc = getRegU32(ctx, 31);\n"
                          << "    }\n"
+                         << "}\n\n"
+                         << "void " << eeFastFunctionName(generatedName)
+                         << "(uint8_t* rdram, R5900Context* ctx, PS2Runtime *runtime) {\n"
+                         << "    " << sharedStubName
+                         << "(rdram, ctx, runtime);\n"
+                         << "}\n\n"
+                         << "void " << eePreciseFunctionName(generatedName)
+                         << "(uint8_t* rdram, R5900Context* ctx, PS2Runtime *runtime) {\n"
+                         << "    " << sharedStubName
+                         << "(rdram, ctx, runtime);\n"
                          << "}";
                     m_generatedStubs[function.start] = stub.str();
                 }
@@ -1759,7 +1772,10 @@ namespace ps2recomp
                     continue;
                 }
 
-                ss << "void " << generatedName << "(uint8_t* rdram, R5900Context* ctx, PS2Runtime* runtime);\n";
+                ss << "void " << eeFastFunctionName(generatedName)
+                   << "(uint8_t* rdram, R5900Context* ctx, PS2Runtime* runtime);\n";
+                ss << "void " << eePreciseFunctionName(generatedName)
+                   << "(uint8_t* rdram, R5900Context* ctx, PS2Runtime* runtime);\n";
             }
 
             // ss << "\n} // namespace stubs\n";
@@ -1804,7 +1820,10 @@ namespace ps2recomp
 
                 std::string finalName = m_codeGenerator->getFunctionName(function.start);
 
-                ss << "void " << finalName << "(uint8_t* rdram, R5900Context* ctx, PS2Runtime *runtime);\n";
+                ss << "void " << eeFastFunctionName(finalName)
+                   << "(uint8_t* rdram, R5900Context* ctx, PS2Runtime *runtime);\n";
+                ss << "void " << eePreciseFunctionName(finalName)
+                   << "(uint8_t* rdram, R5900Context* ctx, PS2Runtime *runtime);\n";
             }
 
             ss << "\n#endif // PS2_RECOMPILED_FUNCTIONS_H\n";

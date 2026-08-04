@@ -205,29 +205,36 @@ namespace ps2recomp
         return info;
     }
 
-    std::string eeInstructionIssueCall(
+    std::string eeObservationDescriptorInitializer(
         const Instruction &inst)
     {
         const EeInstructionPerformanceInfo info =
             eeInstructionPerformanceInfo(inst);
         return fmt::format(
-            "if ((ctx->cop0_perf & 0x80000000u) != 0u) {{ "
-            "runtime->recordEeInstructionIssue(ctx, {{{}u, 0x{:08X}u, "
-            "0x{:08X}u, {}u}}); }}",
+            "{{0x{:X},{{{},0x{:X},0x{:X},{}}},{}}}",
+            inst.address,
             info.issuePipeMask,
             inst.gprReadMask,
             inst.gprWriteMask,
-            info.issueFlags);
+            info.issueFlags,
+            info.completionEvents);
     }
 
-    std::string eeInstructionCompletionCall(
-        const Instruction &inst)
+    std::string eeObservationBeginCall(
+        const std::string &descriptorExpression,
+        bool breakpointAlreadyChecked)
     {
-        const EeInstructionPerformanceInfo info =
-            eeInstructionPerformanceInfo(inst);
         return fmt::format(
-            "if ((ctx->cop0_perf & 0x80000000u) != 0u) {{ "
-            "runtime->recordEeInstructionCompletion(ctx, {}u); }}",
-            info.completionEvents);
+            "runtime->observeEeInstructionBeginPolicy<Mode>(ctx, {}, {});",
+            descriptorExpression,
+            breakpointAlreadyChecked ? "true" : "false");
+    }
+
+    std::string eeObservationCompletionCall(
+        const std::string &descriptorExpression)
+    {
+        return fmt::format(
+            "runtime->observeEeInstructionCompletePolicy<Mode>(ctx, {});",
+            descriptorExpression);
     }
 }

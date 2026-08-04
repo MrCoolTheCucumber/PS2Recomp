@@ -19,9 +19,14 @@ namespace ps2recomp
     [[nodiscard]] EeInstructionPerformanceInfo
     eeInstructionPerformanceInfo(const Instruction &inst);
     [[nodiscard]] std::string
-    eeInstructionIssueCall(const Instruction &inst);
+    eeObservationDescriptorInitializer(const Instruction &inst);
     [[nodiscard]] std::string
-    eeInstructionCompletionCall(const Instruction &inst);
+    eeObservationBeginCall(
+        const std::string &descriptorExpression,
+        bool breakpointAlreadyChecked);
+    [[nodiscard]] std::string
+    eeObservationCompletionCall(
+        const std::string &descriptorExpression);
 }
 
 #endif

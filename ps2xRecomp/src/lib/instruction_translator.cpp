@@ -54,14 +54,17 @@ namespace ps2recomp
             {
                 return fmt::format("runtime->Load{}(rdram, ctx, {})", width, resolvedAddressExpr);
             }
-            return fmt::format("READ{}({})", width, resolvedAddressExpr);
+            return fmt::format(
+                "PS2X_EE_READ{}(Mode, {})",
+                width,
+                resolvedAddressExpr);
         }
 
         if (inst.isMmio)
         {
             return fmt::format("runtime->Load{}(rdram, ctx, {})", width, addr);
         }
-        return fmt::format("READ{}({})", width, addr);
+        return fmt::format("PS2X_EE_READ{}(Mode, {})", width, addr);
     }
 
     std::string InstructionTranslator::translateMemoryWrite(const Instruction &inst,
@@ -80,7 +83,7 @@ namespace ps2recomp
                 return fmt::format("runtime->Store{}(rdram, ctx, {}, {})", width, resolvedAddressExpr, value);
             }
             return fmt::format(
-                "WRITE{}({}, {})",
+                "PS2X_EE_WRITE{}(Mode, {}, {})",
                 width,
                 resolvedAddressExpr,
                 value);
@@ -90,7 +93,11 @@ namespace ps2recomp
         {
             return fmt::format("runtime->Store{}(rdram, ctx, {}, {})", width, addr, value);
         }
-        return fmt::format("WRITE{}({}, {})", width, addr, value);
+        return fmt::format(
+            "PS2X_EE_WRITE{}(Mode, {}, {})",
+            width,
+            addr,
+            value);
     }
 
     std::string InstructionTranslator::translate(
@@ -160,11 +167,9 @@ namespace ps2recomp
         {
             return fmt::format(
                 "([&]() {{ const uint32_t eeBreakpointAddress = {}; "
-                "const bool eeBreakpointCheckValue = "
-                "runtime->CheckEeDataAddressBreakpoint(ctx, eeBreakpointAddress, false); "
+                "const bool eeBreakpointCheckValue = runtime->observeEeDataAddressPolicy<Mode>(ctx, eeBreakpointAddress, false); "
                 "auto eeBreakpointValue = {}; "
-                "if (eeBreakpointCheckValue) "
-                "runtime->CheckEeDataValueBreakpoint(ctx, eeBreakpointAddress, {}, false); "
+                "if (eeBreakpointCheckValue) runtime->observeEeDataValuePolicy<Mode>(ctx, eeBreakpointAddress, {}, false); "
                 "return eeBreakpointValue; }}())",
                 addr,
                 genRead(width, "eeBreakpointAddress"),
@@ -177,11 +182,9 @@ namespace ps2recomp
         {
             return fmt::format(
                 "([&]() {{ const uint32_t eeBreakpointAddress = {}; "
-                "const bool eeBreakpointCheckValue = "
-                "runtime->CheckEeDataAddressBreakpoint(ctx, eeBreakpointAddress, false); "
+                "const bool eeBreakpointCheckValue = runtime->observeEeDataAddressPolicy<Mode>(ctx, eeBreakpointAddress, false); "
                 "auto eeBreakpointValue = {}; "
-                "if (eeBreakpointCheckValue) "
-                "runtime->CheckEeDataValueBreakpoint(ctx, eeBreakpointAddress, {}, false); "
+                "if (eeBreakpointCheckValue) runtime->observeEeDataValuePolicy<Mode>(ctx, eeBreakpointAddress, {}, false); "
                 "return eeBreakpointValue; }}())",
                 addr,
                 genAlignedQuadwordRead("eeBreakpointAddress"),
@@ -196,8 +199,8 @@ namespace ps2recomp
             return fmt::format(
                 "{{ const uint32_t eeBreakpointAddress = {}; "
                 "auto eeBreakpointStoreValue = {}; "
-                "if (runtime->CheckEeDataAddressBreakpoint(ctx, eeBreakpointAddress, true)) "
-                "runtime->CheckEeDataValueBreakpoint(ctx, eeBreakpointAddress, {}, true); "
+                "if (runtime->observeEeDataAddressPolicy<Mode>(ctx, eeBreakpointAddress, true)) "
+                "runtime->observeEeDataValuePolicy<Mode>(ctx, eeBreakpointAddress, {}, true); "
                 "{}; }}",
                 addr,
                 value,
@@ -213,8 +216,8 @@ namespace ps2recomp
             return fmt::format(
                 "{{ const uint32_t eeBreakpointAddress = {}; "
                 "auto eeBreakpointStoreValue = {}; "
-                "if (runtime->CheckEeDataAddressBreakpoint(ctx, eeBreakpointAddress, true)) "
-                "runtime->CheckEeDataValueBreakpoint(ctx, eeBreakpointAddress, {}, true); "
+                "if (runtime->observeEeDataAddressPolicy<Mode>(ctx, eeBreakpointAddress, true)) "
+                "runtime->observeEeDataValuePolicy<Mode>(ctx, eeBreakpointAddress, {}, true); "
                 "{}; }}",
                 addr,
                 value,
@@ -383,46 +386,46 @@ namespace ps2recomp
 
         case OPCODE_LDL:
             return fmt::format("{{ uint32_t addr = ADD32(GPR_U32(ctx, {}), {}); "
-                               "bool eeBreakpointCheckValue = runtime->CheckEeDataAddressBreakpoint(ctx, addr, false); "
+                               "const bool eeBreakpointCheckValue = runtime->observeEeDataAddressPolicy<Mode>(ctx, addr, false); "
                                "uint32_t aligned_addr = addr & ~7u; "
                                "uint32_t offset = addr & 7u; "
                                "uint64_t mem = {}; "
                                "uint32_t shift = (7u - offset) << 3; "
                                "uint64_t keepMask = (shift == 0) ? 0ull : ((1ull << shift) - 1ull); "
                                "uint64_t merged = (GPR_U64(ctx, {}) & keepMask) | (mem << shift); "
-                               "if (eeBreakpointCheckValue) runtime->CheckEeDataValueBreakpoint(ctx, addr, (uint32_t)merged, false); "
+                               "if (eeBreakpointCheckValue) runtime->observeEeDataValuePolicy<Mode>(ctx, addr, (uint32_t)merged, false); "
                                "SET_GPR_U64(ctx, {}, merged); }}",
                                inst.rs, inst.simmediate, genRead(64, "aligned_addr"), inst.rt, inst.rt);
 
         case OPCODE_LDR:
             return fmt::format("{{ uint32_t addr = ADD32(GPR_U32(ctx, {}), {}); "
-                               "bool eeBreakpointCheckValue = runtime->CheckEeDataAddressBreakpoint(ctx, addr, false); "
+                               "const bool eeBreakpointCheckValue = runtime->observeEeDataAddressPolicy<Mode>(ctx, addr, false); "
                                "uint32_t aligned_addr = addr & ~7u; "
                                "uint32_t offset = addr & 7u; "
                                "uint64_t mem = {}; "
                                "uint32_t shift = offset << 3; "
                                "uint64_t keepMask = (offset == 0) ? 0ull : (0xFFFFFFFFFFFFFFFFull << ((8u - offset) << 3)); "
                                "uint64_t merged = (GPR_U64(ctx, {}) & keepMask) | (mem >> shift); "
-                               "if (eeBreakpointCheckValue) runtime->CheckEeDataValueBreakpoint(ctx, addr, (uint32_t)merged, false); "
+                               "if (eeBreakpointCheckValue) runtime->observeEeDataValuePolicy<Mode>(ctx, addr, (uint32_t)merged, false); "
                                "SET_GPR_U64(ctx, {}, merged); }}",
                                inst.rs, inst.simmediate, genRead(64, "aligned_addr"), inst.rt, inst.rt);
 
         case OPCODE_LWL:
             return fmt::format("{{ uint32_t addr = ADD32(GPR_U32(ctx, {}), {}); "
-                               "bool eeBreakpointCheckValue = runtime->CheckEeDataAddressBreakpoint(ctx, addr, false); "
+                               "const bool eeBreakpointCheckValue = runtime->observeEeDataAddressPolicy<Mode>(ctx, addr, false); "
                                "uint32_t aligned_addr = addr & ~3u; "
                                "uint32_t offset = addr & 3u; "
                                "uint32_t mem = {}; "
                                "uint32_t shift = (3u - offset) << 3; "
                                "uint32_t keepMask = (shift == 0) ? 0u : ((1u << shift) - 1u); "
                                "uint32_t merged = (GPR_U32(ctx, {}) & keepMask) | (mem << shift); "
-                               "if (eeBreakpointCheckValue) runtime->CheckEeDataValueBreakpoint(ctx, addr, merged, false); "
+                               "if (eeBreakpointCheckValue) runtime->observeEeDataValuePolicy<Mode>(ctx, addr, merged, false); "
                                "SET_GPR_S32(ctx, {}, (int32_t)merged); }}",
                                inst.rs, inst.simmediate, genRead(32, "aligned_addr"), inst.rt, inst.rt);
 
         case OPCODE_LWR:
             return fmt::format("{{ uint32_t addr = ADD32(GPR_U32(ctx, {}), {}); "
-                               "bool eeBreakpointCheckValue = runtime->CheckEeDataAddressBreakpoint(ctx, addr, false); "
+                               "const bool eeBreakpointCheckValue = runtime->observeEeDataAddressPolicy<Mode>(ctx, addr, false); "
                                "uint32_t aligned_addr = addr & ~3u; "
                                "uint32_t offset = addr & 3u; "
                                "uint32_t mem = {}; "
@@ -431,53 +434,53 @@ namespace ps2recomp
                                "uint32_t merged32 = (GPR_U32(ctx, {}) & keepMask) | (mem >> shift); "
                                "uint64_t merged64 = (GPR_U64(ctx, {}) & 0xFFFFFFFF00000000ull) | (uint64_t)merged32; "
                                "if (offset == 0) merged64 = (uint64_t)(int64_t)(int32_t)merged32; "
-                               "if (eeBreakpointCheckValue) runtime->CheckEeDataValueBreakpoint(ctx, addr, merged32, false); "
+                               "if (eeBreakpointCheckValue) runtime->observeEeDataValuePolicy<Mode>(ctx, addr, merged32, false); "
                                "SET_GPR_U64(ctx, {}, merged64); }}",
                                inst.rs, inst.simmediate, genRead(32, "aligned_addr"),
                                inst.rt, inst.rt, inst.rt);
 
         case OPCODE_SWL:
             return fmt::format("{{ uint32_t addr = ADD32(GPR_U32(ctx, {}), {}); "
-                               "if (runtime->CheckEeDataAddressBreakpoint(ctx, addr, true)) runtime->CheckEeDataValueBreakpoint(ctx, addr, GPR_U32(ctx, {}), true); "
+                               "if (runtime->observeEeDataAddressPolicy<Mode>(ctx, addr, true)) runtime->observeEeDataValuePolicy<Mode>(ctx, addr, GPR_U32(ctx, {}), true); "
                                "uint32_t aligned_addr = addr & ~3u; "
                                "uint32_t offset = addr & 3u; "
                                "uint32_t shift = (3u - offset) << 3; "
                                "uint8_t byte_enable = (uint8_t)((1u << (offset + 1u)) - 1u); "
                                "uint32_t value = GPR_U32(ctx, {}) >> shift; "
-                               "WRITE_MASKED32(aligned_addr, value, byte_enable); }}",
+                               "PS2X_EE_WRITE_MASKED32(Mode, aligned_addr, value, byte_enable); }}",
                                inst.rs, inst.simmediate, inst.rt, inst.rt);
 
         case OPCODE_SWR:
             return fmt::format("{{ uint32_t addr = ADD32(GPR_U32(ctx, {}), {}); "
-                               "if (runtime->CheckEeDataAddressBreakpoint(ctx, addr, true)) runtime->CheckEeDataValueBreakpoint(ctx, addr, GPR_U32(ctx, {}), true); "
+                               "if (runtime->observeEeDataAddressPolicy<Mode>(ctx, addr, true)) runtime->observeEeDataValuePolicy<Mode>(ctx, addr, GPR_U32(ctx, {}), true); "
                                "uint32_t aligned_addr = addr & ~3u; "
                                "uint32_t offset = addr & 3u; "
                                "uint32_t shift = offset << 3; "
                                "uint8_t byte_enable = (uint8_t)((0xFu << offset) & 0xFu); "
                                "uint32_t value = GPR_U32(ctx, {}) << shift; "
-                               "WRITE_MASKED32(aligned_addr, value, byte_enable); }}",
+                               "PS2X_EE_WRITE_MASKED32(Mode, aligned_addr, value, byte_enable); }}",
                                inst.rs, inst.simmediate, inst.rt, inst.rt);
 
         case OPCODE_SDL:
             return fmt::format("{{ uint32_t addr = ADD32(GPR_U32(ctx, {}), {}); "
-                               "if (runtime->CheckEeDataAddressBreakpoint(ctx, addr, true)) runtime->CheckEeDataValueBreakpoint(ctx, addr, GPR_U32(ctx, {}), true); "
+                               "if (runtime->observeEeDataAddressPolicy<Mode>(ctx, addr, true)) runtime->observeEeDataValuePolicy<Mode>(ctx, addr, GPR_U32(ctx, {}), true); "
                                "uint32_t aligned_addr = addr & ~7u; "
                                "uint32_t offset = addr & 7u; "
                                "uint32_t shift = (7u - offset) << 3; "
                                "uint8_t byte_enable = (uint8_t)((1u << (offset + 1u)) - 1u); "
                                "uint64_t value = GPR_U64(ctx, {}) >> shift; "
-                               "WRITE_MASKED64(aligned_addr, value, byte_enable); }}",
+                               "PS2X_EE_WRITE_MASKED64(Mode, aligned_addr, value, byte_enable); }}",
                                inst.rs, inst.simmediate, inst.rt, inst.rt);
 
         case OPCODE_SDR:
             return fmt::format("{{ uint32_t addr = ADD32(GPR_U32(ctx, {}), {}); "
-                               "if (runtime->CheckEeDataAddressBreakpoint(ctx, addr, true)) runtime->CheckEeDataValueBreakpoint(ctx, addr, GPR_U32(ctx, {}), true); "
+                               "if (runtime->observeEeDataAddressPolicy<Mode>(ctx, addr, true)) runtime->observeEeDataValuePolicy<Mode>(ctx, addr, GPR_U32(ctx, {}), true); "
                                "uint32_t aligned_addr = addr & ~7u; "
                                "uint32_t offset = addr & 7u; "
                                "uint32_t shift = offset << 3; "
                                "uint8_t byte_enable = (uint8_t)((0xFFu << offset) & 0xFFu); "
                                "uint64_t value = GPR_U64(ctx, {}) << shift; "
-                               "WRITE_MASKED64(aligned_addr, value, byte_enable); }}",
+                               "PS2X_EE_WRITE_MASKED64(Mode, aligned_addr, value, byte_enable); }}",
                                inst.rs, inst.simmediate, inst.rt, inst.rt);
         case OPCODE_CACHE:
             return fmt::format(

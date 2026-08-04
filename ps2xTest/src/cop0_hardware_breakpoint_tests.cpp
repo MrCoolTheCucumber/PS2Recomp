@@ -254,7 +254,7 @@ void register_cop0_hardware_breakpoint_tests()
                 generated.find("ctx->pc = 0x1000u;");
             const std::size_t ordinaryCheck =
                 generated.find(
-                    "runtime->CheckEeInstructionBreakpoint(ctx, ctx->pc);",
+                    "runtime->observeEeInstructionBeginPolicy<Mode>(ctx,",
                     ordinaryPc);
             const std::size_t ordinaryRetire =
                 generated.find(
@@ -268,14 +268,14 @@ void register_cop0_hardware_breakpoint_tests()
             t.IsTrue(
                 countOccurrences(
                     generated,
-                    "runtime->CheckEeInstructionBreakpoint(ctx, ctx->pc);") >= 4u,
+                    "runtime->observeEeInstructionBeginPolicy<Mode>(ctx,") >= 4u,
                 "ordinary, branch, target, and executed delay-slot instructions should all be checked");
 
             const std::size_t delayState =
                 generated.find("ctx->in_delay_slot = true;");
             const std::size_t delayCheck =
                 generated.find(
-                    "runtime->CheckEeInstructionBreakpoint(ctx, ctx->pc);",
+                    "runtime->observeEeInstructionBeginPolicy<Mode>(ctx,",
                     delayState);
             t.IsTrue(
                 delayState != std::string::npos &&
@@ -317,7 +317,7 @@ void register_cop0_hardware_breakpoint_tests()
             const std::size_t write = ordinary.find(
                 "runtime->writeCop0Breakpoint(ctx, 0u");
             const std::size_t completion = ordinary.find(
-                "runtime->recordEeInstructionCompletion",
+                "runtime->observeEeInstructionCompletePolicy<Mode>",
                 write);
             const std::size_t nextPc = ordinary.find(
                 "ctx->pc = 0x4004u;", completion);
@@ -364,7 +364,7 @@ void register_cop0_hardware_breakpoint_tests()
             const std::size_t performanceWrite = performance.find(
                 "runtime->writeCop0Performance(rdram, ctx, 0u");
             const std::size_t performanceCompletion = performance.find(
-                "runtime->recordEeInstructionCompletion",
+                "runtime->observeEeInstructionCompletePolicy<Mode>",
                 performanceWrite);
             const std::size_t performanceTransition = performance.find(
                 "completeEeObservationModeTransition(",
@@ -458,7 +458,7 @@ void register_cop0_hardware_breakpoint_tests()
             const std::size_t returnTransition = returning.find(
                 "completeEeObservationModeTransitionAtGuestBranch(");
             const std::size_t returnValidation = returning.find(
-                "ValidateGuestBranchTarget(");
+                "validateEeGuestBranchTargetPolicy<Mode>(");
             t.IsTrue(
                 returnTransition != std::string::npos &&
                     returnValidation != std::string::npos &&
@@ -775,10 +775,10 @@ void register_cop0_hardware_breakpoint_tests()
                 decodeIType(0x2010u, OPCODE_SWL, 1u, 2u, 8u));
 
             const std::size_t lbAddressCheck =
-                lb.find("CheckEeDataAddressBreakpoint");
+                lb.find("observeEeDataAddressPolicy<Mode>");
             const std::size_t lbRead = lb.find("READ8(");
             const std::size_t lbValueCheck =
-                lb.find("CheckEeDataValueBreakpoint");
+                lb.find("observeEeDataValuePolicy<Mode>");
             t.IsTrue(
                 lbAddressCheck < lbRead && lbRead < lbValueCheck,
                 "a signed load should check address-only breakpoints before the read and data-value breakpoints afterward");
@@ -787,7 +787,7 @@ void register_cop0_hardware_breakpoint_tests()
                     std::string::npos,
                 "LB should compare the sign-extended loaded byte");
             t.IsTrue(
-                sb.find("CheckEeDataValueBreakpoint") != std::string::npos &&
+                sb.find("observeEeDataValuePolicy<Mode>") != std::string::npos &&
                     sb.find("GPR_U32(ctx, 2)") != std::string::npos,
                 "SB should compare the complete lower 32 bits of its source GPR");
             t.IsTrue(
@@ -795,15 +795,15 @@ void register_cop0_hardware_breakpoint_tests()
                     std::string::npos,
                 "LQ should compare the low 32 bits of loaded data");
             t.IsTrue(
-                lwl.find("CheckEeDataValueBreakpoint") !=
+                lwl.find("observeEeDataValuePolicy<Mode>") !=
                         std::string::npos &&
                     lwl.find("uint32_t merged =") !=
                         std::string::npos &&
-                    lwl.find("CheckEeDataValueBreakpoint") >
+                    lwl.find("observeEeDataValuePolicy<Mode>") >
                         lwl.find("uint32_t merged ="),
                 "LWL should compare the final value after merging with its GPR");
             t.IsTrue(
-                swl.find("CheckEeDataValueBreakpoint") !=
+                swl.find("observeEeDataValuePolicy<Mode>") !=
                         std::string::npos &&
                     swl.find("GPR_U32(ctx, 2)") !=
                         std::string::npos,
@@ -838,11 +838,11 @@ void register_cop0_hardware_breakpoint_tests()
                     std::string::npos,
                 "the fixture should exercise the coalesced GIF-DMA path");
             t.IsTrue(
-                generated.find("EeDataBreakpointEnabled") !=
+                generated.find("eeDataBreakpointEnabledPolicy<Mode>") !=
                     std::string::npos,
                 "coalescing should select individual stores while architectural data breakpoints are enabled");
             t.IsTrue(
-                generated.find("CheckEeDataAddressBreakpoint") !=
+                generated.find("observeEeDataAddressPolicy<Mode>") !=
                     std::string::npos,
                 "the individual-store fallback should retain breakpoint matching");
         });

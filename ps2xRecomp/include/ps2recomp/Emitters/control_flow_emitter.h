@@ -60,6 +60,8 @@ namespace ps2recomp
         bool isCallLikeEdge() const;
         bool isInternalTarget(uint32_t target) const;
         std::vector<uint32_t> resolvedLocalIndirectTargets() const;
+        std::string observationDescriptor(
+            const Instruction &instruction) const;
 
         std::string delaySlotCode(bool branchDelayExecution) const;
         void emitBasicBlockBoundary(std::string_view indent);

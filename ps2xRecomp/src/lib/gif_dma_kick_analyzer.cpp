@@ -289,7 +289,7 @@ namespace ps2recomp
 
         if (slot < plan.captures.size() && plan.captures[slot])
             code << "uint32_t " << plan.values[slot] << " = " << plan.captureExpressions[slot] << ";\n";
-        code << "if (runtime->EeDataBreakpointEnabled(ctx, true)) {\n";
+        code << "if (runtime->eeDataBreakpointEnabledPolicy<Mode>(ctx, true)) {\n";
         code << "    " << slowPathCode << "\n";
         code << "} else {\n";
         code << "    " << gifDmaKickCall(plan) << "\n";

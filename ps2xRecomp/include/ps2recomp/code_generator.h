@@ -2,6 +2,7 @@
 #define PS2RECOMP_CODE_GENERATOR_H
 
 #include <cstdint>
+#include <cstddef>
 #include <string>
 #include <vector>
 #include <map>
@@ -64,6 +65,11 @@ namespace ps2recomp
         void setResumeEntryTargets(const std::unordered_map<uint32_t, std::vector<uint32_t>> &resumeTargetsByOwner);
         void setEmitInstructionComments(bool emitInstructionComments);
         void setReporter(RecompilerReporter *reporter);
+        void setCurrentEeObservationDescriptors(
+            std::string arrayName,
+            std::unordered_map<uint32_t, size_t> indicesByAddress);
+        [[nodiscard]] std::string eeObservationDescriptorExpression(
+            uint32_t address) const;
 
         AnalysisResult collectInternalBranchTargets(const Function &function,
                                                   const std::vector<Instruction> &instructions,
@@ -81,6 +87,9 @@ namespace ps2recomp
         bool m_emitInstructionComments = true;
         RecompilerReporter *m_reporter = nullptr;
         std::string m_currentFunctionName;
+        std::string m_currentEeObservationDescriptorArray;
+        std::unordered_map<uint32_t, size_t>
+            m_currentEeObservationDescriptorIndices;
 
         std::string translateInstruction(const Instruction &inst);
         std::string translateInstruction(const Instruction &inst, const MemoryAccessHint &memoryHint);

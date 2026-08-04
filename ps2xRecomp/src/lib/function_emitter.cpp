@@ -14,6 +14,7 @@
 #include <sstream>
 #include <stdexcept>
 #include <unordered_set>
+#include <utility>
 
 namespace ps2recomp
 {
@@ -124,7 +125,60 @@ namespace ps2recomp
             sanitizedName = nameBuilder.str();
         }
 
-        ss << "void " << sanitizedName << "(uint8_t* rdram, R5900Context* ctx, PS2Runtime *runtime) {\n";
+        std::vector<Instruction> observationDescriptors =
+            scheduledInstructions;
+        std::unordered_set<uint32_t> descriptorAddresses;
+        descriptorAddresses.reserve(
+            observationDescriptors.size() * 2u);
+        for (const Instruction &instruction : observationDescriptors)
+        {
+            descriptorAddresses.insert(instruction.address);
+        }
+        for (const Instruction &instruction : scheduledInstructions)
+        {
+            const uint32_t delayAddress = instruction.address + 4u;
+            if (instruction.hasDelaySlot &&
+                !descriptorAddresses.contains(delayAddress))
+            {
+                observationDescriptors.push_back(
+                    makeSyntheticDelaySlot(delayAddress));
+                descriptorAddresses.insert(delayAddress);
+            }
+        }
+        std::sort(
+            observationDescriptors.begin(),
+            observationDescriptors.end(),
+            [](const Instruction &left, const Instruction &right)
+            {
+                return left.address < right.address;
+            });
+
+        const std::string descriptorName =
+            eeObservationDescriptorName(sanitizedName);
+        std::unordered_map<uint32_t, size_t> descriptorIndices;
+        descriptorIndices.reserve(observationDescriptors.size());
+        ss << "namespace {\n";
+        ss << "PS2X_EE_OBSERVATION_COLD_DATA static const "
+              "EeObservationInstructionDescriptor "
+           << descriptorName << "[] = {\n";
+        for (size_t index = 0u;
+             index < observationDescriptors.size(); ++index)
+        {
+            descriptorIndices.emplace(
+                observationDescriptors[index].address, index);
+            ss << eeObservationDescriptorInitializer(
+                      observationDescriptors[index])
+               << ",\n";
+        }
+        ss << "};\n";
+        ss << "}\n\n";
+        cg.setCurrentEeObservationDescriptors(
+            "eeo", std::move(descriptorIndices));
+
+        ss << "template <EeArchitecturalObservationMode Mode>\n";
+        ss << "static void " << eeTemplateBodyName(sanitizedName)
+           << "(uint8_t* rdram, R5900Context* ctx, PS2Runtime *runtime) {\n";
+        ss << "const auto*eeo=" << descriptorName << ";\n";
         ss << "#ifdef PS2_FUNCTION_LOG_TRACKER\n";
         ss << "    PS_LOG_ENTRY(\"" << sanitizedName << "\");\n";
         ss << "#endif\n";
@@ -171,24 +225,32 @@ namespace ps2recomp
 
             try
             {
+                const std::string observationDescriptor =
+                    cg.eeObservationDescriptorExpression(
+                        inst.address);
+                if (observationDescriptor.empty())
+                {
+                    throw std::runtime_error(
+                        "Missing EE observation descriptor");
+                }
                 ss << "    ctx->pc = 0x" << std::hex
                    << inst.address << "u;\n"
                    << std::dec;
+                const bool breakpointAlreadyChecked =
+                    validateSequentialFetch;
                 if (validateSequentialFetch)
                 {
-                    ss << "    runtime->ValidateInstructionFetch(ctx, ctx->pc);\n";
+                    ss << "    runtime->validateEeInstructionFetchPolicy<Mode>(ctx, ctx->pc);\n";
                     validateSequentialFetch = false;
                 }
-                else
-                {
-                    ss << "    runtime->CheckEeInstructionBreakpoint(ctx, ctx->pc);\n";
-                }
+                ss << "    "
+                   << eeObservationBeginCall(
+                          observationDescriptor,
+                          breakpointAlreadyChecked)
+                   << "\n";
 
                 if (inst.hasDelaySlot)
                 {
-                    ss << "    "
-                       << eeInstructionIssueCall(inst)
-                       << "\n";
                     ss << "    ctx->beginEeInstruction();\n";
                     ss << "    ctx->advanceEeCycleTicks("
                        << eeInstructionCycleTicks(inst) << "u);\n";
@@ -251,9 +313,6 @@ namespace ps2recomp
                     const EeInstructionPerformanceInfo
                         performanceInfo =
                             eeInstructionPerformanceInfo(inst);
-                    ss << "    "
-                       << eeInstructionIssueCall(inst)
-                       << "\n";
                     ss << "    ctx->beginEeInstruction();\n";
                     ss << "    ctx->advanceEeCycleTicks("
                        << eeInstructionCycleTicks(inst) << "u);\n";
@@ -268,7 +327,8 @@ namespace ps2recomp
                                 .completionBeforeEffect)
                         {
                             ss << "    "
-                               << eeInstructionCompletionCall(inst)
+                               << eeObservationCompletionCall(
+                                      observationDescriptor)
                                << "\n";
                         }
                         const size_t slot = gifDmaKickPlan.slotFor(i);
@@ -277,7 +337,7 @@ namespace ps2recomp
                         const MemoryAccessHint memoryHint =
                             resolveMemoryAccessHint(
                                 inst, constantRegisters);
-                        ss << "    if (runtime->EeDataBreakpointEnabled(ctx, true)) {\n";
+                        ss << "    if (runtime->eeDataBreakpointEnabledPolicy<Mode>(ctx, true)) {\n";
                         ss << "        "
                            << cg.translateInstruction(inst, memoryHint)
                            << "\n";
@@ -294,7 +354,8 @@ namespace ps2recomp
                                  .completionBeforeEffect)
                         {
                             ss << "    "
-                               << eeInstructionCompletionCall(inst)
+                               << eeObservationCompletionCall(
+                                      observationDescriptor)
                                << "\n";
                         }
 
@@ -309,7 +370,8 @@ namespace ps2recomp
                             .completionBeforeEffect)
                     {
                         ss << "    "
-                           << eeInstructionCompletionCall(inst)
+                           << eeObservationCompletionCall(
+                                  observationDescriptor)
                            << "\n";
                     }
                     if (mayChangeEeArchitecturalObservationMode(inst))
@@ -330,7 +392,8 @@ namespace ps2recomp
                              .completionBeforeEffect)
                     {
                         ss << "    "
-                           << eeInstructionCompletionCall(inst)
+                           << eeObservationCompletionCall(
+                                  observationDescriptor)
                            << "\n";
                     }
 
@@ -371,6 +434,20 @@ namespace ps2recomp
                << std::dec;
         }
 
+        ss << "}\n\n";
+        ss << "template PS2X_EE_OBSERVATION_PRECISE_BODY void "
+           << eeTemplateBodyName(sanitizedName)
+           << "<EeArchitecturalObservationMode::Precise>("
+              "uint8_t*, R5900Context*, PS2Runtime*);\n\n";
+        ss << "void " << eeFastFunctionName(sanitizedName)
+           << "(uint8_t* rdram, R5900Context* ctx, PS2Runtime *runtime) {\n";
+        ss << "    " << eeTemplateBodyName(sanitizedName)
+           << "<EeArchitecturalObservationMode::Fast>(rdram, ctx, runtime);\n";
+        ss << "}\n\n";
+        ss << "void " << eePreciseFunctionName(sanitizedName)
+           << "(uint8_t* rdram, R5900Context* ctx, PS2Runtime *runtime) {\n";
+        ss << "    " << eeTemplateBodyName(sanitizedName)
+           << "<EeArchitecturalObservationMode::Precise>(rdram, ctx, runtime);\n";
         ss << "}\n";
         return ss.str();
     }

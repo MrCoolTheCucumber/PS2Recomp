@@ -312,7 +312,7 @@ void register_code_generator_tests()
 
         t.IsTrue(
             generated.find("SET_GPR_U64(ctx, 6, (uint64_t)(uint32_t)([&]()") != std::string::npos &&
-                generated.find("READ32(eeBreakpointAddress)") != std::string::npos,
+                generated.find("PS2X_EE_READ32(Mode, eeBreakpointAddress)") != std::string::npos,
             "LWU should zero-extend the loaded word to 64 bits");
         t.IsTrue(
             generated.find("SET_GPR_U32(ctx, 6") == std::string::npos,
@@ -536,13 +536,13 @@ void register_code_generator_tests()
         std::string generated = gen.generateFunction(func, instructions, false);
         printGeneratedCode("constant RDRAM load and store emit fast memory access", generated);
 
-        t.IsTrue(generated.find("READ32(0x123460u)") != std::string::npos,
+        t.IsTrue(generated.find("PS2X_EE_READ32(Mode, 0x123460u)") != std::string::npos,
                  "constant RDRAM LW should retain guest-mode-aware fast-path selection");
-        t.IsTrue(generated.find("WRITE32(0x123464u, eeBreakpointStoreValue);") != std::string::npos,
+        t.IsTrue(generated.find("PS2X_EE_WRITE32(Mode, 0x123464u, eeBreakpointStoreValue);") != std::string::npos,
                  "constant RDRAM SW should retain guest-mode-aware fast-path selection");
-        t.IsTrue(generated.find("READ32(ADD32(GPR_U32(ctx, 1)") == std::string::npos,
+        t.IsTrue(generated.find("PS2X_EE_READ32(Mode, ADD32(GPR_U32(ctx, 1)") == std::string::npos,
                  "constant RDRAM LW should not go through READ32 address classification");
-        t.IsTrue(generated.find("WRITE32(ADD32(GPR_U32(ctx, 1)") == std::string::npos,
+        t.IsTrue(generated.find("PS2X_EE_WRITE32(Mode, ADD32(GPR_U32(ctx, 1)") == std::string::npos,
                  "constant RDRAM SW should not go through WRITE32 address classification");
     });
 
@@ -557,10 +557,10 @@ void register_code_generator_tests()
             store, MemoryAccessHint{true, 0xA0001000u});
 
         t.IsTrue(
-            generatedLoad.find("READ32(0x80001000u)") != std::string::npos,
+            generatedLoad.find("PS2X_EE_READ32(Mode, 0x80001000u)") != std::string::npos,
             "a resolved KSEG0 load should retain runtime mode selection");
         t.IsTrue(
-            generatedStore.find("WRITE32(0xA0001000u, eeBreakpointStoreValue)") !=
+            generatedStore.find("PS2X_EE_WRITE32(Mode, 0xA0001000u, eeBreakpointStoreValue)") !=
                 std::string::npos,
             "a resolved KSEG1 store should retain runtime mode selection");
         t.IsTrue(
@@ -614,18 +614,18 @@ void register_code_generator_tests()
         printGeneratedCode("EE LQ silently aligns dynamic address", dynamicLq);
         printGeneratedCode("EE SQ silently aligns dynamic address", dynamicSq);
 
-        t.IsTrue(dynamicLq.find("READ128((eeBreakpointAddress & ~0xFu))") != std::string::npos,
+        t.IsTrue(dynamicLq.find("PS2X_EE_READ128(Mode, (eeBreakpointAddress & ~0xFu))") != std::string::npos,
                  "LQ should clear the low four effective-address bits");
-        t.IsTrue(dynamicSq.find("WRITE128((eeBreakpointAddress & ~0xFu), eeBreakpointStoreValue)") != std::string::npos,
+        t.IsTrue(dynamicSq.find("PS2X_EE_WRITE128(Mode, (eeBreakpointAddress & ~0xFu), eeBreakpointStoreValue)") != std::string::npos,
                  "SQ should clear the low four effective-address bits");
 
         const MemoryAccessHint unalignedHint{true, 0x00123458u};
         const std::string constantLq = gen.translateInstruction(lq, unalignedHint);
         const std::string constantSq = gen.translateInstruction(sq, unalignedHint);
 
-        t.IsTrue(constantLq.find("READ128(0x123450u)") != std::string::npos,
+        t.IsTrue(constantLq.find("PS2X_EE_READ128(Mode, 0x123450u)") != std::string::npos,
                  "constant LQ hint should be aligned before selecting the fast path");
-        t.IsTrue(constantSq.find("WRITE128(0x123450u, eeBreakpointStoreValue)") != std::string::npos,
+        t.IsTrue(constantSq.find("PS2X_EE_WRITE128(Mode, 0x123450u, eeBreakpointStoreValue)") != std::string::npos,
                  "constant SQ hint should be aligned before selecting the fast path");
         t.IsTrue(constantLq.find("runtime->Load128") == std::string::npos,
                  "silently aligned LQ should not be treated as an address error");
@@ -645,13 +645,13 @@ void register_code_generator_tests()
         const std::string sdlCode = gen.translateInstruction(sdl);
         const std::string sdrCode = gen.translateInstruction(sdr);
 
-        t.IsTrue(swlCode.find("WRITE_MASKED32(aligned_addr") != std::string::npos,
+        t.IsTrue(swlCode.find("PS2X_EE_WRITE_MASKED32(Mode, aligned_addr") != std::string::npos,
                  "SWL should issue one masked 32-bit store");
-        t.IsTrue(swrCode.find("WRITE_MASKED32(aligned_addr") != std::string::npos,
+        t.IsTrue(swrCode.find("PS2X_EE_WRITE_MASKED32(Mode, aligned_addr") != std::string::npos,
                  "SWR should issue one masked 32-bit store");
-        t.IsTrue(sdlCode.find("WRITE_MASKED64(aligned_addr") != std::string::npos,
+        t.IsTrue(sdlCode.find("PS2X_EE_WRITE_MASKED64(Mode, aligned_addr") != std::string::npos,
                  "SDL should issue one masked 64-bit store");
-        t.IsTrue(sdrCode.find("WRITE_MASKED64(aligned_addr") != std::string::npos,
+        t.IsTrue(sdrCode.find("PS2X_EE_WRITE_MASKED64(Mode, aligned_addr") != std::string::npos,
                  "SDR should issue one masked 64-bit store");
         t.IsTrue(
             swlCode.find("byte_enable = (uint8_t)((1u << (offset + 1u)) - 1u)") !=
@@ -711,7 +711,7 @@ void register_code_generator_tests()
                  "dynamic GIF TADR source should be captured when the store is coalesced");
         t.IsTrue(generated.find("runtime->kickGifDmaChainFromMMIO(rdram, ctx, 0x4u, 0x4u, gifDmaKickValue_3024_2, 0x105u);") != std::string::npos,
                  "known GIF DMA MMIO stores should coalesce into the native kick helper");
-        t.IsTrue(generated.find("runtime->EeDataBreakpointEnabled(ctx, true)") != std::string::npos,
+        t.IsTrue(generated.find("runtime->eeDataBreakpointEnabledPolicy<Mode>(ctx, true)") != std::string::npos,
                  "coalescing should retain a guarded architectural-breakpoint fallback");
         t.IsTrue(generated.find("runtime->Store32(rdram, ctx, 0x1000E020u") != std::string::npos,
                  "the breakpoint fallback should preserve the individual D_PCR store");
@@ -754,8 +754,8 @@ void register_code_generator_tests()
                  "coalesced helper should still run as the return delay slot");
         t.IsTrue(generated.find("runtime->kickGifDmaChainFromMMIO(rdram, ctx, 0x4u, 0x4u, gifDmaKickValue_2e7cb4_2, 0x105u);") != std::string::npos,
                  "loadImage-like GIF DMA stores should coalesce into the native kick helper");
-        t.IsTrue(generated.find("runtime->EeDataBreakpointEnabled(ctx, true)") != std::string::npos &&
-                     generated.find("CheckEeDataAddressBreakpoint") != std::string::npos,
+        t.IsTrue(generated.find("runtime->eeDataBreakpointEnabledPolicy<Mode>(ctx, true)") != std::string::npos &&
+                     generated.find("observeEeDataAddressPolicy<Mode>") != std::string::npos,
                  "the coalesced delay-slot store should retain a guarded breakpoint fallback");
     });
 
@@ -1313,9 +1313,9 @@ void register_code_generator_tests()
                 "PS2Runtime::RecompiledFunctionPair g_ps2RecompiledFunctionTable") !=
                 std::string::npos,
             "the dense table should retain O(1) slots containing function pairs");
-        t.IsTrue(registration.find("g_ps2RecompiledFunctionTable[2] = {resume_owner_0x7000, resume_owner_0x7000}; // 0x7008") != std::string::npos,
+        t.IsTrue(registration.find("g_ps2RecompiledFunctionTable[2] = {resume_owner_0x7000__ee_fast, resume_owner_0x7000__ee_precise}; // 0x7008") != std::string::npos,
                  "resume entry pc should register to the owner wrapper");
-        t.IsTrue(registration.find("g_ps2RecompiledFunctionTable[3] = {resume_owner_0x7000, resume_owner_0x7000}; // 0x700c") != std::string::npos,
+        t.IsTrue(registration.find("g_ps2RecompiledFunctionTable[3] = {resume_owner_0x7000__ee_fast, resume_owner_0x7000__ee_precise}; // 0x700c") != std::string::npos,
                  "multiple resume pcs should register to the same owner wrapper");
         const RecompilerReporter::Counters counters = reporter.counters();
         t.Equals(counters.resumeEntryTargetsAudited, size_t{3},
@@ -1366,7 +1366,7 @@ void register_code_generator_tests()
 
         t.IsTrue(
             registration.find(
-                "{0x9000u, {ps2_module_test_overlay_entry_0x9000, ps2_module_test_overlay_entry_0x9000}}") !=
+                "{0x9000u, {ps2_module_test_overlay_entry_0x9000__ee_fast, ps2_module_test_overlay_entry_0x9000__ee_precise}}") !=
                 std::string::npos,
             "module registration should retain the prefixed native entry");
         t.IsTrue(
@@ -1430,7 +1430,7 @@ void register_code_generator_tests()
         std::string registration = gen.generateFunctionRegistration({owner}, {});
         printGeneratedCode("external mid-function entry can register to the owner wrapper", registration);
 
-        t.IsTrue(registration.find("g_ps2RecompiledFunctionTable[1] = {owner_0x5000, owner_0x5000}; // 0x5004") != std::string::npos,
+        t.IsTrue(registration.find("g_ps2RecompiledFunctionTable[1] = {owner_0x5000__ee_fast, owner_0x5000__ee_precise}; // 0x5004") != std::string::npos,
                  "mid-function external entry should register back to the owner wrapper");
     });
 
@@ -1486,7 +1486,8 @@ void register_code_generator_tests()
         std::string generated = gen.generateFunction(func, instructions, false);
         printGeneratedCode("jumps to known symbols call by name", generated);
 
-        t.IsTrue(generated.find("target_func(rdram, ctx, runtime); return;") != std::string::npos,
+        t.IsTrue(generated.find("target_func__ee_fast(rdram, ctx, runtime);") != std::string::npos &&
+                     generated.find("target_func__ee_precise(rdram, ctx, runtime);") != std::string::npos,
                  "jump to known function should emit direct call");
     });
 
@@ -1538,7 +1539,8 @@ void register_code_generator_tests()
             std::string sw = gen.generateJumpTableSwitch(inst, 0x0, entries);
             printGeneratedCode("renamed function used in jump table", sw);
 
-        t.IsTrue(sw.find("renamed_target(rdram, ctx, runtime);") != std::string::npos,
+        t.IsTrue(sw.find("renamed_target__ee_fast(rdram, ctx, runtime);") != std::string::npos &&
+                     sw.find("renamed_target__ee_precise(rdram, ctx, runtime);") != std::string::npos,
                  "jump table should use renamed function name");
         });
 
@@ -1571,9 +1573,11 @@ void register_code_generator_tests()
             std::string generated = gen.generateFunction(func, instructions, false);
             printGeneratedCode("reserved identifiers are sanitized and used in calls", generated);
 
-            t.IsTrue(generated.find("void ps2___is_pointer(") != std::string::npos,
+            t.IsTrue(generated.find("void ps2___is_pointer__ee_fast(") != std::string::npos &&
+                         generated.find("void ps2___is_pointer__ee_precise(") != std::string::npos,
                      "definition should use sanitized name");
-            t.IsTrue(generated.find("ps2___is_pointer(rdram, ctx, runtime); return;") != std::string::npos,
+            t.IsTrue(generated.find("ps2___is_pointer__ee_fast(rdram, ctx, runtime);") != std::string::npos &&
+                         generated.find("ps2___is_pointer__ee_precise(rdram, ctx, runtime);") != std::string::npos,
                 "call should use sanitized name but got: " + generated);
         });
 
@@ -1678,7 +1682,7 @@ void register_code_generator_tests()
             const size_t nextPc = generated.find(
                 "ctx->pc = 0x80001004u;", statusWrite);
             const size_t validation = generated.find(
-                "runtime->ValidateInstructionFetch(ctx, ctx->pc);",
+                "runtime->validateEeInstructionFetchPolicy<Mode>(ctx, ctx->pc);",
                 nextPc);
             const size_t nextEffect = generated.find(
                 "SET_GPR_S32(ctx, 2", validation);
@@ -2110,7 +2114,7 @@ void register_code_generator_tests()
             constexpr std::string_view boundary =
                 "runtime->serviceEeEventsAtBlockBoundary(rdram, ctx);";
             constexpr std::string_view validation =
-                "runtime->ValidateInstructionFetch(ctx, ctx->pc);";
+                "runtime->validateEeInstructionFetchPolicy<Mode>(ctx, ctx->pc);";
 
             Function staticJumpFunction;
             staticJumpFunction.name = "post_delay_static_jump";
@@ -2129,7 +2133,7 @@ void register_code_generator_tests()
             const size_t staticBoundary = staticJump.find(
                 boundary, staticTarget);
             const size_t staticDispatch = staticJump.find(
-                "dispatchGuestBranch", staticTarget);
+                "dispatchValidatedGuestBranchPolicy<Mode>", staticTarget);
             t.IsTrue(
                 staticTarget != std::string::npos &&
                     staticValidation != std::string::npos &&
@@ -2760,10 +2764,10 @@ void register_code_generator_tests()
             // SET_GPR_U32(ctx, 31, 0xA008u);
             // ctx->pc = 0xA004u;
             // ... delay slot ...
-            // runtime->dispatchGuestBranch(..., DirectCall, "JAL")
+            // runtime->dispatchValidatedGuestBranchPolicy<Mode>(..., DirectCall, "JAL")
 
             t.IsTrue(generated.find("SET_GPR_U32(ctx, 31, 0xA008u);") != std::string::npos, "JAL should set RA");
-            t.IsTrue(generated.find("runtime->dispatchGuestBranch(rdram, ctx, 0xB000u") != std::string::npos,
+            t.IsTrue(generated.find("runtime->dispatchValidatedGuestBranchPolicy<Mode>(rdram, ctx, 0xB000u") != std::string::npos,
                      "JAL should dispatch through the runtime branch helper");
             t.IsTrue(generated.find("PS2Runtime::GuestBranchKind::DirectCall") != std::string::npos,
                      "JAL should identify itself as a direct call");
@@ -2792,7 +2796,7 @@ void register_code_generator_tests()
 
             t.IsTrue(generated.find("SET_GPR_U32(ctx, 31, 0xA108u);") != std::string::npos,
                      "truncated trailing JAL should still set RA");
-            t.IsTrue(generated.find("runtime->dispatchGuestBranch(rdram, ctx, 0xB000u") != std::string::npos,
+            t.IsTrue(generated.find("runtime->dispatchValidatedGuestBranchPolicy<Mode>(rdram, ctx, 0xB000u") != std::string::npos,
                      "truncated trailing JAL should still emit the call dispatch");
             t.IsTrue(generated.find("0xA100u, 0xA108u") != std::string::npos,
                      "truncated trailing JAL should still pass the fallthrough to runtime dispatch");
@@ -2867,7 +2871,7 @@ void register_code_generator_tests()
 
             t.IsTrue(generated.find("const uint32_t jumpTarget = GPR_U32(ctx, 4);") != std::string::npos, "JALR should read target from RS");
             t.IsTrue(generated.find("SET_GPR_U32(ctx, 31, 0xD008u);") != std::string::npos, "JALR should set link register");
-            t.IsTrue(generated.find("runtime->dispatchGuestBranch(rdram, ctx, jumpTarget") != std::string::npos, "JALR should dispatch through runtime branch helper");
+            t.IsTrue(generated.find("runtime->dispatchValidatedGuestBranchPolicy<Mode>(rdram, ctx, jumpTarget") != std::string::npos, "JALR should dispatch through runtime branch helper");
             t.IsTrue(generated.find("PS2Runtime::GuestBranchKind::IndirectCall") != std::string::npos,
                      "JALR should identify itself as an indirect call");
             t.IsTrue(generated.find("0xD000u, 0xD008u") != std::string::npos,
@@ -3130,8 +3134,8 @@ void register_code_generator_tests()
             t.IsTrue(generated.find("label_1308:") != std::string::npos,
                      "internal JAL return address should still be emitted as a label");
             const size_t targetValidation = generated.find(
-                "runtime->ValidateGuestBranchTarget(ctx, jumpTarget, "
-                "PS2Runtime::GuestBranchKind::Return)");
+                "runtime->validateEeGuestBranchTargetPolicy<Mode>("
+                "ctx, jumpTarget, PS2Runtime::GuestBranchKind::Return)");
             const size_t callbackBoundary = generated.find(
                 "runtime->serviceEeEventsAtBlockBoundary(rdram, ctx);",
                 targetValidation);
@@ -3331,7 +3335,7 @@ void register_code_generator_tests()
 
             t.IsFalse(generated.find("switch (jumpTarget)") != std::string::npos,
                       "unresolved JALR should not emit a broad local switch over every internal label");
-            t.IsTrue(generated.find("runtime->dispatchGuestBranch(rdram, ctx, jumpTarget") != std::string::npos,
+            t.IsTrue(generated.find("runtime->dispatchValidatedGuestBranchPolicy<Mode>(rdram, ctx, jumpTarget") != std::string::npos,
                      "unresolved JALR should dispatch through the runtime branch helper");
             t.IsTrue(generated.find("PS2Runtime::GuestBranchKind::IndirectCall") != std::string::npos,
                      "JALR should retain indirect-call dispatch kind");

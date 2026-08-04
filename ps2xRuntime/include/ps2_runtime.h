@@ -141,6 +141,33 @@ struct EeObservationInstructionDescriptor
 
 static_assert(sizeof(EeObservationInstructionDescriptor) == 24u);
 
+#if defined(__GNUC__) || defined(__clang__)
+#define PS2X_EE_OBSERVATION_COLD_DATA                                  \
+    __attribute__((used, section(".rodata.unlikely.ee_observation")))
+#else
+#define PS2X_EE_OBSERVATION_COLD_DATA
+#endif
+
+#if defined(_MSC_VER)
+#define PS2X_EE_OBSERVATION_POLICY_INLINE __forceinline
+#define PS2X_EE_OBSERVATION_PRECISE_BODY __declspec(noinline)
+#elif defined(__GNUC__) && !defined(__clang__)
+#define PS2X_EE_OBSERVATION_POLICY_INLINE                              \
+    inline __attribute__((always_inline))
+#define PS2X_EE_OBSERVATION_PRECISE_BODY                               \
+    __attribute__((noinline, noipa, cold, optimize("Oz"),             \
+                   section(".text.unlikely.ee_observation")))
+#elif defined(__clang__)
+#define PS2X_EE_OBSERVATION_POLICY_INLINE                              \
+    inline __attribute__((always_inline))
+#define PS2X_EE_OBSERVATION_PRECISE_BODY                               \
+    __attribute__((noinline, cold, minsize,                            \
+                   section(".text.unlikely.ee_observation")))
+#else
+#define PS2X_EE_OBSERVATION_POLICY_INLINE inline
+#define PS2X_EE_OBSERVATION_PRECISE_BODY
+#endif
+
 inline constexpr uint32_t PS2_RECOMPILED_FUNCTION_PAIR_ABI_VERSION = 2u;
 
 struct PS2GuestFunctionSymbol
@@ -1313,6 +1340,40 @@ public:
                              uint32_t fallthroughPc,
                              GuestBranchKind kind,
                              const char *debugName);
+    // Generated code has already validated the resolved target with its
+    // compile-time observation policy before servicing the block boundary.
+    // Preserve that policy through the transfer without repeating the fetch
+    // breakpoint check or deriving the mode again inside the dispatcher.
+    bool dispatchValidatedGuestBranch(
+        uint8_t *rdram,
+        R5900Context *ctx,
+        uint32_t targetPc,
+        uint32_t sourcePc,
+        uint32_t fallthroughPc,
+        GuestBranchKind kind,
+        const char *debugName,
+        EeArchitecturalObservationMode mode);
+    template <EeArchitecturalObservationMode Mode>
+    PS2X_EE_OBSERVATION_POLICY_INLINE
+    bool dispatchValidatedGuestBranchPolicy(
+        uint8_t *rdram,
+        R5900Context *ctx,
+        uint32_t targetPc,
+        uint32_t sourcePc,
+        uint32_t fallthroughPc,
+        GuestBranchKind kind,
+        const char *debugName)
+    {
+        return dispatchValidatedGuestBranch(
+            rdram,
+            ctx,
+            targetPc,
+            sourcePc,
+            fallthroughPc,
+            kind,
+            debugName,
+            Mode);
+    }
     [[nodiscard]] bool ValidateGuestBranchTarget(
         R5900Context *ctx,
         uint32_t targetPc,
@@ -1403,6 +1464,145 @@ public:
         R5900Context *ctx,
         const EeObservationInstructionDescriptor *instruction,
         bool taken);
+
+    template <EeArchitecturalObservationMode Mode>
+    PS2X_EE_OBSERVATION_POLICY_INLINE
+    void validateEeInstructionFetchPolicy(
+        R5900Context *ctx,
+        uint32_t virtualAddress)
+    {
+        if constexpr (Mode ==
+                      EeArchitecturalObservationMode::Precise)
+        {
+            ValidateInstructionFetch(ctx, virtualAddress);
+        }
+        else
+        {
+            ValidateInstructionFetchWithoutObservation(
+                ctx, virtualAddress);
+        }
+    }
+
+    template <EeArchitecturalObservationMode Mode>
+    [[nodiscard]] PS2X_EE_OBSERVATION_POLICY_INLINE
+    bool validateEeGuestBranchTargetPolicy(
+        R5900Context *ctx,
+        uint32_t target,
+        GuestBranchKind kind)
+    {
+        if constexpr (Mode ==
+                      EeArchitecturalObservationMode::Precise)
+        {
+            return ValidateGuestBranchTarget(
+                ctx, target, kind);
+        }
+        return ValidateGuestBranchTargetWithoutObservation(
+            ctx, target, kind);
+    }
+
+    template <EeArchitecturalObservationMode Mode>
+    PS2X_EE_OBSERVATION_POLICY_INLINE
+    void observeEeInstructionBeginPolicy(
+        R5900Context *ctx,
+        const EeObservationInstructionDescriptor *instruction,
+        bool breakpointAlreadyChecked)
+    {
+        if constexpr (Mode ==
+                      EeArchitecturalObservationMode::Precise)
+        {
+            observeEeInstructionBeginPrecise(
+                ctx, instruction, breakpointAlreadyChecked);
+        }
+    }
+
+    template <EeArchitecturalObservationMode Mode>
+    PS2X_EE_OBSERVATION_POLICY_INLINE
+    void observeEeInstructionCompletePolicy(
+        R5900Context *ctx,
+        const EeObservationInstructionDescriptor *instruction)
+    {
+        if constexpr (Mode ==
+                      EeArchitecturalObservationMode::Precise)
+        {
+            observeEeInstructionCompletePrecise(
+                ctx, instruction);
+        }
+    }
+
+    template <EeArchitecturalObservationMode Mode>
+    [[nodiscard]] PS2X_EE_OBSERVATION_POLICY_INLINE
+    bool observeEeDataAddressPolicy(
+        R5900Context *ctx,
+        uint32_t virtualAddress,
+        bool write)
+    {
+        if constexpr (Mode ==
+                      EeArchitecturalObservationMode::Precise)
+        {
+            return observeEeDataAddressPrecise(
+                ctx, virtualAddress, write);
+        }
+        return false;
+    }
+
+    template <EeArchitecturalObservationMode Mode>
+    PS2X_EE_OBSERVATION_POLICY_INLINE
+    void observeEeDataValuePolicy(
+        R5900Context *ctx,
+        uint32_t virtualAddress,
+        uint32_t value,
+        bool write)
+    {
+        if constexpr (Mode ==
+                      EeArchitecturalObservationMode::Precise)
+        {
+            observeEeDataValuePrecise(
+                ctx, virtualAddress, value, write);
+        }
+    }
+
+    template <EeArchitecturalObservationMode Mode>
+    [[nodiscard]] PS2X_EE_OBSERVATION_POLICY_INLINE
+    bool eeDataBreakpointEnabledPolicy(
+        const R5900Context *ctx,
+        bool write) const noexcept
+    {
+        if constexpr (Mode ==
+                      EeArchitecturalObservationMode::Precise)
+        {
+            return EeDataBreakpointEnabled(ctx, write);
+        }
+        return false;
+    }
+
+    template <EeArchitecturalObservationMode Mode>
+    PS2X_EE_OBSERVATION_POLICY_INLINE
+    void observeEePredictedBranchPolicy(
+        R5900Context *ctx,
+        const EeObservationInstructionDescriptor *instruction)
+    {
+        if constexpr (Mode ==
+                      EeArchitecturalObservationMode::Precise)
+        {
+            observeEePredictedBranchPrecise(
+                ctx, instruction);
+        }
+    }
+
+    template <EeArchitecturalObservationMode Mode>
+    PS2X_EE_OBSERVATION_POLICY_INLINE
+    void observeEeConditionalBranchPolicy(
+        R5900Context *ctx,
+        const EeObservationInstructionDescriptor *instruction,
+        bool taken)
+    {
+        if constexpr (Mode ==
+                      EeArchitecturalObservationMode::Precise)
+        {
+            observeEeConditionalBranchPrecise(
+                ctx, instruction, taken);
+        }
+    }
 
     void executeVU0Microprogram(uint8_t *rdram, R5900Context *ctx, uint32_t address);
     void vu0StartMicroProgram(uint8_t *rdram, R5900Context *ctx, uint32_t address);

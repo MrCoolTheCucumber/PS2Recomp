@@ -6573,12 +6573,34 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
     {
         return false;
     }
+
+    return dispatchValidatedGuestBranch(
+        rdram,
+        ctx,
+        targetPc,
+        sourcePc,
+        fallthroughPc,
+        kind,
+        debugName,
+        architecturalObservationMode(ctx));
+}
+
+bool PS2Runtime::dispatchValidatedGuestBranch(
+    uint8_t *rdram,
+    R5900Context *ctx,
+    uint32_t targetPc,
+    uint32_t sourcePc,
+    uint32_t fallthroughPc,
+    GuestBranchKind kind,
+    const char *debugName,
+    EeArchitecturalObservationMode mode)
+{
     targetPc = normalizeGuestFunctionAddress(targetPc);
     ctx->pc = targetPc;
     const bool isCall = (kind == GuestBranchKind::DirectCall || kind == GuestBranchKind::IndirectCall);
     RecompiledFunction targetFn =
         activeRecompiledFunction(targetPc, rdram)
-            .select(architecturalObservationMode(ctx));
+            .select(mode);
 
     if (kind == GuestBranchKind::Return)
     {

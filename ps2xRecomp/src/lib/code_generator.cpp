@@ -166,6 +166,32 @@ namespace ps2recomp
         m_reporter = reporter;
     }
 
+    void CodeGenerator::setCurrentEeObservationDescriptors(
+        std::string arrayName,
+        std::unordered_map<uint32_t, size_t> indicesByAddress)
+    {
+        m_currentEeObservationDescriptorArray =
+            std::move(arrayName);
+        m_currentEeObservationDescriptorIndices =
+            std::move(indicesByAddress);
+    }
+
+    std::string CodeGenerator::eeObservationDescriptorExpression(
+        uint32_t address) const
+    {
+        const auto index =
+            m_currentEeObservationDescriptorIndices.find(address);
+        if (m_currentEeObservationDescriptorArray.empty() ||
+            index == m_currentEeObservationDescriptorIndices.end())
+        {
+            return {};
+        }
+        return fmt::format(
+            "{}+{}",
+            m_currentEeObservationDescriptorArray,
+            index->second);
+    }
+
     std::string CodeGenerator::getFunctionName(uint32_t address) const
     {
         auto it = m_renamedFunctions.find(address);
