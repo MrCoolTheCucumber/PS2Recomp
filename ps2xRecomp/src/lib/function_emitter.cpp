@@ -221,6 +221,8 @@ namespace ps2recomp
             lastInstructionWasControlFlow = inst.hasDelaySlot;
             const bool batchRetirement =
                 eeInstructionCanBatchRetirement(inst);
+            const bool deferRetirementMaterialization =
+                eeInstructionCanDeferRetirementMaterialization(inst);
 
             if (internalTargets.contains(inst.address))
             {
@@ -339,6 +341,13 @@ namespace ps2recomp
                     {
                         ss << "    if constexpr (Mode == "
                               "EeArchitecturalObservationMode::Precise) { "
+                              "ctx->beginEeInstruction(); }\n";
+                    }
+                    else if (deferRetirementMaterialization)
+                    {
+                        ss << "    if constexpr (Mode == "
+                              "EeArchitecturalObservationMode::Fast) { "
+                              "ctx->retireEeInstructions(1u); } else { "
                               "ctx->beginEeInstruction(); }\n";
                     }
                     else

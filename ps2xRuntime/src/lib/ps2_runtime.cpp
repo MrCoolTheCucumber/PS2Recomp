@@ -12339,7 +12339,16 @@ void PS2Runtime::debugObserveMemoryAccess(uint32_t address,
 
     if (matched)
     {
-        debugBlockGuestAtBoundary(const_cast<R5900Context *>(ctx), "watchpoint");
+        R5900Context *const mutableContext =
+            const_cast<R5900Context *>(ctx);
+        if (mutableContext)
+        {
+            // Fast direct-RDRAM accesses may carry the current retirement in
+            // the counted Random run. A matched watchpoint publishes the
+            // context before the memory effect, so materialize it first.
+            mutableContext->finishEeInstruction();
+        }
+        debugBlockGuestAtBoundary(mutableContext, "watchpoint");
     }
 }
 

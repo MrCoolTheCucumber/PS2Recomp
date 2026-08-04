@@ -1,5 +1,6 @@
 #include "MiniTest.h"
 #include "ps2_runtime.h"
+#include "ps2_runtime_macros.h"
 #include "ps2recomp/code_generator.h"
 #include "ps2recomp/instructions.h"
 #include "ps2recomp/r5900_decoder.h"
@@ -158,11 +159,16 @@ void register_ee_bus_error_tests()
             const std::string generated =
                 CodeGenerator({}, {}).generateFunction(
                     function, instructions, false);
+            const std::string deferredRetirement =
+                "if constexpr (Mode == "
+                "EeArchitecturalObservationMode::Fast) { "
+                "ctx->retireEeInstructions(1u); } else { "
+                "ctx->beginEeInstruction(); }";
             const size_t loadRetirement = generated.find(
-                "ctx->beginEeInstruction();");
+                deferredRetirement);
             const size_t load = generated.find("READ32(", loadRetirement);
             const size_t storeRetirement = generated.find(
-                "ctx->beginEeInstruction();",
+                deferredRetirement,
                 loadRetirement + 1u);
             const size_t store = generated.find("WRITE32(", storeRetirement);
 
@@ -170,17 +176,61 @@ void register_ee_bus_error_tests()
                 loadRetirement != std::string::npos &&
                     load != std::string::npos &&
                     loadRetirement < load,
-                "a bus-faultable load should retire before its memory boundary");
+                "a Fast load should pre-retire before its faultable boundary");
             t.IsTrue(
                 storeRetirement != std::string::npos &&
                     store != std::string::npos &&
                     storeRetirement < store,
-                "a bus-faultable store should retire before its memory boundary");
+                "a Fast store should pre-retire before its faultable boundary");
             t.IsTrue(
                 load != std::string::npos &&
                     storeRetirement != std::string::npos &&
                     load < storeRetirement,
                 "the two data instructions should retain program order");
+        });
+
+        tc.Run("Fast pre-retired data faults publish the complete prefix", [](TestCase &t)
+        {
+            PS2Runtime runtime;
+            t.IsTrue(
+                runtime.memory().initialize(),
+                "the pre-retirement fault fixture should initialize memory");
+            R5900Context ctx{};
+            ctx.pc = 0x00124840u;
+            ctx.cop0_random = 47u;
+            ctx.cop0_wired = 0u;
+            ctx.retireEeInstructions(3u);
+            ctx.retireEeInstructions(1u);
+
+            const bool raised = raisesGuestException([&]()
+            {
+                (void)Ps2EeMemoryAccessPolicy<
+                    EeArchitecturalObservationMode::Fast>::read32(
+                    runtime.memory().getRDRAM(),
+                    &ctx,
+                    &runtime,
+                    kUnmappedKseg1Base);
+            });
+
+            t.IsTrue(
+                raised,
+                "the Fast slow-path bus fault should unwind guest execution");
+            t.Equals(
+                ctx.insn_count,
+                uint64_t{4u},
+                "the fault should count its completed prefix and current instruction");
+            t.Equals(
+                ctx.cop0_random,
+                43u,
+                "the fault should publish Random through the current instruction");
+            t.Equals(
+                ctx.cop0_random_pending_retirements,
+                uint64_t{0u},
+                "the fault should expose no pending retirement work");
+            t.Equals(
+                ctx.cop0_epc,
+                0x00124840u,
+                "the fault should retain the current load as its restart PC");
         });
 
         tc.Run("CACHE fills route physical faults through DBE", [](TestCase &t)

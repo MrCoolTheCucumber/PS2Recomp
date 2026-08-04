@@ -340,6 +340,64 @@ void register_ps2_debug_control_tests()
                       "the fast-path flag should clear with the final watchpoint");
         });
 
+        tc.Run("matched watchpoints publish deferred Random before blocking", [](TestCase &t)
+        {
+            PS2Runtime runtime;
+            const uint64_t watchpoint = runtime.debugAddWatchpoint(
+                0x80003000u,
+                4u,
+                PS2Runtime::DebugMemoryAccess::Read);
+            R5900Context ctx{};
+            ctx.pc = 0x00128000u;
+            ctx.cop0_random = 47u;
+            ctx.cop0_wired = 0u;
+            ctx.retireEeInstructions(3u);
+            std::atomic<bool> returned{false};
+
+            std::thread worker([&]()
+            {
+                runtime.debugObserveMemoryAccess(
+                    0x80003000u,
+                    4u,
+                    PS2Runtime::DebugMemoryAccess::Read,
+                    &ctx);
+                returned.store(true, std::memory_order_release);
+            });
+
+            const auto deadline =
+                std::chrono::steady_clock::now() +
+                std::chrono::seconds(1);
+            while (!runtime.debugIsPaused() &&
+                   std::chrono::steady_clock::now() < deadline)
+            {
+                std::this_thread::yield();
+            }
+
+            t.IsTrue(
+                runtime.debugIsPaused(),
+                "a matching direct-access watchpoint should block the observer");
+            t.IsFalse(
+                returned.load(std::memory_order_acquire),
+                "the watchpoint observer should remain blocked before resume");
+            t.Equals(
+                ctx.cop0_random,
+                44u,
+                "the paused watchpoint context should expose materialized Random");
+            t.Equals(
+                ctx.cop0_random_pending_retirements,
+                uint64_t{0u},
+                "the paused watchpoint context should expose no pending work");
+
+            runtime.debugResume();
+            worker.join();
+            t.IsTrue(
+                returned.load(std::memory_order_acquire),
+                "the watchpoint observer should resume cleanly");
+            t.IsTrue(
+                runtime.debugRemoveWatchpoint(watchpoint),
+                "the focused watchpoint should be removable");
+        });
+
         tc.Run("debug memory reads include scratchpad aliases", [](TestCase &t)
         {
             PS2Runtime runtime;

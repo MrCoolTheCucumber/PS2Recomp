@@ -18,7 +18,7 @@
 
 namespace
 {
-    constexpr uint32_t kOutputSchemaVersion = 1u;
+    constexpr uint32_t kOutputSchemaVersion = 2u;
     constexpr uint32_t kRoundsPerBlock = 4u;
     constexpr uint32_t kInstructionsPerRound = 16u;
     constexpr uint32_t kInstructionsPerBlock =
@@ -43,6 +43,7 @@ namespace
     enum class RetirementStrategy : uint8_t
     {
         ScalarReference,
+        DeferredIndividual,
         GeneratedBatch,
         DeferredGeneratedBlocks,
         RuntimePublishedBlocks,
@@ -118,6 +119,14 @@ namespace
                       RetirementStrategy::ScalarReference)
         {
             ctx->beginEeInstruction();
+        }
+        else if constexpr (Strategy ==
+                           RetirementStrategy::DeferredIndividual)
+        {
+            // Models faultable Fast instructions which must count before
+            // their effect but can carry Random across a successful direct
+            // memory path.
+            ctx->retireEeInstructions(1u);
         }
     }
 
@@ -257,6 +266,15 @@ namespace
     }
 
     extern "C" PS2_RANDOM_BENCHMARK_NOINLINE
+    void EeRandomRetirementDeferredIndividual(
+        R5900Context *ctx,
+        uint64_t blocks)
+    {
+        runArithmeticBlocks<
+            RetirementStrategy::DeferredIndividual>(ctx, blocks);
+    }
+
+    extern "C" PS2_RANDOM_BENCHMARK_NOINLINE
     void EeRandomRetirementGeneratedBatch(
         R5900Context *ctx,
         uint64_t blocks)
@@ -310,10 +328,13 @@ namespace
             RetirementStrategy::DirectBlockTotal>(ctx, blocks);
     }
 
-    constexpr std::array<BenchmarkCase, 7u> kCases{{
+    constexpr std::array<BenchmarkCase, 8u> kCases{{
         {"scalar_reference",
          RetirementStrategy::ScalarReference,
          EeRandomRetirementScalarReference},
+        {"deferred_individual",
+         RetirementStrategy::DeferredIndividual,
+         EeRandomRetirementDeferredIndividual},
         {"generated_batch",
          RetirementStrategy::GeneratedBatch,
          EeRandomRetirementGeneratedBatch},
@@ -410,6 +431,8 @@ namespace
         {
         case RetirementStrategy::ScalarReference:
             return "scalar_reference";
+        case RetirementStrategy::DeferredIndividual:
+            return "deferred_individual";
         case RetirementStrategy::GeneratedBatch:
             return "production_counted_batch";
         case RetirementStrategy::DeferredGeneratedBlocks:

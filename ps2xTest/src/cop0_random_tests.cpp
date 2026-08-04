@@ -1,6 +1,7 @@
 #include "MiniTest.h"
 
 #include "ps2_runtime.h"
+#include "ps2_runtime_macros.h"
 #include "ps2recomp/code_generator.h"
 #include "ps2recomp/ee_retirement_model.h"
 #include "ps2recomp/instructions.h"
@@ -100,6 +101,27 @@ void register_cop0_random_tests()
             t.IsFalse(
                 eeInstructionCanBatchRetirement(load),
                 "faultable memory should remain a scalar boundary");
+            t.IsTrue(
+                eeInstructionCanDeferRetirementMaterialization(load),
+                "dynamic memory can pre-retire before a guarded Fast access");
+
+            Instruction mmioLoad = load;
+            mmioLoad.isMmio = true;
+            t.IsFalse(
+                eeInstructionCanDeferRetirementMaterialization(mmioLoad),
+                "statically known MMIO should materialize before its helper");
+
+            Instruction vuLoad = load;
+            vuLoad.isVU = true;
+            t.IsFalse(
+                eeInstructionCanDeferRetirementMaterialization(vuLoad),
+                "VU memory should materialize before synchronization helpers");
+
+            Instruction controlLoad = load;
+            controlLoad.modificationInfo.modifiesControl = true;
+            t.IsFalse(
+                eeInstructionCanDeferRetirementMaterialization(controlLoad),
+                "memory with control effects should retain a scalar boundary");
 
             Instruction cop0{};
             cop0.opcode = OPCODE_COP0;
@@ -121,6 +143,46 @@ void register_cop0_random_tests()
             t.IsFalse(
                 eeInstructionCanBatchRetirement(mmi),
                 "unclassified multimedia operations should remain conservative");
+        });
+
+        tc.Run("Fast direct memory retains Random until a slow path", [](TestCase &t)
+        {
+            PS2Runtime runtime;
+            t.IsTrue(
+                runtime.memory().initialize(),
+                "the retirement fixture should initialize RDRAM");
+            uint8_t *const rdram =
+                runtime.memory().getRDRAM();
+            R5900Context ctx{};
+            ctx.cop0_random = 47u;
+            ctx.cop0_wired = 0u;
+            ctx.retireEeInstructions(3u);
+
+            const uint32_t direct =
+                Ps2EeMemoryAccessPolicy<
+                    EeArchitecturalObservationMode::Fast>::read32(
+                    rdram, &ctx, &runtime, 0x80001000u);
+            (void)direct;
+            t.Equals(
+                ctx.cop0_random,
+                47u,
+                "a direct RDRAM access should not publish pending Random work");
+            t.Equals(
+                ctx.cop0_random_pending_retirements,
+                uint64_t{3u},
+                "a direct RDRAM access should retain the counted run");
+
+            (void)Ps2EeMemoryAccessPolicy<
+                EeArchitecturalObservationMode::Fast>::read32(
+                rdram, &ctx, &runtime, 0xB000E010u);
+            t.Equals(
+                ctx.cop0_random,
+                44u,
+                "a slow MMIO path should materialize all prior retirements");
+            t.Equals(
+                ctx.cop0_random_pending_retirements,
+                uint64_t{0u},
+                "a slow MMIO path should publish no pending Random work");
         });
 
         tc.Run("generated fast arithmetic uses one retirement batch", [](TestCase &t)

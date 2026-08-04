@@ -5,6 +5,21 @@
 
 namespace ps2recomp
 {
+    bool eeInstructionCanDeferRetirementMaterialization(
+        const Instruction &instruction)
+    {
+        return (instruction.isLoad || instruction.isStore) &&
+               !instruction.hasDelaySlot &&
+               !instruction.isBranch &&
+               !instruction.isJump &&
+               !instruction.isCall &&
+               !instruction.isReturn &&
+               !instruction.isMmio &&
+               !instruction.isMMI &&
+               !instruction.isVU &&
+               !instruction.modificationInfo.modifiesControl;
+    }
+
     bool eeInstructionCanBatchRetirement(
         const Instruction &instruction)
     {
