@@ -7,6 +7,7 @@
 #include "ps2recomp/recompiler_reporter.h"
 
 #include <algorithm>
+#include <array>
 #include <cstring>
 #include <deque>
 
@@ -443,6 +444,144 @@ namespace ps2recomp
                                  merged.values[reg] != outgoing.values[reg]))
                             {
                                 merged.invalidate(reg);
+                                changed = true;
+                            }
+                        }
+                    }
+                    if (changed)
+                    {
+                        worklist.push_back(successor);
+                    }
+                }
+            }
+        }
+
+        // Track scaled register values through the same conservative CFG used
+        // for constants. Compilers sometimes move a table byte offset into a
+        // callee-saved register, perform a substantial amount of work, then
+        // use that saved offset for a dispatch. A short backwards scan cannot
+        // see the original SLL, while this state remains valid only when every
+        // incoming path agrees and neither the value nor its source has been
+        // overwritten.
+        struct ScaledRegisterValue
+        {
+            bool known = false;
+            uint32_t sourceRegister = 0u;
+            uint32_t strideBytes = 0u;
+        };
+        using ScaledRegisterState = std::array<ScaledRegisterValue, 32u>;
+        std::vector<ScaledRegisterState> scaledRegistersBefore;
+
+        const auto invalidateScaledRegister = [](ScaledRegisterState &state,
+                                                 uint32_t reg)
+        {
+            if (reg == 0u)
+            {
+                return;
+            }
+            for (uint32_t destination = 1u; destination < 32u;
+                 ++destination)
+            {
+                if (destination == reg ||
+                    (state[destination].known &&
+                     state[destination].sourceRegister == reg))
+                {
+                    state[destination] = {};
+                }
+            }
+        };
+        const auto transferScaledRegisters = [&](const Instruction &inst,
+                                                  ScaledRegisterState &state)
+        {
+            const ScaledRegisterState incoming = state;
+            ScaledRegisterValue producedValue;
+            uint32_t producedRegister = 0u;
+
+            if (inst.opcode == OPCODE_SPECIAL &&
+                inst.function == SPECIAL_SLL && inst.rd != 0u &&
+                inst.rt != 0u && inst.rd != inst.rt && inst.sa >= 2u &&
+                inst.sa < 31u)
+            {
+                producedValue.known = true;
+                producedValue.sourceRegister = inst.rt;
+                producedValue.strideBytes = 1u << inst.sa;
+                producedRegister = inst.rd;
+            }
+            else
+            {
+                uint32_t copySourceRegister = 0u;
+                if (getExactRegisterCopySource(inst, inst.rd,
+                                               copySourceRegister) &&
+                    incoming[copySourceRegister].known)
+                {
+                    producedValue = incoming[copySourceRegister];
+                    producedRegister = inst.rd;
+                }
+            }
+
+            for (uint32_t reg = 1u; reg < 32u; ++reg)
+            {
+                if (writesRegister(inst, reg))
+                {
+                    invalidateScaledRegister(state, reg);
+                }
+            }
+
+            // Calls may overwrite the MIPS caller-saved registers. Preserve
+            // $s0-$s7, $gp, $sp, and $fp as required by the ABI.
+            if (inst.isCall)
+            {
+                for (uint32_t reg = 1u; reg <= 15u; ++reg)
+                {
+                    invalidateScaledRegister(state, reg);
+                }
+                invalidateScaledRegister(state, 24u);
+                invalidateScaledRegister(state, 25u);
+                invalidateScaledRegister(state, 31u);
+            }
+
+            if (producedValue.known && producedRegister != 0u)
+            {
+                state[producedRegister] = producedValue;
+            }
+        };
+
+        if (hasIndirectRegisterJump && !instructions.empty())
+        {
+            scaledRegistersBefore.resize(instructions.size());
+            std::vector<bool> scaledReachable(instructions.size(), false);
+            scaledReachable[0] = true;
+            std::deque<size_t> worklist{0u};
+            while (!worklist.empty())
+            {
+                const size_t index = worklist.front();
+                worklist.pop_front();
+
+                ScaledRegisterState outgoing =
+                    scaledRegistersBefore[index];
+                transferScaledRegisters(instructions[index], outgoing);
+                for (size_t successor : successors[index])
+                {
+                    bool changed = false;
+                    if (!scaledReachable[successor])
+                    {
+                        scaledRegistersBefore[successor] = outgoing;
+                        scaledReachable[successor] = true;
+                        changed = true;
+                    }
+                    else
+                    {
+                        auto &merged = scaledRegistersBefore[successor];
+                        for (uint32_t reg = 1u; reg < 32u; ++reg)
+                        {
+                            if (merged[reg].known &&
+                                (!outgoing[reg].known ||
+                                 merged[reg].sourceRegister !=
+                                     outgoing[reg].sourceRegister ||
+                                 merged[reg].strideBytes !=
+                                     outgoing[reg].strideBytes))
+                            {
+                                merged[reg] = {};
                                 changed = true;
                             }
                         }
@@ -1017,6 +1156,38 @@ namespace ps2recomp
                             {
                                 scaledIndex =
                                     findScaledIndexDefinition(indexReg);
+                            }
+
+                            // If the short local scan could not see the scale,
+                            // reuse a value proven live by the CFG data flow.
+                            // Use the ADDU itself as the proof point; guard
+                            // validation below still requires a nearby bound
+                            // on the unchanged source register.
+                            if (scaledIndex.instructionIndex < 0 &&
+                                static_cast<size_t>(adduIndex) <
+                                    scaledRegistersBefore.size())
+                            {
+                                const auto useDataFlowValue =
+                                    [&](uint32_t reg)
+                                {
+                                    const ScaledRegisterValue &value =
+                                        scaledRegistersBefore[adduIndex][reg];
+                                    if (!value.known)
+                                    {
+                                        return false;
+                                    }
+                                    scaledIndex.destinationRegister = reg;
+                                    scaledIndex.sourceRegister =
+                                        value.sourceRegister;
+                                    scaledIndex.strideBytes =
+                                        value.strideBytes;
+                                    scaledIndex.instructionIndex = adduIndex;
+                                    return true;
+                                };
+                                if (!useDataFlowValue(tableBaseReg))
+                                {
+                                    useDataFlowValue(indexReg);
+                                }
                             }
 
                             uint32_t copiedIndexSourceRegister = 0u;

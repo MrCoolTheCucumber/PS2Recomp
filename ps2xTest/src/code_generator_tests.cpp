@@ -1416,7 +1416,7 @@ void register_code_generator_tests()
         Function func;
         func.name = "reused_jump_table_index";
         func.start = 0x4000u;
-        func.end = 0x40A4u;
+        func.end = 0x4180u;
         func.isRecompiled = true;
         func.isStub = false;
 
@@ -1564,6 +1564,65 @@ void register_code_generator_tests()
             func, copiedIndexInstructions);
         t.IsFalse(analysis.jumpTableTargets.contains(0x4028u),
                   "a copied-index source overwrite before the guard must reject the stale bound");
+
+        std::vector<Instruction> copiedScaledIndexInstructions{
+            decodeR(0x4000u, 0u, 23u, 16u, 2u, SPECIAL_SLL),
+            makeNop(0x4004u),
+            makeNop(0x4008u),
+            makeNop(0x400Cu),
+            decodeR(0x4010u, 16u, 0u, 30u, 0u, SPECIAL_DADDU),
+            decodeI(0x4014u, OPCODE_ADDIU, 0u, 16u, 0u),
+        };
+        for (uint32_t address = 0x4018u; address <= 0x414Cu;
+             address += 4u)
+        {
+            copiedScaledIndexInstructions.push_back(makeNop(address));
+        }
+        copiedScaledIndexInstructions.push_back(
+            decodeI(0x4150u, OPCODE_SLTIU, 23u, 3u, 2u));
+        copiedScaledIndexInstructions.push_back(
+            decodeI(0x4154u, OPCODE_BEQ, 3u, 0u, 6u));
+        copiedScaledIndexInstructions.push_back(
+            decodeI(0x4158u, OPCODE_LUI, 0u, 2u, 0x0020u));
+        copiedScaledIndexInstructions.push_back(
+            decodeI(0x415Cu, OPCODE_ADDIU, 2u, 2u, 0u));
+        copiedScaledIndexInstructions.push_back(
+            decodeR(0x4160u, 30u, 2u, 2u, 0u, SPECIAL_ADDU));
+        copiedScaledIndexInstructions.push_back(
+            decodeI(0x4164u, OPCODE_LW, 2u, 3u, 0u));
+        copiedScaledIndexInstructions.push_back(makeJr(0x4168u, 3u));
+        copiedScaledIndexInstructions.push_back(makeNop(0x416Cu));
+        copiedScaledIndexInstructions.push_back(makeNop(0x4170u));
+        analysis = gen.collectInternalBranchTargets(
+            func, copiedScaledIndexInstructions);
+        t.IsTrue(analysis.jumpTableTargets.contains(0x4168u),
+                 "an exact post-scale copy should preserve a long-lived bounded table offset");
+        t.IsTrue(analysis.indirectFallbackEntryPoints.empty(),
+                 "a resolved post-scale copy should not request broad fallback entries");
+
+        std::vector<Instruction> copiedScaleSourceClobberInstructions =
+            copiedScaledIndexInstructions;
+        copiedScaleSourceClobberInstructions[10] =
+            decodeI(0x4028u, OPCODE_ADDIU, 0u, 23u, 0u);
+        analysis = gen.collectInternalBranchTargets(
+            func, copiedScaleSourceClobberInstructions);
+        t.IsFalse(analysis.jumpTableTargets.contains(0x4168u),
+                  "a source overwrite must invalidate a saved scaled offset");
+
+        copiedScaledIndexInstructions[3] =
+            decodeI(0x400Cu, OPCODE_ADDIU, 0u, 16u, 0u);
+        analysis = gen.collectInternalBranchTargets(
+            func, copiedScaledIndexInstructions);
+        t.IsFalse(analysis.jumpTableTargets.contains(0x4168u),
+                  "a scaled-value overwrite before its copy must reject the stale offset");
+
+        copiedScaledIndexInstructions[3] = makeNop(0x400Cu);
+        copiedScaledIndexInstructions[5] =
+            decodeI(0x4014u, OPCODE_ADDIU, 0u, 30u, 0u);
+        analysis = gen.collectInternalBranchTargets(
+            func, copiedScaledIndexInstructions);
+        t.IsFalse(analysis.jumpTableTargets.contains(0x4168u),
+                  "a copied scaled-value overwrite before table use must reject the stale offset");
 
         instructions[15] =
             decodeI(instructions[15].address, OPCODE_ADDIU, 0u, 8u, 0u);
