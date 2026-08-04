@@ -1173,6 +1173,84 @@ void register_code_generator_tests()
                   "unresolved JALR should not pretend it has a resolved local jump table");
     });
 
+    tc.Run("control-flow diagnostics report once and list only unresolved indirect branches", [](TestCase &t) {
+        Function func;
+        func.name = "mixed_indirect_branches";
+        func.start = 0x3400;
+        func.end = 0x3460;
+        func.isRecompiled = true;
+        func.isStub = false;
+
+        constexpr uint32_t tableAddress = 0x00200000u;
+
+        Instruction sll{};
+        sll.address = 0x3408;
+        sll.opcode = OPCODE_SPECIAL;
+        sll.function = SPECIAL_SLL;
+        sll.rd = 8;
+        sll.rt = 4;
+        sll.sa = 2;
+
+        Instruction addu{};
+        addu.address = 0x340C;
+        addu.opcode = OPCODE_SPECIAL;
+        addu.function = SPECIAL_ADDU;
+        addu.rs = 9;
+        addu.rt = 8;
+        addu.rd = 9;
+
+        JumpTable configured{};
+        configured.address = tableAddress;
+        configured.entries.push_back({0u, 0x3440u});
+        configured.entries.push_back({1u, 0x3450u});
+
+        const std::vector<Instruction> instructions{
+            makeLui(0x3400, 9, 0x0020),
+            makeAddiu(0x3404, 9, 9, 0),
+            sll,
+            addu,
+            makeLw(0x3410, 10, 9, 0),
+            makeJr(0x3414, 10),
+            makeNop(0x3418),
+            makeJalr(0x3420, 25, 31),
+            makeNop(0x3424),
+            makeNop(0x3440),
+            makeNop(0x3450),
+        };
+
+        RecompilerReporter reporter;
+        CodeGenerator gen({}, {});
+        gen.setConfiguredJumpTables({configured});
+        gen.setReporter(&reporter);
+
+        CodeGenerator::AnalysisResult quietAnalysis =
+            gen.collectInternalBranchTargets(func, instructions);
+        t.IsTrue(quietAnalysis.jumpTableTargets.contains(0x3414u),
+                 "the configured JR should be resolved independently of diagnostics");
+        t.Equals(reporter.counters().indirectFallbackPromotions,
+                 static_cast<size_t>(0),
+                 "ordinary analysis passes must not record duplicate fallback diagnostics");
+
+        CodeGenerator::AnalysisResult reportedAnalysis =
+            gen.collectInternalBranchTargets(func, instructions, nullptr, true);
+        t.IsTrue(reportedAnalysis.indirectFallbackEntryPoints.contains(0x3440u),
+                 "the unresolved JALR should still request conservative fallback entries");
+        t.Equals(reporter.counters().indirectFallbackPromotions,
+                 static_cast<size_t>(1),
+                 "the designated diagnostic pass should record one fallback promotion");
+
+        std::ostringstream summary;
+        reporter.printSummary(summary);
+        const std::string report = summary.str();
+        t.IsTrue(report.find("unresolved JR/JALR at 0x3420;") != std::string::npos,
+                 "the warning should name the unresolved JALR");
+        t.IsFalse(report.find("unresolved JR/JALR at 0x3414") != std::string::npos,
+                  "the warning must not include the resolved jump-table JR");
+        t.Equals(countOccurrences(report, "unresolved JR/JALR at"),
+                 static_cast<size_t>(1),
+                 "the reporter should contain one control-flow fallback event");
+    });
+
     tc.Run("resume entry targets emit a top-level pc switch in the owner wrapper", [](TestCase &t) {
         Function func;
         func.name = "resume_owner";

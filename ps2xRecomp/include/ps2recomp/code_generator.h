@@ -72,8 +72,9 @@ namespace ps2recomp
             uint32_t address) const;
 
         AnalysisResult collectInternalBranchTargets(const Function &function,
-                                                  const std::vector<Instruction> &instructions,
-                                                  const std::vector<Function> *allFunctions = nullptr);
+                                                    const std::vector<Instruction> &instructions,
+                                                    const std::vector<Function> *allFunctions = nullptr,
+                                                    bool reportDiagnostics = false);
 
     public:
         std::unordered_map<uint32_t, Symbol> m_symbols;

@@ -308,7 +308,8 @@ namespace ps2recomp
 
         if (hasIndirectRegisterJump)
         {
-            bool needsIndirectFallback = false;
+            std::vector<uint32_t> unresolvedJumpAddresses;
+            unresolvedJumpAddresses.reserve(indirectJumps.size());
             for (const Instruction *jrInst : indirectJumps)
             {
                 if (jrInst->function == SPECIAL_JALR)
@@ -524,21 +525,18 @@ namespace ps2recomp
                 }
                 if (!foundTable)
                 {
-                    needsIndirectFallback = true;
+                    unresolvedJumpAddresses.push_back(jrInst->address);
                 }
             }
 
-            if (needsIndirectFallback)
+            if (!unresolvedJumpAddresses.empty())
             {
                 if (m_reporter)
                 {
-                    std::vector<uint32_t> jumpAddresses;
-                    jumpAddresses.reserve(indirectJumps.size());
-                    for (const Instruction *jrInst : indirectJumps)
-                    {
-                        jumpAddresses.push_back(jrInst->address);
-                    }
-                    m_reporter->recordIndirectFallbackPromotion(function.name, jumpAddresses, instructionAddresses.size());
+                    m_reporter->recordIndirectFallbackPromotion(
+                        function.name,
+                        unresolvedJumpAddresses,
+                        instructionAddresses.size());
                 }
 
                 for (uint32_t addr : instructionAddresses)

@@ -2106,7 +2106,8 @@ namespace ps2recomp
 
             const auto &instructions = decodedIt->second;
             CodeGenerator::AnalysisResult analysisResult =
-                m_codeGenerator->collectInternalBranchTargets(function, instructions, &m_functions);
+                m_codeGenerator->collectInternalBranchTargets(
+                    function, instructions, &m_functions, true);
 
             auto mapTargetToOwner =
                 [&](uint32_t target)

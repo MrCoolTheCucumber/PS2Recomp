@@ -295,9 +295,15 @@ namespace ps2recomp
     }
 
     CodeGenerator::AnalysisResult CodeGenerator::collectInternalBranchTargets(
-        const Function &function, const std::vector<Instruction> &instructions, const std::vector<Function> *allFunctions)
+        const Function &function,
+        const std::vector<Instruction> &instructions,
+        const std::vector<Function> *allFunctions,
+        bool reportDiagnostics)
     {
-        ControlFlowAnalyzer analyzer(m_sections, m_configJumpTableTargetsByAddress, m_reporter);
+        ControlFlowAnalyzer analyzer(
+            m_sections,
+            m_configJumpTableTargetsByAddress,
+            reportDiagnostics ? m_reporter : nullptr);
         return analyzer.analyze(function, instructions, allFunctions);
     }
 
