@@ -1736,6 +1736,29 @@ void register_code_generator_tests()
         t.IsTrue(analysis.indirectFallbackEntryPoints.empty(),
                  "emission analysis should validate executable table targets without function metadata");
 
+        writeTableWord(callableFieldOffset, 0u);
+        writeTableWord(recordStride + callableFieldOffset, 0u);
+        CodeGenerator unassertedNullOnlyGen(symbols, sections);
+        analysis = unassertedNullOnlyGen.collectInternalBranchTargets(
+            caller, instructions, &functions);
+        t.IsFalse(analysis.indirectFallbackEntryPoints.empty(),
+                  "an unasserted null-only read-only array must retain conservative fallback entries");
+
+        CodeGenerator assertedNullOnlyGen(symbols, sections);
+        assertedNullOnlyGen.setConfiguredFunctionTableRanges({
+            FunctionTableRange{
+                tableAddress,
+                static_cast<uint32_t>(tableData.size())}});
+        analysis = assertedNullOnlyGen.collectInternalBranchTargets(
+            caller, instructions, &functions);
+        t.IsTrue(analysis.indirectFallbackEntryPoints.empty(),
+                 "an explicitly verified null-only function table should not request fallback entries");
+        t.IsTrue(analysis.externalEntryPoints.empty(),
+                 "a null-only function table should not invent callable targets");
+
+        writeTableWord(callableFieldOffset, 0x6004u);
+        writeTableWord(recordStride + callableFieldOffset, 0x6100u);
+
         std::vector<Section> writableSections{tableSection, codeSection};
         writableSections[0].isReadOnly = false;
         CodeGenerator writableGen(symbols, writableSections);

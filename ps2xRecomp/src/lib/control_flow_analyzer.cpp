@@ -1438,6 +1438,7 @@ namespace ps2recomp
                                 const Section *tableSection = nullptr;
                                 uint32_t tableRangeAddress = 0u;
                                 uint32_t tableRangeSize = 0u;
+                                bool hasConfiguredTableRange = false;
 
                                 // Explicit immutable subranges take priority
                                 // over coarse ELF section flags and also
@@ -1466,6 +1467,7 @@ namespace ps2recomp
                                             tableSection = &sec;
                                             tableRangeAddress = range.address;
                                             tableRangeSize = range.size;
+                                            hasConfiguredTableRange = true;
                                             break;
                                         }
                                     }
@@ -1585,8 +1587,18 @@ namespace ps2recomp
                                             }
                                         }
 
+                                        // A configured range is an explicit
+                                        // assertion that these records form a
+                                        // function table. Permit a complete
+                                        // null-only placeholder table in that
+                                        // case; without the assertion, keep
+                                        // requiring at least one callable
+                                        // value so an unrelated zero-filled
+                                        // read-only array cannot suppress
+                                        // conservative fallback coverage.
                                         if (validFunctionTable &&
-                                            foundCallableTarget)
+                                            (foundCallableTarget ||
+                                             hasConfiguredTableRange))
                                         {
                                             if (!localTargets.empty())
                                             {

@@ -169,7 +169,8 @@ namespace ps2recomp
     // Exact extent of a strided function table known by external analysis to
     // remain immutable, even when the ELF places it in a writable section.
     // This is an analysis assertion only; it does not change guest memory
-    // permissions. The analyzer still validates every non-null target.
+    // permissions. The analyzer still validates every non-null target; a
+    // verified placeholder table may contain only null fields.
     struct FunctionTableRange
     {
         uint32_t address = 0;
