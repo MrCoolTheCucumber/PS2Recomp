@@ -769,7 +769,11 @@ namespace ps2recomp
                 if (configuredBranchIt !=
                     m_configIndirectBranchTargetsByInstructionAddress.end())
                 {
-                    bool validTargets = !configuredBranchIt->second.empty();
+                    // An explicitly configured empty set asserts that this
+                    // indirect branch is unreachable in the analyzed image.
+                    // Its presence is distinct from an unconfigured site,
+                    // which must retain conservative fallback coverage.
+                    bool validTargets = true;
                     std::vector<uint32_t> localTargets;
                     std::vector<uint32_t> externalTargets;
                     for (uint32_t target : configuredBranchIt->second)

@@ -111,6 +111,9 @@ Indirect branch targets:
   branch can reach.
 * Use this only when reverse engineering has proven the target set is complete.
   An incomplete set can omit required generated entry points.
+* An empty array explicitly asserts that the indirect branch is unreachable in
+  this ELF. This is distinct from omitting the address, which retains
+  conservative fallback coverage.
 * Instruction and target addresses must be nonzero and four-byte aligned;
   malformed configuration is rejected. If a target is not a decoded local
   instruction or executable ELF address, analysis ignores the set and retains
@@ -121,6 +124,7 @@ Example:
 ```toml
 [indirect_branches]
 "0x001FD9CC" = ["0x001FD9E0", "0x001FD9E4", "0x001FD9E8"]
+"0x001FDABC" = [] # statically proven unreachable
 ```
 
 Address binding for stripped ELFs:

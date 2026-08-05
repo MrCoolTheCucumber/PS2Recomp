@@ -347,12 +347,6 @@ namespace ps2recomp
                         }
                         targets.push_back(target);
                     }
-                    if (targets.empty())
-                    {
-                        throw std::runtime_error(
-                            "Configured indirect branch '" +
-                            addressText + "' has no targets.");
-                    }
                     std::sort(targets.begin(), targets.end());
                     targets.erase(
                         std::unique(targets.begin(), targets.end()),

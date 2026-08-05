@@ -4076,6 +4076,16 @@ void register_code_generator_tests()
                      "second configured target should appear in the emitted switch");
 
             gen.setConfiguredIndirectBranchTargets({
+                {0x1680u, {}},
+            });
+            const CodeGenerator::AnalysisResult unreachableAnalysis =
+                gen.collectInternalBranchTargets(func, instructions);
+            t.IsTrue(unreachableAnalysis.indirectFallbackEntryPoints.empty(),
+                     "an explicitly empty target set should resolve an unreachable indirect branch");
+            t.IsTrue(unreachableAnalysis.jumpTableTargets.empty(),
+                     "an unreachable indirect branch should not invent local targets");
+
+            gen.setConfiguredIndirectBranchTargets({
                 {0x1680u, {0x3000u}},
             });
             const CodeGenerator::AnalysisResult invalidAnalysis =

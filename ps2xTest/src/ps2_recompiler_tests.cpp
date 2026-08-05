@@ -891,6 +891,7 @@ void register_ps2_recompiler_tests()
             configFile << "]\n";
             configFile << "\n[indirect_branches]\n";
             configFile << "\"0x1640\" = [\"0x1620\", \"0x1630\", \"0x1620\"]\n";
+            configFile << "\"0x1650\" = []\n";
             configFile.close();
 
             ConfigManager manager(configPath.string());
@@ -944,8 +945,8 @@ void register_ps2_recompiler_tests()
 
             t.Equals(
                 config.indirectBranchTargetsByInstructionAddress.size(),
-                static_cast<size_t>(1),
-                "one configured indirect branch should be loaded");
+                static_cast<size_t>(2),
+                "configured indirect branches, including an empty set, should be loaded");
             const auto indirectBranch =
                 config.indirectBranchTargetsByInstructionAddress.find(
                     0x1640u);
@@ -968,8 +969,30 @@ void register_ps2_recompiler_tests()
                 }
             }
 
+            const auto unreachableIndirectBranch =
+                config.indirectBranchTargetsByInstructionAddress.find(
+                    0x1650u);
+            t.IsTrue(
+                unreachableIndirectBranch !=
+                    config.indirectBranchTargetsByInstructionAddress.end(),
+                "an explicitly empty indirect target set should parse");
+            if (unreachableIndirectBranch !=
+                config.indirectBranchTargetsByInstructionAddress.end())
+            {
+                t.IsTrue(unreachableIndirectBranch->second.empty(),
+                         "an explicitly empty indirect target set should stay empty");
+            }
+
             manager.saveConfig(config);
             const RecompilerConfig roundTripped = manager.loadConfig();
+            const auto roundTrippedUnreachable =
+                roundTripped.indirectBranchTargetsByInstructionAddress.find(
+                    0x1650u);
+            t.IsTrue(
+                roundTrippedUnreachable !=
+                    roundTripped.indirectBranchTargetsByInstructionAddress.end() &&
+                    roundTrippedUnreachable->second.empty(),
+                "an explicitly empty indirect target set should survive config save and reload");
             t.Equals(roundTripped.functionTableRanges.size(),
                      static_cast<size_t>(1),
                      "function-table ranges should survive config save and reload");
