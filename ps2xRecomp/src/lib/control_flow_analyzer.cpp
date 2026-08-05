@@ -17,12 +17,14 @@ namespace ps2recomp
         const std::vector<Section> &sections,
         const std::unordered_map<uint32_t, std::vector<uint32_t>> &configuredJumpTableTargetsByAddress,
         const std::unordered_map<uint32_t, std::vector<uint32_t>> &configuredIndirectBranchTargetsByInstructionAddress,
+        const std::unordered_set<uint32_t> &configuredRegisteredIndirectCalls,
         const std::vector<FunctionTableRange> &configuredFunctionTableRanges,
         RecompilerReporter *reporter)
         : m_sections(sections),
           m_configJumpTableTargetsByAddress(configuredJumpTableTargetsByAddress),
           m_configIndirectBranchTargetsByInstructionAddress(
               configuredIndirectBranchTargetsByInstructionAddress),
+          m_configRegisteredIndirectCalls(configuredRegisteredIndirectCalls),
           m_configFunctionTableRanges(configuredFunctionTableRanges),
           m_reporter(reporter)
     {
@@ -1626,6 +1628,23 @@ namespace ps2recomp
                         }
                     }
                 }
+                // Prefer every exact configured or inferred target set above.
+                // Some callback APIs intentionally accept targets supplied by
+                // another executable image. When reverse engineering proves
+                // that an ordinary JALR-to-$ra site can only call entries
+                // registered independently by the primary image or an active
+                // module, there is no need to make every instruction in this
+                // caller a speculative local entry. Runtime dispatch and the
+                // JALR resume PC are unchanged.
+                if (!foundTable &&
+                    jrInst->function == SPECIAL_JALR &&
+                    jrInst->rd == 31u &&
+                    m_configRegisteredIndirectCalls.contains(
+                        jrInst->address))
+                {
+                    foundTable = true;
+                }
+
                 if (!foundTable)
                 {
                     unresolvedJumpAddresses.push_back(jrInst->address);

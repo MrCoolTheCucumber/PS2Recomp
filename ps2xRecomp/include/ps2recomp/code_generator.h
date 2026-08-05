@@ -65,6 +65,8 @@ namespace ps2recomp
         void setConfiguredJumpTables(const std::vector<JumpTable> &jumpTables);
         void setConfiguredIndirectBranchTargets(
             const std::unordered_map<uint32_t, std::vector<uint32_t>> &targetsByInstructionAddress);
+        void setConfiguredRegisteredIndirectCalls(
+            const std::vector<uint32_t> &instructionAddresses);
         void setConfiguredFunctionTableRanges(
             const std::vector<FunctionTableRange> &ranges);
         void setResumeEntryTargets(const std::unordered_map<uint32_t, std::vector<uint32_t>> &resumeTargetsByOwner);
@@ -88,6 +90,7 @@ namespace ps2recomp
         std::unordered_map<uint32_t, std::vector<uint32_t>> m_configJumpTableTargetsByAddress;
         std::unordered_map<uint32_t, std::vector<uint32_t>>
             m_configIndirectBranchTargetsByInstructionAddress;
+        std::unordered_set<uint32_t> m_configRegisteredIndirectCalls;
         std::vector<FunctionTableRange> m_configFunctionTableRanges;
         std::unordered_map<uint32_t, std::vector<uint32_t>> m_resumeEntryTargetsByOwner;
         const std::vector<Section>& m_sections;

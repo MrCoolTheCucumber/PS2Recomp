@@ -873,6 +873,7 @@ void register_ps2_recompiler_tests()
             configFile << "module_match_address = \"0x245c28\"\n";
             configFile << "module_match_size = 96\n\n";
             configFile << "[analysis]\n";
+            configFile << "registered_indirect_calls = [\"0x1660\", \"0x1640\", \"0x1660\"]\n";
             configFile << "[[analysis.function_table_range]]\n";
             configFile << "address = \"0x183f90\"\n";
             configFile << "size = \"0x260\"\n\n";
@@ -907,6 +908,15 @@ void register_ps2_recompiler_tests()
                      "module match size should parse");
             t.Equals(config.functionTableRanges.size(), static_cast<size_t>(1),
                      "one configured function-table range should be loaded");
+            t.Equals(config.registeredIndirectCalls.size(), static_cast<size_t>(2),
+                     "registered indirect calls should be sorted and deduplicated");
+            if (config.registeredIndirectCalls.size() >= 2u)
+            {
+                t.Equals(config.registeredIndirectCalls[0], 0x1640u,
+                         "first registered indirect call should parse");
+                t.Equals(config.registeredIndirectCalls[1], 0x1660u,
+                         "second registered indirect call should parse");
+            }
             if (!config.functionTableRanges.empty())
             {
                 t.Equals(config.functionTableRanges.front().address, 0x183f90u,
@@ -996,6 +1006,16 @@ void register_ps2_recompiler_tests()
             t.Equals(roundTripped.functionTableRanges.size(),
                      static_cast<size_t>(1),
                      "function-table ranges should survive config save and reload");
+            t.Equals(roundTripped.registeredIndirectCalls.size(),
+                     static_cast<size_t>(2),
+                     "registered indirect calls should survive config save and reload");
+            if (roundTripped.registeredIndirectCalls.size() >= 2u)
+            {
+                t.Equals(roundTripped.registeredIndirectCalls[0], 0x1640u,
+                         "first round-tripped registered call should match");
+                t.Equals(roundTripped.registeredIndirectCalls[1], 0x1660u,
+                         "second round-tripped registered call should match");
+            }
             if (!roundTripped.functionTableRanges.empty())
             {
                 t.Equals(roundTripped.functionTableRanges.front().address,

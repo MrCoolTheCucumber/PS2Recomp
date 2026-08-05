@@ -104,6 +104,9 @@ Main fields in `config.toml`:
 * `patches.instructions`: raw instruction replacements by address.
 * `indirect_branches`: complete, statically verified target sets for indirect
   `JR`/`JALR` instructions that automatic control-flow analysis cannot resolve.
+* `analysis.registered_indirect_calls`: dynamic callback `JALR` sites whose
+  targets are proven to be entries registered independently by the primary
+  ELF or an active fixed-address AOT module.
 
 Indirect branch targets:
 
@@ -125,6 +128,29 @@ Example:
 [indirect_branches]
 "0x001FD9CC" = ["0x001FD9E0", "0x001FD9E4", "0x001FD9E8"]
 "0x001FDABC" = [] # statically proven unreachable
+```
+
+Registered indirect calls:
+
+* Use this for an ordinary `JALR` that writes `$ra` when the target set is
+  intentionally dynamic, but reverse engineering proves every possible target
+  is an independently registered callable entry. Cross-overlay callback APIs
+  are a common example.
+* This assertion does not hard-code a target or bypass runtime validation. The
+  generated code still performs normal `IndirectCall` dispatch and resumes at
+  the instruction after the delay slot.
+* It only prevents the analyzer from registering every instruction in the
+  caller as a speculative local target. A listed `JR` or a `JALR` that does not
+  link through `$ra` remains conservative.
+* Do not use this if the target may be an otherwise-undiscovered label inside
+  the caller. In that case provide a complete `indirect_branches` target set or
+  retain fallback coverage.
+
+Example:
+
+```toml
+[analysis]
+registered_indirect_calls = ["0x0012BB6C"]
 ```
 
 Address binding for stripped ELFs:

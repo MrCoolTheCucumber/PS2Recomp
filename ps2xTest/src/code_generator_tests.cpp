@@ -1334,6 +1334,90 @@ void register_code_generator_tests()
                   "unresolved JALR should not pretend it has a resolved local jump table");
     });
 
+    tc.Run("registered indirect JALR keeps dynamic dispatch without broad local entries", [](TestCase &t) {
+        Function func;
+        func.name = "registered_indirect_call";
+        func.start = 0x3280u;
+        func.end = 0x32A0u;
+        func.isRecompiled = true;
+        func.isStub = false;
+
+        const std::vector<Instruction> instructions{
+            makeNop(0x3280u),
+            makeJalr(0x3284u, 25u, 31u),
+            makeNop(0x3288u),
+            makeNop(0x328Cu),
+            makeNop(0x3290u),
+        };
+
+        RecompilerReporter reporter;
+        CodeGenerator gen({}, {});
+        gen.setReporter(&reporter);
+        gen.setConfiguredRegisteredIndirectCalls({0x3284u});
+        const CodeGenerator::AnalysisResult analysis =
+            gen.collectInternalBranchTargets(
+                func, instructions, nullptr, true);
+
+        t.IsTrue(analysis.indirectFallbackEntryPoints.empty(),
+                 "a registered-target JALR should not promote every local instruction");
+        t.IsTrue(analysis.resumeEntryPoints.contains(0x328Cu),
+                 "a registered-target JALR must retain its call return PC");
+        t.IsFalse(analysis.jumpTableTargets.contains(0x3284u),
+                  "a registered-target assertion should not invent a fixed target set");
+        t.Equals(reporter.counters().indirectFallbackPromotions,
+                 static_cast<size_t>(0),
+                 "a registered-target JALR should not report fallback promotion");
+
+        const std::string generated =
+            gen.generateFunction(func, instructions, false);
+        t.IsTrue(generated.find(
+                     "PS2Runtime::GuestBranchKind::IndirectCall") !=
+                     std::string::npos,
+                 "a registered-target JALR should keep runtime indirect-call dispatch");
+        t.IsTrue(generated.find("0x328Cu") != std::string::npos,
+                 "generated dispatch should retain the JALR fallthrough PC");
+    });
+
+    tc.Run("registered indirect call assertion rejects JR and non-ra link forms", [](TestCase &t) {
+        const auto expectFallback = [&](const Function &func,
+                                        const std::vector<Instruction> &instructions,
+                                        uint32_t configuredAddress,
+                                        const std::string &message)
+        {
+            CodeGenerator gen({}, {});
+            gen.setConfiguredRegisteredIndirectCalls({configuredAddress});
+            const CodeGenerator::AnalysisResult analysis =
+                gen.collectInternalBranchTargets(func, instructions);
+            t.IsFalse(analysis.indirectFallbackEntryPoints.empty(), message);
+        };
+
+        Function jrFunc;
+        jrFunc.name = "registered_assertion_on_jr";
+        jrFunc.start = 0x32C0u;
+        jrFunc.end = 0x32D0u;
+        jrFunc.isRecompiled = true;
+        jrFunc.isStub = false;
+        expectFallback(
+            jrFunc,
+            {makeNop(0x32C0u), makeJr(0x32C4u, 25u),
+             makeNop(0x32C8u), makeNop(0x32CCu)},
+            0x32C4u,
+            "a JR must ignore the registered indirect call assertion");
+
+        Function nonRaLinkFunc;
+        nonRaLinkFunc.name = "registered_assertion_on_non_ra_jalr";
+        nonRaLinkFunc.start = 0x32E0u;
+        nonRaLinkFunc.end = 0x32F0u;
+        nonRaLinkFunc.isRecompiled = true;
+        nonRaLinkFunc.isStub = false;
+        expectFallback(
+            nonRaLinkFunc,
+            {makeNop(0x32E0u), makeJalr(0x32E4u, 25u, 30u),
+             makeNop(0x32E8u), makeNop(0x32ECu)},
+            0x32E4u,
+            "a non-$ra JALR must ignore the registered indirect call assertion");
+    });
+
     tc.Run("control-flow diagnostics report once and list only unresolved indirect branches", [](TestCase &t) {
         Function func;
         func.name = "mixed_indirect_branches";
@@ -1731,6 +1815,13 @@ void register_code_generator_tests()
                  "a validated mid-function table target should be promoted in its owner");
         t.IsFalse(analysis.jumpTableTargets.contains(0x5018u),
                   "external callable targets should continue through runtime JALR dispatch");
+
+        gen.setConfiguredRegisteredIndirectCalls({0x5018u});
+        analysis = gen.collectInternalBranchTargets(
+            caller, instructions, &functions);
+        t.IsTrue(analysis.externalEntryPoints.contains(0x6004u),
+                 "an exact inferred target set should take priority over the registered-call assertion");
+        gen.setConfiguredRegisteredIndirectCalls({});
 
         analysis = gen.collectInternalBranchTargets(caller, instructions);
         t.IsTrue(analysis.indirectFallbackEntryPoints.empty(),

@@ -161,6 +161,21 @@ namespace ps2recomp
         }
     }
 
+    void CodeGenerator::setConfiguredRegisteredIndirectCalls(
+        const std::vector<uint32_t> &instructionAddresses)
+    {
+        m_configRegisteredIndirectCalls.clear();
+        for (uint32_t address : instructionAddresses)
+        {
+            if (address == 0u || (address & 3u) != 0u)
+            {
+                throw std::runtime_error(
+                    "Configured registered indirect call address must be nonzero and aligned.");
+            }
+            m_configRegisteredIndirectCalls.insert(address);
+        }
+    }
+
     void CodeGenerator::setConfiguredFunctionTableRanges(
         const std::vector<FunctionTableRange> &ranges)
     {
@@ -378,6 +393,7 @@ namespace ps2recomp
             m_sections,
             m_configJumpTableTargetsByAddress,
             m_configIndirectBranchTargetsByInstructionAddress,
+            m_configRegisteredIndirectCalls,
             m_configFunctionTableRanges,
             reportDiagnostics ? m_reporter : nullptr);
         return analyzer.analyze(function, instructions, allFunctions);

@@ -31,6 +31,7 @@ namespace ps2recomp
         ControlFlowAnalyzer(const std::vector<Section> &sections,
                             const std::unordered_map<uint32_t, std::vector<uint32_t>> &configuredJumpTableTargetsByAddress,
                             const std::unordered_map<uint32_t, std::vector<uint32_t>> &configuredIndirectBranchTargetsByInstructionAddress,
+                            const std::unordered_set<uint32_t> &configuredRegisteredIndirectCalls,
                             const std::vector<FunctionTableRange> &configuredFunctionTableRanges,
                             RecompilerReporter *reporter);
 
@@ -43,6 +44,7 @@ namespace ps2recomp
         const std::unordered_map<uint32_t, std::vector<uint32_t>> &m_configJumpTableTargetsByAddress;
         const std::unordered_map<uint32_t, std::vector<uint32_t>> &
             m_configIndirectBranchTargetsByInstructionAddress;
+        const std::unordered_set<uint32_t> &m_configRegisteredIndirectCalls;
         const std::vector<FunctionTableRange> &m_configFunctionTableRanges;
         RecompilerReporter *m_reporter = nullptr;
     };

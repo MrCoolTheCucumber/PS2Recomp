@@ -357,6 +357,35 @@ namespace ps2recomp
             if (data.contains("analysis") && data.at("analysis").is_table())
             {
                 const auto &analysisNode = data.at("analysis");
+                if (analysisNode.contains("registered_indirect_calls"))
+                {
+                    const auto &callsNode =
+                        analysisNode.at("registered_indirect_calls");
+                    if (!callsNode.is_array())
+                    {
+                        throw std::runtime_error(
+                            "Configured analysis.registered_indirect_calls must be an address array.");
+                    }
+
+                    for (const auto &addressNode : callsNode.as_array())
+                    {
+                        uint32_t address = 0u;
+                        if (!parseAddress(addressNode, address) ||
+                            address == 0u || (address & 3u) != 0u)
+                        {
+                            throw std::runtime_error(
+                                "Configured registered indirect call must be a nonzero aligned address.");
+                        }
+                        config.registeredIndirectCalls.push_back(address);
+                    }
+                    std::sort(config.registeredIndirectCalls.begin(),
+                              config.registeredIndirectCalls.end());
+                    config.registeredIndirectCalls.erase(
+                        std::unique(config.registeredIndirectCalls.begin(),
+                                    config.registeredIndirectCalls.end()),
+                        config.registeredIndirectCalls.end());
+                }
+
                 if (analysisNode.contains("function_table_range"))
                 {
                     const auto &rangesNode =
@@ -549,22 +578,40 @@ namespace ps2recomp
             data["indirect_branches"] = branches;
         }
 
-        if (!config.functionTableRanges.empty())
+        if (!config.functionTableRanges.empty() ||
+            !config.registeredIndirectCalls.empty())
         {
             toml::table analysis;
-            toml::array ranges;
-            for (const FunctionTableRange &range : config.functionTableRanges)
+            if (!config.registeredIndirectCalls.empty())
             {
-                toml::table node;
-                std::ostringstream address;
-                address << "0x" << std::hex << range.address;
-                std::ostringstream size;
-                size << "0x" << std::hex << range.size;
-                node["address"] = address.str();
-                node["size"] = size.str();
-                ranges.push_back(node);
+                std::vector<uint32_t> calls = config.registeredIndirectCalls;
+                std::sort(calls.begin(), calls.end());
+                calls.erase(std::unique(calls.begin(), calls.end()), calls.end());
+                toml::array addresses;
+                for (uint32_t call : calls)
+                {
+                    std::ostringstream address;
+                    address << "0x" << std::hex << call;
+                    addresses.push_back(address.str());
+                }
+                analysis["registered_indirect_calls"] = addresses;
             }
-            analysis["function_table_range"] = ranges;
+            if (!config.functionTableRanges.empty())
+            {
+                toml::array ranges;
+                for (const FunctionTableRange &range : config.functionTableRanges)
+                {
+                    toml::table node;
+                    std::ostringstream address;
+                    address << "0x" << std::hex << range.address;
+                    std::ostringstream size;
+                    size << "0x" << std::hex << range.size;
+                    node["address"] = address.str();
+                    node["size"] = size.str();
+                    ranges.push_back(node);
+                }
+                analysis["function_table_range"] = ranges;
+            }
             data["analysis"] = analysis;
         }
 

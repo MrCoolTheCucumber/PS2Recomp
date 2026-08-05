@@ -224,6 +224,11 @@ namespace ps2recomp
         std::vector<JumpTable> jumpTables;
         std::unordered_map<uint32_t, std::vector<uint32_t>>
             indirectBranchTargetsByInstructionAddress;
+        // JALR sites proven to call entries registered independently by the
+        // primary ELF or an active fixed-address module. These calls remain
+        // dynamically dispatched; the assertion only suppresses speculative
+        // promotion of every instruction in the caller as a local target.
+        std::vector<uint32_t> registeredIndirectCalls;
         std::vector<FunctionTableRange> functionTableRanges;
         std::vector<Function> functionBoundaries;
     };
