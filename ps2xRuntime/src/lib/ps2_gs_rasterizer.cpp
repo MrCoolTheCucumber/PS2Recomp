@@ -2669,6 +2669,25 @@ void GSRasterizer::recordAcceleratedCommit(
     }
 }
 
+void GSRasterizer::recordAcceleratedCommitBatch(
+    GS *gs,
+    const GsVulkanAcceleratedCommitBatch &batch)
+{
+    DebugProgressScope progress(*this, gs, batch.commandCount);
+    m_debugCandidatePixelBatch += batch.candidatePixels;
+
+    // These effects are idempotent across a homogeneous completion batch, so
+    // aggregate metadata preserves frontend order without retaining complete
+    // register and vertex snapshots for every GPU draw.
+    m_textureReadVram = nullptr;
+    if (gs->m_hasPreferredDisplaySource &&
+        batch.framebufferBasePages.test(
+            gs->m_preferredDisplayDestFbp))
+    {
+        gs->m_hasPreferredDisplaySource = false;
+    }
+}
+
 void GSRasterizer::flushDrawBatch(
     GS *gs,
     GsFlushReason reason)
@@ -2774,10 +2793,7 @@ bool GSRasterizer::setRendererMode(GsRendererMode mode)
                 {
                     renderSoftwarePrimitive(m_owner, command);
                 },
-                [this](const GsDrawCommand &command)
-                {
-                    recordAcceleratedCommit(m_owner, command);
-                },
+                {},
                 &state.capabilityReport,
                 &state.diagnostic,
                 [this]() -> std::span<const uint8_t>
@@ -2791,6 +2807,27 @@ bool GSRasterizer::setRendererMode(GsRendererMode mode)
                     return std::span<const uint8_t>(
                         m_textureSnapshot.data(),
                         m_textureSnapshot.size());
+                },
+                [this]() -> GsVulkanDecodedPalette
+                {
+                    if (!m_owner)
+                        return {};
+                    prepareDecodedClut(m_owner);
+                    if (!m_decodedClutActive)
+                        return {};
+                    return {
+                        std::span<const uint32_t>(
+                            m_decodedClut.data(),
+                            m_decodedClut.size()),
+                        m_decodedClutGeneration,
+                        m_decodedClutTexa,
+                        m_decodedClutSourcePsm,
+                        m_decodedClutCsm,
+                        m_decodedClutCsa};
+                },
+                [this](const GsVulkanAcceleratedCommitBatch &batch)
+                {
+                    recordAcceleratedCommitBatch(m_owner, batch);
                 });
         if (!accelerated)
             return false;
@@ -5806,13 +5843,15 @@ void GSRasterizer::drawTriangle(GS *gs)
                     channel == 4
                         ? static_cast<int>(std::nearbyint(blockDeltaFloat))
                         : static_cast<int>(blockDeltaFloat);
-                if ((channel == 0 || channel == 4) &&
+                if ((channel == 0 || channel == 3 || channel == 4) &&
                     debugPixel)
                 {
                     std::cerr
                         << (channel == 4
                                 ? "[gs:fog-dda] draw="
-                                : "[gs:color-dda] draw=")
+                                : channel == 3
+                                    ? "[gs:alpha-dda] draw="
+                                    : "[gs:color-dda] draw=")
                         << drawTrace().index
                         << " xy=(" << x << ',' << y << ')'
                         << " scan=" << scanlineColor[channel]
@@ -5881,7 +5920,10 @@ void GSRasterizer::drawTriangle(GS *gs)
                 b = static_cast<uint8_t>(packed >> 16u);
                 a = static_cast<uint8_t>(packed >> 24u);
                 if (debugPixel)
+                {
                     (void)interpolateDdaFixed(0);
+                    (void)interpolateDdaFixed(3);
+                }
 #else
                 auto shadeChannel = [&](int channel)
                 {

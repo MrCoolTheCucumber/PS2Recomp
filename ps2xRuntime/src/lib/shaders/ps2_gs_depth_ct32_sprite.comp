@@ -52,10 +52,10 @@ void write_z24(uint word_index, uint initial_word)
     }
 }
 
-uint blend_source_over_rgb(uint source, uint destination)
+uint blend_rgb(uint source, uint destination, uint factor)
 {
     uint result = source & 0xff000000u;
-    int alpha = int(source >> 24u);
+    int alpha = int(factor);
     for (uint shift = 0u; shift < 24u; shift += 8u)
     {
         int source_channel = int((source >> shift) & 0xffu);
@@ -102,12 +102,33 @@ void main()
 
     uint framebuffer_word_index = gs_word_index(
         0x00u, sprite.framebuffer_base_block, x, y);
-    uint color = sprite.rgba;
-    if (sprite.color_blend_mode == 1u)
+    uint color_operation = sprite.color_blend_mode & 0x3u;
+    bool destination_alpha_test =
+        (sprite.color_blend_mode & (1u << 16u)) != 0u;
+    uint destination = 0u;
+    if (color_operation != 0u || destination_alpha_test)
     {
-        uint destination = atomicAdd(
+        destination = atomicAdd(
             gs_vram.words[framebuffer_word_index], 0u);
-        color = blend_source_over_rgb(sprite.rgba, destination);
+    }
+    if (destination_alpha_test)
+    {
+        uint expected_alpha_msb =
+            (sprite.color_blend_mode >> 17u) & 1u;
+        if (((destination >> 31u) & 1u) != expected_alpha_msb)
+            return;
+    }
+    uint color = sprite.rgba;
+    if (color_operation == 1u)
+    {
+        color = blend_rgb(
+            sprite.rgba, destination, sprite.rgba >> 24u);
+    }
+    else if (color_operation == 2u)
+    {
+        uint fixed_alpha =
+            (sprite.color_blend_mode >> 8u) & 0xffu;
+        color = blend_rgb(sprite.rgba, destination, fixed_alpha);
     }
     atomicExchange(gs_vram.words[framebuffer_word_index], color);
     if (sprite.depth_write == 0u)

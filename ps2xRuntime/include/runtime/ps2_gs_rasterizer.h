@@ -101,6 +101,9 @@ private:
     void recordAcceleratedCommit(
         GS *gs,
         const GsDrawCommand &command);
+    void recordAcceleratedCommitBatch(
+        GS *gs,
+        const GsVulkanAcceleratedCommitBatch &batch);
     void flushSoftwareDrawBatch(GS *gs);
     [[nodiscard]] size_t softwarePendingCommandCount() const noexcept;
     void renderSoftwarePrimitive(GS *gs, const GsDrawCommand &command);

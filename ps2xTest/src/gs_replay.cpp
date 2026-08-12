@@ -71,6 +71,7 @@ namespace
                "[--vulkan-min-hybrid-pixels COUNT] "
                "[--vulkan-min-hybrid-source-copy-alpha-pixels COUNT] "
                "[--vulkan-min-hybrid-depth-ct32-pixels COUNT] "
+               "[--vulkan-min-hybrid-alpha-fail-depth-run-pixels COUNT] "
                "[--vulkan-min-hybrid-nearest-ct32-pixels COUNT] "
                "[--vulkan-min-hybrid-linear-ct32-pixels COUNT] "
                "[--vulkan-min-hybrid-linear-ct32-clamp-pixels COUNT] "
@@ -313,12 +314,18 @@ namespace
                    << (device.shaderInt16 ? "true" : "false")
                    << ",\"shader_int64\":"
                    << (device.shaderInt64 ? "true" : "false")
+                   << ",\"shader_float64\":"
+                   << (device.shaderFloat64 ? "true" : "false")
                    << ",\"exact_vram_storage\":"
                    << (device.exactVramStorage ? "true" : "false")
                    << ",\"exact_ct32_triangle\":"
                    << (device.exactCt32Triangle ? "true" : "false")
                    << ",\"exact_gouraud_depth_ct32_triangle\":"
                    << (device.exactGouraudDepthCt32Triangle
+                           ? "true"
+                           : "false")
+                   << ",\"exact_t8_gouraud_depth_ct32_triangle\":"
+                   << (device.exactT8GouraudDepthCt32Triangle
                            ? "true"
                            : "false")
                    << ",\"exact_depth_ct32_sprite\":"
@@ -457,6 +464,22 @@ namespace
                << ",\"gouraud_depth_ct32_triangle_candidate_pixels_executed\":"
                << statistics
                       .gouraudDepthCt32TriangleCandidatePixelsExecuted
+               << ",\"t8_gouraud_depth_ct32_triangle_draws_completed\":"
+               << statistics.t8GouraudDepthCt32TriangleDrawsCompleted
+               << ",\"t8_gouraud_depth_ct32_triangle_draws_failed\":"
+               << statistics.t8GouraudDepthCt32TriangleDrawsFailed
+               << ",\"t8_gouraud_depth_ct32_triangle_candidate_pixels_executed\":"
+               << statistics
+                      .t8GouraudDepthCt32TriangleCandidatePixelsExecuted
+               << ",\"resident_t8_gouraud_depth_ct32_triangle_batches_completed\":"
+               << statistics
+                      .residentT8GouraudDepthCt32TriangleBatchesCompleted
+               << ",\"resident_t8_gouraud_depth_ct32_triangle_batches_failed\":"
+               << statistics
+                      .residentT8GouraudDepthCt32TriangleBatchesFailed
+               << ",\"largest_resident_t8_gouraud_depth_ct32_triangle_batch\":"
+               << statistics
+                      .largestResidentT8GouraudDepthCt32TriangleBatch
                << ",\"resident_sprite_batches_completed\":"
                << statistics.residentSpriteBatchesCompleted
                << ",\"resident_sprite_batches_failed\":"
@@ -976,6 +999,29 @@ int main(int argc, char **argv)
                     return 2;
                 }
                 vulkanBackendConfig.minimumHybridDepthCt32SpritePixels =
+                    minimum;
+                vulkanOptionUsed = true;
+                replayOptionUsed = true;
+                gifReplayOptionUsed = true;
+            }
+            else if (argument ==
+                     "--vulkan-min-hybrid-alpha-fail-depth-run-pixels")
+            {
+                uint64_t minimum = 0u;
+                constexpr uint64_t maximumPixels =
+                    2048ull * 2048ull *
+                    GS_VULKAN_MAX_RESIDENT_DEPTH_CT32_BATCH;
+                if (!parseCount(argv[index], minimum) ||
+                    minimum > maximumPixels)
+                {
+                    std::cerr
+                        << "Vulkan hybrid alpha-fail depth run-pixel threshold "
+                           "must be between 0 and "
+                        << maximumPixels << '\n';
+                    return 2;
+                }
+                vulkanBackendConfig
+                    .minimumHybridFramebufferOnlyAlphaFailDepthCt32RunPixels =
                     minimum;
                 vulkanOptionUsed = true;
                 replayOptionUsed = true;

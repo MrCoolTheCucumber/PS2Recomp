@@ -24,7 +24,13 @@ inline constexpr uint32_t GS_VULKAN_NOOP_GROUP_COUNT =
         GS_VULKAN_VRAM_SIZE / sizeof(uint32_t) /
         GS_VULKAN_NOOP_LOCAL_SIZE);
 inline constexpr uint32_t GS_VULKAN_MAX_MEMORY_CASES = 65536u;
-inline constexpr size_t GS_VULKAN_MAX_RESIDENT_SPRITE_BATCH = 64u;
+inline constexpr size_t GS_VULKAN_AUXILIARY_STORAGE_SIZE =
+    8u * 1024u * 1024u;
+// Resident commands share one bounded host-visible record allocation and one
+// command buffer. A larger bound amortizes queue/fence overhead for the many
+// small primitives emitted by PS2 renderers while remaining below the fixed
+// 2 MiB auxiliary allocation even for the largest exact draw record.
+inline constexpr size_t GS_VULKAN_MAX_RESIDENT_SPRITE_BATCH = 1024u;
 inline constexpr size_t GS_VULKAN_MAX_RESIDENT_DEPTH_CT32_BATCH =
     GS_VULKAN_MAX_RESIDENT_SPRITE_BATCH;
 inline constexpr size_t GS_VULKAN_MAX_RESIDENT_NEAREST_CT32_BATCH =
@@ -36,6 +42,8 @@ inline constexpr size_t
         GS_VULKAN_MAX_RESIDENT_SPRITE_BATCH;
 inline constexpr size_t GS_VULKAN_MAX_RESIDENT_TRIANGLE_BATCH =
     GS_VRAM_PAGE_COUNT;
+inline constexpr size_t GS_VULKAN_MAX_RESIDENT_T8_TRIANGLE_BATCH =
+    6144u;
 
 enum class GsVulkanProbeStatus : uint8_t
 {
@@ -101,6 +109,7 @@ struct GsVulkanDeviceReport
     bool hostVisibleMemory = false;
     bool shaderInt16 = false;
     bool shaderInt64 = false;
+    bool shaderFloat64 = false;
 
     // Vulkan 1.0 compute shaders have exact 32-bit integer storage-buffer
     // access. This flag also requires the queue, limits, and memory classes
@@ -115,6 +124,11 @@ struct GsVulkanDeviceReport
     // 64-bit coverage requirement and additionally reproduces the software
     // rasterizer's single-precision eight-pixel color DDA.
     bool exactGouraudDepthCt32Triangle = false;
+
+    // Perspective T8 Gouraud/depth triangles additionally reproduce the
+    // software rasterizer's binary64 Z DDA. Their decoded palette and setup
+    // record are supplied through the bounded auxiliary storage buffer.
+    bool exactT8GouraudDepthCt32Triangle = false;
 
     // Exact flat CT32 plus Z32/Z24 depth uses only the permanent raw-VRAM
     // contract and 32-bit storage-buffer atomics.
@@ -238,6 +252,12 @@ struct GsVulkanServiceStatistics
     uint64_t gouraudDepthCt32TriangleDrawsCompleted = 0u;
     uint64_t gouraudDepthCt32TriangleDrawsFailed = 0u;
     uint64_t gouraudDepthCt32TriangleCandidatePixelsExecuted = 0u;
+    uint64_t t8GouraudDepthCt32TriangleDrawsCompleted = 0u;
+    uint64_t t8GouraudDepthCt32TriangleDrawsFailed = 0u;
+    uint64_t t8GouraudDepthCt32TriangleCandidatePixelsExecuted = 0u;
+    uint64_t residentT8GouraudDepthCt32TriangleBatchesCompleted = 0u;
+    uint64_t residentT8GouraudDepthCt32TriangleBatchesFailed = 0u;
+    uint64_t largestResidentT8GouraudDepthCt32TriangleBatch = 0u;
     uint64_t residentSpriteBatchesCompleted = 0u;
     uint64_t residentSpriteBatchesFailed = 0u;
     uint64_t largestResidentSpriteBatch = 0u;
@@ -348,10 +368,24 @@ static_assert(offsetof(GsVulkanCt32Sprite, reserved) == 28u);
 // Fixed record for exact flat CT32 color plus Z32/Z24 depth execution. The
 // depth method uses GS ZTST values (ALWAYS=1, GEQUAL=2, GREATER=3); depthWrite
 // is normalized from ZMASK. Z24 writes preserve the unrelated high byte.
-// colorBlendMode 0 writes RGBA directly. Mode 1 applies the clamped standard
-// GS source-over equation to RGB and still writes source alpha.
+// colorBlendMode is a packed color-operation descriptor. Source-copy and
+// source-over use their literal operation values. FIXED_ALPHA additionally
+// stores FIX in bits 8..15 and optional CT32 DATE/DATM state in bits 16..17.
+// Every operation writes source alpha; alpha blending only changes RGB.
 inline constexpr uint32_t GS_VULKAN_DEPTH_CT32_COLOR_SOURCE_COPY = 0u;
 inline constexpr uint32_t GS_VULKAN_DEPTH_CT32_COLOR_SOURCE_OVER = 1u;
+inline constexpr uint32_t GS_VULKAN_DEPTH_CT32_COLOR_FIXED_ALPHA = 2u;
+inline constexpr uint32_t GS_VULKAN_DEPTH_CT32_COLOR_OPERATION_MASK = 0x3u;
+inline constexpr uint32_t GS_VULKAN_DEPTH_CT32_COLOR_FIXED_ALPHA_SHIFT = 8u;
+inline constexpr uint32_t GS_VULKAN_DEPTH_CT32_COLOR_FIXED_ALPHA_MASK =
+    0xFFu << GS_VULKAN_DEPTH_CT32_COLOR_FIXED_ALPHA_SHIFT;
+inline constexpr uint32_t GS_VULKAN_DEPTH_CT32_COLOR_DATE = 1u << 16u;
+inline constexpr uint32_t GS_VULKAN_DEPTH_CT32_COLOR_DATM = 1u << 17u;
+inline constexpr uint32_t GS_VULKAN_DEPTH_CT32_COLOR_DESCRIPTOR_MASK =
+    GS_VULKAN_DEPTH_CT32_COLOR_OPERATION_MASK |
+    GS_VULKAN_DEPTH_CT32_COLOR_FIXED_ALPHA_MASK |
+    GS_VULKAN_DEPTH_CT32_COLOR_DATE |
+    GS_VULKAN_DEPTH_CT32_COLOR_DATM;
 
 struct alignas(16) GsVulkanDepthCt32Sprite
 {
@@ -402,6 +436,14 @@ static_assert(offsetof(GsVulkanDepthCt32Sprite, reserved3) == 60u);
 // Rejection leaves the caller's record untouched. Device execution remains
 // independently capability-gated by the Vulkan service.
 [[nodiscard]] GsBackendDecision prepareGsVulkanSourceOverDepthCt32Sprite(
+    const GsDrawCommand &command,
+    GsVulkanDepthCt32Sprite &sprite) noexcept;
+
+// Publishes the exact framebuffer-only alpha-fail operation through the same
+// depth sprite ABI. The record carries FIX and optional DATE/DATM state while
+// forcing depthWrite to zero. Rejection preserves the caller's record.
+[[nodiscard]] GsBackendDecision
+prepareGsVulkanFramebufferOnlyAlphaFailDepthCt32Sprite(
     const GsDrawCommand &command,
     GsVulkanDepthCt32Sprite &sprite) noexcept;
 
@@ -849,6 +891,171 @@ prepareGsVulkanGouraudSourceOverDepthCt32Triangle(
     const GsDrawCommand &command,
     GsVulkanGouraudDepthCt32Triangle &triangle) noexcept;
 
+// Storage-buffer record for the dominant perspective T8 triangle contract.
+// Every floating-point field stores the exact host setup bit pattern. The
+// embedded palette is the GS frontend's decoded cached CLUT at submission
+// time; reading palette source VRAM later would be architecturally incorrect.
+struct alignas(16) GsVulkanT8GouraudDepthCt32Triangle
+{
+    uint32_t framebufferBaseBlock = 0u;
+    uint32_t framebufferWidth = 0u;
+    uint32_t boundsX0 = 0u;
+    uint32_t boundsY0 = 0u;
+    uint32_t boundsX1 = 0u;
+    uint32_t boundsY1 = 0u;
+    uint32_t depthBaseBlock = 0u;
+    uint32_t depthPsm = 0u;
+    uint32_t positiveArea = 0u;
+    uint32_t topLeftEdgeMask = 0u;
+    std::array<int32_t, 3> vertexX12_4{};
+    std::array<int32_t, 3> vertexY12_4{};
+    std::array<uint32_t, 3> vertexZ{};
+    std::array<uint32_t, 3> rgba{};
+    uint32_t vertexFog = 0u;
+    uint32_t fogColor = 0u;
+    std::array<uint32_t, 3> sBits{};
+    std::array<uint32_t, 3> tBits{};
+    std::array<uint32_t, 3> qBits{};
+    std::array<uint32_t, 4> colorDxBits{};
+    std::array<uint32_t, 4> colorDyBits{};
+    uint32_t fogDxBits = 0u;
+    uint32_t fogDyBits = 0u;
+    std::array<uint32_t, 3> textureDxBits{};
+    std::array<uint32_t, 3> textureDyBits{};
+    std::array<uint32_t, 2> depthDxBits{};
+    std::array<uint32_t, 2> depthDyBits{};
+    // Zero for a standalone record; resident records index their separately
+    // captured palette table here.
+    uint32_t paletteIndex = 0u;
+    uint32_t rasterFlags = 0u;
+    uint32_t reserved = 0u;
+    std::array<uint32_t, 8> textureBaseBlocks{};
+    std::array<uint32_t, 8> textureWidths{};
+    uint32_t textureWidthLog2 = 0u;
+    uint32_t textureHeightLog2 = 0u;
+    uint32_t maximumMipLevel = 0u;
+    uint32_t textureWrapU = 0u;
+    uint32_t textureWrapV = 0u;
+    int32_t lodK = 0;
+    uint32_t lodL = 0u;
+    uint32_t alphaReference = 0u;
+    std::array<uint32_t, 256> palette{};
+
+    bool operator==(
+        const GsVulkanT8GouraudDepthCt32Triangle &) const = default;
+};
+
+static_assert(sizeof(GsVulkanT8GouraudDepthCt32Triangle) == 1344u);
+static_assert(std::is_standard_layout_v<
+              GsVulkanT8GouraudDepthCt32Triangle>);
+static_assert(std::is_trivially_copyable_v<
+              GsVulkanT8GouraudDepthCt32Triangle>);
+static_assert(offsetof(
+    GsVulkanT8GouraudDepthCt32Triangle,
+    textureBaseBlocks) == 224u);
+static_assert(offsetof(
+    GsVulkanT8GouraudDepthCt32Triangle,
+    palette) == 320u);
+
+using GsVulkanT8Palette = std::array<uint32_t, 256>;
+
+inline constexpr uint32_t GS_VULKAN_T8_GOURAUD_FLAG_FOG = 1u << 0u;
+inline constexpr uint32_t GS_VULKAN_T8_GOURAUD_FLAG_DEPTH_GEQUAL =
+    1u << 1u;
+inline constexpr uint32_t GS_VULKAN_T8_GOURAUD_FLAG_DEPTH_WRITE =
+    1u << 2u;
+inline constexpr uint32_t GS_VULKAN_T8_GOURAUD_FLAG_ALPHA_FAIL_RGB_ONLY =
+    1u << 3u;
+inline constexpr uint32_t GS_VULKAN_T8_GOURAUD_FLAG_CONSTANT_Q_FIXED =
+    1u << 4u;
+inline constexpr uint32_t GS_VULKAN_T8_GOURAUD_VALID_FLAGS =
+    GS_VULKAN_T8_GOURAUD_FLAG_FOG |
+    GS_VULKAN_T8_GOURAUD_FLAG_DEPTH_GEQUAL |
+    GS_VULKAN_T8_GOURAUD_FLAG_DEPTH_WRITE |
+    GS_VULKAN_T8_GOURAUD_FLAG_ALPHA_FAIL_RGB_ONLY |
+    GS_VULKAN_T8_GOURAUD_FLAG_CONSTANT_Q_FIXED;
+
+// Compact resident record for the same exact T8 contract. Palettes are
+// captured once per distinct consecutive CLUT image and indexed explicitly
+// by each record. This keeps a 1 KiB immutable palette from
+// being copied and uploaded once for every tiny strip triangle.
+struct alignas(16) GsVulkanResidentT8GouraudDepthCt32Triangle
+{
+    uint32_t framebufferBaseBlock = 0u;
+    uint32_t framebufferWidth = 0u;
+    uint32_t boundsX0 = 0u;
+    uint32_t boundsY0 = 0u;
+    uint32_t boundsX1 = 0u;
+    uint32_t boundsY1 = 0u;
+    uint32_t depthBaseBlock = 0u;
+    uint32_t depthPsm = 0u;
+    uint32_t positiveArea = 0u;
+    uint32_t topLeftEdgeMask = 0u;
+    std::array<int32_t, 3> vertexX12_4{};
+    std::array<int32_t, 3> vertexY12_4{};
+    std::array<uint32_t, 3> vertexZ{};
+    std::array<uint32_t, 3> rgba{};
+    uint32_t vertexFog = 0u;
+    uint32_t fogColor = 0u;
+    std::array<uint32_t, 3> sBits{};
+    std::array<uint32_t, 3> tBits{};
+    std::array<uint32_t, 3> qBits{};
+    std::array<uint32_t, 4> colorDxBits{};
+    std::array<uint32_t, 4> colorDyBits{};
+    uint32_t fogDxBits = 0u;
+    uint32_t fogDyBits = 0u;
+    std::array<uint32_t, 3> textureDxBits{};
+    std::array<uint32_t, 3> textureDyBits{};
+    std::array<uint32_t, 2> depthDxBits{};
+    std::array<uint32_t, 2> depthDyBits{};
+    uint32_t paletteIndex = 0u;
+    // Per-record state permits exact batching of nearby GS contracts without
+    // multiplying pipelines. An unset depth-comparison bit means ALWAYS.
+    uint32_t rasterFlags = 0u;
+    uint32_t reserved = 0u;
+    std::array<uint32_t, 8> textureBaseBlocks{};
+    std::array<uint32_t, 8> textureWidths{};
+    uint32_t textureWidthLog2 = 0u;
+    uint32_t textureHeightLog2 = 0u;
+    uint32_t maximumMipLevel = 0u;
+    uint32_t textureWrapU = 0u;
+    uint32_t textureWrapV = 0u;
+    int32_t lodK = 0;
+    uint32_t lodL = 0u;
+    uint32_t alphaReference = 0u;
+
+    bool operator==(
+        const GsVulkanResidentT8GouraudDepthCt32Triangle &) const = default;
+};
+
+static_assert(
+    sizeof(GsVulkanResidentT8GouraudDepthCt32Triangle) == 320u);
+static_assert(std::is_standard_layout_v<
+              GsVulkanResidentT8GouraudDepthCt32Triangle>);
+static_assert(std::is_trivially_copyable_v<
+              GsVulkanResidentT8GouraudDepthCt32Triangle>);
+static_assert(offsetof(
+    GsVulkanResidentT8GouraudDepthCt32Triangle,
+    paletteIndex) == offsetof(
+        GsVulkanT8GouraudDepthCt32Triangle, paletteIndex));
+static_assert(offsetof(
+    GsVulkanResidentT8GouraudDepthCt32Triangle,
+    textureBaseBlocks) == 224u);
+
+[[nodiscard]] GsBackendDecision
+prepareGsVulkanT8GouraudSourceOverDepthCt32Triangle(
+    const GsDrawCommand &command,
+    std::span<const uint32_t> decodedPalette,
+    GsVulkanT8GouraudDepthCt32Triangle &triangle,
+    const GsDrawResources *classifiedResources = nullptr) noexcept;
+
+[[nodiscard]] GsBackendDecision
+prepareGsVulkanResidentT8GouraudSourceOverDepthCt32Triangle(
+    const GsDrawCommand &command,
+    uint32_t paletteIndex,
+    GsVulkanResidentT8GouraudDepthCt32Triangle &triangle,
+    const GsDrawResources *classifiedResources = nullptr) noexcept;
+
 // Narrow injectable execution seam used by the Phase 3 verification backend.
 // Production requests still enter through the single-owner service below.
 class IGsVulkanDrawExecutor
@@ -892,6 +1099,16 @@ public:
         const GsVulkanGouraudDepthCt32Triangle &triangle,
         std::vector<uint8_t> &output,
         std::string *error = nullptr) = 0;
+    [[nodiscard]] virtual bool executeT8GouraudDepthCt32Triangle(
+        std::span<const uint8_t>,
+        const GsVulkanT8GouraudDepthCt32Triangle &,
+        std::vector<uint8_t> &,
+        std::string *error = nullptr)
+    {
+        if (error)
+            *error = "T8 Gouraud depth triangle execution is unavailable";
+        return false;
+    }
     [[nodiscard]] virtual bool uploadVramPages(
         std::span<const uint8_t> source,
         const GsVramPageMask &pages,
@@ -940,6 +1157,30 @@ public:
     [[nodiscard]] virtual bool executeResidentCt32Triangles(
         std::span<const GsVulkanCt32Triangle> triangles,
         std::string *error = nullptr) = 0;
+    [[nodiscard]] virtual bool executeResidentT8GouraudDepthCt32Triangles(
+        std::span<const GsVulkanResidentT8GouraudDepthCt32Triangle>,
+        std::span<const GsVulkanT8Palette>,
+        std::string *error = nullptr)
+    {
+        if (error)
+            *error = "resident T8 Gouraud depth triangle execution is unavailable";
+        return false;
+    }
+    // The raster backend has already classified resource aliasing for these
+    // immutable records. Generic executors may retain the full public
+    // validation path; the production service can omit that duplicate page-
+    // range reconstruction while still validating every raw field.
+    [[nodiscard]] virtual bool
+    executePreparedResidentT8GouraudDepthCt32Triangles(
+        std::vector<GsVulkanResidentT8GouraudDepthCt32Triangle> triangles,
+        std::vector<GsVulkanT8Palette> palettes,
+        std::string *error = nullptr)
+    {
+        return executeResidentT8GouraudDepthCt32Triangles(
+            std::span<const GsVulkanResidentT8GouraudDepthCt32Triangle>(
+                triangles),
+            std::span<const GsVulkanT8Palette>(palettes), error);
+    }
     virtual void shutdown() noexcept = 0;
     [[nodiscard]] virtual GsVulkanCapabilityReport
     capabilities() const = 0;
@@ -1041,6 +1282,12 @@ public:
         std::vector<uint8_t> &output,
         std::string *error = nullptr) override;
 
+    [[nodiscard]] bool executeT8GouraudDepthCt32Triangle(
+        std::span<const uint8_t> input,
+        const GsVulkanT8GouraudDepthCt32Triangle &triangle,
+        std::vector<uint8_t> &output,
+        std::string *error = nullptr) override;
+
     // Copies only the selected 8 KiB physical pages between canonical CPU
     // storage and the persistent device-local VRAM allocation. The source and
     // destination still describe the exact 4 MiB GS address space; page data
@@ -1120,6 +1367,16 @@ public:
         std::span<const GsVulkanCt32Triangle> triangles,
         std::string *error = nullptr) override;
 
+    [[nodiscard]] bool executeResidentT8GouraudDepthCt32Triangles(
+        std::span<const GsVulkanResidentT8GouraudDepthCt32Triangle> triangles,
+        std::span<const GsVulkanT8Palette> palettes,
+        std::string *error = nullptr) override;
+    [[nodiscard]] bool
+    executePreparedResidentT8GouraudDepthCt32Triangles(
+        std::vector<GsVulkanResidentT8GouraudDepthCt32Triangle> triangles,
+        std::vector<GsVulkanT8Palette> palettes,
+        std::string *error = nullptr) override;
+
     // Idempotently drains accepted work and destroys every Vulkan object on
     // the owning worker before returning. The diagnostic snapshots remain
     // readable after shutdown.
@@ -1130,6 +1387,11 @@ public:
     [[nodiscard]] bool healthy() const override;
 
 private:
+    [[nodiscard]] bool executeResidentT8GouraudDepthCt32TrianglesImpl(
+        std::vector<GsVulkanResidentT8GouraudDepthCt32Triangle> triangles,
+        std::vector<GsVulkanT8Palette> palettes,
+        bool validateResourceViews,
+        std::string *error);
     struct Impl;
     explicit GsVulkanService(std::unique_ptr<Impl> impl);
     std::unique_ptr<Impl> m_impl;

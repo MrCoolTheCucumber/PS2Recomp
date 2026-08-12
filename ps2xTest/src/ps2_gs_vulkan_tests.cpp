@@ -362,6 +362,42 @@ namespace
             global);
     }
 
+    GsDrawCommand makeFramebufferOnlyAlphaFailCommand(
+        const GsDrawCommand &command,
+        uint64_t sequence,
+        uint8_t fixedAlpha,
+        bool destinationAlphaTest,
+        bool destinationAlphaMsb,
+        uint8_t alphaReference = 0u)
+    {
+        const GsDrawCommand blended = makeAlphaBlendCommand(
+            command,
+            sequence,
+            (static_cast<uint64_t>(fixedAlpha) << 32u) | 0x64u,
+            false,
+            true);
+        GSContext context = blended.context();
+        context.test =
+            1ull | // ATE=1, ATST=NEVER.
+            (static_cast<uint64_t>(alphaReference) << 4u) |
+            (1ull << 12u) | // AFAIL=FB_ONLY.
+            (1ull << 16u) | // ZTE=1.
+            (1ull << 17u);  // ZTST=ALWAYS.
+        if (destinationAlphaTest)
+        {
+            context.test |= 1ull << 14u;
+            if (destinationAlphaMsb)
+                context.test |= 1ull << 15u;
+        }
+        return buildGsDrawCommand(
+            sequence,
+            blended.primitive(),
+            context,
+            std::span<const GSVertex>(blended.vertices()).first(
+                blended.vertexCount()),
+            blended.globalState());
+    }
+
     GsDrawCommand makeDepthCt32SpriteCommand(
         uint64_t sequence,
         uint32_t framebufferPage,
@@ -744,6 +780,95 @@ namespace
             global);
     }
 
+    GsDrawCommand makeT8GouraudSourceOverDepthCt32TriangleCommand(
+        uint64_t sequence,
+        GSPrimType primitiveType = GS_PRIM_TRISTRIP)
+    {
+        GSPrimReg primitive{};
+        primitive.type = primitiveType;
+        primitive.iip = true;
+        primitive.tme = true;
+        primitive.fge = true;
+        primitive.abe = true;
+        primitive.fst = false;
+
+        GSContext context{};
+        context.frame = {80u, 4u, GS_PSM_CT32, 0u};
+        context.scissor = {0u, 31u, 0u, 31u};
+        context.tex0 = {
+            64u, 1u, GS_PSM_T8, 5u, 5u,
+            1u, 0u, 512u, GS_PSM_CT32, 0u, 0u, 4u};
+        context.xyoffset = {0u, 0u};
+        context.zbuf = {100u, GS_PSM_Z24, false};
+        // LCM=0, MXL=2, MMAG=LINEAR, MMIN=LINEAR_MIPMAP_NEAREST,
+        // L=1, K=-110/16.
+        context.tex1 =
+            (2ull << 2u) |
+            (1ull << 5u) |
+            (4ull << 6u) |
+            (1ull << 19u) |
+            (0xF92ull << 32u);
+        const auto mip = [](uint32_t baseBlock, uint32_t width)
+        {
+            return static_cast<uint64_t>(baseBlock) |
+                   (static_cast<uint64_t>(width) << 14u);
+        };
+        context.miptbp1 = mip(128u, 1u) | (mip(192u, 1u) << 20u);
+        context.clamp = 1ull << 2u; // REPEAT U, CLAMP V.
+        context.alpha = 0x2000000044ull;
+        // ATE=1, ATST=GEQUAL, AREF=12, AFAIL=RGB_ONLY,
+        // DATE=0, ZTE=1, ZTST=GEQUAL.
+        context.test = 0x530CBull;
+
+        GsDrawGlobalState global{};
+        global.texa = {0u, false, 128u};
+        global.fogColor = 0x002F1A0Fu;
+        global.colorClamp = true;
+
+        constexpr std::array<uint16_t, 3> rawX{{81u, 405u, 137u}};
+        constexpr std::array<uint16_t, 3> rawY{{65u, 99u, 375u}};
+        constexpr std::array<uint32_t, 3> rgba{{
+            0x305020E0u,
+            0xC0D04030u,
+            0x8040E090u,
+        }};
+        constexpr std::array<uint32_t, 3> depth{{
+            0x002010u,
+            0x00A000u,
+            0x005800u,
+        }};
+        constexpr std::array<float, 3> s{{0.125f, 1.25f, -0.25f}};
+        constexpr std::array<float, 3> t{{0.25f, 0.5f, 1.5f}};
+        constexpr std::array<float, 3> q{{0.75f, 1.5f, 0.5f}};
+        constexpr std::array<uint8_t, 3> fog{{16u, 220u, 96u}};
+
+        std::array<GSVertex, 3> vertices{};
+        for (size_t index = 0u; index < vertices.size(); ++index)
+        {
+            GSVertex &vertex = vertices[index];
+            vertex.x12_4 = rawX[index];
+            vertex.y12_4 = rawY[index];
+            vertex.x = static_cast<float>(rawX[index]) / 16.0f;
+            vertex.y = static_cast<float>(rawY[index]) / 16.0f;
+            vertex.zInteger = depth[index];
+            vertex.z = static_cast<double>(depth[index]);
+            vertex.r = static_cast<uint8_t>(rgba[index]);
+            vertex.g = static_cast<uint8_t>(rgba[index] >> 8u);
+            vertex.b = static_cast<uint8_t>(rgba[index] >> 16u);
+            vertex.a = static_cast<uint8_t>(rgba[index] >> 24u);
+            vertex.s = s[index];
+            vertex.t = t[index];
+            vertex.q = q[index];
+            vertex.fog = fog[index];
+        }
+        return buildGsDrawCommand(
+            sequence,
+            primitive,
+            context,
+            std::span<const GSVertex>(vertices),
+            global);
+    }
+
     void applyCt32SpriteCpu(
         std::vector<uint8_t> &vram,
         const GsVulkanCt32Sprite &sprite)
@@ -773,6 +898,14 @@ namespace
             decision = prepareGsVulkanSourceOverDepthCt32Sprite(
                 command, sprite);
         }
+        if (!decision.supported)
+        {
+            const GsBackendDecision framebufferOnlyDecision =
+                prepareGsVulkanFramebufferOnlyAlphaFailDepthCt32Sprite(
+                    command, sprite);
+            if (framebufferOnlyDecision.supported)
+                decision = framebufferOnlyDecision;
+        }
         return decision;
     }
 
@@ -780,11 +913,11 @@ namespace
         std::vector<uint8_t> &vram,
         const GsVulkanDepthCt32Sprite &sprite)
     {
-        const auto blendSourceOver = [](
-            uint32_t source, uint32_t destination)
+        const auto blendRgb = [](
+            uint32_t source, uint32_t destination, uint32_t factor)
         {
             uint32_t result = source & 0xFF000000u;
-            const int alpha = static_cast<int>(source >> 24u);
+            const int alpha = static_cast<int>(factor);
             for (uint32_t shift = 0u; shift < 24u; shift += 8u)
             {
                 const int sourceChannel = static_cast<int>(
@@ -842,17 +975,50 @@ namespace
                      sprite.depth > currentDepth);
                 if (!passes)
                     continue;
-                const uint32_t color =
-                    sprite.colorBlendMode ==
-                            GS_VULKAN_DEPTH_CT32_COLOR_SOURCE_OVER
-                        ? blendSourceOver(
-                              sprite.rgba,
-                              GSMem::ReadCT32(
-                                  vram.data(),
-                                  sprite.framebufferBaseBlock,
-                                  sprite.framebufferWidth,
-                                  x, y))
-                        : sprite.rgba;
+                const uint32_t colorOperation =
+                    sprite.colorBlendMode &
+                    GS_VULKAN_DEPTH_CT32_COLOR_OPERATION_MASK;
+                const bool destinationAlphaTest =
+                    (sprite.colorBlendMode &
+                     GS_VULKAN_DEPTH_CT32_COLOR_DATE) != 0u;
+                const uint32_t destination =
+                    colorOperation !=
+                            GS_VULKAN_DEPTH_CT32_COLOR_SOURCE_COPY ||
+                        destinationAlphaTest
+                    ? GSMem::ReadCT32(
+                          vram.data(),
+                          sprite.framebufferBaseBlock,
+                          sprite.framebufferWidth,
+                          x, y)
+                    : 0u;
+                if (destinationAlphaTest)
+                {
+                    const uint32_t expectedAlphaMsb =
+                        (sprite.colorBlendMode &
+                         GS_VULKAN_DEPTH_CT32_COLOR_DATM) != 0u
+                        ? 1u
+                        : 0u;
+                    if (((destination >> 31u) & 1u) != expectedAlphaMsb)
+                        continue;
+                }
+                uint32_t color = sprite.rgba;
+                if (colorOperation ==
+                    GS_VULKAN_DEPTH_CT32_COLOR_SOURCE_OVER)
+                {
+                    color = blendRgb(
+                        sprite.rgba, destination,
+                        sprite.rgba >> 24u);
+                }
+                else if (colorOperation ==
+                         GS_VULKAN_DEPTH_CT32_COLOR_FIXED_ALPHA)
+                {
+                    const uint32_t factor =
+                        (sprite.colorBlendMode &
+                         GS_VULKAN_DEPTH_CT32_COLOR_FIXED_ALPHA_MASK) >>
+                        GS_VULKAN_DEPTH_CT32_COLOR_FIXED_ALPHA_SHIFT;
+                    color = blendRgb(
+                        sprite.rgba, destination, factor);
+                }
                 GSMem::WriteCT32(
                     vram.data(),
                     sprite.framebufferBaseBlock,
@@ -1841,6 +2007,48 @@ namespace
         }
     }
 
+    void drawT8GouraudDepthCt32TriangleCommand(
+        GS &gs,
+        const GsDrawCommand &command)
+    {
+        configureNearestCt32SpriteCommand(gs, command);
+        const GsDrawGlobalState &global = command.globalState();
+        const uint64_t texa =
+            static_cast<uint64_t>(global.texa.ta0) |
+            (static_cast<uint64_t>(global.texa.aem) << 15u) |
+            (static_cast<uint64_t>(global.texa.ta1) << 32u);
+        gs.writeRegister(GS_REG_TEXA, texa);
+        gs.writeRegister(GS_REG_FOGCOL, global.fogColor);
+
+        for (size_t index = 0u; index < command.vertexCount(); ++index)
+        {
+            const GSVertex &vertex = command.vertices()[index];
+            const uint32_t rgba =
+                static_cast<uint32_t>(vertex.r) |
+                (static_cast<uint32_t>(vertex.g) << 8u) |
+                (static_cast<uint32_t>(vertex.b) << 16u) |
+                (static_cast<uint32_t>(vertex.a) << 24u);
+            const uint64_t rgbaq =
+                static_cast<uint64_t>(rgba) |
+                (static_cast<uint64_t>(
+                    std::bit_cast<uint32_t>(vertex.q)) << 32u);
+            const uint64_t st =
+                static_cast<uint64_t>(
+                    std::bit_cast<uint32_t>(vertex.s)) |
+                (static_cast<uint64_t>(
+                    std::bit_cast<uint32_t>(vertex.t)) << 32u);
+            const uint64_t xyzf =
+                static_cast<uint64_t>(vertex.x12_4) |
+                (static_cast<uint64_t>(vertex.y12_4) << 16u) |
+                (static_cast<uint64_t>(
+                    vertex.zInteger & 0x00FFFFFFu) << 32u) |
+                (static_cast<uint64_t>(vertex.fog) << 56u);
+            gs.writeRegister(GS_REG_RGBAQ, rgbaq);
+            gs.writeRegister(GS_REG_ST, st);
+            gs.writeRegister(GS_REG_XYZF2, xyzf);
+        }
+    }
+
     void drawFlatCt32Point(
         GS &gs, uint16_t x, uint16_t y, uint32_t rgba)
     {
@@ -2011,7 +2219,8 @@ namespace
             bool exactNearestCt32Sprite_ = true,
             bool exactLinearCt32Sprite_ = true,
             bool exactDepthCt32Sprite_ = true,
-            bool exactFeedbackLinearDepthCt32Sprite_ = true)
+            bool exactFeedbackLinearDepthCt32Sprite_ = true,
+            bool exactT8GouraudDepthCt32Triangle_ = false)
             : behavior(behavior_)
         {
             report.compiled = true;
@@ -2033,6 +2242,8 @@ namespace
             report.devices[0].exactFeedbackLinearDepthCt32Sprite =
                 exactLinearCt32Sprite_ && exactDepthCt32Sprite_ &&
                 exactFeedbackLinearDepthCt32Sprite_;
+            report.devices[0].exactT8GouraudDepthCt32Triangle =
+                exactT8GouraudDepthCt32Triangle_;
         }
 
         void setExactGouraudDepthCt32Triangle(bool exact) noexcept
@@ -2310,6 +2521,55 @@ namespace
             ++serviceStatistics.queueSubmissions;
             ++serviceStatistics.shaderDispatches;
             serviceStatistics.pipelineBarriers += 6u;
+            ++serviceStatistics.pipelineBinds;
+            ++serviceStatistics.pipelineCacheHits;
+            ++serviceStatistics.fenceWaits;
+            if (error)
+                error->clear();
+            return true;
+        }
+
+        bool executeResidentT8GouraudDepthCt32Triangles(
+            std::span<const GsVulkanResidentT8GouraudDepthCt32Triangle> triangles,
+            std::span<const GsVulkanT8Palette> palettes,
+            std::string *error) override
+        {
+            if (!isHealthy || behavior == Behavior::Fail ||
+                behavior == Behavior::FailResidentDraw ||
+                behavior == Behavior::InvalidOutput ||
+                triangles.empty() ||
+                palettes.empty() ||
+                std::any_of(
+                    triangles.begin(), triangles.end(),
+                    [&](const auto &triangle)
+                    {
+                        return triangle.paletteIndex >= palettes.size();
+                    }) ||
+                !report.devices[0].exactT8GouraudDepthCt32Triangle)
+            {
+                serviceStatistics
+                    .t8GouraudDepthCt32TriangleDrawsFailed +=
+                    triangles.size();
+                ++serviceStatistics
+                      .residentT8GouraudDepthCt32TriangleBatchesFailed;
+                if (error)
+                    *error = "injected resident T8 triangle failure";
+                return false;
+            }
+            serviceStatistics
+                .t8GouraudDepthCt32TriangleDrawsCompleted +=
+                triangles.size();
+            ++serviceStatistics
+                  .residentT8GouraudDepthCt32TriangleBatchesCompleted;
+            serviceStatistics
+                .largestResidentT8GouraudDepthCt32TriangleBatch =
+                std::max(
+                    serviceStatistics
+                        .largestResidentT8GouraudDepthCt32TriangleBatch,
+                    static_cast<uint64_t>(triangles.size()));
+            ++serviceStatistics.queueSubmissions;
+            ++serviceStatistics.shaderDispatches;
+            serviceStatistics.pipelineBarriers += 3u;
             ++serviceStatistics.pipelineBinds;
             ++serviceStatistics.pipelineCacheHits;
             ++serviceStatistics.fenceWaits;
@@ -2839,7 +3099,7 @@ void register_ps2_gs_vulkan_tests()
                      "the fixed 64-thread kernel should cover every 4 MiB word");
             t.Equals(GS_VULKAN_MAX_MEMORY_CASES, 65536u,
                      "memory conformance batches should have a fixed host bound");
-            t.Equals(GS_VULKAN_MAX_RESIDENT_SPRITE_BATCH, size_t{64u},
+            t.Equals(GS_VULKAN_MAX_RESIDENT_SPRITE_BATCH, size_t{1024u},
                      "resident sprite batches should have a fixed host bound");
             t.Equals(GS_VULKAN_MAX_RESIDENT_NEAREST_CT32_BATCH,
                      GS_VULKAN_MAX_RESIDENT_SPRITE_BATCH,
@@ -3483,6 +3743,113 @@ void register_ps2_gs_vulkan_tests()
                     sentinel == expectedSentinel,
                     "rejected source-over preparation must preserve caller output");
             }
+        });
+
+        tc.Run("framebuffer-only alpha failure retains FIX DATE and suppresses depth", [](TestCase &t)
+        {
+            GSMem::InitLookupTables();
+            const GsDrawCommand opaque = makeDepthCt32SpriteCommand(
+                55u, 112u, 8u, 216u, GS_PSM_Z24, false, 1u,
+                {0u, 63u, 0u, 31u}, {0u, 0u},
+                17u, 17u, 1009u, 497u,
+                0x7F808080u, 0x00123456u);
+            const std::array<GsDrawCommand, 2> commands{{
+                makeFramebufferOnlyAlphaFailCommand(
+                    opaque, 56u, 0u, false, false),
+                makeFramebufferOnlyAlphaFailCommand(
+                    opaque, 57u, 32u, true, true, 128u),
+            }};
+            const std::array<uint32_t, 2> expectedDescriptors{{
+                GS_VULKAN_DEPTH_CT32_COLOR_FIXED_ALPHA,
+                GS_VULKAN_DEPTH_CT32_COLOR_FIXED_ALPHA |
+                    (32u <<
+                     GS_VULKAN_DEPTH_CT32_COLOR_FIXED_ALPHA_SHIFT) |
+                    GS_VULKAN_DEPTH_CT32_COLOR_DATE |
+                    GS_VULKAN_DEPTH_CT32_COLOR_DATM,
+            }};
+
+            for (size_t index = 0u; index < commands.size(); ++index)
+            {
+                const GsDrawCommand &command = commands[index];
+                t.IsTrue(
+                    command.resources().readsDestination,
+                    "fixed blending should expose its framebuffer dependency");
+                t.IsFalse(
+                    classifyGsDepthCt32Sprite(command).supported,
+                    "alpha failure must not widen the opaque depth contract");
+                t.IsFalse(
+                    classifyGsSourceOverDepthCt32Sprite(command).supported,
+                    "fixed blending must not widen source-over");
+                t.IsTrue(
+                    classifyGsFramebufferOnlyAlphaFailDepthCt32Sprite(
+                        command).supported,
+                    "the exact framebuffer-only alpha failure should classify");
+
+                GsVulkanDepthCt32Sprite sprite{
+                    1u, 2u, 3u, 4u, 5u, 6u, 7u, 8u,
+                    9u, 10u, 11u, 12u, 13u, 14u, 15u, 16u};
+                const GsBackendDecision decision =
+                    prepareGsVulkanFramebufferOnlyAlphaFailDepthCt32Sprite(
+                        command, sprite);
+                t.IsTrue(
+                    decision.supported,
+                    "the exact framebuffer-only operation should prepare");
+                t.Equals(
+                    sprite.colorBlendMode,
+                    expectedDescriptors[index],
+                    "the record should retain FIX and canonical DATE/DATM");
+                t.Equals(
+                    sprite.depthTestMethod, 1u,
+                    "the record should retain the always-pass depth method");
+                t.Equals(
+                    sprite.depthWrite, 0u,
+                    "AFAIL=FB_ONLY must suppress depth writes despite clear ZMASK");
+                if (!decision.supported)
+                    continue;
+
+                std::vector<uint8_t> actual = makeVramPattern(
+                    0xFB0A0000u + static_cast<uint32_t>(index));
+                std::vector<uint8_t> expected = actual;
+                applyDepthCt32SpriteCpu(expected, sprite);
+                GS gs;
+                gs.init(
+                    actual.data(),
+                    static_cast<uint32_t>(actual.size()),
+                    nullptr);
+                gs.setDebugHistoryPaused(true);
+                drawNearestCt32SpriteCommand(gs, command);
+                gs.flushRenderBatch();
+                if (actual != expected)
+                {
+                    const auto mismatch = std::mismatch(
+                        actual.begin(), actual.end(), expected.begin());
+                    t.Fail(
+                        "framebuffer-only alpha-fail record diverged from software case " +
+                        std::to_string(index) + " at byte " +
+                        std::to_string(mismatch.first - actual.begin()));
+                }
+            }
+
+            GSContext rejectedContext = commands.front().context();
+            rejectedContext.test &= ~(0x3ull << 12u); // AFAIL=KEEP.
+            const GsDrawCommand rejected = buildGsDrawCommand(
+                58u,
+                commands.front().primitive(),
+                rejectedContext,
+                std::span<const GSVertex>(commands.front().vertices())
+                    .first(commands.front().vertexCount()),
+                commands.front().globalState());
+            GsVulkanDepthCt32Sprite sentinel{
+                1u, 2u, 3u, 4u, 5u, 6u, 7u, 8u,
+                9u, 10u, 11u, 12u, 13u, 14u, 15u, 16u};
+            const GsVulkanDepthCt32Sprite expectedSentinel = sentinel;
+            t.IsFalse(
+                prepareGsVulkanFramebufferOnlyAlphaFailDepthCt32Sprite(
+                    rejected, sentinel).supported,
+                "a different alpha failure action must remain outside the contract");
+            t.IsTrue(
+                sentinel == expectedSentinel,
+                "rejected framebuffer-only preparation must preserve caller output");
         });
 
         tc.Run("depth CT32 prepared record matches the production software GS", [](TestCase &t)
@@ -4889,6 +5256,171 @@ void register_ps2_gs_vulkan_tests()
                     nonNormalizable).reason,
                 GsFallbackReason::AlphaBlend,
                 "source-over must stay destination-dependent away from alpha 128");
+        });
+
+        tc.Run("Perspective T8 Gouraud triangle preparation retains exact mip and palette state", [](TestCase &t)
+        {
+            const GsDrawCommand command =
+                makeT8GouraudSourceOverDepthCt32TriangleCommand(34u);
+            std::array<uint32_t, 256> palette{};
+            for (uint32_t index = 0u; index < palette.size(); ++index)
+            {
+                palette[index] =
+                    ((index * 17u) & 0xFFu) |
+                    (((index * 29u) & 0xFFu) << 8u) |
+                    (((index * 43u) & 0xFFu) << 16u) |
+                    ((32u + (index % 192u)) << 24u);
+            }
+
+            GsVulkanT8GouraudDepthCt32Triangle triangle{};
+            triangle.framebufferBaseBlock = 0xDEADu;
+            triangle.palette.fill(0xA5A5A5A5u);
+            const GsBackendDecision decision =
+                prepareGsVulkanT8GouraudSourceOverDepthCt32Triangle(
+                    command, palette, triangle);
+            t.IsTrue(decision.supported,
+                     "the measured perspective T8 strip state should be eligible");
+            t.Equals(decision.reason, GsFallbackReason::Supported,
+                     "eligible T8 preparation should retain the canonical reason");
+            t.Equals(triangle.framebufferBaseBlock, 2560u,
+                     "FRAME page units should become 256-byte blocks");
+            t.Equals(triangle.framebufferWidth, 4u,
+                     "T8 preparation should retain FRAME width");
+            t.Equals(triangle.depthBaseBlock, 3200u,
+                     "ZBUF page units should become 256-byte blocks");
+            t.Equals(triangle.depthPsm,
+                     static_cast<uint32_t>(GS_PSM_Z24),
+                     "T8 preparation should retain Z24 depth");
+            t.Equals(triangle.textureBaseBlocks[0], 64u,
+                     "the base texture level should retain TEX0 TBP0");
+            t.Equals(triangle.textureBaseBlocks[1], 128u,
+                     "mip level one should retain MIPTBP1 TBP1");
+            t.Equals(triangle.textureBaseBlocks[2], 192u,
+                     "mip level two should retain MIPTBP1 TBP2");
+            t.Equals(triangle.textureWidths[0], 1u,
+                     "the base texture level should retain TBW");
+            t.Equals(triangle.textureWidths[1], 1u,
+                     "mip level one should retain TBW1");
+            t.Equals(triangle.textureWidths[2], 1u,
+                     "mip level two should retain TBW2");
+            t.Equals(triangle.maximumMipLevel, 2u,
+                     "the prepared record should retain MXL");
+            t.Equals(triangle.textureWrapU, 0u,
+                     "the prepared record should retain REPEAT U");
+            t.Equals(triangle.textureWrapV, 1u,
+                     "the prepared record should retain CLAMP V");
+            t.Equals(triangle.lodK, -110,
+                     "the signed TEX1 K field should be sign-extended");
+            t.Equals(triangle.lodL, 1u,
+                     "the prepared record should retain TEX1 L");
+            t.Equals(triangle.alphaReference, 12u,
+                     "the prepared record should retain alpha-test AREF");
+            t.Equals(triangle.vertexFog,
+                     16u | (220u << 8u) | (96u << 16u),
+                     "all three fog coefficients should remain ordered");
+            t.Equals(triangle.fogColor, 0x002F1A0Fu,
+                     "the prepared record should retain FOGCOL");
+            t.Equals(
+                triangle.sBits[0],
+                std::bit_cast<uint32_t>(0.125f *
+                    static_cast<float>(65536u << 5u)),
+                "S should be scaled once with the exact host float product");
+            t.Equals(triangle.qBits[1],
+                     std::bit_cast<uint32_t>(1.5f),
+                     "perspective Q should retain its exact input bits");
+            t.IsTrue(triangle.vertexZ[0] != triangle.vertexZ[1] &&
+                         triangle.vertexZ[1] != triangle.vertexZ[2],
+                     "the exact contract should retain varying integer Z");
+            t.IsTrue(triangle.palette == palette,
+                     "the submission-time decoded CLUT must be embedded verbatim");
+            t.Equals(triangle.paletteIndex, 0u,
+                     "a standalone record should use its embedded palette");
+            t.Equals(
+                triangle.rasterFlags,
+                GS_VULKAN_T8_GOURAUD_FLAG_FOG |
+                    GS_VULKAN_T8_GOURAUD_FLAG_DEPTH_GEQUAL |
+                    GS_VULKAN_T8_GOURAUD_FLAG_DEPTH_WRITE |
+                    GS_VULKAN_T8_GOURAUD_FLAG_ALPHA_FAIL_RGB_ONLY,
+                "preparation should retain fog, depth, and alpha-fail state");
+            t.Equals(triangle.reserved, 0u,
+                     "prepared ABI padding must remain deterministic");
+
+            GSPrimReg framebufferOnlyPrimitive = command.primitive();
+            framebufferOnlyPrimitive.type = GS_PRIM_TRIANGLE;
+            framebufferOnlyPrimitive.fge = false;
+            GSContext framebufferOnlyContext = command.context();
+            framebufferOnlyContext.zbuf.zmask = true;
+            // MXL=0, MMAG=LINEAR, MMIN=LINEAR, MTBA=1. With constant Q,
+            // software converts the biased scanline DDA to integers in
+            // three independent parts.
+            framebufferOnlyContext.tex1 =
+                (1ull << 5u) | (1ull << 6u) | (1ull << 9u);
+            // ATE=1, ATST=NEVER, AFAIL=FB_ONLY, DATE=0,
+            // ZTE=1, ZTST=ALWAYS.
+            framebufferOnlyContext.test = 0x3180Bull;
+            std::array<GSVertex, 3> constantQVertices = command.vertices();
+            for (GSVertex &vertex : constantQVertices)
+                vertex.q = 1.0f;
+            const GsDrawCommand framebufferOnly = buildGsDrawCommand(
+                35u,
+                framebufferOnlyPrimitive,
+                framebufferOnlyContext,
+                std::span<const GSVertex>(constantQVertices),
+                command.globalState());
+            GsVulkanT8GouraudDepthCt32Triangle framebufferOnlyRecord{};
+            const GsBackendDecision framebufferOnlyDecision =
+                prepareGsVulkanT8GouraudSourceOverDepthCt32Triangle(
+                    framebufferOnly, palette, framebufferOnlyRecord);
+            t.IsTrue(framebufferOnlyDecision.supported,
+                     "the exact constant-Q framebuffer-only variant should be eligible");
+            t.Equals(
+                framebufferOnlyRecord.rasterFlags,
+                GS_VULKAN_T8_GOURAUD_FLAG_CONSTANT_Q_FIXED,
+                "the nearby state should disable fog and depth while retaining split fixed DDA setup");
+            t.Equals(
+                framebufferOnlyRecord.sBits[0],
+                std::bit_cast<uint32_t>(
+                    constantQVertices[0].s *
+                        static_cast<float>(65536u << 5u) -
+                    32768.0f),
+                "constant-Q setup should capture the pre-biased fixed S seed");
+
+            const GsVulkanT8GouraudDepthCt32Triangle sentinel = triangle;
+            const GsBackendDecision shortPalette =
+                prepareGsVulkanT8GouraudSourceOverDepthCt32Triangle(
+                    command,
+                    std::span<const uint32_t>(palette).first(255u),
+                    triangle);
+            t.Equals(shortPalette.reason,
+                     GsFallbackReason::BackendUnavailable,
+                     "an incomplete decoded CLUT should fail before publication");
+            t.IsTrue(triangle == sentinel,
+                     "decoded-CLUT rejection must leave the prior record untouched");
+
+            GSPrimReg fixedCoordinates = command.primitive();
+            fixedCoordinates.fst = true;
+            const GsDrawCommand rejectedCoordinates = buildGsDrawCommand(
+                35u, fixedCoordinates, command.context(),
+                std::span<const GSVertex>(command.vertices()),
+                command.globalState());
+            t.Equals(
+                classifyGsT8GouraudSourceOverDepthCt32Triangle(
+                    rejectedCoordinates).reason,
+                GsFallbackReason::UnsupportedPrimitiveState,
+                "the perspective contract must reject fixed UV coordinates");
+
+            GSContext nearestMip = command.context();
+            nearestMip.tex1 &= ~(0x7ull << 6u);
+            nearestMip.tex1 |= 1ull << 6u;
+            const GsDrawCommand rejectedFilter = buildGsDrawCommand(
+                36u, command.primitive(), nearestMip,
+                std::span<const GSVertex>(command.vertices()),
+                command.globalState());
+            t.Equals(
+                classifyGsT8GouraudSourceOverDepthCt32Triangle(
+                    rejectedFilter).reason,
+                GsFallbackReason::UnsupportedTextureFilter,
+                "a different MMIN mode should remain in software fallback");
         });
 
         tc.Run("Gouraud depth triangle record oracle matches software rasterization", [](TestCase &t)
@@ -6790,6 +7322,113 @@ void register_ps2_gs_vulkan_tests()
             }
         });
 
+        tc.Run("Vulkan Hybrid defers framebuffer-only alpha-fail runs by aggregate work", [](TestCase &t)
+        {
+            GSMem::InitLookupTables();
+            const GsDrawCommand opaque = makeDepthCt32SpriteCommand(
+                30'330u, 112u, 8u, 216u, GS_PSM_Z24, false, 1u,
+                {0u, 511u, 0u, 415u},
+                {1792u * 16u, 1840u * 16u},
+                1792u * 16u - 8u, 1840u * 16u - 8u,
+                (1792u + 32u) * 16u - 8u,
+                (1840u + 416u) * 16u - 8u,
+                0x7F808080u, 0u);
+            const std::array<GsDrawCommand, 2> commands{{
+                makeFramebufferOnlyAlphaFailCommand(
+                    opaque, 30'331u, 0u, false, false),
+                makeFramebufferOnlyAlphaFailCommand(
+                    opaque, 30'332u, 32u, true, true, 128u),
+            }};
+            for (const GsDrawCommand &command : commands)
+            {
+                GsVulkanDepthCt32Sprite prepared{};
+                t.IsTrue(
+                    prepareGsVulkanFramebufferOnlyAlphaFailDepthCt32Sprite(
+                        command, prepared).supported,
+                    "every aggregate alpha-fail fixture should prepare");
+            }
+
+            std::vector<uint8_t> vram =
+                makeVramPattern(0x48594146u);
+            GsVulkanRasterBackendConfig config{};
+            config.mode = GsRendererMode::Hybrid;
+            t.Equals(
+                config
+                    .minimumHybridFramebufferOnlyAlphaFailDepthCt32RunPixels,
+                212'480ull,
+                "alpha-fail Hybrid should retain the resident-run crossover");
+            std::unique_ptr<GsVulkanRasterBackend> backend =
+                GsVulkanRasterBackend::createWithExecutor(
+                    std::make_unique<FakeCt32Executor>(
+                        FakeCt32Executor::Behavior::Exact),
+                    config, vram, [](const GsDrawCommand &) {}, {},
+                    nullptr);
+            t.IsNotNull(
+                backend.get(),
+                "an exact depth executor should create alpha-fail Hybrid mode");
+            if (!backend)
+                return;
+
+            t.IsTrue(
+                backend->classify(commands.front()).supported,
+                "aggregate admission must expose each semantic run member");
+            const GsHybridBatchPolicy policy =
+                backend->hybridBatchPolicy(commands.front());
+            t.IsTrue(
+                policy.deferred(),
+                "the alpha-fail policy should defer isolated small draws");
+            t.Equals(
+                policy.minimumPixels, 212'480ull,
+                "the alpha-fail policy should publish its aggregate work floor");
+            t.Equals(
+                policy.maximumCommands,
+                config.maximumResidentBatchCommands,
+                "the alpha-fail run should share the resident service bound");
+            t.IsTrue(
+                backend->hybridBatchCompatible(commands[0], commands[1]),
+                "FIX and DATE may vary within one resident alpha-fail run");
+            t.IsFalse(
+                backend->hybridBatchCompatible(commands[1], opaque),
+                "a different depth color contract should end the deferred run");
+
+            t.IsTrue(
+                backend->setMode(GsRendererMode::GpuStrict),
+                "the alpha-fail policy fixture should enter strict mode");
+            t.IsFalse(
+                backend->hybridBatchPolicy(commands.front()).deferred(),
+                "strict mode should admit exact alpha-fail work immediately");
+            t.IsTrue(
+                backend->setMode(GsRendererMode::Verify),
+                "the alpha-fail policy fixture should enter Verify mode");
+            t.IsFalse(
+                backend->hybridBatchPolicy(commands.front()).deferred(),
+                "Verify should not borrow the Hybrid aggregate floor");
+
+            GsVulkanRasterBackendConfig disabledConfig = config;
+            disabledConfig
+                .minimumHybridFramebufferOnlyAlphaFailDepthCt32RunPixels =
+                0u;
+            std::vector<uint8_t> disabledVram = vram;
+            std::unique_ptr<GsVulkanRasterBackend> disabled =
+                GsVulkanRasterBackend::createWithExecutor(
+                    std::make_unique<FakeCt32Executor>(
+                        FakeCt32Executor::Behavior::Exact),
+                    disabledConfig, disabledVram,
+                    [](const GsDrawCommand &) {}, {}, nullptr);
+            t.IsNotNull(
+                disabled.get(),
+                "a zero-threshold alpha-fail Hybrid should construct");
+            if (disabled)
+            {
+                t.IsTrue(
+                    disabled->classify(commands.front()).supported,
+                    "zero should preserve semantic alpha-fail support");
+                t.IsFalse(
+                    disabled->hybridBatchPolicy(commands.front()).deferred(),
+                    "zero should admit an exact alpha-fail draw immediately");
+            }
+        });
+
         tc.Run("Vulkan strict backend keeps ordered depth CT32 sprites resident", [](TestCase &t)
         {
             GSMem::InitLookupTables();
@@ -8322,6 +8961,59 @@ void register_ps2_gs_vulkan_tests()
             t.Equals(statistics.pageOwnership.gpuNewerPages,
                      static_cast<size_t>(0u),
                      "the final observation should leave no hidden GPU writer");
+        });
+
+        tc.Run("Vulkan T8 resident work survives read-only CPU access to sampled pages", [](TestCase &t)
+        {
+            GSMem::InitLookupTables();
+            const GsDrawCommand command =
+                makeT8GouraudSourceOverDepthCt32TriangleCommand(30'200u);
+            const GsDrawResources resources = command.resources();
+            GsVramPageMask textureReads = resources.texturePages;
+            textureReads.unionWith(resources.mipPages);
+            t.IsTrue(textureReads.any(),
+                     "the T8 fixture should expose sampled texture pages");
+
+            std::vector<uint8_t> vram = makeVramPattern(0x54385252u);
+            std::array<uint32_t, 256> palette{};
+            auto executor = std::make_unique<FakeCt32Executor>(
+                FakeCt32Executor::Behavior::Exact,
+                true, true, true, true, true, true);
+            std::unique_ptr<GsVulkanRasterBackend> backend =
+                GsVulkanRasterBackend::createWithExecutor(
+                    std::move(executor),
+                    GsVulkanRasterBackendConfig{
+                        GsRendererMode::Hybrid, {}},
+                    vram, [](const GsDrawCommand &) {},
+                    [](const GsDrawCommand &) {}, nullptr, {},
+                    [&]() -> GsVulkanDecodedPalette
+                    {
+                        return {palette};
+                    });
+            t.IsNotNull(backend.get(),
+                        "the T8 read/read coherency fixture should construct");
+            if (!backend)
+                return;
+
+            backend->submit(
+                std::span<const GsDrawCommand>(&command, 1u));
+            t.Equals(backend->pendingCommandCount(), static_cast<size_t>(1u),
+                     "the accepted T8 draw should remain resident");
+
+            GsVramPageMask noWrites;
+            backend->prepareCpuVramAccess(
+                textureReads, noWrites, GsFlushReason::ClutHazard);
+            t.Equals(backend->pendingCommandCount(), static_cast<size_t>(1u),
+                     "CPU read and pending GPU read must not conflict");
+            t.Equals(backend->serviceStatistics().queueSubmissions, 0ull,
+                     "read/read coherence should not submit the resident batch");
+
+            backend->prepareCpuVramAccess(
+                noWrites, textureReads, GsFlushReason::Transfer);
+            t.Equals(backend->pendingCommandCount(), static_cast<size_t>(0u),
+                     "CPU write to a sampled page must drain pending GPU reads");
+            t.Equals(backend->serviceStatistics().queueSubmissions, 2ull,
+                     "the conflicting write should upload inputs and execute one batch");
         });
 
         tc.Run("Vulkan resident queue drains at its configured bound", [](TestCase &t)
@@ -16420,8 +17112,8 @@ void register_ps2_gs_vulkan_tests()
             invalid.depthTestMethod = 0u;
             expectRejected(gpu, invalid, "unsupported depth sprite method");
             invalid = sprites.front();
-            invalid.depthWrite = 0u;
-            expectRejected(gpu, invalid, "redundant masked ALWAYS depth sprite");
+            invalid.depthWrite = 2u;
+            expectRejected(gpu, invalid, "invalid depth sprite write flag");
             invalid = sprites.front();
             invalid.depthBaseBlock = invalid.framebufferBaseBlock;
             expectRejected(gpu, invalid, "aliased depth and color surfaces");
@@ -16576,7 +17268,7 @@ void register_ps2_gs_vulkan_tests()
             }
 
             GsVulkanDepthCt32Sprite invalid = sprites.front();
-            invalid.colorBlendMode = 2u;
+            invalid.colorBlendMode = 3u;
             std::vector<uint8_t> rejectedOutput = {0x12u, 0x34u};
             const std::vector<uint8_t> outputSentinel = rejectedOutput;
             std::string rejectionError;
@@ -16606,6 +17298,126 @@ void register_ps2_gs_vulkan_tests()
             t.Equals(
                 statistics.validationWarnings, 0u,
                 "source-over depth execution should emit no validation warnings");
+            service->shutdown();
+        });
+
+        tc.Run("Vulkan framebuffer-only alpha-fail sprites match FIX and DATE in one resident batch", [](TestCase &t)
+        {
+            GSMem::InitLookupTables();
+            const GsDrawCommand opaque = makeDepthCt32SpriteCommand(
+                30'150u, 112u, 8u, 216u, GS_PSM_Z24, false, 1u,
+                {0u, 127u, 0u, 63u}, {0u, 0u},
+                17u, 17u, 2033u, 1009u,
+                0x7F808080u, 0x00123456u);
+            const std::array<GsDrawCommand, 2> commands{{
+                makeFramebufferOnlyAlphaFailCommand(
+                    opaque, 30'151u, 0u, false, false),
+                makeFramebufferOnlyAlphaFailCommand(
+                    opaque, 30'152u, 32u, true, true, 128u),
+            }};
+            std::array<GsVulkanDepthCt32Sprite, 2> sprites{};
+            for (size_t index = 0u; index < sprites.size(); ++index)
+            {
+                const GsBackendDecision decision =
+                    prepareGsVulkanFramebufferOnlyAlphaFailDepthCt32Sprite(
+                        commands[index], sprites[index]);
+                if (!decision.supported)
+                {
+                    t.Fail(
+                        "synthetic framebuffer-only alpha-fail sprite was rejected as " +
+                        std::string(gsFallbackReasonName(decision.reason)));
+                    return;
+                }
+            }
+
+            GsVulkanCapabilityReport preflight{};
+            const GsVulkanServiceConfig config =
+                makeRendererServiceConfig(preflight);
+            GsVulkanCapabilityReport creationReport{};
+            std::string creationError;
+            std::unique_ptr<GsVulkanService> service =
+                GsVulkanService::create(
+                    config, &creationReport, &creationError);
+            if (!preflight.ready())
+            {
+                t.IsNull(
+                    service.get(),
+                    "an unavailable host should skip framebuffer-only execution cleanly");
+                return;
+            }
+            t.IsNotNull(
+                service.get(),
+                "a suitable device should create the framebuffer-only service");
+            if (!service)
+                return;
+            const GsVulkanDeviceReport *selected =
+                creationReport.selectedDevice();
+            t.IsNotNull(
+                selected,
+                "the framebuffer-only service should retain its device");
+            if (!selected || !selected->exactDepthCt32Sprite)
+            {
+                service->shutdown();
+                return;
+            }
+
+            const std::vector<uint8_t> initial =
+                makeVramPattern(0xFB0A1501u);
+            std::vector<uint8_t> expected = initial;
+            for (const GsVulkanDepthCt32Sprite &sprite : sprites)
+                applyDepthCt32SpriteCpu(expected, sprite);
+            GsVramPageMask allPages;
+            allPages.setAll();
+            std::string operationError;
+            t.IsTrue(
+                service->uploadVramPages(
+                    initial, allPages, &operationError),
+                "the framebuffer-only fixture should upload resident VRAM");
+            if (!operationError.empty())
+                t.Fail("framebuffer-only upload failed: " + operationError);
+
+            const GsVulkanServiceStatistics before =
+                service->statistics();
+            operationError.clear();
+            if (!service->executeResidentDepthCt32Sprites(
+                    sprites, &operationError))
+            {
+                t.Fail(
+                    "resident framebuffer-only alpha-fail batch failed: " +
+                    operationError);
+                service->shutdown();
+                return;
+            }
+            const GsVulkanServiceStatistics afterBatch =
+                service->statistics();
+            std::vector<uint8_t> actual(
+                GS_VULKAN_VRAM_SIZE, 0xA5u);
+            operationError.clear();
+            t.IsTrue(
+                service->downloadVramPages(
+                    actual, allPages, &operationError),
+                "the framebuffer-only result should download");
+            t.IsTrue(
+                actual == expected,
+                "resident FIX and DATE output must match complete CPU VRAM");
+
+            const GsVulkanServiceStatistics after =
+                service->statistics();
+            t.Equals(
+                afterBatch.queueSubmissions - before.queueSubmissions,
+                1ull,
+                "the two framebuffer-only draws should share one submission");
+            t.Equals(
+                afterBatch.depthCt32SpriteDrawsCompleted -
+                    before.depthCt32SpriteDrawsCompleted,
+                static_cast<uint64_t>(sprites.size()),
+                "both framebuffer-only draws should complete exactly once");
+            t.Equals(
+                after.validationErrors, 0u,
+                "framebuffer-only execution must remain validation-clean");
+            t.Equals(
+                after.validationWarnings, 0u,
+                "framebuffer-only execution should emit no validation warnings");
             service->shutdown();
         });
 
@@ -17906,6 +18718,347 @@ void register_ps2_gs_vulkan_tests()
                       "a stopped service must reject Gouraud work");
             t.IsTrue(shutdownOutput == shutdownSentinel,
                      "post-shutdown Gouraud rejection must preserve output");
+        });
+
+        tc.Run("Vulkan perspective T8 Gouraud triangles match software in single and resident execution", [](TestCase &t)
+        {
+            GSMem::InitLookupTables();
+            const GsDrawCommand first =
+                makeT8GouraudSourceOverDepthCt32TriangleCommand(30'100u);
+            std::array<GSVertex, 3> secondVertices = first.vertices();
+            constexpr std::array<float, 3> secondQ{{1.25f, 0.625f, 2.0f}};
+            for (size_t index = 0u; index < secondVertices.size(); ++index)
+            {
+                GSVertex &vertex = secondVertices[index];
+                vertex.r = static_cast<uint8_t>(210u - index * 37u);
+                vertex.g = static_cast<uint8_t>(25u + index * 83u);
+                vertex.b = static_cast<uint8_t>(160u - index * 41u);
+                vertex.a = static_cast<uint8_t>(72u + index * 61u);
+                vertex.zInteger += 0x3000u +
+                                   static_cast<uint32_t>(index) * 0x1000u;
+                vertex.z = static_cast<double>(vertex.zInteger);
+                vertex.s += 0.375f * static_cast<float>(index + 1u);
+                vertex.t -= 0.1875f * static_cast<float>(index + 1u);
+                vertex.q = secondQ[index];
+                vertex.fog = static_cast<uint8_t>(255u - vertex.fog);
+            }
+            const GsDrawCommand second = buildGsDrawCommand(
+                30'101u,
+                first.primitive(),
+                first.context(),
+                std::span<const GSVertex>(secondVertices),
+                first.globalState());
+            GSPrimReg thirdPrimitive = first.primitive();
+            thirdPrimitive.type = GS_PRIM_TRIANGLE;
+            thirdPrimitive.fge = false;
+            GSContext thirdContext = first.context();
+            thirdContext.zbuf.zmask = true;
+            thirdContext.tex1 =
+                (1ull << 5u) | (1ull << 6u) | (1ull << 9u);
+            thirdContext.test = 0x3180Bull;
+            std::array<GSVertex, 3> thirdVertices = first.vertices();
+            for (size_t index = 0u; index < thirdVertices.size(); ++index)
+            {
+                thirdVertices[index].q = 1.0f;
+                thirdVertices[index].a =
+                    index == 0u ? 128u : 0u;
+            }
+            const GsDrawCommand third = buildGsDrawCommand(
+                30'102u,
+                thirdPrimitive,
+                thirdContext,
+                std::span<const GSVertex>(thirdVertices),
+                first.globalState());
+            const std::array<GsDrawCommand, 2> commands{{first, second}};
+
+            std::array<uint32_t, 256> palette{};
+            std::vector<uint8_t> initial =
+                makeVramPattern(0x54384750u);
+            const auto swizzleClutIndex = [](uint32_t index)
+            {
+                return (index & 0xE7u) |
+                       ((index & 0x08u) << 1u) |
+                       ((index & 0x10u) >> 1u);
+            };
+            for (uint32_t index = 0u; index < palette.size(); ++index)
+            {
+                palette[index] =
+                    ((index * 17u) & 0xFFu) |
+                    (((index * 29u) & 0xFFu) << 8u) |
+                    (((index * 43u) & 0xFFu) << 16u) |
+                    ((32u + (index % 192u)) << 24u);
+                const uint32_t sourceIndex = swizzleClutIndex(index);
+                GSMem::WriteCT32(
+                    initial.data(),
+                    first.context().tex0.cbp,
+                    1u,
+                    sourceIndex & 0x0Fu,
+                    sourceIndex >> 4u,
+                    palette[index]);
+            }
+            constexpr std::array<uint32_t, 3> textureBases{{
+                64u, 128u, 192u}};
+            constexpr std::array<uint32_t, 3> textureSizes{{
+                32u, 16u, 8u}};
+            for (size_t level = 0u; level < textureBases.size(); ++level)
+            {
+                for (uint32_t y = 0u; y < textureSizes[level]; ++y)
+                {
+                    for (uint32_t x = 0u; x < textureSizes[level]; ++x)
+                    {
+                        const uint32_t index =
+                            (x * 13u + y * 31u +
+                             static_cast<uint32_t>(level) * 47u) & 0xFFu;
+                        GSMem::WriteP8(
+                            initial.data(),
+                            textureBases[level], 1u,
+                            x, y, index);
+                    }
+                }
+            }
+
+            std::array<GsVulkanT8GouraudDepthCt32Triangle, 2> prepared{};
+            for (size_t index = 0u; index < commands.size(); ++index)
+            {
+                const GsBackendDecision decision =
+                    prepareGsVulkanT8GouraudSourceOverDepthCt32Triangle(
+                        commands[index], palette, prepared[index]);
+                if (!decision.supported)
+                {
+                    t.Fail(
+                        "synthetic perspective T8 triangle was rejected as " +
+                        std::string(gsFallbackReasonName(decision.reason)));
+                    return;
+                }
+            }
+            GsVulkanT8GouraudDepthCt32Triangle thirdPrepared{};
+            const GsBackendDecision thirdDecision =
+                prepareGsVulkanT8GouraudSourceOverDepthCt32Triangle(
+                    third, palette, thirdPrepared);
+            if (!thirdDecision.supported)
+            {
+                t.Fail(
+                    "synthetic constant-Q T8 triangle was rejected as " +
+                    std::string(gsFallbackReasonName(thirdDecision.reason)));
+                return;
+            }
+
+            const auto renderSoftware = [&](size_t commandCount)
+            {
+                std::vector<uint8_t> output = initial;
+                GS gs;
+                gs.init(
+                    output.data(),
+                    static_cast<uint32_t>(output.size()),
+                    nullptr);
+                gs.setDebugHistoryPaused(true);
+                for (size_t index = 0u; index < commandCount; ++index)
+                {
+                    drawT8GouraudDepthCt32TriangleCommand(
+                        gs, commands[index]);
+                    gs.flushRenderBatch();
+                }
+                return output;
+            };
+            const std::vector<uint8_t> expectedSingle = renderSoftware(1u);
+            const std::vector<uint8_t> expectedResident = renderSoftware(2u);
+            const auto renderThirdSoftware = [&]()
+            {
+                std::vector<uint8_t> output = initial;
+                GS gs;
+                gs.init(
+                    output.data(),
+                    static_cast<uint32_t>(output.size()),
+                    nullptr);
+                gs.setDebugHistoryPaused(true);
+                drawT8GouraudDepthCt32TriangleCommand(gs, third);
+                gs.flushRenderBatch();
+                return output;
+            };
+            const std::vector<uint8_t> expectedThird =
+                renderThirdSoftware();
+
+            GsVulkanCapabilityReport preflight{};
+            const GsVulkanServiceConfig config =
+                makeRendererServiceConfig(preflight);
+            GsVulkanCapabilityReport creationReport{};
+            std::string creationError;
+            std::unique_ptr<GsVulkanService> service =
+                GsVulkanService::create(
+                    config, &creationReport, &creationError);
+            if (!preflight.ready())
+            {
+                t.IsNull(service.get(),
+                         "an unavailable host should skip T8 execution cleanly");
+                return;
+            }
+            t.IsNotNull(service.get(),
+                        "a suitable device should create the T8 service");
+            t.IsTrue(creationError.empty(),
+                     "successful T8 service creation should clear its diagnostic");
+            if (!service)
+                return;
+
+            const GsVulkanDeviceReport *selected =
+                creationReport.selectedDevice();
+            t.IsNotNull(selected,
+                        "the T8 service should retain its selected device");
+            if (!selected)
+                return;
+            if (!selected->exactT8GouraudDepthCt32Triangle)
+            {
+                std::vector<uint8_t> output = {0xA5u};
+                const std::vector<uint8_t> sentinel = output;
+                std::string error;
+                t.IsFalse(service->executeT8GouraudDepthCt32Triangle(
+                              initial, prepared.front(), output, &error),
+                          "a device without exact T8 support must reject");
+                t.IsTrue(output == sentinel,
+                         "T8 capability rejection must preserve output");
+                t.IsFalse(error.empty(),
+                          "T8 capability rejection should retain a diagnostic");
+                service->shutdown();
+                return;
+            }
+            t.IsTrue(selected->shaderInt64 && selected->shaderFloat64,
+                     "the exact T8 path should expose both numeric prerequisites");
+
+            std::vector<uint8_t> actualSingle = {0xA5u};
+            std::string operationError;
+            if (!service->executeT8GouraudDepthCt32Triangle(
+                    initial, prepared.front(), actualSingle,
+                    &operationError))
+            {
+                t.Fail("single T8 Vulkan execution failed: " + operationError);
+                return;
+            }
+            if (actualSingle != expectedSingle)
+            {
+                const auto mismatch = std::mismatch(
+                    actualSingle.begin(), actualSingle.end(),
+                    expectedSingle.begin());
+                t.Fail(
+                    "single T8 Vulkan execution first disagreed with software at byte " +
+                    std::to_string(static_cast<size_t>(
+                        mismatch.first - actualSingle.begin())));
+                return;
+            }
+            std::vector<uint8_t> actualThird = {0xA5u};
+            if (!service->executeT8GouraudDepthCt32Triangle(
+                    initial, thirdPrepared, actualThird,
+                    &operationError))
+            {
+                t.Fail(
+                    "constant-Q T8 Vulkan execution failed: " +
+                    operationError);
+                return;
+            }
+            if (actualThird != expectedThird)
+            {
+                const auto mismatch = std::mismatch(
+                    actualThird.begin(), actualThird.end(),
+                    expectedThird.begin());
+                t.Fail(
+                    "constant-Q T8 Vulkan execution first disagreed with software at byte " +
+                    std::to_string(static_cast<size_t>(
+                        mismatch.first - actualThird.begin())));
+                return;
+            }
+
+            GsVramPageMask allPages;
+            allPages.setAll();
+            t.IsTrue(service->uploadVramPages(
+                         initial, allPages, &operationError),
+                     "resident T8 validation should upload canonical VRAM");
+            t.IsTrue(operationError.empty(),
+                     "resident T8 upload should clear its diagnostic");
+            const GsVulkanServiceStatistics beforeResident =
+                service->statistics();
+            std::vector<GsVulkanResidentT8GouraudDepthCt32Triangle>
+                residentPrepared(prepared.size());
+            for (size_t index = 0u; index < prepared.size(); ++index)
+            {
+                std::memcpy(
+                    &residentPrepared[index], &prepared[index],
+                    sizeof(residentPrepared[index]));
+                residentPrepared[index].paletteIndex = 0u;
+            }
+            const std::array<GsVulkanT8Palette, 1> residentPalettes{{
+                prepared.front().palette,
+            }};
+            t.IsTrue(service->executeResidentT8GouraudDepthCt32Triangles(
+                         residentPrepared, residentPalettes,
+                         &operationError),
+                     "dependent T8 triangles should execute in one resident batch");
+            t.IsTrue(operationError.empty(),
+                     "resident T8 execution should clear its diagnostic");
+            const GsVulkanServiceStatistics afterResident =
+                service->statistics();
+            t.Equals(afterResident.shaderDispatches -
+                         beforeResident.shaderDispatches,
+                     1ull,
+                     "ordered resident T8 execution should use one dispatch");
+            t.Equals(afterResident.pipelineBarriers -
+                         beforeResident.pipelineBarriers,
+                     3ull,
+                     "ordered resident T8 execution should need only batch-level barriers");
+            std::vector<uint8_t> actualResident(
+                GS_VULKAN_VRAM_SIZE, 0u);
+            t.IsTrue(service->downloadVramPages(
+                         actualResident, allPages, &operationError),
+                     "resident T8 validation should observe canonical VRAM");
+            if (actualResident != expectedResident)
+            {
+                const auto mismatch = std::mismatch(
+                    actualResident.begin(), actualResident.end(),
+                    expectedResident.begin());
+                t.Fail(
+                    "resident T8 Vulkan execution first disagreed with software at byte " +
+                    std::to_string(static_cast<size_t>(
+                        mismatch.first - actualResident.begin())));
+                return;
+            }
+
+            GsVulkanT8GouraudDepthCt32Triangle invalid = prepared.front();
+            invalid.qBits[0] = 0x7F800000u;
+            std::vector<uint8_t> rejectedOutput = {0x12u, 0x34u};
+            const std::vector<uint8_t> rejectedSentinel = rejectedOutput;
+            t.IsFalse(service->executeT8GouraudDepthCt32Triangle(
+                          initial, invalid, rejectedOutput, &operationError),
+                      "non-finite T8 setup should fail closed");
+            t.IsTrue(rejectedOutput == rejectedSentinel,
+                     "invalid T8 rejection must preserve caller output");
+            t.IsFalse(operationError.empty(),
+                      "invalid T8 rejection should retain a diagnostic");
+
+            const GsVulkanServiceStatistics statistics =
+                service->statistics();
+            t.Equals(
+                statistics.t8GouraudDepthCt32TriangleDrawsCompleted,
+                4ull,
+                "two single and two resident T8 draws should complete");
+            t.Equals(
+                statistics.t8GouraudDepthCt32TriangleDrawsFailed,
+                0ull,
+                "caller-side T8 rejection should not count a worker failure");
+            t.Equals(
+                statistics
+                    .residentT8GouraudDepthCt32TriangleBatchesCompleted,
+                1ull,
+                "the dependent resident pair should use one batch");
+            t.Equals(
+                statistics.largestResidentT8GouraudDepthCt32TriangleBatch,
+                2ull,
+                "the resident batch high water should retain both draws");
+            t.Equals(statistics.shaderDispatches, 3ull,
+                     "two single plus ordered resident T8 execution should use three dispatches");
+            t.Equals(statistics.validationErrors, 0u,
+                     "T8 execution must remain validation-clean");
+            t.Equals(statistics.validationWarnings, 0u,
+                     "T8 execution should emit no validation warnings");
+
+            service->shutdown();
+            service->shutdown();
         });
 
         tc.Run("Vulkan resident page operations preserve unselected bytes", [](TestCase &t)

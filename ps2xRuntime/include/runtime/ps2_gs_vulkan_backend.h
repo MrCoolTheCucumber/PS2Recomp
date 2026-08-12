@@ -28,6 +28,12 @@ struct GsVulkanRasterBackendConfig
     // Depth work includes one CT32 write plus an exact Z32/Z24 test/write. The
     // default is the conservative isolated-draw crossover across both formats.
     uint64_t minimumHybridDepthCt32SpritePixels = 262'144u;
+    // Framebuffer-only alpha-fail draws perform no depth I/O and are commonly
+    // emitted as compatible runs. Admission therefore uses aggregate run work
+    // so one resident submission can amortize its queue and fence overhead.
+    uint64_t
+        minimumHybridFramebufferOnlyAlphaFailDepthCt32RunPixels =
+            212'480u;
     // Nearest texture work is the exact clipped sample/write rectangle.
     uint64_t minimumHybridNearestCt32SpritePixels = 8'192u;
     // REPEAT linear texture work is the exact clipped sample/write rectangle.
@@ -68,6 +74,28 @@ struct GsVulkanRasterBackendStatistics
     std::string lastVerificationArtifact;
 };
 
+// Production completion accounting only needs aggregate frontend metadata.
+// Keeping it separate from GsDrawCommand lets a resident batch avoid retaining
+// and copying complete register/vertex snapshots after GPU preparation.
+struct GsVulkanAcceleratedCommitBatch
+{
+    uint64_t commandCount = 0u;
+    uint64_t candidatePixels = 0u;
+    // FRAME.FBP is a 9-bit GS page index, so the physical page-mask shape is
+    // also an exact compact set representation for touched framebuffer bases.
+    GsVramPageMask framebufferBasePages;
+};
+
+struct GsVulkanDecodedPalette
+{
+    std::span<const uint32_t> colors;
+    uint64_t generation = 0u;
+    uint16_t texa = 0u;
+    uint8_t sourcePsm = 0u;
+    uint8_t csm = 0u;
+    uint8_t csa = 0u;
+};
+
 // Verify mode retains Phase 3's independent whole-image transaction and full
 // 4 MiB comparison. Hybrid and strict use the page-coherency hooks inherited
 // from IGsRasterBackend, so canonical CPU VRAM may be stale until the router
@@ -77,12 +105,20 @@ class GsVulkanRasterBackend final : public IGsRasterBackend
 {
 public:
     using DrawCallback = std::function<void(const GsDrawCommand &)>;
+    using AcceleratedBatchCommitCallback =
+        std::function<void(const GsVulkanAcceleratedCommitBatch &)>;
     // Verify invokes this synchronously once per admitted feedback draw;
     // resident modes copy it once when opening an admitted feedback batch. The
     // caller owns the returned bytes and must keep them stable only for the
     // callback.
     using FeedbackSnapshotCallback =
         std::function<std::span<const uint8_t>()>;
+    // The callback refreshes and exposes the frontend's architectural decoded
+    // CLUT. Its exact identity fields must change whenever the decoded colors
+    // can change. The backend copies all 256 entries synchronously only when a
+    // resident batch observes a new identity.
+    using DecodedPaletteCallback =
+        std::function<GsVulkanDecodedPalette()>;
 
     [[nodiscard]] static std::unique_ptr<GsVulkanRasterBackend> create(
         const GsVulkanServiceConfig &serviceConfig,
@@ -92,7 +128,9 @@ public:
         DrawCallback acceleratedCommit,
         GsVulkanCapabilityReport *report = nullptr,
         std::string *error = nullptr,
-        FeedbackSnapshotCallback feedbackSnapshot = {});
+        FeedbackSnapshotCallback feedbackSnapshot = {},
+        DecodedPaletteCallback decodedPalette = {},
+        AcceleratedBatchCommitCallback acceleratedBatchCommit = {});
 
     // Dependency-injected construction keeps mismatch, execution-failure, and
     // lifecycle tests deterministic even on compiled-out or GPU-less hosts.
@@ -104,7 +142,9 @@ public:
         DrawCallback softwareOracle,
         DrawCallback acceleratedCommit,
         std::string *error = nullptr,
-        FeedbackSnapshotCallback feedbackSnapshot = {});
+        FeedbackSnapshotCallback feedbackSnapshot = {},
+        DecodedPaletteCallback decodedPalette = {},
+        AcceleratedBatchCommitCallback acceleratedBatchCommit = {});
 
     ~GsVulkanRasterBackend() override;
 
@@ -127,6 +167,10 @@ public:
     [[nodiscard]] size_t pendingCommandCount() const noexcept override;
     void prepareCpuVramAccess(
         const GsVramPageMask &pages,
+        GsFlushReason reason) override;
+    void prepareCpuVramAccess(
+        const GsVramPageMask &readPages,
+        const GsVramPageMask &writePages,
         GsFlushReason reason) override;
     void noteCpuVramWrite(const GsVramPageMask &pages) override;
 

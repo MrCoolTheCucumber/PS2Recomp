@@ -70,6 +70,13 @@ public:
 
     void noteCpuWrite(const GsVramPageMask &pages);
     void noteGpuWrite(const GsVramPageMask &pages);
+    // Applies one already ordered resident GPU batch as a single ownership
+    // transition. operationCount and pageTouches retain the per-command
+    // diagnostics without rescanning all 512 pages for every draw.
+    void noteGpuWriteBatch(
+        const GsVramPageMask &pages,
+        uint64_t operationCount,
+        uint64_t pageTouches);
     void completeCpuToGpu(const GsVramPageMask &pages);
     void completeGpuToCpu(const GsVramPageMask &pages);
 

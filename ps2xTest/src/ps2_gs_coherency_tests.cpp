@@ -170,6 +170,31 @@ void register_ps2_gs_coherency_tests()
                      "the final rejected writer should retain a valid map");
         });
 
+        tc.Run("ordered GPU batches retain per-command diagnostics", [](TestCase &t)
+        {
+            GsVramCoherency coherency;
+            GsVramPageMask pages;
+            pages.set(7u);
+            pages.set(8u);
+            pages.set(511u);
+
+            coherency.noteGpuWriteBatch(pages, 19u, 43u);
+
+            t.IsTrue(coherency.gpuNewerPages(pages) == pages,
+                     "one batch transition should own the complete write union");
+            t.Equals(coherency.page(7u).gpuGeneration,
+                     coherency.page(511u).gpuGeneration,
+                     "an ordered batch should publish one final GPU generation");
+            const GsVramCoherencyStatistics statistics =
+                coherency.statistics();
+            t.Equals(statistics.gpuWriteOperations, 19ull,
+                     "batch ownership should retain its architectural draw count");
+            t.Equals(statistics.gpuWritePages, 43ull,
+                     "batch ownership should retain repeated per-draw page touches");
+            t.IsTrue(coherency.invariantHolds(),
+                     "the compact batch transition should preserve invariants");
+        });
+
         tc.Run("fixed-seed access streams match an independent ownership model", [](TestCase &t)
         {
             GsVramCoherency coherency;

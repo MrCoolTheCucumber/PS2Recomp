@@ -21,6 +21,10 @@ public:
 
     void clear() noexcept;
     void set(size_t page) noexcept;
+    // Sets a consecutive range in the circular 4 MiB page space. Large
+    // conservative surfaces commonly cover hundreds of pages, so populate
+    // whole mask words instead of paying one read/modify/write per page.
+    void setRange(size_t firstPage, size_t pageCount) noexcept;
     void setAll() noexcept;
     void unionWith(const GsVramPageMask &other) noexcept;
 
@@ -316,6 +320,19 @@ public:
         (void)pages;
         (void)reason;
     }
+    // The split form lets a device backend distinguish CPU reads (which only
+    // conflict with pending GPU writes) from CPU writes (which also conflict
+    // with pending GPU reads). Legacy backends retain conservative behavior
+    // through the union-forwarding default.
+    virtual void prepareCpuVramAccess(
+        const GsVramPageMask &readPages,
+        const GsVramPageMask &writePages,
+        GsFlushReason reason)
+    {
+        GsVramPageMask pages = readPages;
+        pages.unionWith(writePages);
+        prepareCpuVramAccess(pages, reason);
+    }
     virtual void noteCpuVramWrite(const GsVramPageMask &pages)
     {
         (void)pages;
@@ -367,6 +384,10 @@ private:
     void drainActive(GsFlushReason reason);
     void synchronizeCpuVram(
         const GsVramPageMask &pages,
+        GsFlushReason reason);
+    void synchronizeCpuVram(
+        const GsVramPageMask &readPages,
+        const GsVramPageMask &writePages,
         GsFlushReason reason);
     void resolvePendingHybrid(bool accelerate);
     void updateDeferredQueueDepth() noexcept;
@@ -429,6 +450,14 @@ private:
 [[nodiscard]] GsBackendDecision classifyGsSourceOverDepthCt32Sprite(
     const GsDrawCommand &command) noexcept;
 
+// Exact flat CT32 depth subset where TEST always fails alpha and AFAIL keeps
+// framebuffer writes only. The admitted blend is (Cs-Cd)*FIX/128+Cd, with
+// optional CT32 destination-alpha testing. Depth comparison is ALWAYS and the
+// failed alpha test suppresses every depth write regardless of ZMASK.
+[[nodiscard]] GsBackendDecision
+classifyGsFramebufferOnlyAlphaFailDepthCt32Sprite(
+    const GsDrawCommand &command) noexcept;
+
 // Phase 6's first texture predicate deliberately covers only direct CT32
 // point sampling whose integer FST coordinates advance exactly one texel per
 // framebuffer pixel. Repeat wrap and disjoint source/destination pages keep
@@ -466,6 +495,17 @@ classifyGsFeedbackLinearDepthCt32Sprite(
 [[nodiscard]] GsBackendDecision
 classifyGsGouraudSourceOverDepthCt32Triangle(
     const GsDrawCommand &command) noexcept;
+
+// Exact perspective T8 Gouraud/fog triangle slice used by the dominant RAC1
+// pipeline. The contract consumes the frontend's decoded CSM1 CT32 palette,
+// supports REPEAT/CLAMP and nearest-mip linear filtering, and retains the
+// standard source-over, alpha GEQUAL/RGB_ONLY, and Z GEQUAL/write semantics.
+// TRIANGLE, TRISTRIP, and TRIFAN commands share the same assembled three-
+// vertex raster operation and are classified identically.
+[[nodiscard]] GsBackendDecision
+classifyGsT8GouraudSourceOverDepthCt32Triangle(
+    const GsDrawCommand &command,
+    GsDrawResources *supportedResources = nullptr) noexcept;
 
 [[nodiscard]] std::string_view gsFallbackReasonName(
     GsFallbackReason reason) noexcept;

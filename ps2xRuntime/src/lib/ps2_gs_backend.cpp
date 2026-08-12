@@ -3,6 +3,7 @@
 
 #include <algorithm>
 #include <bit>
+#include <cmath>
 #include <cstdlib>
 #include <limits>
 #include <stdexcept>
@@ -42,6 +43,17 @@ namespace
         // first exact destination-dependent contract.
         return primitive.abe &&
                (context.alpha & 0xFFu) == 0x44u &&
+               !global.pabe && global.colorClamp;
+    }
+
+    bool isFixedAlphaBlend(const GSPrimReg &primitive,
+                           const GSContext &context,
+                           const GsDrawGlobalState &global) noexcept
+    {
+        // A=Cs, B=Cd, C=FIX, D=Cd. PABE and wraparound color arithmetic
+        // remain outside this exact slice.
+        return primitive.abe &&
+               (context.alpha & 0xFFu) == 0x64u &&
                !global.pabe && global.colorClamp;
     }
 
@@ -97,10 +109,7 @@ namespace
         const uint32_t firstPage = startBlock / 32u;
         const uint32_t lastBlock = startBlock + blockCount - 1u;
         const uint32_t pageCount = lastBlock / 32u - firstPage + 1u;
-        for (uint32_t page = 0u; page < pageCount; ++page)
-        {
-            mask.set((firstPage + page) % GS_VRAM_PAGE_COUNT);
-        }
+        mask.setRange(firstPage, pageCount);
     }
 
     bool addSurfaceRange(GsVramPageMask &mask,
@@ -597,6 +606,32 @@ void GsVramPageMask::set(size_t page) noexcept
         m_words[page / 64u] |= 1ull << (page % 64u);
 }
 
+void GsVramPageMask::setRange(
+    size_t firstPage,
+    size_t pageCount) noexcept
+{
+    if (pageCount == 0u)
+        return;
+    if (pageCount >= kPageCount)
+    {
+        setAll();
+        return;
+    }
+
+    firstPage %= kPageCount;
+    while (pageCount != 0u)
+    {
+        const size_t bit = firstPage % 64u;
+        const size_t run = std::min(pageCount, 64u - bit);
+        const uint64_t bits = run == 64u
+            ? std::numeric_limits<uint64_t>::max()
+            : ((uint64_t{1} << run) - 1u) << bit;
+        m_words[firstPage / 64u] |= bits;
+        firstPage = (firstPage + run) % kPageCount;
+        pageCount -= run;
+    }
+}
+
 void GsVramPageMask::setAll() noexcept
 {
     m_words.fill(std::numeric_limits<uint64_t>::max());
@@ -824,6 +859,7 @@ namespace
         DisabledOrSourceCopy,
         SourceOver,
         SourceOverConstant128,
+        FramebufferOnlyAlphaFailFixed,
     };
 
     enum class ShadingRequirement : uint8_t
@@ -956,13 +992,38 @@ namespace
                     command.vertices()[index].a == 128u;
             }
             break;
+        case AlphaRequirement::FramebufferOnlyAlphaFailFixed:
+            acceptedAlpha =
+                isFixedAlphaBlend(primitive, context, global);
+            break;
         }
         if (!acceptedAlpha)
             return {false, GsFallbackReason::AlphaBlend};
-        if ((context.test & 1u) != 0u)
+        const bool framebufferOnlyAlphaFail =
+            alphaRequirement ==
+            AlphaRequirement::FramebufferOnlyAlphaFailFixed;
+        if (framebufferOnlyAlphaFail)
+        {
+            const bool alphaTestEnabled = (context.test & 1u) != 0u;
+            const uint8_t alphaTestMethod = static_cast<uint8_t>(
+                (context.test >> 1u) & 0x7u);
+            const uint8_t alphaFailMethod = static_cast<uint8_t>(
+                (context.test >> 12u) & 0x3u);
+            if (!alphaTestEnabled || alphaTestMethod != 0u ||
+                alphaFailMethod != 1u)
+            {
+                return {false, GsFallbackReason::AlphaTest};
+            }
+        }
+        else if ((context.test & 1u) != 0u)
+        {
             return {false, GsFallbackReason::AlphaTest};
-        if (((context.test >> 14u) & 1u) != 0u)
+        }
+        if (!framebufferOnlyAlphaFail &&
+            ((context.test >> 14u) & 1u) != 0u)
+        {
             return {false, GsFallbackReason::DestinationAlphaTest};
+        }
         if (context.frame.fbmsk != 0u)
             return {false, GsFallbackReason::FramebufferMask};
         if ((context.fba & 1u) != 0u)
@@ -1092,8 +1153,11 @@ namespace
                 ((context.test >> 16u) & 1u) != 0u;
             const uint8_t depthTestMethod =
                 static_cast<uint8_t>((context.test >> 17u) & 0x3u);
-            if (!depthTestEnabled || depthTestMethod == 0u ||
-                (depthTestMethod == 1u && context.zbuf.zmask))
+            const bool supportedDepth = framebufferOnlyAlphaFail
+                ? depthTestEnabled && depthTestMethod == 1u
+                : depthTestEnabled && depthTestMethod != 0u &&
+                      !(depthTestMethod == 1u && context.zbuf.zmask);
+            if (!supportedDepth)
             {
                 return {false, GsFallbackReason::UnsupportedDepthFunction};
             }
@@ -1107,7 +1171,8 @@ namespace
         const bool allowsDestinationRead =
             alphaRequirement == AlphaRequirement::SourceOver ||
             alphaRequirement ==
-                AlphaRequirement::SourceOverConstant128;
+                AlphaRequirement::SourceOverConstant128 ||
+            framebufferOnlyAlphaFail;
         if (resources.readsDestination && !allowsDestinationRead)
             return {false, GsFallbackReason::DestinationRead};
         if (aliasRequirement ==
@@ -1160,6 +1225,16 @@ GsBackendDecision classifyGsSourceOverDepthCt32Sprite(
         TextureRequirement::Disabled,
         DepthRequirement::Z32OrZ24,
         AlphaRequirement::SourceOver);
+}
+
+GsBackendDecision classifyGsFramebufferOnlyAlphaFailDepthCt32Sprite(
+    const GsDrawCommand &command) noexcept
+{
+    return classifyFlatCt32State(
+        command, GS_PRIM_SPRITE, 2u,
+        TextureRequirement::Disabled,
+        DepthRequirement::Z32OrZ24,
+        AlphaRequirement::FramebufferOnlyAlphaFailFixed);
 }
 
 GsBackendDecision classifyGsNearestCt32TexturedSprite(
@@ -1231,6 +1306,149 @@ GsBackendDecision classifyGsGouraudSourceOverDepthCt32Triangle(
             GsFallbackReason::UnsupportedDepthFunction};
     }
     return decision;
+}
+
+GsBackendDecision classifyGsT8GouraudSourceOverDepthCt32Triangle(
+    const GsDrawCommand &command,
+    GsDrawResources *supportedResources) noexcept
+{
+    const GSPrimReg &primitive = command.primitive();
+    const GSContext &context = command.context();
+    const GsDrawGlobalState &global = command.globalState();
+    const GsDrawBounds &bounds = command.bounds();
+
+    if (bounds.empty())
+        return {false, GsFallbackReason::EmptyBounds};
+    if (!bounds.exact)
+        return {false, GsFallbackReason::InexactBounds};
+    if (primitive.type != GS_PRIM_TRIANGLE &&
+        primitive.type != GS_PRIM_TRISTRIP &&
+        primitive.type != GS_PRIM_TRIFAN)
+    {
+        return {false, GsFallbackReason::UnsupportedPrimitive};
+    }
+    if (command.vertexCount() != 3u || !primitive.iip ||
+        !primitive.tme || primitive.fst ||
+        primitive.aa1 || primitive.fix)
+    {
+        return {false, GsFallbackReason::UnsupportedPrimitiveState};
+    }
+    if (context.frame.psm != GS_PSM_CT32)
+        return {false, GsFallbackReason::UnsupportedFramebufferFormat};
+    if (context.frame.fbmsk != 0u)
+        return {false, GsFallbackReason::FramebufferMask};
+    if (!isSourceOverAlphaBlend(primitive, context, global))
+        return {false, GsFallbackReason::AlphaBlend};
+
+    const bool alphaTestEnabled = (context.test & 1u) != 0u;
+    const uint8_t alphaTestMethod =
+        static_cast<uint8_t>((context.test >> 1u) & 0x7u);
+    const uint8_t alphaFailMethod =
+        static_cast<uint8_t>((context.test >> 12u) & 0x3u);
+    if (!alphaTestEnabled || alphaTestMethod != 5u ||
+        (alphaFailMethod != 1u && alphaFailMethod != 3u))
+    {
+        return {false, GsFallbackReason::AlphaTest};
+    }
+    if (((context.test >> 14u) & 1u) != 0u)
+        return {false, GsFallbackReason::DestinationAlphaTest};
+    if ((context.fba & 1u) != 0u)
+    {
+        return {
+            false,
+            GsFallbackReason::FramebufferAlphaCorrection};
+    }
+    if (global.dither)
+        return {false, GsFallbackReason::Dither};
+    if (global.scanMask != 0u)
+        return {false, GsFallbackReason::ScanMask};
+
+    if (context.tex0.psm != GS_PSM_T8 ||
+        context.tex0.cpsm != GS_PSM_CT32 ||
+        context.tex0.csm != 0u || context.tex0.csa != 0u)
+    {
+        return {false, GsFallbackReason::UnsupportedTextureFormat};
+    }
+    if (context.tex0.tcc != 1u || context.tex0.tfx != 0u)
+    {
+        return {false, GsFallbackReason::UnsupportedTextureFunction};
+    }
+    if (context.tex0.tbw == 0u || context.tex0.tbw > 0x3Fu ||
+        context.tex0.tw > 10u || context.tex0.th > 10u)
+    {
+        return {false, GsFallbackReason::UnsupportedTextureState};
+    }
+
+    const uint8_t maximumMipLevel =
+        static_cast<uint8_t>((context.tex1 >> 2u) & 0x7u);
+    const uint8_t magnificationFilter =
+        static_cast<uint8_t>((context.tex1 >> 5u) & 0x1u);
+    const uint8_t minificationFilter =
+        static_cast<uint8_t>((context.tex1 >> 6u) & 0x7u);
+    const bool fixedLod = (context.tex1 & 1u) != 0u;
+    const bool automaticMipBase =
+        ((context.tex1 >> 9u) & 1u) != 0u;
+    if (maximumMipLevel > 3u || magnificationFilter != 1u ||
+        (maximumMipLevel == 0u
+             ? minificationFilter != 1u && minificationFilter != 4u
+             : fixedLod || minificationFilter != 4u || automaticMipBase))
+    {
+        return {false, GsFallbackReason::UnsupportedTextureFilter};
+    }
+    const uint8_t wrapModeU =
+        static_cast<uint8_t>(context.clamp & 0x3u);
+    const uint8_t wrapModeV =
+        static_cast<uint8_t>((context.clamp >> 2u) & 0x3u);
+    if (wrapModeU > 1u || wrapModeV > 1u)
+        return {false, GsFallbackReason::UnsupportedTextureWrap};
+    for (uint8_t level = 1u; level <= maximumMipLevel; ++level)
+    {
+        const uint8_t shift = static_cast<uint8_t>((level - 1u) * 20u);
+        const uint32_t width =
+            static_cast<uint32_t>((context.miptbp1 >> (shift + 14u)) &
+                                  0x3Fu);
+        if (width == 0u)
+            return {false, GsFallbackReason::UnsupportedTextureState};
+    }
+
+    const bool depthTestEnabled =
+        ((context.test >> 16u) & 1u) != 0u;
+    const uint8_t depthTestMethod =
+        static_cast<uint8_t>((context.test >> 17u) & 0x3u);
+    if ((context.zbuf.psm != GS_PSM_Z32 &&
+         context.zbuf.psm != GS_PSM_Z24) ||
+        !depthTestEnabled ||
+        (depthTestMethod != 1u && depthTestMethod != 2u))
+    {
+        return {false, GsFallbackReason::UnsupportedDepthFunction};
+    }
+    if (!ct32RectangleHasUniqueWords(
+            bounds,
+            std::max<uint32_t>(context.frame.fbw, 1u)))
+    {
+        return {false, GsFallbackReason::UnknownMemoryLayout};
+    }
+
+    for (const GSVertex &vertex : command.vertices())
+    {
+        if (!std::isfinite(vertex.s) ||
+            !std::isfinite(vertex.t) ||
+            !std::isfinite(vertex.q))
+        {
+            return {
+                false,
+                GsFallbackReason::UnsupportedTextureCoordinates};
+        }
+    }
+
+    const GsDrawResources resources = command.resources();
+    if (resources.unknownMemoryLayout)
+        return {false, GsFallbackReason::UnknownMemoryLayout};
+    if (resources.aliasesAnotherView())
+        return {false, GsFallbackReason::ResourceAlias};
+    if (supportedResources)
+        *supportedResources = resources;
+    return {true, GsFallbackReason::Supported};
 }
 
 GsBackendRouter::GsBackendRouter(
@@ -1319,10 +1537,10 @@ GsSubmissionResult GsBackendRouter::submit(
         if (m_acceleratedBackend)
         {
             const GsDrawResources resources = command.resources();
-            GsVramPageMask accessPages = resources.readPages;
-            accessPages.unionWith(resources.writePages);
             synchronizeCpuVram(
-                accessPages, GsFlushReason::BackendSwitch);
+                resources.readPages,
+                resources.writePages,
+                GsFlushReason::BackendSwitch);
             m_softwareBackend->submit(
                 std::span<const GsDrawCommand>(&command, 1u));
             m_acceleratedBackend->noteCpuVramWrite(resources.writePages);
@@ -1481,10 +1699,10 @@ GsSubmissionResult GsBackendRouter::submit(
 
     transitionTo(ActiveBackend::Software);
     const GsDrawResources resources = command.resources();
-    GsVramPageMask accessPages = resources.readPages;
-    accessPages.unionWith(resources.writePages);
     synchronizeCpuVram(
-        accessPages, GsFlushReason::BackendSwitch);
+        resources.readPages,
+        resources.writePages,
+        GsFlushReason::BackendSwitch);
     m_softwareBackend->submit(
         std::span<const GsDrawCommand>(&command, 1u));
     if (m_acceleratedBackend)
@@ -1565,16 +1783,23 @@ void GsBackendRouter::beginCpuVramAccess(
     resolvePendingHybrid(false);
     m_admittedHybridTail.reset();
     m_admittedHybridPolicy = {};
-    drainActive(reason);
-    m_activeBackend = ActiveBackend::None;
+    // Software writes are only materialized when its queue is drained. The
+    // accelerated backend can instead decide from its pending resource masks
+    // whether this exact page access conflicts with queued device work. This
+    // keeps unrelated CLUT/transfer traffic from forcing a global GPU fence.
+    if (m_activeBackend == ActiveBackend::Software)
+        drainActive(reason);
 
-    GsVramPageMask accessPages = readPages;
-    accessPages.unionWith(writePages);
-    synchronizeCpuVram(accessPages, reason);
+    synchronizeCpuVram(readPages, writePages, reason);
+    m_activeBackend =
+        m_acceleratedBackend &&
+                m_acceleratedBackend->pendingCommandCount() != 0u
+            ? ActiveBackend::Accelerated
+            : ActiveBackend::None;
 
     if (m_countersEnabled)
     {
-        m_counters.queueDepth = 0u;
+        updateDeferredQueueDepth();
         recordFlush(reason);
     }
 }
@@ -1649,6 +1874,19 @@ void GsBackendRouter::synchronizeCpuVram(
         m_acceleratedBackend->prepareCpuVramAccess(pages, reason);
 }
 
+void GsBackendRouter::synchronizeCpuVram(
+    const GsVramPageMask &readPages,
+    const GsVramPageMask &writePages,
+    GsFlushReason reason)
+{
+    if (m_acceleratedBackend &&
+        (readPages.any() || writePages.any()))
+    {
+        m_acceleratedBackend->prepareCpuVramAccess(
+            readPages, writePages, reason);
+    }
+}
+
 void GsBackendRouter::resolvePendingHybrid(bool accelerate)
 {
     if (m_pendingHybridCommands.empty())
@@ -1674,17 +1912,17 @@ void GsBackendRouter::resolvePendingHybrid(bool accelerate)
     else
     {
         transitionTo(ActiveBackend::Software);
-        GsVramPageMask accessPages;
+        GsVramPageMask readPages;
         GsVramPageMask writePages;
         for (const GsDrawCommand &command : commands)
         {
             const GsDrawResources resources = command.resources();
-            accessPages.unionWith(resources.readPages);
-            accessPages.unionWith(resources.writePages);
+            readPages.unionWith(resources.readPages);
             writePages.unionWith(resources.writePages);
         }
         synchronizeCpuVram(
-            accessPages, GsFlushReason::BackendSwitch);
+            readPages, writePages,
+            GsFlushReason::BackendSwitch);
         m_softwareBackend->submit(commands);
         if (m_acceleratedBackend)
             m_acceleratedBackend->noteCpuVramWrite(writePages);

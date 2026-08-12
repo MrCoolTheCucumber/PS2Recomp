@@ -135,6 +135,22 @@ void GsVramCoherency::noteCpuWrite(
 void GsVramCoherency::noteGpuWrite(
     const GsVramPageMask &pages)
 {
+    noteGpuWriteBatch(pages, 1u, pages.count());
+}
+
+void GsVramCoherency::noteGpuWriteBatch(
+    const GsVramPageMask &pages,
+    uint64_t operationCount,
+    uint64_t pageTouches)
+{
+    const size_t uniquePages = pages.count();
+    if (uniquePages == 0u)
+        return;
+    if (operationCount == 0u || pageTouches < uniquePages)
+    {
+        throw std::invalid_argument(
+            "GPU write batch diagnostics do not describe its page mask");
+    }
     for (size_t pageIndex = 0u; pageIndex < m_pages.size(); ++pageIndex)
     {
         if (pages.test(pageIndex) &&
@@ -144,17 +160,14 @@ void GsVramCoherency::noteGpuWrite(
             reject("GPU write overlaps a CPU-newer GS VRAM page");
         }
     }
-    if (!pages.any())
-        return;
-
     const uint64_t generation = allocateGeneration();
     for (size_t pageIndex = 0u; pageIndex < m_pages.size(); ++pageIndex)
     {
         if (pages.test(pageIndex))
             m_pages[pageIndex].gpuGeneration = generation;
     }
-    ++m_statistics.gpuWriteOperations;
-    m_statistics.gpuWritePages += pages.count();
+    m_statistics.gpuWriteOperations += operationCount;
+    m_statistics.gpuWritePages += pageTouches;
 }
 
 void GsVramCoherency::completeCpuToGpu(

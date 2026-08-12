@@ -742,6 +742,36 @@ void register_ps2_gs_tests()
                       "bounded region coordinates should retain scoped page masks");
         });
 
+        tc.Run("GS page-mask ranges set exact circular intervals", [](TestCase &t)
+        {
+            GsVramPageMask pages;
+            pages.setRange(61u, 70u);
+            t.Equals(
+                pages.count(), static_cast<size_t>(70u),
+                "the multi-word interval should have the requested size");
+            for (size_t page = 0u; page < pages.kPageCount; ++page)
+            {
+                t.Equals(
+                    pages.test(page), page >= 61u && page < 131u,
+                    "the multi-word interval should contain exactly its requested pages");
+            }
+
+            pages.clear();
+            pages.setRange(500u, 24u);
+            t.Equals(
+                pages.count(), static_cast<size_t>(24u),
+                "the wrapped interval should have the requested size");
+            for (size_t page = 0u; page < pages.kPageCount; ++page)
+            {
+                t.Equals(
+                    pages.test(page), page >= 500u || page < 12u,
+                    "the interval should wrap exactly across the VRAM ring");
+            }
+
+            pages.setRange(123u, pages.kPageCount);
+            t.IsTrue(pages.all(), "a complete range should set every page");
+        });
+
         tc.Run("GS surface rectangle masks contain every canonical PSM address", [](TestCase &t)
         {
             struct SurfaceSpec
@@ -1297,6 +1327,8 @@ void register_ps2_gs_tests()
                      "external CPU transaction should publish its writer mask once");
             t.IsTrue(accelerated.cpuWritePages[0] == cpuWrites,
                      "external CPU publication should not dirty read-only pages");
+            t.Equals(router.counters().queueDepth, 1ull,
+                     "an unrelated CPU transaction should preserve pending accelerated work");
 
             accelerated.cpuAccessPages.clear();
             accelerated.cpuAccessReasons.clear();
@@ -1304,8 +1336,8 @@ void register_ps2_gs_tests()
             const GsSubmissionResult frameDraw = router.submit(command);
             t.IsTrue(frameDraw.submitted && frameDraw.usedAccelerated,
                      "the frame checkpoint fixture should begin with pending GPU work");
-            t.Equals(router.counters().queueDepth, 1ull,
-                     "the frame checkpoint should observe pending accelerated work");
+            t.Equals(router.counters().queueDepth, 2ull,
+                     "the frame checkpoint should observe both retained accelerated draws");
             router.flush(GsFlushReason::PresentationLatch);
             t.Equals(accelerated.cpuAccessPages.size(),
                      static_cast<size_t>(1u),
