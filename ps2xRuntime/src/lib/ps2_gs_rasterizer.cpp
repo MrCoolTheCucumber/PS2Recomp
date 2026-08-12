@@ -2736,6 +2736,16 @@ void GSRasterizer::flushDrawBatch(
     m_backendState->router.flush(reason);
 }
 
+void GSRasterizer::flushDrawBatchForCpuReadback(
+    GS *gs,
+    const GsVramPageMask &readPages,
+    GsFlushReason reason)
+{
+    if (gs && gs != m_owner)
+        return;
+    m_backendState->router.flushForCpuReadback(readPages, reason);
+}
+
 void GSRasterizer::beginCpuVramAccess(
     GS *gs,
     const GsVramPageMask &readPages,

@@ -10412,7 +10412,7 @@ void register_ps2_gs_vulkan_tests()
             }
         });
 
-        tc.Run("GS Vulkan presentation latch publishes a complete CPU frame checkpoint", [](TestCase &t)
+        tc.Run("GS Vulkan presentation publishes display pages and snapshots publish all VRAM", [](TestCase &t)
         {
             GSMem::InitLookupTables();
             std::vector<uint8_t> softwareVram =
@@ -10499,8 +10499,22 @@ void register_ps2_gs_vulkan_tests()
 
             software.latchHostPresentationFrame();
             accelerated.latchHostPresentationFrame();
-            t.IsTrue(acceleratedVram == softwareVram,
-                     "the frame checkpoint should publish every GPU-newer page");
+            t.IsTrue(std::equal(
+                         acceleratedVram.begin() +
+                             displayPage * GS_VRAM_PAGE_SIZE,
+                         acceleratedVram.begin() +
+                             (displayPage + 1u) * GS_VRAM_PAGE_SIZE,
+                         softwareVram.begin() +
+                             displayPage * GS_VRAM_PAGE_SIZE),
+                     "the frame checkpoint should publish the GPU-newer display page");
+            t.IsTrue(std::equal(
+                         acceleratedVram.begin() +
+                             offscreenPage * GS_VRAM_PAGE_SIZE,
+                         acceleratedVram.begin() +
+                             (offscreenPage + 1u) * GS_VRAM_PAGE_SIZE,
+                         initial.begin() +
+                             offscreenPage * GS_VRAM_PAGE_SIZE),
+                     "presentation should leave an off-display GPU-newer page resident");
 
             std::vector<uint8_t> softwareFrame;
             std::vector<uint8_t> acceleratedFrame;
@@ -10562,8 +10576,8 @@ void register_ps2_gs_vulkan_tests()
                      "the frame batch should retain both disjoint draws");
             t.Equals(service.pageDownloadOperationsCompleted, 1ull,
                      "the frame checkpoint should publish GPU-newer pages once");
-            t.Equals(service.pagesDownloaded, 2ull,
-                     "presentation should publish display and off-display GPU pages");
+            t.Equals(service.pagesDownloaded, 1ull,
+                     "presentation should publish only the GPU-newer display page");
             t.Equals(service.queueSubmissions, 3ull,
                      "one upload batch and download should use three submissions");
             t.Equals(service.shaderDispatches, 2ull,
@@ -10585,12 +10599,12 @@ void register_ps2_gs_vulkan_tests()
                      1ull,
                      "the first frame should request one full CPU publication");
             t.Equals(backend.pageOwnership.gpuNewerPages,
-                     static_cast<size_t>(0u),
-                     "no hidden GPU writer may survive a frame checkpoint");
+                     static_cast<size_t>(1u),
+                     "the off-display GPU writer should remain device-resident");
             t.Equals(backend.coherency.cpuToGpuPages, 2ull,
                      "coherency should record the two uploaded draw pages");
-            t.Equals(backend.coherency.gpuToCpuPages, 2ull,
-                     "coherency should record display and off-display publication");
+            t.Equals(backend.coherency.gpuToCpuPages, 1ull,
+                     "coherency should record only display publication");
             counters = accelerated.backendCounters();
             t.Equals(counters.queueDepth, 0ull,
                      "the presentation boundary should leave no pending draw");
@@ -10624,6 +10638,18 @@ void register_ps2_gs_vulkan_tests()
                      "frame synchronization should remain validation-clean");
             t.Equals(repeatedService.validationWarnings, 0u,
                      "frame synchronization should emit no validation warnings");
+
+            accelerated.refreshDisplaySnapshot();
+            const GsVulkanServiceStatistics snapshotService =
+                accelerated.vulkanRendererServiceStatistics();
+            t.Equals(snapshotService.pagesDownloaded, 2ull,
+                     "a full VRAM snapshot should publish the retained off-display page");
+            t.IsTrue(acceleratedVram == softwareVram,
+                     "full observation should still materialize every GPU-newer page");
+            backend = accelerated.vulkanRendererBackendStatistics();
+            t.Equals(backend.pageOwnership.gpuNewerPages,
+                     static_cast<size_t>(0u),
+                     "full observation should leave no hidden GPU writer");
         });
 
         tc.Run("GS Vulkan fixed-seed transition streams match software at every observation", [](TestCase &t)
@@ -10783,8 +10809,8 @@ void register_ps2_gs_vulkan_tests()
                         return false;
                     }
                     ++frameObservations;
-                    name = "presentation latch";
-                    break;
+                    ++forcedObservations;
+                    return true;
                 }
                 case 2u:
                     software.writeRegister(GS_REG_FINISH, 0u);
@@ -11091,7 +11117,7 @@ void register_ps2_gs_vulkan_tests()
             t.Equals(operationIndex, cycleCount * actionCount,
                      "the randomized transition stream should remain bounded");
             t.Equals(forcedObservations, 27ull,
-                     "scheduled feedback and final boundaries should all compare VRAM");
+                     "scheduled observations and final boundaries should all be validated");
             t.Equals(frameObservations, 5ull,
                      "five scheduled frame observations should compare host pixels");
 
@@ -11398,8 +11424,8 @@ void register_ps2_gs_vulkan_tests()
                         return false;
                     }
                     ++frameObservations;
-                    name = "presentation latch";
-                    break;
+                    ++forcedObservations;
+                    return true;
                 }
                 case 2u:
                     software.writeRegister(GS_REG_FINISH, 0u);
@@ -11608,7 +11634,7 @@ void register_ps2_gs_vulkan_tests()
             t.Equals(operationIndex, cycleCount * actionCount,
                      "the strict transition stream should remain bounded");
             t.Equals(forcedObservations, 17ull,
-                     "mode switches scheduled observations and final state should compare VRAM");
+                     "mode switches scheduled observations and final state should be validated");
             t.Equals(frameObservations, 2ull,
                      "both scheduled frame observations should compare host pixels");
 
@@ -14034,8 +14060,6 @@ void register_ps2_gs_vulkan_tests()
                      "strict depth presentation should preserve frame height");
             t.IsTrue(strictFrame == softwareFrame,
                      "strict depth presentation bytes should match software");
-            if (!compareFullVram("presentation checkpoint"))
-                return;
 
             drawPair(commands[2]);
             configureNearestCt32SpriteCommand(software, flat);
@@ -14799,8 +14823,6 @@ void register_ps2_gs_vulkan_tests()
                      "strict linear presentation should preserve frame height");
             t.IsTrue(strictFrame == softwareFrame,
                      "strict linear presentation bytes should match software");
-            if (!compareFullVram("presentation checkpoint"))
-                return;
 
             drawNearestCt32SpriteCommand(software, smallA);
             drawNearestCt32SpriteCommand(strict, smallA);

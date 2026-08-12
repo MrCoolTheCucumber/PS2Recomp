@@ -1936,6 +1936,29 @@ void GsBackendRouter::flush(GsFlushReason reason)
     }
 }
 
+void GsBackendRouter::flushForCpuReadback(
+    const GsVramPageMask &readPages,
+    GsFlushReason reason)
+{
+    resolvePendingHybrid(false);
+    m_admittedHybridTail.reset();
+    m_admittedHybridPolicy = {};
+
+    // A presentation-style observation is still a command-stream checkpoint:
+    // finish all preceding work even when some of it targets off-screen VRAM.
+    // Only the CPU publication itself is narrowed to the pages the observer
+    // will actually read.
+    drainActive(reason);
+    synchronizeCpuVram(readPages, reason);
+
+    m_activeBackend = ActiveBackend::None;
+    if (m_countersEnabled)
+    {
+        m_counters.queueDepth = 0u;
+        recordFlush(reason);
+    }
+}
+
 void GsBackendRouter::beginCpuVramAccess(
     const GsVramPageMask &readPages,
     const GsVramPageMask &writePages,

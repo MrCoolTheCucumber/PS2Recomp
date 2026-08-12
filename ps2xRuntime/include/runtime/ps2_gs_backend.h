@@ -369,6 +369,13 @@ public:
     [[nodiscard]] GsSubmissionResult submit(
         const GsDrawCommand &command);
     void flush(GsFlushReason reason);
+    // Completes the current command stream like a normal flush, but only
+    // publishes the requested GPU-newer pages to canonical CPU VRAM. This is
+    // intended for bounded observers such as host presentation; full-state
+    // observations continue to use flush(reason).
+    void flushForCpuReadback(
+        const GsVramPageMask &readPages,
+        GsFlushReason reason);
 
     // Brackets a non-rasterizer CPU access to GS local memory. begin drains
     // already-submitted work, downloads only affected device-newer pages, and

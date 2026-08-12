@@ -28,6 +28,10 @@ public:
     void flushDrawBatch(
         GS *gs,
         GsFlushReason reason = GsFlushReason::Explicit);
+    void flushDrawBatchForCpuReadback(
+        GS *gs,
+        const GsVramPageMask &readPages,
+        GsFlushReason reason);
     void beginCpuVramAccess(
         GS *gs,
         const GsVramPageMask &readPages,

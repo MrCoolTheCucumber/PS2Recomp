@@ -1449,8 +1449,6 @@ bool GS::copyFrameToHostRgbaUnlocked(const GSFrameReg &frame,
 void GS::latchHostPresentationFrame()
 {
     std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
-    m_rasterizer.flushDrawBatch(
-        this, GsFlushReason::PresentationLatch);
     latchHostPresentationFrameUnlocked();
 }
 
@@ -1489,6 +1487,98 @@ void GS::latchHostPresentationFrameUnlocked()
 
     const bool validCrt1 = pmode.enableCrt1 && hasDisplaySetup(m_privRegs->display1, displayFrame1);
     const bool validCrt2 = pmode.enableCrt2 && hasDisplaySetup(m_privRegs->display2, displayFrame2);
+
+    GsVramPageMask presentationPages;
+    const auto addPresentationSurface = [&presentationPages](
+        const GSFrameReg &frame,
+        uint32_t width,
+        uint32_t height,
+        bool frameBaseIsPages,
+        uint32_t sourceOriginX,
+        uint32_t sourceOriginY)
+    {
+        if (width == 0u || height == 0u ||
+            width > kMaxPresentationWidth ||
+            height > kMaxPresentationHeight)
+        {
+            return;
+        }
+        const uint32_t baseBlock = frameBaseIsPages
+            ? GSInternal::framePageBaseToBlock(frame.fbp)
+            : frame.fbp;
+        const uint32_t bufferWidth = frame.fbw
+            ? frame.fbw
+            : std::max<uint32_t>(1u, (width + 63u) / 64u);
+        presentationPages.unionWith(gsVramPagesForSurfaceRect(
+            baseBlock,
+            bufferWidth,
+            frame.psm,
+            sourceOriginX,
+            sourceOriginY,
+            width,
+            height));
+    };
+
+    if (validCrt1)
+    {
+        addPresentationSurface(
+            displayFrame1, width1, height1, true,
+            displayOrigin1.x, displayOrigin1.y);
+    }
+    if (validCrt2)
+    {
+        addPresentationSurface(
+            displayFrame2, width2, height2, true,
+            displayOrigin2.x, displayOrigin2.y);
+    }
+
+    // The single-circuit path may use an immutable source retained across a
+    // display copy. Include both it and the direct display surface so a failed
+    // preferred-source conversion can safely fall back without another GPU
+    // round trip.
+    if (validCrt1 != validCrt2)
+    {
+        const GSFrameReg &displayFrame = validCrt1
+            ? displayFrame1
+            : displayFrame2;
+        const uint32_t width = validCrt1 ? width1 : width2;
+        const uint32_t height = validCrt1 ? height1 : height2;
+        if (m_hasPreferredDisplaySource &&
+            m_preferredDisplayDestFbp == displayFrame.fbp &&
+            (m_preferredDisplaySourceFrame.fbw != 0u ||
+             m_preferredDisplaySourceFrame.fbp != displayFrame.fbp))
+        {
+            addPresentationSurface(
+                m_preferredDisplaySourceFrame,
+                width,
+                height,
+                false,
+                0u,
+                0u);
+        }
+    }
+
+    // The legacy FBP-zero recovery probes both draw contexts only when the
+    // direct display is black. Publish those possible sources up front so the
+    // fallback remains one bounded checkpoint.
+    const auto addFbpZeroCandidates = [&](bool valid,
+                                          const GSFrameReg &displayFrame,
+                                          uint32_t width,
+                                          uint32_t height)
+    {
+        if (!valid || displayFrame.fbp != 0u)
+            return;
+        for (const GSContext &context : m_ctx)
+        {
+            addPresentationSurface(
+                context.frame, width, height, true, 0u, 0u);
+        }
+    };
+    addFbpZeroCandidates(validCrt1, displayFrame1, width1, height1);
+    addFbpZeroCandidates(validCrt2, displayFrame2, width2, height2);
+
+    m_rasterizer.flushDrawBatchForCpuReadback(
+        this, presentationPages, GsFlushReason::PresentationLatch);
 
     auto copyDisplaySource = [&](const GSFrameReg &displayFrame,
                                  const GSDisplayReadOrigin &displayOrigin,
