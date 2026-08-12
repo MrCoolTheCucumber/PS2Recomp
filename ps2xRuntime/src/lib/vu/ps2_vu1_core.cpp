@@ -317,13 +317,20 @@ bool vuExecutionStatesEqual(
             rightPipeline.fmacFlags[index];
         if (leftFlags.active != rightFlags.active)
             return fail("pipeline.fmacFlags.active");
+        if (leftFlags.fmacActive != rightFlags.fmacActive)
+            return fail("pipeline.fmacFlags.fmacActive");
+        if (leftFlags.clipActive != rightFlags.clipActive)
+            return fail("pipeline.fmacFlags.clipActive");
         if (leftFlags.mac != rightFlags.mac)
             return fail("pipeline.fmacFlags.mac");
         if (leftFlags.status != rightFlags.status)
             return fail("pipeline.fmacFlags.status");
+        if (leftFlags.clip != rightFlags.clip)
+            return fail("pipeline.fmacFlags.clip");
     }
     VU_COMPARE_PIPELINE_FIELD(fmacFlagIndex);
     VU_COMPARE_PIPELINE_FIELD(workingMac);
+    VU_COMPARE_PIPELINE_FIELD(workingClip);
 #undef VU_COMPARE_PIPELINE_FIELD
 
     if (firstDifference)
@@ -669,6 +676,7 @@ void VuUnit::start(
     m_state.pipeline.fmacFlags = {};
     m_state.pipeline.fmacFlagIndex = 0u;
     m_state.pipeline.workingMac = m_state.mac;
+    m_state.pipeline.workingClip = m_state.clip;
     m_state.vf[0][0] = 0.0f;
     m_state.vf[0][1] = 0.0f;
     m_state.vf[0][2] = 0.0f;
@@ -1217,6 +1225,8 @@ std::string VuUnit::formatVerifyMismatch(
                        pipeline.fmacFlagIndex)
                 << ",working_mac=0x" << std::hex
                 << pipeline.workingMac
+                << ",working_clip=0x"
+                << pipeline.workingClip
                 << ",vi_backup=" << std::dec
                 << static_cast<uint32_t>(
                        state.viBackupCycles)
@@ -1821,11 +1831,16 @@ void VuInterpreterBackend::commitFmacFlags(
     const VuPipelineState::FmacFlags &pending)
 {
     VuExecutionState &state = *m_state;
-    state.mac = pending.mac;
-    state.status =
-        (state.status & 0xff0u) |
-        (pending.status & 0x0fu) |
-        ((pending.status & 0x0fu) << 6u);
+    if (pending.fmacActive)
+    {
+        state.mac = pending.mac;
+        state.status =
+            (state.status & 0xff0u) |
+            (pending.status & 0x0fu) |
+            ((pending.status & 0x0fu) << 6u);
+    }
+    if (pending.clipActive)
+        state.clip = pending.clip;
 }
 
 void VuInterpreterBackend::scheduleFmacFlags(
@@ -1875,11 +1890,24 @@ void VuInterpreterBackend::scheduleFmacFlags(
         status |= 0x8u;
 
     pipeline.workingMac = mac;
-    pipeline.fmacFlags[pipeline.fmacFlagIndex] = {
-        .active = true,
-        .mac = mac,
-        .status = status,
-    };
+    VuPipelineState::FmacFlags &pending =
+        pipeline.fmacFlags[pipeline.fmacFlagIndex];
+    pending.active = true;
+    pending.fmacActive = true;
+    pending.mac = mac;
+    pending.status = status;
+}
+
+void VuInterpreterBackend::scheduleClipFlags(uint32_t clip)
+{
+    VuExecutionState &state = *m_state;
+    VuPipelineState &pipeline = state.pipeline;
+    pipeline.workingClip = clip & 0x00ffffffu;
+    VuPipelineState::FmacFlags &pending =
+        pipeline.fmacFlags[pipeline.fmacFlagIndex];
+    pending.active = true;
+    pending.clipActive = true;
+    pending.clip = pipeline.workingClip;
 }
 
 void VuInterpreterBackend::backupVi(uint8_t reg)

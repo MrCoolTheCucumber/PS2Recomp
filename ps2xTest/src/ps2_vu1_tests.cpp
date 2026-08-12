@@ -342,6 +342,23 @@ namespace
                (static_cast<uint32_t>(imm) & 0x7FFu);
     }
 
+    uint32_t makeVuFlagOperation(
+        uint8_t primary, uint8_t it, uint8_t is = 0u)
+    {
+        return (static_cast<uint32_t>(primary & 0x7fu) << 25u) |
+               (static_cast<uint32_t>(it & 0x1fu) << 16u) |
+               (static_cast<uint32_t>(is & 0x1fu) << 11u);
+    }
+
+    uint32_t makeVuStatusFlagOperation(
+        uint8_t primary, uint8_t it, uint16_t immediate)
+    {
+        return (static_cast<uint32_t>(primary & 0x7fu) << 25u) |
+               (static_cast<uint32_t>(immediate & 0x0800u) << 10u) |
+               (static_cast<uint32_t>(it & 0x0fu) << 16u) |
+               static_cast<uint32_t>(immediate & 0x07ffu);
+    }
+
     uint32_t makeVuBranch(int16_t imm)
     {
         return (0x20u << 25) | (static_cast<uint32_t>(imm) & 0x7FFu);
@@ -720,17 +737,22 @@ void register_ps2_vu1_tests()
             };
             original.pipeline.fmacFlags[2] = {
                 .active = true,
+                .fmacActive = true,
+                .clipActive = true,
                 .mac = 0x1234u,
                 .status = 0x5u,
+                .clip = 0x654321u,
             };
             original.pipeline.fmacFlagIndex = 1u;
             original.pipeline.workingMac = 0xabcd;
+            original.pipeline.workingClip = 0xabcdefu;
 
             VuExecutionState clone = original;
             original.pipeline.xgkick.packet[0] = 0xffu;
             original.pipeline.delayedQ.result = -1.0f;
             original.pipeline.delayedP.result = -2.0f;
             original.pipeline.fmacFlags[2].mac = 0u;
+            original.pipeline.fmacFlags[2].clip = 0u;
 
             t.Equals(clone.pc, uint32_t{0x138u},
                      "the architectural state should be copied");
@@ -756,10 +778,14 @@ void register_ps2_vu1_tests()
                      "the delayed P result should be copied");
             t.Equals(clone.pipeline.fmacFlags[2].mac, uint32_t{0x1234u},
                      "the fixed FMAC pipeline should be copied");
+            t.Equals(clone.pipeline.fmacFlags[2].clip, uint32_t{0x654321u},
+                     "the fixed clip pipeline should be copied");
             t.Equals(clone.pipeline.fmacFlagIndex, uint8_t{1u},
                      "the FMAC pipeline cursor should be copied");
             t.Equals(clone.pipeline.workingMac, uint32_t{0xabcdu},
                      "the pending MAC accumulator should be copied");
+            t.Equals(clone.pipeline.workingClip, uint32_t{0xabcdefu},
+                     "the pending clip accumulator should be copied");
         });
 
         tc.Run("unit reports backend-neutral execution lifecycle", [](TestCase &t)
@@ -1807,6 +1833,273 @@ void register_ps2_vu1_tests()
             t.Equals(
                 upperBroadcast.selector, uint8_t{3u},
                 "broadcast upper opcodes should retain their component");
+        });
+
+        tc.Run("lower MAC and clip flag opcodes retain their architectural encodings", [](TestCase &t)
+        {
+            struct DecodeExpectation
+            {
+                uint8_t primary;
+                uint8_t it;
+                uint8_t is;
+                const char *name;
+            };
+            constexpr std::array<DecodeExpectation, 4u> expectations{{
+                {0x18u, 2u, 3u, "LowerFmeq"},
+                {0x1au, 4u, 5u, "LowerFmand"},
+                {0x1bu, 10u, 0u, "LowerFmor"},
+                {0x1cu, 6u, 0u, "LowerFcget"},
+            }};
+            for (const DecodeExpectation &expectation : expectations)
+            {
+                const VuIrOperation operation =
+                    decodeVuIrInstructionPair(
+                        0u,
+                        makeVuFlagOperation(
+                            expectation.primary,
+                            expectation.it,
+                            expectation.is),
+                        kVuUpperNop)
+                        .lower;
+                t.Equals(
+                    std::string(vuIrOpcodeName(operation.opcode)),
+                    std::string(expectation.name),
+                    "primary opcode " +
+                        std::to_string(expectation.primary));
+            }
+
+            auto verifyExecution =
+                [&t](VuBackendKind backend, const char *backendName)
+            {
+                Vu1Fixture fx;
+                t.IsTrue(
+                    fx.initialize(),
+                    std::string(backendName) +
+                        " flag-op fixture should initialize");
+                writeVuInstructionPair(
+                    fx.code, 0u,
+                    makeVuFlagOperation(0x18u, 2u, 3u),
+                    kVuUpperNop);
+                writeVuInstructionPair(
+                    fx.code, 8u,
+                    makeVuFlagOperation(0x1au, 4u, 5u),
+                    kVuUpperNop);
+                writeVuInstructionPair(
+                    fx.code, 16u,
+                    makeVuFlagOperation(0x1bu, 10u, 0u),
+                    kVuUpperNop);
+                writeVuInstructionPair(
+                    fx.code, 24u,
+                    makeVuFlagOperation(0x1cu, 6u),
+                    kVuUpperNop);
+                fx.mem.markVU1CodeModified();
+
+                VuUnit unit(VuUnitId::Vu1);
+                std::string diagnostic;
+                t.IsTrue(
+                    unit.setBackend(backend, &diagnostic),
+                    std::string(backendName) +
+                        " backend should be selectable");
+                unit.state().mac = 0x000eu;
+                unit.state().clip = 0x00abcdefu;
+                unit.state().vi[3] = 0x000e;
+                unit.state().vi[5] = 0x00f3;
+                unit.state().vi[10] = 0x00fe;
+
+                unit.execute(
+                    fx.code, PS2_VU1_CODE_SIZE,
+                    fx.data, PS2_VU1_DATA_SIZE,
+                    fx.gs, &fx.mem,
+                    0u, 0u, 0u, 4u);
+                t.Equals(
+                    unit.state().vi[2], int32_t{1},
+                    std::string(backendName) +
+                        " FMEQ should compare the MAC flag");
+                t.Equals(
+                    unit.state().vi[4], int32_t{2},
+                    std::string(backendName) +
+                        " FMAND should mask the MAC flag");
+                t.Equals(
+                    unit.state().vi[10], int32_t{0x000e},
+                    std::string(backendName) +
+                        " FMOR should execute opcode 0x1b");
+                t.Equals(
+                    unit.state().vi[6], int32_t{0x0def},
+                    std::string(backendName) +
+                        " FCGET should expose the low 12 clip bits");
+            };
+
+            verifyExecution(
+                VuBackendKind::Interpreter, "interpreter");
+            if (VuRecompilerBackend::supported())
+            {
+                verifyExecution(
+                    VuBackendKind::Recompiler, "recompiler");
+            }
+        });
+
+        tc.Run("CLIP flags become visible after four instruction pairs", [](TestCase &t)
+        {
+            auto verifyExecution =
+                [&t](VuBackendKind backend, const char *backendName)
+            {
+                Vu1Fixture fx;
+                t.IsTrue(
+                    fx.initialize(),
+                    std::string(backendName) +
+                        " clip-latency fixture should initialize");
+
+                const uint32_t clip =
+                    makeVuUpperSpecial(0x1fu, 0xeu, 2u, 1u);
+                writeVuInstructionPair(
+                    fx.code, 0u,
+                    makeVuFlagOperation(0x1cu, 2u), clip);
+                writeVuInstructionPair(
+                    fx.code, 8u,
+                    makeVuFlagOperation(0x1cu, 3u), kVuUpperNop);
+                writeVuInstructionPair(
+                    fx.code, 16u,
+                    makeVuFlagOperation(0x1cu, 4u), kVuUpperNop);
+                writeVuInstructionPair(
+                    fx.code, 24u,
+                    makeVuFlagOperation(0x1cu, 5u), kVuUpperNop);
+                writeVuInstructionPair(
+                    fx.code, 32u, 0u, kVuUpperNop);
+                fx.mem.markVU1CodeModified();
+
+                VuUnit unit(VuUnitId::Vu1);
+                std::string diagnostic;
+                t.IsTrue(
+                    unit.setBackend(backend, &diagnostic),
+                    std::string(backendName) +
+                        " backend should be selectable");
+                constexpr uint32_t initialClip = 0x00123456u;
+                unit.state().clip = initialClip;
+                unit.state().vf[1][0] = 2.0f;
+                unit.state().vf[1][1] = -3.0f;
+                unit.state().vf[1][2] = 0.5f;
+                unit.state().vf[2][3] = -1.0f;
+
+                unit.execute(
+                    fx.code, PS2_VU1_CODE_SIZE,
+                    fx.data, PS2_VU1_DATA_SIZE,
+                    fx.gs, &fx.mem,
+                    0u, 0u, 0u, 5u);
+
+                for (uint8_t target = 2u; target <= 5u; ++target)
+                {
+                    t.Equals(
+                        unit.state().vi[target],
+                        int32_t{initialClip & 0x0fffu},
+                        std::string(backendName) +
+                            " FCGET before cycle four should see the old clip flags");
+                }
+                constexpr uint32_t expected =
+                    ((initialClip << 6u) | 0x09u) & 0x00ffffffu;
+                t.Equals(
+                    unit.state().clip, expected,
+                    std::string(backendName) +
+                        " CLIP should commit before the fifth pair executes");
+            };
+
+            verifyExecution(
+                VuBackendKind::Interpreter, "interpreter");
+            if (VuRecompilerBackend::supported())
+            {
+                verifyExecution(
+                    VuBackendKind::Recompiler, "recompiler");
+            }
+        });
+
+        tc.Run("lower status flag opcodes retain their target and split immediate", [](TestCase &t)
+        {
+            const VuIrOperation fsand =
+                decodeVuIrInstructionPair(
+                    0u,
+                    makeVuStatusFlagOperation(
+                        0x16u, 13u, 0x002u),
+                    kVuUpperNop)
+                    .lower;
+            t.IsTrue(
+                fsand.opcode == VuIrOpcode::LowerFsand &&
+                    fsand.viWriteMask == (1u << 13u) &&
+                    vuIrHasOpFlag(fsand, VuIrOpReadsStatus),
+                "FSAND VI13 metadata should retain the encoded target");
+
+            auto verifyExecution =
+                [&t](VuBackendKind backend, const char *backendName)
+            {
+                Vu1Fixture fx;
+                t.IsTrue(
+                    fx.initialize(),
+                    std::string(backendName) +
+                        " status-op fixture should initialize");
+                writeVuInstructionPair(
+                    fx.code, 0u,
+                    makeVuStatusFlagOperation(
+                        0x14u, 2u, 0x8c1u),
+                    kVuUpperNop);
+                writeVuInstructionPair(
+                    fx.code, 8u,
+                    makeVuStatusFlagOperation(
+                        0x16u, 13u, 0x802u),
+                    kVuUpperNop);
+                writeVuInstructionPair(
+                    fx.code, 16u,
+                    makeVuStatusFlagOperation(
+                        0x17u, 4u, 0x802u),
+                    kVuUpperNop);
+                writeVuInstructionPair(
+                    fx.code, 24u,
+                    makeVuStatusFlagOperation(
+                        0x15u, 0u, 0xb40u),
+                    kVuUpperNop);
+                fx.mem.markVU1CodeModified();
+
+                VuUnit unit(VuUnitId::Vu1);
+                std::string diagnostic;
+                t.IsTrue(
+                    unit.setBackend(backend, &diagnostic),
+                    std::string(backendName) +
+                        " backend should be selectable");
+                unit.state().status = 0x8c1u;
+                unit.state().vi[1] = 0xffd6;
+                unit.state().vi[13] = 0x009b;
+
+                unit.execute(
+                    fx.code, PS2_VU1_CODE_SIZE,
+                    fx.data, PS2_VU1_DATA_SIZE,
+                    fx.gs, &fx.mem,
+                    0u, 0u, 0u, 4u);
+                t.Equals(
+                    unit.state().vi[2], int32_t{1},
+                    std::string(backendName) +
+                        " FSEQ should compare all 12 immediate bits");
+                t.Equals(
+                    unit.state().vi[13], int32_t{0x0800},
+                    std::string(backendName) +
+                        " FSAND should write the encoded VI target");
+                t.Equals(
+                    unit.state().vi[4], int32_t{0x08c3},
+                    std::string(backendName) +
+                        " FSOR should write the bitwise union");
+                t.Equals(
+                    unit.state().vi[1], int32_t{0xffd6},
+                    std::string(backendName) +
+                        " status tests must not alias their target to VI1");
+                t.Equals(
+                    unit.state().status, uint32_t{0x0b41},
+                    std::string(backendName) +
+                        " FSSET should preserve current low status bits");
+            };
+
+            verifyExecution(
+                VuBackendKind::Interpreter, "interpreter");
+            if (VuRecompilerBackend::supported())
+            {
+                verifyExecution(
+                    VuBackendKind::Recompiler, "recompiler");
+            }
         });
 
         tc.Run("VU IR blocks retain delay slots and side-exit reasons", [](TestCase &t)
@@ -4030,6 +4323,11 @@ void register_ps2_vu1_tests()
             writeVuInstructionPair(
                 fx.code, 0u, 0u,
                 makeVuUpperSpecial(0x1Fu, 0xEu, 2u, 1u)); // CLIPw.xyz vf1, vf2w
+            for (uint32_t pc = 8u; pc <= 32u; pc += 8u)
+            {
+                writeVuInstructionPair(
+                    fx.code, pc, 0u, kVuUpperNop);
+            }
 
             VuUnit vu1;
             vu1.state().clip = 0x00123456u;
@@ -4040,7 +4338,7 @@ void register_ps2_vu1_tests()
 
             vu1.execute(fx.code, PS2_VU1_CODE_SIZE,
                         fx.data, PS2_VU1_DATA_SIZE,
-                        fx.gs, &fx.mem, 0u, 0u, 0u, 1u);
+                        fx.gs, &fx.mem, 0u, 0u, 0u, 5u);
 
             const uint32_t expected =
                 ((0x00123456u << 6u) | 0x09u) & 0x00FFFFFFu;

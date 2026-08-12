@@ -49,6 +49,7 @@ struct VU1NativeEmitterSpikeAccess
         interpreter.m_state.pipeline.fmacFlags = {};
         interpreter.m_state.pipeline.fmacFlagIndex = 0u;
         interpreter.m_state.pipeline.workingMac = initialState.mac;
+        interpreter.m_state.pipeline.workingClip = initialState.clip;
     }
 
     static void advanceFmac(VuUnit &interpreter)

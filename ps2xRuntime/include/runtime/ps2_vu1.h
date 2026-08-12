@@ -257,8 +257,11 @@ struct VuPipelineState
     struct FmacFlags
     {
         bool active = false;
+        bool fmacActive = false;
+        bool clipActive = false;
         uint32_t mac = 0;
         uint32_t status = 0;
+        uint32_t clip = 0;
     };
 
     static constexpr uint8_t kFmacFlagStages = 4u;
@@ -269,6 +272,7 @@ struct VuPipelineState
     std::array<FmacFlags, kFmacFlagStages> fmacFlags{};
     uint8_t fmacFlagIndex = 0u;
     uint32_t workingMac = 0u;
+    uint32_t workingClip = 0u;
 };
 
 struct VuExecutionState
@@ -662,6 +666,7 @@ private:
     void commitFmacFlags(const VuPipelineState::FmacFlags &pending);
     void scheduleFmacFlags(const float result[4], uint8_t dest,
                            bool preserveUnselected);
+    void scheduleClipFlags(uint32_t clip);
     void backupVi(uint8_t reg);
     int32_t readViForBranch(uint8_t reg) const;
 

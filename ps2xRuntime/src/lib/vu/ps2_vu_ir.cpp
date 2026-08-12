@@ -476,7 +476,7 @@ namespace
         case 0x14u:
             operation.opcode = VuIrOpcode::LowerFseq;
             operation.flags |= VuIrOpReadsStatus;
-            addViWrite(operation, 1u);
+            addViWrite(operation, viT);
             return operation;
         case 0x15u:
             operation.opcode = VuIrOpcode::LowerFsset;
@@ -485,29 +485,34 @@ namespace
         case 0x16u:
             operation.opcode = VuIrOpcode::LowerFsand;
             operation.flags |= VuIrOpReadsStatus;
-            addViWrite(operation, 1u);
+            addViWrite(operation, viT);
             return operation;
         case 0x17u:
             operation.opcode = VuIrOpcode::LowerFsor;
             operation.flags |= VuIrOpReadsStatus;
-            addViWrite(operation, 1u);
-            return operation;
-        case 0x18u:
-            operation.opcode = VuIrOpcode::LowerFmand;
-            operation.flags |= VuIrOpReadsMac;
-            addViRead(operation, viS);
             addViWrite(operation, viT);
             return operation;
-        case 0x1au:
+        case 0x18u:
             operation.opcode = VuIrOpcode::LowerFmeq;
             operation.flags |= VuIrOpReadsMac;
             addViRead(operation, viS);
             addViWrite(operation, viT);
             return operation;
-        case 0x1cu:
+        case 0x1au:
+            operation.opcode = VuIrOpcode::LowerFmand;
+            operation.flags |= VuIrOpReadsMac;
+            addViRead(operation, viS);
+            addViWrite(operation, viT);
+            return operation;
+        case 0x1bu:
             operation.opcode = VuIrOpcode::LowerFmor;
             operation.flags |= VuIrOpReadsMac;
             addViRead(operation, viS);
+            addViWrite(operation, viT);
+            return operation;
+        case 0x1cu:
+            operation.opcode = VuIrOpcode::LowerFcget;
+            operation.flags |= VuIrOpReadsClip;
             addViWrite(operation, viT);
             return operation;
         case 0x20u:
@@ -1159,6 +1164,7 @@ std::string_view vuIrOpcodeName(VuIrOpcode opcode)
         VU_IR_OPCODE_NAME(LowerFmand);
         VU_IR_OPCODE_NAME(LowerFmeq);
         VU_IR_OPCODE_NAME(LowerFmor);
+        VU_IR_OPCODE_NAME(LowerFcget);
         VU_IR_OPCODE_NAME(LowerB);
         VU_IR_OPCODE_NAME(LowerBal);
         VU_IR_OPCODE_NAME(LowerJr);

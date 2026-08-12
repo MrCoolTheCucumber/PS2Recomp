@@ -140,7 +140,7 @@ void VuInterpreterBackend::execLower(
     }
     case 0x11: // FCSET
     {
-        state.clip = instr & 0xFFFFFF;
+        scheduleClipFlags(instr & 0xFFFFFF);
         return;
     }
     case 0x12: // FCAND
@@ -159,52 +159,84 @@ void VuInterpreterBackend::execLower(
     }
     case 0x14: // FSEQ
     {
-        uint16_t imm12 = instr & 0xFFF;
-        if (1 != 0)
-            state.vi[1] = ((state.status & 0xFFF) == imm12) ? 1 : 0;
+        uint8_t it = VIT(instr);
+        uint16_t imm12 =
+            (uint16_t)((((instr >> 21) & 1u) << 11u) |
+                       (instr & 0x7FFu));
+        if (it != 0)
+            state.vi[it] =
+                ((state.status & 0xFFFu) == imm12) ? 1 : 0;
         return;
     }
     case 0x15: // FSSET
     {
-        state.status = (instr >> 6) & 0xFC0;
+        uint16_t imm12 =
+            (uint16_t)((((instr >> 21) & 1u) << 11u) |
+                       (instr & 0x7FFu));
+        state.status =
+            (uint32_t)(imm12 & 0xFC0u) |
+            (state.status & 0x3Fu);
         return;
     }
     case 0x16: // FSAND
     {
-        uint16_t imm12 = instr & 0xFFF;
-        if (1 != 0)
-            state.vi[1] = (int32_t)(state.status & imm12);
+        uint8_t it = VIT(instr);
+        uint16_t imm12 =
+            (uint16_t)((((instr >> 21) & 1u) << 11u) |
+                       (instr & 0x7FFu));
+        if (it != 0)
+            state.vi[it] =
+                (int32_t)((state.status & 0xFFFu) & imm12);
         return;
     }
     case 0x17: // FSOR
     {
-        uint16_t imm12 = instr & 0xFFF;
-        if (1 != 0)
-            state.vi[1] = ((state.status | imm12) == 0xFFF) ? 1 : 0;
+        uint8_t it = VIT(instr);
+        uint16_t imm12 =
+            (uint16_t)((((instr >> 21) & 1u) << 11u) |
+                       (instr & 0x7FFu));
+        if (it != 0)
+            state.vi[it] =
+                (int32_t)((state.status & 0xFFFu) | imm12);
         return;
     }
-    case 0x18: // FMAND
+    case 0x18: // FMEQ
     {
         uint8_t it = VIT(instr);
         uint8_t is = VIS(instr);
         if (it != 0)
-            state.vi[it] = (int32_t)(state.mac & (uint32_t)(uint16_t)state.vi[is]);
+            state.vi[it] =
+                ((state.mac & 0xFFFFu) ==
+                 (uint32_t)(uint16_t)state.vi[is])
+                    ? 1
+                    : 0;
         return;
     }
-    case 0x1A: // FMEQ
+    case 0x1A: // FMAND
     {
         uint8_t it = VIT(instr);
         uint8_t is = VIS(instr);
         if (it != 0)
-            state.vi[it] = ((state.mac & 0xFFFF) == (uint32_t)(uint16_t)state.vi[is]) ? 1 : 0;
+            state.vi[it] =
+                (int32_t)((state.mac & 0xFFFFu) &
+                          (uint32_t)(uint16_t)state.vi[is]);
         return;
     }
-    case 0x1C: // FMOR
+    case 0x1B: // FMOR
     {
         uint8_t it = VIT(instr);
         uint8_t is = VIS(instr);
         if (it != 0)
-            state.vi[it] = (int32_t)(state.mac | (uint32_t)(uint16_t)state.vi[is]);
+            state.vi[it] =
+                (int32_t)((state.mac & 0xFFFFu) |
+                          (uint32_t)(uint16_t)state.vi[is]);
+        return;
+    }
+    case 0x1C: // FCGET
+    {
+        uint8_t it = VIT(instr);
+        if (it != 0)
+            state.vi[it] = (int32_t)(state.clip & 0x0FFFu);
         return;
     }
     case 0x20: // B (unconditional branch)

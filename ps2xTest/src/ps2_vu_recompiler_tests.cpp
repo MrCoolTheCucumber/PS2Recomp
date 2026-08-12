@@ -485,7 +485,7 @@ void register_ps2_vu_recompiler_tests()
                 }
 
                 t.Equals(
-                    kOpcodeCount, uint32_t{122u},
+                    kOpcodeCount, uint32_t{123u},
                     "the audit must be updated when IR grows");
                 t.Equals(
                     baselineCounts[static_cast<size_t>(
@@ -497,7 +497,7 @@ void register_ps2_vu_recompiler_tests()
                     baselineCounts[static_cast<size_t>(
                         VuRecompilerOpcodeDisposition::
                             NativeHelper)],
-                    uint32_t{50u},
+                    uint32_t{51u},
                     "baseline helper opcode count");
                 t.Equals(
                     baselineCounts[static_cast<size_t>(
@@ -515,7 +515,7 @@ void register_ps2_vu_recompiler_tests()
                     avxFmaCounts[static_cast<size_t>(
                         VuRecompilerOpcodeDisposition::
                             NativeHelper)],
-                    uint32_t{34u},
+                    uint32_t{35u},
                     "AVX/FMA helper opcode count");
                 t.Equals(
                     avxFmaCounts[static_cast<size_t>(

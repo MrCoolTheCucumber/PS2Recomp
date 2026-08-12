@@ -1613,11 +1613,15 @@ namespace
              pipeline.fmacFlags)
         {
             hashValue(hash, stage.active);
+            hashValue(hash, stage.fmacActive);
+            hashValue(hash, stage.clipActive);
             hashValue(hash, stage.mac);
             hashValue(hash, stage.status);
+            hashValue(hash, stage.clip);
         }
         hashValue(hash, pipeline.fmacFlagIndex);
         hashValue(hash, pipeline.workingMac);
+        hashValue(hash, pipeline.workingClip);
         return hash;
     }
 

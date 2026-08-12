@@ -437,8 +437,9 @@ void VuInterpreterBackend::execUpper(uint32_t instr)
             uint32_t wBits = 0u;
             std::memcpy(bits, vs, sizeof(bits));
             std::memcpy(&wBits, &vt[3], sizeof(wBits));
-            state.clip = Ps2VuUpdateClipFlags(
-                state.clip, bits[0], bits[1], bits[2], wBits);
+            scheduleClipFlags(Ps2VuUpdateClipFlags(
+                state.pipeline.workingClip,
+                bits[0], bits[1], bits[2], wBits));
             return;
         }
         case 0x20: // ADDAq

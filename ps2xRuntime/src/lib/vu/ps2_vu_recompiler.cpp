@@ -1322,6 +1322,8 @@ namespace
                     offsetof(
                         VuPipelineState, fmacFlags));
             Label done;
+            Label noFmac;
+            Label noClip;
 
             m_code.movzx(
                 m_code.eax,
@@ -1335,11 +1337,9 @@ namespace
                 m_code.al);
             if (knownSlot == KnownFmacSlot::Inactive)
                 return;
-            m_code.lea(
-                m_code.eax,
-                m_code.ptr[
-                    m_code.rax + m_code.rax * 2u]);
-            m_code.shl(m_code.eax, 2u);
+            m_code.imul(
+                m_code.eax, m_code.eax,
+                static_cast<int>(sizeof(Flags)));
             m_code.lea(
                 m_code.rdx,
                 m_code.ptr[
@@ -1355,6 +1355,12 @@ namespace
                 m_code.je(done);
             }
 
+            m_code.cmp(
+                m_code.byte[
+                    m_code.rdx +
+                    offsetof(Flags, fmacActive)],
+                0u);
+            m_code.je(noFmac);
             m_code.mov(
                 m_code.eax,
                 m_code.dword[
@@ -1391,13 +1397,30 @@ namespace
                         offsetof(
                             VuExecutionState, status))],
                 m_code.eax);
+            m_code.L(noFmac);
+            m_code.cmp(
+                m_code.byte[
+                    m_code.rdx +
+                    offsetof(Flags, clipActive)],
+                0u);
+            m_code.je(noClip);
+            m_code.mov(
+                m_code.eax,
+                m_code.dword[
+                    m_code.rdx +
+                    offsetof(Flags, clip)]);
+            m_code.mov(
+                m_code.dword[
+                    m_code.rbx +
+                    stateOffset(
+                        offsetof(
+                            VuExecutionState, clip))],
+                m_code.eax);
+            m_code.L(noClip);
             m_code.mov(
                 m_code.qword[m_code.rdx], 0u);
             m_code.mov(
-                m_code.dword[
-                    m_code.rdx +
-                    offsetof(Flags, status)],
-                0u);
+                m_code.qword[m_code.rdx + 8u], 0u);
             if (knownSlot == KnownFmacSlot::Dynamic)
                 m_code.L(done);
         }
@@ -2654,11 +2677,9 @@ namespace
                 m_code.ecx,
                 m_code.byte[
                     m_code.rbx + indexOffset]);
-            m_code.lea(
-                m_code.ecx,
-                m_code.ptr[
-                    m_code.rcx + m_code.rcx * 2u]);
-            m_code.shl(m_code.ecx, 2u);
+            m_code.imul(
+                m_code.ecx, m_code.ecx,
+                static_cast<int>(sizeof(Flags)));
             m_code.lea(
                 m_code.rdx,
                 m_code.ptr[
@@ -2668,6 +2689,11 @@ namespace
                 m_code.byte[
                     m_code.rdx +
                     offsetof(Flags, active)],
+                1u);
+            m_code.mov(
+                m_code.byte[
+                    m_code.rdx +
+                    offsetof(Flags, fmacActive)],
                 1u);
             m_code.mov(
                 m_code.dword[
@@ -4557,9 +4583,15 @@ namespace
                                     VuPipelineState::
                                         kFmacFlagStages];
                             knownFmacSlot =
-                                vuIrHasOpFlag(
-                                    producer.upper,
-                                    VuIrOpFmac)
+                                (vuIrHasOpFlag(
+                                     producer.upper,
+                                     VuIrOpFmac) ||
+                                 vuIrHasOpFlag(
+                                     producer.upper,
+                                     VuIrOpWritesClip) ||
+                                 vuIrHasOpFlag(
+                                     producer.lower,
+                                     VuIrOpWritesClip))
                                     ? KnownFmacSlot::Active
                                     : KnownFmacSlot::Inactive;
                         }

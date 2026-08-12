@@ -87,6 +87,7 @@ enum class VuIrOpcode : uint8_t
     LowerFmand,
     LowerFmeq,
     LowerFmor,
+    LowerFcget,
     LowerB,
     LowerBal,
     LowerJr,
