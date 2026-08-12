@@ -1609,6 +1609,13 @@ int main(int argc, char **argv)
         renderBatchScope.gs = nullptr;
     }
 
+    // Final comparison, hashing, and output are CPU observations. Hybrid may
+    // deliberately leave newer pages resident on the GPU after the last
+    // packet, so use the ordinary save/load observation boundary to publish
+    // canonical CPU VRAM before reading it directly below.
+    if (gs.rendererMode() != GsRendererMode::Software)
+        (void)gs.captureReplayState();
+
     const VramDifference difference = expectedVram.empty()
         ? VramDifference{}
         : compareVram(memory.getGSVRAM(), expectedVram);
