@@ -73,6 +73,10 @@ struct GsVulkanRasterBackendStatistics
     uint64_t queueBackpressureDrains = 0u;
     uint64_t pipelineChangeDrains = 0u;
     uint64_t cpuAccessPreparations = 0u;
+    std::array<uint64_t, GS_FLUSH_REASON_COUNT>
+        pageDownloadOperationsByReason{};
+    std::array<uint64_t, GS_FLUSH_REASON_COUNT>
+        pagesDownloadedByReason{};
     GsVramCoherencySummary pageOwnership{};
     GsVramCoherencyStatistics coherency{};
     std::string lastVerificationArtifact;

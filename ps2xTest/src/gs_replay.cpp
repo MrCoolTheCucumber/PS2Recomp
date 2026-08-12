@@ -590,7 +590,25 @@ namespace
                << statistics.pipelineChangeDrains
                << ",\"cpu_access_preparations\":"
                << statistics.cpuAccessPreparations
-               << ",\"page_ownership\":{\"synchronized_pages\":"
+               << ",\"page_downloads_by_reason\":{";
+        for (size_t index = 0u;
+             index < GS_FLUSH_REASON_COUNT;
+             ++index)
+        {
+            if (index != 0u)
+                output << ',';
+            writeJsonString(
+                output,
+                gsFlushReasonName(
+                    static_cast<GsFlushReason>(index)));
+            output << ":{\"operations\":"
+                   << statistics
+                          .pageDownloadOperationsByReason[index]
+                   << ",\"pages\":"
+                   << statistics.pagesDownloadedByReason[index]
+                   << '}';
+        }
+        output << "},\"page_ownership\":{\"synchronized_pages\":"
                << statistics.pageOwnership.synchronizedPages
                << ",\"cpu_newer_pages\":"
                << statistics.pageOwnership.cpuNewerPages

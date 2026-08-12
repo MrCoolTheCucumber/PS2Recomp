@@ -910,6 +910,13 @@ struct GsVulkanRasterBackend::Impl final
                     std::string(gsFlushReasonName(reason)),
                 std::move(executionError));
         }
+        const size_t reasonIndex = static_cast<size_t>(reason);
+        if (reasonIndex < GS_FLUSH_REASON_COUNT)
+        {
+            ++statistics.pageDownloadOperationsByReason[reasonIndex];
+            statistics.pagesDownloadedByReason[reasonIndex] +=
+                pages.count();
+        }
         coherency.completeGpuToCpu(pages);
     }
 

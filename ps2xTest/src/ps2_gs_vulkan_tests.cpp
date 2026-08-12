@@ -10578,6 +10578,18 @@ void register_ps2_gs_vulkan_tests()
                      "the frame checkpoint should publish GPU-newer pages once");
             t.Equals(service.pagesDownloaded, 1ull,
                      "presentation should publish only the GPU-newer display page");
+            backend = accelerated.vulkanRendererBackendStatistics();
+            const size_t presentationReason = static_cast<size_t>(
+                GsFlushReason::PresentationLatch);
+            t.Equals(
+                backend.pageDownloadOperationsByReason[
+                    presentationReason],
+                1ull,
+                "presentation should attribute one scoped page download");
+            t.Equals(
+                backend.pagesDownloadedByReason[presentationReason],
+                1ull,
+                "presentation should attribute only its display page");
             t.Equals(service.queueSubmissions, 3ull,
                      "one upload batch and download should use three submissions");
             t.Equals(service.shaderDispatches, 2ull,
