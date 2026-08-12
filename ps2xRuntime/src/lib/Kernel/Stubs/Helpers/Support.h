@@ -1703,33 +1703,44 @@ namespace
         return value;
     }
 
-    static uint32_t bytesForPixels(uint8_t psm, uint32_t pixelCount)
+    // IMAGE transfers are tightly packed by the transfer PSM. Formats such as
+    // PSMT8H and PSMT4HL/HH select lanes in 32-bit GS local-memory words, but
+    // their host payloads remain 8-bit and 4-bit respectively.
+    static uint32_t gsTransferBytesForPixels(uint8_t psm, uint32_t pixelCount)
     {
         const uint64_t pixels = static_cast<uint64_t>(pixelCount);
-        uint64_t bytes = 0;
+        uint32_t transferBitsPerPixel = 32u;
         switch (psm)
         {
         case 0:  // PSMCT32
-        case 1:  // PSMCT24 (treat as 32)
-        case 27: // PSMT8H (packed in 32-bit lanes)
-        case 36: // PSMT4HL (packed in 32-bit lanes)
-        case 44: // PSMT4HH (packed in 32-bit lanes)
-            bytes = pixels * 4ull;
+        case 48: // PSMZ32
+            transferBitsPerPixel = 32u;
+            break;
+        case 1:  // PSMCT24
+        case 49: // PSMZ24
+            transferBitsPerPixel = 24u;
             break;
         case 2:  // PSMCT16
         case 10: // PSMCT16S
-            bytes = pixels * 2ull;
+        case 50: // PSMZ16
+        case 58: // PSMZ16S
+            transferBitsPerPixel = 16u;
             break;
         case 19: // PSMT8
-            bytes = pixels;
+        case 27: // PSMT8H
+            transferBitsPerPixel = 8u;
             break;
         case 20: // PSMT4
-            bytes = (pixels + 1ull) / 2ull;
+        case 36: // PSMT4HL
+        case 44: // PSMT4HH
+            transferBitsPerPixel = 4u;
             break;
         default:
-            bytes = pixels * 4ull;
             break;
         }
+
+        const uint64_t bytes =
+            (pixels * static_cast<uint64_t>(transferBitsPerPixel) + 7ull) / 8ull;
         if (bytes > 0xFFFFFFFFull)
         {
             return 0xFFFFFFFFu;

@@ -3283,6 +3283,78 @@ void register_ps2_memory_tests()
             }
         });
 
+        tc.Run("processPendingTransfers synchronously drains scheduled GIF DMA", [](TestCase &t)
+        {
+            PS2Memory mem;
+            t.IsTrue(mem.initialize(),
+                     "PS2Memory initialize should succeed");
+
+            constexpr uint32_t kGifCh = 0x1000A000u;
+            constexpr uint32_t kSource = 0x00022600u;
+            constexpr uint32_t kQwc = 16u;
+            std::memset(mem.getRDRAM() + kSource,
+                        0x5Au, kQwc * 16u);
+
+            uint32_t scheduleCount = 0u;
+            uint32_t cancelCount = 0u;
+            mem.setGifDmaScheduleCallback(
+                [&](uint32_t)
+                {
+                    ++scheduleCount;
+                    return true;
+                });
+            mem.setGifDmaCancelCallback(
+                [&]()
+                {
+                    ++cancelCount;
+                });
+
+            std::vector<std::vector<uint8_t>> captured;
+            mem.setGifPacketCallback(
+                [&](const uint8_t *data,
+                    uint32_t sizeBytes)
+                {
+                    captured.emplace_back(
+                        data, data + sizeBytes);
+                });
+
+            t.IsTrue(mem.writeIORegister(
+                         kGifCh + 0x10u, kSource),
+                     "GIF MADR write should succeed");
+            t.IsTrue(mem.writeIORegister(
+                         kGifCh + 0x20u, kQwc),
+                     "GIF QWC write should succeed");
+            t.IsTrue(mem.writeIORegister(
+                         kGifCh, 0x100u),
+                     "GIF normal transfer should start");
+
+            GifDmaSnapshot state =
+                mem.gifDmaSnapshot();
+            t.IsTrue(state.active &&
+                         state.eventManaged &&
+                         state.qwc == 8u,
+                     "the initial slice should leave an event-owned eight-QW tail");
+            t.Equals(scheduleCount, 1u,
+                     "the initial slice should schedule one continuation");
+
+            mem.processPendingTransfers();
+
+            state = mem.gifDmaSnapshot();
+            t.IsFalse(state.active,
+                      "an explicit pending-transfer barrier should finish GIF DMA");
+            t.Equals(cancelCount, 1u,
+                     "the barrier should cancel scheduler ownership before draining");
+            t.Equals(captured.size(),
+                     static_cast<size_t>(1u),
+                     "the barrier should emit one complete GIF DMA stream");
+            if (!captured.empty())
+            {
+                t.Equals(captured[0].size(),
+                         static_cast<size_t>(kQwc * 16u),
+                         "the synchronous drain must preserve the scheduled tail");
+            }
+        });
+
         tc.Run("GIF DMA scheduled END chain combines tag and initial slice cost", [](TestCase &t)
         {
             PS2Memory mem;

@@ -9280,9 +9280,21 @@ void PS2Memory::drainVif1DmaCompatibility()
 
 void PS2Memory::processPendingTransfers()
 {
-    if (m_gifDma.active &&
-        !m_gifDma.eventManaged)
+    // HLE DMA helpers call this as an explicit synchronous barrier.  Once a
+    // GIF continuation belongs to the EE event scheduler, cancel that event
+    // before taking ownership and draining it here.  Otherwise the next HLE
+    // transfer can replace an active tail while the GIF path still expects
+    // its remaining IMAGE qwords.
+    if (m_gifDma.active)
+    {
+        if (m_gifDma.eventManaged)
+        {
+            if (m_gifDmaCancelCallback)
+                m_gifDmaCancelCallback();
+            m_gifDma.eventManaged = false;
+        }
         drainGifDmaCompatibility();
+    }
     if (m_vif0Dma.active &&
         !m_vif0Dma.eventManaged)
         drainVif0DmaCompatibility();

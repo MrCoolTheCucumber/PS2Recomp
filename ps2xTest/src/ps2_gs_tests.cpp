@@ -6737,6 +6737,127 @@ void register_ps2_gs_tests()
                      "the next strip triangle should use B-C-D after the skipped kick");
         });
 
+        tc.Run("sceGsSetDefLoadImage sizes packed host transfers by PSM", [](TestCase &t)
+        {
+            PS2Runtime runtime;
+            t.IsTrue(runtime.memory().initialize(), "runtime memory initialize should succeed");
+            uint8_t *const rdram = runtime.memory().getRDRAM();
+            constexpr uint32_t kPacketAddr = 0x4000u;
+
+            struct TransferSpec
+            {
+                const char *name;
+                uint8_t psm;
+                uint16_t width;
+                uint16_t height;
+                uint32_t expectedQwc;
+            };
+
+            constexpr std::array<TransferSpec, 14> specs{{
+                {"PSMCT32", GS_PSM_CT32, 64u, 64u, 1024u},
+                {"PSMCT24", GS_PSM_CT24, 64u, 64u, 768u},
+                {"PSMCT16", GS_PSM_CT16, 64u, 64u, 512u},
+                {"PSMCT16S", GS_PSM_CT16S, 64u, 64u, 512u},
+                {"PSMT8", GS_PSM_T8, 64u, 64u, 256u},
+                {"PSMT4", GS_PSM_T4, 64u, 64u, 128u},
+                {"PSMT8H", GS_PSM_T8H, 64u, 64u, 256u},
+                {"PSMT8H 32x32", GS_PSM_T8H, 32u, 32u, 64u},
+                {"PSMT4HL", GS_PSM_T4HL, 64u, 64u, 128u},
+                {"PSMT4HH", GS_PSM_T4HH, 64u, 64u, 128u},
+                {"PSMZ32", GS_PSM_Z32, 64u, 64u, 1024u},
+                {"PSMZ24", GS_PSM_Z24, 64u, 64u, 768u},
+                {"PSMZ16", GS_PSM_Z16, 64u, 64u, 512u},
+                {"PSMZ16S", GS_PSM_Z16S, 64u, 64u, 512u},
+            }};
+
+            for (const TransferSpec &spec : specs)
+            {
+                std::memset(rdram + kPacketAddr, 0, 6u * 16u);
+
+                R5900Context defineCtx{};
+                setRegU32(defineCtx, 4, kPacketAddr);
+                setRegU32(defineCtx, 5, 0u);
+                setRegU32(defineCtx, 6, 1u);
+                setRegU32(defineCtx, 7, spec.psm);
+                setRegU32(defineCtx, 8, 0u);
+                setRegU32(defineCtx, 9, 0u);
+                setRegU32(defineCtx, 10, spec.width);
+                setRegU32(defineCtx, 11, spec.height);
+                ps2_stubs::sceGsSetDefLoadImage(rdram, &defineCtx, &runtime);
+
+                t.Equals(static_cast<int32_t>(getRegU32Test(defineCtx, 2)), 6,
+                         std::string(spec.name) + " should produce a six-QW setup packet");
+
+                uint64_t imageTag = 0u;
+                std::memcpy(&imageTag, rdram + kPacketAddr + 80u, sizeof(imageTag));
+                t.Equals(static_cast<uint32_t>(imageTag & 0x7FFFu), spec.expectedQwc,
+                         std::string(spec.name) + " IMAGE NLOOP should use packed host-transfer bytes");
+            }
+        });
+
+        tc.Run("sceGsExecLoadImage drains a scheduled IMAGE tail before returning", [](TestCase &t)
+        {
+            PS2Runtime runtime;
+            t.IsTrue(runtime.memory().initialize(),
+                     "runtime memory initialize should succeed");
+            uint8_t *const rdram =
+                runtime.memory().getRDRAM();
+
+            constexpr uint32_t kPacketAddr = 0x8000u;
+            constexpr uint32_t kSourceAddr = 0x9000u;
+            constexpr uint32_t kDbp = 0x40u;
+            constexpr uint32_t kWidth = 16u;
+            constexpr uint32_t kHeight = 16u;
+            constexpr uint32_t kPixelCount =
+                kWidth * kHeight;
+
+            R5900Context defineCtx{};
+            setRegU32(defineCtx, 4, kPacketAddr);
+            setRegU32(defineCtx, 5, kDbp);
+            setRegU32(defineCtx, 6, 1u);
+            setRegU32(defineCtx, 7, GS_PSM_CT32);
+            setRegU32(defineCtx, 8, 0u);
+            setRegU32(defineCtx, 9, 0u);
+            setRegU32(defineCtx, 10, kWidth);
+            setRegU32(defineCtx, 11, kHeight);
+            ps2_stubs::sceGsSetDefLoadImage(
+                rdram, &defineCtx, &runtime);
+
+            for (uint32_t pixelIndex = 0u;
+                 pixelIndex < kPixelCount;
+                 ++pixelIndex)
+            {
+                const uint32_t pixel =
+                    0xA5000000u | pixelIndex;
+                std::memcpy(
+                    rdram + kSourceAddr +
+                        pixelIndex * sizeof(pixel),
+                    &pixel, sizeof(pixel));
+            }
+
+            R5900Context loadCtx{};
+            setRegU32(loadCtx, 4, kPacketAddr);
+            setRegU32(loadCtx, 5, kSourceAddr);
+            ps2_stubs::sceGsExecLoadImage(
+                rdram, &loadCtx, &runtime);
+
+            t.Equals(
+                static_cast<int32_t>(
+                    getRegU32Test(loadCtx, 2)),
+                0,
+                "sceGsExecLoadImage should succeed");
+            t.IsFalse(
+                runtime.memory()
+                    .gifDmaSnapshot().active,
+                "sceGsExecLoadImage should not return with an IMAGE tail active");
+            t.Equals(
+                runtime.gs().ReadVram(
+                    GS_PSM_CT32, kDbp, 1u,
+                    kWidth - 1u, kHeight - 1u),
+                0xA50000FFu,
+                "the final pixel should survive the scheduled eight-QW tail");
+        });
+
         tc.Run("sceGs load-image stubs use the Sony setup-packet ABI and literal DBP units", [](TestCase &t)
         {
             PS2Runtime runtime;
@@ -6943,7 +7064,40 @@ void register_ps2_gs_tests()
                       "TRXDIR payload must encode dir=0 (host-to-local)");
         });
 
-        tc.Run("sceGsResetGraph frees its temporary GIF packet", [](TestCase &t)
+        tc.Run("sceGsPutDrawEnv submits the leading GIFtag and its payload", [](TestCase &t)
+        {
+            PS2Runtime runtime;
+            t.IsTrue(runtime.memory().initialize(), "runtime memory initialize should succeed");
+            uint8_t *const rdram = runtime.memory().getRDRAM();
+            constexpr uint32_t kPacketAddr = 0x8000u;
+
+            // A packed two-loop CLAMP_1 packet distinguishes the Sony ABI
+            // from the old HLE layout.  Interpreting the first QW as an A+D
+            // pair writes the GIFtag value to CLAMP_1 and drops the final
+            // payload; normal GIF parsing applies 5 and then 0.
+            const uint64_t packet[] = {
+                makeGifTag(2u, 0u, 1u),
+                static_cast<uint64_t>(GS_REG_CLAMP_1),
+                5ull,
+                0ull,
+                0ull,
+                0ull,
+            };
+            std::memcpy(rdram + kPacketAddr, packet, sizeof(packet));
+            runtime.gs().writeRegister(GS_REG_CLAMP_1, 0x55ull);
+
+            R5900Context ctx{};
+            setRegU32(ctx, 4, kPacketAddr);
+            ps2_stubs::sceGsPutDrawEnv(rdram, &ctx, &runtime);
+
+            t.Equals(static_cast<int32_t>(getRegU32Test(ctx, 2)), 0,
+                     "sceGsPutDrawEnv should submit a valid draw-environment packet");
+            const GsReplayState state = runtime.gs().captureReplayState();
+            t.Equals(state.ctx[0].clamp, 0ull,
+                     "the final packed CLAMP_1 payload should win over the leading GIFtag");
+        });
+
+        tc.Run("sceGsResetGraph reset mode preserves guest heap availability", [](TestCase &t)
         {
             PS2Runtime runtime;
             t.IsTrue(runtime.memory().initialize(), "runtime memory initialize should succeed");
@@ -6959,7 +7113,50 @@ void register_ps2_gs_tests()
             t.Equals(static_cast<int32_t>(getRegU32Test(ctx, 2)), 0,
                      "sceGsResetGraph should succeed in reset mode");
             expectGuestHeapReusable(t, runtime,
-                                    "sceGsResetGraph should free its temporary GIF packet");
+                                    "sceGsResetGraph should leave the guest heap reusable");
+        });
+
+        tc.Run("sceGsResetGraph reset mode clears drawing state and programs privileged registers", [](TestCase &t)
+        {
+            PS2Runtime runtime;
+            t.IsTrue(runtime.memory().initialize(), "runtime memory initialize should succeed");
+
+            runtime.gs().writeRegister(GS_REG_SCANMSK, 2u);
+            runtime.gs().writeRegister(GS_REG_PRMODECONT, 0u);
+            runtime.gs().writeRegister(GS_REG_CLAMP_1, 0x123456789abcdef0ull);
+            runtime.gs().writeRegister(GS_REG_TEXA, 0x0000003c0000004full);
+
+            std::vector<uint8_t> rdram(PS2_RAM_SIZE, 0u);
+            R5900Context ctx{};
+            setRegU32(ctx, 4, 0u);
+            setRegU32(ctx, 5, 1u);
+            setRegU32(ctx, 6, 2u);
+            setRegU32(ctx, 7, 1u);
+            ps2_stubs::sceGsResetGraph(rdram.data(), &ctx, &runtime);
+
+            const GsReplayState state = runtime.gs().captureReplayState();
+            t.Equals(state.scanMask, static_cast<uint8_t>(0u),
+                     "GS_INIT_RESET should clear a stale odd/even scanline mask");
+            t.IsTrue(state.prmodecont,
+                     "GS_INIT_RESET should restore PRMODECONT");
+            t.Equals(state.ctx[0].clamp, 0ull,
+                     "GS_INIT_RESET should clear context drawing registers");
+            t.Equals(state.texa.ta0, static_cast<uint8_t>(0u),
+                     "GS_INIT_RESET should clear TEXA TA0");
+            t.Equals(state.texa.ta1, static_cast<uint8_t>(0u),
+                     "GS_INIT_RESET should clear TEXA TA1");
+
+            const GSRegisters &regs = runtime.memory().gs();
+            t.Equals(regs.pmode, 0x8005ull,
+                     "sceGsResetGraph should program PMODE through privileged MMIO state");
+            t.Equals(regs.smode2, 0x3ull,
+                     "sceGsResetGraph should program interlaced frame-mode SMODE2");
+            t.Equals(regs.dispfb1, regs.dispfb2,
+                     "sceGsResetGraph should initialize both display circuits equally");
+            t.Equals(regs.display1, regs.display2,
+                     "sceGsResetGraph should initialize both display rectangles equally");
+            t.Equals(static_cast<int32_t>(getRegU32Test(ctx, 2)), 0,
+                     "sceGsResetGraph should succeed in reset mode");
         });
 
         tc.Run("sceGsSyncV waits on VBlank and reports interlaced field parity", [](TestCase &t)

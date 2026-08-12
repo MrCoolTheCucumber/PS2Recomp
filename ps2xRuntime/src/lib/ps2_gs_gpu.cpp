@@ -1170,6 +1170,8 @@ void GS::recordRegisterDebugEventUnlocked(uint8_t regAddr, uint64_t value)
     case GS_REG_TEX2_2:
     case GS_REG_TEXA:
     case GS_REG_TEXCLUT:
+    case GS_REG_CLAMP_1:
+    case GS_REG_CLAMP_2:
     case GS_REG_FRAME_1:
     case GS_REG_FRAME_2:
     case GS_REG_ZBUF_1:

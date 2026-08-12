@@ -913,7 +913,7 @@ namespace ps2_stubs
             return;
         }
 
-        const uint32_t rowBytes = bytesForPixels(img.psm, static_cast<uint32_t>(img.width));
+        const uint32_t rowBytes = gsTransferBytesForPixels(img.psm, static_cast<uint32_t>(img.width));
         if (rowBytes == 0)
         {
             setReturnS32(ctx, -1);
@@ -1007,14 +1007,30 @@ namespace ps2_stubs
 
     void sceGsPutDrawEnv(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
-        uint32_t envAddr = getRegU32(ctx, 4);
-        GsRegPairMem pairs[8]{};
-        if (!readGsRegPairs(rdram, envAddr, pairs, 8u))
+        const uint32_t packetAddr = getRegU32(ctx, 4);
+        uint64_t gifTag = 0u;
+        if (!runtime || !runtime->syncCoreSubsystems() ||
+            !tryReadQwordFromGuest(rdram, runtime, packetAddr, gifTag))
         {
             setReturnS32(ctx, -1);
             return;
         }
-        applyGsRegPairs(runtime, pairs, 8u);
+
+        // The Sony ABI receives a complete GIF packet: a leading GIFtag
+        // followed by NLOOP payload QWs.  Submit it as one normal-mode GIF
+        // DMA, matching the retail implementation.  Treating packetAddr as
+        // the first {value, register} pair makes packed register descriptors
+        // reinterpret the GIFtag itself as drawing state.
+        const uint32_t packetQwc =
+            static_cast<uint32_t>(gifTag & 0x7FFFu) + 1u;
+        constexpr uint32_t GIF_CHANNEL = 0x1000A000u;
+        constexpr uint32_t CHCR_STR_MODE0 = 0x101u;
+        auto &mem = runtime->memory();
+        mem.writeIORegister(GIF_CHANNEL + 0x10u, packetAddr);
+        mem.writeIORegister(GIF_CHANNEL + 0x20u, packetQwc);
+        mem.writeIORegister(GIF_CHANNEL + 0x00u, CHCR_STR_MODE0);
+        mem.processPendingTransfers();
+
         setReturnS32(ctx, 0);
     }
 
@@ -1035,6 +1051,14 @@ namespace ps2_stubs
 
             if (runtime)
             {
+                // GS_INIT_RESET writes RESET in the privileged CSR before
+                // programming the requested video mode.  That reset clears
+                // drawing registers such as SCANMSK; retaining them lets a
+                // previous renderer leak odd/even scanline masks into the
+                // next client (notably MPEG playback).  GS local memory is
+                // intentionally retained by GS::reset().
+                runtime->gs().reset();
+
                 EeInterruptRuntimeState &state =
                     runtime->eeInterruptRuntimeState();
                 {
@@ -1064,43 +1088,19 @@ namespace ps2_stubs
 
             if (runtime)
             {
-                uint32_t pktAddr = runtime->guestMalloc(128u, 16u);
-                if (pktAddr != 0u)
-                {
-                    uint8_t *pkt = getMemPtr(rdram, pktAddr);
-                    if (pkt)
-                    {
-                        uint64_t *q = reinterpret_cast<uint64_t *>(pkt);
-                        q[0] = makeGiftagAplusD(7u);
-                        q[1] = 0xEULL;
-                        q[2] = pmode;
-                        q[3] = 0x41ULL;
-                        q[4] = smode2;
-                        q[5] = 0x42ULL;
-                        q[6] = dispfb;
-                        q[7] = 0x59ULL;
-                        q[8] = display;
-                        q[9] = 0x5aULL;
-                        q[10] = dispfb;
-                        q[11] = 0x5bULL;
-                        q[12] = display;
-                        q[13] = 0x5cULL;
-                        q[14] = bgcolor;
-                        q[15] = 0x5fULL;
-                        constexpr uint32_t GIF_CHANNEL = 0x1000A000;
-                        constexpr uint32_t CHCR_STR_MODE0 = 0x101u;
-                        auto &mem = runtime->memory();
-                        mem.writeIORegister(GIF_CHANNEL + 0x10u, pktAddr);
-                        mem.writeIORegister(GIF_CHANNEL + 0x20u, 8u);
-                        mem.writeIORegister(GIF_CHANNEL + 0x00u, CHCR_STR_MODE0);
-                        mem.processPendingTransfers();
-                        runtime->guestFree(pktAddr);
-                    }
-                    else
-                    {
-                        runtime->guestFree(pktAddr);
-                    }
-                }
+                // PMODE through BGCOLOR are privileged GS MMIO registers,
+                // not GIF A+D register IDs.  Program the privileged bank
+                // directly; feeding their low address bytes to the GIF would
+                // instead corrupt drawing registers such as SCISSOR_2 and
+                // ALPHA_1.
+                auto &regs = runtime->memory().gs();
+                regs.pmode = pmode;
+                regs.smode2 = smode2;
+                regs.dispfb1 = dispfb;
+                regs.display1 = display;
+                regs.dispfb2 = dispfb;
+                regs.display2 = display;
+                regs.bgcolor = bgcolor;
             }
         }
 
@@ -1409,7 +1409,7 @@ namespace ps2_stubs
         }
 
         const uint32_t imageBytes =
-            bytesForPixels(static_cast<uint8_t>(args.psm), static_cast<uint32_t>(pixelCount));
+            gsTransferBytesForPixels(static_cast<uint8_t>(args.psm), static_cast<uint32_t>(pixelCount));
         const uint64_t imageQwc64 = (static_cast<uint64_t>(imageBytes) + 15ull) / 16ull;
         if (imageQwc64 > 0x7FFFull)
         {
