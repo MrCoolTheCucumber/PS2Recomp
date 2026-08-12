@@ -3016,6 +3016,66 @@ namespace
             return true;
         }
 
+        bool executeResidentGouraudDepthCt32Triangles(
+            std::span<const GsVulkanGouraudDepthCt32Triangle> triangles,
+            std::string *error) override
+        {
+            if (!isHealthy || behavior == Behavior::Fail ||
+                behavior == Behavior::FailResidentDraw ||
+                behavior == Behavior::InvalidOutput ||
+                triangles.empty() ||
+                triangles.size() >
+                    GS_VULKAN_MAX_RESIDENT_GOURAUD_DEPTH_CT32_TRIANGLE_BATCH ||
+                !report.devices[0].exactGouraudDepthCt32Triangle)
+            {
+                serviceStatistics
+                    .gouraudDepthCt32TriangleDrawsFailed +=
+                    triangles.size();
+                ++serviceStatistics
+                      .residentGouraudDepthCt32TriangleBatchesFailed;
+                if (error)
+                {
+                    *error =
+                        "injected resident Gouraud depth triangle failure";
+                }
+                return false;
+            }
+            for (const auto &triangle : triangles)
+            {
+                if (behavior == Behavior::Exact)
+                {
+                    applyGouraudDepthCt32TriangleCpu(
+                        residentVram, triangle);
+                }
+                serviceStatistics
+                    .gouraudDepthCt32TriangleCandidatePixelsExecuted +=
+                    static_cast<uint64_t>(
+                        triangle.boundsX1 - triangle.boundsX0) *
+                    static_cast<uint64_t>(
+                        triangle.boundsY1 - triangle.boundsY0);
+            }
+            serviceStatistics
+                .gouraudDepthCt32TriangleDrawsCompleted +=
+                triangles.size();
+            ++serviceStatistics
+                  .residentGouraudDepthCt32TriangleBatchesCompleted;
+            serviceStatistics
+                .largestResidentGouraudDepthCt32TriangleBatch =
+                std::max(
+                    serviceStatistics
+                        .largestResidentGouraudDepthCt32TriangleBatch,
+                    static_cast<uint64_t>(triangles.size()));
+            ++serviceStatistics.queueSubmissions;
+            ++serviceStatistics.shaderDispatches;
+            serviceStatistics.pipelineBarriers += 3u;
+            ++serviceStatistics.pipelineBinds;
+            ++serviceStatistics.pipelineCacheHits;
+            ++serviceStatistics.fenceWaits;
+            if (error)
+                error->clear();
+            return true;
+        }
+
         void shutdown() noexcept override
         {
             isHealthy = false;
@@ -3114,6 +3174,10 @@ void register_ps2_gs_vulkan_tests()
             t.Equals(GS_VULKAN_MAX_RESIDENT_TRIANGLE_BATCH,
                      GS_VRAM_PAGE_COUNT,
                      "disjoint triangle batches cannot exceed physical pages");
+            t.Equals(
+                GS_VULKAN_MAX_RESIDENT_GOURAUD_DEPTH_CT32_TRIANGLE_BATCH,
+                size_t{6144u},
+                "ordered Gouraud tile batches should retain a fixed host bound");
         });
 
         tc.Run("CT32 sprite preparation applies exact GS bounds and eligibility", [](TestCase &t)
@@ -8518,7 +8582,7 @@ void register_ps2_gs_vulkan_tests()
             }
         });
 
-        tc.Run("Vulkan raster backend verifies Gouraud depth triangles only behind capability", [](TestCase &t)
+        tc.Run("Vulkan raster backend verifies and batches Gouraud depth triangles", [](TestCase &t)
         {
             GSMem::InitLookupTables();
             const GsDrawCommand command =
@@ -8539,6 +8603,8 @@ void register_ps2_gs_vulkan_tests()
                 makeVramPattern(0x47445631u);
             std::vector<uint8_t> expected = initial;
             applyGouraudDepthCt32TriangleCpu(expected, prepared);
+            std::vector<uint8_t> twiceExpected = expected;
+            applyGouraudDepthCt32TriangleCpu(twiceExpected, prepared);
             std::vector<uint8_t> vram = initial;
             uint64_t softwareCalls = 0u;
             GsVulkanRasterBackendConfig config{};
@@ -8607,16 +8673,50 @@ void register_ps2_gs_vulkan_tests()
 
             t.IsTrue(backend->setMode(GsRendererMode::GpuStrict),
                      "the synchronized backend should accept strict mode");
+            t.IsTrue(
+                backend->classify(command).supported,
+                "strict should expose the resident Gouraud class");
+            backend->submit(
+                std::span<const GsDrawCommand>(&command, 1u));
             t.Equals(
-                backend->classify(command).reason,
-                GsFallbackReason::GouraudShading,
-                "strict must keep the new Gouraud class closed");
+                backend->pendingCommandCount(), size_t{1u},
+                "strict Gouraud triangles should enter the resident queue");
+            backend->flush(GsFlushReason::Explicit);
+            backend->prepareCpuVramAccess(
+                command.resources().writePages,
+                GsFlushReason::CpuReadback);
+            t.IsTrue(
+                vram == twiceExpected,
+                "strict resident Gouraud execution should preserve exact VRAM");
+            t.Equals(
+                softwareCalls, 1ull,
+                "strict Gouraud execution must not call the software oracle");
+            const GsVulkanServiceStatistics strictService =
+                backend->serviceStatistics();
+            t.Equals(
+                strictService.gouraudDepthCt32TriangleDrawsCompleted,
+                2ull,
+                "Verify and strict should each execute one Gouraud triangle");
+            t.Equals(
+                strictService
+                    .residentGouraudDepthCt32TriangleBatchesCompleted,
+                1ull,
+                "strict should use one resident Gouraud request");
             t.IsTrue(backend->setMode(GsRendererMode::Hybrid),
                      "the synchronized backend should accept Hybrid mode");
+            t.IsTrue(
+                backend->classify(command).supported,
+                "Hybrid should expose the qualified Gouraud class");
+            const GsHybridBatchPolicy hybridPolicy =
+                backend->hybridBatchPolicy(command);
             t.Equals(
-                backend->classify(command).reason,
-                GsFallbackReason::GouraudShading,
-                "Hybrid must keep the unmeasured Gouraud class closed");
+                hybridPolicy.minimumPixels,
+                config.minimumHybridGouraudDepthCt32TriangleRunPixels,
+                "Hybrid should admit Gouraud work by aggregate run bounds");
+            t.Equals(
+                hybridPolicy.maximumCommands,
+                GS_VULKAN_MAX_RESIDENT_GOURAUD_DEPTH_CT32_TRIANGLE_BATCH,
+                "Hybrid should retain the bounded ordered-tile batch size");
 
             std::vector<uint8_t> unavailableVram = initial;
             auto unavailableExecutor =
@@ -15324,6 +15424,120 @@ void register_ps2_gs_vulkan_tests()
                      "integrated Gouraud Verify should emit no validation warnings");
         });
 
+        tc.Run("GS Hybrid deferred fallback renders immutable Gouraud snapshots", [](TestCase &t)
+        {
+            GSMem::InitLookupTables();
+            const std::array<GsDrawCommand, 2> commands{{
+                makeGouraudSourceOverDepthCt32TriangleCommand(
+                    30'510u, 17u, 8u, 240u, GS_PSM_Z24,
+                    {4u, 31u, 3u, 27u}, {32u, 16u},
+                    {289u, 209u, 65u},
+                    {33u, 65u, 401u},
+                    {0x80000000u, 0x800A8040u, 0x80F01070u},
+                    0x00123456u),
+                makeGouraudSourceOverDepthCt32TriangleCommand(
+                    30'511u, 17u, 8u, 240u, GS_PSM_Z24,
+                    {4u, 31u, 3u, 27u}, {32u, 16u},
+                    {289u, 209u, 65u},
+                    {33u, 65u, 401u},
+                    {0x80F04010u, 0x8020D080u, 0x807010F0u},
+                    0x00654321u),
+            }};
+            for (const GsDrawCommand &command : commands)
+            {
+                GsVulkanGouraudDepthCt32Triangle prepared{};
+                t.IsTrue(
+                    prepareGsVulkanGouraudSourceOverDepthCt32Triangle(
+                        command, prepared).supported,
+                    "each deferred Gouraud fixture should be exact");
+            }
+
+            const std::vector<uint8_t> initial =
+                makeVramPattern(0x47444642u);
+            std::vector<uint8_t> softwareVram = initial;
+            std::vector<uint8_t> hybridVram = initial;
+            GS software;
+            GS hybrid;
+            software.init(
+                softwareVram.data(),
+                static_cast<uint32_t>(softwareVram.size()), nullptr);
+            hybrid.init(
+                hybridVram.data(),
+                static_cast<uint32_t>(hybridVram.size()), nullptr);
+
+            GsVulkanCapabilityReport preflight{};
+            const GsVulkanServiceConfig serviceConfig =
+                makeRendererServiceConfig(preflight);
+            GsVulkanRasterBackendConfig backendConfig{};
+            backendConfig
+                .minimumHybridGouraudDepthCt32TriangleRunPixels =
+                1'000'000u;
+            t.IsTrue(
+                hybrid.configureVulkanRenderer(
+                    serviceConfig, backendConfig),
+                "the deferred fallback fixture should accept Vulkan configuration");
+            if (!preflight.ready())
+            {
+                t.IsFalse(
+                    hybrid.setRendererMode(GsRendererMode::Hybrid),
+                    "an unavailable host should decline Hybrid cleanly");
+                return;
+            }
+            const GsVulkanDeviceReport *selected =
+                preflight.selectedDevice();
+            t.IsNotNull(selected,
+                        "a ready deferred fixture should select one device");
+            if (!selected ||
+                !selected->exactGouraudDepthCt32Triangle)
+            {
+                return;
+            }
+            t.IsTrue(
+                hybrid.setRendererMode(GsRendererMode::Hybrid),
+                "the capable host should enter Hybrid mode");
+            if (hybrid.rendererMode() != GsRendererMode::Hybrid)
+                return;
+            hybrid.setBackendCountersEnabled(true);
+            hybrid.resetBackendCounters();
+
+            for (const GsDrawCommand &command : commands)
+            {
+                drawGouraudDepthCt32TriangleCommand(software, command);
+                drawGouraudDepthCt32TriangleCommand(hybrid, command);
+            }
+            t.IsTrue(
+                hybridVram == initial,
+                "the sub-threshold run should remain undecided until observation");
+            (void)software.getDebugSnapshot();
+            (void)hybrid.getDebugSnapshot();
+            t.IsFalse(
+                softwareVram == initial,
+                "the software oracle should execute both blended triangles");
+            t.IsTrue(
+                hybridVram == softwareVram,
+                "deferred fallback must restore each immutable command state before rasterization");
+
+            const GsBackendCounters counters = hybrid.backendCounters();
+            t.Equals(counters.commands, 2ull,
+                     "the deferred fixture should retain both commands");
+            t.Equals(counters.softwareCommands, 2ull,
+                     "the sub-threshold run should fall back in full");
+            t.Equals(counters.fallbackCommands, 2ull,
+                     "both deferred decisions should name fallback");
+            t.Equals(counters.acceleratedCommands, 0ull,
+                     "the forced-high threshold must post no GPU draws");
+            t.Equals(
+                counters.decisions[static_cast<size_t>(
+                    GsFallbackReason::CostModel)],
+                2ull,
+                "both deferred members should retain the cost decision");
+            t.Equals(
+                hybrid.vulkanRendererServiceStatistics()
+                    .gouraudDepthCt32TriangleDrawsCompleted,
+                0ull,
+                "software fallback must not post Gouraud GPU work");
+        });
+
         tc.Run("GS Vulkan hybrid scopes host transfers and readbacks to overlapping pages", [](TestCase &t)
         {
             GSMem::InitLookupTables();
@@ -18646,6 +18860,49 @@ void register_ps2_gs_vulkan_tests()
                         triangle.boundsY1 - triangle.boundsY0);
             }
 
+            const std::array<GsVulkanGouraudDepthCt32Triangle, 3>
+                residentTriangles{{
+                    triangles.front(),
+                    triangles.front(),
+                    triangles.front(),
+                }};
+            const std::vector<uint8_t> residentInitial =
+                makeVramPattern(0x47524254u);
+            std::vector<uint8_t> residentExpected = residentInitial;
+            for (const auto &triangle : residentTriangles)
+            {
+                applyGouraudDepthCt32TriangleCpu(
+                    residentExpected, triangle);
+            }
+            GsVramPageMask allPages;
+            allPages.setAll();
+            std::string residentError;
+            t.IsTrue(
+                service->uploadVramPages(
+                    residentInitial, allPages, &residentError),
+                "the resident Gouraud fixture should upload canonical VRAM");
+            t.IsTrue(
+                service->executeResidentGouraudDepthCt32Triangles(
+                    residentTriangles, &residentError),
+                "overlapping Gouraud triangles should execute as one ordered tile batch");
+            std::vector<uint8_t> residentActual(
+                GS_VULKAN_VRAM_SIZE, 0u);
+            t.IsTrue(
+                service->downloadVramPages(
+                    residentActual, allPages, &residentError),
+                "the resident Gouraud result should download cleanly");
+            t.IsTrue(
+                residentActual == residentExpected,
+                "ordered tiles must match three sequential overlapping draws");
+            expectedCandidatePixels +=
+                static_cast<uint64_t>(residentTriangles.size()) *
+                static_cast<uint64_t>(
+                    residentTriangles.front().boundsX1 -
+                    residentTriangles.front().boundsX0) *
+                static_cast<uint64_t>(
+                    residentTriangles.front().boundsY1 -
+                    residentTriangles.front().boundsY0);
+
             const auto expectRejected =
                 [&](std::span<const uint8_t> input,
                     GsVulkanGouraudDepthCt32Triangle triangle,
@@ -18691,7 +18948,8 @@ void register_ps2_gs_vulkan_tests()
                 service->statistics();
             t.Equals(
                 statistics.gouraudDepthCt32TriangleDrawsCompleted,
-                static_cast<uint64_t>(triangles.size()),
+                static_cast<uint64_t>(
+                    triangles.size() + residentTriangles.size()),
                 "every accepted Gouraud triangle should complete once");
             t.Equals(
                 statistics.gouraudDepthCt32TriangleDrawsFailed,
@@ -18702,6 +18960,15 @@ void register_ps2_gs_vulkan_tests()
                     .gouraudDepthCt32TriangleCandidatePixelsExecuted,
                 expectedCandidatePixels,
                 "Gouraud statistics should count conservative dispatch pixels");
+            t.Equals(
+                statistics
+                    .residentGouraudDepthCt32TriangleBatchesCompleted,
+                1ull,
+                "the overlapping corpus should use one resident request");
+            t.Equals(
+                statistics.largestResidentGouraudDepthCt32TriangleBatch,
+                static_cast<uint64_t>(residentTriangles.size()),
+                "resident statistics should retain the exact batch size");
             t.Equals(statistics.validationErrors, 0u,
                      "Gouraud execution must remain validation-clean");
             t.Equals(statistics.validationWarnings, 0u,

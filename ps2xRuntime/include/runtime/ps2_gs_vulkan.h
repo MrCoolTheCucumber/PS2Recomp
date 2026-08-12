@@ -42,6 +42,8 @@ inline constexpr size_t
         GS_VULKAN_MAX_RESIDENT_SPRITE_BATCH;
 inline constexpr size_t GS_VULKAN_MAX_RESIDENT_TRIANGLE_BATCH =
     GS_VRAM_PAGE_COUNT;
+inline constexpr size_t
+    GS_VULKAN_MAX_RESIDENT_GOURAUD_DEPTH_CT32_TRIANGLE_BATCH = 6144u;
 inline constexpr size_t GS_VULKAN_MAX_RESIDENT_T8_TRIANGLE_BATCH =
     6144u;
 
@@ -252,6 +254,9 @@ struct GsVulkanServiceStatistics
     uint64_t gouraudDepthCt32TriangleDrawsCompleted = 0u;
     uint64_t gouraudDepthCt32TriangleDrawsFailed = 0u;
     uint64_t gouraudDepthCt32TriangleCandidatePixelsExecuted = 0u;
+    uint64_t residentGouraudDepthCt32TriangleBatchesCompleted = 0u;
+    uint64_t residentGouraudDepthCt32TriangleBatchesFailed = 0u;
+    uint64_t largestResidentGouraudDepthCt32TriangleBatch = 0u;
     uint64_t t8GouraudDepthCt32TriangleDrawsCompleted = 0u;
     uint64_t t8GouraudDepthCt32TriangleDrawsFailed = 0u;
     uint64_t t8GouraudDepthCt32TriangleCandidatePixelsExecuted = 0u;
@@ -812,6 +817,10 @@ struct alignas(16) GsVulkanGouraudDepthCt32Triangle
 };
 
 static_assert(sizeof(GsVulkanGouraudDepthCt32Triangle) == 112u);
+static_assert(
+    sizeof(GsVulkanGouraudDepthCt32Triangle) *
+            GS_VULKAN_MAX_RESIDENT_GOURAUD_DEPTH_CT32_TRIANGLE_BATCH <=
+        sizeof(GsVulkanMemoryCase) * GS_VULKAN_MAX_MEMORY_CASES);
 static_assert(std::is_standard_layout_v<
               GsVulkanGouraudDepthCt32Triangle>);
 static_assert(std::is_trivially_copyable_v<
@@ -1157,6 +1166,14 @@ public:
     [[nodiscard]] virtual bool executeResidentCt32Triangles(
         std::span<const GsVulkanCt32Triangle> triangles,
         std::string *error = nullptr) = 0;
+    [[nodiscard]] virtual bool executeResidentGouraudDepthCt32Triangles(
+        std::span<const GsVulkanGouraudDepthCt32Triangle>,
+        std::string *error = nullptr)
+    {
+        if (error)
+            *error = "resident Gouraud depth triangle execution is unavailable";
+        return false;
+    }
     [[nodiscard]] virtual bool executeResidentT8GouraudDepthCt32Triangles(
         std::span<const GsVulkanResidentT8GouraudDepthCt32Triangle>,
         std::span<const GsVulkanT8Palette>,
@@ -1365,6 +1382,12 @@ public:
         std::string *error = nullptr) override;
     [[nodiscard]] bool executeResidentCt32Triangles(
         std::span<const GsVulkanCt32Triangle> triangles,
+        std::string *error = nullptr) override;
+
+    // Bins overlapping Gouraud/depth draws into ordered 8x8 tile lists so
+    // one invocation serializes every guest draw touching a pixel.
+    [[nodiscard]] bool executeResidentGouraudDepthCt32Triangles(
+        std::span<const GsVulkanGouraudDepthCt32Triangle> triangles,
         std::string *error = nullptr) override;
 
     [[nodiscard]] bool executeResidentT8GouraudDepthCt32Triangles(

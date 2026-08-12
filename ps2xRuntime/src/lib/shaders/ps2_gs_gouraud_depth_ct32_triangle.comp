@@ -11,7 +11,7 @@ layout(set = 0, binding = 0, std430) buffer GsVram
     uint words[];
 } gs_vram;
 
-layout(push_constant) uniform GouraudDepthTriangleParameters
+struct GouraudDepthTriangle
 {
     uint framebuffer_base_block;
     uint framebuffer_width;
@@ -35,7 +35,29 @@ layout(push_constant) uniform GouraudDepthTriangleParameters
     uint top_left_edge_mask;
     uvec4 color_dx_bits;
     uvec4 color_dy_bits;
-} triangle;
+};
+
+layout(set = 0, binding = 1, std430) readonly buffer TriangleRecords
+{
+    GouraudDepthTriangle records[];
+} triangle_records;
+
+// Resident batches use the same ordered 8x8 tile-list representation as the
+// indexed triangle pipeline. Each descriptor is {x, y, first, count}; packed
+// record indices begin at parameters.tile_index_words.
+layout(set = 0, binding = 2, std430) readonly buffer TileWork
+{
+    uint words[];
+} tile_work;
+
+layout(push_constant) uniform GouraudDepthTriangleParameters
+{
+    uint record_index;
+    uint tile_index_words;
+} parameters;
+
+uint current_record_index;
+#define triangle triangle_records.records[current_record_index]
 
 struct TriangleVertex
 {
@@ -379,11 +401,12 @@ void write_z24(uint word_index, uint initial_word)
     }
 }
 
-void main()
+void rasterize_pixel(uint record_index, uint x, uint y)
 {
-    uint x = triangle.bounds_x0 + gl_GlobalInvocationID.x;
-    uint y = triangle.bounds_y0 + gl_GlobalInvocationID.y;
+    current_record_index = record_index;
     if (x >= triangle.bounds_x1 || y >= triangle.bounds_y1)
+        return;
+    if (x < triangle.bounds_x0 || y < triangle.bounds_y0)
         return;
 
     int sample_x = int(x << 4u);
@@ -424,5 +447,29 @@ void main()
     else
     {
         atomicExchange(gs_vram.words[depth_word_index], triangle.depth);
+    }
+}
+
+void main()
+{
+    if (parameters.tile_index_words == 0u)
+    {
+        current_record_index = parameters.record_index;
+        uint x = triangle.bounds_x0 + gl_GlobalInvocationID.x;
+        uint y = triangle.bounds_y0 + gl_GlobalInvocationID.y;
+        rasterize_pixel(parameters.record_index, x, y);
+        return;
+    }
+
+    uint descriptor = gl_WorkGroupID.x * 4u;
+    uint x = tile_work.words[descriptor] + gl_LocalInvocationID.x;
+    uint y = tile_work.words[descriptor + 1u] + gl_LocalInvocationID.y;
+    uint first = tile_work.words[descriptor + 2u];
+    uint count = tile_work.words[descriptor + 3u];
+    for (uint index = 0u; index < count; ++index)
+    {
+        uint record_index = tile_work.words[
+            parameters.tile_index_words + first + index];
+        rasterize_pixel(record_index, x, y);
     }
 }

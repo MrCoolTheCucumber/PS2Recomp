@@ -50,6 +50,10 @@ struct GsVulkanRasterBackendConfig
     // Triangle work is the conservative clipped bounding box dispatched by the
     // compute kernel, including samples rejected by its exact edge tests.
     uint64_t minimumHybridTriangleCandidatePixels = 32'768u;
+    // Small Gouraud/depth triangles are emitted as one overlapping run. A
+    // resident ordered-tile dispatch amortizes setup using aggregate clipped
+    // bounds instead of applying the flat triangle's isolated-draw gate.
+    uint64_t minimumHybridGouraudDepthCt32TriangleRunPixels = 262'144u;
 };
 
 struct GsVulkanRasterBackendStatistics

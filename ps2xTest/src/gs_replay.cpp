@@ -77,6 +77,7 @@ namespace
                "[--vulkan-min-hybrid-linear-ct32-clamp-pixels COUNT] "
                "[--vulkan-min-hybrid-feedback-ct32-run-pixels COUNT] "
                "[--vulkan-min-hybrid-triangle-pixels COUNT] "
+               "[--vulkan-min-hybrid-gouraud-depth-run-pixels COUNT] "
                "[--vulkan-validation] [--vulkan-loader FILE] "
                "[--vulkan-vendor ID] [--vulkan-device ID] "
                "[--backend-stats] [--stop-after-command COUNT] "
@@ -464,6 +465,15 @@ namespace
                << ",\"gouraud_depth_ct32_triangle_candidate_pixels_executed\":"
                << statistics
                       .gouraudDepthCt32TriangleCandidatePixelsExecuted
+               << ",\"resident_gouraud_depth_ct32_triangle_batches_completed\":"
+               << statistics
+                      .residentGouraudDepthCt32TriangleBatchesCompleted
+               << ",\"resident_gouraud_depth_ct32_triangle_batches_failed\":"
+               << statistics
+                      .residentGouraudDepthCt32TriangleBatchesFailed
+               << ",\"largest_resident_gouraud_depth_ct32_triangle_batch\":"
+               << statistics
+                      .largestResidentGouraudDepthCt32TriangleBatch
                << ",\"t8_gouraud_depth_ct32_triangle_draws_completed\":"
                << statistics.t8GouraudDepthCt32TriangleDrawsCompleted
                << ",\"t8_gouraud_depth_ct32_triangle_draws_failed\":"
@@ -885,6 +895,8 @@ int main(int argc, char **argv)
             argument ==
                 "--vulkan-min-hybrid-feedback-ct32-run-pixels" ||
             argument == "--vulkan-min-hybrid-triangle-pixels" ||
+            argument ==
+                "--vulkan-min-hybrid-gouraud-depth-run-pixels" ||
             argument == "--vulkan-loader" ||
             argument == "--vulkan-vendor" ||
             argument == "--vulkan-device")
@@ -1125,6 +1137,29 @@ int main(int argc, char **argv)
                     return 2;
                 }
                 vulkanBackendConfig.minimumHybridTriangleCandidatePixels =
+                    minimum;
+                vulkanOptionUsed = true;
+                replayOptionUsed = true;
+                gifReplayOptionUsed = true;
+            }
+            else if (argument ==
+                     "--vulkan-min-hybrid-gouraud-depth-run-pixels")
+            {
+                uint64_t minimum = 0u;
+                constexpr uint64_t maximumPixels =
+                    2048ull * 2048ull *
+                    GS_VULKAN_MAX_RESIDENT_GOURAUD_DEPTH_CT32_TRIANGLE_BATCH;
+                if (!parseCount(argv[index], minimum) ||
+                    minimum > maximumPixels)
+                {
+                    std::cerr
+                        << "Vulkan hybrid Gouraud depth triangle run-pixel threshold "
+                           "must be between 0 and "
+                        << maximumPixels << '\n';
+                    return 2;
+                }
+                vulkanBackendConfig
+                    .minimumHybridGouraudDepthCt32TriangleRunPixels =
                     minimum;
                 vulkanOptionUsed = true;
                 replayOptionUsed = true;

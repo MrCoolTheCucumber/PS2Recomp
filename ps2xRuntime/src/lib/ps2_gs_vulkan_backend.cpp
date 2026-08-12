@@ -751,6 +751,7 @@ struct GsVulkanRasterBackend::Impl final
         LinearCt32Sprite,
         FeedbackLinearDepthCt32Sprite,
         Ct32Triangle,
+        GouraudDepthCt32Triangle,
         T8GouraudDepthCt32Triangle,
     };
 
@@ -773,6 +774,8 @@ struct GsVulkanRasterBackend::Impl final
     std::vector<GsVulkanFeedbackLinearDepthCt32Sprite>
         pendingFeedbackLinearDepthCt32Sprites;
     std::vector<GsVulkanCt32Triangle> pendingTriangles;
+    std::vector<GsVulkanGouraudDepthCt32Triangle>
+        pendingGouraudDepthTriangles;
     std::vector<GsVulkanResidentT8GouraudDepthCt32Triangle>
         pendingT8GouraudDepthTriangles;
     // The legacy per-draw callback is retained for diagnostics/tests, but
@@ -872,6 +875,7 @@ struct GsVulkanRasterBackend::Impl final
         pendingLinearCt32Sprites.clear();
         pendingFeedbackLinearDepthCt32Sprites.clear();
         pendingTriangles.clear();
+        pendingGouraudDepthTriangles.clear();
         pendingT8GouraudDepthTriangles.clear();
         pendingCommitCommands.clear();
         pendingResidentReadPages.clear();
@@ -900,6 +904,8 @@ struct GsVulkanRasterBackend::Impl final
             return pendingFeedbackLinearDepthCt32Sprites.size();
         case ResidentPipeline::Ct32Triangle:
             return pendingTriangles.size();
+        case ResidentPipeline::GouraudDepthCt32Triangle:
+            return pendingGouraudDepthTriangles.size();
         case ResidentPipeline::T8GouraudDepthCt32Triangle:
             return pendingT8GouraudDepthTriangles.size();
         }
@@ -945,6 +951,8 @@ struct GsVulkanRasterBackend::Impl final
         }
         else if (pipeline == ResidentPipeline::Ct32Triangle)
             batchName = "resident CT32 triangle batch";
+        else if (pipeline == ResidentPipeline::GouraudDepthCt32Triangle)
+            batchName = "resident Gouraud depth CT32 triangle batch";
         else if (pipeline ==
                  ResidentPipeline::T8GouraudDepthCt32Triangle)
         {
@@ -973,6 +981,11 @@ struct GsVulkanRasterBackend::Impl final
         {
             executed = executor->executeResidentCt32Triangles(
                 pendingTriangles, &executionError);
+        }
+        else if (pipeline == ResidentPipeline::GouraudDepthCt32Triangle)
+        {
+            executed = executor->executeResidentGouraudDepthCt32Triangles(
+                pendingGouraudDepthTriangles, &executionError);
         }
         else if (pipeline ==
                  ResidentPipeline::T8GouraudDepthCt32Triangle)
@@ -1186,6 +1199,8 @@ GsVulkanRasterBackend::createWithExecutor(
     impl->pendingFeedbackLinearDepthCt32Sprites.reserve(
         backendConfig.maximumResidentBatchCommands);
     impl->pendingTriangles.reserve(backendConfig.maximumResidentBatchCommands);
+    impl->pendingGouraudDepthTriangles.reserve(
+        GS_VULKAN_MAX_RESIDENT_GOURAUD_DEPTH_CT32_TRIANGLE_BATCH);
     impl->pendingT8GouraudDepthTriangles.reserve(
         GS_VULKAN_MAX_RESIDENT_T8_TRIANGLE_BATCH);
     if (impl->acceleratedCommit)
@@ -1193,7 +1208,9 @@ GsVulkanRasterBackend::createWithExecutor(
         impl->pendingCommitCommands.reserve(
             std::max(
                 backendConfig.maximumResidentBatchCommands,
-                GS_VULKAN_MAX_RESIDENT_T8_TRIANGLE_BATCH));
+                std::max(
+                    GS_VULKAN_MAX_RESIDENT_GOURAUD_DEPTH_CT32_TRIANGLE_BATCH,
+                    GS_VULKAN_MAX_RESIDENT_T8_TRIANGLE_BATCH)));
     }
     impl->pendingT8Palettes.reserve(16u);
     impl->submissionResourcesScratch.reserve(1u);
@@ -1449,11 +1466,7 @@ GsBackendDecision GsVulkanRasterBackend::classify(
         return triangleDecision;
     }
 
-    // Preserve every established triangle fallback outside Verify. The new
-    // class remains closed in strict/Hybrid until resident execution and a
-    // crossover are independently qualified.
-    if (m_impl->config.mode != GsRendererMode::Verify ||
-        triangleDecision.reason != GsFallbackReason::GouraudShading)
+    if (triangleDecision.reason != GsFallbackReason::GouraudShading)
     {
         return triangleDecision;
     }
@@ -1491,6 +1504,21 @@ GsHybridBatchPolicy GsVulkanRasterBackend::hybridBatchPolicy(
                 m_impl->config
                     .minimumHybridFramebufferOnlyAlphaFailDepthCt32RunPixels,
                 m_impl->config.maximumResidentBatchCommands};
+        }
+    }
+
+    if (m_impl->config
+                .minimumHybridGouraudDepthCt32TriangleRunPixels != 0u &&
+        m_impl->exactGouraudDepthCt32Triangle)
+    {
+        GsVulkanGouraudDepthCt32Triangle triangle{};
+        if (prepareGsVulkanGouraudSourceOverDepthCt32Triangle(
+                command, triangle).supported)
+        {
+            return {
+                m_impl->config
+                    .minimumHybridGouraudDepthCt32TriangleRunPixels,
+                GS_VULKAN_MAX_RESIDENT_GOURAUD_DEPTH_CT32_TRIANGLE_BATCH};
         }
     }
 
@@ -1532,6 +1560,25 @@ bool GsVulkanRasterBackend::hybridBatchCompatible(
                 next, nextFramebufferOnly).supported)
         {
             return true;
+        }
+    }
+
+    if (m_impl->exactGouraudDepthCt32Triangle)
+    {
+        GsVulkanGouraudDepthCt32Triangle firstTriangle{};
+        GsVulkanGouraudDepthCt32Triangle nextTriangle{};
+        if (prepareGsVulkanGouraudSourceOverDepthCt32Triangle(
+                first, firstTriangle).supported &&
+            prepareGsVulkanGouraudSourceOverDepthCt32Triangle(
+                next, nextTriangle).supported)
+        {
+            return firstTriangle.framebufferBaseBlock ==
+                       nextTriangle.framebufferBaseBlock &&
+                   firstTriangle.framebufferWidth ==
+                       nextTriangle.framebufferWidth &&
+                   firstTriangle.depthBaseBlock ==
+                       nextTriangle.depthBaseBlock &&
+                   firstTriangle.depthPsm == nextTriangle.depthPsm;
         }
     }
 
@@ -1675,8 +1722,7 @@ void GsVulkanRasterBackend::submit(
         {
             const GsBackendDecision triangleDecision =
                 prepareGsVulkanCt32Triangle(command, triangle);
-            if (!triangleDecision.supported &&
-                m_impl->config.mode == GsRendererMode::Verify)
+            if (!triangleDecision.supported)
             {
                 isGouraudDepthTriangle =
                     prepareGsVulkanGouraudSourceOverDepthCt32Triangle(
@@ -1952,6 +1998,11 @@ void GsVulkanRasterBackend::submit(
                 pipeline = Impl::ResidentPipeline::
                     T8GouraudDepthCt32Triangle;
             }
+            else if (isGouraudDepthTriangle)
+            {
+                pipeline = Impl::ResidentPipeline::
+                    GouraudDepthCt32Triangle;
+            }
             else if (isTriangle)
                 pipeline = Impl::ResidentPipeline::Ct32Triangle;
             else if (isDepthSprite)
@@ -2065,6 +2116,26 @@ void GsVulkanRasterBackend::submit(
                         GsFlushReason::ResourceHazard);
                 }
             }
+            else if (pipeline == Impl::ResidentPipeline::
+                         GouraudDepthCt32Triangle &&
+                     m_impl->pendingResidentCommandTotal != 0u)
+            {
+                const auto &first =
+                    m_impl->pendingGouraudDepthTriangles.front();
+                const bool sameRenderTarget =
+                    first.framebufferBaseBlock ==
+                        gouraudDepthTriangle.framebufferBaseBlock &&
+                    first.framebufferWidth ==
+                        gouraudDepthTriangle.framebufferWidth &&
+                    first.depthBaseBlock ==
+                        gouraudDepthTriangle.depthBaseBlock &&
+                    first.depthPsm == gouraudDepthTriangle.depthPsm;
+                if (!sameRenderTarget)
+                {
+                    m_impl->drainPendingResidentCommands(
+                        GsFlushReason::PipelineChange);
+                }
+            }
             const bool hasDependency =
                 m_impl->pendingResidentWritePages.intersects(
                     residentReadPages) ||
@@ -2078,6 +2149,8 @@ void GsVulkanRasterBackend::submit(
                 pipeline == Impl::ResidentPipeline::
                     FeedbackLinearDepthCt32Sprite ||
                 pipeline == Impl::ResidentPipeline::
+                    GouraudDepthCt32Triangle ||
+                pipeline == Impl::ResidentPipeline::
                     T8GouraudDepthCt32Triangle;
             if (hasDependency && !ordersDependenciesInBatch)
             {
@@ -2088,6 +2161,9 @@ void GsVulkanRasterBackend::submit(
                 pipeline == Impl::ResidentPipeline::
                                 T8GouraudDepthCt32Triangle
                     ? GS_VULKAN_MAX_RESIDENT_T8_TRIANGLE_BATCH
+                : pipeline == Impl::ResidentPipeline::
+                                GouraudDepthCt32Triangle
+                    ? GS_VULKAN_MAX_RESIDENT_GOURAUD_DEPTH_CT32_TRIANGLE_BATCH
                     : m_impl->config.maximumResidentBatchCommands;
             if (m_impl->pendingResidentCommandTotal >=
                 maximumBatchCommands)
@@ -2169,6 +2245,10 @@ void GsVulkanRasterBackend::submit(
                 break;
             case Impl::ResidentPipeline::Ct32Triangle:
                 m_impl->pendingTriangles.push_back(triangle);
+                break;
+            case Impl::ResidentPipeline::GouraudDepthCt32Triangle:
+                m_impl->pendingGouraudDepthTriangles.push_back(
+                    gouraudDepthTriangle);
                 break;
             case Impl::ResidentPipeline::T8GouraudDepthCt32Triangle:
                 m_impl->pendingT8GouraudDepthTriangles.push_back(

@@ -2982,6 +2982,59 @@ void GSRasterizer::renderSoftwarePrimitive(
 
     const GSContext &ctx = command.context();
     const GSPrimReg &primitive = command.primitive();
+    const GsDrawGlobalState &global = command.globalState();
+    const size_t contextIndex = primitive.ctxt ? 1u : 0u;
+    const GSContext savedContext = gs->m_ctx[contextIndex];
+    const GSPrimReg savedPrimitive = gs->m_prim;
+    std::array<GSVertex, 3> savedVertices{};
+    std::copy_n(gs->m_vtxQueue, savedVertices.size(),
+                savedVertices.begin());
+    const int savedVertexCount = gs->m_vtxCount;
+    const GSTexaReg savedTexa = gs->m_texa;
+    const GSTexClutReg savedTexclut = gs->m_texclut;
+    const uint32_t savedFogColor = gs->m_fogColor;
+    const bool savedPrmodecont = gs->m_prmodecont;
+    const bool savedPabe = gs->m_pabe;
+    const uint8_t savedScanMask = gs->m_scanMask;
+    const uint64_t savedDimx = gs->m_dimx;
+    const bool savedDither = gs->m_dither;
+    const bool savedColorClamp = gs->m_colorClamp;
+    const auto restoreState = [&](GS *state) noexcept
+    {
+        state->m_ctx[contextIndex] = savedContext;
+        state->m_prim = savedPrimitive;
+        std::copy(savedVertices.begin(), savedVertices.end(),
+                  state->m_vtxQueue);
+        state->m_vtxCount = savedVertexCount;
+        state->m_texa = savedTexa;
+        state->m_texclut = savedTexclut;
+        state->m_fogColor = savedFogColor;
+        state->m_prmodecont = savedPrmodecont;
+        state->m_pabe = savedPabe;
+        state->m_scanMask = savedScanMask;
+        state->m_dimx = savedDimx;
+        state->m_dither = savedDither;
+        state->m_colorClamp = savedColorClamp;
+    };
+    std::unique_ptr<GS, decltype(restoreState)> stateGuard(
+        gs, restoreState);
+
+    // The router can defer a Hybrid decision beyond later GIF register and
+    // vertex writes. Render from the immutable command snapshot, then restore
+    // the live frontend state so a software fallback remains order-exact.
+    gs->m_ctx[contextIndex] = ctx;
+    gs->m_prim = primitive;
+    std::copy_n(command.vertices().data(), 3u, gs->m_vtxQueue);
+    gs->m_vtxCount = command.vertexCount();
+    gs->m_texa = global.texa;
+    gs->m_texclut = global.texclut;
+    gs->m_fogColor = global.fogColor;
+    gs->m_prmodecont = global.prmodecont;
+    gs->m_pabe = global.pabe;
+    gs->m_scanMask = global.scanMask;
+    gs->m_dimx = global.dimx;
+    gs->m_dither = global.dither;
+    gs->m_colorClamp = global.colorClamp;
     prepareDecodedClut(gs);
     m_textureReadVram = nullptr;
     const uint32_t frameBase =
@@ -3192,7 +3245,6 @@ void GSRasterizer::renderSoftwarePrimitive(
         const GSVertex &v0 = command.vertices()[0];
         const GSVertex &v1 = command.vertices()[1];
         const GSVertex &v2 = command.vertices()[2];
-        const GsDrawGlobalState &global = command.globalState();
         const GsDrawBounds &bounds = command.bounds();
         const GsDrawResources resources = command.resources();
         const GsBackendDecision decision =
